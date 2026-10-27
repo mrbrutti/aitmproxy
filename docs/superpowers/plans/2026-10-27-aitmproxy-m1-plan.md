@@ -455,15 +455,20 @@ wave (Tasks 29–31). Exit gate (Task 31 / **AC19**) on the whole workspace:
 
 ```text
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
-→ FMT=0  CLIPPY=0  TEST=0 — 54 test binaries, 0 failed, 4 ignored (Chromium-gated)
-AITM_SOAK=1 cargo test -p aitm --test soak → 31,378 req/s; RSS plateau 19183→19267 KiB (0.4%)
+→ FMT=0  CLIPPY=0  TEST=0 — 54 test binaries, 0 failed, 0 ignored
+AITM_SOAK=1  cargo test -p aitm --test soak → 31,378 req/s; RSS plateau 19183→19267 KiB (0.4%)
+AITM_CHROME=1 cargo test → the 4 Chromium tests run for real, all pass (CHROME_EXIT=0)
 ```
 
 **Chromium:** Google Chrome is installed (`/Applications/Google Chrome.app`);
-chromiumoxide auto-detects it. The Chromium-gated tests pass for real when run
-with `cargo test -- --ignored --test-threads=1` (serial, so only one Chrome at a
-time — they flake under cargo's default intra-binary parallelism, so they stay
-`#[ignore]` to keep the default gate fast and hermetic).
+chromiumoxide auto-detects it (the optional Chromium fetcher is deliberately
+disabled — `aitm-browser/Cargo.toml` — so we drive a system browser, not a bundled
+one). The four Chromium-backed tests are **no longer `#[ignore]`d**: they are in
+the default suite but gated at run time on `AITM_CHROME=1` (the soak test's
+`AITM_SOAK` pattern), so plain `cargo test` runs them inert — no browser needed,
+nothing flakes — and `AITM_CHROME=1 cargo test` exercises them for real. They
+self-serialize (one headless Chrome at a time), so the real run needs no
+`--test-threads=1` and passes under default parallelism.
 
 ### Acceptance-criteria coverage (AC19 table)
 
@@ -478,15 +483,15 @@ time — they flake under cargo's default intra-binary parallelism, so they stay
 | AC7 MCP full 18-tool surface | `aitm` `frontends::ac7_exact_eighteen_tools` | pass |
 | AC8 One surface, two frontends | `aitm-cli` `cli_matches_mcp`; `aitm` `frontends::mutate_headers_roundtrip_over_{mcp,cli}` | pass |
 | AC9 MCP-only capture | `aitm-mcp` `mcp::mcp_only_capture` | pass |
-| AC10 Browser routes through proxy | `aitm-browser` `driver::launch_args_route_through_the_proxy` (args); e2e setup drives Chrome via the proxy listener | pass (args) / see note |
-| AC11 Browser primitives | `aitm-browser` `browser::primitives` | ignored-pass (Chromium) |
-| AC12 SSRF / private-IP guard | `aitm-core` `guard::ssrf_connector_decision`; `aitm-browser` `ssrf::{navigate_blocks_private…, navigate_permitted…}`; `aitm-poc` `run::browser_navigate_to_private_off_scope_is_refused` | pass (+ ignored-pass) |
+| AC10 Browser routes through proxy | `aitm-browser` `browser::navigate_routes_through_proxy` (real Chrome dials the proxy for a loopback target); `driver::launch_args_route_through_the_proxy` (args); e2e drives Chrome via the proxy | pass (+ Chromium) |
+| AC11 Browser primitives | `aitm-browser` `browser::primitives` | pass (Chromium) |
+| AC12 SSRF / private-IP guard | `aitm-core` `guard::ssrf_connector_decision`; `aitm-browser` `ssrf::{navigate_blocks_private…, navigate_permitted…}`; `aitm-poc` `run::browser_navigate_to_private_off_scope_is_refused` | pass (+ Chromium) |
 | AC13 PoC artifact round-trip | `aitm-poc` `serde::{example1_roundtrips, preserves_unmodeled_fields}` | pass |
-| AC14 poc.run pass-vs-patched | `aitm-poc` `run::pass_vs_patched` (browser double); e2e (real Chrome) | pass (+ ignored-pass) |
-| AC15 Three artifacts | `aitm-poc` `run::three_artifacts`; e2e | pass (+ ignored-pass) |
+| AC14 poc.run pass-vs-patched | `aitm-poc` `run::pass_vs_patched` (browser double); e2e (real Chrome) | pass (+ Chromium) |
+| AC15 Three artifacts | `aitm-poc` `run::three_artifacts`; e2e | pass (+ Chromium) |
 | AC16 Scope gating | `aitm-plugins` `mutate::request_send_scope_gated`, `replay::replay_out_of_scope_refused`; `aitm-poc` `run::http_step_out_of_scope_is_refused` | pass |
 | AC17 Rate limiting | `aitm-plugins` `scope_rate::rate_limit_throttles_burst`; `aitm-core` `guard::rate_limit_burst` | pass |
-| AC18 E2E reflected XSS over MCP | `aitm` `e2e_reflected_xss::reflected_xss_over_mcp` | ignored-pass (Chromium) |
+| AC18 E2E reflected XSS over MCP | `aitm` `e2e_reflected_xss::reflected_xss_over_mcp` | pass (Chromium) |
 | AC19 Gate green | this exit gate | pass |
 | AC20 Throughput + bounded memory | `aitm` `soak::throughput_floor_and_memory_plateau` (`AITM_SOAK=1`) — 31,378 req/s, plateau | pass |
 | AC-P1 Ordered events + halt | `aitm-core` `chain::{ordered_events_and_halt, intercept_resume_forwards}` | pass |
@@ -502,20 +507,23 @@ time — they flake under cargo's default intra-binary parallelism, so they stay
 | AC-L6 Extractor binds a later variable | `aitm-poc` `matcher::regex_binds_later_var`; `run::extract_binds_variable_for_a_later_assertion` | pass |
 | AC-L7 Schema validation rejects malformed | `aitm-poc` `serde::{missing_id_rejected, unknown_step_rejected}` | pass |
 
-Every M1 AC maps to a passing test. The Chromium-gated tests (AC11, AC18, and the
-browser halves of AC10/AC12/AC14/AC15) pass for real on this machine under the
-serial `--ignored` run; they are `#[ignore]`d so the default gate stays fast and
-needs no browser.
+Every M1 AC maps to a passing test. The Chromium-backed tests (AC11, AC18, and the
+browser halves of AC10/AC12/AC14/AC15) pass for real on this machine under
+`AITM_CHROME=1 cargo test` at default parallelism; with the variable unset they
+run inert, so the default gate stays fast and needs no browser.
 
 **Note on AC10:** chromiumoxide launches Chrome with `--proxy-server` +
-`--proxy-bypass-list=<-loopback>` (unit-tested), and the e2e drives Chrome against
-a loopback target via that listener. A standalone assertion that Google Chrome
-*dials the proxy* for a bare listener proved Chrome-version-fragile (loopback
-proxy-bypass timing), so `navigate_routes_through_proxy` stays `#[ignore]`d;
-verifying browser-originated capture with a non-loopback host + hosts mapping is a
-follow-up. The browser's SSRF for loopback targets is still enforced pre-flight
-(`check_url` in `browser.navigate` and the poc runner), independent of connector
-routing.
+`--proxy-bypass-list=<-loopback>` (unit-tested). `navigate_routes_through_proxy`
+now drives real Chrome to a loopback target through a listener that doubles as the
+proxy and answers 200 (the proven Task-19 permitted-navigation pattern), and
+asserts Chrome dialed the proxy; it is bounded by the 30 s `nav_timeout`, so it
+fails rather than hangs if Chrome ever does not. The earlier bare-stub variant
+(target never answered) was Chrome-version-fragile and was replaced. Verifying
+browser-originated capture through the *real `HttpModule` connector* with a
+non-loopback host + hosts mapping remains a follow-up (this test and the e2e both
+use a listener, not the production connector). The browser's SSRF for loopback
+targets is still enforced pre-flight (`check_url` in `browser.navigate` and the
+poc runner), independent of connector routing.
 
 ### What was cut / deferred
 See **Follow-ups** below (CA owner-uid check, broader `Event::Error` coverage,
@@ -542,11 +550,12 @@ correctness/security/robustness item, not pure cosmetics.
 - **CA key owner-uid check.** Also refuse a CA key not owned by the current uid
   (the group/other-mode check and explicit validity already land); needs a
   non-`unsafe` `getuid` (e.g. `rustix`) under `forbid(unsafe_code)`.
-- **Verify browser-originated capture (AC10).** Confirm Google Chrome dials the
-  proxy for a non-loopback target (hosts mapping / `--host-resolver-rules`) so a
-  browser navigation appears as a captured `HttpFlow` and is SSRF-filtered at the
-  connector; the current `navigate_routes_through_proxy` test is Chrome-fragile
-  for a bare loopback stub and stays `#[ignore]`d.
+- **Verify browser-originated capture through the real connector (AC10).**
+  `navigate_routes_through_proxy` now proves real Chrome dials the proxy (loopback
+  target, listener-as-proxy). Still open: drive Chrome to a *non-loopback* target
+  (hosts mapping / `--host-resolver-rules`) through the production `HttpModule`
+  connector so the navigation appears as a captured `HttpFlow` and is SSRF-filtered
+  at the connector, not just pre-flight.
 
 ### Deferred cosmetic (no security/correctness angle)
 

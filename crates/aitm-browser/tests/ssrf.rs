@@ -1,7 +1,8 @@
 //! Task 19: the SSRF guard and the `browser.*` commands.
 //!
 //! Everything here runs without Chromium except the last test, which drives a
-//! real browser through the permitted path and is `#[ignore]`d until one exists.
+//! real browser through the permitted path; it is part of the default suite but
+//! inert unless `AITM_CHROME=1` is set (mirrors the soak test's `AITM_SOAK`).
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -268,8 +269,11 @@ fn page_commands_need_a_browser() {
 /// navigation reaches a real driver. The loopback listener doubles as the
 /// browser's `--proxy-server`, answering any absolute-form request with 200.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs Chromium"]
 async fn navigate_permitted_after_scope_reaches_driver() {
+    if std::env::var_os("AITM_CHROME").is_none() {
+        eprintln!("skipped; set AITM_CHROME=1 to run the Chromium-backed test (AC12)");
+        return;
+    }
     use aitm_browser::{BrowserConfig, ChromeDriver};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

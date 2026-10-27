@@ -1,11 +1,12 @@
 //! Task 29 / AC18: the reflected-XSS reproduction driven **entirely over MCP**
 //! against the bundled vulnerable/patched target, with a real headless Chrome.
 //!
-//! `#[ignore = "needs Chromium"]`: run explicitly (and single-threaded, so only
-//! one Chrome launches at a time):
+//! Part of the default suite but inert unless `AITM_CHROME=1` is set (mirrors
+//! the soak test's `AITM_SOAK`), so `cargo test` stays fast and hermetic where
+//! no browser is installed. Run it for real with:
 //!
 //! ```text
-//! cargo test -p aitm --test e2e_reflected_xss -- --ignored --test-threads=1 --nocapture
+//! AITM_CHROME=1 cargo test -p aitm --test e2e_reflected_xss -- --nocapture
 //! ```
 //!
 //! Flow: `scope.add` the target, then `poc.run` a parameterized Example-1 PoC
@@ -151,8 +152,11 @@ fn rpc(server: &McpServer, id: u64, method: &str, params: JsonValue) -> JsonValu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Chromium"]
 async fn reflected_xss_over_mcp() {
+    if std::env::var_os("AITM_CHROME").is_none() {
+        eprintln!("skipped; set AITM_CHROME=1 to run the Chromium-backed e2e (AC18)");
+        return;
+    }
     // Write the PoC to a temp file (poc.run loads it by path).
     let poc_path = std::env::temp_dir().join(format!("aitm-e2e-{}.poc.yaml", std::process::id()));
     std::fs::write(&poc_path, example1_poc()).expect("write poc");
