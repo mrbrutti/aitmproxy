@@ -24,6 +24,9 @@ dependencies = [
  "aitm-poc",
  "aitm-proto-http",
  "aitm-proto-ws",
+ "anyhow",
+ "futures",
+ "tokio",
 ]
 
 [[package]]

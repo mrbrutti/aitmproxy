@@ -6,6 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 description = "The aitmproxy binary: wires modules, plugins, and frontends from config."
 
+[lib]
+name = "aitm"
+path = "src/lib.rs"
+
 [[bin]]
 name = "aitm"
 path = "src/main.rs"
@@ -20,3 +24,6 @@ aitm-browser.workspace = true
 aitm-poc.workspace = true
 aitm-mcp.workspace = true
 aitm-cli.workspace = true
+anyhow = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }

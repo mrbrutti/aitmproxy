@@ -42,6 +42,14 @@ impl Proxy {
         &self.inner.registry
     }
 
+    /// The command registry as a shared handle. Frontends (`McpServer::new`,
+    /// `Cli::new`) take `Arc<Registry>`; this hands them the *same* registry the
+    /// chain dispatches through, so a command invoked over MCP/CLI and an event
+    /// handled on the wire see one plugin set.
+    pub fn registry_arc(&self) -> Arc<Registry> {
+        self.inner.registry.clone()
+    }
+
     /// The shared flow store (for assembling a `CommandHost`).
     pub fn store(&self) -> Arc<dyn FlowStore> {
         self.inner.store.clone()
