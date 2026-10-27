@@ -7,13 +7,21 @@
 //! `ModuleCtx` carries the core service handles a module uses without naming any
 //! concrete acceptor type: a flow store, an event sink (the ordered plugin chain,
 //! wired in Task 8), and a guarded upstream connector.
+//!
+//! It also carries the **upgrade hand-off** (mitmproxy-style next-layer
+//! re-dispatch): when a module finishes an HTTP upgrade it calls
+//! [`ModuleCtx::handoff_upgrade`], and the module that claims the
+//! `from_upgrade` hint is spawned with a child context holding the handshake
+//! flow id and the already-open upstream stream ([`ModuleCtx::handshake`],
+//! [`ModuleCtx::take_upstream`]).
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
 
 use crate::event::{Event, Verdict};
+use crate::flow::FlowId;
 use crate::store::FlowStore;
 use crate::stream::ByteStream;
 
@@ -27,7 +35,10 @@ pub trait ProtocolModule: Send + Sync {
     fn spawn(&self, io: ByteStream, ctx: ModuleCtx) -> BoxFuture<'_, anyhow::Result<()>>;
 }
 
-/// What the acceptor peeks before choosing a module.
+/// What the acceptor peeks before choosing a module. On an upgrade hand-off
+/// `from_upgrade` is `true` and `alpn` names the upgraded protocol
+/// (`"websocket"`).
+#[derive(Debug, Clone)]
 pub struct NextLayerHint {
     pub dst: SocketAddr,
     pub is_tls: bool,
@@ -57,6 +68,14 @@ pub struct ModuleCtx {
     store: Arc<dyn FlowStore>,
     sink: Arc<dyn EventSink>,
     connector: Arc<dyn UpstreamConnector>,
+    /// The registered modules, for upgrade re-dispatch.
+    modules: Arc<[Arc<dyn ProtocolModule>]>,
+    /// What the acceptor (or the handing-off module) peeked.
+    hint: Option<NextLayerHint>,
+    /// On an upgrade hand-off: the 101 handshake flow.
+    handshake: Option<FlowId>,
+    /// On an upgrade hand-off: the already-upgraded upstream stream, taken once.
+    upstream: Mutex<Option<ByteStream>>,
 }
 
 impl ModuleCtx {
@@ -70,7 +89,79 @@ impl ModuleCtx {
             store,
             sink,
             connector,
+            modules: Vec::new().into(),
+            hint: None,
+            handshake: None,
+            upstream: Mutex::new(None),
         }
+    }
+
+    /// Attach the registered modules so an upgrade can be re-dispatched.
+    pub fn with_modules(mut self, modules: Arc<[Arc<dyn ProtocolModule>]>) -> Self {
+        self.modules = modules;
+        self
+    }
+
+    /// Attach what the acceptor peeked about this connection.
+    pub fn with_hint(mut self, hint: NextLayerHint) -> Self {
+        self.hint = Some(hint);
+        self
+    }
+
+    /// A child context for the module taking over after an upgrade: same
+    /// services, plus the handshake flow and the already-open upstream stream.
+    pub fn for_upgrade(
+        &self,
+        handshake: FlowId,
+        upstream: ByteStream,
+        hint: NextLayerHint,
+    ) -> ModuleCtx {
+        ModuleCtx {
+            store: self.store.clone(),
+            sink: self.sink.clone(),
+            connector: self.connector.clone(),
+            modules: self.modules.clone(),
+            hint: Some(hint),
+            handshake: Some(handshake),
+            upstream: Mutex::new(Some(upstream)),
+        }
+    }
+
+    /// Hand an upgraded connection to the first registered module that claims
+    /// `hint` (which must have `from_upgrade == true`), spawning it with the
+    /// client stream and a child context carrying `handshake` and `upstream`.
+    pub fn handoff_upgrade(
+        &self,
+        io: ByteStream,
+        upstream: ByteStream,
+        handshake: FlowId,
+        hint: NextLayerHint,
+    ) -> BoxFuture<'_, anyhow::Result<()>> {
+        let protocol = hint.alpn.first().cloned().unwrap_or_default();
+        let module = self.modules.iter().find(|m| m.matches(&hint)).cloned();
+        let child = self.for_upgrade(handshake, upstream, hint);
+        Box::pin(async move {
+            let Some(module) = module else {
+                anyhow::bail!("no protocol module claims the {protocol:?} upgrade");
+            };
+            module.spawn(io, child).await
+        })
+    }
+
+    /// What was peeked about this connection, if the acceptor attached it.
+    pub fn hint(&self) -> Option<&NextLayerHint> {
+        self.hint.as_ref()
+    }
+
+    /// On an upgrade hand-off, the 101 handshake flow this connection continues.
+    pub fn handshake(&self) -> Option<FlowId> {
+        self.handshake
+    }
+
+    /// On an upgrade hand-off, the already-upgraded upstream stream. `None`
+    /// once taken or when this is not a hand-off.
+    pub fn take_upstream(&self) -> Option<ByteStream> {
+        self.upstream.lock().ok().and_then(|mut slot| slot.take())
     }
 
     /// The shared flow store.

@@ -28,7 +28,7 @@ struct ProxyInner {
     store: Arc<dyn FlowStore>,
     guard: Arc<dyn ScopeRateGuard>,
     chain: Arc<Chain>,
-    modules: Vec<Arc<dyn ProtocolModule>>,
+    modules: Arc<[Arc<dyn ProtocolModule>]>,
 }
 
 impl Proxy {
@@ -91,7 +91,9 @@ async fn handle_conn(
     let connector: Arc<dyn UpstreamConnector> = Arc::new(GuardedConnector {
         guard: inner.guard.clone(),
     });
-    let ctx = ModuleCtx::new(inner.store.clone(), inner.chain.clone(), connector);
+    let ctx = ModuleCtx::new(inner.store.clone(), inner.chain.clone(), connector)
+        .with_modules(inner.modules.clone())
+        .with_hint(hint);
     let io: ByteStream = Box::pin(stream);
     module.spawn(io, ctx).await
 }
@@ -162,7 +164,7 @@ impl ProxyBuilder {
                 store,
                 guard,
                 chain,
-                modules: self.modules,
+                modules: self.modules.into(),
             }),
         })
     }
