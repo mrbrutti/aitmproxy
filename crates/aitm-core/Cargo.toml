@@ -8,4 +8,5 @@ description = "Protocol-agnostic core: flow model, event/plugin chain, command r
 
 [dependencies]
 uuid.workspace = true
+indexmap.workspace = true
 tokio = { workspace = true, features = ["sync"] }

@@ -9,6 +9,7 @@ pub mod error;
 pub mod event;
 pub mod flow;
 pub mod header;
+pub mod store;
 
 pub use body::{Body, StreamBody};
 pub use error::{FlowError, GuardError};
@@ -18,6 +19,7 @@ pub use flow::{
     InterceptState, ResumeHandle, WsDir, WsFlow, WsMessage, WsOpcode,
 };
 pub use header::HeaderMap;
+pub use store::{FlowKind, FlowQuery, FlowStore, MemFlowStore};
 
 /// The crate version, wired to the Cargo package version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
