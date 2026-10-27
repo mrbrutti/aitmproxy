@@ -21,3 +21,6 @@ uuid.workspace = true
 aitm-proto-http.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
 tokio-tungstenite = "0.28"
+
+[lints]
+workspace = true

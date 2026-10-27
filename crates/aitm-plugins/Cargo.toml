@@ -11,3 +11,6 @@ aitm-core.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync"] }
+
+[lints]
+workspace = true

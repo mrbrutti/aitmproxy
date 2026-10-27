@@ -21,6 +21,11 @@ rust-version = "1.97"
 
 # Shared external dependency versions. Members opt in with `workspace = true`.
 # Concrete versions chosen within the stack in docs/research/03-rust-proxy-stack.md.
+[workspace.lints.rust]
+# No crate in this workspace needs `unsafe`; forbid it so a future one is a
+# deliberate, reviewed decision (platform spec unsafe policy).
+unsafe_code = "forbid"
+
 [workspace.dependencies]
 anyhow = "1"
 futures = "0.3"

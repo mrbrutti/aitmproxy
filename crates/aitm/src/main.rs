@@ -3,16 +3,19 @@
 //!
 //! Invoked with a subcommand (`aitm flow list`, `aitm scope add --host ex.test`)
 //! it dispatches once over the CLI frontend and exits. Invoked bare it starts the
-//! proxy accept loop and the MCP server (stdio or loopback-TCP per config). M1
-//! uses `Config::default()`; reading a config file is a later wave.
+//! proxy accept loop and the MCP server (stdio or loopback-TCP per config), with
+//! the embedded browser attached when Chromium is available. M1 uses
+//! `Config::default()`; reading a config file is a later wave.
 
 use std::sync::Arc;
 
 use aitm::wire::{build_proxy, TcpRequestSender};
-use aitm_core::{Config, PipelineClient, ProxyClient};
+use aitm_core::{BrowserDriver, Config, PipelineClient, ProxyClient};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_tracing();
+
     let cfg = Config::default();
     let proxy = build_proxy(&cfg)?;
 
@@ -28,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if !argv.is_empty() {
-        // One-shot CLI dispatch.
+        // One-shot CLI dispatch (no browser needed).
         let cli = aitm_cli::Cli::new(registry.clone()).with_services(
             store.clone(),
             client.clone(),
@@ -47,16 +50,36 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Otherwise, run the proxy accept loop alongside the MCP server.
-    let mcp = aitm_mcp::McpServer::new(registry, cfg.mcp.transport.clone()).with_services(
-        store, client, guard,
-        // The live browser driver attaches once Chromium is available (Task 29).
-        None,
-    );
+    // Server path: attach the embedded browser if Chromium is available, so the
+    // browser.* commands reach a live driver.
+    let browser: Option<Arc<dyn BrowserDriver>> = match aitm_browser::ChromeDriver::launch(
+        &cfg.browser,
+    )
+    .await
+    {
+        Ok(driver) => Some(Arc::new(driver)),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "embedded browser unavailable; browser.* commands will error until Chromium is installed"
+            );
+            None
+        }
+    };
+
+    let mcp = aitm_mcp::McpServer::new(registry, cfg.mcp.transport.clone())
+        .with_services(store, client, guard, browser);
 
     let listen = cfg.listen;
     tokio::select! {
         result = proxy.run(listen) => result,
         result = mcp.serve() => result,
     }
+}
+
+/// Install a tracing subscriber (RUST_LOG-driven, defaulting to `info`).
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = fmt().with_env_filter(filter).try_init();
 }

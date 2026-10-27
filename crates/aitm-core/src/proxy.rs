@@ -63,12 +63,21 @@ impl Proxy {
     /// Bind and run the accept loop until an unrecoverable error.
     pub async fn run(self, listen: SocketAddr) -> anyhow::Result<()> {
         let listener = TcpListener::bind(listen).await?;
+        tracing::info!(%listen, "proxy listening");
         let inner = self.inner;
         loop {
-            let (stream, peer) = listener.accept().await?;
+            let (stream, peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!(error = %e, "accept failed");
+                    continue;
+                }
+            };
             let inner = inner.clone();
             tokio::spawn(async move {
-                let _ = handle_conn(inner, stream, peer).await;
+                if let Err(e) = handle_conn(inner, stream, peer).await {
+                    tracing::warn!(%peer, error = %e, "connection handler ended with an error");
+                }
             });
         }
     }
@@ -93,12 +102,11 @@ async fn handle_conn(
     };
 
     let Some(module) = inner.modules.iter().find(|m| m.matches(&hint)).cloned() else {
+        tracing::debug!(%peer, "no protocol module claimed the connection");
         return Ok(());
     };
 
-    let connector: Arc<dyn UpstreamConnector> = Arc::new(GuardedConnector {
-        guard: inner.guard.clone(),
-    });
+    let connector: Arc<dyn UpstreamConnector> = Arc::new(PassiveConnector);
     let ctx = ModuleCtx::new(inner.store.clone(), inner.chain.clone(), connector)
         .with_modules(inner.modules.clone())
         .with_hint(hint);
@@ -106,16 +114,23 @@ async fn handle_conn(
     module.spawn(io, ctx).await
 }
 
-/// Opens upstream TCP streams after a scope/rate check.
-struct GuardedConnector {
-    guard: Arc<dyn ScopeRateGuard>,
-}
+/// Opens upstream TCP streams for **passive** proxied traffic. Passive capture
+/// is not gated by the scope allowlist (an intercepting proxy must relay what
+/// the client sends) and does not consume the active-action rate budget — scope
+/// and rate are enforced only on active reissue (`flow.replay`, `request.send`,
+/// `browser.navigate`, `poc.run`) by the command handlers / `PipelineClient`.
+///
+/// A bounded connect timeout keeps a dead upstream from pinning the connection.
+struct PassiveConnector;
 
-impl UpstreamConnector for GuardedConnector {
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl UpstreamConnector for PassiveConnector {
     fn connect(&self, dst: SocketAddr) -> BoxFuture<'_, anyhow::Result<ByteStream>> {
         Box::pin(async move {
-            let _permit = self.guard.check_active(&dst.ip().to_string())?;
-            let stream = TcpStream::connect(dst).await?;
+            let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(dst))
+                .await
+                .map_err(|_| anyhow::anyhow!("upstream connect to {dst} timed out"))??;
             let bs: ByteStream = Box::pin(stream);
             Ok(bs)
         })
