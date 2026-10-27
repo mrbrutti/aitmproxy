@@ -1,16 +1,30 @@
 //! The forked obscura engine as a managed child: finding the binary, probing
-//! that it is the aitmproxy fork, and building the exact `serve` command.
+//! that it is the aitmproxy fork, building the exact `serve` command, running
+//! the child from spawn to reap, and the `BrowserDriver` over it.
 //!
-//! Spec §D3 (discovery, probe) and §D4 (argv, environment). Starting and
-//! stopping the child, and the `BrowserDriver` over it, are Task 20.
+//! Spec §D3 (discovery, probe), §D4 (argv, environment, lifecycle) and §D5
+//! (`ObscuraDriver` over the shared CDP session).
 
+use std::collections::VecDeque;
+use std::future::Future;
+use std::io;
+use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use aitm_core::{BrowserConfig, ObscuraConfig};
+use aitm_core::{BrowserConfig, BrowserDriver, ClickTarget, NavOutcome, ObscuraConfig, Value};
 use anyhow::Context as _;
+use chromiumoxide::browser::Browser;
+use futures::future::BoxFuture;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
+use tracing::{debug, info, warn};
+
+use crate::driver::CdpSession;
 
 /// Environment variables removed from the child so its trust and routing are
 /// exactly what aitmproxy passes as flags, whatever the operator's shell carries.
@@ -31,6 +45,22 @@ pub const SCRUBBED_ENV: [&str; 11] = [
 /// Bound on each probe invocation (`--help`, `--version`): every subprocess is
 /// bounded, and a binary that hangs on `--help` is not one we want to serve.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often `start` and `stop` re-check the child.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Stderr lines kept for error reports.
+const STDERR_TAIL_LINES: usize = 50;
+
+/// How long `start` lets the stderr pump drain after the child exited early.
+const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The fork's CDP WebSocket path (`obscura serve` prints it when it listens).
+const CDP_WS_PATH: &str = "/devtools/browser";
+
+/// Ready-file name: `<prefix><aitm pid>-<cdp port><suffix>` under the OS temp dir.
+const READY_FILE_PREFIX: &str = "aitm-obscura-";
+const READY_FILE_SUFFIX: &str = ".ready";
 
 /// What the probe learned about the binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,7 +148,7 @@ async fn run_probe_flag(binary: &Path, flag: &str) -> anyhow::Result<String> {
                 binary.display()
             )
         })?
-        .with_context(|| format!("running {} {flag}", binary.display()))?;
+        .map_err(|err| spawn_error(err, binary))?;
 
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
@@ -131,15 +161,95 @@ fn scrub_env(cmd: &mut Command) {
     }
 }
 
+/// Turn a spawn failure into an operator-facing error. `EACCES` on a binary
+/// we found is a missing exec bit or macOS Gatekeeper quarantine (Review
+/// Focus #5), so the hint names both fixes.
+fn spawn_error(err: io::Error, binary: &Path) -> anyhow::Error {
+    if err.kind() == io::ErrorKind::PermissionDenied {
+        anyhow::anyhow!(
+            "{binary}: permission denied when running it ({err}); make it executable with \
+             `chmod +x {binary}` and, if it was downloaded on macOS, clear the quarantine with \
+             `xattr -d com.apple.quarantine {binary}`",
+            binary = binary.display()
+        )
+    } else {
+        anyhow::Error::new(err).context(format!("running {}", binary.display()))
+    }
+}
+
+/// `PATH` lookup for discovery: the first `<dir>/<name>` that is a file.
+fn lookup_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// A loopback port nothing listens on right now (bind-and-release).
+fn free_loopback_port() -> anyhow::Result<u16> {
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).context("picking a free loopback port")?;
+    Ok(listener.local_addr()?.port())
+}
+
+/// Log any ready-file an earlier `aitm` left behind (it was killed, so no
+/// destructor ran); the operator decides whether an obscura is still running.
+fn warn_stale_ready_files() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(READY_FILE_PREFIX) && name.ends_with(READY_FILE_SUFFIX) {
+            warn!(
+                path = %entry.path().display(),
+                "stale obscura ready-file from an earlier run; remove it if no obscura is running"
+            );
+        }
+    }
+}
+
+/// Remove the ready-file; a missing one is fine (idempotent).
+fn remove_ready_file(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => debug!(path = %path.display(), %err, "could not remove the obscura ready-file"),
+    }
+}
+
+/// Forward the child's lines to `tracing` at debug, keeping the last
+/// [`STDERR_TAIL_LINES`] in `tail` when given.
+async fn pump_lines<R: AsyncRead + Unpin>(
+    reader: R,
+    stream: &'static str,
+    tail: Option<Arc<Mutex<VecDeque<String>>>>,
+) {
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        debug!(target: "obscura", stream, "{line}");
+        if let Some(tail) = &tail {
+            if let Ok(mut tail) = tail.lock() {
+                if tail.len() == STDERR_TAIL_LINES {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+        }
+    }
+}
+
 /// A running `obscura serve` owned by one driver.
 pub struct ObscuraProcess {
-    // Populated by `start` (Task 20); `command` alone spawns nothing.
-    #[allow(dead_code)]
     child: Child,
-    #[allow(dead_code)]
+    /// The pid at spawn; `Child::id` is `None` once the child is reaped.
+    pid: u32,
     cdp_port: u16,
-    #[allow(dead_code)]
     ready_file: PathBuf,
+    spawned_at: Instant,
+    stop_timeout: Duration,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl ObscuraProcess {
@@ -153,6 +263,10 @@ impl ObscuraProcess {
         cdp_port: u16,
         ready_file: &Path,
     ) -> Command {
+        if !config.headless {
+            warn!("browser.headless = false is ignored: obscura has no head");
+        }
+
         let mut cmd = Command::new(binary);
         cmd.arg("serve")
             .args(["--host", "127.0.0.1"])
@@ -171,6 +285,323 @@ impl ObscuraProcess {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         scrub_env(&mut cmd);
+        // obscura takes its CDP bearer token from this variable, and
+        // chromiumoxide 0.9's `Browser::connect` cannot send a header, so an
+        // inherited token would only make every connect fail. The endpoint
+        // stays loopback-only; `start` logs that it is unauthenticated.
+        cmd.env_remove("OBSCURA_CDP_TOKEN");
         cmd
+    }
+
+    /// Discover and probe the binary, spawn `serve` on a free loopback port,
+    /// and wait — bounded by `start_timeout` — until it listens. Returns the
+    /// process and the CDP WebSocket URL to connect to.
+    pub async fn start(config: &BrowserConfig, ca_cert: &Path) -> anyhow::Result<(Self, String)> {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf));
+        let binary = discover_binary(
+            &config.obscura,
+            std::env::var_os("AITM_OBSCURA_BIN").map(PathBuf::from),
+            exe_dir.as_deref(),
+            &lookup_on_path,
+        )?;
+        let probed = probe(&binary).await?;
+        info!(binary = %binary.display(), version = %probed.version, "obscura probed");
+
+        warn_stale_ready_files();
+        let cdp_port = free_loopback_port()?;
+        let ready_file = std::env::temp_dir().join(format!(
+            "{READY_FILE_PREFIX}{}-{cdp_port}{READY_FILE_SUFFIX}",
+            std::process::id()
+        ));
+        // A leftover with this name would read as "ready" before the child is.
+        remove_ready_file(&ready_file);
+
+        let mut child = Self::command(config, &binary, ca_cert, cdp_port, &ready_file)
+            .spawn()
+            .map_err(|err| spawn_error(err, &binary))?;
+        let spawned_at = Instant::now();
+        let Some(pid) = child.id() else {
+            anyhow::bail!("obscura exited before its pid could be read");
+        };
+        info!(pid, port = cdp_port, "obscura started");
+        info!("CDP endpoint is loopback-only and unauthenticated");
+
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
+        let stderr_pump = child.stderr.take().map(|stderr| {
+            tokio::spawn(pump_lines(stderr, "stderr", Some(Arc::clone(&stderr_tail))))
+        });
+        if let Some(stdout) = child.stdout.take() {
+            tokio::spawn(pump_lines(stdout, "stdout", None));
+        }
+
+        let mut process = Self {
+            child,
+            pid,
+            cdp_port,
+            ready_file,
+            spawned_at,
+            stop_timeout: config.obscura.stop_timeout,
+            stderr_tail,
+        };
+        process
+            .wait_ready(config.obscura.start_timeout, stderr_pump)
+            .await?;
+        Ok((process, format!("ws://127.0.0.1:{cdp_port}{CDP_WS_PATH}")))
+    }
+
+    /// Poll until the ready-file appears or the CDP port accepts a connection,
+    /// whichever first; a child that exits first is an immediate error.
+    async fn wait_ready(
+        &mut self,
+        start_timeout: Duration,
+        stderr_pump: Option<JoinHandle<()>>,
+    ) -> anyhow::Result<()> {
+        let deadline = self.spawned_at + start_timeout;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                // Let the pump drain what the child wrote before it exited.
+                if let Some(pump) = stderr_pump {
+                    let _ = tokio::time::timeout(STDERR_DRAIN_TIMEOUT, pump).await;
+                }
+                anyhow::bail!(
+                    "obscura exited during startup with {status}: {}",
+                    self.stderr_tail_text()
+                );
+            }
+            if self.ready_file.exists()
+                || TcpStream::connect((Ipv4Addr::LOCALHOST, self.cdp_port))
+                    .await
+                    .is_ok()
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.start_kill();
+                anyhow::bail!(
+                    "obscura (pid {}) did not listen on port {} within {start_timeout:?}: {}",
+                    self.pid,
+                    self.cdp_port,
+                    self.stderr_tail_text()
+                );
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    fn stderr_tail_text(&self) -> String {
+        let tail = self
+            .stderr_tail
+            .lock()
+            .map(|tail| tail.iter().cloned().collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default();
+        if tail.is_empty() {
+            "(no stderr)".to_string()
+        } else {
+            tail
+        }
+    }
+
+    /// Time since the child was spawned, for callers that share `start_timeout`
+    /// with their own attach step.
+    pub(crate) fn since_spawn(&self) -> Duration {
+        self.spawned_at.elapsed()
+    }
+
+    /// The child's pid while it runs; `None` once it has been reaped.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    /// Reap the child if it has exited (sticky: keeps returning the status).
+    pub(crate) fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    /// Graceful stop: SIGTERM, poll up to `stop_timeout`, then SIGKILL; remove
+    /// the ready-file. A child that already exited is just reaped.
+    pub async fn stop(mut self) -> anyhow::Result<()> {
+        if self.child.try_wait()?.is_none() {
+            self.send_term();
+            let deadline = Instant::now() + self.stop_timeout;
+            while self.child.try_wait()?.is_none() {
+                if Instant::now() >= deadline {
+                    warn!(
+                        pid = self.pid,
+                        "obscura did not exit within {:?} of SIGTERM; killing it",
+                        self.stop_timeout
+                    );
+                    self.child.kill().await?;
+                    break;
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        }
+        info!(pid = self.pid, "obscura stopped");
+        remove_ready_file(&self.ready_file);
+        Ok(())
+    }
+
+    /// Ask the child to exit. No `libc`/`nix` in the tree: on Unix this is
+    /// `kill -TERM <pid>`; elsewhere the only signal available is the kill.
+    fn send_term(&mut self) {
+        #[cfg(unix)]
+        {
+            match std::process::Command::new("kill")
+                .args(["-TERM", &self.pid.to_string()])
+                .status()
+            {
+                Ok(status) if status.success() => {}
+                Ok(status) => debug!(pid = self.pid, %status, "kill -TERM did not succeed"),
+                Err(err) => debug!(pid = self.pid, %err, "kill -TERM could not run"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.start_kill();
+        }
+    }
+}
+
+impl Drop for ObscuraProcess {
+    /// `kill_on_drop` reaps the child; the ready-file is ours to remove.
+    fn drop(&mut self) {
+        remove_ready_file(&self.ready_file);
+    }
+}
+
+/// The forked obscura as the engine: a managed child and the CDP session over it.
+pub struct ObscuraDriver {
+    session: CdpSession,
+    /// `None` once `close` has stopped the child.
+    process: Mutex<Option<ObscuraProcess>>,
+}
+
+impl ObscuraDriver {
+    /// `ObscuraProcess::start`, then `Browser::connect` on its WebSocket URL,
+    /// the handler task, and one `about:blank` page — all within
+    /// `start_timeout` of the spawn. No `Security.setIgnoreCertificateErrors`:
+    /// trust comes from `--ca-cert`, and obscura would accept the call as a
+    /// no-op.
+    pub async fn launch(config: &BrowserConfig, ca_cert: &Path) -> anyhow::Result<Self> {
+        let (process, ws_url) = ObscuraProcess::start(config, ca_cert).await?;
+        let remaining = config
+            .obscura
+            .start_timeout
+            .saturating_sub(process.since_spawn());
+        let attached = tokio::time::timeout(remaining, async {
+            let (browser, handler) = Browser::connect(&ws_url)
+                .await
+                .with_context(|| format!("connecting to obscura CDP at {ws_url}"))?;
+            CdpSession::attach(browser, handler, config.nav_timeout).await
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "obscura CDP at {ws_url} was not attached within {:?} of spawn",
+                config.obscura.start_timeout
+            ))
+        });
+        let session = match attached {
+            Ok(session) => session,
+            Err(err) => {
+                if let Err(stop_err) = process.stop().await {
+                    debug!(%stop_err, "stopping obscura after a failed attach");
+                }
+                return Err(err);
+            }
+        };
+        info!(pid = process.pid, %ws_url, "obscura CDP attached");
+        Ok(Self {
+            session,
+            process: Mutex::new(Some(process)),
+        })
+    }
+
+    /// Graceful shutdown: CDP `Browser.close`, then SIGTERM, then SIGKILL after
+    /// `stop_timeout`. What `main` calls on shutdown.
+    pub async fn close(self) -> anyhow::Result<()> {
+        self.shutdown().await
+    }
+
+    /// The close path through a shared handle (`LaunchedBrowser`); idempotent.
+    pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
+        if let Err(err) = self.session.close().await {
+            debug!(%err, "CDP close failed; stopping the obscura child directly");
+        }
+        let process = self
+            .process
+            .lock()
+            .map_err(|_| anyhow::anyhow!("obscura process lock poisoned"))?
+            .take();
+        match process {
+            Some(process) => process.stop().await,
+            None => Ok(()),
+        }
+    }
+
+    /// The child's pid while it runs; `None` after `close` or once it is reaped.
+    pub fn pid(&self) -> Option<u32> {
+        self.process.lock().ok()?.as_ref()?.pid()
+    }
+
+    /// Dead-child detection (spec §D4): a child that exited is reported as
+    /// such, not as a broken socket.
+    fn ensure_alive(&self) -> anyhow::Result<()> {
+        let mut guard = self
+            .process
+            .lock()
+            .map_err(|_| anyhow::anyhow!("obscura process lock poisoned"))?;
+        let Some(process) = guard.as_mut() else {
+            anyhow::bail!("embedded browser (obscura) is closed");
+        };
+        match process.try_wait()? {
+            Some(status) => anyhow::bail!("embedded browser (obscura) exited with {status}"),
+            None => Ok(()),
+        }
+    }
+
+    /// Run one primitive with the child checked before, and again after a
+    /// failure: a child that died mid-call is the cause, not the socket.
+    async fn guarded<T>(&self, op: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+        self.ensure_alive()?;
+        match op.await {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                self.ensure_alive()?;
+                Err(err)
+            }
+        }
+    }
+}
+
+impl BrowserDriver for ObscuraDriver {
+    fn navigate(&self, url: &str) -> BoxFuture<'_, anyhow::Result<NavOutcome>> {
+        let url = url.to_string();
+        Box::pin(async move { self.guarded(self.session.navigate(&url)).await })
+    }
+
+    fn click(&self, target: ClickTarget) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(self.guarded(self.session.click(target)))
+    }
+
+    fn type_text(&self, selector: &str, text: &str) -> BoxFuture<'_, anyhow::Result<()>> {
+        let selector = selector.to_string();
+        let text = text.to_string();
+        Box::pin(async move { self.guarded(self.session.type_text(&selector, &text)).await })
+    }
+
+    fn screenshot(&self) -> BoxFuture<'_, anyhow::Result<Vec<u8>>> {
+        Box::pin(self.guarded(self.session.screenshot()))
+    }
+
+    fn eval(&self, expr: &str) -> BoxFuture<'_, anyhow::Result<Value>> {
+        let expr = expr.to_string();
+        Box::pin(async move { self.guarded(self.session.eval(&expr)).await })
+    }
+
+    fn get_dom(&self) -> BoxFuture<'_, anyhow::Result<String>> {
+        Box::pin(self.guarded(self.session.get_dom()))
     }
 }
