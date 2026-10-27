@@ -57,6 +57,10 @@ pub fn type_schema(ty: &TypeDesc) -> JsonValue {
         TypeDesc::FlowId => json!({"type": "string", "format": "uuid"}),
         TypeDesc::Array(item) => json!({"type": "array", "items": type_schema(item)}),
         TypeDesc::Object(defs) => object_schema(defs),
+        TypeDesc::Map(item) => json!({
+            "type": "object",
+            "additionalProperties": type_schema(item),
+        }),
         TypeDesc::Any => json!({}),
     }
 }

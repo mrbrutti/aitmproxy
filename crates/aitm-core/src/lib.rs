@@ -4,6 +4,7 @@
 //! registry, the flow store, the scope/rate guard, and the proxy acceptor. Every
 //! other crate in the workspace depends on this one.
 
+pub mod authority;
 pub mod body;
 pub mod chain;
 pub mod client;
@@ -23,6 +24,7 @@ pub mod store;
 pub mod stream;
 pub mod value;
 
+pub use authority::{Authority, AuthorityError};
 pub use body::{Body, StreamBody};
 pub use chain::Chain;
 pub use client::{PipelineClient, RequestSender};
@@ -39,7 +41,7 @@ pub use flow::{
     InterceptState, ResumeHandle, WsDir, WsFlow, WsMessage, WsOpcode,
 };
 pub use guard::{classify_host, ActionPermit, HostClass, ScopeRateGuard, StdGuard};
-pub use header::HeaderMap;
+pub use header::{HeaderError, HeaderMap};
 pub use plugin::Plugin;
 pub use protocol::{EventSink, ModuleCtx, NextLayerHint, ProtocolModule, UpstreamConnector};
 pub use proxy::{Proxy, ProxyBuilder};

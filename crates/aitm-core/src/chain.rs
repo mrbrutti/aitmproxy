@@ -42,10 +42,15 @@ impl Chain {
             let mut ctx = FlowCtx::new(&mut flow);
             let mut verdict = Verdict::Continue;
             for plugin in self.registry.plugins() {
-                let v = match plugin.lock() {
-                    Ok(mut p) => p.on_event(&ev, &mut ctx),
-                    Err(_) => Verdict::Continue,
-                };
+                // Recover a poisoned plugin lock rather than silently skipping the
+                // plugin: a prior panic must not quietly drop a security plugin
+                // (scope, intercept) from the chain.
+                let mut p = plugin.lock().unwrap_or_else(|poisoned| {
+                    tracing::warn!("plugin lock was poisoned; recovering and continuing dispatch");
+                    poisoned.into_inner()
+                });
+                let v = p.on_event(&ev, &mut ctx);
+                drop(p);
                 if matches!(v, Verdict::Halt) {
                     verdict = Verdict::Halt;
                     break;

@@ -254,7 +254,9 @@ fn build_request(
 
     let mut headers = HeaderMap::new();
     for (name, value) in &http.headers {
-        headers.set(&tmpl.render(name, live)?, &tmpl.render(value, live)?);
+        headers
+            .try_set(&tmpl.render(name, live)?, &tmpl.render(value, live)?)
+            .map_err(|e| anyhow::anyhow!("poc.run: http step header: {e}"))?;
     }
 
     let body = match &http.body {
@@ -455,7 +457,7 @@ impl Command for PocRunCommand {
                 },
                 ParamDef {
                     name: "vars".to_string(),
-                    ty: TypeDesc::Object(Vec::new()),
+                    ty: TypeDesc::Map(Box::new(TypeDesc::Any)),
                     required: false,
                     description: "Additional variable bindings (name → value).".to_string(),
                 },

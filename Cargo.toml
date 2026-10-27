@@ -26,6 +26,7 @@ anyhow = "1"
 futures = "0.3"
 indexmap = "2"
 tokio = "1"
+tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 # Internal crates, referenced by path so the workspace builds in-tree.

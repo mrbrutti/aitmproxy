@@ -5,10 +5,11 @@
 //! protocol modules, plugins, and command handlers can all reach it behind a
 //! shared reference.
 
-use std::sync::RwLock;
+use std::sync::{PoisonError, RwLock};
 
 use indexmap::IndexMap;
 
+use crate::authority::Authority;
 use crate::flow::{Flow, FlowId};
 
 /// A shared, queryable store of captured flows.
@@ -43,28 +44,44 @@ pub enum FlowKind {
     WebSocket,
 }
 
-/// The default in-memory flow store.
-#[derive(Default)]
+/// How many flows the default store keeps before evicting the oldest.
+pub const DEFAULT_MAX_FLOWS: usize = 50_000;
+
+/// The default in-memory flow store. Bounded: once `capacity` flows are held, a
+/// new insertion evicts the oldest (FIFO) so a long-running proxy cannot grow
+/// without limit.
 pub struct MemFlowStore {
     flows: RwLock<IndexMap<FlowId, Flow>>,
+    capacity: usize,
 }
 
-impl MemFlowStore {
-    /// An empty store.
-    pub fn new() -> Self {
-        Self::default()
+impl Default for MemFlowStore {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_MAX_FLOWS)
     }
 }
 
-/// The host portion of an `authority` (`host[:port]`), without the port.
-fn authority_host(authority: &str) -> &str {
-    // IPv6 literals are bracketed (`[::1]:443`); split on the last colon only
-    // when it is not inside brackets. Hosts in M1 are plain names or IPv4.
-    match authority.rsplit_once(':') {
-        Some((host, port)) if !host.contains(':') && port.chars().all(|c| c.is_ascii_digit()) => {
-            host
+impl MemFlowStore {
+    /// An empty store bounded at [`DEFAULT_MAX_FLOWS`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// An empty store bounded at `capacity` flows (0 means unbounded).
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            flows: RwLock::new(IndexMap::new()),
+            capacity,
         }
-        _ => authority,
+    }
+}
+
+/// The host portion of an `authority` (`host[:port]`), without the port, folded
+/// to lowercase — parsed through [`Authority`] so IPv6 and ports are uniform.
+fn authority_host(authority: &str) -> String {
+    match Authority::parse_with_default(authority, 0) {
+        Ok(a) => a.host,
+        Err(_) => authority.to_ascii_lowercase(),
     }
 }
 
@@ -91,7 +108,10 @@ fn matches(flow: &Flow, q: &FlowQuery) -> bool {
     match flow {
         Flow::Http(f) => {
             if let Some(host) = &q.host {
-                if authority_host(&f.request.authority) != host && &f.request.authority != host {
+                let want = host.to_ascii_lowercase();
+                if authority_host(&f.request.authority) != want
+                    && f.request.authority.to_ascii_lowercase() != want
+                {
                     return false;
                 }
             }
@@ -119,39 +139,49 @@ fn matches(flow: &Flow, q: &FlowQuery) -> bool {
 impl FlowStore for MemFlowStore {
     fn insert(&self, flow: Flow) -> FlowId {
         let id = flow.id();
-        if let Ok(mut flows) = self.flows.write() {
-            flows.insert(id, flow);
+        let mut flows = self.flows.write().unwrap_or_else(PoisonError::into_inner);
+        flows.insert(id, flow);
+        // Bound memory: evict the oldest flows once over capacity. Re-inserting
+        // an existing id updates in place and does not grow the map.
+        if self.capacity > 0 {
+            while flows.len() > self.capacity {
+                flows.shift_remove_index(0);
+            }
         }
         id
     }
 
     fn get(&self, id: FlowId) -> Option<Flow> {
-        self.flows.read().ok()?.get(&id).cloned()
+        self.flows
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+            .cloned()
     }
 
     fn update(&self, id: FlowId, f: &mut dyn FnMut(&mut Flow)) {
-        if let Ok(mut flows) = self.flows.write() {
-            if let Some(flow) = flows.get_mut(&id) {
-                f(flow);
-            }
+        let mut flows = self.flows.write().unwrap_or_else(PoisonError::into_inner);
+        if let Some(flow) = flows.get_mut(&id) {
+            f(flow);
         }
     }
 
     fn list(&self) -> Vec<FlowId> {
-        match self.flows.read() {
-            Ok(flows) => flows.keys().copied().collect(),
-            Err(_) => Vec::new(),
-        }
+        self.flows
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect()
     }
 
     fn query(&self, q: &FlowQuery) -> Vec<FlowId> {
-        match self.flows.read() {
-            Ok(flows) => flows
-                .iter()
-                .filter(|(_, flow)| matches(flow, q))
-                .map(|(id, _)| *id)
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+        self.flows
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(_, flow)| matches(flow, q))
+            .map(|(id, _)| *id)
+            .collect()
     }
 }

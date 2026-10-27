@@ -83,6 +83,17 @@ pub fn from_json(j: &JsonValue, ty: &TypeDesc) -> anyhow::Result<Value> {
                 .ok_or_else(|| anyhow::anyhow!("expected an object, got {j}"))?;
             object_from_json(fields, defs, "object").map(Value::Object)
         }
+        TypeDesc::Map(item) => {
+            let fields = j
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("expected an object, got {j}"))?;
+            let mut out = BTreeMap::new();
+            for (k, v) in fields {
+                let value = from_json(v, item).map_err(|e| anyhow::anyhow!("`{k}`: {e}"))?;
+                out.insert(k.clone(), value);
+            }
+            Ok(Value::Object(out))
+        }
         TypeDesc::Any => Ok(any_from_json(j)),
     }
 }

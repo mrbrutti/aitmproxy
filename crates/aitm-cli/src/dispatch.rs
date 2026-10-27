@@ -216,7 +216,7 @@ fn parse_value(raw: &str, ty: &TypeDesc) -> anyhow::Result<Value> {
                 .map_err(|e| anyhow::anyhow!("not a valid flow id: {e}"))?;
             Ok(Value::Str(raw.to_string()))
         }
-        TypeDesc::Array(_) | TypeDesc::Object(_) => {
+        TypeDesc::Array(_) | TypeDesc::Object(_) | TypeDesc::Map(_) => {
             let json: JsonValue = serde_json::from_str(raw)
                 .map_err(|e| anyhow::anyhow!("expected JSON for this flag ({e})"))?;
             json_to_value(&json, ty)
@@ -289,6 +289,17 @@ fn json_to_value(j: &JsonValue, ty: &TypeDesc) -> anyhow::Result<Value> {
             }
             Ok(Value::Object(out))
         }
+        TypeDesc::Map(item) => {
+            let fields = j
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("expected an object, got {j}"))?;
+            let mut out = BTreeMap::new();
+            for (k, v) in fields {
+                let value = json_to_value(v, item).map_err(|e| anyhow::anyhow!("`{k}`: {e}"))?;
+                out.insert(k.clone(), value);
+            }
+            Ok(Value::Object(out))
+        }
         TypeDesc::Any => Ok(any_from_json(j)),
     }
 }
@@ -322,7 +333,7 @@ fn type_hint(ty: &TypeDesc) -> &'static str {
         TypeDesc::Bytes => "text",
         TypeDesc::FlowId => "flow-id",
         TypeDesc::Array(_) => "json-array",
-        TypeDesc::Object(_) => "json-object",
+        TypeDesc::Object(_) | TypeDesc::Map(_) => "json-object",
         TypeDesc::Any => "value",
     }
 }

@@ -12,6 +12,10 @@ futures.workspace = true
 uuid.workspace = true
 indexmap.workspace = true
 tokio = { workspace = true, features = ["sync", "io-util", "net", "rt", "time"] }
+tracing.workspace = true
+# Per-user config dir for the CA material, so the key is never written into the
+# launch directory where another process could read or plant it.
+dirs = "5"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

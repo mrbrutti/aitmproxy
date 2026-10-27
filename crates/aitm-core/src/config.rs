@@ -18,6 +18,10 @@ pub struct Config {
     pub ca: CaConfig,
     pub mcp: McpConfig,
     pub browser: BrowserConfig,
+    /// Skip verification of upstream server certificates. **Off by default**:
+    /// the proxy verifies upstream TLS against the platform roots. Turning this
+    /// on (for a lab with self-signed targets) trusts any upstream certificate.
+    pub ssl_insecure: bool,
 }
 
 impl Default for Config {
@@ -29,6 +33,7 @@ impl Default for Config {
             ca: CaConfig::default(),
             mcp: McpConfig::default(),
             browser: BrowserConfig::default(),
+            ssl_insecure: false,
         }
     }
 }
@@ -54,6 +59,10 @@ pub struct LimitConfig {
     /// A host is disabled after this many errors.
     pub host_error_budget: u32,
     pub backoff: BackoffConfig,
+    /// Cap on a single message body (request served, or captured response copy).
+    /// Larger bodies are refused (requests) or truncated in the stored copy
+    /// (responses) so a hostile peer cannot exhaust memory. Default 10 MiB.
+    pub max_body_bytes: usize,
 }
 
 impl Default for LimitConfig {
@@ -64,6 +73,7 @@ impl Default for LimitConfig {
             max_concurrency: 25,
             host_error_budget: 10,
             backoff: BackoffConfig::default(),
+            max_body_bytes: 10 * 1024 * 1024,
         }
     }
 }
@@ -98,10 +108,20 @@ pub struct CaConfig {
 impl Default for CaConfig {
     fn default() -> Self {
         Self {
-            dir: PathBuf::from(".aitm/ca"),
+            dir: default_ca_dir(),
             key_mode: 0o600,
         }
     }
+}
+
+/// The per-user CA directory (`$XDG_CONFIG_HOME/aitmproxy/ca` or the platform
+/// equivalent), so the key is not written into whatever directory the proxy was
+/// launched from where another process could read or plant it. Falls back to a
+/// local hidden dir when no config dir is discoverable.
+fn default_ca_dir() -> PathBuf {
+    dirs::config_dir()
+        .map(|d| d.join("aitmproxy").join("ca"))
+        .unwrap_or_else(|| PathBuf::from(".aitm/ca"))
 }
 
 /// MCP transport selection.

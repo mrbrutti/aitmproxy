@@ -8,9 +8,10 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::authority::Authority;
 use crate::config::{LimitConfig, ScopeEntry};
 use crate::error::GuardError;
 
@@ -91,24 +92,70 @@ fn host_without_port(host: &str) -> Option<&str> {
 fn classify_ip(ip: IpAddr) -> HostClass {
     match ip {
         IpAddr::V4(v4) => {
+            let o = v4.octets();
             if v4.is_loopback() {
                 HostClass::Loopback
-            } else if v4.is_private() || v4.is_link_local() || v4.is_unspecified() {
+            } else if v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                // "This host on this network" (0.0.0.0/8).
+                || o[0] == 0
+                // Carrier-grade NAT (100.64.0.0/10).
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+                // IETF protocol assignments (192.0.0.0/24).
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                // Benchmarking (198.18.0.0/15).
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                // Multicast + reserved + broadcast (224.0.0.0/3).
+                || o[0] >= 224
+            {
                 HostClass::Private
             } else {
                 HostClass::Public
             }
         }
         IpAddr::V6(v6) => {
+            // NAT64 well-known prefix 64:ff9b::/96 carries an embedded v4.
+            let seg = v6.segments();
+            if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6] == [0, 0, 0, 0] {
+                let o = v6.octets();
+                return classify_ip(IpAddr::V4(std::net::Ipv4Addr::new(
+                    o[12], o[13], o[14], o[15],
+                )));
+            }
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return classify_ip(IpAddr::V4(v4));
             }
-            let seg0 = v6.segments()[0];
+            // Deprecated IPv4-compatible ::a.b.c.d (not ::/::1).
+            if seg[0..6] == [0, 0, 0, 0, 0, 0] && !(seg[6] == 0 && (seg[7] == 0 || seg[7] == 1)) {
+                let o = v6.octets();
+                return classify_ip(IpAddr::V4(std::net::Ipv4Addr::new(
+                    o[12], o[13], o[14], o[15],
+                )));
+            }
+            let seg0 = seg[0];
             let is_ula = (seg0 & 0xfe00) == 0xfc00;
             let is_link_local = (seg0 & 0xffc0) == 0xfe80;
+            // Site-local fec0::/10 (deprecated) and multicast ff00::/8.
+            let is_site_local = (seg0 & 0xffc0) == 0xfec0;
+            let is_multicast = (seg0 & 0xff00) == 0xff00;
+            // 6to4 2002::/16 and Teredo 2001:0000::/32 embed a v4 relay/address.
+            if seg0 == 0x2002 {
+                return classify_ip(IpAddr::V4(std::net::Ipv4Addr::new(
+                    (seg[1] >> 8) as u8,
+                    (seg[1] & 0xff) as u8,
+                    (seg[2] >> 8) as u8,
+                    (seg[2] & 0xff) as u8,
+                )));
+            }
             if v6.is_loopback() {
                 HostClass::Loopback
-            } else if v6.is_unspecified() || is_ula || is_link_local {
+            } else if v6.is_unspecified()
+                || is_ula
+                || is_link_local
+                || is_site_local
+                || is_multicast
+            {
                 HostClass::Private
             } else {
                 HostClass::Public
@@ -191,34 +238,44 @@ impl StdGuard {
     /// buckets are reset so the new rate takes effect immediately.
     pub fn set_per_host_rps(&self, rps: u32) {
         self.per_host_rps.store(rps, Ordering::SeqCst);
-        if let Ok(mut buckets) = self.host_buckets.lock() {
-            buckets.clear();
-        }
+        self.host_buckets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 
     /// Record an error against a host; once the budget is exhausted the host is
     /// disabled and `check_active` refuses it with `HostDisabled`.
     pub fn record_error(&self, host: &str) {
-        if let Ok(mut errors) = self.host_errors.lock() {
-            *errors.entry(host.to_string()).or_insert(0) += 1;
-        }
+        *self
+            .host_errors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(host.to_string())
+            .or_insert(0) += 1;
     }
 
     fn in_scope(&self, host: &str) -> bool {
-        match self.scope.read() {
-            Ok(entries) => entries.iter().any(|e| host_in_scope(host, &e.host)),
-            Err(_) => false,
-        }
+        // Recover from a poisoned lock rather than silently refusing/allowing:
+        // deny-by-default still holds, every entry is still consulted.
+        self.scope
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|e| host_in_scope(host, &e.host))
     }
 
     fn is_disabled(&self, host: &str) -> bool {
         if self.host_error_budget == 0 {
             return false;
         }
-        match self.host_errors.lock() {
-            Ok(errors) => errors.get(host).copied().unwrap_or(0) >= self.host_error_budget,
-            Err(_) => false,
-        }
+        self.host_errors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(host)
+            .copied()
+            .unwrap_or(0)
+            >= self.host_error_budget
     }
 }
 
@@ -228,30 +285,14 @@ impl Default for StdGuard {
     }
 }
 
-/// Whether `host` falls under scope entry `entry` (exact, `host:port`, wildcard).
+/// Whether `host` (`host` or `host:port`) falls under scope entry `entry`
+/// (exact, `host:port`, or `*.wildcard`). Parsing goes through [`Authority`] so
+/// IPv6 and ports fold the same way the rest of the system keys on a target.
 fn host_in_scope(host: &str, entry: &str) -> bool {
-    let host = host.to_ascii_lowercase();
-    let entry = entry.to_ascii_lowercase();
-    if entry == host {
-        return true;
+    match Authority::parse_with_default(host, 0) {
+        Ok(a) => a.matches_scope_entry(entry),
+        Err(_) => false,
     }
-    // A portless entry matches a `host:port` request on the same host.
-    if let Some((h, p)) = host.rsplit_once(':') {
-        if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() && entry == h {
-            return true;
-        }
-    }
-    // `*.domain` matches the domain and any subdomain.
-    if let Some(suffix) = entry.strip_prefix("*.") {
-        let hp = host
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(host.as_str());
-        if hp == suffix || hp.ends_with(&format!(".{suffix}")) {
-            return true;
-        }
-    }
-    false
 }
 
 impl ScopeRateGuard for StdGuard {
@@ -263,16 +304,31 @@ impl ScopeRateGuard for StdGuard {
             return Err(GuardError::HostDisabled);
         }
 
-        // Global then per-host rate.
-        if let Ok(mut bucket) = self.global_bucket.lock() {
+        // Global then per-host rate. A poisoned bucket lock is recovered (its
+        // data is still valid) so a panic elsewhere cannot disable throttling.
+        {
+            let mut bucket = self
+                .global_bucket
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             if !bucket.try_take() {
                 return Err(GuardError::RateLimited {
                     retry_after: bucket.retry_after(),
                 });
             }
         }
-        if let Ok(mut buckets) = self.host_buckets.lock() {
+        {
             let rps = self.per_host_rps.load(Ordering::SeqCst);
+            // A zero per-host budget means refuse, not "one per second".
+            if rps == 0 {
+                return Err(GuardError::RateLimited {
+                    retry_after: Duration::from_secs(1),
+                });
+            }
+            let mut buckets = self
+                .host_buckets
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             let bucket = buckets
                 .entry(host.to_string())
                 .or_insert_with(|| TokenBucket::new(rps));
@@ -304,12 +360,16 @@ impl ScopeRateGuard for StdGuard {
     }
 
     fn add_scope(&self, entry: ScopeEntry) {
-        if let Ok(mut scope) = self.scope.write() {
-            scope.push(entry);
-        }
+        self.scope
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(entry);
     }
 
     fn list_scope(&self) -> Vec<ScopeEntry> {
-        self.scope.read().map(|s| s.clone()).unwrap_or_default()
+        self.scope
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }

@@ -63,7 +63,7 @@ fn request_fields(all_required_authority: bool) -> Vec<ParamDef> {
         field("path", TypeDesc::Str, false, "Request path and query."),
         field(
             "headers",
-            TypeDesc::Object(vec![]),
+            TypeDesc::Map(Box::new(TypeDesc::Str)),
             false,
             "Header name→value; each replaces any existing header of that name.",
         ),
@@ -94,8 +94,13 @@ fn apply_edits(
                     anyhow::bail!("edit `headers` must be an object, got {val:?}");
                 };
                 for (name, hval) in headers {
+                    let value = as_str(name, hval)?;
+                    // Validate before mutating so a CRLF-injected value is refused
+                    // and leaves the stored request unchanged.
                     req.headers.remove(name);
-                    req.headers.set(name, as_str(name, hval)?);
+                    req.headers
+                        .try_set(name, value)
+                        .map_err(|e| anyhow::anyhow!("edit `headers`: {e}"))?;
                 }
             }
             other => anyhow::bail!("unknown edit key `{other}`"),

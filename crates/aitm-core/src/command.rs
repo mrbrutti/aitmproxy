@@ -15,7 +15,11 @@ pub enum TypeDesc {
     Bytes,
     FlowId,
     Array(Box<TypeDesc>),
+    /// A fixed set of named fields.
     Object(Vec<ParamDef>),
+    /// A free-form string-keyed map whose values all share one type
+    /// (`headers: Map(Str)`, `vars: Map(Any)`).
+    Map(Box<TypeDesc>),
     Any,
 }
 
