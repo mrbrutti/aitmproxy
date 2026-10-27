@@ -401,11 +401,89 @@ Each task below marks **Independent:** with its parallel group.
 
 ## Review log
 
-Kept by the main session during stage 6. One row per finding.
+Kept by the main session during stage 6. One row per finding. The integrated-M1
+panel (security + quality + spec reviewers) returned FAIL; the fix-and-harden
+pass below was approved by Matt 2026-10-27.
 
-| Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
-|---|---|---|---|---|
+| Area | Severity | Finding | Disposition |
+|---|---|---|---|
+| Reconcile R1 | Critical | Passive capture was scope-gated at the upstream connector (keyed on IP), breaking capture and conflating passive with active | Fixed in `b0384b3`: `PassiveConnector` does not run `check_active`; scope/rate stay on active reissue. Data-flow 1 reconciled in the platform spec. |
+| Reconcile R2 | Important | Matcher model had no `part`, so `word`/`regex` could not target headers (AC-L5, Example 3) | Fixed in `8a7d003`: `Assertion::Word/Regex` carry `MatchPart{Body,Header,All}`; serde + matcher updated; spec/model reconciled. |
+| Reconcile R3 | Critical | Upstream TLS accepted any certificate (`AcceptAnyServerCert` always) | Fixed in `cec3818`: verify against webpki roots by default; `Config.ssl_insecure` / `HttpModule::with_insecure` opt-out. Spec Security + Config reconciled. |
+| Correctness | Critical | Scope key mismatch (IP vs authority; divergent host:port parses) | Fixed in `f77335e`: shared `aitm_core::Authority`; guard + store key on it; `scope.add host:port` now admits navigation. |
+| Correctness | Important | No `TypeDesc::Map`, so `flow.mutate`/`poc.run` maps failed over MCP/CLI | Fixed in `f77335e`: `TypeDesc::Map(Box<TypeDesc>)` + frontend conversion; `headers` is `Map(Str)`, `vars` is `Map(Any)`. Proven in `5229e09`. |
+| Correctness | Important | Browser not wired into the binary | Fixed in `b0384b3`: `main` launches `ChromeDriver` (best effort) and attaches it via `with_services`. |
+| Correctness | Important | Lock poisoning silently disabled scope/rate or dropped a plugin | Fixed in `f77335e`: guard, store, chain recover with `PoisonError::into_inner`; chain logs. |
+| Correctness | Important | PoC matcher/DSL errors became `false` (bad artifact ran) | Fixed in `05eefaf`: `precheck` compiles every regex and parses every DSL (`dsl::check`) before any request. |
+| Security | Critical | Header CRLF injection via header edits | Fixed in `f77335e`: `HeaderMap::try_set` rejects CR/LF/NUL/whitespace; mutate + runner route through it. Proven in `5229e09`. |
+| Security | Important | `classify_ip` range gaps (CGNAT, 0/8, 198.18/15, 224/3, v6 NAT64/6to4/site-local/…) | Fixed in `f77335e`. |
+| Security | Important | PoC file trust (arbitrary load, path, serde leakage) | Fixed in `05eefaf`: `.yaml` only, no symlink, `schema::validate`, content-free errors, id regex; size cap in `6eb662f`. |
+| Security | Important | CA written to the launch directory | Fixed in `f77335e`: default CA dir is the per-user config dir. (Load-time owner/mode check + explicit validity dates: deferred, see Follow-ups.) |
+| Security | Important | PoC artifacts world-readable; credentials baked into built PoCs | Fixed in `6eb662f`: artifacts `0700`/`0600`; `poc.build` redacts Cookie/Authorization/Proxy-Authorization/X-API-Key to required `{{var}}`. |
+| Security | Important | Unbounded buffers (flow store, request sender) | Fixed: store bounded (`f77335e`), sender read capped (`6eb662f`), `LimitConfig.max_body_bytes` added (`f77335e`). Enforcement in the proto-http serve path + WS reassembly: deferred, see Follow-ups. |
+| Security | Minor | serde_yaml billion-laughs | Fixed in `6eb662f`: 1 MiB PoC size cap + `validate` before typed deserialize. |
+| Robustness | Important | Silent error discards; no logging | Fixed in `b0384b3`: `tracing` at the accept/handler/poison points; `tracing-subscriber` in `main`. (Protocol-module error→`Event::Error` mapping, CDP loop, transport: deferred.) |
+| Robustness | Important | `per_host_rps == 0` throttled at 1 rps instead of refusing | Fixed in `f77335e`. |
+| Robustness | Minor | No `forbid(unsafe_code)` | Fixed in `b0384b3`: `unsafe_code = "forbid"` workspace-wide. |
+| Tests | Important | AC7 exact 18-tool set unproven; frontends stubbed | Fixed in `5229e09`: `tools/list` exact-18 + `flow.mutate` map round-trip over MCP and CLI + CRLF refusal + `poc.run` vars coercion. |
+
+### Deferred (tracked in Follow-ups, approved 2026-10-27)
+
+Rate-limit double-count + real-client test rewrites; the binary's Http1/TLS
+request sender; browser-origin SSRF at the connector + `poc.run` navigate SSRF;
+error taxonomy / `record_error` / backoff / host-disable; parked-flow leak on
+client EOF; AC13 field preservation (info/http-step extras); CA load-time
+permission checks + validity dates; proto-http/WS body-cap enforcement;
+exact-count test tightening.
 
 ## Shipped
 
 What merged, what was cut, follow-ups. Filled at stage 7.
+
+## Follow-ups
+
+Tracked work the fix-and-harden pass deferred (approved 2026-10-27). Each is a
+correctness/security/robustness item, not pure cosmetics.
+
+- **Rate-limit single chokepoint + real-client tests.** Drop the command-side
+  `check_active` in `replay.rs`/`mutate.rs`/`runner.rs` (the `PipelineClient`
+  already guards), drop the runner's redundant re-insert, and rewrite the
+  replay/mutate/scope tests to drive the real `PipelineClient` against a local
+  server instead of stub clients. (Coupled: removing the command-side check
+  requires the tests to stop using non-guarding stub clients.)
+- **Binary Http1/TLS request sender.** Replace `aitm/src/wire.rs`
+  `TcpRequestSender`/`parse_response` with `aitm-proto-http`'s `Http1Machine` +
+  a TLS connector: chunked decoding, no duplicate `Content-Length`/
+  `Transfer-Encoding`, real TLS for `https`, connect/read timeouts.
+- **Browser-origin SSRF at the connector.** Give the embedded browser its own
+  proxy listener/port (or peer match) so the upstream connector can enforce
+  `SsrfPolicy` on browser-originated connections (redirects, page `fetch`,
+  sub-resources, `browser.eval`), closing the gap the per-navigation `check_url`
+  does not cover. Thread the authority through `UpstreamConnector::connect`.
+- **poc.run navigate SSRF.** Run the SSRF classifier before `check_active` in the
+  runner's browser step (needs `SsrfPolicy` on the run path), parsing with
+  `url::Url`.
+- **Error taxonomy + host-disable + backoff.** Map protocol failures to
+  `FlowError` + `Event::Error`, call `guard.record_error` on upstream failure/5xx,
+  and implement the `BackoffConfig` timer so `HostDisabled` becomes live.
+- **Parked-flow leak.** In the chain, select on client EOF/timeout while a flow
+  is intercepted and drop the parked entry on disconnect.
+- **AC13 field preservation.** Now that `part`/matchers are modeled (R2), stop
+  dropping `PocInfo` (description/author/metadata) and `HttpStep`
+  (matchers/matchers-condition/raw/path) fields; round-trip them.
+- **CA load-time hardening.** On load, refuse/warn if the key is not owned by the
+  current uid or is group/other-accessible; set explicit validity (root ~10y,
+  leaf ≤398d).
+- **Body-cap enforcement.** Enforce `LimitConfig.max_body_bytes` in the
+  proto-http serve path (request served, captured response copy — truncate +
+  mark `FlowMeta`) and bound WS fragment reassembly to a per-flow ring.
+- **Test tightening.** Replace `>= 1` refusal assertions with exact counts where
+  deterministic.
+
+### Deferred cosmetic (no security/correctness angle)
+
+JSON→Value converter dedup (3→1), base64 dedup (2→1), `ParamDef` constructor
+helpers, a `test-support` feature, the `serve()` refactor, `Flow` helper methods,
+`HeaderMap::set`→`append` rename, `NextLayerHint.dst`→`peer` rename, CLI
+Debug→JSON output, workspace-dep `workspace=true` hygiene, `Body::Streamed`
+naming, `Proxy` API noise, `McpServer` Mutex, tautological-test deletion.

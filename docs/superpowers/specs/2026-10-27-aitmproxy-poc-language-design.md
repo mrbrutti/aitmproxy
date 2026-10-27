@@ -202,8 +202,8 @@ reusable by a future scanner plugin — platform spec). Maps to `aitm-poc::Asser
 | `type` | Payload | `Assertion` variant |
 |---|---|---|
 | `status` | int | `Status(u16)` |
-| `word` | string(s), `encoding: hex?` | `Word(String)` |
-| `regex` | pattern(s) | `Regex(String)` |
+| `word` | string(s), `encoding: hex?`, `part` | `Word { word, part }` |
+| `regex` | pattern(s), `part` | `Regex { regex, part }` |
 | `size` | int (content length) | via `Dsl` |
 | `binary` | hex byte signature | via `Dsl`/`Word` hex |
 | `dsl` | expression(s) over `status_code`, `body`, `all_headers`, `content_length`, extracted vars | `Dsl(String)` |
