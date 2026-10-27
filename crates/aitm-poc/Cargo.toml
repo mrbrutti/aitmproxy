@@ -9,6 +9,7 @@ description = "Reproducible-PoC engine: artifact model, YAML serde, templating, 
 [dependencies]
 aitm-core.workspace = true
 aitm-browser.workspace = true
+anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 regex = "1"
