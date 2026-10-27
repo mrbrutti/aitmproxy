@@ -233,13 +233,23 @@ impl StdPocRunner {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        // The id is validated by `precheck` before this runs, so it is a safe
-        // single path component.
         // The configured output root is trusted; create it if missing.
         std::fs::create_dir_all(&self.out_dir)?;
-        let dir = self.out_dir.join(format!("aitm-poc-{}-{}", poc.id, nanos));
         // Create the per-run dir *atomically* owner-only, failing if it exists, so
         // a pre-created world-readable dir or a planted symlink can't be reused.
+        // The name is made collision-proof — pid + a process-wide counter, not just
+        // the timestamp — so two concurrent runs of the same PoC id never clash on
+        // the fail-if-exists create. `poc.id` is `precheck`-validated (safe single
+        // path component).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = self.out_dir.join(format!(
+            "aitm-poc-{}-{}-{}-{}",
+            poc.id,
+            std::process::id(),
+            seq,
+            nanos
+        ));
         create_private_dir(&dir)?;
 
         let poc_path = dir.join(format!("{}.poc.yaml", poc.id));
@@ -618,6 +628,26 @@ impl Command for PocRunCommand {
         match path.extension().and_then(|e| e.to_str()) {
             Some("yaml") | Some("yml") => {}
             _ => anyhow::bail!("poc.run: `{poc_path}` must be a .yaml file"),
+        }
+        // Opt-in confinement: when a PoC directory is configured, the file must
+        // resolve (canonicalized, so `..` and symlinks are followed) to a path
+        // under it. Unconfigured (`None`) loads from any path, as before.
+        if let Some(root) = host.poc_dir() {
+            let canon_root = root.canonicalize().map_err(|e| {
+                anyhow::anyhow!(
+                    "poc.run: PoC dir `{}` is not accessible: {e}",
+                    root.display()
+                )
+            })?;
+            let canon_path = path
+                .canonicalize()
+                .map_err(|e| anyhow::anyhow!("poc.run: cannot resolve `{poc_path}`: {e}"))?;
+            if !canon_path.starts_with(&canon_root) {
+                anyhow::bail!(
+                    "poc.run: `{poc_path}` is outside the configured PoC directory `{}`",
+                    root.display()
+                );
+            }
         }
         // Open with `O_NOFOLLOW` so a symlink at the final component fails to open,
         // then stat and read the *opened handle* — closing the stat/open TOCTOU

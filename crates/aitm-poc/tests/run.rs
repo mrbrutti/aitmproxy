@@ -390,3 +390,51 @@ fn poc_run_refuses_a_symlinked_poc_file() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Opt-in PoC-dir confinement: with a configured dir, a PoC file outside it is
+/// refused (bails before any network). Unconfigured, loading is unconstrained.
+#[cfg(unix)]
+#[test]
+fn poc_run_confines_to_configured_dir() {
+    use aitm_core::{Command, HttpFlow, Params};
+
+    struct NoClient;
+    impl aitm_core::ProxyClient for NoClient {
+        fn send(&self, _req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+            Box::pin(async { anyhow::bail!("unused") })
+        }
+    }
+
+    let base = std::env::temp_dir().join(format!("aitm-poc-confine-{}", std::process::id()));
+    let inside = base.join("pocs");
+    std::fs::create_dir_all(&inside).expect("mkdir inside");
+    let outside = base.join("outside.yaml");
+    std::fs::write(
+        &outside,
+        "id: demo\ninfo:\n  name: n\nsteps: []\nsuccess:\n  all: []\n",
+    )
+    .expect("write outside");
+
+    let store = MemFlowStore::new();
+    let client = NoClient;
+    let guard = StdGuard::default();
+    let host = CommandHost::new(&store, &client, &guard, None).with_poc_dir(Some(inside.clone()));
+
+    let args = Params::new(
+        [(
+            "poc_path".to_string(),
+            Value::Str(outside.display().to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let err = PocRunCommand
+        .invoke(args, &host)
+        .expect_err("a PoC outside the configured dir must be refused");
+    assert!(
+        err.to_string()
+            .contains("outside the configured PoC directory"),
+        "want a confinement refusal, got: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}

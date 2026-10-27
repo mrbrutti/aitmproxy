@@ -55,6 +55,7 @@ pub struct CommandHost<'a> {
     guard: &'a dyn ScopeRateGuard,
     browser: Option<&'a dyn BrowserDriver>,
     ssrf: crate::config::SsrfPolicy,
+    poc_dir: Option<std::path::PathBuf>,
 }
 
 impl<'a> CommandHost<'a> {
@@ -74,12 +75,20 @@ impl<'a> CommandHost<'a> {
             guard,
             browser,
             ssrf: crate::config::SsrfPolicy::default(),
+            poc_dir: None,
         }
     }
 
     /// Use the configured SSRF policy instead of the default.
     pub fn with_ssrf(mut self, policy: crate::config::SsrfPolicy) -> Self {
         self.ssrf = policy;
+        self
+    }
+
+    /// Confine `poc.run` to loading PoC files under `dir` (opt-in). `None` leaves
+    /// loading unconfined (the default).
+    pub fn with_poc_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.poc_dir = dir;
         self
     }
 
@@ -98,6 +107,10 @@ impl<'a> CommandHost<'a> {
     /// The configured SSRF policy (defaults to deny-by-default).
     pub fn ssrf_policy(&self) -> &crate::config::SsrfPolicy {
         &self.ssrf
+    }
+    /// The configured PoC directory confinement, if any (`None` = unconfined).
+    pub fn poc_dir(&self) -> Option<&std::path::Path> {
+        self.poc_dir.as_deref()
     }
 }
 

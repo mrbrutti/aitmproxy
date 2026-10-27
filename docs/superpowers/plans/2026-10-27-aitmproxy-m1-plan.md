@@ -453,16 +453,15 @@ gaps. All addressed below (TDD, full gate green):
 | SSRF (consistency) | Important | `poc.run` navigate used `SsrfPolicy::default()`, and `check_url` compared scope as raw strings (inconsistent with the connector's `Authority` fold, e.g. `[::1]:3000`) | Fixed in `eba16eb` + `026adef`: `CommandHost` carries the configured policy (threaded from the MCP/CLI frontends); `check_url` delegates to `aitm_core::ssrf_check` per resolved address. `[::1]:3000` consistency tested. |
 | SSRF (classifier) | Important | `classify_ip` gaps: IPv4 TEST-NET docs, IPv6 doc `2001:db8::/32`, Teredo `2001::/32`, NAT64 local-use `64:ff9b:1::/48` | Fixed in `8afc25c`; the Teredo comment now matches the code. Tested. |
 | Artifacts | Important | Artifact dir/files created then chmod'd (race): a pre-created world-readable dir or planted symlink could be reused | Fixed in `026adef`: `DirBuilder::mode(0o700).create` (fail-if-exists) + `create_new`/`0600` files. |
-| PoC path | Important | `poc_path` stat/open symlink TOCTOU | Fixed in `026adef`: `O_NOFOLLOW` open + stat/read on the handle. Symlink refusal tested. **Deferred (product decision):** confining under a *configured* PoC dir — no such config exists and mandating one changes the load-by-path workflow. |
+| PoC path | Important | `poc_path` stat/open symlink TOCTOU; no confinement | Fixed in `026adef` (`O_NOFOLLOW` open + stat/read on the handle; symlink refusal tested) and the opt-in confinement follow-up: a `PocConfig.dir` (`None` = unconfined, the default; `Some(root)` = canonicalize + `starts_with`), threaded through `CommandHost` from the MCP/CLI frontends. Not mandatory, so the load-any-`.yaml`-by-path workflow is preserved. Outside-dir refusal tested; the per-run artifact dir name was also made collision-proof (pid + counter) for the fail-if-exists create. |
 | CA hygiene | Important | CA key stat/read TOCTOU; dir not `0700`; CWD-relative fallback dir | Fixed in `81c1488`: `O_NOFOLLOW` open + fstat mode check; dir `0700`; key `create_new`; default dir falls back to `$HOME/.aitm/ca`. Symlinked-key refusal tested. |
 | Resource bound | Important | Store bounded on count only; no byte budget; unbounded `serve` reads | Fixed in `81c1488`: resident-byte budget (`max_flow_bytes`, 512 MiB default) tracked across insert/update and evicted oldest-first; each socket read bounded by a 30s idle timeout; oversized request → 413 + close immediately. Byte-eviction + update-growth tested. |
 
 ### Deferred (tracked in Follow-ups, approved 2026-10-27)
 
-CA key owner-uid check (needs a non-`unsafe` getuid). Confining `poc.run`'s
-`poc_path` under a configured PoC directory (needs a new config field + a default;
-a product decision, since mandating it changes the load-any-`.yaml`-by-path
-workflow). (Error-taxonomy mapping is wired at the main upstream-failure point;
+CA key owner-uid check (needs a non-`unsafe` getuid). (PoC-path confinement is now
+done as opt-in `PocConfig.dir`, so it is no longer deferred.) (Error-taxonomy
+mapping is wired at the main upstream-failure point;
 extending `Event::Error` to every module failure path, and evaluating per-step
 matchers, are incremental.)
 

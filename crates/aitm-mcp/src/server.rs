@@ -49,6 +49,7 @@ pub struct McpServer {
     services: Option<Services>,
     on_bound: Mutex<Option<OnBound>>,
     ssrf: SsrfPolicy,
+    poc_dir: Option<std::path::PathBuf>,
 }
 
 /// A JSON-RPC level failure (as opposed to a tool's own error result).
@@ -76,6 +77,7 @@ impl McpServer {
             services: None,
             on_bound: Mutex::new(None),
             ssrf: SsrfPolicy::default(),
+            poc_dir: None,
         }
     }
 
@@ -84,6 +86,12 @@ impl McpServer {
     /// silently falling back to the default.
     pub fn with_ssrf_policy(mut self, policy: SsrfPolicy) -> Self {
         self.ssrf = policy;
+        self
+    }
+
+    /// Confine `poc.run` to PoC files under `dir` (opt-in; `None` = unconfined).
+    pub fn with_poc_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.poc_dir = dir;
         self
     }
 
@@ -123,6 +131,7 @@ impl McpServer {
             services,
             on_bound,
             ssrf,
+            poc_dir,
         } = self;
         let on_bound = on_bound.into_inner().unwrap_or(None);
         let server = Arc::new(McpServer {
@@ -131,6 +140,7 @@ impl McpServer {
             services,
             on_bound: Mutex::new(None),
             ssrf,
+            poc_dir,
         });
         match selected {
             McpTransport::Stdio => transport::serve_stdio(server).await,
@@ -256,7 +266,8 @@ impl McpServer {
             services.guard.as_ref(),
             services.browser.as_deref(),
         )
-        .with_ssrf(self.ssrf.clone());
+        .with_ssrf(self.ssrf.clone())
+        .with_poc_dir(self.poc_dir.clone());
         Ok(match cmd.invoke(args, &host) {
             Ok(value) => {
                 let structured = to_json(&value);

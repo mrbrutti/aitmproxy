@@ -18,6 +18,7 @@ pub struct Config {
     pub ca: CaConfig,
     pub mcp: McpConfig,
     pub browser: BrowserConfig,
+    pub poc: PocConfig,
     /// Skip verification of upstream server certificates. **Off by default**:
     /// the proxy verifies upstream TLS against the platform roots. Turning this
     /// on (for a lab with self-signed targets) trusts any upstream certificate.
@@ -40,11 +41,21 @@ impl Default for Config {
             ca: CaConfig::default(),
             mcp: McpConfig::default(),
             browser: BrowserConfig::default(),
+            poc: PocConfig::default(),
             ssl_insecure: false,
             max_flows: crate::store::DEFAULT_MAX_FLOWS,
             max_flow_bytes: crate::store::DEFAULT_MAX_FLOW_BYTES,
         }
     }
+}
+
+/// PoC-engine configuration.
+#[derive(Debug, Clone, Default)]
+pub struct PocConfig {
+    /// When set, `poc.run` only loads a PoC file that resolves (canonicalized)
+    /// to a path under this directory. `None` (the default) imposes no
+    /// confinement — a PoC may be loaded from any path, as before.
+    pub dir: Option<PathBuf>,
 }
 
 /// Scope configuration. Deny-by-default: an empty list means nothing is active.

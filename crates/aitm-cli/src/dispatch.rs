@@ -28,6 +28,7 @@ pub struct Cli {
     registry: Arc<Registry>,
     services: Option<Services>,
     ssrf: SsrfPolicy,
+    poc_dir: Option<std::path::PathBuf>,
 }
 
 impl Cli {
@@ -38,6 +39,7 @@ impl Cli {
             registry,
             services: None,
             ssrf: SsrfPolicy::default(),
+            poc_dir: None,
         }
     }
 
@@ -45,6 +47,12 @@ impl Cli {
     /// runner's browser navigation matches the connector.
     pub fn with_ssrf_policy(mut self, policy: SsrfPolicy) -> Self {
         self.ssrf = policy;
+        self
+    }
+
+    /// Confine `poc.run` to PoC files under `dir` (opt-in; `None` = unconfined).
+    pub fn with_poc_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.poc_dir = dir;
         self
     }
 
@@ -79,7 +87,8 @@ impl Cli {
             services.guard.as_ref(),
             services.browser.as_deref(),
         )
-        .with_ssrf(self.ssrf.clone());
+        .with_ssrf(self.ssrf.clone())
+        .with_poc_dir(self.poc_dir.clone());
         cmd.invoke(args, &host)
     }
 
