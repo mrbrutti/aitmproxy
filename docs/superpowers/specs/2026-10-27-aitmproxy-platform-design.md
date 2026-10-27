@@ -492,8 +492,25 @@ pub trait ProxyClient: Send + Sync {
 
 ### Protocol-module seam
 
+**Trait placement (accepted structuring call, orchestrator 2026-10-27).** The
+protocol-seam traits and types below — `ProtocolModule`, `NextLayerHint`,
+`ModuleCtx`, `ByteStream`, `AsyncReadWrite` — are **defined in `aitm-core`**,
+because `aitm-core`'s public surface names them (`ProxyBuilder::register_module(
+Arc<dyn ProtocolModule>)`, and `CommandHost`/`ModuleCtx`) and `aitm-core` cannot
+depend on crates that depend on it (cargo rejects the cycle). `aitm-plugin`
+**re-exports** them (`pub use aitm_core::{ProtocolModule, NextLayerHint,
+ModuleCtx, ByteStream, AsyncReadWrite};`), so it remains the public authoring
+surface and both documented import paths keep working — `aitm_core::Proxy::
+builder().register_module(...)` (platform Example 1) and `use
+aitm_plugin::ProtocolModule` (plugin-system Example 2 and the proto crates).
+This is a reconciliation within the design: no behavior, scope, or signature
+changes. **Governing rule:** any trait or type named by the `aitm-core` public
+surface (`CommandHost`, `ModuleCtx`, `ProxyBuilder`, `Config`) is defined in
+`aitm-core`; concrete implementations live in their own crates; `aitm-plugin`
+re-exports the protocol seam.
+
 ```rust
-// aitm-plugin — the protocol seam and what a module is handed
+// defined in aitm-core; re-exported by aitm-plugin — the protocol seam and what a module is handed
 
 pub trait ProtocolModule: Send + Sync {
     /// Stable id: "http", "ws", later "l4".
@@ -536,6 +553,26 @@ pub type ByteStream = Pin<Box<dyn AsyncReadWrite + Send>>;
 - `aitm-proto-l4` (roadmap) implements the **same trait** over `pnet`/`pcap` or
   TPROXY/nfqueue, enabling dual-layer testing (fuzz one target at L7 and L4). The
   seam exists in M1; the module does not.
+
+**Upgrade handoff (accepted structuring call, resolved during implementation,
+approved by orchestrator 2026-10-27).** After `HttpModule` MITMs an HTTP 101
+upgrade there are two already-upgraded live byte streams, but `spawn(io, ctx)`
+otherwise only lets a module dial a *fresh* upstream via
+`ModuleCtx::connect_upstream`, and `ModuleCtx` cannot carry the handshake
+`FlowId` the `WsFlow` must link to. `ModuleCtx` therefore gains an additive
+upgrade-handoff construction path — `ModuleCtx::for_upgrade(handshake: FlowId,
+upstream: ByteStream, hint: NextLayerHint)` — plus accessors
+`handshake() -> Option<FlowId>`, `take_upstream() -> Option<ByteStream>`, and
+`hint() -> &NextLayerHint`. The core acceptor **re-dispatches** after an upgrade
+(mitmproxy `next_layer` style): `HttpModule` signals the upgrade, the core
+builds the upgrade `ModuleCtx` and calls the matching `ProtocolModule`
+(`WsModule`, whose `matches()` is true with `from_upgrade = true`) via its
+existing `spawn`; `WsModule` links `WsFlow.handshake` from `handshake()` and
+takes the already-upgraded stream with `take_upstream()` instead of dialing a
+new one with `connect_upstream()`. There is no direct `aitm-proto-http` →
+`aitm-proto-ws` crate edge — the core mediates. The public
+`ProtocolModule::spawn` signature is unchanged; this is additive and a
+reconciliation within the design, with no behavior or scope change.
 
 #### `aitm-proto-http`: TLS MITM + sans-IO HTTP
 
@@ -755,6 +792,27 @@ impl Cli {
 }
 ```
 
+**Frontends receive the core service handles via an additive builder; the
+declared `McpServer::new`/`Cli::new` signatures are unchanged (accepted
+structuring call, resolved during implementation, approved by orchestrator
+2026-10-27).** A `Registry` alone cannot answer `tools/call` / `dispatch`:
+`Command::invoke(args, &CommandHost)` needs a `CommandHost`, which carries the
+flow store, proxy client, scope/rate guard, and (optional) browser — none of
+which a `Registry` holds. So `McpServer` and `Cli` each gain an additive
+builder method
+
+```rust
+fn with_services(self, store: Arc<dyn FlowStore>, client: Arc<dyn ProxyClient>,
+                 guard: Arc<dyn ScopeRateGuard>, browser: Option<Arc<dyn BrowserDriver>>) -> Self;
+```
+
+These handles are exactly what `Proxy::store()/client()/guard()/browser()`
+already provide; at invoke time the frontend builds a `CommandHost` from them
+and passes it to `Command::invoke`. If `with_services` was not called, an
+invoke returns a clear error. `tools/list` and schema derivation never need
+services. This is a reconciliation within the design: additive only, no
+behavior or signature change to `new`.
+
 ### Embedded headless browser (`aitm-browser`)
 
 - **chromiumoxide in-process over CDP (Architect's call)** — the lean path for a
@@ -770,8 +828,17 @@ impl Cli {
 - **SSRF/private-IP guard:** navigations resolve DNS and are checked against the
   scope + a private/loopback denylist before loading (decided posture below).
 
+**Trait placement (accepted structuring call, orchestrator 2026-10-27).** The
+browser-seam trait and types the `aitm-core` surface names — `BrowserDriver`
+(returned by `CommandHost::browser() -> Option<&dyn BrowserDriver>`) plus
+`ClickTarget`, `NavOutcome`, `BrowserConfig` (held by `Config.browser`), and
+`SsrfPolicy` — are **defined in `aitm-core`**, for the same cycle reason as the
+protocol seam (per the governing rule above). The concrete chromiumoxide
+implementation of `BrowserDriver` and the `SsrfGuard` stay in `aitm-browser`.
+No behavior, scope, or signature change; documented import paths are preserved.
+
 ```rust
-// aitm-browser — the driver trait, config, and SSRF guard
+// trait + config types defined in aitm-core; chromiumoxide impl in aitm-browser
 
 pub trait BrowserDriver: Send + Sync {
     fn navigate(&self, url: &str) -> BoxFuture<'_, Result<NavOutcome>>;
@@ -1558,3 +1625,41 @@ itself** — none of which may require editing the core.
     reflected-XSS **vulnerable + patched** test target is an M1 deliverable; the
     broad agent-driven multi-vuln site is a later-milestone product goal with its
     own exit test.
+17. **Seam-trait placement (accepted structuring call, resolved during
+    implementation, approved by orchestrator 2026-10-27).** Any trait or type
+    named by the `aitm-core` public surface is **defined in `aitm-core`**, because
+    `aitm-core` cannot depend on crates that depend on it (cargo rejects the
+    cycle). The protocol seam (`ProtocolModule`, `NextLayerHint`, `ModuleCtx`,
+    `ByteStream`, `AsyncReadWrite`) and the browser seam (`BrowserDriver`,
+    `ClickTarget`, `NavOutcome`, `BrowserConfig`, `SsrfPolicy`) are therefore
+    defined in `aitm-core`; concrete impls live in their own crates (`aitm-proto-*`,
+    `aitm-browser`), and `aitm-plugin` **re-exports** the protocol seam so it stays
+    the public authoring surface. A reconciliation within the design: no behavior,
+    scope, or signature change; all documented import paths still work.
+18. **Frontend service handles via an additive `with_services(...)` builder
+    (accepted structuring call, resolved during implementation, approved by
+    orchestrator 2026-10-27).** `McpServer::new(Arc<Registry>, McpTransport)` and
+    `Cli::new(Arc<Registry>)` receive only a `Registry`, but `tools/call` /
+    `dispatch` must build a `CommandHost` to call `Command::invoke`, and a
+    `CommandHost` needs the flow store, proxy client, scope/rate guard, and
+    optional browser. Both frontends therefore gain `with_services(self, store:
+    Arc<dyn FlowStore>, client: Arc<dyn ProxyClient>, guard: Arc<dyn
+    ScopeRateGuard>, browser: Option<Arc<dyn BrowserDriver>>) -> Self`, fed from
+    `Proxy::store()/client()/guard()/browser()`; the frontend builds a
+    `CommandHost` per invoke, and an invoke without `with_services` returns a
+    clear error. The declared `new` signatures are unchanged — additive only, no
+    behavior/scope/signature change.
+19. **Protocol-module upgrade handoff (accepted structuring call, resolved
+    during implementation, approved by orchestrator 2026-10-27).** A WebSocket
+    101 upgrade produces two already-upgraded live streams, but `spawn(io, ctx)`
+    only lets a module dial a fresh upstream via `ModuleCtx::connect_upstream`,
+    and `ModuleCtx` cannot carry the handshake `FlowId` the `WsFlow` links to.
+    `ModuleCtx` therefore gains an additive `for_upgrade(handshake: FlowId,
+    upstream: ByteStream, hint: NextLayerHint)` constructor plus `handshake() ->
+    Option<FlowId>`, `take_upstream() -> Option<ByteStream>`, and `hint() ->
+    &NextLayerHint`; the core re-dispatches an upgrade to the matching module
+    (mitmproxy `next_layer` style), which takes the existing upstream stream with
+    `take_upstream()` rather than dialing a new one. No `aitm-proto-http` →
+    `aitm-proto-ws` crate edge — the core mediates. The public
+    `ProtocolModule::spawn` signature is unchanged; additive only, no
+    behavior/scope/signature change.
