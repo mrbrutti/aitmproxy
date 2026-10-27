@@ -11,6 +11,7 @@ pub mod extract;
 pub mod matcher;
 pub mod model;
 pub mod schema;
+pub mod template;
 
 pub use extract::{run_extractors, Extraction, Extractor, ExtractorKind};
 pub use matcher::{evaluate, MatchContext};
@@ -19,3 +20,4 @@ pub use model::{
     Severity, Step, Variable,
 };
 pub use schema::{validate, PocError};
+pub use template::{PocTemplate, Template, VarBindings};
