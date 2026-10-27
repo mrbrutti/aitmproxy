@@ -492,8 +492,25 @@ pub trait ProxyClient: Send + Sync {
 
 ### Protocol-module seam
 
+**Trait placement (accepted structuring call, orchestrator 2026-10-27).** The
+protocol-seam traits and types below — `ProtocolModule`, `NextLayerHint`,
+`ModuleCtx`, `ByteStream`, `AsyncReadWrite` — are **defined in `aitm-core`**,
+because `aitm-core`'s public surface names them (`ProxyBuilder::register_module(
+Arc<dyn ProtocolModule>)`, and `CommandHost`/`ModuleCtx`) and `aitm-core` cannot
+depend on crates that depend on it (cargo rejects the cycle). `aitm-plugin`
+**re-exports** them (`pub use aitm_core::{ProtocolModule, NextLayerHint,
+ModuleCtx, ByteStream, AsyncReadWrite};`), so it remains the public authoring
+surface and both documented import paths keep working — `aitm_core::Proxy::
+builder().register_module(...)` (platform Example 1) and `use
+aitm_plugin::ProtocolModule` (plugin-system Example 2 and the proto crates).
+This is a reconciliation within the design: no behavior, scope, or signature
+changes. **Governing rule:** any trait or type named by the `aitm-core` public
+surface (`CommandHost`, `ModuleCtx`, `ProxyBuilder`, `Config`) is defined in
+`aitm-core`; concrete implementations live in their own crates; `aitm-plugin`
+re-exports the protocol seam.
+
 ```rust
-// aitm-plugin — the protocol seam and what a module is handed
+// defined in aitm-core; re-exported by aitm-plugin — the protocol seam and what a module is handed
 
 pub trait ProtocolModule: Send + Sync {
     /// Stable id: "http", "ws", later "l4".
@@ -770,8 +787,17 @@ impl Cli {
 - **SSRF/private-IP guard:** navigations resolve DNS and are checked against the
   scope + a private/loopback denylist before loading (decided posture below).
 
+**Trait placement (accepted structuring call, orchestrator 2026-10-27).** The
+browser-seam trait and types the `aitm-core` surface names — `BrowserDriver`
+(returned by `CommandHost::browser() -> Option<&dyn BrowserDriver>`) plus
+`ClickTarget`, `NavOutcome`, `BrowserConfig` (held by `Config.browser`), and
+`SsrfPolicy` — are **defined in `aitm-core`**, for the same cycle reason as the
+protocol seam (per the governing rule above). The concrete chromiumoxide
+implementation of `BrowserDriver` and the `SsrfGuard` stay in `aitm-browser`.
+No behavior, scope, or signature change; documented import paths are preserved.
+
 ```rust
-// aitm-browser — the driver trait, config, and SSRF guard
+// trait + config types defined in aitm-core; chromiumoxide impl in aitm-browser
 
 pub trait BrowserDriver: Send + Sync {
     fn navigate(&self, url: &str) -> BoxFuture<'_, Result<NavOutcome>>;
@@ -1558,3 +1584,14 @@ itself** — none of which may require editing the core.
     reflected-XSS **vulnerable + patched** test target is an M1 deliverable; the
     broad agent-driven multi-vuln site is a later-milestone product goal with its
     own exit test.
+17. **Seam-trait placement (accepted structuring call, resolved during
+    implementation, approved by orchestrator 2026-10-27).** Any trait or type
+    named by the `aitm-core` public surface is **defined in `aitm-core`**, because
+    `aitm-core` cannot depend on crates that depend on it (cargo rejects the
+    cycle). The protocol seam (`ProtocolModule`, `NextLayerHint`, `ModuleCtx`,
+    `ByteStream`, `AsyncReadWrite`) and the browser seam (`BrowserDriver`,
+    `ClickTarget`, `NavOutcome`, `BrowserConfig`, `SsrfPolicy`) are therefore
+    defined in `aitm-core`; concrete impls live in their own crates (`aitm-proto-*`,
+    `aitm-browser`), and `aitm-plugin` **re-exports** the protocol seam so it stays
+    the public authoring surface. A reconciliation within the design: no behavior,
+    scope, or signature change; all documented import paths still work.

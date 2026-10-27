@@ -166,7 +166,14 @@ Uses the platform spec's `Plugin`, `ProtocolModule`, and `Command` traits verbat
   its behavior with **no core edit** (the proof the seam is real).
 - **Protocol modules** are authored the same way via `ProtocolModule` (`id`,
   `matches(&NextLayerHint)`, `spawn`), so a new protocol is a new crate + a
-  registration call. L4 is the roadmap example behind the same trait.
+  registration call. L4 is the roadmap example behind the same trait. The
+  protocol-seam traits (`ProtocolModule`, `NextLayerHint`, `ModuleCtx`,
+  `ByteStream`, `AsyncReadWrite`) are **defined in `aitm-core` and re-exported by
+  `aitm-plugin`** (accepted structuring call, orchestrator 2026-10-27:
+  `aitm-core`'s public surface names them, so they cannot live in a crate that
+  depends on `aitm-core`). The **authoring import path is unchanged** —
+  `use aitm_plugin::ProtocolModule` still works via the re-export — and
+  `aitm-plugin` remains the public authoring surface.
 - **Options.** A plugin declares typed options at `load` (name, default,
   description), settable from config/CLI and readable at event time. (Exact
   `Registry` option API is a small addition the builder makes to the platform
@@ -486,6 +493,9 @@ impl ProtocolModule for FooModule {
 
 Demonstrates: the full `ProtocolModule` surface a contributor implements to add a
 protocol in a new crate, registration-only, with no core change (the protocol seam).
+(The `use aitm_plugin::{...}` path is a re-export: these traits are defined in
+`aitm-core` and re-exported by `aitm-plugin` — see the Tier 1 note above — so this
+import is unchanged.)
 
 ### Example 3 — Rhai scripting plugin, same job (M2 tier)
 
