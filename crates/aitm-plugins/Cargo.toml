@@ -10,4 +10,4 @@ description = "First-party feature plugins: capture, replay, intercept, mutate, 
 aitm-core.workspace = true
 anyhow.workspace = true
 futures.workspace = true
-tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync"] }

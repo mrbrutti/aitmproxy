@@ -2,9 +2,11 @@
 //! mutate, scope, rate-limit). Each registers its own commands; none lives in core.
 
 pub mod capture;
+pub mod intercept;
 pub mod replay;
 
 pub use capture::CapturePlugin;
+pub use intercept::InterceptPlugin;
 pub use replay::ReplayPlugin;
 
 /// Drive a future to completion from a synchronous `Command::invoke`.
