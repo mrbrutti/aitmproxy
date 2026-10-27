@@ -73,6 +73,27 @@ fn refuses_a_group_readable_key() {
     );
 }
 
+/// A CA key that is a symlink is refused: the loader opens with `O_NOFOLLOW`, so
+/// it won't follow a planted link to an arbitrary file.
+#[cfg(unix)]
+#[test]
+fn refuses_a_symlinked_key() {
+    let dir = temp_dir();
+    CertAuthority::load_or_generate(&dir, 0o600).expect("generate root");
+    let key_path = dir.join("ca.key");
+    // Move the real key aside and point `ca.key` at it via a symlink.
+    let real = dir.join("ca.key.real");
+    std::fs::rename(&key_path, &real).expect("rename key");
+    std::os::unix::fs::symlink(&real, &key_path).expect("symlink key");
+    let err = CertAuthority::load_or_generate(&dir, 0o600)
+        .err()
+        .expect("a symlinked CA key must be refused");
+    assert!(
+        err.to_string().contains("open CA key"),
+        "error must be an open refusal, got: {err}"
+    );
+}
+
 #[test]
 fn load_reuses_persisted_root() {
     let dir = temp_dir();

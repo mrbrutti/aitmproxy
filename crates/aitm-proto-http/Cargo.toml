@@ -28,6 +28,10 @@ tracing.workspace = true
 # Sniffing the upstream leaf's CN/SANs before minting an impersonating leaf.
 x509-parser = "0.18"
 
+# Unix-only: the `O_NOFOLLOW` constant for a TOCTOU-safe CA-key open (no unsafe).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 uuid.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

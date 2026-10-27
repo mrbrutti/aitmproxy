@@ -40,6 +40,12 @@ const TLS_HANDSHAKE: u8 = 0x16;
 const MAX_CONNECT_HEAD: usize = 16 * 1024;
 /// Socket read size.
 const READ_CHUNK: usize = 16 * 1024;
+
+/// Per-read idle timeout. A single socket read may block at most this long, so a
+/// slow client (slowloris) or a hung upstream cannot hold a connection open
+/// indefinitely. It resets each read, so a legitimately slow large transfer that
+/// keeps delivering chunks is unaffected.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Request-line prefixes that mark a cleartext HTTP connection.
 const HTTP_METHODS: &[&str] = &[
     "GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "PATCH ", "CONNECT ", "TRACE ",
@@ -425,10 +431,19 @@ async fn serve(
                     | HttpSansIoEvent::ResponseComplete(_) => {}
                 }
             }
-            if complete {
+            if complete || request_oversized {
+                // Stop reading the moment the body exceeds the cap: respond 413 and
+                // close immediately rather than draining the rest of the request.
                 break;
             }
-            let n = client.read(&mut buf).await?;
+            let n = match tokio::time::timeout(READ_TIMEOUT, client.read(&mut buf)).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    // Idle too long between bytes (slowloris): drop the connection.
+                    let _ = client.shutdown().await;
+                    return Ok(());
+                }
+            };
             if n == 0 {
                 // Client finished (between requests, or gave up mid-request).
                 return Ok(());
@@ -527,7 +542,10 @@ async fn serve(
         // ResponseHeaders; upstream chunks are then captured but not forwarded.
         let mut forward_chunks = true;
         while !done {
-            let n = up.read(&mut buf).await?;
+            let n = match tokio::time::timeout(READ_TIMEOUT, up.read(&mut buf)).await {
+                Ok(r) => r?,
+                Err(_) => bail!("upstream read timed out"),
+            };
             let events = if n == 0 {
                 machine.on_eof(Side::Server)
             } else {

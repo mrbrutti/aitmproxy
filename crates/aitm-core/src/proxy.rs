@@ -217,7 +217,10 @@ impl ProxyBuilder {
     /// the registry (running each plugin's `load`), and the chain.
     pub fn build(self) -> anyhow::Result<Proxy> {
         let config = self.config.unwrap_or_default();
-        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::with_capacity(config.max_flows));
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::with_limits(
+            config.max_flows,
+            config.max_flow_bytes,
+        ));
         let guard: Arc<dyn ScopeRateGuard> = Arc::new(StdGuard::new(config.limits.clone()));
         for entry in &config.scope.entries {
             guard.add_scope(entry.clone());

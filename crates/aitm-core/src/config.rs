@@ -25,6 +25,10 @@ pub struct Config {
     /// Flow-store capacity (0 = unbounded). The store evicts the oldest flow once
     /// over this, so a long run has bounded memory.
     pub max_flows: usize,
+    /// Flow-store resident-byte budget (0 = unbounded). A second bound alongside
+    /// `max_flows`, so a few very large captures cannot exhaust memory while under
+    /// the flow-count cap.
+    pub max_flow_bytes: usize,
 }
 
 impl Default for Config {
@@ -38,6 +42,7 @@ impl Default for Config {
             browser: BrowserConfig::default(),
             ssl_insecure: false,
             max_flows: crate::store::DEFAULT_MAX_FLOWS,
+            max_flow_bytes: crate::store::DEFAULT_MAX_FLOW_BYTES,
         }
     }
 }
@@ -120,11 +125,14 @@ impl Default for CaConfig {
 
 /// The per-user CA directory (`$XDG_CONFIG_HOME/aitmproxy/ca` or the platform
 /// equivalent), so the key is not written into whatever directory the proxy was
-/// launched from where another process could read or plant it. Falls back to a
-/// local hidden dir when no config dir is discoverable.
+/// launched from where another process could read or plant it. Falls back to
+/// `$HOME/.aitm/ca` — never a CWD-relative path, which could be world-writable or
+/// shared — and only to a local hidden dir when neither a config nor a home dir
+/// is discoverable.
 fn default_ca_dir() -> PathBuf {
     dirs::config_dir()
         .map(|d| d.join("aitmproxy").join("ca"))
+        .or_else(|| dirs::home_dir().map(|h| h.join(".aitm").join("ca")))
         .unwrap_or_else(|| PathBuf::from(".aitm/ca"))
 }
 

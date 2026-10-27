@@ -42,10 +42,14 @@ impl CertAuthority {
         let cert_path = dir.join(CERT_FILE);
 
         let (issuer, root_pem) = if key_path.exists() && cert_path.exists() {
-            // The persisted key is a secret: refuse to use one that is readable
-            // by group/other (a plantability / exposure risk).
-            check_key_security(&key_path)?;
-            let key_pem = fs::read_to_string(&key_path)
+            // Open the key without following a symlink, then check the *opened
+            // handle's* mode and read from it — no stat/read TOCTOU, and a
+            // symlinked key fails to open. The key is a secret: refuse one readable
+            // by group/other (an exposure / plantability risk).
+            let mut key_file = open_key_nofollow(&key_path)?;
+            check_key_handle(&key_file, &key_path)?;
+            let mut key_pem = String::new();
+            std::io::Read::read_to_string(&mut key_file, &mut key_pem)
                 .with_context(|| format!("read CA key {}", key_path.display()))?;
             let cert_pem = fs::read_to_string(&cert_path)
                 .with_context(|| format!("read CA cert {}", cert_path.display()))?;
@@ -54,7 +58,7 @@ impl CertAuthority {
                 Issuer::from_ca_cert_pem(&cert_pem, key).context("parse persisted CA cert")?;
             (issuer, cert_pem)
         } else {
-            fs::create_dir_all(dir).with_context(|| format!("create CA dir {}", dir.display()))?;
+            create_ca_dir(dir)?;
             let key = KeyPair::generate().context("generate CA key")?;
             let params = root_params();
             let cert = params.self_signed(&key).context("self-sign CA cert")?;
@@ -150,12 +154,34 @@ fn set_validity(params: &mut CertificateParams, days: i64) {
     params.not_after = now + time::Duration::days(days);
 }
 
-/// Refuse a CA key that is readable by group or other (Unix). The key must be a
-/// secret; a looser mode means it could be read or replaced by another user.
+/// Open the CA key read-only without following a symlink at the final component
+/// (`O_NOFOLLOW`), so a symlinked key fails to open and the caller can stat/read
+/// the returned handle with no TOCTOU window.
 #[cfg(unix)]
-fn check_key_security(path: &Path) -> Result<()> {
+fn open_key_nofollow(path: &Path) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open CA key {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn open_key_nofollow(path: &Path) -> Result<fs::File> {
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        anyhow::bail!("refusing to open symlinked CA key {}", path.display());
+    }
+    fs::File::open(path).with_context(|| format!("open CA key {}", path.display()))
+}
+
+/// Refuse a CA key readable by group or other, checking the *opened handle*
+/// (fstat), so it describes the file we actually hold open.
+#[cfg(unix)]
+fn check_key_handle(file: &fs::File, path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(path)
+    let mode = file
+        .metadata()
         .with_context(|| format!("stat CA key {}", path.display()))?
         .permissions()
         .mode()
@@ -172,33 +198,52 @@ fn check_key_security(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn check_key_security(_path: &Path) -> Result<()> {
+fn check_key_handle(_file: &fs::File, _path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write `bytes` to `path` so that the file never exists with a looser mode
-/// than `mode`: created with it, and re-applied in case the file pre-existed.
+/// Create the CA directory owner-only (`0700` on Unix), including parents, so the
+/// key is never briefly world-readable in a default-mode directory.
+fn create_ca_dir(dir: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(dir)
+        .with_context(|| format!("create CA dir {}", dir.display()))
+}
+
+/// Write the freshly generated key to a brand-new file (`create_new`, so it never
+/// follows a planted symlink or clobbers an existing key) created with mode `mode`.
 fn write_private(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::OpenOptionsExt;
         let mut file = fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(mode)
             .open(path)
             .with_context(|| format!("create CA key {}", path.display()))?;
         file.write_all(bytes)
             .with_context(|| format!("write CA key {}", path.display()))?;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))
-            .with_context(|| format!("chmod CA key {}", path.display()))?;
     }
     #[cfg(not(unix))]
     {
+        use std::io::Write;
         let _ = mode;
-        fs::write(path, bytes).with_context(|| format!("write CA key {}", path.display()))?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("create CA key {}", path.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("write CA key {}", path.display()))?;
     }
     Ok(())
 }
