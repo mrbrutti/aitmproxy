@@ -1,0 +1,235 @@
+//! The flow model: identity, HTTP/WebSocket flows, and interception lifecycle.
+//!
+//! Shapes (types, fields) are fixed by the platform spec; bodies and internal
+//! representations are the builder's. Every flow is `Clone` so the store can hand
+//! out owned snapshots and a plugin can `backup()` a flow before editing it.
+
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
+
+use tokio::sync::oneshot;
+
+use crate::body::Body;
+use crate::header::HeaderMap;
+
+/// Opaque, globally unique flow identifier. UUID v4 backed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FlowId(uuid::Uuid);
+
+impl FlowId {
+    /// Mint a fresh, random identifier.
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+
+    /// The underlying UUID.
+    pub fn as_uuid(&self) -> uuid::Uuid {
+        self.0
+    }
+}
+
+impl Default for FlowId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for FlowId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for FlowId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(uuid::Uuid::parse_str(s)?))
+    }
+}
+
+/// Every captured interaction. An enum so new protocols slot in without core edits.
+#[derive(Debug, Clone)]
+pub enum Flow {
+    Http(HttpFlow),
+    WebSocket(WsFlow),
+}
+
+impl Flow {
+    /// This flow's identifier, regardless of protocol.
+    pub fn id(&self) -> FlowId {
+        match self {
+            Flow::Http(f) => f.id,
+            Flow::WebSocket(f) => f.id,
+        }
+    }
+}
+
+/// A captured HTTP interaction.
+#[derive(Debug, Clone)]
+pub struct HttpFlow {
+    pub id: FlowId,
+    pub request: HttpRequest,
+    /// `None` until the response arrives.
+    pub response: Option<HttpResponse>,
+    pub client_conn: ConnInfo,
+    /// `None` if short-circuited before reaching upstream.
+    pub server_conn: Option<ConnInfo>,
+    pub metadata: FlowMeta,
+    pub intercept: InterceptState,
+}
+
+/// A captured WebSocket conversation (after the HTTP upgrade).
+#[derive(Debug, Clone)]
+pub struct WsFlow {
+    pub id: FlowId,
+    /// The originating `HttpFlow` (the 101 upgrade).
+    pub handshake: FlowId,
+    /// Newest message is `messages.last()`.
+    pub messages: Vec<WsMessage>,
+    pub client_conn: ConnInfo,
+    pub server_conn: Option<ConnInfo>,
+    pub metadata: FlowMeta,
+    pub intercept: InterceptState,
+}
+
+/// An HTTP request.
+#[derive(Debug, Clone)]
+pub struct HttpRequest {
+    pub method: String,
+    /// `"https"` after TLS MITM.
+    pub scheme: String,
+    /// `host[:port]`.
+    pub authority: String,
+    /// Path plus query.
+    pub path: String,
+    pub version: HttpVersion,
+    pub headers: HeaderMap,
+    pub body: Body,
+    pub timestamp: SystemTime,
+}
+
+/// An HTTP response.
+#[derive(Debug, Clone)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub version: HttpVersion,
+    pub headers: HeaderMap,
+    pub body: Body,
+    pub timestamp: SystemTime,
+}
+
+/// HTTP protocol version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpVersion {
+    Http11,
+    H2,
+}
+
+/// A single WebSocket frame.
+#[derive(Debug, Clone)]
+pub struct WsMessage {
+    pub dir: WsDir,
+    pub opcode: WsOpcode,
+    pub data: Vec<u8>,
+    pub timestamp: SystemTime,
+    /// `true` if a plugin or PoC authored this frame.
+    pub injected: bool,
+}
+
+/// Direction of a WebSocket frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsDir {
+    ClientToServer,
+    ServerToClient,
+}
+
+/// WebSocket frame opcode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsOpcode {
+    Text,
+    Binary,
+    Ping,
+    Pong,
+    Close,
+}
+
+/// Connection metadata for one side of a flow.
+#[derive(Debug, Clone)]
+pub struct ConnInfo {
+    pub peer: SocketAddr,
+    pub sni: Option<String>,
+    pub alpn: Option<String>,
+    pub tls: bool,
+    pub established: SystemTime,
+}
+
+/// Per-flow bookkeeping: marks, comment, replay flag, timing.
+#[derive(Debug, Clone)]
+pub struct FlowMeta {
+    pub marks: Vec<String>,
+    pub comment: Option<String>,
+    pub is_replay: bool,
+    pub created: SystemTime,
+    pub duration: Option<Duration>,
+}
+
+impl Default for FlowMeta {
+    fn default() -> Self {
+        Self {
+            marks: Vec::new(),
+            comment: None,
+            is_replay: false,
+            created: SystemTime::now(),
+            duration: None,
+        }
+    }
+}
+
+/// Lifecycle of interception for a single flow.
+#[derive(Debug, Clone)]
+pub enum InterceptState {
+    /// Flowing normally.
+    Observed,
+    /// Parked as a pausable future; a backup was taken and a resume handle armed.
+    Intercepted {
+        backup: Box<Flow>,
+        resume: ResumeHandle,
+    },
+    /// Resumed after interception (edits applied, forwarded).
+    Resumed,
+    /// Dropped; the client sees a reset/closed connection.
+    Killed,
+}
+
+/// Wakes the parked pausable future when a command resumes the flow.
+///
+/// Oneshot-backed: [`ResumeHandle::new`] returns the handle plus the receiver the
+/// parked future awaits; [`ResumeHandle::fire`] wakes it (idempotent).
+#[derive(Debug, Clone)]
+pub struct ResumeHandle {
+    tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+impl ResumeHandle {
+    /// A handle paired with the receiver the parked future should await.
+    pub fn new() -> (Self, oneshot::Receiver<()>) {
+        let (tx, rx) = oneshot::channel();
+        (
+            Self {
+                tx: Arc::new(Mutex::new(Some(tx))),
+            },
+            rx,
+        )
+    }
+
+    /// Wake the parked future. A second call is a no-op.
+    pub fn fire(&self) {
+        if let Ok(mut guard) = self.tx.lock() {
+            if let Some(tx) = guard.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+}

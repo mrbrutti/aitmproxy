@@ -7,3 +7,5 @@ rust-version.workspace = true
 description = "Protocol-agnostic core: flow model, event/plugin chain, command registry, flow store, scope/rate guard, proxy acceptor."
 
 [dependencies]
+uuid.workspace = true
+tokio = { workspace = true, features = ["sync"] }
