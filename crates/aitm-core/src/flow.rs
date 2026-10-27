@@ -173,6 +173,9 @@ pub struct FlowMeta {
     pub is_replay: bool,
     pub created: SystemTime,
     pub duration: Option<Duration>,
+    /// A body exceeded the configured cap: the stored copy was truncated (the
+    /// client still received the full stream).
+    pub truncated: bool,
 }
 
 impl Default for FlowMeta {
@@ -183,6 +186,7 @@ impl Default for FlowMeta {
             is_replay: false,
             created: SystemTime::now(),
             duration: None,
+            truncated: false,
         }
     }
 }

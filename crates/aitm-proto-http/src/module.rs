@@ -17,8 +17,8 @@ use std::task::{Context as TaskCx, Poll};
 use std::time::SystemTime;
 
 use aitm_core::{
-    Body, CaConfig, ConnInfo, Event, Flow, FlowId, FlowMeta, HttpFlow, HttpRequest, HttpResponse,
-    InterceptState, StreamBody,
+    Body, CaConfig, ConnInfo, Event, Flow, FlowId, FlowMeta, HeaderMap, HttpFlow, HttpRequest,
+    HttpResponse, HttpVersion, InterceptState, StreamBody,
 };
 use aitm_plugin::{ByteStream, ModuleCtx, NextLayerHint, ProtocolModule};
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -54,7 +54,12 @@ pub struct HttpModule {
     /// Skip upstream certificate verification (lab self-signed targets). Off by
     /// default: upstream TLS is verified against the webpki roots.
     insecure: bool,
+    /// Cap on a buffered request body and the captured copy of a response body.
+    max_body_bytes: usize,
 }
+
+/// Default per-message body cap, matching `LimitConfig::default().max_body_bytes`.
+const DEFAULT_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 impl Default for HttpModule {
     fn default() -> Self {
@@ -77,7 +82,14 @@ impl HttpModule {
             provider: Arc::new(rustls::crypto::ring::default_provider()),
             upstream_tls: OnceLock::new(),
             insecure: false,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         }
+    }
+
+    /// Set the per-message body cap (maps to `LimitConfig.max_body_bytes`).
+    pub fn with_max_body_bytes(mut self, max: usize) -> Self {
+        self.max_body_bytes = max;
+        self
     }
 
     /// A module using an already-loaded CA.
@@ -171,12 +183,19 @@ impl HttpModule {
                 self.mitm(client, ctx, peer, Some(target)).await
             } else {
                 let conn = Conn::plain(peer, Some(target.authority()));
-                serve(&ctx, Box::pin(client), None, conn).await
+                serve(&ctx, Box::pin(client), None, conn, self.max_body_bytes).await
             }
         } else if first.first() == Some(&TLS_HANDSHAKE) {
             self.mitm(client, ctx, peer, None).await
         } else {
-            serve(&ctx, Box::pin(client), None, Conn::plain(peer, None)).await
+            serve(
+                &ctx,
+                Box::pin(client),
+                None,
+                Conn::plain(peer, None),
+                self.max_body_bytes,
+            )
+            .await
         }
     }
 
@@ -246,7 +265,14 @@ impl HttpModule {
                 established: now,
             }),
         };
-        serve(&ctx, Box::pin(client_tls), Some(Box::pin(upstream)), conn).await
+        serve(
+            &ctx,
+            Box::pin(client_tls),
+            Some(Box::pin(upstream)),
+            conn,
+            self.max_body_bytes,
+        )
+        .await
     }
 }
 
@@ -319,6 +345,7 @@ async fn serve(
     mut client: ByteStream,
     mut upstream: Option<ByteStream>,
     mut conn: Conn,
+    max_body: usize,
 ) -> Result<()> {
     let mut machine = Http1Machine::new();
     let mut buf = vec![0u8; READ_CHUNK];
@@ -329,6 +356,7 @@ async fn serve(
         // the head is in and inserting the flow.
         let mut flow_id: Option<FlowId> = None;
         let mut body: Vec<u8> = Vec::new();
+        let mut request_oversized = false;
         let mut upgrade_protocol: Option<String> = None;
         let mut complete = false;
         // Start by draining anything already buffered (a pipelined request).
@@ -366,7 +394,15 @@ async fn serve(
                         flow_id = Some(id);
                     }
                     HttpSansIoEvent::RequestBodyChunk { bytes, .. } => {
-                        body.extend_from_slice(&bytes)
+                        // Bound the buffered request: beyond the cap the bytes are
+                        // dropped and the request is refused (not forwarded partial).
+                        let room = max_body.saturating_sub(body.len());
+                        if bytes.len() > room {
+                            body.extend_from_slice(&bytes[..room]);
+                            request_oversized = true;
+                        } else {
+                            body.extend_from_slice(&bytes);
+                        }
                     }
                     HttpSansIoEvent::RequestComplete(id) => {
                         let mut captured = Some(std::mem::take(&mut body));
@@ -400,6 +436,21 @@ async fn serve(
             feed.extend_from_slice(&buf[..n]);
         }
         let id = flow_id.ok_or_else(|| anyhow!("request completed without headers"))?;
+
+        // A request body over the cap is refused (413) rather than buffered or
+        // forwarded truncated; the stored copy is marked truncated.
+        if request_oversized {
+            ctx.store().update(id, &mut |f: &mut Flow| {
+                if let Flow::Http(h) = f {
+                    h.metadata.truncated = true;
+                }
+            });
+            let resp = oversized_response();
+            machine.enqueue_response(&resp);
+            flush(&mut machine, Side::Client, &mut client).await?;
+            let _ = client.shutdown().await;
+            return Ok(());
+        }
 
         // --- Dispatch the complete request through the chain, then act on
         // what the plugins left in the store.
@@ -466,8 +517,10 @@ async fn serve(
         machine.enqueue_request(&request);
         flush(&mut machine, Side::Server, up).await?;
 
-        // --- Response: capture while streaming it back.
+        // --- Response: capture while streaming it back. The captured copy is
+        // bounded by `max_body`; the client still receives the full stream.
         let mut captured: Vec<u8> = Vec::new();
+        let mut response_truncated = false;
         let mut done = false;
         let mut response_close = false;
         // Set when a plugin replaced the streamed body with its own on
@@ -508,7 +561,13 @@ async fn serve(
                         flush(&mut machine, Side::Client, &mut client).await?;
                     }
                     HttpSansIoEvent::ResponseBodyChunk { bytes, .. } => {
-                        captured.extend_from_slice(&bytes);
+                        let room = max_body.saturating_sub(captured.len());
+                        if bytes.len() > room {
+                            captured.extend_from_slice(&bytes[..room]);
+                            response_truncated = true;
+                        } else {
+                            captured.extend_from_slice(&bytes);
+                        }
                         if forward_chunks {
                             machine.enqueue_body_chunk(Side::Client, &bytes);
                             flush(&mut machine, Side::Client, &mut client).await?;
@@ -529,6 +588,7 @@ async fn serve(
                                         Body::Bytes(bytes)
                                     };
                                 }
+                                h.metadata.truncated |= response_truncated;
                                 h.metadata.duration = h.metadata.created.elapsed().ok();
                             }
                         });
@@ -572,6 +632,20 @@ async fn serve(
             let _ = client.shutdown().await;
             return Ok(());
         }
+    }
+}
+
+/// A `413 Payload Too Large` response for a request body over the cap.
+fn oversized_response() -> HttpResponse {
+    let mut headers = HeaderMap::new();
+    headers.set("Content-Type", "text/plain");
+    headers.set("Connection", "close");
+    HttpResponse {
+        status: 413,
+        version: HttpVersion::Http11,
+        headers,
+        body: Body::Bytes(b"request body exceeds the configured limit".to_vec()),
+        timestamp: SystemTime::now(),
     }
 }
 

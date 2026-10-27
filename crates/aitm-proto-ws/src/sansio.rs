@@ -43,6 +43,9 @@ pub enum WsSansIoEvent {
 
 /// Largest single-frame payload accepted.
 const MAX_FRAME_PAYLOAD: u64 = 16 * 1024 * 1024;
+/// Largest reassembled (fragmented) message accepted, so a stream of
+/// continuation frames cannot grow memory without bound.
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 const OP_CONTINUATION: u8 = 0x0;
 const OP_TEXT: u8 = 0x1;
@@ -177,6 +180,9 @@ impl WsStateMachine for WsFrameMachine {
                     let Some((opcode, mut data)) = self.reader_mut(from).partial.take() else {
                         bail!("continuation frame without a message in progress");
                     };
+                    if data.len().saturating_add(frame.payload.len()) > MAX_MESSAGE_BYTES {
+                        bail!("reassembled WebSocket message exceeds {MAX_MESSAGE_BYTES} bytes");
+                    }
                     data.extend_from_slice(&frame.payload);
                     if frame.fin {
                         self.push_message(from, opcode, data, &mut events);

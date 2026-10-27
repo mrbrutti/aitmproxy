@@ -201,6 +201,112 @@ async fn https_get(
     (status, body)
 }
 
+/// A TLS fixture that answers with a body of exactly `len` bytes.
+async fn spawn_big_fixture(len: usize) -> SocketAddr {
+    let key = rcgen::KeyPair::generate().expect("fixture key");
+    let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+        .expect("fixture params")
+        .self_signed(&key)
+        .expect("fixture cert");
+    let cfg = rustls::ServerConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .expect("fixture versions")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        )
+        .expect("fixture server config");
+    let acceptor = TlsAcceptor::from(Arc::new(cfg));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fixture");
+    let addr = listener.local_addr().expect("fixture addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let _ = read_head(&mut tls).await;
+                let body = vec![b'A'; len];
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n");
+                let _ = tls.write_all(head.as_bytes()).await;
+                let _ = tls.write_all(&body).await;
+                let _ = tls.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+/// Run a proxy whose HTTP module caps bodies at `max_body`.
+async fn run_proxy_capped(
+    ca: Arc<CertAuthority>,
+    max_body: usize,
+) -> (SocketAddr, Arc<dyn FlowStore>) {
+    let config = Config {
+        scope: ScopeConfig {
+            entries: vec![ScopeEntry {
+                host: "127.0.0.1".to_string(),
+            }],
+        },
+        ..Config::default()
+    };
+    let proxy = Proxy::builder()
+        .with_config(config)
+        .register_module(Arc::new(
+            HttpModule::with_ca(ca)
+                .with_insecure(true)
+                .with_max_body_bytes(max_body),
+        ))
+        .build()
+        .expect("build proxy");
+    let store = proxy.store();
+    let addr = free_port();
+    tokio::spawn(async move {
+        let _ = proxy.run(addr).await;
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(addr).await.is_err() {
+        assert!(Instant::now() < deadline, "proxy never started listening");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    (addr, store)
+}
+
+/// A response body over the cap is truncated in the stored copy and the flow is
+/// marked truncated, while the client still receives the full body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_body_capped_in_store() {
+    let dir = temp_dir();
+    let ca = Arc::new(CertAuthority::load_or_generate(&dir, 0o600).expect("CA"));
+    let root_pem = ca.root_cert_pem().to_string();
+
+    let cap = 64usize;
+    let upstream = spawn_big_fixture(1000).await;
+    let (proxy, store) = run_proxy_capped(ca, cap).await;
+
+    let (status, body) = https_get(proxy, upstream, "/big", &root_pem).await;
+    assert_eq!(status, 200);
+    // The client received the whole body.
+    assert_eq!(body.len(), 1000, "client must get the full streamed body");
+
+    let flow = wait_for_flow(&*store).await;
+    assert!(flow.metadata.truncated, "flow must be marked truncated");
+    match flow.response.and_then(|r| match r.body {
+        Body::Bytes(b) => Some(b.len()),
+        _ => None,
+    }) {
+        Some(len) => assert_eq!(len, cap, "stored response copy must be capped"),
+        None => panic!("expected a buffered (truncated) response body"),
+    }
+}
+
 /// The first captured HTTP flow that has a response, waiting briefly for it.
 async fn wait_for_flow(store: &dyn FlowStore) -> HttpFlow {
     let deadline = Instant::now() + Duration::from_secs(5);

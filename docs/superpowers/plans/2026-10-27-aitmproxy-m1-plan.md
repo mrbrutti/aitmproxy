@@ -420,7 +420,7 @@ pass below was approved by Matt 2026-10-27.
 | Security | Important | PoC file trust (arbitrary load, path, serde leakage) | Fixed in `05eefaf`: `.yaml` only, no symlink, `schema::validate`, content-free errors, id regex; size cap in `6eb662f`. |
 | Security | Important | CA written to the launch directory | Fixed in `f77335e`: default CA dir is the per-user config dir. (Load-time owner/mode check + explicit validity dates: deferred, see Follow-ups.) |
 | Security | Important | PoC artifacts world-readable; credentials baked into built PoCs | Fixed in `6eb662f`: artifacts `0700`/`0600`; `poc.build` redacts Cookie/Authorization/Proxy-Authorization/X-API-Key to required `{{var}}`. |
-| Security | Important | Unbounded buffers (flow store, request sender) | Fixed: store bounded (`f77335e`), sender read capped (`6eb662f`), `LimitConfig.max_body_bytes` added (`f77335e`). Enforcement in the proto-http serve path + WS reassembly: deferred, see Follow-ups. |
+| Security | Important | Unbounded buffers (flow store, request sender, serve paths) | Fixed: store bounded (`f77335e`), sender read capped (`6eb662f`), `LimitConfig.max_body_bytes` enforced in the proto-http serve path (second pass: oversized request → 413; response captured copy truncated + `FlowMeta.truncated`, client still streamed) and WS fragment reassembly capped at 16 MiB. |
 | Security | Minor | serde_yaml billion-laughs | Fixed in `6eb662f`: 1 MiB PoC size cap + `validate` before typed deserialize. |
 | Robustness | Important | Silent error discards; no logging | Fixed in `b0384b3`: `tracing` at the accept/handler/poison points; `tracing-subscriber` in `main`. (Protocol-module error→`Event::Error` mapping, CDP loop, transport: deferred.) |
 | Robustness | Important | `per_host_rps == 0` throttled at 1 rps instead of refusing | Fixed in `f77335e`. |
@@ -434,8 +434,7 @@ pass below was approved by Matt 2026-10-27.
 Rate-limit double-count + real-client test rewrites; the binary's Http1/TLS
 request sender; error taxonomy / `record_error` / backoff / host-disable;
 parked-flow leak on client EOF; AC13 field preservation (info/http-step extras);
-CA load-time permission checks + validity dates; proto-http/WS body-cap
-enforcement; exact-count test tightening.
+CA load-time permission checks + validity dates; exact-count test tightening.
 
 ## Shipped
 
@@ -472,9 +471,6 @@ correctness/security/robustness item, not pure cosmetics.
 - **CA load-time hardening.** On load, refuse/warn if the key is not owned by the
   current uid or is group/other-accessible; set explicit validity (root ~10y,
   leaf ≤398d).
-- **Body-cap enforcement.** Enforce `LimitConfig.max_body_bytes` in the
-  proto-http serve path (request served, captured response copy — truncate +
-  mark `FlowMeta`) and bound WS fragment reassembly to a per-flow ring.
 - **Test tightening.** Replace `>= 1` refusal assertions with exact counts where
   deterministic.
 
