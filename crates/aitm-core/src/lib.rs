@@ -5,10 +5,14 @@
 //! other crate in the workspace depends on this one.
 
 pub mod body;
+pub mod error;
+pub mod event;
 pub mod flow;
 pub mod header;
 
 pub use body::{Body, StreamBody};
+pub use error::{FlowError, GuardError};
+pub use event::{Event, Verdict};
 pub use flow::{
     ConnInfo, Flow, FlowId, FlowMeta, HttpFlow, HttpRequest, HttpResponse, HttpVersion,
     InterceptState, ResumeHandle, WsDir, WsFlow, WsMessage, WsOpcode,
