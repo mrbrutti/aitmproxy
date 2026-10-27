@@ -1,0 +1,181 @@
+//! The handler/command contexts and the service seams they reach through.
+//!
+//! `FlowCtx` is the read/mutate handle a plugin gets while handling an event.
+//! `CommandHost` is what a command sees: the store, the proxy client, the guard,
+//! and an optional browser. The `ProxyClient` and `BrowserDriver` traits live here
+//! (not in their feature crates) because `CommandHost` references them and
+//! `aitm-core` is the bottom of the dependency graph — a feature crate implements
+//! them. The concrete `FlowCtx`/`CommandHost` wiring is completed in Task 8.
+
+use futures::future::BoxFuture;
+use tokio::sync::oneshot;
+
+use crate::flow::{Flow, HttpFlow, HttpRequest, HttpResponse, InterceptState, ResumeHandle};
+use crate::guard::ScopeRateGuard;
+use crate::store::FlowStore;
+use crate::value::Value;
+
+/// Reissue a request through the proxy's own pipeline (scope/rate-guarded,
+/// captured). Implemented in Task 8; the trait is here so `CommandHost` can name it.
+pub trait ProxyClient: Send + Sync {
+    /// Send `req` and return the resulting captured flow (marked `is_replay`).
+    fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>>;
+}
+
+/// Where to click in the browser.
+#[derive(Debug, Clone)]
+pub enum ClickTarget {
+    Selector(String),
+    Point { x: f64, y: f64 },
+}
+
+/// The outcome of a navigation.
+#[derive(Debug, Clone)]
+pub struct NavOutcome {
+    pub final_url: String,
+    pub status: Option<u16>,
+}
+
+/// The embedded browser's CUA-style primitives. Declared in core because
+/// `CommandHost::browser` returns `&dyn BrowserDriver`; `aitm-browser` implements it.
+pub trait BrowserDriver: Send + Sync {
+    fn navigate(&self, url: &str) -> BoxFuture<'_, anyhow::Result<NavOutcome>>;
+    fn click(&self, target: ClickTarget) -> BoxFuture<'_, anyhow::Result<()>>;
+    fn type_text(&self, selector: &str, text: &str) -> BoxFuture<'_, anyhow::Result<()>>;
+    /// PNG bytes.
+    fn screenshot(&self) -> BoxFuture<'_, anyhow::Result<Vec<u8>>>;
+    fn eval(&self, expr: &str) -> BoxFuture<'_, anyhow::Result<Value>>;
+    fn get_dom(&self) -> BoxFuture<'_, anyhow::Result<String>>;
+}
+
+/// Core services a command may use, without depending on any protocol crate.
+pub struct CommandHost<'a> {
+    store: &'a dyn FlowStore,
+    client: &'a dyn ProxyClient,
+    guard: &'a dyn ScopeRateGuard,
+    browser: Option<&'a dyn BrowserDriver>,
+}
+
+impl<'a> CommandHost<'a> {
+    /// Assemble a host from borrowed core services.
+    pub fn new(
+        store: &'a dyn FlowStore,
+        client: &'a dyn ProxyClient,
+        guard: &'a dyn ScopeRateGuard,
+        browser: Option<&'a dyn BrowserDriver>,
+    ) -> Self {
+        Self {
+            store,
+            client,
+            guard,
+            browser,
+        }
+    }
+
+    pub fn store(&self) -> &dyn FlowStore {
+        self.store
+    }
+    pub fn client(&self) -> &dyn ProxyClient {
+        self.client
+    }
+    pub fn browser(&self) -> Option<&dyn BrowserDriver> {
+        self.browser
+    }
+    pub fn guard(&self) -> &dyn ScopeRateGuard {
+        self.guard
+    }
+}
+
+/// Read/mutate handle a plugin gets while handling an event for one flow.
+///
+/// Holds a mutable borrow of the flow plus an optional backup. `intercept()` parks
+/// the flow (arming a [`ResumeHandle`]); Task 8's chain awaits the paired receiver
+/// to drive the pausable future, and resumes/kills the flow in the store.
+pub struct FlowCtx<'a> {
+    flow: &'a mut Flow,
+    backup: Option<Box<Flow>>,
+    parked: Option<oneshot::Receiver<()>>,
+}
+
+impl<'a> FlowCtx<'a> {
+    /// Wrap a borrowed flow for the duration of one event.
+    pub fn new(flow: &'a mut Flow) -> Self {
+        Self {
+            flow,
+            backup: None,
+            parked: None,
+        }
+    }
+
+    /// The flow this event is about.
+    pub fn flow(&self) -> &Flow {
+        self.flow
+    }
+
+    /// Mutate the flow in place before it is forwarded.
+    pub fn flow_mut(&mut self) -> &mut Flow {
+        self.flow
+    }
+
+    /// Short-circuit: answer the client with this response (HTTP flows only).
+    pub fn set_response(&mut self, resp: HttpResponse) {
+        if let Flow::Http(f) = self.flow {
+            f.response = Some(resp);
+        }
+    }
+
+    /// Park this flow as a pausable future; a command later resumes it. Returns
+    /// the handle a command fires to resume.
+    pub fn intercept(&mut self) -> ResumeHandle {
+        let (handle, rx) = ResumeHandle::new();
+        let backup = self
+            .backup
+            .take()
+            .unwrap_or_else(|| Box::new(self.flow.clone()));
+        set_intercept(
+            self.flow,
+            InterceptState::Intercepted {
+                backup,
+                resume: handle.clone(),
+            },
+        );
+        self.parked = Some(rx);
+        handle
+    }
+
+    /// Mark the flow resumed (edits applied, ready to forward).
+    pub fn resume(&mut self) {
+        set_intercept(self.flow, InterceptState::Resumed);
+    }
+
+    /// Drop the flow; the client sees a reset/closed connection.
+    pub fn kill(&mut self) {
+        set_intercept(self.flow, InterceptState::Killed);
+    }
+
+    /// Snapshot the flow before edits (enables `revert`).
+    pub fn backup(&mut self) {
+        self.backup = Some(Box::new(self.flow.clone()));
+    }
+
+    /// Restore the last backup, discarding edits.
+    pub fn revert(&mut self) {
+        if let Some(backup) = self.backup.take() {
+            *self.flow = *backup;
+        }
+    }
+
+    /// Take the parked receiver, if `intercept()` armed one. The chain (Task 8)
+    /// awaits it to implement the pausable future.
+    pub fn take_parked(&mut self) -> Option<oneshot::Receiver<()>> {
+        self.parked.take()
+    }
+}
+
+/// Set a flow's interception state regardless of protocol.
+fn set_intercept(flow: &mut Flow, state: InterceptState) {
+    match flow {
+        Flow::Http(f) => f.intercept = state,
+        Flow::WebSocket(f) => f.intercept = state,
+    }
+}
