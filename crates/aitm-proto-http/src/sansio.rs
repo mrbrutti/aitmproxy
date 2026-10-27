@@ -657,7 +657,12 @@ fn parse_headers<'a>(lines: impl Iterator<Item = &'a str>) -> Result<HeaderMap> 
         if name.is_empty() || name.contains(' ') {
             bail!("malformed header name {name:?}");
         }
-        headers.set(name, value.trim());
+        // Fail closed on an invalid name/value (control byte, embedded CR/LF).
+        // `set` would *drop* it silently; dropping a framing header such as
+        // `Content-Length` desynchronises us from the peer (request smuggling).
+        headers
+            .try_set(name, value.trim())
+            .map_err(|e| anyhow!("{e}"))?;
     }
     Ok(headers)
 }

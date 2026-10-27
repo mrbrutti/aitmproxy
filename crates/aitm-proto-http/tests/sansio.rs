@@ -37,6 +37,22 @@ fn parse_request_headers_and_complete() {
     assert_eq!(req.headers.get("host"), Some("h"));
 }
 
+/// A header value with a control byte must fail the parse, not get silently
+/// dropped: dropping `Content-Length` would let the peer frame the message with
+/// the header while the machine frames it without — request/response smuggling.
+#[test]
+fn invalid_header_byte_fails_closed() {
+    let mut m = Http1Machine::new();
+    let result = m.on_bytes(
+        Side::Client,
+        b"GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\x01\r\n\r\n",
+    );
+    assert!(
+        result.is_err(),
+        "a control char in a header value must fail the parse, got {result:?}"
+    );
+}
+
 #[test]
 fn chunked_body_streams() {
     let mut m = Http1Machine::new();
