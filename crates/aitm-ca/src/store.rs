@@ -140,11 +140,47 @@ impl Platform {
     }
 }
 
-/// Which Linux family the host is, from its anchor directories (and
-/// `os-release` as a tie-break). `None` when neither directory exists.
-/// Filled in by Task 14.
-pub fn detect_linux_family(_exec: &dyn Executor) -> Option<LinuxFamily> {
-    None
+/// Which Linux family the host is: directory existence first, `os-release`
+/// as the tie-break (Architect's call C6). `None` when neither anchor
+/// directory exists, which makes the host `Unsupported("linux")`.
+pub fn detect_linux_family(exec: &dyn Executor) -> Option<LinuxFamily> {
+    let fedora = exec.dir_exists(Path::new(FEDORA_ANCHOR_DIR));
+    let debian = exec.dir_exists(Path::new(DEBIAN_ANCHOR_DIR));
+    match (fedora, debian) {
+        (false, false) => None,
+        (true, false) => Some(LinuxFamily::Fedora),
+        (false, true) => Some(LinuxFamily::Debian),
+        (true, true) => Some(os_release_family(exec)),
+    }
+}
+
+/// Both anchor directories exist: ask `os-release`. The first file that
+/// exists decides; with none, Fedora (first in mkcert's order).
+fn os_release_family(exec: &dyn Executor) -> LinuxFamily {
+    for path in ["/etc/os-release", "/usr/lib/os-release"] {
+        if let Ok(Some(bytes)) = exec.read_file(Path::new(path)) {
+            return family_from_os_release(&String::from_utf8_lossy(&bytes));
+        }
+    }
+    LinuxFamily::Fedora
+}
+
+/// The space-separated tokens of `ID` and `ID_LIKE`, lowercased and
+/// unquoted: any of `debian`, `ubuntu` → Debian; `fedora`, `rhel`,
+/// `centos` — or anything else — → Fedora.
+fn family_from_os_release(text: &str) -> LinuxFamily {
+    let debian = text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(key, _)| matches!(key.trim(), "ID" | "ID_LIKE"))
+        .flat_map(|(_, value)| value.trim().trim_matches('"').split_whitespace())
+        .map(|token| token.trim_matches('"').to_ascii_lowercase())
+        .any(|token| token == "debian" || token == "ubuntu");
+    if debian {
+        LinuxFamily::Debian
+    } else {
+        LinuxFamily::Fedora
+    }
 }
 
 /// Whether a certificate with our fingerprint is in a store.
