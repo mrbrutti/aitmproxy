@@ -54,6 +54,25 @@ fn mint_then_cache_hit() {
     );
 }
 
+/// A persisted key that becomes group/other-readable is refused on the next load.
+#[cfg(unix)]
+#[test]
+fn refuses_a_group_readable_key() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir();
+    CertAuthority::load_or_generate(&dir, 0o600).expect("generate root");
+    let key_path = dir.join("ca.key");
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644))
+        .expect("loosen key mode");
+    let err = CertAuthority::load_or_generate(&dir, 0o600)
+        .err()
+        .expect("a group/other-readable CA key must be refused");
+    assert!(
+        err.to_string().contains("group/other"),
+        "error must explain the mode problem, got: {err}"
+    );
+}
+
 #[test]
 fn load_reuses_persisted_root() {
     let dir = temp_dir();

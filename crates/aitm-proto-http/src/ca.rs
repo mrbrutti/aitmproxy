@@ -42,6 +42,9 @@ impl CertAuthority {
         let cert_path = dir.join(CERT_FILE);
 
         let (issuer, root_pem) = if key_path.exists() && cert_path.exists() {
+            // The persisted key is a secret: refuse to use one that is readable
+            // by group/other (a plantability / exposure risk).
+            check_key_security(&key_path)?;
             let key_pem = fs::read_to_string(&key_path)
                 .with_context(|| format!("read CA key {}", key_path.display()))?;
             let cert_pem = fs::read_to_string(&cert_path)
@@ -95,6 +98,7 @@ impl CertAuthority {
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         params.use_authority_key_identifier_extension = true;
+        set_validity(&mut params, LEAF_VALIDITY_DAYS);
 
         let key = KeyPair::generate().context("generate leaf key")?;
         let cert = params
@@ -115,7 +119,12 @@ impl CertAuthority {
     }
 }
 
-/// Parameters of the self-signed root.
+/// Root validity: ~10 years. Leaves: ≤397 days (under the CA/Browser Forum's
+/// 398-day cap, so a leaf a browser might see is not rejected for lifetime).
+const ROOT_VALIDITY_DAYS: i64 = 3650;
+const LEAF_VALIDITY_DAYS: i64 = 397;
+
+/// Parameters of the self-signed root, with an explicit ~10-year validity.
 fn root_params() -> CertificateParams {
     let mut params = CertificateParams::default();
     params
@@ -130,7 +139,41 @@ fn root_params() -> CertificateParams {
         KeyUsagePurpose::CrlSign,
         KeyUsagePurpose::DigitalSignature,
     ];
+    set_validity(&mut params, ROOT_VALIDITY_DAYS);
     params
+}
+
+/// Set an explicit validity window (a short backdate absorbs clock skew).
+fn set_validity(params: &mut CertificateParams, days: i64) {
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::hours(1);
+    params.not_after = now + time::Duration::days(days);
+}
+
+/// Refuse a CA key that is readable by group or other (Unix). The key must be a
+/// secret; a looser mode means it could be read or replaced by another user.
+#[cfg(unix)]
+fn check_key_security(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(path)
+        .with_context(|| format!("stat CA key {}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode & 0o077 != 0 {
+        anyhow::bail!(
+            "CA key {} is accessible to group/other (mode {:o}); refusing to load it. \
+             Restrict it with `chmod 600`.",
+            path.display(),
+            mode
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_key_security(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Write `bytes` to `path` so that the file never exists with a looser mode

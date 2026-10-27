@@ -418,7 +418,7 @@ pass below was approved by Matt 2026-10-27.
 | Security | Critical | Header CRLF injection via header edits | Fixed in `f77335e`: `HeaderMap::try_set` rejects CR/LF/NUL/whitespace; mutate + runner route through it. Proven in `5229e09`. |
 | Security | Important | `classify_ip` range gaps (CGNAT, 0/8, 198.18/15, 224/3, v6 NAT64/6to4/site-local/…) | Fixed in `f77335e`. |
 | Security | Important | PoC file trust (arbitrary load, path, serde leakage) | Fixed in `05eefaf`: `.yaml` only, no symlink, `schema::validate`, content-free errors, id regex; size cap in `6eb662f`. |
-| Security | Important | CA written to the launch directory | Fixed in `f77335e`: default CA dir is the per-user config dir. (Load-time owner/mode check + explicit validity dates: deferred, see Follow-ups.) |
+| Security | Important | CA written to the launch directory; no load-time checks or explicit validity | Fixed in `f77335e` (per-user config dir) + second pass: `load_or_generate` refuses a CA key readable by group/other; root validity ~10y, leaf ≤397 days (under the 398-day cap). Refusal tested. (Owner-uid check needs a non-`unsafe` getuid crate — left as a small follow-up under `forbid(unsafe_code)`.) |
 | Security | Important | PoC artifacts world-readable; credentials baked into built PoCs | Fixed in `6eb662f`: artifacts `0700`/`0600`; `poc.build` redacts Cookie/Authorization/Proxy-Authorization/X-API-Key to required `{{var}}`. |
 | Security | Important | Unbounded buffers (flow store, request sender, serve paths) | Fixed: store bounded (`f77335e`), sender read capped (`6eb662f`), `LimitConfig.max_body_bytes` enforced in the proto-http serve path (second pass: oversized request → 413; response captured copy truncated + `FlowMeta.truncated`, client still streamed) and WS fragment reassembly capped at 16 MiB. |
 | Security | Minor | serde_yaml billion-laughs | Fixed in `6eb662f`: 1 MiB PoC size cap + `validate` before typed deserialize. |
@@ -435,8 +435,8 @@ pass below was approved by Matt 2026-10-27.
 
 Rate-limit double-count + real-client test rewrites; error taxonomy /
 `record_error` / backoff / host-disable; parked-flow leak on client EOF; AC13
-field preservation (info/http-step extras); CA load-time permission checks +
-validity dates; exact-count test tightening.
+field preservation (info/http-step extras); CA key owner-uid check (needs a
+non-`unsafe` getuid); exact-count test tightening.
 
 ## Shipped
 
@@ -466,9 +466,9 @@ correctness/security/robustness item, not pure cosmetics.
 - **AC13 field preservation.** Now that `part`/matchers are modeled (R2), stop
   dropping `PocInfo` (description/author/metadata) and `HttpStep`
   (matchers/matchers-condition/raw/path) fields; round-trip them.
-- **CA load-time hardening.** On load, refuse/warn if the key is not owned by the
-  current uid or is group/other-accessible; set explicit validity (root ~10y,
-  leaf ≤398d).
+- **CA key owner-uid check.** Also refuse a CA key not owned by the current uid
+  (the group/other-mode check and explicit validity already land); needs a
+  non-`unsafe` `getuid` (e.g. `rustix`) under `forbid(unsafe_code)`.
 - **Test tightening.** Replace `>= 1` refusal assertions with exact counts where
   deterministic.
 
