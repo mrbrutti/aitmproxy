@@ -1,0 +1,317 @@
+//! Task 24 (AC14/AC15/AC-L2/AC-L3): the `PocRunner` executes a `Poc` end to end
+//! — HTTP steps through the scope guard + proxy client, browser steps through the
+//! `BrowserDriver`, extract steps binding variables — evaluates `success`, and
+//! emits the three artifacts (finding capture, YAML PoC file, screenshot PNG).
+//!
+//! The browser is a deterministic double here: `aitm-poc` has no way to stand up
+//! Chromium + the proxy, so these tests exercise the runner's full logic with a
+//! stub `BrowserDriver` and the real bundled vulnerable/patched target. The HTTP
+//! `word` matcher carries the pass-vs-patch discrimination (the patched target
+//! HTML-escapes the quote, so the marker word is absent); the genuine real-Chromium
+//! full-stack run is Task 29. No test here needs Chromium.
+
+mod support;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use aitm_core::{
+    Body, CommandHost, ConnInfo, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow, HttpRequest,
+    HttpResponse, HttpVersion, InterceptState, LimitConfig, MemFlowStore, NavOutcome, ProxyClient,
+    ScopeEntry, ScopeRateGuard, StdGuard, Value,
+};
+use aitm_core::{BrowserDriver, ClickTarget};
+use aitm_poc::{Poc, PocRunner, StdPocRunner, VarBindings};
+use futures::future::BoxFuture;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use support::target::{spawn, TargetMode};
+
+const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+
+fn conn() -> ConnInfo {
+    ConnInfo {
+        peer: "127.0.0.1:0".parse().unwrap(),
+        sni: None,
+        alpn: None,
+        tls: false,
+        established: SystemTime::now(),
+    }
+}
+
+/// A real `ProxyClient`: issues the request over a raw HTTP/1.1 loopback
+/// connection to the request's authority and returns the captured flow.
+struct TargetClient;
+
+impl ProxyClient for TargetClient {
+    fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+        Box::pin(async move {
+            let mut stream = tokio::net::TcpStream::connect(&req.authority).await?;
+            let raw = format!(
+                "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                req.method, req.path, req.authority
+            );
+            stream.write_all(raw.as_bytes()).await?;
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await?;
+            let text = String::from_utf8_lossy(&buf);
+            let (head, body) = text.split_once("\r\n\r\n").unwrap_or(("", &text));
+            let status = head
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|code| code.parse::<u16>().ok())
+                .unwrap_or(0);
+            Ok(HttpFlow {
+                id: FlowId::new(),
+                request: req,
+                response: Some(HttpResponse {
+                    status,
+                    version: HttpVersion::Http11,
+                    headers: HeaderMap::new(),
+                    body: Body::Bytes(body.as_bytes().to_vec()),
+                    timestamp: SystemTime::now(),
+                }),
+                client_conn: conn(),
+                server_conn: None,
+                metadata: FlowMeta {
+                    is_replay: true,
+                    ..Default::default()
+                },
+                intercept: InterceptState::Observed,
+            })
+        })
+    }
+}
+
+/// A deterministic `BrowserDriver` double: `eval` returns a fixed value, and
+/// `screenshot` returns valid PNG bytes. No Chromium involved.
+struct StubBrowser {
+    eval_value: Value,
+}
+
+impl BrowserDriver for StubBrowser {
+    fn navigate(&self, url: &str) -> BoxFuture<'_, anyhow::Result<NavOutcome>> {
+        let url = url.to_string();
+        Box::pin(async move {
+            Ok(NavOutcome {
+                final_url: url,
+                status: Some(200),
+            })
+        })
+    }
+    fn click(&self, _target: ClickTarget) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn type_text(&self, _selector: &str, _text: &str) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn screenshot(&self) -> BoxFuture<'_, anyhow::Result<Vec<u8>>> {
+        Box::pin(async {
+            let mut png = PNG_MAGIC.to_vec();
+            png.extend_from_slice(b"\x00\x00\x00\rIHDR stub pixels");
+            Ok(png)
+        })
+    }
+    fn eval(&self, _expr: &str) -> BoxFuture<'_, anyhow::Result<Value>> {
+        let value = self.eval_value.clone();
+        Box::pin(async move { Ok(value) })
+    }
+    fn get_dom(&self) -> BoxFuture<'_, anyhow::Result<String>> {
+        Box::pin(async { Ok(String::new()) })
+    }
+}
+
+fn guard_scoping(addr: SocketAddr) -> StdGuard {
+    let guard = StdGuard::new(LimitConfig::default());
+    guard.add_scope(ScopeEntry {
+        host: addr.to_string(),
+    });
+    guard
+}
+
+/// Example 1 (reflected XSS), with a fixed `marker` for deterministic assertions.
+fn example1_yaml() -> &'static str {
+    r#"
+id: reflected-xss-search-q
+info:
+  name: Reflected XSS in search 'q' parameter
+  severity: high
+  cwe: CWE-79
+  tags: [xss, reflected]
+variables:
+  - name: target
+    required: true
+  - name: param
+    default: q
+  - name: marker
+    default: MARK1234
+  - name: payload
+    default: "<script>window.__aitm='{{marker}}'</script>"
+steps:
+  - http:
+      method: GET
+      url: "{{target}}/search?{{param}}={{url_encode(payload)}}"
+  - browser:
+      action: navigate
+      url: "{{target}}/search?{{param}}={{url_encode(payload)}}"
+  - browser:
+      action: screenshot
+      label: xss-triggered
+success:
+  all:
+    - type: word
+      word: "window.__aitm='{{marker}}'"
+    - type: browser-eval
+      expr: "window.__aitm"
+      equals: "{{marker}}"
+"#
+}
+
+fn example1_bindings(addr: SocketAddr) -> VarBindings {
+    VarBindings::new().with("target", Value::Str(format!("http://{addr}")))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pass_vs_patched() {
+    let poc: Poc = serde_yaml::from_str(example1_yaml()).expect("parse example 1");
+
+    // Vulnerable target: the marker word is reflected AND the browser marker is
+    // observed → the PoC passes.
+    let vuln = spawn(TargetMode::Vulnerable);
+    let store = Arc::new(MemFlowStore::new());
+    let client = TargetClient;
+    let guard = guard_scoping(vuln);
+    let browser = StubBrowser {
+        eval_value: Value::Str("MARK1234".to_string()),
+    };
+    let host = CommandHost::new(store.as_ref(), &client, &guard, Some(&browser));
+    let result = StdPocRunner::new()
+        .run(&poc, example1_bindings(vuln), &host)
+        .await
+        .expect("run against vulnerable");
+    assert!(
+        result.passed,
+        "PoC must pass against the vulnerable target; outcomes: {:?}",
+        result.evaluated
+    );
+
+    // Patched target: the quote is HTML-escaped, so the marker word is absent →
+    // the `all` success is false even though the stub browser still answers.
+    let patched = spawn(TargetMode::Patched);
+    let store2 = Arc::new(MemFlowStore::new());
+    let guard2 = guard_scoping(patched);
+    let browser2 = StubBrowser {
+        eval_value: Value::Str("MARK1234".to_string()),
+    };
+    let host2 = CommandHost::new(store2.as_ref(), &client, &guard2, Some(&browser2));
+    let result2 = StdPocRunner::new()
+        .run(&poc, example1_bindings(patched), &host2)
+        .await
+        .expect("run against patched");
+    assert!(
+        !result2.passed,
+        "PoC must fail against the patched target; outcomes: {:?}",
+        result2.evaluated
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn three_artifacts() {
+    let poc: Poc = serde_yaml::from_str(example1_yaml()).expect("parse example 1");
+    let vuln = spawn(TargetMode::Vulnerable);
+    let store = Arc::new(MemFlowStore::new());
+    let client = TargetClient;
+    let guard = guard_scoping(vuln);
+    let browser = StubBrowser {
+        eval_value: Value::Str("MARK1234".to_string()),
+    };
+    let host = CommandHost::new(store.as_ref(), &client, &guard, Some(&browser));
+
+    let result = StdPocRunner::new()
+        .run(&poc, example1_bindings(vuln), &host)
+        .await
+        .expect("run");
+
+    // (1) finding capture: a valid FlowId present in the store.
+    assert!(
+        store.get(result.finding_capture).is_some(),
+        "finding_capture must be a flow in the store"
+    );
+
+    // (2) the PoC file re-parses as the same Poc.
+    let written = std::fs::read_to_string(&result.poc_path).expect("read poc file");
+    let reparsed: Poc = serde_yaml::from_str(&written).expect("re-parse poc file");
+    assert_eq!(reparsed, poc, "written PoC must round-trip to the same Poc");
+
+    // (3) the screenshot starts with the PNG magic.
+    let png = std::fs::read(&result.screenshot_path).expect("read screenshot");
+    assert!(
+        png.starts_with(&PNG_MAGIC),
+        "screenshot must be a PNG, got first bytes: {:?}",
+        &png[..png.len().min(8)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_step_out_of_scope_is_refused() {
+    let poc: Poc = serde_yaml::from_str(example1_yaml()).expect("parse example 1");
+    let vuln = spawn(TargetMode::Vulnerable);
+    let store = Arc::new(MemFlowStore::new());
+    let client = TargetClient;
+    // Guard with NO scope entry → the http step must be refused.
+    let guard = StdGuard::new(LimitConfig::default());
+    let browser = StubBrowser {
+        eval_value: Value::Null,
+    };
+    let host = CommandHost::new(store.as_ref(), &client, &guard, Some(&browser));
+
+    let err = StdPocRunner::new()
+        .run(&poc, example1_bindings(vuln), &host)
+        .await
+        .expect_err("out-of-scope run must error");
+    assert!(
+        err.to_string().to_lowercase().contains("scope"),
+        "error must mention scope, got: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extract_binds_variable_for_a_later_assertion() {
+    // An http step whose body carries a token; an extract step binds it; the
+    // top-level `success` is a DSL assertion that reads the bound variable.
+    let yaml = r#"
+id: extract-chain
+info:
+  name: Extractor binds a variable
+  severity: low
+steps:
+  - http:
+      method: GET
+      url: "{{target}}/search?q=token-ABC123-end"
+  - extract:
+      name: token
+      type: regex
+      regex: "token-([A-Z0-9]+)-end"
+success:
+  type: dsl
+  dsl: "token == \"ABC123\""
+"#;
+    let poc: Poc = serde_yaml::from_str(yaml).expect("parse extract poc");
+    let vuln = spawn(TargetMode::Vulnerable);
+    let store = Arc::new(MemFlowStore::new());
+    let client = TargetClient;
+    let guard = guard_scoping(vuln);
+    let host = CommandHost::new(store.as_ref(), &client, &guard, None);
+
+    let result = StdPocRunner::new()
+        .run(&poc, example1_bindings(vuln), &host)
+        .await
+        .expect("run extract chain");
+    assert!(
+        result.passed,
+        "extracted token must satisfy the DSL success; outcomes: {:?}",
+        result.evaluated
+    );
+}
