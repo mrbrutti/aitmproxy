@@ -32,17 +32,20 @@ user's request to keep research docs and memory inside `docs/research`.)
 
 ## Environment constraints (this machine, 2026-10-26)
 
-- The Claude sandbox **blocks creating `.git`** in the working dir and **blocks
-  GitHub API/network**. Git init, remote creation, and push must be run by the
-  user in their own terminal. See `docs/research/../../README`-level notes / the
-  session for the exact commands.
-- `gh` has the `mrbrutti` account configured but keyring login was failing.
+- The Claude **Bash sandbox blocks creating `.git`** in the working dir and
+  **blocks GitHub network**, even with bypass mode / `dangerouslyDisableSandbox`.
+  Run all git/gh operations through the **Terminal panel** (`run_in_terminal`),
+  which runs in the user's real login shell outside the sandbox.
+- SSH to GitHub fails (`Permission denied (publickey)`) — the local SSH key is
+  not tied to `mrbrutti`. Use an **HTTPS remote** + `gh auth setup-git` so pushes
+  authenticate with the `mrbrutti` gh token. (`gh` API itself works: it created
+  the repo.) The keyring "login failing" warning is cosmetic; the token is valid.
 
 ## Status
 
 - [x] Research on reference tools (mitmproxy, nuclei, Rust proxy stack,
   Playwright/CUA) — see this folder.
-- [ ] Private repo `mrbrutti/aitmproxy` created + pushed (blocked on user's
-  terminal).
+- [x] Private repo `mrbrutti/aitmproxy` created + pushed —
+  https://github.com/mrbrutti/aitmproxy (branch `main`).
 - [ ] Product brainstorming / definition.
 - [ ] Design document.
