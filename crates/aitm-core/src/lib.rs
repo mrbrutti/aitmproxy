@@ -5,19 +5,26 @@
 //! other crate in the workspace depends on this one.
 
 pub mod body;
+pub mod config;
 pub mod error;
 pub mod event;
 pub mod flow;
+pub mod guard;
 pub mod header;
 pub mod store;
 
 pub use body::{Body, StreamBody};
+pub use config::{
+    BackoffConfig, BrowserConfig, CaConfig, Config, LimitConfig, McpConfig, McpTransport,
+    ScopeConfig, ScopeEntry, SsrfPolicy,
+};
 pub use error::{FlowError, GuardError};
 pub use event::{Event, Verdict};
 pub use flow::{
     ConnInfo, Flow, FlowId, FlowMeta, HttpFlow, HttpRequest, HttpResponse, HttpVersion,
     InterceptState, ResumeHandle, WsDir, WsFlow, WsMessage, WsOpcode,
 };
+pub use guard::{classify_host, ActionPermit, HostClass, ScopeRateGuard, StdGuard};
 pub use header::HeaderMap;
 pub use store::{FlowKind, FlowQuery, FlowStore, MemFlowStore};
 
