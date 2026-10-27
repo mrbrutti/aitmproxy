@@ -3,10 +3,12 @@
 
 pub mod capture;
 pub mod intercept;
+pub mod mutate;
 pub mod replay;
 
 pub use capture::CapturePlugin;
 pub use intercept::InterceptPlugin;
+pub use mutate::MutatePlugin;
 pub use replay::ReplayPlugin;
 
 /// Drive a future to completion from a synchronous `Command::invoke`.
