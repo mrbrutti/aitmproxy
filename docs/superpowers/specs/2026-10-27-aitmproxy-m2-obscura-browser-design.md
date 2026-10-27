@@ -1,6 +1,6 @@
 # aitmproxy Milestone 2 — embedded obscura browser + CA management design
 
-**Status:** draft
+**Status:** approved (2026-10-27 by Matt)
 **Research inputs:** `docs/research/06-obscura-embedding.md`,
 `docs/research/experiments/2026-10-27-obscura-ca-mitm.md`,
 `docs/research/07-ca-install.md` (CA install/uninstall per platform; on branch
@@ -1621,19 +1621,12 @@ Config:
 
 ## Open questions
 
-Only Matt can answer these. Each has a recommended default so the plan can
-proceed if the answer is "as written".
-
-1. **Operator config surface.** Recommended: the **YAML config file** (D10 —
-   the platform spec's stated plan, one small module in `aitm`; the
-   `AITM_CA_ALLOW_AGENT_INSTALL` env bridge keeps working on top of it).
-   Alternative: `AITM_*` env overrides only, leaving the file for later.
-2. **Packaging scope.** Recommended: the **minimal `scripts/package.sh`** (D3:
-   one tarball for the host platform, fork binary downloaded from the fork's
-   GitHub Release and checksum-verified, no signing, no brew, no CI), with a
-   full multi-target release pipeline and brew formula deferred to a later
-   milestone. Alternative: build that pipeline now (then: is there an Apple
-   signing identity?).
+*(Resolved by Matt, 2026-10-27, both taken as recommended: (1) operator config
+surface = the **YAML config file** (D10), with `AITM_*` env overrides as a
+bridge; (2) packaging scope = the **minimal single-platform tarball** (D3), a
+full release pipeline / brew formula deferred to a later milestone. Also
+confirmed: `ca.allow_agent_install` default **off**, and this is Milestone 2
+with the Rhai scripting tier at M3. No questions remain.)*
 
 ### Summary
 
