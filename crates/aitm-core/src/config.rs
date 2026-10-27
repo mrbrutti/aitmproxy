@@ -123,6 +123,13 @@ pub struct CaConfig {
     pub dir: PathBuf,
     /// File mode for the private key (`0o600`).
     pub key_mode: u32,
+    /// Let an agent frontend (MCP) run `ca.install`/`ca.uninstall`. **Off by
+    /// default**: only the human CLI may change the OS trust store unless the
+    /// operator opts in.
+    pub allow_agent_install: bool,
+    /// Append-only JSON Lines record of every `ca.*` change or export. A
+    /// sibling of `dir`, never inside it, so the CA dir holds only key and cert.
+    pub audit_log: PathBuf,
 }
 
 impl Default for CaConfig {
@@ -130,6 +137,8 @@ impl Default for CaConfig {
         Self {
             dir: default_ca_dir(),
             key_mode: 0o600,
+            allow_agent_install: false,
+            audit_log: default_ca_audit_log(),
         }
     }
 }
@@ -141,10 +150,21 @@ impl Default for CaConfig {
 /// shared — and only to a local hidden dir when neither a config nor a home dir
 /// is discoverable.
 fn default_ca_dir() -> PathBuf {
+    default_aitm_dir().join("ca")
+}
+
+/// The CA audit log, `<config_dir>/aitmproxy/ca-audit.jsonl`: a sibling of
+/// [`default_ca_dir`] with the same fallbacks.
+fn default_ca_audit_log() -> PathBuf {
+    default_aitm_dir().join("ca-audit.jsonl")
+}
+
+/// The per-user aitmproxy directory the CA dir and audit log live under.
+fn default_aitm_dir() -> PathBuf {
     dirs::config_dir()
-        .map(|d| d.join("aitmproxy").join("ca"))
-        .or_else(|| dirs::home_dir().map(|h| h.join(".aitm").join("ca")))
-        .unwrap_or_else(|| PathBuf::from(".aitm/ca"))
+        .map(|d| d.join("aitmproxy"))
+        .or_else(|| dirs::home_dir().map(|h| h.join(".aitm")))
+        .unwrap_or_else(|| PathBuf::from(".aitm"))
 }
 
 /// MCP transport selection.
@@ -170,14 +190,52 @@ impl Default for McpConfig {
     }
 }
 
+/// Which browser engine backs the `browser.*` tools. Declared here next to
+/// `BrowserConfig`; `aitm-browser` selects the launcher from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BrowserEngine {
+    /// The bundled, forked obscura engine, which trusts the MITM CA via `--ca-cert`.
+    #[default]
+    Obscura,
+    /// A system Chrome/Chromium (the M1 behaviour).
+    Chrome,
+}
+
+/// How to find and start the forked obscura.
+#[derive(Debug, Clone)]
+pub struct ObscuraConfig {
+    /// The `obscura` binary; `None` runs the discovery order (bundled next to
+    /// `aitm`, then `AITM_OBSCURA_BIN`, then `PATH`).
+    pub binary: Option<PathBuf>,
+    /// Spawn → CDP connected; default 15 s.
+    pub start_timeout: Duration,
+    /// Graceful stop → SIGKILL; default 5 s.
+    pub stop_timeout: Duration,
+}
+
+impl Default for ObscuraConfig {
+    fn default() -> Self {
+        Self {
+            binary: None,
+            start_timeout: Duration::from_secs(15),
+            stop_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
 /// Embedded-browser configuration. Declared in `aitm-core` because `Config`
 /// references it; `aitm-browser` implements the driver against this type.
 #[derive(Debug, Clone)]
 pub struct BrowserConfig {
+    /// Engine selection; default obscura.
+    pub engine: BrowserEngine,
+    /// Obscura launcher settings (used when `engine` is `Obscura`).
+    pub obscura: ObscuraConfig,
     /// The proxy upstream (`--proxy-server`).
     pub proxy_addr: SocketAddr,
+    /// Chrome only: obscura has no head.
     pub headless: bool,
-    /// Trust the proxy CA via CDP `Security.setIgnoreCertificateErrors`.
+    /// Chrome only: trust the proxy CA via CDP `Security.setIgnoreCertificateErrors`.
     pub ignore_cert_errors: bool,
     pub nav_timeout: Duration,
     pub ssrf: SsrfPolicy,
@@ -186,6 +244,8 @@ pub struct BrowserConfig {
 impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
+            engine: BrowserEngine::default(),
+            obscura: ObscuraConfig::default(),
             // A dedicated loopback port, distinct from the main listener (8080):
             // the embedded browser dials this SSRF-filtered listener.
             proxy_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),

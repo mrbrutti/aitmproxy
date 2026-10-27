@@ -105,3 +105,29 @@ fn load_reuses_persisted_root() {
         "second load_or_generate must reuse the persisted root, not mint a new one"
     );
 }
+
+/// M2 Task 8: `cert_path()` names `<dir>/ca.crt` whether the root was just
+/// generated or reloaded, and reading it leaves the key file untouched.
+#[test]
+fn cert_path_after_generate_and_reload() {
+    let dir = temp_dir();
+    let key_path = dir.join("ca.key");
+
+    let generated = CertAuthority::load_or_generate(&dir, 0o600).expect("generate root");
+    assert_eq!(generated.cert_path(), dir.join("ca.crt"));
+    let key_before = std::fs::read(&key_path).expect("read key");
+
+    let loaded = CertAuthority::load_or_generate(&dir, 0o600).expect("load root");
+    assert_eq!(loaded.cert_path(), dir.join("ca.crt"));
+    assert_eq!(loaded.cert_path(), generated.cert_path());
+
+    // The accessor never touches the key: same bytes, same mode.
+    let key_after = std::fs::read(&key_path).expect("read key again");
+    assert_eq!(key_before, key_after, "ca.key bytes changed");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "ca.key mode was {mode:o}, want 600");
+    }
+}

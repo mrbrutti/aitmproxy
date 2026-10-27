@@ -48,6 +48,18 @@ pub trait BrowserDriver: Send + Sync {
     fn get_dom(&self) -> BoxFuture<'_, anyhow::Result<String>>;
 }
 
+/// Which frontend is invoking a command. A command that gates an active
+/// capability on a human being present (the `ca.*` trust-store changes) reads
+/// this from the host; the frontends never learn command names.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Frontend {
+    /// The human-driven `aitm` CLI.
+    Cli,
+    /// An agent over MCP.
+    Mcp,
+}
+
 /// Core services a command may use, without depending on any protocol crate.
 pub struct CommandHost<'a> {
     store: &'a dyn FlowStore,
@@ -56,6 +68,7 @@ pub struct CommandHost<'a> {
     browser: Option<&'a dyn BrowserDriver>,
     ssrf: crate::config::SsrfPolicy,
     poc_dir: Option<std::path::PathBuf>,
+    frontend: Frontend,
 }
 
 impl<'a> CommandHost<'a> {
@@ -76,6 +89,9 @@ impl<'a> CommandHost<'a> {
             browser,
             ssrf: crate::config::SsrfPolicy::default(),
             poc_dir: None,
+            // The gated posture: a host that did not declare itself the human
+            // CLI is treated as agent-driven.
+            frontend: Frontend::Mcp,
         }
     }
 
@@ -83,6 +99,17 @@ impl<'a> CommandHost<'a> {
     pub fn with_ssrf(mut self, policy: crate::config::SsrfPolicy) -> Self {
         self.ssrf = policy;
         self
+    }
+
+    /// Declare which frontend built this host (defaults to [`Frontend::Mcp`]).
+    pub fn with_frontend(mut self, frontend: Frontend) -> Self {
+        self.frontend = frontend;
+        self
+    }
+
+    /// The frontend invoking the command; [`Frontend::Mcp`] when never set.
+    pub fn frontend(&self) -> Frontend {
+        self.frontend
     }
 
     /// Confine `poc.run` to loading PoC files under `dir` (opt-in). `None` leaves

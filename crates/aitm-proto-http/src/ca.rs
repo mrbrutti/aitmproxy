@@ -3,7 +3,7 @@
 //! repeat host is a cache hit rather than a second mint (AC3).
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -30,6 +30,8 @@ pub struct LeafCert {
 pub struct CertAuthority {
     issuer: Issuer<'static, KeyPair>,
     root_pem: String,
+    /// `<dir>/ca.crt`, as loaded or written by `load_or_generate`.
+    cert_path: PathBuf,
     leaves: Cache<String, Arc<LeafCert>>,
     last_hit: AtomicBool,
 }
@@ -72,6 +74,7 @@ impl CertAuthority {
         Ok(Self {
             issuer,
             root_pem,
+            cert_path,
             leaves: Cache::new(LEAF_CACHE_CAPACITY),
             last_hit: AtomicBool::new(false),
         })
@@ -80,6 +83,12 @@ impl CertAuthority {
     /// PEM of the root certificate, for the "install & trust the CA" flow.
     pub fn root_cert_pem(&self) -> &str {
         &self.root_pem
+    }
+
+    /// Path of the root certificate file (`<dir>/ca.crt`), for a launcher that
+    /// needs the certificate **file** and must never see the key beside it.
+    pub fn cert_path(&self) -> &Path {
+        &self.cert_path
     }
 
     /// Cache hit, or mint and sign a leaf for `host` carrying the sniffed `sans`.
