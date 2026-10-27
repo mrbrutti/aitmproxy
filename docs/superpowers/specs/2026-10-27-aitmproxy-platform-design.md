@@ -2,6 +2,7 @@
 
 **Status:** draft
 **Research inputs:** `docs/research/01-mitmproxy.md`, `docs/research/02-nuclei.md`, `docs/research/03-rust-proxy-stack.md`, `docs/research/04-playwright-cua.md`, `docs/research/05-synthesis.md`
+**Companion specs:** plugin system — `docs/superpowers/specs/2026-10-27-aitmproxy-plugin-system-design.md` (the two-tier Rust+Rhai plugin model); PoC language — `docs/superpowers/specs/2026-10-27-aitmproxy-poc-language-design.md` (the YAML PoC language + script escape hatch). This spec owns the core/architecture and the `aitm-core`/`aitm-poc`/`aitm-plugin` Rust types the two companions reference; it does not duplicate their detail.
 
 ## Intent
 
@@ -40,8 +41,10 @@ Platform (build toward):
 - A **protocol-module seam** so protocols can be added later (HTTP/S + WebSocket
   first; raw L4/packet capability designed in, built later), by us or by
   external contributors.
-- A **plugin seam** that starts as native compiled-in Rust and can later gain a
-  runtime mechanism (WASM or embedded scripting) without recompiling the core.
+- A **two-tier plugin seam**: native compiled-in Rust (M1), plus a **committed
+  Rhai scripting tier** (human-readable runtime addons loaded without recompiling
+  the core; API shape decided in M1, runtime in M2), with WASM a roadmap option
+  behind the same seam. Detailed in the companion plugin-system spec.
 - **Plugin power sufficient for a future automated scanner.** The plugin seam,
   event bus, and command surface must be general enough that a later
   automated-scanner plugin — one that crawls, discovers injection points,
@@ -914,7 +917,7 @@ pub trait Template: Send + Sync {
 pub struct PocRunResult {
     pub passed: bool,
     pub finding_capture: FlowId,    // (1) triggering request/response flow
-    pub poc_path: PathBuf,          // (2) the replayable PoC file (TOML)
+    pub poc_path: PathBuf,          // (2) the replayable PoC file (YAML)
     pub screenshot_path: PathBuf,   // (3) PNG of the vuln triggering
     pub evaluated: Vec<AssertionOutcome>,
 }
@@ -922,8 +925,13 @@ pub struct PocRunResult {
 pub struct AssertionOutcome { pub assertion: String, pub matched: bool }
 ```
 
-- **PoC artifact format (decided):** a serde-serializable document; **TOML** is
-  the on-disk default (Architect's call, per Matt).
+- **PoC artifact format (decided by Matt): YAML.** A serde-serializable document;
+  **YAML** is the on-disk format (chosen for readability and nuclei/mitmproxy
+  familiarity). This supersedes this spec's earlier TOML call. The full PoC
+  language — schema, templating, matcher/extractor DSL, step types, and the Rhai
+  `script` escape hatch — is specified in the companion **PoC-language spec**
+  (`docs/superpowers/specs/2026-10-27-aitmproxy-poc-language-design.md`); this
+  section keeps only the Rust `aitm-poc` model it serializes to/from.
 - The PoC is **parameterized, not a transcript** — it need not retrace the exact
   original flow; it reproduces the finding from variables. The matcher/extractor
   vocabulary is borrowed from nuclei (`02-nuclei.md`); in M1 it is exercised to
@@ -1195,7 +1203,7 @@ sequenceDiagram
 2. The `PocBuilder` reads the flow from the store and **parameterizes** it:
    replaces concrete values with `{{var}}` placeholders per the chosen variables,
    orders the steps, attaches the success `Assertion`.
-3. It serializes the `Poc` to TOML and returns its path.
+3. It serializes the `Poc` to YAML and returns its path.
 
 ```mermaid
 sequenceDiagram
@@ -1208,7 +1216,7 @@ sequenceDiagram
   B->>S: get(flow_id)
   S-->>B: HttpFlow
   B->>B: parameterize -> Poc (variables, steps, success)
-  B-->>A: Poc serialized to TOML (path)
+  B-->>A: Poc serialized to YAML (path)
 ```
 
 ### 6. `poc.run` end-to-end (the reflected-XSS E2E, AC18)
@@ -1347,7 +1355,8 @@ gets its own explicit exit test when specced:
 |---|---|---|
 | Performance scale-up | Reach the **~10,000 rps** standing target on a single instance with bounded memory | A soak/load gate at the 10k-rps target, memory plateau held |
 | More protocols / L4 | `aitm-proto-l4` and further modules behind the existing seam | Capture/interception functional tests per new protocol; core untouched |
-| Runtime plugin mechanism | WASM/scripting plugins without recompiling the core | A third-party plugin loaded at runtime passes the plugin-API conformance tests |
+| Rhai scripting tier (**M2, committed**) | Human-readable runtime script plugins + the PoC `script` step, loaded without recompiling the core (API shape decided in M1) | Script-tier ACs green (plugin-system spec AC-P6–AC-P11; PoC-language AC-L8) |
+| WASM plugin runtime (roadmap) | Sandboxed any-language plugins behind the same seam | A WASM plugin loaded at runtime passes the plugin-API conformance tests |
 | Native GUIs | macOS/Linux GUI frontends over the same command bus | GUI drives the same commands; parity test with CLI/MCP |
 | PoC signing/validation | Supply-chain safety for shared PoCs | Signed-PoC verify/reject tests |
 | Automated-scanner plugin | Full Burp-style scanner **as a plugin** on the existing seams | Scanner plugin finds seeded bugs with no core edits |
@@ -1409,8 +1418,9 @@ criteria. **AC20** is the performance/soak criterion. M1's exit gate (see
     posture: block private + loopback unless explicitly in scope.)
 13. **AC13 — PoC artifact round-trips:** A reflected-XSS finding is captured into
     a `Poc` with variables (target URL, injection parameter, payload) and a
-    `BrowserEval` success assertion; the artifact serializes to **TOML** on disk
-    and deserializes back equal, and passes schema validation. (See data-flow 5.)
+    `BrowserEval` success assertion; the artifact serializes to **YAML** on disk
+    and deserializes back equal, and passes schema validation. (See data-flow 5
+    and the companion PoC-language spec.)
 14. **AC14 — PoC runs with no agent, deterministically:** `poc.run` on the
     artifact executes with only aitmproxy: it returns **pass** against a bundled
     vulnerable target and **fail** against a patched build of the same target.
@@ -1473,13 +1483,14 @@ Constraints, Design, Safety, and Acceptance-criteria sections above; none remain
 aitmproxy is a Rust workspace with a thin, protocol-agnostic MITM **core**
 (flow store + typed event bus + ordered plugin chain + command registry +
 scope/rate guards), protocols and features behind a **ProtocolModule seam** and a
-native-Rust **Plugin seam** (WASM/scripting later), and frontends — **MCP**, CLI,
+**two-tier Plugin seam** (compiled-in Rust in M1, committed **Rhai scripting tier**
+in M2, WASM roadmap), and frontends — **MCP**, CLI,
 future GUIs — that are all clients of **one command surface**, which is what makes
 100% of the tool MCP-controllable and keeps the tool/agent split honest. M1 runs
 on **macOS + Linux** and delivers HTTP/S + WebSocket capture, MCP control (stdio +
 loopback-TCP-with-token), an embedded chromiumoxide browser routed through the
 proxy with a block-private/loopback-unless-scoped SSRF guard, and a
-**parameterized, self-contained PoC engine** (TOML artifacts) that reproduces a
+**parameterized, self-contained PoC engine** (YAML artifacts) that reproduces a
 reflected XSS with no agent and emits the three artifacts (finding, replayable
 PoC, screenshot). Authorization in M1 is deny-by-default scope (no separate
 recorded-authorization file). A **first-class, tested performance requirement**
@@ -1511,16 +1522,21 @@ itself** — none of which may require editing the core.
 5. One **command bus** as the single control plane; MCP and CLI/TUI/GUIs are
    frontends over it; MCP tool schemas derive from command `ParamSchema` via the
    transport-neutral `TypeDesc`/`Value`.
-6. Plugin API = native compiled-in Rust trait objects first, seam shaped for a
-   later WASM/scripting runtime; public trait surface treated as external-authoring
-   API (per Matt's decision to open the project).
+6. Plugin API = **two tiers behind one seam**: native compiled-in Rust trait
+   objects (M1) and a **committed Rhai scripting tier** (human-readable runtime
+   addons; API shape decided in M1, runtime in M2), with WASM a further-future
+   roadmap option — not "Rust-only, WASM-later." Public trait surface and the
+   script-facing API are treated as external-authoring contracts (per Matt's
+   decision to open the project). Detailed in the companion plugin-system spec.
 7. Embedded browser via **chromiumoxide/CDP in-process**, proxy via
    `--proxy-server`, CA trust via `Security.setIgnoreCertificateErrors`; CUA VMs
    reserved for later.
-8. PoC engine = declarative, parameterized, self-contained serde artifact
-   (**TOML** default, now decided) reusing nuclei's matcher/extractor vocabulary —
-   used for reproduction in M1 but kept **reusable by a future scanner plugin**,
-   not walled off; signing deferred.
+8. PoC engine = declarative-first, parameterized, self-contained serde artifact in
+   **YAML** (decided by Matt, superseding the earlier TOML call; readability +
+   nuclei familiarity), flexible via a **Rhai `script` escape hatch** reusing the
+   plugin-system scripting API. Reuses nuclei's matcher/extractor vocabulary — used
+   for reproduction in M1 but kept **reusable by a future scanner plugin**, not
+   walled off; signing deferred. Detailed in the companion PoC-language spec.
 9. Deny-by-default scope posture; active actions gated, passive capture allowed.
    This is also the M1 authorization mechanism — **no separate recorded-auth file
    in M1** (deferred), per Matt.
