@@ -116,6 +116,44 @@ fn ssrf_connector_decision() {
     .is_ok());
 }
 
+/// DNS rebinding: a scoped *hostname* must not lift a private/loopback block;
+/// only an IP-literal / `localhost` entry matching the resolved dst does.
+#[test]
+fn scoped_hostname_does_not_lift_private() {
+    let policy = SsrfPolicy::default();
+    let scope = vec![scoped("evil.test")];
+    assert!(matches!(
+        ssrf_check(
+            &policy,
+            &scope,
+            "evil.test:80",
+            "127.0.0.1".parse().unwrap()
+        ),
+        Err(GuardError::PrivateAddressBlocked(_))
+    ));
+    assert!(matches!(
+        ssrf_check(
+            &policy,
+            &scope,
+            "evil.test:80",
+            "169.254.169.254".parse().unwrap()
+        ),
+        Err(GuardError::PrivateAddressBlocked(_))
+    ));
+    // The documented escape hatch: scope the resolved IP literal.
+    let ip_scope = vec![scoped("evil.test"), scoped("127.0.0.1")];
+    assert!(ssrf_check(
+        &policy,
+        &ip_scope,
+        "evil.test:80",
+        "127.0.0.1".parse().unwrap()
+    )
+    .is_ok());
+    // A scoped `localhost` authority to a loopback dst is still allowed.
+    let lh = vec![scoped("localhost")];
+    assert!(ssrf_check(&policy, &lh, "localhost:3000", "127.0.0.1".parse().unwrap()).is_ok());
+}
+
 #[test]
 fn deny_by_default() {
     let guard = StdGuard::default();
@@ -132,6 +170,60 @@ fn classify_private() {
     assert!(matches!(classify_host("127.0.0.1"), HostClass::Loopback));
     assert!(matches!(classify_host("10.0.0.5"), HostClass::Private));
     assert!(matches!(classify_host("93.184.216.34"), HostClass::Public));
+}
+
+/// Reserved ranges a public-looking literal could hide behind are private:
+/// the IPv4 TEST-NET docs, IPv6 documentation + Teredo, and NAT64 local-use.
+#[test]
+fn classify_reserved_ranges() {
+    assert!(matches!(classify_host("192.0.2.5"), HostClass::Private));
+    assert!(matches!(classify_host("198.51.100.5"), HostClass::Private));
+    assert!(matches!(classify_host("203.0.113.5"), HostClass::Private));
+    assert!(matches!(classify_host("2001:db8::1"), HostClass::Private));
+    assert!(matches!(classify_host("2001::1"), HostClass::Private));
+    assert!(matches!(classify_host("64:ff9b:1::1"), HostClass::Private));
+    // A genuinely public v4/v6 is still public.
+    assert!(matches!(
+        classify_host("2606:2800:220:1::1"),
+        HostClass::Public
+    ));
+}
+
+/// Rate limiting, the error budget and host-disable key on the *normalized* host,
+/// so different spellings of one host cannot each get a fresh allowance and a
+/// disabled host is not reachable under another spelling (AC17 / host-disable).
+#[test]
+fn rate_and_disable_key_is_normalized() {
+    // One token per host: the first spelling passes, the next shares the bucket.
+    let guard = StdGuard::new(LimitConfig {
+        per_host_rps: 1,
+        ..Default::default()
+    });
+    guard.add_scope(scoped("target.example"));
+    assert!(guard.check_active("Target.Example").is_ok());
+    assert!(
+        matches!(
+            guard.check_active("target.example:443"),
+            Err(GuardError::RateLimited { .. })
+        ),
+        "a different spelling must share the per-host bucket"
+    );
+
+    // A host disabled under one spelling is disabled under every spelling.
+    let g2 = StdGuard::new(LimitConfig {
+        per_host_rps: 1000,
+        host_error_budget: 1,
+        ..Default::default()
+    });
+    g2.add_scope(scoped("target.example"));
+    g2.record_error("TARGET.example:443");
+    assert!(
+        matches!(
+            g2.check_active("target.example"),
+            Err(GuardError::HostDisabled)
+        ),
+        "disable must apply across spellings"
+    );
 }
 
 #[test]

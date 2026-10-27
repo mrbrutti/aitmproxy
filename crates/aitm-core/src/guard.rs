@@ -109,6 +109,11 @@ fn classify_ip(ip: IpAddr) -> HostClass {
                 || (o[0] == 192 && o[1] == 0 && o[2] == 0)
                 // Benchmarking (198.18.0.0/15).
                 || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                // Documentation TEST-NET-1/2/3 (192.0.2.0/24, 198.51.100.0/24,
+                // 203.0.113.0/24) — never a real target, so refuse by default.
+                || (o[0] == 192 && o[1] == 0 && o[2] == 2)
+                || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113)
                 // Multicast + reserved + broadcast (224.0.0.0/3).
                 || o[0] >= 224
             {
@@ -126,6 +131,11 @@ fn classify_ip(ip: IpAddr) -> HostClass {
                     o[12], o[13], o[14], o[15],
                 )));
             }
+            // NAT64 local-use prefix 64:ff9b:1::/48 (RFC 8215): a local translator,
+            // not a public target — refuse by default.
+            if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001 {
+                return HostClass::Private;
+            }
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return classify_ip(IpAddr::V4(v4));
             }
@@ -142,7 +152,13 @@ fn classify_ip(ip: IpAddr) -> HostClass {
             // Site-local fec0::/10 (deprecated) and multicast ff00::/8.
             let is_site_local = (seg0 & 0xffc0) == 0xfec0;
             let is_multicast = (seg0 & 0xff00) == 0xff00;
-            // 6to4 2002::/16 and Teredo 2001:0000::/32 embed a v4 relay/address.
+            // Documentation 2001:db8::/32 (RFC 3849): never a real target.
+            let is_doc = seg0 == 0x2001 && seg[1] == 0x0db8;
+            // Teredo 2001:0000::/32 (RFC 4380): tunnels to an embedded relay; we do
+            // not decode it, we refuse the whole prefix so it can't reach a private
+            // host via the tunnel.
+            let is_teredo = seg0 == 0x2001 && seg[1] == 0x0000;
+            // 6to4 2002::/16 embeds the v4 relay; classify that address instead.
             if seg0 == 0x2002 {
                 return classify_ip(IpAddr::V4(std::net::Ipv4Addr::new(
                     (seg[1] >> 8) as u8,
@@ -158,6 +174,8 @@ fn classify_ip(ip: IpAddr) -> HostClass {
                 || is_link_local
                 || is_site_local
                 || is_multicast
+                || is_doc
+                || is_teredo
             {
                 HostClass::Private
             } else {
@@ -177,11 +195,12 @@ fn blocked_by_policy(class: HostClass, policy: &crate::config::SsrfPolicy) -> bo
 }
 
 /// SSRF decision for an upstream connection: refuse a private/loopback target
-/// (by the requested `authority` or the resolved `dst`) unless the host or IP
-/// literal is **explicitly** in scope (an exact `host`/`host:port`/IP entry — a
-/// wildcard does not lift the block). Used by the browser proxy connector so
-/// redirects, page `fetch`, sub-resources and `browser.eval` are all covered,
-/// not only the first navigation.
+/// (by the requested `authority` or the resolved `dst`) unless an **IP literal /
+/// `localhost`** that matches `dst` is explicitly in scope (a wildcard, and —
+/// crucially — a scoped *DNS hostname*, do not lift the block; a hostname that
+/// resolves private is a DNS-rebinding attempt). Used by the browser proxy
+/// connector so redirects, page `fetch`, sub-resources and `browser.eval` are all
+/// covered, not only the first navigation.
 pub fn ssrf_check(
     policy: &crate::config::SsrfPolicy,
     scope: &[ScopeEntry],
@@ -200,18 +219,46 @@ pub fn ssrf_check(
         return Ok(());
     }
 
+    // The block is lifted only by an *address* the operator scoped: the resolved
+    // `dst` as an IP-literal entry, a `localhost` entry for a loopback dst, or a
+    // requested authority that is itself this literal address / `localhost` and is
+    // scoped. A scoped DNS *hostname* must NOT whitelist a private resolution —
+    // otherwise an attacker scopes a public name they control and rebinds it to
+    // 127.0.0.1 / 169.254.169.254 (DNS rebinding).
     let ip_auth = Authority::new(&dst.to_string(), dst_port(auth.as_ref()));
-    let in_scope = policy.allow_if_in_scope
+    let dst_loopback = matches!(classify_ip(dst), HostClass::Loopback);
+    let auth_is_this_literal = auth
+        .as_ref()
+        .is_some_and(|a| a.ip() == Some(dst) || (a.host == "localhost" && dst_loopback));
+    let lifted = policy.allow_if_in_scope
         && scope.iter().any(|e| {
-            auth.as_ref()
-                .is_some_and(|a| a.matches_scope_entry_exactly(&e.host))
-                || ip_auth.matches_scope_entry_exactly(&e.host)
+            ip_auth.matches_scope_entry_exactly(&e.host)
+                || (dst_loopback && e.host.trim().eq_ignore_ascii_case("localhost"))
+                || (auth_is_this_literal
+                    && auth
+                        .as_ref()
+                        .is_some_and(|a| a.matches_scope_entry_exactly(&e.host)))
         });
-    if in_scope {
-        Ok(())
-    } else {
-        Err(GuardError::PrivateAddressBlocked(host))
+    if lifted {
+        return Ok(());
     }
+
+    // A scoped hostname that resolved to a private address is refused, not lifted:
+    // warn so an operator who legitimately needs an internal host knows to scope
+    // its IP literal instead.
+    let scoped_name_resolved_private = auth.as_ref().is_some_and(|a| {
+        a.ip().is_none()
+            && a.host != "localhost"
+            && scope.iter().any(|e| a.matches_scope_entry_exactly(&e.host))
+    });
+    if scoped_name_resolved_private {
+        tracing::warn!(
+            host = %host,
+            dst = %dst,
+            "scoped hostname resolved to a private/loopback address; refusing (possible DNS rebinding) — scope the IP literal to allow it"
+        );
+    }
+    Err(GuardError::PrivateAddressBlocked(host))
 }
 
 fn dst_port(auth: Option<&Authority>) -> u16 {
@@ -365,7 +412,15 @@ impl ScopeRateGuard for StdGuard {
         if !self.in_scope(host) {
             return Err(GuardError::OutOfScope(host.to_string()));
         }
-        if self.is_disabled(host) {
+        // Key the throttle, error budget and disable window on the *normalized*
+        // host, the same fold scope matching uses, so `target.example`,
+        // `TARGET.example` and `Target.Example:443` share one bucket/counter and a
+        // disabled host is not reachable under another spelling.
+        let key = match Authority::parse_with_default(host, 0) {
+            Ok(a) => a.host,
+            Err(_) => return Err(GuardError::OutOfScope(host.to_string())),
+        };
+        if self.is_disabled(&key) {
             return Err(GuardError::HostDisabled);
         }
 
@@ -395,7 +450,7 @@ impl ScopeRateGuard for StdGuard {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             let bucket = buckets
-                .entry(host.to_string())
+                .entry(key.clone())
                 .or_insert_with(|| TokenBucket::new(rps));
             if !bucket.try_take() {
                 return Err(GuardError::RateLimited {
@@ -446,11 +501,17 @@ impl ScopeRateGuard for StdGuard {
         if self.host_error_budget == 0 {
             return;
         }
+        // Same normalized key as `check_active`, so the budget and disable window
+        // can't be evaded (or double-counted) by spelling the host differently.
+        let key = match Authority::parse_with_default(host, 0) {
+            Ok(a) => a.host,
+            Err(_) => return,
+        };
         let mut errors = self
             .host_errors
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let count = errors.entry(host.to_string()).or_insert(0);
+        let count = errors.entry(key.clone()).or_insert(0);
         *count += 1;
         if *count >= self.host_error_budget {
             *count = 0;
@@ -460,7 +521,7 @@ impl ScopeRateGuard for StdGuard {
                     .disable_count
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                let n = d.entry(host.to_string()).or_insert(0);
+                let n = d.entry(key.clone()).or_insert(0);
                 *n += 1;
                 *n
             };
@@ -468,7 +529,7 @@ impl ScopeRateGuard for StdGuard {
             self.disabled_until
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert(host.to_string(), until);
+                .insert(key, until);
         }
     }
 }
