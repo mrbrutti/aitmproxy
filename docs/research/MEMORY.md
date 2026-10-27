@@ -29,6 +29,8 @@ user's request to keep research docs and memory inside `docs/research`.)
 - Research docs and project memory live in `docs/research/`.
 - Design documents live in `docs/superpowers/specs/` (brainstorming workflow).
 - Nothing is built until the design document is approved (brainstorming gate).
+- Development workflow (7 engines, 7 stages) is defined in `docs/superpowers/WORKFLOW.md`;
+  engines live in `.claude/agents/`; `CLAUDE.md` points every session at it (2026-10-27).
 
 ## Environment constraints (this machine, 2026-10-26)
 
@@ -47,5 +49,6 @@ user's request to keep research docs and memory inside `docs/research`.)
   Playwright/CUA) — see this folder.
 - [x] Private repo `mrbrutti/aitmproxy` created + pushed —
   https://github.com/mrbrutti/aitmproxy (branch `main`).
+- [x] Development workflow, engines, and templates (2026-10-27).
 - [ ] Product brainstorming / definition.
 - [ ] Design document.

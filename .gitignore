@@ -1,5 +1,6 @@
-# Claude Code local session/config artifacts
-.claude/
+# Claude Code local session/config artifacts (agent engines are tracked)
+.claude/*
+!.claude/agents/
 
 # Rust
 /target/
