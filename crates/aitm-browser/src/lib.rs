@@ -7,10 +7,12 @@
 mod commands;
 mod config;
 mod driver;
+pub mod obscura;
 mod ssrf;
 
 pub use aitm_core::{BrowserDriver, ClickTarget, NavOutcome};
 pub use commands::{register_browser_commands, BrowserPlugin};
 pub use config::{BrowserConfig, SsrfPolicy};
 pub use driver::ChromeDriver;
+pub use obscura::{ObscuraProcess, ProbeInfo};
 pub use ssrf::{check_url, HostResolver, ResolvedTarget, SsrfGuard, StdSsrfGuard, SystemResolver};
