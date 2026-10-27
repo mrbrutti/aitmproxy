@@ -8,3 +8,17 @@ description = "Embedded headless browser driver over CDP, with SSRF guard and br
 
 [dependencies]
 aitm-core.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+# Named by the plan (Task 18): headless Chromium over CDP on tokio. No default
+# features: the CDP socket is plain ws://localhost, and the optional Chromium
+# fetcher (which the TLS features pull in) is not wanted.
+chromiumoxide = { version = "0.9", default-features = false }
+# `page.evaluate` yields `serde_json::Value`; converted to `aitm_core::Value`.
+serde_json = "1"
+# URL authority parsing for the SSRF guard (already in the tree via chromiumoxide).
+url = "2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
