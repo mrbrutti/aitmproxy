@@ -1,9 +1,44 @@
 //! Task 6: the scope/rate guard, SSRF address classification, and config types.
 
 use aitm_core::{
-    classify_host, ssrf_check, GuardError, HostClass, LimitConfig, ScopeEntry, ScopeRateGuard,
-    SsrfPolicy, StdGuard,
+    classify_host, ssrf_check, BackoffConfig, GuardError, HostClass, LimitConfig, ScopeEntry,
+    ScopeRateGuard, SsrfPolicy, StdGuard,
 };
+
+/// Once a host's error budget is exhausted it is disabled, then eligible again
+/// after the backoff window (so `HostDisabled` and `BackoffConfig` are live).
+#[test]
+fn host_disable_then_backoff_recovery() {
+    let guard = StdGuard::new(LimitConfig {
+        global_rps: 1000,
+        per_host_rps: 1000,
+        max_concurrency: 1000,
+        host_error_budget: 2,
+        backoff: BackoffConfig {
+            base: std::time::Duration::from_millis(60),
+            max: std::time::Duration::from_secs(1),
+            factor: 2.0,
+        },
+        ..LimitConfig::default()
+    });
+    guard.add_scope(scoped("ex.test"));
+
+    assert!(guard.check_active("ex.test").is_ok());
+    guard.record_error("ex.test"); // 1 < budget
+    assert!(guard.check_active("ex.test").is_ok());
+    guard.record_error("ex.test"); // reaches budget 2 → disabled
+    assert!(matches!(
+        guard.check_active("ex.test"),
+        Err(GuardError::HostDisabled)
+    ));
+
+    // After the backoff window the host is eligible again.
+    std::thread::sleep(std::time::Duration::from_millis(90));
+    assert!(
+        guard.check_active("ex.test").is_ok(),
+        "host should recover after the backoff window"
+    );
+}
 
 fn scoped(host: &str) -> ScopeEntry {
     ScopeEntry { host: host.into() }

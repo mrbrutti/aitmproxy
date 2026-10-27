@@ -50,7 +50,17 @@ impl ProxyClient for PipelineClient {
         Box::pin(async move {
             // Hold the permit for the whole send (concurrency released on drop).
             let _permit = self.guard.check_active(&req.authority)?;
-            let response = self.sender.send(&req).await?;
+            let response = match self.sender.send(&req).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    // An upstream failure counts against the host's error budget.
+                    self.guard.record_error(&req.authority);
+                    return Err(e);
+                }
+            };
+            if response.status >= 500 {
+                self.guard.record_error(&req.authority);
+            }
             let flow = HttpFlow {
                 id: FlowId::new(),
                 request: req,

@@ -23,6 +23,9 @@ pub trait ScopeRateGuard: Send + Sync {
     fn add_scope(&self, entry: ScopeEntry);
     /// The current scope entries.
     fn list_scope(&self) -> Vec<ScopeEntry>;
+    /// Record an error against `host`; once its budget is exhausted the guard
+    /// disables it (with backoff) and `check_active` refuses it. Default: no-op.
+    fn record_error(&self, _host: &str) {}
 }
 
 /// A granted concurrency slot. Dropping it releases the slot (RAII).
@@ -267,6 +270,11 @@ pub struct StdGuard {
     in_flight: Arc<AtomicU32>,
     host_error_budget: u32,
     host_errors: Mutex<HashMap<String, u32>>,
+    backoff: crate::config::BackoffConfig,
+    /// Per-host: how many times it has been disabled (drives exponential backoff).
+    disable_count: Mutex<HashMap<String, u32>>,
+    /// Per-host: the instant a disabled host becomes eligible again.
+    disabled_until: Mutex<HashMap<String, Instant>>,
 }
 
 impl StdGuard {
@@ -281,7 +289,22 @@ impl StdGuard {
             in_flight: Arc::new(AtomicU32::new(0)),
             host_error_budget: limits.host_error_budget,
             host_errors: Mutex::new(HashMap::new()),
+            backoff: limits.backoff,
+            disable_count: Mutex::new(HashMap::new()),
+            disabled_until: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The backoff duration for the `n`-th disable of a host (exponential,
+    /// capped at `backoff.max`).
+    fn backoff_for(&self, n: u32) -> Duration {
+        let factor = self
+            .backoff
+            .factor
+            .max(1.0)
+            .powi(n.saturating_sub(1) as i32);
+        let secs = self.backoff.base.as_secs_f64() * factor;
+        Duration::from_secs_f64(secs).min(self.backoff.max)
     }
 
     /// Reconfigure the per-host rate at runtime (drives AC-P4: changing the
@@ -293,17 +316,6 @@ impl StdGuard {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
-    }
-
-    /// Record an error against a host; once the budget is exhausted the host is
-    /// disabled and `check_active` refuses it with `HostDisabled`.
-    pub fn record_error(&self, host: &str) {
-        *self
-            .host_errors
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(host.to_string())
-            .or_insert(0) += 1;
     }
 
     fn in_scope(&self, host: &str) -> bool {
@@ -320,13 +332,15 @@ impl StdGuard {
         if self.host_error_budget == 0 {
             return false;
         }
-        self.host_errors
+        match self
+            .disabled_until
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(host)
-            .copied()
-            .unwrap_or(0)
-            >= self.host_error_budget
+        {
+            Some(until) => Instant::now() < *until,
+            None => false,
+        }
     }
 }
 
@@ -422,5 +436,39 @@ impl ScopeRateGuard for StdGuard {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Record an error. On reaching the per-host budget the host is disabled for
+    /// a backoff window (exponential per disable); after the window it is eligible
+    /// again. The error counter resets so the next budget triggers the next,
+    /// longer, backoff.
+    fn record_error(&self, host: &str) {
+        if self.host_error_budget == 0 {
+            return;
+        }
+        let mut errors = self
+            .host_errors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let count = errors.entry(host.to_string()).or_insert(0);
+        *count += 1;
+        if *count >= self.host_error_budget {
+            *count = 0;
+            drop(errors);
+            let disables = {
+                let mut d = self
+                    .disable_count
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let n = d.entry(host.to_string()).or_insert(0);
+                *n += 1;
+                *n
+            };
+            let until = Instant::now() + self.backoff_for(disables);
+            self.disabled_until
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(host.to_string(), until);
+        }
     }
 }

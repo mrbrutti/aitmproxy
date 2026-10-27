@@ -602,6 +602,14 @@ async fn serve(
                 }
             }
             if n == 0 && !done {
+                // Map the transport failure to the typed error bus before bailing.
+                ctx.emit(Event::Error {
+                    flow: id,
+                    kind: aitm_core::FlowError::Upstream(
+                        "upstream closed before completing the response".to_string(),
+                    ),
+                })
+                .await;
                 bail!("upstream closed before completing the response");
             }
         }
