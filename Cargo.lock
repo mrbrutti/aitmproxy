@@ -29,6 +29,10 @@ name = "aitm-cli"
 version = "0.1.0"
 dependencies = [
  "aitm-core",
+ "aitm-mcp",
+ "anyhow",
+ "futures",
+ "serde_json",
 ]
 
 [[package]]
