@@ -17,6 +17,7 @@ This folder holds the reference research gathered while defining **aitmproxy**
 | [03-rust-proxy-stack.md](03-rust-proxy-stack.md) | RustProxy, obscura, hudsucker | Rust proxy references + best-practice crate stack |
 | [04-playwright-cua.md](04-playwright-cua.md) | Playwright, trycua/cua | Headless-browser control + computer-use-agent driver |
 | [05-synthesis.md](05-synthesis.md) | — | Combined design takeaways for aitmproxy |
+| [06-obscura-embedding.md](06-obscura-embedding.md) | obscura | Embedding obscura as aitmproxy's browser engine: embeddability, CDP surface, MITM/CA gap |
 | [MEMORY.md](MEMORY.md) | — | Project memory: durable facts and decisions |
 
 ## Reference projects
