@@ -10,7 +10,8 @@ description = "Embedded headless browser driver over CDP, with SSRF guard and br
 aitm-core.workspace = true
 anyhow.workspace = true
 futures.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
+# `process` (Task 19): the forked obscura runs as a managed child.
+tokio = { workspace = true, features = ["rt", "sync", "time", "process"] }
 # Named by the plan (Task 18): headless Chromium over CDP on tokio. No default
 # features: the CDP socket is plain ws://localhost, and the optional Chromium
 # fetcher (which the TLS features pull in) is not wanted.
