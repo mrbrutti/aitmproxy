@@ -23,6 +23,14 @@ reproduces a finding as a parameterized self-contained PoC, and drives an
 embedded headless browser to screenshot the vulnerability triggering —
 demonstrated end to end on a reflected XSS.
 
+**Why Rust — performance and stability under load.** A core reason for the
+rewrite is resource behaviour: mitmproxy (Python) and Burp (Java) consume heavy
+memory and, under high-volume or large-body traffic, bog down, exhaust resources,
+or crash (OOM). aitmproxy exists partly to **avoid that** — to sustain heavy
+sustained load with bounded, stable memory and no crashes. This is not a
+nice-to-have; it is a first-class, tested requirement (see Constraints and the
+performance acceptance criterion).
+
 ## Goals
 
 Platform (build toward):
@@ -103,9 +111,11 @@ Milestone 1 (ship and prove):
   replay. A PoC that is not self-contained and deterministic is a failure.
 - An agent-only tool. If disabling MCP leaves any deterministic capability
   unreachable from the CLI, the tool/agent split has failed.
-- Python-tier throughput. If the Rust core cannot comfortably out-throughput
-  mitmproxy on high-volume or large-body traffic, a core reason for the project
-  is lost.
+- Python-tier throughput or Python/Java-tier resource behaviour. If the Rust core
+  cannot comfortably out-throughput mitmproxy on high-volume or large-body
+  traffic, a core reason for the project is lost — and it is **equally a failure**
+  if the proxy crashes, OOMs, or grows memory without bound under sustained load.
+  Stable, bounded memory under heavy load is as required as raw speed.
 - Shipping active-attack capability with unsafe defaults (no scope control, no
   rate limiting, unguarded SSRF from the embedded browser).
 - A plugin API too narrow to host a future automated scanner. If adding active
@@ -120,7 +130,17 @@ Milestone 1 (ship and prove):
   signed-off Security-reviewer entry.
 - **Performance/memory:** async, zero-copy where practical, bodies streamed not
   buffered by default; must scale to high connection counts. sans-IO protocol
-  logic kept allocation-light.
+  logic kept allocation-light. These choices exist precisely to beat the
+  Python/Java resource profile (see Intent): streamed bodies + backpressure cap
+  peak memory, and allocation-light sans-IO keeps per-flow cost flat.
+- **Throughput & memory under load (hard requirement):** a single instance must
+  sustain **thousands up to ~10,000 requests/second with bounded, stable
+  memory** — no leaks, no unbounded growth, no OOM, no crash under sustained
+  load. Memory must plateau (not trend upward) over a long run. This is a direct
+  consequence of the streamed-bodies / backpressure / allocation-light-sans-IO
+  design above, and is verified, not assumed (see the performance acceptance
+  criterion; the M1-gated floor vs. the ~10,000 rps standing target is an
+  Architect's call recorded there).
 - **Platform (decided):** developed/distributed on macOS (`brew install`); the
   core and browser **must also run on Linux**. M1 targets **macOS + Linux**
   (Architect's call, per Matt). No L4/transparent capture either way in M1, so
@@ -1297,11 +1317,54 @@ flowchart TD
   Rate -- yes --> Proceed["acquire permit, execute action"]
 ```
 
+## Milestones and exit criteria
+
+Development proceeds milestone by milestone, and **each milestone has an explicit
+test gate that must fully pass before the next milestone begins.** A milestone is
+not "done" — and the next does not start — until its gate is green. Verification
+at every gate is **both** TDD unit tests **and** functional/behavioral tests that
+drive the real tool end-to-end (see the Acceptance-criteria preamble); unit tests
+alone never close a gate.
+
+**Intentionally-vulnerable test target (M1 deliverable).** M1 ships a bundled,
+intentionally-vulnerable web app exhibiting a **reflected XSS**, plus a **patched
+variant** of the same app. The patched variant is what makes AC14's pass/fail
+deterministic (vulnerable → `poc.run` passes; patched → it fails). This target is
+an M1 deliverable, not test scaffolding borrowed from elsewhere; only its
+implementation details are left to the builder. M1's test site is limited to this
+reflected-XSS vulnerable+patched pair — the broad, multi-vulnerability,
+agent-driven site is a later milestone (below).
+
+**M1 exit gate.** All M1 acceptance criteria (AC1–AC20) green — unit **and**
+functional (AC10, AC14, AC18) **and** performance/soak (AC20) — through the Rust
+gate `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`.
+Only then does post-M1 work begin.
+
+**Later milestones and their gates (roadmap depth).** Sketched, not detailed; each
+gets its own explicit exit test when specced:
+
+| Milestone (roadmap) | Theme | Exit gate (high level) |
+|---|---|---|
+| Performance scale-up | Reach the **~10,000 rps** standing target on a single instance with bounded memory | A soak/load gate at the 10k-rps target, memory plateau held |
+| More protocols / L4 | `aitm-proto-l4` and further modules behind the existing seam | Capture/interception functional tests per new protocol; core untouched |
+| Runtime plugin mechanism | WASM/scripting plugins without recompiling the core | A third-party plugin loaded at runtime passes the plugin-API conformance tests |
+| Native GUIs | macOS/Linux GUI frontends over the same command bus | GUI drives the same commands; parity test with CLI/MCP |
+| PoC signing/validation | Supply-chain safety for shared PoCs | Signed-PoC verify/reject tests |
+| Automated-scanner plugin | Full Burp-style scanner **as a plugin** on the existing seams | Scanner plugin finds seeded bugs with no core edits |
+| **Agent-driven vuln-finding site (product-level goal)** | An **AI agent autonomously drives aitmproxy against a test website seeded with known vulnerabilities and finds them by itself** — the ultimate functional proof the tool works | An exit test that seeds N known vulns and asserts the agent, unaided, reports them |
+
 ## Acceptance criteria
 
 All criteria are for **Milestone 1** and are observable via `cargo test`
 (integration tests may stand up local TLS/HTTP/WS servers and a bundled
-vulnerable target) unless noted.
+vulnerable target) unless noted. Verification is **TDD unit tests AND
+functional/behavioral tests that drive the real tool end-to-end** — not unit
+tests alone. The **functional acceptance tests** of M1 are **AC10**
+(browser-routed-through-proxy), **AC14** (`poc.run` pass-vs-patched), and
+**AC18** (end-to-end reflected XSS over MCP); they exercise aitmproxy as a user
+(or agent) would and are distinct from the per-type unit tests behind the other
+criteria. **AC20** is the performance/soak criterion. M1's exit gate (see
+"Milestones and exit criteria") is **every criterion below green**.
 
 1. **AC1 — HTTPS capture:** With the CA generated and trusted, an HTTPS GET sent
    through the proxy is captured as an `HttpFlow` whose request and response are
@@ -1369,6 +1432,16 @@ vulnerable target) unless noted.
     data-flow 6.)
 19. **AC19 — Gate green:** `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
     passes for the workspace.
+20. **AC20 — Throughput & bounded memory under load (performance/soak):** A
+    load/soak test drives sustained traffic through the proxy and asserts both:
+    (i) a **sustained-throughput floor** — the proxy holds **≥ 2,000 requests/
+    second on a single instance** for the duration of the run (Architect's call
+    for the M1 floor; **~10,000 rps on a single instance** is recorded as the
+    standing architectural target, gated at a later milestone, not M1); and
+    (ii) **memory stays bounded** — resident memory plateaus over the sustained
+    run with no upward trend, no leak, and no crash/OOM. (The exact load profile,
+    body sizes, and run duration are the builder's, so long as the run is long
+    enough to expose a leak or unbounded growth.)
 
 ## Left to the builder
 
@@ -1409,14 +1482,21 @@ proxy with a block-private/loopback-unless-scoped SSRF guard, and a
 **parameterized, self-contained PoC engine** (TOML artifacts) that reproduces a
 reflected XSS with no agent and emits the three artifacts (finding, replayable
 PoC, screenshot). Authorization in M1 is deny-by-default scope (no separate
-recorded-authorization file). This revision adds near-complete per-crate interface
-declarations, nine data-flow walkthroughs, and ten mermaid diagrams (one
-architecture graph, seven sequence diagrams, one state diagram, one gating
-flowchart). Later
-milestones (roadmap only): L4 raw-packet fuzzing, more protocols, native
-macOS/Linux GUIs, a runtime plugin mechanism, PoC signing/validation, and a
-**full automated-scanner plugin (Burp-style), built on the plugin system** — none
-of which may require editing the core.
+recorded-authorization file). A **first-class, tested performance requirement**
+(the reason for the Rust rewrite) stands against Python/Java resource behaviour:
+sustained **thousands up to ~10,000 rps on a single instance with bounded, stable
+memory** — no leaks, no OOM, no crash — with an M1 floor of **≥ 2,000 rps**
+(Architect's call) soak-tested in AC20 and the ~10,000 rps target gated later.
+Development is **milestone-gated**: each milestone has an explicit exit test
+(unit **and** functional/end-to-end **and**, where relevant, performance) that
+must fully pass before the next begins; M1's gate is AC1–AC20 green, and M1 ships
+a bundled reflected-XSS **vulnerable + patched** test target. Later milestones
+(roadmap only): the ~10,000 rps performance scale-up, L4 raw-packet fuzzing, more
+protocols, native macOS/Linux GUIs, a runtime plugin mechanism, PoC
+signing/validation, a **full automated-scanner plugin (Burp-style), built on the
+plugin system**, and the product-level goal of an **AI agent autonomously driving
+aitmproxy against a vulnerability-seeded test website and finding the bugs by
+itself** — none of which may require editing the core.
 
 ### Architect's calls
 
@@ -1452,3 +1532,13 @@ of which may require editing the core.
 13. SSRF posture **decided**: block private + loopback ranges unless the host is
     explicitly in scope; `scope.add` is the only escape hatch (per Matt).
 14. M1 runtime OS **decided**: macOS + Linux (per Matt).
+15. **M1 sustained-throughput floor = ≥ 2,000 rps on a single instance** with
+    bounded/plateauing memory (AC20); **~10,000 rps** is the standing
+    architectural target, gated at a later performance-scale-up milestone, not
+    M1. Memory stability under sustained load is as required as speed.
+16. **Milestone-gated development:** each milestone has an explicit exit gate
+    (unit + functional/end-to-end + performance where relevant) that must fully
+    pass before the next starts; M1's gate = AC1–AC20 green. The bundled
+    reflected-XSS **vulnerable + patched** test target is an M1 deliverable; the
+    broad agent-driven multi-vuln site is a later-milestone product goal with its
+    own exit test.
