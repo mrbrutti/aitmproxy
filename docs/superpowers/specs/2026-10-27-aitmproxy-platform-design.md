@@ -1,6 +1,6 @@
 # aitmproxy platform design
 
-**Status:** draft
+**Status:** approved (2026-10-27 by Matt)
 **Research inputs:** `docs/research/01-mitmproxy.md`, `docs/research/02-nuclei.md`, `docs/research/03-rust-proxy-stack.md`, `docs/research/04-playwright-cua.md`, `docs/research/05-synthesis.md`
 **Companion specs:** plugin system — `docs/superpowers/specs/2026-10-27-aitmproxy-plugin-system-design.md` (the two-tier Rust+Rhai plugin model); PoC language — `docs/superpowers/specs/2026-10-27-aitmproxy-poc-language-design.md` (the YAML PoC language + script escape hatch). This spec owns the core/architecture and the `aitm-core`/`aitm-poc`/`aitm-plugin` Rust types the two companions reference; it does not duplicate their detail.
 

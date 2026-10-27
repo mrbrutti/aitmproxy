@@ -1,6 +1,6 @@
 # aitmproxy PoC language design
 
-**Status:** draft
+**Status:** approved (2026-10-27 by Matt)
 **Research inputs:** `docs/research/02-nuclei.md`, `docs/research/01-mitmproxy.md`, `docs/research/05-synthesis.md`
 **Companion specs:** platform — `docs/superpowers/specs/2026-10-27-aitmproxy-platform-design.md`; plugin system — `docs/superpowers/specs/2026-10-27-aitmproxy-plugin-system-design.md`
 
@@ -577,10 +577,5 @@ platform spec's AC13–AC15/AC18.
 
 ## Open questions
 
-Only Matt can answer these.
-
-1. **Scripting engine** for the `script` step is inherited from the plugin-system
-   spec's open question (Rhai). Answering it there answers it here.
-
-*(Format is settled: **YAML, decided by Matt** — folded into Constraints and the
-reconciled platform spec.)*
+*(None. The `script` step engine is **Rhai**, confirmed by Matt on 2026-10-27
+(plugin-system spec). Format is **YAML, decided by Matt**. No questions remain.)*

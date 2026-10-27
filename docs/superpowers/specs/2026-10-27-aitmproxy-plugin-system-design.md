@@ -1,6 +1,6 @@
 # aitmproxy plugin system design
 
-**Status:** draft
+**Status:** approved (2026-10-27 by Matt)
 **Research inputs:** `docs/research/01-mitmproxy.md`, `docs/research/02-nuclei.md`, `docs/research/03-rust-proxy-stack.md`, `docs/research/05-synthesis.md`
 **Companion specs:** platform — `docs/superpowers/specs/2026-10-27-aitmproxy-platform-design.md`; PoC language — `docs/superpowers/specs/2026-10-27-aitmproxy-poc-language-design.md`
 
@@ -83,7 +83,7 @@ in M2).
   must pass. Rhai is the embedded scripting engine (Architect's call): pure-Rust,
   embeddable, memory-safe, natively sandboxable (operation limits, no I/O unless
   granted) — the right fit for an untrusted, human-authored tier, and it avoids
-  pulling a JS/V8 runtime into the core. Matt may veto the engine choice.
+  pulling a JS/V8 runtime into the core. Confirmed by Matt (2026-10-27).
 - **Performance:** the Rust tier carries performance-critical paths; scripts are
   for flexibility, not throughput. Script hooks run under an operation/time budget
   and must not stall the proxy (CPU-bound work is bounded and offloaded, mirroring
@@ -610,8 +610,5 @@ so M1 builds the seam to satisfy them.
 
 ## Open questions
 
-Only Matt can answer these.
-
-1. **Scripting engine = Rhai?** Rhai is the Architect's call (pure-Rust,
-   sandboxable, no V8). Confirm, or prefer another embeddable engine. This also
-   fixes the PoC `script` step language (PoC spec reuses it).
+*(Resolved. The scripting engine is **Rhai**, confirmed by Matt on 2026-10-27, for
+both the plugin tier and the PoC `script` step. No questions remain.)*
