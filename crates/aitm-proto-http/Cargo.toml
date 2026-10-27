@@ -20,6 +20,8 @@ moka = { version = "0.12", features = ["sync"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-pki-types = { version = "1.9", features = ["std"] }
+# Root trust anchors for verifying upstream server certificates (R3).
+webpki-roots = "0.26"
 # Sniffing the upstream leaf's CN/SANs before minting an impersonating leaf.
 x509-parser = "0.18"
 

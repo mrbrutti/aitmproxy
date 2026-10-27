@@ -124,7 +124,8 @@ async fn run_proxy(
     };
     let mut builder = Proxy::builder()
         .with_config(config)
-        .register_module(Arc::new(HttpModule::with_ca(ca)));
+        // The test upstream presents a self-signed leaf; trust it explicitly.
+        .register_module(Arc::new(HttpModule::with_ca(ca).with_insecure(true)));
     for plugin in plugins {
         builder = builder.register_plugin(plugin);
     }

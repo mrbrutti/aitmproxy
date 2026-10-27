@@ -49,7 +49,7 @@ pub fn build_proxy(cfg: &Config) -> anyhow::Result<Proxy> {
 /// Assemble the proxy from configuration and an explicit feature set.
 pub fn build_proxy_with(cfg: &Config, features: &Features) -> anyhow::Result<Proxy> {
     let ca = CertAuthority::load_or_generate(&cfg.ca.dir, cfg.ca.key_mode)?;
-    let http = HttpModule::with_ca(Arc::new(ca));
+    let http = HttpModule::with_ca(Arc::new(ca)).with_insecure(cfg.ssl_insecure);
 
     let mut builder = Proxy::builder()
         .with_config(cfg.clone())

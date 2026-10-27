@@ -51,6 +51,9 @@ pub struct HttpModule {
     ca_config: CaConfig,
     provider: Arc<CryptoProvider>,
     upstream_tls: OnceLock<Arc<ClientConfig>>,
+    /// Skip upstream certificate verification (lab self-signed targets). Off by
+    /// default: upstream TLS is verified against the webpki roots.
+    insecure: bool,
 }
 
 impl Default for HttpModule {
@@ -73,6 +76,7 @@ impl HttpModule {
             ca_config: cfg,
             provider: Arc::new(rustls::crypto::ring::default_provider()),
             upstream_tls: OnceLock::new(),
+            insecure: false,
         }
     }
 
@@ -82,6 +86,13 @@ impl HttpModule {
         // A fresh OnceLock cannot already be set.
         let _ = module.ca.set(ca);
         module
+    }
+
+    /// Skip upstream certificate verification when `insecure` is true (maps to
+    /// `Config.ssl_insecure`; default false verifies against the webpki roots).
+    pub fn with_insecure(mut self, insecure: bool) -> Self {
+        self.insecure = insecure;
+        self
     }
 
     /// The CA, loading it on first use.
@@ -97,19 +108,32 @@ impl HttpModule {
     }
 
     /// The client config used towards upstream servers, built on first use.
+    ///
+    /// Upstream certificates are verified against the webpki root store by
+    /// default (R3): a bad or self-signed upstream certificate fails the
+    /// handshake, so the proxy never presents a trusted leaf for a server it
+    /// could not itself authenticate. `Config.ssl_insecure` (via
+    /// [`HttpModule::with_insecure`]) turns verification off for a lab of
+    /// self-signed targets.
     fn upstream_tls(&self) -> Result<Arc<ClientConfig>> {
         if let Some(cfg) = self.upstream_tls.get() {
             return Ok(cfg.clone());
         }
-        let verifier = Arc::new(AcceptAnyServerCert {
-            provider: self.provider.clone(),
-        });
-        let mut cfg = ClientConfig::builder_with_provider(self.provider.clone())
+        let builder = ClientConfig::builder_with_provider(self.provider.clone())
             .with_safe_default_protocol_versions()
-            .context("upstream TLS versions")?
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth();
+            .context("upstream TLS versions")?;
+        let mut cfg = if self.insecure {
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert {
+                    provider: self.provider.clone(),
+                }))
+                .with_no_client_auth()
+        } else {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            builder.with_root_certificates(roots).with_no_client_auth()
+        };
         cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
         let cfg = Arc::new(cfg);
         Ok(self.upstream_tls.get_or_init(|| cfg).clone())

@@ -178,7 +178,7 @@ async fn run_proxy() -> (SocketAddr, Arc<dyn FlowStore>) {
     };
     let proxy = Proxy::builder()
         .with_config(config)
-        .register_module(Arc::new(HttpModule::new()))
+        .register_module(Arc::new(HttpModule::new().with_insecure(true)))
         .register_module(Arc::new(WsModule::new()))
         .build()
         .expect("build proxy");
