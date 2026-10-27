@@ -30,5 +30,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[dev-dependencies]
+serde_json = "1"
+hyper = { version = "1", features = ["server", "http1"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+bytes = "1"
+
 [lints]
 workspace = true
