@@ -126,8 +126,12 @@ impl RequestSender for TcpRequestSender {
             if !body.is_empty() {
                 stream.write_all(&body).await?;
             }
+            // Bound the response read so a hostile upstream cannot exhaust memory.
+            const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
             let mut raw = Vec::new();
-            stream.read_to_end(&mut raw).await?;
+            tokio::io::AsyncReadExt::take(stream, MAX_RESPONSE_BYTES)
+                .read_to_end(&mut raw)
+                .await?;
             Ok(parse_response(&raw))
         })
     }

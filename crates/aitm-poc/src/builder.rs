@@ -39,24 +39,43 @@ impl PocBuilder for StdPocBuilder {
     fn build(&self, flow: &HttpFlow, spec: PocSpec) -> anyhow::Result<Poc> {
         let req = &flow.request;
         let url = parameterize_url(req, &spec.variables);
+        let (headers, secret_vars) = request_headers(&req.headers);
 
         let step = HttpStep {
             method: req.method.clone(),
             url,
-            headers: request_headers(&req.headers),
+            headers,
             body: body_text(&req.body),
             extract: Vec::new(),
         };
 
+        // Credential headers are never baked into a shareable PoC: they become
+        // required `{{var}}` placeholders the runner must be given at run time.
+        let mut variables = spec.variables;
+        for var in secret_vars {
+            if !variables.iter().any(|v| v.name == var.name) {
+                variables.push(var);
+            }
+        }
+
         Ok(Poc {
             id: slug(&spec.info.name),
             info: spec.info,
-            variables: spec.variables,
+            variables,
             steps: vec![Step::Http(step)],
             success: spec.success,
         })
     }
 }
+
+/// Request headers whose value is a credential: replaced with a placeholder in a
+/// built PoC so the secret is never written to disk.
+const SECRET_HEADERS: [&str; 4] = [
+    "cookie",
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+];
 
 /// Replace the flow's concrete URL pieces with `{{var}}` placeholders.
 fn parameterize_url(req: &HttpRequest, variables: &[Variable]) -> String {
@@ -90,13 +109,39 @@ fn parameterize_url(req: &HttpRequest, variables: &[Variable]) -> String {
     url
 }
 
-/// Carry request headers into the PoC, dropping `Host` (implied by `{{target}}`).
-fn request_headers(headers: &HeaderMap) -> Vec<(String, String)> {
-    headers
-        .iter()
-        .filter(|(name, _)| !name.eq_ignore_ascii_case("host"))
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
+/// Carry request headers into the PoC, dropping `Host` (implied by `{{target}}`)
+/// and redacting credential headers to `{{var}}` placeholders. Returns the
+/// headers and the required variables the redacted ones introduce.
+fn request_headers(headers: &HeaderMap) -> (Vec<(String, String)>, Vec<Variable>) {
+    let mut out = Vec::new();
+    let mut vars = Vec::new();
+    for (name, value) in headers.iter() {
+        if name.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        if SECRET_HEADERS.iter().any(|s| name.eq_ignore_ascii_case(s)) {
+            let var = secret_var_name(name);
+            out.push((name.to_string(), format!("{{{{{var}}}}}")));
+            if !vars.iter().any(|v: &Variable| v.name == var) {
+                vars.push(Variable {
+                    name: var,
+                    default: None,
+                    description: format!(
+                        "Credential for the `{name}` header (not stored in the PoC)"
+                    ),
+                    required: true,
+                });
+            }
+        } else {
+            out.push((name.to_string(), value.to_string()));
+        }
+    }
+    (out, vars)
+}
+
+/// A variable name for a redacted credential header (`X-API-Key` → `x_api_key`).
+fn secret_var_name(header: &str) -> String {
+    header.to_ascii_lowercase().replace('-', "_")
 }
 
 fn body_text(body: &Body) -> Option<String> {

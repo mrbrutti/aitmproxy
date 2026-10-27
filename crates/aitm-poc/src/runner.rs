@@ -227,16 +227,21 @@ impl StdPocRunner {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
+        // The id is validated by `precheck` before this runs, so it is a safe
+        // single path component.
         let dir = self.out_dir.join(format!("aitm-poc-{}-{}", poc.id, nanos));
         std::fs::create_dir_all(&dir)?;
+        restrict_dir(&dir)?;
 
         let poc_path = dir.join(format!("{}.poc.yaml", poc.id));
         std::fs::write(&poc_path, serde_yaml::to_string(poc)?)?;
+        restrict_file(&poc_path)?;
 
         let screenshot_path = match screenshot {
             Some(bytes) => {
                 let path = dir.join("screenshot.png");
                 std::fs::write(&path, bytes)?;
+                restrict_file(&path)?;
                 path
             }
             None => PathBuf::new(),
@@ -244,6 +249,34 @@ impl StdPocRunner {
 
         Ok((poc_path, screenshot_path))
     }
+}
+
+/// Tighten an artifact directory to owner-only (`0700`) on Unix. A finding's
+/// request/response and screenshot may hold sensitive data, so they are not
+/// world-readable.
+#[cfg(unix)]
+fn restrict_dir(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+/// Tighten an artifact file to owner-only (`0600`) on Unix.
+#[cfg(unix)]
+fn restrict_file(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_dir(_path: &std::path::Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_file(_path: &std::path::Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 /// A filesystem-safe PoC id: `^[a-z0-9][a-z0-9-]{0,63}$`. Used to build the
@@ -548,6 +581,11 @@ impl Command for PocRunCommand {
             .map_err(|e| anyhow::anyhow!("poc.run: cannot stat `{poc_path}`: {e}"))?;
         if meta.file_type().is_symlink() {
             anyhow::bail!("poc.run: refusing to load `{poc_path}`: it is a symlink");
+        }
+        // Cap the document size before parsing (billion-laughs / huge-doc guard).
+        const MAX_POC_BYTES: u64 = 1024 * 1024;
+        if meta.len() > MAX_POC_BYTES {
+            anyhow::bail!("poc.run: `{poc_path}` exceeds the {MAX_POC_BYTES}-byte PoC size cap");
         }
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("poc.run: cannot read `{poc_path}`: {e}"))?;

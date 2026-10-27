@@ -115,3 +115,57 @@ fn build_parameterizes_flow() {
         "the chosen success assertion is carried through"
     );
 }
+
+/// Credential headers are redacted to `{{var}}` placeholders and become required
+/// variables, so a built PoC never carries a session cookie or bearer token.
+#[test]
+fn build_redacts_credential_headers() {
+    let mut flow = xss_flow();
+    flow.request.headers.set("Cookie", "sid=supersecret");
+    flow.request
+        .headers
+        .set("Authorization", "Bearer tok-abc123");
+    flow.request.headers.set("X-Trace", "keepme");
+
+    let spec = PocSpec {
+        info: PocInfo {
+            name: "cred finding".into(),
+            severity: Severity::Medium,
+            references: vec![],
+            tags: vec![],
+            cwe: None,
+        },
+        variables: vec![],
+        success: Assertion::Status(200),
+    };
+    let poc = StdPocBuilder.build(&flow, spec).expect("build succeeds");
+    let Step::Http(step) = &poc.steps[0] else {
+        panic!("http step");
+    };
+
+    let header = |name: &str| {
+        step.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(header("Cookie").as_deref(), Some("{{cookie}}"));
+    assert_eq!(
+        header("Authorization").as_deref(),
+        Some("{{authorization}}")
+    );
+    assert_eq!(header("X-Trace").as_deref(), Some("keepme"));
+
+    // The secret becomes a required variable with no default (must be supplied).
+    for name in ["cookie", "authorization"] {
+        let var = poc
+            .variables
+            .iter()
+            .find(|v| v.name == name)
+            .unwrap_or_else(|| panic!("variable {name} must be declared"));
+        assert!(var.required && var.default.is_none());
+    }
+    // No secret value survives anywhere in the serialized PoC.
+    let yaml = serde_yaml::to_string(&poc).unwrap();
+    assert!(!yaml.contains("supersecret") && !yaml.contains("tok-abc123"));
+}
