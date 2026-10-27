@@ -10,9 +10,19 @@ description = "HTTP/1.1 protocol module: TLS MITM, certificate authority, sans-I
 aitm-core.workspace = true
 aitm-plugin.workspace = true
 anyhow.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync"] }
 # Certificate authority: root generation + leaf minting, and the leaf cache.
 rcgen = { version = "0.14", features = ["x509-parser"] }
 moka = { version = "0.12", features = ["sync"] }
+# TLS MITM. The `ring` provider is selected explicitly everywhere so feature
+# unification with another crate's provider cannot change which one is used.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pki-types = { version = "1.9", features = ["std"] }
+# Sniffing the upstream leaf's CN/SANs before minting an impersonating leaf.
+x509-parser = "0.18"
 
 [dev-dependencies]
 uuid.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
