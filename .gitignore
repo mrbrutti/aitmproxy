@@ -1,0 +1,13 @@
+# Claude Code local session/config artifacts
+.claude/
+
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.orig
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
