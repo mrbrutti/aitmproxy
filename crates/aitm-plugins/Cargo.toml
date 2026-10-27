@@ -1,0 +1,16 @@
+[package]
+name = "aitm-plugins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "First-party feature plugins: capture, replay, intercept, mutate, scope, rate-limit."
+
+[dependencies]
+aitm-core.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,40 @@
+[package]
+name = "aitm-proto-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "HTTP/1.1 protocol module: TLS MITM, certificate authority, sans-IO HTTP state machine."
+
+[dependencies]
+aitm-core.workspace = true
+aitm-plugin.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
+# Certificate authority: root generation + leaf minting, and the leaf cache.
+rcgen = { version = "0.14", features = ["x509-parser"] }
+moka = { version = "0.12", features = ["sync"] }
+# TLS MITM. The `ring` provider is selected explicitly everywhere so feature
+# unification with another crate's provider cannot change which one is used.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pki-types = { version = "1.9", features = ["std"] }
+# Root trust anchors for verifying upstream server certificates (R3).
+webpki-roots = "0.26"
+# Explicit certificate validity windows (rcgen uses `time` 0.3).
+time = "0.3"
+tracing.workspace = true
+# Sniffing the upstream leaf's CN/SANs before minting an impersonating leaf.
+x509-parser = "0.18"
+
+# Unix-only: the `O_NOFOLLOW` constant for a TOCTOU-safe CA-key open (no unsafe).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+uuid.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

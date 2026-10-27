@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aitm-core",
+    "crates/aitm-plugin",
+    "crates/aitm-proto-http",
+    "crates/aitm-proto-ws",
+    "crates/aitm-plugins",
+    "crates/aitm-browser",
+    "crates/aitm-poc",
+    "crates/aitm-mcp",
+    "crates/aitm-cli",
+    "crates/aitm",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.97"
+
+# Shared external dependency versions. Members opt in with `workspace = true`.
+# Concrete versions chosen within the stack in docs/research/03-rust-proxy-stack.md.
+[workspace.lints.rust]
+# No crate in this workspace needs `unsafe`; forbid it so a future one is a
+# deliberate, reviewed decision (platform spec unsafe policy).
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+anyhow = "1"
+futures = "0.3"
+indexmap = "2"
+tokio = "1"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+# Internal crates, referenced by path so the workspace builds in-tree.
+aitm-core = { path = "crates/aitm-core" }
+aitm-plugin = { path = "crates/aitm-plugin" }
+aitm-proto-http = { path = "crates/aitm-proto-http" }
+aitm-proto-ws = { path = "crates/aitm-proto-ws" }
+aitm-plugins = { path = "crates/aitm-plugins" }
+aitm-browser = { path = "crates/aitm-browser" }
+aitm-poc = { path = "crates/aitm-poc" }
+aitm-mcp = { path = "crates/aitm-mcp" }
+aitm-cli = { path = "crates/aitm-cli" }

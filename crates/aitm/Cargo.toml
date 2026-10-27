@@ -1,0 +1,42 @@
+[package]
+name = "aitm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The aitmproxy binary: wires modules, plugins, and frontends from config."
+
+[lib]
+name = "aitm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aitm"
+path = "src/main.rs"
+
+[dependencies]
+aitm-core.workspace = true
+aitm-plugin.workspace = true
+aitm-proto-http.workspace = true
+aitm-proto-ws.workspace = true
+aitm-plugins.workspace = true
+aitm-browser.workspace = true
+aitm-poc.workspace = true
+aitm-mcp.workspace = true
+aitm-cli.workspace = true
+anyhow = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+serde_json = "1"
+serde_yaml = "0.9"
+hyper = { version = "1", features = ["server", "http1"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+bytes = "1"
+
+[lints]
+workspace = true

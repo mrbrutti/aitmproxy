@@ -1,0 +1,24 @@
+[package]
+name = "aitm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Protocol-agnostic core: flow model, event/plugin chain, command registry, flow store, scope/rate guard, proxy acceptor."
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+uuid.workspace = true
+indexmap.workspace = true
+tokio = { workspace = true, features = ["sync", "io-util", "net", "rt", "time"] }
+tracing.workspace = true
+# Per-user config dir for the CA material, so the key is never written into the
+# launch directory where another process could read or plant it.
+dirs = "5"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

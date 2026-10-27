@@ -1,0 +1,30 @@
+[package]
+name = "aitm-poc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Reproducible-PoC engine: artifact model, YAML serde, templating, matcher DSL, builder, runner."
+
+[dependencies]
+aitm-core.workspace = true
+aitm-browser.workspace = true
+anyhow = "1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+regex = "1"
+
+# Unix-only: the `O_NOFOLLOW` constant for a TOCTOU-safe PoC-file open (no unsafe).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "net", "macros", "io-util"] }
+hyper = { version = "1", features = ["server", "http1"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+bytes = "1"
+
+[lints]
+workspace = true

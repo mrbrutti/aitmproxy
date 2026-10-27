@@ -401,11 +401,184 @@ Each task below marks **Independent:** with its parallel group.
 
 ## Review log
 
-Kept by the main session during stage 6. One row per finding.
+Kept by the main session during stage 6. One row per finding. The integrated-M1
+panel (security + quality + spec reviewers) returned FAIL; the fix-and-harden
+pass below was approved by Matt 2026-10-27.
 
-| Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
-|---|---|---|---|---|
+| Area | Severity | Finding | Disposition |
+|---|---|---|---|
+| Reconcile R1 | Critical | Passive capture was scope-gated at the upstream connector (keyed on IP), breaking capture and conflating passive with active | Fixed in `b0384b3`: `PassiveConnector` does not run `check_active`; scope/rate stay on active reissue. Data-flow 1 reconciled in the platform spec. |
+| Reconcile R2 | Important | Matcher model had no `part`, so `word`/`regex` could not target headers (AC-L5, Example 3) | Fixed in `8a7d003`: `Assertion::Word/Regex` carry `MatchPart{Body,Header,All}`; serde + matcher updated; spec/model reconciled. |
+| Reconcile R3 | Critical | Upstream TLS accepted any certificate (`AcceptAnyServerCert` always) | Fixed in `cec3818`: verify against webpki roots by default; `Config.ssl_insecure` / `HttpModule::with_insecure` opt-out. Spec Security + Config reconciled. |
+| Correctness | Critical | Scope key mismatch (IP vs authority; divergent host:port parses) | Fixed in `f77335e`: shared `aitm_core::Authority`; guard + store key on it; `scope.add host:port` now admits navigation. |
+| Correctness | Important | No `TypeDesc::Map`, so `flow.mutate`/`poc.run` maps failed over MCP/CLI | Fixed in `f77335e`: `TypeDesc::Map(Box<TypeDesc>)` + frontend conversion; `headers` is `Map(Str)`, `vars` is `Map(Any)`. Proven in `5229e09`. |
+| Correctness | Important | Browser not wired into the binary | Fixed in `b0384b3`: `main` launches `ChromeDriver` (best effort) and attaches it via `with_services`. |
+| Correctness | Important | Lock poisoning silently disabled scope/rate or dropped a plugin | Fixed in `f77335e`: guard, store, chain recover with `PoisonError::into_inner`; chain logs. |
+| Correctness | Important | PoC matcher/DSL errors became `false` (bad artifact ran) | Fixed in `05eefaf`: `precheck` compiles every regex and parses every DSL (`dsl::check`) before any request. |
+| Security | Critical | Header CRLF injection via header edits | Fixed in `f77335e`: `HeaderMap::try_set` rejects CR/LF/NUL/whitespace; mutate + runner route through it. Proven in `5229e09`. |
+| Security | Important | `classify_ip` range gaps (CGNAT, 0/8, 198.18/15, 224/3, v6 NAT64/6to4/site-local/…) | Fixed in `f77335e`. |
+| Security | Important | PoC file trust (arbitrary load, path, serde leakage) | Fixed in `05eefaf`: `.yaml` only, no symlink, `schema::validate`, content-free errors, id regex; size cap in `6eb662f`. |
+| Security | Important | CA written to the launch directory; no load-time checks or explicit validity | Fixed in `f77335e` (per-user config dir) + second pass: `load_or_generate` refuses a CA key readable by group/other; root validity ~10y, leaf ≤397 days (under the 398-day cap). Refusal tested. (Owner-uid check needs a non-`unsafe` getuid crate — left as a small follow-up under `forbid(unsafe_code)`.) |
+| Security | Important | PoC artifacts world-readable; credentials baked into built PoCs | Fixed in `6eb662f`: artifacts `0700`/`0600`; `poc.build` redacts Cookie/Authorization/Proxy-Authorization/X-API-Key to required `{{var}}`. |
+| Security | Important | Unbounded buffers (flow store, request sender, serve paths) | Fixed: store bounded (`f77335e`), sender read capped (`6eb662f`), `LimitConfig.max_body_bytes` enforced in the proto-http serve path (second pass: oversized request → 413; response captured copy truncated + `FlowMeta.truncated`, client still streamed) and WS fragment reassembly capped at 16 MiB. |
+| Security | Minor | serde_yaml billion-laughs | Fixed in `6eb662f`: 1 MiB PoC size cap + `validate` before typed deserialize. |
+| Robustness | Important | Silent error discards; no logging | Fixed in `b0384b3`: `tracing` at the accept/handler/poison points; `tracing-subscriber` in `main`. (Protocol-module error→`Event::Error` mapping, CDP loop, transport: deferred.) |
+| Robustness | Important | `per_host_rps == 0` throttled at 1 rps instead of refusing | Fixed in `f77335e`. |
+| Robustness | Minor | No `forbid(unsafe_code)` | Fixed in `b0384b3`: `unsafe_code = "forbid"` workspace-wide. |
+| Tests | Important | AC7 exact 18-tool set unproven; frontends stubbed | Fixed in `5229e09`: `tools/list` exact-18 + `flow.mutate` map round-trip over MCP and CLI + CRLF refusal + `poc.run` vars coercion. |
+| Security | Important | Browser-origin SSRF unenforced (redirects / fetch / sub-resources bypass the per-navigation `check_url`) | Fixed in `db88c51`: a dedicated browser-facing listener (`Proxy::run_browser`, `cfg.browser.proxy_addr` :8081) whose `SsrfConnector` runs `ssrf_check` on every upstream (authority host + resolved IP); `UpstreamConnector::connect` now threads the authority. |
+| Security | Important | `poc.run` browser navigate not SSRF-checked | Fixed in `9b…`: the runner calls `aitm_browser::check_url` (url::Url parse + resolve + classify) before `check_active`; refusal tested. |
+
+| Correctness | Important | Second, hand-rolled HTTP client in the binary (plaintext for https, no chunked decode, possible duplicate framing) | Fixed in `b0…`/second pass: `aitm_proto_http::Http1Sender` drives the shared `Http1Machine` (chunked decode, single `Content-Length`, no stray `Transfer-Encoding`) with rustls TLS for `https` (verify default, `ssl_insecure` opt-out); `TcpRequestSender`/`parse_response` deleted. Chunked-decode and single-CL framing tested. |
+
+| Correctness | Important | Rate-limit double-count (command + client both `check_active`) | Fixed in second pass: the `PipelineClient` is the single scope/rate chokepoint; `flow.replay` / `request.send` / the poc runner no longer re-check (nor does the runner re-insert). The replay/mutate/scope-rate tests now drive a real `PipelineClient` (over an echo `RequestSender`) so the single-guard refusal/throttle is actually asserted. |
+
+| Robustness | Important | `record_error` / backoff / host-disable never wired; dead `BackoffConfig` | Fixed in second pass: `record_error` is on the `ScopeRateGuard` trait; `StdGuard` disables a host once its error budget is hit, for an exponential `BackoffConfig` window, then re-enables it; `PipelineClient` records an error on a send failure or 5xx. The HTTP module maps an incomplete-response transport failure to `Event::Error(FlowError::Upstream)`. Disable+recovery tested. |
+
+| Robustness | Important | Parked (intercepted) flow could pin forever if never resumed | Fixed in second pass: the chain bounds the parked await with `Chain::with_intercept_timeout` (default 5 min); on timeout the flow is killed and the `Intercepted` state (and its backup) released. Tested with a short timeout. |
+
+| Tests | Minor | AC13 field loss (`PocInfo` description/author/metadata, `HttpStep` matchers/raw/path dropped) | Fixed in second pass: `PocInfo` gains `description`/`author`/`metadata`; `HttpStep` keeps unmodeled keys in a flattened `extra` map, so a PoC round-trips faithfully. Tested. (Per-step matcher *evaluation* remains future work.) |
+
+| Tests | Minor | Loose `>= 1` rate-limit assertions | Fixed in second pass: the deterministic burst tests (guard + scope-rate) now assert exact pass/refuse counts (a burst of N at `per_host_rps=K` passes exactly K and refuses N−K); confirmed stable across repeated runs. |
+
+**Security re-review, round 3 (2026-10-27).** The re-review confirmed the seven
+prior fixes hold and found one Important residual, one regression, and hardening
+gaps. All addressed below (TDD, full gate green):
+
+| Area | Severity | Finding | Disposition |
+|---|---|---|---|
+| Rate limiting | Important (residual) | Token bucket / error budget / disable map keyed on the raw `host` while scope matching normalized via `Authority`, so spellings each got a fresh allowance and a disabled host was reachable under another spelling | Fixed in `8afc25c`: `check_active`/`record_error` key on the normalized `Authority::host`. `Target.Example` and `target.example:443` now share a bucket; disable applies across spellings. Tested. |
+| Smuggling | Important (regression) | `parse_headers` used `HeaderMap::set`, which (since the CRLF fix) silently *drops* an invalid header — `Content-Length: 5\x01` vanished → framing desync | Fixed in `359c915`: `try_set` + fail-closed `bail!`, like the malformed-name branch. Tested (control byte fails the parse). |
+| SSRF (rebinding) | Important | `ssrf_check` lifted the private/loopback block whenever a scope entry matched by host *name*, so a scoped public host rebinding to 127.0.0.1 / 169.254.169.254 was dialed | Fixed in `8afc25c`: lift only via an IP-literal / `localhost` entry matching the resolved dst; a scoped hostname that resolves private is refused + warn-logged (scope the IP literal to allow). Tested at guard and browser layers. |
+| SSRF (consistency) | Important | `poc.run` navigate used `SsrfPolicy::default()`, and `check_url` compared scope as raw strings (inconsistent with the connector's `Authority` fold, e.g. `[::1]:3000`) | Fixed in `eba16eb` + `026adef`: `CommandHost` carries the configured policy (threaded from the MCP/CLI frontends); `check_url` delegates to `aitm_core::ssrf_check` per resolved address. `[::1]:3000` consistency tested. |
+| SSRF (classifier) | Important | `classify_ip` gaps: IPv4 TEST-NET docs, IPv6 doc `2001:db8::/32`, Teredo `2001::/32`, NAT64 local-use `64:ff9b:1::/48` | Fixed in `8afc25c`; the Teredo comment now matches the code. Tested. |
+| Artifacts | Important | Artifact dir/files created then chmod'd (race): a pre-created world-readable dir or planted symlink could be reused | Fixed in `026adef`: `DirBuilder::mode(0o700).create` (fail-if-exists) + `create_new`/`0600` files. |
+| PoC path | Important | `poc_path` stat/open symlink TOCTOU; no confinement | Fixed in `026adef` (`O_NOFOLLOW` open + stat/read on the handle; symlink refusal tested) and the opt-in confinement follow-up: a `PocConfig.dir` (`None` = unconfined, the default; `Some(root)` = canonicalize + `starts_with`), threaded through `CommandHost` from the MCP/CLI frontends. Not mandatory, so the load-any-`.yaml`-by-path workflow is preserved. Outside-dir refusal tested; the per-run artifact dir name was also made collision-proof (pid + counter) for the fail-if-exists create. |
+| CA hygiene | Important | CA key stat/read TOCTOU; dir not `0700`; CWD-relative fallback dir | Fixed in `81c1488`: `O_NOFOLLOW` open + fstat mode check; dir `0700`; key `create_new`; default dir falls back to `$HOME/.aitm/ca`. Symlinked-key refusal tested. |
+| Resource bound | Important | Store bounded on count only; no byte budget; unbounded `serve` reads | Fixed in `81c1488`: resident-byte budget (`max_flow_bytes`, 512 MiB default) tracked across insert/update and evicted oldest-first; each socket read bounded by a 30s idle timeout; oversized request → 413 + close immediately. Byte-eviction + update-growth tested. |
+
+### Deferred (tracked in Follow-ups, approved 2026-10-27)
+
+CA key owner-uid check (needs a non-`unsafe` getuid). (PoC-path confinement is now
+done as opt-in `PocConfig.dir`, so it is no longer deferred.) (Error-taxonomy
+mapping is wired at the main upstream-failure point;
+extending `Event::Error` to every module failure path, and evaluating per-step
+matchers, are incremental.)
 
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7.
+**Milestone 1 integrated on `claude/m1-integration-905257`.** Ten crates built
+test-first in parallel, merged, hardened across two review passes, then the final
+wave (Tasks 29–31). Exit gate (Task 31 / **AC19**) on the whole workspace:
+
+```text
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+→ FMT=0  CLIPPY=0  TEST=0 — 54 test binaries, 0 failed, 0 ignored
+AITM_SOAK=1  cargo test -p aitm --test soak → 31,378 req/s; RSS plateau 19183→19267 KiB (0.4%)
+AITM_CHROME=1 cargo test → the 4 Chromium tests run for real, all pass (CHROME_EXIT=0)
+```
+
+**Chromium:** Google Chrome is installed (`/Applications/Google Chrome.app`);
+chromiumoxide auto-detects it (the optional Chromium fetcher is deliberately
+disabled — `aitm-browser/Cargo.toml` — so we drive a system browser, not a bundled
+one). The four Chromium-backed tests are **no longer `#[ignore]`d**: they are in
+the default suite but gated at run time on `AITM_CHROME=1` (the soak test's
+`AITM_SOAK` pattern), so plain `cargo test` runs them inert — no browser needed,
+nothing flakes — and `AITM_CHROME=1 cargo test` exercises them for real. They
+self-serialize (one headless Chrome at a time), so the real run needs no
+`--test-threads=1` and passes under default parallelism.
+
+### Acceptance-criteria coverage (AC19 table)
+
+| AC | Proven by | Status |
+|---|---|---|
+| AC1 HTTPS capture | `aitm-proto-http` `https_capture::https_get_captured` | pass |
+| AC2 WebSocket capture | `aitm-proto-ws` `ws_capture::ws_frames_captured_in_order` | pass |
+| AC3 CA mint + moka cache | `aitm-proto-http` `ca::mint_then_cache_hit` | pass |
+| AC4 Event chain + halt | `aitm-core` `chain::ordered_events_and_halt` | pass |
+| AC5 Request mutation reaches upstream | `aitm-proto-http` `https_capture::request_mutation_reaches_upstream`; `aitm-plugins` `mutate` | pass |
+| AC6 Replay | `aitm-plugins` `replay::replay_marks_is_replay` | pass |
+| AC7 MCP full 18-tool surface | `aitm` `frontends::ac7_exact_eighteen_tools` | pass |
+| AC8 One surface, two frontends | `aitm-cli` `cli_matches_mcp`; `aitm` `frontends::mutate_headers_roundtrip_over_{mcp,cli}` | pass |
+| AC9 MCP-only capture | `aitm-mcp` `mcp::mcp_only_capture` | pass |
+| AC10 Browser routes through proxy | `aitm-browser` `browser::navigate_routes_through_proxy` (real Chrome dials the proxy for a loopback target); `driver::launch_args_route_through_the_proxy` (args); e2e drives Chrome via the proxy | pass (+ Chromium) |
+| AC11 Browser primitives | `aitm-browser` `browser::primitives` | pass (Chromium) |
+| AC12 SSRF / private-IP guard | `aitm-core` `guard::ssrf_connector_decision`; `aitm-browser` `ssrf::{navigate_blocks_private…, navigate_permitted…}`; `aitm-poc` `run::browser_navigate_to_private_off_scope_is_refused` | pass (+ Chromium) |
+| AC13 PoC artifact round-trip | `aitm-poc` `serde::{example1_roundtrips, preserves_unmodeled_fields}` | pass |
+| AC14 poc.run pass-vs-patched | `aitm-poc` `run::pass_vs_patched` (browser double); e2e (real Chrome) | pass (+ Chromium) |
+| AC15 Three artifacts | `aitm-poc` `run::three_artifacts`; e2e | pass (+ Chromium) |
+| AC16 Scope gating | `aitm-plugins` `mutate::request_send_scope_gated`, `replay::replay_out_of_scope_refused`; `aitm-poc` `run::http_step_out_of_scope_is_refused` | pass |
+| AC17 Rate limiting | `aitm-plugins` `scope_rate::rate_limit_throttles_burst`; `aitm-core` `guard::rate_limit_burst` | pass |
+| AC18 E2E reflected XSS over MCP | `aitm` `e2e_reflected_xss::reflected_xss_over_mcp` | pass (Chromium) |
+| AC19 Gate green | this exit gate | pass |
+| AC20 Throughput + bounded memory | `aitm` `soak::throughput_floor_and_memory_plateau` (`AITM_SOAK=1`) — 31,378 req/s, plateau | pass |
+| AC-P1 Ordered events + halt | `aitm-core` `chain::{ordered_events_and_halt, intercept_resume_forwards}` | pass |
+| AC-P2 Command over both frontends | `aitm-mcp` `ping_over_mcp`; `aitm-cli` `ping_over_cli` | pass |
+| AC-P3 Removable plugin, no core edit | `aitm` `wiring::drop_mutate_disables_mutation_no_core_edit` | pass |
+| AC-P4 Plugin options end-to-end | `aitm` `wiring::option_from_config`; `aitm-plugins` `scope_rate::option_changes_behavior` | pass |
+| AC-P5 Protocol module via the seam | `aitm-plugin` `seam::toy_module_claims_and_drives` | pass |
+| AC-L1 YAML round-trips | `aitm-poc` `serde::example1_roundtrips` | pass |
+| AC-L2 Deterministic pass-vs-patched | `aitm-poc` `run::pass_vs_patched` | pass |
+| AC-L3 Three artifacts | `aitm-poc` `run::three_artifacts` | pass |
+| AC-L4 Templating | `aitm-poc` `template::{var_and_override, runtime_placeholders}` | pass |
+| AC-L5 Matcher DSL | `aitm-poc` `matcher::{status_word_regex_browser, matcher_part_header, negative_and_or}` | pass |
+| AC-L6 Extractor binds a later variable | `aitm-poc` `matcher::regex_binds_later_var`; `run::extract_binds_variable_for_a_later_assertion` | pass |
+| AC-L7 Schema validation rejects malformed | `aitm-poc` `serde::{missing_id_rejected, unknown_step_rejected}` | pass |
+
+Every M1 AC maps to a passing test. The Chromium-backed tests (AC11, AC18, and the
+browser halves of AC10/AC12/AC14/AC15) pass for real on this machine under
+`AITM_CHROME=1 cargo test` at default parallelism; with the variable unset they
+run inert, so the default gate stays fast and needs no browser.
+
+**Note on AC10:** chromiumoxide launches Chrome with `--proxy-server` +
+`--proxy-bypass-list=<-loopback>` (unit-tested). `navigate_routes_through_proxy`
+now drives real Chrome to a loopback target through a listener that doubles as the
+proxy and answers 200 (the proven Task-19 permitted-navigation pattern), and
+asserts Chrome dialed the proxy; it is bounded by the 30 s `nav_timeout`, so it
+fails rather than hangs if Chrome ever does not. The earlier bare-stub variant
+(target never answered) was Chrome-version-fragile and was replaced. Verifying
+browser-originated capture through the *real `HttpModule` connector* with a
+non-loopback host + hosts mapping remains a follow-up (this test and the e2e both
+use a listener, not the production connector). The browser's SSRF for loopback
+targets is still enforced pre-flight (`check_url` in `browser.navigate` and the
+poc runner), independent of connector routing.
+
+### What was cut / deferred
+See **Follow-ups** below (CA owner-uid check, broader `Event::Error` coverage,
+per-step matcher evaluation, the AC10 browser-capture verification, and the
+cosmetic dedup/rename items). Tasks 29/30/31 are complete; nothing in M1's scope
+is outstanding beyond those tracked follow-ups.
+
+## Follow-ups
+
+Tracked work the fix-and-harden pass deferred (approved 2026-10-27). Each is a
+correctness/security/robustness item, not pure cosmetics.
+
+- **Browser-origin SSRF at the connector.** Give the embedded browser its own
+  proxy listener/port (or peer match) so the upstream connector can enforce
+  `SsrfPolicy` on browser-originated connections (redirects, page `fetch`,
+  sub-resources, `browser.eval`), closing the gap the per-navigation `check_url`
+  does not cover. Thread the authority through `UpstreamConnector::connect`.
+- **Error taxonomy coverage.** Extend `Event::Error(FlowError::…)` emission to the
+  remaining module failure paths (TLS handshake, connect, parse) — the budget /
+  backoff / host-disable path and the main upstream-failure mapping already land.
+- **Per-step matcher evaluation.** `HttpStep.extra` now preserves `matchers` /
+  `matchers-condition` for round-trip; evaluating them (and `step(id)` references
+  from `success`) is still future work.
+- **CA key owner-uid check.** Also refuse a CA key not owned by the current uid
+  (the group/other-mode check and explicit validity already land); needs a
+  non-`unsafe` `getuid` (e.g. `rustix`) under `forbid(unsafe_code)`.
+- **Verify browser-originated capture through the real connector (AC10).**
+  `navigate_routes_through_proxy` now proves real Chrome dials the proxy (loopback
+  target, listener-as-proxy). Still open: drive Chrome to a *non-loopback* target
+  (hosts mapping / `--host-resolver-rules`) through the production `HttpModule`
+  connector so the navigation appears as a captured `HttpFlow` and is SSRF-filtered
+  at the connector, not just pre-flight.
+
+### Deferred cosmetic (no security/correctness angle)
+
+JSON→Value converter dedup (3→1), base64 dedup (2→1), `ParamDef` constructor
+helpers, a `test-support` feature, the `serve()` refactor, `Flow` helper methods,
+`HeaderMap::set`→`append` rename, `NextLayerHint.dst`→`peer` rename, CLI
+Debug→JSON output, workspace-dep `workspace=true` hygiene, `Body::Streamed`
+naming, `Proxy` API noise, `McpServer` Mutex, tautological-test deletion.

@@ -947,10 +947,14 @@ pub enum ExtractSource {
 }
 
 pub enum Assertion {               // nuclei operator vocabulary; reproduction in M1, reusable by a future scanner plugin
-    Status(u16), Word(String), Regex(String), Dsl(String),
+    Status(u16),
+    // (Reconciliation R2, 2026-10-27) word/regex carry the nuclei `part`
+    // (body default / header / all) so a matcher can target response headers.
+    Word { word: String, part: MatchPart }, Regex { regex: String, part: MatchPart }, Dsl(String),
     BrowserEval { expr: String, equals: Value },  // e.g. XSS marker observed in the page
     All(Vec<Assertion>), Any(Vec<Assertion>), Not(Box<Assertion>),
 }
+pub enum MatchPart { Body, Header, All }   // default Body
 ```
 
 ```rust
@@ -1028,6 +1032,7 @@ pub struct Config {
     pub ca: CaConfig,
     pub mcp: McpConfig,
     pub browser: BrowserConfig,
+    pub ssl_insecure: bool,             // (R3) default false: verify upstream TLS
 }
 
 pub struct ScopeConfig {
@@ -1040,10 +1045,11 @@ pub struct ScopeEntry {
 
 pub struct LimitConfig {
     pub global_rps: u32,                // default 150
-    pub per_host_rps: u32,
+    pub per_host_rps: u32,              // 0 == refuse (not "1 rps")
     pub max_concurrency: u32,           // default 25
     pub host_error_budget: u32,         // host disabled after N errors
     pub backoff: BackoffConfig,
+    pub max_body_bytes: usize,          // default 10 MiB; per-message body cap
 }
 
 pub struct BackoffConfig { pub base: Duration, pub max: Duration, pub factor: f64 }
@@ -1077,7 +1083,17 @@ for Matt.)
   until added via `scope.add`. Active actions (`flow.replay`, `request.send`,
   `browser.navigate`, `poc.run`) against an out-of-scope host are refused with a
   clear error. Passive capture of observed traffic is allowed, but active reissue
-  is gated.
+  is gated. **(Reconciliation R1, 2026-10-27):** the scope/rate check is applied
+  **only on active actions**, by the command handlers / `PipelineClient` — the
+  passive upstream connector does **not** scope-gate proxied traffic and does not
+  consume the active-action rate budget. The scope key is the requested
+  **authority** (`host[:port]`, via `aitm_core::Authority`), not a resolved IP.
+- **Upstream TLS verification (Reconciliation R3, 2026-10-27):** the MITM path
+  **verifies upstream server certificates against the platform/webpki roots by
+  default**; a certificate that does not verify fails the handshake and the
+  tunnel is dropped (the proxy never presents a trusted leaf for a server it
+  could not authenticate). `Config.ssl_insecure` (default `false`) turns
+  verification off for a lab of self-signed targets.
 - **Authorization gating (decided, per Matt):** deny-by-default scope **is** the
   M1 authorization mechanism; there is **no separate recorded-authorization file**
   in M1. An explicit, recorded per-scope authorization gate (e.g. a confirmed
@@ -1143,8 +1159,9 @@ internals stay the builder's.
    CONNECT or TLS ClientHello, peeks bytes/SNI/ALPN into a `NextLayerHint`.
 2. It asks each registered `ProtocolModule::matches`; `aitm-proto-http` claims it
    and is handed a `ByteStream` + `ModuleCtx` via `spawn`.
-3. `aitm-proto-http` connects upstream (through `ModuleCtx::connect_upstream`,
-   scope/rate-guarded), reads the upstream leaf's CN/SANs, and calls
+3. `aitm-proto-http` connects upstream (through `ModuleCtx::connect_upstream`;
+   passive capture is **not** scope-gated — R1), verifies the upstream
+   certificate (R3), reads the upstream leaf's CN/SANs, and calls
    `CertAuthority::leaf_for(host, sans)` — a **moka cache hit** on a repeat host.
 4. It completes the client TLS handshake impersonating the host, then decrypts and
    drives the `HttpStateMachine`.
