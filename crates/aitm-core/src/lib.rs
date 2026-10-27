@@ -14,8 +14,10 @@ pub mod flow;
 pub mod guard;
 pub mod header;
 pub mod plugin;
+pub mod protocol;
 pub mod registry;
 pub mod store;
+pub mod stream;
 pub mod value;
 
 pub use body::{Body, StreamBody};
@@ -34,8 +36,10 @@ pub use flow::{
 pub use guard::{classify_host, ActionPermit, HostClass, ScopeRateGuard, StdGuard};
 pub use header::HeaderMap;
 pub use plugin::Plugin;
+pub use protocol::{EventSink, ModuleCtx, NextLayerHint, ProtocolModule, UpstreamConnector};
 pub use registry::Registry;
 pub use store::{FlowKind, FlowQuery, FlowStore, MemFlowStore};
+pub use stream::{AsyncReadWrite, ByteStream};
 pub use value::{Params, Value};
 
 /// The crate version, wired to the Cargo package version.
