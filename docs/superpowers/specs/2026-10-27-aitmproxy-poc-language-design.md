@@ -204,6 +204,12 @@ reusable by a future scanner plugin — platform spec). Maps to `aitm-poc::Asser
 | `status` | int | `Status(u16)` |
 | `word` | string(s), `encoding: hex?`, `part` | `Word { word, part }` |
 | `regex` | pattern(s), `part` | `Regex { regex, part }` |
+
+> Unmodeled `http`-step keys (`matchers`/`matchers-condition`/`raw`/`path`) and
+> `info` extras (`description`/`author`/`metadata`) are **preserved** on the model
+> (`HttpStep.extra`, `PocInfo.description/author/metadata`) so a PoC round-trips
+> faithfully (AC13). Per-step matcher *evaluation* is future work; M1 evaluates
+> the top-level `success`.
 | `size` | int (content length) | via `Dsl` |
 | `binary` | hex byte signature | via `Dsl`/`Word` hex |
 | `dsl` | expression(s) over `status_code`, `body`, `all_headers`, `content_length`, extracted vars | `Dsl(String)` |

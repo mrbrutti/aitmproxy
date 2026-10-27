@@ -437,12 +437,14 @@ pass below was approved by Matt 2026-10-27.
 
 | Robustness | Important | Parked (intercepted) flow could pin forever if never resumed | Fixed in second pass: the chain bounds the parked await with `Chain::with_intercept_timeout` (default 5 min); on timeout the flow is killed and the `Intercepted` state (and its backup) released. Tested with a short timeout. |
 
+| Tests | Minor | AC13 field loss (`PocInfo` description/author/metadata, `HttpStep` matchers/raw/path dropped) | Fixed in second pass: `PocInfo` gains `description`/`author`/`metadata`; `HttpStep` keeps unmodeled keys in a flattened `extra` map, so a PoC round-trips faithfully. Tested. (Per-step matcher *evaluation* remains future work.) |
+
 ### Deferred (tracked in Follow-ups, approved 2026-10-27)
 
-AC13 field preservation (info/http-step extras); CA key owner-uid check (needs a
-non-`unsafe` getuid); exact-count test tightening. (Error-taxonomy mapping is
-wired at the main upstream-failure point; extending `Event::Error` to every
-module failure path is incremental.)
+CA key owner-uid check (needs a non-`unsafe` getuid); exact-count test tightening.
+(Error-taxonomy mapping is wired at the main upstream-failure point; extending
+`Event::Error` to every module failure path, and evaluating per-step matchers,
+are incremental.)
 
 ## Shipped
 
@@ -461,9 +463,9 @@ correctness/security/robustness item, not pure cosmetics.
 - **Error taxonomy coverage.** Extend `Event::Error(FlowError::…)` emission to the
   remaining module failure paths (TLS handshake, connect, parse) — the budget /
   backoff / host-disable path and the main upstream-failure mapping already land.
-- **AC13 field preservation.** Now that `part`/matchers are modeled (R2), stop
-  dropping `PocInfo` (description/author/metadata) and `HttpStep`
-  (matchers/matchers-condition/raw/path) fields; round-trip them.
+- **Per-step matcher evaluation.** `HttpStep.extra` now preserves `matchers` /
+  `matchers-condition` for round-trip; evaluating them (and `step(id)` references
+  from `success`) is still future work.
 - **CA key owner-uid check.** Also refuse a CA key not owned by the current uid
   (the group/other-mode check and explicit validity already land); needs a
   non-`unsafe` `getuid` (e.g. `rustix`) under `forbid(unsafe_code)`.

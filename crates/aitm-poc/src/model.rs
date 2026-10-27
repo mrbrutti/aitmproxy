@@ -25,9 +25,9 @@ pub struct Poc {
     pub success: Assertion,
 }
 
-/// Identification metadata. Deliberately carries no remediation / fix prose
-/// (platform Non-goal). Extra on-disk `info` keys (`description`, `author`,
-/// `metadata`) are accepted and ignored — they are not part of the model.
+/// Identification metadata. Carries no remediation / fix prose (platform
+/// Non-goal), but the on-disk `description` / `author` / `metadata` keys are
+/// preserved so a PoC round-trips faithfully (AC13).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PocInfo {
     pub name: String,
@@ -38,6 +38,12 @@ pub struct PocInfo {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwe: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_yaml::Value>,
 }
 
 /// Finding severity. Serializes as the lowercase nuclei vocabulary.
@@ -117,9 +123,10 @@ impl<'de> Deserialize<'de> for Step {
     }
 }
 
-/// An HTTP request step. On-disk `matchers`/`matchers-condition`/`raw`/`path`
-/// keys are accepted and ignored here — the model carries the request shape only;
-/// assertions live in per-step evaluation (Task 22) and top-level `success`.
+/// An HTTP request step. The model carries the request shape; on-disk keys it
+/// does not interpret (`matchers`/`matchers-condition`/`raw`/`path`/…) are kept
+/// in `extra` so the step round-trips faithfully (AC13). Per-step matcher
+/// *evaluation* is still future work; top-level `success` is what M1 evaluates.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HttpStep {
     pub method: String,
@@ -130,6 +137,13 @@ pub struct HttpStep {
     pub body: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extract: Vec<ExtractStep>,
+    /// Unmodeled on-disk keys, preserved verbatim for round-trip fidelity.
+    #[serde(
+        flatten,
+        default,
+        skip_serializing_if = "serde_yaml::Mapping::is_empty"
+    )]
+    pub extra: serde_yaml::Mapping,
 }
 
 /// A browser-driver step carrying exactly one action.

@@ -64,6 +64,9 @@ fn build_parameterizes_flow() {
             references: vec![],
             tags: vec!["xss".into()],
             cwe: Some("CWE-79".into()),
+            description: None,
+            author: None,
+            metadata: None,
         },
         variables: vec![
             Variable {
@@ -134,6 +137,9 @@ fn build_redacts_credential_headers() {
             references: vec![],
             tags: vec![],
             cwe: None,
+            description: None,
+            author: None,
+            metadata: None,
         },
         variables: vec![],
         success: Assertion::Status(200),

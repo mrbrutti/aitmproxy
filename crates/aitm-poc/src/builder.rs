@@ -47,6 +47,7 @@ impl PocBuilder for StdPocBuilder {
             headers,
             body: body_text(&req.body),
             extract: Vec::new(),
+            extra: serde_yaml::Mapping::new(),
         };
 
         // Credential headers are never baked into a shareable PoC: they become
@@ -255,6 +256,9 @@ impl Command for PocBuildCommand {
                 references: Vec::new(),
                 tags: Vec::new(),
                 cwe: None,
+                description: None,
+                author: None,
+                metadata: None,
             },
             variables: vec![
                 Variable {
