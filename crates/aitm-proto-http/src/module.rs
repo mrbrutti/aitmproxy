@@ -2,7 +2,8 @@
 //! connections, performs TLS MITM with leaves minted by the [`CertAuthority`],
 //! drives the sans-IO machine, captures each exchange as an `HttpFlow`, emits
 //! the request/response events through the plugin chain, and forwards the
-//! (possibly mutated) request upstream (platform spec data-flow 1).
+//! (possibly mutated) request upstream (platform spec data-flow 1). After a
+//! 101 it hands both streams to the module claiming the upgrade (data-flow 3).
 //!
 //! Request bodies are gathered before `Event::Request` fires, since plugins
 //! mutate the complete request; response bodies stream to the client chunk by
@@ -130,6 +131,7 @@ impl HttpModule {
     /// Peek the first bytes and route: CONNECT tunnel (then TLS or cleartext
     /// inside it), raw TLS (SNI picks the upstream), or cleartext HTTP.
     async fn drive(&self, io: ByteStream, ctx: ModuleCtx) -> Result<()> {
+        let peer = ctx.hint().map(|h| h.dst).unwrap_or_else(unknown_peer);
         let mut client = Prefixed::new(io);
         let first = client.peek(8).await?.to_vec();
         if first.starts_with(b"CONNECT ") {
@@ -142,15 +144,15 @@ impl HttpModule {
             client.flush().await?;
             let next = client.peek(1).await?.to_vec();
             if next.first() == Some(&TLS_HANDSHAKE) {
-                self.mitm(client, ctx, Some(target)).await
+                self.mitm(client, ctx, peer, Some(target)).await
             } else {
-                let conn = Conn::plain(Some(target.authority()));
+                let conn = Conn::plain(peer, Some(target.authority()));
                 serve(&ctx, Box::pin(client), None, conn).await
             }
         } else if first.first() == Some(&TLS_HANDSHAKE) {
-            self.mitm(client, ctx, None).await
+            self.mitm(client, ctx, peer, None).await
         } else {
-            serve(&ctx, Box::pin(client), None, Conn::plain(None)).await
+            serve(&ctx, Box::pin(client), None, Conn::plain(peer, None)).await
         }
     }
 
@@ -161,6 +163,7 @@ impl HttpModule {
         &self,
         client: Prefixed<ByteStream>,
         ctx: ModuleCtx,
+        peer: SocketAddr,
         target: Option<Target>,
     ) -> Result<()> {
         let start = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), client)
@@ -203,7 +206,7 @@ impl HttpModule {
             scheme: "https".to_string(),
             tunnel_authority: Some(target.authority()),
             client_conn: ConnInfo {
-                peer: unknown_peer(),
+                peer,
                 sni,
                 alpn: Some("http/1.1".to_string()),
                 tls: true,
@@ -265,12 +268,12 @@ struct Conn {
 }
 
 impl Conn {
-    fn plain(tunnel_authority: Option<String>) -> Self {
+    fn plain(peer: SocketAddr, tunnel_authority: Option<String>) -> Self {
         Self {
             scheme: "http".to_string(),
             tunnel_authority,
             client_conn: ConnInfo {
-                peer: unknown_peer(),
+                peer,
                 sni: None,
                 alpn: None,
                 tls: false,
@@ -282,7 +285,8 @@ impl Conn {
 }
 
 /// Serve HTTP exchanges between `client` and `upstream` until either side
-/// closes. With no `upstream` (cleartext forward proxy), one is opened for the
+/// closes, or until a 101 hands both streams to the upgraded protocol's
+/// module. With no `upstream` (cleartext forward proxy), one is opened for the
 /// first request's authority and reopened when the authority changes.
 async fn serve(
     ctx: &ModuleCtx,
@@ -299,6 +303,7 @@ async fn serve(
         // the head is in and inserting the flow.
         let mut flow_id: Option<FlowId> = None;
         let mut body: Vec<u8> = Vec::new();
+        let mut upgrade_protocol: Option<String> = None;
         let mut complete = false;
         // Start by draining anything already buffered (a pipelined request).
         let mut feed: Vec<u8> = Vec::new();
@@ -350,8 +355,9 @@ async fn serve(
                         });
                         complete = true;
                     }
-                    // The upgrade itself is honoured after the 101 (see below).
-                    HttpSansIoEvent::Upgrade { .. } => {}
+                    HttpSansIoEvent::Upgrade { protocol, .. } => {
+                        upgrade_protocol = Some(protocol);
+                    }
                     HttpSansIoEvent::ResponseHeaders(_)
                     | HttpSansIoEvent::ResponseBodyChunk { .. }
                     | HttpSansIoEvent::ResponseComplete(_) => {}
@@ -512,11 +518,26 @@ async fn serve(
         }
 
         if machine.is_upgraded() {
-            // The connection now belongs to the upgraded protocol. Handing the
-            // two streams and the handshake flow to the next module needs the
-            // seam to carry them; until it does, the tunnel ends here.
-            let _ = client.shutdown().await;
-            return Ok(());
+            // The connection now belongs to the upgraded protocol: hand both
+            // streams (with any bytes already read past the 101) and the
+            // handshake flow to the module that claims it.
+            let protocol = upgrade_protocol.unwrap_or_else(|| "unknown".to_string());
+            let Some(upstream_io) = upstream.take() else {
+                bail!("upgraded without an upstream stream");
+            };
+            let client_rest = machine.take_leftover(Side::Client);
+            let server_rest = machine.take_leftover(Side::Server);
+            let hint = NextLayerHint {
+                dst: conn.client_conn.peer,
+                is_tls: conn.client_conn.tls,
+                client_hello_sni: conn.client_conn.sni.clone(),
+                alpn: vec![protocol],
+                first_bytes: client_rest.clone(),
+                from_upgrade: true,
+            };
+            let client_io: ByteStream = Box::pin(Prefixed::with_prefix(client, client_rest));
+            let upstream_io: ByteStream = Box::pin(Prefixed::with_prefix(upstream_io, server_rest));
+            return ctx.handoff_upgrade(client_io, upstream_io, id, hint).await;
         }
         if request_close || response_close {
             let _ = client.shutdown().await;
@@ -619,8 +640,7 @@ fn split_host_port(authority: &str, default_port: u16) -> Result<(String, u16)> 
     }
 }
 
-/// The placeholder peer for the client side: the seam hands a module the
-/// stream without its address.
+/// The placeholder peer when the acceptor attached no hint.
 fn unknown_peer() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
 }
@@ -718,7 +738,8 @@ impl ServerCertVerifier for AcceptAnyServerCert {
 
 /// A stream with a replay buffer in front: lets the module peek at the first
 /// bytes (and consume a CONNECT head) before handing the rest to a TLS
-/// acceptor or the HTTP machine unchanged.
+/// acceptor or the HTTP machine unchanged, and lets bytes already read past a
+/// 101 travel with the stream into the next module.
 struct Prefixed<S> {
     prefix: Vec<u8>,
     inner: S,
@@ -726,10 +747,12 @@ struct Prefixed<S> {
 
 impl<S: AsyncRead + Unpin> Prefixed<S> {
     fn new(inner: S) -> Self {
-        Self {
-            prefix: Vec::new(),
-            inner,
-        }
+        Self::with_prefix(inner, Vec::new())
+    }
+
+    /// A stream that yields `prefix` before anything from `inner`.
+    fn with_prefix(inner: S, prefix: Vec<u8>) -> Self {
+        Self { prefix, inner }
     }
 
     /// Buffer at least `n` bytes (fewer only at EOF) and return the buffer.

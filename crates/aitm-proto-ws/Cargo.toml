@@ -9,3 +9,15 @@ description = "WebSocket protocol module: activates on HTTP Upgrade and captures
 [dependencies]
 aitm-core.workspace = true
 aitm-plugin.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync"] }
+# Unpredictable masking keys for frames authored towards the server (RFC 6455 5.3).
+uuid.workspace = true
+
+[dev-dependencies]
+# The AC2 test upgrades through a real Proxy, so it needs the HTTP module that
+# performs the hand-off. Test-only: no library edge between the proto crates.
+aitm-proto-http.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
+tokio-tungstenite = "0.28"
