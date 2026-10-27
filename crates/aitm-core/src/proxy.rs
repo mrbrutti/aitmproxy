@@ -29,6 +29,8 @@ struct ProxyInner {
     guard: Arc<dyn ScopeRateGuard>,
     chain: Arc<Chain>,
     modules: Arc<[Arc<dyn ProtocolModule>]>,
+    /// SSRF posture enforced on the browser-facing listener.
+    browser_ssrf: crate::config::SsrfPolicy,
 }
 
 impl Proxy {
@@ -60,11 +62,25 @@ impl Proxy {
         self.inner.guard.clone()
     }
 
-    /// Bind and run the accept loop until an unrecoverable error.
-    pub async fn run(self, listen: SocketAddr) -> anyhow::Result<()> {
+    /// Bind and run the main client-facing accept loop. Passive capture here is
+    /// not SSRF-filtered (the operator controls the client); scope/rate apply to
+    /// active reissue only.
+    pub async fn run(&self, listen: SocketAddr) -> anyhow::Result<()> {
+        self.accept_loop(listen, false).await
+    }
+
+    /// Bind and run the **browser-facing** accept loop. The embedded browser dials
+    /// this listener (`--proxy-server`), and every upstream it opens — including
+    /// redirects, `fetch`, sub-resources and `browser.eval` traffic — is
+    /// SSRF-filtered: a private/loopback target is refused unless the host or IP
+    /// is explicitly in scope.
+    pub async fn run_browser(&self, listen: SocketAddr) -> anyhow::Result<()> {
+        self.accept_loop(listen, true).await
+    }
+
+    async fn accept_loop(&self, listen: SocketAddr, ssrf: bool) -> anyhow::Result<()> {
         let listener = TcpListener::bind(listen).await?;
-        tracing::info!(%listen, "proxy listening");
-        let inner = self.inner;
+        tracing::info!(%listen, ssrf, "proxy listening");
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(pair) => pair,
@@ -73,9 +89,9 @@ impl Proxy {
                     continue;
                 }
             };
-            let inner = inner.clone();
+            let inner = self.inner.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_conn(inner, stream, peer).await {
+                if let Err(e) = handle_conn(inner, stream, peer, ssrf).await {
                     tracing::warn!(%peer, error = %e, "connection handler ended with an error");
                 }
             });
@@ -83,11 +99,13 @@ impl Proxy {
     }
 }
 
-/// Peek, pick a module, and drive it.
+/// Peek, pick a module, and drive it. `ssrf` selects the browser-facing SSRF
+/// connector over the passive one.
 async fn handle_conn(
     inner: Arc<ProxyInner>,
     stream: TcpStream,
     peer: SocketAddr,
+    ssrf: bool,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; 64];
     let n = stream.peek(&mut buf).await.unwrap_or(0);
@@ -106,7 +124,14 @@ async fn handle_conn(
         return Ok(());
     };
 
-    let connector: Arc<dyn UpstreamConnector> = Arc::new(PassiveConnector);
+    let connector: Arc<dyn UpstreamConnector> = if ssrf {
+        Arc::new(SsrfConnector {
+            policy: inner.browser_ssrf.clone(),
+            guard: inner.guard.clone(),
+        })
+    } else {
+        Arc::new(PassiveConnector)
+    };
     let ctx = ModuleCtx::new(inner.store.clone(), inner.chain.clone(), connector)
         .with_modules(inner.modules.clone())
         .with_hint(hint);
@@ -114,25 +139,49 @@ async fn handle_conn(
     module.spawn(io, ctx).await
 }
 
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn dial(dst: SocketAddr) -> anyhow::Result<ByteStream> {
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(dst))
+        .await
+        .map_err(|_| anyhow::anyhow!("upstream connect to {dst} timed out"))??;
+    Ok(Box::pin(stream))
+}
+
 /// Opens upstream TCP streams for **passive** proxied traffic. Passive capture
 /// is not gated by the scope allowlist (an intercepting proxy must relay what
 /// the client sends) and does not consume the active-action rate budget — scope
 /// and rate are enforced only on active reissue (`flow.replay`, `request.send`,
 /// `browser.navigate`, `poc.run`) by the command handlers / `PipelineClient`.
-///
-/// A bounded connect timeout keeps a dead upstream from pinning the connection.
 struct PassiveConnector;
 
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 impl UpstreamConnector for PassiveConnector {
-    fn connect(&self, dst: SocketAddr) -> BoxFuture<'_, anyhow::Result<ByteStream>> {
+    fn connect(
+        &self,
+        _authority: &str,
+        dst: SocketAddr,
+    ) -> BoxFuture<'_, anyhow::Result<ByteStream>> {
+        Box::pin(dial(dst))
+    }
+}
+
+/// Opens upstream streams for the browser-facing listener, refusing a
+/// private/loopback target unless it is explicitly in scope (SSRF).
+struct SsrfConnector {
+    policy: crate::config::SsrfPolicy,
+    guard: Arc<dyn ScopeRateGuard>,
+}
+
+impl UpstreamConnector for SsrfConnector {
+    fn connect(
+        &self,
+        authority: &str,
+        dst: SocketAddr,
+    ) -> BoxFuture<'_, anyhow::Result<ByteStream>> {
+        let authority = authority.to_string();
         Box::pin(async move {
-            let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(dst))
-                .await
-                .map_err(|_| anyhow::anyhow!("upstream connect to {dst} timed out"))??;
-            let bs: ByteStream = Box::pin(stream);
-            Ok(bs)
+            crate::guard::ssrf_check(&self.policy, &self.guard.list_scope(), &authority, dst.ip())?;
+            dial(dst).await
         })
     }
 }
@@ -180,6 +229,7 @@ impl ProxyBuilder {
         }
         let registry = Arc::new(registry);
         let chain = Arc::new(Chain::new(registry.clone(), store.clone()));
+        let browser_ssrf = config.browser.ssrf.clone();
 
         Ok(Proxy {
             inner: Arc::new(ProxyInner {
@@ -188,6 +238,7 @@ impl ProxyBuilder {
                 guard,
                 chain,
                 modules: self.modules.into(),
+                browser_ssrf,
             }),
         })
     }

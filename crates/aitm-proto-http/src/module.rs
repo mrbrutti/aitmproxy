@@ -204,7 +204,9 @@ impl HttpModule {
             }
         };
 
-        let tcp = ctx.connect_upstream(target.addr).await?;
+        let tcp = ctx
+            .connect_upstream(&target.authority(), target.addr)
+            .await?;
         let server_name = ServerName::try_from(target.host.clone())
             .map_err(|e| anyhow!("invalid upstream name {:?}: {e}", target.host))?;
         let upstream = TlsConnector::from(self.upstream_tls()?)
@@ -437,7 +439,10 @@ async fn serve(
         };
         if needs_connect {
             let target = Target::resolve(&request.authority, 80).await?;
-            upstream = Some(ctx.connect_upstream(target.addr).await?);
+            upstream = Some(
+                ctx.connect_upstream(&target.authority(), target.addr)
+                    .await?,
+            );
             current_authority = Some(request.authority.clone());
             let server_conn = ConnInfo {
                 peer: target.addr,

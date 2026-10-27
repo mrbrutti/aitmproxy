@@ -164,6 +164,57 @@ fn classify_ip(ip: IpAddr) -> HostClass {
     }
 }
 
+/// Whether a host class is blocked by an SSRF policy.
+fn blocked_by_policy(class: HostClass, policy: &crate::config::SsrfPolicy) -> bool {
+    match class {
+        HostClass::Loopback => policy.block_loopback,
+        HostClass::Private => policy.block_private,
+        HostClass::Public => false,
+    }
+}
+
+/// SSRF decision for an upstream connection: refuse a private/loopback target
+/// (by the requested `authority` or the resolved `dst`) unless the host or IP
+/// literal is **explicitly** in scope (an exact `host`/`host:port`/IP entry — a
+/// wildcard does not lift the block). Used by the browser proxy connector so
+/// redirects, page `fetch`, sub-resources and `browser.eval` are all covered,
+/// not only the first navigation.
+pub fn ssrf_check(
+    policy: &crate::config::SsrfPolicy,
+    scope: &[ScopeEntry],
+    authority: &str,
+    dst: IpAddr,
+) -> Result<(), GuardError> {
+    let auth = Authority::parse_with_default(authority, 0).ok();
+    let host = auth
+        .as_ref()
+        .map(|a| a.host.clone())
+        .unwrap_or_else(|| authority.to_ascii_lowercase());
+
+    let blocked = blocked_by_policy(classify_host(&host), policy)
+        || blocked_by_policy(classify_ip(dst), policy);
+    if !blocked {
+        return Ok(());
+    }
+
+    let ip_auth = Authority::new(&dst.to_string(), dst_port(auth.as_ref()));
+    let in_scope = policy.allow_if_in_scope
+        && scope.iter().any(|e| {
+            auth.as_ref()
+                .is_some_and(|a| a.matches_scope_entry_exactly(&e.host))
+                || ip_auth.matches_scope_entry_exactly(&e.host)
+        });
+    if in_scope {
+        Ok(())
+    } else {
+        Err(GuardError::PrivateAddressBlocked(host))
+    }
+}
+
+fn dst_port(auth: Option<&Authority>) -> u16 {
+    auth.map(|a| a.port).unwrap_or(0)
+}
+
 /// A simple token bucket: `rate` tokens/sec, burst up to `capacity`.
 struct TokenBucket {
     tokens: f64,

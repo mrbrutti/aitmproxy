@@ -163,7 +163,9 @@ pub struct BrowserConfig {
 impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
-            proxy_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+            // A dedicated loopback port, distinct from the main listener (8080):
+            // the embedded browser dials this SSRF-filtered listener.
+            proxy_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
             headless: true,
             ignore_cert_errors: true,
             nav_timeout: Duration::from_secs(30),

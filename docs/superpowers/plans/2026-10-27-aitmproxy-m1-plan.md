@@ -426,15 +426,15 @@ pass below was approved by Matt 2026-10-27.
 | Robustness | Important | `per_host_rps == 0` throttled at 1 rps instead of refusing | Fixed in `f77335e`. |
 | Robustness | Minor | No `forbid(unsafe_code)` | Fixed in `b0384b3`: `unsafe_code = "forbid"` workspace-wide. |
 | Tests | Important | AC7 exact 18-tool set unproven; frontends stubbed | Fixed in `5229e09`: `tools/list` exact-18 + `flow.mutate` map round-trip over MCP and CLI + CRLF refusal + `poc.run` vars coercion. |
+| Security | Important | Browser-origin SSRF unenforced (redirects / fetch / sub-resources bypass the per-navigation `check_url`) | Fixed in `6e…` (second pass): a dedicated browser-facing listener (`Proxy::run_browser`, `cfg.browser.proxy_addr` :8081) whose `SsrfConnector` runs `ssrf_check` on every upstream (authority host + resolved IP); `UpstreamConnector::connect` now threads the authority. |
 
 ### Deferred (tracked in Follow-ups, approved 2026-10-27)
 
 Rate-limit double-count + real-client test rewrites; the binary's Http1/TLS
-request sender; browser-origin SSRF at the connector + `poc.run` navigate SSRF;
-error taxonomy / `record_error` / backoff / host-disable; parked-flow leak on
-client EOF; AC13 field preservation (info/http-step extras); CA load-time
-permission checks + validity dates; proto-http/WS body-cap enforcement;
-exact-count test tightening.
+request sender; `poc.run` navigate SSRF; error taxonomy / `record_error` /
+backoff / host-disable; parked-flow leak on client EOF; AC13 field preservation
+(info/http-step extras); CA load-time permission checks + validity dates;
+proto-http/WS body-cap enforcement; exact-count test tightening.
 
 ## Shipped
 

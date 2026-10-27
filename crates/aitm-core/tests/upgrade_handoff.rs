@@ -25,7 +25,11 @@ impl EventSink for NoopSink {
 struct NoReconnect;
 
 impl UpstreamConnector for NoReconnect {
-    fn connect(&self, _dst: SocketAddr) -> BoxFuture<'_, anyhow::Result<ByteStream>> {
+    fn connect(
+        &self,
+        _authority: &str,
+        _dst: SocketAddr,
+    ) -> BoxFuture<'_, anyhow::Result<ByteStream>> {
         Box::pin(async { anyhow::bail!("must not reconnect after an upgrade") })
     }
 }

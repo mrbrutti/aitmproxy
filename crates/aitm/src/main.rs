@@ -70,9 +70,13 @@ async fn main() -> anyhow::Result<()> {
     let mcp = aitm_mcp::McpServer::new(registry, cfg.mcp.transport.clone())
         .with_services(store, client, guard, browser);
 
-    let listen = cfg.listen;
+    // The main listener relays client traffic; the browser listener is
+    // SSRF-filtered (the embedded browser dials `cfg.browser.proxy_addr`).
+    let main_listen = cfg.listen;
+    let browser_listen = cfg.browser.proxy_addr;
     tokio::select! {
-        result = proxy.run(listen) => result,
+        result = proxy.run(main_listen) => result,
+        result = proxy.run_browser(browser_listen) => result,
         result = mcp.serve() => result,
     }
 }

@@ -76,7 +76,11 @@ impl EventSink for NoopSink {
 struct NoopConnector;
 
 impl UpstreamConnector for NoopConnector {
-    fn connect(&self, _dst: SocketAddr) -> BoxFuture<'_, anyhow::Result<ByteStream>> {
+    fn connect(
+        &self,
+        _authority: &str,
+        _dst: SocketAddr,
+    ) -> BoxFuture<'_, anyhow::Result<ByteStream>> {
         Box::pin(async { anyhow::bail!("no upstream in this test") })
     }
 }

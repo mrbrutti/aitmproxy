@@ -59,7 +59,14 @@ pub trait EventSink: Send + Sync {
 /// Opens a guarded (scope/rate-checked) upstream byte stream. Implemented in
 /// Task 8; a module reaches it only through [`ModuleCtx::connect_upstream`].
 pub trait UpstreamConnector: Send + Sync {
-    fn connect(&self, dst: SocketAddr) -> BoxFuture<'_, anyhow::Result<ByteStream>>;
+    /// Open an upstream stream to `dst`. `authority` is the host[:port] the client
+    /// asked for (so a connector can apply scope/SSRF policy on the name, not only
+    /// the resolved address).
+    fn connect(
+        &self,
+        authority: &str,
+        dst: SocketAddr,
+    ) -> BoxFuture<'_, anyhow::Result<ByteStream>>;
 }
 
 /// Handles a module uses to emit flows/events and reach upstream — never the
@@ -174,8 +181,14 @@ impl ModuleCtx {
         self.sink.emit(ev)
     }
 
-    /// Open a guarded upstream byte stream (scope/rate checked).
-    pub fn connect_upstream(&self, dst: SocketAddr) -> BoxFuture<'_, anyhow::Result<ByteStream>> {
-        self.connector.connect(dst)
+    /// Open an upstream byte stream through the connection's connector. `authority`
+    /// is the requested host[:port]; the connector decides policy (the passive
+    /// connector relays freely; the browser connector enforces SSRF).
+    pub fn connect_upstream(
+        &self,
+        authority: &str,
+        dst: SocketAddr,
+    ) -> BoxFuture<'_, anyhow::Result<ByteStream>> {
+        self.connector.connect(authority, dst)
     }
 }

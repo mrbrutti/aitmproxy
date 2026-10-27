@@ -40,7 +40,7 @@ pub use flow::{
     ConnInfo, Flow, FlowId, FlowMeta, HttpFlow, HttpRequest, HttpResponse, HttpVersion,
     InterceptState, ResumeHandle, WsDir, WsFlow, WsMessage, WsOpcode,
 };
-pub use guard::{classify_host, ActionPermit, HostClass, ScopeRateGuard, StdGuard};
+pub use guard::{classify_host, ssrf_check, ActionPermit, HostClass, ScopeRateGuard, StdGuard};
 pub use header::{HeaderError, HeaderMap};
 pub use plugin::Plugin;
 pub use protocol::{EventSink, ModuleCtx, NextLayerHint, ProtocolModule, UpstreamConnector};
