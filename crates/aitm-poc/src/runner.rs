@@ -163,8 +163,17 @@ impl StdPocRunner {
                     match &browser.action {
                         BrowserAction::Navigate { url } => {
                             let url = tmpl.render(url, &live)?;
-                            let host_str = authority_of(&url)?;
-                            let _permit = host.guard().check_active(&host_str)?;
+                            // SSRF pre-flight (resolve + classify, url::Url parse)
+                            // before the scope/rate check, so a PoC cannot drive
+                            // the browser at a private/loopback target off-scope.
+                            let target = aitm_browser::check_url(
+                                &url,
+                                &aitm_core::SsrfPolicy::default(),
+                                &host.guard().list_scope(),
+                                &aitm_browser::SystemResolver,
+                            )?;
+                            let authority = format!("{}:{}", target.host, target.addr.port());
+                            let _permit = host.guard().check_active(&authority)?;
                             driver.navigate(&url).await?;
                             drop(_permit);
                         }
@@ -382,11 +391,6 @@ fn parse_url(url: &str) -> anyhow::Result<(String, String, String)> {
         None => (rest.to_string(), "/".to_string()),
     };
     Ok((scheme.to_string(), authority, path))
-}
-
-/// The `host[:port]` of a URL, for the scope check on a browser navigation.
-fn authority_of(url: &str) -> anyhow::Result<String> {
-    Ok(parse_url(url)?.1)
 }
 
 /// Evaluate one extractor against the context, binding it both for `dsl` matchers

@@ -13,4 +13,4 @@ pub use aitm_core::{BrowserDriver, ClickTarget, NavOutcome};
 pub use commands::{register_browser_commands, BrowserPlugin};
 pub use config::{BrowserConfig, SsrfPolicy};
 pub use driver::ChromeDriver;
-pub use ssrf::{HostResolver, ResolvedTarget, SsrfGuard, StdSsrfGuard, SystemResolver};
+pub use ssrf::{check_url, HostResolver, ResolvedTarget, SsrfGuard, StdSsrfGuard, SystemResolver};

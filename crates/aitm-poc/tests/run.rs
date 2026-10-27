@@ -255,6 +255,43 @@ async fn three_artifacts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browser_navigate_to_private_off_scope_is_refused() {
+    // A browser-only PoC that navigates to a loopback target not in scope: the
+    // SSRF pre-flight refuses it before the driver is touched.
+    let yaml = r#"
+id: ssrf-navigate
+info:
+  name: navigate SSRF guard
+  severity: low
+steps:
+  - browser:
+      action: navigate
+      url: "http://127.0.0.1:9/"
+success:
+  type: status
+  status: 200
+"#;
+    let poc: Poc = serde_yaml::from_str(yaml).expect("parse");
+    let store = Arc::new(MemFlowStore::new());
+    let client = TargetClient;
+    // Empty scope: 127.0.0.1 is loopback and not explicitly in scope.
+    let guard = StdGuard::new(LimitConfig::default());
+    let browser = StubBrowser {
+        eval_value: Value::Null,
+    };
+    let host = CommandHost::new(store.as_ref(), &client, &guard, Some(&browser));
+    let err = StdPocRunner::new()
+        .run(&poc, VarBindings::new(), &host)
+        .await
+        .expect_err("off-scope loopback navigation must be refused");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("scope") || msg.contains("private") || msg.contains("loopback"),
+        "error must be an SSRF/scope refusal, got: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_step_out_of_scope_is_refused() {
     let poc: Poc = serde_yaml::from_str(example1_yaml()).expect("parse example 1");
     let vuln = spawn(TargetMode::Vulnerable);

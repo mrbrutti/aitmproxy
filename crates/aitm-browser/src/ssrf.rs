@@ -83,7 +83,7 @@ impl SsrfGuard for StdSsrfGuard {
 /// resolve is refused as `OutOfScope`: a target we cannot name cannot be in
 /// scope. Only an exact `host` or `host:port` entry lifts a private/loopback
 /// block — a wildcard does not.
-pub(crate) fn check_url(
+pub fn check_url(
     url: &str,
     policy: &SsrfPolicy,
     scope: &[ScopeEntry],
