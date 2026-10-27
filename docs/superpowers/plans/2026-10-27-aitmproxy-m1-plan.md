@@ -435,12 +435,14 @@ pass below was approved by Matt 2026-10-27.
 
 | Robustness | Important | `record_error` / backoff / host-disable never wired; dead `BackoffConfig` | Fixed in second pass: `record_error` is on the `ScopeRateGuard` trait; `StdGuard` disables a host once its error budget is hit, for an exponential `BackoffConfig` window, then re-enables it; `PipelineClient` records an error on a send failure or 5xx. The HTTP module maps an incomplete-response transport failure to `Event::Error(FlowError::Upstream)`. Disable+recovery tested. |
 
+| Robustness | Important | Parked (intercepted) flow could pin forever if never resumed | Fixed in second pass: the chain bounds the parked await with `Chain::with_intercept_timeout` (default 5 min); on timeout the flow is killed and the `Intercepted` state (and its backup) released. Tested with a short timeout. |
+
 ### Deferred (tracked in Follow-ups, approved 2026-10-27)
 
-Parked-flow leak on client EOF; AC13 field preservation (info/http-step extras);
-CA key owner-uid check (needs a non-`unsafe` getuid); exact-count test tightening.
-(Error-taxonomy mapping is wired at the main upstream-failure point; extending
-`Event::Error` to every module failure path is incremental.)
+AC13 field preservation (info/http-step extras); CA key owner-uid check (needs a
+non-`unsafe` getuid); exact-count test tightening. (Error-taxonomy mapping is
+wired at the main upstream-failure point; extending `Event::Error` to every
+module failure path is incremental.)
 
 ## Shipped
 
@@ -459,8 +461,6 @@ correctness/security/robustness item, not pure cosmetics.
 - **Error taxonomy coverage.** Extend `Event::Error(FlowError::…)` emission to the
   remaining module failure paths (TLS handshake, connect, parse) — the budget /
   backoff / host-disable path and the main upstream-failure mapping already land.
-- **Parked-flow leak.** In the chain, select on client EOF/timeout while a flow
-  is intercepted and drop the parked entry on disconnect.
 - **AC13 field preservation.** Now that `part`/matchers are modeled (R2), stop
   dropping `PocInfo` (description/author/metadata) and `HttpStep`
   (matchers/matchers-condition/raw/path) fields; round-trip them.

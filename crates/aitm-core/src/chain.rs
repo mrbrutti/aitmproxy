@@ -15,16 +15,31 @@ use crate::protocol::EventSink;
 use crate::registry::Registry;
 use crate::store::FlowStore;
 
+/// How long a parked (intercepted) flow waits for a resume before it is killed,
+/// so an abandoned interception cannot pin a flow forever.
+const DEFAULT_INTERCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Dispatches events to the registry's ordered plugin list over a shared store.
 pub struct Chain {
     registry: Arc<Registry>,
     store: Arc<dyn FlowStore>,
+    intercept_timeout: std::time::Duration,
 }
 
 impl Chain {
     /// Build a chain over a registry and store.
     pub fn new(registry: Arc<Registry>, store: Arc<dyn FlowStore>) -> Self {
-        Self { registry, store }
+        Self {
+            registry,
+            store,
+            intercept_timeout: DEFAULT_INTERCEPT_TIMEOUT,
+        }
+    }
+
+    /// Set how long an intercepted flow may stay parked before it is killed.
+    pub fn with_intercept_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.intercept_timeout = timeout;
+        self
     }
 
     /// Dispatch one event. Plugins run in registration order; a `Halt` stops the
@@ -63,12 +78,20 @@ impl Chain {
         self.store.insert(flow);
 
         // Pausable future: a parked flow waits for a resume command to fire the
-        // handle stored in its `Intercepted` state.
+        // handle stored in its `Intercepted` state, bounded by a timeout so an
+        // abandoned interception (e.g. the client vanished) cannot pin the flow.
         if let Some(rx) = parked {
-            let _ = rx.await;
-            self.store.update(id, &mut |f: &mut Flow| {
-                set_intercept(f, InterceptState::Resumed)
-            });
+            match tokio::time::timeout(self.intercept_timeout, rx).await {
+                Ok(_) => self.store.update(id, &mut |f: &mut Flow| {
+                    set_intercept(f, InterceptState::Resumed)
+                }),
+                Err(_) => {
+                    tracing::warn!(%id, "intercepted flow was never resumed; killing it");
+                    self.store.update(id, &mut |f: &mut Flow| {
+                        set_intercept(f, InterceptState::Killed)
+                    });
+                }
+            }
         }
 
         verdict

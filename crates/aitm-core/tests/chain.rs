@@ -170,3 +170,23 @@ async fn intercept_resume_forwards() {
         "flow should be Resumed after firing the handle"
     );
 }
+
+/// An intercepted flow that is never resumed is killed after the timeout, so it
+/// cannot pin the flow (or its backup) forever.
+#[tokio::test]
+async fn abandoned_intercept_is_killed_after_timeout() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(Interceptor));
+    let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+    let id = store.insert(http_flow());
+    let chain = Chain::new(Arc::new(reg), store.clone())
+        .with_intercept_timeout(std::time::Duration::from_millis(50));
+
+    // Dispatch parks, then (no resume ever fires) the timeout kills the flow.
+    chain.dispatch(Event::Request(id)).await;
+
+    assert!(
+        matches!(store.get(id), Some(Flow::Http(f)) if matches!(f.intercept, InterceptState::Killed)),
+        "an abandoned intercept must be killed after the timeout"
+    );
+}
