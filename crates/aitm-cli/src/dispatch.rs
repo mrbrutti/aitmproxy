@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use aitm_core::{
     BrowserDriver, Command, CommandHost, FlowId, FlowStore, ParamSchema, Params, ProxyClient,
-    Registry, ScopeRateGuard, TypeDesc, Value,
+    Registry, ScopeRateGuard, SsrfPolicy, TypeDesc, Value,
 };
 use serde_json::Value as JsonValue;
 
@@ -27,6 +27,7 @@ struct Services {
 pub struct Cli {
     registry: Arc<Registry>,
     services: Option<Services>,
+    ssrf: SsrfPolicy,
 }
 
 impl Cli {
@@ -36,7 +37,15 @@ impl Cli {
         Self {
             registry,
             services: None,
+            ssrf: SsrfPolicy::default(),
         }
+    }
+
+    /// Use the configured SSRF policy for command-side pre-flights, so the PoC
+    /// runner's browser navigation matches the connector.
+    pub fn with_ssrf_policy(mut self, policy: SsrfPolicy) -> Self {
+        self.ssrf = policy;
+        self
     }
 
     /// The services every `Command::invoke` receives through its `CommandHost`.
@@ -69,7 +78,8 @@ impl Cli {
             services.client.as_ref(),
             services.guard.as_ref(),
             services.browser.as_deref(),
-        );
+        )
+        .with_ssrf(self.ssrf.clone());
         cmd.invoke(args, &host)
     }
 

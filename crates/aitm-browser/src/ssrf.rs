@@ -8,7 +8,7 @@
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
-use aitm_core::{classify_host, GuardError, HostClass, ScopeEntry, ScopeRateGuard, SsrfPolicy};
+use aitm_core::{ssrf_check, Authority, GuardError, ScopeEntry, ScopeRateGuard, SsrfPolicy};
 
 /// Validates a navigation target against policy + scope before it is loaded.
 pub trait SsrfGuard: Send + Sync {
@@ -111,26 +111,19 @@ pub fn check_url(
         return Err(refused());
     };
 
-    let blocked = std::iter::once(classify_host(&host))
-        .chain(addrs.iter().map(|ip| classify_host(&ip.to_string())))
-        .any(|class| match class {
-            HostClass::Loopback => policy.block_loopback,
-            HostClass::Private => policy.block_private,
-            HostClass::Public => false,
-        });
-    if blocked && !(policy.allow_if_in_scope && explicitly_in_scope(scope, &host, port)) {
-        return Err(GuardError::PrivateAddressBlocked(host));
+    // Delegate the block/scope decision to the core SSRF check for every resolved
+    // address, so scope matching and the DNS-rebinding rule are identical to the
+    // connector's (a scoped hostname does not lift a private resolution). The
+    // authority is built through `Authority` so IPv6 brackets and the port fold
+    // the same way everywhere.
+    let authority = Authority::new(&host, port).to_string();
+    for ip in &addrs {
+        ssrf_check(policy, scope, &authority, *ip)
+            .map_err(|_| GuardError::PrivateAddressBlocked(host.clone()))?;
     }
 
     Ok(ResolvedTarget {
         host,
         addr: SocketAddr::new(first, port),
     })
-}
-
-fn explicitly_in_scope(scope: &[ScopeEntry], host: &str, port: u16) -> bool {
-    let with_port = format!("{host}:{port}");
-    scope
-        .iter()
-        .any(|e| e.host.eq_ignore_ascii_case(host) || e.host.eq_ignore_ascii_case(&with_port))
 }

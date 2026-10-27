@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use aitm_core::{
     BrowserDriver, CommandHost, FlowStore, McpTransport, ProxyClient, Registry, ScopeRateGuard,
+    SsrfPolicy,
 };
 use serde_json::{json, Map, Value as JsonValue};
 
@@ -47,6 +48,7 @@ pub struct McpServer {
     transport: McpTransport,
     services: Option<Services>,
     on_bound: Mutex<Option<OnBound>>,
+    ssrf: SsrfPolicy,
 }
 
 /// A JSON-RPC level failure (as opposed to a tool's own error result).
@@ -73,7 +75,16 @@ impl McpServer {
             transport,
             services: None,
             on_bound: Mutex::new(None),
+            ssrf: SsrfPolicy::default(),
         }
+    }
+
+    /// Use the configured SSRF policy for command-side pre-flights (the PoC
+    /// runner's browser navigation), so it matches the connector instead of
+    /// silently falling back to the default.
+    pub fn with_ssrf_policy(mut self, policy: SsrfPolicy) -> Self {
+        self.ssrf = policy;
+        self
     }
 
     /// The services every `Command::invoke` receives through its `CommandHost`.
@@ -111,6 +122,7 @@ impl McpServer {
             transport: selected,
             services,
             on_bound,
+            ssrf,
         } = self;
         let on_bound = on_bound.into_inner().unwrap_or(None);
         let server = Arc::new(McpServer {
@@ -118,6 +130,7 @@ impl McpServer {
             transport: selected.clone(),
             services,
             on_bound: Mutex::new(None),
+            ssrf,
         });
         match selected {
             McpTransport::Stdio => transport::serve_stdio(server).await,
@@ -242,7 +255,8 @@ impl McpServer {
             services.client.as_ref(),
             services.guard.as_ref(),
             services.browser.as_deref(),
-        );
+        )
+        .with_ssrf(self.ssrf.clone());
         Ok(match cmd.invoke(args, &host) {
             Ok(value) => {
                 let structured = to_json(&value);

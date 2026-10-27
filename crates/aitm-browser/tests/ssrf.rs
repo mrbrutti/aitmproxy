@@ -139,6 +139,50 @@ fn dns_with_one_private_record_among_public_is_blocked() {
     ));
 }
 
+/// DNS rebinding through the browser guard: a scoped *hostname* that resolves to
+/// a private address is refused; scoping the resolved IP literal lifts it. This
+/// is the same rule the connector applies, now that `check_url` delegates to
+/// `aitm_core::ssrf_check`.
+#[test]
+fn scoped_hostname_resolving_private_is_rebinding_and_refused() {
+    let scope = Arc::new(StdGuard::default());
+    scope.add_scope(ScopeEntry {
+        host: "intranet.test".into(),
+    });
+    let dns = Arc::new(FakeDns(vec![("intranet.test", ip("10.0.0.9"))]));
+    let ssrf = StdSsrfGuard::with_resolver(SsrfPolicy::default(), scope.clone(), dns);
+    assert!(
+        matches!(
+            ssrf.check("http://intranet.test/"),
+            Err(GuardError::PrivateAddressBlocked(_))
+        ),
+        "a scoped hostname must not whitelist its private resolution"
+    );
+    scope.add_scope(ScopeEntry {
+        host: "10.0.0.9".into(),
+    });
+    assert!(
+        ssrf.check("http://intranet.test/").is_ok(),
+        "scoping the resolved IP literal is the escape hatch"
+    );
+}
+
+/// An IPv6 loopback literal entry (`[::1]:3000`) folds through `Authority` the
+/// same way the connector does, so it lifts the block consistently.
+#[test]
+fn ipv6_loopback_scope_entry_is_consistent() {
+    let scope = Arc::new(StdGuard::default());
+    let ssrf = StdSsrfGuard::new(SsrfPolicy::default(), scope.clone());
+    assert!(matches!(
+        ssrf.check("http://[::1]:3000/"),
+        Err(GuardError::PrivateAddressBlocked(_))
+    ));
+    scope.add_scope(ScopeEntry {
+        host: "[::1]:3000".into(),
+    });
+    assert!(ssrf.check("http://[::1]:3000/").is_ok());
+}
+
 #[test]
 fn public_host_resolves_without_scope() {
     let scope = Arc::new(StdGuard::default());

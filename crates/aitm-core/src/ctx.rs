@@ -54,10 +54,14 @@ pub struct CommandHost<'a> {
     client: &'a dyn ProxyClient,
     guard: &'a dyn ScopeRateGuard,
     browser: Option<&'a dyn BrowserDriver>,
+    ssrf: crate::config::SsrfPolicy,
 }
 
 impl<'a> CommandHost<'a> {
-    /// Assemble a host from borrowed core services.
+    /// Assemble a host from borrowed core services. The SSRF policy defaults to
+    /// the deny-by-default posture; wiring that has the configured policy sets it
+    /// with [`CommandHost::with_ssrf`] so command-side pre-flights (e.g. the PoC
+    /// runner's browser navigation) match the connector.
     pub fn new(
         store: &'a dyn FlowStore,
         client: &'a dyn ProxyClient,
@@ -69,7 +73,14 @@ impl<'a> CommandHost<'a> {
             client,
             guard,
             browser,
+            ssrf: crate::config::SsrfPolicy::default(),
         }
+    }
+
+    /// Use the configured SSRF policy instead of the default.
+    pub fn with_ssrf(mut self, policy: crate::config::SsrfPolicy) -> Self {
+        self.ssrf = policy;
+        self
     }
 
     pub fn store(&self) -> &dyn FlowStore {
@@ -83,6 +94,10 @@ impl<'a> CommandHost<'a> {
     }
     pub fn guard(&self) -> &dyn ScopeRateGuard {
         self.guard
+    }
+    /// The configured SSRF policy (defaults to deny-by-default).
+    pub fn ssrf_policy(&self) -> &crate::config::SsrfPolicy {
+        &self.ssrf
     }
 }
 
