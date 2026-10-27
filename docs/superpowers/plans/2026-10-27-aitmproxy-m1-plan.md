@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** draft
+**Status:** approved (2026-10-27 by Matt)
 **Spec:** `docs/superpowers/specs/2026-10-27-aitmproxy-platform-design.md` (platform + M1, AC1–AC20); `docs/superpowers/specs/2026-10-27-aitmproxy-plugin-system-design.md` (AC-P1–AC-P5); `docs/superpowers/specs/2026-10-27-aitmproxy-poc-language-design.md` (AC-L1–AC-L7)
 **Branch / worktree:** `feat/aitmproxy-m1`
 
@@ -14,7 +14,7 @@
 
 ## Architect's structuring calls (reconciliations within the specs)
 
-These resolve seams the specs left to the builder; they do not change any declared signature. Flagged in the Questions section for Matt's FYI.
+These resolve seams the specs left to the builder; they do not change any declared signature. Flagged in the Questions section for Matt's FYI. **Accepted by Matt (2026-10-27):** HTTP/1.1-first with HTTP/2 deferred, the `aitm-plugins` crate, and the test-only target fixture.
 
 1. **Trait placement (authoritative per plugin-system spec worked examples).** `Plugin`, `FlowCtx`, `Registry`, `Command`, `ParamSchema`, `Event`, `Verdict`, `Flow` and the flow/value/host types live in **`aitm-core`** (plugin-system Example 1 imports them from `aitm_core`). The protocol seam — `ProtocolModule`, `NextLayerHint`, `ModuleCtx`, `ByteStream`, `AsyncReadWrite` — lives in **`aitm-plugin`**, which depends on `aitm-core` (Example 2 imports them from `aitm_plugin`). The platform-spec crate-table summary ("aitm-plugin: Plugin, ProtocolModule…") is a loose summary; the code imports are authoritative.
 2. **First-party feature plugins get their own crate `aitm-plugins`** (capture, replay, intercept, mutate, scope, rate-limit), so `aitm-core` hosts no feature code and AC-P3 (drop a plugin, no core edit) is true by construction. Browser commands live in `aitm-browser`; PoC commands in `aitm-poc`. Each crate registers its own `Command`s.
