@@ -5,6 +5,8 @@
 //! other crate in the workspace depends on this one.
 
 pub mod body;
+pub mod chain;
+pub mod client;
 pub mod command;
 pub mod config;
 pub mod ctx;
@@ -15,12 +17,15 @@ pub mod guard;
 pub mod header;
 pub mod plugin;
 pub mod protocol;
+pub mod proxy;
 pub mod registry;
 pub mod store;
 pub mod stream;
 pub mod value;
 
 pub use body::{Body, StreamBody};
+pub use chain::Chain;
+pub use client::{PipelineClient, RequestSender};
 pub use command::{Command, ParamDef, ParamSchema, TypeDesc};
 pub use config::{
     BackoffConfig, BrowserConfig, CaConfig, Config, LimitConfig, McpConfig, McpTransport,
@@ -37,6 +42,7 @@ pub use guard::{classify_host, ActionPermit, HostClass, ScopeRateGuard, StdGuard
 pub use header::HeaderMap;
 pub use plugin::Plugin;
 pub use protocol::{EventSink, ModuleCtx, NextLayerHint, ProtocolModule, UpstreamConnector};
+pub use proxy::{Proxy, ProxyBuilder};
 pub use registry::Registry;
 pub use store::{FlowKind, FlowQuery, FlowStore, MemFlowStore};
 pub use stream::{AsyncReadWrite, ByteStream};

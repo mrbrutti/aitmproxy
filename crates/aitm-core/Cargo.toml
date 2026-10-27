@@ -11,4 +11,7 @@ anyhow.workspace = true
 futures.workspace = true
 uuid.workspace = true
 indexmap.workspace = true
-tokio = { workspace = true, features = ["sync", "io-util"] }
+tokio = { workspace = true, features = ["sync", "io-util", "net", "rt", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
