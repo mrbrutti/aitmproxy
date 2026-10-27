@@ -6,6 +6,7 @@
 //! and the `PocBuilder` (`builder`). The `PocRunner` and the Rhai `script` step
 //! land in later waves.
 
+pub mod builder;
 pub mod dsl;
 pub mod extract;
 pub mod matcher;
@@ -13,6 +14,7 @@ pub mod model;
 pub mod schema;
 pub mod template;
 
+pub use builder::{PocBuildCommand, PocBuilder, PocSpec, StdPocBuilder};
 pub use extract::{run_extractors, Extraction, Extractor, ExtractorKind};
 pub use matcher::{evaluate, MatchContext};
 pub use model::{
