@@ -51,6 +51,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aitm-ca"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "ring",
+ "serde",
+ "serde_json",
+ "time",
+ "tracing",
+ "x509-parser",
+]
+
+[[package]]
 name = "aitm-cli"
 version = "0.1.0"
 dependencies = [
