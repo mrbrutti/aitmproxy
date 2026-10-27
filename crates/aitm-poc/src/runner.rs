@@ -115,6 +115,9 @@ impl StdPocRunner {
         bindings: VarBindings,
         host: &CommandHost<'_>,
     ) -> anyhow::Result<PocRunResult> {
+        // Fail a malformed PoC before any request is sent: compile every regex and
+        // parse every DSL expression, and reject an unsafe `id`.
+        precheck(poc)?;
         let tmpl = PocTemplate::from_poc(poc)?;
 
         // Bindings grow as extractors bind variables for later steps.
@@ -241,6 +244,66 @@ impl StdPocRunner {
 
         Ok((poc_path, screenshot_path))
     }
+}
+
+/// A filesystem-safe PoC id: `^[a-z0-9][a-z0-9-]{0,63}$`. Used to build the
+/// artifact directory name, so it can never contain path separators or `..`.
+pub fn is_valid_poc_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    if bytes.is_empty() || bytes.len() > 64 {
+        return false;
+    }
+    let first_ok = bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit();
+    first_ok
+        && bytes
+            .iter()
+            .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Reject a PoC that cannot be run safely: an unsafe id, a regex that does not
+/// compile, or a DSL expression that does not parse. Runs before any request.
+fn precheck(poc: &Poc) -> anyhow::Result<()> {
+    if !is_valid_poc_id(&poc.id) {
+        anyhow::bail!(
+            "poc.run: PoC id {:?} is not a safe identifier (expected ^[a-z0-9][a-z0-9-]{{0,63}}$)",
+            poc.id
+        );
+    }
+    check_assertion(&poc.success)?;
+    for step in &poc.steps {
+        match step {
+            Step::Http(http) => {
+                for ex in &http.extract {
+                    check_extract(ex)?;
+                }
+            }
+            Step::Extract(ex) => check_extract(ex)?,
+            Step::Browser(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn check_assertion(assertion: &Assertion) -> anyhow::Result<()> {
+    match assertion {
+        Assertion::Regex(pattern) => regex::Regex::new(pattern)
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("poc.run: invalid regex matcher {pattern:?}: {e}")),
+        Assertion::Dsl(expr) => crate::dsl::check(expr)
+            .map_err(|e| anyhow::anyhow!("poc.run: invalid dsl matcher {expr:?}: {e}")),
+        Assertion::All(items) | Assertion::Any(items) => items.iter().try_for_each(check_assertion),
+        Assertion::Not(inner) => check_assertion(inner),
+        Assertion::Status(_) | Assertion::Word(_) | Assertion::BrowserEval { .. } => Ok(()),
+    }
+}
+
+fn check_extract(step: &crate::model::ExtractStep) -> anyhow::Result<()> {
+    if let crate::model::ExtractSource::Regex(pattern) = &step.source {
+        regex::Regex::new(pattern)
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("poc.run: invalid regex extractor {pattern:?}: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Build a captured-request shape from a templated http step.
@@ -468,10 +531,28 @@ impl Command for PocRunCommand {
 
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         let poc_path = args.get_str("poc_path")?;
-        let text = std::fs::read_to_string(poc_path)
+        let path = std::path::Path::new(poc_path);
+        // Only load a plainly-named YAML file, never a symlink (which could point
+        // the loader at an arbitrary file).
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("yaml") | Some("yml") => {}
+            _ => anyhow::bail!("poc.run: `{poc_path}` must be a .yaml file"),
+        }
+        let meta = std::fs::symlink_metadata(path)
+            .map_err(|e| anyhow::anyhow!("poc.run: cannot stat `{poc_path}`: {e}"))?;
+        if meta.file_type().is_symlink() {
+            anyhow::bail!("poc.run: refusing to load `{poc_path}`: it is a symlink");
+        }
+        let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("poc.run: cannot read `{poc_path}`: {e}"))?;
-        let poc: Poc = serde_yaml::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("poc.run: `{poc_path}` is not a valid PoC: {e}"))?;
+        // Validate the raw document, then type it. Parse errors are reported
+        // without echoing the offending file content.
+        let raw: serde_yaml::Value = serde_yaml::from_str(&text)
+            .map_err(|_| anyhow::anyhow!("poc.run: `{poc_path}` is not valid YAML"))?;
+        crate::schema::validate(&raw)
+            .map_err(|e| anyhow::anyhow!("poc.run: `{poc_path}` failed validation: {e}"))?;
+        let poc: Poc = serde_yaml::from_value(raw)
+            .map_err(|_| anyhow::anyhow!("poc.run: `{poc_path}` is not a valid PoC document"))?;
 
         let mut bindings = VarBindings::new();
         if let Ok(target) = args.get_str("target") {
@@ -521,4 +602,54 @@ impl Command for PocRunCommand {
 /// Register `poc.run` on a registry (called from binary assembly, Task 28).
 pub fn register(registry: &mut Registry) {
     registry.add_command(Arc::new(PocRunCommand));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Assertion, PocInfo, Severity};
+
+    fn poc_with(id: &str, success: Assertion) -> Poc {
+        Poc {
+            id: id.to_string(),
+            info: PocInfo {
+                name: "t".into(),
+                severity: Severity::Low,
+                references: vec![],
+                tags: vec![],
+                cwe: None,
+            },
+            variables: vec![],
+            steps: vec![],
+            success,
+        }
+    }
+
+    #[test]
+    fn valid_ids() {
+        assert!(is_valid_poc_id("reflected-xss-search-q"));
+        assert!(is_valid_poc_id("a1"));
+        assert!(!is_valid_poc_id(""));
+        assert!(!is_valid_poc_id("-leading"));
+        assert!(!is_valid_poc_id("Has-Upper"));
+        assert!(!is_valid_poc_id("has/slash"));
+        assert!(!is_valid_poc_id("../escape"));
+    }
+
+    #[test]
+    fn precheck_rejects_bad_id_regex_and_dsl() {
+        assert!(precheck(&poc_with("BadId", Assertion::Status(200))).is_err());
+        assert!(precheck(&poc_with("ok", Assertion::Regex("([".into()))).is_err());
+        assert!(precheck(&poc_with("ok", Assertion::Dsl("status_code ==".into()))).is_err());
+        // A well-formed PoC passes the precheck.
+        assert!(precheck(&poc_with(
+            "ok",
+            Assertion::All(vec![
+                Assertion::Status(200),
+                Assertion::Regex("a[0-9]+".into()),
+                Assertion::Dsl("status_code == 200".into()),
+            ]),
+        ))
+        .is_ok());
+    }
 }

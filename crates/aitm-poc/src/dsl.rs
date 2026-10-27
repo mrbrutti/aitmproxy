@@ -152,6 +152,13 @@ pub fn eval_bool(expr: &str, ctx: &DslContext) -> bool {
     eval(expr, ctx).map(|v| is_truthy(&v)).unwrap_or(false)
 }
 
+/// Check that `expr` tokenizes and parses (and names only known functions),
+/// without any response context — so a malformed matcher fails when the PoC is
+/// loaded, before any request is sent, instead of silently evaluating to false.
+pub fn check(expr: &str) -> anyhow::Result<()> {
+    eval(expr, &DslContext::default()).map(|_| ())
+}
+
 fn is_truthy(v: &Value) -> bool {
     match v {
         Value::Bool(b) => *b,
