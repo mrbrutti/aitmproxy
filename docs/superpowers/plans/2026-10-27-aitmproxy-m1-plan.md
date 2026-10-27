@@ -431,12 +431,13 @@ pass below was approved by Matt 2026-10-27.
 
 | Correctness | Important | Second, hand-rolled HTTP client in the binary (plaintext for https, no chunked decode, possible duplicate framing) | Fixed in `b0…`/second pass: `aitm_proto_http::Http1Sender` drives the shared `Http1Machine` (chunked decode, single `Content-Length`, no stray `Transfer-Encoding`) with rustls TLS for `https` (verify default, `ssl_insecure` opt-out); `TcpRequestSender`/`parse_response` deleted. Chunked-decode and single-CL framing tested. |
 
+| Correctness | Important | Rate-limit double-count (command + client both `check_active`) | Fixed in second pass: the `PipelineClient` is the single scope/rate chokepoint; `flow.replay` / `request.send` / the poc runner no longer re-check (nor does the runner re-insert). The replay/mutate/scope-rate tests now drive a real `PipelineClient` (over an echo `RequestSender`) so the single-guard refusal/throttle is actually asserted. |
+
 ### Deferred (tracked in Follow-ups, approved 2026-10-27)
 
-Rate-limit double-count + real-client test rewrites; error taxonomy /
-`record_error` / backoff / host-disable; parked-flow leak on client EOF; AC13
-field preservation (info/http-step extras); CA key owner-uid check (needs a
-non-`unsafe` getuid); exact-count test tightening.
+Error taxonomy / `record_error` / backoff / host-disable; parked-flow leak on
+client EOF; AC13 field preservation (info/http-step extras); CA key owner-uid
+check (needs a non-`unsafe` getuid); exact-count test tightening.
 
 ## Shipped
 
@@ -447,12 +448,6 @@ What merged, what was cut, follow-ups. Filled at stage 7.
 Tracked work the fix-and-harden pass deferred (approved 2026-10-27). Each is a
 correctness/security/robustness item, not pure cosmetics.
 
-- **Rate-limit single chokepoint + real-client tests.** Drop the command-side
-  `check_active` in `replay.rs`/`mutate.rs`/`runner.rs` (the `PipelineClient`
-  already guards), drop the runner's redundant re-insert, and rewrite the
-  replay/mutate/scope tests to drive the real `PipelineClient` against a local
-  server instead of stub clients. (Coupled: removing the command-side check
-  requires the tests to stop using non-guarding stub clients.)
 - **Browser-origin SSRF at the connector.** Give the embedded browser its own
   proxy listener/port (or peer match) so the upstream connector can enforce
   `SsrfPolicy` on browser-originated connections (redirects, page `fetch`,

@@ -217,8 +217,8 @@ impl Command for RequestSend {
             .collect();
         apply_edits(&mut req, &edits)?;
 
-        // Held across the send: dropping the permit releases the concurrency slot.
-        let _permit = host.guard().check_active(&req.authority)?;
+        // The `ProxyClient` is the single scope/rate chokepoint and guards the
+        // authority before sending; the command does not re-check.
         let sent = block_on(host.client().send(req))?;
         Ok(Value::Str(sent.id.to_string()))
     }

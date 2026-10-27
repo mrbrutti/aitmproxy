@@ -3,59 +3,37 @@
 //! (AC-P4).
 
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    Body, CommandHost, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow,
-    HttpRequest, HttpResponse, HttpVersion, InterceptState, LimitConfig, MemFlowStore, Params,
-    Plugin, ProxyClient, Registry, StdGuard, Value,
+    Body, CommandHost, HeaderMap, HttpRequest, HttpResponse, HttpVersion, LimitConfig,
+    MemFlowStore, Params, PipelineClient, Plugin, Registry, RequestSender, StdGuard, Value,
 };
 use aitm_plugins::{MutatePlugin, RateLimitPlugin, ScopePlugin};
 use futures::future::BoxFuture;
 
-fn conn() -> ConnInfo {
-    ConnInfo {
-        peer: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
-        sni: None,
-        alpn: None,
-        tls: false,
-        established: SystemTime::now(),
-    }
-}
+/// Answers 200 without its own guard: the single scope/rate chokepoint is the
+/// `PipelineClient` wrapping it, so one `request.send` is exactly one token.
+struct EchoSender;
 
-/// Answers 200 without touching the guard — the per-host bucket is consumed only
-/// by the command's own `check_active`, so one request is exactly one token.
-struct EchoClient {
-    store: Arc<MemFlowStore>,
-}
-
-impl ProxyClient for EchoClient {
-    fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
-        Box::pin(async move {
-            let flow = HttpFlow {
-                id: FlowId::new(),
-                request: req,
-                response: Some(HttpResponse {
-                    status: 200,
-                    version: HttpVersion::Http11,
-                    headers: HeaderMap::new(),
-                    body: Body::Empty,
-                    timestamp: SystemTime::now(),
-                }),
-                client_conn: conn(),
-                server_conn: None,
-                metadata: FlowMeta {
-                    is_replay: true,
-                    ..Default::default()
-                },
-                intercept: InterceptState::Observed,
-            };
-            self.store.insert(Flow::Http(flow.clone()));
-            Ok(flow)
+impl RequestSender for EchoSender {
+    fn send(&self, _req: &HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpResponse>> {
+        Box::pin(async {
+            Ok(HttpResponse {
+                status: 200,
+                version: HttpVersion::Http11,
+                headers: HeaderMap::new(),
+                body: Body::Empty,
+                timestamp: SystemTime::now(),
+            })
         })
     }
+}
+
+/// A `PipelineClient` (the real guard chokepoint) over the echo sender.
+fn pipe(store: &Arc<MemFlowStore>, guard: &Arc<StdGuard>) -> PipelineClient {
+    PipelineClient::new(store.clone(), guard.clone(), Arc::new(EchoSender))
 }
 
 fn params(pairs: &[(&str, Value)]) -> Params {
@@ -74,12 +52,10 @@ fn scope_add_then_list() {
     assert_eq!(plugin.name(), "scope");
     reg.add_plugin(Box::new(plugin));
 
-    let store = MemFlowStore::new();
-    let guard = StdGuard::default();
-    let client = EchoClient {
-        store: Arc::new(MemFlowStore::new()),
-    };
-    let host = CommandHost::new(&store, &client, &guard, None);
+    let store = Arc::new(MemFlowStore::new());
+    let guard = Arc::new(StdGuard::default());
+    let client = pipe(&store, &guard);
+    let host = CommandHost::new(store.as_ref(), &client, guard.as_ref(), None);
 
     let added = reg
         .command("scope.add")
@@ -144,17 +120,15 @@ fn registry_with_option(default_rps: u32) -> Registry {
 #[test]
 fn rate_limit_throttles_burst() {
     let reg = registry_with_option(2);
-    let store = MemFlowStore::new();
-    let guard = permissive_guard(100); // deliberately high; the option overrides it
+    let store = Arc::new(MemFlowStore::new());
+    let guard = Arc::new(permissive_guard(100)); // deliberately high; the option overrides it
 
     // The rate-limit plugin's option drives the guard's per-host bucket.
     assert_eq!(RateLimitPlugin::configured(&reg), Some(2));
-    RateLimitPlugin::apply(&reg, &guard);
+    RateLimitPlugin::apply(&reg, guard.as_ref());
 
-    let client = EchoClient {
-        store: Arc::new(MemFlowStore::new()),
-    };
-    let host = CommandHost::new(&store, &client, &guard, None);
+    let client = pipe(&store, &guard);
+    let host = CommandHost::new(store.as_ref(), &client, guard.as_ref(), None);
     reg.command("scope.add")
         .expect("registered")
         .invoke(params(&[("host", Value::Str("ex.test".into()))]), &host)
@@ -170,20 +144,18 @@ fn rate_limit_throttles_burst() {
 #[test]
 fn option_changes_behavior() {
     let mut reg = registry_with_option(2);
-    let store = MemFlowStore::new();
-    let guard = permissive_guard(2);
+    let store = Arc::new(MemFlowStore::new());
+    let guard = Arc::new(permissive_guard(2));
 
-    let client = EchoClient {
-        store: Arc::new(MemFlowStore::new()),
-    };
-    let host = CommandHost::new(&store, &client, &guard, None);
+    let client = pipe(&store, &guard);
+    let host = CommandHost::new(store.as_ref(), &client, guard.as_ref(), None);
     reg.command("scope.add")
         .expect("registered")
         .invoke(params(&[("host", Value::Str("ex.test".into()))]), &host)
         .expect("scope.add ok");
 
     // Low option → throttled.
-    RateLimitPlugin::apply(&reg, &guard);
+    RateLimitPlugin::apply(&reg, guard.as_ref());
     assert!(
         burst_rate_limited(&reg, &host, 6) >= 1,
         "low per_host_rps must throttle"
@@ -192,7 +164,7 @@ fn option_changes_behavior() {
     // Raise the option and re-apply (resets the bucket) → the same burst passes.
     reg.set_option(RateLimitPlugin::OPTION, Value::Int(10_000));
     assert_eq!(RateLimitPlugin::configured(&reg), Some(10_000));
-    RateLimitPlugin::apply(&reg, &guard);
+    RateLimitPlugin::apply(&reg, guard.as_ref());
     assert_eq!(
         burst_rate_limited(&reg, &host, 6),
         0,

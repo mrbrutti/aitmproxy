@@ -71,8 +71,8 @@ impl Command for FlowReplay {
             anyhow::bail!("flow {id} is a WebSocket flow; only HTTP flows can be replayed");
         };
         let request = http.request;
-        // Held across the send: dropping the permit releases the concurrency slot.
-        let _permit = host.guard().check_active(&request.authority)?;
+        // The `ProxyClient` (`PipelineClient`) is the single scope/rate chokepoint;
+        // it guards the authority before sending, so the command does not re-check.
         let replayed = block_on(host.client().send(request))?;
         Ok(Value::Str(replayed.id.to_string()))
     }

@@ -8,8 +8,8 @@ use std::time::SystemTime;
 
 use aitm_core::{
     Body, CommandHost, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow,
-    HttpRequest, HttpResponse, HttpVersion, InterceptState, MemFlowStore, Params, Plugin,
-    ProxyClient, Registry, ScopeEntry, ScopeRateGuard, StdGuard, Value,
+    HttpRequest, HttpResponse, HttpVersion, InterceptState, MemFlowStore, Params, PipelineClient,
+    Plugin, Registry, ScopeEntry, ScopeRateGuard, StdGuard, Value,
 };
 use aitm_plugins::ReplayPlugin;
 use futures::future::BoxFuture;
@@ -45,35 +45,20 @@ fn captured_get(path: &str) -> Flow {
     })
 }
 
-/// Honors the `ProxyClient` contract without a network: answers 200 and stores
-/// the result as a replay flow.
-struct EchoClient {
-    store: Arc<MemFlowStore>,
-}
+/// Answers 200 without its own guard; the `PipelineClient` wrapping it is the
+/// single scope/rate chokepoint and marks + stores the replay flow.
+struct EchoSender;
 
-impl ProxyClient for EchoClient {
-    fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
-        Box::pin(async move {
-            let flow = HttpFlow {
-                id: FlowId::new(),
-                request: req,
-                response: Some(HttpResponse {
-                    status: 200,
-                    version: HttpVersion::Http11,
-                    headers: HeaderMap::new(),
-                    body: Body::Bytes(b"echo".to_vec()),
-                    timestamp: SystemTime::now(),
-                }),
-                client_conn: conn(),
-                server_conn: None,
-                metadata: FlowMeta {
-                    is_replay: true,
-                    ..Default::default()
-                },
-                intercept: InterceptState::Observed,
-            };
-            self.store.insert(Flow::Http(flow.clone()));
-            Ok(flow)
+impl aitm_core::RequestSender for EchoSender {
+    fn send(&self, _req: &HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpResponse>> {
+        Box::pin(async {
+            Ok(HttpResponse {
+                status: 200,
+                version: HttpVersion::Http11,
+                headers: HeaderMap::new(),
+                body: Body::Bytes(b"echo".to_vec()),
+                timestamp: SystemTime::now(),
+            })
         })
     }
 }
@@ -97,14 +82,12 @@ fn replay_marks_is_replay() {
     let reg = registry();
     let store = Arc::new(MemFlowStore::new());
     let original = store.insert(captured_get("/a"));
-    let guard = StdGuard::default();
+    let guard = Arc::new(StdGuard::default());
     guard.add_scope(ScopeEntry {
         host: "ex.test".into(),
     });
-    let client = EchoClient {
-        store: store.clone(),
-    };
-    let host = CommandHost::new(&*store, &client, &guard, None);
+    let client = PipelineClient::new(store.clone(), guard.clone(), Arc::new(EchoSender));
+    let host = CommandHost::new(store.as_ref(), &client, guard.as_ref(), None);
 
     let out = reg
         .command("flow.replay")
@@ -135,11 +118,9 @@ fn replay_out_of_scope_refused() {
     let reg = registry();
     let store = Arc::new(MemFlowStore::new());
     let original = store.insert(captured_get("/a"));
-    let guard = StdGuard::default(); // empty scope: deny by default
-    let client = EchoClient {
-        store: store.clone(),
-    };
-    let host = CommandHost::new(&*store, &client, &guard, None);
+    let guard = Arc::new(StdGuard::default()); // empty scope: deny by default
+    let client = PipelineClient::new(store.clone(), guard.clone(), Arc::new(EchoSender));
+    let host = CommandHost::new(store.as_ref(), &client, guard.as_ref(), None);
 
     let err = reg
         .command("flow.replay")
@@ -157,11 +138,9 @@ fn replay_out_of_scope_refused() {
 fn replay_unknown_flow_is_an_error() {
     let reg = registry();
     let store = Arc::new(MemFlowStore::new());
-    let guard = StdGuard::default();
-    let client = EchoClient {
-        store: store.clone(),
-    };
-    let host = CommandHost::new(&*store, &client, &guard, None);
+    let guard = Arc::new(StdGuard::default());
+    let client = PipelineClient::new(store.clone(), guard.clone(), Arc::new(EchoSender));
+    let host = CommandHost::new(store.as_ref(), &client, guard.as_ref(), None);
 
     let missing = FlowId::new();
     let err = reg

@@ -17,9 +17,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    Body, CommandHost, ConnInfo, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow, HttpRequest,
-    HttpResponse, HttpVersion, InterceptState, LimitConfig, MemFlowStore, NavOutcome, ProxyClient,
-    ScopeEntry, ScopeRateGuard, StdGuard, Value,
+    Body, CommandHost, FlowStore, HeaderMap, HttpRequest, HttpResponse, HttpVersion, LimitConfig,
+    MemFlowStore, NavOutcome, RequestSender, ScopeEntry, ScopeRateGuard, StdGuard, Value,
 };
 use aitm_core::{BrowserDriver, ClickTarget};
 use aitm_poc::{Poc, PocRunner, StdPocRunner, VarBindings};
@@ -30,27 +29,21 @@ use support::target::{spawn, TargetMode};
 
 const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
 
-fn conn() -> ConnInfo {
-    ConnInfo {
-        peer: "127.0.0.1:0".parse().unwrap(),
-        sni: None,
-        alpn: None,
-        tls: false,
-        established: SystemTime::now(),
-    }
-}
+/// A real `RequestSender`: issues the request over a raw HTTP/1.1 loopback
+/// connection to the request's authority and returns the response. Wrapped in a
+/// `PipelineClient` by each test, so scope/rate guarding and capture happen in
+/// the single client chokepoint — not in the command.
+struct TargetSender;
 
-/// A real `ProxyClient`: issues the request over a raw HTTP/1.1 loopback
-/// connection to the request's authority and returns the captured flow.
-struct TargetClient;
-
-impl ProxyClient for TargetClient {
-    fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+impl RequestSender for TargetSender {
+    fn send(&self, req: &HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpResponse>> {
+        let authority = req.authority.clone();
+        let method = req.method.clone();
+        let path = req.path.clone();
         Box::pin(async move {
-            let mut stream = tokio::net::TcpStream::connect(&req.authority).await?;
+            let mut stream = tokio::net::TcpStream::connect(&authority).await?;
             let raw = format!(
-                "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                req.method, req.path, req.authority
+                "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
             );
             stream.write_all(raw.as_bytes()).await?;
             let mut buf = Vec::new();
@@ -63,26 +56,20 @@ impl ProxyClient for TargetClient {
                 .and_then(|line| line.split_whitespace().nth(1))
                 .and_then(|code| code.parse::<u16>().ok())
                 .unwrap_or(0);
-            Ok(HttpFlow {
-                id: FlowId::new(),
-                request: req,
-                response: Some(HttpResponse {
-                    status,
-                    version: HttpVersion::Http11,
-                    headers: HeaderMap::new(),
-                    body: Body::Bytes(body.as_bytes().to_vec()),
-                    timestamp: SystemTime::now(),
-                }),
-                client_conn: conn(),
-                server_conn: None,
-                metadata: FlowMeta {
-                    is_replay: true,
-                    ..Default::default()
-                },
-                intercept: InterceptState::Observed,
+            Ok(HttpResponse {
+                status,
+                version: HttpVersion::Http11,
+                headers: HeaderMap::new(),
+                body: Body::Bytes(body.as_bytes().to_vec()),
+                timestamp: SystemTime::now(),
             })
         })
     }
+}
+
+/// A `PipelineClient` over the real target sender and the given store + guard.
+fn pipeline_client(store: &Arc<MemFlowStore>, guard: &Arc<StdGuard>) -> aitm_core::PipelineClient {
+    aitm_core::PipelineClient::new(store.clone(), guard.clone(), Arc::new(TargetSender))
 }
 
 /// A deterministic `BrowserDriver` double: `eval` returns a fixed value, and
@@ -181,12 +168,12 @@ async fn pass_vs_patched() {
     // observed → the PoC passes.
     let vuln = spawn(TargetMode::Vulnerable);
     let store = Arc::new(MemFlowStore::new());
-    let client = TargetClient;
-    let guard = guard_scoping(vuln);
+    let guard = Arc::new(guard_scoping(vuln));
+    let client = pipeline_client(&store, &guard);
     let browser = StubBrowser {
         eval_value: Value::Str("MARK1234".to_string()),
     };
-    let host = CommandHost::new(store.as_ref(), &client, &guard, Some(&browser));
+    let host = CommandHost::new(store.as_ref(), &client, guard.as_ref(), Some(&browser));
     let result = StdPocRunner::new()
         .run(&poc, example1_bindings(vuln), &host)
         .await
@@ -201,11 +188,12 @@ async fn pass_vs_patched() {
     // the `all` success is false even though the stub browser still answers.
     let patched = spawn(TargetMode::Patched);
     let store2 = Arc::new(MemFlowStore::new());
-    let guard2 = guard_scoping(patched);
+    let guard2 = Arc::new(guard_scoping(patched));
+    let client2 = pipeline_client(&store2, &guard2);
     let browser2 = StubBrowser {
         eval_value: Value::Str("MARK1234".to_string()),
     };
-    let host2 = CommandHost::new(store2.as_ref(), &client, &guard2, Some(&browser2));
+    let host2 = CommandHost::new(store2.as_ref(), &client2, guard2.as_ref(), Some(&browser2));
     let result2 = StdPocRunner::new()
         .run(&poc, example1_bindings(patched), &host2)
         .await
@@ -222,12 +210,12 @@ async fn three_artifacts() {
     let poc: Poc = serde_yaml::from_str(example1_yaml()).expect("parse example 1");
     let vuln = spawn(TargetMode::Vulnerable);
     let store = Arc::new(MemFlowStore::new());
-    let client = TargetClient;
-    let guard = guard_scoping(vuln);
+    let guard = Arc::new(guard_scoping(vuln));
+    let client = pipeline_client(&store, &guard);
     let browser = StubBrowser {
         eval_value: Value::Str("MARK1234".to_string()),
     };
-    let host = CommandHost::new(store.as_ref(), &client, &guard, Some(&browser));
+    let host = CommandHost::new(store.as_ref(), &client, guard.as_ref(), Some(&browser));
 
     let result = StdPocRunner::new()
         .run(&poc, example1_bindings(vuln), &host)
@@ -273,13 +261,13 @@ success:
 "#;
     let poc: Poc = serde_yaml::from_str(yaml).expect("parse");
     let store = Arc::new(MemFlowStore::new());
-    let client = TargetClient;
     // Empty scope: 127.0.0.1 is loopback and not explicitly in scope.
-    let guard = StdGuard::new(LimitConfig::default());
+    let guard = Arc::new(StdGuard::new(LimitConfig::default()));
+    let client = pipeline_client(&store, &guard);
     let browser = StubBrowser {
         eval_value: Value::Null,
     };
-    let host = CommandHost::new(store.as_ref(), &client, &guard, Some(&browser));
+    let host = CommandHost::new(store.as_ref(), &client, guard.as_ref(), Some(&browser));
     let err = StdPocRunner::new()
         .run(&poc, VarBindings::new(), &host)
         .await
@@ -296,13 +284,13 @@ async fn http_step_out_of_scope_is_refused() {
     let poc: Poc = serde_yaml::from_str(example1_yaml()).expect("parse example 1");
     let vuln = spawn(TargetMode::Vulnerable);
     let store = Arc::new(MemFlowStore::new());
-    let client = TargetClient;
-    // Guard with NO scope entry → the http step must be refused.
-    let guard = StdGuard::new(LimitConfig::default());
+    // Guard with NO scope entry → the http step must be refused by the client.
+    let guard = Arc::new(StdGuard::new(LimitConfig::default()));
+    let client = pipeline_client(&store, &guard);
     let browser = StubBrowser {
         eval_value: Value::Null,
     };
-    let host = CommandHost::new(store.as_ref(), &client, &guard, Some(&browser));
+    let host = CommandHost::new(store.as_ref(), &client, guard.as_ref(), Some(&browser));
 
     let err = StdPocRunner::new()
         .run(&poc, example1_bindings(vuln), &host)
@@ -338,9 +326,9 @@ success:
     let poc: Poc = serde_yaml::from_str(yaml).expect("parse extract poc");
     let vuln = spawn(TargetMode::Vulnerable);
     let store = Arc::new(MemFlowStore::new());
-    let client = TargetClient;
-    let guard = guard_scoping(vuln);
-    let host = CommandHost::new(store.as_ref(), &client, &guard, None);
+    let guard = Arc::new(guard_scoping(vuln));
+    let client = pipeline_client(&store, &guard);
+    let host = CommandHost::new(store.as_ref(), &client, guard.as_ref(), None);
 
     let result = StdPocRunner::new()
         .run(&poc, example1_bindings(vuln), &host)

@@ -26,8 +26,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    Body, ClickTarget, Command, CommandHost, Flow, FlowId, HeaderMap, HttpRequest, HttpVersion,
-    ParamDef, ParamSchema, Params, Registry, TypeDesc, Value,
+    Body, ClickTarget, Command, CommandHost, FlowId, HeaderMap, HttpRequest, HttpVersion, ParamDef,
+    ParamSchema, Params, Registry, TypeDesc, Value,
 };
 use futures::future::BoxFuture;
 
@@ -130,14 +130,11 @@ impl StdPocRunner {
             match step {
                 Step::Http(http) => {
                     let req = build_request(http, &tmpl, &live)?;
-                    let authority = req.authority.clone();
-                    let _permit = host.guard().check_active(&authority)?;
+                    // The `ProxyClient` guards the authority (scope/rate) and
+                    // stores the captured flow; the runner neither re-checks nor
+                    // re-inserts. The returned flow's id anchors the finding.
                     let flow = host.client().send(req).await?;
-                    drop(_permit);
-
-                    // Store the captured flow; it anchors the finding artifact.
-                    let id = host.store().insert(Flow::Http(flow.clone()));
-                    finding = Some(id);
+                    finding = Some(flow.id);
 
                     if let Some(resp) = &flow.response {
                         ctx.status = resp.status;

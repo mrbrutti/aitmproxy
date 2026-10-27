@@ -68,6 +68,38 @@ impl EchoClient {
     }
 }
 
+/// A `RequestSender` that records requests and answers 200 — wrapped in a
+/// `PipelineClient` (the single guard chokepoint) by the scope test.
+struct EchoSender {
+    sent: Mutex<Vec<HttpRequest>>,
+}
+
+impl EchoSender {
+    fn new() -> Self {
+        Self {
+            sent: Mutex::new(Vec::new()),
+        }
+    }
+    fn sent(&self) -> Vec<HttpRequest> {
+        self.sent.lock().expect("sent lock").clone()
+    }
+}
+
+impl aitm_core::RequestSender for EchoSender {
+    fn send(&self, req: &HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpResponse>> {
+        self.sent.lock().expect("sent lock").push(req.clone());
+        Box::pin(async {
+            Ok(HttpResponse {
+                status: 200,
+                version: HttpVersion::Http11,
+                headers: HeaderMap::new(),
+                body: Body::Empty,
+                timestamp: SystemTime::now(),
+            })
+        })
+    }
+}
+
 impl ProxyClient for EchoClient {
     fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
         Box::pin(async move {
@@ -217,9 +249,12 @@ fn mutate_rejects_unknown_edit() {
 fn request_send_scope_gated() {
     let reg = registry();
     let store = Arc::new(MemFlowStore::new());
-    let guard = StdGuard::default(); // empty scope
-    let client = EchoClient::new(store.clone());
-    let host = CommandHost::new(&*store, &client, &guard, None);
+    let guard = Arc::new(StdGuard::default()); // empty scope
+    let sender = Arc::new(EchoSender::new());
+    // The PipelineClient is the single scope chokepoint; it must refuse an
+    // out-of-scope send before the sender is ever reached.
+    let client = aitm_core::PipelineClient::new(store.clone(), guard.clone(), sender.clone());
+    let host = CommandHost::new(store.as_ref(), &client, guard.as_ref(), None);
     let send = reg
         .command("request.send")
         .expect("request.send registered");
@@ -236,7 +271,7 @@ fn request_send_scope_gated() {
         .invoke(crafted.clone(), &host)
         .expect_err("out-of-scope send is refused");
     assert!(err.to_string().contains("scope"), "mentions scope: {err}");
-    assert!(client.sent().is_empty(), "nothing reached the client");
+    assert!(sender.sent().is_empty(), "nothing reached the client");
     assert!(store.list().is_empty());
 
     guard.add_scope(ScopeEntry {
@@ -247,7 +282,7 @@ fn request_send_scope_gated() {
         panic!("request.send must return the new flow id, got {out:?}");
     };
     let id: FlowId = id.parse().expect("a valid flow id");
-    let sent = client.sent();
+    let sent = sender.sent();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].method, "POST");
     assert_eq!(sent[0].scheme, "https");
@@ -266,7 +301,7 @@ fn request_send_scope_gated() {
         .invoke(params(&[("authority", s("ex.test"))]), &host)
         .expect("minimal send succeeds");
     assert!(matches!(out, Value::Str(_)));
-    let sent = client.sent();
+    let sent = sender.sent();
     assert_eq!(sent.len(), 2);
     assert_eq!(sent[1].method, "GET");
     assert_eq!(sent[1].scheme, "http");
