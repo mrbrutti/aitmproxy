@@ -3,7 +3,7 @@
 use aitm_core::Value;
 use aitm_poc::extract::{run_extractors, Extractor, ExtractorKind};
 use aitm_poc::matcher::{evaluate, MatchContext};
-use aitm_poc::Assertion;
+use aitm_poc::{Assertion, MatchPart};
 
 /// AC-L5: status/word/regex/browser-eval matchers evaluate to the expected boolean.
 #[test]
@@ -14,14 +14,11 @@ fn status_word_regex_browser() {
     assert!(evaluate(&Assertion::Status(200), &ctx));
     assert!(!evaluate(&Assertion::Status(404), &ctx));
 
-    assert!(evaluate(
-        &Assertion::Word("window.__aitm='ABC'".into()),
-        &ctx
-    ));
-    assert!(!evaluate(&Assertion::Word("not present".into()), &ctx));
+    assert!(evaluate(&Assertion::word("window.__aitm='ABC'"), &ctx));
+    assert!(!evaluate(&Assertion::word("not present"), &ctx));
 
-    assert!(evaluate(&Assertion::Regex("__aitm='[A-Z]+'".into()), &ctx));
-    assert!(!evaluate(&Assertion::Regex("__aitm='[0-9]+'".into()), &ctx));
+    assert!(evaluate(&Assertion::regex("__aitm='[A-Z]+'"), &ctx));
+    assert!(!evaluate(&Assertion::regex("__aitm='[0-9]+'"), &ctx));
 
     assert!(evaluate(
         &Assertion::BrowserEval {
@@ -46,11 +43,11 @@ fn negative_and_or() {
 
     // Negative matcher: true when the word is absent.
     assert!(evaluate(
-        &Assertion::Not(Box::new(Assertion::Word("patched".into()))),
+        &Assertion::Not(Box::new(Assertion::word("patched"))),
         &ctx
     ));
     assert!(!evaluate(
-        &Assertion::Not(Box::new(Assertion::Word("reflected".into()))),
+        &Assertion::Not(Box::new(Assertion::word("reflected"))),
         &ctx
     ));
 
@@ -59,7 +56,7 @@ fn negative_and_or() {
 
     // All: every child must hold.
     assert!(evaluate(
-        &Assertion::All(vec![hit.clone(), Assertion::Word("body".into())]),
+        &Assertion::All(vec![hit.clone(), Assertion::word("body")]),
         &ctx
     ));
     assert!(!evaluate(
@@ -73,7 +70,49 @@ fn negative_and_or() {
         &ctx
     ));
     assert!(!evaluate(
-        &Assertion::Any(vec![miss.clone(), Assertion::Word("absent".into())]),
+        &Assertion::Any(vec![miss.clone(), Assertion::word("absent")]),
+        &ctx
+    ));
+}
+
+/// AC-L5 (R2): a `word`/`regex` matcher with `part: header` tests the response
+/// headers, not the body.
+#[test]
+fn matcher_part_header() {
+    let ctx = MatchContext::new(200, "body has no marker")
+        .with_header("X-Powered-By", "Express")
+        .with_header("Set-Cookie", "sid=abc; HttpOnly");
+
+    // Body part (default) does not see the header value.
+    assert!(!evaluate(&Assertion::word("Express"), &ctx));
+    // Header part does.
+    assert!(evaluate(
+        &Assertion::Word {
+            word: "Express".into(),
+            part: MatchPart::Header,
+        },
+        &ctx
+    ));
+    assert!(evaluate(
+        &Assertion::Regex {
+            regex: "sid=[a-z0-9]+".into(),
+            part: MatchPart::Header,
+        },
+        &ctx
+    ));
+    // `all` sees both body and headers.
+    assert!(evaluate(
+        &Assertion::Word {
+            word: "body has no marker".into(),
+            part: MatchPart::All,
+        },
+        &ctx
+    ));
+    assert!(evaluate(
+        &Assertion::Word {
+            word: "Express".into(),
+            part: MatchPart::All,
+        },
         &ctx
     ));
 }

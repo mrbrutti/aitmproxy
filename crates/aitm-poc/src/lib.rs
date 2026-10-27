@@ -19,8 +19,8 @@ pub use builder::{PocBuildCommand, PocBuilder, PocSpec, StdPocBuilder};
 pub use extract::{run_extractors, Extraction, Extractor, ExtractorKind};
 pub use matcher::{evaluate, MatchContext};
 pub use model::{
-    Assertion, BrowserAction, BrowserStep, ExtractSource, ExtractStep, HttpStep, Poc, PocInfo,
-    Severity, Step, Variable,
+    Assertion, BrowserAction, BrowserStep, ExtractSource, ExtractStep, HttpStep, MatchPart, Poc,
+    PocInfo, Severity, Step, Variable,
 };
 pub use runner::{AssertionOutcome, PocRunCommand, PocRunResult, PocRunner, StdPocRunner};
 pub use schema::{validate, PocError};

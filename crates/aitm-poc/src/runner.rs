@@ -286,14 +286,14 @@ fn precheck(poc: &Poc) -> anyhow::Result<()> {
 
 fn check_assertion(assertion: &Assertion) -> anyhow::Result<()> {
     match assertion {
-        Assertion::Regex(pattern) => regex::Regex::new(pattern)
+        Assertion::Regex { regex, .. } => regex::Regex::new(regex)
             .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("poc.run: invalid regex matcher {pattern:?}: {e}")),
+            .map_err(|e| anyhow::anyhow!("poc.run: invalid regex matcher {regex:?}: {e}")),
         Assertion::Dsl(expr) => crate::dsl::check(expr)
             .map_err(|e| anyhow::anyhow!("poc.run: invalid dsl matcher {expr:?}: {e}")),
         Assertion::All(items) | Assertion::Any(items) => items.iter().try_for_each(check_assertion),
         Assertion::Not(inner) => check_assertion(inner),
-        Assertion::Status(_) | Assertion::Word(_) | Assertion::BrowserEval { .. } => Ok(()),
+        Assertion::Status(_) | Assertion::Word { .. } | Assertion::BrowserEval { .. } => Ok(()),
     }
 }
 
@@ -380,8 +380,14 @@ fn render_assertion(
 ) -> anyhow::Result<Assertion> {
     Ok(match assertion {
         Assertion::Status(code) => Assertion::Status(*code),
-        Assertion::Word(w) => Assertion::Word(tmpl.render(w, live)?),
-        Assertion::Regex(r) => Assertion::Regex(tmpl.render(r, live)?),
+        Assertion::Word { word, part } => Assertion::Word {
+            word: tmpl.render(word, live)?,
+            part: *part,
+        },
+        Assertion::Regex { regex, part } => Assertion::Regex {
+            regex: tmpl.render(regex, live)?,
+            part: *part,
+        },
         Assertion::Dsl(d) => Assertion::Dsl(tmpl.render(d, live)?),
         Assertion::BrowserEval { expr, equals } => Assertion::BrowserEval {
             expr: tmpl.render(expr, live)?,
@@ -469,8 +475,8 @@ fn push_outcomes(assertion: &Assertion, ctx: &MatchContext, out: &mut Vec<Assert
 fn describe(assertion: &Assertion) -> String {
     match assertion {
         Assertion::Status(code) => format!("status == {code}"),
-        Assertion::Word(w) => format!("word: {w}"),
-        Assertion::Regex(r) => format!("regex: {r}"),
+        Assertion::Word { word, .. } => format!("word: {word}"),
+        Assertion::Regex { regex, .. } => format!("regex: {regex}"),
         Assertion::Dsl(d) => format!("dsl: {d}"),
         Assertion::BrowserEval { expr, equals } => {
             format!("browser-eval {expr} == {equals:?}")
@@ -639,14 +645,14 @@ mod tests {
     #[test]
     fn precheck_rejects_bad_id_regex_and_dsl() {
         assert!(precheck(&poc_with("BadId", Assertion::Status(200))).is_err());
-        assert!(precheck(&poc_with("ok", Assertion::Regex("([".into()))).is_err());
+        assert!(precheck(&poc_with("ok", Assertion::regex("("))).is_err());
         assert!(precheck(&poc_with("ok", Assertion::Dsl("status_code ==".into()))).is_err());
         // A well-formed PoC passes the precheck.
         assert!(precheck(&poc_with(
             "ok",
             Assertion::All(vec![
                 Assertion::Status(200),
-                Assertion::Regex("a[0-9]+".into()),
+                Assertion::regex("a[0-9]+"),
                 Assertion::Dsl("status_code == 200".into()),
             ]),
         ))

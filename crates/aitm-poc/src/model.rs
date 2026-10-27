@@ -164,17 +164,64 @@ pub enum ExtractSource {
     BrowserEval(String),
 }
 
+/// Which part of a response a `word`/`regex` matcher is tested against
+/// (nuclei `part`): the body (default), the headers, or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MatchPart {
+    #[default]
+    Body,
+    Header,
+    All,
+}
+
+impl MatchPart {
+    fn as_str(self) -> &'static str {
+        match self {
+            MatchPart::Body => "body",
+            MatchPart::Header => "header",
+            MatchPart::All => "all",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "body" => Some(MatchPart::Body),
+            "header" | "headers" => Some(MatchPart::Header),
+            "all" => Some(MatchPart::All),
+            _ => None,
+        }
+    }
+}
+
 /// The matcher / `success` assertion tree (nuclei operator vocabulary).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Assertion {
     Status(u16),
-    Word(String),
-    Regex(String),
+    Word { word: String, part: MatchPart },
+    Regex { regex: String, part: MatchPart },
     Dsl(String),
     BrowserEval { expr: String, equals: Value },
     All(Vec<Assertion>),
     Any(Vec<Assertion>),
     Not(Box<Assertion>),
+}
+
+impl Assertion {
+    /// A `word` matcher against the response body.
+    pub fn word(word: impl Into<String>) -> Self {
+        Assertion::Word {
+            word: word.into(),
+            part: MatchPart::Body,
+        }
+    }
+
+    /// A `regex` matcher against the response body.
+    pub fn regex(regex: impl Into<String>) -> Self {
+        Assertion::Regex {
+            regex: regex.into(),
+            part: MatchPart::Body,
+        }
+    }
 }
 
 fn is_false(b: &bool) -> bool {
@@ -473,13 +520,19 @@ fn assertion_to_yaml(a: &Assertion) -> serde_yaml::Value {
                 serde_yaml::Value::Number((*n as u64).into()),
             );
         }
-        Assertion::Word(w) => {
+        Assertion::Word { word, part } => {
             str_entry(&mut m, "type", "word");
-            str_entry(&mut m, "word", w);
+            str_entry(&mut m, "word", word);
+            if *part != MatchPart::Body {
+                str_entry(&mut m, "part", part.as_str());
+            }
         }
-        Assertion::Regex(r) => {
+        Assertion::Regex { regex, part } => {
             str_entry(&mut m, "type", "regex");
-            str_entry(&mut m, "regex", r);
+            str_entry(&mut m, "regex", regex);
+            if *part != MatchPart::Body {
+                str_entry(&mut m, "part", part.as_str());
+            }
         }
         Assertion::Dsl(d) => {
             str_entry(&mut m, "type", "dsl");
@@ -553,8 +606,14 @@ fn assertion_from_yaml(v: &serde_yaml::Value) -> Result<Assertion, String> {
                 .ok_or("status matcher missing numeric `status`")?;
             Assertion::Status(code as u16)
         }
-        Some("word") => Assertion::Word(payload("word")?),
-        Some("regex") => Assertion::Regex(payload("regex")?),
+        Some("word") => Assertion::Word {
+            word: payload("word")?,
+            part: part_of(v)?,
+        },
+        Some("regex") => Assertion::Regex {
+            regex: payload("regex")?,
+            part: part_of(v)?,
+        },
         Some("dsl") => Assertion::Dsl(payload("dsl")?),
         Some("browser-eval") => Assertion::BrowserEval {
             expr: payload("expr")?,
@@ -576,6 +635,14 @@ fn assertion_from_yaml(v: &serde_yaml::Value) -> Result<Assertion, String> {
         Ok(Assertion::Not(Box::new(base)))
     } else {
         Ok(base)
+    }
+}
+
+/// Parse the nuclei `part` modifier (`body` default / `header` / `all`).
+fn part_of(v: &serde_yaml::Value) -> Result<MatchPart, String> {
+    match v.get("part").and_then(|p| p.as_str()) {
+        None => Ok(MatchPart::Body),
+        Some(s) => MatchPart::parse(s).ok_or_else(|| format!("unknown matcher part `{s}`")),
     }
 }
 

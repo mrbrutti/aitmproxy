@@ -13,7 +13,7 @@ use aitm_core::Value;
 use regex::Regex;
 
 use crate::dsl::{self, DslContext};
-use crate::model::Assertion;
+use crate::model::{Assertion, MatchPart};
 
 /// What an assertion is judged against: a response plus any observed browser
 /// values and bound variables.
@@ -65,15 +65,31 @@ impl MatchContext {
             vars: self.vars.clone(),
         }
     }
+
+    /// The text a `word`/`regex` matcher searches, per its `part`.
+    fn part_text(&self, part: MatchPart) -> String {
+        let headers = || {
+            self.headers
+                .iter()
+                .map(|(name, value)| format!("{name}: {value}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        match part {
+            MatchPart::Body => self.body.clone(),
+            MatchPart::Header => headers(),
+            MatchPart::All => format!("{}\n{}", headers(), self.body),
+        }
+    }
 }
 
 /// Evaluate an assertion tree against `ctx`.
 pub fn evaluate(assertion: &Assertion, ctx: &MatchContext) -> bool {
     match assertion {
         Assertion::Status(code) => ctx.status == *code,
-        Assertion::Word(w) => ctx.body.contains(w),
-        Assertion::Regex(pattern) => Regex::new(pattern)
-            .map(|re| re.is_match(&ctx.body))
+        Assertion::Word { word, part } => ctx.part_text(*part).contains(word),
+        Assertion::Regex { regex, part } => Regex::new(regex)
+            .map(|re| re.is_match(&ctx.part_text(*part)))
             .unwrap_or(false),
         Assertion::Dsl(expr) => dsl::eval_bool(expr, &ctx.dsl_context()),
         Assertion::BrowserEval { expr, equals } => {
