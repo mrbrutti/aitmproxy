@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** draft
+**Status:** approved (2026-10-27 by Matt)
 **Spec:** `docs/superpowers/specs/2026-10-27-aitmproxy-m2-obscura-browser-design.md` (approved 2026-10-27; M2-AC1–AC22, CA-AC1–AC29)
 **Branch / worktree:** aitmproxy `feat/aitmproxy-m2`; obscura fork `aitm/ca-cert` in a worktree of `/Users/matt/Security/obscura`
 
