@@ -9,3 +9,10 @@ description = "HTTP/1.1 protocol module: TLS MITM, certificate authority, sans-I
 [dependencies]
 aitm-core.workspace = true
 aitm-plugin.workspace = true
+anyhow.workspace = true
+# Certificate authority: root generation + leaf minting, and the leaf cache.
+rcgen = { version = "0.14", features = ["x509-parser"] }
+moka = { version = "0.12", features = ["sync"] }
+
+[dev-dependencies]
+uuid.workspace = true
