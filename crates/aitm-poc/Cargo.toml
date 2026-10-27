@@ -9,3 +9,13 @@ description = "Reproducible-PoC engine: artifact model, YAML serde, templating, 
 [dependencies]
 aitm-core.workspace = true
 aitm-browser.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+regex = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "net", "macros", "io-util"] }
+hyper = { version = "1", features = ["server", "http1"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+bytes = "1"
