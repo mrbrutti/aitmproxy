@@ -554,6 +554,26 @@ pub type ByteStream = Pin<Box<dyn AsyncReadWrite + Send>>;
   TPROXY/nfqueue, enabling dual-layer testing (fuzz one target at L7 and L4). The
   seam exists in M1; the module does not.
 
+**Upgrade handoff (accepted structuring call, resolved during implementation,
+approved by orchestrator 2026-10-27).** After `HttpModule` MITMs an HTTP 101
+upgrade there are two already-upgraded live byte streams, but `spawn(io, ctx)`
+otherwise only lets a module dial a *fresh* upstream via
+`ModuleCtx::connect_upstream`, and `ModuleCtx` cannot carry the handshake
+`FlowId` the `WsFlow` must link to. `ModuleCtx` therefore gains an additive
+upgrade-handoff construction path — `ModuleCtx::for_upgrade(handshake: FlowId,
+upstream: ByteStream, hint: NextLayerHint)` — plus accessors
+`handshake() -> Option<FlowId>`, `take_upstream() -> Option<ByteStream>`, and
+`hint() -> &NextLayerHint`. The core acceptor **re-dispatches** after an upgrade
+(mitmproxy `next_layer` style): `HttpModule` signals the upgrade, the core
+builds the upgrade `ModuleCtx` and calls the matching `ProtocolModule`
+(`WsModule`, whose `matches()` is true with `from_upgrade = true`) via its
+existing `spawn`; `WsModule` links `WsFlow.handshake` from `handshake()` and
+takes the already-upgraded stream with `take_upstream()` instead of dialing a
+new one with `connect_upstream()`. There is no direct `aitm-proto-http` →
+`aitm-proto-ws` crate edge — the core mediates. The public
+`ProtocolModule::spawn` signature is unchanged; this is additive and a
+reconciliation within the design, with no behavior or scope change.
+
 #### `aitm-proto-http`: TLS MITM + sans-IO HTTP
 
 ```rust
@@ -1628,4 +1648,18 @@ itself** — none of which may require editing the core.
     `Proxy::store()/client()/guard()/browser()`; the frontend builds a
     `CommandHost` per invoke, and an invoke without `with_services` returns a
     clear error. The declared `new` signatures are unchanged — additive only, no
+    behavior/scope/signature change.
+19. **Protocol-module upgrade handoff (accepted structuring call, resolved
+    during implementation, approved by orchestrator 2026-10-27).** A WebSocket
+    101 upgrade produces two already-upgraded live streams, but `spawn(io, ctx)`
+    only lets a module dial a fresh upstream via `ModuleCtx::connect_upstream`,
+    and `ModuleCtx` cannot carry the handshake `FlowId` the `WsFlow` links to.
+    `ModuleCtx` therefore gains an additive `for_upgrade(handshake: FlowId,
+    upstream: ByteStream, hint: NextLayerHint)` constructor plus `handshake() ->
+    Option<FlowId>`, `take_upstream() -> Option<ByteStream>`, and `hint() ->
+    &NextLayerHint`; the core re-dispatches an upgrade to the matching module
+    (mitmproxy `next_layer` style), which takes the existing upstream stream with
+    `take_upstream()` rather than dialing a new one. No `aitm-proto-http` →
+    `aitm-proto-ws` crate edge — the core mediates. The public
+    `ProtocolModule::spawn` signature is unchanged; additive only, no
     behavior/scope/signature change.
