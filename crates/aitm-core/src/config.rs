@@ -22,6 +22,9 @@ pub struct Config {
     /// the proxy verifies upstream TLS against the platform roots. Turning this
     /// on (for a lab with self-signed targets) trusts any upstream certificate.
     pub ssl_insecure: bool,
+    /// Flow-store capacity (0 = unbounded). The store evicts the oldest flow once
+    /// over this, so a long run has bounded memory.
+    pub max_flows: usize,
 }
 
 impl Default for Config {
@@ -34,6 +37,7 @@ impl Default for Config {
             mcp: McpConfig::default(),
             browser: BrowserConfig::default(),
             ssl_insecure: false,
+            max_flows: crate::store::DEFAULT_MAX_FLOWS,
         }
     }
 }

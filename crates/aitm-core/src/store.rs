@@ -141,12 +141,15 @@ impl FlowStore for MemFlowStore {
         let id = flow.id();
         let mut flows = self.flows.write().unwrap_or_else(PoisonError::into_inner);
         flows.insert(id, flow);
-        // Bound memory: evict the oldest flows once over capacity. Re-inserting
-        // an existing id updates in place and does not grow the map.
-        if self.capacity > 0 {
-            while flows.len() > self.capacity {
-                flows.shift_remove_index(0);
-            }
+        // Bound memory: once over capacity, evict the oldest flows in a batch
+        // (down to ~90% of capacity). Dropping the oldest `k` in one `drain` is a
+        // single O(n) shift amortized over `k` inserts, so sustained capture stays
+        // cheap — a per-insert `shift_remove_index(0)` is O(n) *every* time.
+        // Re-inserting an existing id updates in place and does not grow the map.
+        if self.capacity > 0 && flows.len() > self.capacity {
+            let keep = self.capacity - self.capacity / 10;
+            let remove = flows.len().saturating_sub(keep);
+            flows.drain(0..remove);
         }
         id
     }
