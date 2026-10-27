@@ -12,20 +12,14 @@
 //! so a config change moves the observed throttle threshold (AC-P4).
 
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use aitm_browser::BrowserPlugin;
-use aitm_core::{
-    Body, Config, HeaderMap, HttpRequest, HttpResponse, HttpVersion, Plugin, Proxy, Registry,
-    RequestSender,
-};
+use aitm_core::{Config, Plugin, Proxy, Registry};
 use aitm_plugins::{
     CapturePlugin, InterceptPlugin, MutatePlugin, RateLimitPlugin, ReplayPlugin, ScopePlugin,
 };
 use aitm_proto_http::{CertAuthority, HttpModule};
 use aitm_proto_ws::WsModule;
-use futures::future::BoxFuture;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Which removable first-party feature plugins to register. Dropping one here is
 /// the whole of AC-P3: the command disappears from the registry with no core edit.
@@ -92,78 +86,7 @@ impl Plugin for PocCommands {
     }
 }
 
-/// A minimal plaintext HTTP/1.1 `RequestSender` for the `PipelineClient`: it
-/// dials the request's authority over TCP and reads one response. This backs
-/// `flow.replay` / `request.send` against http upstreams; TLS upstream replay is
-/// a follow-up (the MITM path already handles TLS on the accept side).
-pub struct TcpRequestSender;
-
-impl RequestSender for TcpRequestSender {
-    fn send(&self, req: &HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpResponse>> {
-        let authority = req.authority.clone();
-        let method = req.method.clone();
-        let path = req.path.clone();
-        let headers: Vec<(String, String)> = req
-            .headers
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        let body = match &req.body {
-            Body::Bytes(bytes) => bytes.clone(),
-            _ => Vec::new(),
-        };
-        Box::pin(async move {
-            let mut stream = tokio::net::TcpStream::connect(&authority).await?;
-            // Host comes from the authority; drop any caller Host to avoid duplicates.
-            let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\n");
-            for (name, value) in &headers {
-                if name.eq_ignore_ascii_case("host") {
-                    continue;
-                }
-                head.push_str(&format!("{name}: {value}\r\n"));
-            }
-            head.push_str(&format!("Content-Length: {}\r\n", body.len()));
-            head.push_str("Connection: close\r\n\r\n");
-            stream.write_all(head.as_bytes()).await?;
-            if !body.is_empty() {
-                stream.write_all(&body).await?;
-            }
-            // Bound the response read so a hostile upstream cannot exhaust memory.
-            const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
-            let mut raw = Vec::new();
-            tokio::io::AsyncReadExt::take(stream, MAX_RESPONSE_BYTES)
-                .read_to_end(&mut raw)
-                .await?;
-            Ok(parse_response(&raw))
-        })
-    }
-}
-
-/// Parse a raw HTTP/1.1 response into an `HttpResponse` (status + buffered body).
-fn parse_response(raw: &[u8]) -> HttpResponse {
-    let split = raw.windows(4).position(|w| w == b"\r\n\r\n");
-    let (head, body) = match split {
-        Some(i) => (&raw[..i], raw[i + 4..].to_vec()),
-        None => (raw, Vec::new()),
-    };
-    let head = String::from_utf8_lossy(head);
-    let mut lines = head.lines();
-    let status = lines
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse::<u16>().ok())
-        .unwrap_or(0);
-    let mut headers = HeaderMap::new();
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            headers.set(name.trim(), value.trim());
-        }
-    }
-    HttpResponse {
-        status,
-        version: HttpVersion::Http11,
-        headers,
-        body: Body::Bytes(body),
-        timestamp: SystemTime::now(),
-    }
-}
+/// The request sender backing `flow.replay` / `request.send`: real HTTP/1.1 over
+/// `aitm-proto-http`'s `Http1Machine` (chunked decode, clean framing) with TLS
+/// for `https`. Re-exported from `aitm-proto-http`.
+pub use aitm_proto_http::Http1Sender;

@@ -429,12 +429,14 @@ pass below was approved by Matt 2026-10-27.
 | Security | Important | Browser-origin SSRF unenforced (redirects / fetch / sub-resources bypass the per-navigation `check_url`) | Fixed in `db88c51`: a dedicated browser-facing listener (`Proxy::run_browser`, `cfg.browser.proxy_addr` :8081) whose `SsrfConnector` runs `ssrf_check` on every upstream (authority host + resolved IP); `UpstreamConnector::connect` now threads the authority. |
 | Security | Important | `poc.run` browser navigate not SSRF-checked | Fixed in `9b…`: the runner calls `aitm_browser::check_url` (url::Url parse + resolve + classify) before `check_active`; refusal tested. |
 
+| Correctness | Important | Second, hand-rolled HTTP client in the binary (plaintext for https, no chunked decode, possible duplicate framing) | Fixed in `b0…`/second pass: `aitm_proto_http::Http1Sender` drives the shared `Http1Machine` (chunked decode, single `Content-Length`, no stray `Transfer-Encoding`) with rustls TLS for `https` (verify default, `ssl_insecure` opt-out); `TcpRequestSender`/`parse_response` deleted. Chunked-decode and single-CL framing tested. |
+
 ### Deferred (tracked in Follow-ups, approved 2026-10-27)
 
-Rate-limit double-count + real-client test rewrites; the binary's Http1/TLS
-request sender; error taxonomy / `record_error` / backoff / host-disable;
-parked-flow leak on client EOF; AC13 field preservation (info/http-step extras);
-CA load-time permission checks + validity dates; exact-count test tightening.
+Rate-limit double-count + real-client test rewrites; error taxonomy /
+`record_error` / backoff / host-disable; parked-flow leak on client EOF; AC13
+field preservation (info/http-step extras); CA load-time permission checks +
+validity dates; exact-count test tightening.
 
 ## Shipped
 
@@ -451,10 +453,6 @@ correctness/security/robustness item, not pure cosmetics.
   replay/mutate/scope tests to drive the real `PipelineClient` against a local
   server instead of stub clients. (Coupled: removing the command-side check
   requires the tests to stop using non-guarding stub clients.)
-- **Binary Http1/TLS request sender.** Replace `aitm/src/wire.rs`
-  `TcpRequestSender`/`parse_response` with `aitm-proto-http`'s `Http1Machine` +
-  a TLS connector: chunked decoding, no duplicate `Content-Length`/
-  `Transfer-Encoding`, real TLS for `https`, connect/read timeouts.
 - **Browser-origin SSRF at the connector.** Give the embedded browser its own
   proxy listener/port (or peer match) so the upstream connector can enforce
   `SsrfPolicy` on browser-originated connections (redirects, page `fetch`,

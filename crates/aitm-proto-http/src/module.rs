@@ -783,6 +783,11 @@ fn cert_names(der: &CertificateDer<'_>) -> Vec<String> {
     names
 }
 
+/// Build the accept-any verifier (shared with the replay sender's insecure mode).
+pub(crate) fn accept_any_verifier(provider: Arc<CryptoProvider>) -> Arc<dyn ServerCertVerifier> {
+    Arc::new(AcceptAnyServerCert { provider })
+}
+
 /// Accepts whatever certificate an upstream presents. An intercepting proxy
 /// must reach self-signed and internal targets; the presented leaf is still
 /// sniffed for the names the impersonating leaf must carry. Signatures are

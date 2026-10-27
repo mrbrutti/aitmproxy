@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use aitm::wire::{build_proxy, TcpRequestSender};
+use aitm::wire::{build_proxy, Http1Sender};
 use aitm_core::{BrowserDriver, Config, PipelineClient, ProxyClient};
 
 #[tokio::main]
@@ -26,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
     let client: Arc<dyn ProxyClient> = Arc::new(PipelineClient::new(
         store.clone(),
         guard.clone(),
-        Arc::new(TcpRequestSender),
+        Arc::new(Http1Sender::new().with_insecure(cfg.ssl_insecure)),
     ));
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
