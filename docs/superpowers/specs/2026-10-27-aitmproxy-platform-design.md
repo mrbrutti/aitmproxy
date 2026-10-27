@@ -772,6 +772,27 @@ impl Cli {
 }
 ```
 
+**Frontends receive the core service handles via an additive builder; the
+declared `McpServer::new`/`Cli::new` signatures are unchanged (accepted
+structuring call, resolved during implementation, approved by orchestrator
+2026-10-27).** A `Registry` alone cannot answer `tools/call` / `dispatch`:
+`Command::invoke(args, &CommandHost)` needs a `CommandHost`, which carries the
+flow store, proxy client, scope/rate guard, and (optional) browser — none of
+which a `Registry` holds. So `McpServer` and `Cli` each gain an additive
+builder method
+
+```rust
+fn with_services(self, store: Arc<dyn FlowStore>, client: Arc<dyn ProxyClient>,
+                 guard: Arc<dyn ScopeRateGuard>, browser: Option<Arc<dyn BrowserDriver>>) -> Self;
+```
+
+These handles are exactly what `Proxy::store()/client()/guard()/browser()`
+already provide; at invoke time the frontend builds a `CommandHost` from them
+and passes it to `Command::invoke`. If `with_services` was not called, an
+invoke returns a clear error. `tools/list` and schema derivation never need
+services. This is a reconciliation within the design: additive only, no
+behavior or signature change to `new`.
+
 ### Embedded headless browser (`aitm-browser`)
 
 - **chromiumoxide in-process over CDP (Architect's call)** — the lean path for a
@@ -1595,3 +1616,16 @@ itself** — none of which may require editing the core.
     `aitm-browser`), and `aitm-plugin` **re-exports** the protocol seam so it stays
     the public authoring surface. A reconciliation within the design: no behavior,
     scope, or signature change; all documented import paths still work.
+18. **Frontend service handles via an additive `with_services(...)` builder
+    (accepted structuring call, resolved during implementation, approved by
+    orchestrator 2026-10-27).** `McpServer::new(Arc<Registry>, McpTransport)` and
+    `Cli::new(Arc<Registry>)` receive only a `Registry`, but `tools/call` /
+    `dispatch` must build a `CommandHost` to call `Command::invoke`, and a
+    `CommandHost` needs the flow store, proxy client, scope/rate guard, and
+    optional browser. Both frontends therefore gain `with_services(self, store:
+    Arc<dyn FlowStore>, client: Arc<dyn ProxyClient>, guard: Arc<dyn
+    ScopeRateGuard>, browser: Option<Arc<dyn BrowserDriver>>) -> Self`, fed from
+    `Proxy::store()/client()/guard()/browser()`; the frontend builds a
+    `CommandHost` per invoke, and an invoke without `with_services` returns a
+    clear error. The declared `new` signatures are unchanged — additive only, no
+    behavior/scope/signature change.
