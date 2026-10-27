@@ -15,6 +15,10 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 regex = "1"
 
+# Unix-only: the `O_NOFOLLOW` constant for a TOCTOU-safe PoC-file open (no unsafe).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "net", "macros", "io-util"] }
 hyper = { version = "1", features = ["server", "http1"] }

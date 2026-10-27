@@ -165,7 +165,7 @@ impl StdPocRunner {
                             // the browser at a private/loopback target off-scope.
                             let target = aitm_browser::check_url(
                                 &url,
-                                &aitm_core::SsrfPolicy::default(),
+                                host.ssrf_policy(),
                                 &host.guard().list_scope(),
                                 &aitm_browser::SystemResolver,
                             )?;
@@ -235,19 +235,20 @@ impl StdPocRunner {
             .unwrap_or(0);
         // The id is validated by `precheck` before this runs, so it is a safe
         // single path component.
+        // The configured output root is trusted; create it if missing.
+        std::fs::create_dir_all(&self.out_dir)?;
         let dir = self.out_dir.join(format!("aitm-poc-{}-{}", poc.id, nanos));
-        std::fs::create_dir_all(&dir)?;
-        restrict_dir(&dir)?;
+        // Create the per-run dir *atomically* owner-only, failing if it exists, so
+        // a pre-created world-readable dir or a planted symlink can't be reused.
+        create_private_dir(&dir)?;
 
         let poc_path = dir.join(format!("{}.poc.yaml", poc.id));
-        std::fs::write(&poc_path, serde_yaml::to_string(poc)?)?;
-        restrict_file(&poc_path)?;
+        write_private_file(&poc_path, serde_yaml::to_string(poc)?.as_bytes())?;
 
         let screenshot_path = match screenshot {
             Some(bytes) => {
                 let path = dir.join("screenshot.png");
-                std::fs::write(&path, bytes)?;
-                restrict_file(&path)?;
+                write_private_file(&path, bytes)?;
                 path
             }
             None => PathBuf::new(),
@@ -257,32 +258,73 @@ impl StdPocRunner {
     }
 }
 
-/// Tighten an artifact directory to owner-only (`0700`) on Unix. A finding's
-/// request/response and screenshot may hold sensitive data, so they are not
-/// world-readable.
+/// Create `path` as a new owner-only (`0700`) directory, failing if it already
+/// exists. The mode is set at creation (not chmod-after), and fail-if-exists
+/// prevents reusing a pre-created world-readable dir or a planted symlink — a
+/// finding's request/response and screenshot may hold sensitive data.
 #[cfg(unix)]
-fn restrict_dir(path: &std::path::Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-/// Tighten an artifact file to owner-only (`0600`) on Unix.
-#[cfg(unix)]
-fn restrict_file(path: &std::path::Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+fn create_private_dir(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(path)?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn restrict_dir(_path: &std::path::Path) -> anyhow::Result<()> {
+fn create_private_dir(path: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::DirBuilder::new().create(path)?;
+    Ok(())
+}
+
+/// Write `bytes` to a brand-new owner-only (`0600`) file, failing if it already
+/// exists (`create_new`), so the write cannot follow a planted symlink or clobber
+/// an existing file.
+#[cfg(unix)]
+fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn restrict_file(_path: &std::path::Path) -> anyhow::Result<()> {
+fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    f.write_all(bytes)?;
     Ok(())
+}
+
+/// Open `path` read-only without following a symlink at the final component
+/// (`O_NOFOLLOW`): opening a symlink fails, so the loader can stat and read the
+/// returned handle with no stat/open TOCTOU window.
+#[cfg(unix)]
+fn open_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Best-effort fallback where `O_NOFOLLOW` is unavailable: reject a symlink
+/// final component before opening (a residual TOCTOU remains off Unix).
+#[cfg(not(unix))]
+fn open_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to open a symlink",
+        ));
+    }
+    std::fs::File::open(path)
 }
 
 /// A filesystem-safe PoC id: `^[a-z0-9][a-z0-9-]{0,63}$`. Used to build the
@@ -572,23 +614,29 @@ impl Command for PocRunCommand {
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         let poc_path = args.get_str("poc_path")?;
         let path = std::path::Path::new(poc_path);
-        // Only load a plainly-named YAML file, never a symlink (which could point
-        // the loader at an arbitrary file).
+        // Only load a plainly-named YAML file.
         match path.extension().and_then(|e| e.to_str()) {
             Some("yaml") | Some("yml") => {}
             _ => anyhow::bail!("poc.run: `{poc_path}` must be a .yaml file"),
         }
-        let meta = std::fs::symlink_metadata(path)
+        // Open with `O_NOFOLLOW` so a symlink at the final component fails to open,
+        // then stat and read the *opened handle* — closing the stat/open TOCTOU
+        // window where the path could be swapped for a symlink to an arbitrary file.
+        let mut file = open_nofollow(path)
+            .map_err(|e| anyhow::anyhow!("poc.run: cannot open `{poc_path}`: {e}"))?;
+        let meta = file
+            .metadata()
             .map_err(|e| anyhow::anyhow!("poc.run: cannot stat `{poc_path}`: {e}"))?;
-        if meta.file_type().is_symlink() {
-            anyhow::bail!("poc.run: refusing to load `{poc_path}`: it is a symlink");
+        if !meta.file_type().is_file() {
+            anyhow::bail!("poc.run: refusing to load `{poc_path}`: not a regular file");
         }
         // Cap the document size before parsing (billion-laughs / huge-doc guard).
         const MAX_POC_BYTES: u64 = 1024 * 1024;
         if meta.len() > MAX_POC_BYTES {
             anyhow::bail!("poc.run: `{poc_path}` exceeds the {MAX_POC_BYTES}-byte PoC size cap");
         }
-        let text = std::fs::read_to_string(path)
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut file, &mut text)
             .map_err(|e| anyhow::anyhow!("poc.run: cannot read `{poc_path}`: {e}"))?;
         // Validate the raw document, then type it. Parse errors are reported
         // without echoing the offending file content.

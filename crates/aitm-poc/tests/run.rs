@@ -21,7 +21,7 @@ use aitm_core::{
     MemFlowStore, NavOutcome, RequestSender, ScopeEntry, ScopeRateGuard, StdGuard, Value,
 };
 use aitm_core::{BrowserDriver, ClickTarget};
-use aitm_poc::{Poc, PocRunner, StdPocRunner, VarBindings};
+use aitm_poc::{Poc, PocRunCommand, PocRunner, StdPocRunner, VarBindings};
 use futures::future::BoxFuture;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -339,4 +339,54 @@ success:
         "extracted token must satisfy the DSL success; outcomes: {:?}",
         result.evaluated
     );
+}
+
+/// poc.run opens the PoC file with `O_NOFOLLOW`, so a symlinked path is refused
+/// (closing the stat/open TOCTOU). It bails before any network or browser work,
+/// so this needs no target server.
+#[cfg(unix)]
+#[test]
+fn poc_run_refuses_a_symlinked_poc_file() {
+    use aitm_core::{Command, HttpFlow, Params};
+
+    struct NoClient;
+    impl aitm_core::ProxyClient for NoClient {
+        fn send(&self, _req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+            Box::pin(async { anyhow::bail!("unused") })
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!("aitm-poc-toctou-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let real = dir.join("real.yaml");
+    std::fs::write(
+        &real,
+        "id: demo\ninfo:\n  name: n\nsteps: []\nsuccess:\n  all: []\n",
+    )
+    .expect("write real");
+    let link = dir.join("link.yaml");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+    let store = MemFlowStore::new();
+    let client = NoClient;
+    let guard = StdGuard::default();
+    let host = CommandHost::new(&store, &client, &guard, None);
+
+    let args = Params::new(
+        [(
+            "poc_path".to_string(),
+            Value::Str(link.display().to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let err = PocRunCommand
+        .invoke(args, &host)
+        .expect_err("a symlinked PoC path must be refused");
+    assert!(
+        err.to_string().contains("cannot open"),
+        "want an open refusal, got: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
