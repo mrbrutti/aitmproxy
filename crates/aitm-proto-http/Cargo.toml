@@ -1,0 +1,11 @@
+[package]
+name = "aitm-proto-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "HTTP/1.1 protocol module: TLS MITM, certificate authority, sans-IO HTTP state machine."
+
+[dependencies]
+aitm-core.workspace = true
+aitm-plugin.workspace = true

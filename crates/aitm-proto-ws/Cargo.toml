@@ -1,0 +1,11 @@
+[package]
+name = "aitm-proto-ws"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "WebSocket protocol module: activates on HTTP Upgrade and captures frames."
+
+[dependencies]
+aitm-core.workspace = true
+aitm-plugin.workspace = true

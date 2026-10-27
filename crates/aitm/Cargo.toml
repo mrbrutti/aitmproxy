@@ -1,0 +1,22 @@
+[package]
+name = "aitm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The aitmproxy binary: wires modules, plugins, and frontends from config."
+
+[[bin]]
+name = "aitm"
+path = "src/main.rs"
+
+[dependencies]
+aitm-core.workspace = true
+aitm-plugin.workspace = true
+aitm-proto-http.workspace = true
+aitm-proto-ws.workspace = true
+aitm-plugins.workspace = true
+aitm-browser.workspace = true
+aitm-poc.workspace = true
+aitm-mcp.workspace = true
+aitm-cli.workspace = true

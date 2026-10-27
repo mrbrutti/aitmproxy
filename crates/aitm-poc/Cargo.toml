@@ -1,0 +1,11 @@
+[package]
+name = "aitm-poc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Reproducible-PoC engine: artifact model, YAML serde, templating, matcher DSL, builder, runner."
+
+[dependencies]
+aitm-core.workspace = true
+aitm-browser.workspace = true

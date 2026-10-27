@@ -1,0 +1,10 @@
+[package]
+name = "aitm-plugins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "First-party feature plugins: capture, replay, intercept, mutate, scope, rate-limit."
+
+[dependencies]
+aitm-core.workspace = true
