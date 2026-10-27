@@ -439,12 +439,13 @@ pass below was approved by Matt 2026-10-27.
 
 | Tests | Minor | AC13 field loss (`PocInfo` description/author/metadata, `HttpStep` matchers/raw/path dropped) | Fixed in second pass: `PocInfo` gains `description`/`author`/`metadata`; `HttpStep` keeps unmodeled keys in a flattened `extra` map, so a PoC round-trips faithfully. Tested. (Per-step matcher *evaluation* remains future work.) |
 
+| Tests | Minor | Loose `>= 1` rate-limit assertions | Fixed in second pass: the deterministic burst tests (guard + scope-rate) now assert exact pass/refuse counts (a burst of N at `per_host_rps=K` passes exactly K and refuses N−K); confirmed stable across repeated runs. |
+
 ### Deferred (tracked in Follow-ups, approved 2026-10-27)
 
-CA key owner-uid check (needs a non-`unsafe` getuid); exact-count test tightening.
-(Error-taxonomy mapping is wired at the main upstream-failure point; extending
-`Event::Error` to every module failure path, and evaluating per-step matchers,
-are incremental.)
+CA key owner-uid check (needs a non-`unsafe` getuid). (Error-taxonomy mapping is
+wired at the main upstream-failure point; extending `Event::Error` to every
+module failure path, and evaluating per-step matchers, are incremental.)
 
 ## Shipped
 
@@ -469,8 +470,6 @@ correctness/security/robustness item, not pure cosmetics.
 - **CA key owner-uid check.** Also refuse a CA key not owned by the current uid
   (the group/other-mode check and explicit validity already land); needs a
   non-`unsafe` `getuid` (e.g. `rustix`) under `forbid(unsafe_code)`.
-- **Test tightening.** Replace `>= 1` refusal assertions with exact counts where
-  deterministic.
 
 ### Deferred cosmetic (no security/correctness angle)
 

@@ -163,14 +163,17 @@ fn rate_limit_burst() {
     });
     guard.add_scope(scoped("ex.test"));
 
+    // The per-host bucket holds exactly `per_host_rps` tokens; an instant 5-call
+    // burst refills a negligible fraction, so exactly the first 2 pass.
+    let mut permitted = 0;
     let mut rate_limited = 0;
     for _ in 0..5 {
-        if let Err(GuardError::RateLimited { .. }) = guard.check_active("ex.test") {
-            rate_limited += 1;
+        match guard.check_active("ex.test") {
+            Ok(_) => permitted += 1,
+            Err(GuardError::RateLimited { .. }) => rate_limited += 1,
+            Err(other) => panic!("unexpected refusal: {other:?}"),
         }
     }
-    assert!(
-        rate_limited >= 1,
-        "a 5-call burst at per_host_rps=2 must throttle at least once"
-    );
+    assert_eq!(permitted, 2, "exactly per_host_rps calls pass the burst");
+    assert_eq!(rate_limited, 3, "the remaining 3 are rate-limited");
 }

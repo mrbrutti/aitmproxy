@@ -134,10 +134,12 @@ fn rate_limit_throttles_burst() {
         .invoke(params(&[("host", Value::Str("ex.test".into()))]), &host)
         .expect("scope.add ok");
 
-    let refused = burst_rate_limited(&reg, &host, 6);
-    assert!(
-        refused >= 1,
-        "a 6-burst against per_host_rps=2 must be throttled at least once, refused={refused}"
+    // per_host_rps=2 → the bucket holds 2 tokens; a 6-burst passes exactly 2 and
+    // refuses the remaining 4 (an instant burst refills a negligible fraction).
+    assert_eq!(
+        burst_rate_limited(&reg, &host, 6),
+        4,
+        "a 6-burst against per_host_rps=2 refuses exactly 4"
     );
 }
 
@@ -154,11 +156,12 @@ fn option_changes_behavior() {
         .invoke(params(&[("host", Value::Str("ex.test".into()))]), &host)
         .expect("scope.add ok");
 
-    // Low option → throttled.
+    // Low option → the 6-burst passes 2 and refuses the other 4.
     RateLimitPlugin::apply(&reg, guard.as_ref());
-    assert!(
-        burst_rate_limited(&reg, &host, 6) >= 1,
-        "low per_host_rps must throttle"
+    assert_eq!(
+        burst_rate_limited(&reg, &host, 6),
+        4,
+        "low per_host_rps throttles all but the 2-token burst"
     );
 
     // Raise the option and re-apply (resets the bucket) → the same burst passes.
