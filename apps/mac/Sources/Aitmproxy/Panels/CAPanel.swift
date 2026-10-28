@@ -1,0 +1,152 @@
+import AitmBusClient
+import AitmproxyKit
+import AppKit
+import SwiftUI
+import UniformTypeIdentifiers
+
+/// Certificate Authority (S-058): the CA's status, export PEM/DER, install or
+/// uninstall after the proxy's own confirmation, the read-only agent-gate flag,
+/// and setup guides for iOS, Android, browsers and terminals.
+struct CAPanel: View {
+    @Environment(Session.self) private var session
+    @State private var status: CAStatus?
+    @State private var agentMayInstall = false
+    @State private var busy = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: Space.lg) {
+                Text("Certificate Authority").font(Tok.Face.ui(Tok.Typography.Size.xl, .medium)).foregroundStyle(Tok.Ink.primary.color)
+                if let status {
+                    statusLine(status)
+                    buttons(status)
+                    Text("Agent may install: \(agentMayInstall ? "yes" : "no")")
+                        .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
+                    Rule()
+                    guides
+                } else {
+                    LoadingLines().frame(height: 120) // grid: ok loading placeholder
+                }
+            }
+            .padding(Space.xl)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Tok.Ground.surface.color)
+        .gridArea("ca")
+        .onAppear(perform: load)
+    }
+
+    private func statusLine(_ status: CAStatus) -> some View {
+        VStack(alignment: .leading, spacing: Space.sm) {
+            HStack(spacing: Space.md) {
+                Text(status.statusText)
+                    .font(Tok.Face.ui(Tok.Typography.Size.md, .medium))
+                    .foregroundStyle((status.installed ? Tok.Ink.primary : Tok.Intercept.deep).color)
+                if let expires = status.expires {
+                    Text("expires \(expires.formatted(.dateTime.year().month(.abbreviated).day()))")
+                        .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.secondary.color)
+                }
+            }
+            if !status.fingerprint.isEmpty {
+                keyValue("SHA-256", status.fingerprint)
+            }
+            keyValue("Subject", status.subject)
+            if let path = status.path { keyValue("Path", path) }
+        }
+    }
+
+    private func keyValue(_ key: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: Space.md) {
+            Text(key).font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.secondary.color)
+                .frame(width: 72, alignment: .leading)
+            Text(value).font(Tok.Face.data(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.primary.color)
+                .textSelection(.enabled).lineLimit(1).truncationMode(.middle)
+        }
+    }
+
+    private func buttons(_ status: CAStatus) -> some View {
+        HStack(spacing: Space.sm) {
+            FlatButton("Export PEM") { export(format: "pem") }.disabled(busy || !status.exists)
+            FlatButton("Export DER") { export(format: "der") }.disabled(busy || !status.exists)
+            Spacer()
+            if status.installed {
+                FlatButton("Uninstall…") { change(install: false, status: status) }.disabled(busy)
+            } else {
+                PrimaryButton("Install…") { change(install: true, status: status) }.disabled(busy || !status.exists)
+            }
+        }
+    }
+
+    private var guides: some View {
+        VStack(alignment: .leading, spacing: Space.md) {
+            Text("SETUP").font(Tok.Face.ui(Tok.Typography.Size.xs, .medium)).tracking(0.6).foregroundStyle(Tok.Ink.tertiary.color)
+            ForEach(CAStatus.guides, id: \.title) { guide in
+                VStack(alignment: .leading, spacing: Space.xs) {
+                    Text(guide.title).font(Tok.Face.ui(Tok.Typography.Size.md, .semibold)).foregroundStyle(Tok.Ink.primary.color)
+                    Text(guide.body).font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.secondary.color)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    // MARK: Actions
+
+    private func load() {
+        if Store.usesFixtures {
+            status = Fixtures.caStatus
+            agentMayInstall = Fixtures.caStatus.allowAgentInstall
+            return
+        }
+        agentMayInstall = configFlag()
+        Task {
+            if let json = try? await session.runCommand("ca.status", [:]), let parsed = CAStatus(json: json) {
+                status = parsed
+                if parsed.allowAgentInstall { agentMayInstall = true }
+            } else {
+                status = CAStatus(fingerprint: "", installed: false, trusted: false, exists: false)
+            }
+        }
+    }
+
+    /// `ca.allow_agent_install` from the proxy's own config.yaml.
+    private func configFlag() -> Bool {
+        guard let yaml = try? String(contentsOf: BusService.configURL, encoding: .utf8) else { return false }
+        return ConfigDocument(yaml: yaml, path: BusService.configURL.path, envOverrides: []).allowAgentInstall
+    }
+
+    private func export(format: String) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "aitmproxy-ca.\(format == "der" ? "der" : "pem")"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        busy = true
+        Task {
+            defer { busy = false }
+            do { _ = try await session.runCommand("ca.export", ["format": .string(format), "path": .string(url.path)]) }
+            catch { session.lastError = "ca.export: \(BusService.describe(error))" }
+        }
+    }
+
+    private func change(install: Bool, status: CAStatus) {
+        let alert = NSAlert()
+        alert.messageText = install ? "Install the aitmproxy root CA?" : "Remove the aitmproxy root CA?"
+        alert.informativeText = status.confirmPrompt(install: install)
+        alert.addButton(withTitle: install ? "Install" : "Remove")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        busy = true
+        Task {
+            defer { busy = false }
+            do {
+                _ = try await session.runCommand(install ? "ca.install" : "ca.uninstall", [:])
+                if let json = try? await session.runCommand("ca.status", [:]), let parsed = CAStatus(json: json) {
+                    self.status = parsed
+                }
+            } catch {
+                session.lastError = "ca.\(install ? "install" : "uninstall"): \(BusService.describe(error))"
+            }
+        }
+    }
+}

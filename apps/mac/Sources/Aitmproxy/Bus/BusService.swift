@@ -16,6 +16,7 @@ final class BusService: FlowActions {
 
     @ObservationIgnored private var client: BusClient?
     @ObservationIgnored private var runTask: Task<Void, Never>?
+    @ObservationIgnored private var notificationTask: Task<Void, Never>?
     @ObservationIgnored private var summaries: [FlowID: FlowSummary] = [:]
 
     init(session: Session) { self.session = session }
@@ -48,6 +49,14 @@ final class BusService: FlowActions {
             session.bus = .connecting(address)
             let client = BusClient(endpoint: endpoint, clientName: "aitm-mac", clientVersion: session.version)
             self.client = client
+            // Server push (F2 agent activity, F4 flow events) lands on the session's sink.
+            notificationTask?.cancel()
+            notificationTask = Task { [weak self] in
+                for await note in client.notifications {
+                    guard let self else { return }
+                    session.notificationSink?(note.method, note.params)
+                }
+            }
             do {
                 serverInfo = try await client.connect()
                 session.bus = .connected(address)
@@ -112,18 +121,30 @@ final class BusService: FlowActions {
         return client
     }
 
+    /// One call, recorded for the activity log whatever the outcome.
+    private func call(_ name: String, _ args: [String: JSONValue] = [:]) async throws -> JSONValue {
+        do {
+            let value = try await call(name, args)
+            session.commandRecorder?(name, args, nil)
+            return value
+        } catch {
+            session.commandRecorder?(name, args, Self.describe(error))
+            throw error
+        }
+    }
+
     func setIntercept(_ enabled: Bool, rules: [BreakpointRule]) async throws {
         // `rules` is F3; the core rejects unknown arguments, so they travel only when there are any.
         var args: [String: JSONValue] = ["enabled": .bool(enabled)]
         if enabled, !rules.isEmpty {
             args["rules"] = .array(rules.map { .object($0.arguments.mapValues { .string($0) }) })
         }
-        let armed = try await live().call("flow.intercept", args).boolValue ?? enabled
+        let armed = try await call("flow.intercept", args).boolValue ?? enabled
         session.interceptArmed = armed
     }
 
     func resume(_ id: FlowID) async throws {
-        _ = try await live().call("flow.resume", ["id": .string(id.raw)])
+        _ = try await call("flow.resume", ["id": .string(id.raw)])
         summaries[id] = nil
     }
 
@@ -131,48 +152,48 @@ final class BusService: FlowActions {
         // `mode` is F3; the core resets today and rejects unknown arguments, so send it only when asked for.
         var args: [String: JSONValue] = ["id": .string(id.raw)]
         if mode != .reset { args["mode"] = .string(mode.rawValue) }
-        _ = try await live().call("flow.kill", args)
+        _ = try await call("flow.kill", args)
         summaries[id] = nil
     }
 
     func mutate(_ id: FlowID, edits: RequestEdits) async throws {
-        _ = try await live().call("flow.mutate", ["id": .string(id.raw), "edits": .object(edits.arguments)])
+        _ = try await call("flow.mutate", ["id": .string(id.raw), "edits": .object(edits.arguments)])
     }
 
     func replay(_ id: FlowID) async throws -> FlowID? {
-        try await live().call("flow.replay", ["id": .string(id.raw)]).stringValue.map(FlowID.init)
+        try await call("flow.replay", ["id": .string(id.raw)]).stringValue.map(FlowID.init)
     }
 
     func send(_ request: RequestEdits) async throws -> FlowID? {
-        try await live().call("request.send", request.arguments).stringValue.map(FlowID.init)
+        try await call("request.send", request.arguments).stringValue.map(FlowID.init)
     }
 
     func addScope(_ host: String) async throws {
-        _ = try await live().call("scope.add", ["host": .string(host)])
+        _ = try await call("scope.add", ["host": .string(host)])
         await refreshScope()
     }
 
     func removeScope(_ host: String) async throws {
-        _ = try await live().call("scope.remove", ["host": .string(host)])
+        _ = try await call("scope.remove", ["host": .string(host)])
         await refreshScope()
     }
 
     func mark(_ id: FlowID, color: MarkColor?) async throws {
         let marks: JSONValue = color.map { .array([.string($0.rawValue)]) } ?? .array([])
-        _ = try await live().call("flow.mark", ["id": .string(id.raw), "marks": marks])
+        _ = try await call("flow.mark", ["id": .string(id.raw), "marks": marks])
     }
 
     func comment(_ id: FlowID, text: String) async throws {
-        _ = try await live().call("flow.comment", ["id": .string(id.raw), "text": .string(text)])
+        _ = try await call("flow.comment", ["id": .string(id.raw), "text": .string(text)])
     }
 
     func setCapturing(_ on: Bool) async throws {
-        _ = try await live().call(on ? "proxy.resume" : "proxy.pause")
+        _ = try await call(on ? "proxy.resume" : "proxy.pause")
         session.capturing = on
     }
 
     func clear() async throws {
-        _ = try await live().call("flow.clear")
+        _ = try await call("flow.clear")
         summaries = [:]
         session.rows = []
         session.details = [:]

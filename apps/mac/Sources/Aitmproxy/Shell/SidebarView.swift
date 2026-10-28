@@ -48,6 +48,8 @@ struct SidebarView: View {
                                     page: .apps, bundleID: client.bundleID)
                         }
                     }
+                    item(.overview)
+                    item(.connections)
                     item(.domains, count: session.hosts.count)
                     if session.page == .domains || querying {
                         let visible = session.hosts.filter { matches($0.0) }

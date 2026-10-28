@@ -104,10 +104,10 @@ enum SelfTest {
 
             // S-018: pause and clear.
             session.setCapturing(false)
-            try? await Task.sleep(for: .milliseconds(50))
+            await settle { !session.capturing }
             check("pausing capture flips the state", !session.capturing)
             session.clearSession(confirm: { _ in true })
-            try? await Task.sleep(for: .milliseconds(50))
+            await settle { session.rows.isEmpty }
             check("clearing empties the session", session.rows.isEmpty && session.focused == nil)
 
             // M3: filters, saved filters, sidebar query, palette.
@@ -160,14 +160,14 @@ enum SelfTest {
             session.killMode = .respond503
             if let id = session.rows.first(where: { $0.seq == 51 })?.id {
                 session.kill(id)
-                try? await Task.sleep(for: .milliseconds(50))
+                await settle { session.rows.first { $0.seq == 51 }?.status == 503 }
                 check("Kill with Respond 503 shows the synthetic status", session.rows.first { $0.seq == 51 }?.status == 503)
             }
             session.killMode = .reset
             session.selection = Set(session.rows.filter { [41, 50].contains($0.seq) }.map(\.id))
             session.resumeSelected()
             check("bulk resume reports what it skipped", session.lastError == "Resumed 1 · skipped 1 (not paused)")
-            try? await Task.sleep(for: .milliseconds(500))
+            await settle { session.rows.first { $0.seq == 50 }?.state == .complete }
             check("bulk resume resumed the paused row", session.rows.first { $0.seq == 50 }?.state == .complete)
 
             // S-037/S-038: a draft diffs against the proxy's request; Apply & Resume sends mutate then resume.
@@ -183,12 +183,43 @@ enum SelfTest {
                 let parsed = try? RawHTTP.parse(RawHTTP.render(m))
                 check("the raw editor text round-trips", parsed?.headers == m.headers && parsed?.bodyText == "{}")
                 session.applyAndResume(paused.id)
-                try? await Task.sleep(for: .milliseconds(1_200))
+                await settle { session.rows.first { $0.id == paused.id }?.state == .complete }
                 let after = session.rows.first { $0.id == paused.id }
                 check("Apply & Resume mutated and resumed the flow", after?.state == .complete && after?.edited == true
                       && session.details[paused.id]?.request.header("x-debug") == "1" && session.editDrafts[paused.id] == nil,
                       "state=\(String(describing: after?.state)) edited=\(String(describing: after?.edited)) x-debug=\(session.details[paused.id]?.request.header("x-debug") ?? "nil") draft=\(session.editDrafts[paused.id] == nil) error=\(session.lastError ?? "-")")
             }
+
+            // S-062: two queries over one capture; the inspector follows the focused pane; Clear acts on the capture.
+            session.loadFixtures()
+            session.splitView = true
+            session.secondQuery.chip = .websocket
+            check("the second pane has its own chip", session.secondVisibleRows.count == 1 && session.visibleRows.count == 14)
+            session.focus(pane: 1, on: session.secondVisibleRows.first?.id)
+            check("selecting in pane 2 focuses it and the inspector", session.focusedPane == 1 && session.focusedRow?.kind == .websocket)
+            session.splitView = false
+            check("leaving split view returns focus to pane 1", session.focusedPane == 0)
+
+            // S-070: a burst of 500 rows in 10 batches of 50 appends — each batch's model update + a frame stays short.
+            session.loadFixtures()
+            var batches: [Duration] = []
+            for batch in 0..<10 {
+                let started = ContinuousClock.now
+                var appended = session.rows
+                for n in 0..<50 {
+                    appended.append(Fixtures.rows[n % Fixtures.rows.count].withID("burst-\(batch)-\(n)", seq: 100 + batch * 50 + n))
+                }
+                session.rows = appended
+                let model = ContinuousClock.now - started
+                await Task.yield()
+                try? await Task.sleep(for: .milliseconds(20))
+                batches.append(ContinuousClock.now - started - .milliseconds(20))
+                print("BURST batch \(batch): model \(Format.duration(model)) · with frame \(Format.duration(batches[batch]))")
+            }
+            let worst = batches.dropFirst().max() ?? .zero
+            check("500 appended rows keep every warm batch under 50 ms (worst \(Format.duration(worst)))", worst < .milliseconds(50), Format.duration(worst))
+            check("appends keep the selection", session.focusedRow?.seq == 50)
+            check("the list holds 514 rows", session.rows.count == 514)
 
             // S-040: rules validate, test against the list, persist, and change the armed notice.
             let rule = BreakpointRule(name: "login", url: "*/api/auth/*", method: "POST")
@@ -217,6 +248,15 @@ enum SelfTest {
 
             print(failures == 0 ? "SELFTEST PASS \(count) checks" : "SELFTEST FAIL \(failures) of \(count) checks")
             finish(code: failures == 0 ? 0 : 1)
+        }
+    }
+
+    /// Waits for an async action to land instead of sleeping a fixed time (the
+    /// fixture actions hop through Tasks; under load a fixed sleep races them).
+    private static func settle(timeout: Duration = .seconds(5), until done: () -> Bool) async {
+        let deadline = ContinuousClock.now + timeout
+        while !done(), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(25))
         }
     }
 

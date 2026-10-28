@@ -64,6 +64,11 @@ enum Snapshot {
                     scene.apply(to: session)
                     try? await Task.sleep(for: .seconds(0.8))
                     capture(to: "\(dir)/\(scene.rawValue)-\(mode).png")
+                    if scene == .detached, let inspector = NSApp.windows.first(where: { $0.title == "Inspector" }) {
+                        inspector.setContentSize(NSSize(width: 1100, height: 620))
+                        try? await Task.sleep(for: .seconds(0.4))
+                        capture(to: "\(dir)/\(scene.rawValue)-window-\(mode).png", window: inspector)
+                    }
                     SnapshotScene.reset(session)
                     try? await Task.sleep(for: .seconds(0.2))
                 }

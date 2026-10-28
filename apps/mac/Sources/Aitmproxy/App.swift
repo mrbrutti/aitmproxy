@@ -31,6 +31,16 @@ struct AitmproxyApp: App {
             FlowCommands(session: session)
         }
 
+        // S-061: the inspector in its own window; closing it returns to the previous layout.
+        Window("Inspector", id: "inspector") {
+            DetachedInspector()
+                .environment(session)
+                .themed()
+                .frame(minWidth: 720, minHeight: 360)
+        }
+        .defaultSize(width: 1100, height: 620)
+        .windowToolbarStyle(.unifiedCompact)
+
         Settings {
             SettingsView()
                 .environment(session)
@@ -155,6 +165,25 @@ struct FlowCommands: Commands {
                 .keyboardShortcut("b", modifiers: [.command, .shift])
             Button("Scope…") { if session.page == .scope { session.scopeSheetVisible = true } else { session.show(.scope) } }
                 .keyboardShortcut("o", modifiers: [.command, .shift])
+            Divider()
+            Button("Browser") { session.show(.browser) }
+                .keyboardShortcut("w", modifiers: [.command, .shift])
+            Button("New Browser Tab") { session.show(.browser); session.browser.newTab() }
+                .keyboardShortcut("t", modifiers: .command)
+            Divider()
+            Button("Overview") { session.show(.overview) }
+            Button("Connection Log") { session.show(.connections) }
+            Button("Certificate Authority…") { session.show(.ca) }
+            Button("Configuration…") { session.show(.config) }
+        }
+        CommandMenu("Agent") {
+            Picker("Policy", selection: Binding(get: { session.agentPolicy }, set: { session.activity.choose($0) })) {
+                ForEach(AgentPolicy.allCases, id: \.self) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.inline)
+            Divider()
+            Button(session.activityLogVisible ? "Hide Activity Log" : "Activity Log…") { session.activityLogVisible.toggle() }
+                .keyboardShortcut("l", modifiers: [.command, .shift])
         }
         CommandMenu("View") {
             Button(session.filterBarVisible ? "Hide Filter Bar" : "Show Filter Bar") { session.filterBarVisible.toggle() }
@@ -173,6 +202,11 @@ struct FlowCommands: Commands {
             Picker("Sort By", selection: Binding(get: { session.sort.key }, set: { session.sort = FlowSort(key: $0, ascending: true) })) {
                 ForEach(FlowSort.Key.allCases, id: \.self) { Text($0.title).tag($0) }
             }
+            Picker("Layout", selection: Binding(get: { session.layout }, set: { session.layout = $0 })) {
+                ForEach(InspectorLayout.allCases, id: \.self) { Text($0.title).tag($0) }
+            }
+            Toggle("Split View", isOn: Binding(get: { session.splitView }, set: { session.splitView = $0 }))
+                .keyboardShortcut("4", modifiers: [.command, .option])
             Picker("Density", selection: Binding(get: { session.density }, set: { session.density = $0 })) {
                 ForEach(Density.allCases) { Text($0.title).tag($0) }
             }

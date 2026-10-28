@@ -10,12 +10,18 @@ struct ChipBar: View {
 
     var body: some View {
         HStack(spacing: 2) {
-            ForEach(Array(ContentCategory.groups.enumerated()), id: \.offset) { index, group in
-                if index > 0 {
-                    Rectangle().fill(Tok.Line.border.color).frame(width: 1, height: Tok.Metric.chipSeparator).padding(.horizontal, Tok.Metric.gapTight)
-                }
-                ForEach(group) { chip in
-                    Chip(title: chip.title, on: selected == chip) { selected = chip }
+            // Chips never truncate; the row scrolls when the pane is narrow (split view).
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 2) {
+                    ForEach(Array(ContentCategory.groups.enumerated()), id: \.offset) { index, group in
+                        if index > 0 {
+                            Rectangle().fill(Tok.Line.border.color).frame(width: 1, height: Tok.Metric.chipSeparator).padding(.horizontal, Tok.Metric.gapTight)
+                        }
+                        ForEach(group) { chip in
+                            Chip(title: chip.title, on: selected == chip) { selected = chip }
+                                .fixedSize()
+                        }
+                    }
                 }
             }
             Spacer(minLength: Space.sm)

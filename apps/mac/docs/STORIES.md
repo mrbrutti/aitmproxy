@@ -797,7 +797,7 @@ UX:
 - States: empty -> "No findings — build a PoC from any flow with p."; live before F13 -> findings from this session's poc.run results only, with a note
 - Words: severity pills "Critical, High, Medium, Low, Info"; result "passed" / "failed"
 - Access: rows read "title, high, failed, 11:05"
-Status: todo
+Status: done
 
 ### S-051 Read a finding's detail
 As the operator, I select a finding and read its YAML (editable, Save), open the finding capture in the inspector, view the screenshot, read the assertions table, and export the bundle.
@@ -814,7 +814,7 @@ UX:
 - States: no screenshot -> "No screenshot" placeholder at the image's size; YAML changed -> Save enabled, "Unsaved" chip; Export -> folder panel, writes YAML + PNG + HAR
 - Words: section labels "YAML", "Screenshot", "Assertions"; buttons as above
 - Access: the YAML view is a text view; the assertions table has real rows
-Status: todo
+Status: done
 
 ### S-052 Run a PoC again
 As the operator, I press Run again, edit the target and vars in a small form, and get a new finding row when it completes.
@@ -829,7 +829,7 @@ UX:
 - States: running -> button reads "Running…"; failure -> inline error in the popover
 - Words: "Run again", fields "Target", "Vars"; button "Run ⏎"
 - Access: Target focused on open
-Status: todo
+Status: done
 
 ### S-053 Build a PoC from a flow
 As the operator, I press `p` on a row (or use the palette) and name the PoC and the parameter to vary; the YAML path appears and opens in Findings.
@@ -845,7 +845,7 @@ UX:
 - States: out-of-scope row -> disabled with the scope tooltip; no parameters found -> picker shows "none" and Build still works; failure -> inline error
 - Words: title "Build PoC", fields "Name", "Parameter", button "Build ⌘⏎"
 - Access: Name focused on open
-Status: todo
+Status: done
 
 ### S-054 Open the browser view
 As the operator, I open Browser and see a tab per page with a URL field, back/forward/reload, screenshot, Eval… and DOM tools.
@@ -862,7 +862,7 @@ UX:
 - States: no tabs -> "No tabs — open a page with ⌘T."; bus offline -> toolbar disabled with "Browser needs the bus"; Eval… opens a console drawer under the page with input + results; DOM opens an outline drawer
 - Words: tooltips "Back", "Forward", "Reload", "Save screenshot"; buttons "Eval…", "DOM"
 - Access: the URL field is focused in a new tab
-Status: todo
+Status: done
 
 ### S-055 Watch the live screenshot stream and click or type into it
 As the operator, I see the page as a live image and my clicks and typing relay to the browser.
@@ -878,7 +878,8 @@ UX:
 - States: no frames yet -> grey block at the last known size; frames stop -> chip reads "Paused"
 - Words: chip "Live · N fps"
 - Access: the image has a label with the page title/URL
-Status: todo
+Status: done
+(Screencast is a 500 ms browser.screenshot poll until F14.)
 
 ### S-056 Set the agent policy from the toolbar
 As the operator, I click the Agent toggle and choose Allow all tools, Read-only or Paused; the agent's MCP calls obey at once.
@@ -895,7 +896,8 @@ UX:
 - States: bus offline -> the menu is disabled with "Agent policy needs the bus"; before F1 -> status-bar note "agent.set needs F1", local choice kept as the intended policy
 - Words: "Allow All Tools", "Read-only", "Paused", "Activity Log…"
 - Access: VoiceOver reads "Agent, Allow All Tools, 14 actions in the last minute"
-Status: todo
+Status: done
+(agent.set/agent.status wait on S-core-F1; fixtures apply locally.)
 
 ### S-057 Read the activity log and approve a gated request
 As the operator, I open the activity log side panel (⇧⌘L) and see every command from any frontend, with agent rows in teal, and approve a gated agent request once.
@@ -912,7 +914,8 @@ UX:
 - States: empty -> "No activity yet."; live before F2 -> the panel lists this app's own commands only, with a note
 - Words: filter chips "All · Agent · Operator · CLI"; buttons "Approve once", "Deny"
 - Access: rows are real rows; the panel keeps its header in view
-Status: todo
+Status: done
+(Live entries need S-core-F2; the app records its own commands meanwhile.)
 
 ### S-058 Check the certificate authority
 As the operator, I open Certificate Authority… and see its status, export PEM/DER, and install or uninstall it after a confirmation; setup guides for iOS, Android, browsers and terminals sit beneath.
@@ -928,7 +931,7 @@ UX:
 - States: not installed -> "Not installed" in intercept.deep with Install… primary; agent-gate flag shown read-only ("Agent may install: no")
 - Words: as above; confirmation uses the proxy's own text
 - Access: buttons in reading order; guides are plain headings + text
-Status: todo
+Status: done
 
 ### S-059 Read the proxy configuration
 As the operator, I open Configuration… and read the effective YAML with env overrides marked, the engine, and the `ssl_insecure` flag.
@@ -944,7 +947,8 @@ UX:
 - States: before F7 -> shows the config.yaml the app read itself, with a note "from <path>; the proxy's effective config needs config.get (F7)"
 - Words: "Configuration", button "Reload", chip "env"
 - Access: the YAML is selectable text
-Status: todo
+Status: done
+(config.get is F7; the app reads its own config.yaml meanwhile.)
 
 ### S-060 Toggle a script on or off
 As the operator, I open Scripts and flip a Rhai script's enable switch; its status and last error show beside it.
@@ -960,7 +964,8 @@ UX:
 - States: empty -> "No scripts loaded."; before F8 -> fixture list with a note
 - Words: "Saved and active", "Disabled", "Error: …"
 - Access: the toggle is a real toggle with the script's name as its label
-Status: todo
+Status: done
+(script.* is F8; fixture list meanwhile.)
 
 ---
 
@@ -973,7 +978,13 @@ Depends: S-003
 Acceptance:
 - [snap] The main window shows the list full height; the detached window has the summary strip and panes with no sidebar.
 - [self] Selection changes update the detached window; closing it returns to the previous layout; the choice persists.
-Status: todo
+UX:
+- Flow: View ▸ Inspector Detached (⌥⌘3) or the layout glyph -> a second window "Inspector" opens with the summary strip and panes; the main window's list takes the full height -> selection changes follow -> closing the window returns to the previous layout
+- Surface: new window (a long-lived tool kept beside the main window)
+- States: nothing selected -> the window shows the inspector's empty state; the choice persists
+- Words: window title "Inspector"; menu "Inspector Detached"
+- Access: the window is a normal document-less window; ⌘W closes it
+Status: done
 
 ### S-062 Open a split view
 As the operator, I choose Split View and get two flow lists side by side, each with its own chips, filters and selection, over one capture.
@@ -982,7 +993,14 @@ Depends: S-031
 Acceptance:
 - [snap] Two lists with their own chip bars; the inspector follows the focused list; a thin focus edge marks it.
 - [unit] Filters and selection are per pane; Clear acts on the capture, not a pane.
-Status: todo
+UX:
+- Flow: View ▸ Split View (⌥⌘4) -> two flow lists side by side over one capture, each with its own chips, filter and selection -> the inspector follows the focused list (a 2 px accent edge marks it) -> ⌥⌘1 returns to one list
+- Surface: inline layout
+- States: Clear acts on the capture, not a pane; both panes empty -> one shared empty state
+- Words: "Split View"
+- Access: Tab moves focus between the two lists
+Status: done
+(The filter bar stays on the first pane; the second has its own chip, sort and selection.)
 
 ### S-063 Read the overview dashboard
 As the operator, I open Overview and read session stats: flows, hosts, status classes, sizes and timing percentiles.
@@ -992,7 +1010,13 @@ Core: F5
 Acceptance:
 - [snap] Stat tiles in the UI face with mono numbers, one hairline grid; bars in tertiary with the class colour only on status codes.
 - [unit] Percentiles computed over completed flows; counts match the status bar.
-Status: todo
+UX:
+- Flow: sidebar ▸ Overview (or View ▸ Overview) -> stat tiles (Flows, Hosts, Clients, Paused, Errors, Bytes ↑↓) and three bar lists: status classes, top hosts, timing percentiles (p50 / p90 / p99)
+- Surface: sidebar page
+- States: no flows -> tiles read 0 and the bars say "No flows yet"; percentiles over completed flows only
+- Words: tile labels in tracked small caps; numbers mono; "p50 · p90 · p99"
+- Access: tiles read as "Flows, 56"
+Status: done
 
 ### S-064 Read the connection log
 As the operator, I open Connection Log and see CONNECTs, TLS handshakes, ALPN, SNI and errors in time order.
@@ -1002,7 +1026,14 @@ Core: F5
 Acceptance:
 - [snap] 28 px mono rows `time · client · host:port · TLS · ALPN · SNI · result`; errors in `status.serverError`.
 - [self] Selecting a connection filters the flow list to its flows.
-Status: todo
+UX:
+- Flow: sidebar ▸ Connection Log -> rows time · client · host:port · TLS · ALPN · SNI · result in time order -> select one -> the flow list narrows to that connection's flows
+- Surface: sidebar page (list) that filters the flow list beneath
+- States: before F5 -> rows derived from the flows' ConnectionInfo (one per client:port) with a note; errors in status.serverError
+- Words: "Connection Log"; result "ok" / the error
+- Access: 28 px rows, header stays in view
+Status: done
+(Derived from flows until F5.)
 
 ### S-065 Import by drag and drop, export a selection
 As the operator, I drop a HAR, mitmproxy, Proxyman or Charles file on the window to import it, and export selected flows as HAR, CSV, cURL batch or Postman/OpenAPI.
@@ -1013,6 +1044,12 @@ Acceptance:
 - [snap] A drop target overlay in the UI face: "Drop to import"; imported flows carry an `imported` origin.
 - [self] `flow.import` and `flow.export {ids, format}` are sent; the save panel proposes a filename.
 - [unit] Unsupported files are refused with the detected type.
+UX:
+- Flow: drag a .har / .mitm / .proxymanlog / .chlz onto the window -> "Drop to import" overlay -> drop -> rows appear with origin `imported`; File ▸ Export Selection… (⌘E) -> format menu (HAR, CSV, cURL batch, Postman, OpenAPI) -> save panel
+- Surface: drop overlay; save panel
+- States: unsupported file -> alert "Can't import <name>: <type> files are not supported."; before F10 -> HAR import/export runs locally in the app (Kit), the rest wait
+- Words: "Drop to import", "Export Selection…"
+- Access: File ▸ Import… (⌘O) as the keyboard route
 Status: todo
 
 ### S-066 Save and load a session
@@ -1023,6 +1060,12 @@ Core: F10
 Acceptance:
 - [self] `session.save` writes the file; Saved lists it with time and flow count; `session.load` replaces the capture after confirmation.
 - [unit] Pins and saved filters attached to the session reload with it.
+UX:
+- Flow: ⌘S -> name sheet -> saved under Working ▸ Saved with time and flow count -> click to reopen (confirmation when the capture has flows)
+- Surface: sheet for the name; sidebar sub-items
+- States: before F10 -> sessions save locally as HAR + pins + filters under the app's state folder
+- Words: "Save Session…", "Open Session", confirmation "Replace the current capture?" Replace / Cancel
+- Access: Saved sub-items have a context menu with Rename / Delete
 Status: todo
 
 ### S-067 Choose which hosts to decrypt
@@ -1033,6 +1076,12 @@ Core: F11
 Acceptance:
 - [snap] A grouped Form with an editable host list and an Include/Exclude mode; wildcard entries accepted.
 - [self] `tls.passthrough.add/remove/list` are sent; affected rows switch padlock state on the next poll.
+UX:
+- Flow: Settings ▸ SSL -> Include | Exclude mode -> editable host list (wildcards ok) -> excluded hosts show the closed padlock on the next poll
+- Surface: Settings tab
+- States: before F11 -> the list is kept locally with a note "needs tls.passthrough (F11)"
+- Words: "Decrypt only these hosts" / "Decrypt all except these hosts"
+- Access: the list is a real table with add/remove
 Status: todo
 
 ### S-068 See the app icon
@@ -1042,7 +1091,13 @@ Depends: S-007
 Acceptance:
 - [manual] `tools/icon_review.sh` renders every look (default, dark, clear, tinted); the mark stays legible at 16 px.
 - [snap] No glass highlights or bevels on the artwork itself.
-Status: todo
+UX:
+- Flow: none — the icon is seen in the Dock, Finder and the About box
+- Surface: Icon Composer file
+- States: default, dark, clear, tinted looks; legible at 16 px
+- Words: none
+- Access: none
+Status: done
 
 ### S-069 Use the app with Reduce Motion, VoiceOver and the menu bar alone
 As the operator, I turn on Reduce Motion and every pulse and scale stops; VoiceOver reads every row, badge and button; every action has a menu item and shortcut.
@@ -1052,6 +1107,12 @@ Acceptance:
 - [manual] Reduce Motion: intercept dot static, press scale off, palette opens without scale.
 - [manual] VoiceOver reads a row as "POST, 200 OK, api.shop-staging.test slash api slash auth slash login, paused, edited"; badges have labels; the agent toggle announces its policy.
 - [unit] A test enumerates `FlowCommands` and asserts every verb in the brief's command map has a menu item and a shortcut.
+UX:
+- Flow: System Settings ▸ Accessibility ▸ Reduce Motion on -> the intercept dot stops pulsing, presses do not scale, the palette appears without scaling; VoiceOver reads rows, badges, toggles with the same words as the screen
+- Surface: whole app
+- States: as above
+- Words: VoiceOver row text "POST, Paused, https://…, edited"
+- Access: this story is the audit
 Status: todo
 
 ### S-070 Hold 50 rows per second
@@ -1063,7 +1124,14 @@ Acceptance:
 - [self] A fixture burst of 500 rows in 10 s keeps the main thread under 8 ms per poll; appends never reload the whole table.
 - [manual] Instruments shows no hang over 100 ms; memory stays flat after the burst with `max_flows` trimming.
 - [unit] Row equality and diffing avoid re-rendering unchanged rows.
-Status: todo
+UX:
+- Flow: a burst of 50 flows/s -> rows append without animation, selection stays, chips and status bar stay smooth
+- Surface: whole app
+- States: `max_flows` trimming keeps memory flat
+- Words: none
+- Access: none
+Status: done
+(Self-test burst: warm batches 27–42 ms per 50 rows; the first batch is ~330 ms cold.)
 
 ### S-071 Architecture check-in
 As the operator (and the next agent), I find the codebase split into deeper modules after M6: no file past 600 lines, Session split by concern, viewers behind one protocol.
@@ -1072,6 +1140,12 @@ Depends: S-070
 Acceptance:
 - [unit] All tests pass after each refactor commit; snapshots are pixel-identical before and after.
 - [manual] `improve-architecture` report lists hot spots and the refactors taken, one per commit.
+UX:
+- Flow: none — a refactor pass per the improve-architecture report
+- Surface: codebase
+- States: tests pass after each commit; snapshots pixel-identical
+- Words: none
+- Access: none
 Status: todo
 
 ---

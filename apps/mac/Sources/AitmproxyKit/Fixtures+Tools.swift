@@ -41,7 +41,7 @@ extension Fixtures {
             tool("browser.click", "Click an element.", [("selector", str("CSS selector."), true)]),
             tool("browser.type", "Type into an element.", [("selector", str("CSS selector."), true), ("text", str("Text to type."), true)]),
             tool("browser.screenshot", "Capture the page as PNG bytes."),
-            tool("browser.eval", "Evaluate JavaScript in the page.", [("script", str("JavaScript source."), true)]),
+            tool("browser.eval", "Evaluate JavaScript in the page.", [("expr", str("JavaScript expression."), true)]),
             tool("browser.get_dom", "Return the page's DOM as text."),
             tool("poc.build", "Build a PoC YAML from a flow.",
                  [("flow_id", flowID, true), ("name", str("PoC name."), true), ("param", str("The parameter to vary."), false)]),

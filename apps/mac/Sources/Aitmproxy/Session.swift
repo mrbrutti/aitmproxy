@@ -6,7 +6,7 @@ import Observation
 
 /// The sidebar's entries (foundation §2.6). Snapshot mode walks every case.
 enum SidebarPage: String, CaseIterable, Identifiable {
-    case pinned, saved, apps, domains, scope, findings, browser, scripts, agent
+    case pinned, saved, apps, domains, overview, connections, scope, findings, browser, scripts, agent, ca, config
 
     var id: String { rawValue }
 
@@ -16,11 +16,15 @@ enum SidebarPage: String, CaseIterable, Identifiable {
         case .saved: "Saved"
         case .apps: "Apps"
         case .domains: "Domains"
+        case .overview: "Overview"
+        case .connections: "Connection Log"
         case .scope: "Scope"
         case .findings: "Findings"
         case .browser: "Browser"
         case .scripts: "Scripts"
         case .agent: "Agent"
+        case .ca: "Certificate Authority"
+        case .config: "Configuration"
         }
     }
 
@@ -30,26 +34,49 @@ enum SidebarPage: String, CaseIterable, Identifiable {
         case .saved: "tray.full"
         case .apps: "app.badge"
         case .domains: Tok.Glyph.browser
+        case .overview: "chart.bar"
+        case .connections: "point.3.connected.trianglepath.dotted"
         case .scope: Tok.Glyph.scope
         case .findings: Tok.Glyph.poc
         case .browser: Tok.Glyph.browser
         case .scripts: "chevron.left.forwardslash.chevron.right"
         case .agent: Tok.Glyph.agent
+        case .ca: Tok.Glyph.lock
+        case .config: "doc.text"
         }
     }
 
     /// Pages that show the flow list (the rest open their own panel).
     var showsFlows: Bool {
         switch self {
-        case .pinned, .saved, .apps, .domains, .scope: true
-        case .findings, .browser, .scripts, .agent: false
+        case .pinned, .saved, .apps, .domains, .scope, .connections: true
+        case .overview, .findings, .browser, .scripts, .agent, .ca, .config: false
         }
     }
+
+    /// CA and Configuration open from the Proxy menu and the palette, not the sidebar list.
+    var isInSidebar: Bool { self != .ca && self != .config }
 }
 
-/// Where the inspector sits (Proxyman's layouts).
+/// Where the inspector sits (Proxyman's layouts): below, right, or in its own window.
 enum InspectorLayout: String, CaseIterable {
-    case horizontal, vertical
+    case horizontal, vertical, detached
+
+    var title: String {
+        switch self {
+        case .horizontal: "Inspector Below"
+        case .vertical: "Inspector Right"
+        case .detached: "Inspector Detached"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .horizontal: "rectangle.split.1x2"
+        case .vertical: Tok.Glyph.split
+        case .detached: "macwindow.on.rectangle"
+        }
+    }
 }
 
 /// The agent policy (foundation §4.8, F1).
@@ -72,17 +99,12 @@ enum BusState: Hashable {
     case failed(String)
 }
 
-/// A sidebar sub-item: one client or one host (S-013).
-enum FlowGroup: Hashable {
-    case host(String)
-    case client(String)
-}
-
 /// Everything the shell shows. One object, shared through the environment.
 @Observable
 final class Session {
     var rows: [FlowRow] = [] {
         didSet {
+            rowsVersion &+= 1
             // Auto-select follows the newest flow, but never steals a paused row being edited (S-015).
             guard autoSelect, rows.count > oldValue.count, let last = rows.last else { return }
             if focusedRow?.state == .paused { return }
@@ -91,13 +113,26 @@ final class Session {
     }
     /// The sidebar sub-item narrowing the list, if any.
     var group: FlowGroup?
-    var details: [FlowID: FlowDetail] = [:]
+    var details: [FlowID: FlowDetail] = [:] {
+        didSet { rowsVersion &+= 1 }
+    }
     var selection: Set<FlowID> = []
     /// The flow the inspector shows: the last clicked row.
     var focused: FlowID?
     var page: SidebarPage? = .apps
     var chip: ContentCategory = .all
-    var layout: InspectorLayout = .horizontal
+    var layout: InspectorLayout = Store.isOverridden ? .horizontal
+        : InspectorLayout(rawValue: UserDefaults.standard.string(forKey: "layout") ?? "") ?? .horizontal {
+        didSet {
+            if oldValue != .detached { attachedLayout = oldValue }
+            if !Store.isOverridden { UserDefaults.standard.set(layout.rawValue, forKey: "layout") }
+            if layout == .detached { detachRequestTick += 1 }
+        }
+    }
+    /// The layout to return to when the detached window closes.
+    var attachedLayout: InspectorLayout = .horizontal
+    /// Bumped when the inspector should open in its own window (the shell owns `openWindow`).
+    var detachRequestTick = 0
     var requestTab: RequestTab = .raw
     var responseTab: ResponseTab = .body
     var sort: FlowSort = .captureOrder
@@ -125,7 +160,8 @@ final class Session {
     var filterAdvanced = false
     var filterError: FilterParseError?
     @ObservationIgnored private var compiledFilter: CompiledFilter?
-    @ObservationIgnored private var filterExpression: FilterExpression = .matchAll
+    /// The active filter expression (observed, so the list re-queries on change).
+    private(set) var filterExpression: FilterExpression = .matchAll
     var savedFilters: [SavedFilter] = []
     @ObservationIgnored private lazy var savedFilterStore = SavedFilterStore(stateDirectory: Store.url)
     /// The sidebar's quick filter (⌘⇧F).
@@ -226,10 +262,21 @@ final class Session {
     var recentPaletteIDs: [String] = UserDefaults.standard.stringArray(forKey: "palette.recent") ?? []
     /// A generic bus call for the palette; nil until a bus is attached.
     @ObservationIgnored var commandRunner: ((String, [String: JSONValue]) async throws -> JSONValue)?
+    /// Every command this app runs, for the activity log (S-057): name, args, result text or nil on success.
+    @ObservationIgnored var commandRecorder: ((String, [String: JSONValue], String?) -> Void)?
+    /// Unsolicited bus notifications (`notifications/aitm/*`, F2/F4), fed by BusService.
+    @ObservationIgnored var notificationSink: ((String, JSONValue) -> Void)?
 
     func runCommand(_ name: String, _ args: [String: JSONValue]) async throws -> JSONValue {
         guard let commandRunner else { throw BusError.disconnected }
-        return try await commandRunner(name, args)
+        do {
+            let value = try await commandRunner(name, args)
+            commandRecorder?(name, args, nil)
+            return value
+        } catch {
+            commandRecorder?(name, args, BusService.describe(error))
+            throw error
+        }
     }
 
     func rememberPaletteUse(_ item: PaletteItem) {
@@ -254,12 +301,18 @@ final class Session {
             ("Filter Bar", "Stack filters over the list", "⌘F", { [self] in filterBarVisible.toggle() }),
             ("Inspector Below", "Horizontal layout", "⌥⌘1", { [self] in layout = .horizontal }),
             ("Inspector Right", "Vertical layout", "⌥⌘2", { [self] in layout = .vertical }),
+            ("Inspector Detached", "The inspector in its own window", "⌥⌘3", { [self] in layout = .detached }),
+            (splitView ? "Single List" : "Split View", "Two lists over one capture", "⌥⌘4", { [self] in splitView.toggle() }),
         ]
         for (title, subtitle, shortcut, action) in locals {
             all.append(PaletteItem(id: "local:\(title)", section: .local, title: title, subtitle: subtitle, shortcut: shortcut, method: nil, kind: .local(action)))
         }
         let setup: [(String, String, () -> Void)] = [
-            ("Install CA…", "Trust the proxy's certificate authority (asks for confirmation)", { [self] in lastError = "CA install arrives with the CA panel (M5)" }),
+            ("Certificate Authority…", "Status, export, install the proxy's CA", { [self] in show(.ca) }),
+            ("Configuration…", "The proxy's effective config", { [self] in show(.config) }),
+            ("Overview", "Session statistics", { [self] in show(.overview) }),
+            ("Connection Log", "CONNECTs, TLS, ALPN, SNI", { [self] in show(.connections) }),
+            ("Activity Log", "Every command from every frontend", { [self] in activityLogVisible.toggle() }),
             ("Add Host to Scope…", "Authorise a host for testing", { [self] in scopeSheetVisible = true }),
             ("Open Browser", "Show the embedded browser", { [self] in show(.browser) }),
         ]
@@ -352,31 +405,67 @@ final class Session {
     var focusedRow: FlowRow? { rows.first { $0.id == focused } }
     var focusedDetail: FlowDetail? { focused.flatMap { details[$0] } }
 
-    /// Rows after the sidebar page, the chip and the sort (the filter bar stacks on top later).
-    var visibleRows: [FlowRow] {
-        sort.sorted(filteredRows)
+    /// The list's query: scope page, group, chip, filter expression, sort (one Kit value, S-062 ready).
+    var query: FlowQuery {
+        FlowQuery(inScopeOnly: page == .scope, group: group, chip: chip, filter: filterExpression, sort: sort)
     }
 
-    private var filteredRows: [FlowRow] {
-        var out = rows
-        if page == .scope { out = out.filter(\.inScope) }
-        if let compiledFilter {
-            out = out.filter { compiledFilter.matches(FilterSubject(row: $0, detail: details[$0.id])) }
+    /// Rows after the query. Compiled once per query change, not per access.
+    var visibleRows: [FlowRow] {
+        let q = query
+        if cachedQuery != q || cachedRows == nil || cachedRowsVersion != rowsVersion {
+            cachedQuery = q
+            cachedCompiled = q.compiled()
+            cachedRows = cachedCompiled?.apply(rows, details: details)
+            cachedRowsVersion = rowsVersion
         }
-        switch group {
-        case .host(let host)?: out = out.filter { $0.authority == host }
-        case .client(let name)?: out = out.filter { $0.client?.name == name }
-        case nil: break
-        }
-        if chip != .all {
-            out = out.filter { row in
-                let detail = details[row.id]
-                return chip.matches(row: row, contentType: detail?.response?.contentType ?? detail?.request.contentType,
-                                    httpVersion: detail?.connection.httpVersion)
-            }
-        }
-        return out
+        return cachedRows ?? rows
     }
+
+    // MARK: Panels (M5): each panel owns its state; the session holds one of each.
+
+    @ObservationIgnored lazy var poc = PocPanelState(session: self)
+    @ObservationIgnored lazy var browser = BrowserState(session: self)
+    @ObservationIgnored lazy var activity = ActivityState(session: self)
+    var activityLogVisible = false
+    /// The flow a Build PoC sheet is for (S-053).
+    var buildPoCFlowID: FlowID?
+
+    /// Routes the app's own commands and the bus's notifications into the activity log (S-057).
+    func attachActivityHooks() {
+        commandRecorder = { [weak self] name, args, failure in
+            self?.activity.record(command: name, args: args, result: failure.map { .error($0) } ?? .ok)
+        }
+        notificationSink = { [weak self] method, params in
+            if method == "notifications/aitm/agent" { self?.activity.ingest(params) }
+        }
+    }
+
+    // MARK: Split view (S-062): a second list over the same capture.
+
+    var splitView = false {
+        didSet { if !splitView { focusedPane = 0 } }
+    }
+    /// The second pane's chip, group and sort; the filter bar stays on the first pane.
+    var secondQuery = FlowQuery()
+    var secondSelection: Set<FlowID> = []
+    /// Which pane the inspector follows (0 or 1).
+    var focusedPane = 0
+
+    var secondVisibleRows: [FlowRow] { secondQuery.apply(rows, details: details) }
+
+    /// Selecting in a pane makes it the focused one and leads the inspector.
+    func focus(pane: Int, on id: FlowID?) {
+        focusedPane = pane
+        focused = id
+    }
+
+    @ObservationIgnored private var cachedQuery: FlowQuery?
+    @ObservationIgnored private var cachedCompiled: FlowQuery.Compiled?
+    @ObservationIgnored private var cachedRows: [FlowRow]?
+    @ObservationIgnored private var cachedRowsVersion = 0
+    /// Bumped whenever `rows` or `details` change, so the cache knows.
+    @ObservationIgnored private var rowsVersion = 0
 
     /// Clients and hosts for the sidebar's Apps / Domains groups, most flows first.
     var clients: [(ClientInfo, Int)] {
@@ -636,7 +725,7 @@ final class Session {
             if row.state == .paused { editPaused(id) } else { lastError = "Only a paused flow can be edited" }
         case .mark(let color): mark(id, color)
         case .comment: select(id)
-        case .buildPoC: lastError = "Build PoC opens with the PoC panel (M5)"
+        case .buildPoC: buildPoCFlowID = id
         case .pinHost: isPinned(.host(row.authority)) ? unpin(.host(row.authority)) : pin(.host(row.authority))
         case .copyURL:
             NSPasteboard.general.clearContents()
@@ -674,5 +763,7 @@ final class Session {
         downBytesPerSecond = 3_000
         bus = .connected("127.0.0.1:9090")
         select(Fixtures.rows[9].id)
+        poc.load()
+        findingsCount = poc.findings.count
     }
 }

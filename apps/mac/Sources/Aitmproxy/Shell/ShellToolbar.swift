@@ -82,12 +82,12 @@ struct AgentToggle: View {
     var body: some View {
         @Bindable var session = session
         Menu {
-            Picker("Agent policy", selection: $session.agentPolicy) {
+            Picker("Agent policy", selection: Binding(get: { session.agentPolicy }, set: { session.activity.choose($0) })) {
                 ForEach(AgentPolicy.allCases, id: \.self) { Text($0.title).tag($0) }
             }
             .pickerStyle(.inline)
             Divider()
-            Button("Activity Log…") {}
+            Button("Activity Log…") { session.activityLogVisible.toggle() }
         } label: {
             HStack(spacing: Space.sm) {
                 Capsule()
@@ -123,8 +123,19 @@ struct LayoutPicker: View {
 
     var body: some View {
         HStack(spacing: Space.xs) {
-            layoutButton(.horizontal, symbol: "rectangle.split.1x2", help: "Inspector below")
-            layoutButton(.vertical, symbol: Tok.Glyph.split, help: "Inspector right")
+            ForEach(InspectorLayout.allCases, id: \.self) { layout in
+                layoutButton(layout, symbol: layout.symbol, help: layout.title)
+            }
+            Button { session.splitView.toggle() } label: {
+                Image(systemName: "square.split.2x1")
+                    .font(.system(size: 15, weight: .regular))
+                    .foregroundStyle(session.splitView ? Tok.Ink.primary.color : Tok.Ink.tertiary.color)
+                    .frame(width: Tok.Size.control, height: Tok.Size.control)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(session.splitView ? "Single list" : "Split view (⌥⌘4)")
+            .accessibilityAddTraits(session.splitView ? .isSelected : [])
         }
     }
 

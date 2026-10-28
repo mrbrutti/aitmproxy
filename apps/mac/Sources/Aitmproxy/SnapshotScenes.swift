@@ -1,4 +1,5 @@
 import AitmproxyKit
+import AppKit
 import Foundation
 
 /// States that are not sidebar pages but have a `Screens:` entry in
@@ -15,6 +16,11 @@ enum SnapshotScene: String, CaseIterable {
     case rulesSheet = "rules-sheet"
     case editPaused = "edit-paused"
     case scopeSheet = "scope-sheet"
+    case detached
+    case split
+    case activityLog = "activity-log"
+    case buildPoC = "build-poc"
+    case findingDetail = "finding-detail"
     case composeSheet = "compose-sheet"
     case inspectHeaders = "inspect-headers"
     case inspectCookies = "inspect-cookies"
@@ -63,6 +69,22 @@ enum SnapshotScene: String, CaseIterable {
             }
         case .scopeSheet:
             session.scopeSheetVisible = true
+        case .detached:
+            session.layout = .detached
+        case .activityLog:
+            session.activityLogVisible = true
+        case .buildPoC:
+            session.select(Fixtures.rows[7].id)
+            session.buildPoCFlowID = Fixtures.rows[7].id
+        case .findingDetail:
+            session.page = .findings
+            session.poc.load()
+            session.poc.select(session.poc.findings.first?.id)
+        case .split:
+            session.splitView = true
+            session.secondQuery.chip = .json
+            session.secondSelection = [Fixtures.rows[0].id]
+            session.focus(pane: 1, on: Fixtures.rows[0].id)
         case .rulesSheet:
             session.breakpointRules = BreakpointRules(rules: [
                 BreakpointRule(name: "Login requests", url: "*/api/auth/*", method: "POST", onResponse: true, flag: .red),
@@ -136,6 +158,15 @@ enum SnapshotScene: String, CaseIterable {
         session.clearFilter()
         session.sidebarQuery = ""
         session.paletteVisible = false
+        if session.layout == .detached {
+            NSApp.windows.first { $0.title == "Inspector" }?.close()
+            session.layout = .horizontal
+        }
+        session.activityLogVisible = false
+        session.buildPoCFlowID = nil
+        session.splitView = false
+        session.secondQuery = FlowQuery()
+        session.secondSelection = []
         session.rulesVisible = false
         session.scopeSheetVisible = false
         session.composeVisible = false

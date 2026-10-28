@@ -9,7 +9,7 @@ cd "$here" || exit 1
 echo "== unit tests"
 swift test --scratch-path ~/Library/Developer/Aitmproxy/test-build 2>&1 | grep -E 'Test run|failed|error:' | tail -6
 echo "== self-test"
-tools/selftest.sh 2>&1 | grep -E 'FAIL|SELFTEST'
+tools/selftest.sh 2>&1 | grep -E 'FAIL|SELFTEST' | grep -v '^PASS' || echo 'SELFTEST: no output'
 echo "== snapshots ($pages)"
 APP_SNAPSHOT_PAGES=$pages tools/snap.sh 2>&1 | grep -E 'SNAPSHOT done|error|fallback'
 echo "== parts gallery"

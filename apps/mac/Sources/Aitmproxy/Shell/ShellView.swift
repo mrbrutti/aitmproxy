@@ -6,6 +6,7 @@ import SwiftUI
 struct ShellView: View {
     @Environment(Session.self) private var session
     @Environment(\.openSettings) private var openSettings
+    @Environment(\.openWindow) private var openWindow
     @State private var sidebarVisible = true
     @State private var bus: BusService?
 
@@ -47,7 +48,10 @@ struct ShellView: View {
             ScopeSheet().environment(session).themed()
         }
         .toolbar { ShellToolbar(sidebarVisible: $sidebarVisible) }
+        .onChange(of: session.detachRequestTick) { openWindow(id: "inspector") }
         .task {
+            session.attachActivityHooks()
+            if session.layout == .detached { openWindow(id: "inspector") }
             if Store.usesFixtures {
                 session.loadFixtures()
             } else {
@@ -68,13 +72,46 @@ struct MainView: View {
 
     var body: some View {
         @Bindable var session = session
-        VStack(spacing: 0) {
-            ChipBar(selected: $session.chip, filterActive: session.filterBarVisible) { session.filterBarVisible.toggle() }
+        HStack(spacing: 0) {
+            content
+            if session.activityLogVisible {
+                VRule()
+                ActivityLogPanel(state: session.activity).frame(width: ActivityLogPanel.panelWidth)
+            }
+        }
+        .sheet(item: Binding(get: { session.buildPoCFlowID.map(BuildPoCTarget.init) }, set: { session.buildPoCFlowID = $0?.id })) { target in
+            BuildPoCSheet(flowID: target.id).environment(session).themed()
+        }
+    }
+
+    /// The page's own panel, or the flow list with the inspector.
+    @ViewBuilder private var content: some View {
+        switch session.page ?? .apps {
+        case .overview: OverviewPanel()
+        case .findings: FindingsPanel(state: session.poc)
+        case .browser: BrowserPanel(state: session.browser)
+        case .scripts: ScriptsPanel()
+        case .agent: AgentPanel(state: session.activity)
+        case .ca: CAPanel()
+        case .config: ConfigPanel()
+        default: listAndInspector
+        }
+    }
+
+    private var listAndInspector: some View {
+        @Bindable var session = session
+        return VStack(spacing: 0) {
+            if !session.splitView {
+                ChipBar(selected: $session.chip, filterActive: session.filterBarVisible) { session.filterBarVisible.toggle() }
+            }
             if session.filterBarVisible {
                 FilterBar()
             }
             // A real NSSplitView: draggable, remembered; the inspector takes 45% until the operator moves it.
-            if session.layout == .vertical {
+            if session.layout == .detached {
+                flows
+                if session.interceptArmed { InterceptBar() }
+            } else if session.layout == .vertical {
                 SplitPane(axis: .vertical, firstMinimum: 420, secondMinimum: 420, initialSecondFraction: 0.5,
                           autosaveName: "main.vertical") { flows } second: { inspector }
             } else {
@@ -89,14 +126,53 @@ struct MainView: View {
             if session.page == .scope {
                 ScopePanel()
                 Rule()
+            } else if session.page == .connections {
+                ConnectionLogPanel().frame(height: 280)
+                Rule()
             } else if !Store.usesFixtures, session.scopeHosts.isEmpty, case .connected = session.bus {
                 ScopeBanner()
                 Rule()
             }
-            flowTable
+            if session.splitView {
+                // Two lists, own chips and selection, one capture; the focused pane carries a 2 px accent edge.
+                HStack(spacing: 0) {
+                    listPane(0)
+                    VRule()
+                    listPane(1)
+                }
+            } else {
+                flowTable
+            }
         }
         .environment(session)
         .themed()
+    }
+
+    private func listPane(_ pane: Int) -> some View {
+        @Bindable var session = session
+        return VStack(spacing: 0) {
+            if pane == 0 {
+                ChipBar(selected: $session.chip, filterActive: session.filterBarVisible) { session.filterBarVisible.toggle() }
+            } else {
+                ChipBar(selected: $session.secondQuery.chip)
+            }
+            if pane == 0 {
+                flowTable
+            } else {
+                FlowTableView(rows: session.secondVisibleRows, selection: $session.secondSelection, sort: $session.secondQuery.sort,
+                              density: session.density, layoutURL: nil,
+                              isPinned: { session.isPinned(.host($0)) },
+                              onComment: { id, text in session.comment(id, text) },
+                              onFocus: { id in session.focus(pane: 1, on: id) },
+                              onAction: { action, id in session.perform(action, on: id) },
+                              onToggleIntercept: { session.arm(!session.interceptArmed) },
+                              onCompose: { session.openCompose() })
+            }
+        }
+        .overlay(alignment: .top) {
+            Rectangle().fill(session.focusedPane == pane ? Palette.accent : .clear).frame(height: 2)
+        }
+        .frame(maxWidth: .infinity)
     }
 
     private var flowTable: some View {
@@ -105,7 +181,7 @@ struct MainView: View {
                              density: session.density, layoutURL: session.columnsURL,
                              isPinned: { session.isPinned(.host($0)) },
                              onComment: { id, text in session.comment(id, text) },
-                             onFocus: { id in session.focused = id },
+                             onFocus: { id in session.focus(pane: 0, on: id) },
                              onAction: { action, id in session.perform(action, on: id) },
                              onToggleIntercept: { session.arm(!session.interceptArmed) },
                              onCompose: { session.openCompose() })
@@ -128,6 +204,11 @@ struct MainView: View {
         .environment(session)
         .themed()
     }
+}
+
+/// `sheet(item:)` wants an Identifiable; a flow id is one.
+struct BuildPoCTarget: Identifiable {
+    let id: FlowID
 }
 
 /// "No flows yet — point a client at 127.0.0.1:8080 or open the browser." (foundation §2.8)
