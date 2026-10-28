@@ -26,6 +26,7 @@ use aitm_core::{
 use arc_swap::ArcSwap;
 use rhai::{CallFnOptions, Dynamic, Engine, EvalAltResult, Scope, AST};
 
+use crate::command::ScriptRegHandle;
 use crate::config::{RhaiConfig, RhaiLimits, ScriptMeta};
 use crate::engine::AbortKind;
 use crate::error::ScriptError;
@@ -219,10 +220,23 @@ impl Plugin for ScriptPlugin {
         &self.meta.name
     }
 
-    /// The script's `load(reg)` runs through the command/option bridge
-    /// (plan Task 10, `command.rs`); until that bridge exists there is nothing
-    /// to hand the script, so a script registers no commands or options yet.
-    fn load(&mut self, _reg: &mut Registry) {}
+    /// Run the script's `load(reg)` through the command/option bridge
+    /// (`command.rs`), so what it registers lands in the platform registry the
+    /// frontends read — a script command is an MCP tool and a CLI subcommand
+    /// with no special casing (spec §9).
+    ///
+    /// A `load` that throws is logged and installs nothing; the script keeps
+    /// its hooks, because a broken registration is no reason to drop a working
+    /// `on_request` (spec §8's error policy, applied to load).
+    fn load(&mut self, reg: &mut Registry) {
+        let ast = self.ast.load_full();
+        let mut handle = ScriptRegHandle::new(reg).with_options(self.options.clone());
+        if let Err(err) = handle.run_load(&self.engine, &ast) {
+            tracing::error!(target: SCRIPT_TARGET, script = %self.meta.name, "{err}");
+        }
+        // Defaults the script declared join the options its hooks read.
+        self.options = handle.into_options();
+    }
 
     fn on_event(&mut self, ev: &Event, ctx: &mut FlowCtx<'_>) -> Verdict {
         let Some(hook) = hook_for(ev) else {

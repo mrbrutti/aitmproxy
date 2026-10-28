@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use rhai::{Dynamic, Engine, ParseError, ParseErrorType, AST};
 
+use crate::command::register_reg_api;
 use crate::config::{RhaiConfig, ScriptEntry, ScriptMeta};
 use crate::engine::build_engine;
 use crate::error::ScriptError;
@@ -34,6 +35,7 @@ use crate::host_core::{
 };
 use crate::host_net::{BrowserCapability, HttpCapability, ScopeCapability, StoreCapability};
 use crate::plugin::{ErrorSink, ScriptPlugin};
+use crate::poc_step::VarsCapability;
 use crate::prelude::register_prelude;
 
 /// The script `API` contract this build supports: M3's first and only one.
@@ -77,6 +79,9 @@ impl RhaiLoader {
     pub fn new(cfg: RhaiConfig, services: ScriptServices) -> Result<Self, ScriptError> {
         let mut engine = build_engine(&cfg.limits, cfg.hook_timeout);
         register_flow_api(&mut engine);
+        // The `load(reg)` bridge: without it a script's `reg.add_command` is an
+        // unknown function and no script could register anything (Task 10).
+        register_reg_api(&mut engine);
         for capability in m3_capabilities() {
             tracing::debug!(
                 target: LOADER_TARGET,
@@ -104,6 +109,12 @@ impl RhaiLoader {
     /// binds the chain into it once built.
     pub fn error_sink(&self) -> Arc<ErrorSink> {
         Arc::clone(&self.errors)
+    }
+
+    /// The services the host surface was registered against, so the PoC step
+    /// executor is built from the same handles as the plugins.
+    pub fn services(&self) -> &ScriptServices {
+        &self.services
     }
 
     /// Compile every enabled entry in `cfg.scripts`, in declaration order.
@@ -187,7 +198,11 @@ impl RhaiLoader {
 
 /// The providers M3 ships (spec §6a). A namespace missing from this list does
 /// not exist for scripts.
-fn m3_capabilities() -> [Arc<dyn ScriptCapability>; 6] {
+///
+/// `vars` is here rather than in the PoC executor because the engine is built
+/// once and shared: its verbs must exist on the engine before any step runs,
+/// even though the handle itself is pushed per step.
+fn m3_capabilities() -> [Arc<dyn ScriptCapability>; 7] {
     [
         Arc::new(LogCapability),
         Arc::new(FindingCapability),
@@ -195,6 +210,7 @@ fn m3_capabilities() -> [Arc<dyn ScriptCapability>; 6] {
         Arc::new(BrowserCapability),
         Arc::new(StoreCapability),
         Arc::new(ScopeCapability),
+        Arc::new(VarsCapability),
     ]
 }
 
