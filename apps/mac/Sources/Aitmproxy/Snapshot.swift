@@ -30,6 +30,12 @@ enum Snapshot {
                                         IOPMAssertionLevel(kIOPMAssertionLevelOn), "Snapshots" as CFString, &awake)
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
             try? await Task.sleep(for: .seconds(1.5))
+            // Deterministic frames: pages at the default 1440×900, the gallery at the whole screen.
+            if let window = NSApp.windows.first(where: { $0.canBecomeMain && !$0.isSheet }) {
+                let frame = NSRect(x: window.frame.minX, y: window.frame.maxY - 900, width: 1440, height: 900)
+                window.setFrame(frame, display: true)
+                window.center()
+            }
             if env["APP_KIT_GALLERY"] == "1" {
                 // The parts gallery is one tall page: give it the whole screen, then one shot per mode.
                 if let window = NSApp.windows.first(where: { $0.canBecomeMain && !$0.isSheet }),
@@ -51,6 +57,14 @@ enum Snapshot {
                     session.page = page
                     try? await Task.sleep(for: .seconds(0.8))
                     capture(to: "\(dir)/\(page.rawValue)-\(mode).png")
+                }
+                // Panels, bars and selections (docs/STORIES.md `Screens:`), each applied then reset.
+                for scene in SnapshotScene.allCases where only?.contains(scene.rawValue) ?? true {
+                    scene.apply(to: session)
+                    try? await Task.sleep(for: .seconds(0.8))
+                    capture(to: "\(dir)/\(scene.rawValue)-\(mode).png")
+                    SnapshotScene.reset(session)
+                    try? await Task.sleep(for: .seconds(0.2))
                 }
             }
             if only == nil || only?.contains("settings") == true {

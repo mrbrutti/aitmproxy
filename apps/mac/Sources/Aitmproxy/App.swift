@@ -107,11 +107,11 @@ struct FlowCommands: Commands {
             }
             .keyboardShortcut(.return, modifiers: .command)
             .disabled(session.interceptTarget == nil)
-            Button("Kill") { if let target = session.interceptTarget { session.kill(target.id) } }
+            Button("Kill") { if let target = session.interceptTarget { session.perform(.kill, on: target.id) } }
                 .keyboardShortcut("\\", modifiers: .command)
                 .disabled(session.interceptTarget == nil)
             Divider()
-            Button("Replay") { if let id = session.focused { session.replay(id) } }
+            Button("Replay") { if let id = session.focused { session.perform(.replay, on: id) } }
                 .keyboardShortcut("r", modifiers: [])
                 .disabled(session.focused == nil)
             Button(session.focusedRow.map { $0.state == .paused || $0.state == .pending } == true ? "Kill" : "Delete") {
@@ -125,10 +125,10 @@ struct FlowCommands: Commands {
             Divider()
             Menu("Mark") {
                 ForEach(MarkColor.allCases, id: \.self) { color in
-                    Button(color.title) { if let id = session.focused { session.mark(id, color) } }
+                    Button(color.title) { if let id = session.focused { session.perform(.mark(color), on: id) } }
                 }
                 Divider()
-                Button("Clear Mark") { if let id = session.focused { session.mark(id, nil) } }
+                Button("Clear Mark") { if let id = session.focused { session.perform(.mark(nil), on: id) } }
             }
             .disabled(session.focused == nil)
             Button("Comment…") { if let id = session.focused { session.perform(.comment, on: id) } }
@@ -141,12 +141,15 @@ struct FlowCommands: Commands {
             .disabled(session.focused == nil)
         }
         CommandMenu("View") {
-            Button("Filter Bar") {}
+            Button(session.filterBarVisible ? "Hide Filter Bar" : "Show Filter Bar") { session.filterBarVisible.toggle() }
                 .keyboardShortcut("f", modifiers: .command)
-            Button("Sidebar Filter") {}
+            Button("Sidebar Filter") { session.sidebarFilterFocusTick += 1 }
                 .keyboardShortcut("f", modifiers: [.command, .shift])
-            Button("Command Palette") {}
-                .keyboardShortcut("k", modifiers: .command)
+            Button("Command Palette") {
+                session.paletteOpenedByKeyboard = true
+                session.paletteVisible.toggle()
+            }
+            .keyboardShortcut("k", modifiers: .command)
             Divider()
             Picker("Sort By", selection: Binding(get: { session.sort.key }, set: { session.sort = FlowSort(key: $0, ascending: true) })) {
                 ForEach(FlowSort.Key.allCases, id: \.self) { Text($0.title).tag($0) }

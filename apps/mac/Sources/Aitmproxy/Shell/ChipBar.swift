@@ -5,6 +5,8 @@ import SwiftUI
 /// fill, 500 weight); the rest plain secondary. `⌘1…9` select.
 struct ChipBar: View {
     @Binding var selected: ContentCategory
+    var filterActive = false
+    var onFilters: () -> Void = {}
 
     var body: some View {
         HStack(spacing: 2) {
@@ -17,13 +19,13 @@ struct ChipBar: View {
                 }
             }
             Spacer(minLength: Space.sm)
-            Button {} label: {
+            Button(action: onFilters) {
                 HStack(spacing: 2) {
                     Text("Filters")
-                    Image(systemName: "chevron.down").font(.system(size: 9, weight: .medium))
+                    Image(systemName: filterActive ? "chevron.up" : "chevron.down").font(.system(size: 9, weight: .medium))
                 }
-                .font(Tok.Face.ui(Tok.Typography.Size.sm))
-                .foregroundStyle(Tok.Ink.tertiary.color)
+                .font(Tok.Face.ui(Tok.Typography.Size.sm, filterActive ? .medium : .regular))
+                .foregroundStyle(filterActive ? Tok.Ink.primary.color : Tok.Ink.tertiary.color)
                 .padding(.horizontal, Space.sm)
                 .frame(height: Tok.Metric.chip)
             }

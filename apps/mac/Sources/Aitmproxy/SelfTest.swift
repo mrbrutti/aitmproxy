@@ -110,6 +110,45 @@ enum SelfTest {
             try? await Task.sleep(for: .milliseconds(50))
             check("clearing empties the session", session.rows.isEmpty && session.focused == nil)
 
+            // M3: filters, saved filters, sidebar query, palette.
+            session.loadFixtures()
+            session.filterStack = FilterStack(rows: [FilterRow(.method, .equals, "POST")])
+            check("a Method = POST row narrows to the two POSTs", session.visibleRows.map(\.seq) == [44, 50])
+            session.filterStack = FilterStack(rows: [FilterRow(.method, .equals, "POST"), FilterRow(.status, .equals, "502")], combinator: .or)
+            check("two rows under Any widen the list", session.visibleRows.map(\.seq) == [44, 45, 50])
+            session.filterStack.combinator = .and
+            check("switching to All narrows it", session.visibleRows.isEmpty)
+            session.filterStack = FilterStack(rows: [FilterRow(.url, .regex, "(")])
+            check("an invalid regex marks the row and matches nothing", session.filterStack.rows[0].validationError != nil && session.visibleRows.isEmpty)
+            session.clearFilter()
+            session.setFilterAdvanced(true)
+            session.filterText = "~m POST & ~c 2"
+            check("the Advanced text filters", session.filterError == nil && session.visibleRows.map(\.seq) == [44])
+            session.filterText = "~m POST &"
+            check("a parse error reports an offset", session.filterError != nil && session.visibleRows.count == 14)
+            session.setFilterAdvanced(false)
+            session.clearFilter()
+            session.filterStack = FilterStack(rows: [FilterRow(.host, .contains, "cdn")])
+            session.saveFilter(named: "cdn only")
+            session.clearFilter()
+            check("saving a filter persists it", (try? SavedFilterStore(stateDirectory: Store.url).load())?.first?.name == "cdn only")
+            if let saved = session.savedFilters.first { session.applySavedFilter(saved) }
+            check("applying a saved filter sets the rows and the text", session.visibleRows.count == 2 && session.currentFilterExpressionText.contains("cdn"))
+            session.clearFilter()
+            session.filterBarVisible = false
+            session.sidebarQuery = "staging"
+            check("the sidebar query matches hosts case-insensitively", session.hosts.filter { $0.0.localizedCaseInsensitiveContains("staging") }.count == 3)
+            session.sidebarQuery = ""
+            let items = session.paletteItems(for: "repl")
+            check("the palette ranks flow.replay first for 'repl'", items.first?.title == "flow.replay")
+            check("every tool appears in the palette", session.paletteItems(for: "").filter { if case .command = $0.kind { return true }; return false }.count == Fixtures.tools.count)
+            let flows = session.paletteItems(for: "auth/login")
+            check("a URL fragment finds its flow", flows.contains { if case .flow = $0.kind { return $0.title.contains("auth/login") }; return false })
+            if let tool = Fixtures.tools.first(where: { $0.name == "flow.replay" }) {
+                let form = PaletteForm(tool: tool, session: session)
+                check("a FlowId parameter becomes a flow picker preset to the focused flow", form.values["id"] == session.focused?.raw && !form.missing.isEmpty == (session.focused == nil))
+            }
+
             print(failures == 0 ? "SELFTEST PASS \(count) checks" : "SELFTEST FAIL \(failures) of \(count) checks")
             finish(code: failures == 0 ? 0 : 1)
         }

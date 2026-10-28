@@ -1,3 +1,4 @@
+import AitmBusClient
 import AitmproxyKit
 import AppKit
 import Foundation
@@ -97,6 +98,8 @@ final class Session {
     var page: SidebarPage? = .apps
     var chip: ContentCategory = .all
     var layout: InspectorLayout = .horizontal
+    var requestTab: RequestTab = .raw
+    var responseTab: ResponseTab = .body
     var sort: FlowSort = .captureOrder
     var density: Density = Density(rawValue: UserDefaults.standard.string(forKey: "density") ?? "") ?? .dense {
         didSet { if !Store.isOverridden { UserDefaults.standard.set(density.rawValue, forKey: "density") } }
@@ -108,6 +111,185 @@ final class Session {
     }
     /// Column order/widths/hidden set (S-008).
     var columnsURL: URL { Store.url.appending(path: "columns.json") }
+
+    // MARK: Filters (S-031–S-034)
+
+    var filterBarVisible = false
+    var filterStack = FilterStack() {
+        didSet { if !filterAdvanced { recompileFilter(from: filterStack.expression) } }
+    }
+    /// The Advanced text; authoritative while `filterAdvanced`.
+    var filterText = "" {
+        didSet { if filterAdvanced { parseFilterText() } }
+    }
+    var filterAdvanced = false
+    var filterError: FilterParseError?
+    @ObservationIgnored private var compiledFilter: CompiledFilter?
+    @ObservationIgnored private var filterExpression: FilterExpression = .matchAll
+    var savedFilters: [SavedFilter] = []
+    @ObservationIgnored private lazy var savedFilterStore = SavedFilterStore(stateDirectory: Store.url)
+    /// The sidebar's quick filter (⌘⇧F).
+    var sidebarQuery = ""
+    /// Bumped to move focus into the sidebar filter field.
+    var sidebarFilterFocusTick = 0
+
+    /// The text form of whatever is filtering right now.
+    var currentFilterExpressionText: String { filterAdvanced ? filterText : filterStack.text }
+
+    /// The rows view of the Advanced text, when the expression is flat.
+    var filterStackFromText: FilterStack? {
+        guard filterAdvanced, filterError == nil else { return nil }
+        return filterExpression.stack
+    }
+
+    func setFilterAdvanced(_ advanced: Bool) {
+        if advanced {
+            filterText = filterStack.text
+            filterAdvanced = true
+            parseFilterText()
+        } else {
+            if let stack = filterExpression.stack { filterStack = stack }
+            filterAdvanced = false
+            recompileFilter(from: filterStack.expression)
+        }
+    }
+
+    private func parseFilterText() {
+        do {
+            let expression = try FilterExpression.parse(filterText)
+            filterError = nil
+            recompileFilter(from: expression)
+        } catch {
+            filterError = error
+            compiledFilter = nil
+            filterExpression = .matchAll
+        }
+    }
+
+    private func recompileFilter(from expression: FilterExpression) {
+        filterExpression = expression
+        compiledFilter = expression == .matchAll ? nil : CompiledFilter(expression)
+    }
+
+    func clearFilter() {
+        filterStack = FilterStack(rows: [FilterRow(.url, .contains)])
+        filterText = ""
+        filterError = nil
+        compiledFilter = nil
+        filterExpression = .matchAll
+    }
+
+    func loadSavedFilters() {
+        savedFilters = (try? savedFilterStore.load()) ?? []
+    }
+
+    func saveFilter(named name: String) {
+        let expression = currentFilterExpressionText
+        guard !name.isEmpty, !expression.isEmpty else { return }
+        savedFilters.removeAll { $0.name == name }
+        savedFilters.append(SavedFilter(name: name, expression: expression))
+        try? savedFilterStore.save(savedFilters)
+    }
+
+    func deleteSavedFilter(_ saved: SavedFilter) {
+        savedFilters.removeAll { $0.id == saved.id }
+        try? savedFilterStore.save(savedFilters)
+    }
+
+    /// Sets both the rows and the Advanced text (S-033).
+    func applySavedFilter(_ saved: SavedFilter) {
+        guard let expression = try? FilterExpression.parse(saved.expression) else { return }
+        if let stack = expression.stack {
+            filterAdvanced = false
+            filterStack = stack
+        } else {
+            filterAdvanced = true
+            filterText = saved.expression
+        }
+        filterBarVisible = true
+    }
+
+    // MARK: Palette (S-035, S-036)
+
+    var paletteVisible = false
+    /// Opened with the mouse → animates; with ⌘K → does not (foundation §2.8).
+    var paletteOpenedByKeyboard = true
+    var tools: [ToolDescriptor] = Store.usesFixtures ? Fixtures.tools : []
+    var recentPaletteIDs: [String] = UserDefaults.standard.stringArray(forKey: "palette.recent") ?? []
+    /// A generic bus call for the palette; nil until a bus is attached.
+    @ObservationIgnored var commandRunner: ((String, [String: JSONValue]) async throws -> JSONValue)?
+
+    func runCommand(_ name: String, _ args: [String: JSONValue]) async throws -> JSONValue {
+        guard let commandRunner else { throw BusError.disconnected }
+        return try await commandRunner(name, args)
+    }
+
+    func rememberPaletteUse(_ item: PaletteItem) {
+        recentPaletteIDs.removeAll { $0 == item.id }
+        recentPaletteIDs.insert(item.id, at: 0)
+        recentPaletteIDs = Array(recentPaletteIDs.prefix(5))
+        if !Store.isOverridden { UserDefaults.standard.set(recentPaletteIDs, forKey: "palette.recent") }
+    }
+
+    func paletteItems(for query: String) -> [PaletteItem] {
+        var all: [PaletteItem] = []
+        for tool in tools {
+            all.append(PaletteItem(id: "cmd:\(tool.name)", section: .commands, title: tool.name, subtitle: tool.description,
+                                   shortcut: nil, method: nil, kind: .command(tool)))
+        }
+        let locals: [(String, String, String?, () -> Void)] = [
+            (interceptArmed ? "Disarm Intercept" : "Arm Intercept", "Stop or start parking every request", "i", { [self] in arm(!interceptArmed) }),
+            ("Compose Request…", "Write and send a new request", "⌘N", {}),
+            (capturing ? "Pause Capture" : "Resume Capture", "Stop or start recording flows", "⇧⌘R", { [self] in setCapturing(!capturing) }),
+            ("Clear Session", "Drop every flow", "⌘⌫", { [self] in clearSession(confirm: ClearConfirmation.ask) }),
+            (autoSelect ? "Stop Auto-select" : "Auto-select New Flows", "Follow the newest flow as it arrives", "⇧⌘A", { [self] in autoSelect.toggle() }),
+            ("Filter Bar", "Stack filters over the list", "⌘F", { [self] in filterBarVisible.toggle() }),
+            ("Inspector Below", "Horizontal layout", "⌥⌘1", { [self] in layout = .horizontal }),
+            ("Inspector Right", "Vertical layout", "⌥⌘2", { [self] in layout = .vertical }),
+        ]
+        for (title, subtitle, shortcut, action) in locals {
+            all.append(PaletteItem(id: "local:\(title)", section: .local, title: title, subtitle: subtitle, shortcut: shortcut, method: nil, kind: .local(action)))
+        }
+        let setup: [(String, String, () -> Void)] = [
+            ("Install CA…", "Trust the proxy's certificate authority (asks for confirmation)", { [self] in lastError = "CA install arrives with the CA panel (M5)" }),
+            ("Add Host to Scope…", "Authorise a host for testing", { [self] in show(.scope) }),
+            ("Open Browser", "Show the embedded browser", { [self] in show(.browser) }),
+        ]
+        for (title, subtitle, action) in setup {
+            all.append(PaletteItem(id: "setup:\(title)", section: .setup, title: title, subtitle: subtitle, shortcut: nil, method: nil, kind: .local(action)))
+        }
+        for saved in savedFilters {
+            all.append(PaletteItem(id: "filter:\(saved.id)", section: .filters, title: "Filter: \(saved.name)", subtitle: saved.expression,
+                                   shortcut: nil, method: nil, kind: .savedFilter(saved)))
+        }
+        if !query.isEmpty {
+            for row in rows {
+                all.append(PaletteItem(id: "flow:\(row.id.raw)", section: .flows, title: row.url,
+                                       subtitle: "\(row.status.map(String.init) ?? (row.state == .paused ? "paused" : "—")) · \(row.client?.name ?? "")",
+                                       shortcut: nil, method: row.method, kind: .flow(row.id)))
+            }
+        }
+        let trimmed = query.trimmingCharacters(in: .whitespaces)
+        var ranked: [(PaletteItem, Int)] = all.compactMap { item in
+            if trimmed.isEmpty { return (item, 1) }
+            let score = Fuzzy.score(trimmed, name: item.title, description: item.subtitle)
+            return score > 0 ? (item, score) : nil
+        }
+        // Recent on top (only when nothing is typed), then by score within section order.
+        if trimmed.isEmpty {
+            let recent = ranked.filter { recentPaletteIDs.contains($0.0.id) }.map { item, score -> (PaletteItem, Int) in
+                var r = item; r.section = .recent; r.id = "recent:" + item.id; return (r, score)
+            }
+            ranked = recent.sorted { recentPaletteIDs.firstIndex(of: String($0.0.id.dropFirst(7))) ?? 0 < recentPaletteIDs.firstIndex(of: String($1.0.id.dropFirst(7))) ?? 0 } + ranked
+        }
+        let order = PaletteSection.allCases
+        return ranked
+            .sorted { a, b in
+                let sa = order.firstIndex(of: a.0.section) ?? 0, sb = order.firstIndex(of: b.0.section) ?? 0
+                return sa == sb ? a.1 > b.1 : sa < sb
+            }
+            .prefix(60).map(\.0)
+    }
     var listenAddress = "127.0.0.1:8080"
     var agentPolicy: AgentPolicy = .all
     var agentActionsLastMinute = 0
@@ -137,6 +319,23 @@ final class Session {
 
     init() {
         if !Store.usesFixtures { pins = Pins.load(from: pinsURL) }
+        loadSavedFilters()
+        if Store.usesFixtures {
+            // Fixture commands: the ones the shell already models act; the rest echo.
+            commandRunner = { [weak self] name, args in
+                guard let self else { throw BusError.disconnected }
+                switch name {
+                case "flow.intercept": arm(args["enabled"]?.boolValue ?? true); return .bool(interceptArmed)
+                case "flow.resume": if let id = args["id"]?.stringValue { resume(FlowID(id)) }; return .null
+                case "flow.kill": if let id = args["id"]?.stringValue { kill(FlowID(id)) }; return .null
+                case "flow.replay": if let id = args["id"]?.stringValue { replay(FlowID(id)) }; return .string("replayed")
+                case "flow.list": return .array(rows.map { .string($0.id.raw) })
+                case "scope.list": return .array(scopeHosts.map { .string($0) })
+                case "scope.add": if let h = args["host"]?.stringValue { addScope(h) }; return .string(args["host"]?.stringValue ?? "")
+                default: return .string("ok (fixture)")
+                }
+            }
+        }
     }
 
     var paused: [FlowRow] { rows.filter { $0.state == .paused } }
@@ -151,6 +350,9 @@ final class Session {
     private var filteredRows: [FlowRow] {
         var out = rows
         if page == .scope { out = out.filter(\.inScope) }
+        if let compiledFilter {
+            out = out.filter { compiledFilter.matches(FilterSubject(row: $0, detail: details[$0.id])) }
+        }
         switch group {
         case .host(let host)?: out = out.filter { $0.authority == host }
         case .client(let name)?: out = out.filter { $0.client?.name == name }

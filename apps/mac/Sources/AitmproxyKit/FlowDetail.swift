@@ -61,13 +61,22 @@ public struct FlowDetail: Hashable, Sendable {
     public var connection: ConnectionInfo
     /// The request as it arrived, before any `flow.mutate` (the core's backup).
     public var originalRequest: HTTPMessage?
+    /// Per-phase timing (F5); nil until the core reports it.
+    public var timing: FlowTiming?
+    /// Set when a body is paged or truncated (F5 `flow.detail {body: range}`).
+    public var requestBodyExtent: BodyExtent?
+    public var responseBodyExtent: BodyExtent?
 
     public init(id: FlowID, request: HTTPMessage, response: HTTPMessage? = nil,
-                connection: ConnectionInfo, originalRequest: HTTPMessage? = nil) {
+                connection: ConnectionInfo, originalRequest: HTTPMessage? = nil, timing: FlowTiming? = nil,
+                requestBodyExtent: BodyExtent? = nil, responseBodyExtent: BodyExtent? = nil) {
         self.id = id
         self.request = request
         self.response = response
         self.connection = connection
         self.originalRequest = originalRequest
+        self.timing = timing
+        self.requestBodyExtent = requestBodyExtent
+        self.responseBodyExtent = responseBodyExtent
     }
 }

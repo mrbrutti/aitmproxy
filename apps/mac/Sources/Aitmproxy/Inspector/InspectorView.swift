@@ -178,13 +178,15 @@ enum ResponseTab: String, CaseIterable, CustomStringConvertible {
 }
 
 struct RequestPane: View {
+    @Environment(Session.self) private var session
     var row: FlowRow
     var detail: FlowDetail?
-    @State private var tab: RequestTab = .raw
+    private var tab: RequestTab { session.requestTab }
 
     var body: some View {
+        @Bindable var session = session
         VStack(spacing: 0) {
-            PaneTabs(title: "Request", tabs: RequestTab.allCases, selected: $tab) {
+            PaneTabs(title: "Request", tabs: RequestTab.allCases, selected: $session.requestTab) {
                 if row.state == .paused {
                     Text("editing").font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
                 }
@@ -252,13 +254,15 @@ struct RequestPane: View {
 }
 
 struct ResponsePane: View {
+    @Environment(Session.self) private var session
     var row: FlowRow
     var detail: FlowDetail?
-    @State private var tab: ResponseTab = .body
+    private var tab: ResponseTab { session.responseTab }
 
     var body: some View {
+        @Bindable var session = session
         VStack(spacing: 0) {
-            PaneTabs(title: "Response", tabs: ResponseTab.allCases, selected: $tab) {
+            PaneTabs(title: "Response", tabs: ResponseTab.allCases, selected: $session.responseTab) {
                 HStack(spacing: 4) {
                     Text("\(format) ▾")
                         .font(Tok.Face.ui(Tok.Typography.Size.sm))

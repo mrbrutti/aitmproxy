@@ -8,6 +8,15 @@ import SwiftUI
 /// client / host; a sub-item narrows the list (S-013); ⇧P pins one (S-014).
 struct SidebarView: View {
     @Environment(Session.self) private var session
+    @FocusState private var filterFocused: Bool
+
+    /// Case-insensitive substring over host / client name (S-034).
+    private func matches(_ text: String) -> Bool {
+        let q = session.sidebarQuery.trimmingCharacters(in: .whitespaces)
+        return q.isEmpty || text.localizedCaseInsensitiveContains(q)
+    }
+
+    private var querying: Bool { !session.sidebarQuery.trimmingCharacters(in: .whitespaces).isEmpty }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -17,10 +26,10 @@ struct SidebarView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     group("Working")
                     item(.pinned, count: session.pins.hosts.count + session.pins.apps.count)
-                    ForEach(session.pins.hosts, id: \.self) { host in
+                    ForEach(session.pins.hosts.filter(matches), id: \.self) { host in
                         subItem(.host(host), title: host, monogram: "◎", count: session.hosts.first { $0.0 == host }?.1, page: .pinned)
                     }
-                    ForEach(session.pins.apps, id: \.self) { app in
+                    ForEach(session.pins.apps.filter(matches), id: \.self) { app in
                         subItem(.client(app), title: app, monogram: String(app.prefix(1)),
                                 count: session.clients.first { $0.0.name == app }?.1, page: .pinned)
                     }
@@ -31,15 +40,19 @@ struct SidebarView: View {
 
                     group("All")
                     item(.apps, count: session.clients.count)
-                    if session.page == .apps {
-                        ForEach(session.clients, id: \.0) { client, count in
+                    if session.page == .apps || querying {
+                        let visible = session.clients.filter { matches($0.0.name) }
+                        if querying, visible.isEmpty { hint("No match") }
+                        ForEach(visible, id: \.0) { client, count in
                             subItem(.client(client.name), title: client.name, monogram: client.monogram, count: count,
                                     page: .apps, bundleID: client.bundleID)
                         }
                     }
                     item(.domains, count: session.hosts.count)
-                    if session.page == .domains {
-                        ForEach(session.hosts, id: \.0) { host, count in
+                    if session.page == .domains || querying {
+                        let visible = session.hosts.filter { matches($0.0) }
+                        if querying, visible.isEmpty { hint("No match") }
+                        ForEach(visible, id: \.0) { host, count in
                             subItem(.host(host), title: host, monogram: "◎", count: count, page: .domains)
                         }
                     }
@@ -165,16 +178,29 @@ struct SidebarView: View {
     }
 
     private var filterField: some View {
-        HStack(spacing: Space.sm) {
+        @Bindable var session = session
+        return HStack(spacing: Space.sm) {
             Image(systemName: Tok.Glyph.search).font(.system(size: 12)).foregroundStyle(Tok.Ink.tertiary.color)
-            Text("Filter").font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.tertiary.color)
-            Spacer()
-            Text("⌘⇧F").font(Tok.Face.ui(Tok.Typography.Size.xs)).foregroundStyle(Tok.Ink.tertiary.color)
+            TextField("Filter", text: $session.sidebarQuery)
+                .textFieldStyle(.plain)
+                .font(Tok.Face.ui(Tok.Typography.Size.md))
+                .focused($filterFocused)
+                .onExitCommand { session.sidebarQuery = ""; filterFocused = false }
+            if querying {
+                Button { session.sidebarQuery = "" } label: {
+                    Image(systemName: "xmark.circle.fill").font(.system(size: 12)).foregroundStyle(Tok.Ink.tertiary.color)
+                }
+                .buttonStyle(.plain)
+            } else {
+                Text("⌘⇧F").font(Tok.Face.ui(Tok.Typography.Size.xs)).foregroundStyle(Tok.Ink.tertiary.color)
+            }
         }
         .padding(.horizontal, Tok.Metric.padInner)
         .frame(height: Tok.Size.control)
         .background(Tok.Ground.raised.color, in: RoundedRectangle(cornerRadius: Tok.Radius.control))
+        .overlay(RoundedRectangle(cornerRadius: Tok.Radius.control).strokeBorder(filterFocused ? Palette.accent : .clear, lineWidth: 2))
         .padding(Space.sm)
+        .onChange(of: session.sidebarFilterFocusTick) { filterFocused = true }
     }
 }
 

@@ -282,6 +282,12 @@ Acceptance:
 - [snap] Two-column tables, lowercase mono names in `syntax.key`, 13 pt, 28 px rows; Cookies and Set-Cookie split attributes (`HttpOnly`, `Secure`, `SameSite`, `Expires`) into sub-columns.
 - [unit] Cookie parsing handles quoted values, missing attributes and duplicate names.
 - [self] On the live bus the tables fill from `flow.detail`; until it answers, grey loading bars at real size show (no shimmer).
+UX:
+- Flow: select a flow -> Request ▸ Headers (default for finished flows) / Cookies / Query, Response ▸ Headers / Set-Cookie -> read; click a value to select it, ⌘C copies `name: value`
+- Surface: inspector tabs (details of the selection while working)
+- States: no cookies -> "No cookies" in tertiary inside the pane; live without F5 -> loading bars; a header value longer than the pane truncates with the full value in a tooltip
+- Words: tabs "Headers", "Cookies", "Query", "Set-Cookie"; column heads for cookies "Name · Value · Domain · Path · Expires · Flags"
+- Access: tables are real rows to VoiceOver ("content-type, application/json")
 Status: todo
 
 ### S-020 Read the timing waterfall and the connection facts
@@ -293,6 +299,12 @@ Acceptance:
 - [snap] Timing draws one bar per phase in tertiary with the duration printed beside it; the total matches the Duration column.
 - [unit] Missing phases print as a grey dash, a real 0 ms as `0 ms`.
 - [snap] Connection shows `HTTP/2 · TLS 1.3 · h2` and the SNI; SSL padlock state agrees with the row.
+UX:
+- Flow: Request ▸ Timing -> five bars (DNS, Connect, TLS, Wait, Download) with ms beside each and the total under them; Request ▸ Connection -> key : value table
+- Surface: inspector tabs
+- States: phase missing -> dash and no bar; live without F5 -> loading bars; plain HTTP -> TLS row says "none"
+- Words: "Timing", "Connection"; rows "protocol · tls · alpn · sni · client · server"
+- Access: each bar has an accessibility value ("Wait, 89 ms")
 Status: todo
 
 ### S-021 View a pretty-printed body
@@ -305,6 +317,12 @@ Acceptance:
 - [unit] `JSONTree.pretty` keeps key order; form bodies split into a key : value table; multipart lists parts with their headers.
 - [snap] Markdown and HTML offer a Rendered toggle; rendering is sandboxed with scripts off.
 - [self] A 5 MB JSON body opens without blocking the main thread for more than one frame.
+UX:
+- Flow: Body tab -> the body pretty-printed in the detected format -> `JSON ▾` picker changes the format -> for Markdown/HTML a "Rendered" toggle appears -> fold chevrons collapse objects/arrays
+- Surface: inspector tab; the picker is a popup button in the tab bar's trailing slot (a few choices tied to one control)
+- States: empty body -> "No body" tertiary; unknown binary -> hex; a body over the inline limit -> truncated chip (S-027); rendering never runs scripts or loads remote resources
+- Words: picker items "Auto, JSON, XML, HTML, JS, CSS, Form, Multipart, Markdown, Text, Hex"; toggle "Rendered"
+- Access: the viewer is a text view (selectable, VoiceOver reads lines); ⌘A selects the body only
 Status: todo
 
 ### S-022 Explore a JSON body as a tree
@@ -315,6 +333,12 @@ Acceptance:
 - [snap] Rows show key, `{3 keys}` / `[2 items]` summaries when collapsed, scalar values in syntax colours; disclosure chevrons flat and grey.
 - [unit] `JSONNode.filter` keeps ancestors of matches; `sortedKeys` keeps paths stable; `copyText` round-trips.
 - [manual] Context menu: Copy Value, Copy Path (`$.user.roles[0]`), Expand All, Collapse All.
+UX:
+- Flow: Response ▸ JSON -> tree expanded one level -> click chevrons or ⌥-click to expand all -> type in the filter field to narrow -> right-click a node for Copy Value / Copy Path / Expand All / Collapse All; "Sort Keys" toggle in the trailing slot
+- Surface: inspector tab (an outline)
+- States: not JSON -> "Not JSON — see Body"; filter with no match -> "No match" and the tree stays; huge arrays show the first 1 000 items with "Show more"
+- Words: summaries "{3 keys}", "[2 items]"; menu "Copy Value", "Copy Path", "Expand All", "Collapse All"; toggle "Sort Keys"
+- Access: disclosure rows report expanded/collapsed; paths read as text
 Status: todo
 
 ### S-023 View an image body with its metadata
@@ -325,6 +349,12 @@ Acceptance:
 - [snap] The image sits on a checkerboard at 1× (fit to pane when larger) with `1200×800 · PNG · 184 KB · sRGB` beneath.
 - [unit] Unsupported or corrupt data falls back to the hex viewer with a notice.
 - [manual] Open in Preview and Export… in the pane's trailing controls.
+UX:
+- Flow: select an image response -> Body shows it at 1× (fit when larger) on a checkerboard -> caption `1200×800 · PNG · 184 KB · sRGB` -> trailing slot: "Open in Preview", "Export…"
+- Surface: inspector tab
+- States: corrupt data -> hex viewer with "Not a readable image" notice; SVG renders via NSImage; animated GIF shows frame 1
+- Words: caption order dimensions · type · size · colour space; buttons "Open in Preview", "Export…"
+- Access: the image has an accessibility label with the caption
 Status: todo
 
 ### S-024 View a binary body as hex, protobuf or MessagePack
@@ -335,6 +365,12 @@ Acceptance:
 - [snap] Hex lines `00000010  48 54 54 50 …  HTTP…`, 16 bytes per line, mono, offsets tertiary.
 - [unit] `HexDump.lines(range:)` serves only visible lines; protobuf raw decode lists field number, wire type, value; MessagePack decodes to the JSON tree.
 - [self] A 20 MB body scrolls through the hex viewer without loading it all into rows.
+UX:
+- Flow: Body picker ▸ Hex -> offset · bytes · ASCII lines; picker ▸ Protobuf (raw) -> field table; picker ▸ MessagePack -> JSON tree
+- Surface: inspector tab (picker formats)
+- States: a 20 MB body -> hex pages by visible lines; protobuf that fails to walk -> "Not protobuf — showing hex"
+- Words: hex columns unlabelled (Proxyman convention); protobuf columns "Field · Wire type · Value"
+- Access: hex lines are selectable text
 Status: todo
 
 ### S-025 Read a streaming response as an SSE event list
@@ -346,6 +382,12 @@ Acceptance:
 - [snap] One row per event, newest at the bottom, `data` pretty-printed when JSON; a `Merged` toggle concatenates deltas.
 - [unit] Multi-line `data:` fields and comment lines parse per the SSE spec.
 - [self] New events append live without scrolling the operator away from where they read.
+UX:
+- Flow: select a `text/event-stream` flow -> Body shows one row per event (time · id · event · data) -> "Merged" toggle concatenates OpenAI-style deltas into one text -> new events append at the bottom without moving the scroll
+- Surface: inspector tab (a list)
+- States: no events yet -> "Waiting for events…"; a comment line shows dimmed; live without F4 -> events refresh with the poll
+- Words: toggle "Merged"; columns "Time · ID · Event · Data"
+- Access: rows read as "event message, data …"
 Status: todo
 
 ### S-026 Diff two flows
@@ -356,6 +398,12 @@ Acceptance:
 - [snap] Four collapsible sections; added lines on `diffAdd`, removed on `diffRemove`; a Side-by-side / Unified toggle.
 - [unit] `FlowDiff.compare` pretty-prints JSON on both sides first; `unified()` exports a patch with one header per section.
 - [manual] Export Patch… writes the unified text; a `truncated` chip appears over 2 MB per side.
+UX:
+- Flow: ⌘-click a second row -> Response ▸ Diff -> four collapsible sections (Request head · Request body · Response head · Response body) side by side -> "Unified" toggle -> "Export Patch…" saves the unified text
+- Surface: inspector tab; Export Patch… is a save panel
+- States: one row selected -> "Select a second flow with ⌘-click to compare"; identical sections collapse with "No changes"; over 2 MB a side -> `truncated` chip
+- Words: toggle "Side by side" / "Unified"; button "Export Patch…"; section titles as above
+- Access: added/removed lines carry +/- markers, not colour alone
 Status: todo
 
 ### S-027 Page through a large body
@@ -366,6 +414,12 @@ Core: F5
 Acceptance:
 - [snap] A raised chip `truncated · 2.0 of 18.4 MB` sits in the tab bar's trailing slot; Load more fetches the next range via `flow.detail {body: range}`.
 - [unit] Paged ranges concatenate in order; a failed range shows Retry inside the viewer with the last good time.
+UX:
+- Flow: open a truncated body -> chip `truncated · 2.0 of 18.4 MB` in the tab bar's trailing slot -> "Load more" at the bottom of the viewer fetches the next range -> the viewer grows in place
+- Surface: inline chip + inline button
+- States: fetch failing -> "Unable to load the next 2 MB · Retry" with the last good time; everything loaded -> chip disappears
+- Words: chip "truncated · X of Y"; button "Load more"; error as above
+- Access: the chip is a status, the button a real button
 Status: todo
 
 ### S-028 Copy a request as code or export the body
@@ -376,6 +430,12 @@ Acceptance:
 - [unit] `CodeExport.curl/httpie/pythonRequests/fetch` drop hop-by-hop and pseudo-headers, quote safely, never add `-k`.
 - [manual] ⇧⌘C copies cURL; the menu lists the other three; Export Body… proposes a filename from the path and content type.
 - [self] The copied text appears on the pasteboard as plain text.
+UX:
+- Flow: summary strip ▸ copy menu (or ⇧⌘C) -> "Copy as cURL" at once; menu lists httpie, Python, fetch; "Export Body…" -> save panel prefilled with the path's last segment and the type's extension
+- Surface: menu on the summary strip's copy button; save panel for export
+- States: no body -> "Export Body…" disabled; non-UTF-8 body -> cURL uses base64 and says so in a tooltip
+- Words: "Copy as cURL ⇧⌘C", "Copy as httpie", "Copy as Python (requests)", "Copy as fetch", "Export Body…"
+- Access: all in Flow ▸ Copy As ▸ too
 Status: todo
 
 ### S-029 Find in body with match highlighting
@@ -386,6 +446,12 @@ Acceptance:
 - [snap] A 28 px find field in the tab bar's trailing slot with `3 of 12`; matches on `syntax.match`, the current one with a 2 px accent outline.
 - [unit] Search is case-insensitive by default with a regex toggle; a filter-bar body term pre-fills and highlights.
 - [manual] ⏎ and ⇧⏎ step; Esc closes and keeps the scroll position.
+UX:
+- Flow: ⌥⌘F in a body viewer -> 28 px find field in the tab bar's trailing slot with focus -> type -> matches highlight, `3 of 12` -> ⏎ / ⇧⏎ step, Esc closes and keeps the scroll position
+- Surface: inline field (a tool kept beside the work)
+- States: no matches -> `0 of 0` in tertiary, field stays; regex toggle "(.*)" invalid -> field border intercept.deep
+- Words: placeholder "Find in body"; counter "n of m"; toggle tooltip "Regular expression"
+- Access: the field is the only control focused on open; the current match is announced
 Status: todo
 
 ---
@@ -411,7 +477,13 @@ Acceptance:
 - [unit] `CompiledFilter` matches rows and details for contains / equals / wildcard / regex / JSON path / full text / greater / less; an invalid regex marks the row and matches nothing.
 - [self] Two rows under Any widen the list; switching to All narrows it; the status bar shows `n / N rows`.
 - [manual] Filtering 50 rows/s stays under one frame per poll.
-Status: todo
+UX:
+- Flow: ⌘F (or chip bar ▸ Filters, View ▸ Filter Bar) -> bar opens under the chips with one empty row, value field focused -> pick Field, Operator, type Value -> list follows each keystroke -> `+` adds a row -> All / Any switch -> ⌘F again or the ✕ closes and clears
+- Surface: inline bar (a tool kept open beside the work); each row is three popup buttons + a field + `not` + ✕
+- States: empty row = no filtering; invalid regex -> value field border intercept.deep and tooltip with the error, row matches nothing; status bar shows `n / N rows`
+- Words: bar label "Match" + segmented "All | Any"; row controls "Field ▾", "Operator ▾", value placeholder per operator ("contains…", "regex…", "$.path or $.path=value"); `not` toggle reads "not"; buttons "+ Add Row", "Advanced", bookmark glyph for saved filters, "Clear"
+- Access: every control labelled; Tab order field → operator → value → not → remove; ⌘F toggles, Esc in the value field closes the bar
+Status: done
 
 ### S-032 Edit the filter as a mitmproxy expression
 As the operator, I flip the filter bar to Advanced and see or type the same filter as text (`~m POST & ~c 5`), copyable between surfaces.
@@ -421,7 +493,13 @@ Acceptance:
 - [unit] `FilterExpression.parse` and `.text` round-trip every stack; nested expressions stay in text form with the rows view disabled and a hint.
 - [snap] A parse error underlines the offset and prints the message beneath the field.
 - [manual] Paste a mitmproxy filter and the rows view populates when it is flat.
-Status: todo
+UX:
+- Flow: filter bar ▸ "Advanced" -> the rows fold into one mono text field holding the same filter (`~m POST & ~c 5`) -> edit -> list follows; "Rows" switches back when the expression is flat
+- Surface: inline (the same bar, second mode)
+- States: parse error -> the character at the offset underlined in intercept.deep and the message in 12 pt beneath; nested expression -> "Rows" disabled with hint "Nested filter — edit as text"
+- Words: toggle "Rows | Advanced"; placeholder "~u login & ~m POST"; the expression also prints read-only in tertiary under the rows view
+- Access: the text field announces errors; ⌘C copies the expression
+Status: done
 
 ### S-033 Save a filter by name
 As the operator, I save the current stack under a name from the filter bar's bookmark menu and reapply it from that menu or the palette.
@@ -431,7 +509,13 @@ Acceptance:
 - [unit] Saved filters persist as `{name, expression}` under `Store.url/filters.json`; renaming and deleting work.
 - [snap] The bookmark menu lists saved filters with their expression in tertiary beneath the name.
 - [self] Applying a saved filter sets both the rows and the Advanced text.
-Status: todo
+UX:
+- Flow: bookmark glyph ▸ "Save Filter…" -> name field in a popover -> Save -> listed in the menu with its expression beneath; choose one -> rows + text fill; "Manage…" -> rename/delete inline
+- Surface: menu on the bar's bookmark button; popover for the name (one value)
+- States: no saved filters -> menu shows "No saved filters"; a name already used -> "Replace" instead of Save
+- Words: "Save Filter…", "Manage Saved Filters…", popover title "Save Filter", field placeholder "Name", button "Save"
+- Access: saved filters also appear in the palette as "Filter: <name>"
+Status: done
 
 ### S-034 Filter the sidebar quickly
 As the operator, I press ⌘⇧F, type into the sidebar's filter field, and the Apps, Domains and Pinned sub-items narrow to matches.
@@ -441,7 +525,13 @@ Acceptance:
 - [snap] The field takes focus with a 2 px accent ring; non-matching sub-items hide; group headers stay.
 - [unit] Matching is case-insensitive substring over host and client name.
 - [manual] Esc clears and returns focus to the list.
-Status: todo
+UX:
+- Flow: ⌘⇧F -> the sidebar filter field takes focus with the accent ring -> type -> Apps, Domains and Pinned sub-items narrow (groups expand to show matches) -> Esc clears and returns focus to the list
+- Surface: inline field (already in the sidebar's foot)
+- States: no match -> each group shows "No match" in tertiary; empty query -> groups fold back to the selected page's expansion
+- Words: placeholder "Filter", shortcut hint "⌘⇧F" in the field
+- Access: the field is a real text field; matching is case-insensitive substring over host and client name
+Status: done
 
 ### S-035 Run a command from the palette
 As the operator, I press ⌘K, type part of a command's name or description, and run it; forms for its parameters are built from `tools/list`.
@@ -451,7 +541,13 @@ Acceptance:
 - [snap] A floating panel, radius 10, `floating` shadow, 13 pt rows with name, description in tertiary and the shortcut right-aligned; Recent and Pinned sections on top.
 - [unit] Fuzzy ranking scores name over description; every tool from `tools/list` appears; a `FlowId` parameter becomes a flow picker, `Bytes` a file/hex input, `required` drives validation.
 - [manual] Keyboard open/close does not animate; mouse open scales from 0.97 in 160 ms.
-Status: todo
+UX:
+- Flow: ⌘K -> floating panel over the window, field focused -> type -> ranked results (Recent, Pinned, Commands, Flows, Setup) -> ↑↓ ⏎ -> a command without parameters runs at once; one with parameters opens its form in the panel (fields from tools/list: label = name, help = description, required marked) -> ⏎ runs -> result line shows in the panel for 2 s -> Esc closes
+- Surface: floating panel (radius 10, floating shadow); keyboard open/close never animates
+- States: bus offline -> commands section says "Bus offline — connect in Settings ▸ Bus" and only local actions list; a failed command shows the error inline in the panel; gated commands (confirm) show "Confirm" before running
+- Words: placeholder "Type a command, a URL or a setting…"; sections "Recent", "Pinned", "Commands", "Flows", "Setup"; run button "Run ⏎"
+- Access: full keyboard; VoiceOver reads "flow.replay, Replay a captured flow, command"
+Status: done
 
 ### S-036 Jump to a flow or a setup action from the palette
 As the operator, I type a URL fragment to select that flow, or a word like "install" to run a setup action (install CA, add scope, open browser).
@@ -460,7 +556,13 @@ Depends: S-035
 Acceptance:
 - [unit] Flow results show method badge, status and URL; selecting one selects and reveals the row.
 - [snap] Setup actions form their own section with the gated ones (CA install) showing a confirmation step.
-Status: todo
+UX:
+- Flow: ⌘K -> type part of a URL -> matching flows list with method badge, status and URL -> ⏎ selects the row and scrolls to it; type "install"/"scope"/"browser" -> Setup actions: "Install CA…", "Add Host to Scope…", "Open Browser"
+- Surface: the same palette, two more sections
+- States: CA install is gated -> a confirm step with the proxy's confirm text; no flows match -> section hidden
+- Words: section titles "Flows", "Setup"; setup items as above with ellipses when they ask for input
+- Access: flow rows read as "POST, 200, https://…"
+Status: done
 
 ---
 

@@ -30,7 +30,10 @@ struct ShellToolbar: ToolbarContent {
         .sharedBackgroundVisibility(.hidden)
         ToolbarItemGroup(placement: .primaryAction) {
             AgentToggle()
-            Button {} label: { Label("Command Palette", systemImage: Tok.Glyph.palette) }
+            Button {
+                session.paletteOpenedByKeyboard = false
+                session.paletteVisible.toggle()
+            } label: { Label("Command Palette", systemImage: Tok.Glyph.palette) }
                 .help("Command palette (⌘K)")
             LayoutPicker()
         }

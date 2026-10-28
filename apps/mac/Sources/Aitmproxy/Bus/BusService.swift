@@ -53,6 +53,11 @@ final class BusService: FlowActions {
                 session.bus = .connected(address)
                 session.listenAddress = Self.listenAddress() ?? session.listenAddress
                 tools = (try? await client.listTools()) ?? []
+                session.tools = tools
+                session.commandRunner = { [weak self] name, args in
+                    guard let self, let client = self.client else { throw BusError.disconnected }
+                    return try await client.call(name, args)
+                }
                 await refreshScope()
                 backoff = .seconds(1)
                 try await pollLoop(client)

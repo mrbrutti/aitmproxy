@@ -25,6 +25,18 @@ struct ShellView: View {
             }
         }
         .background(Tok.Ground.surface.color)
+        .overlay(alignment: .top) {
+            if session.paletteVisible {
+                ZStack(alignment: .top) {
+                    Color.black.opacity(0.001).ignoresSafeArea().onTapGesture { session.paletteVisible = false }
+                    CommandPalette()
+                        .padding(.top, Space.section * 2)
+                        .transition(session.paletteOpenedByKeyboard ? .identity
+                                    : .scale(scale: 0.97, anchor: .top).combined(with: .opacity))
+                }
+                .animation(session.paletteOpenedByKeyboard ? nil : Tok.Motion.easeOut(Tok.Motion.popover), value: session.paletteVisible)
+            }
+        }
         .toolbar { ShellToolbar(sidebarVisible: $sidebarVisible) }
         .task {
             if Store.usesFixtures {
@@ -48,7 +60,10 @@ struct MainView: View {
     var body: some View {
         @Bindable var session = session
         VStack(spacing: 0) {
-            ChipBar(selected: $session.chip)
+            ChipBar(selected: $session.chip, filterActive: session.filterBarVisible) { session.filterBarVisible.toggle() }
+            if session.filterBarVisible {
+                FilterBar()
+            }
             if session.layout == .vertical {
                 HSplitView {
                     flows.frame(minWidth: 480)
