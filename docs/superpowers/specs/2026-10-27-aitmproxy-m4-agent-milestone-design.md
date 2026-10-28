@@ -122,8 +122,8 @@ The human-readable client label (from `initialize.clientInfo.name`, e.g. `aitm-m
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentPolicy {
-    All,       // every agent call runs (still subject to scope/rate/SSRF + always-on config gates)
-    Auto,      // autonomous: Read + Write run; Sensitive refused unless its own config gate allows (no human loop)
+    All,       // Read + Write + Sensitive run (Sensitive still iff its own config gate is on); no prompt
+    Auto,      // autonomous: Read + Write run; Sensitive always refused for the agent (no human loop)
     Ask,       // Read + Write run; Sensitive prompts the operator and runs only on approval (human in the loop)
     ReadOnly,  // only non-mutating (Read) commands
     Paused,    // nothing from the agent runs
@@ -151,11 +151,13 @@ pub trait Command {
 
 | policy | Read | Write | Sensitive |
 |---|---|---|---|
-| `All` | run | run | run (still via its config gate, e.g. `ca.allow_agent_install`) |
-| `Auto` | run | run | **refuse** unless its config gate allows (no prompt, no human) |
-| `Ask` | run | run | **prompt the operator** (needs-confirmation handshake, D4) → run on approval; refuse if no operator is connected or on timeout |
+| `All` | run | run | run **iff its own config gate is on** (e.g. `ca.allow_agent_install`); no prompt |
+| `Auto` | run | run | **always refuse** — autonomous but zero Sensitive actions (switch to `All` or `Ask` to permit them) |
+| `Ask` | run | run | **prompt the operator** (approval handshake, D4) → run on approval; refuse if no operator is connected or on timeout |
 | `ReadOnly` | run | refuse | refuse |
 | `Paused` | refuse | refuse | refuse |
+
+**Two independent dimensions (the model F8 scripting authoring and any future agent-gated capability plug into).** An agent Sensitive action needs **both**: (1) the **policy** permits Sensitive — only `All` (unconditionally) or `Ask` (via live operator approval) do; `Auto`/`ReadOnly`/`Paused` never; and (2) the command's **own deny-by-default config gate** is satisfied — `ca.allow_agent_install`, `scope.allow_agent_widen`, and (incoming, UI-extensions spec F8a/b/c) `scripts.allow_agent_authoring`, each default OFF. A human `Operator`/`Cli` is never policy-gated and authors freely. New agent-gated capabilities add a `*.allow_agent_*` flag and declare their commands `Sensitive`; nothing in the policy layer changes. So under the default `Auto`, the agent can never install the CA, widen scope, or author scripts — the operator flips the capability flag **and** runs under `All`/`Ask`.
 
 **Commands** (registered by a tiny first-party `AgentPlugin`, so they appear in `tools/list` like any other):
 
@@ -363,7 +365,7 @@ Verification is **TDD unit tests AND functional/behavioral tests that drive the 
 1. **AC-M4-1 — token class sets role:** a loopback-TCP connection presenting `operator_token` is treated as `Frontend::Operator`; one presenting `agent_token` as `Frontend::Mcp`; an unknown token is refused `-32001`. Asserted via a command whose behavior differs by role.
 2. **AC-M4-2 — `call_tool` no longer hard-codes the frontend:** an operator-role connection invoking a `confirm_prompt`-bearing command gets the confirmation handshake (AC-M4-7), proving the role is read from the connection, not hard-coded.
 3. **AC-M4-3 — sensitivity classifier & fail-closed default:** `Command::sensitivity()` defaults to `Sensitive`; the declared `Read`/`Write` commands return their tier; `mutates()` is `sensitivity()!=Read`. Asserted by iterating the registry, including that the sensitive set (`ca.install/uninstall`, `scope.add`, `findings.remove`, `agent.set`) is classified `Sensitive`.
-4. **AC-M4-4 — five-mode policy enforcement for the agent:** across `Paused`/`ReadOnly`/`Auto`/`Ask`/`All`, an agent `tools/call` is gated per the D2 matrix — `Paused` refuses all; `ReadOnly` allows only Read; `Auto` allows Read+Write and refuses Sensitive (unless its config gate allows); `Ask` allows Read+Write and parks a Sensitive call for operator approval; `All` allows all (Sensitive still via config gate). An **operator** connection is unaffected by policy in every mode.
+4. **AC-M4-4 — five-mode policy enforcement for the agent:** across `Paused`/`ReadOnly`/`Auto`/`Ask`/`All`, an agent `tools/call` is gated per the D2 matrix — `Paused` refuses all; `ReadOnly` allows only Read; `Auto` allows Read+Write and **always refuses Sensitive**; `Ask` allows Read+Write and parks a Sensitive call for operator approval; `All` allows Read+Write and runs a Sensitive call **iff its own config gate is on** (asserted with the gate both off → refused and on → runs). An **operator** connection is unaffected by policy in every mode.
 5. **AC-M4-5 — `agent.status`/`agent.set`/`agent.approve`:** `agent.status` returns the current policy, connected clients, and (so a harness can self-govern) is readable by any role; `agent.set` changes the policy and is **refused over the agent role**; `agent.approve` resolves a parked `Ask` request and is operator/CLI-only; `tools/list` exposes each command's `sensitivity` and `confirmable`.
 6. **AC-M4-5b — `Ask` approval flow:** under `Ask`, an agent Sensitive call is parked, an `approval_requested` notification is pushed to a connected operator, `agent.approve {allow:true}` runs it and `{allow:false}`/timeout/no-operator refuses it; the agent cannot approve its own request.
 
