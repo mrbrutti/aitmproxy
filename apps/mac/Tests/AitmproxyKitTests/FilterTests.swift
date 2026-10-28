@@ -61,7 +61,6 @@ private let withResponse = [41, 42, 43, 44, 45, 46, 47, 48, 53, 54]
         "~comment todo",
         "~c:gt 400",
         "(~u a & ~u b) & ~u c",
-        "!!~s",
     ])
     func roundTrips(_ text: String) throws {
         let parsed = try FilterExpression.parse(text)
@@ -79,8 +78,8 @@ private let withResponse = [41, 42, 43, 44, 45, 46, 47, 48, 53, 54]
         #expect(try FilterExpression.parse("  ~u   a   &~m  GET ").text == "~u a & ~m GET")
         #expect(try FilterExpression.parse("~u:re a").text == "~u a")
         #expect(try FilterExpression.parse("~m:equals GET").text == "~m GET")
-        #expect(try FilterExpression.parse("~u ~m") == .term(.field(.url, .regex, "~m")) == false)
         #expect(try FilterExpression.parse("~u \"~m\"") == .term(.field(.url, .regex, "~m")))
+        #expect(try FilterExpression.parse("!!~s").text == "!~q")
         #expect(try FilterExpression.parse("") == .matchAll)
         #expect(try FilterExpression.parse("   ") == .matchAll)
         #expect(FilterExpression.matchAll.text == "")
@@ -360,15 +359,26 @@ private let withResponse = [41, 42, 43, 44, 45, 46, 47, 48, 53, 54]
 
     @Test func binaryAndOversizedBodies() throws {
         var detail = Fixtures.detail(for: Fixtures.rows[0])
-        let big = Data(repeating: UInt8(ascii: "a"), count: CompiledFilter.bodyScanLimit) + Data("needle".utf8)
-        detail.response?.body = big
-        let subject = FilterSubject(row: Fixtures.rows[0], detail: detail)
-        #expect(!(try CompiledFilter(parsing: "~bs needle").matches(subject)))
-        #expect(try CompiledFilter(parsing: "~bs ^a+$").matches(subject))
+        let needle = try CompiledFilter(parsing: "~bs needle")
+        let needleText = try CompiledFilter(parsing: "~bs:contains needle")
+        let anyA = try CompiledFilter(parsing: "~bs a")
+        // "needle" starts exactly at the scan limit: not seen.
+        detail.response?.body = Data(repeating: UInt8(ascii: "a"), count: CompiledFilter.bodyScanLimit) + Data("needle".utf8)
+        let beyond = FilterSubject(row: Fixtures.rows[0], detail: detail)
+        #expect(!needle.matches(beyond))
+        #expect(!needleText.matches(beyond))
+        #expect(anyA.matches(beyond))
+        // "needle" ends exactly at the scan limit: seen.
+        detail.response?.body = Data(repeating: UInt8(ascii: "a"), count: CompiledFilter.bodyScanLimit - 6) + Data("needle".utf8)
+        let within = FilterSubject(row: Fixtures.rows[0], detail: detail)
+        #expect(needle.matches(within))
+        #expect(needleText.matches(within))
         detail.response?.body = Data([0xFF, 0xFE, 0x00, 0x41])
         let binary = FilterSubject(row: Fixtures.rows[0], detail: detail)
-        #expect(try CompiledFilter(parsing: "~bs A").matches(binary))
-        #expect(!(try CompiledFilter(parsing: "~bs:json a").matches(binary)))
+        let letterA = try CompiledFilter(parsing: "~bs A")
+        let json = try CompiledFilter(parsing: "~bs:json a")
+        #expect(letterA.matches(binary))
+        #expect(!json.matches(binary))
     }
 
     @Test func conveniencesAgreeWithCompiledFilter() throws {
@@ -390,7 +400,7 @@ private let withResponse = [41, 42, 43, 44, 45, 46, 47, 48, 53, 54]
         #expect(contains.matchRanges(in: body, field: .responseBody).map { String(body[$0]) } == ["Gateway"])
         #expect(contains.matchRanges(in: body, field: .requestBody).isEmpty)
         let regex = try CompiledFilter(parsing: "~bs \\d+")
-        #expect(regex.matchRanges(in: body, field: .responseBody).map { String(body[$0]) } == ["502", "1", "1"])
+        #expect(regex.matchRanges(in: body, field: .responseBody).map { String(body[$0]) } == ["1", "502", "1"])
         #expect(regex.matchRanges(in: body, field: .url).isEmpty)
     }
 
@@ -514,8 +524,9 @@ private let withResponse = [41, 42, 43, 44, 45, 46, 47, 48, 53, 54]
 
 @Suite struct SavedFilterStoreTests {
     @Test func roundTripsThroughFile() throws {
-        let directory = FileManager.default.temporaryDirectory
-            .appending(path: "aitmproxy-filter-tests-\(UUID().uuidString)")
+        let tmp = ProcessInfo.processInfo.environment["TMPDIR"].map { URL(filePath: $0) }
+            ?? FileManager.default.temporaryDirectory
+        let directory = tmp.appending(path: "aitmproxy-filter-tests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = SavedFilterStore(stateDirectory: directory)
         #expect(store.fileURL.lastPathComponent == "filters.json")

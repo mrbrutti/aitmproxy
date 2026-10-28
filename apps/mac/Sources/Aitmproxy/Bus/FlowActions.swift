@@ -12,6 +12,12 @@ protocol FlowActions: AnyObject {
     func replay(_ id: FlowID) async throws -> FlowID?
     func send(_ request: RequestEdits) async throws -> FlowID?
     func addScope(_ host: String) async throws
+    /// F6: `flow.mark {id, marks}` / `flow.comment {id, text}`.
+    func mark(_ id: FlowID, color: MarkColor?) async throws
+    func comment(_ id: FlowID, text: String) async throws
+    /// F7: `proxy.pause` / `proxy.resume` / `flow.clear`.
+    func setCapturing(_ on: Bool) async throws
+    func clear() async throws
 }
 
 /// Fixture behaviour: resume completes the flow with a 200 after a beat,
@@ -71,8 +77,10 @@ final class FixtureActions: FlowActions {
         copy.startedAt = .now
         copy.state = source.status == nil ? .pending : .complete
         copy.edited = false
-        session.rows.append(copy)
+        copy.mark = nil
+        copy.comment = nil
         session.details[copy.id] = session.details[id].map { FlowDetail(id: copy.id, request: $0.request, response: $0.response, connection: $0.connection) }
+        session.rows.append(copy)
         return copy.id
     }
 
@@ -85,8 +93,8 @@ final class FixtureActions: FlowActions {
             status: 200, state: .complete, origin: .human, client: Fixtures.aitm, startedAt: .now,
             duration: .milliseconds(120), requestBytes: Int64(request.body?.count ?? 0), responseBytes: 0,
             inScope: session.scopeHosts.contains { request.authority?.hasSuffix($0) ?? false })
-        session.rows.append(row)
         session.details[id] = Fixtures.detail(for: row)
+        session.rows.append(row)
         return id
     }
 
@@ -95,5 +103,25 @@ final class FixtureActions: FlowActions {
         for index in session.rows.indices where session.rows[index].authority.hasSuffix(host) {
             session.rows[index].inScope = true
         }
+    }
+
+    func mark(_ id: FlowID, color: MarkColor?) async throws {
+        guard let index = session.rows.firstIndex(where: { $0.id == id }) else { return }
+        session.rows[index].mark = color
+    }
+
+    func comment(_ id: FlowID, text: String) async throws {
+        guard let index = session.rows.firstIndex(where: { $0.id == id }) else { return }
+        session.rows[index].comment = text.isEmpty ? nil : text
+    }
+
+    func setCapturing(_ on: Bool) async throws {
+        session.capturing = on
+    }
+
+    func clear() async throws {
+        session.rows = []
+        session.details = [:]
+        session.select(nil)
     }
 }

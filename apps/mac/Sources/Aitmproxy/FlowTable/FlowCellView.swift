@@ -71,12 +71,13 @@ final class FlowCellView: NSTableCellView {
         set {}
     }
 
-    func configure(_ row: FlowRow) {
+    func configure(_ row: FlowRow, density: Density = .dense) {
         for view in [label, badge, dot, icon, swatch, monogram] as [NSView] { view.isHidden = true }
         let dim = !row.inScope
         let ink = dim ? Tok.Ink.tertiary : Tok.Ink.primary
         let meta = dim ? Tok.Ink.tertiary : Tok.Ink.secondary
-        label.font = Tok.Face.nsData(Tok.Typography.Size.md)
+        let body = density.bodySize
+        label.font = Tok.Face.nsData(body)
         label.attributedStringValue = NSAttributedString()
         label.textColor = meta.nsColor
         switch column {
@@ -87,13 +88,13 @@ final class FlowCellView: NSTableCellView {
             label.stringValue = row.isReplay ? "\(row.seq) ↻" : "\(row.seq)"
             label.isHidden = false
         case .url:
-            label.attributedStringValue = urlText(row, dim: dim)
+            label.attributedStringValue = urlText(row, dim: dim, size: body)
             label.isHidden = false
         case .client:
             if let client = row.client {
                 monogram.text = client.monogram
                 monogram.isHidden = false
-                label.font = Tok.Face.nsUI(Tok.Typography.Size.md)
+                label.font = Tok.Face.nsUI(body)
                 label.stringValue = client.name
             } else {
                 label.stringValue = Format.dash
@@ -125,7 +126,7 @@ final class FlowCellView: NSTableCellView {
                 label.isHidden = false
             case .complete:
                 label.stringValue = row.status.map(String.init) ?? Format.dash
-                label.font = Tok.Face.nsData(Tok.Typography.Size.md, .medium)
+                label.font = Tok.Face.nsData(body, .medium)
                 label.textColor = (dim ? Tok.Ink.tertiary : row.statusColor).nsColor
                 label.isHidden = false
             }
@@ -169,19 +170,23 @@ final class FlowCellView: NSTableCellView {
                 badge.font = Tok.Face.nsUI(Tok.Typography.Size.xs)
                 badge.isHidden = false
             }
+        case .comment:
+            label.font = Tok.Face.nsUI(body)
+            label.stringValue = row.comment ?? ""
+            label.textColor = ink.nsColor
+            label.isHidden = false
         case .mark:
             if let mark = row.mark {
                 swatch.layer?.backgroundColor = mark.color.cgColor
                 swatch.isHidden = false
             }
         }
-        toolTip = column == .url ? row.url : column == .ssl ? row.tls.help : nil
-        _ = ink
+        toolTip = column == .url ? row.url : column == .ssl ? row.tls.help : column == .comment ? row.comment : nil
     }
 
     /// Host in ink, path in the link colour, query dimmed; killed rows struck through.
-    private func urlText(_ row: FlowRow, dim: Bool) -> NSAttributedString {
-        let font = Tok.Face.nsData(Tok.Typography.Size.md)
+    private func urlText(_ row: FlowRow, dim: Bool, size: CGFloat) -> NSAttributedString {
+        let font = Tok.Face.nsData(size)
         let killed = row.state == .killed
         let host = dim || killed ? Tok.Ink.tertiary : Tok.Ink.primary
         let path = dim || killed ? Tok.Ink.tertiary : Tok.Ink.link

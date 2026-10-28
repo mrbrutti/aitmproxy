@@ -13,15 +13,15 @@ struct ShellToolbar: ToolbarContent {
                 Label("Toggle Sidebar", systemImage: Tok.Glyph.sidebar)
             }
             .help("Toggle sidebar")
-            Button { session.capturing.toggle() } label: {
+            Button { session.setCapturing(!session.capturing) } label: {
                 Label(session.capturing ? "Pause Capture" : "Resume Capture",
                       systemImage: session.capturing ? Tok.Glyph.pause : Tok.Glyph.record)
             }
-            .help(session.capturing ? "Pause capture" : "Resume capture")
+            .help(session.capturing ? "Pause capture (⇧⌘R)" : "Resume capture (⇧⌘R)")
             Button {} label: { Label("Compose", systemImage: Tok.Glyph.compose) }
                 .help("Compose a request (n)")
-            Button {} label: { Label("Clear", systemImage: Tok.Glyph.clear) }
-                .help("Clear the session")
+            Button { session.clearSession(confirm: ClearConfirmation.ask) } label: { Label("Clear Session", systemImage: Tok.Glyph.clear) }
+                .help("Clear every flow from the session (⌘⌫)")
         }
         .sharedBackgroundVisibility(.hidden)
         ToolbarItem(placement: .principal) {

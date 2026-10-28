@@ -10,12 +10,19 @@ struct ShellView: View {
     @State private var bus: BusService?
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Hosting controllers do not inherit this view's environment: pass it on.
-            ShellSplitView(sidebarVisible: $sidebarVisible,
-                           sidebar: SidebarView().environment(session).themed(),
-                           main: MainView().environment(session).themed())
-            StatusBar()
+        Group {
+            // APP_KIT_GALLERY=1 shows the parts gallery (DesignKit/KitGallery.swift) in place of the shell.
+            if KitGallery.enabled {
+                KitGallery()
+            } else {
+                VStack(spacing: 0) {
+                    // Hosting controllers do not inherit this view's environment: pass it on.
+                    ShellSplitView(sidebarVisible: $sidebarVisible,
+                                   sidebar: SidebarView().environment(session).themed(),
+                                   main: MainView().environment(session).themed())
+                    StatusBar()
+                }
+            }
         }
         .background(Tok.Ground.surface.color)
         .toolbar { ShellToolbar(sidebarVisible: $sidebarVisible) }
@@ -58,9 +65,14 @@ struct MainView: View {
 
     private var flows: some View {
         @Bindable var session = session
-        return FlowTableView(rows: session.visibleRows, selection: $session.selection) { id in
-            session.focused = id
-        }
+        return FlowTableView(rows: session.visibleRows, selection: $session.selection, sort: $session.sort,
+                             density: session.density, layoutURL: session.columnsURL,
+                             isPinned: { session.isPinned(.host($0)) },
+                             onComment: { id, text in session.comment(id, text) },
+                             onFocus: { id in session.focused = id },
+                             onAction: { action, id in session.perform(action, on: id) },
+                             onToggleIntercept: { session.arm(!session.interceptArmed) },
+                             onCompose: {})
         .overlay {
             if session.visibleRows.isEmpty {
                 EmptyFlows(filtered: !session.rows.isEmpty, listen: session.listenAddress)

@@ -89,7 +89,6 @@ final class BusService: FlowActions {
                     return row
                 }
             if rows != session.rows { session.rows = rows }
-            if session.autoSelect, let last = rows.last, session.focused != last.id { session.select(last.id) }
             try await Task.sleep(for: pollInterval)
         }
     }
@@ -138,6 +137,28 @@ final class BusService: FlowActions {
     func addScope(_ host: String) async throws {
         _ = try await live().call("scope.add", ["host": .string(host)])
         await refreshScope()
+    }
+
+    func mark(_ id: FlowID, color: MarkColor?) async throws {
+        let marks: JSONValue = color.map { .array([.string($0.rawValue)]) } ?? .array([])
+        _ = try await live().call("flow.mark", ["id": .string(id.raw), "marks": marks])
+    }
+
+    func comment(_ id: FlowID, text: String) async throws {
+        _ = try await live().call("flow.comment", ["id": .string(id.raw), "text": .string(text)])
+    }
+
+    func setCapturing(_ on: Bool) async throws {
+        _ = try await live().call(on ? "proxy.resume" : "proxy.pause")
+        session.capturing = on
+    }
+
+    func clear() async throws {
+        _ = try await live().call("flow.clear")
+        summaries = [:]
+        session.rows = []
+        session.details = [:]
+        session.select(nil)
     }
 
     // MARK: Endpoint

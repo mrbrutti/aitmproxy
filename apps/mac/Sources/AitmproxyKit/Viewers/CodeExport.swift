@@ -435,15 +435,14 @@ public enum CodeExport {
                 flush()
                 i += 1
             case "\\":
-                inWord = true
                 if i + 1 < chars.count {
                     let next = chars[i + 1]
                     if next == "\n" {
-                        i += 2
-                        if i < chars.count, chars[i] == "\r" { i += 1 }
+                        i += 2   // line continuation: joins the words around it
                     } else if next == "\r", i + 2 < chars.count, chars[i + 2] == "\n" {
                         i += 3
                     } else {
+                        inWord = true
                         current.unicodeScalars.append(next)
                         i += 2
                     }

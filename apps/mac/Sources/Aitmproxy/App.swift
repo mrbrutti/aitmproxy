@@ -1,3 +1,4 @@
+import AitmproxyKit
 import AppKit
 import SwiftUI
 
@@ -89,6 +90,10 @@ struct FlowCommands: Commands {
         CommandGroup(replacing: .newItem) {
             Button("Compose Request…") {}
                 .keyboardShortcut("n")
+            Divider()
+            Button("Clear Session") { session.clearSession(confirm: ClearConfirmation.ask) }
+                .keyboardShortcut(.delete, modifiers: .command)
+                .disabled(session.rows.isEmpty)
         }
         CommandMenu("Flow") {
             Button(session.interceptArmed ? "Disarm Intercept" : "Arm Intercept") {
@@ -109,11 +114,31 @@ struct FlowCommands: Commands {
             Button("Replay") { if let id = session.focused { session.replay(id) } }
                 .keyboardShortcut("r", modifiers: [])
                 .disabled(session.focused == nil)
-            Button("Build PoC from Flow…") {}
+            Button(session.focusedRow.map { $0.state == .paused || $0.state == .pending } == true ? "Kill" : "Delete") {
+                if let id = session.focused { session.deleteOrKill(id) }
+            }
+            .keyboardShortcut("d", modifiers: [])
+            .disabled(session.focused == nil)
+            Button("Build PoC from Flow…") { if let id = session.focused { session.perform(.buildPoC, on: id) } }
                 .keyboardShortcut("p", modifiers: [])
+                .disabled(session.focused == nil)
             Divider()
-            Button("Comment…") {}
+            Menu("Mark") {
+                ForEach(MarkColor.allCases, id: \.self) { color in
+                    Button(color.title) { if let id = session.focused { session.mark(id, color) } }
+                }
+                Divider()
+                Button("Clear Mark") { if let id = session.focused { session.mark(id, nil) } }
+            }
+            .disabled(session.focused == nil)
+            Button("Comment…") { if let id = session.focused { session.perform(.comment, on: id) } }
                 .keyboardShortcut("l", modifiers: .command)
+                .disabled(session.focused == nil)
+            Button(session.focusedRow.map { session.isPinned(.host($0.authority)) } == true ? "Unpin Host" : "Pin Host") {
+                if let id = session.focused { session.perform(.pinHost, on: id) }
+            }
+            .keyboardShortcut("p", modifiers: .shift)
+            .disabled(session.focused == nil)
         }
         CommandMenu("View") {
             Button("Filter Bar") {}
@@ -122,6 +147,17 @@ struct FlowCommands: Commands {
                 .keyboardShortcut("f", modifiers: [.command, .shift])
             Button("Command Palette") {}
                 .keyboardShortcut("k", modifiers: .command)
+            Divider()
+            Picker("Sort By", selection: Binding(get: { session.sort.key }, set: { session.sort = FlowSort(key: $0, ascending: true) })) {
+                ForEach(FlowSort.Key.allCases, id: \.self) { Text($0.title).tag($0) }
+            }
+            Picker("Density", selection: Binding(get: { session.density }, set: { session.density = $0 })) {
+                ForEach(Density.allCases) { Text($0.title).tag($0) }
+            }
+            Toggle("Auto-select", isOn: Binding(get: { session.autoSelect }, set: { session.autoSelect = $0 }))
+                .keyboardShortcut("a", modifiers: [.command, .shift])
+            Button(session.capturing ? "Pause Capture" : "Resume Capture") { session.setCapturing(!session.capturing) }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
         }
     }
 }

@@ -187,3 +187,13 @@ public enum Fixtures {
         }
     }
 }
+
+extension FlowRow {
+    /// A copy with another id and sequence number (tests and the self-test).
+    public func withID(_ raw: String, seq: Int) -> FlowRow {
+        var copy = self
+        copy.id = FlowID(raw)
+        copy.seq = seq
+        return copy
+    }
+}

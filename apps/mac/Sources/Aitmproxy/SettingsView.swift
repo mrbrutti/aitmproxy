@@ -56,17 +56,17 @@ enum SettingsTab: String, CaseIterable, Identifiable {
 }
 
 struct GeneralSettings: View {
-    @AppStorage("density") private var density = "dense"
-    @AppStorage("autoSelect") private var autoSelect = false
+    @Environment(Session.self) private var session
 
     var body: some View {
+        @Bindable var session = session
         Section("Flow list") {
-            Picker("Row density", selection: $density) {
-                Text("Dense (28 pt)").tag("dense")
-                Text("Default (32 pt)").tag("default")
-                Text("Comfortable (40 pt)").tag("comfortable")
+            Picker("Row density", selection: $session.density) {
+                ForEach(Density.allCases) { density in
+                    Text("\(density.title) (\(Int(density.rowHeight)) pt)").tag(density)
+                }
             }
-            Toggle("Auto-select new flows", isOn: $autoSelect)
+            Toggle("Auto-select new flows", isOn: $session.autoSelect)
         }
     }
 }

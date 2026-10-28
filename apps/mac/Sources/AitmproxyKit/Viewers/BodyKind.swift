@@ -178,7 +178,7 @@ public enum BodyKind: Hashable, Sendable {
     public static func imageInfo(_ data: Data) -> BodyKind? {
         let b = Array(data.prefix(64))
         guard b.count >= 4 else { return nil }
-        if b.count >= 8, b[0] == 0x89, b[1] == 0x50, b[2] == 0x4E, b[3] == 0x47, b[4] == 0x0D, b[5] == 0x0A, b[6] == 0x1A, b[7] == 0x1A {
+        if b.count >= 8, b[0] == 0x89, b[1] == 0x50, b[2] == 0x4E, b[3] == 0x47, b[4] == 0x0D, b[5] == 0x0A, b[6] == 0x1A, b[7] == 0x0A {
             // IHDR is always the first chunk: length(4) "IHDR"(4) width(4) height(4).
             if b.count >= 24, b[12] == 0x49, b[13] == 0x48, b[14] == 0x44, b[15] == 0x52 {
                 return .image(format: .png, width: Int(be32(b, 16)), height: Int(be32(b, 20)))

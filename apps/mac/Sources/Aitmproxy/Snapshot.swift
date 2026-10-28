@@ -30,6 +30,21 @@ enum Snapshot {
                                         IOPMAssertionLevel(kIOPMAssertionLevelOn), "Snapshots" as CFString, &awake)
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
             try? await Task.sleep(for: .seconds(1.5))
+            if env["APP_KIT_GALLERY"] == "1" {
+                // The parts gallery is one tall page: give it the whole screen, then one shot per mode.
+                if let window = NSApp.windows.first(where: { $0.canBecomeMain && !$0.isSheet }),
+                   let screen = window.screen ?? NSScreen.main {
+                    window.setFrame(screen.visibleFrame, display: true)
+                }
+                for mode in ["light", "dark"] {
+                    NSApp.appearance = NSAppearance(named: mode == "light" ? .aqua : .darkAqua)
+                    try? await Task.sleep(for: .seconds(0.8))
+                    capture(to: "\(dir)/gallery-\(mode).png")
+                }
+                print("SNAPSHOT done \(dir)")
+                NSApp.terminate(nil)
+                return
+            }
             for mode in ["light", "dark"] {
                 NSApp.appearance = NSAppearance(named: mode == "light" ? .aqua : .darkAqua)
                 for page in SidebarPage.allCases where only?.contains(page.rawValue) ?? true {

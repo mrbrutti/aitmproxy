@@ -43,6 +43,73 @@ enum SelfTest {
             session.interceptArmed = false
             check("disarming clears the armed state", !session.interceptArmed)
 
+            // S-009: sorting never moves the selection; status puts rows without a code last.
+            session.sort = FlowSort(key: .status, ascending: false)
+            check("sorting by status puts 502 first and paused last",
+                  session.visibleRows.first?.status == 502 && session.visibleRows.last?.state != .complete)
+            check("sorting keeps the selection", session.focusedRow?.seq == 41 && session.selection.count == 1)
+            session.sort = .captureOrder
+            check("capture order is the default sort", session.visibleRows.map(\.seq) == session.rows.map(\.seq))
+
+            // S-016: density moves row pitch and body size together, selection intact.
+            session.density = .comfortable
+            check("comfortable density is 40pt rows with 14pt text", session.density.rowHeight == 40 && session.density.bodySize == 14)
+            check("changing density keeps the selection", session.focusedRow?.seq == 41)
+            session.density = .dense
+
+            // S-008: the column layout round-trips through the state folder.
+            let layout = ColumnLayout(order: ["seq", "url", "method"], widths: ["url": 333], hidden: ["mark"])
+            try? layout.save(to: session.columnsURL)
+            let loaded = ColumnLayout.load(from: session.columnsURL)
+            check("column layout persists under Store.url/columns.json", loaded == layout)
+            check("a missing column width falls back to its default", loaded?.width(for: "time", default: 124) == 124)
+
+            // S-012: multi-select summary.
+            session.selection = Set(session.rows[0..<3].map(\.id))
+            check("three selected rows summarise size and timing", session.selectionSummary?.text == "3 selected · 20.7 KB · 177 ms")
+            session.select(session.rows[0].id)
+            check("one row returns the summary to the row count", session.selectionSummary == nil)
+
+            // S-013: grouping from the sidebar.
+            session.show(.apps, group: .client("curl"))
+            check("selecting curl under Apps narrows to curl's flows", session.visibleRows.count == 3 && session.visibleRows.allSatisfy { $0.client?.name == "curl" })
+            session.show(.domains, group: .host("cdn.shop-staging.test"))
+            check("selecting a host under Domains narrows to it", session.visibleRows.allSatisfy { $0.authority == "cdn.shop-staging.test" })
+            session.show(.apps)
+            check("the group header shows all flows again", session.visibleRows.count == 14)
+
+            // S-014: pins persist and never duplicate.
+            session.pin(.host("cdn.shop-staging.test"))
+            session.pin(.host("cdn.shop-staging.test"))
+            check("pinning a host twice stores it once", session.pins.hosts.filter { $0 == "cdn.shop-staging.test" }.count == 1)
+            check("pins persist under Store.url/pins.json", Pins.load(from: session.pinsURL).hosts.contains("cdn.shop-staging.test"))
+            session.unpin(.host("cdn.shop-staging.test"))
+            check("unpinning removes the host", !session.pins.hosts.contains("cdn.shop-staging.test"))
+
+            // S-015: Auto-select follows the newest flow, except from a paused row.
+            session.autoSelect = true
+            session.select(session.rows[0].id)
+            session.rows.append(Fixtures.rows[0].withID("auto-1", seq: 60))
+            check("Auto-select focuses the newest flow", session.focusedRow?.seq == 60)
+            session.select(session.rows[9].id)  // the paused login
+            session.rows.append(Fixtures.rows[0].withID("auto-2", seq: 61))
+            check("Auto-select does not steal focus from a paused row", session.focusedRow?.seq == 50)
+            session.autoSelect = false
+
+            // S-017: marks and comments.
+            let first = session.rows[0].id
+            session.mark(first, .green)
+            session.comment(first, "baseline")
+            check("marking and commenting update the row at once", session.rows[0].mark == .green && session.rows[0].comment == "baseline")
+
+            // S-018: pause and clear.
+            session.setCapturing(false)
+            try? await Task.sleep(for: .milliseconds(50))
+            check("pausing capture flips the state", !session.capturing)
+            session.clearSession(confirm: { _ in true })
+            try? await Task.sleep(for: .milliseconds(50))
+            check("clearing empties the session", session.rows.isEmpty && session.focused == nil)
+
             print(failures == 0 ? "SELFTEST PASS \(count) checks" : "SELFTEST FAIL \(failures) of \(count) checks")
             finish(code: failures == 0 ? 0 : 1)
         }

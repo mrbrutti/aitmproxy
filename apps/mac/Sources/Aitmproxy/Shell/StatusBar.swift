@@ -11,12 +11,17 @@ struct StatusBar: View {
             SmallButton("Clear") {}
             SmallButton("Filter") {}
             SmallButton("Auto-select", on: session.autoSelect) { session.autoSelect.toggle() }
+                .help("Follow the newest flow as it arrives (⇧⌘A)")
             Spacer()
             HStack(spacing: Tok.Metric.gapMeta) {
                 if let error = session.lastError {
                     Text(error).foregroundStyle(Tok.Status.serverError.color).lineLimit(1)
                 }
-                Text("\(session.selection.count) / \(session.visibleRows.count) rows")
+                if let summary = session.selectionSummary {
+                    Text(summary.text).font(Tok.Face.data(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.primary.color)
+                } else {
+                    Text("\(session.selection.count) / \(session.visibleRows.count) rows")
+                }
                 if !session.paused.isEmpty {
                     Text("\(session.paused.count) paused").foregroundStyle(Tok.Intercept.deep.color)
                 }

@@ -20,6 +20,7 @@ SwiftData database and no server.
 - After every UI change, take snapshots with sample data and look at them: `tools/snap.sh`.
   It writes `/tmp/Aitmproxy-shots/<page>-light.png` and `-dark.png` for every sidebar page, and `settings-<tab>-light.png` and `-dark.png` for every Settings tab, then quits. `APP_SNAPSHOT_PAGES=all,settings tools/snap.sh` limits the pages.
   For a panel, sheet, or popover, add a capture to `Snapshot.swift` like the Settings loop.
+- Parts gallery (every kit part in every state, `design/KIT.md`): `APP_KIT_GALLERY=1 APP_STORE=/tmp/x APP_SNAPSHOT=/tmp/Aitmproxy-gallery ~/Applications/Aitmproxy.app/Contents/MacOS/Aitmproxy` captures the parts gallery as `gallery-light.png` and `gallery-dark.png`.
 - Snapshots, seed data, and the self-test refuse to run without `APP_STORE` in /tmp.
 - Never test against the real database in `~/Library/Application Support/Aitmproxy/`.
 - Then check the grid: `tools/grid-lint.sh` and `swift tools/check-layout.swift /tmp/Aitmproxy-shots/*-layout.json`. Both print PASS.

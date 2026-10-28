@@ -1,9 +1,11 @@
 import AitmproxyKit
+import AppKit
 import SwiftUI
 
 /// Working: Pinned, Saved · All: Apps, Domains · aitmproxy: Scope, Findings,
 /// Browser, Scripts, Agent (foundation §2.6). Flat `surface`, 28px rows,
-/// counts only on queues.
+/// counts only on queues. Apps and Domains expand to one sub-item per
+/// client / host; a sub-item narrows the list (S-013); ⇧P pins one (S-014).
 struct SidebarView: View {
     @Environment(Session.self) private var session
 
@@ -14,9 +16,16 @@ struct SidebarView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     group("Working")
-                    item(.pinned, count: session.pinnedHosts.count)
-                    ForEach(session.pinnedHosts, id: \.self) { host in
-                        subItem(host, monogram: "◎", count: nil)
+                    item(.pinned, count: session.pins.hosts.count + session.pins.apps.count)
+                    ForEach(session.pins.hosts, id: \.self) { host in
+                        subItem(.host(host), title: host, monogram: "◎", count: session.hosts.first { $0.0 == host }?.1, page: .pinned)
+                    }
+                    ForEach(session.pins.apps, id: \.self) { app in
+                        subItem(.client(app), title: app, monogram: String(app.prefix(1)),
+                                count: session.clients.first { $0.0.name == app }?.1, page: .pinned)
+                    }
+                    if session.page == .pinned, session.pins.isEmpty {
+                        hint("Nothing pinned — press ⇧P on a row.")
                     }
                     item(.saved, count: session.savedSessions)
 
@@ -24,10 +33,16 @@ struct SidebarView: View {
                     item(.apps, count: session.clients.count)
                     if session.page == .apps {
                         ForEach(session.clients, id: \.0) { client, count in
-                            subItem(client.name, monogram: client.monogram, count: count)
+                            subItem(.client(client.name), title: client.name, monogram: client.monogram, count: count,
+                                    page: .apps, bundleID: client.bundleID)
                         }
                     }
                     item(.domains, count: session.hosts.count)
+                    if session.page == .domains {
+                        ForEach(session.hosts, id: \.0) { host, count in
+                            subItem(.host(host), title: host, monogram: "◎", count: count, page: .domains)
+                        }
+                    }
 
                     group("aitmproxy")
                     item(.scope, count: session.scopeHosts.count, queue: true)
@@ -67,11 +82,19 @@ struct SidebarView: View {
             .padding(.bottom, Space.sm)
     }
 
+    private func hint(_ text: String) -> some View {
+        Text(text)
+            .font(Tok.Face.ui(Tok.Typography.Size.sm))
+            .foregroundStyle(Tok.Ink.tertiary.color)
+            .padding(.leading, 28)
+            .padding(.vertical, Space.xs)
+    }
+
     private func item(_ page: SidebarPage, count: Int? = nil, text: String? = nil, queue: Bool = false,
                       agent: Bool = false) -> some View {
-        let selected = session.page == page
+        let selected = session.page == page && session.group == nil
         return Button {
-            session.page = page
+            session.show(page)
         } label: {
             HStack(spacing: Space.sm) {
                 Image(systemName: page.symbol)
@@ -84,7 +107,7 @@ struct SidebarView: View {
                 Spacer(minLength: Space.xs)
                 if let text {
                     countChip(text, queue: queue, agent: agent)
-                } else if let count {
+                } else if let count, count > 0 || !queue {
                     countChip("\(count)", queue: queue, agent: agent)
                 }
             }
@@ -94,6 +117,7 @@ struct SidebarView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     private func countChip(_ text: String, queue: Bool, agent: Bool) -> some View {
@@ -105,22 +129,39 @@ struct SidebarView: View {
             .background(agent ? Tok.Agent.tint.color : queue ? Tok.Ground.raised.color : .clear, in: Capsule())
     }
 
-    private func subItem(_ title: String, monogram: String, count: Int?) -> some View {
-        HStack(spacing: Space.sm) {
-            Monogram(text: monogram)
-            Text(title)
-                .font(Tok.Face.ui(Tok.Typography.Size.md))
-                .foregroundStyle(Tok.Ink.primary.color)
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Spacer(minLength: Space.xs)
-            if let count {
-                Text("\(count)").font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.secondary.color)
+    /// One client or host under its group. Selecting it narrows the list; the context menu pins it.
+    private func subItem(_ group: FlowGroup, title: String, monogram: String, count: Int?, page: SidebarPage,
+                         bundleID: String? = nil) -> some View {
+        let selected = session.page == page && session.group == group
+        let pinned = session.isPinned(group)
+        let noun: String = { if case .host = group { return "Host" } else { return "App" } }()
+        return Button {
+            session.show(page, group: group)
+        } label: {
+            HStack(spacing: Space.sm) {
+                AppMark(monogram: monogram, bundleID: bundleID)
+                Text(title)
+                    .font(Tok.Face.ui(Tok.Typography.Size.md, selected ? .medium : .regular))
+                    .foregroundStyle(Tok.Ink.primary.color)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: Space.xs)
+                if let count {
+                    Text("\(count)").font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.secondary.color)
+                }
             }
+            .padding(.leading, 28)
+            .padding(.trailing, Space.sm)
+            .frame(height: Tok.Size.control)
+            .background(selected ? Tok.Ground.active.color : .clear, in: RoundedRectangle(cornerRadius: Tok.Radius.control))
+            .contentShape(Rectangle())
         }
-        .padding(.leading, 28)
-        .padding(.trailing, Space.sm)
-        .frame(height: Tok.Size.control)
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button(pinned ? "Unpin \(noun)" : "Pin \(noun)") { pinned ? session.unpin(group) : session.pin(group) }
+        }
+        .accessibilityLabel("\(title), \(count ?? 0) flows\(pinned ? ", pinned" : "")")
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     private var filterField: some View {
@@ -137,7 +178,29 @@ struct SidebarView: View {
     }
 }
 
-/// A 16px app disc: the real app icon when the client resolves to one, else a monogram on `raised`.
+/// The real app icon when the client resolves to a running application, else a monogram on `raised`.
+struct AppMark: View {
+    var monogram: String
+    var bundleID: String?
+
+    var body: some View {
+        if let icon = Self.icon(for: bundleID) {
+            Image(nsImage: icon)
+                .resizable()
+                .frame(width: 16, height: 16)
+        } else {
+            Monogram(text: monogram)
+        }
+    }
+
+    static func icon(for bundleID: String?) -> NSImage? {
+        guard let bundleID else { return nil }
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else { return nil }
+        return app.icon
+    }
+}
+
+/// A 16px app disc for clients with no icon.
 struct Monogram: View {
     var text: String
     var body: some View {

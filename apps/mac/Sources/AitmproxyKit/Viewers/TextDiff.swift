@@ -198,20 +198,18 @@ public struct TextDiff: Hashable, Sendable {
     static func cap(_ text: String) -> (String, Bool) {
         let utf8 = text.utf8
         guard utf8.count > maxBytesPerSide else { return (text, false) }
-        let limit = utf8.index(utf8.startIndex, offsetBy: maxBytesPerSide)
-        var cut = String(decoding: utf8[utf8.startIndex..<limit], as: UTF8.self)
-        if let newline = cut.lastIndex(of: "\n") {
-            cut = String(cut[..<newline])
-        }
-        return (cut, true)
+        var end = utf8.index(utf8.startIndex, offsetBy: maxBytesPerSide)
+        if let newline = utf8[..<end].lastIndex(of: 0x0A) { end = newline }
+        return (String(decoding: utf8[..<end], as: UTF8.self), true)
     }
 
-    /// Lines without their terminators; a trailing newline does not add an empty line.
+    /// Lines without their LF or CRLF terminators; a trailing newline does not
+    /// add an empty line. Splits on bytes because Swift treats `\r\n` as one Character.
     static func splitLines(_ text: String) -> [String] {
         guard !text.isEmpty else { return [] }
-        var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map { line -> String in
-            if line.hasSuffix("\r") { return String(line.dropLast()) }
-            return String(line)
+        var lines = text.utf8.split(separator: 0x0A, omittingEmptySubsequences: false).map { slice -> String in
+            let bytes = slice.last == 0x0D ? slice.dropLast() : slice[...]
+            return String(decoding: bytes, as: UTF8.self)
         }
         if lines.last == "" { lines.removeLast() }
         return lines
