@@ -54,6 +54,20 @@ extension SelfTest {
             let status = session.rows.first { $0.id == row.id }?.status
             check("the sent flow completes with a status (\(status.map(String.init) ?? "none"))", status != nil)
 
+            // F5: flow.detail returns the FULL request/response — the content the
+            // operator reviews and edits. This is the gap the summary-only flow.get left.
+            check("tools/list has flow.detail (F5)", names.contains("flow.detail"))
+            await session.loadDetail(row.id)
+            if let det = session.details[row.id] {
+                // request.send carries no headers of its own; the request line must be there.
+                check("flow.detail returns the request line", det.request.startLine.contains("/"), det.request.startLine)
+                check("flow.detail returns the response with a body to review",
+                      det.response != nil && (det.response?.body?.isEmpty == false),
+                      "resp \(det.response?.startLine ?? "nil") bytes \(det.response?.body?.count ?? -1)")
+            } else {
+                check("flow.detail returned a detail for review", false, "no detail; err \(session.lastError ?? "-")")
+            }
+
             // flow.replay adds a flow and selects it.
             let count = session.rows.count
             session.replay(row.id)
@@ -68,6 +82,13 @@ extension SelfTest {
             if let curl1 = curlThroughProxy(upstream, listen: session.listenAddress) {
                 await settle(timeout: .seconds(6)) { !session.paused.isEmpty }
                 if let parked = session.paused.first {
+                    // F5 + edit path: the parked request's full content (line + the client's
+                    // real headers) is available to review and edit — a real curl sends headers.
+                    await session.loadDetail(parked.id)
+                    let pd = session.details[parked.id]
+                    check("a parked request exposes its line + headers for editing (flow.detail)",
+                          pd?.request.startLine.contains("/") == true && pd?.request.headers.isEmpty == false,
+                          "detail \(pd?.request.startLine ?? "nil") headers \(pd?.request.headers.count ?? -1)")
                     session.resume(parked.id)
                     await settle(timeout: .seconds(6)) { !session.paused.contains { $0.id == parked.id } && !curl1.isRunning }
                     check("flow.resume releases a parked flow and the client gets its response",

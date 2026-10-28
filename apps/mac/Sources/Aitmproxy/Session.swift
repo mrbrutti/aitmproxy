@@ -306,6 +306,7 @@ final class Session {
     func focus(pane: Int, on id: FlowID?) {
         focusedPane = pane
         focused = id
+        ensureDetail(for: id)
     }
 
     @ObservationIgnored private var cachedQuery: FlowQuery?
@@ -331,6 +332,7 @@ final class Session {
     func select(_ id: FlowID?) {
         selection = id.map { [$0] } ?? []
         focused = id
+        ensureDetail(for: id)
     }
 
     /// `3 selected · 24.1 KB · 1.47 s` while more than one row is selected (S-012).
