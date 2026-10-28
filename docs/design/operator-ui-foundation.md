@@ -187,6 +187,7 @@ Each component: anatomy → states → keyboard. The bus commands behind it are 
 
 | | macOS (SwiftUI/AppKit) | Web (browser) | TUI (terminal) |
 |---|---|---|---|
+| **Stack (Matt's constraints)** | **Fully native Swift/SwiftUI**; AppKit where SwiftUI cannot hold the density (the flow table). No web view, no Electron. | **Runs everywhere, native-grade fidelity and snappiness**; stack recommendation in §2.10, not locked. | **Rust, ratatui**; one binary for macOS and Linux. |
 | Tokens | `Tokens.swift` generated from tokens.json; `Color(light:dark:)`; accent follows the system accent unless Multicolor | `tokens.css` generated; `:root` + `[data-theme=dark]`; `prefers-color-scheme` default | ratatui `Style` table; truecolor → dark hex, else `tui` ANSI name; bold/dim/reverse for hierarchy |
 | UI face / data face | SF Pro / SF Mono | Inter (self-hosted) / ui-monospace, JetBrains Mono | terminal font / same |
 | Icons | SF Symbols | Lucide SVG sprite | `icon.glyph.tui` |
@@ -200,6 +201,34 @@ Each component: anatomy → states → keyboard. The bus commands behind it are 
 | Command palette | ⌘K floating | ⌘K floating | `:` prompt + fuzzy popup |
 | Mouse | yes | yes | optional |
 | Remote bus | loopback or network | network only (via the web bridge, §4.9) | loopback or network |
+
+### 2.10 Implementation targets per surface
+
+Matt's constraints (2026-10-27): the macOS app is **fully native Swift/SwiftUI**; the TUI is **Rust/ratatui and cross-platform** (Linux and macOS); the web UI **runs everywhere and must match the native app's fidelity, polish and snappiness**. One tokens file and one component vocabulary translate to all three as follows; where a translation cannot be faithful, the surface degrades the way §2.9 says, never silently.
+
+**(a) macOS — Swift/SwiftUI, AppKit-backed where density demands.**
+- Tokens: a generated `Tokens.swift` (`Color(light:dark:)` per colour token, with the Increase-Contrast variants; `Font` per size/weight; `CGFloat` per space/size/radius; `Animation` per motion token). Accent follows the Mac's system accent unless it is Multicolor, then the brand blue (HIG).
+- Flow list: an `NSTableView` wrapped for SwiftUI (`NSViewRepresentable`) — SwiftUI `Table` cannot hold 28px rows at 50 appends/s without hitching; everything else (sidebar, inspector tabs, bars, sheets) is SwiftUI. Split regions via `NSSplitViewController` or `HSplitView` with persisted widths.
+- Body viewers: a `NSTextView`-based code view with our syntax tokens (or a thin wrapper over a Swift CodeMirror-class editor if one proves faster); JSON tree as `OutlineGroup`; images native; diff via a two-column text view.
+- Icons: SF Symbols by the glyph map. App icons for the Client column from the resolved process (core resolves peer → pid; the app maps pid → `NSRunningApplication` icon).
+- Window chrome follows macOS 26 (Liquid Glass toolbar); the inside of every panel stays flat per §2.2.
+
+**(b) Web — runs everywhere, native-grade.** The bar is: 28px rows appending at 50/s with no jank, sub-16ms tab switches, a body viewer that opens a 5 MB JSON without freezing, cold load under ~300 KB gzipped. *Recommendation (a suggestion for Matt, not locked):*
+- **SolidJS + TypeScript** — fine-grained reactivity with no virtual-DOM diff, so a flow-list row updates in place when its response arrives; ~7 KB runtime. (Svelte 5 is the equivalent alternative; React would need heavy memoisation to hit the same frame budget.)
+- **Virtualised flow list** (TanStack Virtual) rendering only the visible 30–40 rows; column layout via CSS grid with `contain: strict` on rows.
+- **CodeMirror 6** for body/raw viewers — incremental parsing, viewport-only rendering, ~150 KB; it is what makes a 5 MB body scroll. (Proxyman uses Monaco; Monaco is 2–3 MB and single-threaded on load.)
+- **Tokens as CSS custom properties** (generated `tokens.css`), the data face as a self-hosted JetBrains Mono (SF Mono where present via `ui-monospace`), Lucide SVG sprite for icons, `@starting-style` and `transform/opacity`-only motion per §2.8.
+- **Delivery**: a Vite build embedded as static assets in the `aitm` binary and served by `aitm web` (§4.9), with the WebSocket bridge on the same origin; no separate deploy. Works offline against a local proxy and remotely against a TLS bus.
+- *Alternative considered:* a Rust/WASM front end (Leptos/Dioxus) sharing the Rust bus client with the TUI — one language, but WASM bundles start at ~1 MB and there is no CodeMirror-class editor in that ecosystem; not recommended for v1.
+
+**(c) TUI — Rust, ratatui, macOS + Linux.**
+- Tokens: a generated `tokens.rs` of ratatui `Style`s; truecolor terminals use the dark hex set, 256/16-colour terminals the `tui` ANSI names; weight → bold, tertiary → dim, selection → reverse in the accent. Size/space tokens collapse to cells (one line per row; sidebar 28 cols).
+- Shell: the §2.6 regions as ratatui layouts; `b` toggles the sidebar; below 120 columns the inspector takes the whole screen on `Enter` and returns on `Esc`.
+- **Degradations, by design**: no inline images (screenshots/image bodies show `[image W×H type · o to open]`, kitty/sixel graphics only if the terminal advertises them); no browser viewport (URL + DOM outline + last-screenshot placeholder; navigate/eval still work); diff is unified under 120 cols; split view needs ≥ 160 cols; no drag-and-drop (`:import <path>`); clipboard via OSC 52 where allowed; mouse optional, keyboard complete.
+- Client column: core resolves peer → process on both OSes (macOS `libproc`, Linux `/proc/net/tcp` + `/proc/*/fd`), so the TUI shows the process name on Linux too.
+- Build: a `crates/aitm-tui` binary that is a bus client like the others; it may also *embed* the proxy (`aitm tui` starts core + TUI in one process over an in-process channel) so a single binary works on a Linux box with no second process — the bus contract is unchanged either way.
+
+Shared across all three: one `aitm-bus-client` contract (§4.10) so the three clients make identical calls, and one fixture file of recorded bus traffic used by all three surfaces' UI tests so a screen renders the same data on every platform.
 
 ---
 
@@ -419,6 +448,16 @@ Not in the command surface today; the only control is the config transport. Prop
 
 Loopback TCP + token is right for a local desktop/TUI. For the web UI and remote TUI: `McpTransport::Tcp { bind, token, tls: {cert, key} }` (network listener, TLS required off-loopback) and an `aitm web` subcommand that serves the static web UI and a **WebSocket bridge** (`/bus`) relaying newline-delimited JSON-RPC lines to the local bus, authenticated by the same token in the first WS message. The bridge is dumb; all policy stays in the core.
 
+### 4.10 Clients per surface (implementation targets)
+
+| Surface | Client | Transport | Notes |
+|---|---|---|---|
+| macOS (Swift/SwiftUI) | `AitmBusClient` Swift package: `NWConnection` over loopback TCP (or network TLS), newline-delimited JSON-RPC, `Codable` models generated from `tools/list` schemas at build time plus a dynamic path for unknown commands | loopback TCP today; TLS TCP after F15 | May spawn `aitm` itself and read `on_bound`; subscribes (F4) on a second connection |
+| Web (TS, recommended SolidJS) | `aitm-bus-client` TypeScript package over **WebSocket** to `aitm web`'s `/bus` bridge; same JSON-RPC lines; `tools/list` → runtime form generation | WS bridge (F15); same-origin | Reconnect with back-off; the bridge is dumb, all policy in core |
+| TUI (Rust/ratatui) | `aitm-bus-client` Rust crate (shared with any future Rust surface), `tokio` TCP; in-process channel when the TUI embeds the proxy | loopback TCP or TLS TCP (F15); in-process | Linux + macOS |
+
+All three send `initialize.clientInfo.name` (`aitm-mac` / `aitm-web` / `aitm-tui`) and connect with the **operator** token class (F1), so the core treats them as `Frontend::Operator` and the activity log names them.
+
 ---
 
 ## 5. Core follow-ups (Rust side) — ordered by how much UI they unblock
@@ -452,9 +491,11 @@ F1, F2, F4, F5 are the critical path for any of the three surfaces; F3 and F6 ma
 3. **"The feature Proxyman now has."** Candidates from the changelog (Appendix A), most likely first: **MCP server** (6.4, Jan 2026; v3 in 6.8 — Codex/Claude Code/Cursor control Proxyman; they also ship a `SKILL.md`), **Network Extension** (26.1, Oct 10 2026 — capture every app without proxy settings), **Split View** (26.0), **HTTP/2 capture** (26.0), **Overview Dashboard + Timing view** (26.2, Oct 18), **`onWebsocket()` scripting** (26.1–26.3), **Command Palette** (6.0), **Team Workspace / share log online** (6.4–6.5). Which did you mean? If MCP: §4.8's toggle is our answer, plus we already *are* an MCP server — the difference is we let the agent drive 100%.
 4. **Agent policy default.** `All` (agent acts freely until paused) or `ReadOnly` (human promotes it)? I lean `All` for a tool whose premise is agent-driven testing, with the toggle one click away.
 5. **Web UI hosting.** `aitm web` built into the binary (my proposal, §4.9) vs. a separate static bundle pointed at a bus URL?
-6. **Client app resolution** (the `Client` column): macOS can map the peer socket to a process/app icon; web/TUI can't. Fine to show `pid`/`peer` there, or drop the column off-mac?
+6. **Client app resolution** (the `Client` column): I now propose the core resolves peer → process on macOS (`libproc`) and Linux (`/proc`), so every surface gets the process name and the Mac app adds the icon; the web UI shows what the core gives it. OK to add that to F5?
 7. **Density default**: 28px rows (Proxyman) or 32?
 8. **Mark colours**: Proxyman's 11 macOS system colours, or a smaller set that survives the TUI's 8?
+9. **Web stack**: §2.10(b) recommends SolidJS + TypeScript, TanStack Virtual, CodeMirror 6, Vite, embedded in the binary behind `aitm web`. Accept as the starting point, or do you have a stack you want?
+10. **TUI embedding**: should `aitm tui` be able to start the proxy in-process (one binary on a Linux box), in addition to connecting to a running one?
 
 ---
 
