@@ -179,6 +179,7 @@ async fn run() -> anyhow::Result<()> {
     let mcp = aitm_mcp::McpServer::new(registry, cfg.mcp.transport.clone())
         .with_ssrf_policy(cfg.browser.ssrf.clone())
         .with_poc_dir(cfg.poc.dir.clone())
+        .with_mcp_roles(cfg.mcp.operator_token.clone(), cfg.mcp.stdio_role)
         .with_config(Arc::new(cfg.clone()))
         .with_services(store, client, guard, browser);
 

@@ -31,6 +31,37 @@ pub const INTERNAL_ERROR: i64 = -32603;
 /// A loopback-TCP connection whose first line was not the expected token.
 pub const UNAUTHORIZED: i64 = -32001;
 
+/// Per-connection context, built once by the transport after it has classified
+/// the connection's auth token (or, for stdio, from `mcp.stdio_role`), and
+/// threaded into every message on that connection through [`McpServer::handle_on`].
+///
+/// The `role` drives policy and confirmation decisions (Tasks 4/5/9); the
+/// `client_label` is the connection's `initialize.clientInfo.name`, carried for
+/// audit only. (Task 7 adds the bounded push sink here.)
+#[derive(Debug, Clone)]
+pub struct ConnCtx {
+    /// The frontend this connection speaks as.
+    pub role: Frontend,
+    /// The human-readable client label from `initialize.clientInfo.name`.
+    pub client_label: Option<String>,
+}
+
+impl ConnCtx {
+    /// A context for `role` with no client label yet.
+    pub fn new(role: Frontend) -> Self {
+        Self {
+            role,
+            client_label: None,
+        }
+    }
+
+    /// The default agent context (`Frontend::Mcp`, no label) the back-compat
+    /// [`McpServer::handle`] wrapper uses.
+    pub fn agent() -> Self {
+        Self::new(Frontend::Mcp)
+    }
+}
+
 /// The core services a `CommandHost` borrows; shared handles so one server can
 /// answer many connections.
 struct Services {
@@ -51,6 +82,10 @@ pub struct McpServer {
     ssrf: SsrfPolicy,
     poc_dir: Option<std::path::PathBuf>,
     config: Option<Arc<aitm_core::Config>>,
+    /// The second loopback-TCP token; a connection presenting it is an operator.
+    operator_token: Option<Arc<str>>,
+    /// The role a stdio connection speaks as (default [`Frontend::Mcp`]).
+    stdio_role: Frontend,
 }
 
 /// A JSON-RPC level failure (as opposed to a tool's own error result).
@@ -80,7 +115,23 @@ impl McpServer {
             ssrf: SsrfPolicy::default(),
             poc_dir: None,
             config: None,
+            operator_token: None,
+            stdio_role: Frontend::Mcp,
         }
+    }
+
+    /// The operator token (loopback TCP) and the stdio connection's role. The
+    /// agent token stays on [`McpTransport::LoopbackTcp`]; an operator token here
+    /// lets a loopback connection present it to be treated as [`Frontend::Operator`].
+    pub fn with_mcp_roles(mut self, operator_token: Option<String>, stdio_role: Frontend) -> Self {
+        self.operator_token = operator_token.map(Into::into);
+        self.stdio_role = stdio_role;
+        self
+    }
+
+    /// The role a stdio connection is served as (default [`Frontend::Mcp`]).
+    pub fn stdio_role(&self) -> Frontend {
+        self.stdio_role
     }
 
     /// Attach the proxy configuration so `config.get`/`proxy.status` can read it.
@@ -141,6 +192,8 @@ impl McpServer {
             ssrf,
             poc_dir,
             config,
+            operator_token,
+            stdio_role,
         } = self;
         let on_bound = on_bound.into_inner().unwrap_or(None);
         let server = Arc::new(McpServer {
@@ -151,11 +204,15 @@ impl McpServer {
             ssrf,
             poc_dir,
             config,
+            operator_token: operator_token.clone(),
+            stdio_role,
         });
         match selected {
             McpTransport::Stdio => transport::serve_stdio(server).await,
             McpTransport::LoopbackTcp { port, token } => {
-                let listener = LoopbackTcp::bind(port, token).await?;
+                let listener = LoopbackTcp::bind(port, token)
+                    .await?
+                    .with_operator_token(operator_token.map(|t| t.to_string()));
                 if let Some(f) = on_bound {
                     f(listener.local_addr());
                 }
@@ -164,8 +221,17 @@ impl McpServer {
         }
     }
 
-    /// Handle one JSON-RPC message; `None` when it was a notification (no reply).
+    /// Handle one JSON-RPC message with a default agent connection
+    /// ([`Frontend::Mcp`], no client label). Back-compat wrapper over
+    /// [`McpServer::handle_on`] for in-process callers and existing tests.
     pub fn handle(&self, message: &str) -> Option<String> {
+        self.handle_on(&ConnCtx::agent(), message)
+    }
+
+    /// Handle one JSON-RPC message on a specific connection; `None` when it was
+    /// a notification (no reply). The `conn` carries the frontend role and the
+    /// client label, so `tools/call` runs against the right [`Frontend`].
+    pub fn handle_on(&self, conn: &ConnCtx, message: &str) -> Option<String> {
         let parsed: JsonValue = match serde_json::from_str(message) {
             Ok(v) => v,
             Err(e) => {
@@ -198,7 +264,7 @@ impl McpServer {
             );
         };
         let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-        let outcome = self.dispatch(method, &params);
+        let outcome = self.dispatch(conn, method, &params);
         let id = id?;
         Some(
             match outcome {
@@ -209,7 +275,12 @@ impl McpServer {
         )
     }
 
-    fn dispatch(&self, method: &str, params: &JsonValue) -> Result<JsonValue, RpcError> {
+    fn dispatch(
+        &self,
+        conn: &ConnCtx,
+        method: &str,
+        params: &JsonValue,
+    ) -> Result<JsonValue, RpcError> {
         match method {
             "initialize" => {
                 let version = params
@@ -231,7 +302,7 @@ impl McpServer {
                     .collect();
                 Ok(json!({"tools": tools}))
             }
-            "tools/call" => self.call_tool(params),
+            "tools/call" => self.call_tool(conn, params),
             m if m.starts_with("notifications/") => Ok(JsonValue::Null),
             other => Err(RpcError::new(
                 METHOD_NOT_FOUND,
@@ -240,7 +311,7 @@ impl McpServer {
         }
     }
 
-    fn call_tool(&self, params: &JsonValue) -> Result<JsonValue, RpcError> {
+    fn call_tool(&self, conn: &ConnCtx, params: &JsonValue) -> Result<JsonValue, RpcError> {
         let name = params
             .get("name")
             .and_then(JsonValue::as_str)
@@ -278,9 +349,14 @@ impl McpServer {
         )
         .with_ssrf(self.ssrf.clone())
         .with_poc_dir(self.poc_dir.clone())
-        // Said explicitly, though it is the default: an agent is on this end,
-        // so a gated command relies on its config flag, never on a prompt.
-        .with_frontend(Frontend::Mcp);
+        // The role comes from the connection (token class, or stdio_role), not a
+        // hard-coded agent: an operator UI is treated as a human, an agent as an
+        // agent, so gated commands and policy decide by who is actually on the end.
+        .with_frontend(conn.role);
+        let host = match &conn.client_label {
+            Some(label) => host.with_client_label(label.clone()),
+            None => host,
+        };
         let host = match &self.config {
             Some(cfg) => host.with_config(cfg.clone()),
             None => host,

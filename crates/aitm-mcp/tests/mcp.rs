@@ -15,7 +15,7 @@ use aitm_core::{
 };
 use aitm_mcp::json::{from_json, to_json};
 use aitm_mcp::transport::LoopbackTcp;
-use aitm_mcp::{McpSchemaDerive, McpServer, StdSchemaDerive};
+use aitm_mcp::{ConnCtx, McpSchemaDerive, McpServer, StdSchemaDerive};
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -261,9 +261,30 @@ impl Command for FrontendCmd {
         let label = match host.frontend() {
             Frontend::Cli => "cli",
             Frontend::Mcp => "mcp",
+            Frontend::Operator => "operator",
             _ => "other",
         };
         Ok(Value::Str(label.into()))
+    }
+}
+
+/// `demo.client`: reports the host's client label (`<none>` when unset), so a
+/// test can prove the `initialize.clientInfo.name` capture reaches `CommandHost`.
+struct ClientLabelCmd;
+
+impl Command for ClientLabelCmd {
+    fn name(&self) -> &str {
+        "demo.client"
+    }
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "Names the connection's client label.".into(),
+            params: vec![],
+            result: TypeDesc::Str,
+        }
+    }
+    fn invoke(&self, _args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        Ok(Value::Str(host.client_label().unwrap_or("<none>").into()))
     }
 }
 
@@ -712,6 +733,7 @@ async fn serve_lines_answers_each_request_on_its_own_line() {
         srv,
         BufReader::new(srv_r),
         srv_w,
+        ConnCtx::agent(),
     ));
 
     let (cli_r, mut cli_w) = tokio::io::split(client_side);
@@ -841,4 +863,151 @@ async fn serve_binds_loopback_from_config() {
     let reply: JsonValue =
         serde_json::from_str(&lines.next_line().await.expect("io").expect("line")).expect("json");
     assert_eq!(tool_names(&reply).len(), 6);
+}
+
+// ----------------------------------------------------- M4 Task 3: conn role
+
+/// A registry exposing the two role/label reporter stubs.
+fn role_registry() -> Arc<Registry> {
+    let mut reg = Registry::new();
+    reg.add_command(Arc::new(FrontendCmd));
+    reg.add_command(Arc::new(ClientLabelCmd));
+    Arc::new(reg)
+}
+
+/// A loopback-TCP server over `role_registry`, agent token `agent`, operator
+/// token `op`, bound on a free port; returns the bound address.
+async fn serve_role_server() -> SocketAddr {
+    let srv = McpServer::new(
+        role_registry(),
+        McpTransport::LoopbackTcp {
+            port: 0,
+            token: "agent".into(),
+        },
+    )
+    .with_services(
+        Arc::new(MemFlowStore::new()),
+        Arc::new(StubClient),
+        Arc::new(StdGuard::default()),
+        None,
+    )
+    .with_mcp_roles(Some("op".into()), Frontend::Mcp);
+    let (tx, rx) = tokio::sync::oneshot::channel::<SocketAddr>();
+    tokio::spawn(
+        srv.on_bound(move |addr| {
+            let _ = tx.send(addr);
+        })
+        .serve(),
+    );
+    rx.await.expect("serve reports its bound address")
+}
+
+/// Open a connection, send `first_line` (the auth preamble) then `calls`, and
+/// return the first reply line parsed as JSON.
+async fn first_reply(addr: SocketAddr, lines_in: &str) -> JsonValue {
+    let mut s = TcpStream::connect(addr).await.expect("connect");
+    s.write_all(lines_in.as_bytes()).await.expect("write");
+    let (r, _w) = s.split();
+    let mut lines = BufReader::new(r).lines();
+    serde_json::from_str(&lines.next_line().await.expect("io").expect("a reply line"))
+        .expect("json")
+}
+
+/// AC-M4-1: the operator token sets `Frontend::Operator`.
+#[tokio::test]
+async fn operator_token_sets_operator_role() {
+    let addr = serve_role_server().await;
+    let reply = first_reply(
+        addr,
+        "{\"token\":\"op\"}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"demo.frontend\",\"arguments\":{}}}\n",
+    )
+    .await;
+    assert_eq!(reply["result"]["structuredContent"], json!("operator"));
+}
+
+/// AC-M4-1: the agent token sets `Frontend::Mcp`.
+#[tokio::test]
+async fn agent_token_sets_agent_role() {
+    let addr = serve_role_server().await;
+    let reply = first_reply(
+        addr,
+        "{\"token\":\"agent\"}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"demo.frontend\",\"arguments\":{}}}\n",
+    )
+    .await;
+    assert_eq!(reply["result"]["structuredContent"], json!("mcp"));
+}
+
+/// AC-M4-1: an unknown token is refused `-32001`, no role assigned.
+#[tokio::test]
+async fn unknown_token_refused() {
+    let addr = serve_role_server().await;
+    let reply = first_reply(
+        addr,
+        "{\"token\":\"bogus\"}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"demo.frontend\",\"arguments\":{}}}\n",
+    )
+    .await;
+    assert_eq!(reply["error"]["code"], json!(-32001));
+    assert_eq!(reply["error"]["message"], json!("unauthorized"));
+}
+
+/// AC-M4-1: stdio defaults to the agent role, threaded through `serve_lines`.
+#[tokio::test]
+async fn stdio_default_role_is_agent() {
+    let srv = Arc::new(
+        McpServer::new(role_registry(), McpTransport::Stdio).with_services(
+            Arc::new(MemFlowStore::new()),
+            Arc::new(StubClient),
+            Arc::new(StdGuard::default()),
+            None,
+        ),
+    );
+    assert_eq!(srv.stdio_role(), Frontend::Mcp);
+
+    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+    let (srv_r, srv_w) = tokio::io::split(server_side);
+    let conn = ConnCtx::new(srv.stdio_role());
+    let task = tokio::spawn(aitm_mcp::transport::serve_lines(
+        srv,
+        BufReader::new(srv_r),
+        srv_w,
+        conn,
+    ));
+
+    let (cli_r, mut cli_w) = tokio::io::split(client_side);
+    let mut lines = BufReader::new(cli_r).lines();
+    cli_w
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"demo.frontend\",\"arguments\":{}}}\n")
+        .await
+        .expect("write");
+    let reply: JsonValue =
+        serde_json::from_str(&lines.next_line().await.expect("io").expect("line")).expect("json");
+    assert_eq!(reply["result"]["structuredContent"], json!("mcp"));
+    cli_w.shutdown().await.expect("shutdown");
+    task.await.expect("join").expect("loop ends cleanly at EOF");
+}
+
+/// The `initialize.clientInfo.name` is captured onto the connection and reaches
+/// `CommandHost::client_label` for subsequent calls (unset before any call).
+#[tokio::test]
+async fn client_label_captured_from_initialize() {
+    let addr = serve_role_server().await;
+    let mut s = TcpStream::connect(addr).await.expect("connect");
+    s.write_all(
+        b"{\"token\":\"op\"}\n\
+          {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"aitm-mac\",\"version\":\"0\"}}}\n\
+          {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"demo.client\",\"arguments\":{}}}\n",
+    )
+    .await
+    .expect("write");
+    let (r, _w) = s.split();
+    let mut lines = BufReader::new(r).lines();
+    let init: JsonValue =
+        serde_json::from_str(&lines.next_line().await.expect("io").expect("init reply"))
+            .expect("json");
+    assert_eq!(init["id"], json!(1));
+    let call: JsonValue =
+        serde_json::from_str(&lines.next_line().await.expect("io").expect("call reply"))
+            .expect("json");
+    assert_eq!(call["id"], json!(2));
+    assert_eq!(call["result"]["structuredContent"], json!("aitm-mac"));
 }

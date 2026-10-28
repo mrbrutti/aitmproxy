@@ -18,8 +18,9 @@ use anyhow::{bail, Context as _};
 use serde::Deserialize;
 
 use aitm_core::{
-    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, FirefoxConfig, LimitConfig,
-    McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SsrfPolicy, Value,
+    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, FirefoxConfig, Frontend,
+    LimitConfig, McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry,
+    SsrfPolicy, Value,
 };
 use aitm_plugin_rhai::{RhaiConfig, ScriptEntry};
 
@@ -358,12 +359,38 @@ struct McpFile {
     /// YAML tag. `default` keeps the key optional under `with`.
     #[serde(default, with = "serde_yaml::with::singleton_map")]
     transport: Option<TransportFile>,
+    /// A second loopback-TCP token; a connection presenting it is a human
+    /// operator ([`Frontend::Operator`]) rather than an agent.
+    operator_token: Option<String>,
+    /// The role a stdio connection speaks as (default `agent`).
+    stdio_role: Option<RoleFile>,
 }
 
 impl McpFile {
     fn apply(self, c: &mut McpConfig) {
         if let Some(t) = self.transport {
             c.transport = t.into();
+        }
+        if self.operator_token.is_some() {
+            c.operator_token = self.operator_token;
+        }
+        set(&mut c.stdio_role, self.stdio_role.map(Into::into));
+    }
+}
+
+/// `stdio_role: agent | operator`.
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RoleFile {
+    Agent,
+    Operator,
+}
+
+impl From<RoleFile> for Frontend {
+    fn from(r: RoleFile) -> Self {
+        match r {
+            RoleFile::Agent => Frontend::Mcp,
+            RoleFile::Operator => Frontend::Operator,
         }
     }
 }

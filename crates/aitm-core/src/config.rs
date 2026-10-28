@@ -9,6 +9,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::agent::AgentPolicy;
+use crate::ctx::Frontend;
+
 /// Top-level configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -192,12 +195,32 @@ pub enum McpTransport {
 #[derive(Debug, Clone)]
 pub struct McpConfig {
     pub transport: McpTransport,
+    /// The token that marks a loopback-TCP connection as an autonomous agent
+    /// ([`Frontend::Mcp`]). For the loopback transport the required token also
+    /// lives on [`McpTransport::LoopbackTcp`]; this field is the canonical name
+    /// so wiring and audit can speak of "the agent token" directly.
+    pub agent_token: Option<String>,
+    /// The token that marks a loopback-TCP connection as a human operator
+    /// ([`Frontend::Operator`]). **Off by default**: without it, every
+    /// loopback connection is an agent, matching the M1/M2 posture.
+    pub operator_token: Option<String>,
+    /// The agent policy the server starts under (enforced from Task 4). Default
+    /// [`AgentPolicy::Auto`] per the milestone's adopted default.
+    pub policy: AgentPolicy,
+    /// The role a stdio connection is given (there is no token on stdio).
+    /// Default [`Frontend::Mcp`] — stdio is the agent-attach transport; an
+    /// operator attached over stdio sets this to [`Frontend::Operator`].
+    pub stdio_role: Frontend,
 }
 
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
             transport: McpTransport::Stdio,
+            agent_token: None,
+            operator_token: None,
+            policy: AgentPolicy::Auto,
+            stdio_role: Frontend::Mcp,
         }
     }
 }
