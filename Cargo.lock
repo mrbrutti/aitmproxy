@@ -112,6 +112,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "aitm-findings"
+version = "0.1.0"
+dependencies = [
+ "aitm-core",
+ "aitm-poc",
+ "anyhow",
+ "futures",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "aitm-mcp"
 version = "0.1.0"
 dependencies = [

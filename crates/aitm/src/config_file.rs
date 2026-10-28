@@ -18,9 +18,9 @@ use anyhow::{bail, Context as _};
 use serde::Deserialize;
 
 use aitm_core::{
-    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, FirefoxConfig, Frontend,
-    LimitConfig, McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry,
-    SsrfPolicy, Value,
+    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, FindingsConfig, FirefoxConfig,
+    Frontend, LimitConfig, McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig,
+    ScopeEntry, SsrfPolicy, Value,
 };
 use aitm_plugin_rhai::{RhaiConfig, ScriptEntry};
 
@@ -109,6 +109,7 @@ struct ConfigFile {
     mcp: Option<McpFile>,
     browser: Option<BrowserFile>,
     poc: Option<PocFile>,
+    findings: Option<FindingsFile>,
     ssl_insecure: Option<bool>,
     max_flows: Option<usize>,
     max_flow_bytes: Option<usize>,
@@ -138,6 +139,9 @@ impl ConfigFile {
         }
         if let Some(p) = self.poc {
             p.apply(&mut c.poc);
+        }
+        if let Some(f) = self.findings {
+            f.apply(&mut c.findings);
         }
         set(&mut c.ssl_insecure, self.ssl_insecure);
         set(&mut c.max_flows, self.max_flows);
@@ -530,6 +534,21 @@ impl PocFile {
         }
         if let Some(d) = self.out_dir {
             c.out_dir = Some(d);
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FindingsFile {
+    /// Where the persistent findings store writes per-finding YAML + `runs.jsonl`.
+    dir: Option<PathBuf>,
+}
+
+impl FindingsFile {
+    fn apply(self, c: &mut FindingsConfig) {
+        if let Some(d) = self.dir {
+            c.dir = Some(d);
         }
     }
 }
