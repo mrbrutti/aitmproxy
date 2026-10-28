@@ -19,6 +19,7 @@ This folder holds the reference research gathered while defining **aitmproxy**
 | [05-synthesis.md](05-synthesis.md) | — | Combined design takeaways for aitmproxy |
 | [06-obscura-embedding.md](06-obscura-embedding.md) | obscura | Embedding obscura as aitmproxy's browser engine: embeddability, CDP surface, MITM/CA gap |
 | [07-ca-install.md](07-ca-install.md) | mkcert, mitmproxy, Burp, OS trust-store tools | Exporting/installing/uninstalling/checking the root CA on macOS, Linux, Windows: exact commands, exit codes, idempotency, SHA-256 vs SHA-1 keys |
+| [08-l4-packet-rust.md](08-l4-packet-rust.md) | pnet, pcap, socket2/nix, etherparse, scapy, boofuzz | Raw-L4 / packet capture + injection in Rust for M4: crate comparison, per-OS privilege model (`CAP_NET_RAW`, `/dev/bpf*`), macOS/Linux limits, how scapy/boofuzz separate crafting from sending and bound rate |
 | [MEMORY.md](MEMORY.md) | — | Project memory: durable facts and decisions |
 
 ## Reference projects
