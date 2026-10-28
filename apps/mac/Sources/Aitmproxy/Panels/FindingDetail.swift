@@ -60,6 +60,7 @@ struct FindingDetail: View {
                     }
                 }
                 CodeTextView(text: state.yamlDraft, contentType: "text/yaml", editable: true,
+                             completion: { LanguageCompletion.pocYAML(source: $0, caret: $1) },
                              onTextChange: { state.yamlDraft = $0 })
                     .frame(height: 260) // grid: ok fixed editor height on a scrolling page
                     .clipShape(RoundedRectangle(cornerRadius: Tok.Radius.control))

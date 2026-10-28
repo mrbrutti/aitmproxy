@@ -3,6 +3,8 @@ import Foundation
 /// Syntax roles for the body viewers and header tables (tokens `color.syntax.*`).
 public enum SyntaxKind: Hashable, Sendable {
     case plain, key, string, number, boolean, punct, bracket, method, version
+    /// Code-editing additions (Rhai / PoC-YAML): control keywords and comments.
+    case keyword, comment
 }
 
 public struct SyntaxRun: Hashable, Sendable {
