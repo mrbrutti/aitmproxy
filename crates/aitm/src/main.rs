@@ -27,8 +27,19 @@ use tracing::{info, warn};
 /// The config file path when `--config` is not given.
 const CONFIG_ENV: &str = "AITM_CONFIG";
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// The runtime is built by hand rather than with `#[tokio::main]` so its
+/// workers get a stack sized for script evaluation: a hook runs on the worker
+/// that dispatches it (`block_in_place`), and Rhai recurses once per nesting
+/// level of a value — see `aitm_plugin_rhai::engine::WORKER_STACK_SIZE`.
+fn main() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(aitm_plugin_rhai::engine::WORKER_STACK_SIZE)
+        .build()?;
+    runtime.block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     init_tracing();
 
     let (config_arg, argv) = split_config_arg(std::env::args().skip(1).collect())?;
@@ -40,6 +51,9 @@ async fn main() -> anyhow::Result<()> {
     } = config_file::load_settings(config_path.as_deref())?;
     env::apply(&mut cfg, |k| std::env::var(k).ok());
     env::apply_rhai(&mut rhai_cfg, |k| std::env::var(k).ok());
+    // A script's `browser.navigate` decides SSRF under the same policy as the
+    // `browser.navigate` command.
+    rhai_cfg.ssrf = cfg.browser.ssrf.clone();
     // `--script` entries come last, so they take the chain positions after the
     // config's (spec §8: config entries, then flags).
     rhai_cfg
@@ -73,6 +87,19 @@ async fn main() -> anyhow::Result<()> {
     for plugin in &tier.plugins {
         info!(target: "aitm::scripts", script = %plugin.name(), "script plugin registered");
     }
+    // Scripts see bodies up to the proxy's configured cap; the engine's string
+    // and blob limits default to the same figure, and must keep up with it.
+    let max_body = cfg.limits.max_body_bytes;
+    if max_body > tier.limits.max_string_size || max_body > tier.limits.max_array_size {
+        warn!(
+            target: "aitm::scripts",
+            max_body_bytes = max_body,
+            max_string_size = tier.limits.max_string_size,
+            max_array_size = tier.limits.max_array_size,
+            "limits.max_body_bytes exceeds the rhai string/blob limits; scripts reading a body \
+             larger than those limits will fail (raise rhai.max_string_size / max_array_size)"
+        );
+    }
 
     let Assembled { proxy, ca } = assemble_with_scripts(
         &cfg,
@@ -81,9 +108,10 @@ async fn main() -> anyhow::Result<()> {
             plugins: tier
                 .plugins
                 .into_iter()
-                .map(|p| Box::new(p) as Box<dyn Plugin>)
+                .map(|p| Box::new(p.with_max_body(max_body)) as Box<dyn Plugin>)
                 .collect(),
             executor: Some(tier.executor.clone()),
+            commands: Some(Box::new(tier.commands)),
         },
     )?;
 

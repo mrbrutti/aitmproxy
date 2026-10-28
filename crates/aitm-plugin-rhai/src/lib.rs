@@ -8,6 +8,7 @@
 //! Every module is declared here up front so later tasks never re-touch this file.
 
 pub mod command;
+pub mod commands;
 pub mod config;
 pub mod engine;
 pub mod error;
@@ -26,13 +27,15 @@ pub mod wire;
 // stay public for tests and for a capability provider in another crate; these
 // are the names a binary needs.
 pub use command::{register_reg_api, ScriptCommand, ScriptRegHandle};
+pub use commands::ScriptCommands;
 pub use config::{RhaiConfig, RhaiLimits, ScriptEntry, ScriptMeta};
+pub use engine::{Budget, RunKind, WORKER_STACK_SIZE};
 pub use error::ScriptError;
 pub use host_core::{
     Finding, FindingSink, MemoryFindingSink, Options, ScriptCapability, ScriptServices,
 };
 pub use loader::{RhaiLoader, SUPPORTED_API};
-pub use plugin::{ErrorSink, ScriptPlugin};
+pub use plugin::{ErrorSink, ScriptHandle, ScriptPlugin};
 pub use poc_step::{RhaiScriptExecutor, ScriptVars, VarsCapability};
 pub use prelude::PRELUDE_SRC;
 pub use wire::{build, executor, load_scripts, ScriptTier};

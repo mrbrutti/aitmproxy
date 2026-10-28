@@ -383,6 +383,30 @@ What merged, what was cut, follow-ups. Filled at stage 7.
 
 ### Deferred follow-ups
 
+- **From the stage-6 panel (2026-10-28 fix round; Minor, not fixed):**
+  - PoC step compile cache keyed by a 64-bit `DefaultHasher` of `(name, body)`
+    (`poc_step.rs`); key by the exact `(String, String)` or a 256-bit digest.
+  - `Event::Error` for a failed hook is dispatched through a second `Chain`
+    and races the originating dispatch's `store.insert` (last writer wins on
+    marks/comment); emit through the proxy's own sink after persistence.
+  - No per-hook log line cap: a hook can emit ~2M log lines per event within
+    budget; add a per-hook cap or token bucket on the script log target.
+  - `ScriptCapability::min_api` is declared but never enforced (one API
+    version exists); enforce at registration when a second version lands.
+  - `Http1Sender` (the M1 replay path) still writes `method`/`path` to the
+    request line unvalidated; the script path validates them in `parse_request`
+    — mirror the token/CTL check in the sender.
+  - `http.send` consumes two rate-limit tokens per call (`check_active` here
+    and again in `PipelineClient::send`); parity with the M1 PoC runner.
+  - `wire::load_scripts` drops the `ErrorSink`; `RhaiConfig.hot_reload` is
+    unread; WebSocket write-back targets `messages.last_mut()` by assumption;
+    `ScriptedPocRunCommand` duplicates `PocRunCommand`; `ScriptStepCtx.artifacts`
+    is reserved/unpopulated; `--strict-scripts` is the `AITM_SCRIPTS_STRICT`
+    env var instead; `configure()` is listed but has no event to fire on; a
+    script-only PoC cannot anchor `finding_capture`; `option` is registered by
+    the `log` provider.
+  - `script.reload` swaps hooks only; commands/options a script's `load(reg)`
+    registered are unchanged until restart (the registry is sealed once built).
 - **Script-step screenshot → PoC artifact file.** Task 14 flagged, Task 15
   resolved as option C (Matt via orchestrator, 2026-10-27): in M3 a PoC `script`
   step's `browser.screenshot()` returns the screenshot bytes to the script but is

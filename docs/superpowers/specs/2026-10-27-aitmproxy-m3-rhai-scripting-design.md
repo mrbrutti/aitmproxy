@@ -538,9 +538,32 @@ bridge is the one structural subtlety in this milestone.
   therefore cannot starve other flows — mitmproxy's `@concurrent` lesson,
   realized.
 - Inside that closure, an async host function drives its guarded future with the
-  stored handle: `services.rt.block_on(fut)`. The guards run inside the future, so
-  **every script-initiated network or browser action is scope/rate/SSRF checked
-  on exactly the same path as a Rust plugin's** (no second code path to audit).
+  stored handle: `services.rt.block_on(tokio::time::timeout(remaining, fut))`,
+  where `remaining` is what is left of the run's `hook_timeout`. The guards run
+  inside the future, so **every script-initiated network or browser action is
+  scope/rate/SSRF checked on exactly the same path as a Rust plugin's** (no
+  second code path to audit), and a peer that never answers ends the hook at
+  its deadline exactly as a busy loop would (the same Timeout abort). The
+  `http.send` sender additionally carries an overall response deadline.
+- The dispatcher opens a *run* (`engine::begin_run`) of a known kind — hook,
+  `load`, command, PoC step — around every evaluation; the run carries the
+  wall-clock deadline and tells the host verbs who is calling:
+  - **`browser.*` is refused inside a flow hook.** The embedded browser drives
+    its pages through this proxy, so a navigation started from a hook would
+    queue on the chain lock that hook is holding until the navigation timeout.
+    The verbs are available from a script command and a PoC `script` step.
+  - **`scope.add` is refused from a PoC step always**, and from plugin scripts
+    unless the operator sets `rhai: allow_scope_add: true` (default off): a
+    scope entry also lifts the SSRF block for the host it names, so widening
+    scope is the operator's decision. Every widening is logged at `warn` with
+    the script's name. `scope.list` is always available.
+- `browser.navigate` from a script makes the **same** SSRF decision as the Rust
+  `browser.navigate` command (`aitm_browser::check_url`: resolve the name,
+  classify every address under the host's `browser.ssrf` policy, DNS-rebinding
+  rule included), then the scope/rate gate.
+- `http.send` validates the request line: the method must be an RFC 9110 token
+  and the path may carry no space or control character, so nothing assembled
+  from extracted data can smuggle a header or a second request.
 
 ```rust
 // aitm-plugin-rhai — host-function signatures as Rhai sees them.
@@ -638,10 +661,30 @@ a real engagement:
 Third-party or shared scripts are **not** covered by this boundary; signing and
 verification are deferred and shared with the PoC signing mechanism.
 
-**Capability model.** Default-deny by construction: Rhai's core language has no
-filesystem, network, process, env, or clock access, and `print`/`debug` are routed
-to the host logger via `on_print`/`on_debug` rather than stdout. Capabilities are
-*only* the registered host functions.
+**Capability model.** Default-deny by construction: the engine is built *raw*
+(`Engine::new_raw()`) and given Rhai's standard packages **minus**
+`BasicTimePackage`, so a script has no filesystem, network, process, env, or
+clock (`timestamp`/`elapsed` do not exist); `sleep(INT|FLOAT)`, which lives in
+the language-core package and cannot be left out, is shadowed with a catchable
+refusal, because a native sleep ticks no operation and neither budget could end
+it. `import` is capped at zero modules *and* resolved by `DummyModuleResolver`,
+so raising `max_modules` never reaches the filesystem. `print`/`debug` are
+routed to the host logger via `on_print`/`on_debug` rather than stdout.
+Capabilities are *only* the registered host functions. The exact global
+function table a bare hardened engine offers — operators and arithmetic,
+strings, arrays, blobs, maps, ranges and iterators, function-pointer
+introspection (`name`, `is_anonymous`, `get_fn_metadata_list`), `tag`/`set_tag`,
+`print`/`debug`, `exit` (ends the script), and the refusing `sleep` — is pinned
+by `tests/engine.rs::allowed_global_functions_are_pinned`; a Rhai upgrade that
+adds a name fails that test and is re-audited.
+
+**Nesting depth.** No Rhai limit bounds how deeply an array or map nests (the
+size limits count elements), and Rhai's own size walk, clone and drop recurse
+once per level. The marshalling layer refuses a value nested deeper than
+`marshal::MAX_DEPTH` (32) with an error; for Rhai's own recursion the bound is
+the thread stack, so the `aitm` binary builds its tokio runtime with
+`engine::WORKER_STACK_SIZE` (64 MiB) worker stacks — the depth the operation
+and time budgets let a script reach within one run fits with margin.
 
 ```rust
 // aitm-plugin-rhai — sandbox configuration, all enforced on the shared Engine.
@@ -651,13 +694,24 @@ pub struct RhaiLimits {
     pub max_call_levels: usize,         // default 64          -> set_max_call_levels
     pub max_expr_depth: usize,          // default 128         -> set_max_expr_depths
     pub max_function_expr_depth: usize, // default 64          -> set_max_expr_depths
-    pub max_string_size: usize,         // default 64 KiB      -> set_max_string_size
-    pub max_array_size: usize,          // default 16_384      -> set_max_array_size
+    pub max_string_size: usize,         // default 10 MiB (= LimitConfig::max_body_bytes) -> set_max_string_size
+    pub max_array_size: usize,          // default 10 MiB (blob bytes count here) -> set_max_array_size
     pub max_map_size: usize,            // default 16_384      -> set_max_map_size
     pub max_modules: usize,             // default 0 (imports forbidden) -> set_max_modules
 }
 
 impl Default for RhaiLimits { /* the values above */ }
+```
+
+Rhai checks every value a script builds *and every value a host function
+returns* against the size limits, and blob bytes count against
+`max_array_size`. The string and blob limits therefore default to the body cap
+the flow snapshot copies (§5, `LimitConfig::max_body_bytes`), so a body the
+proxy buffered, a real screenshot or a DOM is something a script can read
+whole; an operator who raises `limits.max_body_bytes` raises these too (the
+binary warns when they fall behind).
+
+```rust
 
 /// Applied once when the shared Engine is built.
 pub fn harden(engine: &mut rhai::Engine, limits: &RhaiLimits, hook_timeout: Duration);

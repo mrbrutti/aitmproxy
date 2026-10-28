@@ -16,8 +16,9 @@
 //! The guarded async namespaces (`http`, `browser`, `store`, `scope`) are
 //! Task 7's providers in `host_net`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
@@ -39,11 +40,17 @@ pub struct ScriptServices {
     pub rt: tokio::runtime::Handle,
 }
 
-/// Where `finding(...)` deposits observations; the command surface reads them
-/// back. Reporting only — a sink never acts on what it is given.
+/// Where `finding(...)` deposits observations; the command surface
+/// (`findings.list`) reads them back. Reporting only — a sink never acts on
+/// what it is given.
 pub trait FindingSink: Send + Sync {
     fn record(&self, f: Finding);
+    /// Everything retained, oldest first.
     fn list(&self) -> Vec<Finding>;
+    /// How many findings a bounded sink has discarded to stay bounded.
+    fn dropped(&self) -> u64 {
+        0
+    }
 }
 
 /// One structured observation a script reported against the run.
@@ -59,29 +66,61 @@ pub struct Finding {
     pub at: SystemTime,
 }
 
-/// The default sink: findings kept in memory, in the order reported.
-#[derive(Default)]
-pub struct MemoryFindingSink(Mutex<Vec<Finding>>);
+/// The default sink: a ring of the newest findings, in the order reported. A
+/// hook that records on every request of a long engagement cannot grow it
+/// without bound; what falls off the front is counted in [`FindingSink::dropped`].
+pub struct MemoryFindingSink {
+    findings: Mutex<VecDeque<Finding>>,
+    capacity: usize,
+    dropped: AtomicU64,
+}
+
+/// Findings the default sink retains: plenty for an engagement's observations,
+/// bounded for a hook that reports per request.
+pub const DEFAULT_FINDING_CAPACITY: usize = 10_000;
+
+impl Default for MemoryFindingSink {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_FINDING_CAPACITY)
+    }
+}
 
 impl MemoryFindingSink {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// A sink that keeps at most `capacity` findings (the newest).
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            findings: Mutex::new(VecDeque::with_capacity(capacity.min(1024))),
+            capacity: capacity.max(1),
+            dropped: AtomicU64::new(0),
+        }
+    }
 }
 
 impl FindingSink for MemoryFindingSink {
     fn record(&self, f: Finding) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(f);
+        let mut findings = self.findings.lock().unwrap_or_else(PoisonError::into_inner);
+        if findings.len() >= self.capacity {
+            findings.pop_front();
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        findings.push_back(f);
     }
 
     fn list(&self) -> Vec<Finding> {
-        self.0
+        self.findings
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 }
 
@@ -297,6 +336,18 @@ fn str_field(
             "finding(...) '{key}' must be a string, got {}",
             value_kind(other)
         ))),
+    }
+}
+
+/// The nuclei severity vocabulary `Severity` serializes as — the inverse of
+/// [`parse_severity`], for `findings.list`.
+pub fn severity_name(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Info => "info",
+        Severity::Low => "low",
+        Severity::Medium => "medium",
+        Severity::High => "high",
+        Severity::Critical => "critical",
     }
 }
 

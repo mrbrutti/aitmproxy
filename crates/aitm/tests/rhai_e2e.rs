@@ -244,17 +244,31 @@ async fn script_added_without_rebuild() {
     );
 }
 
-/// AC-M3-5/7: a script reaching the network out of scope is refused by the same
-/// guard as Rust (deny-by-default: the empty-scope guard refuses every host),
-/// the hook's error is isolated, and the chain keeps serving. The flow is
-/// forwarded unchanged — the denied send never mutated it.
+/// AC-M3-5/7: a script reaching for the filesystem fails with a clear
+/// `ScriptError`; one reaching the network out of scope is refused by the
+/// same guard as Rust (deny-by-default: the empty-scope guard refuses every
+/// host); each hook's error is isolated — the flow is forwarded unchanged by
+/// it, an `Event::Error` names the script and the cause — and *other scripts
+/// are unaffected*: the third script's edit lands and the chain keeps serving.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn script_cannot_escape_or_exceed_scope() {
     let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
     let guard = Arc::new(StdGuard::default()); // no scope ⇒ every host refused
-    let src = TempScript::new(
-        "escape",
+    let reader = TempScript::new(
+        "reader",
         r#"
+        const NAME = "reader";
+        fn on_request(flow) {
+            // Sandbox denial (AC-M3-5): no such function exists for a script.
+            open_file("/etc/passwd");
+            flow.request.headers.set("X-Read", "1");
+        }
+        "#,
+    );
+    let escaper = TempScript::new(
+        "escaper",
+        r#"
+        const NAME = "escaper";
         fn on_request(flow) {
             // Guard refusal (AC-M3-7): out-of-scope send, uncaught, aborts the hook.
             http.send(#{ method: "GET", url: "http://evil.test/" });
@@ -262,24 +276,233 @@ async fn script_cannot_escape_or_exceed_scope() {
         }
         "#,
     );
+    let bystander = TempScript::new(
+        "bystander",
+        r#"
+        const NAME = "bystander";
+        fn on_request(flow) { flow.request.headers.set("X-Bystander", "1"); }
+        "#,
+    );
     let tier = wire::build(
-        rhai_cfg(vec![ScriptEntry::new(src.path())]),
+        rhai_cfg(vec![
+            ScriptEntry::new(reader.path()),
+            ScriptEntry::new(escaper.path()),
+            ScriptEntry::new(bystander.path()),
+        ]),
         services(store.clone(), guard),
     )
     .expect("tier builds");
+    assert!(tier.errors.is_empty(), "{:?}", tier.errors);
 
     let probe = Arc::new(ProbeLog::default());
-    let chain = chain_with(tier.plugins, probe, store.clone());
+    let chain = Arc::new(chain_with(tier.plugins, probe.clone(), store.clone()));
+    // The chain is also where the scripts' `Event::Error`s go, so the trailing
+    // probe sees them as a native plugin would.
+    tier.error_sink.bind(chain.clone());
+
     let id = insert_request(store.as_ref(), "GET", "/");
     // The chain returns (no stall, no panic): the proxy keeps serving.
     assert_eq!(chain.dispatch(Event::Request(id)).await, Verdict::Continue);
 
     let flow = store.get(id).unwrap();
+    let headers = &http(&flow).request.headers;
     assert_eq!(
-        http(&flow).request.headers.get("X-Should-Not-Appear"),
+        headers.get("X-Read"),
         None,
-        "an errored hook forwards the flow unchanged (effects discarded)",
+        "the sandbox-denied hook's edit was discarded"
     );
+    assert_eq!(
+        headers.get("X-Should-Not-Appear"),
+        None,
+        "the guard-denied hook's edit was discarded",
+    );
+    assert_eq!(
+        headers.get("X-Bystander"),
+        Some("1"),
+        "a script after two failing ones still runs and its edit lands",
+    );
+
+    // Both failures reached the bus, each naming its script and its cause.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let errors = loop {
+        let errors: Vec<String> = probe
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                Event::Error { kind, .. } => Some(kind.to_string()),
+                _ => None,
+            })
+            .collect();
+        if errors.len() >= 2 || Instant::now() >= deadline {
+            break errors;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert_eq!(
+        errors.len(),
+        2,
+        "one Event::Error per failed hook: {errors:?}"
+    );
+    let reader_err = errors
+        .iter()
+        .find(|e| e.contains("reader"))
+        .unwrap_or_else(|| panic!("an error names the reader script: {errors:?}"));
+    assert!(
+        reader_err.contains("open_file"),
+        "the sandbox denial names the missing function: {reader_err}"
+    );
+    let escaper_err = errors
+        .iter()
+        .find(|e| e.contains("escaper"))
+        .unwrap_or_else(|| panic!("an error names the escaper script: {errors:?}"));
+    assert!(
+        escaper_err.contains("was denied capability 'http.send'")
+            && escaper_err.contains("evil.test"),
+        "the guard refusal is the pinned denial naming the host: {escaper_err}"
+    );
+}
+
+/// `(plugin name, X-Seq as that plugin saw it)`, in dispatch order.
+type SeqLog = Arc<Mutex<Vec<(&'static str, Option<String>)>>>;
+
+/// A native plugin that records, on each request, the `X-Seq` header *as it
+/// stands when the plugin runs* — the observed ordering of AC-M3-10.
+struct SeqProbe {
+    name: &'static str,
+    seen: SeqLog,
+}
+
+impl Plugin for SeqProbe {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn on_event(&mut self, ev: &Event, ctx: &mut FlowCtx<'_>) -> Verdict {
+        if let (Event::Request(_), Flow::Http(f)) = (ev, ctx.flow()) {
+            self.seen.lock().unwrap().push((
+                self.name,
+                f.request.headers.get("X-Seq").map(str::to_string),
+            ));
+        }
+        Verdict::Continue
+    }
+}
+
+/// A script that appends `tag` to the `X-Seq` header.
+fn seq_script(tag: &str) -> String {
+    format!(
+        r#"
+        const NAME = "seq-{tag}";
+        fn on_request(flow) {{
+            let seen = flow.request.headers.get("X-Seq");
+            flow.request.headers.set("X-Seq", if seen == "" {{ "{tag}" }} else {{ seen + ",{tag}" }});
+        }}
+        "#
+    )
+}
+
+/// AC-M3-10, the observed ordering: a native plugin ahead of the scripts sees
+/// the flow before any script edit, the scripts run in declaration order, and
+/// a native plugin after them sees both edits. Then the binary's own wiring
+/// (`assemble_with_scripts`) is checked to place the scripts after every
+/// native plugin that acts on a flow and before the command providers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn natives_and_scripts_run_in_registration_order() {
+    let a = TempScript::new("seq-a", &seq_script("a"));
+    let b = TempScript::new("seq-b", &seq_script("b"));
+    let entries = || vec![ScriptEntry::new(a.path()), ScriptEntry::new(b.path())];
+
+    let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+    let tier = wire::build(
+        rhai_cfg(entries()),
+        services(store.clone(), Arc::new(StdGuard::default())),
+    )
+    .expect("tier builds");
+    assert!(tier.errors.is_empty(), "{:?}", tier.errors);
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::new();
+    registry.add_plugin(Box::new(SeqProbe {
+        name: "lead",
+        seen: seen.clone(),
+    }));
+    for plugin in tier.plugins {
+        registry.add_plugin(Box::new(plugin));
+    }
+    registry.add_plugin(Box::new(SeqProbe {
+        name: "trail",
+        seen: seen.clone(),
+    }));
+    let chain = Chain::new(Arc::new(registry), store.clone());
+
+    let id = insert_request(store.as_ref(), "GET", "/");
+    assert_eq!(chain.dispatch(Event::Request(id)).await, Verdict::Continue);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![("lead", None), ("trail", Some("a,b".to_string()))],
+        "natives first, then scripts in declaration order, then the trailing native",
+    );
+    assert_eq!(
+        http(&store.get(id).unwrap()).request.headers.get("X-Seq"),
+        Some("a,b")
+    );
+
+    // The binary's placement: after the flow-acting natives, before the
+    // command providers, in declaration order.
+    let tier = wire::build(
+        rhai_cfg(entries()),
+        services(Arc::new(MemFlowStore::new()), Arc::new(StdGuard::default())),
+    )
+    .expect("tier builds");
+    let mut cfg = Config::default();
+    cfg.ca.dir = temp_dir("rhai-order");
+    let Assembled { proxy, .. } = assemble_with_scripts(
+        &cfg,
+        &Features::default(),
+        ScriptWiring {
+            plugins: tier
+                .plugins
+                .into_iter()
+                .map(|p| Box::new(p) as Box<dyn Plugin>)
+                .collect(),
+            executor: Some(tier.executor.clone()),
+            commands: Some(Box::new(tier.commands)),
+        },
+    )
+    .expect("assemble");
+    let names: Vec<String> = proxy
+        .registry_arc()
+        .plugins()
+        .iter()
+        .map(|p| p.lock().unwrap().name().to_string())
+        .collect();
+    let at = |name: &str| {
+        names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("{name} is registered: {names:?}"))
+    };
+    assert_eq!(at("seq-b"), at("seq-a") + 1, "declaration order: {names:?}");
+    for native in [
+        "capture",
+        "replay",
+        "intercept",
+        "mutate",
+        "scope",
+        "rate-limit",
+    ] {
+        assert!(
+            at(native) < at("seq-a"),
+            "{native} precedes the scripts: {names:?}"
+        );
+    }
+    for provider in ["browser", "poc", "scripts"] {
+        assert!(
+            at("seq-b") < at(provider),
+            "{provider} follows the scripts: {names:?}"
+        );
+    }
 }
 
 /// AC-M3-3: a script-registered command is enumerated by MCP `tools/list` and
@@ -306,12 +529,14 @@ async fn script_command_over_frontends() {
                 .map(|p| Box::new(p) as Box<dyn Plugin>)
                 .collect(),
             executor: Some(tier.executor.clone()),
+            commands: Some(Box::new(tier.commands)),
         },
     )
     .expect("assemble with the tagger script");
     let registry = proxy.registry_arc();
 
-    // MCP tools/list includes the script command.
+    // MCP tools/list includes the script command — and the tier's own three
+    // (spec §3/§8: `script.validate`, `script.reload`, `findings.list`).
     let server = aitm_mcp::McpServer::new(registry.clone(), McpTransport::Stdio).with_services(
         Arc::new(MemFlowStore::new()),
         Arc::new(StubClient) as Arc<dyn ProxyClient>,
@@ -332,6 +557,12 @@ async fn script_command_over_frontends() {
         names.contains(&"tagger.ping"),
         "the script command is an MCP tool; got {names:?}",
     );
+    for tool in ["script.validate", "script.reload", "findings.list"] {
+        assert!(
+            names.contains(&tool),
+            "{tool} is an MCP tool; got {names:?}"
+        );
+    }
 
     // MCP tools/call returns "pong".
     let call = serde_json::json!({
@@ -361,6 +592,22 @@ async fn script_command_over_frontends() {
     assert!(
         rendered.contains("pong"),
         "CLI tagger ping → pong; got {rendered}",
+    );
+
+    // `aitm script validate --path <file>` is the CLI face of `script.validate`
+    // (spec §8): the worked example validates and reports its hooks.
+    let out = cli
+        .dispatch(&[
+            "script".to_string(),
+            "validate".to_string(),
+            "--path".to_string(),
+            TAGGER.to_string(),
+        ])
+        .expect("cli script validate");
+    let rendered = String::from_utf8(aitm::render::render_cli_value(&out)).unwrap();
+    assert!(
+        rendered.contains("tagger") && rendered.contains("on_request"),
+        "CLI script validate reports the script's name and hooks; got {rendered}",
     );
 }
 
@@ -504,7 +751,16 @@ async fn poc_script_step_pass_vs_patched() {
     use aitm::scripts::LateHandles;
     use aitm_core::{BrowserDriver, Params, Value};
 
-    for engine in engines::engines() {
+    // Spec review (M3): without an engine the loop body never runs and the
+    // test would pass vacuously under `--ignored`; a run that proves nothing
+    // must say so instead.
+    let engines = engines::engines();
+    assert!(
+        !engines.is_empty(),
+        "no browser engine is enabled: set AITM_OBSCURA=1 (with AITM_OBSCURA_BIN) or \
+         AITM_CHROME=1 — this test proves AC-M3-8 only against a real engine"
+    );
+    for engine in engines {
         for (mode, want) in [(Mode::Vulnerable, true), (Mode::Patched, false)] {
             let target = spawn_notes_target(mode).await;
             let base = format!("http://{target}");
@@ -536,6 +792,7 @@ async fn poc_script_step_pass_vs_patched() {
                 ScriptWiring {
                     plugins: Vec::new(),
                     executor: Some(tier.executor.clone()),
+                    commands: Some(Box::new(tier.commands)),
                 },
             )
             .expect("assemble proxy");

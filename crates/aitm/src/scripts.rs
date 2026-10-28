@@ -72,9 +72,18 @@ impl FlowStore for LateHandles {
     fn insert(&self, flow: Flow) -> FlowId {
         match self.store.get() {
             Some(store) => store.insert(flow),
-            // Unreachable once bound; a fresh id keeps the signature honest
-            // without inventing a store to put the flow in.
-            None => FlowId::new(),
+            // Unreachable once bound (binding precedes serving). Should it
+            // ever happen, a flow would be lost: say so loudly rather than
+            // mint an id as if it had been kept.
+            None => {
+                let id = flow.id();
+                tracing::error!(
+                    target: "aitm::scripts",
+                    flow = %id,
+                    "a flow was inserted before the script tier's store was bound; it is NOT stored"
+                );
+                id
+            }
         }
     }
 
@@ -181,5 +190,41 @@ impl BrowserDriver for LateHandles {
             Some(d) => d.get_dom(),
             None => no_browser(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one safety property this facade must hold even if a script ran
+    /// before binding: a guard that cannot check refuses, and nothing reads
+    /// as present.
+    #[tokio::test]
+    async fn unbound_handles_refuse_and_read_as_empty() {
+        let handles = LateHandles::new();
+        assert!(matches!(
+            handles.check_active("ex.test"),
+            Err(GuardError::OutOfScope(host)) if host == "ex.test"
+        ));
+        assert!(handles.list_scope().is_empty());
+        assert!(handles.list().is_empty());
+        assert!(handles.get(FlowId::new()).is_none());
+        let err = handles.navigate("http://ex.test/").await.unwrap_err();
+        assert!(err.to_string().contains("no browser engine"), "{err}");
+        let err = handles
+            .send(HttpRequest {
+                method: "GET".into(),
+                scheme: "http".into(),
+                authority: "ex.test".into(),
+                path: "/".into(),
+                version: aitm_core::HttpVersion::Http11,
+                headers: aitm_core::HeaderMap::new(),
+                body: aitm_core::Body::Empty,
+                timestamp: std::time::SystemTime::now(),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not running yet"), "{err}");
     }
 }
