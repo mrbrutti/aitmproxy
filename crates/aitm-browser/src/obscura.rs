@@ -444,11 +444,12 @@ impl ObscuraProcess {
     }
 
     /// Ask the child to exit. No `libc`/`nix` in the tree: on Unix this is
-    /// `kill -TERM <pid>`; elsewhere the only signal available is the kill.
+    /// `/bin/kill -TERM <pid>` (by absolute path, never a `PATH` lookup);
+    /// elsewhere the only signal available is the kill.
     fn send_term(&mut self) {
         #[cfg(unix)]
         {
-            match std::process::Command::new("kill")
+            match std::process::Command::new("/bin/kill")
                 .args(["-TERM", &self.pid.to_string()])
                 .status()
             {
@@ -476,6 +477,25 @@ pub struct ObscuraDriver {
     session: CdpSession,
     /// `None` once `close` has stopped the child.
     process: Mutex<Option<ObscuraProcess>>,
+    /// `nav_timeout`: the bound on every primitive other than `navigate`,
+    /// which `CdpSession` already bounds with the same value.
+    op_timeout: Duration,
+}
+
+/// Run one primitive under `limit` (Global Constraint: every operation is
+/// bounded). A CDP call on a live child can otherwise wait for as long as
+/// the child keeps it waiting. `what` names the primitive in the error.
+pub async fn bounded<T>(
+    limit: Duration,
+    what: &str,
+    op: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    match tokio::time::timeout(limit, op).await {
+        Ok(result) => result,
+        Err(_) => {
+            anyhow::bail!("embedded browser (obscura) {what} did not complete within {limit:?}")
+        }
+    }
 }
 
 impl ObscuraDriver {
@@ -516,6 +536,7 @@ impl ObscuraDriver {
         Ok(Self {
             session,
             process: Mutex::new(Some(process)),
+            op_timeout: config.nav_timeout,
         })
     }
 
@@ -563,7 +584,8 @@ impl ObscuraDriver {
     }
 
     /// Run one primitive with the child checked before, and again after a
-    /// failure: a child that died mid-call is the cause, not the socket.
+    /// failure (a timeout included): a child that died mid-call is the
+    /// cause, not the socket.
     async fn guarded<T>(&self, op: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
         self.ensure_alive()?;
         match op.await {
@@ -574,6 +596,16 @@ impl ObscuraDriver {
             }
         }
     }
+
+    /// [`Self::guarded`] under the per-operation bound, for the primitives
+    /// `CdpSession` does not bound itself.
+    async fn timed<T>(
+        &self,
+        what: &str,
+        op: impl Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        self.guarded(bounded(self.op_timeout, what, op)).await
+    }
 }
 
 impl BrowserDriver for ObscuraDriver {
@@ -583,25 +615,28 @@ impl BrowserDriver for ObscuraDriver {
     }
 
     fn click(&self, target: ClickTarget) -> BoxFuture<'_, anyhow::Result<()>> {
-        Box::pin(self.guarded(self.session.click(target)))
+        Box::pin(self.timed("click", self.session.click(target)))
     }
 
     fn type_text(&self, selector: &str, text: &str) -> BoxFuture<'_, anyhow::Result<()>> {
         let selector = selector.to_string();
         let text = text.to_string();
-        Box::pin(async move { self.guarded(self.session.type_text(&selector, &text)).await })
+        Box::pin(async move {
+            self.timed("type", self.session.type_text(&selector, &text))
+                .await
+        })
     }
 
     fn screenshot(&self) -> BoxFuture<'_, anyhow::Result<Vec<u8>>> {
-        Box::pin(self.guarded(self.session.screenshot()))
+        Box::pin(self.timed("screenshot", self.session.screenshot()))
     }
 
     fn eval(&self, expr: &str) -> BoxFuture<'_, anyhow::Result<Value>> {
         let expr = expr.to_string();
-        Box::pin(async move { self.guarded(self.session.eval(&expr)).await })
+        Box::pin(async move { self.timed("eval", self.session.eval(&expr)).await })
     }
 
     fn get_dom(&self) -> BoxFuture<'_, anyhow::Result<String>> {
-        Box::pin(self.guarded(self.session.get_dom()))
+        Box::pin(self.timed("get_dom", self.session.get_dom()))
     }
 }

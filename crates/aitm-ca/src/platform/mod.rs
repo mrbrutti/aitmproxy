@@ -12,6 +12,8 @@ pub mod linux;
 pub mod macos;
 pub mod windows;
 
+use tracing::debug;
+
 use crate::exec::{CmdLine, CmdOutput, Executor};
 use crate::store::{TrustError, TrustErrorKind};
 
@@ -41,9 +43,11 @@ pub(crate) fn sudo_if_needed(mut cmd: CmdLine, exec: &dyn Executor) -> CmdLine {
 
 /// Run `cmd`, turning the executor's own failures into a [`TrustError`]:
 /// a timeout is `Timeout`, anything else (the program could not be
-/// started) is `ToolMissing`. A non-zero exit is still `Ok`.
+/// started) is `ToolMissing`. A non-zero exit is still `Ok`. Every command
+/// that ran is one `debug!` with its rendered line and exit code (spec §D8
+/// Logging; `-1` when the child died on a signal).
 pub(crate) fn run(exec: &dyn Executor, cmd: &CmdLine) -> Result<CmdOutput, TrustError> {
-    exec.run(cmd).map_err(|e| {
+    let out = exec.run(cmd).map_err(|e| {
         let message = format!("{e:#}");
         // `RealExecutor` says "timed out" and nothing else does.
         let kind = if message.contains("timed out") {
@@ -52,7 +56,14 @@ pub(crate) fn run(exec: &dyn Executor, cmd: &CmdLine) -> Result<CmdOutput, Trust
             TrustErrorKind::ToolMissing
         };
         TrustError::new(kind, message)
-    })
+    })?;
+    debug!(
+        target: "aitm_ca",
+        command_line = cmd.render().as_str(),
+        code = out.code.unwrap_or(-1),
+        "ran trust-store command"
+    );
+    Ok(out)
 }
 
 /// The last few non-empty lines of stderr, joined — enough to explain a

@@ -35,7 +35,9 @@ pub struct CaCert {
 impl CaCert {
     /// Reads only `<dir>/ca.crt`, through the executor (so tests can supply
     /// it and record the path). `Ok(None)` when it does not exist; `Err`
-    /// unless the file holds exactly one PEM `CERTIFICATE` block.
+    /// unless the file holds exactly one PEM `CERTIFICATE` block and no
+    /// other block: `pem` is exported and tee'd as is, so a key that ended
+    /// up in the file (a combined PEM renamed) must stop everything here.
     pub fn load(dir: &Path, exec: &dyn Executor) -> anyhow::Result<Option<CaCert>> {
         let path = dir.join("ca.crt");
         let Some(bytes) = exec.read_file(&path)? else {
@@ -46,11 +48,18 @@ impl CaCert {
         let mut count = 0usize;
         for block in Pem::iter_from_buffer(&bytes) {
             let block = block.with_context(|| format!("{} is not valid PEM", path.display()))?;
-            if block.label == "CERTIFICATE" {
-                count += 1;
-                if first.is_none() {
-                    first = Some(block.contents);
-                }
+            if block.label != "CERTIFICATE" {
+                // The label only; never the block.
+                bail!(
+                    "{} holds a PEM {} block; ca.crt must hold exactly one CERTIFICATE block \
+                     and nothing else",
+                    path.display(),
+                    block.label
+                );
+            }
+            count += 1;
+            if first.is_none() {
+                first = Some(block.contents);
             }
         }
         let der = match first {

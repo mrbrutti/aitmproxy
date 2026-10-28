@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Context as _;
+use anyhow::{bail, Context as _};
 use serde::Deserialize;
 
 use aitm_core::{
@@ -45,12 +45,13 @@ pub fn load(path: Option<&Path>) -> anyhow::Result<Config> {
     parse(&text).with_context(|| format!("in config file {}", path.display()))
 }
 
-/// Parse YAML into a `Config`: unknown keys are errors; absent keys keep
+/// Parse YAML into a `Config`: unknown keys are errors, as is a value the
+/// file may not set (`ca.key_mode` wider than the owner); absent keys keep
 /// their `Config::default()` value.
 pub fn parse(yaml: &str) -> anyhow::Result<Config> {
     let file: ConfigFile = serde_yaml::from_str(yaml).context("parsing config YAML")?;
     let mut cfg = Config::default();
-    file.apply(&mut cfg);
+    file.apply(&mut cfg)?;
     Ok(cfg)
 }
 
@@ -84,7 +85,7 @@ struct ConfigFile {
 }
 
 impl ConfigFile {
-    fn apply(self, c: &mut Config) {
+    fn apply(self, c: &mut Config) -> anyhow::Result<()> {
         set(&mut c.listen, self.listen);
         if let Some(s) = self.scope {
             s.apply(&mut c.scope);
@@ -93,7 +94,7 @@ impl ConfigFile {
             l.apply(&mut c.limits);
         }
         if let Some(ca) = self.ca {
-            ca.apply(&mut c.ca);
+            ca.apply(&mut c.ca)?;
         }
         if let Some(m) = self.mcp {
             m.apply(&mut c.mcp);
@@ -107,6 +108,7 @@ impl ConfigFile {
         set(&mut c.ssl_insecure, self.ssl_insecure);
         set(&mut c.max_flows, self.max_flows);
         set(&mut c.max_flow_bytes, self.max_flow_bytes);
+        Ok(())
     }
 }
 
@@ -175,11 +177,23 @@ struct CaFile {
 }
 
 impl CaFile {
-    fn apply(self, c: &mut CaConfig) {
+    /// `key_mode` may only narrow the key's permissions: a mode with any
+    /// group or other bit set is refused, so no config file can make the CA
+    /// key readable beyond its owner.
+    fn apply(self, c: &mut CaConfig) -> anyhow::Result<()> {
+        if let Some(mode) = self.key_mode {
+            if mode & 0o077 != 0 {
+                bail!(
+                    "ca.key_mode {mode:#o} grants group or other permissions on the CA key; use \
+                     an owner-only mode such as 0o600"
+                );
+            }
+        }
         set(&mut c.dir, self.dir);
         set(&mut c.key_mode, self.key_mode);
         set(&mut c.allow_agent_install, self.allow_agent_install);
         set(&mut c.audit_log, self.audit_log);
+        Ok(())
     }
 }
 

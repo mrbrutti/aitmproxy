@@ -99,6 +99,26 @@ fn two_blocks_is_an_error() {
     assert!(err.to_string().contains("exactly one"), "got: {err}");
 }
 
+/// A combined key+certificate PEM renamed to `ca.crt` must never be loaded:
+/// `export` ships the file text and `install` tees it into a world-readable
+/// anchor, so any block that is not a `CERTIFICATE` is an error that names
+/// the block's label without echoing its contents.
+#[test]
+fn foreign_block_is_an_error() {
+    let key: &[u8] = b"-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n";
+    for (tag, bytes) in [
+        ("cert then key", [FIXTURE, key].concat()),
+        ("key then cert", [key, FIXTURE].concat()),
+    ] {
+        let exec = StubExec::new().file("/ca/ca.crt", &bytes);
+        let err = CaCert::load(Path::new("/ca"), &exec).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("EC PRIVATE KEY"), "{tag}: got: {msg}");
+        assert!(msg.contains("/ca/ca.crt"), "{tag}: got: {msg}");
+        assert!(!msg.contains("AAAA"), "{tag}: echoes block contents: {msg}");
+    }
+}
+
 #[test]
 fn key_is_never_read() {
     let exec = StubExec::new()

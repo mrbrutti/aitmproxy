@@ -2,7 +2,7 @@
 //! `AuditRecord` JSON shape, and the checked-in fixture CA.
 
 use aitm_ca::audit::AuditRecord;
-use aitm_ca::exec::{CmdLine, CmdOutput};
+use aitm_ca::exec::{absolute_program, CmdLine, CmdOutput};
 
 const FIXTURE: &str = include_str!("fixtures/ca.crt");
 
@@ -35,6 +35,31 @@ fn render_quotes_whitespace() {
     assert!(!cmd.render().contains("STDIN-MUST-NOT-RENDER"));
     // The argument itself is stored unquoted; quoting is a rendering concern.
     assert_eq!(cmd.args[1], path);
+}
+
+/// The tools the stores shell out to are spawned by absolute path, not
+/// looked up on the caller's `PATH` (security review): a `CmdLine` keeps
+/// its short name, so rendered lines and the spec's command tables are
+/// unchanged, and `RealExecutor` resolves the name at spawn time.
+#[cfg(unix)]
+#[test]
+fn trust_store_tools_resolve_to_absolute_paths() {
+    for (name, path) in [
+        ("sudo", "/usr/bin/sudo"),
+        ("security", "/usr/bin/security"),
+        ("tee", "/usr/bin/tee"),
+        ("rm", "/bin/rm"),
+        ("id", "/usr/bin/id"),
+    ] {
+        assert_eq!(absolute_program(name), path, "{name}");
+    }
+    // Anything else, and anything already absolute, passes through.
+    assert_eq!(
+        absolute_program("update-ca-certificates"),
+        "update-ca-certificates"
+    );
+    assert_eq!(absolute_program("/opt/bin/security"), "/opt/bin/security");
+    assert_eq!(absolute_program("sleep"), "sleep");
 }
 
 #[test]

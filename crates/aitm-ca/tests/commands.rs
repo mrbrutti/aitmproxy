@@ -1,7 +1,8 @@
 //! Task 16 — the four `ca.*` commands as a frontend sees them: `CaPlugin`
 //! registered in a `Registry`, invoked through a `CommandHost` that declares
 //! its `Frontend`, against a scripted executor, an in-memory audit log and a
-//! fixed macOS platform. Nothing here touches a real trust store.
+//! fixed platform (macOS unless a test pins another). Nothing here touches a
+//! real trust store.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -13,7 +14,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, ThreadId};
 
 use aitm_ca::audit::AuditRecord;
-use aitm_ca::store::Platform;
+use aitm_ca::store::{
+    LinuxFamily, Platform, TrustError, TrustErrorKind, DEBIAN_ANCHOR_DIR, FEDORA_ANCHOR_DIR,
+};
 use aitm_ca::testing::{MemoryAuditLog, ScriptedExecutor, FIXTURE_FP1, FIXTURE_FP256};
 use aitm_ca::CaPlugin;
 use aitm_core::{
@@ -98,7 +101,19 @@ struct Harness {
 }
 
 impl Harness {
+    /// Pinned to macOS, the platform most tests speak.
     fn new(cfg: CaConfig, exec: ScriptedExecutor, audit: MemoryAuditLog) -> Self {
+        Self::on(Platform::MacOs, cfg, exec, audit)
+    }
+
+    /// Pinned to `platform`, so the command layer is driven through its
+    /// Linux and unsupported branches too (CA-AC16, CA-AC17).
+    fn on(
+        platform: Platform,
+        cfg: CaConfig,
+        exec: ScriptedExecutor,
+        audit: MemoryAuditLog,
+    ) -> Self {
         let exec = Arc::new(exec);
         let audit = Arc::new(audit);
         let mut reg = Registry::new();
@@ -106,7 +121,7 @@ impl Harness {
             cfg,
             exec.clone(),
             audit.clone(),
-            Platform::MacOs,
+            platform,
         )));
         Self {
             exec,
@@ -298,13 +313,8 @@ fn export_der_and_out() {
     );
     assert!(h.records()[0].detail.contains(&out.display().to_string()));
 
-    // PEM to a file: byte-identical to ca.crt. Truncates what was there.
+    // PEM to a fresh file: byte-identical to ca.crt.
     let out = out_dir.join("root.pem");
-    fs::write(
-        &out,
-        b"stale contents much longer than the certificate itself will be\n".repeat(40),
-    )
-    .unwrap();
     let v = h
         .call(
             "ca.export",
@@ -327,6 +337,8 @@ fn export_refusals() {
 
     let e = err_text(h.call("ca.export", Frontend::Cli, &[("format", str_arg("p12"))]));
     assert!(e.contains("format must be pem or der"), "got: {e}");
+    // A bad argument is refused before the audit log is touched.
+    assert!(h.records().is_empty(), "{:?}", h.records());
 
     for inside in ["/ca/copy.pem", "/ca/sub/copy.pem", "/ca/./copy.pem"] {
         let e = err_text(h.call("ca.export", Frontend::Cli, &[("out", str_arg(inside))]));
@@ -336,8 +348,102 @@ fn export_refusals() {
         );
         assert!(e.contains("/ca"), "{inside}: got: {e}");
     }
-    // Argument refusals happen before anything else: nothing was recorded.
-    assert!(h.records().is_empty(), "{:?}", h.records());
+    // An `out` refusal is a refused export, so it is audited (spec §D8:
+    // every export that got past argument parsing is recorded).
+    let records = h.records();
+    assert_eq!(records.len(), 3, "{records:?}");
+    for rec in &records {
+        assert_eq!(rec.command, "ca.export");
+        assert_eq!(rec.outcome, "error");
+        assert_eq!(rec.fingerprint_sha256.as_deref(), Some(FIXTURE_FP256));
+        assert!(
+            rec.detail
+                .contains("refusing to write into the CA directory"),
+            "{}",
+            rec.detail
+        );
+    }
+
+    // An existing file is never overwritten, from any frontend: `--out`
+    // over MCP must not be a way to truncate an operator's file.
+    let ca_dir = real_ca_dir("export-refuse-ca");
+    let out_dir = scratch("export-refuse-out");
+    fs::create_dir_all(&out_dir).unwrap();
+    let existing = out_dir.join("keep.pem");
+    fs::write(&existing, b"precious\n").unwrap();
+    let audit_log = out_dir.join("audit").join("ca-audit.jsonl");
+    let h = Harness::new(
+        CaConfig {
+            audit_log: audit_log.clone(),
+            ..cfg(&ca_dir, false)
+        },
+        ScriptedExecutor::new().with_real_fs(),
+        MemoryAuditLog::new(),
+    );
+    let e = err_text(h.call(
+        "ca.export",
+        Frontend::Mcp,
+        &[("out", str_arg(&existing.display().to_string()))],
+    ));
+    assert!(e.contains("already exists"), "got: {e}");
+    assert!(e.contains(&existing.display().to_string()), "got: {e}");
+    assert_eq!(fs::read(&existing).unwrap(), b"precious\n");
+
+    // The audit log itself is refused by canonical path: spelled through
+    // `..` it is a different string but the same file.
+    fs::create_dir_all(audit_log.parent().unwrap()).unwrap();
+    fs::write(&audit_log, b"").unwrap();
+    let dotted = out_dir
+        .join("audit")
+        .join("..")
+        .join("audit")
+        .join("ca-audit.jsonl");
+    assert_ne!(dotted, audit_log);
+    let e = err_text(h.call(
+        "ca.export",
+        Frontend::Mcp,
+        &[("out", str_arg(&dotted.display().to_string()))],
+    ));
+    assert!(e.contains("audit log"), "got: {e}");
+    assert_eq!(fs::read(&audit_log).unwrap(), b"");
+
+    // The config file beside it is refused even before it exists.
+    let config = audit_log.with_file_name("config.yaml");
+    assert!(!config.exists());
+    let e = err_text(h.call(
+        "ca.export",
+        Frontend::Mcp,
+        &[("out", str_arg(&config.display().to_string()))],
+    ));
+    assert!(e.contains("config file"), "got: {e}");
+    assert!(!config.exists(), "ca.export created the config file");
+
+    // Each refusal was recorded, with the fingerprint, from the agent frontend.
+    let records = h.records();
+    assert_eq!(records.len(), 3, "{records:?}");
+    for rec in &records {
+        assert_eq!(rec.command, "ca.export");
+        assert_eq!(rec.frontend, "mcp");
+        assert_eq!(rec.outcome, "error");
+        assert_eq!(rec.fingerprint_sha256.as_deref(), Some(FIXTURE_FP256));
+    }
+    assert!(
+        records[0].detail.contains("already exists"),
+        "{}",
+        records[0].detail
+    );
+    assert!(
+        records[1].detail.contains("audit log"),
+        "{}",
+        records[1].detail
+    );
+    assert!(
+        records[2].detail.contains("config file"),
+        "{}",
+        records[2].detail
+    );
+    let _ = fs::remove_dir_all(&ca_dir);
+    let _ = fs::remove_dir_all(&out_dir);
 
     // No ca.crt at all.
     let h = Harness::new(
@@ -490,6 +596,200 @@ fn gate_allows_with_flag_and_cli() {
     assert!(e.contains("scope"), "got: {e}");
     assert!(h.exec.runs().is_empty());
     assert!(h.records().is_empty());
+}
+
+// CA-AC11 (command level): a store failure is audited as `error`, with the
+// identity the command had resolved by then.
+#[test]
+fn store_failure_is_audited() {
+    let stderr = "SecTrustSettingsSetTrustSettings: The authorization was denied since no user \
+                  interaction was possible";
+    let h = Harness::new(
+        cfg("/ca", false),
+        ScriptedExecutor::new()
+            .file("/ca/ca.crt", FIXTURE)
+            .respond(&add_user(), 1, "", stderr),
+        MemoryAuditLog::new(),
+    );
+    let (result, capture) = traced(|| h.call("ca.install", Frontend::Cli, &[]));
+    let err = result.unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<TrustError>().map(|e| e.kind),
+        Some(TrustErrorKind::HeadlessAuth),
+        "{err:#}"
+    );
+    let e = format!("{err:#}");
+    assert!(e.contains("GUI session"), "got: {e}");
+    assert!(e.contains(stderr), "got: {e}");
+    // Query, the failed add, and the post-failure requery (absent: nothing
+    // to roll back).
+    assert_eq!(
+        h.exec.runs(),
+        vec![Q_USER.to_string(), add_user(), Q_USER.to_string()]
+    );
+
+    let records = h.records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let rec = &records[0];
+    assert_eq!(
+        rec,
+        &AuditRecord {
+            ts: rec.ts.clone(),
+            command: "ca.install",
+            frontend: "cli",
+            outcome: "error",
+            scope: Some("user".to_string()),
+            platform: Some("macos".to_string()),
+            fingerprint_sha256: Some(FIXTURE_FP256.to_string()),
+            detail: rec.detail.clone(),
+        }
+    );
+    assert!(rec.detail.contains("GUI session"), "{}", rec.detail);
+    assert!(!rec.detail.contains("BEGIN CERTIFICATE"), "{}", rec.detail);
+
+    // Spec §D8: the failure is one WARN naming the error kind; no INFO.
+    let warns = capture.at(Level::WARN, "aitm_ca");
+    assert_eq!(warns.len(), 1, "{capture:?}");
+    let f = &warns[0].fields;
+    assert_eq!(f.get("command").map(String::as_str), Some("ca.install"));
+    assert_eq!(f.get("kind").map(String::as_str), Some("HeadlessAuth"));
+    assert_eq!(f.get("scope").map(String::as_str), Some("user"));
+    assert_eq!(
+        f.get("message").map(String::as_str),
+        Some("OS trust store change failed")
+    );
+    assert!(capture.at(Level::INFO, "aitm_ca").is_empty());
+}
+
+// CA-AC17 (command level)
+#[test]
+fn unsupported_platform_status_and_install() {
+    let h = Harness::on(
+        Platform::Unsupported("linux".to_string()),
+        cfg("/ca", false),
+        ScriptedExecutor::new().file("/ca/ca.crt", FIXTURE),
+        MemoryAuditLog::new(),
+    );
+
+    let v = h.call("ca.status", Frontend::Cli, &[]).unwrap();
+    assert!(flag(&v, "exists"));
+    assert_eq!(text(&v, "fingerprint_sha256"), FIXTURE_FP256);
+    assert_eq!(text(&v, "platform"), "unsupported");
+    assert_eq!(field(&v, "stores"), &Value::Object(BTreeMap::new()));
+    let detail = strings(&v, "detail");
+    assert!(
+        detail
+            .iter()
+            .any(|d| d.contains(FEDORA_ANCHOR_DIR) && d.contains(DEBIAN_ANCHOR_DIR)),
+        "{detail:?}"
+    );
+    assert!(
+        detail.iter().any(|d| d.contains(OBSCURA_FLAG)),
+        "{detail:?}"
+    );
+    assert!(h.exec.runs().is_empty());
+    assert!(h.records().is_empty());
+
+    for (name, expected_records) in [("ca.install", 1), ("ca.uninstall", 2)] {
+        let err = h.call(name, Frontend::Cli, &[]).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<TrustError>().map(|e| e.kind),
+            Some(TrustErrorKind::UnsupportedPlatform),
+            "{name}: {err:#}"
+        );
+        let e = format!("{err:#}");
+        for needle in [FEDORA_ANCHOR_DIR, DEBIAN_ANCHOR_DIR, "/ca/ca.crt"] {
+            assert!(e.contains(needle), "{name}: got: {e}");
+        }
+        assert!(
+            h.exec.runs().is_empty(),
+            "{name} ran something on an unsupported platform"
+        );
+
+        let records = h.records();
+        assert_eq!(records.len(), expected_records, "{name}: {records:?}");
+        let rec = records.last().unwrap();
+        assert_eq!(
+            rec,
+            &AuditRecord {
+                ts: rec.ts.clone(),
+                command: rec.command,
+                frontend: "cli",
+                outcome: "error",
+                scope: None,
+                platform: Some("unsupported".to_string()),
+                fingerprint_sha256: Some(FIXTURE_FP256.to_string()),
+                detail: rec.detail.clone(),
+            }
+        );
+        assert_eq!(rec.command, name);
+        assert!(rec.detail.contains(DEBIAN_ANCHOR_DIR), "{}", rec.detail);
+    }
+    // Nothing to confirm: invoke fails with the clear error instead.
+    assert_eq!(h.confirm("ca.install", &[]), None);
+}
+
+// CA-AC16 (command level)
+#[test]
+fn linux_scope_defaults_to_system() {
+    const ANCHOR: &str = "/usr/local/share/ca-certificates/aitmproxy-root-ca.crt";
+    let h = Harness::on(
+        Platform::Linux(LinuxFamily::Debian),
+        cfg("/ca", false),
+        ScriptedExecutor::new().file("/ca/ca.crt", FIXTURE),
+        MemoryAuditLog::new(),
+    );
+
+    // No scope asked for: the platform's only scope, `system`.
+    let v = h.call("ca.install", Frontend::Cli, &[]).unwrap();
+    assert_eq!(text(&v, "scope"), "system");
+    assert_eq!(text(&v, "platform"), "linux-debian");
+    assert_eq!(text(&v, "location"), ANCHOR);
+    assert!(flag(&v, "changed"));
+    assert_eq!(
+        h.exec.runs(),
+        vec![
+            format!("sudo -- tee {ANCHOR}"),
+            "sudo -- update-ca-certificates".to_string()
+        ]
+    );
+    assert_eq!(h.exec.stdins()[0].as_deref(), Some(FIXTURE));
+    let records = h.records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].outcome, "ok");
+    assert_eq!(records[0].scope.as_deref(), Some("system"));
+    assert_eq!(records[0].platform.as_deref(), Some("linux-debian"));
+
+    // The prompt resolves the same scope and names the anchor.
+    let p = h.confirm("ca.install", &[]).expect("install asks");
+    assert!(p.contains(&format!("into {ANCHOR} (scope system)?")), "{p}");
+
+    // `scope == "user"` is refused before anything runs, and audited.
+    let h = Harness::on(
+        Platform::Linux(LinuxFamily::Fedora),
+        cfg("/ca", false),
+        ScriptedExecutor::new().file("/ca/ca.crt", FIXTURE),
+        MemoryAuditLog::new(),
+    );
+    let err = h
+        .call("ca.install", Frontend::Cli, &[("scope", str_arg("user"))])
+        .unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<TrustError>().map(|e| e.kind),
+        Some(TrustErrorKind::UnsupportedScope),
+        "{err:#}"
+    );
+    assert!(
+        format!("{err:#}").contains("no per-user OS trust store"),
+        "{err:#}"
+    );
+    assert!(h.exec.runs().is_empty());
+    let records = h.records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].outcome, "error");
+    assert_eq!(records[0].scope.as_deref(), Some("user"));
+    assert_eq!(records[0].platform.as_deref(), Some("linux-fedora"));
+    assert_eq!(h.confirm("ca.install", &[("scope", str_arg("user"))]), None);
 }
 
 // CA-AC21
@@ -739,6 +1039,23 @@ fn tracing_fields() {
         Some("ok")
     );
     assert_eq!(h.records().len(), 1);
+
+    // Spec §D8: every subprocess is one DEBUG event with the rendered line
+    // and its exit code — here the query and the add, in order.
+    let debug = capture.at(Level::DEBUG, "aitm_ca");
+    let lines: Vec<&str> = debug
+        .iter()
+        .map(|e| e.fields.get("command_line").map_or("", String::as_str))
+        .collect();
+    assert_eq!(lines, vec![Q_USER, add_user().as_str()], "{debug:?}");
+    for e in &debug {
+        assert_eq!(e.fields.get("code").map(String::as_str), Some("0"), "{e:?}");
+        assert_eq!(
+            e.fields.get("message").map(String::as_str),
+            Some("ran trust-store command"),
+            "{e:?}"
+        );
+    }
 
     // Nothing logged carries the certificate itself.
     for e in &capture.0 {

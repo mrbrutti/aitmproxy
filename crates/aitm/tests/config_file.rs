@@ -145,6 +145,27 @@ fn transport_map_forms_load() {
     );
 }
 
+/// A `ca.key_mode` that lets group or other read the CA key is refused when
+/// the file is parsed, so no config can widen the key's permissions; modes
+/// confined to the owner load as given (octal or decimal spelling).
+#[test]
+fn key_mode_with_group_or_other_bits_is_refused() {
+    redirect_home();
+    for mode in ["0o644", "0o640", "0o604", "0o777", "420"] {
+        let err = parse(&format!("ca:\n  key_mode: {mode}\n"))
+            .expect_err(&format!("key_mode {mode} must be refused"));
+        let msg = format!("{err:#}");
+        assert!(msg.contains("key_mode"), "{mode}: {msg}");
+        assert!(msg.contains("group"), "{mode}: {msg}");
+        assert!(msg.contains("other"), "{mode}: {msg}");
+    }
+    for (mode, want) in [("0o600", 0o600), ("0o400", 0o400), ("384", 0o600)] {
+        let cfg = parse(&format!("ca:\n  key_mode: {mode}\n"))
+            .unwrap_or_else(|e| panic!("key_mode {mode} must load: {e:#}"));
+        assert_eq!(cfg.ca.key_mode, want, "{mode}");
+    }
+}
+
 /// A two-line file sets one field and leaves every other at its default.
 #[test]
 fn two_line_file_is_valid() {
