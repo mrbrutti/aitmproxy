@@ -7,6 +7,8 @@ rust-version.workspace = true
 description = "CA trust-store management: the ca.* command family over an Executor trait, with an audit log."
 
 [dependencies]
+# The command/plugin traits, `CommandHost` (and its `Frontend`), `CaConfig`.
+aitm-core.workspace = true
 anyhow.workspace = true
 # Home directory for the per-user keychain path (RealExecutor::home_dir).
 dirs = "5"
@@ -20,6 +22,10 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 tracing.workspace = true
 # Parsing the single PEM block in ca.crt into DER for digesting.
 x509-parser = "0.18"
+
+[dev-dependencies]
+# A capturing subscriber for the tracing-field assertions (CA-AC25).
+tracing-subscriber = "0.3"
 
 [lints]
 workspace = true
