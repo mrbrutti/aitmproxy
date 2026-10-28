@@ -2,9 +2,10 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** draft
+**Status:** approved (2026-10-28 by Matt)
 **Spec:** `docs/superpowers/specs/2026-10-27-aitmproxy-m4-agent-milestone-design.md` (approved 2026-10-28 by Matt; AC-M4-1 … AC-M4-19, incl. AC-M4-5b/6b/8b/15b/16b)
 **Branch / worktree:** `feat/aitmproxy-m4`
+**Execution:** subagent-driven (Matt, 2026-10-28) — one fresh Coder per task in the `feat/aitmproxy-m4` worktree, panel review between tasks.
 
 **Goal:** Prove the agent-first thesis — an AI agent (harness-neutral; Claude the reference) autonomously drives aitmproxy against a real, seeded-vulnerable target through real browsers and finds → reproduces → reports vulnerabilities — by building the operator/agent command architecture (F1 identity+policy, F2 audit/agent stream, F4 push, confirm/approve-over-the-wire, tool-output-quality result rendering), a persistent findings store, a hermetic multi-vuln test target + grader, a Firefox browser engine, and the harness-neutral driver surface, with a deterministic scripted-driver exit gate and a live-agent acceptance.
 
