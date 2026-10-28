@@ -14,10 +14,13 @@
 //! exactly as passive capture is ungated. Replaying an imported flow is a later,
 //! explicit `flow.replay`, never a side effect of import.
 //!
-//! **Formats.** Only the native `aitm` format is wired here. The `format` param is
-//! already the extension point: HAR 1.2 export/import and mitmproxy `.flows`
-//! import land in Task 9 by adding arms to [`require_native`]/the dispatch.
+//! **Formats.** `flow.export`/`flow.import` carry a `format` param ([`Format`]).
+//! Native `aitm` (full fidelity) and HAR 1.2 (lossy interchange) both export and
+//! import; mitmproxy `.flows` is import-only. `session.save`/`session.load`
+//! remain native-only — they persist and restore the whole store verbatim.
 
+pub mod har;
+pub mod mitmproxy;
 pub mod native;
 
 use std::sync::Arc;
@@ -30,8 +33,16 @@ use anyhow::Context;
 
 use native::{from_doc, to_doc, SessionDoc, SCHEMA};
 
-/// The one serialization format this task wires. HAR / mitmproxy arrive in Task 9.
-const FORMAT_AITM: &str = "aitm";
+/// A serialization format for `flow.export`/`flow.import`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Format {
+    /// Native `aitm` session JSON: full fidelity, round-trips every field.
+    Aitm,
+    /// HAR 1.2: a lossy, portable interchange.
+    Har,
+    /// mitmproxy `.flows`: import only.
+    Mitmproxy,
+}
 
 /// Registers `session.save`, `session.load`, `flow.export`, `flow.import`.
 /// Observes no events — serialization is a pure view over the store.
@@ -50,24 +61,45 @@ impl Plugin for SessionIoPlugin {
     }
 }
 
-/// The requested format, defaulting to the native `aitm` format when omitted.
-fn format_param(args: &Params) -> anyhow::Result<String> {
-    match args.get("format") {
-        None | Some(Value::Null) => Ok(FORMAT_AITM.to_string()),
-        Some(Value::Str(s)) => Ok(s.clone()),
+/// The requested format, defaulting to native `aitm` when omitted.
+fn format_param(args: &Params) -> anyhow::Result<Format> {
+    let name = match args.get("format") {
+        None | Some(Value::Null) => return Ok(Format::Aitm),
+        Some(Value::Str(s)) => s.as_str(),
         Some(other) => anyhow::bail!("param `format` must be a string, got {other:?}"),
+    };
+    match name {
+        "aitm" => Ok(Format::Aitm),
+        "har" => Ok(Format::Har),
+        "mitmproxy" => Ok(Format::Mitmproxy),
+        other => anyhow::bail!("unknown format `{other}`; use `aitm`, `har`, or `mitmproxy`"),
     }
 }
 
-/// Accept only the native `aitm` format for now. HAR 1.2 and mitmproxy `.flows`
-/// are added here in Task 9; until then they are a clear, catchable refusal.
-fn require_native(format: &str) -> anyhow::Result<()> {
+/// Serialize flows in the requested format. mitmproxy `.flows` is import-only, so
+/// exporting it is a clear, catchable refusal.
+fn encode(format: Format, flows: &[Flow]) -> anyhow::Result<Vec<u8>> {
     match format {
-        FORMAT_AITM => Ok(()),
-        "har" | "mitmproxy" => {
-            anyhow::bail!("format `{format}` is not supported yet (added in Task 9); use `aitm`")
+        Format::Aitm => encode_native(flows),
+        Format::Har => serde_json::to_vec_pretty(&har::flows_to_har(flows))
+            .context("serializing HAR 1.2 document"),
+        Format::Mitmproxy => {
+            anyhow::bail!("format `mitmproxy` is import-only; export as `har` or `aitm`")
         }
-        other => anyhow::bail!("unknown format `{other}`; use `aitm`"),
+    }
+}
+
+/// Parse flows from the requested format. Every path is passive: it only builds
+/// `Flow`s in memory and never egresses.
+fn decode(format: Format, bytes: &[u8]) -> anyhow::Result<Vec<Flow>> {
+    match format {
+        Format::Aitm => Ok(from_doc(&parse_native(bytes)?)),
+        Format::Har => {
+            let doc: har::Har =
+                serde_json::from_slice(bytes).context("parsing HAR 1.2 document")?;
+            Ok(har::har_to_flows(&doc))
+        }
+        Format::Mitmproxy => mitmproxy::mitmproxy_to_flows(bytes),
     }
 }
 
@@ -234,8 +266,8 @@ impl Command for FlowExport {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "Export selected flows (or the whole store) to native `aitm` JSON. \
-                          Returns bytes, or writes to `path` when given."
+            description: "Export selected flows (or the whole store) as `aitm` native JSON or \
+                          HAR 1.2. Returns bytes, or writes to `path` when given."
                 .into(),
             params: vec![
                 ParamDef {
@@ -248,7 +280,7 @@ impl Command for FlowExport {
                     name: "format".into(),
                     ty: TypeDesc::Str,
                     required: false,
-                    description: "Serialization format; `aitm` (default).".into(),
+                    description: "Serialization format; `aitm` (default) or `har`.".into(),
                 },
                 ParamDef {
                     name: "path".into(),
@@ -281,10 +313,10 @@ impl Command for FlowExport {
     }
 
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
-        require_native(&format_param(&args)?)?;
+        let format = format_param(&args)?;
         let ids = ids_param(&args)?;
         let flows = collect_flows(host, ids)?;
-        let bytes = encode_native(&flows)?;
+        let bytes = encode(format, &flows)?;
         let count = Value::Int(flows.len() as i64);
         match args.get("path") {
             Some(Value::Str(path)) => {
@@ -313,9 +345,9 @@ impl Command for FlowImport {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "Import flows from a native `aitm` document (by `path` or `bytes`) into \
-                          the store, marked `imported`. Passive: no upstream requests, never \
-                          replays."
+            description: "Import flows (by `path` or `bytes`) into the store, marked `imported`. \
+                          Formats: `aitm`, `har`, or mitmproxy `.flows`. Passive: no upstream \
+                          requests, never replays."
                 .into(),
             params: vec![
                 ParamDef {
@@ -334,7 +366,8 @@ impl Command for FlowImport {
                     name: "format".into(),
                     ty: TypeDesc::Str,
                     required: false,
-                    description: "Serialization format; `aitm` (default).".into(),
+                    description: "Serialization format; `aitm` (default), `har`, or `mitmproxy`."
+                        .into(),
                 },
             ],
             result: TypeDesc::Object(vec![ParamDef {
@@ -347,7 +380,7 @@ impl Command for FlowImport {
     }
 
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
-        require_native(&format_param(&args)?)?;
+        let format = format_param(&args)?;
         let bytes = match (args.get("bytes"), args.get("path")) {
             (Some(Value::Bytes(b)), _) => b.clone(),
             (_, Some(Value::Str(path))) => {
@@ -355,10 +388,10 @@ impl Command for FlowImport {
             }
             _ => anyhow::bail!("flow.import needs `bytes` or `path`"),
         };
-        let doc = parse_native(&bytes)?;
+        let flows = decode(format, &bytes)?;
         let store = host.store();
         let mut ids = Vec::new();
-        for mut flow in from_doc(&doc) {
+        for mut flow in flows {
             // Imported flows are tagged `imported` and are explicitly not replays;
             // nothing egresses — they only populate the store.
             let meta = flow.metadata_mut();
