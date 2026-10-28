@@ -40,6 +40,42 @@ fn nested_object_round_trips() {
     assert_eq!(dynamic_to_value(&d).expect("map converts back"), v);
 }
 
+/// A nest of `n` singleton arrays, built as a script would (`a = [a]`).
+fn nested(n: usize) -> rhai::Dynamic {
+    let mut d = rhai::Dynamic::from_array(rhai::Array::new());
+    for _ in 0..n {
+        d = rhai::Dynamic::from_array(vec![d]);
+    }
+    d
+}
+
+/// Security review (M3, Critical): a value nested deeper than the marshal cap
+/// is an error, never a stack overflow — checked on a 2 MiB thread, the stack
+/// a tokio worker has. The cap itself is `MAX_DEPTH`.
+#[test]
+fn deep_nesting_is_an_error_not_an_abort() {
+    use aitm_plugin_rhai::marshal::MAX_DEPTH;
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            // Exactly at the cap converts; one past it is refused.
+            dynamic_to_value(&nested(MAX_DEPTH)).expect("MAX_DEPTH levels convert");
+            let err = dynamic_to_value(&nested(MAX_DEPTH + 1))
+                .expect_err("MAX_DEPTH + 1 levels must be refused");
+            assert!(
+                err.to_string().contains("nested deeper than"),
+                "the error names the cap: {err}"
+            );
+            // A nest well past the cap — the depth that overflowed the worker
+            // stack in the review's probe — is refused the same way.
+            let err = dynamic_to_value(&nested(1000)).expect_err("1000 levels must be refused");
+            assert!(err.to_string().contains("nested deeper than"), "{err}");
+        })
+        .expect("spawn")
+        .join()
+        .expect("the thread must not abort");
+}
+
 #[test]
 fn unmapped_rhai_type_is_runtime_error() {
     // A `char` has no `Value` counterpart.

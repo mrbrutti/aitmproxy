@@ -45,11 +45,28 @@ pub fn value_to_dynamic(v: &Value) -> Dynamic {
     }
 }
 
+/// How deep an array/map a script hands the host may nest. Every layer of the
+/// conversion (and of Rhai's own clone and drop) is one stack frame, and no
+/// Rhai limit bounds nesting — `max_array_size` counts elements, so a
+/// thousand singleton arrays inside one another are a thousand elements.
+/// Thirty-two levels is more than any JSON a script would build and far
+/// short of what overflows a 2 MiB worker stack.
+pub const MAX_DEPTH: usize = 32;
+
 /// Convert a Rhai value back into a bus `Value`. Fails with
-/// [`ScriptError::Runtime`] for a Rhai type that has no `Value` counterpart;
-/// the error names the offending type (nested conversions report the inner
-/// type).
+/// [`ScriptError::Runtime`] for a Rhai type that has no `Value` counterpart
+/// (the error names the offending type; nested conversions report the inner
+/// type) or for a value nested deeper than [`MAX_DEPTH`].
 pub fn dynamic_to_value(d: &Dynamic) -> Result<Value, ScriptError> {
+    convert(d, 0)
+}
+
+fn convert(d: &Dynamic, depth: usize) -> Result<Value, ScriptError> {
+    if depth > MAX_DEPTH {
+        return Err(runtime(format!(
+            "value nested deeper than {MAX_DEPTH} levels cannot be passed to the host"
+        )));
+    }
     // A closure-captured (shared) value is unwrapped to a plain one so the
     // typed accessors below see through it.
     let d = d.flatten_clone();
@@ -74,27 +91,30 @@ pub fn dynamic_to_value(d: &Dynamic) -> Result<Value, ScriptError> {
     if let Ok(items) = d.as_array_ref() {
         return items
             .iter()
-            .map(dynamic_to_value)
+            .map(|item| convert(item, depth + 1))
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array);
     }
     if let Ok(map) = d.as_map_ref() {
         return map
             .iter()
-            .map(|(k, v)| Ok((k.to_string(), dynamic_to_value(v)?)))
+            .map(|(k, v)| Ok((k.to_string(), convert(v, depth + 1)?)))
             .collect::<Result<BTreeMap<_, _>, _>>()
             .map(Value::Object);
     }
-    Err(unmapped(d.type_name()))
+    Err(runtime(format!(
+        "cannot convert a Rhai `{}` into a value",
+        d.type_name()
+    )))
 }
 
-/// The error for a Rhai type with no `Value` counterpart. The script/hook/line
-/// context is not known at this layer; the caller that owns it fills it in.
-fn unmapped(type_name: &str) -> ScriptError {
+/// A conversion failure. The script/hook/line context is not known at this
+/// layer; the caller that owns it fills it in.
+fn runtime(message: String) -> ScriptError {
     ScriptError::Runtime {
         script: String::new(),
         hook: String::new(),
         line: 0,
-        message: format!("cannot convert a Rhai `{type_name}` into a value"),
+        message,
     }
 }
