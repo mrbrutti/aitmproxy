@@ -4,8 +4,9 @@
 //! The platform-spec `Assertion::Word`/`Regex` carry only a pattern (no `part`),
 //! so M1 matches them against the response body; `BrowserEval` compares an
 //! observed browser value; `All`/`Any`/`Not` compose; `Dsl` defers to the shared
-//! evaluator. `negative` and `matchers-condition` are expressed by the serde layer
-//! as `Not` / `All` / `Any`, so evaluation sees only this tree.
+//! evaluator, which also resolves `step("name")` against the script-step outcomes
+//! the runner recorded. `negative` and `matchers-condition` are expressed by the
+//! serde layer as `Not` / `All` / `Any`, so evaluation sees only this tree.
 
 use std::collections::BTreeMap;
 
@@ -14,9 +15,10 @@ use regex::Regex;
 
 use crate::dsl::{self, DslContext};
 use crate::model::{Assertion, MatchPart};
+use crate::runner::StepOutcome;
 
 /// What an assertion is judged against: a response plus any observed browser
-/// values and bound variables.
+/// values, bound variables, and script-step outcomes.
 #[derive(Debug, Clone, Default)]
 pub struct MatchContext {
     pub status: u16,
@@ -26,6 +28,8 @@ pub struct MatchContext {
     pub browser: BTreeMap<String, Value>,
     /// Variables bound by earlier extractors / bindings (for `dsl`).
     pub vars: BTreeMap<String, Value>,
+    /// Script-step outcomes by step name (for `dsl`'s `step("name")`).
+    pub steps: BTreeMap<String, StepOutcome>,
 }
 
 impl MatchContext {
@@ -37,6 +41,7 @@ impl MatchContext {
             headers: Vec::new(),
             browser: BTreeMap::new(),
             vars: BTreeMap::new(),
+            steps: BTreeMap::new(),
         }
     }
 
@@ -63,6 +68,11 @@ impl MatchContext {
             status: self.status,
             body: self.body.clone(),
             vars: self.vars.clone(),
+            steps: self
+                .steps
+                .iter()
+                .map(|(name, outcome)| (name.clone(), outcome.as_str().to_string()))
+                .collect(),
         }
     }
 

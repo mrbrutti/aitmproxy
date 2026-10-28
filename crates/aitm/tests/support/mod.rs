@@ -34,7 +34,11 @@ pub fn config(tag: &str) -> Config {
 /// frontends (`tui::services`): the registry, store and guard from the proxy,
 /// the replay client over `Http1Sender`; no browser, no log file.
 pub fn assemble_services(cfg: &Config) -> (Proxy, Services) {
-    let Assembled { proxy, ca: _ } = assemble(cfg).expect("assemble");
+    let Assembled {
+        proxy,
+        ca: _,
+        listening: _,
+    } = assemble(cfg).expect("assemble");
     let services = tui::services(&proxy, cfg, None, TuiLog::Off);
     (proxy, services)
 }

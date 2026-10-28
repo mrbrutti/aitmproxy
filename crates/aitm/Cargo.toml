@@ -23,6 +23,7 @@ aitm-plugins.workspace = true
 aitm-browser.workspace = true
 aitm-ca.workspace = true
 aitm-poc.workspace = true
+aitm-plugin-rhai.workspace = true
 aitm-mcp.workspace = true
 aitm-cli.workspace = true
 # `aitm tui` embeds the proxy: the TUI runs in-process over `aitm-bus-client`'s

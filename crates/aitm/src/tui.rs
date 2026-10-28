@@ -124,6 +124,7 @@ pub fn server(cfg: &Config, transport: McpTransport, services: &Services) -> Mcp
     McpServer::new(services.registry.clone(), transport)
         .with_ssrf_policy(cfg.browser.ssrf.clone())
         .with_poc_dir(cfg.poc.dir.clone())
+        .with_config(Arc::new(cfg.clone()))
         .with_services(
             services.store.clone(),
             services.client.clone(),

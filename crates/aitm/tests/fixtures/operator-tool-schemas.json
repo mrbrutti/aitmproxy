@@ -1,0 +1,138 @@
+{
+  "config.get": {
+    "additionalProperties": false,
+    "properties": {},
+    "type": "object"
+  },
+  "flow.clear": {
+    "additionalProperties": false,
+    "properties": {},
+    "type": "object"
+  },
+  "flow.comment": {
+    "additionalProperties": false,
+    "properties": {
+      "id": {
+        "description": "The flow to comment on.",
+        "format": "uuid",
+        "type": "string"
+      },
+      "text": {
+        "description": "The comment text; empty clears the comment.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "id",
+      "text"
+    ],
+    "type": "object"
+  },
+  "flow.detail": {
+    "additionalProperties": false,
+    "properties": {
+      "body": {
+        "description": "Body mode: `none`, `inline` (default), or `range`.",
+        "type": "string"
+      },
+      "id": {
+        "description": "The flow to inspect.",
+        "format": "uuid",
+        "type": "string"
+      },
+      "length": {
+        "description": "Byte length for `body: range` (default: to the end).",
+        "type": "integer"
+      },
+      "offset": {
+        "description": "Byte offset for `body: range` (default 0).",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "id"
+    ],
+    "type": "object"
+  },
+  "flow.mark": {
+    "additionalProperties": false,
+    "properties": {
+      "id": {
+        "description": "The flow to mark.",
+        "format": "uuid",
+        "type": "string"
+      },
+      "marks": {
+        "description": "The marks to set; replaces any existing marks.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "id",
+      "marks"
+    ],
+    "type": "object"
+  },
+  "poc.artifact": {
+    "additionalProperties": false,
+    "properties": {
+      "path": {
+        "description": "Path to the artifact, under the PoC output directory.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "path"
+    ],
+    "type": "object"
+  },
+  "poc.get": {
+    "additionalProperties": false,
+    "properties": {
+      "poc_path": {
+        "description": "Path to the PoC YAML file.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "poc_path"
+    ],
+    "type": "object"
+  },
+  "poc.list": {
+    "additionalProperties": false,
+    "properties": {},
+    "type": "object"
+  },
+  "proxy.pause": {
+    "additionalProperties": false,
+    "properties": {},
+    "type": "object"
+  },
+  "proxy.resume": {
+    "additionalProperties": false,
+    "properties": {},
+    "type": "object"
+  },
+  "proxy.status": {
+    "additionalProperties": false,
+    "properties": {},
+    "type": "object"
+  },
+  "scope.remove": {
+    "additionalProperties": false,
+    "properties": {
+      "host": {
+        "description": "The scope entry to remove (exact match).",
+        "type": "string"
+      }
+    },
+    "required": [
+      "host"
+    ],
+    "type": "object"
+  }
+}
