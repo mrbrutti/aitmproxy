@@ -1,0 +1,55 @@
+{
+  "_comment": "Rhai token grammar for colouring, not parsing (UI spec §1.1). Each surface generates its tokenizer from this file; a tolerant colorizer must never throw on partial input. Lexical rules are described, not compiled: the regexes are ECMAScript-flavoured and every surface re-expresses them in its own engine.",
+  "language": "rhai",
+  "keywords": [
+    "fn", "private", "let", "const",
+    "if", "else", "switch",
+    "while", "loop", "for", "in", "do", "until",
+    "return", "break", "continue",
+    "throw", "try", "catch",
+    "import", "export", "as",
+    "this"
+  ],
+  "literals": ["true", "false", "()"],
+  "operators": [
+    "+", "-", "*", "/", "%", "**",
+    "<<", ">>", "&", "|", "^", "!",
+    "==", "!=", "<", ">", "<=", ">=",
+    "&&", "||", "??",
+    "=", "+=", "-=", "*=", "/=", "%=", "**=", "<<=", ">>=", "&=", "|=", "^=",
+    "..", "..="
+  ],
+  "punctuation": ["(", ")", "{", "}", "[", "]", ",", ";", ":", "::", ".", "?.", "#{", "=>"],
+  "lexical": {
+    "comment": {
+      "line": { "start": "//" },
+      "block": { "start": "/*", "end": "*/", "nested": true },
+      "note": "An unterminated block comment colours to end of buffer."
+    },
+    "string": {
+      "double": { "start": "\"", "end": "\"", "escape": "\\", "multiline": false },
+      "char": { "start": "'", "end": "'", "escape": "\\", "multiline": false },
+      "interpolated": { "start": "`", "end": "`", "escape": "\\", "multiline": true, "interpolation": { "start": "${", "end": "}" } },
+      "raw": { "start": "#\"", "end": "\"#", "multiline": true },
+      "note": "An unterminated string colours to end of line (to end of buffer for the multiline forms) and must not suppress colouring of later lines."
+    },
+    "number": {
+      "pattern": "0x[0-9a-fA-F_]+|0o[0-7_]+|0b[01_]+|[0-9][0-9_]*(\\.[0-9][0-9_]*)?([eE][+-]?[0-9_]+)?",
+      "forms": ["int", "float", "hex", "octal", "binary"]
+    },
+    "identifier": {
+      "pattern": "[A-Za-z_][A-Za-z0-9_]*"
+    }
+  },
+  "map_token": {
+    "keyword": "keyword",
+    "literal": "boolean",
+    "string": "string",
+    "number": "number",
+    "comment": "comment",
+    "operator": "punct",
+    "punctuation": "punct",
+    "identifier": "text"
+  },
+  "map_token_note": "Values are the foundation syntax.* tokens (key/string/number/boolean/punct) plus the additive comment/keyword/text tokens (UI spec §1.1). `true`/`false`/`()` colour as boolean."
+}
