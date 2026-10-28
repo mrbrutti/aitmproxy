@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 
 use aitm::config_file::{default_config_path, load, parse};
-use aitm_core::{BrowserEngine, Config};
+use aitm_core::{BrowserEngine, Config, McpTransport};
 
 /// Point the per-user config dir at a temp dir, once, before any test reads
 /// it. `dirs::config_dir()` follows `$HOME` on macOS and `$XDG_CONFIG_HOME` on
@@ -119,6 +119,30 @@ fn unknown_key_is_an_error() {
     let err = parse("browser:\n  enigne: chrome\n").expect_err("misspelled key");
     let msg = format!("{err:#}");
     assert!(msg.contains("enigne"), "error does not name the key: {msg}");
+}
+
+/// The documented `mcp.transport` forms are plain maps — `{loopback_tcp:
+/// {port, token}}` and `{stdio: {}}` — not YAML `!tags`.
+#[test]
+fn transport_map_forms_load() {
+    redirect_home();
+    let cfg = parse("mcp:\n  transport:\n    loopback_tcp:\n      port: 7001\n      token: t0k\n")
+        .expect("loopback_tcp map form");
+    assert!(
+        matches!(
+            &cfg.mcp.transport,
+            McpTransport::LoopbackTcp { port: 7001, token } if token == "t0k"
+        ),
+        "{:?}",
+        cfg.mcp.transport
+    );
+
+    let cfg = parse("mcp:\n  transport:\n    stdio: {}\n").expect("stdio map form");
+    assert!(
+        matches!(cfg.mcp.transport, McpTransport::Stdio),
+        "{:?}",
+        cfg.mcp.transport
+    );
 }
 
 /// A two-line file sets one field and leaves every other at its default.

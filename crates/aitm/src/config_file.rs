@@ -186,6 +186,10 @@ impl CaFile {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct McpFile {
+    /// `singleton_map`: the documented `{loopback_tcp: {…}}` map form. serde_yaml
+    /// 0.9 otherwise reads an externally tagged enum only as a `!loopback_tcp`
+    /// YAML tag. `default` keeps the key optional under `with`.
+    #[serde(default, with = "serde_yaml::with::singleton_map")]
     transport: Option<TransportFile>,
 }
 
