@@ -821,8 +821,10 @@ pub struct ScriptStepCtx<'a> {
 
 pub enum ScriptVerdict { Pass, Fail, Neutral }
 
-/// What `step("name")` resolves to in the success DSL.
-pub enum StepOutcome { Matched, NotMatched, Pass, Fail, Error }
+/// What `step("name")` resolves to in the success DSL, as the strings
+/// "matched" / "not-matched" / "pass" / "fail" / "error" / "neutral"
+/// (`Neutral` added at Task 13: a step that returns neither pass nor fail).
+pub enum StepOutcome { Matched, NotMatched, Pass, Fail, Error, Neutral }
 ```
 
 **Inputs** available to the step: `vars` (every PoC variable, caller `--var`
