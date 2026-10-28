@@ -13,9 +13,16 @@
 //! `map.add` (the path is canonicalized and must stay under the map root), the
 //! confinement analog of the SSRF guard.
 //!
-//! **Map Remote** ([`MapAction::Remote`]/[`RemoteTarget`]) is defined here so its
-//! serve-side (the scope-guarded host rewrite) lands additively in Task 13; this
-//! crate does not act on `remote` entries.
+//! **Map Remote** ([`MapAction::Remote`]/[`RemoteTarget`]): on a request event, a
+//! matching `remote` rule rewrites the request's scheme/authority/path (and the
+//! `Host` header) in place so it goes upstream to a different host. Because that is
+//! active egress to a (possibly new) host, the plugin **must** pass the rewritten
+//! authority through [`ScopeRateGuard::check_active`] *before* altering the request
+//! — the deny-by-default point for Map Remote. An out-of-scope target is refused:
+//! the request is left untouched and the flow is short-circuited with an error
+//! response, so the original is not forwarded to the new host (or the old one).
+//! `FlowCtx` does not carry the guard, so the plugin holds its own handle
+//! (constructor-injected, wired in Task 14).
 //!
 //! **Agent gate:** `map.add`/`map.remove` shape live traffic, so an agent
 //! (`Frontend::Mcp`) frontend is refused unless `maps.allow_agent_authoring` is
@@ -32,8 +39,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
 use aitm_core::{
-    Body, Command, CommandHost, Event, Flow, FlowCtx, Frontend, HeaderMap, HttpResponse,
-    HttpVersion, ParamDef, ParamSchema, Params, Plugin, Registry, TypeDesc, Value, Verdict,
+    Authority, Body, Command, CommandHost, Event, Flow, FlowCtx, Frontend, HeaderMap, HttpResponse,
+    HttpVersion, ParamDef, ParamSchema, Params, Plugin, Registry, ScopeRateGuard, TypeDesc, Value,
+    Verdict,
 };
 use aitm_rules::{compile, CompiledRule, Phase, Rule};
 
@@ -50,13 +58,19 @@ struct MapEntry {
     local_file: Option<PathBuf>,
 }
 
-/// State the plugin (which serves Map Local on events) shares with its commands
-/// (which author the rules). The map root and agent gate are fixed at construction.
+/// State the plugin (which serves Map Local and Map Remote on events) shares with
+/// its commands (which author the rules). The map root, agent gate and scope guard
+/// are fixed at construction.
 struct Shared {
     maps: Mutex<Vec<MapEntry>>,
     map_root: PathBuf,
     allow_agent_authoring: bool,
     next_id: AtomicU64,
+    /// The one scope/rate guard every active egress passes. Map Remote redirects
+    /// to a new host, so it calls [`ScopeRateGuard::check_active`] on the rewritten
+    /// authority before touching the request. `FlowCtx` does not carry the guard,
+    /// so the plugin holds its own handle (constructor-injected, wired in Task 14).
+    guard: Arc<dyn ScopeRateGuard>,
 }
 
 impl Shared {
@@ -79,14 +93,21 @@ pub struct MapRulesPlugin {
 impl MapRulesPlugin {
     /// Build the plugin over `map_root` (the directory Map Local files are
     /// confined to) with the agent-authoring gate `allow_agent_authoring`
-    /// (default off at the call site). `Config.maps` wires both in Task 14.
-    pub fn new(map_root: PathBuf, allow_agent_authoring: bool) -> Self {
+    /// (default off at the call site) and the shared scope `guard` Map Remote
+    /// redirects pass. `Config.maps` and the proxy's `guard()` wire all three in
+    /// Task 14.
+    pub fn new(
+        map_root: PathBuf,
+        allow_agent_authoring: bool,
+        guard: Arc<dyn ScopeRateGuard>,
+    ) -> Self {
         Self {
             shared: Arc::new(Shared {
                 maps: Mutex::new(Vec::new()),
                 map_root,
                 allow_agent_authoring,
                 next_id: AtomicU64::new(1),
+                guard,
             }),
         }
     }
@@ -109,10 +130,13 @@ impl Plugin for MapRulesPlugin {
         }));
     }
 
-    /// Serve Map Local. On a request event, the first matching `local` rule
-    /// answers the client from its file and halts the chain — no upstream, no
-    /// guard. `remote` rules are left for Task 13. Idempotent: once a response is
-    /// present (this plugin's or another's) nothing is re-served.
+    /// Serve Map Local and Map Remote. On a request event the first matching rule
+    /// wins: a `local` rule answers the client from its file and halts the chain
+    /// (no upstream, no guard); a `remote` rule rewrites the request target after
+    /// its rewritten authority passes the scope guard, then lets it continue
+    /// upstream — or, when the target is out of scope, refuses it with an error
+    /// response (the request is left untouched and not forwarded). Idempotent: once
+    /// a response is present (this plugin's or another's) nothing is re-served.
     fn on_event(&mut self, ev: &Event, ctx: &mut FlowCtx<'_>) -> Verdict {
         if !matches!(ev, Event::RequestHeaders(_) | Event::Request(_)) {
             return Verdict::Continue;
@@ -123,24 +147,141 @@ impl Plugin for MapRulesPlugin {
             _ => return Verdict::Continue,
         }
 
+        let guard = self.shared.guard.as_ref();
         let maps = self.shared.lock_maps();
-        let response = maps.iter().find_map(|entry| match entry.kind {
-            MapKind::Local if entry.rule.matches(ctx.flow(), Phase::Request, None) => {
-                Some(local_response(entry))
+        let decision = maps.iter().find_map(|entry| {
+            if !entry.rule.matches(ctx.flow(), Phase::Request, None) {
+                return None;
             }
-            // Map Remote serve-side is Task 13; `remote` rules are inert here.
-            _ => None,
+            Some(match &entry.action {
+                MapAction::Local { .. } => Decision::Serve(local_response(entry)),
+                MapAction::Remote { to } => decide_remote(to, guard),
+            })
         });
         drop(maps);
 
-        match response {
-            Some(resp) => {
+        match decision {
+            // Map Local, or a refused Map Remote: answer and halt, no upstream.
+            Some(Decision::Serve(resp)) => {
                 ctx.set_response(resp);
                 Verdict::Halt
+            }
+            // An in-scope Map Remote: rewrite the target and continue upstream.
+            Some(Decision::Rewrite(plan)) => {
+                apply_remote(ctx.flow_mut(), &plan);
+                Verdict::Continue
             }
             None => Verdict::Continue,
         }
     }
+}
+
+/// What a matched rule resolves to once the guard has (for Map Remote) had its say.
+enum Decision {
+    /// Answer the client with this response and halt — no upstream. Used by Map
+    /// Local and by a Map Remote refusal.
+    Serve(HttpResponse),
+    /// Rewrite the request target in place, then let it continue upstream (an
+    /// allowed Map Remote redirect).
+    Rewrite(RemotePlan),
+}
+
+/// A computed Map Remote rewrite. A `None` field keeps the request's original
+/// value; `authority` is always replaced (and is what the scope guard checks).
+struct RemotePlan {
+    scheme: Option<String>,
+    authority: String,
+    path: Option<String>,
+}
+
+/// Resolve a `remote` rule: compute the rewrite, then gate it on the scope guard.
+/// A malformed target, or a target the guard refuses, becomes a visible error
+/// response (the request is never rewritten, so it is not forwarded to that host).
+fn decide_remote(to: &RemoteTarget, guard: &dyn ScopeRateGuard) -> Decision {
+    let plan = match plan_remote(to) {
+        Ok(plan) => plan,
+        Err(err) => return Decision::Serve(text_response(502, &format!("map remote: {err}"))),
+    };
+    // Deny-by-default: the rewritten authority is active egress to a new host, so
+    // it must pass the one guard. The permit is only a pre-flight — the real
+    // egress later takes its own slot — so we drop it immediately.
+    match guard.check_active(&plan.authority) {
+        Ok(_) => Decision::Rewrite(plan),
+        Err(err) => Decision::Serve(text_response(
+            502,
+            &format!("map remote: refused redirect to {} — {err}", plan.authority),
+        )),
+    }
+}
+
+/// Compute the rewrite a Map Remote target describes, validating the new authority
+/// (a malformed target is refused rather than redirected). The target fully
+/// determines the rewrite, so the original request is not consulted here.
+fn plan_remote(to: &RemoteTarget) -> anyhow::Result<RemotePlan> {
+    match to {
+        RemoteTarget::Host { authority, scheme } => {
+            validate_authority(authority)?;
+            Ok(RemotePlan {
+                scheme: scheme.clone(),
+                authority: authority.clone(),
+                // A bare host swap keeps the original path.
+                path: None,
+            })
+        }
+        RemoteTarget::Url(url) => {
+            let (scheme, authority, path) = split_url(url)?;
+            Ok(RemotePlan {
+                scheme: Some(scheme),
+                authority,
+                path: Some(path),
+            })
+        }
+    }
+}
+
+/// Validate a redirect authority (`host[:port]`); the guard-checked, request-bound
+/// value must be a well-formed authority.
+fn validate_authority(authority: &str) -> anyhow::Result<()> {
+    Authority::parse_with_default(authority, 0)
+        .map_err(|err| anyhow::anyhow!("invalid redirect authority {authority:?}: {err}"))?;
+    Ok(())
+}
+
+/// Split an absolute `scheme://authority/path` redirect URL into its parts. The
+/// target is operator-supplied (CLI/config), so a minimal split suffices; the
+/// authority is validated so a malformed URL is refused rather than redirected.
+fn split_url(url: &str) -> anyhow::Result<(String, String, String)> {
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| {
+        anyhow::anyhow!("redirect url {url:?} must be absolute (scheme://host/path)")
+    })?;
+    if scheme.is_empty() {
+        anyhow::bail!("redirect url {url:?} is missing a scheme");
+    }
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    validate_authority(authority)?;
+    Ok((scheme.to_string(), authority.to_string(), path.to_string()))
+}
+
+/// Apply a computed rewrite to the request in place, keeping the `Host` header in
+/// step with the new authority so the new upstream routes the redirected request.
+fn apply_remote(flow: &mut Flow, plan: &RemotePlan) {
+    let Flow::Http(f) = flow else {
+        return;
+    };
+    if let Some(scheme) = &plan.scheme {
+        f.request.scheme = scheme.clone();
+    }
+    f.request.authority = plan.authority.clone();
+    if let Some(path) = &plan.path {
+        f.request.path = path.clone();
+    }
+    // `HeaderMap::set` appends (multimap semantics), so drop the stale `Host`
+    // first to replace it rather than leave the old host ahead of the new one.
+    f.request.headers.remove("host");
+    f.request.headers.set("host", &plan.authority);
 }
 
 /// Build the response a `local` rule serves. Reads the confined file; a read
@@ -161,16 +302,26 @@ fn local_response(entry: &MapEntry) -> HttpResponse {
 
     match std::fs::read(path) {
         Ok(bytes) => http_response(status, headers, path, bytes),
-        Err(err) => http_response(
+        Err(err) => text_response(
             502,
-            &[(
-                "content-type".to_string(),
-                "text/plain; charset=utf-8".to_string(),
-            )],
-            Path::new("error.txt"),
-            format!("map local: cannot read {}: {err}", path.display()).into_bytes(),
+            &format!("map local: cannot read {}: {err}", path.display()),
         ),
     }
+}
+
+/// A plain-text response, used for a Map Local read miss and a Map Remote scope
+/// refusal, so the failure is visible to the client rather than silently leaking
+/// or forwarding the request.
+fn text_response(status: u16, message: &str) -> HttpResponse {
+    http_response(
+        status,
+        &[(
+            "content-type".to_string(),
+            "text/plain; charset=utf-8".to_string(),
+        )],
+        Path::new("error.txt"),
+        message.as_bytes().to_vec(),
+    )
 }
 
 /// Assemble an [`HttpResponse`] from a status, the rule's header overrides, the
