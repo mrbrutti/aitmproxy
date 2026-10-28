@@ -27,6 +27,23 @@ struct ShellView: View {
             }
         }
         .background(Tok.Ground.surface.color)
+        // Drop a HAR (or, after F10, a mitmproxy/Proxyman/Charles file) anywhere on the window (S-065).
+        .onDrop(of: [.fileURL], isTargeted: $session.dropTargeted) { providers in
+            // Stays on the main actor: the item provider's async load is awaited here.
+            Task { @MainActor in
+                for provider in providers {
+                    let data: Data? = await withCheckedContinuation { done in
+                        _ = provider.loadDataRepresentation(for: .fileURL) { data, _ in done.resume(returning: data) }
+                    }
+                    guard let data, let url = URL(dataRepresentation: data, relativeTo: nil) else { continue }
+                    if !session.importFile(url) { break }
+                }
+            }
+            return !providers.isEmpty
+        }
+        .overlay {
+            if session.dropTargeted { DropOverlay() }
+        }
         .overlay(alignment: .top) {
             if session.paletteVisible {
                 ZStack(alignment: .top) {
@@ -232,6 +249,33 @@ struct EmptyFlows: View {
         .padding(.top, Tok.Size.columnHeader)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .allowsHitTesting(false)
+    }
+}
+
+/// The "Drop to import" face over the whole window while a file is dragged
+/// in (S-065): the surface at nine tenths, one line of type, no illustration.
+struct DropOverlay: View {
+    var body: some View {
+        ZStack {
+            Tok.Ground.surface.color.opacity(0.92)
+            VStack(spacing: Space.sm) {
+                Image(systemName: "arrow.down.doc")
+                    .font(.system(size: Tok.Typography.Size.xl * 2, weight: .light))
+                    .foregroundStyle(Tok.Ink.secondary.color)
+                Text("Drop to import")
+                    .font(Tok.Face.ui(Tok.Typography.Size.xl, .medium)).foregroundStyle(Tok.Ink.primary.color)
+                Text("HAR files are read here; mitmproxy, Proxyman and Charles files need the proxy (F10).")
+                    .font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.tertiary.color)
+            }
+            .multilineTextAlignment(.center)
+            .padding(Space.section)
+            .overlay(RoundedRectangle(cornerRadius: Tok.Radius.panel).strokeBorder(Tok.Line.control.color, style: StrokeStyle(lineWidth: 1, dash: [6, 6])))
+            .padding(Space.section)
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Drop to import")
     }
 }
 

@@ -16,6 +16,7 @@ enum SnapshotScene: String, CaseIterable {
     case rulesSheet = "rules-sheet"
     case editPaused = "edit-paused"
     case scopeSheet = "scope-sheet"
+    case importDrop = "import-drop"
     case detached
     case split
     case activityLog = "activity-log"
@@ -69,6 +70,8 @@ enum SnapshotScene: String, CaseIterable {
             }
         case .scopeSheet:
             session.scopeSheetVisible = true
+        case .importDrop:
+            session.dropTargeted = true
         case .detached:
             session.layout = .detached
         case .activityLog:
@@ -169,6 +172,7 @@ enum SnapshotScene: String, CaseIterable {
         session.secondSelection = []
         session.rulesVisible = false
         session.scopeSheetVisible = false
+        session.dropTargeted = false
         session.composeVisible = false
         session.requestTab = .raw
         session.responseTab = .body

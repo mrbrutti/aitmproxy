@@ -71,6 +71,8 @@ public enum FlowState: Hashable, Sendable {
 /// replay / request.send / poc.run (teal tick). Needs F2 for the live bus.
 public enum FlowOrigin: Hashable, Sendable {
     case client, human, agent
+    /// Read from a file (S-065), never on the wire.
+    case imported
 }
 
 /// The SSL column.

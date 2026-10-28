@@ -44,6 +44,8 @@ One name per thing, everywhere: buttons, menus, tooltips, errors, stories.
 | Request pane / Response pane | The two halves of the inspector | left/right side |
 | Body viewer | A tab that renders a body: Pretty, Tree, Image, Hex, Raw, Diff | previewer, formatter |
 | Quick Look | A floating preview of a body (Space on the list; Flow ▸ Quick Look Body) | peek, popup |
+| Import | Read flows from a file into the capture (⌘O, or drop on the window); they carry the `imported` origin | load, open |
+| Export Selection | Write the selected flows as HAR (⌘E), CSV or a cURL batch | save as, download |
 | Resume All | Release every paused flow (⌥⌘⏎) | continue all, release all |
 | Revert to Original | Drop the draft edits of a paused request | reset, discard |
 | Copy as | Copy a flow as cURL (⇧⌘C), httpie, Python (requests) or fetch | export code, snippet |

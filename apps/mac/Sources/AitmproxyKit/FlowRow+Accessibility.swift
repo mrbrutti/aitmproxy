@@ -19,6 +19,7 @@ extension FlowRow {
         if isReplay { parts.append("replay") }
         if edited { parts.append("edited") }
         if origin == .agent { parts.append("agent") }
+        if origin == .imported { parts.append("imported") }
         if tls == .tunnelled { parts.append("not decrypted") }
         if tls == .pinnedOrFailed { parts.append("TLS failed") }
         if let mark { parts.append("marked \(mark.rawValue)") }

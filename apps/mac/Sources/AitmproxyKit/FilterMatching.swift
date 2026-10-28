@@ -380,6 +380,7 @@ struct MatchContext {
             case .client: return "client"
             case .human: return "human"
             case .agent: return "agent"
+            case .imported: return "imported"
             }
         case .scope: return row.inScope ? "in" : "out"
         case .requestHeader, .responseHeader, .requestBody, .responseBody, .contentType, .wsDirection:

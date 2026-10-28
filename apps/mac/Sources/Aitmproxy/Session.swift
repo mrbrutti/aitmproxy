@@ -182,6 +182,8 @@ final class Session {
     var quickLookTick = 0
     /// Typed into the Scope sheet's field when Flow ▸ Add Host to Scope… opens it.
     var scopeSheetHost: String?
+    /// A file is being dragged over the window (S-065): the "Drop to import" face shows.
+    var dropTargeted = false
 
     // MARK: Palette (S-035, S-036)
 

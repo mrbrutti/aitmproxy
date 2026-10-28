@@ -1041,16 +1041,17 @@ Screens: import-drop
 Depends: S-046
 Core: F10
 Acceptance:
-- [snap] A drop target overlay in the UI face: "Drop to import"; imported flows carry an `imported` origin.
-- [self] `flow.import` and `flow.export {ids, format}` are sent; the save panel proposes a filename.
-- [unit] Unsupported files are refused with the detected type.
+- [snap] A drop target overlay in the UI face: "Drop to import" (`import-drop`); imported flows carry an `imported` origin (neutral tag in the Origin column).
+- [self] `flow.import` / `flow.export {ids, format}` are sent when the bus lists them (F10); before that an exported HAR imports back locally as `imported` rows with their details, and a Charles file is refused by name. The save panel proposes `aitmproxy-<date>.<ext>`.
+- [unit] `TransferTests`: formats detected by extension and content; unsupported files refused with the detected type and the alert's words; HAR round-trips the fixtures (method, host, query, status, headers, bodies, duration); CSV and cURL batch cover every row.
 UX:
-- Flow: drag a .har / .mitm / .proxymanlog / .chlz onto the window -> "Drop to import" overlay -> drop -> rows appear with origin `imported`; File ▸ Export Selection… (⌘E) -> format menu (HAR, CSV, cURL batch, Postman, OpenAPI) -> save panel
+- Flow: drag a .har / .mitm / .proxymanlog / .chlz onto the window -> "Drop to import" overlay -> drop -> rows appear with origin `imported`; File ▸ Export Selection… ▸ HAR… (⌘E) / CSV… / cURL Batch… -> save panel
 - Surface: drop overlay; save panel
-- States: unsupported file -> alert "Can't import <name>: <type> files are not supported."; before F10 -> HAR import/export runs locally in the app (Kit), the rest wait
-- Words: "Drop to import", "Export Selection…"
-- Access: File ▸ Import… (⌘O) as the keyboard route
-Status: todo
+- States: unsupported file -> alert "Can't import <name>: <type> files are not supported until the proxy imports them (F10)."; before F10 -> HAR import/export runs locally in the app (Kit), the rest wait
+- Words: "Drop to import", "Import…", "Export Selection…"
+- Access: File ▸ Import… (⌘O) as the keyboard route; the overlay is one accessibility element "Drop to import"
+Notes: Postman/OpenAPI export and the mitmproxy/Proxyman/Charles readers are the proxy's (F10); the app sends `flow.import {path}` / `flow.export {ids, format}` as soon as the bus lists the tools. Export takes the multi-selection, else the focused row, else every visible row.
+Status: done
 
 ### S-066 Save and load a session
 As the operator, I press ⌘S to save the capture as a session and reopen it from Saved in the sidebar.

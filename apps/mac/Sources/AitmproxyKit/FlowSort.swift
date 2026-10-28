@@ -104,6 +104,7 @@ extension FlowOrigin {
         case .agent: 0
         case .human: 1
         case .client: 2
+        case .imported: 3
         }
     }
 }

@@ -50,7 +50,7 @@ import Testing
             #expect(!entry.items.isEmpty && entry.items.allSatisfy { !$0.titles.isEmpty }, "\(entry.brief) has no items")
         }
         let deferred = CommandMap.all.filter { if case .deferred = $0.scope { return true } else { return false } }
-        #expect(deferred.map(\.brief) == ["Import…", "Export Selection…", "Save Session", "Focus Inspector"])
+        #expect(deferred.map(\.brief) == ["Save Session", "Focus Inspector"])
     }
 
     @Test func rowsDescribeThemselvesForVoiceOver() {

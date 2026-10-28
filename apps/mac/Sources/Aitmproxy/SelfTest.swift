@@ -246,6 +246,30 @@ enum SelfTest {
                 check("a FlowId parameter becomes a flow picker preset to the focused flow", form.values["id"] == session.focused?.raw && !form.missing.isEmpty == (session.focused == nil))
             }
 
+            // S-065: HAR out and back in, locally before F10; other formats refused by name.
+            do {
+                let before = session.rows.count
+                let maxSeq = session.rows.map(\.seq).max() ?? 0
+                let chosen = Array(session.rows.prefix(2))
+                let har = FlowTransfer.export(chosen.map { ($0, session.details[$0.id]) }, as: .har)
+                let file = FileManager.default.temporaryDirectory.appending(path: "selftest-\(UUID().uuidString).har")
+                try? har.write(to: file, atomically: true, encoding: .utf8)
+                check("importing an exported HAR appends its flows as imported",
+                      session.importFile(file) && session.rows.count == before + 2
+                          && session.rows.suffix(2).allSatisfy { $0.origin == .imported && $0.inScope }
+                          && session.rows.last?.seq == maxSeq + 2,
+                      "rows \(session.rows.count) wanted \(before + 2); last seq \(session.rows.last?.seq ?? -1)")
+                check("the imported flow is selected and has its detail",
+                      session.focusedRow?.origin == .imported && session.focusedDetail?.request.startLine.hasPrefix("PUT /api/cart") == true,
+                      "focused \(session.focusedRow?.url ?? "-") \(session.focusedDetail?.request.startLine ?? "-")")
+                let charles = FileManager.default.temporaryDirectory.appending(path: "selftest.chlz")
+                try? Data().write(to: charles)
+                check("a Charles file is refused by name", !session.importFile(charles) && session.lastError?.hasPrefix("Can't import selftest.chlz: Charles") == true,
+                      session.lastError ?? "-")
+                session.rows.removeLast(2)
+                session.select(session.rows.first { $0.seq == 50 }?.id)
+            }
+
             // S-069: the menu bar carries the brief's command map, and a bare-letter
             // shortcut never takes a letter from a text field.
             checkMenuCoverage()

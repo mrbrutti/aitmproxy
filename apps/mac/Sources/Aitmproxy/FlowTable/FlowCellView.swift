@@ -169,6 +169,13 @@ final class FlowCellView: NSTableCellView {
                 badge.uppercase = false
                 badge.font = Tok.Face.nsUI(Tok.Typography.Size.xs)
                 badge.isHidden = false
+            } else if row.origin == .imported {
+                // From a file (S-065): a neutral tag, no hue — nothing happened on the wire.
+                badge.text = "imported"
+                badge.pair = ColorPair(fg: Tok.Ink.secondary, bg: Tok.Ground.raised)
+                badge.uppercase = false
+                badge.font = Tok.Face.nsUI(Tok.Typography.Size.xs)
+                badge.isHidden = false
             }
         case .comment:
             label.font = Tok.Face.nsUI(body)

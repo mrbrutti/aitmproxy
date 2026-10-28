@@ -120,8 +120,8 @@ public enum CommandMap {
         let chips = ["All", "HTTP", "HTTPS", "WebSocket", "h1", "h2", "JSON", "Form", "XML"]
         return [
             E("File", "Compose Request…", "⌘N (`n`)", items: one("Compose Request…", "⌘N"), listKey: "n"),
-            E("File", "Import…", "⌘O", items: one("Import…", "⌘O"), scope: .deferred("S-065")),
-            E("File", "Export Selection…", "⌘E", items: one("Export Selection…", "⌘E"), scope: .deferred("S-065")),
+            E("File", "Import…", "⌘O", items: one("Import…", "⌘O")),
+            E("File", "Export Selection…", "⌘E", items: [I(["Export Selection…"]), I("HAR…", "⌘E"), I(["CSV…"]), I(["cURL Batch…"])]),
             E("File", "Save Session", "⌘S", items: one("Save Session", "⌘S"), scope: .deferred("S-066")),
             E("File", "Clear Session", "⌘⌫", items: one("Clear Session", "⌘⌫")),
 

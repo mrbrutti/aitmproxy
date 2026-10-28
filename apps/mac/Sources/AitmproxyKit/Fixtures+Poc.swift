@@ -126,6 +126,23 @@ extension Fixtures {
 public enum HAR {
     /// The HAR JSON text for `detail` (one entry). `startedAt` stamps the entry.
     public static func string(for detail: FlowDetail, row: FlowRow? = nil, startedAt: Date = Date()) -> String {
+        log(entries: [entry(for: detail, row: row, startedAt: startedAt)])
+    }
+
+    /// A whole log: `FlowTransfer.export` joins one entry per selected flow.
+    public static func log(entries: [JSONValue]) -> String {
+        let log: JSONValue = .object([
+            "log": .object([
+                "version": .string("1.2"),
+                "creator": .object(["name": .string("aitmproxy"), "version": .string("0.1")]),
+                "entries": .array(entries),
+            ]),
+        ])
+        return log.serialized(prettyPrinted: true)
+    }
+
+    /// One HAR entry for `detail`.
+    public static func entry(for detail: FlowDetail, row: FlowRow? = nil, startedAt: Date = Date()) -> JSONValue {
         let req = detail.request
         let resp = detail.response
         let url = row?.url ?? requestURL(detail)
@@ -148,14 +165,7 @@ public enum HAR {
             "timings": .object(["send": .number(0), "wait": .number(0), "receive": .number(0)]),
         ]
         if let id = row?.id.raw ?? Optional(detail.id.raw) { entry["_flowId"] = .string(id) }
-        let log: JSONValue = .object([
-            "log": .object([
-                "version": .string("1.2"),
-                "creator": .object(["name": .string("aitmproxy"), "version": .string("0.1")]),
-                "entries": .array([.object(entry)]),
-            ]),
-        ])
-        return log.serialized(prettyPrinted: true)
+        return .object(entry)
     }
 
     private static func response(_ message: HTTPMessage?) -> JSONValue {

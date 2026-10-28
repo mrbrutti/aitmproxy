@@ -101,6 +101,16 @@ struct FlowCommands: Commands {
             Button("Compose Request…") { session.openCompose() }
                 .keyboardShortcut("n")
             Divider()
+            Button("Import…") { session.chooseImport() }
+                .keyboardShortcut("o")
+            Menu("Export Selection…") {
+                Button("HAR…") { session.exportSelection(as: .har) }
+                    .keyboardShortcut("e")
+                Button("CSV…") { session.exportSelection(as: .csv) }
+                Button("cURL Batch…") { session.exportSelection(as: .curl) }
+            }
+            .disabled(session.rows.isEmpty)
+            Divider()
             Button("Clear Session") { session.clearSession(confirm: ClearConfirmation.ask) }
                 .keyboardShortcut(.delete, modifiers: .command)
                 .disabled(session.rows.isEmpty)
