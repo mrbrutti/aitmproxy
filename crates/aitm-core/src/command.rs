@@ -48,4 +48,11 @@ pub trait Command: Send + Sync {
     fn schema(&self) -> ParamSchema;
     /// Run the command with typed arguments against the core services in `host`.
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value>;
+    /// A question a human frontend must put to the operator before `invoke`,
+    /// for these arguments. `None` (the default) means no confirmation is
+    /// needed; a frontend without a human never asks and relies on the
+    /// command's own gate.
+    fn confirm_prompt(&self, _args: &Params) -> Option<String> {
+        None
+    }
 }

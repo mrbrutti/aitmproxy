@@ -1,0 +1,74 @@
+{
+  "browser.click": {
+    "additionalProperties": false,
+    "properties": {
+      "selector": {
+        "description": "CSS selector to click.",
+        "type": "string"
+      },
+      "x": {
+        "description": "Viewport x, when no selector.",
+        "type": "number"
+      },
+      "y": {
+        "description": "Viewport y, when no selector.",
+        "type": "number"
+      }
+    },
+    "type": "object"
+  },
+  "browser.eval": {
+    "additionalProperties": false,
+    "properties": {
+      "expr": {
+        "description": "JavaScript expression.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "expr"
+    ],
+    "type": "object"
+  },
+  "browser.get_dom": {
+    "additionalProperties": false,
+    "properties": {},
+    "type": "object"
+  },
+  "browser.navigate": {
+    "additionalProperties": false,
+    "properties": {
+      "url": {
+        "description": "The http(s) URL to load.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "url"
+    ],
+    "type": "object"
+  },
+  "browser.screenshot": {
+    "additionalProperties": false,
+    "properties": {},
+    "type": "object"
+  },
+  "browser.type": {
+    "additionalProperties": false,
+    "properties": {
+      "selector": {
+        "description": "CSS selector of the input.",
+        "type": "string"
+      },
+      "text": {
+        "description": "Text to type.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "selector",
+      "text"
+    ],
+    "type": "object"
+  }
+}

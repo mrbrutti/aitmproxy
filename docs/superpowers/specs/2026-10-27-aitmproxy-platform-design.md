@@ -43,7 +43,7 @@ Platform (build toward):
   external contributors.
 - A **two-tier plugin seam**: native compiled-in Rust (M1), plus a **committed
   Rhai scripting tier** (human-readable runtime addons loaded without recompiling
-  the core; API shape decided in M1, runtime in M2), with WASM a roadmap option
+  the core; API shape decided in M1, runtime in M3), with WASM a roadmap option
   behind the same seam. Detailed in the companion plugin-system spec.
 - **Plugin power sufficient for a future automated scanner.** The plugin seam,
   event bus, and command surface must be general enough that a later
@@ -241,17 +241,19 @@ graph TD
 
 **Crate layout (Architect's call):**
 
-| Crate | Responsibility | M1 |
+| Crate | Responsibility | Status |
 |---|---|---|
 | `aitm-core` | Connection acceptance, `Flow` store, typed `Event` bus, ordered plugin chain, interception primitives, command registry, scope + rate-limit guard. Knows no protocol. | yes |
 | `aitm-proto-http` | HTTP/1.1 + HTTP/2 + TLS MITM protocol module (hyper 1.x, rustls, rcgen, moka, x509-parser). | yes |
 | `aitm-proto-ws` | WebSocket module; intercepts after the HTTP upgrade (tokio-tungstenite). | yes |
 | `aitm-proto-l4` | Raw-packet / L4 module behind the same seam. Trait placement only. | roadmap |
 | `aitm-plugin` | The plugin API: `Plugin`, `ProtocolModule`, event hooks, command registration. | yes |
-| `aitm-browser` | Embedded headless Chromium over CDP; CUA-style primitives; SSRF guard. | yes |
+| `aitm-browser` | Embedded headless browser over CDP — the forked **obscura** engine (default, M2) or external Chrome, selected by `BrowserConfig.engine`; CUA-style primitives; SSRF guard. | yes (Chrome M1, obscura M2) |
 | `aitm-poc` | PoC artifact model, builder, and runner. | yes |
 | `aitm-mcp` | MCP server frontend over the command bus. | yes |
 | `aitm-cli` | Minimal CLI/TUI frontend over the command bus. | yes (CLI) |
+| `aitm-ca` | OS trust-store management for the MITM CA: the `ca.*` commands (export/status/install/uninstall), per-platform stores (macOS/Linux/Windows), fail-closed JSONL audit, deny-by-default agent-install gate. | M2 |
+| `aitm-plugin-rhai` | Rhai scripting tier: a `.rhai` file as a first-class chain plugin + the PoC `script` step. | M3 |
 | `aitm` | The binary: wires core + modules + plugins + frontends from config. | yes |
 
 **Separation of concerns that must hold:** the core depends on none of the
@@ -1022,6 +1024,8 @@ pub struct AssertionOutcome { pub assertion: String, pub matched: bool }
 
 ### Configuration model
 
+*(M2 amendment: config is now loadable from a **YAML file** — `--config <path>` or `AITM_CONFIG`, parsed with `deny_unknown_fields` so a misspelled key errors. `BrowserConfig` gains `engine` (`obscura` default | `chrome`) and `obscura` (binary path + start/stop timeouts); `CaConfig` gains `allow_agent_install` (default `false`) and `audit_log`. `AITM_CA_ALLOW_AGENT_INSTALL` bridges the gate from the environment.)*
+
 ```rust
 // aitm (binary) — the config the ProxyBuilder consumes
 
@@ -1094,6 +1098,16 @@ for Matt.)
   tunnel is dropped (the proxy never presents a trusted leaf for a server it
   could not authenticate). `Config.ssl_insecure` (default `false`) turns
   verification off for a lab of self-signed targets.
+- **MITM CA trust (M2 amendment):** the forged root CA (signing per-host leaves)
+  stays `0600` in a `0700` dir and is never read, logged, or exported by any new
+  code path — `ca.*` and the obscura child receive only the certificate *file*
+  path. Trusting it is explicit and operator-controlled via two approved paths:
+  `aitm ca install`/`export` (OS trust store, for native browsers and other apps
+  through the proxy) and the embedded obscura engine's `--ca-cert` flag (obscura
+  ignores the OS store). `ca.install`/`ca.uninstall` are **deny-by-default for
+  agents** (the MCP `Frontend`) — gated behind `ca.allow_agent_install` (default
+  `false`), confirmed interactively on the CLI, and recorded in a fail-closed
+  JSONL audit log.
 - **Authorization gating (decided, per Matt):** deny-by-default scope **is** the
   M1 authorization mechanism; there is **no separate recorded-authorization file**
   in M1. An explicit, recorded per-scope authorization gate (e.g. a confirmed
@@ -1439,7 +1453,8 @@ gets its own explicit exit test when specced:
 |---|---|---|
 | Performance scale-up | Reach the **~10,000 rps** standing target on a single instance with bounded memory | A soak/load gate at the 10k-rps target, memory plateau held |
 | More protocols / L4 | `aitm-proto-l4` and further modules behind the existing seam | Capture/interception functional tests per new protocol; core untouched |
-| Rhai scripting tier (**M2, committed**) | Human-readable runtime script plugins + the PoC `script` step, loaded without recompiling the core (API shape decided in M1) | Script-tier ACs green (plugin-system spec AC-P6–AC-P11; PoC-language AC-L8) |
+| Embedded obscura browser + CA trust (**M2, committed**) | Bundled forked obscura engine trusting the MITM CA via `--ca-cert`, behind the unchanged `BrowserDriver`; `ca.*` OS-trust-store commands; YAML config | M2-AC1–22 + CA-AC1–29 green; stage-6 panel review PASS |
+| Rhai scripting tier (**M3, committed**) | Human-readable runtime script plugins + the PoC `script` step, loaded without recompiling the core (API shape decided in M1) | Script-tier ACs green (plugin-system spec AC-P6–AC-P11; PoC-language AC-L8) |
 | WASM plugin runtime (roadmap) | Sandboxed any-language plugins behind the same seam | A WASM plugin loaded at runtime passes the plugin-API conformance tests |
 | Native GUIs | macOS/Linux GUI frontends over the same command bus | GUI drives the same commands; parity test with CLI/MCP |
 | PoC signing/validation | Supply-chain safety for shared PoCs | Signed-PoC verify/reject tests |
@@ -1484,6 +1499,7 @@ criteria. **AC20** is the performance/soak criterion. M1's exit gate (see
    for every M1 command (`flow.list`, `flow.get`, `flow.replay`, intercept/
    resume/kill, `flow.mutate`, `request.send`, `browser.*`, `poc.build`,
    `poc.run`, `scope.*`). The test asserts the exact expected tool-name set.
+   *(M2 amendment: the surface grows to **22 tools**, adding `ca.export`, `ca.status`, `ca.install`, `ca.uninstall`; the M2 test pins the 22-name set.)*
 8. **AC8 — One surface, two frontends:** A chosen command (e.g. `flow.list`)
    invoked over MCP and over the CLI returns equivalent results, proving both are
    clients of one command bus.

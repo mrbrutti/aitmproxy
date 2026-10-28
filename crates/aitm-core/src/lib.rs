@@ -30,10 +30,12 @@ pub use chain::Chain;
 pub use client::{PipelineClient, RequestSender};
 pub use command::{Command, ParamDef, ParamSchema, TypeDesc};
 pub use config::{
-    BackoffConfig, BrowserConfig, CaConfig, Config, LimitConfig, McpConfig, McpTransport,
-    PocConfig, ScopeConfig, ScopeEntry, SsrfPolicy,
+    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, LimitConfig, McpConfig,
+    McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SsrfPolicy,
 };
-pub use ctx::{BrowserDriver, ClickTarget, CommandHost, FlowCtx, NavOutcome, ProxyClient};
+pub use ctx::{
+    BrowserDriver, ClickTarget, CommandHost, FlowCtx, Frontend, NavOutcome, ProxyClient,
+};
 pub use error::{FlowError, GuardError};
 pub use event::{Event, Verdict};
 pub use flow::{

@@ -1,7 +1,9 @@
-//! Task 28 / AC7 / AC8: the real wired command set, exercised through both
-//! frontends. Proves the exact 18-tool `tools/list` and that an open `headers`
-//! map (TypeDesc::Map) round-trips through MCP and the CLI into a mutated flow,
-//! and that poc.run's `vars` map is coerced rather than rejected.
+//! Task 28 / AC7 / AC8, M2 Task 21 / M2-AC17: the real wired command set,
+//! exercised through both frontends. Proves the exact 22-tool `tools/list`
+//! (the 18 M1 tools plus `ca.*`), that the six `browser.*` schemas match the
+//! checked-in snapshot, that an open `headers` map (TypeDesc::Map) round-trips
+//! through MCP and the CLI into a mutated flow, and that poc.run's `vars` map
+//! is coerced rather than rejected.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,7 +19,7 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 18] = [
+const EXPECTED_TOOLS: [&str; 22] = [
     "flow.list",
     "flow.get",
     "flow.replay",
@@ -36,7 +38,18 @@ const EXPECTED_TOOLS: [&str; 18] = [
     "poc.run",
     "scope.add",
     "scope.list",
+    "ca.export",
+    "ca.install",
+    "ca.status",
+    "ca.uninstall",
 ];
+
+/// The six `browser.*` tool schemas as M1 shipped them, keyed by tool name.
+/// M2 changes the engine behind them, never their surface (M2-AC17).
+const BROWSER_SCHEMAS_SNAPSHOT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/browser-tool-schemas.json"
+);
 
 fn temp_ca_dir(tag: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -104,13 +117,12 @@ fn rpc(server: &McpServer, id: u64, method: &str, params: JsonValue) -> JsonValu
 }
 
 #[test]
-fn ac7_exact_eighteen_tools() {
+fn ac7_exact_twenty_two_tools() {
     let proxy = build_proxy(&config("ac7")).expect("build proxy");
     let server = McpServer::new(proxy.registry_arc(), McpTransport::Stdio);
     let resp = rpc(&server, 1, "tools/list", json!({}));
-    let mut names: Vec<String> = resp["result"]["tools"]
-        .as_array()
-        .expect("tools array")
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    let mut names: Vec<String> = tools
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
@@ -119,7 +131,36 @@ fn ac7_exact_eighteen_tools() {
     expected.sort();
     assert_eq!(
         names, expected,
-        "tools/list must be exactly the 18 M1 tools"
+        "tools/list must be exactly the 18 M1 tools plus the four ca.* tools"
+    );
+
+    // The browser.* schemas are byte-for-byte M1's: compare the six
+    // inputSchemas, keyed by name, against the checked-in snapshot.
+    let actual: serde_json::Map<String, JsonValue> = tools
+        .iter()
+        .filter(|t| {
+            t["name"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("browser.")
+        })
+        .map(|t| {
+            (
+                t["name"].as_str().unwrap().to_string(),
+                t["inputSchema"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(actual.len(), 6, "six browser.* tools: {:?}", actual.keys());
+    let actual_text = serde_json::to_string_pretty(&actual).expect("serialize schemas");
+    let snapshot_text = std::fs::read_to_string(BROWSER_SCHEMAS_SNAPSHOT).unwrap_or_else(|e| {
+        panic!("read snapshot {BROWSER_SCHEMAS_SNAPSHOT}: {e}\nactual schemas:\n{actual_text}\n")
+    });
+    let snapshot: JsonValue = serde_json::from_str(&snapshot_text).expect("snapshot is JSON");
+    assert_eq!(
+        JsonValue::Object(actual),
+        snapshot,
+        "browser.* schemas drifted from the M1 snapshot; actual:\n{actual_text}\n"
     );
 
     // The headers map derives an open-object JSON Schema (TypeDesc::Map).

@@ -7,6 +7,7 @@ members = [
     "crates/aitm-proto-ws",
     "crates/aitm-plugins",
     "crates/aitm-browser",
+    "crates/aitm-ca",
     "crates/aitm-poc",
     "crates/aitm-plugin-rhai",
     "crates/aitm-mcp",
@@ -42,6 +43,7 @@ aitm-proto-http = { path = "crates/aitm-proto-http" }
 aitm-proto-ws = { path = "crates/aitm-proto-ws" }
 aitm-plugins = { path = "crates/aitm-plugins" }
 aitm-browser = { path = "crates/aitm-browser" }
+aitm-ca = { path = "crates/aitm-ca" }
 aitm-poc = { path = "crates/aitm-poc" }
 aitm-plugin-rhai = { path = "crates/aitm-plugin-rhai" }
 aitm-mcp = { path = "crates/aitm-mcp" }

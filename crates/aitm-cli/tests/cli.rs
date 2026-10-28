@@ -4,14 +4,15 @@
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use aitm_cli::Cli;
+use aitm_cli::{Cli, Confirmer, TtyConfirmer};
 use aitm_core::{
-    Body, Command, CommandHost, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow,
-    HttpRequest, HttpVersion, InterceptState, McpTransport, MemFlowStore, ParamDef, ParamSchema,
-    Params, Plugin, ProxyClient, Registry, StdGuard, TypeDesc, Value,
+    Body, Command, CommandHost, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, Frontend, HeaderMap,
+    HttpFlow, HttpRequest, HttpVersion, InterceptState, McpTransport, MemFlowStore, ParamDef,
+    ParamSchema, Params, Plugin, ProxyClient, Registry, StdGuard, TypeDesc, Value,
 };
 use aitm_mcp::json::from_json;
 use aitm_mcp::McpServer;
@@ -396,4 +397,168 @@ fn dispatch_without_services_is_an_error() {
     let cli = Cli::new(registry());
     let e = err_text(cli.dispatch(&argv(&["demo", "ping"])));
     assert!(e.contains("with_services"), "{e}");
+}
+
+// ------------------------------------------ M2 Task 17: Frontend::Cli, --yes
+
+/// `demo.confirm`: asks `Proceed?` before running and reports which frontend
+/// ran it; counts its invocations so a test can prove nothing ran.
+struct ConfirmCmd {
+    invoked: AtomicUsize,
+}
+
+impl Command for ConfirmCmd {
+    fn name(&self) -> &str {
+        "demo.confirm"
+    }
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "Asks before running.".into(),
+            params: vec![],
+            result: TypeDesc::Str,
+        }
+    }
+    fn invoke(&self, _args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        self.invoked.fetch_add(1, Ordering::SeqCst);
+        let label = match host.frontend() {
+            Frontend::Cli => "cli",
+            Frontend::Mcp => "mcp",
+            _ => "other",
+        };
+        Ok(Value::Str(label.into()))
+    }
+    fn confirm_prompt(&self, _args: &Params) -> Option<String> {
+        Some("Proceed?".into())
+    }
+}
+
+/// Answers every prompt the same way and records what it was asked.
+struct ScriptedConfirmer {
+    answer: bool,
+    prompts: Mutex<Vec<String>>,
+}
+
+impl ScriptedConfirmer {
+    fn new(answer: bool) -> Arc<Self> {
+        Arc::new(Self {
+            answer,
+            prompts: Mutex::new(Vec::new()),
+        })
+    }
+    fn prompts(&self) -> Vec<String> {
+        self.prompts.lock().unwrap().clone()
+    }
+}
+
+impl Confirmer for ScriptedConfirmer {
+    fn confirm(&self, prompt: &str) -> anyhow::Result<bool> {
+        self.prompts.lock().unwrap().push(prompt.to_string());
+        Ok(self.answer)
+    }
+}
+
+/// A CLI whose registry holds `demo.ping` and `demo.confirm`, plus the handle
+/// to the confirm command so its invoke count can be read.
+fn confirm_cli(confirmer: Option<Arc<dyn Confirmer>>) -> (Cli, Arc<ConfirmCmd>) {
+    let cmd = Arc::new(ConfirmCmd {
+        invoked: AtomicUsize::new(0),
+    });
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(DemoPlugin));
+    reg.add_command(cmd.clone());
+    let mut cli = cli_with(Arc::new(reg), Arc::new(MemFlowStore::new()));
+    if let Some(c) = confirmer {
+        cli = cli.with_confirmer(c);
+    }
+    (cli, cmd)
+}
+
+/// CA-AC22 mechanics: the CLI host declares itself `Frontend::Cli`.
+#[test]
+fn frontend_is_cli() {
+    let (cli, cmd) = confirm_cli(None);
+    let out = cli
+        .dispatch(&argv(&["demo", "confirm", "--yes"]))
+        .expect("--yes skips the prompt");
+    assert_eq!(out, Value::Str("cli".into()));
+    assert_eq!(cmd.invoked.load(Ordering::SeqCst), 1);
+}
+
+/// CA-AC23 mechanics: `confirm_prompt` gates `invoke` through the `Confirmer`.
+#[test]
+fn confirmer_gates_invoke() {
+    let no = ScriptedConfirmer::new(false);
+    let (cli, cmd) = confirm_cli(Some(no.clone()));
+    let e = err_text(cli.dispatch(&argv(&["demo", "confirm"])));
+    assert!(e.contains("aborted"), "{e}");
+    assert!(e.contains("demo.confirm"), "names the command: {e}");
+    assert_eq!(cmd.invoked.load(Ordering::SeqCst), 0, "nothing ran");
+    assert_eq!(no.prompts(), vec!["Proceed?".to_string()]);
+
+    let yes = ScriptedConfirmer::new(true);
+    let (cli, cmd) = confirm_cli(Some(yes.clone()));
+    let out = cli
+        .dispatch(&argv(&["demo", "confirm"]))
+        .expect("confirmed");
+    assert_eq!(out, Value::Str("cli".into()));
+    assert_eq!(cmd.invoked.load(Ordering::SeqCst), 1);
+    assert_eq!(yes.prompts(), vec!["Proceed?".to_string()]);
+
+    // With --yes the confirmer is never consulted.
+    let yes = ScriptedConfirmer::new(true);
+    let (cli, cmd) = confirm_cli(Some(yes.clone()));
+    cli.dispatch(&argv(&["demo", "confirm", "--yes"]))
+        .expect("--yes");
+    assert_eq!(cmd.invoked.load(Ordering::SeqCst), 1);
+    assert!(
+        yes.prompts().is_empty(),
+        "confirmer was asked: {:?}",
+        yes.prompts()
+    );
+}
+
+/// A non-interactive `TtyConfirmer` cannot ask, so it points at `--yes`.
+#[test]
+fn non_interactive_needs_yes() {
+    let e = match TtyConfirmer::new(false).confirm("Proceed?") {
+        Ok(v) => panic!("expected an error, got {v}"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(e.contains("--yes"), "{e}");
+    assert!(e.contains("not a terminal"), "{e}");
+
+    let (cli, cmd) = confirm_cli(Some(Arc::new(TtyConfirmer::new(false))));
+    let e = err_text(cli.dispatch(&argv(&["demo", "confirm"])));
+    assert!(e.contains("--yes"), "{e}");
+    assert!(e.contains("demo.confirm"), "names the command: {e}");
+    assert_eq!(cmd.invoked.load(Ordering::SeqCst), 0);
+}
+
+/// `--yes` is reserved: accepted as a no-op by commands without a prompt, never
+/// an unknown flag, and documented once in usage.
+#[test]
+fn yes_is_a_noop_elsewhere() {
+    let cli = cli();
+    let out = cli
+        .dispatch(&argv(&["demo", "ping", "--yes"]))
+        .expect("--yes is accepted everywhere");
+    assert_eq!(out, Value::Str("pong".into()));
+
+    let store = Arc::new(MemFlowStore::new());
+    let id = store.insert(http_flow("target.test", "/"));
+    let cli = cli_with(registry(), store);
+    let got = cli
+        .dispatch(&argv(&["flow", "get", "--yes", "--id", &id.to_string()]))
+        .expect("--yes among real flags");
+    let Value::Object(fields) = got else {
+        panic!("expected object, got {got:?}")
+    };
+    assert_eq!(fields["authority"], Value::Str("target.test".into()));
+
+    // Real unknown flags are still reported, and never blamed on --yes.
+    let e = err_text(cli.dispatch(&argv(&["demo", "ping", "--yes", "--bogus"])));
+    assert!(e.contains("unknown flag --bogus"), "{e}");
+    assert!(!e.contains("unknown flag --yes"), "{e}");
+
+    assert_eq!(cli.usage().matches("--yes").count(), 1, "{}", cli.usage());
 }

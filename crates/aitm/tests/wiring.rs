@@ -47,10 +47,22 @@ impl ProxyClient for UnusedClient {
 fn drop_mutate_disables_mutation_no_core_edit() {
     let cfg = config_with_ca("acp3");
 
-    let with_mutate =
-        build_proxy_with(&cfg, &Features { mutate: true }).expect("build with mutate");
-    let without_mutate =
-        build_proxy_with(&cfg, &Features { mutate: false }).expect("build without mutate");
+    let with_mutate = build_proxy_with(
+        &cfg,
+        &Features {
+            mutate: true,
+            ..Features::default()
+        },
+    )
+    .expect("build with mutate");
+    let without_mutate = build_proxy_with(
+        &cfg,
+        &Features {
+            mutate: false,
+            ..Features::default()
+        },
+    )
+    .expect("build without mutate");
 
     // The only difference is the registration list — no aitm-core change.
     assert!(
