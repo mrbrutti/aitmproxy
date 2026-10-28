@@ -172,4 +172,11 @@ TUI's local y/N confirmation for `ca.install`/`ca.uninstall` is the interim guar
 
 ## Shipped
 
-(filled at integration)
+(filled at integration by the main session)
+
+**Hand-off from the TUI lead, 2026-10-28:** branch `claude/ui-tui-16e3cc` at `ef0891e`, 8 commits
+on `c6a5c0c`. Final panel: security PASS, quality PASS, spec clear after the plan/README fixes;
+every Critical/Important fixed, every Minor fixed or accepted above. Gate green in a real shell
+(0 failures over 88 test binaries). Not built in this pass: the Follow-up plan table (split view
+and the no-core-dependency rows await Matt's final word). Core follow-ups this surface depends
+on, by what they unblock: F1 (M4), F5, F7, F4, F13, F14.
