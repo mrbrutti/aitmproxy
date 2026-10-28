@@ -16,6 +16,7 @@ name = "aitm"
 version = "0.1.0"
 dependencies = [
  "aitm-browser",
+ "aitm-ca",
  "aitm-cli",
  "aitm-core",
  "aitm-mcp",
