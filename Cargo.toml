@@ -10,6 +10,7 @@ members = [
     "crates/aitm-plugin-sessionio",
     "crates/aitm-plugin-passthrough",
     "crates/aitm-plugin-wsctl",
+    "crates/aitm-plugin-maprules",
     "crates/aitm-browser",
     "crates/aitm-ca",
     "crates/aitm-poc",
@@ -52,6 +53,7 @@ aitm-plugins = { path = "crates/aitm-plugins" }
 aitm-plugin-sessionio = { path = "crates/aitm-plugin-sessionio" }
 aitm-plugin-passthrough = { path = "crates/aitm-plugin-passthrough" }
 aitm-plugin-wsctl = { path = "crates/aitm-plugin-wsctl" }
+aitm-plugin-maprules = { path = "crates/aitm-plugin-maprules" }
 aitm-browser = { path = "crates/aitm-browser" }
 aitm-ca = { path = "crates/aitm-ca" }
 aitm-poc = { path = "crates/aitm-poc" }
