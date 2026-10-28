@@ -142,11 +142,12 @@ final class BusService: FlowActions {
 
     // MARK: Endpoint
 
-    /// Settings > Bus: the proxy's config.yaml by default, else host/port/token file.
+    /// The proxy's config.yaml (`AITM_CONFIG`, as the `aitm` binary reads it,
+    /// else the default path) by default; else Settings > Bus host/port/token file.
     static func resolveEndpoint() -> BusEndpoint? {
         let defaults = UserDefaults.standard
         let fromConfig = defaults.object(forKey: "bus.fromConfig") as? Bool ?? true
-        if fromConfig, let endpoint = try? BusEndpoint.fromConfigFile() { return endpoint }
+        if fromConfig, let endpoint = try? BusEndpoint.fromConfigFile(configURL) { return endpoint }
         let host = defaults.string(forKey: "bus.host") ?? "127.0.0.1"
         let port = UInt16(clamping: defaults.integer(forKey: "bus.port"))
         var token = ""
@@ -158,9 +159,16 @@ final class BusService: FlowActions {
         return BusEndpoint(host: host, port: port, token: token)
     }
 
+    static var configURL: URL {
+        if let path = ProcessInfo.processInfo.environment["AITM_CONFIG"], !path.isEmpty {
+            return URL(fileURLWithPath: path)
+        }
+        return BusEndpoint.defaultConfigURL
+    }
+
     /// `listen: 127.0.0.1:8080` from the same config.yaml, for the toolbar pill.
     static func listenAddress() -> String? {
-        guard let text = try? String(contentsOf: BusEndpoint.defaultConfigURL, encoding: .utf8) else { return nil }
+        guard let text = try? String(contentsOf: configURL, encoding: .utf8) else { return nil }
         for line in text.split(separator: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("listen:") {

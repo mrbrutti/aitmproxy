@@ -71,9 +71,11 @@ enum Store {
         return dir
     }
 
-    /// Fixture mode: APP_FIXTURES=1, or any snapshot/self-test run.
+    /// Fixture mode: APP_FIXTURES=1, or any snapshot/self-test run — unless
+    /// APP_LIVE=1 asks a snapshot to capture the live bus instead.
     static var usesFixtures: Bool {
         let env = ProcessInfo.processInfo.environment
+        if env["APP_LIVE"] == "1" { return false }
         return env["APP_FIXTURES"] == "1" || env["APP_SNAPSHOT"] != nil || SelfTest.requested
     }
 }

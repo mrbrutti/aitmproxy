@@ -158,8 +158,8 @@ enum FlowColumn: String, CaseIterable {
         case .status: 72
         case .time: 124
         case .duration: 72
-        case .request: 72
-        case .response: 72
+        case .request: 80
+        case .response: 80
         case .ssl: 40
         case .edited: 52
         case .origin: 60
