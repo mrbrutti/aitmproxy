@@ -1,0 +1,125 @@
+import AppKit
+import SwiftUI
+
+// Aitmproxy — the native macOS operator app for the aitmproxy command bus.
+//   Aitmproxy                       the app (connects to the bus from Settings or config.yaml)
+//   APP_FIXTURES=1 Aitmproxy        show the fixture session instead of a live bus
+//   APP_STORE=<dir> Aitmproxy       keep local state (pins, saved filters) elsewhere (tests)
+//   APP_SNAPSHOT=<dir> Aitmproxy    save a PNG of every sidebar page and Settings tab in light and dark, then quit
+//   Aitmproxy --selftest            run the self-test and quit with 0 or 1 (tools/selftest.sh)
+//   APP_ACCENT=<id> Aitmproxy       run with another accent from Theme.all (UI/Theme.swift)
+//   APP_GRID=1 Aitmproxy            draw the 8 pt grid and the layout probes over the window
+
+@main
+struct AitmproxyApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    @State private var session = Session()
+
+    var body: some Scene {
+        Window("aitmproxy", id: "main") {
+            ShellView()
+                .environment(session)
+                .themed()
+                .overlay { if GridOverlay.enabled { GridOverlay() } }
+                .frame(minWidth: 1100, minHeight: 640)
+                .toolbar(removing: .title)
+        }
+        .defaultSize(width: 1440, height: 900)
+        .windowToolbarStyle(.unified)
+        .commands {
+            FlowCommands(session: session)
+        }
+
+        Settings {
+            SettingsView()
+                .environment(session)
+                .themed()
+        }
+        .windowResizability(.contentSize)
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Started from a terminal, the process is not a foreground app yet.
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    /// The self-test's result becomes the exit code, after a normal quit.
+    func applicationWillTerminate(_ notification: Notification) {
+        if SelfTest.requested { exit(SelfTest.exitCode) }
+    }
+}
+
+/// Where surface-local state lives (pins, saved filters, compose history):
+/// ~/Library/Application Support/Aitmproxy/. Flows never persist here; they live in the proxy.
+enum Store {
+    /// True when APP_STORE points somewhere else (tests, snapshots).
+    static var isOverridden: Bool {
+        !(ProcessInfo.processInfo.environment["APP_STORE"] ?? "").isEmpty
+    }
+
+    static var url: URL {
+        if let path = ProcessInfo.processInfo.environment["APP_STORE"], !path.isEmpty {
+            return URL(fileURLWithPath: path, isDirectory: true)
+        }
+        let dir = URL.applicationSupportDirectory.appending(path: "Aitmproxy", directoryHint: .isDirectory)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// Fixture mode: APP_FIXTURES=1, or any snapshot/self-test run.
+    static var usesFixtures: Bool {
+        let env = ProcessInfo.processInfo.environment
+        return env["APP_FIXTURES"] == "1" || env["APP_SNAPSHOT"] != nil || SelfTest.requested
+    }
+}
+
+/// Menu bar items for every flow action, with the shortcuts the foundation
+/// prints on buttons (§2.7). The targets resolve when the item fires.
+struct FlowCommands: Commands {
+    let session: Session
+
+    var body: some Commands {
+        CommandGroup(replacing: .newItem) {
+            Button("Compose Request…") {}
+                .keyboardShortcut("n")
+        }
+        CommandMenu("Flow") {
+            Button(session.interceptArmed ? "Disarm Intercept" : "Arm Intercept") {
+                session.arm(!session.interceptArmed)
+            }
+            .keyboardShortcut("i", modifiers: [])
+            Button("Resume") {
+                if let target = session.interceptTarget {
+                    target.edited ? session.applyAndResume(target.id) : session.resume(target.id)
+                }
+            }
+            .keyboardShortcut(.return, modifiers: .command)
+            .disabled(session.interceptTarget == nil)
+            Button("Kill") { if let target = session.interceptTarget { session.kill(target.id) } }
+                .keyboardShortcut("\\", modifiers: .command)
+                .disabled(session.interceptTarget == nil)
+            Divider()
+            Button("Replay") { if let id = session.focused { session.replay(id) } }
+                .keyboardShortcut("r", modifiers: [])
+                .disabled(session.focused == nil)
+            Button("Build PoC from Flow…") {}
+                .keyboardShortcut("p", modifiers: [])
+            Divider()
+            Button("Comment…") {}
+                .keyboardShortcut("l", modifiers: .command)
+        }
+        CommandMenu("View") {
+            Button("Filter Bar") {}
+                .keyboardShortcut("f", modifiers: .command)
+            Button("Sidebar Filter") {}
+                .keyboardShortcut("f", modifiers: [.command, .shift])
+            Button("Command Palette") {}
+                .keyboardShortcut("k", modifiers: .command)
+        }
+    }
+}

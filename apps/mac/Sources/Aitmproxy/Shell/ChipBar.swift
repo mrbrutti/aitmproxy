@@ -1,0 +1,57 @@
+import AitmproxyKit
+import SwiftUI
+
+/// The content-type quick filter (foundation §2.7). One chip active (raised
+/// fill, 500 weight); the rest plain secondary. `⌘1…9` select.
+struct ChipBar: View {
+    @Binding var selected: ContentCategory
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(Array(ContentCategory.groups.enumerated()), id: \.offset) { index, group in
+                if index > 0 {
+                    Rectangle().fill(Tok.Line.border.color).frame(width: 1, height: Tok.Metric.chipSeparator).padding(.horizontal, Tok.Metric.gapTight)
+                }
+                ForEach(group) { chip in
+                    Chip(title: chip.title, on: selected == chip) { selected = chip }
+                }
+            }
+            Spacer(minLength: Space.sm)
+            Button {} label: {
+                HStack(spacing: 2) {
+                    Text("Filters")
+                    Image(systemName: "chevron.down").font(.system(size: 9, weight: .medium))
+                }
+                .font(Tok.Face.ui(Tok.Typography.Size.sm))
+                .foregroundStyle(Tok.Ink.tertiary.color)
+                .padding(.horizontal, Space.sm)
+                .frame(height: Tok.Metric.chip)
+            }
+            .buttonStyle(.plain)
+            .help("Filter bar (⌘F)")
+        }
+        .padding(.horizontal, Tok.Metric.padInner)
+        .frame(height: Tok.Size.filterBar)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(alignment: .bottom) { Rule() }
+    }
+}
+
+struct Chip: View {
+    var title: String
+    var on: Bool
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(Tok.Face.ui(Tok.Typography.Size.sm, on ? .medium : .regular))
+                .foregroundStyle(on ? Tok.Ink.primary.color : Tok.Ink.secondary.color)
+                .padding(.horizontal, Space.sm)
+                .frame(height: Tok.Metric.chip)
+                .background(on ? Tok.Ground.raised.color : .clear, in: Capsule())
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+}
