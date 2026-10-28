@@ -15,6 +15,7 @@
 //! plus the embedded web UI and its `/bus` bridge (`aitm::web`, F15).
 
 use std::io::Write as _;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -281,8 +282,9 @@ async fn run() -> anyhow::Result<()> {
                     );
                 }
                 let listener = TcpListener::bind(settings.listen).await?;
-                let url = web::ui_url(listener.local_addr()?, &settings.token);
-                info!(url = %url, "web UI listening");
+                let local_addr = listener.local_addr()?;
+                let url = web::ui_url(local_addr, &settings.token);
+                log_web_listening(local_addr);
                 println!("web UI: {url}");
                 Some((listener, state))
             }
@@ -366,6 +368,16 @@ fn split_script_args(argv: Vec<String>) -> anyhow::Result<(Vec<PathBuf>, Vec<Str
     Ok((scripts, rest))
 }
 
+/// Emit the `aitm web` "listening" lifecycle line.
+///
+/// AC2: the bridge token must never enter the structured log stream. This takes
+/// only the bound `addr`, so it *cannot* log the tokened URL even by accident;
+/// the full `http://addr/#t=<token>` URL is disclosed exactly once, to stdout,
+/// by the caller's `println!`.
+fn log_web_listening(addr: SocketAddr) {
+    info!(%addr, "web UI listening");
+}
+
 /// Install a tracing subscriber (RUST_LOG-driven, defaulting to `info`).
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
@@ -375,12 +387,92 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Write};
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
-    use super::{parse_mode, split_config_arg, split_script_args, Mode};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    use super::{log_web_listening, parse_mode, split_config_arg, split_script_args, Mode};
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A `MakeWriter` that appends every formatted log line to a shared buffer,
+    /// so a test can read back exactly what the subscriber emitted.
+    #[derive(Clone)]
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for BufWriter {
+        type Writer = BufWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn web_listening_log_has_no_token() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(BufWriter(buf.clone()))
+            .finish();
+
+        let addr = "127.0.0.1:8082".parse().unwrap();
+        tracing::subscriber::with_default(subscriber, || log_web_listening(addr));
+
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        // The lifecycle line records the bound address...
+        assert!(out.contains("web UI listening"), "missing event: {out:?}");
+        assert!(out.contains("127.0.0.1:8082"), "missing addr: {out:?}");
+        // ...and never the token or the tokened URL that carries it.
+        let token = crate::web::generate_token();
+        let tokened_url = crate::web::ui_url(addr, &token);
+        assert!(!out.contains(&token), "token leaked into log: {out:?}");
+        assert!(
+            !out.contains("#t="),
+            "token fragment leaked into log: {out:?}"
+        );
+        assert!(
+            !out.contains(&tokened_url),
+            "tokened URL leaked into log: {out:?}"
+        );
+    }
+
+    #[test]
+    fn no_tracing_call_site_logs_a_tokened_url() {
+        // AC2's second clause: no `tracing` macro in the server/web/tui paths may
+        // carry a token-bearing URL. `web::ui_url` is the only tokened-URL builder
+        // and `#t=` is the token fragment marker, so a log macro referencing
+        // either would be leaking the token.
+        const SOURCES: &[(&str, &str)] = &[
+            ("main.rs", include_str!("main.rs")),
+            ("tui.rs", include_str!("tui.rs")),
+            ("web/mod.rs", include_str!("web/mod.rs")),
+            ("web/bridge.rs", include_str!("web/bridge.rs")),
+            ("web/http.rs", include_str!("web/http.rs")),
+        ];
+        const MACROS: &[&str] = &["info!", "warn!", "debug!", "trace!", "error!"];
+
+        for (name, src) in SOURCES {
+            for (lineno, line) in src.lines().enumerate() {
+                let is_log_call = MACROS.iter().any(|m| line.contains(m));
+                if is_log_call && (line.contains("ui_url") || line.contains("#t=")) {
+                    panic!("{name}:{} logs a tokened URL: {line:?}", lineno + 1);
+                }
+            }
+        }
     }
 
     #[test]
