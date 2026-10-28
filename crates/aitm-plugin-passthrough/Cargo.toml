@@ -7,9 +7,25 @@ rust-version.workspace = true
 description = "Per-host TLS passthrough: the Arc-shared host list and the tls.passthrough.* command family, agent-gated."
 
 [dependencies]
-# The command/plugin traits, `CommandHost` (and its `Frontend`), `Registry`.
+# The command/plugin traits, `CommandHost` (and its `Frontend`), `Registry`,
+# plus the `ProtocolModule`/`NextLayerHint`/`ModuleCtx`/`ByteStream` seam the
+# `PassthroughModule` plugs into.
 aitm-core.workspace = true
 anyhow.workspace = true
+# `BoxFuture` for the `ProtocolModule::spawn` return type.
+futures.workspace = true
+# Resolving the upstream authority and copying bytes both ways with no MITM.
+tokio = { workspace = true, features = ["io-util", "net"] }
+
+[dev-dependencies]
+uuid.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "io-util", "net"] }
+# The real HTTP module (MITM side of the test) and its certificate authority.
+aitm-proto-http.workspace = true
+# A loopback TLS origin with its own cert, and the two client handshakes.
+rcgen = { version = "0.14", features = ["x509-parser"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 
 [lints]
 workspace = true

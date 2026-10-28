@@ -161,7 +161,14 @@ name = "aitm-plugin-passthrough"
 version = "0.1.0"
 dependencies = [
  "aitm-core",
+ "aitm-proto-http",
  "anyhow",
+ "futures",
+ "rcgen",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
+ "uuid",
 ]
 
 [[package]]
