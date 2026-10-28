@@ -8,7 +8,6 @@ pub mod hex;
 pub mod image;
 pub mod json;
 
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::model::{human_bytes, Message};
@@ -285,9 +284,4 @@ fn with_truncated<'a>(theme: &Theme, mut lines: Vec<Line<'a>>, truncated: bool) 
         );
     }
     lines
-}
-
-/// A plain styled line.
-pub fn plain<'a>(text: impl Into<String>, style: Style) -> Line<'a> {
-    Line::styled(text.into(), style)
 }

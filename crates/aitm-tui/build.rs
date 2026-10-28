@@ -156,6 +156,10 @@ pub struct PairToken {
 "#;
 
 /// Walks `color.<group>.<token>` and classifies every token.
+///
+/// Order: `serde_json::Map` without `preserve_order` is a `BTreeMap`, so the
+/// generated groups, constants and `ALL_*` tables are alphabetical by key,
+/// not in file order. The same holds for `collect_glyphs`.
 fn collect_groups(root: &Map<String, Value>) -> Vec<Group> {
     let color = match root.get("color") {
         Some(Value::Object(m)) => m,
@@ -255,7 +259,14 @@ fn is_meta(key: &str) -> bool {
 }
 
 /// `onAccent` → `ON_ACCENT`, `lineNumber` → `LINE_NUMBER`, `get` → `GET`.
+/// A name that starts with a digit cannot be a Rust identifier and fails the
+/// build with a message naming it.
 fn screaming_snake(name: &str) -> String {
+    if name.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        panic!(
+            "tokens: {name:?} starts with a digit and cannot be a Rust constant name; rename the token (e.g. prefix a letter)"
+        );
+    }
     let mut out = String::with_capacity(name.len() + 4);
     for (i, ch) in name.chars().enumerate() {
         if ch.is_ascii_uppercase() && i > 0 {

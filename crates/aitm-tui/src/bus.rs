@@ -4,7 +4,7 @@
 //! and reports everything as [`BusEvent`]s. Features the bus does not offer
 //! are simply not polled: the app reads `tools/list` and degrades (§2.10).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,10 +24,18 @@ pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub type Connector =
     Arc<dyn Fn() -> aitm_bus_client::BoxFuture<'static, anyhow::Result<BusClient>> + Send + Sync>;
 
+/// The JSON-RPC code `aitm-mcp` answers a wrong token with (foundation §4.1).
+const UNAUTHORIZED: i64 = -32001;
+
+/// What the app is told when the bus refuses the token; retrying cannot fix it.
+pub const REFUSED: &str = "bus refused the token — check --token-file";
+
 /// Run until the app goes away: the request channel closes, or an event
 /// cannot be delivered because its receiver is gone. A failed connect or a
 /// lost transport never ends the loop; it is retried with exponential
 /// back-off (500 ms doubling to 10 s, reset after each successful connect).
+/// The one exception is a token refusal during the handshake: that is
+/// reported as [`REFUSED`] and the task stops, since no retry can succeed.
 pub async fn run(
     connect: Connector,
     mut rx: mpsc::Receiver<BusRequest>,
@@ -55,6 +63,10 @@ pub async fn run(
         let mut session = Session::new(client, tx.clone());
         match session.serve(&mut rx, poll_every).await {
             Outcome::Closed => return,
+            Outcome::Refused(why) => {
+                let _ = tx.send(BusEvent::Disconnected(why)).await;
+                return;
+            }
             Outcome::Lost(why) => {
                 if tx.send(BusEvent::Disconnected(why)).await.is_err() {
                     return;
@@ -70,6 +82,8 @@ enum Outcome {
     Closed,
     /// The transport failed; reconnect.
     Lost(String),
+    /// The bus rejected our token during the handshake; do not reconnect.
+    Refused(String),
 }
 
 struct Session {
@@ -139,22 +153,20 @@ impl Session {
             .client
             .initialize(CLIENT_NAME, CLIENT_VERSION)
             .await
-            .map_err(lost)?;
-        let tools = self.client.tools_list().await.map_err(lost)?;
-        self.tools = tools
-            .into_iter()
-            .map(|t| ToolInfo {
-                name: t.name,
-                description: t.description,
-                input_schema: t.input_schema,
-            })
-            .collect();
+            .map_err(|e| match e {
+                BusError::Rpc {
+                    code: UNAUTHORIZED, ..
+                } => Outcome::Refused(REFUSED.to_string()),
+                other => lost(other),
+            })?;
+        self.tools = self.client.tools_list().await.map_err(lost)?;
         let listening = if self.has("proxy.status") {
             match self.client.call("proxy.status", json!({})).await {
                 Ok(v) => v
                     .get("listening")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                Err(BusError::Transport(e)) => return Err(Outcome::Lost(format!("{e:#}"))),
                 Err(_) => None,
             }
         } else {
@@ -180,6 +192,10 @@ impl Session {
             Err(e) => return self.report(e).await,
         };
         let mut out = Vec::with_capacity(ids.len());
+        // The first per-flow failure of this pass, reported once below: a row
+        // whose `flow.get` fails keeps its cached summary rather than vanishing
+        // (the app would evict it and drop the selection).
+        let mut first_failure: Option<(String, String)> = None;
         for id in &ids {
             let settled = self.summaries.get(id).is_some_and(|s| {
                 s.get("status").is_some_and(|st| !st.is_null())
@@ -192,19 +208,31 @@ impl Session {
                         self.summaries.insert(id.clone(), v);
                     }
                     Err(BusError::Transport(e)) => return Err(Outcome::Lost(format!("{e:#}"))),
-                    Err(_) => continue,
+                    Err(e) => {
+                        if first_failure.is_none() {
+                            first_failure = Some((id.clone(), error_text(e)));
+                        }
+                    }
                 }
             }
             if let Some(s) = self.summaries.get(id) {
                 out.push(s.clone());
             }
         }
-        self.summaries.retain(|k, _| ids.contains(k));
+        let live: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        self.summaries.retain(|k, _| live.contains(k.as_str()));
         self.emit(BusEvent::Flows(out)).await?;
+        if let Some((id, why)) = first_failure {
+            self.emit(BusEvent::Toast(
+                Level::Warn,
+                format!("flow.get {id}: {why}"),
+            ))
+            .await?;
+        }
 
         if self.polls % 6 == 1 {
             if self.has("scope.list") {
-                if let Ok(Value::Array(entries)) = self.client.call("scope.list", json!({})).await {
+                if let Value::Array(entries) = self.panel("scope.list").await? {
                     let scope = entries
                         .into_iter()
                         .filter_map(|v| v.as_str().map(str::to_string))
@@ -213,20 +241,32 @@ impl Session {
                 }
             }
             if self.has("agent.status") {
-                if let Ok(v) = self.client.call("agent.status", json!({})).await {
+                let v = self.panel("agent.status").await?;
+                if !v.is_null() {
                     let mut a = AgentState::default();
                     a.apply_status(&v);
                     self.emit(BusEvent::Agent(a)).await?;
                 }
             }
             if self.has("poc.list") {
-                if let Ok(Value::Array(items)) = self.client.call("poc.list", json!({})).await {
+                if let Value::Array(items) = self.panel("poc.list").await? {
                     let findings = items.iter().filter_map(Finding::from_json).collect();
                     self.emit(BusEvent::Findings(findings)).await?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Read a slow-changing panel. A transport failure ends the session like
+    /// anywhere else; a tool or protocol error leaves the panel as it was
+    /// (`Null`) — it is re-read on the next slow pass, no toast every 3 s.
+    async fn panel(&self, name: &str) -> Result<Value, Outcome> {
+        match self.client.call(name, json!({})).await {
+            Ok(v) => Ok(v),
+            Err(BusError::Transport(e)) => Err(Outcome::Lost(format!("{e:#}"))),
+            Err(_) => Ok(Value::Null),
+        }
     }
 
     async fn handle(&mut self, req: BusRequest) -> Result<(), Outcome> {
@@ -243,7 +283,14 @@ impl Session {
                 {
                     Ok(v) => match FlowDetail::from_json(&v) {
                         Some(d) => self.emit(BusEvent::Detail(Box::new(d))).await,
-                        None => Ok(()),
+                        None => {
+                            self.emit(BusEvent::DetailFailed(id.clone())).await?;
+                            self.emit(BusEvent::Toast(
+                                Level::Warn,
+                                format!("flow.detail {id}: malformed reply"),
+                            ))
+                            .await
+                        }
                     },
                     Err(e) => self.report(e).await,
                 };
@@ -272,10 +319,17 @@ impl Session {
                 }
                 ("poc.build", a)
             }
-            BusRequest::PocRun { poc_path, target } => {
+            BusRequest::PocRun {
+                poc_path,
+                target,
+                vars,
+            } => {
                 let mut a = json!({ "poc_path": poc_path });
                 if let Some(t) = target {
                     a["target"] = Value::String(t);
+                }
+                if let Some(v) = vars {
+                    a["vars"] = v;
                 }
                 ("poc.run", a)
             }
@@ -326,10 +380,20 @@ impl Session {
                 ))
                 .await;
         }
+        // A mutation changes rows: forget the summary of the flow it names so
+        // the next poll re-reads that one. Only the whole-store commands
+        // invalidate everything; new flows are not cached yet anyway.
+        let touched = args.get("id").and_then(Value::as_str).map(str::to_string);
         match self.client.call(name, args).await {
             Ok(value) => {
-                // A mutation changes rows; re-read the ones we thought settled.
-                self.summaries.clear();
+                match name {
+                    "flow.clear" | "flow.import" => self.summaries.clear(),
+                    _ => {
+                        if let Some(id) = touched {
+                            self.summaries.remove(&id);
+                        }
+                    }
+                }
                 self.emit(BusEvent::CallOk {
                     name: name.to_string(),
                     value,
@@ -343,16 +407,23 @@ impl Session {
     async fn report(&self, e: BusError) -> Result<(), Outcome> {
         match e {
             BusError::Transport(e) => Err(Outcome::Lost(format!("{e:#}"))),
-            BusError::Tool(m) => self.emit(BusEvent::Toast(Level::Error, m)).await,
-            BusError::Rpc { code, message } => {
-                self.emit(BusEvent::Toast(Level::Error, format!("{message} ({code})")))
+            other => {
+                self.emit(BusEvent::Toast(Level::Error, error_text(other)))
                     .await
             }
-            BusError::Protocol(m) => self.emit(BusEvent::Toast(Level::Error, m)).await,
         }
     }
 }
 
 fn lost(e: BusError) -> Outcome {
     Outcome::Lost(e.to_string())
+}
+
+/// The operator-facing text of a non-transport error.
+fn error_text(e: BusError) -> String {
+    match e {
+        BusError::Transport(e) => format!("{e:#}"),
+        BusError::Tool(m) | BusError::Protocol(m) => m,
+        BusError::Rpc { code, message } => format!("{message} ({code})"),
+    }
 }

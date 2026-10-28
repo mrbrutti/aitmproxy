@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aitm_bus_client::{BoxFuture, BusClient, BusTransport};
-use aitm_tui::action::{BusEvent, BusRequest, Level};
+use aitm_tui::action::{BusEvent, BusRequest, Level, ToolSchema as _};
 use aitm_tui::bus::{self, Connector, CLIENT_NAME};
 use aitm_tui::fixture::{Fixture, FixtureTransport, Shared};
 use serde_json::{json, Value};
@@ -37,13 +37,16 @@ impl BusTransport for Recording {
 }
 
 /// A transport that dies after `budget` lines: the proxy going away mid-session.
+/// Every line, including the one that fails, is recorded.
 struct Flaky {
     inner: FixtureTransport,
     budget: AtomicUsize,
+    lines: Lines,
 }
 
 impl BusTransport for Flaky {
     fn send(&self, line: String) -> BoxFuture<'_, anyhow::Result<Option<String>>> {
+        self.lines.lock().unwrap().push(line.clone());
         if self
             .budget
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -53,6 +56,75 @@ impl BusTransport for Flaky {
         }
         self.inner.send(line)
     }
+}
+
+/// `(request, the fixture's reply) -> the reply to deliver`: lets a test hand
+/// the client a malformed or failing answer for one tool while the rest of
+/// the fixture behaves.
+type Rewrite = Arc<dyn Fn(&Value, Option<String>) -> Option<String> + Send + Sync>;
+
+/// The fixture transport with one tool's replies rewritten.
+struct Rewriting {
+    inner: FixtureTransport,
+    rewrite: Rewrite,
+}
+
+impl BusTransport for Rewriting {
+    fn send(&self, line: String) -> BoxFuture<'_, anyhow::Result<Option<String>>> {
+        let req: Value = serde_json::from_str(&line).expect("the client sends JSON");
+        let inner = self.inner.send(line);
+        let rewrite = self.rewrite.clone();
+        Box::pin(async move {
+            let reply = inner.await?;
+            Ok(rewrite(&req, reply))
+        })
+    }
+}
+
+/// A server that refuses the token: every request is answered with the
+/// `-32001` error `aitm-mcp` sends before it hangs up.
+struct Refusing;
+
+impl BusTransport for Refusing {
+    fn send(&self, line: String) -> BoxFuture<'_, anyhow::Result<Option<String>>> {
+        let req: Value = serde_json::from_str(&line).expect("the client sends JSON");
+        let reply = req.get("id").filter(|id| !id.is_null()).map(|id| {
+            json!({"jsonrpc":"2.0","id":id,"error":{"code":-32001,"message":"unauthorized"}})
+                .to_string()
+        });
+        Box::pin(async move { Ok(reply) })
+    }
+}
+
+/// The name of the tool a `tools/call` line invokes.
+fn tool_name(req: &Value) -> &str {
+    if req["method"] == "tools/call" {
+        req["params"]["name"].as_str().unwrap_or("")
+    } else {
+        ""
+    }
+}
+
+/// A `tools/call` reply for `req` whose tool reports failure with `message`.
+fn tool_error_reply(req: &Value, message: &str) -> String {
+    json!({"jsonrpc":"2.0","id":req["id"],"result":{
+        "content":[{"type":"text","text":message}],"isError":true}})
+    .to_string()
+}
+
+fn start_rewriting(poll: Duration, rewrite: Rewrite) -> Running {
+    let shared = Fixture::builtin().shared();
+    let connect: Connector = Arc::new(move || {
+        let shared = shared.clone();
+        let rewrite = rewrite.clone();
+        Box::pin(async move {
+            Ok(BusClient::new(Box::new(Rewriting {
+                inner: FixtureTransport::new(shared),
+                rewrite,
+            })))
+        })
+    });
+    start_with(connect, poll, Arc::new(Mutex::new(Vec::new())))
 }
 
 struct Running {
@@ -522,25 +594,30 @@ async fn a_failed_connect_reports_disconnected_then_retries_with_backoff() {
     finish(r).await;
 }
 
-#[tokio::test]
-async fn a_transport_failure_mid_session_reconnects_and_resumes_polling() {
+/// A bus whose transport dies after `budget` lines, every line recorded.
+fn start_flaky(budget: usize, poll: Duration) -> Running {
     let shared = Fixture::builtin().shared();
+    let lines: Lines = Arc::new(Mutex::new(Vec::new()));
+    let recorded = lines.clone();
     let connect: Connector = Arc::new(move || {
         let shared = shared.clone();
+        let lines = recorded.clone();
         Box::pin(async move {
             Ok(BusClient::new(Box::new(Flaky {
                 inner: FixtureTransport::new(shared),
-                // initialize, initialized, tools/list, proxy.status, flow.list,
-                // flow.get f41 — then the socket "resets".
-                budget: AtomicUsize::new(6),
+                budget: AtomicUsize::new(budget),
+                lines,
             })))
         })
     });
-    let mut r = start_with(
-        connect,
-        Duration::from_millis(20),
-        Arc::new(Mutex::new(Vec::new())),
-    );
+    start_with(connect, poll, lines)
+}
+
+#[tokio::test]
+async fn a_transport_failure_mid_session_reconnects_and_resumes_polling() {
+    // initialize, initialized, tools/list, proxy.status, flow.list,
+    // flow.get f41 — then the socket "resets".
+    let mut r = start_flaky(6, Duration::from_millis(20));
     let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
     let lost = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Disconnected(_))).await;
     assert!(
@@ -549,6 +626,205 @@ async fn a_transport_failure_mid_session_reconnects_and_resumes_polling() {
     );
     // A fresh connection: initialize again, tools/list again.
     let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
+    finish(r).await;
+}
+
+/// Q9: a transport failure while reading a slow panel (scope.list here) ends
+/// the session at once — the next line on the wire is a fresh `initialize`,
+/// not the remaining panels on a dead socket.
+#[tokio::test]
+async fn a_transport_failure_in_a_slow_panel_reconnects_at_once() {
+    // initialize, initialized, tools/list, proxy.status, flow.list, 14 × flow.get
+    // = 19 lines succeed; the 20th, scope.list, "resets".
+    let mut r = start_flaky(19, Duration::from_millis(20));
+    let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
+    let flows = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Flows(_))).await;
+    assert!(
+        matches!(&flows, BusEvent::Flows(s) if s.len() == 14),
+        "{flows:?}"
+    );
+    let lost = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Disconnected(_))).await;
+    assert!(
+        matches!(&lost, BusEvent::Disconnected(why) if why.contains("connection reset by peer")),
+        "{lost:?}"
+    );
+    let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
+    let wire = sent(&r.lines);
+    let scope_at = wire
+        .iter()
+        .position(|w| tool_name(w) == "scope.list")
+        .expect("scope.list was attempted");
+    assert_eq!(
+        wire[scope_at + 1]["method"],
+        "initialize",
+        "after the failed scope.list the session reconnects instead of trying \
+         agent.status / poc.list on the dead transport: {:?}",
+        &wire[scope_at..]
+    );
+    finish(r).await;
+}
+
+/// Q9: the bus answering the handshake with `-32001` means our token is wrong.
+/// Retrying with back-off cannot fix that, so the task reports it once, with
+/// the fix in the message, and stops.
+#[tokio::test]
+async fn a_refused_token_during_the_handshake_is_reported_once_and_not_retried() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = attempts.clone();
+    let connect: Connector = Arc::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(BusClient::new(Box::new(Refusing))) })
+    });
+    let mut r = start_with(
+        connect,
+        Duration::from_millis(20),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let first = timeout(WAIT, r.ev_rx.recv()).await.unwrap().unwrap();
+    assert_eq!(
+        first,
+        BusEvent::Disconnected("bus refused the token — check --token-file".into())
+    );
+    // The task ends on its own: no second connect, no back-off loop. Both
+    // channels are still open here, so this is the task's decision.
+    timeout(WAIT, r.task)
+        .await
+        .expect("the task stops after a token refusal")
+        .expect("the task does not panic");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "no retry");
+    drop(r.req_tx);
+}
+
+/// Q1: a `flow.detail` reply the model rejects is reported, and the app is
+/// told not to ask again for that id.
+#[tokio::test]
+async fn a_malformed_flow_detail_reply_is_a_warn_toast_and_a_detail_failed_event() {
+    let rewrite: Rewrite = Arc::new(|req, reply| {
+        if tool_name(req) == "flow.detail" {
+            Some(
+                json!({"jsonrpc":"2.0","id":req["id"],"result":{
+                    "content":[{"type":"text","text":"{}"}],
+                    "structuredContent":{"garbage":true},"isError":false}})
+                .to_string(),
+            )
+        } else {
+            reply
+        }
+    });
+    let mut r = start_rewriting(Duration::from_millis(50), rewrite);
+    let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
+    r.req_tx
+        .send(BusRequest::Detail("f41".into()))
+        .await
+        .unwrap();
+    let failed = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::DetailFailed(_))).await;
+    assert_eq!(failed, BusEvent::DetailFailed("f41".into()));
+    let toast = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Toast(..))).await;
+    assert_eq!(
+        toast,
+        BusEvent::Toast(Level::Warn, "flow.detail f41: malformed reply".into())
+    );
+    finish(r).await;
+}
+
+/// Q1: a per-flow `flow.get` error must not drop the row (the app would evict
+/// it and lose the selection); the cached summary stays and the operator
+/// sees one warning per poll, however many flows failed.
+#[tokio::test]
+async fn a_per_flow_get_error_keeps_the_cached_row_and_warns_once_per_poll() {
+    let lists = Arc::new(AtomicUsize::new(0));
+    let rewrite: Rewrite = Arc::new(move |req, reply| {
+        match tool_name(req) {
+            "flow.list" => {
+                lists.fetch_add(1, Ordering::SeqCst);
+                reply
+            }
+            // From the second poll on, the two paused flows (re-fetched every
+            // poll) fail at the store.
+            "flow.get"
+                if lists.load(Ordering::SeqCst) >= 2
+                    && matches!(
+                        req["params"]["arguments"]["id"].as_str(),
+                        Some("f50") | Some("f51")
+                    ) =>
+            {
+                Some(tool_error_reply(req, "store hiccup"))
+            }
+            _ => reply,
+        }
+    });
+    let mut r = start_rewriting(Duration::from_millis(50), rewrite);
+    let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Flows(_))).await;
+
+    let second = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Flows(_))).await;
+    let BusEvent::Flows(rows) = second else {
+        unreachable!()
+    };
+    assert_eq!(rows.len(), 14, "no row is dropped: {rows:?}");
+    let f50 = rows
+        .iter()
+        .find(|s| s["id"] == "f50")
+        .expect("f50 is still a row");
+    assert_eq!(
+        f50["intercept"], "intercepted",
+        "the cached summary is kept"
+    );
+
+    // Between this Flows and the next: exactly one warning, naming the first
+    // failure, although two flows failed.
+    let mut toasts = Vec::new();
+    loop {
+        let ev = timeout(WAIT, r.ev_rx.recv()).await.unwrap().unwrap();
+        match ev {
+            BusEvent::Flows(_) => break,
+            BusEvent::Toast(level, text) => toasts.push((level, text)),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        toasts,
+        vec![(Level::Warn, "flow.get f50: store hiccup".to_string())]
+    );
+    finish(r).await;
+}
+
+/// Q6: a mutation invalidates the row it touched, not every settled row — the
+/// next poll re-reads that one id (plus the flows that are always polled).
+#[tokio::test]
+async fn a_mutation_re_reads_only_the_touched_flow() {
+    let mut r = start(Fixture::builtin().shared(), Duration::from_millis(50));
+    let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Flows(_))).await;
+    r.req_tx
+        .send(BusRequest::Mark {
+            id: "f41".into(),
+            marks: vec!["red".into()],
+        })
+        .await
+        .unwrap();
+    let _ = next_where(
+        &mut r.ev_rx,
+        |e| matches!(e, BusEvent::CallOk { name, .. } if name == "flow.mark"),
+    )
+    .await;
+    let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Flows(_))).await;
+    let wire = sent(&r.lines);
+    let mark_at = wire
+        .iter()
+        .position(|w| tool_name(w) == "flow.mark")
+        .expect("flow.mark was sent");
+    let gets: Vec<&str> = wire[mark_at..]
+        .iter()
+        .filter(|w| tool_name(w) == "flow.get")
+        .filter_map(|w| w["params"]["arguments"]["id"].as_str())
+        .collect();
+    assert!(
+        gets.contains(&"f41"),
+        "the marked flow is re-read: {gets:?}"
+    );
+    assert!(
+        !gets.contains(&"f42"),
+        "an untouched settled flow is not re-read: {gets:?}"
+    );
     finish(r).await;
 }
 

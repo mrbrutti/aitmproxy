@@ -30,12 +30,33 @@ pub fn map(key: KeyEvent, mode: Mode) -> Option<Action> {
         Mode::Findings => findings(key),
         Mode::Scope => scope(key),
         Mode::Agent => agent(key),
+        Mode::Ca => ca(key),
+        Mode::Browser => panel(key),
+        // Any key closes help (README); `:` goes straight to the palette.
         Mode::Help => Some(match key.code {
-            KeyCode::Char('q') => Action::Quit,
             KeyCode::Char(':') => Action::PaletteOpen,
             _ => Action::Back,
         }),
     }
+}
+
+/// A read-only panel: back, palette, help.
+fn panel(key: KeyEvent) -> Option<Action> {
+    Some(match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => Action::Back,
+        KeyCode::Char(':') => Action::PaletteOpen,
+        KeyCode::Char('?') => Action::Help,
+        _ => return None,
+    })
+}
+
+fn ca(key: KeyEvent) -> Option<Action> {
+    Some(match key.code {
+        KeyCode::Char('e') => Action::Command("ca-export-prompt".into()),
+        KeyCode::Char('i') => Action::Command("ca.install".into()),
+        KeyCode::Char('u') => Action::Command("ca.uninstall".into()),
+        _ => return panel(key),
+    })
 }
 
 /// The shared list-navigation keys. A key with Control held is not navigation
@@ -277,6 +298,59 @@ mod tests {
         assert_eq!(map(rel, Mode::Flows), None);
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(map(ctrl_c, Mode::Edit), Some(Action::Quit));
+    }
+
+    /// Q11: the README says any key closes help; `q` is a key.
+    #[test]
+    fn q_closes_help_instead_of_quitting() {
+        assert_eq!(
+            map(press(KeyCode::Char('q')), Mode::Help),
+            Some(Action::Back)
+        );
+        assert_eq!(
+            map(press(KeyCode::Char('x')), Mode::Help),
+            Some(Action::Back)
+        );
+        assert_eq!(
+            map(press(KeyCode::Char(':')), Mode::Help),
+            Some(Action::PaletteOpen)
+        );
+    }
+
+    /// I2 / C2: the CA and Browser panels are keyboard-complete.
+    #[test]
+    fn ca_and_browser_panels_map_their_keys() {
+        assert_eq!(
+            map(press(KeyCode::Char('e')), Mode::Ca),
+            Some(Action::Command("ca-export-prompt".into()))
+        );
+        assert_eq!(
+            map(press(KeyCode::Char('i')), Mode::Ca),
+            Some(Action::Command("ca.install".into()))
+        );
+        assert_eq!(
+            map(press(KeyCode::Char('u')), Mode::Ca),
+            Some(Action::Command("ca.uninstall".into()))
+        );
+        assert_eq!(map(press(KeyCode::Esc), Mode::Ca), Some(Action::Back));
+        assert_eq!(
+            map(press(KeyCode::Char('q')), Mode::Browser),
+            Some(Action::Back)
+        );
+        assert_eq!(
+            map(press(KeyCode::Char(':')), Mode::Browser),
+            Some(Action::PaletteOpen)
+        );
+        assert_eq!(map(press(KeyCode::Char('z')), Mode::Browser), None);
+        // The confirm prompt takes its answer as typed input.
+        assert_eq!(
+            map(press(KeyCode::Char('y')), Mode::Prompt(PromptKind::Confirm)),
+            Some(Action::Input('y'))
+        );
+        assert_eq!(
+            map(press(KeyCode::Esc), Mode::Prompt(PromptKind::Confirm)),
+            Some(Action::Back)
+        );
     }
 
     #[test]

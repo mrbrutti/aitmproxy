@@ -9,15 +9,14 @@
 //! bind with `PermissionDenied`, the test prints a note and returns; it must
 //! be run for real in the Terminal panel (the plan's "Done when").
 
+mod support;
+
 use std::io;
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use aitm::wire::{assemble, Assembled, Http1Sender};
-use aitm_core::{Config, McpTransport, PipelineClient, ProxyClient, ScopeRateGuard};
+use aitm::tui::build_servers;
+use aitm_core::{Config, McpTransport};
 use aitm_mcp::McpServer;
 use aitm_tui::action::{BusEvent, BusRequest, Level};
 use aitm_tui::TransportChoice;
@@ -34,42 +33,24 @@ const STEP: Duration = Duration::from_secs(2);
 /// The TUI poll interval under test (the plan says 50 ms).
 const POLL: Duration = Duration::from_millis(50);
 
-fn temp_ca_dir(tag: &str) -> PathBuf {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("aitm-tui-live-bus-{tag}-{nanos}-{n}"))
-}
-
+/// The default config with a throwaway CA and the loopback-TCP agent
+/// transport `aitm tui` serves beside the UI.
 fn config(tag: &str) -> Config {
-    let mut cfg = Config::default();
-    cfg.ca.dir = temp_ca_dir(tag);
+    let mut cfg = support::config(tag);
+    cfg.mcp.transport = McpTransport::LoopbackTcp {
+        port: 0,
+        token: TOKEN.into(),
+    };
     cfg
 }
 
-/// The agent-facing server exactly as `aitm` builds it: `assemble`, the shared
-/// service handles, then one `McpServer` on loopback TCP port 0.
+/// The agent-facing server exactly as `aitm tui` builds it: `assemble`, the
+/// shared service handles, then `tui::build_servers` — the loopback-TCP half.
 fn build_server(cfg: &Config) -> McpServer {
-    let Assembled { proxy, ca: _ } = assemble(cfg).expect("assemble");
-    let registry = proxy.registry_arc();
-    let store = proxy.store();
-    let guard: Arc<dyn ScopeRateGuard> = proxy.guard();
-    let client: Arc<dyn ProxyClient> = Arc::new(PipelineClient::new(
-        store.clone(),
-        guard.clone(),
-        Arc::new(Http1Sender::new().with_insecure(cfg.ssl_insecure)),
-    ));
-    McpServer::new(
-        registry,
-        McpTransport::LoopbackTcp {
-            port: 0,
-            token: TOKEN.into(),
-        },
-    )
-    .with_services(store, client, guard, None)
+    let (_proxy, services) = support::assemble_services(cfg);
+    build_servers(cfg, services)
+        .0
+        .expect("a loopback-TCP transport gets an agent server")
 }
 
 /// Spawn `serve()` and wait for `on_bound` to report the address.

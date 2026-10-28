@@ -19,8 +19,9 @@
 <rect x="990.8" y="8.0" width="168.0" height="18" fill="#262628"/>
 <rect x="1158.8" y="8.0" width="252.0" height="18" fill="#262628"/>
 <text x="1158.8" y="21.5" fill="#2DD4BF" xml:space="preserve" font-weight="bold">[⚙ Agent ● all tools · 14/min]</text>
-<rect x="1410.8" y="8.0" width="277.2" height="18" fill="#262628"/>
-<text x="1410.8" y="21.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">  : palette  ▄▄ below  b sidebar </text>
+<rect x="1410.8" y="8.0" width="268.8" height="18" fill="#262628"/>
+<text x="1410.8" y="21.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">  : palette  ▄▄ below  b sidebar</text>
+<rect x="1679.6" y="8.0" width="8.4" height="18" fill="#262628"/>
 <rect x="8.0" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="16.4" y="26.0" width="42.0" height="18" fill="#262628"/>
 <text x="16.4" y="39.5" fill="#E6E6E8" xml:space="preserve" font-weight="bold"> All </text>
@@ -191,7 +192,9 @@
 <rect x="75.2" y="80.0" width="159.6" height="18" fill="#1E1E20"/>
 <rect x="234.8" y="80.0" width="8.4" height="18" fill="#1E1E20"/>
 <text x="234.8" y="93.5" fill="#2E2E31" xml:space="preserve">│</text>
-<rect x="243.2" y="80.0" width="16.8" height="18" fill="#1E1E20"/>
+<rect x="243.2" y="80.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="243.2" y="93.5" fill="#7DD3FC" xml:space="preserve">▍</text>
+<rect x="251.6" y="80.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="260.0" y="80.0" width="8.4" height="18" fill="#1E1E20"/>
 <text x="260.0" y="93.5" fill="#4ADE80" xml:space="preserve">●</text>
 <rect x="268.4" y="80.0" width="8.4" height="18" fill="#1E1E20"/>
@@ -732,10 +735,10 @@
 <rect x="1595.6" y="278.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1604.0" y="278.0" width="16.8" height="18" fill="#1E1E20"/>
 <rect x="1620.8" y="278.0" width="67.2" height="18" fill="#1E1E20"/>
-<rect x="8.0" y="296.0" width="201.6" height="18" fill="#1E1E20"/>
-<text x="8.0" y="309.5" fill="#E6E6E8" xml:space="preserve">  Browser               </text>
-<rect x="209.6" y="296.0" width="25.2" height="18" fill="#1E1E20"/>
-<text x="209.6" y="309.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">F14</text>
+<rect x="8.0" y="296.0" width="117.6" height="18" fill="#1E1E20"/>
+<text x="8.0" y="309.5" fill="#E6E6E8" xml:space="preserve">  Browser     </text>
+<rect x="125.6" y="296.0" width="109.2" height="18" fill="#1E1E20"/>
+<text x="125.6" y="309.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">not built yet</text>
 <rect x="234.8" y="296.0" width="8.4" height="18" fill="#1E1E20"/>
 <text x="234.8" y="309.5" fill="#2E2E31" xml:space="preserve" opacity="0.7">│</text>
 <rect x="243.2" y="296.0" width="16.8" height="18" fill="#1E1E20"/>
@@ -828,7 +831,7 @@
 <rect x="344.0" y="476.0" width="512.4" height="18" fill="#F5A524"/>
 <text x="344.0" y="489.5" fill="#1F1300" xml:space="preserve">  POST https://auth.shop-staging.test/api/auth/login · edited</text>
 <rect x="856.4" y="476.0" width="831.6" height="18" fill="#F5A524"/>
-<text x="856.4" y="489.5" fill="#1F1300" xml:space="preserve" font-weight="bold">                                            [a Resume] [A Resume all] [d Kill] [e Edit] [i Disarm] </text>
+<text x="856.4" y="489.5" fill="#1F1300" xml:space="preserve" font-weight="bold">      [a Resume] [A Resume all] [d Kill · abort mode: reset (429/503 need F3)] [e Edit] [i Disarm] </text>
 <rect x="8.0" y="494.0" width="226.8" height="18" fill="#1E1E20"/>
 <rect x="234.8" y="494.0" width="1453.2" height="18" fill="#1E1E20"/>
 <text x="234.8" y="507.5" fill="#2E2E31" xml:space="preserve">│────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</text>
@@ -857,21 +860,27 @@
 <rect x="327.2" y="530.0" width="58.8" height="18" fill="#262628"/>
 <text x="327.2" y="543.5" fill="#60A5FA" xml:space="preserve" font-weight="bold" text-decoration="underline">Headers</text>
 <rect x="386.0" y="530.0" width="16.8" height="18" fill="#262628"/>
-<rect x="402.8" y="530.0" width="42.0" height="18" fill="#262628"/>
-<text x="402.8" y="543.5" fill="#B4B4B8" xml:space="preserve">Query</text>
-<rect x="444.8" y="530.0" width="16.8" height="18" fill="#262628"/>
-<rect x="461.6" y="530.0" width="33.6" height="18" fill="#262628"/>
-<text x="461.6" y="543.5" fill="#B4B4B8" xml:space="preserve">Body</text>
-<rect x="495.2" y="530.0" width="16.8" height="18" fill="#262628"/>
-<rect x="512.0" y="530.0" width="25.2" height="18" fill="#262628"/>
-<text x="512.0" y="543.5" fill="#B4B4B8" xml:space="preserve">Raw</text>
-<rect x="537.2" y="530.0" width="16.8" height="18" fill="#262628"/>
-<rect x="554.0" y="530.0" width="58.8" height="18" fill="#262628"/>
-<text x="554.0" y="543.5" fill="#B4B4B8" xml:space="preserve">Summary</text>
+<rect x="402.8" y="530.0" width="100.8" height="18" fill="#262628"/>
+<text x="402.8" y="543.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">Cookies (F5)</text>
+<rect x="503.6" y="530.0" width="16.8" height="18" fill="#262628"/>
+<rect x="520.4" y="530.0" width="42.0" height="18" fill="#262628"/>
+<text x="520.4" y="543.5" fill="#B4B4B8" xml:space="preserve">Query</text>
+<rect x="562.4" y="530.0" width="16.8" height="18" fill="#262628"/>
+<rect x="579.2" y="530.0" width="33.6" height="18" fill="#262628"/>
+<text x="579.2" y="543.5" fill="#B4B4B8" xml:space="preserve">Body</text>
 <rect x="612.8" y="530.0" width="16.8" height="18" fill="#262628"/>
-<rect x="629.6" y="530.0" width="84.0" height="18" fill="#262628"/>
-<text x="629.6" y="543.5" fill="#B4B4B8" xml:space="preserve">Connection</text>
-<rect x="713.6" y="530.0" width="243.6" height="18" fill="#262628"/>
+<rect x="629.6" y="530.0" width="25.2" height="18" fill="#262628"/>
+<text x="629.6" y="543.5" fill="#B4B4B8" xml:space="preserve">Raw</text>
+<rect x="654.8" y="530.0" width="16.8" height="18" fill="#262628"/>
+<rect x="671.6" y="530.0" width="58.8" height="18" fill="#262628"/>
+<text x="671.6" y="543.5" fill="#B4B4B8" xml:space="preserve">Summary</text>
+<rect x="730.4" y="530.0" width="16.8" height="18" fill="#262628"/>
+<rect x="747.2" y="530.0" width="92.4" height="18" fill="#262628"/>
+<text x="747.2" y="543.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">Timing (F5)</text>
+<rect x="839.6" y="530.0" width="16.8" height="18" fill="#262628"/>
+<rect x="856.4" y="530.0" width="84.0" height="18" fill="#262628"/>
+<text x="856.4" y="543.5" fill="#B4B4B8" xml:space="preserve">Connection</text>
+<rect x="940.4" y="530.0" width="16.8" height="18" fill="#262628"/>
 <rect x="957.2" y="530.0" width="8.4" height="18" fill="#1E1E20"/>
 <text x="957.2" y="543.5" fill="#2E2E31" xml:space="preserve">│</text>
 <rect x="965.6" y="530.0" width="92.4" height="18" fill="#262628"/>
@@ -879,21 +888,24 @@
 <rect x="1058.0" y="530.0" width="58.8" height="18" fill="#262628"/>
 <text x="1058.0" y="543.5" fill="#B4B4B8" xml:space="preserve">Headers</text>
 <rect x="1116.8" y="530.0" width="16.8" height="18" fill="#262628"/>
-<rect x="1133.6" y="530.0" width="33.6" height="18" fill="#262628"/>
-<text x="1133.6" y="543.5" fill="#60A5FA" xml:space="preserve" font-weight="bold" text-decoration="underline">Body</text>
-<rect x="1167.2" y="530.0" width="16.8" height="18" fill="#262628"/>
-<rect x="1184.0" y="530.0" width="25.2" height="18" fill="#262628"/>
-<text x="1184.0" y="543.5" fill="#B4B4B8" xml:space="preserve">Raw</text>
-<rect x="1209.2" y="530.0" width="16.8" height="18" fill="#262628"/>
-<rect x="1226.0" y="530.0" width="33.6" height="18" fill="#262628"/>
-<text x="1226.0" y="543.5" fill="#B4B4B8" xml:space="preserve">JSON</text>
+<rect x="1133.6" y="530.0" width="126.0" height="18" fill="#262628"/>
+<text x="1133.6" y="543.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">Set-Cookie (F5)</text>
 <rect x="1259.6" y="530.0" width="16.8" height="18" fill="#262628"/>
-<rect x="1276.4" y="530.0" width="25.2" height="18" fill="#262628"/>
-<text x="1276.4" y="543.5" fill="#B4B4B8" xml:space="preserve">Hex</text>
-<rect x="1301.6" y="530.0" width="16.8" height="18" fill="#262628"/>
-<rect x="1318.4" y="530.0" width="33.6" height="18" fill="#262628"/>
-<text x="1318.4" y="543.5" fill="#B4B4B8" xml:space="preserve">Diff</text>
-<rect x="1352.0" y="530.0" width="336.0" height="18" fill="#262628"/>
+<rect x="1276.4" y="530.0" width="33.6" height="18" fill="#262628"/>
+<text x="1276.4" y="543.5" fill="#60A5FA" xml:space="preserve" font-weight="bold" text-decoration="underline">Body</text>
+<rect x="1310.0" y="530.0" width="16.8" height="18" fill="#262628"/>
+<rect x="1326.8" y="530.0" width="25.2" height="18" fill="#262628"/>
+<text x="1326.8" y="543.5" fill="#B4B4B8" xml:space="preserve">Raw</text>
+<rect x="1352.0" y="530.0" width="16.8" height="18" fill="#262628"/>
+<rect x="1368.8" y="530.0" width="33.6" height="18" fill="#262628"/>
+<text x="1368.8" y="543.5" fill="#B4B4B8" xml:space="preserve">JSON</text>
+<rect x="1402.4" y="530.0" width="16.8" height="18" fill="#262628"/>
+<rect x="1419.2" y="530.0" width="25.2" height="18" fill="#262628"/>
+<text x="1419.2" y="543.5" fill="#B4B4B8" xml:space="preserve">Hex</text>
+<rect x="1444.4" y="530.0" width="16.8" height="18" fill="#262628"/>
+<rect x="1461.2" y="530.0" width="33.6" height="18" fill="#262628"/>
+<text x="1461.2" y="543.5" fill="#B4B4B8" xml:space="preserve">Diff</text>
+<rect x="1494.8" y="530.0" width="193.2" height="18" fill="#262628"/>
 <rect x="8.0" y="548.0" width="226.8" height="18" fill="#1E1E20"/>
 <rect x="234.8" y="548.0" width="8.4" height="18" fill="#1E1E20"/>
 <text x="234.8" y="561.5" fill="#2E2E31" xml:space="preserve">│</text>
@@ -1094,16 +1106,18 @@
 <text x="579.2" y="903.5" fill="#E6E6E8" xml:space="preserve" font-weight="bold"> t</text>
 <rect x="596.0" y="890.0" width="126.0" height="18" fill="#262628"/>
 <text x="596.0" y="903.5" fill="#B4B4B8" xml:space="preserve"> Auto-select ○ </text>
-<rect x="722.0" y="890.0" width="184.8" height="18" fill="#262628"/>
-<rect x="906.8" y="890.0" width="100.8" height="18" fill="#262628"/>
-<text x="906.8" y="903.5" fill="#B4B4B8" xml:space="preserve">10 / 14 rows</text>
-<rect x="1007.6" y="890.0" width="92.4" height="18" fill="#262628"/>
-<text x="1007.6" y="903.5" fill="#F5A524" xml:space="preserve" font-weight="bold"> · 2 paused</text>
-<rect x="1100.0" y="890.0" width="226.8" height="18" fill="#262628"/>
-<text x="1100.0" y="903.5" fill="#B4B4B8" xml:space="preserve"> · 13 in scope · 2 findings</text>
-<rect x="1326.8" y="890.0" width="184.8" height="18" fill="#262628"/>
-<rect x="1511.6" y="890.0" width="42.0" height="18" fill="#262628"/>
-<text x="1511.6" y="903.5" fill="#B4B4B8" xml:space="preserve">983 B</text>
+<rect x="722.0" y="890.0" width="126.0" height="18" fill="#262628"/>
+<rect x="848.0" y="890.0" width="100.8" height="18" fill="#262628"/>
+<text x="848.0" y="903.5" fill="#B4B4B8" xml:space="preserve">10 / 14 rows</text>
+<rect x="948.8" y="890.0" width="92.4" height="18" fill="#262628"/>
+<text x="948.8" y="903.5" fill="#F5A524" xml:space="preserve" font-weight="bold"> · 2 paused</text>
+<rect x="1041.2" y="890.0" width="226.8" height="18" fill="#262628"/>
+<text x="1041.2" y="903.5" fill="#B4B4B8" xml:space="preserve"> · 13 in scope · 2 findings</text>
+<rect x="1268.0" y="890.0" width="134.4" height="18" fill="#262628"/>
+<rect x="1402.4" y="890.0" width="42.0" height="18" fill="#262628"/>
+<text x="1402.4" y="903.5" fill="#B4B4B8" xml:space="preserve">983 B</text>
+<rect x="1444.4" y="890.0" width="109.2" height="18" fill="#262628"/>
+<text x="1444.4" y="903.5" fill="#8E8E93" xml:space="preserve" opacity="0.7"> ↑ — ↓ — (F4)</text>
 <rect x="1553.6" y="890.0" width="33.6" height="18" fill="#262628"/>
 <text x="1553.6" y="903.5" fill="#4ADE80" xml:space="preserve">  ● </text>
 <rect x="1587.2" y="890.0" width="100.8" height="18" fill="#262628"/>

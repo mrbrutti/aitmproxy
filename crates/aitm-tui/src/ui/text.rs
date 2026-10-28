@@ -8,6 +8,12 @@ pub fn width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
+/// A cell count as ratatui's `u16`, saturating instead of wrapping: the one
+/// place the renderers convert a measured width or a row index.
+pub fn cells(w: usize) -> u16 {
+    u16::try_from(w).unwrap_or(u16::MAX)
+}
+
 /// Fit `s` into exactly `w` cells: pad with spaces or cut with `…`.
 pub fn fit(s: &str, w: usize) -> String {
     let cur = width(s);
@@ -84,6 +90,17 @@ mod tests {
         assert_eq!(right("12", 5), "   12");
         assert_eq!(truncate("héllo wörld", 6), "héllo…");
         assert_eq!(width("✋ 2"), 4);
+    }
+
+    /// Q10: one saturating conversion for every cell count the renderers
+    /// hand to ratatui, instead of `as u16` at each site.
+    #[test]
+    fn cells_saturates_instead_of_wrapping() {
+        assert_eq!(cells(0), 0);
+        assert_eq!(cells(5), 5);
+        assert_eq!(cells(65_535), u16::MAX);
+        assert_eq!(cells(70_000), u16::MAX);
+        assert_eq!(cells(usize::MAX), u16::MAX);
     }
 
     #[test]

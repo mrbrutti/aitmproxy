@@ -4,6 +4,7 @@
 
 mod common;
 
+use aitm_tui::action::ToolSchema as _;
 use aitm_tui::action::{Action, BusEvent, BusRequest, Level, ToolInfo};
 use aitm_tui::app::{App, Chip, Mode, Pane, PromptKind, SidebarItem, REQUEST_TABS, RESPONSE_TABS};
 use aitm_tui::caps::TermCaps;
@@ -286,18 +287,29 @@ fn sidebar_items_group_the_list_and_open_the_panels() {
         "{text}"
     );
 
-    for (item, mode) in [
-        (SidebarItem::Scope, Mode::Scope),
-        (SidebarItem::Findings, Mode::Findings),
-    ] {
-        let _ = app.update(Action::SidebarNext);
-        assert_eq!(app.sidebar, item);
-        assert_eq!(app.mode, mode);
-    }
+    // Scope filters the list (§2.7 "The flow list's Scope sidebar item filters
+    // to in-scope"); the panel is `S` / `:scope`.
+    let _ = app.update(Action::SidebarNext);
+    assert_eq!(app.sidebar, SidebarItem::Scope);
+    assert_eq!(app.mode, Mode::Flows);
+    assert_eq!(visible_ids(&app).len(), 13, "f44 is out of scope");
+    let _ = app.update(Action::SidebarNext);
+    assert_eq!(app.sidebar, SidebarItem::Findings);
+    assert_eq!(app.mode, Mode::Findings);
+    // Browser: a panel that says it is not built and lists the browser.* tools.
     let _ = app.update(Action::SidebarNext);
     assert_eq!(app.sidebar, SidebarItem::Browser);
-    assert_eq!(app.mode, Mode::Flows);
-    assert!(toast(&app).contains("F14"), "{}", toast(&app));
+    assert_eq!(app.mode, Mode::Browser);
+    let text = text_of(&app, 200, 50);
+    assert!(text.contains("Browser — not built yet"), "{text}");
+    assert!(text.contains(":browser.navigate"), "{text}");
+    assert!(text.contains(":browser.get_dom"), "{text}");
+    assert!(text.contains(":browser.screenshot"), "{text}");
+    assert!(!text.contains("F14"), "not an F-number: {text}");
+    assert_eq!(
+        keys::map(press(KeyCode::Esc), Mode::Browser),
+        Some(Action::Back)
+    );
     let _ = app.update(Action::SidebarNext);
     assert!(toast(&app).contains("F8"), "{}", toast(&app));
     let _ = app.update(Action::SidebarNext);
@@ -564,12 +576,33 @@ fn ctrl_k_opens_the_palette_as_the_readme_promises() {
 
 // ----------------------------------------------------- §2.7 inspector
 
-/// §2.7 "Inspector": request tabs Headers · Query · Body · Raw · Summary ·
-/// Connection and response tabs Headers · Body · Raw · JSON · Hex · Diff,
-/// each drawing its viewer.
+/// §2.7 "Inspector": request tabs Headers · Cookies · Query · Body · Raw ·
+/// Summary · Timing · Connection and response tabs Headers · Set-Cookie ·
+/// Body · Raw · JSON · Hex · Diff, each drawing its viewer (the F5 tabs draw
+/// their follow-up sentence — fix pass 1, I1).
 #[test]
 fn inspector_tabs_draw_their_viewers() {
+    assert_eq!(REQUEST_TABS.len(), 8);
+    assert_eq!(RESPONSE_TABS.len(), 7);
     let cases: &[(Pane, &str, &str, &[&str])] = &[
+        (
+            Pane::Request,
+            "Cookies",
+            "f41",
+            &["Cookies need core follow-up F5"],
+        ),
+        (
+            Pane::Request,
+            "Timing",
+            "f41",
+            &["Timing need core follow-up F5"],
+        ),
+        (
+            Pane::Response,
+            "Set-Cookie",
+            "f41",
+            &["Set-Cookie need core follow-up F5"],
+        ),
         (
             Pane::Request,
             "Headers",
@@ -711,7 +744,12 @@ fn inspector_tabs_draw_their_viewers() {
         keys::map(press(KeyCode::Right), Mode::Inspector),
         Some(Action::InspectorTabNext)
     );
+    // The response pane opens on Body (index 2 since Set-Cookie was added):
+    // three steps back wrap to Diff.
+    assert_eq!(RESPONSE_TABS[app.inspector.response_tab], "Body");
     let _ = app.update(Action::InspectorTabPrev);
+    let _ = app.update(Action::InspectorTabPrev);
+    assert_eq!(RESPONSE_TABS[app.inspector.response_tab], "Headers");
     let _ = app.update(Action::InspectorTabPrev);
     assert_eq!(RESPONSE_TABS[app.inspector.response_tab], "Diff");
     // The focused pane's title takes the accent.
@@ -908,9 +946,22 @@ fn body_viewer_dispatches_on_content_type_and_bytes() {
     );
     app.inspector.response_tab = RESPONSE_TABS.iter().position(|t| *t == "Hex").unwrap();
     assert!(text_of(&app, 200, 50).contains("00000000  89 50 4e 47"));
-    // `o` is the documented way out; the TUI says so instead of pretending.
+    // `o` is the documented way out (§2.9): the bytes go to a private temp
+    // file and the run loop hands it to the desktop.
     let _ = app.update(Action::OpenExternally);
-    assert!(toast(&app).starts_with("Opening externally is deferred to the shell"));
+    let target = app.take_open_target().expect("an image body is openable");
+    assert!(
+        target.path.ends_with("aitm-tui-img.png"),
+        "{}",
+        target.path.display()
+    );
+    assert_eq!(std::fs::read(&target.path).unwrap(), png);
+    assert!(
+        toast(&app).ends_with("aitm-tui-img.png — opening"),
+        "{}",
+        toast(&app)
+    );
+    let _ = std::fs::remove_file(&target.path);
     // The list's chip bar classifies it as Media.
     app.mode = Mode::Flows;
     let _ = app.update(Action::ChipIndex(13));
@@ -1402,11 +1453,16 @@ fn findings_panel_lists_runs_and_opens_the_capture() {
     for c in "https://staging2.test".chars() {
         let _ = app.update(Action::Input(c));
     }
+    // Target, then vars (§2.7 "Run again … editable target/vars"); blank = none.
+    assert!(app.update(Action::Submit).is_empty());
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::PocVars));
+    assert!(text_of(&app, 200, 50).contains(" vars: "));
     assert_eq!(
         app.update(Action::Submit),
         vec![BusRequest::PocRun {
             poc_path: "pocs/idor-cart-items.yaml".into(),
-            target: Some("https://staging2.test".into())
+            target: Some("https://staging2.test".into()),
+            vars: None
         }]
     );
     assert_eq!(app.mode, Mode::Findings);
@@ -1434,12 +1490,19 @@ fn findings_panel_lists_runs_and_opens_the_capture() {
     for c in "Reflected XSS".chars() {
         let _ = app.update(Action::Input(c));
     }
+    // Name, then param (`poc.build {flow_id, name, param}`, §4.3).
+    assert!(app.update(Action::Submit).is_empty());
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::PocParam));
+    assert!(text_of(&app, 200, 50).contains(" poc param: "));
+    for c in "q".chars() {
+        let _ = app.update(Action::Input(c));
+    }
     assert_eq!(
         app.update(Action::Submit),
         vec![BusRequest::PocBuild {
             flow_id: "f48".into(),
             name: Some("Reflected XSS".into()),
-            param: None
+            param: Some("q".into())
         }]
     );
     let _ = app.on_bus(BusEvent::CallOk {
@@ -1641,16 +1704,17 @@ fn every_absent_tool_degrades_to_a_labelled_follow_up() {
     for label in [
         "(core follow-up F7)",
         "F10│",
-        "F14│",
+        "not built yet│",
         "M3│",
         "F1│",
         "n/a (F1)",
+        "↑ — ↓ — (F4)",
     ] {
         assert!(text.contains(label), "{label}: {text}");
     }
     let _ = app.update(Action::OpenScope);
     assert!(text_of(&app, 200, 50).contains("(needs core follow-up F12)"));
-    assert!(text_of(&app, 200, 50).contains("readout needs F5"));
+    assert!(text_of(&app, 200, 50).contains("readout needs F7, config.get"));
     let _ = app.update(Action::ToggleIntercept);
     app.mode = Mode::Flows;
     app.selected = Some("a".into());
@@ -1663,6 +1727,19 @@ fn every_absent_tool_degrades_to_a_labelled_follow_up() {
         "observed",
     )]));
     assert!(text_of(&app, 200, 50).contains("Rules… needs core follow-up F3"));
+    // The paused bar's Kill hint names the abort modes F3 adds; `:export`
+    // names F10 (fix pass 1, I1).
+    let _ = app.on_bus(BusEvent::Flows(vec![
+        summary("a", "GET", "h.test", "/a", Some(200), "observed"),
+        summary("b", "POST", "h.test", "/b", None, "intercepted"),
+    ]));
+    assert!(
+        text_of(&app, 200, 50).contains("[d Kill · abort mode: reset (429/503 need F3)]"),
+        "{}",
+        text_of(&app, 200, 50)
+    );
+    assert!(app.run_command("export").is_empty());
+    assert!(toast(&app).contains("F10"), "{}", toast(&app));
 
     // With the tools present, the same controls reach the bus.
     app.tools.extend(tools(&[

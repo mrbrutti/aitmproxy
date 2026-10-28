@@ -13,19 +13,25 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::{Duration, Instant};
 
 use aitm_tui::action::{Action, BusEvent, Level, ToolInfo};
-use aitm_tui::app::{App, Layout, Mode, Pane, PromptKind, NARROW_COLS, RESPONSE_TABS, SPLIT_COLS};
+use aitm_tui::app::{App, Layout, Mode, Pane, PromptKind, RESPONSE_TABS};
 use aitm_tui::caps::TermCaps;
-use aitm_tui::fixture_app;
 use aitm_tui::keys;
 use aitm_tui::model::{FlowDetail, Message};
 use aitm_tui::snapshot::{render, to_ansi, to_svg, to_text};
 use aitm_tui::tokens::size::SIDEBAR_COLS;
 use aitm_tui::viewers;
+use aitm_tui::{fixture_app, fixture_app_core};
 use common::*;
 use crossterm::event::KeyCode;
 use serde_json::json;
 
-const GENEROUS: Duration = Duration::from_secs(2);
+/// Bound for the interactive paths over 5 000 flows (render, filter, palette).
+/// The plan's target is "a flow list of 5 000 rows rendering under 50 ms in
+/// `snapshot::render`"; these tests run unoptimised (debug), so the bound is
+/// 5× that. A regression that makes a frame cost the 250 ms tick still fails.
+const INTERACTIVE: Duration = Duration::from_millis(250);
+/// Bound for the 5 MB body paths only (pretty-print, tree, hex, a frame).
+const BULK: Duration = Duration::from_secs(2);
 
 // ------------------------------------------------------------- §2.6 shell
 
@@ -140,8 +146,11 @@ fn shell_regions_render_in_the_mockup_order_at_200x50() {
     .expect("intercept bar");
     let bar = lines[bar_y];
     assert!(bar.contains("· edited"), "f50 is edited: {bar}");
+    // The Kill hint names the one abort mode the bus has (fix pass 1, I1).
     assert!(
-        bar.contains("[a Resume] [A Resume all] [d Kill] [e Edit] [i Disarm]"),
+        bar.contains(
+            "[a Resume] [A Resume all] [d Kill · abort mode: reset (429/503 need F3)] [e Edit] [i Disarm]"
+        ),
         "{bar}"
     );
     let bar_style = theme().intercept_bar();
@@ -170,12 +179,15 @@ fn shell_regions_render_in_the_mockup_order_at_200x50() {
     assert!(summary.contains("TLS · h2"), "{summary}");
     assert!(summary.contains("client curl"), "{summary}");
     assert!(summary.contains("in scope"), "{summary}");
+    // Tab rows carry the F5-gated tabs as labelled placeholders (fix pass 1, I1).
     assert!(
-        text.contains("Request  Headers  Query  Body  Raw  Summary  Connection"),
+        text.contains(
+            "Request  Headers  Cookies (F5)  Query  Body  Raw  Summary  Timing (F5)  Connection"
+        ),
         "{text}"
     );
     assert!(
-        text.contains("Response  Headers  Body  Raw  JSON  Hex  Diff"),
+        text.contains("Response  Headers  Set-Cookie (F5)  Body  Raw  JSON  Hex  Diff"),
         "{text}"
     );
     assert!(
@@ -247,8 +259,6 @@ fn b_toggles_the_sidebar_and_the_list_reclaims_its_28_columns() {
 
 #[test]
 fn below_120_columns_enter_full_screens_the_inspector_and_esc_returns() {
-    assert_eq!(NARROW_COLS, 120);
-    assert_eq!(SPLIT_COLS, 160);
     let list_header = |text: &str| line_with(text, "URL").is_some_and(|l| l.contains("Method"));
 
     let mut app = fixture_app(100, 30);
@@ -767,7 +777,7 @@ fn five_thousand_flows_ingest_and_render_within_bounds() {
         ("filter", filter_time),
         ("palette", palette_time),
     ] {
-        assert!(d < GENEROUS, "{what} took {d:?}");
+        assert!(d < INTERACTIVE, "{what} took {d:?} (bound {INTERACTIVE:?})");
     }
 }
 
@@ -872,7 +882,7 @@ fn a_five_megabyte_json_body_renders_without_panicking() {
         ("tree_with_paths", tree_time),
         ("hex::dump", hex_time),
     ] {
-        assert!(d < GENEROUS, "{what} took {d:?}");
+        assert!(d < BULK, "{what} took {d:?}");
     }
 }
 
@@ -893,12 +903,50 @@ fn inspector_frames_with_a_five_megabyte_body_stay_under_two_seconds() {
         let d = t.elapsed();
         assert!(frame.contains("Response  Headers"), "{tab}: {frame}");
         let _ = write!(report, "{tab} {d:?}  ");
-        if d >= GENEROUS {
+        if d >= BULK {
             slow.push(format!("{tab} tab frame {d:?}"));
         }
     }
     eprintln!("tester: one inspector frame at 200×50 with a 5 MB body — {report}");
     assert!(slow.is_empty(), "{}", slow.join(", "));
+}
+
+/// The honest second snapshot (`aitm-tui --snapshot-core`): the fixture
+/// limited to the 22 commands the bus serves today (foundation §4.1), so the
+/// screen shows what an operator gets against the real core — no detail,
+/// agent or findings data, every F-gated surface in its degraded state.
+#[test]
+fn fixture_app_core_offers_exactly_the_22_core_tools_and_no_f_gated_data() {
+    let app = fixture_app_core(200, 50);
+    let mut names: Vec<&str> = app.tools.iter().map(|t| t.name.as_str()).collect();
+    names.sort_unstable();
+    let mut want: Vec<&str> = CORE_TOOLS.to_vec();
+    want.sort_unstable();
+    assert_eq!(names, want);
+    assert_eq!(app.tools.len(), 22);
+    for gated in ["flow.detail", "agent.status", "poc.list", "proxy.status"] {
+        assert!(!app.has_tool(gated), "{gated} is not a core tool");
+    }
+    assert_eq!(app.flows.len(), 14, "the same recorded flows");
+    assert!(
+        app.details.is_empty(),
+        "no flow.detail on the core bus, so no detail is loaded"
+    );
+    assert!(
+        app.flows
+            .iter()
+            .all(|f| f.duration_ms.is_none() && f.tls.is_none()),
+        "the F5 columns stay dashes"
+    );
+    assert!(app.findings.is_empty(), "poc.list is F-gated");
+    assert_eq!(app.agent.policy, None, "agent.status is F-gated");
+    assert_eq!(app.listening.as_deref(), Some("127.0.0.1:8080"));
+    assert_eq!(app.selected.as_deref(), Some("f50"));
+
+    // The full fixture is the richer one; the core one renders without panicking.
+    assert!(fixture_app(200, 50).tools.len() > 22);
+    let text = text_of(&app, 200, 50);
+    assert!(text.contains("10 / 14 rows"), "{text}");
 }
 
 #[test]

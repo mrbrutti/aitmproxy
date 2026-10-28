@@ -75,30 +75,9 @@ pub fn tools(names: &[&str]) -> Vec<ToolInfo> {
 }
 
 /// The 22 commands the bus serves today (foundation §4.1) — no F* tools.
-pub const CORE_TOOLS: &[&str] = &[
-    "flow.list",
-    "flow.get",
-    "flow.intercept",
-    "flow.resume",
-    "flow.kill",
-    "flow.mutate",
-    "flow.replay",
-    "request.send",
-    "scope.add",
-    "scope.list",
-    "browser.navigate",
-    "browser.click",
-    "browser.type",
-    "browser.screenshot",
-    "browser.eval",
-    "browser.get_dom",
-    "poc.build",
-    "poc.run",
-    "ca.export",
-    "ca.status",
-    "ca.install",
-    "ca.uninstall",
-];
+/// Every test binary compiles this module; not all of them use the list.
+#[allow(unused_imports)]
+pub use aitm_tui::CORE_TOOLS;
 
 /// A `flow.get` summary as the core shapes it (§4.3).
 pub fn summary(

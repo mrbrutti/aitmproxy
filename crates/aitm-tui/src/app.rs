@@ -6,21 +6,37 @@
 //! data on every platform").
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use serde_json::{json, Map, Value};
 
+use crate::action::ToolSchema as _;
 use crate::action::{Action, BusEvent, BusRequest, Level, ToolInfo};
 use crate::caps::TermCaps;
 use crate::filter::{self, Expr};
 use crate::model::{
-    counts_by, AgentPolicy, AgentState, Finding, FlowDetail, FlowKind, FlowRow, Message,
+    counts_by, scope_covers, AgentPolicy, AgentState, Finding, FlowDetail, FlowKind, FlowRow,
+    Message,
 };
+use crate::open::{self, OpenTarget};
 use crate::theme::Theme;
 use crate::viewers::json;
 
 /// Terminal widths below which the shell changes shape (§2.10(c)).
 pub const NARROW_COLS: u16 = 120;
+/// Two lists side by side need this many columns (§2.9); the split view
+/// itself is not built in this pass, so `:split` only says so.
 pub const SPLIT_COLS: u16 = 160;
+
+/// How many flow details the app keeps; past this the oldest non-selected
+/// ones are dropped (they are fetched again on demand).
+pub const MAX_DETAILS: usize = 2_000;
+
+/// Tools that ask the operator for a local `y/N` before they are sent
+/// (§4.2 step 4: the bus has no `confirm` on the wire until F1, and the
+/// TUI's server identity is `Frontend::Mcp`). `dry_run=true` bypasses.
+pub const CONFIRM_TOOLS: &[&str] = &["ca.install", "ca.uninstall"];
 
 /// Which screen owns the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +52,10 @@ pub enum Mode {
     Scope,
     Findings,
     Agent,
+    /// The CA panel (`:ca`): `ca.status` facts, export / install / uninstall.
+    Ca,
+    /// The browser view placeholder: not built yet, lists `:browser.*`.
+    Browser,
     Help,
     QuickLook,
 }
@@ -51,8 +71,28 @@ pub enum PromptKind {
     Mark,
     Pin,
     ScopeAdd,
+    /// `poc.build`: the finding's title (blank = none), then…
     PocName,
+    /// …the parameter to parameterize (blank = none).
+    PocParam,
+    /// `poc.run`: the base URL for `target` (blank = the PoC's own), then…
     PocTarget,
+    /// …`k=v …` variable bindings (blank = none).
+    PocVars,
+    /// `ca.export`: `[pem|der] [path]`.
+    CaExport,
+    /// `y/N` for a tool in [`CONFIRM_TOOLS`]; the call waits in `App::confirm`.
+    Confirm,
+}
+
+/// A tool call held back for the operator's `y/N`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfirmCall {
+    pub name: String,
+    pub description: String,
+    pub args: Value,
+    /// Where to go after the answer.
+    pub return_to: Mode,
 }
 
 /// Inspector placement; the TUI has horizontal and vertical only (§2.6).
@@ -225,9 +265,42 @@ pub enum Pane {
     Response,
 }
 
-/// Inspector tabs, in the foundation's order (§2.7).
-pub const REQUEST_TABS: [&str; 6] = ["Headers", "Query", "Body", "Raw", "Summary", "Connection"];
-pub const RESPONSE_TABS: [&str; 6] = ["Headers", "Body", "Raw", "JSON", "Hex", "Diff"];
+/// Inspector tabs, in the foundation's order (§2.7). `Cookies`, `Timing` and
+/// `Set-Cookie` wait on core follow-up F5 and render disabled with that label
+/// (see [`tab_follow_up`]); they are listed so the absence is never silent.
+pub const REQUEST_TABS: [&str; 8] = [
+    "Headers",
+    "Cookies",
+    "Query",
+    "Body",
+    "Raw",
+    "Summary",
+    "Timing",
+    "Connection",
+];
+pub const RESPONSE_TABS: [&str; 7] = [
+    "Headers",
+    "Set-Cookie",
+    "Body",
+    "Raw",
+    "JSON",
+    "Hex",
+    "Diff",
+];
+
+/// The core follow-up a tab waits on, if any.
+pub fn tab_follow_up(tab: &str) -> Option<&'static str> {
+    match tab {
+        "Cookies" | "Timing" | "Set-Cookie" => Some("F5"),
+        _ => None,
+    }
+}
+
+/// Index of `name` in `tabs` (0 when absent, which cannot happen for the
+/// constants above).
+fn tab_index(tabs: &[&str], name: &str) -> usize {
+    tabs.iter().position(|t| *t == name).unwrap_or(0)
+}
 
 /// Inspector view state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,7 +323,7 @@ impl Default for InspectorState {
         Self {
             pane: Pane::Request,
             request_tab: 0,
-            response_tab: 1,
+            response_tab: tab_index(&RESPONSE_TABS, "Body"),
             scroll: 0,
             cursor_line: 0,
             folds: HashSet::new(),
@@ -364,6 +437,37 @@ impl ComposeForm {
             body: String::new(),
             field: 1,
         }
+    }
+
+    /// `:compose post-json` (§2.7 "Templates: … POST JSON").
+    pub fn template_post_json() -> Self {
+        Self {
+            method: "POST".into(),
+            headers: "Content-Type: application/json".into(),
+            body: "{}".into(),
+            ..Self::template_get()
+        }
+    }
+
+    /// `:compose post-form` (§2.7 "Templates: … POST Form").
+    pub fn template_post_form() -> Self {
+        Self {
+            method: "POST".into(),
+            headers: "Content-Type: application/x-www-form-urlencoded".into(),
+            body: String::new(),
+            ..Self::template_get()
+        }
+    }
+
+    /// The template a `:compose <name>` argument names; `None` for an
+    /// unknown one. `ws` is not here: WebSocket inject is core follow-up F9.
+    pub fn template(name: &str) -> Option<Self> {
+        Some(match name {
+            "get" | "empty" => Self::template_get(),
+            "post-json" | "json" => Self::template_post_json(),
+            "post-form" | "form" => Self::template_post_form(),
+            _ => return None,
+        })
     }
 
     /// Prefill from a captured flow (Edit & repeat).
@@ -543,7 +647,12 @@ pub enum PaletteKind {
 #[derive(Debug, Clone)]
 pub struct App {
     pub flows: Vec<FlowRow>,
+    /// `flows[index[id]].id == id`; rebuilt whenever `flows` changes shape
+    /// (`on_bus(Flows)`), so row lookups are O(1).
+    pub index: HashMap<String, usize>,
     pub details: HashMap<String, FlowDetail>,
+    /// Flows whose `flow.detail` reply was malformed: not asked for again.
+    pub detail_failed: HashSet<String>,
     pub selected: Option<String>,
     pub next_seq: usize,
     pub mode: Mode,
@@ -582,13 +691,23 @@ pub struct App {
     pub list_offset: usize,
     /// Pending PoC build: the flow and the name typed so far.
     pub poc_pending: Option<(String, Option<String>)>,
+    /// Pending PoC run: the YAML path and the target typed so far.
+    pub poc_run_pending: Option<(String, Option<String>)>,
+    /// A tool call waiting for the operator's `y/N` (`Mode::Prompt(Confirm)`).
+    pub confirm: Option<ConfirmCall>,
+    /// What `o` asked to open; the run loop takes it with [`App::take_open_target`].
+    pub pending_open: Option<OpenTarget>,
+    /// The last `ca.status` result, for the CA panel.
+    pub ca_status: Option<Value>,
 }
 
 impl App {
     pub fn new(caps: TermCaps, bus_address: impl Into<String>) -> Self {
         Self {
             flows: Vec::new(),
+            index: HashMap::new(),
             details: HashMap::new(),
+            detail_failed: HashSet::new(),
             selected: None,
             next_seq: 1,
             mode: Mode::Flows,
@@ -625,6 +744,10 @@ impl App {
             should_quit: false,
             list_offset: 0,
             poc_pending: None,
+            poc_run_pending: None,
+            confirm: None,
+            pending_open: None,
+            ca_status: None,
         }
     }
 
@@ -639,8 +762,41 @@ impl App {
         self.width < NARROW_COLS
     }
 
+    /// The bus is on this machine: loopback TCP or the in-process channel.
+    /// Local paths the bus reports (`poc_path`) are only meaningful then.
+    pub fn is_loopback_bus(&self) -> bool {
+        self.bus_address == "in-process"
+            || self
+                .bus_address
+                .parse::<SocketAddr>()
+                .is_ok_and(|a| a.ip().is_loopback())
+    }
+
+    /// Rebuild `index` from `flows`.
+    fn rebuild_index(&mut self) {
+        self.index = self
+            .flows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.id.clone(), i))
+            .collect();
+    }
+
     pub fn row(&self, id: &str) -> Option<&FlowRow> {
-        self.flows.iter().find(|r| r.id == id)
+        self.index
+            .get(id)
+            .and_then(|&i| self.flows.get(i))
+            .filter(|r| r.id == id)
+    }
+
+    pub fn row_mut(&mut self, id: &str) -> Option<&mut FlowRow> {
+        let i = *self.index.get(id)?;
+        self.flows.get_mut(i).filter(|r| r.id == id)
+    }
+
+    /// What `o` asked to open, once; the run loop performs it.
+    pub fn take_open_target(&mut self) -> Option<OpenTarget> {
+        self.pending_open.take()
     }
 
     pub fn selected_row(&self) -> Option<&FlowRow> {
@@ -920,6 +1076,9 @@ impl App {
             }
             Action::Help => self.mode = Mode::Help,
             Action::Back => self.back(),
+            Action::Input(c) if self.mode == Mode::Prompt(PromptKind::Confirm) => {
+                out.extend(self.answer_confirm(matches!(c, 'y' | 'Y')));
+            }
             Action::Input(c) => self.input(c),
             Action::Backspace => match self.mode {
                 Mode::Compose => {
@@ -997,8 +1156,8 @@ impl App {
                 _ => {}
             },
             Action::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
-            Action::SidebarNext => self.sidebar_step(1, &mut out),
-            Action::SidebarPrev => self.sidebar_step(-1, &mut out),
+            Action::SidebarNext => self.sidebar_step(1),
+            Action::SidebarPrev => self.sidebar_step(-1),
             Action::ChipNext => self.chip = step(&Chip::ALL, self.chip, 1),
             Action::ChipPrev => self.chip = step(&Chip::ALL, self.chip, -1),
             Action::ChipIndex(i) => {
@@ -1040,10 +1199,23 @@ impl App {
                 if ids.is_empty() {
                     self.toast(Level::Info, "Nothing paused.");
                 }
+                let mut skipped = 0usize;
+                let mut sent = 0usize;
                 for r in ids {
                     if self.in_scope(&r) {
                         out.push(BusRequest::Resume(r.id));
+                        sent += 1;
+                    } else {
+                        skipped += 1;
                     }
+                }
+                if skipped > 0 {
+                    self.toast(
+                        Level::Warn,
+                        format!(
+                            "Resume all: {sent} resumed, {skipped} skipped — out of scope (add their hosts to scope to act)"
+                        ),
+                    );
                 }
             }
             Action::Kill => {
@@ -1076,7 +1248,7 @@ impl App {
                         self.selected = Some(r.id.clone());
                         self.mode = Mode::Edit;
                         self.inspector.pane = Pane::Request;
-                        self.inspector.request_tab = 3;
+                        self.inspector.request_tab = tab_index(&REQUEST_TABS, "Raw");
                     }
                     None => {
                         self.toast(Level::Warn, "Raw edit needs the request detail (core follow-up F5); headers-only edit via :flow.mutate");
@@ -1191,12 +1363,7 @@ impl App {
                     self.toast(Level::Info, "No node on this line to copy");
                 }
             }
-            Action::OpenExternally => {
-                self.toast(
-                    Level::Info,
-                    "Opening externally is deferred to the shell: see the status bar path",
-                );
-            }
+            Action::OpenExternally => self.open_externally(),
             Action::OpenFindings => {
                 self.mode = Mode::Findings;
                 self.sidebar = SidebarItem::Findings;
@@ -1270,6 +1437,145 @@ impl App {
         }
     }
 
+    /// `o`: hand the thing under the cursor to the desktop (§2.9). In the
+    /// Findings panel that is the screenshot; elsewhere an image or large
+    /// body, written to a private temp file first. Anything the terminal can
+    /// show inline is not opened, and the toast says so.
+    fn open_externally(&mut self) {
+        if self.mode == Mode::Findings {
+            let Some(f) = self.findings.get(self.finding_cursor) else {
+                return;
+            };
+            match &f.screenshot_path {
+                Some(p) => {
+                    let path = PathBuf::from(p);
+                    self.toast(Level::Info, format!("opening screenshot {p}"));
+                    self.pending_open = Some(OpenTarget {
+                        path,
+                        label: "screenshot".into(),
+                    });
+                }
+                None => self.toast(Level::Info, "this finding has no screenshot to open"),
+            }
+            return;
+        }
+        let Some(row) = self.selected_row() else {
+            self.toast(
+                Level::Info,
+                "o opens the selected flow's image or large body",
+            );
+            return;
+        };
+        let id = row.id.clone();
+        let Some(d) = self.details.get(&id) else {
+            self.toast(
+                Level::Warn,
+                "o needs the flow's detail (core follow-up F5, flow.detail)",
+            );
+            return;
+        };
+        // The focused pane in the inspector; the response (else request) otherwise.
+        let (which, msg) = match (self.mode, self.inspector.pane) {
+            (Mode::Inspector | Mode::Edit, Pane::Request) => ("request", d.request.as_ref()),
+            (Mode::Inspector | Mode::Edit, Pane::Response) => ("response", d.response.as_ref()),
+            _ => match (&d.response, &d.request) {
+                (Some(r), _) => ("response", Some(r)),
+                (None, req) => ("request", req.as_ref()),
+            },
+        };
+        let Some(msg) = msg else {
+            self.toast(Level::Info, format!("no {which} body to open"));
+            return;
+        };
+        let ct = msg.content_type().unwrap_or_default();
+        let ext = if ct.starts_with("image/") {
+            match ct.as_str() {
+                "image/png" => "png",
+                "image/jpeg" | "image/jpg" => "jpg",
+                "image/gif" => "gif",
+                "image/webp" => "webp",
+                _ => "bin",
+            }
+        } else if crate::viewers::is_large(msg) {
+            if msg.body_text().is_some() {
+                "txt"
+            } else {
+                "bin"
+            }
+        } else {
+            self.toast(
+                Level::Info,
+                "o opens images and large bodies; this body is shown inline",
+            );
+            return;
+        };
+        match open::body_to_temp_file(&id, ext, &msg.body) {
+            Ok(path) => {
+                self.toast(Level::Info, format!("wrote {} — opening", path.display()));
+                self.pending_open = Some(OpenTarget {
+                    path,
+                    label: format!("{id} {which} body"),
+                });
+            }
+            Err(e) => self.toast(Level::Error, format!("could not write the body: {e}")),
+        }
+    }
+
+    /// Hold `name(args)` for a `y/N` when it is in [`CONFIRM_TOOLS`] (and not
+    /// a dry run); otherwise send it.
+    fn call_tool(&mut self, name: &str, args: Value) -> Vec<BusRequest> {
+        // `dry_run=true` typed at the prompt is a string unless the schema
+        // types it; both spellings bypass.
+        let dry_run = match args.get("dry_run") {
+            Some(Value::Bool(b)) => *b,
+            Some(Value::String(s)) => s.eq_ignore_ascii_case("true"),
+            _ => false,
+        };
+        if CONFIRM_TOOLS.contains(&name) && !dry_run {
+            let description = self
+                .tools
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.description.clone())
+                .unwrap_or_default();
+            let return_to = match self.mode {
+                Mode::Prompt(_) => Mode::Flows,
+                other => other,
+            };
+            self.confirm = Some(ConfirmCall {
+                name: name.to_string(),
+                description,
+                args,
+                return_to,
+            });
+            self.open_prompt(PromptKind::Confirm);
+            return Vec::new();
+        }
+        vec![BusRequest::Call {
+            name: name.to_string(),
+            args,
+        }]
+    }
+
+    /// The operator answered the confirm prompt.
+    fn answer_confirm(&mut self, yes: bool) -> Vec<BusRequest> {
+        self.prompt.clear();
+        let Some(c) = self.confirm.take() else {
+            self.mode = Mode::Flows;
+            return Vec::new();
+        };
+        self.mode = c.return_to;
+        if yes {
+            vec![BusRequest::Call {
+                name: c.name,
+                args: c.args,
+            }]
+        } else {
+            self.toast(Level::Info, format!("{} cancelled", c.name));
+            Vec::new()
+        }
+    }
+
     fn back(&mut self) {
         self.mode = match self.mode {
             Mode::Edit => {
@@ -1279,6 +1585,19 @@ impl App {
             Mode::Prompt(PromptKind::Filter) => {
                 self.prompt.clear();
                 Mode::Flows
+            }
+            Mode::Prompt(PromptKind::Confirm) => {
+                let _ = self.answer_confirm(false);
+                return;
+            }
+            Mode::Prompt(PromptKind::CaExport) => {
+                self.prompt.clear();
+                Mode::Ca
+            }
+            Mode::Prompt(PromptKind::PocTarget | PromptKind::PocVars) => {
+                self.prompt.clear();
+                self.poc_run_pending = None;
+                Mode::Findings
             }
             Mode::Prompt(_) => {
                 self.prompt.clear();
@@ -1359,10 +1678,7 @@ impl App {
                             return out;
                         }
                         self.mode = Mode::Flows;
-                        out.push(BusRequest::Call {
-                            name,
-                            args: json!({}),
-                        });
+                        out.extend(self.call_tool(&name, json!({})));
                     }
                     Some(PaletteItem {
                         kind: PaletteKind::Command(cmd),
@@ -1421,27 +1737,82 @@ impl App {
                 self.mode = Mode::Scope;
                 self.prompt.clear();
             }
-            Mode::Prompt(PromptKind::PocName) => {
-                if let Some((id, _)) = self.poc_pending.take() {
-                    let name = (!text.is_empty()).then_some(text);
+            // `poc.build`: name, then param (§2.7 "Build PoC from flow … name, parameter").
+            Mode::Prompt(PromptKind::PocName) => match self.poc_pending.take() {
+                Some((id, _)) => {
+                    self.poc_pending = Some((id, (!text.is_empty()).then_some(text)));
+                    self.open_prompt(PromptKind::PocParam);
+                }
+                None => self.mode = Mode::Flows,
+            },
+            Mode::Prompt(PromptKind::PocParam) => {
+                if let Some((id, name)) = self.poc_pending.take() {
                     out.push(BusRequest::PocBuild {
                         flow_id: id,
                         name,
-                        param: None,
+                        param: (!text.is_empty()).then_some(text),
                     });
                 }
                 self.mode = Mode::Flows;
                 self.prompt.clear();
             }
-            Mode::Prompt(PromptKind::PocTarget) => {
-                if let Some(f) = self.findings.get(self.finding_cursor) {
-                    out.push(BusRequest::PocRun {
-                        poc_path: f.poc_path.clone(),
-                        target: (!text.is_empty()).then_some(text),
-                    });
+            // `poc.run`: target, then vars (§2.7 "Run again … editable target/vars").
+            Mode::Prompt(PromptKind::PocTarget) => match self.poc_run_pending.take() {
+                Some((path, _)) => {
+                    self.poc_run_pending = Some((path, (!text.is_empty()).then_some(text)));
+                    self.open_prompt(PromptKind::PocVars);
+                }
+                None => self.mode = Mode::Findings,
+            },
+            Mode::Prompt(PromptKind::PocVars) => {
+                let Some((poc_path, target)) = self.poc_run_pending.take() else {
+                    self.mode = Mode::Findings;
+                    self.prompt.clear();
+                    return out;
+                };
+                match parse_kv_args(&text, None) {
+                    Ok(Value::Object(m)) if m.is_empty() => out.push(BusRequest::PocRun {
+                        poc_path,
+                        target,
+                        vars: None,
+                    }),
+                    Ok(vars) => out.push(BusRequest::PocRun {
+                        poc_path,
+                        target,
+                        vars: Some(vars),
+                    }),
+                    Err(e) => {
+                        // Keep the prompt open with the pending run intact.
+                        self.poc_run_pending = Some((poc_path, target));
+                        self.toast(Level::Error, format!("vars: {e}"));
+                        return out;
+                    }
                 }
                 self.mode = Mode::Findings;
                 self.prompt.clear();
+            }
+            Mode::Prompt(PromptKind::CaExport) => {
+                let mut args = Map::new();
+                let mut words = text.split_whitespace();
+                match words.next() {
+                    Some(fmt @ ("pem" | "der")) => {
+                        args.insert("format".into(), Value::String(fmt.to_string()));
+                    }
+                    Some(path) => {
+                        args.insert("out".into(), Value::String(path.to_string()));
+                    }
+                    None => {}
+                }
+                if let Some(path) = words.next() {
+                    args.insert("out".into(), Value::String(path.to_string()));
+                }
+                self.mode = Mode::Ca;
+                self.prompt.clear();
+                out.extend(self.call_tool("ca.export", Value::Object(args)));
+            }
+            Mode::Prompt(PromptKind::Confirm) => {
+                let yes = matches!(text.to_ascii_lowercase().as_str(), "y" | "yes");
+                out.extend(self.answer_confirm(yes));
             }
             Mode::Compose => {
                 if self.compose.field < 3 {
@@ -1586,16 +1957,14 @@ impl App {
         }
     }
 
-    fn sidebar_step(&mut self, d: i32, out: &mut Vec<BusRequest>) {
+    /// `]`/`[`: the Scope item filters the list (§2.7 "The flow list's
+    /// `Scope` sidebar item filters to in-scope"); the panel is `S`/`:scope`.
+    fn sidebar_step(&mut self, d: i32) {
         self.sidebar = step(&SidebarItem::ALL, self.sidebar, d);
         match self.sidebar {
             SidebarItem::Findings => self.mode = Mode::Findings,
-            SidebarItem::Scope => self.mode = Mode::Scope,
             SidebarItem::Agent => self.mode = Mode::Agent,
-            SidebarItem::Browser => {
-                self.mode = Mode::Flows;
-                self.toast(Level::Info, "Browser view: URL/DOM/navigate via :browser.* (viewport is core follow-up F14)");
-            }
+            SidebarItem::Browser => self.mode = Mode::Browser,
             SidebarItem::Scripts => {
                 self.mode = Mode::Flows;
                 self.toast(Level::Info, "Scripts arrive with M3 (core follow-up F8)");
@@ -1606,7 +1975,6 @@ impl App {
             }
             _ => self.mode = Mode::Flows,
         }
-        let _ = out;
     }
 
     fn tab_step(&mut self, d: i32) {
@@ -1620,8 +1988,51 @@ impl App {
 
     fn ensure_detail(&mut self, out: &mut Vec<BusRequest>) {
         if let Some(id) = &self.selected {
-            if !self.details.contains_key(id) && self.has_tool("flow.detail") {
+            if !self.details.contains_key(id)
+                && !self.detail_failed.contains(id)
+                && self.has_tool("flow.detail")
+            {
                 out.push(BusRequest::Detail(id.clone()));
+            }
+        }
+    }
+
+    /// Drop details for flows that are gone, then cap the map at
+    /// [`MAX_DETAILS`] by evicting the oldest non-selected ones.
+    fn prune_details(&mut self, seen: &HashSet<String>) {
+        self.details.retain(|id, _| seen.contains(id));
+        if self.details.len() <= MAX_DETAILS {
+            return;
+        }
+        let selected = self.selected.clone();
+        let mut over = self.details.len() - MAX_DETAILS;
+        for r in &self.flows {
+            if over == 0 {
+                break;
+            }
+            if selected.as_deref() == Some(r.id.as_str()) {
+                continue;
+            }
+            if self.details.remove(&r.id).is_some() {
+                over -= 1;
+            }
+        }
+    }
+
+    /// Read the YAML of findings that came without one from `poc_path`, which
+    /// only names a file on this machine when the bus is local (§2.7 "PoC
+    /// panel … the YAML").
+    fn fill_finding_yaml(&mut self) {
+        if !self.is_loopback_bus() {
+            return;
+        }
+        for f in &mut self.findings {
+            if f.yaml.is_some() || f.yaml_error.is_some() {
+                continue;
+            }
+            match std::fs::read_to_string(&f.poc_path) {
+                Ok(y) => f.yaml = Some(y),
+                Err(e) => f.yaml_error = Some(e.to_string()),
             }
         }
     }
@@ -1693,7 +2104,52 @@ impl App {
             })),
             "kill" => out.extend(self.update(Action::Kill)),
             "replay" | "repeat" => out.extend(self.update(Action::Replay)),
-            "compose" | "new" => out.extend(self.update(Action::Compose)),
+            // `:compose` prefills from the selection; `:compose <template>`
+            // starts from a template (§2.7 "Templates").
+            "compose" | "new" if rest.is_empty() => out.extend(self.update(Action::Compose)),
+            "compose" | "new" => match rest {
+                "ws" | "websocket" => self.toast(
+                    Level::Warn,
+                    "WebSocket compose needs core follow-up F9 (ws.inject)",
+                ),
+                other => match ComposeForm::template(other) {
+                    Some(f) => {
+                        self.compose = f;
+                        self.mode = Mode::Compose;
+                    }
+                    None => self.toast(
+                        Level::Error,
+                        format!(
+                            "unknown compose template `{other}` (get · post-json · post-form · ws)"
+                        ),
+                    ),
+                },
+            },
+            "split" => self.toast(
+                Level::Info,
+                format!("split view: not built in this pass (needs ≥ {SPLIT_COLS} cols)"),
+            ),
+            "export" => self.toast(
+                Level::Warn,
+                "Export needs core follow-up F10 (flow.export); findings export F13",
+            ),
+            "ca" => {
+                self.mode = Mode::Ca;
+                if self.has_tool("ca.status") {
+                    out.push(BusRequest::Call {
+                        name: "ca.status".into(),
+                        args: json!({}),
+                    });
+                }
+            }
+            "ca-export-prompt" => {
+                if self.has_tool("ca.export") {
+                    self.open_prompt(PromptKind::CaExport);
+                } else {
+                    self.toast(Level::Warn, "ca.export is not on this bus");
+                }
+            }
+            "browser" => self.mode = Mode::Browser,
             "curl" => match ComposeForm::from_curl(line) {
                 Some(f) => {
                     self.compose = f;
@@ -1737,6 +2193,7 @@ impl App {
                     out.push(BusRequest::PocRun {
                         poc_path: path,
                         target,
+                        vars: None,
                     });
                 } else if rest == "build" {
                     out.extend(self.update(Action::BuildPoc));
@@ -1751,9 +2208,9 @@ impl App {
                 }
             }
             "poc-rerun" => {
-                if self.findings.get(self.finding_cursor).is_some() {
-                    self.prompt.clear();
-                    self.mode = Mode::Prompt(PromptKind::PocTarget);
+                if let Some(f) = self.findings.get(self.finding_cursor) {
+                    self.poc_run_pending = Some((f.poc_path.clone(), None));
+                    self.open_prompt(PromptKind::PocTarget);
                 }
             }
             "scope-prompt" => self.open_prompt(PromptKind::ScopeAdd),
@@ -1767,10 +2224,7 @@ impl App {
             "refresh" => out.push(BusRequest::Refresh),
             tool if self.has_tool(tool) => {
                 match parse_kv_args(rest, self.tools.iter().find(|t| t.name == tool)) {
-                    Ok(args) => out.push(BusRequest::Call {
-                        name: tool.to_string(),
-                        args,
-                    }),
+                    Ok(args) => out.extend(self.call_tool(tool, args)),
                     Err(e) => self.toast(Level::Error, format!("{tool}: {e}")),
                 }
             }
@@ -1809,13 +2263,15 @@ impl App {
             }
             BusEvent::Flows(summaries) => {
                 let had = self.flows.len();
-                let mut seen: HashSet<String> = HashSet::new();
+                let can_detail = self.has_tool("flow.detail");
+                let mut seen: HashSet<String> = HashSet::with_capacity(summaries.len());
                 for s in &summaries {
                     let Some(id) = s.get("id").and_then(Value::as_str) else {
                         continue;
                     };
                     seen.insert(id.to_string());
-                    if let Some(existing) = self.flows.iter_mut().find(|r| r.id == id) {
+                    if let Some(&i) = self.index.get(id) {
+                        let existing = &mut self.flows[i];
                         if let Some(fresh) = FlowRow::from_summary(s, existing.seq) {
                             let changed = fresh.status != existing.status
                                 || fresh.intercept != existing.intercept;
@@ -1825,20 +2281,28 @@ impl App {
                             existing.ws_messages = fresh.ws_messages.or(existing.ws_messages);
                             if changed
                                 && self.details.remove(id).is_some()
-                                && self.has_tool("flow.detail")
+                                && can_detail
+                                && !self.detail_failed.contains(id)
                             {
                                 out.push(BusRequest::Detail(id.to_string()));
                             }
                         }
                     } else if let Some(row) = FlowRow::from_summary(s, self.next_seq) {
                         self.next_seq += 1;
-                        if self.has_tool("flow.detail") {
+                        if can_detail && !self.detail_failed.contains(&row.id) {
                             out.push(BusRequest::Detail(row.id.clone()));
                         }
+                        self.index.insert(row.id.clone(), self.flows.len());
                         self.flows.push(row);
                     }
                 }
+                let before = self.flows.len();
                 self.flows.retain(|r| seen.contains(&r.id));
+                if self.flows.len() != before {
+                    self.rebuild_index();
+                }
+                self.prune_details(&seen);
+                self.detail_failed.retain(|id| seen.contains(id));
                 if self
                     .selected
                     .as_deref()
@@ -1853,10 +2317,18 @@ impl App {
                 }
             }
             BusEvent::Detail(d) => {
-                if let Some(row) = self.flows.iter_mut().find(|r| r.id == d.id) {
+                if let Some(row) = self.row_mut(&d.id) {
                     row.apply_detail(&d);
                 }
+                self.detail_failed.remove(&d.id);
                 self.details.insert(d.id.clone(), *d);
+            }
+            BusEvent::DetailFailed(id) => {
+                self.toast(
+                    Level::Warn,
+                    format!("flow.detail {id}: malformed reply — not asking again"),
+                );
+                self.detail_failed.insert(id);
             }
             BusEvent::Intercept(armed) => self.intercept_armed = armed,
             BusEvent::Scope(entries) => self.scope = entries,
@@ -1865,6 +2337,7 @@ impl App {
                 self.finding_cursor = self
                     .finding_cursor
                     .min(self.findings.len().saturating_sub(1));
+                self.fill_finding_yaml();
             }
             BusEvent::Agent(a) => self.agent = a,
             BusEvent::CallOk { name, value } => {
@@ -1890,6 +2363,29 @@ impl App {
                             self.toast(Level::Info, format!("PoC {verdict}: {}", f.title));
                             self.findings.insert(0, f);
                             self.finding_cursor = 0;
+                            self.fill_finding_yaml();
+                        }
+                    }
+                    "ca.status" => {
+                        self.ca_status = Some(value);
+                        return out;
+                    }
+                    "ca.export" => self.toast(
+                        Level::Info,
+                        format!("CA exported: {}", value.as_str().unwrap_or("ok")),
+                    ),
+                    "ca.install" | "ca.uninstall" => {
+                        let text = match &value {
+                            Value::String(s) => s.clone(),
+                            Value::Null => "ok".into(),
+                            other => other.to_string(),
+                        };
+                        self.toast(Level::Info, format!("{name}: {text}"));
+                        if self.has_tool("ca.status") {
+                            out.push(BusRequest::Call {
+                                name: "ca.status".into(),
+                                args: json!({}),
+                            });
                         }
                     }
                     "flow.mutate" => self.toast(Level::Info, "Edit applied"),
@@ -1921,12 +2417,8 @@ impl App {
                 out.push(BusRequest::Refresh);
             }
             BusEvent::Toast(level, text) => self.toast(level, text),
-            BusEvent::Notification(v) => {
-                if let Some(paused) = v.pointer("/params/paused").and_then(Value::as_u64) {
-                    let _ = paused;
-                }
-                out.push(BusRequest::Refresh);
-            }
+            // An F4 push: whatever it says, the list is stale; poll now.
+            BusEvent::Notification(_) => out.push(BusRequest::Refresh),
         }
         out
     }
@@ -1943,6 +2435,10 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
         "compose",
         "Compose a request, prefilled from the selection (n)",
     ),
+    (
+        "compose get|post-json|post-form|ws",
+        "Compose from a template (ws needs F9)",
+    ),
     ("curl <command>", "Import a curl command line into compose"),
     ("filter <expr>", "Set the filter expression (/)"),
     (
@@ -1955,7 +2451,14 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("poc run <path> [target]", "Run a PoC YAML"),
     ("agent all|readonly|paused", "Set the agent policy"),
     ("agent", "Open the agent panel and activity log"),
+    ("ca", "CA panel: status, export, install, uninstall"),
+    (
+        "browser",
+        "Browser view (not built yet): the :browser.* commands",
+    ),
     ("layout h|v", "Inspector below or right"),
+    ("split", "Split view (not built in this pass)"),
+    ("export", "Export flows (needs F10)"),
     ("sidebar", "Toggle the sidebar (b)"),
     ("pin [host]", "Pin a host to the top of the list (p)"),
     ("import <path>", "Import HAR / mitmproxy / Proxyman flows"),
@@ -1968,20 +2471,6 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("help", "Keys and commands"),
     ("quit", "Leave the TUI"),
 ];
-
-/// Whether `authority` is covered by any scope entry.
-pub fn scope_covers(scope: &[String], authority: &str) -> bool {
-    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
-    scope.iter().any(|e| {
-        if let Some(suffix) = e.strip_prefix("*.") {
-            host == suffix || host.ends_with(&format!(".{suffix}"))
-        } else if e.contains(':') {
-            e == authority
-        } else {
-            e == host
-        }
-    })
-}
 
 /// Subsequence match: every char of `needle` appears in order in `hay`.
 pub fn fuzzy(needle: &str, hay: &str) -> bool {
@@ -2417,21 +2906,580 @@ mod tests {
         assert!(ComposeForm::from_curl("wget https://a.test").is_none());
     }
 
+    // ------------------------------------------------- fix pass 1 (panel)
+
+    /// S1 / I2: `ca.install` and `ca.uninstall` wait for a local `y/N`; `n`
+    /// and Esc cancel with a toast; `dry_run=true` goes straight through.
     #[test]
-    fn scope_matching_rules() {
-        let s = vec![
-            "api.test".to_string(),
-            "*.shop.test".to_string(),
-            "h.test:8443".to_string(),
-        ];
-        assert!(scope_covers(&s, "api.test"));
-        assert!(scope_covers(&s, "api.test:443"));
-        assert!(scope_covers(&s, "shop.test"));
-        assert!(scope_covers(&s, "a.b.shop.test"));
-        assert!(scope_covers(&s, "h.test:8443"));
-        assert!(!scope_covers(&s, "h.test"));
-        assert!(!scope_covers(&s, "notshop.test"));
-        assert!(!scope_covers(&[], "api.test"));
+    fn confirm_tools_wait_for_y_and_cancel_on_n_or_esc() {
+        let mut app = app_with_flows();
+        app.tools
+            .extend(tools(&["ca.install", "ca.uninstall", "ca.status"]));
+        app.tools
+            .iter_mut()
+            .find(|t| t.name == "ca.install")
+            .unwrap()
+            .description = "Install the CA into the OS trust store (confirmed).".into();
+        // From the palette: nothing reaches the bus until `y`.
+        let _ = app.update(Action::PaletteOpen);
+        for c in "ca.install".chars() {
+            let _ = app.update(Action::Input(c));
+        }
+        assert!(app.update(Action::Submit).is_empty());
+        assert_eq!(app.mode, Mode::Prompt(PromptKind::Confirm));
+        let c = app.confirm.as_ref().expect("held call");
+        assert_eq!(c.name, "ca.install");
+        assert_eq!(
+            c.description,
+            "Install the CA into the OS trust store (confirmed)."
+        );
+        assert_eq!(
+            app.update(Action::Input('y')),
+            vec![BusRequest::Call {
+                name: "ca.install".into(),
+                args: json!({})
+            }]
+        );
+        assert_eq!(app.mode, Mode::Flows);
+        assert!(app.confirm.is_none());
+        // `n` cancels with a toast.
+        assert!(app.run_command("ca.uninstall").is_empty());
+        assert_eq!(app.mode, Mode::Prompt(PromptKind::Confirm));
+        assert!(app.update(Action::Input('n')).is_empty());
+        assert_eq!(app.mode, Mode::Flows);
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("ca.uninstall cancelled")
+        );
+        // Esc cancels too.
+        assert!(app.run_command("ca.install").is_empty());
+        assert!(app.update(Action::Back).is_empty());
+        assert_eq!(app.mode, Mode::Flows);
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("ca.install cancelled")
+        );
+        // Enter on the empty prompt is "N"; typing `yes` then Enter is yes.
+        assert!(app.run_command("ca.install").is_empty());
+        assert!(app.update(Action::Submit).is_empty());
+        assert_eq!(app.mode, Mode::Flows);
+        // `dry_run=true` bypasses the prompt.
+        assert_eq!(
+            app.run_command("ca.install dry_run=true"),
+            vec![BusRequest::Call {
+                name: "ca.install".into(),
+                args: json!({"dry_run": "true"})
+            }]
+        );
+        assert_eq!(app.mode, Mode::Flows);
+        // From the CA panel the answer returns to the panel.
+        let _ = app.run_command("ca");
+        assert_eq!(app.mode, Mode::Ca);
+        assert!(app.update(Action::Command("ca.install".into())).is_empty());
+        assert_eq!(app.mode, Mode::Prompt(PromptKind::Confirm));
+        assert_eq!(app.update(Action::Input('y')).len(), 1);
+        assert_eq!(app.mode, Mode::Ca);
+        // Unconfirmed tools are unchanged.
+        assert_eq!(
+            app.run_command("flow.replay id=f1"),
+            vec![BusRequest::Call {
+                name: "flow.replay".into(),
+                args: json!({"id": "f1"})
+            }]
+        );
+    }
+
+    /// I2: `:ca` opens the panel and asks `ca.status`; the result fills it;
+    /// `e` prompts for format/path and calls `ca.export`.
+    #[test]
+    fn ca_panel_shows_status_and_exports() {
+        let mut app = app_with_flows();
+        assert_eq!(app.run_command("ca"), vec![], "no ca.status on this bus");
+        assert_eq!(app.mode, Mode::Ca);
+        app.tools.extend(tools(&["ca.status", "ca.export"]));
+        assert_eq!(
+            app.run_command("ca"),
+            vec![BusRequest::Call {
+                name: "ca.status".into(),
+                args: json!({})
+            }]
+        );
+        let reqs = app.on_bus(BusEvent::CallOk {
+            name: "ca.status".into(),
+            value: json!({"path": "/tmp/ca.pem", "fingerprint": "AB:CD", "installed": false}),
+        });
+        assert!(
+            reqs.is_empty(),
+            "a status reply is not a mutation: no refresh"
+        );
+        assert_eq!(app.ca_status.as_ref().unwrap()["fingerprint"], "AB:CD");
+        let _ = app.update(Action::Command("ca-export-prompt".into()));
+        assert_eq!(app.mode, Mode::Prompt(PromptKind::CaExport));
+        for c in "der /tmp/out.der".chars() {
+            let _ = app.update(Action::Input(c));
+        }
+        assert_eq!(
+            app.update(Action::Submit),
+            vec![BusRequest::Call {
+                name: "ca.export".into(),
+                args: json!({"format": "der", "out": "/tmp/out.der"})
+            }]
+        );
+        assert_eq!(app.mode, Mode::Ca);
+        let _ = app.update(Action::Command("ca-export-prompt".into()));
+        assert_eq!(
+            app.update(Action::Submit),
+            vec![BusRequest::Call {
+                name: "ca.export".into(),
+                args: json!({})
+            }],
+            "blank = defaults"
+        );
+        let _ = app.update(Action::Back);
+        assert_eq!(app.mode, Mode::Flows);
+    }
+
+    /// S3: details follow the flows (vanished rows drop theirs) and never
+    /// exceed `MAX_DETAILS`; the selected flow's detail survives the cap.
+    #[test]
+    fn details_are_pruned_with_the_flows_and_capped() {
+        let mut app = App::new(TermCaps::full(), "x");
+        app.tools = tools(&["flow.list", "flow.get", "flow.detail"]);
+        let n = MAX_DETAILS + 150;
+        let summaries: Vec<Value> = (0..n)
+            .map(|i| {
+                summary(
+                    &format!("f{i}"),
+                    "GET",
+                    "h.test",
+                    "/p",
+                    Some(200),
+                    "observed",
+                )
+            })
+            .collect();
+        let _ = app.on_bus(BusEvent::Flows(summaries.clone()));
+        app.selected = Some("f3".into());
+        for i in 0..n {
+            let d = FlowDetail::from_json(&json!({"id": format!("f{i}"), "kind": "http"})).unwrap();
+            let _ = app.on_bus(BusEvent::Detail(Box::new(d)));
+        }
+        assert_eq!(app.details.len(), n, "details arrive unbounded…");
+        let _ = app.on_bus(BusEvent::Flows(summaries.clone()));
+        assert_eq!(
+            app.details.len(),
+            MAX_DETAILS,
+            "…and are capped on the next poll"
+        );
+        assert!(
+            app.details.contains_key("f3"),
+            "the selected flow keeps its detail"
+        );
+        assert!(
+            !app.details.contains_key("f0"),
+            "the oldest unselected go first"
+        );
+        assert!(app.details.contains_key(&format!("f{}", n - 1)));
+        // A vanished flow takes its detail with it.
+        let _ = app.on_bus(BusEvent::Flows(summaries[1..].to_vec()));
+        assert!(!app.details.contains_key("f0"));
+        assert!(app.row("f0").is_none());
+        assert_eq!(app.row("f1").map(|r| r.seq), Some(2));
+    }
+
+    /// Q6: `index` keeps `flows[index[id]].id == id` through merges and
+    /// evictions, so `row()` is a map lookup.
+    #[test]
+    fn index_tracks_flows_through_merges_and_evictions() {
+        let mut app = app_with_flows();
+        let check = |app: &App| {
+            assert_eq!(app.index.len(), app.flows.len());
+            for (id, &i) in &app.index {
+                assert_eq!(&app.flows[i].id, id);
+            }
+        };
+        check(&app);
+        assert_eq!(app.row("f2").map(|r| r.seq), Some(2));
+        let _ = app.on_bus(BusEvent::Flows(vec![
+            summary(
+                "f3",
+                "POST",
+                "auth.shop-staging.test",
+                "/l",
+                Some(200),
+                "resumed",
+            ),
+            summary(
+                "f4",
+                "GET",
+                "api.shop-staging.test",
+                "/me",
+                None,
+                "observed",
+            ),
+        ]));
+        check(&app);
+        assert!(app.row("f1").is_none());
+        assert_eq!(app.row("f4").map(|r| r.seq), Some(4));
+        assert_eq!(app.row("f3").and_then(|r| r.status), Some(200));
+        let d = FlowDetail::from_json(&json!({"id":"f4","kind":"http",
+            "response":{"status":201,"headers":[["content-type","text/plain"]]}}))
+        .unwrap();
+        let _ = app.on_bus(BusEvent::Detail(Box::new(d)));
+        assert_eq!(app.row("f4").and_then(|r| r.status), Some(201));
+        assert_eq!(app.row_mut("f4").map(|r| r.seq), Some(4));
+    }
+
+    /// Q1 (app side): a flow whose detail came back malformed is not asked
+    /// for again, by `ensure_detail` or by the poll merge.
+    #[test]
+    fn detail_failed_flows_are_not_requested_again() {
+        let mut app = App::new(TermCaps::full(), "x");
+        app.tools = tools(&["flow.list", "flow.get", "flow.detail"]);
+        let a = summary("a", "GET", "h.test", "/a", None, "observed");
+        assert_eq!(
+            app.on_bus(BusEvent::Flows(vec![a.clone()])),
+            vec![BusRequest::Detail("a".into())]
+        );
+        let _ = app.on_bus(BusEvent::DetailFailed("a".into()));
+        assert!(app.detail_failed.contains("a"));
+        assert!(app
+            .current_toast()
+            .unwrap()
+            .text
+            .starts_with("flow.detail a: malformed reply"));
+        assert!(
+            app.update(Action::Enter).is_empty(),
+            "Enter does not refetch"
+        );
+        let done = summary("a", "GET", "h.test", "/a", Some(200), "observed");
+        assert!(
+            app.on_bus(BusEvent::Flows(vec![done])).is_empty(),
+            "a state change does not refetch either"
+        );
+        // A good detail later clears the mark.
+        let d = FlowDetail::from_json(&json!({"id":"a","kind":"http"})).unwrap();
+        let _ = app.on_bus(BusEvent::Detail(Box::new(d)));
+        assert!(!app.detail_failed.contains("a"));
+    }
+
+    /// C1: `o` yields an `OpenTarget` for a screenshot or an image / large
+    /// body (written to a private temp file), and says why otherwise.
+    #[test]
+    fn open_externally_targets_screenshots_images_and_large_bodies() {
+        let mut app = crate::fixture_app(200, 50);
+        // Findings: the screenshot path as is.
+        let _ = app.update(Action::OpenFindings);
+        app.finding_cursor = 0;
+        let _ = app.update(Action::OpenExternally);
+        let t = app.take_open_target().expect("screenshot target");
+        assert_eq!(t.path, PathBuf::from("pocs/reflected-xss-search.png"));
+        assert_eq!(t.label, "screenshot");
+        assert!(app.take_open_target().is_none(), "taken once");
+        let _ = app.update(Action::Down);
+        let _ = app.update(Action::OpenExternally);
+        assert!(app.take_open_target().is_none());
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("this finding has no screenshot to open")
+        );
+        // A small text body (f41's products JSON) is shown inline: nothing to open.
+        app.selected = Some("f41".into());
+        app.mode = Mode::Inspector;
+        app.inspector.pane = Pane::Response;
+        let _ = app.update(Action::OpenExternally);
+        assert!(app.take_open_target().is_none());
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("o opens images and large bodies; this body is shown inline")
+        );
+        // Inspector on an image response: the bytes land in a temp .png.
+        // (A `Flows` event is a full pass, so this becomes the only flow.)
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&[0u8; 32]);
+        let _ = app.on_bus(BusEvent::Flows(vec![summary(
+            "img",
+            "GET",
+            "cdn.shop-staging.test",
+            "/hero.png",
+            Some(200),
+            "observed",
+        )]));
+        let d = FlowDetail::from_json(&json!({"id":"img","kind":"http",
+            "response":{"status":200,"headers":[["content-type","image/png"]],"body": crate::base64::encode(&png)}}))
+        .unwrap();
+        let _ = app.on_bus(BusEvent::Detail(Box::new(d)));
+        app.selected = Some("img".into());
+        app.mode = Mode::Inspector;
+        app.inspector.pane = Pane::Response;
+        let _ = app.update(Action::OpenExternally);
+        let t = app.take_open_target().expect("image target");
+        assert!(t.path.ends_with("aitm-tui-img.png"), "{}", t.path.display());
+        assert_eq!(std::fs::read(&t.path).unwrap(), png);
+        assert_eq!(t.label, "img response body");
+        assert!(app
+            .current_toast()
+            .unwrap()
+            .text
+            .ends_with("aitm-tui-img.png — opening"));
+        let _ = std::fs::remove_file(&t.path);
+        // The request pane of the same flow has no body to open.
+        app.inspector.pane = Pane::Request;
+        let _ = app.update(Action::OpenExternally);
+        assert!(app.take_open_target().is_none());
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("no request body to open")
+        );
+        // A large text body goes to a .txt; from the flow list the response is taken.
+        let big = "x".repeat(crate::viewers::LARGE_BODY_BYTES + 1);
+        let d = FlowDetail::from_json(&json!({"id":"img","kind":"http",
+            "response":{"status":200,"headers":[["content-type","text/plain"]],"body": crate::base64::encode(big.as_bytes())}}))
+        .unwrap();
+        let _ = app.on_bus(BusEvent::Detail(Box::new(d)));
+        app.mode = Mode::Flows;
+        let _ = app.update(Action::OpenExternally);
+        let t = app.take_open_target().expect("large body target");
+        assert!(t.path.ends_with("aitm-tui-img.txt"), "{}", t.path.display());
+        assert_eq!(
+            std::fs::metadata(&t.path).unwrap().len() as usize,
+            big.len()
+        );
+        let _ = std::fs::remove_file(&t.path);
+        // No selection: say what `o` is for.
+        app.selected = None;
+        let _ = app.update(Action::OpenExternally);
+        assert!(app.take_open_target().is_none());
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("o opens the selected flow's image or large body")
+        );
+    }
+
+    /// C4: `P` asks for the name, then the param; Findings `r` asks for the
+    /// target, then `k=v` vars; blanks are `None`.
+    #[test]
+    fn poc_build_and_run_take_their_second_prompts() {
+        let mut app = app_with_flows();
+        app.selected = Some("f1".into());
+        let _ = app.update(Action::BuildPoc);
+        assert_eq!(app.mode, Mode::Prompt(PromptKind::PocName));
+        for c in "IDOR".chars() {
+            let _ = app.update(Action::Input(c));
+        }
+        assert!(app.update(Action::Submit).is_empty());
+        assert_eq!(app.mode, Mode::Prompt(PromptKind::PocParam));
+        assert_eq!(app.prompt, "");
+        for c in "id".chars() {
+            let _ = app.update(Action::Input(c));
+        }
+        assert_eq!(
+            app.update(Action::Submit),
+            vec![BusRequest::PocBuild {
+                flow_id: "f1".into(),
+                name: Some("IDOR".into()),
+                param: Some("id".into())
+            }]
+        );
+        assert_eq!(app.mode, Mode::Flows);
+        // Blank name and param.
+        let _ = app.update(Action::BuildPoc);
+        let _ = app.update(Action::Submit);
+        assert_eq!(
+            app.update(Action::Submit),
+            vec![BusRequest::PocBuild {
+                flow_id: "f1".into(),
+                name: None,
+                param: None
+            }]
+        );
+        // Esc on the second prompt drops the pending build.
+        let _ = app.update(Action::BuildPoc);
+        let _ = app.update(Action::Submit);
+        let _ = app.update(Action::Back);
+        assert!(app.poc_pending.is_none());
+        assert_eq!(app.mode, Mode::Flows);
+
+        // Run again: target, then vars.
+        app.findings =
+            vec![Finding::from_json(&json!({"poc_path": "pocs/x.yaml", "passed": true})).unwrap()];
+        app.mode = Mode::Findings;
+        let _ = app.update(Action::Command("poc-rerun".into()));
+        assert_eq!(app.mode, Mode::Prompt(PromptKind::PocTarget));
+        for c in "https://t.test".chars() {
+            let _ = app.update(Action::Input(c));
+        }
+        assert!(app.update(Action::Submit).is_empty());
+        assert_eq!(app.mode, Mode::Prompt(PromptKind::PocVars));
+        for c in "user=alice n=2".chars() {
+            let _ = app.update(Action::Input(c));
+        }
+        assert_eq!(
+            app.update(Action::Submit),
+            vec![BusRequest::PocRun {
+                poc_path: "pocs/x.yaml".into(),
+                target: Some("https://t.test".into()),
+                vars: Some(json!({"user": "alice", "n": "2"}))
+            }]
+        );
+        assert_eq!(app.mode, Mode::Findings);
+        // Blank target and vars.
+        let _ = app.update(Action::Command("poc-rerun".into()));
+        let _ = app.update(Action::Submit);
+        assert_eq!(
+            app.update(Action::Submit),
+            vec![BusRequest::PocRun {
+                poc_path: "pocs/x.yaml".into(),
+                target: None,
+                vars: None
+            }]
+        );
+        // A malformed vars line keeps the prompt open and says so.
+        let _ = app.update(Action::Command("poc-rerun".into()));
+        let _ = app.update(Action::Submit);
+        for c in "novalue".chars() {
+            let _ = app.update(Action::Input(c));
+        }
+        assert!(app.update(Action::Submit).is_empty());
+        assert_eq!(app.mode, Mode::Prompt(PromptKind::PocVars));
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("vars: `novalue` is not key=value")
+        );
+        let _ = app.update(Action::Back);
+        assert_eq!(app.mode, Mode::Findings);
+        assert!(app.poc_run_pending.is_none());
+    }
+
+    /// C4: on a loopback bus a finding without YAML reads it from `poc_path`;
+    /// an unreadable path is reported; a remote bus never touches the disk.
+    #[test]
+    fn finding_yaml_is_read_from_poc_path_on_a_loopback_bus() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("aitm-tui-test-finding.yaml");
+        std::fs::write(&path, "name: from disk\n").unwrap();
+        let findings = |p: &std::path::Path| {
+            vec![
+                Finding::from_json(&json!({"poc_path": p.to_string_lossy(), "passed": true}))
+                    .unwrap(),
+                Finding::from_json(
+                    &json!({"poc_path": "/nonexistent/aitm-tui/x.yaml", "passed": false}),
+                )
+                .unwrap(),
+                Finding::from_json(
+                    &json!({"poc_path": "/nonexistent/y.yaml", "yaml": "name: inline\n"}),
+                )
+                .unwrap(),
+            ]
+        };
+        let mut local = App::new(TermCaps::full(), "127.0.0.1:9090");
+        assert!(local.is_loopback_bus());
+        let _ = local.on_bus(BusEvent::Findings(findings(&path)));
+        assert_eq!(local.findings[0].yaml.as_deref(), Some("name: from disk\n"));
+        assert!(local.findings[1].yaml.is_none());
+        assert!(
+            local.findings[1]
+                .yaml_error
+                .as_deref()
+                .is_some_and(|e| !e.is_empty()),
+            "{:?}",
+            local.findings[1].yaml_error
+        );
+        assert_eq!(local.findings[2].yaml.as_deref(), Some("name: inline\n"));
+        let embedded = App::new(TermCaps::full(), "in-process");
+        assert!(embedded.is_loopback_bus());
+        let mut remote = App::new(TermCaps::full(), "10.0.0.5:9090");
+        assert!(!remote.is_loopback_bus());
+        let _ = remote.on_bus(BusEvent::Findings(findings(&path)));
+        assert!(remote.findings[0].yaml.is_none());
+        assert!(remote.findings[1].yaml_error.is_none());
+        assert!(!App::new(TermCaps::full(), "fixture").is_loopback_bus());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// C4: `:compose <template>`; `ws` names F9.
+    #[test]
+    fn compose_templates_fill_the_form() {
+        let mut app = app_with_flows();
+        assert!(app.run_command("compose post-json").is_empty());
+        assert_eq!(app.mode, Mode::Compose);
+        assert_eq!(app.compose.method, "POST");
+        assert_eq!(app.compose.headers, "Content-Type: application/json");
+        assert_eq!(app.compose.body, "{}");
+        assert_eq!(app.compose.field, 1);
+        let _ = app.run_command("compose post-form");
+        assert_eq!(
+            app.compose.headers,
+            "Content-Type: application/x-www-form-urlencoded"
+        );
+        assert_eq!(app.compose.body, "");
+        let _ = app.run_command("compose get");
+        assert_eq!(app.compose, ComposeForm::template_get());
+        app.mode = Mode::Flows;
+        let _ = app.run_command("compose ws");
+        assert_eq!(app.mode, Mode::Flows);
+        assert!(app.current_toast().unwrap().text.contains("F9"));
+        let _ = app.run_command("compose nope");
+        assert!(app
+            .current_toast()
+            .unwrap()
+            .text
+            .starts_with("unknown compose template `nope`"));
+        // Bare `:compose` still prefills from the selection.
+        app.selected = Some("f2".into());
+        let _ = app.run_command("compose");
+        assert_eq!(app.compose.method, "POST");
+        assert_eq!(app.compose.url, "https://telemetry.vendor.example/v2/batch");
+    }
+
+    /// C3 / I1 / M-misc: `:split` and `:export` say what is missing; the
+    /// Scope sidebar item filters the list; Resume all reports what it skipped.
+    #[test]
+    fn split_export_scope_item_and_resume_all_report_honestly() {
+        let mut app = app_with_flows();
+        assert!(app.run_command("split").is_empty());
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("split view: not built in this pass (needs ≥ 160 cols)")
+        );
+        assert!(app.run_command("export").is_empty());
+        assert!(app.current_toast().unwrap().text.contains("F10"));
+        app.sidebar = SidebarItem::Domains;
+        let _ = app.update(Action::SidebarNext);
+        assert_eq!(app.sidebar, SidebarItem::Scope);
+        assert_eq!(app.mode, Mode::Flows, "the item filters; S opens the panel");
+        assert_eq!(app.visible().len(), 2);
+        let _ = app.update(Action::OpenScope);
+        assert_eq!(app.mode, Mode::Scope);
+        // Two paused flows, one out of scope.
+        let _ = app.on_bus(BusEvent::Flows(vec![
+            summary(
+                "f1",
+                "GET",
+                "api.shop-staging.test",
+                "/a",
+                None,
+                "intercepted",
+            ),
+            summary(
+                "f2",
+                "POST",
+                "telemetry.vendor.example",
+                "/b",
+                None,
+                "intercepted",
+            ),
+        ]));
+        assert_eq!(
+            app.update(Action::ResumeAll),
+            vec![BusRequest::Resume("f1".into())]
+        );
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some(
+                "Resume all: 1 resumed, 1 skipped — out of scope (add their hosts to scope to act)"
+            )
+        );
     }
 
     /// The fixture app on `f41` (products JSON) with the Response pane's JSON

@@ -8,15 +8,23 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::app::{App, Mode, Pane, REQUEST_TABS, RESPONSE_TABS};
+use crate::app::{tab_follow_up, App, Mode, Pane, REQUEST_TABS, RESPONSE_TABS};
 use crate::model::{
     clock_of, human_bytes, human_ms, FlowDetail, FlowKind, FlowRow, Intercept, Message,
 };
 use crate::theme::Theme;
 use crate::tokens::color;
 use crate::ui::bars::{put, put_sides};
-use crate::ui::text::{fit, truncate};
+use crate::ui::selection_bg;
+use crate::ui::text::{cells, fit, truncate};
 use crate::viewers;
+
+/// What a tab that waits on a core follow-up says instead of a viewer.
+pub fn follow_up_sentence(tab: &str, f: &str) -> String {
+    format!(
+        "{tab} need core follow-up {f} (flow.detail does not carry them yet); the bus serves headers and bodies only today."
+    )
+}
 
 pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     buf.set_style(area, theme.surface());
@@ -185,26 +193,37 @@ fn pane(
     };
     let mut spans = vec![Span::styled(format!(" {title}  "), title_style)];
     for (i, t) in tabs.iter().enumerate() {
+        // A tab waiting on a core follow-up is drawn dim with its F-number
+        // (§2.10(c): never silent), and still selectable so it can say why.
+        let label = match tab_follow_up(t) {
+            Some(f) => format!("{t} ({f})"),
+            None => (*t).to_string(),
+        };
+        let disabled = tab_follow_up(t).is_some();
         if i == active {
             spans.push(Span::styled(
-                *t,
+                label,
                 theme
                     .accent()
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             ));
+        } else if disabled {
+            spans.push(Span::styled(label, theme.text_tertiary()));
         } else {
-            spans.push(Span::styled(*t, theme.text_secondary()));
+            spans.push(Span::styled(label, theme.text_secondary()));
         }
         spans.push(Span::raw("  "));
     }
-    if which == Pane::Request && app.mode == Mode::Edit {
-        spans.push(Span::styled(
-            "editing",
+    // The `editing` badge is right-aligned so it survives a pane too narrow
+    // for the whole tab row.
+    let editing = (which == Pane::Request && app.mode == Mode::Edit).then(|| {
+        Line::styled(
+            "editing ",
             theme
                 .fg(&color::intercept::BASE)
                 .add_modifier(Modifier::BOLD),
-        ));
-    }
+        )
+    });
     let tab_rect = Rect::new(area.x, area.y, area.width, 1);
     buf.set_style(tab_rect, theme.raised());
     // The JSON tab builds its tree once per frame: the node path on the tab
@@ -231,13 +250,13 @@ fn pane(
             .cloned()
             .flatten()
     });
-    match path {
-        Some(path) => put_sides(
-            buf,
-            tab_rect,
-            Line::from(spans),
-            Line::styled(format!("{path} "), theme.text_secondary()),
-        ),
+    let right = match (editing, path) {
+        (Some(badge), _) => Some(badge),
+        (None, Some(path)) => Some(Line::styled(format!("{path} "), theme.text_secondary())),
+        (None, None) => None,
+    };
+    match right {
+        Some(right) => put_sides(buf, tab_rect, Line::from(spans), right),
         None => put(buf, tab_rect, Line::from(spans)),
     }
 
@@ -287,7 +306,7 @@ fn pane(
     let gutter = lines.len() > 1 && viewer_tab && (detail.is_some() || tabs[active] == "Query");
     let highlight = cursor.filter(|_| has_tree);
     for (k, line) in lines.iter().skip(scroll).take(height).enumerate() {
-        let y = body.y + k as u16;
+        let y = body.y + cells(k);
         let mut x = body.x;
         if gutter {
             let n = format!("{:>4} ", scroll + k + 1);
@@ -297,12 +316,7 @@ fn pane(
         buf.set_line(x, y, line, body.right().saturating_sub(x));
         if highlight == Some(scroll + k) {
             // Background and modifier only, so the syntax colours survive.
-            let sel = theme.selection();
-            let mut bg_only = Style::default().add_modifier(sel.add_modifier);
-            if let Some(bg) = sel.bg {
-                bg_only = bg_only.bg(bg);
-            }
-            buf.set_style(Rect::new(body.x, y, body.width, 1), bg_only);
+            buf.set_style(Rect::new(body.x, y, body.width, 1), selection_bg(theme));
         }
     }
     if lines.len() > usize::from(body.height) {
@@ -310,7 +324,7 @@ fn pane(
             " ↓ {} more ",
             lines.len() - scroll - usize::from(body.height).min(lines.len() - scroll)
         );
-        let x = body.right().saturating_sub(more.len() as u16 + 1);
+        let x = body.right().saturating_sub(cells(more.len()) + 1);
         buf.set_string(x, body.bottom() - 1, more, theme.text_tertiary());
     }
 }
@@ -333,6 +347,13 @@ fn content<'a>(
     if (which, tab) == (Pane::Request, "Query") {
         return viewers::query(theme, &row.path);
     }
+    // Cookies, Timing and Set-Cookie wait on core follow-up F5.
+    if let Some(f) = tab_follow_up(tab) {
+        return vec![Line::styled(
+            follow_up_sentence(tab, f),
+            theme.intercept_armed_quiet(),
+        )];
+    }
     let Some(d) = detail else {
         let mut lines = viewers::facts(theme, &summary_facts(app, row, None));
         if app.has_tool("flow.detail") {
@@ -353,18 +374,18 @@ fn content<'a>(
     match (which, tab) {
         (_, "Headers") => match msg {
             Some(m) => viewers::headers(theme, &m.headers),
-            None => pending_response(app, theme, row, d, width),
+            None => pending_response(app, theme, row, d),
         },
         // A WebSocket flow's response is its `101` handshake (Headers tab); its
         // frames are the body worth reading.
         (Pane::Response, "Body") if row.kind == FlowKind::WebSocket => ws_frames(theme, d),
         (_, "Body") => match msg {
             Some(m) => viewers::body_paged(theme, m),
-            None => pending_response(app, theme, row, d, width),
+            None => pending_response(app, theme, row, d),
         },
         (_, "Raw") => match msg {
             Some(m) => viewers::raw_paged(theme, m, which == Pane::Request),
-            None => pending_response(app, theme, row, d, width),
+            None => pending_response(app, theme, row, d),
         },
         (Pane::Request, "Summary") => viewers::facts(theme, &summary_facts(app, row, Some(d))),
         (Pane::Request, "Connection") => {
@@ -401,7 +422,7 @@ fn content<'a>(
             }
             (Some(_), Some(lines)) => lines,
             (Some(_), None) => vec![Line::styled("body is not JSON", theme.text_tertiary())],
-            (None, _) => pending_response(app, theme, row, d, width),
+            (None, _) => pending_response(app, theme, row, d),
         },
         (Pane::Response, "Hex") => {
             let per_line = if width >= 100 { 16 } else { 8 };
@@ -411,7 +432,7 @@ fn content<'a>(
                 }
                 Some(m) if !m.body.is_empty() => viewers::hex::dump(theme, &m.body, per_line),
                 Some(_) => vec![Line::styled("0 B", theme.text_tertiary())],
-                None => pending_response(app, theme, row, d, width),
+                None => pending_response(app, theme, row, d),
             }
         }
         (Pane::Response, "Diff") => {
@@ -465,7 +486,6 @@ fn pending_response<'a>(
     theme: &Theme,
     row: &FlowRow,
     d: &FlowDetail,
-    _width: u16,
 ) -> Vec<Line<'a>> {
     let why = match d.intercept {
         Intercept::Intercepted => "No response yet — the request is paused.",
@@ -640,7 +660,7 @@ fn editor(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     let h = usize::from(area.height.saturating_sub(1));
     let top = e.cursor_line.saturating_sub(h.saturating_sub(1));
     for (k, line) in e.lines.iter().skip(top).take(h).enumerate() {
-        let y = area.y + k as u16;
+        let y = area.y + cells(k);
         let idx = top + k;
         let style = if line.is_empty() && idx > 0 {
             theme.text_tertiary()
@@ -662,7 +682,7 @@ fn editor(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         );
         if idx == e.cursor_line {
             let cx =
-                area.x + 2 + e.cursor_col.min(usize::from(area.width.saturating_sub(3))) as u16;
+                area.x + 2 + cells(e.cursor_col.min(usize::from(area.width.saturating_sub(3))));
             buf.set_style(
                 Rect::new(cx, y, 1, 1),
                 Style::default().add_modifier(Modifier::REVERSED),
@@ -743,8 +763,72 @@ mod tests {
             .unwrap();
         app.details.remove("f41");
         let text = to_text(&snap(&app, &theme, 200, 50));
-        assert!(text.contains("id      f41"), "{text}");
-        assert!(!text.contains("1 id      f41"), "gutter on facts: {text}");
+        // The `id … f41` fact row: whatever sits before it on the line (the
+        // sidebar), the label is `id`, not a line number followed by `id`.
+        let fact_prefixes: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.split_once("f41").map(|(before, _)| before.trim_end()))
+            .filter(|before| before.ends_with("id"))
+            .collect();
+        assert!(!fact_prefixes.is_empty(), "{text}");
+        for before in fact_prefixes {
+            let before_id = before.strip_suffix("id").unwrap_or("").trim_end();
+            assert!(
+                !before_id.ends_with(|c: char| c.is_ascii_digit()),
+                "gutter on facts: {before:?}"
+            );
+        }
+    }
+
+    /// I1: the F5-dependent tabs are present, labelled, dim, and say why.
+    #[test]
+    fn follow_up_tabs_are_labelled_and_explain_themselves() {
+        let theme = Theme::new(true);
+        let mut app = crate::fixture_app(200, 50);
+        app.selected = Some("f41".into());
+        app.mode = Mode::Inspector;
+        let buf = snap(&app, &theme, 200, 50);
+        let text = to_text(&buf);
+        let (y, req_tabs) = row_with(&buf, "Request  Headers").expect("request tab row");
+        assert!(req_tabs.contains("Cookies (F5)"), "{req_tabs}");
+        assert!(req_tabs.contains("Timing (F5)"), "{req_tabs}");
+        let x = req_tabs
+            .find("Cookies")
+            .map(|b| req_tabs[..b].chars().count())
+            .unwrap();
+        assert_eq!(
+            buf.cell((x as u16, y)).map(|c| c.fg),
+            theme.text_tertiary().fg,
+            "disabled tab is dim"
+        );
+        let (_, resp_tabs) = row_with(&buf, "Response  Headers").expect("response tab row");
+        assert!(resp_tabs.contains("Set-Cookie (F5)"), "{resp_tabs}");
+        assert!(
+            !text.contains("need core follow-up F5"),
+            "nothing selected yet"
+        );
+
+        for (pane, tab) in [
+            (Pane::Request, "Cookies"),
+            (Pane::Request, "Timing"),
+            (Pane::Response, "Set-Cookie"),
+        ] {
+            app.inspector.pane = pane;
+            let tabs = match pane {
+                Pane::Request => &crate::app::REQUEST_TABS[..],
+                Pane::Response => &RESPONSE_TABS[..],
+            };
+            let i = tabs.iter().position(|t| *t == tab).unwrap();
+            match pane {
+                Pane::Request => app.inspector.request_tab = i,
+                Pane::Response => app.inspector.response_tab = i,
+            }
+            let text = to_text(&snap(&app, &theme, 200, 50));
+            assert!(
+                text.contains(&format!("{tab} need core follow-up F5")),
+                "{tab}: {text}"
+            );
+        }
     }
 
     #[test]

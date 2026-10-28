@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use aitm_bus_client::{
     read_token_file, BusClient, BusError, InProcessHandler, InProcessTransport, TcpTransport,
+    MAX_LINE_BYTES,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -23,11 +24,29 @@ enum CallMode {
     Answer,
     /// Close the connection without replying (simulates a dying proxy).
     DropConnection,
+    /// Answer with one line of `MAX_LINE_BYTES + 1` bytes (a reply the client
+    /// must refuse to buffer).
+    OversizedReply,
 }
 
 /// Bind a fake bus on `127.0.0.1:0` and serve connections until the test ends.
-async fn spawn_fake(mode: CallMode) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+///
+/// `None` when the bind was refused with `PermissionDenied`: that is the
+/// Claude sandbox, which cannot bind ports, not a bug. The caller prints a
+/// note and returns; these tests must be run for real in the Terminal panel.
+async fn spawn_fake(mode: CallMode) -> Option<SocketAddr> {
+    let listener = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!(
+                "bus_client: skipped — this sandbox refuses to bind 127.0.0.1:0 \
+                 (PermissionDenied); run `cargo test -p aitm-bus-client --test bus_client` \
+                 in the Terminal panel for the real run"
+            );
+            return None;
+        }
+        Err(e) => panic!("bind 127.0.0.1:0: {e}"),
+    };
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
@@ -35,7 +54,7 @@ async fn spawn_fake(mode: CallMode) -> SocketAddr {
             tokio::spawn(serve_one(stream, mode));
         }
     });
-    addr
+    Some(addr)
 }
 
 async fn serve_one(stream: TcpStream, mode: CallMode) {
@@ -91,6 +110,25 @@ async fn serve_one(stream: TcpStream, mode: CallMode) {
                     drop(write);
                     return;
                 }
+                if let CallMode::OversizedReply = mode {
+                    // A syntactically fine reply whose line is one byte over the cap.
+                    let head =
+                        format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"structuredContent":""#);
+                    let tail = "\"}}\n";
+                    let pad = MAX_LINE_BYTES + 1 - head.len() - (tail.len() - 1);
+                    write.write_all(head.as_bytes()).await.unwrap();
+                    let chunk = vec![b'z'; 1024 * 1024];
+                    let mut left = pad;
+                    while left > 0 {
+                        let n = left.min(chunk.len());
+                        if write.write_all(&chunk[..n]).await.is_err() {
+                            return;
+                        }
+                        left -= n;
+                    }
+                    let _ = write.write_all(tail.as_bytes()).await;
+                    return;
+                }
                 match req["params"]["name"].as_str().unwrap_or_default() {
                     "flow.list" => json!({"jsonrpc":"2.0","id":id,"result":{
                         "content":[{"type":"text","text":"[\"a\",\"b\"]"}],
@@ -122,7 +160,9 @@ async fn connect(addr: SocketAddr, token: &str) -> BusClient {
 
 #[tokio::test]
 async fn wrong_token_surfaces_unauthorized_rpc_error() {
-    let addr = spawn_fake(CallMode::Answer).await;
+    let Some(addr) = spawn_fake(CallMode::Answer).await else {
+        return;
+    };
     let client = connect(addr, "wrong").await;
     let err = timeout(Duration::from_secs(2), client.initialize("aitm-tui", "0.1"))
         .await
@@ -136,7 +176,9 @@ async fn wrong_token_surfaces_unauthorized_rpc_error() {
 
 #[tokio::test]
 async fn initialize_tools_list_and_call_over_tcp() {
-    let addr = spawn_fake(CallMode::Answer).await;
+    let Some(addr) = spawn_fake(CallMode::Answer).await else {
+        return;
+    };
     let client = connect(addr, TOKEN).await;
 
     let info = client.initialize("aitm-tui", "0.1").await.unwrap();
@@ -168,7 +210,9 @@ async fn initialize_tools_list_and_call_over_tcp() {
 
 #[tokio::test]
 async fn unsolicited_notification_reaches_subscribers_without_disturbing_calls() {
-    let addr = spawn_fake(CallMode::Answer).await;
+    let Some(addr) = spawn_fake(CallMode::Answer).await else {
+        return;
+    };
     let client = connect(addr, TOKEN).await;
     let mut pushes = client.notifications().expect("TCP delivers notifications");
 
@@ -195,7 +239,9 @@ async fn unsolicited_notification_reaches_subscribers_without_disturbing_calls()
 
 #[tokio::test]
 async fn connection_dropped_mid_request_fails_with_transport_error() {
-    let addr = spawn_fake(CallMode::DropConnection).await;
+    let Some(addr) = spawn_fake(CallMode::DropConnection).await else {
+        return;
+    };
     let client = connect(addr, TOKEN).await;
     client.initialize("aitm-tui", "0.1").await.unwrap();
 
@@ -208,6 +254,32 @@ async fn connection_dropped_mid_request_fails_with_transport_error() {
     }
 
     // And later requests fail fast too, rather than queueing forever.
+    let later = timeout(Duration::from_secs(2), client.ping())
+        .await
+        .expect("must not hang");
+    assert!(matches!(later, Err(BusError::Transport(_))), "{later:?}");
+}
+
+/// S7: a reply line over `MAX_LINE_BYTES` is not buffered; the connection is
+/// closed as gone and the in-flight call fails with a transport error that
+/// names the cap.
+#[tokio::test]
+async fn a_reply_line_over_the_cap_fails_the_call_and_closes_the_connection() {
+    let Some(addr) = spawn_fake(CallMode::OversizedReply).await else {
+        return;
+    };
+    let client = connect(addr, TOKEN).await;
+    client.initialize("aitm-tui", "0.1").await.unwrap();
+
+    let outcome = timeout(Duration::from_secs(20), client.call("flow.list", json!({})))
+        .await
+        .expect("an oversized reply must fail the call, not hang");
+    match outcome {
+        Err(BusError::Transport(e)) => {
+            assert!(format!("{e:#}").contains("reply line over 64 MiB"), "{e:#}")
+        }
+        other => panic!("expected Transport error, got {other:?}"),
+    }
     let later = timeout(Duration::from_secs(2), client.ping())
         .await
         .expect("must not hang");

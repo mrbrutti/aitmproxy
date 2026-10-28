@@ -1,0 +1,523 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="856" height="556" viewBox="0 0 856 556" font-family="SF Mono, JetBrains Mono, Menlo, monospace" font-size="14">
+<rect width="100%" height="100%" fill="#161618"/>
+<rect x="8.0" y="8.0" width="42.0" height="18" fill="#262628"/>
+<text x="8.0" y="21.5" fill="#60A5FA" xml:space="preserve" font-weight="bold"> ›•‹ </text>
+<rect x="50.0" y="8.0" width="75.6" height="18" fill="#262628"/>
+<text x="50.0" y="21.5" fill="#E6E6E8" xml:space="preserve" font-weight="bold">aitmproxy</text>
+<rect x="125.6" y="8.0" width="16.8" height="18" fill="#262628"/>
+<rect x="142.4" y="8.0" width="50.4" height="18" fill="#262628"/>
+<text x="142.4" y="21.5" fill="#4ADE80" xml:space="preserve">● rec </text>
+<rect x="192.8" y="8.0" width="159.6" height="18" fill="#262628"/>
+<text x="192.8" y="21.5" fill="#8E8E93" xml:space="preserve" opacity="0.7"> ✎ compose  ⌫ clear</text>
+<rect x="352.4" y="8.0" width="8.4" height="18" fill="#262628"/>
+<rect x="360.8" y="8.0" width="16.8" height="18" fill="#262628"/>
+<text x="360.8" y="21.5" fill="#F5A524" xml:space="preserve">● </text>
+<rect x="377.6" y="8.0" width="75.6" height="18" fill="#262628"/>
+<text x="377.6" y="21.5" fill="#E6E6E8" xml:space="preserve" font-weight="bold">aitmproxy</text>
+<rect x="453.2" y="8.0" width="134.4" height="18" fill="#262628"/>
+<text x="453.2" y="21.5" fill="#B4B4B8" xml:space="preserve"> · listening 127</text>
+<rect x="587.6" y="8.0" width="252.0" height="18" fill="#262628"/>
+<text x="587.6" y="21.5" fill="#2DD4BF" xml:space="preserve" font-weight="bold">[⚙ Agent ● all tools · 14/min]</text>
+<rect x="839.6" y="8.0" width="8.4" height="18" fill="#262628"/>
+<rect x="8.0" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="16.4" y="26.0" width="42.0" height="18" fill="#262628"/>
+<text x="16.4" y="39.5" fill="#E6E6E8" xml:space="preserve" font-weight="bold"> All </text>
+<rect x="58.4" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="58.4" y="39.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">1</text>
+<rect x="66.8" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="75.2" y="26.0" width="16.8" height="18" fill="#1E1E20"/>
+<text x="75.2" y="39.5" fill="#2E2E31" xml:space="preserve">│ </text>
+<rect x="92.0" y="26.0" width="33.6" height="18" fill="#1E1E20"/>
+<text x="92.0" y="39.5" fill="#B4B4B8" xml:space="preserve">HTTP</text>
+<rect x="125.6" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="125.6" y="39.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">2</text>
+<rect x="134.0" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="142.4" y="26.0" width="42.0" height="18" fill="#1E1E20"/>
+<text x="142.4" y="39.5" fill="#B4B4B8" xml:space="preserve">HTTPS</text>
+<rect x="184.4" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="184.4" y="39.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">3</text>
+<rect x="192.8" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="201.2" y="26.0" width="75.6" height="18" fill="#1E1E20"/>
+<text x="201.2" y="39.5" fill="#B4B4B8" xml:space="preserve">WebSocket</text>
+<rect x="276.8" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="276.8" y="39.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">4</text>
+<rect x="285.2" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="293.6" y="26.0" width="16.8" height="18" fill="#1E1E20"/>
+<text x="293.6" y="39.5" fill="#2E2E31" xml:space="preserve">│ </text>
+<rect x="310.4" y="26.0" width="16.8" height="18" fill="#1E1E20"/>
+<text x="310.4" y="39.5" fill="#B4B4B8" xml:space="preserve">h1</text>
+<rect x="327.2" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="327.2" y="39.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">5</text>
+<rect x="335.6" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="344.0" y="26.0" width="16.8" height="18" fill="#1E1E20"/>
+<text x="344.0" y="39.5" fill="#B4B4B8" xml:space="preserve">h2</text>
+<rect x="360.8" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="360.8" y="39.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">6</text>
+<rect x="369.2" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="377.6" y="26.0" width="16.8" height="18" fill="#1E1E20"/>
+<text x="377.6" y="39.5" fill="#2E2E31" xml:space="preserve">│ </text>
+<rect x="394.4" y="26.0" width="33.6" height="18" fill="#1E1E20"/>
+<text x="394.4" y="39.5" fill="#B4B4B8" xml:space="preserve">JSON</text>
+<rect x="428.0" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="428.0" y="39.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">7</text>
+<rect x="436.4" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="444.8" y="26.0" width="33.6" height="18" fill="#1E1E20"/>
+<text x="444.8" y="39.5" fill="#B4B4B8" xml:space="preserve">Form</text>
+<rect x="478.4" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="478.4" y="39.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">8</text>
+<rect x="486.8" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="495.2" y="26.0" width="25.2" height="18" fill="#1E1E20"/>
+<text x="495.2" y="39.5" fill="#B4B4B8" xml:space="preserve">XML</text>
+<rect x="520.4" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="520.4" y="39.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">9</text>
+<rect x="528.8" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="537.2" y="26.0" width="16.8" height="18" fill="#1E1E20"/>
+<text x="537.2" y="39.5" fill="#B4B4B8" xml:space="preserve">JS</text>
+<rect x="554.0" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="554.0" y="39.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">0</text>
+<rect x="562.4" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="570.8" y="26.0" width="25.2" height="18" fill="#1E1E20"/>
+<text x="570.8" y="39.5" fill="#B4B4B8" xml:space="preserve">CSS</text>
+<rect x="596.0" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="604.4" y="26.0" width="58.8" height="18" fill="#1E1E20"/>
+<text x="604.4" y="39.5" fill="#B4B4B8" xml:space="preserve">GraphQL</text>
+<rect x="663.2" y="26.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="671.6" y="26.0" width="67.2" height="18" fill="#1E1E20"/>
+<text x="671.6" y="39.5" fill="#B4B4B8" xml:space="preserve">Document</text>
+<rect x="738.8" y="26.0" width="16.8" height="18" fill="#1E1E20"/>
+<rect x="755.6" y="26.0" width="92.4" height="18" fill="#1E1E20"/>
+<text x="755.6" y="39.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">⌕ / filter </text>
+<rect x="8.0" y="44.0" width="42.0" height="18" fill="#1E1E20"/>
+<text x="8.0" y="57.5" fill="#60A5FA" xml:space="preserve" font-weight="bold"> ›•‹ </text>
+<rect x="50.0" y="44.0" width="75.6" height="18" fill="#1E1E20"/>
+<text x="50.0" y="57.5" fill="#E6E6E8" xml:space="preserve" font-weight="bold">aitmproxy</text>
+<rect x="125.6" y="44.0" width="109.2" height="18" fill="#1E1E20"/>
+<rect x="234.8" y="44.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="57.5" fill="#2E2E31" xml:space="preserve">│</text>
+<rect x="243.2" y="44.0" width="8.4" height="18" fill="#262628"/>
+<rect x="251.6" y="44.0" width="8.4" height="18" fill="#262628"/>
+<rect x="260.0" y="44.0" width="8.4" height="18" fill="#262628"/>
+<rect x="268.4" y="44.0" width="8.4" height="18" fill="#262628"/>
+<rect x="276.8" y="44.0" width="42.0" height="18" fill="#262628"/>
+<text x="276.8" y="57.5" fill="#B4B4B8" xml:space="preserve">    #</text>
+<rect x="318.8" y="44.0" width="8.4" height="18" fill="#262628"/>
+<rect x="327.2" y="44.0" width="277.2" height="18" fill="#262628"/>
+<text x="327.2" y="57.5" fill="#B4B4B8" xml:space="preserve">URL                              </text>
+<rect x="604.4" y="44.0" width="8.4" height="18" fill="#262628"/>
+<rect x="612.8" y="44.0" width="58.8" height="18" fill="#262628"/>
+<text x="612.8" y="57.5" fill="#B4B4B8" xml:space="preserve">Method </text>
+<rect x="671.6" y="44.0" width="8.4" height="18" fill="#262628"/>
+<rect x="680.0" y="44.0" width="50.4" height="18" fill="#262628"/>
+<text x="680.0" y="57.5" fill="#B4B4B8" xml:space="preserve">Status</text>
+<rect x="730.4" y="44.0" width="8.4" height="18" fill="#262628"/>
+<rect x="738.8" y="44.0" width="100.8" height="18" fill="#262628"/>
+<text x="738.8" y="57.5" fill="#B4B4B8" xml:space="preserve">Time        </text>
+<rect x="839.6" y="44.0" width="8.4" height="18" fill="#262628"/>
+<rect x="8.0" y="62.0" width="226.8" height="18" fill="#1E1E20"/>
+<rect x="234.8" y="62.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="75.5" fill="#2E2E31" xml:space="preserve">│</text>
+<rect x="243.2" y="62.0" width="16.8" height="18" fill="#1E1E20"/>
+<rect x="260.0" y="62.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="260.0" y="75.5" fill="#4ADE80" xml:space="preserve">●</text>
+<rect x="268.4" y="62.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="276.8" y="62.0" width="42.0" height="18" fill="#1E1E20"/>
+<text x="276.8" y="75.5" fill="#B4B4B8" xml:space="preserve">    1</text>
+<rect x="318.8" y="62.0" width="294.0" height="18" fill="#1E1E20"/>
+<text x="318.8" y="75.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-stag…cs&amp;limit=20 </text>
+<rect x="612.8" y="62.0" width="58.8" height="18" fill="#1E2A44"/>
+<text x="612.8" y="75.5" fill="#93C5FD" xml:space="preserve" font-weight="bold"> GET   </text>
+<rect x="671.6" y="62.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="680.0" y="62.0" width="50.4" height="18" fill="#1E1E20"/>
+<text x="680.0" y="75.5" fill="#4ADE80" xml:space="preserve" font-weight="bold">200   </text>
+<rect x="730.4" y="62.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="738.8" y="62.0" width="100.8" height="18" fill="#1E1E20"/>
+<text x="738.8" y="75.5" fill="#B4B4B8" xml:space="preserve">11:04:58.120</text>
+<rect x="839.6" y="62.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="80.0" width="67.2" height="18" fill="#1E1E20"/>
+<text x="8.0" y="93.5" fill="#8E8E93" xml:space="preserve" font-weight="bold" opacity="0.7"> Working</text>
+<rect x="75.2" y="80.0" width="159.6" height="18" fill="#1E1E20"/>
+<rect x="234.8" y="80.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="93.5" fill="#2E2E31" xml:space="preserve">│</text>
+<rect x="243.2" y="80.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="243.2" y="93.5" fill="#7DD3FC" xml:space="preserve">▍</text>
+<rect x="251.6" y="80.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="260.0" y="80.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="260.0" y="93.5" fill="#4ADE80" xml:space="preserve">●</text>
+<rect x="268.4" y="80.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="276.8" y="80.0" width="42.0" height="18" fill="#1E1E20"/>
+<text x="276.8" y="93.5" fill="#B4B4B8" xml:space="preserve">    2</text>
+<rect x="318.8" y="80.0" width="294.0" height="18" fill="#1E1E20"/>
+<text x="318.8" y="93.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-stag…rt/items/42 </text>
+<rect x="612.8" y="80.0" width="58.8" height="18" fill="#3A2E12"/>
+<text x="612.8" y="93.5" fill="#FCD34D" xml:space="preserve" font-weight="bold"> PUT   </text>
+<rect x="671.6" y="80.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="680.0" y="80.0" width="50.4" height="18" fill="#1E1E20"/>
+<text x="680.0" y="93.5" fill="#4ADE80" xml:space="preserve" font-weight="bold">200   </text>
+<rect x="730.4" y="80.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="738.8" y="80.0" width="100.8" height="18" fill="#1E1E20"/>
+<text x="738.8" y="93.5" fill="#B4B4B8" xml:space="preserve">11:04:59.301</text>
+<rect x="839.6" y="80.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="98.0" width="226.8" height="18" fill="#1E1E20"/>
+<text x="8.0" y="111.5" fill="#E6E6E8" xml:space="preserve">  Pinned                   </text>
+<rect x="234.8" y="98.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="111.5" fill="#2E2E31" xml:space="preserve" opacity="0.7">│</text>
+<rect x="243.2" y="98.0" width="16.8" height="18" fill="#1E1E20"/>
+<rect x="260.0" y="98.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="260.0" y="111.5" fill="#7DD3FC" xml:space="preserve">●</text>
+<rect x="268.4" y="98.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="276.8" y="98.0" width="42.0" height="18" fill="#1E1E20"/>
+<text x="276.8" y="111.5" fill="#B4B4B8" xml:space="preserve">    3</text>
+<rect x="318.8" y="98.0" width="294.0" height="18" fill="#1E1E20"/>
+<text x="318.8" y="111.5" fill="#E6E6E8" xml:space="preserve"> https://cdn.shop-stag…app.3f1c.js </text>
+<rect x="612.8" y="98.0" width="58.8" height="18" fill="#1E2A44"/>
+<text x="612.8" y="111.5" fill="#93C5FD" xml:space="preserve" font-weight="bold"> GET   </text>
+<rect x="671.6" y="98.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="680.0" y="98.0" width="50.4" height="18" fill="#1E1E20"/>
+<text x="680.0" y="111.5" fill="#7DD3FC" xml:space="preserve" font-weight="bold">304   </text>
+<rect x="730.4" y="98.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="738.8" y="98.0" width="100.8" height="18" fill="#1E1E20"/>
+<text x="738.8" y="111.5" fill="#B4B4B8" xml:space="preserve">11:05:00.014</text>
+<rect x="839.6" y="98.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="116.0" width="201.6" height="18" fill="#1E1E20"/>
+<text x="8.0" y="129.5" fill="#E6E6E8" xml:space="preserve">  Saved                 </text>
+<rect x="209.6" y="116.0" width="25.2" height="18" fill="#1E1E20"/>
+<text x="209.6" y="129.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">F10</text>
+<rect x="234.8" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="129.5" fill="#2E2E31" xml:space="preserve" opacity="0.7">│</text>
+<rect x="243.2" y="116.0" width="16.8" height="18" fill="#1E1E20"/>
+<rect x="260.0" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="260.0" y="129.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">●</text>
+<rect x="268.4" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="276.8" y="116.0" width="42.0" height="18" fill="#1E1E20"/>
+<text x="276.8" y="129.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">    4</text>
+<rect x="318.8" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="327.2" y="116.0" width="277.2" height="18" fill="#1E1E20"/>
+<text x="327.2" y="129.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">https://telemetry.ven…le/v2/batch</text>
+<rect x="604.4" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="612.8" y="116.0" width="58.8" height="18" fill="#1E1E20"/>
+<text x="612.8" y="129.5" fill="#8E8E93" xml:space="preserve" opacity="0.7"> POST  </text>
+<rect x="671.6" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="680.0" y="116.0" width="50.4" height="18" fill="#1E1E20"/>
+<text x="680.0" y="129.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">204   </text>
+<rect x="730.4" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="738.8" y="116.0" width="100.8" height="18" fill="#1E1E20"/>
+<text x="738.8" y="129.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">11:05:01.772</text>
+<rect x="839.6" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="134.0" width="226.8" height="18" fill="#1E1E20"/>
+<rect x="234.8" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="147.5" fill="#2E2E31" xml:space="preserve">│</text>
+<rect x="243.2" y="134.0" width="16.8" height="18" fill="#1E1E20"/>
+<rect x="260.0" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="260.0" y="147.5" fill="#F87171" xml:space="preserve">●</text>
+<rect x="268.4" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="276.8" y="134.0" width="42.0" height="18" fill="#1E1E20"/>
+<text x="276.8" y="147.5" fill="#B4B4B8" xml:space="preserve">    5</text>
+<rect x="318.8" y="134.0" width="294.0" height="18" fill="#1E1E20"/>
+<text x="318.8" y="147.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-stag…ders?page=3 </text>
+<rect x="612.8" y="134.0" width="58.8" height="18" fill="#1E2A44"/>
+<text x="612.8" y="147.5" fill="#93C5FD" xml:space="preserve" font-weight="bold"> GET   </text>
+<rect x="671.6" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="680.0" y="134.0" width="50.4" height="18" fill="#1E1E20"/>
+<text x="680.0" y="147.5" fill="#F87171" xml:space="preserve" font-weight="bold">502   </text>
+<rect x="730.4" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="738.8" y="134.0" width="100.8" height="18" fill="#1E1E20"/>
+<text x="738.8" y="147.5" fill="#B4B4B8" xml:space="preserve">11:05:03.890</text>
+<rect x="839.6" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="152.0" width="33.6" height="18" fill="#1E1E20"/>
+<text x="8.0" y="165.5" fill="#8E8E93" xml:space="preserve" font-weight="bold" opacity="0.7"> All</text>
+<rect x="41.6" y="152.0" width="193.2" height="18" fill="#1E1E20"/>
+<rect x="234.8" y="152.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="165.5" fill="#2E2E31" xml:space="preserve">│</text>
+<rect x="243.2" y="152.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="243.2" y="165.5" fill="#2DD4BF" xml:space="preserve">▎</text>
+<rect x="251.6" y="152.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="260.0" y="152.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="260.0" y="165.5" fill="#4ADE80" xml:space="preserve">●</text>
+<rect x="268.4" y="152.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="276.8" y="152.0" width="42.0" height="18" fill="#1E1E20"/>
+<text x="276.8" y="165.5" fill="#B4B4B8" xml:space="preserve">   6↻</text>
+<rect x="318.8" y="152.0" width="294.0" height="18" fill="#1E1E20"/>
+<text x="318.8" y="165.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-stag…ders?page=3 </text>
+<rect x="612.8" y="152.0" width="58.8" height="18" fill="#1E2A44"/>
+<text x="612.8" y="165.5" fill="#93C5FD" xml:space="preserve" font-weight="bold"> GET   </text>
+<rect x="671.6" y="152.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="680.0" y="152.0" width="50.4" height="18" fill="#1E1E20"/>
+<text x="680.0" y="165.5" fill="#4ADE80" xml:space="preserve" font-weight="bold">200   </text>
+<rect x="730.4" y="152.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="738.8" y="152.0" width="100.8" height="18" fill="#1E1E20"/>
+<text x="738.8" y="165.5" fill="#B4B4B8" xml:space="preserve">11:05:04.067</text>
+<rect x="839.6" y="152.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="170.0" width="92.4" height="18" fill="#2B3344"/>
+<text x="8.0" y="183.5" fill="#E6E6E8" xml:space="preserve" font-weight="bold">  All flows</text>
+<rect x="100.4" y="170.0" width="134.4" height="18" fill="#2B3344"/>
+<text x="100.4" y="183.5" fill="#E6E6E8" xml:space="preserve">              14</text>
+<rect x="234.8" y="170.0" width="8.4" height="18" fill="#2B3344"/>
+<text x="234.8" y="183.5" fill="#2E2E31" xml:space="preserve">│</text>
+<rect x="243.2" y="170.0" width="16.8" height="18" fill="#1E1E20"/>
+<rect x="260.0" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="260.0" y="183.5" fill="#C4B5FD" xml:space="preserve">●</text>
+<rect x="268.4" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="276.8" y="170.0" width="42.0" height="18" fill="#1E1E20"/>
+<text x="276.8" y="183.5" fill="#B4B4B8" xml:space="preserve">    7</text>
+<rect x="318.8" y="170.0" width="235.2" height="18" fill="#1E1E20"/>
+<text x="318.8" y="183.5" fill="#E6E6E8" xml:space="preserve"> wss://api.shop-staging.test</text>
+<rect x="554.0" y="170.0" width="50.4" height="18" fill="#1E1E20"/>
+<text x="554.0" y="183.5" fill="#7DB2F8" xml:space="preserve">/ws/n…</text>
+<rect x="604.4" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="612.8" y="170.0" width="58.8" height="18" fill="#2E2550"/>
+<text x="612.8" y="183.5" fill="#C4B5FD" xml:space="preserve" font-weight="bold"> WS    </text>
+<rect x="671.6" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="680.0" y="170.0" width="50.4" height="18" fill="#1E1E20"/>
+<text x="680.0" y="183.5" fill="#C4B5FD" xml:space="preserve" font-weight="bold">101   </text>
+<rect x="730.4" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="738.8" y="170.0" width="100.8" height="18" fill="#1E1E20"/>
+<text x="738.8" y="183.5" fill="#B4B4B8" xml:space="preserve">11:05:04.966</text>
+<rect x="839.6" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="188.0" width="218.4" height="18" fill="#1E1E20"/>
+<text x="8.0" y="201.5" fill="#E6E6E8" xml:space="preserve">  Apps                    </text>
+<rect x="226.4" y="188.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="226.4" y="201.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">5</text>
+<rect x="234.8" y="188.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="201.5" fill="#2E2E31" xml:space="preserve" opacity="0.7">│</text>
+<rect x="243.2" y="188.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="243.2" y="201.5" fill="#2DD4BF" xml:space="preserve">▎</text>
+<rect x="251.6" y="188.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="260.0" y="188.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="260.0" y="201.5" fill="#4ADE80" xml:space="preserve">●</text>
+<rect x="268.4" y="188.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="276.8" y="188.0" width="42.0" height="18" fill="#1E1E20"/>
+<text x="276.8" y="201.5" fill="#B4B4B8" xml:space="preserve">    8</text>
+<rect x="318.8" y="188.0" width="294.0" height="18" fill="#1E1E20"/>
+<text x="318.8" y="201.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-stag…alert(1)%3E </text>
+<rect x="612.8" y="188.0" width="58.8" height="18" fill="#1E2A44"/>
+<text x="612.8" y="201.5" fill="#93C5FD" xml:space="preserve" font-weight="bold"> GET   </text>
+<rect x="671.6" y="188.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="680.0" y="188.0" width="50.4" height="18" fill="#1E1E20"/>
+<text x="680.0" y="201.5" fill="#4ADE80" xml:space="preserve" font-weight="bold">200   </text>
+<rect x="730.4" y="188.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="738.8" y="188.0" width="100.8" height="18" fill="#1E1E20"/>
+<text x="738.8" y="201.5" fill="#B4B4B8" xml:space="preserve">11:05:13.208</text>
+<rect x="839.6" y="188.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="206.0" width="218.4" height="18" fill="#1E1E20"/>
+<text x="8.0" y="219.5" fill="#E6E6E8" xml:space="preserve">  Domains                 </text>
+<rect x="226.4" y="206.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="226.4" y="219.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">4</text>
+<rect x="234.8" y="206.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="219.5" fill="#2E2E31" xml:space="preserve" opacity="0.7">│</text>
+<rect x="243.2" y="206.0" width="16.8" height="18" fill="#1E1E20"/>
+<rect x="260.0" y="206.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="260.0" y="219.5" fill="#8E8E93" xml:space="preserve">●</text>
+<rect x="268.4" y="206.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="276.8" y="206.0" width="42.0" height="18" fill="#1E1E20"/>
+<text x="276.8" y="219.5" fill="#B4B4B8" xml:space="preserve">    9</text>
+<rect x="318.8" y="206.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="327.2" y="206.0" width="277.2" height="18" fill="#1E1E20"/>
+<text x="327.2" y="219.5" fill="#8E8E93" xml:space="preserve" text-decoration="line-through">https://api.shop-stag…ount/delete</text>
+<rect x="604.4" y="206.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="612.8" y="206.0" width="58.8" height="18" fill="#3B1C1C"/>
+<text x="612.8" y="219.5" fill="#FCA5A5" xml:space="preserve" font-weight="bold"> DELETE</text>
+<rect x="671.6" y="206.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="680.0" y="206.0" width="50.4" height="18" fill="#1E1E20"/>
+<text x="680.0" y="219.5" fill="#8E8E93" xml:space="preserve">killed</text>
+<rect x="730.4" y="206.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="738.8" y="206.0" width="100.8" height="18" fill="#1E1E20"/>
+<text x="738.8" y="219.5" fill="#B4B4B8" xml:space="preserve">11:05:19.402</text>
+<rect x="839.6" y="206.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="224.0" width="226.8" height="18" fill="#1E1E20"/>
+<rect x="234.8" y="224.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="237.5" fill="#2E2E31" xml:space="preserve">│</text>
+<rect x="243.2" y="224.0" width="8.4" height="18" fill="#2B3344"/>
+<text x="243.2" y="237.5" fill="#F5A524" xml:space="preserve">▎</text>
+<rect x="251.6" y="224.0" width="8.4" height="18" fill="#2B3344"/>
+<rect x="260.0" y="224.0" width="8.4" height="18" fill="#2B3344"/>
+<text x="260.0" y="237.5" fill="#F5A524" xml:space="preserve">●</text>
+<rect x="268.4" y="224.0" width="8.4" height="18" fill="#2B3344"/>
+<rect x="276.8" y="224.0" width="42.0" height="18" fill="#2B3344"/>
+<text x="276.8" y="237.5" fill="#B4B4B8" xml:space="preserve">   10</text>
+<rect x="318.8" y="224.0" width="294.0" height="18" fill="#2B3344"/>
+<text x="318.8" y="237.5" fill="#E6E6E8" xml:space="preserve"> https://auth.shop-sta…/auth/login </text>
+<rect x="612.8" y="224.0" width="58.8" height="18" fill="#14322A"/>
+<text x="612.8" y="237.5" fill="#86EFAC" xml:space="preserve" font-weight="bold"> POST  </text>
+<rect x="671.6" y="224.0" width="8.4" height="18" fill="#2B3344"/>
+<rect x="680.0" y="224.0" width="50.4" height="18" fill="#2B3344"/>
+<text x="680.0" y="237.5" fill="#F5A524" xml:space="preserve" font-weight="bold">Paused</text>
+<rect x="730.4" y="224.0" width="8.4" height="18" fill="#2B3344"/>
+<rect x="738.8" y="224.0" width="100.8" height="18" fill="#2B3344"/>
+<text x="738.8" y="237.5" fill="#B4B4B8" xml:space="preserve">11:05:22.994</text>
+<rect x="839.6" y="224.0" width="8.4" height="18" fill="#2B3344"/>
+<rect x="8.0" y="242.0" width="84.0" height="18" fill="#1E1E20"/>
+<text x="8.0" y="255.5" fill="#8E8E93" xml:space="preserve" font-weight="bold" opacity="0.7"> aitmproxy</text>
+<rect x="92.0" y="242.0" width="142.8" height="18" fill="#1E1E20"/>
+<rect x="234.8" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="255.5" fill="#2E2E31" xml:space="preserve">│</text>
+<rect x="243.2" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="243.2" y="255.5" fill="#F5A524" xml:space="preserve">▎</text>
+<rect x="251.6" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="260.0" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="260.0" y="255.5" fill="#F5A524" xml:space="preserve">●</text>
+<rect x="268.4" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="276.8" y="242.0" width="42.0" height="18" fill="#1E1E20"/>
+<text x="276.8" y="255.5" fill="#B4B4B8" xml:space="preserve">   11</text>
+<rect x="318.8" y="242.0" width="294.0" height="18" fill="#1E1E20"/>
+<text x="318.8" y="255.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-stag…test/api/me </text>
+<rect x="612.8" y="242.0" width="58.8" height="18" fill="#1E2A44"/>
+<text x="612.8" y="255.5" fill="#93C5FD" xml:space="preserve" font-weight="bold"> GET   </text>
+<rect x="671.6" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="680.0" y="242.0" width="50.4" height="18" fill="#1E1E20"/>
+<text x="680.0" y="255.5" fill="#F5A524" xml:space="preserve" font-weight="bold">Paused</text>
+<rect x="730.4" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="738.8" y="242.0" width="100.8" height="18" fill="#1E1E20"/>
+<text x="738.8" y="255.5" fill="#B4B4B8" xml:space="preserve">11:05:24.179</text>
+<rect x="839.6" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="260.0" width="218.4" height="18" fill="#1E1E20"/>
+<text x="8.0" y="273.5" fill="#E6E6E8" xml:space="preserve">  Scope                   </text>
+<rect x="226.4" y="260.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="226.4" y="273.5" fill="#B4B4B8" xml:space="preserve" font-weight="bold">3</text>
+<rect x="234.8" y="260.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="273.5" fill="#2E2E31" xml:space="preserve" font-weight="bold">│</text>
+<rect x="243.2" y="260.0" width="16.8" height="18" fill="#1E1E20"/>
+<rect x="260.0" y="260.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="260.0" y="273.5" fill="#F5A524" xml:space="preserve">●</text>
+<rect x="268.4" y="260.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="276.8" y="260.0" width="42.0" height="18" fill="#1E1E20"/>
+<text x="276.8" y="273.5" fill="#B4B4B8" xml:space="preserve">   12</text>
+<rect x="318.8" y="260.0" width="294.0" height="18" fill="#1E1E20"/>
+<text x="318.8" y="273.5" fill="#E6E6E8" xml:space="preserve"> https://cdn.shop-stag…s/hero.webp </text>
+<rect x="612.8" y="260.0" width="58.8" height="18" fill="#1E2A44"/>
+<text x="612.8" y="273.5" fill="#93C5FD" xml:space="preserve" font-weight="bold"> GET   </text>
+<rect x="671.6" y="260.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="680.0" y="260.0" width="50.4" height="18" fill="#1E1E20"/>
+<text x="680.0" y="273.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—     </text>
+<rect x="730.4" y="260.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="738.8" y="260.0" width="100.8" height="18" fill="#1E1E20"/>
+<text x="738.8" y="273.5" fill="#B4B4B8" xml:space="preserve">11:05:34.509</text>
+<rect x="839.6" y="260.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="278.0" width="218.4" height="18" fill="#1E1E20"/>
+<text x="8.0" y="291.5" fill="#E6E6E8" xml:space="preserve">  Findings                </text>
+<rect x="226.4" y="278.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="226.4" y="291.5" fill="#B4B4B8" xml:space="preserve" font-weight="bold">2</text>
+<rect x="234.8" y="278.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="291.5" fill="#2E2E31" xml:space="preserve" font-weight="bold">│</text>
+<rect x="243.2" y="278.0" width="16.8" height="18" fill="#1E1E20"/>
+<rect x="260.0" y="278.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="260.0" y="291.5" fill="#FCD34D" xml:space="preserve">●</text>
+<rect x="268.4" y="278.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="276.8" y="278.0" width="42.0" height="18" fill="#1E1E20"/>
+<text x="276.8" y="291.5" fill="#B4B4B8" xml:space="preserve">   13</text>
+<rect x="318.8" y="278.0" width="294.0" height="18" fill="#1E1E20"/>
+<text x="318.8" y="291.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-stag…st/api/cart </text>
+<rect x="612.8" y="278.0" width="58.8" height="18" fill="#3B2516"/>
+<text x="612.8" y="291.5" fill="#FDBA74" xml:space="preserve" font-weight="bold"> PATCH </text>
+<rect x="671.6" y="278.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="680.0" y="278.0" width="50.4" height="18" fill="#1E1E20"/>
+<text x="680.0" y="291.5" fill="#FCD34D" xml:space="preserve" font-weight="bold">422   </text>
+<rect x="730.4" y="278.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="738.8" y="278.0" width="100.8" height="18" fill="#1E1E20"/>
+<text x="738.8" y="291.5" fill="#B4B4B8" xml:space="preserve">11:05:34.814</text>
+<rect x="839.6" y="278.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="296.0" width="117.6" height="18" fill="#1E1E20"/>
+<text x="8.0" y="309.5" fill="#E6E6E8" xml:space="preserve">  Browser     </text>
+<rect x="125.6" y="296.0" width="109.2" height="18" fill="#1E1E20"/>
+<text x="125.6" y="309.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">not built yet</text>
+<rect x="234.8" y="296.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="309.5" fill="#2E2E31" xml:space="preserve" opacity="0.7">│</text>
+<rect x="243.2" y="296.0" width="16.8" height="18" fill="#1E1E20"/>
+<rect x="260.0" y="296.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="260.0" y="309.5" fill="#4ADE80" xml:space="preserve">●</text>
+<rect x="268.4" y="296.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="276.8" y="296.0" width="42.0" height="18" fill="#1E1E20"/>
+<text x="276.8" y="309.5" fill="#B4B4B8" xml:space="preserve">   14</text>
+<rect x="318.8" y="296.0" width="294.0" height="18" fill="#1E1E20"/>
+<text x="318.8" y="309.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-stag…/api/health </text>
+<rect x="612.8" y="296.0" width="58.8" height="18" fill="#2A2A2D"/>
+<text x="612.8" y="309.5" fill="#B4B4B8" xml:space="preserve" font-weight="bold"> HEAD  </text>
+<rect x="671.6" y="296.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="680.0" y="296.0" width="50.4" height="18" fill="#1E1E20"/>
+<text x="680.0" y="309.5" fill="#4ADE80" xml:space="preserve" font-weight="bold">200   </text>
+<rect x="730.4" y="296.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="738.8" y="296.0" width="100.8" height="18" fill="#1E1E20"/>
+<text x="738.8" y="309.5" fill="#B4B4B8" xml:space="preserve">11:05:35.603</text>
+<rect x="839.6" y="296.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="314.0" width="210.0" height="18" fill="#1E1E20"/>
+<text x="8.0" y="327.5" fill="#E6E6E8" xml:space="preserve">  Scripts                </text>
+<rect x="218.0" y="314.0" width="16.8" height="18" fill="#1E1E20"/>
+<text x="218.0" y="327.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">M3</text>
+<rect x="234.8" y="314.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="327.5" fill="#2E2E31" xml:space="preserve" opacity="0.7">│</text>
+<rect x="243.2" y="314.0" width="604.8" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="332.0" width="176.4" height="18" fill="#1E1E20"/>
+<text x="8.0" y="345.5" fill="#E6E6E8" xml:space="preserve">  Agent              </text>
+<rect x="184.4" y="332.0" width="50.4" height="18" fill="#1E1E20"/>
+<text x="184.4" y="345.5" fill="#B4B4B8" xml:space="preserve" font-weight="bold">14/min</text>
+<rect x="234.8" y="332.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="345.5" fill="#2E2E31" xml:space="preserve" font-weight="bold">│</text>
+<rect x="243.2" y="332.0" width="604.8" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="350.0" width="226.8" height="18" fill="#1E1E20"/>
+<rect x="234.8" y="350.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="363.5" fill="#2E2E31" xml:space="preserve">│</text>
+<rect x="243.2" y="350.0" width="604.8" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="368.0" width="226.8" height="18" fill="#1E1E20"/>
+<rect x="234.8" y="368.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="381.5" fill="#2E2E31" xml:space="preserve">│</text>
+<rect x="243.2" y="368.0" width="604.8" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="386.0" width="226.8" height="18" fill="#1E1E20"/>
+<rect x="234.8" y="386.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="399.5" fill="#2E2E31" xml:space="preserve">│</text>
+<rect x="243.2" y="386.0" width="604.8" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="404.0" width="226.8" height="18" fill="#1E1E20"/>
+<rect x="234.8" y="404.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="417.5" fill="#2E2E31" xml:space="preserve">│</text>
+<rect x="243.2" y="404.0" width="604.8" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="422.0" width="226.8" height="18" fill="#1E1E20"/>
+<rect x="234.8" y="422.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="435.5" fill="#2E2E31" xml:space="preserve">│</text>
+<rect x="243.2" y="422.0" width="604.8" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="440.0" width="226.8" height="18" fill="#1E1E20"/>
+<rect x="234.8" y="440.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="453.5" fill="#2E2E31" xml:space="preserve">│</text>
+<rect x="243.2" y="440.0" width="604.8" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="458.0" width="226.8" height="18" fill="#1E1E20"/>
+<rect x="234.8" y="458.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="471.5" fill="#2E2E31" xml:space="preserve">│</text>
+<rect x="243.2" y="458.0" width="604.8" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="476.0" width="226.8" height="18" fill="#1E1E20"/>
+<rect x="234.8" y="476.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="489.5" fill="#2E2E31" xml:space="preserve">│</text>
+<rect x="243.2" y="476.0" width="604.8" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="494.0" width="226.8" height="18" fill="#1E1E20"/>
+<rect x="234.8" y="494.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="507.5" fill="#2E2E31" xml:space="preserve">│</text>
+<rect x="243.2" y="494.0" width="604.8" height="18" fill="#1E1E20"/>
+<rect x="8.0" y="512.0" width="42.0" height="18" fill="#1E1E20"/>
+<text x="8.0" y="525.5" fill="#E6E6E8" xml:space="preserve" font-weight="bold"> [ ] </text>
+<rect x="50.0" y="512.0" width="50.4" height="18" fill="#1E1E20"/>
+<text x="50.0" y="525.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">move  </text>
+<rect x="100.4" y="512.0" width="16.8" height="18" fill="#1E1E20"/>
+<text x="100.4" y="525.5" fill="#E6E6E8" xml:space="preserve" font-weight="bold">b </text>
+<rect x="117.2" y="512.0" width="33.6" height="18" fill="#1E1E20"/>
+<text x="117.2" y="525.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">hide</text>
+<rect x="150.8" y="512.0" width="84.0" height="18" fill="#1E1E20"/>
+<rect x="234.8" y="512.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="234.8" y="525.5" fill="#2E2E31" xml:space="preserve">│</text>
+<rect x="243.2" y="512.0" width="604.8" height="18" fill="#F5A524"/>
+<rect x="8.0" y="530.0" width="16.8" height="18" fill="#262628"/>
+<text x="8.0" y="543.5" fill="#E6E6E8" xml:space="preserve" font-weight="bold"> ?</text>
+<rect x="24.8" y="530.0" width="50.4" height="18" fill="#262628"/>
+<text x="24.8" y="543.5" fill="#B4B4B8" xml:space="preserve"> help </text>
+<rect x="75.2" y="530.0" width="33.6" height="18" fill="#262628"/>
+<rect x="108.8" y="530.0" width="100.8" height="18" fill="#262628"/>
+<text x="108.8" y="543.5" fill="#B4B4B8" xml:space="preserve">10 / 14 rows</text>
+<rect x="209.6" y="530.0" width="92.4" height="18" fill="#262628"/>
+<text x="209.6" y="543.5" fill="#F5A524" xml:space="preserve" font-weight="bold"> · 2 paused</text>
+<rect x="302.0" y="530.0" width="226.8" height="18" fill="#262628"/>
+<text x="302.0" y="543.5" fill="#B4B4B8" xml:space="preserve"> · 13 in scope · 2 findings</text>
+<rect x="528.8" y="530.0" width="33.6" height="18" fill="#262628"/>
+<rect x="562.4" y="530.0" width="42.0" height="18" fill="#262628"/>
+<text x="562.4" y="543.5" fill="#B4B4B8" xml:space="preserve">983 B</text>
+<rect x="604.4" y="530.0" width="109.2" height="18" fill="#262628"/>
+<text x="604.4" y="543.5" fill="#8E8E93" xml:space="preserve" opacity="0.7"> ↑ — ↓ — (F4)</text>
+<rect x="713.6" y="530.0" width="33.6" height="18" fill="#262628"/>
+<text x="713.6" y="543.5" fill="#4ADE80" xml:space="preserve">  ● </text>
+<rect x="747.2" y="530.0" width="100.8" height="18" fill="#262628"/>
+<text x="747.2" y="543.5" fill="#B4B4B8" xml:space="preserve">bus fixture </text>
+</svg>

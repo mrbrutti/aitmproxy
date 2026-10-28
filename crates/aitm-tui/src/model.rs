@@ -152,9 +152,7 @@ impl FlowRow {
         if let Some(resp) = &d.response {
             self.status = resp.status.or(self.status);
             self.resp_size = Some(resp.body.len() as u64);
-            self.content_type = resp
-                .header("content-type")
-                .map(|v| v.split(';').next().unwrap_or(v).trim().to_ascii_lowercase());
+            self.content_type = resp.content_type();
         }
         if let Some(c) = &d.client_conn {
             self.client = c.process.clone().or_else(|| c.peer.clone());
@@ -490,7 +488,11 @@ pub struct Finding {
     pub screenshot_path: Option<String>,
     /// `(assertion, matched)`.
     pub assertions: Vec<(String, bool)>,
+    /// The PoC YAML, from the result or (on a loopback bus) read from
+    /// `poc_path` by the app.
     pub yaml: Option<String>,
+    /// Why `poc_path` could not be read, when the app tried.
+    pub yaml_error: Option<String>,
 }
 
 impl Finding {
@@ -530,6 +532,7 @@ impl Finding {
             screenshot_path: s("screenshot_path"),
             assertions,
             yaml: s("yaml"),
+            yaml_error: None,
         })
     }
 }
@@ -680,6 +683,22 @@ pub fn clock_of(ts: &str) -> String {
         .unwrap_or_else(|| ts.to_string())
 }
 
+/// Scope-as-authorisation (§2.7): whether `authority` is covered by any scope
+/// entry — `host`, `host:port` (exact) or `*.wildcard` (the suffix itself or
+/// any subdomain of it).
+pub fn scope_covers(scope: &[String], authority: &str) -> bool {
+    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
+    scope.iter().any(|e| {
+        if let Some(suffix) = e.strip_prefix("*.") {
+            host == suffix || host.ends_with(&format!(".{suffix}"))
+        } else if e.contains(':') {
+            e == authority
+        } else {
+            e == host
+        }
+    })
+}
+
 /// Count flows per key, preserving first-seen order.
 pub fn counts_by<'a, I, F>(rows: I, key: F) -> Vec<(String, usize)>
 where
@@ -795,6 +814,40 @@ mod tests {
         assert_eq!(human_ms(1210), "1.21 s");
         assert_eq!(clock_of("2026-10-27T11:05:22.994Z"), "11:05:22.994");
         assert_eq!(compact_json(&json!({"id":"f1","n":2})), "id=f1 n=2");
+    }
+
+    /// Q3: scope matching lives with the model, not the reducer.
+    #[test]
+    fn scope_matching_rules() {
+        let s = vec![
+            "api.test".to_string(),
+            "*.shop.test".to_string(),
+            "h.test:8443".to_string(),
+        ];
+        assert!(scope_covers(&s, "api.test"));
+        assert!(scope_covers(&s, "api.test:443"));
+        assert!(scope_covers(&s, "shop.test"));
+        assert!(scope_covers(&s, "a.b.shop.test"));
+        assert!(scope_covers(&s, "h.test:8443"));
+        assert!(!scope_covers(&s, "h.test"));
+        assert!(!scope_covers(&s, "notshop.test"));
+        assert!(!scope_covers(&[], "api.test"));
+    }
+
+    /// Q7: the row's content type comes from `Message::content_type`, so the
+    /// two cannot drift (parameters stripped, lowercased).
+    #[test]
+    fn apply_detail_uses_the_message_content_type() {
+        let d = FlowDetail::from_json(&json!({"id":"f1",
+            "response":{"status":200,"headers":[["Content-Type"," Text/HTML ; charset=utf-8"]]}}))
+        .unwrap();
+        let mut row = FlowRow::from_summary(&json!({"id":"f1"}), 1).unwrap();
+        row.apply_detail(&d);
+        assert_eq!(
+            row.content_type,
+            d.response.as_ref().unwrap().content_type()
+        );
+        assert_eq!(row.content_type.as_deref(), Some("text/html"));
     }
 
     #[test]

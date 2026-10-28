@@ -1,41 +1,27 @@
 //! TUI plan Task 4: `aitm tui` embeds the proxy in one process. `main` builds
-//! the proxy exactly as the server path does and then constructs **two**
-//! `McpServer`s over the same `Arc<Registry>` and services: one served on the
-//! configured agent transport, one wrapped as `Arc<McpServer>` whose `handle`
-//! becomes the TUI's in-process bus handler. This test wires the same shape
-//! and drives the handler through `aitm_bus_client::BusClient` over
-//! `InProcessTransport` — the literal contract the TUI relies on
-//! (foundation §4.1–4.2, §4.10).
+//! the proxy exactly as the server path does and then `tui::build_servers`
+//! constructs **two** `McpServer`s over the same `Arc<Registry>` and services:
+//! one served on the configured agent transport (loopback TCP only — `None`
+//! for stdio, which would share the terminal), one wrapped as
+//! `Arc<McpServer>` whose `handle` becomes the TUI's in-process bus handler.
+//! This test calls that same `build_servers` and drives the handler through
+//! `aitm_bus_client::BusClient` over `InProcessTransport` — the literal
+//! contract the TUI relies on (foundation §4.1–4.2, §4.10).
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+mod support;
+
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use aitm::wire::{assemble, Assembled, Http1Sender};
+use aitm::tui::build_servers;
 use aitm_bus_client::{BusClient, InProcessHandler, InProcessTransport};
 use aitm_core::{
-    Body, Config, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow, HttpRequest,
-    HttpVersion, InterceptState, McpTransport, PipelineClient, ProxyClient, ScopeRateGuard,
+    Body, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow, HttpRequest,
+    HttpVersion, InterceptState, McpTransport,
 };
 use aitm_mcp::McpServer;
 use serde_json::{json, Value};
-
-fn temp_ca_dir(tag: &str) -> PathBuf {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("aitm-tui-embed-{tag}-{nanos}-{n}"))
-}
-
-fn config(tag: &str) -> Config {
-    let mut cfg = Config::default();
-    cfg.ca.dir = temp_ca_dir(tag);
-    cfg
-}
+use support::{assemble_services, config};
 
 /// The two servers `aitm tui` builds, plus the shared store so a test can
 /// observe that both see one proxy.
@@ -48,38 +34,19 @@ struct Embedded {
     store: Arc<dyn FlowStore>,
 }
 
-/// Mirror `main`'s `tui` wiring: `assemble`, the shared service handles, then
-/// two `McpServer`s over the same Arcs.
+/// `main`'s `tui` wiring: `assemble`, the shared service handles, then
+/// `build_servers` over a loopback-TCP agent transport.
 fn embed(tag: &str) -> Embedded {
-    let cfg = config(tag);
-    let Assembled { proxy, ca: _ } = assemble(&cfg).expect("assemble");
-    let registry = proxy.registry_arc();
-    let store = proxy.store();
-    let guard: Arc<dyn ScopeRateGuard> = proxy.guard();
-    let client: Arc<dyn ProxyClient> = Arc::new(PipelineClient::new(
-        store.clone(),
-        guard.clone(),
-        Arc::new(Http1Sender::new().with_insecure(cfg.ssl_insecure)),
-    ));
-
-    let agent = McpServer::new(
-        registry.clone(),
-        McpTransport::LoopbackTcp {
-            port: 0,
-            token: "test-token".into(),
-        },
-    )
-    .with_services(store.clone(), client.clone(), guard.clone(), None);
-
-    let ui = Arc::new(McpServer::new(registry, McpTransport::Stdio).with_services(
-        store.clone(),
-        client,
-        guard,
-        None,
-    ));
-    let handler: InProcessHandler = Arc::new(move |line: &str| ui.handle(line));
+    let mut cfg = config(tag);
+    cfg.mcp.transport = McpTransport::LoopbackTcp {
+        port: 0,
+        token: "test-token".into(),
+    };
+    let (_proxy, services) = assemble_services(&cfg);
+    let store = services.store.clone();
+    let (agent, handler) = build_servers(&cfg, services);
     Embedded {
-        agent,
+        agent: agent.expect("a loopback-TCP transport gets an agent server"),
         handler,
         store,
     }
@@ -167,4 +134,20 @@ async fn both_servers_see_the_one_embedded_proxy() {
 
     let via_agent = flow_list_via_handle(&embedded.agent);
     assert_eq!(via_agent, via_tui, "agent and TUI servers share one store");
+}
+
+/// A stdio agent transport would share the terminal with the UI, so
+/// `build_servers` serves no agent server for it; the TUI side still answers.
+#[test]
+fn a_stdio_agent_transport_gets_no_agent_server_beside_the_tui() {
+    let mut cfg = config("stdio");
+    cfg.mcp.transport = McpTransport::Stdio;
+    let (_proxy, services) = assemble_services(&cfg);
+    let (agent, handler) = build_servers(&cfg, services);
+    assert!(agent.is_none(), "stdio is not served beside the TUI");
+    let reply = handler(&json!({"jsonrpc":"2.0","id":1,"method":"ping","params":{}}).to_string())
+        .expect("the TUI-side server replies");
+    let reply: Value = serde_json::from_str(&reply).expect("reply is JSON");
+    assert_eq!(reply["id"], 1);
+    assert!(reply["result"].is_object(), "{reply}");
 }

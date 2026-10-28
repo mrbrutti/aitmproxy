@@ -12,11 +12,19 @@ use crate::app::{App, BusStatus, Chip, Mode, PromptKind};
 use crate::model::{human_bytes, AgentPolicy};
 use crate::theme::Theme;
 use crate::tokens::glyph;
-use crate::ui::text::{fit, truncate, width};
+use crate::ui::text::{cells, truncate, width};
+use crate::ui::FrameView;
 
 /// The toolbar shows its `: palette · layout · b sidebar` hints from this
 /// width up; narrower, the agent toggle alone is the right cluster.
 pub const TOOLBAR_HINTS_COLS: u16 = 150;
+
+/// The intercept bar's Kill hint: the abort mode is fixed at connection
+/// reset until core follow-up F3 adds 429/503.
+pub const KILL_HINT: &str = "[d Kill · abort mode: reset (429/503 need F3)]";
+
+/// The status bar's throughput cluster: live rates need the F4 push stream.
+pub const THROUGHPUT_PLACEHOLDER: &str = "↑ — ↓ — (F4)";
 
 /// Write a line, clipped to the area.
 pub fn put(buf: &mut Buffer, area: Rect, line: Line<'_>) {
@@ -31,7 +39,7 @@ pub fn put_sides(buf: &mut Buffer, area: Rect, left: Line<'_>, right: Line<'_>) 
     if area.height == 0 {
         return;
     }
-    let rw = right.width() as u16;
+    let rw = cells(right.width());
     buf.set_line(area.x, area.y, &left, area.width.saturating_sub(rw + 1));
     if rw < area.width {
         buf.set_line(area.x + area.width - rw, area.y, &right, rw);
@@ -116,11 +124,11 @@ pub fn toolbar(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     right.push(Span::raw(" "));
     let right = Line::from(right);
 
-    let lw = Line::from(left.clone()).width() as u16;
-    let rw = right.width() as u16;
+    let lw = cells(Line::from(left.clone()).width());
+    let rw = cells(right.width());
     buf.set_line(area.x, area.y, &Line::from(left), area.width);
     if lw + rw + 2 < area.width {
-        let pw = pill.width() as u16;
+        let pw = cells(pill.width());
         let free_start = lw;
         let free_end = area.width.saturating_sub(rw);
         let x = if pw + 2 <= free_end.saturating_sub(free_start) {
@@ -188,8 +196,8 @@ pub fn chips(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     put_sides(buf, area, left, right);
 }
 
-pub fn intercept(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    let paused = app.paused();
+pub fn intercept(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut Buffer) {
+    let paused = &view.paused;
     if paused.is_empty() {
         if !app.intercept_armed {
             return;
@@ -215,7 +223,7 @@ pub fn intercept(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         return;
     }
     buf.set_style(area, theme.intercept_bar());
-    let target = app.intercept_target();
+    let target = view.intercept_target(app);
     let (desc, edited) = match target {
         Some(r) => {
             let d = format!("{} {}", r.method, r.url());
@@ -228,9 +236,9 @@ pub fn intercept(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     };
     let edited_note = if edited { " · edited" } else { "" };
     let actions = if app.mode == Mode::Edit {
-        "[^S Apply & Resume] [^R Revert] [Esc Cancel]"
+        "[^S Apply & Resume] [^R Revert] [Esc Cancel]".to_string()
     } else {
-        "[a Resume] [A Resume all] [d Kill] [e Edit] [i Disarm]"
+        format!("[a Resume] [A Resume all] {KILL_HINT} [e Edit] [i Disarm]")
     };
     let count = format!(" {} {} paused", glyph::INTERCEPT, paused.len());
     let left = Line::from(vec![
@@ -257,7 +265,7 @@ pub fn intercept(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     }
 }
 
-pub fn status(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
+pub fn status(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut Buffer) {
     buf.set_style(area, theme.raised());
     // The key hints for this mode, most important first; the right-most are
     // dropped when the centre counts would not fit otherwise.
@@ -307,6 +315,13 @@ pub fn status(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             ("Esc", "back"),
         ],
         Mode::Compose => vec![("Tab", "next field"), ("^S", "send"), ("Esc", "cancel")],
+        Mode::Ca => vec![
+            ("e", "export"),
+            ("i", "install"),
+            ("u", "uninstall"),
+            ("Esc", "back"),
+        ],
+        Mode::Browser => vec![(":", "browser.* commands"), ("Esc", "back")],
         _ => vec![("Esc", "back")],
     };
     let hint_line = |hints: &[(&str, &str)]| -> Line<'static> {
@@ -329,17 +344,15 @@ pub fn status(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         };
         Line::styled(t.text.clone(), style.add_modifier(Modifier::BOLD))
     } else {
-        let vis = app.visible().len();
-        let pos = app
-            .selected
-            .as_deref()
-            .and_then(|id| app.visible().iter().position(|&i| app.flows[i].id == id))
+        let vis = view.visible.len();
+        let pos = view
+            .selected_pos(app)
             .map_or("–".to_string(), |p| (p + 1).to_string());
         let mut spans = vec![Span::styled(
             format!("{pos} / {vis} rows"),
             theme.text_secondary(),
         )];
-        let paused = app.paused().len();
+        let paused = view.paused.len();
         if paused > 0 {
             spans.push(Span::styled(
                 format!(" · {paused} paused"),
@@ -372,21 +385,24 @@ pub fn status(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             "bus down · retrying".to_string(),
         ),
     };
+    // Throughput needs the F4 push stream; until then the cluster says so
+    // (§2.7 "Status bar": `196 MB ↑ 6 KB/s ↓ 3 KB/s`).
     let right = Line::from(vec![
         Span::styled(human_bytes(app.total_bytes()), theme.text_secondary()),
+        Span::styled(format!(" {THROUGHPUT_PLACEHOLDER}"), theme.text_tertiary()),
         Span::styled("  ● ", bus_dot),
         Span::styled(format!("{bus_text} "), theme.text_secondary()),
     ]);
 
-    let rw = right.width() as u16;
-    let cw = center.width() as u16;
+    let rw = cells(right.width());
+    let cw = cells(center.width());
     // Drop hints from the right before touching the centre counts.
     let mut left_line = hint_line(&hints);
-    while !hints.is_empty() && (left_line.width() as u16).saturating_add(cw + 2 + rw) > area.width {
+    while !hints.is_empty() && cells(left_line.width()).saturating_add(cw + 2 + rw) > area.width {
         hints.pop();
         left_line = hint_line(&hints);
     }
-    let lw = left_line.width() as u16;
+    let lw = cells(left_line.width());
     buf.set_line(area.x, area.y, &left_line, area.width.saturating_sub(rw));
     if lw + rw < area.width {
         buf.set_line(area.x + area.width - rw, area.y, &right, rw);
@@ -419,10 +435,34 @@ pub fn prompt(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             "scope add:",
             "host · host:port · *.wildcard — a human action",
         ),
-        PromptKind::PocName => ("poc name:", "⏎ build from the selected flow (poc.build)"),
-        PromptKind::PocTarget => ("target:", "base URL for `target` · ⏎ run (poc.run)"),
+        PromptKind::PocName => (
+            "poc name:",
+            "human title for the finding · blank = none · ⏎ next (param)",
+        ),
+        PromptKind::PocParam => (
+            "poc param:",
+            "query parameter to parameterize · blank = none · ⏎ build (poc.build)",
+        ),
+        PromptKind::PocTarget => (
+            "target:",
+            "base URL for `target` · blank = the PoC's own · ⏎ next (vars)",
+        ),
+        PromptKind::PocVars => ("vars:", "k=v k2=v2 … · blank = none · ⏎ run (poc.run)"),
+        PromptKind::CaExport => (
+            "ca export:",
+            "[pem|der] [path] · blank = defaults · ⏎ export (ca.export)",
+        ),
+        PromptKind::Confirm => ("confirm:", "y runs it · n / Esc cancels"),
     };
-    let text = format!(" {sigil} {}", app.prompt);
+    let text = match (kind, &app.confirm) {
+        (PromptKind::Confirm, Some(c)) => {
+            format!(
+                " {sigil} {} — {} [y/N] {}",
+                c.name, c.description, app.prompt
+            )
+        }
+        _ => format!(" {sigil} {}", app.prompt),
+    };
     let cursor = Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED));
     let left = Line::from(vec![
         Span::styled(text, theme.text_primary().add_modifier(Modifier::BOLD)),
@@ -434,5 +474,4 @@ pub fn prompt(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     } else {
         put_sides(buf, area, left, right);
     }
-    let _ = fit;
 }

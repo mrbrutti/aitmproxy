@@ -23,6 +23,11 @@ serde_json with `preserve_order`, tokio, futures, anyhow).
 
 ## Tasks
 
+Manifests touched by the skeleton (Tasks 1–3): workspace `Cargo.toml` (members + path deps),
+`Cargo.lock` (ratatui 0.30, crossterm 0.29, similar 2, unicode-width 0.2 and ratatui's
+sub-crates), `crates/aitm-bus-client/Cargo.toml`, `crates/aitm-tui/Cargo.toml` — declared here
+after the fact (spec review I5).
+
 ### Task 1: tokens generator (done)
 - **Satisfies:** §2.10(c) "generated tokens.rs"; §2.5 glyph map.
 - **Files:** `crates/aitm-tui/build.rs`, `src/tokens.rs`, `src/theme.rs`.
@@ -77,6 +82,42 @@ serde_json with `preserve_order`, tokio, futures, anyhow).
 ### Task 9: panel review + fixes
 - `security-reviewer`, `quality-reviewer`, `spec-reviewer` in parallel on the whole branch diff vs `main`; fixes dispatched as fix tasks; log below.
 
+### Task 10: Browser view (decision 1, parent session 2026-10-28: build it)
+- **Satisfies:** §2.7 "Browser view … TUI: URL + last screenshot as placeholder + `get_dom` text outline; navigate/eval available"; §2.9 "URL, DOM outline, last screenshot placeholder"; §3.9 Embedded browser view, tui ◐ no viewport. The six `browser.*` commands exist today; F14 (`browser.tabs`, screencast) stays a labelled follow-up.
+- **Depends on:** the panel-1 fix tasks (they own `app.rs`/`ui/**` until they land).
+- **Files:** `crates/aitm-tui/src/app.rs` (`Mode::Browser`, `BrowserState { url, dom: Option<String>, dom_outline: Vec<String>, screenshot: Option<(u32,u32,&'static str, usize)>, last_eval: Option<String>, busy: Option<&'static str> }`, actions), `crates/aitm-tui/src/ui/browser.rs` (create: URL line, screenshot placeholder `[screenshot W×H PNG · o to open]`, DOM outline, eval result, key hints), `crates/aitm-tui/src/ui/mod.rs` (dispatch), `crates/aitm-tui/src/keys.rs` (`Mode::Browser` map: `g` navigate prompt, `e` eval prompt, `d` refresh DOM, `s` screenshot, `o` open screenshot, Esc), `crates/aitm-tui/src/action.rs` (`BusRequest::Browser{Navigate(url)|Eval(expr)|GetDom|Screenshot}` or reuse `Call`), `crates/aitm-tui/src/bus.rs` (route `browser.screenshot` bytes: base64 → `CallOk` value stays; app decodes), `crates/aitm-tui/fixtures/bus-fixture.json` (fixture answers `browser.get_dom` with a small HTML document and `browser.screenshot` with a 1×1 PNG so the panel renders in tests), `crates/aitm-tui/src/fixture.rs`, README (Browser section), `crates/aitm-tui/tests/tester_components.rs` (one panel test).
+- **Change:** sidebar `Browser` opens `Mode::Browser`; `:browser` too. DOM outline = tag path per element, indented, first 200 lines (a tiny tag scanner, no HTML crate: track `<tag`, skip `</`, `script`/`style` bodies, attributes `id`/`class` shown). Screenshot bytes go through `viewers::image::dimensions` for the placeholder and are kept for `o` (open via `open::body_to_temp_file`). Errors from `browser.*` (no engine) show in the panel, not only as a toast. Flows the browser produces already appear in the list with client `obscura`.
+- **Test:** fixture app → `Action::OpenBrowser` → render contains `Browser`, the URL, `[screenshot 1×1 PNG`, and an outline line `html › body › h1`; `:browser.navigate url=https://x` from the panel yields `BusRequest::Call { name: "browser.navigate", .. }`; the bus `CallOk { name: "browser.get_dom" }` fills `dom_outline`.
+- **Done when:** the test passes and the gate passes.
+
+## Follow-up plan (descoped from v1 pending Matt — decisions 2 and 3, 2026-10-28)
+
+Recorded here so the departure from the foundation is explicit (spec §0). Each item is a
+labelled "not in this pass" in the README; none is faked.
+
+| Item | Foundation ref | Note |
+|---|---|---|
+| Split view (two lists ≥ 160 cols, else tabbed) | §2.6, §2.9, §3.1 | `:split` toasts "not built in v1"; `SPLIT_COLS` kept for it |
+| Saved filters | §3.2 | surface-local state; needs a config/state file decision shared with the GUIs |
+| Match highlighting in body viewers | §3.2 | needs the filter's matched spans threaded into viewers |
+| Sidebar quick filter (⌘⇧F) | §2.7, §3.2 | the sidebar is 28 cols; a filter line fits |
+| Compose templates beyond GET / POST-JSON / POST-Form; Query field; body modes | §2.7, §3.5 | multipart needs a body builder |
+| Message templates for edits | §3.4 | |
+| WebSocket sent/received filter | §3.7 | `~ws` + direction atom |
+| Setup guides text | §3.6 | content only |
+| Column hide (fixed set) | §3.1 | `:columns` toggles |
+| Palette recent / pinned | §2.7 | |
+| Comment column; mark swatch beyond the first colour | §2.7 | |
+| JSON tree: copy node value, filter, sort keys | §3.3 | |
+| Kitty/sixel inline images | §2.9 | optional by design; `caps` already detects them |
+| `app.rs` module split (`app/{compose,edit,palette,commands}.rs`) | quality Q3 | refactor once no fix task is in the file |
+
+Accepted additions (decision 4): sidebar items "All flows" and "Agent", `:curl`, Ctrl-K/Ctrl-F,
+`AITM_BUS`/`AITM_BUS_TOKEN`, `--token` (marked insecure), PoC key `P` (spec erratum: §2.8's
+`p` collides with pin), diff threshold by pane width, intercept bar above the inspector when it
+is shown. F1 (operator identity + confirm on the wire) is owned by the M4 milestone spec; the
+TUI's local y/N confirmation for `ca.install`/`ca.uninstall` is the interim guard until it lands.
+
 ## Review log
 
 | Task | Reviewer | Severity | Finding | Disposition |
@@ -91,6 +132,18 @@ serde_json with `preserve_order`, tokio, futures, anyhow).
 | 3 | Tester (pass 1) | Observation | O1 diff threshold is the pane width, not terminal columns | accepted by lead: the pane is what the diff has |
 | 3 | Tester (pass 1) | Observation | O2 intercept bar between list and inspector (mockup) vs "above the status bar" (§2.7 text) | accepted by lead: follows the mockup |
 | 3 | Tester (pass 1) | Observation | O4 `on_bus(Flows)` is O(n²), 160 ms at 5 000 flows | follow-up if it grows; fix allowed in the fix task when small |
+| 1–7 | Tester (pass 1) | — | F1–F7 | fixed in 3752a5b (all six pinned tests green) |
+| 3, 4 | Security (panel 1) | Important | S1 `ca.install`/`ca.uninstall` reachable from the palette with no confirmation; TUI identity is `Frontend::Mcp` until F1 | fix task A (local y/N gate); F1 priority raised with the parent session |
+| 3 | Security (panel 1) | Important | S2 un-deadlined Myers diff per frame | fix task A (50 ms deadline + input caps) |
+| 3 | Security (panel 1) | Minor | S3–S9 details never pruned, `--token` on argv, non-loopback `--bus`, log file mode, TCP line cap, compose width underflow, filter recursion depth | fix tasks A/B |
+| 3, 4, 6 | Quality (panel 1) | Important | Q1 bus poll drops a row on a per-flow `flow.get` error; malformed `flow.detail` silent · Q2 embed tests hand-roll the wiring | fix task B |
+| 1–7 | Quality (panel 1) | Minor | Q3–Q12 structure, dead code, `ToolInfo` duplicate, per-frame passes, test bounds, clipboard/-32001 handling, casts, F-labels, build.rs | fix tasks A/B; Q3's `app.rs` split deferred to a follow-up (two writers in the file now) |
+| 3 | Spec (panel 1) | Critical | C1 `o` open-externally only toasts | fix task A/B (real open via `open`/`xdg-open`) |
+| 3 | Spec (panel 1) | Critical | C2 Browser view absent (browser.* exist today) | **Matt**: lead recommends building it next; relabelled "not built yet" meanwhile |
+| 3 | Spec (panel 1) | Critical | C3 Split view absent | **Matt**: lead recommends descoping for v1; README corrected |
+| 3 | Spec (panel 1) | Critical | C4 catalog rows with no core dependency missing (saved filters, highlighting, templates, column hide, poc param/vars, YAML from disk …) | fix task A does poc `param`/`vars`/YAML-from-disk + compose templates; the rest **Matt**: build vs descope |
+| 3 | Spec (panel 1) | Important | I1 F-dependent features absent silently · I2 no confirm/CA panel · I3 no regex operator · I4 additions (All flows, Agent item, :curl, Ctrl-K, env vars) · I5 undeclared manifests / mixed commit | A: I1, I2, I3 · I4 **Matt** (lead recommends accepting) · I5 fixed in this plan text; one commit per task from here |
+| 3 | Spec (panel 1) | Minor | O1 diff threshold by pane width · O2 intercept bar placement · `P` vs `p` in the findings empty state · param names in bus.rs · extra key aliases · fixture advertises F-tools · manual evidence · note drift | README wording (A); acceptances for **Matt**; honest `--snapshot-core` (B); Terminal-panel evidence: `cargo run -p aitm -- --config … tui` showed two curl flows via the in-process bus; `cargo test -p aitm --test tui_live_bus` → `1 passed` in a real shell |
 
 ## Shipped
 

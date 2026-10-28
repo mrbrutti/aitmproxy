@@ -29,8 +29,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt as _, AsyncWriteExt, BufReader};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
@@ -40,6 +40,12 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// How many unsolicited server lines are buffered for slow subscribers.
 const NOTIFICATION_CAPACITY: usize = 256;
+
+/// The longest reply line the TCP transport will buffer (64 MiB). A line that
+/// grows past this closes the connection as gone instead of growing the
+/// client's memory without bound; it is far above any real `flow.detail`
+/// with an inline body.
+pub const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
 
 /// A boxed, sendable future, as returned by [`BusTransport::send`].
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -262,17 +268,31 @@ impl BusTransport for TcpTransport {
 
 /// Split the socket into lines and route each: a reply to its waiter, a
 /// notification to subscribers, a `null`-id error (the token refusal) to every
-/// waiter. On EOF or error every waiter is failed so nothing hangs.
-async fn read_loop(
-    read_half: OwnedReadHalf,
+/// waiter. On EOF, a read error, or a line over [`MAX_LINE_BYTES`] every
+/// waiter is failed so nothing hangs.
+async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
+    read_half: R,
     pending: Arc<Mutex<Pending>>,
     notify: broadcast::Sender<String>,
 ) {
-    let mut lines = BufReader::new(read_half).lines();
+    // `take` caps how much one `read_until` may pull: a line that fills the
+    // whole allowance without a newline is over the cap. The limit is reset
+    // before every line.
+    let allowance = MAX_LINE_BYTES as u64 + 1;
+    let mut reader = BufReader::new(read_half).take(allowance);
+    let mut buf: Vec<u8> = Vec::new();
     let why = loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
-                let line = line.trim().to_string();
+        buf.clear();
+        reader.set_limit(allowance);
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) => break "server closed the connection".to_string(),
+            Ok(_) => {
+                if buf.last() != Some(&b'\n') && buf.len() > MAX_LINE_BYTES {
+                    break "reply line over 64 MiB".to_string();
+                }
+                // No trailing newline with room to spare is EOF mid-line: the
+                // partial line is handled and the next read reports the close.
+                let line = String::from_utf8_lossy(&buf).trim().to_string();
                 if line.is_empty() {
                     continue;
                 }
@@ -303,7 +323,6 @@ async fn read_loop(
                     }
                 }
             }
-            Ok(None) => break "server closed the connection".to_string(),
             Err(e) => break format!("read error: {e}"),
         }
     };
@@ -543,4 +562,85 @@ pub fn read_token_file(path: &Path) -> anyhow::Result<String> {
         path.display()
     );
     Ok(token.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run `read_loop` over an in-memory pipe and return the close reason it
+    /// recorded once the writer side is done.
+    async fn close_reason_after(write: impl FnOnce(tokio::io::DuplexStream)) -> Option<Closed> {
+        let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let (notify, _) = broadcast::channel(4);
+        let reader = tokio::spawn(read_loop(client_end, pending.clone(), notify));
+        write(server_end);
+        reader.await.expect("read_loop does not panic");
+        let closed = pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .closed
+            .clone();
+        closed
+    }
+
+    #[tokio::test]
+    async fn a_line_over_the_cap_closes_the_connection_as_gone() {
+        let closed = close_reason_after(|mut server| {
+            tokio::spawn(async move {
+                let chunk = vec![b'x'; 1024 * 1024];
+                let mut left = MAX_LINE_BYTES + 1;
+                while left > 0 {
+                    let n = left.min(chunk.len());
+                    if server.write_all(&chunk[..n]).await.is_err() {
+                        return;
+                    }
+                    left -= n;
+                }
+                let _ = server.write_all(b"\n").await;
+            });
+        })
+        .await;
+        match closed {
+            Some(Closed::Gone(why)) => assert_eq!(why, "reply line over 64 MiB"),
+            Some(Closed::Refused(line)) => panic!("refused? {line}"),
+            None => panic!("the connection was not closed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_line_exactly_at_the_cap_is_delivered() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let (tx, rx) = oneshot::channel();
+        pending.lock().unwrap().waiters.insert("1".into(), tx);
+        let (client_end, mut server_end) = tokio::io::duplex(64 * 1024);
+        let (notify, _) = broadcast::channel(4);
+        let reader = tokio::spawn(read_loop(client_end, pending.clone(), notify));
+        let prefix = br#"{"jsonrpc":"2.0","id":1,"result":""#;
+        let suffix = br#""}"#;
+        let pad = MAX_LINE_BYTES - prefix.len() - suffix.len();
+        tokio::spawn(async move {
+            let _ = server_end.write_all(prefix).await;
+            let chunk = vec![b'y'; 1024 * 1024];
+            let mut left = pad;
+            while left > 0 {
+                let n = left.min(chunk.len());
+                if server_end.write_all(&chunk[..n]).await.is_err() {
+                    return;
+                }
+                left -= n;
+            }
+            let _ = server_end.write_all(suffix).await;
+            let _ = server_end.write_all(b"\n").await;
+            // Dropping the writer is the server hanging up afterwards.
+        });
+        let reply = rx.await.expect("the capped line reaches its waiter");
+        assert_eq!(reply.len(), MAX_LINE_BYTES);
+        reader.await.expect("read_loop ends on EOF");
+        assert!(matches!(
+            pending.lock().unwrap().closed,
+            Some(Closed::Gone(ref why)) if why == "server closed the connection"
+        ));
+    }
 }

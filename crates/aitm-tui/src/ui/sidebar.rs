@@ -164,9 +164,16 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             true,
         ),
     );
+    // The browser view is a TUI build item, not a core follow-up: say so
+    // rather than borrow an F-number.
     line(
         buf,
-        item(app, SidebarItem::Browser, Some("F14".into()), false),
+        item(
+            app,
+            SidebarItem::Browser,
+            Some("not built yet".into()),
+            false,
+        ),
     );
     line(
         buf,

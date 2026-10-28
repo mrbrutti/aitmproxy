@@ -9,15 +9,15 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use aitm_bus_client::BusTransport;
 use aitm_tui::action::Action;
-use aitm_tui::app::{parse_kv_args, scope_covers, App, ComposeForm, EditBuffer, Mode, PromptKind};
+use aitm_tui::app::{parse_kv_args, App, ComposeForm, EditBuffer, Mode, PromptKind};
 use aitm_tui::base64;
 use aitm_tui::filter;
 use aitm_tui::fixture::{Fixture, FixtureTransport};
 use aitm_tui::fixture_app;
 use aitm_tui::keys;
 use aitm_tui::model::{
-    AgentPolicy, AgentState, Finding, FlowDetail, FlowKind, FlowRow, Intercept, Message, Meta,
-    Origin, Severity,
+    scope_covers, AgentPolicy, AgentState, Finding, FlowDetail, FlowKind, FlowRow, Intercept,
+    Message, Meta, Origin, Severity,
 };
 use aitm_tui::ui::text::{elide_middle, fit, right, truncate, width};
 use aitm_tui::viewers;
@@ -298,10 +298,38 @@ fn filter_parser_never_panics_and_names_each_error() {
         "~s 2xxxx",
         "~u \\",
         "~u %",
+        // Regex arguments (fix pass 1, I3) and their edges.
+        "/",
+        "//",
+        "/(/",
+        "~u //",
+        "~u /(/",
+        "~u /\\/",
+        "~b /a/ /b/",
+        "~m /GET/",
+        "~d /(?i)x/",
+        "~u /x{99999}/",
+        "~u \"/x/\"",
+        "/日本/",
     ];
     for s in inputs {
         let _ = filter::parse(s);
     }
+    assert!(filter::parse("~u /(/")
+        .unwrap_err()
+        .starts_with("bad regex /(/: "));
+    assert_eq!(
+        filter::parse("~m /GET/").unwrap_err(),
+        "`~m` takes a literal, not a regex"
+    );
+    assert_eq!(
+        filter::parse(&format!("{}~a", "!".repeat(10_000))).unwrap_err(),
+        "expression too deep"
+    );
+    assert!(
+        filter::parse("~u /x{99999}/").is_err(),
+        "a regex past the size limit is refused, not compiled"
+    );
     assert_eq!(filter::parse("~").unwrap_err(), "`~` needs a name");
     assert_eq!(filter::parse("((").unwrap_err(), "expression ends early");
     assert_eq!(filter::parse("\"").unwrap_err(), "unterminated quote");
@@ -539,6 +567,8 @@ fn every_mode() -> Vec<Mode> {
         Mode::Scope,
         Mode::Findings,
         Mode::Agent,
+        Mode::Ca,
+        Mode::Browser,
         Mode::Help,
         Mode::QuickLook,
     ];
@@ -550,7 +580,11 @@ fn every_mode() -> Vec<Mode> {
         PromptKind::Pin,
         PromptKind::ScopeAdd,
         PromptKind::PocName,
+        PromptKind::PocParam,
         PromptKind::PocTarget,
+        PromptKind::PocVars,
+        PromptKind::CaExport,
+        PromptKind::Confirm,
     ] {
         v.push(Mode::Prompt(k));
     }
@@ -579,6 +613,29 @@ fn app_in(mode: Mode) -> App {
         }
         Mode::Prompt(PromptKind::PocName) => {
             let _ = app.update(Action::BuildPoc);
+        }
+        Mode::Prompt(PromptKind::PocParam) => {
+            let _ = app.update(Action::BuildPoc);
+            let _ = app.update(Action::Submit);
+        }
+        Mode::Prompt(PromptKind::PocTarget) => {
+            app.mode = Mode::Findings;
+            let _ = app.update(Action::Command("poc-rerun".into()));
+        }
+        Mode::Prompt(PromptKind::PocVars) => {
+            app.mode = Mode::Findings;
+            let _ = app.update(Action::Command("poc-rerun".into()));
+            let _ = app.update(Action::Submit);
+        }
+        Mode::Prompt(PromptKind::CaExport) => {
+            let _ = app.run_command("ca");
+            let _ = app.update(Action::Command("ca-export-prompt".into()));
+        }
+        Mode::Prompt(PromptKind::Confirm) => {
+            let _ = app.run_command("ca.install");
+        }
+        Mode::Ca => {
+            let _ = app.run_command("ca");
         }
         other => app.mode = other,
     }
@@ -799,10 +856,25 @@ fn run_command_survives_odd_lines_and_reports_each_problem() {
         "import x",
         "日本語",
         "~m GET",
+        // Fix pass 1 commands.
+        "split",
+        "export",
+        "ca",
+        "ca-export-prompt",
+        "ca.install",
+        "ca.install dry_run=true",
+        "browser",
+        "compose post-json",
+        "compose ws",
+        "compose nope",
+        "compose ",
+        "filter ~u /(/",
+        "filter ~u /^https/",
     ];
     for cmd in odd {
         let _ = app.run_command(cmd);
         app.mode = Mode::Flows;
+        app.confirm = None;
     }
     assert!(app.run_command("flow.get").is_empty());
     assert_eq!(toast(&app), "flow.get: missing required `id`");
@@ -829,7 +901,8 @@ fn run_command_survives_odd_lines_and_reports_each_problem() {
         app.run_command("poc run x y z"),
         vec![aitm_tui::action::BusRequest::PocRun {
             poc_path: "x".into(),
-            target: Some("y z".into())
+            target: Some("y z".into()),
+            vars: None
         }]
     );
     let _ = app.run_command("layout sideways");

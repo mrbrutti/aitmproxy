@@ -307,7 +307,7 @@ impl Fixture {
                     .and_then(Value::as_str)
                     .ok_or_else(|| "missing `authority`".to_string())?
                     .to_string();
-                if !crate::app::scope_covers(&self.scope, &authority) {
+                if !crate::model::scope_covers(&self.scope, &authority) {
                     return Err(format!("{authority} is out of scope"));
                 }
                 let new_id = self.new_id();

@@ -9,11 +9,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Widget};
 
 use crate::app::{App, PaletteKind, BUILTIN_COMMANDS};
-use crate::model::{clock_of, AgentPolicy, FlowKind, Origin};
+use crate::model::{clock_of, scope_covers, AgentPolicy, FlowKind, Origin};
 use crate::theme::Theme;
 use crate::tokens::{color, glyph};
 use crate::ui::centered;
-use crate::ui::text::{fit, truncate};
+use crate::ui::text::{cells, fit, truncate};
 use crate::viewers;
 
 fn boxed(theme: &Theme, title: &str, area: Rect, buf: &mut Buffer) -> Rect {
@@ -38,7 +38,7 @@ fn lines_into(buf: &mut Buffer, area: Rect, lines: &[Line<'_>], scroll: usize) {
         .take(usize::from(area.height))
         .enumerate()
     {
-        buf.set_line(area.x, area.y + k as u16, line, area.width);
+        buf.set_line(area.x, area.y + cells(k), line, area.width);
     }
 }
 
@@ -65,7 +65,7 @@ pub fn palette(app: &App, theme: &Theme, screen: Rect, prompt_line: Rect, buf: &
     // it to the rows available there, and draw nothing when fewer than three
     // fit (border, one item, border) — a short terminal keeps the prompt.
     let above = prompt_line.y.saturating_sub(screen.y);
-    let h = ((items.len().min(10) + 2) as u16).min(above);
+    let h = cells(items.len().min(10) + 2).min(above);
     let w = screen.width.min(100);
     if h < 3 || w < 4 {
         return;
@@ -83,7 +83,7 @@ pub fn palette(app: &App, theme: &Theme, screen: Rect, prompt_line: Rect, buf: &
         .enumerate()
     {
         let selected = top + k == app.palette_cursor;
-        let row = Rect::new(inner.x, inner.y + k as u16, inner.width, 1);
+        let row = Rect::new(inner.x, inner.y + cells(k), inner.width, 1);
         if selected {
             buf.set_style(row, theme.selection());
         }
@@ -211,7 +211,7 @@ pub fn compose(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             for (k, l) in text.lines().take(usize::from(body_area.height)).enumerate() {
                 buf.set_string(
                     body_area.x,
-                    body_area.y + k as u16,
+                    body_area.y + cells(k),
                     fit(l, usize::from(body_area.width)),
                     theme.text_primary(),
                 );
@@ -222,8 +222,9 @@ pub fn compose(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
                     .count()
                     .saturating_sub(usize::from(!text.is_empty() && !text.ends_with('\n')));
                 let col = text.rsplit('\n').next().map_or(0, |l| l.chars().count());
-                let cy = body_area.y + (last.min(usize::from(body_area.height) - 1)) as u16;
-                let cx = body_area.x + (col.min(usize::from(body_area.width) - 1)) as u16;
+                let cy = body_area.y + cells(last.min(usize::from(body_area.height) - 1));
+                let cx =
+                    body_area.x + cells(col.min(usize::from(body_area.width).saturating_sub(1)));
                 buf.set_style(
                     Rect::new(cx, cy, 1, 1),
                     ratatui::style::Style::default().add_modifier(Modifier::REVERSED),
@@ -238,7 +239,11 @@ pub fn compose(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             );
             if active {
                 let cx = body_area.x
-                    + (text.chars().count().min(usize::from(body_area.width) - 1)) as u16;
+                    + cells(
+                        text.chars()
+                            .count()
+                            .min(usize::from(body_area.width).saturating_sub(1)),
+                    );
                 buf.set_style(
                     Rect::new(cx, body_area.y, 1, 1),
                     ratatui::style::Style::default().add_modifier(Modifier::REVERSED),
@@ -258,7 +263,7 @@ pub fn compose(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     );
     field(buf, body, 3, "Body", &f.body, true);
     let scope_note = match f.authority() {
-        Some(a) if crate::app::scope_covers(&app.scope, &a) => Span::styled(
+        Some(a) if scope_covers(&app.scope, &a) => Span::styled(
             format!("{a} is in scope"),
             theme.fg(&color::status::SUCCESS),
         ),
@@ -309,7 +314,7 @@ pub fn scope(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         let n = app
             .flows
             .iter()
-            .filter(|r| crate::app::scope_covers(std::slice::from_ref(h), &r.authority))
+            .filter(|r| scope_covers(std::slice::from_ref(h), &r.authority))
             .count();
         let style = if i == app.scope_cursor {
             theme.selection().add_modifier(Modifier::BOLD)
@@ -319,7 +324,7 @@ pub fn scope(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         lines.push(Line::from(vec![
             Span::styled(format!(" {} {}", glyph::SCOPE, fit(h, 44)), style),
             Span::styled(
-                format!("{n} flows   rate limit: core default (readout needs F5)"),
+                format!("{n} flows   rate limit: core default (readout needs F7, config.get)"),
                 theme.text_tertiary(),
             ),
         ]));
@@ -328,7 +333,7 @@ pub fn scope(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     let oos: Vec<String> = app
         .domains()
         .into_iter()
-        .filter(|(h, _)| !crate::app::scope_covers(&app.scope, h))
+        .filter(|(h, _)| !scope_covers(&app.scope, h))
         .map(|(h, n)| format!("{h} ({n})"))
         .collect();
     if !oos.is_empty() {
@@ -479,13 +484,127 @@ pub fn findings(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             };
             d.push(Line::styled(format!(" {l}"), style));
         }
+    } else if let Some(e) = &f.yaml_error {
+        d.push(Line::styled(
+            format!(" yaml not readable: {e}"),
+            theme.intercept_armed_quiet(),
+        ));
+    } else {
+        d.push(Line::styled(
+            " yaml: not in the result; read from poc_path only on a loopback bus",
+            theme.text_tertiary(),
+        ));
     }
     d.push(Line::raw(""));
     d.push(Line::styled(
-        " r run again (poc.run) · o open screenshot · export needs core follow-up F13",
+        " r run again (poc.run: target, then vars) · o open screenshot · export needs core follow-up F13",
         theme.text_tertiary(),
     ));
     lines_into(buf, detail, &d, 0);
+}
+
+/// The browser view is not built in this pass (§2.7 "Browser view": URL +
+/// DOM outline + last-screenshot placeholder). The panel says so and lists
+/// the `browser.*` commands the bus does offer, so the operator can still
+/// drive the embedded browser from the palette.
+pub fn browser(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    let inner = boxed(theme, "Browser — not built yet", area, buf);
+    let mut lines = vec![
+        Line::styled(
+            " The browser view (URL · DOM outline · last-screenshot placeholder) is not built in this pass.",
+            theme.text_secondary(),
+        ),
+        Line::styled(
+            " Until it is, drive the embedded browser from the palette with these commands:",
+            theme.text_secondary(),
+        ),
+        Line::raw(""),
+    ];
+    let mut tools: Vec<_> = app
+        .tools
+        .iter()
+        .filter(|t| t.name.starts_with("browser."))
+        .collect();
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    if tools.is_empty() {
+        lines.push(Line::styled(
+            "   (this bus offers no browser.* tools)",
+            theme.text_tertiary(),
+        ));
+    }
+    for t in tools {
+        lines.push(Line::from(vec![
+            Span::styled(format!("   :{:<20}", t.name), theme.accent()),
+            Span::styled(
+                truncate(&t.description, usize::from(inner.width).saturating_sub(26)),
+                theme.text_secondary(),
+            ),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        " e.g. :browser.navigate url=https://example.test · Esc back",
+        theme.text_tertiary(),
+    ));
+    lines_into(buf, inner, &lines, 0);
+}
+
+/// The CA panel (§3.6): the facts `ca.status` reports, and the three
+/// actions — `e` export, `i` install, `u` uninstall (the last two confirmed
+/// locally, see `CONFIRM_TOOLS`).
+pub fn ca(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    let inner = boxed(theme, "CA — the MITM certificate", area, buf);
+    let mut lines = Vec::new();
+    match &app.ca_status {
+        Some(serde_json::Value::Object(map)) if !map.is_empty() => {
+            let w = map.keys().map(String::len).max().unwrap_or(0).min(24);
+            for (k, v) in map {
+                let text = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Null => "—".into(),
+                    other => other.to_string(),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {k:<w$}"), theme.text_secondary()),
+                    Span::raw("  "),
+                    Span::styled(text, theme.text_primary()),
+                ]));
+            }
+        }
+        Some(other) => lines.push(Line::styled(
+            format!(" ca.status: {other}"),
+            theme.text_primary(),
+        )),
+        None if app.has_tool("ca.status") => {
+            lines.push(Line::styled(" loading ca.status…", theme.text_tertiary()))
+        }
+        None => lines.push(Line::styled(
+            " ca.status is not on this bus.",
+            theme.intercept_armed_quiet(),
+        )),
+    }
+    lines.push(Line::raw(""));
+    let avail = |name: &str| {
+        if app.has_tool(name) {
+            String::new()
+        } else {
+            " (not on this bus)".to_string()
+        }
+    };
+    lines.push(Line::styled(
+        format!(
+            " e export{} · i install{} · u uninstall{} · Esc back",
+            avail("ca.export"),
+            avail("ca.install"),
+            avail("ca.uninstall")
+        ),
+        theme.text_tertiary(),
+    ));
+    lines.push(Line::styled(
+        " install/uninstall ask for a local y/N first: the bus has no confirm step until core follow-up F1.",
+        theme.text_tertiary(),
+    ));
+    lines_into(buf, inner, &lines, 0);
 }
 
 pub fn agent(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {

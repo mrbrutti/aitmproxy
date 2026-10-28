@@ -10,9 +10,7 @@
 //! with the configured browser engine attached when it launches, and closes
 //! the browser on every orderly exit path including SIGINT/SIGTERM (spec §D6).
 //! Invoked as `aitm tui` it does the same but with the terminal operator UI in
-//! the process too, over an in-process bus channel (`tui` module).
-
-mod tui;
+//! the process too, over an in-process bus channel (`aitm::tui`).
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -21,7 +19,7 @@ use std::time::Duration;
 
 use aitm::render::render_cli_value;
 use aitm::wire::{assemble, Assembled, Http1Sender};
-use aitm::{config_file, env};
+use aitm::{config_file, env, tui};
 use aitm_core::{BrowserDriver, PipelineClient, ProxyClient};
 use tracing::{info, warn};
 
@@ -61,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     // The TUI owns the terminal, so its subscriber must not write there.
-    let _tui_log = match mode {
+    let tui_log = match mode {
         Mode::Tui => tui::init_tracing(),
         Mode::Server | Mode::Cli(_) => {
             init_tracing();
@@ -129,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
                 client,
                 guard,
                 browser,
-                log_path: _tui_log,
+                log_path: tui_log,
             },
         )
         .await
@@ -147,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
             result = proxy.run(main_listen) => result,
             result = proxy.run_browser(browser_listen) => result,
             result = mcp.serve() => result,
-            () = shutdown_signal() => {
+            () = aitm::shutdown_signal() => {
                 info!("shutdown signal received");
                 Ok(())
             }
@@ -184,36 +182,6 @@ fn split_config_arg(argv: Vec<String>) -> anyhow::Result<(Option<PathBuf>, Vec<S
         return Ok((Some(PathBuf::from(path)), rest.collect()));
     }
     Ok((None, std::iter::once(first).chain(rest).collect()))
-}
-
-/// Resolves on SIGINT (Ctrl-C) or, on Unix, SIGTERM. A handler that cannot be
-/// installed is logged and never fires, so it cannot end the run by itself.
-async fn shutdown_signal() {
-    let interrupt = async {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            warn!(error = %e, "could not install the SIGINT handler");
-            std::future::pending::<()>().await;
-        }
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                term.recv().await;
-            }
-            Err(e) => {
-                warn!(error = %e, "could not install the SIGTERM handler");
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        () = interrupt => {}
-        () = terminate => {}
-    }
 }
 
 /// Install a tracing subscriber (RUST_LOG-driven, defaulting to `info`).
@@ -284,10 +252,6 @@ mod tests {
         assert_eq!(
             parse_mode(args(&["tui", "extra"])),
             Err("usage: aitm [--config <path>] tui (takes no further arguments)".to_string())
-        );
-        assert_eq!(
-            parse_mode(args(&["tui", "extra"])).unwrap_err(),
-            super::tui::USAGE
         );
     }
 }

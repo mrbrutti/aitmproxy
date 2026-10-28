@@ -11,8 +11,9 @@ the same recorded fixture. Design, degradations and the bus contract are in
 ## Run
 
 ```
-usage: aitm-tui (--bus host:port (--token-file p | --token t) | --fixture [path]) [--ansi|--truecolor] [--poll ms]
+usage: aitm-tui (--bus host:port (--token-file p | --token t (insecure: visible in ps)) [--allow-remote-bus] | --fixture [path]) [--ansi|--truecolor] [--poll ms]
        aitm-tui --snapshot out.svg [--cols N --rows N]
+       aitm-tui --snapshot-core out.svg [--cols N --rows N]   (fixture limited to the 22 core tools)
 ```
 
 **Against a running proxy.** The proxy's loopback TCP transport and its token:
@@ -21,17 +22,22 @@ usage: aitm-tui (--bus host:port (--token-file p | --token t) | --fixture [path]
 aitm-tui --bus 127.0.0.1:9090 --token-file ~/.aitm/bus.token
 ```
 
-`--token t` passes the token inline; with neither, `AITM_BUS_TOKEN` is read.
-With no `--bus`, `AITM_BUS` and `AITM_BUS_TOKEN` are used. The TUI writes the
-token line, sends `initialize` as client `aitm-tui`, then `tools/list` once
-and builds the palette from it. The flow list is polled every `--poll` ms
-(default 500, floor 100) until F4 adds push. A lost connection reconnects
-with back-off (0.5 s doubling to 10 s); the status bar shows the bus state.
+`--token t` passes the token inline; it is accepted but **insecure: the token
+is visible to every process on the machine in `ps`** — prefer `--token-file`
+or `AITM_BUS_TOKEN`. With neither flag, `AITM_BUS_TOKEN` is read; with no
+`--bus`, `AITM_BUS` and `AITM_BUS_TOKEN` are used. A bus address that is not
+on loopback is **refused** unless `--allow-remote-bus` is given, because the
+token travels in cleartext until the TLS bus lands (core follow-up F15). The
+TUI writes the token line, sends `initialize` as client `aitm-tui`, then
+`tools/list` once and builds the palette from it. The flow list is polled
+every `--poll` ms (default 500, floor 100) until F4 adds push. A lost
+connection reconnects with back-off (0.5 s doubling to 10 s); the status bar
+shows the bus state.
 
-**Embedded (landing in the same branch).** `aitm tui` starts the proxy and the
-TUI in one process over an in-process channel; the bus contract is unchanged.
-While the TUI owns the terminal the stdio agent transport is skipped with a
-warning; a loopback TCP agent transport is still served.
+**Embedded.** `aitm tui` starts the proxy and the TUI in one process over an
+in-process channel; the bus contract is unchanged. While the TUI owns the
+terminal the stdio agent transport is skipped with a warning; a loopback TCP
+agent transport is still served.
 
 **Fixture.** `aitm-tui --fixture` runs against the built-in
 `fixtures/bus-fixture.json`; `--fixture path/to.json` against another recording.
@@ -39,6 +45,9 @@ warning; a loopback TCP agent transport is still served.
 **Snapshot.** `aitm-tui --snapshot out.svg --cols 200 --rows 50` renders the
 main screen from the fixture and exits. The extension picks the format:
 `.svg`, `.ans`/`.ansi` (escape codes), anything else plain text. Default 200×50.
+`--snapshot-core` renders the same screen against the fixture limited to the
+22 tools the core serves today, so the two pictures show what is real now and
+what the F-tools add.
 
 `--ansi` forces the 16-colour palette, `--truecolor` the hex palette;
 otherwise the terminal is detected (see Terminal capabilities).
@@ -47,18 +56,24 @@ otherwise the terminal is detected (see Terminal capabilities).
 
 Top to bottom: toolbar (record/compose/clear, listening pill, agent toggle),
 chip bar (content-type chips, `1`–`9`/`0` select), sidebar (28 columns,
-`b` hides, `[`/`]` move), flow list, intercept bar when flows are paused,
-inspector (request pane left, response pane right, tabs per pane), status bar
-(key hints · row counts · size · bus state). Layout is horizontal (inspector
-below) or vertical (inspector right); below 120 columns the inspector takes
-the whole screen on `Enter` and returns on `Esc`.
+`b` hides, `[`/`]` move), flow list, intercept bar when armed or when flows
+are paused, inspector (request pane left, response pane right, tabs per
+pane), status bar (key hints · row counts · size and throughput · bus state).
+Layout is horizontal (inspector below) or vertical (inspector right); below
+120 columns the inspector takes the whole screen on `Enter` and returns on
+`Esc`. The intercept bar sits above the inspector when it is shown, else
+above the status bar.
 
-Degradations, by design (§2.10(c)): no inline images (image bodies show
-`[image W×H type · o to open]`; kitty/sixel graphics only if the terminal
-advertises them); no browser viewport (URL, DOM outline, last-screenshot
-placeholder; navigate/eval still work); diff is unified under 120 columns;
-split view needs 160 or more; no drag-and-drop (`:import <path>`); clipboard
-via OSC 52 where allowed; mouse optional, keyboard complete.
+Degradations, by design (§2.10(c)): no inline images — image bodies show
+`[image W×H type · o to open]` and `o` writes the bytes to a private temp
+file and opens it with the desktop (`open` / `xdg-open`); kitty/sixel
+graphics only if the terminal advertises them. No browser viewport: the
+Browser sidebar item opens a panel that says the view is not built yet and
+lists the `:browser.*` commands. Diff is unified when the response pane is
+narrower than 120 cells and side by side when it is ≥ 120 cells. Split view:
+not built in this pass (`:split` says so; it would need ≥ 160 columns). No
+drag-and-drop (`:import <path>`); clipboard via OSC 52 where allowed; mouse
+optional, keyboard complete.
 
 ## Keys
 
@@ -71,13 +86,13 @@ via OSC 52 where allowed; mouse optional, keyboard complete.
 | `↑`/`k`, `↓`/`j`, `PgUp`, `PgDn`, `Home`/`g`, `End`/`G` | move |
 | `Enter` / `Esc` / `Space` | open inspector / back / quick look |
 | `Tab`/`→`, `Shift-Tab`/`←`, `1`–`9`, `0` | next / previous / nth chip |
-| `b`, `[`, `]` | toggle sidebar, previous / next sidebar item |
-| `i` · `a` / `A` · `d` or `x` | arm/disarm interception · resume one / all · kill |
+| `b`, `[`, `]` | toggle sidebar, previous / next sidebar item (Scope filters the list; Findings, Browser, Agent open their panels) |
+| `i` · `a` / `A` · `d` or `x` | arm/disarm interception · resume one / all (out-of-scope flows are skipped and counted) · kill |
 | `e` · `r` · `n` | edit the paused request · replay · compose from selection |
-| `p` / `m` / `c` · `P` | pin host / mark / comment · build PoC |
+| `p` / `m` / `c` · `P` | pin host / mark / comment · build PoC (name, then param) |
 | `F` / `S` / `@` | findings / scope / agent panel |
 | `l` · `t` | toggle layout (inspector below or right) · toggle auto-select |
-| `y` / `o` | copy URL (OSC 52) / open externally |
+| `y` / `o` | copy URL (OSC 52) / open the image or large body externally |
 | `/` or `Ctrl-F` · `:` or `Ctrl-K` · `q` | filter prompt · command palette · quit |
 
 **Inspector / Quick look**
@@ -86,7 +101,7 @@ via OSC 52 where allowed; mouse optional, keyboard complete.
 |---|---|
 | `Esc` / `q` | back |
 | `Tab` / `Shift-Tab` | switch request / response pane |
-| `←`/`h`, `→`/`l` | previous / next tab |
+| `←`/`h`, `→`/`l` | previous / next tab (`Cookies (F5)`, `Timing (F5)`, `Set-Cookie (F5)` are listed, dim, and explain themselves) |
 | `↑`/`k`, `↓`/`j`, `PgUp`, `PgDn`/`Space`, `Home`/`g`, `End`/`G` | scroll |
 | `z` | fold (JSON tree) |
 | `e`, `a`, `d`/`x`, `r`, `n`, `P`, `y`, `o`, `i`, `:`, `/`, `?` | as in Flows |
@@ -95,13 +110,16 @@ via OSC 52 where allowed; mouse optional, keyboard complete.
 revert · `Esc` back · arrows, `Home`, `End`, `Enter`, `Backspace`, `Tab` and
 printable keys edit.
 
-**Prompt** (filter, palette, scope add, PoC target): `Enter` submit · `Esc`
-back · `↑`/`↓` move (palette also `Tab`/`Shift-Tab`) · text edits.
+**Prompt** (filter, palette, scope add, PoC name/param, PoC target/vars, CA
+export, confirm): `Enter` submit · `Esc` back · `↑`/`↓` move (palette also
+`Tab`/`Shift-Tab`) · text edits. The confirm prompt takes `y` to run and
+anything else to cancel.
 
 **Compose**: `Ctrl-Enter` or `Ctrl-S` send · `Enter` submit field ·
 `Tab`/`↓`, `Shift-Tab`/`↑` next / previous field · `Esc` back.
 
-**Findings**: move keys · `Enter` open · `r` run the PoC again · `o` open
+**Findings**: move keys · `Enter` open the capture · `r` run the PoC again
+(asks for the target, then `k=v …` vars; blank = none) · `o` open the
 screenshot · `Esc`/`q` back.
 
 **Scope**: move keys · `a`/`n`/`+` add host · `d`/`x`/`-` remove selected ·
@@ -109,6 +127,12 @@ screenshot · `Esc`/`q` back.
 
 **Agent**: `1`/`a` all tools · `2`/`r` read-only · `3`/`p` paused ·
 `↑`/`k`, `↓`/`j` scroll the log · `Esc`/`q` back.
+
+**CA** (`:ca`): `e` export (asks `[pem|der] [path]`) · `i` install · `u`
+uninstall (both confirmed with `y/N` first) · `Esc`/`q` back.
+
+**Browser** (`:browser` or the sidebar item): read-only; `:` for the
+`browser.*` commands · `Esc`/`q` back.
 
 ## `:` commands
 
@@ -118,22 +142,27 @@ screenshot · `Esc`/`q` back.
 |---|---|
 | `intercept` | Arm/disarm interception (`i`) |
 | `resume` / `resume all` | Resume the targeted paused flow / every paused flow |
-| `kill` | Kill the targeted paused flow |
+| `kill` | Kill the targeted paused flow (abort mode: reset; 429/503 need F3) |
 | `replay` | Repeat the selected flow unchanged (`r`) |
 | `compose` | Compose a request, prefilled from the selection (`n`) |
+| `compose get\|post-json\|post-form\|ws` | Compose from a template (`ws` needs F9) |
 | `curl <command>` | Import a curl command line into compose |
 | `filter <expr>` | Set the filter expression (`/`) |
 | `scope add <host>` | Add a host to scope (scope-as-authorisation) |
 | `scope` | Open the scope panel (`scope rm <host>` removes; needs F12) |
 | `findings` | Open the PoC findings panel |
-| `poc build` | Build a PoC from the selected flow |
+| `poc build` | Build a PoC from the selected flow (name, then param) |
 | `poc run <path> [target]` | Run a PoC YAML |
 | `agent all\|readonly\|paused` | Set the agent policy |
 | `agent` | Open the agent panel and activity log |
+| `ca` | CA panel: `ca.status` facts, export, install, uninstall |
+| `browser` | Browser view (not built yet): the `:browser.*` commands |
 | `layout h\|v` | Inspector below or right |
+| `split` | Split view — not built in this pass |
+| `export` | Export flows — needs F10 |
 | `sidebar` | Toggle the sidebar (`b`) |
 | `pin [host]` | Pin a host to the top of the list (`p`) |
-| `import <path>` | Import HAR / mitmproxy / Proxyman flows |
+| `import <path>` | Import HAR / mitmproxy / Proxyman flows — needs F10 |
 | `clear` | Clear the session |
 | `pause` / `record` | Pause / resume capture |
 | `copy` | Copy the selected URL (OSC 52) |
@@ -158,7 +187,7 @@ expr  := or
 or    := and ( '|' and )*
 and   := not ( '&'? not )*          juxtaposition is AND
 not   := '!' not | atom
-atom  := '(' expr ')' | '~' name [arg] | word      a bare word is ~u word
+atom  := '(' expr ')' | '~' name [arg] | word | /re/     a bare word is ~u word, a bare /re/ is ~u /re/
 ```
 
 Atoms: `~u` url · `~d` host · `~m` method · `~s`/`~c` status (`200`, `4xx`) ·
@@ -166,8 +195,13 @@ Atoms: `~u` url · `~d` host · `~m` method · `~s`/`~c` status (`200`, `4xx`) �
 process · `~comment` · `~mark` colour · flags `~a` agent-originated ·
 `~scope` / `~oos` · `~ws` · `~paused` · `~killed` · `~replay` · `~e` edited ·
 `~q` no response yet. Text arguments match case-insensitively as substrings,
-with `*` and `?` wildcards; a quoted argument may contain spaces. `~h` and
-`~b` need the flow's detail (F5) and are false until it has arrived.
+with `*` and `?` wildcards; a quoted argument may contain spaces. A
+slash-delimited argument is a **regex** — `~u`, `~d`, `~h` and `~b` take one —
+compiled once when the expression is parsed, case-insensitive unless it says
+`(?-i)`; `&`, `|` and parentheses inside the slashes belong to the regex, and
+`\/` is a literal slash. A word that only starts with `/` (`~u /api/login`)
+stays a literal. `~h` and `~b` need the flow's detail (F5) and are false
+until it has arrived. Nesting of `!` and `(` is limited to 64 levels.
 
 ```
 login                              URLs containing "login"
@@ -175,6 +209,8 @@ login                              URLs containing "login"
 (~m GET | ~m HEAD) !~s 2xx         GET/HEAD that did not succeed
 ~d "*.shop-staging.test" ~t json   JSON from any shop-staging host
 ~a | ~paused                       agent-originated or currently paused
+~u /^https:\/\/api\..*\/login$/    regex on the URL
+~h /^x-request-id$/                a header named exactly that
 ```
 
 ## When the core lacks a tool
@@ -186,17 +222,39 @@ never hidden and never fails silently. Against today's core that is:
 
 | Follow-up | Tool(s) | What is disabled |
 |---|---|---|
-| F1 | `agent.status`, `agent.set` | agent policy toggle (read-only) |
-| F5 | `flow.detail` | inspector bodies, raw edit, `~h`/`~b` filters |
+| F1 | `agent.status`, `agent.set` | agent policy toggle (read-only); confirmations over the bus |
+| F2 | audit ring, `notifications/aitm/agent` | activity log rows, Origin column, agent ticks |
+| F3 | `flow.intercept {rules}`, `flow.kill {mode}` | breakpoint rules (`Rules…`), kill abort modes 429/503 |
+| F4 | `flow.subscribe`, server push | live list (polling instead), status-bar throughput (`↑ — ↓ — (F4)`) |
+| F5 | `flow.detail` | inspector bodies, raw edit, `~h`/`~b` filters, `Cookies`, `Timing`, `Set-Cookie` tabs |
 | F6 | `flow.mark`, `flow.comment` | `m` mark, `c` comment |
-| F7 | `proxy.pause`, `flow.clear` | `:pause`, `:record`, `:clear` |
+| F7 | `proxy.pause`, `flow.clear`, `config.get` | `:pause`, `:record`, `:clear`, the scope panel's rate-limit readout |
+| F9 | `ws.send` | WebSocket compose (`:compose ws`) and replay of WS flows |
+| F10 | `session.save/load`, `flow.export`, `flow.import` | `:export`, `:import`, Saved sessions |
 | F12 | `scope.remove` | `d` in the scope panel, `:scope rm` |
 | F13 | `poc.list` | findings export |
+| F14 | `browser.tabs`, `browser.screencast` | a live browser viewport (the browser *panel* is a TUI build item, see below) |
 
-The fixture already contains these tools in their proposed shape, so the
-screens can be built and tested before the core has them. Sidebar items
-whose feature is further out carry their label (`F10` saved sessions, `F14`
-browser view, `M3` scripts).
+Confirmations are **local** until F1: `ca.install` and `ca.uninstall` (the
+`CONFIRM_TOOLS` list) ask for `y/N` in the TUI before anything is sent, because
+the bus has no `confirm` on the wire yet and the TUI's server identity is
+`Frontend::Mcp`; `dry_run=true` skips the prompt. The fixture already contains
+the F-tools in their proposed shape, so the screens can be built and tested
+before the core has them. Sidebar items whose feature is further out carry
+their label (`F10` saved sessions, `not built yet` browser view, `M3` scripts).
+
+## Not in this pass
+
+TUI-side features from the foundation's catalog that are not built yet (no
+core dependency; build-or-descope is Matt's call):
+
+- the browser view (URL · DOM outline · last-screenshot placeholder; navigate/eval) — the panel says so and lists `:browser.*`
+- split view (two lists side by side ≥ 160 columns) — `:split` says so
+- saved filters by name; match highlighting in body viewers; the sidebar quick filter
+- compose templates Multipart and WebSocket (`:compose ws` names F9); edit templates
+- WebSocket sent/received direction filter
+- setup-guide text; column hide; a Comment column (≥ 170 columns); palette recent/pinned
+- PoC YAML editable with Save (the YAML is shown; on a loopback bus it is read from `poc_path` when the result has none)
 
 ## Terminal capabilities
 
@@ -227,9 +285,12 @@ Bodies are readable `body_text`; the fixture transport base64-encodes them as
 `body` the way `flow.detail` will. Mutating commands update it in memory the
 way the core would (resume attaches the recorded `on_resume` response, kill
 marks the flow, replay and `request.send` append). In tests,
-`aitm_tui::fixture_app(cols, rows)` loads it into an `App`; `snapshot::render`
-draws to a buffer and `to_text` / `to_svg` / `to_ansi` serialise it.
-`docs/design/tui/main-screen.svg` is such a snapshot.
+`aitm_tui::fixture_app(cols, rows)` loads it into an `App`
+(`fixture_app_core` with only the 22 core tools); `snapshot::render` draws to
+a buffer and `to_text` / `to_svg` / `to_ansi` serialise it.
+`docs/design/tui/main-screen.svg` is such a snapshot with every proposed tool
+present; `docs/design/tui/main-screen-core.svg` is the same screen against
+today's 22 core tools, F-labels and all.
 
 ## Development
 
@@ -243,4 +304,5 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   the build on purpose.
 - `aitm-bus-client`'s TCP tests bind `127.0.0.1:0`. The Claude sandbox cannot
   bind ports, so run them in a real shell (the Terminal panel).
-- No `unsafe` (workspace `forbid`), no new dependencies beyond `Cargo.lock`.
+- No `unsafe` (workspace `forbid`); the only dependency added since the
+  skeleton is `regex` (already in `Cargo.lock`).

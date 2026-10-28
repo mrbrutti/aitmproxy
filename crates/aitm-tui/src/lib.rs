@@ -9,7 +9,8 @@
 //!
 //! Structure: [`app`] holds the state and reducer, [`bus`] the one task that
 //! talks to the proxy, [`ui`] and [`viewers`] draw, [`snapshot`] renders
-//! off-screen, [`fixture`] serves the recorded bus.
+//! off-screen, [`fixture`] serves the recorded bus, [`open`] hands a file to
+//! the desktop for `o`.
 
 pub mod action;
 pub mod app;
@@ -21,6 +22,7 @@ pub mod filter;
 pub mod fixture;
 pub mod keys;
 pub mod model;
+pub mod open;
 pub mod snapshot;
 pub mod theme;
 pub mod tokens;
@@ -35,10 +37,10 @@ use std::time::Duration;
 use aitm_bus_client::{BusClient, InProcessHandler, InProcessTransport, TcpTransport};
 use crossterm::event::{Event, EventStream};
 use futures::StreamExt as _;
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::action::{Action, BusEvent, ToolInfo};
+use crate::action::{Action, BusEvent, Level, ToolInfo};
 use crate::app::App;
 use crate::caps::TermCaps;
 use crate::fixture::{Fixture, FixtureTransport};
@@ -132,10 +134,10 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     let (ev_tx, mut ev_rx) = mpsc::channel(512);
     let bus_task = tokio::spawn(bus::run(connect, req_rx, ev_tx, opts.poll));
     if let Some(note) = opts.startup_note {
-        app.toast(action::Level::Info, note);
+        app.toast(Level::Info, note);
     }
-    if opts.listening.is_some() {
-        app.listening = opts.listening;
+    if let Some(listening) = opts.listening {
+        app.listening = Some(listening);
     }
 
     let mut terminal = ratatui::init();
@@ -154,12 +156,18 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
             ev = events.next() => match ev {
                 Some(Ok(Event::Key(key))) => {
                     if let Some(action) = keys::map(key, app.mode) {
-                        if action == Action::CopyUrl && caps.osc52 {
-                            if let Some(text) = app.copy_text() {
-                                let _ = clipboard::copy(&text);
-                            }
+                        // The copy goes to the terminal first; the app only
+                        // reports "copied" when the OSC 52 write succeeded.
+                        let failed_copy = if action == Action::CopyUrl && caps.osc52 {
+                            app.copy_text()
+                                .and_then(|text| clipboard::copy(&text).err())
+                        } else {
+                            None
+                        };
+                        match failed_copy {
+                            Some(e) => app.toast(Level::Warn, format!("clipboard: {e}")),
+                            None => requests.extend(app.update(action)),
                         }
-                        requests.extend(app.update(action));
                     }
                 }
                 Some(Ok(Event::Resize(w, h))) => requests.extend(app.update(Action::Resize(w, h))),
@@ -180,6 +188,13 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
                 break;
             }
         }
+        // `o`: the reducer only names the file; the side effect happens here.
+        if let Some(t) = app.take_open_target() {
+            match open::open_externally(&t) {
+                Ok(()) => app.toast(Level::Info, format!("opened {}", t.label)),
+                Err(e) => app.toast(Level::Warn, format!("open: {e}")),
+            }
+        }
         if app.should_quit {
             break Ok(());
         }
@@ -189,14 +204,54 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     result
 }
 
+/// The 22 commands the bus serves today (foundation §4.1), in the spec's
+/// order — what [`fixture_app_core`] limits the fixture to.
+pub const CORE_TOOLS: &[&str] = &[
+    "flow.list",
+    "flow.get",
+    "flow.intercept",
+    "flow.resume",
+    "flow.kill",
+    "flow.mutate",
+    "flow.replay",
+    "request.send",
+    "scope.add",
+    "scope.list",
+    "browser.navigate",
+    "browser.click",
+    "browser.type",
+    "browser.screenshot",
+    "browser.eval",
+    "browser.get_dom",
+    "poc.build",
+    "poc.run",
+    "ca.export",
+    "ca.status",
+    "ca.install",
+    "ca.uninstall",
+];
+
 /// An [`App`] loaded synchronously from the built-in fixture, sized `cols`×`rows`,
 /// with the paused login request selected — the state every snapshot and UI
-/// test starts from.
+/// test starts from. The fixture's whole tool list is offered, F-gated
+/// commands included.
 pub fn fixture_app(cols: u16, rows: u16) -> App {
+    load_fixture_app(cols, rows, false)
+}
+
+/// [`fixture_app`] against the bus as it exists today: only [`CORE_TOOLS`]
+/// are offered, so nothing F-gated is loaded (no `flow.detail`, `agent.status`
+/// or `poc.list`) and every dependent surface shows its degraded state. This
+/// is what `aitm-tui --snapshot-core` renders.
+pub fn fixture_app_core(cols: u16, rows: u16) -> App {
+    load_fixture_app(cols, rows, true)
+}
+
+fn load_fixture_app(cols: u16, rows: u16, core_only: bool) -> App {
     let mut fx = Fixture::builtin();
     let mut app = App::new(TermCaps::full(), "fixture");
     let _ = app.update(Action::Resize(cols, rows));
-    let tools = fx
+    let tools: Vec<ToolInfo> = fx
         .tools
         .iter()
         .map(|t| ToolInfo {
@@ -204,6 +259,7 @@ pub fn fixture_app(cols: u16, rows: u16) -> App {
             description: t["description"].as_str().unwrap_or("").to_string(),
             input_schema: t.get("inputSchema").cloned().unwrap_or(Value::Null),
         })
+        .filter(|t| !core_only || CORE_TOOLS.contains(&t.name.as_str()))
         .collect();
     let listening = Some(fx.listening.clone());
     let _ = app.on_bus(BusEvent::Connected {
@@ -229,21 +285,26 @@ pub fn fixture_app(cols: u16, rows: u16) -> App {
         .filter_map(|id| fx.call("flow.get", &arg(id)).ok())
         .collect();
     let _ = app.on_bus(BusEvent::Flows(summaries));
-    for id in &ids {
-        if let Ok(v) = fx.call("flow.detail", &arg(id)) {
-            if let Some(d) = FlowDetail::from_json(&v) {
-                let _ = app.on_bus(BusEvent::Detail(Box::new(d)));
+    if app.has_tool("flow.detail") {
+        for id in &ids {
+            if let Ok(v) = fx.call("flow.detail", &arg(id)) {
+                if let Some(d) = FlowDetail::from_json(&v) {
+                    let _ = app.on_bus(BusEvent::Detail(Box::new(d)));
+                }
             }
         }
     }
     let _ = app.on_bus(BusEvent::Scope(fx.scope.clone()));
     let _ = app.on_bus(BusEvent::Intercept(fx.intercept_armed));
-    let mut agent = AgentState::default();
-    agent.apply_status(&fx.agent);
-    let _ = app.on_bus(BusEvent::Agent(agent));
-    let findings = fx.findings.iter().filter_map(Finding::from_json).collect();
-    let _ = app.on_bus(BusEvent::Findings(findings));
+    if app.has_tool("agent.status") {
+        let mut agent = AgentState::default();
+        agent.apply_status(&fx.agent);
+        let _ = app.on_bus(BusEvent::Agent(agent));
+    }
+    if app.has_tool("poc.list") {
+        let findings = fx.findings.iter().filter_map(Finding::from_json).collect();
+        let _ = app.on_bus(BusEvent::Findings(findings));
+    }
     app.selected = Some("f50".into());
-    let _ = json!({});
     app
 }

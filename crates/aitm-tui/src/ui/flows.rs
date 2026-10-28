@@ -10,8 +10,29 @@ use ratatui::text::{Line, Span};
 use crate::app::App;
 use crate::model::{clock_of, human_bytes, human_ms, FlowKind, FlowRow, Origin};
 use crate::theme::Theme;
-use crate::tokens::{color, glyph};
-use crate::ui::text::{elide_middle, fit, right, width};
+use crate::tokens::{color, glyph, ColorToken};
+use crate::ui::text::{cells, elide_middle, fit, right, width};
+use crate::ui::{selection_bg, FrameView};
+
+/// The glyph of the mark swatch in the Tick column (§2.7 "marked: colour
+/// swatch left of `#`").
+pub const MARK_SWATCH: &str = "▍";
+
+/// The token nearest to one of Proxyman's mark colours; `None` for a name
+/// the TUI does not know (it then draws no swatch).
+pub fn mark_color(mark: &str) -> Option<&'static ColorToken> {
+    Some(match mark.to_ascii_lowercase().as_str() {
+        "red" => &color::status::SERVER_ERROR,
+        "orange" => &color::status::PENDING,
+        "yellow" => &color::status::CLIENT_ERROR,
+        "green" => &color::status::SUCCESS,
+        "sky" | "cyan" | "teal" => &color::status::REDIRECT,
+        "blue" => &color::accent::BASE,
+        "violet" | "purple" | "pink" => &color::status::INFORMATIONAL,
+        "grey" | "gray" => &color::text::TERTIARY,
+        _ => return None,
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColKey {
@@ -171,7 +192,7 @@ pub fn columns(width: usize) -> Vec<Col> {
     cols
 }
 
-pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
+pub fn render(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut Buffer) {
     buf.set_style(area, theme.surface());
     if area.height == 0 {
         return;
@@ -198,7 +219,7 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         area.width,
         area.height.saturating_sub(1),
     );
-    let visible = app.visible();
+    let visible = &view.visible;
     if visible.is_empty() {
         let msg = if app.flows.is_empty() {
             match &app.listening {
@@ -228,7 +249,7 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     }
     let mut entries: Vec<Entry> = Vec::with_capacity(visible.len() + 8);
     for (pos, &i) in visible.iter().enumerate() {
-        if let Some((title, n)) = app.group_header(&visible, pos) {
+        if let Some((title, n)) = app.group_header(visible, pos) {
             entries.push(Entry::Header(title, n));
         }
         entries.push(Entry::Row(i));
@@ -246,7 +267,7 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     };
 
     for (k, entry) in entries.iter().skip(offset).take(h).enumerate() {
-        let y = rows_area.y + k as u16;
+        let y = rows_area.y + cells(k);
         let row_rect = Rect::new(rows_area.x, y, rows_area.width, 1);
         match entry {
             Entry::Header(title, n) => {
@@ -264,12 +285,7 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
                 let r = &app.flows[*i];
                 let selected = app.selected.as_deref() == Some(r.id.as_str());
                 if selected {
-                    let sel = theme.selection();
-                    let mut bg_only = Style::default().add_modifier(sel.add_modifier);
-                    if let Some(bg) = sel.bg {
-                        bg_only = bg_only.bg(bg);
-                    }
-                    buf.set_style(row_rect, bg_only);
+                    buf.set_style(row_rect, selection_bg(theme));
                 }
                 let line = row_line(app, theme, r, &cols);
                 buf.set_line(row_rect.x, y, &line, row_rect.width);
@@ -286,10 +302,15 @@ fn row_line<'a>(app: &App, theme: &Theme, r: &'a FlowRow, cols: &[Col]) -> Line<
     let mut spans: Vec<Span<'a>> = Vec::with_capacity(cols.len() * 2);
     for c in cols {
         let span = match c.key {
+            // Paused and agent ticks come first; otherwise the first mark's
+            // colour swatch (§2.7 "marked").
             ColKey::Tick => match (r.origin, r.paused()) {
                 (_, true) => Span::styled("▎", s(theme.fg(&color::intercept::BASE))),
                 (Origin::Agent, _) => Span::styled("▎", s(theme.agent())),
-                _ => Span::raw(" "),
+                _ => match r.marks.first().and_then(|m| mark_color(m)) {
+                    Some(tok) => Span::styled(MARK_SWATCH, s(theme.fg(tok))),
+                    None => Span::raw(" "),
+                },
             },
             ColKey::Dot => {
                 let style = if r.paused() || r.pending() {
@@ -436,6 +457,47 @@ fn row_line<'a>(app: &App, theme: &Theme, r: &'a FlowRow, cols: &[Col]) -> Line<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M-misc: a marked flow carries a `▍` swatch in its first mark's colour
+    /// in the Tick column; paused and agent ticks take precedence.
+    #[test]
+    fn marked_rows_show_a_colour_swatch_in_the_tick_column() {
+        let theme = Theme::new(true);
+        let app = crate::fixture_app(200, 50);
+        let buf = crate::snapshot::render(&app, &theme, 200, 50);
+        let text = crate::snapshot::to_text(&buf);
+        let find = |needle: &str| -> (u16, usize) {
+            let (y, line) = text
+                .lines()
+                .enumerate()
+                .find(|(_, l)| l.contains(needle))
+                .unwrap_or_else(|| panic!("no row containing {needle:?}"));
+            let x = line
+                .find("https://")
+                .map(|b| line[..b].chars().count())
+                .unwrap();
+            (y as u16, x)
+        };
+        // f42 (PUT cart item) is marked `sky`, human, not paused: swatch in the
+        // redirect (sky) token.
+        let (y, url_x) = find("/api/cart/items/42");
+        let tick = buf.cell((url_x as u16 - 10, y)).unwrap();
+        assert_eq!(tick.symbol(), MARK_SWATCH);
+        assert_eq!(tick.fg, theme.fg(&color::status::REDIRECT).fg.unwrap());
+        // f48 is marked `red` but agent-originated: the agent tick wins.
+        let (y, url_x) = find("/api/search?q=");
+        let tick = buf.cell((url_x as u16 - 10, y)).unwrap();
+        assert_eq!(tick.symbol(), "▎");
+        assert_eq!(tick.fg, theme.agent().fg.unwrap());
+        // Unmarked (f41): blank.
+        let (y, url_x) = find("/api/products?category");
+        assert_eq!(buf.cell((url_x as u16 - 10, y)).unwrap().symbol(), " ");
+        // The palette map, by token.
+        assert_eq!(mark_color("Red"), Some(&color::status::SERVER_ERROR));
+        assert_eq!(mark_color("grey"), Some(&color::text::TERTIARY));
+        assert_eq!(mark_color("gray"), Some(&color::text::TERTIARY));
+        assert_eq!(mark_color("chartreuse"), None);
+    }
 
     #[test]
     fn columns_drop_from_the_right_as_the_terminal_narrows() {

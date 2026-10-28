@@ -6,7 +6,12 @@
 
 use serde_json::Value;
 
-use crate::model::{AgentPolicy, AgentState, Finding, FlowDetail, FlowRow};
+use crate::model::{AgentPolicy, AgentState, Finding, FlowDetail};
+
+/// A tool the bus offers, enough to build the palette and a form: the
+/// `tools/list` entry exactly as the bus client decodes it. [`ToolSchema`]
+/// adds the form-building view of its schema.
+pub use aitm_bus_client::ToolDef as ToolInfo;
 
 /// A user intent, already resolved from the key map for the current mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +106,8 @@ pub enum BusRequest {
     PocRun {
         poc_path: String,
         target: Option<String>,
+        /// Template variables for the PoC (`poc.run {vars?}`, §4.3).
+        vars: Option<Value>,
     },
     AgentSet(AgentPolicy),
     ProxyPause(bool),
@@ -141,6 +148,9 @@ pub enum BusEvent {
     /// A full pass over `flow.list` + `flow.get`, oldest first.
     Flows(Vec<Value>),
     Detail(Box<FlowDetail>),
+    /// `flow.detail` for this id answered with something the model rejects;
+    /// the app must stop asking for it (a `Toast` accompanies this).
+    DetailFailed(String),
     Intercept(bool),
     Scope(Vec<String>),
     Findings(Vec<Finding>),
@@ -155,17 +165,15 @@ pub enum BusEvent {
     Notification(Value),
 }
 
-/// A tool the bus offers, enough to build the palette and a form.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolInfo {
-    pub name: String,
-    pub description: String,
-    pub input_schema: Value,
+/// The form-building view of a tool's `inputSchema` (foundation §4.2 step 3:
+/// every form is built from the schema, never hard-coded).
+pub trait ToolSchema {
+    /// `(name, type, required, description)` for every declared parameter.
+    fn params(&self) -> Vec<(String, String, bool, String)>;
 }
 
-impl ToolInfo {
-    /// `(name, type, required, description)` for every declared parameter.
-    pub fn params(&self) -> Vec<(String, String, bool, String)> {
+impl ToolSchema for ToolInfo {
+    fn params(&self) -> Vec<(String, String, bool, String)> {
         let required: Vec<&str> = self
             .input_schema
             .get("required")
@@ -199,6 +207,3 @@ impl ToolInfo {
             .unwrap_or_default()
     }
 }
-
-/// Row data the app keeps for a flow plus whether its detail is loaded.
-pub type RowSlot = (FlowRow, bool);
