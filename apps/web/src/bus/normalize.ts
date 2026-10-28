@@ -142,7 +142,7 @@ export function toDetail(raw: unknown, seqFallback: number): FlowDetail {
     response: res && resBody ? { headers: headersOf(res.headers), body: resBody } : null,
     conn: rec(r.conn) as FlowDetail['conn'],
     timing: r.timing ? (rec(r.timing) as FlowDetail['timing']) : null,
-    ...(Array.isArray(r.ws_messages) ? { wsMessages: r.ws_messages as WsMessage[] } : {}),
+    ...(Array.isArray(r.ws_messages ?? r.wsMessages) ? { wsMessages: (r.ws_messages ?? r.wsMessages) as WsMessage[] } : {}),
     original: original
       ? {
           method: str(original.method) ?? summary.method,
