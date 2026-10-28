@@ -145,8 +145,35 @@ extension SelfTest {
 
             let recorded = session.activity.entries.filter { $0.origin == .operator }.count
             check("every action is in the activity log (\(recorded) operator entries)", recorded >= 11)
+
+            checkHumanInputPath(session)
             finishLive()
         }
+    }
+
+    /// The human-input path (keyboard + the real menu bar), NOT the MCP bus: a
+    /// real key equivalent dispatched through `NSApp.mainMenu` must drive the UI,
+    /// proving an operator can work the app directly. Pixel-level mouse
+    /// computer-use (clicking rendered rows) needs a CUA harness and is out of a
+    /// headless self-test; the menu audit (checkMenuCoverage) proves every action
+    /// is reachable, and this proves the keyboard actually dispatches one.
+    private static func checkHumanInputPath(_ session: Session) {
+        guard let menu = NSApp.mainMenu,
+              let window = NSApp.windows.first(where: { $0.isVisible && !($0 is NSPanel) }) else {
+            return check("a main window exists for the human-input check", false)
+        }
+        window.makeKeyAndOrderFront(nil)
+        let before = session.paletteVisible
+        // ⌘K = View ▸ Command Palette. Dispatched as a real key equivalent through the menu.
+        if let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command,
+                                        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                                        context: nil, characters: "k", charactersIgnoringModifiers: "k",
+                                        isARepeat: false, keyCode: 40) {
+            _ = menu.performKeyEquivalent(with: event)
+        }
+        check("a real menu key equivalent (⌘K) drives the UI from the keyboard, not the bus",
+              session.paletteVisible != before, "palette \(session.paletteVisible) was \(before)")
+        session.paletteVisible = false
     }
 
     /// `curl -x <listen> http://<upstream>/`, left running: while intercept is
