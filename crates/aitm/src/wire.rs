@@ -19,7 +19,8 @@ use aitm_browser::BrowserPlugin;
 use aitm_ca::CaPlugin;
 use aitm_core::{Config, Plugin, Proxy, Registry};
 use aitm_plugins::{
-    CapturePlugin, InterceptPlugin, MutatePlugin, RateLimitPlugin, ReplayPlugin, ScopePlugin,
+    CapturePlugin, InterceptPlugin, MetaPlugin, MutatePlugin, RateLimitPlugin, ReplayPlugin,
+    ScopePlugin,
 };
 use aitm_proto_http::{CertAuthority, HttpModule};
 use aitm_proto_ws::WsModule;
@@ -74,6 +75,7 @@ pub fn assemble_with(cfg: &Config, features: &Features) -> anyhow::Result<Assemb
         // First-party plugins, in chain order. Intercept precedes mutate so a
         // request is parked before mutate would act (data-flow 2).
         .register_plugin(Box::new(CapturePlugin::new()))
+        .register_plugin(Box::new(MetaPlugin::new()))
         .register_plugin(Box::new(ReplayPlugin::new()))
         .register_plugin(Box::new(InterceptPlugin::new()));
     if features.mutate {

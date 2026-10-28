@@ -3,6 +3,7 @@
 
 pub mod capture;
 pub mod intercept;
+pub mod meta;
 pub mod mutate;
 pub mod ratelimit;
 pub mod replay;
@@ -10,6 +11,7 @@ pub mod scope;
 
 pub use capture::CapturePlugin;
 pub use intercept::InterceptPlugin;
+pub use meta::MetaPlugin;
 pub use mutate::MutatePlugin;
 pub use ratelimit::RateLimitPlugin;
 pub use replay::ReplayPlugin;

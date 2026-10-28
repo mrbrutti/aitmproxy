@@ -19,7 +19,7 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 22] = [
+const EXPECTED_TOOLS: [&str; 24] = [
     "flow.list",
     "flow.get",
     "flow.replay",
@@ -27,6 +27,8 @@ const EXPECTED_TOOLS: [&str; 22] = [
     "flow.resume",
     "flow.kill",
     "flow.mutate",
+    "flow.mark",
+    "flow.comment",
     "request.send",
     "browser.navigate",
     "browser.click",
@@ -131,7 +133,7 @@ fn ac7_exact_twenty_two_tools() {
     expected.sort();
     assert_eq!(
         names, expected,
-        "tools/list must be exactly the 18 M1 tools plus the four ca.* tools"
+        "tools/list must be exactly the M2 tools plus the operator-command additions"
     );
 
     // The browser.* schemas are byte-for-byte M1's: compare the six
