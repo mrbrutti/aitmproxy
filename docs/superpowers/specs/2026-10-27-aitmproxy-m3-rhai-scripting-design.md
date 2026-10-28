@@ -1,6 +1,6 @@
 # aitmproxy M3 — Rhai scripting tier design
 
-**Status:** draft
+**Status:** approved (2026-10-27 by Matt)
 **Research inputs:** `docs/research/07-rhai-embedding.md`, `docs/research/01-mitmproxy.md`, `docs/research/02-nuclei.md`, `docs/research/05-synthesis.md`
 **Companion specs:** platform — `docs/superpowers/specs/2026-10-27-aitmproxy-platform-design.md`; plugin system — `docs/superpowers/specs/2026-10-27-aitmproxy-plugin-system-design.md`; PoC language — `docs/superpowers/specs/2026-10-27-aitmproxy-poc-language-design.md`; M2 browser/config — `docs/superpowers/specs/2026-10-27-aitmproxy-m2-obscura-browser-design.md`
 
