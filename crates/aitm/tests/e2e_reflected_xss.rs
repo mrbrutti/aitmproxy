@@ -1,26 +1,32 @@
-//! Task 29 / AC18: the reflected-XSS reproduction driven **entirely over MCP**
-//! against the bundled vulnerable/patched target, with a real headless Chrome.
+//! Platform AC18 / M2-AC14: the reflected-XSS reproduction driven **entirely
+//! over MCP** against the bundled vulnerable/patched target, with a real
+//! engine — system Chrome, the forked obscura, or both.
 //!
-//! Part of the default suite but inert unless `AITM_CHROME=1` is set (mirrors
-//! the soak test's `AITM_SOAK`), so `cargo test` stays fast and hermetic where
-//! no browser is installed. Run it for real with:
+//! Part of the default suite but runs only the engines enabled by
+//! `AITM_CHROME=1` / `AITM_OBSCURA=1` (with `AITM_OBSCURA_BIN`), via the
+//! `aitm-browser` test support module; inert when neither is set, so `cargo
+//! test` stays fast and hermetic where no browser is installed. Run it for
+//! real with:
 //!
 //! ```text
-//! AITM_CHROME=1 cargo test -p aitm --test e2e_reflected_xss -- --nocapture
+//! AITM_CHROME=1 AITM_OBSCURA=1 AITM_OBSCURA_BIN=/path/to/obscura cargo test -p aitm --test e2e_reflected_xss -- --nocapture
 //! ```
 //!
-//! Flow: `scope.add` the target, then `poc.run` a parameterized Example-1 PoC
-//! (its http step captures the finding; its browser step drives Chrome through
-//! the proxy and evaluates the marker) → `passed == true` and the three artifacts
-//! against the vulnerable target, `passed == false` against the patched one.
+//! Flow, per engine: `scope.add` the target, then `poc.run` a parameterized
+//! Example-1 PoC (its http step captures the finding; its browser step drives
+//! the engine through the proxy and evaluates the marker) → `passed == true`
+//! and the three artifacts against the vulnerable target, `passed == false`
+//! against the patched one.
+
+#[path = "../../aitm-browser/tests/support/engines.rs"]
+mod engines;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use aitm::wire::{build_proxy, Http1Sender};
-use aitm_browser::ChromeDriver;
-use aitm_core::{BrowserDriver, Config, McpTransport, PipelineClient, ProxyClient, ScopeEntry};
+use aitm::wire::{assemble, Assembled, Http1Sender};
+use aitm_core::{BrowserEngine, Config, McpTransport, PipelineClient, ProxyClient, ScopeEntry};
 use aitm_mcp::McpServer;
 use bytes::Bytes;
 use http_body_util::Full;
@@ -153,36 +159,47 @@ fn rpc(server: &McpServer, id: u64, method: &str, params: JsonValue) -> JsonValu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reflected_xss_over_mcp() {
-    if std::env::var_os("AITM_CHROME").is_none() {
-        eprintln!("skipped; set AITM_CHROME=1 to run the Chromium-backed e2e (AC18)");
+    let engines = engines::engines();
+    if engines.is_empty() {
         return;
     }
     // Write the PoC to a temp file (poc.run loads it by path).
     let poc_path = std::env::temp_dir().join(format!("aitm-e2e-{}.poc.yaml", std::process::id()));
     std::fs::write(&poc_path, example1_poc()).expect("write poc");
 
-    let vuln = run_case(Mode::Vulnerable, &poc_path).await;
-    assert!(vuln, "the PoC must pass against the vulnerable target");
+    for engine in engines {
+        let vuln = run_case(engine, Mode::Vulnerable, &poc_path).await;
+        assert!(
+            vuln,
+            "[{engine:?}] the PoC must pass against the vulnerable target"
+        );
 
-    let patched = run_case(Mode::Patched, &poc_path).await;
-    assert!(!patched, "the PoC must fail against the patched target");
+        let patched = run_case(engine, Mode::Patched, &poc_path).await;
+        assert!(
+            !patched,
+            "[{engine:?}] the PoC must fail against the patched target"
+        );
+    }
 }
 
-/// Stand up target + proxy + real browser + MCP server, drive the PoC entirely
-/// over MCP, and return `passed`. Also asserts the three artifacts on a pass.
-async fn run_case(mode: Mode, poc_path: &std::path::Path) -> bool {
+/// Stand up target + proxy + the real engine + MCP server, drive the PoC
+/// entirely over MCP, and return `passed`. Also asserts the three artifacts on
+/// a pass.
+async fn run_case(engine: BrowserEngine, mode: Mode, poc_path: &std::path::Path) -> bool {
     let target = spawn_target(mode).await;
     let target_authority = target.to_string();
 
-    // A browser-facing proxy listener; the browser routes through it (SSRF-guarded).
+    // A browser-facing proxy listener; the engine routes through it (SSRF-guarded).
     let browser_listen = free_addr();
     let mut cfg = Config::default();
     cfg.ca.dir = std::env::temp_dir().join(format!("aitm-e2e-ca-{}", std::process::id()));
-    cfg.browser.proxy_addr = browser_listen;
+    cfg.browser = engines::config_for(engine, browser_listen);
     cfg.scope.entries = vec![ScopeEntry {
         host: target_authority.clone(),
     }];
-    let proxy = build_proxy(&cfg).expect("build proxy");
+    // `assemble` (not `build_proxy`): the engine needs the CA's certificate
+    // file, which is how `main` launches it too (spec §D6).
+    let Assembled { proxy, ca } = assemble(&cfg).expect("assemble proxy");
 
     let store = proxy.store();
     let guard = proxy.guard();
@@ -193,18 +210,16 @@ async fn run_case(mode: Mode, poc_path: &std::path::Path) -> bool {
         Arc::new(Http1Sender::new()),
     ));
 
-    // Run the browser-facing accept loop so Chrome can reach the target through it.
+    // Run the browser-facing accept loop so the engine can reach the target through it.
     tokio::spawn(async move {
         let _ = proxy.run_browser(browser_listen).await;
     });
     wait_listening(browser_listen).await;
 
-    // A real headless Chrome routed through the proxy.
-    let driver: Arc<dyn BrowserDriver> = Arc::new(
-        ChromeDriver::launch(&cfg.browser)
-            .await
-            .expect("launch Chrome (Google Chrome must be installed)"),
-    );
+    // The real engine, routed through the proxy and trusting its CA.
+    let driver = aitm_browser::launch(&cfg.browser, ca.cert_path())
+        .await
+        .unwrap_or_else(|err| panic!("[{engine:?}] launch: {err:#}"));
 
     let server = McpServer::new(registry, McpTransport::Stdio).with_services(
         store.clone(),

@@ -1,8 +1,12 @@
 //! Task 19: the SSRF guard and the `browser.*` commands.
 //!
-//! Everything here runs without Chromium except the last test, which drives a
-//! real browser through the permitted path; it is part of the default suite but
-//! inert unless `AITM_CHROME=1` is set (mirrors the soak test's `AITM_SOAK`).
+//! Everything here runs without a browser except the last test, which drives a
+//! real engine through the permitted path; it is part of the default suite but
+//! runs only the engines enabled by `AITM_CHROME=1` / `AITM_OBSCURA=1`
+//! (`support/engines.rs`), and is inert when neither is set.
+
+#[path = "support/engines.rs"]
+mod engines;
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -309,17 +313,22 @@ fn page_commands_need_a_browser() {
     assert!(err.to_string().contains("browser"), "{err}");
 }
 
-/// AC12 (command half, permitted side): with the exact `host:port` in scope the
-/// navigation reaches a real driver. The loopback listener doubles as the
-/// browser's `--proxy-server`, answering any absolute-form request with 200.
+/// AC12 (command half, permitted side), per engine: with the exact `host:port`
+/// in scope the navigation reaches a real driver. The loopback listener doubles
+/// as the engine's proxy, answering any absolute-form request with 200.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn navigate_permitted_after_scope_reaches_driver() {
-    if std::env::var_os("AITM_CHROME").is_none() {
-        eprintln!("skipped; set AITM_CHROME=1 to run the Chromium-backed test (AC12)");
+    let engines = engines::engines();
+    if engines.is_empty() {
         return;
     }
-    use aitm_browser::{BrowserConfig, ChromeDriver};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // obscura needs a real PEM on `--ca-cert`; Chrome ignores the path.
+    let ca_cert = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../aitm-ca/tests/fixtures/ca.crt")
+        .canonicalize()
+        .expect("aitm-ca fixture ca.crt");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -340,36 +349,35 @@ async fn navigate_permitted_after_scope_reaches_driver() {
         }
     });
 
-    let driver = Arc::new(
-        ChromeDriver::launch(&BrowserConfig {
-            proxy_addr: addr,
-            ..BrowserConfig::default()
+    for engine in engines {
+        let driver = aitm_browser::launch(&engines::config_for(engine, addr), &ca_cert)
+            .await
+            .unwrap_or_else(|err| panic!("[{engine:?}] launch: {err:#}"));
+
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        let outcome = tokio::task::spawn_blocking(move || {
+            let mut reg = Registry::new();
+            register_browser_commands(&mut reg, SsrfPolicy::default());
+            let navigate = reg.command("browser.navigate").expect("registered").clone();
+            let store = MemFlowStore::new();
+            let guard = StdGuard::default();
+            guard.add_scope(ScopeEntry {
+                host: format!("127.0.0.1:{}", addr.port()),
+            });
+            let host = CommandHost::new(&store, &NoClient, &guard, Some(&*driver));
+            navigate.invoke(params(&[("url", Value::Str(url))]), &host)
         })
         .await
-        .expect("launch headless Chromium"),
-    );
+        .expect("join")
+        .unwrap_or_else(|err| panic!("[{engine:?}] navigation permitted once in scope: {err:#}"));
 
-    let url = format!("http://127.0.0.1:{}/", addr.port());
-    let outcome = tokio::task::spawn_blocking(move || {
-        let mut reg = Registry::new();
-        register_browser_commands(&mut reg, SsrfPolicy::default());
-        let navigate = reg.command("browser.navigate").expect("registered").clone();
-        let store = MemFlowStore::new();
-        let guard = StdGuard::default();
-        guard.add_scope(ScopeEntry {
-            host: format!("127.0.0.1:{}", addr.port()),
-        });
-        let host = CommandHost::new(&store, &NoClient, &guard, Some(&*driver));
-        navigate.invoke(params(&[("url", Value::Str(url))]), &host)
-    })
-    .await
-    .expect("join")
-    .expect("navigation permitted once in scope");
-
-    let Value::Object(fields) = outcome else {
-        panic!("navigate returns an object, got {outcome:?}");
-    };
-    assert!(
-        matches!(fields.get("final_url"), Some(Value::Str(u)) if u.starts_with("http://127.0.0.1:"))
-    );
+        let Value::Object(fields) = outcome else {
+            panic!("[{engine:?}] navigate returns an object, got {outcome:?}");
+        };
+        assert!(
+            matches!(fields.get("final_url"), Some(Value::Str(u)) if u.starts_with("http://127.0.0.1:")),
+            "[{engine:?}] final_url: {:?}",
+            fields.get("final_url")
+        );
+    }
 }

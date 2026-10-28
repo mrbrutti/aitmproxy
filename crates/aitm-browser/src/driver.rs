@@ -168,14 +168,27 @@ pub(crate) fn launch_args(config: &BrowserConfig) -> Vec<String> {
     ]
 }
 
-/// Convert a CDP evaluation result into a bus [`Value`].
+/// Largest magnitude a float holds exactly (2^53): below it an integral
+/// float is an integer, above it the cast would be lossy.
+const MAX_EXACT_FLOAT: f64 = 9_007_199_254_740_992.0;
+
+/// Convert a CDP evaluation result into a bus [`Value`]. JS has one number
+/// type, and obscura serialises every number as a float, so an integral
+/// float is the integer (`1+1` is `Int(2)` on both engines).
 pub(crate) fn json_to_value(json: &serde_json::Value) -> Value {
     match json {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(b) => Value::Bool(*b),
         serde_json::Value::Number(n) => match n.as_i64() {
             Some(i) => Value::Int(i),
-            None => Value::Float(n.as_f64().unwrap_or(f64::NAN)),
+            None => {
+                let f = n.as_f64().unwrap_or(f64::NAN);
+                if f.is_finite() && f.fract() == 0.0 && f.abs() <= MAX_EXACT_FLOAT {
+                    Value::Int(f as i64)
+                } else {
+                    Value::Float(f)
+                }
+            }
         },
         serde_json::Value::String(s) => Value::Str(s.clone()),
         serde_json::Value::Array(items) => Value::Array(items.iter().map(json_to_value).collect()),
@@ -289,5 +302,21 @@ mod tests {
             panic!("expected an object");
         };
         assert_eq!(obj.get("k"), Some(&Value::Int(3)));
+    }
+
+    /// M2-AC13: JS has one number type, and obscura serialises every number as
+    /// a float, so an integral float is the integer (`1+1` is `Int(2)` on both
+    /// engines); a true fraction, and a magnitude past the exactly-representable
+    /// range, stay `Float`.
+    #[test]
+    fn json_to_value_folds_integral_floats() {
+        assert_eq!(json_to_value(&serde_json::json!(2.0)), Value::Int(2));
+        assert_eq!(json_to_value(&serde_json::json!(-3.0)), Value::Int(-3));
+        assert_eq!(json_to_value(&serde_json::json!(0.0)), Value::Int(0));
+        assert_eq!(json_to_value(&serde_json::json!(1.5)), Value::Float(1.5));
+        assert_eq!(
+            json_to_value(&serde_json::json!(1e300)),
+            Value::Float(1e300)
+        );
     }
 }
