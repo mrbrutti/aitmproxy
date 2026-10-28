@@ -5,6 +5,7 @@ members = [
     "crates/aitm-plugin",
     "crates/aitm-proto-http",
     "crates/aitm-proto-ws",
+    "crates/aitm-proto-l4",
     "crates/aitm-plugins",
     "crates/aitm-browser",
     "crates/aitm-ca",
@@ -40,6 +41,7 @@ aitm-core = { path = "crates/aitm-core" }
 aitm-plugin = { path = "crates/aitm-plugin" }
 aitm-proto-http = { path = "crates/aitm-proto-http" }
 aitm-proto-ws = { path = "crates/aitm-proto-ws" }
+aitm-proto-l4 = { path = "crates/aitm-proto-l4" }
 aitm-plugins = { path = "crates/aitm-plugins" }
 aitm-browser = { path = "crates/aitm-browser" }
 aitm-ca = { path = "crates/aitm-ca" }

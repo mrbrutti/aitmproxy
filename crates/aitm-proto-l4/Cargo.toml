@@ -1,0 +1,20 @@
+[package]
+name = "aitm-proto-l4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Authorized raw-L4 / packet MITM: capture, scapy-style craft + guarded inject, send-recv, and in-path packet interception behind a deny-by-default L4Guard."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# L4ScopeId is uuid-backed; the `serde` feature lets scope ids round-trip in
+# config / command payloads. `v4` comes from the workspace definition.
+uuid = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+# config is authored as YAML by the operator; the deserialization test parses it.
+serde_yaml = "0.9"
+
+[lints]
+workspace = true

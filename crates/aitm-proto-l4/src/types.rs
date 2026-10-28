@@ -1,0 +1,122 @@
+//! Scope / guard value types (M5 Task 1).
+//!
+//! These are the authorization vocabulary shared by the `L4Guard`, the command
+//! surface, the flow model, and the config. Signatures are copied verbatim from
+//! the M5 design spec; later tasks add behaviour (guard matching, rate buckets)
+//! without changing these shapes.
+
+use std::net::IpAddr;
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// What a guard check is about — Capture, Inject, or Intercept are separate,
+/// separately-scoped capabilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum L4Action {
+    Capture,
+    Inject,
+    Intercept,
+}
+
+/// The target of a check — resolved from a capture/interception bind or from a
+/// decoded packet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct L4Target {
+    pub interface: String,
+    pub direction: L4Direction,
+    pub dst: Option<IpAddr>,
+    pub dst_port: Option<u16>,
+    pub proto: L4Proto,
+}
+
+/// Traffic direction, relative to the host running aitmproxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum L4Direction {
+    Inbound,
+    Outbound,
+}
+
+/// Transport/network protocol selector. `Other(u8)` and `Raw` keep the model
+/// open to any protocol, matching the craft layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum L4Proto {
+    Tcp,
+    Udp,
+    Icmp,
+    IcmpV6,
+    Other(u8),
+    Raw,
+}
+
+/// A deny-by-default scope entry. Nothing captures, injects, or intercepts until
+/// an entry exists and matches; Capture / Inject / Intercept are distinct
+/// capabilities on the entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct L4ScopeEntry {
+    /// Generated when omitted, so operators author scope without writing UUIDs.
+    #[serde(default)]
+    pub id: L4ScopeId,
+    pub cidr: IpCidr,
+    /// `Any` == `0..=65535`; matched for Tcp/Udp.
+    pub ports: PortRange,
+    pub interface: String,
+    pub direction: L4Direction,
+    /// Capture | Inject | Intercept — the capability this entry grants.
+    pub capability: L4Capability,
+    /// Per-entry injection ceiling (pps + burst).
+    pub inject_rate: RateCap,
+}
+
+/// Stable identifier for a scope entry (uuid-backed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct L4ScopeId(Uuid);
+
+impl L4ScopeId {
+    /// Mint a fresh scope id.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for L4ScopeId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The capability a scope entry grants. Mirrors `L4Action`, but names what an
+/// entry *authorizes* rather than what a check *requests*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum L4Capability {
+    Capture,
+    Inject,
+    Intercept,
+}
+
+/// An inclusive port range. `lo == 0 && hi == 65535` means "any port".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortRange {
+    pub lo: u16,
+    pub hi: u16,
+}
+
+/// A CIDR block: a base address plus a prefix length in bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpCidr {
+    pub addr: IpAddr,
+    pub prefix: u8,
+}
+
+/// An injection rate ceiling. `pps == 0` means **refuse** (the `per_host_rps`
+/// "0 means refuse" convention, not "1 pps").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateCap {
+    pub pps: u32,
+    pub burst: u32,
+}
