@@ -4,6 +4,7 @@
 //! registry, the flow store, the scope/rate guard, and the proxy acceptor. Every
 //! other crate in the workspace depends on this one.
 
+pub mod agent;
 pub mod authority;
 pub mod body;
 pub mod chain;
@@ -24,6 +25,7 @@ pub mod store;
 pub mod stream;
 pub mod value;
 
+pub use agent::AgentPolicy;
 pub use authority::{Authority, AuthorityError};
 pub use body::{Body, StreamBody};
 pub use chain::Chain;
