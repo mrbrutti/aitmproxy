@@ -96,38 +96,63 @@ fn paused_insert_is_resident_but_hidden() {
 }
 
 #[test]
-fn reinsert_of_visible_flow_while_paused_stays_visible() {
+fn reinsert_of_visible_flow_while_paused_stays_visible_and_keeps_marks() {
     // A flow first seen while capturing is visible; the chain re-inserts it on
     // later events, and pausing mid-flight must NOT hide it or drop its marks.
     let store = MemFlowStore::new();
     let id = store.insert(http(InterceptState::Observed, false));
+    store.update(id, &mut |f| f.metadata_mut().marks = vec!["red".into()]);
     assert!(store.list().contains(&id));
 
     store.set_capturing(false);
-    // Re-insert the same id (as the chain does on each event).
-    store.insert(http_with_id(id, InterceptState::Observed, true));
+    // Re-insert the SAME flow as it now stands (as the chain does on each event,
+    // carrying the current state including the mark).
+    let current = store.get(id).expect("resident");
+    store.insert(current);
     assert!(
         store.list().contains(&id),
         "an already-visible in-flight flow stays visible when capture pauses"
     );
     assert_eq!(store.count(), 1);
+    assert_eq!(
+        store.get(id).unwrap().metadata().marks,
+        vec!["red".to_string()],
+        "the mark survives the re-insert"
+    );
 }
 
 #[test]
-fn hidden_flows_age_out_via_eviction() {
-    // With capacity 1 and nothing visible to show, hidden flows are bounded by the
-    // normal FIFO eviction rather than any retire step.
-    let store = MemFlowStore::with_capacity(1);
+fn hidden_flows_age_out_via_eviction_without_stale_ids() {
+    // With a tiny capacity, hidden flows are bounded by the normal FIFO eviction
+    // rather than any retire step, and the hidden set never keeps a stale id.
+    let store = MemFlowStore::with_capacity(2);
     store.set_capturing(false);
-    for _ in 0..5 {
-        store.insert(http(InterceptState::Observed, true));
-    }
+    let ids: Vec<_> = (0..5)
+        .map(|_| store.insert(http(InterceptState::Observed, true)))
+        .collect();
+
     assert!(store.list().is_empty(), "hidden flows are never listed");
-    // Eviction keeps the map bounded near capacity even while paused.
     assert!(
-        store.resident_bytes() > 0,
-        "some hidden flow is still resident"
+        store.get(ids[0]).is_none(),
+        "the oldest hidden flow is evicted"
     );
+    // The hidden set holds exactly the hidden flows still resident — no stale ids.
+    let resident = ids.iter().filter(|id| store.get(**id).is_some()).count();
+    assert_eq!(store.hidden_len(), resident);
+    assert!(resident <= 2, "eviction keeps the map near capacity");
+}
+
+#[test]
+fn clear_prunes_the_hidden_set() {
+    let store = MemFlowStore::new();
+    store.set_capturing(false);
+    for _ in 0..3 {
+        store.insert(http(InterceptState::Observed, true)); // terminal: has response
+    }
+    assert_eq!(store.hidden_len(), 3);
+    let outcome = store.clear();
+    assert_eq!(outcome.cleared, 3, "clear removes hidden terminal flows");
+    assert_eq!(store.hidden_len(), 0, "clear prunes their hidden ids");
 }
 
 #[test]

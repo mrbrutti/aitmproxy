@@ -64,7 +64,7 @@ fn summary(path: &Path, poc: &Poc) -> Value {
 
 /// Load one PoC under `dir`, returning `None` (and logging) when it does not parse.
 fn load_summary(path: &Path, dir: &Path) -> Option<Value> {
-    match loader::read_confined(path, dir, MAX_POC_BYTES)
+    match loader::read_confined(path, dir, MAX_POC_BYTES, &[])
         .ok()
         .and_then(|b| String::from_utf8(b).ok())
         .and_then(|t| loader::parse_poc(&t).ok())
@@ -164,7 +164,7 @@ impl Command for PocGet {
             .config()
             .and_then(|c| c.poc.dir.clone())
             .ok_or_else(|| anyhow::anyhow!("poc.get: no PoC directory is configured"))?;
-        let bytes = loader::read_confined(Path::new(poc_path), &dir, MAX_POC_BYTES)
+        let bytes = loader::read_confined(Path::new(poc_path), &dir, MAX_POC_BYTES, &[])
             .map_err(|e| anyhow::anyhow!("poc.get: {e}"))?;
         let text = String::from_utf8(bytes).map_err(|_| {
             anyhow::anyhow!("poc.get: not found or outside the configured PoC directory")
@@ -233,8 +233,13 @@ impl Command for PocArtifact {
                     "poc.artifact: no PoC output directory is configured (set poc.out_dir)"
                 )
             })?;
-        let bytes = loader::read_confined(Path::new(path_arg), &root, MAX_ARTIFACT_BYTES)
-            .map_err(|e| anyhow::anyhow!("poc.artifact: {e}"))?;
+        let bytes = loader::read_confined(
+            Path::new(path_arg),
+            &root,
+            MAX_ARTIFACT_BYTES,
+            &ARTIFACT_EXTENSIONS,
+        )
+        .map_err(|e| anyhow::anyhow!("poc.artifact: {e}"))?;
         Ok(Value::Bytes(bytes))
     }
 }

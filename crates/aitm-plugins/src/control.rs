@@ -3,9 +3,11 @@
 //! `proxy.status` reports the proxy's live state (whether it is listening and on
 //! what address, whether interception is armed, how many flows are paused, and
 //! whether capture is on) so a surface has a read-only way to learn it.
-//! `proxy.pause`/`proxy.resume` toggle capture (the record button); `flow.clear`
-//! removes the terminal flows; `config.get` returns a redacted view of the
-//! configuration (never the MCP token or any key material).
+//! `proxy.pause`/`proxy.resume` toggle whether new flows are *shown*: a paused
+//! flow still passes through the proxy and stays in memory (reachable by id), it
+//! is simply hidden from `list`/`status`/`count` and aged out by normal eviction.
+//! `flow.clear` removes the terminal flows; `config.get` returns a redacted view
+//! of the configuration (never the MCP token or any key material).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -114,8 +116,12 @@ impl Command for ProxyPause {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "Pause capture: new flows are not retained (traffic still flows). \
-                          Returns the capture state."
+            description: "Pause capture: new flows are hidden from list/status/count. Traffic \
+                          still flows and each hidden flow stays in memory, reachable by id, until \
+                          it ages out via normal eviction (use flow.clear to drop completed ones). \
+                          While paused, continued traffic can evict older visible flows under the \
+                          store's capacity bound, so resume or clear to reclaim history. Returns \
+                          the capture state."
                 .into(),
             params: vec![],
             result: TypeDesc::Object(Vec::new()),
@@ -137,7 +143,7 @@ impl Command for ProxyResume {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "Resume capture: new flows are retained again. Returns the capture state."
+            description: "Resume capture: new flows are shown again. Returns the capture state."
                 .into(),
             params: vec![],
             result: TypeDesc::Object(Vec::new()),

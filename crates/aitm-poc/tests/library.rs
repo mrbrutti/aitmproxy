@@ -284,3 +284,26 @@ fn poc_artifact_rejects_disallowed_extension() {
     .expect_err("a non-artifact extension must be refused");
     assert!(err.to_string().contains("artifacts are served"), "{err}");
 }
+
+#[cfg(unix)]
+#[test]
+fn poc_artifact_rejects_png_symlink_to_pem() {
+    // Defense in depth: a `.png` symlink whose canonical target is a `.pem` must be
+    // refused — the extension is checked on the resolved path, not just the name.
+    let out_dir = unique_dir("art-symext");
+    let key = out_dir.join("ca.pem");
+    std::fs::write(&key, b"-----BEGIN PRIVATE KEY-----").unwrap();
+    let link = out_dir.join("look.png");
+    std::os::unix::fs::symlink(&key, &link).unwrap();
+    let err = call(
+        &reg(),
+        cfg_with(None, Some(out_dir)),
+        "poc.artifact",
+        &[("path", Value::Str(link.display().to_string()))],
+    )
+    .expect_err("a .png symlink to a .pem must be refused");
+    assert!(
+        err.to_string().contains("outside") || err.to_string().contains("artifacts"),
+        "{err}"
+    );
+}

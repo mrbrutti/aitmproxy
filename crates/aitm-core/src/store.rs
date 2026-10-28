@@ -26,8 +26,8 @@ pub trait FlowStore: Send + Sync {
     /// retained so the pipeline can `get`/`update` it. When capture is paused a
     /// **newly**-inserted flow is marked *hidden* — excluded from `list`/`query`
     /// and the counts, but kept resident and reachable by id (so the pipeline,
-    /// interception and replay all keep working). Hidden flows are not retired on
-    /// a lifecycle event; they age out through the normal capacity/byte eviction,
+    /// interception and replay all keep working). Hidden flows are not dropped on
+    /// any lifecycle event; they age out through the normal capacity/byte eviction,
     /// so pausing simply stops *showing* new flows while keeping memory bounded.
     fn insert(&self, flow: Flow) -> FlowId;
     /// A clone of the stored flow, if present. Returns hidden flows too, so a
@@ -105,7 +105,7 @@ pub struct MemFlowStore {
     capturing: AtomicBool,
     /// Ids captured while paused: resident but hidden from `list`/`query`/counts
     /// (unless currently intercepted). They age out through the normal eviction,
-    /// never a lifecycle retire. Always locked **after** `flows` to avoid deadlock.
+    /// never on a lifecycle event. Always locked **after** `flows` to avoid deadlock.
     hidden: Mutex<HashSet<FlowId>>,
 }
 
@@ -150,6 +150,12 @@ impl MemFlowStore {
         self.resident.load(Ordering::Relaxed)
     }
 
+    /// How many ids are marked hidden (for tests / introspection). Every hidden id
+    /// always corresponds to a resident flow — eviction and `clear` prune it.
+    pub fn hidden_len(&self) -> usize {
+        self.hidden().len()
+    }
+
     /// Evict the oldest flows until both the count and byte bounds hold. Called
     /// under the write lock after a mutation that may have pushed over a bound.
     fn evict_over_limit(&self, flows: &mut IndexMap<FlowId, Flow>) {
@@ -179,7 +185,7 @@ impl MemFlowStore {
     /// Drain the `remove` oldest flows, decrementing the resident-byte counter by
     /// their estimated size and dropping any of them from the hidden set. This is
     /// the only path that removes a hidden flow: paused captures age out here, so
-    /// memory stays bounded without a per-event retire step.
+    /// memory stays bounded without a per-event cleanup step.
     fn drain_oldest(&self, flows: &mut IndexMap<FlowId, Flow>, remove: usize) {
         let remove = remove.min(flows.len());
         if remove == 0 {
@@ -206,8 +212,11 @@ fn is_visible(id: &FlowId, flow: &Flow, hidden: &HashSet<FlowId>) -> bool {
 
 /// Whether a flow has reached a point where it can be removed without stranding
 /// the pipeline: an intercepted (parked) flow never qualifies; an HTTP flow does
-/// once it is killed or has a fully-buffered response; a WebSocket flow once
-/// killed (there is no end marker on the flow yet — see the F-list retention gap).
+/// once it is killed or has a fully-buffered response — **except a `101` upgrade**,
+/// whose `HttpFlow` the WebSocket module reads *after* the response is set
+/// (`WsModule::drive` → `get(handshake)`), so clearing it mid-handoff would drop
+/// the socket. A WebSocket flow qualifies once killed (there is no end marker on
+/// the flow yet — see the F-list retention gap).
 fn is_terminal(flow: &Flow) -> bool {
     match flow {
         Flow::Http(f) => match &f.intercept {
@@ -216,7 +225,7 @@ fn is_terminal(flow: &Flow) -> bool {
             _ => f
                 .response
                 .as_ref()
-                .is_some_and(|r| !matches!(r.body, Body::Streamed(_))),
+                .is_some_and(|r| r.status != 101 && !matches!(r.body, Body::Streamed(_))),
         },
         Flow::WebSocket(f) => matches!(f.intercept, InterceptState::Killed),
     }

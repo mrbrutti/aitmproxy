@@ -609,8 +609,10 @@ impl Command for PocRunCommand {
         // oracle); unconfigured, it loads any path but still refuses a symlinked or
         // non-regular file and caps the size.
         let bytes = match host.poc_dir() {
-            Some(root) => crate::loader::read_confined(path, root, crate::loader::MAX_POC_BYTES)
-                .map_err(|e| anyhow::anyhow!("poc.run: `{poc_path}`: {e}"))?,
+            Some(root) => {
+                crate::loader::read_confined(path, root, crate::loader::MAX_POC_BYTES, &[])
+                    .map_err(|e| anyhow::anyhow!("poc.run: `{poc_path}`: {e}"))?
+            }
             None => crate::loader::read_capped(path, crate::loader::MAX_POC_BYTES)
                 .map_err(|e| anyhow::anyhow!("poc.run: cannot open `{poc_path}`: {e}"))?,
         };

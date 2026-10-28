@@ -74,13 +74,27 @@ pub fn read_capped(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
 }
 
 /// Read `path`, requiring it to resolve (canonicalized, so `..` and symlinks are
-/// followed) under `root`. Every failure collapses to one [`ConfinedError`].
-pub fn read_confined(path: &Path, root: &Path, max: u64) -> Result<Vec<u8>, ConfinedError> {
+/// followed) under `root`. When `allowed_exts` is non-empty, the **canonical**
+/// path's extension must be one of them — so a `foo.png` symlink pointing at a
+/// `bar.pem` is rejected, not just one named `.pem`. Every failure collapses to
+/// one [`ConfinedError`] (no file-existence oracle).
+pub fn read_confined(
+    path: &Path,
+    root: &Path,
+    max: u64,
+    allowed_exts: &[&str],
+) -> Result<Vec<u8>, ConfinedError> {
     let within = || -> Option<Vec<u8>> {
         let canon_root = root.canonicalize().ok()?;
         let canon_path = path.canonicalize().ok()?;
         if !canon_path.starts_with(&canon_root) {
             return None;
+        }
+        if !allowed_exts.is_empty() {
+            let ext = canon_path.extension().and_then(|e| e.to_str());
+            if !ext.is_some_and(|e| allowed_exts.contains(&e)) {
+                return None;
+            }
         }
         // The canonical path has no symlink final component, so the hardened read
         // is a pure confinement + size check.
