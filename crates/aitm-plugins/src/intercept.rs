@@ -17,10 +17,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use aitm_core::{
-    Command, CommandHost, Event, Flow, FlowCtx, FlowId, InterceptState, ParamDef, ParamSchema,
-    Params, Plugin, Registry, ResumeHandle, TypeDesc, Value, Verdict,
+    Body, Command, CommandHost, Event, Flow, FlowCtx, FlowId, HeaderMap, HttpResponse,
+    InterceptState, ParamDef, ParamSchema, Params, Plugin, Registry, ResumeHandle, TypeDesc, Value,
+    Verdict,
 };
 use aitm_rules::{CompiledRule, HostMatch, MatchCondition, Phase, Rule, UrlMatch};
 
@@ -488,7 +490,9 @@ impl Command for FlowResume {
     }
 }
 
-/// `flow.kill {id}` → drop the parked flow; the client sees a closed connection.
+/// `flow.kill {id, mode?}` → abort the parked flow. `reset` (default) drops it so
+/// the client sees a reset/closed connection; `429`/`503` synthesize that status
+/// to the client with no upstream call.
 struct FlowKill {
     shared: Arc<Shared>,
 }
@@ -500,26 +504,56 @@ impl Command for FlowKill {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "Drop an intercepted flow; the client sees a reset/closed connection."
+            description: "Abort an intercepted flow. mode=reset (default) drops it so the client \
+                          sees a reset/closed connection; mode=429 or mode=503 answers the client \
+                          with that status and an empty body, with no upstream request."
                 .into(),
-            params: vec![id_param("The intercepted flow to kill.")],
+            params: vec![
+                id_param("The intercepted flow to kill."),
+                ParamDef {
+                    name: "mode".into(),
+                    ty: TypeDesc::Str,
+                    required: false,
+                    description: "Abort mode: reset (default), 429, or 503.".into(),
+                },
+            ],
             result: TypeDesc::Str,
         }
     }
 
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
-        release(&self.shared, host, args.get_flow_id("id")?, Release::Kill)
+        let how = match args.get("mode") {
+            None => Release::Reset,
+            Some(_) => parse_kill_mode(args.get_str("mode")?)?,
+        };
+        release(&self.shared, host, args.get_flow_id("id")?, how)
+    }
+}
+
+/// Parse the `flow.kill` `mode`: `reset` keeps the drop behaviour; `429`/`503`
+/// synthesize that status. Any other value is an `Err`.
+fn parse_kill_mode(mode: &str) -> anyhow::Result<Release> {
+    match mode {
+        "reset" => Ok(Release::Reset),
+        "429" => Ok(Release::Synthesize(429)),
+        "503" => Ok(Release::Synthesize(503)),
+        other => anyhow::bail!("unknown kill mode `{other}` (want reset, 429, or 503)"),
     }
 }
 
 enum Release {
     Resume,
-    Kill,
+    /// Drop the flow; the client sees a reset/closed connection.
+    Reset,
+    /// Short-circuit: answer the client with this status and an empty body, with
+    /// no upstream connection.
+    Synthesize(u16),
 }
 
-/// Release a parked flow: record its new state in the store, then wake the
-/// parked future. The handle is the one this plugin parked, or — for a flow
-/// another plugin parked — the one its stored `Intercepted` state carries.
+/// Release a parked flow: record its new state (and, for a synthesized abort, its
+/// response) in the store, then wake the parked future. The handle is the one this
+/// plugin parked, or — for a flow another plugin parked — the one its stored
+/// `Intercepted` state carries.
 fn release(shared: &Shared, host: &CommandHost, id: FlowId, how: Release) -> anyhow::Result<Value> {
     let parked = shared
         .parked
@@ -530,15 +564,37 @@ fn release(shared: &Shared, host: &CommandHost, id: FlowId, how: Release) -> any
         Some(handle) => handle,
         None => stored_handle(host, id)?,
     };
-    let (state, label) = match how {
-        Release::Resume => (InterceptState::Resumed, "resumed"),
-        Release::Kill => (InterceptState::Killed, "killed"),
+    // A synthesized abort is `Resumed` with a response already set: the HTTP module
+    // short-circuits to the client before any upstream connect. A `reset` abort is
+    // `Killed` and drops the connection. Neither opens an upstream connection.
+    let (state, label, synth) = match how {
+        Release::Resume => (InterceptState::Resumed, "resumed", None),
+        Release::Reset => (InterceptState::Killed, "killed", None),
+        Release::Synthesize(status) => (InterceptState::Resumed, "killed", Some(status)),
     };
     host.store().update(id, &mut |flow: &mut Flow| {
-        set_intercept(flow, state.clone())
+        if let Some(status) = synth {
+            set_short_circuit(flow, status);
+        }
+        set_intercept(flow, state.clone());
     });
     handle.fire();
     Ok(Value::Str(label.into()))
+}
+
+/// Attach a minimal synthesized response (given status, empty body) to an HTTP
+/// flow so the module answers the client without an upstream request. Mirrors
+/// [`FlowCtx::set_response`] for a flow released outside an event.
+fn set_short_circuit(flow: &mut Flow, status: u16) {
+    if let Flow::Http(f) = flow {
+        f.response = Some(HttpResponse {
+            status,
+            version: f.request.version,
+            headers: HeaderMap::new(),
+            body: Body::Empty,
+            timestamp: SystemTime::now(),
+        });
+    }
 }
 
 /// The resume handle a stored flow's `Intercepted` state carries.
