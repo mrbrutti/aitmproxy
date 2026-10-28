@@ -236,7 +236,7 @@ pub const CORE_TOOLS: &[&str] = &[
 /// test starts from. The fixture's whole tool list is offered, F-gated
 /// commands included.
 pub fn fixture_app(cols: u16, rows: u16) -> App {
-    load_fixture_app(cols, rows, false)
+    fixture_app_from(Fixture::builtin(), cols, rows)
 }
 
 /// [`fixture_app`] against the bus as it exists today: only [`CORE_TOOLS`]
@@ -244,17 +244,25 @@ pub fn fixture_app(cols: u16, rows: u16) -> App {
 /// or `poc.list`) and every dependent surface shows its degraded state. This
 /// is what `aitm-tui --snapshot-core` renders.
 pub fn fixture_app_core(cols: u16, rows: u16) -> App {
-    load_fixture_app(cols, rows, true)
+    load_fixture_app(Fixture::builtin(), cols, rows, true)
 }
 
-fn load_fixture_app(cols: u16, rows: u16, core_only: bool) -> App {
-    let mut fx = Fixture::builtin();
+/// [`fixture_app`] from an already parsed fixture (`--fixture path`): its
+/// whole tool list is offered. A fixture is a developer's file, so a tool
+/// entry the client cannot read is a panic naming it, not a silent omission.
+pub fn fixture_app_from(fx: Fixture, cols: u16, rows: u16) -> App {
+    load_fixture_app(fx, cols, rows, false)
+}
+
+fn load_fixture_app(mut fx: Fixture, cols: u16, rows: u16, core_only: bool) -> App {
     let mut app = App::new(TermCaps::full(), "fixture");
     let _ = app.update(Action::Resize(cols, rows));
     let tools: Vec<ToolInfo> = fx
         .tools
         .iter()
-        .filter_map(|t| ToolInfo::from_json(t).ok())
+        .map(|t| {
+            ToolInfo::from_json(t).unwrap_or_else(|e| panic!("bus-fixture.json tool entry: {e}"))
+        })
         .filter(|t| !core_only || CORE_TOOLS.contains(&t.name.as_str()))
         .collect();
     // The listen address comes from `proxy.status` (F7), which the core bus

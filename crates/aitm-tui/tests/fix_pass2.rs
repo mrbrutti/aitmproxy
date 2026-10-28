@@ -8,8 +8,9 @@ use std::path::Path;
 use aitm_tui::action::{Action, BusEvent, BusRequest, Level, ToolInfo};
 use aitm_tui::app::{App, Mode, PromptKind, SidebarItem};
 use aitm_tui::caps::TermCaps;
+use aitm_tui::fixture::Fixture;
 use aitm_tui::model::Finding;
-use aitm_tui::{fixture_app, fixture_app_core, CORE_TOOLS};
+use aitm_tui::{fixture_app, fixture_app_core, fixture_app_from, CORE_TOOLS};
 use common::*;
 use serde_json::json;
 
@@ -25,6 +26,204 @@ fn failed(name: &str, message: &str) -> BusEvent {
         name: name.into(),
         message: message.into(),
     }
+}
+
+/// The built-in fixture's 1×1 PNG screenshot: a real image file's bytes.
+fn fixture_png() -> Vec<u8> {
+    let png = aitm_tui::base64::decode(&Fixture::builtin().browser_screenshot)
+        .expect("the fixture's screenshot is base64");
+    assert_eq!(
+        aitm_tui::viewers::image::dimensions(&png),
+        Some((1, 1, "PNG"))
+    );
+    png
+}
+
+// ------------------------------------------------------- pass-2 re-check M1
+
+/// M1: a prompt returns to the mode it was opened from, not to a mode fixed
+/// by its kind — `:` from the Scope panel lands back in Scope, `/` from the
+/// inspector back in the inspector.
+#[test]
+fn a_prompt_returns_to_the_mode_it_was_opened_from() {
+    let mut app = fixture_app(200, 50);
+    let _ = app.update(Action::OpenScope);
+    assert_eq!(app.mode, Mode::Scope);
+    let _ = app.update(Action::PaletteOpen);
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::Palette));
+    let _ = app.update(Action::Back);
+    assert_eq!(app.mode, Mode::Scope, "Esc from `:` opened in Scope");
+
+    app.mode = Mode::Inspector;
+    let _ = app.update(Action::FilterOpen);
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::Filter));
+    for c in "login".chars() {
+        let _ = app.update(Action::Input(c));
+    }
+    let _ = app.update(Action::Submit);
+    assert_eq!(
+        app.mode,
+        Mode::Inspector,
+        "Enter from `/` opened in Inspector"
+    );
+    assert_eq!(app.filter_text, "login");
+
+    // The palette's Enter on a blank line goes back where it came from too.
+    let _ = app.run_command("ca");
+    assert_eq!(app.mode, Mode::Ca);
+    let _ = app.update(Action::PaletteOpen);
+    let _ = app.update(Action::Submit);
+    assert_eq!(app.mode, Mode::Ca, "Enter (blank) from `:` opened in Ca");
+
+    // A chained prompt keeps the origin of the first one.
+    let _ = app.update(Action::OpenFindings);
+    let _ = app.update(Action::PocRerun);
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::PocTarget));
+    let _ = app.update(Action::Submit);
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::PocVars));
+    let _ = app.update(Action::Back);
+    assert_eq!(app.mode, Mode::Findings);
+}
+
+// ------------------------------------------------------- pass-2 re-check M2
+
+/// M2: only the `browser.*` calls the view tracks (those with a busy label)
+/// count as in flight — an answer for an untracked `browser.*` tool does
+/// not settle a tracked call that is still waiting.
+#[test]
+fn an_untracked_browser_tool_answer_does_not_settle_a_tracked_call_in_flight() {
+    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = app.update(Action::Resize(200, 50));
+    let mut with_tabs: Vec<&str> = CORE_TOOLS.to_vec();
+    with_tabs.push("browser.tabs");
+    let _ = connect(&mut app, &with_tabs, None);
+    let _ = app.update(Action::BrowserRefreshDom);
+    assert_eq!(app.browser.inflight, 1);
+    assert_eq!(app.browser.busy, Some("reading the DOM"));
+
+    // An untracked call is not counted when sent …
+    assert_eq!(
+        app.run_command("browser.tabs"),
+        vec![call("browser.tabs", json!({}))]
+    );
+    assert_eq!(app.browser.inflight, 1, "browser.tabs is not tracked");
+    assert_eq!(app.browser.busy, Some("reading the DOM"));
+    // … nor when it answers or fails.
+    let _ = app.on_bus(BusEvent::CallOk {
+        name: "browser.tabs".into(),
+        value: json!([]),
+    });
+    assert_eq!(app.browser.inflight, 1, "get_dom is still in flight");
+    assert_eq!(app.browser.busy, Some("reading the DOM"));
+    let _ = app.on_bus(failed("browser.tabs", "no tabs"));
+    assert_eq!(app.browser.inflight, 1);
+    assert_eq!(app.browser.busy, Some("reading the DOM"));
+    assert_eq!(app.browser.error, None, "not the view's answer");
+    assert_eq!(toast(&app), "no tabs");
+
+    let _ = app.on_bus(BusEvent::CallOk {
+        name: "browser.get_dom".into(),
+        value: json!("<html></html>"),
+    });
+    assert_eq!(app.browser.inflight, 0);
+    assert_eq!(app.browser.busy, None);
+}
+
+// ------------------------------------------------------- pass-2 re-check M3
+
+/// M3: the fixture loader does not swallow a tool entry it cannot read — a
+/// nameless tool parses as a document but loading the app from it panics
+/// naming the fixture.
+#[test]
+#[should_panic(expected = "bus-fixture.json tool entry")]
+fn a_fixture_tool_without_a_name_panics_the_fixture_loader() {
+    let fx = Fixture::parse(r#"{"tools":[{"description":"nameless"}],"flows":[]}"#)
+        .expect("the document itself parses");
+    assert_eq!(fx.tools.len(), 1);
+    let _ = fixture_app_from(fx, 200, 50);
+}
+
+/// M3 (control): the same loader builds the app from a parsed fixture whose
+/// tools are well-formed.
+#[test]
+fn the_fixture_loader_builds_an_app_from_a_parsed_fixture() {
+    let fx = Fixture::parse(
+        r#"{"tools":[{"name":"flow.list","description":"","inputSchema":{"type":"object"}}],"flows":[]}"#,
+    )
+    .unwrap();
+    let app = fixture_app_from(fx, 120, 40);
+    assert!(app.has_tool("flow.list"));
+    assert!(!app.has_tool("flow.get"));
+    assert_eq!((app.width, app.height), (120, 40));
+}
+
+// ------------------------------------------------------- pass-2 re-check M4
+
+/// M4: the regular-file and size checks run on the opened handle, so a
+/// directory that happens to carry a `.yaml` name is refused as "not a
+/// regular file" whatever its pre-open metadata said.
+#[test]
+fn finding_yaml_refuses_a_directory_handle_with_a_yaml_name() {
+    let dir = std::env::temp_dir().join(format!("aitm-tui-fix-pass2-fstat-{}", std::process::id()));
+    let as_dir = dir.join("poc.yaml");
+    std::fs::create_dir_all(&as_dir).unwrap();
+    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = app.on_bus(BusEvent::Findings(vec![Finding::from_json(
+        &json!({"poc_path": as_dir.to_string_lossy(), "passed": true}),
+    )
+    .unwrap()]));
+    assert_eq!(app.findings[0].yaml, None);
+    let err = app.findings[0].yaml_error.as_deref().unwrap_or("");
+    assert!(err.contains("regular file"), "{err:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------- pass-2 re-check M5
+
+/// M5: Findings `o` hands the desktop a regular file whose first bytes are
+/// an image; a `.png`-named text file or directory opens nothing and the
+/// toast says so with the resolved path.
+#[test]
+fn findings_o_opens_only_a_regular_file_that_is_an_image() {
+    let dir = std::env::temp_dir().join(format!("aitm-tui-fix-pass2-image-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("dir.png")).unwrap();
+    let fake = dir.join("fake.png");
+    std::fs::write(&fake, "hello, not an image\n").unwrap();
+    let real = dir.join("real.png");
+    std::fs::write(&real, fixture_png()).unwrap();
+
+    let mut app = fixture_app(200, 50);
+    let _ = app.update(Action::OpenFindings);
+    app.finding_cursor = 0;
+
+    app.findings[0].screenshot_path = Some(fake.to_string_lossy().into_owned());
+    let _ = app.update(Action::OpenExternally);
+    assert!(
+        app.take_open_target().is_none(),
+        "a text file is not opened"
+    );
+    assert_eq!(
+        toast(&app),
+        format!(
+            "not an image: {}",
+            std::fs::canonicalize(&fake).unwrap().display()
+        )
+    );
+
+    app.findings[0].screenshot_path = Some(dir.join("dir.png").to_string_lossy().into_owned());
+    let _ = app.update(Action::OpenExternally);
+    assert!(
+        app.take_open_target().is_none(),
+        "a directory is not opened"
+    );
+    assert!(toast(&app).starts_with("not an image: "), "{}", toast(&app));
+
+    app.findings[0].screenshot_path = Some(real.to_string_lossy().into_owned());
+    let _ = app.update(Action::OpenExternally);
+    let target = app.take_open_target().expect("a real PNG opens");
+    assert_eq!(target.path, std::fs::canonicalize(&real).unwrap());
+    assert_eq!(target.label, "screenshot");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ------------------------------------------------------------------ QI-1
@@ -283,7 +482,7 @@ fn findings_o_canonicalizes_the_screenshot_path_and_refuses_one_that_does_not_re
     let dir = std::env::temp_dir().join(format!("aitm-tui-fix-pass2-shot-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("sub")).unwrap();
     let shot = dir.join("shot.png");
-    std::fs::write(&shot, b"\x89PNG\r\n\x1a\n").unwrap();
+    std::fs::write(&shot, fixture_png()).unwrap();
     let dotted = dir.join("sub").join("..").join("shot.png");
     app.findings[0].screenshot_path = Some(dotted.to_string_lossy().into_owned());
     let _ = app.update(Action::OpenExternally);
@@ -427,9 +626,9 @@ fn ca_panel_install_without_the_ca_plugin_names_the_missing_tool() {
 // ------------------------------------------------------------------- Q-2
 
 /// Q-2: Esc and Enter from every prompt land in the same mode — the one the
-/// prompt was opened from (ScopeAdd → Scope, CaExport → Ca, the browser
-/// prompts → Browser, the PoC run prompts → Findings, Confirm → where the
-/// call was made, everything else → Flows).
+/// prompt was opened from (here ScopeAdd from Scope, CaExport from Ca, the
+/// browser prompts from Browser, the PoC run prompts from Findings, Confirm
+/// from where the call was made, everything else from Flows).
 #[test]
 fn esc_and_enter_from_every_prompt_land_in_the_same_mode() {
     let open = |app: &mut App, kind: PromptKind| {

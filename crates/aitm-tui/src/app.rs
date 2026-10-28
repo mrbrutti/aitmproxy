@@ -98,27 +98,6 @@ pub enum PromptKind {
     BrowserEval,
 }
 
-impl PromptKind {
-    /// Where Esc or Enter leaves the operator: the mode the prompt was
-    /// opened from. A confirm goes back to where its call was made.
-    fn returns_to(self, app: &App) -> Mode {
-        match self {
-            PromptKind::ScopeAdd => Mode::Scope,
-            PromptKind::PocTarget | PromptKind::PocVars => Mode::Findings,
-            PromptKind::CaExport => Mode::Ca,
-            PromptKind::BrowserUrl | PromptKind::BrowserEval => Mode::Browser,
-            PromptKind::Confirm => app.confirm.as_ref().map_or(Mode::Flows, |c| c.return_to),
-            PromptKind::Palette
-            | PromptKind::Filter
-            | PromptKind::Comment
-            | PromptKind::Mark
-            | PromptKind::Pin
-            | PromptKind::PocName
-            | PromptKind::PocParam => Mode::Flows,
-        }
-    }
-}
-
 /// The last `browser.screenshot`: its header facts and the bytes `o` hands
 /// to the desktop.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +139,14 @@ pub struct BrowserState {
     pub inflight: usize,
     /// The last `browser.*` failure, shown in the panel until the next call.
     pub error: Option<String>,
+}
+
+/// Whether the browser view counts a call as in flight: exactly the calls
+/// [`browser_busy_label`] has a word for. The same predicate gates the
+/// increment in `call_tool` and the decrements on `CallOk`/`CallFailed`, so
+/// an answer for an untracked `browser.*` tool never settles a tracked one.
+fn is_tracked_browser_call(name: &str) -> bool {
+    browser_busy_label(name).is_some()
 }
 
 /// The panel's word for a `browser.*` call in flight.
@@ -753,6 +740,10 @@ pub struct App {
     pub filter: Option<Expr>,
     pub filter_text: String,
     pub prompt: String,
+    /// The mode the open prompt was opened from — where Esc or Enter
+    /// returns. Set by `open_prompt` only when a prompt is not already open,
+    /// so a chained prompt (PoC name → param) keeps the first one's origin.
+    pub prompt_from: Mode,
     pub palette_cursor: usize,
     pub pinned_hosts: Vec<String>,
     pub auto_select: bool,
@@ -810,6 +801,7 @@ impl App {
             filter: None,
             filter_text: String::new(),
             prompt: String::new(),
+            prompt_from: Mode::Flows,
             palette_cursor: 0,
             pinned_hosts: Vec::new(),
             auto_select: false,
@@ -1511,8 +1503,8 @@ impl App {
             }
             Action::PaletteOpen => self.open_prompt(PromptKind::Palette),
             Action::FilterOpen => {
+                self.open_prompt(PromptKind::Filter);
                 self.prompt = self.filter_text.clone();
-                self.mode = Mode::Prompt(PromptKind::Filter);
             }
             Action::InspectorPaneToggle => {
                 self.inspector.pane = match self.inspector.pane {
@@ -1641,9 +1633,14 @@ impl App {
                 return;
             };
             // The path is the bus's word; resolve it before the desktop
-            // sees it, and open nothing when it does not resolve (SEC-2).
+            // sees it, and open nothing when it does not resolve (SEC-2) or
+            // is not a regular file whose header is an image we know.
             match f.screenshot_path.as_deref().map(std::fs::canonicalize) {
                 Some(Ok(path)) => {
+                    if !is_image_file(&path) {
+                        self.toast(Level::Warn, format!("not an image: {}", path.display()));
+                        return;
+                    }
                     self.toast(
                         Level::Info,
                         format!("opening screenshot {}", path.display()),
@@ -1759,7 +1756,8 @@ impl App {
         if let Some(label) = browser_busy_label(name) {
             // However it was reached (panel key, palette, `:browser.* …`),
             // the browser view shows the call in flight and forgets the
-            // last error.
+            // last error. `is_tracked_browser_call` is this same test; the
+            // settle paths on `CallOk`/`CallFailed` use it.
             self.browser.busy = Some(label);
             self.browser.inflight += 1;
             self.browser.error = None;
@@ -1874,17 +1872,25 @@ impl App {
         };
     }
 
+    /// Open a prompt, remembering where it was opened from. A prompt opened
+    /// on top of another (PoC name → param, target → vars) keeps the first
+    /// one's origin.
     fn open_prompt(&mut self, kind: PromptKind) {
         self.prompt.clear();
         self.palette_cursor = 0;
+        if !matches!(self.mode, Mode::Prompt(_)) {
+            self.prompt_from = self.mode;
+        }
         self.mode = Mode::Prompt(kind);
     }
 
     /// Leave the open prompt for the mode it was opened from, line cleared.
+    /// The confirm prompt does not come here: both its answers go through
+    /// `answer_confirm`, which returns to `ConfirmCall::return_to`.
     fn close_prompt(&mut self) {
         self.prompt.clear();
-        if let Mode::Prompt(kind) = self.mode {
-            self.mode = kind.returns_to(self);
+        if matches!(self.mode, Mode::Prompt(_)) {
+            self.mode = self.prompt_from;
         }
     }
 
@@ -2722,7 +2728,7 @@ impl App {
                         Level::Info,
                         format!("Scope + {}", value.as_str().unwrap_or("?")),
                     ),
-                    n if n.starts_with("browser.") => {
+                    n if is_tracked_browser_call(n) => {
                         self.browser_settled();
                         self.on_browser_ok(n, &value, &mut out);
                     }
@@ -2738,9 +2744,9 @@ impl App {
                 out.push(BusRequest::Refresh);
             }
             BusEvent::CallFailed { name, message } => {
-                // A failed `browser.*` call is the view's answer: the panel
-                // must show it (§2.10(c)), not only the status line.
-                if name.starts_with("browser.") {
+                // A failed tracked `browser.*` call is the view's answer: the
+                // panel must show it (§2.10(c)), not only the status line.
+                if is_tracked_browser_call(&name) {
                     self.browser_settled();
                     self.browser.error = Some(message.clone());
                 }
@@ -2817,6 +2823,24 @@ impl App {
     }
 }
 
+/// Whether `path` is a regular file whose first bytes are an image header
+/// [`crate::viewers::image::dimensions`] recognises — what Findings `o` is
+/// willing to hand to the desktop. Judged on the opened handle, like
+/// [`read_poc_yaml`]; a file that cannot be opened is not an image either.
+fn is_image_file(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    let mut head = Vec::with_capacity(32);
+    if file.take(32).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    crate::viewers::image::dimensions(&head).is_some()
+}
+
 /// A finding's YAML from `poc_path`, when that is a regular `.yaml`/`.yml`
 /// file of at most [`MAX_POC_YAML_BYTES`] (the path is the bus's word, read
 /// only on a loopback bus); `Err` is the reason the panel shows.
@@ -2829,7 +2853,10 @@ fn read_poc_yaml(path: &str) -> Result<String, String> {
     if !is_yaml {
         return Err("not a .yaml/.yml file".to_string());
     }
-    let meta = std::fs::metadata(p).map_err(|e| e.to_string())?;
+    // Open first, then judge the handle: the file-kind and size checks and
+    // the read all see the same inode, so nothing can be swapped in between.
+    let file = File::open(p).map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
     if !meta.is_file() {
         return Err("not a regular file".to_string());
     }
@@ -2840,9 +2867,7 @@ fn read_poc_yaml(path: &str) -> Result<String, String> {
         ));
     }
     let mut text = String::new();
-    File::open(p)
-        .map_err(|e| e.to_string())?
-        .take(MAX_POC_YAML_BYTES)
+    file.take(MAX_POC_YAML_BYTES)
         .read_to_string(&mut text)
         .map_err(|e| e.to_string())?;
     Ok(text)

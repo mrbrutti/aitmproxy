@@ -37,7 +37,13 @@ shows the bus state.
 **Embedded.** `aitm tui` starts the proxy and the TUI in one process over an
 in-process channel; the bus contract is unchanged. While the TUI owns the
 terminal the stdio agent transport is skipped with a warning; a loopback TCP
-agent transport is still served.
+agent transport is still served. The proxy's `tracing` output would paint
+over the UI, so it goes to a file instead, and only when `RUST_LOG` is set:
+`AITM_TUI_LOG=<path>` names the file (created, or appended to if it exists);
+otherwise a fresh `aitm-tui-<pid>.log` is created under the system temp
+directory for this run. Either way the file is owner-only (`0600`) on Unix,
+and the status bar's startup toast says where it went — or that there is no
+log because `RUST_LOG` is unset.
 
 **Fixture.** `aitm-tui --fixture` runs against the built-in
 `fixtures/bus-fixture.json`; `--fixture path/to.json` against another recording.
