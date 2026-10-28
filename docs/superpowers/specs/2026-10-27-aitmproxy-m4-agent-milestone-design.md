@@ -1,6 +1,6 @@
 # aitmproxy M4 — agent-driven real-test milestone design
 
-**Status:** draft
+**Status:** approved (2026-10-28 by Matt)
 **Research inputs:** `docs/research/04-playwright-cua.md`, `docs/research/05-synthesis.md`, `docs/research/07-ca-install.md`
 **Design inputs:** `docs/superpowers/specs/2026-10-27-aitmproxy-platform-design.md` (the roadmap "Agent-driven vuln-finding site" product goal, the tool/agent split, the command bus, the PoC engine), `docs/design/operator-ui-foundation.md` §4 (command-bus contract) and §5 (core follow-ups F1–F15), and the operator-commands Coder blocker analysis (`side-session-notes/.../operator-commands-CODER-BLOCKER.md`).
 **Companion / downstream specs:** the additive operator commands **F5** (`flow.detail`), **F6** (`flow.mark`/`flow.comment`), **F7** (`proxy.status`/`pause`/`resume`, `flow.clear`, `config.get`), **F12** (`scope.remove` + agent-widen gate), **F13** (`poc.list`/`poc.get`/`poc.artifact`) are being specced and built as their own spec+plan elsewhere; M4 **depends on** them and references their shapes from the foundation doc, it does not redesign them. **F2** (command-invocation audit ring + `notifications/aitm/agent`) is **owned by M4** and designed here as one coherent operator/agent-channel story with F1 (identity) and F4 (push): it is what lights up the operator "Agent" page while the agent works.
