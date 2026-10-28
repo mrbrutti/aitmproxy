@@ -197,3 +197,74 @@ fn poc_artifact_requires_out_dir() {
     .expect_err("poc.artifact needs a configured out-dir");
     assert!(err.to_string().contains("output directory"), "{err}");
 }
+
+#[test]
+fn poc_artifact_refuses_symlink_escape() {
+    let out_dir = unique_dir("art-symlink");
+    let outside = unique_dir("art-secret");
+    let secret = outside.join("secret.bin");
+    std::fs::write(&secret, b"top secret").unwrap();
+    // A symlink inside the out-dir that points outside must not exfiltrate.
+    let link = out_dir.join("escape.bin");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+    #[cfg(not(unix))]
+    std::fs::write(&link, b"x").unwrap();
+    let err = call(
+        &reg(),
+        cfg_with(None, Some(out_dir)),
+        "poc.artifact",
+        &[("path", Value::Str(link.display().to_string()))],
+    )
+    .expect_err("a symlink escaping the out-dir must be refused");
+    assert!(err.to_string().contains("outside"), "{err}");
+}
+
+#[test]
+fn poc_artifact_missing_file_is_generic_error() {
+    let out_dir = unique_dir("art-missing");
+    let err = call(
+        &reg(),
+        cfg_with(None, Some(out_dir.clone())),
+        "poc.artifact",
+        &[(
+            "path",
+            Value::Str(out_dir.join("nope.png").display().to_string()),
+        )],
+    )
+    .expect_err("a missing artifact must be refused");
+    // No existence oracle: the same wording as an out-of-dir path.
+    assert!(err.to_string().contains("outside"), "{err}");
+}
+
+#[test]
+fn poc_artifact_enforces_size_cap() {
+    let out_dir = unique_dir("art-big");
+    let big = out_dir.join("big.bin");
+    // 17 MiB > the 16 MiB artifact cap.
+    std::fs::write(&big, vec![0u8; 17 * 1024 * 1024]).unwrap();
+    let err = call(
+        &reg(),
+        cfg_with(None, Some(out_dir)),
+        "poc.artifact",
+        &[("path", Value::Str(big.display().to_string()))],
+    )
+    .expect_err("an oversize artifact must be refused");
+    assert!(err.to_string().contains("outside"), "{err}");
+}
+
+#[test]
+fn poc_get_enforces_size_cap() {
+    let lib = unique_dir("get-big");
+    let big = lib.join("big.yaml");
+    // 2 MiB > the 1 MiB PoC cap.
+    std::fs::write(&big, vec![b'a'; 2 * 1024 * 1024]).unwrap();
+    let err = call(
+        &reg(),
+        cfg_with(Some(lib), None),
+        "poc.get",
+        &[("poc_path", Value::Str(big.display().to_string()))],
+    )
+    .expect_err("an oversize PoC must be refused");
+    assert!(err.to_string().contains("outside"), "{err}");
+}

@@ -7,9 +7,9 @@ use std::time::{Duration, SystemTime};
 use aitm_core::{
     Body, CommandHost, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow,
     HttpRequest, HttpResponse, HttpVersion, InterceptState, MemFlowStore, Params, ProxyClient,
-    StdGuard, Value,
+    StdGuard, Value, WsDir, WsFlow, WsMessage, WsOpcode,
 };
-use aitm_plugins::DetailPlugin;
+use aitm_plugins::{DetailPlugin, MutatePlugin};
 use futures::future::BoxFuture;
 
 struct StubClient;
@@ -220,4 +220,210 @@ fn unknown_id_is_an_error() {
         .invoke(Params::new(map), &host)
         .expect_err("unknown id must be refused");
     assert!(err.to_string().contains(&missing.to_string()), "{err}");
+}
+
+fn detail_args(store: &dyn FlowStore, id: FlowId, args: &[(&str, Value)]) -> anyhow::Result<Value> {
+    let mut reg = aitm_core::Registry::new();
+    reg.add_plugin(Box::new(DetailPlugin::new()));
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(store, &client, &guard, None);
+    let mut map = BTreeMap::new();
+    map.insert("id".to_string(), Value::Str(id.to_string()));
+    for (k, v) in args {
+        map.insert(k.to_string(), v.clone());
+    }
+    reg.command("flow.detail")
+        .unwrap()
+        .invoke(Params::new(map), &host)
+}
+
+#[test]
+fn range_slices_and_clamps_body() {
+    let store = MemFlowStore::new();
+    let id = store.insert(flow_with_bodies()); // request body `{"u":"a"}` (9 bytes)
+
+    // offset 2, length 3 -> bytes[2..5].
+    let d = detail_args(
+        &store,
+        id,
+        &[
+            ("body", Value::Str("range".into())),
+            ("offset", Value::Int(2)),
+            ("length", Value::Int(3)),
+        ],
+    )
+    .expect("range ok");
+    let req = obj_of(&d, "request");
+    assert_eq!(req.get("body"), Some(&Value::Bytes(b"u\":".to_vec())));
+
+    // length past the end clamps to the end.
+    let d = detail_args(
+        &store,
+        id,
+        &[
+            ("body", Value::Str("range".into())),
+            ("offset", Value::Int(6)),
+            ("length", Value::Int(99)),
+        ],
+    )
+    .expect("clamp ok");
+    let req = obj_of(&d, "request");
+    assert_eq!(req.get("body"), Some(&Value::Bytes(b"a\"}".to_vec())));
+
+    // offset past the end -> empty slice.
+    let d = detail_args(
+        &store,
+        id,
+        &[
+            ("body", Value::Str("range".into())),
+            ("offset", Value::Int(100)),
+        ],
+    )
+    .expect("past-end ok");
+    let req = obj_of(&d, "request");
+    assert_eq!(req.get("body"), Some(&Value::Bytes(vec![])));
+}
+
+#[test]
+fn bad_body_args_are_errors() {
+    let store = MemFlowStore::new();
+    let id = store.insert(flow_with_bodies());
+
+    let err = detail_args(
+        &store,
+        id,
+        &[
+            ("body", Value::Str("range".into())),
+            ("offset", Value::Int(-1)),
+        ],
+    )
+    .expect_err("negative offset refused");
+    assert!(err.to_string().contains("non-negative"), "{err}");
+
+    let err = detail_args(&store, id, &[("body", Value::Str("bogus".into()))])
+        .expect_err("unknown mode refused");
+    assert!(err.to_string().contains("none|inline|range"), "{err}");
+
+    let err =
+        detail_args(&store, id, &[("body", Value::Int(5))]).expect_err("non-string body refused");
+    assert!(err.to_string().contains("string"), "{err}");
+}
+
+fn obj_of<'a>(v: &'a Value, k: &str) -> &'a BTreeMap<String, Value> {
+    match v {
+        Value::Object(o) => match o.get(k) {
+            Some(Value::Object(inner)) => inner,
+            other => panic!("expected object at {k}, got {other:?}"),
+        },
+        other => panic!("not an object: {other:?}"),
+    }
+}
+
+#[test]
+fn websocket_detail_has_handshake_and_messages() {
+    let store = MemFlowStore::new();
+    let handshake = FlowId::new();
+    let caddr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::LOCALHOST,
+        0,
+    ));
+    let ws = Flow::WebSocket(WsFlow {
+        id: FlowId::new(),
+        handshake,
+        messages: vec![
+            WsMessage {
+                dir: WsDir::ClientToServer,
+                opcode: WsOpcode::Text,
+                data: b"hi".to_vec(),
+                timestamp: std::time::SystemTime::now(),
+                injected: false,
+            },
+            WsMessage {
+                dir: WsDir::ServerToClient,
+                opcode: WsOpcode::Binary,
+                data: b"\x00\x01".to_vec(),
+                timestamp: std::time::SystemTime::now(),
+                injected: true,
+            },
+        ],
+        client_conn: ConnInfo {
+            peer: caddr,
+            sni: None,
+            alpn: None,
+            tls: false,
+            established: std::time::SystemTime::now(),
+        },
+        server_conn: None,
+        metadata: FlowMeta::default(),
+        intercept: InterceptState::Observed,
+    });
+    let id = store.insert(ws);
+    let d = detail_args(&store, id, &[("body", Value::Str("inline".into()))]).expect("ok");
+    let Value::Object(d) = d else { panic!() };
+    assert_eq!(d.get("kind"), Some(&Value::Str("websocket".into())));
+    assert_eq!(d.get("handshake"), Some(&Value::Str(handshake.to_string())));
+    let Some(Value::Array(msgs)) = d.get("messages") else {
+        panic!("messages array: {d:?}");
+    };
+    assert_eq!(msgs.len(), 2);
+    let m0 = match &msgs[0] {
+        Value::Object(o) => o,
+        _ => panic!(),
+    };
+    assert_eq!(m0.get("dir"), Some(&Value::Str("client_to_server".into())));
+    assert_eq!(m0.get("opcode"), Some(&Value::Str("text".into())));
+    assert_eq!(m0.get("length"), Some(&Value::Int(2)));
+    assert_eq!(m0.get("data"), Some(&Value::Bytes(b"hi".to_vec())));
+}
+
+#[test]
+fn mutate_sets_edited_in_detail() {
+    let store = MemFlowStore::new();
+    let id = store.insert(flow_with_bodies());
+    let mut reg = aitm_core::Registry::new();
+    reg.add_plugin(Box::new(DetailPlugin::new()));
+    reg.add_plugin(Box::new(MutatePlugin::new()));
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(&store, &client, &guard, None);
+
+    // Before mutate: edited is false.
+    let before = reg
+        .command("flow.detail")
+        .unwrap()
+        .invoke(id_param(id), &host)
+        .unwrap();
+    assert!(!field_bool(&before, "edited"));
+
+    // Mutate the request, then detail reports edited == true.
+    let mut edits = BTreeMap::new();
+    edits.insert("method".to_string(), Value::Str("POST".into()));
+    let mut margs = BTreeMap::new();
+    margs.insert("id".to_string(), Value::Str(id.to_string()));
+    margs.insert("edits".to_string(), Value::Object(edits));
+    reg.command("flow.mutate")
+        .unwrap()
+        .invoke(Params::new(margs), &host)
+        .expect("mutate ok");
+
+    let after = reg
+        .command("flow.detail")
+        .unwrap()
+        .invoke(id_param(id), &host)
+        .unwrap();
+    assert!(field_bool(&after, "edited"));
+}
+
+fn id_param(id: FlowId) -> Params {
+    let mut m = BTreeMap::new();
+    m.insert("id".to_string(), Value::Str(id.to_string()));
+    Params::new(m)
+}
+
+fn field_bool(v: &Value, k: &str) -> bool {
+    match v {
+        Value::Object(o) => matches!(o.get(k), Some(Value::Bool(true))),
+        _ => panic!("not an object"),
+    }
 }

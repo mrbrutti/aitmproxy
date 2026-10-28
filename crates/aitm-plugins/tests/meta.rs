@@ -174,3 +174,100 @@ fn unknown_id_is_an_error() {
         );
     }
 }
+
+fn mark_call(
+    reg: &Registry,
+    store: &dyn FlowStore,
+    id: FlowId,
+    marks: Value,
+) -> anyhow::Result<Value> {
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(store, &client, &guard, None);
+    let mut map = BTreeMap::new();
+    map.insert("id".to_string(), Value::Str(id.to_string()));
+    map.insert("marks".to_string(), marks);
+    reg.command("flow.mark")
+        .unwrap()
+        .invoke(Params::new(map), &host)
+}
+
+fn comment_call(
+    reg: &Registry,
+    store: &dyn FlowStore,
+    id: FlowId,
+    text: Value,
+) -> anyhow::Result<Value> {
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(store, &client, &guard, None);
+    let mut map = BTreeMap::new();
+    map.insert("id".to_string(), Value::Str(id.to_string()));
+    map.insert("text".to_string(), text);
+    reg.command("flow.comment")
+        .unwrap()
+        .invoke(Params::new(map), &host)
+}
+
+#[test]
+fn flow_mark_rejects_bad_shapes_and_caps() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(MetaPlugin::new()));
+    let store = MemFlowStore::new();
+    let id = store.insert(http_flow());
+
+    // Missing marks param.
+    {
+        let guard = StdGuard::default();
+        let client = StubClient;
+        let host = CommandHost::new(&store, &client, &guard, None);
+        let mut m = BTreeMap::new();
+        m.insert("id".to_string(), Value::Str(id.to_string()));
+        assert!(reg
+            .command("flow.mark")
+            .unwrap()
+            .invoke(Params::new(m), &host)
+            .is_err());
+    }
+    // Non-array marks.
+    assert!(mark_call(&reg, &store, id, Value::Str("red".into())).is_err());
+    // Non-string element.
+    assert!(mark_call(&reg, &store, id, Value::Array(vec![Value::Int(1)])).is_err());
+    // Too many marks.
+    let many = Value::Array((0..33).map(|i| Value::Str(format!("m{i}"))).collect());
+    assert!(mark_call(&reg, &store, id, many).is_err());
+    // Mark too long.
+    let long = Value::Array(vec![Value::Str("x".repeat(65))]);
+    assert!(mark_call(&reg, &store, id, long).is_err());
+    // Control char in a mark.
+    assert!(mark_call(
+        &reg,
+        &store,
+        id,
+        Value::Array(vec![Value::Str("a\nb".into())])
+    )
+    .is_err());
+    // A valid set still works, and none of the above was stored.
+    assert!(mark_call(
+        &reg,
+        &store,
+        id,
+        Value::Array(vec![Value::Str("red".into())])
+    )
+    .is_ok());
+}
+
+#[test]
+fn flow_comment_caps_and_allows_newlines() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(MetaPlugin::new()));
+    let store = MemFlowStore::new();
+    let id = store.insert(http_flow());
+
+    // Over the 4 KiB cap.
+    assert!(comment_call(&reg, &store, id, Value::Str("x".repeat(4097))).is_err());
+    // A bare control char (e.g. NUL / ESC) is rejected.
+    assert!(comment_call(&reg, &store, id, Value::Str("a\u{1b}b".into())).is_err());
+    // Newlines and tabs are allowed.
+    assert!(comment_call(&reg, &store, id, Value::Str("line1\nline2\tend".into())).is_ok());
+}

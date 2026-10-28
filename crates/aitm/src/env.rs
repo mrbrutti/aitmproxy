@@ -27,3 +27,50 @@ pub fn apply(cfg: &mut Config, lookup: impl Fn(&str) -> Option<String>) {
 fn is_truthy(raw: &str) -> bool {
     matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with(env: &[(&str, &str)]) -> Config {
+        let mut cfg = Config::default();
+        let map: std::collections::HashMap<String, String> = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        apply(&mut cfg, |k| map.get(k).cloned());
+        cfg
+    }
+
+    #[test]
+    fn scope_widen_env_bridges_and_wins() {
+        // Unset leaves the default (off).
+        assert!(!with(&[]).scope.allow_agent_widen);
+        // Truthy values turn it on; anything else turns it off.
+        assert!(
+            with(&[(SCOPE_ALLOW_AGENT_WIDEN, "true")])
+                .scope
+                .allow_agent_widen
+        );
+        assert!(
+            with(&[(SCOPE_ALLOW_AGENT_WIDEN, "1")])
+                .scope
+                .allow_agent_widen
+        );
+        assert!(
+            !with(&[(SCOPE_ALLOW_AGENT_WIDEN, "nope")])
+                .scope
+                .allow_agent_widen
+        );
+    }
+
+    #[test]
+    fn ca_install_env_still_bridges() {
+        assert!(
+            with(&[(CA_ALLOW_AGENT_INSTALL, "yes")])
+                .ca
+                .allow_agent_install
+        );
+        assert!(!with(&[]).ca.allow_agent_install);
+    }
+}
