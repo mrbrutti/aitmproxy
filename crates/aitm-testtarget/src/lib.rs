@@ -18,6 +18,7 @@
 //! and nothing in [`app`] reads it (AC-M4-10).
 
 mod app;
+pub mod grader;
 pub mod manifest;
 mod seed;
 
@@ -25,6 +26,7 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
+pub use grader::{grade, GradeReport};
 pub use manifest::{manifest, manifest_yaml, PlantedVuln};
 pub use seed::SeedMode;
 

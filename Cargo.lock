@@ -236,6 +236,9 @@ dependencies = [
 name = "aitm-testtarget"
 version = "0.1.0"
 dependencies = [
+ "aitm-core",
+ "aitm-findings",
+ "aitm-poc",
  "bytes",
  "http-body-util",
  "hyper",
