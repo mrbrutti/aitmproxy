@@ -4,7 +4,8 @@ import SwiftUI
 
 /// What a row can do, from the keyboard (S-010), the context menu or the Flow menu.
 enum FlowRowAction: Hashable {
-    case resume, kill, delete, replay, edit, mark(MarkColor?), comment, buildPoC, pinHost, copyURL, quickLook
+    case resume, kill, delete, replay, editAndReplay, edit, mark(MarkColor?), comment, buildPoC, pinHost, copyURL, quickLook,
+         resumeSelected, killSelected
 }
 
 /// An `NSTableView` that turns mitmproxy's single-key verbs into row actions.

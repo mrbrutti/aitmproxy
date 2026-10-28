@@ -25,6 +25,8 @@ struct CodeView: View {
                     .padding(.top, Space.xs)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            // The content is at least the viewport's size, so short bodies sit top-leading and never centre.
+            GeometryReader { viewport in
             ScrollView([.vertical, .horizontal]) {
             VStack(alignment: .leading, spacing: 0) {
                 ForEach(Array(lines.enumerated()), id: \.element.id) { index, line in
@@ -51,9 +53,10 @@ struct CodeView: View {
                 }
             }
             .padding(.vertical, Space.sm)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(minWidth: viewport.size.width, minHeight: viewport.size.height, alignment: .topLeading)
             }
             .textSelection(.enabled)
+            }
         }
     }
 

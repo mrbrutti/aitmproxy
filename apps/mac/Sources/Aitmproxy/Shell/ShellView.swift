@@ -37,6 +37,12 @@ struct ShellView: View {
                 .animation(session.paletteOpenedByKeyboard ? nil : Tok.Motion.easeOut(Tok.Motion.popover), value: session.paletteVisible)
             }
         }
+        .sheet(isPresented: Binding(get: { session.composeVisible }, set: { session.composeVisible = $0 })) {
+            ComposeSheet().environment(session).themed()
+        }
+        .sheet(isPresented: Binding(get: { session.rulesVisible }, set: { session.rulesVisible = $0 })) {
+            RulesSheet().environment(session).themed()
+        }
         .toolbar { ShellToolbar(sidebarVisible: $sidebarVisible) }
         .task {
             if Store.usesFixtures {
@@ -64,21 +70,25 @@ struct MainView: View {
             if session.filterBarVisible {
                 FilterBar()
             }
+            // A real NSSplitView: draggable, remembered; the inspector takes 45% until the operator moves it.
             if session.layout == .vertical {
-                HSplitView {
-                    flows.frame(minWidth: 480)
-                    inspector.frame(minWidth: 480)
-                }
+                SplitPane(axis: .vertical, firstMinimum: 420, secondMinimum: 420, initialSecondFraction: 0.5,
+                          autosaveName: "main.vertical") { flows } second: { inspector }
             } else {
-                VSplitView {
-                    flows.frame(minHeight: 160)
-                    inspector.frame(minHeight: 200)
-                }
+                SplitPane(axis: .horizontal, firstMinimum: 160, secondMinimum: 200, initialSecondFraction: 0.45,
+                          autosaveName: "main.horizontal") { flows } second: { inspector }
             }
         }
     }
 
     private var flows: some View {
+        @Bindable var session = session
+        return flowTable
+            .environment(session)
+            .themed()
+    }
+
+    private var flowTable: some View {
         @Bindable var session = session
         return FlowTableView(rows: session.visibleRows, selection: $session.selection, sort: $session.sort,
                              density: session.density, layoutURL: session.columnsURL,
@@ -87,7 +97,7 @@ struct MainView: View {
                              onFocus: { id in session.focused = id },
                              onAction: { action, id in session.perform(action, on: id) },
                              onToggleIntercept: { session.arm(!session.interceptArmed) },
-                             onCompose: {})
+                             onCompose: { session.openCompose() })
         .overlay {
             if session.visibleRows.isEmpty {
                 EmptyFlows(filtered: !session.rows.isEmpty, listen: session.listenAddress)
@@ -104,6 +114,8 @@ struct MainView: View {
             }
             InspectorView()
         }
+        .environment(session)
+        .themed()
     }
 }
 

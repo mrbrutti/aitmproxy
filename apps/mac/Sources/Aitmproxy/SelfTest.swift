@@ -144,6 +144,52 @@ enum SelfTest {
             check("every tool appears in the palette", session.paletteItems(for: "").filter { if case .command = $0.kind { return true }; return false }.count == Fixtures.tools.count)
             let flows = session.paletteItems(for: "auth/login")
             check("a URL fragment finds its flow", flows.contains { if case .flow = $0.kind { return $0.title.contains("auth/login") }; return false })
+            // M4: compose, edit & replay, kill modes, bulk.
+            session.composeDraft = ComposeDraft(method: "POST", url: "https://api.shop-staging.test/api/cart", headersText: "accept: application/json", body: "{\"q\":1}", bodyKind: .json)
+            let before = session.rows.count
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in session.sendCompose { _ in c.resume() } }
+            check("Send creates a new flow, selected, origin human", session.rows.count == before + 1 && session.focusedRow?.origin == .human && session.focusedRow?.method == .post)
+            check("compose history persists newest first", ComposeHistory.load(from: session.composeURL).entries.first?.url == "https://api.shop-staging.test/api/cart")
+            session.composeDraft = ComposeDraft(url: "https://telemetry.vendor-analytics.example/v2/batch")
+            check("an out-of-scope URL cannot be sent", session.composeDraft.validationError(scope: session.scopeHosts)?.hasPrefix("Out of scope") == true)
+            if let id = session.rows.first(where: { $0.seq == 50 })?.id {
+                session.editAndReplay(id)
+                check("Edit & Replay prefills Compose from the flow", session.composeVisible && session.composeDraft.url.hasSuffix("/api/auth/login") && session.composeDraft.method == "POST")
+                session.composeVisible = false
+            }
+            session.killMode = .respond503
+            if let id = session.rows.first(where: { $0.seq == 51 })?.id {
+                session.kill(id)
+                try? await Task.sleep(for: .milliseconds(50))
+                check("Kill with Respond 503 shows the synthetic status", session.rows.first { $0.seq == 51 }?.status == 503)
+            }
+            session.killMode = .reset
+            session.selection = Set(session.rows.filter { [41, 50].contains($0.seq) }.map(\.id))
+            session.resumeSelected()
+            check("bulk resume reports what it skipped", session.lastError == "Resumed 1 · skipped 1 (not paused)")
+            try? await Task.sleep(for: .milliseconds(500))
+            check("bulk resume resumed the paused row", session.rows.first { $0.seq == 50 }?.state == .complete)
+
+            // S-040: rules validate, test against the list, persist, and change the armed notice.
+            let rule = BreakpointRule(name: "login", url: "*/api/auth/*", method: "POST")
+            check("a rule tests against the current list", BreakpointRules(rules: [rule]).matchCount(of: rule, in: Fixtures.rows) == 1)
+            check("an empty URL and a bad regex are rejected",
+                  BreakpointRule(url: "").validationError != nil && BreakpointRule(url: "[", matching: .regex).validationError != nil)
+            session.setBreakpointRules(BreakpointRules(rules: [rule, BreakpointRule(url: "*", enabled: false)]))
+            check("the armed notice counts enabled rules", session.breakpointRules.armedNotice == "Intercept armed — 1 rule")
+            check("rules persist under Store.url/rules.json", BreakpointRules.load(from: session.rulesURL).rules.count == 2)
+
+            // M2 scenes: the fixture extras re-key and select correctly.
+            session.loadFixtureExtras()
+            let cookieRow = session.extraRow { $0.request.header("cookie") != nil }
+            check("the cookie extra row exists and is re-keyed", cookieRow?.id.raw.hasPrefix("extra-") == true)
+            if let cookieRow { session.select(cookieRow.id) }
+            check("selecting the cookie row focuses it", session.focusedRow?.id == cookieRow?.id,
+                  "focused \(session.focusedRow?.seq ?? -1) wanted \(cookieRow?.seq ?? -1)")
+            check("the cookie row's detail has three request cookies",
+                  session.focusedDetail.map { Cookie.cookies(in: $0.request).count } == 3)
+            check("an image extra row exists", session.extraRow { ($0.response?.contentType ?? "").hasPrefix("image/") } != nil)
+
             if let tool = Fixtures.tools.first(where: { $0.name == "flow.replay" }) {
                 let form = PaletteForm(tool: tool, session: session)
                 check("a FlowId parameter becomes a flow picker preset to the focused flow", form.values["id"] == session.focused?.raw && !form.missing.isEmpty == (session.focused == nil))

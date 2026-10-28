@@ -112,8 +112,13 @@ final class BusService: FlowActions {
         return client
     }
 
-    func setIntercept(_ enabled: Bool) async throws {
-        let armed = try await live().call("flow.intercept", ["enabled": .bool(enabled)]).boolValue ?? enabled
+    func setIntercept(_ enabled: Bool, rules: [BreakpointRule]) async throws {
+        // `rules` is F3; the core rejects unknown arguments, so they travel only when there are any.
+        var args: [String: JSONValue] = ["enabled": .bool(enabled)]
+        if enabled, !rules.isEmpty {
+            args["rules"] = .array(rules.map { .object($0.arguments.mapValues { .string($0) }) })
+        }
+        let armed = try await live().call("flow.intercept", args).boolValue ?? enabled
         session.interceptArmed = armed
     }
 
@@ -122,8 +127,11 @@ final class BusService: FlowActions {
         summaries[id] = nil
     }
 
-    func kill(_ id: FlowID) async throws {
-        _ = try await live().call("flow.kill", ["id": .string(id.raw)])
+    func kill(_ id: FlowID, mode: KillMode) async throws {
+        // `mode` is F3; the core resets today and rejects unknown arguments, so send it only when asked for.
+        var args: [String: JSONValue] = ["id": .string(id.raw)]
+        if mode != .reset { args["mode"] = .string(mode.rawValue) }
+        _ = try await live().call("flow.kill", args)
         summaries[id] = nil
     }
 

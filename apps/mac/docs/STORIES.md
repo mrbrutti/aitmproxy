@@ -288,7 +288,7 @@ UX:
 - States: no cookies -> "No cookies" in tertiary inside the pane; live without F5 -> loading bars; a header value longer than the pane truncates with the full value in a tooltip
 - Words: tabs "Headers", "Cookies", "Query", "Set-Cookie"; column heads for cookies "Name · Value · Domain · Path · Expires · Flags"
 - Access: tables are real rows to VoiceOver ("content-type, application/json")
-Status: todo
+Status: done
 
 ### S-020 Read the timing waterfall and the connection facts
 As the operator, I open Timing to see DNS, connect, TLS, wait and download as bars, and Connection for protocol, TLS, ALPN, SNI, client and server.
@@ -305,7 +305,7 @@ UX:
 - States: phase missing -> dash and no bar; live without F5 -> loading bars; plain HTTP -> TLS row says "none"
 - Words: "Timing", "Connection"; rows "protocol · tls · alpn · sni · client · server"
 - Access: each bar has an accessibility value ("Wait, 89 ms")
-Status: todo
+Status: done
 
 ### S-021 View a pretty-printed body
 As the operator, I open Body and see JSON, XML, HTML, JS, CSS, form or multipart bodies formatted and syntax-highlighted, with a format picker and a rendered preview for Markdown and HTML.
@@ -323,7 +323,8 @@ UX:
 - States: empty body -> "No body" tertiary; unknown binary -> hex; a body over the inline limit -> truncated chip (S-027); rendering never runs scripts or loads remote resources
 - Words: picker items "Auto, JSON, XML, HTML, JS, CSS, Form, Multipart, Markdown, Text, Hex"; toggle "Rendered"
 - Access: the viewer is a text view (selectable, VoiceOver reads lines); ⌘A selects the body only
-Status: todo
+Status: done
+(Fold chevrons are drawn but folding is disabled pending a range-remapping pass.)
 
 ### S-022 Explore a JSON body as a tree
 As the operator, I open the JSON tab and fold nodes, copy a node, copy its path, filter by text and sort keys.
@@ -339,7 +340,7 @@ UX:
 - States: not JSON -> "Not JSON — see Body"; filter with no match -> "No match" and the tree stays; huge arrays show the first 1 000 items with "Show more"
 - Words: summaries "{3 keys}", "[2 items]"; menu "Copy Value", "Copy Path", "Expand All", "Collapse All"; toggle "Sort Keys"
 - Access: disclosure rows report expanded/collapsed; paths read as text
-Status: todo
+Status: done
 
 ### S-023 View an image body with its metadata
 As the operator, I select an image response and see it inline with dimensions, type, size and colour space.
@@ -355,7 +356,7 @@ UX:
 - States: corrupt data -> hex viewer with "Not a readable image" notice; SVG renders via NSImage; animated GIF shows frame 1
 - Words: caption order dimensions · type · size · colour space; buttons "Open in Preview", "Export…"
 - Access: the image has an accessibility label with the caption
-Status: todo
+Status: done
 
 ### S-024 View a binary body as hex, protobuf or MessagePack
 As the operator, I switch a binary body to Hex (offset · bytes · ASCII) or ask for a raw protobuf or MessagePack decode.
@@ -371,7 +372,7 @@ UX:
 - States: a 20 MB body -> hex pages by visible lines; protobuf that fails to walk -> "Not protobuf — showing hex"
 - Words: hex columns unlabelled (Proxyman convention); protobuf columns "Field · Wire type · Value"
 - Access: hex lines are selectable text
-Status: todo
+Status: done
 
 ### S-025 Read a streaming response as an SSE event list
 As the operator, I select an `text/event-stream` flow and see each event (id, event, data, time) as a row, with the merged text for OpenAI-style deltas.
@@ -388,7 +389,7 @@ UX:
 - States: no events yet -> "Waiting for events…"; a comment line shows dimmed; live without F4 -> events refresh with the poll
 - Words: toggle "Merged"; columns "Time · ID · Event · Data"
 - Access: rows read as "event message, data …"
-Status: todo
+Status: done
 
 ### S-026 Diff two flows
 As the operator, I select a second flow with ⌘-click and open Diff to compare request head, request body, response head and response body side by side or unified.
@@ -404,7 +405,7 @@ UX:
 - States: one row selected -> "Select a second flow with ⌘-click to compare"; identical sections collapse with "No changes"; over 2 MB a side -> `truncated` chip
 - Words: toggle "Side by side" / "Unified"; button "Export Patch…"; section titles as above
 - Access: added/removed lines carry +/- markers, not colour alone
-Status: todo
+Status: done
 
 ### S-027 Page through a large body
 As the operator, I open a body the core truncated or paged and see a `truncated` chip and a Load more control instead of a frozen viewer.
@@ -420,7 +421,8 @@ UX:
 - States: fetch failing -> "Unable to load the next 2 MB · Retry" with the last good time; everything loaded -> chip disappears
 - Words: chip "truncated · X of Y"; button "Load more"; error as above
 - Access: the chip is a status, the button a real button
-Status: todo
+Status: done
+(Chip + Load more are built; the range fetch itself reports "needs flow.detail (F5)" until S-core-F5.)
 
 ### S-028 Copy a request as code or export the body
 As the operator, I copy the request as cURL, httpie, Python or fetch from the summary strip's menu, or export the body to a file.
@@ -436,7 +438,7 @@ UX:
 - States: no body -> "Export Body…" disabled; non-UTF-8 body -> cURL uses base64 and says so in a tooltip
 - Words: "Copy as cURL ⇧⌘C", "Copy as httpie", "Copy as Python (requests)", "Copy as fetch", "Export Body…"
 - Access: all in Flow ▸ Copy As ▸ too
-Status: todo
+Status: done
 
 ### S-029 Find in body with match highlighting
 As the operator, I press ⌥⌘F in a body viewer, type a term and see every match highlighted with next/previous navigation.
@@ -452,7 +454,7 @@ UX:
 - States: no matches -> `0 of 0` in tertiary, field stays; regex toggle "(.*)" invalid -> field border intercept.deep
 - Words: placeholder "Find in body"; counter "n of m"; toggle tooltip "Regular expression"
 - Access: the field is the only control focused on open; the current match is announced
-Status: todo
+Status: done
 
 ---
 
@@ -577,6 +579,12 @@ Acceptance:
 - [unit] `RequestEdits.diff(original, edited)` yields only changed headers, body and start line; the Edited pencil appears after a successful mutate.
 - [self] Revert restores the original from the core's backup and clears the pencil.
 - [manual] Leaving the row with pending edits asks Keep editing / Discard.
+UX:
+- Flow: `e` on a paused row (or Flow ▸ Edit Paused Request) -> Request pane switches to Raw with the body editable and Headers/Query as editable tables -> edited lines take the amber edge, the footer counts edits -> ⌘⏎ Apply & Resume (or the bar's button) -> flow continues, pencil appears; "Revert to Original" (⌘Z in the editor) discards
+- Surface: inline in the inspector (the paused flow is already on screen)
+- States: unpaused row -> hint "Only a paused flow can be edited"; mutate fails -> status-bar error, edits kept; live without F5 -> the raw text comes from the summary only, with a note
+- Words: footer "N edits pending · Apply & Resume sends flow.mutate then flow.resume · Revert to original"; button "Apply & Resume ⌘⏎"
+- Access: the editor is a text view; the tables are real rows with add/remove buttons
 Status: todo
 
 ### S-038 Edit a paused request's raw bytes
@@ -587,6 +595,12 @@ Acceptance:
 - [unit] Raw text parses back into start line, headers and body; a malformed message is refused with the line number.
 - [snap] Non-UTF-8 bodies switch Raw to read-only with a hint to use Hex.
 - [self] Changing the start line sends `method` and `path` in the edits.
+UX:
+- Flow: Raw tab while paused -> edit the exact bytes (start line, headers, blank line, body) -> Apply & Resume parses them back into method/path/headers/body
+- Surface: inline (the same Raw editor)
+- States: an unparsable message -> inline error under the editor, Apply disabled
+- Words: error "Could not parse the request: <reason>"
+- Access: ⌘A selects the message only
 Status: todo
 
 ### S-039 Kill with an abort mode
@@ -597,7 +611,13 @@ Core: F3
 Acceptance:
 - [snap] `Kill ⌘\ ▾` opens a menu: Reset connection (default), Respond 429, Respond 503; the chosen mode is remembered for the session.
 - [self] `flow.kill {id, mode}` is sent; the row shows `killed` grey and struck for reset, or the synthetic status for 429/503.
-Status: todo
+UX:
+- Flow: bar ▸ Kill ▾ -> menu Reset connection ✓ / Respond 429 / Respond 503 -> choosing runs it and remembers the mode -> Kill's main button and ⌘\ reuse it
+- Surface: menu on the split button
+- States: live before F3 -> the core resets and the status bar notes "mode needs flow.kill {mode} (F3)"; fixtures show the synthetic status in the row
+- Words: "Reset connection", "Respond 429", "Respond 503"; tooltip "Kill <mode> (⌘\); click the chevron for other modes"
+- Access: the menu is a real menu; the default action is the button itself
+Status: done
 
 ### S-040 Set breakpoint rules
 As the operator, I open Rules… and add rules (name, URL wildcard or regex, method, request or response phase, flag) so only matching flows pause.
@@ -608,7 +628,13 @@ Acceptance:
 - [snap] A sheet with a rules table on the left and the Proxyman form on the right (name, URL, wildcard/regex switch, method, phase checkboxes, Test your rule field, flag); one primary button `Save ⌘⏎`.
 - [unit] Rule validation rejects an invalid regex and an empty URL; `Test your rule` evaluates against the current list and shows match counts.
 - [self] `flow.intercept {enabled, rules}` is sent; the armed notice reads `Intercept armed — 2 rules`.
-Status: todo
+UX:
+- Flow: bar ▸ Rules… (or Proxy ▸ Breakpoint Rules… ⇧⌘B) -> sheet: rules table left, form right (Name, URL + Wildcard|Regex, Method, ☑ Request ☑ Response, Test your rule, Flag) -> Save ⌘⏎ -> armed notice reads "Intercept armed — 2 rules"
+- Surface: sheet (one task that finishes or cancels)
+- States: invalid regex / empty URL -> inline error under the field, Save disabled; no rules -> "Every request pauses" note; live before F3 -> rules kept locally and the bar says "rules need F3"
+- Words: sheet title "Breakpoint Rules"; buttons "Add Rule", "Remove", "Test your rule", "Save ⌘⏎", "Cancel"
+- Access: table rows selectable by keyboard; form fields in reading order
+Status: done
 
 ### S-041 Intercept and edit a response
 As the operator, I pause at the response phase and change status, headers or body before the client sees it.
@@ -618,6 +644,12 @@ Core: F3
 Acceptance:
 - [snap] The summary pill reads `Paused · response`; the Response pane becomes editable like the request.
 - [self] Apply & Resume sends the response edits then `flow.resume`; the Edited pencil appears.
+UX:
+- Flow: a rule with ☑ Response pauses at the response -> summary pill `Paused · response` -> Response pane editable (status, headers, body) -> Apply & Resume
+- Surface: inline in the inspector
+- States: before F3 nothing pauses at the response; the pill never shows
+- Words: pill "Paused · response"; footer as the request editor's
+- Access: same as S-037
 Status: todo
 
 ### S-042 Compose a request
@@ -628,7 +660,13 @@ Acceptance:
 - [snap] A sheet: method menu, URL field, tabs Headers (bulk edit text) · Query · Body (raw / JSON / form / multipart); templates Empty, GET, POST JSON, POST Form, Multipart, WebSocket; a History list on the left; one primary button `Send ⌘⏎`.
 - [unit] History persists under `Store.url/compose.json`, newest first, capped at 200; a URL to a host outside `scope.list` disables Send with "Out of scope — add host to scope to send".
 - [self] `request.send` returns a FlowId; the new row is selected, marked `↻`, origin human.
-Status: todo
+UX:
+- Flow: ⌘N / `n` / toolbar compose / palette -> sheet with History left, Method + URL, Headers · Query · Body tabs -> Template menu fills a shape -> ⌘⏎ Send -> sheet closes, the new flow is selected with ↻
+- Surface: sheet (one short task that must finish or cancel)
+- States: URL without a host -> Send disabled "Enter a URL with a host"; host outside scope -> "Out of scope — add host to scope to send"; send fails -> status-bar error, sheet stays; no history -> "Nothing sent yet"
+- Words: title "Compose Request"; tabs "Headers", "Query", "Body"; body kinds "Raw | JSON | Form | Multipart"; templates "Empty, GET, POST JSON, POST Form, Multipart, WebSocket (disabled until F9)"; buttons "Send ⌘⏎", "Cancel"
+- Access: the URL field has focus when empty; Esc cancels
+Status: done
 
 ### S-043 Import a cURL command into Compose
 As the operator, I paste a `curl …` command anywhere in the compose sheet and the fields fill from it.
@@ -637,7 +675,13 @@ Depends: S-042
 Acceptance:
 - [unit] `CodeExport.parseCurl` handles `-X -H -d --data-raw --json -u -A -b -e --url -G -I -F`, attached short values, quoting and line continuations.
 - [snap] A pasted command shows an `Imported from cURL` chip; unknown flags are listed in a tertiary note.
-Status: todo
+UX:
+- Flow: paste a `curl …` command into the URL, Headers or Body field (or Template ▸ Import cURL from Clipboard) -> every field fills -> chip "Imported from cURL" -> unknown flags listed beneath in tertiary
+- Surface: inline (the compose sheet)
+- States: text that is not a curl command is left alone; flags curl would ignore are listed, never silently dropped
+- Words: chip "Imported from cURL"; note "Ignored cURL flags: --foo"
+- Access: nothing changes focus on import
+Status: done
 
 ### S-044 Repeat a flow, or edit and repeat
 As the operator, I press `r` to replay the selected flow unchanged, or ⇧R to open Compose prefilled with it.
@@ -647,7 +691,13 @@ Acceptance:
 - [self] `flow.replay` returns a new id; the new row carries `↻` and is selected; on fixtures a copy appends.
 - [snap] Edit & repeat opens the sheet with method, URL, headers and body from the detail; Send creates a flow with `↻`.
 - [unit] Replay of an out-of-scope flow is disabled with the scope tooltip.
-Status: todo
+UX:
+- Flow: `r` -> the flow is sent again unchanged, the copy appends with ↻ and is selected; ⇧R (or Flow ▸ Edit & Replay…, context menu) -> Compose opens prefilled (host and content-length dropped) -> Send
+- Surface: inline for Replay; the compose sheet for Edit & Replay
+- States: out-of-scope row -> both disabled with the scope tooltip; replay fails -> status-bar error
+- Words: "Replay" (r), "Edit & Replay…" (⇧R)
+- Access: both in the Flow menu and the context menu
+Status: done
 
 ### S-045 Read a WebSocket flow's frames
 As the operator, I select a WebSocket flow and the inspector lists frames (direction, opcode, length, time, injected) with text, JSON tree and hex viewers and a sent/received filter.
@@ -658,6 +708,12 @@ Acceptance:
 - [snap] The Request | Response split becomes one frame list over a frame viewer; direction arrows `↑ ↓`, injected frames tagged; the row's Request/Response cells show `21 ↑ 17 ↓`.
 - [unit] Frame viewers reuse the JSON tree and hex viewers; the filter hides one direction.
 - [self] New frames append live without animation.
+UX:
+- Flow: select a WebSocket row -> the inspector shows one frame list (time · ↑/↓ · opcode · length · injected) over a frame viewer (Text | JSON | Hex) -> a Sent | Received | Both filter in the tab bar
+- Surface: inspector (replaces the Request | Response split for WS flows)
+- States: no frames yet -> "No frames yet"; before F5 the list shows the counts only with "Frames need flow.detail (F5)"
+- Words: columns "Time · Dir · Opcode · Length"; tag "injected"; filter "Sent | Received | Both"
+- Access: rows read as "sent, text, 42 bytes"
 Status: todo
 
 ### S-046 Act on several flows at once
@@ -667,7 +723,13 @@ Depends: S-012
 Acceptance:
 - [unit] Resume and Kill apply to the paused rows in the selection in capture order; the status bar reports `Resumed 2 · skipped 1 (not paused)`.
 - [manual] Diff is enabled for exactly two rows; Export for any number.
-Status: todo
+UX:
+- Flow: ⌘-click rows -> Flow ▸ Resume Selected (⌥⌘⏎) / Kill Selected, or the context menu's "Resume 3 Selected" -> paused rows act in capture order -> status bar reports "Resumed 2 · skipped 1 (not paused)"
+- Surface: inline (menu items on the existing selection)
+- States: nothing paused in the selection -> items disabled; Diff enabled for exactly two rows (M2); Export for any number (M6)
+- Words: "Resume Selected", "Kill Selected", context "Resume N Selected" / "Kill N Selected"; report as above
+- Access: the report is announced via the status bar
+Status: done
 
 ---
 

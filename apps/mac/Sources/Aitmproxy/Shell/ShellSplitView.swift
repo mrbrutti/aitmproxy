@@ -17,13 +17,17 @@ struct ShellSplitView<Sidebar: View, Main: View>: NSViewControllerRepresentable 
         controller.splitView.isVertical = true
         controller.splitView.dividerStyle = .thin
 
-        let side = NSSplitViewItem(viewController: NSHostingController(rootView: sidebar))
+        let sideHost = NSHostingController(rootView: sidebar)
+        sideHost.sizingOptions = []
+        let side = NSSplitViewItem(viewController: sideHost)
         side.minimumThickness = Tok.Size.sidebarMin
         side.maximumThickness = Tok.Size.sidebarMax
         side.canCollapse = true
         // Higher than the main pane's, so the sidebar keeps its width and the main pane stretches.
         side.holdingPriority = NSLayoutConstraint.Priority(rawValue: 260)
-        let content = NSSplitViewItem(viewController: NSHostingController(rootView: main))
+        let mainHost = NSHostingController(rootView: main)
+        mainHost.sizingOptions = []
+        let content = NSSplitViewItem(viewController: mainHost)
         content.minimumThickness = 720
         content.holdingPriority = NSLayoutConstraint.Priority(rawValue: 250)
         controller.addSplitViewItem(side)

@@ -132,6 +132,14 @@ final class Session {
     var sidebarQuery = ""
     /// Bumped to move focus into the sidebar filter field.
     var sidebarFilterFocusTick = 0
+    /// Bumped by ⌥⌘F to open Find in the focused pane's body viewer.
+    var findRequestTick = 0
+
+    /// Fetches the next body range (F5 `flow.detail {body: range}`); until then it says so.
+    func loadMoreBody(for id: FlowID) async throws {
+        _ = try await runCommand("flow.detail", ["id": .string(id.raw), "body": .string("range")])
+        throw BusError.tool(message: "Paged bodies need flow.detail (F5)")
+    }
 
     /// The text form of whatever is filtering right now.
     var currentFilterExpressionText: String { filterAdvanced ? filterText : filterStack.text }
@@ -239,7 +247,7 @@ final class Session {
         }
         let locals: [(String, String, String?, () -> Void)] = [
             (interceptArmed ? "Disarm Intercept" : "Arm Intercept", "Stop or start parking every request", "i", { [self] in arm(!interceptArmed) }),
-            ("Compose Request…", "Write and send a new request", "⌘N", {}),
+            ("Compose Request…", "Write and send a new request", "⌘N", { [self] in openCompose() }),
             (capturing ? "Pause Capture" : "Resume Capture", "Stop or start recording flows", "⇧⌘R", { [self] in setCapturing(!capturing) }),
             ("Clear Session", "Drop every flow", "⌘⌫", { [self] in clearSession(confirm: ClearConfirmation.ask) }),
             (autoSelect ? "Stop Auto-select" : "Auto-select New Flows", "Follow the newest flow as it arrives", "⇧⌘A", { [self] in autoSelect.toggle() }),
@@ -319,13 +327,15 @@ final class Session {
 
     init() {
         if !Store.usesFixtures { pins = Pins.load(from: pinsURL) }
+        composeHistory = ComposeHistory.load(from: composeURL)
+        if !Store.usesFixtures { breakpointRules = BreakpointRules.load(from: rulesURL) }
         loadSavedFilters()
         if Store.usesFixtures {
             // Fixture commands: the ones the shell already models act; the rest echo.
             commandRunner = { [weak self] name, args in
                 guard let self else { throw BusError.disconnected }
                 switch name {
-                case "flow.intercept": arm(args["enabled"]?.boolValue ?? true); return .bool(interceptArmed)
+                case "flow.intercept": interceptArmed = args["enabled"]?.boolValue ?? true; return .bool(interceptArmed)
                 case "flow.resume": if let id = args["id"]?.stringValue { resume(FlowID(id)) }; return .null
                 case "flow.kill": if let id = args["id"]?.stringValue { kill(FlowID(id)) }; return .null
                 case "flow.replay": if let id = args["id"]?.stringValue { replay(FlowID(id)) }; return .string("replayed")
@@ -435,7 +445,8 @@ final class Session {
     }
 
     func arm(_ on: Bool) {
-        perform(on ? "arm intercept" : "disarm intercept") { [self] in try await actions.setIntercept(on) }
+        let rules = breakpointRules.enabled
+        perform(on ? "arm intercept" : "disarm intercept") { [self] in try await actions.setIntercept(on, rules: rules) }
     }
 
     /// The bar's target: the focused paused row, else the oldest paused.
@@ -453,9 +464,82 @@ final class Session {
         perform("resume all") { [self] in for id in ids { try await actions.resume(id) } }
     }
 
+    /// Remembered for the session (S-039).
+    var killMode: KillMode = .reset
+
     func kill(_ id: FlowID) {
-        perform("kill") { [self] in try await actions.kill(id) }
+        let mode = killMode
+        perform("kill") { [self] in try await actions.kill(id, mode: mode) }
     }
+
+    // MARK: Breakpoint rules (S-040, F3)
+
+    var rulesVisible = false
+    var breakpointRules = BreakpointRules()
+    var rulesURL: URL { Store.url.appending(path: "rules.json") }
+
+    /// Saves the set; re-arms with the rules when intercept is on (the core takes them after F3).
+    func setBreakpointRules(_ rules: BreakpointRules) {
+        breakpointRules = rules
+        try? rules.save(to: rulesURL)
+        if interceptArmed {
+            perform("set rules") { [self] in try await actions.setIntercept(true, rules: rules.enabled) }
+        }
+    }
+
+    // MARK: Compose (S-042–S-044)
+
+    var composeVisible = false
+    var composeDraft = ComposeDraft()
+    var composeHistory = ComposeHistory()
+    var composeURL: URL { Store.url.appending(path: "compose.json") }
+
+    func openCompose(_ draft: ComposeDraft? = nil) {
+        if let draft { composeDraft = draft }
+        composeVisible = true
+    }
+
+    /// Edit & Replay (⇧R): Compose prefilled from the flow's detail.
+    func editAndReplay(_ id: FlowID) {
+        guard let row = rows.first(where: { $0.id == id }) else { return }
+        guard row.inScope else { lastError = "Out of scope — add \(row.authority) to scope to act"; return }
+        let detail = details[id] ?? Fixtures.detail(for: row)
+        openCompose(ComposeDraft.from(detail: detail, row: row))
+    }
+
+    func sendCompose(completion: @escaping (Bool) -> Void) {
+        let draft = composeDraft
+        guard draft.validationError(scope: scopeHosts) == nil else { completion(false); return }
+        Task {
+            do {
+                let newID = try await actions.send(draft.requestEdits())
+                composeHistory.record(draft)
+                try? composeHistory.save(to: composeURL)
+                lastError = nil
+                if let newID { select(newID) }
+                completion(true)
+            } catch {
+                lastError = "send: \(BusService.describe(error))"
+                completion(false)
+            }
+        }
+    }
+
+    // MARK: Bulk (S-046)
+
+    /// Resume or kill every paused row in the selection, in capture order; reports skips.
+    func resumeSelected() { bulk("Resumed") { [self] id in resume(id) } }
+    func killSelected() { bulk("Killed") { [self] id in kill(id) } }
+
+    private func bulk(_ verb: String, _ act: (FlowID) -> Void) {
+        let chosen = rows.filter { selection.contains($0.id) }
+        let paused = chosen.filter { $0.state == .paused }
+        for row in paused { act(row.id) }
+        let skipped = chosen.count - paused.count
+        lastError = skipped > 0 ? "\(verb) \(paused.count) · skipped \(skipped) (not paused)" : nil
+    }
+
+    var selectedRows: [FlowRow] { rows.filter { selection.contains($0.id) } }
 
     func replay(_ id: FlowID) {
         perform("replay") { [self] in
@@ -512,6 +596,9 @@ final class Session {
         case .kill: kill(id)
         case .delete: deleteOrKill(id)
         case .replay: replay(id)
+        case .editAndReplay: editAndReplay(id)
+        case .resumeSelected: resumeSelected()
+        case .killSelected: killSelected()
         case .edit:
             if row.state == .paused { select(id) } else { lastError = "Only a paused flow can be edited" }
         case .mark(let color): mark(id, color)

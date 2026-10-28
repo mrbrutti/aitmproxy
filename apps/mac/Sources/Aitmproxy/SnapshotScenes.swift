@@ -12,11 +12,18 @@ enum SnapshotScene: String, CaseIterable {
     case palette
     case paletteFlows = "palette-flows"
     case multiSelect = "multi-select"
+    case rulesSheet = "rules-sheet"
+    case composeSheet = "compose-sheet"
     case inspectHeaders = "inspect-headers"
+    case inspectCookies = "inspect-cookies"
     case inspectBody = "inspect-body"
     case inspectJSON = "inspect-json"
+    case inspectImage = "inspect-image"
+    case inspectHex = "inspect-hex"
+    case inspectSSE = "inspect-sse"
     case inspectDiff = "inspect-diff"
     case inspectTiming = "inspect-timing"
+    case inspectFind = "inspect-find"
 
     func apply(to session: Session) {
         session.page = .apps
@@ -44,24 +51,70 @@ enum SnapshotScene: String, CaseIterable {
             session.paletteVisible = true
         case .multiSelect:
             session.selection = Set(session.rows.prefix(3).map(\.id))
+        case .rulesSheet:
+            session.breakpointRules = BreakpointRules(rules: [
+                BreakpointRule(name: "Login requests", url: "*/api/auth/*", method: "POST", onResponse: true, flag: .red),
+                BreakpointRule(name: "Cart writes", url: #"/api/cart(/|$)"#, matching: .regex, enabled: false),
+            ])
+            session.rulesVisible = true
+        case .composeSheet:
+            session.composeDraft = ComposeDraft.Template.postJSON.draft
+            session.composeDraft.url = "https://api.shop-staging.test/api/cart"
+            session.composeDraft.body = "{\n  \"quantity\": 2,\n  \"note\": \"gift wrap\"\n}"
+            session.composeVisible = true
         case .inspectHeaders:
             session.select(session.rows.first { $0.seq == 41 }?.id)
             session.requestTab = .headers
             session.responseTab = .headers
+        case .inspectCookies:
+            session.loadFixtureExtras()
+            session.select(session.extraRow { $0.request.header("cookie") != nil }?.id)
+            session.requestTab = .cookies
+            session.responseTab = .setCookie
         case .inspectBody:
-            session.select(session.rows.first { $0.seq == 46 }?.id)
+            if var detail = session.details[Fixtures.rows[5].id] {
+                detail.response = Fixtures.prettyJSON
+                session.details[Fixtures.rows[5].id] = detail
+            }
+            session.select(Fixtures.rows[5].id)
             session.requestTab = .body
             session.responseTab = .body
         case .inspectJSON:
-            session.select(session.rows.first { $0.seq == 46 }?.id)
+            if var detail = session.details[Fixtures.rows[5].id] {
+                detail.response = Fixtures.prettyJSON
+                session.details[Fixtures.rows[5].id] = detail
+            }
+            session.select(Fixtures.rows[5].id)
             session.responseTab = .json
+        case .inspectImage:
+            session.loadFixtureExtras()
+            session.select(session.extraRow { ($0.response?.contentType ?? "").hasPrefix("image/") }?.id)
+            session.responseTab = .body
+        case .inspectHex:
+            session.loadFixtureExtras()
+            session.select(session.extraRow { ($0.response?.contentType ?? "").hasPrefix("application/octet-stream") }?.id)
+            session.responseTab = .body
+        case .inspectSSE:
+            session.loadFixtureExtras()
+            session.select(session.extraRow { ($0.response?.contentType ?? "").hasPrefix("text/event-stream") }?.id)
+            session.responseTab = .body
         case .inspectDiff:
             session.selection = Set(session.rows.filter { $0.seq == 45 || $0.seq == 46 }.map(\.id))
             session.focused = session.rows.first { $0.seq == 46 }?.id
             session.responseTab = .diff
+        case .inspectFind:
+            if var detail = session.details[Fixtures.rows[5].id] {
+                detail.response = Fixtures.prettyJSON
+                session.details[Fixtures.rows[5].id] = detail
+            }
+            session.select(Fixtures.rows[5].id)
+            session.responseTab = .body
+            session.findRequestTick += 1
         case .inspectTiming:
-            session.select(session.rows.first { $0.seq == 41 }?.id)
-            session.requestTab = .connection
+            session.loadFixtureExtras()
+            session.select(session.extraRow { $0.timing != nil }?.id)
+            session.requestTab = .timing
+            session.responseTab = .headers
         }
     }
 
@@ -71,6 +124,8 @@ enum SnapshotScene: String, CaseIterable {
         session.clearFilter()
         session.sidebarQuery = ""
         session.paletteVisible = false
+        session.rulesVisible = false
+        session.composeVisible = false
         session.requestTab = .raw
         session.responseTab = .body
         session.select(session.rows.first { $0.seq == 50 }?.id)

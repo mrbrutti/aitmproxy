@@ -88,7 +88,7 @@ struct FlowCommands: Commands {
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
-            Button("Compose Request…") {}
+            Button("Compose Request…") { session.openCompose() }
                 .keyboardShortcut("n")
             Divider()
             Button("Clear Session") { session.clearSession(confirm: ClearConfirmation.ask) }
@@ -114,6 +114,15 @@ struct FlowCommands: Commands {
             Button("Replay") { if let id = session.focused { session.perform(.replay, on: id) } }
                 .keyboardShortcut("r", modifiers: [])
                 .disabled(session.focused == nil)
+            Button("Edit & Replay…") { if let id = session.focused { session.editAndReplay(id) } }
+                .keyboardShortcut("r", modifiers: .shift)
+                .disabled(session.focused == nil)
+            Divider()
+            Button("Resume Selected") { session.resumeSelected() }
+                .keyboardShortcut(.return, modifiers: [.command, .option])
+                .disabled(session.selectedRows.allSatisfy { $0.state != .paused })
+            Button("Kill Selected") { session.killSelected() }
+                .disabled(session.selectedRows.allSatisfy { $0.state != .paused })
             Button(session.focusedRow.map { $0.state == .paused || $0.state == .pending } == true ? "Kill" : "Delete") {
                 if let id = session.focused { session.deleteOrKill(id) }
             }
@@ -140,6 +149,12 @@ struct FlowCommands: Commands {
             .keyboardShortcut("p", modifiers: .shift)
             .disabled(session.focused == nil)
         }
+        CommandMenu("Proxy") {
+            Button("Breakpoint Rules…") { session.rulesVisible = true }
+                .keyboardShortcut("b", modifiers: [.command, .shift])
+            Button("Scope…") { session.show(.scope) }
+                .keyboardShortcut("o", modifiers: [.command, .shift])
+        }
         CommandMenu("View") {
             Button(session.filterBarVisible ? "Hide Filter Bar" : "Show Filter Bar") { session.filterBarVisible.toggle() }
                 .keyboardShortcut("f", modifiers: .command)
@@ -150,6 +165,9 @@ struct FlowCommands: Commands {
                 session.paletteVisible.toggle()
             }
             .keyboardShortcut("k", modifiers: .command)
+            Button("Find in Body") { session.findRequestTick += 1 }
+                .keyboardShortcut("f", modifiers: [.command, .option])
+                .disabled(session.focused == nil)
             Divider()
             Picker("Sort By", selection: Binding(get: { session.sort.key }, set: { session.sort = FlowSort(key: $0, ascending: true) })) {
                 ForEach(FlowSort.Key.allCases, id: \.self) { Text($0.title).tag($0) }

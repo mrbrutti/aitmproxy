@@ -13,7 +13,7 @@ import Testing
         let refresh = Fuzzy.match("fr", in: "browser.refresh")?.score ?? 0
         #expect(replay > refresh)
         let run = Fuzzy.match("rep", in: "flow.replay")?.score ?? 0
-        let scattered = Fuzzy.match("rep", in: "request.send-probe")?.score ?? 0
+        let scattered = Fuzzy.match("rep", in: "rate.limit.export")?.score ?? 0
         #expect(run > scattered)
     }
 

@@ -317,7 +317,14 @@ struct FlowTableView: NSViewRepresentable {
             add(paused || row.state == .pending ? "Kill" : "Delete", .delete, key: "d")
             menu.addItem(.separator())
             add("Replay", .replay, key: "r")
+            add("Edit & Replay…", .editAndReplay)
             add("Build PoC from Flow…", .buildPoC, key: "p")
+            if let table, table.selectedRowIndexes.count > 1 {
+                menu.addItem(.separator())
+                let n = table.selectedRowIndexes.count
+                add("Resume \(n) Selected", .resumeSelected)
+                add("Kill \(n) Selected", .killSelected)
+            }
             menu.addItem(.separator())
             let mark = NSMenuItem(title: "Mark", action: nil, keyEquivalent: "")
             mark.submenu = markMenu(for: row)

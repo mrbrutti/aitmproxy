@@ -18,8 +18,8 @@ struct ShellToolbar: ToolbarContent {
                       systemImage: session.capturing ? Tok.Glyph.pause : Tok.Glyph.record)
             }
             .help(session.capturing ? "Pause capture (⇧⌘R)" : "Resume capture (⇧⌘R)")
-            Button {} label: { Label("Compose", systemImage: Tok.Glyph.compose) }
-                .help("Compose a request (n)")
+            Button { session.openCompose() } label: { Label("Compose", systemImage: Tok.Glyph.compose) }
+                .help("Compose a request (⌘N)")
             Button { session.clearSession(confirm: ClearConfirmation.ask) } label: { Label("Clear Session", systemImage: Tok.Glyph.clear) }
                 .help("Clear every flow from the session (⌘⌫)")
         }

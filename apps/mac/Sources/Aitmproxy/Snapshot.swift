@@ -29,13 +29,14 @@ enum Snapshot {
             IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
                                         IOPMAssertionLevel(kIOPMAssertionLevelOn), "Snapshots" as CFString, &awake)
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-            try? await Task.sleep(for: .seconds(1.5))
-            // Deterministic frames: pages at the default 1440×900, the gallery at the whole screen.
+            // Deterministic frames before the first layout settles: pages at 1440×900, the gallery at the whole screen.
             if let window = NSApp.windows.first(where: { $0.canBecomeMain && !$0.isSheet }) {
+                window.isRestorable = false
                 let frame = NSRect(x: window.frame.minX, y: window.frame.maxY - 900, width: 1440, height: 900)
                 window.setFrame(frame, display: true)
                 window.center()
             }
+            try? await Task.sleep(for: .seconds(1.5))
             if env["APP_KIT_GALLERY"] == "1" {
                 // The parts gallery is one tall page: give it the whole screen, then one shot per mode.
                 if let window = NSApp.windows.first(where: { $0.canBecomeMain && !$0.isSheet }),
@@ -100,13 +101,15 @@ enum Snapshot {
         }
         NSApp.activate()
         window.makeKeyAndOrderFront(nil)
-        let size = window.contentView?.bounds.size ?? .zero
+        // A scene that opened a sheet wants the sheet, not the target behind it.
+        let target = window.attachedSheet ?? window
+        let size = target.contentView?.bounds.size ?? .zero
         GridProbes.shared.write(to: path.replacingOccurrences(of: ".png", with: "-layout.json"), window: size)
         try? FileManager.default.removeItem(atPath: path)
         for _ in 1...3 {
             let shot = Process()
             shot.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-            shot.arguments = ["-x", "-o", "-l", String(window.windowNumber), path]
+            shot.arguments = ["-x", "-o", "-l", String(target.windowNumber), path]
             try? shot.run()
             shot.waitUntilExit()
             if FileManager.default.fileExists(atPath: path) {
@@ -115,7 +118,7 @@ enum Snapshot {
             }
             Thread.sleep(forTimeInterval: 0.5)
         }
-        guard let view = window.contentView?.superview ?? window.contentView,
+        guard let view = target.contentView?.superview ?? target.contentView,
               let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
         view.cacheDisplay(in: view.bounds, to: rep)
         if let data = rep.representation(using: .png, properties: [:]) {

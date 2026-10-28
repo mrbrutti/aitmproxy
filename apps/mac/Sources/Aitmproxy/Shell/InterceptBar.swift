@@ -22,9 +22,9 @@ struct InterceptBar: View {
     private var armedNotice: some View {
         HStack(spacing: Tok.Metric.padInner) {
             Image(systemName: Tok.Glyph.intercept).font(.system(size: 13))
-            Text("Intercept armed — every request pauses here")
+            Text(session.breakpointRules.armedNotice)
             Spacer()
-            GhostButton("Rules…", onColor: Tok.Intercept.deep) {}
+            GhostButton("Rules…", onColor: Tok.Intercept.deep) { session.rulesVisible = true }
             GhostButton("Disarm", hint: "i", onColor: Tok.Intercept.deep) { session.arm(false) }
         }
         .font(Tok.Face.ui(Tok.Typography.Size.md))
@@ -61,8 +61,25 @@ struct InterceptBar: View {
                     if let target { target.edited ? session.applyAndResume(target.id) : session.resume(target.id) }
                 }
                 GhostButton("Resume all") { session.resumeAll() }
-                GhostButton("Kill", hint: "⌘\\", menu: true) { if let target { session.kill(target.id) } }
-                GhostButton("Rules…") {}
+                Menu {
+                    ForEach(KillMode.allCases, id: \.self) { mode in
+                        Button {
+                            session.killMode = mode
+                            if let target { session.kill(target.id) }
+                        } label: {
+                            if mode == session.killMode { Label(mode.title, systemImage: "checkmark") } else { Text(mode.title) }
+                        }
+                    }
+                } label: {
+                    GhostButton("Kill", hint: "⌘\\", menu: true) { if let target { session.kill(target.id) } }
+                } primaryAction: {
+                    if let target { session.kill(target.id) }
+                }
+                .menuStyle(.button)
+                .buttonStyle(.plain)
+                .menuIndicator(.hidden)
+                .help("Kill \(session.killMode.title.lowercased()) (⌘\\); click the chevron for other modes")
+                GhostButton("Rules…") { session.rulesVisible = true }
                 GhostButton("Disarm", hint: "i") { session.arm(false) }
             }
         }

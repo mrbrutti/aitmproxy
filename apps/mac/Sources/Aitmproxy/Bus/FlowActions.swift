@@ -5,9 +5,9 @@ import Foundation
 /// §4.6); on fixtures the session itself changes, so the UI stays
 /// demonstrable and testable without a proxy.
 protocol FlowActions: AnyObject {
-    func setIntercept(_ enabled: Bool) async throws
+    func setIntercept(_ enabled: Bool, rules: [BreakpointRule]) async throws
     func resume(_ id: FlowID) async throws
-    func kill(_ id: FlowID) async throws
+    func kill(_ id: FlowID, mode: KillMode) async throws
     func mutate(_ id: FlowID, edits: RequestEdits) async throws
     func replay(_ id: FlowID) async throws -> FlowID?
     func send(_ request: RequestEdits) async throws -> FlowID?
@@ -27,7 +27,7 @@ final class FixtureActions: FlowActions {
 
     init(session: Session) { self.session = session }
 
-    func setIntercept(_ enabled: Bool) async throws {
+    func setIntercept(_ enabled: Bool, rules: [BreakpointRule]) async throws {
         session.interceptArmed = enabled
     }
 
@@ -46,10 +46,17 @@ final class FixtureActions: FlowActions {
         }
     }
 
-    func kill(_ id: FlowID) async throws {
+    func kill(_ id: FlowID, mode: KillMode) async throws {
         guard let index = session.rows.firstIndex(where: { $0.id == id }) else { return }
-        session.rows[index].state = .killed
-        session.rows[index].status = nil
+        if let status = mode.syntheticStatus {
+            session.rows[index].state = .complete
+            session.rows[index].status = status
+            session.rows[index].duration = .milliseconds(1)
+            session.rows[index].responseBytes = 0
+        } else {
+            session.rows[index].state = .killed
+            session.rows[index].status = nil
+        }
     }
 
     func mutate(_ id: FlowID, edits: RequestEdits) async throws {
