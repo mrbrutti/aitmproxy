@@ -424,6 +424,8 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
       }
       case 'scope.list':
         return [...scope].map((host) => ({ host, rate_limit: { rps: 10, burst: 20 }, backoff: { base_ms: 500, max_ms: 8000 } }));
+      case 'agent.activity':
+        return activity.slice(-200).map((a) => ({ ...a }));
       case 'scope.add':
         scope.add(need(args, 'host'));
         recordActivity(tool, args, 'web');
@@ -433,7 +435,8 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
         recordActivity(tool, args, 'web');
         return { ok: true, count: scope.size };
       case 'poc.list':
-        return pocs;
+        // A fresh array each call, as JSON decoding over the wire would give.
+        return pocs.map((p) => ({ ...p }));
       case 'poc.get': {
         const p = pocs.find((x) => x.id === args.id || x.poc_path === args.poc_path);
         if (!p) throw new BusError('unknown poc');
@@ -529,8 +532,6 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
         stateTick();
         return { policy: agentPolicy };
       }
-      case 'agent.activity':
-        return activity.slice(-200);
       case 'proxy.status':
         return { listening: capturing, address: '127.0.0.1:8080', protocol: 'HTTP/2', flows: flows.size };
       case 'proxy.pause':

@@ -1,7 +1,6 @@
-// Slot: the Findings panel (foundation §2.7). Filled in by its own builder; the shell mounts it
-// in place of the inspector when app.ui.panel === 'findings'.
+// The Findings panel (foundation §2.7 "PoC panel"). The shell mounts it in place of the inspector
+// when app.ui.panel === 'findings'; the implementation lives in ./findings.
 import type { Component } from 'solid-js';
+import { Findings } from './findings/Findings';
 
-export const FindingsPanel: Component = () => (
-  <div style={{ padding: '12px', color: 'var(--color-text-tertiary)' }}>Findings</div>
-);
+export const FindingsPanel: Component = () => <Findings />;
