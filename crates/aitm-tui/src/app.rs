@@ -426,6 +426,11 @@ impl InspectorState {
 
 /// A paused request being edited as raw text: request line, headers, blank
 /// line, body. `to_edits` turns it back into `flow.mutate` edits.
+///
+/// The body is sent back only when its lines changed, and then with the line
+/// ending and trailing newline the original had, so an untouched body — and
+/// any body that is not UTF-8, which the editor only describes — reaches the
+/// upstream byte for byte as it was captured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditBuffer {
     pub id: String,
@@ -433,6 +438,18 @@ pub struct EditBuffer {
     pub cursor_line: usize,
     pub cursor_col: usize,
     pub original: Vec<String>,
+    /// Whether the captured body was UTF-8 text (editable); a binary body is
+    /// shown as a placeholder and never sent back.
+    pub body_is_text: bool,
+    /// `"\r\n"` when the captured text body used CRLF, else `"\n"`.
+    pub line_ending: &'static str,
+    /// Whether the captured text body ended with a newline.
+    pub trailing_newline: bool,
+}
+
+/// The body line shown for a body the editor cannot represent as text.
+fn binary_placeholder(len: usize) -> String {
+    format!("<{len} binary bytes — edit in hex is a follow-up>")
 }
 
 impl EditBuffer {
@@ -448,20 +465,26 @@ impl EditBuffer {
             lines.push(format!("{n}: {v}"));
         }
         lines.push(String::new());
-        if let Some(text) = req.body_text() {
-            lines.extend(text.lines().map(str::to_string));
-        } else if !req.body.is_empty() {
-            lines.push(format!(
-                "<{} binary bytes — edit in hex is a follow-up>",
-                req.body.len()
-            ));
-        }
+        let (body_is_text, line_ending, trailing_newline) = match req.body_text() {
+            Some(text) => {
+                lines.extend(text.lines().map(str::to_string));
+                let crlf = text.contains("\r\n");
+                (true, if crlf { "\r\n" } else { "\n" }, text.ends_with('\n'))
+            }
+            None => {
+                lines.push(binary_placeholder(req.body.len()));
+                (false, "\n", false)
+            }
+        };
         Self {
             id: id.to_string(),
             original: lines.clone(),
             lines,
             cursor_line: 0,
             cursor_col: 0,
+            body_is_text,
+            line_ending,
+            trailing_newline,
         }
     }
 
@@ -469,8 +492,19 @@ impl EditBuffer {
         self.lines != self.original
     }
 
+    /// The lines after the first blank line: the body as the editor shows it.
+    fn body_lines(lines: &[String]) -> &[String] {
+        lines
+            .iter()
+            .skip(1)
+            .position(String::is_empty)
+            .map_or(&lines[lines.len()..], |i| &lines[i + 2..])
+    }
+
     /// The `flow.mutate` `edits` object: method, path, every header (the core
-    /// replaces by name) and the body as text.
+    /// replaces by name) and — only when its lines changed and the body is
+    /// text — the body, rebuilt with the original line ending and trailing
+    /// newline. An untouched or binary body is left to the core as captured.
     pub fn to_edits(&self) -> Value {
         let mut edits = Map::new();
         let mut it = self.lines.iter();
@@ -484,19 +518,21 @@ impl EditBuffer {
             }
         }
         let mut headers = Map::new();
-        let mut body = Vec::new();
-        let mut in_body = false;
-        for line in it {
-            if in_body {
-                body.push(line.as_str());
-            } else if line.is_empty() {
-                in_body = true;
-            } else if let Some((n, v)) = line.split_once(':') {
+        for line in it.take_while(|l| !l.is_empty()) {
+            if let Some((n, v)) = line.split_once(':') {
                 headers.insert(n.trim().to_string(), Value::String(v.trim().to_string()));
             }
         }
         edits.insert("headers".into(), Value::Object(headers));
-        edits.insert("body".into(), Value::String(body.join("\n")));
+
+        let body = Self::body_lines(&self.lines);
+        if self.body_is_text && body != Self::body_lines(&self.original) {
+            let mut text = body.join(self.line_ending);
+            if self.trailing_newline {
+                text.push_str(self.line_ending);
+            }
+            edits.insert("body".into(), Value::String(text));
+        }
         Value::Object(edits)
     }
 }
@@ -3641,12 +3677,66 @@ mod tests {
                 assert_eq!(edits["path"], "/api/auth/login");
                 assert_eq!(edits["headers"]["x-forwarded-for"], "127.0.0.1");
                 assert_eq!(edits["headers"]["host"], "auth.shop-staging.test");
-                assert_eq!(edits["body"], r#"{"email":"ops"}"#);
+                // The body was not touched, so it is not sent: the core keeps
+                // the parked request's bytes exactly as they were.
+                assert!(edits.get("body").is_none(), "{edits}");
             }
             other => panic!("expected Mutate, got {other:?}"),
         }
         assert_eq!(reqs[1], BusRequest::Resume("f3".into()));
         assert_eq!(app.mode, Mode::Flows);
+    }
+
+    fn message_with_body(body: &[u8]) -> Message {
+        Message {
+            method: Some("POST".into()),
+            path: Some("/upload".into()),
+            version: Some("HTTP/1.1".into()),
+            headers: vec![("host".into(), "h.test".into())],
+            body: body.to_vec(),
+            ..Message::default()
+        }
+    }
+
+    /// A body that is not UTF-8 is shown as a placeholder and never sent back:
+    /// the edit → mutate round trip must leave the forwarded bytes untouched.
+    #[test]
+    fn binary_body_survives_the_edit_round_trip_untouched() {
+        let bytes = [0x00u8, 0xff, 0x89, b'P', b'N', b'G', 0xfe];
+        let mut e = EditBuffer::from_request("f9", &message_with_body(&bytes));
+        assert!(!e.body_is_text);
+        assert_eq!(e.lines[3], "<7 binary bytes — edit in hex is a follow-up>");
+        // Edit a header: that is sent; the body key is absent.
+        e.lines[1] = "host: other.test".into();
+        let edits = e.to_edits();
+        assert_eq!(edits["headers"]["host"], "other.test");
+        assert!(edits.get("body").is_none(), "{edits}");
+        // Even typing over the placeholder sends no body.
+        e.lines[3] = "oops".into();
+        assert!(e.to_edits().get("body").is_none());
+    }
+
+    /// CRLF line endings and a trailing newline are kept when a text body is
+    /// edited; an untouched body is not sent at all.
+    #[test]
+    fn crlf_and_trailing_newline_survive_a_body_edit() {
+        let mut e = EditBuffer::from_request("f9", &message_with_body(b"a=1\r\nb=2\r\n"));
+        assert_eq!(&e.lines[3..], ["a=1", "b=2"]);
+        assert!(
+            e.to_edits().get("body").is_none(),
+            "unchanged body is not sent"
+        );
+        e.lines[4] = "b=3".into();
+        assert_eq!(e.to_edits()["body"], "a=1\r\nb=3\r\n");
+
+        let mut e = EditBuffer::from_request("f9", &message_with_body(b"x\ny"));
+        e.lines[4] = "z".into();
+        assert_eq!(e.to_edits()["body"], "x\nz");
+
+        let mut e = EditBuffer::from_request("f9", &message_with_body(b""));
+        assert!(e.to_edits().get("body").is_none());
+        e.lines.push("new".into());
+        assert_eq!(e.to_edits()["body"], "new");
     }
 
     #[test]

@@ -999,13 +999,16 @@ fn compose_kv_and_edit_buffer_edge_cases() {
 
     let e = EditBuffer::from_request("x", &Message::default());
     assert_eq!(e.lines, vec!["GET / HTTP/1.1", ""]);
+    // An untouched body is never sent (byte-exact round trip), so there is
+    // no `body` key for an empty body either; clearing every line changes
+    // nothing about the (empty) body.
     assert_eq!(
         e.to_edits(),
-        json!({"method":"GET","path":"/","headers":{},"body":""})
+        json!({"method":"GET","path":"/","headers":{}})
     );
     let mut empty = e.clone();
     empty.lines.clear();
-    assert_eq!(empty.to_edits(), json!({"headers":{},"body":""}));
+    assert_eq!(empty.to_edits(), json!({"headers":{}}));
     assert!(empty.dirty());
     let bin = EditBuffer::from_request(
         "x",
@@ -1018,6 +1021,10 @@ fn compose_kv_and_edit_buffer_edge_cases() {
         bin.lines[2],
         "<3 binary bytes — edit in hex is a follow-up>"
     );
+    // A binary body is described, never sent back — even if the placeholder is edited.
+    let mut bin_edited = bin.clone();
+    bin_edited.lines[2] = "typed over".into();
+    assert!(bin_edited.to_edits().get("body").is_none());
     // Editing at the ends of lines and across lines.
     let mut app = fixture_app(200, 50);
     let _ = app.update(Action::Edit);
