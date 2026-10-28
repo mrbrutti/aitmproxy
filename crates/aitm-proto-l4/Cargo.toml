@@ -11,6 +11,17 @@ serde = { version = "1", features = ["derive"] }
 # L4ScopeId is uuid-backed; the `serde` feature lets scope ids round-trip in
 # config / command payloads. `v4` comes from the workspace definition.
 uuid = { workspace = true, features = ["serde"] }
+# Craft (M5 Task 2). `pnet_packet` is the verbatim field-level builder — every
+# header field is settable, so deliberately-malformed packets are expressible
+# (research note 08). `etherparse` is the structural parser used by `summarize`.
+# Versions pinned from research note 08 (etherparse 0.21, pnet_packet 0.35).
+pnet_packet = "0.35"
+etherparse = "0.21"
+# Typed `CraftError`. `2` matches the thiserror already resolved in the workspace
+# lock, so no second major version enters the tree. (Task 4 also depends on
+# `thiserror` for `L4GuardError` — a trivial Cargo.toml merge at integration,
+# flagged in the Task 2 handover.)
+thiserror = "2"
 
 [dev-dependencies]
 # config is authored as YAML by the operator; the deserialization test parses it.
