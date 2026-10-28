@@ -16,6 +16,7 @@ name = "aitm"
 version = "0.1.0"
 dependencies = [
  "aitm-browser",
+ "aitm-bus-client",
  "aitm-ca",
  "aitm-cli",
  "aitm-core",
@@ -25,6 +26,7 @@ dependencies = [
  "aitm-poc",
  "aitm-proto-http",
  "aitm-proto-ws",
+ "aitm-tui",
  "anyhow",
  "bytes",
  "futures",

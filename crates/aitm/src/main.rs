@@ -9,6 +9,10 @@
 //! the proxy accept loop and the MCP server (stdio or loopback-TCP per config),
 //! with the configured browser engine attached when it launches, and closes
 //! the browser on every orderly exit path including SIGINT/SIGTERM (spec §D6).
+//! Invoked as `aitm tui` it does the same but with the terminal operator UI in
+//! the process too, over an in-process bus channel (`tui` module).
+
+mod tui;
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -24,11 +28,47 @@ use tracing::{info, warn};
 /// The config file path when `--config` is not given.
 const CONFIG_ENV: &str = "AITM_CONFIG";
 
+/// What the command line asked for, after the `--config` split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Mode {
+    /// No arguments: the proxy plus the configured MCP transport.
+    Server,
+    /// A subcommand: one-shot dispatch over the CLI frontend.
+    Cli(Vec<String>),
+    /// `tui`: the proxy plus the terminal operator UI in one process.
+    Tui,
+}
+
+/// Classify `argv`. `tui` takes no arguments; anything after it is a usage
+/// error carrying the line to print.
+fn parse_mode(argv: Vec<String>) -> Result<Mode, String> {
+    match argv.first().map(String::as_str) {
+        None => Ok(Mode::Server),
+        Some("tui") if argv.len() == 1 => Ok(Mode::Tui),
+        Some("tui") => Err(tui::USAGE.to_string()),
+        Some(_) => Ok(Mode::Cli(argv)),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
-
     let (config_arg, argv) = split_config_arg(std::env::args().skip(1).collect())?;
+    let mode = match parse_mode(argv) {
+        Ok(mode) => mode,
+        Err(usage) => {
+            eprintln!("{usage}");
+            std::process::exit(2);
+        }
+    };
+    // The TUI owns the terminal, so its subscriber must not write there.
+    let _tui_log = match mode {
+        Mode::Tui => tui::init_tracing(),
+        Mode::Server | Mode::Cli(_) => {
+            init_tracing();
+            None
+        }
+    };
+
     let config_path = config_arg.or_else(|| std::env::var_os(CONFIG_ENV).map(PathBuf::from));
     let mut cfg = config_file::load(config_path.as_deref())?;
     env::apply(&mut cfg, |k| std::env::var(k).ok());
@@ -44,13 +84,13 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(Http1Sender::new().with_insecure(cfg.ssl_insecure)),
     ));
 
-    if !argv.is_empty() {
+    if let Mode::Cli(argv) = &mode {
         // One-shot CLI dispatch (no browser needed).
         let cli = aitm_cli::Cli::new(registry.clone())
             .with_ssrf_policy(cfg.browser.ssrf.clone())
             .with_poc_dir(cfg.poc.dir.clone())
             .with_services(store.clone(), client.clone(), guard.clone(), None);
-        match cli.dispatch(&argv) {
+        match cli.dispatch(argv) {
             Ok(value) => {
                 let mut stdout = std::io::stdout().lock();
                 stdout.write_all(&render_cli_value(&value))?;
@@ -79,22 +119,38 @@ async fn main() -> anyhow::Result<()> {
     };
     let browser: Option<Arc<dyn BrowserDriver>> = launched.as_ref().map(|l| l.driver.clone());
 
-    let mcp = aitm_mcp::McpServer::new(registry, cfg.mcp.transport.clone())
-        .with_ssrf_policy(cfg.browser.ssrf.clone())
-        .with_poc_dir(cfg.poc.dir.clone())
-        .with_services(store, client, guard, browser);
+    let result = if mode == Mode::Tui {
+        tui::run(
+            &cfg,
+            &proxy,
+            tui::Services {
+                registry,
+                store,
+                client,
+                guard,
+                browser,
+                log_path: _tui_log,
+            },
+        )
+        .await
+    } else {
+        let mcp = aitm_mcp::McpServer::new(registry, cfg.mcp.transport.clone())
+            .with_ssrf_policy(cfg.browser.ssrf.clone())
+            .with_poc_dir(cfg.poc.dir.clone())
+            .with_services(store, client, guard, browser);
 
-    // The main listener relays client traffic; the browser listener is
-    // SSRF-filtered (the embedded browser dials `cfg.browser.proxy_addr`).
-    let main_listen = cfg.listen;
-    let browser_listen = cfg.browser.proxy_addr;
-    let result = tokio::select! {
-        result = proxy.run(main_listen) => result,
-        result = proxy.run_browser(browser_listen) => result,
-        result = mcp.serve() => result,
-        () = shutdown_signal() => {
-            info!("shutdown signal received");
-            Ok(())
+        // The main listener relays client traffic; the browser listener is
+        // SSRF-filtered (the embedded browser dials `cfg.browser.proxy_addr`).
+        let main_listen = cfg.listen;
+        let browser_listen = cfg.browser.proxy_addr;
+        tokio::select! {
+            result = proxy.run(main_listen) => result,
+            result = proxy.run_browser(browser_listen) => result,
+            result = mcp.serve() => result,
+            () = shutdown_signal() => {
+                info!("shutdown signal received");
+                Ok(())
+            }
         }
     };
 
@@ -171,7 +227,7 @@ fn init_tracing() {
 mod tests {
     use std::path::PathBuf;
 
-    use super::split_config_arg;
+    use super::{parse_mode, split_config_arg, Mode};
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
@@ -203,5 +259,35 @@ mod tests {
     fn bare_config_flag_without_a_path_is_an_error() {
         let err = split_config_arg(args(&["--config"])).unwrap_err();
         assert_eq!(err.to_string(), "--config requires a path");
+    }
+
+    #[test]
+    fn empty_argv_is_the_server() {
+        assert_eq!(parse_mode(args(&[])), Ok(Mode::Server));
+    }
+
+    #[test]
+    fn a_subcommand_is_a_cli_dispatch() {
+        assert_eq!(
+            parse_mode(args(&["flow", "list"])),
+            Ok(Mode::Cli(args(&["flow", "list"])))
+        );
+    }
+
+    #[test]
+    fn tui_alone_embeds_the_proxy() {
+        assert_eq!(parse_mode(args(&["tui"])), Ok(Mode::Tui));
+    }
+
+    #[test]
+    fn tui_with_extra_arguments_is_a_usage_error() {
+        assert_eq!(
+            parse_mode(args(&["tui", "extra"])),
+            Err("usage: aitm [--config <path>] tui (takes no further arguments)".to_string())
+        );
+        assert_eq!(
+            parse_mode(args(&["tui", "extra"])).unwrap_err(),
+            super::tui::USAGE
+        );
     }
 }

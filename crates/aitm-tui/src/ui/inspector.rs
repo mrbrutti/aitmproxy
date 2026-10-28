@@ -14,7 +14,7 @@ use crate::model::{
 };
 use crate::theme::Theme;
 use crate::tokens::color;
-use crate::ui::bars::put;
+use crate::ui::bars::{put, put_sides};
 use crate::ui::text::{fit, truncate};
 use crate::viewers;
 
@@ -207,7 +207,18 @@ fn pane(
     }
     let tab_rect = Rect::new(area.x, area.y, area.width, 1);
     buf.set_style(tab_rect, theme.raised());
-    put(buf, tab_rect, Line::from(spans));
+    // The JSON tab names the node under the cursor on the right (§2.7
+    // "JSONPath of node").
+    let json_tab = which == Pane::Response && tabs[active] == "JSON";
+    match app.json_cursor_path().filter(|_| json_tab) {
+        Some(path) => put_sides(
+            buf,
+            tab_rect,
+            Line::from(spans),
+            Line::styled(format!("{path} "), theme.text_secondary()),
+        ),
+        None => put(buf, tab_rect, Line::from(spans)),
+    }
 
     let body = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
     let lines: Vec<Line<'_>> = if which == Pane::Request && app.mode == Mode::Edit {
@@ -215,22 +226,30 @@ fn pane(
     } else {
         content(app, theme, row, detail, which, tabs[active], body.width)
     };
-    let scroll = if focused {
-        usize::from(app.inspector.scroll)
-    } else {
-        0
+    let last = lines.len().saturating_sub(1);
+    let height = usize::from(body.height);
+    // The focused pane scrolls to its offset, then far enough that the cursor
+    // line is inside the window.
+    let cursor = focused.then(|| app.inspector.cursor_line.min(last));
+    let scroll = match cursor {
+        Some(c) => {
+            let s = usize::from(app.inspector.scroll).min(last);
+            if c < s {
+                c
+            } else if c >= s + height {
+                c + 1 - height
+            } else {
+                s
+            }
+        }
+        None => 0,
     };
-    let scroll = scroll.min(lines.len().saturating_sub(1));
     let gutter = lines.len() > 1
         && tabs[active] != "Headers"
         && tabs[active] != "Summary"
         && tabs[active] != "Connection";
-    for (k, line) in lines
-        .iter()
-        .skip(scroll)
-        .take(usize::from(body.height))
-        .enumerate()
-    {
+    let highlight = cursor.filter(|_| json_tab);
+    for (k, line) in lines.iter().skip(scroll).take(height).enumerate() {
         let y = body.y + k as u16;
         let mut x = body.x;
         if gutter {
@@ -239,6 +258,15 @@ fn pane(
             x += 5;
         }
         buf.set_line(x, y, line, body.right().saturating_sub(x));
+        if highlight == Some(scroll + k) {
+            // Background and modifier only, so the syntax colours survive.
+            let sel = theme.selection();
+            let mut bg_only = Style::default().add_modifier(sel.add_modifier);
+            if let Some(bg) = sel.bg {
+                bg_only = bg_only.bg(bg);
+            }
+            buf.set_style(Rect::new(body.x, y, body.width, 1), bg_only);
+        }
     }
     if lines.len() > usize::from(body.height) {
         let more = format!(
@@ -577,4 +605,81 @@ fn editor(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         truncate(hint, usize::from(area.width.saturating_sub(2))),
         theme.text_tertiary(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::action::Action;
+    use crate::app::{Mode, Pane, RESPONSE_TABS};
+    use crate::snapshot::{render as snap, to_text};
+    use crate::theme::Theme;
+
+    fn json_tab_app(cols: u16, rows: u16) -> crate::app::App {
+        let mut app = crate::fixture_app(cols, rows);
+        app.selected = Some("f41".into());
+        app.mode = Mode::Inspector;
+        app.inspector.pane = Pane::Response;
+        app.inspector.response_tab = RESPONSE_TABS.iter().position(|t| *t == "JSON").unwrap();
+        app
+    }
+
+    /// The buffer row (as text) that contains `needle`, with its y.
+    fn row_with(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, String)> {
+        to_text(buf)
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains(needle))
+            .map(|(y, l)| (y as u16, l.to_string()))
+    }
+
+    #[test]
+    fn json_tab_highlights_the_cursor_line_and_shows_its_path() {
+        let theme = Theme::new(true);
+        let mut app = json_tab_app(200, 50);
+        app.inspector.cursor_line = 4;
+        let buf = snap(&app, &theme, 200, 50);
+        let (_, tabs) = row_with(&buf, "Response  Headers").expect("response tab row");
+        assert!(
+            tabs.trim_end().ends_with("$.items[0].name"),
+            "node path right-aligned on the tab row: {tabs:?}"
+        );
+        let (y, _) = row_with(&buf, "Noise-cancelling headphones").expect("cursor line drawn");
+        let sel = theme.selection().bg;
+        let x = to_text(&buf)
+            .lines()
+            .nth(usize::from(y))
+            .and_then(|l| l.find("Noise"))
+            .unwrap() as u16;
+        assert_eq!(buf.cell((x, y)).map(|c| c.bg), Some(sel.unwrap()));
+        // The line above is not highlighted.
+        assert_ne!(buf.cell((x, y - 1)).map(|c| c.bg), Some(sel.unwrap()));
+
+        // Off the JSON tab there is no path and no highlight.
+        app.inspector.response_tab = 1;
+        let buf = snap(&app, &theme, 200, 50);
+        let (_, tabs) = row_with(&buf, "Response  Headers").unwrap();
+        assert!(!tabs.contains("$."), "{tabs:?}");
+    }
+
+    #[test]
+    fn json_tab_scrolls_to_keep_the_cursor_visible() {
+        let theme = Theme::new(true);
+        // A short terminal: the response pane shows fewer than 18 lines.
+        let mut app = json_tab_app(200, 20);
+        let text = to_text(&snap(&app, &theme, 200, 20));
+        assert!(text.contains("\"items\": ["), "{text}");
+        assert!(
+            !text.contains("\"total\": 2"),
+            "pane must be shorter than the tree: {text}"
+        );
+        // Cursor on the last line: the window follows it down.
+        let _ = app.update(Action::End);
+        assert_eq!(app.inspector.cursor_line, 17);
+        let text = to_text(&snap(&app, &theme, 200, 20));
+        assert!(text.contains("\"total\": 2"), "{text}");
+        // And back up: Home shows the top again.
+        let _ = app.update(Action::Home);
+        let text = to_text(&snap(&app, &theme, 200, 20));
+        assert!(text.contains("\"items\": ["), "{text}");
+    }
 }

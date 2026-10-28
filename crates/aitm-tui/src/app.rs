@@ -15,6 +15,8 @@ use crate::filter::{self, Expr};
 use crate::model::{
     counts_by, AgentPolicy, AgentState, Finding, FlowDetail, FlowKind, FlowRow, Message,
 };
+use crate::theme::Theme;
+use crate::viewers::json;
 
 /// Terminal widths below which the shell changes shape (§2.10(c)).
 pub const NARROW_COLS: u16 = 120;
@@ -234,6 +236,9 @@ pub struct InspectorState {
     pub request_tab: usize,
     pub response_tab: usize,
     pub scroll: u16,
+    /// The highlighted line in the focused pane (0-based). Up/Down move it;
+    /// the renderer scrolls so it stays visible.
+    pub cursor_line: usize,
     /// JSON-tree paths that are folded.
     pub folds: HashSet<String>,
     /// The other flow for the Diff tab.
@@ -247,9 +252,18 @@ impl Default for InspectorState {
             request_tab: 0,
             response_tab: 1,
             scroll: 0,
+            cursor_line: 0,
             folds: HashSet::new(),
             diff_with: None,
         }
+    }
+}
+
+impl InspectorState {
+    /// Back to the top of the pane: a new flow, pane or tab.
+    fn reset_view(&mut self) {
+        self.scroll = 0;
+        self.cursor_line = 0;
     }
 }
 
@@ -637,6 +651,47 @@ impl App {
         self.selected.as_deref().and_then(|id| self.details.get(id))
     }
 
+    /// The selected flow's response body when the Response pane's JSON tab
+    /// is showing it; `None` on any other pane or tab.
+    fn json_body(&self) -> Option<&str> {
+        if self.inspector.pane != Pane::Response
+            || RESPONSE_TABS.get(self.inspector.response_tab) != Some(&"JSON")
+        {
+            return None;
+        }
+        self.selected_detail()?.response.as_ref()?.body_text()
+    }
+
+    /// The JSON tree as the JSON tab draws it (paths only matter here, so the
+    /// theme is irrelevant); `None` off the JSON tab or when the body is not JSON.
+    fn json_tree(&self) -> Option<Vec<Option<String>>> {
+        let body = self.json_body()?;
+        json::tree_with_paths(&Theme::new(false), body, &self.inspector.folds).map(|(_, p)| p)
+    }
+
+    /// The node path (`$.items[0].name`) of the cursor line on the Response
+    /// pane's JSON tab; `None` elsewhere or on a closing-bracket line.
+    pub fn json_cursor_path(&self) -> Option<String> {
+        let paths = self.json_tree()?;
+        let at = self.inspector.cursor_line.min(paths.len().checked_sub(1)?);
+        paths.get(at).cloned().flatten()
+    }
+
+    /// How many lines the focused viewer has, when the app can know it
+    /// (the JSON tree). Other viewers are shaped by the renderer.
+    fn viewer_line_count(&self) -> Option<usize> {
+        self.json_tree().map(|p| p.len())
+    }
+
+    /// What `y` copies: the node path on the JSON tab in Inspector mode, the
+    /// selected flow's URL otherwise.
+    pub fn copy_text(&self) -> Option<String> {
+        if self.mode == Mode::Inspector && self.json_body().is_some() {
+            return self.json_cursor_path();
+        }
+        self.selected_row().map(FlowRow::url)
+    }
+
     /// Scope-as-authorisation (§2.7): `host`, `host:port`, `*.wildcard`.
     pub fn in_scope(&self, row: &FlowRow) -> bool {
         scope_covers(&self.scope, &row.authority)
@@ -905,7 +960,7 @@ impl App {
                 Mode::Flows => {
                     if self.selected.is_some() {
                         self.mode = Mode::Inspector;
-                        self.inspector.scroll = 0;
+                        self.inspector.reset_view();
                         self.ensure_detail(&mut out);
                     }
                 }
@@ -1108,13 +1163,21 @@ impl App {
                 }
             }
             Action::CopyUrl => {
-                if self.selected_row().is_some() {
+                let json_tab = self.mode == Mode::Inspector && self.json_body().is_some();
+                let (what, shown) = if json_tab {
+                    ("node path", "on the pane's tab row")
+                } else {
+                    ("URL", "in the status bar")
+                };
+                if self.copy_text().is_some() {
                     let msg = if self.caps.osc52 {
-                        "URL copied (OSC 52)"
+                        format!("{what} copied (OSC 52)")
                     } else {
-                        "Terminal does not advertise OSC 52; URL shown in the status bar"
+                        format!("Terminal does not advertise OSC 52; {what} shown {shown}")
                     };
                     self.toast(Level::Info, msg);
+                } else if json_tab {
+                    self.toast(Level::Info, "No node on this line to copy");
                 }
             }
             Action::OpenExternally => {
@@ -1155,7 +1218,7 @@ impl App {
                     Pane::Request => Pane::Response,
                     Pane::Response => Pane::Request,
                 };
-                self.inspector.scroll = 0;
+                self.inspector.reset_view();
             }
             Action::InspectorTabNext => self.tab_step(1),
             Action::InspectorTabPrev => self.tab_step(-1),
@@ -1163,7 +1226,22 @@ impl App {
                 let s = i32::from(self.inspector.scroll) + d;
                 self.inspector.scroll = u16::try_from(s.max(0)).unwrap_or(u16::MAX);
             }
-            Action::ToggleFold => {}
+            Action::ToggleFold => {
+                // Only container nodes fold; a leaf or closing bracket is a no-op.
+                let target = if self.mode == Mode::Inspector {
+                    self.json_cursor_path().filter(|p| {
+                        self.json_body()
+                            .is_some_and(|b| json::container_paths(b).contains(p))
+                    })
+                } else {
+                    None
+                };
+                if let Some(path) = target {
+                    if !self.inspector.folds.remove(&path) {
+                        self.inspector.folds.insert(path);
+                    }
+                }
+            }
         }
         out
     }
@@ -1423,17 +1501,34 @@ impl App {
                 };
             }
             Mode::Inspector | Mode::QuickLook => {
-                let d: i32 = match action {
-                    Action::Up => -1,
-                    Action::Down => 1,
-                    Action::PageUp => -20,
-                    Action::PageDown => 20,
-                    Action::Home => -(i32::from(u16::MAX)),
-                    Action::End => 20,
-                    _ => 0,
-                };
-                let s = i32::from(self.inspector.scroll) + d;
-                self.inspector.scroll = u16::try_from(s.max(0)).unwrap_or(u16::MAX);
+                // Up/Down move the cursor line (the renderer scrolls to keep it
+                // visible); PgUp/PgDn move the window by a page and pull the
+                // cursor into it. The line count is known for the JSON tree;
+                // elsewhere the renderer clamps what it draws.
+                const PAGE: usize = 20;
+                let last = self.viewer_line_count().map(|n| n.saturating_sub(1));
+                let clamp = |c: usize| last.map_or(c, |l| c.min(l));
+                let ins = &mut self.inspector;
+                let mut paged = matches!(action, Action::PageUp | Action::PageDown);
+                match action {
+                    Action::Up => ins.cursor_line = ins.cursor_line.saturating_sub(1),
+                    Action::Down => ins.cursor_line = clamp(ins.cursor_line + 1),
+                    Action::PageUp => ins.scroll = ins.scroll.saturating_sub(PAGE as u16),
+                    Action::PageDown => ins.scroll = ins.scroll.saturating_add(PAGE as u16),
+                    Action::Home => ins.reset_view(),
+                    Action::End => match last {
+                        Some(l) => ins.cursor_line = l,
+                        None => {
+                            ins.scroll = ins.scroll.saturating_add(PAGE as u16);
+                            paged = true;
+                        }
+                    },
+                    _ => {}
+                }
+                if paged {
+                    let top = usize::from(ins.scroll);
+                    ins.cursor_line = clamp(ins.cursor_line.clamp(top, top + PAGE - 1));
+                }
             }
             Mode::Edit => {
                 if let Some(e) = &mut self.edit {
@@ -1474,7 +1569,7 @@ impl App {
                 };
                 self.selected = Some(self.flows[vis[next]].id.clone());
                 self.auto_select = false;
-                self.inspector.scroll = 0;
+                self.inspector.reset_view();
                 self.ensure_detail(out);
             }
         }
@@ -1509,7 +1604,7 @@ impl App {
             Pane::Response => (&mut self.inspector.response_tab, RESPONSE_TABS.len()),
         };
         *tab = (*tab as i32 + d).rem_euclid(n as i32) as usize;
-        self.inspector.scroll = 0;
+        self.inspector.reset_view();
     }
 
     fn ensure_detail(&mut self, out: &mut Vec<BusRequest>) {
@@ -2326,6 +2421,134 @@ mod tests {
         assert!(!scope_covers(&s, "h.test"));
         assert!(!scope_covers(&s, "notshop.test"));
         assert!(!scope_covers(&[], "api.test"));
+    }
+
+    /// The fixture app on `f41` (products JSON) with the Response pane's JSON
+    /// tab focused.
+    fn json_tab_app() -> App {
+        let mut app = crate::fixture_app(200, 50);
+        app.selected = Some("f41".into());
+        app.mode = Mode::Inspector;
+        app.inspector.pane = Pane::Response;
+        app.inspector.response_tab = RESPONSE_TABS
+            .iter()
+            .position(|t| *t == "JSON")
+            .expect("JSON tab");
+        app
+    }
+
+    fn json_tab_text(app: &App) -> Vec<String> {
+        let body = app
+            .selected_detail()
+            .and_then(|d| d.response.as_ref())
+            .and_then(Message::body_text)
+            .expect("f41 response body");
+        crate::viewers::json::tree(&crate::theme::Theme::new(true), body, &app.inspector.folds)
+            .expect("f41 body is JSON")
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn toggle_fold_folds_the_json_node_under_the_cursor() {
+        let mut app = json_tab_app();
+        // Line 0 is `{`; line 1 is `"items": [` (gutter line 2).
+        app.inspector.cursor_line = 1;
+        assert_eq!(app.json_cursor_path().as_deref(), Some("$.items"));
+        assert!(app.update(Action::ToggleFold).is_empty());
+        assert!(app.inspector.folds.contains("$.items"));
+        let lines = json_tab_text(&app);
+        assert_eq!(lines[1], "▸   \"items\": […] 2 items,");
+        assert_eq!(lines.len(), 5);
+        let _ = app.update(Action::ToggleFold);
+        assert!(!app.inspector.folds.contains("$.items"));
+        assert_eq!(json_tab_text(&app).len(), 18);
+
+        // A leaf line has a path but nothing to fold.
+        app.inspector.cursor_line = 3;
+        assert_eq!(app.json_cursor_path().as_deref(), Some("$.items[0].id"));
+        let _ = app.update(Action::ToggleFold);
+        assert!(app.inspector.folds.is_empty());
+
+        // Only the Response pane's JSON tab folds.
+        app.inspector.cursor_line = 1;
+        app.inspector.pane = Pane::Request;
+        assert_eq!(app.json_cursor_path(), None);
+        let _ = app.update(Action::ToggleFold);
+        assert!(app.inspector.folds.is_empty());
+        app.inspector.pane = Pane::Response;
+        app.inspector.response_tab = 1;
+        assert_eq!(app.json_cursor_path(), None);
+        let _ = app.update(Action::ToggleFold);
+        assert!(app.inspector.folds.is_empty());
+    }
+
+    #[test]
+    fn inspector_up_down_move_the_cursor_line_and_clamp_to_the_tree() {
+        let mut app = json_tab_app();
+        assert_eq!(app.inspector.cursor_line, 0);
+        let _ = app.update(Action::Down);
+        let _ = app.update(Action::Down);
+        assert_eq!(app.inspector.cursor_line, 2);
+        assert_eq!(app.inspector.scroll, 0);
+        assert_eq!(app.json_cursor_path().as_deref(), Some("$.items[0]"));
+        let _ = app.update(Action::Up);
+        let _ = app.update(Action::Up);
+        let _ = app.update(Action::Up);
+        assert_eq!(app.inspector.cursor_line, 0);
+        // 18 lines in the unfolded tree: End lands on the last one.
+        let _ = app.update(Action::End);
+        assert_eq!(app.inspector.cursor_line, 17);
+        let _ = app.update(Action::Down);
+        assert_eq!(app.inspector.cursor_line, 17);
+        let _ = app.update(Action::Home);
+        assert_eq!(app.inspector.cursor_line, 0);
+        assert_eq!(app.inspector.scroll, 0);
+        // PageDown moves the window by 20 and pulls the cursor into it
+        // (the tree is shorter than a page, so the cursor stops on the last line).
+        let _ = app.update(Action::PageDown);
+        assert_eq!(app.inspector.scroll, 20);
+        assert_eq!(app.inspector.cursor_line, 17);
+        let _ = app.update(Action::PageUp);
+        assert_eq!(app.inspector.scroll, 0);
+        assert_eq!(app.inspector.cursor_line, 17);
+        // Changing tab or pane puts the cursor back at the top.
+        let _ = app.update(Action::InspectorTabNext);
+        assert_eq!(app.inspector.cursor_line, 0);
+    }
+
+    #[test]
+    fn copy_offers_the_url_in_flows_and_the_node_path_on_the_json_tab() {
+        let mut app = json_tab_app();
+        app.inspector.cursor_line = 4;
+        assert_eq!(
+            app.copy_text().as_deref(),
+            Some("$.items[0].name"),
+            "JSON tab copies the node path"
+        );
+        let _ = app.update(Action::CopyUrl);
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("node path copied (OSC 52)")
+        );
+        app.mode = Mode::Flows;
+        assert_eq!(
+            app.copy_text().as_deref(),
+            Some("https://api.shop-staging.test/api/products?category=electronics&limit=20")
+        );
+        let _ = app.update(Action::CopyUrl);
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("URL copied (OSC 52)")
+        );
+        app.selected = None;
+        assert_eq!(app.copy_text(), None);
     }
 
     #[test]

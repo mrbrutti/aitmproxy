@@ -11,18 +11,43 @@ use crate::theme::Theme;
 /// Pretty-print with the syntax tokens. `None` when the text is not JSON.
 pub fn pretty<'a>(theme: &Theme, text: &str) -> Option<Vec<Line<'a>>> {
     let v: Value = serde_json::from_str(text).ok()?;
-    let mut out = Vec::new();
+    let mut out = Sink::default();
     render(theme, &v, 0, None, &mut out, &HashSet::new(), "$", true);
-    Some(out)
+    Some(out.lines)
 }
 
 /// The tree view: like `pretty`, but a folded node collapses to one line
 /// (`▸ "user": {…} 4 keys`) and every container line carries its fold marker.
 pub fn tree<'a>(theme: &Theme, text: &str, folds: &HashSet<String>) -> Option<Vec<Line<'a>>> {
+    tree_with_paths(theme, text, folds).map(|(lines, _)| lines)
+}
+
+/// The tree view plus, for each line, the node path it shows: `Some` for a
+/// value line (a container's opening or folded line, or a leaf), `None` for
+/// a closing bracket. Both vectors have the same length.
+pub fn tree_with_paths<'a>(
+    theme: &Theme,
+    text: &str,
+    folds: &HashSet<String>,
+) -> Option<(Vec<Line<'a>>, Vec<Option<String>>)> {
     let v: Value = serde_json::from_str(text).ok()?;
-    let mut out = Vec::new();
+    let mut out = Sink::default();
     render(theme, &v, 0, None, &mut out, folds, "$", false);
-    Some(out)
+    Some((out.lines, out.paths))
+}
+
+/// The lines being built, each with the node path it belongs to.
+#[derive(Default)]
+struct Sink<'a> {
+    lines: Vec<Line<'a>>,
+    paths: Vec<Option<String>>,
+}
+
+impl<'a> Sink<'a> {
+    fn push(&mut self, line: Line<'a>, path: Option<&str>) {
+        self.lines.push(line);
+        self.paths.push(path.map(str::to_string));
+    }
 }
 
 /// Paths of every container node, in document order (for fold navigation).
@@ -58,7 +83,7 @@ fn render<'a>(
     v: &Value,
     depth: usize,
     key: Option<&str>,
-    out: &mut Vec<Line<'a>>,
+    out: &mut Sink<'a>,
     folds: &HashSet<String>,
     path: &str,
     plain: bool,
@@ -88,7 +113,7 @@ fn render<'a>(
                 format!(" {} keys", m.len()),
                 theme.text_tertiary(),
             ));
-            out.push(Line::from(spans));
+            out.push(Line::from(spans), Some(path));
         }
         Value::Array(a) if !plain && folds.contains(path) => {
             spans.push(Span::styled("[…]", theme.syntax_bracket()));
@@ -96,11 +121,11 @@ fn render<'a>(
                 format!(" {} items", a.len()),
                 theme.text_tertiary(),
             ));
-            out.push(Line::from(spans));
+            out.push(Line::from(spans), Some(path));
         }
         Value::Object(m) => {
             spans.push(Span::styled("{", theme.syntax_bracket()));
-            out.push(Line::from(spans));
+            out.push(Line::from(spans), Some(path));
             let n = m.len();
             for (i, (k, c)) in m.iter().enumerate() {
                 let child = format!("{path}.{k}");
@@ -109,11 +134,11 @@ fn render<'a>(
                     comma(out, theme);
                 }
             }
-            out.push(close(theme, &indent, "}", plain));
+            out.push(close(theme, &indent, "}", plain), None);
         }
         Value::Array(a) => {
             spans.push(Span::styled("[", theme.syntax_bracket()));
-            out.push(Line::from(spans));
+            out.push(Line::from(spans), Some(path));
             let n = a.len();
             for (i, c) in a.iter().enumerate() {
                 let child = format!("{path}[{i}]");
@@ -122,32 +147,32 @@ fn render<'a>(
                     comma(out, theme);
                 }
             }
-            out.push(close(theme, &indent, "]", plain));
+            out.push(close(theme, &indent, "]", plain), None);
         }
         Value::String(s) => {
             spans.push(Span::styled(
                 serde_json::to_string(s).unwrap_or_else(|_| format!("\"{s}\"")),
                 theme.syntax_string(),
             ));
-            out.push(Line::from(spans));
+            out.push(Line::from(spans), Some(path));
         }
         Value::Number(n) => {
             spans.push(Span::styled(n.to_string(), theme.syntax_number()));
-            out.push(Line::from(spans));
+            out.push(Line::from(spans), Some(path));
         }
         Value::Bool(b) => {
             spans.push(Span::styled(b.to_string(), theme.syntax_boolean()));
-            out.push(Line::from(spans));
+            out.push(Line::from(spans), Some(path));
         }
         Value::Null => {
             spans.push(Span::styled("null", theme.syntax_boolean()));
-            out.push(Line::from(spans));
+            out.push(Line::from(spans), Some(path));
         }
     }
 }
 
-fn comma<'a>(out: &mut Vec<Line<'a>>, theme: &Theme) {
-    if let Some(last) = out.last_mut() {
+fn comma(out: &mut Sink<'_>, theme: &Theme) {
+    if let Some(last) = out.lines.last_mut() {
         last.spans.push(Span::styled(",", theme.syntax_punct()));
     }
 }
@@ -217,5 +242,56 @@ mod tests {
             vec!["▾ {", "▸   \"user\": {…} 2 keys,", "    \"n\": 2", "  }"]
         );
         assert_eq!(container_paths(src), vec!["$", "$.user"]);
+    }
+
+    #[test]
+    fn tree_with_paths_labels_every_node_line() {
+        let t = Theme::new(true);
+        let (lines, paths) = tree_with_paths(&t, r#"{"a":{"b":1}}"#, &HashSet::new()).unwrap();
+        assert_eq!(
+            text(&lines),
+            vec!["▾ {", "▾   \"a\": {", "      \"b\": 1", "    }", "  }"]
+        );
+        assert_eq!(
+            paths,
+            vec![
+                Some("$".to_string()),
+                Some("$.a".to_string()),
+                Some("$.a.b".to_string()),
+                None,
+                None,
+            ]
+        );
+        // A folded container keeps its path on its one line.
+        let folds: HashSet<String> = ["$.a".to_string()].into_iter().collect();
+        let (lines, paths) = tree_with_paths(&t, r#"{"a":{"b":1},"c":[true]}"#, &folds).unwrap();
+        assert_eq!(
+            text(&lines),
+            vec![
+                "▾ {",
+                "▸   \"a\": {…} 1 keys,",
+                "▾   \"c\": [",
+                "      true",
+                "    ]",
+                "  }"
+            ]
+        );
+        assert_eq!(
+            paths,
+            vec![
+                Some("$".to_string()),
+                Some("$.a".to_string()),
+                Some("$.c".to_string()),
+                Some("$.c[0]".to_string()),
+                None,
+                None,
+            ]
+        );
+        assert!(tree_with_paths(&t, "nope", &HashSet::new()).is_none());
+        // `tree` stays the thin wrapper.
+        assert_eq!(
+            text(&tree(&t, r#"{"a":{"b":1}}"#, &HashSet::new()).unwrap()).len(),
+            5
+        );
     }
 }

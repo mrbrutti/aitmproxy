@@ -62,6 +62,23 @@ pub struct RunOptions {
     pub caps: Option<TermCaps>,
     /// Flow-list poll interval (F4 push is not on the bus yet).
     pub poll: Duration,
+    /// A note shown in the status bar at start (e.g. where the embedded
+    /// proxy's log went).
+    pub startup_note: Option<String>,
+}
+
+/// Restores the terminal when dropped, so a caller that drops the `run`
+/// future mid-flight (the embedded proxy ending first, a signal) never leaves
+/// the shell in raw mode on the alternate screen.
+struct TerminalGuard {
+    bus_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        ratatui::restore();
+        self.bus_task.abort();
+    }
 }
 
 /// Build the connector for a transport choice, plus the address label the
@@ -111,8 +128,12 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     let (req_tx, req_rx) = mpsc::channel(128);
     let (ev_tx, mut ev_rx) = mpsc::channel(512);
     let bus_task = tokio::spawn(bus::run(connect, req_rx, ev_tx, opts.poll));
+    if let Some(note) = opts.startup_note {
+        app.toast(action::Level::Info, note);
+    }
 
     let mut terminal = ratatui::init();
+    let _guard = TerminalGuard { bus_task };
     let size = terminal.size()?;
     let _ = app.update(Action::Resize(size.width, size.height));
     let mut events = EventStream::new();
@@ -128,8 +149,8 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
                 Some(Ok(Event::Key(key))) => {
                     if let Some(action) = keys::map(key, app.mode) {
                         if action == Action::CopyUrl && caps.osc52 {
-                            if let Some(r) = app.selected_row() {
-                                let _ = clipboard::copy(&r.url());
+                            if let Some(text) = app.copy_text() {
+                                let _ = clipboard::copy(&text);
                             }
                         }
                         requests.extend(app.update(action));
@@ -157,9 +178,8 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
             break Ok(());
         }
     };
-    ratatui::restore();
     drop(req_tx);
-    bus_task.abort();
+    // `_guard` restores the terminal and stops the bus task here.
     result
 }
 
