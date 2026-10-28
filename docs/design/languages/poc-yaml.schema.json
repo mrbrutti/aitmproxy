@@ -1,0 +1,166 @@
+{
+  "_comment": "PoC YAML key tree for schema-aware completion + hover (UI spec §1.1). Content mirrors docs/superpowers/specs/2026-10-27-aitmproxy-poc-language-design.md §'Document structure', §'Step types', §'Matcher / extractor DSL', §'Success / assertion model' and its four worked examples. Node = { type, description, required?, enum?, keys?, items?, one_of_keys?, $ref? }. `keys` is the child key map of a `map`; `items` is the element node of a `list`; `$ref` is `#/$defs/<name>`. Completion walks the YAML nesting: key position -> the enclosing node's `keys`; after `key:` -> that node's `enum` (or true/false for `boolean`). If the builder's validation poc-schema ships, regenerate this from it.",
+  "type": "map",
+  "description": "A PoC document.",
+  "keys": {
+    "id": { "type": "string", "required": true, "description": "Unique PoC identifier (no spaces)." },
+    "info": {
+      "type": "map",
+      "required": true,
+      "description": "Identification metadata for the PoC.",
+      "keys": {
+        "name": { "type": "string", "description": "Human title." },
+        "author": { "type": "string", "description": "Optional author." },
+        "severity": {
+          "type": "enum",
+          "enum": ["info", "low", "medium", "high", "critical"],
+          "description": "How serious the finding is; maps to Severity."
+        },
+        "description": { "type": "string", "description": "What the finding is (no fix prose)." },
+        "reference": { "type": "list", "description": "URLs, CVE or CWE references.", "items": { "type": "string", "description": "One reference." } },
+        "tags": { "type": "list", "description": "Tags for selection and reporting.", "items": { "type": "string", "description": "One tag." } },
+        "cwe": { "type": "string", "description": "Optional CWE identifier, e.g. CWE-79." },
+        "metadata": { "type": "map", "description": "Arbitrary key: value metadata." }
+      }
+    },
+    "variables": {
+      "type": "list",
+      "description": "Reusable {{placeholders}} with optional defaults.",
+      "items": {
+        "type": "map",
+        "description": "One variable definition.",
+        "keys": {
+          "name": { "type": "string", "description": "The variable name, referenced as {{name}}." },
+          "default": { "type": "any", "description": "Default value; may be a DSL expression wrapped in {{ }}, evaluated once at run start." },
+          "description": { "type": "string", "description": "What the variable is for." },
+          "required": { "type": "boolean", "description": "Whether the caller must supply a value (default false)." }
+        }
+      }
+    },
+    "steps": {
+      "type": "list",
+      "required": true,
+      "description": "Ordered steps; each entry has exactly one step key.",
+      "items": {
+        "type": "map",
+        "description": "One step.",
+        "one_of_keys": ["http", "browser", "extract", "script"],
+        "keys": {
+          "http": {
+            "type": "map",
+            "description": "Send an HTTP request through the proxy's guarded client.",
+            "keys": {
+              "method": { "type": "string", "description": "HTTP method: GET, POST, ..." },
+              "url": { "type": "string", "description": "Full URL (templated)." },
+              "path": { "type": "string", "description": "Path relative to {{BaseURL}} (templated)." },
+              "headers": { "type": "map", "description": "Request headers (templated)." },
+              "body": { "type": "string", "description": "Request body (templated); use raw for full control." },
+              "raw": { "type": "string", "description": "Full raw HTTP text with placeholders (nuclei RAW mode)." },
+              "extract": { "type": "list", "description": "Post-response extractors.", "items": { "$ref": "#/$defs/extractor" } },
+              "matchers": { "type": "list", "description": "Per-step matchers.", "items": { "$ref": "#/$defs/matcher" } },
+              "matchers-condition": {
+                "type": "enum",
+                "enum": ["and", "or"],
+                "description": "How this step's matchers combine."
+              }
+            }
+          },
+          "browser": {
+            "type": "map",
+            "description": "Drive the embedded browser with one action.",
+            "keys": {
+              "action": {
+                "type": "enum",
+                "enum": ["navigate", "click", "type", "eval", "screenshot"],
+                "description": "Which browser action to run."
+              },
+              "url": { "type": "string", "description": "Page to load (navigate); SSRF-guarded." },
+              "target": { "type": "string", "description": "Selector or x,y to click (click)." },
+              "selector": { "type": "string", "description": "Element to type into (type)." },
+              "text": { "type": "string", "description": "Text to type (type)." },
+              "expr": { "type": "string", "description": "JavaScript to run; bind or assert its value (eval)." },
+              "label": { "type": "string", "description": "Artifact label for the PNG (screenshot)." }
+            }
+          },
+          "extract": { "$ref": "#/$defs/extractor" },
+          "script": {
+            "type": "map",
+            "description": "Rhai escape hatch using the plugin-system Rhai API, plus vars.get/vars.set.",
+            "keys": {
+              "name": { "type": "string", "description": "Optional label; success can reference the step's verdict by this name." },
+              "script": { "type": "string", "description": "Rhai source; may `return pass` or `return fail`." }
+            }
+          }
+        }
+      }
+    },
+    "success": {
+      "type": "map",
+      "required": true,
+      "description": "What 'triggered' means: an assertion tree evaluated after all steps. A bare matcher, or a list of matchers, is also allowed.",
+      "keys": {
+        "all": { "type": "list", "description": "True when every assertion holds.", "items": { "$ref": "#/$defs/matcher" } },
+        "any": { "type": "list", "description": "True when at least one assertion holds.", "items": { "$ref": "#/$defs/matcher" } },
+        "not": { "$ref": "#/$defs/matcher" }
+      }
+    }
+  },
+  "$defs": {
+    "matcher": {
+      "type": "map",
+      "description": "A matcher or assertion over a response, the page, or a step's verdict.",
+      "keys": {
+        "type": {
+          "type": "enum",
+          "enum": ["status", "word", "regex", "size", "binary", "dsl", "browser-eval"],
+          "description": "The matcher kind."
+        },
+        "status": { "type": "integer", "description": "Expected status code (status)." },
+        "word": { "type": "string", "description": "Literal word to find (word)." },
+        "regex": { "type": "string", "description": "Pattern to match (regex)." },
+        "size": { "type": "integer", "description": "Expected content length (size)." },
+        "binary": { "type": "string", "description": "Hex byte signature (binary)." },
+        "dsl": { "type": "string", "description": "DSL expression over status_code, body, all_headers, content_length and extracted vars (dsl)." },
+        "expr": { "type": "string", "description": "JavaScript to evaluate in the page (browser-eval)." },
+        "equals": { "type": "string", "description": "Expected value of expr (browser-eval)." },
+        "encoding": { "type": "enum", "enum": ["hex"], "description": "Value encoding for word." },
+        "part": {
+          "type": "enum",
+          "enum": ["body", "header", "all"],
+          "description": "Which part of the response to match (default body)."
+        },
+        "condition": {
+          "type": "enum",
+          "enum": ["and", "or"],
+          "description": "How a matcher's own values combine."
+        },
+        "negative": { "type": "boolean", "description": "Invert the match." },
+        "internal": { "type": "boolean", "description": "Precondition only; not printed." },
+        "name": { "type": "string", "description": "Label for the matcher, referenceable from success." }
+      }
+    },
+    "extractor": {
+      "type": "map",
+      "description": "Extracts a value from a response or the page; a named extractor binds a variable.",
+      "keys": {
+        "name": { "type": "string", "description": "Binds a variable for later steps." },
+        "type": {
+          "type": "enum",
+          "enum": ["regex", "json", "kval", "dsl", "browser-eval"],
+          "description": "The extractor kind."
+        },
+        "from": {
+          "type": "enum",
+          "enum": ["body", "header", "all"],
+          "description": "Which part of the response to extract from."
+        },
+        "regex": { "type": "string", "description": "Pattern with capture groups (regex)." },
+        "group": { "type": "integer", "description": "Capture group to take (regex)." },
+        "json": { "type": "string", "description": "JSONPath or jq expression (json)." },
+        "kval": { "type": "string", "description": "Header or cookie key, dashes as underscores (kval)." },
+        "expr": { "type": "string", "description": "Expression to evaluate (dsl, browser-eval)." },
+        "internal": { "type": "boolean", "description": "Pass between steps without printing." }
+      }
+    }
+  }
+}

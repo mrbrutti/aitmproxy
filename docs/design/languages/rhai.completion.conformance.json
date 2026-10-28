@@ -1,0 +1,130 @@
+[
+  {
+    "name": "top-level: every hook at an empty buffer",
+    "context": "",
+    "caret": 0,
+    "kind": "top-level",
+    "path": "",
+    "expected_candidates": [ "load", "configure", "on_request_headers", "on_request", "on_response_headers", "on_response", "on_ws_start", "on_ws_message", "on_ws_end", "on_error" ]
+  },
+  {
+    "name": "top-level: on_ prefix offers the eight event hooks",
+    "context": "on_",
+    "caret": 3,
+    "kind": "top-level",
+    "path": "",
+    "expected_candidates": [ "on_request_headers", "on_request", "on_response_headers", "on_response", "on_ws_start", "on_ws_message", "on_ws_end", "on_error" ]
+  },
+  {
+    "name": "top-level: lo prefix inside a hook body offers the log global",
+    "context": "fn on_request(flow) {\n    lo",
+    "caret": 28,
+    "kind": "top-level",
+    "path": "",
+    "expected_candidates": [ "log" ]
+  },
+  {
+    "name": "top-level: DSL helper prefix inside a hook body",
+    "context": "fn on_request(flow) {\n    b64",
+    "caret": 29,
+    "kind": "top-level",
+    "path": "",
+    "expected_candidates": [ "b64_decode", "b64_encode" ]
+  },
+  {
+    "name": "member: flow. offers the flow object members",
+    "context": "fn on_request(flow) {\n    flow.",
+    "caret": 31,
+    "kind": "member",
+    "path": "flow",
+    "expected_candidates": [ "id", "kind", "marks", "comment", "is_replay", "request", "response", "set_response", "intercept", "resume", "kill", "backup", "revert", "mark" ]
+  },
+  {
+    "name": "member: flow.re filters by prefix",
+    "context": "fn on_request(flow) {\n    flow.re",
+    "caret": 33,
+    "kind": "member",
+    "path": "flow",
+    "expected_candidates": [ "request", "response", "resume", "revert" ]
+  },
+  {
+    "name": "member: flow.request. offers the request members",
+    "context": "fn on_request(flow) {\n    flow.request.",
+    "caret": 39,
+    "kind": "member",
+    "path": "flow.request",
+    "expected_candidates": [ "method", "url", "path", "headers", "body", "set_json", "query" ]
+  },
+  {
+    "name": "member: flow.request.headers. offers the map-like methods",
+    "context": "fn on_request(flow) {\n    flow.request.headers.",
+    "caret": 47,
+    "kind": "member",
+    "path": "flow.request.headers",
+    "expected_candidates": [ "get", "set", "remove", "has" ]
+  },
+  {
+    "name": "member: flow.response. offers the response members",
+    "context": "fn on_response(flow) {\n    flow.response.",
+    "caret": 41,
+    "kind": "member",
+    "path": "flow.response",
+    "expected_candidates": [ "status", "headers", "body" ]
+  },
+  {
+    "name": "member: msg. inside on_ws_message offers the message members",
+    "context": "fn on_ws_message(flow, msg) {\n    msg.",
+    "caret": 38,
+    "kind": "member",
+    "path": "msg",
+    "expected_candidates": [ "direction", "opcode", "text", "data", "set_text", "set_bytes", "drop" ]
+  },
+  {
+    "name": "member: msg.te filters by prefix",
+    "context": "fn on_ws_message(flow, msg) {\n    msg.te",
+    "caret": 40,
+    "kind": "member",
+    "path": "msg",
+    "expected_candidates": [ "text" ]
+  },
+  {
+    "name": "member: log. offers the log levels",
+    "context": "fn on_request(flow) {\n    log.",
+    "caret": 30,
+    "kind": "member",
+    "path": "log",
+    "expected_candidates": [ "info", "warn", "error" ]
+  },
+  {
+    "name": "member: browser. offers the browser actions",
+    "context": "fn on_response(flow) {\n    browser.",
+    "caret": 35,
+    "kind": "member",
+    "path": "browser",
+    "expected_candidates": [ "navigate", "click", "type", "screenshot", "eval", "get_dom" ]
+  },
+  {
+    "name": "member: http. offers send",
+    "context": "fn on_request(flow) {\n    http.",
+    "caret": 31,
+    "kind": "member",
+    "path": "http",
+    "expected_candidates": [ "send" ]
+  },
+  {
+    "name": "member: store. offers get and query",
+    "context": "fn on_request(flow) {\n    store.",
+    "caret": 32,
+    "kind": "member",
+    "path": "store",
+    "expected_candidates": [ "get", "query" ]
+  },
+  {
+    "name": "member: scope. offers add and list",
+    "context": "fn on_request(flow) {\n    scope.",
+    "caret": 32,
+    "kind": "member",
+    "path": "scope",
+    "expected_candidates": [ "add", "list" ]
+  }
+]
