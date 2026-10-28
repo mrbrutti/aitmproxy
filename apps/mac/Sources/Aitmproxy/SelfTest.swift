@@ -10,8 +10,8 @@ enum SelfTest {
     static var requested: Bool { CommandLine.arguments.contains("--selftest") }
     /// Read by AppDelegate.applicationWillTerminate.
     static var exitCode: Int32 = 0
-    private static var failures = 0
-    private static var count = 0
+    static var failures = 0
+    static var count = 0
 
     static func runIfRequested(session: Session) {
         guard requested else { return }
@@ -21,6 +21,8 @@ enum SelfTest {
             finish(code: 1)
             return
         }
+        // APP_LIVE=1: the bus pass instead of the fixture checks (SelfTest+Live.swift).
+        if live { return runLive(session: session) }
         Task {
             try? await Task.sleep(for: .seconds(0.5))
             check("fixtures load 14 rows", session.rows.count == 14)
@@ -350,14 +352,14 @@ enum SelfTest {
 
     /// Waits for an async action to land instead of sleeping a fixed time (the
     /// fixture actions hop through Tasks; under load a fixed sleep races them).
-    private static func settle(timeout: Duration = .seconds(5), until done: () -> Bool) async {
+    static func settle(timeout: Duration = .seconds(5), until done: () -> Bool) async {
         let deadline = ContinuousClock.now + timeout
         while !done(), ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(25))
         }
     }
 
-    private static func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+    static func check(_ name: String, _ ok: Bool, _ detail: String = "") {
         count += 1
         if !ok { failures += 1 }
         print(ok ? "PASS \(name)" : "FAIL \(name)\(detail.isEmpty ? "" : ": \(detail)")")

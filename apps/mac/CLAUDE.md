@@ -17,6 +17,7 @@ SwiftData database and no server.
 - Build and install: `./build.sh`. Add `--open` to restart the app with the new build. The build shows warnings; fix them.
 - Unit tests: `swift test --scratch-path ~/Library/Developer/Aitmproxy/test-build`.
 - Self-test (the app's real functions on a /tmp store): `tools/selftest.sh`. Exit 0 when every check passes. Add a check for every story with logic in `SelfTest.swift`.
+- Live self-test (every proxy action over the real bus, `SelfTest+Live.swift`): start `aitm` with a config (`AITM_CONFIG=… ./target/release/aitm`) and an upstream (`python3 -m http.server 8099 --bind 127.0.0.1`), then `AITM_CONFIG=… tools/selftest-live.sh`. Run it after any change to `Bus/`.
 - After every UI change, take snapshots with sample data and look at them: `tools/snap.sh`.
   It writes `/tmp/Aitmproxy-shots/<page>-light.png` and `-dark.png` for every sidebar page, and `settings-<tab>-light.png` and `-dark.png` for every Settings tab, then quits. `APP_SNAPSHOT_PAGES=all,settings tools/snap.sh` limits the pages.
   For a panel, sheet, or popover, add a capture to `Snapshot.swift` like the Settings loop.
