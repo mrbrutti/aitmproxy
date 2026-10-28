@@ -9,8 +9,12 @@
 //! This is the crate foundation (M5 Task 1): config and scope/guard value types.
 #![forbid(unsafe_code)]
 
+pub mod backend;
 pub mod config;
 pub mod craft;
 pub mod flow;
 pub mod guard;
 pub mod types;
+pub mod wire;
+
+pub use backend::L4Error;
