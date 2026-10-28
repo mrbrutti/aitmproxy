@@ -166,6 +166,7 @@ name = "aitm-plugins"
 version = "0.1.0"
 dependencies = [
  "aitm-core",
+ "aitm-rules",
  "anyhow",
  "futures",
  "time",
