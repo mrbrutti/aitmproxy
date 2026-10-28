@@ -49,6 +49,13 @@ design, not a new decision.
   the chain exactly as a Rust plugin's `Verdict::Halt` does.
 - **Hand-writable in minutes.** A useful script is a handful of lines with no
   imports, no boilerplate, no registration ceremony; every hook is optional.
+- **Reads like a small, friendly JS-like DSL.** Matt's standing comparison is a
+  surface that "looks like JavaScript so people can work things out." Rhai stays
+  the engine (locked), but the *feel* comes from the design above it: Rhai's own
+  JS-like syntax (including `${...}` template literals), curated domain verbs for
+  flow/request/response/scope/intercept/findings, and a small bundled prelude — so
+  a reader sees a clean domain language, not raw general-purpose scripting. This is
+  a first-class goal alongside human-friendliness, not a coat of paint.
 - **One scripting surface, reused.** The PoC `script` step runs the same engine,
   the same host functions, and the same DSL helpers as a scripted plugin.
 - **Script-authored commands are first-class.** A command registered from a
@@ -203,6 +210,36 @@ These are binding design rules, not aspirations. Each is testable.
    `Continue` (§8).
 8. **Examples are part of the deliverable.** The worked examples below are
    normative reference shapes and ship as runnable fixtures.
+
+#### 2a. The JS-like DSL feel — built on Rhai, not transpiled (Architect's call)
+
+Matt wants the surface to read like an easy, JavaScript-looking DSL (the stated
+inspiration was a proxy whose rules "look like JavaScript"). The locked decision
+is that Rhai is the *engine*; the reconciliation is that the **JS-like feel is a
+design choice in the layer above Rhai**, which is cheap because Rhai's syntax is
+already C/JS/Rust-like. The feel is produced by three stacked layers, no separate
+DSL compiler:
+
+1. **Rhai's native JS-isms.** Backtick **template literals with `${...}`**
+   (`` `${base}/search?q=${url_encode(p)}` ``), the `in` operator
+   (`"secret" in msg.text`), indexers (`headers["X-Api"]`), ranges, object maps
+   (`#{ method: "POST", url: u }`), and `if/else`/`for`/`let` that already look
+   like JS. Using these in every example is most of the win.
+2. **Curated domain verbs (the DSL vocabulary).** The host API (§3, §6) is chosen
+   to read as a small traffic-manipulation language — `flow.request.headers.set`,
+   `flow.mark`, `flow.set_response`, `http.send`, `browser.screenshot`,
+   `scope.add`, `finding` — nouns and verbs a tester recognizes, never raw engine
+   primitives.
+3. **A small bundled prelude.** A first-party `prelude.rhai` compiled once and
+   shared by every script and PoC step, providing thin sugar (e.g. `ok(resp)`,
+   `json(map)`, `contains_ci(h, s)`) so common intent reads as one friendly call.
+   It is ordinary Rhai, versioned with the `API` contract, and listed in the docs.
+
+What this is **not**: a hand-written JS parser, a transpiler, or a second
+language. If Matt decides the three layers still fall short of the JS-like feel he
+wants, a thin JS-flavoured surface compiled down to Rhai is possible but costs a
+real parser/compiler and its own test burden — captured as Open question 10, not
+chosen silently.
 
 ### 3. The script-facing surface (pinned)
 
@@ -743,7 +780,9 @@ sequenceDiagram
 
 These ship as runnable fixtures and are written to be read. Examples 1–2 are
 scripted plugins; Example 3 is a YAML PoC with a Rhai `script` step. Each ends
-with a one-line note on what it shows.
+with a one-line note on what it shows. Note throughout the deliberately JS-like
+feel (§2a): `${...}` template literals, `in`, indexed headers, `#{ ... }` maps,
+and domain verbs — the surface reads like a small traffic DSL.
 
 ### Example 1 — a readable plugin: tag requests, flag slow errors, expose a command
 
@@ -765,7 +804,7 @@ fn on_request(flow) {
 fn on_response(flow) {
     if flow.response.status >= 500 {
         flow.mark("server-error");
-        log.warn("5xx on " + flow.request.path);
+        log.warn(`5xx on ${flow.request.path}`);   // JS-style template literal
     }
 }
 ```
@@ -800,7 +839,7 @@ fn on_request(flow) {
                 name: "unauthenticated admin write blocked",
                 severity: "medium",
                 flow_id: flow.id,
-                detail: req.method + " " + req.path + " without X-Admin-Token",
+                detail: `${req.method} ${req.path} without X-Admin-Token`,
                 tags: ["access-control"],
             });
             return halt();                       // stop the chain; nothing forwarded
@@ -859,19 +898,19 @@ steps:
 
         let base = vars.get("target");
         let m    = vars.get("marker");
+        let form = "application/x-www-form-urlencoded";
 
         // Authenticate, then store the payload. http.send is scope/rate-gated.
-        http.send(#{ method: "POST", url: base + "/login",
-                     headers: #{ "Content-Type": "application/x-www-form-urlencoded" },
-                     body: "user=" + vars.get("user") + "&pass=" + vars.get("pass")
-                          + "&csrf=" + vars.get("csrf") });
+        http.send(#{ method: "POST", url: `${base}/login`,
+                     headers: #{ "Content-Type": form },
+                     body: `user=${vars.get("user")}&pass=${vars.get("pass")}&csrf=${vars.get("csrf")}` });
 
-        http.send(#{ method: "POST", url: base + "/notes",
-                     headers: #{ "Content-Type": "application/x-www-form-urlencoded" },
-                     body: "note=<script>window.__aitm='" + m + "'</script>" });
+        http.send(#{ method: "POST", url: `${base}/notes`,
+                     headers: #{ "Content-Type": form },
+                     body: `note=<script>window.__aitm='${m}'</script>` });
 
         // Visit the rendered note and confirm the script ran (SSRF-gated).
-        browser.navigate(base + "/notes");
+        browser.navigate(`${base}/notes`);
         browser.screenshot();                      // becomes a run artifact
         if browser.eval("window.__aitm") == m { return pass; }
         return fail;
@@ -949,6 +988,8 @@ satisfies the PoC-language spec's AC-L8; the cross-reference is noted per item.
   `Scope` (for cross-event script state) is exposed in M3 or deferred.
 - Error-message rendering details beyond the pinned format (colour, source-line
   extraction).
+- The contents of the bundled `prelude.rhai` (§2a) — the initial set of sugar
+  helpers; the layering is fixed, the exact helper list is not.
 
 ## Open questions
 
@@ -983,6 +1024,15 @@ accept by silence or redirect any one.
 9. **Research-note numbering.** `07-rhai-embedding.md` is the next free number on
    `main`; an `07-ca-install.md` may exist on the in-flight M2 branch. *Default:
    keep `07` here and renumber at integration if M2 lands an `07` first* — trivial.
+10. **How JS-like should the surface be — Rhai + DSL-shaped prelude vs a thin
+    transpiled JS-like DSL?** *Default: Rhai + curated domain verbs + bundled
+    prelude (§2a)* — it already yields a JS-looking surface (template literals,
+    maps, `in`, indexers) at near-zero cost and no second toolchain. The
+    alternative — authoring a small JS-flavoured syntax compiled down to Rhai —
+    would match an exact JS target more closely but adds a real parser/compiler,
+    its own error mapping, and an ongoing test burden, for a surface Rhai largely
+    already provides. **This is Matt's call at the approval gate.** If chosen, it
+    is a separate milestone; it does not change any Rust interface in this spec.
 
 ## Summary
 
@@ -1024,3 +1074,9 @@ round-trip guarantees. Nothing is built; this is a draft spec for approval.
     companion specs say (reconciled, no API change).
 11. **Human ergonomics as an acceptance-bearing goal**, with a pinned error format
     and runnable, readable examples.
+12. **JS-like feel via Rhai + curated verbs + bundled prelude**, not a transpiled
+    DSL (§2a); whether to go further to a transpiled JS-like surface is deferred to
+    Matt at the gate (OQ10). *Note: the cited RustProxy DSL precedent
+    (`BarisSenel/RustProxy`) turned out to be a reverse-SOCKS5 tunneler with no
+    scripting layer; the DSL vocabulary to mine is nuclei's (`02-nuclei.md`),
+    expressed through Rhai's JS-like syntax.*

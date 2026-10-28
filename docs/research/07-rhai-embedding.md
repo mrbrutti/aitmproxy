@@ -134,6 +134,27 @@ the stored `AST` behind the lock the host plugin already holds. A file watcher
 good `AST`. (The plugin-system spec marks hot-reload a "later nicety" — treat as
 roadmap, design the swap-point but don't require it for the exit gate.)
 
+## 6a. JS-like authoring ergonomics (what Rhai gives for free)
+
+Rhai's own syntax is already C/JavaScript/Rust-like, and two features make a
+curated surface read like a small, friendly JS DSL without any transpilation:
+
+- **Template literals.** Backtick strings with `${...}` interpolation, exactly
+  like JavaScript: `` `${base}/search?q=${url_encode(payload)}` ``. (Escape
+  sequences are not processed inside backtick strings.) This alone removes most
+  of the `+ "..." +` concatenation noise that makes embedded scripts ugly.
+- **`in`, indexing, ranges.** `"secret" in body`, `headers["X-Api"]`,
+  `record[4..8]` — all read naturally.
+
+So the "easy JS-like DSL" Matt wants is achievable as **Rhai + a curated
+domain-verb host API + a small bundled prelude**, not a separate DSL compiler.
+Object maps (`#{ ... }`) are the natural argument shape for `http.send(#{...})`
+and `finding(#{...})`. (The RustProxy project cited as a DSL precedent,
+`BarisSenel/RustProxy`, is in fact a reverse-SOCKS5 tunneler with CLI-flag config
+and no scripting layer — the DSL inspiration to mine is nuclei's matcher/DSL
+vocabulary, already captured in `02-nuclei.md`, expressed through Rhai's
+JS-like syntax.)
+
 ## 7. Design takeaways for aitmproxy M3
 
 1. One shared `Engine` (built with `sync`, default-deny, all limits set,
