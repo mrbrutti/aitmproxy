@@ -229,6 +229,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aitm-rules"
+version = "0.1.0"
+dependencies = [
+ "aitm-core",
+ "regex",
+]
+
+[[package]]
 name = "aitm-tui"
 version = "0.1.0"
 dependencies = [

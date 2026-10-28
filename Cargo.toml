@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/aitm-core",
+    "crates/aitm-rules",
     "crates/aitm-plugin",
     "crates/aitm-proto-http",
     "crates/aitm-proto-ws",
@@ -40,6 +41,7 @@ uuid = { version = "1", features = ["v4"] }
 
 # Internal crates, referenced by path so the workspace builds in-tree.
 aitm-core = { path = "crates/aitm-core" }
+aitm-rules = { path = "crates/aitm-rules" }
 aitm-plugin = { path = "crates/aitm-plugin" }
 aitm-proto-http = { path = "crates/aitm-proto-http" }
 aitm-proto-ws = { path = "crates/aitm-proto-ws" }
