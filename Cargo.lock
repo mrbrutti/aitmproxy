@@ -133,6 +133,7 @@ name = "aitm-mcp"
 version = "0.1.0"
 dependencies = [
  "aitm-core",
+ "aitm-plugins",
  "anyhow",
  "futures",
  "serde_json",

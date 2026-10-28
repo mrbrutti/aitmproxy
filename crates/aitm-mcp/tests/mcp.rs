@@ -9,13 +9,15 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    Body, Command, CommandHost, ConnInfo, Flow, FlowMeta, FlowStore, Frontend, HeaderMap, HttpFlow,
-    HttpRequest, HttpVersion, InterceptState, McpTransport, MemFlowStore, ParamDef, ParamSchema,
-    Params, Plugin, ProxyClient, Registry, StdGuard, TypeDesc, Value,
+    AgentPolicy, AgentState, Body, Command, CommandHost, Config, ConnInfo, Flow, FlowMeta,
+    FlowStore, Frontend, HeaderMap, HttpFlow, HttpRequest, HttpVersion, InterceptState,
+    McpTransport, MemFlowStore, ParamDef, ParamSchema, Params, Plugin, ProxyClient, Registry,
+    Sensitivity, StdGuard, TypeDesc, Value,
 };
 use aitm_mcp::json::{from_json, to_json};
 use aitm_mcp::transport::LoopbackTcp;
 use aitm_mcp::{ConnCtx, McpSchemaDerive, McpServer, StdSchemaDerive};
+use aitm_plugins::AgentPlugin;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -337,15 +339,25 @@ fn registry() -> Arc<Registry> {
     Arc::new(reg)
 }
 
+/// The ungated policy. Tests that predate the M4 Task 4 policy gate (transport,
+/// coercion, roles) drive stub commands that do not declare a tier, so they
+/// default to `Sensitive`; `All` lets them run as before. The policy gate itself
+/// is tested with an explicit `AgentState` in the Task 4 section.
+fn ungated() -> Arc<AgentState> {
+    Arc::new(AgentState::new(AgentPolicy::All))
+}
+
 /// A stdio-configured server with services attached (the transport is unused
 /// when driving `handle` in-process).
 fn server_with(store: Arc<MemFlowStore>) -> McpServer {
-    McpServer::new(registry(), McpTransport::Stdio).with_services(
-        store,
-        Arc::new(StubClient),
-        Arc::new(StdGuard::default()),
-        None,
-    )
+    McpServer::new(registry(), McpTransport::Stdio)
+        .with_agent_state(ungated())
+        .with_services(
+            store,
+            Arc::new(StubClient),
+            Arc::new(StdGuard::default()),
+            None,
+        )
 }
 
 fn server() -> McpServer {
@@ -686,7 +698,7 @@ fn protocol_errors() {
 
 #[test]
 fn call_without_services_is_an_internal_error_but_list_works() {
-    let srv = McpServer::new(registry(), McpTransport::Stdio);
+    let srv = McpServer::new(registry(), McpTransport::Stdio).with_agent_state(ungated());
     assert_eq!(tool_names(&rpc(&srv, 1, "tools/list", json!({}))).len(), 6);
     let resp = rpc(
         &srv,
@@ -707,12 +719,14 @@ fn call_without_services_is_an_internal_error_but_list_works() {
 fn frontend_is_mcp() {
     let mut reg = Registry::new();
     reg.add_command(Arc::new(FrontendCmd));
-    let srv = McpServer::new(Arc::new(reg), McpTransport::Stdio).with_services(
-        Arc::new(MemFlowStore::new()),
-        Arc::new(StubClient),
-        Arc::new(StdGuard::default()),
-        None,
-    );
+    let srv = McpServer::new(Arc::new(reg), McpTransport::Stdio)
+        .with_agent_state(ungated())
+        .with_services(
+            Arc::new(MemFlowStore::new()),
+            Arc::new(StubClient),
+            Arc::new(StdGuard::default()),
+            None,
+        );
     let resp = rpc(
         &srv,
         1,
@@ -891,6 +905,7 @@ async fn serve_role_server() -> SocketAddr {
         Arc::new(StdGuard::default()),
         None,
     )
+    .with_agent_state(ungated())
     .with_mcp_roles(Some("op".into()), Frontend::Mcp);
     let (tx, rx) = tokio::sync::oneshot::channel::<SocketAddr>();
     tokio::spawn(
@@ -954,12 +969,14 @@ async fn unknown_token_refused() {
 #[tokio::test]
 async fn stdio_default_role_is_agent() {
     let srv = Arc::new(
-        McpServer::new(role_registry(), McpTransport::Stdio).with_services(
-            Arc::new(MemFlowStore::new()),
-            Arc::new(StubClient),
-            Arc::new(StdGuard::default()),
-            None,
-        ),
+        McpServer::new(role_registry(), McpTransport::Stdio)
+            .with_agent_state(ungated())
+            .with_services(
+                Arc::new(MemFlowStore::new()),
+                Arc::new(StubClient),
+                Arc::new(StdGuard::default()),
+                None,
+            ),
     );
     assert_eq!(srv.stdio_role(), Frontend::Mcp);
 
@@ -1010,4 +1027,221 @@ async fn client_label_captured_from_initialize() {
             .expect("json");
     assert_eq!(call["id"], json!(2));
     assert_eq!(call["result"]["structuredContent"], json!("aitm-mac"));
+}
+
+// ------------------------------------------------- M4 Task 4: policy gate
+
+/// A no-op command of a declared [`Sensitivity`], so the policy matrix can be
+/// exercised tier by tier. Returns `"ran"` when the gate lets it through.
+struct TierCmd {
+    name: &'static str,
+    sens: Sensitivity,
+}
+
+impl Command for TierCmd {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn sensitivity(&self) -> Sensitivity {
+        self.sens
+    }
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "stub".into(),
+            params: vec![],
+            result: TypeDesc::Str,
+        }
+    }
+    fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+        Ok(Value::Str("ran".into()))
+    }
+}
+
+/// A server whose registry carries one command per tier, two Sensitive stubs
+/// named after the config-gated commands (`ca.install`, `scope.add`), and the
+/// real `AgentPlugin` (so `agent.status`/`agent.set` are exercised end to end).
+/// `state` is shared with the server's policy gate; `config` feeds the per-command
+/// config gates the `Auto` policy consults for Sensitive commands.
+fn policy_server(state: Arc<AgentState>, config: Option<Arc<Config>>) -> McpServer {
+    let mut reg = Registry::new();
+    reg.add_command(Arc::new(TierCmd {
+        name: "demo.read",
+        sens: Sensitivity::Read,
+    }));
+    reg.add_command(Arc::new(TierCmd {
+        name: "demo.write",
+        sens: Sensitivity::Write,
+    }));
+    reg.add_command(Arc::new(TierCmd {
+        name: "demo.sensitive",
+        sens: Sensitivity::Sensitive,
+    }));
+    reg.add_command(Arc::new(TierCmd {
+        name: "ca.install",
+        sens: Sensitivity::Sensitive,
+    }));
+    reg.add_command(Arc::new(TierCmd {
+        name: "scope.add",
+        sens: Sensitivity::Sensitive,
+    }));
+    reg.add_plugin(Box::new(AgentPlugin::new(state.clone())));
+    let mut srv = McpServer::new(Arc::new(reg), McpTransport::Stdio)
+        .with_services(
+            Arc::new(MemFlowStore::new()),
+            Arc::new(StubClient),
+            Arc::new(StdGuard::default()),
+            None,
+        )
+        .with_agent_state(state);
+    if let Some(cfg) = config {
+        srv = srv.with_config(cfg);
+    }
+    srv
+}
+
+/// Call `name` with no arguments on a connection of `role`; parse the reply.
+fn call_as(srv: &McpServer, role: Frontend, name: &str) -> JsonValue {
+    call_as_args(srv, role, name, json!({}))
+}
+
+/// Call `name` with `args` on a connection of `role`; parse the reply.
+fn call_as_args(srv: &McpServer, role: Frontend, name: &str, args: JsonValue) -> JsonValue {
+    let req = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}});
+    let resp = srv
+        .handle_on(&ConnCtx::new(role), &req.to_string())
+        .expect("a request gets a response");
+    serde_json::from_str(&resp).expect("response is JSON")
+}
+
+/// Whether a `tools/call` reply is a tool error (a policy refusal, or any other
+/// command error).
+fn is_refused(resp: &JsonValue) -> bool {
+    resp["result"]["isError"] == json!(true)
+}
+
+/// AC-M4-4: the five-mode policy matrix, enforced for the agent role, over a
+/// Read / Write / Sensitive (no config gate) command. Expected `[read, write,
+/// sensitive]` run-outcomes per the spec D2 table.
+#[test]
+fn policy_matrix_for_agent() {
+    let cases = [
+        (AgentPolicy::Paused, [false, false, false]),
+        (AgentPolicy::ReadOnly, [true, false, false]),
+        (AgentPolicy::Auto, [true, true, false]),
+        // `Ask` allows Read+Write; a Sensitive call is parked for operator
+        // approval (Task 9) and until then refused, so it does not run here.
+        (AgentPolicy::Ask, [true, true, false]),
+        (AgentPolicy::All, [true, true, true]),
+    ];
+    for (policy, [read, write, sensitive]) in cases {
+        let srv = policy_server(Arc::new(AgentState::new(policy)), None);
+        let ran = |name: &str| !is_refused(&call_as(&srv, Frontend::Mcp, name));
+        assert_eq!(ran("demo.read"), read, "read under {policy:?}");
+        assert_eq!(ran("demo.write"), write, "write under {policy:?}");
+        assert_eq!(
+            ran("demo.sensitive"),
+            sensitive,
+            "sensitive under {policy:?}"
+        );
+    }
+}
+
+/// AC-M4-4: an operator (and the CLI) connection is never policy-gated — even a
+/// Write under `Paused` runs, where the agent is refused outright.
+#[test]
+fn operator_bypasses_policy() {
+    let srv = policy_server(Arc::new(AgentState::new(AgentPolicy::Paused)), None);
+    assert!(
+        is_refused(&call_as(&srv, Frontend::Mcp, "demo.write")),
+        "agent Write refused under Paused"
+    );
+    assert!(
+        !is_refused(&call_as(&srv, Frontend::Operator, "demo.write")),
+        "operator Write runs under Paused"
+    );
+    assert!(
+        !is_refused(&call_as(&srv, Frontend::Cli, "demo.write")),
+        "CLI Write runs under Paused"
+    );
+}
+
+/// Review Focus #2: the agent cannot change its own policy. Even under `All`
+/// (where the policy gate would not block a Sensitive call), `agent.set` is
+/// refused for the agent role and the policy is unchanged; an operator may set it.
+#[test]
+fn agent_cannot_set_policy() {
+    let state = Arc::new(AgentState::new(AgentPolicy::All));
+    let srv = policy_server(state.clone(), None);
+
+    let agent = call_as_args(
+        &srv,
+        Frontend::Mcp,
+        "agent.set",
+        json!({"policy": "paused"}),
+    );
+    assert!(is_refused(&agent), "agent agent.set is refused");
+    assert_eq!(
+        state.policy(),
+        AgentPolicy::All,
+        "policy unchanged by the agent"
+    );
+
+    let op = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "agent.set",
+        json!({"policy": "paused"}),
+    );
+    assert!(!is_refused(&op), "operator agent.set runs");
+    assert_eq!(op["result"]["structuredContent"]["policy"], json!("paused"));
+    assert_eq!(
+        state.policy(),
+        AgentPolicy::Paused,
+        "operator set takes effect"
+    );
+}
+
+/// AC-M4-5: `agent.status` is Read and readable by every role, reporting the
+/// current policy.
+#[test]
+fn agent_status_readable_by_any_role() {
+    let srv = policy_server(Arc::new(AgentState::new(AgentPolicy::Auto)), None);
+    for role in [Frontend::Mcp, Frontend::Operator, Frontend::Cli] {
+        let resp = call_as(&srv, role, "agent.status");
+        assert!(!is_refused(&resp), "agent.status refused for {role:?}");
+        assert_eq!(
+            resp["result"]["structuredContent"]["policy"],
+            json!("auto"),
+            "policy reported to {role:?}"
+        );
+    }
+}
+
+/// Review Focus #2: under `Auto`, the policy gate *defers* a config-gated
+/// Sensitive command (ca.install/uninstall, scope.add) to the command — which
+/// self-governs on its own `ca.allow_agent_install` / `scope.allow_agent_widen`
+/// flag, its dry-run escape, and its own audit — rather than pre-empting it, while
+/// any other Sensitive command is refused outright. (The flag-driven refuse/allow
+/// of the real commands is proven against the real wiring in `ca_frontends.rs`
+/// and the scope plugin's own tests; the stubs here carry no self-gate, so they
+/// run once the policy gate lets them through.) `Config::default()` is attached to
+/// prove the policy gate does not read the flag itself.
+#[test]
+fn auto_defers_config_gated_sensitive_to_the_command() {
+    let srv = policy_server(
+        Arc::new(AgentState::new(AgentPolicy::Auto)),
+        Some(Arc::new(Config::default())),
+    );
+    assert!(
+        !is_refused(&call_as(&srv, Frontend::Mcp, "ca.install")),
+        "ca.install is deferred to its own gate, not pre-empted by the policy gate"
+    );
+    assert!(
+        !is_refused(&call_as(&srv, Frontend::Mcp, "scope.add")),
+        "scope.add is deferred to its own gate"
+    );
+    assert!(
+        is_refused(&call_as(&srv, Frontend::Mcp, "demo.sensitive")),
+        "a Sensitive command with no config gate is refused outright under Auto"
+    );
 }

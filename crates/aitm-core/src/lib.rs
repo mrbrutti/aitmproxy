@@ -25,7 +25,7 @@ pub mod store;
 pub mod stream;
 pub mod value;
 
-pub use agent::AgentPolicy;
+pub use agent::{AgentPolicy, AgentState};
 pub use authority::{Authority, AuthorityError};
 pub use body::{Body, StreamBody};
 pub use chain::Chain;

@@ -10,9 +10,10 @@ use std::time::SystemTime;
 
 use aitm_cli::{Cli, Confirmer, TtyConfirmer};
 use aitm_core::{
-    Body, Command, CommandHost, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, Frontend, HeaderMap,
-    HttpFlow, HttpRequest, HttpVersion, InterceptState, McpTransport, MemFlowStore, ParamDef,
-    ParamSchema, Params, Plugin, ProxyClient, Registry, StdGuard, TypeDesc, Value,
+    AgentPolicy, AgentState, Body, Command, CommandHost, ConnInfo, Flow, FlowId, FlowMeta,
+    FlowStore, Frontend, HeaderMap, HttpFlow, HttpRequest, HttpVersion, InterceptState,
+    McpTransport, MemFlowStore, ParamDef, ParamSchema, Params, Plugin, ProxyClient, Registry,
+    StdGuard, TypeDesc, Value,
 };
 use aitm_mcp::json::from_json;
 use aitm_mcp::McpServer;
@@ -246,12 +247,17 @@ fn cli_matches_mcp() {
         .dispatch(&argv(&["flow", "list"]))
         .expect("cli dispatch ok");
 
-    let mcp = McpServer::new(reg, McpTransport::Stdio).with_services(
-        store,
-        Arc::new(StubClient),
-        Arc::new(StdGuard::default()),
-        None,
-    );
+    // The local `flow.list` stub declares no `sensitivity()`, so it is the
+    // fail-closed `Sensitive` default; this test compares the CLI and MCP result
+    // values, not the M4 policy gate, so it runs ungated (`All`).
+    let mcp = McpServer::new(reg, McpTransport::Stdio)
+        .with_agent_state(Arc::new(AgentState::new(AgentPolicy::All)))
+        .with_services(
+            store,
+            Arc::new(StubClient),
+            Arc::new(StdGuard::default()),
+            None,
+        );
     let req = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                      "params": {"name": "flow.list", "arguments": {}}});
     let resp: JsonValue =

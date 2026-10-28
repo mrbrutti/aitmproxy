@@ -17,10 +17,10 @@ use std::sync::Arc;
 
 use aitm_browser::BrowserPlugin;
 use aitm_ca::CaPlugin;
-use aitm_core::{Config, Plugin, Proxy, Registry};
+use aitm_core::{AgentState, Config, Plugin, Proxy, Registry};
 use aitm_plugins::{
-    CapturePlugin, ControlPlugin, DetailPlugin, InterceptPlugin, MetaPlugin, MutatePlugin,
-    RateLimitPlugin, ReplayPlugin, ScopePlugin,
+    AgentPlugin, CapturePlugin, ControlPlugin, DetailPlugin, InterceptPlugin, MetaPlugin,
+    MutatePlugin, RateLimitPlugin, ReplayPlugin, ScopePlugin,
 };
 use aitm_proto_http::{CertAuthority, HttpModule};
 use aitm_proto_ws::WsModule;
@@ -53,6 +53,10 @@ pub struct Assembled {
     /// Set `true` once the proxy is actually serving, so `proxy.status.listening`
     /// is honest (a one-shot `aitm proxy status` that never serves reports `false`).
     pub listening: Arc<std::sync::atomic::AtomicBool>,
+    /// The agent policy state, seeded from `cfg.mcp.policy` and shared with the
+    /// `AgentPlugin` already registered; hand it to `McpServer::with_agent_state`
+    /// so the server's policy gate reads the same policy `agent.set` writes.
+    pub agent_state: Arc<AgentState>,
 }
 
 /// The scripting tier, ready to take its place in the chain (M3 spec §8).
@@ -142,13 +146,17 @@ pub fn assemble_with_scripts(
     for plugin in scripts.plugins {
         builder = builder.register_plugin(plugin);
     }
+    // The agent policy state, shared between the `AgentPlugin` (agent.status/set)
+    // and the MCP server's policy gate; seeded from config.
+    let agent_state = Arc::new(AgentState::new(cfg.mcp.policy));
     builder = builder
-        // Command providers: the browser, poc and ca commands.
+        // Command providers: the browser, poc, ca and agent commands.
         .register_plugin(Box::new(BrowserPlugin::new(cfg.browser.ssrf.clone())))
         .register_plugin(Box::new(PocCommands {
             executor: scripts.executor,
         }))
-        .register_plugin(Box::new(ca_plugin));
+        .register_plugin(Box::new(ca_plugin))
+        .register_plugin(Box::new(AgentPlugin::new(agent_state.clone())));
     if let Some(commands) = scripts.commands {
         builder = builder.register_plugin(commands);
     }
@@ -157,6 +165,7 @@ pub fn assemble_with_scripts(
         proxy: builder.build()?,
         ca,
         listening,
+        agent_state,
     })
 }
 

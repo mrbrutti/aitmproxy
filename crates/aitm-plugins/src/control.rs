@@ -63,6 +63,10 @@ impl Command for ProxyStatus {
         "proxy.status"
     }
 
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Read
+    }
+
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description:
@@ -191,6 +195,10 @@ struct ConfigGet;
 impl Command for ConfigGet {
     fn name(&self) -> &str {
         "config.get"
+    }
+
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Read
     }
 
     fn schema(&self) -> ParamSchema {

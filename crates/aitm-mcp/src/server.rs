@@ -10,8 +10,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use aitm_core::{
-    BrowserDriver, CommandHost, FlowStore, Frontend, McpTransport, ProxyClient, Registry,
-    ScopeRateGuard, SsrfPolicy,
+    AgentPolicy, AgentState, BrowserDriver, Command, CommandHost, FlowStore, Frontend,
+    McpTransport, ProxyClient, Registry, ScopeRateGuard, Sensitivity, SsrfPolicy,
 };
 use serde_json::{json, Map, Value as JsonValue};
 
@@ -86,6 +86,10 @@ pub struct McpServer {
     operator_token: Option<Arc<str>>,
     /// The role a stdio connection speaks as (default [`Frontend::Mcp`]).
     stdio_role: Frontend,
+    /// The agent policy in effect, enforced by [`McpServer::call_tool`] for the
+    /// agent role. Shared with the `AgentPlugin`, so an operator `agent.set` is
+    /// seen here at once.
+    agent_state: Arc<AgentState>,
 }
 
 /// A JSON-RPC level failure (as opposed to a tool's own error result).
@@ -117,7 +121,17 @@ impl McpServer {
             config: None,
             operator_token: None,
             stdio_role: Frontend::Mcp,
+            // The milestone default; wiring overrides it from `McpConfig.policy`.
+            agent_state: Arc::new(AgentState::new(AgentPolicy::Auto)),
         }
+    }
+
+    /// The shared agent-policy state the policy gate reads and `agent.set` writes.
+    /// Wiring seeds it from `McpConfig.policy` and hands the same `Arc` to the
+    /// `AgentPlugin`.
+    pub fn with_agent_state(mut self, agent_state: Arc<AgentState>) -> Self {
+        self.agent_state = agent_state;
+        self
     }
 
     /// The operator token (loopback TCP) and the stdio connection's role. The
@@ -194,6 +208,7 @@ impl McpServer {
             config,
             operator_token,
             stdio_role,
+            agent_state,
         } = self;
         let on_bound = on_bound.into_inner().unwrap_or(None);
         let server = Arc::new(McpServer {
@@ -206,6 +221,7 @@ impl McpServer {
             config,
             operator_token: operator_token.clone(),
             stdio_role,
+            agent_state,
         });
         match selected {
             McpTransport::Stdio => transport::serve_stdio(server).await,
@@ -331,6 +347,11 @@ impl McpServer {
             .registry
             .command(name)
             .ok_or_else(|| RpcError::new(INVALID_PARAMS, format!("unknown tool `{name}`")))?;
+        // The agent policy gate (D2), before anything runs. Only the agent role
+        // is gated; an operator or the CLI is the control and bypasses it.
+        if let Some(reason) = self.policy_refusal(conn, cmd.as_ref()) {
+            return Ok(tool_error(reason));
+        }
         let services = self.services.as_ref().ok_or_else(|| {
             RpcError::new(
                 INTERNAL_ERROR,
@@ -373,6 +394,75 @@ impl McpServer {
             // A failing command is a tool result, not a protocol failure.
             Err(e) => tool_error(format!("{e:#}")),
         })
+    }
+
+    /// The D2 policy decision for one command on one connection: `Some(reason)`
+    /// when the agent policy refuses it, `None` when it may proceed. Only the
+    /// agent role (`Frontend::Mcp`) is gated — `Operator`/`Cli` are the control.
+    fn policy_refusal(&self, conn: &ConnCtx, cmd: &dyn Command) -> Option<String> {
+        if conn.role != Frontend::Mcp {
+            return None;
+        }
+        let policy = self.agent_state.policy();
+        let sens = cmd.sensitivity();
+        let allowed = match (policy, sens) {
+            (AgentPolicy::All, _) => true,
+            (AgentPolicy::Auto, Sensitivity::Read | Sensitivity::Write) => true,
+            // Autonomous: a Sensitive command is refused unless it carries its own
+            // per-command agent config gate (ca.install/uninstall → ca.allow_agent_install,
+            // scope.add → scope.allow_agent_widen). Those are deferred to the
+            // command, which self-governs — honouring its config flag, dry-run
+            // escape, and its own audit/refusal — so the policy gate never pre-empts
+            // the command-level posture. A Sensitive command with no such gate is
+            // refused here (deny-by-default).
+            (AgentPolicy::Auto, Sensitivity::Sensitive) => defers_to_command_gate(cmd.name()),
+            (AgentPolicy::Ask, Sensitivity::Read | Sensitivity::Write) => true,
+            // `Ask` parks a Sensitive call for operator approval (Task 9); until
+            // that lands it is refused rather than run.
+            (AgentPolicy::Ask, Sensitivity::Sensitive) => false,
+            (AgentPolicy::ReadOnly, Sensitivity::Read) => true,
+            (AgentPolicy::ReadOnly, _) => false,
+            (AgentPolicy::Paused, _) => false,
+            // `AgentPolicy` is `#[non_exhaustive]`: a future posture fails closed.
+            _ => false,
+        };
+        if allowed {
+            None
+        } else {
+            Some(policy_refusal_reason(policy, sens, cmd.name()))
+        }
+    }
+}
+
+/// Whether a Sensitive command carries its own per-command agent config gate, so
+/// the `Auto` policy defers the agent's call to the command (which enforces the
+/// flag, dry-run, and audit) instead of pre-empting it (spec D2, "unless its
+/// config gate allows"). Any other Sensitive command is refused by the policy gate.
+fn defers_to_command_gate(name: &str) -> bool {
+    matches!(name, "ca.install" | "ca.uninstall" | "scope.add")
+}
+
+/// The refusal text for a command the agent policy blocked, tuned to why.
+fn policy_refusal_reason(policy: AgentPolicy, sens: Sensitivity, name: &str) -> String {
+    match policy {
+        AgentPolicy::Paused => format!(
+            "`{name}` refused: the agent policy is `paused`; no agent command runs. An operator can \
+             change it with agent.set."
+        ),
+        AgentPolicy::ReadOnly => format!(
+            "`{name}` refused: the agent policy is `readonly`; only read-only commands run. An \
+             operator can change it with agent.set."
+        ),
+        _ if sens == Sensitivity::Sensitive => format!(
+            "`{name}` refused: a sensitive command is not allowed to the agent under the `{}` \
+             policy without its config gate (e.g. ca.allow_agent_install, scope.allow_agent_widen). \
+             An operator can run or approve it, or open that gate.",
+            policy.label()
+        ),
+        _ => format!(
+            "`{name}` refused by the agent policy `{}`.",
+            policy.label()
+        ),
     }
 }
 

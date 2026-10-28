@@ -1,6 +1,8 @@
 //! `aitm-plugins` — first-party feature plugins (capture, replay, intercept,
-//! mutate, scope, rate-limit). Each registers its own commands; none lives in core.
+//! mutate, scope, rate-limit, agent). Each registers its own commands; none lives
+//! in core.
 
+pub mod agent;
 pub mod capture;
 pub mod control;
 pub mod detail;
@@ -11,6 +13,7 @@ pub mod ratelimit;
 pub mod replay;
 pub mod scope;
 
+pub use agent::AgentPlugin;
 pub use capture::CapturePlugin;
 pub use control::ControlPlugin;
 pub use detail::DetailPlugin;

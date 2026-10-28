@@ -29,9 +29,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use aitm::wire::{assemble_with_scripts, Assembled, Features, Http1Sender, ScriptWiring};
 use aitm_core::{
-    Body, Chain, Config, ConnInfo, Event, Flow, FlowCtx, FlowId, FlowMeta, FlowStore, HeaderMap,
-    HttpFlow, HttpRequest, HttpVersion, InterceptState, McpTransport, MemFlowStore, PipelineClient,
-    Plugin, ProxyClient, Registry, ScopeEntry, StdGuard, Verdict,
+    AgentPolicy, AgentState, Body, Chain, Config, ConnInfo, Event, Flow, FlowCtx, FlowId, FlowMeta,
+    FlowStore, HeaderMap, HttpFlow, HttpRequest, HttpVersion, InterceptState, McpTransport,
+    MemFlowStore, PipelineClient, Plugin, ProxyClient, Registry, ScopeEntry, StdGuard, Verdict,
 };
 use aitm_plugin_rhai::{
     wire, MemoryFindingSink, RhaiConfig, ScriptEntry, ScriptPlugin, ScriptServices,
@@ -537,12 +537,18 @@ async fn script_command_over_frontends() {
 
     // MCP tools/list includes the script command — and the tier's own three
     // (spec §3/§8: `script.validate`, `script.reload`, `findings.list`).
-    let server = aitm_mcp::McpServer::new(registry.clone(), McpTransport::Stdio).with_services(
-        Arc::new(MemFlowStore::new()),
-        Arc::new(StubClient) as Arc<dyn ProxyClient>,
-        Arc::new(StdGuard::default()),
-        None,
-    );
+    // A Rhai-registered command declares no `sensitivity()`, so it is the
+    // fail-closed `Sensitive` default; this test is about reachability over the
+    // frontends, not the M4 policy gate, so it runs under the permissive `All`
+    // policy where the agent may call a Sensitive command.
+    let server = aitm_mcp::McpServer::new(registry.clone(), McpTransport::Stdio)
+        .with_agent_state(Arc::new(AgentState::new(AgentPolicy::All)))
+        .with_services(
+            Arc::new(MemFlowStore::new()),
+            Arc::new(StubClient) as Arc<dyn ProxyClient>,
+            Arc::new(StdGuard::default()),
+            None,
+        );
     let req = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}});
     let resp: serde_json::Value =
         serde_json::from_str(&server.handle(&req.to_string()).expect("a response"))
