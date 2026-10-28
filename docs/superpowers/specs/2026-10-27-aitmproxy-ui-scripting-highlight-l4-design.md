@@ -1,6 +1,6 @@
 # Operator-UI scripting, highlighting & L4 design
 
-**Status:** draft for Matt's approval, 2026-10-28. Design only; nothing here is built.
+**Status:** approved (2026-10-28 by Matt — "as drafted," so each open question is resolved to its proposed default; see Open questions). Design only; nothing here is built.
 **Extends:** `docs/design/operator-ui-foundation.md` (the shared operator-UI foundation — this spec is an addition to it, consistent with its palette/type/components) and its companions `docs/design/tokens.json`, `docs/design/mockup/index.html`.
 **Companion specs:** plugin system / Rhai — `docs/superpowers/specs/2026-10-27-aitmproxy-plugin-system-design.md`; PoC language — `docs/superpowers/specs/2026-10-27-aitmproxy-poc-language-design.md`; platform — `docs/superpowers/specs/2026-10-27-aitmproxy-platform-design.md`; L4 (M5) — `claude/m4-l4-spec-10eea7` branch.
 **Surfaces:** the three human-operator UIs the foundation defines — macOS (SwiftUI/AppKit, `apps/mac`), web (SolidJS + CodeMirror 6, `apps/web`), TUI (Rust/ratatui, `crates/aitm-tui`). Each is an unmerged branch at writing (web PR #3, TUI PR #5, macOS in flight).
@@ -293,9 +293,9 @@ Observable and testable on each surface's existing harness (web vitest + `shot.m
 
 ## Open questions
 
-Only Matt can answer these; empty when approved.
+Resolved at approval (2026-10-28, Matt approved "as drafted" → each proposed default accepted):
 
-1. **L4 badge hue.** L4 needs a list/badge colour distinct from accent-blue, intercept-amber, agent-teal, and WS-magenta. I propose a **slate/indigo** pair added to `tokens.json` (`color.l4.*`), with `TCP`/`UDP`/`ICMP` as sub-labels in that one hue. Accept slate/indigo, or pick the colour? (Palette is yours per foundation OQ1–2.)
-2. **Agent authoring gate default.** I propose `scripts.allow_agent_authoring` **off** by default (agent cannot save/reload/enable scripts), mirroring `ca.allow_agent_install` and `scope.allow_agent_widen`; the human authors freely. Confirm off-by-default.
-3. **The registry-sealed limitation.** A script that registers new *commands/options* needs a restart to activate them (`script.reload` swaps hooks only). I propose accepting this for now — hooks reload live, a restart banner covers commands/options — and deferring "hot command registration" as a possible later core follow-up rather than building it now. Accept the limitation, or should hot-registration be a committed follow-up?
-4. **Filter vocabulary extension.** Part 3 adds `~l4 ~tcp ~udp ~icmp` atoms and an `L4` chip to the shared filter grammar. Confirm that vocabulary (it becomes part of the portable grammar all three surfaces share and test against).
+1. **L4 badge hue** → **slate/indigo** `color.l4.*` added to `tokens.json` (light/dark + TUI ANSI), with `TCP`/`UDP`/`ICMP` as sub-labels in that one hue. (Revisit if the hue clashes once rendered.)
+2. **Agent authoring gate default** → `scripts.allow_agent_authoring` **off** by default (agent cannot save/reload/enable/disable scripts; `script.validate` stays agent-allowed); humans author freely.
+3. **Registry-sealed limitation** → **accepted**: `script.reload` swaps hooks live; new commands/options need a restart (surfaced via the restart banner). "Hot command registration" is **deferred**, not a committed follow-up.
+4. **Filter vocabulary** → **confirmed**: `~l4 ~tcp ~udp ~icmp` atoms and an `L4` chip join the shared `filter.grammar.json` and the conformance fixture.
