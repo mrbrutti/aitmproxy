@@ -11,4 +11,5 @@
 
 pub mod config;
 pub mod craft;
+pub mod guard;
 pub mod types;
