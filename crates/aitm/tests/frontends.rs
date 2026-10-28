@@ -1,6 +1,6 @@
 //! Task 28 / AC7 / AC8, M2 Task 21 / M2-AC17: the real wired command set,
-//! exercised through both frontends. Proves the exact 22-tool `tools/list`
-//! (the 18 M1 tools plus `ca.*`), that the six `browser.*` schemas match the
+//! exercised through both frontends. Proves the exact `tools/list` (the M2 tools
+//! plus the operator-command additions), that the six `browser.*` schemas match the
 //! checked-in snapshot, that an open `headers` map (TypeDesc::Map) round-trips
 //! through MCP and the CLI into a mutated flow, and that poc.run's `vars` map
 //! is coerced rather than rejected.
@@ -129,7 +129,7 @@ fn rpc(server: &McpServer, id: u64, method: &str, params: JsonValue) -> JsonValu
 }
 
 #[test]
-fn ac7_exact_twenty_two_tools() {
+fn ac7_exact_tool_set() {
     let proxy = build_proxy(&config("ac7")).expect("build proxy");
     let server = McpServer::new(proxy.registry_arc(), McpTransport::Stdio);
     let resp = rpc(&server, 1, "tools/list", json!({}));
