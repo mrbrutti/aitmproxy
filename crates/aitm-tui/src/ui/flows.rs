@@ -18,17 +18,22 @@ use crate::ui::{selection_bg, FrameView};
 /// swatch left of `#`").
 pub const MARK_SWATCH: &str = "▍";
 
-/// The token nearest to one of Proxyman's mark colours; `None` for a name
-/// the TUI does not know (it then draws no swatch).
+/// The `color.mark.*` token for one of the eleven mark colours the surfaces
+/// share (tokens.json, 2026-10-28), with Proxyman's older names as aliases;
+/// `None` for a name the TUI does not know (it then draws no swatch).
 pub fn mark_color(mark: &str) -> Option<&'static ColorToken> {
     Some(match mark.to_ascii_lowercase().as_str() {
-        "red" => &color::status::SERVER_ERROR,
-        "orange" => &color::status::PENDING,
-        "yellow" => &color::status::CLIENT_ERROR,
-        "green" => &color::status::SUCCESS,
-        "sky" | "cyan" | "teal" => &color::status::REDIRECT,
-        "blue" => &color::accent::BASE,
-        "violet" | "purple" | "pink" => &color::status::INFORMATIONAL,
+        "red" => &color::mark::RED,
+        "orange" => &color::mark::ORANGE,
+        "yellow" => &color::mark::YELLOW,
+        "green" => &color::mark::GREEN,
+        "mint" => &color::mark::MINT,
+        "teal" => &color::mark::TEAL,
+        "cyan" | "sky" => &color::mark::CYAN,
+        "blue" => &color::mark::BLUE,
+        "indigo" => &color::mark::INDIGO,
+        "purple" | "violet" => &color::mark::PURPLE,
+        "pink" => &color::mark::PINK,
         "grey" | "gray" => &color::text::TERTIARY,
         _ => return None,
     })
@@ -479,11 +484,11 @@ mod tests {
             (y as u16, x)
         };
         // f42 (PUT cart item) is marked `sky`, human, not paused: swatch in the
-        // redirect (sky) token.
+        // shared `mark.cyan` token (sky is Proxyman's name for it).
         let (y, url_x) = find("/api/cart/items/42");
         let tick = buf.cell((url_x as u16 - 10, y)).unwrap();
         assert_eq!(tick.symbol(), MARK_SWATCH);
-        assert_eq!(tick.fg, theme.fg(&color::status::REDIRECT).fg.unwrap());
+        assert_eq!(tick.fg, theme.fg(&color::mark::CYAN).fg.unwrap());
         // f48 is marked `red` but agent-originated: the agent tick wins.
         let (y, url_x) = find("/api/search?q=");
         let tick = buf.cell((url_x as u16 - 10, y)).unwrap();
@@ -493,7 +498,7 @@ mod tests {
         let (y, url_x) = find("/api/products?category");
         assert_eq!(buf.cell((url_x as u16 - 10, y)).unwrap().symbol(), " ");
         // The palette map, by token.
-        assert_eq!(mark_color("Red"), Some(&color::status::SERVER_ERROR));
+        assert_eq!(mark_color("Red"), Some(&color::mark::RED));
         assert_eq!(mark_color("grey"), Some(&color::text::TERTIARY));
         assert_eq!(mark_color("gray"), Some(&color::text::TERTIARY));
         assert_eq!(mark_color("chartreuse"), None);
