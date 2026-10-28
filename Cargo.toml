@@ -11,6 +11,7 @@ members = [
     "crates/aitm-poc",
     "crates/aitm-mcp",
     "crates/aitm-cli",
+    "crates/aitm-testtarget",
     "crates/aitm",
 ]
 
@@ -46,3 +47,4 @@ aitm-ca = { path = "crates/aitm-ca" }
 aitm-poc = { path = "crates/aitm-poc" }
 aitm-mcp = { path = "crates/aitm-mcp" }
 aitm-cli = { path = "crates/aitm-cli" }
+aitm-testtarget = { path = "crates/aitm-testtarget" }
