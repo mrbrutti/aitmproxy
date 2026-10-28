@@ -19,6 +19,7 @@ This folder holds the reference research gathered while defining **aitmproxy**
 | [05-synthesis.md](05-synthesis.md) | — | Combined design takeaways for aitmproxy |
 | [06-obscura-embedding.md](06-obscura-embedding.md) | obscura | Embedding obscura as aitmproxy's browser engine: embeddability, CDP surface, MITM/CA gap |
 | [07-ca-install.md](07-ca-install.md) | mkcert, mitmproxy, Burp, OS trust-store tools | Exporting/installing/uninstalling/checking the root CA on macOS, Linux, Windows: exact commands, exit codes, idempotency, SHA-256 vs SHA-1 keys |
+| [07-rhai-embedding.md](07-rhai-embedding.md) | Rhai | Embedding Rhai (M3): compile/call_fn, type marshalling, sandbox limits, the sync/async host-fn bridge, hot-reload |
 | [MEMORY.md](MEMORY.md) | — | Project memory: durable facts and decisions |
 
 ## Reference projects

@@ -55,6 +55,22 @@ pub struct Assembled {
     pub listening: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// The scripting tier, ready to take its place in the chain (M3 spec §8).
+#[derive(Default)]
+pub struct ScriptWiring {
+    /// Plugins in declaration order. They are registered after the first-party
+    /// feature plugins and before the command providers, so a script sees a
+    /// flow once capture/scope/rate-limit/intercept/mutate have acted and its
+    /// `halt()` short-circuits everything after it.
+    pub plugins: Vec<Box<dyn Plugin>>,
+    /// Runs a PoC's `script` steps. `None` leaves `poc.run` declarative-only,
+    /// erroring on a `script` step rather than skipping it.
+    pub executor: Option<Arc<dyn aitm_poc::ScriptStepExecutor>>,
+    /// The tier's command plugin (`script.validate`, `script.reload`,
+    /// `findings.list`), registered among the command providers.
+    pub commands: Option<Box<dyn Plugin>>,
+}
+
 /// Assemble the proxy from configuration with the default feature set.
 pub fn assemble(cfg: &Config) -> anyhow::Result<Assembled> {
     assemble_with(cfg, &Features::default())
@@ -62,6 +78,15 @@ pub fn assemble(cfg: &Config) -> anyhow::Result<Assembled> {
 
 /// Assemble the proxy from configuration and an explicit feature set.
 pub fn assemble_with(cfg: &Config, features: &Features) -> anyhow::Result<Assembled> {
+    assemble_with_scripts(cfg, features, ScriptWiring::default())
+}
+
+/// Assemble the proxy with the scripting tier wired in.
+pub fn assemble_with_scripts(
+    cfg: &Config,
+    features: &Features,
+    scripts: ScriptWiring,
+) -> anyhow::Result<Assembled> {
     // Refuse a PoC output dir that would expose the CA key: `poc.artifact` serves
     // files under `poc.out_dir`, so it must not equal or contain `ca.dir`.
     if let Some(out_dir) = &cfg.poc.out_dir {
@@ -111,11 +136,22 @@ pub fn assemble_with(cfg: &Config, features: &Features) -> anyhow::Result<Assemb
         .unwrap_or_else(|| CaPlugin::new(cfg.ca.clone()));
     builder = builder
         .register_plugin(Box::new(ScopePlugin::new(cfg.scope.allow_agent_widen)))
-        .register_plugin(Box::new(RateLimitPlugin::new(cfg.limits.per_host_rps)))
+        .register_plugin(Box::new(RateLimitPlugin::new(cfg.limits.per_host_rps)));
+    // Scripts take their chain positions here: after every native plugin that
+    // acts on a flow, in the order the operator declared them (spec §8).
+    for plugin in scripts.plugins {
+        builder = builder.register_plugin(plugin);
+    }
+    builder = builder
         // Command providers: the browser, poc and ca commands.
         .register_plugin(Box::new(BrowserPlugin::new(cfg.browser.ssrf.clone())))
-        .register_plugin(Box::new(PocCommands))
+        .register_plugin(Box::new(PocCommands {
+            executor: scripts.executor,
+        }))
         .register_plugin(Box::new(ca_plugin));
+    if let Some(commands) = scripts.commands {
+        builder = builder.register_plugin(commands);
+    }
 
     Ok(Assembled {
         proxy: builder.build()?,
@@ -137,7 +173,12 @@ pub fn build_proxy_with(cfg: &Config, features: &Features) -> anyhow::Result<Pro
 /// A plugin that registers the `poc.build` and `poc.run` commands. The poc crate
 /// exposes free `register` functions rather than a plugin; this adapts them into
 /// the one `load`-driven registration path the builder uses.
-struct PocCommands;
+///
+/// With a script executor, `poc.run` dispatches `script` steps through the Rhai
+/// tier; without one it is the declarative M1 command.
+struct PocCommands {
+    executor: Option<Arc<dyn aitm_poc::ScriptStepExecutor>>,
+}
 
 impl Plugin for PocCommands {
     fn name(&self) -> &str {
@@ -146,7 +187,10 @@ impl Plugin for PocCommands {
 
     fn load(&mut self, reg: &mut Registry) {
         aitm_poc::builder::register(reg);
-        aitm_poc::runner::register(reg);
+        match self.executor.clone() {
+            Some(exec) => aitm_poc::runner::register_with_executor(reg, exec),
+            None => aitm_poc::runner::register(reg),
+        }
         aitm_poc::library::register(reg);
     }
 }
