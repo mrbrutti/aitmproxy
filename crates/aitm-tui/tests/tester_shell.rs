@@ -100,8 +100,9 @@ fn shell_regions_render_in_the_mockup_order_at_200x50() {
         "{:?}",
         sidebar("  Scope")
     );
+    // Two recorded runs plus the library-only third PoC (C8).
     assert!(
-        sidebar("  Findings").ends_with("2│"),
+        sidebar("  Findings").ends_with("3│"),
         "{:?}",
         sidebar("  Findings")
     );
@@ -214,8 +215,9 @@ fn shell_regions_render_in_the_mockup_order_at_200x50() {
             "hint {hint:?} missing from {status:?}"
         );
     }
+    // Two runs plus the library-only third PoC (C8).
     assert!(
-        status.contains("11 / 15 rows · 2 paused · 14 in scope · 2 findings"),
+        status.contains("11 / 15 rows · 2 paused · 14 in scope · 3 findings"),
         "{status}"
     );
     assert!(status.contains("● bus fixture"), "{status}");
@@ -369,10 +371,11 @@ fn empty_states_keep_the_frame_and_say_the_trades_words() {
     assert!(text.contains("– / 0 rows · 0 in scope"), "{text}");
     assert!(text.contains("URL"), "the header stays in view: {text}");
 
-    // Without a listen address the words stay generic and the pill says why.
+    // Without a listen address the words stay generic and the pill says why
+    // (the F7 label needs a bus without `proxy.status`: the pre-merge core).
     let mut unknown = App::new(TermCaps::full(), "x");
     let _ = unknown.update(Action::Resize(160, 30));
-    let _ = connect(&mut unknown, CORE_TOOLS, None);
+    let _ = connect(&mut unknown, PRE_MERGE_TOOLS, None);
     let text = text_of(&unknown, 160, 30);
     assert!(
         text.contains("No flows yet — point a client at the proxy or open the browser."),
@@ -692,7 +695,9 @@ fn palette_overlay_survives_short_terminals() {
 fn five_thousand_flows_ingest_and_render_within_bounds() {
     let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
     let _ = app.update(Action::Resize(200, 50));
-    let _ = connect(&mut app, CORE_TOOLS, Some("127.0.0.1:8080"));
+    // A bus without `flow.detail`, so ingest is measured without the 5000
+    // detail fetches the lit core would ask for.
+    let _ = connect(&mut app, PRE_MERGE_TOOLS, Some("127.0.0.1:8080"));
     let _ = app.on_bus(BusEvent::Scope(vec!["*.shop-staging.test".into()]));
     let methods = ["GET", "POST", "PUT", "DELETE"];
     let summaries: Vec<_> = (0..5000usize)
@@ -912,43 +917,63 @@ fn inspector_frames_with_a_five_megabyte_body_stay_under_two_seconds() {
 }
 
 /// The honest second snapshot (`aitm-tui --snapshot-core`): the fixture
-/// limited to the 22 commands the bus serves today (foundation §4.1), so the
-/// screen shows what an operator gets against the real core — no detail,
-/// agent or findings data, every F-gated surface in its degraded state.
+/// limited to the 37 commands the bus serves today (the 2026-10-28 core
+/// merge). F5/F6/F7/F12/F13 and the M3 commands are lit; only the F1 agent
+/// tools are still ahead of the core, so the agent surface alone degrades.
 #[test]
-fn fixture_app_core_offers_exactly_the_22_core_tools_and_no_f_gated_data() {
+fn fixture_app_core_offers_exactly_the_37_core_tools_and_only_f1_degrades() {
     let app = fixture_app_core(200, 50);
     let mut names: Vec<&str> = app.tools.iter().map(|t| t.name.as_str()).collect();
     names.sort_unstable();
     let mut want: Vec<&str> = CORE_TOOLS.to_vec();
     want.sort_unstable();
     assert_eq!(names, want);
-    assert_eq!(app.tools.len(), 22);
-    for gated in ["flow.detail", "agent.status", "poc.list", "proxy.status"] {
-        assert!(!app.has_tool(gated), "{gated} is not a core tool");
+    assert_eq!(app.tools.len(), 37);
+    for lit in [
+        "flow.detail",
+        "flow.mark",
+        "flow.comment",
+        "proxy.status",
+        "proxy.pause",
+        "proxy.resume",
+        "flow.clear",
+        "config.get",
+        "scope.remove",
+        "poc.list",
+        "poc.get",
+        "poc.artifact",
+        "findings.list",
+        "script.reload",
+        "script.validate",
+    ] {
+        assert!(app.has_tool(lit), "{lit} is on today's core");
+    }
+    for gated in ["agent.status", "agent.set"] {
+        assert!(!app.has_tool(gated), "{gated} is still F1");
     }
     assert_eq!(app.flows.len(), 15, "the same recorded flows");
-    assert!(
-        app.details.is_empty(),
-        "no flow.detail on the core bus, so no detail is loaded"
-    );
+    assert_eq!(app.details.len(), 15, "flow.detail is on the core bus");
     assert!(
         app.flows
             .iter()
-            .all(|f| f.duration_ms.is_none() && f.tls.is_none()),
-        "the F5 columns stay dashes"
+            .all(|f| f.tls.is_some() && f.req_size.is_some()),
+        "the F5 columns are filled from flow.detail"
     );
-    assert!(app.findings.is_empty(), "poc.list is F-gated");
+    assert_eq!(
+        app.findings.len(),
+        3,
+        "the library plus the two recorded runs"
+    );
     assert_eq!(app.agent.policy, None, "agent.status is F-gated");
-    // `proxy.status` (F7) is what reports the listen address; without it
-    // the core app does not know one (SP-1).
-    assert_eq!(app.listening, None);
+    assert_eq!(app.listening.as_deref(), Some("127.0.0.1:8080"));
+    assert_eq!(app.serving, Some(true));
     assert_eq!(app.selected.as_deref(), Some("f50"));
 
-    // The full fixture is the richer one; the core one renders without panicking.
-    assert!(fixture_app(200, 50).tools.len() > 22);
+    // The full fixture only adds the F1 tools; the core one renders.
+    assert_eq!(fixture_app(200, 50).tools.len(), 39);
     let text = text_of(&app, 200, 50);
     assert!(text.contains("11 / 15 rows"), "{text}");
+    assert!(text.contains("Agent · n/a (F1)"), "{text}");
 }
 
 #[test]

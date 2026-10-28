@@ -17,7 +17,7 @@ use aitm_tui::fixture_app;
 use aitm_tui::keys;
 use aitm_tui::model::{
     scope_covers, AgentPolicy, AgentState, Finding, FlowDetail, FlowKind, FlowRow, Intercept,
-    Message, Meta, Origin, Severity,
+    Message, Meta, Origin, Severity, WsDir,
 };
 use aitm_tui::ui::text::{elide_middle, fit, right, truncate, width};
 use aitm_tui::viewers;
@@ -46,7 +46,7 @@ fn flow_detail_from_json_tolerates_empty_and_wrongly_typed_input() {
 
     let d = FlowDetail::from_json(&json!({
         "id":"x","kind":7,"request":"nope","response":[1],"client_conn":true,"server_conn":null,
-        "meta":"m","frames":"f","intercept":42,"edited":"yes"
+        "meta":"m","messages":"f","intercept":42,"edited":"yes"
     }))
     .unwrap();
     assert_eq!(d.kind, FlowKind::Http);
@@ -55,7 +55,7 @@ fn flow_detail_from_json_tolerates_empty_and_wrongly_typed_input() {
     assert!(d.client_conn.is_none());
     assert!(d.server_conn.is_none());
     assert_eq!(d.meta, Meta::default());
-    assert!(d.frames.is_empty());
+    assert!(d.messages.is_empty());
     assert_eq!(d.intercept, Intercept::Observed);
     assert!(!d.edited);
 
@@ -80,16 +80,20 @@ fn flow_detail_from_json_tolerates_empty_and_wrongly_typed_input() {
     assert_eq!(resp.content_type(), None);
     assert_eq!(resp.body_text(), Some(""));
 
-    // Frames with missing fields.
+    // Messages with missing fields (the core's `messages`, C1): an absent or
+    // unknown direction is `None`, never guessed.
     let d = FlowDetail::from_json(
-        &json!({"id":"w","kind":"websocket","frames":[{}, {"dir":"c2s","data":"aGk="}, 7]}),
+        &json!({"id":"w","kind":"websocket","messages":[{}, {"dir":"client_to_server","data":"aGk="}, 7]}),
     )
     .unwrap();
     assert_eq!(d.kind, FlowKind::WebSocket);
-    assert_eq!(d.frames.len(), 3);
-    assert_eq!(d.frames[0].dir, "?");
-    assert_eq!(d.frames[0].opcode, "text");
-    assert_eq!(d.frames[1].data, b"hi");
+    assert_eq!(d.messages.len(), 3);
+    assert_eq!(d.messages[0].dir, None);
+    assert_eq!(d.messages[0].opcode, "text");
+    assert_eq!(d.messages[0].timestamp, None);
+    assert_eq!(d.messages[1].dir, Some(WsDir::ClientToServer));
+    assert_eq!(d.messages[1].data, b"hi");
+    assert_eq!(d.messages[2].dir, None);
 
     // Through the app: a malformed detail for a known flow leaves the row as it was.
     let mut app = fixture_app(200, 50);

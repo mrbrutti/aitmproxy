@@ -230,9 +230,11 @@ fn finding_yaml_read_failure_is_shown_in_the_panel() {
                 .unwrap(),
         ]
     };
+    // A bus without `poc.get` (the pre-merge core): the YAML is read from
+    // disk on a loopback bus; with `poc.get` it would come over the bus (C9).
     let mut local = App::new(TermCaps::full(), "127.0.0.1:9090");
     let _ = local.update(Action::Resize(160, 40));
-    let _ = connect(&mut local, CORE_TOOLS, None);
+    let _ = connect(&mut local, PRE_MERGE_TOOLS, None);
     let _ = local.on_bus(BusEvent::Findings(findings()));
     let _ = local.update(Action::OpenFindings);
     let text = text_of(&local, 160, 40);
@@ -253,7 +255,7 @@ fn finding_yaml_read_failure_is_shown_in_the_panel() {
 
     let mut remote = App::new(TermCaps::full(), "10.0.0.5:9090");
     let _ = remote.update(Action::Resize(160, 40));
-    let _ = connect(&mut remote, CORE_TOOLS, None);
+    let _ = connect(&mut remote, PRE_MERGE_TOOLS, None);
     let _ = remote.on_bus(BusEvent::Findings(findings()));
     let _ = remote.update(Action::OpenFindings);
     let text = text_of(&remote, 160, 40);
@@ -267,14 +269,16 @@ fn finding_yaml_read_failure_is_shown_in_the_panel() {
 
 // --------------------------------------------- the honest core snapshot
 
-/// `--snapshot-core` (M-misc): against the 22 core tools the screen carries
-/// no data that only an F-gated tool could have produced, and every F-gated
-/// surface is labelled where the plan says (I1, Q11).
+/// `--snapshot-core` (M-misc), re-pinned after the 2026-10-28 core merge:
+/// against the 37 core tools the screen carries the F5/F13 data the core
+/// now serves — sizes, durations, headers, the PoC library — and only the
+/// surfaces still ahead of the core (F1 agent, F3 rules, F4 push, F10
+/// sessions, M3 scripts, the F5 cookie/timing tabs) keep their labels.
 #[test]
-fn core_fixture_render_has_no_f_gated_data_and_every_f_label() {
+fn core_fixture_render_is_lit_except_for_what_is_still_ahead_of_the_core() {
     let mut app = fixture_app_core(200, 50);
     let text = text_of(&app, 200, 50);
-    // Labels on the shell.
+    // Labels on the shell: what the core still lacks.
     for label in [
         "Cookies (F5)",
         "Timing (F5)",
@@ -283,9 +287,11 @@ fn core_fixture_render_has_no_f_gated_data_and_every_f_label() {
         "↑ — ↓ — (F4)",
         // Two recorded flows are paused, so the bar is the saturated one.
         "[d Kill · abort mode: reset (429/503 need F3)]",
+        "listening 127.0.0.1:8080",
     ] {
         assert!(text.contains(label), "{label:?} missing:\n{text}");
     }
+    assert!(!text.contains("F7"), "proxy.status is on the core: {text}");
     let sidebar = |needle: &str| -> String {
         line_with(&text, needle)
             .unwrap_or_else(|| panic!("sidebar item {needle:?}"))
@@ -314,12 +320,11 @@ fn core_fixture_render_has_no_f_gated_data_and_every_f_label() {
         sidebar("  Browser")
     );
     assert!(
-        sidebar("  Findings").ends_with("F13│"),
-        "no poc.list: {:?}",
+        sidebar("  Findings").ends_with("3│"),
+        "poc.list is on the core: {:?}",
         sidebar("  Findings")
     );
-    // No F5 data in the list: every Duration / Request / Response cell is a
-    // dash — no `ms`, no byte counts, no edited pencil, no TLS padlock state.
+    // F5 data in the list: durations and sizes are real.
     let header_y = line_index(&text, "URL").expect("list header");
     let rows: Vec<&str> = text
         .lines()
@@ -327,33 +332,31 @@ fn core_fixture_render_has_no_f_gated_data_and_every_f_label() {
         .take_while(|l| l.contains("https://") || l.contains("wss://"))
         .collect();
     assert_eq!(rows.len(), 15, "all 15 recorded flows are listed:\n{text}");
-    for row in &rows {
-        assert!(!row.contains(" ms"), "duration without flow.detail: {row}");
-        for unit in [" B ", " kB", " KB", " MB"] {
-            assert!(!row.contains(unit), "size without flow.detail: {row}");
-        }
-        assert!(
-            !row.contains(aitm_tui::tokens::glyph::COMPOSE),
-            "edited mark without flow.detail: {row}"
-        );
-    }
-    // The inspector says F5 instead of inventing headers.
+    // Nine recorded flows have a sub-second duration; f45's reads `1.21 s`.
     assert!(
-        text.contains("Headers and bodies need core follow-up F5 (flow.detail)"),
+        rows.iter().filter(|r| r.contains(" ms")).count() >= 9,
+        "durations from flow.detail:\n{text}"
+    );
+    assert!(rows.iter().any(|r| r.contains("1.21 s")), "{text}");
+    assert!(
+        rows.iter().any(|r| r.contains(" B ") || r.contains(" KB")),
+        "sizes from flow.detail:\n{text}"
+    );
+    // The inspector shows the paused request's headers, not an F5 label.
+    assert!(text.contains("x-forwarded-for"), "{text}");
+    assert!(
+        !text.contains("need core follow-up F5 (flow.detail)"),
         "{text}"
     );
-    assert!(!text.contains("x-forwarded-for"), "{text}");
-    // The status bar's counts are the real ones: no findings, no agent rate.
-    // (The in-scope count is pinned by `websocket_rows_on_the_core_bus_…`:
-    // today it reads 12 because the WebSocket row has no authority.)
+    // The status bar's counts: findings counted, no agent rate.
     let status = text.lines().last().unwrap();
     assert!(status.contains("11 / 15 rows · 2 paused · "), "{status}");
-    assert!(!status.contains("findings"), "{status}");
+    assert!(status.contains("3 findings"), "{status}");
     assert!(
         !text.contains("/min"),
         "no agent rate without agent.status: {text}"
     );
-    // The same screen in the inspector and the panels.
+    // The same screen in the panels.
     let _ = app.update(Action::OpenAgent);
     let text = text_of(&app, 200, 50);
     assert!(
@@ -362,10 +365,16 @@ fn core_fixture_render_has_no_f_gated_data_and_every_f_label() {
     );
     let _ = app.update(Action::Back);
     let _ = app.update(Action::OpenFindings);
-    assert!(text_of(&app, 200, 50).contains("No findings — build a PoC from any flow with P."));
+    let text = text_of(&app, 200, 50);
+    assert!(text.contains("Reflected XSS in /api/search q"), "{text}");
+    assert!(text.contains("· not run · r to run"), "{text}");
     let _ = app.update(Action::Back);
     let _ = app.update(Action::OpenScope);
-    assert!(text_of(&app, 200, 50).contains("readout needs F7, config.get"));
+    assert!(
+        text_of(&app, 200, 50).contains("rate limit: loading config.get…"),
+        "{}",
+        text_of(&app, 200, 50)
+    );
     // And the 100×30 shell the second SVG was taken at.
     let _ = app.update(Action::Back);
     let _ = app.update(Action::Resize(100, 30));
@@ -449,15 +458,26 @@ fn websocket_rows_on_the_core_bus_take_their_url_from_the_handshake_row() {
 /// it reads `0 B`. It must be a dash until at least one size is known.
 #[test]
 fn status_bar_total_is_a_dash_until_a_size_is_known() {
-    let core = fixture_app_core(200, 50);
-    assert!(core
+    // A bus without `flow.detail` (the pre-merge core) knows no sizes.
+    let mut old = App::new(TermCaps::full(), "x");
+    let _ = old.update(Action::Resize(200, 50));
+    let _ = connect(&mut old, PRE_MERGE_TOOLS, None);
+    let _ = old.on_bus(BusEvent::Flows(vec![summary(
+        "a",
+        "GET",
+        "h.test",
+        "/",
+        Some(200),
+        "observed",
+    )]));
+    assert!(old
         .flows
         .iter()
         .all(|r| r.req_size.is_none() && r.resp_size.is_none()));
-    let status = text_of(&core, 200, 50).lines().last().unwrap().to_string();
+    let status = text_of(&old, 200, 50).lines().last().unwrap().to_string();
     assert!(
         status.contains("— ↑ — ↓ — (F4)"),
-        "no size is known on the core bus: {status}"
+        "no size is known without flow.detail: {status}"
     );
     assert!(!status.contains("0 B ↑"), "{status}");
     // With details, the sum is real; with details whose bodies are all empty,

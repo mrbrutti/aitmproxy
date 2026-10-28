@@ -31,7 +31,22 @@ pub struct Fixture {
     pub agent: Value,
     pub tools: Vec<Value>,
     pub flows: Vec<Value>,
+    /// Recorded `poc.run` results (the `findings` key): what a run this
+    /// session would have answered. `poc.list` does not serve these — the
+    /// core's library lists files — so `fixture_app` replays them as
+    /// `CallOk { name: "poc.run" }`.
     pub findings: Vec<Value>,
+    /// The PoC library (`pocs` key): `poc.list` summaries and `poc.get`
+    /// bodies, each `{id, title, severity, poc_path, description, yaml}`.
+    pub pocs: Vec<Value>,
+    /// `poc.artifact` answers: artifact path → base64 bytes.
+    pub artifacts: Map<String, Value>,
+    /// The redacted `config.get` object (`config` key); `listen` and
+    /// `scope.entries` follow the fixture's live state.
+    pub config: Value,
+    /// `findings.list` entries (`script_findings` key): what Rhai scripts
+    /// recorded, in the plugin's shape.
+    pub script_findings: Vec<Value>,
     /// The embedded browser's page (`browser` key): its outer HTML and a PNG
     /// screenshot as base64. Empty when the document has no `browser`
     /// section; every `browser.*` call then fails like a proxy without an
@@ -101,6 +116,14 @@ impl Fixture {
             tools: arr("tools"),
             flows,
             findings: arr("findings"),
+            pocs: arr("pocs"),
+            artifacts: v
+                .get("artifacts")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
+            config: v.get("config").cloned().unwrap_or(Value::Null),
+            script_findings: arr("script_findings"),
             browser_dom: v
                 .pointer("/browser/dom")
                 .and_then(Value::as_str)
@@ -165,7 +188,7 @@ impl Fixture {
             o.insert(
                 "messages".into(),
                 Value::from(
-                    f.get("frames")
+                    f.get("messages")
                         .and_then(Value::as_array)
                         .map_or(0, Vec::len),
                 ),
@@ -189,7 +212,9 @@ impl Fixture {
         Value::Object(o)
     }
 
-    /// The `flow.detail` view: bodies and frames as base64.
+    /// The `flow.detail` view in the core's shape: bodies as base64 with
+    /// `body_size`; a WebSocket flow's `messages` with `data` as base64 and
+    /// `length`; the recorded `on_resume` never leaves the fixture.
     fn detail(f: &Value) -> Value {
         let mut d = f.clone();
         if let Some(obj) = d.as_object_mut() {
@@ -199,10 +224,11 @@ impl Fixture {
                     encode_body(m);
                 }
             }
-            if let Some(frames) = obj.get_mut("frames").and_then(Value::as_array_mut) {
-                for fr in frames.iter_mut().filter_map(Value::as_object_mut) {
-                    if let Some(Value::String(t)) = fr.remove("data_text") {
-                        fr.insert("data".into(), Value::String(base64::encode(t.as_bytes())));
+            if let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) {
+                for m in messages.iter_mut().filter_map(Value::as_object_mut) {
+                    if let Some(Value::String(t)) = m.remove("data_text") {
+                        m.insert("length".into(), Value::from(t.len()));
+                        m.insert("data".into(), Value::String(base64::encode(t.as_bytes())));
                     }
                 }
             }
@@ -377,10 +403,15 @@ impl Fixture {
                 }
                 Ok(Value::String(host))
             }
+            // `scope.remove {host}` → whether an entry was removed (exact match).
             "scope.remove" => {
-                let host = args.get("host").and_then(Value::as_str).unwrap_or("");
+                let host = args
+                    .get("host")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing `host`".to_string())?;
+                let before = self.scope.len();
                 self.scope.retain(|h| h != host);
-                Ok(Value::String(host.to_string()))
+                Ok(Value::Bool(self.scope.len() != before))
             }
             "poc.build" => {
                 let flow_id = args
@@ -414,10 +445,75 @@ impl Fixture {
                     "severity": "info", "target": args.get("target").cloned().unwrap_or(Value::Null),
                     "at": "2026-10-27T11:07:00.000Z", "origin": "human"
                 });
-                self.findings.insert(0, result.clone());
                 Ok(result)
             }
-            "poc.list" => Ok(Value::Array(self.findings.clone())),
+            // The PoC library as `aitm-poc`'s `library.rs` serves it: one
+            // summary per file, sorted by path; the YAML and description come
+            // from `poc.get`.
+            "poc.list" => {
+                let mut items: Vec<Value> = self
+                    .pocs
+                    .iter()
+                    .map(|p| {
+                        json!({
+                            "poc_path": p["poc_path"], "id": p["id"],
+                            "title": p["title"], "severity": p["severity"],
+                        })
+                    })
+                    .collect();
+                items.sort_by(|a, b| {
+                    a["poc_path"]
+                        .as_str()
+                        .unwrap_or("")
+                        .cmp(b["poc_path"].as_str().unwrap_or(""))
+                });
+                Ok(Value::Array(items))
+            }
+            "poc.get" => {
+                let path = args
+                    .get("poc_path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing `poc_path`".to_string())?;
+                let p = self
+                    .pocs
+                    .iter()
+                    .find(|p| p["poc_path"].as_str() == Some(path))
+                    .ok_or_else(|| {
+                        "poc.get: not found or outside the configured PoC directory".to_string()
+                    })?;
+                Ok(json!({
+                    "poc_path": path, "id": p["id"], "title": p["title"],
+                    "severity": p["severity"],
+                    "description": p.get("description").cloned().unwrap_or(Value::Null),
+                    "yaml": p.get("yaml").cloned().unwrap_or(Value::String(String::new())),
+                }))
+            }
+            // Bytes (base64 on the wire) for a known artifact; only the kinds
+            // `poc.run` writes, like the core.
+            "poc.artifact" => {
+                let path = args
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing `path`".to_string())?;
+                let ext = std::path::Path::new(path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                if !matches!(ext, "png" | "yaml" | "yml") {
+                    return Err("poc.artifact: only png, yaml, yml artifacts are served".into());
+                }
+                self.artifacts.get(path).cloned().ok_or_else(|| {
+                    "poc.artifact: not found or outside the configured PoC output directory"
+                        .to_string()
+                })
+            }
+            "findings.list" => Ok(json!({
+                "findings": self.script_findings.clone(),
+                "dropped": 0,
+            })),
+            "script.validate" | "script.reload" => {
+                Err("fixture has no scripts loaded; run against a live proxy".into())
+            }
             "agent.status" => Ok(self.agent.clone()),
             "agent.set" => {
                 let p = args
@@ -430,27 +526,75 @@ impl Fixture {
                 self.agent["policy"] = Value::String(p.into());
                 Ok(Value::String(p.into()))
             }
-            "proxy.status" => Ok(
-                json!({"listening": self.listening, "paused": self.capture_paused, "protocol": "HTTP/2"}),
-            ),
+            // The control plugin's shapes (F7).
+            "proxy.status" => {
+                let paused = self
+                    .flows
+                    .iter()
+                    .filter(|f| f.get("intercept").and_then(Value::as_str) == Some("intercepted"))
+                    .count();
+                Ok(json!({
+                    "listening": true, "address": self.listening,
+                    "intercept_armed": self.intercept_armed,
+                    "capturing": !self.capture_paused,
+                    "paused": paused, "flows": self.flows.len(),
+                }))
+            }
             "proxy.pause" => {
-                self.capture_paused = args.get("paused").and_then(Value::as_bool).unwrap_or(true);
-                Ok(Value::Bool(self.capture_paused))
+                self.capture_paused = true;
+                Ok(json!({"capturing": false}))
             }
+            "proxy.resume" => {
+                self.capture_paused = false;
+                Ok(json!({"capturing": true}))
+            }
+            // Completed flows go; in-flight and intercepted ones are kept.
             "flow.clear" => {
-                let n = self.flows.len();
-                self.flows.clear();
-                Ok(Value::from(n))
+                let before = self.flows.len();
+                self.flows.retain(|f| {
+                    let intercept = f.get("intercept").and_then(Value::as_str);
+                    let done = !f["response"].is_null() || intercept == Some("killed");
+                    !done || intercept == Some("intercepted")
+                });
+                let kept = self.flows.len();
+                Ok(json!({"cleared": before - kept, "skipped_in_flight": kept}))
             }
+            // The meta plugin (F6): mark returns the new set, comment the text
+            // (null once cleared).
             "flow.mark" => {
+                let marks = args
+                    .get("marks")
+                    .filter(|m| m.is_array())
+                    .cloned()
+                    .ok_or_else(|| "missing required param `marks`".to_string())?;
                 let f = self.flow_mut(&id_arg()?)?;
-                f["meta"]["marks"] = args.get("marks").cloned().unwrap_or_else(|| json!([]));
-                Ok(Value::String("ok".into()))
+                f["meta"]["marks"] = marks.clone();
+                Ok(marks)
             }
             "flow.comment" => {
+                let text = args
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing required param `text`".to_string())?
+                    .to_string();
+                let comment = if text.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(text)
+                };
                 let f = self.flow_mut(&id_arg()?)?;
-                f["meta"]["comment"] = args.get("text").cloned().unwrap_or(Value::Null);
-                Ok(Value::String("ok".into()))
+                f["meta"]["comment"] = comment.clone();
+                Ok(comment)
+            }
+            "config.get" => {
+                let mut cfg = match &self.config {
+                    Value::Object(o) => Value::Object(o.clone()),
+                    _ => json!({}),
+                };
+                cfg["listen"] = Value::String(self.listening.clone());
+                cfg["scope"]["entries"] =
+                    Value::Array(self.scope.iter().cloned().map(Value::String).collect());
+                Ok(cfg)
             }
             "ca.status" => Ok(
                 json!({"path": "~/.aitm/ca.crt", "fingerprint_sha256": "3A:F1:…:9C", "installed": false, "platform": "fixture"}),
@@ -541,9 +685,18 @@ impl Fixture {
 
 fn encode_body(m: &mut Map<String, Value>) {
     if let Some(Value::String(t)) = m.remove("body_text") {
+        m.insert("body_size".into(), Value::from(t.len()));
         m.insert("body".into(), Value::String(base64::encode(t.as_bytes())));
     } else if let Some(b) = m.remove("body_b64") {
+        let size = b
+            .as_str()
+            .and_then(base64::decode)
+            .map_or(0, |bytes| bytes.len());
+        m.insert("body_size".into(), Value::from(size));
         m.insert("body".into(), b);
+    }
+    if !m.contains_key("body_truncated") {
+        m.insert("body_truncated".into(), Value::Bool(false));
     }
 }
 

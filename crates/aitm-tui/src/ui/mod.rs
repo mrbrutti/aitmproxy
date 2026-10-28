@@ -110,6 +110,7 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         Mode::Agent => overlays::agent(app, theme, body, buf),
         Mode::Browser => browser::render(app, theme, body, buf),
         Mode::Ca => overlays::ca(app, theme, body, buf),
+        Mode::Config => overlays::config(app, theme, body, buf),
         Mode::Inspector | Mode::Edit if app.narrow() => inspector::render(app, theme, body, buf),
         _ => main_region(app, theme, &view, body, buf),
     }

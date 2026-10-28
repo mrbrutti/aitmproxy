@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 
-use crate::model::{AgentPolicy, AgentState, Finding, FlowDetail};
+use crate::model::{AgentPolicy, AgentState, Finding, FlowDetail, ProxyStatus};
 
 /// A tool the bus offers, enough to build the palette and a form: the
 /// `tools/list` entry exactly as the bus client decodes it. [`ToolSchema`]
@@ -133,8 +133,12 @@ pub enum BusRequest {
         vars: Option<Value>,
     },
     AgentSet(AgentPolicy),
+    /// `true` → `proxy.pause {}`, `false` → `proxy.resume {}` (F7: two
+    /// parameterless tools, each answering the capture state).
     ProxyPause(bool),
     ClearFlows,
+    /// `poc.get {poc_path}` (F13): the PoC's YAML and description.
+    PocGet(String),
     Mark {
         id: String,
         marks: Vec<String>,
@@ -162,11 +166,13 @@ pub enum Level {
 /// What the bus task learned.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BusEvent {
+    /// The handshake succeeded: `initialize` answered and `tools/list` read.
     Connected {
         server: String,
         tools: Vec<ToolInfo>,
-        listening: Option<String>,
     },
+    /// `proxy.status` (F7), read at the handshake and on every slow pass.
+    ProxyStatus(ProxyStatus),
     Disconnected(String),
     /// A full pass over `flow.list` + `flow.get`, oldest first.
     Flows(Vec<Value>),
@@ -176,7 +182,10 @@ pub enum BusEvent {
     DetailFailed(String),
     Intercept(bool),
     Scope(Vec<String>),
+    /// The PoC library (`poc.list`, F13): files, none of them run.
     Findings(Vec<Finding>),
+    /// What Rhai scripts recorded with `finding(...)` (`findings.list`, M3).
+    ScriptFindings(Vec<Finding>),
     Agent(AgentState),
     /// A command completed; `name` is the tool, `value` its structured result.
     CallOk {

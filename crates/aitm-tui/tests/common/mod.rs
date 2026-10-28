@@ -6,6 +6,7 @@
 
 use aitm_tui::action::{BusEvent, BusRequest, ToolInfo};
 use aitm_tui::app::App;
+use aitm_tui::model::ProxyStatus;
 use aitm_tui::snapshot::{render, to_text};
 use aitm_tui::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -74,10 +75,38 @@ pub fn tools(names: &[&str]) -> Vec<ToolInfo> {
         .collect()
 }
 
-/// The 22 commands the bus serves today (foundation §4.1) — no F* tools.
-/// Every test binary compiles this module; not all of them use the list.
+/// The commands the bus serves today (37 since the core merge of
+/// 2026-10-28). Every test binary compiles this module; not all use the list.
 #[allow(unused_imports)]
 pub use aitm_tui::CORE_TOOLS;
+
+/// The 22 commands the bus served before that merge — a bus with none of
+/// the F5/F6/F7/F12/F13/M3 tools. Tests that prove a *missing* tool degrades
+/// honestly connect to this list; `CORE_TOOLS` is for "today's core".
+pub const PRE_MERGE_TOOLS: &[&str] = &[
+    "flow.list",
+    "flow.get",
+    "flow.intercept",
+    "flow.resume",
+    "flow.kill",
+    "flow.mutate",
+    "flow.replay",
+    "request.send",
+    "scope.add",
+    "scope.list",
+    "browser.navigate",
+    "browser.click",
+    "browser.type",
+    "browser.screenshot",
+    "browser.eval",
+    "browser.get_dom",
+    "poc.build",
+    "poc.run",
+    "ca.export",
+    "ca.status",
+    "ca.install",
+    "ca.uninstall",
+];
 
 /// A `flow.get` summary as the core shapes it (§4.3).
 pub fn summary(
@@ -95,13 +124,25 @@ pub fn summary(
     })
 }
 
-/// Connect `app` to a bus offering `tool_names`, as the bus task would.
+/// Connect `app` to a bus offering `tool_names`, as the bus task would:
+/// `Connected`, then — when the caller names a listen address — the
+/// `proxy.status` the handshake reads (listening, armed off, capturing).
 pub fn connect(app: &mut App, tool_names: &[&str], listening: Option<&str>) -> Vec<BusRequest> {
-    app.on_bus(BusEvent::Connected {
+    let mut out = app.on_bus(BusEvent::Connected {
         server: "aitmproxy test".into(),
         tools: tools(tool_names),
-        listening: listening.map(str::to_string),
-    })
+    });
+    if let Some(addr) = listening {
+        out.extend(app.on_bus(BusEvent::ProxyStatus(ProxyStatus {
+            listening: true,
+            address: Some(addr.to_string()),
+            intercept_armed: false,
+            capturing: true,
+            paused: 0,
+            flows: 0,
+        })));
+    }
+    out
 }
 
 /// Visible flow ids in display order.

@@ -152,32 +152,52 @@ async fn tui_bus_task_runs_against_the_live_loopback_server() {
     let bus_task = tokio::spawn(aitm_tui::bus::run(connect, req_rx, ev_tx, POLL));
 
     // 1. The first event is the handshake result, read straight off the live
-    //    tools/list: present tools, and the one the bus does not have yet.
+    //    tools/list: exactly the tools the TUI's `CORE_TOOLS` says today's
+    //    core serves (the 2026-10-28 merge: F5/F6/F7/F12/F13 and the M3
+    //    commands), `flow.detail` among them.
     let first = next_event(&mut ev_rx).await;
-    let BusEvent::Connected {
-        server,
-        tools,
-        listening,
-    } = first
-    else {
+    let BusEvent::Connected { server, tools } = first else {
         panic!("the first event must be Connected, got {first:?}");
     };
     assert_eq!(server, format!("aitmproxy {}", aitm_core::VERSION));
-    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-    for want in ["flow.list", "flow.intercept", "request.send"] {
+    let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    names.sort_unstable();
+    // This harness assembles the proxy without the M3 script tier, so the
+    // three `script.*`/`findings.*` tools are absent; everything it serves
+    // must be in `CORE_TOOLS`, and every operator command must be served.
+    for name in &names {
         assert!(
-            names.contains(&want),
-            "tools must contain {want}: {names:?}"
+            aitm_tui::CORE_TOOLS.contains(name),
+            "live tool `{name}` is missing from aitm_tui::CORE_TOOLS"
         );
     }
-    assert!(
-        !names.contains(&"flow.detail"),
-        "flow.detail is not on the bus yet (foundation §4.4): {names:?}"
-    );
-    // `proxy.status` is not registered, so the bus has nothing to report here.
-    assert_eq!(listening, None);
+    let script_tier = ["findings.list", "script.reload", "script.validate"];
+    for want in aitm_tui::CORE_TOOLS
+        .iter()
+        .filter(|t| !script_tier.contains(t))
+    {
+        assert!(
+            names.contains(want),
+            "the live bus lacks `{want}`: {names:?}"
+        );
+    }
+    assert!(names.contains(&"flow.detail"), "{names:?}");
 
-    // 2. The first poll over a fresh proxy: `flow.list` is empty.
+    // 2. The handshake reads `proxy.status` (F7) and reports it as the next
+    //    event, in the control plugin's shape. Nothing bound the proxy's
+    //    listen address in this test, so `listening` is honestly false while
+    //    `address` is the configured one; a fresh store has no flows.
+    let second = next_event(&mut ev_rx).await;
+    let BusEvent::ProxyStatus(status) = second else {
+        panic!("Connected is followed by ProxyStatus, got {second:?}");
+    };
+    assert_eq!(status.address, Some(cfg.listen.to_string()));
+    assert!(!status.listening, "the proxy is not serving in this test");
+    assert!(!status.intercept_armed);
+    assert!(status.capturing);
+    assert_eq!((status.paused, status.flows), (0, 0));
+
+    // 3. The first poll over a fresh proxy: `flow.list` is empty.
     let flows = wait_for(&mut ev_rx, "Flows", |e| match e {
         BusEvent::Flows(v) => Some(v.clone()),
         _ => None,
@@ -185,7 +205,7 @@ async fn tui_bus_task_runs_against_the_live_loopback_server() {
     .await;
     assert!(flows.is_empty(), "a fresh proxy has no flows: {flows:?}");
 
-    // 3. A real tools/call through the TCP transport; polls may interleave.
+    // 4. A real tools/call through the TCP transport; polls may interleave.
     req_tx
         .send(BusRequest::Intercept(true))
         .await
@@ -198,7 +218,7 @@ async fn tui_bus_task_runs_against_the_live_loopback_server() {
     assert_eq!(name, "flow.intercept");
     assert_eq!(value, Value::Bool(true));
 
-    // 4. A tool the live tools/list does not offer is refused locally.
+    // 5. A tool the live tools/list does not offer is refused locally.
     req_tx
         .send(BusRequest::Call {
             name: "nope".into(),
@@ -214,7 +234,7 @@ async fn tui_bus_task_runs_against_the_live_loopback_server() {
     assert_eq!(name, "nope");
     assert_eq!(message, "nope is not on this bus");
 
-    // 5. Closing the request channel ends `run`.
+    // 6. Closing the request channel ends `run`.
     drop(req_tx);
     timeout(STEP, bus_task)
         .await

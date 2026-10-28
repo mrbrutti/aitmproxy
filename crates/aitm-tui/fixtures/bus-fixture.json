@@ -45,16 +45,23 @@
     { "name": "browser.get_dom", "description": "Return the page's DOM as text.", "inputSchema": { "type": "object", "properties": {} } },
     { "name": "poc.build", "description": "Build a parameterized reproducible PoC (YAML) from a captured flow.", "inputSchema": { "type": "object", "properties": { "flow_id": { "type": "string", "description": "The captured flow to reproduce." }, "name": { "type": "string", "description": "Human title for the finding." }, "param": { "type": "string", "description": "The reflected query parameter to parameterize." } }, "required": ["flow_id"] } },
     { "name": "poc.run", "description": "Run a reproducible PoC (YAML) with no agent and emit the three artifacts.", "inputSchema": { "type": "object", "properties": { "poc_path": { "type": "string", "description": "Path to the PoC YAML file to execute." }, "target": { "type": "string", "description": "Base URL bound to the `target` variable." }, "vars": { "type": "object", "description": "Additional variable bindings." } }, "required": ["poc_path"] } },
-    { "name": "poc.list", "description": "(F13) List PoC runs with their verdicts and artifacts.", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "poc.list", "description": "(F13) List the PoCs in the configured PoC directory (id, title, severity, path).", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "poc.get", "description": "(F13) Read one PoC by path: id, title, severity, description, and the YAML source.", "inputSchema": { "type": "object", "properties": { "poc_path": { "type": "string", "description": "Path to the PoC YAML file." } }, "required": ["poc_path"] } },
+    { "name": "poc.artifact", "description": "(F13) Read a PoC run artifact (YAML copy or screenshot) as bytes, confined to the PoC output directory.", "inputSchema": { "type": "object", "properties": { "path": { "type": "string", "description": "Path to the artifact." } }, "required": ["path"] } },
+    { "name": "findings.list", "description": "(M3) Findings scripts recorded with finding(...): each as an object, oldest first, plus how many the sink dropped.", "inputSchema": { "type": "object", "properties": { "limit": { "type": "integer", "description": "return only the newest N findings" } } } },
+    { "name": "script.validate", "description": "(M3) Compile a .rhai script without loading it.", "inputSchema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] } },
+    { "name": "script.reload", "description": "(M3) Recompile a loaded script from its file and swap its hooks live.", "inputSchema": { "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"] } },
     { "name": "ca.status", "description": "Report the MITM CA: path, fingerprint, trust-store state.", "inputSchema": { "type": "object", "properties": {} } },
     { "name": "ca.export", "description": "Export the CA certificate (PEM or DER).", "inputSchema": { "type": "object", "properties": { "format": { "type": "string" }, "out": { "type": "string" } } } },
     { "name": "ca.install", "description": "Install the CA into the OS trust store (confirmed).", "inputSchema": { "type": "object", "properties": {} } },
     { "name": "ca.uninstall", "description": "Remove the CA from the OS trust store (confirmed).", "inputSchema": { "type": "object", "properties": {} } },
     { "name": "agent.status", "description": "(F1) Agent policy, recent action count, connected clients and the activity log.", "inputSchema": { "type": "object", "properties": {} } },
     { "name": "agent.set", "description": "(F1) Set the agent policy: all | readonly | paused. Refused to the agent itself.", "inputSchema": { "type": "object", "properties": { "policy": { "type": "string", "description": "all | readonly | paused" } }, "required": ["policy"] } },
-    { "name": "proxy.status", "description": "(F7) Listening address and capture state.", "inputSchema": { "type": "object", "properties": {} } },
-    { "name": "proxy.pause", "description": "(F7) Pause or resume capture.", "inputSchema": { "type": "object", "properties": { "paused": { "type": "boolean" } }, "required": ["paused"] } },
-    { "name": "flow.clear", "description": "(F7) Clear every captured flow.", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "proxy.status", "description": "(F7) The proxy's live state: listening + address, intercept_armed, paused (parked-flow count), capturing, and flows.", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "proxy.pause", "description": "(F7) Pause capture: new flows are hidden from list/status/count. Returns the capture state.", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "proxy.resume", "description": "(F7) Resume capture: new flows are shown again. Returns the capture state.", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "flow.clear", "description": "(F7) Remove completed flows from the store (in-flight and intercepted flows are kept); returns {cleared, skipped_in_flight}.", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "config.get", "description": "(F7) A redacted view of the proxy configuration (no MCP token or key material).", "inputSchema": { "type": "object", "properties": {} } },
     { "name": "flow.mark", "description": "(F6) Set a flow's mark colours.", "inputSchema": { "type": "object", "properties": { "id": { "type": "string" }, "marks": { "type": "array" } }, "required": ["id", "marks"] } },
     { "name": "flow.comment", "description": "(F6) Set a flow's comment.", "inputSchema": { "type": "object", "properties": { "id": { "type": "string" }, "text": { "type": "string" } }, "required": ["id", "text"] } }
   ],
@@ -132,10 +139,10 @@
       "request": { "method": "GET", "scheme": "wss", "authority": "api.shop-staging.test", "path": "/ws/notifications", "version": "HTTP/1.1",
         "headers": [["host", "api.shop-staging.test"], ["upgrade", "websocket"], ["sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="]], "body_text": "" },
       "response": { "status": 101, "version": "HTTP/1.1", "headers": [["upgrade", "websocket"], ["sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="]], "body_text": "" },
-      "frames": [
-        { "dir": "c2s", "opcode": "text", "data_text": "{\"type\":\"subscribe\",\"channel\":\"orders\"}", "time": "2026-10-27T11:05:05.001Z", "injected": false },
-        { "dir": "s2c", "opcode": "text", "data_text": "{\"type\":\"ack\",\"channel\":\"orders\"}", "time": "2026-10-27T11:05:05.040Z", "injected": false },
-        { "dir": "s2c", "opcode": "text", "data_text": "{\"type\":\"order.updated\",\"id\":9002,\"status\":\"shipped\"}", "time": "2026-10-27T11:05:21.300Z", "injected": false }
+      "messages": [
+        { "dir": "client_to_server", "opcode": "text", "data_text": "{\"type\":\"subscribe\",\"channel\":\"orders\"}", "timestamp": "2026-10-27T11:05:05.001Z", "injected": false },
+        { "dir": "server_to_client", "opcode": "text", "data_text": "{\"type\":\"ack\",\"channel\":\"orders\"}", "timestamp": "2026-10-27T11:05:05.040Z", "injected": false },
+        { "dir": "server_to_client", "opcode": "text", "data_text": "{\"type\":\"order.updated\",\"id\":9002,\"status\":\"shipped\"}", "timestamp": "2026-10-27T11:05:21.300Z", "injected": false }
       ],
       "client_conn": { "peer": "127.0.0.1:52120", "sni": "api.shop-staging.test", "alpn": "http/1.1", "tls": true, "process": "obscura" },
       "server_conn": { "peer": "203.0.113.10:443", "sni": "api.shop-staging.test", "alpn": "http/1.1", "tls": true },
@@ -212,17 +219,35 @@
       "meta": { "marks": [], "comment": "upstream cert pinned — tunnelled", "is_replay": false, "created": "2026-10-27T11:05:35.603Z", "duration_ms": 25, "truncated": false, "origin": "human" }
     }
   ],
+  "pocs": [
+    {
+      "$description": "The PoC library under poc.dir, as poc.list summarises it (poc_path, id, title, severity) and poc.get returns it (plus description and the YAML). The first two are the files the recorded runs below executed; the third has not run this session.",
+      "id": "reflected-xss-search", "title": "Reflected XSS in /api/search q", "severity": "high", "poc_path": "pocs/reflected-xss-search.yaml",
+      "description": "The q parameter of /api/search is reflected into the results heading without encoding; the browser step proves the payload executes.",
+      "yaml": "name: Reflected XSS in /api/search q\nseverity: high\nvars:\n  target: https://api.shop-staging.test\n  payload: '\"><img src=x onerror=alert(1)>'\nsteps:\n  - request:\n      method: GET\n      url: '{{target}}/api/search?q={{payload}}'\n    assert:\n      - status: 200\n      - word: '{{payload}}'\n  - browser:\n      navigate: '{{target}}/api/search?q={{payload}}'\n      screenshot: true\n    assert:\n      - eval: document.title\n        equals: Results\n"
+    },
+    {
+      "id": "idor-cart-items", "title": "IDOR on /api/cart/items/{id}", "severity": "medium", "poc_path": "pocs/idor-cart-items.yaml",
+      "description": "Reading another customer's cart line by id; passes only when the response names an item that is not ours.",
+      "yaml": "name: IDOR on /api/cart/items/{id}\nseverity: medium\nvars:\n  target: https://api.shop-staging.test\n  other: 43\nsteps:\n  - request:\n      method: GET\n      url: '{{target}}/api/cart/items/{{other}}'\n    assert:\n      - status: 200\n      - dsl: body.item_id != 42\n"
+    },
+    {
+      "id": "open-redirect-next", "title": "Open redirect via next=", "severity": "low", "poc_path": "pocs/open-redirect-next.yaml",
+      "description": "The login page's next= parameter is followed verbatim after a successful login.",
+      "yaml": "name: Open redirect via next=\nseverity: low\nvars:\n  target: https://auth.shop-staging.test\n  evil: https://evil.example/\nsteps:\n  - request:\n      method: GET\n      url: '{{target}}/login?next={{evil}}'\n    assert:\n      - status: 302\n      - header: location == {{evil}}\n"
+    }
+  ],
   "findings": [
     {
+      "$description": "Recorded poc.run results for the first two library files. The core keeps no run history, so poc.list never returns these; fixture_app replays them as CallOk { name: poc.run } so the panel shows one passed and one failed run beside the library-only third PoC.",
       "title": "Reflected XSS in /api/search q", "severity": "high", "target": "https://api.shop-staging.test", "passed": true,
       "at": "2026-10-27T11:05:16.410Z", "origin": "agent", "poc_path": "pocs/reflected-xss-search.yaml", "finding_capture": "f48",
-      "screenshot_path": "pocs/reflected-xss-search.png", "screenshot": { "width": 1200, "height": 800, "type": "PNG" },
+      "screenshot_path": "pocs/reflected-xss-search.png",
       "evaluated": [
         { "assertion": "status == 200", "matched": true },
         { "assertion": "word: <img src=x onerror=alert(1)>", "matched": true },
         { "assertion": "browser-eval document.title == \"Results\"", "matched": true }
-      ],
-      "yaml": "name: Reflected XSS in /api/search q\nseverity: high\nvars:\n  target: https://api.shop-staging.test\n  payload: '\"><img src=x onerror=alert(1)>'\nsteps:\n  - request:\n      method: GET\n      url: '{{target}}/api/search?q={{payload}}'\n    assert:\n      - status: 200\n      - word: '{{payload}}'\n  - browser:\n      navigate: '{{target}}/api/search?q={{payload}}'\n      screenshot: true\n    assert:\n      - eval: document.title\n        equals: Results\n"
+      ]
     },
     {
       "title": "IDOR on /api/cart/items/{id}", "severity": "medium", "target": "https://api.shop-staging.test", "passed": false,
@@ -231,8 +256,25 @@
       "evaluated": [
         { "assertion": "status == 200", "matched": true },
         { "assertion": "dsl: body.item_id != 42", "matched": false }
-      ],
-      "yaml": "name: IDOR on /api/cart/items/{id}\nseverity: medium\nvars:\n  target: https://api.shop-staging.test\n  other: 43\nsteps:\n  - request:\n      method: GET\n      url: '{{target}}/api/cart/items/{{other}}'\n    assert:\n      - status: 200\n      - dsl: body.item_id != 42\n"
+      ]
     }
-  ]
+  ],
+  "artifacts": {
+    "$description": "poc.artifact answers, path → base64 bytes (the same 1×1 PNG as the browser screenshot).",
+    "pocs/reflected-xss-search.png": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+  },
+  "config": {
+    "$description": "config.get as the control plugin redacts it (listen and scope.entries follow the fixture's live state).",
+    "listen": "127.0.0.1:8080",
+    "ssl_insecure": false,
+    "max_flows": 10000,
+    "max_flow_bytes": 10485760,
+    "scope": { "entries": ["api.shop-staging.test", "auth.shop-staging.test", "cdn.shop-staging.test"], "allow_agent_widen": false },
+    "limits": { "global_rps": 50, "per_host_rps": 10, "max_concurrency": 8, "host_error_budget": 20, "max_body_bytes": 1048576 },
+    "ca": { "dir": "/Users/op/.aitm/ca", "allow_agent_install": false },
+    "mcp": { "transport": "loopback_tcp", "port": 9090 },
+    "browser": { "engine": "obscura" },
+    "poc_dir": "/Users/op/engagements/shop-staging/pocs",
+    "poc_out_dir": "/Users/op/engagements/shop-staging/pocs/out"
+  }
 }

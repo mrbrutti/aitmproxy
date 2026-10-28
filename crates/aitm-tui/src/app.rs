@@ -8,9 +8,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
@@ -20,7 +20,7 @@ use crate::caps::TermCaps;
 use crate::filter::{self, Expr};
 use crate::model::{
     counts_by, human_bytes, scope_covers, value_text, AgentPolicy, AgentState, Finding, FlowDetail,
-    FlowKind, FlowRow, Message,
+    FlowKind, FlowRow, Message, Severity,
 };
 use crate::open::{self, OpenTarget};
 use crate::theme::Theme;
@@ -43,8 +43,12 @@ pub const MAX_DETAILS: usize = 2_000;
 pub const CONFIRM_TOOLS: &[&str] = &["ca.install", "ca.uninstall"];
 
 /// The most PoC YAML the Findings panel reads from disk for one finding
-/// (`poc_path` on a loopback bus).
+/// (`poc_path` on a loopback bus without `poc.get`).
 pub const MAX_POC_YAML_BYTES: u64 = 256 * 1024;
+
+/// How many `-2`, `-3`, … suffixes a written PoC tries before giving up,
+/// so a name collision never overwrites and never loops forever.
+const MAX_POC_NAME_TRIES: u32 = 1000;
 
 /// Which screen owns the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +69,9 @@ pub enum Mode {
     /// The browser view (§2.7): URL, DOM outline, last-screenshot placeholder;
     /// navigate / eval / screenshot through `browser.*`.
     Browser,
+    /// The config panel (`:config`, F7): the redacted `config.get` object,
+    /// read-only.
+    Config,
     Help,
     QuickLook,
 }
@@ -758,7 +765,20 @@ pub struct App {
     pub bus_address: String,
     pub tools: Vec<ToolInfo>,
     pub caps: TermCaps,
+    /// The proxy's listen address: from `proxy.status` (F7) or the embed.
     pub listening: Option<String>,
+    /// `proxy.status.listening`: whether the proxy is actually serving;
+    /// `None` until a status arrives.
+    pub serving: Option<bool>,
+    /// `proxy.status.paused`: the store's own parked-flow count, which the
+    /// status bar prefers to its filtered view when the list is filtered.
+    pub store_paused: Option<u64>,
+    /// The redacted `config.get` object (F7), once fetched (`:config`, the
+    /// scope panel).
+    pub config: Option<Value>,
+    /// Where a built PoC is written (C12): `--poc-dir` / the embed's
+    /// `poc.dir`; else `config.get`'s `poc_dir`; else a temp fallback.
+    pub poc_dir: Option<PathBuf>,
     pub toasts: VecDeque<Toast>,
     pub compose: ComposeForm,
     pub compose_history: Vec<Value>,
@@ -782,6 +802,17 @@ pub struct App {
     pub ca_status: Option<Value>,
     /// The browser view (§2.7).
     pub browser: BrowserState,
+    /// Hosts whose `scope.remove` is in flight, oldest first: the reply is a
+    /// bare bool, so the toast takes its host from here.
+    pub pending_scope_removals: VecDeque<String>,
+    /// PoC paths whose `poc.get` is in flight, oldest first (a failure
+    /// carries no path, so it settles the oldest).
+    pub poc_get_inflight: VecDeque<String>,
+    /// The screenshot path a `poc.artifact` fetch will open (Findings `o`).
+    pub pending_artifact: Option<String>,
+    /// File-name slugs for `poc.build` calls in flight, oldest first (C12:
+    /// the reply is the YAML text, named after what the operator typed).
+    pub poc_build_pending: VecDeque<String>,
 }
 
 impl App {
@@ -817,6 +848,10 @@ impl App {
             tools: Vec::new(),
             caps,
             listening: None,
+            serving: None,
+            store_paused: None,
+            config: None,
+            poc_dir: None,
             toasts: VecDeque::new(),
             compose: ComposeForm::template_get(),
             compose_history: Vec::new(),
@@ -833,6 +868,10 @@ impl App {
             pending_open: None,
             ca_status: None,
             browser: BrowserState::default(),
+            pending_scope_removals: VecDeque::new(),
+            poc_get_inflight: VecDeque::new(),
+            pending_artifact: None,
+            poc_build_pending: VecDeque::new(),
         }
     }
 
@@ -1462,7 +1501,7 @@ impl App {
                     self.toast(Level::Info, "No node on this line to copy");
                 }
             }
-            Action::OpenExternally => self.open_externally(),
+            Action::OpenExternally => self.open_externally(&mut out),
             Action::OpenFindings => {
                 self.mode = Mode::Findings;
                 self.sidebar = SidebarItem::Findings;
@@ -1470,6 +1509,7 @@ impl App {
             Action::OpenScope => {
                 self.mode = Mode::Scope;
                 self.sidebar = SidebarItem::Scope;
+                self.ensure_config(&mut out);
             }
             Action::OpenAgent => {
                 self.mode = Mode::Agent;
@@ -1567,8 +1607,13 @@ impl App {
             }
             Action::PocRerun => {
                 if let Some(f) = self.findings.get(self.finding_cursor) {
-                    self.poc_run_pending = Some((f.poc_path.clone(), None));
-                    self.open_prompt(PromptKind::PocTarget);
+                    if f.poc_path.is_empty() {
+                        // A Rhai `finding(...)` names no PoC file.
+                        self.toast(Level::Info, "a script finding has no PoC to run");
+                    } else {
+                        self.poc_run_pending = Some((f.poc_path.clone(), None));
+                        self.open_prompt(PromptKind::PocTarget);
+                    }
                 }
             }
             Action::ScopeAddPrompt => self.open_prompt(PromptKind::ScopeAdd),
@@ -1604,10 +1649,11 @@ impl App {
     }
 
     /// `o`: hand the thing under the cursor to the desktop (§2.9). In the
-    /// Findings panel that is the screenshot; elsewhere an image or large
-    /// body, written to a private temp file first. Anything the terminal can
-    /// show inline is not opened, and the toast says so.
-    fn open_externally(&mut self) {
+    /// Findings panel that is the screenshot — a local file on a loopback
+    /// bus, else fetched through `poc.artifact` (F13); elsewhere an image or
+    /// large body, written to a private temp file first. Anything the
+    /// terminal can show inline is not opened, and the toast says so.
+    fn open_externally(&mut self, out: &mut Vec<BusRequest>) {
         if self.mode == Mode::Browser {
             match &self.browser.screenshot {
                 Some(shot) => {
@@ -1632,11 +1678,22 @@ impl App {
             let Some(f) = self.findings.get(self.finding_cursor) else {
                 return;
             };
-            // The path is the bus's word; resolve it before the desktop
-            // sees it, and open nothing when it does not resolve (SEC-2) or
-            // is not a regular file whose header is an image we know.
-            match f.screenshot_path.as_deref().map(std::fs::canonicalize) {
-                Some(Ok(path)) => {
+            let Some(p) = f.screenshot_path.clone() else {
+                self.toast(Level::Info, "this finding has no screenshot to open");
+                return;
+            };
+            // The path is the bus's word. On a loopback bus it may name a
+            // file here: resolve it before the desktop sees it (SEC-2) and
+            // open it only when it is a regular file whose header is an
+            // image we know. Otherwise — a remote bus, or a path that does
+            // not exist here — the bytes come through `poc.artifact` (F13).
+            let local = if self.is_loopback_bus() {
+                std::fs::canonicalize(&p).ok()
+            } else {
+                None
+            };
+            match local {
+                Some(path) => {
                     if !is_image_file(&path) {
                         self.toast(Level::Warn, format!("not an image: {}", path.display()));
                         return;
@@ -1650,11 +1707,26 @@ impl App {
                         label: "screenshot".into(),
                     });
                 }
-                Some(Err(e)) => {
-                    let p = f.screenshot_path.clone().unwrap_or_default();
-                    self.toast(Level::Warn, format!("open: {p}: {e}"));
+                None if self.has_tool("poc.artifact") => {
+                    self.toast(
+                        Level::Info,
+                        format!("fetching screenshot {p} (poc.artifact)"),
+                    );
+                    self.pending_artifact = Some(p.clone());
+                    out.push(BusRequest::Call {
+                        name: "poc.artifact".into(),
+                        args: json!({ "path": p }),
+                    });
                 }
-                None => self.toast(Level::Info, "this finding has no screenshot to open"),
+                None => match std::fs::canonicalize(&p) {
+                    Err(e) => self.toast(Level::Warn, format!("open: {p}: {e}")),
+                    Ok(_) => self.toast(
+                        Level::Warn,
+                        format!(
+                            "open: {p}: the bus is not on this machine and has no poc.artifact"
+                        ),
+                    ),
+                },
             }
             return;
         }
@@ -2017,6 +2089,10 @@ impl App {
             },
             Mode::Prompt(PromptKind::PocParam) => {
                 if let Some((id, name)) = self.poc_pending.take() {
+                    // C12: the reply is YAML text; remember what to call the file.
+                    let seq = self.row(&id).map_or(0, |r| r.seq);
+                    self.poc_build_pending
+                        .push_back(poc_slug(name.as_deref(), seq));
                     out.push(BusRequest::PocBuild {
                         flow_id: id,
                         name,
@@ -2352,17 +2428,17 @@ impl App {
         }
     }
 
-    /// Read the YAML of findings that came without one from `poc_path`, which
-    /// only names a file on this machine when the bus is local (§2.7 "PoC
-    /// panel … the YAML"). What an earlier pass read (or failed to read) for
-    /// the same `poc_path` is carried over from `previous`, so a `poc.list`
-    /// poll does not touch every file again.
-    fn fill_finding_yaml(&mut self, previous: &[Finding]) {
-        if !self.is_loopback_bus() {
-            return;
-        }
+    /// Get the YAML of findings that have none yet (§2.7 "PoC panel … the
+    /// YAML"): through `poc.get` (F13) when the bus has it — one request per
+    /// path, none while one is in flight — else from `poc_path` on this
+    /// machine, which only means something on a loopback bus. What an
+    /// earlier pass got (or failed to get) for the same `poc_path` is carried
+    /// over from `previous`, so a `poc.list` poll does not ask again.
+    fn fill_finding_yaml(&mut self, previous: &[Finding], out: &mut Vec<BusRequest>) {
+        let over_bus = self.has_tool("poc.get");
+        let local = self.is_loopback_bus();
         for f in &mut self.findings {
-            if f.yaml.is_some() || f.yaml_error.is_some() {
+            if f.yaml.is_some() || f.yaml_error.is_some() || f.poc_path.is_empty() {
                 continue;
             }
             if let Some(p) = previous
@@ -2371,13 +2447,142 @@ impl App {
             {
                 f.yaml = p.yaml.clone();
                 f.yaml_error = p.yaml_error.clone();
+                if f.description.is_none() {
+                    f.description = p.description.clone();
+                }
                 continue;
             }
-            match read_poc_yaml(&f.poc_path) {
-                Ok(y) => f.yaml = Some(y),
-                Err(e) => f.yaml_error = Some(e),
+            if over_bus {
+                if !self.poc_get_inflight.contains(&f.poc_path) {
+                    self.poc_get_inflight.push_back(f.poc_path.clone());
+                    out.push(BusRequest::PocGet(f.poc_path.clone()));
+                }
+            } else if local {
+                match read_poc_yaml(&f.poc_path) {
+                    Ok(y) => f.yaml = Some(y),
+                    Err(e) => f.yaml_error = Some(e),
+                }
             }
         }
+    }
+
+    /// Fold a `poc.list` pass (the library: files, none run) into the
+    /// findings. A run result from this session keeps its verdict and is
+    /// never dropped because the library pass omitted it; a library entry
+    /// fills only paths with no run, and lends its description to a run that
+    /// has none. Script findings are untouched.
+    fn merge_library(&mut self, library: Vec<Finding>, out: &mut Vec<BusRequest>) {
+        let previous = std::mem::take(&mut self.findings);
+        let mut merged: Vec<Finding> = previous
+            .iter()
+            .filter(|f| f.ran)
+            .cloned()
+            .map(|mut f| {
+                if f.description.is_none() {
+                    if let Some(lib) = library
+                        .iter()
+                        .find(|l| !f.poc_path.is_empty() && l.poc_path == f.poc_path)
+                    {
+                        f.description = lib.description.clone();
+                    }
+                }
+                f
+            })
+            .collect();
+        for lib in library {
+            if !merged
+                .iter()
+                .any(|f| !f.poc_path.is_empty() && f.poc_path == lib.poc_path)
+            {
+                merged.push(lib);
+            }
+        }
+        self.findings = merged;
+        self.finding_cursor = self
+            .finding_cursor
+            .min(self.findings.len().saturating_sub(1));
+        self.fill_finding_yaml(&previous, out);
+    }
+
+    /// A `poc.run` result (or a PoC the TUI just wrote) takes the place of
+    /// any entry for the same path and goes to the top.
+    fn upsert_finding(&mut self, f: Finding, out: &mut Vec<BusRequest>) {
+        let previous = std::mem::take(&mut self.findings);
+        let mut kept: Vec<Finding> = previous
+            .iter()
+            .filter(|p| p.poc_path.is_empty() || p.poc_path != f.poc_path)
+            .cloned()
+            .collect();
+        let mut f = f;
+        if let Some(old) = previous.iter().find(|p| p.poc_path == f.poc_path) {
+            // The library's title/description/YAML are about the file; a
+            // run result names only the path, so keep them.
+            if old.title != default_title(&old.poc_path) && f.title == default_title(&f.poc_path) {
+                f.title = old.title.clone();
+            }
+            if f.description.is_none() {
+                f.description = old.description.clone();
+            }
+        }
+        kept.insert(0, f);
+        self.findings = kept;
+        self.finding_cursor = 0;
+        self.fill_finding_yaml(&previous, out);
+    }
+
+    /// Ask `config.get` (F7) once, when the bus has it and nothing is held.
+    fn ensure_config(&mut self, out: &mut Vec<BusRequest>) {
+        if self.config.is_none() && self.has_tool("config.get") {
+            out.push(BusRequest::Call {
+                name: "config.get".into(),
+                args: json!({}),
+            });
+        }
+    }
+
+    /// C12: write a built PoC's YAML under the PoC dir. Returns the path and
+    /// a note for the toast when the dir was the temp fallback.
+    fn write_poc(&self, yaml: &str, slug: &str) -> Result<(PathBuf, &'static str), String> {
+        let (dir, note) = match self.poc_dir.clone().or_else(|| {
+            self.config
+                .as_ref()
+                .and_then(|c| c.get("poc_dir"))
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+        }) {
+            Some(d) => (d, ""),
+            None => (
+                std::env::temp_dir().join("aitm-pocs"),
+                " — no PoC dir configured, so it went under the temp dir; poc.run confined to \
+                 poc.dir will refuse it (pass --poc-dir)",
+            ),
+        };
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        for n in 1..=MAX_POC_NAME_TRIES {
+            let name = if n == 1 {
+                format!("{slug}.yaml")
+            } else {
+                format!("{slug}-{n}.yaml")
+            };
+            let path = dir.join(name);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    f.write_all(yaml.as_bytes())
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
+                    return Ok((path, note));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            }
+        }
+        Err(format!(
+            "{}: {MAX_POC_NAME_TRIES} files already carry that name",
+            dir.display()
+        ))
     }
 
     /// Run a `:` command line.
@@ -2423,12 +2628,30 @@ impl App {
                     ("add", h) if !h.is_empty() => out.push(BusRequest::ScopeAdd(h.to_string())),
                     ("rm", h) | ("remove", h) if !h.is_empty() => {
                         if self.has_tool("scope.remove") {
+                            self.pending_scope_removals.push_back(h.to_string());
                             out.push(BusRequest::ScopeRemove(h.to_string()));
                         } else {
                             self.toast(Level::Warn, "scope.remove needs core follow-up F12");
                         }
                     }
-                    _ => self.mode = Mode::Scope,
+                    _ => {
+                        self.mode = Mode::Scope;
+                        self.ensure_config(&mut out);
+                    }
+                }
+            }
+            "config" => {
+                self.mode = Mode::Config;
+                if self.has_tool("config.get") {
+                    out.push(BusRequest::Call {
+                        name: "config.get".into(),
+                        args: json!({}),
+                    });
+                } else {
+                    self.toast(
+                        Level::Warn,
+                        "Config view needs core follow-up F7 (config.get)",
+                    );
                 }
             }
             "agent" => match AgentPolicy::parse(rest) {
@@ -2507,14 +2730,16 @@ impl App {
                     self.toast(Level::Warn, "Clear needs core follow-up F7 (flow.clear)");
                 }
             }
+            // F7: two tools, each checked on its own.
             "pause" | "record" => {
-                if self.has_tool("proxy.pause") {
-                    let pause = cmd == "pause";
+                let pause = cmd == "pause";
+                let tool = if pause { "proxy.pause" } else { "proxy.resume" };
+                if self.has_tool(tool) {
                     out.push(BusRequest::ProxyPause(pause));
                 } else {
                     self.toast(
                         Level::Warn,
-                        "Pause/record needs core follow-up F7 (proxy.pause)",
+                        format!("{} needs core follow-up F7 ({tool})", title_case(cmd)),
                     );
                 }
             }
@@ -2567,23 +2792,32 @@ impl App {
     pub fn on_bus(&mut self, event: BusEvent) -> Vec<BusRequest> {
         let mut out = Vec::new();
         match event {
-            BusEvent::Connected {
-                server,
-                tools,
-                listening,
-            } => {
+            BusEvent::Connected { server, tools } => {
                 self.bus = BusStatus::Connected {
                     server,
                     address: self.bus_address.clone(),
                 };
                 self.tools = tools;
-                if listening.is_some() {
-                    self.listening = listening;
-                }
                 // A (re)connect is a new session: nothing sent before it
                 // will be answered.
                 self.browser_forget_inflight();
                 out.push(BusRequest::Refresh);
+            }
+            BusEvent::ProxyStatus(s) => {
+                if s.address.is_some() {
+                    self.listening = s.address;
+                }
+                self.serving = Some(s.listening);
+                self.intercept_armed = s.intercept_armed;
+                self.capture_paused = !s.capturing;
+                self.store_paused = Some(s.paused);
+            }
+            BusEvent::ScriptFindings(list) => {
+                self.findings.retain(|f| f.script.is_none());
+                self.findings.extend(list);
+                self.finding_cursor = self
+                    .finding_cursor
+                    .min(self.findings.len().saturating_sub(1));
             }
             BusEvent::Disconnected(why) => {
                 self.bus = BusStatus::Disconnected(why.clone());
@@ -2657,13 +2891,7 @@ impl App {
             }
             BusEvent::Intercept(armed) => self.intercept_armed = armed,
             BusEvent::Scope(entries) => self.scope = entries,
-            BusEvent::Findings(f) => {
-                let previous = std::mem::replace(&mut self.findings, f);
-                self.finding_cursor = self
-                    .finding_cursor
-                    .min(self.findings.len().saturating_sub(1));
-                self.fill_finding_yaml(&previous);
-            }
+            BusEvent::Findings(library) => self.merge_library(library, &mut out),
             BusEvent::Agent(a) => self.agent = a,
             BusEvent::CallOk { name, value } => {
                 match name.as_str() {
@@ -2676,20 +2904,107 @@ impl App {
                             format!("{name} → new flow {}", value.as_str().unwrap_or("?")),
                         );
                     }
+                    // C12: the core answers with the PoC's YAML text, not a
+                    // path — the TUI writes the file and lists it.
                     "poc.build" => {
-                        self.toast(
-                            Level::Info,
-                            format!("PoC written: {}", value.as_str().unwrap_or("?")),
-                        );
+                        let slug = self
+                            .poc_build_pending
+                            .pop_front()
+                            .unwrap_or_else(|| "poc".into());
+                        match value.as_str() {
+                            Some(text) if looks_like_yaml(text) => {
+                                match self.write_poc(text, &slug) {
+                                    Ok((path, note)) => {
+                                        self.toast(
+                                            Level::Info,
+                                            format!("PoC written: {}{note}", path.display()),
+                                        );
+                                        let f = Finding {
+                                            title: yaml_field(text, "name")
+                                                .unwrap_or_else(|| slug.clone()),
+                                            severity: yaml_field(text, "severity")
+                                                .map_or(Severity::Info, |s| Severity::parse(&s)),
+                                            target: String::new(),
+                                            ran: false,
+                                            passed: false,
+                                            when: String::new(),
+                                            origin: crate::model::Origin::Human,
+                                            poc_path: path.to_string_lossy().into_owned(),
+                                            description: yaml_field(text, "description"),
+                                            script: None,
+                                            finding_capture: None,
+                                            screenshot_path: None,
+                                            assertions: Vec::new(),
+                                            yaml: Some(text.to_string()),
+                                            yaml_error: None,
+                                        };
+                                        self.upsert_finding(f, &mut out);
+                                    }
+                                    Err(e) => self.toast(
+                                        Level::Error,
+                                        format!("could not write the PoC: {e}"),
+                                    ),
+                                }
+                            }
+                            Some(path) => {
+                                self.toast(Level::Info, format!("PoC written: {path}"));
+                            }
+                            None => self.toast(Level::Info, "PoC written: ?"),
+                        }
                     }
                     "poc.run" => {
                         if let Some(f) = Finding::from_json(&value) {
                             let verdict = if f.passed { "passed" } else { "failed" };
                             self.toast(Level::Info, format!("PoC {verdict}: {}", f.title));
-                            self.findings.insert(0, f);
-                            self.finding_cursor = 0;
-                            self.fill_finding_yaml(&[]);
+                            self.upsert_finding(f, &mut out);
                         }
+                    }
+                    "poc.get" => {
+                        let path = value
+                            .get("poc_path")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        if let Some(p) = &path {
+                            self.poc_get_inflight.retain(|x| x != p);
+                            for f in self.findings.iter_mut().filter(|f| &f.poc_path == p) {
+                                f.yaml = value
+                                    .get("yaml")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                                    .or_else(|| f.yaml.clone());
+                                if let Some(d) = value.get("description").and_then(Value::as_str) {
+                                    f.description = Some(d.to_string());
+                                }
+                            }
+                        }
+                        return out;
+                    }
+                    "poc.artifact" => {
+                        let p = self.pending_artifact.take().unwrap_or_default();
+                        match value.as_str().and_then(crate::base64::decode) {
+                            Some(bytes) if crate::viewers::image::dimensions(&bytes).is_some() => {
+                                match open::body_to_temp_file("poc-screenshot", "png", &bytes) {
+                                    Ok(path) => {
+                                        self.toast(Level::Info, format!("opening screenshot {p}"));
+                                        self.pending_open = Some(OpenTarget {
+                                            path,
+                                            label: format!("screenshot {p}"),
+                                        });
+                                    }
+                                    Err(e) => self.toast(
+                                        Level::Error,
+                                        format!("could not write the screenshot: {e}"),
+                                    ),
+                                }
+                            }
+                            _ => self
+                                .toast(Level::Warn, format!("poc.artifact: {p} is not an image")),
+                        }
+                        return out;
+                    }
+                    "config.get" => {
+                        self.config = Some(value);
+                        return out;
                     }
                     "ca.status" => {
                         self.ca_status = Some(value);
@@ -2728,6 +3043,71 @@ impl App {
                         Level::Info,
                         format!("Scope + {}", value.as_str().unwrap_or("?")),
                     ),
+                    // F12: a bool; the host is the one we asked about.
+                    "scope.remove" => {
+                        let host = self
+                            .pending_scope_removals
+                            .pop_front()
+                            .unwrap_or_else(|| "?".into());
+                        if value.as_bool() == Some(true) {
+                            self.scope.retain(|h| *h != host);
+                            self.scope_cursor =
+                                self.scope_cursor.min(self.scope.len().saturating_sub(1));
+                            self.toast(Level::Info, format!("removed {host}"));
+                        } else {
+                            self.toast(Level::Info, format!("{host} was not in scope"));
+                        }
+                    }
+                    // F7: both answer the capture state.
+                    "proxy.pause" | "proxy.resume" => {
+                        let capturing = value
+                            .get("capturing")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(name == "proxy.resume");
+                        self.capture_paused = !capturing;
+                        let msg = if capturing {
+                            "capture resumed"
+                        } else {
+                            "capture paused"
+                        };
+                        self.toast(Level::Info, msg);
+                    }
+                    "flow.clear" => {
+                        let n = |k: &str| value.get(k).and_then(Value::as_u64).unwrap_or(0);
+                        self.toast(
+                            Level::Info,
+                            format!(
+                                "cleared {} flows · {} in flight kept",
+                                n("cleared"),
+                                n("skipped_in_flight")
+                            ),
+                        );
+                    }
+                    // F6: the row's swatch and comment come from its detail,
+                    // which is now stale — drop it and ask again.
+                    "flow.mark" | "flow.comment" => {
+                        let msg = match (name.as_str(), &value) {
+                            ("flow.mark", Value::Array(marks)) if marks.is_empty() => {
+                                "marks cleared".to_string()
+                            }
+                            ("flow.mark", Value::Array(marks)) => format!(
+                                "marked: {}",
+                                marks
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            ),
+                            ("flow.mark", _) => "marks saved".to_string(),
+                            (_, Value::Null) => "comment cleared".to_string(),
+                            _ => "comment saved".to_string(),
+                        };
+                        self.toast(Level::Info, msg);
+                        if let Some(id) = self.selected.clone() {
+                            self.details.remove(&id);
+                            self.request_detail(&id, &mut out);
+                        }
+                    }
                     n if is_tracked_browser_call(n) => {
                         self.browser_settled();
                         self.on_browser_ok(n, &value, &mut out);
@@ -2749,6 +3129,24 @@ impl App {
                 if is_tracked_browser_call(&name) {
                     self.browser_settled();
                     self.browser.error = Some(message.clone());
+                }
+                match name.as_str() {
+                    // The reply names no path: it settles the oldest ask.
+                    "poc.get" => {
+                        if let Some(p) = self.poc_get_inflight.pop_front() {
+                            for f in self.findings.iter_mut().filter(|f| f.poc_path == p) {
+                                f.yaml_error = Some(message.clone());
+                            }
+                        }
+                    }
+                    "scope.remove" => {
+                        self.pending_scope_removals.pop_front();
+                    }
+                    "poc.artifact" => self.pending_artifact = None,
+                    "poc.build" => {
+                        self.poc_build_pending.pop_front();
+                    }
+                    _ => {}
                 }
                 self.toast(Level::Error, message);
             }
@@ -2873,6 +3271,53 @@ fn read_poc_yaml(path: &str) -> Result<String, String> {
     Ok(text)
 }
 
+/// `pause` → `Pause`, for a toast that starts a sentence.
+fn title_case(word: &str) -> String {
+    let mut c = word.chars();
+    match c.next() {
+        Some(first) => first.to_uppercase().chain(c).collect(),
+        None => String::new(),
+    }
+}
+
+/// C12: whether a `poc.build` reply is the PoC's YAML text rather than a
+/// path — it spans lines, or it neither contains a `/` nor ends in
+/// `.yaml`/`.yml`.
+fn looks_like_yaml(s: &str) -> bool {
+    s.contains('\n') || !(s.contains('/') || s.ends_with(".yaml") || s.ends_with(".yml"))
+}
+
+/// The file-name slug for a built PoC: the name the operator typed, lower
+/// case with spaces as `-`, reduced to safe characters; else `poc-<seq>`.
+fn poc_slug(name: Option<&str>, seq: usize) -> String {
+    let typed = name
+        .map(|n| open::safe_name(&n.trim().to_lowercase().replace([' ', '\t'], "-")))
+        .filter(|s| s != "flow");
+    typed.unwrap_or_else(|| format!("poc-{seq}"))
+}
+
+/// The scalar value of the first `key:` line in a YAML text (any indent),
+/// quotes stripped — enough to title a PoC the TUI just wrote.
+fn yaml_field(yaml: &str, key: &str) -> Option<String> {
+    yaml.lines().find_map(|l| {
+        let (k, v) = l.trim_start().split_once(':')?;
+        if k.trim() != key {
+            return None;
+        }
+        let v = v.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+        (!v.is_empty()).then(|| v.to_string())
+    })
+}
+
+/// The title `Finding::from_json` falls back to for a path: its file stem.
+fn default_title(poc_path: &str) -> String {
+    Path::new(poc_path)
+        .file_stem()
+        .and_then(|x| x.to_str())
+        .unwrap_or("poc")
+        .to_string()
+}
+
 /// Built-in `:` commands shown in the palette.
 pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("intercept", "Arm/disarm interception (i)"),
@@ -2901,6 +3346,7 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("agent all|readonly|paused", "Set the agent policy"),
     ("agent", "Open the agent panel and activity log"),
     ("ca", "CA panel: status, export, install, uninstall"),
+    ("config", "Config panel: the redacted config.get view"),
     (
         "browser",
         "Browser view: URL, DOM outline, screenshot; navigate and eval",
@@ -3010,6 +3456,7 @@ pub fn parse_kv_args(rest: &str, tool: Option<&ToolInfo>) -> Result<Value, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ProxyStatus;
     use serde_json::json;
 
     fn tools(names: &[&str]) -> Vec<ToolInfo> {
@@ -3610,21 +4057,27 @@ mod tests {
     #[test]
     fn open_externally_targets_screenshots_images_and_large_bodies() {
         let mut app = crate::fixture_app(200, 50);
-        // Findings: the screenshot path is resolved first (SEC-2); the
-        // fixture's relative path does not exist here, so nothing opens.
+        // Findings: the fixture bus is not on this machine, so the screenshot
+        // is fetched through `poc.artifact` (C10) rather than opened from a
+        // local path; nothing opens before the bytes arrive.
         let _ = app.update(Action::OpenFindings);
         app.finding_cursor = 0;
-        let _ = app.update(Action::OpenExternally);
+        assert_eq!(
+            app.update(Action::OpenExternally),
+            vec![BusRequest::Call {
+                name: "poc.artifact".into(),
+                args: json!({"path": "pocs/reflected-xss-search.png"})
+            }]
+        );
         assert!(
             app.take_open_target().is_none(),
-            "an unresolved path opens nothing"
+            "nothing opens before the bytes arrive"
         );
-        assert!(
-            app.current_toast()
-                .is_some_and(|t| t.text.starts_with("open: pocs/reflected-xss-search.png: ")),
-            "{:?}",
-            app.current_toast()
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("fetching screenshot pocs/reflected-xss-search.png (poc.artifact)")
         );
+        app.pending_artifact = None;
         let _ = app.update(Action::Down);
         let _ = app.update(Action::OpenExternally);
         assert!(app.take_open_target().is_none());
@@ -4058,6 +4511,526 @@ mod tests {
         );
         app.selected = None;
         assert_eq!(app.copy_text(), None);
+    }
+
+    // ------------------------------------------- core sync 2026-10-28 (C3–C12)
+
+    fn status(listening: bool, capturing: bool, paused: u64) -> ProxyStatus {
+        ProxyStatus {
+            listening,
+            address: Some("127.0.0.1:8080".into()),
+            intercept_armed: true,
+            capturing,
+            paused,
+            flows: 3,
+        }
+    }
+
+    /// C3: `proxy.status` drives the pill, the armed flag, the record toggle
+    /// and the store's paused count.
+    #[test]
+    fn proxy_status_event_sets_listening_armed_capture_and_paused() {
+        let mut app = app_with_flows();
+        assert_eq!(app.listening, None);
+        assert_eq!(app.serving, None);
+        assert!(app
+            .on_bus(BusEvent::ProxyStatus(status(true, false, 2)))
+            .is_empty());
+        assert_eq!(app.listening.as_deref(), Some("127.0.0.1:8080"));
+        assert_eq!(app.serving, Some(true));
+        assert!(app.intercept_armed);
+        assert!(app.capture_paused, "capturing: false is a paused capture");
+        assert_eq!(app.store_paused, Some(2));
+        let _ = app.on_bus(BusEvent::ProxyStatus(status(false, true, 0)));
+        assert_eq!(app.serving, Some(false));
+        assert!(!app.capture_paused);
+        assert_eq!(
+            app.listening.as_deref(),
+            Some("127.0.0.1:8080"),
+            "the configured address is still known while not serving"
+        );
+    }
+
+    /// C4: `:pause` → `proxy.pause`, `:record` → `proxy.resume`, each gated
+    /// on its own tool; the reply's `capturing` sets the toggle and toasts.
+    #[test]
+    fn pause_and_record_need_their_own_tools_and_follow_the_capture_state() {
+        let mut app = app_with_flows();
+        app.tools.extend(tools(&["proxy.pause"]));
+        assert_eq!(app.run_command("pause"), vec![BusRequest::ProxyPause(true)]);
+        assert!(app.run_command("record").is_empty());
+        assert!(app.current_toast().unwrap().text.contains("proxy.resume"));
+        app.tools.extend(tools(&["proxy.resume"]));
+        assert_eq!(
+            app.run_command("record"),
+            vec![BusRequest::ProxyPause(false)]
+        );
+        let reqs = app.on_bus(BusEvent::CallOk {
+            name: "proxy.pause".into(),
+            value: json!({"capturing": false}),
+        });
+        assert!(app.capture_paused);
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("capture paused")
+        );
+        assert_eq!(reqs, vec![BusRequest::Refresh]);
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "proxy.resume".into(),
+            value: json!({"capturing": true}),
+        });
+        assert!(!app.capture_paused);
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("capture resumed")
+        );
+    }
+
+    /// C5: `flow.clear` answers with counts; the toast says both.
+    #[test]
+    fn flow_clear_result_is_a_counted_toast_then_a_refresh() {
+        let mut app = app_with_flows();
+        let reqs = app.on_bus(BusEvent::CallOk {
+            name: "flow.clear".into(),
+            value: json!({"cleared": 12, "skipped_in_flight": 3}),
+        });
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("cleared 12 flows · 3 in flight kept")
+        );
+        assert_eq!(reqs, vec![BusRequest::Refresh]);
+    }
+
+    /// C6: after `flow.mark` / `flow.comment` the selected flow's detail is
+    /// stale (the row's swatch and comment come from it): drop it and ask again.
+    #[test]
+    fn mark_and_comment_results_refetch_the_selected_detail() {
+        let mut app = app_with_flows();
+        app.tools
+            .extend(tools(&["flow.detail", "flow.mark", "flow.comment"]));
+        app.selected = Some("f1".into());
+        let d = FlowDetail::from_json(&json!({"id":"f1","kind":"http","meta":{"marks":["red"]}}))
+            .unwrap();
+        let _ = app.on_bus(BusEvent::Detail(Box::new(d)));
+        assert_eq!(app.row("f1").unwrap().marks, vec!["red".to_string()]);
+        let reqs = app.on_bus(BusEvent::CallOk {
+            name: "flow.mark".into(),
+            value: json!(["red", "sky"]),
+        });
+        assert!(
+            !app.details.contains_key("f1"),
+            "the stale detail is dropped"
+        );
+        assert_eq!(
+            reqs,
+            vec![BusRequest::Detail("f1".into()), BusRequest::Refresh]
+        );
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("marked: red sky")
+        );
+        let d = FlowDetail::from_json(&json!({"id":"f1","kind":"http"})).unwrap();
+        let _ = app.on_bus(BusEvent::Detail(Box::new(d)));
+        let reqs = app.on_bus(BusEvent::CallOk {
+            name: "flow.comment".into(),
+            value: Value::Null,
+        });
+        assert_eq!(
+            reqs,
+            vec![BusRequest::Detail("f1".into()), BusRequest::Refresh]
+        );
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("comment cleared")
+        );
+    }
+
+    /// C7: `scope.remove` answers a bool; the toast names the host either way
+    /// and a removed host leaves the panel at once.
+    #[test]
+    fn scope_remove_result_names_the_host() {
+        let mut app = app_with_flows();
+        app.tools.extend(tools(&["scope.remove"]));
+        app.scope = vec!["a.test".into(), "b.test".into()];
+        assert_eq!(
+            app.run_command("scope rm a.test"),
+            vec![BusRequest::ScopeRemove("a.test".into())]
+        );
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "scope.remove".into(),
+            value: json!(true),
+        });
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("removed a.test")
+        );
+        assert_eq!(app.scope, vec!["b.test".to_string()]);
+        let _ = app.run_command("scope rm zzz.test");
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "scope.remove".into(),
+            value: json!(false),
+        });
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("zzz.test was not in scope")
+        );
+        assert_eq!(app.scope, vec!["b.test".to_string()]);
+    }
+
+    /// C8: a `poc.list` pass is the library: it fills paths with no run and
+    /// never overrides or drops a run result from this session.
+    #[test]
+    fn library_pass_merges_under_this_sessions_run_results() {
+        let mut app = App::new(TermCaps::full(), "10.0.0.5:9090");
+        app.tools = tools(&["poc.list", "poc.run"]);
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "poc.run".into(),
+            value: json!({"poc_path": "pocs/a.yaml", "passed": true, "finding_capture": "f1",
+                          "evaluated": [{"assertion": "status == 200", "matched": true}]}),
+        });
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "poc.run".into(),
+            value: json!({"poc_path": "pocs/gone.yaml", "passed": false}),
+        });
+        assert_eq!(app.findings.len(), 2);
+        let library = vec![
+            Finding::from_json(
+                &json!({"poc_path": "pocs/a.yaml", "id": "a", "title": "A", "severity": "high"}),
+            )
+            .unwrap(),
+            Finding::from_json(
+                &json!({"poc_path": "pocs/b.yaml", "id": "b", "title": "B", "severity": "low",
+                                       "description": "about b"}),
+            )
+            .unwrap(),
+        ];
+        let _ = app.on_bus(BusEvent::Findings(library.clone()));
+        let paths: Vec<&str> = app.findings.iter().map(|f| f.poc_path.as_str()).collect();
+        assert_eq!(paths, vec!["pocs/gone.yaml", "pocs/a.yaml", "pocs/b.yaml"]);
+        let a = app
+            .findings
+            .iter()
+            .find(|f| f.poc_path == "pocs/a.yaml")
+            .unwrap();
+        assert!(a.ran && a.passed, "the run's verdict wins over the library");
+        assert_eq!(a.assertions.len(), 1);
+        let b = app
+            .findings
+            .iter()
+            .find(|f| f.poc_path == "pocs/b.yaml")
+            .unwrap();
+        assert!(!b.ran);
+        assert_eq!(b.title, "B");
+        assert_eq!(b.description.as_deref(), Some("about b"));
+        let gone = app
+            .findings
+            .iter()
+            .find(|f| f.poc_path == "pocs/gone.yaml")
+            .unwrap();
+        assert!(
+            gone.ran && !gone.passed,
+            "a run the library pass omits is kept"
+        );
+        // A second run of a path replaces its entry instead of duplicating it.
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "poc.run".into(),
+            value: json!({"poc_path": "pocs/b.yaml", "passed": true}),
+        });
+        assert_eq!(app.findings.len(), 3);
+        assert_eq!(app.findings[0].poc_path, "pocs/b.yaml");
+        assert!(app.findings[0].ran && app.findings[0].passed);
+        assert_eq!(app.findings[0].title, "B", "the library's title is kept");
+        assert_eq!(app.finding_cursor, 0);
+        // Script findings sit beside them and survive a library pass.
+        let _ = app.on_bus(BusEvent::ScriptFindings(vec![Finding::from_script_json(
+            &json!({"name": "admin write", "severity": "high", "source": "observer", "at": 1}),
+        )
+        .unwrap()]));
+        assert_eq!(app.findings.len(), 4);
+        let _ = app.on_bus(BusEvent::Findings(library));
+        assert_eq!(app.findings.len(), 4);
+        assert!(app
+            .findings
+            .iter()
+            .any(|f| f.script.as_deref() == Some("observer")));
+        // `r` on a script finding has nothing to run.
+        app.mode = Mode::Findings;
+        app.finding_cursor = 3;
+        assert!(app.update(Action::PocRerun).is_empty());
+        assert_eq!(app.mode, Mode::Findings);
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("a script finding has no PoC to run")
+        );
+    }
+
+    /// C9: with `poc.get` on the bus the YAML comes over the bus, once per
+    /// path, and never from this machine's disk.
+    #[test]
+    fn poc_get_fills_the_yaml_when_the_bus_has_it() {
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        assert!(app.is_loopback_bus());
+        app.tools = tools(&["poc.list", "poc.get"]);
+        let library = vec![
+            Finding::from_json(&json!({"poc_path": "/nonexistent/a.yaml", "title": "A"})).unwrap(),
+            Finding::from_json(&json!({"poc_path": "/nonexistent/b.yaml", "title": "B"})).unwrap(),
+        ];
+        let reqs = app.on_bus(BusEvent::Findings(library.clone()));
+        assert_eq!(
+            reqs,
+            vec![
+                BusRequest::PocGet("/nonexistent/a.yaml".into()),
+                BusRequest::PocGet("/nonexistent/b.yaml".into())
+            ]
+        );
+        assert!(
+            app.findings.iter().all(|f| f.yaml_error.is_none()),
+            "no disk read when poc.get exists: {:?}",
+            app.findings
+        );
+        // The same pass again asks nothing while the first is in flight.
+        assert!(app.on_bus(BusEvent::Findings(library.clone())).is_empty());
+        let reqs = app.on_bus(BusEvent::CallOk {
+            name: "poc.get".into(),
+            value: json!({"poc_path": "/nonexistent/a.yaml", "id": "a", "title": "A", "severity": "high",
+                          "description": "about a", "yaml": "name: A\n"}),
+        });
+        assert!(reqs.is_empty(), "a read is not a mutation: no refresh");
+        let a = app
+            .findings
+            .iter()
+            .find(|f| f.poc_path == "/nonexistent/a.yaml")
+            .unwrap();
+        assert_eq!(a.yaml.as_deref(), Some("name: A\n"));
+        assert_eq!(a.description.as_deref(), Some("about a"));
+        let _ = app.on_bus(BusEvent::CallFailed {
+            name: "poc.get".into(),
+            message: "poc.get: not found or outside the configured PoC directory".into(),
+        });
+        let b = app
+            .findings
+            .iter()
+            .find(|f| f.poc_path == "/nonexistent/b.yaml")
+            .unwrap();
+        assert_eq!(
+            b.yaml_error.as_deref(),
+            Some("poc.get: not found or outside the configured PoC directory")
+        );
+        // A later pass asks for neither again.
+        assert!(app.on_bus(BusEvent::Findings(library)).is_empty());
+    }
+
+    /// C10: on a bus that is not loopback the screenshot comes through
+    /// `poc.artifact` and lands in a private temp file for `o`.
+    #[test]
+    fn findings_o_fetches_the_screenshot_through_poc_artifact_off_loopback() {
+        let mut app = App::new(TermCaps::full(), "10.0.0.5:9090");
+        app.tools = tools(&["poc.list", "poc.artifact"]);
+        app.findings = vec![Finding::from_json(
+            &json!({"poc_path": "pocs/x.yaml", "passed": true, "screenshot_path": "/srv/out/x.png"}),
+        )
+        .unwrap()];
+        app.mode = Mode::Findings;
+        assert_eq!(
+            app.update(Action::OpenExternally),
+            vec![BusRequest::Call {
+                name: "poc.artifact".into(),
+                args: json!({"path": "/srv/out/x.png"})
+            }]
+        );
+        assert!(
+            app.take_open_target().is_none(),
+            "nothing opens before the bytes arrive"
+        );
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&[0u8; 32]);
+        let reqs = app.on_bus(BusEvent::CallOk {
+            name: "poc.artifact".into(),
+            value: Value::String(crate::base64::encode(&png)),
+        });
+        assert!(reqs.is_empty(), "a read is not a mutation: no refresh");
+        let t = app.take_open_target().expect("the screenshot opens");
+        assert!(
+            t.path.ends_with("aitm-tui-poc-screenshot.png"),
+            "{}",
+            t.path.display()
+        );
+        assert_eq!(std::fs::read(&t.path).unwrap(), png);
+        assert_eq!(t.label, "screenshot /srv/out/x.png");
+        let _ = std::fs::remove_file(&t.path);
+        // Bytes that are not an image are refused.
+        let _ = app.update(Action::OpenExternally);
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "poc.artifact".into(),
+            value: Value::String(crate::base64::encode(b"hello")),
+        });
+        assert!(app.take_open_target().is_none());
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("poc.artifact: /srv/out/x.png is not an image")
+        );
+        // Without `poc.artifact` an unresolved path is the old refusal.
+        app.tools.retain(|t| t.name != "poc.artifact");
+        assert!(app.update(Action::OpenExternally).is_empty());
+        assert!(app
+            .current_toast()
+            .is_some_and(|t| t.text.starts_with("open: /srv/out/x.png: ")));
+    }
+
+    /// C11: `:config` asks `config.get` and shows the redacted object; without
+    /// the tool the panel is labelled.
+    #[test]
+    fn config_command_fetches_and_holds_the_redacted_config() {
+        let mut app = app_with_flows();
+        assert!(app.run_command("config").is_empty());
+        assert_eq!(app.mode, Mode::Config);
+        assert!(app.current_toast().unwrap().text.contains("F7"));
+        let _ = app.update(Action::Back);
+        assert_eq!(app.mode, Mode::Flows);
+        app.tools.extend(tools(&["config.get"]));
+        assert_eq!(
+            app.run_command("config"),
+            vec![BusRequest::Call {
+                name: "config.get".into(),
+                args: json!({})
+            }]
+        );
+        assert_eq!(app.mode, Mode::Config);
+        let reqs = app.on_bus(BusEvent::CallOk {
+            name: "config.get".into(),
+            value: json!({"listen": "127.0.0.1:8080", "scope": {"entries": ["a.test"]}}),
+        });
+        assert!(reqs.is_empty(), "a read is not a mutation: no refresh");
+        assert_eq!(app.config.as_ref().unwrap()["listen"], "127.0.0.1:8080");
+        // The scope panel asks for it once too (its rate-limit readout).
+        app.config = None;
+        assert_eq!(
+            app.update(Action::OpenScope),
+            vec![BusRequest::Call {
+                name: "config.get".into(),
+                args: json!({})
+            }]
+        );
+    }
+
+    /// C12: the core's `poc.build` returns the YAML text, not a path. The TUI
+    /// writes it under the PoC dir (never overwriting), toasts the path and
+    /// lists it as a library entry `r` can run.
+    #[test]
+    fn poc_build_yaml_text_is_written_under_the_poc_dir_and_listed() {
+        let dir = std::env::temp_dir().join(format!("aitm-tui-poc-build-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = app_with_flows();
+        app.tools.extend(tools(&["poc.build", "poc.run"]));
+        app.poc_dir = Some(dir.clone());
+        app.selected = Some("f1".into());
+        let _ = app.update(Action::BuildPoc);
+        for c in "Reflected XSS".chars() {
+            let _ = app.update(Action::Input(c));
+        }
+        let _ = app.update(Action::Submit);
+        assert_eq!(app.update(Action::Submit).len(), 1, "poc.build is sent");
+        let yaml = "id: reflected-xss\ninfo:\n  name: Reflected XSS in q\n  severity: high\n";
+        let reqs = app.on_bus(BusEvent::CallOk {
+            name: "poc.build".into(),
+            value: Value::String(yaml.into()),
+        });
+        let path = dir.join("reflected-xss.yaml");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml);
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some(format!("PoC written: {}", path.display())).as_deref()
+        );
+        assert_eq!(reqs, vec![BusRequest::Refresh]);
+        let f = app
+            .findings
+            .iter()
+            .find(|f| f.poc_path == path.to_string_lossy())
+            .expect("listed as a library entry");
+        assert!(!f.ran);
+        assert_eq!(f.title, "Reflected XSS in q");
+        assert_eq!(f.severity, crate::model::Severity::High);
+        assert_eq!(f.yaml.as_deref(), Some(yaml));
+        // `r` on it runs that path.
+        app.mode = Mode::Findings;
+        app.finding_cursor = app
+            .findings
+            .iter()
+            .position(|x| x.poc_path == f.poc_path)
+            .unwrap();
+        let _ = app.update(Action::PocRerun);
+        let _ = app.update(Action::Submit);
+        assert_eq!(
+            app.update(Action::Submit),
+            vec![BusRequest::PocRun {
+                poc_path: path.to_string_lossy().into_owned(),
+                target: None,
+                vars: None
+            }]
+        );
+        // A second build with the same name never overwrites: `-2`.
+        app.mode = Mode::Flows;
+        let _ = app.update(Action::BuildPoc);
+        for c in "Reflected XSS".chars() {
+            let _ = app.update(Action::Input(c));
+        }
+        let _ = app.update(Action::Submit);
+        let _ = app.update(Action::Submit);
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "poc.build".into(),
+            value: Value::String("id: again\n".into()),
+        });
+        let second = dir.join("reflected-xss-2.yaml");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "id: again\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml, "untouched");
+        // A blank name falls back to the flow's sequence number.
+        let _ = app.update(Action::BuildPoc);
+        let _ = app.update(Action::Submit);
+        let _ = app.update(Action::Submit);
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "poc.build".into(),
+            value: Value::String("id: blank\n".into()),
+        });
+        assert!(dir.join("poc-1.yaml").is_file());
+        // A path-looking reply keeps today's behaviour.
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "poc.build".into(),
+            value: json!("pocs/reflected-xss.yaml"),
+        });
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("PoC written: pocs/reflected-xss.yaml")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        // No PoC dir anywhere: the temp fallback, and the toast says so.
+        app.poc_dir = None;
+        app.config = None;
+        let _ = app.update(Action::BuildPoc);
+        for c in "fallback".chars() {
+            let _ = app.update(Action::Input(c));
+        }
+        let _ = app.update(Action::Submit);
+        let _ = app.update(Action::Submit);
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "poc.build".into(),
+            value: Value::String("id: fallback\n".into()),
+        });
+        let fallback = std::env::temp_dir().join("aitm-pocs");
+        let toast = app.current_toast().unwrap().text.clone();
+        assert!(
+            toast.starts_with(&format!(
+                "PoC written: {}",
+                fallback.join("fallback").display()
+            )),
+            "{toast}"
+        );
+        assert!(toast.contains("no PoC dir configured"), "{toast}");
+        assert!(toast.contains("--poc-dir"), "{toast}");
+        for entry in std::fs::read_dir(&fallback).unwrap().flatten() {
+            if entry.file_name().to_string_lossy().starts_with("fallback") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 
     #[test]

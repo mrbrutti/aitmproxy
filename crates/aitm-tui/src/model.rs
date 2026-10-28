@@ -147,16 +147,22 @@ impl FlowRow {
                 self.scheme = s.clone();
             }
             self.version = req.version.clone();
-            self.req_size = Some(req.body.len() as u64);
+            self.req_size = Some(req.size());
         }
         if let Some(resp) = &d.response {
             self.status = resp.status.or(self.status);
-            self.resp_size = Some(resp.body.len() as u64);
+            self.resp_size = Some(resp.size());
             self.content_type = resp.content_type();
         }
         if let Some(c) = &d.client_conn {
-            self.client = c.process.clone().or_else(|| c.peer.clone());
+            // The Client column is the owning process (null until the core
+            // resolves peer→process, foundation Q6); the peer address stays
+            // on the Connection tab.
+            self.client = c.process.clone();
             self.tls = Some(c.tls);
+        }
+        if d.kind == FlowKind::WebSocket && self.ws_messages.is_none() {
+            self.ws_messages = i64::try_from(d.messages.len()).ok();
         }
         self.time = d.meta.created.clone();
         self.duration_ms = d.meta.duration_ms;
@@ -222,10 +228,19 @@ pub struct Message {
     /// Name/value pairs in wire order; names as sent.
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// The core's `body_size`: the stored body's length even when `body` is
+    /// null (body mode `none`, or a body still streaming).
+    pub body_size: Option<u64>,
     pub body_truncated: bool,
 }
 
 impl Message {
+    /// The body's size for the list columns: `body_size` when the core
+    /// reported one, else the bytes it sent.
+    pub fn size(&self) -> u64 {
+        self.body_size.unwrap_or(self.body.len() as u64)
+    }
+
     fn parse(v: &Value) -> Self {
         let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
         let headers = match v.get("headers") {
@@ -264,6 +279,7 @@ impl Message {
             version: s("version"),
             headers,
             body,
+            body_size: v.get("body_size").and_then(Value::as_u64),
             body_truncated: v
                 .get("body_truncated")
                 .and_then(Value::as_bool)
@@ -298,6 +314,9 @@ pub struct Conn {
     pub sni: Option<String>,
     pub alpn: Option<String>,
     pub tls: bool,
+    /// When the connection was established (RFC3339), as the core reports it.
+    pub established: Option<String>,
+    /// The owning process; `None` until the core resolves it (foundation Q6).
     pub process: Option<String>,
 }
 
@@ -309,6 +328,7 @@ impl Conn {
             sni: s("sni"),
             alpn: s("alpn"),
             tls: v.get("tls").and_then(Value::as_bool).unwrap_or(false),
+            established: s("established"),
             process: s("process"),
         }
     }
@@ -326,14 +346,67 @@ pub struct Meta {
     pub origin: Origin,
 }
 
-/// One WebSocket frame.
+/// A WebSocket message's direction, as `flow.detail` labels it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsDir {
+    ClientToServer,
+    ServerToClient,
+}
+
+impl WsDir {
+    /// `client_to_server` / `server_to_client`; anything else is unknown.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "client_to_server" => Some(Self::ClientToServer),
+            "server_to_client" => Some(Self::ServerToClient),
+            _ => None,
+        }
+    }
+
+    /// The glyph the frame list draws: `→` to the server, `←` back.
+    pub fn arrow(self) -> &'static str {
+        match self {
+            Self::ClientToServer => "→",
+            Self::ServerToClient => "←",
+        }
+    }
+}
+
+/// One WebSocket message (`flow.detail` `messages[]`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WsFrame {
-    pub dir: String,
+    /// `None` when the bus named a direction the model does not know.
+    pub dir: Option<WsDir>,
     pub opcode: String,
+    /// The core's `length`: the message's size even when `data` is null.
+    pub length: Option<u64>,
     pub data: Vec<u8>,
-    pub time: Option<String>,
+    pub timestamp: Option<String>,
     pub injected: bool,
+}
+
+impl WsFrame {
+    fn parse(f: &Value) -> Self {
+        Self {
+            dir: f.get("dir").and_then(Value::as_str).and_then(WsDir::parse),
+            opcode: f
+                .get("opcode")
+                .and_then(Value::as_str)
+                .unwrap_or("text")
+                .to_string(),
+            length: f.get("length").and_then(Value::as_u64),
+            data: f
+                .get("data")
+                .and_then(Value::as_str)
+                .and_then(crate::base64::decode)
+                .unwrap_or_default(),
+            timestamp: f
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            injected: f.get("injected").and_then(Value::as_bool).unwrap_or(false),
+        }
+    }
 }
 
 /// Everything the inspector shows for one flow.
@@ -348,7 +421,8 @@ pub struct FlowDetail {
     pub meta: Meta,
     pub intercept: Intercept,
     pub edited: bool,
-    pub frames: Vec<WsFrame>,
+    /// A WebSocket flow's messages, oldest first; empty for HTTP.
+    pub messages: Vec<WsFrame>,
 }
 
 impl FlowDetail {
@@ -385,32 +459,10 @@ impl FlowDetail {
                 .unwrap_or(false),
             origin: Origin::parse(meta_v.get("origin")),
         };
-        let frames = v
-            .get("frames")
+        let messages = v
+            .get("messages")
             .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .map(|f| WsFrame {
-                        dir: f
-                            .get("dir")
-                            .and_then(Value::as_str)
-                            .unwrap_or("?")
-                            .to_string(),
-                        opcode: f
-                            .get("opcode")
-                            .and_then(Value::as_str)
-                            .unwrap_or("text")
-                            .to_string(),
-                        data: f
-                            .get("data")
-                            .and_then(Value::as_str)
-                            .and_then(crate::base64::decode)
-                            .unwrap_or_default(),
-                        time: f.get("time").and_then(Value::as_str).map(str::to_string),
-                        injected: f.get("injected").and_then(Value::as_bool).unwrap_or(false),
-                    })
-                    .collect()
-            })
+            .map(|a| a.iter().map(WsFrame::parse).collect())
             .unwrap_or_default();
         Some(Self {
             id,
@@ -437,8 +489,42 @@ impl FlowDetail {
             meta,
             intercept: Intercept::parse(v.get("intercept").and_then(Value::as_str).unwrap_or("")),
             edited: v.get("edited").and_then(Value::as_bool).unwrap_or(false),
-            frames,
+            messages,
         })
+    }
+}
+
+/// `proxy.status` as the control plugin (F7) reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyStatus {
+    /// Whether the proxy is actually serving (false on a one-shot command
+    /// that never bound).
+    pub listening: bool,
+    /// The configured listen address.
+    pub address: Option<String>,
+    pub intercept_armed: bool,
+    /// Whether new flows are retained (`proxy.pause` turns this off).
+    pub capturing: bool,
+    /// Parked (intercepted) flows in the store.
+    pub paused: u64,
+    /// Visible flows in the store.
+    pub flows: u64,
+}
+
+impl ProxyStatus {
+    /// Parse the result object. Lenient: a missing flag reads as the quiet
+    /// state (not listening, not armed, capturing).
+    pub fn from_json(v: &Value) -> Self {
+        let b = |k: &str, default: bool| v.get(k).and_then(Value::as_bool).unwrap_or(default);
+        let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+        Self {
+            listening: b("listening", false),
+            address: v.get("address").and_then(Value::as_str).map(str::to_string),
+            intercept_armed: b("intercept_armed", false),
+            capturing: b("capturing", true),
+            paused: n("paused"),
+            flows: n("flows"),
+        }
     }
 }
 
@@ -474,29 +560,79 @@ impl Severity {
     }
 }
 
-/// One PoC run (the Findings panel, §2.7).
+/// One entry of the Findings panel (§2.7): a PoC from the library
+/// (`poc.list`, not run yet), a `poc.run` result (run, with a verdict), or a
+/// finding a Rhai script recorded (`findings.list`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
     pub title: String,
     pub severity: Severity,
     pub target: String,
+    /// Whether this entry carries a verdict: true for a `poc.run` result
+    /// (`passed` / `evaluated` present) and a script finding; false for a
+    /// library entry, which only names a PoC file.
+    pub ran: bool,
     pub passed: bool,
     pub when: String,
     pub origin: Origin,
+    /// The PoC file; empty for a script finding, which has none.
     pub poc_path: String,
+    /// The PoC's `info.description` (from `poc.get`, or the library entry).
+    pub description: Option<String>,
+    /// The script that recorded this finding (`findings.list` `source`).
+    pub script: Option<String>,
     pub finding_capture: Option<String>,
     pub screenshot_path: Option<String>,
     /// `(assertion, matched)`.
     pub assertions: Vec<(String, bool)>,
-    /// The PoC YAML, from the result or (on a loopback bus) read from
-    /// `poc_path` by the app.
+    /// The PoC YAML, from `poc.get`, the result, or (on a loopback bus
+    /// without `poc.get`) read from `poc_path` by the app.
     pub yaml: Option<String>,
-    /// Why `poc_path` could not be read, when the app tried.
+    /// Why the YAML could not be read, when the app tried.
     pub yaml_error: Option<String>,
 }
 
 impl Finding {
-    /// Parse one entry of `poc.list` (F13) or a `poc.run` result.
+    /// Parse one `findings.list` entry (a Rhai `finding(...)`): `at` is Unix
+    /// milliseconds, `source` the script's name. `None` without a `name`.
+    pub fn from_script_json(v: &Value) -> Option<Self> {
+        let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+        let title = s("name")?;
+        let when = v
+            .get("at")
+            .and_then(Value::as_i64)
+            .filter(|ms| *ms > 0)
+            .map(|ms| {
+                let secs = (ms / 1000).rem_euclid(86_400);
+                format!(
+                    "{:02}:{:02}:{:02}.{:03}",
+                    secs / 3600,
+                    (secs / 60) % 60,
+                    secs % 60,
+                    ms.rem_euclid(1000)
+                )
+            })
+            .unwrap_or_default();
+        Some(Self {
+            title,
+            severity: Severity::parse(v.get("severity").and_then(Value::as_str).unwrap_or("info")),
+            target: String::new(),
+            ran: true,
+            passed: true,
+            when,
+            origin: Origin::Unknown,
+            poc_path: String::new(),
+            description: s("detail"),
+            script: Some(s("source").unwrap_or_else(|| "script".into())),
+            finding_capture: s("flow_id"),
+            screenshot_path: None,
+            assertions: Vec::new(),
+            yaml: None,
+            yaml_error: None,
+        })
+    }
+
+    /// Parse one entry of `poc.list` (a library file) or a `poc.run` result.
     pub fn from_json(v: &Value) -> Option<Self> {
         let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
         let poc_path = s("poc_path")?;
@@ -524,10 +660,13 @@ impl Finding {
             }),
             severity: Severity::parse(v.get("severity").and_then(Value::as_str).unwrap_or("info")),
             target: s("target").unwrap_or_default(),
+            ran: v.get("passed").is_some() || v.get("evaluated").is_some(),
             passed: v.get("passed").and_then(Value::as_bool).unwrap_or(false),
             when: s("at").or_else(|| s("when")).unwrap_or_default(),
             origin: Origin::parse(v.get("origin")),
             poc_path,
+            description: s("description"),
+            script: None,
             finding_capture: s("finding_capture"),
             screenshot_path: s("screenshot_path"),
             assertions,
@@ -857,6 +996,147 @@ mod tests {
             d.response.as_ref().unwrap().content_type()
         );
         assert_eq!(row.content_type.as_deref(), Some("text/html"));
+    }
+
+    /// C1: the core's WebSocket `flow.detail` — `messages`, not `frames`;
+    /// `dir` as `client_to_server` / `server_to_client`; `timestamp`; `data`
+    /// base64 or null.
+    #[test]
+    fn detail_parses_websocket_messages_in_the_core_shape() {
+        let v = json!({"id":"w1","kind":"websocket","handshake":"f40",
+            "messages":[
+                {"dir":"client_to_server","opcode":"text","length":5,"injected":false,
+                 "timestamp":"2026-10-27T11:05:05.001Z","data":"aGVsbG8="},
+                {"dir":"server_to_client","opcode":"binary","length":2,"injected":true,
+                 "timestamp":"2026-10-27T11:05:05.040Z","data":null},
+                {"dir":"sideways"}
+            ],
+            "client_conn":{"peer":"127.0.0.1:1","sni":null,"alpn":null,"tls":true,
+                           "established":"2026-10-27T11:05:04.900Z","process":null},
+            "server_conn":null,
+            "meta":{"marks":[],"comment":null,"is_replay":false,"created":"2026-10-27T11:05:04.966Z",
+                    "duration_ms":null,"truncated":false,"edited":false,"origin":null},
+            "intercept":"observed","edited":false});
+        let d = FlowDetail::from_json(&v).unwrap();
+        assert_eq!(d.kind, FlowKind::WebSocket);
+        assert!(d.request.is_none() && d.response.is_none());
+        assert_eq!(d.messages.len(), 3);
+        assert_eq!(d.messages[0].dir, Some(WsDir::ClientToServer));
+        assert_eq!(d.messages[0].data, b"hello");
+        assert_eq!(d.messages[0].length, Some(5));
+        assert_eq!(
+            d.messages[0].timestamp.as_deref(),
+            Some("2026-10-27T11:05:05.001Z")
+        );
+        assert_eq!(d.messages[1].dir, Some(WsDir::ServerToClient));
+        assert_eq!(d.messages[1].opcode, "binary");
+        assert!(d.messages[1].injected);
+        assert!(d.messages[1].data.is_empty(), "data: null is no bytes");
+        assert_eq!(
+            d.messages[2].dir, None,
+            "an unknown direction is not guessed"
+        );
+        assert_eq!(WsDir::ClientToServer.arrow(), "→");
+        assert_eq!(WsDir::ServerToClient.arrow(), "←");
+        assert_eq!(
+            d.client_conn.as_ref().unwrap().established.as_deref(),
+            Some("2026-10-27T11:05:04.900Z")
+        );
+        // The row's message count comes from the detail when the summary lacked it.
+        let mut row =
+            FlowRow::from_summary(&json!({"id":"w1","kind":"websocket","handshake":"f40"}), 1)
+                .unwrap();
+        assert_eq!(row.ws_messages, None);
+        row.apply_detail(&d);
+        assert_eq!(row.ws_messages, Some(3));
+        assert_eq!(row.client, None, "process is null: no client");
+    }
+
+    /// C2: `body: null` with `body_size` (body mode `none`, or a body still
+    /// streaming) feeds the size columns; `client_conn.process: null` is a
+    /// dash in the Client column, never the peer address.
+    #[test]
+    fn detail_uses_body_size_when_the_body_is_null_and_no_client_without_a_process() {
+        let v = json!({"id":"f1","kind":"http",
+            "request":{"method":"GET","scheme":"https","authority":"h.test","path":"/","version":"HTTP/1.1",
+                       "headers":[],"body":null,"body_size":1234,"body_truncated":false},
+            "response":{"status":200,"version":"HTTP/1.1","headers":[["content-type","text/plain"]],
+                        "body":null,"body_size":0,"body_truncated":false},
+            "client_conn":{"peer":"127.0.0.1:50000","sni":null,"alpn":null,"tls":false,
+                           "established":"2026-10-27T11:05:04.900Z","process":null},
+            "server_conn":{"peer":"203.0.113.1:443","sni":"h.test","alpn":"http/1.1","tls":true,
+                           "established":"2026-10-27T11:05:04.950Z"},
+            "meta":{"marks":[],"comment":null,"is_replay":false,"created":"2026-10-27T11:05:04.966Z",
+                    "duration_ms":12,"truncated":false,"edited":false,"origin":null},
+            "intercept":"observed","edited":false});
+        let d = FlowDetail::from_json(&v).unwrap();
+        let req = d.request.as_ref().unwrap();
+        assert_eq!(req.body_size, Some(1234));
+        assert!(req.body.is_empty());
+        let mut row = FlowRow::from_summary(&json!({"id":"f1","kind":"http"}), 1).unwrap();
+        row.apply_detail(&d);
+        assert_eq!(row.req_size, Some(1234));
+        assert_eq!(row.resp_size, Some(0));
+        assert_eq!(row.client, None);
+        assert_eq!(
+            d.client_conn.as_ref().unwrap().peer.as_deref(),
+            Some("127.0.0.1:50000")
+        );
+        assert_eq!(row.origin, Origin::Unknown);
+        assert_eq!(row.duration_ms, Some(12));
+        // An inline body without `body_size` still sizes from the bytes.
+        let d = FlowDetail::from_json(&json!({"id":"f2","request":{"body":"aGVsbG8="}})).unwrap();
+        let mut row = FlowRow::from_summary(&json!({"id":"f2"}), 2).unwrap();
+        row.apply_detail(&d);
+        assert_eq!(row.req_size, Some(5));
+    }
+
+    /// C8: a `poc.list` entry is a PoC file, not a run — `ran` is false until
+    /// a `poc.run` result (which carries `passed` / `evaluated`) says otherwise.
+    #[test]
+    fn finding_from_a_library_entry_is_not_run_and_a_run_result_is() {
+        let lib = Finding::from_json(
+            &json!({"id":"open-redirect","title":"Open redirect","severity":"low",
+            "poc_path":"/pocs/open-redirect.yaml","description":"Follows next="}),
+        )
+        .unwrap();
+        assert!(!lib.ran);
+        assert_eq!(lib.description.as_deref(), Some("Follows next="));
+        assert_eq!(lib.title, "Open redirect");
+        assert_eq!(lib.severity, Severity::Low);
+        assert!(lib.assertions.is_empty());
+        let run = Finding::from_json(&json!({"poc_path":"/pocs/x.yaml","passed":false})).unwrap();
+        assert!(run.ran);
+        assert!(!run.passed);
+        assert_eq!(run.description, None);
+        assert!(
+            Finding::from_json(&json!({"poc_path":"/pocs/y.yaml","evaluated":[]}))
+                .unwrap()
+                .ran
+        );
+    }
+
+    /// C3: `proxy.status` as the control plugin shapes it.
+    #[test]
+    fn proxy_status_parses_the_control_plugin_shape() {
+        let s = ProxyStatus::from_json(&json!({"listening":true,"address":"127.0.0.1:8080",
+            "intercept_armed":false,"capturing":true,"paused":2,"flows":15}));
+        assert_eq!(
+            s,
+            ProxyStatus {
+                listening: true,
+                address: Some("127.0.0.1:8080".into()),
+                intercept_armed: false,
+                capturing: true,
+                paused: 2,
+                flows: 15
+            }
+        );
+        let off = ProxyStatus::from_json(&json!({"listening":false,"address":null}));
+        assert!(!off.listening);
+        assert_eq!(off.address, None);
+        assert!(off.capturing, "an absent capture state is not 'paused'");
+        assert_eq!(off.paused, 0);
     }
 
     #[test]

@@ -40,11 +40,11 @@ use futures::StreamExt as _;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::action::{Action, BusEvent, Level, ToolInfo};
+use crate::action::{Action, BusEvent, BusRequest, Level, ToolInfo};
 use crate::app::App;
 use crate::caps::TermCaps;
 use crate::fixture::{Fixture, FixtureTransport};
-use crate::model::{AgentState, Finding, FlowDetail};
+use crate::model::{AgentState, Finding, FlowDetail, ProxyStatus};
 use crate::theme::Theme;
 
 /// Where the UI gets its bus.
@@ -68,8 +68,13 @@ pub struct RunOptions {
     /// proxy's log went).
     pub startup_note: Option<String>,
     /// The proxy's listen address when the caller knows it (the embed does);
-    /// otherwise it comes from `proxy.status` (core follow-up F7) or stays unknown.
+    /// otherwise it comes from `proxy.status` (F7) or stays unknown.
     pub listening: Option<String>,
+    /// Where a built PoC is written (`poc.build` answers with the YAML text,
+    /// not a path): the embed passes `poc.dir`, the standalone client
+    /// `--poc-dir`. `None` falls back to `config.get`'s `poc_dir`, then a
+    /// temp directory the toast names.
+    pub poc_dir: Option<PathBuf>,
 }
 
 /// Restores the terminal when dropped, so a caller that drops the `run`
@@ -139,6 +144,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     if let Some(listening) = opts.listening {
         app.listening = Some(listening);
     }
+    app.poc_dir = opts.poc_dir;
 
     let mut terminal = ratatui::init();
     let _guard = TerminalGuard { bus_task };
@@ -204,19 +210,34 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     result
 }
 
-/// The 22 commands the bus serves today (foundation §4.1), in the spec's
-/// order — what [`fixture_app_core`] limits the fixture to.
+/// The 37 commands the bus serves today — `tools/list` of the core as of
+/// the 2026-10-28 merge: foundation §4.1's 22, plus `flow.detail` (F5),
+/// `flow.mark` / `flow.comment` (F6), `proxy.status` / `proxy.pause` /
+/// `proxy.resume` / `flow.clear` / `config.get` (F7), `scope.remove` (F12),
+/// `poc.list` / `poc.get` / `poc.artifact` (F13) and the M3 Rhai commands
+/// `findings.list`, `script.reload`, `script.validate`. What
+/// [`fixture_app_core`] limits the fixture to; `agent.status` / `agent.set`
+/// (F1) are the fixture's only tools still ahead of the core.
 pub const CORE_TOOLS: &[&str] = &[
     "flow.list",
     "flow.get",
+    "flow.detail",
     "flow.intercept",
     "flow.resume",
     "flow.kill",
     "flow.mutate",
     "flow.replay",
+    "flow.mark",
+    "flow.comment",
+    "flow.clear",
     "request.send",
     "scope.add",
+    "scope.remove",
     "scope.list",
+    "proxy.status",
+    "proxy.pause",
+    "proxy.resume",
+    "config.get",
     "browser.navigate",
     "browser.click",
     "browser.type",
@@ -225,6 +246,12 @@ pub const CORE_TOOLS: &[&str] = &[
     "browser.get_dom",
     "poc.build",
     "poc.run",
+    "poc.list",
+    "poc.get",
+    "poc.artifact",
+    "findings.list",
+    "script.reload",
+    "script.validate",
     "ca.export",
     "ca.status",
     "ca.install",
@@ -240,9 +267,9 @@ pub fn fixture_app(cols: u16, rows: u16) -> App {
 }
 
 /// [`fixture_app`] against the bus as it exists today: only [`CORE_TOOLS`]
-/// are offered, so nothing F-gated is loaded (no `flow.detail`, `agent.status`
-/// or `poc.list`) and every dependent surface shows its degraded state. This
-/// is what `aitm-tui --snapshot-core` renders.
+/// are offered. Since the 2026-10-28 core merge that is everything but the
+/// F1 agent tools, so the agent toggle and panel show their degraded state
+/// and the rest is lit. This is what `aitm-tui --snapshot-core` renders.
 pub fn fixture_app_core(cols: u16, rows: u16) -> App {
     load_fixture_app(Fixture::builtin(), cols, rows, true)
 }
@@ -265,14 +292,16 @@ fn load_fixture_app(mut fx: Fixture, cols: u16, rows: u16, core_only: bool) -> A
         })
         .filter(|t| !core_only || CORE_TOOLS.contains(&t.name.as_str()))
         .collect();
-    // The listen address comes from `proxy.status` (F7), which the core bus
-    // does not have: the core-only app does not know it either.
-    let listening = (!core_only).then(|| fx.listening.clone());
     let _ = app.on_bus(BusEvent::Connected {
         server: format!("{} {}", fx.server_name, fx.server_version),
         tools,
-        listening,
     });
+    // The handshake reads `proxy.status` (F7) when the bus has it.
+    if app.has_tool("proxy.status") {
+        if let Ok(v) = fx.call("proxy.status", &serde_json::Map::new()) {
+            let _ = app.on_bus(BusEvent::ProxyStatus(ProxyStatus::from_json(&v)));
+        }
+    }
     let ids: Vec<String> = fx
         .call("flow.list", &serde_json::Map::new())
         .ok()
@@ -307,10 +336,46 @@ fn load_fixture_app(mut fx: Fixture, cols: u16, rows: u16, core_only: bool) -> A
         agent.apply_status(&fx.agent);
         let _ = app.on_bus(BusEvent::Agent(agent));
     }
+    // The PoC library (`poc.list`, files not run), then the recorded run
+    // results replayed as `poc.run` answers — oldest first, so the newest
+    // ends up on top — then the YAML each asks for through `poc.get`.
+    let mut pending = Vec::new();
     if app.has_tool("poc.list") {
-        let findings = fx.findings.iter().filter_map(Finding::from_json).collect();
-        let _ = app.on_bus(BusEvent::Findings(findings));
+        if let Ok(Value::Array(items)) = fx.call("poc.list", &serde_json::Map::new()) {
+            let library = items.iter().filter_map(Finding::from_json).collect();
+            pending.extend(app.on_bus(BusEvent::Findings(library)));
+        }
     }
+    if app.has_tool("poc.run") {
+        for run in fx.findings.iter().rev() {
+            pending.extend(app.on_bus(BusEvent::CallOk {
+                name: "poc.run".into(),
+                value: run.clone(),
+            }));
+        }
+    }
+    for req in pending {
+        if let BusRequest::PocGet(path) = req {
+            let mut m = serde_json::Map::new();
+            m.insert("poc_path".into(), Value::String(path));
+            if let Ok(v) = fx.call("poc.get", &m) {
+                let _ = app.on_bus(BusEvent::CallOk {
+                    name: "poc.get".into(),
+                    value: v,
+                });
+            }
+        }
+    }
+    if app.has_tool("findings.list") {
+        if let Ok(v) = fx.call("findings.list", &serde_json::Map::new()) {
+            if let Some(items) = v.get("findings").and_then(Value::as_array) {
+                let list = items.iter().filter_map(Finding::from_script_json).collect();
+                let _ = app.on_bus(BusEvent::ScriptFindings(list));
+            }
+        }
+    }
+    // The replay above is a recording, not live events: no toasts from it.
+    app.toasts.clear();
     app.selected = Some("f50".into());
     app
 }

@@ -38,8 +38,10 @@ pub fn open_externally(t: &OpenTarget) -> std::io::Result<()> {
         .map(drop)
 }
 
-/// A flow id reduced to filename-safe characters (ids come from the bus).
-fn safe_name(id: &str) -> String {
+/// A flow id (or a typed PoC name) reduced to filename-safe characters:
+/// ASCII alphanumerics, `-` and `_`, at most 64 of them; `flow` when nothing
+/// survives.
+pub fn safe_name(id: &str) -> String {
     let s: String = id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))

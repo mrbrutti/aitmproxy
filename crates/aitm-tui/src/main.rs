@@ -2,12 +2,14 @@
 //! recorded fixture, or render a snapshot of the main screen to a file.
 //!
 //! ```text
-//! aitm-tui --bus 127.0.0.1:9090 --token-file ~/.aitm/bus.token
+//! aitm-tui --bus 127.0.0.1:9090 --token-file ~/.aitm/bus.token [--poc-dir dir]
 //! aitm-tui --fixture [path.json]
 //! aitm-tui --snapshot out.svg [--cols 200 --rows 50] [--fixture path]
-//! aitm-tui --snapshot-core out.svg      (the 22 core tools only)
+//! aitm-tui --snapshot-core out.svg      (the 37 core tools only)
 //! ```
-//! `--ansi` forces the 16-colour palette, `--truecolor` the hex palette.
+//! `--poc-dir` is where a built PoC (`P`) is written — `poc.build` answers
+//! with the YAML text; it should be the proxy's `poc.dir` so `poc.run` can
+//! read it back. `--ansi` forces the 16-colour palette, `--truecolor` the hex palette.
 //! `--token t` is accepted but visible to every process on the machine
 //! (`ps`); prefer `--token-file` or `AITM_BUS_TOKEN`. A bus that is not on
 //! loopback is refused unless `--allow-remote-bus` is given: the token
@@ -21,7 +23,7 @@ use aitm_tui::caps::TermCaps;
 use aitm_tui::theme::Theme;
 use aitm_tui::{fixture_app, fixture_app_core, snapshot, RunOptions, TransportChoice};
 
-const USAGE: &str = "usage: aitm-tui (--bus host:port (--token-file p | --token t (insecure: visible in ps)) [--allow-remote-bus] | --fixture [path]) [--ansi|--truecolor] [--poll ms]\n       aitm-tui --snapshot out.svg [--cols N --rows N]\n       aitm-tui --snapshot-core out.svg [--cols N --rows N]   (fixture limited to the 22 core tools)";
+const USAGE: &str = "usage: aitm-tui (--bus host:port (--token-file p | --token t (insecure: visible in ps)) [--allow-remote-bus] | --fixture [path]) [--poc-dir dir] [--ansi|--truecolor] [--poll ms]\n       aitm-tui --snapshot out.svg [--cols N --rows N]\n       aitm-tui --snapshot-core out.svg [--cols N --rows N]   (fixture limited to the 37 core tools)\n       --poc-dir: where P (poc.build) writes the PoC YAML; use the proxy's poc.dir so poc.run can read it";
 
 /// Why a non-loopback bus is refused without the flag.
 const REMOTE_BUS_REFUSED: &str = "refusing a bus that is not on loopback: the token would travel in cleartext (the TLS bus is core follow-up F15). Pass --allow-remote-bus to do it anyway.";
@@ -32,13 +34,15 @@ struct Args {
     token_file: Option<PathBuf>,
     fixture: Option<Option<PathBuf>>,
     snapshot: Option<PathBuf>,
-    /// `--snapshot-core`: the fixture with only the 22 core tools.
+    /// `--snapshot-core`: the fixture with only the 37 core tools.
     snapshot_core: bool,
     cols: u16,
     rows: u16,
     caps: Option<TermCaps>,
     poll_ms: u64,
     allow_remote_bus: bool,
+    /// `--poc-dir`: where a built PoC's YAML is written.
+    poc_dir: Option<PathBuf>,
 }
 
 /// S5: a bus address off loopback needs an explicit opt-in.
@@ -63,6 +67,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         caps: None,
         poll_ms: 500,
         allow_remote_bus: false,
+        poc_dir: None,
     };
     let mut i = 0;
     let value = |i: &mut usize, flag: &str| -> Result<String, String> {
@@ -89,6 +94,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 a.snapshot_core = true;
             }
             "--allow-remote-bus" => a.allow_remote_bus = true,
+            "--poc-dir" => a.poc_dir = Some(PathBuf::from(value(&mut i, "--poc-dir")?)),
             "--cols" => {
                 a.cols = value(&mut i, "--cols")?
                     .parse()
@@ -181,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
         poll: Duration::from_millis(args.poll_ms.max(100)),
         startup_note: None,
         listening: None,
+        poc_dir: args.poc_dir,
     })
     .await
 }
@@ -229,6 +236,28 @@ mod tests {
         ))
         .unwrap();
         assert!(a.allow_remote_bus);
+    }
+
+    /// C12: `--poc-dir` names where `P` writes the built PoC; it needs a value
+    /// and USAGE explains it.
+    #[test]
+    fn poc_dir_flag_takes_a_path_and_is_documented() {
+        let a = parse(&argv(
+            "--bus 127.0.0.1:9090 --token-file t --poc-dir /tmp/pocs",
+        ))
+        .unwrap();
+        assert_eq!(
+            a.poc_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/pocs"))
+        );
+        assert_eq!(parse(&argv("--fixture")).unwrap().poc_dir, None);
+        assert_eq!(
+            parse(&argv("--fixture --poc-dir")).err().as_deref(),
+            Some("--poc-dir needs a value")
+        );
+        assert!(USAGE.contains("[--poc-dir dir]"), "{USAGE}");
+        assert!(USAGE.contains("poc.build"), "{USAGE}");
+        assert!(USAGE.contains("37 core tools"), "{USAGE}");
     }
 
     #[test]

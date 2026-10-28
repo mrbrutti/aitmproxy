@@ -1409,7 +1409,7 @@ fn findings_panel_lists_runs_and_opens_the_capture() {
     );
     let _ = app.update(Action::OpenFindings);
     let text = text_of(&app, 200, 50);
-    assert!(text.contains("Findings — PoC runs"), "{text}");
+    assert!(text.contains("Findings — PoCs and runs"), "{text}");
     let first = line_with(&text, "Reflected XSS in /api/search q").unwrap();
     assert!(first.contains("✓") && first.contains("high"), "{first}");
     let second = line_with(&text, "IDOR on /api/cart/items/{id}").unwrap();
@@ -1432,7 +1432,8 @@ fn findings_panel_lists_runs_and_opens_the_capture() {
         "YAML: {text}"
     );
     assert!(text.contains("export needs core follow-up F13"), "{text}");
-    assert!(text.contains("2 findings"), "status bar: {text}");
+    // Two runs plus the library-only third PoC (C8: `poc.list` is files).
+    assert!(text.contains("3 findings"), "status bar: {text}");
 
     // Enter opens the finding capture in the inspector.
     assert_eq!(
@@ -1660,7 +1661,9 @@ fn agent_toggle_and_panel_follow_the_policy() {
 fn every_absent_tool_degrades_to_a_labelled_follow_up() {
     let mut app = App::new(TermCaps::full(), "x");
     let _ = app.update(Action::Resize(200, 50));
-    let _ = connect(&mut app, CORE_TOOLS, None);
+    // The pre-merge bus: none of the F5/F6/F7/F12/F13 tools, so each
+    // control's label is exercised (today's core has them all).
+    let _ = connect(&mut app, PRE_MERGE_TOOLS, None);
     app.scope = vec!["h.test".into()];
     let _ = app.on_bus(BusEvent::Flows(vec![
         summary("a", "GET", "h.test", "/a", Some(200), "observed"),
@@ -1762,6 +1765,7 @@ fn every_absent_tool_degrades_to_a_labelled_follow_up() {
         "agent.set",
         "flow.clear",
         "proxy.pause",
+        "proxy.resume",
         "flow.import",
         "scope.remove",
     ]));
@@ -1809,7 +1813,8 @@ fn every_absent_tool_degrades_to_a_labelled_follow_up() {
 /// row's state changes after its detail was loaded.
 #[test]
 fn tools_list_drives_detail_fetching() {
-    let core_only = |app: &mut App| connect(app, CORE_TOOLS, None);
+    // "A bus without flow.detail" is the pre-merge core now.
+    let core_only = |app: &mut App| connect(app, PRE_MERGE_TOOLS, None);
     let mut app = App::new(TermCaps::full(), "x");
     let _ = core_only(&mut app);
     let a = summary("a", "GET", "h.test", "/a", None, "observed");
@@ -1822,7 +1827,7 @@ fn tools_list_drives_detail_fetching() {
     assert!(text_of(&app, 200, 50).contains("need core follow-up F5"));
 
     let mut app = App::new(TermCaps::full(), "x");
-    let mut with_detail: Vec<&str> = CORE_TOOLS.to_vec();
+    let mut with_detail: Vec<&str> = PRE_MERGE_TOOLS.to_vec();
     with_detail.push("flow.detail");
     let _ = connect(&mut app, &with_detail, None);
     assert_eq!(

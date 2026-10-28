@@ -14,6 +14,7 @@ use aitm_bus_client::{BoxFuture, BusClient, BusTransport};
 use aitm_tui::action::{BusEvent, BusRequest, Level, ToolSchema as _};
 use aitm_tui::bus::{self, Connector, CLIENT_NAME};
 use aitm_tui::fixture::{Fixture, FixtureTransport, Shared};
+use aitm_tui::model::ProxyStatus;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -206,16 +207,10 @@ async fn connect_sequence_identifies_as_aitm_tui_and_builds_features_from_tools_
     let mut r = start(Fixture::builtin().shared(), Duration::from_millis(50));
 
     let first = timeout(WAIT, r.ev_rx.recv()).await.unwrap().unwrap();
-    let BusEvent::Connected {
-        server,
-        tools,
-        listening,
-    } = first
-    else {
+    let BusEvent::Connected { server, tools } = first else {
         panic!("the first event must be Connected, got {first:?}");
     };
     assert_eq!(server, "aitmproxy 0.3.0-fixture");
-    assert_eq!(listening.as_deref(), Some("127.0.0.1:8080"));
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     for n in [
         "flow.list",
@@ -230,9 +225,28 @@ async fn connect_sequence_identifies_as_aitm_tui_and_builds_features_from_tools_
         "scope.list",
         "flow.detail",
         "agent.status",
+        "proxy.resume",
+        "poc.get",
+        "poc.artifact",
+        "config.get",
+        "findings.list",
     ] {
         assert!(names.contains(&n), "{n} missing from {names:?}");
     }
+    // C3: the handshake reads `proxy.status` and reports it as its own event,
+    // in the control plugin's shape.
+    let second = timeout(WAIT, r.ev_rx.recv()).await.unwrap().unwrap();
+    assert_eq!(
+        second,
+        BusEvent::ProxyStatus(ProxyStatus {
+            listening: true,
+            address: Some("127.0.0.1:8080".into()),
+            intercept_armed: true,
+            capturing: true,
+            paused: 2,
+            flows: 15,
+        })
+    );
     let get = tools.iter().find(|t| t.name == "flow.get").unwrap();
     assert_eq!(
         get.description,
@@ -306,11 +320,24 @@ async fn connect_sequence_identifies_as_aitm_tui_and_builds_features_from_tools_
     };
     assert_eq!(a.policy, Some(aitm_tui::model::AgentPolicy::All));
     assert_eq!(a.log.len(), 7);
+    // C8: `poc.list` is the PoC library — files, not runs — so none has run.
     let findings = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Findings(_))).await;
     let BusEvent::Findings(f) = findings else {
         unreachable!()
     };
-    assert_eq!(f.len(), 2);
+    assert_eq!(f.len(), 3);
+    assert!(f.iter().all(|x| !x.ran), "{f:?}");
+    assert_eq!(f[0].poc_path, "pocs/idor-cart-items.yaml");
+    assert_eq!(f[0].title, "IDOR on /api/cart/items/{id}");
+    assert_eq!(f[2].poc_path, "pocs/reflected-xss-search.yaml");
+    // The Rhai findings sink and the proxy state ride on the slow pass too.
+    let scripted = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::ScriptFindings(_))).await;
+    assert_eq!(scripted, BusEvent::ScriptFindings(vec![]));
+    let status = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::ProxyStatus(_))).await;
+    assert!(
+        matches!(&status, BusEvent::ProxyStatus(s) if s.flows == 15 && s.paused == 2),
+        "{status:?}"
+    );
 
     // Settled flows are not re-fetched on the next poll; the paused ones are.
     let before = sent(&r.lines).len();
@@ -558,6 +585,132 @@ async fn requests_become_tool_calls_and_results_become_events() {
         .iter()
         .any(|w| w["params"]["name"] == "flow.list"));
 
+    finish(r).await;
+}
+
+/// C4: `proxy.pause` and `proxy.resume` are two parameterless tools whose
+/// result is the capture state; the one `ProxyPause(bool)` request picks
+/// the tool.
+#[tokio::test]
+async fn pause_and_resume_are_two_parameterless_tools_answering_the_capture_state() {
+    let mut r = start(Fixture::builtin().shared(), Duration::from_millis(50));
+    let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
+    r.req_tx.send(BusRequest::ProxyPause(true)).await.unwrap();
+    let ev = next_where(
+        &mut r.ev_rx,
+        |e| matches!(e, BusEvent::CallOk { name, .. } if name == "proxy.pause"),
+    )
+    .await;
+    assert_eq!(
+        ev,
+        BusEvent::CallOk {
+            name: "proxy.pause".into(),
+            value: json!({"capturing": false})
+        }
+    );
+    r.req_tx.send(BusRequest::ProxyPause(false)).await.unwrap();
+    let ev = next_where(
+        &mut r.ev_rx,
+        |e| matches!(e, BusEvent::CallOk { name, .. } if name == "proxy.resume"),
+    )
+    .await;
+    assert_eq!(
+        ev,
+        BusEvent::CallOk {
+            name: "proxy.resume".into(),
+            value: json!({"capturing": true})
+        }
+    );
+    let wire = sent(&r.lines);
+    let pause = wire
+        .iter()
+        .find(|w| tool_name(w) == "proxy.pause")
+        .expect("proxy.pause sent");
+    assert_eq!(pause["params"]["arguments"], json!({}));
+    let resume = wire
+        .iter()
+        .find(|w| tool_name(w) == "proxy.resume")
+        .expect("proxy.resume sent");
+    assert_eq!(resume["params"]["arguments"], json!({}));
+    finish(r).await;
+}
+
+/// C9: `PocGet(path)` is `poc.get {poc_path}`; the result carries the YAML
+/// and description the panel shows.
+#[tokio::test]
+async fn poc_get_asks_by_path_and_answers_with_the_yaml() {
+    let mut r = start(Fixture::builtin().shared(), Duration::from_millis(50));
+    let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
+    r.req_tx
+        .send(BusRequest::PocGet("pocs/idor-cart-items.yaml".into()))
+        .await
+        .unwrap();
+    let ev = next_where(
+        &mut r.ev_rx,
+        |e| matches!(e, BusEvent::CallOk { name, .. } if name == "poc.get"),
+    )
+    .await;
+    let BusEvent::CallOk { value, .. } = ev else {
+        unreachable!()
+    };
+    assert_eq!(value["poc_path"], "pocs/idor-cart-items.yaml");
+    assert_eq!(value["id"], "idor-cart-items");
+    assert_eq!(value["severity"], "medium");
+    assert!(value["yaml"]
+        .as_str()
+        .unwrap()
+        .starts_with("name: IDOR on /api/cart/items/{id}"));
+    assert!(value["description"].is_string());
+    let line = sent(&r.lines)
+        .into_iter()
+        .find(|w| tool_name(w) == "poc.get")
+        .unwrap();
+    assert_eq!(
+        line["params"]["arguments"],
+        json!({"poc_path": "pocs/idor-cart-items.yaml"})
+    );
+    // An unknown path is the tool's error, not a transport failure.
+    r.req_tx
+        .send(BusRequest::PocGet("pocs/nope.yaml".into()))
+        .await
+        .unwrap();
+    let ev = next_where(
+        &mut r.ev_rx,
+        |e| matches!(e, BusEvent::CallFailed { name, .. } if name == "poc.get"),
+    )
+    .await;
+    assert!(
+        matches!(&ev, BusEvent::CallFailed { message, .. } if message.starts_with("poc.get: ")),
+        "{ev:?}"
+    );
+    finish(r).await;
+}
+
+/// `findings.list` (the Rhai findings sink, M3) is read on the slow pass
+/// when the bus has it; each entry becomes a script finding.
+#[tokio::test]
+async fn findings_list_entries_arrive_as_script_findings() {
+    let fx = Fixture::parse(
+        r#"{"tools":[{"name":"flow.list"},{"name":"findings.list"}],
+            "script_findings":[{"name":"admin write","severity":"high","flow_id":"f1",
+                                "detail":"unauthenticated","tags":["auth"],"source":"observer",
+                                "at":39904067}]}"#,
+    )
+    .unwrap();
+    let mut r = start(fx.shared(), Duration::from_millis(50));
+    let ev = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::ScriptFindings(_))).await;
+    let BusEvent::ScriptFindings(list) = ev else {
+        unreachable!()
+    };
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].title, "admin write");
+    assert_eq!(list[0].severity, aitm_tui::model::Severity::High);
+    assert_eq!(list[0].script.as_deref(), Some("observer"));
+    assert_eq!(list[0].finding_capture.as_deref(), Some("f1"));
+    assert_eq!(list[0].description.as_deref(), Some("unauthenticated"));
+    assert_eq!(list[0].when, "11:05:04.067");
+    assert!(list[0].ran);
+    assert_eq!(list[0].poc_path, "");
     finish(r).await;
 }
 

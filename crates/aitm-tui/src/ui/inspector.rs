@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 
 use crate::app::{tab_follow_up, App, Mode, Pane, REQUEST_TABS, RESPONSE_TABS};
 use crate::model::{
-    clock_of, human_bytes, human_ms, FlowDetail, FlowKind, FlowRow, Intercept, Message,
+    clock_of, human_bytes, human_ms, FlowDetail, FlowKind, FlowRow, Intercept, Message, WsDir,
 };
 use crate::theme::Theme;
 use crate::tokens::color;
@@ -407,8 +407,19 @@ fn content<'a>(
                         ));
                         rows.push(("  sni", c.sni.clone().unwrap_or_else(|| "—".into())));
                         rows.push(("  alpn", c.alpn.clone().unwrap_or_else(|| "—".into())));
-                        if let Some(p) = &c.process {
-                            rows.push(("  process", p.clone()));
+                        rows.push((
+                            "  established",
+                            c.established.as_deref().map_or("—".to_string(), clock_of),
+                        ));
+                        if label == "client" {
+                            // Peer→process resolution is deferred by the core
+                            // (foundation Q6): it reports null until then.
+                            rows.push((
+                                "  process",
+                                c.process
+                                    .clone()
+                                    .unwrap_or_else(|| "— (not resolved by the core yet)".into()),
+                            ));
                         }
                     }
                     None => rows.push((label, "— (not reached)".into())),
@@ -519,22 +530,23 @@ fn pending_response<'a>(
 /// `time · → / ← · opcode · text · injected`. The Response pane's Body tab
 /// and quick-look show these; the `101` handshake stays on the Headers tab.
 pub fn ws_frames<'a>(theme: &Theme, d: &FlowDetail) -> Vec<Line<'a>> {
-    if d.frames.is_empty() {
+    if d.messages.is_empty() {
         return vec![Line::styled("no frames yet", theme.text_tertiary())];
     }
-    d.frames
+    d.messages
         .iter()
         .map(|f| {
-            let c2s = f.dir == "c2s";
-            let arrow = if c2s { "→" } else { "←" };
-            let style = if c2s {
-                theme.fg(&color::status::INFORMATIONAL)
-            } else {
-                theme.text_primary()
+            let arrow = f.dir.map_or("?", WsDir::arrow);
+            let style = match f.dir {
+                Some(WsDir::ClientToServer) => theme.fg(&color::status::INFORMATIONAL),
+                _ => theme.text_primary(),
             };
             Line::from(vec![
                 Span::styled(
-                    format!("{} ", f.time.as_deref().map_or("—".to_string(), clock_of)),
+                    format!(
+                        "{} ",
+                        f.timestamp.as_deref().map_or("—".to_string(), clock_of)
+                    ),
                     theme.text_tertiary(),
                 ),
                 Span::styled(format!("{arrow} {} ", f.opcode), style),

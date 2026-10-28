@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::action::{BusEvent, BusRequest, Level, ToolInfo};
-use crate::model::{AgentState, Finding, FlowDetail};
+use crate::model::{AgentState, Finding, FlowDetail, ProxyStatus};
 
 /// Client name sent in `initialize.clientInfo` (§4.2).
 pub const CLIENT_NAME: &str = "aitm-tui";
@@ -160,24 +160,27 @@ impl Session {
                 other => lost(other),
             })?;
         self.tools = self.client.tools_list().await.map_err(lost)?;
-        let listening = if self.has("proxy.status") {
-            match self.client.call("proxy.status", json!({})).await {
-                Ok(v) => v
-                    .get("listening")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                Err(BusError::Transport(e)) => return Err(Outcome::Lost(format!("{e:#}"))),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
         self.emit(BusEvent::Connected {
             server: format!("{} {}", info.name, info.version),
             tools: self.tools.clone(),
-            listening,
         })
-        .await
+        .await?;
+        // `proxy.status` is read-only: a tool error here leaves the state
+        // unknown and the session alive; only a dead transport ends it.
+        self.proxy_status().await
+    }
+
+    /// Read `proxy.status` (F7) when the bus has it and report it.
+    async fn proxy_status(&self) -> Result<(), Outcome> {
+        if !self.has("proxy.status") {
+            return Ok(());
+        }
+        let v = self.panel("proxy.status").await?;
+        if v.is_object() {
+            self.emit(BusEvent::ProxyStatus(ProxyStatus::from_json(&v)))
+                .await?;
+        }
+        Ok(())
     }
 
     /// One pass over the flow list, plus the slow-changing panels every few passes.
@@ -254,6 +257,14 @@ impl Session {
                     self.emit(BusEvent::Findings(findings)).await?;
                 }
             }
+            if self.has("findings.list") {
+                let v = self.panel("findings.list").await?;
+                if let Some(items) = v.get("findings").and_then(Value::as_array) {
+                    let findings = items.iter().filter_map(Finding::from_script_json).collect();
+                    self.emit(BusEvent::ScriptFindings(findings)).await?;
+                }
+            }
+            self.proxy_status().await?;
         }
         Ok(())
     }
@@ -334,8 +345,11 @@ impl Session {
                 ("poc.run", a)
             }
             BusRequest::AgentSet(p) => ("agent.set", json!({ "policy": p.wire() })),
-            BusRequest::ProxyPause(p) => ("proxy.pause", json!({ "paused": p })),
+            // F7: pause and resume are two parameterless tools.
+            BusRequest::ProxyPause(true) => ("proxy.pause", json!({})),
+            BusRequest::ProxyPause(false) => ("proxy.resume", json!({})),
             BusRequest::ClearFlows => ("flow.clear", json!({})),
+            BusRequest::PocGet(path) => ("poc.get", json!({ "poc_path": path })),
             BusRequest::Mark { id, marks } => ("flow.mark", json!({ "id": id, "marks": marks })),
             BusRequest::Comment { id, text } => ("flow.comment", json!({ "id": id, "text": text })),
             BusRequest::Import(path) => ("flow.import", json!({ "path": path })),

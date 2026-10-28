@@ -79,13 +79,15 @@ pub fn toolbar(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     } else {
         (theme.fg(&crate::tokens::color::status::SUCCESS), "")
     };
-    let listen = match &app.listening {
-        Some(l) => format!("listening {l}"),
-        None => match &app.bus {
-            BusStatus::Connected { .. } => "listen address unknown (core follow-up F7)".to_string(),
-            BusStatus::Connecting => "connecting to the bus…".to_string(),
-            BusStatus::Disconnected(_) => "bus disconnected".to_string(),
-        },
+    // The address comes from `proxy.status` (F7) or the embed; `listening:
+    // false` there means the proxy never bound (a one-shot command).
+    let listen = match (&app.bus, app.serving, &app.listening) {
+        (BusStatus::Connecting, _, None) => "connecting to the bus…".to_string(),
+        (BusStatus::Disconnected(_), _, None) => "bus disconnected".to_string(),
+        (_, Some(false), _) => "not serving".to_string(),
+        (_, _, Some(l)) => format!("listening {l}"),
+        (_, _, None) if app.has_tool("proxy.status") => "listen address unknown".to_string(),
+        (_, _, None) => "listen address unknown (core follow-up F7)".to_string(),
     };
     let pill = Line::from(vec![
         Span::styled("● ", dot_style),
@@ -359,7 +361,12 @@ pub fn status(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut 
             format!("{pos} / {vis} rows"),
             theme.text_secondary(),
         )];
-        let paused = view.paused.len();
+        // The view only knows the rows it holds; while the list is filtered
+        // the store's own count (`proxy.status.paused`, F7) is the truth.
+        let paused = match (app.filter.is_some(), app.store_paused) {
+            (true, Some(n)) => usize::try_from(n).unwrap_or(usize::MAX),
+            _ => view.paused.len(),
+        };
         if paused > 0 {
             spans.push(Span::styled(
                 format!(" · {paused} paused"),

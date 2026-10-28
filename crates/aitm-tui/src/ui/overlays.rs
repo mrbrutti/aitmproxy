@@ -326,7 +326,7 @@ pub fn scope(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         lines.push(Line::from(vec![
             Span::styled(format!(" {} {}", glyph::SCOPE, fit(h, 44)), style),
             Span::styled(
-                format!("{n} flows   rate limit: core default (readout needs F7, config.get)"),
+                format!("{n} flows   rate limit: {}", rate_limit_readout(app)),
                 theme.text_tertiary(),
             ),
         ]));
@@ -360,8 +360,31 @@ pub fn scope(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     lines_into(buf, inner, &lines, 0);
 }
 
+/// The scope panel's rate-limit words: the `limits` of `config.get` (F7)
+/// once fetched; what is missing otherwise.
+fn rate_limit_readout(app: &App) -> String {
+    let limits = app.config.as_ref().and_then(|c| c.get("limits"));
+    match limits {
+        Some(l) => {
+            let n = |k: &str| {
+                l.get(k)
+                    .and_then(serde_json::Value::as_u64)
+                    .map_or("—".to_string(), |v| v.to_string())
+            };
+            format!(
+                "{} rps per host · {} global · {} concurrent",
+                n("per_host_rps"),
+                n("global_rps"),
+                n("max_concurrency")
+            )
+        }
+        None if app.has_tool("config.get") => "loading config.get…".to_string(),
+        None => "core default (readout needs F7, config.get)".to_string(),
+    }
+}
+
 pub fn findings(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    let inner = boxed(theme, "Findings — PoC runs", area, buf);
+    let inner = boxed(theme, "Findings — PoCs and runs", area, buf);
     if app.findings.is_empty() {
         buf.set_string(
             inner.x + 1,
@@ -379,10 +402,11 @@ pub fn findings(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     let mut lines = Vec::new();
     for (i, f) in app.findings.iter().enumerate() {
         let selected = i == app.finding_cursor;
-        let verdict = if f.passed {
-            ("✓", theme.fg(&color::status::SUCCESS))
-        } else {
-            ("✗", theme.fg(&color::status::SERVER_ERROR))
+        // A library entry (C8) has no verdict: it is a PoC file nobody ran.
+        let verdict = match (f.ran, f.passed) {
+            (false, _) => ("·", theme.text_tertiary()),
+            (true, true) => ("✓", theme.fg(&color::status::SUCCESS)),
+            (true, false) => ("✗", theme.fg(&color::status::SERVER_ERROR)),
         };
         let base = if selected {
             theme.selection()
@@ -408,11 +432,13 @@ pub fn findings(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         } else {
             Span::raw("")
         };
+        let second = match (&f.script, f.ran) {
+            (Some(s), _) => format!("       script {s} · {}", clock_of(&f.when)),
+            (None, false) => "       · not run · r to run".to_string(),
+            (None, true) => format!("       {} · {}", truncate(&f.target, 30), clock_of(&f.when)),
+        };
         lines.push(Line::from(vec![
-            Span::styled(
-                format!("       {} · {}", truncate(&f.target, 30), clock_of(&f.when)),
-                theme.text_tertiary(),
-            ),
+            Span::styled(second, theme.text_tertiary()),
             origin,
         ]));
     }
@@ -426,52 +452,86 @@ pub fn findings(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     let Some(f) = app.findings.get(app.finding_cursor) else {
         return;
     };
-    let mut d = vec![
-        Line::from(vec![
-            Span::styled(
-                format!(" {}", f.title),
-                theme.text_primary().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {}", f.severity.label()),
-                theme.severity(f.severity.label()),
-            ),
-        ]),
-        Line::styled(format!(" target  {}", f.target), theme.text_secondary()),
-        Line::styled(format!(" poc     {}", f.poc_path), theme.text_secondary()),
-        Line::styled(
+    let mut d = vec![Line::from(vec![
+        Span::styled(
+            format!(" {}", f.title),
+            theme.text_primary().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {}", f.severity.label()),
+            theme.severity(f.severity.label()),
+        ),
+    ])];
+    // C9: the PoC's description (from `poc.get`, or a script's `detail`).
+    if let Some(desc) = &f.description {
+        for l in desc.lines() {
+            d.push(Line::styled(format!(" {l}"), theme.text_secondary()));
+        }
+    }
+    match &f.script {
+        Some(s) => d.push(Line::styled(
+            format!(" script  {s}"),
+            theme.text_secondary(),
+        )),
+        None => {
+            if f.ran {
+                d.push(Line::styled(
+                    format!(" target  {}", f.target),
+                    theme.text_secondary(),
+                ));
+            }
+            d.push(Line::styled(
+                format!(" poc     {}", f.poc_path),
+                theme.text_secondary(),
+            ));
+        }
+    }
+    if f.ran {
+        d.push(Line::styled(
             format!(
                 " capture {}  (⏎ opens it in the inspector)",
                 f.finding_capture.as_deref().unwrap_or("—")
             ),
             theme.text_secondary(),
-        ),
-    ];
-    match &f.screenshot_path {
-        Some(p) => d.push(Line::styled(
-            format!(" [screenshot · {p} · o to open]"),
-            theme.text_secondary(),
-        )),
-        None => d.push(Line::styled(" no screenshot", theme.text_tertiary())),
+        ));
+        match &f.screenshot_path {
+            Some(p) => d.push(Line::styled(
+                format!(" [screenshot · {p} · o to open]"),
+                theme.text_secondary(),
+            )),
+            None if f.script.is_none() => {
+                d.push(Line::styled(" no screenshot", theme.text_tertiary()))
+            }
+            None => {}
+        }
+    } else {
+        d.push(Line::styled(
+            " not run yet — r runs it (poc.run: target, then vars)",
+            theme.text_tertiary(),
+        ));
     }
     d.push(Line::raw(""));
-    d.push(Line::styled(
-        " Assertions",
-        theme.accent().add_modifier(Modifier::BOLD),
-    ));
-    for (a, ok) in &f.assertions {
-        let mark = if *ok {
-            Span::styled(" ✓ ", theme.fg(&color::status::SUCCESS))
-        } else {
-            Span::styled(" ✗ ", theme.fg(&color::status::SERVER_ERROR))
-        };
-        d.push(Line::from(vec![
-            mark,
-            Span::styled(a.clone(), theme.text_primary()),
-        ]));
+    if f.ran && f.script.is_none() {
+        d.push(Line::styled(
+            " Assertions",
+            theme.accent().add_modifier(Modifier::BOLD),
+        ));
+        for (a, ok) in &f.assertions {
+            let mark = if *ok {
+                Span::styled(" ✓ ", theme.fg(&color::status::SUCCESS))
+            } else {
+                Span::styled(" ✗ ", theme.fg(&color::status::SERVER_ERROR))
+            };
+            d.push(Line::from(vec![
+                mark,
+                Span::styled(a.clone(), theme.text_primary()),
+            ]));
+        }
+        d.push(Line::raw(""));
     }
-    d.push(Line::raw(""));
-    if let Some(y) = &f.yaml {
+    if f.script.is_some() {
+        // A script finding has no PoC file behind it.
+    } else if let Some(y) = &f.yaml {
         d.push(Line::styled(
             " YAML",
             theme.accent().add_modifier(Modifier::BOLD),
@@ -491,18 +551,84 @@ pub fn findings(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             format!(" yaml not readable: {e}"),
             theme.intercept_armed_quiet(),
         ));
+    } else if app.has_tool("poc.get") {
+        d.push(Line::styled(
+            " yaml: loading (poc.get)…",
+            theme.text_tertiary(),
+        ));
     } else {
         d.push(Line::styled(
-            " yaml: not in the result; read from poc_path only on a loopback bus",
+            " yaml: not in the result; read from poc_path only on a loopback bus (poc.get is not on this bus)",
             theme.text_tertiary(),
         ));
     }
     d.push(Line::raw(""));
     d.push(Line::styled(
-        " r run again (poc.run: target, then vars) · o open screenshot · export needs core follow-up F13",
+        " r run (poc.run: target, then vars) · o open screenshot · export needs core follow-up F13",
         theme.text_tertiary(),
     ));
     lines_into(buf, detail, &d, 0);
+}
+
+/// The config panel (`:config`, F7): the redacted `config.get` object, one
+/// line per leaf. Nested keys join with `.`, arrays with `, `; `null` is a
+/// dash. Read-only.
+pub fn config(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    let inner = boxed(theme, "Config — the redacted config.get view", area, buf);
+    let mut lines = Vec::new();
+    match &app.config {
+        Some(v) => {
+            let mut rows: Vec<(String, String)> = Vec::new();
+            flatten_config("", v, &mut rows);
+            let w = rows
+                .iter()
+                .map(|(k, _)| k.chars().count())
+                .max()
+                .unwrap_or(0);
+            for (k, text) in rows {
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {k:<w$}"), theme.text_secondary()),
+                    Span::raw("  "),
+                    Span::styled(text, theme.text_primary()),
+                ]));
+            }
+        }
+        None if app.has_tool("config.get") => {
+            lines.push(Line::styled(" loading config.get…", theme.text_tertiary()))
+        }
+        None => lines.push(Line::styled(
+            " config.get is not on this bus (needs core follow-up F7).",
+            theme.intercept_armed_quiet(),
+        )),
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        " The MCP token and key material are never sent; this view is read-only · Esc back",
+        theme.text_tertiary(),
+    ));
+    lines_into(buf, inner, &lines, 0);
+}
+
+/// `{"a":{"b":1},"c":[1,2]}` → `[("a.b","1"),("c","1, 2")]`, in key order.
+fn flatten_config(prefix: &str, v: &serde_json::Value, out: &mut Vec<(String, String)>) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, child) in map {
+                let key = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                flatten_config(&key, child, out);
+            }
+        }
+        serde_json::Value::Array(items) => out.push((
+            prefix.to_string(),
+            items.iter().map(value_text).collect::<Vec<_>>().join(", "),
+        )),
+        serde_json::Value::Null => out.push((prefix.to_string(), "—".to_string())),
+        other => out.push((prefix.to_string(), value_text(other))),
+    }
 }
 
 /// The CA panel (§3.6): the facts `ca.status` reports, and the three

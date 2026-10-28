@@ -239,6 +239,7 @@ pub async fn run(cfg: &Config, proxy: &Proxy, services: Services) -> anyhow::Res
         poll: POLL,
         startup_note: Some(startup_note),
         listening: Some(cfg.listen.to_string()),
+        poc_dir: cfg.poc.dir.clone(),
     });
 
     let main_listen = cfg.listen;

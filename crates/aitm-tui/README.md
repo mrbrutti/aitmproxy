@@ -11,16 +11,27 @@ the same recorded fixture. Design, degradations and the bus contract are in
 ## Run
 
 ```
-usage: aitm-tui (--bus host:port (--token-file p | --token t (insecure: visible in ps)) [--allow-remote-bus] | --fixture [path]) [--ansi|--truecolor] [--poll ms]
+usage: aitm-tui (--bus host:port (--token-file p | --token t (insecure: visible in ps)) [--allow-remote-bus] | --fixture [path]) [--poc-dir dir] [--ansi|--truecolor] [--poll ms]
        aitm-tui --snapshot out.svg [--cols N --rows N]
-       aitm-tui --snapshot-core out.svg [--cols N --rows N]   (fixture limited to the 22 core tools)
+       aitm-tui --snapshot-core out.svg [--cols N --rows N]   (fixture limited to the 37 core tools)
+       --poc-dir: where P (poc.build) writes the PoC YAML; use the proxy's poc.dir so poc.run can read it
 ```
 
 **Against a running proxy.** The proxy's loopback TCP transport and its token:
 
 ```sh
-aitm-tui --bus 127.0.0.1:9090 --token-file ~/.aitm/bus.token
+aitm-tui --bus 127.0.0.1:9090 --token-file ~/.aitm/bus.token --poc-dir ~/engagement/pocs
 ```
+
+`--poc-dir` names the directory a built PoC is written to. The core's
+`poc.build` answers with the PoC's **YAML text**, not a file; the TUI writes
+it as `<poc-dir>/<name>.yaml` (never overwriting: `-2`, `-3`, … on a
+collision), toasts the path and lists it in Findings for `r` to run. Point it
+at the proxy's `poc.dir`, because `poc.run` only reads PoCs under that
+directory. Without the flag the TUI uses `config.get`'s `poc_dir` when it
+has fetched it, else a temp directory — and the toast says so, since
+`poc.run` will refuse a path outside `poc.dir`. `aitm tui` (the embed) passes
+`poc.dir` itself.
 
 `--token t` passes the token inline; it is accepted but **insecure: the token
 is visible to every process on the machine in `ps`** — prefer `--token-file`
@@ -52,8 +63,8 @@ log because `RUST_LOG` is unset.
 main screen from the fixture and exits. The extension picks the format:
 `.svg`, `.ans`/`.ansi` (escape codes), anything else plain text. Default 200×50.
 `--snapshot-core` renders the same screen against the fixture limited to the
-22 tools the core serves today, so the two pictures show what is real now and
-what the F-tools add.
+37 tools the core serves today (`CORE_TOOLS`), so the two pictures show what
+is real now and what the remaining F-tools (the F1 agent pair) add.
 
 `--ansi` forces the 16-colour palette, `--truecolor` the hex palette;
 otherwise the terminal is detected (see Terminal capabilities).
@@ -65,8 +76,10 @@ chip bar (content-type chips, `1`–`9`/`0` select), sidebar (28 columns,
 `b` hides, `[`/`]` move), flow list, intercept bar when armed or when flows
 are paused, inspector (request pane left, response pane right, tabs per
 pane), status bar (key hints · row counts · total size and throughput · bus
-state; the total reads `—` until a size is known, which takes `flow.detail`
-(F5), and the throughput cluster `↑ — ↓ — (F4)` until the push stream).
+state; the total reads `—` until a size is known from `flow.detail`, and the
+throughput cluster `↑ — ↓ — (F4)` until the push stream). The listening pill
+follows `proxy.status`: the address while serving, `not serving` when the
+proxy never bound, `capture paused` while `:pause` is in effect.
 Layout is horizontal (inspector below) or vertical (inspector right); below
 120 columns the inspector takes the whole screen on `Enter` and returns on
 `Esc`. The intercept bar sits above the inspector when it is shown, else
@@ -127,9 +140,18 @@ anything else to cancel.
 **Compose**: `Ctrl-Enter` or `Ctrl-S` send · `Enter` submit field ·
 `Tab`/`↓`, `Shift-Tab`/`↑` next / previous field · `Esc` back.
 
-**Findings**: move keys · `Enter` open the capture · `r` run the PoC again
-(asks for the target, then `k=v …` vars; blank = none) · `o` open the
-screenshot · `Esc`/`q` back.
+**Findings**: move keys · `Enter` open the capture · `r` run the PoC (asks
+for the target, then `k=v …` vars; blank = none) · `o` open the screenshot
+(a local file on a loopback bus, else fetched through `poc.artifact` into a
+private temp file) · `Esc`/`q` back. The list is the PoC library
+(`poc.list`: every file under `poc.dir`, shown `· not run · r to run`) merged
+with this session's `poc.run` results (✓/✗, assertions, capture, screenshot)
+and whatever Rhai scripts recorded with `finding(...)` (`findings.list`,
+shown with their script's name). The YAML and description come from
+`poc.get`; on a loopback bus without it the YAML is read from `poc_path`.
+
+**Config** (`:config`): the redacted `config.get` object, one line per leaf
+(`scope.entries  a.test, *.b.test`), read-only · `Esc`/`q` back.
 
 **Scope**: move keys · `a`/`n`/`+` add host · `d`/`x`/`-` remove selected ·
 `Esc`/`q` back.
@@ -159,7 +181,8 @@ flight the panel says so (`⟳ navigating…`); when one fails — a bus with th
 tools but no engine, or a bus without `browser.*` at all — the error is shown
 in the panel, not only as a toast. `:browser.navigate url=…` from anywhere
 feeds the same view. Flows the browser makes appear with client `obscura`
-once F5 (`flow.detail`) carries the client; a dash today.
+once the core resolves the peer to its process (`flow.detail` reports
+`client_conn.process: null` until then — foundation Q6); a dash today.
 
 ## `:` commands
 
@@ -176,13 +199,14 @@ once F5 (`flow.detail`) carries the client; a dash today.
 | `curl <command>` | Import a curl command line into compose |
 | `filter <expr>` | Set the filter expression (`/`) |
 | `scope add <host>` | Add a host to scope (scope-as-authorisation) |
-| `scope` | Open the scope panel (`scope rm <host>` removes; needs F12) |
+| `scope` | Open the scope panel (`scope rm <host>` removes via `scope.remove`; the rate-limit readout is `config.get`'s `limits`) |
 | `findings` | Open the PoC findings panel |
-| `poc build` | Build a PoC from the selected flow (name, then param) |
+| `poc build` | Build a PoC from the selected flow (name, then param); the YAML is written under `--poc-dir` |
 | `poc run <path> [target]` | Run a PoC YAML |
 | `agent all\|readonly\|paused` | Set the agent policy |
 | `agent` | Open the agent panel and activity log |
 | `ca` | CA panel: `ca.status` facts, export, install, uninstall |
+| `config` | Config panel: the redacted `config.get` view |
 | `browser` | Browser view: URL, DOM outline, screenshot; navigate and eval |
 | `layout h\|v` | Inspector below or right |
 | `split` | Split view — not built in this pass |
@@ -190,8 +214,8 @@ once F5 (`flow.detail`) carries the client; a dash today.
 | `sidebar` | Toggle the sidebar (`b`) |
 | `pin [host]` | Pin a host to the top of the list (`p`) |
 | `import <path>` | Import HAR / mitmproxy / Proxyman flows — needs F10 |
-| `clear` | Clear the session |
-| `pause` / `record` | Pause / resume capture |
+| `clear` | Clear completed flows (`flow.clear`; the toast says `cleared N flows · M in flight kept`) |
+| `pause` / `record` | Pause / resume capture (`proxy.pause` / `proxy.resume`) |
 | `copy` | Copy the selected URL (OSC 52) |
 | `auto` | Toggle auto-select of new flows |
 | `refresh` | Poll the bus now |
@@ -253,24 +277,36 @@ never hidden and never fails silently. Against today's core that is:
 | F2 | audit ring, `notifications/aitm/agent` | activity log rows, Origin column, agent ticks |
 | F3 | `flow.intercept {rules}`, `flow.kill {mode}` | breakpoint rules (`Rules…`), response-phase intercept/edit, kill abort modes 429/503 |
 | F4 | `flow.subscribe`, server push | live list (polling instead), status-bar throughput (`↑ — ↓ — (F4)`) |
-| F5 | `flow.detail` | inspector bodies, raw edit, `~h`/`~b` filters, `Cookies`, `Timing`, `Set-Cookie` tabs, the Client column, sizes (the status-bar total) |
-| F6 | `flow.mark`, `flow.comment` | `m` mark, `c` comment |
-| F7 | `proxy.status/pause`, `flow.clear`, `config.get` | `:pause`, `:record`, `:clear`, the listening pill's address, the scope panel's rate-limit readout, config view and the `ssl_insecure` toggle |
+| F5 (rest) | timing phases, cookies, peer→process | `Cookies`, `Timing`, `Set-Cookie` tabs; the Client column (`client_conn.process` is null until the core resolves it) |
 | F9 | `ws.send` | WebSocket compose (`:compose ws`) and replay of WS flows |
 | F10 | `session.save/load`, `flow.export`, `flow.import` | `:export`, `:import`, Saved sessions |
 | F11 | `tls.passthrough.list/add/remove` | SSL include/exclude list (which hosts to MITM) |
-| F12 | `scope.remove` | `d` in the scope panel, `:scope rm` |
-| F13 | `poc.list` | findings list across sessions (`poc.list`; the sidebar item reads `F13` until a run this session), export |
+| F13 (rest) | findings export | export of a finding (YAML + PNG + HAR) |
 | F14 | `browser.tabs`, `browser.screencast` | a live browser viewport and the tab count in the sidebar (the Browser view itself is built; see **Browser** above) |
+
+**Lit up with the core of 2026-10-28** (the merge that brought `tools/list`
+to 37): F5 `flow.detail` (bodies, headers, connections, metadata, sizes,
+durations, WebSocket messages, raw edit, `~h`/`~b` filters); F6 `flow.mark` /
+`flow.comment` (`m`, `c`; the row's swatch and comment refresh from the
+re-fetched detail); F7 `proxy.status` (the pill, the record toggle, the
+store's paused count), `proxy.pause` / `proxy.resume` (`:pause` / `:record`),
+`flow.clear` (`:clear`), `config.get` (`:config`, the scope panel's
+rate-limit readout); F12 `scope.remove` (`d` in the scope panel, `:scope rm`);
+F13 `poc.list` / `poc.get` / `poc.artifact` (the Findings library, its YAML
+and descriptions, screenshots off-loopback); M3 `findings.list` (script
+findings in the panel). `script.reload` / `script.validate` are on the
+palette like any tool; the script editor itself is F8/M3. A bus without any
+of these (an older core) still gets the labels above — the tests connect to
+such a bus as `PRE_MERGE_TOOLS`.
 
 Confirmations are **local** until F1: `ca.install` and `ca.uninstall` (the
 `CONFIRM_TOOLS` list) ask for `y/N` in the TUI before anything is sent, because
 the bus has no `confirm` on the wire yet and the TUI's server identity is
-`Frontend::Mcp`; `dry_run=true` skips the prompt. The fixture already contains
-the F-tools in their proposed shape, so the screens can be built and tested
-before the core has them. Sidebar items whose feature is further out carry
-their label (`F10` saved sessions, `M3` scripts); the Browser item's count is
-the open tab count, a dash until F14 (`browser.tabs`).
+`Frontend::Mcp`; `dry_run=true` skips the prompt. The fixture contains the
+F1 tools in their proposed shape and every lit tool in the core's real shape.
+Sidebar items whose feature is further out carry their label (`F10` saved
+sessions, `M3` scripts); the Browser item's count is the open tab count, a
+dash until F14 (`browser.tabs`).
 
 ## Not in this pass
 
@@ -282,14 +318,15 @@ core dependency; build-or-descope is Matt's call):
 - compose templates Multipart and WebSocket (`:compose ws` names F9); the compose Query field and body modes; edit templates
 - WebSocket sent/received direction filter
 - setup-guide text; column hide; a Comment column (≥ 170 columns); palette recent/pinned
-- custom columns, multi-select with a summary, overview dashboard text (need `flow.detail` data, F5)
-- JSONPath/jq and full-text filter operators (body fields need F5; grammar to be fixed in the foundation)
+- custom columns, multi-select with a summary, overview dashboard text
+- JSONPath/jq and full-text filter operators (grammar to be fixed in the foundation)
 - Protobuf / MessagePack viewers, an SSE event list, rendered Markdown/HTML preview (plain text / hex today)
 - code generator / copy as cURL, export body (`:curl` imports only)
 - mark swatch beyond the first colour
 - JSON tree: copy node value, filter, sort keys (fold and copy node path are built)
 - inline images: not built in this pass (`caps` detects kitty/sixel)
-- PoC YAML editable with Save (the YAML is shown; on a loopback bus it is read from `poc_path` when the result has none — a regular `.yaml`/`.yml` file of at most 256 KiB)
+- PoC YAML editable with Save (the YAML is shown, from `poc.get`; on a loopback bus without that tool it is read from `poc_path` — a regular `.yaml`/`.yml` file of at most 256 KiB)
+- the `ssl_insecure` toggle (the value is shown in `:config`, read-only)
 
 ## Terminal capabilities
 
@@ -316,19 +353,23 @@ Detected once at start from the environment (`caps.rs`):
 scope, agent state, the `tools/list` reply, 15 flows (the mockup's rows
 41–54 plus `f40`, the 101 upgrade the WebSocket flow `f47` names as its
 handshake — on the real bus a WebSocket summary carries only that id, and
-the row takes its URL from it) and 2 findings. Per foundation §2.10 it is the
-one fixture shared by the
-macOS, web and TUI surfaces, so a screen renders the same data everywhere.
-Bodies are readable `body_text`; the fixture transport base64-encodes them as
-`body` the way `flow.detail` will. Mutating commands update it in memory the
-way the core would (resume attaches the recorded `on_resume` response, kill
-marks the flow, replay and `request.send` append). In tests,
-`aitm_tui::fixture_app(cols, rows)` loads it into an `App`
-(`fixture_app_core` with only the 22 core tools); `snapshot::render` draws to
+the row takes its URL from it), a PoC library of 3 files (`pocs`, what
+`poc.list` / `poc.get` serve), 2 recorded `poc.run` results (`findings`,
+replayed as `CallOk { name: "poc.run" }` since the core keeps no run
+history), `poc.artifact` bytes, and the redacted `config.get` object. Per
+foundation §2.10 it is the one fixture shared by the macOS, web and TUI
+surfaces, so a screen renders the same data everywhere. Bodies are readable
+`body_text` and WebSocket messages `data_text`; the fixture transport
+base64-encodes them as `body` / `data` with `body_size` / `length` the way
+`flow.detail` does. Mutating commands update it in memory the way the core
+would (resume attaches the recorded `on_resume` response, kill marks the
+flow, replay and `request.send` append, `flow.clear` drops completed flows).
+In tests, `aitm_tui::fixture_app(cols, rows)` loads it into an `App`
+(`fixture_app_core` with only the 37 core tools); `snapshot::render` draws to
 a buffer and `to_text` / `to_svg` / `to_ansi` serialise it.
 `docs/design/tui/main-screen.svg` is such a snapshot with every proposed tool
 present; `docs/design/tui/main-screen-core.svg` is the same screen against
-today's 22 core tools, F-labels and all.
+today's 37 core tools — the F1 agent toggle is the one labelled surface.
 
 ## Development
 

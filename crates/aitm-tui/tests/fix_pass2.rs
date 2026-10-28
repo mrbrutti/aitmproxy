@@ -193,6 +193,9 @@ fn findings_o_opens_only_a_regular_file_that_is_an_image() {
     std::fs::write(&real, fixture_png()).unwrap();
 
     let mut app = fixture_app(200, 50);
+    // A local path is only opened from a loopback bus (C10): elsewhere the
+    // bytes come through `poc.artifact`.
+    app.bus_address = "127.0.0.1:9090".into();
     let _ = app.update(Action::OpenFindings);
     app.finding_cursor = 0;
 
@@ -421,10 +424,13 @@ fn finding_yaml_is_read_only_from_small_regular_yaml_files_and_is_carried_forwar
     std::fs::write(&big, "x".repeat(256 * 1024 + 1)).unwrap();
     let subdir = dir.join("dir.yaml");
     std::fs::create_dir_all(&subdir).unwrap();
+    // `poc.list` entries are files, not runs (C8): no `passed` here, so a
+    // later pass replaces them rather than keeping them as run results.
     let finding = |p: &Path| {
-        Finding::from_json(&json!({"poc_path": p.to_string_lossy(), "passed": true})).unwrap()
+        Finding::from_json(&json!({"poc_path": p.to_string_lossy(), "title": "t"})).unwrap()
     };
 
+    // A loopback bus without `poc.get`: the YAML is read from disk.
     let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
     let _ = app.on_bus(BusEvent::Findings(vec![
         finding(&good),
@@ -464,10 +470,12 @@ fn finding_yaml_is_read_only_from_small_regular_yaml_files_and_is_carried_forwar
 // ----------------------------------------------------------------- SEC-2
 
 /// SEC-2: Findings `o` opens the screenshot by its canonical path; a path
-/// that does not resolve opens nothing and says why.
+/// that does not resolve here opens nothing locally — on a bus with
+/// `poc.artifact` (C10) it is fetched, on one without it the toast says why.
 #[test]
 fn findings_o_canonicalizes_the_screenshot_path_and_refuses_one_that_does_not_resolve() {
     let mut app = fixture_app(200, 50);
+    app.bus_address = "127.0.0.1:9090".into();
     let _ = app.update(Action::OpenFindings);
     app.finding_cursor = 0;
     assert_eq!(
@@ -475,7 +483,18 @@ fn findings_o_canonicalizes_the_screenshot_path_and_refuses_one_that_does_not_re
         Some("pocs/reflected-xss-search.png"),
         "the fixture's relative path does not exist here"
     );
-    let _ = app.update(Action::OpenExternally);
+    assert_eq!(
+        app.update(Action::OpenExternally),
+        vec![call(
+            "poc.artifact",
+            json!({"path": "pocs/reflected-xss-search.png"})
+        )],
+        "unresolved here, so fetched through the bus"
+    );
+    assert!(app.take_open_target().is_none(), "nothing to open yet");
+    app.pending_artifact = None;
+    app.tools.retain(|t| t.name != "poc.artifact");
+    assert!(app.update(Action::OpenExternally).is_empty());
     assert!(app.take_open_target().is_none(), "nothing to open");
     assert!(toast(&app).starts_with("open: "), "{}", toast(&app));
 
@@ -537,21 +556,24 @@ fn dry_run_bypasses_the_confirm_only_as_a_declared_boolean_true() {
 
 // ------------------------------------------------------------------ SP-1
 
-/// SP-1: today's TCP bus has no `proxy.status`, so the core-only fixture app
-/// has no listening address and the pill says F7; the full fixture keeps it.
+/// SP-1, re-pinned after the core merge (C3): today's bus has `proxy.status`,
+/// so the core-only fixture app knows the listen address; only a bus without
+/// the tool (the pre-merge core) makes the pill say F7.
 #[test]
-fn the_core_only_fixture_app_has_no_listening_address_and_the_pill_says_f7() {
+fn the_core_only_fixture_app_knows_the_listen_address_and_only_a_pre_merge_bus_says_f7() {
     let core = fixture_app_core(200, 50);
-    assert_eq!(core.listening, None);
+    assert_eq!(core.listening.as_deref(), Some("127.0.0.1:8080"));
     let toolbar = text_of(&core, 200, 50).lines().next().unwrap().to_string();
+    assert!(toolbar.contains("listening 127.0.0.1:8080"), "{toolbar}");
+    assert!(!toolbar.contains("F7"), "{toolbar}");
+    let mut old = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = old.update(Action::Resize(200, 50));
+    let _ = connect(&mut old, PRE_MERGE_TOOLS, None);
+    assert_eq!(old.listening, None);
+    let toolbar = text_of(&old, 200, 50).lines().next().unwrap().to_string();
     assert!(
         toolbar.contains("listen address unknown (core follow-up F7)"),
         "{toolbar}"
-    );
-    assert!(!toolbar.contains("listening 127.0.0.1:8080"), "{toolbar}");
-    assert_eq!(
-        fixture_app(200, 50).listening.as_deref(),
-        Some("127.0.0.1:8080")
     );
 }
 
@@ -569,16 +591,22 @@ fn the_findings_sidebar_item_says_f13_without_poc_list_and_0_only_with_an_empty_
             .take(28)
             .collect()
     };
-    let mut core = fixture_app_core(200, 50);
-    assert!(item(&core).ends_with("F13│"), "{:?}", item(&core));
+    // Today's core has `poc.list` (C8): the core fixture counts its library
+    // and runs; the F13 label needs the pre-merge bus.
+    let core = fixture_app_core(200, 50);
+    assert!(item(&core).ends_with("3│"), "{:?}", item(&core));
+    let mut old = App::new(TermCaps::full(), "x");
+    let _ = old.update(Action::Resize(200, 50));
+    let _ = connect(&mut old, PRE_MERGE_TOOLS, None);
+    assert!(item(&old).ends_with("F13│"), "{:?}", item(&old));
     // A run this session is counted even without poc.list.
-    let _ = core.on_bus(BusEvent::CallOk {
+    let _ = old.on_bus(BusEvent::CallOk {
         name: "poc.run".into(),
         value: json!({"poc_path": "pocs/x.yaml", "passed": true}),
     });
-    assert!(item(&core).ends_with("1│"), "{:?}", item(&core));
+    assert!(item(&old).ends_with("1│"), "{:?}", item(&old));
 
-    let mut with_list: Vec<&str> = CORE_TOOLS.to_vec();
+    let mut with_list: Vec<&str> = PRE_MERGE_TOOLS.to_vec();
     with_list.push("poc.list");
     let mut app = App::new(TermCaps::full(), "x");
     let _ = app.update(Action::Resize(200, 50));
@@ -587,7 +615,7 @@ fn the_findings_sidebar_item_says_f13_without_poc_list_and_0_only_with_an_empty_
     let _ = app.on_bus(BusEvent::Findings(vec![]));
     assert!(item(&app).ends_with("0│"), "{:?}", item(&app));
     let full = fixture_app(200, 50);
-    assert!(item(&full).ends_with("2│"), "{:?}", item(&full));
+    assert!(item(&full).ends_with("3│"), "{:?}", item(&full));
 }
 
 // ------------------------------------------------------------------- Q-1

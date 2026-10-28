@@ -32,6 +32,8 @@ pub fn map(key: KeyEvent, mode: Mode) -> Option<Action> {
         Mode::Agent => agent(key),
         Mode::Ca => ca(key),
         Mode::Browser => browser(key),
+        // Read-only: back, palette, help.
+        Mode::Config => panel(key),
         // Any key closes help (README); `:` goes straight to the palette.
         Mode::Help => Some(match key.code {
             KeyCode::Char(':') => Action::PaletteOpen,
