@@ -52,15 +52,22 @@ The operator workflow is verified two ways, both repeatable:
 - **Deterministic human-input** — the in-app self-test's menu audit (every action
   has a menu item + shortcut) and key-event checks.
 
-**CUA automation coverage boundary (now closed for selection):** The *Accessibility-API*
-path (System Events addressing elements by the AX tree) can't see SwiftUI's
-in-window content (flow rows, inspector tabs, the Raw editor are unnamed,
-timing-sensitive nodes), so **element-by-name** automation of those is not
-possible. The **coordinate path** (screenshot → compute pixel → CGEvent click)
-does not touch the AX tree and therefore has no such limit — it reliably selects
-rendered rows (and can target tabs / the editor by coordinate). Net: full pixel
-coverage of the operator click-through; the only residual limit is cosmetic
-(by-name AX addressing), which `.accessibilityIdentifier`s would add if ever wanted.
+**CUA automation coverage boundary (now closed for selection):** The **coordinate
+path** (screenshot → compute pixel → CGEvent click) does not touch the AX tree, so
+it reliably selects any rendered row — the pixel gate verifies this with a
+`screencapture`+`md5` inspector-region diff across three distinct rows (green every
+run). That is the deterministic coverage.
+
+Stable `.accessibilityIdentifier`s are set on the key views — flow rows
+(`flow-row-<i>-seq<n>`), the inspector URL (`inspector-url`), the Raw editor
+(`raw-request-editor`), the edit-status (`edit-status`), and the Resume/Edit
+buttons — for VoiceOver and for XCUITest. Note: **AppleScript / System Events does
+not surface SwiftUI's `AXIdentifier`** (verified — reads return NOTFOUND), and the
+NSTableView AX descent is timing-sensitive, so the scripted *read-back* uses the
+screenshot diff rather than by-identifier AX reads. A fully by-identifier
+deterministic UI test would be an **XCUITest** target (which does read these
+identifiers); the end-to-end "an edit reaches the client" assertion already lives
+in the agent `tools/selftest-live.sh` (edit → `flow.mutate` → `flow.resume`).
 
 ## 1. Our core command surface (post-merge, 34 tools)
 

@@ -59,6 +59,10 @@ struct SummaryStrip: View {
             .font(Tok.Face.data(Tok.Typography.Size.md))
             .lineLimit(1)
             .truncationMode(.middle)
+            // Deterministic read-back of which flow the inspector is showing (CUA / a11y).
+            .accessibilityElement(children: .ignore)
+            .accessibilityIdentifier("inspector-url")
+            .accessibilityValue(row.url)
             if let detail {
                 ExportMenu(detail: detail, row: row)
             } else {

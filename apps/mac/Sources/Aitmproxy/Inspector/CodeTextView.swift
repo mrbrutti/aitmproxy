@@ -50,6 +50,8 @@ struct CodeTextView: NSViewRepresentable {
 
         let textView = NSTextView(frame: .zero, textContainer: container)
         textView.isEditable = editable
+        // Stable identifier for the editable Raw request editor (CUA / accessibility).
+        if editable { textView.setAccessibilityIdentifier("raw-request-editor") }
         textView.isSelectable = true
         textView.isRichText = false
         textView.usesFontPanel = false

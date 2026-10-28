@@ -156,6 +156,8 @@ struct FlowTableView: NSViewRepresentable {
             view.leftEdge = rows[row].leftEdge?.nsColor
             // VoiceOver reads the row in the screen's words (S-069); cells add nothing.
             view.setAccessibilityLabel(rows[row].accessibilityDescription)
+            // Stable identifier for CUA/accessibility: row index + the flow's seq.
+            view.setAccessibilityIdentifier("flow-row-\(row)-seq\(rows[row].seq)")
             return view
         }
 

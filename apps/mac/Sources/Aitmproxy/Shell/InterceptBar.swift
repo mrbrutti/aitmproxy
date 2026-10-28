@@ -60,8 +60,10 @@ struct InterceptBar: View {
                 PrimaryButton(target.map { session.pendingEditCount($0.id) > 0 } == true ? "Apply & Resume" : "Resume", hint: "⌘⏎") {
                     if let target { session.applyAndResume(target.id) }
                 }
+                .accessibilityIdentifier("resume-button")
                 if let target, row(target).state == .paused {
                     GhostButton("Edit", hint: "e") { session.editPaused(target.id) }
+                        .accessibilityIdentifier("edit-button")
                 }
                 GhostButton("Resume all") { session.resumeAll() }
                 Menu {

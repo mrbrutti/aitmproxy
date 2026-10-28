@@ -35,6 +35,9 @@ struct RawRequestEditor: View {
                     Text(n == 0 ? "No edits · Resume forwards the request as it arrived"
                          : "\(n) edit\(n == 1 ? "" : "s") pending · Apply & Resume sends flow.mutate then flow.resume")
                         .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
+                        // Deterministic read-back of the pending-edit count (CUA / a11y).
+                        .accessibilityIdentifier("edit-status")
+                        .accessibilityValue("\(n)")
                 }
                 Spacer()
                 if session.editDrafts[row.id] != nil {
