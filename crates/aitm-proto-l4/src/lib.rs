@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
+pub mod capture;
 pub mod config;
 pub mod craft;
 pub mod flow;
