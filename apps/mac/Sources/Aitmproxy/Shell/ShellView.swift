@@ -43,6 +43,9 @@ struct ShellView: View {
         .sheet(isPresented: Binding(get: { session.rulesVisible }, set: { session.rulesVisible = $0 })) {
             RulesSheet().environment(session).themed()
         }
+        .sheet(isPresented: Binding(get: { session.scopeSheetVisible }, set: { session.scopeSheetVisible = $0 })) {
+            ScopeSheet().environment(session).themed()
+        }
         .toolbar { ShellToolbar(sidebarVisible: $sidebarVisible) }
         .task {
             if Store.usesFixtures {
@@ -82,10 +85,18 @@ struct MainView: View {
     }
 
     private var flows: some View {
-        @Bindable var session = session
-        return flowTable
-            .environment(session)
-            .themed()
+        VStack(spacing: 0) {
+            if session.page == .scope {
+                ScopePanel()
+                Rule()
+            } else if !Store.usesFixtures, session.scopeHosts.isEmpty, case .connected = session.bus {
+                ScopeBanner()
+                Rule()
+            }
+            flowTable
+        }
+        .environment(session)
+        .themed()
     }
 
     private var flowTable: some View {

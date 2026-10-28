@@ -14,6 +14,7 @@ enum SnapshotScene: String, CaseIterable {
     case multiSelect = "multi-select"
     case rulesSheet = "rules-sheet"
     case editPaused = "edit-paused"
+    case scopeSheet = "scope-sheet"
     case composeSheet = "compose-sheet"
     case inspectHeaders = "inspect-headers"
     case inspectCookies = "inspect-cookies"
@@ -60,6 +61,8 @@ enum SnapshotScene: String, CaseIterable {
                 m.body = Data("{\n  \"email\": \"ops@shop-staging.test\",\n  \"password\": \"' OR 1=1 --\",\n  \"remember\": true\n}".utf8)
                 session.updateDraft(id, m)
             }
+        case .scopeSheet:
+            session.scopeSheetVisible = true
         case .rulesSheet:
             session.breakpointRules = BreakpointRules(rules: [
                 BreakpointRule(name: "Login requests", url: "*/api/auth/*", method: "POST", onResponse: true, flag: .red),
@@ -134,6 +137,7 @@ enum SnapshotScene: String, CaseIterable {
         session.sidebarQuery = ""
         session.paletteVisible = false
         session.rulesVisible = false
+        session.scopeSheetVisible = false
         session.composeVisible = false
         session.requestTab = .raw
         session.responseTab = .body

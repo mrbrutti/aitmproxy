@@ -749,7 +749,7 @@ UX:
 - States: empty -> "No hosts in scope — add one to authorise testing; everything stays read-only until then." with the field focused; invalid entry -> message under the field, Add disabled; live `scope.add` failing -> status-bar error, entry kept pending in tertiary
 - Words: columns "Host · Limit · Back-off · Flows"; button "Add ⌘⏎"; placeholder "host, host:port or *.wildcard"
 - Access: entries are a real table; the field is the only focused control when empty
-Status: todo
+Status: done
 
 ### S-048 Remove a host from scope
 As the operator, I select a scope entry and press Delete to remove it; flows on that host dim again.
@@ -765,7 +765,7 @@ UX:
 - States: live before F12 -> status-bar error "Removing needs scope.remove (F12)" and the entry stays
 - Words: "Remove from Scope"
 - Access: Delete key on the selected row
-Status: todo
+Status: done
 
 ### S-049 See out-of-scope flows dimmed with their actions disabled
 As the operator, I see flows outside the scope in tertiary, and every mutating action on them disabled with the tooltip "Out of scope — add `host` to scope to act".
@@ -781,7 +781,7 @@ UX:
 - States: empty scope on the live bus dims nothing (the proxy enforces scope; an empty list means "no guard") — shows a status-bar note "No scope set"
 - Words: tooltip as above; strip "out of scope"
 - Access: disabled items stay visible to VoiceOver with the reason as help
-Status: todo
+Status: done
 
 ### S-050 Browse findings in the PoC panel
 As the operator, I open Findings and see every PoC run as a row: title, severity pill, target, passed/failed, when, origin.

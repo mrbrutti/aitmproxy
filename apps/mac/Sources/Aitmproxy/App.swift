@@ -153,7 +153,7 @@ struct FlowCommands: Commands {
         CommandMenu("Proxy") {
             Button("Breakpoint Rules…") { session.rulesVisible = true }
                 .keyboardShortcut("b", modifiers: [.command, .shift])
-            Button("Scope…") { session.show(.scope) }
+            Button("Scope…") { if session.page == .scope { session.scopeSheetVisible = true } else { session.show(.scope) } }
                 .keyboardShortcut("o", modifiers: [.command, .shift])
         }
         CommandMenu("View") {

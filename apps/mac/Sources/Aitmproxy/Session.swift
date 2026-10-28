@@ -260,7 +260,7 @@ final class Session {
         }
         let setup: [(String, String, () -> Void)] = [
             ("Install CA…", "Trust the proxy's certificate authority (asks for confirmation)", { [self] in lastError = "CA install arrives with the CA panel (M5)" }),
-            ("Add Host to Scope…", "Authorise a host for testing", { [self] in show(.scope) }),
+            ("Add Host to Scope…", "Authorise a host for testing", { [self] in scopeSheetVisible = true }),
             ("Open Browser", "Show the embedded browser", { [self] in show(.browser) }),
         ]
         for (title, subtitle, action) in setup {
@@ -475,6 +475,7 @@ final class Session {
     // MARK: Breakpoint rules (S-040, F3)
 
     var rulesVisible = false
+    var scopeSheetVisible = false
     var breakpointRules = BreakpointRules()
     var rulesURL: URL { Store.url.appending(path: "rules.json") }
 

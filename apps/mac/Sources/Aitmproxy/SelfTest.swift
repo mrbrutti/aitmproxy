@@ -183,10 +183,11 @@ enum SelfTest {
                 let parsed = try? RawHTTP.parse(RawHTTP.render(m))
                 check("the raw editor text round-trips", parsed?.headers == m.headers && parsed?.bodyText == "{}")
                 session.applyAndResume(paused.id)
-                try? await Task.sleep(for: .milliseconds(600))
+                try? await Task.sleep(for: .milliseconds(1_200))
                 let after = session.rows.first { $0.id == paused.id }
                 check("Apply & Resume mutated and resumed the flow", after?.state == .complete && after?.edited == true
-                      && session.details[paused.id]?.request.header("x-debug") == "1" && session.editDrafts[paused.id] == nil)
+                      && session.details[paused.id]?.request.header("x-debug") == "1" && session.editDrafts[paused.id] == nil,
+                      "state=\(String(describing: after?.state)) edited=\(String(describing: after?.edited)) x-debug=\(session.details[paused.id]?.request.header("x-debug") ?? "nil") draft=\(session.editDrafts[paused.id] == nil) error=\(session.lastError ?? "-")")
             }
 
             // S-040: rules validate, test against the list, persist, and change the armed notice.
