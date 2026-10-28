@@ -9,7 +9,7 @@
 
 ## Intent
 
-This milestone proves aitmproxy's reason to exist: **a Claude agent, given nothing but the MCP command bus and a skill set, autonomously drives aitmproxy against a real, seeded-vulnerable target using real browsers, and finds → reproduces → reports vulnerabilities end to end** — the agent-first thesis demonstrated on a real target, not on synthetic data or hardcoded answers. The platform spec names this as the roadmap's "product-level goal … an AI agent autonomously driving aitmproxy against a vulnerability-seeded test website and finding the bugs by itself." M4 is that milestone.
+This milestone proves aitmproxy's reason to exist: **an AI agent, given nothing but the MCP command bus and a skill set, autonomously drives aitmproxy against a real, seeded-vulnerable target using real browsers, and finds → reproduces → reports vulnerabilities end to end** — the agent-first thesis demonstrated on a real target, not on synthetic data or hardcoded answers. The platform spec names this as the roadmap's "product-level goal … an AI agent autonomously driving aitmproxy against a vulnerability-seeded test website and finding the bugs by itself." M4 is that milestone. The driver is **harness-neutral** — MCP is a vendor-neutral protocol, so **Claude, OpenAI/Codex, or any MCP-capable harness** can drive it; Claude is the reference/live-gate harness, and support for others is a design requirement, not an afterthought.
 
 To make that possible, M4 also builds the **operator/agent command architecture** that the three UIs and the agent both need and that was deliberately deferred here from the operator-UI foundation work: the per-connection operator-vs-agent identity split (**F1**), the server-push channel that the live agent loop and the live flow list both ride (**F4**), and the confirm-over-the-wire mechanism that closes the hole where confirm-gated commands (`ca.install`) are reachable over the bus with no confirmation. These are architectural core changes — they are M4's, not additive drop-ins — and they are the heart of this spec.
 
@@ -19,18 +19,19 @@ The agent only ever **finds and reproduces**. It never exploits beyond the minim
 
 Observable outcomes:
 
-1. **A Claude agent driver surface** — a committed Claude plugin / skill set (SKILL.md + skills + MCP wiring) that an agent uses to operate aitmproxy over the MCP bus: browse, intercept, mutate, replay, scope, run PoCs, and report. It encodes the *strategy* (the observe→reason→act→reproduce loop); the tool keeps all deterministic machinery (tool/agent split).
-2. **F1 — per-connection operator/agent identity + the agent on/off policy.** A connection authenticates as either an **operator** or an **agent** token class; `call_tool` no longer hard-codes `Frontend::Mcp`. An `AgentPolicy { All, ReadOnly, Paused }` is enforced in the MCP server before `invoke`; `agent.status` / `agent.set` expose and change it; the agent cannot un-pause itself.
+1. **A harness-neutral agent driver surface** — a committed, layered driver: a portable playbook (works with any MCP harness) + thin per-harness adapters (**Claude** plugin/skills as the reference; an **OpenAI/Codex** adapter; a generic MCP-client config) + MCP wiring, that an agent uses to operate aitmproxy over the bus: browse, intercept, mutate, replay, scope, run PoCs, report. It encodes the *strategy* (the observe→reason→act→reproduce loop); the tool keeps all deterministic machinery (tool/agent split) and stays model-agnostic.
+2. **F1 — per-connection operator/agent identity + a multi-mode agent policy.** A connection authenticates as either an **operator** or an **agent** token class; `call_tool` no longer hard-codes `Frontend::Mcp`. A five-mode `AgentPolicy { All, Auto, Ask, ReadOnly, Paused }` is enforced in the MCP server before `invoke`, against a per-command `Sensitivity { Read, Write, Sensitive }`; under `Ask` a Sensitive agent call is held for the operator's approval. `agent.status`/`agent.set`/`agent.approve` expose and drive it; the agent cannot change its own policy or self-approve. Harnesses can read the policy + sensitivity to self-govern too.
 3. **F4 — server push + F2 — the agent/activity channel.** A subscription channel (`flow.subscribe` / `flow.unsubscribe`) over which the server writes unsolicited `notifications/aitm/{flow,state,agent}` lines on both transports, overturning today's strict request/response invariant; and a **command-invocation audit ring (F2)** that records every call from every role and feeds the `notifications/aitm/agent` stream, so the operator "Agent" page sees every agent action as it happens. The live agent loop and the three UIs both consume the channel. F1/F2/F4 are one operator/agent-channel story.
-4. **Confirm-over-the-wire.** An operator connection can satisfy a command's `confirm_prompt` through a defined two-phase handshake; an agent connection still cannot (its gated commands stay governed by config flags such as `ca.allow_agent_install`). The `ca.install`-reachable-with-no-confirm hole is closed.
+4. **Confirm/approve-over-the-wire + tool-output-quality result rendering.** An operator connection satisfies a command's `confirm_prompt` through a two-phase handshake; the same primitive routes an `Ask`-policy Sensitive agent call to the operator for approval; an agent still cannot self-confirm (config gates stand). The `ca.install`-reachable-with-no-confirm hole is closed. Separately, every command result carries a one-line `summarize` + a formatted (not jammed-JSON) rendering, so the agent's transcript on the operator "Agent" page reads at the same quality as the flow inspector's output — for any harness.
 5. **A real, seeded-vulnerable test target** — a hermetic, self-contained web app seeded with a documented, enumerated set of real vulnerabilities (reflected XSS, stored XSS, SSRF, broken access control/IDOR, auth bypass, open redirect), plus patched control variants, run with no external network. The planted-vuln manifest is visible only to the grader, never to the agent.
 6. **Real agent-driven e2e through real browsers on a custom, non-system proxy** — the agent exercises the target through the embedded **obscura** engine **and** an **external Chrome** (via `--proxy-server`), with **Firefox** (via its own profile proxy prefs + cert store) added as a second external engine. Never the OS proxy; never synthetic-only.
 7. **A reporting contract backed by a persistent findings store** — a durable, human-readable **findings / run-history store** (distinct from the PoC *library* `poc.list` exposes) with `findings.list`/`get`/`record` commands, from which the agent assembles a human-friendly markdown report and a machine-readable index. The tool produces artifacts and persists finding records; the agent writes prose. This closes the F13-history gap.
-8. **A milestone exit gate** with two tiers: a **deterministic** functional gate (a scripted driver that uses only the public command surface drives find→reproduce→report against the seeded target and the grader passes, through the Rust gate) and a **live-agent acceptance** (an actual Claude agent, unaided, finds and reports the seeded vulns), the latter being the product-thesis proof.
+8. **A milestone exit gate** with two tiers: a **deterministic** functional gate (a scripted driver — a non-LLM MCP client — drives find→reproduce→report against the seeded target and the grader passes, through the Rust gate) and a **live-agent acceptance** (an actual LLM agent via a supported harness, Claude as the reference, unaided, finds and reports the seeded vulns), the latter being the product-thesis proof.
 
 ## Non-goals
 
-- **No automated-scanner plugin.** M4 does not build the Burp-style scanner-as-a-plugin (that is its own roadmap milestone). The *intelligence* in M4 lives in the Claude agent's skill set, not in a new Rust discovery engine. The tool gains no crawl/discovery/fuzz-orchestration logic; it gains the command architecture and the test target the agent needs.
+- **No automated-scanner plugin.** M4 does not build the Burp-style scanner-as-a-plugin (that is its own roadmap milestone). The *intelligence* in M4 lives in the agent's skill set, not in a new Rust discovery engine. The tool gains no crawl/discovery/fuzz-orchestration logic; it gains the command architecture and the test target the agent needs.
+- **No model/provider SDK or model logic in the tool.** Harness-neutrality is achieved *through MCP*, the vendor-neutral protocol — not by building provider clients (Anthropic/OpenAI SDKs), a model-abstraction layer, or prompt-running into `aitm`. The tool exposes commands; harnesses bring their own model. Per-harness adapters live in the driver surface, never in the core.
 - **No report prose or remediation advice in the tool.** As in M1: the tool emits artifacts; the agent writes the report. M4 defines the report *contract*, not a tool-side report generator.
 - **No new protocols and no L4.** Raw-L4/packet MITM is a separate milestone (see the milestone-numbering note in the Design). M4 is HTTP/S + WebSocket only, as shipped.
 - **No new interception semantics.** Response-phase interception and breakpoint rules (**F3**) are out of scope; M4 uses request-phase intercept/mutate/resume as they exist.
@@ -114,36 +115,61 @@ The human-readable client label (from `initialize.clientInfo.name`, e.g. `aitm-m
 
 ### D2. Agent policy and the on/off toggle (F1, part 2)
 
-**Decision — `AgentPolicy` enforced in the MCP server, read-only-ness declared by the command.**
+**Decision — a five-mode `AgentPolicy`, enforced in the MCP server against a per-command sensitivity the command declares.** Matt asked for more than the on/off/read-only triple: an autonomous mode and an *ask-the-user-on-sensitive-calls* mode. The set is `#[non_exhaustive]` so more can be added later.
 
 ```rust
 // aitm-core (additive)
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentPolicy { All, ReadOnly, Paused }
+pub enum AgentPolicy {
+    All,       // every agent call runs (still subject to scope/rate/SSRF + always-on config gates)
+    Auto,      // autonomous: Read + Write run; Sensitive refused unless its own config gate allows (no human loop)
+    Ask,       // Read + Write run; Sensitive prompts the operator and runs only on approval (human in the loop)
+    ReadOnly,  // only non-mutating (Read) commands
+    Paused,    // nothing from the agent runs
+}
+
+/// How much care a command needs, declared by the command. Drives policy and the
+/// ReadOnly set. Fail-closed default: an unclassified command is treated as the
+/// most careful tier, so a new command never silently runs under Auto/Ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sensitivity { Read, Write, Sensitive }
 
 pub trait Command {
     // … existing methods …
-    /// Whether this command changes state. Default true: a command is mutating
-    /// unless it declares otherwise, so the read-only set is opt-in and safe.
-    fn mutates(&self) -> bool { true }
+    fn sensitivity(&self) -> Sensitivity { Sensitivity::Sensitive }   // fail-closed default
+    /// Convenience, derived: a command mutates unless it is Read.
+    fn mutates(&self) -> bool { self.sensitivity() != Sensitivity::Read }
 }
 ```
 
-The read-only commands (`flow.list`, `flow.get`, `flow.detail`, `scope.list`, `ca.status`, `agent.status`, `proxy.status`, `config.get`, `poc.list`, `poc.get`, `browser.get_dom`, `browser.screenshot`) override `mutates()` to `false`. Enforcement lives in `call_tool`, **only for the agent role**:
+- **Read** (declared) — `flow.list/get/detail`, `scope.list`, `ca.status`, `agent.status/activity`, `proxy.status`, `config.get`, `poc.list/get`, `findings.list/get`, `browser.get_dom/screenshot`.
+- **Write** (declared, the routine testing verbs — bounded by scope/rate/SSRF, so autonomous-safe) — `flow.replay/mutate/resume/kill`, `request.send`, `poc.build/run`, `browser.navigate/click/type/eval`, `flow.mark/comment`, `findings.record`, `flow.subscribe/unsubscribe`.
+- **Sensitive** (declared, or the fail-closed default — trust/authorization/irreversible-beyond-scope) — `ca.install/uninstall`, `scope.add` (widens authorization; also has its own `scope.allow_agent_widen` gate), `findings.remove`, `agent.set`.
 
-- `conn.role == Operator` or `Cli` → policy does not apply (a human surface is never auto-paused; the operator *is* the control).
-- `conn.role == Mcp` (agent) and `policy == Paused` → the call returns a tool error `"agent paused by operator"` before `invoke`.
-- agent and `policy == ReadOnly` and `cmd.mutates()` → the same refusal.
-- otherwise → proceed.
+**Enforcement in `call_tool`, only for the agent role** (`Operator`/`Cli` are never policy-gated — the operator *is* the control):
+
+| policy | Read | Write | Sensitive |
+|---|---|---|---|
+| `All` | run | run | run (still via its config gate, e.g. `ca.allow_agent_install`) |
+| `Auto` | run | run | **refuse** unless its config gate allows (no prompt, no human) |
+| `Ask` | run | run | **prompt the operator** (needs-confirmation handshake, D4) → run on approval; refuse if no operator is connected or on timeout |
+| `ReadOnly` | run | refuse | refuse |
+| `Paused` | refuse | refuse | refuse |
 
 **Commands** (registered by a tiny first-party `AgentPlugin`, so they appear in `tools/list` like any other):
 
-| Command | Params → result | mutates | Notes |
+| Command | Params → result | sensitivity | Notes |
 |---|---|---|---|
-| `agent.status` | `{}` → `{policy, actions_last_minute, connected_clients: [{role, client, since}]}` | false | any role may read |
-| `agent.set` | `{policy: "all"\|"readonly"\|"paused"}` → `{policy}` | true | **refused when `conn.role == Mcp`** — the agent cannot change its own policy; operator/CLI only |
+| `agent.status` | `{}` → `{policy, actions_last_minute, connected_clients:[{role,client,since}]}` | Read | any role |
+| `agent.set` | `{policy: "all"\|"auto"\|"ask"\|"readonly"\|"paused"}` → `{policy}` | Sensitive | **refused for the agent role** — it cannot change its own policy; operator/CLI only |
+| `agent.approve` | `{request_id, allow: bool}` → `{}` | Sensitive | approve/deny a parked `Ask`-policy Sensitive call (D4); operator/CLI only |
 
-`agent.set` carries no `confirm_prompt` for a human (the toggle is itself the deliberate act). The default policy for agent connections is `mcp.policy` (see Open questions for the default value).
+`agent.set` is the deliberate operator act (no `confirm_prompt`). The default policy is `mcp.policy` (Open questions).
+
+**The harness can govern itself too (Matt's "let the harnesses use these policies / prompt the users").** The current `policy` (from `agent.status`) and each command's `sensitivity` + `confirmable` flag (in `tools/list`, D3b/D4) are exposed to the connected harness. A harness with its own tool-approval UI (Claude Code, Codex, Cursor) can therefore read which of its calls are Sensitive and **prompt its own user before calling** — self-governing on its side — while the `Ask` policy is aitmproxy's *own* enforcement for harnesses that have no native prompt. The two compose: a Sensitive call can be gated by the harness's prompt and/or aitmproxy's `Ask` handshake; neither can be bypassed by the other.
+
+**Phasing (if Matt wants to stage it).** `Paused`/`ReadOnly`/`All` are trivial once the role split (D1) and `sensitivity()` land; `Auto` adds only the Sensitive-refuse branch; `Ask` additionally needs the operator-prompt routing (reuses D4's handshake over the F4 push channel) and a connected operator. The enum being `#[non_exhaustive]`, `Ask` may land last without reworking the others.
 
 ### D3. Server push, subscriptions, and the agent/activity channel (F4 + F2)
 
@@ -178,6 +204,24 @@ F2 is the record behind the operator "Agent" page: who ran what, with what resul
 4. **Query command.** `agent.activity {since?, limit?}` → `[AuditEntry]` (read-only, `mutates()==false`) lets a surface or a reconnecting agent catch up on recent activity without replaying the whole stream, mirroring `flow.subscribe {since}`.
 5. **This is the audit that makes the live-agent run reviewable.** AC-M4-17's autonomous run is fully reconstructable after the fact from the ring/JSONL: every scope add, replay, mutate, PoC run, and refusal, in order, by origin.
 
+### D3b. Result presentation and the agent transcript (tool-output-quality rendering)
+
+**Goal.** The operator "Agent" page and the activity log must render the agent's tool calls and results at the **same quality as the flow inspector's tool/body output** — formatted cards, not raw JSON blobs — and the same must hold whichever harness drives the bus (D7). The rendering is **schema-driven**, so new commands render well with no per-command surface code.
+
+**Problem (verified).** The MCP `tools/call` result today is `{"content":[{"type":"text","text":"<json>"}], "structuredContent": <json>, "isError": false}` — the `content` text is a **stringified JSON dump** (`crates/aitm-mcp/src/server.rs`). A transcript built from that shows jammed JSON. The structured value is already typed (`ParamSchema.result: TypeDesc`, the `Value` enum), so the data to render well exists; what's missing is (a) a readable `content` rendering and (b) a one-line human summary per outcome.
+
+**Decision — add a thin presentation layer, additive to the result contract (Architect's call).**
+
+1. **One-line summary, authored server-side.** `Command` gains an optional
+   ```rust
+   fn summarize(&self, _args: &Params, _result: &Value) -> Option<String> { None }
+   ```
+   returning a human one-liner for an outcome (e.g. `flow.replay` → "replayed #52 → 200 OK in 1.2s"; `poc.run` → "PoC passed on target, failed on control — 3 artifacts"; `scope.add` → "added api.example.com to scope"). Server-side so the **CLI, the audit ring/JSONL, the agent stream, and every surface** show the *same* line. Default `None` → surfaces fall back to the typed render.
+2. **Formatted `content`, unchanged `structuredContent`.** The `tools/call` result keeps `structuredContent` as the exact machine value (contract unchanged) but its `content` text block becomes a readable rendering: the `summarize` line (when present) followed by **pretty-printed** structured detail (stable key order, indented) — never a jammed one-liner. A dumb viewer already shows something clean; `isError` is unchanged.
+3. **Rich detail is schema-driven, reusing the inspector viewers.** A surface renders the structured result against the command's `result: TypeDesc` using the **same body viewers as the flow inspector** (foundation §2.7: pretty/JSON-tree/hex/image) — so `browser.screenshot` bytes show as an image, a `poc.run` result as a typed tree, a `flow.detail` as the inspector's own panes. The `TypeDesc` → viewer mapping is generic, so a new command gets quality rendering for free; `summarize` is the only optional per-command nicety.
+4. **The transcript entry (F2).** Each `AuditEntry` / `notifications/aitm/agent` line carries `result_summary` (from `summarize`) beside `args_summary`; the full typed result is fetchable via `agent.activity`. The "Agent" page renders each entry as a card — command chip + args key/value table + the result summary, expandable to the typed-tree detail — identical in quality to a flow row expanding into the inspector. This is what makes the agent's transcript read like well-formatted tool output.
+5. **Harness-neutral by construction.** None of the above knows which harness produced the action: it renders from the typed result + `summarize` + the F1 origin/label, so a Claude, OpenAI, or any-MCP-harness transcript renders identically (D7).
+
 ### D4. Confirm-over-the-wire
 
 **Problem (verified).** `Command::confirm_prompt(args) -> Option<String>` exists (`crates/aitm-core/src/command.rs:55`) and the CLI asks a human via a `Confirmer`, but the MCP path never surfaces it: the server built `Frontend::Mcp` and relied purely on config gates. So an **operator** surface on the bus had no way to satisfy a confirm (it would be silently treated as an agent), and the TUI panel observed that `ca.install` is reachable over the bus with no confirmation path at all until F1 exists.
@@ -192,10 +236,12 @@ F2 is the record behind the operator "Agent" page: who ran what, with what resul
   ```
 
   The surface shows `prompt` to the human; on approval it re-sends the identical call with `_confirm: "<confirm_token>"` in `arguments`. The server validates the token (same command + args + connection, short TTL, single use) and then runs `invoke`. The `_confirm` key is a reserved argument stripped before the typed `Params` are built, so it never reaches the command.
-- When `conn.role == Mcp` (agent), `confirm_prompt` is **not** offered as a handshake. Confirm-gated commands remain governed by their own config gate exactly as today (e.g. `ca.install`/`ca.uninstall` require `ca.allow_agent_install`, else refused; the fail-closed JSONL audit still records the attempt). The agent can never self-confirm.
+- When `conn.role == Mcp` (agent) under policy `All`/`Auto`, `confirm_prompt` is **not** offered as a handshake to the agent; confirm-gated commands stay governed by their own config gate exactly as today (`ca.install`/`uninstall` need `ca.allow_agent_install`, else refused; the fail-closed JSONL audit records the attempt). The agent can never self-confirm.
 - `Cli` is unchanged (its `Confirmer` asks the local human).
 
-This closes the hole: the operator path now has a real, auditable confirmation; the agent path cannot reach a confirm-gated capability except through its explicit config gate.
+**The `Ask` policy reuses this handshake, routed to the operator over the push channel.** When an agent calls a **Sensitive** command under policy `Ask` (D2), the server does not return `needs_confirmation` *to the agent* (it must not self-approve); instead it **parks the call**, pushes a `notifications/aitm/agent {event:"approval_requested", command, args_summary, prompt, request_id}` to the connected operator surface(s) over the F4 channel, and the operator approves/denies with `agent.approve {request_id, allow}` (operator/CLI-only). On approve the parked call runs; on deny or timeout (or if no operator is connected) it is refused with a clear error. This is the same prompt/approve primitive as the operator confirm handshake, aimed at the agent's Sensitive calls — the "prompt the user on sensitive calls" Matt asked for, enforced by aitmproxy regardless of the harness, and composing with any native harness prompt (D2).
+
+This closes the hole three ways: the operator path has a real, auditable confirmation; the agent path cannot reach a confirm-gated capability except through its explicit config gate; and under `Ask` a Sensitive agent call is held for a human's approval over the live channel.
 
 ### D5. The seeded-vulnerable test target and grader
 
@@ -212,7 +258,7 @@ This closes the hole: the operator path now has a real, auditable confirmation; 
 
   Plus several **benign decoy endpoints** (parameters that look injectable but are safe) so discovery is non-trivial and false positives are penalized.
 - **Seeding and the manifest.** Each planted vuln is described in a `manifest` (a typed Rust table, also emitted as YAML for humans) with `{id, class, vulnerable_path, patched_path, trigger_hint, success_signal}`. **The manifest is consumed only by the grader; it is never served, never reachable over the proxy, and never handed to the agent or the scripted driver.** The app selects vulnerable vs patched behavior per-path from a seed/config the harness sets, so the same binary serves both the vulnerable origin and its patched control.
-- **The grader.** A harness-side component that takes the agent's (or scripted driver's) produced findings — the PoC artifacts and the report index (D7) — and scores them against the manifest: a planted vuln counts as **found-and-reproduced** iff there is a PoC whose `poc.run` **passes against the vulnerable path and fails against the patched control**, matched to the planted vuln by endpoint + class (not by the agent naming an id it was given). The grader reports: planted vs found, reproduced count, and **false-positive PoCs** (a passing PoC not corresponding to any planted vuln, e.g. on a decoy). The gate threshold (how many of N, false-positive ceiling) is stated in the acceptance criteria.
+- **The grader.** A harness-side component that takes the agent's (or scripted driver's) produced findings — the recorded findings store + PoC artifacts and the report index (D8/D8a) — and scores them against the manifest: a planted vuln counts as **found-and-reproduced** iff there is a PoC whose `poc.run` **passes against the vulnerable path and fails against the patched control**, matched to the planted vuln by endpoint + class (not by the agent naming an id it was given). The grader reports: planted vs found, reproduced count, and **false-positive PoCs** (a passing PoC not corresponding to any planted vuln, e.g. on a decoy). The gate threshold (how many of N, false-positive ceiling) is stated in the acceptance criteria.
 
 ### D6. Real browsers on a custom, non-system proxy
 
@@ -223,9 +269,15 @@ The e2e drives the target through real browsers, each pointed at aitmproxy as a 
 - **Firefox (new, Architect's call on how; additive engine).** Firefox ignores `--proxy-server` and the OS store; the driver therefore writes a **throwaway profile** whose `user.js` sets `network.proxy.type=1`, `network.proxy.http/ssl=127.0.0.1`, `network.proxy.http_port/ssl_port=<port>`, `network.proxy.allow_hijacking_localhost=true`, and trusts the CA either by `security.enterprise_roots.enabled` + an OS-store-free `certutil` import into that profile's `cert9.db`, or by a `policies.json` `Certificates.Install` entry pointing at the exported CA **cert file** (never the key). The profile is created in a temp dir and discarded after the run; the operator's real Firefox profile and OS store are untouched. Because Firefox's CDP support is partial, the M4 gate requires Firefox only for **capture-through-custom-proxy** (navigate → the page's requests appear as captured flows) and screenshot; full `eval`/DOM parity is a stretch, flagged, not gate-blocking. `BrowserConfig.engine` gains `firefox` and a `firefox` sub-config (binary path, timeouts), mirroring the `obscura` sub-config.
 - **The invariant under test.** For every engine, the e2e asserts the target's requests land in the flow store as captured flows produced by that browser — proof that traffic went through aitmproxy's custom proxy, not around it. A negative check confirms no capture occurs when the browser is *not* pointed at the proxy (guarding against accidental OS-proxy routing).
 
-### D7. The Claude agent driver surface
+### D7. The agent driver surface — harness-neutral (Claude, OpenAI, any MCP harness)
 
-A committed Claude plugin / skill set (not Rust), the companion the M1 spec deferred. It lives in the repo (e.g. `agent/` with a `plugin.json`/`.mcp.json` wiring the loopback-TCP agent token, a `SKILL.md`, and per-phase skills) and is the only "intelligence" in the loop; everything it does is a call to a public command.
+**Decision — the bus is the neutral control plane; the driver is layered, not Claude-only (Matt: support Claude/OpenAI/other harnesses).** aitmproxy's thesis is "MCP controls 100% of the tool," and **MCP is a vendor-neutral protocol** — any MCP-capable harness (Claude Code, OpenAI/Codex, Cursor, or a bare MCP client) can already drive every command. So the *tool* is harness-agnostic by construction; nothing model-specific is built into `aitm-core`/`aitm-mcp`, and no provider SDK is a dependency (Non-goal). What is per-harness is only the *packaging* of the strategy. The driver surface is therefore three layers:
+
+1. **Portable playbook (harness-neutral, the real product surface).** A plain-language operating guide + command recipes (the loop below, the candidate heuristics, the reproduction bar, the reporting contract) that assume only the MCP tool list — no Claude-specific features. This is the single source of the methodology; the adapters are thin shells over it.
+2. **Per-harness adapters (thin).** (a) a **Claude** plugin / skill set (`.mcp.json` wiring the loopback-TCP agent token, `SKILL.md`, per-phase skills) — the reference and the live-gate harness; (b) an **OpenAI/Codex** adapter (its MCP server config + a system-prompt/instructions file carrying the same playbook); (c) a **generic MCP client** config for any other harness. Each adapter just points its harness at the bus and loads the portable playbook; adding a harness is a new adapter, never a tool change.
+3. **Harness self-governance** (D2) — each adapter can read the current `policy` and per-command `sensitivity`/`confirmable` and let its own harness prompt its user on Sensitive calls, composing with aitmproxy's `Ask` policy.
+
+It lives in the repo (e.g. `agent/` with the portable playbook + an adapter per harness) and is the only "intelligence" in the loop; everything it does is a call to a public command, so the deterministic scripted driver (a non-LLM MCP client) reproduces the whole loop with no harness at all.
 
 **The operating loop (observe → reason → act → reproduce → report):**
 
@@ -296,8 +348,8 @@ Both are written under the configured PoC/report out-dir; a remote surface reads
 
 ### D9. Safety and capability model (how deny-by-default extends)
 
-- **New commands behind the guards.** `agent.status`/`flow.subscribe`/`flow.unsubscribe` are read-only (`mutates()==false`), observation-only, and leak nothing an operator surface cannot already see; they are still subject to the policy gate for an agent (read-only commands pass `ReadOnly`, all are blocked under `Paused`). `agent.set` is mutating and **operator/CLI-only** (refused for the agent role).
-- **The agent cannot escalate.** It cannot un-pause itself (`agent.set` refused for `Mcp`), cannot self-confirm (D4), cannot widen scope without `scope.allow_agent_widen`, cannot install the CA without `ca.allow_agent_install`. All active actions pass `ScopeRateGuard::check_active` and the browser SSRF guard unchanged.
+- **New commands behind the guards.** `agent.status`/`agent.activity`/`flow.subscribe`/`flow.unsubscribe`/`findings.list`/`findings.get` are `Read` (observation-only) and leak nothing an operator surface cannot already see; they still pass the policy gate (allowed under `ReadOnly`, blocked under `Paused`). `agent.set`/`agent.approve`/`findings.remove` are `Sensitive` and **operator/CLI-only** (refused for the agent role).
+- **The agent cannot escalate.** It cannot change its own policy (`agent.set` refused for `Mcp`), cannot approve its own `Ask` request (`agent.approve` operator-only), cannot self-confirm (D4), cannot widen scope without `scope.allow_agent_widen`, cannot install the CA without `ca.allow_agent_install`. Under `Auto` a Sensitive call is refused without a config gate; under `Ask` it waits for a human. All active actions pass `ScopeRateGuard::check_active` and the browser SSRF guard unchanged. The `Sensitivity` default is fail-closed (`Sensitive`), so a new command never silently runs autonomously.
 - **Reproduction-only boundary.** The skill set's act phase is bounded to tests that prove a finding and stops at `poc.run`; there is no "exploit"/"pivot"/"exfiltrate" skill. The seeded target's success signals are markers (a reflected token, a stored marker, an SSRF callback to an in-scope sink), not real secrets, so even a passing PoC proves reproduction without taking data.
 - **Push respects observation semantics.** Subscriptions deliver flow lifecycle events (passive capture, already allowed); they do not perform or authorize any active action, and the backpressure policy (D3) bounds their cost.
 - **Audit.** Every invocation from every role is recorded (F2 ring + the generalized JSONL audit the CA plugin keeps), surfaced as `notifications/aitm/agent` and the UIs' activity log. The live-agent run is fully auditable after the fact.
@@ -310,9 +362,10 @@ Verification is **TDD unit tests AND functional/behavioral tests that drive the 
 
 1. **AC-M4-1 — token class sets role:** a loopback-TCP connection presenting `operator_token` is treated as `Frontend::Operator`; one presenting `agent_token` as `Frontend::Mcp`; an unknown token is refused `-32001`. Asserted via a command whose behavior differs by role.
 2. **AC-M4-2 — `call_tool` no longer hard-codes the frontend:** an operator-role connection invoking a `confirm_prompt`-bearing command gets the confirmation handshake (AC-M4-7), proving the role is read from the connection, not hard-coded.
-3. **AC-M4-3 — `mutates()` default & read-only set:** `Command::mutates()` defaults to `true`; the declared read-only commands return `false`. Asserted by iterating the registry.
-4. **AC-M4-4 — policy enforcement for the agent:** with `policy==Paused`, every agent `tools/call` returns the paused tool error; with `ReadOnly`, a mutating command is refused and a read-only one succeeds; with `All`, both succeed. An **operator** connection is unaffected by policy in all three states.
-5. **AC-M4-5 — `agent.status`/`agent.set`:** `agent.status` returns the current policy and connected clients; `agent.set` changes it; `agent.set` is **refused when called over the agent role** and succeeds over operator/CLI.
+3. **AC-M4-3 — sensitivity classifier & fail-closed default:** `Command::sensitivity()` defaults to `Sensitive`; the declared `Read`/`Write` commands return their tier; `mutates()` is `sensitivity()!=Read`. Asserted by iterating the registry, including that the sensitive set (`ca.install/uninstall`, `scope.add`, `findings.remove`, `agent.set`) is classified `Sensitive`.
+4. **AC-M4-4 — five-mode policy enforcement for the agent:** across `Paused`/`ReadOnly`/`Auto`/`Ask`/`All`, an agent `tools/call` is gated per the D2 matrix — `Paused` refuses all; `ReadOnly` allows only Read; `Auto` allows Read+Write and refuses Sensitive (unless its config gate allows); `Ask` allows Read+Write and parks a Sensitive call for operator approval; `All` allows all (Sensitive still via config gate). An **operator** connection is unaffected by policy in every mode.
+5. **AC-M4-5 — `agent.status`/`agent.set`/`agent.approve`:** `agent.status` returns the current policy, connected clients, and (so a harness can self-govern) is readable by any role; `agent.set` changes the policy and is **refused over the agent role**; `agent.approve` resolves a parked `Ask` request and is operator/CLI-only; `tools/list` exposes each command's `sensitivity` and `confirmable`.
+6. **AC-M4-5b — `Ask` approval flow:** under `Ask`, an agent Sensitive call is parked, an `approval_requested` notification is pushed to a connected operator, `agent.approve {allow:true}` runs it and `{allow:false}`/timeout/no-operator refuses it; the agent cannot approve its own request.
 
 **F4 + F2 — push & audit**
 
@@ -323,6 +376,10 @@ Verification is **TDD unit tests AND functional/behavioral tests that drive the 
 
 7. **AC-M4-7 — operator confirm handshake:** an operator-role call to a confirm-gated command (e.g. `ca.install`) returns `needs_confirmation` with a prompt and token; re-sending with the matching `_confirm` token runs it; a wrong/expired/replayed token is refused.
 8. **AC-M4-8 — agent cannot self-confirm:** an agent-role call to `ca.install` with `ca.allow_agent_install` unset is refused (no handshake offered); with it set, it runs and is audited. `tools/list` marks the command `confirmable`.
+
+**Result presentation (tool-output-quality rendering)**
+
+9. **AC-M4-8b — formatted result + summary:** `Command::summarize` defaults `None`; a representative set (`flow.replay`, `poc.run`, `scope.add`, …) returns a one-line summary; a `tools/call` result's `structuredContent` is the exact machine value **unchanged**, while its `content` text is a formatted rendering (summary + pretty, stable-key detail), and the F2 transcript entry carries `result_summary`. A surface renders a sample result against its `result: TypeDesc` identically across the shared fixture used by all three surfaces.
 
 **Seeded target & grader**
 
@@ -342,9 +399,13 @@ Verification is **TDD unit tests AND functional/behavioral tests that drive the 
 16. **AC-M4-15b — scripted driver records & reports:** the driver records each confirmed finding via `findings.record` and renders `report.md` + `findings.index.json` (D8 contract) from the findings store, gathering artifacts via F13.
 17. **AC-M4-16 — grader gate green:** the grader scores the **recorded findings** and confirms the scripted driver found-and-reproduced **all** enumerated vulns with **zero** false-positive findings. This is the deterministic exit gate.
 
+**Harness neutrality**
+
+17. **AC-M4-16b — harness-neutral driver:** the driver ships the portable playbook + at least a **Claude** adapter and one **non-Claude** adapter (OpenAI/Codex or a generic MCP-client config); a deterministic test proves a **non-LLM generic MCP client** (not the Claude plugin) drives the full loop over the bus — i.e. nothing in the tool is Claude-specific. A check confirms `aitm` has no provider-SDK dependency.
+
 **Live-agent acceptance (the product-thesis proof, operator-run)**
 
-17. **AC-M4-17 — a Claude agent, unaided, finds & reports:** using the committed plugin/skill set over the MCP bus (agent token, `policy==All`), with only the target host in scope and no manifest access, a live Claude agent drives the loop and the grader confirms it found-and-reproduced at least the agreed threshold of the enumerated vulns and produced the report. Operator-run and signed off (a demo-grade gate, not CI), because it needs a live model.
+18. **AC-M4-17 — a live agent, unaided, finds & reports:** using a supported harness over the MCP bus (**Claude as the reference harness**; agent token, autonomous policy — `Auto` or `All`), with only the target host in scope and no manifest access, a live agent drives the loop and the grader confirms it found-and-reproduced at least the agreed threshold of the enumerated vulns and produced the report. Operator-run and signed off (a demo-grade gate, not CI), because it needs a live model. Running the same acceptance under a second harness (e.g. OpenAI/Codex) is encouraged but gated per Open question.
 
 **Gate**
 
@@ -361,19 +422,23 @@ Verification is **TDD unit tests AND functional/behavioral tests that drive the 
 - The Firefox trust mechanism choice (`certutil` into the throwaway profile vs `policies.json`), and the per-engine launch details, consistent with D6.
 - The plugin/skill-set file layout, skill wording, and MCP wiring, consistent with the D7 loop and the human-friendly constraint.
 - Whether stdio defaults to agent or exposes `mcp.stdio_role`, and the config key names, consistent with D1.
+- The exact `summarize` wording per command and which commands get one (the typed-render fallback covers the rest), and the `TypeDesc`→viewer mapping details, consistent with D3b.
+- The driver surface's layout — the portable playbook format and the per-harness adapter files (Claude plugin/skills, OpenAI/Codex config, generic MCP client) — consistent with D7; adding a harness is a new adapter.
+- Whether `Ask` ships in M4 or is phased after `All`/`Auto`/`ReadOnly`/`Paused` (D2 phasing note), and the parked-request TTL for `agent.approve`.
 
 ## Open questions
 
 Only Matt can answer these; kept to the few that are genuinely his call.
 
-1. **Agent-policy default (`mcp.policy`).** `All` (the agent acts freely the moment it connects, until an operator pauses it) or `ReadOnly` (it observes until a human promotes it)?
-   - **`All` — recommended (Architect's call pending Matt).** M4's whole premise is autonomous agent-driven testing, the toggle is one action away, and every active action is still deny-by-default scope + rate + SSRF gated and fully audited, so "free" never means "unbounded" or "out of scope." The live-agent acceptance (AC-M4-17) sets the policy explicitly regardless, so the default does not affect the gate — only the out-of-the-box posture for real use.
-   - **`ReadOnly` — the safer default** if you want a human to deliberately arm the agent every session; costs one `agent.set {all}` at the start of each run and makes "nothing acts until I say so" the default story.
-   I lean **`All`**, but this is the one posture call I'm flagging for you.
+1. **Agent-policy default (`mcp.policy`).** Now that the set is `All`/`Auto`/`Ask`/`ReadOnly`/`Paused` (D2), which is the out-of-the-box default?
+   - **`Auto` — recommended (Architect's call pending Matt).** It is autonomous — the agent runs the whole testing loop (all `Write` verbs) with no human in the loop — yet **fail-closed on Sensitive actions**: it cannot touch trust (`ca.install`) or widen authorization (`scope.add`) without an explicit config gate. Best match for "agent-driven by default, but can't escalate." (`All` is one step looser — Sensitive runs via config gate with no prompt; `Ask` keeps a human on Sensitive calls; `ReadOnly`/`Paused` require arming.) The live-agent gate sets the policy explicitly, so this only sets the default posture.
+   - I moved my lean from `All` to **`Auto`** given you added the richer modes; happy to go `Ask` if you want a human on every Sensitive call by default. This is the one posture call I'm flagging.
 
 2. **Milestone numbering.** This spec claims **M4 = the agent-driven real-test milestone** and treats **raw-L4/packet MITM as M5**, per this session's brief; the sibling L4 spec's working note currently labels L4 "M4." Please confirm the numbering so the two specs don't collide (a hand-over note has been left for the L4 session either way).
 
 3. **Live-agent threshold (AC-M4-17).** Must the live agent find **all** enumerated vulns to pass, or a stated majority (e.g. ≥ N of 6) with zero false positives? The deterministic gate (AC-M4-16) already requires *all* with zero false positives from the scripted driver; the live-agent bar can be the same or a notch lower given model variance. I propose **≥ all-but-one with zero false positives**, but it's your call what "the thesis is proven" means.
+
+4. **Second live harness in the gate.** The design is harness-neutral and AC-M4-16b proves it deterministically with a non-LLM client, so **Claude alone as the live-gate harness** (AC-M4-17) is enough to prove the thesis. Do you also want the live acceptance **run under a second harness (OpenAI/Codex)** as part of the gate, or is a Claude live run + the deterministic neutrality proof sufficient? I lean the latter (cost/availability), with the OpenAI adapter shipped and runnable on demand.
 
 ---
 
@@ -383,6 +448,9 @@ Only Matt can answer these; kept to the few that are genuinely his call.
 11. **F2 audit ring is owned by M4:** a bounded in-memory ring appended after the policy/confirm gates (refusals included), secrets redacted, feeding `notifications/aitm/agent` + `agent.activity`; the CA plugin's JSONL log is generalized into a core audit sink (a superset, one format), durable audit opt-in. It is what makes the live-agent run (AC-M4-17) reviewable.
 12. **Verified live-wire shapes are ground truth over the (stale) foundation doc:** `browser.eval` uses `expr`; `browser.click` x/y-or-selector; `browser.type` requires a selector (`":focus"`); `poc.build` returns YAML text; `ca.status` reports `yes|no|unknown`. The agent skill set is written to these.
 13. **A persistent findings / run-history store is M4's (closes the F13-history gap):** a human-readable on-disk `FindingStore` (per-finding YAML + `runs.jsonl`) with `findings.list`/`get`/`record`/`remove`, distinct from the PoC *library* (`poc.list`) and from the F2 *command-audit* ring. `poc.*` is unchanged; recording a finding is a separate, gated, audited act after a passing `poc.run`; the report and grader read the store.
+14. **Multi-mode policy with a declared sensitivity classifier (Matt's richer-policy ask):** `AgentPolicy { All, Auto, Ask, ReadOnly, Paused }` (`#[non_exhaustive]`) enforced against `Command::sensitivity() { Read, Write, Sensitive }` (fail-closed `Sensitive` default; `mutates()` derived). `Auto` = autonomous but fail-closed on Sensitive; `Ask` = parks a Sensitive agent call for operator approval via `agent.approve` over the F4 channel. Policy + sensitivity are exposed so a harness can self-govern and prompt its own user. Default recommended `Auto`.
+15. **Tool-output-quality result rendering (Matt's "nice parsed format" ask):** server-side `Command::summarize` one-liner + a formatted (not jammed-JSON) `content` with `structuredContent` unchanged; surfaces render rich detail from the result `TypeDesc` reusing the inspector viewers; the F2 transcript carries `result_summary`. Schema-driven and harness-neutral.
+16. **The driver is harness-neutral (Matt's "support Claude/OpenAI/others" ask):** MCP is the vendor-neutral control plane, so the tool stays model-agnostic (no provider SDKs in `aitm` — a Non-goal). The driver is a portable playbook + thin per-harness adapters (Claude reference + OpenAI/Codex + generic MCP client); AC-M4-16b proves neutrality deterministically; Claude is the live-gate reference harness.
 2. **`Frontend` stays `Copy`:** add a unit `Operator` role; carry the client label separately on `CommandHost` (refines the blocker note's `Operator { client: String }`).
 3. **Connection role = token class presented** (`agent_token` vs `operator_token`); stdio defaults to the agent role (overridable). A per-connection `ConnCtx` threads role + client label + the push sink into message handling; the old `handle` stays as a back-compat wrapper.
 4. **`AgentPolicy { All, ReadOnly, Paused }` enforced in `call_tool` for the agent role only**, with read-only-ness declared by `Command::mutates()` (default true). `agent.set` is operator/CLI-only.
