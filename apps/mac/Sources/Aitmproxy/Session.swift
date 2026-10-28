@@ -100,6 +100,9 @@ enum BusState: Hashable {
 }
 
 /// Everything the shell shows. One object, shared through the environment.
+/// This file holds the state; the actions sit in one extension file per
+/// concern: `Session+Verbs` (row and proxy intents), `Session+Editing`
+/// (compose, paused-request drafts), `Session+Filters`, `Session+Palette`.
 @Observable
 final class Session {
     var rows: [FlowRow] = [] {
@@ -159,11 +162,11 @@ final class Session {
     }
     var filterAdvanced = false
     var filterError: FilterParseError?
-    @ObservationIgnored private var compiledFilter: CompiledFilter?
+    @ObservationIgnored var compiledFilter: CompiledFilter?
     /// The active filter expression (observed, so the list re-queries on change).
-    private(set) var filterExpression: FilterExpression = .matchAll
+    var filterExpression: FilterExpression = .matchAll
     var savedFilters: [SavedFilter] = []
-    @ObservationIgnored private lazy var savedFilterStore = SavedFilterStore(stateDirectory: Store.url)
+    @ObservationIgnored lazy var savedFilterStore = SavedFilterStore(stateDirectory: Store.url)
     /// The sidebar's quick filter (⌘⇧F).
     var sidebarQuery = ""
     /// Bumped to move focus into the sidebar filter field.
@@ -180,114 +183,6 @@ final class Session {
     /// Typed into the Scope sheet's field when Flow ▸ Add Host to Scope… opens it.
     var scopeSheetHost: String?
 
-    /// Flow ▸ Add Host to Scope… (⇧S): the Scope sheet with the focused row's host typed in.
-    func addFocusedHostToScope() {
-        guard let row = focusedRow else { return }
-        scopeSheetHost = row.authority
-        scopeSheetVisible = true
-    }
-
-    /// Flow ▸ Copy as … (⇧⌘C): the focused flow as a command or snippet.
-    func copyFocused(as kind: ExportKind) {
-        guard let row = focusedRow, let detail = focusedDetail else { return }
-        ExportMenu.copy(kind, detail: detail, row: row)
-    }
-
-    /// Flow ▸ Diff Selected (⌘D): exactly two selected flows open the Diff tab.
-    var canDiffSelected: Bool { selection.count == 2 }
-    func diffSelected() {
-        guard canDiffSelected else { return }
-        responseTab = .diff
-    }
-
-    /// Agent ▸ Approve Pending Request (⌥⏎): the oldest gated command runs.
-    func approvePendingRequest() {
-        guard let entry = activity.pending.first else { return }
-        activity.approve(entry)
-    }
-
-    /// Fetches the next body range (F5 `flow.detail {body: range}`); until then it says so.
-    func loadMoreBody(for id: FlowID) async throws {
-        _ = try await runCommand("flow.detail", ["id": .string(id.raw), "body": .string("range")])
-        throw BusError.tool(message: "Paged bodies need flow.detail (F5)")
-    }
-
-    /// The text form of whatever is filtering right now.
-    var currentFilterExpressionText: String { filterAdvanced ? filterText : filterStack.text }
-
-    /// The rows view of the Advanced text, when the expression is flat.
-    var filterStackFromText: FilterStack? {
-        guard filterAdvanced, filterError == nil else { return nil }
-        return filterExpression.stack
-    }
-
-    func setFilterAdvanced(_ advanced: Bool) {
-        if advanced {
-            filterText = filterStack.text
-            filterAdvanced = true
-            parseFilterText()
-        } else {
-            if let stack = filterExpression.stack { filterStack = stack }
-            filterAdvanced = false
-            recompileFilter(from: filterStack.expression)
-        }
-    }
-
-    private func parseFilterText() {
-        do {
-            let expression = try FilterExpression.parse(filterText)
-            filterError = nil
-            recompileFilter(from: expression)
-        } catch {
-            filterError = error
-            compiledFilter = nil
-            filterExpression = .matchAll
-        }
-    }
-
-    private func recompileFilter(from expression: FilterExpression) {
-        filterExpression = expression
-        compiledFilter = expression == .matchAll ? nil : CompiledFilter(expression)
-    }
-
-    func clearFilter() {
-        filterStack = FilterStack(rows: [FilterRow(.url, .contains)])
-        filterText = ""
-        filterError = nil
-        compiledFilter = nil
-        filterExpression = .matchAll
-    }
-
-    func loadSavedFilters() {
-        savedFilters = (try? savedFilterStore.load()) ?? []
-    }
-
-    func saveFilter(named name: String) {
-        let expression = currentFilterExpressionText
-        guard !name.isEmpty, !expression.isEmpty else { return }
-        savedFilters.removeAll { $0.name == name }
-        savedFilters.append(SavedFilter(name: name, expression: expression))
-        try? savedFilterStore.save(savedFilters)
-    }
-
-    func deleteSavedFilter(_ saved: SavedFilter) {
-        savedFilters.removeAll { $0.id == saved.id }
-        try? savedFilterStore.save(savedFilters)
-    }
-
-    /// Sets both the rows and the Advanced text (S-033).
-    func applySavedFilter(_ saved: SavedFilter) {
-        guard let expression = try? FilterExpression.parse(saved.expression) else { return }
-        if let stack = expression.stack {
-            filterAdvanced = false
-            filterStack = stack
-        } else {
-            filterAdvanced = true
-            filterText = saved.expression
-        }
-        filterBarVisible = true
-    }
-
     // MARK: Palette (S-035, S-036)
 
     var paletteVisible = false
@@ -302,90 +197,6 @@ final class Session {
     /// Unsolicited bus notifications (`notifications/aitm/*`, F2/F4), fed by BusService.
     @ObservationIgnored var notificationSink: ((String, JSONValue) -> Void)?
 
-    func runCommand(_ name: String, _ args: [String: JSONValue]) async throws -> JSONValue {
-        guard let commandRunner else { throw BusError.disconnected }
-        do {
-            let value = try await commandRunner(name, args)
-            commandRecorder?(name, args, nil)
-            return value
-        } catch {
-            commandRecorder?(name, args, BusService.describe(error))
-            throw error
-        }
-    }
-
-    func rememberPaletteUse(_ item: PaletteItem) {
-        recentPaletteIDs.removeAll { $0 == item.id }
-        recentPaletteIDs.insert(item.id, at: 0)
-        recentPaletteIDs = Array(recentPaletteIDs.prefix(5))
-        if !Store.isOverridden { UserDefaults.standard.set(recentPaletteIDs, forKey: "palette.recent") }
-    }
-
-    func paletteItems(for query: String) -> [PaletteItem] {
-        var all: [PaletteItem] = []
-        for tool in tools {
-            all.append(PaletteItem(id: "cmd:\(tool.name)", section: .commands, title: tool.name, subtitle: tool.description,
-                                   shortcut: nil, method: nil, kind: .command(tool)))
-        }
-        let locals: [(String, String, String?, () -> Void)] = [
-            (interceptArmed ? "Disarm Intercept" : "Arm Intercept", "Stop or start parking every request", "i", { [self] in arm(!interceptArmed) }),
-            ("Compose Request…", "Write and send a new request", "⌘N", { [self] in openCompose() }),
-            (capturing ? "Pause Capture" : "Resume Capture", "Stop or start recording flows", "⇧⌘R", { [self] in setCapturing(!capturing) }),
-            ("Clear Session", "Drop every flow", "⌘⌫", { [self] in clearSession(confirm: ClearConfirmation.ask) }),
-            (autoSelect ? "Stop Auto-select" : "Auto-select New Flows", "Follow the newest flow as it arrives", "⇧⌘A", { [self] in autoSelect.toggle() }),
-            ("Filter Bar", "Stack filters over the list", "⌘F", { [self] in filterBarVisible.toggle() }),
-            ("Inspector Below", "Horizontal layout", "⌥⌘1", { [self] in layout = .horizontal }),
-            ("Inspector Right", "Vertical layout", "⌥⌘2", { [self] in layout = .vertical }),
-            ("Inspector Detached", "The inspector in its own window", "⌥⌘3", { [self] in layout = .detached }),
-            (splitView ? "Single List" : "Split View", "Two lists over one capture", "⌥⌘4", { [self] in splitView.toggle() }),
-        ]
-        for (title, subtitle, shortcut, action) in locals {
-            all.append(PaletteItem(id: "local:\(title)", section: .local, title: title, subtitle: subtitle, shortcut: shortcut, method: nil, kind: .local(action)))
-        }
-        let setup: [(String, String, () -> Void)] = [
-            ("Certificate Authority…", "Status, export, install the proxy's CA", { [self] in show(.ca) }),
-            ("Configuration…", "The proxy's effective config", { [self] in show(.config) }),
-            ("Overview", "Session statistics", { [self] in show(.overview) }),
-            ("Connection Log", "CONNECTs, TLS, ALPN, SNI", { [self] in show(.connections) }),
-            ("Activity Log", "Every command from every frontend", { [self] in activityLogVisible.toggle() }),
-            ("Add Host to Scope…", "Authorise a host for testing", { [self] in scopeSheetVisible = true }),
-            ("Open Browser", "Show the embedded browser", { [self] in show(.browser) }),
-        ]
-        for (title, subtitle, action) in setup {
-            all.append(PaletteItem(id: "setup:\(title)", section: .setup, title: title, subtitle: subtitle, shortcut: nil, method: nil, kind: .local(action)))
-        }
-        for saved in savedFilters {
-            all.append(PaletteItem(id: "filter:\(saved.id)", section: .filters, title: "Filter: \(saved.name)", subtitle: saved.expression,
-                                   shortcut: nil, method: nil, kind: .savedFilter(saved)))
-        }
-        if !query.isEmpty {
-            for row in rows {
-                all.append(PaletteItem(id: "flow:\(row.id.raw)", section: .flows, title: row.url,
-                                       subtitle: "\(row.status.map(String.init) ?? (row.state == .paused ? "paused" : "—")) · \(row.client?.name ?? "")",
-                                       shortcut: nil, method: row.method, kind: .flow(row.id)))
-            }
-        }
-        let trimmed = query.trimmingCharacters(in: .whitespaces)
-        var ranked: [(PaletteItem, Int)] = all.compactMap { item in
-            if trimmed.isEmpty { return (item, 1) }
-            let score = Fuzzy.score(trimmed, name: item.title, description: item.subtitle)
-            return score > 0 ? (item, score) : nil
-        }
-        // Recent on top (only when nothing is typed), then by score within section order.
-        if trimmed.isEmpty {
-            let recent = ranked.filter { recentPaletteIDs.contains($0.0.id) }.map { item, score -> (PaletteItem, Int) in
-                var r = item; r.section = .recent; r.id = "recent:" + item.id; return (r, score)
-            }
-            ranked = recent.sorted { recentPaletteIDs.firstIndex(of: String($0.0.id.dropFirst(7))) ?? 0 < recentPaletteIDs.firstIndex(of: String($1.0.id.dropFirst(7))) ?? 0 } + ranked
-        }
-        let order = PaletteSection.allCases
-        return ranked
-            .sorted { a, b in
-                let sa = order.firstIndex(of: a.0.section) ?? 0, sb = order.firstIndex(of: b.0.section) ?? 0
-                return sa == sb ? a.1 > b.1 : sa < sb
-            }
-            .prefix(60).map(\.0)
-    }
     var listenAddress = "127.0.0.1:8080"
     var agentPolicy: AgentPolicy = .all
     var agentActionsLastMinute = 0
@@ -554,237 +365,23 @@ final class Session {
         }
     }
 
-    // MARK: Intents (foundation §4.5, §4.6)
-
-    /// Runs an action; a failure lands in `lastError` instead of being lost.
-    private func perform(_ what: String, _ work: @escaping () async throws -> Void) {
-        Task {
-            do {
-                try await work()
-                lastError = nil
-            } catch {
-                lastError = "\(what): \(BusService.describe(error))"
-            }
-        }
-    }
-
-    func arm(_ on: Bool) {
-        let rules = breakpointRules.enabled
-        perform(on ? "arm intercept" : "disarm intercept") { [self] in try await actions.setIntercept(on, rules: rules) }
-    }
-
-    /// The bar's target: the focused paused row, else the oldest paused.
-    var interceptTarget: FlowRow? {
-        if let focusedRow, focusedRow.state == .paused { return focusedRow }
-        return paused.first
-    }
-
-    func resume(_ id: FlowID) {
-        perform("resume") { [self] in try await actions.resume(id) }
-    }
-
-    func resumeAll() {
-        let ids = paused.map(\.id)
-        perform("resume all") { [self] in for id in ids { try await actions.resume(id) } }
-    }
+    // MARK: Intents — state (the actions live in Session+Verbs.swift)
 
     /// Remembered for the session (S-039).
     var killMode: KillMode = .reset
-
-    func kill(_ id: FlowID) {
-        let mode = killMode
-        perform("kill") { [self] in try await actions.kill(id, mode: mode) }
-    }
-
-    // MARK: Breakpoint rules (S-040, F3)
-
     var rulesVisible = false
     var scopeSheetVisible = false
     var breakpointRules = BreakpointRules()
     var rulesURL: URL { Store.url.appending(path: "rules.json") }
 
-    /// Saves the set; re-arms with the rules when intercept is on (the core takes them after F3).
-    func setBreakpointRules(_ rules: BreakpointRules) {
-        breakpointRules = rules
-        try? rules.save(to: rulesURL)
-        if interceptArmed {
-            perform("set rules") { [self] in try await actions.setIntercept(true, rules: rules.enabled) }
-        }
-    }
-
-    // MARK: Compose (S-042–S-044)
+    // MARK: Compose and editing — state (the actions live in Session+Editing.swift)
 
     var composeVisible = false
     var composeDraft = ComposeDraft()
     var composeHistory = ComposeHistory()
     var composeURL: URL { Store.url.appending(path: "compose.json") }
-
-    func openCompose(_ draft: ComposeDraft? = nil) {
-        if let draft { composeDraft = draft }
-        composeVisible = true
-    }
-
-    /// Edit & Replay (⇧R): Compose prefilled from the flow's detail.
-    func editAndReplay(_ id: FlowID) {
-        guard let row = rows.first(where: { $0.id == id }) else { return }
-        guard row.inScope else { lastError = "Out of scope — add \(row.authority) to scope to act"; return }
-        let detail = details[id] ?? Fixtures.detail(for: row)
-        openCompose(ComposeDraft.from(detail: detail, row: row))
-    }
-
-    func sendCompose(completion: @escaping (Bool) -> Void) {
-        let draft = composeDraft
-        guard draft.validationError(scope: scopeHosts) == nil else { completion(false); return }
-        Task {
-            do {
-                let newID = try await actions.send(draft.requestEdits())
-                composeHistory.record(draft)
-                try? composeHistory.save(to: composeURL)
-                lastError = nil
-                if let newID { select(newID) }
-                completion(true)
-            } catch {
-                lastError = "send: \(BusService.describe(error))"
-                completion(false)
-            }
-        }
-    }
-
-    // MARK: Bulk (S-046)
-
-    /// Resume or kill every paused row in the selection, in capture order; reports skips.
-    func resumeSelected() { bulk("Resumed") { [self] id in resume(id) } }
-    func killSelected() { bulk("Killed") { [self] id in kill(id) } }
-
-    private func bulk(_ verb: String, _ act: (FlowID) -> Void) {
-        let chosen = rows.filter { selection.contains($0.id) }
-        let paused = chosen.filter { $0.state == .paused }
-        for row in paused { act(row.id) }
-        let skipped = chosen.count - paused.count
-        lastError = skipped > 0 ? "\(verb) \(paused.count) · skipped \(skipped) (not paused)" : nil
-    }
-
-    var selectedRows: [FlowRow] { rows.filter { selection.contains($0.id) } }
-
-    func replay(_ id: FlowID) {
-        perform("replay") { [self] in
-            if let newID = try await actions.replay(id) { select(newID) }
-        }
-    }
-
-    // MARK: Editing a paused request (S-037, S-038)
-
     /// The operator's unsent edits per paused flow; nil = as the proxy holds it.
     var editDrafts: [FlowID: HTTPMessage] = [:]
-
-    func updateDraft(_ id: FlowID, _ message: HTTPMessage) {
-        editDrafts[id] = message
-    }
-
-    func revertDraft(_ id: FlowID) {
-        editDrafts[id] = nil
-    }
-
-    /// Edits the draft would send, against what the proxy currently holds.
-    func pendingEdits(_ id: FlowID) -> RequestEdits {
-        guard let draft = editDrafts[id], let detail = details[id] else { return RequestEdits() }
-        return RequestEdits.diff(from: detail.request, to: draft)
-    }
-
-    func pendingEditCount(_ id: FlowID) -> Int { pendingEdits(id).changeCount }
-
-    /// `Apply & Resume`: mutate with the pending edits, then resume (§4.5).
-    func applyAndResume(_ id: FlowID) {
-        let edits = pendingEdits(id)
-        perform("apply & resume") { [self] in
-            if !edits.isEmpty { try await actions.mutate(id, edits: edits) }
-            editDrafts[id] = nil
-            try await actions.resume(id)
-        }
-    }
-
-    /// `e`: the paused row's Raw tab, editable.
-    func editPaused(_ id: FlowID) {
-        select(id)
-        requestTab = .raw
-    }
-
-    func addScope(_ host: String) {
-        perform("add to scope") { [self] in try await actions.addScope(host) }
-    }
-
-    func removeScope(_ host: String, confirm: (Int) -> Bool = { _ in true }) {
-        let pausedOnHost = paused.filter { Scope.matches($0.authority, host) }.count
-        if pausedOnHost > 0, !confirm(pausedOnHost) { return }
-        perform("remove from scope") { [self] in try await actions.removeScope(host) }
-    }
-
-    /// Marks and comments apply locally at once; the bus call (F6) follows.
-    func mark(_ id: FlowID, _ color: MarkColor?) {
-        if let i = rows.firstIndex(where: { $0.id == id }) { rows[i].mark = color }
-        perform("mark") { [self] in try await actions.mark(id, color: color) }
-    }
-
-    func comment(_ id: FlowID, _ text: String) {
-        if let i = rows.firstIndex(where: { $0.id == id }) { rows[i].comment = text.isEmpty ? nil : text }
-        perform("comment") { [self] in try await actions.comment(id, text: text) }
-    }
-
-    func setCapturing(_ on: Bool) {
-        perform(on ? "resume capture" : "pause capture") { [self] in try await actions.setCapturing(on) }
-    }
-
-    /// Clear asks first when flows are paused (they would be dropped mid-flight).
-    func clearSession(confirm: (Int) -> Bool = { _ in true }) {
-        let pausedCount = paused.count
-        if pausedCount > 0, !confirm(pausedCount) { return }
-        perform("clear") { [self] in try await actions.clear() }
-    }
-
-    /// A row verb from the keyboard, the context menu or the Flow menu (S-010).
-    func perform(_ action: FlowRowAction, on id: FlowID) {
-        guard let row = rows.first(where: { $0.id == id }) else { return }
-        guard row.inScope else {
-            lastError = "Out of scope — add \(row.authority) to scope to act"
-            return
-        }
-        switch action {
-        case .resume: row.edited ? applyAndResume(id) : resume(id)
-        case .kill: kill(id)
-        case .delete: deleteOrKill(id)
-        case .replay: replay(id)
-        case .editAndReplay: editAndReplay(id)
-        case .resumeSelected: resumeSelected()
-        case .killSelected: killSelected()
-        case .edit:
-            if row.state == .paused { editPaused(id) } else { lastError = "Only a paused flow can be edited" }
-        case .mark(let color): mark(id, color)
-        case .comment: select(id)
-        case .buildPoC: buildPoCFlowID = id
-        case .pinHost: isPinned(.host(row.authority)) ? unpin(.host(row.authority)) : pin(.host(row.authority))
-        case .copyURL:
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(row.url, forType: .string)
-        case .quickLook:
-            if let detail = details[id], BodyQuickLook.shared.prepare(detail, row: row) {
-                quickLookTick += 1
-            } else {
-                lastError = "No body to Quick Look"
-            }
-        }
-    }
-
-    /// Deleting a finished flow only hides it from this view; a pending or paused one is killed.
-    func deleteOrKill(_ id: FlowID) {
-        guard let row = rows.first(where: { $0.id == id }) else { return }
-        if row.state == .paused || row.state == .pending {
-            kill(id)
-        } else {
-            rows.removeAll { $0.id == id }
-            selection.remove(id)
-            if focused == id { focused = nil }
-        }
-    }
 
     /// The mockup's state: armed intercept, two paused, the login selected.
     func loadFixtures() {
