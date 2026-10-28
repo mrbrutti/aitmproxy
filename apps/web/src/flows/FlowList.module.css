@@ -1,0 +1,294 @@
+/* The flow list (§2.7): sticky 28px header, virtualised 28px rows, mono data, hairline rules,
+   no zebra, no row animation. Colour goes on data (dot, method, status, path), not chrome. */
+.list {
+  position: relative;
+  min-height: 0;
+  min-width: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  background: var(--color-ground-surface);
+}
+.scroll {
+  overflow: auto;
+  overscroll-behavior: contain;
+  outline: none;
+  position: relative;
+}
+.scroll:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--color-line-focus);
+  border-radius: 0;
+}
+
+/* ---------- header ---------- */
+.header {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: grid;
+  grid-template-columns: var(--cols);
+  min-width: var(--cols-min);
+  height: var(--size-column-header);
+  background: var(--color-ground-surface);
+  border-bottom: 1px solid var(--color-line-border);
+  font: var(--font-size-sm) var(--font-ui);
+  color: var(--color-text-secondary);
+  -webkit-user-select: none;
+  user-select: none;
+}
+.th {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 100%;
+  padding: 0 8px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  min-width: 0;
+}
+.th[data-align='right'] {
+  justify-content: flex-end;
+}
+.th[data-align='center'] {
+  justify-content: center;
+}
+.th[data-sortable='true'] {
+  cursor: default;
+}
+@media (hover: hover) and (pointer: fine) {
+  .th[data-sortable='true']:hover {
+    color: var(--color-text-primary);
+  }
+}
+.th .sort {
+  color: var(--color-text-tertiary);
+  margin-left: 4px;
+}
+.grip {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  width: 7px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 1;
+}
+.grip::after {
+  content: '';
+  position: absolute;
+  top: 7px;
+  bottom: 7px;
+  left: 3px;
+  width: 1px;
+  background: var(--color-line-rule);
+}
+@media (hover: hover) and (pointer: fine) {
+  .grip:hover::after,
+  .grip[data-active='true']::after {
+    background: var(--color-line-control);
+  }
+}
+
+/* ---------- rows ---------- */
+.canvas {
+  position: relative;
+  min-width: var(--cols-min);
+  width: 100%;
+}
+.row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: var(--row);
+  display: grid;
+  grid-template-columns: var(--cols);
+  align-items: center;
+  contain: strict;
+  border-bottom: 1px solid var(--color-line-rule);
+  font: var(--font-size-md) var(--font-data);
+  color: var(--color-text-primary);
+  -webkit-user-select: none;
+  user-select: none;
+}
+html[data-density='comfortable'] .row {
+  font-size: var(--font-size-base);
+}
+@media (hover: hover) and (pointer: fine) {
+  .row:hover {
+    background: var(--color-ground-hover);
+  }
+}
+.row[aria-selected='true'] {
+  background: var(--color-ground-active);
+}
+.row[data-paused='true'] {
+  box-shadow: inset 2px 0 0 var(--color-intercept-base);
+}
+.row[data-agent='true'] {
+  box-shadow: inset 2px 0 0 var(--color-agent-base);
+}
+.row[data-oos='true'] .cell {
+  color: var(--color-text-tertiary);
+}
+.row[data-oos='true'] .host,
+.row[data-oos='true'] .path,
+.row[data-oos='true'] .q {
+  color: var(--color-text-tertiary);
+}
+.row[data-killed='true'] .url {
+  text-decoration: line-through;
+  color: var(--color-text-tertiary);
+}
+.row[data-killed='true'] .host,
+.row[data-killed='true'] .path {
+  color: var(--color-text-tertiary);
+}
+
+.cell {
+  padding: 0 8px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+}
+.cell[data-align='right'] {
+  text-align: right;
+}
+.cell[data-align='center'] {
+  text-align: center;
+  padding: 0;
+}
+.cDot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.cSeq {
+  color: var(--color-text-secondary);
+}
+.host {
+  color: var(--color-text-primary);
+}
+.path {
+  color: var(--color-text-link);
+}
+.q {
+  color: var(--color-text-tertiary);
+}
+.client {
+  font-family: var(--font-ui);
+  color: var(--color-text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.appdot {
+  width: 16px;
+  height: 16px;
+  border-radius: var(--radius-badge);
+  background: var(--color-ground-raised);
+  border: 1px solid var(--color-line-control);
+  flex: none;
+  display: grid;
+  place-items: center;
+  font: var(--font-weight-medium) var(--font-size-xs) / 1 var(--font-ui);
+  color: var(--color-text-secondary);
+}
+.clientName {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.muted {
+  color: var(--color-text-secondary);
+}
+.dash {
+  color: var(--color-text-tertiary);
+}
+.ssl {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-secondary);
+}
+.ssl[data-tls='pinned'] {
+  color: var(--color-status-client-error);
+}
+.edited {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-secondary);
+}
+.origin {
+  font-family: var(--font-ui);
+  font-size: var(--font-size-xs);
+}
+.tag {
+  color: var(--color-agent-deep);
+  background: var(--color-agent-tint);
+  border-radius: var(--radius-badge);
+  padding: 1px 5px;
+}
+.mark {
+  display: block;
+  width: 6px;
+  height: 16px;
+  border-radius: 2px;
+  margin: 0 auto;
+}
+
+/* ---------- empty states (§2.8: keep the frame, say the trade's words) ---------- */
+.empty {
+  position: absolute;
+  inset: var(--size-column-header) 0 0 0;
+  display: grid;
+  place-content: center;
+  gap: 8px;
+  text-align: center;
+  padding: 24px;
+  font: var(--font-size-md) / 1.5 var(--font-ui);
+  color: var(--color-text-tertiary);
+  pointer-events: none;
+}
+.empty .mono {
+  font-family: var(--font-data);
+}
+.empty button {
+  pointer-events: auto;
+  color: var(--color-text-link);
+  font-size: var(--font-size-sm);
+  justify-self: center;
+}
+
+/* ---------- "↓ N new" pill ---------- */
+.newPill {
+  position: absolute;
+  right: 16px;
+  bottom: 12px;
+  z-index: 4;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px 0 8px;
+  border-radius: var(--radius-pill);
+  background: var(--color-ground-inverse);
+  color: var(--color-text-on-inverse);
+  font: var(--font-weight-medium) var(--font-size-sm) var(--font-ui);
+  box-shadow: var(--shadow-floating);
+  transition:
+    opacity var(--motion-popover) var(--motion-ease-out),
+    transform var(--motion-press) var(--motion-ease-out);
+}
+@starting-style {
+  .newPill {
+    opacity: 0;
+  }
+}
+.newPill:active {
+  transform: scale(0.97);
+}

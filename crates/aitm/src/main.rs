@@ -9,6 +9,8 @@
 //! the proxy accept loop and the MCP server (stdio or loopback-TCP per config),
 //! with the configured browser engine attached when it launches, and closes
 //! the browser on every orderly exit path including SIGINT/SIGTERM (spec §D6).
+//! `aitm web [--listen ADDR] [--token TOKEN] [--no-open]` is the server path
+//! plus the embedded web UI and its `/bus` bridge (`aitm::web`, F15).
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -18,10 +20,12 @@ use std::time::Duration;
 use aitm::config_file::Settings;
 use aitm::render::render_cli_value;
 use aitm::scripts::LateHandles;
+use aitm::web::{self, WebArgs, WebCommand, WebState};
 use aitm::wire::{assemble_with_scripts, Assembled, Features, Http1Sender, ScriptWiring};
 use aitm::{config_file, env};
 use aitm_core::{BrowserDriver, Chain, PipelineClient, Plugin, ProxyClient};
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
+use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 /// The config file path when `--config` is not given.
@@ -44,6 +48,25 @@ async fn run() -> anyhow::Result<()> {
 
     let (config_arg, argv) = split_config_arg(std::env::args().skip(1).collect())?;
     let (script_args, argv) = split_script_args(argv)?;
+
+    // `aitm web …` is the server path with the web UI attached; its options
+    // are resolved before any config is loaded so `--help` and bad flags are
+    // answered immediately.
+    let web_args: Option<WebArgs> = match argv.first().map(String::as_str) {
+        Some("web") => match web::parse_args(&argv[1..])? {
+            WebCommand::Help => {
+                print!("{}", web::USAGE);
+                return Ok(());
+            }
+            WebCommand::Run(args) => Some(args),
+        },
+        _ => None,
+    };
+    let web_settings = match &web_args {
+        Some(args) => Some(args.resolve(|k| std::env::var(k).ok())?),
+        None => None,
+    };
+
     let config_path = config_arg.or_else(|| std::env::var_os(CONFIG_ENV).map(PathBuf::from));
     let Settings {
         core: mut cfg,
@@ -136,7 +159,7 @@ async fn run() -> anyhow::Result<()> {
     tier.error_sink
         .bind(Arc::new(Chain::new(registry.clone(), store.clone())));
 
-    if !argv.is_empty() {
+    if web_args.is_none() && !argv.is_empty() {
         // One-shot CLI dispatch (no browser needed).
         let cli = aitm_cli::Cli::new(registry.clone())
             .with_ssrf_policy(cfg.browser.ssrf.clone())
@@ -176,11 +199,64 @@ async fn run() -> anyhow::Result<()> {
         handles.bind_browser(driver);
     }
 
-    let mcp = aitm_mcp::McpServer::new(registry, cfg.mcp.transport.clone())
+    let mcp = aitm_mcp::McpServer::new(registry.clone(), cfg.mcp.transport.clone())
         .with_ssrf_policy(cfg.browser.ssrf.clone())
         .with_poc_dir(cfg.poc.dir.clone())
         .with_config(Arc::new(cfg.clone()))
-        .with_services(store, client, guard, browser);
+        .with_services(
+            store.clone(),
+            client.clone(),
+            guard.clone(),
+            browser.clone(),
+        );
+
+    // `aitm web`: a second McpServer over the same registry and services
+    // (`serve` consumes the first), driven by the bridge's `handle` calls.
+    let web_server = match web_settings {
+        Some(settings) => {
+            let bus = aitm_mcp::McpServer::new(registry, cfg.mcp.transport.clone())
+                .with_ssrf_policy(cfg.browser.ssrf.clone())
+                .with_poc_dir(cfg.poc.dir.clone())
+                .with_config(Arc::new(cfg.clone()))
+                .with_services(store, client, guard, browser);
+            let state = Arc::new(WebState {
+                mcp: Arc::new(bus),
+                token: settings.token.clone(),
+            });
+            if settings.insecure_bind {
+                warn!(
+                    listen = %settings.listen,
+                    "binding the web UI off loopback WITHOUT TLS ({}=1); the bridge token \
+                     is its only protection",
+                    web::INSECURE_BIND_ENV
+                );
+            }
+            // The proxy and the browser's proxy port bind later in the select; a shared
+            // address would surface as a bare "address in use" there, so name it here.
+            for (what, addr) in [
+                ("proxy listen", cfg.listen),
+                ("browser.proxy_addr", cfg.browser.proxy_addr),
+            ] {
+                anyhow::ensure!(
+                    settings.listen != addr,
+                    "web UI --listen {} collides with {what} ({addr}); pick another port",
+                    settings.listen
+                );
+            }
+            let listener = TcpListener::bind(settings.listen).await?;
+            let url = web::ui_url(listener.local_addr()?, &settings.token);
+            info!(url = %url, "web UI listening");
+            println!("web UI: {url}");
+            Some((listener, state))
+        }
+        None => None,
+    };
+    let web_run = async move {
+        match web_server {
+            Some((listener, state)) => web::serve(listener, state).await,
+            None => std::future::pending().await,
+        }
+    };
 
     // The main listener relays client traffic; the browser listener is
     // SSRF-filtered (the embedded browser dials `cfg.browser.proxy_addr`).
@@ -192,6 +268,7 @@ async fn run() -> anyhow::Result<()> {
         result = proxy.run(main_listen) => result,
         result = proxy.run_browser(browser_listen) => result,
         result = mcp.serve() => result,
+        result = web_run => result,
         () = shutdown_signal() => {
             info!("shutdown signal received");
             Ok(())
