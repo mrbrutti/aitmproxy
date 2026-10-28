@@ -14,10 +14,14 @@ extension Session {
     }
 
     /// Fetches and stores one flow's detail. Re-fetched on each selection so a
-    /// response that arrived after the first look shows up.
+    /// response that arrived after the first look shows up. A WebSocket flow
+    /// decodes into `wsDetails` (handshake + frames, S-045); HTTP into `details`.
     func loadDetail(_ id: FlowID) async {
-        guard let value = try? await runCommand("flow.detail", ["id": .string(id.raw), "body": .string("inline")]),
-              let detail = FlowDetail(detailJSON: value) else { return }
-        details[id] = detail
+        guard let value = try? await runCommand("flow.detail", ["id": .string(id.raw), "body": .string("inline")]) else { return }
+        if let detail = FlowDetail(detailJSON: value) {
+            details[id] = detail
+        } else if let ws = WSDetail(detailJSON: value) {
+            wsDetails[id] = ws
+        }
     }
 }

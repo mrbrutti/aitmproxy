@@ -14,12 +14,17 @@ struct InspectorView: View {
                 if let row = session.focusedRow {
                     SummaryStrip(row: row, detail: session.focusedDetail)
                     Rule()
-                    // A real split: the operator drags the divider; the position is remembered.
-                    SplitPane(axis: .vertical, firstMinimum: 240, secondMinimum: 240, initialSecondFraction: 0.5,
-                              autosaveName: "inspector.panes") {
-                        RequestPane(row: row, detail: session.focusedDetail).environment(session).themed()
-                    } second: {
-                        ResponsePane(row: row, detail: session.focusedDetail).environment(session).themed()
+                    if row.kind == .websocket {
+                        // A WebSocket is a message stream, not a request/response pair (S-045).
+                        WebSocketInspector(row: row, detail: session.focusedWSDetail).environment(session).themed()
+                    } else {
+                        // A real split: the operator drags the divider; the position is remembered.
+                        SplitPane(axis: .vertical, firstMinimum: 240, secondMinimum: 240, initialSecondFraction: 0.5,
+                                  autosaveName: "inspector.panes") {
+                            RequestPane(row: row, detail: session.focusedDetail).environment(session).themed()
+                        } second: {
+                            ResponsePane(row: row, detail: session.focusedDetail).environment(session).themed()
+                        }
                     }
                 } else {
                     EmptyInspector()

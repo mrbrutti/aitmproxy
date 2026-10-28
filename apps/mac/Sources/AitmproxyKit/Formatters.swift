@@ -50,4 +50,20 @@ public enum Format {
 
     /// `6 KB/s`.
     public static func rate(_ bytesPerSecond: Int64) -> String { "\(bytes(bytesPerSecond))/s" }
+
+    /// An RFC 3339 / ISO 8601 timestamp with fractional seconds, as the core emits
+    /// for WebSocket frames. A local formatter, since `ISO8601DateFormatter` is not Sendable.
+    public static func rfc3339(_ date: Date) -> String {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f.string(from: date)
+    }
+
+    /// `11:04:58.120` for a frame's RFC 3339 timestamp, or nil when it does not parse.
+    public static func clock(rfc3339 string: String) -> String? {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        guard let date = f.date(from: string) ?? ISO8601DateFormatter().date(from: string) else { return nil }
+        return time(date)
+    }
 }

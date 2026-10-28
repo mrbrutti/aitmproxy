@@ -72,7 +72,7 @@ extension ConnectionInfo {
     }
 }
 
-/// One WebSocket frame from `flow.detail` `messages[]` (S-045 will render these).
+/// One WebSocket frame from `flow.detail` `messages[]` (S-045).
 public struct WSFrameDetail: Hashable, Sendable {
     public enum Direction: String, Sendable { case clientToServer = "client_to_server", serverToClient = "server_to_client" }
     public var direction: Direction
@@ -81,6 +81,16 @@ public struct WSFrameDetail: Hashable, Sendable {
     public var injected: Bool
     public var timestamp: String?
     public var data: Data?
+
+    public init(direction: Direction, opcode: String, length: Int, injected: Bool = false,
+                timestamp: String? = nil, data: Data? = nil) {
+        self.direction = direction
+        self.opcode = opcode
+        self.length = length
+        self.injected = injected
+        self.timestamp = timestamp
+        self.data = data
+    }
 
     public init?(json: JSONValue) {
         guard let dir = json["dir"]?.stringValue.flatMap(Direction.init(rawValue:)) else { return nil }
@@ -96,4 +106,81 @@ public struct WSFrameDetail: Hashable, Sendable {
     public static func frames(in json: JSONValue) -> [WSFrameDetail] {
         (json["messages"]?.arrayValue ?? []).compactMap(WSFrameDetail.init(json:))
     }
+
+    /// `data` as UTF-8 for a text frame, nil for binary or empty.
+    public var text: String? {
+        guard opcode == "text", let data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// A one-line summary for the frames table: the first line of a text frame,
+    /// a control-frame note, or a byte count for binary.
+    public var preview: String {
+        switch opcode {
+        case "text":
+            guard let text, !text.isEmpty else { return "(empty)" }
+            let firstLine = text.split(whereSeparator: \.isNewline).first.map(String.init) ?? text
+            return firstLine
+        case "ping": return "Ping"
+        case "pong": return "Pong"
+        case "close": return "Close"
+        default:
+            return length == 0 ? "(empty)" : "\(length) bytes"
+        }
+    }
+
+    /// Which body viewer the payload gets. A WebSocket frame carries no content
+    /// type, so the kind is sniffed from the bytes: a JSON text frame reads as
+    /// JSON, other text as text, binary as binary.
+    public var bodyKind: BodyKind {
+        guard let data, !data.isEmpty else { return .text }
+        return BodyKind.detect(contentType: nil, data: data)
+    }
+
+    /// A content type to feed the body viewer so a JSON text frame pretty-prints.
+    /// Binary and empty control frames carry none (the viewer sniffs → hex / no body).
+    public var contentTypeHint: String? {
+        switch bodyKind {
+        case .json: "application/json"
+        case .xml: "application/xml"
+        case .html: "text/html"
+        case .javascript: "application/javascript"
+        case .css: "text/css"
+        case .text: opcode == "text" ? "text/plain" : nil
+        default: nil
+        }
+    }
+}
+
+/// Everything the inspector needs for one WebSocket flow (S-045): the handshake
+/// flow it upgraded from, the ordered message stream, and the connection.
+/// A WebSocket flow is a different shape from an HTTP request/response, so it is
+/// its own type rather than a variant of `FlowDetail`.
+public struct WSDetail: Hashable, Sendable {
+    public var id: FlowID
+    /// The id of the HTTP upgrade flow (`handshake` in the detail JSON), if the core gave one.
+    public var handshakeFlowID: String?
+    public var frames: [WSFrameDetail]
+    public var connection: ConnectionInfo
+
+    public init(id: FlowID, handshakeFlowID: String? = nil, frames: [WSFrameDetail], connection: ConnectionInfo) {
+        self.id = id
+        self.handshakeFlowID = handshakeFlowID
+        self.frames = frames
+        self.connection = connection
+    }
+
+    /// Decodes a `flow.detail` WebSocket result (`kind == "websocket"`). Returns
+    /// nil for an HTTP flow (decode that with `FlowDetail(detailJSON:)`).
+    public init?(detailJSON json: JSONValue) {
+        guard let idRaw = json["id"]?.stringValue, json["kind"]?.stringValue == "websocket" else { return nil }
+        self.init(
+            id: FlowID(idRaw),
+            handshakeFlowID: json["handshake"]?.stringValue,
+            frames: WSFrameDetail.frames(in: json),
+            connection: ConnectionInfo(detailJSON: json, requestVersion: "HTTP/1.1"))
+    }
+
+    public var sentCount: Int { frames.filter { $0.direction == .clientToServer }.count }
+    public var receivedCount: Int { frames.filter { $0.direction == .serverToClient }.count }
 }

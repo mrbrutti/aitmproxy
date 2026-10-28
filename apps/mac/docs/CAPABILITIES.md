@@ -95,7 +95,7 @@ Not yet on the bus: `flow.subscribe` (F4 live push), `ws.send` (F9),
 | Protocol | Status | Note |
 |---|---|---|
 | HTTP/1.1 | ✅ full MITM | CONNECT tunnel, TLS MITM with on-the-fly leaf cert, chunked, 100-continue, 101 upgrade |
-| WebSocket | ✅ captured | Text/Binary/Close/Ping/Pong/Continuation, reassembly, masking; frames in `flow.detail` `messages`. Inject/edit = F9 |
+| WebSocket | ✅ captured + viewed | Text/Binary/Close/Ping/Pong/Continuation, reassembly, masking; frames in `flow.detail` `messages`, shown in the inspector (S-045). Inject/edit = F9 |
 | HTTP/2 | — stub | `H2` enum exists but never produced; ALPN pinned to http/1.1. (Proxyman shipped h2 in 26.0.0 — a real gap) |
 | gRPC / protobuf | — none in core | client-side body viewers only |
 | TCP / L4 raw | — none | no passthrough/tunnel-only; L4 is M5 |
@@ -110,7 +110,8 @@ Not yet on the bus: `flow.subscribe` (F4 live push), `ws.send` (F9),
 | Arm/disarm intercept; Resume/Resume All; Kill | ✅ live | kill modes + rules = F3; kill-forwards gap |
 | **Edit a paused request (Raw + headers) → Apply & Resume** | ✅ **live now** | detail provides the content; `flow.mutate`+`flow.resume` |
 | Intercept & edit a **response** | 🧩 planned (S-041) | F3 response-phase |
-| WebSocket frame list + viewers + inject/edit | 🧩 planned (S-045) | detail already returns `messages` (`WSFrameDetail`); inject = F9 |
+| **WebSocket frame list + viewers (read)** | ✅ **live now** | S-045: frame stream (dir/opcode/length/time/injected) over JSON/text/hex viewers + Sent/Received/Both filter (`WebSocketInspector.swift`); fed by `flow.detail` `messages` (`WSDetail`) |
+| WebSocket frame inject/edit | 🧩 planned | inject/edit = F9 |
 | Mark (colors) + Comment | ✅ live | F6 |
 | Scope page/sheet/banner | ✅ live (add/list) | needs `allow_agent_widen` until F1; remove = F12 |
 | Findings / Build / Run PoC; remote findings | ✅ live | F13 |
@@ -207,6 +208,6 @@ The UI flow model and viewers are designed to extend from HTTP flows to streams.
 
 1. **F1 operator frontend/token** — so operator UIs aren't treated as agents (unblocks scope + any operator-gated command without the config opt-in).
 2. **F3 response-phase intercept + rules + kill modes** — edit responses, breakpoint rules, 429/503 kill modes. (`flow.kill` drop fixed in PR #7.)
-3. **S-045 + F9 WebSocket frames** — review (detail already returns `messages`) and inject/edit.
+3. **F9 WebSocket frame inject/edit** — reading frames shipped (S-045); inject/edit still needs F9.
 4. **F10 sessions + import/export**, **F11 tls.passthrough**, **F4 live push**.
 5. **HTTP/2** in core (Proxyman has it; we have a stub).
