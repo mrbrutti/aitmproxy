@@ -550,7 +550,7 @@ fn navigate(&mut Browser, url: &str)                 -> Result<(), Box<EvalAltRe
 fn click(&mut Browser, target: &str)                 -> Result<(), Box<EvalAltResult>>;
 fn type_text(&mut Browser, sel: &str, text: &str)    -> Result<(), Box<EvalAltResult>>;
 fn screenshot(&mut Browser)                          -> Result<rhai::Blob, Box<EvalAltResult>>;
-fn eval(&mut Browser, expr: &str)                    -> Result<rhai::Dynamic, Box<EvalAltResult>>;
+fn evaluate(&mut Browser, expr: &str)                -> Result<rhai::Dynamic, Box<EvalAltResult>>;
 fn get_dom(&mut Browser)                             -> Result<ImmutableString, Box<EvalAltResult>>;
 
 fn get(&mut Store, id: &str)        -> Result<rhai::Map, Box<EvalAltResult>>;
@@ -566,6 +566,13 @@ fn finding(f: rhai::Map) -> Result<(), Box<EvalAltResult>>;
 fn option(name: &str) -> rhai::Dynamic;
 fn halt();  fn r#continue();
 ```
+
+The browser verb is `browser.evaluate` **in a script**, not `browser.eval`:
+`eval` is a Rhai reserved word, so it cannot be a method name on any engine
+(measured on a bare `Engine::new()`, so this is Rhai's own grammar, not our
+`disable_symbol("eval")` hardening). The shipped **MCP and CLI tool name stays
+`browser.eval`** — M1's 22-tool surface is unchanged, since a tool name is not
+a Rhai identifier. Only the in-script spelling differs.
 
 #### 6a. The capability seam — protocol-extensible by construction (Architect's call)
 
@@ -1013,7 +1020,7 @@ steps:
         // Visit the rendered note and confirm the script ran (SSRF-gated).
         browser.navigate(`${base}/notes`);
         browser.screenshot();                      // becomes a run artifact
-        if browser.eval("window.__aitm") == m { return pass; }
+        if browser.evaluate("window.__aitm") == m { return pass; }
         return fail;
 
 success:
