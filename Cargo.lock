@@ -185,6 +185,7 @@ version = "0.1.0"
 dependencies = [
  "aitm-core",
  "anyhow",
+ "base64 0.22.1",
  "futures",
  "serde",
  "serde_json",
