@@ -622,6 +622,18 @@ export function createAppStore(bus: BusClient) {
       });
     }
 
+    /** Replace the multi-selection wholesale (e.g. a shift-range computed in the list's sort order). */
+    function setSelection(ids: readonly FlowId[], anchor: FlowId | null = ids[ids.length - 1] ?? null) {
+      batch(() => {
+        setSelectedIds(new Set<FlowId>(ids));
+        setSelectedIdRaw(anchor);
+        if (anchor) {
+          setUi('panel', 'inspector');
+          void loadDetail(anchor);
+        }
+      });
+    }
+
     function moveSelection(delta: number) {
       const list = visible();
       if (!list.length) return;
@@ -642,6 +654,7 @@ export function createAppStore(bus: BusClient) {
 
     const actions = {
       select,
+      setSelection,
       moveSelection,
       loadDetail,
       notice,
