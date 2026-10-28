@@ -17,8 +17,8 @@ use anyhow::{bail, Context as _};
 use serde::Deserialize;
 
 use aitm_core::{
-    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, LimitConfig, McpConfig,
-    McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SsrfPolicy,
+    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, FirefoxConfig, LimitConfig,
+    McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SsrfPolicy,
 };
 
 /// `<config_dir>/aitmproxy/config.yaml`: a sibling of the CA dir with the
@@ -237,6 +237,7 @@ impl From<TransportFile> for McpTransport {
 struct BrowserFile {
     engine: Option<EngineFile>,
     obscura: Option<ObscuraFile>,
+    firefox: Option<FirefoxFile>,
     proxy_addr: Option<SocketAddr>,
     headless: Option<bool>,
     ignore_cert_errors: Option<bool>,
@@ -250,6 +251,9 @@ impl BrowserFile {
         if let Some(o) = self.obscura {
             o.apply(&mut c.obscura);
         }
+        if let Some(f) = self.firefox {
+            f.apply(&mut c.firefox);
+        }
         set(&mut c.proxy_addr, self.proxy_addr);
         set(&mut c.headless, self.headless);
         set(&mut c.ignore_cert_errors, self.ignore_cert_errors);
@@ -260,12 +264,13 @@ impl BrowserFile {
     }
 }
 
-/// `engine: obscura | chrome`.
+/// `engine: obscura | chrome | firefox`.
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum EngineFile {
     Obscura,
     Chrome,
+    Firefox,
 }
 
 impl From<EngineFile> for BrowserEngine {
@@ -273,6 +278,7 @@ impl From<EngineFile> for BrowserEngine {
         match e {
             EngineFile::Obscura => BrowserEngine::Obscura,
             EngineFile::Chrome => BrowserEngine::Chrome,
+            EngineFile::Firefox => BrowserEngine::Firefox,
         }
     }
 }
@@ -292,6 +298,24 @@ impl ObscuraFile {
         }
         set_secs(&mut c.start_timeout, self.start_timeout);
         set_secs(&mut c.stop_timeout, self.stop_timeout);
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FirefoxFile {
+    binary: Option<PathBuf>,
+    start_timeout: Option<u64>,
+    nav_timeout: Option<u64>,
+}
+
+impl FirefoxFile {
+    fn apply(self, c: &mut FirefoxConfig) {
+        if let Some(b) = self.binary {
+            c.binary = b;
+        }
+        set_secs(&mut c.start_timeout, self.start_timeout);
+        set_secs(&mut c.nav_timeout, self.nav_timeout);
     }
 }
 
