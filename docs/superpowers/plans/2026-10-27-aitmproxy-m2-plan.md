@@ -599,4 +599,4 @@ What merged, what was cut, follow-ups. Filled at stage 7.
 - Fixture fingerprints (Task 9): `FP256 = 41:88:D2:5C:9E:BD:56:21:31:81:52:AD:D8:CE:78:C4:9C:40:77:C4:07:D1:7F:0D:4B:58:6E:22:E4:4A:CA:43`, `FP1 = B1:30:2C:92:2B:7C:A0:78:5D:76:E0:A0:00:43:01:51:1C:05:92:90`.
 - Fork binary: tag `aitm-v1` (release `mrbrutti/obscura`, 4 tarballs + SHA256SUMS); local render build `/Users/matt/Security/obscura/dist/obscura`, SHA-256 `f5a579247eb78f78439d5f101dc53746bb0850accea300e409f390d8f0f10107`.
 - Upstream PR / issues (Task 29): **pending Matt's go-ahead** — publishes to the third-party `h4ckf0r0day/obscura` repo (the `--ca-cert` PR + two spike issues).
-- Memory report (Task 30): **pending exit-gate Tester run** — obscura vs Chrome peak RSS during `e2e_reflected_xss` (M2-AC20).
+- Memory report (Task 30, M2-AC20): peak RSS during `e2e_reflected_xss` — **obscura 43.5 MB (single process) vs Chrome 228 MB main / 1039 MB process tree**. Exit gate PASS at 28ab0c1: fmt/clippy exit 0, 241 default tests + 64 gated (both engines) passed, 0 failed, 1 ignored (`real_os`).
