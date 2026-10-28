@@ -42,6 +42,17 @@ thiserror = "2"
 # the aitm-proto-l4 crate root keeps `#![forbid(unsafe_code)]` (AC20).
 pcap = "2.5"
 
+# In-path interception (M5 Task 11): Linux NFQUEUE. `nfq` talks netlink directly
+# (no GPL `libnetfilter_queue` link), its public API is safe `fn`s so the crate
+# root keeps `#![forbid(unsafe_code)]` (its own `unsafe` stays internal), and a
+# `Message` holds an `Arc` of the recv buffer with no lifetime, so a parked packet
+# can be verdicted later — exactly the park/mutate/forward model M5 needs. Version
+# pinned from research note 09 (nfq 0.2.5). Linux-only: NFQUEUE has no macOS
+# equivalent, so the dep is behind a target cfg and `l4.intercept.*` returns
+# `L4Unavailable` on every other OS.
+[target.'cfg(target_os = "linux")'.dependencies]
+nfq = "0.2.5"
+
 [dev-dependencies]
 # config is authored as YAML by the operator; the deserialization test parses it.
 serde_yaml = "0.9"
