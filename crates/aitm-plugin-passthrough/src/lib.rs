@@ -11,8 +11,10 @@
 //! `PassthroughModule` (Task 11) reads it — both hold clones of one `Arc`.
 
 mod list;
+mod module;
 
 pub use list::PassthroughList;
+pub use module::PassthroughModule;
 
 use std::sync::Arc;
 
