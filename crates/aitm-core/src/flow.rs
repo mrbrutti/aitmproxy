@@ -165,7 +165,7 @@ pub struct ConnInfo {
     pub established: SystemTime,
 }
 
-/// Per-flow bookkeeping: marks, comment, replay flag, timing.
+/// Per-flow bookkeeping: marks, comment, replay flag, timing, edit state.
 #[derive(Debug, Clone)]
 pub struct FlowMeta {
     pub marks: Vec<String>,
@@ -176,6 +176,10 @@ pub struct FlowMeta {
     /// A body exceeded the configured cap: the stored copy was truncated (the
     /// client still received the full stream).
     pub truncated: bool,
+    /// The captured request was edited by `flow.mutate` since capture. Drives the
+    /// inspector's "Edited" flag; the original is recoverable while the flow is
+    /// still intercepted (`InterceptState::Intercepted { backup }`).
+    pub edited: bool,
 }
 
 impl Default for FlowMeta {
@@ -187,6 +191,7 @@ impl Default for FlowMeta {
             created: SystemTime::now(),
             duration: None,
             truncated: false,
+            edited: false,
         }
     }
 }

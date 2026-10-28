@@ -2,6 +2,7 @@
 //! mutate, scope, rate-limit). Each registers its own commands; none lives in core.
 
 pub mod capture;
+pub mod detail;
 pub mod intercept;
 pub mod meta;
 pub mod mutate;
@@ -10,6 +11,7 @@ pub mod replay;
 pub mod scope;
 
 pub use capture::CapturePlugin;
+pub use detail::DetailPlugin;
 pub use intercept::InterceptPlugin;
 pub use meta::MetaPlugin;
 pub use mutate::MutatePlugin;

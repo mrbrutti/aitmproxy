@@ -172,6 +172,11 @@ impl Command for FlowMutate {
         host.store().update(id, &mut |flow: &mut Flow| {
             if let Flow::Http(f) = flow {
                 result = apply_edits(&mut f.request, &edits);
+                // Record that the request was edited, so the inspector's "Edited"
+                // flag (flow.detail.edited) reflects a real mutation.
+                if result.is_ok() {
+                    f.metadata.edited = true;
+                }
             }
         });
         result?;

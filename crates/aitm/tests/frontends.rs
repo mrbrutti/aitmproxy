@@ -19,9 +19,10 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 24] = [
+const EXPECTED_TOOLS: [&str; 25] = [
     "flow.list",
     "flow.get",
+    "flow.detail",
     "flow.replay",
     "flow.intercept",
     "flow.resume",
