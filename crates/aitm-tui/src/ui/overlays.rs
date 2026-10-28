@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Widget};
 
 use crate::app::{App, PaletteKind, BUILTIN_COMMANDS};
-use crate::model::{clock_of, AgentPolicy, Origin};
+use crate::model::{clock_of, AgentPolicy, FlowKind, Origin};
 use crate::theme::Theme;
 use crate::tokens::{color, glyph};
 use crate::ui::centered;
@@ -61,10 +61,17 @@ pub fn palette(app: &App, theme: &Theme, screen: Rect, prompt_line: Rect, buf: &
     if items.is_empty() {
         return;
     }
-    let h = (items.len().min(10) + 2) as u16;
+    // The box sits above the prompt line and never leaves the screen: shrink
+    // it to the rows available there, and draw nothing when fewer than three
+    // fit (border, one item, border) — a short terminal keeps the prompt.
+    let above = prompt_line.y.saturating_sub(screen.y);
+    let h = ((items.len().min(10) + 2) as u16).min(above);
     let w = screen.width.min(100);
-    let y = prompt_line.y.saturating_sub(h);
-    let area = Rect::new(screen.x + (screen.width - w) / 2, y, w, h);
+    if h < 3 || w < 4 {
+        return;
+    }
+    let y = prompt_line.y - h;
+    let area = Rect::new(screen.x + (screen.width - w) / 2, y, w, h).intersection(screen);
     let inner = boxed(theme, "palette", area, buf);
     let top = app
         .palette_cursor
@@ -158,8 +165,9 @@ pub fn quick_look(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
     let title = format!("#{} {} {}", row.seq, row.method, truncate(&row.url(), 60));
     let inner = boxed(theme, &title, area, buf);
     let lines: Vec<Line<'_>> = match app.selected_detail() {
+        Some(d) if row.kind == FlowKind::WebSocket => crate::ui::inspector::ws_frames(theme, d),
         Some(d) => match d.response.as_ref().or(d.request.as_ref()) {
-            Some(m) => viewers::body(theme, m),
+            Some(m) => viewers::body_paged(theme, m),
             None => vec![Line::styled("no body yet", theme.text_tertiary())],
         },
         None => vec![Line::styled(

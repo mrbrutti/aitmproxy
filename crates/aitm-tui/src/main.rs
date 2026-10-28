@@ -148,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
         caps: args.caps,
         poll: Duration::from_millis(args.poll_ms.max(100)),
         startup_note: None,
+        listening: None,
     })
     .await
 }

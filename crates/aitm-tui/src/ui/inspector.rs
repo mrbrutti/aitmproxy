@@ -207,10 +207,31 @@ fn pane(
     }
     let tab_rect = Rect::new(area.x, area.y, area.width, 1);
     buf.set_style(tab_rect, theme.raised());
-    // The JSON tab names the node under the cursor on the right (§2.7
-    // "JSONPath of node").
+    // The JSON tab builds its tree once per frame: the node path on the tab
+    // row (§2.7 "JSONPath of node") and the pane's lines come from the same
+    // build. A large body (viewers::LARGE_BODY_BYTES) is not parsed at all.
     let json_tab = which == Pane::Response && tabs[active] == "JSON";
-    match app.json_cursor_path().filter(|_| json_tab) {
+    let json = if json_tab {
+        detail
+            .and_then(|d| d.response.as_ref())
+            .filter(|m| !viewers::is_large(m))
+            .and_then(Message::body_text)
+            .and_then(|t| viewers::json::tree_with_paths(theme, t, &app.inspector.folds))
+    } else {
+        None
+    };
+    let (json_lines, json_paths) = match json {
+        Some((lines, paths)) => (Some(lines), Some(paths)),
+        None => (None, None),
+    };
+    let path = json_paths.as_ref().and_then(|paths| {
+        let last = paths.len().min(viewers::MAX_VIEWER_LINES).checked_sub(1)?;
+        paths
+            .get(app.inspector.cursor_line.min(last))
+            .cloned()
+            .flatten()
+    });
+    match path {
         Some(path) => put_sides(
             buf,
             tab_rect,
@@ -221,11 +242,23 @@ fn pane(
     }
 
     let body = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
-    let lines: Vec<Line<'_>> = if which == Pane::Request && app.mode == Mode::Edit {
+    if which == Pane::Request && app.mode == Mode::Edit {
         return editor(app, theme, body, buf);
-    } else {
-        content(app, theme, row, detail, which, tabs[active], body.width)
-    };
+    }
+    let has_tree = json_paths.is_some();
+    let lines = viewers::page(
+        theme,
+        content(
+            app,
+            theme,
+            row,
+            detail,
+            which,
+            tabs[active],
+            body.width,
+            json_lines,
+        ),
+    );
     let last = lines.len().saturating_sub(1);
     let height = usize::from(body.height);
     // The focused pane scrolls to its offset, then far enough that the cursor
@@ -244,11 +277,15 @@ fn pane(
         }
         None => 0,
     };
-    let gutter = lines.len() > 1
-        && tabs[active] != "Headers"
-        && tabs[active] != "Summary"
-        && tabs[active] != "Connection";
-    let highlight = cursor.filter(|_| json_tab);
+    // Line numbers only in front of a real viewer: not the key/value tabs,
+    // and not the summary-facts fallback a tab shows before detail arrives
+    // (the Query table comes from the row, so it counts either way).
+    let viewer_tab = matches!(
+        tabs[active],
+        "Query" | "Body" | "Raw" | "JSON" | "Hex" | "Diff"
+    );
+    let gutter = lines.len() > 1 && viewer_tab && (detail.is_some() || tabs[active] == "Query");
+    let highlight = cursor.filter(|_| has_tree);
     for (k, line) in lines.iter().skip(scroll).take(height).enumerate() {
         let y = body.y + k as u16;
         let mut x = body.x;
@@ -278,6 +315,10 @@ fn pane(
     }
 }
 
+/// The lines of one tab. `json_lines` is the JSON tree `pane` already built
+/// for the Response JSON tab (`None` on every other tab, or when the body is
+/// large or not JSON).
+#[allow(clippy::too_many_arguments)]
 fn content<'a>(
     app: &'a App,
     theme: &Theme,
@@ -286,7 +327,12 @@ fn content<'a>(
     which: Pane,
     tab: &str,
     width: u16,
+    json_lines: Option<Vec<Line<'a>>>,
 ) -> Vec<Line<'a>> {
+    // The query string is in the summary row; it needs no detail.
+    if (which, tab) == (Pane::Request, "Query") {
+        return viewers::query(theme, &row.path);
+    }
     let Some(d) = detail else {
         let mut lines = viewers::facts(theme, &summary_facts(app, row, None));
         if app.has_tool("flow.detail") {
@@ -309,13 +355,15 @@ fn content<'a>(
             Some(m) => viewers::headers(theme, &m.headers),
             None => pending_response(app, theme, row, d, width),
         },
-        (Pane::Request, "Query") => viewers::query(theme, &row.path),
+        // A WebSocket flow's response is its `101` handshake (Headers tab); its
+        // frames are the body worth reading.
+        (Pane::Response, "Body") if row.kind == FlowKind::WebSocket => ws_frames(theme, d),
         (_, "Body") => match msg {
-            Some(m) => viewers::body(theme, m),
+            Some(m) => viewers::body_paged(theme, m),
             None => pending_response(app, theme, row, d, width),
         },
         (_, "Raw") => match msg {
-            Some(m) => viewers::raw(theme, m, which == Pane::Request),
+            Some(m) => viewers::raw_paged(theme, m, which == Pane::Request),
             None => pending_response(app, theme, row, d, width),
         },
         (Pane::Request, "Summary") => viewers::facts(theme, &summary_facts(app, row, Some(d))),
@@ -347,18 +395,25 @@ fn content<'a>(
             }
             viewers::facts(theme, &rows)
         }
-        (Pane::Response, "JSON") => match msg.and_then(Message::body_text) {
-            Some(t) => viewers::json::tree(theme, t, &app.inspector.folds)
-                .unwrap_or_else(|| vec![Line::styled("body is not JSON", theme.text_tertiary())]),
-            None => pending_response(app, theme, row, d, width),
-        },
-        (Pane::Response, "Hex") => match msg {
-            Some(m) if !m.body.is_empty() => {
-                viewers::hex::dump(theme, &m.body, if width >= 100 { 16 } else { 8 })
+        (Pane::Response, "JSON") => match (msg, json_lines) {
+            (Some(m), _) if viewers::is_large(m) => {
+                viewers::large_body_preview(theme, m, false, 16)
             }
-            Some(_) => vec![Line::styled("0 B", theme.text_tertiary())],
-            None => pending_response(app, theme, row, d, width),
+            (Some(_), Some(lines)) => lines,
+            (Some(_), None) => vec![Line::styled("body is not JSON", theme.text_tertiary())],
+            (None, _) => pending_response(app, theme, row, d, width),
         },
+        (Pane::Response, "Hex") => {
+            let per_line = if width >= 100 { 16 } else { 8 };
+            match msg {
+                Some(m) if viewers::is_large(m) => {
+                    viewers::large_body_preview(theme, m, true, per_line)
+                }
+                Some(m) if !m.body.is_empty() => viewers::hex::dump(theme, &m.body, per_line),
+                Some(_) => vec![Line::styled("0 B", theme.text_tertiary())],
+                None => pending_response(app, theme, row, d, width),
+            }
+        }
         (Pane::Response, "Diff") => {
             let other = reference_flow(app, row);
             let (Some(cur), Some((other_row, other_d))) = (msg, other) else {
@@ -367,11 +422,17 @@ fn content<'a>(
                     theme.text_tertiary(),
                 )];
             };
-            let old = other_d
-                .response
-                .as_ref()
-                .and_then(Message::body_text)
-                .unwrap_or("");
+            let other_resp = other_d.response.as_ref();
+            if viewers::is_large(cur) || other_resp.is_some_and(viewers::is_large) {
+                return vec![Line::styled(
+                    format!(
+                        "large body · diff skipped over {} · o to open externally",
+                        human_bytes(viewers::LARGE_BODY_BYTES as u64)
+                    ),
+                    theme.intercept_armed_quiet(),
+                )];
+            }
+            let old = other_resp.and_then(Message::body_text).unwrap_or("");
             let new = cur.body_text().unwrap_or("");
             let mut lines = vec![Line::styled(
                 format!(
@@ -414,26 +475,7 @@ fn pending_response<'a>(
     };
     let mut lines = vec![Line::styled(why, theme.text_tertiary())];
     if row.kind == FlowKind::WebSocket {
-        for f in &d.frames {
-            let arrow = if f.dir == "c2s" { "→" } else { "←" };
-            let style = if f.dir == "c2s" {
-                theme.fg(&color::status::INFORMATIONAL)
-            } else {
-                theme.text_primary()
-            };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{} ", f.time.as_deref().map_or("—".to_string(), clock_of)),
-                    theme.text_tertiary(),
-                ),
-                Span::styled(format!("{arrow} {} ", f.opcode), style),
-                Span::styled(
-                    String::from_utf8_lossy(&f.data).into_owned(),
-                    theme.text_primary(),
-                ),
-                Span::styled(if f.injected { "  injected" } else { "" }, theme.agent()),
-            ]));
-        }
+        lines.extend(ws_frames(theme, d));
         return lines;
     }
     if let Some((other, od)) = reference_flow(app, row) {
@@ -447,10 +489,43 @@ fn pending_response<'a>(
                 theme.text_tertiary(),
             ));
             lines.push(Line::raw(""));
-            lines.extend(viewers::body(theme, resp));
+            lines.extend(viewers::body_paged(theme, resp));
         }
     }
     lines
+}
+
+/// A WebSocket flow's frames (§3.7 "WS flow with frame list"), one per line:
+/// `time · → / ← · opcode · text · injected`. The Response pane's Body tab
+/// and quick-look show these; the `101` handshake stays on the Headers tab.
+pub fn ws_frames<'a>(theme: &Theme, d: &FlowDetail) -> Vec<Line<'a>> {
+    if d.frames.is_empty() {
+        return vec![Line::styled("no frames yet", theme.text_tertiary())];
+    }
+    d.frames
+        .iter()
+        .map(|f| {
+            let c2s = f.dir == "c2s";
+            let arrow = if c2s { "→" } else { "←" };
+            let style = if c2s {
+                theme.fg(&color::status::INFORMATIONAL)
+            } else {
+                theme.text_primary()
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!("{} ", f.time.as_deref().map_or("—".to_string(), clock_of)),
+                    theme.text_tertiary(),
+                ),
+                Span::styled(format!("{arrow} {} ", f.opcode), style),
+                Span::styled(
+                    String::from_utf8_lossy(&f.data).into_owned(),
+                    theme.text_primary(),
+                ),
+                Span::styled(if f.injected { "  injected" } else { "" }, theme.agent()),
+            ])
+        })
+        .collect()
 }
 
 /// The most recent earlier flow to the same method + host + path that has a response.
@@ -659,6 +734,17 @@ mod tests {
         let buf = snap(&app, &theme, 200, 50);
         let (_, tabs) = row_with(&buf, "Response  Headers").unwrap();
         assert!(!tabs.contains("$."), "{tabs:?}");
+
+        // Without detail both Body tabs fall back to the summary facts, which
+        // are not a body viewer: no line-number gutter in front of them.
+        app.inspector.request_tab = crate::app::REQUEST_TABS
+            .iter()
+            .position(|t| *t == "Body")
+            .unwrap();
+        app.details.remove("f41");
+        let text = to_text(&snap(&app, &theme, 200, 50));
+        assert!(text.contains("id      f41"), "{text}");
+        assert!(!text.contains("1 id      f41"), "gutter on facts: {text}");
     }
 
     #[test]

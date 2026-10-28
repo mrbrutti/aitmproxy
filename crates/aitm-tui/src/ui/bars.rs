@@ -14,6 +14,10 @@ use crate::theme::Theme;
 use crate::tokens::glyph;
 use crate::ui::text::{fit, truncate, width};
 
+/// The toolbar shows its `: palette · layout · b sidebar` hints from this
+/// width up; narrower, the agent toggle alone is the right cluster.
+pub const TOOLBAR_HINTS_COLS: u16 = 150;
+
 /// Write a line, clipped to the area.
 pub fn put(buf: &mut Buffer, area: Rect, line: Line<'_>) {
     if area.height == 0 {
@@ -100,13 +104,17 @@ pub fn toolbar(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         crate::app::Layout::Horizontal => "▄▄ below",
         crate::app::Layout::Vertical => "▌▐ right",
     };
-    let right = Line::from(vec![
-        Span::styled(format!("[{agent_label}]"), agent_style),
-        Span::styled(
-            format!("  {} palette  {}  b sidebar ", glyph::PALETTE, layout),
+    let mut right = vec![Span::styled(format!("[{agent_label}]"), agent_style)];
+    // The key hints are a courtesy; below this width they would squeeze the
+    // listening pill into the agent toggle.
+    if area.width >= TOOLBAR_HINTS_COLS {
+        right.push(Span::styled(
+            format!("  {} palette  {}  b sidebar", glyph::PALETTE, layout),
             theme.text_tertiary(),
-        ),
-    ]);
+        ));
+    }
+    right.push(Span::raw(" "));
+    let right = Line::from(right);
 
     let lw = Line::from(left.clone()).width() as u16;
     let rw = right.width() as u16;
@@ -251,70 +259,67 @@ pub fn intercept(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
 
 pub fn status(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     buf.set_style(area, theme.raised());
-    let key = |k: &str, label: &str| -> Vec<Span<'static>> {
-        vec![
-            Span::styled(
+    // The key hints for this mode, most important first; the right-most are
+    // dropped when the centre counts would not fit otherwise.
+    let mut hints: Vec<(&str, &str)> = match app.mode {
+        Mode::Flows => vec![
+            ("?", "help"),
+            ("i", "intercept"),
+            ("e", "edit"),
+            ("r", "replay"),
+            ("n", "compose"),
+            ("P", "poc"),
+            (":", "palette"),
+            (
+                "t",
+                if app.auto_select {
+                    "Auto-select ●"
+                } else {
+                    "Auto-select ○"
+                },
+            ),
+        ],
+        Mode::Inspector => vec![
+            ("Esc", "back"),
+            ("Tab", "pane"),
+            ("←→", "tabs"),
+            ("↑↓", "scroll"),
+            ("e", "edit"),
+            ("y", "copy url"),
+        ],
+        Mode::Edit => vec![
+            ("^S", "Apply & Resume"),
+            ("^R", "revert"),
+            ("Esc", "cancel"),
+        ],
+        Mode::Findings => vec![
+            ("↑↓", "select"),
+            ("⏎", "open capture"),
+            ("r", "run again"),
+            ("o", "open screenshot"),
+            ("Esc", "back"),
+        ],
+        Mode::Scope => vec![("a", "add"), ("d", "remove"), ("Esc", "back")],
+        Mode::Agent => vec![
+            ("1", "all"),
+            ("2", "read-only"),
+            ("3", "paused"),
+            ("Esc", "back"),
+        ],
+        Mode::Compose => vec![("Tab", "next field"), ("^S", "send"), ("Esc", "cancel")],
+        _ => vec![("Esc", "back")],
+    };
+    let hint_line = |hints: &[(&str, &str)]| -> Line<'static> {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(hints.len() * 2);
+        for (k, label) in hints {
+            spans.push(Span::styled(
                 format!(" {k}"),
                 theme.text_primary().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!(" {label} "), theme.text_secondary()),
-        ]
+            ));
+            spans.push(Span::styled(format!(" {label} "), theme.text_secondary()));
+        }
+        Line::from(spans)
     };
-    let mut left: Vec<Span<'static>> = Vec::new();
-    match app.mode {
-        Mode::Flows => {
-            left.extend(key("?", "help"));
-            left.extend(key("i", "intercept"));
-            left.extend(key("e", "edit"));
-            left.extend(key("r", "replay"));
-            left.extend(key("n", "compose"));
-            left.extend(key("P", "poc"));
-            left.extend(key(":", "palette"));
-            let auto = if app.auto_select {
-                "Auto-select ●"
-            } else {
-                "Auto-select ○"
-            };
-            left.extend(key("t", auto));
-        }
-        Mode::Inspector => {
-            left.extend(key("Esc", "back"));
-            left.extend(key("Tab", "pane"));
-            left.extend(key("←→", "tabs"));
-            left.extend(key("↑↓", "scroll"));
-            left.extend(key("e", "edit"));
-            left.extend(key("y", "copy url"));
-        }
-        Mode::Edit => {
-            left.extend(key("^S", "Apply & Resume"));
-            left.extend(key("^R", "revert"));
-            left.extend(key("Esc", "cancel"));
-        }
-        Mode::Findings => {
-            left.extend(key("↑↓", "select"));
-            left.extend(key("⏎", "open capture"));
-            left.extend(key("r", "run again"));
-            left.extend(key("o", "open screenshot"));
-            left.extend(key("Esc", "back"));
-        }
-        Mode::Scope => {
-            left.extend(key("a", "add"));
-            left.extend(key("d", "remove"));
-            left.extend(key("Esc", "back"));
-        }
-        Mode::Agent => {
-            left.extend(key("1", "all"));
-            left.extend(key("2", "read-only"));
-            left.extend(key("3", "paused"));
-            left.extend(key("Esc", "back"));
-        }
-        Mode::Compose => {
-            left.extend(key("Tab", "next field"));
-            left.extend(key("^S", "send"));
-            left.extend(key("Esc", "cancel"));
-        }
-        _ => left.extend(key("Esc", "back")),
-    }
 
     let center: Line<'static> = if let Some(t) = app.current_toast() {
         let style = match t.level {
@@ -373,13 +378,18 @@ pub fn status(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         Span::styled(format!("{bus_text} "), theme.text_secondary()),
     ]);
 
-    let left_line = Line::from(left);
-    let lw = left_line.width() as u16;
     let rw = right.width() as u16;
+    let cw = center.width() as u16;
+    // Drop hints from the right before touching the centre counts.
+    let mut left_line = hint_line(&hints);
+    while !hints.is_empty() && (left_line.width() as u16).saturating_add(cw + 2 + rw) > area.width {
+        hints.pop();
+        left_line = hint_line(&hints);
+    }
+    let lw = left_line.width() as u16;
     buf.set_line(area.x, area.y, &left_line, area.width.saturating_sub(rw));
     if lw + rw < area.width {
         buf.set_line(area.x + area.width - rw, area.y, &right, rw);
-        let cw = center.width() as u16;
         let free = area.width - lw - rw;
         if cw + 2 <= free {
             let x = area.x + lw + (free - cw) / 2;

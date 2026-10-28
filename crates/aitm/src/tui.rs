@@ -127,6 +127,7 @@ pub async fn run(cfg: &Config, proxy: &Proxy, services: Services) -> anyhow::Res
             Some(p) => format!("embedded proxy · log: {}", p.display()),
             None => "embedded proxy · set RUST_LOG to write a log file".to_string(),
         }),
+        listening: Some(cfg.listen.to_string()),
     });
 
     let main_listen = cfg.listen;

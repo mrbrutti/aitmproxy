@@ -24,7 +24,10 @@ pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub type Connector =
     Arc<dyn Fn() -> aitm_bus_client::BoxFuture<'static, anyhow::Result<BusClient>> + Send + Sync>;
 
-/// Run until the request channel closes.
+/// Run until the app goes away: the request channel closes, or an event
+/// cannot be delivered because its receiver is gone. A failed connect or a
+/// lost transport never ends the loop; it is retried with exponential
+/// back-off (500 ms doubling to 10 s, reset after each successful connect).
 pub async fn run(
     connect: Connector,
     mut rx: mpsc::Receiver<BusRequest>,

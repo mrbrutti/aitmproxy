@@ -38,8 +38,13 @@ pub fn map(key: KeyEvent, mode: Mode) -> Option<Action> {
     }
 }
 
-fn nav(code: KeyCode) -> Option<Action> {
-    Some(match code {
+/// The shared list-navigation keys. A key with Control held is not navigation
+/// (`Ctrl-K` opens the palette, `j`/`k` only move when pressed bare).
+fn nav(key: KeyEvent) -> Option<Action> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    Some(match key.code {
         KeyCode::Up | KeyCode::Char('k') => Action::Up,
         KeyCode::Down | KeyCode::Char('j') => Action::Down,
         KeyCode::PageUp => Action::PageUp,
@@ -51,7 +56,7 @@ fn nav(code: KeyCode) -> Option<Action> {
 }
 
 fn flows(key: KeyEvent, ctrl: bool) -> Option<Action> {
-    if let Some(a) = nav(key.code) {
+    if let Some(a) = nav(key) {
         return Some(a);
     }
     Some(match key.code {
@@ -171,7 +176,7 @@ fn compose(key: KeyEvent, ctrl: bool) -> Option<Action> {
 }
 
 fn findings(key: KeyEvent) -> Option<Action> {
-    if let Some(a) = nav(key.code) {
+    if let Some(a) = nav(key) {
         return Some(a);
     }
     Some(match key.code {
@@ -186,7 +191,7 @@ fn findings(key: KeyEvent) -> Option<Action> {
 }
 
 fn scope(key: KeyEvent) -> Option<Action> {
-    if let Some(a) = nav(key.code) {
+    if let Some(a) = nav(key) {
         return Some(a);
     }
     Some(match key.code {

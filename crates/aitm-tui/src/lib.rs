@@ -65,6 +65,9 @@ pub struct RunOptions {
     /// A note shown in the status bar at start (e.g. where the embedded
     /// proxy's log went).
     pub startup_note: Option<String>,
+    /// The proxy's listen address when the caller knows it (the embed does);
+    /// otherwise it comes from `proxy.status` (core follow-up F7) or stays unknown.
+    pub listening: Option<String>,
 }
 
 /// Restores the terminal when dropped, so a caller that drops the `run`
@@ -130,6 +133,9 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     let bus_task = tokio::spawn(bus::run(connect, req_rx, ev_tx, opts.poll));
     if let Some(note) = opts.startup_note {
         app.toast(action::Level::Info, note);
+    }
+    if opts.listening.is_some() {
+        app.listening = opts.listening;
     }
 
     let mut terminal = ratatui::init();

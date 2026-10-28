@@ -81,6 +81,16 @@ serde_json with `preserve_order`, tokio, futures, anyhow).
 
 | Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
+| 3 | Tester (pass 1) | Important | F1 palette popup panics on terminals shorter than ~12 rows (`overlays.rs` box not clamped to the screen) | fix task dispatched 2026-10-27 |
+| 3, 5 | Tester (pass 1) | Important | F2 viewers rebuilt every frame; JSON tab builds the tree three times; a 5 MB body costs 1.1–3.3 s per frame | fix task: page bodies (1 MiB byte cap, 4 000-line cap, one tree per frame) |
+| 3 | Tester (pass 1) | Important | F3 WebSocket frames unreachable: drawn only when the response is absent, but a WS flow's response is the 101 | fix task: frames on the Response Body tab for WS flows |
+| 3 | Tester (pass 1) | Important | F4 `percent_decode` slices by byte offset → panic on a multibyte char after `%` (reachable from any request path) | fix task |
+| 3 | Tester (pass 1) | Minor | F5 at exactly 120 columns the toolbar pill is cut into the agent toggle and the status counts collapse | fix task: drop hint clusters before counts |
+| 3 | Tester (pass 1) | Minor | F6 Ctrl-K dead (`nav` maps `k` before the ctrl arm) | fix task |
+| 3 | Lead | Minor | F7 line-number gutter drawn for the summary-facts fallback | fix task |
+| 3 | Tester (pass 1) | Observation | O1 diff threshold is the pane width, not terminal columns | accepted by lead: the pane is what the diff has |
+| 3 | Tester (pass 1) | Observation | O2 intercept bar between list and inspector (mockup) vs "above the status bar" (§2.7 text) | accepted by lead: follows the mockup |
+| 3 | Tester (pass 1) | Observation | O4 `on_bus(Flows)` is O(n²), 160 ms at 5 000 flows | follow-up if it grows; fix allowed in the fix task when small |
 
 ## Shipped
 

@@ -652,21 +652,32 @@ impl App {
     }
 
     /// The selected flow's response body when the Response pane's JSON tab
-    /// is showing it; `None` on any other pane or tab.
+    /// is showing it; `None` on any other pane or tab, and for a large body
+    /// (over `viewers::LARGE_BODY_BYTES`), which the tab previews as text
+    /// instead of parsing.
     fn json_body(&self) -> Option<&str> {
         if self.inspector.pane != Pane::Response
             || RESPONSE_TABS.get(self.inspector.response_tab) != Some(&"JSON")
         {
             return None;
         }
-        self.selected_detail()?.response.as_ref()?.body_text()
+        let resp = self.selected_detail()?.response.as_ref()?;
+        if crate::viewers::is_large(resp) {
+            return None;
+        }
+        resp.body_text()
     }
 
     /// The JSON tree as the JSON tab draws it (paths only matter here, so the
-    /// theme is irrelevant); `None` off the JSON tab or when the body is not JSON.
+    /// theme is irrelevant), cut where the renderer cuts it
+    /// (`viewers::MAX_VIEWER_LINES`); `None` off the JSON tab or when the
+    /// body is not JSON.
     fn json_tree(&self) -> Option<Vec<Option<String>>> {
         let body = self.json_body()?;
-        json::tree_with_paths(&Theme::new(false), body, &self.inspector.folds).map(|(_, p)| p)
+        let (_, mut paths) =
+            json::tree_with_paths(&Theme::new(false), body, &self.inspector.folds)?;
+        paths.truncate(crate::viewers::MAX_VIEWER_LINES);
+        Some(paths)
     }
 
     /// The node path (`$.items[0].name`) of the cursor line on the Response
