@@ -374,6 +374,12 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 1 | quality | Important | Matcher's host/phase/ws_dir/method/enabled/WS-flow branches untested (crate reused by F3/F9/Map) | Fix dispatched to m6-t1-rules — add branch tests |
+| 1 | security | Minor | `HostMatch::Wildcard` case-sensitive vs lowercased subject → uppercase host patterns silently never fire | Fix dispatched — lowercase host wildcard (real latent bug; promoted to fix) |
+| 1 | security | Minor | No explicit regex size cap (relies on `regex` 10 MiB default); agent-supplied patterns | Fix dispatched — add `RegexBuilder` `size_limit` ~1 MiB |
+| 1 | quality/spec | Important/Minor | URL clause matches path, not spec §0's `scheme://authority/path?query` | Resolved — path+query confirmed (consistent with authoritative AC-R2 `^/v…$`); spec §0 reconciled 2026-10-28 |
+| 1 | quality/spec | Minor | `CompiledRule::rule()` public accessor not in Interfaces block | Accepted — F3 needs `rule().id` as the remove handle; exposes only public data |
+| 1 | quality | Minor | Per-char `String` alloc in `wildcard_to_regex` (cold path) | Accepted — cold path (compile-time), not the per-event matcher |
 
 ## Shipped
 
