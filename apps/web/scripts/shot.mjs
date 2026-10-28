@@ -1,13 +1,13 @@
 // Headless-Chrome driver over CDP (no Playwright): screenshots and real-frame perf numbers.
 //
 //   node scripts/shot.mjs --url 'http://localhost:5173/?initial=60' --out shots/main-dark.png \
-//        [--width 1600 --height 1000] [--scale 2] [--keys i,End] [--eval '<js>'] [--wait 2500] [--perf 10000]
+//        [--width 1600 --height 1000] [--scale 2] [--keys i,End] [--eval '<js>' | --evalFile f.js] [--wait 2500] [--perf 10000]
 //
 // --keys sends real key presses (CDP Input) after load; --eval runs JS after the keys; --wait is the
 // settle time before the capture; --perf N samples requestAnimationFrame for N ms and prints
 // {frames,p50,p95,max,dropped} plus window.__aitmPerf if the app exposes it.
 import { spawn } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 const CHROME = process.env.CHROME ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
@@ -94,8 +94,9 @@ try {
     await s('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
     await new Promise((r) => setTimeout(r, Number(args.keyDelay ?? 400)));
   }
-  if (args.eval && args.eval !== 'true') {
-    const r = await s('Runtime.evaluate', { expression: args.eval, awaitPromise: true, returnByValue: true });
+  const evalSrc = args.evalFile && args.evalFile !== 'true' ? readFileSync(args.evalFile, 'utf8') : args.eval;
+  if (evalSrc && evalSrc !== 'true') {
+    const r = await s('Runtime.evaluate', { expression: evalSrc, awaitPromise: true, returnByValue: true });
     if (r.exceptionDetails) console.error('eval failed:', r.exceptionDetails.text, r.exceptionDetails.exception?.description);
     else if (r.result.value !== undefined) console.log('eval:', JSON.stringify(r.result.value));
   }

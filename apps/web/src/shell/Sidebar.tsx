@@ -139,7 +139,7 @@ export const Sidebar: Component<{ class?: string }> = (props) => {
             {(a) => (
               <Item
                 sub
-                monogram={a.name.slice(0, 1)}
+                {...(a.id === 'unknown' ? {} : { monogram: a.name.slice(0, 1) })}
                 label={a.name}
                 count={a.count}
                 current={is({ kind: 'app', key: a.id })}
