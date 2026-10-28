@@ -2,8 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** approved (2026-10-28 by Matt)
-**Spec:** `docs/superpowers/specs/2026-10-27-aitmproxy-m3-rhai-scripting-design.md` (approved 2026-10-27; AC-M3-1…AC-M3-12, inheriting plugin-system AC-P6–AC-P11 and PoC-language AC-L8)
+**Status:** approved (2026-10-28 by Matt; engine Rhai, OQ10 resolved = C)
+**Spec:** `docs/superpowers/specs/2026-10-27-aitmproxy-m3-rhai-scripting-design.md` (approved; AC-M3-1…AC-M3-12, inheriting plugin-system AC-P6–AC-P11 and PoC-language AC-L8)
 **Branch / worktree:** `feat/aitmproxy-m3`, cut from `main` (M1) at stage 4; the spec, research note, and this plan are committed on `claude/m3-rhai-spec-2197df`.
 
 **Goal:** Add the Rhai scripting tier — a new `aitm-plugin-rhai` crate that turns a `.rhai` file into a first-class, ordered-chain `Plugin`, plus the PoC `script`-step escape hatch (`Step::Script` in `aitm-poc` driven through a `ScriptStepExecutor` seam) — over the M1 seams on `main`, with `aitm-core` unchanged and every AC-M3 criterion green.
@@ -18,7 +18,8 @@ Every task's requirements implicitly include these (verbatim from the spec):
 
 - **Gate:** `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test` before any review. TDD: no production code without a failing test first; the Coder's report includes both runs.
 - **`unsafe` stays forbidden.** The workspace sets `unsafe_code = "forbid"`; the M3 design is deliberately `unsafe`-free (shared-state handles, not raw pointers). A task that reaches for `unsafe` has mis-designed and must stop and report.
-- **Engine features:** `rhai` with `sync` only. `unchecked` and `internals` must never be enabled — `unchecked` disables the very limits this tier relies on.
+- **Engine features:** `rhai` with `sync` only. `unchecked` and `internals` must never be enabled — `unchecked` disables the very limits this tier relies on. (Engine decided: Rhai — spec OQ10, Matt 2026-10-28.)
+- **Capabilities register through the seam (spec §6a).** The `log`/`finding`/`http`/`browser`/`store`/`scope` host functions are registered as `ScriptCapability` providers, not one hard-coded block, so a future protocol/L4 crate adds its own verbs with no sandbox-core change. **L4/new-protocol verbs and the extended (packet/address-level) scope model are out of M3** (spec §7a, OQ11); M3 builds only today's capabilities behind the seam.
 - **Multi-threaded runtime required.** `tokio::task::block_in_place` panics on a current-thread runtime; all script dispatch and the e2e tests run on the multi-thread flavour the proxy already uses.
 - **Declared signatures are authoritative.** Types and signatures in the spec and in each task's Interfaces block are copied exactly; bodies and in-module file layout are the builder's.
 - **No `aitm-core` edits.** M3 adds crates and additive `aitm-poc` members only. Script runtime errors reach the bus as `FlowError::Protocol("script: …")` (spec OQ2) — no new core variant.
@@ -185,10 +186,12 @@ Longest sequential chain: 1 → 3 → 6 → 7 → 8 → 9 → 10 → 15 (8 tasks
   pub trait FindingSink: Send + Sync { fn record(&self, f: Finding); fn list(&self) -> Vec<Finding>; }
   pub struct Finding { pub name: String, pub severity: aitm_poc::Severity, pub flow: Option<aitm_core::FlowId>, pub detail: Option<String>, pub tags: Vec<String>, pub source: String, pub at: std::time::SystemTime }
   pub struct MemoryFindingSink(/* Mutex<Vec<Finding>> */);  // default + test impl
-  pub fn register_host_core(engine: &mut rhai::Engine, services: ScriptServices, options: Arc<Options>, source: String);
   pub struct Options(/* BTreeMap<String, aitm_core::Value> */);
+  // the protocol-extensible seam (spec §6a): one namespace of verbs == one provider
+  pub trait ScriptCapability: Send + Sync { fn namespace(&self) -> &str; fn min_api(&self) -> &str; fn register(&self, engine: &mut rhai::Engine, services: &ScriptServices); }
+  pub struct LogCapability; pub struct FindingCapability;   // M3's first providers (log/finding/option)
   ```
-- **Change:** register `log`/`log.info`/`warn`/`error` → `tracing`; `finding(map)` parses `#{name,severity,flow_id?,detail?,tags?}` (via `dynamic_to_value`) into a `Finding{source}` and calls `findings.record`; `option(name)` returns `value_to_dynamic(options.get(name))` or `()`.
+- **Change:** define the `ScriptCapability` seam and ship `LogCapability`/`FindingCapability` as the first providers. `log`/`log.info`/`warn`/`error` → `tracing`; `finding(map)` parses `#{name,severity,flow_id?,detail?,tags?}` (via `dynamic_to_value`) into a `Finding{source}` and calls `findings.record`; `option(name)` returns `value_to_dynamic(options.get(name))` or `()`. Each provider's `register` wires only its own namespace; the engine builder (Task 2/9) holds a `Vec<Arc<dyn ScriptCapability>>` and registers each.
 - **Test:**
   - `host_core.rs::finding_records_fields`: a script `finding(#{ name:"x", severity:"medium", tags:["a"] })` with a `MemoryFindingSink` → `list()[0].name == "x"`, `.severity == Severity::Medium`, `.tags == ["a"]`, `.source` is the script name.
   - `host_core.rs::option_reads_set_value`: `Options` holding `tag → Str("v")`; script `option("tag")` → `"v"`; unknown key → `()`.
@@ -203,11 +206,12 @@ Longest sequential chain: 1 → 3 → 6 → 7 → 8 → 9 → 10 → 15 (8 tasks
 - **Files:** Modify `src/host_net.rs`; test `tests/host_net.rs`.
 - **Interfaces — Produces:**
   ```rust
-  pub fn register_host_net(engine: &mut rhai::Engine, services: ScriptServices);
+  // each is a ScriptCapability provider (spec §6a), not a bare register fn
+  pub struct HttpCapability; pub struct BrowserCapability; pub struct StoreCapability; pub struct ScopeCapability;
   // Rhai-visible: http.send(#{..})->#{..}; browser.navigate/click/type/screenshot/eval/get_dom;
   //              store.get(id)/query(#{..}); scope.add(host)/list() — signatures per spec §6.
   ```
-- **Change:** each namespace is a `Clone` marker holding `ScriptServices`. Async ones call `services.rt.block_on(fut)` (the enclosing hook has already entered `block_in_place`); the future is the existing guarded call (`guard.check_active` → `client.send` / `browser.*`). A `GuardError` maps to `Err(Box<EvalAltResult>)` whose message names the host and reason (catchable in Rhai). `store.*` reads the store; `scope.add/list` goes through the guard.
+- **Change:** each capability is a `ScriptCapability` provider whose `register` wires its namespace; each verb holds `ScriptServices`. Async ones call `services.rt.block_on(fut)` (the enclosing hook has already entered `block_in_place`); the future is the existing guarded call (`guard.check_active` → `client.send` / `browser.*`). A `GuardError` maps to `Err(Box<EvalAltResult>)` whose message names the host and reason (catchable in Rhai). `store.*` reads the store; `scope.add/list` goes through the guard.
 - **Test** (`#[tokio::test(flavor = "multi_thread")]`, stub `ScopeRateGuard`/`ProxyClient`/`FlowStore`):
   - `host_net.rs::out_of_scope_send_is_catchable` (RF#2/#3): guard refuses `evil.test`; script `try { http.send(#{method:"GET",url:"http://evil.test/"}); "sent" } catch(e) { "caught:" + e }` → result starts `"caught:"` and contains `"evil.test"`.
   - `host_net.rs::in_scope_send_returns_map`: guard allows; stub client returns a flow with status 200 → script `http.send(#{method:"GET",url:"http://ok.test/"}).status` → `200`.

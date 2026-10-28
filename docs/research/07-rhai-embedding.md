@@ -149,11 +149,48 @@ curated surface read like a small, friendly JS DSL without any transpilation:
 So the "easy JS-like DSL" Matt wants is achievable as **Rhai + a curated
 domain-verb host API + a small bundled prelude**, not a separate DSL compiler.
 Object maps (`#{ ... }`) are the natural argument shape for `http.send(#{...})`
-and `finding(#{...})`. (The RustProxy project cited as a DSL precedent,
-`BarisSenel/RustProxy`, is in fact a reverse-SOCKS5 tunneler with CLI-flag config
-and no scripting layer — the DSL inspiration to mine is nuclei's matcher/DSL
-vocabulary, already captured in `02-nuclei.md`, expressed through Rhai's
-JS-like syntax.)
+and `finding(#{...})`.
+
+## 6b. The `rustman-engine` precedent (evaluated; retained as record)
+
+> **Resolved 2026-10-28:** Matt chose **Rhai** as the engine, considering a full
+> language the stronger base for future L4/other-protocol growth than a minimal DSL.
+> This section is kept as the evaluation record; its good ideas (forgiving reads,
+> the effect model — which the M3 spec's snapshot+apply already is) live on in the
+> Rhai design. No engine comparison remains in the M3 spec.
+
+The scripting precedent Matt pointed at is **`rustman-engine`**
+(github.com/rust-man-org/rustman-engine; scripting ref at
+rust-man-org.github.io/rustman/scripting.html), **not** `BarisSenel/RustProxy`
+(which has no scripting layer — a reverse-SOCKS5 tunneler; disregard the earlier
+citation). Facts, from its README + scripting reference (MIT; new — one commit, no
+crates.io release):
+
+- **Minimal, JS-looking, pure-Rust** (no JS runtime): `let`, `if/else`, `+ - == != && || !`,
+  `//` comments, optional `;`. **Deliberately no loops, no user-defined functions,
+  no array/object literals, no regex, no try/catch, no string slicing** — minimalism
+  so a human or an LLM writes a correct script first try.
+- **Effect-based execution.** `run(source, HostInput) -> RunOutcome { effects }`;
+  effects are `SetHeader`, `SetBody`, `SetEnv`, `Test { name, passed }`, `Log`; the
+  host applies them, the script never mutates host state. On error, earlier effects
+  are discarded. Built-ins: `env`, `header(s)`, `set_header`, `cookie`, `body`,
+  `set_body`, `url`, `test`, `print`, `base64_*`, `jwt_decode`, `contains`,
+  `json_parse/stringify`, `aes_*`. Request/response objects are HTTP-API-client-shaped
+  (`response.status`, `response.json()`); **no WS/browser/intercept/scope/finding**,
+  and the README shows **no host-registration seam** for custom built-ins.
+- **Forgiving defaults.** Missing env/header/cookie → `""`; missing field → `null`;
+  `contains` on non-strings → `false`; bad `json_parse`/`jwt_decode`/`base64_decode`
+  → `null`. A check for something absent never aborts.
+
+**Assessment for aitmproxy (two uses):** the effect model + forgiving defaults are
+excellent and align with our existing `FlowEffect` snapshot+apply (§5 of the M3
+spec). But no-loops/no-functions is too limited for full scripted **plugins**
+(iterate headers, richer chain logic), and the built-in surface is API-client-shaped
+with no extensibility seam — so adopting it wholesale cannot cover M3's plugin half
+or the protocol-extensibility requirement without heavy forking of an unproven
+engine. The M3 spec's recommended path is **Rhai shaped to rustman-engine's
+ergonomics** (effect model we already have, forgiving defaults, minimal curated
+verbs), with the engine choice left to Matt at the gate (M3 spec OQ10).
 
 ## 7. Design takeaways for aitmproxy M3
 

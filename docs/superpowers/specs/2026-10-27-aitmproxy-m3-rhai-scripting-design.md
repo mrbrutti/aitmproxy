@@ -1,6 +1,6 @@
 # aitmproxy M3 — Rhai scripting tier design
 
-**Status:** approved (2026-10-27 by Matt)
+**Status:** approved (2026-10-28 by Matt — engine Rhai confirmed, OQ10 resolved; protocol-extensibility seam added)
 **Research inputs:** `docs/research/07-rhai-embedding.md`, `docs/research/01-mitmproxy.md`, `docs/research/02-nuclei.md`, `docs/research/05-synthesis.md`
 **Companion specs:** platform — `docs/superpowers/specs/2026-10-27-aitmproxy-platform-design.md`; plugin system — `docs/superpowers/specs/2026-10-27-aitmproxy-plugin-system-design.md`; PoC language — `docs/superpowers/specs/2026-10-27-aitmproxy-poc-language-design.md`; M2 browser/config — `docs/superpowers/specs/2026-10-27-aitmproxy-m2-obscura-browser-design.md`
 
@@ -67,6 +67,14 @@ design, not a new decision.
   so no script can stall or OOM the proxy.
 - **Errors a human can act on.** Compile and runtime failures name the script,
   line, column, and the likely fix; one bad script never takes the proxy down.
+- **Protocol-extensible capability surface.** Script verbs are organized so a
+  future MITM protocol module — and eventually the L4/packet-crafting milestone —
+  can register its *own* verbs behind the same deny-by-default + guard model, in
+  its own crate, with no sandbox-core rework. The seam is versioned against the
+  `const API` contract (§6a). M3 ships only today's capabilities; the seam
+  anticipates the rest. This growth is Matt's stated rationale for choosing Rhai: a
+  full scripting language is the stronger base for richer future protocols than a
+  minimal DSL would be.
 - **No core redesign.** M3 adds crates and registrations; it does not restructure
   `aitm-core`.
 
@@ -81,6 +89,13 @@ design, not a new decision.
   mechanism (platform + PoC-language specs). M3 treats scripts as
   trusted-by-operator but sandboxed.
 - **No WASM tier.** Roadmap only, behind the same seam (plugin-system spec).
+- **No new-protocol or L4/raw-packet script verbs in M3.** M3 ships HTTP/WS plus
+  the existing browser/scope/finding capabilities only. The capability seam (§6a)
+  and the scope-growth note (§7a) anticipate new protocols and L4/packet crafting
+  (scapy-style injection of malformed packets); M3 builds none of them and must not
+  preclude them. Those capabilities are more powerful and more dangerous, so when
+  they land they stay deny-by-default and fully guarded, with a scope model that
+  extends beyond host:port (§7a).
 - **No script marketplace, dependency resolution, or remote fetching.**
 - **No scanner logic.** M3 ships the tier, not checks built on it. aitmproxy
   finds and reproduces; it never fixes.
@@ -112,11 +127,14 @@ design, not a new decision.
   must pass before any review. `unsafe` requires a `// SAFETY:` comment and a
   signed-off Security-reviewer entry. **The M3 design is deliberately
   `unsafe`-free** (see the marshalling decision).
-- **Engine:** `rhai` 1.27.x with the **`sync` feature** (`Engine`/`Scope`/`AST`
-  become `Send + Sync`, required to share the engine across the proxy's tasks).
-  The **`unchecked` feature must never be enabled** — it disables the operation,
-  stack, module, and data-size limits this design depends on. The `internals`
-  feature stays off.
+- **Engine (decided — Rhai, Matt 2026-10-28; OQ10).** `rhai` 1.27.x with the
+  **`sync` feature** (`Engine`/`Scope`/`AST` become `Send + Sync`, required to share
+  the engine across the proxy's tasks). The **`unchecked` feature must never be
+  enabled** — it disables the operation, stack, module, and data-size limits this
+  design depends on. The `internals` feature stays off. **Rationale (Matt's):** a
+  full scripting language is the stronger base for growth — as new MITM protocols
+  and the eventual L4/packet milestone add capabilities (§6a, §7a), Rhai expresses
+  their richer logic (loops, functions, control flow) where a minimal DSL could not.
 - **Runtime:** script hooks block; they run under `tokio::task::block_in_place`,
   which **requires the multi-threaded tokio runtime flavour** the proxy already
   uses. Async host functions bridge with a stored `tokio::runtime::Handle`.
@@ -211,35 +229,32 @@ These are binding design rules, not aspirations. Each is testable.
 8. **Examples are part of the deliverable.** The worked examples below are
    normative reference shapes and ship as runnable fixtures.
 
-#### 2a. The JS-like DSL feel — built on Rhai, not transpiled (Architect's call)
+#### 2a. The JS-like DSL feel — built on Rhai (Matt's call)
 
-Matt wants the surface to read like an easy, JavaScript-looking DSL (the stated
-inspiration was a proxy whose rules "look like JavaScript"). The locked decision
-is that Rhai is the *engine*; the reconciliation is that the **JS-like feel is a
-design choice in the layer above Rhai**, which is cheap because Rhai's syntax is
-already C/JS/Rust-like. The feel is produced by three stacked layers, no separate
-DSL compiler:
+Matt wants the surface to read like an easy, JavaScript-looking DSL, and chose
+**Rhai** as the engine (OQ10) — a full scripting language, deliberately, because it
+is the stronger base for growth: as new MITM protocols and the eventual L4/packet
+milestone add capabilities (§6a), their richer logic (loops, functions, control
+flow) needs a real language, not a minimal DSL. The JS-like *feel* is then a design
+choice in the layer above the engine, cheap because Rhai's syntax is already
+C/JS/Rust-like, produced by four stacked choices with no separate DSL compiler:
 
-1. **Rhai's native JS-isms.** Backtick **template literals with `${...}`**
+1. **Native JS-isms.** Backtick **template literals with `${...}`**
    (`` `${base}/search?q=${url_encode(p)}` ``), the `in` operator
-   (`"secret" in msg.text`), indexers (`headers["X-Api"]`), ranges, object maps
-   (`#{ method: "POST", url: u }`), and `if/else`/`for`/`let` that already look
-   like JS. Using these in every example is most of the win.
-2. **Curated domain verbs (the DSL vocabulary).** The host API (§3, §6) is chosen
-   to read as a small traffic-manipulation language — `flow.request.headers.set`,
-   `flow.mark`, `flow.set_response`, `http.send`, `browser.screenshot`,
-   `scope.add`, `finding` — nouns and verbs a tester recognizes, never raw engine
-   primitives.
-3. **A small bundled prelude.** A first-party `prelude.rhai` compiled once and
-   shared by every script and PoC step, providing thin sugar (e.g. `ok(resp)`,
-   `json(map)`, `contains_ci(h, s)`) so common intent reads as one friendly call.
-   It is ordinary Rhai, versioned with the `API` contract, and listed in the docs.
-
-What this is **not**: a hand-written JS parser, a transpiler, or a second
-language. If Matt decides the three layers still fall short of the JS-like feel he
-wants, a thin JS-flavoured surface compiled down to Rhai is possible but costs a
-real parser/compiler and its own test burden — captured as Open question 10, not
-chosen silently.
+   (`"secret" in msg.text`), indexers (`headers["X-Api"]`), object maps
+   (`#{ method: "POST", url: u }`), and `if/else`/`for`/`let`. Using these in every
+   example is most of the win.
+2. **Curated domain verbs** read as a small traffic language —
+   `flow.request.headers.set`, `flow.mark`, `flow.set_response`, `http.send`,
+   `browser.screenshot`, `scope.add`, `finding` — never raw engine primitives.
+3. **A small bundled prelude** (`prelude.rhai`) of thin sugar (`ok(resp)`,
+   `contains_ci(h, s)`, `json(map)`), compiled once, shared by plugins and PoC
+   steps, versioned with the `API` contract.
+4. **Forgiving reads.** A missing header/env/query read returns `""`, a missing
+   object field `null`, rather than throwing — so a script checking for something
+   absent never aborts mid-hook. This is the human-friendliness goal applied to the
+   read path, and it pairs with the effect model in §5 (edits are recorded and
+   applied after the hook, discarded on error).
 
 ### 3. The script-facing surface (pinned)
 
@@ -534,6 +549,47 @@ fn option(name: &str) -> rhai::Dynamic;
 fn halt();  fn r#continue();
 ```
 
+#### 6a. The capability seam — protocol-extensible by construction (Architect's call)
+
+The host functions above are not registered as one hard-coded block. They are
+grouped into **capability providers** behind one seam, so a future protocol module
+— a new MITM protocol today, the L4/packet milestone later — ships its *own* verbs
+in its *own* crate and registers them the same way, with **no sandbox-core rework**.
+This is what keeps "everything-is-a-plugin" true for the scripting surface too.
+
+```rust
+// aitm-plugin-rhai — one capability == one namespace of script verbs.
+
+pub trait ScriptCapability: Send + Sync {
+    /// Namespace as scripts see it: "log", "http", "browser", "store", "scope",
+    /// "finding" today; "l4", "dns", … in their own crates later.
+    fn namespace(&self) -> &str;
+    /// Lowest `const API` a script must declare to be offered this namespace.
+    /// New capabilities raise the floor additively; older scripts never see them.
+    fn min_api(&self) -> &str;
+    /// Register this namespace's verbs into the shared engine, wired to the shared
+    /// services and the guard. Called once when the engine is built.
+    fn register(&self, engine: &mut rhai::Engine, services: &ScriptServices);
+}
+```
+
+- **M3's own namespaces are the first providers.** `LogCapability`,
+  `FindingCapability`, `HttpCapability`, `BrowserCapability`, `StoreCapability`,
+  and `ScopeCapability` each implement `ScriptCapability`; the engine builder is
+  handed a `Vec<Arc<dyn ScriptCapability>>` and registers each. Nothing is special
+  about them — they are simply the providers that ship in M3.
+- **Deny-by-default stays deny-by-default.** A capability a build does not register
+  is simply absent from scripts; there is no ambient namespace. A new protocol's
+  verbs appear only when its provider is wired in.
+- **Guards are inherited, not re-invented.** Every active verb a provider registers
+  routes through the services' guard (`ScopeRateGuard` / SSRF today; the extended
+  guard of §7a when L4 lands). A provider cannot grant a script a path that skips
+  the guard — the seam hands it the guarded services, not raw sockets.
+- **Versioned against `const API`.** `min_api` lets a capability be introduced
+  without breaking older scripts; the stability policy (plugin-system spec) governs
+  it. L4/new-protocol verbs are **out of M3 scope** (Non-goals); this seam is the
+  contract they will plug into.
+
 ### 7. Sandbox, capability model, and the trust boundary
 
 **Trust boundary — stated plainly.** Scripts are **provided by the operator** who
@@ -591,6 +647,31 @@ pub fn harden(engine: &mut rhai::Engine, limits: &RhaiLimits, hook_timeout: Dura
 **Guard enforcement is structural, not advisory:** the only way out of the
 sandbox is a host function in §6, and each network/browser one awaits a future
 that already contains the `ScopeRateGuard` / SSRF check. There is no second path.
+
+#### 7a. The scope model grows with new protocols (the L4 note)
+
+Today's authorization scope is **host:port + an SSRF/private-IP denylist** — a
+model shaped by HTTP/WS, where every action targets a URL with a host and a port.
+That is the right and sufficient model for M3's capabilities.
+
+As aitmproxy adds MITM protocols and eventually **L4 / raw-packet crafting**
+(scapy-style injection of malformed packets), script capabilities will reach below
+host:port: arbitrary addresses, port ranges, protocols, interfaces and direction,
+and crafted/malformed packets. These are **more powerful and more dangerous** than
+an HTTP request, so the authorization model must grow with them:
+
+- The guard model **extends beyond host:port** — e.g. address/CIDR ranges, port
+  ranges, interface + direction, and injection-rate caps — expressed through the
+  existing `ScopeRateGuard` seam (which is where the extension lands; M3 does not
+  change it).
+- Any such capability stays **deny-by-default and fully guarded**: it is offered to
+  a script only when its provider (§6a) is wired in, and its every action passes
+  the extended guard. A raw-packet verb that could reach outside the authorized
+  engagement is a security failure.
+- The capability seam (§6a) and this scope-growth note are the two anticipatory
+  hooks. **M3 builds neither the L4 verbs nor the extended scope** (Non-goals); it
+  only guarantees the design does not preclude them. The exact extended-scope shape
+  is Open question 11.
 
 ### 8. Loading, validation, ordering, errors, reload
 
@@ -1024,15 +1105,19 @@ accept by silence or redirect any one.
 9. **Research-note numbering.** `07-rhai-embedding.md` is the next free number on
    `main`; an `07-ca-install.md` may exist on the in-flight M2 branch. *Default:
    keep `07` here and renumber at integration if M2 lands an `07` first* — trivial.
-10. **How JS-like should the surface be — Rhai + DSL-shaped prelude vs a thin
-    transpiled JS-like DSL?** *Default: Rhai + curated domain verbs + bundled
-    prelude (§2a)* — it already yields a JS-looking surface (template literals,
-    maps, `in`, indexers) at near-zero cost and no second toolchain. The
-    alternative — authoring a small JS-flavoured syntax compiled down to Rhai —
-    would match an exact JS target more closely but adds a real parser/compiler,
-    its own error mapping, and an ongoing test burden, for a surface Rhai largely
-    already provides. **This is Matt's call at the approval gate.** If chosen, it
-    is a separate milestone; it does not change any Rust interface in this spec.
+10. **The engine — RESOLVED: Rhai + curated verbs + prelude (Matt, 2026-10-28).**
+    Matt chose Rhai, and considers it the stronger choice precisely because of
+    future L4 and other-protocol support: a full scripting language expresses the
+    richer logic those capabilities will need (§6a, §7a), where a minimal DSL could
+    not. No further engine evaluation; §3–§9 are the Rhai design, and the JS-like
+    feel is built in the layer above it (§2a).
+11. **The extended scope model for L4 / new protocols (§7a).** *Default: keep
+    host:port + SSRF for M3 and leave the `ScopeRateGuard` seam as the extension
+    point; do not design the packet/address-level scope now.* When L4 lands it will
+    need address/CIDR + port-range + interface/direction + injection-rate scope,
+    deny-by-default and fully guarded — specified in that milestone, not this one.
+    Flagged so the M3 guard interfaces are reviewed as the thing that must grow, not
+    be replaced.
 
 ## Summary
 
@@ -1051,7 +1136,12 @@ a pinned, fix-oriented error format. The PoC `script` step reuses the identical
 surface via a `ScriptStepExecutor` seam that keeps `aitm-poc` Rhai-free for the M1
 declarative subset. Twelve `cargo test`-observable exit criteria cover the
 inherited AC-P6–P11 / AC-L8 plus M3's own ordering, error-isolation, and
-round-trip guarantees. Nothing is built; this is a draft spec for approval.
+round-trip guarantees. The host functions are organized as a **protocol-extensible
+capability seam** (§6a) so future protocols and the eventual L4/packet milestone
+register their own verbs behind the same guards, with a note that the scope model
+grows beyond host:port when L4 lands (§7a). The **engine is Rhai** (Matt,
+2026-10-28, OQ10 resolved), chosen as a full language — the stronger base for that
+growth than a minimal DSL. Nothing is built; this is the approved design for M3.
 
 **Architect's calls (approve or correct):**
 
@@ -1074,9 +1164,14 @@ round-trip guarantees. Nothing is built; this is a draft spec for approval.
     companion specs say (reconciled, no API change).
 11. **Human ergonomics as an acceptance-bearing goal**, with a pinned error format
     and runnable, readable examples.
-12. **JS-like feel via Rhai + curated verbs + bundled prelude**, not a transpiled
-    DSL (§2a); whether to go further to a transpiled JS-like surface is deferred to
-    Matt at the gate (OQ10). *Note: the cited RustProxy DSL precedent
-    (`BarisSenel/RustProxy`) turned out to be a reverse-SOCKS5 tunneler with no
-    scripting layer; the DSL vocabulary to mine is nuclei's (`02-nuclei.md`),
-    expressed through Rhai's JS-like syntax.*
+12. **Engine: Rhai + curated verbs + bundled prelude (Matt, 2026-10-28; OQ10
+    resolved).** Chosen deliberately as a full language — the stronger base for
+    future L4/other-protocol growth than a minimal DSL. The JS-like feel is built in
+    the layer above it (§2a). *(Engine-comparison history is recorded in research
+    note 07; it does not affect the design.)*
+13. **Protocol-extensible capability seam (§6a)** — M3's host functions are
+    registered as `ScriptCapability` providers so future protocols/L4 add verbs in
+    their own crates, deny-by-default and guarded, versioned against `const API`.
+14. **Scope model grows for L4 (§7a)** — host:port + SSRF today; the `ScopeRateGuard`
+    seam is the extension point for packet/address-level scope when L4 lands. L4
+    verbs and extended scope are **out of M3** (OQ11), not precluded.
