@@ -1,0 +1,25 @@
+[package]
+name = "aitm-plugin-rhai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Rhai scripting tier: a .rhai file becomes an ordered-chain Plugin; PoC script-step executor."
+
+[dependencies]
+aitm-core.workspace = true
+aitm-poc.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+# `sync` only. Never `unchecked` (it disables the operation/size limits the
+# sandbox relies on) and never `internals` (M3 spec §7, plan Global Constraints).
+rhai = { version = "1.27", features = ["sync"] }
+arc-swap = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+serde_yaml = "0.9"
+
+[lints]
+workspace = true
