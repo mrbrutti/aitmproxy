@@ -85,10 +85,31 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The absolute path a trust-store tool is spawned by. The stores name
+/// tools by their short names, so rendered lines stay readable and the
+/// spec's command tables hold; [`RealExecutor`] resolves them here rather
+/// than on the caller's `PATH`, where a planted `security` or `sudo` would
+/// win. Anything unlisted (the Linux refresh tools, which are reported as
+/// missing packages when absent) and anything already absolute pass through.
+pub fn absolute_program(program: &str) -> &str {
+    if !cfg!(unix) {
+        return program;
+    }
+    match program {
+        "sudo" => "/usr/bin/sudo",
+        "security" => "/usr/bin/security",
+        "tee" => "/usr/bin/tee",
+        "rm" => "/bin/rm",
+        "id" => "/usr/bin/id",
+        _ => program,
+    }
+}
+
 /// The host itself: `std::process::Command` under a wall-clock timeout,
 /// 15 s for queries and 180 s for mutations (long enough to type a password
 /// or answer an OS dialog). On expiry the child is killed and `run` fails
-/// with an error naming the command and `timed out`.
+/// with an error naming the command and `timed out`. Programs are spawned
+/// by [`absolute_program`].
 #[derive(Debug)]
 pub struct RealExecutor {
     query_timeout: Duration,
@@ -147,7 +168,7 @@ impl Executor for RealExecutor {
         };
         let rendered = cmd.render();
 
-        let mut child = Command::new(&cmd.program)
+        let mut child = Command::new(absolute_program(&cmd.program))
             .args(&cmd.args)
             .stdin(if cmd.stdin.is_some() {
                 Stdio::piped()
