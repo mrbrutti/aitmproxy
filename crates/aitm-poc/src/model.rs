@@ -70,12 +70,13 @@ pub struct Variable {
 }
 
 /// One ordered step. A single-key map names the step type (`http:`/`browser:`/
-/// `extract:`), the nuclei shape — not serde's `!Tag` external tagging.
+/// `extract:`/`script:`), the nuclei shape — not serde's `!Tag` external tagging.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Step {
     Http(HttpStep),
     Browser(BrowserStep),
     Extract(ExtractStep),
+    Script(ScriptStep),
 }
 
 impl Serialize for Step {
@@ -84,6 +85,7 @@ impl Serialize for Step {
             Step::Http(h) => ("http", serde_yaml::to_value(h)),
             Step::Browser(b) => ("browser", serde_yaml::to_value(b)),
             Step::Extract(e) => ("extract", serde_yaml::to_value(e)),
+            Step::Script(s) => ("script", serde_yaml::to_value(s)),
         };
         let inner = inner.map_err(serde::ser::Error::custom)?;
         let mut m = serde_yaml::Mapping::new();
@@ -114,6 +116,9 @@ impl<'de> Deserialize<'de> for Step {
                 serde_yaml::from_value(inner).map_err(serde::de::Error::custom)?,
             )),
             "extract" => Ok(Step::Extract(
+                serde_yaml::from_value(inner).map_err(serde::de::Error::custom)?,
+            )),
+            "script" => Ok(Step::Script(
                 serde_yaml::from_value(inner).map_err(serde::de::Error::custom)?,
             )),
             other => Err(serde::de::Error::custom(format!(
@@ -176,6 +181,16 @@ pub enum ExtractSource {
     JsonPath(String),
     Header(String),
     BrowserEval(String),
+}
+
+/// The reserved Rhai escape hatch: a top-level script body (not a function),
+/// optionally named so `success` can reference its verdict via `step("name")`.
+/// Execution is the scripting tier's job (M3 spec §10); this crate only models it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScriptStep {
+    pub script: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Which part of a response a `word`/`regex` matcher is tested against

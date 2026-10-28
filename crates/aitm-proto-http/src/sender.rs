@@ -24,6 +24,11 @@ use crate::sansio::{Http1Machine, HttpSansIoEvent, HttpStateMachine, Side};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// The whole exchange after connecting — TLS handshake, write, and the full
+/// response — must finish within this. The per-read timeout alone resets on
+/// every byte, so an upstream trickling a header forever would otherwise hold
+/// the caller (and, through a script's `http.send`, a hook) open indefinitely.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const READ_CHUNK: usize = 16 * 1024;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -31,6 +36,7 @@ const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub struct Http1Sender {
     provider: Arc<CryptoProvider>,
     insecure: bool,
+    response_timeout: Duration,
 }
 
 impl Default for Http1Sender {
@@ -45,6 +51,7 @@ impl Http1Sender {
         Self {
             provider: Arc::new(rustls::crypto::ring::default_provider()),
             insecure: false,
+            response_timeout: RESPONSE_TIMEOUT,
         }
     }
 
@@ -52,6 +59,13 @@ impl Http1Sender {
     /// `Config.ssl_insecure`).
     pub fn with_insecure(mut self, insecure: bool) -> Self {
         self.insecure = insecure;
+        self
+    }
+
+    /// The overall deadline for one exchange after the TCP connect (default
+    /// 60s).
+    pub fn with_response_timeout(mut self, timeout: Duration) -> Self {
+        self.response_timeout = timeout;
         self
     }
 
@@ -91,17 +105,27 @@ impl RequestSender for Http1Sender {
                 .await
                 .map_err(|_| anyhow!("connect to {addr} timed out"))??;
 
-            if scheme == "https" {
-                let name = ServerName::try_from(host.clone())
-                    .map_err(|e| anyhow!("invalid server name {host:?}: {e}"))?;
-                let tls = TlsConnector::from(self.client_config()?)
-                    .connect(name, tcp)
-                    .await
-                    .with_context(|| format!("TLS to {host}"))?;
-                drive(tls, &req).await
-            } else {
-                drive(tcp, &req).await
-            }
+            let exchange = async {
+                if scheme == "https" {
+                    let name = ServerName::try_from(host.clone())
+                        .map_err(|e| anyhow!("invalid server name {host:?}: {e}"))?;
+                    let tls = TlsConnector::from(self.client_config()?)
+                        .connect(name, tcp)
+                        .await
+                        .with_context(|| format!("TLS to {host}"))?;
+                    drive(tls, &req).await
+                } else {
+                    drive(tcp, &req).await
+                }
+            };
+            tokio::time::timeout(self.response_timeout, exchange)
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "upstream response from {addr} timed out after {:?}",
+                        self.response_timeout
+                    )
+                })?
         })
     }
 }
