@@ -1,0 +1,428 @@
+//! The one-line bars: toolbar (listening pill, agent toggle), content-type
+//! chips, the intercept bar ("one line above the status bar in yellow reverse
+//! video", §2.7), the status bar and the `:`/`/` prompt that replaces it.
+
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+
+use crate::action::Level;
+use crate::app::{App, BusStatus, Chip, Mode, PromptKind};
+use crate::model::{human_bytes, AgentPolicy};
+use crate::theme::Theme;
+use crate::tokens::glyph;
+use crate::ui::text::{fit, truncate, width};
+
+/// Write a line, clipped to the area.
+pub fn put(buf: &mut Buffer, area: Rect, line: Line<'_>) {
+    if area.height == 0 {
+        return;
+    }
+    buf.set_line(area.x, area.y, &line, area.width);
+}
+
+/// Write `left` and `right` on one line, the right part right-aligned.
+pub fn put_sides(buf: &mut Buffer, area: Rect, left: Line<'_>, right: Line<'_>) {
+    if area.height == 0 {
+        return;
+    }
+    let rw = right.width() as u16;
+    buf.set_line(area.x, area.y, &left, area.width.saturating_sub(rw + 1));
+    if rw < area.width {
+        buf.set_line(area.x + area.width - rw, area.y, &right, rw);
+    }
+}
+
+pub fn toolbar(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    buf.set_style(area, theme.raised());
+    let bold = theme.text_primary().add_modifier(Modifier::BOLD);
+    let mut left = vec![
+        Span::styled(" ›•‹ ", theme.accent().add_modifier(Modifier::BOLD)),
+        Span::styled("aitmproxy", bold),
+        Span::styled("  ", theme.text_secondary()),
+    ];
+    let rec = if app.capture_paused {
+        Span::styled(format!("{} paused ", glyph::PAUSE), theme.text_secondary())
+    } else {
+        Span::styled(
+            format!("{} rec ", glyph::RECORD),
+            theme.fg(&crate::tokens::color::status::SUCCESS),
+        )
+    };
+    left.push(rec);
+    left.push(Span::styled(
+        format!(" {} compose  {} clear", glyph::COMPOSE, glyph::CLEAR),
+        theme.text_tertiary(),
+    ));
+
+    // The listening pill, centred.
+    let (dot_style, state) = if app.intercept_armed {
+        (
+            theme.fg(&crate::tokens::color::intercept::BASE),
+            " · intercept armed",
+        )
+    } else if app.capture_paused {
+        (theme.text_tertiary(), " · capture paused")
+    } else {
+        (theme.fg(&crate::tokens::color::status::SUCCESS), "")
+    };
+    let listen = match &app.listening {
+        Some(l) => format!("listening {l}"),
+        None => match &app.bus {
+            BusStatus::Connected { .. } => "listen address unknown (core follow-up F7)".to_string(),
+            BusStatus::Connecting => "connecting to the bus…".to_string(),
+            BusStatus::Disconnected(_) => "bus disconnected".to_string(),
+        },
+    };
+    let pill = Line::from(vec![
+        Span::styled("● ", dot_style),
+        Span::styled("aitmproxy", bold),
+        Span::styled(format!(" · {listen}{state}"), theme.text_secondary()),
+    ]);
+
+    let agent_style = match app.agent.policy {
+        Some(AgentPolicy::All) | Some(AgentPolicy::ReadOnly) => {
+            theme.agent().add_modifier(Modifier::BOLD)
+        }
+        Some(AgentPolicy::Paused) | None => theme.text_tertiary().add_modifier(Modifier::BOLD),
+    };
+    let agent_label = match app.agent.policy {
+        Some(p) => format!(
+            "{} Agent ● {} · {}/min",
+            glyph::AGENT,
+            p.label(),
+            app.agent.actions_last_minute
+        ),
+        None => format!("{} Agent · n/a (F1)", glyph::AGENT),
+    };
+    let layout = match app.layout {
+        crate::app::Layout::Horizontal => "▄▄ below",
+        crate::app::Layout::Vertical => "▌▐ right",
+    };
+    let right = Line::from(vec![
+        Span::styled(format!("[{agent_label}]"), agent_style),
+        Span::styled(
+            format!("  {} palette  {}  b sidebar ", glyph::PALETTE, layout),
+            theme.text_tertiary(),
+        ),
+    ]);
+
+    let lw = Line::from(left.clone()).width() as u16;
+    let rw = right.width() as u16;
+    buf.set_line(area.x, area.y, &Line::from(left), area.width);
+    if lw + rw + 2 < area.width {
+        let pw = pill.width() as u16;
+        let free_start = lw;
+        let free_end = area.width.saturating_sub(rw);
+        let x = if pw + 2 <= free_end.saturating_sub(free_start) {
+            area.x + free_start + (free_end - free_start - pw) / 2
+        } else {
+            area.x + free_start + 1
+        };
+        buf.set_line(x, area.y, &pill, free_end.saturating_sub(x - area.x));
+        buf.set_line(area.x + area.width - rw, area.y, &right, rw);
+    }
+}
+
+pub fn chips(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    buf.set_style(area, theme.surface());
+    let mut spans = vec![Span::raw(" ")];
+    for (i, c) in Chip::ALL.iter().enumerate() {
+        if matches!(c, Chip::Http | Chip::H1 | Chip::Json) {
+            spans.push(Span::styled("│ ", theme.rule()));
+        }
+        let label = c.label();
+        let style = if *c == app.chip {
+            theme
+                .raised()
+                .add_modifier(Modifier::BOLD)
+                .patch(theme.text_primary())
+        } else {
+            theme.text_secondary()
+        };
+        let key = if i < 9 {
+            format!("{}", i + 1)
+        } else if i == 9 {
+            "0".into()
+        } else {
+            String::new()
+        };
+        if *c == app.chip {
+            spans.push(Span::styled(format!(" {label} "), style));
+        } else {
+            spans.push(Span::styled(label, style));
+        }
+        if !key.is_empty() {
+            spans.push(Span::styled(
+                key,
+                theme.text_tertiary().add_modifier(Modifier::DIM),
+            ));
+        }
+        spans.push(Span::raw(" "));
+    }
+    let left = Line::from(spans);
+    let right = match (&app.filter, app.mode) {
+        (_, Mode::Prompt(PromptKind::Filter)) => Line::styled("filter: editing… ", theme.accent()),
+        (Some(_), _) => Line::from(vec![
+            Span::styled(format!("{} ", glyph::FILTER), theme.accent()),
+            Span::styled(
+                truncate(&app.filter_text, 40),
+                theme.accent().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  Esc clears ", theme.text_tertiary()),
+        ]),
+        (None, _) => Line::styled(
+            format!("{} / filter ", glyph::FILTER),
+            theme.text_tertiary(),
+        ),
+    };
+    put_sides(buf, area, left, right);
+}
+
+pub fn intercept(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    let paused = app.paused();
+    if paused.is_empty() {
+        if !app.intercept_armed {
+            return;
+        }
+        buf.set_style(area, theme.intercept_armed_quiet());
+        put(
+            buf,
+            area,
+            Line::from(vec![
+                Span::styled(
+                    format!(
+                        " {} Intercept armed — every request pauses here",
+                        glyph::INTERCEPT
+                    ),
+                    theme.intercept_armed_quiet().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "   [i] Disarm   Rules… needs core follow-up F3",
+                    theme.intercept_armed_quiet(),
+                ),
+            ]),
+        );
+        return;
+    }
+    buf.set_style(area, theme.intercept_bar());
+    let target = app.intercept_target();
+    let (desc, edited) = match target {
+        Some(r) => {
+            let d = format!("{} {}", r.method, r.url());
+            (
+                d,
+                r.edited || app.edit.as_ref().is_some_and(|e| e.id == r.id && e.dirty()),
+            )
+        }
+        None => (String::new(), false),
+    };
+    let edited_note = if edited { " · edited" } else { "" };
+    let actions = if app.mode == Mode::Edit {
+        "[^S Apply & Resume] [^R Revert] [Esc Cancel]"
+    } else {
+        "[a Resume] [A Resume all] [d Kill] [e Edit] [i Disarm]"
+    };
+    let count = format!(" {} {} paused", glyph::INTERCEPT, paused.len());
+    let left = Line::from(vec![
+        Span::styled(count, theme.intercept_bar()),
+        Span::styled(
+            format!("  {desc}{edited_note}"),
+            theme.intercept_bar().remove_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let right = Line::styled(format!("{actions} "), theme.intercept_bar());
+    let total = left.width() + right.width() + 1;
+    if total > usize::from(area.width) {
+        let avail = usize::from(area.width).saturating_sub(right.width() + 2);
+        let left = Line::styled(
+            truncate(
+                &format!(" {} {} paused  {desc}", glyph::INTERCEPT, paused.len()),
+                avail,
+            ),
+            theme.intercept_bar(),
+        );
+        put_sides(buf, area, left, right);
+    } else {
+        put_sides(buf, area, left, right);
+    }
+}
+
+pub fn status(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    buf.set_style(area, theme.raised());
+    let key = |k: &str, label: &str| -> Vec<Span<'static>> {
+        vec![
+            Span::styled(
+                format!(" {k}"),
+                theme.text_primary().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {label} "), theme.text_secondary()),
+        ]
+    };
+    let mut left: Vec<Span<'static>> = Vec::new();
+    match app.mode {
+        Mode::Flows => {
+            left.extend(key("?", "help"));
+            left.extend(key("i", "intercept"));
+            left.extend(key("e", "edit"));
+            left.extend(key("r", "replay"));
+            left.extend(key("n", "compose"));
+            left.extend(key("P", "poc"));
+            left.extend(key(":", "palette"));
+            let auto = if app.auto_select {
+                "Auto-select ●"
+            } else {
+                "Auto-select ○"
+            };
+            left.extend(key("t", auto));
+        }
+        Mode::Inspector => {
+            left.extend(key("Esc", "back"));
+            left.extend(key("Tab", "pane"));
+            left.extend(key("←→", "tabs"));
+            left.extend(key("↑↓", "scroll"));
+            left.extend(key("e", "edit"));
+            left.extend(key("y", "copy url"));
+        }
+        Mode::Edit => {
+            left.extend(key("^S", "Apply & Resume"));
+            left.extend(key("^R", "revert"));
+            left.extend(key("Esc", "cancel"));
+        }
+        Mode::Findings => {
+            left.extend(key("↑↓", "select"));
+            left.extend(key("⏎", "open capture"));
+            left.extend(key("r", "run again"));
+            left.extend(key("o", "open screenshot"));
+            left.extend(key("Esc", "back"));
+        }
+        Mode::Scope => {
+            left.extend(key("a", "add"));
+            left.extend(key("d", "remove"));
+            left.extend(key("Esc", "back"));
+        }
+        Mode::Agent => {
+            left.extend(key("1", "all"));
+            left.extend(key("2", "read-only"));
+            left.extend(key("3", "paused"));
+            left.extend(key("Esc", "back"));
+        }
+        Mode::Compose => {
+            left.extend(key("Tab", "next field"));
+            left.extend(key("^S", "send"));
+            left.extend(key("Esc", "cancel"));
+        }
+        _ => left.extend(key("Esc", "back")),
+    }
+
+    let center: Line<'static> = if let Some(t) = app.current_toast() {
+        let style = match t.level {
+            Level::Info => theme.text_primary(),
+            Level::Warn => theme.intercept_armed_quiet(),
+            Level::Error => theme.fg(&crate::tokens::color::status::SERVER_ERROR),
+        };
+        Line::styled(t.text.clone(), style.add_modifier(Modifier::BOLD))
+    } else {
+        let vis = app.visible().len();
+        let pos = app
+            .selected
+            .as_deref()
+            .and_then(|id| app.visible().iter().position(|&i| app.flows[i].id == id))
+            .map_or("–".to_string(), |p| (p + 1).to_string());
+        let mut spans = vec![Span::styled(
+            format!("{pos} / {vis} rows"),
+            theme.text_secondary(),
+        )];
+        let paused = app.paused().len();
+        if paused > 0 {
+            spans.push(Span::styled(
+                format!(" · {paused} paused"),
+                theme
+                    .fg(&crate::tokens::color::intercept::BASE)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.push(Span::styled(
+            format!(" · {} in scope", app.in_scope_count()),
+            theme.text_secondary(),
+        ));
+        if !app.findings.is_empty() {
+            spans.push(Span::styled(
+                format!(" · {} findings", app.findings.len()),
+                theme.text_secondary(),
+            ));
+        }
+        Line::from(spans)
+    };
+
+    let (bus_dot, bus_text) = match &app.bus {
+        BusStatus::Connected { address, .. } => (
+            theme.fg(&crate::tokens::color::status::SUCCESS),
+            format!("bus {address}"),
+        ),
+        BusStatus::Connecting => (theme.text_tertiary(), "bus connecting…".to_string()),
+        BusStatus::Disconnected(_) => (
+            theme.fg(&crate::tokens::color::status::SERVER_ERROR),
+            "bus down · retrying".to_string(),
+        ),
+    };
+    let right = Line::from(vec![
+        Span::styled(human_bytes(app.total_bytes()), theme.text_secondary()),
+        Span::styled("  ● ", bus_dot),
+        Span::styled(format!("{bus_text} "), theme.text_secondary()),
+    ]);
+
+    let left_line = Line::from(left);
+    let lw = left_line.width() as u16;
+    let rw = right.width() as u16;
+    buf.set_line(area.x, area.y, &left_line, area.width.saturating_sub(rw));
+    if lw + rw < area.width {
+        buf.set_line(area.x + area.width - rw, area.y, &right, rw);
+        let cw = center.width() as u16;
+        let free = area.width - lw - rw;
+        if cw + 2 <= free {
+            let x = area.x + lw + (free - cw) / 2;
+            buf.set_line(x, area.y, &center, cw);
+        } else if free > 4 {
+            let x = area.x + lw + 1;
+            buf.set_line(x, area.y, &center, free - 2);
+        }
+    }
+}
+
+pub fn prompt(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    buf.set_style(area, theme.raised());
+    let Mode::Prompt(kind) = app.mode else {
+        return;
+    };
+    let (sigil, hint) = match kind {
+        PromptKind::Palette => (":", "command or tool · ↑↓ choose · ⏎ run · Esc"),
+        PromptKind::Filter => (
+            "/",
+            "~u url ~d host ~m method ~s status ~a agent ~paused · & | ! ( )",
+        ),
+        PromptKind::Comment => ("comment:", "⏎ save · Esc"),
+        PromptKind::Mark => ("mark:", "colours separated by spaces · ⏎ save"),
+        PromptKind::Pin => ("pin host:", "⏎ pin"),
+        PromptKind::ScopeAdd => (
+            "scope add:",
+            "host · host:port · *.wildcard — a human action",
+        ),
+        PromptKind::PocName => ("poc name:", "⏎ build from the selected flow (poc.build)"),
+        PromptKind::PocTarget => ("target:", "base URL for `target` · ⏎ run (poc.run)"),
+    };
+    let text = format!(" {sigil} {}", app.prompt);
+    let cursor = Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED));
+    let left = Line::from(vec![
+        Span::styled(text, theme.text_primary().add_modifier(Modifier::BOLD)),
+        cursor,
+    ]);
+    let right = Line::styled(format!("{hint} "), theme.text_tertiary());
+    if width(hint) + left.width() + 2 > usize::from(area.width) {
+        put(buf, area, left);
+    } else {
+        put_sides(buf, area, left, right);
+    }
+    let _ = fit;
+}
