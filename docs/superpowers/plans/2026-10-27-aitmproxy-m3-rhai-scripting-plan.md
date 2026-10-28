@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** draft
+**Status:** approved (2026-10-28 by Matt)
 **Spec:** `docs/superpowers/specs/2026-10-27-aitmproxy-m3-rhai-scripting-design.md` (approved 2026-10-27; AC-M3-1…AC-M3-12, inheriting plugin-system AC-P6–AC-P11 and PoC-language AC-L8)
 **Branch / worktree:** `feat/aitmproxy-m3`, cut from `main` (M1) at stage 4; the spec, research note, and this plan are committed on `claude/m3-rhai-spec-2197df`.
 
