@@ -305,10 +305,42 @@ async fn frame_drop_not_delivered() {
         );
     }
 
-    // The store holds only the single dropped frame — no echoed second frame.
+    // Single-frame drop (Task 7): the frame was not forwarded (no echo) and the
+    // conversation was NOT torn down — the flow is not left `Killed`.
     let flow = ws_flow(h.store.as_ref()).expect("ws flow");
-    assert_eq!(flow.messages.len(), 1, "no frame was forwarded/echoed");
-    assert!(matches!(flow.intercept, InterceptState::Killed));
+    assert_eq!(
+        flow.messages.len(),
+        1,
+        "the dropped frame was not forwarded/echoed"
+    );
+    assert!(
+        !matches!(flow.intercept, InterceptState::Killed),
+        "a single-frame drop must keep the conversation open, not kill it"
+    );
+
+    // Prove the socket is still live: a second frame still parks, forwards, echoes.
+    ws.send(Message::text("after")).await.expect("send second");
+    let (id2, index2) = wait_for_parked_frame(h.store.as_ref()).await;
+    invoke(
+        &h.reg,
+        h.store.as_ref(),
+        h.guard.as_ref(),
+        "ws.frame",
+        params(vec![
+            ("id", Value::Str(id2.to_string())),
+            ("index", Value::Int(index2 as i64)),
+            ("action", Value::Str("forward".into())),
+        ]),
+    )
+    .expect("ws.frame forward succeeds after a drop");
+    let echoed = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("echo arrives after a single-frame drop")
+        .expect("a frame")
+        .expect("frame ok");
+    assert_eq!(echoed.to_text().expect("text frame"), "after");
+
+    ws.close(None).await.ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
