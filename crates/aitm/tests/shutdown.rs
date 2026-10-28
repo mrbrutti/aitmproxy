@@ -181,13 +181,10 @@ fn write_config(dir: &Path) -> (PathBuf, [SocketAddr; 3]) {
     let listen = free_addr();
     let browser = free_addr();
     let mcp = free_addr();
-    // `transport` is an externally tagged enum: serde_yaml 0.9 reads the
-    // `!loopback_tcp` tag form (the `{loopback_tcp: {...}}` map form is
-    // rejected with "expected a YAML tag starting with '!'").
     let mut yaml = format!(
         "listen: {listen}\n\
          ca:\n  dir: \"{ca}\"\n  audit_log: \"{audit}\"\n\
-         mcp:\n  transport: !loopback_tcp\n    port: {mcp_port}\n    token: shutdown-test\n\
+         mcp:\n  transport:\n    loopback_tcp:\n      port: {mcp_port}\n      token: shutdown-test\n\
          browser:\n  proxy_addr: {browser}\n",
         ca = dir.join("ca").display(),
         audit = dir.join("ca-audit.jsonl").display(),
