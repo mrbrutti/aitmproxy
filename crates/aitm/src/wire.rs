@@ -20,7 +20,7 @@ use aitm_ca::CaPlugin;
 use aitm_core::{AgentState, Config, Plugin, Proxy, Registry};
 use aitm_plugins::{
     AgentPlugin, CapturePlugin, ControlPlugin, DetailPlugin, InterceptPlugin, MetaPlugin,
-    MutatePlugin, RateLimitPlugin, ReplayPlugin, ScopePlugin,
+    MutatePlugin, RateLimitPlugin, ReplayPlugin, ScopePlugin, SubscriptionPlugin,
 };
 use aitm_proto_http::{CertAuthority, HttpModule};
 use aitm_proto_ws::WsModule;
@@ -57,6 +57,10 @@ pub struct Assembled {
     /// `AgentPlugin` already registered; hand it to `McpServer::with_agent_state`
     /// so the server's policy gate reads the same policy `agent.set` writes.
     pub agent_state: Arc<AgentState>,
+    /// The F4 push broadcast: the `SubscriptionPlugin` registered in the chain
+    /// forwards lifecycle events to it; hand it to `McpServer::with_push` so the
+    /// server's dispatcher fans `notifications/aitm/flow` to subscribers.
+    pub push_tx: tokio::sync::broadcast::Sender<aitm_core::Event>,
 }
 
 /// The scripting tier, ready to take its place in the chain (M3 spec §8).
@@ -118,6 +122,10 @@ pub fn assemble_with_scripts(
     let armed = intercept.armed_flag();
     let listening = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // The F4 push tap: a chain plugin forwards lifecycle events to this broadcast,
+    // which the MCP server's dispatcher drains into per-connection push sinks.
+    let (push_tx, _push_rx) = tokio::sync::broadcast::channel(aitm_mcp::DEFAULT_BROADCAST_CAPACITY);
+
     let mut builder = Proxy::builder()
         .with_config(cfg.clone())
         // Protocol modules: HTTP first; WsModule only claims post-upgrade connections.
@@ -126,6 +134,9 @@ pub fn assemble_with_scripts(
         // First-party plugins, in chain order. Intercept precedes mutate so a
         // request is parked before mutate would act (data-flow 2).
         .register_plugin(Box::new(CapturePlugin::new()))
+        // The subscription tap sits right after capture so it sees every captured
+        // flow (the summary is rendered from the store at dispatch time).
+        .register_plugin(Box::new(SubscriptionPlugin::new(push_tx.clone())))
         .register_plugin(Box::new(DetailPlugin::new()))
         .register_plugin(Box::new(MetaPlugin::new()))
         .register_plugin(Box::new(ReplayPlugin::new()))
@@ -166,6 +177,7 @@ pub fn assemble_with_scripts(
         ca,
         listening,
         agent_state,
+        push_tx,
     })
 }
 

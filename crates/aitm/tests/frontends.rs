@@ -19,9 +19,11 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 36] = [
+const EXPECTED_TOOLS: [&str; 38] = [
     "agent.status",
     "agent.set",
+    "flow.subscribe",
+    "flow.unsubscribe",
     "flow.list",
     "flow.get",
     "flow.detail",

@@ -1245,3 +1245,318 @@ fn auto_defers_config_gated_sensitive_to_the_command() {
         "a Sensitive command with no config gate is refused outright under Auto"
     );
 }
+
+// ------------------------------------------------ M4 Task 7: F4 server push
+
+use aitm_core::Event;
+use aitm_mcp::NotificationSink;
+use aitm_plugins::SubscriptionPlugin;
+use std::time::Duration;
+use tokio::io::{duplex, split, DuplexStream, Lines, ReadHalf, WriteHalf};
+use tokio::sync::broadcast;
+
+/// A registry carrying the subscription commands (so `tools/list` shows them).
+fn push_registry() -> Arc<Registry> {
+    let (tx, _rx) = broadcast::channel::<Event>(64);
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(SubscriptionPlugin::new(tx)));
+    reg.add_command(Arc::new(CaptureCmd));
+    Arc::new(reg)
+}
+
+/// A server with the subscription commands registered, services over `store`, an
+/// ungated policy, and a small per-connection push `capacity` so overflow is
+/// cheap to force.
+fn push_server(store: Arc<MemFlowStore>, capacity: usize) -> Arc<McpServer> {
+    Arc::new(
+        McpServer::new(push_registry(), McpTransport::Stdio)
+            .with_agent_state(ungated())
+            .with_push_capacity(capacity)
+            .with_services(
+                store,
+                Arc::new(StubClient),
+                Arc::new(StdGuard::default()),
+                None,
+            ),
+    )
+}
+
+type ClientReader = Lines<BufReader<ReadHalf<DuplexStream>>>;
+
+/// Open a streaming connection to `srv` over an in-memory duplex of `buf` bytes.
+/// The connection's push sink is injected (so the test can observe its bound
+/// state) with `capacity`. Returns the client write half, a line reader over the
+/// client read half, the injected sink, and the server task.
+fn open_push_conn(
+    srv: Arc<McpServer>,
+    role: Frontend,
+    buf: usize,
+    capacity: usize,
+) -> (
+    WriteHalf<DuplexStream>,
+    ClientReader,
+    NotificationSink,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let (client, server_side) = duplex(buf);
+    let (s_r, s_w) = split(server_side);
+    let sink = NotificationSink::new(capacity);
+    let mut conn = ConnCtx::new(role);
+    conn.out = Some(sink.clone());
+    let task = tokio::spawn(aitm_mcp::transport::serve_lines(
+        srv,
+        BufReader::new(s_r),
+        s_w,
+        conn,
+    ));
+    let (c_r, c_w) = split(client);
+    (c_w, BufReader::new(c_r).lines(), sink, task)
+}
+
+async fn write_req(w: &mut WriteHalf<DuplexStream>, req: &JsonValue) {
+    let mut line = req.to_string();
+    line.push('\n');
+    w.write_all(line.as_bytes()).await.expect("write");
+    w.flush().await.expect("flush");
+}
+
+async fn next_json(lines: &mut ClientReader) -> JsonValue {
+    let line = lines
+        .next_line()
+        .await
+        .expect("io")
+        .expect("a line was expected");
+    serde_json::from_str(&line).expect("json line")
+}
+
+/// The bounded sink drops the oldest notification on overflow and flags the lag;
+/// a drain surfaces the lag marker and clears it (RF#1, unit level).
+#[test]
+fn notification_sink_drops_oldest_and_flags_lag() {
+    let sink = NotificationSink::new(2);
+    sink.push("a".into());
+    sink.push("b".into());
+    assert_eq!(sink.queued_len(), 2);
+    assert!(!sink.lagged());
+
+    sink.push("c".into()); // over capacity: oldest ("a") is dropped, lag set
+    assert_eq!(
+        sink.queued_len(),
+        2,
+        "the sink never grows past its capacity"
+    );
+    assert!(sink.lagged());
+
+    let drained = sink.drain();
+    assert!(
+        drained
+            .iter()
+            .any(|l| l.contains("notifications/aitm/state") && l.contains("\"lagged\":true")),
+        "the drain carries a lagged state marker: {drained:?}"
+    );
+    assert!(drained.iter().any(|l| l == "b"));
+    assert!(drained.iter().any(|l| l == "c"));
+    assert!(!drained.iter().any(|l| l == "a"), "oldest was dropped");
+    assert!(!sink.lagged(), "lag flag cleared after it is surfaced");
+    assert_eq!(sink.queued_len(), 0);
+}
+
+/// Replies are never dropped, even when the notification lane has overflowed.
+#[test]
+fn notification_sink_never_drops_replies() {
+    let sink = NotificationSink::new(1);
+    sink.push_reply("r1".into());
+    sink.push("n1".into());
+    sink.push("n2".into()); // drops n1
+    sink.push_reply("r2".into());
+    let drained = sink.drain();
+    assert!(drained.iter().any(|l| l == "r1"));
+    assert!(drained.iter().any(|l| l == "r2"));
+    assert!(drained.iter().any(|l| l == "n2"));
+    assert!(!drained.iter().any(|l| l == "n1"));
+}
+
+/// After `flow.subscribe`, a new flow through the proxy produces a
+/// `notifications/aitm/flow {event:"created"}` line on that connection with no
+/// further request (AC-M4-6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscribe_pushes_created_on_new_flow() {
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store.clone(), 1024);
+    let (mut w, mut lines, _sink, task) =
+        open_push_conn(srv.clone(), Frontend::Operator, 64 * 1024, 1024);
+
+    write_req(
+        &mut w,
+        &json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"flow.subscribe","arguments":{}}}),
+    )
+    .await;
+    let reply = next_json(&mut lines).await;
+    assert_eq!(reply["id"], 1);
+    assert!(
+        reply["result"]["structuredContent"]["sub_id"]
+            .as_u64()
+            .is_some(),
+        "subscribe returns a sub_id: {reply}"
+    );
+
+    // A new flow arrives through the proxy (the chain dispatches RequestHeaders).
+    let id = store.insert(http_flow("example.com:443", "/a"));
+    srv.push_flow_event(&Event::RequestHeaders(id));
+
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["method"], "notifications/aitm/flow");
+    assert_eq!(note["params"]["event"], "created");
+    assert_eq!(note["params"]["id"], id.to_string());
+    assert_eq!(note["params"]["summary"]["authority"], "example.com:443");
+
+    // Shutting down the client's write side is EOF for the server's reader, so
+    // the read loop ends and the writer task drains and exits.
+    let _ = w.shutdown().await;
+    let _ = task.await;
+}
+
+/// `flow.unsubscribe` stops the push (AC-M4-6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsubscribe_stops_push() {
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store.clone(), 1024);
+    let (mut w, mut lines, _sink, task) =
+        open_push_conn(srv.clone(), Frontend::Operator, 64 * 1024, 1024);
+
+    write_req(
+        &mut w,
+        &json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"flow.subscribe","arguments":{}}}),
+    )
+    .await;
+    let reply = next_json(&mut lines).await;
+    let sub_id = reply["result"]["structuredContent"]["sub_id"]
+        .as_u64()
+        .expect("sub_id");
+
+    write_req(
+        &mut w,
+        &json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":"flow.unsubscribe","arguments":{"sub_id":sub_id}}}),
+    )
+    .await;
+    let reply = next_json(&mut lines).await;
+    assert_eq!(reply["id"], 2);
+    assert_eq!(reply["result"]["isError"], false);
+
+    // A flow after unsubscribe produces no push.
+    let id = store.insert(http_flow("example.com:443", "/b"));
+    srv.push_flow_event(&Event::RequestHeaders(id));
+    let quiet = tokio::time::timeout(Duration::from_millis(250), lines.next_line()).await;
+    assert!(
+        quiet.is_err(),
+        "no notification should arrive after unsubscribe"
+    );
+
+    // Shutting down the client's write side is EOF for the server's reader, so
+    // the read loop ends and the writer task drains and exits.
+    let _ = w.shutdown().await;
+    let _ = task.await;
+}
+
+/// The `state` stream emits on change (AC-M4-6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn state_pushed_on_change() {
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store.clone(), 1024);
+    let (mut w, mut lines, _sink, task) =
+        open_push_conn(srv.clone(), Frontend::Operator, 64 * 1024, 1024);
+
+    write_req(
+        &mut w,
+        &json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"flow.subscribe","arguments":{}}}),
+    )
+    .await;
+    let _ = next_json(&mut lines).await;
+
+    srv.push_state(json!({"intercept_armed": true, "agent": "auto"}));
+
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["method"], "notifications/aitm/state");
+    assert_eq!(note["params"]["intercept_armed"], true);
+    assert_eq!(note["params"]["agent"], "auto");
+
+    // Shutting down the client's write side is EOF for the server's reader, so
+    // the read loop ends and the writer task drains and exits.
+    let _ = w.shutdown().await;
+    let _ = task.await;
+}
+
+/// RF#1 (pinned): a subscriber that stops reading has its sink bounded (drop
+/// oldest + a `lagged` marker) and never blocks the proxy or a second
+/// subscriber's flows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_subscriber_lags_not_blocks() {
+    const CAP: usize = 4;
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store.clone(), CAP);
+
+    // A: a slow subscriber over a tiny duplex that it stops reading.
+    let (mut a_w, mut a_lines, a_sink, a_task) =
+        open_push_conn(srv.clone(), Frontend::Operator, 256, CAP);
+    write_req(
+        &mut a_w,
+        &json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"flow.subscribe","arguments":{}}}),
+    )
+    .await;
+    let _ = next_json(&mut a_lines).await; // A reads its subscribe reply, then stops.
+
+    // B: a healthy subscriber that keeps reading.
+    let (mut b_w, mut b_lines, _b_sink, b_task) =
+        open_push_conn(srv.clone(), Frontend::Operator, 64 * 1024, 1024);
+    write_req(
+        &mut b_w,
+        &json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"flow.subscribe","arguments":{}}}),
+    )
+    .await;
+    let _ = next_json(&mut b_lines).await;
+
+    // Drive many flows. `push_flow_event` must never block on A's stalled socket.
+    for i in 0..(CAP * 50) {
+        let id = store.insert(http_flow("example.com:443", &format!("/{i}")));
+        srv.push_flow_event(&Event::RequestHeaders(id));
+    }
+
+    // A's sink is bounded and flagged lagged (give the blocked writer a moment).
+    assert!(
+        a_sink.queued_len() <= CAP,
+        "a stalled subscriber's sink never grows past its capacity: {}",
+        a_sink.queued_len()
+    );
+    let mut lagged = false;
+    for _ in 0..50 {
+        if a_sink.lagged() {
+            lagged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(lagged, "the stalled subscriber is flagged lagged");
+
+    // B's flows still flow despite A being stuck.
+    let note = next_json(&mut b_lines).await;
+    assert_eq!(note["method"], "notifications/aitm/flow");
+    assert_eq!(note["params"]["event"], "created");
+
+    // Teardown: drop A fully (both halves) so its blocked writer sees a closed
+    // socket and exits; A's writer is parked on the stalled duplex, so merely
+    // closing the read direction would leave it hanging.
+    drop(a_w);
+    drop(a_lines);
+    drop(b_w);
+    drop(b_lines);
+    a_task.abort();
+    b_task.abort();
+    let _ = a_task.await;
+    let _ = b_task.await;
+}

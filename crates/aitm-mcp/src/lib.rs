@@ -14,4 +14,6 @@ pub mod transport;
 
 pub use aitm_core::McpTransport;
 pub use schema::{McpSchemaDerive, McpTool, StdSchemaDerive};
-pub use server::{ConnCtx, McpServer};
+pub use server::{
+    ConnCtx, McpServer, NotificationSink, DEFAULT_BROADCAST_CAPACITY, DEFAULT_PUSH_CAPACITY,
+};

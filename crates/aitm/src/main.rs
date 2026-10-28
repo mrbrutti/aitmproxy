@@ -106,6 +106,7 @@ async fn run() -> anyhow::Result<()> {
         ca,
         listening,
         agent_state,
+        push_tx,
     } = assemble_with_scripts(
         &cfg,
         &Features::default(),
@@ -183,6 +184,7 @@ async fn run() -> anyhow::Result<()> {
         .with_mcp_roles(cfg.mcp.operator_token.clone(), cfg.mcp.stdio_role)
         .with_config(Arc::new(cfg.clone()))
         .with_agent_state(agent_state)
+        .with_push(push_tx)
         .with_services(store, client, guard, browser);
 
     // The main listener relays client traffic; the browser listener is

@@ -12,6 +12,7 @@ pub mod mutate;
 pub mod ratelimit;
 pub mod replay;
 pub mod scope;
+pub mod subscription;
 
 pub use agent::AgentPlugin;
 pub use capture::CapturePlugin;
@@ -23,6 +24,7 @@ pub use mutate::MutatePlugin;
 pub use ratelimit::RateLimitPlugin;
 pub use replay::ReplayPlugin;
 pub use scope::ScopePlugin;
+pub use subscription::SubscriptionPlugin;
 
 /// Drive a future to completion from a synchronous `Command::invoke`.
 ///

@@ -12,7 +12,7 @@ use tokio::io::{
 };
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::server::{error_response, ConnCtx, McpServer, UNAUTHORIZED};
+use crate::server::{error_response, ConnCtx, McpServer, NotificationSink, UNAUTHORIZED};
 
 /// Longest single message (one line) a transport accepts. Longer lines end the
 /// connection instead of growing a buffer without bound.
@@ -22,41 +22,96 @@ pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 /// message, each reply out is one line. Returns at EOF. Commands run on the
 /// blocking pool so a slow tool cannot stall the runtime.
 ///
+/// The write half is owned by a dedicated writer task draining the connection's
+/// bounded [`NotificationSink`] (F4): both request replies and server-initiated
+/// `notifications/aitm/*` lines go through it, so writes are serialized per
+/// connection and the read loop never blocks on a slow socket. The sink is the
+/// `conn.out` the subscription registry pushes to; when the connection ends its
+/// subscriptions are dropped and the writer drains and exits.
+///
 /// `conn` carries the connection's role (from its auth token, or `stdio_role`)
 /// and, once an `initialize` arrives, its `clientInfo.name` label; every message
 /// is dispatched through [`McpServer::handle_on`] with it.
 pub async fn serve_lines<R, W>(
     server: Arc<McpServer>,
     reader: R,
-    mut writer: W,
+    writer: W,
     mut conn: ConnCtx,
 ) -> anyhow::Result<()>
 where
     R: AsyncBufRead + Unpin + Send,
-    W: AsyncWrite + Unpin + Send,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
+    // The per-connection push sink and the writer task that owns the socket. A
+    // caller may inject the sink (so a test can observe its bounds); otherwise it
+    // is sized from the server's configured capacity.
+    let sink = conn
+        .out
+        .clone()
+        .unwrap_or_else(|| NotificationSink::new(server.push_capacity()));
+    conn.out = Some(sink.clone());
+    if conn.conn_id == 0 {
+        conn.conn_id = server.next_conn_id();
+    }
+    let writer_task = tokio::spawn(write_loop(writer, sink.clone()));
+
     let mut reader = reader.take(MAX_MESSAGE_BYTES as u64);
     let mut line = String::new();
-    while read_message(&mut reader, &mut line).await? {
-        let message = line.trim().to_string();
-        if message.is_empty() {
-            continue;
-        }
-        // The client names itself once, in `initialize`; carry that label onto
-        // the connection for audit (first one wins) without re-parsing later.
-        if conn.client_label.is_none() {
-            if let Some(label) = client_label_from_initialize(&message) {
-                conn.client_label = Some(label);
+    let outcome: anyhow::Result<()> = async {
+        while read_message(&mut reader, &mut line).await? {
+            let message = line.trim().to_string();
+            if message.is_empty() {
+                continue;
+            }
+            // The client names itself once, in `initialize`; carry that label
+            // onto the connection for audit (first one wins) without re-parsing.
+            if conn.client_label.is_none() {
+                if let Some(label) = client_label_from_initialize(&message) {
+                    conn.client_label = Some(label);
+                }
+            }
+            let srv = server.clone();
+            let c = conn.clone();
+            let reply = tokio::task::spawn_blocking(move || srv.handle_on(&c, &message)).await?;
+            if let Some(reply) = reply {
+                // Replies ride the sink too (never dropped); the writer task
+                // serializes them with any interleaved notifications.
+                sink.push_reply(reply);
             }
         }
-        let srv = server.clone();
-        let c = conn.clone();
-        let reply = tokio::task::spawn_blocking(move || srv.handle_on(&c, &message)).await?;
-        if let Some(mut reply) = reply {
-            reply.push('\n');
-            writer.write_all(reply.as_bytes()).await?;
+        Ok(())
+    }
+    .await;
+
+    // Teardown: drop this connection's subscriptions, then let the writer drain
+    // what is queued and exit.
+    server.drop_connection(conn.conn_id);
+    sink.close();
+    let _ = writer_task.await;
+    outcome
+}
+
+/// Drain `sink` to `writer` until the sink is closed and empty. Each frame is a
+/// complete JSON-RPC line; a trailing newline is appended per line.
+async fn write_loop<W>(mut writer: W, sink: NotificationSink) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    loop {
+        let frames = sink.drain();
+        if !frames.is_empty() {
+            for mut frame in frames {
+                frame.push('\n');
+                writer.write_all(frame.as_bytes()).await?;
+            }
             writer.flush().await?;
+            // Re-check for anything queued while we were writing before parking.
+            continue;
         }
+        if sink.is_closed_and_drained() {
+            break;
+        }
+        sink.wait().await;
     }
     Ok(())
 }

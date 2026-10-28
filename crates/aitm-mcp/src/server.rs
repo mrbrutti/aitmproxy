@@ -6,18 +6,30 @@
 //! `tools/call` coerces the arguments by the command's schema and runs
 //! `Command::invoke` against a `CommandHost` built from the attached services.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aitm_core::{
-    AgentPolicy, AgentState, BrowserDriver, Command, CommandHost, FlowStore, Frontend,
-    McpTransport, ProxyClient, Registry, ScopeRateGuard, Sensitivity, SsrfPolicy,
+    AgentPolicy, AgentState, BrowserDriver, Command, CommandHost, Event, Flow, FlowId, FlowQuery,
+    FlowStore, Frontend, McpTransport, ProxyClient, Registry, ScopeRateGuard, Sensitivity,
+    SsrfPolicy,
 };
 use serde_json::{json, Map, Value as JsonValue};
+use tokio::sync::{broadcast, Notify};
 
 use crate::json::{params_from_json, to_json};
 use crate::schema::{McpSchemaDerive, StdSchemaDerive};
 use crate::transport::{self, LoopbackTcp};
+
+/// The default per-connection push-sink capacity (notification lines). A slow
+/// subscriber's notification lane is bounded to this many lines before the oldest
+/// are dropped and the connection is flagged `lagged`; replies are never bounded.
+pub const DEFAULT_PUSH_CAPACITY: usize = 4096;
+
+/// The default capacity of the core→server event broadcast ring.
+pub const DEFAULT_BROADCAST_CAPACITY: usize = 8192;
 
 /// The MCP protocol revision this server speaks when the client names none.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -37,21 +49,32 @@ pub const UNAUTHORIZED: i64 = -32001;
 ///
 /// The `role` drives policy and confirmation decisions (Tasks 4/5/9); the
 /// `client_label` is the connection's `initialize.clientInfo.name`, carried for
-/// audit only. (Task 7 adds the bounded push sink here.)
+/// audit only. `out` is the bounded push sink the transport's writer task drains
+/// (F4); `conn_id` identifies the connection so its subscriptions are dropped
+/// when it ends. In-process callers (`McpServer::handle`) have no push sink.
 #[derive(Debug, Clone)]
 pub struct ConnCtx {
     /// The frontend this connection speaks as.
     pub role: Frontend,
     /// The human-readable client label from `initialize.clientInfo.name`.
     pub client_label: Option<String>,
+    /// A per-connection id, assigned by the transport, used to drop this
+    /// connection's subscriptions when it ends. `0` means "not a streaming
+    /// connection" (an in-process `handle` call).
+    pub conn_id: u64,
+    /// The bounded push sink the transport's writer task drains to the socket;
+    /// `None` for in-process callers that have no writer task.
+    pub out: Option<NotificationSink>,
 }
 
 impl ConnCtx {
-    /// A context for `role` with no client label yet.
+    /// A context for `role` with no client label, no connection id, and no sink.
     pub fn new(role: Frontend) -> Self {
         Self {
             role,
             client_label: None,
+            conn_id: 0,
+            out: None,
         }
     }
 
@@ -59,6 +82,298 @@ impl ConnCtx {
     /// [`McpServer::handle`] wrapper uses.
     pub fn agent() -> Self {
         Self::new(Frontend::Mcp)
+    }
+}
+
+/// A bounded, per-connection push sink feeding one connection's writer task.
+///
+/// Two lanes share the sink so a slow subscriber can never grow core memory or
+/// block the proxy data path:
+/// - **replies** to the connection's own requests are unbounded (a stalled reader
+///   stops sending requests, so replies cannot grow without bound) and are
+///   **never dropped**;
+/// - **notifications** (`notifications/aitm/{flow,state}`) are bounded to
+///   `capacity` lines; on overflow the *oldest* notification is dropped and the
+///   connection is flagged `lagged`, surfaced on the next drain as a
+///   `notifications/aitm/state {lagged:true}` line.
+///
+/// Every `push`/`push_reply` is non-blocking: the producer (the dispatcher task,
+/// or the read loop) never awaits the socket.
+#[derive(Clone)]
+pub struct NotificationSink {
+    inner: Arc<SinkInner>,
+}
+
+struct SinkInner {
+    queues: Mutex<SinkQueues>,
+    capacity: usize,
+    lagged: AtomicBool,
+    closed: AtomicBool,
+    notify: Notify,
+}
+
+#[derive(Default)]
+struct SinkQueues {
+    replies: VecDeque<String>,
+    notes: VecDeque<String>,
+}
+
+impl std::fmt::Debug for NotificationSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotificationSink")
+            .field("capacity", &self.inner.capacity)
+            .field("queued", &self.queued_len())
+            .field("lagged", &self.lagged())
+            .finish()
+    }
+}
+
+impl NotificationSink {
+    /// A sink whose notification lane holds at most `capacity` lines (clamped to
+    /// at least 1) before dropping the oldest.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: Arc::new(SinkInner {
+                queues: Mutex::new(SinkQueues::default()),
+                capacity: capacity.max(1),
+                lagged: AtomicBool::new(false),
+                closed: AtomicBool::new(false),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SinkQueues> {
+        self.inner
+            .queues
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Enqueue a reply to the connection's own request. Never dropped.
+    pub fn push_reply(&self, line: String) {
+        self.lock().replies.push_back(line);
+        self.inner.notify.notify_one();
+    }
+
+    /// Enqueue a server-initiated notification. On overflow the oldest
+    /// notification is dropped and the connection is flagged `lagged`.
+    pub fn push(&self, line: String) {
+        {
+            let mut q = self.lock();
+            if q.notes.len() >= self.inner.capacity {
+                q.notes.pop_front();
+                self.inner.lagged.store(true, Ordering::Relaxed);
+            }
+            q.notes.push_back(line);
+        }
+        self.inner.notify.notify_one();
+    }
+
+    /// Take everything queued, replies first (priority), then — if the lag flag
+    /// is set — a `lagged` state marker, then the surviving notifications. Clears
+    /// the lag flag.
+    pub fn drain(&self) -> Vec<String> {
+        let mut q = self.lock();
+        let mut out: Vec<String> = q.replies.drain(..).collect();
+        if self.inner.lagged.swap(false, Ordering::Relaxed) {
+            out.push(lagged_state_line());
+        }
+        out.extend(q.notes.drain(..));
+        out
+    }
+
+    /// How many notifications are currently queued (for tests / introspection).
+    pub fn queued_len(&self) -> usize {
+        self.lock().notes.len()
+    }
+
+    /// Whether the notification lane has overflowed since the last drain.
+    pub fn lagged(&self) -> bool {
+        self.inner.lagged.load(Ordering::Relaxed)
+    }
+
+    /// Mark the sink closed and wake the writer so it can drain and exit.
+    pub fn close(&self) {
+        self.inner.closed.store(true, Ordering::Relaxed);
+        self.inner.notify.notify_one();
+    }
+
+    /// Whether the sink is closed and holds nothing more to write.
+    pub fn is_closed_and_drained(&self) -> bool {
+        if !self.inner.closed.load(Ordering::Relaxed) {
+            return false;
+        }
+        let q = self.lock();
+        q.replies.is_empty() && q.notes.is_empty() && !self.inner.lagged.load(Ordering::Relaxed)
+    }
+
+    /// Wait until there may be something new to write (or the sink was closed).
+    pub async fn wait(&self) {
+        self.inner.notify.notified().await;
+    }
+}
+
+/// The `notifications/aitm/state {lagged:true}` line a drain surfaces after an
+/// overflow, so a slow subscriber knows to catch up via `flow.list`/`since`.
+fn lagged_state_line() -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/aitm/state",
+        "params": {"lagged": true},
+    })
+    .to_string()
+}
+
+/// The subscription filter (a subset of [`FlowQuery`]): match live and replayed
+/// flows by host and/or method. An unset field does not constrain.
+#[derive(Debug, Clone, Default)]
+struct FlowFilter {
+    host: Option<String>,
+    method: Option<String>,
+}
+
+impl FlowFilter {
+    /// Parse the optional `filter` argument object (`{host?, method?}`).
+    fn parse(filter: Option<&JsonValue>) -> Self {
+        let Some(obj) = filter.and_then(JsonValue::as_object) else {
+            return Self::default();
+        };
+        Self {
+            host: obj
+                .get("host")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string),
+            method: obj
+                .get("method")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string),
+        }
+    }
+
+    /// Whether `flow` passes every set constraint.
+    fn matches(&self, flow: &Flow) -> bool {
+        match flow {
+            Flow::Http(f) => {
+                if let Some(host) = &self.host {
+                    if !host_eq(&f.request.authority, host) {
+                        return false;
+                    }
+                }
+                if let Some(method) = &self.method {
+                    if !f.request.method.eq_ignore_ascii_case(method) {
+                        return false;
+                    }
+                }
+                true
+            }
+            // host/method are HTTP concepts: a WebSocket flow matches only an
+            // otherwise-unconstrained filter.
+            Flow::WebSocket(_) => self.host.is_none() && self.method.is_none(),
+        }
+    }
+
+    /// The equivalent store query, for `since` replay.
+    fn as_query(&self) -> FlowQuery {
+        FlowQuery {
+            host: self.host.clone(),
+            method: self.method.clone(),
+            ..FlowQuery::default()
+        }
+    }
+}
+
+/// Case-insensitive host match: compare the host portion of `authority`
+/// (`host[:port]`) against `want`.
+fn host_eq(authority: &str, want: &str) -> bool {
+    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
+    host.eq_ignore_ascii_case(want) || authority.eq_ignore_ascii_case(want)
+}
+
+/// One live subscription: the connection it belongs to, that connection's push
+/// sink, and the filter it watches.
+struct Subscription {
+    sub_id: u64,
+    conn_id: u64,
+    sink: NotificationSink,
+    filter: FlowFilter,
+}
+
+/// The per-server subscription registry. Subscriptions are keyed by an opaque
+/// `sub_id` and tagged with their `conn_id`, so a connection's subscriptions are
+/// all dropped when it ends.
+#[derive(Default)]
+struct Subscriptions {
+    inner: Mutex<SubState>,
+}
+
+#[derive(Default)]
+struct SubState {
+    next_sub: u64,
+    subs: Vec<Subscription>,
+}
+
+impl Subscriptions {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SubState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Register a subscription for `conn_id` over `sink`; returns its `sub_id`.
+    fn add(&self, conn_id: u64, sink: NotificationSink, filter: FlowFilter) -> u64 {
+        let mut st = self.lock();
+        st.next_sub += 1;
+        let sub_id = st.next_sub;
+        st.subs.push(Subscription {
+            sub_id,
+            conn_id,
+            sink,
+            filter,
+        });
+        sub_id
+    }
+
+    /// Remove `sub_id` if it belongs to `conn_id`. Returns whether it existed.
+    fn remove(&self, conn_id: u64, sub_id: u64) -> bool {
+        let mut st = self.lock();
+        let before = st.subs.len();
+        st.subs
+            .retain(|s| !(s.sub_id == sub_id && s.conn_id == conn_id));
+        st.subs.len() != before
+    }
+
+    /// Drop every subscription belonging to `conn_id` (connection ended).
+    fn drop_connection(&self, conn_id: u64) {
+        self.lock().subs.retain(|s| s.conn_id != conn_id);
+    }
+
+    /// Push `line` to each connection with at least one subscription matching
+    /// `flow` (at most once per connection, even with several matching subs).
+    fn fanout_flow(&self, flow: &Flow, line: &str) {
+        let st = self.lock();
+        let mut seen: Vec<u64> = Vec::new();
+        for sub in &st.subs {
+            if seen.contains(&sub.conn_id) || !sub.filter.matches(flow) {
+                continue;
+            }
+            seen.push(sub.conn_id);
+            sub.sink.push(line.to_string());
+        }
+    }
+
+    /// Push `line` to every subscribed connection (once each), regardless of
+    /// filter — state changes concern the whole session.
+    fn fanout_state(&self, line: &str) {
+        let st = self.lock();
+        let mut seen: Vec<u64> = Vec::new();
+        for sub in &st.subs {
+            if seen.contains(&sub.conn_id) {
+                continue;
+            }
+            seen.push(sub.conn_id);
+            sub.sink.push(line.to_string());
+        }
     }
 }
 
@@ -90,6 +405,18 @@ pub struct McpServer {
     /// agent role. Shared with the `AgentPlugin`, so an operator `agent.set` is
     /// seen here at once.
     agent_state: Arc<AgentState>,
+    /// The live per-connection subscription registry (F4). `flow.subscribe`/
+    /// `flow.unsubscribe` manage it; the dispatcher fans notifications to it.
+    subscriptions: Arc<Subscriptions>,
+    /// The core→server event broadcast sender; a connection built from the
+    /// `SubscriptionPlugin`'s chain tap. `serve` subscribes a dispatcher task to
+    /// it. `None` disables live flow push (the in-process path).
+    push_tx: Option<broadcast::Sender<Event>>,
+    /// Per-connection push-sink capacity (notification lines) before drop-oldest.
+    push_capacity: usize,
+    /// Monotonic source of per-connection ids, so each streaming connection's
+    /// subscriptions can be dropped when it ends.
+    conn_seq: Arc<AtomicU64>,
 }
 
 /// A JSON-RPC level failure (as opposed to a tool's own error result).
@@ -123,7 +450,82 @@ impl McpServer {
             stdio_role: Frontend::Mcp,
             // The milestone default; wiring overrides it from `McpConfig.policy`.
             agent_state: Arc::new(AgentState::new(AgentPolicy::Auto)),
+            subscriptions: Arc::new(Subscriptions::default()),
+            push_tx: None,
+            push_capacity: DEFAULT_PUSH_CAPACITY,
+            conn_seq: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Attach the core→server event broadcast (the `SubscriptionPlugin`'s chain
+    /// tap). `serve` spawns a dispatcher that renders each event as a
+    /// `notifications/aitm/flow` line and fans it to matching subscriptions.
+    pub fn with_push(mut self, tx: broadcast::Sender<Event>) -> Self {
+        self.push_tx = Some(tx);
+        self
+    }
+
+    /// Set the per-connection push-sink capacity (notification lines before the
+    /// oldest is dropped and the connection is flagged `lagged`).
+    pub fn with_push_capacity(mut self, capacity: usize) -> Self {
+        self.push_capacity = capacity.max(1);
+        self
+    }
+
+    /// The configured per-connection push-sink capacity. The transport uses it to
+    /// size a connection's sink when the caller did not inject one.
+    pub fn push_capacity(&self) -> usize {
+        self.push_capacity
+    }
+
+    /// Mint the next per-connection id (the transport tags each connection so its
+    /// subscriptions are dropped when it ends).
+    pub fn next_conn_id(&self) -> u64 {
+        self.conn_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Drop every subscription a connection held (called by the transport when
+    /// the connection ends).
+    pub fn drop_connection(&self, conn_id: u64) {
+        self.subscriptions.drop_connection(conn_id);
+    }
+
+    /// Render `ev` as a `notifications/aitm/flow` line and fan it to every
+    /// subscription whose filter matches the event's flow. Non-blocking; a slow
+    /// subscriber's sink absorbs or drops the line without stalling the caller.
+    pub fn push_flow_event(&self, ev: &Event) {
+        let Some(id) = event_flow_id(ev) else {
+            return;
+        };
+        let Some(services) = self.services.as_ref() else {
+            return;
+        };
+        let Some(flow) = services.store.get(id) else {
+            return;
+        };
+        let line = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/aitm/flow",
+            "params": {
+                "event": event_label(ev),
+                "id": id.to_string(),
+                "summary": flow_summary(&flow),
+            },
+        })
+        .to_string();
+        self.subscriptions.fanout_flow(&flow, &line);
+    }
+
+    /// Render a `notifications/aitm/state` line from `state` (a params object)
+    /// and fan it to every subscribed connection. Non-blocking.
+    pub fn push_state(&self, state: JsonValue) {
+        let line = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/aitm/state",
+            "params": state,
+        })
+        .to_string();
+        self.subscriptions.fanout_state(&line);
     }
 
     /// The shared agent-policy state the policy gate reads and `agent.set` writes.
@@ -209,6 +611,10 @@ impl McpServer {
             operator_token,
             stdio_role,
             agent_state,
+            subscriptions,
+            push_tx,
+            push_capacity,
+            conn_seq,
         } = self;
         let on_bound = on_bound.into_inner().unwrap_or(None);
         let server = Arc::new(McpServer {
@@ -222,7 +628,29 @@ impl McpServer {
             operator_token: operator_token.clone(),
             stdio_role,
             agent_state,
+            subscriptions,
+            push_tx: push_tx.clone(),
+            push_capacity,
+            conn_seq,
         });
+        // The push dispatcher: for each core event, render + fan a flow
+        // notification to matching subscriptions. One task per server, draining
+        // the broadcast ring; it ends when every sender drops.
+        if let Some(tx) = &push_tx {
+            let dispatch_server = server.clone();
+            let mut rx = tx.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(ev) => dispatch_server.push_flow_event(&ev),
+                        // The dispatcher fell behind the ring: skip the missed
+                        // events rather than block the chain (spec D3.5).
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
         match selected {
             McpTransport::Stdio => transport::serve_stdio(server).await,
             McpTransport::LoopbackTcp { port, token } => {
@@ -343,6 +771,17 @@ impl McpServer {
                 ))
             }
         };
+        // F4 connection-scoped subscription management. These need the ConnCtx's
+        // push sink and the server's subscription registry — neither of which a
+        // `CommandHost` can carry — so the server handles them directly instead
+        // of through `Command::invoke`. They are `Read`: gated like any read
+        // (blocked only under `Paused`, and only for the agent role).
+        if name == "flow.subscribe" || name == "flow.unsubscribe" {
+            if let Some(reason) = self.read_refusal(conn, name) {
+                return Ok(tool_error(reason));
+            }
+            return Ok(self.handle_subscription(conn, name, arguments));
+        }
         let cmd = self
             .registry
             .command(name)
@@ -432,6 +871,104 @@ impl McpServer {
             Some(policy_refusal_reason(policy, sens, cmd.name()))
         }
     }
+
+    /// The policy decision for a `Read` command (`flow.subscribe`/`unsubscribe`):
+    /// `Some(reason)` only when the agent role is `Paused` (which refuses all),
+    /// `None` otherwise. Operator/CLI always pass.
+    fn read_refusal(&self, conn: &ConnCtx, name: &str) -> Option<String> {
+        if conn.role != Frontend::Mcp {
+            return None;
+        }
+        match self.agent_state.policy() {
+            AgentPolicy::Paused => Some(format!(
+                "`{name}` refused: the agent policy is `paused`; no agent command runs. An operator \
+                 can change it with agent.set."
+            )),
+            _ => None,
+        }
+    }
+
+    /// Run `flow.subscribe`/`flow.unsubscribe` against the connection and the
+    /// subscription registry, returning the `tools/call` result.
+    fn handle_subscription(
+        &self,
+        conn: &ConnCtx,
+        name: &str,
+        args: &Map<String, JsonValue>,
+    ) -> JsonValue {
+        let Some(sink) = conn.out.clone() else {
+            return tool_error(format!(
+                "`{name}` is only meaningful over a streaming MCP connection (it has no push sink \
+                 to deliver notifications on)."
+            ));
+        };
+        match name {
+            "flow.subscribe" => self.subscribe(conn.conn_id, sink, args),
+            "flow.unsubscribe" => self.unsubscribe(conn.conn_id, args),
+            _ => tool_error(format!("unknown subscription command `{name}`")),
+        }
+    }
+
+    /// Register a subscription for this connection; optionally replay matching
+    /// store entries after `since` before live events. Returns `{sub_id}`.
+    fn subscribe(
+        &self,
+        conn_id: u64,
+        sink: NotificationSink,
+        args: &Map<String, JsonValue>,
+    ) -> JsonValue {
+        let filter = FlowFilter::parse(args.get("filter"));
+        let since = args
+            .get("since")
+            .and_then(JsonValue::as_str)
+            .and_then(|s| s.parse::<FlowId>().ok());
+        let sub_id = self
+            .subscriptions
+            .add(conn_id, sink.clone(), filter.clone());
+        if let Some(since) = since {
+            self.replay_since(&sink, &filter, since);
+        }
+        tool_ok(json!({ "sub_id": sub_id }))
+    }
+
+    /// Remove a subscription this connection owns. Returns `{}` whether or not it
+    /// existed (idempotent).
+    fn unsubscribe(&self, conn_id: u64, args: &Map<String, JsonValue>) -> JsonValue {
+        let Some(sub_id) = args.get("sub_id").and_then(JsonValue::as_u64) else {
+            return tool_error("flow.unsubscribe requires an integer `sub_id`".to_string());
+        };
+        self.subscriptions.remove(conn_id, sub_id);
+        tool_ok(json!({}))
+    }
+
+    /// Replay the matching flows currently in the store that were captured after
+    /// `since` (exclusive), oldest first, as `created` flow notifications — a
+    /// reconnecting subscriber catches up before the live stream resumes.
+    fn replay_since(&self, sink: &NotificationSink, filter: &FlowFilter, since: FlowId) {
+        let Some(services) = self.services.as_ref() else {
+            return;
+        };
+        let store = services.store.as_ref();
+        let ids = store.query(&filter.as_query());
+        // `query` returns ids in insertion order; replay only those after `since`.
+        let start = ids.iter().position(|id| *id == since).map_or(0, |p| p + 1);
+        for id in &ids[start..] {
+            let Some(flow) = store.get(*id) else {
+                continue;
+            };
+            let line = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/aitm/flow",
+                "params": {
+                    "event": "created",
+                    "id": id.to_string(),
+                    "summary": flow_summary(&flow),
+                },
+            })
+            .to_string();
+            sink.push(line);
+        }
+    }
 }
 
 /// Whether a Sensitive command carries its own per-command agent config gate, so
@@ -480,4 +1017,64 @@ fn tool_error(text: String) -> JsonValue {
         "content": [{"type": "text", "text": text}],
         "isError": true,
     })
+}
+
+/// A successful `tools/call` result carrying `value` as its structured content,
+/// mirroring the shape the normal command path produces.
+fn tool_ok(value: JsonValue) -> JsonValue {
+    json!({
+        "content": [{"type": "text", "text": value.to_string()}],
+        "structuredContent": value,
+        "isError": false,
+    })
+}
+
+/// The flow id an event concerns (every current variant names one).
+fn event_flow_id(ev: &Event) -> Option<FlowId> {
+    match ev {
+        Event::RequestHeaders(id)
+        | Event::Request(id)
+        | Event::ResponseHeaders(id)
+        | Event::Response(id)
+        | Event::WsStart(id)
+        | Event::WsEnd(id) => Some(*id),
+        Event::WsMessage { flow, .. } | Event::Error { flow, .. } => Some(*flow),
+        // `Event` is `#[non_exhaustive]`: a future flowless event pushes nothing.
+        _ => None,
+    }
+}
+
+/// The `notifications/aitm/flow` `event` label for a lifecycle event.
+fn event_label(ev: &Event) -> &'static str {
+    match ev {
+        // The first event about an HTTP or WebSocket flow is its creation.
+        Event::RequestHeaders(_) | Event::WsStart(_) => "created",
+        Event::Request(_) => "request",
+        Event::ResponseHeaders(_) | Event::Response(_) => "response",
+        Event::WsMessage { .. } => "ws_message",
+        Event::WsEnd(_) => "killed",
+        Event::Error { .. } => "killed",
+        _ => "meta",
+    }
+}
+
+/// The `flow.get`-shaped summary a notification carries (full detail stays a
+/// `flow.detail` pull, F5).
+fn flow_summary(flow: &Flow) -> JsonValue {
+    match flow {
+        Flow::Http(f) => json!({
+            "id": f.id.to_string(),
+            "kind": "http",
+            "method": f.request.method,
+            "authority": f.request.authority,
+            "path": f.request.path,
+            "status": f.response.as_ref().map(|r| r.status),
+        }),
+        Flow::WebSocket(f) => json!({
+            "id": f.id.to_string(),
+            "kind": "ws",
+            "handshake": f.handshake.to_string(),
+            "messages": f.messages.len(),
+        }),
+    }
 }
