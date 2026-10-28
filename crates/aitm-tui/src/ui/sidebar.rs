@@ -164,16 +164,11 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             true,
         ),
     );
-    // The browser view is a TUI build item, not a core follow-up: say so
-    // rather than borrow an F-number.
+    // The count here is the open tab count, which needs `browser.tabs` (F14):
+    // missing is a dash (§2.8), the view itself is built (task 10).
     line(
         buf,
-        item(
-            app,
-            SidebarItem::Browser,
-            Some("not built yet".into()),
-            false,
-        ),
+        item(app, SidebarItem::Browser, Some("—".into()), false),
     );
     line(
         buf,

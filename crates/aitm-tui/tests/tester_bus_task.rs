@@ -420,10 +420,12 @@ async fn requests_become_tool_calls_and_results_become_events() {
         ev,
         BusEvent::Toast(Level::Error, "flow is not intercepted".into())
     );
+    // (Task 10 gave the fixture a browser; `ca.*` mutations are what it
+    // still refuses, so that is the arbitrary-tool error path now.)
     r.req_tx
         .send(BusRequest::Call {
-            name: "browser.navigate".into(),
-            args: json!({"url": "https://x"}),
+            name: "ca.install".into(),
+            args: json!({}),
         })
         .await
         .unwrap();
@@ -435,7 +437,7 @@ async fn requests_become_tool_calls_and_results_become_events() {
         ev,
         BusEvent::Toast(
             Level::Error,
-            "fixture has no browser engine; run against a live proxy".into()
+            "CA changes are not simulated by the fixture".into()
         )
     );
 

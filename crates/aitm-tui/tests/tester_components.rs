@@ -8,6 +8,7 @@ use aitm_tui::action::ToolSchema as _;
 use aitm_tui::action::{Action, BusEvent, BusRequest, Level, ToolInfo};
 use aitm_tui::app::{App, Chip, Mode, Pane, PromptKind, SidebarItem, REQUEST_TABS, RESPONSE_TABS};
 use aitm_tui::caps::TermCaps;
+use aitm_tui::fixture::Fixture;
 use aitm_tui::fixture_app;
 use aitm_tui::keys;
 use aitm_tui::model::{AgentPolicy, AgentState, FlowDetail, Message};
@@ -296,16 +297,19 @@ fn sidebar_items_group_the_list_and_open_the_panels() {
     let _ = app.update(Action::SidebarNext);
     assert_eq!(app.sidebar, SidebarItem::Findings);
     assert_eq!(app.mode, Mode::Findings);
-    // Browser: a panel that says it is not built and lists the browser.* tools.
-    let _ = app.update(Action::SidebarNext);
+    // Browser: the view opens and asks the bus for the page (task 10); the
+    // only F-number on it is the live viewport/tabs line.
+    let reqs = app.update(Action::SidebarNext);
     assert_eq!(app.sidebar, SidebarItem::Browser);
     assert_eq!(app.mode, Mode::Browser);
+    assert_eq!(reqs.len(), 2, "{reqs:?}");
     let text = text_of(&app, 200, 50);
-    assert!(text.contains("Browser — not built yet"), "{text}");
-    assert!(text.contains(":browser.navigate"), "{text}");
-    assert!(text.contains(":browser.get_dom"), "{text}");
-    assert!(text.contains(":browser.screenshot"), "{text}");
-    assert!(!text.contains("F14"), "not an F-number: {text}");
+    assert!(text.contains("Browser — embedded obscura"), "{text}");
+    assert!(!text.contains("not built"), "{text}");
+    assert!(
+        text.contains("live viewport and tabs need core follow-up F14"),
+        "{text}"
+    );
     assert_eq!(
         keys::map(press(KeyCode::Esc), Mode::Browser),
         Some(Action::Back)
@@ -1704,7 +1708,6 @@ fn every_absent_tool_degrades_to_a_labelled_follow_up() {
     for label in [
         "(core follow-up F7)",
         "F10│",
-        "not built yet│",
         "M3│",
         "F1│",
         "n/a (F1)",
@@ -1712,6 +1715,13 @@ fn every_absent_tool_degrades_to_a_labelled_follow_up() {
     ] {
         assert!(text.contains(label), "{label}: {text}");
     }
+    // The Browser item's count is the tab count, which needs F14: a dash
+    // for "missing" (§2.8), not a "not built" label — the view is built.
+    assert!(
+        line_with(&text, "  Browser").is_some_and(|l| l.ends_with("—│")),
+        "{:?}",
+        line_with(&text, "  Browser")
+    );
     let _ = app.update(Action::OpenScope);
     assert!(text_of(&app, 200, 50).contains("(needs core follow-up F12)"));
     assert!(text_of(&app, 200, 50).contains("readout needs F7, config.get"));
@@ -1871,4 +1881,290 @@ fn tools_list_drives_detail_fetching() {
         ]
     );
     let _ = Level::Info;
+}
+
+// ------------------------------------------------------ §2.7 browser view
+
+/// Run `reqs` against the fixture as the bus task would and feed the answers
+/// back: `CallOk` for a result, an error toast for a tool error.
+fn answer(app: &mut App, fx: &mut Fixture, reqs: Vec<BusRequest>) {
+    for r in reqs {
+        if let BusRequest::Call { name, args } = r {
+            let obj = args.as_object().cloned().unwrap_or_default();
+            match fx.call(&name, &obj) {
+                Ok(value) => {
+                    let _ = app.on_bus(BusEvent::CallOk { name, value });
+                }
+                Err(e) => {
+                    let _ = app.on_bus(BusEvent::Toast(Level::Error, e));
+                }
+            }
+        }
+    }
+}
+
+fn call(name: &str, args: serde_json::Value) -> BusRequest {
+    BusRequest::Call {
+        name: name.into(),
+        args,
+    }
+}
+
+/// §2.7 "Browser view … TUI: URL + last screenshot as placeholder + `get_dom`
+/// text outline; navigate/eval available"; §2.9 "URL, DOM outline, last
+/// screenshot placeholder"; §2.10(c) "no browser viewport … navigate/eval
+/// still work". Plan task 10.
+#[test]
+fn browser_view_shows_url_screenshot_and_dom_outline() {
+    let mut app = fixture_app(200, 50);
+    let mut fx = Fixture::builtin();
+
+    // Opening the view asks the bus for the page once.
+    let reqs = app.update(Action::OpenBrowser);
+    assert_eq!(app.mode, Mode::Browser);
+    assert_eq!(app.sidebar, SidebarItem::Browser);
+    assert_eq!(
+        reqs,
+        vec![
+            call("browser.get_dom", json!({})),
+            call("browser.screenshot", json!({})),
+        ]
+    );
+    assert_eq!(app.browser.busy, Some("loading the page"));
+    let text = text_of(&app, 200, 50);
+    assert!(text.contains("[no screenshot yet · s]"), "{text}");
+    assert!(text.contains("loading the page"), "{text}");
+    // The URL is unknown until the operator navigates: a dash (§2.8).
+    assert!(
+        line_with(&text, " URL ").is_some_and(|l| l.contains("—")),
+        "{text}"
+    );
+
+    answer(&mut app, &mut fx, reqs);
+    assert_eq!(app.browser.busy, None);
+    assert_eq!(app.browser.error, None);
+    assert_eq!(
+        app.browser.dom_outline,
+        vec![
+            "html",
+            "  head",
+            "    meta",
+            "    title",
+            "    script",
+            "  body",
+            "    h1#title",
+            "    p.lead",
+            "      a.link",
+            "    img#hero",
+            "    script",
+        ]
+    );
+    assert_eq!(app.browser.screenshot, Some((1, 1, "PNG", 70)));
+    let text = text_of(&app, 200, 50);
+    assert!(text.contains("Browser — embedded obscura"), "{text}");
+    assert!(
+        text.contains("[screenshot 1×1 PNG · 70 B · o to open]"),
+        "{text}"
+    );
+    assert!(line_with(&text, "      a.link").is_some(), "{text}");
+    assert!(text.contains("11 elements"), "{text}");
+    assert!(
+        text.contains("live viewport and tabs need core follow-up F14"),
+        "{text}"
+    );
+    // ↓ walks the outline; the header names the cursor's path.
+    for _ in 0..6 {
+        let _ = app.update(Action::Down);
+    }
+    assert_eq!(app.browser.dom_cursor, 6);
+    let text = text_of(&app, 200, 50);
+    assert!(text.contains("html › body › h1#title"), "{text}");
+    let _ = app.update(Action::Home);
+    assert_eq!(app.browser.dom_cursor, 0);
+    let _ = app.update(Action::End);
+    assert_eq!(app.browser.dom_cursor, 10);
+
+    // `g` opens the URL prompt prefilled with the current URL; ⏎ navigates.
+    assert_eq!(
+        keys::map(press(KeyCode::Char('g')), Mode::Browser),
+        Some(Action::Command("browser-url-prompt".into()))
+    );
+    let _ = app.update(Action::Command("browser-url-prompt".into()));
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::BrowserUrl));
+    assert_eq!(app.prompt, "");
+    for c in "https://shop-staging.test/".chars() {
+        let _ = app.update(Action::Input(c));
+    }
+    let reqs = app.update(Action::Submit);
+    assert_eq!(
+        reqs,
+        vec![call(
+            "browser.navigate",
+            json!({"url": "https://shop-staging.test/"})
+        )]
+    );
+    assert_eq!(app.mode, Mode::Browser);
+    assert_eq!(app.browser.busy, Some("navigating"));
+    answer(&mut app, &mut fx, reqs);
+    assert_eq!(app.browser.url, "https://shop-staging.test/");
+    assert!(
+        text_of(&app, 200, 50).contains("https://shop-staging.test/"),
+        "{}",
+        text_of(&app, 200, 50)
+    );
+    let _ = app.update(Action::Command("browser-url-prompt".into()));
+    assert_eq!(app.prompt, "https://shop-staging.test/");
+    let _ = app.update(Action::Back);
+    assert_eq!(app.mode, Mode::Browser);
+    assert_eq!(app.prompt, "");
+
+    // `e` prompts for an expression; the argument is named by the tool's
+    // schema (`expr` on today's bus), not hard-coded.
+    assert_eq!(
+        keys::map(press(KeyCode::Char('e')), Mode::Browser),
+        Some(Action::Command("browser-eval-prompt".into()))
+    );
+    let _ = app.update(Action::Command("browser-eval-prompt".into()));
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::BrowserEval));
+    for c in "document.title".chars() {
+        let _ = app.update(Action::Input(c));
+    }
+    let reqs = app.update(Action::Submit);
+    assert_eq!(
+        reqs,
+        vec![call("browser.eval", json!({"expr": "document.title"}))]
+    );
+    assert_eq!(app.browser.busy, Some("evaluating"));
+    answer(&mut app, &mut fx, reqs);
+    assert_eq!(app.browser.last_eval.as_deref(), Some("Shop — staging"));
+    assert!(
+        text_of(&app, 200, 50).contains("eval › Shop — staging"),
+        "{}",
+        text_of(&app, 200, 50)
+    );
+    // `d` and `s` refresh; `:browser.navigate url=…` from the panel is the
+    // same call the prompt makes.
+    assert_eq!(
+        keys::map(press(KeyCode::Char('d')), Mode::Browser),
+        Some(Action::Command("browser-dom".into()))
+    );
+    assert_eq!(
+        keys::map(press(KeyCode::Char('s')), Mode::Browser),
+        Some(Action::Command("browser-screenshot".into()))
+    );
+    assert_eq!(
+        app.update(Action::Command("browser-dom".into())),
+        vec![call("browser.get_dom", json!({}))]
+    );
+    assert_eq!(app.browser.busy, Some("reading the DOM"));
+    assert_eq!(
+        app.update(Action::Command("browser-screenshot".into())),
+        vec![call("browser.screenshot", json!({}))]
+    );
+    assert_eq!(app.browser.busy, Some("capturing a screenshot"));
+    let reqs = app.run_command("browser.navigate url=https://x");
+    assert_eq!(
+        reqs,
+        vec![call("browser.navigate", json!({"url": "https://x"}))]
+    );
+    answer(&mut app, &mut fx, reqs);
+    assert_eq!(app.browser.url, "https://x");
+
+    // `o` writes the screenshot to a private temp file and opens it.
+    assert_eq!(
+        keys::map(press(KeyCode::Char('o')), Mode::Browser),
+        Some(Action::OpenExternally)
+    );
+    let _ = app.update(Action::OpenExternally);
+    let target = app.take_open_target().expect("an open target");
+    assert!(
+        target.path.to_string_lossy().ends_with(".png"),
+        "{:?}",
+        target.path
+    );
+    assert_eq!(std::fs::read(&target.path).unwrap().len(), 70);
+    let _ = std::fs::remove_file(&target.path);
+
+    // `:browser` opens the view too and does not re-fetch what it has.
+    app.mode = Mode::Flows;
+    assert!(app.run_command("browser").is_empty());
+    assert_eq!(app.mode, Mode::Browser);
+}
+
+/// §2.10(c) "where a translation cannot be faithful, the surface degrades …
+/// never silently": a bus without `browser.*`, and a tool error from a bus
+/// that has them but no engine, both show in the panel itself.
+#[test]
+fn browser_view_says_when_the_bus_has_no_browser_and_shows_tool_errors() {
+    let mut app = fixture_app(200, 50);
+    let no_browser: Vec<&str> = CORE_TOOLS
+        .iter()
+        .copied()
+        .filter(|t| !t.starts_with("browser."))
+        .collect();
+    let _ = connect(&mut app, &no_browser, None);
+    assert!(app.update(Action::OpenBrowser).is_empty());
+    assert_eq!(app.mode, Mode::Browser);
+    let text = text_of(&app, 200, 50);
+    assert!(
+        text.contains("this bus offers no browser.* tools"),
+        "{text}"
+    );
+    assert!(app.update(Action::Command("browser-dom".into())).is_empty());
+    assert_eq!(
+        app.browser.error.as_deref(),
+        Some("browser.get_dom is not on this bus")
+    );
+    assert!(
+        text_of(&app, 200, 50).contains("browser.get_dom is not on this bus"),
+        "{}",
+        text_of(&app, 200, 50)
+    );
+    assert!(app
+        .update(Action::Command("browser-url-prompt".into()))
+        .is_empty());
+    assert_eq!(
+        app.mode,
+        Mode::Browser,
+        "no prompt for a tool that is absent"
+    );
+
+    // The tools are there but nothing answers behind them (a live proxy with
+    // no obscura): the error lands in the panel, not only in a toast.
+    let _ = connect(&mut app, CORE_TOOLS, None);
+    let reqs = app.update(Action::Command("browser-dom".into()));
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(app.browser.busy, Some("reading the DOM"));
+    assert_eq!(app.browser.error, None, "a new call clears the old error");
+    let _ = app.on_bus(BusEvent::Toast(
+        Level::Error,
+        "browser engine is not running".into(),
+    ));
+    assert_eq!(app.browser.busy, None);
+    assert_eq!(
+        app.browser.error.as_deref(),
+        Some("browser engine is not running")
+    );
+    let text = text_of(&app, 200, 50);
+    assert!(text.contains("browser engine is not running"), "{text}");
+    assert_eq!(toast(&app), "browser engine is not running");
+    // An info toast while idle is not a browser error.
+    let _ = app.on_bus(BusEvent::Toast(Level::Info, "Resumed".into()));
+    assert_eq!(
+        app.browser.error.as_deref(),
+        Some("browser engine is not running")
+    );
+
+    // `o` with no screenshot says so instead of opening nothing.
+    let _ = app.update(Action::OpenExternally);
+    assert!(app.take_open_target().is_none());
+    assert_eq!(toast(&app), "no screenshot yet — s captures one");
+
+    // A fixture document without a `browser` section still answers like the
+    // bus did before task 10, so that error path stays reachable in tests.
+    let mut fx = Fixture::parse(r#"{"tools":[{"name":"browser.get_dom"}]}"#).unwrap();
+    assert_eq!(
+        fx.call("browser.get_dom", &serde_json::Map::new()),
+        Err("fixture has no browser engine; run against a live proxy".into())
+    );
 }

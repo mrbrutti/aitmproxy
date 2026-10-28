@@ -60,6 +60,9 @@ pub enum Action {
     OpenFindings,
     OpenScope,
     OpenAgent,
+    /// The browser view (§2.7); asks the bus for the DOM and a screenshot
+    /// the first time, when it offers `browser.*`.
+    OpenBrowser,
     AgentSet(AgentPolicy),
     // Text prompts
     PaletteOpen,

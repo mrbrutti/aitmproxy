@@ -31,7 +31,7 @@ pub fn map(key: KeyEvent, mode: Mode) -> Option<Action> {
         Mode::Scope => scope(key),
         Mode::Agent => agent(key),
         Mode::Ca => ca(key),
-        Mode::Browser => panel(key),
+        Mode::Browser => browser(key),
         // Any key closes help (README); `:` goes straight to the palette.
         Mode::Help => Some(match key.code {
             KeyCode::Char(':') => Action::PaletteOpen,
@@ -55,6 +55,26 @@ fn ca(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('e') => Action::Command("ca-export-prompt".into()),
         KeyCode::Char('i') => Action::Command("ca.install".into()),
         KeyCode::Char('u') => Action::Command("ca.uninstall".into()),
+        _ => return panel(key),
+    })
+}
+
+/// The browser view (§2.7, task 10): `g` URL prompt, `e` eval prompt, `d`
+/// re-read the DOM, `s` screenshot, `o` open it, ↑↓ walk the outline. `g`
+/// is the URL here, so Home is the key for "top of the outline".
+fn browser(key: KeyEvent) -> Option<Action> {
+    Some(match key.code {
+        KeyCode::Char('g') => Action::Command("browser-url-prompt".into()),
+        KeyCode::Char('e') => Action::Command("browser-eval-prompt".into()),
+        KeyCode::Char('d') => Action::Command("browser-dom".into()),
+        KeyCode::Char('s') => Action::Command("browser-screenshot".into()),
+        KeyCode::Char('o') => Action::OpenExternally,
+        KeyCode::Up | KeyCode::Char('k') => Action::Up,
+        KeyCode::Down | KeyCode::Char('j') => Action::Down,
+        KeyCode::PageUp => Action::PageUp,
+        KeyCode::PageDown => Action::PageDown,
+        KeyCode::Home => Action::Home,
+        KeyCode::End | KeyCode::Char('G') => Action::End,
         _ => return panel(key),
     })
 }
@@ -342,6 +362,36 @@ mod tests {
             Some(Action::PaletteOpen)
         );
         assert_eq!(map(press(KeyCode::Char('z')), Mode::Browser), None);
+        // Task 10: the browser view's verbs and outline navigation.
+        for (key, cmd) in [
+            ('g', "browser-url-prompt"),
+            ('e', "browser-eval-prompt"),
+            ('d', "browser-dom"),
+            ('s', "browser-screenshot"),
+        ] {
+            assert_eq!(
+                map(press(KeyCode::Char(key)), Mode::Browser),
+                Some(Action::Command(cmd.into())),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            map(press(KeyCode::Char('o')), Mode::Browser),
+            Some(Action::OpenExternally)
+        );
+        assert_eq!(map(press(KeyCode::Down), Mode::Browser), Some(Action::Down));
+        assert_eq!(
+            map(press(KeyCode::Char('j')), Mode::Browser),
+            Some(Action::Down)
+        );
+        assert_eq!(map(press(KeyCode::Up), Mode::Browser), Some(Action::Up));
+        assert_eq!(map(press(KeyCode::Home), Mode::Browser), Some(Action::Home));
+        assert_eq!(map(press(KeyCode::End), Mode::Browser), Some(Action::End));
+        assert_eq!(
+            map(press(KeyCode::Char('?')), Mode::Browser),
+            Some(Action::Help)
+        );
+        assert_eq!(map(press(KeyCode::Esc), Mode::Browser), Some(Action::Back));
         // The confirm prompt takes its answer as typed input.
         assert_eq!(
             map(press(KeyCode::Char('y')), Mode::Prompt(PromptKind::Confirm)),

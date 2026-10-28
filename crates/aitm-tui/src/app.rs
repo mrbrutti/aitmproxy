@@ -54,7 +54,8 @@ pub enum Mode {
     Agent,
     /// The CA panel (`:ca`): `ca.status` facts, export / install / uninstall.
     Ca,
-    /// The browser view placeholder: not built yet, lists `:browser.*`.
+    /// The browser view (§2.7): URL, DOM outline, last-screenshot placeholder;
+    /// navigate / eval / screenshot through `browser.*`.
     Browser,
     Help,
     QuickLook,
@@ -83,6 +84,54 @@ pub enum PromptKind {
     CaExport,
     /// `y/N` for a tool in [`CONFIRM_TOOLS`]; the call waits in `App::confirm`.
     Confirm,
+    /// Browser view `g`: the URL for `browser.navigate`, prefilled.
+    BrowserUrl,
+    /// Browser view `e`: a JavaScript expression for `browser.eval`.
+    BrowserEval,
+}
+
+/// The browser view's state (§2.7 "Browser view", TUI column of §2.9): what
+/// the `browser.*` commands have reported so far. Plain data; `App::on_bus`
+/// fills it and `ui::browser` draws it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BrowserState {
+    /// The URL `browser.navigate` last confirmed (`final_url`); empty until
+    /// the operator navigates, since the bus has no "where are you" call.
+    pub url: String,
+    /// The URL a navigate in flight asked for, used when the reply has no
+    /// `final_url`.
+    pub pending_url: Option<String>,
+    /// The last `browser.get_dom` text.
+    pub dom: Option<String>,
+    /// [`crate::ui::browser::outline`] of `dom`.
+    pub dom_outline: Vec<String>,
+    /// The outline line ↑↓ is on.
+    pub dom_cursor: usize,
+    /// `(width, height, format, bytes)` of the last screenshot.
+    pub screenshot: Option<(u32, u32, &'static str, usize)>,
+    /// The screenshot itself, for `o`.
+    pub screenshot_png: Option<Vec<u8>>,
+    /// The last `browser.eval` result as text.
+    pub last_eval: Option<String>,
+    /// What the panel says is in flight; cleared when `inflight` reaches 0.
+    pub busy: Option<&'static str>,
+    /// `browser.*` calls awaiting an answer.
+    pub inflight: usize,
+    /// The last `browser.*` failure, shown in the panel until the next call.
+    pub error: Option<String>,
+}
+
+/// The panel's word for a `browser.*` call in flight.
+fn browser_busy_label(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "browser.navigate" => "navigating",
+        "browser.eval" => "evaluating",
+        "browser.get_dom" => "reading the DOM",
+        "browser.screenshot" => "capturing a screenshot",
+        "browser.click" => "clicking",
+        "browser.type" => "typing",
+        _ => return None,
+    })
 }
 
 /// A tool call held back for the operator's `y/N`.
@@ -699,6 +748,8 @@ pub struct App {
     pub pending_open: Option<OpenTarget>,
     /// The last `ca.status` result, for the CA panel.
     pub ca_status: Option<Value>,
+    /// The browser view (§2.7).
+    pub browser: BrowserState,
 }
 
 impl App {
@@ -748,6 +799,7 @@ impl App {
             confirm: None,
             pending_open: None,
             ca_status: None,
+            browser: BrowserState::default(),
         }
     }
 
@@ -1156,8 +1208,8 @@ impl App {
                 _ => {}
             },
             Action::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
-            Action::SidebarNext => self.sidebar_step(1),
-            Action::SidebarPrev => self.sidebar_step(-1),
+            Action::SidebarNext => self.sidebar_step(1, &mut out),
+            Action::SidebarPrev => self.sidebar_step(-1, &mut out),
             Action::ChipNext => self.chip = step(&Chip::ALL, self.chip, 1),
             Action::ChipPrev => self.chip = step(&Chip::ALL, self.chip, -1),
             Action::ChipIndex(i) => {
@@ -1376,6 +1428,22 @@ impl App {
                 self.mode = Mode::Agent;
                 self.sidebar = SidebarItem::Agent;
             }
+            Action::OpenBrowser => {
+                self.mode = Mode::Browser;
+                self.sidebar = SidebarItem::Browser;
+                // First open: ask for what the panel shows, when the bus
+                // can answer. Later opens keep what they have (`d`/`s`).
+                let mut asked = false;
+                if self.browser.dom.is_none() && self.has_tool("browser.get_dom") {
+                    asked |= self.browser_call("browser.get_dom", json!({}), &mut out);
+                }
+                if self.browser.screenshot.is_none() && self.has_tool("browser.screenshot") {
+                    asked |= self.browser_call("browser.screenshot", json!({}), &mut out);
+                }
+                if asked {
+                    self.browser.busy = Some("loading the page");
+                }
+            }
             Action::AgentSet(p) => {
                 if self.has_tool("agent.set") {
                     out.push(BusRequest::AgentSet(p));
@@ -1442,6 +1510,24 @@ impl App {
     /// body, written to a private temp file first. Anything the terminal can
     /// show inline is not opened, and the toast says so.
     fn open_externally(&mut self) {
+        if self.mode == Mode::Browser {
+            match &self.browser.screenshot_png {
+                Some(png) => match open::body_to_temp_file("browser-screenshot", "png", png) {
+                    Ok(path) => {
+                        self.toast(Level::Info, "opening the screenshot");
+                        self.pending_open = Some(OpenTarget {
+                            path,
+                            label: "screenshot".into(),
+                        });
+                    }
+                    Err(e) => {
+                        self.toast(Level::Error, format!("could not write the screenshot: {e}"))
+                    }
+                },
+                None => self.toast(Level::Info, "no screenshot yet — s captures one"),
+            }
+            return;
+        }
         if self.mode == Mode::Findings {
             let Some(f) = self.findings.get(self.finding_cursor) else {
                 return;
@@ -1551,10 +1637,59 @@ impl App {
             self.open_prompt(PromptKind::Confirm);
             return Vec::new();
         }
+        if let Some(label) = browser_busy_label(name) {
+            // However it was reached (panel key, palette, `:browser.* …`),
+            // the browser view shows the call in flight and forgets the
+            // last error.
+            self.browser.busy = Some(label);
+            self.browser.inflight += 1;
+            self.browser.error = None;
+            if name == "browser.navigate" {
+                self.browser.pending_url =
+                    args.get("url").and_then(Value::as_str).map(str::to_string);
+            }
+        }
         vec![BusRequest::Call {
             name: name.to_string(),
             args,
         }]
+    }
+
+    /// A `browser.*` call from the view. When the bus lacks the tool the
+    /// panel says so (not only a toast) and nothing is sent.
+    fn browser_call(&mut self, name: &str, args: Value, out: &mut Vec<BusRequest>) -> bool {
+        if !self.has_tool(name) {
+            let msg = format!("{name} is not on this bus");
+            self.browser.error = Some(msg.clone());
+            self.toast(Level::Warn, msg);
+            return false;
+        }
+        out.extend(self.call_tool(name, args));
+        true
+    }
+
+    /// The name `browser.eval` gives its expression parameter, read from the
+    /// tool's schema (`expr` on today's bus) so the form follows the bus.
+    fn browser_eval_param(&self) -> String {
+        let params = self
+            .tools
+            .iter()
+            .find(|t| t.name == "browser.eval")
+            .map(|t| t.params())
+            .unwrap_or_default();
+        params
+            .iter()
+            .find(|p| p.2)
+            .or(params.first())
+            .map_or_else(|| "expr".to_string(), |p| p.0.clone())
+    }
+
+    /// A `browser.*` call was answered or failed: one fewer in flight.
+    fn browser_settled(&mut self) {
+        self.browser.inflight = self.browser.inflight.saturating_sub(1);
+        if self.browser.inflight == 0 {
+            self.browser.busy = None;
+        }
     }
 
     /// The operator answered the confirm prompt.
@@ -1593,6 +1728,10 @@ impl App {
             Mode::Prompt(PromptKind::CaExport) => {
                 self.prompt.clear();
                 Mode::Ca
+            }
+            Mode::Prompt(PromptKind::BrowserUrl | PromptKind::BrowserEval) => {
+                self.prompt.clear();
+                Mode::Browser
             }
             Mode::Prompt(PromptKind::PocTarget | PromptKind::PocVars) => {
                 self.prompt.clear();
@@ -1814,6 +1953,21 @@ impl App {
                 let yes = matches!(text.to_ascii_lowercase().as_str(), "y" | "yes");
                 out.extend(self.answer_confirm(yes));
             }
+            Mode::Prompt(PromptKind::BrowserUrl) => {
+                self.mode = Mode::Browser;
+                self.prompt.clear();
+                if !text.is_empty() {
+                    self.browser_call("browser.navigate", json!({ "url": text }), &mut out);
+                }
+            }
+            Mode::Prompt(PromptKind::BrowserEval) => {
+                self.mode = Mode::Browser;
+                self.prompt.clear();
+                if !text.is_empty() {
+                    let key = self.browser_eval_param();
+                    self.browser_call("browser.eval", json!({ key: text }), &mut out);
+                }
+            }
             Mode::Compose => {
                 if self.compose.field < 3 {
                     self.compose.field += 1;
@@ -1862,6 +2016,25 @@ impl App {
                         Action::Up => self.finding_cursor.saturating_sub(1),
                         Action::Down => (self.finding_cursor + 1).min(n - 1),
                         _ => self.finding_cursor,
+                    };
+                }
+            }
+            Mode::Browser => {
+                let n = self.browser.dom_outline.len();
+                if n > 0 {
+                    // The outline region is the body minus the panel's own
+                    // lines (border, URL, screenshot, state, header, eval,
+                    // F14, hints) and the three bars.
+                    let page = usize::from(self.height.saturating_sub(13)).max(1);
+                    let c = self.browser.dom_cursor;
+                    self.browser.dom_cursor = match action {
+                        Action::Up => c.saturating_sub(1),
+                        Action::Down => (c + 1).min(n - 1),
+                        Action::PageUp => c.saturating_sub(page),
+                        Action::PageDown => (c + page).min(n - 1),
+                        Action::Home => 0,
+                        Action::End => n - 1,
+                        _ => c,
                     };
                 }
             }
@@ -1959,12 +2132,12 @@ impl App {
 
     /// `]`/`[`: the Scope item filters the list (§2.7 "The flow list's
     /// `Scope` sidebar item filters to in-scope"); the panel is `S`/`:scope`.
-    fn sidebar_step(&mut self, d: i32) {
+    fn sidebar_step(&mut self, d: i32, out: &mut Vec<BusRequest>) {
         self.sidebar = step(&SidebarItem::ALL, self.sidebar, d);
         match self.sidebar {
             SidebarItem::Findings => self.mode = Mode::Findings,
             SidebarItem::Agent => self.mode = Mode::Agent,
-            SidebarItem::Browser => self.mode = Mode::Browser,
+            SidebarItem::Browser => out.extend(self.update(Action::OpenBrowser)),
             SidebarItem::Scripts => {
                 self.mode = Mode::Flows;
                 self.toast(Level::Info, "Scripts arrive with M3 (core follow-up F8)");
@@ -2149,7 +2322,30 @@ impl App {
                     self.toast(Level::Warn, "ca.export is not on this bus");
                 }
             }
-            "browser" => self.mode = Mode::Browser,
+            "browser" => out.extend(self.update(Action::OpenBrowser)),
+            // The browser view's keys (`keys::browser`): prompts open only
+            // when the bus can take the call; the panel says so otherwise.
+            "browser-url-prompt" => {
+                if self.has_tool("browser.navigate") {
+                    self.open_prompt(PromptKind::BrowserUrl);
+                    self.prompt = self.browser.url.clone();
+                } else {
+                    self.browser_call("browser.navigate", Value::Null, &mut out);
+                }
+            }
+            "browser-eval-prompt" => {
+                if self.has_tool("browser.eval") {
+                    self.open_prompt(PromptKind::BrowserEval);
+                } else {
+                    self.browser_call("browser.eval", Value::Null, &mut out);
+                }
+            }
+            "browser-dom" => {
+                self.browser_call("browser.get_dom", json!({}), &mut out);
+            }
+            "browser-screenshot" => {
+                self.browser_call("browser.screenshot", json!({}), &mut out);
+            }
             "curl" => match ComposeForm::from_curl(line) {
                 Some(f) => {
                     self.compose = f;
@@ -2404,6 +2600,10 @@ impl App {
                         Level::Info,
                         format!("Scope + {}", value.as_str().unwrap_or("?")),
                     ),
+                    n if n.starts_with("browser.") => {
+                        self.browser_settled();
+                        self.on_browser_ok(n, &value, &mut out);
+                    }
                     _ => {
                         let text = match &value {
                             Value::String(s) => s.clone(),
@@ -2416,11 +2616,95 @@ impl App {
                 }
                 out.push(BusRequest::Refresh);
             }
-            BusEvent::Toast(level, text) => self.toast(level, text),
+            BusEvent::Toast(level, text) => {
+                // The bus task reports a failed call as an error toast with
+                // the tool's message, and a tool it lacks as a warning
+                // naming it. While a `browser.*` call is in flight those are
+                // its answer, and the panel must show them (§2.10(c)), not
+                // only the status line.
+                let browser_failure = self.browser.inflight > 0
+                    && (level == Level::Error
+                        || (level == Level::Warn && text.starts_with("browser.")));
+                if browser_failure {
+                    self.browser_settled();
+                    self.browser.error = Some(text.clone());
+                }
+                self.toast(level, text);
+            }
             // An F4 push: whatever it says, the list is stale; poll now.
             BusEvent::Notification(_) => out.push(BusRequest::Refresh),
         }
         out
+    }
+
+    /// A `browser.*` call answered: fill the view. A navigate re-reads the
+    /// page (DOM and screenshot) when the bus offers those calls, keeping the
+    /// last ones on screen until the new ones land (§2.8: no layout shift).
+    fn on_browser_ok(&mut self, name: &str, value: &Value, out: &mut Vec<BusRequest>) {
+        match name {
+            "browser.navigate" => {
+                let url = value
+                    .get("final_url")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| self.browser.pending_url.take());
+                if let Some(url) = url {
+                    self.browser.url = url;
+                }
+                let status = value
+                    .get("status")
+                    .and_then(Value::as_u64)
+                    .map_or(String::new(), |s| format!(" ({s})"));
+                self.toast(
+                    Level::Info,
+                    format!("navigated: {}{status}", self.browser.url),
+                );
+                let mut asked = false;
+                if self.has_tool("browser.get_dom") {
+                    asked |= self.browser_call("browser.get_dom", json!({}), out);
+                }
+                if self.has_tool("browser.screenshot") {
+                    asked |= self.browser_call("browser.screenshot", json!({}), out);
+                }
+                if asked {
+                    self.browser.busy = Some("loading the page");
+                }
+            }
+            "browser.get_dom" => {
+                let html = match value {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                self.browser.dom_outline = crate::ui::browser::outline(&html);
+                self.browser.dom_cursor = self
+                    .browser
+                    .dom_cursor
+                    .min(self.browser.dom_outline.len().saturating_sub(1));
+                self.browser.dom = Some(html);
+            }
+            "browser.screenshot" => match value.as_str().and_then(crate::base64::decode) {
+                Some(bytes) if !bytes.is_empty() => {
+                    let n = bytes.len();
+                    self.browser.screenshot = Some(
+                        crate::viewers::image::dimensions(&bytes)
+                            .map_or((0, 0, "image", n), |(w, h, f)| (w, h, f, n)),
+                    );
+                    self.browser.screenshot_png = Some(bytes);
+                }
+                _ => {
+                    self.browser.error =
+                        Some("browser.screenshot: the result is not image bytes".into());
+                }
+            },
+            "browser.eval" => {
+                self.browser.last_eval = Some(match value {
+                    Value::String(s) => s.clone(),
+                    Value::Null => "null".into(),
+                    other => other.to_string(),
+                });
+            }
+            _ => self.toast(Level::Info, format!("{name}: ok")),
+        }
     }
 }
 
@@ -2454,7 +2738,7 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("ca", "CA panel: status, export, install, uninstall"),
     (
         "browser",
-        "Browser view (not built yet): the :browser.* commands",
+        "Browser view: URL, DOM outline, screenshot; navigate and eval",
     ),
     ("layout h|v", "Inspector below or right"),
     ("split", "Split view (not built in this pass)"),

@@ -68,8 +68,9 @@ Degradations, by design (§2.10(c)): no inline images — image bodies show
 `[image W×H type · o to open]` and `o` writes the bytes to a private temp
 file and opens it with the desktop (`open` / `xdg-open`); kitty/sixel
 graphics only if the terminal advertises them. No browser viewport: the
-Browser sidebar item opens a panel that says the view is not built yet and
-lists the `:browser.*` commands. Diff is unified when the response pane is
+Browser view shows the URL, the DOM as a text outline and the last screenshot
+as a placeholder (`o` opens it); navigate, eval, screenshot and DOM refresh
+still work (see **Browser** below). Diff is unified when the response pane is
 narrower than 120 cells and side by side when it is ≥ 120 cells. Split view:
 not built in this pass (`:split` says so; it would need ≥ 160 columns). No
 drag-and-drop (`:import <path>`); clipboard via OSC 52 where allowed; mouse
@@ -131,8 +132,26 @@ screenshot · `Esc`/`q` back.
 **CA** (`:ca`): `e` export (asks `[pem|der] [path]`) · `i` install · `u`
 uninstall (both confirmed with `y/N` first) · `Esc`/`q` back.
 
-**Browser** (`:browser` or the sidebar item): read-only; `:` for the
-`browser.*` commands · `Esc`/`q` back.
+**Browser** (`:browser`, the sidebar item, or `]` onto it): the embedded
+browser (obscura) over the six `browser.*` commands, degraded as §2.10(c)
+says — no viewport. Line 1 is the URL (a dash until you navigate; the bus has
+no "where are you" call); then `[screenshot W×H PNG · N KB · o to open]` or
+`[no screenshot yet · s]`; then the DOM outline — one indented `tag#id.class`
+line per element, `script`/`style` bodies skipped, the first 200 elements,
+with the cursor's path (`html › body › h1#title`) in its header; then the
+last `eval` result; then `live viewport and tabs need core follow-up F14`.
+Keys: `g` URL prompt, prefilled with the current URL (`browser.navigate`,
+then the DOM and screenshot are re-read) · `e` expression prompt
+(`browser.eval`; the argument name follows the tool's schema) · `d` re-read
+the DOM (`browser.get_dom`) · `s` screenshot (`browser.screenshot`) · `o`
+write the screenshot to a private temp file and open it · `↑`/`k`, `↓`/`j`,
+`PgUp`/`PgDn`, `Home`/`End` walk the outline · `:` palette · `Esc`/`q` back.
+Opening the view asks for the DOM and a screenshot once. While a call is in
+flight the panel says so (`⟳ navigating…`); when one fails — a bus with the
+tools but no engine, or a bus without `browser.*` at all — the error is shown
+in the panel, not only as a toast. `:browser.navigate url=…` from anywhere
+feeds the same view. Flows the browser makes appear in the list with client
+`obscura`.
 
 ## `:` commands
 
@@ -156,7 +175,7 @@ uninstall (both confirmed with `y/N` first) · `Esc`/`q` back.
 | `agent all\|readonly\|paused` | Set the agent policy |
 | `agent` | Open the agent panel and activity log |
 | `ca` | CA panel: `ca.status` facts, export, install, uninstall |
-| `browser` | Browser view (not built yet): the `:browser.*` commands |
+| `browser` | Browser view: URL, DOM outline, screenshot; navigate and eval |
 | `layout h\|v` | Inspector below or right |
 | `split` | Split view — not built in this pass |
 | `export` | Export flows — needs F10 |
@@ -233,7 +252,7 @@ never hidden and never fails silently. Against today's core that is:
 | F10 | `session.save/load`, `flow.export`, `flow.import` | `:export`, `:import`, Saved sessions |
 | F12 | `scope.remove` | `d` in the scope panel, `:scope rm` |
 | F13 | `poc.list` | findings export |
-| F14 | `browser.tabs`, `browser.screencast` | a live browser viewport (the browser *panel* is a TUI build item, see below) |
+| F14 | `browser.tabs`, `browser.screencast` | a live browser viewport and the tab count in the sidebar (the Browser view itself is built; see **Browser** above) |
 
 Confirmations are **local** until F1: `ca.install` and `ca.uninstall` (the
 `CONFIRM_TOOLS` list) ask for `y/N` in the TUI before anything is sent, because
@@ -241,14 +260,14 @@ the bus has no `confirm` on the wire yet and the TUI's server identity is
 `Frontend::Mcp`; `dry_run=true` skips the prompt. The fixture already contains
 the F-tools in their proposed shape, so the screens can be built and tested
 before the core has them. Sidebar items whose feature is further out carry
-their label (`F10` saved sessions, `not built yet` browser view, `M3` scripts).
+their label (`F10` saved sessions, `M3` scripts); the Browser item's count is
+the open tab count, a dash until F14 (`browser.tabs`).
 
 ## Not in this pass
 
 TUI-side features from the foundation's catalog that are not built yet (no
 core dependency; build-or-descope is Matt's call):
 
-- the browser view (URL · DOM outline · last-screenshot placeholder; navigate/eval) — the panel says so and lists `:browser.*`
 - split view (two lists side by side ≥ 160 columns) — `:split` says so
 - saved filters by name; match highlighting in body viewers; the sidebar quick filter
 - compose templates Multipart and WebSocket (`:compose ws` names F9); edit templates

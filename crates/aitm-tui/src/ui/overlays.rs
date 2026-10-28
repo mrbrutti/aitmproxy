@@ -16,7 +16,8 @@ use crate::ui::centered;
 use crate::ui::text::{cells, fit, truncate};
 use crate::viewers;
 
-fn boxed(theme: &Theme, title: &str, area: Rect, buf: &mut Buffer) -> Rect {
+/// A bordered, titled panel filling `area`; returns the drawable inside.
+pub(crate) fn boxed(theme: &Theme, title: &str, area: Rect, buf: &mut Buffer) -> Rect {
     Clear.render(area, buf);
     buf.set_style(area, theme.surface());
     let block = Block::default()
@@ -31,7 +32,8 @@ fn boxed(theme: &Theme, title: &str, area: Rect, buf: &mut Buffer) -> Rect {
     inner
 }
 
-fn lines_into(buf: &mut Buffer, area: Rect, lines: &[Line<'_>], scroll: usize) {
+/// Draw `lines[scroll..]` top-down into `area`, as many as fit.
+pub(crate) fn lines_into(buf: &mut Buffer, area: Rect, lines: &[Line<'_>], scroll: usize) {
     for (k, line) in lines
         .iter()
         .skip(scroll)
@@ -501,52 +503,6 @@ pub fn findings(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         theme.text_tertiary(),
     ));
     lines_into(buf, detail, &d, 0);
-}
-
-/// The browser view is not built in this pass (§2.7 "Browser view": URL +
-/// DOM outline + last-screenshot placeholder). The panel says so and lists
-/// the `browser.*` commands the bus does offer, so the operator can still
-/// drive the embedded browser from the palette.
-pub fn browser(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    let inner = boxed(theme, "Browser — not built yet", area, buf);
-    let mut lines = vec![
-        Line::styled(
-            " The browser view (URL · DOM outline · last-screenshot placeholder) is not built in this pass.",
-            theme.text_secondary(),
-        ),
-        Line::styled(
-            " Until it is, drive the embedded browser from the palette with these commands:",
-            theme.text_secondary(),
-        ),
-        Line::raw(""),
-    ];
-    let mut tools: Vec<_> = app
-        .tools
-        .iter()
-        .filter(|t| t.name.starts_with("browser."))
-        .collect();
-    tools.sort_by(|a, b| a.name.cmp(&b.name));
-    if tools.is_empty() {
-        lines.push(Line::styled(
-            "   (this bus offers no browser.* tools)",
-            theme.text_tertiary(),
-        ));
-    }
-    for t in tools {
-        lines.push(Line::from(vec![
-            Span::styled(format!("   :{:<20}", t.name), theme.accent()),
-            Span::styled(
-                truncate(&t.description, usize::from(inner.width).saturating_sub(26)),
-                theme.text_secondary(),
-            ),
-        ]));
-    }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        " e.g. :browser.navigate url=https://example.test · Esc back",
-        theme.text_tertiary(),
-    ));
-    lines_into(buf, inner, &lines, 0);
 }
 
 /// The CA panel (§3.6): the facts `ca.status` reports, and the three

@@ -32,6 +32,14 @@ pub struct Fixture {
     pub tools: Vec<Value>,
     pub flows: Vec<Value>,
     pub findings: Vec<Value>,
+    /// The embedded browser's page (`browser` key): its outer HTML and a PNG
+    /// screenshot as base64. Empty when the document has no `browser`
+    /// section; every `browser.*` call then fails like a proxy without an
+    /// engine would.
+    pub browser_dom: String,
+    pub browser_screenshot: String,
+    /// The last `browser.navigate` URL.
+    pub browser_url: String,
     next_id: u64,
 }
 
@@ -93,6 +101,17 @@ impl Fixture {
             tools: arr("tools"),
             flows,
             findings: arr("findings"),
+            browser_dom: v
+                .pointer("/browser/dom")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            browser_screenshot: v
+                .pointer("/browser/screenshot_png_base64")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            browser_url: String::new(),
             next_id,
         })
     }
@@ -189,6 +208,16 @@ impl Fixture {
             }
         }
         d
+    }
+
+    /// The `<title>` of the fixture page, for `browser.eval document.title`.
+    fn browser_title(&self) -> String {
+        let dom = &self.browser_dom;
+        let Some(start) = dom.find("<title>") else {
+            return String::new();
+        };
+        let body = &dom[start + "<title>".len()..];
+        body[..body.find("</title>").unwrap_or(body.len())].to_string()
     }
 
     fn new_id(&mut self) -> String {
@@ -426,9 +455,35 @@ impl Fixture {
             "ca.status" => Ok(
                 json!({"path": "~/.aitm/ca.crt", "fingerprint_sha256": "3A:F1:…:9C", "installed": false, "platform": "fixture"}),
             ),
-            n if n.starts_with("browser.") => {
+            n if n.starts_with("browser.") && self.browser_dom.is_empty() => {
                 Err("fixture has no browser engine; run against a live proxy".into())
             }
+            // The six `browser.*` commands, shaped as `aitm-browser` answers
+            // them: navigate → `{final_url, status}`, screenshot → PNG bytes
+            // (base64 on the wire), eval → any value, get_dom → outer HTML.
+            "browser.navigate" => {
+                let url = args
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing `url`".to_string())?;
+                self.browser_url = url.to_string();
+                Ok(json!({"final_url": url, "status": 200}))
+            }
+            "browser.click" | "browser.type" => Ok(Value::Null),
+            "browser.screenshot" => Ok(Value::String(self.browser_screenshot.clone())),
+            "browser.eval" => {
+                let expr = args
+                    .get("expr")
+                    .or_else(|| args.get("expression"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing `expr`".to_string())?;
+                Ok(Value::String(match expr {
+                    "document.title" => self.browser_title(),
+                    "location.href" => self.browser_url.clone(),
+                    _ => "42".to_string(),
+                }))
+            }
+            "browser.get_dom" => Ok(Value::String(self.browser_dom.clone())),
             n if n.starts_with("ca.") => Err("CA changes are not simulated by the fixture".into()),
             other => Err(format!("fixture does not implement `{other}`")),
         }
@@ -623,11 +678,25 @@ mod tests {
         assert_eq!(id, "f55");
         let err = c.call("nope", json!({})).await.unwrap_err();
         assert!(matches!(err, BusError::Rpc { code: -32602, .. }));
-        let err = c
+        // Task 10: the fixture has a browser; navigate answers in the
+        // core's shape, eval reads the page title, screenshot is a PNG.
+        let nav = c
             .call("browser.navigate", json!({"url":"https://x"}))
             .await
-            .unwrap_err();
-        assert!(matches!(err, BusError::Tool(_)));
+            .unwrap();
+        assert_eq!(nav, json!({"final_url": "https://x", "status": 200}));
+        let title = c
+            .call("browser.eval", json!({"expr":"document.title"}))
+            .await
+            .unwrap();
+        assert_eq!(title, "Shop — staging");
+        let shot = c.call("browser.screenshot", json!({})).await.unwrap();
+        let png = crate::base64::decode(shot.as_str().unwrap()).unwrap();
+        assert_eq!(png.len(), 70);
+        assert!(png.starts_with(b"\x89PNG"));
+        // A tool error still surfaces as `BusError::Tool`.
+        let err = c.call("ca.install", json!({})).await.unwrap_err();
+        assert!(matches!(err, BusError::Tool(m) if m.contains("not simulated")));
     }
 
     #[tokio::test]

@@ -321,7 +321,14 @@ pub fn status(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut 
             ("u", "uninstall"),
             ("Esc", "back"),
         ],
-        Mode::Browser => vec![(":", "browser.* commands"), ("Esc", "back")],
+        Mode::Browser => vec![
+            ("g", "url"),
+            ("d", "dom"),
+            ("s", "shot"),
+            ("e", "eval"),
+            ("o", "open"),
+            ("Esc", "back"),
+        ],
         _ => vec![("Esc", "back")],
     };
     let hint_line = |hints: &[(&str, &str)]| -> Line<'static> {
@@ -453,6 +460,14 @@ pub fn prompt(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             "[pem|der] [path] · blank = defaults · ⏎ export (ca.export)",
         ),
         PromptKind::Confirm => ("confirm:", "y runs it · n / Esc cancels"),
+        PromptKind::BrowserUrl => (
+            "url:",
+            "http(s) URL for the embedded browser · ⏎ go (browser.navigate) · Esc",
+        ),
+        PromptKind::BrowserEval => (
+            "eval:",
+            "JavaScript expression · ⏎ run (browser.eval) · Esc",
+        ),
     };
     let text = match (kind, &app.confirm) {
         (PromptKind::Confirm, Some(c)) => {

@@ -19,6 +19,11 @@
       { "at": "11:05:30.111", "origin": "mcp", "command": "scope.add", "args": { "host": "telemetry.vendor-analytics.example" }, "result": "refused: agent cannot widen scope" }
     ]
   },
+  "browser": {
+    "$description": "What the embedded browser (obscura) has loaded: browser.get_dom returns `dom`, browser.screenshot the PNG below (1×1, 70 bytes), browser.eval document.title the page title. A fixture without this key answers every browser.* call with 'fixture has no browser engine'.",
+    "dom": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Shop — staging</title><script src=\"/app.js\"></script></head><body><h1 id=\"title\">Shop — staging</h1><p class=\"lead\">Welcome back. <a class=\"link\" href=\"/account\">Your account</a></p><img id=\"hero\" src=\"/img/hero.png\" alt=\"\"><script>window.__state = {\"cart\": \"<b>3</b>\"};</script></body></html>",
+    "screenshot_png_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+  },
   "tools": [
     { "name": "flow.list", "description": "List captured flow ids, oldest first.", "inputSchema": { "type": "object", "properties": {} } },
     { "name": "flow.get", "description": "Summarize one captured flow: kind, request line, status, state.", "inputSchema": { "type": "object", "properties": { "id": { "type": "string", "description": "The flow to summarize." } }, "required": ["id"] } },
@@ -36,7 +41,7 @@
     { "name": "browser.click", "description": "Click a CSS selector in the embedded browser.", "inputSchema": { "type": "object", "properties": { "selector": { "type": "string" } }, "required": ["selector"] } },
     { "name": "browser.type", "description": "Type into a CSS selector.", "inputSchema": { "type": "object", "properties": { "selector": { "type": "string" }, "text": { "type": "string" } }, "required": ["selector", "text"] } },
     { "name": "browser.screenshot", "description": "Capture the viewport as PNG bytes.", "inputSchema": { "type": "object", "properties": {} } },
-    { "name": "browser.eval", "description": "Evaluate JavaScript in the page.", "inputSchema": { "type": "object", "properties": { "expression": { "type": "string" } }, "required": ["expression"] } },
+    { "name": "browser.eval", "description": "Evaluate JavaScript in the page.", "inputSchema": { "type": "object", "properties": { "expr": { "type": "string", "description": "JavaScript expression." } }, "required": ["expr"] } },
     { "name": "browser.get_dom", "description": "Return the page's DOM as text.", "inputSchema": { "type": "object", "properties": {} } },
     { "name": "poc.build", "description": "Build a parameterized reproducible PoC (YAML) from a captured flow.", "inputSchema": { "type": "object", "properties": { "flow_id": { "type": "string", "description": "The captured flow to reproduce." }, "name": { "type": "string", "description": "Human title for the finding." }, "param": { "type": "string", "description": "The reflected query parameter to parameterize." } }, "required": ["flow_id"] } },
     { "name": "poc.run", "description": "Run a reproducible PoC (YAML) with no agent and emit the three artifacts.", "inputSchema": { "type": "object", "properties": { "poc_path": { "type": "string", "description": "Path to the PoC YAML file to execute." }, "target": { "type": "string", "description": "Base URL bound to the `target` variable." }, "vars": { "type": "object", "description": "Additional variable bindings." } }, "required": ["poc_path"] } },
