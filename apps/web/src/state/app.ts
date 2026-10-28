@@ -363,7 +363,8 @@ export function createAppStore(bus: BusClient) {
             .then((list) => setProxy('activity', list.map((a) => ({ ...a, seq: ++activitySeq }))))
             .catch(() => {}),
         );
-      if (has('flow.intercept')) jobs.push(bus.call<boolean>('flow.intercept').then((a) => setProxy('armed', !!a)).catch(() => {}));
+      // No read for the intercept state exists: `flow.intercept {}` ARMS (enabled defaults to
+      // true), so the armed flag comes only from notifications/aitm/state and our own calls.
       if (has('proxy.status'))
         jobs.push(
           bus

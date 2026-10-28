@@ -132,6 +132,18 @@ async fn main() -> anyhow::Result<()> {
                     web::INSECURE_BIND_ENV
                 );
             }
+            // The proxy and the browser's proxy port bind later in the select; a shared
+            // address would surface as a bare "address in use" there, so name it here.
+            for (what, addr) in [
+                ("proxy listen", cfg.listen),
+                ("browser.proxy_addr", cfg.browser.proxy_addr),
+            ] {
+                anyhow::ensure!(
+                    settings.listen != addr,
+                    "web UI --listen {} collides with {what} ({addr}); pick another port",
+                    settings.listen
+                );
+            }
             let listener = TcpListener::bind(settings.listen).await?;
             let url = web::ui_url(listener.local_addr()?, &settings.token);
             info!(url = %url, "web UI listening");

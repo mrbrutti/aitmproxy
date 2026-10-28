@@ -101,7 +101,11 @@ export const Toolbar: Component = () => {
       <div class={css.listen} role="status" aria-live="polite">
         <StatusDot hue={dotHue()} />
         <span>
-          <b>aitmproxy</b> · {app.proxy.listening ? 'listening' : 'paused'} <b class={css.mono}>{app.proxy.address || '—'}</b>
+          <b>aitmproxy</b> · {app.proxy.listening ? 'listening' : 'paused'}
+          <Show when={app.proxy.address}>
+            {' '}
+            <b class={css.mono}>{app.proxy.address}</b>
+          </Show>
           <Show when={app.proxy.protocol}> · {app.proxy.protocol}</Show>
           <Show when={app.proxy.armed}> · intercept armed</Show>
         </span>

@@ -23,7 +23,9 @@ use aitm_mcp::McpServer;
 pub use http::{router, serve, serve_until};
 
 /// Default bind address for `aitm web`.
-pub const DEFAULT_LISTEN: &str = "127.0.0.1:8081";
+/// 8080 is the proxy and 8081 the embedded browser's dedicated proxy port
+/// (`BrowserConfig::proxy_addr`), so the web UI takes the next one.
+pub const DEFAULT_LISTEN: &str = "127.0.0.1:8082";
 /// Overrides the default bind address when `--listen` is absent.
 pub const LISTEN_ENV: &str = "AITM_WEB_LISTEN";
 /// Supplies the token when `--token` is absent.
@@ -39,7 +41,7 @@ Run the proxy (as `aitm` does) and also serve the web operator UI.
 
 Options:
   --listen <addr>   Bind address for the UI and its /bus bridge
-                    [default: 127.0.0.1:8081; env: AITM_WEB_LISTEN]
+                    [default: 127.0.0.1:8082; env: AITM_WEB_LISTEN]
   --token <token>   Bridge token the UI must present as its first message
                     [default: generated; env: AITM_WEB_TOKEN]
   --no-open         Do not open a browser (accepted; nothing is opened yet)

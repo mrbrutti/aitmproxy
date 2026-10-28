@@ -3,8 +3,8 @@ import { defineConfig } from 'vite';
 import solid from 'vite-plugin-solid';
 
 // `aitm web` serves dist/ and the /bus WebSocket bridge on one origin. In dev, Vite
-// proxies /bus to a running `aitm web` (AITM_WEB, default 127.0.0.1:8081).
-const bus = process.env.AITM_WEB ?? 'http://127.0.0.1:8081';
+// proxies /bus to a running `aitm web` (AITM_WEB, default 127.0.0.1:8082).
+const bus = process.env.AITM_WEB ?? 'http://127.0.0.1:8082';
 
 export default defineConfig({
   plugins: [solid()],

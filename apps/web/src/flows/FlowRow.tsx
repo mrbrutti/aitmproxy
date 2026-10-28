@@ -69,10 +69,13 @@ export const FlowRow: Component<FlowRowProps> = (props) => {
       </span>
       <Show when={show('client')}>
         <span class={`${css.cell} ${css.client}`} role="gridcell" title={f().client.addr ?? f().client.name}>
-          <span class={css.appdot} aria-hidden="true">
-            {f().client.name.slice(0, 1)}
-          </span>
-          <span class={css.clientName}>{f().client.name}</span>
+          {/* Until the core resolves peer → process (F5) the client is unknown: a dash, no disc. */}
+          <Show when={f().client.id !== 'unknown'} fallback={<span class={css.clientName}>—</span>}>
+            <span class={css.appdot} aria-hidden="true">
+              {f().client.name.slice(0, 1)}
+            </span>
+            <span class={css.clientName}>{f().client.name}</span>
+          </Show>
         </span>
       </Show>
       <Show when={show('method')}>
