@@ -1,6 +1,10 @@
 # aitmproxy Milestone 5 — raw L4 / packet MITM design
 
-**Status:** draft
+**Status:** approved (2026-10-28 by Matt) for the original scope — **amended
+2026-10-28** with the send-and-receive (`sr`) primitive and the "same loop as
+HTTP/S + WS, at L4" fuzzing / memory-safety framing (per Matt's follow-ups). These
+amendments and **Open Question 5** (in-path L4 interception: in M5 or deferred?)
+are pending Matt's confirmation before stage 3 (the plan).
 **Research inputs:** `docs/research/08-l4-packet-rust.md` (L4 crate/privilege/OS
 research — note its provenance caveat: registry versions are second-hand and must
 be re-checked with `cargo info` before building), `docs/research/03-rust-proxy-stack.md`,
@@ -24,6 +28,21 @@ exploits maliciously, and the entire M5 design exists to make the most powerful
 capability in the tool **structurally impossible to aim at anything the operator
 has not explicitly authorized**.
 
+**In one line: the same loop aitmproxy already runs at HTTP/S and WebSocket —
+capture, inspect, mutate, replay/send, observe the response, reproduce — brought
+down to the raw packet layer.** Where the HTTP layer sends a request and shows the
+response (`request.send` / `flow.replay`), L4 crafts a packet for **any protocol**
+and sends it to **see what comes back — a response, a wrong response, or nothing
+at all** (scapy's `sr`/`sr1`). That makes M5 a **fuzzing + MITM hybrid aimed at
+memory-safety and robustness vulnerabilities** in authorized **data-plane
+targets** — a router, switch, or firewall's packet path; an nginx or other
+server's TCP/IP stack. The operator (or agent) sends crafted/malformed stimuli and
+watches the reply: an unexpected reply, or **silence where the target was
+answering a moment ago, is a candidate crash to reproduce**. Per the tool/agent
+split, *strategy* (what to mutate, when to re-probe liveness, how to triage) lives
+in the agent or a Rhai script; the **tool** provides the deterministic,
+guard-bounded machinery (craft, send, send-and-receive, capture, reproduce).
+
 L4 is reachable from the same places everything else is — the command bus, MCP,
 and the M3 Rhai scripting tier — and its flows are first-class and queryable, so
 an operator can run L7 and L4 tests against the same target through one tool. The
@@ -38,34 +57,49 @@ out-of-scope target is refused by construction.
   packet crafting + guard-gated injection**, added as new crates/plugins only —
   **no behavioral or structural edits to `aitm-core`** (see Constraints and Open
   Question 1 for the single, optional, pre-blessed additive enum variant).
+- **The L4 analog of the L7 active loop:** a guarded **send-and-receive** primitive
+  (`l4.send_recv`, scapy `sr`/`sr1`) that injects a crafted packet for **any
+  protocol** and returns the **correlated response — or a typed "no response /
+  other"** — so an operator can send a stimulus and see what the target does. This
+  is the heart of the fuzzing / memory-safety-hunting use.
 - An **extended, deny-by-default authorization model for L4**: scope expressed as
   CIDR + port-range + interface + direction + capability (capture vs inject) +
   per-entry injection-rate cap, enforced at one choke point. An out-of-scope or
   unauthorized packet action is refused with a typed error, observably in tests.
-- **L4 flows first-class**: captured and injected packets are recorded as
-  queryable L4 flows, reachable over the command bus, MCP, and Rhai exactly like
-  HTTP/WS flows.
+- **L4 flows first-class**: captured, injected, and stimulus/response packets are
+  recorded as queryable L4 flows, reachable over the command bus, MCP, and Rhai
+  exactly like HTTP/WS flows.
 - **L4 verbs in the M3 Rhai tier**, injected as sandboxed host functions that
   route through the same L4 guard — a script cannot exceed scope, rate, or size.
 - **Fail-closed privilege handling**: L4 is opt-in and disabled by default;
   without the required OS privilege every L4 command returns a typed
   "unavailable" error instead of crashing.
 - A self-contained, deterministic **exit test**: craft → inject on an
-  explicitly-scoped loopback interface → capture observes the injected packet,
-  plus a suite proving the guard is airtight.
+  explicitly-scoped loopback interface → capture observes the injected packet, and
+  a scoped-loopback **send-and-receive** returns a response (and a typed
+  no-response on silence), plus a suite proving the guard is airtight.
 
 ## Non-goals
 
-- **No transparent / in-path L4 interception in M5.** TPROXY/nfqueue-style
-  interception that presents connection-like byte streams to the acceptor is a
-  *separate future mode* that would use the `ProtocolModule::spawn` seam; M5 is
-  raw capture + craft + inject only, which is command-driven (see Design).
+- **No transparent / in-path L4 interception in M5 (see Open Question 5).**
+  Parking a *live, in-flight* packet to mutate-and-forward it — the direct analog
+  of `flow.intercept` / `flow.mutate` on a live connection — requires a
+  TPROXY/nfqueue-style in-path position that presents connection-like byte streams
+  to the acceptor (the `ProtocolModule::spawn` seam). M5 instead delivers the
+  active/stimulus side of the same loop: capture, craft, inject, **send-and-receive**,
+  and reproduce. Whether to pull in-path interception into M5 is Open Question 5
+  (recommended: keep it the deferred mode).
 - **No L7 stream reassembly** from captured packets (no TCP-stream reconstruction
   into HTTP flows) in M5.
 - **No native PoC step type for L4.** L4 reproduction inside a PoC is expressible
   through the existing PoC `script` step calling `l4.*` verbs; a first-class `L4`
   `Step` variant is a deferred, additive `aitm-poc` change (not an `aitm-core`
   change) and is out of M5 scope.
+- **No automated fuzzing/crash-triage engine in the tool.** The tool provides the
+  primitives (craft, inject, send-and-receive, capture) and the raw signal
+  (response / wrong response / no response); the *mutation and triage strategy*
+  lives in the agent or a Rhai script (tool/agent split), the same way discovery
+  intelligence lives in the agent for L7.
 - **No new remote/authenticated transport.** L4 is driven over the existing MCP
   (stdio / loopback-token) and CLI surfaces.
 - **No privilege-escalation or OS-trust machinery.** M5 documents the least
@@ -76,11 +110,16 @@ out-of-scope target is refused by construction.
 
 - **An unbounded packet-flooding primitive.** A capability that could emit
   high-volume uncontrolled traffic — i.e. a denial-of-service tool — is a design
-  failure. Rate caps, bounded per-call counts, and deny-by-default scope must make
-  uncontrolled sending impossible, not merely discouraged.
+  failure. The purpose is to find a crash with **bounded, controlled** traffic and
+  reproduce it, not to flood. Rate caps, bounded per-call counts, and
+  deny-by-default scope must make uncontrolled sending impossible, not merely
+  discouraged.
+- **Weaponizing a crash.** A discovered crash/hang is a **finding to reproduce**
+  for the authorized operator (via the PoC/script path), never an exploit the tool
+  develops or delivers.
 - **Any path by which a raw-packet action reaches an out-of-scope, private, or
-  non-consented destination.** If injection or capture can touch something the
-  operator did not explicitly scope, the guard has failed by design.
+  non-consented destination.** If injection, send-and-receive, or capture can touch
+  something the operator did not explicitly scope, the guard has failed by design.
 - **A guard that can be bypassed.** If any code path writes to the wire without
   passing the single guarded choke point, the design has failed.
 - **Editing `aitm-core` to add L4.** If adding L4 forces changes to core logic,
@@ -125,11 +164,11 @@ out-of-scope target is refused by construction.
 
 ### Where L4 sits — the seam call (Architect's call)
 
-Raw capture and raw injection are **command-driven, not acceptor-driven**. A NIC
-sniffer and a packet sender are not connections the core acceptor hands off via
-`NextLayerHint`, so `ProtocolModule::spawn(io: ByteStream, …)` — which is shaped
-for a duplex byte stream the acceptor already owns — is the wrong driver for raw
-L4 (research note 08 reaches the same conclusion). Therefore:
+Raw capture, injection, and send-and-receive are **command-driven, not
+acceptor-driven**. A NIC sniffer and a packet sender are not connections the core
+acceptor hands off via `NextLayerHint`, so `ProtocolModule::spawn(io: ByteStream,
+…)` — which is shaped for a duplex byte stream the acceptor already owns — is the
+wrong driver for raw L4 (research note 08 reaches the same conclusion). Therefore:
 
 - **`aitm-proto-l4` rides the `Plugin` + `Command` seams.** `L4Module` implements
   `Plugin`; its `load(&mut Registry)` registers the `l4.*` commands and options.
@@ -137,7 +176,8 @@ L4 (research note 08 reaches the same conclusion). Therefore:
   `Plugin` and `Command` traits already accept new implementors in new crates.
 - **The `ProtocolModule` seam stays reserved** for the *future* transparent /
   in-path L4 interception mode (TPROXY/nfqueue), which genuinely does present
-  connection-like byte streams. M5 does not build it.
+  connection-like byte streams — the mode that would add live packet
+  intercept/mutate/forward (Open Question 5). M5 does not build it.
 
 ```mermaid
 graph TD
@@ -149,7 +189,7 @@ graph TD
   subgraph Core["aitm-core (UNCHANGED)"]
     REG["command Registry"]
     PLUGSEAM["Plugin + Command seam"]
-    PROTOSEAM["ProtocolModule seam (reserved for future in-path L4)"]
+    PROTOSEAM["ProtocolModule seam (reserved for future in-path L4 — Open Q5)"]
     CGUARD["ScopeRateGuard (host:port + rps)"]
   end
   subgraph L4["aitm-proto-l4 (NEW crate)"]
@@ -157,6 +197,7 @@ graph TD
     LGUARD["L4Guard — deny-by-default CIDR/port/iface/dir + rate/size caps + denylist"]
     CRAFT["PacketSpec::build (pure / sans-IO craft)"]
     WIRE["send_on_wire — THE single guarded choke point (pcap L2 inject)"]
+    SR["send_recv — inject + await correlated reply (sr/sr1)"]
     CAP["capture task (pcap/BPF, scope-filtered)"]
     LSTORE["L4FlowStore (l4-owned; Open Q1 = optional unify)"]
   end
@@ -169,7 +210,10 @@ graph TD
   MOD --> LGUARD
   MOD --> CRAFT
   MOD --> CAP
+  MOD --> SR
   CRAFT --> WIRE
+  SR --> WIRE
+  SR --> CAP
   LGUARD --> WIRE
   WIRE -->|requires L4Permit| LSTORE
   CAP --> LSTORE
@@ -187,8 +231,9 @@ L4 therefore adds its own **deny-by-default** guard, `L4Guard`, living entirely 
 **Invariant — one choke point.** There is exactly one function in the crate that
 writes bytes to the wire, and it takes an `L4Permit` that can only be produced by
 `L4Guard::check`. Crafting produces bytes but cannot send them; only the guarded
-choke point sends. Capture is likewise started only behind `L4Guard::check`. This
-is the structural guarantee behind every anti-goal.
+choke point sends, and **send-and-receive sends through that same choke point**.
+Capture is likewise started only behind `L4Guard::check`. This is the structural
+guarantee behind every anti-goal.
 
 ```rust
 // aitm-proto-l4 — the L4 authorization guard (deny-by-default)
@@ -199,8 +244,8 @@ impl L4Guard {
     pub fn new(cfg: &L4Config) -> Self;
 
     /// The ONLY gate. Called before a capture starts and before any packet is
-    /// written to the wire. Returns a permit (an RAII send/rate budget) or a
-    /// typed refusal. There is no unchecked path.
+    /// written to the wire (inject and send-and-receive alike). Returns a permit
+    /// (an RAII send/rate budget) or a typed refusal. There is no unchecked path.
     pub fn check(&self, action: L4Action, target: &L4Target) -> Result<L4Permit, L4GuardError>;
 
     pub fn add_scope(&self, entry: L4ScopeEntry) -> Result<L4ScopeId, L4GuardError>;
@@ -208,6 +253,8 @@ impl L4Guard {
     pub fn list_scope(&self) -> Vec<L4ScopeEntry>;
 }
 
+/// SendRecv needs BOTH Inject (to send) and Capture (to receive the reply); the
+/// command checks the guard for each capability.
 pub enum L4Action { Capture, Inject }
 
 /// What a check is about — resolved from a capture bind or the packet being sent.
@@ -288,10 +335,13 @@ Crafting is **pure and sans-IO**: it turns a layered, human-readable spec into
 on-wire bytes with no privilege and no guard (building bytes is not sending them).
 It follows scapy's model — stack layers, auto-complete omitted fields, allow any
 field to be overridden, **including with deliberately malformed values** (the
-point of robustness fuzzing). Because malformed IP headers require L2 injection on
-Linux (research note 08), the model reaches down to the Ethernet layer.
-`etherparse` builds/validates well-formed frames; `pnet_packet` is used where a
-field must be set verbatim to a malformed value.
+point of robustness fuzzing). **Any protocol** is expressible: known layers carry
+named fields, and the `Raw(Vec<u8>)` layer (plus `L4Proto::Other(u8)` /
+`Ipv4Spec.protocol`) lets an author place arbitrary bytes for a protocol the model
+doesn't name. Because malformed IP headers require L2 injection on Linux (research
+note 08), the model reaches down to the Ethernet layer. `etherparse`
+builds/validates well-formed frames; `pnet_packet` is used where a field must be
+set verbatim to a malformed value.
 
 ```rust
 // aitm-proto-l4 — layered packet spec (pure / sans-IO)
@@ -305,7 +355,7 @@ pub enum Layer {
     Tcp(TcpSpec),
     Udp(UdpSpec),
     Icmp(IcmpSpec),
-    Raw(Vec<u8>),                     // arbitrary payload / trailing bytes
+    Raw(Vec<u8>),                     // arbitrary payload / any unnamed protocol
 }
 
 // Every *Spec field is an Option: None == auto-complete (scapy-style — checksum,
@@ -343,26 +393,72 @@ The same `PacketSpec` is the **YAML** form used in PoCs/scripts and the shape th
 Rhai `l4.*` verbs build, so one layered model is learned once (consistent with the
 PoC/plugin human-friendly rule).
 
+### Send-and-receive — the L4 analog of replay/`request.send`
+
+`l4.send_recv` is the stimulus/response primitive that makes M5 "the same loop at
+L4": it injects a crafted packet and **waits for the correlated reply within a
+timeout**, returning a typed outcome. It is the scapy `sr`/`sr1` verb, and the
+basis of the fuzzing / memory-safety-hunting loop.
+
+```rust
+// aitm-proto-l4 — send-and-receive (scapy sr/sr1); sends through the same choke point
+
+pub struct SendRecvSpec {
+    pub packet: PacketSpec,           // the stimulus (any protocol, possibly malformed)
+    pub dst: IpAddr,
+    pub dst_port: Option<u16>,
+    pub interface: String,
+    pub timeout: Duration,            // how long to wait for a reply
+    pub expect: ReplyMatch,           // how a reply is correlated to this stimulus
+}
+
+/// How an inbound packet is matched as "the reply" to the stimulus. Default
+/// correlates on the 5-tuple (src/dst addr+port, proto) reversed.
+pub enum ReplyMatch { FiveTuple, FromHost(IpAddr), Any }
+
+pub enum SendRecvOutcome {
+    Response(L4Packet),               // one correlated reply
+    Responses(Vec<L4Packet>),         // several (e.g. fragments / multiple replies)
+    Other(L4Packet),                  // a non-matching / error reply (ICMP unreachable, RST, …)
+    NoResponse { waited: Duration },  // silence within the timeout — the candidate crash/hang signal
+}
+```
+
+- **Both capabilities required.** `l4.send_recv` needs `Inject` (to send) **and**
+  `Capture` (to receive) in the L4 scope for the target; the command checks the
+  guard for each. The stimulus is sent through the one guarded choke point.
+- **The fuzzing / memory-safety loop (strategy = agent/script):** the agent or a
+  Rhai script mutates a `PacketSpec`, calls `l4.send_recv`, and reads the outcome.
+  A `Response`/`Other` is normal behaviour to record; a **`NoResponse` where the
+  target was responding a moment before is the candidate crash** — the agent
+  confirms it (re-probe liveness with a known-good stimulus) and reproduces it via
+  the PoC `script` path. The tool emits the raw signal; it does not decide what is
+  a bug (tool/agent split).
+- **Bounded, not a flood.** Every `l4.send_recv` is one guarded, rate-capped send;
+  a fuzzing run is many such calls, each individually bounded — there is no uncapped
+  path. Both the stimulus and any reply are recorded (linked) in the `L4Flow`.
+
 ### The flow model
 
 L4 flows mirror `WsFlow` (a session holding an ordered packet vector with an
-`injected` flag). **Default (zero `aitm-core` edits):** they live in an
-`aitm-proto-l4`-owned `L4FlowStore`, exposed via `l4.flow.*` commands so they are
-first-class over MCP/CLI/Rhai. Open Question 1 offers the optional promotion to a
-unified `Flow::L4` variant.
+`injected` flag). A send-and-receive records the stimulus and its reply as two
+linked packets in the same flow. **Default (zero `aitm-core` edits):** flows live
+in an `aitm-proto-l4`-owned `L4FlowStore`, exposed via `l4.flow.*` commands so they
+are first-class over MCP/CLI/Rhai. Open Question 1 offers the optional promotion to
+a unified `Flow::L4` variant.
 
 ```rust
 // aitm-proto-l4 — l4-owned flow model (see Open Question 1 for optional unify)
 
 pub struct L4Flow {
     pub id: L4FlowId,
-    pub kind: L4FlowKind,             // Capture session | Craft/inject session
+    pub kind: L4FlowKind,             // Capture session | Craft/inject session | SendRecv
     pub bind: L4Bind,                 // interface + derived filter, or target
     pub packets: Vec<L4Packet>,       // newest == packets.last()
     pub metadata: L4Meta,
 }
 
-pub enum L4FlowKind { Capture, Craft }
+pub enum L4FlowKind { Capture, Craft, SendRecv }
 pub struct L4FlowId(/* uuid-backed */);
 
 pub struct L4Packet {
@@ -370,7 +466,7 @@ pub struct L4Packet {
     pub timestamp: SystemTime,
     pub bytes: Vec<u8>,
     pub decoded: PacketSummary,
-    pub injected: bool,               // true iff authored + sent by l4.inject
+    pub injected: bool,               // true iff authored + sent by l4.inject / l4.send_recv
 }
 
 pub struct L4Bind { /* interface, optional scope-derived filter, optional target */ }
@@ -410,6 +506,7 @@ pub struct L4Config {
     pub global_inject_pps: u32,       // tool-wide injection ceiling (0 ⇒ refuse)
     pub max_packet_bytes: usize,      // hard frame-size cap
     pub max_packets_per_call: u32,    // bound on one l4.inject batch
+    pub default_recv_timeout: Duration, // default wait for l4.send_recv
     pub dangerous_dst_override: bool, // default false; the denylist cannot be globally disabled
 }
 
@@ -433,26 +530,28 @@ command is transport-specific.
 | `l4.interfaces` | read-only | List capture-capable interfaces (so an operator/agent can choose one). |
 | `l4.scope.add` / `l4.scope.remove` / `l4.scope.list` | n/a (manages scope) | Manage the deny-by-default L4 scope (CIDR, ports, interface, direction, capability, rate). |
 | `l4.capture.start` / `l4.capture.stop` / `l4.capture.status` | **yes** (`Capture`) | Start/stop a scoped, filtered capture on an interface; returns an `L4Flow` id. |
-| `l4.flow.list` / `l4.flow.get` | read-only | Query L4 flows and their packets. |
+| `l4.flow.list` / `l4.flow.get` | read-only | Query L4 flows and their packets (stimulus + reply linked). |
 | `l4.craft` | no (pure) | Build a `PacketSpec` into bytes + summary for review; no privilege, no wire access. |
 | `l4.inject` | **yes** (`Inject`) | The gated send: inject a crafted spec (or raw bytes) to a target, as a bounded, rate-capped batch; every packet passes the choke point. |
+| `l4.send_recv` | **yes** (`Inject` + `Capture`) | Scapy `sr`/`sr1`: inject a stimulus and return the correlated `SendRecvOutcome` (response / other / none) within a timeout — the L4 analog of `request.send`. |
 
-There is **no** `l4.fuzz` verb: the tool owns the deterministic send (`l4.inject`,
-each call guard-checked, rate-capped, count-bounded); the *mutation strategy*
-(which fields to mutate, what to try next) is the agent's or a Rhai script's job.
-This keeps the tool/agent split and means a fuzzing loop is many guarded
-`l4.inject` calls, each individually bounded — there is no uncapped batch path.
+There is **no** `l4.fuzz` verb: the tool owns the deterministic send and
+send-and-receive (`l4.inject` / `l4.send_recv`, each guard-checked, rate-capped,
+count-bounded); the *mutation and triage strategy* (what to mutate, when to
+re-probe liveness, what counts as a crash) is the agent's or a Rhai script's job.
+A fuzzing run is many guarded calls, each individually bounded — there is no
+uncapped batch path and no in-tool crash-triage engine (tool/agent split).
 
 ### M3 Rhai scripting tier integration
 
 L4 verbs are injected into the Rhai sandbox as host functions under an `l4.*`
-namespace (`l4.craft`, `l4.inject`, `l4.capture_start`, `l4.flow_get`, …), exactly
-as `http.*` / `browser.*` are injected today. Every host function that touches the
-wire routes through the **same** `L4Guard` choke point, so a script is bound by the
-same deny-by-default scope, rate, size, and denylist rules — it cannot reach an
-out-of-scope or dangerous destination the guard would refuse. The L4 host
-functions are present only when the L4 module is enabled; the script-facing surface
-is versioned like the rest of the scripting contract.
+namespace (`l4.craft`, `l4.inject`, `l4.send_recv`, `l4.capture_start`,
+`l4.flow_get`, …), exactly as `http.*` / `browser.*` are injected today. Every host
+function that touches the wire routes through the **same** `L4Guard` choke point,
+so a script is bound by the same deny-by-default scope, rate, size, and denylist
+rules — it cannot reach an out-of-scope or dangerous destination the guard would
+refuse. The L4 host functions are present only when the L4 module is enabled; the
+script-facing surface is versioned like the rest of the scripting contract.
 
 ### Privilege and cross-platform behaviour (fail-closed)
 
@@ -472,7 +571,9 @@ is versioned like the rest of the scripting contract.
   TCP handshakes may draw a host-kernel RST) are surfaced as typed results or
   documented test preconditions, never silent.
 
-## Data-flow walkthrough — craft → inject → capture (the exit path)
+## Data-flow walkthroughs
+
+### Craft → inject → capture (the baseline exit path)
 
 ```mermaid
 flowchart TD
@@ -485,9 +586,23 @@ flowchart TD
   F --> G["l4.flow.get → operator/agent/MCP sees the injected packet captured — round-trip proven"]
 ```
 
+### Send-and-receive (the fuzzing / memory-safety loop)
+
+```mermaid
+flowchart TD
+  S["agent/script mutates a PacketSpec (strategy = agent's)"] --> T["l4.send_recv — L4Guard.check(Inject)+(Capture)"]
+  T -->|refused| RR["typed L4GuardError"]
+  T -->|L4Permit| U["send stimulus via the choke point; await correlated reply (timeout)"]
+  U --> V{"reply?"}
+  V -->|matched| W["SendRecvOutcome::Response/Responses — record, continue"]
+  V -->|non-matching| X["SendRecvOutcome::Other (RST / ICMP error) — record, continue"]
+  V -->|silence| Y["SendRecvOutcome::NoResponse — candidate crash/hang"]
+  Y --> Z["agent re-probes liveness with a known-good stimulus; if still silent → reproduce via PoC script path"]
+```
+
 ## Worked examples (normative usage shapes)
 
-**1 — Scoped loopback round-trip (the exit test, over the CLI).** All on an
+**1 — Scoped loopback round-trip (baseline exit test, over the CLI).** All on an
 explicitly-scoped loopback interface, so it is self-contained and authorized:
 
 ```bash
@@ -514,7 +629,17 @@ layers:
   - raw: "probe"
 ```
 
-**3 — A refused action (deny-by-default proven).** With no scope entry for it,
+**3 — Send-and-receive (stimulus → response, the L7-parity verb).** Against a
+scoped local responder; returns the reply or a typed no-response:
+
+```bash
+aitm l4 send-recv --spec ./udp-probe.yaml --dst 127.0.0.1 --port 5353 \
+  --interface lo0 --timeout 1s
+# -> SendRecvOutcome::Response { ... }       (a reply came back)
+# -> SendRecvOutcome::NoResponse { waited }  (silence — candidate crash to confirm)
+```
+
+**4 — A refused action (deny-by-default proven).** With no scope entry for it,
 injection to a metadata address is refused by the guard, not attempted:
 
 ```bash
@@ -522,14 +647,14 @@ aitm l4 inject --spec ./udp-probe.yaml --dst 169.254.169.254 --port 80 --count 1
 # -> error: DangerousDestinationBlocked("169.254.169.254 not in L4 scope")
 ```
 
-**4 — Rhai, guard-bound.** A script drives a bounded loop; every `l4.inject` call
-passes the same guard, so the script cannot exceed scope or rate:
+**5 — Rhai, guard-bound fuzzing loop.** Strategy in the script; each call guarded:
 
 ```rust
-// each l4.inject is individually guard-checked, rate-capped, count-bounded
-for i in 0..10 {
-    let spec = l4::craft_udp("127.0.0.1", 9, mutate(i));  // strategy = script's job
-    l4::inject(spec, "127.0.0.1", 9, 1);                  // send = tool's job, guarded
+// each l4.send_recv is individually guard-checked, rate-capped, and bounded
+for i in 0..50 {
+    let spec = l4::craft_udp("127.0.0.1", 5353, mutate(i));   // strategy = script's job
+    let out = l4::send_recv(spec, "127.0.0.1", 5353, "lo0", 1000);
+    if out.is_no_response() { record_candidate(i); }          // triage = script's job
 }
 ```
 
@@ -539,14 +664,15 @@ Each is observable via `cargo test` (integration tests may use a scoped loopback
 interface; privilege-gated tests are marked and skip cleanly where privilege is
 absent, asserting `L4Unavailable` rather than failing).
 
-1. **M5-AC1 — Deny-by-default:** with an empty L4 scope, `l4.inject` and
-   `l4.capture.start` are refused with `OutOfL4Scope`; no packet is written and no
-   capture starts.
+1. **M5-AC1 — Deny-by-default:** with an empty L4 scope, `l4.inject`,
+   `l4.send_recv`, and `l4.capture.start` are refused with `OutOfL4Scope`; no packet
+   is written and no capture starts.
 2. **M5-AC2 — Out-of-scope inject refused:** with a scope entry for CIDR *A*,
    injecting to an address outside *A* returns `OutOfL4Scope`; injecting to an
    in-scope address (loopback) succeeds.
 3. **M5-AC3 — Capability split:** with only a `Capture` entry for a target,
    `l4.inject` to it returns `CapabilityNotGranted(Inject)`; capture still works.
+   `l4.send_recv` with only one of the two capabilities is refused.
 4. **M5-AC4 — Dangerous-destination denylist:** injecting to `169.254.169.254`
    (or loopback/link-local/multicast) without an explicit scope entry returns
    `DangerousDestinationBlocked`; an explicit scope entry is the only way through.
@@ -566,39 +692,49 @@ absent, asserting `L4Unavailable` rather than failing).
 9. **M5-AC9 — Round-trip (headline):** on an explicitly-scoped loopback interface,
    craft → inject → capture results in an `L4Flow` containing the injected packet
    with `injected = true`, retrievable via `l4.flow.get`.
-10. **M5-AC10 — Fail-closed without privilege:** with `enabled = true` but no
+10. **M5-AC10 — Send-and-receive returns a response:** against a scoped local
+    responder on loopback, `l4.send_recv` returns `SendRecvOutcome::Response` (or
+    `Responses`) carrying the reply, recorded linked to the stimulus in the `L4Flow`.
+11. **M5-AC11 — Send-and-receive reports silence:** with no responder (or a dropped
+    stimulus), `l4.send_recv` returns `SendRecvOutcome::NoResponse { waited }` after
+    the timeout — never hangs — giving the candidate-crash signal.
+12. **M5-AC12 — Fail-closed without privilege:** with `enabled = true` but no
     privilege, guarded `l4.*` commands return `L4Unavailable` and the proxy does
     not panic; with `enabled = false`, the module is not registered.
-11. **M5-AC11 — Reachable everywhere:** every `l4.*` command appears in MCP
+13. **M5-AC13 — Reachable everywhere:** every `l4.*` command appears in MCP
     `tools/list`, is invocable over the CLI, and (for wire-touching verbs) is
     reachable from a Rhai script — and the Rhai path is refused by the **same**
     guard for an out-of-scope target (asserts the script cannot bypass the guard).
-12. **M5-AC12 — Core untouched:** `git diff --stat` shows **no** changes under
+14. **M5-AC14 — Core untouched:** `git diff --stat` shows **no** changes under
     `aitm-core/` (default design), satisfying the roadmap gate "core untouched."
     If Open Question 1 is accepted, the only core change is the additive
     `Flow::L4`/`Event::L4*` variant with no changed core logic.
-13. **M5-AC13 — No `unsafe`:** `aitm-proto-l4` compiles under the workspace
+15. **M5-AC15 — No `unsafe`:** `aitm-proto-l4` compiles under the workspace
     `forbid(unsafe_code)`; the crate contains no `unsafe` block.
-14. **M5-AC14 — One choke point:** a test (or a documented structural check)
+16. **M5-AC16 — One choke point:** a test (or a documented structural check)
     confirms the only wire-write function requires an `L4Permit`, which only
-    `L4Guard::check` produces — there is no unguarded send path.
+    `L4Guard::check` produces — `l4.inject` and `l4.send_recv` both go through it;
+    there is no unguarded send path.
 
 ## Milestone exit criteria
 
-M5 is done when **all M5-AC1–AC14 are green** — unit **and** functional (the
-AC9 loopback round-trip and the AC1–AC6 guard-airtightness suite driving the real
-commands) — through the full Rust gate
+M5 is done when **all M5-AC1–AC16 are green** — unit **and** functional (the AC9
+loopback round-trip, the AC10/AC11 send-and-receive, and the AC1–AC6
+guard-airtightness suite driving the real commands) — through the full Rust gate
 (`cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`),
 and the stage-6 panel review (security, quality, spec) passes with no open
 findings. The headline functional proof is the scoped-loopback craft → inject →
-capture round-trip plus the guard-refusal suite; the "core untouched" check
-(AC12) and "no unsafe" check (AC13) are hard gates.
+capture round-trip and a scoped-loopback send-and-receive (response + no-response),
+plus the guard-refusal suite; the "core untouched" (AC14) and "no unsafe" (AC15)
+checks are hard gates.
 
 ## Left to the builder
 
 - Exact per-layer field lists in each `*Spec` (the Option-per-field shape is
   fixed; the field set is the builder's), and the `etherparse`-vs-`pnet_packet`
   split per field.
+- The reply-correlation details for `l4.send_recv` within the declared
+  `ReplyMatch` shapes (5-tuple reversal, source-host match).
 - Internal layout of `L4Guard` rate buckets, the capture-task registry, and the
   `L4FlowStore` implementation.
 - The BPF filter string derived from an `L4ScopeEntry`, and interface enumeration
@@ -610,72 +746,91 @@ capture round-trip plus the guard-refusal suite; the "core untouched" check
 
 ## Open questions
 
-Each has a recommended default so Matt can confirm or redirect.
+Questions 1–4 are **decided** per Matt's approval of the recommended defaults
+(2026-10-28). Question 5 is **open** (raised by Matt's "same as HTTP/S + WS"
+follow-up) and should be answered before the plan.
 
-1. **L4 flows in the core `Flow` enum, or an l4-owned store?** The brief asks for
-   both "L4 flows in the flow store" and "no `aitm-core` edits," which collide
-   because `Flow`/`Event` are defined in the core. **Recommended default:** ship
-   M5 with the **l4-owned `L4FlowStore`** (zero core edits; flows first-class over
-   MCP/CLI/Rhai via `l4.flow.*`), *and* treat promotion to a single additive
-   `Flow::L4(L4Flow)` + `Event::L4*` variant (behind `#[non_exhaustive]`, the one
-   change the platform spec pre-blessed, touching no core logic) as a blessed
-   follow-up if you want one unified store. This keeps the hard "no core edits"
-   constraint satisfied now while leaving the unified path open.
-2. **Capture-promiscuity posture.** M5 scopes and filters capture (stronger than
-   L7 passive capture) so out-of-scope packets never surface. **Recommended
-   default:** yes — keep capture deny-by-default and scope-filtered. Confirm you
-   don't want a looser "capture everything on the interface" mode (I recommend
-   against it).
-3. **Privilege ceiling + privilege separation.** **Recommended default:** require
-   least privilege (`setcap cap_net_raw` on Linux; `/dev/bpf` group on macOS),
-   discourage running as root, and **defer** a privilege-separated helper
-   (dumpcap-style) to a later hardening pass — documented in M5, not built.
-   Confirm, or ask for the separated helper in M5.
-4. **Default caps.** **Recommended default:** conservative, all configurable —
-   `global_inject_pps` low (e.g. tens of pps), small `burst`, modest
-   `max_packets_per_call`, `max_packet_bytes` at a normal MTU, and `pps == 0`
-   meaning *refuse* (matching `per_host_rps`). Confirm the posture (exact numbers
-   are the builder's within "conservative").
+1. **DECIDED — l4-owned flow store.** Ship M5 with the l4-owned `L4FlowStore`
+   (zero `aitm-core` edits; flows first-class over MCP/CLI/Rhai via `l4.flow.*`).
+   Promotion to a single additive `Flow::L4` + `Event::L4*` variant (behind
+   `#[non_exhaustive]`, the one change the platform spec pre-blessed) is a blessed
+   follow-up if a unified store is later wanted.
+2. **DECIDED — capture stays scope-filtered.** Capture is deny-by-default and
+   bound to a scope-derived filter; there is no looser "capture everything on the
+   interface" mode.
+3. **DECIDED — least privilege, helper deferred.** Require `setcap cap_net_raw`
+   (Linux) / `/dev/bpf` group (macOS), discourage running as root, document the
+   minimal grant; a privilege-separated helper (dumpcap-style) is deferred.
+4. **DECIDED — conservative, configurable caps.** `global_inject_pps` low (tens of
+   pps), small `burst`, modest `max_packets_per_call`, `max_packet_bytes` at a
+   normal MTU, `pps == 0` ⇒ refuse. Exact numbers are the builder's within
+   "conservative."
+5. **OPEN — in-path L4 interception in M5, or deferred?** Matt asked for "the same
+   we do with HTTP/S + WS, at L4." M5 as specced delivers the **active** half of
+   that loop (capture, craft, inject, send-and-receive, reproduce). The **in-path**
+   half — parking a *live, in-flight* packet to mutate-and-forward it, the direct
+   analog of `flow.intercept` / `flow.mutate` — needs a transparent TPROXY
+   (Linux) / `pf` divert (macOS) / nfqueue position and the `ProtocolModule::spawn`
+   seam, and is a materially larger build (kernel hooks, per-OS routing setup,
+   held-packet lifecycle). **Recommended default:** keep in-path interception the
+   **deferred** transparent-L4 mode (its own later milestone), and ship M5 as the
+   active capture/craft/send-receive/reproduce fuzzing-and-MITM capability — which
+   already covers fuzzing an nginx/router/switch and reproducing a finding.
+   Confirm, or tell me to pull in-path interception into M5 (the plan grows
+   accordingly).
 
 ## Summary
 
-M5 adds `aitm-proto-l4`: raw-packet **capture** and scapy-style **craft + guarded
-inject** for **authorized** L4 robustness testing, reachable over the command bus,
-MCP, and the M3 Rhai tier, with L4 flows first-class. It rides the existing
-`Plugin` + `Command` seams (raw send is command-driven, so `ProtocolModule::spawn`
-— stream-shaped — stays reserved for a future in-path mode), so it needs **no
-`aitm-core` edits** (the one optional, pre-blessed additive enum variant is Open
-Question 1). The design's core is an **airtight, deny-by-default authorization
+M5 adds `aitm-proto-l4`: raw-packet **capture**, scapy-style **craft + guarded
+inject**, and a guarded **send-and-receive** (`sr`/`sr1`) — the same
+capture/inspect/mutate/replay/observe/reproduce loop aitmproxy runs at HTTP/S and
+WebSocket, now at the packet layer, for **authorized** fuzzing and memory-safety /
+robustness testing of data-plane targets (routers, switches, nginx). It is
+reachable over the command bus, MCP, and the M3 Rhai tier, with L4 flows
+first-class. It rides the existing `Plugin` + `Command` seams (raw send is
+command-driven, so `ProtocolModule::spawn` — stream-shaped — stays reserved for a
+future in-path mode; see Open Question 5), so it needs **no `aitm-core` edits** (the
+one optional, pre-blessed additive enum variant is Open Question 1, decided as the
+l4-owned store). The design's core is an **airtight, deny-by-default authorization
 model**: a new in-crate `L4Guard` extends scope from host:port to CIDR + port +
 interface + direction + capability + rate, composes with the core guard for
 defense in depth, blocks dangerous destinations by default, and funnels **every**
-wire write through a **single guarded choke point** that requires a permit only the
-guard can mint — making an out-of-scope, private, or unbounded packet action
-impossible by construction. Crafting is pure/sans-IO and human-readable (YAML +
-Rhai), privilege is opt-in and fail-closed, `forbid(unsafe)` holds via
+wire write — inject and send-and-receive alike — through a **single guarded choke
+point** that requires a permit only the guard can mint, making an out-of-scope,
+private, or unbounded packet action impossible by construction. Crafting is
+pure/sans-IO and human-readable (YAML + Rhai), any protocol is expressible, the
+stimulus→response→`NoResponse` loop is the memory-safety signal (strategy in the
+agent/script), privilege is opt-in and fail-closed, `forbid(unsafe)` holds via
 `pcap`/`pnet_packet`/`etherparse`, and the exit test is a self-contained,
 authorized scoped-loopback craft → inject → capture round-trip plus a
-guard-refusal suite.
+send-and-receive and a guard-refusal suite.
 
 ### Architect's calls (for Matt to check while reading)
 
-1. **Seam:** L4 rides the `Plugin` + `Command` seams (command-driven), not
-   `ProtocolModule::spawn` (stream-shaped); `ProtocolModule` stays reserved for a
-   future in-path interception mode.
-2. **No core edits by default:** l4-owned `L4FlowStore` keeps `aitm-core`
+1. **L7 parity, active half:** M5 is "the same loop at L4" for capture / craft /
+   inject / send-and-receive / reproduce; live in-path intercept/mutate/forward is
+   Open Question 5 (recommended deferred to the transparent-L4 mode).
+2. **Send-and-receive:** `l4.send_recv` (scapy `sr`/`sr1`) returns a typed
+   `SendRecvOutcome` (Response / Responses / Other / NoResponse); `NoResponse` is
+   the candidate-crash signal; it sends through the one guarded choke point and
+   needs both `Inject` and `Capture` scope.
+3. **Seam:** L4 rides the `Plugin` + `Command` seams (command-driven), not
+   `ProtocolModule::spawn` (stream-shaped).
+4. **No core edits by default:** l4-owned `L4FlowStore` keeps `aitm-core`
    untouched; the unified `Flow::L4` variant is the optional follow-up (Open Q1).
-3. **Authorization:** a new in-crate deny-by-default `L4Guard` (CIDR/port/iface/
+5. **Authorization:** a new in-crate deny-by-default `L4Guard` (CIDR/port/iface/
    direction/capability/rate + dangerous-dst denylist), composed with the core
    guard; capture and inject are separate capabilities; capture is scope-filtered.
-4. **One choke point:** a single wire-write function gated by an `L4Permit` only
-   `L4Guard::check` can mint — the structural anti-bypass guarantee.
-5. **Craft:** pure/sans-IO scapy-style layered `PacketSpec` (Option-per-field,
+6. **One choke point:** a single wire-write function gated by an `L4Permit` only
+   `L4Guard::check` can mint — inject and send-and-receive both go through it.
+7. **Craft:** pure/sans-IO scapy-style layered `PacketSpec` (Option-per-field,
    auto-complete or verbatim/malformed), reaching to L2 (needed for malformed IP on
-   Linux), human-readable in YAML and Rhai.
-6. **Backend:** `pcap` (capture + L2 inject) + `pnet_packet` (malformed fields) +
+   Linux), **any protocol** via the `Raw` layer, human-readable in YAML and Rhai.
+8. **Backend:** `pcap` (capture + L2 inject) + `pnet_packet` (malformed fields) +
    `etherparse` (well-formed build/decode), preserving `forbid(unsafe)`; `pnet`
    `datalink` as the documented fallback.
-7. **Privilege:** opt-in (`enabled=false` default), fail-closed (`L4Unavailable`),
+9. **Privilege:** opt-in (`enabled=false` default), fail-closed (`L4Unavailable`),
    least-privilege documented; privilege-separated helper deferred.
-8. **No `l4.fuzz` verb:** mutation strategy is the agent's/script's; the tool
-   offers only the bounded, guarded `l4.inject` — no uncapped batch path exists.
+10. **No `l4.fuzz`/no in-tool triage:** mutation and triage strategy is the
+    agent's/script's; the tool offers only bounded, guarded `l4.inject` /
+    `l4.send_recv` — no uncapped batch path exists.
