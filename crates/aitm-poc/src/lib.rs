@@ -26,7 +26,7 @@ pub use model::{
 };
 pub use runner::{
     AssertionOutcome, PocRunCommand, PocRunResult, PocRunner, ScriptStepCtx, ScriptStepError,
-    ScriptStepExecutor, ScriptVerdict, StdPocRunner, StepOutcome,
+    ScriptStepExecutor, ScriptVerdict, ScriptedPocRunCommand, StdPocRunner, StepOutcome,
 };
 pub use schema::{validate, PocError};
 pub use template::{PocTemplate, Template, VarBindings};

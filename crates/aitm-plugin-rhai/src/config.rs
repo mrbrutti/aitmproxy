@@ -22,6 +22,25 @@ pub struct RhaiConfig {
     pub strict: bool,
 }
 
+impl Default for RhaiConfig {
+    /// No scripts, the shipped sandbox limits, a two-second hook budget, and
+    /// skip-and-log compile errors — the posture an operator gets by writing
+    /// nothing (spec §2 rule 5, §8).
+    fn default() -> Self {
+        Self {
+            scripts: Vec::new(),
+            limits: RhaiLimits::default(),
+            hook_timeout: DEFAULT_HOOK_TIMEOUT,
+            hot_reload: false,
+            strict: false,
+        }
+    }
+}
+
+/// The wall-clock budget one hook gets before it is aborted; the figure the
+/// spec's pinned timeout message quotes.
+pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// One declared script and the options handed to it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScriptEntry {

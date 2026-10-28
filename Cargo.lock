@@ -35,6 +35,7 @@ dependencies = [
  "aitm-core",
  "aitm-mcp",
  "aitm-plugin",
+ "aitm-plugin-rhai",
  "aitm-plugins",
  "aitm-poc",
  "aitm-proto-http",

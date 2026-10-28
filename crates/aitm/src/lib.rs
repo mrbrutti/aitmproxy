@@ -7,4 +7,5 @@
 pub mod config_file;
 pub mod env;
 pub mod render;
+pub mod scripts;
 pub mod wire;

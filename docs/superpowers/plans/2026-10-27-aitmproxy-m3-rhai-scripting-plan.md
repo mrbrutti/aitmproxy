@@ -346,7 +346,7 @@ Longest sequential chain: 1 → 3 → 6 → 7 → 8 → 9 → 10 → 15 (8 tasks
   impl aitm_poc::ScriptStepExecutor for RhaiScriptExecutor { fn run_step(&self, step, ctx) -> Result<aitm_poc::ScriptVerdict, aitm_poc::ScriptStepError>; }
   #[derive(Clone)] pub struct ScriptVars(Arc<Mutex<VarBindings>>);  // vars.get / vars.set
   ```
-- **Change:** compile `step.script` (cache by content hash — builder's call), build a `Scope` with a `ScriptVars` handle over `ctx.vars` and the host namespaces registered, run `eval_ast_with_scope` under `block_in_place` + budget. Interpret the returned value: the globals `pass`/`fail` map to `ScriptVerdict::Pass`/`Fail`, falling off the end → `Neutral`; a sandbox/timeout/op error → `ScriptStepError`. `vars.set` writes back through the shared `Arc<Mutex<VarBindings>>`; `browser.screenshot()` output paths append to `ctx.artifacts`.
+- **Change:** compile `step.script` (cache by content hash — builder's call), build a `Scope` with a `ScriptVars` handle over `ctx.vars` and the host namespaces registered, run `eval_ast_with_scope` under `block_in_place` + budget. Interpret the returned value: the globals `pass`/`fail` map to `ScriptVerdict::Pass`/`Fail`, falling off the end → `Neutral`; a sandbox/timeout/op error → `ScriptStepError`. `vars.set` writes back through the shared `Arc<Mutex<VarBindings>>`. `browser.screenshot()` returns the screenshot **bytes** (a `Blob`) to the script; in M3 a *script step* does **not** auto-promote a screenshot to a PoC artifact file — the declarative `screenshot` step is what produces the artifact. (OQ8/Task-15 resolution, option C, Matt via orchestrator 2026-10-27: script-step screenshot-artifact promotion is a deferred follow-up; `ScriptStepCtx` and `host_net` are not changed for it. `ctx.artifacts` stays in the seam, unpopulated from scripts in M3.)
 - **Test** (`multi_thread`, stub services):
   - `poc_step.rs::reads_and_sets_vars`: a step `vars.set("x", "1"); return pass;` → `ScriptVerdict::Pass` and `ctx.vars` has `x == "1"`.
   - `poc_step.rs::guarded_call_enforced`: a step calling `http.send` to an out-of-scope host (stub guard refuses) with no `try`/`catch` → `ScriptStepError` (guarded, not a panic).
@@ -380,3 +380,16 @@ Kept by the main session during stage 6. One row per finding.
 ## Shipped
 
 What merged, what was cut, follow-ups. Filled at stage 7.
+
+### Deferred follow-ups
+
+- **Script-step screenshot → PoC artifact file.** Task 14 flagged, Task 15
+  resolved as option C (Matt via orchestrator, 2026-10-27): in M3 a PoC `script`
+  step's `browser.screenshot()` returns the screenshot bytes to the script but is
+  **not** auto-promoted to a run-artifact file; the declarative `screenshot` step
+  remains how a PoC produces that artifact. `ScriptStepCtx.artifacts` stays as the
+  seam (unpopulated from scripts in M3). A later milestone can populate it by
+  giving the browser screenshot verb a per-run artifact sink and `ScriptStepCtx`
+  an output directory — deliberately deferred to avoid a late interface change to
+  Task 13's `ScriptStepCtx` and a non-additive edit to Task 7's `host_net.rs` at
+  convergence.

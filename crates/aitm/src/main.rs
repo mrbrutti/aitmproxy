@@ -15,10 +15,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aitm::config_file::Settings;
 use aitm::render::render_cli_value;
-use aitm::wire::{assemble, Assembled, Http1Sender};
+use aitm::scripts::LateHandles;
+use aitm::wire::{assemble_with_scripts, Assembled, Features, Http1Sender, ScriptWiring};
 use aitm::{config_file, env};
-use aitm_core::{BrowserDriver, PipelineClient, ProxyClient};
+use aitm_core::{BrowserDriver, Chain, PipelineClient, Plugin, ProxyClient};
+use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
 use tracing::{info, warn};
 
 /// The config file path when `--config` is not given.
@@ -29,10 +32,60 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let (config_arg, argv) = split_config_arg(std::env::args().skip(1).collect())?;
+    let (script_args, argv) = split_script_args(argv)?;
     let config_path = config_arg.or_else(|| std::env::var_os(CONFIG_ENV).map(PathBuf::from));
-    let mut cfg = config_file::load(config_path.as_deref())?;
+    let Settings {
+        core: mut cfg,
+        rhai: mut rhai_cfg,
+    } = config_file::load_settings(config_path.as_deref())?;
     env::apply(&mut cfg, |k| std::env::var(k).ok());
-    let Assembled { proxy, ca } = assemble(&cfg)?;
+    env::apply_rhai(&mut rhai_cfg, |k| std::env::var(k).ok());
+    // `--script` entries come last, so they take the chain positions after the
+    // config's (spec §8: config entries, then flags).
+    rhai_cfg
+        .scripts
+        .extend(script_args.into_iter().map(ScriptEntry::new));
+
+    // The tier is built before the proxy — a script compiles against the shared
+    // engine, and the engine's host verbs close over these handles — so they are
+    // bound to the proxy's real ones below, before anything is served.
+    let handles = LateHandles::new();
+    let findings = Arc::new(MemoryFindingSink::new());
+    let services = ScriptServices {
+        store: handles.clone(),
+        client: handles.clone(),
+        browser: Some(handles.clone()),
+        guard: handles.clone(),
+        findings,
+        rt: tokio::runtime::Handle::current(),
+    };
+    let strict = rhai_cfg.strict;
+    let tier = aitm_plugin_rhai::wire::build(rhai_cfg, services)?;
+    for err in &tier.errors {
+        warn!(target: "aitm::scripts", "{err}");
+    }
+    if strict && !tier.errors.is_empty() {
+        anyhow::bail!(
+            "{} script(s) failed to load and `rhai.strict` is set",
+            tier.errors.len()
+        );
+    }
+    for plugin in &tier.plugins {
+        info!(target: "aitm::scripts", script = %plugin.name(), "script plugin registered");
+    }
+
+    let Assembled { proxy, ca } = assemble_with_scripts(
+        &cfg,
+        &Features::default(),
+        ScriptWiring {
+            plugins: tier
+                .plugins
+                .into_iter()
+                .map(|p| Box::new(p) as Box<dyn Plugin>)
+                .collect(),
+            executor: Some(tier.executor.clone()),
+        },
+    )?;
 
     // Shared service handles for the frontends and the replay client.
     let registry = proxy.registry_arc();
@@ -43,6 +96,13 @@ async fn main() -> anyhow::Result<()> {
         guard.clone(),
         Arc::new(Http1Sender::new().with_insecure(cfg.ssl_insecure)),
     ));
+
+    // The scripting tier now reaches exactly the proxy's store, client and
+    // guard, and a failed hook's `Event::Error` reaches the chain rather than
+    // only the log.
+    handles.bind_proxy(store.clone(), client.clone(), guard.clone());
+    tier.error_sink
+        .bind(Arc::new(Chain::new(registry.clone(), store.clone())));
 
     if !argv.is_empty() {
         // One-shot CLI dispatch (no browser needed).
@@ -78,6 +138,10 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let browser: Option<Arc<dyn BrowserDriver>> = launched.as_ref().map(|l| l.driver.clone());
+    // `browser.*` in a script reaches the same engine the commands do.
+    if let Some(driver) = browser.clone() {
+        handles.bind_browser(driver);
+    }
 
     let mcp = aitm_mcp::McpServer::new(registry, cfg.mcp.transport.clone())
         .with_ssrf_policy(cfg.browser.ssrf.clone())
@@ -130,6 +194,29 @@ fn split_config_arg(argv: Vec<String>) -> anyhow::Result<(Option<PathBuf>, Vec<S
     Ok((None, std::iter::once(first).chain(rest).collect()))
 }
 
+/// Split every `--script <path>` / `--script=<path>` out of `argv`, keeping the
+/// order they were written: that is the order they take in the chain (spec §8).
+/// Repeatable, and recognised anywhere a subcommand is not, so
+/// `aitm --script a.rhai --script b.rhai` starts the proxy with both.
+fn split_script_args(argv: Vec<String>) -> anyhow::Result<(Vec<PathBuf>, Vec<String>)> {
+    let mut scripts = Vec::new();
+    let mut rest = Vec::new();
+    let mut args = argv.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--script" {
+            let path = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("--script requires a path"))?;
+            scripts.push(PathBuf::from(path));
+        } else if let Some(path) = arg.strip_prefix("--script=") {
+            scripts.push(PathBuf::from(path));
+        } else {
+            rest.push(arg);
+        }
+    }
+    Ok((scripts, rest))
+}
+
 /// Resolves on SIGINT (Ctrl-C) or, on Unix, SIGTERM. A handler that cannot be
 /// installed is logged and never fires, so it cannot end the run by itself.
 async fn shutdown_signal() {
@@ -171,7 +258,7 @@ fn init_tracing() {
 mod tests {
     use std::path::PathBuf;
 
-    use super::split_config_arg;
+    use super::{split_config_arg, split_script_args};
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
@@ -203,5 +290,25 @@ mod tests {
     fn bare_config_flag_without_a_path_is_an_error() {
         let err = split_config_arg(args(&["--config"])).unwrap_err();
         assert_eq!(err.to_string(), "--config requires a path");
+    }
+
+    #[test]
+    fn script_flags_are_collected_in_order_and_stripped() {
+        let (scripts, rest) = split_script_args(args(&[
+            "--script",
+            "a.rhai",
+            "flow",
+            "--script=b.rhai",
+            "list",
+        ]))
+        .unwrap();
+        assert_eq!(scripts, [PathBuf::from("a.rhai"), PathBuf::from("b.rhai")]);
+        assert_eq!(rest, args(&["flow", "list"]), "the subcommand is untouched");
+    }
+
+    #[test]
+    fn bare_script_flag_without_a_path_is_an_error() {
+        let err = split_script_args(args(&["--script"])).unwrap_err();
+        assert_eq!(err.to_string(), "--script requires a path");
     }
 }

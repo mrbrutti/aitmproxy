@@ -827,7 +827,7 @@ pub struct ScriptStepCtx<'a> {
     pub vars: &'a mut VarBindings,                      // read + write; later steps see writes
     pub host: &'a CommandHost<'a>,                      // store / client / browser / guard
     pub step_results: &'a mut BTreeMap<String, StepOutcome>,
-    pub artifacts: &'a mut Vec<PathBuf>,                // screenshots a script takes land here
+    pub artifacts: &'a mut Vec<PathBuf>,                // seam for script-written artifacts (unpopulated in M3; see §10)
 }
 
 pub enum ScriptVerdict { Pass, Fail, Neutral }
@@ -848,8 +848,12 @@ helpers. Nothing else — no filesystem, no OS.
 step's `name` and readable from `success` as `step("name") == "pass"`, matching
 the PoC-language spec's Example 4; falling off the end is `Neutral`; (2)
 variables bound with `vars.set(...)`, visible to later steps; (3) side effects —
-`http.send` calls are captured as ordinary flows and `browser.screenshot()`
-contributes to the same artifact set a declarative `screenshot` step does.
+`http.send` calls are captured as ordinary flows. `browser.screenshot()` returns
+the screenshot **bytes** (a `Blob`) to the script; in M3 a *script step* does
+**not** auto-promote a screenshot to a PoC artifact file — the declarative
+`screenshot` step is what produces the artifact. Script-step screenshot-artifact
+promotion is a deferred follow-up (Task-15 resolution, option C): the `ctx.artifacts`
+seam stays for it, unpopulated from scripts in M3.
 
 **Failure reporting:** a runtime error, sandbox denial, timeout, or operation-limit
 abort records `StepOutcome::Error` for the step, adds a failed `AssertionOutcome`
@@ -1023,7 +1027,7 @@ steps:
 
         // Visit the rendered note and confirm the script ran (SSRF-gated).
         browser.navigate(`${base}/notes`);
-        browser.screenshot();                      // becomes a run artifact
+        browser.screenshot();                      // returns bytes to the script (M3: not auto-saved as a run artifact)
         if browser.evaluate("window.__aitm") == m { return pass; }
         return fail;
 
