@@ -800,10 +800,22 @@ export function createAppStore(bus: BusClient) {
         }),
       buildPoc: (flowId: FlowId, name: string, param?: string) =>
         guarded('build PoC', async () => {
-          const r = await bus.call<{ poc_path: string }>('poc.build', param ? { flow_id: flowId, name, param } : { flow_id: flowId, name });
+          // poc.build returns the YAML text. Until poc.list (F13) exists the panel cannot show
+          // it, so the text is also put on the clipboard.
+          const r = await bus.call<string | { yaml?: string }>('poc.build', param ? { flow_id: flowId, name, param } : { flow_id: flowId, name });
+          const yaml = typeof r === 'string' ? r : (r?.yaml ?? null);
           await refreshSide();
-          setUi('panel', 'findings');
-          return r;
+          const listed = proxy.tools.some((t) => t.name === 'poc.list');
+          if (listed) setUi('panel', 'findings');
+          if (yaml && !listed) {
+            try {
+              await navigator.clipboard.writeText(yaml);
+              notice(`PoC "${name}" built — YAML copied (poc.list will show it here once the core lists runs)`);
+            } catch {
+              notice(`PoC "${name}" built`);
+            }
+          }
+          return yaml;
         }),
       runPoc: (pocPath: string, target?: string, vars?: Record<string, string>) =>
         guarded('run PoC', async () => {

@@ -461,7 +461,8 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
         };
         pocs.unshift(p);
         recordActivity(tool, { flow_id: f.id, name }, 'web');
-        return { poc_path: p.poc_path, id: p.id };
+        // The core returns the YAML text (not a path); listing it afterwards is poc.list (F13).
+        return p.yaml;
       }
       case 'poc.run': {
         const p = pocs.find((x) => x.poc_path === args.poc_path || x.id === args.id);
@@ -512,10 +513,16 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
         return { url: browserUrl, title: 'Shop (staging)' };
       }
       case 'browser.click':
+        if (typeof args.selector !== 'string' && (typeof args.x !== 'number' || typeof args.y !== 'number'))
+          throw new BusError('browser.click needs x and y, or a selector', -32602);
+        recordActivity(tool, args, 'web');
+        return { ok: true };
       case 'browser.type':
+        need(args, 'selector');
         recordActivity(tool, args, 'web');
         return { ok: true };
       case 'browser.eval':
+        need(args, 'expr');
         recordActivity(tool, args, 'web');
         return { result: `"${browserUrl}"` };
       case 'browser.get_dom':
@@ -564,7 +571,8 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
         return { ok: true };
       }
       case 'ca.status':
-        return { installed: true, fingerprint: 'SHA256:9F1C3B…', path: '~/Library/Application Support/aitmproxy/ca.pem', stores: { system: false, user: true, firefox: false } };
+        // The core reports installed/trusted as yes | no | unknown.
+        return { installed: 'yes', trusted: 'yes', fingerprint: 'SHA256:9F1C3B…', path: '~/Library/Application Support/aitmproxy/ca.pem', stores: { system: 'no', user: 'yes', firefox: 'unknown' } };
       case 'ca.export':
         return { pem: '-----BEGIN CERTIFICATE-----\nMIIB…\n-----END CERTIFICATE-----\n' };
       case 'config.get':
@@ -592,9 +600,9 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
     ['scope.remove', 'Withdraw authorisation for a host.', { host: { type: 'string' } }, ['host']],
     ['browser.tabs', 'Open tabs of the embedded browser.', {}],
     ['browser.navigate', 'Navigate the embedded browser.', { url: { type: 'string' } }, ['url']],
-    ['browser.click', 'Click an element by CSS selector.', { selector: { type: 'string' } }, ['selector']],
-    ['browser.type', 'Type into an element.', { selector: { type: 'string' }, text: { type: 'string' } }, ['selector', 'text']],
-    ['browser.eval', 'Evaluate JavaScript in the page.', { script: { type: 'string' } }, ['script']],
+    ['browser.click', 'Click a point (x, y) or an element by CSS selector.', { x: { type: 'number' }, y: { type: 'number' }, selector: { type: 'string' } }],
+    ['browser.type', 'Type into an element; ":focus" addresses the focused one.', { selector: { type: 'string' }, text: { type: 'string' } }, ['selector', 'text']],
+    ['browser.eval', 'Evaluate a JavaScript expression in the page.', { expr: { type: 'string' } }, ['expr']],
     ['browser.get_dom', 'Serialised DOM of the current page.', {}],
     ['browser.screenshot', 'PNG screenshot of the current page.', {}],
     ['poc.list', 'PoC runs and findings.', {}],

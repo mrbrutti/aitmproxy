@@ -211,7 +211,8 @@ export function createBrowserState(app: AppStore) {
 
   async function typeInto(selector: string, text: string): Promise<boolean> {
     try {
-      await app.call('browser.type', { selector, text });
+      // browser.type requires a selector; `:focus` addresses the focused element.
+      await app.call('browser.type', { selector: selector.trim() || ':focus', text });
       void refreshFrame();
       return true;
     } catch (e) {
@@ -228,7 +229,8 @@ export function createBrowserState(app: AppStore) {
     setEvalLog((l) => [...l, { seq, script: s, result: null, error: null }].slice(-EVAL_LOG_MAX));
     const settle = (p: Partial<EvalEntry>) => setEvalLog((l) => l.map((e) => (e.seq === seq ? { ...e, ...p } : e)));
     try {
-      settle({ result: asText(await app.call<unknown>('browser.eval', { script: s })) });
+      // The core's parameter is `expr` (verified against the running core; the foundation text says `script`).
+      settle({ result: asText(await app.call<unknown>('browser.eval', { expr: s })) });
     } catch (e) {
       settle({ error: (e as Error).message });
       fail('eval', e);
