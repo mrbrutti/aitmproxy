@@ -162,6 +162,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aitm-plugin-sessionio"
+version = "0.1.0"
+dependencies = [
+ "aitm-core",
+ "anyhow",
+ "futures",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aitm-plugins"
 version = "0.1.0"
 dependencies = [
