@@ -16,27 +16,36 @@
 //!
 //! `ws.frame` acts on an already-captured, already-parked frame — no new egress
 //! beyond what the flow already carries — so, like editing a parked HTTP request,
-//! it is **not** scope-guarded. (`ws.send` live injection, which *does* egress, is
-//! Task 7.)
+//! it is **not** scope-guarded.
 //!
-//! ## Drop semantics (known limitation — see Task 7)
+//! `ws.send {id, dir, opcode, data}` (Task 7) composes a *new* frame and injects
+//! it onto the live socket. It does egress active traffic, so it first passes
+//! [`ScopeRateGuard::check_active`](aitm_core::ScopeRateGuard::check_active) on
+//! the flow's authority (out of scope → `Err`, surfaced as `isError: true`), then
+//! enqueues the frame onto the flow's channel in the shared
+//! [`InjectRegistry`]. The `aitm-proto-ws` module drains that channel from its
+//! live `select!`, frames the payload towards the side `dir` implies, and appends
+//! a `WsMessage { injected: true }`. The plugin and the module share one
+//! `InjectRegistry` `Arc` (the module gets its handle via
+//! [`WsCtlPlugin::inject_registry`], wired in the binary — Task 14).
 //!
-//! The `aitm-proto-ws` module's frame loop has two post-park outcomes: forward
-//! the (possibly edited) stored frame, or — if the flow is `Killed` — stop. It
-//! exposes no per-frame "skip this one, keep the conversation open" hook, so
-//! `drop` tears the whole conversation down rather than dropping a single frame
-//! and continuing. A true single-frame drop needs an additive hook in
-//! `aitm-proto-ws`'s `handle`, which belongs to Task 7 (the task that already
-//! edits `aitm-proto-ws`); Task 6 keeps its changes to this crate.
+//! ## Single-frame drop
+//!
+//! `ws.frame {action:"drop"}` marks the flow [`InterceptState::Killed`]; Task 7
+//! taught the `aitm-proto-ws` relay loop to read that as "skip forwarding this one
+//! frame but keep the conversation open" (resetting the park state), mirroring the
+//! Rhai `msg.drop()` semantics. `Killed` is only ever set on a WS flow by a frame
+//! drop, so there is no ambiguity with a whole-conversation kill.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use aitm_core::{
-    Command, CommandHost, Event, Flow, FlowCtx, FlowId, InterceptState, ParamDef, ParamSchema,
-    Params, Plugin, Registry, ResumeHandle, TypeDesc, Value, Verdict, WsDir, WsOpcode,
+    Command, CommandHost, Event, Flow, FlowCtx, FlowId, FlowStore, InterceptState, ParamDef,
+    ParamSchema, Params, Plugin, Registry, ResumeHandle, TypeDesc, Value, Verdict, WsDir, WsOpcode,
 };
+use aitm_proto_ws::{InjectFrame, InjectRegistry};
 use aitm_rules::{compile, CompiledRule, HostMatch, MatchCondition, Phase, Rule, UrlMatch};
 
 /// State the plugin (which parks frames on events) shares with its commands
@@ -51,16 +60,28 @@ struct Shared {
     parked: Mutex<HashMap<FlowId, ResumeHandle>>,
 }
 
-/// Registers `ws.intercept` and `ws.frame`; parks matching WS frames while armed.
+/// Registers `ws.intercept`, `ws.frame` and `ws.send`; parks matching WS frames
+/// while armed and injects composed frames onto live sockets.
 pub struct WsCtlPlugin {
     shared: Arc<Shared>,
+    /// Flow → inject sender, shared with the `aitm-proto-ws` module so `ws.send`
+    /// can reach a live conversation's `select!` loop.
+    inject: InjectRegistry,
 }
 
 impl WsCtlPlugin {
     pub fn new() -> Self {
         Self {
             shared: Arc::default(),
+            inject: InjectRegistry::default(),
         }
+    }
+
+    /// A handle to the shared inject registry, to pass to
+    /// [`WsModule::with_inject_registry`](aitm_proto_ws::WsModule::with_inject_registry)
+    /// so the plugin and the live WS module share one channel map.
+    pub fn inject_registry(&self) -> InjectRegistry {
+        self.inject.clone()
     }
 }
 
@@ -81,6 +102,9 @@ impl Plugin for WsCtlPlugin {
         }));
         reg.add_command(Arc::new(WsFrame {
             shared: self.shared.clone(),
+        }));
+        reg.add_command(Arc::new(WsSend {
+            inject: self.inject.clone(),
         }));
     }
 
@@ -335,6 +359,124 @@ fn frame_exists(host: &CommandHost, id: FlowId, index: usize) -> anyhow::Result<
         }
         Some(_) => anyhow::bail!("flow {id} is not a WebSocket flow"),
         None => anyhow::bail!("no flow with id {id}"),
+    }
+}
+
+// --- ws.send -----------------------------------------------------------------
+
+/// `ws.send {id, dir, opcode, data}` → compose a frame and inject it onto a live
+/// WebSocket. Scope-guarded (active egress); enqueues onto the shared registry.
+struct WsSend {
+    inject: InjectRegistry,
+}
+
+impl Command for WsSend {
+    fn name(&self) -> &str {
+        "ws.send"
+    }
+
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "Compose a new WebSocket frame and inject it onto a live conversation. \
+                          Active egress: refused unless the flow's host is in scope."
+                .into(),
+            params: vec![
+                ParamDef {
+                    name: "id".into(),
+                    ty: TypeDesc::FlowId,
+                    required: true,
+                    description: "The live WebSocket flow to inject into.".into(),
+                },
+                ParamDef {
+                    name: "dir".into(),
+                    ty: TypeDesc::Str,
+                    required: true,
+                    description: "c2s (towards the server) or s2c (towards the client).".into(),
+                },
+                ParamDef {
+                    name: "opcode".into(),
+                    ty: TypeDesc::Str,
+                    required: true,
+                    description: "text|binary|ping|pong|close.".into(),
+                },
+                ParamDef {
+                    name: "data".into(),
+                    ty: TypeDesc::Bytes,
+                    required: true,
+                    description: "the frame payload (bytes or a UTF-8 string).".into(),
+                },
+            ],
+            result: TypeDesc::Object(vec![ParamDef {
+                name: "index".into(),
+                ty: TypeDesc::Int,
+                required: true,
+                description: "index of the appended injected WsMessage.".into(),
+            }]),
+        }
+    }
+
+    fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        let id = args.get_flow_id("id")?;
+        let dir = parse_dir(args.get_str("dir")?)?;
+        let opcode = parse_opcode(args.get_str("opcode")?)?;
+        let data = req_bytes(&args, "data")?;
+
+        // Active egress onto a live socket → scope-gated. The permit's RAII slot
+        // is released as the frame is handed off; the gate here is scope.
+        let authority = ws_authority(host.store(), id)?;
+        let _permit = host.guard().check_active(&authority)?;
+
+        // Resolve the live conversation's inject sender.
+        let sender = lock(&self.inject).get(&id).cloned();
+        let Some(sender) = sender else {
+            anyhow::bail!(
+                "flow {id} has no live WebSocket inject channel (closed or never opened)"
+            );
+        };
+
+        // The module appends the injected frame in enqueue order; it will occupy
+        // the position after the frames captured so far.
+        let index = match host.store().get(id) {
+            Some(Flow::WebSocket(w)) => w.messages.len(),
+            Some(_) => anyhow::bail!("flow {id} is not a WebSocket flow"),
+            None => anyhow::bail!("no flow with id {id}"),
+        };
+
+        sender
+            .send(InjectFrame { dir, opcode, data })
+            .map_err(|_| {
+                anyhow::anyhow!("WebSocket flow {id} closed before the frame was injected")
+            })?;
+
+        Ok(Value::Object(
+            [("index".to_string(), Value::Int(index as i64))]
+                .into_iter()
+                .collect(),
+        ))
+    }
+}
+
+/// The authority (`host[:port]`) a WebSocket flow talks to, read from its
+/// handshake `HttpFlow` — the scope subject for `ws.send`.
+fn ws_authority(store: &dyn FlowStore, id: FlowId) -> anyhow::Result<String> {
+    let handshake = match store.get(id) {
+        Some(Flow::WebSocket(w)) => w.handshake,
+        Some(_) => anyhow::bail!("flow {id} is not a WebSocket flow"),
+        None => anyhow::bail!("no flow with id {id}"),
+    };
+    match store.get(handshake) {
+        Some(Flow::Http(h)) => Ok(h.request.authority.clone()),
+        _ => anyhow::bail!("WebSocket flow {id} has no handshake HTTP flow to resolve its host"),
+    }
+}
+
+/// A required byte-string argument, accepting raw bytes or a UTF-8 string.
+fn req_bytes(args: &Params, name: &str) -> anyhow::Result<Vec<u8>> {
+    match args.get(name) {
+        Some(Value::Bytes(b)) => Ok(b.clone()),
+        Some(Value::Str(s)) => Ok(s.clone().into_bytes()),
+        Some(other) => anyhow::bail!("param `{name}` must be bytes or a string, got {other:?}"),
+        None => anyhow::bail!("missing required param `{name}`"),
     }
 }
 
