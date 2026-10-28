@@ -209,11 +209,17 @@ name = "aitm-plugins"
 version = "0.1.0"
 dependencies = [
  "aitm-core",
+ "aitm-proto-http",
  "aitm-rules",
  "anyhow",
  "futures",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
  "time",
  "tokio",
+ "tokio-rustls",
+ "uuid",
 ]
 
 [[package]]
