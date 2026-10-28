@@ -347,13 +347,23 @@ export function createAppStore(bus: BusClient) {
       const has = (n: string) => proxy.tools.some((t) => t.name === n);
       const jobs: Promise<unknown>[] = [];
       if (has('scope.list'))
-        jobs.push(bus.call<ProxyState['scope']>('scope.list').then((s) => setProxy('scope', Array.isArray(s) ? s : [])).catch(() => {}));
+        jobs.push(
+          bus
+            .call<unknown>('scope.list')
+            // The bus returns an array of host strings; fixtures add rate-limit/back-off objects.
+            .then((s) => setProxy('scope', Array.isArray(s) ? s.map((e) => (typeof e === 'string' ? { host: e } : (e as ProxyState['scope'][number]))) : []))
+            .catch(() => {}),
+        );
       if (has('poc.list')) jobs.push(bus.call<PocRun[]>('poc.list').then((p) => setProxy('findings', p)).catch(() => {}));
       if (has('agent.status'))
         jobs.push(
           bus
-            .call<{ policy: AgentPolicy; actions_last_minute: number }>('agent.status')
-            .then((a) => setProxy({ agent: a.policy, agentActionsLastMinute: a.actions_last_minute }))
+            .call<{ policy: AgentPolicy; actions_last_minute: number; log?: AgentNotification[] }>('agent.status')
+            .then((a) => {
+              setProxy({ agent: a.policy, agentActionsLastMinute: a.actions_last_minute });
+              // The activity log rides on agent.status as `log` (no agent.activity command on the bus).
+              if (Array.isArray(a.log) && !has('agent.activity')) setProxy('activity', a.log.map((e) => ({ ...e, seq: ++activitySeq })));
+            })
             .catch(() => {}),
         );
       if (has('agent.activity'))
@@ -368,8 +378,18 @@ export function createAppStore(bus: BusClient) {
       if (has('proxy.status'))
         jobs.push(
           bus
-            .call<{ listening: boolean; address?: string; protocol?: string }>('proxy.status')
-            .then((s) => setProxy({ listening: s.listening, address: s.address ?? proxy.address, protocol: s.protocol ?? proxy.protocol }))
+            .call<{ listening?: boolean | string | null; address?: string | null; capturing?: boolean; paused?: number | boolean; protocol?: string }>('proxy.status')
+            .then((s) =>
+              setProxy({
+                // Landed shape: `listening` is the bound address (string|null) — the core is
+                // moving to `listening: bool` + `address`; `capturing` is the record toggle;
+                // `paused` is a COUNT of intercepted flows. The store's `listening` flag is the
+                // capture state.
+                listening: s.capturing ?? (typeof s.paused === 'boolean' ? !s.paused : proxy.listening),
+                address: (typeof s.listening === 'string' ? s.listening : s.address) ?? proxy.address,
+                protocol: s.protocol ?? proxy.protocol,
+              }),
+            )
             .catch(() => {}),
         );
       await Promise.all(jobs);
@@ -790,7 +810,8 @@ export function createAppStore(bus: BusClient) {
         }),
       mark: (id: FlowId, mark: MarkColor | null) =>
         guarded('mark', async () => {
-          await bus.call('flow.mark', { id, mark });
+          // The bus takes `marks: [str]` and replaces the set; the UI keeps one mark per flow.
+          await bus.call('flow.mark', { id, marks: mark ? [mark] : [] });
           patch(id, { mark });
         }),
       comment: (id: FlowId, text: string) =>

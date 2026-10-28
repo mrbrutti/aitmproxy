@@ -61,11 +61,49 @@ export function pngBlob(base64: string, mime = 'image/png'): Blob {
   return new Blob([bytes as BlobPart], { type: mime });
 }
 
-/** What `poc.artifact` returns (§4.7 / F13): bytes for images, text for YAML. */
+/** A `poc.artifact` result once normalised: the bytes (base64) plus a mime inferred from the path. */
 export interface Artifact {
   mime: string;
   base64?: string;
   text?: string;
+}
+
+const MIME_BY_EXT: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+  yaml: 'text/yaml',
+  yml: 'text/yaml',
+  har: 'application/json',
+  json: 'application/json',
+  txt: 'text/plain',
+};
+
+export function mimeForPath(path: string): string {
+  const ext = path.split('.').pop()?.toLowerCase() ?? '';
+  return MIME_BY_EXT[ext] ?? 'application/octet-stream';
+}
+
+/**
+ * The bus returns `poc.artifact` as bare base64 of the file's bytes (F13); an older fixture shape
+ * was `{mime, base64|text}`. Both become an Artifact; textual types also get `text`.
+ */
+export function toArtifact(raw: unknown, path: string): Artifact {
+  const mime = mimeForPath(path);
+  if (typeof raw === 'string') {
+    const a: Artifact = { mime, base64: raw };
+    if (mime.startsWith('text/') || mime === 'application/json') {
+      try {
+        a.text = new TextDecoder().decode(base64ToBytes(raw));
+      } catch {
+        /* leave undecoded */
+      }
+    }
+    return a;
+  }
+  const r = (raw ?? {}) as Partial<Artifact>;
+  return { mime: r.mime || mime, ...(r.base64 ? { base64: r.base64 } : {}), ...(r.text ? { text: r.text } : {}) };
 }
 
 export function artifactDataUrl(a: Artifact): string | null {

@@ -438,9 +438,9 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
         // A fresh array each call, as JSON decoding over the wire would give.
         return pocs.map((p) => ({ ...p }));
       case 'poc.get': {
-        const p = pocs.find((x) => x.id === args.id || x.poc_path === args.poc_path);
+        const p = pocs.find((x) => x.poc_path === need(args, 'poc_path'));
         if (!p) throw new BusError('unknown poc');
-        return p;
+        return { ...p };
       }
       case 'poc.build': {
         const f = flowArg(args, 'flow_id');
@@ -495,10 +495,12 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
         return run;
       }
       case 'poc.artifact': {
+        // Bare base64 of the file's bytes, as the bus returns it (the caller knows the type from the path).
         const path = need(args, 'path');
-        if (path.endsWith('.png')) return { mime: 'image/png', base64: await screenshotPng(browserUrl) };
+        if (path.endsWith('.png')) return await screenshotPng(browserUrl);
         const p = pocs.find((x) => x.poc_path === path);
-        return { mime: 'text/yaml', text: p?.yaml ?? '' };
+        if (!p) throw new BusError(`no artifact at ${path}`);
+        return btoa(String.fromCharCode(...new TextEncoder().encode(p.yaml)));
       }
       case 'browser.tabs':
         return [{ id: 'tab_1', url: browserUrl, title: 'Shop (staging)', active: true }];
@@ -540,7 +542,8 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
         return { policy: agentPolicy };
       }
       case 'proxy.status':
-        return { listening: capturing, address: '127.0.0.1:8080', protocol: 'HTTP/2', flows: flows.size };
+        // Listener state and capture state are separate on the bus.
+        return { listening: true, address: '127.0.0.1:8080', capturing, paused: !capturing, protocol: 'HTTP/2', flows: flows.size };
       case 'proxy.pause':
         capturing = false;
         recordActivity(tool, args, 'web');
@@ -558,7 +561,8 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
         return { ok: true };
       case 'flow.mark': {
         const f = flowArg(args);
-        const m = { ...f, mark: (args.mark as FlowDetail['mark']) ?? null };
+        if (!Array.isArray(args.marks)) throw new BusError("missing required parameter 'marks' (array)", -32602);
+        const m = { ...f, mark: ((args.marks[0] as string | undefined) as FlowDetail['mark']) ?? null };
         flows.set(f.id, m);
         flowEvent('meta', m);
         return { ok: true };
@@ -591,7 +595,7 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
     ['flow.kill', 'Abort a flow; the client sees a reset.', { id: { type: 'string', 'x-aitm': 'FlowId' }, mode: { type: 'string', enum: ['reset', '429', '503'] } }, ['id']],
     ['flow.mutate', 'Edit a paused request before it continues.', { id: { type: 'string', 'x-aitm': 'FlowId' }, edits: { type: 'object', description: 'method, path, headers, body' } }, ['id', 'edits']],
     ['flow.replay', 'Send a captured request again.', { id: { type: 'string', 'x-aitm': 'FlowId' } }, ['id']],
-    ['flow.mark', 'Set the mark colour of a flow.', { id: { type: 'string', 'x-aitm': 'FlowId' }, mark: { type: 'string' } }, ['id']],
+    ['flow.mark', 'Replace the marks of a flow.', { id: { type: 'string', 'x-aitm': 'FlowId' }, marks: { type: 'array', items: { type: 'string' } } }, ['id', 'marks']],
     ['flow.comment', 'Set the comment on a flow.', { id: { type: 'string', 'x-aitm': 'FlowId' }, text: { type: 'string' } }, ['id']],
     ['flow.clear', 'Remove every captured flow.', {}],
     ['request.send', 'Send a crafted request through the proxy (scope and rate guarded).', { method: { type: 'string' }, url: { type: 'string' }, headers: { type: 'object' }, body: { type: 'string' } }, ['method', 'url']],
@@ -606,7 +610,7 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
     ['browser.get_dom', 'Serialised DOM of the current page.', {}],
     ['browser.screenshot', 'PNG screenshot of the current page.', {}],
     ['poc.list', 'PoC runs and findings.', {}],
-    ['poc.get', 'One PoC with its YAML and results.', { id: { type: 'string' } }],
+    ['poc.get', 'One PoC with its YAML and results.', { poc_path: { type: 'string' } }, ['poc_path']],
     ['poc.build', 'Build a PoC YAML from a captured flow.', { flow_id: { type: 'string', 'x-aitm': 'FlowId' }, name: { type: 'string' }, param: { type: 'string' } }, ['flow_id', 'name']],
     ['poc.run', 'Run a PoC against a target.', { poc_path: { type: 'string' }, target: { type: 'string' }, vars: { type: 'object' } }, ['poc_path']],
     ['poc.artifact', 'Read a PoC artifact (YAML or PNG) from the PoC directory.', { path: { type: 'string' } }, ['path']],

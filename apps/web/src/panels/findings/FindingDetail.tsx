@@ -7,7 +7,7 @@ import type { PocRun } from '~/bus/mock';
 import { Badge, Button, Icon, Menu, Popover, type AnchorRect } from '~/components';
 import { methodHue, statusHue, type FlowSummary } from '~/model/flow';
 import { useApp } from '~/state/context';
-import { artifactDataUrl, downloadBlob, exportFilename, pngBlob, yamlBlob, type Artifact } from './export';
+import { artifactDataUrl, downloadBlob, exportFilename, pngBlob, toArtifact, yamlBlob, type Artifact } from './export';
 import { fmtWhen, fmtWhenFull, matchedCount, parseVars, varsFromYaml, varsText } from './model';
 import { SeverityPill } from './SeverityPill';
 import { findingsState } from './state';
@@ -47,7 +47,7 @@ export const FindingDetail: Component<FindingDetailProps> = (props) => {
   // ---- screenshot (lazy, keyed by path) ----
   const [shot, { refetch: refetchShot }] = createResource(
     () => run().screenshot_path,
-    (path) => app.call<Artifact>('poc.artifact', { path }),
+    async (path) => toArtifact(await app.call<unknown>('poc.artifact', { path }), path),
   );
   const shotUrl = createMemo(() => {
     const a = shot.latest;
@@ -126,7 +126,7 @@ export const FindingDetail: Component<FindingDetailProps> = (props) => {
     const path = run().screenshot_path;
     if (!path) return;
     try {
-      const a = shot.latest && !shot.error ? shot.latest : await app.call<Artifact>('poc.artifact', { path });
+      const a: Artifact = shot.latest && !shot.error ? shot.latest : toArtifact(await app.call<unknown>('poc.artifact', { path }), path);
       if (!a.base64) throw new Error('empty artifact');
       downloadBlob(exportFilename(run(), 'png'), pngBlob(a.base64, a.mime));
     } catch (e) {
