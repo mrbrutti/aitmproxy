@@ -146,7 +146,7 @@ step "a real request through the proxy appears in the list with its status" \
 
 keys End; keys Enter
 step "Enter opens the inspector with real F5 headers and body" \
-  expect_pane 6 "Request" "Response" "host" "content-type"
+  expect_pane 6 "Request" "Response" "user-agent" "\"method\": \"GET\""
 keys Escape
 
 keys i

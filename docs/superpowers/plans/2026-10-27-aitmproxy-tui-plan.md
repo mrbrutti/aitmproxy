@@ -174,6 +174,16 @@ TUI's local y/N confirmation for `ca.install`/`ca.uninstall` is the interim guar
 
 (filled at integration by the main session)
 
+**Live verification against real core (2026-10-28, after merging main with F5/F6/F7/F12/F13):**
+`scripts/bus-agent-check.py` — an agent over the loopback bus through every command the UIs
+rely on: 36 ok, 2 failed, both core-side (`poc.build` returns YAML text, not a path under
+`poc.dir`; routed to core — the TUI writes the file itself meanwhile). `scripts/tui-live-check.sh`
+— tmux keystrokes into the real TUI: capture → `i` → paused request → `Enter` review → `e` raw
+edit → `Ctrl-S` Apply & Resume → the client receives the upstream echo WITH the edited header →
+F5 body shows it → `P` build → `:poc run` → `F` findings → `i` disarm → `:config`: **19/19 steps
+in `aitm tui` (embedded) and 19/19 with a separate `aitm` over the bus.** Browser engine not
+configured on this host, so browser.* and screenshots were exercised against the fixture only.
+
 **Hand-off from the TUI lead, 2026-10-28:** branch `claude/ui-tui-16e3cc` at `ef0891e`, 8 commits
 on `c6a5c0c`. Final panel: security PASS, quality PASS, spec clear after the plan/README fixes;
 every Critical/Important fixed, every Minor fixed or accepted above. Gate green in a real shell

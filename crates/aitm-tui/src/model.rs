@@ -824,11 +824,19 @@ pub fn human_ms(ms: u64) -> String {
     }
 }
 
-/// `2026-10-27T11:05:22.994Z` → `11:05:22.994`; anything else passes through.
+/// `2026-10-27T11:05:22.994Z` → `11:05:22.994`; anything without a `T` passes
+/// through. The zone suffix is dropped and the fraction kept to milliseconds:
+/// the core emits RFC 3339 with nanoseconds and the Time column has 12 cells.
 pub fn clock_of(ts: &str) -> String {
-    ts.split_once('T')
-        .map(|(_, t)| t.trim_end_matches('Z').to_string())
-        .unwrap_or_else(|| ts.to_string())
+    let Some((_, t)) = ts.split_once('T') else {
+        return ts.to_string();
+    };
+    let t = t.trim_end_matches('Z');
+    let t = t.split(['+', '-']).next().unwrap_or(t);
+    match t.split_once('.') {
+        Some((hms, frac)) => format!("{hms}.{}", &frac[..frac.len().min(3)]),
+        None => t.to_string(),
+    }
 }
 
 /// Scope-as-authorisation (§2.7): whether `authority` is covered by any scope
@@ -961,6 +969,9 @@ mod tests {
         assert_eq!(human_ms(89), "89 ms");
         assert_eq!(human_ms(1210), "1.21 s");
         assert_eq!(clock_of("2026-10-27T11:05:22.994Z"), "11:05:22.994");
+        assert_eq!(clock_of("2026-10-28T16:54:34.859123456Z"), "16:54:34.859");
+        assert_eq!(clock_of("2026-10-28T16:54:34+02:00"), "16:54:34");
+        assert_eq!(clock_of("16:54"), "16:54");
         assert_eq!(compact_json(&json!({"id":"f1","n":2})), "id=f1 n=2");
     }
 

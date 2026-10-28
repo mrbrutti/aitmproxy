@@ -385,3 +385,18 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   bind ports, so run them in a real shell (the Terminal panel).
 - No `unsafe` (workspace `forbid`); the only dependency added since the
   skeleton is `regex` (already in `Cargo.lock`).
+
+### Live checks against a real core
+
+Both need a real shell (they bind ports) and nothing else: a local echo server
+stands in for the upstream, so they run offline and deterministically.
+
+```sh
+scripts/bus-agent-check.py            # an agent over the loopback bus, every command the UIs rely on
+scripts/tui-live-check.sh embed       # tmux keystrokes into `aitm tui`: capture → i → paused → review → e edit → ^S → F5 body → P/poc run → F → :config
+scripts/tui-live-check.sh bus         # the same against a separate `aitm` over `--bus … --token … --poc-dir …`
+```
+
+Each prints `ok`/`FAIL` per step and keeps the pane captures under a temp dir;
+the exit status is the number of failed steps. Browser steps need an engine
+configured on the host and are reported as unavailable otherwise.
