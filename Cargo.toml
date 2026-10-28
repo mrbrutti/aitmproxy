@@ -8,6 +8,7 @@ members = [
     "crates/aitm-proto-ws",
     "crates/aitm-plugins",
     "crates/aitm-plugin-sessionio",
+    "crates/aitm-plugin-passthrough",
     "crates/aitm-browser",
     "crates/aitm-ca",
     "crates/aitm-poc",
@@ -48,6 +49,7 @@ aitm-proto-http = { path = "crates/aitm-proto-http" }
 aitm-proto-ws = { path = "crates/aitm-proto-ws" }
 aitm-plugins = { path = "crates/aitm-plugins" }
 aitm-plugin-sessionio = { path = "crates/aitm-plugin-sessionio" }
+aitm-plugin-passthrough = { path = "crates/aitm-plugin-passthrough" }
 aitm-browser = { path = "crates/aitm-browser" }
 aitm-ca = { path = "crates/aitm-ca" }
 aitm-poc = { path = "crates/aitm-poc" }

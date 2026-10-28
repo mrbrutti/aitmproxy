@@ -1,0 +1,15 @@
+[package]
+name = "aitm-plugin-passthrough"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Per-host TLS passthrough: the Arc-shared host list and the tls.passthrough.* command family, agent-gated."
+
+[dependencies]
+# The command/plugin traits, `CommandHost` (and its `Frontend`), `Registry`.
+aitm-core.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true
