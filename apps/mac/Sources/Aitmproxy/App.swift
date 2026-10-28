@@ -100,13 +100,14 @@ struct FlowCommands: Commands {
                 session.arm(!session.interceptArmed)
             }
             .keyboardShortcut("i", modifiers: [])
-            Button("Resume") {
-                if let target = session.interceptTarget {
-                    target.edited ? session.applyAndResume(target.id) : session.resume(target.id)
-                }
+            Button(session.interceptTarget.map { session.pendingEditCount($0.id) > 0 } == true ? "Apply & Resume" : "Resume") {
+                if let target = session.interceptTarget { session.applyAndResume(target.id) }
             }
             .keyboardShortcut(.return, modifiers: .command)
             .disabled(session.interceptTarget == nil)
+            Button("Edit Paused Request") { if let id = session.focused { session.perform(.edit, on: id) } }
+                .keyboardShortcut("e", modifiers: [])
+                .disabled(session.focusedRow?.state != .paused)
             Button("Kill") { if let target = session.interceptTarget { session.perform(.kill, on: target.id) } }
                 .keyboardShortcut("\\", modifiers: .command)
                 .disabled(session.interceptTarget == nil)

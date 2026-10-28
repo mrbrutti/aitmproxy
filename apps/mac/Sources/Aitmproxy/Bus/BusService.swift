@@ -152,6 +152,11 @@ final class BusService: FlowActions {
         await refreshScope()
     }
 
+    func removeScope(_ host: String) async throws {
+        _ = try await live().call("scope.remove", ["host": .string(host)])
+        await refreshScope()
+    }
+
     func mark(_ id: FlowID, color: MarkColor?) async throws {
         let marks: JSONValue = color.map { .array([.string($0.rawValue)]) } ?? .array([])
         _ = try await live().call("flow.mark", ["id": .string(id.raw), "marks": marks])

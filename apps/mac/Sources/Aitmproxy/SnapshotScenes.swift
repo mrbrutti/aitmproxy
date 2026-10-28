@@ -13,6 +13,7 @@ enum SnapshotScene: String, CaseIterable {
     case paletteFlows = "palette-flows"
     case multiSelect = "multi-select"
     case rulesSheet = "rules-sheet"
+    case editPaused = "edit-paused"
     case composeSheet = "compose-sheet"
     case inspectHeaders = "inspect-headers"
     case inspectCookies = "inspect-cookies"
@@ -51,6 +52,14 @@ enum SnapshotScene: String, CaseIterable {
             session.paletteVisible = true
         case .multiSelect:
             session.selection = Set(session.rows.prefix(3).map(\.id))
+        case .editPaused:
+            let id = Fixtures.rows[9].id
+            session.editPaused(id)
+            if var m = session.details[id]?.request {
+                m.headers.append(.init("x-debug", "1"))
+                m.body = Data("{\n  \"email\": \"ops@shop-staging.test\",\n  \"password\": \"' OR 1=1 --\",\n  \"remember\": true\n}".utf8)
+                session.updateDraft(id, m)
+            }
         case .rulesSheet:
             session.breakpointRules = BreakpointRules(rules: [
                 BreakpointRule(name: "Login requests", url: "*/api/auth/*", method: "POST", onResponse: true, flag: .red),
@@ -128,6 +137,7 @@ enum SnapshotScene: String, CaseIterable {
         session.composeVisible = false
         session.requestTab = .raw
         session.responseTab = .body
+        session.editDrafts = [:]
         session.select(session.rows.first { $0.seq == 50 }?.id)
     }
 }

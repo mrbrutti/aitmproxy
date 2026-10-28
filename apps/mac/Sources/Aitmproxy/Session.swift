@@ -547,19 +547,51 @@ final class Session {
         }
     }
 
+    // MARK: Editing a paused request (S-037, S-038)
+
+    /// The operator's unsent edits per paused flow; nil = as the proxy holds it.
+    var editDrafts: [FlowID: HTTPMessage] = [:]
+
+    func updateDraft(_ id: FlowID, _ message: HTTPMessage) {
+        editDrafts[id] = message
+    }
+
+    func revertDraft(_ id: FlowID) {
+        editDrafts[id] = nil
+    }
+
+    /// Edits the draft would send, against what the proxy currently holds.
+    func pendingEdits(_ id: FlowID) -> RequestEdits {
+        guard let draft = editDrafts[id], let detail = details[id] else { return RequestEdits() }
+        return RequestEdits.diff(from: detail.request, to: draft)
+    }
+
+    func pendingEditCount(_ id: FlowID) -> Int { pendingEdits(id).changeCount }
+
     /// `Apply & Resume`: mutate with the pending edits, then resume (§4.5).
     func applyAndResume(_ id: FlowID) {
-        let edits = details[id].flatMap { detail in
-            detail.originalRequest.map { RequestEdits.diff(from: $0, to: detail.request) }
-        } ?? RequestEdits()
+        let edits = pendingEdits(id)
         perform("apply & resume") { [self] in
             if !edits.isEmpty { try await actions.mutate(id, edits: edits) }
+            editDrafts[id] = nil
             try await actions.resume(id)
         }
     }
 
+    /// `e`: the paused row's Raw tab, editable.
+    func editPaused(_ id: FlowID) {
+        select(id)
+        requestTab = .raw
+    }
+
     func addScope(_ host: String) {
         perform("add to scope") { [self] in try await actions.addScope(host) }
+    }
+
+    func removeScope(_ host: String, confirm: (Int) -> Bool = { _ in true }) {
+        let pausedOnHost = paused.filter { Scope.matches($0.authority, host) }.count
+        if pausedOnHost > 0, !confirm(pausedOnHost) { return }
+        perform("remove from scope") { [self] in try await actions.removeScope(host) }
     }
 
     /// Marks and comments apply locally at once; the bus call (F6) follows.
@@ -600,7 +632,7 @@ final class Session {
         case .resumeSelected: resumeSelected()
         case .killSelected: killSelected()
         case .edit:
-            if row.state == .paused { select(id) } else { lastError = "Only a paused flow can be edited" }
+            if row.state == .paused { editPaused(id) } else { lastError = "Only a paused flow can be edited" }
         case .mark(let color): mark(id, color)
         case .comment: select(id)
         case .buildPoC: lastError = "Build PoC opens with the PoC panel (M5)"

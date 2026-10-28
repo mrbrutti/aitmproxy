@@ -57,8 +57,11 @@ struct InterceptBar: View {
             }
             Spacer(minLength: Space.sm)
             HStack(spacing: Tok.Metric.gapTight) {
-                PrimaryButton(target?.edited == true ? "Apply & Resume" : "Resume", hint: "⌘⏎") {
-                    if let target { target.edited ? session.applyAndResume(target.id) : session.resume(target.id) }
+                PrimaryButton(target.map { session.pendingEditCount($0.id) > 0 } == true ? "Apply & Resume" : "Resume", hint: "⌘⏎") {
+                    if let target { session.applyAndResume(target.id) }
+                }
+                if let target, row(target).state == .paused {
+                    GhostButton("Edit", hint: "e") { session.editPaused(target.id) }
                 }
                 GhostButton("Resume all") { session.resumeAll() }
                 Menu {
@@ -95,11 +98,15 @@ struct InterceptBar: View {
         .accessibilityLabel("Intercept: \(session.paused.count) paused")
     }
 
+    private func row(_ r: FlowRow) -> FlowRow { r }
+
     private func targetText(_ row: FlowRow) -> String {
         var s = "\(row.method.label) \(row.url)"
-        if row.edited, let detail = session.details[row.id], let original = detail.originalRequest {
-            let changed = detail.request.headers.count - original.headers.count
-            let n = max(abs(changed), 1)
+        let pending = session.pendingEditCount(row.id)
+        if pending > 0 {
+            s += " · \(pending) edit\(pending == 1 ? "" : "s") pending"
+        } else if row.edited, let detail = session.details[row.id], let original = detail.originalRequest {
+            let n = max(abs(detail.request.headers.count - original.headers.count), 1)
             s += " · edited (\(n) header\(n == 1 ? "" : "s"))"
         }
         return s

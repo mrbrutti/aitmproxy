@@ -170,6 +170,25 @@ enum SelfTest {
             try? await Task.sleep(for: .milliseconds(500))
             check("bulk resume resumed the paused row", session.rows.first { $0.seq == 50 }?.state == .complete)
 
+            // S-037/S-038: a draft diffs against the proxy's request; Apply & Resume sends mutate then resume.
+            session.loadFixtures()
+            if let paused = session.rows.first(where: { $0.seq == 51 }) {
+                session.editPaused(paused.id)
+                check("`e` selects the paused row and opens Raw", session.focused == paused.id && session.requestTab == .raw)
+                var m = session.details[paused.id]!.request
+                m.headers.append(.init("x-debug", "1"))
+                m.body = Data("{}".utf8)
+                session.updateDraft(paused.id, m)
+                check("the draft counts two pending edits", session.pendingEditCount(paused.id) == 2)
+                let parsed = try? RawHTTP.parse(RawHTTP.render(m))
+                check("the raw editor text round-trips", parsed?.headers == m.headers && parsed?.bodyText == "{}")
+                session.applyAndResume(paused.id)
+                try? await Task.sleep(for: .milliseconds(600))
+                let after = session.rows.first { $0.id == paused.id }
+                check("Apply & Resume mutated and resumed the flow", after?.state == .complete && after?.edited == true
+                      && session.details[paused.id]?.request.header("x-debug") == "1" && session.editDrafts[paused.id] == nil)
+            }
+
             // S-040: rules validate, test against the list, persist, and change the armed notice.
             let rule = BreakpointRule(name: "login", url: "*/api/auth/*", method: "POST")
             check("a rule tests against the current list", BreakpointRules(rules: [rule]).matchCount(of: rule, in: Fixtures.rows) == 1)

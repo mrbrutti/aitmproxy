@@ -585,7 +585,7 @@ UX:
 - States: unpaused row -> hint "Only a paused flow can be edited"; mutate fails -> status-bar error, edits kept; live without F5 -> the raw text comes from the summary only, with a note
 - Words: footer "N edits pending · Apply & Resume sends flow.mutate then flow.resume · Revert to original"; button "Apply & Resume ⌘⏎"
 - Access: the editor is a text view; the tables are real rows with add/remove buttons
-Status: todo
+Status: done
 
 ### S-038 Edit a paused request's raw bytes
 As the operator, I open Raw on a paused row and edit the exact message text, including the start line, and apply it.
@@ -601,7 +601,7 @@ UX:
 - States: an unparsable message -> inline error under the editor, Apply disabled
 - Words: error "Could not parse the request: <reason>"
 - Access: ⌘A selects the message only
-Status: todo
+Status: done
 
 ### S-039 Kill with an abort mode
 As the operator, I open the Kill menu on the intercept bar or row and choose reset connection, 429 or 503.
@@ -743,6 +743,12 @@ Acceptance:
 - [snap] The Scope page lists entries with their limit readout (`10 req/s · back-off 2×`) and the count of flows in scope; the sheet has a text field with validation and `Add ⌘⏎`.
 - [unit] Entry validation accepts the three forms and rejects schemes and paths; `hostMatches` handles wildcard and port.
 - [self] `scope.add` is sent; the Scope count in the sidebar and `N hosts in scope` in the status bar update; affected rows lose their dimming.
+UX:
+- Flow: sidebar ▸ Scope (or Proxy ▸ Scope… ⇧⌘O) -> the Scope page: entries table over the in-scope flow list -> "Add Host…" or type in the field at the top -> ⌘⏎ adds -> the row loses its dimming at once
+- Surface: sidebar page with an inline add field; the sheet (⇧⌘O) is the same panel for when the list is elsewhere
+- States: empty -> "No hosts in scope — add one to authorise testing; everything stays read-only until then." with the field focused; invalid entry -> message under the field, Add disabled; live `scope.add` failing -> status-bar error, entry kept pending in tertiary
+- Words: columns "Host · Limit · Back-off · Flows"; button "Add ⌘⏎"; placeholder "host, host:port or *.wildcard"
+- Access: entries are a real table; the field is the only focused control when empty
 Status: todo
 
 ### S-048 Remove a host from scope
@@ -753,6 +759,12 @@ Core: F12
 Acceptance:
 - [self] `scope.remove` is sent; rows on that host render out of scope and their actions disable.
 - [manual] Removal asks for confirmation when a paused flow is on that host.
+UX:
+- Flow: select an entry -> Delete (or its ✕) -> gone; flows on that host dim; if a paused flow is on the host, "Remove host from scope? 1 paused flow will become read-only." Remove / Cancel
+- Surface: inline; confirmation only when a paused flow is affected
+- States: live before F12 -> status-bar error "Removing needs scope.remove (F12)" and the entry stays
+- Words: "Remove from Scope"
+- Access: Delete key on the selected row
 Status: todo
 
 ### S-049 See out-of-scope flows dimmed with their actions disabled
@@ -763,6 +775,12 @@ Acceptance:
 - [snap] Row 44 (telemetry host) renders in `text.tertiary` end to end; the summary strip reads `out of scope` in `intercept.deep`.
 - [manual] Replay, Edit, Mutate, Build PoC and Compose-from are disabled on it with the tooltip; Resume/Kill of a paused out-of-scope flow stay enabled.
 - [self] `scope.list` empty on the live bus dims every row.
+UX:
+- Flow: nothing to do — rows outside scope render in tertiary; hovering a disabled action shows "Out of scope — add host to scope to act"; the summary strip reads "out of scope" in intercept.deep
+- Surface: inline states
+- States: empty scope on the live bus dims nothing (the proxy enforces scope; an empty list means "no guard") — shows a status-bar note "No scope set"
+- Words: tooltip as above; strip "out of scope"
+- Access: disabled items stay visible to VoiceOver with the reason as help
 Status: todo
 
 ### S-050 Browse findings in the PoC panel
@@ -773,6 +791,12 @@ Core: F13
 Acceptance:
 - [snap] Severity pills critical/high/medium/low/info on their tint pairs; failed runs show ✗ in `status.serverError`; agent-run rows carry the teal tag; empty state "No findings — build a PoC from any flow with p."
 - [self] `poc.list` fills the list; the Findings count in the sidebar and status bar match.
+UX:
+- Flow: sidebar ▸ Findings -> list: title · severity pill · target · ✓/✗ · when · origin -> select one -> detail on the right
+- Surface: sidebar page (master list left, detail right, replacing the flow list)
+- States: empty -> "No findings — build a PoC from any flow with p."; live before F13 -> findings from this session's poc.run results only, with a note
+- Words: severity pills "Critical, High, Medium, Low, Info"; result "passed" / "failed"
+- Access: rows read "title, high, failed, 11:05"
 Status: todo
 
 ### S-051 Read a finding's detail
@@ -784,6 +808,12 @@ Acceptance:
 - [snap] YAML syntax-highlighted in a code view with line numbers; screenshot inline; assertions table `assertion · ✓/✗`; buttons Open capture · Run again · Export.
 - [self] Open capture selects `finding_capture` in the list and focuses the inspector; Save writes the YAML through `poc.get/set` or the path.
 - [manual] Export writes YAML + PNG + HAR of the capture into a folder the operator chooses.
+UX:
+- Flow: select a finding -> YAML (editable) with Save, the screenshot, the assertions table, buttons Open capture · Run again · Export -> Open capture selects the flow and switches to Apps with the inspector focused
+- Surface: detail pane of the Findings page
+- States: no screenshot -> "No screenshot" placeholder at the image's size; YAML changed -> Save enabled, "Unsaved" chip; Export -> folder panel, writes YAML + PNG + HAR
+- Words: section labels "YAML", "Screenshot", "Assertions"; buttons as above
+- Access: the YAML view is a text view; the assertions table has real rows
 Status: todo
 
 ### S-052 Run a PoC again
@@ -793,6 +823,12 @@ Depends: S-051
 Acceptance:
 - [unit] The form is built from `poc.run`'s schema (`poc_path`, `target`, `vars`); vars edit as key : value rows.
 - [self] The new run appears in Findings with passed/failed and selects itself.
+UX:
+- Flow: Run again -> small popover: Target (prefilled), Vars as key : value rows -> Run -> row appears in Findings with its result and selects itself
+- Surface: popover from the button
+- States: running -> button reads "Running…"; failure -> inline error in the popover
+- Words: "Run again", fields "Target", "Vars"; button "Run ⏎"
+- Access: Target focused on open
 Status: todo
 
 ### S-053 Build a PoC from a flow
@@ -803,6 +839,12 @@ Acceptance:
 - [snap] A small sheet: name, parameter picker populated from the request's query, headers and JSON body keys, `Build ⌘⏎`.
 - [self] `poc.build {flow_id, name, param}` returns a path; the Findings page selects the new PoC and shows its YAML.
 - [unit] Disabled with the scope tooltip for out-of-scope rows.
+UX:
+- Flow: `p` on a row (Flow ▸ Build PoC from Flow…, context menu, palette) -> sheet: Name (prefilled from path), Parameter picker (query keys, header names, JSON body keys), `Build ⌘⏎` -> Findings page opens on the new PoC's YAML
+- Surface: sheet
+- States: out-of-scope row -> disabled with the scope tooltip; no parameters found -> picker shows "none" and Build still works; failure -> inline error
+- Words: title "Build PoC", fields "Name", "Parameter", button "Build ⌘⏎"
+- Access: Name focused on open
 Status: todo
 
 ### S-054 Open the browser view
@@ -814,6 +856,12 @@ Acceptance:
 - [snap] Flat toolbar: URL field, four glyph buttons, `Eval…` and `DOM` as text buttons; tabs as plain text with a close glyph; empty state "No tabs — open a page with ⌘T."
 - [self] `browser.navigate` loads a URL; `browser.eval` returns text into a console drawer; `browser.get_dom` shows an outline.
 - [snap] Flows the browser produces show `obscura` in the Client column.
+UX:
+- Flow: sidebar ▸ Browser (⇧⌘W) -> tabs row + flat toolbar (URL field, ← → ⟳, screenshot, "Eval…", "DOM") over the page image -> ⌘T new tab -> type a URL ⏎ -> navigates
+- Surface: sidebar page
+- States: no tabs -> "No tabs — open a page with ⌘T."; bus offline -> toolbar disabled with "Browser needs the bus"; Eval… opens a console drawer under the page with input + results; DOM opens an outline drawer
+- Words: tooltips "Back", "Forward", "Reload", "Save screenshot"; buttons "Eval…", "DOM"
+- Access: the URL field is focused in a new tab
 Status: todo
 
 ### S-055 Watch the live screenshot stream and click or type into it
@@ -824,6 +872,12 @@ Core: F14 (screencast)
 Acceptance:
 - [self] Frames arrive via `browser.screencast` (fallback: `browser.screenshot` every 500 ms) and draw without layout shift.
 - [manual] A click at (x, y) sends `browser.click` scaled to the page; typing sends `browser.type`; a `Live` chip shows the frame rate.
+UX:
+- Flow: the page draws as a live image; click -> `browser.click` at the page coordinate; typing -> `browser.type`; a "Live · 2 fps" chip top-right
+- Surface: inline (the image is the control)
+- States: no frames yet -> grey block at the last known size; frames stop -> chip reads "Paused"
+- Words: chip "Live · N fps"
+- Access: the image has a label with the page title/URL
 Status: todo
 
 ### S-056 Set the agent policy from the toolbar
@@ -835,6 +889,12 @@ Acceptance:
 - [snap] Teal switch when the agent may act, grey when paused; a count badge of actions in the last minute; the Agent sidebar page shows policy, connected clients and the same count.
 - [self] `agent.set {policy}` is sent and `agent.status` read back; Paused makes the agent's next call fail with "agent paused by operator".
 - [unit] The app refuses to show the toggle as changed until the bus confirms.
+UX:
+- Flow: toolbar Agent ▸ menu: Allow All Tools / Read-only / Paused -> `agent.set` -> switch colour changes only after the bus confirms; sidebar ▸ Agent page shows policy, connected clients, actions/min and the activity log
+- Surface: menu on the toolbar control; sidebar page for detail
+- States: bus offline -> the menu is disabled with "Agent policy needs the bus"; before F1 -> status-bar note "agent.set needs F1", local choice kept as the intended policy
+- Words: "Allow All Tools", "Read-only", "Paused", "Activity Log…"
+- Access: VoiceOver reads "Agent, Allow All Tools, 14 actions in the last minute"
 Status: todo
 
 ### S-057 Read the activity log and approve a gated request
@@ -846,6 +906,12 @@ Acceptance:
 - [snap] Rows `time · origin · command · args summary · result`, 28 px, agent rows with a teal left edge; filter by origin; the panel keeps its header in view.
 - [self] Entries arrive via `notifications/aitm/agent` and the agent toggle's count follows them.
 - [snap] A pending gated command (`ca.install`) shows as a row with Approve once / Deny; approving runs it with the operator identity.
+UX:
+- Flow: ⇧⌘L (or Agent ▸ Activity Log…) -> side panel on the right: filter by origin, rows time · origin · command · args · result, agent rows with a teal left edge -> a pending gated row shows Approve once / Deny -> approve runs it with the operator identity
+- Surface: side panel (a tool kept open beside the work)
+- States: empty -> "No activity yet."; live before F2 -> the panel lists this app's own commands only, with a note
+- Words: filter chips "All · Agent · Operator · CLI"; buttons "Approve once", "Deny"
+- Access: rows are real rows; the panel keeps its header in view
 Status: todo
 
 ### S-058 Check the certificate authority
@@ -856,6 +922,12 @@ Acceptance:
 - [snap] Status line (fingerprint, installed/trusted, expiry) from `ca.status`; buttons Export PEM · Export DER · Install… · Uninstall…; guides as plain text sections.
 - [self] Install/uninstall show the command's confirmation text first and run with the operator identity; the audit line appears in the activity log.
 - [unit] The agent-gate flag (`ca.allow_agent_install`) is shown read-only.
+UX:
+- Flow: Proxy ▸ Certificate Authority… -> panel: status line (fingerprint, installed/trusted, expiry), buttons Export PEM · Export DER · Install… · Uninstall…, setup guides beneath (iOS, Android, Browsers, Terminal) -> Install… shows the command's confirmation text -> runs
+- Surface: sidebar page / window-level panel
+- States: not installed -> "Not installed" in intercept.deep with Install… primary; agent-gate flag shown read-only ("Agent may install: no")
+- Words: as above; confirmation uses the proxy's own text
+- Access: buttons in reading order; guides are plain headings + text
 Status: todo
 
 ### S-059 Read the proxy configuration
@@ -866,6 +938,12 @@ Core: F7
 Acceptance:
 - [snap] YAML in a read-only code view; overridden keys carry an `env` chip; the listen address and bus address are highlighted.
 - [self] `config.get` fills the view; Reload re-reads it.
+UX:
+- Flow: Proxy ▸ Configuration… -> read-only YAML code view; overridden keys carry an `env` chip; listen and bus addresses highlighted; Reload
+- Surface: sidebar page / panel
+- States: before F7 -> shows the config.yaml the app read itself, with a note "from <path>; the proxy's effective config needs config.get (F7)"
+- Words: "Configuration", button "Reload", chip "env"
+- Access: the YAML is selectable text
 Status: todo
 
 ### S-060 Toggle a script on or off
@@ -876,6 +954,12 @@ Core: F8
 Acceptance:
 - [snap] One row per script: name, matching rule summary, run-on phases, `● Saved and active` or the error; a flat toggle; the sidebar count reads `N active`.
 - [self] `script.enable/disable` are sent; the count updates.
+UX:
+- Flow: sidebar ▸ Scripts -> one row per script: name, rule summary, run-on phases, status dot + "Saved and active" or the error, a flat toggle -> flip -> `script.enable/disable`
+- Surface: sidebar page
+- States: empty -> "No scripts loaded."; before F8 -> fixture list with a note
+- Words: "Saved and active", "Disabled", "Error: …"
+- Access: the toggle is a real toggle with the script's name as its label
 Status: todo
 
 ---

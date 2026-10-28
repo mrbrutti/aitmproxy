@@ -335,16 +335,25 @@ struct RequestPane: View {
                 if tab == .body, let detail {
                     BodyHost.controls(message: detail.request, extent: detail.requestBodyExtent, state: bodyState, sseState: sseState)
                 } else if row.state == .paused {
-                    Text("editing").font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
+                    let n = session.pendingEditCount(row.id)
+                    Text(n > 0 ? "\(n) pending" : "editing").font(Tok.Face.ui(Tok.Typography.Size.sm))
+                        .foregroundStyle(n > 0 ? Tok.Intercept.deep.color : Tok.Ink.tertiary.color)
                 }
             }
             if let detail {
                 switch tab {
                 case .raw:
-                    CodeView(lines: BodyLines.raw(detail.request, original: detail.originalRequest),
-                             footer: row.state == .paused && row.edited
-                                 ? "1 edit pending · Apply & Resume sends flow.mutate then flow.resume · Revert to original" : nil)
-                case .headers: HeaderTable(headers: detail.request.headers)
+                    if row.state == .paused {
+                        RawRequestEditor(row: row, detail: detail)
+                    } else {
+                        CodeView(lines: BodyLines.raw(detail.request, original: detail.originalRequest), footer: nil)
+                    }
+                case .headers:
+                    if row.state == .paused {
+                        EditableHeaderTable(row: row, detail: detail)
+                    } else {
+                        HeaderTable(headers: detail.request.headers)
+                    }
                 case .cookies: CookieTable(cookies: Cookie.cookies(in: detail.request), bodySize: bodySize)
                 case .query: QueryTable(query: row.query)
                 case .body: BodyHost(message: detail.request, extent: detail.requestBodyExtent, bodySize: bodySize, sseState: sseState, state: bodyState)

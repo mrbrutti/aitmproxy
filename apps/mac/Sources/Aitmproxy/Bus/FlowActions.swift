@@ -12,6 +12,8 @@ protocol FlowActions: AnyObject {
     func replay(_ id: FlowID) async throws -> FlowID?
     func send(_ request: RequestEdits) async throws -> FlowID?
     func addScope(_ host: String) async throws
+    /// F12: `scope.remove {host}`.
+    func removeScope(_ host: String) async throws
     /// F6: `flow.mark {id, marks}` / `flow.comment {id, text}`.
     func mark(_ id: FlowID, color: MarkColor?) async throws
     func comment(_ id: FlowID, text: String) async throws
@@ -68,6 +70,11 @@ final class FixtureActions: FlowActions {
             request.headers.append(.init(name, value))
         }
         if let body = edits.body { request.body = body }
+        if edits.method != nil || edits.path != nil {
+            let parts = request.startLine.split(separator: " ").map(String.init)
+            let version = parts.count > 2 ? parts[2] : "HTTP/2"
+            request.startLine = "\(edits.method ?? parts.first ?? "GET") \(edits.path ?? (parts.count > 1 ? parts[1] : "/")) \(version)"
+        }
         detail.request = request
         session.details[id] = detail
         if let index = session.rows.firstIndex(where: { $0.id == id }) { session.rows[index].edited = true }
@@ -109,6 +116,13 @@ final class FixtureActions: FlowActions {
         if !session.scopeHosts.contains(host) { session.scopeHosts.append(host) }
         for index in session.rows.indices where session.rows[index].authority.hasSuffix(host) {
             session.rows[index].inScope = true
+        }
+    }
+
+    func removeScope(_ host: String) async throws {
+        session.scopeHosts.removeAll { $0 == host }
+        for index in session.rows.indices {
+            session.rows[index].inScope = session.scopeHosts.isEmpty || Scope.contains(session.rows[index].authority, in: session.scopeHosts)
         }
     }
 
