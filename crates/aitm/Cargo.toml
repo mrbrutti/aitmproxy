@@ -21,22 +21,29 @@ aitm-proto-http.workspace = true
 aitm-proto-ws.workspace = true
 aitm-plugins.workspace = true
 aitm-browser.workspace = true
+aitm-ca.workspace = true
 aitm-poc.workspace = true
 aitm-mcp.workspace = true
 aitm-cli.workspace = true
 anyhow = "1"
 futures = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "process", "time"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 serde_json = "1"
-serde_yaml = "0.9"
 hyper = { version = "1", features = ["server", "http1"] }
 http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 bytes = "1"
+# The HTTPS fixture behind the obscura MITM tests (M2 Task 24): same crates and
+# features as aitm-proto-http, so nothing new enters the tree.
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 
 [lints]
 workspace = true

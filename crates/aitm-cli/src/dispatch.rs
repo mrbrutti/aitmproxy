@@ -3,17 +3,25 @@
 //! following `--name value` / `--name=value` is a `ParamDef` of that command,
 //! parsed by its `TypeDesc`. Scalars come from the text, arrays and objects from
 //! JSON text, bytes from the argument's UTF-8, booleans from a bare flag or a
-//! `true`/`false` literal.
+//! `true`/`false` literal. One flag is the CLI's own: a bare `--yes` is removed
+//! before parsing and answers the command's confirmation prompt, if it has one.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
 use aitm_core::{
-    BrowserDriver, Command, CommandHost, FlowId, FlowStore, ParamSchema, Params, ProxyClient,
-    Registry, ScopeRateGuard, SsrfPolicy, TypeDesc, Value,
+    BrowserDriver, Command, CommandHost, FlowId, FlowStore, Frontend, ParamSchema, Params,
+    ProxyClient, Registry, ScopeRateGuard, SsrfPolicy, TypeDesc, Value,
 };
+use anyhow::Context as _;
 use serde_json::Value as JsonValue;
+
+use crate::confirm::{Confirmer, TtyConfirmer};
+
+/// The reserved flag: not a `ParamDef`, accepted by every command, skips the
+/// confirmation prompt.
+const YES_FLAG: &str = "--yes";
 
 /// The core services a `CommandHost` borrows for each dispatch.
 struct Services {
@@ -29,18 +37,27 @@ pub struct Cli {
     services: Option<Services>,
     ssrf: SsrfPolicy,
     poc_dir: Option<std::path::PathBuf>,
+    confirmer: Arc<dyn Confirmer>,
 }
 
 impl Cli {
     /// A CLI over `registry`. Attach services with [`Cli::with_services`] before
-    /// dispatching.
+    /// dispatching. Confirmation prompts go to the terminal on stdin until
+    /// [`Cli::with_confirmer`] says otherwise.
     pub fn new(registry: Arc<Registry>) -> Self {
         Self {
             registry,
             services: None,
             ssrf: SsrfPolicy::default(),
             poc_dir: None,
+            confirmer: Arc::new(TtyConfirmer::from_stdin()),
         }
+    }
+
+    /// Put confirmation prompts to `confirmer` instead of the terminal.
+    pub fn with_confirmer(mut self, confirmer: Arc<dyn Confirmer>) -> Self {
+        self.confirmer = confirmer;
+        self
     }
 
     /// Use the configured SSRF policy for command-side pre-flights, so the PoC
@@ -75,9 +92,13 @@ impl Cli {
 
     /// `aitm flow replay --id <uuid>` -> command "flow.replay" + Params{ id }.
     /// Subcommand path maps 1:1 to Command::name(); flags map to ParamDef by name.
+    /// A command with a `confirm_prompt` is put to the confirmer first unless
+    /// `--yes` was given; a "no" leaves it un-invoked.
     pub fn dispatch(&self, argv: &[String]) -> anyhow::Result<Value> {
         let (cmd, flags) = self.resolve(argv)?;
-        let args = parse_flags(flags, &cmd.schema(), cmd.name())?;
+        let yes = flags.iter().any(|t| t == YES_FLAG);
+        let flags: Vec<String> = flags.iter().filter(|t| *t != YES_FLAG).cloned().collect();
+        let args = parse_flags(&flags, &cmd.schema(), cmd.name())?;
         let services = self.services.as_ref().ok_or_else(|| {
             anyhow::anyhow!("no core services attached; call Cli::with_services first")
         })?;
@@ -88,7 +109,19 @@ impl Cli {
             services.browser.as_deref(),
         )
         .with_ssrf(self.ssrf.clone())
-        .with_poc_dir(self.poc_dir.clone());
+        .with_poc_dir(self.poc_dir.clone())
+        .with_frontend(Frontend::Cli);
+        if !yes {
+            if let Some(prompt) = cmd.confirm_prompt(&args) {
+                let confirmed = self
+                    .confirmer
+                    .confirm(&prompt)
+                    .with_context(|| cmd.name().to_string())?;
+                if !confirmed {
+                    anyhow::bail!("aborted: {} not run", cmd.name());
+                }
+            }
+        }
         cmd.invoke(args, &host)
     }
 
@@ -96,7 +129,8 @@ impl Cli {
     pub fn usage(&self) -> String {
         let mut out = String::from(
             "usage: aitm <command> [--flag value]...\n\
-             (a value that itself starts with `--` must be given as --flag=value)\n\
+             (a value that itself starts with `--` must be given as --flag=value;\n\
+             --yes answers a command's confirmation prompt without asking)\n\
              \ncommands:\n",
         );
         for cmd in self.registry.commands() {

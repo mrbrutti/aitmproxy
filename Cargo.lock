@@ -16,6 +16,7 @@ name = "aitm"
 version = "0.1.0"
 dependencies = [
  "aitm-browser",
+ "aitm-ca",
  "aitm-cli",
  "aitm-core",
  "aitm-mcp",
@@ -30,9 +31,13 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "rcgen",
+ "rustls",
+ "serde",
  "serde_json",
  "serde_yaml",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]
@@ -47,7 +52,24 @@ dependencies = [
  "futures",
  "serde_json",
  "tokio",
+ "tracing",
  "url",
+]
+
+[[package]]
+name = "aitm-ca"
+version = "0.1.0"
+dependencies = [
+ "aitm-core",
+ "anyhow",
+ "dirs",
+ "ring",
+ "serde",
+ "serde_json",
+ "time",
+ "tracing",
+ "tracing-subscriber",
+ "x509-parser",
 ]
 
 [[package]]

@@ -575,14 +575,28 @@ Phases in Stream A: **core types** (7, 8) → **`aitm-ca`** (9–16) and **front
 
 Kept by the main session during stage 6. One row per finding.
 
-| Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
+| Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
+| 16 | security | Important | `ca.export --out` truncates any existing file (incl. the audit log), ungated over MCP | fixed in 83521fa (`create_new` + canonical audit-log/config refusal, performed after `audit.open()` and recorded; tests added) |
+| 16 | quality | Important | CA-AC17 has no command-level test | fixed in 83521fa (test Harness parametrised on `Platform`; `Unsupported("linux")` case) |
+| 16 | quality | Important | CA-AC11 store-failure `outcome=="error"` audit record unasserted | fixed in 83521fa (canned headless `add-trusted-cert` exit 1 via `Frontend::Cli`; record asserted; code uses `Err(audit.fail(err))`) |
+| 28 | spec | Important | Task 28 packaging absent (M2-AC19) | fixed in 83521fa (`scripts/package.sh` + `README.md`, smoke-tested end to end) |
+| 16 | spec | Important | §D8 per-subprocess `debug!` log unimplemented | fixed in 83521fa (`platform/mod.rs::run` + `tracing_fields` assertion) |
+| 16 | spec | Important | CA-AC16/CA-AC17 untested at command level | fixed in 83521fa |
+| 20 | security | Minor | non-CERTIFICATE PEM in `ca.crt`, caller-PATH tool resolution, `ca.key_mode` from YAML | fixed in 83521fa (bail on non-CERT label; absolute tool paths; reject group/other bits at parse) |
+| 20 | quality | Minor | live-child primitives unbounded (hung V8 wedges the MCP call) | fixed in 83521fa (`guarded()` wraps each op in `timeout(nav_timeout, …)`) |
+| 6 | spec | Accepted | fork gate unattainable on upstream `034a147` (its fmt/clippy are already red) | substitute gate used (per-crate `clippy` on patched hunks + `nextest -p obscura-net/js/cli`); pending Matt's confirmation at integration |
+| 5 | spec/sec | Accepted | obscura-worker ignores `OBSCURA_CA_CERT` (`serve` children get roots; `scrape` workers don't); clap keeps the innermost global `--ca-cert` | documented follow-up (orchestrator 2026-10-28): aitmproxy uses `obscura serve` with a single `--ca-cert`; the worker gap is a one-line upstream follow-up |
+| — | all | Minor | ~40 remaining Minors/nits (dedup, `AuditRecord` serde enums, CDP loopback token [needs fork patch], `/tmp` ready-file dir, unbounded line pump, Windows-Unknown, `main.rs {err:#}`, §D8 "created/truncated" wording) | deferred to post-M2 follow-ups (orchestrator 2026-10-28); full lists in the reviewers' reports |
+| 30 | spec | Close-out | §D12 platform-spec amendments, this Review log + Shipped, fixture fingerprints | this entry + Shipped below; §D12 amendments applied at integration |
+
+**Panel re-review (stage 6) at `83521fa`:** security **PASS**, quality **PASS** (241 passed, 1 ignored `real_os`), spec code **PASS** (close-out items above are not code defects).
 
 ## Shipped
 
 What merged, what was cut, follow-ups. Filled at stage 7.
 
-- Fixture fingerprints (Task 9): `<FP256> = ________`, `<FP1> = ________`.
-- Fork binary: tag `aitm-vN`, local path, SHA-256.
-- Upstream PR / issues (Task 29): ________.
-- Memory report (Task 30): obscura peak RSS ________ MB vs Chrome ________ MB during `e2e_reflected_xss`.
+- Fixture fingerprints (Task 9): `FP256 = 41:88:D2:5C:9E:BD:56:21:31:81:52:AD:D8:CE:78:C4:9C:40:77:C4:07:D1:7F:0D:4B:58:6E:22:E4:4A:CA:43`, `FP1 = B1:30:2C:92:2B:7C:A0:78:5D:76:E0:A0:00:43:01:51:1C:05:92:90`.
+- Fork binary: tag `aitm-v1` (release `mrbrutti/obscura`, 4 tarballs + SHA256SUMS); local render build `/Users/matt/Security/obscura/dist/obscura`, SHA-256 `f5a579247eb78f78439d5f101dc53746bb0850accea300e409f390d8f0f10107`.
+- Upstream PR / issues (Task 29): **pending Matt's go-ahead** — publishes to the third-party `h4ckf0r0day/obscura` repo (the `--ca-cert` PR + two spike issues).
+- Memory report (Task 30, M2-AC20): peak RSS during `e2e_reflected_xss` — **obscura 43.5 MB (single process) vs Chrome 228 MB main / 1039 MB process tree**. Exit gate PASS at 28ab0c1: fmt/clippy exit 0, 241 default tests + 64 gated (both engines) passed, 0 failed, 1 ignored (`real_os`).

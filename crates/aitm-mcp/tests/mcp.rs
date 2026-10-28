@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    Body, Command, CommandHost, ConnInfo, Flow, FlowMeta, FlowStore, HeaderMap, HttpFlow,
+    Body, Command, CommandHost, ConnInfo, Flow, FlowMeta, FlowStore, Frontend, HeaderMap, HttpFlow,
     HttpRequest, HttpVersion, InterceptState, McpTransport, MemFlowStore, ParamDef, ParamSchema,
     Params, Plugin, ProxyClient, Registry, StdGuard, TypeDesc, Value,
 };
@@ -240,6 +240,30 @@ impl Command for FailCmd {
     }
     fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
         anyhow::bail!("boom: nothing to see")
+    }
+}
+
+/// `demo.frontend`: reports which frontend built the host it ran on.
+struct FrontendCmd;
+
+impl Command for FrontendCmd {
+    fn name(&self) -> &str {
+        "demo.frontend"
+    }
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "Names the invoking frontend.".into(),
+            params: vec![],
+            result: TypeDesc::Str,
+        }
+    }
+    fn invoke(&self, _args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        let label = match host.frontend() {
+            Frontend::Cli => "cli",
+            Frontend::Mcp => "mcp",
+            _ => "other",
+        };
+        Ok(Value::Str(label.into()))
     }
 }
 
@@ -654,6 +678,28 @@ fn call_without_services_is_an_internal_error_but_list_works() {
         .as_str()
         .expect("msg")
         .contains("with_services"));
+}
+
+/// M2 Task 18 (CA-AC19 mechanics): the host `tools/call` builds declares
+/// itself `Frontend::Mcp`, so a gated command sees an agent, not a human.
+#[test]
+fn frontend_is_mcp() {
+    let mut reg = Registry::new();
+    reg.add_command(Arc::new(FrontendCmd));
+    let srv = McpServer::new(Arc::new(reg), McpTransport::Stdio).with_services(
+        Arc::new(MemFlowStore::new()),
+        Arc::new(StubClient),
+        Arc::new(StdGuard::default()),
+        None,
+    );
+    let resp = rpc(
+        &srv,
+        1,
+        "tools/call",
+        json!({"name": "demo.frontend", "arguments": {}}),
+    );
+    assert_eq!(resp["result"]["isError"], json!(false));
+    assert_eq!(resp["result"]["structuredContent"], json!("mcp"));
 }
 
 /// The transports share one newline-JSON loop; prove it over an in-memory pipe.

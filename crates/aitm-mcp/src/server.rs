@@ -10,8 +10,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use aitm_core::{
-    BrowserDriver, CommandHost, FlowStore, McpTransport, ProxyClient, Registry, ScopeRateGuard,
-    SsrfPolicy,
+    BrowserDriver, CommandHost, FlowStore, Frontend, McpTransport, ProxyClient, Registry,
+    ScopeRateGuard, SsrfPolicy,
 };
 use serde_json::{json, Map, Value as JsonValue};
 
@@ -267,7 +267,10 @@ impl McpServer {
             services.browser.as_deref(),
         )
         .with_ssrf(self.ssrf.clone())
-        .with_poc_dir(self.poc_dir.clone());
+        .with_poc_dir(self.poc_dir.clone())
+        // Said explicitly, though it is the default: an agent is on this end,
+        // so a gated command relies on its config flag, never on a prompt.
+        .with_frontend(Frontend::Mcp);
         Ok(match cmd.invoke(args, &host) {
             Ok(value) => {
                 let structured = to_json(&value);

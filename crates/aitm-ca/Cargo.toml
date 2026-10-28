@@ -1,0 +1,31 @@
+[package]
+name = "aitm-ca"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CA trust-store management: the ca.* command family over an Executor trait, with an audit log."
+
+[dependencies]
+# The command/plugin traits, `CommandHost` (and its `Frontend`), `CaConfig`.
+aitm-core.workspace = true
+anyhow.workspace = true
+# Home directory for the per-user keychain path (RealExecutor::home_dir).
+dirs = "5"
+# Certificate fingerprints (SHA-256, and SHA-1 for `security -Z` / certutil).
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+# Audit log records are JSON Lines; command results are JSON-shaped Values.
+serde_json = "1"
+# RFC 3339 timestamps on audit records.
+time = { version = "0.3", features = ["formatting", "parsing"] }
+tracing.workspace = true
+# Parsing the single PEM block in ca.crt into DER for digesting.
+x509-parser = "0.18"
+
+[dev-dependencies]
+# A capturing subscriber for the tracing-field assertions (CA-AC25).
+tracing-subscriber = "0.3"
+
+[lints]
+workspace = true
