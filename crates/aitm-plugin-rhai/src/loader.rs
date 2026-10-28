@@ -27,7 +27,7 @@ use rhai::{Dynamic, Engine, ParseError, ParseErrorType, AST};
 
 use crate::command::register_reg_api;
 use crate::config::{RhaiConfig, ScriptEntry, ScriptMeta};
-use crate::engine::build_engine;
+use crate::engine::{build_engine, Budget};
 use crate::error::ScriptError;
 use crate::flow_api::register_flow_api;
 use crate::host_core::{
@@ -82,7 +82,7 @@ impl RhaiLoader {
         // The `load(reg)` bridge: without it a script's `reg.add_command` is an
         // unknown function and no script could register anything (Task 10).
         register_reg_api(&mut engine);
-        for capability in m3_capabilities() {
+        for capability in m3_capabilities(&cfg) {
             tracing::debug!(
                 target: LOADER_TARGET,
                 namespace = capability.namespace(),
@@ -115,6 +115,11 @@ impl RhaiLoader {
     /// executor is built from the same handles as the plugins.
     pub fn services(&self) -> &ScriptServices {
         &self.services
+    }
+
+    /// The run budget the configuration gives every hook, step and command.
+    pub fn budget(&self) -> Budget {
+        Budget::of(&self.cfg)
     }
 
     /// Compile every enabled entry in `cfg.scripts`, in declaration order.
@@ -168,13 +173,15 @@ impl RhaiLoader {
     }
 
     /// Parse and compile only; no plugin is built and nothing is registered.
+    /// Backs `script.validate`.
     pub fn validate(&self, path: &Path) -> Result<ScriptMeta, ScriptError> {
         self.compile(path).map(|(_, meta)| meta)
     }
 
     /// Read, compile, and describe one script. The AST is named after the
-    /// script so host verbs can attribute what they record to it.
-    fn compile(&self, path: &Path) -> Result<(AST, ScriptMeta), ScriptError> {
+    /// script so host verbs can attribute what they record to it. Backs
+    /// `script.reload`, which swaps the AST into the running plugin.
+    pub fn compile(&self, path: &Path) -> Result<(AST, ScriptMeta), ScriptError> {
         let stem = file_stem(path);
         let src = fs::read_to_string(path).map_err(|err| ScriptError::Compile {
             script: stem.clone(),
@@ -197,19 +204,20 @@ impl RhaiLoader {
 }
 
 /// The providers M3 ships (spec §6a). A namespace missing from this list does
-/// not exist for scripts.
+/// not exist for scripts. `browser` decides SSRF under the host's policy and
+/// `scope.add` is offered only when the config allows it.
 ///
 /// `vars` is here rather than in the PoC executor because the engine is built
 /// once and shared: its verbs must exist on the engine before any step runs,
 /// even though the handle itself is pushed per step.
-fn m3_capabilities() -> [Arc<dyn ScriptCapability>; 7] {
+fn m3_capabilities(cfg: &RhaiConfig) -> [Arc<dyn ScriptCapability>; 7] {
     [
         Arc::new(LogCapability),
         Arc::new(FindingCapability),
         Arc::new(HttpCapability),
-        Arc::new(BrowserCapability),
+        Arc::new(BrowserCapability::new(cfg.ssrf.clone())),
         Arc::new(StoreCapability),
-        Arc::new(ScopeCapability),
+        Arc::new(ScopeCapability::new(cfg.allow_scope_add)),
         Arc::new(VarsCapability),
     ]
 }

@@ -197,6 +197,8 @@ impl ScriptFile {
 struct RhaiFile {
     /// Fail startup on a compile error instead of skipping the script.
     strict: Option<bool>,
+    /// Let plugin scripts widen the scope with `scope.add(...)` (off by default).
+    allow_scope_add: Option<bool>,
     /// Seconds a single hook may run before it is aborted.
     hook_timeout: Option<u64>,
     max_operations: Option<u64>,
@@ -212,6 +214,7 @@ struct RhaiFile {
 impl RhaiFile {
     fn apply(self, r: &mut RhaiConfig) {
         set(&mut r.strict, self.strict);
+        set(&mut r.allow_scope_add, self.allow_scope_add);
         set_secs(&mut r.hook_timeout, self.hook_timeout);
         let l = &mut r.limits;
         set(&mut l.max_operations, self.max_operations);

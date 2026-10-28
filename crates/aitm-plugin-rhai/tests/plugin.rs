@@ -26,6 +26,7 @@ use aitm_plugin_rhai::flow_api::register_flow_api;
 use aitm_plugin_rhai::host_core::{
     FindingCapability, LogCapability, MemoryFindingSink, Options, ScriptCapability, ScriptServices,
 };
+use aitm_plugin_rhai::host_net::HttpCapability;
 use aitm_plugin_rhai::plugin::{ErrorSink, ScriptPlugin};
 use rhai::Engine;
 
@@ -151,11 +152,9 @@ fn http(flow: &Flow) -> &HttpFlow {
 
 fn config(limits: RhaiLimits, hook_timeout: Duration) -> RhaiConfig {
     RhaiConfig {
-        scripts: Vec::new(),
         limits,
         hook_timeout,
-        hot_reload: false,
-        strict: false,
+        ..RhaiConfig::default()
     }
 }
 
@@ -190,7 +189,10 @@ impl Fixture {
         };
         let mut engine = build_engine(&cfg.limits, cfg.hook_timeout);
         register_flow_api(&mut engine);
-        let providers: [&dyn ScriptCapability; 2] = [&LogCapability, &FindingCapability];
+        // `http` rides a never-reached client behind an empty-scope guard, so a
+        // hook that calls it is always denied — the denial path under test.
+        let providers: [&dyn ScriptCapability; 3] =
+            [&LogCapability, &FindingCapability, &HttpCapability];
         for provider in providers {
             provider.register(&mut engine, &services);
         }
@@ -400,6 +402,90 @@ async fn errored_hook_discards_edits() {
         "the chain went on to the next plugin: {:?}",
         h.probe.events()
     );
+}
+
+/// Quality review (M3, Important): a `flow.response` write in `on_request` —
+/// a plausible slip for `flow.request` — must not fabricate a status-0
+/// response the proxy then serves as a short-circuit. It is a hook error: the
+/// flow is forwarded with no response, the chain continues, and the bus says
+/// what to use instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_write_in_the_request_phase_is_an_error_not_a_short_circuit() {
+    let h = Harness::default(
+        r#"fn on_request(flow) { flow.response.headers.set("X-Seen", "1"); flow.response.status = 204; }"#,
+    );
+    let id = h.insert(http_flow());
+
+    let verdict = h.dispatch(Event::Request(id)).await;
+
+    assert_eq!(verdict, Verdict::Continue);
+    assert!(
+        http(&h.flow(id)).response.is_none(),
+        "no response was fabricated on the flow"
+    );
+    assert!(
+        h.probe.events().contains(&Event::Request(id)),
+        "the chain went on"
+    );
+    let errors = h.wait_for_errors(1).await;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    let msg = script_error_message(&errors[0]);
+    assert!(
+        msg.contains("no response yet") && msg.contains("set_response"),
+        "the error names the fix: {msg}"
+    );
+}
+
+/// Spec review (M3, Important): an uncaught guard refusal reaches the bus in
+/// the spec's pinned *denial* format — capability, typed reason, and the
+/// scope help line — not as a generic runtime error. A caught one is still a
+/// value the script can render and inspect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn denied_capability_reaches_the_bus_in_the_pinned_format() {
+    let h =
+        Harness::default(r#"fn on_request(flow) { http.send(#{ url: "http://evil.test/" }); }"#);
+    let id = h.insert(http_flow());
+    assert_eq!(h.dispatch(Event::Request(id)).await, Verdict::Continue);
+
+    let errors = h.wait_for_errors(1).await;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    let msg = script_error_message(&errors[0]);
+    assert!(
+        msg.contains("was denied capability 'http.send'"),
+        "pinned denial line: {msg}"
+    );
+    assert!(
+        msg.contains("reason: OutOfScope(\"evil.test\")"),
+        "typed reason: {msg}"
+    );
+    assert!(msg.contains("scope.add"), "scope help line: {msg}");
+
+    // Caught, the denial renders as text and exposes its parts.
+    let h = Harness::default(
+        r#"
+        fn on_request(flow) {
+            try { http.send(#{ url: "http://evil.test/" }); }
+            catch (e) {
+                flow.request.headers.set("X-Denied", "" + e);
+                flow.request.headers.set("X-Denied-Capability", e.capability);
+                flow.request.headers.set("X-Denied-Host", e.host);
+            }
+        }
+        "#,
+    );
+    let id = h.insert(http_flow());
+    assert_eq!(h.dispatch(Event::Request(id)).await, Verdict::Continue);
+    let flow = h.flow(id);
+    let f = http(&flow);
+    assert_eq!(
+        f.request.headers.get("X-Denied"),
+        Some("http.send to evil.test denied: host evil.test is out of scope")
+    );
+    assert_eq!(
+        f.request.headers.get("X-Denied-Capability"),
+        Some("http.send")
+    );
+    assert_eq!(f.request.headers.get("X-Denied-Host"), Some("evil.test"));
 }
 
 /// AC-M3-6, RF#4: a runaway hook is aborted by whichever budget it exhausts,

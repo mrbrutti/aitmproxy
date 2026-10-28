@@ -11,8 +11,19 @@
 //! verb drives its future with the stored runtime handle (`services.rt`), and
 //! the caller — `ScriptPlugin::on_event`, or a test — has already entered
 //! `tokio::task::block_in_place`, so blocking this worker is legal and tokio
-//! moves other tasks elsewhere. No second network path exists: every verb here
-//! passes the same `ScopeRateGuard` / SSRF guard a Rust plugin passes.
+//! moves other tasks elsewhere. Every future is driven under
+//! `tokio::time::timeout` for what is left of the run's wall-clock budget
+//! ([`crate::engine::remaining_budget`]), so a peer that never answers ends
+//! the hook at its deadline exactly as a busy loop would — the handle must
+//! therefore come from a runtime with timers enabled. No second network path
+//! exists: every verb here passes the same `ScopeRateGuard` / SSRF guard a
+//! Rust plugin passes.
+//!
+//! **Who is calling matters** ([`crate::engine::current_run`]). `browser.*` is
+//! refused inside a flow hook: the embedded browser routes through this proxy,
+//! so the navigation would queue on the chain lock the hook is holding.
+//! `scope.add` is refused from a PoC step always, and from plugins unless the
+//! operator set `rhai: allow_scope_add: true`.
 //!
 //! **Option C.** A read whose answer may simply be absent is forgiving —
 //! `store.get(unknown)` is `()`, a query matching nothing is an empty array. A
@@ -20,23 +31,71 @@
 //! capability and the reason, because a denial is not an absence.
 
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use aitm_browser::{check_url, HostResolver, SystemResolver};
 use aitm_core::{
-    classify_host, ssrf_check, Authority, Body, BrowserDriver, ClickTarget, Flow, FlowId, FlowKind,
-    FlowQuery, GuardError, HeaderMap, HostClass, HttpFlow, HttpRequest, HttpResponse, HttpVersion,
-    ScopeEntry, SsrfPolicy, Value,
+    Authority, Body, BrowserDriver, ClickTarget, Flow, FlowId, FlowKind, FlowQuery, GuardError,
+    HeaderMap, HttpFlow, HttpRequest, HttpResponse, HttpVersion, ScopeEntry, SsrfPolicy, Value,
 };
-use rhai::{Array, Blob, Dynamic, Engine, EvalAltResult, ImmutableString, Map, Module, Position};
+use rhai::{
+    Array, Blob, Dynamic, Engine, EvalAltResult, ImmutableString, Map, Module, NativeCallContext,
+    Position,
+};
 
+use crate::config::DEFAULT_HOOK_TIMEOUT;
+use crate::engine::{current_run, remaining_budget, AbortKind, RunKind};
 use crate::host_core::{ScriptCapability, ScriptServices};
 use crate::marshal::{dynamic_to_value, value_to_dynamic};
 
 /// The `API` version these providers require: M3's first and only one.
 const API_1: &str = "1";
+
+/// A guard refusal as the script catches it: `e.capability`, `e.host`,
+/// `e.reason`, and `"" + e` / `print(e)` render the one-line message. Thrown
+/// as the payload of a runtime error so that, uncaught, the dispatcher can
+/// recognise it and report the spec's pinned denial format rather than a
+/// generic runtime failure (`ScriptError::from_eval`).
+#[derive(Debug, Clone)]
+pub struct DeniedToken {
+    pub capability: String,
+    pub host: String,
+    pub reason: GuardError,
+}
+
+impl std::fmt::Display for DeniedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} to {} denied: {}",
+            self.capability, self.host, self.reason
+        )
+    }
+}
+
+/// Make [`DeniedToken`] readable from a script. Idempotent; every provider
+/// whose verbs can be refused registers it.
+fn register_denial(engine: &mut Engine) {
+    engine
+        .register_type_with_name::<DeniedToken>("Denied")
+        .register_get("capability", |d: &mut DeniedToken| -> ImmutableString {
+            d.capability.as_str().into()
+        })
+        .register_get("host", |d: &mut DeniedToken| -> ImmutableString {
+            d.host.as_str().into()
+        })
+        .register_get("reason", |d: &mut DeniedToken| -> ImmutableString {
+            d.reason.to_string().into()
+        })
+        .register_fn("to_string", |d: &mut DeniedToken| -> ImmutableString {
+            d.to_string().into()
+        })
+        .register_fn("to_debug", |d: &mut DeniedToken| -> ImmutableString {
+            format!("{d:?}").into()
+        });
+}
 
 /// Log target for what a script's guarded verbs do, so an operator can filter
 /// scope changes and refusals out of the rest of the log.
@@ -46,17 +105,23 @@ const HOST_TARGET: &str = "aitm_plugin_rhai::host";
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HttpCapability;
 
-/// `browser.navigate/click/type_text/screenshot/eval/get_dom`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct BrowserCapability;
+/// `browser.navigate/click/type_text/screenshot/evaluate/get_dom`, with the
+/// SSRF policy `navigate` checks a target against and the resolver it uses.
+#[derive(Clone)]
+pub struct BrowserCapability {
+    policy: SsrfPolicy,
+    resolver: Arc<dyn HostResolver>,
+}
 
 /// `store.get(id)` / `store.query(#{ … })`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StoreCapability;
 
-/// `scope.add(host)` / `scope.list()`.
+/// `scope.add(host)` / `scope.list()`; `add` only when the operator allowed it.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct ScopeCapability;
+pub struct ScopeCapability {
+    allow_add: bool,
+}
 
 /// The value behind the script-visible `http` constant.
 #[derive(Clone)]
@@ -64,7 +129,11 @@ struct HttpNs(ScriptServices);
 
 /// The value behind the script-visible `browser` constant.
 #[derive(Clone)]
-struct BrowserNs(ScriptServices);
+struct BrowserNs {
+    services: ScriptServices,
+    policy: SsrfPolicy,
+    resolver: Arc<dyn HostResolver>,
+}
 
 /// The value behind the script-visible `store` constant.
 #[derive(Clone)]
@@ -72,7 +141,42 @@ struct StoreNs(ScriptServices);
 
 /// The value behind the script-visible `scope` constant.
 #[derive(Clone)]
-struct ScopeNs(ScriptServices);
+struct ScopeNs {
+    services: ScriptServices,
+    allow_add: bool,
+}
+
+impl Default for BrowserCapability {
+    /// The deny-by-default policy and the system resolver.
+    fn default() -> Self {
+        Self::new(SsrfPolicy::default())
+    }
+}
+
+impl BrowserCapability {
+    /// `navigate` decides under `policy` — the host's `browser.ssrf` — with
+    /// the operating system's resolver.
+    pub fn new(policy: SsrfPolicy) -> Self {
+        Self {
+            policy,
+            resolver: Arc::new(SystemResolver),
+        }
+    }
+
+    /// Resolve names through `resolver` instead (tests).
+    pub fn with_resolver(mut self, resolver: Arc<dyn HostResolver>) -> Self {
+        self.resolver = resolver;
+        self
+    }
+}
+
+impl ScopeCapability {
+    /// `allow_add` is `rhai: allow_scope_add` — whether plugin scripts may
+    /// widen the scope. PoC steps may not, whatever it says.
+    pub fn new(allow_add: bool) -> Self {
+        Self { allow_add }
+    }
+}
 
 impl ScriptCapability for HttpCapability {
     fn namespace(&self) -> &str {
@@ -84,6 +188,7 @@ impl ScriptCapability for HttpCapability {
     }
 
     fn register(&self, engine: &mut Engine, services: &ScriptServices) {
+        register_denial(engine);
         engine
             .register_type_with_name::<HttpNs>("http")
             .register_fn("send", |ns: &mut HttpNs, req: Map| send(&ns.0, req));
@@ -101,52 +206,61 @@ impl ScriptCapability for BrowserCapability {
     }
 
     fn register(&self, engine: &mut Engine, services: &ScriptServices) {
+        register_denial(engine);
         engine
             .register_type_with_name::<BrowserNs>("browser")
             .register_fn("navigate", |ns: &mut BrowserNs, url: &str| {
-                navigate(&ns.0, url)
+                navigate(ns, url)
             })
             .register_fn("click", |ns: &mut BrowserNs, target: &str| {
-                let driver = driver(&ns.0)?;
+                let driver = driver(ns, "browser.click")?;
                 block_on(
-                    &ns.0,
+                    "browser.click",
+                    &ns.services,
                     driver.click(ClickTarget::Selector(target.to_string())),
                 )
-                .map_err(|err| failed("browser.click", err))
             })
             .register_fn(
                 "type_text",
                 |ns: &mut BrowserNs, selector: &str, text: &str| {
-                    let driver = driver(&ns.0)?;
-                    block_on(&ns.0, driver.type_text(selector, text))
-                        .map_err(|err| failed("browser.type_text", err))
+                    let driver = driver(ns, "browser.type_text")?;
+                    block_on(
+                        "browser.type_text",
+                        &ns.services,
+                        driver.type_text(selector, text),
+                    )
                 },
             )
             .register_fn("screenshot", |ns: &mut BrowserNs| -> ScriptResult<Blob> {
-                let driver = driver(&ns.0)?;
-                block_on(&ns.0, driver.screenshot())
-                    .map_err(|err| failed("browser.screenshot", err))
+                let driver = driver(ns, "browser.screenshot")?;
+                block_on("browser.screenshot", &ns.services, driver.screenshot())
             })
             // `evaluate`, not `eval`: `eval` is a Rhai reserved word and cannot
             // be a method name, so no script could call it (spec §6). The MCP
             // and CLI tool is still named `browser.eval` — a tool name is not a
             // Rhai identifier.
             .register_fn("evaluate", |ns: &mut BrowserNs, expr: &str| {
-                let driver = driver(&ns.0)?;
-                block_on(&ns.0, driver.eval(expr))
+                let driver = driver(ns, "browser.evaluate")?;
+                block_on("browser.evaluate", &ns.services, driver.eval(expr))
                     .map(|value| value_to_dynamic(&value))
-                    .map_err(|err| failed("browser.evaluate", err))
             })
             .register_fn(
                 "get_dom",
                 |ns: &mut BrowserNs| -> ScriptResult<ImmutableString> {
-                    let driver = driver(&ns.0)?;
-                    block_on(&ns.0, driver.get_dom())
+                    let driver = driver(ns, "browser.get_dom")?;
+                    block_on("browser.get_dom", &ns.services, driver.get_dom())
                         .map(ImmutableString::from)
-                        .map_err(|err| failed("browser.get_dom", err))
                 },
             );
-        set_namespace(engine, "browser", BrowserNs(services.clone()));
+        set_namespace(
+            engine,
+            "browser",
+            BrowserNs {
+                services: services.clone(),
+                policy: self.policy.clone(),
+                resolver: Arc::clone(&self.resolver),
+            },
+        );
     }
 }
 
@@ -180,19 +294,31 @@ impl ScriptCapability for ScopeCapability {
     fn register(&self, engine: &mut Engine, services: &ScriptServices) {
         engine
             .register_type_with_name::<ScopeNs>("scope")
-            .register_fn("add", |ns: &mut ScopeNs, host: &str| add_scope(&ns.0, host))
+            .register_fn(
+                "add",
+                |ctx: NativeCallContext, ns: &mut ScopeNs, host: &str| add_scope(&ctx, ns, host),
+            )
             .register_fn("list", |ns: &mut ScopeNs| -> Array {
-                ns.0.guard
+                ns.services
+                    .guard
                     .list_scope()
                     .into_iter()
                     .map(|entry| Dynamic::from(entry.host))
                     .collect()
             });
-        set_namespace(engine, "scope", ScopeNs(services.clone()));
+        set_namespace(
+            engine,
+            "scope",
+            ScopeNs {
+                services: services.clone(),
+                allow_add: self.allow_add,
+            },
+        );
     }
 }
 
-/// What every fallible verb returns: a Rhai error a script can `try`/`catch`.
+/// What every fallible verb returns: a Rhai error a script can `try`/`catch`
+/// (or, for a budget abort, a termination it cannot).
 type ScriptResult<T> = Result<T, Box<EvalAltResult>>;
 
 /// Expose `value` to scripts as the global constant `name`.
@@ -202,10 +328,34 @@ fn set_namespace<T: Clone + Send + Sync + 'static>(engine: &mut Engine, name: &s
     engine.register_global_module(module.into());
 }
 
-/// Drive a guarded future from the synchronous engine. The caller has already
-/// entered `block_in_place`, so this worker may block.
-fn block_on<F: Future>(services: &ScriptServices, fut: F) -> F::Output {
-    services.rt.block_on(fut)
+/// Drive a guarded future from the synchronous engine, for at most what is
+/// left of the run's budget. The caller has already entered `block_in_place`,
+/// so this worker may block. A future that outlives the budget aborts the run
+/// with the same Timeout termination `on_progress` would raise — the hook
+/// ends at its deadline whether it is computing or waiting. Outside any run
+/// (a bare evaluation) the default hook budget applies.
+fn block_on<T>(
+    capability: &str,
+    services: &ScriptServices,
+    fut: impl Future<Output = anyhow::Result<T>>,
+) -> ScriptResult<T> {
+    let budget = remaining_budget().unwrap_or(DEFAULT_HOOK_TIMEOUT);
+    match services.rt.block_on(tokio::time::timeout(budget, fut)) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(failed(capability, err)),
+        Err(_) => {
+            tracing::warn!(
+                target: HOST_TARGET,
+                capability,
+                ?budget,
+                "host call outlived the run's budget; aborting the run"
+            );
+            Err(
+                EvalAltResult::ErrorTerminated(Dynamic::from(AbortKind::Timeout), Position::NONE)
+                    .into(),
+            )
+        }
+    }
 }
 
 // ---------------------------------------------------------------- http.send
@@ -223,8 +373,7 @@ fn send(services: &ScriptServices, req: Map) -> ScriptResult<Map> {
         .check_active(&authority)
         .map_err(|reason| denied("http.send", &authority, &reason))?;
 
-    let flow = block_on(services, services.client.send(request))
-        .map_err(|err| failed("http.send", err))?;
+    let flow = block_on("http.send", services, services.client.send(request))?;
     Ok(response_map(&flow))
 }
 
@@ -233,6 +382,12 @@ const SEND_KEYS: [&str; 4] = ["method", "url", "headers", "body"];
 
 /// Turn the script's request map into a captured-request shape. A malformed
 /// request is a mistake, not an absence: it is refused with what to fix.
+///
+/// Nothing reaches the request line unvalidated: the method must be an HTTP
+/// token (RFC 9110 §5.6.2) and the path/query may carry no space or control
+/// character, so a CR/LF assembled from extracted data cannot smuggle a
+/// header or a second request. Header names and values go through `try_set`,
+/// which refuses the same characters.
 fn parse_request(req: Map) -> ScriptResult<HttpRequest> {
     if let Some(unknown) = req.keys().find(|k| !SEND_KEYS.contains(&k.as_str())) {
         return Err(error(format!(
@@ -250,10 +405,20 @@ fn parse_request(req: Map) -> ScriptResult<HttpRequest> {
         }
     };
     let (scheme, authority, path) = parse_url("http.send", &url)?;
+    if path.bytes().any(|b| b <= b' ' || b == 0x7f) {
+        return Err(error(format!(
+            "http.send(...): URL \"{}\" has a space or control character in its path; percent-encode it",
+            url.escape_default()
+        )));
+    }
     let method = text_field(&req, "method", "http.send")?.unwrap_or_else(|| "GET".to_string());
+    if !is_token(&method) {
+        return Err(error(format!(
+            "http.send(...) 'method' must be an HTTP token like GET or POST, got \"{}\"",
+            method.escape_default()
+        )));
+    }
 
-    // Header names and values go through `try_set`, which refuses the control
-    // characters a header-injection payload needs.
     let mut headers = HeaderMap::new();
     if let Some(value) = req.get("headers").filter(|value| !value.is_unit()) {
         let map = value.read_lock::<Map>().ok_or_else(|| {
@@ -298,6 +463,13 @@ fn parse_request(req: Map) -> ScriptResult<HttpRequest> {
     })
 }
 
+/// RFC 9110 `token`: one or more `tchar`.
+fn is_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
 /// What a script sees back from `http.send`.
 fn response_map(flow: &HttpFlow) -> Map {
     let mut out = Map::new();
@@ -322,62 +494,50 @@ fn response_map(flow: &HttpFlow) -> Map {
 
 // ------------------------------------------------------------------ browser
 
-/// The wired browser, or a catchable error: a build with no browser cannot
-/// perform the action at all, which is a failure, not an absent answer.
-fn driver(services: &ScriptServices) -> ScriptResult<Arc<dyn BrowserDriver>> {
-    services.browser.clone().ok_or_else(|| {
+/// The wired browser, or a catchable error — and, first, the run-kind gate:
+/// a flow hook may not drive the browser at all. The embedded browser sends
+/// every request through this proxy, so a navigation from a hook would queue
+/// on the chain lock that hook is holding until the navigation timeout; the
+/// verbs are safe from a script command or a PoC step, where no lock is held.
+fn driver(ns: &BrowserNs, capability: &str) -> ScriptResult<Arc<dyn BrowserDriver>> {
+    if current_run() == Some(RunKind::Hook) {
+        return Err(error(format!(
+            "{capability} is not available inside a flow hook: the browser drives its pages \
+             through this proxy, so the navigation would wait on the chain that is running \
+             this hook. Drive the browser from a script command (reg.add_command) or a PoC \
+             script step instead."
+        )));
+    }
+    ns.services.browser.clone().ok_or_else(|| {
         error("no browser is configured; start aitm with the browser enabled to use browser.*")
     })
 }
 
-/// `browser.navigate(url)`: SSRF pre-flight first (a private/loopback target
-/// that is not explicitly in scope is refused before anything is driven), then
-/// the scope/rate gate, then the drive. Later verbs act on the page this
-/// admitted; the browser's own proxy connector guards its sub-resources.
-fn navigate(services: &ScriptServices, url: &str) -> ScriptResult<()> {
-    let driver = driver(services)?;
+/// `browser.navigate(url)`: the same SSRF decision as the Rust
+/// `browser.navigate` command — resolve the host and classify every address
+/// under the host's policy, so a scoped *name* pointing at a private address
+/// is refused — then the scope/rate gate, then the drive. Later verbs act on
+/// the page this admitted; the browser's own proxy connector guards its
+/// sub-resources.
+fn navigate(ns: &BrowserNs, url: &str) -> ScriptResult<()> {
+    let driver = driver(ns, "browser.navigate")?;
     let (_, authority, _) = parse_url("browser.navigate", url)?;
     let authority = normalize_authority("browser.navigate", url, &authority)?;
 
-    ssrf_preflight(services, &authority)
-        .map_err(|reason| denied("browser.navigate", &authority, &reason))?;
-    let _permit = services
+    check_url(
+        url,
+        &ns.policy,
+        &ns.services.guard.list_scope(),
+        ns.resolver.as_ref(),
+    )
+    .map_err(|reason| denied("browser.navigate", &authority, &reason))?;
+    let _permit = ns
+        .services
         .guard
         .check_active(&authority)
         .map_err(|reason| denied("browser.navigate", &authority, &reason))?;
 
-    block_on(services, driver.navigate(url))
-        .map(|_| ())
-        .map_err(|err| failed("browser.navigate", err))
-}
-
-/// The SSRF decision for a navigation target, on `aitm-core`'s own check (the
-/// one the proxy connector uses), under the deny-by-default policy.
-///
-/// A host that is already an address — or `localhost` — is classified here. A
-/// DNS name is classified where it is resolved: the browser's proxy connector,
-/// which sees the actual connection (and therefore redirects, page `fetch` and
-/// sub-resources too). `aitm-core` exposes no resolver, and resolving here
-/// would be a second, divergent decision path.
-fn ssrf_preflight(services: &ScriptServices, authority: &str) -> Result<(), GuardError> {
-    let parsed = Authority::parse_with_default(authority, 80)
-        .map_err(|_| GuardError::OutOfScope(authority.to_string()))?;
-    let dst = match parsed.ip() {
-        Some(ip) => Some(ip),
-        None if classify_host(&parsed.host) == HostClass::Loopback => {
-            Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
-        }
-        None => None,
-    };
-    match dst {
-        Some(ip) => ssrf_check(
-            &SsrfPolicy::default(),
-            &services.guard.list_scope(),
-            authority,
-            ip,
-        ),
-        None => Ok(()),
-    }
+    block_on("browser.navigate", &ns.services, driver.navigate(url)).map(|_| ())
 }
 
 // -------------------------------------------------------------------- store
@@ -518,17 +678,43 @@ fn http_response_map(resp: &HttpResponse) -> Map {
 // -------------------------------------------------------------------- scope
 
 /// `scope.add(host)`: widen the authorized scope through the guard itself, so
-/// every later check — a script's and a Rust plugin's alike — sees it. Logged,
-/// because an operator auditing a run wants to see scope grow.
-fn add_scope(services: &ScriptServices, host: &str) -> ScriptResult<()> {
+/// every later check — a script's and a Rust plugin's alike — sees it.
+///
+/// Widening the scope also lifts the SSRF block for an address named exactly,
+/// so this is the one verb that is *not* available by default: a plugin
+/// script gets it only when the operator set `rhai: allow_scope_add: true`,
+/// and a PoC step — a shareable artifact that runs inside the scope the
+/// operator set — never does. Every widening is logged at `warn` with the
+/// script that did it, because an operator auditing a run wants to see scope
+/// grow.
+fn add_scope(ctx: &NativeCallContext, ns: &ScopeNs, host: &str) -> ScriptResult<()> {
+    if current_run() == Some(RunKind::PocStep) {
+        return Err(error(
+            "scope.add(...) is not available from a PoC script step: a PoC runs inside the \
+             scope the operator set. Add the host with the scope.add command or the `scope:` \
+             config before running it.",
+        ));
+    }
+    if !ns.allow_add {
+        return Err(error(
+            "scope.add(...) is disabled: a script may not widen the engagement scope unless \
+             the config sets `rhai: allow_scope_add: true`. Add the host with the scope.add \
+             command or the `scope:` config instead.",
+        ));
+    }
     let host = host.trim();
     if host.is_empty() || Authority::parse_with_default(host, 0).is_err() {
         return Err(error(format!(
             "scope.add(...): \"{host}\" is not a host, host:port or *.wildcard"
         )));
     }
-    tracing::info!(target: HOST_TARGET, host, "script added a scope entry");
-    services.guard.add_scope(ScopeEntry {
+    tracing::warn!(
+        target: HOST_TARGET,
+        script = ctx.call_source().unwrap_or("<unnamed script>"),
+        host,
+        "script widened the engagement scope"
+    );
+    ns.services.guard.add_scope(ScopeEntry {
         host: host.to_string(),
     });
     Ok(())
@@ -627,7 +813,12 @@ fn error(message: impl Into<String>) -> Box<EvalAltResult> {
 /// the host and why. Denial is never forgiven into an "absent" answer.
 fn denied(capability: &str, host: &str, reason: &GuardError) -> Box<EvalAltResult> {
     tracing::warn!(target: HOST_TARGET, capability, host, %reason, "script capability denied");
-    error(format!("{capability} to {host} denied: {reason}"))
+    let token = DeniedToken {
+        capability: capability.to_string(),
+        host: host.to_string(),
+        reason: reason.clone(),
+    };
+    EvalAltResult::ErrorRuntime(Dynamic::from(token), Position::NONE).into()
 }
 
 /// An action that was allowed but did not succeed (upstream refused the

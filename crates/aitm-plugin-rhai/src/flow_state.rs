@@ -151,11 +151,12 @@ impl FlowState {
                 if let Some(req) = request {
                     req.write_back(&mut f.request);
                 }
-                if let Some(resp) = response {
-                    match f.response.as_mut() {
-                        Some(live) => resp.write_back(live),
-                        None => f.response = Some(resp.into_response(f.request.version)),
-                    }
+                // A snapshot only ever carries a response the live flow already
+                // had: the handles refuse to edit an absent one, and the only
+                // way to *create* a response is the explicit `SetResponse`
+                // effect below.
+                if let (Some(resp), Some(live)) = (response, f.response.as_mut()) {
+                    resp.write_back(live);
                 }
                 f.metadata.marks = marks;
                 f.metadata.comment = comment;
@@ -270,17 +271,6 @@ impl ResponseState {
         }
         if body_changed(&self.body, &before.body) {
             live.body = Body::Bytes(self.body);
-        }
-    }
-
-    /// A fresh response where the live flow had none yet.
-    fn into_response(self, version: HttpVersion) -> HttpResponse {
-        HttpResponse {
-            status: self.status,
-            version,
-            headers: header_map(self.headers),
-            body: Body::Bytes(self.body),
-            timestamp: SystemTime::now(),
         }
     }
 }

@@ -5,6 +5,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use aitm_core::GuardError;
+use rhai::EvalAltResult;
+
+use crate::engine::{AbortKind, Budget};
+use crate::host_net::DeniedToken;
 
 /// Everything that can go wrong loading or running a script, carrying what a
 /// human needs to fix it. `Display` renders the spec §8 pinned format:
@@ -57,6 +61,91 @@ pub enum ScriptError {
         declared: String,
         supported: String,
     },
+}
+
+impl ScriptError {
+    /// The `ScriptError` a failed evaluation amounts to: which budget it
+    /// blew (named with the configured figure), which capability refused it,
+    /// or where it threw. One classifier for every entry point — hook, `load`,
+    /// command, PoC step — so the pinned format is the same everywhere.
+    pub fn from_eval(script: &str, hook: &str, err: &EvalAltResult, budget: &Budget) -> Self {
+        let script = script.to_string();
+        let hook = hook.to_string();
+        let op_limit = |script, hook| ScriptError::OpLimit {
+            script,
+            hook,
+            operations: budget.max_operations,
+        };
+        match err {
+            EvalAltResult::ErrorTerminated(token, _) => {
+                match token.clone().try_cast::<AbortKind>() {
+                    Some(AbortKind::OpLimit) => return op_limit(script, hook),
+                    Some(AbortKind::Timeout) => {
+                        return ScriptError::Timeout {
+                            script,
+                            hook,
+                            elapsed: budget.hook_timeout,
+                        }
+                    }
+                    None => {}
+                }
+            }
+            // The engine's own hard cap, one operation above the token's
+            // threshold (see `engine::harden`).
+            EvalAltResult::ErrorTooManyOperations(_) => return op_limit(script, hook),
+            _ => {}
+        }
+        // A throw inside the hook body arrives wrapped in `ErrorInFunctionCall`
+        // (one layer per script function on the way out); the cause — and
+        // the position worth reporting — is the innermost error.
+        let cause = innermost(err);
+        if let EvalAltResult::ErrorRuntime(value, _) = cause {
+            if let Some(denied) = value.clone().try_cast::<DeniedToken>() {
+                return ScriptError::Denied {
+                    script,
+                    hook,
+                    capability: denied.capability,
+                    reason: denied.reason,
+                };
+            }
+        }
+        ScriptError::Runtime {
+            script,
+            hook,
+            line: cause.position().line().unwrap_or(0),
+            message: describe(cause),
+        }
+    }
+}
+
+/// The error at the bottom of a chain of script function calls.
+fn innermost(err: &EvalAltResult) -> &EvalAltResult {
+    match err {
+        EvalAltResult::ErrorInFunctionCall(_, _, inner, _) => innermost(inner),
+        other => other,
+    }
+}
+
+/// What went wrong, in one line without Rhai's own framing: a thrown value
+/// reads as itself (a thrown denial as its message), anything else as Rhai
+/// renders it minus the trailing position, which the pinned format already
+/// carries.
+pub fn describe(err: &EvalAltResult) -> String {
+    if let EvalAltResult::ErrorRuntime(value, _) = err {
+        if let Some(denied) = value.clone().try_cast::<DeniedToken>() {
+            return denied.to_string();
+        }
+        if let Some(text) = value.read_lock::<rhai::ImmutableString>() {
+            return text.to_string();
+        }
+    }
+    let mut text = err.to_string();
+    if let Some(i) = text.rfind(" (line ") {
+        if text.ends_with(')') {
+            text.truncate(i);
+        }
+    }
+    text
 }
 
 /// The help text shared by every "the hook was aborted" class.

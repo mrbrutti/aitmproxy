@@ -32,6 +32,7 @@ scripts:
     enabled: false
 rhai:
   strict: true
+  allow_scope_add: true
   hook_timeout: 5
   max_operations: 500000
   max_string_size: 4096
@@ -63,6 +64,10 @@ rhai:
     assert!(!s.rhai.scripts[2].enabled, "enabled: false is honoured");
 
     assert!(s.rhai.strict);
+    assert!(
+        s.rhai.allow_scope_add,
+        "the operator opted plugin scripts into scope.add"
+    );
     assert_eq!(s.rhai.hook_timeout, Duration::from_secs(5));
     assert_eq!(s.rhai.limits.max_operations, 500_000);
     assert_eq!(s.rhai.limits.max_string_size, 4096);
@@ -83,6 +88,10 @@ fn absent_sections_keep_defaults() {
     let s = settings("listen: \"127.0.0.1:9000\"\n");
     assert!(s.rhai.scripts.is_empty());
     assert!(!s.rhai.strict);
+    assert!(
+        !s.rhai.allow_scope_add,
+        "scripts may not widen the scope unless the operator says so"
+    );
     assert_eq!(s.rhai.hook_timeout, Duration::from_secs(2));
     assert_eq!(
         s.rhai.limits,

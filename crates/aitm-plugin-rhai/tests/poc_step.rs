@@ -129,9 +129,9 @@ impl Harness {
             &LogCapability,
             &FindingCapability,
             &HttpCapability,
-            &BrowserCapability,
+            &BrowserCapability::default(),
             &StoreCapability,
-            &ScopeCapability,
+            &ScopeCapability::default(),
             &VarsCapability,
         ];
         for provider in providers {
@@ -375,6 +375,58 @@ async fn runaway_step_hits_op_budget() {
     assert!(
         err.to_string().contains("10000 operation budget"),
         "the error must name the budget: {err}"
+    );
+}
+
+/// Quality review (M3, Minor): a step that runs out of wall-clock names the
+/// *configured* budget — the figure the operator set — not the elapsed time
+/// it happened to measure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_step_names_the_configured_time_budget() {
+    use aitm_plugin_rhai::engine::Budget;
+
+    let h = Harness::new();
+    let limits = RhaiLimits {
+        max_operations: 0,
+        ..RhaiLimits::default()
+    };
+    let budget = Budget {
+        max_operations: 0,
+        hook_timeout: Duration::from_millis(50),
+    };
+    let exec = RhaiScriptExecutor::new(h.engine(&limits), h.services.clone()).with_budget(budget);
+    let mut vars = aitm_poc::VarBindings::new();
+
+    let started = Instant::now();
+    let err = h
+        .run_step(&exec, r#"let i = 0; loop { i += 1; }"#, &mut vars)
+        .expect_err("a slow step must be aborted");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(
+        err.to_string().contains("50ms time budget"),
+        "the error quotes the configured budget: {err}"
+    );
+}
+
+/// Security review (M3, Important): a PoC step never widens the scope, even
+/// where plugin scripts are allowed to — a PoC is a shared artifact that runs
+/// inside the scope the operator set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn step_cannot_widen_scope() {
+    let h = Harness::new();
+    let mut engine = build_engine(&RhaiLimits::default(), Duration::from_secs(5));
+    ScopeCapability::new(true).register(&mut engine, &h.services);
+    VarsCapability.register(&mut engine, &h.services);
+    let exec = RhaiScriptExecutor::new(Arc::new(engine), h.services.clone());
+    let mut vars = aitm_poc::VarBindings::new();
+
+    let err = h
+        .run_step(&exec, r#"scope.add("evil.test"); return pass;"#, &mut vars)
+        .expect_err("scope.add from a step must fail the step");
+    assert!(err.to_string().contains("PoC"), "{err}");
+    assert!(
+        !h.guard.list_scope().iter().any(|e| e.host == "evil.test"),
+        "the scope is unchanged"
     );
 }
 

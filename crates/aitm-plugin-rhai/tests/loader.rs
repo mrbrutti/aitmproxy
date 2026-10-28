@@ -55,8 +55,8 @@ fn config(scripts: Vec<ScriptEntry>, strict: bool) -> RhaiConfig {
         scripts,
         limits: RhaiLimits::default(),
         hook_timeout: Duration::from_secs(5),
-        hot_reload: false,
         strict,
+        ..RhaiConfig::default()
     }
 }
 
@@ -351,11 +351,9 @@ async fn new_reports_an_unbuildable_engine() {
         ..RhaiLimits::default()
     };
     let cfg = RhaiConfig {
-        scripts: Vec::new(),
         limits,
         hook_timeout: Duration::from_secs(5),
-        hot_reload: false,
-        strict: false,
+        ..RhaiConfig::default()
     };
 
     let err = RhaiLoader::new(cfg, services())

@@ -13,8 +13,10 @@
 //!
 //! The step body is a top-level block, not a function: it is compiled once per
 //! distinct text (cached by content), then run with `eval_ast_with_scope`
-//! inside `tokio::task::block_in_place`, under the engine's operation and
-//! wall-clock budget. The scope carries the constants `pass` and `fail`; the
+//! as blocking work inside a `PocStep` run ([`crate::engine::begin_run`]),
+//! under the configured operation and wall-clock budget — the run kind is
+//! what keeps `scope.add` out of a step. The scope carries the constants
+//! `pass` and `fail`; the
 //! value the script returns — `return pass;`, `return fail;`, or a bare tail
 //! expression — is the verdict, and anything else (falling off the end, `()`,
 //! a stray number) is `Neutral` (Review Focus #5).
@@ -34,14 +36,14 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
 
 use aitm_poc::{
     ScriptStep, ScriptStepCtx, ScriptStepError, ScriptStepExecutor, ScriptVerdict, VarBindings,
 };
 use rhai::{Dynamic, Engine, EvalAltResult, Position, Scope, AST};
 
-use crate::engine::AbortKind;
+use crate::config::DEFAULT_HOOK_TIMEOUT;
+use crate::engine::{begin_run, blocking, Budget, RunKind};
 use crate::error::ScriptError;
 use crate::host_core::{ScriptCapability, ScriptServices};
 use crate::marshal::{dynamic_to_value, value_to_dynamic};
@@ -50,6 +52,8 @@ use crate::marshal::{dynamic_to_value, value_to_dynamic};
 pub struct RhaiScriptExecutor {
     engine: Arc<Engine>,
     services: ScriptServices,
+    /// The budget a step runs under; the figure its abort errors quote.
+    budget: Budget,
     /// Compiled step bodies by content hash; a PoC's steps compile once per
     /// process, however often the PoC is run.
     cache: Mutex<HashMap<u64, Arc<AST>>>,
@@ -68,12 +72,27 @@ const UNNAMED_STEP: &str = "script";
 impl RhaiScriptExecutor {
     /// Run steps on `engine`, which must already carry the host surface and
     /// [`VarsCapability`]; `services` are the handles that surface is wired to.
+    /// The budget defaults to the engine's operation cap and the default hook
+    /// timeout; [`RhaiScriptExecutor::with_budget`] sets the configured one.
     pub fn new(engine: Arc<Engine>, services: ScriptServices) -> Self {
+        let budget = Budget {
+            // `engine::harden` sets the hard cap one above the configured
+            // budget so the named token fires first.
+            max_operations: engine.max_operations().saturating_sub(1),
+            hook_timeout: DEFAULT_HOOK_TIMEOUT,
+        };
         Self {
             engine,
             services,
+            budget,
             cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The budget every step runs under (the tier's configured one).
+    pub fn with_budget(mut self, budget: Budget) -> Self {
+        self.budget = budget;
+        self
     }
 
     /// The services the shared engine's host verbs act through — the handles
@@ -119,49 +138,6 @@ impl RhaiScriptExecutor {
         cache.insert(key, Arc::clone(&ast));
         Ok(ast)
     }
-
-    /// The `ScriptError` a failed run amounts to: which budget it blew, or
-    /// where it threw.
-    fn classify(&self, script: &str, err: &EvalAltResult, elapsed: Duration) -> ScriptError {
-        let script = script.to_string();
-        let hook = STEP_HOOK.to_string();
-        let op_limit = |script, hook| ScriptError::OpLimit {
-            script,
-            hook,
-            operations: self.operation_budget(),
-        };
-        match err {
-            EvalAltResult::ErrorTerminated(token, _) => {
-                match token.clone().try_cast::<AbortKind>() {
-                    Some(AbortKind::OpLimit) => return op_limit(script, hook),
-                    Some(AbortKind::Timeout) => {
-                        return ScriptError::Timeout {
-                            script,
-                            hook,
-                            elapsed,
-                        }
-                    }
-                    None => {}
-                }
-            }
-            // The engine's own hard cap, one operation above the token's
-            // threshold (see `engine::harden`).
-            EvalAltResult::ErrorTooManyOperations(_) => return op_limit(script, hook),
-            _ => {}
-        }
-        ScriptError::Runtime {
-            script,
-            hook,
-            line: err.position().line().unwrap_or(0),
-            message: err.to_string(),
-        }
-    }
-
-    /// The operation budget as configured: `engine::harden` sets the engine's
-    /// hard cap one above it so the named token fires first.
-    fn operation_budget(&self) -> u64 {
-        self.engine.max_operations().saturating_sub(1)
-    }
 }
 
 impl ScriptStepExecutor for RhaiScriptExecutor {
@@ -182,8 +158,8 @@ impl ScriptStepExecutor for RhaiScriptExecutor {
             // constant, and `vars.set(...)` is one.
             .push("vars", vars.clone());
 
-        let started = Instant::now();
-        let result = tokio::task::block_in_place(|| {
+        let result = blocking(|| {
+            let _run = begin_run(RunKind::PocStep, self.budget.hook_timeout);
             self.engine.eval_ast_with_scope::<Dynamic>(&mut scope, &ast)
         });
 
@@ -194,7 +170,7 @@ impl ScriptStepExecutor for RhaiScriptExecutor {
             }
             // `vars` is dropped unapplied: the bindings stay as they were.
             Err(err) => Err(ScriptStepError(
-                self.classify(name, &err, started.elapsed()).to_string(),
+                ScriptError::from_eval(name, STEP_HOOK, &err, &self.budget).to_string(),
             )),
         }
     }

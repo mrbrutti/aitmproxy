@@ -13,12 +13,14 @@
 //! `Event::Error` reaches the bus, and the chain continues (spec §8,
 //! AC-M3-12).
 //!
-//! The whole hook runs inside `tokio::task::block_in_place`, so a slow script
-//! blocks only this worker and the guarded async host verbs may `block_on`
-//! the runtime handle (spec §6).
+//! The whole hook runs inside `engine::blocking` (`block_in_place`) with a
+//! run of kind `Hook` open ([`crate::engine::begin_run`]), so a slow script
+//! blocks only this worker, the guarded async host verbs may `block_on` the
+//! runtime handle for what is left of the budget, and `browser.*` knows to
+//! refuse (spec §6).
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::time::Duration;
 
 use aitm_core::{
     Event, EventSink, FlowCtx, FlowError, FlowId, LimitConfig, Plugin, Registry, Verdict,
@@ -27,8 +29,8 @@ use arc_swap::ArcSwap;
 use rhai::{CallFnOptions, Dynamic, Engine, EvalAltResult, Scope, AST};
 
 use crate::command::ScriptRegHandle;
-use crate::config::{RhaiConfig, RhaiLimits, ScriptMeta};
-use crate::engine::AbortKind;
+use crate::config::{RhaiConfig, ScriptMeta};
+use crate::engine::{begin_run, blocking, Budget, RunKind};
 use crate::error::ScriptError;
 use crate::flow_api::{ActiveFlow, ScriptFlow, ScriptWsMessage};
 use crate::flow_state::FlowState;
@@ -41,17 +43,55 @@ const SCRIPT_TARGET: &str = "aitm_plugin_rhai::script";
 pub struct ScriptPlugin {
     meta: ScriptMeta,
     engine: Arc<Engine>,
-    /// Swapped live by [`ScriptPlugin::reload`]; a hook holds the AST it
-    /// started with for its whole run.
-    ast: ArcSwap<AST>,
+    /// The compiled script, shared with the `script.reload` command.
+    handle: Arc<ScriptHandle>,
     services: ScriptServices,
     /// Passed to every hook run as its Rhai tag, where `option(name)` reads it.
     options: Options,
-    limits: RhaiLimits,
-    hook_timeout: Duration,
+    budget: Budget,
     /// How much of a body the snapshot materializes for the script.
     max_body: usize,
     errors: Arc<ErrorSink>,
+}
+
+/// A loaded script's identity and its live AST — the hot-reload seam. The
+/// plugin reads the AST per event; `script.reload` swaps it from outside the
+/// chain, which owns the plugin itself behind its lock. A hook already running
+/// finishes on the AST it started with; the next event sees the new one.
+pub struct ScriptHandle {
+    name: String,
+    path: PathBuf,
+    ast: ArcSwap<AST>,
+}
+
+impl ScriptHandle {
+    fn new(meta: &ScriptMeta, ast: AST) -> Self {
+        Self {
+            name: meta.name.clone(),
+            path: meta.path.clone(),
+            ast: ArcSwap::from_pointee(named(ast, &meta.name)),
+        }
+    }
+
+    /// The script's `NAME` (or file stem).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The file it was compiled from — what a reload recompiles.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Put a freshly compiled AST in service. The caller keeps the old one by
+    /// simply not calling this when a recompile fails.
+    pub fn swap(&self, ast: AST) {
+        self.ast.store(Arc::new(named(ast, &self.name)));
+    }
+
+    fn current(&self) -> Arc<AST> {
+        self.ast.load_full()
+    }
 }
 
 /// Where a failed hook's `Event::Error` goes. Late-bound: plugins are
@@ -94,15 +134,14 @@ impl ScriptPlugin {
         options: Options,
         cfg: &RhaiConfig,
     ) -> Self {
-        let ast = ArcSwap::from_pointee(named(ast, &meta.name));
+        let handle = Arc::new(ScriptHandle::new(&meta, ast));
         Self {
             meta,
             engine,
-            ast,
+            handle,
             services,
             options,
-            limits: cfg.limits.clone(),
-            hook_timeout: cfg.hook_timeout,
+            budget: Budget::of(cfg),
             max_body: LimitConfig::default().max_body_bytes,
             errors: Arc::default(),
         }
@@ -124,17 +163,22 @@ impl ScriptPlugin {
         &self.meta
     }
 
-    /// Swap in a freshly compiled AST (the hot-reload seam). A hook already
-    /// running finishes on the AST it started with; the next event sees the
-    /// new one. The caller keeps the old AST by simply not calling this when a
-    /// recompile fails.
+    /// Swap in a freshly compiled AST (the hot-reload seam; see
+    /// [`ScriptHandle::swap`]).
     pub fn reload(&self, ast: AST) {
-        self.ast.store(Arc::new(named(ast, &self.meta.name)));
+        self.handle.swap(ast);
+    }
+
+    /// The handle `script.reload` swaps the AST through. Taken by the wiring
+    /// before the plugin is boxed into the registry.
+    pub fn handle(&self) -> Arc<ScriptHandle> {
+        Arc::clone(&self.handle)
     }
 
     /// Run `hook` over `state` the way the spec's bridge describes: the whole
-    /// call under `block_in_place`, with `state` bound as the flow a bare
-    /// `halt()` acts on and the script's options as the run's tag.
+    /// call as blocking work, inside a `Hook` run with the configured budget,
+    /// with `state` bound as the flow a bare `halt()` acts on and the script's
+    /// options as the run's tag.
     fn call_hook(
         &self,
         ast: &AST,
@@ -142,7 +186,8 @@ impl ScriptPlugin {
         state: &Arc<Mutex<FlowState>>,
         args: Vec<Dynamic>,
     ) -> Result<(), Box<EvalAltResult>> {
-        tokio::task::block_in_place(|| {
+        blocking(|| {
+            let _run = begin_run(RunKind::Hook, self.budget.hook_timeout);
             let _active = ActiveFlow::enter(Arc::clone(state));
             self.engine
                 .call_fn_with_options::<Dynamic>(
@@ -154,43 +199,6 @@ impl ScriptPlugin {
                 )
                 .map(drop)
         })
-    }
-
-    /// The `ScriptError` a failed hook run amounts to: which budget it blew,
-    /// or where it threw.
-    fn classify(&self, hook: &str, err: &EvalAltResult) -> ScriptError {
-        let script = self.meta.name.clone();
-        let hook = hook.to_string();
-        let op_limit = |script, hook| ScriptError::OpLimit {
-            script,
-            hook,
-            operations: self.limits.max_operations,
-        };
-        match err {
-            EvalAltResult::ErrorTerminated(token, _) => {
-                match token.clone().try_cast::<AbortKind>() {
-                    Some(AbortKind::OpLimit) => return op_limit(script, hook),
-                    Some(AbortKind::Timeout) => {
-                        return ScriptError::Timeout {
-                            script,
-                            hook,
-                            elapsed: self.hook_timeout,
-                        }
-                    }
-                    None => {}
-                }
-            }
-            // The engine's own hard cap, one operation above the token's
-            // threshold (see `engine::harden`).
-            EvalAltResult::ErrorTooManyOperations(_) => return op_limit(script, hook),
-            _ => {}
-        }
-        ScriptError::Runtime {
-            script,
-            hook,
-            line: err.position().line().unwrap_or(0),
-            message: err.to_string(),
-        }
     }
 
     /// Log the failure and surface it on the bus as
@@ -229,8 +237,10 @@ impl Plugin for ScriptPlugin {
     /// its hooks, because a broken registration is no reason to drop a working
     /// `on_request` (spec §8's error policy, applied to load).
     fn load(&mut self, reg: &mut Registry) {
-        let ast = self.ast.load_full();
-        let mut handle = ScriptRegHandle::new(reg).with_options(self.options.clone());
+        let ast = self.handle.current();
+        let mut handle = ScriptRegHandle::new(reg)
+            .with_options(self.options.clone())
+            .with_budget(self.budget);
         if let Err(err) = handle.run_load(&self.engine, &ast) {
             tracing::error!(target: SCRIPT_TARGET, script = %self.meta.name, "{err}");
         }
@@ -242,7 +252,7 @@ impl Plugin for ScriptPlugin {
         let Some(hook) = hook_for(ev) else {
             return Verdict::Continue;
         };
-        let ast = self.ast.load_full();
+        let ast = self.handle.current();
         if !defines(&ast, hook) {
             return Verdict::Continue;
         }
@@ -259,7 +269,7 @@ impl Plugin for ScriptPlugin {
             Ok(()) => take(state).apply_to(ctx),
             Err(err) => {
                 // `state` is dropped unapplied: the flow stays as it was.
-                let err = self.classify(hook, &err);
+                let err = ScriptError::from_eval(&self.meta.name, hook, &err, &self.budget);
                 self.report(ev, flow_id, &err);
                 Verdict::Continue
             }

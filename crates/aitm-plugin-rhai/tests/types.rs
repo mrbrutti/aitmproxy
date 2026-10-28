@@ -42,6 +42,13 @@ fn limits_default() {
     let limits = RhaiLimits::default();
     assert_eq!(limits.max_operations, 2_000_000);
     assert_eq!(limits.max_modules, 0);
+    // Security review (M3, Important): the string and blob limits agree with
+    // the body cap the snapshot copies, so a body the proxy buffered is a body
+    // a script can read (blob bytes count against `max_array_size`).
+    let snapshot_cap = aitm_core::LimitConfig::default().max_body_bytes;
+    assert_eq!(limits.max_string_size, snapshot_cap);
+    assert_eq!(limits.max_array_size, snapshot_cap);
+    assert_eq!(limits.max_map_size, 16_384);
 }
 
 #[test]

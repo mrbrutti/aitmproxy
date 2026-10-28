@@ -60,8 +60,7 @@ fn config(scripts: Vec<ScriptEntry>) -> RhaiConfig {
         scripts,
         limits: RhaiLimits::default(),
         hook_timeout: Duration::from_secs(5),
-        hot_reload: false,
-        strict: false,
+        ..RhaiConfig::default()
     }
 }
 

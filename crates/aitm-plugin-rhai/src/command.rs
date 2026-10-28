@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use aitm_core::{Command, CommandHost, ParamDef, ParamSchema, Params, Registry, TypeDesc, Value};
 use rhai::{CallFnOptions, Dynamic, Engine, EvalAltResult, FnPtr, Position, Scope, AST};
 
+use crate::engine::{begin_run, blocking, Budget, RunKind};
 use crate::error::ScriptError;
 use crate::host_core::Options;
 use crate::marshal::{dynamic_to_value, value_to_dynamic};
@@ -44,6 +45,8 @@ pub struct ScriptCommand {
     func: FnPtr,
     /// Passed as the call's tag so `option(name)` works inside a command.
     options: Options,
+    /// The run budget a command invocation gets (the script's hook budget).
+    budget: Budget,
     /// The script that registered it, for error messages.
     script: String,
 }
@@ -72,11 +75,14 @@ impl Command for ScriptCommand {
     /// The host services are not needed here: every verb the function may
     /// call was wired to the shared, guarded `ScriptServices` when the engine
     /// was built, so a command reaches the network only the way a hook does.
+    /// The call runs as a `Command` run under the script's budget; a failure
+    /// is reported in the pinned `ScriptError` format, naming the command.
     fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
         let mut call_args = self.func.curry().to_vec();
         call_args.push(Dynamic::from_map(args_map(&args)));
 
         let result = blocking(|| {
+            let _run = begin_run(RunKind::Command, self.budget.hook_timeout);
             self.engine.call_fn_with_options::<Dynamic>(
                 CallFnOptions::new().with_tag(self.options.clone()),
                 &mut Scope::new(),
@@ -87,9 +93,9 @@ impl Command for ScriptCommand {
         })
         .map_err(|err| {
             anyhow::anyhow!(
-                "command `{}` (script `{}`) failed: {err}",
+                "command `{}` failed: {}",
                 self.name,
-                self.script
+                ScriptError::from_eval(&self.script, &self.name, &err, &self.budget)
             )
         })?;
 
@@ -108,14 +114,16 @@ impl Command for ScriptCommand {
 pub struct ScriptRegHandle<'a> {
     reg: &'a mut Registry,
     options: Options,
+    budget: Budget,
 }
 
 impl<'a> ScriptRegHandle<'a> {
-    /// A handle over `reg` with no options set yet.
+    /// A handle over `reg` with no options set yet and the default budget.
     pub fn new(reg: &'a mut Registry) -> Self {
         Self {
             reg,
             options: Options::default(),
+            budget: Budget::default(),
         }
     }
 
@@ -127,9 +135,21 @@ impl<'a> ScriptRegHandle<'a> {
         self
     }
 
+    /// The budget `load` runs under, and every command it registers.
+    pub fn with_budget(mut self, budget: Budget) -> Self {
+        self.budget = budget;
+        self
+    }
+
     /// Run the script's `load(reg)` if it defines one, then install every
     /// command and option it registered. A `load` that throws installs
-    /// nothing and is reported as a `ScriptError::Runtime` on hook `load`.
+    /// nothing and is reported as a `ScriptError` on hook `load`.
+    ///
+    /// `load` is called from `Proxy::build`, on the thread driving `main`'s
+    /// future — inside the runtime. It crosses the same bridge as every other
+    /// entry point (`engine::blocking`), so a guarded async verb in `load`
+    /// works instead of panicking the proxy at startup, and it reads the
+    /// configured options like a hook does.
     pub fn run_load(&mut self, engine: &Arc<Engine>, ast: &Arc<AST>) -> Result<(), ScriptError> {
         if !ast.iter_functions().any(|f| f.name == LOAD_HOOK) {
             return Ok(());
@@ -137,15 +157,18 @@ impl<'a> ScriptRegHandle<'a> {
         let script = ast.source().unwrap_or("script").to_string();
         let collector = RegCollector::default();
 
-        engine
-            .call_fn::<Dynamic>(&mut Scope::new(), ast, LOAD_HOOK, (collector.clone(),))
-            .map(drop)
-            .map_err(|err| ScriptError::Runtime {
-                script: script.clone(),
-                hook: LOAD_HOOK.to_string(),
-                line: err.position().line().unwrap_or(0),
-                message: err.to_string(),
-            })?;
+        blocking(|| {
+            let _run = begin_run(RunKind::Load, self.budget.hook_timeout);
+            engine.call_fn_with_options::<Dynamic>(
+                CallFnOptions::new().with_tag(self.options.clone()),
+                &mut Scope::new(),
+                ast,
+                LOAD_HOOK,
+                (collector.clone(),),
+            )
+        })
+        .map(drop)
+        .map_err(|err| ScriptError::from_eval(&script, LOAD_HOOK, &err, &self.budget))?;
 
         let collected = collector.take();
         for (name, default, desc) in collected.options {
@@ -162,6 +185,7 @@ impl<'a> ScriptRegHandle<'a> {
                 ast: Arc::clone(ast),
                 func,
                 options: self.options.clone(),
+                budget: self.budget,
                 script: script.clone(),
             }));
         }
@@ -261,18 +285,6 @@ fn args_map(params: &Params) -> rhai::Map {
     value_to_dynamic(&Value::Object(fields))
         .try_cast::<rhai::Map>()
         .unwrap_or_default()
-}
-
-/// Run `f` as blocking work when on a multi-thread runtime worker (so a
-/// command that calls a guarded async verb does not stall its peers), else
-/// inline — a frontend that invokes outside tokio must not panic.
-fn blocking<T>(f: impl FnOnce() -> T) -> T {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(f)
-        }
-        _ => f(),
-    }
 }
 
 /// A catchable runtime error; the engine fills in the call position.

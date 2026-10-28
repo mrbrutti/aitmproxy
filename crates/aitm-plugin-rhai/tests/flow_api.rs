@@ -9,7 +9,9 @@ use aitm_core::{FlowId, FlowKind};
 use aitm_plugin_rhai::config::RhaiLimits;
 use aitm_plugin_rhai::engine::build_engine;
 use aitm_plugin_rhai::flow_api::{register_flow_api, ActiveFlow, ScriptFlow, ScriptWsMessage};
-use aitm_plugin_rhai::flow_state::{FlowEffect, FlowState, RequestState, WsMessageState};
+use aitm_plugin_rhai::flow_state::{
+    FlowEffect, FlowState, RequestState, ResponseState, WsMessageState,
+};
 use rhai::{Engine, Scope};
 
 fn engine() -> Engine {
@@ -147,6 +149,106 @@ fn ws_message_drop_and_set_text() {
     let st = state.lock().unwrap();
     assert_eq!(st.ws_message.as_ref().unwrap().data, b"redacted".to_vec());
     assert_eq!(st.effects, vec![FlowEffect::DropWsMessage]);
+}
+
+/// Security review (M3, Important): a script sees the whole body the proxy
+/// buffered. The engine's string/blob limits default to the snapshot cap, so a
+/// 100 KiB body — well past the 64 KiB that used to throw — reads whole as
+/// text and as bytes, and a needle at its very end is found.
+#[test]
+fn large_bodies_read_whole() {
+    let mut body = vec![b'a'; 100 * 1024 - 6];
+    body.extend_from_slice(b"needle");
+    let state = http_state();
+    {
+        let mut st = state.lock().unwrap();
+        st.request.as_mut().unwrap().body = vec![b'b'; 20 * 1024];
+        st.response = Some(ResponseState {
+            status: 200,
+            headers: Vec::new(),
+            body: body.clone(),
+        });
+    }
+    let got: rhai::Array = run_with_flow(
+        &state,
+        r#"[flow.response.body.len(), "needle" in flow.response.body, flow.response.bytes.len(), flow.request.bytes.len()]"#,
+    );
+    assert_eq!(got[0].as_int().unwrap(), 100 * 1024);
+    assert!(got[1].as_bool().unwrap(), "the needle at the end is found");
+    assert_eq!(got[2].as_int().unwrap(), 100 * 1024);
+    assert_eq!(got[3].as_int().unwrap(), 20 * 1024);
+}
+
+/// Quality review (M3, Important): a response write before a response exists
+/// (the request phase) is a loud error, not a fabricated status-0 response the
+/// proxy would serve. Reads stay forgiving; the explicit `set_response` is the
+/// one way to answer a request.
+#[test]
+fn response_write_before_a_response_exists_is_an_error() {
+    let state = http_state();
+    let status: i64 = run_with_flow(&state, "flow.response.status");
+    assert_eq!(status, 0, "a forgiving read of the absent response");
+
+    let engine = engine();
+    for write in [
+        r#"flow.response.status = 403"#,
+        r#"flow.response.body = "x""#,
+        r#"flow.response.headers.set("X-Seen", "1")"#,
+        r#"flow.response.headers["X-Seen"] = "1""#,
+        r#"flow.response.headers.remove("X-Seen")"#,
+    ] {
+        let mut scope = Scope::new();
+        scope.push("flow", ScriptFlow(Arc::clone(&state)));
+        let err = engine
+            .run_with_scope(&mut scope, write)
+            .expect_err("a write to the absent response must fail");
+        let text = err.to_string();
+        assert!(
+            text.contains("no response yet") && text.contains("set_response"),
+            "{write}: the error says what to do instead: {text}"
+        );
+    }
+    assert!(
+        state.lock().unwrap().response.is_none(),
+        "no response was fabricated"
+    );
+}
+
+/// Security review (M3, Minor, SHOULD-fix): the request setters are
+/// validated. The method must be an HTTP token, and `url` may change the
+/// path and query but not re-target the authority — another host is reached
+/// through the guarded `http.send`, never by rewriting a live request.
+#[test]
+fn request_setters_are_validated() {
+    let state = http_state();
+    let engine = engine();
+    for (write, names) in [
+        (r#"flow.request.method = "GE T""#, "token"),
+        (r#"flow.request.url = "http://other.internal/x""#, "host"),
+        (r#"flow.request.url = "https://ex.test/x""#, "host"),
+    ] {
+        let mut scope = Scope::new();
+        scope.push("flow", ScriptFlow(Arc::clone(&state)));
+        let err = engine
+            .run_with_scope(&mut scope, write)
+            .expect_err("the write must be refused");
+        assert!(err.to_string().contains(names), "{write}: {err}");
+    }
+    {
+        let st = state.lock().unwrap();
+        let req = st.request.as_ref().unwrap();
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.url, "http://ex.test/items?q=1");
+    }
+
+    // Same origin, a bare path, and a token method all go through.
+    let url: String = run_with_flow(
+        &state,
+        r#"flow.request.method = "PURGE"; flow.request.url = "http://ex.test/moved?x=2"; flow.request.url"#,
+    );
+    assert_eq!(url, "http://ex.test/moved?x=2");
+    let url: String = run_with_flow(&state, r#"flow.request.url = "/again"; flow.request.url"#);
+    assert_eq!(url, "http://ex.test/again", "a bare path keeps the origin");
 }
 
 /// Option C: a pure read of something absent is `""`, never an error.

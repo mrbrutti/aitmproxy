@@ -153,6 +153,132 @@ async fn script_option_registered() {
     assert!(registry.command("tag").is_none());
 }
 
+/// Security + quality review (M3, Important): `load(reg)` runs on the thread
+/// that is driving `main`'s future, inside the runtime. A guarded async verb
+/// there used to panic ("Cannot start a runtime from within a runtime") and
+/// take the proxy down at startup; `load` now crosses the same bridge every
+/// other entry point does. This test body runs exactly where `Proxy::build`
+/// does: on the runtime's `block_on` thread.
+#[tokio::test(flavor = "multi_thread")]
+async fn load_may_call_guarded_verbs() {
+    use aitm_core::{FlowStore, ScopeEntry, ScopeRateGuard};
+    use aitm_plugin_rhai::host_core::{MemoryFindingSink, ScriptCapability, ScriptServices};
+    use aitm_plugin_rhai::host_net::HttpCapability;
+
+    let guard = Arc::new(StdGuard::default());
+    guard.add_scope(ScopeEntry {
+        host: "ok.test".to_string(),
+    });
+    let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+    let services = ScriptServices {
+        store,
+        client: Arc::new(PongClient),
+        browser: None,
+        guard,
+        findings: Arc::new(MemoryFindingSink::new()),
+        rt: tokio::runtime::Handle::current(),
+    };
+    let mut engine = build_engine(&RhaiLimits::default(), Duration::from_secs(2));
+    register_reg_api(&mut engine);
+    HttpCapability.register(&mut engine, &services);
+    let engine = Arc::new(engine);
+
+    let ast = compile_named(
+        &engine,
+        "warm",
+        r#"
+        fn load(reg) {
+            let r = http.send(#{ url: "http://ok.test/health" });
+            reg.add_command("warm.status", "status seen at load", |args| r.status);
+        }
+        "#,
+    );
+    let mut registry = Registry::new();
+    load_into(&mut registry, &engine, &ast);
+
+    let cmd = registry
+        .command("warm.status")
+        .expect("load ran to completion and registered its command");
+    let store = MemFlowStore::new();
+    let client = StubClient;
+    let guard = StdGuard::default();
+    let host = CommandHost::new(&store, &client, &guard, None);
+    assert_eq!(
+        cmd.invoke(Params::default(), &host).expect("invokes"),
+        Value::Int(200)
+    );
+}
+
+/// A client that answers `200` with an empty body.
+struct PongClient;
+
+impl ProxyClient for PongClient {
+    fn send(
+        &self,
+        req: HttpRequest,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<HttpFlow>> + Send + '_>> {
+        use aitm_core::{Body, ConnInfo, FlowId, FlowMeta, HeaderMap, HttpResponse, HttpVersion};
+        Box::pin(async move {
+            Ok(HttpFlow {
+                id: FlowId::new(),
+                request: req,
+                response: Some(HttpResponse {
+                    status: 200,
+                    version: HttpVersion::Http11,
+                    headers: HeaderMap::new(),
+                    body: Body::Empty,
+                    timestamp: std::time::SystemTime::now(),
+                }),
+                client_conn: ConnInfo {
+                    peer: "127.0.0.1:0".parse().expect("addr"),
+                    sni: None,
+                    alpn: None,
+                    tls: false,
+                    established: std::time::SystemTime::now(),
+                },
+                server_conn: None,
+                metadata: FlowMeta::default(),
+                intercept: aitm_core::InterceptState::Observed,
+            })
+        })
+    }
+}
+
+/// Quality review (M3, Minor): config-supplied options are readable inside
+/// `load(reg)` too, not only in hooks and commands.
+#[tokio::test(flavor = "multi_thread")]
+async fn option_is_readable_inside_load() {
+    use aitm_plugin_rhai::host_core::{LogCapability, Options, ScriptCapability, ScriptServices};
+
+    let mut engine = build_engine(&RhaiLimits::default(), Duration::from_secs(2));
+    register_reg_api(&mut engine);
+    let services = ScriptServices {
+        store: Arc::new(MemFlowStore::new()),
+        client: Arc::new(StubClient),
+        browser: None,
+        guard: Arc::new(StdGuard::default()),
+        findings: Arc::new(aitm_plugin_rhai::host_core::MemoryFindingSink::new()),
+        rt: tokio::runtime::Handle::current(),
+    };
+    LogCapability.register(&mut engine, &services);
+    let engine = Arc::new(engine);
+    let ast = compile_named(
+        &engine,
+        "named",
+        r#"fn load(reg) { reg.add_command(option("command"), "", |args| "pong"); }"#,
+    );
+
+    let mut registry = Registry::new();
+    let mut handle = ScriptRegHandle::new(&mut registry).with_options(Options::new(
+        BTreeMap::from([("command".to_string(), Value::Str("named.ping".into()))]),
+    ));
+    handle.run_load(&engine, &ast).expect("load runs");
+    assert!(
+        registry.command("named.ping").is_some(),
+        "load read the configured option"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn script_without_load_registers_nothing() {
     let engine = engine_with_reg_api();

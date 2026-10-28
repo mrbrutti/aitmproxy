@@ -10,10 +10,16 @@
 //! instead of erroring, so a script probing for something absent never aborts
 //! mid-hook. Mutations record onto the shared state (field edits, or
 //! [`FlowEffect`]s for control actions) and are discarded with it on error.
+//! A *write* to a side the flow does not have is a loud error: editing
+//! `flow.response` in `on_request` (before any response exists) names
+//! `flow.set_response(...)` as the way to answer a request, rather than
+//! fabricating a response the proxy would serve.
 //!
 //! Sizes a script can write are bounded by the engine itself: `harden` caps
 //! every string at `max_string_size` and every blob at `max_array_size`, so a
-//! body setter never sees more than that.
+//! body setter never sees more than that. The request's `method` must be an
+//! HTTP token and its `url` may not re-target the authority: another host is
+//! reached through the guarded `http.send`, never by rewriting a live request.
 
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -177,12 +183,24 @@ fn register_request(engine: &mut Engine) {
         .register_get_set(
             "method",
             |r: &mut ScriptRequest| -> ImmutableString { r.read(|q| q.method.as_str().into()) },
-            |r: &mut ScriptRequest, v: ImmutableString| r.edit(|q| q.method = v.to_string()),
+            |r: &mut ScriptRequest, v: ImmutableString| -> ScriptResult {
+                if !is_token(&v) {
+                    return Err(error(format!(
+                        "flow.request.method must be an HTTP token like GET or POST, got \"{}\"",
+                        v.escape_default()
+                    )));
+                }
+                r.edit(|q| q.method = v.to_string())
+            },
         )
         .register_get_set(
             "url",
             |r: &mut ScriptRequest| -> ImmutableString { r.read(|q| q.url.as_str().into()) },
-            |r: &mut ScriptRequest, v: ImmutableString| r.edit(|q| q.url = v.to_string()),
+            |r: &mut ScriptRequest, v: ImmutableString| -> ScriptResult {
+                let current: String = r.read(|q| q.url.clone());
+                let url = same_origin_url(&current, &v)?;
+                r.edit(|q| q.url = url)
+            },
         )
         .register_get_set(
             "path",
@@ -207,7 +225,7 @@ fn register_request(engine: &mut Engine) {
         )
         .register_fn(
             "set_json",
-            |r: &mut ScriptRequest, value: Map| -> Result<(), Box<EvalAltResult>> {
+            |r: &mut ScriptRequest, value: Map| -> ScriptResult {
                 let json = json_of(value)?;
                 r.edit(|q| {
                     q.body = json.into_bytes();
@@ -217,8 +235,7 @@ fn register_request(engine: &mut Engine) {
                         "Content-Type",
                         "application/json",
                     );
-                });
-                Ok(())
+                })
             },
         );
 }
@@ -255,7 +272,7 @@ fn register_headers(engine: &mut Engine) {
         })
         .register_fn("remove", |h: &mut ScriptHeaders, key: &str| {
             let side = h.1;
-            h.edit(|pairs| pairs.retain(|(k, _)| !key_matches(side, k, key)));
+            h.edit(|pairs| pairs.retain(|(k, _)| !key_matches(side, k, key)))
         })
         .register_fn("has", |h: &mut ScriptHeaders, key: &str| -> bool {
             let side = h.1;
@@ -267,7 +284,7 @@ fn register_headers(engine: &mut Engine) {
         .register_indexer_get_set(
             |h: &mut ScriptHeaders, key: ImmutableString| h.get(&key),
             |h: &mut ScriptHeaders, key: ImmutableString, value: ImmutableString| {
-                h.set(&key, &value);
+                h.set(&key, &value)
             },
         );
 }
@@ -304,16 +321,34 @@ impl ScriptFlow {
     }
 }
 
+/// What a fallible handle operation returns: a catchable Rhai error.
+type ScriptResult = Result<(), Box<EvalAltResult>>;
+
+/// The error for a write to the request of a flow that has none.
+const NO_REQUEST: &str =
+    "flow.request cannot be edited: a WebSocket flow has no request (reads return \"\")";
+
+/// The error for a write to the response before one exists — the request
+/// phase. The fix is the explicit short-circuit.
+const NO_RESPONSE: &str = "flow.response cannot be edited: the flow has no response yet (this is \
+                           the request phase). To answer the request yourself call \
+                           flow.set_response(status, headers, body); reads of the absent \
+                           response return defaults.";
+
 impl ScriptRequest {
     /// Read from the request; a flow without one reads as the default (`""`).
     fn read<R: Default>(&self, f: impl FnOnce(&RequestState) -> R) -> R {
         lock(&self.0).request.as_ref().map(f).unwrap_or_default()
     }
 
-    /// Edit the request; a flow without one (WebSocket) has nothing to edit.
-    fn edit(&self, f: impl FnOnce(&mut RequestState)) {
-        if let Some(request) = lock(&self.0).request.as_mut() {
-            f(request);
+    /// Edit the request; a flow without one (WebSocket) refuses the write.
+    fn edit(&self, f: impl FnOnce(&mut RequestState)) -> ScriptResult {
+        match lock(&self.0).request.as_mut() {
+            Some(request) => {
+                f(request);
+                Ok(())
+            }
+            None => Err(error(NO_REQUEST)),
         }
     }
 }
@@ -324,12 +359,16 @@ impl ScriptResponse {
         lock(&self.0).response.as_ref().map(f).unwrap_or_default()
     }
 
-    /// Edit the response, creating an empty one on a flow that has none yet so
-    /// the edit is kept; `apply_to` then installs it as a fresh response.
-    fn edit(&self, f: impl FnOnce(&mut ResponseState)) {
-        f(lock(&self.0)
-            .response
-            .get_or_insert_with(ResponseState::default));
+    /// Edit the response; a flow without one yet refuses the write (never
+    /// fabricate a response — `set_response` is the way to create one).
+    fn edit(&self, f: impl FnOnce(&mut ResponseState)) -> ScriptResult {
+        match lock(&self.0).response.as_mut() {
+            Some(response) => {
+                f(response);
+                Ok(())
+            }
+            None => Err(error(NO_RESPONSE)),
+        }
     }
 }
 
@@ -346,9 +385,9 @@ impl ScriptHeaders {
         })
     }
 
-    fn set(&self, key: &str, value: &str) {
+    fn set(&self, key: &str, value: &str) -> ScriptResult {
         let side = self.1;
-        self.edit(|pairs| set_pair(pairs, side, key, value));
+        self.edit(|pairs| set_pair(pairs, side, key, value))
     }
 
     fn read<R: Default>(&self, f: impl FnOnce(&[(String, String)]) -> R) -> R {
@@ -356,9 +395,17 @@ impl ScriptHeaders {
         self.1.pairs(&state).map(f).unwrap_or_default()
     }
 
-    fn edit(&self, f: impl FnOnce(&mut Vec<(String, String)>)) {
-        if let Some(pairs) = self.1.pairs_mut(&mut lock(&self.0)) {
-            f(pairs);
+    /// Edit the pair list; a side the flow does not have refuses the write.
+    fn edit(&self, f: impl FnOnce(&mut Vec<(String, String)>)) -> ScriptResult {
+        match self.1.pairs_mut(&mut lock(&self.0)) {
+            Some(pairs) => {
+                f(pairs);
+                Ok(())
+            }
+            None => Err(error(match self.1 {
+                HeaderSide::ResponseHeaders => NO_RESPONSE,
+                HeaderSide::RequestHeaders | HeaderSide::RequestQuery => NO_REQUEST,
+            })),
         }
     }
 }
@@ -435,6 +482,52 @@ fn clamp_status(status: i64) -> u16 {
     u16::try_from(status.clamp(0, i64::from(u16::MAX))).unwrap_or(u16::MAX)
 }
 
+/// RFC 9110 `token`: one or more `tchar`.
+fn is_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// The URL a `flow.request.url = …` write stores: a bare path (and query) is
+/// joined onto the request's origin; a whole URL is accepted only on the same
+/// origin. Re-targeting the authority is refused — the live request would be
+/// sent to a host the guard never checked.
+fn same_origin_url(current: &str, new: &str) -> Result<String, Box<EvalAltResult>> {
+    let (origin, _) = split_origin(current);
+    if !new.contains("://") {
+        let path = if new.starts_with('/') {
+            new.to_string()
+        } else {
+            format!("/{new}")
+        };
+        return Ok(format!("{origin}{path}"));
+    }
+    let (new_origin, _) = split_origin(new);
+    if !new_origin.eq_ignore_ascii_case(origin) {
+        return Err(error(format!(
+            "flow.request.url cannot change the host: the request targets {origin} and the new \
+             URL targets {new_origin}. Change the path and query only, or reach another host \
+             with http.send(...)."
+        )));
+    }
+    Ok(new.to_string())
+}
+
+/// `("scheme://authority", "/path?query")` of a whole URL.
+fn split_origin(url: &str) -> (&str, &str) {
+    let after_scheme = url.find("://").map(|i| i + 3).unwrap_or(0);
+    match url[after_scheme..].find('/') {
+        Some(i) => url.split_at(after_scheme + i),
+        None => (url, "/"),
+    }
+}
+
+/// A catchable runtime error; the engine fills in the call position.
+fn error(message: impl Into<String>) -> Box<EvalAltResult> {
+    EvalAltResult::ErrorRuntime(Dynamic::from(message.into()), Position::NONE).into()
+}
+
 /// The text view of a body: lossy UTF-8, so a binary body still reads.
 fn text_of(bytes: &[u8]) -> ImmutableString {
     String::from_utf8_lossy(bytes).into_owned().into()
@@ -443,12 +536,8 @@ fn text_of(bytes: &[u8]) -> ImmutableString {
 /// Serialize a Rhai map as JSON. A value with no JSON shape (a function
 /// pointer, a custom type) is a runtime error naming the type.
 fn json_of(value: Map) -> Result<String, Box<EvalAltResult>> {
-    let value = dynamic_to_value(&Dynamic::from_map(value)).map_err(|e| {
-        Box::new(EvalAltResult::ErrorRuntime(
-            format!("set_json: {e}").into(),
-            Position::NONE,
-        ))
-    })?;
+    let value =
+        dynamic_to_value(&Dynamic::from_map(value)).map_err(|e| error(format!("set_json: {e}")))?;
     let mut out = String::new();
     write_json(&value, &mut out);
     Ok(out)
