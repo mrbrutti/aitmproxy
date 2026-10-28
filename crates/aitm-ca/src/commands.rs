@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -301,6 +302,57 @@ fn refuse_inside_ca_dir(out: &Path, ca_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `path` with its parent canonicalised (the file itself need not exist
+/// yet), so two spellings of one file compare equal.
+fn canonical_file(path: &Path) -> PathBuf {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    match path.file_name() {
+        Some(name) => canonical_or_self(&parent).join(name),
+        None => canonical_or_self(path),
+    }
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b || canonical_or_self(a) == canonical_or_self(b) || canonical_file(a) == canonical_file(b)
+}
+
+/// Every `out` that `ca.export` refuses, from any frontend: inside the CA
+/// directory (C12), the audit log, and the config file beside it. Each is
+/// compared by canonical path, so no spelling of the same file gets through;
+/// an existing file at any other `out` is refused by [`write_new`].
+fn refuse_protected_out(out: &Path, cfg: &CaConfig) -> anyhow::Result<()> {
+    refuse_inside_ca_dir(out, &cfg.dir)?;
+    let config_file = cfg.audit_log.with_file_name("config.yaml");
+    for (protected, what) in [
+        (cfg.audit_log.as_path(), "the CA audit log"),
+        (config_file.as_path(), "the aitmproxy config file"),
+    ] {
+        if same_file(out, protected) {
+            bail!("refusing to write to {}: it is {what}", out.display());
+        }
+    }
+    Ok(())
+}
+
+/// Create `out` and write `bytes`. Never truncates: an existing file,
+/// symlink or FIFO at `out` is refused, so `--out` cannot be turned on a
+/// file the operator already has.
+fn write_new(out: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut file = match std::fs::File::create_new(out) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => bail!(
+            "refusing to write to {}: it already exists (ca.export never overwrites a file)",
+            out.display()
+        ),
+        Err(e) => return Err(e).with_context(|| format!("creating {}", out.display())),
+    };
+    file.write_all(bytes)
+        .with_context(|| format!("writing {}", out.display()))
+}
+
 /// Where a scope's store lives, before anything runs: the keychain path,
 /// the anchor path, or the Windows store name — the same strings the stores
 /// report as `location`. `None` when the platform has no store.
@@ -376,8 +428,9 @@ impl Command for Export {
                     "out",
                     TypeDesc::Str,
                     false,
-                    "Also write the certificate to this file (created or truncated). Refused \
-                     inside the CA directory.",
+                    "Also write the certificate to this new file. Refused when the file \
+                     already exists, lies inside the CA directory, or is the audit log or \
+                     config file; a refusal is audited.",
                 ),
             ],
             TypeDesc::Object(vec![
@@ -416,9 +469,6 @@ impl Command for Export {
         let shared = &*self.0;
         let format = Format::parse(&args)?;
         let out = opt_str(&args, "out")?.map(PathBuf::from);
-        if let Some(out) = &out {
-            refuse_inside_ca_dir(out, &shared.cfg.dir)?;
-        }
 
         shared.open_audit()?;
         let mut audit = Audit {
@@ -437,10 +487,11 @@ impl Command for Export {
             Format::Pem => cert.pem.as_bytes(),
             Format::Der => &cert.der,
         };
+        // `out` is checked only now, after the audit log is open and the
+        // certificate is known, so a refusal is recorded with its fingerprint.
         if let Some(out) = &out {
-            std::fs::write(out, bytes)
-                .with_context(|| format!("writing {}", out.display()))
-                .map_err(|e| audit.fail(e))?;
+            refuse_protected_out(out, &shared.cfg).map_err(|e| audit.fail(e))?;
+            write_new(out, bytes).map_err(|e| audit.fail(e))?;
         }
 
         let written_to = out.map(|p| p.display().to_string());
