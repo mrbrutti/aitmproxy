@@ -24,8 +24,8 @@
 use std::sync::{Arc, OnceLock};
 
 use aitm_core::{
-    ActionPermit, BrowserDriver, ClickTarget, Flow, FlowId, FlowQuery, FlowStore, GuardError,
-    HttpFlow, HttpRequest, NavOutcome, ProxyClient, ScopeEntry, ScopeRateGuard, Value,
+    ActionPermit, BrowserDriver, ClearOutcome, ClickTarget, Flow, FlowId, FlowQuery, FlowStore,
+    GuardError, HttpFlow, HttpRequest, NavOutcome, ProxyClient, ScopeEntry, ScopeRateGuard, Value,
 };
 use futures::future::BoxFuture;
 
@@ -104,6 +104,29 @@ impl FlowStore for LateHandles {
     fn query(&self, q: &FlowQuery) -> Vec<FlowId> {
         self.store.get().map(|s| s.query(q)).unwrap_or_default()
     }
+
+    fn clear(&self) -> ClearOutcome {
+        self.store.get().map(|s| s.clear()).unwrap_or_default()
+    }
+
+    fn is_capturing(&self) -> bool {
+        // Unbound defaults to capturing (the record toggle's default-on state).
+        self.store.get().map(|s| s.is_capturing()).unwrap_or(true)
+    }
+
+    fn set_capturing(&self, on: bool) {
+        if let Some(store) = self.store.get() {
+            store.set_capturing(on);
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.store.get().map(|s| s.count()).unwrap_or(0)
+    }
+
+    fn intercepted_count(&self) -> usize {
+        self.store.get().map(|s| s.intercepted_count()).unwrap_or(0)
+    }
 }
 
 impl ProxyClient for LateHandles {
@@ -128,6 +151,13 @@ impl ScopeRateGuard for LateHandles {
         if let Some(guard) = self.guard.get() {
             guard.add_scope(entry);
         }
+    }
+
+    fn remove_scope(&self, entry: &str) -> bool {
+        self.guard
+            .get()
+            .map(|g| g.remove_scope(entry))
+            .unwrap_or(false)
     }
 
     fn list_scope(&self) -> Vec<ScopeEntry> {

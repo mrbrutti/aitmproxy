@@ -119,6 +119,7 @@ async fn run_proxy(
             entries: vec![ScopeEntry {
                 host: "127.0.0.1".to_string(),
             }],
+            ..ScopeConfig::default()
         },
         ..Config::default()
     };
@@ -254,6 +255,7 @@ async fn run_proxy_capped(
             entries: vec![ScopeEntry {
                 host: "127.0.0.1".to_string(),
             }],
+            ..ScopeConfig::default()
         },
         ..Config::default()
     };
@@ -403,4 +405,34 @@ async fn second_connection_hits_leaf_cache() {
         ca.last_was_cache_hit(),
         "the second connection to the same host must reuse the cached leaf"
     );
+}
+
+/// C1 regression: pausing capture must not break the pipeline. A request made
+/// while paused is still forwarded (the client gets its response) but is hidden
+/// from `flow.list`; resuming captures again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paused_capture_forwards_but_hides_the_flow() {
+    let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
+    let upstream = spawn_fixture().await;
+    let (proxy, store) = run_proxy(ca.clone(), Vec::new()).await;
+
+    // Pause, then make a real request: it must still complete end-to-end.
+    store.set_capturing(false);
+    let (status, body) = https_get(proxy, upstream, "/hello", ca.root_cert_pem()).await;
+    assert_eq!(status, 200, "paused capture must still forward the request");
+    assert!(body.contains("hello-aitm"), "client body was {body:?}");
+
+    // The 200 above is the real regression guard: under the old drop-on-insert bug
+    // the module's post-dispatch `get` missed the flow and bailed, breaking the
+    // connection. The flow is hidden from the operator's view while paused.
+    assert_eq!(store.count(), 0, "paused capture must not show the flow");
+    assert!(store.list().is_empty());
+
+    // Resume: the next request is recorded and visible.
+    store.set_capturing(true);
+    let (status, _body) = https_get(proxy, upstream, "/hello", ca.root_cert_pem()).await;
+    assert_eq!(status, 200);
+    let flow = wait_for_flow(store.as_ref()).await;
+    assert_eq!(flow.request.path, "/hello");
+    assert_eq!(store.count(), 1, "resumed capture shows exactly one flow");
 }

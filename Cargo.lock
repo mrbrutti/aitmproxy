@@ -154,6 +154,7 @@ dependencies = [
  "aitm-core",
  "anyhow",
  "futures",
+ "time",
  "tokio",
 ]
 
@@ -174,6 +175,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

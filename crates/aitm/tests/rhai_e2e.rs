@@ -786,7 +786,7 @@ async fn poc_script_step_pass_vs_patched() {
             };
             let tier = wire::build(rhai_cfg(vec![]), svc).expect("tier builds");
 
-            let Assembled { proxy, ca } = assemble_with_scripts(
+            let Assembled { proxy, ca, .. } = assemble_with_scripts(
                 &cfg,
                 &Features::default(),
                 ScriptWiring {

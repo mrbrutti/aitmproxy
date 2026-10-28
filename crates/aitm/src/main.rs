@@ -101,7 +101,11 @@ async fn run() -> anyhow::Result<()> {
         );
     }
 
-    let Assembled { proxy, ca } = assemble_with_scripts(
+    let Assembled {
+        proxy,
+        ca,
+        listening,
+    } = assemble_with_scripts(
         &cfg,
         &Features::default(),
         ScriptWiring {
@@ -137,6 +141,7 @@ async fn run() -> anyhow::Result<()> {
         let cli = aitm_cli::Cli::new(registry.clone())
             .with_ssrf_policy(cfg.browser.ssrf.clone())
             .with_poc_dir(cfg.poc.dir.clone())
+            .with_config(Arc::new(cfg.clone()))
             .with_services(store.clone(), client.clone(), guard.clone(), None);
         match cli.dispatch(&argv) {
             Ok(value) => {
@@ -174,12 +179,15 @@ async fn run() -> anyhow::Result<()> {
     let mcp = aitm_mcp::McpServer::new(registry, cfg.mcp.transport.clone())
         .with_ssrf_policy(cfg.browser.ssrf.clone())
         .with_poc_dir(cfg.poc.dir.clone())
+        .with_config(Arc::new(cfg.clone()))
         .with_services(store, client, guard, browser);
 
     // The main listener relays client traffic; the browser listener is
     // SSRF-filtered (the embedded browser dials `cfg.browser.proxy_addr`).
     let main_listen = cfg.listen;
     let browser_listen = cfg.browser.proxy_addr;
+    // We are about to serve: `proxy.status.listening` now reports the truth.
+    listening.store(true, std::sync::atomic::Ordering::Relaxed);
     let result = tokio::select! {
         result = proxy.run(main_listen) => result,
         result = proxy.run_browser(browser_listen) => result,
