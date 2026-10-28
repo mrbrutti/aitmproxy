@@ -183,6 +183,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aitm-testtarget"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde",
+ "serde_yaml",
+ "tokio",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
