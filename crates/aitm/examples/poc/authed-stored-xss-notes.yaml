@@ -52,7 +52,7 @@ steps:
 
         // Visit the rendered note and confirm the script ran (SSRF-gated).
         browser.navigate(`${base}/notes`);
-        browser.screenshot();                      // becomes a run artifact
+        browser.screenshot();                      // returns bytes to the script (M3: not auto-saved as a run artifact)
         if browser.evaluate("window.__aitm") == m { return pass; }
         return fail;
 
