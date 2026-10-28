@@ -1,0 +1,70 @@
+/* Scripts placeholder (§2.7 "Script editor", §3.8): the foundation's shape — list | editor |
+   console — as grey bars at real size (§2.8 loading rule), honest about what is not here yet. */
+.panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  background: var(--color-ground-surface);
+  color: var(--color-text-primary);
+}
+.header {
+  flex: none;
+  height: var(--size-inspector-header);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 var(--space-3);
+  border-bottom: 1px solid var(--color-line-border);
+}
+.header .icon {
+  color: var(--color-text-secondary);
+}
+.title {
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: -0.01em;
+}
+.count {
+  font-size: var(--font-size-base);
+  color: var(--color-text-secondary);
+}
+.count::before {
+  content: '·';
+  margin-right: 8px;
+  color: var(--color-text-tertiary);
+}
+.header .new {
+  margin-left: auto;
+}
+.body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: var(--size-sidebar) minmax(0, 1fr) minmax(200px, 0.6fr);
+}
+.list {
+  border-right: 1px solid var(--color-line-border);
+  padding: var(--space-4) var(--space-3);
+}
+.empty {
+  max-width: 28ch;
+  font-size: var(--font-size-md);
+  line-height: 1.5;
+  color: var(--color-text-tertiary);
+}
+.editor,
+.console {
+  padding: var(--space-4) var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.console {
+  border-left: 1px solid var(--color-line-border);
+}
+.bar {
+  height: 13px;
+  border-radius: 3px;
+  background: var(--color-ground-raised);
+}

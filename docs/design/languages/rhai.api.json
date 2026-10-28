@@ -1,0 +1,148 @@
+{
+  "_comment": "Rhai completion + hover catalog. Mirrors docs/superpowers/specs/2026-10-27-aitmproxy-plugin-system-design.md §'Tier 2 — Rhai scripting plugins' (hook table, 'flow object', 'Host functions') EXACTLY, so the drift guard (plan Task 12) can compare globals/flow/msg/dsl against the engine's registered set. Do not add an entry the plugin-system spec does not define. Entry names are fully qualified (`flow.request.headers.get`); a surface completes the last segment after the receiver chain. `kind` is object | property | method | function.",
+  "api_version": "1",
+  "hooks": [
+    {
+      "name": "load",
+      "signature": "load(reg)",
+      "description": "Called once at startup with the registration handle; register script commands and options here.",
+      "snippet": "fn load(reg) {\n    $0\n}"
+    },
+    {
+      "name": "configure",
+      "signature": "configure()",
+      "description": "Called after options change.",
+      "snippet": "fn configure() {\n    $0\n}"
+    },
+    {
+      "name": "on_request_headers",
+      "signature": "on_request_headers(flow)",
+      "description": "Fires on the RequestHeaders event, before the request body is read.",
+      "snippet": "fn on_request_headers(flow) {\n    $0\n}"
+    },
+    {
+      "name": "on_request",
+      "signature": "on_request(flow)",
+      "description": "Fires on the Request event, once the full request is available; mutate it before it goes upstream.",
+      "snippet": "fn on_request(flow) {\n    $0\n}"
+    },
+    {
+      "name": "on_response_headers",
+      "signature": "on_response_headers(flow)",
+      "description": "Fires on the ResponseHeaders event, before the response body is read.",
+      "snippet": "fn on_response_headers(flow) {\n    $0\n}"
+    },
+    {
+      "name": "on_response",
+      "signature": "on_response(flow)",
+      "description": "Fires on the Response event, once the full response is available.",
+      "snippet": "fn on_response(flow) {\n    $0\n}"
+    },
+    {
+      "name": "on_ws_start",
+      "signature": "on_ws_start(flow)",
+      "description": "Fires on the WsStart event, when a WebSocket connection is established.",
+      "snippet": "fn on_ws_start(flow) {\n    $0\n}"
+    },
+    {
+      "name": "on_ws_message",
+      "signature": "on_ws_message(flow, msg)",
+      "description": "Fires on the WsMessage event for each WebSocket frame; msg is the message object.",
+      "snippet": "fn on_ws_message(flow, msg) {\n    $0\n}"
+    },
+    {
+      "name": "on_ws_end",
+      "signature": "on_ws_end(flow)",
+      "description": "Fires on the WsEnd event, when a WebSocket connection closes.",
+      "snippet": "fn on_ws_end(flow) {\n    $0\n}"
+    },
+    {
+      "name": "on_error",
+      "signature": "on_error(flow, err)",
+      "description": "Fires on the Error event with the flow and the error.",
+      "snippet": "fn on_error(flow, err) {\n    $0\n}"
+    }
+  ],
+  "flow": [
+    { "name": "flow.id", "kind": "property", "signature": "flow.id -> string", "description": "The flow's id." },
+    { "name": "flow.kind", "kind": "property", "signature": "flow.kind -> \"http\" | \"ws\"", "description": "Whether this is an HTTP or a WebSocket flow." },
+    { "name": "flow.marks", "kind": "property", "signature": "flow.marks -> array", "description": "The marks on this flow (settable)." },
+    { "name": "flow.comment", "kind": "property", "signature": "flow.comment -> string", "description": "The operator comment on this flow (settable)." },
+    { "name": "flow.is_replay", "kind": "property", "signature": "flow.is_replay -> bool", "description": "True when this flow is a replay." },
+
+    { "name": "flow.request", "kind": "object", "description": "The request side of the flow." },
+    { "name": "flow.request.method", "kind": "property", "signature": "flow.request.method -> string", "description": "The request method (settable)." },
+    { "name": "flow.request.url", "kind": "property", "signature": "flow.request.url -> string", "description": "The full URL, scheme://authority/path?query (settable)." },
+    { "name": "flow.request.path", "kind": "property", "signature": "flow.request.path -> string", "description": "The request path (settable)." },
+    { "name": "flow.request.headers", "kind": "object", "description": "The request headers, a map-like object." },
+    { "name": "flow.request.headers.get", "kind": "method", "signature": "get(k)", "description": "The value of header k." },
+    { "name": "flow.request.headers.set", "kind": "method", "signature": "set(k, v)", "description": "Set header k to v." },
+    { "name": "flow.request.headers.remove", "kind": "method", "signature": "remove(k)", "description": "Remove header k." },
+    { "name": "flow.request.headers.has", "kind": "method", "signature": "has(k)", "description": "True when header k is present." },
+    { "name": "flow.request.body", "kind": "property", "signature": "flow.request.body -> string | bytes", "description": "The request body (get/set)." },
+    { "name": "flow.request.set_json", "kind": "method", "signature": "set_json(obj)", "description": "Set the request body to the JSON encoding of obj." },
+    { "name": "flow.request.query", "kind": "property", "signature": "flow.request.query -> map", "description": "The query parameters, a map-like object." },
+
+    { "name": "flow.response", "kind": "object", "description": "The response side of the flow." },
+    { "name": "flow.response.status", "kind": "property", "signature": "flow.response.status -> int", "description": "The response status code (settable)." },
+    { "name": "flow.response.headers", "kind": "object", "description": "The response headers, a map-like object." },
+    { "name": "flow.response.headers.get", "kind": "method", "signature": "get(k)", "description": "The value of header k." },
+    { "name": "flow.response.headers.set", "kind": "method", "signature": "set(k, v)", "description": "Set header k to v." },
+    { "name": "flow.response.headers.remove", "kind": "method", "signature": "remove(k)", "description": "Remove header k." },
+    { "name": "flow.response.headers.has", "kind": "method", "signature": "has(k)", "description": "True when header k is present." },
+    { "name": "flow.response.body", "kind": "property", "signature": "flow.response.body -> string | bytes", "description": "The response body." },
+
+    { "name": "flow.set_response", "kind": "method", "signature": "flow.set_response(status, headers, body)", "description": "Short-circuit before upstream: answer the request with this response." },
+    { "name": "flow.intercept", "kind": "method", "signature": "flow.intercept()", "description": "Pause this flow for operator intervention." },
+    { "name": "flow.resume", "kind": "method", "signature": "flow.resume()", "description": "Resume a paused flow." },
+    { "name": "flow.kill", "kind": "method", "signature": "flow.kill()", "description": "Kill this flow." },
+    { "name": "flow.backup", "kind": "method", "signature": "flow.backup()", "description": "Snapshot the flow so it can be reverted." },
+    { "name": "flow.revert", "kind": "method", "signature": "flow.revert()", "description": "Restore the flow to its last backup." },
+    { "name": "flow.mark", "kind": "method", "signature": "flow.mark(tag)", "description": "Add a mark to this flow." }
+  ],
+  "msg": [
+    { "name": "msg.direction", "kind": "property", "signature": "msg.direction -> \"c2s\" | \"s2c\"", "description": "Frame direction: client-to-server or server-to-client." },
+    { "name": "msg.opcode", "kind": "property", "signature": "msg.opcode -> \"text\" | \"binary\" | \"ping\" | \"pong\" | \"close\"", "description": "The WebSocket opcode." },
+    { "name": "msg.text", "kind": "property", "signature": "msg.text -> string", "description": "The frame as text (settable)." },
+    { "name": "msg.data", "kind": "property", "signature": "msg.data -> bytes", "description": "The frame payload as bytes." },
+    { "name": "msg.set_text", "kind": "method", "signature": "msg.set_text(s)", "description": "Replace the frame payload with the text s." },
+    { "name": "msg.set_bytes", "kind": "method", "signature": "msg.set_bytes(b)", "description": "Replace the frame payload with the bytes b." },
+    { "name": "msg.drop", "kind": "method", "signature": "msg.drop()", "description": "Do not forward this frame." }
+  ],
+  "globals": [
+    { "name": "log", "kind": "function", "signature": "log(msg)", "description": "Write msg to the script's log." },
+    { "name": "log.info", "kind": "function", "signature": "log.info(msg)", "description": "Log at info level." },
+    { "name": "log.warn", "kind": "function", "signature": "log.warn(msg)", "description": "Log at warn level." },
+    { "name": "log.error", "kind": "function", "signature": "log.error(msg)", "description": "Log at error level." },
+
+    { "name": "http.send", "kind": "function", "signature": "http.send(#{ method, url, headers, body }) -> #{ status, headers, body, flow_id }", "description": "Send an HTTP request through the proxy's own client (scope- and rate-gated); the exchange is captured as a flow." },
+
+    { "name": "browser.navigate", "kind": "function", "signature": "browser.navigate(url)", "description": "Navigate the embedded browser to url (scope- and SSRF-gated)." },
+    { "name": "browser.click", "kind": "function", "signature": "browser.click(selector_or_xy)", "description": "Click an element by selector, or a point by coordinates." },
+    { "name": "browser.type", "kind": "function", "signature": "browser.type(selector, text)", "description": "Type text into the element matching selector." },
+    { "name": "browser.screenshot", "kind": "function", "signature": "browser.screenshot() -> bytes", "description": "Capture the page as PNG bytes." },
+    { "name": "browser.eval", "kind": "function", "signature": "browser.eval(expr) -> value", "description": "Evaluate a JavaScript expression in the page." },
+    { "name": "browser.get_dom", "kind": "function", "signature": "browser.get_dom() -> string", "description": "The page's DOM as a string." },
+
+    { "name": "store.get", "kind": "function", "signature": "store.get(id) -> flow view", "description": "Read one flow from the flow store by id." },
+    { "name": "store.query", "kind": "function", "signature": "store.query(#{ host, method, status, kind, is_replay }) -> array of flow views", "description": "Query the flow store; returns matching flow views." },
+
+    { "name": "scope.add", "kind": "function", "signature": "scope.add(host)", "description": "Add host to the authorised scope." },
+    { "name": "scope.list", "kind": "function", "signature": "scope.list() -> array", "description": "The hosts currently in scope." },
+
+    { "name": "option", "kind": "function", "signature": "option(name) -> value", "description": "The value of an option set at load." },
+    { "name": "halt", "kind": "function", "signature": "halt()", "description": "Return from a hook to halt the plugin chain (Verdict::Halt). Returning nothing continues the chain." }
+  ],
+  "dsl": [
+    { "name": "b64_encode", "kind": "function", "signature": "b64_encode(s)", "description": "Base64-encode s." },
+    { "name": "b64_decode", "kind": "function", "signature": "b64_decode(s)", "description": "Base64-decode s." },
+    { "name": "url_encode", "kind": "function", "signature": "url_encode(s)", "description": "Percent-encode s for use in a URL." },
+    { "name": "hex_encode", "kind": "function", "signature": "hex_encode(s)", "description": "Hex-encode s." },
+    { "name": "sha256", "kind": "function", "signature": "sha256(s)", "description": "SHA-256 digest of s." },
+    { "name": "md5", "kind": "function", "signature": "md5(s)", "description": "MD5 digest of s." },
+    { "name": "rand_text_alpha", "kind": "function", "signature": "rand_text_alpha(n)", "description": "A random string of n letters." },
+    { "name": "rand_int", "kind": "function", "signature": "rand_int(a, b)", "description": "A random integer between a and b." },
+    { "name": "regex_match", "kind": "function", "signature": "regex_match(pat, s)", "description": "True when pattern pat matches s." },
+    { "name": "regex_extract", "kind": "function", "signature": "regex_extract(pat, s, group)", "description": "The capture group of pat's match in s." }
+  ]
+}
