@@ -66,10 +66,18 @@ fn terminal_flow() -> Flow {
     }
 }
 
-fn reg_with(armed: Arc<AtomicBool>) -> aitm_core::Registry {
+fn reg_with(armed: Arc<AtomicBool>, listening: Arc<AtomicBool>) -> aitm_core::Registry {
     let mut reg = aitm_core::Registry::new();
-    reg.add_plugin(Box::new(ControlPlugin::new(armed)));
+    reg.add_plugin(Box::new(ControlPlugin::new(armed, listening)));
     reg
+}
+
+/// A registry whose control status flags are both off, when a test does not care.
+fn reg() -> aitm_core::Registry {
+    reg_with(
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    )
 }
 
 fn call(
@@ -101,7 +109,8 @@ fn field<'a>(v: &'a Value, k: &str) -> &'a Value {
 #[test]
 fn proxy_status_reports_armed_capturing_paused_and_listening() {
     let armed = Arc::new(AtomicBool::new(true));
-    let reg = reg_with(armed.clone());
+    let listening = Arc::new(AtomicBool::new(true));
+    let reg = reg_with(armed.clone(), listening.clone());
     let store = MemFlowStore::new();
     let guard = StdGuard::default();
 
@@ -122,25 +131,25 @@ fn proxy_status_reports_armed_capturing_paused_and_listening() {
     assert_eq!(field(&status, "capturing"), &Value::Bool(true));
     assert_eq!(field(&status, "paused"), &Value::Int(1));
     assert_eq!(field(&status, "flows"), &Value::Int(2));
-    // listening is a bool; the address is a separate string when config is present.
+    // listening reflects the serving flag; address is the configured listen addr.
     assert_eq!(field(&status, "listening"), &Value::Bool(true));
     assert_eq!(
         field(&status, "address"),
         &Value::Str("127.0.0.1:9191".into())
     );
 
-    // The armed flag is shared: flipping it is visible without re-arming.
+    // Both shared flags reflect the real state: not serving + disarmed, no config.
     armed.store(false, Ordering::Relaxed);
+    listening.store(false, Ordering::Relaxed);
     let status = call(&reg, &store, &guard, None, "proxy.status");
     assert_eq!(field(&status, "intercept_armed"), &Value::Bool(false));
-    // No config attached -> not listening, address null, not an error.
     assert_eq!(field(&status, "listening"), &Value::Bool(false));
     assert_eq!(field(&status, "address"), &Value::Null);
 }
 
 #[test]
-fn pause_resume_marks_inserts_ephemeral() {
-    let reg = reg_with(Arc::new(AtomicBool::new(false)));
+fn pause_resume_marks_inserts_hidden() {
+    let reg = reg();
     let store = MemFlowStore::new();
     let guard = StdGuard::default();
 
@@ -150,22 +159,15 @@ fn pause_resume_marks_inserts_ephemeral() {
     assert!(!store.is_capturing());
 
     // While paused, an insert is still RESIDENT (so the pipeline can get/update it
-    // and intercept/replay work) but hidden from `list` and retireable.
+    // and intercept/replay work) but hidden from `list`/`count`. No retire: it ages
+    // out via normal eviction.
     let id = store.insert(flow(InterceptState::Observed));
     assert!(
         store.get(id).is_some(),
         "paused capture keeps the flow resident for the pipeline"
     );
-    assert!(
-        store.list().is_empty(),
-        "ephemeral flows are hidden from list"
-    );
+    assert!(store.list().is_empty(), "hidden flows are not listed");
     assert_eq!(store.count(), 0);
-    assert!(
-        store.retire_ephemeral(id),
-        "terminal ephemeral flow is retired"
-    );
-    assert!(store.get(id).is_none(), "retired flow is gone");
 
     let resumed = call(&reg, &store, &guard, None, "proxy.resume");
     assert_eq!(field(&resumed, "capturing"), &Value::Bool(true));
@@ -174,15 +176,11 @@ fn pause_resume_marks_inserts_ephemeral() {
         store.list().contains(&id),
         "resumed capture is visible again"
     );
-    assert!(
-        !store.retire_ephemeral(id),
-        "a captured flow is not ephemeral"
-    );
 }
 
 #[test]
 fn flow_clear_removes_terminal_keeps_in_flight() {
-    let reg = reg_with(Arc::new(AtomicBool::new(false)));
+    let reg = reg();
     let store = MemFlowStore::new();
     let guard = StdGuard::default();
     store.insert(terminal_flow());
@@ -207,7 +205,7 @@ fn flow_clear_removes_terminal_keeps_in_flight() {
 
 #[test]
 fn config_get_is_redacted_and_requires_config() {
-    let reg = reg_with(Arc::new(AtomicBool::new(false)));
+    let reg = reg();
     let store = MemFlowStore::new();
     let guard = StdGuard::default();
 

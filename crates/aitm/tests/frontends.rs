@@ -429,3 +429,80 @@ fn config_get_reaches_plugins_over_both_frontends() {
         "cli config.get: {text}"
     );
 }
+
+/// Wire-level proof of the default-off scope gate: an assembled proxy refuses an
+/// MCP `scope.add` under `Config::default()`, and accepts it once the operator
+/// sets `scope.allow_agent_widen` (covers the wire.rs plumbing of the flag).
+#[test]
+fn scope_add_gate_is_wired_default_off() {
+    // Default config: the flag is off, so the agent (MCP) frontend is refused.
+    let mut cfg = config("gate-off");
+    cfg.scope.allow_agent_widen = false;
+    let proxy = build_proxy(&cfg).expect("build proxy");
+    let store = proxy.store();
+    let client: Arc<dyn ProxyClient> = Arc::new(UnusedClient);
+    let server = McpServer::new(proxy.registry_arc(), McpTransport::Stdio).with_services(
+        store,
+        client,
+        proxy.guard(),
+        None,
+    );
+    let resp = rpc(
+        &server,
+        1,
+        "tools/call",
+        json!({"name": "scope.add", "arguments": {"host": "new.test"}}),
+    );
+    assert_eq!(
+        resp["result"]["isError"],
+        json!(true),
+        "MCP scope.add must be refused when allow_agent_widen is off: {resp}"
+    );
+
+    // With the flag on, the same MCP call is accepted.
+    let mut cfg2 = config("gate-on");
+    cfg2.scope.allow_agent_widen = true;
+    let proxy2 = build_proxy(&cfg2).expect("build proxy");
+    let store2 = proxy2.store();
+    let client2: Arc<dyn ProxyClient> = Arc::new(UnusedClient);
+    let server2 = McpServer::new(proxy2.registry_arc(), McpTransport::Stdio).with_services(
+        store2,
+        client2,
+        proxy2.guard(),
+        None,
+    );
+    let resp2 = rpc(
+        &server2,
+        1,
+        "tools/call",
+        json!({"name": "scope.add", "arguments": {"host": "new.test"}}),
+    );
+    assert_eq!(
+        resp2["result"]["isError"],
+        json!(false),
+        "MCP scope.add must be accepted when allow_agent_widen is on: {resp2}"
+    );
+}
+
+/// Startup guard: a PoC output dir that equals (or contains) the CA directory is
+/// refused, so `poc.artifact` can never be pointed at the CA key.
+#[test]
+fn assemble_rejects_out_dir_containing_ca_dir() {
+    let assemble_err = |cfg: &Config| match aitm::wire::assemble(cfg) {
+        Ok(_) => panic!("assemble should have been refused"),
+        Err(e) => e.to_string(),
+    };
+
+    // out_dir == ca.dir is the clearest footgun.
+    let mut cfg = config("ca-guard");
+    cfg.poc.out_dir = Some(cfg.ca.dir.clone());
+    assert!(
+        assemble_err(&cfg).contains("poc.out_dir"),
+        "error should name poc.out_dir"
+    );
+
+    // A parent-of-ca.dir out_dir is refused too.
+    let mut cfg2 = config("ca-guard2");
+    cfg2.poc.out_dir = cfg2.ca.dir.parent().map(|p| p.to_path_buf());
+    assert!(assemble_err(&cfg2).contains("poc.out_dir"));
+}

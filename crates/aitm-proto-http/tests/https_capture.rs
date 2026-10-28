@@ -422,24 +422,17 @@ async fn paused_capture_forwards_but_hides_the_flow() {
     assert_eq!(status, 200, "paused capture must still forward the request");
     assert!(body.contains("hello-aitm"), "client body was {body:?}");
 
-    // The flow was not captured for inspection (hidden while paused).
-    // Give the ephemeral retirement a moment, then assert nothing is listed.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(
-        store.list().is_empty(),
-        "paused capture must not list the flow: {:?}",
-        store.list()
-    );
+    // The 200 above is the real regression guard: under the old drop-on-insert bug
+    // the module's post-dispatch `get` missed the flow and bailed, breaking the
+    // connection. The flow is hidden from the operator's view while paused.
+    assert_eq!(store.count(), 0, "paused capture must not show the flow");
+    assert!(store.list().is_empty());
 
-    // Resume: the next request is recorded again.
+    // Resume: the next request is recorded and visible.
     store.set_capturing(true);
     let (status, _body) = https_get(proxy, upstream, "/hello", ca.root_cert_pem()).await;
     assert_eq!(status, 200);
     let flow = wait_for_flow(store.as_ref()).await;
     assert_eq!(flow.request.path, "/hello");
-    assert_eq!(
-        store.list().len(),
-        1,
-        "resumed capture records exactly one flow"
-    );
+    assert_eq!(store.count(), 1, "resumed capture shows exactly one flow");
 }

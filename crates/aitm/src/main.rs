@@ -32,7 +32,11 @@ async fn main() -> anyhow::Result<()> {
     let config_path = config_arg.or_else(|| std::env::var_os(CONFIG_ENV).map(PathBuf::from));
     let mut cfg = config_file::load(config_path.as_deref())?;
     env::apply(&mut cfg, |k| std::env::var(k).ok());
-    let Assembled { proxy, ca } = assemble(&cfg)?;
+    let Assembled {
+        proxy,
+        ca,
+        listening,
+    } = assemble(&cfg)?;
 
     // Shared service handles for the frontends and the replay client.
     let registry = proxy.registry_arc();
@@ -90,6 +94,8 @@ async fn main() -> anyhow::Result<()> {
     // SSRF-filtered (the embedded browser dials `cfg.browser.proxy_addr`).
     let main_listen = cfg.listen;
     let browser_listen = cfg.browser.proxy_addr;
+    // We are about to serve: `proxy.status.listening` now reports the truth.
+    listening.store(true, std::sync::atomic::Ordering::Relaxed);
     let result = tokio::select! {
         result = proxy.run(main_listen) => result,
         result = proxy.run_browser(browser_listen) => result,

@@ -18,40 +18,40 @@ use crate::flow::{Flow, FlowId, InterceptState};
 /// A shared, queryable store of captured flows.
 ///
 /// Every method is required: a store that silently no-ops `clear`, the capture
-/// toggle, or ephemeral retirement would lie to the operator (e.g. `scope.remove`
+/// toggle, or hidden-marking would lie to the operator (e.g. `scope.remove`
 /// reporting success while leaving a host in scope), so the trait forces each
 /// implementation to make a real choice.
 pub trait FlowStore: Send + Sync {
     /// Store a flow, keyed by its own id; returns that id. The flow is always
-    /// retained so the pipeline can `get`/`update` it; when capture is paused the
-    /// flow is additionally marked *ephemeral* (hidden from `list`/`query` and
-    /// retired at its terminal event).
+    /// retained so the pipeline can `get`/`update` it. When capture is paused a
+    /// **newly**-inserted flow is marked *hidden* — excluded from `list`/`query`
+    /// and the counts, but kept resident and reachable by id (so the pipeline,
+    /// interception and replay all keep working). Hidden flows are not retired on
+    /// a lifecycle event; they age out through the normal capacity/byte eviction,
+    /// so pausing simply stops *showing* new flows while keeping memory bounded.
     fn insert(&self, flow: Flow) -> FlowId;
-    /// A clone of the stored flow, if present. Returns ephemeral flows too, so a
+    /// A clone of the stored flow, if present. Returns hidden flows too, so a
     /// by-id lookup (resume, replay, detail) works while capture is paused.
     fn get(&self, id: FlowId) -> Option<Flow>;
     /// Mutate a stored flow in place.
     fn update(&self, id: FlowId, f: &mut dyn FnMut(&mut Flow));
-    /// Visible flow ids (ephemeral flows excluded), in insertion order.
+    /// Visible flow ids, in insertion order. A hidden flow is shown only while it
+    /// is intercepted (parked), so an operator can still find it to resume.
     fn list(&self) -> Vec<FlowId>;
-    /// Visible ids matching every set filter in `q` (ephemeral excluded).
+    /// Visible ids matching every set filter in `q` (same visibility as `list`).
     fn query(&self, q: &FlowQuery) -> Vec<FlowId>;
-    /// Remove terminal flows (a completed/killed HTTP response, a killed WS);
-    /// in-flight and intercepted (parked) flows are kept so the pipeline is never
-    /// stranded. Reports how many were cleared and how many were skipped.
+    /// Remove terminal flows (a completed/killed HTTP response, a killed WS),
+    /// hidden or not; in-flight and intercepted (parked) flows are kept so the
+    /// pipeline is never stranded. Reports how many were cleared and skipped.
     fn clear(&self) -> ClearOutcome;
-    /// Whether new flows are being retained (the capture/record toggle).
+    /// Whether new flows are being shown (the capture/record toggle).
     fn is_capturing(&self) -> bool;
-    /// Enable (`true`) or disable (`false`) retaining newly inserted flows. While
-    /// disabled, flows still flow through the pipeline but are marked ephemeral.
+    /// Enable (`true`) or disable (`false`) showing newly inserted flows. While
+    /// disabled, flows still flow through the pipeline but are marked hidden.
     fn set_capturing(&self, on: bool);
-    /// Remove a flow iff it was marked ephemeral (captured while paused) and is now
-    /// at its terminal event; returns whether it was removed. A no-op for a
-    /// non-ephemeral flow, so the chain can call it on every terminal event.
-    fn retire_ephemeral(&self, id: FlowId) -> bool;
-    /// The number of visible (non-ephemeral) flows, without cloning any flow.
+    /// The number of visible flows, without cloning any flow.
     fn count(&self) -> usize;
-    /// The number of visible flows currently intercepted (parked), without cloning.
+    /// The number of flows currently intercepted (parked), without cloning.
     fn intercepted_count(&self) -> usize;
 }
 
@@ -100,12 +100,13 @@ pub struct MemFlowStore {
     /// Estimated resident bytes of all held flows. Mutated only under the `flows`
     /// write lock, so it stays consistent with the map.
     resident: AtomicUsize,
-    /// Whether new flows are retained as visible. `false` keeps the flow resident
-    /// (so the pipeline works) but marks it ephemeral (the record toggle).
+    /// Whether new flows are shown. `false` keeps the flow resident (so the
+    /// pipeline works) but marks it hidden (the record toggle).
     capturing: AtomicBool,
-    /// Ids captured while paused: resident but hidden from `list`/`query`, retired
-    /// at their terminal event. Always locked **after** `flows` to avoid deadlock.
-    ephemeral: Mutex<HashSet<FlowId>>,
+    /// Ids captured while paused: resident but hidden from `list`/`query`/counts
+    /// (unless currently intercepted). They age out through the normal eviction,
+    /// never a lifecycle retire. Always locked **after** `flows` to avoid deadlock.
+    hidden: Mutex<HashSet<FlowId>>,
 }
 
 impl Default for MemFlowStore {
@@ -135,15 +136,13 @@ impl MemFlowStore {
             max_bytes,
             resident: AtomicUsize::new(0),
             capturing: AtomicBool::new(true),
-            ephemeral: Mutex::new(HashSet::new()),
+            hidden: Mutex::new(HashSet::new()),
         }
     }
 
-    /// Lock the ephemeral set, recovering from poisoning.
-    fn ephemeral(&self) -> std::sync::MutexGuard<'_, HashSet<FlowId>> {
-        self.ephemeral
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    /// Lock the hidden set, recovering from poisoning.
+    fn hidden(&self) -> std::sync::MutexGuard<'_, HashSet<FlowId>> {
+        self.hidden.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Estimated resident bytes currently held (for tests / introspection).
@@ -178,22 +177,31 @@ impl MemFlowStore {
     }
 
     /// Drain the `remove` oldest flows, decrementing the resident-byte counter by
-    /// their estimated size and dropping any of them from the ephemeral set.
+    /// their estimated size and dropping any of them from the hidden set. This is
+    /// the only path that removes a hidden flow: paused captures age out here, so
+    /// memory stays bounded without a per-event retire step.
     fn drain_oldest(&self, flows: &mut IndexMap<FlowId, Flow>, remove: usize) {
         let remove = remove.min(flows.len());
         if remove == 0 {
             return;
         }
-        let mut ephemeral = self.ephemeral();
+        let mut hidden = self.hidden();
         let freed: usize = flows
             .drain(0..remove)
             .map(|(id, f)| {
-                ephemeral.remove(&id);
+                hidden.remove(&id);
                 flow_size(&f)
             })
             .sum();
         self.resident.fetch_sub(freed, Ordering::Relaxed);
     }
+}
+
+/// Whether a flow is visible to `list`/`query`/`count`: shown unless it was
+/// captured while paused (`hidden`), except a parked (intercepted) hidden flow is
+/// still shown so an operator can find it to resume.
+fn is_visible(id: &FlowId, flow: &Flow, hidden: &HashSet<FlowId>) -> bool {
+    !hidden.contains(id) || is_intercepted(flow)
 }
 
 /// Whether a flow has reached a point where it can be removed without stranding
@@ -324,13 +332,16 @@ impl FlowStore for MemFlowStore {
     fn insert(&self, flow: Flow) -> FlowId {
         let id = flow.id();
         let size = flow_size(&flow);
-        // Record toggle: a flow captured while paused is still stored (so the
-        // pipeline can get/update it and intercept/replay keep working) but marked
-        // ephemeral — hidden from list/query and retired at its terminal event.
         let paused = !self.capturing.load(Ordering::Relaxed);
         let mut flows = self.flows.write().unwrap_or_else(PoisonError::into_inner);
-        if paused {
-            self.ephemeral().insert(id);
+        // Record toggle: mark *only a brand-new* id hidden while paused. The chain
+        // re-inserts a flow on every event, so keying on new-id-ness keeps an
+        // already-visible in-flight flow visible (and its marks/comment intact)
+        // even if capture is paused mid-flight. The flow is always stored so the
+        // pipeline can get/update it and intercept/replay keep working.
+        let is_new = !flows.contains_key(&id);
+        if paused && is_new {
+            self.hidden().insert(id);
         }
         // Re-inserting an existing id replaces in place: discount the old size.
         if let Some(old) = flows.insert(id, flow) {
@@ -372,20 +383,20 @@ impl FlowStore for MemFlowStore {
 
     fn list(&self) -> Vec<FlowId> {
         let flows = self.flows.read().unwrap_or_else(PoisonError::into_inner);
-        let ephemeral = self.ephemeral();
+        let hidden = self.hidden();
         flows
-            .keys()
-            .filter(|id| !ephemeral.contains(id))
-            .copied()
+            .iter()
+            .filter(|(id, flow)| is_visible(id, flow, &hidden))
+            .map(|(id, _)| *id)
             .collect()
     }
 
     fn query(&self, q: &FlowQuery) -> Vec<FlowId> {
         let flows = self.flows.read().unwrap_or_else(PoisonError::into_inner);
-        let ephemeral = self.ephemeral();
+        let hidden = self.hidden();
         flows
             .iter()
-            .filter(|(id, _)| !ephemeral.contains(*id))
+            .filter(|(id, flow)| is_visible(id, flow, &hidden))
             .filter(|(_, flow)| matches(flow, q))
             .map(|(id, _)| *id)
             .collect()
@@ -393,17 +404,18 @@ impl FlowStore for MemFlowStore {
 
     fn clear(&self) -> ClearOutcome {
         let mut flows = self.flows.write().unwrap_or_else(PoisonError::into_inner);
-        let mut ephemeral = self.ephemeral();
+        let mut hidden = self.hidden();
         let mut cleared = 0usize;
         let mut skipped_in_flight = 0usize;
         let mut freed = 0usize;
-        // Keep in-flight and parked flows; removing one would strand the pipeline
-        // (the proto module's `get` after dispatch would miss it) or its resume.
+        // Remove terminal flows (hidden or visible); keep in-flight and parked
+        // flows — removing one would strand the pipeline (the proto module's `get`
+        // after dispatch would miss it) or its resume.
         flows.retain(|id, flow| {
             if is_terminal(flow) {
                 cleared += 1;
                 freed += flow_size(flow);
-                ephemeral.remove(id);
+                hidden.remove(id);
                 false
             } else {
                 skipped_in_flight += 1;
@@ -425,30 +437,17 @@ impl FlowStore for MemFlowStore {
         self.capturing.store(on, Ordering::Relaxed);
     }
 
-    fn retire_ephemeral(&self, id: FlowId) -> bool {
-        let mut flows = self.flows.write().unwrap_or_else(PoisonError::into_inner);
-        if !self.ephemeral().remove(&id) {
-            return false;
-        }
-        if let Some(flow) = flows.shift_remove(&id) {
-            self.resident.fetch_sub(flow_size(&flow), Ordering::Relaxed);
-        }
-        true
-    }
-
     fn count(&self) -> usize {
         let flows = self.flows.read().unwrap_or_else(PoisonError::into_inner);
-        let ephemeral = self.ephemeral();
-        flows.keys().filter(|id| !ephemeral.contains(id)).count()
+        let hidden = self.hidden();
+        flows
+            .iter()
+            .filter(|(id, flow)| is_visible(id, flow, &hidden))
+            .count()
     }
 
     fn intercepted_count(&self) -> usize {
         let flows = self.flows.read().unwrap_or_else(PoisonError::into_inner);
-        let ephemeral = self.ephemeral();
-        flows
-            .iter()
-            .filter(|(id, _)| !ephemeral.contains(*id))
-            .filter(|(_, flow)| is_intercepted(flow))
-            .count()
+        flows.values().filter(|flow| is_intercepted(flow)).count()
     }
 }

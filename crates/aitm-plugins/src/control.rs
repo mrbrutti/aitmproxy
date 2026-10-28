@@ -17,16 +17,19 @@ use aitm_core::{
 };
 
 /// Registers `proxy.status`, `proxy.pause`, `proxy.resume`, `flow.clear`, and
-/// `config.get`. Shares the intercept plugin's armed flag for read-only status.
+/// `config.get`. Shares the intercept plugin's armed flag and a serving flag for
+/// read-only status.
 pub struct ControlPlugin {
     armed: Arc<AtomicBool>,
+    listening: Arc<AtomicBool>,
 }
 
 impl ControlPlugin {
     /// `armed` is the intercept plugin's shared flag (see
-    /// `InterceptPlugin::armed_flag`), so `proxy.status` reports the real state.
-    pub fn new(armed: Arc<AtomicBool>) -> Self {
-        Self { armed }
+    /// `InterceptPlugin::armed_flag`); `listening` is flipped by the binary once it
+    /// is actually serving, so `proxy.status` reports the real state.
+    pub fn new(armed: Arc<AtomicBool>, listening: Arc<AtomicBool>) -> Self {
+        Self { armed, listening }
     }
 }
 
@@ -38,6 +41,7 @@ impl Plugin for ControlPlugin {
     fn load(&mut self, reg: &mut Registry) {
         reg.add_command(Arc::new(ProxyStatus {
             armed: self.armed.clone(),
+            listening: self.listening.clone(),
         }));
         reg.add_command(Arc::new(ProxyPause));
         reg.add_command(Arc::new(ProxyResume));
@@ -49,6 +53,7 @@ impl Plugin for ControlPlugin {
 /// `proxy.status` → the proxy's live state.
 struct ProxyStatus {
     armed: Arc<AtomicBool>,
+    listening: Arc<AtomicBool>,
 }
 
 impl Command for ProxyStatus {
@@ -68,11 +73,14 @@ impl Command for ProxyStatus {
     }
 
     fn invoke(&self, _args: Params, host: &CommandHost) -> anyhow::Result<Value> {
-        // `listening`/`address` are split so a surface can key on the boolean and
-        // show the address when the config is attached (null otherwise).
+        // `listening` is the real serving state (false on a one-shot `aitm proxy
+        // status` that never binds); `address` is the configured listen address.
         let address = host.config().map(|c| c.listen.to_string());
         let mut obj = BTreeMap::new();
-        obj.insert("listening".into(), Value::Bool(address.is_some()));
+        obj.insert(
+            "listening".into(),
+            Value::Bool(self.listening.load(Ordering::Relaxed)),
+        );
         obj.insert("address".into(), address.map_or(Value::Null, Value::Str));
         obj.insert(
             "intercept_armed".into(),

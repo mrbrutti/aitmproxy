@@ -47,35 +47,87 @@ fn http(intercept: InterceptState, with_response: bool) -> Flow {
     })
 }
 
+fn http_with_id(id: FlowId, intercept: InterceptState, with_response: bool) -> Flow {
+    match http(intercept, with_response) {
+        Flow::Http(mut f) => {
+            f.id = id;
+            Flow::Http(f)
+        }
+        other => other,
+    }
+}
+
 #[test]
-fn paused_insert_is_resident_but_hidden_then_retired() {
+fn parked_hidden_flow_is_visible_so_it_can_be_resumed() {
+    // A flow captured while paused that then parks (intercept) must be visible so
+    // an operator can find and resume it (otherwise it hangs to the timeout).
+    let store = MemFlowStore::new();
+    store.set_capturing(false);
+    let id = store.insert(http(InterceptState::Observed, false));
+    assert!(store.list().is_empty(), "hidden until it parks");
+
+    let (h, _rx) = ResumeHandle::new();
+    store.insert(http_with_id(
+        id,
+        InterceptState::Intercepted {
+            backup: Box::new(http(InterceptState::Observed, false)),
+            resume: h,
+        },
+        false,
+    ));
+    assert!(
+        store.list().contains(&id),
+        "a parked hidden flow is shown so it can be resumed"
+    );
+    assert_eq!(store.intercepted_count(), 1);
+}
+
+#[test]
+fn paused_insert_is_resident_but_hidden() {
     let store = MemFlowStore::new();
     store.set_capturing(false);
     let id = store.insert(http(InterceptState::Observed, true));
 
-    // Resident (pipeline can reach it) but hidden from list/query/count.
+    // Resident (pipeline can reach it by id) but hidden from list/query/count.
     assert!(store.get(id).is_some());
     assert!(store.list().is_empty());
     assert_eq!(store.count(), 0);
-
-    assert!(store.retire_ephemeral(id));
-    assert!(store.get(id).is_none());
-    // A second retire is a no-op.
-    assert!(!store.retire_ephemeral(id));
+    assert!(store.resident_bytes() > 0, "the hidden flow is still held");
 }
 
 #[test]
-fn capturing_flows_are_visible_and_not_ephemeral() {
+fn reinsert_of_visible_flow_while_paused_stays_visible() {
+    // A flow first seen while capturing is visible; the chain re-inserts it on
+    // later events, and pausing mid-flight must NOT hide it or drop its marks.
     let store = MemFlowStore::new();
-    assert!(store.is_capturing());
-    let id = store.insert(http(InterceptState::Observed, true));
+    let id = store.insert(http(InterceptState::Observed, false));
     assert!(store.list().contains(&id));
-    assert_eq!(store.count(), 1);
+
+    store.set_capturing(false);
+    // Re-insert the same id (as the chain does on each event).
+    store.insert(http_with_id(id, InterceptState::Observed, true));
     assert!(
-        !store.retire_ephemeral(id),
-        "a captured flow is never ephemeral"
+        store.list().contains(&id),
+        "an already-visible in-flight flow stays visible when capture pauses"
     );
-    assert!(store.get(id).is_some());
+    assert_eq!(store.count(), 1);
+}
+
+#[test]
+fn hidden_flows_age_out_via_eviction() {
+    // With capacity 1 and nothing visible to show, hidden flows are bounded by the
+    // normal FIFO eviction rather than any retire step.
+    let store = MemFlowStore::with_capacity(1);
+    store.set_capturing(false);
+    for _ in 0..5 {
+        store.insert(http(InterceptState::Observed, true));
+    }
+    assert!(store.list().is_empty(), "hidden flows are never listed");
+    // Eviction keeps the map bounded near capacity even while paused.
+    assert!(
+        store.resident_bytes() > 0,
+        "some hidden flow is still resident"
+    );
 }
 
 #[test]

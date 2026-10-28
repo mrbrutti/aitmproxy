@@ -270,3 +270,45 @@ async fn ws_frames_captured_in_order() {
 
     ws.close(None).await.ok();
 }
+
+/// C1/WS regression: a WebSocket upgrade through a PAUSED proxy must still succeed
+/// and relay frames (the 101 Response must not retire the handshake flow out from
+/// under the WS module). The flow is hidden from the list while paused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_upgrade_and_relay_work_while_paused() {
+    let echo = spawn_echo().await;
+    let (proxy, store) = run_proxy().await;
+    store.set_capturing(false);
+
+    let mut tcp = TcpStream::connect(proxy).await.expect("connect proxy");
+    tcp.write_all(format!("CONNECT {echo} HTTP/1.1\r\nHost: {echo}\r\n\r\n").as_bytes())
+        .await
+        .expect("send CONNECT");
+    let reply = read_head(&mut tcp).await;
+    assert!(
+        reply.starts_with("HTTP/1.1 200"),
+        "CONNECT reply: {reply:?}"
+    );
+
+    // The upgrade must complete (101) even though the proxy is paused.
+    let (mut ws, response) = tokio_tungstenite::client_async(format!("ws://{echo}/chat"), tcp)
+        .await
+        .expect("WebSocket handshake through a paused proxy");
+    assert_eq!(
+        response.status().as_u16(),
+        101,
+        "upgrade must succeed while paused"
+    );
+
+    // And frames still relay end-to-end.
+    ws.send(Message::text("paused-ping"))
+        .await
+        .expect("send text");
+    let echoed = ws.next().await.expect("echo reply").expect("echo frame");
+    assert_eq!(echoed.to_text().expect("text"), "paused-ping");
+
+    // While paused the WS flow is hidden from the list.
+    assert!(store.list().is_empty(), "paused capture hides the WS flow");
+
+    ws.close(None).await.ok();
+}

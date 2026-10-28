@@ -50,6 +50,9 @@ impl Default for Features {
 pub struct Assembled {
     pub proxy: Proxy,
     pub ca: Arc<CertAuthority>,
+    /// Set `true` once the proxy is actually serving, so `proxy.status.listening`
+    /// is honest (a one-shot `aitm proxy status` that never serves reports `false`).
+    pub listening: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Assemble the proxy from configuration with the default feature set.
@@ -59,6 +62,18 @@ pub fn assemble(cfg: &Config) -> anyhow::Result<Assembled> {
 
 /// Assemble the proxy from configuration and an explicit feature set.
 pub fn assemble_with(cfg: &Config, features: &Features) -> anyhow::Result<Assembled> {
+    // Refuse a PoC output dir that would expose the CA key: `poc.artifact` serves
+    // files under `poc.out_dir`, so it must not equal or contain `ca.dir`.
+    if let Some(out_dir) = &cfg.poc.out_dir {
+        if cfg.ca.dir == *out_dir || cfg.ca.dir.starts_with(out_dir) {
+            anyhow::bail!(
+                "poc.out_dir ({}) must not equal or contain the CA directory ({}): \
+                 poc.artifact would be able to read the CA key",
+                out_dir.display(),
+                cfg.ca.dir.display()
+            );
+        }
+    }
     let ca = Arc::new(CertAuthority::load_or_generate(
         &cfg.ca.dir,
         cfg.ca.key_mode,
@@ -67,10 +82,12 @@ pub fn assemble_with(cfg: &Config, features: &Features) -> anyhow::Result<Assemb
         .with_insecure(cfg.ssl_insecure)
         .with_max_body_bytes(cfg.limits.max_body_bytes);
 
-    // The control plugin's `proxy.status` reports whether intercept is armed, so
-    // it shares the intercept plugin's armed flag.
+    // The control plugin's `proxy.status` reports whether intercept is armed and
+    // whether the proxy is serving, so it shares the intercept plugin's armed flag
+    // and a listening flag `main` flips once it begins serving.
     let intercept = InterceptPlugin::new();
     let armed = intercept.armed_flag();
+    let listening = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let mut builder = Proxy::builder()
         .with_config(cfg.clone())
@@ -84,7 +101,7 @@ pub fn assemble_with(cfg: &Config, features: &Features) -> anyhow::Result<Assemb
         .register_plugin(Box::new(MetaPlugin::new()))
         .register_plugin(Box::new(ReplayPlugin::new()))
         .register_plugin(Box::new(intercept))
-        .register_plugin(Box::new(ControlPlugin::new(armed)));
+        .register_plugin(Box::new(ControlPlugin::new(armed, listening.clone())));
     if features.mutate {
         builder = builder.register_plugin(Box::new(MutatePlugin::new()));
     }
@@ -103,6 +120,7 @@ pub fn assemble_with(cfg: &Config, features: &Features) -> anyhow::Result<Assemb
     Ok(Assembled {
         proxy: builder.build()?,
         ca,
+        listening,
     })
 }
 

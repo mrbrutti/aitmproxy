@@ -23,6 +23,15 @@ use crate::model::{Poc, Severity};
 /// limit so a single read cannot be made to buffer an unbounded file.
 const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 
+/// `poc.run` only ever writes these artifact kinds; restricting `poc.artifact` to
+/// them means a mis-pointed `out_dir` (e.g. one that contains the CA key) cannot
+/// be used to read a `.pem`/`.key` through the bus.
+const ARTIFACT_EXTENSIONS: [&str; 3] = ["png", "yaml", "yml"];
+
+/// Cap how many directory entries `poc.list` scans, so a huge library directory
+/// cannot stall the command.
+const MAX_LIST_ENTRIES: usize = 10_000;
+
 /// Register `poc.list`, `poc.get`, and `poc.artifact`.
 pub fn register(registry: &mut Registry) {
     registry.add_command(Arc::new(PocList));
@@ -97,7 +106,7 @@ impl Command for PocList {
             Err(_) => return Ok(Value::Array(Vec::new())),
         };
         let mut out = Vec::new();
-        for entry in entries.flatten() {
+        for entry in entries.flatten().take(MAX_LIST_ENTRIES) {
             let path = entry.path();
             let is_yaml = path
                 .extension()
@@ -204,6 +213,18 @@ impl Command for PocArtifact {
 
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         let path_arg = args.get_str("path")?;
+        // Only serve the artifact kinds poc.run writes; never a .pem/.key, even if
+        // out_dir were mis-configured to contain key material.
+        let ext_ok = Path::new(path_arg)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| ARTIFACT_EXTENSIONS.contains(&e));
+        if !ext_ok {
+            anyhow::bail!(
+                "poc.artifact: only {} artifacts are served",
+                ARTIFACT_EXTENSIONS.join(", ")
+            );
+        }
         let root = host
             .config()
             .and_then(|c| c.poc.out_dir.clone())

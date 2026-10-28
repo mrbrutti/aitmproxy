@@ -174,7 +174,7 @@ fn poc_artifact_reads_confined_bytes() {
 
     // A traversal outside the out-dir is refused.
     let outside = unique_dir("art-outside");
-    let secret = outside.join("secret.bin");
+    let secret = outside.join("secret.png");
     std::fs::write(&secret, b"top secret").unwrap();
     let err = call(
         &reg(),
@@ -202,10 +202,10 @@ fn poc_artifact_requires_out_dir() {
 fn poc_artifact_refuses_symlink_escape() {
     let out_dir = unique_dir("art-symlink");
     let outside = unique_dir("art-secret");
-    let secret = outside.join("secret.bin");
+    let secret = outside.join("secret.png");
     std::fs::write(&secret, b"top secret").unwrap();
     // A symlink inside the out-dir that points outside must not exfiltrate.
-    let link = out_dir.join("escape.bin");
+    let link = out_dir.join("escape.png");
     #[cfg(unix)]
     std::os::unix::fs::symlink(&secret, &link).unwrap();
     #[cfg(not(unix))]
@@ -240,7 +240,7 @@ fn poc_artifact_missing_file_is_generic_error() {
 #[test]
 fn poc_artifact_enforces_size_cap() {
     let out_dir = unique_dir("art-big");
-    let big = out_dir.join("big.bin");
+    let big = out_dir.join("big.png");
     // 17 MiB > the 16 MiB artifact cap.
     std::fs::write(&big, vec![0u8; 17 * 1024 * 1024]).unwrap();
     let err = call(
@@ -267,4 +267,20 @@ fn poc_get_enforces_size_cap() {
     )
     .expect_err("an oversize PoC must be refused");
     assert!(err.to_string().contains("outside"), "{err}");
+}
+
+#[test]
+fn poc_artifact_rejects_disallowed_extension() {
+    let out_dir = unique_dir("art-ext");
+    // A key-like file under out_dir must not be served even though it is confined.
+    let pem = out_dir.join("ca.pem");
+    std::fs::write(&pem, b"-----BEGIN PRIVATE KEY-----").unwrap();
+    let err = call(
+        &reg(),
+        cfg_with(None, Some(out_dir)),
+        "poc.artifact",
+        &[("path", Value::Str(pem.display().to_string()))],
+    )
+    .expect_err("a non-artifact extension must be refused");
+    assert!(err.to_string().contains("artifacts are served"), "{err}");
 }
