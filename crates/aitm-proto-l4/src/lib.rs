@@ -11,5 +11,6 @@
 
 pub mod config;
 pub mod craft;
+pub mod flow;
 pub mod guard;
 pub mod types;
