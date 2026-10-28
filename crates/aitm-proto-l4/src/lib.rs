@@ -17,6 +17,7 @@ pub mod craft;
 pub mod flow;
 pub mod guard;
 pub mod module;
+pub mod sendrecv;
 pub mod types;
 pub mod wire;
 
