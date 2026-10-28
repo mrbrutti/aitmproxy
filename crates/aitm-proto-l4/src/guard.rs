@@ -1,0 +1,804 @@
+//! The L4 authorization guard (M5 Tasks 4 + 5).
+//!
+//! [`L4Guard`] is the single, deny-by-default gate every wire-touching L4 action
+//! passes before reaching the network: raw capture, crafted inject, send-and-
+//! receive, and in-path mangling verdicts. It is intentionally **stronger** than
+//! the core [`ScopeRateGuard`](aitm-core) (host-string + rps only): it matches on
+//! interface + direction + CIDR + port, splits Capture / Inject / Intercept into
+//! separate capabilities, enforces a dangerous-destination denylist, and meters
+//! injection with per-entry and global token buckets plus packet size/count caps.
+//!
+//! The crate composes this guard with the core guard for defense in depth at the
+//! command layer (M5 Task 9), where a resolved authority also passes
+//! `CommandHost::guard().check_active(..)`; `L4Guard` itself is self-contained and
+//! takes only an [`L4Config`].
+//!
+//! **One choke point.** The only key to the wire-write and mangling-verdict paths
+//! is an [`L4Permit`], and the only way to mint one is [`L4Guard::check`]: the
+//! permit's constructor is private to this module, so no sibling module can forge
+//! one. A permit is an RAII token carrying a bounded send budget (size + count)
+//! and an in-flight slot released on drop. There is no unchecked path.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::time::{Duration, Instant};
+
+use crate::config::L4Config;
+use crate::types::{IpCidr, L4Action, L4Capability, L4Proto, L4ScopeEntry, L4ScopeId};
+
+/// A typed refusal from the L4 guard. Every wire-touching action passes the guard
+/// first; these are the ways it says no. Mirrors the core `GuardError` style
+/// (hand-written `Display`/`Error`, no external derive crate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum L4GuardError {
+    /// No enabled scope entry matches the target's interface + direction + CIDR +
+    /// port (deny-by-default).
+    OutOfL4Scope(String),
+    /// A scope entry matches the location, but none grants the requested
+    /// capability (Capture / Inject / Intercept are separate).
+    CapabilityNotGranted(L4Capability),
+    /// The destination is on the dangerous-destination denylist (loopback,
+    /// link-local, multicast/broadcast, cloud-metadata, unspecified) and no
+    /// explicit scope entry covers it.
+    DangerousDestinationBlocked(String),
+    /// The per-entry or global injection rate ceiling was hit.
+    InjectionRateExceeded {
+        /// How long to wait before the next injection may succeed.
+        retry_after: Duration,
+    },
+    /// A single packet exceeds `max_packet_bytes`.
+    PacketTooLarge {
+        /// The configured ceiling, in bytes.
+        max: usize,
+    },
+    /// A command tried to emit more packets than `max_packets_per_call`.
+    CountExceeded {
+        /// The configured per-call ceiling.
+        max: u32,
+    },
+    /// The L4 subsystem is unavailable (disabled, no privilege, libpcap/nfq
+    /// absent, or OS-unsupported). Reserved here for downstream tasks.
+    L4Unavailable(String),
+}
+
+impl fmt::Display for L4GuardError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            L4GuardError::OutOfL4Scope(t) => write!(f, "target {t} is out of L4 scope"),
+            L4GuardError::CapabilityNotGranted(cap) => {
+                write!(f, "scope matches but does not grant the {cap:?} capability")
+            }
+            L4GuardError::DangerousDestinationBlocked(dst) => write!(
+                f,
+                "destination {dst} is on the dangerous-destination denylist and not explicitly scoped"
+            ),
+            L4GuardError::InjectionRateExceeded { retry_after } => {
+                write!(f, "injection rate exceeded; retry after {retry_after:?}")
+            }
+            L4GuardError::PacketTooLarge { max } => {
+                write!(f, "packet exceeds the {max}-byte ceiling")
+            }
+            L4GuardError::CountExceeded { max } => {
+                write!(f, "more than {max} packets in one call")
+            }
+            L4GuardError::L4Unavailable(why) => write!(f, "L4 unavailable: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for L4GuardError {}
+
+/// An RAII authorization token: the only key to the wire-write and mangling-
+/// verdict paths. It can be minted **only** by [`L4Guard::check`] (its
+/// constructor is private to this module), carries a bounded send budget, and
+/// releases its in-flight slot on drop.
+pub struct L4Permit {
+    /// What this permit authorizes.
+    action: L4Action,
+    /// Remaining packets this permit may still authorize in the call.
+    remaining: u32,
+    /// The original per-call budget, echoed in `CountExceeded`.
+    budget: u32,
+    /// Per-packet size ceiling.
+    max_packet_bytes: usize,
+    /// In-flight gauge, decremented on drop (RAII).
+    in_flight: Arc<AtomicU32>,
+}
+
+impl L4Permit {
+    /// Authorize one outgoing packet of `len` bytes against the permit's bounded
+    /// budget. Returns [`L4GuardError::PacketTooLarge`] if the packet is over the
+    /// size ceiling (no budget is consumed), [`L4GuardError::CountExceeded`] when
+    /// the per-call budget is exhausted, otherwise consumes one slot and succeeds.
+    ///
+    /// Called by the wire choke point (M5 Task 6) before every write.
+    pub fn authorize_packet(&mut self, len: usize) -> Result<(), L4GuardError> {
+        if len > self.max_packet_bytes {
+            return Err(L4GuardError::PacketTooLarge {
+                max: self.max_packet_bytes,
+            });
+        }
+        if self.remaining == 0 {
+            return Err(L4GuardError::CountExceeded { max: self.budget });
+        }
+        self.remaining -= 1;
+        Ok(())
+    }
+
+    /// What this permit authorizes.
+    #[must_use]
+    pub fn action(&self) -> L4Action {
+        self.action
+    }
+
+    /// Remaining packets this permit may still authorize.
+    #[must_use]
+    pub fn remaining(&self) -> u32 {
+        self.remaining
+    }
+}
+
+impl fmt::Debug for L4Permit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("L4Permit")
+            .field("action", &self.action)
+            .field("remaining", &self.remaining)
+            .field("max_packet_bytes", &self.max_packet_bytes)
+            .finish()
+    }
+}
+
+impl Drop for L4Permit {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A token bucket: `pps` tokens/sec refilling up to `capacity` (the burst).
+struct TokenBucket {
+    tokens: f64,
+    capacity: f64,
+    rate: f64,
+    last: Instant,
+}
+
+impl TokenBucket {
+    fn new(pps: u32, burst: u32) -> Self {
+        let capacity = burst.max(1) as f64;
+        Self {
+            tokens: capacity,
+            capacity,
+            rate: f64::from(pps),
+            last: Instant::now(),
+        }
+    }
+
+    /// Try to consume one token, refilling for elapsed time first.
+    fn try_take(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.capacity);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn retry_after(&self) -> Duration {
+        if self.rate > 0.0 {
+            Duration::from_secs_f64(1.0 / self.rate)
+        } else {
+            Duration::from_secs(1)
+        }
+    }
+}
+
+/// The deny-by-default L4 authorization guard.
+pub struct L4Guard {
+    scope: RwLock<Vec<L4ScopeEntry>>,
+    /// Per-entry injection buckets, keyed by scope id.
+    entry_buckets: Mutex<HashMap<L4ScopeId, TokenBucket>>,
+    /// Tool-wide injection bucket.
+    global_bucket: Mutex<TokenBucket>,
+    global_inject_pps: u32,
+    max_packet_bytes: usize,
+    max_packets_per_call: u32,
+    /// Relaxes the dangerous-destination denylist to "any covering entry" instead
+    /// of "an entry contained within the dangerous range"; it can never globally
+    /// disable the denylist (an explicit covering entry is still required).
+    dangerous_dst_override: bool,
+    in_flight: Arc<AtomicU32>,
+}
+
+impl L4Guard {
+    /// Build a guard from config, seeding scope from `cfg.scope`.
+    #[must_use]
+    pub fn new(cfg: &L4Config) -> Self {
+        Self {
+            scope: RwLock::new(cfg.scope.clone()),
+            entry_buckets: Mutex::new(HashMap::new()),
+            global_bucket: Mutex::new(TokenBucket::new(
+                cfg.global_inject_pps,
+                cfg.global_inject_pps,
+            )),
+            global_inject_pps: cfg.global_inject_pps,
+            max_packet_bytes: cfg.max_packet_bytes,
+            max_packets_per_call: cfg.max_packets_per_call,
+            dangerous_dst_override: cfg.dangerous_dst_override,
+            in_flight: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    /// The ONLY gate. Called before a capture/interception binds and before any
+    /// packet is written to the wire or a mangling verdict is issued. Applies, in
+    /// order: (1) scope + capability match, (2) dangerous-destination denylist,
+    /// (3) rate/size/count caps (rate consumed for `Inject` only), then mints an
+    /// [`L4Permit`] carrying the bounded send budget. There is no unchecked path.
+    pub fn check(&self, action: L4Action, target: &L4Target) -> Result<L4Permit, L4GuardError> {
+        let want = capability_for(action);
+
+        // Phase 1 (scope + capability) and phase 2 (denylist) read the scope; pull
+        // out the chosen entry's id + rate and release the lock before metering.
+        let (entry_id, inject_rate) = {
+            let scope = self.scope.read().unwrap_or_else(PoisonError::into_inner);
+
+            let location: Vec<&L4ScopeEntry> = scope
+                .iter()
+                .filter(|e| entry_matches_location(e, target))
+                .collect();
+            if location.is_empty() {
+                return Err(L4GuardError::OutOfL4Scope(describe(target)));
+            }
+            let granting: Vec<&L4ScopeEntry> = location
+                .into_iter()
+                .filter(|e| e.capability == want)
+                .collect();
+            let chosen = match granting.first() {
+                Some(e) => *e,
+                None => return Err(L4GuardError::CapabilityNotGranted(want)),
+            };
+
+            // Phase 2: dangerous-destination denylist. A dangerous destination is
+            // refused unless a granting entry is *contained within* the dangerous
+            // range (an explicit, deliberate scope — not a broad catch-all). The
+            // override relaxes "contained" to "covers", never to "nothing".
+            if let Some(dst) = target.dst {
+                if let Some((range_addr, range_prefix)) = danger_range(dst) {
+                    let lifted = granting.iter().any(|e| {
+                        self.dangerous_dst_override
+                            || cidr_within(&e.cidr, range_addr, range_prefix)
+                    });
+                    if !lifted {
+                        return Err(L4GuardError::DangerousDestinationBlocked(dst.to_string()));
+                    }
+                }
+            }
+
+            (chosen.id, chosen.inject_rate)
+        };
+
+        // Phase 3: rate caps apply to injection only (capture/interception bind
+        // without consuming an injection budget). Per-entry ceiling first, then the
+        // tool-wide ceiling; `pps == 0` means refuse.
+        if action == L4Action::Inject {
+            if inject_rate.pps == 0 {
+                return Err(L4GuardError::InjectionRateExceeded {
+                    retry_after: Duration::from_secs(1),
+                });
+            }
+            {
+                let mut buckets = self
+                    .entry_buckets
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let bucket = buckets
+                    .entry(entry_id)
+                    .or_insert_with(|| TokenBucket::new(inject_rate.pps, inject_rate.burst));
+                if !bucket.try_take() {
+                    return Err(L4GuardError::InjectionRateExceeded {
+                        retry_after: bucket.retry_after(),
+                    });
+                }
+            }
+            if self.global_inject_pps == 0 {
+                return Err(L4GuardError::InjectionRateExceeded {
+                    retry_after: Duration::from_secs(1),
+                });
+            }
+            let mut global = self
+                .global_bucket
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !global.try_take() {
+                return Err(L4GuardError::InjectionRateExceeded {
+                    retry_after: global.retry_after(),
+                });
+            }
+        }
+
+        // Mint the permit (the only path that constructs one).
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        Ok(L4Permit {
+            action,
+            remaining: self.max_packets_per_call,
+            budget: self.max_packets_per_call,
+            max_packet_bytes: self.max_packet_bytes,
+            in_flight: self.in_flight.clone(),
+        })
+    }
+
+    /// Add a scope entry; returns its id.
+    pub fn add_scope(&self, entry: L4ScopeEntry) -> Result<L4ScopeId, L4GuardError> {
+        let id = entry.id;
+        self.scope
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(entry);
+        Ok(id)
+    }
+
+    /// Remove the scope entry with the given id; returns whether one was removed.
+    pub fn remove_scope(&self, id: L4ScopeId) -> bool {
+        let mut scope = self.scope.write().unwrap_or_else(PoisonError::into_inner);
+        let before = scope.len();
+        scope.retain(|e| e.id != id);
+        let removed = scope.len() != before;
+        drop(scope);
+        if removed {
+            self.entry_buckets
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&id);
+        }
+        removed
+    }
+
+    /// The current scope entries.
+    #[must_use]
+    pub fn list_scope(&self) -> Vec<L4ScopeEntry> {
+        self.scope
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The number of live (undropped) permits — the in-flight gauge the RAII
+    /// permit maintains.
+    #[must_use]
+    pub fn in_flight(&self) -> u32 {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+}
+
+/// The capability an action requests.
+fn capability_for(action: L4Action) -> L4Capability {
+    match action {
+        L4Action::Capture => L4Capability::Capture,
+        L4Action::Inject => L4Capability::Inject,
+        L4Action::Intercept => L4Capability::Intercept,
+    }
+}
+
+/// A short, human-readable name for a refused target (its destination, else its
+/// interface).
+fn describe(target: &L4Target) -> String {
+    match target.dst {
+        Some(ip) => ip.to_string(),
+        None => target.interface.clone(),
+    }
+}
+
+/// Whether a scope entry matches the target's *location* — interface + direction,
+/// plus CIDR and (for Tcp/Udp) port when the target carries them. Capability is
+/// checked separately so "no entry here" and "entry here, wrong capability" are
+/// distinguishable.
+fn entry_matches_location(entry: &L4ScopeEntry, target: &L4Target) -> bool {
+    if entry.interface != target.interface || entry.direction != target.direction {
+        return false;
+    }
+    if let Some(dst) = target.dst {
+        if !cidr_contains(&entry.cidr, dst) {
+            return false;
+        }
+    }
+    if matches!(target.proto, L4Proto::Tcp | L4Proto::Udp) {
+        if let Some(port) = target.dst_port {
+            if port < entry.ports.lo || port > entry.ports.hi {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn mask_v4(bits: u32, prefix: u8) -> u32 {
+    match prefix {
+        0 => 0,
+        p if p >= 32 => bits,
+        p => bits & (!0u32 << (32 - p)),
+    }
+}
+
+fn mask_v6(bits: u128, prefix: u8) -> u128 {
+    match prefix {
+        0 => 0,
+        p if p >= 128 => bits,
+        p => bits & (!0u128 << (128 - p)),
+    }
+}
+
+/// Whether `ip` falls inside `cidr` (same family required).
+fn cidr_contains(cidr: &IpCidr, ip: IpAddr) -> bool {
+    match (cidr.addr, ip) {
+        (IpAddr::V4(net), IpAddr::V4(host)) => {
+            mask_v4(host.into(), cidr.prefix) == mask_v4(net.into(), cidr.prefix)
+        }
+        (IpAddr::V6(net), IpAddr::V6(host)) => {
+            mask_v6(host.into(), cidr.prefix) == mask_v6(net.into(), cidr.prefix)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `cidr` is fully contained within the block `outer_addr`/`outer_prefix`
+/// — i.e. the operator scoped specifically into (not merely across) that block.
+fn cidr_within(cidr: &IpCidr, outer_addr: IpAddr, outer_prefix: u8) -> bool {
+    if cidr.prefix < outer_prefix {
+        return false;
+    }
+    match (cidr.addr, outer_addr) {
+        (IpAddr::V4(net), IpAddr::V4(outer)) => {
+            mask_v4(net.into(), outer_prefix) == mask_v4(outer.into(), outer_prefix)
+        }
+        (IpAddr::V6(net), IpAddr::V6(outer)) => {
+            mask_v6(net.into(), outer_prefix) == mask_v6(outer.into(), outer_prefix)
+        }
+        _ => false,
+    }
+}
+
+/// The dangerous-destination block governing `ip`, if any: loopback, link-local
+/// (incl. cloud metadata `169.254.169.254`), unspecified/this-network, multicast,
+/// and reserved/broadcast. RFC1918 private ranges are deliberately **not** here —
+/// an L4 robustness test legitimately drives a private LAN target; it is loopback
+/// and control-plane addresses that must be deliberately scoped.
+fn danger_range(ip: IpAddr) -> Option<(IpAddr, u8)> {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            if o[0] == 127 {
+                Some((IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8))
+            } else if o[0] == 169 && o[1] == 254 {
+                Some((IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)), 16))
+            } else if o[0] == 0 {
+                Some((IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8))
+            } else if (224..=239).contains(&o[0]) {
+                Some((IpAddr::V4(Ipv4Addr::new(224, 0, 0, 0)), 4))
+            } else if o[0] >= 240 {
+                // 240.0.0.0/4 reserved, incl. 255.255.255.255 limited broadcast.
+                Some((IpAddr::V4(Ipv4Addr::new(240, 0, 0, 0)), 4))
+            } else {
+                None
+            }
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                Some((IpAddr::V6(Ipv6Addr::LOCALHOST), 128))
+            } else if v6.is_unspecified() {
+                Some((IpAddr::V6(Ipv6Addr::UNSPECIFIED), 128))
+            } else {
+                let seg0 = v6.segments()[0];
+                if (seg0 & 0xffc0) == 0xfe80 {
+                    Some((IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)), 10))
+                } else if (seg0 & 0xff00) == 0xff00 {
+                    Some((IpAddr::V6(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0)), 8))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// The target of a guard check — resolved from a capture/interception bind or a
+/// decoded packet.
+pub type L4Target = crate::types::L4Target;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{L4Direction, PortRange, RateCap};
+
+    fn cfg() -> L4Config {
+        L4Config::default()
+    }
+
+    fn entry(
+        cidr: (&str, u8),
+        iface: &str,
+        dir: L4Direction,
+        cap: L4Capability,
+        rate: (u32, u32),
+    ) -> L4ScopeEntry {
+        L4ScopeEntry {
+            id: L4ScopeId::new(),
+            cidr: IpCidr {
+                addr: cidr.0.parse().unwrap(),
+                prefix: cidr.1,
+            },
+            ports: PortRange { lo: 0, hi: 65535 },
+            interface: iface.to_string(),
+            direction: dir,
+            capability: cap,
+            inject_rate: RateCap {
+                pps: rate.0,
+                burst: rate.1,
+            },
+        }
+    }
+
+    fn target(iface: &str, dir: L4Direction, dst: &str, port: u16) -> L4Target {
+        L4Target {
+            interface: iface.to_string(),
+            direction: dir,
+            dst: Some(dst.parse().unwrap()),
+            dst_port: Some(port),
+            proto: L4Proto::Tcp,
+        }
+    }
+
+    /// AC1 — empty scope refuses every action with `OutOfL4Scope`, including the
+    /// capture/interception binds.
+    #[test]
+    fn empty_scope_refuses() {
+        let g = L4Guard::new(&cfg());
+        let t = target("lo0", L4Direction::Outbound, "127.0.0.1", 1234);
+        assert_eq!(
+            g.check(L4Action::Inject, &t).unwrap_err(),
+            L4GuardError::OutOfL4Scope("127.0.0.1".into())
+        );
+        assert!(matches!(
+            g.check(L4Action::Capture, &t),
+            Err(L4GuardError::OutOfL4Scope(_))
+        ));
+        assert!(matches!(
+            g.check(L4Action::Intercept, &t),
+            Err(L4GuardError::OutOfL4Scope(_))
+        ));
+    }
+
+    /// AC2 — in-scope (explicit loopback) inject succeeds.
+    #[test]
+    fn in_scope_ok() {
+        let g = L4Guard::new(&cfg());
+        g.add_scope(entry(
+            ("127.0.0.1", 32),
+            "lo0",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (100, 100),
+        ))
+        .unwrap();
+        let t = target("lo0", L4Direction::Outbound, "127.0.0.1", 1234);
+        assert!(g.check(L4Action::Inject, &t).is_ok());
+    }
+
+    /// AC2 — injecting to a public address outside the scoped CIDR is refused.
+    #[test]
+    fn out_of_scope_inject_refused() {
+        let g = L4Guard::new(&cfg());
+        g.add_scope(entry(
+            ("10.0.0.0", 8),
+            "eth0",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (100, 100),
+        ))
+        .unwrap();
+        let t = target("eth0", L4Direction::Outbound, "8.8.8.8", 443);
+        assert_eq!(
+            g.check(L4Action::Inject, &t).unwrap_err(),
+            L4GuardError::OutOfL4Scope("8.8.8.8".into())
+        );
+    }
+
+    /// AC3 — Capture / Inject / Intercept are separate capabilities: a
+    /// Capture-only entry grants capture but refuses inject and intercept.
+    #[test]
+    fn capability_split() {
+        let g = L4Guard::new(&cfg());
+        g.add_scope(entry(
+            ("127.0.0.1", 32),
+            "lo0",
+            L4Direction::Outbound,
+            L4Capability::Capture,
+            (100, 100),
+        ))
+        .unwrap();
+        let t = target("lo0", L4Direction::Outbound, "127.0.0.1", 1234);
+        assert_eq!(
+            g.check(L4Action::Inject, &t).unwrap_err(),
+            L4GuardError::CapabilityNotGranted(L4Capability::Inject)
+        );
+        assert_eq!(
+            g.check(L4Action::Intercept, &t).unwrap_err(),
+            L4GuardError::CapabilityNotGranted(L4Capability::Intercept)
+        );
+        assert!(g.check(L4Action::Capture, &t).is_ok());
+    }
+
+    /// AC4 — a dangerous destination (cloud metadata) covered only by a broad,
+    /// non-specific entry is still blocked by the denylist.
+    #[test]
+    fn denylist() {
+        let g = L4Guard::new(&cfg());
+        g.add_scope(entry(
+            ("0.0.0.0", 0),
+            "eth0",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (100, 100),
+        ))
+        .unwrap();
+        let t = target("eth0", L4Direction::Outbound, "169.254.169.254", 80);
+        assert_eq!(
+            g.check(L4Action::Inject, &t).unwrap_err(),
+            L4GuardError::DangerousDestinationBlocked("169.254.169.254".into())
+        );
+    }
+
+    /// AC4 — an explicit entry contained within the dangerous range is the way
+    /// through the denylist.
+    #[test]
+    fn denylist_explicit_entry_lifts() {
+        let g = L4Guard::new(&cfg());
+        g.add_scope(entry(
+            ("169.254.169.254", 32),
+            "eth0",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (100, 100),
+        ))
+        .unwrap();
+        let t = target("eth0", L4Direction::Outbound, "169.254.169.254", 80);
+        assert!(g.check(L4Action::Inject, &t).is_ok());
+    }
+
+    /// AC5 — with `inject_rate` N pps the (N+1)-th injection in the window is
+    /// refused with `InjectionRateExceeded`.
+    #[test]
+    fn rate_cap_trips() {
+        let g = L4Guard::new(&cfg());
+        g.add_scope(entry(
+            ("127.0.0.1", 32),
+            "lo0",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (2, 2),
+        ))
+        .unwrap();
+        let t = target("lo0", L4Direction::Outbound, "127.0.0.1", 1234);
+        assert!(g.check(L4Action::Inject, &t).is_ok());
+        assert!(g.check(L4Action::Inject, &t).is_ok());
+        assert!(matches!(
+            g.check(L4Action::Inject, &t),
+            Err(L4GuardError::InjectionRateExceeded { .. })
+        ));
+    }
+
+    /// AC5 — a per-entry rate of 0 pps means refuse, not "one per second".
+    #[test]
+    fn rate_zero_refuses() {
+        let g = L4Guard::new(&cfg());
+        g.add_scope(entry(
+            ("127.0.0.1", 32),
+            "lo0",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (0, 0),
+        ))
+        .unwrap();
+        let t = target("lo0", L4Direction::Outbound, "127.0.0.1", 1234);
+        assert!(matches!(
+            g.check(L4Action::Inject, &t),
+            Err(L4GuardError::InjectionRateExceeded { .. })
+        ));
+    }
+
+    /// AC6 — a packet over `max_packet_bytes` is refused with `PacketTooLarge`.
+    #[test]
+    fn oversize() {
+        let mut c = cfg();
+        c.max_packet_bytes = 1500;
+        let g = L4Guard::new(&c);
+        g.add_scope(entry(
+            ("127.0.0.1", 32),
+            "lo0",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (100, 100),
+        ))
+        .unwrap();
+        let t = target("lo0", L4Direction::Outbound, "127.0.0.1", 1234);
+        let mut permit = g.check(L4Action::Inject, &t).unwrap();
+        assert_eq!(
+            permit.authorize_packet(1501),
+            Err(L4GuardError::PacketTooLarge { max: 1500 })
+        );
+        // A refused oversize packet consumes no budget.
+        assert!(permit.authorize_packet(1500).is_ok());
+    }
+
+    /// AC6 — more packets than `max_packets_per_call` is refused with
+    /// `CountExceeded`.
+    #[test]
+    fn count() {
+        let mut c = cfg();
+        c.max_packets_per_call = 2;
+        let g = L4Guard::new(&c);
+        g.add_scope(entry(
+            ("127.0.0.1", 32),
+            "lo0",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (100, 100),
+        ))
+        .unwrap();
+        let t = target("lo0", L4Direction::Outbound, "127.0.0.1", 1234);
+        let mut permit = g.check(L4Action::Inject, &t).unwrap();
+        assert!(permit.authorize_packet(100).is_ok());
+        assert!(permit.authorize_packet(100).is_ok());
+        assert_eq!(
+            permit.authorize_packet(100),
+            Err(L4GuardError::CountExceeded { max: 2 })
+        );
+    }
+
+    /// AC21 — the permit is RAII: it holds an in-flight slot that is released when
+    /// it drops.
+    #[test]
+    fn permit_releases_slot_on_drop() {
+        let g = L4Guard::new(&cfg());
+        g.add_scope(entry(
+            ("127.0.0.1", 32),
+            "lo0",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (100, 100),
+        ))
+        .unwrap();
+        let t = target("lo0", L4Direction::Outbound, "127.0.0.1", 1234);
+        assert_eq!(g.in_flight(), 0);
+        let permit = g.check(L4Action::Inject, &t).unwrap();
+        assert_eq!(g.in_flight(), 1);
+        drop(permit);
+        assert_eq!(g.in_flight(), 0);
+    }
+
+    /// `remove_scope` reverts to deny-by-default for that target.
+    #[test]
+    fn remove_scope_reverts_to_deny() {
+        let g = L4Guard::new(&cfg());
+        let e = entry(
+            ("127.0.0.1", 32),
+            "lo0",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (100, 100),
+        );
+        let id = g.add_scope(e).unwrap();
+        let t = target("lo0", L4Direction::Outbound, "127.0.0.1", 1234);
+        assert!(g.check(L4Action::Inject, &t).is_ok());
+        assert!(g.remove_scope(id));
+        assert!(matches!(
+            g.check(L4Action::Inject, &t),
+            Err(L4GuardError::OutOfL4Scope(_))
+        ));
+    }
+}
