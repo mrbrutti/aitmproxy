@@ -176,3 +176,21 @@ fn two_line_file_is_valid() {
     cfg.ssl_insecure = false;
     assert_eq!(format!("{cfg:?}"), format!("{:?}", Config::default()));
 }
+
+/// The operator-command gate knobs parse from real config, so the `scope.add`
+/// refusal's instruction is actionable and `poc.artifact` has an output dir.
+#[test]
+fn operator_gate_knobs_load() {
+    redirect_home();
+    let cfg = parse("scope:\n  allow_agent_widen: true\npoc:\n  out_dir: /var/poc-out\n")
+        .expect("parse operator knobs");
+    assert!(cfg.scope.allow_agent_widen);
+    assert_eq!(cfg.poc.out_dir.as_deref(), Some(Path::new("/var/poc-out")),);
+    // Defaults hold when the knobs are absent.
+    let def = parse("ssl_insecure: false\n").expect("parse");
+    assert!(!def.scope.allow_agent_widen);
+    assert_eq!(def.poc.out_dir, None);
+    // Unknown keys under these sections are still rejected (deny_unknown_fields).
+    assert!(parse("scope:\n  bogus: 1\n").is_err());
+    assert!(parse("poc:\n  bogus: 1\n").is_err());
+}

@@ -1,0 +1,34 @@
+[package]
+name = "aitm-plugin-rhai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Rhai scripting tier: a .rhai file becomes an ordered-chain Plugin; PoC script-step executor."
+
+[dependencies]
+aitm-core.workspace = true
+# `check_url` + `SystemResolver`: the one resolve-then-classify SSRF decision
+# the Rust `browser.navigate` command makes, reused for the script verb.
+aitm-browser.workspace = true
+aitm-poc.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# `time`: every guarded host call is wrapped in `tokio::time::timeout` for the
+# remainder of the run's budget.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
+# `sync` only. Never `unchecked` (it disables the operation/size limits the
+# sandbox relies on) and never `internals` (M3 spec §7, plan Global Constraints).
+rhai = { version = "1.27", features = ["sync"] }
+arc-swap = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+serde_yaml = "0.9"
+# `metadata` only for the tests: it exposes `gen_fn_signatures`, which the
+# sandbox audit (`tests/engine.rs`) pins the global function table with. Not a
+# production feature (resolver 2 keeps dev features out of the binary build).
+rhai = { version = "1.27", features = ["sync", "metadata"] }
+
+[lints]
+workspace = true

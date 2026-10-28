@@ -8,8 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aitm_core::{
-    Command, CommandHost, Flow, InterceptState, ParamDef, ParamSchema, Params, Plugin, Registry,
-    TypeDesc, Value,
+    Command, CommandHost, Flow, ParamDef, ParamSchema, Params, Plugin, Registry, TypeDesc, Value,
 };
 
 /// Registers `flow.list` and `flow.get`. Observes no events.
@@ -166,30 +165,15 @@ fn summarize(flow: &Flow) -> Value {
                     .map_or(Value::Null, |r| Value::Int(i64::from(r.status))),
             );
             put("is_replay", Value::Bool(f.metadata.is_replay));
-            put(
-                "intercept",
-                Value::Str(intercept_label(&f.intercept).into()),
-            );
+            put("intercept", Value::Str(f.intercept.label().into()));
         }
         Flow::WebSocket(f) => {
             put("kind", Value::Str("websocket".into()));
             put("handshake", Value::Str(f.handshake.to_string()));
             put("messages", Value::Int(f.messages.len() as i64));
             put("is_replay", Value::Bool(f.metadata.is_replay));
-            put(
-                "intercept",
-                Value::Str(intercept_label(&f.intercept).into()),
-            );
+            put("intercept", Value::Str(f.intercept.label().into()));
         }
     }
     Value::Object(obj)
-}
-
-fn intercept_label(state: &InterceptState) -> &'static str {
-    match state {
-        InterceptState::Observed => "observed",
-        InterceptState::Intercepted { .. } => "intercepted",
-        InterceptState::Resumed => "resumed",
-        InterceptState::Killed => "killed",
-    }
 }

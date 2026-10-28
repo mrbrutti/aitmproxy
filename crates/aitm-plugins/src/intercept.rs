@@ -20,7 +20,9 @@ use aitm_core::{
 /// (which release them).
 #[derive(Default)]
 struct Shared {
-    armed: AtomicBool,
+    /// Shared so a read-only observer (e.g. `proxy.status`) can learn the armed
+    /// state without reaching into this plugin.
+    armed: Arc<AtomicBool>,
     parked: Mutex<HashMap<FlowId, ResumeHandle>>,
 }
 
@@ -35,6 +37,12 @@ impl InterceptPlugin {
         Self {
             shared: Arc::default(),
         }
+    }
+
+    /// A shared handle to the armed flag, so `proxy.status` can report whether
+    /// interception is armed. Reads reflect `flow.intercept`; this never arms it.
+    pub fn armed_flag(&self) -> Arc<AtomicBool> {
+        self.shared.armed.clone()
     }
 }
 
