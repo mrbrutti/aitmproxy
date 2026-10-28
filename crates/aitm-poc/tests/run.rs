@@ -438,3 +438,72 @@ fn poc_run_confines_to_configured_dir() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// poc.run's artifacts land under the configured output dir, and `poc.artifact`
+/// reads a real one back (the F13 round-trip).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_honors_out_dir_and_artifact_reads_it_back() {
+    use aitm_core::{Config, PocConfig};
+
+    let poc: Poc = serde_yaml::from_str(example1_yaml()).expect("parse example 1");
+    let vuln = spawn(TargetMode::Vulnerable);
+    let store = Arc::new(MemFlowStore::new());
+    let guard = Arc::new(guard_scoping(vuln));
+    let client = pipeline_client(&store, &guard);
+    let browser = StubBrowser {
+        eval_value: Value::Str("MARK1234".to_string()),
+    };
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let out_dir =
+        std::env::temp_dir().join(format!("aitm-poc-outdir-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let host = CommandHost::new(store.as_ref(), &client, guard.as_ref(), Some(&browser));
+    let result = StdPocRunner::with_output_dir(out_dir.clone())
+        .run(&poc, example1_bindings(vuln), &host)
+        .await
+        .expect("run");
+
+    // Artifacts are written under the configured out-dir.
+    assert!(
+        result.poc_path.starts_with(&out_dir),
+        "poc artifact must be under out_dir: {}",
+        result.poc_path.display()
+    );
+    assert!(
+        result.screenshot_path.starts_with(&out_dir),
+        "screenshot must be under out_dir: {}",
+        result.screenshot_path.display()
+    );
+
+    // poc.artifact, confined to the same out-dir, reads the YAML copy back.
+    let cfg = Config {
+        poc: PocConfig {
+            dir: None,
+            out_dir: Some(out_dir.clone()),
+        },
+        ..Config::default()
+    };
+    let read_host = CommandHost::new(store.as_ref(), &client, guard.as_ref(), Some(&browser))
+        .with_config(Arc::new(cfg));
+    let mut reg = aitm_core::Registry::new();
+    aitm_poc::library::register(&mut reg);
+    let mut args = std::collections::BTreeMap::new();
+    args.insert(
+        "path".to_string(),
+        Value::Str(result.poc_path.display().to_string()),
+    );
+    let bytes = reg
+        .command("poc.artifact")
+        .unwrap()
+        .invoke(aitm_core::Params::new(args), &read_host)
+        .expect("poc.artifact reads the written YAML");
+    match bytes {
+        Value::Bytes(b) => assert!(!b.is_empty(), "artifact bytes must be non-empty"),
+        other => panic!("poc.artifact must return bytes, got {other:?}"),
+    }
+}

@@ -50,7 +50,7 @@ pub use plugin::Plugin;
 pub use protocol::{EventSink, ModuleCtx, NextLayerHint, ProtocolModule, UpstreamConnector};
 pub use proxy::{Proxy, ProxyBuilder};
 pub use registry::Registry;
-pub use store::{FlowKind, FlowQuery, FlowStore, MemFlowStore};
+pub use store::{ClearOutcome, FlowKind, FlowQuery, FlowStore, MemFlowStore};
 pub use stream::{AsyncReadWrite, ByteStream};
 pub use value::{Params, Value};
 

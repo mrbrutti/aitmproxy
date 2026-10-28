@@ -102,6 +102,7 @@ pub fn apply(ex: &Extractor, ctx: &MatchContext) -> Option<Value> {
                 status: ctx.status,
                 body: ctx.body.clone(),
                 vars: ctx.vars.clone(),
+                steps: BTreeMap::new(),
             },
         )
         .ok(),

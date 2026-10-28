@@ -14,6 +14,11 @@
 //!   `screenshot` is kept for the *screenshot* artifact; `click`/`type` drive the
 //!   page.
 //! - **extract** steps bind a variable from the current response context.
+//! - **script** steps are handed to the optional [`ScriptStepExecutor`] (the Rhai
+//!   tier, wired in by the binary). Its verdict is recorded under the step's name
+//!   and read back from `success` as `step("name")`; the variables it binds reach
+//!   later steps and `success`. With no executor wired, a script step is an error,
+//!   never a silent skip.
 //!
 //! After the steps, `success` is rendered against the bindings, any `browser-eval`
 //! it names is evaluated through the driver, and the tree is judged — the PoC
@@ -21,6 +26,8 @@
 //! (already in the store), the YAML PoC file, and the screenshot PNG, and returns
 //! a [`PocRunResult`].
 
+use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -33,7 +40,7 @@ use futures::future::BoxFuture;
 
 use crate::extract::{apply, Extractor};
 use crate::matcher::{evaluate, MatchContext};
-use crate::model::{Assertion, BrowserAction, Poc, Step};
+use crate::model::{Assertion, BrowserAction, Poc, ScriptStep, Step};
 use crate::template::{PocTemplate, Template, VarBindings};
 
 /// Execute a `Poc` with no agent and emit the three artifacts.
@@ -68,17 +75,114 @@ pub struct AssertionOutcome {
     pub matched: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Script steps: the executor seam (spec §10)
+// ---------------------------------------------------------------------------
+
+/// Runs one `script` step. Implemented by the scripting tier
+/// (`aitm-plugin-rhai`'s `RhaiScriptExecutor`) and wired into the runner by the
+/// binary, so this crate carries no Rhai dependency and the declarative subset
+/// runs without the scripting tier.
+pub trait ScriptStepExecutor: Send + Sync {
+    fn run_step(
+        &self,
+        step: &ScriptStep,
+        ctx: &mut ScriptStepCtx<'_>,
+    ) -> Result<ScriptVerdict, ScriptStepError>;
+}
+
+/// What a script step may touch while it runs.
+pub struct ScriptStepCtx<'a> {
+    /// Read + write; later steps and `success` see the writes.
+    pub vars: &'a mut VarBindings,
+    /// The store / client / browser / guard, behind the same guards as Rust.
+    pub host: &'a CommandHost<'a>,
+    /// Outcomes recorded so far, by step name.
+    pub step_results: &'a mut BTreeMap<String, StepOutcome>,
+    /// Files the script wrote (its screenshots); they join the run's artifacts.
+    pub artifacts: &'a mut Vec<PathBuf>,
+}
+
+/// A script step's result: `return pass` / `return fail`, or neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptVerdict {
+    Pass,
+    Fail,
+    Neutral,
+}
+
+/// What `step("name")` resolves to in the success DSL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepOutcome {
+    Matched,
+    NotMatched,
+    Pass,
+    Fail,
+    Error,
+    Neutral,
+}
+
+impl StepOutcome {
+    /// The string `step("name")` compares against.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StepOutcome::Matched => "matched",
+            StepOutcome::NotMatched => "not-matched",
+            StepOutcome::Pass => "pass",
+            StepOutcome::Fail => "fail",
+            StepOutcome::Error => "error",
+            StepOutcome::Neutral => "neutral",
+        }
+    }
+}
+
+impl From<ScriptVerdict> for StepOutcome {
+    fn from(verdict: ScriptVerdict) -> Self {
+        match verdict {
+            ScriptVerdict::Pass => StepOutcome::Pass,
+            ScriptVerdict::Fail => StepOutcome::Fail,
+            ScriptVerdict::Neutral => StepOutcome::Neutral,
+        }
+    }
+}
+
+/// A script step that reached no verdict — a runtime error, sandbox denial,
+/// timeout, or operation-limit abort — as the message the run reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptStepError(pub String);
+
+impl fmt::Display for ScriptStepError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ScriptStepError {}
+
 /// The default runner. Artifacts are written under `out_dir` (a fresh
-/// per-run subdirectory); defaults to the system temp directory.
-#[derive(Debug, Clone)]
+/// per-run subdirectory); defaults to the system temp directory. Script steps
+/// dispatch through the optional executor; without one they error.
+#[derive(Clone)]
 pub struct StdPocRunner {
     out_dir: PathBuf,
+    script_executor: Option<Arc<dyn ScriptStepExecutor>>,
+}
+
+// Manual: the executor is an opaque trait object, so report only its presence.
+impl fmt::Debug for StdPocRunner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StdPocRunner")
+            .field("out_dir", &self.out_dir)
+            .field("script_executor", &self.script_executor.is_some())
+            .finish()
+    }
 }
 
 impl Default for StdPocRunner {
     fn default() -> Self {
         Self {
             out_dir: std::env::temp_dir(),
+            script_executor: None,
         }
     }
 }
@@ -93,6 +197,15 @@ impl StdPocRunner {
     pub fn with_output_dir(dir: impl Into<PathBuf>) -> Self {
         Self {
             out_dir: dir.into(),
+            script_executor: None,
+        }
+    }
+
+    /// Wire the scripting tier: `script` steps dispatch through `exec`.
+    pub fn with_script_executor(self, exec: Arc<dyn ScriptStepExecutor>) -> Self {
+        Self {
+            script_executor: Some(exec),
+            ..self
         }
     }
 }
@@ -125,8 +238,12 @@ impl StdPocRunner {
         let mut ctx = MatchContext::default();
         let mut finding: Option<FlowId> = None;
         let mut screenshot: Option<Vec<u8>> = None;
+        // Files script steps wrote (their screenshots), see `write_artifacts`.
+        let mut artifacts: Vec<PathBuf> = Vec::new();
+        // One failed outcome per script step that errored (spec §10 failure reporting).
+        let mut script_errors: Vec<AssertionOutcome> = Vec::new();
 
-        for step in &poc.steps {
+        for (index, step) in poc.steps.iter().enumerate() {
             match step {
                 Step::Http(http) => {
                     let req = build_request(http, &tmpl, &live)?;
@@ -196,6 +313,46 @@ impl StdPocRunner {
                 Step::Extract(ex_step) => {
                     bind_extractor(&Extractor::from(ex_step), &mut ctx, &mut live);
                 }
+                Step::Script(script) => {
+                    let executor = self.script_executor.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "script steps require the Rhai runtime (wire a ScriptStepExecutor)"
+                        )
+                    })?;
+                    let name = script
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("step-{}", index + 1));
+                    let before = live.clone();
+                    let outcome = {
+                        let mut step_ctx = ScriptStepCtx {
+                            vars: &mut live,
+                            host,
+                            step_results: &mut ctx.steps,
+                            artifacts: &mut artifacts,
+                        };
+                        match executor.run_step(script, &mut step_ctx) {
+                            Ok(verdict) => StepOutcome::from(verdict),
+                            // The step resolves to "error" and the run goes on; it
+                            // fails only if `success` depends on this step.
+                            Err(err) => {
+                                script_errors.push(AssertionOutcome {
+                                    assertion: format!("script {name}: {err}"),
+                                    matched: false,
+                                });
+                                StepOutcome::Error
+                            }
+                        }
+                    };
+                    ctx.steps.insert(name, outcome);
+                    // Variables the script bound reach `success` the way extractor
+                    // bindings do; later steps already see them in `live`.
+                    for (var, value) in live.iter() {
+                        if before.get(var) != Some(value) {
+                            ctx.vars.insert(var.clone(), value.clone());
+                        }
+                    }
+                }
             }
         }
 
@@ -204,14 +361,22 @@ impl StdPocRunner {
         let success = render_assertion(&poc.success, &tmpl, &live)?;
         eval_browser_assertions(&success, host, &mut ctx).await?;
 
-        let evaluated = collect_outcomes(&success, &ctx);
+        let mut evaluated = collect_outcomes(&success, &ctx);
+        evaluated.extend(script_errors);
         let passed = evaluate(&success, &ctx);
 
         let finding_capture = finding.ok_or_else(|| {
             anyhow::anyhow!("poc.run: no HTTP flow was captured to anchor the finding")
         })?;
 
-        let (poc_path, screenshot_path) = self.write_artifacts(poc, screenshot.as_deref())?;
+        let (poc_path, mut screenshot_path) = self.write_artifacts(poc, screenshot.as_deref())?;
+        // A script's screenshot joins the same artifact set as a declarative one:
+        // with no declarative screenshot, the first script-written file stands in.
+        if screenshot_path.as_os_str().is_empty() {
+            if let Some(first) = artifacts.into_iter().next() {
+                screenshot_path = first;
+            }
+        }
 
         Ok(PocRunResult {
             passed,
@@ -312,31 +477,6 @@ fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()
     Ok(())
 }
 
-/// Open `path` read-only without following a symlink at the final component
-/// (`O_NOFOLLOW`): opening a symlink fails, so the loader can stat and read the
-/// returned handle with no stat/open TOCTOU window.
-#[cfg(unix)]
-fn open_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-}
-
-/// Best-effort fallback where `O_NOFOLLOW` is unavailable: reject a symlink
-/// final component before opening (a residual TOCTOU remains off Unix).
-#[cfg(not(unix))]
-fn open_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "refusing to open a symlink",
-        ));
-    }
-    std::fs::File::open(path)
-}
-
 /// A filesystem-safe PoC id: `^[a-z0-9][a-z0-9-]{0,63}$`. Used to build the
 /// artifact directory name, so it can never contain path separators or `..`.
 pub fn is_valid_poc_id(id: &str) -> bool {
@@ -369,7 +509,7 @@ fn precheck(poc: &Poc) -> anyhow::Result<()> {
                 }
             }
             Step::Extract(ex) => check_extract(ex)?,
-            Step::Browser(_) => {}
+            Step::Browser(_) | Step::Script(_) => {}
         }
     }
     Ok(())
@@ -625,109 +765,139 @@ impl Command for PocRunCommand {
     }
 
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
-        let poc_path = args.get_str("poc_path")?;
-        let path = std::path::Path::new(poc_path);
-        // Only load a plainly-named YAML file.
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("yaml") | Some("yml") => {}
-            _ => anyhow::bail!("poc.run: `{poc_path}` must be a .yaml file"),
-        }
-        // Opt-in confinement: when a PoC directory is configured, the file must
-        // resolve (canonicalized, so `..` and symlinks are followed) to a path
-        // under it. Unconfigured (`None`) loads from any path, as before.
-        if let Some(root) = host.poc_dir() {
-            let canon_root = root.canonicalize().map_err(|e| {
-                anyhow::anyhow!(
-                    "poc.run: PoC dir `{}` is not accessible: {e}",
-                    root.display()
-                )
-            })?;
-            let canon_path = path
-                .canonicalize()
-                .map_err(|e| anyhow::anyhow!("poc.run: cannot resolve `{poc_path}`: {e}"))?;
-            if !canon_path.starts_with(&canon_root) {
-                anyhow::bail!(
-                    "poc.run: `{poc_path}` is outside the configured PoC directory `{}`",
-                    root.display()
-                );
-            }
-        }
-        // Open with `O_NOFOLLOW` so a symlink at the final component fails to open,
-        // then stat and read the *opened handle* — closing the stat/open TOCTOU
-        // window where the path could be swapped for a symlink to an arbitrary file.
-        let mut file = open_nofollow(path)
-            .map_err(|e| anyhow::anyhow!("poc.run: cannot open `{poc_path}`: {e}"))?;
-        let meta = file
-            .metadata()
-            .map_err(|e| anyhow::anyhow!("poc.run: cannot stat `{poc_path}`: {e}"))?;
-        if !meta.file_type().is_file() {
-            anyhow::bail!("poc.run: refusing to load `{poc_path}`: not a regular file");
-        }
-        // Cap the document size before parsing (billion-laughs / huge-doc guard).
-        const MAX_POC_BYTES: u64 = 1024 * 1024;
-        if meta.len() > MAX_POC_BYTES {
-            anyhow::bail!("poc.run: `{poc_path}` exceeds the {MAX_POC_BYTES}-byte PoC size cap");
-        }
-        let mut text = String::new();
-        std::io::Read::read_to_string(&mut file, &mut text)
-            .map_err(|e| anyhow::anyhow!("poc.run: cannot read `{poc_path}`: {e}"))?;
-        // Validate the raw document, then type it. Parse errors are reported
-        // without echoing the offending file content.
-        let raw: serde_yaml::Value = serde_yaml::from_str(&text)
-            .map_err(|_| anyhow::anyhow!("poc.run: `{poc_path}` is not valid YAML"))?;
-        crate::schema::validate(&raw)
-            .map_err(|e| anyhow::anyhow!("poc.run: `{poc_path}` failed validation: {e}"))?;
-        let poc: Poc = serde_yaml::from_value(raw)
-            .map_err(|_| anyhow::anyhow!("poc.run: `{poc_path}` is not a valid PoC document"))?;
-
-        let mut bindings = VarBindings::new();
-        if let Ok(target) = args.get_str("target") {
-            bindings.insert("target", Value::Str(target.to_string()));
-        }
-        if let Ok(vars) = args.get_object("vars") {
-            for (name, value) in vars {
-                bindings.insert(name.clone(), value.clone());
-            }
-        }
-
-        let result = futures::executor::block_on(StdPocRunner::new().run(&poc, bindings, host))?;
-
-        let mut obj = std::collections::BTreeMap::new();
-        obj.insert("passed".to_string(), Value::Bool(result.passed));
-        obj.insert(
-            "finding_capture".to_string(),
-            Value::Str(result.finding_capture.to_string()),
-        );
-        obj.insert(
-            "poc_path".to_string(),
-            Value::Str(result.poc_path.display().to_string()),
-        );
-        obj.insert(
-            "screenshot_path".to_string(),
-            Value::Str(result.screenshot_path.display().to_string()),
-        );
-        obj.insert(
-            "evaluated".to_string(),
-            Value::Array(
-                result
-                    .evaluated
-                    .into_iter()
-                    .map(|o| {
-                        let mut m = std::collections::BTreeMap::new();
-                        m.insert("assertion".to_string(), Value::Str(o.assertion));
-                        m.insert("matched".to_string(), Value::Bool(o.matched));
-                        Value::Object(m)
-                    })
-                    .collect(),
-            ),
-        );
-        Ok(Value::Object(obj))
+        run_poc_command(args, host, None)
     }
 }
 
+/// `poc.run` with the scripting tier wired in: identical to [`PocRunCommand`]
+/// except that `script` steps dispatch through `executor` instead of failing.
+/// The binary registers this one when the Rhai tier is loaded, so a PoC with a
+/// script step runs over MCP and the CLI exactly as a declarative one does.
+pub struct ScriptedPocRunCommand {
+    executor: Arc<dyn ScriptStepExecutor>,
+}
+
+impl ScriptedPocRunCommand {
+    /// Wrap `poc.run` around the executor that runs its `script` steps.
+    pub fn new(executor: Arc<dyn ScriptStepExecutor>) -> Self {
+        Self { executor }
+    }
+}
+
+impl fmt::Debug for ScriptedPocRunCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScriptedPocRunCommand").finish()
+    }
+}
+
+impl Command for ScriptedPocRunCommand {
+    fn name(&self) -> &str {
+        PocRunCommand.name()
+    }
+
+    fn schema(&self) -> ParamSchema {
+        PocRunCommand.schema()
+    }
+
+    fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        run_poc_command(args, host, Some(&self.executor))
+    }
+}
+
+/// The body both registrations share: load the PoC from a confined, symlink-safe
+/// path, bind the caller's variables, and run it — with `executor` wired into the
+/// runner when the host has a scripting tier.
+fn run_poc_command(
+    args: Params,
+    host: &CommandHost,
+    executor: Option<&Arc<dyn ScriptStepExecutor>>,
+) -> anyhow::Result<Value> {
+    let poc_path = args.get_str("poc_path")?;
+    let path = std::path::Path::new(poc_path);
+    // Only load a plainly-named YAML file.
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("yaml") | Some("yml") => {}
+        _ => anyhow::bail!("poc.run: `{poc_path}` must be a .yaml file"),
+    }
+    // Read the document through the shared hardened loader. With a configured PoC
+    // directory the read is confined to it (one generic error, no file oracle);
+    // unconfigured, it loads any path but still refuses a symlinked or non-regular
+    // file and caps the size.
+    let bytes = match host.poc_dir() {
+        Some(root) => crate::loader::read_confined(path, root, crate::loader::MAX_POC_BYTES, &[])
+            .map_err(|e| anyhow::anyhow!("poc.run: `{poc_path}`: {e}"))?,
+        None => crate::loader::read_capped(path, crate::loader::MAX_POC_BYTES)
+            .map_err(|e| anyhow::anyhow!("poc.run: cannot open `{poc_path}`: {e}"))?,
+    };
+    let text = String::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("poc.run: `{poc_path}` is not UTF-8"))?;
+    let poc: Poc = crate::loader::parse_poc(&text)
+        .map_err(|e| anyhow::anyhow!("poc.run: `{poc_path}`: {e}"))?;
+
+    let mut bindings = VarBindings::new();
+    if let Ok(target) = args.get_str("target") {
+        bindings.insert("target", Value::Str(target.to_string()));
+    }
+    if let Ok(vars) = args.get_object("vars") {
+        for (name, value) in vars {
+            bindings.insert(name.clone(), value.clone());
+        }
+    }
+
+    // Write artifacts under the configured PoC output dir when set, so a remote
+    // surface can read them back via `poc.artifact`; else temp.
+    let mut runner = match host.config().and_then(|c| c.poc.out_dir.clone()) {
+        Some(dir) => StdPocRunner::with_output_dir(dir),
+        None => StdPocRunner::new(),
+    };
+    if let Some(exec) = executor {
+        runner = runner.with_script_executor(Arc::clone(exec));
+    }
+    let result = futures::executor::block_on(runner.run(&poc, bindings, host))?;
+
+    let mut obj = std::collections::BTreeMap::new();
+    obj.insert("passed".to_string(), Value::Bool(result.passed));
+    obj.insert(
+        "finding_capture".to_string(),
+        Value::Str(result.finding_capture.to_string()),
+    );
+    obj.insert(
+        "poc_path".to_string(),
+        Value::Str(result.poc_path.display().to_string()),
+    );
+    obj.insert(
+        "screenshot_path".to_string(),
+        Value::Str(result.screenshot_path.display().to_string()),
+    );
+    obj.insert(
+        "evaluated".to_string(),
+        Value::Array(
+            result
+                .evaluated
+                .into_iter()
+                .map(|o| {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert("assertion".to_string(), Value::Str(o.assertion));
+                    m.insert("matched".to_string(), Value::Bool(o.matched));
+                    Value::Object(m)
+                })
+                .collect(),
+        ),
+    );
+    Ok(Value::Object(obj))
+}
+
 /// Register `poc.run` on a registry (called from binary assembly, Task 28).
+/// `script` steps error without an executor; see [`register_with_executor`].
 pub fn register(registry: &mut Registry) {
     registry.add_command(Arc::new(PocRunCommand));
+}
+
+/// Register `poc.run` with the scripting tier wired in, so a PoC's `script`
+/// steps run (M3). The binary calls this instead of [`register`] when the Rhai
+/// tier loaded; both register the same command name and schema.
+pub fn register_with_executor(registry: &mut Registry, executor: Arc<dyn ScriptStepExecutor>) {
+    registry.add_command(Arc::new(ScriptedPocRunCommand::new(executor)));
 }
 
 #[cfg(test)]
