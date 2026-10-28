@@ -155,14 +155,19 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             true,
         ),
     );
+    // The findings list across sessions is `poc.list` (F13): without it the
+    // item carries that label until a run this session gives it a count;
+    // `0` only when the list exists and is empty.
+    let findings_count = if !app.findings.is_empty() {
+        app.findings.len().to_string()
+    } else if app.has_tool("poc.list") {
+        "0".to_string()
+    } else {
+        "F13".to_string()
+    };
     line(
         buf,
-        item(
-            app,
-            SidebarItem::Findings,
-            Some(app.findings.len().to_string()),
-            true,
-        ),
+        item(app, SidebarItem::Findings, Some(findings_count), true),
     );
     // The count here is the open tab count, which needs `browser.tabs` (F14):
     // missing is a dash (§2.8), the view itself is built (task 10).

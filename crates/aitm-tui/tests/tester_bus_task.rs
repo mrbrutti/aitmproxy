@@ -241,7 +241,7 @@ async fn connect_sequence_identifies_as_aitm_tui_and_builds_features_from_tools_
     assert!(
         get.params()
             .iter()
-            .any(|(n, ty, required, _)| n == "id" && ty == "string" && *required),
+            .any(|p| p.name == "id" && p.ty == "string" && p.required),
         "forms are built from the schema"
     );
 
@@ -272,14 +272,14 @@ async fn connect_sequence_identifies_as_aitm_tui_and_builds_features_from_tools_
     let BusEvent::Flows(s) = flows else {
         unreachable!()
     };
-    assert_eq!(s.len(), 14);
-    assert_eq!(s[0]["id"], "f41");
-    assert_eq!(s[13]["id"], "f54");
-    assert_eq!(s[9]["intercept"], "intercepted");
+    assert_eq!(s.len(), 15);
+    assert_eq!(s[0]["id"], "f40");
+    assert_eq!(s[14]["id"], "f54");
+    assert_eq!(s[10]["intercept"], "intercepted");
     let wire = sent(&r.lines);
     assert_eq!(wire[4]["params"]["name"], "flow.list");
     assert_eq!(wire[5]["params"]["name"], "flow.get");
-    assert_eq!(wire[5]["params"]["arguments"], json!({"id": "f41"}));
+    assert_eq!(wire[5]["params"]["arguments"], json!({"id": "f40"}));
     assert_eq!(
         wire.iter().filter(|w| w["method"] == "tools/list").count(),
         1,
@@ -347,7 +347,8 @@ async fn requests_become_tool_calls_and_results_become_events() {
     let mut r = start(Fixture::builtin().shared(), Duration::from_millis(50));
     let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
 
-    // A tool the bus does not offer is refused locally with a warning toast.
+    // A tool the bus does not offer is refused locally as a failed call
+    // naming it (QI-1: the app routes it by tool, not by toast text).
     r.req_tx
         .send(BusRequest::Call {
             name: "nope".into(),
@@ -355,10 +356,13 @@ async fn requests_become_tool_calls_and_results_become_events() {
         })
         .await
         .unwrap();
-    let ev = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Toast(..))).await;
+    let ev = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::CallFailed { .. })).await;
     assert_eq!(
         ev,
-        BusEvent::Toast(Level::Warn, "nope is not on this bus".into())
+        BusEvent::CallFailed {
+            name: "nope".into(),
+            message: "nope is not on this bus".into()
+        }
     );
     assert!(
         !sent(&r.lines).iter().any(|w| w["params"]["name"] == "nope"),
@@ -407,18 +411,18 @@ async fn requests_become_tool_calls_and_results_become_events() {
         json!({"id": "f41", "body": "inline"})
     );
 
-    // A tool error (isError) is an error toast with the tool's message.
+    // A tool error (isError) is a failed call carrying the tool's message.
     r.req_tx
         .send(BusRequest::Resume("f41".into()))
         .await
         .unwrap();
-    let ev = next_where(&mut r.ev_rx, |e| {
-        matches!(e, BusEvent::Toast(Level::Error, _))
-    })
-    .await;
+    let ev = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::CallFailed { .. })).await;
     assert_eq!(
         ev,
-        BusEvent::Toast(Level::Error, "flow is not intercepted".into())
+        BusEvent::CallFailed {
+            name: "flow.resume".into(),
+            message: "flow is not intercepted".into()
+        }
     );
     // (Task 10 gave the fixture a browser; `ca.*` mutations are what it
     // still refuses, so that is the arbitrary-tool error path now.)
@@ -429,16 +433,13 @@ async fn requests_become_tool_calls_and_results_become_events() {
         })
         .await
         .unwrap();
-    let ev = next_where(&mut r.ev_rx, |e| {
-        matches!(e, BusEvent::Toast(Level::Error, _))
-    })
-    .await;
+    let ev = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::CallFailed { .. })).await;
     assert_eq!(
         ev,
-        BusEvent::Toast(
-            Level::Error,
-            "CA changes are not simulated by the fixture".into()
-        )
+        BusEvent::CallFailed {
+            name: "ca.install".into(),
+            message: "CA changes are not simulated by the fixture".into()
+        }
     );
 
     // Arguments the schema does not declare are pruned; the result is a new flow.
@@ -469,10 +470,10 @@ async fn requests_become_tool_calls_and_results_become_events() {
         line["params"]["arguments"]["authority"],
         "api.shop-staging.test"
     );
-    // After a mutation the next poll re-reads everything: 15 flows now.
+    // After a mutation the next poll re-reads everything: 16 flows now.
     let _ = next_where(
         &mut r.ev_rx,
-        |e| matches!(e, BusEvent::Flows(s) if s.len() == 15),
+        |e| matches!(e, BusEvent::Flows(s) if s.len() == 16),
     )
     .await;
 
@@ -636,13 +637,13 @@ async fn a_transport_failure_mid_session_reconnects_and_resumes_polling() {
 /// not the remaining panels on a dead socket.
 #[tokio::test]
 async fn a_transport_failure_in_a_slow_panel_reconnects_at_once() {
-    // initialize, initialized, tools/list, proxy.status, flow.list, 14 × flow.get
-    // = 19 lines succeed; the 20th, scope.list, "resets".
-    let mut r = start_flaky(19, Duration::from_millis(20));
+    // initialize, initialized, tools/list, proxy.status, flow.list, 15 × flow.get
+    // = 20 lines succeed; the 21st, scope.list, "resets".
+    let mut r = start_flaky(20, Duration::from_millis(20));
     let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
     let flows = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Flows(_))).await;
     assert!(
-        matches!(&flows, BusEvent::Flows(s) if s.len() == 14),
+        matches!(&flows, BusEvent::Flows(s) if s.len() == 15),
         "{flows:?}"
     );
     let lost = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Disconnected(_))).await;
@@ -762,7 +763,7 @@ async fn a_per_flow_get_error_keeps_the_cached_row_and_warns_once_per_poll() {
     let BusEvent::Flows(rows) = second else {
         unreachable!()
     };
-    assert_eq!(rows.len(), 14, "no row is dropped: {rows:?}");
+    assert_eq!(rows.len(), 15, "no row is dropped: {rows:?}");
     let f50 = rows
         .iter()
         .find(|s| s["id"] == "f50")

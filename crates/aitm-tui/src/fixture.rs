@@ -597,7 +597,7 @@ mod tests {
         let tools = c.tools_list().await.unwrap();
         assert!(tools.iter().any(|t| t.name == "flow.detail"));
         let ids = c.call("flow.list", json!({})).await.unwrap();
-        assert_eq!(ids.as_array().unwrap().len(), 14);
+        assert_eq!(ids.as_array().unwrap().len(), 15);
         let s = c.call("flow.get", json!({"id":"f50"})).await.unwrap();
         assert_eq!(s["method"], "POST");
         assert_eq!(s["intercept"], "intercepted");
@@ -652,7 +652,7 @@ mod tests {
         let new_id = c.call("flow.replay", json!({"id":"f45"})).await.unwrap();
         assert_eq!(new_id, "f55");
         let ids = c.call("flow.list", json!({})).await.unwrap();
-        assert_eq!(ids.as_array().unwrap().len(), 15);
+        assert_eq!(ids.as_array().unwrap().len(), 16);
         let s = c.call("flow.get", json!({"id":"f55"})).await.unwrap();
         assert_eq!(s["is_replay"], true);
     }

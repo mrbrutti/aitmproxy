@@ -58,7 +58,9 @@ Top to bottom: toolbar (record/compose/clear, listening pill, agent toggle),
 chip bar (content-type chips, `1`–`9`/`0` select), sidebar (28 columns,
 `b` hides, `[`/`]` move), flow list, intercept bar when armed or when flows
 are paused, inspector (request pane left, response pane right, tabs per
-pane), status bar (key hints · row counts · size and throughput · bus state).
+pane), status bar (key hints · row counts · total size and throughput · bus
+state; the total reads `—` until a size is known, which takes `flow.detail`
+(F5), and the throughput cluster `↑ — ↓ — (F4)` until the push stream).
 Layout is horizontal (inspector below) or vertical (inspector right); below
 120 columns the inspector takes the whole screen on `Enter` and returns on
 `Esc`. The intercept bar sits above the inspector when it is shown, else
@@ -66,8 +68,8 @@ above the status bar.
 
 Degradations, by design (§2.10(c)): no inline images — image bodies show
 `[image W×H type · o to open]` and `o` writes the bytes to a private temp
-file and opens it with the desktop (`open` / `xdg-open`); kitty/sixel
-graphics only if the terminal advertises them. No browser viewport: the
+file and opens it with the desktop (`open` / `xdg-open`); inline images are
+not built in this pass (`caps` detects kitty/sixel). No browser viewport: the
 Browser view shows the URL, the DOM as a text outline and the last screenshot
 as a placeholder (`o` opens it); navigate, eval, screenshot and DOM refresh
 still work (see **Browser** below). Diff is unified when the response pane is
@@ -150,8 +152,8 @@ Opening the view asks for the DOM and a screenshot once. While a call is in
 flight the panel says so (`⟳ navigating…`); when one fails — a bus with the
 tools but no engine, or a bus without `browser.*` at all — the error is shown
 in the panel, not only as a toast. `:browser.navigate url=…` from anywhere
-feeds the same view. Flows the browser makes appear in the list with client
-`obscura`.
+feeds the same view. Flows the browser makes appear with client `obscura`
+once F5 (`flow.detail`) carries the client; a dash today.
 
 ## `:` commands
 
@@ -243,15 +245,16 @@ never hidden and never fails silently. Against today's core that is:
 |---|---|---|
 | F1 | `agent.status`, `agent.set` | agent policy toggle (read-only); confirmations over the bus |
 | F2 | audit ring, `notifications/aitm/agent` | activity log rows, Origin column, agent ticks |
-| F3 | `flow.intercept {rules}`, `flow.kill {mode}` | breakpoint rules (`Rules…`), kill abort modes 429/503 |
+| F3 | `flow.intercept {rules}`, `flow.kill {mode}` | breakpoint rules (`Rules…`), response-phase intercept/edit, kill abort modes 429/503 |
 | F4 | `flow.subscribe`, server push | live list (polling instead), status-bar throughput (`↑ — ↓ — (F4)`) |
-| F5 | `flow.detail` | inspector bodies, raw edit, `~h`/`~b` filters, `Cookies`, `Timing`, `Set-Cookie` tabs |
+| F5 | `flow.detail` | inspector bodies, raw edit, `~h`/`~b` filters, `Cookies`, `Timing`, `Set-Cookie` tabs, the Client column, sizes (the status-bar total) |
 | F6 | `flow.mark`, `flow.comment` | `m` mark, `c` comment |
-| F7 | `proxy.pause`, `flow.clear`, `config.get` | `:pause`, `:record`, `:clear`, the scope panel's rate-limit readout |
+| F7 | `proxy.status/pause`, `flow.clear`, `config.get` | `:pause`, `:record`, `:clear`, the listening pill's address, the scope panel's rate-limit readout, config view and the `ssl_insecure` toggle |
 | F9 | `ws.send` | WebSocket compose (`:compose ws`) and replay of WS flows |
 | F10 | `session.save/load`, `flow.export`, `flow.import` | `:export`, `:import`, Saved sessions |
+| F11 | `tls.passthrough.list/add/remove` | SSL include/exclude list (which hosts to MITM) |
 | F12 | `scope.remove` | `d` in the scope panel, `:scope rm` |
-| F13 | `poc.list` | findings export |
+| F13 | `poc.list` | findings list across sessions (`poc.list`; the sidebar item reads `F13` until a run this session), export |
 | F14 | `browser.tabs`, `browser.screencast` | a live browser viewport and the tab count in the sidebar (the Browser view itself is built; see **Browser** above) |
 
 Confirmations are **local** until F1: `ca.install` and `ca.uninstall` (the
@@ -270,10 +273,17 @@ core dependency; build-or-descope is Matt's call):
 
 - split view (two lists side by side ≥ 160 columns) — `:split` says so
 - saved filters by name; match highlighting in body viewers; the sidebar quick filter
-- compose templates Multipart and WebSocket (`:compose ws` names F9); edit templates
+- compose templates Multipart and WebSocket (`:compose ws` names F9); the compose Query field and body modes; edit templates
 - WebSocket sent/received direction filter
 - setup-guide text; column hide; a Comment column (≥ 170 columns); palette recent/pinned
-- PoC YAML editable with Save (the YAML is shown; on a loopback bus it is read from `poc_path` when the result has none)
+- custom columns, multi-select with a summary, overview dashboard text (need `flow.detail` data, F5)
+- JSONPath/jq and full-text filter operators (body fields need F5; grammar to be fixed in the foundation)
+- Protobuf / MessagePack viewers, an SSE event list, rendered Markdown/HTML preview (plain text / hex today)
+- code generator / copy as cURL, export body (`:curl` imports only)
+- mark swatch beyond the first colour
+- JSON tree: copy node value, filter, sort keys (fold and copy node path are built)
+- inline images: not built in this pass (`caps` detects kitty/sixel)
+- PoC YAML editable with Save (the YAML is shown; on a loopback bus it is read from `poc_path` when the result has none — a regular `.yaml`/`.yml` file of at most 256 KiB)
 
 ## Terminal capabilities
 
@@ -297,8 +307,11 @@ Detected once at start from the environment (`caps.rs`):
 ## Fixture and snapshots for UI work
 
 `fixtures/bus-fixture.json` is a recorded bus: server info, listening address,
-scope, agent state, the `tools/list` reply, 14 flows mirroring the mockup's
-rows and 2 findings. Per foundation §2.10 it is the one fixture shared by the
+scope, agent state, the `tools/list` reply, 15 flows (the mockup's rows
+41–54 plus `f40`, the 101 upgrade the WebSocket flow `f47` names as its
+handshake — on the real bus a WebSocket summary carries only that id, and
+the row takes its URL from it) and 2 findings. Per foundation §2.10 it is the
+one fixture shared by the
 macOS, web and TUI surfaces, so a screen renders the same data everywhere.
 Bodies are readable `body_text`; the fixture transport base64-encodes them as
 `body` the way `flow.detail` will. Mutating commands update it in memory the

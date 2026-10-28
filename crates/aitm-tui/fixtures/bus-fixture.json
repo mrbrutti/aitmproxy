@@ -1,5 +1,5 @@
 {
-  "$description": "Recorded-bus fixture for operator-UI development (foundation §2.10: one fixture shared by the three surfaces). Flows mirror docs/design/mockup/index.html rows 41–54. Bodies are plain text (`body_text`) so the file stays readable; the fixture transport base64-encodes them as `body` the way `flow.detail` (core follow-up F5) will. Tools marked F* exist here before the core has them so the UI can be built against their proposed shape.",
+  "$description": "Recorded-bus fixture for operator-UI development (foundation §2.10: one fixture shared by the three surfaces). Flows mirror docs/design/mockup/index.html rows 41–54, plus f40, the 101 upgrade that f47 (the WebSocket flow) names as its handshake — the core's flow.get summary of a WebSocket carries only that id, so the row's URL comes from this flow. Bodies are plain text (`body_text`) so the file stays readable; the fixture transport base64-encodes them as `body` the way `flow.detail` (core follow-up F5) will. Tools marked F* exist here before the core has them so the UI can be built against their proposed shape.",
   "server": { "name": "aitmproxy", "version": "0.3.0-fixture" },
   "listening": "127.0.0.1:8080",
   "intercept_armed": true,
@@ -59,6 +59,15 @@
     { "name": "flow.comment", "description": "(F6) Set a flow's comment.", "inputSchema": { "type": "object", "properties": { "id": { "type": "string" }, "text": { "type": "string" } }, "required": ["id", "text"] } }
   ],
   "flows": [
+    {
+      "id": "f40", "kind": "http", "intercept": "observed", "edited": false,
+      "request": { "method": "GET", "scheme": "https", "authority": "api.shop-staging.test", "path": "/ws/notifications", "version": "HTTP/1.1",
+        "headers": [["host", "api.shop-staging.test"], ["upgrade", "websocket"], ["connection", "Upgrade"], ["sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="], ["sec-websocket-version", "13"]], "body_text": "" },
+      "response": { "status": 101, "version": "HTTP/1.1", "headers": [["upgrade", "websocket"], ["connection", "Upgrade"], ["sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="]], "body_text": "" },
+      "client_conn": { "peer": "127.0.0.1:52120", "sni": "api.shop-staging.test", "alpn": "http/1.1", "tls": true, "process": "obscura" },
+      "server_conn": { "peer": "203.0.113.10:443", "sni": "api.shop-staging.test", "alpn": "http/1.1", "tls": true },
+      "meta": { "marks": [], "comment": null, "is_replay": false, "created": "2026-10-27T11:04:57.880Z", "duration_ms": 12, "truncated": false, "origin": "human" }
+    },
     {
       "id": "f41", "kind": "http", "intercept": "observed", "edited": false,
       "request": { "method": "GET", "scheme": "https", "authority": "api.shop-staging.test", "path": "/api/products?category=electronics&limit=20", "version": "HTTP/2",

@@ -50,9 +50,12 @@ fn panel(key: KeyEvent) -> Option<Action> {
     })
 }
 
+/// The CA panel: `e` export prompt; `i`/`u` run the confirmed tools by name
+/// (the same path as typing `:ca.install`, so a bus without the CA plugin
+/// answers with the missing tool's name).
 fn ca(key: KeyEvent) -> Option<Action> {
     Some(match key.code {
-        KeyCode::Char('e') => Action::Command("ca-export-prompt".into()),
+        KeyCode::Char('e') => Action::CaExportPrompt,
         KeyCode::Char('i') => Action::Command("ca.install".into()),
         KeyCode::Char('u') => Action::Command("ca.uninstall".into()),
         _ => return panel(key),
@@ -64,10 +67,10 @@ fn ca(key: KeyEvent) -> Option<Action> {
 /// is the URL here, so Home is the key for "top of the outline".
 fn browser(key: KeyEvent) -> Option<Action> {
     Some(match key.code {
-        KeyCode::Char('g') => Action::Command("browser-url-prompt".into()),
-        KeyCode::Char('e') => Action::Command("browser-eval-prompt".into()),
-        KeyCode::Char('d') => Action::Command("browser-dom".into()),
-        KeyCode::Char('s') => Action::Command("browser-screenshot".into()),
+        KeyCode::Char('g') => Action::BrowserNavigatePrompt,
+        KeyCode::Char('e') => Action::BrowserEvalPrompt,
+        KeyCode::Char('d') => Action::BrowserRefreshDom,
+        KeyCode::Char('s') => Action::BrowserScreenshot,
         KeyCode::Char('o') => Action::OpenExternally,
         KeyCode::Up | KeyCode::Char('k') => Action::Up,
         KeyCode::Down | KeyCode::Char('j') => Action::Down,
@@ -205,8 +208,8 @@ fn prompt(key: KeyEvent, kind: PromptKind, ctrl: bool) -> Option<Action> {
 fn compose(key: KeyEvent, ctrl: bool) -> Option<Action> {
     Some(match key.code {
         KeyCode::Esc => Action::Back,
-        KeyCode::Enter if ctrl => Action::Command("send".into()),
-        KeyCode::Char('s') if ctrl => Action::Command("send".into()),
+        KeyCode::Enter if ctrl => Action::ComposeSend,
+        KeyCode::Char('s') if ctrl => Action::ComposeSend,
         KeyCode::Enter => Action::Submit,
         KeyCode::Tab | KeyCode::Down => Action::Down,
         KeyCode::BackTab | KeyCode::Up => Action::Up,
@@ -223,7 +226,7 @@ fn findings(key: KeyEvent) -> Option<Action> {
     Some(match key.code {
         KeyCode::Esc | KeyCode::Char('q') => Action::Back,
         KeyCode::Enter => Action::Enter,
-        KeyCode::Char('r') => Action::Command("poc-rerun".into()),
+        KeyCode::Char('r') => Action::PocRerun,
         KeyCode::Char('o') => Action::OpenExternally,
         KeyCode::Char(':') => Action::PaletteOpen,
         KeyCode::Char('?') => Action::Help,
@@ -237,12 +240,8 @@ fn scope(key: KeyEvent) -> Option<Action> {
     }
     Some(match key.code {
         KeyCode::Esc | KeyCode::Char('q') => Action::Back,
-        KeyCode::Char('a') | KeyCode::Char('n') | KeyCode::Char('+') => {
-            Action::Command("scope-prompt".into())
-        }
-        KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Char('-') => {
-            Action::Command("scope-rm-selected".into())
-        }
+        KeyCode::Char('a') | KeyCode::Char('n') | KeyCode::Char('+') => Action::ScopeAddPrompt,
+        KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Char('-') => Action::ScopeRemoveSelected,
         KeyCode::Char(':') => Action::PaletteOpen,
         KeyCode::Char('?') => Action::Help,
         _ => return None,
@@ -337,12 +336,47 @@ mod tests {
         );
     }
 
+    /// Q-1: a panel key is an `Action` variant, never a string pseudo-command
+    /// that `run_command` has to recognise.
+    #[test]
+    fn panel_keys_are_action_variants_not_pseudo_commands() {
+        for (key, mode, want) in [
+            ('g', Mode::Browser, Action::BrowserNavigatePrompt),
+            ('e', Mode::Browser, Action::BrowserEvalPrompt),
+            ('d', Mode::Browser, Action::BrowserRefreshDom),
+            ('s', Mode::Browser, Action::BrowserScreenshot),
+            ('e', Mode::Ca, Action::CaExportPrompt),
+            ('r', Mode::Findings, Action::PocRerun),
+            ('a', Mode::Scope, Action::ScopeAddPrompt),
+            ('n', Mode::Scope, Action::ScopeAddPrompt),
+            ('+', Mode::Scope, Action::ScopeAddPrompt),
+            ('d', Mode::Scope, Action::ScopeRemoveSelected),
+            ('x', Mode::Scope, Action::ScopeRemoveSelected),
+            ('-', Mode::Scope, Action::ScopeRemoveSelected),
+        ] {
+            assert_eq!(
+                map(press(KeyCode::Char(key)), mode),
+                Some(want),
+                "{key} in {mode:?}"
+            );
+        }
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(map(ctrl_s, Mode::Compose), Some(Action::ComposeSend));
+        let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        assert_eq!(map(ctrl_enter, Mode::Compose), Some(Action::ComposeSend));
+        // The CA panel's install/uninstall are the tool names, typed-command style.
+        assert_eq!(
+            map(press(KeyCode::Char('i')), Mode::Ca),
+            Some(Action::Command("ca.install".into()))
+        );
+    }
+
     /// I2 / C2: the CA and Browser panels are keyboard-complete.
     #[test]
     fn ca_and_browser_panels_map_their_keys() {
         assert_eq!(
             map(press(KeyCode::Char('e')), Mode::Ca),
-            Some(Action::Command("ca-export-prompt".into()))
+            Some(Action::CaExportPrompt)
         );
         assert_eq!(
             map(press(KeyCode::Char('i')), Mode::Ca),
@@ -363,15 +397,15 @@ mod tests {
         );
         assert_eq!(map(press(KeyCode::Char('z')), Mode::Browser), None);
         // Task 10: the browser view's verbs and outline navigation.
-        for (key, cmd) in [
-            ('g', "browser-url-prompt"),
-            ('e', "browser-eval-prompt"),
-            ('d', "browser-dom"),
-            ('s', "browser-screenshot"),
+        for (key, want) in [
+            ('g', Action::BrowserNavigatePrompt),
+            ('e', Action::BrowserEvalPrompt),
+            ('d', Action::BrowserRefreshDom),
+            ('s', Action::BrowserScreenshot),
         ] {
             assert_eq!(
                 map(press(KeyCode::Char(key)), Mode::Browser),
-                Some(Action::Command(cmd.into())),
+                Some(want),
                 "{key}"
             );
         }

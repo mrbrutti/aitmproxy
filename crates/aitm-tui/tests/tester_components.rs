@@ -5,7 +5,7 @@
 mod common;
 
 use aitm_tui::action::ToolSchema as _;
-use aitm_tui::action::{Action, BusEvent, BusRequest, Level, ToolInfo};
+use aitm_tui::action::{Action, BusEvent, BusRequest, Level, Param, ToolInfo};
 use aitm_tui::app::{App, Chip, Mode, Pane, PromptKind, SidebarItem, REQUEST_TABS, RESPONSE_TABS};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::fixture::Fixture;
@@ -115,7 +115,7 @@ fn flow_list_rows_show_every_state_from_the_foundation() {
     );
 
     // Replay (f46): `↻` after `#`, agent tick, `agent` in the Origin column.
-    let (y, line) = row(&format!("6{}", glyph::REPLAY));
+    let (y, line) = row(&format!("7{}", glyph::REPLAY));
     assert!(line.contains("/api/orders?page=3"), "{line}");
     let url_x = col_of(line, "https://").unwrap();
     assert_eq!(cell(&buf, url_x - 10, y).symbol(), "▎");
@@ -153,7 +153,7 @@ fn flow_list_rows_show_every_state_from_the_foundation() {
     let (y, line) = row("/api/account/delete");
     let m_x = col_of(line, "DELETE").unwrap();
     assert_eq!(cell(&buf, m_x, y).fg, theme.method("DELETE").fg.unwrap());
-    let (y, line) = row("    5 https");
+    let (y, line) = row("    6 https");
     assert!(line.contains("502"), "f45: {line}");
     let s_x = col_of(line, "502").unwrap();
     assert_eq!(
@@ -167,8 +167,9 @@ fn flow_list_rows_show_every_state_from_the_foundation() {
         theme.status(Some(200), false).fg.unwrap()
     );
 
-    // WebSocket (f47): `WS` badge and the frame count in the Response column.
-    let (_, line) = row("/ws/notifications");
+    // WebSocket (f47): `WS` badge and the frame count in the Response column
+    // (f40, its handshake, shares the path; the scheme tells them apart).
+    let (_, line) = row("wss://api.shop-staging.test/ws/notifications");
     assert!(line.contains(" WS "), "{line}");
     assert!(line.contains(&format!("3 {}", glyph::WEBSOCKET)), "{line}");
 
@@ -274,13 +275,13 @@ fn sidebar_items_group_the_list_and_open_the_panels() {
     let _ = app.update(Action::SidebarNext);
     assert_eq!(app.sidebar, SidebarItem::Apps);
     let text = text_of(&app, 200, 50);
-    assert!(text.contains("▾ obscura  6"), "{text}");
+    assert!(text.contains("▾ obscura  7"), "{text}");
     assert!(text.contains("▾ curl  3"), "{text}");
     assert!(text.contains("▾ python3  2"), "{text}");
     let _ = app.update(Action::SidebarNext);
     assert_eq!(app.sidebar, SidebarItem::Domains);
     let text = text_of(&app, 200, 50);
-    assert!(text.contains("▾ api.shop-staging.test  10"), "{text}");
+    assert!(text.contains("▾ api.shop-staging.test  11"), "{text}");
     assert!(text.contains("▾ cdn.shop-staging.test  2"), "{text}");
     // Domains lists the hosts under the item in the sidebar.
     assert!(
@@ -293,7 +294,7 @@ fn sidebar_items_group_the_list_and_open_the_panels() {
     let _ = app.update(Action::SidebarNext);
     assert_eq!(app.sidebar, SidebarItem::Scope);
     assert_eq!(app.mode, Mode::Flows);
-    assert_eq!(visible_ids(&app).len(), 13, "f44 is out of scope");
+    assert_eq!(visible_ids(&app).len(), 14, "f44 is out of scope");
     let _ = app.update(Action::SidebarNext);
     assert_eq!(app.sidebar, SidebarItem::Findings);
     assert_eq!(app.mode, Mode::Findings);
@@ -349,7 +350,7 @@ fn pinning_a_host_sorts_it_first_and_shows_in_the_sidebar() {
     assert!(text.contains("◎ telemetry.vendor-an…"), "{text}");
     let _ = app.update(Action::Pin);
     assert_eq!(toast(&app), "Unpinned telemetry.vendor-analytics.example");
-    assert_eq!(visible_ids(&app)[0], "f41");
+    assert_eq!(visible_ids(&app)[0], "f40", "arrival order again");
     let _ = app.run_command("pin cdn.shop-staging.test");
     assert_eq!(&visible_ids(&app)[..2], ["f43", "f52"]);
 }
@@ -408,7 +409,7 @@ fn chips_quick_filter_the_list_and_render_as_active() {
     assert_eq!(app.chip, Chip::Json);
     let _ = app.update(Action::Back);
     assert_eq!(app.chip, Chip::All);
-    assert_eq!(visible_ids(&app).len(), 14);
+    assert_eq!(visible_ids(&app).len(), 15);
 }
 
 /// §2.7 "Filter bar": the mitmproxy-style grammar is the portable text form;
@@ -437,8 +438,12 @@ fn filter_expressions_select_the_documented_rows() {
         ("~b correct-horse", &["f50"]),
         ("~h x-request-id", &["f41"]),
         ("~m HEAD | login", &["f50", "f54"]),
-        // f47's detail names the handshake method, so the WebSocket flow is a GET too.
-        ("!~s 2xx ~m GET", &["f43", "f45", "f47", "f51", "f52"]),
+        // f40 is the 101 upgrade; f47's detail names the handshake method,
+        // so the WebSocket flow is a GET too.
+        (
+            "!~s 2xx ~m GET",
+            &["f40", "f43", "f45", "f47", "f51", "f52"],
+        ),
         ("products & ~s 200", &["f41"]),
         ("(~m PUT | ~m PATCH) & ~d api", &["f42", "f53"]),
         ("~u \"cart/items/42\"", &["f42"]),
@@ -451,7 +456,7 @@ fn filter_expressions_select_the_documented_rows() {
         assert_eq!(visible_ids(&app), *want, "{expr}");
     }
     let _ = app.run_command("filter ~scope");
-    assert_eq!(visible_ids(&app).len(), 13);
+    assert_eq!(visible_ids(&app).len(), 14);
     let _ = app.run_command("filter ~zz");
     assert_eq!(toast(&app), "filter: unknown filter `~zz`");
     // `/` opens the prompt prefilled with the current expression.
@@ -507,7 +512,7 @@ fn palette_offers_tools_commands_and_flows() {
         .expect("flows match by URL");
     assert!(
         flow.label
-            .starts_with("#5 GET https://api.shop-staging.test/api/orders"),
+            .starts_with("#6 GET https://api.shop-staging.test/api/orders"),
         "{}",
         flow.label
     );
@@ -515,7 +520,7 @@ fn palette_offers_tools_commands_and_flows() {
     assert!(text.contains(" palette "), "{text}");
     assert!(text.contains(" : orders"), "{text}");
     assert!(
-        text.contains("#5 GET https://api.shop-stagi… flow"),
+        text.contains("#6 GET https://api.shop-stagi… flow"),
         "{text}"
     );
     // Pick the flow: it becomes the selection.
@@ -806,7 +811,7 @@ fn diff_is_unified_in_narrow_panes_and_side_by_side_in_wide_ones() {
     // f46 repeats f45 (same method, host, path): the Diff tab compares them.
     let mut app = inspector_on("f46", Pane::Response, "Diff");
     let text = text_of(&app, 200, 50);
-    assert!(text.contains("vs flow #5 (11:05:03.890)"), "{text}");
+    assert!(text.contains("vs flow #6 (11:05:03.890)"), "{text}");
     // 200 columns with the sidebar: the response pane is 86 cells → unified.
     assert!(
         text.contains("- <html><head><title>502 Bad Gateway"),
@@ -984,7 +989,7 @@ fn quick_look_shows_the_body_and_help_lists_the_keys() {
     assert_eq!(app.mode, Mode::QuickLook);
     let text = text_of(&app, 200, 50);
     assert!(
-        text.contains("#10 POST https://auth.shop-staging.test/api/auth/login"),
+        text.contains("#11 POST https://auth.shop-staging.test/api/auth/login"),
         "{text}"
     );
     assert!(
@@ -1191,7 +1196,7 @@ fn compose_form_imports_curl_prefills_from_flows_and_prechecks_scope() {
     // Send: Ctrl-S or Ctrl-Enter from any field.
     assert_eq!(
         keys::map(ctrl('s'), Mode::Compose),
-        Some(Action::Command("send".into()))
+        Some(Action::ComposeSend)
     );
     assert_eq!(
         keys::map(
@@ -1201,9 +1206,9 @@ fn compose_form_imports_curl_prefills_from_flows_and_prechecks_scope() {
             ),
             Mode::Compose
         ),
-        Some(Action::Command("send".into()))
+        Some(Action::ComposeSend)
     );
-    let reqs = app.update(Action::Command("send".into()));
+    let reqs = app.update(Action::ComposeSend);
     assert_eq!(
         reqs,
         vec![BusRequest::Send(json!({
@@ -1231,7 +1236,7 @@ fn compose_form_imports_curl_prefills_from_flows_and_prechecks_scope() {
         "{text}"
     );
     assert!(text.contains("1 sent this session"), "{text}");
-    assert!(app.update(Action::Command("send".into())).is_empty());
+    assert!(app.update(Action::ComposeSend).is_empty());
     assert_eq!(
         toast(&app),
         "Out of scope — add `evil.example` to scope to send"
@@ -1310,7 +1315,7 @@ fn scope_panel_lists_entries_counts_and_out_of_scope_hosts() {
     assert!(
         line_with(&text, "api.shop-staging.test")
             .unwrap()
-            .contains("10 flows"),
+            .contains("11 flows"),
         "{text}"
     );
     assert!(
@@ -1338,9 +1343,9 @@ fn scope_panel_lists_entries_counts_and_out_of_scope_hosts() {
     // `a` → the add prompt → scope.add; back on the panel afterwards.
     assert_eq!(
         keys::map(press(KeyCode::Char('a')), Mode::Scope),
-        Some(Action::Command("scope-prompt".into()))
+        Some(Action::ScopeAddPrompt)
     );
-    let _ = app.update(Action::Command("scope-prompt".into()));
+    let _ = app.update(Action::ScopeAddPrompt);
     assert_eq!(app.mode, Mode::Prompt(PromptKind::ScopeAdd));
     assert!(text_of(&app, 200, 50).contains("a human action"));
     for c in "*.other.test".chars() {
@@ -1360,24 +1365,22 @@ fn scope_panel_lists_entries_counts_and_out_of_scope_hosts() {
         "api.shop-staging.test".into(),
         "*.other.test".into(),
     ]));
-    assert_eq!(app.in_scope_count(), 10);
+    assert_eq!(app.in_scope_count(), 11);
 
     // `d` removes the entry under the cursor (scope.remove is on this bus).
     let _ = app.update(Action::Down);
     assert_eq!(app.scope_cursor, 1);
     assert_eq!(
         keys::map(press(KeyCode::Char('d')), Mode::Scope),
-        Some(Action::Command("scope-rm-selected".into()))
+        Some(Action::ScopeRemoveSelected)
     );
     assert_eq!(
-        app.update(Action::Command("scope-rm-selected".into())),
+        app.update(Action::ScopeRemoveSelected),
         vec![BusRequest::ScopeRemove("*.other.test".into())]
     );
     // Without scope.remove the control is labelled F12.
     app.tools.retain(|t| t.name != "scope.remove");
-    assert!(app
-        .update(Action::Command("scope-rm-selected".into()))
-        .is_empty());
+    assert!(app.update(Action::ScopeRemoveSelected).is_empty());
     assert_eq!(toast(&app), "scope.remove needs core follow-up F12");
     assert!(text_of(&app, 200, 50).contains("d remove (needs core follow-up F12)"));
     // Every mutating verb on an out-of-scope flow is refused with the host.
@@ -1450,9 +1453,9 @@ fn findings_panel_lists_runs_and_opens_the_capture() {
     assert!(text.contains("✗ dsl: body.item_id != 42"), "{text}");
     assert_eq!(
         keys::map(press(KeyCode::Char('r')), Mode::Findings),
-        Some(Action::Command("poc-rerun".into()))
+        Some(Action::PocRerun)
     );
-    let _ = app.update(Action::Command("poc-rerun".into()));
+    let _ = app.update(Action::PocRerun);
     assert_eq!(app.mode, Mode::Prompt(PromptKind::PocTarget));
     for c in "https://staging2.test".chars() {
         let _ = app.update(Action::Input(c));
@@ -1685,12 +1688,13 @@ fn every_absent_tool_degrades_to_a_labelled_follow_up() {
         assert!(app.run_command(cmd).is_empty(), "{cmd}");
         assert!(toast(&app).contains(f), "{cmd}: {}", toast(&app));
     }
-    // Edit on a paused flow without flow.detail: F5, and the summary is fetched instead.
+    // Edit on a paused flow without flow.detail: F5, and nothing is asked
+    // of a bus that cannot answer (Q-6: one `request_detail` gate).
     app.selected = Some("b".into());
-    assert!(app
-        .update(Action::Edit)
-        .iter()
-        .any(|r| matches!(r, BusRequest::Detail(id) if id == "b")));
+    assert!(
+        app.update(Action::Edit).is_empty(),
+        "no flow.detail on this bus: nothing to fetch"
+    );
     assert!(toast(&app).contains("F5"), "{}", toast(&app));
     assert_eq!(app.mode, Mode::Flows);
     // The inspector and quick-look say F5 instead of showing an empty pane.
@@ -1871,13 +1875,18 @@ fn tools_list_drives_detail_fetching() {
     assert_eq!(
         t.params(),
         vec![
-            (
-                "id".to_string(),
-                "string".to_string(),
-                true,
-                "The flow.".to_string()
-            ),
-            ("n".to_string(), "integer".to_string(), false, String::new()),
+            Param {
+                name: "id".to_string(),
+                ty: "string".to_string(),
+                required: true,
+                description: "The flow.".to_string(),
+            },
+            Param {
+                name: "n".to_string(),
+                ty: "integer".to_string(),
+                required: false,
+                description: String::new(),
+            },
         ]
     );
     let _ = Level::Info;
@@ -1886,7 +1895,7 @@ fn tools_list_drives_detail_fetching() {
 // ------------------------------------------------------ §2.7 browser view
 
 /// Run `reqs` against the fixture as the bus task would and feed the answers
-/// back: `CallOk` for a result, an error toast for a tool error.
+/// back: `CallOk` for a result, `CallFailed` for a tool error (QI-1).
 fn answer(app: &mut App, fx: &mut Fixture, reqs: Vec<BusRequest>) {
     for r in reqs {
         if let BusRequest::Call { name, args } = r {
@@ -1895,8 +1904,8 @@ fn answer(app: &mut App, fx: &mut Fixture, reqs: Vec<BusRequest>) {
                 Ok(value) => {
                     let _ = app.on_bus(BusEvent::CallOk { name, value });
                 }
-                Err(e) => {
-                    let _ = app.on_bus(BusEvent::Toast(Level::Error, e));
+                Err(message) => {
+                    let _ = app.on_bus(BusEvent::CallFailed { name, message });
                 }
             }
         }
@@ -1910,16 +1919,34 @@ fn call(name: &str, args: serde_json::Value) -> BusRequest {
     }
 }
 
-/// §2.7 "Browser view … TUI: URL + last screenshot as placeholder + `get_dom`
-/// text outline; navigate/eval available"; §2.9 "URL, DOM outline, last
-/// screenshot placeholder"; §2.10(c) "no browser viewport … navigate/eval
-/// still work". Plan task 10.
-#[test]
-fn browser_view_shows_url_screenshot_and_dom_outline() {
+/// `(width, height, format, byte count)` of the last screenshot.
+fn shot_facts(app: &App) -> Option<(u32, u32, &'static str, usize)> {
+    app.browser
+        .screenshot
+        .as_ref()
+        .map(|s| (s.width, s.height, s.format, s.bytes.len()))
+}
+
+/// The browser view opened on the fixture, its first DOM and screenshot
+/// answered — where every browser test below starts.
+fn browser_open() -> (App, Fixture) {
     let mut app = fixture_app(200, 50);
     let mut fx = Fixture::builtin();
+    let reqs = app.update(Action::OpenBrowser);
+    answer(&mut app, &mut fx, reqs);
+    assert_eq!(app.mode, Mode::Browser);
+    assert_eq!(app.browser.busy, None);
+    (app, fx)
+}
 
-    // Opening the view asks the bus for the page once.
+/// §2.7 "Browser view … TUI: URL + last screenshot as placeholder + `get_dom`
+/// text outline"; §2.9 "URL, DOM outline, last screenshot placeholder".
+/// Plan task 10: opening the view asks the bus for the page once and draws
+/// the URL (a dash until a navigate), the screenshot line and the outline.
+#[test]
+fn browser_view_opens_asking_for_the_page_and_shows_url_screenshot_and_outline() {
+    let mut app = fixture_app(200, 50);
+    let mut fx = Fixture::builtin();
     let reqs = app.update(Action::OpenBrowser);
     assert_eq!(app.mode, Mode::Browser);
     assert_eq!(app.sidebar, SidebarItem::Browser);
@@ -1959,7 +1986,7 @@ fn browser_view_shows_url_screenshot_and_dom_outline() {
             "    script",
         ]
     );
-    assert_eq!(app.browser.screenshot, Some((1, 1, "PNG", 70)));
+    assert_eq!(shot_facts(&app), Some((1, 1, "PNG", 70)));
     let text = text_of(&app, 200, 50);
     assert!(text.contains("Browser — embedded obscura"), "{text}");
     assert!(
@@ -1972,7 +1999,13 @@ fn browser_view_shows_url_screenshot_and_dom_outline() {
         text.contains("live viewport and tabs need core follow-up F14"),
         "{text}"
     );
-    // ↓ walks the outline; the header names the cursor's path.
+}
+
+/// Task 10: ↓ walks the outline and the header names the cursor's path;
+/// Home and End jump to its ends.
+#[test]
+fn browser_outline_navigation_names_the_cursor_path() {
+    let (mut app, _) = browser_open();
     for _ in 0..6 {
         let _ = app.update(Action::Down);
     }
@@ -1983,13 +2016,18 @@ fn browser_view_shows_url_screenshot_and_dom_outline() {
     assert_eq!(app.browser.dom_cursor, 0);
     let _ = app.update(Action::End);
     assert_eq!(app.browser.dom_cursor, 10);
+}
 
-    // `g` opens the URL prompt prefilled with the current URL; ⏎ navigates.
+/// §2.10(c) "navigate … still work": `g` opens the URL prompt prefilled
+/// with the current URL; ⏎ sends `browser.navigate`; Esc returns to the view.
+#[test]
+fn browser_url_prompt_prefills_the_current_url_and_navigates() {
+    let (mut app, mut fx) = browser_open();
     assert_eq!(
         keys::map(press(KeyCode::Char('g')), Mode::Browser),
-        Some(Action::Command("browser-url-prompt".into()))
+        Some(Action::BrowserNavigatePrompt)
     );
-    let _ = app.update(Action::Command("browser-url-prompt".into()));
+    let _ = app.update(Action::BrowserNavigatePrompt);
     assert_eq!(app.mode, Mode::Prompt(PromptKind::BrowserUrl));
     assert_eq!(app.prompt, "");
     for c in "https://shop-staging.test/".chars() {
@@ -2012,19 +2050,24 @@ fn browser_view_shows_url_screenshot_and_dom_outline() {
         "{}",
         text_of(&app, 200, 50)
     );
-    let _ = app.update(Action::Command("browser-url-prompt".into()));
+    let _ = app.update(Action::BrowserNavigatePrompt);
     assert_eq!(app.prompt, "https://shop-staging.test/");
     let _ = app.update(Action::Back);
     assert_eq!(app.mode, Mode::Browser);
     assert_eq!(app.prompt, "");
+}
 
-    // `e` prompts for an expression; the argument is named by the tool's
-    // schema (`expr` on today's bus), not hard-coded.
+/// §2.10(c) "eval … still work": `e` prompts for an expression; the
+/// argument is named by the tool's schema (`expr` on today's bus), not
+/// hard-coded; the result is drawn on the `eval ›` line.
+#[test]
+fn browser_eval_prompt_sends_the_schema_named_argument_and_shows_the_result() {
+    let (mut app, mut fx) = browser_open();
     assert_eq!(
         keys::map(press(KeyCode::Char('e')), Mode::Browser),
-        Some(Action::Command("browser-eval-prompt".into()))
+        Some(Action::BrowserEvalPrompt)
     );
-    let _ = app.update(Action::Command("browser-eval-prompt".into()));
+    let _ = app.update(Action::BrowserEvalPrompt);
     assert_eq!(app.mode, Mode::Prompt(PromptKind::BrowserEval));
     for c in "document.title".chars() {
         let _ = app.update(Action::Input(c));
@@ -2042,35 +2085,59 @@ fn browser_view_shows_url_screenshot_and_dom_outline() {
         "{}",
         text_of(&app, 200, 50)
     );
-    // `d` and `s` refresh; `:browser.navigate url=…` from the panel is the
-    // same call the prompt makes.
+}
+
+/// Task 10: `d` re-reads the DOM and `s` captures a screenshot, each naming
+/// what is in flight.
+#[test]
+fn browser_d_and_s_refresh_the_dom_and_the_screenshot() {
+    let (mut app, _) = browser_open();
     assert_eq!(
         keys::map(press(KeyCode::Char('d')), Mode::Browser),
-        Some(Action::Command("browser-dom".into()))
+        Some(Action::BrowserRefreshDom)
     );
     assert_eq!(
         keys::map(press(KeyCode::Char('s')), Mode::Browser),
-        Some(Action::Command("browser-screenshot".into()))
+        Some(Action::BrowserScreenshot)
     );
     assert_eq!(
-        app.update(Action::Command("browser-dom".into())),
+        app.update(Action::BrowserRefreshDom),
         vec![call("browser.get_dom", json!({}))]
     );
     assert_eq!(app.browser.busy, Some("reading the DOM"));
     assert_eq!(
-        app.update(Action::Command("browser-screenshot".into())),
+        app.update(Action::BrowserScreenshot),
         vec![call("browser.screenshot", json!({}))]
     );
     assert_eq!(app.browser.busy, Some("capturing a screenshot"));
+    assert_eq!(app.browser.inflight, 2);
+}
+
+/// `:browser.navigate url=…` typed anywhere is the same call the prompt
+/// makes and feeds the same view.
+#[test]
+fn browser_navigate_command_feeds_the_same_view() {
+    let (mut app, mut fx) = browser_open();
     let reqs = app.run_command("browser.navigate url=https://x");
     assert_eq!(
         reqs,
         vec![call("browser.navigate", json!({"url": "https://x"}))]
     );
+    assert_eq!(app.browser.busy, Some("navigating"));
     answer(&mut app, &mut fx, reqs);
     assert_eq!(app.browser.url, "https://x");
+    assert!(
+        text_of(&app, 200, 50).contains("https://x"),
+        "{}",
+        text_of(&app, 200, 50)
+    );
+}
 
-    // `o` writes the screenshot to a private temp file and opens it.
+/// §2.9 "o opens it": `o` writes the screenshot to a private temp file and
+/// hands it to the desktop.
+#[test]
+fn browser_o_writes_the_screenshot_to_a_temp_file_and_opens_it() {
+    let (mut app, _) = browser_open();
     assert_eq!(
         keys::map(press(KeyCode::Char('o')), Mode::Browser),
         Some(Action::OpenExternally)
@@ -2083,12 +2150,18 @@ fn browser_view_shows_url_screenshot_and_dom_outline() {
         target.path
     );
     assert_eq!(std::fs::read(&target.path).unwrap().len(), 70);
+    assert_eq!(target.label, "screenshot");
     let _ = std::fs::remove_file(&target.path);
+}
 
-    // `:browser` opens the view too and does not re-fetch what it has.
+/// `:browser` opens the view too and does not re-fetch what it already has.
+#[test]
+fn browser_command_opens_the_view_without_refetching() {
+    let (mut app, _) = browser_open();
     app.mode = Mode::Flows;
     assert!(app.run_command("browser").is_empty());
     assert_eq!(app.mode, Mode::Browser);
+    assert_eq!(app.browser.inflight, 0);
 }
 
 /// §2.10(c) "where a translation cannot be faithful, the surface degrades …
@@ -2110,7 +2183,7 @@ fn browser_view_says_when_the_bus_has_no_browser_and_shows_tool_errors() {
         text.contains("this bus offers no browser.* tools"),
         "{text}"
     );
-    assert!(app.update(Action::Command("browser-dom".into())).is_empty());
+    assert!(app.update(Action::BrowserRefreshDom).is_empty());
     assert_eq!(
         app.browser.error.as_deref(),
         Some("browser.get_dom is not on this bus")
@@ -2120,9 +2193,7 @@ fn browser_view_says_when_the_bus_has_no_browser_and_shows_tool_errors() {
         "{}",
         text_of(&app, 200, 50)
     );
-    assert!(app
-        .update(Action::Command("browser-url-prompt".into()))
-        .is_empty());
+    assert!(app.update(Action::BrowserNavigatePrompt).is_empty());
     assert_eq!(
         app.mode,
         Mode::Browser,
@@ -2132,14 +2203,14 @@ fn browser_view_says_when_the_bus_has_no_browser_and_shows_tool_errors() {
     // The tools are there but nothing answers behind them (a live proxy with
     // no obscura): the error lands in the panel, not only in a toast.
     let _ = connect(&mut app, CORE_TOOLS, None);
-    let reqs = app.update(Action::Command("browser-dom".into()));
+    let reqs = app.update(Action::BrowserRefreshDom);
     assert_eq!(reqs.len(), 1);
     assert_eq!(app.browser.busy, Some("reading the DOM"));
     assert_eq!(app.browser.error, None, "a new call clears the old error");
-    let _ = app.on_bus(BusEvent::Toast(
-        Level::Error,
-        "browser engine is not running".into(),
-    ));
+    let _ = app.on_bus(BusEvent::CallFailed {
+        name: "browser.get_dom".into(),
+        message: "browser engine is not running".into(),
+    });
     assert_eq!(app.browser.busy, None);
     assert_eq!(
         app.browser.error.as_deref(),

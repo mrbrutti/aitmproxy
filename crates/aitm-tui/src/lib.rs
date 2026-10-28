@@ -254,14 +254,12 @@ fn load_fixture_app(cols: u16, rows: u16, core_only: bool) -> App {
     let tools: Vec<ToolInfo> = fx
         .tools
         .iter()
-        .map(|t| ToolInfo {
-            name: t["name"].as_str().unwrap_or("").to_string(),
-            description: t["description"].as_str().unwrap_or("").to_string(),
-            input_schema: t.get("inputSchema").cloned().unwrap_or(Value::Null),
-        })
+        .filter_map(|t| ToolInfo::from_json(t).ok())
         .filter(|t| !core_only || CORE_TOOLS.contains(&t.name.as_str()))
         .collect();
-    let listening = Some(fx.listening.clone());
+    // The listen address comes from `proxy.status` (F7), which the core bus
+    // does not have: the core-only app does not know it either.
+    let listening = (!core_only).then(|| fx.listening.clone());
     let _ = app.on_bus(BusEvent::Connected {
         server: format!("{} {}", fx.server_name, fx.server_version),
         tools,

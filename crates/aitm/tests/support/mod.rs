@@ -6,12 +6,11 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::SystemTime;
 
-use aitm::tui::Services;
-use aitm::wire::{assemble, Assembled, Http1Sender};
-use aitm_core::{Config, PipelineClient, Proxy, ProxyClient, ScopeRateGuard};
+use aitm::tui::{self, Services, TuiLog};
+use aitm::wire::{assemble, Assembled};
+use aitm_core::{Config, Proxy};
 
 /// A fresh, unique directory under the system temp dir for one test's CA.
 pub fn temp_ca_dir(tag: &str) -> PathBuf {
@@ -32,25 +31,10 @@ pub fn config(tag: &str) -> Config {
 }
 
 /// `assemble`, then the service handles exactly as `main` builds them for the
-/// frontends: the registry, store and guard from the proxy, the replay client
-/// over `Http1Sender`; no browser, no log file.
+/// frontends (`tui::services`): the registry, store and guard from the proxy,
+/// the replay client over `Http1Sender`; no browser, no log file.
 pub fn assemble_services(cfg: &Config) -> (Proxy, Services) {
     let Assembled { proxy, ca: _ } = assemble(cfg).expect("assemble");
-    let registry = proxy.registry_arc();
-    let store = proxy.store();
-    let guard: Arc<dyn ScopeRateGuard> = proxy.guard();
-    let client: Arc<dyn ProxyClient> = Arc::new(PipelineClient::new(
-        store.clone(),
-        guard.clone(),
-        Arc::new(Http1Sender::new().with_insecure(cfg.ssl_insecure)),
-    ));
-    let services = Services {
-        registry,
-        store,
-        client,
-        guard,
-        browser: None,
-        log_path: None,
-    };
+    let services = tui::services(&proxy, cfg, None, TuiLog::Off);
     (proxy, services)
 }

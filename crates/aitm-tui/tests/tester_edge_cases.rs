@@ -620,16 +620,16 @@ fn app_in(mode: Mode) -> App {
         }
         Mode::Prompt(PromptKind::PocTarget) => {
             app.mode = Mode::Findings;
-            let _ = app.update(Action::Command("poc-rerun".into()));
+            let _ = app.update(Action::PocRerun);
         }
         Mode::Prompt(PromptKind::PocVars) => {
             app.mode = Mode::Findings;
-            let _ = app.update(Action::Command("poc-rerun".into()));
+            let _ = app.update(Action::PocRerun);
             let _ = app.update(Action::Submit);
         }
         Mode::Prompt(PromptKind::CaExport) => {
             let _ = app.run_command("ca");
-            let _ = app.update(Action::Command("ca-export-prompt".into()));
+            let _ = app.update(Action::CaExportPrompt);
         }
         Mode::Prompt(PromptKind::Confirm) => {
             let _ = app.run_command("ca.install");
@@ -831,10 +831,6 @@ fn run_command_survives_odd_lines_and_reports_each_problem() {
         "kill",
         "replay",
         "compose",
-        "send",
-        "poc-rerun",
-        "scope-prompt",
-        "scope-rm-selected",
         "copy",
         "auto",
         "refresh",
@@ -860,7 +856,6 @@ fn run_command_survives_odd_lines_and_reports_each_problem() {
         "split",
         "export",
         "ca",
-        "ca-export-prompt",
         "ca.install",
         "ca.install dry_run=true",
         "browser",

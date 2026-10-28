@@ -633,6 +633,15 @@ impl ActivityEntry {
     }
 }
 
+/// A JSON value as one line of text: a string as itself (no quotes),
+/// anything else as compact JSON (`null`, `3.5`, `[1,2]`, `{"a":1}`).
+pub fn value_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// `{"a":1,"b":"x"}` → `a=1 b=x`, for one-line argument summaries.
 pub fn compact_json(v: &Value) -> String {
     match v {

@@ -6,8 +6,11 @@
 //! data on every platform").
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::Read as _;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::Path;
 
 use serde_json::{json, Map, Value};
 
@@ -16,8 +19,8 @@ use crate::action::{Action, BusEvent, BusRequest, Level, ToolInfo};
 use crate::caps::TermCaps;
 use crate::filter::{self, Expr};
 use crate::model::{
-    counts_by, scope_covers, AgentPolicy, AgentState, Finding, FlowDetail, FlowKind, FlowRow,
-    Message,
+    counts_by, human_bytes, scope_covers, value_text, AgentPolicy, AgentState, Finding, FlowDetail,
+    FlowKind, FlowRow, Message,
 };
 use crate::open::{self, OpenTarget};
 use crate::theme::Theme;
@@ -35,8 +38,13 @@ pub const MAX_DETAILS: usize = 2_000;
 
 /// Tools that ask the operator for a local `y/N` before they are sent
 /// (§4.2 step 4: the bus has no `confirm` on the wire until F1, and the
-/// TUI's server identity is `Frontend::Mcp`). `dry_run=true` bypasses.
+/// TUI's server identity is `Frontend::Mcp`). A `dry_run` the tool's schema
+/// declares, given as the JSON boolean `true`, bypasses.
 pub const CONFIRM_TOOLS: &[&str] = &["ca.install", "ca.uninstall"];
+
+/// The most PoC YAML the Findings panel reads from disk for one finding
+/// (`poc_path` on a loopback bus).
+pub const MAX_POC_YAML_BYTES: u64 = 256 * 1024;
 
 /// Which screen owns the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +98,41 @@ pub enum PromptKind {
     BrowserEval,
 }
 
+impl PromptKind {
+    /// Where Esc or Enter leaves the operator: the mode the prompt was
+    /// opened from. A confirm goes back to where its call was made.
+    fn returns_to(self, app: &App) -> Mode {
+        match self {
+            PromptKind::ScopeAdd => Mode::Scope,
+            PromptKind::PocTarget | PromptKind::PocVars => Mode::Findings,
+            PromptKind::CaExport => Mode::Ca,
+            PromptKind::BrowserUrl | PromptKind::BrowserEval => Mode::Browser,
+            PromptKind::Confirm => app.confirm.as_ref().map_or(Mode::Flows, |c| c.return_to),
+            PromptKind::Palette
+            | PromptKind::Filter
+            | PromptKind::Comment
+            | PromptKind::Mark
+            | PromptKind::Pin
+            | PromptKind::PocName
+            | PromptKind::PocParam => Mode::Flows,
+        }
+    }
+}
+
+/// The last `browser.screenshot`: its header facts and the bytes `o` hands
+/// to the desktop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Screenshot {
+    /// Pixel width from the image header; 0 when the format has none we read.
+    pub width: u32,
+    /// Pixel height; 0 as above.
+    pub height: u32,
+    /// `PNG`, `JPEG`, …, or `image` when the bytes match no known magic.
+    pub format: &'static str,
+    /// The image itself.
+    pub bytes: Vec<u8>,
+}
+
 /// The browser view's state (§2.7 "Browser view", TUI column of §2.9): what
 /// the `browser.*` commands have reported so far. Plain data; `App::on_bus`
 /// fills it and `ui::browser` draws it.
@@ -107,10 +150,8 @@ pub struct BrowserState {
     pub dom_outline: Vec<String>,
     /// The outline line ↑↓ is on.
     pub dom_cursor: usize,
-    /// `(width, height, format, bytes)` of the last screenshot.
-    pub screenshot: Option<(u32, u32, &'static str, usize)>,
-    /// The screenshot itself, for `o`.
-    pub screenshot_png: Option<Vec<u8>>,
+    /// The last screenshot, for the placeholder line and `o`.
+    pub screenshot: Option<Screenshot>,
     /// The last `browser.eval` result as text.
     pub last_eval: Option<String>,
     /// What the panel says is in flight; cleared when `inflight` reaches 0.
@@ -953,7 +994,9 @@ impl App {
 
     fn group_key(&self, row: &FlowRow) -> Option<String> {
         match self.group_by()? {
-            GroupBy::Host => Some(row.host().to_string()),
+            // A WebSocket row whose handshake is not listed has no host:
+            // it is not a group of its own.
+            GroupBy::Host => (!row.host().is_empty()).then(|| row.host().to_string()),
             GroupBy::Client => Some(row.client.clone().unwrap_or_else(|| "unknown".into())),
         }
     }
@@ -1029,19 +1072,31 @@ impl App {
         })
     }
 
+    /// Hosts seen, with their flow counts; a row with no host (a WebSocket
+    /// whose handshake is not listed) is not a domain.
     pub fn domains(&self) -> Vec<(String, usize)> {
-        counts_by(&self.flows, |r| Some(r.host().to_string()))
+        counts_by(&self.flows, |r| {
+            (!r.host().is_empty()).then(|| r.host().to_string())
+        })
     }
 
     pub fn in_scope_count(&self) -> usize {
         self.flows.iter().filter(|r| self.in_scope(r)).count()
     }
 
-    pub fn total_bytes(&self) -> u64 {
-        self.flows
-            .iter()
-            .map(|r| r.req_size.unwrap_or(0) + r.resp_size.unwrap_or(0))
-            .sum()
+    /// Bytes captured across the list, once at least one row knows a size
+    /// (sizes come with `flow.detail`, F5); `None` until then, which the
+    /// status bar draws as a dash — a real `0 B` is `Some(0)` (§2.8).
+    pub fn total_bytes(&self) -> Option<u64> {
+        let mut known = false;
+        let mut total = 0u64;
+        for r in &self.flows {
+            for size in [r.req_size, r.resp_size].into_iter().flatten() {
+                known = true;
+                total = total.saturating_add(size);
+            }
+        }
+        known.then_some(total)
     }
 
     pub fn toast(&mut self, level: Level, text: impl Into<String>) {
@@ -1304,7 +1359,7 @@ impl App {
                     }
                     None => {
                         self.toast(Level::Warn, "Raw edit needs the request detail (core follow-up F5); headers-only edit via :flow.mutate");
-                        out.push(BusRequest::Detail(r.id));
+                        self.request_detail(&r.id, &mut out);
                     }
                 }
             }
@@ -1488,21 +1543,72 @@ impl App {
                     }
                 }
             }
+            // The browser view's keys (`keys::browser`): prompts open only
+            // when the bus can take the call; the panel says so otherwise.
+            Action::BrowserNavigatePrompt => {
+                if self.has_tool("browser.navigate") {
+                    self.open_prompt(PromptKind::BrowserUrl);
+                    self.prompt = self.browser.url.clone();
+                } else {
+                    self.browser_missing("browser.navigate");
+                }
+            }
+            Action::BrowserEvalPrompt => {
+                if self.has_tool("browser.eval") {
+                    self.open_prompt(PromptKind::BrowserEval);
+                } else {
+                    self.browser_missing("browser.eval");
+                }
+            }
+            Action::BrowserRefreshDom => {
+                self.browser_call("browser.get_dom", json!({}), &mut out);
+            }
+            Action::BrowserScreenshot => {
+                self.browser_call("browser.screenshot", json!({}), &mut out);
+            }
+            Action::CaExportPrompt => {
+                if self.has_tool("ca.export") {
+                    self.open_prompt(PromptKind::CaExport);
+                } else {
+                    self.toast(Level::Warn, "ca.export is not on this bus");
+                }
+            }
+            Action::PocRerun => {
+                if let Some(f) = self.findings.get(self.finding_cursor) {
+                    self.poc_run_pending = Some((f.poc_path.clone(), None));
+                    self.open_prompt(PromptKind::PocTarget);
+                }
+            }
+            Action::ScopeAddPrompt => self.open_prompt(PromptKind::ScopeAdd),
+            Action::ScopeRemoveSelected => {
+                if let Some(h) = self.scope.get(self.scope_cursor).cloned() {
+                    out.extend(self.run_command(&format!("scope rm {h}")));
+                }
+            }
+            Action::ComposeSend => {
+                if self.mode == Mode::Compose {
+                    self.compose.field = 3;
+                    out.extend(self.submit());
+                }
+            }
         }
         out
     }
 
     fn gate(&mut self, r: &FlowRow) -> bool {
         if self.in_scope(r) {
-            true
-        } else {
-            let host = r.host().to_string();
-            self.toast(
-                Level::Warn,
-                format!("Out of scope — add `{host}` to scope to act"),
-            );
-            false
+            return true;
         }
+        let host = r.host().to_string();
+        let msg = if host.is_empty() {
+            // Only a WebSocket row can lack a host: its summary carries the
+            // handshake id alone, and that flow is not in the list.
+            "Out of scope — unknown host (the WebSocket handshake is not listed)".to_string()
+        } else {
+            format!("Out of scope — add `{host}` to scope to act")
+        };
+        self.toast(Level::Warn, msg);
+        false
     }
 
     /// `o`: hand the thing under the cursor to the desktop (§2.9). In the
@@ -1511,19 +1617,21 @@ impl App {
     /// show inline is not opened, and the toast says so.
     fn open_externally(&mut self) {
         if self.mode == Mode::Browser {
-            match &self.browser.screenshot_png {
-                Some(png) => match open::body_to_temp_file("browser-screenshot", "png", png) {
-                    Ok(path) => {
-                        self.toast(Level::Info, "opening the screenshot");
-                        self.pending_open = Some(OpenTarget {
-                            path,
-                            label: "screenshot".into(),
-                        });
+            match &self.browser.screenshot {
+                Some(shot) => {
+                    match open::body_to_temp_file("browser-screenshot", "png", &shot.bytes) {
+                        Ok(path) => {
+                            self.toast(Level::Info, "opening the screenshot");
+                            self.pending_open = Some(OpenTarget {
+                                path,
+                                label: "screenshot".into(),
+                            });
+                        }
+                        Err(e) => {
+                            self.toast(Level::Error, format!("could not write the screenshot: {e}"))
+                        }
                     }
-                    Err(e) => {
-                        self.toast(Level::Error, format!("could not write the screenshot: {e}"))
-                    }
-                },
+                }
                 None => self.toast(Level::Info, "no screenshot yet — s captures one"),
             }
             return;
@@ -1532,14 +1640,22 @@ impl App {
             let Some(f) = self.findings.get(self.finding_cursor) else {
                 return;
             };
-            match &f.screenshot_path {
-                Some(p) => {
-                    let path = PathBuf::from(p);
-                    self.toast(Level::Info, format!("opening screenshot {p}"));
+            // The path is the bus's word; resolve it before the desktop
+            // sees it, and open nothing when it does not resolve (SEC-2).
+            match f.screenshot_path.as_deref().map(std::fs::canonicalize) {
+                Some(Ok(path)) => {
+                    self.toast(
+                        Level::Info,
+                        format!("opening screenshot {}", path.display()),
+                    );
                     self.pending_open = Some(OpenTarget {
                         path,
                         label: "screenshot".into(),
                     });
+                }
+                Some(Err(e)) => {
+                    let p = f.screenshot_path.clone().unwrap_or_default();
+                    self.toast(Level::Warn, format!("open: {p}: {e}"));
                 }
                 None => self.toast(Level::Info, "this finding has no screenshot to open"),
             }
@@ -1610,13 +1726,16 @@ impl App {
     /// Hold `name(args)` for a `y/N` when it is in [`CONFIRM_TOOLS`] (and not
     /// a dry run); otherwise send it.
     fn call_tool(&mut self, name: &str, args: Value) -> Vec<BusRequest> {
-        // `dry_run=true` typed at the prompt is a string unless the schema
-        // types it; both spellings bypass.
-        let dry_run = match args.get("dry_run") {
-            Some(Value::Bool(b)) => *b,
-            Some(Value::String(s)) => s.eq_ignore_ascii_case("true"),
-            _ => false,
-        };
+        // A dry run bypasses the prompt only when the tool's schema declares
+        // `dry_run` and the value is the JSON boolean `true` (SEC-4): a
+        // string typed at the prompt against a schema without the parameter
+        // would be pruned by the bus task and the real call would run.
+        let declares_dry_run = self
+            .tools
+            .iter()
+            .find(|t| t.name == name)
+            .is_some_and(|t| t.params().iter().any(|p| p.name == "dry_run"));
+        let dry_run = declares_dry_run && args.get("dry_run") == Some(&Value::Bool(true));
         if CONFIRM_TOOLS.contains(&name) && !dry_run {
             let description = self
                 .tools
@@ -1659,13 +1778,18 @@ impl App {
     /// panel says so (not only a toast) and nothing is sent.
     fn browser_call(&mut self, name: &str, args: Value, out: &mut Vec<BusRequest>) -> bool {
         if !self.has_tool(name) {
-            let msg = format!("{name} is not on this bus");
-            self.browser.error = Some(msg.clone());
-            self.toast(Level::Warn, msg);
+            self.browser_missing(name);
             return false;
         }
         out.extend(self.call_tool(name, args));
         true
+    }
+
+    /// The bus does not offer `name`: say so in the panel and the status line.
+    fn browser_missing(&mut self, name: &str) {
+        let msg = format!("{name} is not on this bus");
+        self.browser.error = Some(msg.clone());
+        self.toast(Level::Warn, msg);
     }
 
     /// The name `browser.eval` gives its expression parameter, read from the
@@ -1679,9 +1803,9 @@ impl App {
             .unwrap_or_default();
         params
             .iter()
-            .find(|p| p.2)
+            .find(|p| p.required)
             .or(params.first())
-            .map_or_else(|| "expr".to_string(), |p| p.0.clone())
+            .map_or_else(|| "expr".to_string(), |p| p.name.clone())
     }
 
     /// A `browser.*` call was answered or failed: one fewer in flight.
@@ -1690,6 +1814,13 @@ impl App {
         if self.browser.inflight == 0 {
             self.browser.busy = None;
         }
+    }
+
+    /// The bus went away (or came back): no call sent before now will be
+    /// answered, so the view stops waiting for them.
+    fn browser_forget_inflight(&mut self) {
+        self.browser.inflight = 0;
+        self.browser.busy = None;
     }
 
     /// The operator answered the confirm prompt.
@@ -1717,31 +1848,18 @@ impl App {
                 self.edit = None;
                 Mode::Inspector
             }
-            Mode::Prompt(PromptKind::Filter) => {
-                self.prompt.clear();
-                Mode::Flows
-            }
             Mode::Prompt(PromptKind::Confirm) => {
                 let _ = self.answer_confirm(false);
                 return;
             }
-            Mode::Prompt(PromptKind::CaExport) => {
-                self.prompt.clear();
-                Mode::Ca
-            }
-            Mode::Prompt(PromptKind::BrowserUrl | PromptKind::BrowserEval) => {
-                self.prompt.clear();
-                Mode::Browser
-            }
-            Mode::Prompt(PromptKind::PocTarget | PromptKind::PocVars) => {
-                self.prompt.clear();
-                self.poc_run_pending = None;
-                Mode::Findings
-            }
-            Mode::Prompt(_) => {
-                self.prompt.clear();
-                self.poc_pending = None;
-                Mode::Flows
+            Mode::Prompt(kind) => {
+                match kind {
+                    PromptKind::PocName | PromptKind::PocParam => self.poc_pending = None,
+                    PromptKind::PocTarget | PromptKind::PocVars => self.poc_run_pending = None,
+                    _ => {}
+                }
+                self.close_prompt();
+                return;
             }
             Mode::Flows => {
                 if self.filter.is_some() {
@@ -1760,6 +1878,14 @@ impl App {
         self.prompt.clear();
         self.palette_cursor = 0;
         self.mode = Mode::Prompt(kind);
+    }
+
+    /// Leave the open prompt for the mode it was opened from, line cleared.
+    fn close_prompt(&mut self) {
+        self.prompt.clear();
+        if let Mode::Prompt(kind) = self.mode {
+            self.mode = kind.returns_to(self);
+        }
     }
 
     fn input(&mut self, c: char) {
@@ -1800,14 +1926,16 @@ impl App {
                         ..
                     }) => {
                         self.selected = Some(id);
-                        self.mode = Mode::Flows;
+                        self.close_prompt();
                     }
                     Some(PaletteItem {
                         kind: PaletteKind::Tool(name),
                         ..
                     }) if !text.contains(' ') => {
                         let t = self.tools.iter().find(|t| t.name == name).cloned();
-                        let needs = t.map(|t| t.params().iter().any(|p| p.2)).unwrap_or(false);
+                        let needs = t
+                            .map(|t| t.params().iter().any(|p| p.required))
+                            .unwrap_or(false);
                         if needs {
                             self.prompt = format!("{name} ");
                             self.toast(
@@ -1816,7 +1944,7 @@ impl App {
                             );
                             return out;
                         }
-                        self.mode = Mode::Flows;
+                        self.close_prompt();
                         out.extend(self.call_tool(&name, json!({})));
                     }
                     Some(PaletteItem {
@@ -1826,55 +1954,52 @@ impl App {
                         && !text.is_empty()
                         && cmd.split(' ').count() == 1 =>
                     {
-                        self.mode = Mode::Flows;
+                        self.close_prompt();
                         out.extend(self.run_command(&cmd));
                     }
                     _ => {
-                        self.mode = Mode::Flows;
+                        self.close_prompt();
                         out.extend(self.run_command(&text));
                     }
                 }
-                self.prompt.clear();
             }
-            Mode::Prompt(PromptKind::Filter) => {
-                match filter::parse(&text) {
-                    Ok(expr) => {
-                        self.filter = expr;
-                        self.filter_text = text;
-                        self.mode = Mode::Flows;
-                    }
-                    Err(e) => self.toast(Level::Error, format!("filter: {e}")),
+            Mode::Prompt(PromptKind::Filter) => match filter::parse(&text) {
+                Ok(expr) => {
+                    self.filter = expr;
+                    self.filter_text = text;
+                    self.close_prompt();
                 }
-                self.prompt.clear();
-            }
+                // The prompt stays open on a bad expression; the line is
+                // cleared so the next attempt starts fresh.
+                Err(e) => {
+                    self.toast(Level::Error, format!("filter: {e}"));
+                    self.prompt.clear();
+                }
+            },
             Mode::Prompt(PromptKind::Comment) => {
                 if let Some(id) = self.selected.clone() {
                     out.push(BusRequest::Comment { id, text });
                 }
-                self.mode = Mode::Flows;
-                self.prompt.clear();
+                self.close_prompt();
             }
             Mode::Prompt(PromptKind::Mark) => {
                 if let Some(id) = self.selected.clone() {
                     let marks = text.split_whitespace().map(str::to_string).collect();
                     out.push(BusRequest::Mark { id, marks });
                 }
-                self.mode = Mode::Flows;
-                self.prompt.clear();
+                self.close_prompt();
             }
             Mode::Prompt(PromptKind::Pin) => {
                 if !text.is_empty() && !self.pinned_hosts.contains(&text) {
                     self.pinned_hosts.push(text);
                 }
-                self.mode = Mode::Flows;
-                self.prompt.clear();
+                self.close_prompt();
             }
             Mode::Prompt(PromptKind::ScopeAdd) => {
                 if !text.is_empty() {
                     out.push(BusRequest::ScopeAdd(text));
                 }
-                self.mode = Mode::Scope;
-                self.prompt.clear();
+                self.close_prompt();
             }
             // `poc.build`: name, then param (§2.7 "Build PoC from flow … name, parameter").
             Mode::Prompt(PromptKind::PocName) => match self.poc_pending.take() {
@@ -1882,7 +2007,7 @@ impl App {
                     self.poc_pending = Some((id, (!text.is_empty()).then_some(text)));
                     self.open_prompt(PromptKind::PocParam);
                 }
-                None => self.mode = Mode::Flows,
+                None => self.close_prompt(),
             },
             Mode::Prompt(PromptKind::PocParam) => {
                 if let Some((id, name)) = self.poc_pending.take() {
@@ -1892,8 +2017,7 @@ impl App {
                         param: (!text.is_empty()).then_some(text),
                     });
                 }
-                self.mode = Mode::Flows;
-                self.prompt.clear();
+                self.close_prompt();
             }
             // `poc.run`: target, then vars (§2.7 "Run again … editable target/vars").
             Mode::Prompt(PromptKind::PocTarget) => match self.poc_run_pending.take() {
@@ -1901,12 +2025,11 @@ impl App {
                     self.poc_run_pending = Some((path, (!text.is_empty()).then_some(text)));
                     self.open_prompt(PromptKind::PocVars);
                 }
-                None => self.mode = Mode::Findings,
+                None => self.close_prompt(),
             },
             Mode::Prompt(PromptKind::PocVars) => {
                 let Some((poc_path, target)) = self.poc_run_pending.take() else {
-                    self.mode = Mode::Findings;
-                    self.prompt.clear();
+                    self.close_prompt();
                     return out;
                 };
                 match parse_kv_args(&text, None) {
@@ -1927,8 +2050,7 @@ impl App {
                         return out;
                     }
                 }
-                self.mode = Mode::Findings;
-                self.prompt.clear();
+                self.close_prompt();
             }
             Mode::Prompt(PromptKind::CaExport) => {
                 let mut args = Map::new();
@@ -1945,24 +2067,20 @@ impl App {
                 if let Some(path) = words.next() {
                     args.insert("out".into(), Value::String(path.to_string()));
                 }
-                self.mode = Mode::Ca;
-                self.prompt.clear();
+                self.close_prompt();
                 out.extend(self.call_tool("ca.export", Value::Object(args)));
             }
-            Mode::Prompt(PromptKind::Confirm) => {
-                let yes = matches!(text.to_ascii_lowercase().as_str(), "y" | "yes");
-                out.extend(self.answer_confirm(yes));
-            }
+            // The confirm answers on its first key (`Action::Input` in
+            // `update`), so Enter only ever arrives on a blank line: a "no".
+            Mode::Prompt(PromptKind::Confirm) => out.extend(self.answer_confirm(false)),
             Mode::Prompt(PromptKind::BrowserUrl) => {
-                self.mode = Mode::Browser;
-                self.prompt.clear();
+                self.close_prompt();
                 if !text.is_empty() {
                     self.browser_call("browser.navigate", json!({ "url": text }), &mut out);
                 }
             }
             Mode::Prompt(PromptKind::BrowserEval) => {
-                self.mode = Mode::Browser;
-                self.prompt.clear();
+                self.close_prompt();
                 if !text.is_empty() {
                     let key = self.browser_eval_param();
                     self.browser_call("browser.eval", json!({ key: text }), &mut out);
@@ -2160,12 +2278,48 @@ impl App {
     }
 
     fn ensure_detail(&mut self, out: &mut Vec<BusRequest>) {
-        if let Some(id) = &self.selected {
-            if !self.details.contains_key(id)
-                && !self.detail_failed.contains(id)
-                && self.has_tool("flow.detail")
-            {
-                out.push(BusRequest::Detail(id.clone()));
+        if let Some(id) = self.selected.clone() {
+            self.request_detail(&id, out);
+        }
+    }
+
+    /// Ask the bus for `id`'s detail when it can answer (`flow.detail`, F5)
+    /// and the app neither has it nor has given up on it.
+    fn request_detail(&mut self, id: &str, out: &mut Vec<BusRequest>) {
+        if self.has_tool("flow.detail")
+            && !self.details.contains_key(id)
+            && !self.detail_failed.contains(id)
+        {
+            out.push(BusRequest::Detail(id.to_string()));
+        }
+    }
+
+    /// The core's `flow.get` summary of a WebSocket flow carries no
+    /// authority, scheme or path — only the id of its 101 handshake flow
+    /// (`capture.rs` `summarize`). When that flow is listed, the row takes
+    /// its URL from it: `https` → `wss`, `http` → `ws`. Until then (or when
+    /// the handshake was evicted) the authority stays empty and the row is
+    /// out of scope.
+    fn resolve_websocket_urls(&mut self) {
+        let fixes: Vec<(usize, String, String, String)> = self
+            .flows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.kind == FlowKind::WebSocket && r.authority.is_empty())
+            .filter_map(|(i, r)| {
+                let h = self.row(r.handshake.as_deref()?)?;
+                if h.authority.is_empty() {
+                    return None;
+                }
+                let scheme = if h.scheme == "http" { "ws" } else { "wss" };
+                Some((i, h.authority.clone(), h.path.clone(), scheme.to_string()))
+            })
+            .collect();
+        for (i, authority, path, scheme) in fixes {
+            if let Some(r) = self.flows.get_mut(i) {
+                r.authority = authority;
+                r.path = path;
+                r.scheme = scheme;
             }
         }
     }
@@ -2194,8 +2348,10 @@ impl App {
 
     /// Read the YAML of findings that came without one from `poc_path`, which
     /// only names a file on this machine when the bus is local (§2.7 "PoC
-    /// panel … the YAML").
-    fn fill_finding_yaml(&mut self) {
+    /// panel … the YAML"). What an earlier pass read (or failed to read) for
+    /// the same `poc_path` is carried over from `previous`, so a `poc.list`
+    /// poll does not touch every file again.
+    fn fill_finding_yaml(&mut self, previous: &[Finding]) {
         if !self.is_loopback_bus() {
             return;
         }
@@ -2203,9 +2359,17 @@ impl App {
             if f.yaml.is_some() || f.yaml_error.is_some() {
                 continue;
             }
-            match std::fs::read_to_string(&f.poc_path) {
+            if let Some(p) = previous
+                .iter()
+                .find(|p| p.poc_path == f.poc_path && (p.yaml.is_some() || p.yaml_error.is_some()))
+            {
+                f.yaml = p.yaml.clone();
+                f.yaml_error = p.yaml_error.clone();
+                continue;
+            }
+            match read_poc_yaml(&f.poc_path) {
                 Ok(y) => f.yaml = Some(y),
-                Err(e) => f.yaml_error = Some(e.to_string()),
+                Err(e) => f.yaml_error = Some(e),
             }
         }
     }
@@ -2315,37 +2479,7 @@ impl App {
                     });
                 }
             }
-            "ca-export-prompt" => {
-                if self.has_tool("ca.export") {
-                    self.open_prompt(PromptKind::CaExport);
-                } else {
-                    self.toast(Level::Warn, "ca.export is not on this bus");
-                }
-            }
             "browser" => out.extend(self.update(Action::OpenBrowser)),
-            // The browser view's keys (`keys::browser`): prompts open only
-            // when the bus can take the call; the panel says so otherwise.
-            "browser-url-prompt" => {
-                if self.has_tool("browser.navigate") {
-                    self.open_prompt(PromptKind::BrowserUrl);
-                    self.prompt = self.browser.url.clone();
-                } else {
-                    self.browser_call("browser.navigate", Value::Null, &mut out);
-                }
-            }
-            "browser-eval-prompt" => {
-                if self.has_tool("browser.eval") {
-                    self.open_prompt(PromptKind::BrowserEval);
-                } else {
-                    self.browser_call("browser.eval", Value::Null, &mut out);
-                }
-            }
-            "browser-dom" => {
-                self.browser_call("browser.get_dom", json!({}), &mut out);
-            }
-            "browser-screenshot" => {
-                self.browser_call("browser.screenshot", json!({}), &mut out);
-            }
             "curl" => match ComposeForm::from_curl(line) {
                 Some(f) => {
                     self.compose = f;
@@ -2397,24 +2531,6 @@ impl App {
                     self.mode = Mode::Findings;
                 }
             }
-            "send" => {
-                if self.mode == Mode::Compose {
-                    self.compose.field = 3;
-                    out.extend(self.submit());
-                }
-            }
-            "poc-rerun" => {
-                if let Some(f) = self.findings.get(self.finding_cursor) {
-                    self.poc_run_pending = Some((f.poc_path.clone(), None));
-                    self.open_prompt(PromptKind::PocTarget);
-                }
-            }
-            "scope-prompt" => self.open_prompt(PromptKind::ScopeAdd),
-            "scope-rm-selected" => {
-                if let Some(h) = self.scope.get(self.scope_cursor).cloned() {
-                    out.extend(self.run_command(&format!("scope rm {h}")));
-                }
-            }
             "copy" => out.extend(self.update(Action::CopyUrl)),
             "auto" | "autoselect" => out.extend(self.update(Action::ToggleAutoSelect)),
             "refresh" => out.push(BusRequest::Refresh),
@@ -2424,6 +2540,13 @@ impl App {
                     Err(e) => self.toast(Level::Error, format!("{tool}: {e}")),
                 }
             }
+            // The CA panel's `i`/`u` run these by name; without the CA
+            // plugin the bus has no `ca.*` and the answer names that, not
+            // "unknown command".
+            tool if tool.starts_with("ca.") => self.toast(
+                Level::Warn,
+                format!("{tool} is not on this bus (needs the CA plugin)"),
+            ),
             other => self.toast(
                 Level::Error,
                 format!("unknown command `{other}` (try :help)"),
@@ -2451,15 +2574,18 @@ impl App {
                 if listening.is_some() {
                     self.listening = listening;
                 }
+                // A (re)connect is a new session: nothing sent before it
+                // will be answered.
+                self.browser_forget_inflight();
                 out.push(BusRequest::Refresh);
             }
             BusEvent::Disconnected(why) => {
                 self.bus = BusStatus::Disconnected(why.clone());
+                self.browser_forget_inflight();
                 self.toast(Level::Error, format!("bus: {why}"));
             }
             BusEvent::Flows(summaries) => {
                 let had = self.flows.len();
-                let can_detail = self.has_tool("flow.detail");
                 let mut seen: HashSet<String> = HashSet::with_capacity(summaries.len());
                 for s in &summaries {
                     let Some(id) = s.get("id").and_then(Value::as_str) else {
@@ -2475,19 +2601,15 @@ impl App {
                             existing.intercept = fresh.intercept;
                             existing.is_replay |= fresh.is_replay;
                             existing.ws_messages = fresh.ws_messages.or(existing.ws_messages);
-                            if changed
-                                && self.details.remove(id).is_some()
-                                && can_detail
-                                && !self.detail_failed.contains(id)
-                            {
-                                out.push(BusRequest::Detail(id.to_string()));
+                            // A state change makes the detail stale: drop it
+                            // and ask again (when the bus can answer).
+                            if changed && self.details.remove(id).is_some() {
+                                self.request_detail(id, &mut out);
                             }
                         }
                     } else if let Some(row) = FlowRow::from_summary(s, self.next_seq) {
                         self.next_seq += 1;
-                        if can_detail && !self.detail_failed.contains(&row.id) {
-                            out.push(BusRequest::Detail(row.id.clone()));
-                        }
+                        self.request_detail(&row.id, &mut out);
                         self.index.insert(row.id.clone(), self.flows.len());
                         self.flows.push(row);
                     }
@@ -2497,6 +2619,7 @@ impl App {
                 if self.flows.len() != before {
                     self.rebuild_index();
                 }
+                self.resolve_websocket_urls();
                 self.prune_details(&seen);
                 self.detail_failed.retain(|id| seen.contains(id));
                 if self
@@ -2529,11 +2652,11 @@ impl App {
             BusEvent::Intercept(armed) => self.intercept_armed = armed,
             BusEvent::Scope(entries) => self.scope = entries,
             BusEvent::Findings(f) => {
-                self.findings = f;
+                let previous = std::mem::replace(&mut self.findings, f);
                 self.finding_cursor = self
                     .finding_cursor
                     .min(self.findings.len().saturating_sub(1));
-                self.fill_finding_yaml();
+                self.fill_finding_yaml(&previous);
             }
             BusEvent::Agent(a) => self.agent = a,
             BusEvent::CallOk { name, value } => {
@@ -2559,7 +2682,7 @@ impl App {
                             self.toast(Level::Info, format!("PoC {verdict}: {}", f.title));
                             self.findings.insert(0, f);
                             self.finding_cursor = 0;
-                            self.fill_finding_yaml();
+                            self.fill_finding_yaml(&[]);
                         }
                     }
                     "ca.status" => {
@@ -2572,9 +2695,8 @@ impl App {
                     ),
                     "ca.install" | "ca.uninstall" => {
                         let text = match &value {
-                            Value::String(s) => s.clone(),
-                            Value::Null => "ok".into(),
-                            other => other.to_string(),
+                            Value::Null => "ok".to_string(),
+                            other => value_text(other),
                         };
                         self.toast(Level::Info, format!("{name}: {text}"));
                         if self.has_tool("ca.status") {
@@ -2606,9 +2728,8 @@ impl App {
                     }
                     _ => {
                         let text = match &value {
-                            Value::String(s) => s.clone(),
-                            Value::Null => "ok".into(),
-                            other => other.to_string(),
+                            Value::Null => "ok".to_string(),
+                            other => value_text(other),
                         };
                         let shown: String = text.chars().take(160).collect();
                         self.toast(Level::Info, format!("{name}: {shown}"));
@@ -2616,21 +2737,16 @@ impl App {
                 }
                 out.push(BusRequest::Refresh);
             }
-            BusEvent::Toast(level, text) => {
-                // The bus task reports a failed call as an error toast with
-                // the tool's message, and a tool it lacks as a warning
-                // naming it. While a `browser.*` call is in flight those are
-                // its answer, and the panel must show them (§2.10(c)), not
-                // only the status line.
-                let browser_failure = self.browser.inflight > 0
-                    && (level == Level::Error
-                        || (level == Level::Warn && text.starts_with("browser.")));
-                if browser_failure {
+            BusEvent::CallFailed { name, message } => {
+                // A failed `browser.*` call is the view's answer: the panel
+                // must show it (§2.10(c)), not only the status line.
+                if name.starts_with("browser.") {
                     self.browser_settled();
-                    self.browser.error = Some(text.clone());
+                    self.browser.error = Some(message.clone());
                 }
-                self.toast(level, text);
+                self.toast(Level::Error, message);
             }
+            BusEvent::Toast(level, text) => self.toast(level, text),
             // An F4 push: whatever it says, the list is stale; poll now.
             BusEvent::Notification(_) => out.push(BusRequest::Refresh),
         }
@@ -2671,10 +2787,7 @@ impl App {
                 }
             }
             "browser.get_dom" => {
-                let html = match value {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
+                let html = value_text(value);
                 self.browser.dom_outline = crate::ui::browser::outline(&html);
                 self.browser.dom_cursor = self
                     .browser
@@ -2684,28 +2797,55 @@ impl App {
             }
             "browser.screenshot" => match value.as_str().and_then(crate::base64::decode) {
                 Some(bytes) if !bytes.is_empty() => {
-                    let n = bytes.len();
-                    self.browser.screenshot = Some(
-                        crate::viewers::image::dimensions(&bytes)
-                            .map_or((0, 0, "image", n), |(w, h, f)| (w, h, f, n)),
-                    );
-                    self.browser.screenshot_png = Some(bytes);
+                    let (width, height, format) =
+                        crate::viewers::image::dimensions(&bytes).unwrap_or((0, 0, "image"));
+                    self.browser.screenshot = Some(Screenshot {
+                        width,
+                        height,
+                        format,
+                        bytes,
+                    });
                 }
                 _ => {
                     self.browser.error =
                         Some("browser.screenshot: the result is not image bytes".into());
                 }
             },
-            "browser.eval" => {
-                self.browser.last_eval = Some(match value {
-                    Value::String(s) => s.clone(),
-                    Value::Null => "null".into(),
-                    other => other.to_string(),
-                });
-            }
+            "browser.eval" => self.browser.last_eval = Some(value_text(value)),
             _ => self.toast(Level::Info, format!("{name}: ok")),
         }
     }
+}
+
+/// A finding's YAML from `poc_path`, when that is a regular `.yaml`/`.yml`
+/// file of at most [`MAX_POC_YAML_BYTES`] (the path is the bus's word, read
+/// only on a loopback bus); `Err` is the reason the panel shows.
+fn read_poc_yaml(path: &str) -> Result<String, String> {
+    let p = Path::new(path);
+    let is_yaml = p
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|e| e.eq_ignore_ascii_case("yaml") || e.eq_ignore_ascii_case("yml"));
+    if !is_yaml {
+        return Err("not a .yaml/.yml file".to_string());
+    }
+    let meta = std::fs::metadata(p).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    if meta.len() > MAX_POC_YAML_BYTES {
+        return Err(format!(
+            "{} is over the 256 KiB cap",
+            human_bytes(meta.len())
+        ));
+    }
+    let mut text = String::new();
+    File::open(p)
+        .map_err(|e| e.to_string())?
+        .take(MAX_POC_YAML_BYTES)
+        .read_to_string(&mut text)
+        .map_err(|e| e.to_string())?;
+    Ok(text)
 }
 
 /// Built-in `:` commands shown in the palette.
@@ -2818,12 +2958,7 @@ fn byte_at(s: &str, col: usize) -> usize {
 pub fn parse_kv_args(rest: &str, tool: Option<&ToolInfo>) -> Result<Value, String> {
     let mut args = Map::new();
     let types: HashMap<String, String> = tool
-        .map(|t| {
-            t.params()
-                .into_iter()
-                .map(|(n, ty, _, _)| (n, ty))
-                .collect()
-        })
+        .map(|t| t.params().into_iter().map(|p| (p.name, p.ty)).collect())
         .unwrap_or_default();
     for word in shell_words(rest) {
         let (k, v) = word
@@ -2838,9 +2973,9 @@ pub fn parse_kv_args(rest: &str, tool: Option<&ToolInfo>) -> Result<Value, Strin
         args.insert(k.to_string(), coerced);
     }
     if let Some(t) = tool {
-        for (name, _, required, _) in t.params() {
-            if required && !args.contains_key(&name) {
-                return Err(format!("missing required `{name}`"));
+        for p in t.params() {
+            if p.required && !args.contains_key(&p.name) {
+                return Err(format!("missing required `{}`", p.name));
             }
         }
     }
@@ -3243,18 +3378,16 @@ mod tests {
             app.current_toast().map(|t| t.text.as_str()),
             Some("ca.install cancelled")
         );
-        // Enter on the empty prompt is "N"; typing `yes` then Enter is yes.
+        // Enter only ever arrives on a blank line (the first typed key
+        // answers), and a blank line is "N".
         assert!(app.run_command("ca.install").is_empty());
         assert!(app.update(Action::Submit).is_empty());
         assert_eq!(app.mode, Mode::Flows);
-        // `dry_run=true` bypasses the prompt.
-        assert_eq!(
-            app.run_command("ca.install dry_run=true"),
-            vec![BusRequest::Call {
-                name: "ca.install".into(),
-                args: json!({"dry_run": "true"})
-            }]
-        );
+        // `dry_run=true` does not bypass the prompt while the tool's schema
+        // declares no `dry_run` (SEC-4): the bus task would prune it.
+        assert!(app.run_command("ca.install dry_run=true").is_empty());
+        assert_eq!(app.mode, Mode::Prompt(PromptKind::Confirm));
+        let _ = app.update(Action::Back);
         assert_eq!(app.mode, Mode::Flows);
         // From the CA panel the answer returns to the panel.
         let _ = app.run_command("ca");
@@ -3297,7 +3430,7 @@ mod tests {
             "a status reply is not a mutation: no refresh"
         );
         assert_eq!(app.ca_status.as_ref().unwrap()["fingerprint"], "AB:CD");
-        let _ = app.update(Action::Command("ca-export-prompt".into()));
+        let _ = app.update(Action::CaExportPrompt);
         assert_eq!(app.mode, Mode::Prompt(PromptKind::CaExport));
         for c in "der /tmp/out.der".chars() {
             let _ = app.update(Action::Input(c));
@@ -3310,7 +3443,7 @@ mod tests {
             }]
         );
         assert_eq!(app.mode, Mode::Ca);
-        let _ = app.update(Action::Command("ca-export-prompt".into()));
+        let _ = app.update(Action::CaExportPrompt);
         assert_eq!(
             app.update(Action::Submit),
             vec![BusRequest::Call {
@@ -3452,14 +3585,21 @@ mod tests {
     #[test]
     fn open_externally_targets_screenshots_images_and_large_bodies() {
         let mut app = crate::fixture_app(200, 50);
-        // Findings: the screenshot path as is.
+        // Findings: the screenshot path is resolved first (SEC-2); the
+        // fixture's relative path does not exist here, so nothing opens.
         let _ = app.update(Action::OpenFindings);
         app.finding_cursor = 0;
         let _ = app.update(Action::OpenExternally);
-        let t = app.take_open_target().expect("screenshot target");
-        assert_eq!(t.path, PathBuf::from("pocs/reflected-xss-search.png"));
-        assert_eq!(t.label, "screenshot");
-        assert!(app.take_open_target().is_none(), "taken once");
+        assert!(
+            app.take_open_target().is_none(),
+            "an unresolved path opens nothing"
+        );
+        assert!(
+            app.current_toast()
+                .is_some_and(|t| t.text.starts_with("open: pocs/reflected-xss-search.png: ")),
+            "{:?}",
+            app.current_toast()
+        );
         let _ = app.update(Action::Down);
         let _ = app.update(Action::OpenExternally);
         assert!(app.take_open_target().is_none());
@@ -3506,6 +3646,7 @@ mod tests {
             .unwrap()
             .text
             .ends_with("aitm-tui-img.png — opening"));
+        assert!(app.take_open_target().is_none(), "taken once");
         let _ = std::fs::remove_file(&t.path);
         // The request pane of the same flow has no body to open.
         app.inspector.pane = Pane::Request;
@@ -3588,7 +3729,7 @@ mod tests {
         app.findings =
             vec![Finding::from_json(&json!({"poc_path": "pocs/x.yaml", "passed": true})).unwrap()];
         app.mode = Mode::Findings;
-        let _ = app.update(Action::Command("poc-rerun".into()));
+        let _ = app.update(Action::PocRerun);
         assert_eq!(app.mode, Mode::Prompt(PromptKind::PocTarget));
         for c in "https://t.test".chars() {
             let _ = app.update(Action::Input(c));
@@ -3608,7 +3749,7 @@ mod tests {
         );
         assert_eq!(app.mode, Mode::Findings);
         // Blank target and vars.
-        let _ = app.update(Action::Command("poc-rerun".into()));
+        let _ = app.update(Action::PocRerun);
         let _ = app.update(Action::Submit);
         assert_eq!(
             app.update(Action::Submit),
@@ -3619,7 +3760,7 @@ mod tests {
             }]
         );
         // A malformed vars line keeps the prompt open and says so.
-        let _ = app.update(Action::Command("poc-rerun".into()));
+        let _ = app.update(Action::PocRerun);
         let _ = app.update(Action::Submit);
         for c in "novalue".chars() {
             let _ = app.update(Action::Input(c));

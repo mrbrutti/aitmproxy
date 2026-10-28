@@ -83,6 +83,26 @@ pub enum Action {
     /// Apply the pending edit and resume (`flow.mutate` then `flow.resume`).
     ApplyAndResume,
     RevertEdit,
+    // Panel verbs (keys that are not a typed command line)
+    /// Browser view `g`: the URL prompt for `browser.navigate`, prefilled
+    /// with the current URL.
+    BrowserNavigatePrompt,
+    /// Browser view `e`: the expression prompt for `browser.eval`.
+    BrowserEvalPrompt,
+    /// Browser view `d`: re-read the page (`browser.get_dom`).
+    BrowserRefreshDom,
+    /// Browser view `s`: `browser.screenshot`.
+    BrowserScreenshot,
+    /// CA panel `e`: the `[pem|der] [path]` prompt for `ca.export`.
+    CaExportPrompt,
+    /// Findings `r`: run the selected finding's PoC again (target, then vars).
+    PocRerun,
+    /// Scope panel `a`: the add-host prompt.
+    ScopeAddPrompt,
+    /// Scope panel `d`: remove the entry under the cursor (`scope.remove`).
+    ScopeRemoveSelected,
+    /// Compose `Ctrl-S` / `Ctrl-Enter`: send the form whichever field has focus.
+    ComposeSend,
 }
 
 /// Work for the bus task.
@@ -163,20 +183,42 @@ pub enum BusEvent {
         name: String,
         value: Value,
     },
+    /// A `tools/call` did not complete: the tool reported an error, the
+    /// server answered with a JSON-RPC error or a malformed reply, or the bus
+    /// does not offer `name` at all. `message` is the operator-facing text.
+    CallFailed {
+        name: String,
+        message: String,
+    },
+    /// A notice with no tool behind it (a per-flow poll warning, a malformed
+    /// `flow.detail` reply).
     Toast(Level, String),
     /// An unsolicited server line (F4).
     Notification(Value),
 }
 
+/// One declared parameter of a tool's `inputSchema`, as a form row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Param {
+    /// The property name (`id`, `url`, …).
+    pub name: String,
+    /// The JSON Schema `type`; `any` when the schema does not say.
+    pub ty: String,
+    /// Listed in the schema's `required` array.
+    pub required: bool,
+    /// The schema's `description`, empty when absent.
+    pub description: String,
+}
+
 /// The form-building view of a tool's `inputSchema` (foundation §4.2 step 3:
 /// every form is built from the schema, never hard-coded).
 pub trait ToolSchema {
-    /// `(name, type, required, description)` for every declared parameter.
-    fn params(&self) -> Vec<(String, String, bool, String)>;
+    /// Every declared parameter, in the schema's order.
+    fn params(&self) -> Vec<Param>;
 }
 
 impl ToolSchema for ToolInfo {
-    fn params(&self) -> Vec<(String, String, bool, String)> {
+    fn params(&self) -> Vec<Param> {
         let required: Vec<&str> = self
             .input_schema
             .get("required")
@@ -189,21 +231,19 @@ impl ToolSchema for ToolInfo {
             .map(|props| {
                 props
                     .iter()
-                    .map(|(name, schema)| {
-                        (
-                            name.clone(),
-                            schema
-                                .get("type")
-                                .and_then(Value::as_str)
-                                .unwrap_or("any")
-                                .to_string(),
-                            required.contains(&name.as_str()),
-                            schema
-                                .get("description")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string(),
-                        )
+                    .map(|(name, schema)| Param {
+                        name: name.clone(),
+                        ty: schema
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("any")
+                            .to_string(),
+                        required: required.contains(&name.as_str()),
+                        description: schema
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
                     })
                     .collect()
             })

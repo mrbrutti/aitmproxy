@@ -189,7 +189,7 @@ impl Session {
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect::<Vec<_>>(),
             Ok(_) => Vec::new(),
-            Err(e) => return self.report(e).await,
+            Err(e) => return self.call_failed("flow.list", e).await,
         };
         let mut out = Vec::with_capacity(ids.len());
         // The first per-flow failure of this pass, reported once below: a row
@@ -292,7 +292,7 @@ impl Session {
                             .await
                         }
                     },
-                    Err(e) => self.report(e).await,
+                    Err(e) => self.call_failed("flow.detail", e).await,
                 };
             }
             BusRequest::Intercept(on) => ("flow.intercept", json!({ "enabled": on })),
@@ -374,10 +374,10 @@ impl Session {
     async fn call_and_report(&mut self, name: &str, args: Value) -> Result<(), Outcome> {
         if !self.has(name) {
             return self
-                .emit(BusEvent::Toast(
-                    Level::Warn,
-                    format!("{name} is not on this bus"),
-                ))
+                .emit(BusEvent::CallFailed {
+                    name: name.to_string(),
+                    message: format!("{name} is not on this bus"),
+                })
                 .await;
         }
         // A mutation changes rows: forget the summary of the flow it names so
@@ -400,16 +400,22 @@ impl Session {
                 })
                 .await
             }
-            Err(e) => self.report(e).await,
+            Err(e) => self.call_failed(name, e).await,
         }
     }
 
-    async fn report(&self, e: BusError) -> Result<(), Outcome> {
+    /// A `tools/call` of `name` did not complete. A transport failure ends
+    /// the session like anywhere else; a tool, RPC or protocol error is the
+    /// app's [`BusEvent::CallFailed`] with the operator-facing text.
+    async fn call_failed(&self, name: &str, e: BusError) -> Result<(), Outcome> {
         match e {
             BusError::Transport(e) => Err(Outcome::Lost(format!("{e:#}"))),
             other => {
-                self.emit(BusEvent::Toast(Level::Error, error_text(other)))
-                    .await
+                self.emit(BusEvent::CallFailed {
+                    name: name.to_string(),
+                    message: error_text(other),
+                })
+                .await
             }
         }
     }

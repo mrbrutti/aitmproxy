@@ -383,6 +383,22 @@ pub struct ToolDef {
     pub input_schema: Value,
 }
 
+impl ToolDef {
+    /// Decode one `tools/list` entry. `name` is required; a missing
+    /// `description` is empty and a missing `inputSchema` is `Null`.
+    pub fn from_json(v: &Value) -> Result<Self, BusError> {
+        Ok(Self {
+            name: required_str(v, "name", "tool")?,
+            description: v
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            input_schema: v.get("inputSchema").cloned().unwrap_or(Value::Null),
+        })
+    }
+}
+
 /// A JSON-RPC client over any [`BusTransport`].
 pub struct BusClient {
     transport: Box<dyn BusTransport>,
@@ -438,20 +454,7 @@ impl BusClient {
             .get("tools")
             .and_then(Value::as_array)
             .ok_or_else(|| BusError::Protocol("tools/list result has no tools array".into()))?;
-        tools
-            .iter()
-            .map(|t| {
-                Ok(ToolDef {
-                    name: required_str(t, "name", "tool")?,
-                    description: t
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    input_schema: t.get("inputSchema").cloned().unwrap_or(Value::Null),
-                })
-            })
-            .collect()
+        tools.iter().map(ToolDef::from_json).collect()
     }
 
     /// `tools/call`. `Ok` is the `structuredContent` (or the first text content,
@@ -567,6 +570,35 @@ pub fn read_token_file(path: &Path) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Q-4: one decoder for a `tools/list` entry, shared with the fixture
+    /// loader: `name` required, the rest defaulted.
+    #[test]
+    fn a_tool_entry_decodes_with_defaults_and_needs_a_name() {
+        let full = ToolDef::from_json(&json!({
+            "name": "flow.get",
+            "description": "Summarize one flow.",
+            "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}
+        }))
+        .expect("a complete entry");
+        assert_eq!(full.name, "flow.get");
+        assert_eq!(full.description, "Summarize one flow.");
+        assert_eq!(full.input_schema["required"], json!(["id"]));
+        let bare = ToolDef::from_json(&json!({"name": "flow.list"})).expect("name alone");
+        assert_eq!(
+            bare,
+            ToolDef {
+                name: "flow.list".into(),
+                description: String::new(),
+                input_schema: Value::Null,
+            }
+        );
+        let err = ToolDef::from_json(&json!({"description": "no name"})).unwrap_err();
+        assert!(
+            matches!(&err, BusError::Protocol(m) if m == "tool has no string `name`"),
+            "{err}"
+        );
+    }
 
     /// Run `read_loop` over an in-memory pipe and return the close reason it
     /// recorded once the writer side is done.

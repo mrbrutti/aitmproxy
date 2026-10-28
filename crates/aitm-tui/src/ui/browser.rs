@@ -257,17 +257,19 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         ),
         Span::styled("  g navigate", theme.text_tertiary()),
     ]));
-    let shot = match b.screenshot {
-        Some((sw, sh, fmt, n)) if sw > 0 => format!(
-            " [screenshot {sw}×{sh} {fmt} · {} · o to open]",
-            human_bytes(n as u64)
+    let shot = match &b.screenshot {
+        Some(s) if s.width > 0 => format!(
+            " [screenshot {}×{} {} · {} · o to open]",
+            s.width,
+            s.height,
+            s.format,
+            human_bytes(s.bytes.len() as u64)
         ),
-        Some((_, _, fmt, n)) => {
-            format!(
-                " [screenshot {fmt} · {} · o to open]",
-                human_bytes(n as u64)
-            )
-        }
+        Some(s) => format!(
+            " [screenshot {} · {} · o to open]",
+            s.format,
+            human_bytes(s.bytes.len() as u64)
+        ),
         None => " [no screenshot yet · s]".to_string(),
     };
     top.push(Line::styled(shot, theme.text_secondary()));

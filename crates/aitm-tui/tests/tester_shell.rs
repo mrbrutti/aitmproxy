@@ -91,7 +91,7 @@ fn shell_regions_render_in_the_mockup_order_at_200x50() {
         assert!(text.contains(&format!(" {group}")), "group {group}");
     }
     assert!(
-        sidebar("  All flows").ends_with("14│"),
+        sidebar("  All flows").ends_with("15│"),
         "{:?}",
         sidebar("  All flows")
     );
@@ -215,7 +215,7 @@ fn shell_regions_render_in_the_mockup_order_at_200x50() {
         );
     }
     assert!(
-        status.contains("10 / 14 rows · 2 paused · 13 in scope · 2 findings"),
+        status.contains("11 / 15 rows · 2 paused · 14 in scope · 2 findings"),
         "{status}"
     );
     assert!(status.contains("● bus fixture"), "{status}");
@@ -927,7 +927,7 @@ fn fixture_app_core_offers_exactly_the_22_core_tools_and_no_f_gated_data() {
     for gated in ["flow.detail", "agent.status", "poc.list", "proxy.status"] {
         assert!(!app.has_tool(gated), "{gated} is not a core tool");
     }
-    assert_eq!(app.flows.len(), 14, "the same recorded flows");
+    assert_eq!(app.flows.len(), 15, "the same recorded flows");
     assert!(
         app.details.is_empty(),
         "no flow.detail on the core bus, so no detail is loaded"
@@ -940,13 +940,15 @@ fn fixture_app_core_offers_exactly_the_22_core_tools_and_no_f_gated_data() {
     );
     assert!(app.findings.is_empty(), "poc.list is F-gated");
     assert_eq!(app.agent.policy, None, "agent.status is F-gated");
-    assert_eq!(app.listening.as_deref(), Some("127.0.0.1:8080"));
+    // `proxy.status` (F7) is what reports the listen address; without it
+    // the core app does not know one (SP-1).
+    assert_eq!(app.listening, None);
     assert_eq!(app.selected.as_deref(), Some("f50"));
 
     // The full fixture is the richer one; the core one renders without panicking.
     assert!(fixture_app(200, 50).tools.len() > 22);
     let text = text_of(&app, 200, 50);
-    assert!(text.contains("10 / 14 rows"), "{text}");
+    assert!(text.contains("11 / 15 rows"), "{text}");
 }
 
 #[test]
@@ -962,7 +964,7 @@ fn toasts_from_the_bus_show_in_the_status_bar_and_expire() {
     }
     assert!(app.current_toast().is_none());
     assert!(
-        text_of(&app, 200, 50).contains("10 / 14 rows"),
+        text_of(&app, 200, 50).contains("11 / 15 rows"),
         "the counts come back"
     );
 }

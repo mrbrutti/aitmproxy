@@ -9,14 +9,14 @@
 <text x="142.4" y="21.5" fill="#4ADE80" xml:space="preserve">● rec </text>
 <rect x="192.8" y="8.0" width="159.6" height="18" fill="#262628"/>
 <text x="192.8" y="21.5" fill="#8E8E93" xml:space="preserve" opacity="0.7"> ✎ compose  ⌫ clear</text>
-<rect x="352.4" y="8.0" width="210.0" height="18" fill="#262628"/>
-<rect x="562.4" y="8.0" width="16.8" height="18" fill="#262628"/>
-<text x="562.4" y="21.5" fill="#F5A524" xml:space="preserve">● </text>
-<rect x="579.2" y="8.0" width="75.6" height="18" fill="#262628"/>
-<text x="579.2" y="21.5" fill="#E6E6E8" xml:space="preserve" font-weight="bold">aitmproxy</text>
-<rect x="654.8" y="8.0" width="378.0" height="18" fill="#262628"/>
-<text x="654.8" y="21.5" fill="#B4B4B8" xml:space="preserve"> · listening 127.0.0.1:8080 · intercept armed</text>
-<rect x="1032.8" y="8.0" width="210.0" height="18" fill="#262628"/>
+<rect x="352.4" y="8.0" width="134.4" height="18" fill="#262628"/>
+<rect x="486.8" y="8.0" width="16.8" height="18" fill="#262628"/>
+<text x="486.8" y="21.5" fill="#F5A524" xml:space="preserve">● </text>
+<rect x="503.6" y="8.0" width="75.6" height="18" fill="#262628"/>
+<text x="503.6" y="21.5" fill="#E6E6E8" xml:space="preserve" font-weight="bold">aitmproxy</text>
+<rect x="579.2" y="8.0" width="529.2" height="18" fill="#262628"/>
+<text x="579.2" y="21.5" fill="#B4B4B8" xml:space="preserve"> · listen address unknown (core follow-up F7) · intercept armed</text>
+<rect x="1108.4" y="8.0" width="134.4" height="18" fill="#262628"/>
 <rect x="1242.8" y="8.0" width="168.0" height="18" fill="#262628"/>
 <text x="1242.8" y="21.5" fill="#8E8E93" xml:space="preserve" font-weight="bold" opacity="0.7">[⚙ Agent · n/a (F1)]</text>
 <rect x="1410.8" y="8.0" width="268.8" height="18" fill="#262628"/>
@@ -148,17 +148,15 @@
 <text x="234.8" y="75.5" fill="#2E2E31" xml:space="preserve">│</text>
 <rect x="243.2" y="62.0" width="16.8" height="18" fill="#1E1E20"/>
 <rect x="260.0" y="62.0" width="8.4" height="18" fill="#1E1E20"/>
-<text x="260.0" y="75.5" fill="#4ADE80" xml:space="preserve">●</text>
+<text x="260.0" y="75.5" fill="#C4B5FD" xml:space="preserve">●</text>
 <rect x="268.4" y="62.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="276.8" y="62.0" width="42.0" height="18" fill="#1E1E20"/>
 <text x="276.8" y="75.5" fill="#B4B4B8" xml:space="preserve">    1</text>
 <rect x="318.8" y="62.0" width="252.0" height="18" fill="#1E1E20"/>
 <text x="318.8" y="75.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-staging.test</text>
-<rect x="570.8" y="62.0" width="109.2" height="18" fill="#1E1E20"/>
-<text x="570.8" y="75.5" fill="#7DB2F8" xml:space="preserve">/api/products</text>
-<rect x="680.0" y="62.0" width="252.0" height="18" fill="#1E1E20"/>
-<text x="680.0" y="75.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">?category=electronics&amp;limit=20</text>
-<rect x="932.0" y="62.0" width="100.8" height="18" fill="#1E1E20"/>
+<rect x="570.8" y="62.0" width="142.8" height="18" fill="#1E1E20"/>
+<text x="570.8" y="75.5" fill="#7DB2F8" xml:space="preserve">/ws/notifications</text>
+<rect x="713.6" y="62.0" width="319.2" height="18" fill="#1E1E20"/>
 <rect x="1032.8" y="62.0" width="67.2" height="18" fill="#1E1E20"/>
 <text x="1032.8" y="75.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—       </text>
 <rect x="1100.0" y="62.0" width="8.4" height="18" fill="#1E1E20"/>
@@ -166,7 +164,7 @@
 <text x="1108.4" y="75.5" fill="#93C5FD" xml:space="preserve" font-weight="bold"> GET   </text>
 <rect x="1167.2" y="62.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1175.6" y="62.0" width="50.4" height="18" fill="#1E1E20"/>
-<text x="1175.6" y="75.5" fill="#4ADE80" xml:space="preserve" font-weight="bold">200   </text>
+<text x="1175.6" y="75.5" fill="#C4B5FD" xml:space="preserve" font-weight="bold">101   </text>
 <rect x="1226.0" y="62.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1234.4" y="62.0" width="100.8" height="18" fill="#1E1E20"/>
 <text x="1234.4" y="75.5" fill="#B4B4B8" xml:space="preserve">—           </text>
@@ -200,14 +198,16 @@
 <text x="276.8" y="93.5" fill="#B4B4B8" xml:space="preserve">    2</text>
 <rect x="318.8" y="80.0" width="252.0" height="18" fill="#1E1E20"/>
 <text x="318.8" y="93.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-staging.test</text>
-<rect x="570.8" y="80.0" width="151.2" height="18" fill="#1E1E20"/>
-<text x="570.8" y="93.5" fill="#7DB2F8" xml:space="preserve">/api/cart/items/42</text>
-<rect x="722.0" y="80.0" width="310.8" height="18" fill="#1E1E20"/>
+<rect x="570.8" y="80.0" width="109.2" height="18" fill="#1E1E20"/>
+<text x="570.8" y="93.5" fill="#7DB2F8" xml:space="preserve">/api/products</text>
+<rect x="680.0" y="80.0" width="252.0" height="18" fill="#1E1E20"/>
+<text x="680.0" y="93.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">?category=electronics&amp;limit=20</text>
+<rect x="932.0" y="80.0" width="100.8" height="18" fill="#1E1E20"/>
 <rect x="1032.8" y="80.0" width="67.2" height="18" fill="#1E1E20"/>
 <text x="1032.8" y="93.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—       </text>
 <rect x="1100.0" y="80.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1108.4" y="80.0" width="58.8" height="18" fill="#3A2E12"/>
-<text x="1108.4" y="93.5" fill="#FCD34D" xml:space="preserve" font-weight="bold"> PUT   </text>
+<rect x="1108.4" y="80.0" width="58.8" height="18" fill="#1E2A44"/>
+<text x="1108.4" y="93.5" fill="#93C5FD" xml:space="preserve" font-weight="bold"> GET   </text>
 <rect x="1167.2" y="80.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1175.6" y="80.0" width="50.4" height="18" fill="#1E1E20"/>
 <text x="1175.6" y="93.5" fill="#4ADE80" xml:space="preserve" font-weight="bold">200   </text>
@@ -237,23 +237,23 @@
 <text x="234.8" y="111.5" fill="#2E2E31" xml:space="preserve" opacity="0.7">│</text>
 <rect x="243.2" y="98.0" width="16.8" height="18" fill="#1E1E20"/>
 <rect x="260.0" y="98.0" width="8.4" height="18" fill="#1E1E20"/>
-<text x="260.0" y="111.5" fill="#7DD3FC" xml:space="preserve">●</text>
+<text x="260.0" y="111.5" fill="#4ADE80" xml:space="preserve">●</text>
 <rect x="268.4" y="98.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="276.8" y="98.0" width="42.0" height="18" fill="#1E1E20"/>
 <text x="276.8" y="111.5" fill="#B4B4B8" xml:space="preserve">    3</text>
 <rect x="318.8" y="98.0" width="252.0" height="18" fill="#1E1E20"/>
-<text x="318.8" y="111.5" fill="#E6E6E8" xml:space="preserve"> https://cdn.shop-staging.test</text>
-<rect x="570.8" y="98.0" width="159.6" height="18" fill="#1E1E20"/>
-<text x="570.8" y="111.5" fill="#7DB2F8" xml:space="preserve">/assets/app.3f1c.js</text>
-<rect x="730.4" y="98.0" width="302.4" height="18" fill="#1E1E20"/>
+<text x="318.8" y="111.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-staging.test</text>
+<rect x="570.8" y="98.0" width="151.2" height="18" fill="#1E1E20"/>
+<text x="570.8" y="111.5" fill="#7DB2F8" xml:space="preserve">/api/cart/items/42</text>
+<rect x="722.0" y="98.0" width="310.8" height="18" fill="#1E1E20"/>
 <rect x="1032.8" y="98.0" width="67.2" height="18" fill="#1E1E20"/>
 <text x="1032.8" y="111.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—       </text>
 <rect x="1100.0" y="98.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1108.4" y="98.0" width="58.8" height="18" fill="#1E2A44"/>
-<text x="1108.4" y="111.5" fill="#93C5FD" xml:space="preserve" font-weight="bold"> GET   </text>
+<rect x="1108.4" y="98.0" width="58.8" height="18" fill="#3A2E12"/>
+<text x="1108.4" y="111.5" fill="#FCD34D" xml:space="preserve" font-weight="bold"> PUT   </text>
 <rect x="1167.2" y="98.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1175.6" y="98.0" width="50.4" height="18" fill="#1E1E20"/>
-<text x="1175.6" y="111.5" fill="#7DD3FC" xml:space="preserve" font-weight="bold">304   </text>
+<text x="1175.6" y="111.5" fill="#4ADE80" xml:space="preserve" font-weight="bold">200   </text>
 <rect x="1226.0" y="98.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1234.4" y="98.0" width="100.8" height="18" fill="#1E1E20"/>
 <text x="1234.4" y="111.5" fill="#B4B4B8" xml:space="preserve">—           </text>
@@ -282,37 +282,38 @@
 <text x="234.8" y="129.5" fill="#2E2E31" xml:space="preserve" opacity="0.7">│</text>
 <rect x="243.2" y="116.0" width="16.8" height="18" fill="#1E1E20"/>
 <rect x="260.0" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
-<text x="260.0" y="129.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">●</text>
+<text x="260.0" y="129.5" fill="#7DD3FC" xml:space="preserve">●</text>
 <rect x="268.4" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="276.8" y="116.0" width="42.0" height="18" fill="#1E1E20"/>
-<text x="276.8" y="129.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">    4</text>
-<rect x="318.8" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="327.2" y="116.0" width="428.4" height="18" fill="#1E1E20"/>
-<text x="327.2" y="129.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">https://telemetry.vendor-analytics.example/v2/batch</text>
-<rect x="755.6" y="116.0" width="277.2" height="18" fill="#1E1E20"/>
+<text x="276.8" y="129.5" fill="#B4B4B8" xml:space="preserve">    4</text>
+<rect x="318.8" y="116.0" width="252.0" height="18" fill="#1E1E20"/>
+<text x="318.8" y="129.5" fill="#E6E6E8" xml:space="preserve"> https://cdn.shop-staging.test</text>
+<rect x="570.8" y="116.0" width="159.6" height="18" fill="#1E1E20"/>
+<text x="570.8" y="129.5" fill="#7DB2F8" xml:space="preserve">/assets/app.3f1c.js</text>
+<rect x="730.4" y="116.0" width="302.4" height="18" fill="#1E1E20"/>
 <rect x="1032.8" y="116.0" width="67.2" height="18" fill="#1E1E20"/>
 <text x="1032.8" y="129.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—       </text>
 <rect x="1100.0" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1108.4" y="116.0" width="58.8" height="18" fill="#1E1E20"/>
-<text x="1108.4" y="129.5" fill="#8E8E93" xml:space="preserve" opacity="0.7"> POST  </text>
+<rect x="1108.4" y="116.0" width="58.8" height="18" fill="#1E2A44"/>
+<text x="1108.4" y="129.5" fill="#93C5FD" xml:space="preserve" font-weight="bold"> GET   </text>
 <rect x="1167.2" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1175.6" y="116.0" width="50.4" height="18" fill="#1E1E20"/>
-<text x="1175.6" y="129.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">204   </text>
+<text x="1175.6" y="129.5" fill="#7DD3FC" xml:space="preserve" font-weight="bold">304   </text>
 <rect x="1226.0" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1234.4" y="116.0" width="100.8" height="18" fill="#1E1E20"/>
-<text x="1234.4" y="129.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—           </text>
+<text x="1234.4" y="129.5" fill="#B4B4B8" xml:space="preserve">—           </text>
 <rect x="1335.2" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1343.6" y="116.0" width="67.2" height="18" fill="#1E1E20"/>
-<text x="1343.6" y="129.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">       —</text>
+<text x="1343.6" y="129.5" fill="#B4B4B8" xml:space="preserve">       —</text>
 <rect x="1410.8" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1419.2" y="116.0" width="67.2" height="18" fill="#1E1E20"/>
-<text x="1419.2" y="129.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">       —</text>
+<text x="1419.2" y="129.5" fill="#B4B4B8" xml:space="preserve">       —</text>
 <rect x="1486.4" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1494.8" y="116.0" width="67.2" height="18" fill="#1E1E20"/>
-<text x="1494.8" y="129.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">       —</text>
+<text x="1494.8" y="129.5" fill="#B4B4B8" xml:space="preserve">       —</text>
 <rect x="1562.0" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1570.4" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
-<text x="1570.4" y="129.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">🔓</text>
+<text x="1570.4" y="129.5" fill="#B4B4B8" xml:space="preserve">🔓</text>
 <rect x="1578.8" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1587.2" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1595.6" y="116.0" width="8.4" height="18" fill="#1E1E20"/>
@@ -323,40 +324,37 @@
 <text x="234.8" y="147.5" fill="#2E2E31" xml:space="preserve">│</text>
 <rect x="243.2" y="134.0" width="16.8" height="18" fill="#1E1E20"/>
 <rect x="260.0" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
-<text x="260.0" y="147.5" fill="#F87171" xml:space="preserve">●</text>
+<text x="260.0" y="147.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">●</text>
 <rect x="268.4" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="276.8" y="134.0" width="42.0" height="18" fill="#1E1E20"/>
-<text x="276.8" y="147.5" fill="#B4B4B8" xml:space="preserve">    5</text>
-<rect x="318.8" y="134.0" width="252.0" height="18" fill="#1E1E20"/>
-<text x="318.8" y="147.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-staging.test</text>
-<rect x="570.8" y="134.0" width="92.4" height="18" fill="#1E1E20"/>
-<text x="570.8" y="147.5" fill="#7DB2F8" xml:space="preserve">/api/orders</text>
-<rect x="663.2" y="134.0" width="58.8" height="18" fill="#1E1E20"/>
-<text x="663.2" y="147.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">?page=3</text>
-<rect x="722.0" y="134.0" width="310.8" height="18" fill="#1E1E20"/>
+<text x="276.8" y="147.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">    5</text>
+<rect x="318.8" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="327.2" y="134.0" width="428.4" height="18" fill="#1E1E20"/>
+<text x="327.2" y="147.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">https://telemetry.vendor-analytics.example/v2/batch</text>
+<rect x="755.6" y="134.0" width="277.2" height="18" fill="#1E1E20"/>
 <rect x="1032.8" y="134.0" width="67.2" height="18" fill="#1E1E20"/>
 <text x="1032.8" y="147.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—       </text>
 <rect x="1100.0" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1108.4" y="134.0" width="58.8" height="18" fill="#1E2A44"/>
-<text x="1108.4" y="147.5" fill="#93C5FD" xml:space="preserve" font-weight="bold"> GET   </text>
+<rect x="1108.4" y="134.0" width="58.8" height="18" fill="#1E1E20"/>
+<text x="1108.4" y="147.5" fill="#8E8E93" xml:space="preserve" opacity="0.7"> POST  </text>
 <rect x="1167.2" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1175.6" y="134.0" width="50.4" height="18" fill="#1E1E20"/>
-<text x="1175.6" y="147.5" fill="#F87171" xml:space="preserve" font-weight="bold">502   </text>
+<text x="1175.6" y="147.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">204   </text>
 <rect x="1226.0" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1234.4" y="134.0" width="100.8" height="18" fill="#1E1E20"/>
-<text x="1234.4" y="147.5" fill="#B4B4B8" xml:space="preserve">—           </text>
+<text x="1234.4" y="147.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—           </text>
 <rect x="1335.2" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1343.6" y="134.0" width="67.2" height="18" fill="#1E1E20"/>
-<text x="1343.6" y="147.5" fill="#B4B4B8" xml:space="preserve">       —</text>
+<text x="1343.6" y="147.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">       —</text>
 <rect x="1410.8" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1419.2" y="134.0" width="67.2" height="18" fill="#1E1E20"/>
-<text x="1419.2" y="147.5" fill="#B4B4B8" xml:space="preserve">       —</text>
+<text x="1419.2" y="147.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">       —</text>
 <rect x="1486.4" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1494.8" y="134.0" width="67.2" height="18" fill="#1E1E20"/>
-<text x="1494.8" y="147.5" fill="#B4B4B8" xml:space="preserve">       —</text>
+<text x="1494.8" y="147.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">       —</text>
 <rect x="1562.0" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1570.4" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
-<text x="1570.4" y="147.5" fill="#B4B4B8" xml:space="preserve">🔓</text>
+<text x="1570.4" y="147.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">🔓</text>
 <rect x="1578.8" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1587.2" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1595.6" y="134.0" width="8.4" height="18" fill="#1E1E20"/>
@@ -369,10 +367,10 @@
 <text x="234.8" y="165.5" fill="#2E2E31" xml:space="preserve">│</text>
 <rect x="243.2" y="152.0" width="16.8" height="18" fill="#1E1E20"/>
 <rect x="260.0" y="152.0" width="8.4" height="18" fill="#1E1E20"/>
-<text x="260.0" y="165.5" fill="#4ADE80" xml:space="preserve">●</text>
+<text x="260.0" y="165.5" fill="#F87171" xml:space="preserve">●</text>
 <rect x="268.4" y="152.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="276.8" y="152.0" width="42.0" height="18" fill="#1E1E20"/>
-<text x="276.8" y="165.5" fill="#B4B4B8" xml:space="preserve">   6↻</text>
+<text x="276.8" y="165.5" fill="#B4B4B8" xml:space="preserve">    6</text>
 <rect x="318.8" y="152.0" width="252.0" height="18" fill="#1E1E20"/>
 <text x="318.8" y="165.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-staging.test</text>
 <rect x="570.8" y="152.0" width="92.4" height="18" fill="#1E1E20"/>
@@ -387,7 +385,7 @@
 <text x="1108.4" y="165.5" fill="#93C5FD" xml:space="preserve" font-weight="bold"> GET   </text>
 <rect x="1167.2" y="152.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1175.6" y="152.0" width="50.4" height="18" fill="#1E1E20"/>
-<text x="1175.6" y="165.5" fill="#4ADE80" xml:space="preserve" font-weight="bold">200   </text>
+<text x="1175.6" y="165.5" fill="#F87171" xml:space="preserve" font-weight="bold">502   </text>
 <rect x="1226.0" y="152.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1234.4" y="152.0" width="100.8" height="18" fill="#1E1E20"/>
 <text x="1234.4" y="165.5" fill="#B4B4B8" xml:space="preserve">—           </text>
@@ -411,42 +409,45 @@
 <rect x="8.0" y="170.0" width="92.4" height="18" fill="#2B3344"/>
 <text x="8.0" y="183.5" fill="#E6E6E8" xml:space="preserve" font-weight="bold">  All flows</text>
 <rect x="100.4" y="170.0" width="134.4" height="18" fill="#2B3344"/>
-<text x="100.4" y="183.5" fill="#E6E6E8" xml:space="preserve">              14</text>
+<text x="100.4" y="183.5" fill="#E6E6E8" xml:space="preserve">              15</text>
 <rect x="234.8" y="170.0" width="8.4" height="18" fill="#2B3344"/>
 <text x="234.8" y="183.5" fill="#2E2E31" xml:space="preserve">│</text>
 <rect x="243.2" y="170.0" width="16.8" height="18" fill="#1E1E20"/>
 <rect x="260.0" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
-<text x="260.0" y="183.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">●</text>
+<text x="260.0" y="183.5" fill="#4ADE80" xml:space="preserve">●</text>
 <rect x="268.4" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="276.8" y="170.0" width="42.0" height="18" fill="#1E1E20"/>
-<text x="276.8" y="183.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">    7</text>
-<rect x="318.8" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="327.2" y="170.0" width="50.4" height="18" fill="#1E1E20"/>
-<text x="327.2" y="183.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">wss://</text>
-<rect x="377.6" y="170.0" width="655.2" height="18" fill="#1E1E20"/>
+<text x="276.8" y="183.5" fill="#B4B4B8" xml:space="preserve">   7↻</text>
+<rect x="318.8" y="170.0" width="252.0" height="18" fill="#1E1E20"/>
+<text x="318.8" y="183.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-staging.test</text>
+<rect x="570.8" y="170.0" width="92.4" height="18" fill="#1E1E20"/>
+<text x="570.8" y="183.5" fill="#7DB2F8" xml:space="preserve">/api/orders</text>
+<rect x="663.2" y="170.0" width="58.8" height="18" fill="#1E1E20"/>
+<text x="663.2" y="183.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">?page=3</text>
+<rect x="722.0" y="170.0" width="310.8" height="18" fill="#1E1E20"/>
 <rect x="1032.8" y="170.0" width="67.2" height="18" fill="#1E1E20"/>
 <text x="1032.8" y="183.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—       </text>
 <rect x="1100.0" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1108.4" y="170.0" width="58.8" height="18" fill="#1E1E20"/>
-<text x="1108.4" y="183.5" fill="#8E8E93" xml:space="preserve" opacity="0.7"> WS    </text>
+<rect x="1108.4" y="170.0" width="58.8" height="18" fill="#1E2A44"/>
+<text x="1108.4" y="183.5" fill="#93C5FD" xml:space="preserve" font-weight="bold"> GET   </text>
 <rect x="1167.2" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1175.6" y="170.0" width="50.4" height="18" fill="#1E1E20"/>
-<text x="1175.6" y="183.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—     </text>
+<text x="1175.6" y="183.5" fill="#4ADE80" xml:space="preserve" font-weight="bold">200   </text>
 <rect x="1226.0" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1234.4" y="170.0" width="100.8" height="18" fill="#1E1E20"/>
-<text x="1234.4" y="183.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—           </text>
+<text x="1234.4" y="183.5" fill="#B4B4B8" xml:space="preserve">—           </text>
 <rect x="1335.2" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1343.6" y="170.0" width="67.2" height="18" fill="#1E1E20"/>
-<text x="1343.6" y="183.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">       —</text>
+<text x="1343.6" y="183.5" fill="#B4B4B8" xml:space="preserve">       —</text>
 <rect x="1410.8" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1419.2" y="170.0" width="67.2" height="18" fill="#1E1E20"/>
-<text x="1419.2" y="183.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">       —</text>
+<text x="1419.2" y="183.5" fill="#B4B4B8" xml:space="preserve">       —</text>
 <rect x="1486.4" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1494.8" y="170.0" width="67.2" height="18" fill="#1E1E20"/>
-<text x="1494.8" y="183.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">     3 ⇄</text>
+<text x="1494.8" y="183.5" fill="#B4B4B8" xml:space="preserve">       —</text>
 <rect x="1562.0" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1570.4" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
-<text x="1570.4" y="183.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">🔓</text>
+<text x="1570.4" y="183.5" fill="#B4B4B8" xml:space="preserve">🔓</text>
 <rect x="1578.8" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1587.2" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1595.6" y="170.0" width="8.4" height="18" fill="#1E1E20"/>
@@ -460,23 +461,23 @@
 <text x="234.8" y="201.5" fill="#2E2E31" xml:space="preserve" opacity="0.7">│</text>
 <rect x="243.2" y="188.0" width="16.8" height="18" fill="#1E1E20"/>
 <rect x="260.0" y="188.0" width="8.4" height="18" fill="#1E1E20"/>
-<text x="260.0" y="201.5" fill="#4ADE80" xml:space="preserve">●</text>
+<text x="260.0" y="201.5" fill="#C4B5FD" xml:space="preserve">●</text>
 <rect x="268.4" y="188.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="276.8" y="188.0" width="42.0" height="18" fill="#1E1E20"/>
 <text x="276.8" y="201.5" fill="#B4B4B8" xml:space="preserve">    8</text>
-<rect x="318.8" y="188.0" width="252.0" height="18" fill="#1E1E20"/>
-<text x="318.8" y="201.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-staging.test</text>
-<rect x="570.8" y="188.0" width="453.6" height="18" fill="#1E1E20"/>
-<text x="570.8" y="201.5" fill="#7DB2F8" xml:space="preserve">/api/search?q=%22%3E%3Cimg+src%3Dx+…rror%3Dalert(1)%3E</text>
-<rect x="1024.4" y="188.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="318.8" y="188.0" width="235.2" height="18" fill="#1E1E20"/>
+<text x="318.8" y="201.5" fill="#E6E6E8" xml:space="preserve"> wss://api.shop-staging.test</text>
+<rect x="554.0" y="188.0" width="142.8" height="18" fill="#1E1E20"/>
+<text x="554.0" y="201.5" fill="#7DB2F8" xml:space="preserve">/ws/notifications</text>
+<rect x="696.8" y="188.0" width="336.0" height="18" fill="#1E1E20"/>
 <rect x="1032.8" y="188.0" width="67.2" height="18" fill="#1E1E20"/>
 <text x="1032.8" y="201.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—       </text>
 <rect x="1100.0" y="188.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1108.4" y="188.0" width="58.8" height="18" fill="#1E2A44"/>
-<text x="1108.4" y="201.5" fill="#93C5FD" xml:space="preserve" font-weight="bold"> GET   </text>
+<rect x="1108.4" y="188.0" width="58.8" height="18" fill="#2E2550"/>
+<text x="1108.4" y="201.5" fill="#C4B5FD" xml:space="preserve" font-weight="bold"> WS    </text>
 <rect x="1167.2" y="188.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1175.6" y="188.0" width="50.4" height="18" fill="#1E1E20"/>
-<text x="1175.6" y="201.5" fill="#4ADE80" xml:space="preserve" font-weight="bold">200   </text>
+<text x="1175.6" y="201.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—     </text>
 <rect x="1226.0" y="188.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1234.4" y="188.0" width="100.8" height="18" fill="#1E1E20"/>
 <text x="1234.4" y="201.5" fill="#B4B4B8" xml:space="preserve">—           </text>
@@ -488,7 +489,7 @@
 <text x="1419.2" y="201.5" fill="#B4B4B8" xml:space="preserve">       —</text>
 <rect x="1486.4" y="188.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1494.8" y="188.0" width="67.2" height="18" fill="#1E1E20"/>
-<text x="1494.8" y="201.5" fill="#B4B4B8" xml:space="preserve">       —</text>
+<text x="1494.8" y="201.5" fill="#B4B4B8" xml:space="preserve">     3 ⇄</text>
 <rect x="1562.0" y="188.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1570.4" y="188.0" width="8.4" height="18" fill="#1E1E20"/>
 <text x="1570.4" y="201.5" fill="#B4B4B8" xml:space="preserve">🔓</text>
@@ -500,29 +501,28 @@
 <rect x="8.0" y="206.0" width="218.4" height="18" fill="#1E1E20"/>
 <text x="8.0" y="219.5" fill="#E6E6E8" xml:space="preserve">  Domains                 </text>
 <rect x="226.4" y="206.0" width="8.4" height="18" fill="#1E1E20"/>
-<text x="226.4" y="219.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">5</text>
+<text x="226.4" y="219.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">4</text>
 <rect x="234.8" y="206.0" width="8.4" height="18" fill="#1E1E20"/>
 <text x="234.8" y="219.5" fill="#2E2E31" xml:space="preserve" opacity="0.7">│</text>
 <rect x="243.2" y="206.0" width="16.8" height="18" fill="#1E1E20"/>
 <rect x="260.0" y="206.0" width="8.4" height="18" fill="#1E1E20"/>
-<text x="260.0" y="219.5" fill="#8E8E93" xml:space="preserve">●</text>
+<text x="260.0" y="219.5" fill="#4ADE80" xml:space="preserve">●</text>
 <rect x="268.4" y="206.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="276.8" y="206.0" width="42.0" height="18" fill="#1E1E20"/>
 <text x="276.8" y="219.5" fill="#B4B4B8" xml:space="preserve">    9</text>
-<rect x="318.8" y="206.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="327.2" y="206.0" width="243.6" height="18" fill="#1E1E20"/>
-<text x="327.2" y="219.5" fill="#8E8E93" xml:space="preserve" text-decoration="line-through">https://api.shop-staging.test</text>
-<rect x="570.8" y="206.0" width="159.6" height="18" fill="#1E1E20"/>
-<text x="570.8" y="219.5" fill="#7DB2F8" xml:space="preserve">/api/account/delete</text>
-<rect x="730.4" y="206.0" width="302.4" height="18" fill="#1E1E20"/>
+<rect x="318.8" y="206.0" width="252.0" height="18" fill="#1E1E20"/>
+<text x="318.8" y="219.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-staging.test</text>
+<rect x="570.8" y="206.0" width="453.6" height="18" fill="#1E1E20"/>
+<text x="570.8" y="219.5" fill="#7DB2F8" xml:space="preserve">/api/search?q=%22%3E%3Cimg+src%3Dx+…rror%3Dalert(1)%3E</text>
+<rect x="1024.4" y="206.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1032.8" y="206.0" width="67.2" height="18" fill="#1E1E20"/>
 <text x="1032.8" y="219.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—       </text>
 <rect x="1100.0" y="206.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1108.4" y="206.0" width="58.8" height="18" fill="#3B1C1C"/>
-<text x="1108.4" y="219.5" fill="#FCA5A5" xml:space="preserve" font-weight="bold"> DELETE</text>
+<rect x="1108.4" y="206.0" width="58.8" height="18" fill="#1E2A44"/>
+<text x="1108.4" y="219.5" fill="#93C5FD" xml:space="preserve" font-weight="bold"> GET   </text>
 <rect x="1167.2" y="206.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1175.6" y="206.0" width="50.4" height="18" fill="#1E1E20"/>
-<text x="1175.6" y="219.5" fill="#8E8E93" xml:space="preserve">killed</text>
+<text x="1175.6" y="219.5" fill="#4ADE80" xml:space="preserve" font-weight="bold">200   </text>
 <rect x="1226.0" y="206.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1234.4" y="206.0" width="100.8" height="18" fill="#1E1E20"/>
 <text x="1234.4" y="219.5" fill="#B4B4B8" xml:space="preserve">—           </text>
@@ -546,110 +546,111 @@
 <rect x="8.0" y="224.0" width="226.8" height="18" fill="#1E1E20"/>
 <rect x="234.8" y="224.0" width="8.4" height="18" fill="#1E1E20"/>
 <text x="234.8" y="237.5" fill="#2E2E31" xml:space="preserve">│</text>
-<rect x="243.2" y="224.0" width="8.4" height="18" fill="#2B3344"/>
-<text x="243.2" y="237.5" fill="#F5A524" xml:space="preserve">▎</text>
-<rect x="251.6" y="224.0" width="8.4" height="18" fill="#2B3344"/>
-<rect x="260.0" y="224.0" width="8.4" height="18" fill="#2B3344"/>
-<text x="260.0" y="237.5" fill="#F5A524" xml:space="preserve">●</text>
-<rect x="268.4" y="224.0" width="8.4" height="18" fill="#2B3344"/>
-<rect x="276.8" y="224.0" width="42.0" height="18" fill="#2B3344"/>
+<rect x="243.2" y="224.0" width="16.8" height="18" fill="#1E1E20"/>
+<rect x="260.0" y="224.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="260.0" y="237.5" fill="#8E8E93" xml:space="preserve">●</text>
+<rect x="268.4" y="224.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="276.8" y="224.0" width="42.0" height="18" fill="#1E1E20"/>
 <text x="276.8" y="237.5" fill="#B4B4B8" xml:space="preserve">   10</text>
-<rect x="318.8" y="224.0" width="260.4" height="18" fill="#2B3344"/>
-<text x="318.8" y="237.5" fill="#E6E6E8" xml:space="preserve"> https://auth.shop-staging.test</text>
-<rect x="579.2" y="224.0" width="126.0" height="18" fill="#2B3344"/>
-<text x="579.2" y="237.5" fill="#7DB2F8" xml:space="preserve">/api/auth/login</text>
-<rect x="705.2" y="224.0" width="327.6" height="18" fill="#2B3344"/>
-<rect x="1032.8" y="224.0" width="67.2" height="18" fill="#2B3344"/>
+<rect x="318.8" y="224.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="327.2" y="224.0" width="243.6" height="18" fill="#1E1E20"/>
+<text x="327.2" y="237.5" fill="#8E8E93" xml:space="preserve" text-decoration="line-through">https://api.shop-staging.test</text>
+<rect x="570.8" y="224.0" width="159.6" height="18" fill="#1E1E20"/>
+<text x="570.8" y="237.5" fill="#7DB2F8" xml:space="preserve">/api/account/delete</text>
+<rect x="730.4" y="224.0" width="302.4" height="18" fill="#1E1E20"/>
+<rect x="1032.8" y="224.0" width="67.2" height="18" fill="#1E1E20"/>
 <text x="1032.8" y="237.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—       </text>
-<rect x="1100.0" y="224.0" width="8.4" height="18" fill="#2B3344"/>
-<rect x="1108.4" y="224.0" width="58.8" height="18" fill="#14322A"/>
-<text x="1108.4" y="237.5" fill="#86EFAC" xml:space="preserve" font-weight="bold"> POST  </text>
-<rect x="1167.2" y="224.0" width="8.4" height="18" fill="#2B3344"/>
-<rect x="1175.6" y="224.0" width="50.4" height="18" fill="#2B3344"/>
-<text x="1175.6" y="237.5" fill="#F5A524" xml:space="preserve" font-weight="bold">Paused</text>
-<rect x="1226.0" y="224.0" width="8.4" height="18" fill="#2B3344"/>
-<rect x="1234.4" y="224.0" width="100.8" height="18" fill="#2B3344"/>
+<rect x="1100.0" y="224.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1108.4" y="224.0" width="58.8" height="18" fill="#3B1C1C"/>
+<text x="1108.4" y="237.5" fill="#FCA5A5" xml:space="preserve" font-weight="bold"> DELETE</text>
+<rect x="1167.2" y="224.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1175.6" y="224.0" width="50.4" height="18" fill="#1E1E20"/>
+<text x="1175.6" y="237.5" fill="#8E8E93" xml:space="preserve">killed</text>
+<rect x="1226.0" y="224.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1234.4" y="224.0" width="100.8" height="18" fill="#1E1E20"/>
 <text x="1234.4" y="237.5" fill="#B4B4B8" xml:space="preserve">—           </text>
-<rect x="1335.2" y="224.0" width="8.4" height="18" fill="#2B3344"/>
-<rect x="1343.6" y="224.0" width="67.2" height="18" fill="#2B3344"/>
-<text x="1343.6" y="237.5" fill="#B4B4B8" xml:space="preserve">       …</text>
-<rect x="1410.8" y="224.0" width="8.4" height="18" fill="#2B3344"/>
-<rect x="1419.2" y="224.0" width="67.2" height="18" fill="#2B3344"/>
+<rect x="1335.2" y="224.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1343.6" y="224.0" width="67.2" height="18" fill="#1E1E20"/>
+<text x="1343.6" y="237.5" fill="#B4B4B8" xml:space="preserve">       —</text>
+<rect x="1410.8" y="224.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1419.2" y="224.0" width="67.2" height="18" fill="#1E1E20"/>
 <text x="1419.2" y="237.5" fill="#B4B4B8" xml:space="preserve">       —</text>
-<rect x="1486.4" y="224.0" width="8.4" height="18" fill="#2B3344"/>
-<rect x="1494.8" y="224.0" width="67.2" height="18" fill="#2B3344"/>
+<rect x="1486.4" y="224.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1494.8" y="224.0" width="67.2" height="18" fill="#1E1E20"/>
 <text x="1494.8" y="237.5" fill="#B4B4B8" xml:space="preserve">       —</text>
-<rect x="1562.0" y="224.0" width="8.4" height="18" fill="#2B3344"/>
-<rect x="1570.4" y="224.0" width="8.4" height="18" fill="#2B3344"/>
+<rect x="1562.0" y="224.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1570.4" y="224.0" width="8.4" height="18" fill="#1E1E20"/>
 <text x="1570.4" y="237.5" fill="#B4B4B8" xml:space="preserve">🔓</text>
 <rect x="1578.8" y="224.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1587.2" y="224.0" width="8.4" height="18" fill="#2B3344"/>
-<rect x="1595.6" y="224.0" width="8.4" height="18" fill="#2B3344"/>
-<rect x="1604.0" y="224.0" width="16.8" height="18" fill="#2B3344"/>
-<rect x="1620.8" y="224.0" width="67.2" height="18" fill="#2B3344"/>
+<rect x="1587.2" y="224.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1595.6" y="224.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1604.0" y="224.0" width="16.8" height="18" fill="#1E1E20"/>
+<rect x="1620.8" y="224.0" width="67.2" height="18" fill="#1E1E20"/>
 <rect x="8.0" y="242.0" width="84.0" height="18" fill="#1E1E20"/>
 <text x="8.0" y="255.5" fill="#8E8E93" xml:space="preserve" font-weight="bold" opacity="0.7"> aitmproxy</text>
 <rect x="92.0" y="242.0" width="142.8" height="18" fill="#1E1E20"/>
 <rect x="234.8" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
 <text x="234.8" y="255.5" fill="#2E2E31" xml:space="preserve">│</text>
-<rect x="243.2" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="243.2" y="242.0" width="8.4" height="18" fill="#2B3344"/>
 <text x="243.2" y="255.5" fill="#F5A524" xml:space="preserve">▎</text>
-<rect x="251.6" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="260.0" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="251.6" y="242.0" width="8.4" height="18" fill="#2B3344"/>
+<rect x="260.0" y="242.0" width="8.4" height="18" fill="#2B3344"/>
 <text x="260.0" y="255.5" fill="#F5A524" xml:space="preserve">●</text>
-<rect x="268.4" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="276.8" y="242.0" width="42.0" height="18" fill="#1E1E20"/>
+<rect x="268.4" y="242.0" width="8.4" height="18" fill="#2B3344"/>
+<rect x="276.8" y="242.0" width="42.0" height="18" fill="#2B3344"/>
 <text x="276.8" y="255.5" fill="#B4B4B8" xml:space="preserve">   11</text>
-<rect x="318.8" y="242.0" width="252.0" height="18" fill="#1E1E20"/>
-<text x="318.8" y="255.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-staging.test</text>
-<rect x="570.8" y="242.0" width="58.8" height="18" fill="#1E1E20"/>
-<text x="570.8" y="255.5" fill="#7DB2F8" xml:space="preserve">/api/me</text>
-<rect x="629.6" y="242.0" width="403.2" height="18" fill="#1E1E20"/>
-<rect x="1032.8" y="242.0" width="67.2" height="18" fill="#1E1E20"/>
+<rect x="318.8" y="242.0" width="260.4" height="18" fill="#2B3344"/>
+<text x="318.8" y="255.5" fill="#E6E6E8" xml:space="preserve"> https://auth.shop-staging.test</text>
+<rect x="579.2" y="242.0" width="126.0" height="18" fill="#2B3344"/>
+<text x="579.2" y="255.5" fill="#7DB2F8" xml:space="preserve">/api/auth/login</text>
+<rect x="705.2" y="242.0" width="327.6" height="18" fill="#2B3344"/>
+<rect x="1032.8" y="242.0" width="67.2" height="18" fill="#2B3344"/>
 <text x="1032.8" y="255.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—       </text>
-<rect x="1100.0" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1108.4" y="242.0" width="58.8" height="18" fill="#1E2A44"/>
-<text x="1108.4" y="255.5" fill="#93C5FD" xml:space="preserve" font-weight="bold"> GET   </text>
-<rect x="1167.2" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1175.6" y="242.0" width="50.4" height="18" fill="#1E1E20"/>
+<rect x="1100.0" y="242.0" width="8.4" height="18" fill="#2B3344"/>
+<rect x="1108.4" y="242.0" width="58.8" height="18" fill="#14322A"/>
+<text x="1108.4" y="255.5" fill="#86EFAC" xml:space="preserve" font-weight="bold"> POST  </text>
+<rect x="1167.2" y="242.0" width="8.4" height="18" fill="#2B3344"/>
+<rect x="1175.6" y="242.0" width="50.4" height="18" fill="#2B3344"/>
 <text x="1175.6" y="255.5" fill="#F5A524" xml:space="preserve" font-weight="bold">Paused</text>
-<rect x="1226.0" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1234.4" y="242.0" width="100.8" height="18" fill="#1E1E20"/>
+<rect x="1226.0" y="242.0" width="8.4" height="18" fill="#2B3344"/>
+<rect x="1234.4" y="242.0" width="100.8" height="18" fill="#2B3344"/>
 <text x="1234.4" y="255.5" fill="#B4B4B8" xml:space="preserve">—           </text>
-<rect x="1335.2" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1343.6" y="242.0" width="67.2" height="18" fill="#1E1E20"/>
+<rect x="1335.2" y="242.0" width="8.4" height="18" fill="#2B3344"/>
+<rect x="1343.6" y="242.0" width="67.2" height="18" fill="#2B3344"/>
 <text x="1343.6" y="255.5" fill="#B4B4B8" xml:space="preserve">       …</text>
-<rect x="1410.8" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1419.2" y="242.0" width="67.2" height="18" fill="#1E1E20"/>
+<rect x="1410.8" y="242.0" width="8.4" height="18" fill="#2B3344"/>
+<rect x="1419.2" y="242.0" width="67.2" height="18" fill="#2B3344"/>
 <text x="1419.2" y="255.5" fill="#B4B4B8" xml:space="preserve">       —</text>
-<rect x="1486.4" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1494.8" y="242.0" width="67.2" height="18" fill="#1E1E20"/>
+<rect x="1486.4" y="242.0" width="8.4" height="18" fill="#2B3344"/>
+<rect x="1494.8" y="242.0" width="67.2" height="18" fill="#2B3344"/>
 <text x="1494.8" y="255.5" fill="#B4B4B8" xml:space="preserve">       —</text>
-<rect x="1562.0" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1570.4" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1562.0" y="242.0" width="8.4" height="18" fill="#2B3344"/>
+<rect x="1570.4" y="242.0" width="8.4" height="18" fill="#2B3344"/>
 <text x="1570.4" y="255.5" fill="#B4B4B8" xml:space="preserve">🔓</text>
 <rect x="1578.8" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1587.2" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1595.6" y="242.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1604.0" y="242.0" width="16.8" height="18" fill="#1E1E20"/>
-<rect x="1620.8" y="242.0" width="67.2" height="18" fill="#1E1E20"/>
+<rect x="1587.2" y="242.0" width="8.4" height="18" fill="#2B3344"/>
+<rect x="1595.6" y="242.0" width="8.4" height="18" fill="#2B3344"/>
+<rect x="1604.0" y="242.0" width="16.8" height="18" fill="#2B3344"/>
+<rect x="1620.8" y="242.0" width="67.2" height="18" fill="#2B3344"/>
 <rect x="8.0" y="260.0" width="218.4" height="18" fill="#1E1E20"/>
 <text x="8.0" y="273.5" fill="#E6E6E8" xml:space="preserve">  Scope                   </text>
 <rect x="226.4" y="260.0" width="8.4" height="18" fill="#1E1E20"/>
 <text x="226.4" y="273.5" fill="#B4B4B8" xml:space="preserve" font-weight="bold">3</text>
 <rect x="234.8" y="260.0" width="8.4" height="18" fill="#1E1E20"/>
 <text x="234.8" y="273.5" fill="#2E2E31" xml:space="preserve" font-weight="bold">│</text>
-<rect x="243.2" y="260.0" width="16.8" height="18" fill="#1E1E20"/>
+<rect x="243.2" y="260.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="243.2" y="273.5" fill="#F5A524" xml:space="preserve">▎</text>
+<rect x="251.6" y="260.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="260.0" y="260.0" width="8.4" height="18" fill="#1E1E20"/>
 <text x="260.0" y="273.5" fill="#F5A524" xml:space="preserve">●</text>
 <rect x="268.4" y="260.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="276.8" y="260.0" width="42.0" height="18" fill="#1E1E20"/>
 <text x="276.8" y="273.5" fill="#B4B4B8" xml:space="preserve">   12</text>
 <rect x="318.8" y="260.0" width="252.0" height="18" fill="#1E1E20"/>
-<text x="318.8" y="273.5" fill="#E6E6E8" xml:space="preserve"> https://cdn.shop-staging.test</text>
-<rect x="570.8" y="260.0" width="142.8" height="18" fill="#1E1E20"/>
-<text x="570.8" y="273.5" fill="#7DB2F8" xml:space="preserve">/assets/hero.webp</text>
-<rect x="713.6" y="260.0" width="319.2" height="18" fill="#1E1E20"/>
+<text x="318.8" y="273.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-staging.test</text>
+<rect x="570.8" y="260.0" width="58.8" height="18" fill="#1E1E20"/>
+<text x="570.8" y="273.5" fill="#7DB2F8" xml:space="preserve">/api/me</text>
+<rect x="629.6" y="260.0" width="403.2" height="18" fill="#1E1E20"/>
 <rect x="1032.8" y="260.0" width="67.2" height="18" fill="#1E1E20"/>
 <text x="1032.8" y="273.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—       </text>
 <rect x="1100.0" y="260.0" width="8.4" height="18" fill="#1E1E20"/>
@@ -657,7 +658,7 @@
 <text x="1108.4" y="273.5" fill="#93C5FD" xml:space="preserve" font-weight="bold"> GET   </text>
 <rect x="1167.2" y="260.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1175.6" y="260.0" width="50.4" height="18" fill="#1E1E20"/>
-<text x="1175.6" y="273.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—     </text>
+<text x="1175.6" y="273.5" fill="#F5A524" xml:space="preserve" font-weight="bold">Paused</text>
 <rect x="1226.0" y="260.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1234.4" y="260.0" width="100.8" height="18" fill="#1E1E20"/>
 <text x="1234.4" y="273.5" fill="#B4B4B8" xml:space="preserve">—           </text>
@@ -678,37 +679,37 @@
 <rect x="1595.6" y="260.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1604.0" y="260.0" width="16.8" height="18" fill="#1E1E20"/>
 <rect x="1620.8" y="260.0" width="67.2" height="18" fill="#1E1E20"/>
-<rect x="8.0" y="278.0" width="218.4" height="18" fill="#1E1E20"/>
-<text x="8.0" y="291.5" fill="#E6E6E8" xml:space="preserve">  Findings                </text>
-<rect x="226.4" y="278.0" width="8.4" height="18" fill="#1E1E20"/>
-<text x="226.4" y="291.5" fill="#B4B4B8" xml:space="preserve" font-weight="bold">0</text>
+<rect x="8.0" y="278.0" width="201.6" height="18" fill="#1E1E20"/>
+<text x="8.0" y="291.5" fill="#E6E6E8" xml:space="preserve">  Findings              </text>
+<rect x="209.6" y="278.0" width="25.2" height="18" fill="#1E1E20"/>
+<text x="209.6" y="291.5" fill="#B4B4B8" xml:space="preserve" font-weight="bold">F13</text>
 <rect x="234.8" y="278.0" width="8.4" height="18" fill="#1E1E20"/>
 <text x="234.8" y="291.5" fill="#2E2E31" xml:space="preserve" font-weight="bold">│</text>
 <rect x="243.2" y="278.0" width="16.8" height="18" fill="#1E1E20"/>
 <rect x="260.0" y="278.0" width="8.4" height="18" fill="#1E1E20"/>
-<text x="260.0" y="291.5" fill="#FCD34D" xml:space="preserve">●</text>
+<text x="260.0" y="291.5" fill="#F5A524" xml:space="preserve">●</text>
 <rect x="268.4" y="278.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="276.8" y="278.0" width="42.0" height="18" fill="#1E1E20"/>
 <text x="276.8" y="291.5" fill="#B4B4B8" xml:space="preserve">   13</text>
 <rect x="318.8" y="278.0" width="252.0" height="18" fill="#1E1E20"/>
-<text x="318.8" y="291.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-staging.test</text>
-<rect x="570.8" y="278.0" width="75.6" height="18" fill="#1E1E20"/>
-<text x="570.8" y="291.5" fill="#7DB2F8" xml:space="preserve">/api/cart</text>
-<rect x="646.4" y="278.0" width="386.4" height="18" fill="#1E1E20"/>
+<text x="318.8" y="291.5" fill="#E6E6E8" xml:space="preserve"> https://cdn.shop-staging.test</text>
+<rect x="570.8" y="278.0" width="142.8" height="18" fill="#1E1E20"/>
+<text x="570.8" y="291.5" fill="#7DB2F8" xml:space="preserve">/assets/hero.webp</text>
+<rect x="713.6" y="278.0" width="319.2" height="18" fill="#1E1E20"/>
 <rect x="1032.8" y="278.0" width="67.2" height="18" fill="#1E1E20"/>
 <text x="1032.8" y="291.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—       </text>
 <rect x="1100.0" y="278.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1108.4" y="278.0" width="58.8" height="18" fill="#3B2516"/>
-<text x="1108.4" y="291.5" fill="#FDBA74" xml:space="preserve" font-weight="bold"> PATCH </text>
+<rect x="1108.4" y="278.0" width="58.8" height="18" fill="#1E2A44"/>
+<text x="1108.4" y="291.5" fill="#93C5FD" xml:space="preserve" font-weight="bold"> GET   </text>
 <rect x="1167.2" y="278.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1175.6" y="278.0" width="50.4" height="18" fill="#1E1E20"/>
-<text x="1175.6" y="291.5" fill="#FCD34D" xml:space="preserve" font-weight="bold">422   </text>
+<text x="1175.6" y="291.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—     </text>
 <rect x="1226.0" y="278.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1234.4" y="278.0" width="100.8" height="18" fill="#1E1E20"/>
 <text x="1234.4" y="291.5" fill="#B4B4B8" xml:space="preserve">—           </text>
 <rect x="1335.2" y="278.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1343.6" y="278.0" width="67.2" height="18" fill="#1E1E20"/>
-<text x="1343.6" y="291.5" fill="#B4B4B8" xml:space="preserve">       —</text>
+<text x="1343.6" y="291.5" fill="#B4B4B8" xml:space="preserve">       …</text>
 <rect x="1410.8" y="278.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1419.2" y="278.0" width="67.2" height="18" fill="#1E1E20"/>
 <text x="1419.2" y="291.5" fill="#B4B4B8" xml:space="preserve">       —</text>
@@ -723,31 +724,31 @@
 <rect x="1595.6" y="278.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1604.0" y="278.0" width="16.8" height="18" fill="#1E1E20"/>
 <rect x="1620.8" y="278.0" width="67.2" height="18" fill="#1E1E20"/>
-<rect x="8.0" y="296.0" width="117.6" height="18" fill="#1E1E20"/>
-<text x="8.0" y="309.5" fill="#E6E6E8" xml:space="preserve">  Browser     </text>
-<rect x="125.6" y="296.0" width="109.2" height="18" fill="#1E1E20"/>
-<text x="125.6" y="309.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">not built yet</text>
+<rect x="8.0" y="296.0" width="218.4" height="18" fill="#1E1E20"/>
+<text x="8.0" y="309.5" fill="#E6E6E8" xml:space="preserve">  Browser                 </text>
+<rect x="226.4" y="296.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="226.4" y="309.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—</text>
 <rect x="234.8" y="296.0" width="8.4" height="18" fill="#1E1E20"/>
 <text x="234.8" y="309.5" fill="#2E2E31" xml:space="preserve" opacity="0.7">│</text>
 <rect x="243.2" y="296.0" width="16.8" height="18" fill="#1E1E20"/>
 <rect x="260.0" y="296.0" width="8.4" height="18" fill="#1E1E20"/>
-<text x="260.0" y="309.5" fill="#4ADE80" xml:space="preserve">●</text>
+<text x="260.0" y="309.5" fill="#FCD34D" xml:space="preserve">●</text>
 <rect x="268.4" y="296.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="276.8" y="296.0" width="42.0" height="18" fill="#1E1E20"/>
 <text x="276.8" y="309.5" fill="#B4B4B8" xml:space="preserve">   14</text>
 <rect x="318.8" y="296.0" width="252.0" height="18" fill="#1E1E20"/>
 <text x="318.8" y="309.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-staging.test</text>
-<rect x="570.8" y="296.0" width="92.4" height="18" fill="#1E1E20"/>
-<text x="570.8" y="309.5" fill="#7DB2F8" xml:space="preserve">/api/health</text>
-<rect x="663.2" y="296.0" width="369.6" height="18" fill="#1E1E20"/>
+<rect x="570.8" y="296.0" width="75.6" height="18" fill="#1E1E20"/>
+<text x="570.8" y="309.5" fill="#7DB2F8" xml:space="preserve">/api/cart</text>
+<rect x="646.4" y="296.0" width="386.4" height="18" fill="#1E1E20"/>
 <rect x="1032.8" y="296.0" width="67.2" height="18" fill="#1E1E20"/>
 <text x="1032.8" y="309.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—       </text>
 <rect x="1100.0" y="296.0" width="8.4" height="18" fill="#1E1E20"/>
-<rect x="1108.4" y="296.0" width="58.8" height="18" fill="#2A2A2D"/>
-<text x="1108.4" y="309.5" fill="#B4B4B8" xml:space="preserve" font-weight="bold"> HEAD  </text>
+<rect x="1108.4" y="296.0" width="58.8" height="18" fill="#3B2516"/>
+<text x="1108.4" y="309.5" fill="#FDBA74" xml:space="preserve" font-weight="bold"> PATCH </text>
 <rect x="1167.2" y="296.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1175.6" y="296.0" width="50.4" height="18" fill="#1E1E20"/>
-<text x="1175.6" y="309.5" fill="#4ADE80" xml:space="preserve" font-weight="bold">200   </text>
+<text x="1175.6" y="309.5" fill="#FCD34D" xml:space="preserve" font-weight="bold">422   </text>
 <rect x="1226.0" y="296.0" width="8.4" height="18" fill="#1E1E20"/>
 <rect x="1234.4" y="296.0" width="100.8" height="18" fill="#1E1E20"/>
 <text x="1234.4" y="309.5" fill="#B4B4B8" xml:space="preserve">—           </text>
@@ -774,7 +775,45 @@
 <text x="218.0" y="327.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">M3</text>
 <rect x="234.8" y="314.0" width="8.4" height="18" fill="#1E1E20"/>
 <text x="234.8" y="327.5" fill="#2E2E31" xml:space="preserve" opacity="0.7">│</text>
-<rect x="243.2" y="314.0" width="1444.8" height="18" fill="#1E1E20"/>
+<rect x="243.2" y="314.0" width="16.8" height="18" fill="#1E1E20"/>
+<rect x="260.0" y="314.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="260.0" y="327.5" fill="#4ADE80" xml:space="preserve">●</text>
+<rect x="268.4" y="314.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="276.8" y="314.0" width="42.0" height="18" fill="#1E1E20"/>
+<text x="276.8" y="327.5" fill="#B4B4B8" xml:space="preserve">   15</text>
+<rect x="318.8" y="314.0" width="252.0" height="18" fill="#1E1E20"/>
+<text x="318.8" y="327.5" fill="#E6E6E8" xml:space="preserve"> https://api.shop-staging.test</text>
+<rect x="570.8" y="314.0" width="92.4" height="18" fill="#1E1E20"/>
+<text x="570.8" y="327.5" fill="#7DB2F8" xml:space="preserve">/api/health</text>
+<rect x="663.2" y="314.0" width="369.6" height="18" fill="#1E1E20"/>
+<rect x="1032.8" y="314.0" width="67.2" height="18" fill="#1E1E20"/>
+<text x="1032.8" y="327.5" fill="#8E8E93" xml:space="preserve" opacity="0.7">—       </text>
+<rect x="1100.0" y="314.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1108.4" y="314.0" width="58.8" height="18" fill="#2A2A2D"/>
+<text x="1108.4" y="327.5" fill="#B4B4B8" xml:space="preserve" font-weight="bold"> HEAD  </text>
+<rect x="1167.2" y="314.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1175.6" y="314.0" width="50.4" height="18" fill="#1E1E20"/>
+<text x="1175.6" y="327.5" fill="#4ADE80" xml:space="preserve" font-weight="bold">200   </text>
+<rect x="1226.0" y="314.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1234.4" y="314.0" width="100.8" height="18" fill="#1E1E20"/>
+<text x="1234.4" y="327.5" fill="#B4B4B8" xml:space="preserve">—           </text>
+<rect x="1335.2" y="314.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1343.6" y="314.0" width="67.2" height="18" fill="#1E1E20"/>
+<text x="1343.6" y="327.5" fill="#B4B4B8" xml:space="preserve">       —</text>
+<rect x="1410.8" y="314.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1419.2" y="314.0" width="67.2" height="18" fill="#1E1E20"/>
+<text x="1419.2" y="327.5" fill="#B4B4B8" xml:space="preserve">       —</text>
+<rect x="1486.4" y="314.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1494.8" y="314.0" width="67.2" height="18" fill="#1E1E20"/>
+<text x="1494.8" y="327.5" fill="#B4B4B8" xml:space="preserve">       —</text>
+<rect x="1562.0" y="314.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1570.4" y="314.0" width="8.4" height="18" fill="#1E1E20"/>
+<text x="1570.4" y="327.5" fill="#B4B4B8" xml:space="preserve">🔓</text>
+<rect x="1578.8" y="314.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1587.2" y="314.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1595.6" y="314.0" width="8.4" height="18" fill="#1E1E20"/>
+<rect x="1604.0" y="314.0" width="16.8" height="18" fill="#1E1E20"/>
+<rect x="1620.8" y="314.0" width="67.2" height="18" fill="#1E1E20"/>
 <rect x="8.0" y="332.0" width="210.0" height="18" fill="#1E1E20"/>
 <text x="8.0" y="345.5" fill="#E6E6E8" xml:space="preserve">  Agent                  </text>
 <rect x="218.0" y="332.0" width="16.8" height="18" fill="#1E1E20"/>
@@ -1125,16 +1164,16 @@
 <text x="579.2" y="903.5" fill="#E6E6E8" xml:space="preserve" font-weight="bold"> t</text>
 <rect x="596.0" y="890.0" width="126.0" height="18" fill="#262628"/>
 <text x="596.0" y="903.5" fill="#B4B4B8" xml:space="preserve"> Auto-select ○ </text>
-<rect x="722.0" y="890.0" width="193.2" height="18" fill="#262628"/>
-<rect x="915.2" y="890.0" width="100.8" height="18" fill="#262628"/>
-<text x="915.2" y="903.5" fill="#B4B4B8" xml:space="preserve">10 / 14 rows</text>
-<rect x="1016.0" y="890.0" width="92.4" height="18" fill="#262628"/>
-<text x="1016.0" y="903.5" fill="#F5A524" xml:space="preserve" font-weight="bold"> · 2 paused</text>
-<rect x="1108.4" y="890.0" width="117.6" height="18" fill="#262628"/>
-<text x="1108.4" y="903.5" fill="#B4B4B8" xml:space="preserve"> · 12 in scope</text>
-<rect x="1226.0" y="890.0" width="193.2" height="18" fill="#262628"/>
-<rect x="1419.2" y="890.0" width="25.2" height="18" fill="#262628"/>
-<text x="1419.2" y="903.5" fill="#B4B4B8" xml:space="preserve">0 B</text>
+<rect x="722.0" y="890.0" width="201.6" height="18" fill="#262628"/>
+<rect x="923.6" y="890.0" width="100.8" height="18" fill="#262628"/>
+<text x="923.6" y="903.5" fill="#B4B4B8" xml:space="preserve">11 / 15 rows</text>
+<rect x="1024.4" y="890.0" width="92.4" height="18" fill="#262628"/>
+<text x="1024.4" y="903.5" fill="#F5A524" xml:space="preserve" font-weight="bold"> · 2 paused</text>
+<rect x="1116.8" y="890.0" width="117.6" height="18" fill="#262628"/>
+<text x="1116.8" y="903.5" fill="#B4B4B8" xml:space="preserve"> · 14 in scope</text>
+<rect x="1234.4" y="890.0" width="201.6" height="18" fill="#262628"/>
+<rect x="1436.0" y="890.0" width="8.4" height="18" fill="#262628"/>
+<text x="1436.0" y="903.5" fill="#B4B4B8" xml:space="preserve">—</text>
 <rect x="1444.4" y="890.0" width="109.2" height="18" fill="#262628"/>
 <text x="1444.4" y="903.5" fill="#8E8E93" xml:space="preserve" opacity="0.7"> ↑ — ↓ — (F4)</text>
 <rect x="1553.6" y="890.0" width="33.6" height="18" fill="#262628"/>

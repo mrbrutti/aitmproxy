@@ -18,9 +18,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aitm::render::render_cli_value;
-use aitm::wire::{assemble, Assembled, Http1Sender};
+use aitm::tui::TuiLog;
+use aitm::wire::{assemble, Assembled};
 use aitm::{config_file, env, tui};
-use aitm_core::{BrowserDriver, PipelineClient, ProxyClient};
+use aitm_core::BrowserDriver;
 use tracing::{info, warn};
 
 /// The config file path when `--config` is not given.
@@ -63,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
         Mode::Tui => tui::init_tracing(),
         Mode::Server | Mode::Cli(_) => {
             init_tracing();
-            None
+            TuiLog::Off
         }
     };
 
@@ -72,22 +73,14 @@ async fn main() -> anyhow::Result<()> {
     env::apply(&mut cfg, |k| std::env::var(k).ok());
     let Assembled { proxy, ca } = assemble(&cfg)?;
 
-    // Shared service handles for the frontends and the replay client.
-    let registry = proxy.registry_arc();
-    let store = proxy.store();
-    let guard = proxy.guard();
-    let client: Arc<dyn ProxyClient> = Arc::new(PipelineClient::new(
-        store.clone(),
-        guard.clone(),
-        Arc::new(Http1Sender::new().with_insecure(cfg.ssl_insecure)),
-    ));
-
     if let Mode::Cli(argv) = &mode {
-        // One-shot CLI dispatch (no browser needed).
-        let cli = aitm_cli::Cli::new(registry.clone())
+        // One-shot CLI dispatch (no browser needed): the same service
+        // handles the frontends share, without a browser or a log file.
+        let s = tui::services(&proxy, &cfg, None, TuiLog::Off);
+        let cli = aitm_cli::Cli::new(s.registry.clone())
             .with_ssrf_policy(cfg.browser.ssrf.clone())
             .with_poc_dir(cfg.poc.dir.clone())
-            .with_services(store.clone(), client.clone(), guard.clone(), None);
+            .with_services(s.store, s.client, s.guard, None);
         match cli.dispatch(argv) {
             Ok(value) => {
                 let mut stdout = std::io::stdout().lock();
@@ -116,26 +109,13 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let browser: Option<Arc<dyn BrowserDriver>> = launched.as_ref().map(|l| l.driver.clone());
+    // Shared service handles for the frontends and the replay client.
+    let services = tui::services(&proxy, &cfg, browser, tui_log);
 
     let result = if mode == Mode::Tui {
-        tui::run(
-            &cfg,
-            &proxy,
-            tui::Services {
-                registry,
-                store,
-                client,
-                guard,
-                browser,
-                log_path: tui_log,
-            },
-        )
-        .await
+        tui::run(&cfg, &proxy, services).await
     } else {
-        let mcp = aitm_mcp::McpServer::new(registry, cfg.mcp.transport.clone())
-            .with_ssrf_policy(cfg.browser.ssrf.clone())
-            .with_poc_dir(cfg.poc.dir.clone())
-            .with_services(store, client, guard, browser);
+        let mcp = tui::server(&cfg, cfg.mcp.transport.clone(), &services);
 
         // The main listener relays client traffic; the browser listener is
         // SSRF-filtered (the embedded browser dials `cfg.browser.proxy_addr`).

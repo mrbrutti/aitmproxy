@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Widget};
 
 use crate::app::{App, PaletteKind, BUILTIN_COMMANDS};
-use crate::model::{clock_of, scope_covers, AgentPolicy, FlowKind, Origin};
+use crate::model::{clock_of, scope_covers, value_text, AgentPolicy, FlowKind, Origin};
 use crate::theme::Theme;
 use crate::tokens::{color, glyph};
 use crate::ui::centered;
@@ -516,9 +516,8 @@ pub fn ca(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             let w = map.keys().map(String::len).max().unwrap_or(0).min(24);
             for (k, v) in map {
                 let text = match v {
-                    serde_json::Value::String(s) => s.clone(),
-                    serde_json::Value::Null => "—".into(),
-                    other => other.to_string(),
+                    serde_json::Value::Null => "—".to_string(),
+                    other => value_text(other),
                 };
                 lines.push(Line::from(vec![
                     Span::styled(format!(" {k:<w$}"), theme.text_secondary()),

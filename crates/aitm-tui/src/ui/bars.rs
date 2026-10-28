@@ -393,9 +393,13 @@ pub fn status(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut 
         ),
     };
     // Throughput needs the F4 push stream; until then the cluster says so
-    // (§2.7 "Status bar": `196 MB ↑ 6 KB/s ↓ 3 KB/s`).
+    // (§2.7 "Status bar": `196 MB ↑ 6 KB/s ↓ 3 KB/s`). The total is a dash
+    // until a size is known (F5), a real `0 B` once one is (§2.8).
+    let total = app
+        .total_bytes()
+        .map_or_else(|| "—".to_string(), human_bytes);
     let right = Line::from(vec![
-        Span::styled(human_bytes(app.total_bytes()), theme.text_secondary()),
+        Span::styled(total, theme.text_secondary()),
         Span::styled(format!(" {THROUGHPUT_PLACEHOLDER}"), theme.text_tertiary()),
         Span::styled("  ● ", bus_dot),
         Span::styled(format!("{bus_text} "), theme.text_secondary()),
