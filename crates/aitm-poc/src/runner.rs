@@ -196,6 +196,13 @@ impl StdPocRunner {
                 Step::Extract(ex_step) => {
                     bind_extractor(&Extractor::from(ex_step), &mut ctx, &mut live);
                 }
+                // M3 Task 13 replaces this arm with `ScriptStepExecutor` dispatch;
+                // until then a script step cannot run without the Rhai runtime.
+                Step::Script(_) => {
+                    return Err(anyhow::anyhow!(
+                        "script steps require the Rhai runtime (wire a ScriptStepExecutor)"
+                    ));
+                }
             }
         }
 
@@ -369,7 +376,7 @@ fn precheck(poc: &Poc) -> anyhow::Result<()> {
                 }
             }
             Step::Extract(ex) => check_extract(ex)?,
-            Step::Browser(_) => {}
+            Step::Browser(_) | Step::Script(_) => {}
         }
     }
     Ok(())
