@@ -1,6 +1,6 @@
 # Core-connection model and a self-contained macOS app — design
 
-**Status:** draft
+**Status:** approved (2026-10-28 by Matt)
 **Research inputs:** `docs/research/05-synthesis.md`; `docs/research/07-ca-install.md`;
 `apps/mac/docs/CAPABILITIES.md`; the first-run hygiene findings from running the
 packaged binary (memory `aitmproxy-operator-first-run-hygiene`).
@@ -63,7 +63,8 @@ the bus token.
 - **Changing the bus protocol, the MCP command surface, or how `tui`/`web` embed
   the core in-process.** Those stay as they are; the app reuses the same
   loopback-TCP contract the other clients use.
-- **A universal (arm64 + x86_64) build, unless Matt wants it** (open question).
+- **A universal (arm64 + x86_64) build.** Matt's call (O4): the `.app` bundles an
+  **arm64-only** core, matching the v0.1.0 release target (Apple Silicon, macOS 26+).
 
 ## Anti-goals
 
@@ -167,13 +168,21 @@ CoreConnection
   are implemented; `.remote` is a named case with no behaviour yet, present so the
   future secure-transport milestone adds a variant and its endpoint/auth fields
   rather than reshaping the type.
-- **One active connection now.** The app holds a single active `CoreConnection`.
-  The default is `.embedded`. `.external` is selected in Settings (the existing
-  `BusSettings` hooks: host/port/token-file, or "read from config.yaml") or by
-  launch argument (`--bus host:port` + `--token`/`--token-file`, already parsed by
-  `BusEndpoint.fromArguments`). The seam for "several at once" is that nothing in
-  the flow store, the bus client, or the row model assumes the active connection
-  is the only one — they are keyed by `CoreID`; the UI simply exposes one today.
+- **One active connection now — but the choice is switchable, persistent state
+  (O1).** The app holds a single *active* `CoreConnection`, chosen by a persisted
+  setting (`bus.activeKind` / connection reference in Application Support), **not**
+  a launch-time-only branch. The default is `.embedded`. Selecting an external
+  core in Settings (the existing `BusSettings` hooks: host/port/token-file, or
+  "read from config.yaml"; or the `--bus host:port` + `--token`/`--token-file`
+  launch argument already parsed by `BusEndpoint.fromArguments`) makes external the
+  active connection and the app does **not** spawn an embedded core while external
+  is active. Crucially, choosing external **does not permanently disable** the
+  embedded core: the operator can switch back to embedded at any time from Settings
+  — which (re)starts the embedded core and makes it active — and switch away again.
+  Switching is therefore start/stop + make-active over a persisted choice. The seam
+  for "several at once" is that nothing in the flow store, the bus client, or the
+  row model assumes the active connection is the only one — they are keyed by
+  `CoreID`; the UI simply exposes one active choice today.
 - **`tui`/`web` are embedded too.** This names what they already do: an in-process
   core is a degenerate `.embedded` connection (no socket). No code change is
   required there now; the vocabulary just lines up so a future external-connect
@@ -235,24 +244,32 @@ lifecycle of one `aitm` child:
   core-log/health surface (C4). Because of layer A, that stream carries no token
   and no handshake spam.
 
-**C3 — Port-in-use / already-running core.** The bus port is ephemeral, so the
-*bus* never collides. The **proxy** (`listen`, default `8080`) and
-**browser-proxy** (`browser.proxy_addr`) are fixed ports and can be taken — by a
-previous `aitm`, another app, or a formula-run core the user already started.
-Behaviour: the embedded core fails to bind, exits with a clear error; the manager
-catches it, enters `.degraded`, and the app surfaces a legible choice rather than
-retry-looping. **(Architect's call)** the surfaced options are: retry, pick an
-alternate proxy port, or switch this connection to **external** (connect to the
-core that already holds the port) — the exact affordance is a UX question for
-Matt (open question O3). A user who deliberately runs their own core and wants
-the app to use it chooses external in Settings; embedded stays the default.
+**C3 — Port-in-use / already-running core (O3: auto-pick an alternate port).**
+The bus port is ephemeral, so the *bus* never collides. The **proxy** (`listen`,
+default `8080`) and **browser-proxy** (`browser.proxy_addr`) are fixed ports and
+can be taken — by a previous `aitm`, another app, or a formula-run core the user
+already started. Behaviour (Matt's call): the embedded-core manager **auto-picks
+an alternate proxy port** when the configured one is taken, and **surfaces which
+port it bound quietly, via the health UI** (C4) — no modal, no retry loop. The
+manager probes for a free port before (or on bind-failure, retries with) an
+alternate; the resolved proxy/browser-proxy ports flow into the connection's
+status/health so the operator can see where the proxy actually listens. A user who
+instead wants the app to adopt a core they started themselves chooses **external**
+in Settings (O1); embedded with an auto-chosen port stays the default.
 
-**C4 — Core logs & health in the app.** The app owns the only window onto an
-embedded core's health (there is no terminal). It shows connection status
-(`CoreConnection.status`) and exposes the captured core log. **(Architect's
-call)** reuse the existing Connection Log / Overview surfaces the app already has;
-the precise presentation — live tail, health indicator, where "restarting…" and
-`.degraded` reasons appear — is an open UX question for Matt (O2).
+**C4 — Core logs & health in the app (O2: health dot + on-demand log panel).**
+The app owns the only window onto an embedded core's health (there is no
+terminal). Matt's call: an **always-visible health dot** reflecting the
+connection status — **running / restarting / failed** (mapped from
+`CoreConnection.status`: `.ready` → running, `.starting`/restart-backoff →
+restarting, `.degraded`/`.stopped` → failed) — plus an **on-demand log view
+panel** that shows the captured core stdout/stderr when the operator opens it.
+**Not** an always-on live tail. The health dot also carries the quietly-surfaced
+facts from C3 (the actual proxy port when an alternate was chosen) and the
+`.degraded` reason with the stderr tail when a restart gives up. **(Architect's
+call)** place the dot in a persistent, always-visible spot (toolbar/status area)
+and reuse the existing Connection Log surface for the on-demand panel; exact
+placement within those is the builder's.
 
 ### Install & docs (layer C, shipping artifacts)
 
@@ -295,12 +312,16 @@ the precise presentation — live tail, health indicator, where "restarting…" 
 8. **AC8 — Restart on crash.** Killing the embedded `aitm` while the app runs
    triggers a bounded restart that reconnects; after the backoff cap the app shows
    `.degraded` with the stderr tail rather than looping.
-9. **AC9 — Port-in-use is legible.** With the proxy port already bound, the
-   embedded core's bind failure surfaces as a `.degraded` connection with a clear
-   message and the operator choice (not a silent retry loop or a crash).
-10. **AC10 — External opt-in still works.** Selecting an external core in Settings
-    (or `--bus`+token) connects to an already-running core and does **not** spawn
-    an embedded one; switching back to embedded spawns and connects.
+9. **AC9 — Port-in-use auto-recovers.** With the proxy port already bound, the
+   embedded core comes up on an **auto-chosen alternate proxy port** and connects;
+   the health UI shows the port it actually bound. No modal, no retry loop, no
+   crash.
+10. **AC10 — Active connection is switchable, persistent state.** Selecting an
+    external core in Settings (or `--bus`+token) makes external active, connects to
+    the already-running core, and does **not** spawn an embedded one. Switching
+    back to embedded in Settings (re)starts the embedded core and makes it active;
+    the choice persists across app restarts. A test covers the state transition in
+    both directions and that external never permanently disables embedded.
 11. **AC11 — Bundled binaries are signed & notarized.** `aitm` and `obscura`
     inside the `.app` are signed (Developer ID, hardened runtime) and the DMG
     notarizes and staples with them nested.
@@ -327,26 +348,21 @@ the precise presentation — live tail, health indicator, where "restarting…" 
 
 ## Open questions
 
-Only Matt can answer these; empty before approval.
+None — all resolved by Matt on 2026-10-28:
 
-- **O1 — Both external *and* embedded configured: which wins, and is it visible?**
-  If an operator has set an external core in Settings but the app can also spawn an
-  embedded one, is external an explicit override (and embedded never starts), or
-  does the app offer a choice at launch? Recommendation: external in Settings is an
-  explicit override — the app does not spawn embedded when external is selected.
-- **O2 — How should the app surface core logs and health?** A live log tail in the
-  Connection Log, a health dot in the toolbar/Overview, a "restarting…" banner —
-  how much, and where? This drives C4.
-- **O3 — Port-in-use affordance.** When the proxy/browser port is taken, should the
-  app offer to (a) retry, (b) auto-pick an alternate proxy port, (c) switch to
-  external and adopt the running core, or some subset? This drives C3/AC9.
-- **O4 — Universal vs arm64-only bundling.** Ship an arm64-only `.app` (matches the
-  current target: Apple Silicon, macOS 26+) or a universal binary? Universal
-  roughly doubles the bundled-binary size and the build matrix.
-- **O5 — Is the small Rust `--bus-endpoint-file` addition acceptable**, or do you
-  prefer the app learn the port another way (pre-bind-and-pass, parse a stdout
-  line)? The rendezvous file keeps the token off stdout and matches the obscura
-  precedent, which is why it is the recommendation.
-- **O6 — Phasing.** Ship layer A (hygiene) as its own change now, ahead of B/C?
-  Recommendation: yes — it is low-risk, operator-visible, and unblocks nothing it
-  depends on.
+- **O1 — External vs embedded:** external overrides (embedded does not spawn while
+  external is active), but the active-core choice is **switchable, persistent
+  state**, not launch-only; the operator can switch back to embedded anytime from
+  Settings. Folded into Design B ("One active connection — but switchable").
+- **O2 — Health/logs:** an always-visible **health dot** (running / restarting /
+  failed) plus an **on-demand log view panel**, not an always-on tail. Folded into
+  Design C4.
+- **O3 — Port-in-use:** **auto-pick an alternate proxy port** and surface which
+  port it bound quietly via the health UI. Folded into Design C3 / AC9.
+- **O4 — Bundle arch:** **arm64-only** (matches the v0.1.0 target). Folded into
+  Constraints / Non-goals.
+- **O5 — `--bus-endpoint-file`:** **yes**, add the small core flag so the child
+  publishes its bound bus `host:port` without the token touching stdout. Folded
+  into Design C2.
+- **O6 — Phasing:** **yes**, Layer A (log/token hygiene) ships first as its own
+  independently-landable change, ahead of B and C.
