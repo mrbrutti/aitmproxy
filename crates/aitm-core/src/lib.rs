@@ -32,8 +32,9 @@ pub use chain::Chain;
 pub use client::{PipelineClient, RequestSender};
 pub use command::{Command, ParamDef, ParamSchema, Sensitivity, TypeDesc};
 pub use config::{
-    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, FirefoxConfig, LimitConfig,
-    McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SsrfPolicy,
+    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, FindingsConfig, FirefoxConfig,
+    LimitConfig, McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry,
+    SsrfPolicy,
 };
 pub use ctx::{
     BrowserDriver, ClickTarget, CommandHost, FlowCtx, Frontend, NavOutcome, ProxyClient,

@@ -19,6 +19,7 @@ pub struct Config {
     pub mcp: McpConfig,
     pub browser: BrowserConfig,
     pub poc: PocConfig,
+    pub findings: FindingsConfig,
     /// Skip verification of upstream server certificates. **Off by default**:
     /// the proxy verifies upstream TLS against the platform roots. Turning this
     /// on (for a lab with self-signed targets) trusts any upstream certificate.
@@ -42,6 +43,7 @@ impl Default for Config {
             mcp: McpConfig::default(),
             browser: BrowserConfig::default(),
             poc: PocConfig::default(),
+            findings: FindingsConfig::default(),
             ssl_insecure: false,
             max_flows: crate::store::DEFAULT_MAX_FLOWS,
             max_flow_bytes: crate::store::DEFAULT_MAX_FLOW_BYTES,
@@ -62,6 +64,16 @@ pub struct PocConfig {
     /// `poc.artifact` only serves files confined to this directory, so a
     /// remote/web surface can read run artifacts safely.
     pub out_dir: Option<PathBuf>,
+}
+
+/// Persistent findings / run-history store configuration (M4 Stream B).
+#[derive(Debug, Clone, Default)]
+pub struct FindingsConfig {
+    /// Where the findings store writes one human-readable YAML per finding plus a
+    /// `runs.jsonl` run-history log. `None` (the default) disables persistence:
+    /// `findings.list`/`get` return nothing and `findings.record` errors. A
+    /// sensible deployment points this at a sibling of `poc.dir`.
+    pub dir: Option<PathBuf>,
 }
 
 /// Scope configuration. Deny-by-default: an empty list means nothing is active.
