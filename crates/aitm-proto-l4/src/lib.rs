@@ -16,6 +16,7 @@ pub mod config;
 pub mod craft;
 pub mod flow;
 pub mod guard;
+pub mod intercept;
 pub mod module;
 pub mod types;
 pub mod wire;
