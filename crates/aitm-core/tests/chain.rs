@@ -171,6 +171,59 @@ async fn intercept_resume_forwards() {
     );
 }
 
+/// A killed parked flow must stay `Killed` after the chain's pausable future
+/// wakes, so the HTTP module drops the connection instead of forwarding it.
+///
+/// Regression: the chain used to clobber the kill back to `Resumed` on wake, so
+/// a killed, intercept-armed request was forwarded upstream and the client
+/// received the upstream response instead of a closed connection — the
+/// `flow.kill` safety control did nothing.
+#[tokio::test]
+async fn intercept_kill_is_dropped_not_forwarded() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(Interceptor));
+    let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+    let id = store.insert(http_flow());
+    let chain = Arc::new(Chain::new(Arc::new(reg), store.clone()));
+
+    // Dispatch parks on the resume receiver, so run it concurrently.
+    let chain2 = chain.clone();
+    let task = tokio::spawn(async move { chain2.dispatch(Event::Request(id)).await });
+
+    // Wait until the flow is parked, then grab its resume handle.
+    let resume = loop {
+        if let Some(Flow::Http(f)) = store.get(id) {
+            if let InterceptState::Intercepted { resume, .. } = &f.intercept {
+                break resume.clone();
+            }
+        }
+        tokio::task::yield_now().await;
+    };
+
+    // Reproduce exactly what the intercept plugin's `release(.., Kill)` does:
+    // record `Killed` in the store, then wake the parked future.
+    store.update(id, &mut |f: &mut Flow| {
+        if let Flow::Http(h) = f {
+            h.intercept = InterceptState::Killed;
+        }
+    });
+    resume.fire();
+
+    let verdict = task.await.expect("dispatch completes");
+
+    // The kill survives the wake: the flow is still `Killed` (so the HTTP module
+    // drops the connection rather than forwarding), and the chain halts.
+    assert!(
+        matches!(store.get(id), Some(Flow::Http(f)) if matches!(f.intercept, InterceptState::Killed)),
+        "a killed flow must stay Killed after the wake, not be forwarded as Resumed"
+    );
+    assert_eq!(
+        verdict,
+        Verdict::Halt,
+        "a killed flow halts the chain instead of continuing to forward"
+    );
+}
+
 /// An intercepted flow that is never resumed is killed after the timeout, so it
 /// cannot pin the flow (or its backup) forever.
 #[tokio::test]
