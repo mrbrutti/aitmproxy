@@ -1,0 +1,103 @@
+/* The shell (§2.6): sidebar 240 | main; main = toolbar 44 / chip bar 36 / [filter bar] / body;
+   status bar 28 spans the full width. The body is list (+ intercept bar) | splitter | lower. */
+.app {
+  height: 100%;
+  display: grid;
+  grid-template-columns: var(--size-sidebar) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) var(--size-status-bar);
+  background: var(--color-ground-surface);
+  color: var(--color-text-primary);
+}
+.app[data-sidebar='closed'] {
+  grid-template-columns: minmax(0, 1fr);
+}
+.app[data-sidebar='closed'] .sidebar {
+  display: none;
+}
+@media (max-width: 1100px) {
+  .app {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .sidebar {
+    display: none;
+  }
+}
+
+.sidebar {
+  grid-row: 1 / 2;
+  min-width: 0;
+  min-height: 0;
+}
+
+.main {
+  grid-row: 1 / 2;
+  display: grid;
+  grid-template-rows: var(--size-toolbar) var(--size-filter-bar) auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+}
+
+.body {
+  display: grid;
+  min-height: 0;
+  min-width: 0;
+}
+.body[data-layout='horizontal'] {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(120px, 1fr) 1px minmax(120px, var(--split, 53.5%));
+}
+.body[data-layout='vertical'] {
+  grid-template-rows: minmax(0, 1fr);
+  grid-template-columns: minmax(240px, 1fr) 1px minmax(240px, var(--split, 50%));
+}
+
+.listPane {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  min-height: 0;
+  min-width: 0;
+}
+
+.splitter {
+  position: relative;
+  background: var(--color-line-border);
+  z-index: 2;
+}
+.splitter::after {
+  content: '';
+  position: absolute;
+}
+.body[data-layout='horizontal'] .splitter {
+  cursor: row-resize;
+}
+.body[data-layout='horizontal'] .splitter::after {
+  inset: -3px 0;
+}
+.body[data-layout='vertical'] .splitter {
+  cursor: col-resize;
+}
+.body[data-layout='vertical'] .splitter::after {
+  inset: 0 -3px;
+}
+.splitter:focus-visible {
+  outline: none;
+  background: var(--color-line-focus);
+}
+.dragging,
+.dragging * {
+  cursor: inherit !important;
+  user-select: none !important;
+}
+
+.lower {
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.statusbar {
+  grid-column: 1 / -1;
+  grid-row: 2 / 3;
+}

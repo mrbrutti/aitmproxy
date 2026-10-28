@@ -1,0 +1,44 @@
+/* Mark colours (§2.7: "6px colour swatch, 11 colours as Proxyman" = the macOS system colours).
+   tokens.json has no `color.mark.*` group yet, so these live here until it does; everything else
+   in the UI reads tokens.css. Light / dark pairs follow Apple's system colour values. */
+:root {
+  --mark-red: #ff3b30;
+  --mark-orange: #ff9500;
+  --mark-yellow: #ffcc00;
+  --mark-green: #34c759;
+  --mark-mint: #00c7be;
+  --mark-teal: #30b0c7;
+  --mark-cyan: #32ade6;
+  --mark-blue: #007aff;
+  --mark-indigo: #5856d6;
+  --mark-purple: #af52de;
+  --mark-pink: #ff2d55;
+}
+:root[data-theme='dark'] {
+  --mark-red: #ff453a;
+  --mark-orange: #ff9f0a;
+  --mark-yellow: #ffd60a;
+  --mark-green: #30d158;
+  --mark-mint: #63e6e2;
+  --mark-teal: #40c8e0;
+  --mark-cyan: #64d2ff;
+  --mark-blue: #0a84ff;
+  --mark-indigo: #5e5ce6;
+  --mark-purple: #bf5af2;
+  --mark-pink: #ff375f;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --mark-red: #ff453a;
+    --mark-orange: #ff9f0a;
+    --mark-yellow: #ffd60a;
+    --mark-green: #30d158;
+    --mark-mint: #63e6e2;
+    --mark-teal: #40c8e0;
+    --mark-cyan: #64d2ff;
+    --mark-blue: #0a84ff;
+    --mark-indigo: #5e5ce6;
+    --mark-purple: #bf5af2;
+    --mark-pink: #ff375f;
+  }
+}
