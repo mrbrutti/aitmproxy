@@ -22,6 +22,12 @@ etherparse = "0.21"
 # `thiserror` for `L4GuardError` — a trivial Cargo.toml merge at integration,
 # flagged in the Task 2 handover.)
 thiserror = "2"
+# Wire backend (M5 Task 6): libpcap bindings for L2 capture + inject
+# (`Capture::sendpacket`), the same code path on macOS and Linux. Version pinned
+# from research note 08 (pcap 2.5.0, best-maintained of the group). libpcap ships
+# with macOS; Linux needs `libpcap-dev`. The crate's own `unsafe` stays internal —
+# the aitm-proto-l4 crate root keeps `#![forbid(unsafe_code)]` (AC20).
+pcap = "2.5"
 
 [dev-dependencies]
 # config is authored as YAML by the operator; the deserialization test parses it.
