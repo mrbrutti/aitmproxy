@@ -63,7 +63,16 @@ struct ScopePanel: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
-        .onAppear { if entries.isEmpty { fieldFocused = true } }
+        .onAppear {
+            // Flow ▸ Add Host to Scope… (⇧S) opens with the focused row's host typed in.
+            if let host = session.scopeSheetHost {
+                draft = host
+                session.scopeSheetHost = nil
+                fieldFocused = true
+            } else if entries.isEmpty {
+                fieldFocused = true
+            }
+        }
         .onChange(of: session.scopeHosts) { pending.removeAll { session.scopeHosts.contains($0) } }
     }
 

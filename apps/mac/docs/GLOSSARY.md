@@ -43,7 +43,14 @@ One name per thing, everywhere: buttons, menus, tooltips, errors, stories.
 | Inspector | The Request \| Response area under the list | detail, preview, viewer |
 | Request pane / Response pane | The two halves of the inspector | left/right side |
 | Body viewer | A tab that renders a body: Pretty, Tree, Image, Hex, Raw, Diff | previewer, formatter |
-| Quick Look | A floating preview of a body (Space) | peek, popup |
+| Quick Look | A floating preview of a body (Space on the list; Flow ▸ Quick Look Body) | peek, popup |
+| Resume All | Release every paused flow (⌥⌘⏎) | continue all, release all |
+| Revert to Original | Drop the draft edits of a paused request | reset, discard |
+| Copy as | Copy a flow as cURL (⇧⌘C), httpie, Python (requests) or fetch | export code, snippet |
+| Diff Selected | Compare two selected flows in the Diff tab (⌘D) | compare |
+| Add Host to Scope… | Open Scope with the focused row's host typed in (⇧S) | whitelist, allow host |
+| Toggle Sidebar | Show or hide the sidebar (⌃⌘S) | collapse |
+| Approve Pending Request | Run the oldest gated agent command (⌥⏎) | accept, allow once |
 | Bus | The proxy's command bus the app talks to; connected, connecting or offline | server, backend, MCP server (in UI text) |
 | Listening | The proxy's client-facing address, shown in the toolbar pill | endpoint, port |
 | Column | A flow-list column; reorder, resize, hide from the header's context menu | field |

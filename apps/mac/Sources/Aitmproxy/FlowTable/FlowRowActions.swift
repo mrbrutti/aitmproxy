@@ -1,5 +1,6 @@
 import AitmproxyKit
 import AppKit
+import Quartz
 import SwiftUI
 
 /// What a row can do, from the keyboard (S-010), the context menu or the Flow menu.
@@ -29,9 +30,34 @@ final class FlowKeyTable: NSTableView {
         case "m": onVerb?(.mark(nil))
         case "c": onVerb?(.comment)
         case "p": onVerb?(.buildPoC)
-        case " ": onVerb?(.quickLook)
+        case " ":
+            // Space toggles Quick Look, as in Finder.
+            if QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible {
+                QLPreviewPanel.shared().orderOut(nil)
+            } else {
+                onVerb?(.quickLook)
+            }
         case "\r": onEnter?()
         default: super.keyDown(with: event)
+        }
+    }
+
+    // MARK: Quick Look controller
+
+    // AppKit declares these nonisolated; it calls them on the main thread.
+    nonisolated override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool { true }
+
+    nonisolated override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        MainActor.assumeIsolated {
+            panel.dataSource = BodyQuickLook.shared
+            panel.delegate = BodyQuickLook.shared
+        }
+    }
+
+    nonisolated override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        MainActor.assumeIsolated {
+            panel.dataSource = nil
+            panel.delegate = nil
         }
     }
 }

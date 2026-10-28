@@ -124,7 +124,7 @@ final class BusService: FlowActions {
     /// One call, recorded for the activity log whatever the outcome.
     private func call(_ name: String, _ args: [String: JSONValue] = [:]) async throws -> JSONValue {
         do {
-            let value = try await call(name, args)
+            let value = try await live().call(name, args)
             session.commandRecorder?(name, args, nil)
             return value
         } catch {

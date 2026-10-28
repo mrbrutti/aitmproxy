@@ -7,10 +7,11 @@ struct ShellView: View {
     @Environment(Session.self) private var session
     @Environment(\.openSettings) private var openSettings
     @Environment(\.openWindow) private var openWindow
-    @State private var sidebarVisible = true
     @State private var bus: BusService?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        @Bindable var session = session
         Group {
             // APP_KIT_GALLERY=1 shows the parts gallery (DesignKit/KitGallery.swift) in place of the shell.
             if KitGallery.enabled {
@@ -18,7 +19,7 @@ struct ShellView: View {
             } else {
                 VStack(spacing: 0) {
                     // Hosting controllers do not inherit this view's environment: pass it on.
-                    ShellSplitView(sidebarVisible: $sidebarVisible,
+                    ShellSplitView(sidebarVisible: $session.sidebarVisible,
                                    sidebar: SidebarView().environment(session).themed(),
                                    main: MainView().environment(session).themed())
                     StatusBar()
@@ -30,9 +31,12 @@ struct ShellView: View {
             if session.paletteVisible {
                 ZStack(alignment: .top) {
                     Color.black.opacity(0.001).ignoresSafeArea().onTapGesture { session.paletteVisible = false }
+                    // Keyboard opens land in the same frame; the mouse gets the popover motion,
+                    // a fade only under Reduce Motion (S-069).
                     CommandPalette()
                         .padding(.top, Space.section * 2)
                         .transition(session.paletteOpenedByKeyboard ? .identity
+                                    : reduceMotion ? .opacity
                                     : .scale(scale: 0.97, anchor: .top).combined(with: .opacity))
                 }
                 .animation(session.paletteOpenedByKeyboard ? nil : Tok.Motion.easeOut(Tok.Motion.popover), value: session.paletteVisible)
@@ -47,7 +51,7 @@ struct ShellView: View {
         .sheet(isPresented: Binding(get: { session.scopeSheetVisible }, set: { session.scopeSheetVisible = $0 })) {
             ScopeSheet().environment(session).themed()
         }
-        .toolbar { ShellToolbar(sidebarVisible: $sidebarVisible) }
+        .toolbar { ShellToolbar(sidebarVisible: $session.sidebarVisible) }
         .onChange(of: session.detachRequestTick) { openWindow(id: "inspector") }
         .task {
             session.attachActivityHooks()
@@ -160,7 +164,7 @@ struct MainView: View {
                 flowTable
             } else {
                 FlowTableView(rows: session.secondVisibleRows, selection: $session.secondSelection, sort: $session.secondQuery.sort,
-                              density: session.density, layoutURL: nil,
+                              density: session.density, layoutURL: nil, quickLookTick: session.quickLookTick,
                               isPinned: { session.isPinned(.host($0)) },
                               onComment: { id, text in session.comment(id, text) },
                               onFocus: { id in session.focus(pane: 1, on: id) },
@@ -178,7 +182,7 @@ struct MainView: View {
     private var flowTable: some View {
         @Bindable var session = session
         return FlowTableView(rows: session.visibleRows, selection: $session.selection, sort: $session.sort,
-                             density: session.density, layoutURL: session.columnsURL,
+                             density: session.density, layoutURL: session.columnsURL, quickLookTick: session.quickLookTick,
                              isPinned: { session.isPinned(.host($0)) },
                              onComment: { id, text in session.comment(id, text) },
                              onFocus: { id in session.focus(pane: 0, on: id) },

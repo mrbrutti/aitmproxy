@@ -115,9 +115,15 @@ struct FlowCommands: Commands {
             }
             .keyboardShortcut(.return, modifiers: .command)
             .disabled(session.interceptTarget == nil)
+            Button("Resume All") { session.resumeAll() }
+                .keyboardShortcut(.return, modifiers: [.command, .option])
+                .disabled(session.paused.isEmpty)
             Button("Edit Paused Request") { if let id = session.focused { session.perform(.edit, on: id) } }
                 .keyboardShortcut("e", modifiers: [])
                 .disabled(session.focusedRow?.state != .paused)
+            // ⌘Z stays Undo inside the request editor; the item reverts the whole draft.
+            Button("Revert to Original") { if let id = session.focused { session.revertDraft(id) } }
+                .disabled(session.focused.map { session.pendingEditCount($0) > 0 } != true)
             Button("Kill") { if let target = session.interceptTarget { session.perform(.kill, on: target.id) } }
                 .keyboardShortcut("\\", modifiers: .command)
                 .disabled(session.interceptTarget == nil)
@@ -130,7 +136,6 @@ struct FlowCommands: Commands {
                 .disabled(session.focused == nil)
             Divider()
             Button("Resume Selected") { session.resumeSelected() }
-                .keyboardShortcut(.return, modifiers: [.command, .option])
                 .disabled(session.selectedRows.allSatisfy { $0.state != .paused })
             Button("Kill Selected") { session.killSelected() }
                 .disabled(session.selectedRows.allSatisfy { $0.state != .paused })
@@ -159,6 +164,24 @@ struct FlowCommands: Commands {
             }
             .keyboardShortcut("p", modifiers: .shift)
             .disabled(session.focused == nil)
+            Button("Add Host to Scope…") { session.addFocusedHostToScope() }
+                .keyboardShortcut("s", modifiers: .shift)
+                .disabled(session.focused == nil)
+            Divider()
+            Menu("Copy as") {
+                Button("Copy as cURL") { session.copyFocused(as: .curl) }
+                    .keyboardShortcut("c", modifiers: [.shift, .command])
+                Button("Copy as httpie") { session.copyFocused(as: .httpie) }
+                Button("Copy as Python (requests)") { session.copyFocused(as: .python) }
+                Button("Copy as fetch") { session.copyFocused(as: .fetch) }
+            }
+            .disabled(session.focusedDetail == nil)
+            Button("Diff Selected") { session.diffSelected() }
+                .keyboardShortcut("d", modifiers: .command)
+                .disabled(!session.canDiffSelected)
+            // Space on the focused list; a menu shortcut would take Space from every field.
+            Button("Quick Look Body") { if let id = session.focused { session.perform(.quickLook, on: id) } }
+                .disabled(session.focused == nil)
         }
         CommandMenu("Proxy") {
             Button("Breakpoint Rules…") { session.rulesVisible = true }
@@ -184,6 +207,9 @@ struct FlowCommands: Commands {
             Divider()
             Button(session.activityLogVisible ? "Hide Activity Log" : "Activity Log…") { session.activityLogVisible.toggle() }
                 .keyboardShortcut("l", modifiers: [.command, .shift])
+            Button("Approve Pending Request") { session.approvePendingRequest() }
+                .keyboardShortcut(.return, modifiers: .option)
+                .disabled(session.activity.pending.isEmpty)
         }
         CommandMenu("View") {
             Button(session.filterBarVisible ? "Hide Filter Bar" : "Show Filter Bar") { session.filterBarVisible.toggle() }
@@ -198,15 +224,28 @@ struct FlowCommands: Commands {
             Button("Find in Body") { session.findRequestTick += 1 }
                 .keyboardShortcut("f", modifiers: [.command, .option])
                 .disabled(session.focused == nil)
+            Button("Toggle Sidebar") { session.sidebarVisible.toggle() }
+                .keyboardShortcut("s", modifiers: [.command, .control])
             Divider()
+            // ⌘1…⌘9: the first nine chips, in chip-bar order (foundation §2.7).
+            Menu("Chip") {
+                ForEach(Array(ContentCategory.groups.flatMap { $0 }.prefix(9).enumerated()), id: \.offset) { index, chip in
+                    Toggle(chip.title, isOn: Binding(get: { session.chip == chip }, set: { _ in session.chip = chip }))
+                        .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
+                }
+            }
             Picker("Sort By", selection: Binding(get: { session.sort.key }, set: { session.sort = FlowSort(key: $0, ascending: true) })) {
                 ForEach(FlowSort.Key.allCases, id: \.self) { Text($0.title).tag($0) }
             }
-            Picker("Layout", selection: Binding(get: { session.layout }, set: { session.layout = $0 })) {
-                ForEach(InspectorLayout.allCases, id: \.self) { Text($0.title).tag($0) }
+            Divider()
+            // One item per layout, so each carries its ⌥⌘1…3 (a Picker's options cannot).
+            ForEach(Array(InspectorLayout.allCases.enumerated()), id: \.offset) { index, layout in
+                Toggle(layout.title, isOn: Binding(get: { session.layout == layout }, set: { _ in session.layout = layout }))
+                    .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: [.command, .option])
             }
             Toggle("Split View", isOn: Binding(get: { session.splitView }, set: { session.splitView = $0 }))
                 .keyboardShortcut("4", modifiers: [.command, .option])
+            Divider()
             Picker("Density", selection: Binding(get: { session.density }, set: { session.density = $0 })) {
                 ForEach(Density.allCases) { Text($0.title).tag($0) }
             }

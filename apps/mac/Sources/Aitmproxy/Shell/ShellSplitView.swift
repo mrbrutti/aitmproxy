@@ -42,7 +42,12 @@ struct ShellSplitView<Sidebar: View, Main: View>: NSViewControllerRepresentable 
         (controller.splitViewItems[1].viewController as? NSHostingController<Main>)?.rootView = main
         let item = controller.splitViewItems[0]
         if item.isCollapsed == sidebarVisible {
-            item.animator().isCollapsed = !sidebarVisible
+            // No slide under Reduce Motion (S-069).
+            if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                item.isCollapsed = !sidebarVisible
+            } else {
+                item.animator().isCollapsed = !sidebarVisible
+            }
         }
         context.coordinator.openAtIdealWidthOnce()
     }

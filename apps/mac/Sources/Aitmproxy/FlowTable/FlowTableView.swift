@@ -1,5 +1,6 @@
 import AitmproxyKit
 import AppKit
+import Quartz
 import SwiftUI
 
 /// The flow list (foundation §2.10a): an `NSTableView`, because SwiftUI's
@@ -13,6 +14,8 @@ struct FlowTableView: NSViewRepresentable {
     var density: Density
     /// Where the column layout is kept; nil keeps it in memory only.
     var layoutURL: URL?
+    /// Bumped by the session when the list should show Quick Look (`BodyQuickLook` holds the file).
+    var quickLookTick = 0
     /// Whether a host is pinned (for the context menu's Pin/Unpin label).
     var isPinned: (String) -> Bool = { _ in false }
     /// A comment saved from the popover.
@@ -114,6 +117,15 @@ struct FlowTableView: NSViewRepresentable {
             table.selectRowIndexes(wanted, byExtendingSelection: false)
             coordinator.syncing = false
         }
+        if coordinator.quickLookTick != quickLookTick {
+            coordinator.quickLookTick = quickLookTick
+            // The table controls the panel (FlowKeyTable); take focus so AppKit asks it.
+            if let panel = QLPreviewPanel.shared() {
+                table.window?.makeFirstResponder(table)
+                panel.makeKeyAndOrderFront(nil)
+                panel.reloadData()
+            }
+        }
     }
 
     final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
@@ -121,6 +133,7 @@ struct FlowTableView: NSViewRepresentable {
         var rows: [FlowRow] = []
         var density: Density
         var appliedSort: FlowSort = .captureOrder
+        var quickLookTick: Int
         weak var table: NSTableView?
         /// True while `updateNSView` pushes SwiftUI's selection or sort into the table.
         var syncing = false
@@ -129,6 +142,7 @@ struct FlowTableView: NSViewRepresentable {
         init(_ parent: FlowTableView) {
             self.parent = parent
             self.density = parent.density
+            self.quickLookTick = parent.quickLookTick
         }
 
         // MARK: Rows
@@ -140,6 +154,8 @@ struct FlowTableView: NSViewRepresentable {
             let view = tableView.makeView(withIdentifier: id, owner: nil) as? FlowRowView ?? FlowRowView()
             view.identifier = id
             view.leftEdge = rows[row].leftEdge?.nsColor
+            // VoiceOver reads the row in the screen's words (S-069); cells add nothing.
+            view.setAccessibilityLabel(rows[row].accessibilityDescription)
             return view
         }
 

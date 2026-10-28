@@ -246,9 +246,82 @@ enum SelfTest {
                 check("a FlowId parameter becomes a flow picker preset to the focused flow", form.values["id"] == session.focused?.raw && !form.missing.isEmpty == (session.focused == nil))
             }
 
+            // S-069: the menu bar carries the brief's command map, and a bare-letter
+            // shortcut never takes a letter from a text field.
+            checkMenuCoverage()
+            await checkTypingIsNotAVerb(session)
+
             print(failures == 0 ? "SELFTEST PASS \(count) checks" : "SELFTEST FAIL \(failures) of \(count) checks")
             finish(code: failures == 0 ? 0 : 1)
         }
+    }
+
+    // MARK: S-069
+
+    private struct MenuEntry {
+        var title: String
+        var shortcut: Shortcut?
+    }
+
+    /// Every item of every menu, submenus included, with its key equivalent as a `Shortcut`.
+    private static func allMenuItems() -> [MenuEntry] {
+        var out: [MenuEntry] = []
+        func walk(_ menu: NSMenu) {
+            menu.update()
+            for item in menu.items {
+                var key = item.keyEquivalent
+                var shift = item.keyEquivalentModifierMask.contains(.shift)
+                if key.count == 1, key != key.lowercased() { shift = true; key = key.lowercased() }
+                let mask = item.keyEquivalentModifierMask
+                let shortcut = key.isEmpty ? nil
+                    : Shortcut(key, command: mask.contains(.command), shift: shift, option: mask.contains(.option), control: mask.contains(.control))
+                out.append(MenuEntry(title: item.title, shortcut: shortcut))
+                if let submenu = item.submenu { walk(submenu) }
+            }
+        }
+        if let main = NSApp.mainMenu { walk(main) }
+        return out
+    }
+
+    private static func checkMenuCoverage() {
+        let items = allMenuItems()
+        for entry in CommandMap.all {
+            if case .deferred(let why) = entry.scope {
+                print("SKIP menu \(entry.brief): \(why)")
+                continue
+            }
+            var missing: [String] = []
+            for item in entry.items {
+                let wantsKey = entry.scope == .menu ? item.shortcut : nil
+                let found = items.contains { menu in item.titles.contains(menu.title) && (wantsKey == nil || menu.shortcut == wantsKey) }
+                if !found { missing.append(item.titles[0] + (wantsKey.map { " \($0.display)" } ?? "")) }
+            }
+            check("\(entry.menu) menu has \(entry.brief)", missing.isEmpty, "missing \(missing)")
+        }
+    }
+
+    /// Types `r` into the sidebar filter: the field gets the letter, nothing replays.
+    private static func checkTypingIsNotAVerb(_ session: Session) async {
+        NSApp.activate()
+        guard let window = NSApp.windows.first(where: { $0.isVisible && !($0 is NSPanel) }) else {
+            return check("a main window exists for the typing check", false)
+        }
+        window.makeKeyAndOrderFront(nil)
+        session.sidebarFilterFocusTick += 1
+        await settle { window.firstResponder is NSTextView }
+        guard window.firstResponder is NSTextView else {
+            return check("the sidebar filter takes focus", false, "first responder \(String(describing: window.firstResponder))")
+        }
+        let before = session.rows.count
+        let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                     windowNumber: window.windowNumber, context: nil, characters: "r", charactersIgnoringModifiers: "r",
+                                     isARepeat: false, keyCode: 15)
+        if let event { window.sendEvent(event) }
+        await settle(timeout: .seconds(1)) { session.sidebarQuery == "r" }
+        check("typing r in the sidebar filter types, never replays", session.sidebarQuery == "r" && session.rows.count == before,
+              "query '\(session.sidebarQuery)' rows \(session.rows.count) were \(before)")
+        session.sidebarQuery = ""
+        window.makeFirstResponder(nil)
     }
 
     /// Waits for an async action to land instead of sleeping a fixed time (the

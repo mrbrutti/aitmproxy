@@ -171,6 +171,41 @@ final class Session {
     /// Bumped by ⌥⌘F to open Find in the focused pane's body viewer.
     var findRequestTick = 0
 
+    // MARK: Menu bar coverage (S-069)
+
+    /// View ▸ Toggle Sidebar (⌃⌘S) and the toolbar button share this.
+    var sidebarVisible = true
+    /// Bumped when the list should show Quick Look for the body `BodyQuickLook` holds.
+    var quickLookTick = 0
+    /// Typed into the Scope sheet's field when Flow ▸ Add Host to Scope… opens it.
+    var scopeSheetHost: String?
+
+    /// Flow ▸ Add Host to Scope… (⇧S): the Scope sheet with the focused row's host typed in.
+    func addFocusedHostToScope() {
+        guard let row = focusedRow else { return }
+        scopeSheetHost = row.authority
+        scopeSheetVisible = true
+    }
+
+    /// Flow ▸ Copy as … (⇧⌘C): the focused flow as a command or snippet.
+    func copyFocused(as kind: ExportKind) {
+        guard let row = focusedRow, let detail = focusedDetail else { return }
+        ExportMenu.copy(kind, detail: detail, row: row)
+    }
+
+    /// Flow ▸ Diff Selected (⌘D): exactly two selected flows open the Diff tab.
+    var canDiffSelected: Bool { selection.count == 2 }
+    func diffSelected() {
+        guard canDiffSelected else { return }
+        responseTab = .diff
+    }
+
+    /// Agent ▸ Approve Pending Request (⌥⏎): the oldest gated command runs.
+    func approvePendingRequest() {
+        guard let entry = activity.pending.first else { return }
+        activity.approve(entry)
+    }
+
     /// Fetches the next body range (F5 `flow.detail {body: range}`); until then it says so.
     func loadMoreBody(for id: FlowID) async throws {
         _ = try await runCommand("flow.detail", ["id": .string(id.raw), "body": .string("range")])
@@ -730,7 +765,12 @@ final class Session {
         case .copyURL:
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(row.url, forType: .string)
-        case .quickLook: lastError = "Quick Look arrives with the body viewers (M2)"
+        case .quickLook:
+            if let detail = details[id], BodyQuickLook.shared.prepare(detail, row: row) {
+                quickLookTick += 1
+            } else {
+                lastError = "No body to Quick Look"
+            }
         }
     }
 

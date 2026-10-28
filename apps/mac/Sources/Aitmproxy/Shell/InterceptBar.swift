@@ -175,11 +175,14 @@ struct GhostButton: View {
     }
 }
 
-/// Press: 120ms scale(0.97) (motion.press).
+/// Press: 120ms scale(0.97) (motion.press); a plain opacity dip under Reduce Motion (S-069).
 struct PressStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed ? 0.97 : 1)
-            .animation(Tok.Motion.easeOut(Tok.Motion.press), value: configuration.isPressed)
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.97 : 1)
+            .opacity(configuration.isPressed && reduceMotion ? 0.7 : 1)
+            .animation(reduceMotion ? nil : Tok.Motion.easeOut(Tok.Motion.press), value: configuration.isPressed)
     }
 }

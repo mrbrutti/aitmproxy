@@ -182,6 +182,25 @@ final class FlowCellView: NSTableCellView {
             }
         }
         toolTip = column == .url ? row.url : column == .ssl ? row.tls.help : column == .comment ? row.comment : nil
+        describeDrawnViews(row)
+    }
+
+    /// The drawn views (badge, dot, swatch, monogram) carry labels in the
+    /// screen's words, so VoiceOver reads a cell the same as a sighted user (S-069).
+    private func describeDrawnViews(_ row: FlowRow) {
+        badge.setAccessibilityElement(!badge.isHidden)
+        badge.setAccessibilityRole(.staticText)
+        badge.setAccessibilityLabel(badge.text)
+        dot.setAccessibilityElement(!dot.isHidden)
+        dot.setAccessibilityRole(.image)
+        dot.setAccessibilityLabel("\(row.state)")
+        swatch.setAccessibilityElement(!swatch.isHidden)
+        swatch.setAccessibilityRole(.image)
+        swatch.setAccessibilityLabel(row.mark.map { "marked \($0.rawValue)" })
+        monogram.setAccessibilityElement(!monogram.isHidden)
+        monogram.setAccessibilityRole(.image)
+        monogram.setAccessibilityLabel(row.client?.name)
+        icon.setAccessibilityLabel(icon.image?.accessibilityDescription)
     }
 
     /// Host in ink, path in the link colour, query dimmed; killed rows struck through.

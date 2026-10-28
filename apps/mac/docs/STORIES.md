@@ -1104,16 +1104,18 @@ As the operator, I turn on Reduce Motion and every pulse and scale stops; VoiceO
 Screens: apps
 Depends: S-010
 Acceptance:
-- [manual] Reduce Motion: intercept dot static, press scale off, palette opens without scale.
-- [manual] VoiceOver reads a row as "POST, 200 OK, api.shop-staging.test slash api slash auth slash login, paused, edited"; badges have labels; the agent toggle announces its policy.
-- [unit] A test enumerates `FlowCommands` and asserts every verb in the brief's command map has a menu item and a shortcut.
+- [manual] Reduce Motion: intercept dot static, press scale off (an opacity dip instead), palette opens without scale, the sidebar collapses without a slide.
+- [manual] VoiceOver reads a row as "POST, paused, auth.shop-staging.test slash api slash auth slash login, edited" (`FlowRow.accessibilityDescription`, on the row view); badges, dots, swatches and monograms have labels; the agent segment announces its policy and actions/min.
+- [unit] `CommandMapTests`: the brief's **Command map** bullet parses to the same verbs as `CommandMap.all`, every mapped verb with a brief shortcut has one, and rows describe themselves.
+- [self] The self-test walks `NSApp.mainMenu` and finds a menu item (title and key equivalent) for every `CommandMap` entry; it also types `r` into the sidebar filter and checks nothing replays.
 UX:
 - Flow: System Settings ▸ Accessibility ▸ Reduce Motion on -> the intercept dot stops pulsing, presses do not scale, the palette appears without scaling; VoiceOver reads rows, badges, toggles with the same words as the screen
 - Surface: whole app
 - States: as above
-- Words: VoiceOver row text "POST, Paused, https://…, edited"
+- Words: VoiceOver row text "POST, paused, host/path, edited"; menu items added by the audit: Flow ▸ Resume All (⌥⌘⏎), Revert to Original, Add Host to Scope… (⇧S), Copy as ▸ cURL (⇧⌘C) / httpie / Python (requests) / fetch, Diff Selected (⌘D), Quick Look Body; View ▸ Toggle Sidebar (⌃⌘S), Chip ▸ ⌘1…⌘9, Inspector Below / Right / Detached (⌥⌘1…3); Agent ▸ Approve Pending Request (⌥⏎)
 - Access: this story is the audit
-Status: todo
+Notes: Import…, Export Selection…, Save Session wait on S-065/S-066; Focus Inspector (⏎) has no single focus target yet; Mark (`m`) and Quick Look Body (Space) keep their keys on the focused list, never as menu shortcuts (they would take the key from every field); Revert to Original has no ⌘Z (Undo in the editor). Quick Look now shows the body through `QLPreviewPanel` (the list is its controller; Space toggles). Also fixed here: `BusService.call` recursed into itself (b7d3163) instead of `live().call`, which would have overflowed the stack on any live-bus action.
+Status: done
 
 ### S-070 Hold 50 rows per second
 As the operator, I watch a burst of 50 flows per second and the list, chips and status bar stay smooth.
