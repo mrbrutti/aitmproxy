@@ -224,6 +224,23 @@ impl Theme {
         self.fg(&color::syntax::PUNCT)
     }
 
+    /// `syntax.keyword` (Rhai control words). The spec adds `syntax.keyword` to
+    /// `tokens.json` as an additive token (UI-ext spec §1.1); until it lands,
+    /// the TUI resolves it to `syntax.boolean`, whose own token description
+    /// reads "true/false/null, keywords". Point this at `color::syntax::KEYWORD`
+    /// when that token is added.
+    pub fn syntax_keyword(&self) -> Style {
+        self.fg(&color::syntax::BOOLEAN)
+    }
+
+    /// `syntax.comment` (source comments). The spec adds `syntax.comment` to
+    /// `tokens.json` as an additive token (UI-ext spec §1.1); until it lands,
+    /// the TUI resolves it to the dim `text.tertiary` meta tier. Point this at
+    /// `color::syntax::COMMENT` when that token is added.
+    pub fn syntax_comment(&self) -> Style {
+        self.text_tertiary()
+    }
+
     /// `syntax.bracket`: outer object/array brackets.
     pub fn syntax_bracket(&self) -> Style {
         self.fg(&color::syntax::BRACKET)

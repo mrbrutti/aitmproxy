@@ -536,15 +536,11 @@ pub fn findings(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             " YAML",
             theme.accent().add_modifier(Modifier::BOLD),
         ));
-        for l in y.lines() {
-            let style = if l.trim_start().starts_with('-') {
-                theme.syntax_string()
-            } else if l.contains(':') {
-                theme.syntax_key()
-            } else {
-                theme.text_primary()
-            };
-            d.push(Line::styled(format!(" {l}"), style));
+        // The shared PoC-YAML colouriser (UI-ext plan Task 7), the same token
+        // set the edit path uses; a leading space keeps the panel's indent.
+        for mut line in crate::syntax::highlight_yaml(theme, y) {
+            line.spans.insert(0, Span::raw(" "));
+            d.push(line);
         }
     } else if let Some(e) = &f.yaml_error {
         d.push(Line::styled(
