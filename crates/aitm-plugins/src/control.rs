@@ -1,19 +1,19 @@
 //! The control plugin (F7): proxy and session control over the bus.
 //!
-//! `proxy.status` reports the proxy's live state (listening address, whether
-//! interception is armed, how many flows are paused, whether capture is on, and
-//! the stored-flow count) so a surface has a read-only way to learn it.
+//! `proxy.status` reports the proxy's live state (whether it is listening and on
+//! what address, whether interception is armed, how many flows are paused, and
+//! whether capture is on) so a surface has a read-only way to learn it.
 //! `proxy.pause`/`proxy.resume` toggle capture (the record button); `flow.clear`
-//! empties the store; `config.get` returns a redacted view of the configuration
-//! (never the MCP token or any key material).
+//! removes the terminal flows; `config.get` returns a redacted view of the
+//! configuration (never the MCP token or any key material).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use aitm_core::{
-    BrowserEngine, Command, CommandHost, Config, Flow, InterceptState, McpTransport, ParamSchema,
-    Params, Plugin, Registry, TypeDesc, Value,
+    BrowserEngine, Command, CommandHost, Config, McpTransport, ParamSchema, Params, Plugin,
+    Registry, TypeDesc, Value,
 };
 
 /// Registers `proxy.status`, `proxy.pause`, `proxy.resume`, `flow.clear`, and
@@ -46,24 +46,6 @@ impl Plugin for ControlPlugin {
     }
 }
 
-/// The count of flows currently parked (intercepted) in the store.
-fn paused_count(host: &CommandHost) -> i64 {
-    host.store()
-        .list()
-        .into_iter()
-        .filter_map(|id| host.store().get(id))
-        .filter(is_intercepted)
-        .count() as i64
-}
-
-fn is_intercepted(flow: &Flow) -> bool {
-    let state = match flow {
-        Flow::Http(f) => &f.intercept,
-        Flow::WebSocket(f) => &f.intercept,
-    };
-    matches!(state, InterceptState::Intercepted { .. })
-}
-
 /// `proxy.status` → the proxy's live state.
 struct ProxyStatus {
     armed: Arc<AtomicBool>,
@@ -76,28 +58,33 @@ impl Command for ProxyStatus {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "The proxy's live state: listening address, whether intercept is armed, \
-                          paused-flow count, whether capture is on, and stored-flow count."
-                .into(),
+            description:
+                "The proxy's live state: `listening` (bool) + `address`, `intercept_armed`, \
+                          `paused` (parked-flow count), `capturing`, and `flows` (visible count)."
+                    .into(),
             params: vec![],
             result: TypeDesc::Object(Vec::new()),
         }
     }
 
     fn invoke(&self, _args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        // `listening`/`address` are split so a surface can key on the boolean and
+        // show the address when the config is attached (null otherwise).
+        let address = host.config().map(|c| c.listen.to_string());
         let mut obj = BTreeMap::new();
-        obj.insert(
-            "listening".into(),
-            host.config()
-                .map_or(Value::Null, |c| Value::Str(c.listen.to_string())),
-        );
+        obj.insert("listening".into(), Value::Bool(address.is_some()));
+        obj.insert("address".into(), address.map_or(Value::Null, Value::Str));
         obj.insert(
             "intercept_armed".into(),
             Value::Bool(self.armed.load(Ordering::Relaxed)),
         );
         obj.insert("capturing".into(), Value::Bool(host.store().is_capturing()));
-        obj.insert("paused".into(), Value::Int(paused_count(host)));
-        obj.insert("flows".into(), Value::Int(host.store().list().len() as i64));
+        // Cheap counts over the store's own index — no per-flow clone.
+        obj.insert(
+            "paused".into(),
+            Value::Int(host.store().intercepted_count() as i64),
+        );
+        obj.insert("flows".into(), Value::Int(host.store().count() as i64));
         Ok(Value::Object(obj))
     }
 }
@@ -164,7 +151,8 @@ impl Command for FlowClear {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "Remove every captured flow from the store; returns the count cleared."
+            description: "Remove completed flows from the store (in-flight and intercepted flows \
+                          are kept); returns {cleared, skipped_in_flight}."
                 .into(),
             params: vec![],
             result: TypeDesc::Object(Vec::new()),
@@ -172,9 +160,13 @@ impl Command for FlowClear {
     }
 
     fn invoke(&self, _args: Params, host: &CommandHost) -> anyhow::Result<Value> {
-        let cleared = host.store().clear();
+        let outcome = host.store().clear();
         let mut obj = BTreeMap::new();
-        obj.insert("cleared".into(), Value::Int(cleared as i64));
+        obj.insert("cleared".into(), Value::Int(outcome.cleared as i64));
+        obj.insert(
+            "skipped_in_flight".into(),
+            Value::Int(outcome.skipped_in_flight as i64),
+        );
         Ok(Value::Object(obj))
     }
 }
@@ -294,6 +286,13 @@ fn redacted(cfg: &Config) -> Value {
         "poc_dir".into(),
         cfg.poc
             .dir
+            .as_ref()
+            .map_or(Value::Null, |d| Value::Str(d.display().to_string())),
+    );
+    obj.insert(
+        "poc_out_dir".into(),
+        cfg.poc
+            .out_dir
             .as_ref()
             .map_or(Value::Null, |d| Value::Str(d.display().to_string())),
     );

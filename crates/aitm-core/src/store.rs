@@ -5,41 +5,63 @@
 //! protocol modules, plugins, and command handlers can all reach it behind a
 //! shared reference.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{PoisonError, RwLock};
+use std::sync::{Mutex, PoisonError, RwLock};
 
 use indexmap::IndexMap;
 
 use crate::authority::Authority;
 use crate::body::Body;
-use crate::flow::{Flow, FlowId};
+use crate::flow::{Flow, FlowId, InterceptState};
 
 /// A shared, queryable store of captured flows.
+///
+/// Every method is required: a store that silently no-ops `clear`, the capture
+/// toggle, or ephemeral retirement would lie to the operator (e.g. `scope.remove`
+/// reporting success while leaving a host in scope), so the trait forces each
+/// implementation to make a real choice.
 pub trait FlowStore: Send + Sync {
-    /// Store a flow, keyed by its own id; returns that id.
+    /// Store a flow, keyed by its own id; returns that id. The flow is always
+    /// retained so the pipeline can `get`/`update` it; when capture is paused the
+    /// flow is additionally marked *ephemeral* (hidden from `list`/`query` and
+    /// retired at its terminal event).
     fn insert(&self, flow: Flow) -> FlowId;
-    /// A clone of the stored flow, if present.
+    /// A clone of the stored flow, if present. Returns ephemeral flows too, so a
+    /// by-id lookup (resume, replay, detail) works while capture is paused.
     fn get(&self, id: FlowId) -> Option<Flow>;
     /// Mutate a stored flow in place.
     fn update(&self, id: FlowId, f: &mut dyn FnMut(&mut Flow));
-    /// All stored flow ids, in insertion order.
+    /// Visible flow ids (ephemeral flows excluded), in insertion order.
     fn list(&self) -> Vec<FlowId>;
-    /// Ids of flows matching every set filter in `q`, in insertion order.
+    /// Visible ids matching every set filter in `q` (ephemeral excluded).
     fn query(&self, q: &FlowQuery) -> Vec<FlowId>;
-    /// Remove every stored flow; returns how many were removed. The default is a
-    /// no-op (`0`) for stores that do not support clearing.
-    fn clear(&self) -> usize {
-        0
-    }
-    /// Whether new flows are being retained (the capture/record toggle). The
-    /// default store is always capturing.
-    fn is_capturing(&self) -> bool {
-        true
-    }
+    /// Remove terminal flows (a completed/killed HTTP response, a killed WS);
+    /// in-flight and intercepted (parked) flows are kept so the pipeline is never
+    /// stranded. Reports how many were cleared and how many were skipped.
+    fn clear(&self) -> ClearOutcome;
+    /// Whether new flows are being retained (the capture/record toggle).
+    fn is_capturing(&self) -> bool;
     /// Enable (`true`) or disable (`false`) retaining newly inserted flows. While
-    /// disabled, `insert` drops the flow but still returns its id, so the proxy
-    /// keeps forwarding traffic — it just is not recorded. Default: no-op.
-    fn set_capturing(&self, _on: bool) {}
+    /// disabled, flows still flow through the pipeline but are marked ephemeral.
+    fn set_capturing(&self, on: bool);
+    /// Remove a flow iff it was marked ephemeral (captured while paused) and is now
+    /// at its terminal event; returns whether it was removed. A no-op for a
+    /// non-ephemeral flow, so the chain can call it on every terminal event.
+    fn retire_ephemeral(&self, id: FlowId) -> bool;
+    /// The number of visible (non-ephemeral) flows, without cloning any flow.
+    fn count(&self) -> usize;
+    /// The number of visible flows currently intercepted (parked), without cloning.
+    fn intercepted_count(&self) -> usize;
+}
+
+/// The outcome of [`FlowStore::clear`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClearOutcome {
+    /// Terminal flows removed.
+    pub cleared: usize,
+    /// In-flight or intercepted flows kept.
+    pub skipped_in_flight: usize,
 }
 
 /// A filter over the store. `None` fields do not constrain the result; the seam a
@@ -78,8 +100,12 @@ pub struct MemFlowStore {
     /// Estimated resident bytes of all held flows. Mutated only under the `flows`
     /// write lock, so it stays consistent with the map.
     resident: AtomicUsize,
-    /// Whether new flows are retained. `false` drops inserts (the record toggle).
+    /// Whether new flows are retained as visible. `false` keeps the flow resident
+    /// (so the pipeline works) but marks it ephemeral (the record toggle).
     capturing: AtomicBool,
+    /// Ids captured while paused: resident but hidden from `list`/`query`, retired
+    /// at their terminal event. Always locked **after** `flows` to avoid deadlock.
+    ephemeral: Mutex<HashSet<FlowId>>,
 }
 
 impl Default for MemFlowStore {
@@ -109,7 +135,15 @@ impl MemFlowStore {
             max_bytes,
             resident: AtomicUsize::new(0),
             capturing: AtomicBool::new(true),
+            ephemeral: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Lock the ephemeral set, recovering from poisoning.
+    fn ephemeral(&self) -> std::sync::MutexGuard<'_, HashSet<FlowId>> {
+        self.ephemeral
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Estimated resident bytes currently held (for tests / introspection).
@@ -144,15 +178,45 @@ impl MemFlowStore {
     }
 
     /// Drain the `remove` oldest flows, decrementing the resident-byte counter by
-    /// their estimated size.
+    /// their estimated size and dropping any of them from the ephemeral set.
     fn drain_oldest(&self, flows: &mut IndexMap<FlowId, Flow>, remove: usize) {
         let remove = remove.min(flows.len());
         if remove == 0 {
             return;
         }
-        let freed: usize = flows.drain(0..remove).map(|(_, f)| flow_size(&f)).sum();
+        let mut ephemeral = self.ephemeral();
+        let freed: usize = flows
+            .drain(0..remove)
+            .map(|(id, f)| {
+                ephemeral.remove(&id);
+                flow_size(&f)
+            })
+            .sum();
         self.resident.fetch_sub(freed, Ordering::Relaxed);
     }
+}
+
+/// Whether a flow has reached a point where it can be removed without stranding
+/// the pipeline: an intercepted (parked) flow never qualifies; an HTTP flow does
+/// once it is killed or has a fully-buffered response; a WebSocket flow once
+/// killed (there is no end marker on the flow yet — see the F-list retention gap).
+fn is_terminal(flow: &Flow) -> bool {
+    match flow {
+        Flow::Http(f) => match &f.intercept {
+            InterceptState::Intercepted { .. } => false,
+            InterceptState::Killed => true,
+            _ => f
+                .response
+                .as_ref()
+                .is_some_and(|r| !matches!(r.body, Body::Streamed(_))),
+        },
+        Flow::WebSocket(f) => matches!(f.intercept, InterceptState::Killed),
+    }
+}
+
+/// Whether a flow is currently intercepted (parked).
+fn is_intercepted(flow: &Flow) -> bool {
+    matches!(flow.intercept(), InterceptState::Intercepted { .. })
 }
 
 /// Estimated resident bytes of a flow: the buffered body bytes (the dominant
@@ -171,10 +235,18 @@ fn flow_size(flow: &Flow) -> usize {
                 .as_ref()
                 .map(|r| header_bytes(&r.headers) + body_bytes(&r.body))
                 .unwrap_or(0);
-            BASE + req + resp
+            BASE + req + resp + meta_bytes(&f.metadata)
         }
-        Flow::WebSocket(f) => BASE + f.messages.iter().map(|m| m.data.len()).sum::<usize>(),
+        Flow::WebSocket(f) => {
+            BASE + f.messages.iter().map(|m| m.data.len()).sum::<usize>() + meta_bytes(&f.metadata)
+        }
     }
+}
+
+/// Operator-supplied metadata bytes (marks + comment), so `flow.mark`/`flow.comment`
+/// are accounted against the store's memory budget like any other growth.
+fn meta_bytes(m: &crate::flow::FlowMeta) -> usize {
+    m.marks.iter().map(String::len).sum::<usize>() + m.comment.as_ref().map_or(0, String::len)
 }
 
 fn body_bytes(b: &Body) -> usize {
@@ -251,13 +323,15 @@ fn matches(flow: &Flow, q: &FlowQuery) -> bool {
 impl FlowStore for MemFlowStore {
     fn insert(&self, flow: Flow) -> FlowId {
         let id = flow.id();
-        // Record toggle: while not capturing, drop the flow but return its id so
-        // the proxy keeps forwarding — it is simply not retained for inspection.
-        if !self.capturing.load(Ordering::Relaxed) {
-            return id;
-        }
         let size = flow_size(&flow);
+        // Record toggle: a flow captured while paused is still stored (so the
+        // pipeline can get/update it and intercept/replay keep working) but marked
+        // ephemeral — hidden from list/query and retired at its terminal event.
+        let paused = !self.capturing.load(Ordering::Relaxed);
         let mut flows = self.flows.write().unwrap_or_else(PoisonError::into_inner);
+        if paused {
+            self.ephemeral().insert(id);
+        }
         // Re-inserting an existing id replaces in place: discount the old size.
         if let Some(old) = flows.insert(id, flow) {
             self.resident.fetch_sub(flow_size(&old), Ordering::Relaxed);
@@ -297,30 +371,50 @@ impl FlowStore for MemFlowStore {
     }
 
     fn list(&self) -> Vec<FlowId> {
-        self.flows
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
+        let flows = self.flows.read().unwrap_or_else(PoisonError::into_inner);
+        let ephemeral = self.ephemeral();
+        flows
             .keys()
+            .filter(|id| !ephemeral.contains(id))
             .copied()
             .collect()
     }
 
     fn query(&self, q: &FlowQuery) -> Vec<FlowId> {
-        self.flows
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
+        let flows = self.flows.read().unwrap_or_else(PoisonError::into_inner);
+        let ephemeral = self.ephemeral();
+        flows
             .iter()
+            .filter(|(id, _)| !ephemeral.contains(*id))
             .filter(|(_, flow)| matches(flow, q))
             .map(|(id, _)| *id)
             .collect()
     }
 
-    fn clear(&self) -> usize {
+    fn clear(&self) -> ClearOutcome {
         let mut flows = self.flows.write().unwrap_or_else(PoisonError::into_inner);
-        let n = flows.len();
-        flows.clear();
-        self.resident.store(0, Ordering::Relaxed);
-        n
+        let mut ephemeral = self.ephemeral();
+        let mut cleared = 0usize;
+        let mut skipped_in_flight = 0usize;
+        let mut freed = 0usize;
+        // Keep in-flight and parked flows; removing one would strand the pipeline
+        // (the proto module's `get` after dispatch would miss it) or its resume.
+        flows.retain(|id, flow| {
+            if is_terminal(flow) {
+                cleared += 1;
+                freed += flow_size(flow);
+                ephemeral.remove(id);
+                false
+            } else {
+                skipped_in_flight += 1;
+                true
+            }
+        });
+        self.resident.fetch_sub(freed, Ordering::Relaxed);
+        ClearOutcome {
+            cleared,
+            skipped_in_flight,
+        }
     }
 
     fn is_capturing(&self) -> bool {
@@ -329,5 +423,32 @@ impl FlowStore for MemFlowStore {
 
     fn set_capturing(&self, on: bool) {
         self.capturing.store(on, Ordering::Relaxed);
+    }
+
+    fn retire_ephemeral(&self, id: FlowId) -> bool {
+        let mut flows = self.flows.write().unwrap_or_else(PoisonError::into_inner);
+        if !self.ephemeral().remove(&id) {
+            return false;
+        }
+        if let Some(flow) = flows.shift_remove(&id) {
+            self.resident.fetch_sub(flow_size(&flow), Ordering::Relaxed);
+        }
+        true
+    }
+
+    fn count(&self) -> usize {
+        let flows = self.flows.read().unwrap_or_else(PoisonError::into_inner);
+        let ephemeral = self.ephemeral();
+        flows.keys().filter(|id| !ephemeral.contains(id)).count()
+    }
+
+    fn intercepted_count(&self) -> usize {
+        let flows = self.flows.read().unwrap_or_else(PoisonError::into_inner);
+        let ephemeral = self.ephemeral();
+        flows
+            .iter()
+            .filter(|(id, _)| !ephemeral.contains(*id))
+            .filter(|(_, flow)| is_intercepted(flow))
+            .count()
     }
 }

@@ -3,13 +3,12 @@
 //! `poc.list` and `poc.get` read the PoC library under the configured `poc.dir`
 //! (the directory `poc.run` loads from); `poc.artifact` serves a run artifact (the
 //! YAML copy or screenshot `poc.run` wrote) as bytes, confined to the configured
-//! `poc.out_dir`. All three refuse paths that escape their confinement root and
-//! never follow a symlink at the final component, so a remote/web surface can read
-//! findings without a filesystem path escape.
+//! `poc.out_dir`. All reads go through the shared [`crate::loader`], which resists
+//! symlink/traversal tricks and returns one non-revealing error.
 //!
-//! A persistent per-run *findings history* (pass/fail over time) is not kept by
-//! the core yet; these commands expose the files on disk, which is what the PoC
-//! panel needs to list, open and export.
+//! A persistent per-run *findings record* (pass/fail over time) is not kept by the
+//! core yet; these commands expose the files on disk, which is what the PoC panel
+//! needs to list, open and export.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -17,13 +16,12 @@ use std::sync::Arc;
 
 use aitm_core::{Command, CommandHost, ParamDef, ParamSchema, Params, Registry, TypeDesc, Value};
 
+use crate::loader::{self, MAX_POC_BYTES};
 use crate::model::{Poc, Severity};
 
-/// Cap a single PoC document at 1 MiB (as `poc.run` does) and an artifact at
-/// 50 MiB (a screenshot PNG), so a surface cannot be made to buffer an unbounded
-/// file through the bus.
-const MAX_POC_BYTES: u64 = 1024 * 1024;
-const MAX_ARTIFACT_BYTES: u64 = 50 * 1024 * 1024;
+/// An artifact (screenshot PNG, YAML copy) is capped near the bus's own payload
+/// limit so a single read cannot be made to buffer an unbounded file.
+const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Register `poc.list`, `poc.get`, and `poc.artifact`.
 pub fn register(registry: &mut Registry) {
@@ -47,12 +45,27 @@ fn summary(path: &Path, poc: &Poc) -> Value {
     let mut obj = BTreeMap::new();
     obj.insert("poc_path".into(), Value::Str(path.display().to_string()));
     obj.insert("id".into(), Value::Str(poc.id.clone()));
-    obj.insert("name".into(), Value::Str(poc.info.name.clone()));
+    obj.insert("title".into(), Value::Str(poc.info.name.clone()));
     obj.insert(
         "severity".into(),
         Value::Str(severity_str(poc.info.severity).into()),
     );
     Value::Object(obj)
+}
+
+/// Load one PoC under `dir`, returning `None` (and logging) when it does not parse.
+fn load_summary(path: &Path, dir: &Path) -> Option<Value> {
+    match loader::read_confined(path, dir, MAX_POC_BYTES)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|t| loader::parse_poc(&t).ok())
+    {
+        Some(poc) => Some(summary(path, &poc)),
+        None => {
+            tracing::warn!(path = %path.display(), "poc.list: skipping unreadable or invalid PoC file");
+            None
+        }
+    }
 }
 
 /// `poc.list` → the PoCs in the configured library directory.
@@ -65,7 +78,7 @@ impl Command for PocList {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "List the PoCs in the configured PoC directory (id, name, severity, \
+            description: "List the PoCs in the configured PoC directory (id, title, severity, \
                           path). Empty when no PoC directory is configured."
                 .into(),
             params: vec![],
@@ -77,10 +90,13 @@ impl Command for PocList {
         let Some(dir) = host.config().and_then(|c| c.poc.dir.clone()) else {
             return Ok(Value::Array(Vec::new()));
         };
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            // A missing/unreadable library is an empty list, not an error, and does
+            // not disclose the path's state.
+            Err(_) => return Ok(Value::Array(Vec::new())),
+        };
         let mut out = Vec::new();
-        let entries = std::fs::read_dir(&dir).map_err(|e| {
-            anyhow::anyhow!("poc.list: cannot read PoC dir `{}`: {e}", dir.display())
-        })?;
         for entry in entries.flatten() {
             let path = entry.path();
             let is_yaml = path
@@ -90,18 +106,17 @@ impl Command for PocList {
             if !is_yaml || !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                 continue;
             }
-            // Skip a file that does not parse rather than failing the whole list.
-            if let Ok(poc) = load_poc(&path, &dir) {
-                out.push(summary(&path, &poc));
+            if let Some(item) = load_summary(&path, &dir) {
+                out.push(item);
             }
         }
         // Stable order so the panel does not reshuffle between polls.
-        out.sort_by(|a, b| id_of(a).cmp(id_of(b)));
+        out.sort_by(|a, b| path_of(a).cmp(path_of(b)));
         Ok(Value::Array(out))
     }
 }
 
-fn id_of(v: &Value) -> &str {
+fn path_of(v: &Value) -> &str {
     match v {
         Value::Object(o) => match o.get("poc_path") {
             Some(Value::Str(s)) => s,
@@ -121,7 +136,7 @@ impl Command for PocGet {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "Read one PoC by path (confined to the PoC directory): id, name, \
+            description: "Read one PoC by path (confined to the PoC directory): id, title, \
                           severity, description, and the YAML source."
                 .into(),
             params: vec![ParamDef {
@@ -140,15 +155,17 @@ impl Command for PocGet {
             .config()
             .and_then(|c| c.poc.dir.clone())
             .ok_or_else(|| anyhow::anyhow!("poc.get: no PoC directory is configured"))?;
-        let path = Path::new(poc_path);
-        let text = read_confined_text(path, &dir, MAX_POC_BYTES)
+        let bytes = loader::read_confined(Path::new(poc_path), &dir, MAX_POC_BYTES)
             .map_err(|e| anyhow::anyhow!("poc.get: {e}"))?;
-        let poc = parse_poc(&text).map_err(|e| anyhow::anyhow!("poc.get: `{poc_path}`: {e}"))?;
+        let text = String::from_utf8(bytes).map_err(|_| {
+            anyhow::anyhow!("poc.get: not found or outside the configured PoC directory")
+        })?;
+        let poc = loader::parse_poc(&text).map_err(|e| anyhow::anyhow!("poc.get: {e}"))?;
 
         let mut obj = BTreeMap::new();
         obj.insert("poc_path".into(), Value::Str(poc_path.to_string()));
         obj.insert("id".into(), Value::Str(poc.id.clone()));
-        obj.insert("name".into(), Value::Str(poc.info.name.clone()));
+        obj.insert("title".into(), Value::Str(poc.info.name.clone()));
         obj.insert(
             "severity".into(),
             Value::Str(severity_str(poc.info.severity).into()),
@@ -195,79 +212,8 @@ impl Command for PocArtifact {
                     "poc.artifact: no PoC output directory is configured (set poc.out_dir)"
                 )
             })?;
-        let bytes = read_confined_bytes(Path::new(path_arg), &root, MAX_ARTIFACT_BYTES)
+        let bytes = loader::read_confined(Path::new(path_arg), &root, MAX_ARTIFACT_BYTES)
             .map_err(|e| anyhow::anyhow!("poc.artifact: {e}"))?;
         Ok(Value::Bytes(bytes))
     }
-}
-
-// ---------------------------------------------------------------------------
-// Safe, confined loading
-// ---------------------------------------------------------------------------
-
-fn parse_poc(text: &str) -> anyhow::Result<Poc> {
-    let raw: serde_yaml::Value =
-        serde_yaml::from_str(text).map_err(|_| anyhow::anyhow!("not valid YAML"))?;
-    crate::schema::validate(&raw).map_err(|e| anyhow::anyhow!("failed validation: {e}"))?;
-    serde_yaml::from_value(raw).map_err(|_| anyhow::anyhow!("not a valid PoC document"))
-}
-
-fn load_poc(path: &Path, root: &Path) -> anyhow::Result<Poc> {
-    let text = read_confined_text(path, root, MAX_POC_BYTES)?;
-    parse_poc(&text)
-}
-
-/// Resolve `path`, require it under `root` (canonicalized, so `..`/symlinks are
-/// followed), open without following a final symlink, cap the size, read bytes.
-fn read_confined_bytes(path: &Path, root: &Path, max: u64) -> anyhow::Result<Vec<u8>> {
-    let canon_root = root
-        .canonicalize()
-        .map_err(|e| anyhow::anyhow!("dir `{}` is not accessible: {e}", root.display()))?;
-    let canon_path = path
-        .canonicalize()
-        .map_err(|e| anyhow::anyhow!("cannot resolve `{}`: {e}", path.display()))?;
-    if !canon_path.starts_with(&canon_root) {
-        anyhow::bail!("`{}` is outside `{}`", path.display(), canon_root.display());
-    }
-    let mut file = open_nofollow(&canon_path)
-        .map_err(|e| anyhow::anyhow!("cannot open `{}`: {e}", path.display()))?;
-    let meta = file
-        .metadata()
-        .map_err(|e| anyhow::anyhow!("cannot stat `{}`: {e}", path.display()))?;
-    if !meta.file_type().is_file() {
-        anyhow::bail!("`{}` is not a regular file", path.display());
-    }
-    if meta.len() > max {
-        anyhow::bail!("`{}` exceeds the {max}-byte cap", path.display());
-    }
-    let mut buf = Vec::with_capacity(meta.len() as usize);
-    std::io::Read::read_to_end(&mut file, &mut buf)
-        .map_err(|e| anyhow::anyhow!("cannot read `{}`: {e}", path.display()))?;
-    Ok(buf)
-}
-
-fn read_confined_text(path: &Path, root: &Path, max: u64) -> anyhow::Result<String> {
-    let bytes = read_confined_bytes(path, root, max)?;
-    String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("`{}` is not UTF-8", path.display()))
-}
-
-/// Open read-only without following a symlink at the final component.
-#[cfg(unix)]
-fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
-    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "refusing to open a symlink",
-        ));
-    }
-    std::fs::File::open(path)
 }

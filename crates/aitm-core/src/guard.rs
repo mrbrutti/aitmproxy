@@ -21,12 +21,10 @@ pub trait ScopeRateGuard: Send + Sync {
     fn check_active(&self, host: &str) -> Result<ActionPermit, GuardError>;
     /// Add a host (or `host:port`, or `*.wildcard`) to scope.
     fn add_scope(&self, entry: ScopeEntry);
-    /// Remove the scope entry whose host matches `entry` exactly; returns whether
-    /// one was removed. Narrowing scope is always allowed; the default is a no-op
-    /// for guards that do not support removal.
-    fn remove_scope(&self, _entry: &str) -> bool {
-        false
-    }
+    /// Remove the scope entry matching `entry`; returns whether one was removed.
+    /// Required (no default): a guard that silently kept the entry while reporting
+    /// success would be an auth-relevant lie.
+    fn remove_scope(&self, entry: &str) -> bool;
     /// The current scope entries.
     fn list_scope(&self) -> Vec<ScopeEntry>;
     /// Record an error against `host`; once its budget is exhausted the guard
@@ -403,6 +401,13 @@ impl Default for StdGuard {
     }
 }
 
+/// Normalize a scope entry so `scope.add` and `scope.remove` agree regardless of
+/// surrounding whitespace or case (hosts are case-insensitive). Wildcards and
+/// `host:port` forms are preserved, just trimmed and lowercased.
+fn normalize_scope(entry: &str) -> String {
+    entry.trim().to_ascii_lowercase()
+}
+
 /// Whether `host` (`host` or `host:port`) falls under scope entry `entry`
 /// (exact, `host:port`, or `*.wildcard`). Parsing goes through [`Authority`] so
 /// IPv6 and ports fold the same way the rest of the system keys on a target.
@@ -486,16 +491,20 @@ impl ScopeRateGuard for StdGuard {
     }
 
     fn add_scope(&self, entry: ScopeEntry) {
-        self.scope
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(entry);
+        let host = normalize_scope(&entry.host);
+        let mut scope = self.scope.write().unwrap_or_else(PoisonError::into_inner);
+        // Deduplicate so repeated adds do not grow the list unbounded, and so a
+        // single remove fully drops the entry.
+        if !scope.iter().any(|e| e.host == host) {
+            scope.push(ScopeEntry { host });
+        }
     }
 
     fn remove_scope(&self, entry: &str) -> bool {
+        let want = normalize_scope(entry);
         let mut scope = self.scope.write().unwrap_or_else(PoisonError::into_inner);
         let before = scope.len();
-        scope.retain(|e| e.host != entry);
+        scope.retain(|e| e.host != want);
         scope.len() != before
     }
 

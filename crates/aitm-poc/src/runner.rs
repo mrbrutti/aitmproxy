@@ -312,31 +312,6 @@ fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()
     Ok(())
 }
 
-/// Open `path` read-only without following a symlink at the final component
-/// (`O_NOFOLLOW`): opening a symlink fails, so the loader can stat and read the
-/// returned handle with no stat/open TOCTOU window.
-#[cfg(unix)]
-fn open_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-}
-
-/// Best-effort fallback where `O_NOFOLLOW` is unavailable: reject a symlink
-/// final component before opening (a residual TOCTOU remains off Unix).
-#[cfg(not(unix))]
-fn open_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "refusing to open a symlink",
-        ));
-    }
-    std::fs::File::open(path)
-}
-
 /// A filesystem-safe PoC id: `^[a-z0-9][a-z0-9-]{0,63}$`. Used to build the
 /// artifact directory name, so it can never contain path separators or `..`.
 pub fn is_valid_poc_id(id: &str) -> bool {
@@ -629,53 +604,20 @@ impl Command for PocRunCommand {
             Some("yaml") | Some("yml") => {}
             _ => anyhow::bail!("poc.run: `{poc_path}` must be a .yaml file"),
         }
-        // Opt-in confinement: when a PoC directory is configured, the file must
-        // resolve (canonicalized, so `..` and symlinks are followed) to a path
-        // under it. Unconfigured (`None`) loads from any path, as before.
-        if let Some(root) = host.poc_dir() {
-            let canon_root = root.canonicalize().map_err(|e| {
-                anyhow::anyhow!(
-                    "poc.run: PoC dir `{}` is not accessible: {e}",
-                    root.display()
-                )
-            })?;
-            let canon_path = path
-                .canonicalize()
-                .map_err(|e| anyhow::anyhow!("poc.run: cannot resolve `{poc_path}`: {e}"))?;
-            if !canon_path.starts_with(&canon_root) {
-                anyhow::bail!(
-                    "poc.run: `{poc_path}` is outside the configured PoC directory `{}`",
-                    root.display()
-                );
-            }
-        }
-        // Open with `O_NOFOLLOW` so a symlink at the final component fails to open,
-        // then stat and read the *opened handle* — closing the stat/open TOCTOU
-        // window where the path could be swapped for a symlink to an arbitrary file.
-        let mut file = open_nofollow(path)
-            .map_err(|e| anyhow::anyhow!("poc.run: cannot open `{poc_path}`: {e}"))?;
-        let meta = file
-            .metadata()
-            .map_err(|e| anyhow::anyhow!("poc.run: cannot stat `{poc_path}`: {e}"))?;
-        if !meta.file_type().is_file() {
-            anyhow::bail!("poc.run: refusing to load `{poc_path}`: not a regular file");
-        }
-        // Cap the document size before parsing (billion-laughs / huge-doc guard).
-        const MAX_POC_BYTES: u64 = 1024 * 1024;
-        if meta.len() > MAX_POC_BYTES {
-            anyhow::bail!("poc.run: `{poc_path}` exceeds the {MAX_POC_BYTES}-byte PoC size cap");
-        }
-        let mut text = String::new();
-        std::io::Read::read_to_string(&mut file, &mut text)
-            .map_err(|e| anyhow::anyhow!("poc.run: cannot read `{poc_path}`: {e}"))?;
-        // Validate the raw document, then type it. Parse errors are reported
-        // without echoing the offending file content.
-        let raw: serde_yaml::Value = serde_yaml::from_str(&text)
-            .map_err(|_| anyhow::anyhow!("poc.run: `{poc_path}` is not valid YAML"))?;
-        crate::schema::validate(&raw)
-            .map_err(|e| anyhow::anyhow!("poc.run: `{poc_path}` failed validation: {e}"))?;
-        let poc: Poc = serde_yaml::from_value(raw)
-            .map_err(|_| anyhow::anyhow!("poc.run: `{poc_path}` is not a valid PoC document"))?;
+        // Read the document through the shared hardened loader. With a configured
+        // PoC directory the read is confined to it (one generic error, no file
+        // oracle); unconfigured, it loads any path but still refuses a symlinked or
+        // non-regular file and caps the size.
+        let bytes = match host.poc_dir() {
+            Some(root) => crate::loader::read_confined(path, root, crate::loader::MAX_POC_BYTES)
+                .map_err(|e| anyhow::anyhow!("poc.run: `{poc_path}`: {e}"))?,
+            None => crate::loader::read_capped(path, crate::loader::MAX_POC_BYTES)
+                .map_err(|e| anyhow::anyhow!("poc.run: cannot open `{poc_path}`: {e}"))?,
+        };
+        let text = String::from_utf8(bytes)
+            .map_err(|_| anyhow::anyhow!("poc.run: `{poc_path}` is not UTF-8"))?;
+        let poc: Poc = crate::loader::parse_poc(&text)
+            .map_err(|e| anyhow::anyhow!("poc.run: `{poc_path}`: {e}"))?;
 
         let mut bindings = VarBindings::new();
         if let Ok(target) = args.get_str("target") {

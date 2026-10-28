@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 
 use aitm_core::{
     Body, Command, CommandHost, ConnInfo, Flow, FlowMeta, HeaderMap, HttpResponse, HttpVersion,
-    InterceptState, ParamDef, ParamSchema, Params, Plugin, Registry, TypeDesc, Value, WsMessage,
+    ParamDef, ParamSchema, Params, Plugin, Registry, TypeDesc, Value, WsMessage,
 };
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -168,10 +168,7 @@ fn detail(flow: &Flow, mode: BodyMode) -> Value {
             obj.insert("client_conn".into(), conn(&f.client_conn, true));
             obj.insert("server_conn".into(), opt_conn(f.server_conn.as_ref()));
             obj.insert("meta".into(), meta(&f.metadata));
-            obj.insert(
-                "intercept".into(),
-                Value::Str(intercept_label(&f.intercept).into()),
-            );
+            obj.insert("intercept".into(), Value::Str(f.intercept.label().into()));
             obj.insert("edited".into(), Value::Bool(f.metadata.edited));
         }
         Flow::WebSocket(f) => {
@@ -184,10 +181,7 @@ fn detail(flow: &Flow, mode: BodyMode) -> Value {
             obj.insert("client_conn".into(), conn(&f.client_conn, true));
             obj.insert("server_conn".into(), opt_conn(f.server_conn.as_ref()));
             obj.insert("meta".into(), meta(&f.metadata));
-            obj.insert(
-                "intercept".into(),
-                Value::Str(intercept_label(&f.intercept).into()),
-            );
+            obj.insert("intercept".into(), Value::Str(f.intercept.label().into()));
             obj.insert("edited".into(), Value::Bool(f.metadata.edited));
         }
     }
@@ -232,8 +226,10 @@ fn put_body(obj: &mut BTreeMap<String, Value>, body: &Body, mode: BodyMode, trun
 fn body_bytes(body: &Body) -> Option<&[u8]> {
     match body {
         Body::Bytes(b) => Some(b),
-        // An empty body is zero bytes; a still-streaming body has none buffered.
-        Body::Empty | Body::Streamed(_) => None,
+        // An empty body is zero bytes (so inline emits empty bytes, not null); a
+        // still-streaming body has none buffered yet (emits null).
+        Body::Empty => Some(&[]),
+        Body::Streamed(_) => None,
     }
 }
 
@@ -346,24 +342,22 @@ fn version(v: HttpVersion) -> &'static str {
     }
 }
 
-fn intercept_label(state: &InterceptState) -> &'static str {
-    match state {
-        InterceptState::Observed => "observed",
-        InterceptState::Intercepted { .. } => "intercepted",
-        InterceptState::Resumed => "resumed",
-        InterceptState::Killed => "killed",
-    }
-}
-
 fn duration_ms(d: Duration) -> i64 {
     i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
 }
 
-/// A `SystemTime` as an RFC3339 UTC string; an out-of-range time falls back to the
-/// Unix epoch rather than failing the whole detail.
+/// A `SystemTime` as an RFC3339 UTC string, or `Null` for a time outside the
+/// representable range (never a fabricated epoch timestamp).
 fn rfc3339(t: SystemTime) -> Value {
-    let formatted = OffsetDateTime::from(t)
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
-    Value::Str(formatted)
+    let nanos = match t.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => i128::try_from(d.as_nanos()).ok(),
+        // Pre-epoch: negate the elapsed time back from zero.
+        Err(e) => i128::try_from(e.duration().as_nanos())
+            .ok()
+            .and_then(|n| n.checked_neg()),
+    };
+    nanos
+        .and_then(|n| OffsetDateTime::from_unix_timestamp_nanos(n).ok())
+        .and_then(|dt| dt.format(&Rfc3339).ok())
+        .map_or(Value::Null, Value::Str)
 }

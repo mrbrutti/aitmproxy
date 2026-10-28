@@ -117,6 +117,8 @@ impl ConfigFile {
 struct ScopeFile {
     /// `["host", "host:port", "*.wildcard"]`.
     entries: Option<Vec<String>>,
+    /// Let an agent (MCP) frontend widen scope with `scope.add`. Off by default.
+    allow_agent_widen: Option<bool>,
 }
 
 impl ScopeFile {
@@ -124,6 +126,7 @@ impl ScopeFile {
         if let Some(hosts) = self.entries {
             c.entries = hosts.into_iter().map(|host| ScopeEntry { host }).collect();
         }
+        set(&mut c.allow_agent_widen, self.allow_agent_widen);
     }
 }
 
@@ -315,12 +318,17 @@ impl SsrfFile {
 #[serde(deny_unknown_fields)]
 struct PocFile {
     dir: Option<PathBuf>,
+    /// Where `poc.run` writes artifacts and `poc.artifact` reads them from.
+    out_dir: Option<PathBuf>,
 }
 
 impl PocFile {
     fn apply(self, c: &mut PocConfig) {
         if let Some(d) = self.dir {
             c.dir = Some(d);
+        }
+        if let Some(d) = self.out_dir {
+            c.out_dir = Some(d);
         }
     }
 }

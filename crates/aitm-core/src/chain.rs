@@ -94,8 +94,23 @@ impl Chain {
             }
         }
 
+        // Retire a flow captured while paused once it reaches its terminal event,
+        // so a paused proxy frees memory as flows complete rather than hiding them
+        // forever. A no-op for a normally-captured flow.
+        if is_terminal_event(&ev) {
+            self.store.retire_ephemeral(id);
+        }
+
         verdict
     }
+}
+
+/// The events after which a completed flow is eligible for ephemeral retirement.
+fn is_terminal_event(ev: &Event) -> bool {
+    matches!(
+        ev,
+        Event::Response(_) | Event::WsEnd(_) | Event::Error { .. }
+    )
 }
 
 /// Dispatch through the chain as the `ModuleCtx` event sink.

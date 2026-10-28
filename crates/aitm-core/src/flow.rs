@@ -64,6 +64,30 @@ impl Flow {
             Flow::WebSocket(f) => f.id,
         }
     }
+
+    /// This flow's metadata, regardless of protocol.
+    pub fn metadata(&self) -> &FlowMeta {
+        match self {
+            Flow::Http(f) => &f.metadata,
+            Flow::WebSocket(f) => &f.metadata,
+        }
+    }
+
+    /// This flow's metadata for in-place edits, regardless of protocol.
+    pub fn metadata_mut(&mut self) -> &mut FlowMeta {
+        match self {
+            Flow::Http(f) => &mut f.metadata,
+            Flow::WebSocket(f) => &mut f.metadata,
+        }
+    }
+
+    /// This flow's interception state, regardless of protocol.
+    pub fn intercept(&self) -> &InterceptState {
+        match self {
+            Flow::Http(f) => &f.intercept,
+            Flow::WebSocket(f) => &f.intercept,
+        }
+    }
 }
 
 /// A captured HTTP interaction.
@@ -210,6 +234,18 @@ pub enum InterceptState {
     Resumed,
     /// Dropped; the client sees a reset/closed connection.
     Killed,
+}
+
+impl InterceptState {
+    /// The lowercase label a command surface reports for this state.
+    pub fn label(&self) -> &'static str {
+        match self {
+            InterceptState::Observed => "observed",
+            InterceptState::Intercepted { .. } => "intercepted",
+            InterceptState::Resumed => "resumed",
+            InterceptState::Killed => "killed",
+        }
+    }
 }
 
 /// Wakes the parked pausable future when a command resumes the flow.

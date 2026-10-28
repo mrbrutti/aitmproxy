@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use aitm_core::{
-    Command, CommandHost, Flow, FlowId, FlowMeta, ParamDef, ParamSchema, Params, Plugin, Registry,
-    TypeDesc, Value,
+    Command, CommandHost, Flow, FlowId, ParamDef, ParamSchema, Params, Plugin, Registry, TypeDesc,
+    Value,
 };
 
 /// Registers `flow.mark` and `flow.comment`. Observes no events.
@@ -47,14 +47,6 @@ fn id_param(description: &str) -> ParamDef {
     }
 }
 
-/// A mutable borrow of a flow's metadata, regardless of protocol.
-fn meta_mut(flow: &mut Flow) -> &mut FlowMeta {
-    match flow {
-        Flow::Http(f) => &mut f.metadata,
-        Flow::WebSocket(f) => &mut f.metadata,
-    }
-}
-
 /// Refuse up front when the flow is unknown, so a mistyped id is a clear error
 /// rather than a silently dropped update.
 fn require_flow(host: &CommandHost, id: FlowId) -> anyhow::Result<()> {
@@ -62,6 +54,46 @@ fn require_flow(host: &CommandHost, id: FlowId) -> anyhow::Result<()> {
         .get(id)
         .map(|_| ())
         .ok_or_else(|| anyhow::anyhow!("no flow with id {id}"))
+}
+
+/// Bound the mark set so it cannot grow the store without limit or carry control
+/// characters into a surface: at most 32 marks, each at most 64 bytes, no control
+/// characters (a mark is a short colour/label token).
+const MAX_MARKS: usize = 32;
+const MAX_MARK_BYTES: usize = 64;
+const MAX_COMMENT_BYTES: usize = 4096;
+
+fn validate_marks(marks: &[String]) -> anyhow::Result<()> {
+    if marks.len() > MAX_MARKS {
+        anyhow::bail!("at most {MAX_MARKS} marks (got {})", marks.len());
+    }
+    for m in marks {
+        if m.len() > MAX_MARK_BYTES {
+            anyhow::bail!("each mark is at most {MAX_MARK_BYTES} bytes");
+        }
+        if m.chars().any(char::is_control) {
+            anyhow::bail!("a mark must not contain control characters");
+        }
+    }
+    Ok(())
+}
+
+/// Bound the comment at 4 KiB and reject control characters other than tab and
+/// newline, so a comment cannot bloat memory or smuggle escape sequences.
+fn validate_comment(text: &str) -> anyhow::Result<()> {
+    if text.len() > MAX_COMMENT_BYTES {
+        anyhow::bail!(
+            "comment is at most {MAX_COMMENT_BYTES} bytes (got {})",
+            text.len()
+        );
+    }
+    if text
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        anyhow::bail!("comment must not contain control characters other than tab and newline");
+    }
+    Ok(())
 }
 
 /// `flow.mark {id, marks}` → replace a flow's mark set; returns the new set.
@@ -103,10 +135,11 @@ impl Command for FlowMark {
             Some(other) => anyhow::bail!("param `marks` must be an array, got {other:?}"),
             None => anyhow::bail!("missing required param `marks`"),
         };
+        validate_marks(&marks)?;
         require_flow(host, id)?;
         let to_store = marks.clone();
         host.store().update(id, &mut |flow: &mut Flow| {
-            meta_mut(flow).marks = to_store.clone();
+            flow.metadata_mut().marks = to_store.clone();
         });
         Ok(Value::Array(marks.into_iter().map(Value::Str).collect()))
     }
@@ -139,11 +172,12 @@ impl Command for FlowComment {
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         let id = args.get_flow_id("id")?;
         let text = args.get_str("text")?.to_string();
+        validate_comment(&text)?;
         require_flow(host, id)?;
         let comment = if text.is_empty() { None } else { Some(text) };
         let to_store = comment.clone();
         host.store().update(id, &mut |flow: &mut Flow| {
-            meta_mut(flow).comment = to_store.clone();
+            flow.metadata_mut().comment = to_store.clone();
         });
         Ok(comment.map_or(Value::Null, Value::Str))
     }

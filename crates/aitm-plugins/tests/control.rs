@@ -7,8 +7,8 @@ use std::time::SystemTime;
 
 use aitm_core::{
     Body, CommandHost, Config, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow,
-    HttpRequest, HttpVersion, InterceptState, McpConfig, McpTransport, MemFlowStore, Params,
-    ProxyClient, ScopeConfig, ScopeEntry, StdGuard, Value,
+    HttpRequest, HttpResponse, HttpVersion, InterceptState, McpConfig, McpTransport, MemFlowStore,
+    Params, ProxyClient, ScopeConfig, ScopeEntry, StdGuard, Value,
 };
 use aitm_plugins::ControlPlugin;
 use futures::future::BoxFuture;
@@ -46,6 +46,24 @@ fn flow(intercept: InterceptState) -> Flow {
         metadata: FlowMeta::default(),
         intercept,
     })
+}
+
+/// An Observed HTTP flow with a complete (buffered) response: a terminal flow
+/// `flow.clear` may remove.
+fn terminal_flow() -> Flow {
+    match flow(InterceptState::Observed) {
+        Flow::Http(mut f) => {
+            f.response = Some(HttpResponse {
+                status: 200,
+                version: HttpVersion::Http11,
+                headers: HeaderMap::new(),
+                body: Body::Empty,
+                timestamp: SystemTime::now(),
+            });
+            Flow::Http(f)
+        }
+        other => other,
+    }
 }
 
 fn reg_with(armed: Arc<AtomicBool>) -> aitm_core::Registry {
@@ -104,8 +122,10 @@ fn proxy_status_reports_armed_capturing_paused_and_listening() {
     assert_eq!(field(&status, "capturing"), &Value::Bool(true));
     assert_eq!(field(&status, "paused"), &Value::Int(1));
     assert_eq!(field(&status, "flows"), &Value::Int(2));
+    // listening is a bool; the address is a separate string when config is present.
+    assert_eq!(field(&status, "listening"), &Value::Bool(true));
     assert_eq!(
-        field(&status, "listening"),
+        field(&status, "address"),
         &Value::Str("127.0.0.1:9191".into())
     );
 
@@ -113,12 +133,13 @@ fn proxy_status_reports_armed_capturing_paused_and_listening() {
     armed.store(false, Ordering::Relaxed);
     let status = call(&reg, &store, &guard, None, "proxy.status");
     assert_eq!(field(&status, "intercept_armed"), &Value::Bool(false));
-    // No config attached -> listening is null, not an error.
-    assert_eq!(field(&status, "listening"), &Value::Null);
+    // No config attached -> not listening, address null, not an error.
+    assert_eq!(field(&status, "listening"), &Value::Bool(false));
+    assert_eq!(field(&status, "address"), &Value::Null);
 }
 
 #[test]
-fn pause_resume_toggles_capture_and_drops_inserts() {
+fn pause_resume_marks_inserts_ephemeral() {
     let reg = reg_with(Arc::new(AtomicBool::new(false)));
     let store = MemFlowStore::new();
     let guard = StdGuard::default();
@@ -128,36 +149,60 @@ fn pause_resume_toggles_capture_and_drops_inserts() {
     assert_eq!(field(&paused, "capturing"), &Value::Bool(false));
     assert!(!store.is_capturing());
 
-    // While paused, an insert is dropped (returns an id but is not retained).
+    // While paused, an insert is still RESIDENT (so the pipeline can get/update it
+    // and intercept/replay work) but hidden from `list` and retireable.
     let id = store.insert(flow(InterceptState::Observed));
     assert!(
-        store.get(id).is_none(),
-        "paused capture must not retain the flow"
+        store.get(id).is_some(),
+        "paused capture keeps the flow resident for the pipeline"
     );
-    assert!(store.list().is_empty());
+    assert!(
+        store.list().is_empty(),
+        "ephemeral flows are hidden from list"
+    );
+    assert_eq!(store.count(), 0);
+    assert!(
+        store.retire_ephemeral(id),
+        "terminal ephemeral flow is retired"
+    );
+    assert!(store.get(id).is_none(), "retired flow is gone");
 
     let resumed = call(&reg, &store, &guard, None, "proxy.resume");
     assert_eq!(field(&resumed, "capturing"), &Value::Bool(true));
     let id = store.insert(flow(InterceptState::Observed));
     assert!(
-        store.get(id).is_some(),
-        "resumed capture retains the flow again"
+        store.list().contains(&id),
+        "resumed capture is visible again"
+    );
+    assert!(
+        !store.retire_ephemeral(id),
+        "a captured flow is not ephemeral"
     );
 }
 
 #[test]
-fn flow_clear_empties_the_store() {
+fn flow_clear_removes_terminal_keeps_in_flight() {
     let reg = reg_with(Arc::new(AtomicBool::new(false)));
     let store = MemFlowStore::new();
     let guard = StdGuard::default();
-    store.insert(flow(InterceptState::Observed));
-    store.insert(flow(InterceptState::Observed));
-    assert_eq!(store.list().len(), 2);
+    store.insert(terminal_flow());
+    store.insert(terminal_flow());
+    // An in-flight (Observed, no response) flow and a parked one must be kept.
+    let in_flight = store.insert(flow(InterceptState::Observed));
+    let (h, _rx) = aitm_core::ResumeHandle::new();
+    let parked = store.insert(flow(InterceptState::Intercepted {
+        backup: Box::new(flow(InterceptState::Observed)),
+        resume: h,
+    }));
+    assert_eq!(store.list().len(), 4);
 
     let cleared = call(&reg, &store, &guard, None, "flow.clear");
     assert_eq!(field(&cleared, "cleared"), &Value::Int(2));
-    assert!(store.list().is_empty());
-    assert_eq!(store.resident_bytes(), 0);
+    assert_eq!(field(&cleared, "skipped_in_flight"), &Value::Int(2));
+    // The in-flight and parked flows survive; the parked one stays resolvable.
+    assert!(store.get(in_flight).is_some());
+    assert!(store.get(parked).is_some());
+    assert_eq!(store.count(), 2);
 }
 
 #[test]
