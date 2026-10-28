@@ -87,7 +87,7 @@ pub fn assemble_with(cfg: &Config, features: &Features) -> anyhow::Result<Assemb
         .clone()
         .unwrap_or_else(|| CaPlugin::new(cfg.ca.clone()));
     builder = builder
-        .register_plugin(Box::new(ScopePlugin::new()))
+        .register_plugin(Box::new(ScopePlugin::new(cfg.scope.allow_agent_widen)))
         .register_plugin(Box::new(RateLimitPlugin::new(cfg.limits.per_host_rps)))
         // Command providers: the browser, poc and ca commands.
         .register_plugin(Box::new(BrowserPlugin::new(cfg.browser.ssrf.clone())))

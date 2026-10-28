@@ -19,7 +19,7 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 25] = [
+const EXPECTED_TOOLS: [&str; 26] = [
     "flow.list",
     "flow.get",
     "flow.detail",
@@ -40,6 +40,7 @@ const EXPECTED_TOOLS: [&str; 25] = [
     "poc.build",
     "poc.run",
     "scope.add",
+    "scope.remove",
     "scope.list",
     "ca.export",
     "ca.install",

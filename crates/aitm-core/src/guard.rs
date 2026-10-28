@@ -21,6 +21,12 @@ pub trait ScopeRateGuard: Send + Sync {
     fn check_active(&self, host: &str) -> Result<ActionPermit, GuardError>;
     /// Add a host (or `host:port`, or `*.wildcard`) to scope.
     fn add_scope(&self, entry: ScopeEntry);
+    /// Remove the scope entry whose host matches `entry` exactly; returns whether
+    /// one was removed. Narrowing scope is always allowed; the default is a no-op
+    /// for guards that do not support removal.
+    fn remove_scope(&self, _entry: &str) -> bool {
+        false
+    }
     /// The current scope entries.
     fn list_scope(&self) -> Vec<ScopeEntry>;
     /// Record an error against `host`; once its budget is exhausted the guard
@@ -484,6 +490,13 @@ impl ScopeRateGuard for StdGuard {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .push(entry);
+    }
+
+    fn remove_scope(&self, entry: &str) -> bool {
+        let mut scope = self.scope.write().unwrap_or_else(PoisonError::into_inner);
+        let before = scope.len();
+        scope.retain(|e| e.host != entry);
+        scope.len() != before
     }
 
     fn list_scope(&self) -> Vec<ScopeEntry> {

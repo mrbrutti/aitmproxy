@@ -173,6 +173,7 @@ async fn run_proxy() -> (SocketAddr, Arc<dyn FlowStore>) {
             entries: vec![ScopeEntry {
                 host: "127.0.0.1".to_string(),
             }],
+            ..ScopeConfig::default()
         },
         ..Config::default()
     };

@@ -62,6 +62,12 @@ pub struct PocConfig {
 #[derive(Debug, Clone, Default)]
 pub struct ScopeConfig {
     pub entries: Vec<ScopeEntry>,
+    /// Let an agent frontend (MCP) widen scope with `scope.add`. **Off by
+    /// default**: adding a host to scope is an authorisation decision, so only
+    /// the human CLI may do it unless the operator opts in — mirrors
+    /// [`CaConfig::allow_agent_install`]. `scope.remove` (which only narrows
+    /// scope) is never gated.
+    pub allow_agent_widen: bool,
 }
 
 /// One scope entry: a host, `host:port`, or `*.wildcard`.

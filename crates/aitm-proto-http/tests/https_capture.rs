@@ -119,6 +119,7 @@ async fn run_proxy(
             entries: vec![ScopeEntry {
                 host: "127.0.0.1".to_string(),
             }],
+            ..ScopeConfig::default()
         },
         ..Config::default()
     };
@@ -254,6 +255,7 @@ async fn run_proxy_capped(
             entries: vec![ScopeEntry {
                 host: "127.0.0.1".to_string(),
             }],
+            ..ScopeConfig::default()
         },
         ..Config::default()
     };
