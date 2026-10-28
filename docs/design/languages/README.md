@@ -51,7 +51,7 @@ checked against it by `build.rs`) and macOS (`FilterExpressionSyntax.swift` /
 
 **`flow-kinds.json`** is the flow-kind model: one descriptor each for `http`,
 `websocket` and `l4` (badge `{label, token}` — the L4 token is `l4`, slate/indigo —
-list cells, inspector panes and viewers, `detail_cmd` and its gate, realtime
+list cells, inspector panes and viewers, `list_cmd` (L4 lives in its own store, so the UI merges two list sources), `detail_cmd` and its gate, realtime
 subscription, and a `status`). The flow list and inspector iterate it, so an
 unknown kind renders a labelled placeholder rather than nothing. Web
 (`flow-kinds.ts`), TUI (`flow_kinds.rs`) and macOS (`FlowKind.swift`) build their

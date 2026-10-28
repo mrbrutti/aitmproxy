@@ -339,6 +339,11 @@ test("flow-kinds.json: http / websocket / l4 descriptors", () => {
   }
   const l4 = kinds.find((k) => k.kind === "l4");
   assert.equal(l4.badge.token, "l4");
+  // L4 flows live in an l4-owned store, not core flow.list: the UI merges two list sources.
+  assert.deepEqual(
+    Object.fromEntries(kinds.map((k) => [k.kind, k.list_cmd])),
+    { http: "flow.list", websocket: "flow.list", l4: "l4.flow.list" },
+  );
   assert.equal(l4.badge.label, "L4");
   assert.equal(l4.status, "m5-gated");
   assert.equal(kinds.find((k) => k.kind === "websocket").badge.label, "WS");
