@@ -18,7 +18,12 @@
 //! `scheme://…` string, so the matcher runs URL clauses against the path.)
 
 use aitm_core::{Flow, HttpRequest, WsDir};
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
+
+/// Compiled-program size cap for a single pattern. Rules can be agent-supplied,
+/// so a pattern that would compile to a larger automaton than this is rejected
+/// (`RuleError::BadRegex`) rather than ballooning to the crate's 10 MiB default.
+const REGEX_SIZE_LIMIT: usize = 1 << 20; // 1 MiB
 
 /// One operator-authored match rule. `id` is the stable handle a command surface
 /// uses to remove the rule; `name` is a human label.
@@ -114,20 +119,27 @@ pub fn compile(rule: Rule) -> Result<CompiledRule, RuleError> {
     let host = match &rule.condition.host {
         None => None,
         Some(HostMatch::Exact(h)) => Some(CompiledHost::Exact(h.to_ascii_lowercase())),
+        // Hosts are case-insensitive: lowercase the pattern so it matches the
+        // lowercased authority (`authority_host`). Paths are *not* folded here —
+        // URL matching above stays case-sensitive.
         Some(HostMatch::Wildcard(pat)) => Some(CompiledHost::Wildcard(compile_pattern(
-            &wildcard_to_regex(pat),
+            &wildcard_to_regex(&pat.to_ascii_lowercase()),
             pat,
         )?)),
     };
     Ok(CompiledRule { rule, url, host })
 }
 
-/// Compile `regex_src`, attributing any failure to the operator-facing `pattern`.
+/// Compile `regex_src` under a fixed size cap, attributing any failure (bad
+/// syntax or exceeding [`REGEX_SIZE_LIMIT`]) to the operator-facing `pattern`.
 fn compile_pattern(regex_src: &str, pattern: &str) -> Result<Regex, RuleError> {
-    Regex::new(regex_src).map_err(|e| RuleError::BadRegex {
-        pattern: pattern.to_string(),
-        message: e.to_string(),
-    })
+    RegexBuilder::new(regex_src)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .build()
+        .map_err(|e| RuleError::BadRegex {
+            pattern: pattern.to_string(),
+            message: e.to_string(),
+        })
 }
 
 /// Translate a shell-style wildcard (`*` = any run) into an anchored regex. Every
