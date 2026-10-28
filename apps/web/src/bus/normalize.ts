@@ -246,7 +246,8 @@ function connOf(client: Rec, server: Rec, given: Rec): ConnInfo {
   if (sni) out.sni = sni;
   if (alpn) out.alpn = alpn;
   if (upstream) out.upstream = upstream;
-  if (typeof client.tls === 'boolean') out.tlsVersion = client.tls ? 'TLS' : 'none';
+  // The bus reports only whether TLS was used, not the version; say nothing for plain.
+  if (client.tls === true) out.tlsVersion = 'TLS';
   return out;
 }
 

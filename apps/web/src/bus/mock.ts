@@ -392,7 +392,10 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
         return r.id;
       }
       case 'request.send': {
-        const url = new URL(need(args, 'url'));
+        // The bus takes the parts: {scheme?, authority, path?, method?, headers?, body?}.
+        const authority = need(args, 'authority');
+        const scheme = typeof args.scheme === 'string' ? args.scheme : 'https';
+        const url = new URL(`${scheme}://${authority}${typeof args.path === 'string' ? args.path : '/'}`);
         if (![...scope].some((h) => h === url.hostname || (h.startsWith('*.') && url.hostname.endsWith(h.slice(1)))))
           throw new BusError(`host ${url.hostname} is out of scope`);
         seq++;
@@ -543,7 +546,7 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
       }
       case 'proxy.status':
         // Listener state and capture state are separate on the bus.
-        return { listening: true, address: '127.0.0.1:8080', capturing, paused: !capturing, protocol: 'HTTP/2', flows: flows.size };
+        return { listening: true, address: '127.0.0.1:8080', capturing, intercept_armed: armed, paused: pausedCount(), flows: flows.size, protocol: 'HTTP/2' };
       case 'proxy.pause':
         capturing = false;
         recordActivity(tool, args, 'web');
@@ -589,7 +592,7 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
   const TOOLS: ToolDef[] = [
     ['flow.list', 'List captured flow ids, oldest first.', {}],
     ['flow.get', 'Summary of one flow.', { id: { type: 'string', 'x-aitm': 'FlowId', description: 'Flow id' } }, ['id']],
-    ['flow.detail', 'Headers, bodies, connection and timing of one flow.', { id: { type: 'string', 'x-aitm': 'FlowId' } }, ['id']],
+    ['flow.detail', 'Headers, bodies, connection and timing of one flow.', { id: { type: 'string', 'x-aitm': 'FlowId' }, body: { type: 'string', enum: ['none', 'inline', 'range'] }, offset: { type: 'integer' }, length: { type: 'integer' } }, ['id']],
     ['flow.intercept', 'Arm or disarm interception of every request.', { enabled: { type: 'boolean', description: 'Arm when true; omit to read.' } }],
     ['flow.resume', 'Release a paused flow to upstream.', { id: { type: 'string', 'x-aitm': 'FlowId' } }, ['id']],
     ['flow.kill', 'Abort a flow; the client sees a reset.', { id: { type: 'string', 'x-aitm': 'FlowId' }, mode: { type: 'string', enum: ['reset', '429', '503'] } }, ['id']],
@@ -598,7 +601,7 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
     ['flow.mark', 'Replace the marks of a flow.', { id: { type: 'string', 'x-aitm': 'FlowId' }, marks: { type: 'array', items: { type: 'string' } } }, ['id', 'marks']],
     ['flow.comment', 'Set the comment on a flow.', { id: { type: 'string', 'x-aitm': 'FlowId' }, text: { type: 'string' } }, ['id']],
     ['flow.clear', 'Remove every captured flow.', {}],
-    ['request.send', 'Send a crafted request through the proxy (scope and rate guarded).', { method: { type: 'string' }, url: { type: 'string' }, headers: { type: 'object' }, body: { type: 'string' } }, ['method', 'url']],
+    ['request.send', 'Send a crafted request through the proxy (scope and rate guarded).', { scheme: { type: 'string' }, authority: { type: 'string' }, path: { type: 'string' }, method: { type: 'string' }, headers: { type: 'object' }, body: { type: 'string' } }, ['authority']],
     ['scope.list', 'Hosts the operator authorised.', {}],
     ['scope.add', 'Authorise a host (host, host:port or *.wildcard).', { host: { type: 'string' } }, ['host']],
     ['scope.remove', 'Withdraw authorisation for a host.', { host: { type: 'string' } }, ['host']],

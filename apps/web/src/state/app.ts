@@ -312,6 +312,7 @@ export function createAppStore(bus: BusClient) {
 
     // ---- polling fallback (bus without F4) --------------------------------
     let pollTimer: ReturnType<typeof setTimeout> | null = null;
+    let pollTicks = 0;
     async function pollOnce() {
       try {
         const ids = await bus.call<string[]>('flow.list');
@@ -321,7 +322,12 @@ export function createAppStore(bus: BusClient) {
           return e && e.raw.status == null && e.raw.intercept !== 'killed';
         });
         const want = [...fresh, ...pending.slice(0, 50)];
-        const got = await Promise.all(want.map((id) => bus.call('flow.get', { id }).catch(() => null)));
+        // `flow.detail {body: none}` is a summary with headers, sizes, times and the connection
+        // — everything a row shows — at the cost of one call per flow, like `flow.get`.
+        const rich = proxy.tools.some((t) => t.name === 'flow.detail');
+        const got = await Promise.all(
+          want.map((id) => (rich ? bus.call('flow.detail', { id, body: 'none' }) : bus.call('flow.get', { id })).catch(() => null)),
+        );
         batch(() => {
           got.forEach((raw, i) => {
             if (raw) upsert(toSummary(raw, ids.indexOf(want[i]!) + 1));
@@ -332,11 +338,26 @@ export function createAppStore(bus: BusClient) {
         /* reconnecting; next tick */
       }
     }
+    async function pollStatus() {
+      if (!proxy.tools.some((t) => t.name === 'proxy.status')) return;
+      try {
+        const s = await bus.call<{ capturing?: boolean; intercept_armed?: boolean; address?: string | null; paused?: number }>('proxy.status');
+        setProxy({
+          listening: s.capturing ?? proxy.listening,
+          armed: typeof s.intercept_armed === 'boolean' ? s.intercept_armed : proxy.armed,
+          address: s.address ?? proxy.address,
+        });
+      } catch {
+        /* next tick */
+      }
+    }
     function startPolling() {
       if (pollTimer) return;
       setProxy('polling', true);
       const tick = async () => {
         await pollOnce();
+        // Without push (F4) the listener/intercept state is polled too, every ~2 s.
+        if (++pollTicks % 4 === 0) await pollStatus();
         pollTimer = setTimeout(tick, 500);
       };
       void tick();
@@ -378,16 +399,24 @@ export function createAppStore(bus: BusClient) {
       if (has('proxy.status'))
         jobs.push(
           bus
-            .call<{ listening?: boolean | string | null; address?: string | null; capturing?: boolean; paused?: number | boolean; protocol?: string }>('proxy.status')
+            .call<{
+              listening?: boolean | string | null;
+              address?: string | null;
+              capturing?: boolean;
+              paused?: number | boolean;
+              intercept_armed?: boolean;
+              protocol?: string;
+            }>('proxy.status')
             .then((s) =>
               setProxy({
-                // Landed shape: `listening` is the bound address (string|null) — the core is
-                // moving to `listening: bool` + `address`; `capturing` is the record toggle;
-                // `paused` is a COUNT of intercepted flows. The store's `listening` flag is the
-                // capture state.
+                // Live shape: `listening: bool` + `address` (an older build sent the address as
+                // `listening`); `capturing` is the record toggle; `paused` is a COUNT of
+                // intercepted flows; `intercept_armed` is the only read of the armed state.
+                // The store's `listening` flag is the capture state.
                 listening: s.capturing ?? (typeof s.paused === 'boolean' ? !s.paused : proxy.listening),
                 address: (typeof s.listening === 'string' ? s.listening : s.address) ?? proxy.address,
                 protocol: s.protocol ?? proxy.protocol,
+                armed: typeof s.intercept_armed === 'boolean' ? s.intercept_armed : proxy.armed,
               }),
             )
             .catch(() => {}),
@@ -760,7 +789,10 @@ export function createAppStore(bus: BusClient) {
         }),
       kill: (id: FlowId, mode: KillMode = 'reset') =>
         guarded('kill', async () => {
-          await bus.call('flow.kill', mode === 'reset' ? { id } : { id, mode });
+          // Abort modes are F3; today's flow.kill rejects unknown parameters, so send `mode`
+          // only when the schema declares it.
+          const hasMode = !!proxy.tools.find((t) => t.name === 'flow.kill')?.inputSchema.properties?.mode;
+          await bus.call('flow.kill', mode === 'reset' || !hasMode ? { id } : { id, mode });
           patch(id, { intercept: 'killed', status: null, durationMs: null });
           recomputePaused();
         }),
@@ -778,7 +810,17 @@ export function createAppStore(bus: BusClient) {
         }),
       compose: (req: { method: string; url: string; headers: Record<string, string>; body: string }) =>
         guarded('send', async () => {
-          const id = await bus.call<string>('request.send', req);
+          // request.send takes the parts, not a URL: {scheme, authority, path (with query), method, headers, body}.
+          const u = new URL(req.url);
+          const args: Record<string, unknown> = {
+            scheme: u.protocol.replace(/:$/, ''),
+            authority: u.host,
+            path: `${u.pathname}${u.search}`,
+            method: req.method,
+            headers: req.headers,
+          };
+          if (req.body) args.body = req.body;
+          const id = await bus.call<string>('request.send', args);
           setUi('composeOpen', false);
           return id;
         }),
