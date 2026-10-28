@@ -92,11 +92,66 @@ impl Proxy {
             let inner = self.inner.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle_conn(inner, stream, peer, ssrf).await {
-                    tracing::warn!(%peer, error = %e, "connection handler ended with an error");
+                    if is_benign_disconnect(&e) {
+                        tracing::debug!(%peer, error = %e, "connection closed before completion");
+                    } else {
+                        tracing::warn!(%peer, error = %e, "connection handler ended with an error");
+                    }
                 }
             });
         }
     }
+}
+
+/// Classify a connection-handler error as a benign, expected client-side
+/// disconnect (log at `debug`) rather than a genuine failure (log at `warn`).
+///
+/// A browser or client that aborts a TLS handshake, resets, or closes before a
+/// request would otherwise spam one `warn` per connection. We demote only a
+/// named set, identified by **type** — never by matching message substrings:
+///
+/// - `io::ErrorKind::{ConnectionReset, BrokenPipe, UnexpectedEof}` anywhere in
+///   the chain (peer resets, broken pipes, and EOF-before-a-request; the TLS
+///   layer also reports a mid-handshake EOF as `UnexpectedEof`).
+/// - A received TLS alert (`rustls::Error::AlertReceived`), e.g. the client does
+///   not trust our CA and aborts the handshake. The TLS layer wraps this in an
+///   `InvalidData` io::Error, so we look through the io::Error at its source too.
+fn is_benign_disconnect(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            if is_benign_io_kind(io.kind()) {
+                return true;
+            }
+            if let Some(src) = io.get_ref() {
+                if src
+                    .downcast_ref::<rustls::Error>()
+                    .is_some_and(is_client_abort)
+                {
+                    return true;
+                }
+            }
+        }
+        cause
+            .downcast_ref::<rustls::Error>()
+            .is_some_and(is_client_abort)
+    })
+}
+
+/// The `io::ErrorKind`s that mean "the peer went away", not "we failed".
+fn is_benign_io_kind(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// A TLS error the *client* initiated by aborting the handshake — currently a
+/// received fatal alert (e.g. it rejected our impersonating leaf). Internal TLS
+/// failures are **not** demoted.
+fn is_client_abort(err: &rustls::Error) -> bool {
+    matches!(err, rustls::Error::AlertReceived(_))
 }
 
 /// Peek, pick a module, and drive it. `ssrf` selects the browser-facing SSRF
@@ -244,5 +299,56 @@ impl ProxyBuilder {
                 browser_ssrf,
             }),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_benign_disconnect;
+    use std::io;
+
+    /// A `std::io::Error` of the given kind, wrapped in an `anyhow` context the
+    /// same way the handler does — the classifier must see through the context.
+    fn io_err(kind: io::ErrorKind) -> anyhow::Error {
+        anyhow::Error::new(io::Error::new(kind, "peer went away")).context("driving the connection")
+    }
+
+    #[test]
+    fn benign_disconnects_are_debug_real_errors_warn() {
+        // Client-side disconnects / resets / EOF-before-a-request: all benign.
+        assert!(is_benign_disconnect(&io_err(
+            io::ErrorKind::ConnectionReset
+        )));
+        assert!(is_benign_disconnect(&io_err(io::ErrorKind::BrokenPipe)));
+        assert!(is_benign_disconnect(&io_err(io::ErrorKind::UnexpectedEof)));
+
+        // A client that aborts the TLS handshake with an alert (e.g. it does not
+        // trust our CA): the TLS layer wraps `rustls::Error` in an InvalidData
+        // io::Error, exactly as `tokio_rustls` does. Benign, by type not message.
+        let tls_alert = io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::AlertReceived(rustls::AlertDescription::CertificateUnknown),
+        );
+        let tls_err = anyhow::Error::new(tls_alert).context("client TLS handshake");
+        assert!(is_benign_disconnect(&tls_err));
+
+        // A genuine handler failure stays at warn.
+        let parse_err = anyhow::Error::new(crate::FlowError::Protocol("bad request line".into()))
+            .context("serving HTTP");
+        assert!(!is_benign_disconnect(&parse_err));
+
+        // An unexpected io failure is *not* blanket-demoted: only the named
+        // disconnect kinds are benign, so e.g. a permission error still warns.
+        assert!(!is_benign_disconnect(&io_err(
+            io::ErrorKind::PermissionDenied
+        )));
+
+        // A TLS error that is not a client abort (a message we produced) warns.
+        let tls_internal = io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::General("internal state".into()),
+        );
+        let tls_internal = anyhow::Error::new(tls_internal).context("client TLS handshake");
+        assert!(!is_benign_disconnect(&tls_internal));
     }
 }

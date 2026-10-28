@@ -120,6 +120,7 @@ dependencies = [
  "dirs",
  "futures",
  "indexmap",
+ "rustls",
  "tokio",
  "tracing",
  "uuid",
