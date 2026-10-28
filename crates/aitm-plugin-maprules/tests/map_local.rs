@@ -116,9 +116,13 @@ fn obj(pairs: &[(&str, Value)]) -> Value {
 
 fn registry(map_root: &Path, allow_agent_authoring: bool) -> Registry {
     let mut reg = Registry::new();
+    // Map Local performs no egress, so its guard is never consulted; a default
+    // (deny-by-default) guard satisfies the constructor.
+    let guard: Arc<dyn aitm_core::ScopeRateGuard> = Arc::new(StdGuard::default());
     reg.add_plugin(Box::new(MapRulesPlugin::new(
         map_root.to_path_buf(),
         allow_agent_authoring,
+        guard,
     )));
     reg
 }
