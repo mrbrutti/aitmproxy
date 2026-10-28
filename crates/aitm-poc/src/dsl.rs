@@ -3,11 +3,12 @@
 //!
 //! M1 ships the minimal helper subset the PoC-language spec and plan name
 //! (`contains`, `status_code`, `body`, `url_encode`, `rand_text_alpha`, `base64`),
-//! plus `html_escape`/`to_lower`/`len`/`concat`. The evaluator handles string/int
-//! literals, identifiers (resolved against the context's variables and the
-//! `body`/`status_code`/`content_length` built-ins), function calls, and the
+//! plus `html_escape`/`to_lower`/`len`/`concat`, and `step("name")`, which reads
+//! a script step's recorded outcome from the context (M3). The evaluator handles
+//! string/int literals, identifiers (resolved against the context's variables and
+//! the `body`/`status_code`/`content_length` built-ins), function calls, and the
 //! `== != && || !` operators — enough for the declarative matcher surface. Real
-//! control flow stays in the (M2) Rhai `script` step, not here.
+//! control flow stays in the Rhai `script` step, not here.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -20,15 +21,20 @@ pub struct DslContext {
     pub status: u16,
     pub body: String,
     pub vars: BTreeMap<String, Value>,
+    /// Script-step outcomes by step name, as the strings `step("name")` returns
+    /// (`"pass"`, `"fail"`, `"neutral"`, `"error"`, …).
+    pub steps: BTreeMap<String, String>,
 }
 
 impl DslContext {
-    /// A context over a response status and body, with no bound variables.
+    /// A context over a response status and body, with no bound variables or
+    /// step outcomes.
     pub fn new(status: u16, body: impl Into<String>) -> Self {
         Self {
             status,
             body: body.into(),
             vars: BTreeMap::new(),
+            steps: BTreeMap::new(),
         }
     }
 }
@@ -352,7 +358,7 @@ impl Parser<'_> {
                 self.pos += 1;
                 if self.peek() == Some(&Tok::LParen) {
                     let args = self.parse_args(ctx)?;
-                    call(&name, args)
+                    call(&name, args, ctx)
                 } else {
                     Ok(resolve_ident(&name, ctx))
                 }
@@ -392,10 +398,17 @@ fn resolve_ident(name: &str, ctx: &DslContext) -> Value {
     }
 }
 
-fn call(name: &str, args: Vec<Value>) -> anyhow::Result<Value> {
+fn call(name: &str, args: Vec<Value>, ctx: &DslContext) -> anyhow::Result<Value> {
     let arg_str = |i: usize| -> String { args.get(i).map(as_string).unwrap_or_default() };
     match name {
         "contains" => Ok(Value::Bool(arg_str(0).contains(&arg_str(1)))),
+        // A script step's recorded outcome; `null` when nothing was recorded under
+        // that name, so `check()` (an empty context) still accepts the expression.
+        "step" => Ok(ctx
+            .steps
+            .get(&arg_str(0))
+            .map(|outcome| Value::Str(outcome.clone()))
+            .unwrap_or(Value::Null)),
         "url_encode" => Ok(Value::Str(url_encode(&arg_str(0)))),
         "base64" => Ok(Value::Str(base64(&arg_str(0)))),
         "html_escape" => Ok(Value::Str(html_escape(&arg_str(0)))),

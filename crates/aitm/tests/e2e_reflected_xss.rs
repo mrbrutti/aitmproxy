@@ -197,9 +197,12 @@ async fn run_case(engine: BrowserEngine, mode: Mode, poc_path: &std::path::Path)
     cfg.scope.entries = vec![ScopeEntry {
         host: target_authority.clone(),
     }];
+    // This e2e is agent-driven (scope.add + poc.run over MCP), so it opts into
+    // letting the MCP frontend widen scope (F12 gate; off by default).
+    cfg.scope.allow_agent_widen = true;
     // `assemble` (not `build_proxy`): the engine needs the CA's certificate
     // file, which is how `main` launches it too (spec §D6).
-    let Assembled { proxy, ca } = assemble(&cfg).expect("assemble proxy");
+    let Assembled { proxy, ca, .. } = assemble(&cfg).expect("assemble proxy");
 
     let store = proxy.store();
     let guard = proxy.guard();
