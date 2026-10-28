@@ -172,10 +172,14 @@ dependencies = [
 name = "aitm-proto-l4"
 version = "0.1.0"
 dependencies = [
+ "aitm-core",
+ "anyhow",
  "etherparse",
+ "futures",
  "pcap",
  "pnet_packet",
  "serde",
+ "serde_json",
  "serde_yaml",
  "thiserror 2.0.21",
  "uuid",

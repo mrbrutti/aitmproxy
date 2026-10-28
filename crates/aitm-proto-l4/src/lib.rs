@@ -11,11 +11,14 @@
 
 pub mod backend;
 pub mod capture;
+pub mod commands;
 pub mod config;
 pub mod craft;
 pub mod flow;
 pub mod guard;
+pub mod module;
 pub mod types;
 pub mod wire;
 
 pub use backend::L4Error;
+pub use module::L4Module;
