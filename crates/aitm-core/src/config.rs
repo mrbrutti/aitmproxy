@@ -199,6 +199,10 @@ pub enum BrowserEngine {
     Obscura,
     /// A system Chrome/Chromium (the M1 behaviour).
     Chrome,
+    /// A system Firefox, launched with a throwaway profile whose proxy prefs
+    /// point at aitmproxy and whose cert store trusts the MITM CA — the OS proxy
+    /// and OS trust store are never touched (M4 Task 13, Review Focus #5).
+    Firefox,
 }
 
 /// How to find and start the forked obscura.
@@ -223,6 +227,32 @@ impl Default for ObscuraConfig {
     }
 }
 
+/// How to find and start a system Firefox (used when `engine` is `Firefox`).
+///
+/// Firefox is driven over its remote-debugging (CDP) endpoint. Unlike obscura,
+/// trust and routing are configured per-profile (a throwaway profile), so this
+/// carries no CA flag: the launcher writes the proxy prefs and trusts the CA
+/// into that profile only.
+#[derive(Debug, Clone)]
+pub struct FirefoxConfig {
+    /// The `firefox` binary; a bare name is resolved on `PATH`. Default `firefox`.
+    pub binary: PathBuf,
+    /// Spawn → CDP connected; default 20 s (a cold Firefox profile is slow).
+    pub start_timeout: Duration,
+    /// Per-operation bound on the `BrowserDriver` primitives; default 30 s.
+    pub nav_timeout: Duration,
+}
+
+impl Default for FirefoxConfig {
+    fn default() -> Self {
+        Self {
+            binary: PathBuf::from("firefox"),
+            start_timeout: Duration::from_secs(20),
+            nav_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
 /// Embedded-browser configuration. Declared in `aitm-core` because `Config`
 /// references it; `aitm-browser` implements the driver against this type.
 #[derive(Debug, Clone)]
@@ -231,6 +261,8 @@ pub struct BrowserConfig {
     pub engine: BrowserEngine,
     /// Obscura launcher settings (used when `engine` is `Obscura`).
     pub obscura: ObscuraConfig,
+    /// Firefox launcher settings (used when `engine` is `Firefox`).
+    pub firefox: FirefoxConfig,
     /// The proxy upstream (`--proxy-server`).
     pub proxy_addr: SocketAddr,
     /// Chrome only: obscura has no head.
@@ -246,6 +278,7 @@ impl Default for BrowserConfig {
         Self {
             engine: BrowserEngine::default(),
             obscura: ObscuraConfig::default(),
+            firefox: FirefoxConfig::default(),
             // A dedicated loopback port, distinct from the main listener (8080):
             // the embedded browser dials this SSRF-filtered listener.
             proxy_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
