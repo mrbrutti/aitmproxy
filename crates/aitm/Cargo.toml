@@ -26,6 +26,10 @@ aitm-poc.workspace = true
 aitm-plugin-rhai.workspace = true
 aitm-mcp.workspace = true
 aitm-cli.workspace = true
+# `aitm tui` embeds the proxy: the TUI runs in-process over `aitm-bus-client`'s
+# `InProcessTransport` (TUI plan Task 4). Both are already in the tree.
+aitm-tui.workspace = true
+aitm-bus-client.workspace = true
 anyhow = "1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

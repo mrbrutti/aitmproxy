@@ -12,6 +12,8 @@ members = [
     "crates/aitm-plugin-rhai",
     "crates/aitm-mcp",
     "crates/aitm-cli",
+    "crates/aitm-bus-client",
+    "crates/aitm-tui",
     "crates/aitm",
 ]
 
@@ -48,3 +50,5 @@ aitm-poc = { path = "crates/aitm-poc" }
 aitm-plugin-rhai = { path = "crates/aitm-plugin-rhai" }
 aitm-mcp = { path = "crates/aitm-mcp" }
 aitm-cli = { path = "crates/aitm-cli" }
+aitm-bus-client = { path = "crates/aitm-bus-client" }
+aitm-tui = { path = "crates/aitm-tui" }

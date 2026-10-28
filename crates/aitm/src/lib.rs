@@ -9,5 +9,38 @@ pub mod config_file;
 pub mod env;
 pub mod render;
 pub mod scripts;
+pub mod tui;
 pub mod web;
 pub mod wire;
+
+use tracing::warn;
+
+/// Resolves on SIGINT (Ctrl-C) or, on Unix, SIGTERM. A handler that cannot be
+/// installed is logged and never fires, so it cannot end the run by itself.
+pub async fn shutdown_signal() {
+    let interrupt = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            warn!(error = %e, "could not install the SIGINT handler");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                term.recv().await;
+            }
+            Err(e) => {
+                warn!(error = %e, "could not install the SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = interrupt => {}
+        () = terminate => {}
+    }
+}

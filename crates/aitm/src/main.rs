@@ -9,6 +9,8 @@
 //! the proxy accept loop and the MCP server (stdio or loopback-TCP per config),
 //! with the configured browser engine attached when it launches, and closes
 //! the browser on every orderly exit path including SIGINT/SIGTERM (spec §D6).
+//! Invoked as `aitm tui` it does the same but with the terminal operator UI in
+//! the process too, over an in-process bus channel (`aitm::tui`).
 //! `aitm web [--listen ADDR] [--token TOKEN] [--no-open]` is the server path
 //! plus the embedded web UI and its `/bus` bridge (`aitm::web`, F15).
 
@@ -20,16 +22,44 @@ use std::time::Duration;
 use aitm::config_file::Settings;
 use aitm::render::render_cli_value;
 use aitm::scripts::LateHandles;
+use aitm::tui::TuiLog;
 use aitm::web::{self, WebArgs, WebCommand, WebState};
-use aitm::wire::{assemble_with_scripts, Assembled, Features, Http1Sender, ScriptWiring};
-use aitm::{config_file, env};
-use aitm_core::{BrowserDriver, Chain, PipelineClient, Plugin, ProxyClient};
+use aitm::wire::{assemble_with_scripts, Assembled, Features, ScriptWiring};
+use aitm::{config_file, env, tui};
+use aitm_core::{BrowserDriver, Chain, Plugin};
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 /// The config file path when `--config` is not given.
 const CONFIG_ENV: &str = "AITM_CONFIG";
+
+/// What the command line asked for, after the `--config` and `--script` splits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Mode {
+    /// No arguments: the proxy plus the configured MCP transport.
+    Server,
+    /// A subcommand: one-shot dispatch over the CLI frontend.
+    Cli(Vec<String>),
+    /// `tui`: the proxy plus the terminal operator UI in one process.
+    Tui,
+    /// `web …`: the server path plus the embedded web UI and its `/bus`
+    /// bridge; the options live beside in `WebArgs`.
+    Web,
+}
+
+/// Classify `argv`. `tui` takes no arguments; anything after it is a usage
+/// error carrying the line to print. `web` is recognised here and its
+/// options parsed by the caller (`web::parse_args`).
+fn parse_mode(argv: Vec<String>) -> Result<Mode, String> {
+    match argv.first().map(String::as_str) {
+        None => Ok(Mode::Server),
+        Some("tui") if argv.len() == 1 => Ok(Mode::Tui),
+        Some("tui") => Err(tui::USAGE.to_string()),
+        Some("web") => Ok(Mode::Web),
+        Some(_) => Ok(Mode::Cli(argv)),
+    }
+}
 
 /// The runtime is built by hand rather than with `#[tokio::main]` so its
 /// workers get a stack sized for script evaluation: a hook runs on the worker
@@ -44,11 +74,8 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run() -> anyhow::Result<()> {
-    init_tracing();
-
     let (config_arg, argv) = split_config_arg(std::env::args().skip(1).collect())?;
     let (script_args, argv) = split_script_args(argv)?;
-
     // `aitm web …` is the server path with the web UI attached; its options
     // are resolved before any config is loaded so `--help` and bad flags are
     // answered immediately.
@@ -65,6 +92,21 @@ async fn run() -> anyhow::Result<()> {
     let web_settings = match &web_args {
         Some(args) => Some(args.resolve(|k| std::env::var(k).ok())?),
         None => None,
+    };
+    let mode = match parse_mode(argv) {
+        Ok(mode) => mode,
+        Err(usage) => {
+            eprintln!("{usage}");
+            std::process::exit(2);
+        }
+    };
+    // The TUI owns the terminal, so its subscriber must not write there.
+    let tui_log = match mode {
+        Mode::Tui => tui::init_tracing(),
+        Mode::Server | Mode::Cli(_) | Mode::Web => {
+            init_tracing();
+            TuiLog::Off
+        }
     };
 
     let config_path = config_arg.or_else(|| std::env::var_os(CONFIG_ENV).map(PathBuf::from));
@@ -88,7 +130,7 @@ async fn run() -> anyhow::Result<()> {
     // bound to the proxy's real ones below, before anything is served.
     let handles = LateHandles::new();
     let findings = Arc::new(MemoryFindingSink::new());
-    let services = ScriptServices {
+    let script_services = ScriptServices {
         store: handles.clone(),
         client: handles.clone(),
         browser: Some(handles.clone()),
@@ -97,7 +139,7 @@ async fn run() -> anyhow::Result<()> {
         rt: tokio::runtime::Handle::current(),
     };
     let strict = rhai_cfg.strict;
-    let tier = aitm_plugin_rhai::wire::build(rhai_cfg, services)?;
+    let tier = aitm_plugin_rhai::wire::build(rhai_cfg, script_services)?;
     for err in &tier.errors {
         warn!(target: "aitm::scripts", "{err}");
     }
@@ -142,31 +184,19 @@ async fn run() -> anyhow::Result<()> {
         },
     )?;
 
-    // Shared service handles for the frontends and the replay client.
-    let registry = proxy.registry_arc();
-    let store = proxy.store();
-    let guard = proxy.guard();
-    let client: Arc<dyn ProxyClient> = Arc::new(PipelineClient::new(
-        store.clone(),
-        guard.clone(),
-        Arc::new(Http1Sender::new().with_insecure(cfg.ssl_insecure)),
-    ));
-
-    // The scripting tier now reaches exactly the proxy's store, client and
-    // guard, and a failed hook's `Event::Error` reaches the chain rather than
-    // only the log.
-    handles.bind_proxy(store.clone(), client.clone(), guard.clone());
-    tier.error_sink
-        .bind(Arc::new(Chain::new(registry.clone(), store.clone())));
-
-    if web_args.is_none() && !argv.is_empty() {
-        // One-shot CLI dispatch (no browser needed).
-        let cli = aitm_cli::Cli::new(registry.clone())
+    if let Mode::Cli(argv) = &mode {
+        // One-shot CLI dispatch (no browser needed): the same service
+        // handles the frontends share, without a browser or a log file.
+        let s = tui::services(&proxy, &cfg, None, TuiLog::Off);
+        handles.bind_proxy(s.store.clone(), s.client.clone(), s.guard.clone());
+        tier.error_sink
+            .bind(Arc::new(Chain::new(s.registry.clone(), s.store.clone())));
+        let cli = aitm_cli::Cli::new(s.registry.clone())
             .with_ssrf_policy(cfg.browser.ssrf.clone())
             .with_poc_dir(cfg.poc.dir.clone())
             .with_config(Arc::new(cfg.clone()))
-            .with_services(store.clone(), client.clone(), guard.clone(), None);
-        match cli.dispatch(&argv) {
+            .with_services(s.store, s.client, s.guard, None);
+        match cli.dispatch(argv) {
             Ok(value) => {
                 let mut stdout = std::io::stdout().lock();
                 stdout.write_all(&render_cli_value(&value))?;
@@ -194,84 +224,90 @@ async fn run() -> anyhow::Result<()> {
         }
     };
     let browser: Option<Arc<dyn BrowserDriver>> = launched.as_ref().map(|l| l.driver.clone());
-    // `browser.*` in a script reaches the same engine the commands do.
-    if let Some(driver) = browser.clone() {
+    // Shared service handles for the frontends and the replay client.
+    let services = tui::services(&proxy, &cfg, browser.clone(), tui_log);
+
+    // The scripting tier now reaches exactly the proxy's store, client and
+    // guard, and a failed hook's `Event::Error` reaches the chain rather than
+    // only the log; `browser.*` in a script reaches the same engine the
+    // commands do.
+    handles.bind_proxy(
+        services.store.clone(),
+        services.client.clone(),
+        services.guard.clone(),
+    );
+    tier.error_sink.bind(Arc::new(Chain::new(
+        services.registry.clone(),
+        services.store.clone(),
+    )));
+    if let Some(driver) = browser {
         handles.bind_browser(driver);
     }
 
-    let mcp = aitm_mcp::McpServer::new(registry.clone(), cfg.mcp.transport.clone())
-        .with_ssrf_policy(cfg.browser.ssrf.clone())
-        .with_poc_dir(cfg.poc.dir.clone())
-        .with_config(Arc::new(cfg.clone()))
-        .with_services(
-            store.clone(),
-            client.clone(),
-            guard.clone(),
-            browser.clone(),
-        );
-
-    // `aitm web`: a second McpServer over the same registry and services
-    // (`serve` consumes the first), driven by the bridge's `handle` calls.
-    let web_server = match web_settings {
-        Some(settings) => {
-            let bus = aitm_mcp::McpServer::new(registry, cfg.mcp.transport.clone())
-                .with_ssrf_policy(cfg.browser.ssrf.clone())
-                .with_poc_dir(cfg.poc.dir.clone())
-                .with_config(Arc::new(cfg.clone()))
-                .with_services(store, client, guard, browser);
-            let state = Arc::new(WebState {
-                mcp: Arc::new(bus),
-                token: settings.token.clone(),
-            });
-            if settings.insecure_bind {
-                warn!(
-                    listen = %settings.listen,
-                    "binding the web UI off loopback WITHOUT TLS ({}=1); the bridge token \
-                     is its only protection",
-                    web::INSECURE_BIND_ENV
-                );
-            }
-            // The proxy and the browser's proxy port bind later in the select; a shared
-            // address would surface as a bare "address in use" there, so name it here.
-            for (what, addr) in [
-                ("proxy listen", cfg.listen),
-                ("browser.proxy_addr", cfg.browser.proxy_addr),
-            ] {
-                anyhow::ensure!(
-                    settings.listen != addr,
-                    "web UI --listen {} collides with {what} ({addr}); pick another port",
-                    settings.listen
-                );
-            }
-            let listener = TcpListener::bind(settings.listen).await?;
-            let url = web::ui_url(listener.local_addr()?, &settings.token);
-            info!(url = %url, "web UI listening");
-            println!("web UI: {url}");
-            Some((listener, state))
-        }
-        None => None,
-    };
-    let web_run = async move {
-        match web_server {
-            Some((listener, state)) => web::serve(listener, state).await,
-            None => std::future::pending().await,
-        }
-    };
-
-    // The main listener relays client traffic; the browser listener is
-    // SSRF-filtered (the embedded browser dials `cfg.browser.proxy_addr`).
-    let main_listen = cfg.listen;
-    let browser_listen = cfg.browser.proxy_addr;
     // We are about to serve: `proxy.status.listening` now reports the truth.
     listening.store(true, std::sync::atomic::Ordering::Relaxed);
-    let result = tokio::select! {
-        result = proxy.run(main_listen) => result,
-        result = proxy.run_browser(browser_listen) => result,
-        result = mcp.serve() => result,
-        result = web_run => result,
-        () = shutdown_signal() => {
-            info!("shutdown signal received");
-            Ok(())
+    let result = if mode == Mode::Tui {
+        tui::run(&cfg, &proxy, services).await
+    } else {
+        let mcp = tui::server(&cfg, cfg.mcp.transport.clone(), &services);
+
+        // `aitm web`: a second McpServer over the same registry and services
+        // (`serve` consumes the first), driven by the bridge's `handle` calls.
+        let web_server = match web_settings {
+            Some(settings) => {
+                let bus = tui::server(&cfg, cfg.mcp.transport.clone(), &services);
+                let state = Arc::new(WebState {
+                    mcp: Arc::new(bus),
+                    token: settings.token.clone(),
+                });
+                if settings.insecure_bind {
+                    warn!(
+                        listen = %settings.listen,
+                        "binding the web UI off loopback WITHOUT TLS ({}=1); the bridge token \
+                         is its only protection",
+                        web::INSECURE_BIND_ENV
+                    );
+                }
+                // The proxy and the browser's proxy port bind later in the select; a shared
+                // address would surface as a bare "address in use" there, so name it here.
+                for (what, addr) in [
+                    ("proxy listen", cfg.listen),
+                    ("browser.proxy_addr", cfg.browser.proxy_addr),
+                ] {
+                    anyhow::ensure!(
+                        settings.listen != addr,
+                        "web UI --listen {} collides with {what} ({addr}); pick another port",
+                        settings.listen
+                    );
+                }
+                let listener = TcpListener::bind(settings.listen).await?;
+                let url = web::ui_url(listener.local_addr()?, &settings.token);
+                info!(url = %url, "web UI listening");
+                println!("web UI: {url}");
+                Some((listener, state))
+            }
+            None => None,
+        };
+        let web_run = async move {
+            match web_server {
+                Some((listener, state)) => web::serve(listener, state).await,
+                None => std::future::pending().await,
+            }
+        };
+
+        // The main listener relays client traffic; the browser listener is
+        // SSRF-filtered (the embedded browser dials `cfg.browser.proxy_addr`).
+        let main_listen = cfg.listen;
+        let browser_listen = cfg.browser.proxy_addr;
+        tokio::select! {
+            result = proxy.run(main_listen) => result,
+            result = proxy.run_browser(browser_listen) => result,
+            result = mcp.serve() => result,
+            result = web_run => result,
+            () = aitm::shutdown_signal() => {
+                info!("shutdown signal received");
+                Ok(())
+            }
         }
     };
 
@@ -330,36 +366,6 @@ fn split_script_args(argv: Vec<String>) -> anyhow::Result<(Vec<PathBuf>, Vec<Str
     Ok((scripts, rest))
 }
 
-/// Resolves on SIGINT (Ctrl-C) or, on Unix, SIGTERM. A handler that cannot be
-/// installed is logged and never fires, so it cannot end the run by itself.
-async fn shutdown_signal() {
-    let interrupt = async {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            warn!(error = %e, "could not install the SIGINT handler");
-            std::future::pending::<()>().await;
-        }
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                term.recv().await;
-            }
-            Err(e) => {
-                warn!(error = %e, "could not install the SIGTERM handler");
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        () = interrupt => {}
-        () = terminate => {}
-    }
-}
-
 /// Install a tracing subscriber (RUST_LOG-driven, defaulting to `info`).
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
@@ -371,7 +377,7 @@ fn init_tracing() {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{split_config_arg, split_script_args};
+    use super::{parse_mode, split_config_arg, split_script_args, Mode};
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
@@ -406,6 +412,42 @@ mod tests {
     }
 
     #[test]
+    fn empty_argv_is_the_server() {
+        assert_eq!(parse_mode(args(&[])), Ok(Mode::Server));
+    }
+
+    #[test]
+    fn a_subcommand_is_a_cli_dispatch() {
+        assert_eq!(
+            parse_mode(args(&["flow", "list"])),
+            Ok(Mode::Cli(args(&["flow", "list"])))
+        );
+    }
+
+    #[test]
+    fn tui_alone_embeds_the_proxy() {
+        assert_eq!(parse_mode(args(&["tui"])), Ok(Mode::Tui));
+    }
+
+    #[test]
+    fn web_is_the_server_with_the_web_ui_attached() {
+        assert_eq!(parse_mode(args(&["web"])), Ok(Mode::Web));
+        assert_eq!(
+            parse_mode(args(&["web", "--listen", "127.0.0.1:8082"])),
+            Ok(Mode::Web),
+            "web's own flags are parsed by web::parse_args, not here"
+        );
+    }
+
+    #[test]
+    fn tui_with_extra_arguments_is_a_usage_error() {
+        assert_eq!(
+            parse_mode(args(&["tui", "extra"])),
+            Err("usage: aitm [--config <path>] tui (takes no further arguments)".to_string())
+        );
+    }
+
+    #[test]
     fn script_flags_are_collected_in_order_and_stripped() {
         let (scripts, rest) = split_script_args(args(&[
             "--script",
@@ -423,5 +465,12 @@ mod tests {
     fn bare_script_flag_without_a_path_is_an_error() {
         let err = split_script_args(args(&["--script"])).unwrap_err();
         assert_eq!(err.to_string(), "--script requires a path");
+    }
+
+    #[test]
+    fn script_flags_before_tui_still_embed() {
+        let (scripts, rest) = split_script_args(args(&["--script", "a.rhai", "tui"])).unwrap();
+        assert_eq!(scripts, [PathBuf::from("a.rhai")]);
+        assert_eq!(parse_mode(rest), Ok(Mode::Tui));
     }
 }
