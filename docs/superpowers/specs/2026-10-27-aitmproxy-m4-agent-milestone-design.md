@@ -3,7 +3,9 @@
 **Status:** draft
 **Research inputs:** `docs/research/04-playwright-cua.md`, `docs/research/05-synthesis.md`, `docs/research/07-ca-install.md`
 **Design inputs:** `docs/superpowers/specs/2026-10-27-aitmproxy-platform-design.md` (the roadmap "Agent-driven vuln-finding site" product goal, the tool/agent split, the command bus, the PoC engine), `docs/design/operator-ui-foundation.md` §4 (command-bus contract) and §5 (core follow-ups F1–F15), and the operator-commands Coder blocker analysis (`side-session-notes/.../operator-commands-CODER-BLOCKER.md`).
-**Companion / downstream specs:** the additive operator commands **F5** (`flow.detail`), **F6** (`flow.mark`/`flow.comment`), **F7** (`proxy.status`/`pause`/`resume`, `flow.clear`, `config.get`), **F12** (`scope.remove` + agent-widen gate), **F13** (`poc.list`/`poc.get`/`poc.artifact`) are being specced and built as their own spec+plan elsewhere; M4 **depends on** them and references their shapes from the foundation doc, it does not redesign them. **F2** (command-invocation audit ring + `notifications/aitm/agent`) is referenced as the source of the agent activity stream that rides M4's push channel.
+**Companion / downstream specs:** the additive operator commands **F5** (`flow.detail`), **F6** (`flow.mark`/`flow.comment`), **F7** (`proxy.status`/`pause`/`resume`, `flow.clear`, `config.get`), **F12** (`scope.remove` + agent-widen gate), **F13** (`poc.list`/`poc.get`/`poc.artifact`) are being specced and built as their own spec+plan elsewhere; M4 **depends on** them and references their shapes from the foundation doc, it does not redesign them. **F2** (command-invocation audit ring + `notifications/aitm/agent`) is **owned by M4** and designed here as one coherent operator/agent-channel story with F1 (identity) and F4 (push): it is what lights up the operator "Agent" page while the agent works.
+
+**Verified live-wire facts (ground truth; the foundation doc has drifted).** The macOS surface confirmed the following against the running core over its in-process bus; `docs/design/operator-ui-foundation.md` §4.3 is stale on these, so where this spec or the agent driver surface names a command shape, **these win**: `browser.eval` takes `expr` (not `script`); `browser.click` takes x/y floats **or** a selector; `browser.type` **requires** a selector (operators pass `":focus"`); `poc.build` returns the **YAML text** (not a path); `ca.status` reports installed/trusted as `yes|no|unknown`. The agent skill set (D7) and the report/artifact handling (D8) are written to these shapes.
 
 ## Intent
 
@@ -19,7 +21,7 @@ Observable outcomes:
 
 1. **A Claude agent driver surface** — a committed Claude plugin / skill set (SKILL.md + skills + MCP wiring) that an agent uses to operate aitmproxy over the MCP bus: browse, intercept, mutate, replay, scope, run PoCs, and report. It encodes the *strategy* (the observe→reason→act→reproduce loop); the tool keeps all deterministic machinery (tool/agent split).
 2. **F1 — per-connection operator/agent identity + the agent on/off policy.** A connection authenticates as either an **operator** or an **agent** token class; `call_tool` no longer hard-codes `Frontend::Mcp`. An `AgentPolicy { All, ReadOnly, Paused }` is enforced in the MCP server before `invoke`; `agent.status` / `agent.set` expose and change it; the agent cannot un-pause itself.
-3. **F4 — server push.** A subscription channel (`flow.subscribe` / `flow.unsubscribe`) over which the server writes unsolicited `notifications/aitm/{flow,state,agent}` lines on both transports, overturning today's strict request/response invariant. The live agent loop and the three UIs both consume it.
+3. **F4 — server push + F2 — the agent/activity channel.** A subscription channel (`flow.subscribe` / `flow.unsubscribe`) over which the server writes unsolicited `notifications/aitm/{flow,state,agent}` lines on both transports, overturning today's strict request/response invariant; and a **command-invocation audit ring (F2)** that records every call from every role and feeds the `notifications/aitm/agent` stream, so the operator "Agent" page sees every agent action as it happens. The live agent loop and the three UIs both consume the channel. F1/F2/F4 are one operator/agent-channel story.
 4. **Confirm-over-the-wire.** An operator connection can satisfy a command's `confirm_prompt` through a defined two-phase handshake; an agent connection still cannot (its gated commands stay governed by config flags such as `ca.allow_agent_install`). The `ca.install`-reachable-with-no-confirm hole is closed.
 5. **A real, seeded-vulnerable test target** — a hermetic, self-contained web app seeded with a documented, enumerated set of real vulnerabilities (reflected XSS, stored XSS, SSRF, broken access control/IDOR, auth bypass, open redirect), plus patched control variants, run with no external network. The planted-vuln manifest is visible only to the grader, never to the agent.
 6. **Real agent-driven e2e through real browsers on a custom, non-system proxy** — the agent exercises the target through the embedded **obscura** engine **and** an **external Chrome** (via `--proxy-server`), with **Firefox** (via its own profile proxy prefs + cert store) added as a second external engine. Never the OS proxy; never synthetic-only.
@@ -64,12 +66,12 @@ The parts of the *how* that are decided. Defaults the architect chose are marked
 
 **What M4 owns (new work):**
 
-1. The operator/agent command architecture: **F1** (identity split + agent policy), **F4** (server push), and the **confirm-over-the-wire** mechanism. Rust, in `aitm-core` + `aitm-mcp`.
+1. The operator/agent command architecture: **F1** (identity split + agent policy), **F2** (command-invocation audit ring + the `notifications/aitm/agent` stream), **F4** (server push), and the **confirm-over-the-wire** mechanism — one coherent operator/agent-channel story. Rust, in `aitm-core` + `aitm-mcp`.
 2. The **seeded-vulnerable test target** + the **grader** harness. Rust, a new test-support crate.
 3. The **Firefox** external-browser driver option and the **multi-browser agent-driven e2e**.
 4. The **Claude agent driver surface** (plugin/skill set) and the **report contract**. Markdown/config, committed in the repo.
 
-**What M4 depends on but does not build (referenced, built elsewhere):** **F5** `flow.detail` (the agent inspects headers/bodies/conn/timing through it), **F6** `flow.mark`/`flow.comment` (the agent annotates its working set), **F7** `proxy.status`/`flow.clear`/`config.get`, **F12** `scope.remove` + the `scope.allow_agent_widen` gate, **F13** `poc.list`/`poc.get`/`poc.artifact` (the agent gathers artifacts for the report). **F2** (audit ring) supplies the `notifications/aitm/agent` stream that rides M4's push channel. M4's plan must declare these as prerequisites; if a prerequisite is not yet merged, the dependent acceptance criterion is blocked and the plan says so rather than M4 re-implementing it.
+**What M4 depends on but does not build (referenced, built elsewhere):** **F5** `flow.detail` (the agent inspects headers/bodies/conn/timing through it), **F6** `flow.mark`/`flow.comment` (the agent annotates its working set), **F7** `proxy.status`/`flow.clear`/`config.get`, **F12** `scope.remove` + the `scope.allow_agent_widen` gate, **F13** `poc.list`/`poc.get`/`poc.artifact` (the agent gathers artifacts for the report). M4's plan must declare these as prerequisites; if a prerequisite is not yet merged, the dependent acceptance criterion is blocked and the plan says so rather than M4 re-implementing it.
 
 **Milestone-numbering call (Architect's call, flag for Matt).** A sibling architect is speccing raw-L4/packet MITM; its working note currently labels that work "M4," while the brief for *this* session labels the agent-driven real-test milestone "M4" and L4 "M5." The platform roadmap lists both as later milestones without fixed numbers. **This spec claims M4 = the agent-driven real-test milestone and treats L4 as M5**, per this session's brief. The two specs must not both ship as "M4"; the numbering is flagged in Open questions and a hand-over note is left for the L4 session.
 
@@ -142,7 +144,7 @@ The read-only commands (`flow.list`, `flow.get`, `flow.detail`, `scope.list`, `c
 
 `agent.set` carries no `confirm_prompt` for a human (the toggle is itself the deliberate act). The default policy for agent connections is `mcp.policy` (see Open questions for the default value).
 
-### D3. Server push / subscriptions (F4)
+### D3. Server push, subscriptions, and the agent/activity channel (F4 + F2)
 
 **Problem (verified).** `serve_lines<R,W>` (`crates/aitm-mcp/src/transport.rs:23`) is a strict read→`handle`→write-one-reply loop; the server "never pushes." Loopback TCP already gives each connection its own task and its own `write_half` (`serve_connection`, `transport.rs:108`), so a per-connection writer exists; it is just only ever fed replies.
 
@@ -161,9 +163,19 @@ The read-only commands (`flow.list`, `flow.get`, `flow.detail`, `scope.list`, `c
 4. **The three streams** (shapes from foundation §4.4):
    - `notifications/aitm/flow` — `{event: created|request|response|ws_message|intercepted|released|killed|mutated|meta, id, summary}` (summary is the `flow.get` shape; full detail stays a `flow.detail` pull, F5).
    - `notifications/aitm/state` — `{listening, intercept_armed, paused, agent: all|readonly|paused, throughput}` on change.
-   - `notifications/aitm/agent` — `{origin, command, args, result, at}` per invocation, sourced from the F2 audit ring (referenced). If F2 is not yet merged, this stream is empty and the dependent AC is marked blocked.
+   - `notifications/aitm/agent` — `{origin, command, args, result, at}` per invocation, sourced from the F2 audit ring (D3a, owned by M4).
 5. **Backpressure / drop policy (decided).** Each `NotificationSink` is bounded (size a builder choice, e.g. a few thousand lines). On overflow the server **drops the oldest flow/state notifications for that connection and sets a `lagged` marker** delivered on the next successful write (`notifications/aitm/state {lagged: true}`), so a slow subscriber degrades to "catch up with `flow.list`/`since`" rather than growing core memory or blocking the data path. Replies to the subscriber's own requests are never dropped. The broadcast from the core uses a bounded ring; a lagged *dispatcher* likewise signals lag rather than blocking the plugin chain. This satisfies the bounded-memory constraint.
 6. **Both transports.** Stdio gets the same sink/writer split (one connection). Loopback TCP already is per-connection. No network transport is added (F15 out of scope).
+
+### D3a. The command-invocation audit ring and agent stream (F2)
+
+F2 is the record behind the operator "Agent" page: who ran what, with what result, over the whole session. It is designed here with F1/F4 as one channel, and it is what the agent toggle and the activity log read.
+
+1. **The ring (decided).** A bounded, in-memory ring on the core/server records one `AuditEntry { at, origin: Frontend, client_label, command, args_summary, result: ok|error }` per `invoke`, appended by `call_tool` (and by the CLI dispatch path) **after** the policy/confirm gates, so the ring reflects what actually ran and what was refused (a refusal is an entry with `result: error` and the reason). `args_summary` is a redacted, size-capped rendering — secrets (tokens, the CA key path content, auth headers) are never placed in the ring, consistent with the M2 CA posture. The ring is bounded (builder-chosen capacity) so it satisfies the bounded-memory constraint; it is the *live* view.
+2. **Durable audit — generalize what the CA plugin already keeps.** The CA plugin already writes a fail-closed JSONL audit log; F2 generalizes that into a core audit sink so **every** command invocation (not just `ca.*`) can be appended as a JSONL line when a durable audit path is configured. The CA entries remain a subset; no second log format is introduced. Durable audit is opt-in by config; the in-memory ring is always on.
+3. **The agent stream.** Each new ring entry is rendered as a `notifications/aitm/agent` line and pushed to subscribers through the same per-connection sink and backpressure policy as D3 (drop-oldest + `lagged`). The operator surfaces colour agent-origin entries (teal, per the UI foundation); the `origin`/`client_label` on each entry is exactly the F1 role + label, so the channel names who acted without the surfaces guessing.
+4. **Query command.** `agent.activity {since?, limit?}` → `[AuditEntry]` (read-only, `mutates()==false`) lets a surface or a reconnecting agent catch up on recent activity without replaying the whole stream, mirroring `flow.subscribe {since}`.
+5. **This is the audit that makes the live-agent run reviewable.** AC-M4-17's autonomous run is fully reconstructable after the fact from the ring/JSONL: every scope add, replay, mutate, PoC run, and refusal, in order, by origin.
 
 ### D4. Confirm-over-the-wire
 
@@ -254,9 +266,10 @@ Verification is **TDD unit tests AND functional/behavioral tests that drive the 
 4. **AC-M4-4 — policy enforcement for the agent:** with `policy==Paused`, every agent `tools/call` returns the paused tool error; with `ReadOnly`, a mutating command is refused and a read-only one succeeds; with `All`, both succeed. An **operator** connection is unaffected by policy in all three states.
 5. **AC-M4-5 — `agent.status`/`agent.set`:** `agent.status` returns the current policy and connected clients; `agent.set` changes it; `agent.set` is **refused when called over the agent role** and succeeds over operator/CLI.
 
-**F4 — push**
+**F4 + F2 — push & audit**
 
-6. **AC-M4-6 — subscribe & push:** after `flow.subscribe`, a new flow through the proxy produces a `notifications/aitm/flow {event:created,…}` line on that connection without any further request; `flow.unsubscribe` stops it; `state`/`agent` streams emit on change (agent stream asserted if F2 is merged, else marked blocked). A bounded-sink overflow sets `lagged` rather than growing memory or blocking the proxy (asserted with a deliberately slow reader).
+6. **AC-M4-6 — subscribe & push:** after `flow.subscribe`, a new flow through the proxy produces a `notifications/aitm/flow {event:created,…}` line on that connection without any further request; `flow.unsubscribe` stops it; the `state` stream emits on change. A bounded-sink overflow sets `lagged` rather than growing memory or blocking the proxy (asserted with a deliberately slow reader).
+7. **AC-M4-6b — audit ring & agent stream (F2):** every `invoke` from any role appends one redacted `AuditEntry` to the ring (including refusals, with the reason); `agent.activity {since?, limit?}` returns recent entries; a subscriber receives each new entry as a `notifications/aitm/agent` line carrying the F1 `origin`/`client_label`; secrets never appear in `args_summary`. With a durable audit path configured, the same entries are appended as JSONL (the CA log a subset of it).
 
 **Confirm-over-the-wire**
 
@@ -316,7 +329,9 @@ Only Matt can answer these; kept to the few that are genuinely his call.
 
 ### Architect's calls (recorded)
 
-1. **M4 owns F1 + F4 + confirm-over-the-wire** as core/transport work; **F5/F6/F7/F12/F13 are referenced dependencies** built elsewhere; **F2** supplies the agent push stream. The plan declares these as prerequisites and blocks dependent ACs rather than re-implementing.
+1. **M4 owns F1 + F2 + F4 + confirm-over-the-wire** as one coherent operator/agent-channel story (core/transport work); **F5/F6/F7/F12/F13 are referenced dependencies** built elsewhere. The plan declares those referenced ones as prerequisites and blocks dependent ACs rather than re-implementing.
+11. **F2 audit ring is owned by M4:** a bounded in-memory ring appended after the policy/confirm gates (refusals included), secrets redacted, feeding `notifications/aitm/agent` + `agent.activity`; the CA plugin's JSONL log is generalized into a core audit sink (a superset, one format), durable audit opt-in. It is what makes the live-agent run (AC-M4-17) reviewable.
+12. **Verified live-wire shapes are ground truth over the (stale) foundation doc:** `browser.eval` uses `expr`; `browser.click` x/y-or-selector; `browser.type` requires a selector (`":focus"`); `poc.build` returns YAML text; `ca.status` reports `yes|no|unknown`. The agent skill set is written to these.
 2. **`Frontend` stays `Copy`:** add a unit `Operator` role; carry the client label separately on `CommandHost` (refines the blocker note's `Operator { client: String }`).
 3. **Connection role = token class presented** (`agent_token` vs `operator_token`); stdio defaults to the agent role (overridable). A per-connection `ConnCtx` threads role + client label + the push sink into message handling; the old `handle` stays as a back-compat wrapper.
 4. **`AgentPolicy { All, ReadOnly, Paused }` enforced in `call_tool` for the agent role only**, with read-only-ness declared by `Command::mutates()` (default true). `agent.set` is operator/CLI-only.
