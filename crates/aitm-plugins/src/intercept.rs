@@ -3,9 +3,12 @@
 //!
 //! `flow.intercept {enabled?, rules?}` arms or disarms the mode. With no rules it
 //! parks *every* request (today's global arm, back-compatible); with rules it
-//! parks only a request that matches a rule at `Phase::Request` (F3 selective
-//! interception, via the shared [`aitm_rules`] matcher). While armed and a flow
-//! is to be parked, `on_event(Request)` backs the flow up and parks it; the chain
+//! parks only a flow that matches a rule at its phase (F3 selective
+//! interception, via the shared [`aitm_rules`] matcher) — a request rule at
+//! `Event::Request`, a response rule at `Event::ResponseHeaders` (the point Task 2
+//! pinned as the last instant before any response byte reaches the client, so a
+//! parked response can be edited via `flow.mutate`). While armed and a flow
+//! is to be parked, `on_event` backs the flow up and parks it; the chain
 //! then awaits the `ResumeHandle` this plugin keeps per flow. `flow.resume` fires
 //! that handle so the parked future wakes and forwards the (possibly mutated)
 //! request; `flow.kill` marks the flow killed and wakes the future so the client
@@ -79,13 +82,24 @@ impl Plugin for InterceptPlugin {
     }
 
     fn on_event(&mut self, ev: &Event, ctx: &mut FlowCtx<'_>) -> Verdict {
-        if let Event::Request(id) = ev {
-            if self.shared.armed.load(Ordering::SeqCst) && self.should_park_request(ctx) {
-                ctx.backup();
-                let handle = ctx.intercept();
-                if let Ok(mut parked) = self.shared.parked.lock() {
-                    parked.insert(*id, handle);
-                }
+        // A flow parks at the request phase (`Event::Request`) or — for a response
+        // rule — at `Event::ResponseHeaders`, the point Task 2 pinned as the last
+        // instant before any response byte reaches the client (see
+        // `aitm-proto-http/tests/response_park.rs`).
+        let park = match ev {
+            Event::Request(id) => (self.shared.armed.load(Ordering::SeqCst)
+                && self.should_park(ctx, Phase::Request))
+            .then_some(*id),
+            Event::ResponseHeaders(id) => (self.shared.armed.load(Ordering::SeqCst)
+                && self.should_park(ctx, Phase::Response))
+            .then_some(*id),
+            _ => None,
+        };
+        if let Some(id) = park {
+            ctx.backup();
+            let handle = ctx.intercept();
+            if let Ok(mut parked) = self.shared.parked.lock() {
+                parked.insert(id, handle);
             }
         }
         Verdict::Continue
@@ -93,22 +107,21 @@ impl Plugin for InterceptPlugin {
 }
 
 impl InterceptPlugin {
-    /// Whether this request should park. With no rules the mode parks every
-    /// request (global arm); with rules it parks only a request that matches a
-    /// rule at `Phase::Request` (`Phase::Any` rules fire here too).
-    fn should_park_request(&self, ctx: &FlowCtx<'_>) -> bool {
+    /// Whether this flow should park at `phase`. With no rules the mode is the
+    /// back-compatible global arm: it parks every request but no response (a
+    /// response parks only under an explicit response rule). With rules it parks
+    /// only a flow that matches a rule at `phase` (`Phase::Any` rules fire too).
+    fn should_park(&self, ctx: &FlowCtx<'_>, phase: Phase) -> bool {
         let rules = match self.shared.rules.lock() {
             Ok(rules) => rules,
             // A poisoned lock means a prior panic; fail safe to the global arm.
             Err(poisoned) => poisoned.into_inner(),
         };
         if rules.is_empty() {
-            return true;
+            return phase == Phase::Request;
         }
         let flow = ctx.flow();
-        rules
-            .iter()
-            .any(|rule| rule.matches(flow, Phase::Request, None))
+        rules.iter().any(|rule| rule.matches(flow, phase, None))
     }
 }
 
