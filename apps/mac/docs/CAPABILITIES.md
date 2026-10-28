@@ -25,15 +25,15 @@ the operator-commands merge (PR #6, `tools/list` = 34).
    now fetches **`flow.detail`** (F5, merged) on selection, so request/response
    headers, cookies and bodies render and a paused request is editable. Verified
    end to end (`tools/selftest-live.sh`).
-2. **Operator vs agent identity (F1) — core gap.** The MCP server hardcodes every
-   bus client as `Frontend::Mcp` (`crates/aitm-mcp/src/server.rs`), so the operator
-   app is treated as an *agent*; the F12 gate then refuses `scope.add`
-   ("widening scope from an agent frontend is disabled"). Interim: set
-   `scope.allow_agent_widen: true` in the aitm config. Proper fix: a
-   `Frontend::Operator` token class so operator UIs (mac/web/tui) aren't agents.
-3. **`flow.kill` forwards like resume — core gap.** A killed parked flow is still
-   forwarded and the client gets its response (chain wakes on the same oneshot and
-   marks Resumed). Tracked for F3.
+2. **Operator vs agent identity (F1) — in progress.** The MCP server treated every
+   bus client as `Frontend::Mcp`, so the operator app was an *agent*; the F12 gate
+   then refused `scope.add`. The `Frontend::Operator` type has landed; per-connection
+   wiring (server assigning Operator vs Agent by token class) is a dependent M4 task.
+   Interim: `scope.allow_agent_widen: true` in the aitm config (verified).
+3. **`flow.kill` forwards like resume — FIXED (PR #7).** A killed parked flow is now
+   dropped and the client sees a closed connection. Verified with
+   `APP_LIVE_STRICT=1`: "flow.kill denies the client a response (curl exit 52,
+   row killed)".
 
 ## 1. Our core command surface (post-merge, 34 tools)
 
@@ -138,7 +138,7 @@ Proxyman's documented feature set (left) against our status. `~` = partial.
 | Breakpoint: pause + edit response (status/headers/body) | 🧩 S-041 / F3 |
 | Breakpoint rules (URL/regex/GraphQL), req/resp checkboxes | 🧩 Rules sheet built; core rules = F3 |
 | Raw editor, disable-header, reset to original, templates | ✅ Raw editable + revert (templates ⛔ v1) |
-| Drop/abort modes (reset/429/503) | ~ kill (reset); modes = F3; **kill-forwards gap** |
+| Drop/abort modes (reset/429/503) | ✅ kill drops (closed connection, PR #7); 429/503 modes = F3 |
 | WebSocket breakpoint + compose/inject | 🧩 S-045 + F9 |
 | Map Local, Map Remote, Rewrite, Scripting | ⛔ v1 (Map Local/Remote/Rewrite); scripting = rhai (M3) + F8 surface |
 | Block/Allow list, No-Caching, Throttling | ⛔ v1 (rate-limit exists in core config) |
@@ -172,7 +172,7 @@ The UI flow model and viewers are designed to extend from HTTP flows to streams.
 ## 6. Top priorities to reach the contract
 
 1. **F1 operator frontend/token** — so operator UIs aren't treated as agents (unblocks scope + any operator-gated command without the config opt-in).
-2. **F3 response-phase intercept + rules + kill modes** — edit responses, breakpoint rules, and fix `flow.kill` forwarding.
+2. **F3 response-phase intercept + rules + kill modes** — edit responses, breakpoint rules, 429/503 kill modes. (`flow.kill` drop fixed in PR #7.)
 3. **S-045 + F9 WebSocket frames** — review (detail already returns `messages`) and inject/edit.
 4. **F10 sessions + import/export**, **F11 tls.passthrough**, **F4 live push**.
 5. **HTTP/2** in core (Proxyman has it; we have a stub).
