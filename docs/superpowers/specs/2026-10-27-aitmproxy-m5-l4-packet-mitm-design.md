@@ -1,4 +1,4 @@
-# aitmproxy Milestone 4 — raw L4 / packet MITM design
+# aitmproxy Milestone 5 — raw L4 / packet MITM design
 
 **Status:** draft
 **Research inputs:** `docs/research/08-l4-packet-rust.md` (L4 crate/privilege/OS
@@ -12,7 +12,7 @@ be re-checked with `cargo info` before building), `docs/research/03-rust-proxy-s
 
 ## Intent
 
-Milestone 4 delivers the raw-L4 / packet-level capability the platform reserved
+Milestone 5 delivers the raw-L4 / packet-level capability the platform reserved
 from day one: a new `aitm-proto-l4` crate that lets an operator (or the agent
 driving aitmproxy) **capture raw packets** and **craft and inject arbitrary or
 deliberately malformed packets** (scapy-style) against an **in-scope, authorized**
@@ -20,7 +20,7 @@ target during a sanctioned engagement — for example, robustness-testing a
 server's TCP/IP stack by fuzzing it with malformed packets to find and reproduce
 vulnerabilities. This is **authorized, defensive security testing**: aitmproxy
 finds and reproduces weaknesses for someone with permission to test; it never
-exploits maliciously, and the entire M4 design exists to make the most powerful
+exploits maliciously, and the entire M5 design exists to make the most powerful
 capability in the tool **structurally impossible to aim at anything the operator
 has not explicitly authorized**.
 
@@ -56,19 +56,19 @@ out-of-scope target is refused by construction.
 
 ## Non-goals
 
-- **No transparent / in-path L4 interception in M4.** TPROXY/nfqueue-style
+- **No transparent / in-path L4 interception in M5.** TPROXY/nfqueue-style
   interception that presents connection-like byte streams to the acceptor is a
-  *separate future mode* that would use the `ProtocolModule::spawn` seam; M4 is
+  *separate future mode* that would use the `ProtocolModule::spawn` seam; M5 is
   raw capture + craft + inject only, which is command-driven (see Design).
 - **No L7 stream reassembly** from captured packets (no TCP-stream reconstruction
-  into HTTP flows) in M4.
+  into HTTP flows) in M5.
 - **No native PoC step type for L4.** L4 reproduction inside a PoC is expressible
   through the existing PoC `script` step calling `l4.*` verbs; a first-class `L4`
   `Step` variant is a deferred, additive `aitm-poc` change (not an `aitm-core`
-  change) and is out of M4 scope.
+  change) and is out of M5 scope.
 - **No new remote/authenticated transport.** L4 is driven over the existing MCP
   (stdio / loopback-token) and CLI surfaces.
-- **No privilege-escalation or OS-trust machinery.** M4 documents the least
+- **No privilege-escalation or OS-trust machinery.** M5 documents the least
   privilege required and fails closed without it; it does not grant itself
   privilege.
 
@@ -87,7 +87,7 @@ out-of-scope target is refused by construction.
   the protocol/plugin seam has failed (the one bounded exception — an additive,
   `#[non_exhaustive]` enum variant the platform already reserved — is Open
   Question 1, and is behavior-neutral).
-- **Detection-evasion tooling.** M4 is for finding and reproducing vulnerabilities
+- **Detection-evasion tooling.** M5 is for finding and reproducing vulnerabilities
   for an authorized operator, not for evading defenders.
 
 ## Constraints
@@ -96,7 +96,7 @@ out-of-scope target is refused by construction.
   binary wiring and config). The crate rides the existing `Plugin` + `Command`
   seams. The *only* core touch considered is the optional, additive
   `Flow::L4`/`Event::L4*` variant in Open Question 1, which the platform spec
-  pre-blessed as a minor additive change and which the default M4 design does
+  pre-blessed as a minor additive change and which the default M5 design does
   **not** require.
 - **`forbid(unsafe_code)` must hold.** The workspace forbids `unsafe`. This rules
   out hand-rolled raw `AF_PACKET`/`AF_INET` sockets via `socket2`/`nix` (their
@@ -110,7 +110,7 @@ out-of-scope target is refused by construction.
   injection; loopback framing differs per OS).
 - **Privilege** (research note 08): Linux needs `CAP_NET_RAW`; macOS needs
   read (`/dev/bpf*`) for capture and write for injection; unprivileged L4 is not
-  possible on either OS. M4 must fail closed when privilege is absent.
+  possible on either OS. M5 must fail closed when privilege is absent.
 - **Dependencies:** prefer `pcap` (capture + L2 injection), `pnet_packet`
   (field-level, including malformed, construction), and `etherparse` (well-formed
   build + decode/summarize), with `pnet`'s `datalink` as a documented fallback if
@@ -137,7 +137,7 @@ L4 (research note 08 reaches the same conclusion). Therefore:
   `Plugin` and `Command` traits already accept new implementors in new crates.
 - **The `ProtocolModule` seam stays reserved** for the *future* transparent /
   in-path L4 interception mode (TPROXY/nfqueue), which genuinely does present
-  connection-like byte streams. M4 does not build it.
+  connection-like byte streams. M5 does not build it.
 
 ```mermaid
 graph TD
@@ -177,7 +177,7 @@ graph TD
   PROTOSEAM -. future only .-> L4
 ```
 
-### The authorization model (the heart of M4)
+### The authorization model (the heart of M5)
 
 The core `ScopeRateGuard` is host-string + requests-per-second only — it has no
 notion of CIDR, interface, packets-per-second, or frame size (research note 08).
@@ -464,10 +464,10 @@ is versioned like the rest of the scripting contract.
   checksum/length).
 - **macOS:** read access to `/dev/bpf*` for capture, write for injection; capture
   uses BPF (raw sockets never receive TCP/UDP). Device permissions don't persist
-  across boot without a helper (ChmodBPF-style) — documented, not shipped in M4.
+  across boot without a helper (ChmodBPF-style) — documented, not shipped in M5.
 - **Least privilege, documented.** Running the whole proxy as root is discouraged;
-  M4 documents the minimal grant. A privilege-separated capture/inject helper
-  (dumpcap-style) is recommended **future** hardening (Open Question 3), not M4.
+  M5 documents the minimal grant. A privilege-separated capture/inject helper
+  (dumpcap-style) is recommended **future** hardening (Open Question 3), not M5.
 - **Honest degradation.** OS-specific limits (loopback framing differs; crafted
   TCP handshakes may draw a host-kernel RST) are surfaced as typed results or
   documented test preconditions, never silent.
@@ -539,53 +539,53 @@ Each is observable via `cargo test` (integration tests may use a scoped loopback
 interface; privilege-gated tests are marked and skip cleanly where privilege is
 absent, asserting `L4Unavailable` rather than failing).
 
-1. **M4-AC1 — Deny-by-default:** with an empty L4 scope, `l4.inject` and
+1. **M5-AC1 — Deny-by-default:** with an empty L4 scope, `l4.inject` and
    `l4.capture.start` are refused with `OutOfL4Scope`; no packet is written and no
    capture starts.
-2. **M4-AC2 — Out-of-scope inject refused:** with a scope entry for CIDR *A*,
+2. **M5-AC2 — Out-of-scope inject refused:** with a scope entry for CIDR *A*,
    injecting to an address outside *A* returns `OutOfL4Scope`; injecting to an
    in-scope address (loopback) succeeds.
-3. **M4-AC3 — Capability split:** with only a `Capture` entry for a target,
+3. **M5-AC3 — Capability split:** with only a `Capture` entry for a target,
    `l4.inject` to it returns `CapabilityNotGranted(Inject)`; capture still works.
-4. **M4-AC4 — Dangerous-destination denylist:** injecting to `169.254.169.254`
+4. **M5-AC4 — Dangerous-destination denylist:** injecting to `169.254.169.254`
    (or loopback/link-local/multicast) without an explicit scope entry returns
    `DangerousDestinationBlocked`; an explicit scope entry is the only way through.
-5. **M4-AC5 — Injection rate cap:** with `inject_rate` of N pps, the (N+1)-th
+5. **M5-AC5 — Injection rate cap:** with `inject_rate` of N pps, the (N+1)-th
    injection within the window returns `InjectionRateExceeded { retry_after }`.
-6. **M4-AC6 — Size + count caps:** a packet over `max_packet_bytes` returns
+6. **M5-AC6 — Size + count caps:** a packet over `max_packet_bytes` returns
    `PacketTooLarge`; an `l4.inject` batch over `max_packets_per_call` returns
    `CountExceeded`.
-7. **M4-AC7 — Craft is pure and preserves malformed fields:** `PacketSpec::build`
+7. **M5-AC7 — Craft is pure and preserves malformed fields:** `PacketSpec::build`
    with `ipv4.checksum = Some(0x0000)` produces bytes whose IPv4 checksum field is
    exactly `0x0000` (literal), while a `None` checksum yields the correctly
    computed value — proving both auto-complete and verbatim override, with no
    privilege required.
-8. **M4-AC8 — Scoped capture excludes out-of-scope traffic:** a capture bound to a
+8. **M5-AC8 — Scoped capture excludes out-of-scope traffic:** a capture bound to a
    scope for CIDR *A* records an in-scope packet and does **not** surface an
    out-of-scope packet generated on the same interface.
-9. **M4-AC9 — Round-trip (headline):** on an explicitly-scoped loopback interface,
+9. **M5-AC9 — Round-trip (headline):** on an explicitly-scoped loopback interface,
    craft → inject → capture results in an `L4Flow` containing the injected packet
    with `injected = true`, retrievable via `l4.flow.get`.
-10. **M4-AC10 — Fail-closed without privilege:** with `enabled = true` but no
+10. **M5-AC10 — Fail-closed without privilege:** with `enabled = true` but no
     privilege, guarded `l4.*` commands return `L4Unavailable` and the proxy does
     not panic; with `enabled = false`, the module is not registered.
-11. **M4-AC11 — Reachable everywhere:** every `l4.*` command appears in MCP
+11. **M5-AC11 — Reachable everywhere:** every `l4.*` command appears in MCP
     `tools/list`, is invocable over the CLI, and (for wire-touching verbs) is
     reachable from a Rhai script — and the Rhai path is refused by the **same**
     guard for an out-of-scope target (asserts the script cannot bypass the guard).
-12. **M4-AC12 — Core untouched:** `git diff --stat` shows **no** changes under
+12. **M5-AC12 — Core untouched:** `git diff --stat` shows **no** changes under
     `aitm-core/` (default design), satisfying the roadmap gate "core untouched."
     If Open Question 1 is accepted, the only core change is the additive
     `Flow::L4`/`Event::L4*` variant with no changed core logic.
-13. **M4-AC13 — No `unsafe`:** `aitm-proto-l4` compiles under the workspace
+13. **M5-AC13 — No `unsafe`:** `aitm-proto-l4` compiles under the workspace
     `forbid(unsafe_code)`; the crate contains no `unsafe` block.
-14. **M4-AC14 — One choke point:** a test (or a documented structural check)
+14. **M5-AC14 — One choke point:** a test (or a documented structural check)
     confirms the only wire-write function requires an `L4Permit`, which only
     `L4Guard::check` produces — there is no unguarded send path.
 
 ## Milestone exit criteria
 
-M4 is done when **all M4-AC1–AC14 are green** — unit **and** functional (the
+M5 is done when **all M5-AC1–AC14 are green** — unit **and** functional (the
 AC9 loopback round-trip and the AC1–AC6 guard-airtightness suite driving the real
 commands) — through the full Rust gate
 (`cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`),
@@ -615,13 +615,13 @@ Each has a recommended default so Matt can confirm or redirect.
 1. **L4 flows in the core `Flow` enum, or an l4-owned store?** The brief asks for
    both "L4 flows in the flow store" and "no `aitm-core` edits," which collide
    because `Flow`/`Event` are defined in the core. **Recommended default:** ship
-   M4 with the **l4-owned `L4FlowStore`** (zero core edits; flows first-class over
+   M5 with the **l4-owned `L4FlowStore`** (zero core edits; flows first-class over
    MCP/CLI/Rhai via `l4.flow.*`), *and* treat promotion to a single additive
    `Flow::L4(L4Flow)` + `Event::L4*` variant (behind `#[non_exhaustive]`, the one
    change the platform spec pre-blessed, touching no core logic) as a blessed
    follow-up if you want one unified store. This keeps the hard "no core edits"
    constraint satisfied now while leaving the unified path open.
-2. **Capture-promiscuity posture.** M4 scopes and filters capture (stronger than
+2. **Capture-promiscuity posture.** M5 scopes and filters capture (stronger than
    L7 passive capture) so out-of-scope packets never surface. **Recommended
    default:** yes — keep capture deny-by-default and scope-filtered. Confirm you
    don't want a looser "capture everything on the interface" mode (I recommend
@@ -629,8 +629,8 @@ Each has a recommended default so Matt can confirm or redirect.
 3. **Privilege ceiling + privilege separation.** **Recommended default:** require
    least privilege (`setcap cap_net_raw` on Linux; `/dev/bpf` group on macOS),
    discourage running as root, and **defer** a privilege-separated helper
-   (dumpcap-style) to a later hardening pass — documented in M4, not built.
-   Confirm, or ask for the separated helper in M4.
+   (dumpcap-style) to a later hardening pass — documented in M5, not built.
+   Confirm, or ask for the separated helper in M5.
 4. **Default caps.** **Recommended default:** conservative, all configurable —
    `global_inject_pps` low (e.g. tens of pps), small `burst`, modest
    `max_packets_per_call`, `max_packet_bytes` at a normal MTU, and `pps == 0`
@@ -639,7 +639,7 @@ Each has a recommended default so Matt can confirm or redirect.
 
 ## Summary
 
-M4 adds `aitm-proto-l4`: raw-packet **capture** and scapy-style **craft + guarded
+M5 adds `aitm-proto-l4`: raw-packet **capture** and scapy-style **craft + guarded
 inject** for **authorized** L4 robustness testing, reachable over the command bus,
 MCP, and the M3 Rhai tier, with L4 flows first-class. It rides the existing
 `Plugin` + `Command` seams (raw send is command-driven, so `ProtocolModule::spawn`
