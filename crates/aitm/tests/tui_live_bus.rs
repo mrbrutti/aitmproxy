@@ -21,7 +21,7 @@ use aitm_mcp::McpServer;
 use aitm_tui::action::{BusEvent, BusRequest};
 use aitm_tui::TransportChoice;
 use anyhow::Context as _;
-use serde_json::{json, Value};
+use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
@@ -216,7 +216,7 @@ async fn tui_bus_task_runs_against_the_live_loopback_server() {
     })
     .await;
     assert_eq!(name, "flow.intercept");
-    assert_eq!(value, Value::Bool(true));
+    assert_eq!(value["enabled"], json!(true));
 
     // 5. A tool the live tools/list does not offer is refused locally.
     req_tx

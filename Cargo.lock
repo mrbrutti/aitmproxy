@@ -157,6 +157,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aitm-plugin-passthrough"
+version = "0.1.0"
+dependencies = [
+ "aitm-core",
+ "anyhow",
+]
+
+[[package]]
 name = "aitm-plugin-rhai"
 version = "0.1.0"
 dependencies = [
@@ -169,6 +177,17 @@ dependencies = [
  "serde_yaml",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "aitm-plugin-sessionio"
+version = "0.1.0"
+dependencies = [
+ "aitm-core",
+ "anyhow",
+ "futures",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -190,6 +209,7 @@ name = "aitm-plugins"
 version = "0.1.0"
 dependencies = [
  "aitm-core",
+ "aitm-rules",
  "anyhow",
  "futures",
  "time",
