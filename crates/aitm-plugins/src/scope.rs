@@ -43,6 +43,9 @@ impl Command for ScopeAdd {
     fn name(&self) -> &str {
         "scope.add"
     }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Sensitive
+    }
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
@@ -72,6 +75,9 @@ struct ScopeList;
 impl Command for ScopeList {
     fn name(&self) -> &str {
         "scope.list"
+    }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Read
     }
 
     fn schema(&self) -> ParamSchema {

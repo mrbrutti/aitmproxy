@@ -132,6 +132,9 @@ impl Command for FlowMutate {
     fn name(&self) -> &str {
         "flow.mutate"
     }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Write
+    }
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
@@ -185,6 +188,9 @@ struct RequestSend;
 impl Command for RequestSend {
     fn name(&self) -> &str {
         "request.send"
+    }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Write
     }
 
     fn schema(&self) -> ParamSchema {

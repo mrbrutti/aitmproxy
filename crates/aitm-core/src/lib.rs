@@ -28,7 +28,7 @@ pub use authority::{Authority, AuthorityError};
 pub use body::{Body, StreamBody};
 pub use chain::Chain;
 pub use client::{PipelineClient, RequestSender};
-pub use command::{Command, ParamDef, ParamSchema, TypeDesc};
+pub use command::{Command, ParamDef, ParamSchema, Sensitivity, TypeDesc};
 pub use config::{
     BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, LimitConfig, McpConfig,
     McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SsrfPolicy,

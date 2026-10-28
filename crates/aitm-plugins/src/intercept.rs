@@ -128,6 +128,9 @@ impl Command for FlowResume {
     fn name(&self) -> &str {
         "flow.resume"
     }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Write
+    }
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
@@ -151,6 +154,9 @@ struct FlowKill {
 impl Command for FlowKill {
     fn name(&self) -> &str {
         "flow.kill"
+    }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Write
     }
 
     fn schema(&self) -> ParamSchema {

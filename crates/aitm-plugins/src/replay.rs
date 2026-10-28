@@ -45,6 +45,9 @@ impl Command for FlowReplay {
     fn name(&self) -> &str {
         "flow.replay"
     }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Write
+    }
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {

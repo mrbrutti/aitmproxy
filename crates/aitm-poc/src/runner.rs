@@ -591,6 +591,9 @@ impl Command for PocRunCommand {
     fn name(&self) -> &str {
         "poc.run"
     }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Write
+    }
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {

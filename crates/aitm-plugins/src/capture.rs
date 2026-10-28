@@ -45,6 +45,9 @@ impl Command for FlowList {
     fn name(&self) -> &str {
         "flow.list"
     }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Read
+    }
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
@@ -71,6 +74,9 @@ struct FlowGet;
 impl Command for FlowGet {
     fn name(&self) -> &str {
         "flow.get"
+    }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Read
     }
 
     fn schema(&self) -> ParamSchema {
