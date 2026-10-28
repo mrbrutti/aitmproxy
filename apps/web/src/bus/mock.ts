@@ -49,6 +49,12 @@ export interface PocRun {
   finding_capture: string;
   screenshot_path: string | null;
   evaluated: { assertion: string; matched: boolean }[];
+  /** Built in this session but not yet saved under poc.dir (the core returns YAML text only). */
+  local?: boolean;
+  /** True once the core has been asked for the source (poc.get) or none exists. */
+  description?: string;
+  /** Set when this entry has a run result in this session (poc.run keeps no history). */
+  ran?: boolean;
 }
 
 export interface MockControls {

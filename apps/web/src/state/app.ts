@@ -363,6 +363,62 @@ export function createAppStore(bus: BusClient) {
       void tick();
     }
 
+    // ---- PoC session state ----------------------------------------------------
+    // The core's poc.list returns library summaries ({id, title, severity, poc_path}) and keeps
+    // no run history, and poc.build returns YAML text without writing a file. The session keeps
+    // what the operator would otherwise lose: built-but-unsaved PoCs, fetched sources, and the
+    // last run result per path, merged into one list for the Findings panel.
+    const pocSources = new Map<string, string>();
+    const pocRuns = new Map<string, Partial<PocRun>>();
+    const [localPocs, setLocalPocs] = createSignal<PocRun[]>([]);
+    let lastBusPocs: unknown[] = [];
+
+    function mergeFindings(list: unknown[]): PocRun[] {
+      lastBusPocs = list;
+      const fromBus = list.map((raw): PocRun => {
+        const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+        const pocPath = typeof r.poc_path === 'string' ? r.poc_path : '';
+        const run = pocRuns.get(pocPath) ?? {};
+        const sev = typeof r.severity === 'string' ? r.severity : 'medium';
+        return {
+          id: typeof r.id === 'string' ? r.id : pocPath,
+          title: typeof r.title === 'string' && r.title ? r.title : (pocPath.split('/').pop() ?? 'PoC'),
+          severity: (['critical', 'high', 'medium', 'low', 'info'].includes(sev) ? sev : 'medium') as PocRun['severity'],
+          target: typeof r.target === 'string' ? r.target : '',
+          passed: typeof r.passed === 'boolean' ? r.passed : (run.passed ?? false),
+          at: typeof r.at === 'number' ? r.at : (run.at ?? 0),
+          origin: r.origin === 'agent' ? 'agent' : 'human',
+          poc_path: pocPath,
+          yaml: typeof r.yaml === 'string' ? r.yaml : (pocSources.get(pocPath) ?? ''),
+          finding_capture: typeof r.finding_capture === 'string' ? r.finding_capture : (run.finding_capture ?? ''),
+          screenshot_path: typeof r.screenshot_path === 'string' && r.screenshot_path ? r.screenshot_path : (run.screenshot_path ?? null),
+          evaluated: Array.isArray(r.evaluated) ? (r.evaluated as PocRun['evaluated']) : (run.evaluated ?? []),
+          ...(typeof r.description === 'string' ? { description: r.description } : {}),
+          ...(pocRuns.has(pocPath) ? { ran: true } : {}),
+        };
+      });
+      const listedPaths = new Set(fromBus.map((p) => p.poc_path));
+      return [...localPocs().filter((p) => !listedPaths.has(p.poc_path)), ...fromBus];
+    }
+
+    /** Loads a PoC's YAML through poc.get once and patches it into the list. */
+    async function ensurePocSource(pocPath: string): Promise<string | null> {
+      if (!pocPath) return null;
+      const cached = pocSources.get(pocPath);
+      if (cached) return cached;
+      if (!proxy.tools.some((t) => t.name === 'poc.get')) return null;
+      try {
+        const r = await bus.call<{ yaml?: string; source?: string; description?: string }>('poc.get', { poc_path: pocPath });
+        const yaml = r.yaml ?? r.source ?? '';
+        if (yaml) pocSources.set(pocPath, yaml);
+        setProxy('findings', mergeFindings(lastBusPocs));
+        return yaml || null;
+      } catch (e) {
+        notice(`poc.get: ${(e as Error).message}`, 'error');
+        return null;
+      }
+    }
+
     // ---- bootstrap ----------------------------------------------------------
     async function refreshSide() {
       const has = (n: string) => proxy.tools.some((t) => t.name === n);
@@ -375,7 +431,8 @@ export function createAppStore(bus: BusClient) {
             .then((s) => setProxy('scope', Array.isArray(s) ? s.map((e) => (typeof e === 'string' ? { host: e } : (e as ProxyState['scope'][number]))) : []))
             .catch(() => {}),
         );
-      if (has('poc.list')) jobs.push(bus.call<PocRun[]>('poc.list').then((p) => setProxy('findings', p)).catch(() => {}));
+      if (has('poc.list'))
+        jobs.push(bus.call<unknown[]>('poc.list').then((p) => setProxy('findings', mergeFindings(Array.isArray(p) ? p : []))).catch(() => {}));
       if (has('agent.status'))
         jobs.push(
           bus
@@ -795,10 +852,37 @@ export function createAppStore(bus: BusClient) {
           await bus.call('flow.kill', mode === 'reset' || !hasMode ? { id } : { id, mode });
           patch(id, { intercept: 'killed', status: null, durationMs: null });
           recomputePaused();
+          // Trust but verify: the core has been seen to resume a killed flow. Re-read the state
+          // and say so rather than leaving a row that lies.
+          if (proxy.tools.some((t) => t.name === 'flow.detail')) {
+            setTimeout(() => {
+              void bus
+                .call('flow.detail', { id, body: 'none' })
+                .then((raw) => {
+                  const s = toSummary(raw, byId.get(id)?.raw.seq ?? 0);
+                  if (s.intercept !== 'killed') {
+                    upsert(s);
+                    notice(`flow.kill reported success but the core ${s.intercept === 'resumed' ? 'resumed' : 'kept'} the flow — it reached upstream (core bug)`, 'error');
+                  }
+                })
+                .catch(() => {});
+            }, 400);
+          }
         }),
       mutate: (id: FlowId, edits: { method?: string; path?: string; headers?: Record<string, string> | { name: string; value: string }[]; body?: string }) =>
         guarded('edit', async () => {
-          await bus.call('flow.mutate', { id, edits });
+          // The bus takes `headers` as a name→value object (each replaces that header). A header
+          // the operator deleted cannot be expressed yet — flow.mutate has no removal form.
+          const wire: Record<string, unknown> = { ...edits };
+          let removed: string[] = [];
+          if (Array.isArray(edits.headers)) {
+            const kept = new Set(edits.headers.map((h) => h.name.trim().toLowerCase()).filter(Boolean));
+            removed = (details[id]?.request.headers ?? []).map((h) => h.name).filter((n) => !kept.has(n.toLowerCase()));
+            wire.headers = Object.fromEntries(edits.headers.filter((h) => h.name.trim()).map((h) => [h.name.trim(), h.value]));
+          }
+          await bus.call('flow.mutate', { id, edits: wire });
+          if (removed.length)
+            notice(`${removed.length} removed header${removed.length === 1 ? '' : 's'} (${removed.join(', ')}) stay on the wire — flow.mutate cannot delete headers yet`, 'error');
           patch(id, { edited: true });
           await loadDetail(id, true);
         }),
@@ -863,29 +947,60 @@ export function createAppStore(bus: BusClient) {
         }),
       buildPoc: (flowId: FlowId, name: string, param?: string) =>
         guarded('build PoC', async () => {
-          // poc.build returns the YAML text. Until poc.list (F13) exists the panel cannot show
-          // it, so the text is also put on the clipboard.
-          const r = await bus.call<string | { yaml?: string }>('poc.build', param ? { flow_id: flowId, name, param } : { flow_id: flowId, name });
+          // poc.build returns the YAML text and writes no file, so the result would be lost: it
+          // is kept as a session-local finding (Export saves it; drop the file into poc.dir to run
+          // it) and copied to the clipboard.
+          const r = await bus.call<string | { yaml?: string; poc_path?: string }>('poc.build', param ? { flow_id: flowId, name, param } : { flow_id: flowId, name });
           const yaml = typeof r === 'string' ? r : (r?.yaml ?? null);
           await refreshSide();
-          const listed = proxy.tools.some((t) => t.name === 'poc.list');
-          if (listed) setUi('panel', 'findings');
+          const savedPath = typeof r === 'object' && r && typeof r.poc_path === 'string' ? r.poc_path : null;
+          const listed = savedPath ? proxy.findings.some((p) => p.poc_path === savedPath) : false;
           if (yaml && !listed) {
+            const flow = byId.get(flowId)?.raw;
+            const entry: PocRun = {
+              id: `local:${name}:${Date.now()}`,
+              title: name,
+              severity: 'medium',
+              target: flow ? `${flow.scheme}://${flow.authority}` : '',
+              passed: false,
+              at: Date.now(),
+              origin: 'human',
+              poc_path: '',
+              yaml,
+              finding_capture: flowId,
+              screenshot_path: null,
+              evaluated: [],
+              local: true,
+            };
+            setLocalPocs((l) => [entry, ...l]);
+            setProxy('findings', mergeFindings(lastBusPocs));
             try {
               await navigator.clipboard.writeText(yaml);
-              notice(`PoC "${name}" built — YAML copied (poc.list will show it here once the core lists runs)`);
+              notice(`PoC "${name}" built — kept in Findings and copied; save the YAML into poc.dir to run it`);
             } catch {
-              notice(`PoC "${name}" built`);
+              notice(`PoC "${name}" built — kept in Findings; export the YAML into poc.dir to run it`);
             }
           }
+          setUi('panel', 'findings');
           return yaml;
         }),
       runPoc: (pocPath: string, target?: string, vars?: Record<string, string>) =>
         guarded('run PoC', async () => {
-          const r = await bus.call<PocRun>('poc.run', { poc_path: pocPath, ...(target ? { target } : {}), ...(vars ? { vars } : {}) });
+          const r = await bus.call<Partial<PocRun> & { passed?: boolean }>('poc.run', { poc_path: pocPath, ...(target ? { target } : {}), ...(vars ? { vars } : {}) });
+          // The core keeps no run history: remember this run for the Findings detail.
+          pocRuns.set(pocPath, {
+            passed: r.passed ?? false,
+            at: Date.now(),
+            ...(typeof r.finding_capture === 'string' ? { finding_capture: r.finding_capture } : {}),
+            screenshot_path: typeof r.screenshot_path === 'string' && r.screenshot_path ? r.screenshot_path : null,
+            evaluated: Array.isArray(r.evaluated) ? r.evaluated : [],
+          });
           await refreshSide();
-          return r;
+          setProxy('findings', mergeFindings(lastBusPocs));
+          notice(`PoC ${r.passed ? 'passed' : 'did not pass'}${Array.isArray(r.evaluated) ? ` — ${r.evaluated.filter((e) => e.matched).length} of ${r.evaluated.length} assertions matched` : ''}`);
+          return r as PocRun;
         }),
+      ensurePocSource,
       refreshSide,
       call: <T,>(tool: string, args?: Record<string, unknown>) => bus.call<T>(tool, args),
     };

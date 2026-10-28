@@ -13,7 +13,9 @@
     "preview": "vite preview",
     "typecheck": "npm run tokens && tsc --noEmit",
     "test": "npm run tokens && vitest run",
-    "size": "node scripts/size.mjs"
+    "size": "node scripts/size.mjs",
+    "selftest:live": "node scripts/selftest-live.mjs",
+    "cua:live": "node scripts/cua-live.mjs"
   },
   "dependencies": {
     "@codemirror/commands": "^6.8.0",
