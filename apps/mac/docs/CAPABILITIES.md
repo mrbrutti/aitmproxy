@@ -35,6 +35,33 @@ the operator-commands merge (PR #6, `tools/list` = 34).
    `APP_LIVE_STRICT=1`: "flow.kill denies the client a response (curl exit 52,
    row killed)".
 
+## Verification & CUA automation coverage boundary
+
+The operator workflow is verified two ways, both repeatable:
+- **Agent-driven (MCP bus)** — `tools/selftest-live.sh` (21 checks): intercept →
+  `flow.detail` review → edit a paused request → resume, plus mark/comment,
+  pause/clear, kill (strict), activity log.
+- **Human UI (computer-use)** — `tools/cua-clickthrough.sh` with `tools/cgclick.swift`,
+  two layers, both real input events:
+  - **Pixel path (no Accessibility tree):** normalize the window to a known origin,
+    then **CGEvent-click computed row pixels**; selection is verified by
+    screenshotting the inspector region and confirming it changed (`screencapture`
+    + `md5`, across rows 3/8/1). This clicks pixels, so it has no SwiftUI-AX
+    limitation and selects any rendered element. Proof shots: `/tmp/cua-row*.png`.
+  - **Menu path:** real Accessibility menu-bar clicks (Resume, Build PoC opens a sheet).
+- **Deterministic human-input** — the in-app self-test's menu audit (every action
+  has a menu item + shortcut) and key-event checks.
+
+**CUA automation coverage boundary (now closed for selection):** The *Accessibility-API*
+path (System Events addressing elements by the AX tree) can't see SwiftUI's
+in-window content (flow rows, inspector tabs, the Raw editor are unnamed,
+timing-sensitive nodes), so **element-by-name** automation of those is not
+possible. The **coordinate path** (screenshot → compute pixel → CGEvent click)
+does not touch the AX tree and therefore has no such limit — it reliably selects
+rendered rows (and can target tabs / the editor by coordinate). Net: full pixel
+coverage of the operator click-through; the only residual limit is cosmetic
+(by-name AX addressing), which `.accessibilityIdentifier`s would add if ever wanted.
+
 ## 1. Our core command surface (post-merge, 34 tools)
 
 Live and verified unless noted. Summary from the core survey + the merged `tools/list`.
