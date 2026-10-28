@@ -3,13 +3,12 @@
 // line under it says what the choice means. Disabled, with the reason as a tooltip, until the
 // core gains `agent.set` (F1).
 import { For, type Component } from 'solid-js';
-import { Eye, Pause, Shield } from 'lucide-solid';
-import { Dynamic } from 'solid-js/web';
+import { Icon, type IconName } from '~/components/Icon';
 import type { AgentPolicy } from '~/state/app';
 import { POLICY_OPTIONS } from './activity';
 import css from './AgentPanel.module.css';
 
-const ICONS = { all: Shield, readonly: Eye, paused: Pause } as const;
+const ICONS: Record<AgentPolicy, IconName> = { all: 'shield', readonly: 'eye', paused: 'pause' };
 
 export const PolicyControl: Component<{
   value: AgentPolicy;
@@ -56,7 +55,7 @@ export const PolicyControl: Component<{
               }}
               onKeyDown={(e) => onKey(e, i())}
             >
-              <Dynamic component={ICONS[opt.id]} size={12} strokeWidth={1.5} aria-hidden="true" />
+              <Icon name={ICONS[opt.id]} size={12} />
               {opt.label}
             </button>
           )}

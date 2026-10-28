@@ -96,8 +96,9 @@ export const Sidebar: Component<{ class?: string }> = (props) => {
     <aside class={`${css.sidebar}${props.class ? ` ${props.class}` : ''}`} aria-label="Sources">
       <div class={css.brand}>
         <svg class={css.mark} viewBox="0 0 16 16" aria-hidden="true">
-          <path d="M2 3l4 5-4 5M14 3l-4 5 4 5" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round" />
-          <circle cx="8" cy="8" r="1.7" fill="currentColor" />
+          {/* ›•‹ — chevron tips stop at x=5/11 so the dot (r 1.6) keeps clear air at 16px. */}
+          <path d="M2.5 4.5l2.5 3.5-2.5 3.5M13.5 4.5l-2.5 3.5 2.5 3.5" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+          <circle cx="8" cy="8" r="1.6" fill="currentColor" />
         </svg>
         <h1 class={css.wordmark}>aitmproxy</h1>
         <span class={css.version}>{app.proxy.version}</span>

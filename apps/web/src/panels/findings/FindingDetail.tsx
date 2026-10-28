@@ -3,7 +3,6 @@
 
 import { createMemo, createResource, createSignal, For, Match, onCleanup, Show, Switch, type Component } from 'solid-js';
 import { Portal } from 'solid-js/web';
-import { Download, Image as ImageIcon, Play } from 'lucide-solid';
 import type { PocRun } from '~/bus/mock';
 import { Badge, Button, Icon, Menu, Popover, type AnchorRect } from '~/components';
 import { methodHue, statusHue, type FlowSummary } from '~/model/flow';
@@ -157,12 +156,12 @@ export const FindingDetail: Component<FindingDetailProps> = (props) => {
       <div class={css.bar} role="toolbar" aria-label="Finding actions">
         <Show when={!running()} fallback={<span class={`${css.running} ${css.note}`}>Running…</span>}>
           <Button variant="toolbar" onClick={(e) => openRun(e.currentTarget)} disabled={!run().poc_path} title={run().poc_path ? 'Run this PoC again' : 'No PoC path'}>
-            <Play size={16} strokeWidth={1.5} aria-hidden="true" />
+            <Icon name="play" />
             Run again
           </Button>
         </Show>
         <Button variant="toolbar" onClick={(e) => setExportAnchor(anchorOf(e.currentTarget))} aria-haspopup="menu" aria-expanded={!!exportAnchor()}>
-          <Download size={16} strokeWidth={1.5} aria-hidden="true" />
+          <Icon name="download" />
           Export
           <Icon name="chevron-down" size={12} />
         </Button>
@@ -302,7 +301,7 @@ export const FindingDetail: Component<FindingDetailProps> = (props) => {
               </Match>
               <Match when={true}>
                 <p class={css.muted}>
-                  <ImageIcon size={12} strokeWidth={1.5} aria-hidden="true" style={{ 'vertical-align': '-1px', 'margin-right': '4px' }} />
+                  <Icon name="image" size={12} style={{ 'vertical-align': '-1px', 'margin-right': '4px' }} />
                   Screenshot unavailable.
                 </p>
               </Match>
