@@ -31,10 +31,13 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yaml",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]
