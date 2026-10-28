@@ -1140,15 +1140,16 @@ As the operator (and the next agent), I find the codebase split into deeper modu
 Screens: apps
 Depends: S-070
 Acceptance:
-- [unit] All tests pass after each refactor commit; snapshots are pixel-identical before and after.
-- [manual] `improve-architecture` report lists hot spots and the refactors taken, one per commit.
+- [unit] All tests pass after each refactor commit; snapshots are pixel-identical before and after (`compare.swift`: 0.00% on apps light + dark after each commit).
+- [manual] `improve-architecture` report lists hot spots and the refactors taken, one per commit: `docs/architecture-review-2026-10-28.md`.
 UX:
 - Flow: none — a refactor pass per the improve-architecture report
 - Surface: codebase
 - States: tests pass after each commit; snapshots pixel-identical
 - Words: none
 - Access: none
-Status: todo
+Notes: two Strong cards done as pure moves — `Session` split into state + `Session+Verbs/Editing/Filters/Palette` (809 → 406 lines), `FlowColumn`/`Density` out of `FlowTableView.swift` (542 → 430). No file past 600. Carried: one verb table for row actions (next Strong, before S-041/S-045), viewers behind one `ViewerKind` (with S-045). `docs/ARCHITECTURE.md` and `docs/FIXLOG.md` started.
+Status: done
 
 ---
 
