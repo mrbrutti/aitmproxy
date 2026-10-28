@@ -1,0 +1,24 @@
+[package]
+name = "aitm-plugin-wsctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "WebSocket control plugin: ws.intercept + ws.frame (park, edit/drop live frames)."
+
+[dependencies]
+aitm-core.workspace = true
+aitm-proto-ws.workspace = true
+aitm-rules.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+# The frame-intercept tests upgrade a WebSocket through a real Proxy, so they need
+# the HTTP module (performs the 101 hand-off) and the WS module alongside wsctl.
+aitm-proto-http.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = "0.28"
+
+[lints]
+workspace = true

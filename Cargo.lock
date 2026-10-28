@@ -162,6 +162,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aitm-plugin-wsctl"
+version = "0.1.0"
+dependencies = [
+ "aitm-core",
+ "aitm-proto-http",
+ "aitm-proto-ws",
+ "aitm-rules",
+ "anyhow",
+ "futures",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "aitm-plugins"
 version = "0.1.0"
 dependencies = [
