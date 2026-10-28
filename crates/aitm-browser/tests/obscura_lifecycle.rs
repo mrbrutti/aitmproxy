@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use aitm_browser::obscura::bounded;
 use aitm_browser::{BrowserConfig, BrowserDriver, ObscuraDriver, ObscuraProcess};
 use aitm_core::{BrowserEngine, ObscuraConfig};
 use tracing::{field::Field, span, Event, Level, Metadata};
@@ -62,6 +63,39 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// Every primitive on a live child is bounded by `nav_timeout` (Global
+/// Constraint: bounded operations). The bound is a pure wrapper, so a future
+/// that never resolves proves it fires; a ready future and an inner error
+/// pass through untouched.
+#[tokio::test]
+async fn bounded_op_times_out() {
+    let started = Instant::now();
+    let err = bounded(
+        Duration::from_millis(50),
+        "screenshot",
+        std::future::pending::<anyhow::Result<()>>(),
+    )
+    .await
+    .expect_err("a pending future never completes");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let msg = format!("{err:#}");
+    assert!(msg.contains("obscura"), "{msg}");
+    assert!(msg.contains("screenshot"), "{msg}");
+    assert!(msg.contains("50ms"), "{msg}");
+
+    let value = bounded(Duration::from_millis(50), "eval", async { Ok(7) })
+        .await
+        .expect("a ready future completes");
+    assert_eq!(value, 7);
+
+    let inner = bounded(Duration::from_secs(5), "click", async {
+        Err::<(), _>(anyhow::anyhow!("no such element"))
+    })
+    .await
+    .expect_err("the inner error is kept");
+    assert_eq!(format!("{inner:#}"), "no such element");
 }
 
 /// The full error text of a result that must be `Err` (the `Ok` types here do
