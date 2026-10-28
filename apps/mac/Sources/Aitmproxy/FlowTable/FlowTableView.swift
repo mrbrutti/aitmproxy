@@ -152,17 +152,17 @@ enum FlowColumn: String, CaseIterable {
         switch self {
         case .dot: 24
         case .seq: 52
-        case .url: 320
+        case .url: 300
         case .client: 96
         case .method: 72
         case .status: 72
         case .time: 124
-        case .duration: 72
+        case .duration: 88
         case .request: 80
         case .response: 80
         case .ssl: 40
-        case .edited: 52
-        case .origin: 60
+        case .edited: 64
+        case .origin: 72
         case .mark: 20
         }
     }

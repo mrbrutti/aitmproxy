@@ -28,8 +28,8 @@ struct InspectorView: View {
 struct EmptyInspector: View {
     var body: some View {
         VStack(spacing: Space.sm) {
-            Text("No flow selected").font(Tok.Face.ui(Tok.Typography.Size.base)).foregroundStyle(Tok.Ink.secondary.color)
-            Text("Select a flow to inspect it, or press ↑↓.").font(Tok.Face.ui(Tok.Typography.Size.sm))
+            Text("Nothing selected").font(Tok.Face.ui(Tok.Typography.Size.xl, .medium)).foregroundStyle(Tok.Ink.primary.color)
+            Text("Select a flow to inspect it, or press ↑ ↓.").font(Tok.Face.ui(Tok.Typography.Size.md))
                 .foregroundStyle(Tok.Ink.tertiary.color)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

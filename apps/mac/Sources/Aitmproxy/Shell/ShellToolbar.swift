@@ -23,15 +23,18 @@ struct ShellToolbar: ToolbarContent {
             Button {} label: { Label("Clear", systemImage: Tok.Glyph.clear) }
                 .help("Clear the session")
         }
+        .sharedBackgroundVisibility(.hidden)
         ToolbarItem(placement: .principal) {
             ListeningPill()
         }
+        .sharedBackgroundVisibility(.hidden)
         ToolbarItemGroup(placement: .primaryAction) {
             AgentToggle()
             Button {} label: { Label("Command Palette", systemImage: Tok.Glyph.palette) }
                 .help("Command palette (⌘K)")
             LayoutPicker()
         }
+        .sharedBackgroundVisibility(.hidden)
     }
 }
 
@@ -100,28 +103,39 @@ struct AgentToggle: View {
                         .background(Tok.Agent.tint.color, in: Capsule())
                 }
             }
-            .padding(.horizontal, Tok.Metric.padInner)
+            .padding(.horizontal, Space.sm)
             .frame(height: Tok.Size.control)
-            .overlay(RoundedRectangle(cornerRadius: Tok.Radius.control).strokeBorder(Tok.Line.control.color))
+            .contentShape(Rectangle())
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
+        .menuIndicator(.hidden)
         .help("Agent policy: \(session.agentPolicy.title)")
     }
 }
 
+/// Two flat glyphs; the active layout in ink, the other in secondary. No segmented chrome.
 struct LayoutPicker: View {
     @Environment(Session.self) private var session
 
     var body: some View {
-        @Bindable var session = session
-        Picker("Layout", selection: $session.layout) {
-            Image(systemName: "rectangle.split.1x2").tag(InspectorLayout.horizontal)
-                .help("Inspector below")
-            Image(systemName: Tok.Glyph.split).tag(InspectorLayout.vertical)
-                .help("Inspector right")
+        HStack(spacing: Space.xs) {
+            layoutButton(.horizontal, symbol: "rectangle.split.1x2", help: "Inspector below")
+            layoutButton(.vertical, symbol: Tok.Glyph.split, help: "Inspector right")
         }
-        .pickerStyle(.segmented)
-        .labelsHidden()
+    }
+
+    private func layoutButton(_ layout: InspectorLayout, symbol: String, help: String) -> some View {
+        let on = session.layout == layout
+        return Button { session.layout = layout } label: {
+            Image(systemName: symbol)
+                .font(.system(size: 15, weight: .regular))
+                .foregroundStyle(on ? Tok.Ink.primary.color : Tok.Ink.tertiary.color)
+                .frame(width: Tok.Size.control, height: Tok.Size.control)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .accessibilityAddTraits(on ? .isSelected : [])
     }
 }

@@ -37,13 +37,11 @@ struct SidebarView: View {
                     item(.agent, text: "\(session.agentActionsLastMinute)/min", agent: true)
                 }
                 .padding(.horizontal, Space.sm)
-                .padding(.top, Space.sm)
             }
             filterField
         }
         .frame(maxHeight: .infinity)
         .background(Tok.Ground.surface.color)
-        .overlay(alignment: .trailing) { VRule() }
     }
 
     /// `›•‹ aitmproxy  0.1` — the product mark in the accent, the wordmark in the UI face.
@@ -54,17 +52,19 @@ struct SidebarView: View {
             Spacer()
             Text(session.version).font(Tok.Face.data(Tok.Typography.Size.xs)).foregroundStyle(Tok.Ink.tertiary.color)
         }
-        .padding(.horizontal, Tok.Metric.gapMeta)
-        .frame(height: Tok.Size.filterBar)
+        .padding(.horizontal, Space.lg)
+        .frame(height: Tok.Size.toolbar)
     }
 
+    /// Editorial section labels: small, tracked capitals in the tertiary tier.
     private func group(_ title: String) -> some View {
-        Text(title)
-            .font(Tok.Face.ui(Tok.Typography.Size.sm))
-            .foregroundStyle(Tok.Ink.secondary.color)
+        Text(title.uppercased())
+            .font(Tok.Face.ui(Tok.Typography.Size.xs, .medium))
+            .tracking(0.6)
+            .foregroundStyle(Tok.Ink.tertiary.color)
             .padding(.horizontal, Space.sm)
-            .padding(.top, Space.md)
-            .padding(.bottom, Space.xs)
+            .padding(.top, Space.xl)
+            .padding(.bottom, Space.sm)
     }
 
     private func item(_ page: SidebarPage, count: Int? = nil, text: String? = nil, queue: Bool = false,
@@ -132,7 +132,7 @@ struct SidebarView: View {
         }
         .padding(.horizontal, Tok.Metric.padInner)
         .frame(height: Tok.Size.control)
-        .overlay(RoundedRectangle(cornerRadius: Tok.Radius.control).strokeBorder(Tok.Line.control.color))
+        .background(Tok.Ground.raised.color, in: RoundedRectangle(cornerRadius: Tok.Radius.control))
         .padding(Space.sm)
     }
 }
@@ -146,7 +146,6 @@ struct Monogram: View {
             .foregroundStyle(Tok.Ink.secondary.color)
             .frame(width: 16, height: 16)
             .background(Tok.Ground.raised.color, in: RoundedRectangle(cornerRadius: Tok.Radius.badge))
-            .overlay(RoundedRectangle(cornerRadius: Tok.Radius.badge).strokeBorder(Tok.Line.control.color))
     }
 }
 

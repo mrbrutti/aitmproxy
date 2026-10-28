@@ -11,14 +11,10 @@ struct ShellView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HSplitView {
-                if sidebarVisible {
-                    SidebarView()
-                        .frame(minWidth: Tok.Size.sidebarMin, idealWidth: Tok.Size.sidebar, maxWidth: Tok.Size.sidebarMax)
-                }
-                MainView()
-                    .frame(minWidth: 720, maxWidth: .infinity)
-            }
+            // Hosting controllers do not inherit this view's environment: pass it on.
+            ShellSplitView(sidebarVisible: $sidebarVisible,
+                           sidebar: SidebarView().environment(session).themed(),
+                           main: MainView().environment(session).themed())
             StatusBar()
         }
         .background(Tok.Ground.surface.color)
@@ -92,11 +88,12 @@ struct EmptyFlows: View {
     var body: some View {
         VStack(spacing: Space.sm) {
             Text(filtered ? "No flows match" : "No flows yet")
-                .font(Tok.Face.ui(Tok.Typography.Size.base)).foregroundStyle(Tok.Ink.secondary.color)
+                .font(Tok.Face.ui(Tok.Typography.Size.xl, .medium)).foregroundStyle(Tok.Ink.primary.color)
             Text(filtered ? "Clear the chip or the filter to see the capture."
                  : "Point a client at \(listen) or open the browser.")
-                .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
+                .font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.tertiary.color)
         }
+        .multilineTextAlignment(.center)
         .padding(.top, Tok.Size.columnHeader)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .allowsHitTesting(false)

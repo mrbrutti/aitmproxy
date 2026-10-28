@@ -58,11 +58,12 @@ final class FlowHeaderCell: NSTableHeaderCell {
         paragraph.alignment = alignment
         paragraph.lineBreakMode = .byTruncatingTail
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: Tok.Face.nsUI(Tok.Typography.Size.sm),
-            .foregroundColor: Tok.Ink.secondary.nsColor,
+            .font: Tok.Face.nsUI(Tok.Typography.Size.xs, .medium),
+            .foregroundColor: Tok.Ink.tertiary.nsColor,
+            .kern: 0.5,
             .paragraphStyle: paragraph,
         ]
-        let text = NSAttributedString(string: stringValue, attributes: attributes)
+        let text = NSAttributedString(string: stringValue.uppercased(), attributes: attributes)
         let height = text.size().height
         let rect = NSRect(x: cellFrame.minX + 8, y: cellFrame.midY - height / 2,
                           width: cellFrame.width - 16, height: height)
