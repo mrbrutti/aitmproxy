@@ -25,7 +25,7 @@ Observable outcomes:
 4. **Confirm-over-the-wire.** An operator connection can satisfy a command's `confirm_prompt` through a defined two-phase handshake; an agent connection still cannot (its gated commands stay governed by config flags such as `ca.allow_agent_install`). The `ca.install`-reachable-with-no-confirm hole is closed.
 5. **A real, seeded-vulnerable test target** — a hermetic, self-contained web app seeded with a documented, enumerated set of real vulnerabilities (reflected XSS, stored XSS, SSRF, broken access control/IDOR, auth bypass, open redirect), plus patched control variants, run with no external network. The planted-vuln manifest is visible only to the grader, never to the agent.
 6. **Real agent-driven e2e through real browsers on a custom, non-system proxy** — the agent exercises the target through the embedded **obscura** engine **and** an **external Chrome** (via `--proxy-server`), with **Firefox** (via its own profile proxy prefs + cert store) added as a second external engine. Never the OS proxy; never synthetic-only.
-7. **A reporting contract** — the agent assembles, per finding, the existing three PoC artifacts plus reproduction steps into a human-friendly markdown report and a machine-readable index, consistent with the `poc.build`/`poc.run` model. The tool produces artifacts; the agent writes prose.
+7. **A reporting contract backed by a persistent findings store** — a durable, human-readable **findings / run-history store** (distinct from the PoC *library* `poc.list` exposes) with `findings.list`/`get`/`record` commands, from which the agent assembles a human-friendly markdown report and a machine-readable index. The tool produces artifacts and persists finding records; the agent writes prose. This closes the F13-history gap.
 8. **A milestone exit gate** with two tiers: a **deterministic** functional gate (a scripted driver that uses only the public command surface drives find→reproduce→report against the seeded target and the grader passes, through the Rust gate) and a **live-agent acceptance** (an actual Claude agent, unaided, finds and reports the seeded vulns), the latter being the product-thesis proof.
 
 ## Non-goals
@@ -69,7 +69,8 @@ The parts of the *how* that are decided. Defaults the architect chose are marked
 1. The operator/agent command architecture: **F1** (identity split + agent policy), **F2** (command-invocation audit ring + the `notifications/aitm/agent` stream), **F4** (server push), and the **confirm-over-the-wire** mechanism — one coherent operator/agent-channel story. Rust, in `aitm-core` + `aitm-mcp`.
 2. The **seeded-vulnerable test target** + the **grader** harness. Rust, a new test-support crate.
 3. The **Firefox** external-browser driver option and the **multi-browser agent-driven e2e**.
-4. The **Claude agent driver surface** (plugin/skill set) and the **report contract**. Markdown/config, committed in the repo.
+4. The **persistent findings / run-history store** (`findings.*` commands + on-disk `FindingStore`). Rust, additive first-party module.
+5. The **Claude agent driver surface** (plugin/skill set) and the **report contract**. Markdown/config, committed in the repo.
 
 **What M4 depends on but does not build (referenced, built elsewhere):** **F5** `flow.detail` (the agent inspects headers/bodies/conn/timing through it), **F6** `flow.mark`/`flow.comment` (the agent annotates its working set), **F7** `proxy.status`/`flow.clear`/`config.get`, **F12** `scope.remove` + the `scope.allow_agent_widen` gate, **F13** `poc.list`/`poc.get`/`poc.artifact` (the agent gathers artifacts for the report). M4's plan must declare these as prerequisites; if a prerequisite is not yet merged, the dependent acceptance criterion is blocked and the plan says so rather than M4 re-implementing it.
 
@@ -233,7 +234,7 @@ A committed Claude plugin / skill set (not Rust), the companion the M1 spec defe
 3. **Reason.** From observed requests/responses it enumerates candidate injection/abuse points (parameters, headers, object ids, redirect targets) — strategy that lives in the skill, not the tool.
 4. **Act (bounded).** It tests a candidate with the deterministic primitives — `flow.replay`, `flow.mutate`+`flow.resume`, `request.send`, or a `browser.*` action — each scope/rate/SSRF-gated by the core. It reads the result (`flow.detail`, `browser.eval`/`get_dom`, `browser.screenshot`) to judge whether the behavior is anomalous.
 5. **Reproduce (the finding bar).** When the agent believes a candidate is a real vuln it calls `poc.build` to parameterize it, then `poc.run`. **A finding is "reproduced" iff `poc.run` returns `passed: true` and emits the three artifacts, and — where a control is available — the same PoC `poc.run`s against the patched path and returns `passed: false`.** This is the identical bar as M1 AC14, now reached by discovery rather than by a known target. `poc.run` is the terminal action for that candidate — the agent does not go further (anti-goal: no exploitation beyond proof).
-6. **Report.** After the pass, the agent gathers artifacts via `poc.list`/`poc.get`/`poc.artifact` (F13) and writes the report (D8).
+6. **Record & report.** After the pass, the agent calls `findings.record` to persist the finding (referencing the PoC and its three artifacts), gathers artifacts via `poc.get`/`poc.artifact` (F13), and renders the report (D8) from `findings.list`/`findings.get` (D8a).
 
 **Why this honors the split.** Every verb above is an existing/registered command; the agent adds no capability to the tool. Remove the agent and the same commands reproduce every finding deterministically (that is exactly what the scripted-driver gate proves). The agent supplies crawl strategy, candidate selection, payload choice, and triage — the intelligence the platform spec puts on the agent side.
 
@@ -244,7 +245,54 @@ Consistent with the `poc.build`/`poc.run` three-artifact model (finding capture,
 - **`report.md`** — human-friendly markdown: a title/summary, then one section per finding with `{title, severity, class/CWE, affected endpoint, reproduction steps, PoC path, screenshot (inline or linked), the finding-capture flow id}`. No tool-generated prose; the agent writes it.
 - **`findings.index.json`** (or YAML) — a machine-readable index the grader consumes: a list of `{poc_path, target_path, class, passed, control_passed, finding_capture, screenshot_path}`. This is what lets the grader score discovery without the agent self-asserting against the manifest.
 
-Both are written under the configured PoC/report out-dir; a remote surface reads the PoC artifacts through `poc.artifact` (F13). The report stays readable and editable by a human, who is the final reviewer.
+Both are written under the configured PoC/report out-dir; a remote surface reads the PoC artifacts through `poc.artifact` (F13). The report stays readable and editable by a human, who is the final reviewer. The report is **generated from the persistent findings store** below (D8a) — it is a rendering of recorded findings, not a separate source of truth.
+
+### D8a. The persistent findings / run-history store (new, owned by M4)
+
+**Problem (gap flagged by the core team).** There is no persistent findings or run-history store today. `poc.list` (F13) lists the **PoC library** — the YAML *templates* under `poc.dir` — not a history of what the agent actually *found* across runs. M4's entire point is find → reproduce → **report** on a real target over repeated runs, so a durable record of findings is part of reporting, not an afterthought. This is a store distinct from the PoC library and from the F2 command-audit ring (which records *invocations*, not domain findings).
+
+**Decision — a persistent `FindingStore` with its own read/record commands (Architect's call).**
+
+- **What a finding record is.**
+
+  ```
+  FindingRecord {
+    id,                      # stable finding id (content/time derived)
+    title,                   # human-written, e.g. "Reflected XSS in /search?q"
+    class,                   # vuln class / CWE
+    severity,                # Info|Low|Medium|High|Critical (reuses aitm-poc Severity)
+    target,                  # authority + path the finding is against
+    discovered_at,           # ISO timestamp
+    origin,                  # Frontend role + client_label (from F1): who recorded it
+    poc_ref,                 # the PoC in the library this reproduces with (path/id)
+    reproduction: {          # the poc.run outcome that confirmed it
+      passed,                # true on the vulnerable target
+      control_passed,        # false against the patched control, where one exists
+      run_at
+    },
+    artifacts: {             # the three PoC artifacts, by reference
+      finding_capture,       # FlowId of the triggering flow (in the store)
+      poc_path,              # the replayable PoC YAML
+      screenshot_path        # the "vuln triggering" PNG
+    },
+    flows: [FlowId],         # the flow(s) involved beyond the capture (optional)
+    notes                    # optional human/agent comment
+  }
+  ```
+
+- **Where it's stored.** Persistent on disk under a configured `findings.dir` (default a sibling of `poc.dir` in the user/config dir), **one human-readable YAML file per finding** (readable and editable by a human, per the human-friendly constraint), plus an append-only `runs.jsonl` **run-history** log (one line per `poc.run` outcome against a finding: `{finding_id, poc_ref, passed, control_passed, at, origin}`) that gives the "what did the agent find across runs" timeline without rewriting finding files. The store survives restarts; it is the durable record the report and the operator "Findings" page read.
+- **How it's queried / written (commands registered by a first-party findings module; additive, no core-enum edits).**
+
+  | Command | Params → result | mutates | Role / gate |
+  |---|---|---|---|
+  | `findings.list` | `{filter?: {target?, class?, severity?, since?}}` → `[FindingSummary]` | false | any role (read-only; passes `ReadOnly`) |
+  | `findings.get` | `{id}` → `FindingRecord` | false | any role |
+  | `findings.record` | `{title, class, severity, target, poc_ref, flows?, notes?}` → `{id}` | true | policy-gated like any mutating command; appends a record + a `runs.jsonl` line |
+  | `findings.remove` | `{id}` → `{}` | true | operator/CLI (housekeeping; agent gated by policy) |
+
+- **Relationship to `poc.build`/`poc.run`/F13 (kept clean).** The PoC model and the `poc.*` contracts are **unchanged** (a Non-goal). `poc.build` creates/updates a library template (returns YAML text — verified wire fact); `poc.run` executes it and emits the three artifacts and its pass/control result. **Recording a finding is a separate, explicit, gated act**: after a passing `poc.run`, the agent (or operator) calls `findings.record` referencing that PoC and its artifacts. This keeps `poc.run` pure (no silent persistence), makes every recorded finding an audited invocation (F2), and lets a human record/curate findings by hand too. `poc.list` stays the *library* view; `findings.list` is the *history/results* view they were missing.
+- **The report and the grader read the store.** `report.md` and `findings.index.json` (D8) are rendered from `findings.list`/`findings.get`; the grader scores the recorded findings (each with its `reproduction.passed` + `control_passed`) against the manifest. So "the agent reported it" means "a finding record exists, reproduced, referencing real artifacts."
+- **Gates.** `findings.record`/`remove` are mutating → subject to the agent policy (blocked under `Paused`, refused under `ReadOnly`); reads are read-only. Recording a finding performs no active action against a host, so it needs no scope permit, but it is fully audited. Secrets are never copied into a record (same redaction posture as the audit ring).
 
 ### D9. Safety and capability model (how deny-by-default extends)
 
@@ -290,8 +338,9 @@ Verification is **TDD unit tests AND functional/behavioral tests that drive the 
 
 13. **AC-M4-13 — scripted driver finds via observation:** a scripted driver using only public commands (no manifest access) crawls the target through a real browser, enumerates candidates from `flow.detail`, and tests them.
 14. **AC-M4-14 — scripted driver reproduces:** for each discovered vuln the driver `poc.build`s and `poc.run`s a PoC that passes on the vulnerable path and fails on the patched control, emitting the three artifacts.
-15. **AC-M4-15 — scripted driver reports:** the driver writes `report.md` + `findings.index.json` in the D8 contract, gathering artifacts via F13.
-16. **AC-M4-16 — grader gate green:** the grader confirms the scripted driver found-and-reproduced **all** enumerated vulns with **zero** false-positive PoCs. This is the deterministic exit gate.
+15. **AC-M4-15 — findings store persists & is queryable:** `findings.record` after a passing run writes a human-readable YAML record + a `runs.jsonl` line; `findings.list`/`findings.get` return it (filterable by target/class/severity/since); the record survives a restart and is distinct from `poc.list` (library). `findings.record`/`remove` are policy-gated (blocked under `Paused`, refused under `ReadOnly`); reads are not. Secrets never appear in a record.
+16. **AC-M4-15b — scripted driver records & reports:** the driver records each confirmed finding via `findings.record` and renders `report.md` + `findings.index.json` (D8 contract) from the findings store, gathering artifacts via F13.
+17. **AC-M4-16 — grader gate green:** the grader scores the **recorded findings** and confirms the scripted driver found-and-reproduced **all** enumerated vulns with **zero** false-positive findings. This is the deterministic exit gate.
 
 **Live-agent acceptance (the product-thesis proof, operator-run)**
 
@@ -308,6 +357,7 @@ Verification is **TDD unit tests AND functional/behavioral tests that drive the 
 - The scripted driver's candidate-enumeration and payload lists (it must discover from traffic, not the manifest), and the live threshold number in AC-M4-17 (proposed in Open questions, confirmed with Matt).
 - The subscription registry's internal structure, the exact sink bound and drop granularity, and whether the core event broadcast is one channel or several (so long as D3's backpressure guarantees hold).
 - The `confirm_token` encoding and TTL, and the reserved `_confirm` argument name, consistent with D4.
+- The `FindingStore`'s on-disk layout within `findings.dir` (per-finding YAML + `runs.jsonl`), the `FindingRecord`/`FindingSummary` exact fields beyond those named, the `id` derivation, and which crate hosts the `findings.*` module (additive `aitm-findings` or inside `aitm-poc`), consistent with D8a.
 - The Firefox trust mechanism choice (`certutil` into the throwaway profile vs `policies.json`), and the per-engine launch details, consistent with D6.
 - The plugin/skill-set file layout, skill wording, and MCP wiring, consistent with the D7 loop and the human-friendly constraint.
 - Whether stdio defaults to agent or exposes `mcp.stdio_role`, and the config key names, consistent with D1.
@@ -332,6 +382,7 @@ Only Matt can answer these; kept to the few that are genuinely his call.
 1. **M4 owns F1 + F2 + F4 + confirm-over-the-wire** as one coherent operator/agent-channel story (core/transport work); **F5/F6/F7/F12/F13 are referenced dependencies** built elsewhere. The plan declares those referenced ones as prerequisites and blocks dependent ACs rather than re-implementing.
 11. **F2 audit ring is owned by M4:** a bounded in-memory ring appended after the policy/confirm gates (refusals included), secrets redacted, feeding `notifications/aitm/agent` + `agent.activity`; the CA plugin's JSONL log is generalized into a core audit sink (a superset, one format), durable audit opt-in. It is what makes the live-agent run (AC-M4-17) reviewable.
 12. **Verified live-wire shapes are ground truth over the (stale) foundation doc:** `browser.eval` uses `expr`; `browser.click` x/y-or-selector; `browser.type` requires a selector (`":focus"`); `poc.build` returns YAML text; `ca.status` reports `yes|no|unknown`. The agent skill set is written to these.
+13. **A persistent findings / run-history store is M4's (closes the F13-history gap):** a human-readable on-disk `FindingStore` (per-finding YAML + `runs.jsonl`) with `findings.list`/`get`/`record`/`remove`, distinct from the PoC *library* (`poc.list`) and from the F2 *command-audit* ring. `poc.*` is unchanged; recording a finding is a separate, gated, audited act after a passing `poc.run`; the report and grader read the store.
 2. **`Frontend` stays `Copy`:** add a unit `Operator` role; carry the client label separately on `CommandHost` (refines the blocker note's `Operator { client: String }`).
 3. **Connection role = token class presented** (`agent_token` vs `operator_token`); stdio defaults to the agent role (overridable). A per-connection `ConnCtx` threads role + client label + the push sink into message handling; the old `handle` stays as a back-compat wrapper.
 4. **`AgentPolicy { All, ReadOnly, Paused }` enforced in `call_tool` for the agent role only**, with read-only-ness declared by `Command::mutates()` (default true). `agent.set` is operator/CLI-only.
