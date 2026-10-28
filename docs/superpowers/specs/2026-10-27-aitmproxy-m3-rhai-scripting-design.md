@@ -1,6 +1,6 @@
 # aitmproxy M3 — Rhai scripting tier design
 
-**Status:** approved (2026-10-28 by Matt — engine Rhai confirmed, OQ10 resolved; protocol-extensibility seam added)
+**Status:** approved (2026-10-28 by Matt — engine Rhai, OQ10 option C: rustman-style ergonomics; protocol-extensibility seam)
 **Research inputs:** `docs/research/07-rhai-embedding.md`, `docs/research/01-mitmproxy.md`, `docs/research/02-nuclei.md`, `docs/research/05-synthesis.md`
 **Companion specs:** platform — `docs/superpowers/specs/2026-10-27-aitmproxy-platform-design.md`; plugin system — `docs/superpowers/specs/2026-10-27-aitmproxy-plugin-system-design.md`; PoC language — `docs/superpowers/specs/2026-10-27-aitmproxy-poc-language-design.md`; M2 browser/config — `docs/superpowers/specs/2026-10-27-aitmproxy-m2-obscura-browser-design.md`
 
@@ -229,15 +229,18 @@ These are binding design rules, not aspirations. Each is testable.
 8. **Examples are part of the deliverable.** The worked examples below are
    normative reference shapes and ship as runnable fixtures.
 
-#### 2a. The JS-like DSL feel — built on Rhai (Matt's call)
+#### 2a. The JS-like DSL feel — Rhai shaped to rustman-style ergonomics (Matt's call, option C)
 
 Matt wants the surface to read like an easy, JavaScript-looking DSL, and chose
-**Rhai** as the engine (OQ10) — a full scripting language, deliberately, because it
-is the stronger base for growth: as new MITM protocols and the eventual L4/packet
-milestone add capabilities (§6a), their richer logic (loops, functions, control
-flow) needs a real language, not a minimal DSL. The JS-like *feel* is then a design
-choice in the layer above the engine, cheap because Rhai's syntax is already
-C/JS/Rust-like, produced by four stacked choices with no separate DSL compiler:
+**Rhai** as the engine (OQ10 option C) — a full scripting language, deliberately,
+because it is the stronger base for growth: as new MITM protocols and the eventual
+L4/packet milestone add capabilities (§6a), their richer logic (loops, functions,
+control flow) needs a real language, not a minimal DSL. On top of Rhai the surface
+adopts **`rustman-engine`'s ergonomics** — forgiving defaults, an effect model, a
+minimal curated verb set — so it stays as friendly to write as a tiny DSL. The
+JS-like *feel* is a design choice in the layer above the engine, cheap because
+Rhai's syntax is already C/JS/Rust-like, produced by four stacked choices with no
+separate DSL compiler:
 
 1. **Native JS-isms.** Backtick **template literals with `${...}`**
    (`` `${base}/search?q=${url_encode(p)}` ``), the `in` operator
@@ -393,6 +396,14 @@ handed to Rhai are thin `Clone` wrappers **sharing that one `Arc`**, so every
 copy Rhai makes writes through to the same state. When the hook returns, the host
 applies the state back to the real `FlowCtx`.
 
+**This is the effect model (OQ10 option C).** `FlowState.effects` is literally the
+list of effects a script requested; the host applies them after the hook and
+**discards them on error**, exactly the `rustman-engine`-style "script returns
+effects, host applies, errors discard" shape — realized here with no separate
+language. Reads through the handles are **forgiving** (option C): a missing header,
+query param, or field returns `""`/`null` rather than throwing, so a script probing
+for something absent never aborts mid-hook.
+
 This is sound with **no `unsafe` and no lifetime gymnastics**, it keeps
 `ScriptPlugin: Send`, and it makes the apply step explicit and testable. Cost: a
 per-event clone of the mutable surface (bodies bounded by the existing
@@ -509,7 +520,14 @@ bridge is the one structural subtlety in this milestone.
 
 - Each namespace (`log`, `http`, `browser`, `store`, `scope`) is a small `Clone`
   marker type holding `ScriptServices`, injected as a global constant so
-  `http.send(...)` reads naturally.
+  `http.send(...)` reads naturally. The verb set is deliberately **minimal**
+  (option C) — the common jobs, not an exhaustive API.
+- **Forgiving reads (option C).** Pure lookups with an obvious "absent" answer
+  return `""`/`null` rather than erroring: `option(name)` on an unset option,
+  `store.get(id)` on an unknown id, a `headers`/`query` read of a missing key.
+  Actions that can genuinely fail — a guarded `http.send`/`browser.*` refused by the
+  scope/SSRF guard — still return a catchable error (they are not "absent",
+  they are denied); forgiveness never hides a guard refusal.
 - `ScriptPlugin::on_event` wraps the **entire** hook dispatch in
   `tokio::task::block_in_place(...)`, which tells tokio this worker is about to
   block and lets it move other tasks elsewhere. A CPU-heavy or slow script
@@ -1105,12 +1123,15 @@ accept by silence or redirect any one.
 9. **Research-note numbering.** `07-rhai-embedding.md` is the next free number on
    `main`; an `07-ca-install.md` may exist on the in-flight M2 branch. *Default:
    keep `07` here and renumber at integration if M2 lands an `07` first* — trivial.
-10. **The engine — RESOLVED: Rhai + curated verbs + prelude (Matt, 2026-10-28).**
-    Matt chose Rhai, and considers it the stronger choice precisely because of
-    future L4 and other-protocol support: a full scripting language expresses the
-    richer logic those capabilities will need (§6a, §7a), where a minimal DSL could
-    not. No further engine evaluation; §3–§9 are the Rhai design, and the JS-like
-    feel is built in the layer above it (§2a).
+10. **The engine — RESOLVED: C — Rhai + rustman-style ergonomics (Matt, 2026-10-28).**
+    The engine is **Rhai** — a full scripting language, the stronger base for future
+    L4/other-protocol growth than a minimal DSL (§6a, §7a). Shaped to
+    `rustman-engine`'s ergonomics on top: **forgiving defaults** (missing reads
+    return `""`/`null`, never abort mid-hook), the **effect model** (the §5
+    `Arc<Mutex<FlowState>>` snapshot-then-apply *is* an effect list — edits are
+    recorded and applied after the hook, discarded on error), and a **minimal
+    curated verb set**. §2a and §3–§9 are written to this shaping; no further engine
+    evaluation.
 11. **The extended scope model for L4 / new protocols (§7a).** *Default: keep
     host:port + SSRF for M3 and leave the `ScopeRateGuard` seam as the extension
     point; do not design the packet/address-level scope now.* When L4 lands it will
@@ -1140,8 +1161,10 @@ round-trip guarantees. The host functions are organized as a **protocol-extensib
 capability seam** (§6a) so future protocols and the eventual L4/packet milestone
 register their own verbs behind the same guards, with a note that the scope model
 grows beyond host:port when L4 lands (§7a). The **engine is Rhai** (Matt,
-2026-10-28, OQ10 resolved), chosen as a full language — the stronger base for that
-growth than a minimal DSL. Nothing is built; this is the approved design for M3.
+2026-10-28, OQ10 option C), chosen as a full language — the stronger base for that
+growth than a minimal DSL — and shaped with `rustman-engine`'s ergonomics: forgiving
+defaults, the effect model (§5), and a minimal curated verb set. Nothing is built;
+this is the approved design for M3.
 
 **Architect's calls (approve or correct):**
 
@@ -1164,11 +1187,12 @@ growth than a minimal DSL. Nothing is built; this is the approved design for M3.
     companion specs say (reconciled, no API change).
 11. **Human ergonomics as an acceptance-bearing goal**, with a pinned error format
     and runnable, readable examples.
-12. **Engine: Rhai + curated verbs + bundled prelude (Matt, 2026-10-28; OQ10
-    resolved).** Chosen deliberately as a full language — the stronger base for
-    future L4/other-protocol growth than a minimal DSL. The JS-like feel is built in
-    the layer above it (§2a). *(Engine-comparison history is recorded in research
-    note 07; it does not affect the design.)*
+12. **Engine: option C — Rhai + rustman-style ergonomics (Matt, 2026-10-28; OQ10
+    resolved).** Rhai (a full language, the stronger base for future L4/protocol
+    growth than a minimal DSL), shaped with `rustman-engine`'s ergonomics: forgiving
+    defaults, the effect model (§5 snapshot+apply), and a minimal curated verb set.
+    *(Engine-comparison history is recorded in research note 07; it does not affect
+    the design.)*
 13. **Protocol-extensible capability seam (§6a)** — M3's host functions are
     registered as `ScriptCapability` providers so future protocols/L4 add verbs in
     their own crates, deny-by-default and guarded, versioned against `const API`.

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** approved (2026-10-28 by Matt; engine Rhai, OQ10 resolved = C)
+**Status:** approved (2026-10-28 by Matt) — final, option C (Rhai + rustman-style ergonomics; spec OQ10).
 **Spec:** `docs/superpowers/specs/2026-10-27-aitmproxy-m3-rhai-scripting-design.md` (approved; AC-M3-1…AC-M3-12, inheriting plugin-system AC-P6–AC-P11 and PoC-language AC-L8)
 **Branch / worktree:** `feat/aitmproxy-m3`, cut from `main` (M1) at stage 4; the spec, research note, and this plan are committed on `claude/m3-rhai-spec-2197df`.
 
@@ -19,6 +19,7 @@ Every task's requirements implicitly include these (verbatim from the spec):
 - **Gate:** `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test` before any review. TDD: no production code without a failing test first; the Coder's report includes both runs.
 - **`unsafe` stays forbidden.** The workspace sets `unsafe_code = "forbid"`; the M3 design is deliberately `unsafe`-free (shared-state handles, not raw pointers). A task that reaches for `unsafe` has mis-designed and must stop and report.
 - **Engine features:** `rhai` with `sync` only. `unchecked` and `internals` must never be enabled — `unchecked` disables the very limits this tier relies on. (Engine decided: Rhai — spec OQ10, Matt 2026-10-28.)
+- **Option C ergonomics (spec §2a, §5, OQ10).** Pure reads with an obvious "absent" answer are **forgiving** — `option(unset)`, `store.get(unknown)`, a `headers`/`query` read of a missing key return `""`/`null`, never aborting a hook. The flow surface is the **effect model**: edits/effects are recorded on the `FlowState` snapshot and applied after the hook, **discarded on error** (Task 8). The curated verb set stays minimal. **Guard refusals are NOT forgiven** — a scope/SSRF-denied `http.send`/`browser.*` still returns a catchable error (Task 7). Affects Tasks 3, 5, 6, 7, 11; not Task 1's `ScriptError`/`RhaiConfig`.
 - **Capabilities register through the seam (spec §6a).** The `log`/`finding`/`http`/`browser`/`store`/`scope` host functions are registered as `ScriptCapability` providers, not one hard-coded block, so a future protocol/L4 crate adds its own verbs with no sandbox-core change. **L4/new-protocol verbs and the extended (packet/address-level) scope model are out of M3** (spec §7a, OQ11); M3 builds only today's capabilities behind the seam.
 - **Multi-threaded runtime required.** `tokio::task::block_in_place` panics on a current-thread runtime; all script dispatch and the e2e tests run on the multi-thread flavour the proxy already uses.
 - **Declared signatures are authoritative.** Types and signatures in the spec and in each task's Interfaces block are copied exactly; bodies and in-module file layout are the builder's.
@@ -172,8 +173,9 @@ Longest sequential chain: 1 → 3 → 6 → 7 → 8 → 9 → 10 → 15 (8 tasks
   - `flow_api.rs::script_reads_and_sets_request`: `flow.request.method = "PUT"; flow.request.url` returns the seeded URL; state method `"PUT"`.
   - `flow_api.rs::set_response_then_halt`: `flow.set_response(403, #{}, "no"); halt()` → state has a `SetResponse{status:403,…}` and a `Halt` effect.
   - `flow_api.rs::ws_message_drop_and_set_text`: `msg.set_text("redacted"); msg.drop()` → ws state body `"redacted"` and a `DropWsMessage` effect.
+  - `flow_api.rs::forgiving_missing_header_read` (option C): `flow.request.headers.get("Nope")` on a flow without that header → `""` (not an error); `flow.request.query["absent"]` → `""`.
   - [ ] Tests → FAIL → implement → PASS → gate → commit.
-- **Done when:** the four tests pass.
+- **Done when:** the five tests pass.
 
 ### Task 6: Host core — services, findings, `log`/`finding`/`option` (`host_core.rs`)
 
@@ -217,8 +219,9 @@ Longest sequential chain: 1 → 3 → 6 → 7 → 8 → 9 → 10 → 15 (8 tasks
   - `host_net.rs::in_scope_send_returns_map`: guard allows; stub client returns a flow with status 200 → script `http.send(#{method:"GET",url:"http://ok.test/"}).status` → `200`.
   - `host_net.rs::navigate_ssrf_blocked`: SSRF guard blocks `127.0.0.1` → `browser.navigate("http://127.0.0.1/")` → catchable error containing `127.0.0.1`.
   - `host_net.rs::scope_add_then_list`: `scope.add("ok.test")` then `scope.list()` contains `"ok.test"`.
+  - `host_net.rs::store_get_missing_is_null` (option C): `store.get("00000000-0000-0000-0000-000000000000")` for an id not in the store → `()` (forgiving), while a guard refusal (above) still throws — forgiveness covers absence, not denial.
   - [ ] Tests → FAIL → implement → PASS → gate → commit `feat(rhai): guarded http/browser/store/scope host fns via block_on`.
-- **Done when:** the four tests pass.
+- **Done when:** the five tests pass.
 
 ### Task 8: `ScriptPlugin` + hook dispatch (`plugin.rs`)
 
