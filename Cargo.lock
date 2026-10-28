@@ -147,6 +147,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aitm-plugin-maprules"
+version = "0.1.0"
+dependencies = [
+ "aitm-core",
+ "aitm-rules",
+ "anyhow",
+ "futures",
+]
+
+[[package]]
 name = "aitm-plugin-rhai"
 version = "0.1.0"
 dependencies = [
