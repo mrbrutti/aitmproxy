@@ -19,7 +19,7 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 26] = [
+const EXPECTED_TOOLS: [&str; 31] = [
     "flow.list",
     "flow.get",
     "flow.detail",
@@ -30,6 +30,11 @@ const EXPECTED_TOOLS: [&str; 26] = [
     "flow.mutate",
     "flow.mark",
     "flow.comment",
+    "flow.clear",
+    "proxy.status",
+    "proxy.pause",
+    "proxy.resume",
+    "config.get",
     "request.send",
     "browser.navigate",
     "browser.click",

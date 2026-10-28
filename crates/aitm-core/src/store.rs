@@ -5,7 +5,7 @@
 //! protocol modules, plugins, and command handlers can all reach it behind a
 //! shared reference.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{PoisonError, RwLock};
 
 use indexmap::IndexMap;
@@ -26,6 +26,20 @@ pub trait FlowStore: Send + Sync {
     fn list(&self) -> Vec<FlowId>;
     /// Ids of flows matching every set filter in `q`, in insertion order.
     fn query(&self, q: &FlowQuery) -> Vec<FlowId>;
+    /// Remove every stored flow; returns how many were removed. The default is a
+    /// no-op (`0`) for stores that do not support clearing.
+    fn clear(&self) -> usize {
+        0
+    }
+    /// Whether new flows are being retained (the capture/record toggle). The
+    /// default store is always capturing.
+    fn is_capturing(&self) -> bool {
+        true
+    }
+    /// Enable (`true`) or disable (`false`) retaining newly inserted flows. While
+    /// disabled, `insert` drops the flow but still returns its id, so the proxy
+    /// keeps forwarding traffic — it just is not recorded. Default: no-op.
+    fn set_capturing(&self, _on: bool) {}
 }
 
 /// A filter over the store. `None` fields do not constrain the result; the seam a
@@ -64,6 +78,8 @@ pub struct MemFlowStore {
     /// Estimated resident bytes of all held flows. Mutated only under the `flows`
     /// write lock, so it stays consistent with the map.
     resident: AtomicUsize,
+    /// Whether new flows are retained. `false` drops inserts (the record toggle).
+    capturing: AtomicBool,
 }
 
 impl Default for MemFlowStore {
@@ -92,6 +108,7 @@ impl MemFlowStore {
             capacity,
             max_bytes,
             resident: AtomicUsize::new(0),
+            capturing: AtomicBool::new(true),
         }
     }
 
@@ -234,6 +251,11 @@ fn matches(flow: &Flow, q: &FlowQuery) -> bool {
 impl FlowStore for MemFlowStore {
     fn insert(&self, flow: Flow) -> FlowId {
         let id = flow.id();
+        // Record toggle: while not capturing, drop the flow but return its id so
+        // the proxy keeps forwarding — it is simply not retained for inspection.
+        if !self.capturing.load(Ordering::Relaxed) {
+            return id;
+        }
         let size = flow_size(&flow);
         let mut flows = self.flows.write().unwrap_or_else(PoisonError::into_inner);
         // Re-inserting an existing id replaces in place: discount the old size.
@@ -291,5 +313,21 @@ impl FlowStore for MemFlowStore {
             .filter(|(_, flow)| matches(flow, q))
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    fn clear(&self) -> usize {
+        let mut flows = self.flows.write().unwrap_or_else(PoisonError::into_inner);
+        let n = flows.len();
+        flows.clear();
+        self.resident.store(0, Ordering::Relaxed);
+        n
+    }
+
+    fn is_capturing(&self) -> bool {
+        self.capturing.load(Ordering::Relaxed)
+    }
+
+    fn set_capturing(&self, on: bool) {
+        self.capturing.store(on, Ordering::Relaxed);
     }
 }

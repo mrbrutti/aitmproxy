@@ -19,8 +19,8 @@ use aitm_browser::BrowserPlugin;
 use aitm_ca::CaPlugin;
 use aitm_core::{Config, Plugin, Proxy, Registry};
 use aitm_plugins::{
-    CapturePlugin, DetailPlugin, InterceptPlugin, MetaPlugin, MutatePlugin, RateLimitPlugin,
-    ReplayPlugin, ScopePlugin,
+    CapturePlugin, ControlPlugin, DetailPlugin, InterceptPlugin, MetaPlugin, MutatePlugin,
+    RateLimitPlugin, ReplayPlugin, ScopePlugin,
 };
 use aitm_proto_http::{CertAuthority, HttpModule};
 use aitm_proto_ws::WsModule;
@@ -67,6 +67,11 @@ pub fn assemble_with(cfg: &Config, features: &Features) -> anyhow::Result<Assemb
         .with_insecure(cfg.ssl_insecure)
         .with_max_body_bytes(cfg.limits.max_body_bytes);
 
+    // The control plugin's `proxy.status` reports whether intercept is armed, so
+    // it shares the intercept plugin's armed flag.
+    let intercept = InterceptPlugin::new();
+    let armed = intercept.armed_flag();
+
     let mut builder = Proxy::builder()
         .with_config(cfg.clone())
         // Protocol modules: HTTP first; WsModule only claims post-upgrade connections.
@@ -78,7 +83,8 @@ pub fn assemble_with(cfg: &Config, features: &Features) -> anyhow::Result<Assemb
         .register_plugin(Box::new(DetailPlugin::new()))
         .register_plugin(Box::new(MetaPlugin::new()))
         .register_plugin(Box::new(ReplayPlugin::new()))
-        .register_plugin(Box::new(InterceptPlugin::new()));
+        .register_plugin(Box::new(intercept))
+        .register_plugin(Box::new(ControlPlugin::new(armed)));
     if features.mutate {
         builder = builder.register_plugin(Box::new(MutatePlugin::new()));
     }

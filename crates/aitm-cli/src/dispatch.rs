@@ -37,6 +37,7 @@ pub struct Cli {
     services: Option<Services>,
     ssrf: SsrfPolicy,
     poc_dir: Option<std::path::PathBuf>,
+    config: Option<Arc<aitm_core::Config>>,
     confirmer: Arc<dyn Confirmer>,
 }
 
@@ -50,8 +51,15 @@ impl Cli {
             services: None,
             ssrf: SsrfPolicy::default(),
             poc_dir: None,
+            config: None,
             confirmer: Arc::new(TtyConfirmer::from_stdin()),
         }
+    }
+
+    /// Attach the proxy configuration so `config.get`/`proxy.status` can read it.
+    pub fn with_config(mut self, config: Arc<aitm_core::Config>) -> Self {
+        self.config = Some(config);
+        self
     }
 
     /// Put confirmation prompts to `confirmer` instead of the terminal.
@@ -111,6 +119,10 @@ impl Cli {
         .with_ssrf(self.ssrf.clone())
         .with_poc_dir(self.poc_dir.clone())
         .with_frontend(Frontend::Cli);
+        let host = match &self.config {
+            Some(cfg) => host.with_config(cfg.clone()),
+            None => host,
+        };
         if !yes {
             if let Some(prompt) = cmd.confirm_prompt(&args) {
                 let confirmed = self

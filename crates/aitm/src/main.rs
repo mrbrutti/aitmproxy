@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
         let cli = aitm_cli::Cli::new(registry.clone())
             .with_ssrf_policy(cfg.browser.ssrf.clone())
             .with_poc_dir(cfg.poc.dir.clone())
+            .with_config(Arc::new(cfg.clone()))
             .with_services(store.clone(), client.clone(), guard.clone(), None);
         match cli.dispatch(&argv) {
             Ok(value) => {
@@ -82,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
     let mcp = aitm_mcp::McpServer::new(registry, cfg.mcp.transport.clone())
         .with_ssrf_policy(cfg.browser.ssrf.clone())
         .with_poc_dir(cfg.poc.dir.clone())
+        .with_config(Arc::new(cfg.clone()))
         .with_services(store, client, guard, browser);
 
     // The main listener relays client traffic; the browser listener is

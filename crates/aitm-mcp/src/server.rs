@@ -50,6 +50,7 @@ pub struct McpServer {
     on_bound: Mutex<Option<OnBound>>,
     ssrf: SsrfPolicy,
     poc_dir: Option<std::path::PathBuf>,
+    config: Option<Arc<aitm_core::Config>>,
 }
 
 /// A JSON-RPC level failure (as opposed to a tool's own error result).
@@ -78,7 +79,14 @@ impl McpServer {
             on_bound: Mutex::new(None),
             ssrf: SsrfPolicy::default(),
             poc_dir: None,
+            config: None,
         }
+    }
+
+    /// Attach the proxy configuration so `config.get`/`proxy.status` can read it.
+    pub fn with_config(mut self, config: Arc<aitm_core::Config>) -> Self {
+        self.config = Some(config);
+        self
     }
 
     /// Use the configured SSRF policy for command-side pre-flights (the PoC
@@ -132,6 +140,7 @@ impl McpServer {
             on_bound,
             ssrf,
             poc_dir,
+            config,
         } = self;
         let on_bound = on_bound.into_inner().unwrap_or(None);
         let server = Arc::new(McpServer {
@@ -141,6 +150,7 @@ impl McpServer {
             on_bound: Mutex::new(None),
             ssrf,
             poc_dir,
+            config,
         });
         match selected {
             McpTransport::Stdio => transport::serve_stdio(server).await,
@@ -271,6 +281,10 @@ impl McpServer {
         // Said explicitly, though it is the default: an agent is on this end,
         // so a gated command relies on its config flag, never on a prompt.
         .with_frontend(Frontend::Mcp);
+        let host = match &self.config {
+            Some(cfg) => host.with_config(cfg.clone()),
+            None => host,
+        };
         Ok(match cmd.invoke(args, &host) {
             Ok(value) => {
                 let structured = to_json(&value);

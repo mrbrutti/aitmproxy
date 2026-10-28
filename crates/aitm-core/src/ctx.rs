@@ -69,6 +69,7 @@ pub struct CommandHost<'a> {
     ssrf: crate::config::SsrfPolicy,
     poc_dir: Option<std::path::PathBuf>,
     frontend: Frontend,
+    config: Option<std::sync::Arc<crate::config::Config>>,
 }
 
 impl<'a> CommandHost<'a> {
@@ -92,7 +93,20 @@ impl<'a> CommandHost<'a> {
             // The gated posture: a host that did not declare itself the human
             // CLI is treated as agent-driven.
             frontend: Frontend::Mcp,
+            config: None,
         }
+    }
+
+    /// Attach the proxy configuration, so commands that report or read it
+    /// (`config.get`, `proxy.status`, `poc.*` output confinement) can reach it.
+    pub fn with_config(mut self, config: std::sync::Arc<crate::config::Config>) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// The attached proxy configuration, if the frontend provided it.
+    pub fn config(&self) -> Option<&crate::config::Config> {
+        self.config.as_deref()
     }
 
     /// Use the configured SSRF policy instead of the default.
