@@ -787,109 +787,167 @@ impl Command for PocRunCommand {
     }
 
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
-        let poc_path = args.get_str("poc_path")?;
-        let path = std::path::Path::new(poc_path);
-        // Only load a plainly-named YAML file.
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("yaml") | Some("yml") => {}
-            _ => anyhow::bail!("poc.run: `{poc_path}` must be a .yaml file"),
-        }
-        // Opt-in confinement: when a PoC directory is configured, the file must
-        // resolve (canonicalized, so `..` and symlinks are followed) to a path
-        // under it. Unconfigured (`None`) loads from any path, as before.
-        if let Some(root) = host.poc_dir() {
-            let canon_root = root.canonicalize().map_err(|e| {
-                anyhow::anyhow!(
-                    "poc.run: PoC dir `{}` is not accessible: {e}",
-                    root.display()
-                )
-            })?;
-            let canon_path = path
-                .canonicalize()
-                .map_err(|e| anyhow::anyhow!("poc.run: cannot resolve `{poc_path}`: {e}"))?;
-            if !canon_path.starts_with(&canon_root) {
-                anyhow::bail!(
-                    "poc.run: `{poc_path}` is outside the configured PoC directory `{}`",
-                    root.display()
-                );
-            }
-        }
-        // Open with `O_NOFOLLOW` so a symlink at the final component fails to open,
-        // then stat and read the *opened handle* — closing the stat/open TOCTOU
-        // window where the path could be swapped for a symlink to an arbitrary file.
-        let mut file = open_nofollow(path)
-            .map_err(|e| anyhow::anyhow!("poc.run: cannot open `{poc_path}`: {e}"))?;
-        let meta = file
-            .metadata()
-            .map_err(|e| anyhow::anyhow!("poc.run: cannot stat `{poc_path}`: {e}"))?;
-        if !meta.file_type().is_file() {
-            anyhow::bail!("poc.run: refusing to load `{poc_path}`: not a regular file");
-        }
-        // Cap the document size before parsing (billion-laughs / huge-doc guard).
-        const MAX_POC_BYTES: u64 = 1024 * 1024;
-        if meta.len() > MAX_POC_BYTES {
-            anyhow::bail!("poc.run: `{poc_path}` exceeds the {MAX_POC_BYTES}-byte PoC size cap");
-        }
-        let mut text = String::new();
-        std::io::Read::read_to_string(&mut file, &mut text)
-            .map_err(|e| anyhow::anyhow!("poc.run: cannot read `{poc_path}`: {e}"))?;
-        // Validate the raw document, then type it. Parse errors are reported
-        // without echoing the offending file content.
-        let raw: serde_yaml::Value = serde_yaml::from_str(&text)
-            .map_err(|_| anyhow::anyhow!("poc.run: `{poc_path}` is not valid YAML"))?;
-        crate::schema::validate(&raw)
-            .map_err(|e| anyhow::anyhow!("poc.run: `{poc_path}` failed validation: {e}"))?;
-        let poc: Poc = serde_yaml::from_value(raw)
-            .map_err(|_| anyhow::anyhow!("poc.run: `{poc_path}` is not a valid PoC document"))?;
-
-        let mut bindings = VarBindings::new();
-        if let Ok(target) = args.get_str("target") {
-            bindings.insert("target", Value::Str(target.to_string()));
-        }
-        if let Ok(vars) = args.get_object("vars") {
-            for (name, value) in vars {
-                bindings.insert(name.clone(), value.clone());
-            }
-        }
-
-        let result = futures::executor::block_on(StdPocRunner::new().run(&poc, bindings, host))?;
-
-        let mut obj = std::collections::BTreeMap::new();
-        obj.insert("passed".to_string(), Value::Bool(result.passed));
-        obj.insert(
-            "finding_capture".to_string(),
-            Value::Str(result.finding_capture.to_string()),
-        );
-        obj.insert(
-            "poc_path".to_string(),
-            Value::Str(result.poc_path.display().to_string()),
-        );
-        obj.insert(
-            "screenshot_path".to_string(),
-            Value::Str(result.screenshot_path.display().to_string()),
-        );
-        obj.insert(
-            "evaluated".to_string(),
-            Value::Array(
-                result
-                    .evaluated
-                    .into_iter()
-                    .map(|o| {
-                        let mut m = std::collections::BTreeMap::new();
-                        m.insert("assertion".to_string(), Value::Str(o.assertion));
-                        m.insert("matched".to_string(), Value::Bool(o.matched));
-                        Value::Object(m)
-                    })
-                    .collect(),
-            ),
-        );
-        Ok(Value::Object(obj))
+        run_poc_command(args, host, None)
     }
 }
 
+/// `poc.run` with the scripting tier wired in: identical to [`PocRunCommand`]
+/// except that `script` steps dispatch through `executor` instead of failing.
+/// The binary registers this one when the Rhai tier is loaded, so a PoC with a
+/// script step runs over MCP and the CLI exactly as a declarative one does.
+pub struct ScriptedPocRunCommand {
+    executor: Arc<dyn ScriptStepExecutor>,
+}
+
+impl ScriptedPocRunCommand {
+    /// Wrap `poc.run` around the executor that runs its `script` steps.
+    pub fn new(executor: Arc<dyn ScriptStepExecutor>) -> Self {
+        Self { executor }
+    }
+}
+
+impl fmt::Debug for ScriptedPocRunCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScriptedPocRunCommand").finish()
+    }
+}
+
+impl Command for ScriptedPocRunCommand {
+    fn name(&self) -> &str {
+        PocRunCommand.name()
+    }
+
+    fn schema(&self) -> ParamSchema {
+        PocRunCommand.schema()
+    }
+
+    fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        run_poc_command(args, host, Some(&self.executor))
+    }
+}
+
+/// The body both registrations share: load the PoC from a confined, symlink-safe
+/// path, bind the caller's variables, and run it — with `executor` wired into the
+/// runner when the host has a scripting tier.
+fn run_poc_command(
+    args: Params,
+    host: &CommandHost,
+    executor: Option<&Arc<dyn ScriptStepExecutor>>,
+) -> anyhow::Result<Value> {
+    let poc_path = args.get_str("poc_path")?;
+    let path = std::path::Path::new(poc_path);
+    // Only load a plainly-named YAML file.
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("yaml") | Some("yml") => {}
+        _ => anyhow::bail!("poc.run: `{poc_path}` must be a .yaml file"),
+    }
+    // Opt-in confinement: when a PoC directory is configured, the file must
+    // resolve (canonicalized, so `..` and symlinks are followed) to a path
+    // under it. Unconfigured (`None`) loads from any path, as before.
+    if let Some(root) = host.poc_dir() {
+        let canon_root = root.canonicalize().map_err(|e| {
+            anyhow::anyhow!(
+                "poc.run: PoC dir `{}` is not accessible: {e}",
+                root.display()
+            )
+        })?;
+        let canon_path = path
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("poc.run: cannot resolve `{poc_path}`: {e}"))?;
+        if !canon_path.starts_with(&canon_root) {
+            anyhow::bail!(
+                "poc.run: `{poc_path}` is outside the configured PoC directory `{}`",
+                root.display()
+            );
+        }
+    }
+    // Open with `O_NOFOLLOW` so a symlink at the final component fails to open,
+    // then stat and read the *opened handle* — closing the stat/open TOCTOU
+    // window where the path could be swapped for a symlink to an arbitrary file.
+    let mut file = open_nofollow(path)
+        .map_err(|e| anyhow::anyhow!("poc.run: cannot open `{poc_path}`: {e}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| anyhow::anyhow!("poc.run: cannot stat `{poc_path}`: {e}"))?;
+    if !meta.file_type().is_file() {
+        anyhow::bail!("poc.run: refusing to load `{poc_path}`: not a regular file");
+    }
+    // Cap the document size before parsing (billion-laughs / huge-doc guard).
+    const MAX_POC_BYTES: u64 = 1024 * 1024;
+    if meta.len() > MAX_POC_BYTES {
+        anyhow::bail!("poc.run: `{poc_path}` exceeds the {MAX_POC_BYTES}-byte PoC size cap");
+    }
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut file, &mut text)
+        .map_err(|e| anyhow::anyhow!("poc.run: cannot read `{poc_path}`: {e}"))?;
+    // Validate the raw document, then type it. Parse errors are reported
+    // without echoing the offending file content.
+    let raw: serde_yaml::Value = serde_yaml::from_str(&text)
+        .map_err(|_| anyhow::anyhow!("poc.run: `{poc_path}` is not valid YAML"))?;
+    crate::schema::validate(&raw)
+        .map_err(|e| anyhow::anyhow!("poc.run: `{poc_path}` failed validation: {e}"))?;
+    let poc: Poc = serde_yaml::from_value(raw)
+        .map_err(|_| anyhow::anyhow!("poc.run: `{poc_path}` is not a valid PoC document"))?;
+
+    let mut bindings = VarBindings::new();
+    if let Ok(target) = args.get_str("target") {
+        bindings.insert("target", Value::Str(target.to_string()));
+    }
+    if let Ok(vars) = args.get_object("vars") {
+        for (name, value) in vars {
+            bindings.insert(name.clone(), value.clone());
+        }
+    }
+
+    let mut runner = StdPocRunner::new();
+    if let Some(exec) = executor {
+        runner = runner.with_script_executor(Arc::clone(exec));
+    }
+    let result = futures::executor::block_on(runner.run(&poc, bindings, host))?;
+
+    let mut obj = std::collections::BTreeMap::new();
+    obj.insert("passed".to_string(), Value::Bool(result.passed));
+    obj.insert(
+        "finding_capture".to_string(),
+        Value::Str(result.finding_capture.to_string()),
+    );
+    obj.insert(
+        "poc_path".to_string(),
+        Value::Str(result.poc_path.display().to_string()),
+    );
+    obj.insert(
+        "screenshot_path".to_string(),
+        Value::Str(result.screenshot_path.display().to_string()),
+    );
+    obj.insert(
+        "evaluated".to_string(),
+        Value::Array(
+            result
+                .evaluated
+                .into_iter()
+                .map(|o| {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert("assertion".to_string(), Value::Str(o.assertion));
+                    m.insert("matched".to_string(), Value::Bool(o.matched));
+                    Value::Object(m)
+                })
+                .collect(),
+        ),
+    );
+    Ok(Value::Object(obj))
+}
+
 /// Register `poc.run` on a registry (called from binary assembly, Task 28).
+/// `script` steps error without an executor; see [`register_with_executor`].
 pub fn register(registry: &mut Registry) {
     registry.add_command(Arc::new(PocRunCommand));
+}
+
+/// Register `poc.run` with the scripting tier wired in, so a PoC's `script`
+/// steps run (M3). The binary calls this instead of [`register`] when the Rhai
+/// tier loaded; both register the same command name and schema.
+pub fn register_with_executor(registry: &mut Registry, executor: Arc<dyn ScriptStepExecutor>) {
+    registry.add_command(Arc::new(ScriptedPocRunCommand::new(executor)));
 }
 
 #[cfg(test)]
