@@ -1,0 +1,60 @@
+id: authed-stored-xss-notes
+info:
+  name: Authenticated stored XSS in notes
+  severity: high
+  description: A note's body is stored and rendered unescaped on a later visit.
+  tags: [xss, stored, authed]
+
+variables:
+  - name: target
+    required: true
+  - name: user
+    default: tester
+  - name: pass
+    default: testpass
+  - name: marker
+    default: "{{rand_text_alpha(10)}}"
+
+steps:
+  # Declarative login; pull the CSRF token out for the script step.
+  - http:
+      method: GET
+      url: "{{target}}/login"
+      extract:
+        - name: csrf
+          type: regex
+          from: body
+          regex: 'name="csrf" value="([a-f0-9]+)"'
+          group: 1
+          internal: true
+
+  # The escape hatch: logic the matcher DSL can't express, written plainly.
+  - script:
+      name: store-and-confirm
+      script: |
+        if vars.get("csrf") == () {
+          log.error("no CSRF token — cannot continue");
+          return fail;
+        }
+
+        let base = vars.get("target");
+        let m    = vars.get("marker");
+        let form = "application/x-www-form-urlencoded";
+
+        // Authenticate, then store the payload. http.send is scope/rate-gated.
+        http.send(#{ method: "POST", url: `${base}/login`,
+                     headers: #{ "Content-Type": form },
+                     body: `user=${vars.get("user")}&pass=${vars.get("pass")}&csrf=${vars.get("csrf")}` });
+
+        http.send(#{ method: "POST", url: `${base}/notes`,
+                     headers: #{ "Content-Type": form },
+                     body: `note=<script>window.__aitm='${m}'</script>` });
+
+        // Visit the rendered note and confirm the script ran (SSRF-gated).
+        browser.navigate(`${base}/notes`);
+        browser.screenshot();                      // returns bytes to the script (M3: not auto-saved as a run artifact)
+        if browser.evaluate("window.__aitm") == m { return pass; }
+        return fail;
+
+success:
+  - dsl: 'step("store-and-confirm") == "pass"'

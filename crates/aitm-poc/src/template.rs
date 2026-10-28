@@ -113,6 +113,7 @@ impl PocTemplate {
             status: 0,
             body: String::new(),
             vars: self.merged_vars(vars),
+            steps: BTreeMap::new(),
         };
         Ok(value_to_string(dsl::eval(expr, &ctx)?))
     }

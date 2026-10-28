@@ -19,7 +19,8 @@ use aitm_browser::BrowserPlugin;
 use aitm_ca::CaPlugin;
 use aitm_core::{Config, Plugin, Proxy, Registry};
 use aitm_plugins::{
-    CapturePlugin, InterceptPlugin, MutatePlugin, RateLimitPlugin, ReplayPlugin, ScopePlugin,
+    CapturePlugin, ControlPlugin, DetailPlugin, InterceptPlugin, MetaPlugin, MutatePlugin,
+    RateLimitPlugin, ReplayPlugin, ScopePlugin,
 };
 use aitm_proto_http::{CertAuthority, HttpModule};
 use aitm_proto_ws::WsModule;
@@ -49,6 +50,25 @@ impl Default for Features {
 pub struct Assembled {
     pub proxy: Proxy,
     pub ca: Arc<CertAuthority>,
+    /// Set `true` once the proxy is actually serving, so `proxy.status.listening`
+    /// is honest (a one-shot `aitm proxy status` that never serves reports `false`).
+    pub listening: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The scripting tier, ready to take its place in the chain (M3 spec §8).
+#[derive(Default)]
+pub struct ScriptWiring {
+    /// Plugins in declaration order. They are registered after the first-party
+    /// feature plugins and before the command providers, so a script sees a
+    /// flow once capture/scope/rate-limit/intercept/mutate have acted and its
+    /// `halt()` short-circuits everything after it.
+    pub plugins: Vec<Box<dyn Plugin>>,
+    /// Runs a PoC's `script` steps. `None` leaves `poc.run` declarative-only,
+    /// erroring on a `script` step rather than skipping it.
+    pub executor: Option<Arc<dyn aitm_poc::ScriptStepExecutor>>,
+    /// The tier's command plugin (`script.validate`, `script.reload`,
+    /// `findings.list`), registered among the command providers.
+    pub commands: Option<Box<dyn Plugin>>,
 }
 
 /// Assemble the proxy from configuration with the default feature set.
@@ -58,6 +78,27 @@ pub fn assemble(cfg: &Config) -> anyhow::Result<Assembled> {
 
 /// Assemble the proxy from configuration and an explicit feature set.
 pub fn assemble_with(cfg: &Config, features: &Features) -> anyhow::Result<Assembled> {
+    assemble_with_scripts(cfg, features, ScriptWiring::default())
+}
+
+/// Assemble the proxy with the scripting tier wired in.
+pub fn assemble_with_scripts(
+    cfg: &Config,
+    features: &Features,
+    scripts: ScriptWiring,
+) -> anyhow::Result<Assembled> {
+    // Refuse a PoC output dir that would expose the CA key: `poc.artifact` serves
+    // files under `poc.out_dir`, so it must not equal or contain `ca.dir`.
+    if let Some(out_dir) = &cfg.poc.out_dir {
+        if cfg.ca.dir == *out_dir || cfg.ca.dir.starts_with(out_dir) {
+            anyhow::bail!(
+                "poc.out_dir ({}) must not equal or contain the CA directory ({}): \
+                 poc.artifact would be able to read the CA key",
+                out_dir.display(),
+                cfg.ca.dir.display()
+            );
+        }
+    }
     let ca = Arc::new(CertAuthority::load_or_generate(
         &cfg.ca.dir,
         cfg.ca.key_mode,
@@ -65,6 +106,13 @@ pub fn assemble_with(cfg: &Config, features: &Features) -> anyhow::Result<Assemb
     let http = HttpModule::with_ca(ca.clone())
         .with_insecure(cfg.ssl_insecure)
         .with_max_body_bytes(cfg.limits.max_body_bytes);
+
+    // The control plugin's `proxy.status` reports whether intercept is armed and
+    // whether the proxy is serving, so it shares the intercept plugin's armed flag
+    // and a listening flag `main` flips once it begins serving.
+    let intercept = InterceptPlugin::new();
+    let armed = intercept.armed_flag();
+    let listening = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let mut builder = Proxy::builder()
         .with_config(cfg.clone())
@@ -74,8 +122,11 @@ pub fn assemble_with(cfg: &Config, features: &Features) -> anyhow::Result<Assemb
         // First-party plugins, in chain order. Intercept precedes mutate so a
         // request is parked before mutate would act (data-flow 2).
         .register_plugin(Box::new(CapturePlugin::new()))
+        .register_plugin(Box::new(DetailPlugin::new()))
+        .register_plugin(Box::new(MetaPlugin::new()))
         .register_plugin(Box::new(ReplayPlugin::new()))
-        .register_plugin(Box::new(InterceptPlugin::new()));
+        .register_plugin(Box::new(intercept))
+        .register_plugin(Box::new(ControlPlugin::new(armed, listening.clone())));
     if features.mutate {
         builder = builder.register_plugin(Box::new(MutatePlugin::new()));
     }
@@ -84,16 +135,28 @@ pub fn assemble_with(cfg: &Config, features: &Features) -> anyhow::Result<Assemb
         .clone()
         .unwrap_or_else(|| CaPlugin::new(cfg.ca.clone()));
     builder = builder
-        .register_plugin(Box::new(ScopePlugin::new()))
-        .register_plugin(Box::new(RateLimitPlugin::new(cfg.limits.per_host_rps)))
+        .register_plugin(Box::new(ScopePlugin::new(cfg.scope.allow_agent_widen)))
+        .register_plugin(Box::new(RateLimitPlugin::new(cfg.limits.per_host_rps)));
+    // Scripts take their chain positions here: after every native plugin that
+    // acts on a flow, in the order the operator declared them (spec §8).
+    for plugin in scripts.plugins {
+        builder = builder.register_plugin(plugin);
+    }
+    builder = builder
         // Command providers: the browser, poc and ca commands.
         .register_plugin(Box::new(BrowserPlugin::new(cfg.browser.ssrf.clone())))
-        .register_plugin(Box::new(PocCommands))
+        .register_plugin(Box::new(PocCommands {
+            executor: scripts.executor,
+        }))
         .register_plugin(Box::new(ca_plugin));
+    if let Some(commands) = scripts.commands {
+        builder = builder.register_plugin(commands);
+    }
 
     Ok(Assembled {
         proxy: builder.build()?,
         ca,
+        listening,
     })
 }
 
@@ -110,7 +173,12 @@ pub fn build_proxy_with(cfg: &Config, features: &Features) -> anyhow::Result<Pro
 /// A plugin that registers the `poc.build` and `poc.run` commands. The poc crate
 /// exposes free `register` functions rather than a plugin; this adapts them into
 /// the one `load`-driven registration path the builder uses.
-struct PocCommands;
+///
+/// With a script executor, `poc.run` dispatches `script` steps through the Rhai
+/// tier; without one it is the declarative M1 command.
+struct PocCommands {
+    executor: Option<Arc<dyn aitm_poc::ScriptStepExecutor>>,
+}
 
 impl Plugin for PocCommands {
     fn name(&self) -> &str {
@@ -119,7 +187,11 @@ impl Plugin for PocCommands {
 
     fn load(&mut self, reg: &mut Registry) {
         aitm_poc::builder::register(reg);
-        aitm_poc::runner::register(reg);
+        match self.executor.clone() {
+            Some(exec) => aitm_poc::runner::register_with_executor(reg, exec),
+            None => aitm_poc::runner::register(reg),
+        }
+        aitm_poc::library::register(reg);
     }
 }
 
