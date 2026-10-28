@@ -108,5 +108,31 @@ import Testing
 
         let ping = WSFrameDetail(direction: .clientToServer, opcode: "ping", length: 0)
         #expect(ping.preview == "Ping")
+
+        // A text frame whose bytes are not valid UTF-8 reports its size, not "(empty)".
+        let badText = WSFrameDetail(direction: .serverToClient, opcode: "text", length: 4,
+                                    data: Data([0xFF, 0xFE, 0xFD, 0xFC]))
+        #expect(badText.preview == "4 bytes")
+    }
+
+    @Test func clockParsesVariableFractionalPrecision() {
+        // The core (`time` crate) emits 0 to 9 fractional digits; all must parse to a clock.
+        #expect(Format.clock(rfc3339: "2026-10-28T11:04:58Z") != nil)
+        #expect(Format.clock(rfc3339: "2026-10-28T11:04:58.1Z") != nil)
+        #expect(Format.clock(rfc3339: "2026-10-28T11:04:58.123Z") != nil)
+        #expect(Format.clock(rfc3339: "2026-10-28T11:04:58.123456789Z") != nil)
+        #expect(Format.clock(rfc3339: "not a timestamp") == nil)
+        // The clock is wall-clock HH:MM:SS.mmm; the millisecond truncates to three digits.
+        let threeAndNine = (Format.clock(rfc3339: "2026-10-28T11:04:58.123Z"),
+                            Format.clock(rfc3339: "2026-10-28T11:04:58.123999999Z"))
+        #expect(threeAndNine.0 == threeAndNine.1)
+    }
+
+    @Test func directionFilterKeepsOneSide() {
+        let sent = WSFrameDetail(direction: .clientToServer, opcode: "text", length: 1)
+        let received = WSFrameDetail(direction: .serverToClient, opcode: "text", length: 1)
+        #expect(WSDirectionFilter.both.keeps(sent) && WSDirectionFilter.both.keeps(received))
+        #expect(WSDirectionFilter.sent.keeps(sent) && !WSDirectionFilter.sent.keeps(received))
+        #expect(WSDirectionFilter.received.keeps(received) && !WSDirectionFilter.received.keeps(sent))
     }
 }

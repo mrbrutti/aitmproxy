@@ -118,9 +118,11 @@ public struct WSFrameDetail: Hashable, Sendable {
     public var preview: String {
         switch opcode {
         case "text":
-            guard let text, !text.isEmpty else { return "(empty)" }
-            let firstLine = text.split(whereSeparator: \.isNewline).first.map(String.init) ?? text
-            return firstLine
+            if let text, !text.isEmpty {
+                return text.split(whereSeparator: \.isNewline).first.map(String.init) ?? text
+            }
+            // A text frame whose bytes are not valid UTF-8 still has a payload.
+            return length == 0 ? "(empty)" : "\(length) bytes"
         case "ping": return "Ping"
         case "pong": return "Pong"
         case "close": return "Close"
@@ -183,4 +185,17 @@ public struct WSDetail: Hashable, Sendable {
 
     public var sentCount: Int { frames.filter { $0.direction == .clientToServer }.count }
     public var receivedCount: Int { frames.filter { $0.direction == .serverToClient }.count }
+}
+
+/// The Sent | Received | Both filter over a WebSocket frame stream (S-045).
+public enum WSDirectionFilter: String, CaseIterable, Identifiable, Sendable {
+    case both = "Both", sent = "Sent", received = "Received"
+    public var id: String { rawValue }
+    public func keeps(_ frame: WSFrameDetail) -> Bool {
+        switch self {
+        case .both: true
+        case .sent: frame.direction == .clientToServer
+        case .received: frame.direction == .serverToClient
+        }
+    }
 }

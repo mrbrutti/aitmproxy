@@ -33,8 +33,6 @@ struct WebSocketInspector: View {
                 } second: {
                     frameBody(frames(detail)).environment(session).themed()
                 }
-                // A different WebSocket flow starts at its first frame.
-                .onChange(of: detail.id) { selected = 0 }
             }
         } else {
             LoadingLines()
@@ -67,19 +65,6 @@ struct WebSocketInspector: View {
 private enum WSBodyTab: Hashable, CustomStringConvertible {
     case body
     var description: String { "Body" }
-}
-
-/// The Sent | Received | Both filter over the frame stream (S-045).
-enum WSDirectionFilter: String, CaseIterable, Identifiable {
-    case both = "Both", sent = "Sent", received = "Received"
-    var id: String { rawValue }
-    func keeps(_ frame: WSFrameDetail) -> Bool {
-        switch self {
-        case .both: true
-        case .sent: frame.direction == .clientToServer
-        case .received: frame.direction == .serverToClient
-        }
-    }
 }
 
 /// The frames table: a direction filter over one tappable row per message.

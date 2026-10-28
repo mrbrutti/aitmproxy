@@ -16,7 +16,9 @@ struct InspectorView: View {
                     Rule()
                     if row.kind == .websocket {
                         // A WebSocket is a message stream, not a request/response pair (S-045).
-                        WebSocketInspector(row: row, detail: session.focusedWSDetail).environment(session).themed()
+                        // `.id(row.id)` gives each flow a fresh frame selection and filter.
+                        WebSocketInspector(row: row, detail: session.focusedWSDetail)
+                            .id(row.id).environment(session).themed()
                     } else {
                         // A real split: the operator drags the divider; the position is remembered.
                         SplitPane(axis: .vertical, firstMinimum: 240, secondMinimum: 240, initialSecondFraction: 0.5,
