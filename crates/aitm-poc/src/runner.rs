@@ -687,7 +687,13 @@ impl Command for PocRunCommand {
             }
         }
 
-        let result = futures::executor::block_on(StdPocRunner::new().run(&poc, bindings, host))?;
+        // Write artifacts under the configured PoC output dir when set, so a
+        // remote surface can read them back via `poc.artifact`; else temp.
+        let runner = match host.config().and_then(|c| c.poc.out_dir.clone()) {
+            Some(dir) => StdPocRunner::with_output_dir(dir),
+            None => StdPocRunner::new(),
+        };
+        let result = futures::executor::block_on(runner.run(&poc, bindings, host))?;
 
         let mut obj = std::collections::BTreeMap::new();
         obj.insert("passed".to_string(), Value::Bool(result.passed));

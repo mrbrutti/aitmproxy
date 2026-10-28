@@ -54,8 +54,14 @@ impl Default for Config {
 pub struct PocConfig {
     /// When set, `poc.run` only loads a PoC file that resolves (canonicalized)
     /// to a path under this directory. `None` (the default) imposes no
-    /// confinement — a PoC may be loaded from any path, as before.
+    /// confinement — a PoC may be loaded from any path, as before. `poc.list`
+    /// and `poc.get` enumerate/read the PoC library under this directory.
     pub dir: Option<PathBuf>,
+    /// Where `poc.run` writes its artifacts (the YAML copy and screenshot).
+    /// `None` (the default) writes to the system temp directory as before.
+    /// `poc.artifact` only serves files confined to this directory, so a
+    /// remote/web surface can read run artifacts safely.
+    pub out_dir: Option<PathBuf>,
 }
 
 /// Scope configuration. Deny-by-default: an empty list means nothing is active.

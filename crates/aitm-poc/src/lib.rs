@@ -9,6 +9,7 @@
 pub mod builder;
 pub mod dsl;
 pub mod extract;
+pub mod library;
 pub mod matcher;
 pub mod model;
 pub mod runner;

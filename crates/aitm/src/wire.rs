@@ -129,6 +129,7 @@ impl Plugin for PocCommands {
     fn load(&mut self, reg: &mut Registry) {
         aitm_poc::builder::register(reg);
         aitm_poc::runner::register(reg);
+        aitm_poc::library::register(reg);
     }
 }
 
