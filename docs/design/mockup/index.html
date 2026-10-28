@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aitmproxy — operator UI reference mockup</title>
+<style>
+/* ------------------------------------------------------------------
+   Tokens: mirrors docs/design/tokens.json (color.*, typography.*, size.*).
+   Light values in :root; dark overrides on [data-theme=dark].
+   ------------------------------------------------------------------ */
+:root {
+  --page:#F7F8FA; --surface:#FFFFFF; --raised:#F3F4F6; --active:#E8EEFB; --hover:#F3F4F6; --inverse:#1D1F20;
+  --border:#E5E7EB; --rule:#F0F1F3; --control:#D1D5DB;
+  --text:#111827; --text-2:#4B5563; --text-3:#616A78; --on-accent:#FFFFFF; --on-inverse:#FFFFFF; --link:#1D4ED8;
+  --accent:#2563EB; --accent-deep:#1D4ED8; --accent-tint:#DBEAFE;
+  --intercept:#D97706; --intercept-deep:#B45309; --intercept-tint:#FEF3C7; --on-intercept:#1F1300;
+  --agent:#0D9488; --agent-deep:#0F766E; --agent-tint:#CCFBF1;
+  --m-get-fg:#1D4ED8; --m-get-bg:#DBEAFE; --m-post-fg:#15803D; --m-post-bg:#DCFCE7; --m-put-fg:#B45309; --m-put-bg:#FEF3C7;
+  --m-patch-fg:#C2410C; --m-patch-bg:#FFEDD5; --m-delete-fg:#B91C1C; --m-delete-bg:#FEE2E2; --m-grey-fg:#4B5563; --m-grey-bg:#F3F4F6;
+  --m-ws-fg:#6D28D9; --m-ws-bg:#EDE9FE; /* taste-skill-ignore: violet is the WebSocket/1xx DATA hue (Proxyman convention), not the accent */
+  --s1:#6D28D9; --s2:#15803D; --s3:#0369A1; --s4:#B45309; --s5:#B91C1C; --s-pending:#B45309; --s-killed:#616A78; /* taste-skill-ignore: 1xx status hue */
+  --sev-high-fg:#B91C1C; --sev-high-bg:#FEE2E2;
+  --syn-key:#9D174D; --syn-str:#B45309; --syn-num:#15803D; --syn-bool:#6D28D9; --syn-punct:#6B7280; --syn-bracket:#A16207; --syn-ln:#9CA3AF; --syn-line:#F3F4F6; /* taste-skill-ignore: syntax token colours; line numbers are a gutter, not text */
+  --shadow-floating:0 8px 24px rgba(17,24,39,.12), 0 1px 2px rgba(17,24,39,.08);
+  --font-ui:-apple-system,"SF Pro Text",Inter,system-ui,"Segoe UI",sans-serif;
+  --font-data:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+  --row:28px; --toolbar:44px; --chipbar:36px; --colhead:28px; --summary:40px; --tabbar:36px; --interceptbar:40px; --statusbar:28px; --sidebar:240px;
+  --ease-out:cubic-bezier(.23,1,.32,1);
+}
+[data-theme=dark] {
+  --page:#161618; --surface:#1E1E20; --raised:#262628; --active:#2B3344; --hover:#232325; --inverse:#F5F5F7;
+  --border:#2E2E31; --rule:#252527; --control:#45454A;
+  --text:#E6E6E8; --text-2:#B4B4B8; --text-3:#8E8E93; --on-accent:#0B1220; --on-inverse:#111111; --link:#7DB2F8;
+  --accent:#60A5FA; --accent-deep:#3B82F6; --accent-tint:#1E2A44;
+  --intercept:#F5A524; --intercept-deep:#FBBF24; --intercept-tint:#3A2E12; --on-intercept:#1F1300;
+  --agent:#2DD4BF; --agent-deep:#5EEAD4; --agent-tint:#113A36;
+  --m-get-fg:#93C5FD; --m-get-bg:#1E2A44; --m-post-fg:#86EFAC; --m-post-bg:#14322A; --m-put-fg:#FCD34D; --m-put-bg:#3A2E12;
+  --m-patch-fg:#FDBA74; --m-patch-bg:#3B2516; --m-delete-fg:#FCA5A5; --m-delete-bg:#3B1C1C; --m-grey-fg:#B4B4B8; --m-grey-bg:#2A2A2D;
+  --m-ws-fg:#C4B5FD; --m-ws-bg:#2E2550;
+  --s1:#C4B5FD; --s2:#4ADE80; --s3:#7DD3FC; --s4:#FCD34D; --s5:#F87171; --s-pending:#F5A524; --s-killed:#8E8E93;
+  --sev-high-fg:#F87171; --sev-high-bg:#3B1C1C;
+  --syn-key:#E58BC9; --syn-str:#E8B86D; --syn-num:#7FD88F; --syn-bool:#C4B5FD; --syn-punct:#8E8E93; --syn-bracket:#E5C07B; --syn-ln:#5C5C62; --syn-line:#232325;
+  --shadow-floating:0 8px 24px rgba(0,0,0,.5), 0 1px 2px rgba(0,0,0,.4);
+}
+
+/* ---------- base ---------- */
+*,*::before,*::after{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--page);color:var(--text);font:13px/1.45 var(--font-ui);-webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums}
+button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer}
+button:active{transform:scale(.97)}
+button,.chip,.tab{transition:background-color 100ms ease,color 100ms ease,transform 120ms var(--ease-out)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:1px;border-radius:4px}
+.mono{font-family:var(--font-data)}
+.muted{color:var(--text-2)}
+.faint{color:var(--text-3)}
+svg.i{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none}
+svg.i.sm{width:12px;height:12px}
+
+/* ---------- shell ---------- */
+.app{height:100vh;display:grid;grid-template-columns:var(--sidebar) 1fr;grid-template-rows:1fr var(--statusbar);background:var(--surface)}
+.sidebar{grid-row:1/2;border-right:1px solid var(--border);display:flex;flex-direction:column;min-width:0}
+.main{grid-row:1/2;display:grid;grid-template-rows:var(--toolbar) var(--chipbar) minmax(0,1fr) var(--interceptbar) minmax(0,1.15fr);min-width:0}
+.statusbar{grid-column:1/-1;grid-row:2/3;border-top:1px solid var(--border);background:var(--raised);display:flex;align-items:center;gap:8px;padding:0 12px;font-size:12px;color:var(--text-2)}
+
+/* ---------- sidebar ---------- */
+.brand{height:var(--toolbar);display:flex;align-items:center;gap:8px;padding:0 14px;border-bottom:1px solid var(--border)}
+.mark{width:16px;height:16px;color:var(--accent)}
+.brand h1{font-size:13px;font-weight:500;margin:0;letter-spacing:0}
+.brand .ver{margin-left:auto;font-size:11px;color:var(--text-3)}
+.nav{flex:1;overflow:auto;padding:8px 8px 0}
+.group{font-size:12px;color:var(--text-2);padding:12px 8px 4px}
+.item{display:flex;align-items:center;gap:8px;height:28px;padding:0 8px;border-radius:6px;color:var(--text);font-size:13px;width:100%;text-align:left}
+.item:hover{background:var(--hover)}
+.item[aria-current]{background:var(--active);font-weight:500}
+.item .chev{color:var(--text-3)}
+.item .count{margin-left:auto;font-size:12px;color:var(--text-2)}
+.item .count.q{color:var(--text);background:var(--raised);border-radius:999px;padding:0 6px;min-width:18px;text-align:center;line-height:18px}
+.item .count.agent{color:var(--agent-deep);background:var(--agent-tint)}
+.item .count.paused{color:var(--intercept-deep);background:var(--intercept-tint)}
+.item.sub{padding-left:28px;font-weight:400}
+.appdot{width:16px;height:16px;border-radius:4px;background:var(--raised);border:1px solid var(--control);flex:none;display:grid;place-items:center;font:500 11px/1 var(--font-ui);color:var(--text-2)}
+.sidefilter{margin:8px;height:28px;display:flex;align-items:center;gap:8px;padding:0 10px;border:1px solid var(--control);border-radius:6px;color:var(--text-3);font-size:13px}
+.sidefilter kbd{margin-left:auto}
+kbd{font:11px var(--font-ui);color:var(--text-3)}
+
+/* ---------- toolbar ---------- */
+.toolbar{display:flex;align-items:center;gap:6px;padding:0 12px;border-bottom:1px solid var(--border)}
+.tb{height:28px;min-width:28px;padding:0 6px;border-radius:6px;display:inline-flex;align-items:center;justify-content:center;gap:6px;color:var(--text-2)}
+.tb:hover{background:var(--hover);color:var(--text)}
+.tb.on{color:var(--text)}
+.spacer{flex:1}
+.listen{height:28px;display:inline-flex;align-items:center;gap:8px;padding:0 12px 0 10px;border-radius:999px;background:var(--raised);font-size:12px;color:var(--text-2)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--s2);flex:none}
+.dot.armed{background:var(--intercept)}
+.listen b{font-weight:500;color:var(--text)}
+.agent-toggle{height:28px;display:inline-flex;align-items:center;gap:8px;padding:0 10px;border-radius:6px;border:1px solid var(--control);color:var(--text);font-size:12px}
+.agent-toggle .sw{width:26px;height:16px;border-radius:999px;background:var(--agent);position:relative;flex:none}
+.agent-toggle .sw::after{content:"";position:absolute;top:2px;right:2px;width:12px;height:12px;border-radius:50%;background:#fff}
+.agent-toggle .n{font-size:11px;color:var(--agent-deep);background:var(--agent-tint);border-radius:999px;padding:0 6px;line-height:16px}
+.seg{display:inline-flex;border:1px solid var(--control);border-radius:6px;overflow:hidden}
+.seg .tb{border-radius:0;min-width:30px;height:26px}
+.seg .tb.on{background:var(--raised)}
+
+/* ---------- chip bar ---------- */
+.chips{display:flex;align-items:center;gap:2px;padding:0 10px;border-bottom:1px solid var(--border);overflow:hidden;white-space:nowrap}
+.chip{height:22px;padding:0 8px;border-radius:999px;font-size:12px;color:var(--text-2)}
+.chip:hover{color:var(--text)}
+.chip.on{background:var(--raised);color:var(--text);font-weight:500}
+.sep{width:1px;height:14px;background:var(--border);margin:0 6px;flex:none}
+.chips .more{margin-left:auto;color:var(--text-3)}
+
+/* ---------- flow table ---------- */
+.flows{overflow:auto;position:relative}
+table{border-collapse:collapse;width:100%;min-width:1180px;font-family:var(--font-data);font-size:13px}
+thead th{position:sticky;top:0;background:var(--surface);height:var(--colhead);font:12px var(--font-ui);font-weight:400;color:var(--text-2);text-align:left;padding:0 8px;border-bottom:1px solid var(--border);white-space:nowrap}
+thead th.num,td.num{text-align:right}
+thead th.sort::after{content:" ↑";color:var(--text-3)}
+tbody tr{height:var(--row)}
+tbody td{padding:0 8px;border-bottom:1px solid var(--rule);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
+tbody tr:hover td{background:var(--hover)}
+tbody tr[aria-selected] td{background:var(--active)}
+tbody tr.paused td:first-child{box-shadow:inset 2px 0 0 var(--intercept)} /* taste-skill-ignore: a 2px left edge, not a shadow */
+tbody tr.agent td:first-child{box-shadow:inset 2px 0 0 var(--agent)} /* taste-skill-ignore: a 2px left edge, not a shadow */
+tbody tr.oos td{color:var(--text-3)}
+tbody tr.killed td.url{text-decoration:line-through;color:var(--text-3)}
+td.c-dot{width:24px;text-align:center;padding:0}
+td.c-dot .dot{display:inline-block;vertical-align:middle}
+td.c-dot .dot.p{background:var(--intercept)} /* the dot is a graphic (3:1 rule); the pending text uses --s-pending */
+td.c-dot .dot.e{background:var(--s5)}
+td.c-dot .dot.k{background:var(--s-killed)}
+td.c-num{width:44px;color:var(--text-2);text-align:right}
+td.url{max-width:0;width:46%}
+td.url .host{color:var(--text)}
+td.url .path{color:var(--link)}
+td.url .q{color:var(--text-3)}
+td.client{font-family:var(--font-ui);color:var(--text-2);width:104px}
+td.client .appdot{display:inline-grid;vertical-align:-3px;margin-right:6px}
+.badge{display:inline-block;height:18px;line-height:18px;padding:0 6px;border-radius:4px;font:600 11px/18px var(--font-data);text-transform:uppercase;letter-spacing:0;vertical-align:middle;white-space:nowrap}
+.b-get{color:var(--m-get-fg);background:var(--m-get-bg)} .b-post{color:var(--m-post-fg);background:var(--m-post-bg)}
+.b-put{color:var(--m-put-fg);background:var(--m-put-bg)} .b-patch{color:var(--m-patch-fg);background:var(--m-patch-bg)}
+.b-delete{color:var(--m-delete-fg);background:var(--m-delete-bg)} .b-grey{color:var(--m-grey-fg);background:var(--m-grey-bg)}
+.b-ws{color:var(--m-ws-fg);background:var(--m-ws-bg)}
+.b-paused{color:var(--intercept-deep);background:var(--intercept-tint);text-transform:none}
+.b-200{color:var(--s2);background:transparent;padding:0} .st{font-weight:500}
+.st.s1{color:var(--s1)} .st.s2{color:var(--s2)} .st.s3{color:var(--s3)} .st.s4{color:var(--s4)} .st.s5{color:var(--s5)} .st.sp{color:var(--s-pending)} .st.sk{color:var(--s-killed)}
+td.time,td.dur,td.sz{color:var(--text-2)}
+td.ssl{width:40px;text-align:center;color:var(--text-2)}
+td.ssl .warn{color:var(--s4)}
+td.edited{width:52px;text-align:center;color:var(--text-2)}
+td.origin{width:60px;font-family:var(--font-ui);font-size:11px}
+td.origin .tag{color:var(--agent-deep);background:var(--agent-tint);border-radius:4px;padding:1px 5px}
+td.mark{width:20px;padding:0 4px}
+td.mark i{display:block;width:6px;height:16px;border-radius:2px;margin:0 auto}
+
+/* ---------- intercept bar ---------- */
+.intercept{display:flex;align-items:center;gap:10px;padding:0 12px;background:var(--intercept);color:var(--on-intercept);border-top:1px solid var(--border);border-bottom:1px solid var(--border);font-size:13px}
+.intercept .pulse{width:8px;height:8px;border-radius:50%;background:currentColor;animation:pulse 1.2s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.45}}
+@media (prefers-reduced-motion:reduce){.intercept .pulse{animation:none}}
+.intercept b{font-weight:600}
+.intercept .target{font-family:var(--font-data);opacity:.9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.intercept .actions{margin-left:auto;display:flex;gap:6px}
+.btn{height:26px;padding:0 10px;border-radius:6px;font-size:12px;font-weight:500;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.btn kbd{color:inherit;opacity:.85}
+.btn.primary{background:var(--inverse);color:var(--on-inverse)}
+.btn.ghost{background:rgba(0,0,0,.12);color:var(--on-intercept)}
+.btn.ghost:hover{background:rgba(0,0,0,.2)}
+.btn.outline{border:1px solid var(--control);color:var(--text)}
+.btn.outline:hover{background:var(--hover)}
+
+/* ---------- inspector ---------- */
+.inspector{display:grid;grid-template-rows:var(--summary) minmax(0,1fr);min-height:0}
+.summary{display:flex;align-items:center;gap:10px;padding:0 12px;border-bottom:1px solid var(--border);font-family:var(--font-data);font-size:13px;overflow:hidden}
+.summary .url{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.summary .url .path{color:var(--link)}
+.summary .meta{margin-left:auto;display:flex;gap:14px;color:var(--text-2);font-size:12px;white-space:nowrap}
+.summary .meta b{color:var(--text);font-weight:500}
+.pill{display:inline-block;height:20px;line-height:20px;padding:0 8px;border-radius:4px;font:600 11px/20px var(--font-data);text-transform:uppercase}
+.pill.ok{color:var(--m-post-fg);background:var(--m-post-bg)}
+.panes{display:grid;grid-template-columns:1fr 1fr;min-height:0}
+.pane{display:grid;grid-template-rows:var(--tabbar) minmax(0,1fr);min-width:0}
+.pane+.pane{border-left:1px solid var(--border)}
+.tabs{display:flex;align-items:center;gap:2px;padding:0 12px;border-bottom:1px solid var(--border);white-space:nowrap;overflow:hidden}
+.tabs h2{font-size:16px;font-weight:600;margin:0 10px 0 0}
+.tab{height:var(--tabbar);padding:0 8px;font-size:13px;color:var(--text-2);position:relative}
+.tab:hover{color:var(--text)}
+.tab.on{color:var(--accent);font-weight:500}
+.tab.on::after{content:"";position:absolute;left:8px;right:8px;bottom:-1px;height:2px;background:var(--accent)}
+.tabs .plus{color:var(--text-3)}
+.tabs .right{margin-left:auto;display:flex;gap:4px;align-items:center}
+.fmt{height:24px;padding:0 8px;border-radius:6px;border:1px solid var(--control);font-size:12px;color:var(--text);display:inline-flex;align-items:center;gap:4px}
+.code{overflow:auto;font:13px/20px var(--font-data);padding:8px 0;counter-reset:ln}
+.code .l{display:flex;min-height:20px;padding-right:16px}
+.code .l.cur{background:var(--syn-line)}
+.code .l::before{counter-increment:ln;content:counter(ln);width:44px;flex:none;text-align:right;padding-right:14px;color:var(--syn-ln);user-select:none}
+.code .l.cur::before{color:var(--text-2)}
+.code .fold{width:12px;flex:none;color:var(--text-3);margin-left:-12px}
+.code .l.edited{box-shadow:inset 2px 0 0 var(--intercept)}
+.k{color:var(--syn-key)} .s{color:var(--syn-str)} .n{color:var(--syn-num)} .bo{color:var(--syn-bool)} .p{color:var(--syn-punct)} .br{color:var(--syn-bracket)}
+.mth{color:var(--m-post-fg)} .ver{color:var(--syn-str)}
+.hint{font:12px var(--font-ui);color:var(--text-3);padding:4px 12px 4px 58px}
+
+/* ---------- status bar ---------- */
+.statusbar .btn.small{height:20px;padding:0 8px;background:var(--surface);border:1px solid var(--control);font-weight:400;color:var(--text-2)}
+.statusbar .center{margin:0 auto;display:flex;gap:14px}
+.statusbar .center .paused{color:var(--intercept-deep)}
+.statusbar .right{display:flex;gap:14px;font-family:var(--font-data)}
+.statusbar .bus{display:inline-flex;align-items:center;gap:6px}
+
+/* ---------- mockup controls (not part of the product) ---------- */
+.mock-controls{display:flex;align-items:center;gap:4px;margin-left:16px;padding-left:12px;border-left:1px solid var(--border);font-size:11px}
+.mock-controls .btn{height:20px;padding:0 6px;font-size:11px;font-weight:400}
+.mock-controls .btn.on{background:var(--active);color:var(--text)}
+
+@media (max-width:1100px){.app{grid-template-columns:1fr}.sidebar{display:none}}
+</style>
+</head>
+<body>
+<div class="app" data-ui>
+
+  <!-- ================= sidebar ================= -->
+  <aside class="sidebar">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 16 16" aria-hidden="true"><path d="M2 3l4 5-4 5M14 3l-4 5 4 5" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/><circle cx="8" cy="8" r="1.7" fill="currentColor"/></svg>
+      <h1>aitmproxy</h1>
+      <span class="ver mono">0.3.0</span>
+    </div>
+    <nav class="nav" aria-label="Sources">
+      <div class="group">Working</div>
+      <button class="item"><svg class="i sm" viewBox="0 0 24 24"><path d="M12 17v5M9 3h6l-1 7 3 3H7l3-3z"/></svg>Pinned<span class="count">2</span></button>
+      <button class="item sub"><span class="appdot">◎</span>api.shop-staging.test</button>
+      <button class="item sub"><span class="appdot">◎</span>auth.shop-staging.test</button>
+      <button class="item"><svg class="i sm" viewBox="0 0 24 24"><path d="M4 7h16v12H4zM4 7l2-4h12l2 4"/></svg>Saved<span class="count">3</span></button>
+
+      <div class="group">All</div>
+      <button class="item" aria-current="true"><svg class="i sm" viewBox="0 0 24 24"><path d="M4 6h16v12H4z"/><path d="M4 10h16"/></svg>Apps<span class="count">4</span></button>
+      <button class="item sub"><span class="appdot">o</span>obscura<span class="count">31</span></button>
+      <button class="item sub"><span class="appdot">$</span>curl<span class="count">12</span></button>
+      <button class="item sub"><span class="appdot">S</span>Safari<span class="count">9</span></button>
+      <button class="item sub"><span class="appdot">P</span>python3<span class="count">4</span></button>
+      <button class="item"><svg class="i sm" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 010 18M12 3a14 14 0 000 18"/></svg>Domains<span class="count">7</span></button>
+
+      <div class="group">aitmproxy</div>
+      <button class="item"><svg class="i sm" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>Scope<span class="count q">3</span></button>
+      <button class="item"><svg class="i sm" viewBox="0 0 24 24"><path d="M5 21V4h12l-2 4 2 4H5"/></svg>Findings<span class="count q">2</span></button>
+      <button class="item"><svg class="i sm" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 010 18M12 3a14 14 0 000 18"/></svg>Browser<span class="count">1 tab</span></button>
+      <button class="item"><svg class="i sm" viewBox="0 0 24 24"><path d="M8 4l-5 8 5 8M16 4l5 8-5 8"/></svg>Scripts<span class="count">2 active</span></button>
+      <button class="item"><svg class="i sm" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>Agent<span class="count agent">14/min</span></button>
+    </nav>
+    <div class="sidefilter"><svg class="i sm" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>Filter<kbd>⌘⇧F</kbd></div>
+  </aside>
+
+  <!-- ================= main ================= -->
+  <section class="main">
+
+    <!-- toolbar -->
+    <header class="toolbar">
+      <button class="tb" title="Toggle sidebar"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg></button>
+      <button class="tb on" title="Pause capture"><svg class="i" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></svg></button>
+      <button class="tb" title="Compose (n)"><svg class="i" viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z"/></svg></button>
+      <button class="tb" title="Clear"><svg class="i" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg></button>
+      <span class="spacer"></span>
+      <div class="listen"><span class="dot armed"></span><span><b>aitmproxy</b> · listening <b class="mono">127.0.0.1:8080</b> · HTTP/2 · intercept armed</span></div>
+      <span class="spacer"></span>
+      <button class="agent-toggle" title="Agent policy: all tools"><span class="sw" aria-hidden="true"></span>Agent<span class="n">14</span></button>
+      <button class="tb" title="Command palette (⌘K)"><svg class="i" viewBox="0 0 24 24"><path d="M18 3a3 3 0 00-3 3v12a3 3 0 103-3H6a3 3 0 103 3V6a3 3 0 10-3 3h12a3 3 0 100-6z"/></svg></button>
+      <div class="seg" role="group" aria-label="Layout">
+        <button class="tb on" title="Inspector below"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 13h18"/></svg></button>
+        <button class="tb" title="Inspector right"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M13 4v16"/></svg></button>
+        <button class="tb" title="Split view"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 4v16M3 12h18"/></svg></button>
+      </div>
+    </header>
+
+    <!-- content-type chips -->
+    <div class="chips" role="tablist" aria-label="Quick filter">
+      <button class="chip on">All</button><span class="sep"></span>
+      <button class="chip">HTTP</button><button class="chip">HTTPS</button><button class="chip">WebSocket</button><span class="sep"></span>
+      <button class="chip">h1</button><button class="chip">h2</button><span class="sep"></span>
+      <button class="chip">JSON</button><button class="chip">Form</button><button class="chip">XML</button><button class="chip">JS</button><button class="chip">CSS</button><button class="chip">GraphQL</button><button class="chip">Document</button><button class="chip">Media</button><button class="chip">Other</button>
+      <button class="chip more" title="Filter bar (⌘F)">Filters ▾</button>
+    </div>
+
+    <!-- flow list -->
+    <div class="flows">
+      <table aria-label="Flows">
+        <thead><tr>
+          <th></th><th class="num">#</th><th>URL</th><th>Client</th><th>Method</th><th>Status</th><th class="sort">Time</th><th class="num">Duration</th><th class="num">Request</th><th class="num">Response</th><th>SSL</th><th>Edited</th><th>Origin</th><th></th>
+        </tr></thead>
+        <tbody>
+          <tr><td class="c-dot"><span class="dot"></span></td><td class="c-num">41</td><td class="url"><span class="host">https://api.shop-staging.test</span><span class="path">/api/products</span><span class="q">?category=electronics&amp;limit=20</span></td><td class="client"><span class="appdot">o</span>obscura</td><td><span class="badge b-get">GET</span></td><td><span class="st s2">200</span></td><td class="time">11:04:58.120</td><td class="dur num">89 ms</td><td class="sz num">412 B</td><td class="sz num">18.2 KB</td><td class="ssl" title="Decrypted (MITM)"><svg class="i sm" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 017.5-2"/></svg></td><td class="edited"></td><td class="origin"></td><td class="mark"></td></tr>
+          <tr><td class="c-dot"><span class="dot"></span></td><td class="c-num">42</td><td class="url"><span class="host">https://api.shop-staging.test</span><span class="path">/api/cart/items/42</span></td><td class="client"><span class="appdot">o</span>obscura</td><td><span class="badge b-put">PUT</span></td><td><span class="st s2">200</span></td><td class="time">11:04:59.301</td><td class="dur num">67 ms</td><td class="sz num">1.1 KB</td><td class="sz num">640 B</td><td class="ssl" title="Decrypted (MITM)"><svg class="i sm" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 017.5-2"/></svg></td><td class="edited"></td><td class="origin"></td><td class="mark"><i style="background:var(--s3)"></i></td></tr>
+          <tr><td class="c-dot"><span class="dot"></span></td><td class="c-num">43</td><td class="url"><span class="host">https://cdn.shop-staging.test</span><span class="path">/assets/app.3f1c.js</span></td><td class="client"><span class="appdot">o</span>obscura</td><td><span class="badge b-get">GET</span></td><td><span class="st s3">304</span></td><td class="time">11:05:00.014</td><td class="dur num">21 ms</td><td class="sz num">388 B</td><td class="sz num">0 B</td><td class="ssl" title="Decrypted (MITM)"><svg class="i sm" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 017.5-2"/></svg></td><td class="edited"></td><td class="origin"></td><td class="mark"></td></tr>
+          <tr class="oos"><td class="c-dot"><span class="dot"></span></td><td class="c-num">44</td><td class="url"><span class="host">https://telemetry.vendor-analytics.example</span><span class="path">/v2/batch</span></td><td class="client"><span class="appdot">S</span>Safari</td><td><span class="badge b-post">POST</span></td><td><span class="st s2">204</span></td><td class="time">11:05:01.772</td><td class="dur num">143 ms</td><td class="sz num">6.4 KB</td><td class="sz num">0 B</td><td class="ssl" title="Tunnelled — not decrypted (out of scope)"><svg class="i sm" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg></td><td class="edited"></td><td class="origin"></td><td class="mark"></td></tr>
+          <tr><td class="c-dot"><span class="dot e"></span></td><td class="c-num">45</td><td class="url"><span class="host">https://api.shop-staging.test</span><span class="path">/api/orders</span><span class="q">?page=3</span></td><td class="client"><span class="appdot">$</span>curl</td><td><span class="badge b-get">GET</span></td><td><span class="st s5">502</span></td><td class="time">11:05:03.890</td><td class="dur num">1.21 s</td><td class="sz num">402 B</td><td class="sz num">1.9 KB</td><td class="ssl" title="Decrypted (MITM)"><svg class="i sm" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 017.5-2"/></svg></td><td class="edited"></td><td class="origin"></td><td class="mark"></td></tr>
+          <tr class="agent"><td class="c-dot"><span class="dot"></span></td><td class="c-num">46 ↻</td><td class="url"><span class="host">https://api.shop-staging.test</span><span class="path">/api/orders</span><span class="q">?page=3</span></td><td class="client"><span class="appdot">a</span>aitm</td><td><span class="badge b-get">GET</span></td><td><span class="st s2">200</span></td><td class="time">11:05:04.067</td><td class="dur num">412 ms</td><td class="sz num">402 B</td><td class="sz num">22.7 KB</td><td class="ssl" title="Decrypted (MITM)"><svg class="i sm" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 017.5-2"/></svg></td><td class="edited"></td><td class="origin"><span class="tag">agent</span></td><td class="mark"></td></tr>
+          <tr><td class="c-dot"><span class="dot"></span></td><td class="c-num">47</td><td class="url"><span class="host">wss://api.shop-staging.test</span><span class="path">/ws/notifications</span></td><td class="client"><span class="appdot">o</span>obscura</td><td><span class="badge b-ws">WS</span></td><td><span class="st s1">101</span></td><td class="time">11:05:04.966</td><td class="dur num">—</td><td class="sz num">21 ↑</td><td class="sz num">17 ↓</td><td class="ssl" title="Decrypted (MITM)"><svg class="i sm" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 017.5-2"/></svg></td><td class="edited"></td><td class="origin"></td><td class="mark"></td></tr>
+          <tr class="agent"><td class="c-dot"><span class="dot"></span></td><td class="c-num">48</td><td class="url"><span class="host">https://api.shop-staging.test</span><span class="path">/api/search</span><span class="q">?q=%22%3E%3Cimg+src%3Dx+onerror%3Dalert(1)%3E</span></td><td class="client"><span class="appdot">a</span>aitm</td><td><span class="badge b-get">GET</span></td><td><span class="st s2">200</span></td><td class="time">11:05:13.208</td><td class="dur num">149 ms</td><td class="sz num">511 B</td><td class="sz num">9.3 KB</td><td class="ssl" title="Decrypted (MITM)"><svg class="i sm" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 017.5-2"/></svg></td><td class="edited"></td><td class="origin"><span class="tag">agent</span></td><td class="mark"><i style="background:var(--s5)"></i></td></tr>
+          <tr class="killed"><td class="c-dot"><span class="dot k"></span></td><td class="c-num">49</td><td class="url"><span class="host">https://api.shop-staging.test</span><span class="path">/api/account/delete</span></td><td class="client"><span class="appdot">$</span>curl</td><td><span class="badge b-delete">DELETE</span></td><td><span class="st sk">killed</span></td><td class="time">11:05:19.402</td><td class="dur num">—</td><td class="sz num">298 B</td><td class="sz num">—</td><td class="ssl" title="Decrypted (MITM)"><svg class="i sm" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 017.5-2"/></svg></td><td class="edited"></td><td class="origin"></td><td class="mark"></td></tr>
+          <tr class="paused" aria-selected="true"><td class="c-dot"><span class="dot p"></span></td><td class="c-num">50</td><td class="url"><span class="host">https://auth.shop-staging.test</span><span class="path">/api/auth/login</span></td><td class="client"><span class="appdot">$</span>curl</td><td><span class="badge b-post">POST</span></td><td><span class="badge b-paused">Paused</span></td><td class="time">11:05:22.994</td><td class="dur num">—</td><td class="sz num">186 B</td><td class="sz num">—</td><td class="ssl" title="Decrypted (MITM)"><svg class="i sm" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 017.5-2"/></svg></td><td class="edited" title="Edited while paused"><svg class="i sm" viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z"/></svg></td><td class="origin"></td><td class="mark"></td></tr>
+          <tr class="paused"><td class="c-dot"><span class="dot p"></span></td><td class="c-num">51</td><td class="url"><span class="host">https://api.shop-staging.test</span><span class="path">/api/me</span></td><td class="client"><span class="appdot">o</span>obscura</td><td><span class="badge b-get">GET</span></td><td><span class="badge b-paused">Paused</span></td><td class="time">11:05:24.179</td><td class="dur num">—</td><td class="sz num">344 B</td><td class="sz num">—</td><td class="ssl" title="Decrypted (MITM)"><svg class="i sm" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 017.5-2"/></svg></td><td class="edited"></td><td class="origin"></td><td class="mark"></td></tr>
+          <tr><td class="c-dot"><span class="dot p"></span></td><td class="c-num">52</td><td class="url"><span class="host">https://cdn.shop-staging.test</span><span class="path">/assets/hero.webp</span></td><td class="client"><span class="appdot">o</span>obscura</td><td><span class="badge b-get">GET</span></td><td><span class="st sp">—</span></td><td class="time">11:05:34.509</td><td class="dur num">…</td><td class="sz num">371 B</td><td class="sz num">—</td><td class="ssl" title="Decrypted (MITM)"><svg class="i sm" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 017.5-2"/></svg></td><td class="edited"></td><td class="origin"></td><td class="mark"></td></tr>
+          <tr><td class="c-dot"><span class="dot"></span></td><td class="c-num">53</td><td class="url"><span class="host">https://api.shop-staging.test</span><span class="path">/api/cart</span></td><td class="client"><span class="appdot">P</span>python3</td><td><span class="badge b-patch">PATCH</span></td><td><span class="st s4">422</span></td><td class="time">11:05:34.814</td><td class="dur num">121 ms</td><td class="sz num">903 B</td><td class="sz num">212 B</td><td class="ssl" title="Decrypted (MITM)"><svg class="i sm" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 017.5-2"/></svg></td><td class="edited"></td><td class="origin"></td><td class="mark"></td></tr>
+          <tr><td class="c-dot"><span class="dot"></span></td><td class="c-num">54</td><td class="url"><span class="host">https://api.shop-staging.test</span><span class="path">/api/health</span></td><td class="client"><span class="appdot">P</span>python3</td><td><span class="badge b-grey">HEAD</span></td><td><span class="st s2">200</span></td><td class="time">11:05:35.603</td><td class="dur num">25 ms</td><td class="sz num">120 B</td><td class="sz num">0 B</td><td class="ssl" title="Upstream cert pinned — tunnelled"><svg class="i sm warn" viewBox="0 0 24 24"><path d="M12 3l10 18H2zM12 10v5M12 18h.01"/></svg></td><td class="edited"></td><td class="origin"></td><td class="mark"></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- intercept bar -->
+    <div class="intercept" role="status">
+      <span class="pulse" aria-hidden="true"></span>
+      <b>2 paused</b>
+      <span class="target">POST https://auth.shop-staging.test/api/auth/login · edited (1 header)</span>
+      <div class="actions">
+        <button class="btn primary">Apply &amp; Resume <kbd>⌘⏎</kbd></button>
+        <button class="btn ghost">Resume all</button>
+        <button class="btn ghost">Kill <kbd>⌘\</kbd> ▾</button>
+        <button class="btn ghost">Rules…</button>
+        <button class="btn ghost">Disarm <kbd>i</kbd></button>
+      </div>
+    </div>
+
+    <!-- inspector -->
+    <div class="inspector">
+      <div class="summary">
+        <span class="badge b-post">POST</span>
+        <span class="badge b-paused">Paused · request</span>
+        <span class="url"><span class="host">https://auth.shop-staging.test</span><span class="path">/api/auth/login</span></span>
+        <button class="tb" title="Copy URL"><svg class="i sm" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 012-2h10"/></svg></button>
+        <div class="meta"><span>HTTP/2 · TLS 1.3 · h2</span><span>req <b>186 B</b></span><span>client <b>127.0.0.1:52114</b></span><span>in scope</span></div>
+      </div>
+      <div class="panes">
+        <div class="pane">
+          <div class="tabs" role="tablist">
+            <h2>Request</h2>
+            <button class="tab">Headers</button><button class="tab">Query</button><button class="tab">Body</button><button class="tab on">Raw</button><button class="tab">Summary</button><button class="tab">Connection</button>
+            <button class="tab plus" title="Add viewer">+</button>
+            <div class="right"><span class="faint" style="font-size:12px">editing</span></div>
+          </div>
+          <div class="code" aria-label="Request raw, editable">
+            <div class="l"><span class="mth">POST</span>&nbsp;/api/auth/login&nbsp;<span class="ver">HTTP/2</span></div>
+            <div class="l"><span class="k">host</span><span class="p">: </span>auth.shop-staging.test</div>
+            <div class="l"><span class="k">content-type</span><span class="p">: </span>application/json</div>
+            <div class="l"><span class="k">accept</span><span class="p">: </span>*/*</div>
+            <div class="l"><span class="k">user-agent</span><span class="p">: </span>curl/8.7.1</div>
+            <div class="l edited cur"><span class="k">x-forwarded-for</span><span class="p">: </span>127.0.0.1</div>
+            <div class="l"></div>
+            <div class="l"><span class="br">{</span></div>
+            <div class="l">&nbsp;&nbsp;<span class="k">"email"</span><span class="p">: </span><span class="s">"ops@shop-staging.test"</span><span class="p">,</span></div>
+            <div class="l">&nbsp;&nbsp;<span class="k">"password"</span><span class="p">: </span><span class="s">"correct-horse-battery"</span><span class="p">,</span></div>
+            <div class="l">&nbsp;&nbsp;<span class="k">"remember"</span><span class="p">: </span><span class="bo">true</span></div>
+            <div class="l"><span class="br">}</span></div>
+            <div class="hint">1 edit pending · Apply &amp; Resume sends flow.mutate then flow.resume · <span style="text-decoration:underline">Revert to original</span></div>
+          </div>
+        </div>
+        <div class="pane">
+          <div class="tabs" role="tablist">
+            <h2>Response</h2>
+            <button class="tab">Headers</button><button class="tab on">Body</button><button class="tab">Raw</button><button class="tab">JSON</button><button class="tab">Diff</button>
+            <button class="tab plus" title="Add viewer">+</button>
+            <div class="right"><button class="fmt">JSON ▾</button><button class="tb" title="Find in body"><svg class="i sm" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg></button></div>
+          </div>
+          <div class="code" aria-label="Previous response for this endpoint">
+            <div class="hint" style="padding-left:12px">No response yet — the request is paused. Showing the last response to this endpoint (flow 38, 11:04:12) for reference.</div>
+            <div class="l"><span class="fold">▾</span><span class="br">{</span></div>
+            <div class="l">&nbsp;&nbsp;<span class="k">"token"</span><span class="p">: </span><span class="s">"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvcHMiLCJyb2xlIjoiYWRtaW4ifQ.…"</span><span class="p">,</span></div>
+            <div class="l">&nbsp;&nbsp;<span class="k">"expires_in"</span><span class="p">: </span><span class="n">3600</span><span class="p">,</span></div>
+            <div class="l"><span class="fold">▾</span>&nbsp;&nbsp;<span class="k">"user"</span><span class="p">: </span><span class="br">{</span></div>
+            <div class="l">&nbsp;&nbsp;&nbsp;&nbsp;<span class="k">"id"</span><span class="p">: </span><span class="n">1042</span><span class="p">,</span></div>
+            <div class="l">&nbsp;&nbsp;&nbsp;&nbsp;<span class="k">"email"</span><span class="p">: </span><span class="s">"ops@shop-staging.test"</span><span class="p">,</span></div>
+            <div class="l">&nbsp;&nbsp;&nbsp;&nbsp;<span class="k">"role"</span><span class="p">: </span><span class="s">"admin"</span><span class="p">,</span></div>
+            <div class="l">&nbsp;&nbsp;&nbsp;&nbsp;<span class="k">"mfa_enrolled"</span><span class="p">: </span><span class="bo">false</span></div>
+            <div class="l">&nbsp;&nbsp;<span class="br">}</span><span class="p">,</span></div>
+            <div class="l">&nbsp;&nbsp;<span class="k">"set_cookie"</span><span class="p">: </span><span class="s">"session=…; HttpOnly; Secure; SameSite=Lax"</span></div>
+            <div class="l"><span class="br">}</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- status bar -->
+  <footer class="statusbar">
+    <button class="btn small">Clear</button><button class="btn small">Filter</button><button class="btn small">Auto-select</button>
+    <div class="center"><span>1 / 54 rows</span><span class="paused">2 paused</span><span>3 hosts in scope</span><span>2 findings</span></div>
+    <div class="right"><span>196 MB</span><span>↑ 6 KB/s</span><span>↓ 3 KB/s</span><span class="bus"><span class="dot"></span>bus 127.0.0.1:9090</span></div>
+    <!-- mockup-only controls (not part of the product) -->
+    <div class="mock-controls" aria-label="Mockup controls">
+      <span class="faint">mockup:</span>
+      <button class="btn outline" id="t-light">Light</button>
+      <button class="btn outline on" id="t-dark">Dark</button>
+      <button class="btn outline" id="d-dense" title="Row 28px">Dense</button>
+      <button class="btn outline" id="d-default" title="Row 32px">Default</button>
+    </div>
+  </footer>
+</div>
+<script>
+(function(){
+  var root=document.documentElement;
+  function on(id,fn){document.getElementById(id).addEventListener('click',fn)}
+  function theme(t){root.setAttribute('data-theme',t);document.getElementById('t-light').classList.toggle('on',t==='light');document.getElementById('t-dark').classList.toggle('on',t==='dark');history.replaceState(null,'','#'+t)}
+  function row(px,id){root.style.setProperty('--row',px);document.getElementById('d-dense').classList.toggle('on',id==='d-dense');document.getElementById('d-default').classList.toggle('on',id==='d-default')}
+  on('t-light',function(){theme('light')}); on('t-dark',function(){theme('dark')});
+  on('d-dense',function(){row('28px','d-dense')}); on('d-default',function(){row('32px','d-default')});
+  var want=location.hash.slice(1);
+  if(want==='light'||want==='dark') theme(want);
+  else if(window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches) theme('light');
+  row('28px','d-dense');
+})();
+</script>
+</body>
+</html>
