@@ -1,0 +1,26 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "cramped-padding",
+        "value": "*",
+        "files": [
+          "docs/design/mockup/index.html"
+        ],
+        "createdAt": "2026-10-28T04:30:23.544Z",
+        "reason": "lead designer (this session): fixed-height app bars (toolbar, chip bar, intercept bar, summary strip, tab bars) centre their children vertically inside a 28-44px height, giving 8-14px of visible inset; the code viewer's current-line fill runs edge to edge as editors do. Matches the Proxyman reference the owner asked to copy."
+      },
+      {
+        "rule": "pulsing-dot",
+        "value": "*",
+        "files": [
+          "docs/design/mockup/index.html"
+        ],
+        "createdAt": "2026-10-28T04:30:35.953Z",
+        "reason": "lead designer (this session): the intercept dot pulses only while requests are genuinely paused awaiting the operator (live state), stops when disarmed and under prefers-reduced-motion; documented as motion.interceptPulse in docs/design/tokens.json"
+      }
+    ]
+  }
+}
