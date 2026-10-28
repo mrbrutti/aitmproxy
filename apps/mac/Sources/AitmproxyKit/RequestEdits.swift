@@ -64,4 +64,20 @@ public struct RequestEdits: Hashable, Sendable {
         }
         return edits
     }
+
+    /// Header names present in `original` but absent in `edited` — an attempted
+    /// removal. `flow.mutate` only *replaces* headers (it has no removal form yet,
+    /// see `crates/aitm-plugins/src/mutate.rs`), so `diff` cannot encode these and
+    /// a removal would otherwise be a silent no-op. Surfaced so the UI can tell the
+    /// operator a removal will not take effect until the core gains a removal form.
+    public static func removedHeaderNames(from original: HTTPMessage, to edited: HTTPMessage) -> [String] {
+        let kept = Set(edited.headers.map { $0.name.lowercased() })
+        var names: [String] = []
+        for header in original.headers where !kept.contains(header.name.lowercased()) {
+            if !names.contains(where: { $0.caseInsensitiveCompare(header.name) == .orderedSame }) {
+                names.append(header.name)
+            }
+        }
+        return names
+    }
 }

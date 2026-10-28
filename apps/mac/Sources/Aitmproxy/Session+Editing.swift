@@ -51,6 +51,14 @@ extension Session {
 
     func pendingEditCount(_ id: FlowID) -> Int { pendingEdits(id).changeCount }
 
+    /// Header names the draft removed. `flow.mutate` has no removal form yet, so
+    /// these are NOT applied — the UI surfaces them instead of silently dropping
+    /// the action (an operator must never think a header was removed when it wasn't).
+    func removedHeaders(_ id: FlowID) -> [String] {
+        guard let draft = editDrafts[id], let detail = details[id] else { return [] }
+        return RequestEdits.removedHeaderNames(from: detail.request, to: draft)
+    }
+
     /// `Apply & Resume`: mutate with the pending edits, then resume (§4.5).
     func applyAndResume(_ id: FlowID) {
         let edits = pendingEdits(id)

@@ -36,4 +36,20 @@ import Testing
         #expect(edits.changeCount == 2)
         #expect(RequestEdits.diff(from: original, to: original).changeCount == 0)
     }
+
+    @Test func detectsRemovedHeaders() {
+        let original = HTTPMessage(startLine: "GET /x HTTP/2",
+                                   headers: [.init("host", "a.test"), .init("x-debug", "1"), .init("accept", "*/*")])
+        var edited = original
+        edited.headers.removeAll { $0.name == "x-debug" }
+        // flow.mutate can't remove headers yet, so diff encodes nothing for a pure removal…
+        #expect(RequestEdits.diff(from: original, to: edited).changeCount == 0)
+        // …but the removal is detectable so the UI can say it won't take effect.
+        #expect(RequestEdits.removedHeaderNames(from: original, to: edited) == ["x-debug"])
+        #expect(RequestEdits.removedHeaderNames(from: original, to: original).isEmpty)
+        // A changed (not removed) header is not a removal.
+        var changed = original
+        changed.headers[1].value = "2"
+        #expect(RequestEdits.removedHeaderNames(from: original, to: changed).isEmpty)
+    }
 }

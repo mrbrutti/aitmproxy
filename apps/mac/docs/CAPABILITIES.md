@@ -171,7 +171,7 @@ Proxyman's documented feature set (left) against our status. `~` = partial.
 | Breakpoint: pause + edit request (scheme/host/path/method/headers/query/body) | ✅ live (`flow.detail`+`flow.mutate`) |
 | Breakpoint: pause + edit response (status/headers/body) | 🧩 S-041 / F3 |
 | Breakpoint rules (URL/regex/GraphQL), req/resp checkboxes | 🧩 Rules sheet built; core rules = F3 |
-| Raw editor, disable-header, reset to original, templates | ✅ Raw editable + revert (templates ⛔ v1) |
+| Raw editor, disable-header, reset to original, templates | ✅ Raw editable + revert (templates ⛔ v1). Header *removal* needs a core `flow.mutate` removal form — the UI disables the delete ✕ and warns rather than silently no-op (FIXLOG 2026-10-28) |
 | Drop/abort modes (reset/429/503) | ✅ kill drops (closed connection, PR #7); 429/503 modes = F3 |
 | WebSocket breakpoint + compose/inject | 🧩 S-045 + F9 |
 | Map Local, Map Remote, Rewrite, Scripting | ⛔ v1 (Map Local/Remote/Rewrite); scripting = rhai (M3) + F8 surface |
