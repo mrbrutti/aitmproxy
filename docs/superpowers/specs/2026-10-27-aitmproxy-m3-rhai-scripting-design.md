@@ -281,7 +281,10 @@ implemented and marshalled.
 
 Host-function namespaces: `log`, `http`, `browser`, `store`, `scope`, plus the
 shared DSL helpers (`b64_encode`, `url_encode`, `sha256`, `rand_text_alpha`,
-`regex_match`, …) and `option(name)`. Verdict control: `halt()` / `continue()`.
+`regex_match`, …) and `option(name)`. Verdict control: `halt()`; continuing is
+implicit — a hook that does not call `halt()` continues. (There is no
+`continue()` verb: `continue` is a Rhai reserved word and cannot be a function
+name, the same class of constraint as `browser.eval` → `browser.evaluate`.)
 
 **M3 addition (Architect's call): `finding(...)`.** The brief requires scripts to
 be able to *emit findings*. The M1 surface had no verb for it, so M3 adds one
@@ -508,7 +511,8 @@ fn data(&mut ScriptWsMessage) -> rhai::Blob;            // + set_bytes
 fn drop(&mut ScriptWsMessage);
 ```
 
-**Verdict mapping.** `halt()` records `FlowEffect::Halt`; `continue()` is a no-op.
+**Verdict mapping.** `halt()` records `FlowEffect::Halt`; not calling it is
+"continue" (there is no `continue()` verb — `continue` is a Rhai keyword).
 The hook's *return value is not used for the verdict*, so `return halt();`,
 `halt();`, and falling off the end all behave the way a reader expects.
 `apply_to` returns `Verdict::Halt` iff a `Halt` effect was recorded.
@@ -564,7 +568,7 @@ fn info(&mut Log, msg: &str);  fn warn(&mut Log, msg: &str);  fn error(&mut Log,
 // globals
 fn finding(f: rhai::Map) -> Result<(), Box<EvalAltResult>>;
 fn option(name: &str) -> rhai::Dynamic;
-fn halt();  fn r#continue();
+fn halt();   // no continue(): `continue` is a Rhai keyword; not calling halt() continues
 ```
 
 The browser verb is `browser.evaluate` **in a script**, not `browser.eval`:
