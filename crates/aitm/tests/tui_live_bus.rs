@@ -18,7 +18,7 @@ use std::time::Duration;
 use aitm::tui::build_servers;
 use aitm_core::{Config, McpTransport};
 use aitm_mcp::McpServer;
-use aitm_tui::action::{BusEvent, BusRequest, Level};
+use aitm_tui::action::{BusEvent, BusRequest};
 use aitm_tui::TransportChoice;
 use anyhow::Context as _;
 use serde_json::{json, Value};
@@ -206,12 +206,12 @@ async fn tui_bus_task_runs_against_the_live_loopback_server() {
         })
         .await
         .expect("the bus task is still taking requests");
-    let (level, message) = wait_for(&mut ev_rx, "Toast", |e| match e {
-        BusEvent::Toast(level, m) => Some((*level, m.clone())),
+    let (name, message) = wait_for(&mut ev_rx, "CallFailed", |e| match e {
+        BusEvent::CallFailed { name, message } => Some((name.clone(), message.clone())),
         _ => None,
     })
     .await;
-    assert_eq!(level, Level::Warn);
+    assert_eq!(name, "nope");
     assert_eq!(message, "nope is not on this bus");
 
     // 5. Closing the request channel ends `run`.
