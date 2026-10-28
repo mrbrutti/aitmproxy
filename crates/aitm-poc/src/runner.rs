@@ -14,6 +14,11 @@
 //!   `screenshot` is kept for the *screenshot* artifact; `click`/`type` drive the
 //!   page.
 //! - **extract** steps bind a variable from the current response context.
+//! - **script** steps are handed to the optional [`ScriptStepExecutor`] (the Rhai
+//!   tier, wired in by the binary). Its verdict is recorded under the step's name
+//!   and read back from `success` as `step("name")`; the variables it binds reach
+//!   later steps and `success`. With no executor wired, a script step is an error,
+//!   never a silent skip.
 //!
 //! After the steps, `success` is rendered against the bindings, any `browser-eval`
 //! it names is evaluated through the driver, and the tree is judged — the PoC
@@ -21,6 +26,8 @@
 //! (already in the store), the YAML PoC file, and the screenshot PNG, and returns
 //! a [`PocRunResult`].
 
+use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -33,7 +40,7 @@ use futures::future::BoxFuture;
 
 use crate::extract::{apply, Extractor};
 use crate::matcher::{evaluate, MatchContext};
-use crate::model::{Assertion, BrowserAction, Poc, Step};
+use crate::model::{Assertion, BrowserAction, Poc, ScriptStep, Step};
 use crate::template::{PocTemplate, Template, VarBindings};
 
 /// Execute a `Poc` with no agent and emit the three artifacts.
@@ -68,17 +75,114 @@ pub struct AssertionOutcome {
     pub matched: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Script steps: the executor seam (spec §10)
+// ---------------------------------------------------------------------------
+
+/// Runs one `script` step. Implemented by the scripting tier
+/// (`aitm-plugin-rhai`'s `RhaiScriptExecutor`) and wired into the runner by the
+/// binary, so this crate carries no Rhai dependency and the declarative subset
+/// runs without the scripting tier.
+pub trait ScriptStepExecutor: Send + Sync {
+    fn run_step(
+        &self,
+        step: &ScriptStep,
+        ctx: &mut ScriptStepCtx<'_>,
+    ) -> Result<ScriptVerdict, ScriptStepError>;
+}
+
+/// What a script step may touch while it runs.
+pub struct ScriptStepCtx<'a> {
+    /// Read + write; later steps and `success` see the writes.
+    pub vars: &'a mut VarBindings,
+    /// The store / client / browser / guard, behind the same guards as Rust.
+    pub host: &'a CommandHost<'a>,
+    /// Outcomes recorded so far, by step name.
+    pub step_results: &'a mut BTreeMap<String, StepOutcome>,
+    /// Files the script wrote (its screenshots); they join the run's artifacts.
+    pub artifacts: &'a mut Vec<PathBuf>,
+}
+
+/// A script step's result: `return pass` / `return fail`, or neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptVerdict {
+    Pass,
+    Fail,
+    Neutral,
+}
+
+/// What `step("name")` resolves to in the success DSL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepOutcome {
+    Matched,
+    NotMatched,
+    Pass,
+    Fail,
+    Error,
+    Neutral,
+}
+
+impl StepOutcome {
+    /// The string `step("name")` compares against.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StepOutcome::Matched => "matched",
+            StepOutcome::NotMatched => "not-matched",
+            StepOutcome::Pass => "pass",
+            StepOutcome::Fail => "fail",
+            StepOutcome::Error => "error",
+            StepOutcome::Neutral => "neutral",
+        }
+    }
+}
+
+impl From<ScriptVerdict> for StepOutcome {
+    fn from(verdict: ScriptVerdict) -> Self {
+        match verdict {
+            ScriptVerdict::Pass => StepOutcome::Pass,
+            ScriptVerdict::Fail => StepOutcome::Fail,
+            ScriptVerdict::Neutral => StepOutcome::Neutral,
+        }
+    }
+}
+
+/// A script step that reached no verdict — a runtime error, sandbox denial,
+/// timeout, or operation-limit abort — as the message the run reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptStepError(pub String);
+
+impl fmt::Display for ScriptStepError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ScriptStepError {}
+
 /// The default runner. Artifacts are written under `out_dir` (a fresh
-/// per-run subdirectory); defaults to the system temp directory.
-#[derive(Debug, Clone)]
+/// per-run subdirectory); defaults to the system temp directory. Script steps
+/// dispatch through the optional executor; without one they error.
+#[derive(Clone)]
 pub struct StdPocRunner {
     out_dir: PathBuf,
+    script_executor: Option<Arc<dyn ScriptStepExecutor>>,
+}
+
+// Manual: the executor is an opaque trait object, so report only its presence.
+impl fmt::Debug for StdPocRunner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StdPocRunner")
+            .field("out_dir", &self.out_dir)
+            .field("script_executor", &self.script_executor.is_some())
+            .finish()
+    }
 }
 
 impl Default for StdPocRunner {
     fn default() -> Self {
         Self {
             out_dir: std::env::temp_dir(),
+            script_executor: None,
         }
     }
 }
@@ -93,6 +197,15 @@ impl StdPocRunner {
     pub fn with_output_dir(dir: impl Into<PathBuf>) -> Self {
         Self {
             out_dir: dir.into(),
+            script_executor: None,
+        }
+    }
+
+    /// Wire the scripting tier: `script` steps dispatch through `exec`.
+    pub fn with_script_executor(self, exec: Arc<dyn ScriptStepExecutor>) -> Self {
+        Self {
+            script_executor: Some(exec),
+            ..self
         }
     }
 }
@@ -125,8 +238,12 @@ impl StdPocRunner {
         let mut ctx = MatchContext::default();
         let mut finding: Option<FlowId> = None;
         let mut screenshot: Option<Vec<u8>> = None;
+        // Files script steps wrote (their screenshots), see `write_artifacts`.
+        let mut artifacts: Vec<PathBuf> = Vec::new();
+        // One failed outcome per script step that errored (spec §10 failure reporting).
+        let mut script_errors: Vec<AssertionOutcome> = Vec::new();
 
-        for step in &poc.steps {
+        for (index, step) in poc.steps.iter().enumerate() {
             match step {
                 Step::Http(http) => {
                     let req = build_request(http, &tmpl, &live)?;
@@ -196,12 +313,45 @@ impl StdPocRunner {
                 Step::Extract(ex_step) => {
                     bind_extractor(&Extractor::from(ex_step), &mut ctx, &mut live);
                 }
-                // M3 Task 13 replaces this arm with `ScriptStepExecutor` dispatch;
-                // until then a script step cannot run without the Rhai runtime.
-                Step::Script(_) => {
-                    return Err(anyhow::anyhow!(
-                        "script steps require the Rhai runtime (wire a ScriptStepExecutor)"
-                    ));
+                Step::Script(script) => {
+                    let executor = self.script_executor.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "script steps require the Rhai runtime (wire a ScriptStepExecutor)"
+                        )
+                    })?;
+                    let name = script
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("step-{}", index + 1));
+                    let before = live.clone();
+                    let outcome = {
+                        let mut step_ctx = ScriptStepCtx {
+                            vars: &mut live,
+                            host,
+                            step_results: &mut ctx.steps,
+                            artifacts: &mut artifacts,
+                        };
+                        match executor.run_step(script, &mut step_ctx) {
+                            Ok(verdict) => StepOutcome::from(verdict),
+                            // The step resolves to "error" and the run goes on; it
+                            // fails only if `success` depends on this step.
+                            Err(err) => {
+                                script_errors.push(AssertionOutcome {
+                                    assertion: format!("script {name}: {err}"),
+                                    matched: false,
+                                });
+                                StepOutcome::Error
+                            }
+                        }
+                    };
+                    ctx.steps.insert(name, outcome);
+                    // Variables the script bound reach `success` the way extractor
+                    // bindings do; later steps already see them in `live`.
+                    for (var, value) in live.iter() {
+                        if before.get(var) != Some(value) {
+                            ctx.vars.insert(var.clone(), value.clone());
+                        }
+                    }
                 }
             }
         }
@@ -211,14 +361,22 @@ impl StdPocRunner {
         let success = render_assertion(&poc.success, &tmpl, &live)?;
         eval_browser_assertions(&success, host, &mut ctx).await?;
 
-        let evaluated = collect_outcomes(&success, &ctx);
+        let mut evaluated = collect_outcomes(&success, &ctx);
+        evaluated.extend(script_errors);
         let passed = evaluate(&success, &ctx);
 
         let finding_capture = finding.ok_or_else(|| {
             anyhow::anyhow!("poc.run: no HTTP flow was captured to anchor the finding")
         })?;
 
-        let (poc_path, screenshot_path) = self.write_artifacts(poc, screenshot.as_deref())?;
+        let (poc_path, mut screenshot_path) = self.write_artifacts(poc, screenshot.as_deref())?;
+        // A script's screenshot joins the same artifact set as a declarative one:
+        // with no declarative screenshot, the first script-written file stands in.
+        if screenshot_path.as_os_str().is_empty() {
+            if let Some(first) = artifacts.into_iter().next() {
+                screenshot_path = first;
+            }
+        }
 
         Ok(PocRunResult {
             passed,
