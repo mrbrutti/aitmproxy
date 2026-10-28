@@ -38,8 +38,10 @@ dependencies = [
  "serde_yaml",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

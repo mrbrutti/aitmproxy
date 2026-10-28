@@ -28,17 +28,24 @@ aitm-cli.workspace = true
 anyhow = "1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 serde_yaml = "0.9"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "process", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "process", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[dev-dependencies]
-serde_json = "1"
+# `aitm web` (F15): the static host and the `/bus` WebSocket bridge. hyper,
+# hyper-util, http-body-util and bytes were already dev-dependencies here;
+# tokio-tungstenite is the one aitm-proto-ws tests with. Nothing new enters
+# Cargo.lock.
 hyper = { version = "1", features = ["server", "http1"] }
 http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 bytes = "1"
+tokio-tungstenite = "0.28"
+# Bridge token generation (two v4 UUIDs).
+uuid.workspace = true
+
+[dev-dependencies]
 # The HTTPS fixture behind the obscura MITM tests (M2 Task 24): same crates and
 # features as aitm-proto-http, so nothing new enters the tree.
 rcgen = "0.14"
