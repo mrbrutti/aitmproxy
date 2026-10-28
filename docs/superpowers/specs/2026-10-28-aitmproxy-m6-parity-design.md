@@ -143,7 +143,7 @@ pub struct Rule {
 }
 
 pub struct MatchCondition {
-    pub url: Option<UrlMatch>,    // matched against scheme://authority/path?query
+    pub url: Option<UrlMatch>,    // matched against the request path incl. query (host via `host` below)
     pub method: Option<String>,   // case-insensitive exact; None == any
     pub host: Option<HostMatch>,  // authority wildcard; None == any
     pub phase: Phase,             // which lifecycle point this rule fires at
@@ -162,6 +162,13 @@ Decision: `UrlMatch` carries both wildcard and regex because Proxyman and
 mitmproxy both offer both and the operator rule sheets already expose the choice
 (operator-ui-foundation §2.7 "URL wildcard/regex"). Regex is compiled once per
 rule at add-time; an invalid pattern is rejected by the command that adds it.
+
+**Reconciliation (2026-10-28, Task 1 build):** `UrlMatch` is matched against the
+request **path including its query string**, not the full
+`scheme://authority/path?query` — because the authoritative AC-R2 test pattern
+`^/v[0-9]+/users$` is path-anchored and cannot match a full-URL string. Host
+targeting is the separate `host: HostMatch` clause; a rule that needs both a host
+and a path condition sets both. This keeps F3/F9/Map rule authoring consistent.
 
 ### 1. F3 — rule-based + response-phase intercept + kill modes
 
