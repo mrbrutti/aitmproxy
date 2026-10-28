@@ -1,14 +1,14 @@
 // One PoC run: title, meta line, Assertions, Finding capture, Screenshot, YAML, and the actions
 // bar (Run again · Export · Open capture). Data is null-safe; missing values print a grey dash.
 
-import { createMemo, createResource, createSignal, For, Match, onCleanup, Show, Switch, type Component } from 'solid-js';
+import { createEffect, createMemo, createResource, createSignal, For, Match, on, onCleanup, Show, Switch, type Component } from 'solid-js';
 import { Portal } from 'solid-js/web';
 import type { PocRun } from '~/bus/mock';
 import { Badge, Button, Icon, Menu, Popover, type AnchorRect } from '~/components';
 import { methodHue, statusHue, type FlowSummary } from '~/model/flow';
 import { useApp } from '~/state/context';
 import { artifactDataUrl, downloadBlob, exportFilename, pngBlob, toArtifact, yamlBlob, type Artifact } from './export';
-import { fmtWhen, fmtWhenFull, matchedCount, parseVars, varsFromYaml, varsText } from './model';
+import { fmtWhen, fmtWhenFull, matchedCount, parseVars, varsFromYaml, varsText, verdictOf, whenOf } from './model';
 import { SeverityPill } from './SeverityPill';
 import { findingsState } from './state';
 import { tokenizeYaml } from './yaml';
@@ -29,8 +29,24 @@ export interface FindingDetailProps {
 export const FindingDetail: Component<FindingDetailProps> = (props) => {
   const app = useApp();
   /** Local YAML edits per run id; there is no `poc.save` yet (core follow-up). */
-  const { localYaml, setLocalYaml } = findingsState(app);
+  const { localYaml, setLocalYaml, yamlRequested } = findingsState(app);
   const run = () => props.run;
+  const verdict = createMemo(() => verdictOf(run()));
+
+  // ---- source (lazy): poc.list carries no YAML, so the first look at an entry asks poc.get ----
+  const [loadingPath, setLoadingPath] = createSignal<string | null>(null);
+  const yamlLoading = () => !!run().poc_path && loadingPath() === run().poc_path;
+  createEffect(
+    on(
+      () => [run().poc_path, run().yaml] as const,
+      ([path, text]) => {
+        if (!path || text || yamlRequested.has(path)) return;
+        yamlRequested.add(path);
+        setLoadingPath(path);
+        void app.ensurePocSource(path).finally(() => loadingPath() === path && setLoadingPath(null));
+      },
+    ),
+  );
 
   // ---- finding capture ----
   const flow = createMemo<FlowSummary | null>(() => {
@@ -155,7 +171,12 @@ export const FindingDetail: Component<FindingDetailProps> = (props) => {
     <div class={css.detail} ref={props.ref} tabIndex={-1} aria-label={`Finding: ${run().title ?? ''}`}>
       <div class={css.bar} role="toolbar" aria-label="Finding actions">
         <Show when={!running()} fallback={<span class={`${css.running} ${css.note}`}>Running…</span>}>
-          <Button variant="toolbar" onClick={(e) => openRun(e.currentTarget)} disabled={!run().poc_path} title={run().poc_path ? 'Run this PoC again' : 'No PoC path'}>
+          <Button
+            variant="toolbar"
+            onClick={(e) => openRun(e.currentTarget)}
+            disabled={!run().poc_path || !!run().local}
+            title={run().local ? 'Not saved on the server — export the YAML into poc.dir first' : run().poc_path ? (verdict() === 'not-run' ? 'Run this PoC' : 'Run this PoC again') : 'No PoC path'}
+          >
             <Icon name="play" />
             Run again
           </Button>
@@ -178,21 +199,24 @@ export const FindingDetail: Component<FindingDetailProps> = (props) => {
           <span class={css.sep}>·</span>
           <span class={`${css.mono} ${css.target}`}>{run().target || <span class={css.dash}>—</span>}</span>
           <span class={css.sep}>·</span>
-          <Show when={typeof run().passed === 'boolean'} fallback={<span class={css.dash}>—</span>}>
+          <Show when={verdict() !== 'not-run'} fallback={<span class={css.dash}>Not run yet</span>}>
             <span class={css.verdictText} data-ok={run().passed ? 'true' : 'false'}>
               <Icon name={run().passed ? 'check' : 'x'} size={12} />
               {run().passed ? 'Passed' : 'Failed'}
             </span>
           </Show>
           <span class={css.sep}>·</span>
-          <span class={css.mono} title={fmtWhenFull(run().at) ?? undefined}>
-            {fmtWhen(run().at) ?? <span class={css.dash}>—</span>}
+          <span class={css.mono} title={fmtWhenFull(whenOf(run())) ?? undefined}>
+            {fmtWhen(whenOf(run())) ?? <span class={css.dash}>—</span>}
           </span>
           <span class={css.sep}>·</span>
           <Show when={run().origin === 'agent'} fallback={<span>{run().origin || <span class={css.dash}>—</span>}</span>}>
             <span class={css.tag}>agent</span>
           </Show>
         </div>
+        <Show when={run().local}>
+          <p class={css.localNote}>Built in this session — not saved on the server. Export the YAML into poc.dir to run it.</p>
+        </Show>
         <Show when={run().poc_path}>
           <div class={css.pathLine}>
             <span class={css.path} title={run().poc_path}>
@@ -214,21 +238,23 @@ export const FindingDetail: Component<FindingDetailProps> = (props) => {
               </span>
             </Show>
           </div>
-          <Show when={counts().total > 0} fallback={<p class={css.muted}>No assertions were evaluated.</p>}>
-            <div class={css.assertions} role="table" aria-label="Assertions">
-              <For each={run().evaluated}>
-                {(a) => (
-                  <div class={css.arow} role="row">
-                    <span class={css.verdict} data-ok={a.matched ? 'true' : 'false'} role="cell">
-                      <Icon name={a.matched ? 'check' : 'x'} size={12} label={a.matched ? 'Matched' : 'Not matched'} />
-                    </span>
-                    <span class={css.assertion} role="cell">
-                      {a.assertion || <span class={css.dash}>—</span>}
-                    </span>
-                  </div>
-                )}
-              </For>
-            </div>
+          <Show when={verdict() !== 'not-run'} fallback={<p class={css.muted}>Run the PoC to evaluate its assertions.</p>}>
+            <Show when={counts().total > 0} fallback={<p class={css.muted}>No assertions were evaluated.</p>}>
+              <div class={css.assertions} role="table" aria-label="Assertions">
+                <For each={run().evaluated}>
+                  {(a) => (
+                    <div class={css.arow} role="row">
+                      <span class={css.verdict} data-ok={a.matched ? 'true' : 'false'} role="cell">
+                        <Icon name={a.matched ? 'check' : 'x'} size={12} label={a.matched ? 'Matched' : 'Not matched'} />
+                      </span>
+                      <span class={css.assertion} role="cell">
+                        {a.assertion || <span class={css.dash}>—</span>}
+                      </span>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </Show>
           </Show>
         </section>
 
@@ -341,7 +367,19 @@ export const FindingDetail: Component<FindingDetailProps> = (props) => {
           <Show
             when={editing()}
             fallback={
-              <Show when={yaml()} fallback={<p class={css.muted}>No YAML for this run.</p>}>
+              <Show
+                when={yaml()}
+                fallback={
+                  <Show when={yamlLoading()} fallback={<p class={css.muted}>No YAML for this run.</p>}>
+                    <div class={css.yamlLoading} role="progressbar" aria-label="Loading PoC YAML">
+                      <i />
+                      <i />
+                      <i />
+                      <i />
+                    </div>
+                  </Show>
+                }
+              >
                 <pre class={css.code} aria-label="PoC YAML">
                   <For each={lines()}>
                     {(toks) => (
@@ -387,7 +425,7 @@ export const FindingDetail: Component<FindingDetailProps> = (props) => {
             >
               <label>
                 Target
-                <input class={css.input} value={target()} onInput={(e) => setTarget(e.currentTarget.value)} placeholder={run().target ?? 'https://host'} spellcheck={false} />
+                <input class={css.input} value={target()} onInput={(e) => setTarget(e.currentTarget.value)} placeholder={run().target || 'https://host'} spellcheck={false} />
               </label>
               <label>
                 Vars

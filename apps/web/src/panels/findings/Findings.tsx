@@ -7,7 +7,7 @@ import type { PocRun } from '~/bus/mock';
 import { Icon } from '~/components';
 import { useApp } from '~/state/context';
 import { FindingDetail } from './FindingDetail';
-import { SEVERITIES, filterRuns, fmtWhen, fmtWhenFull, sortNewest, type Severity } from './model';
+import { SEVERITIES, filterRuns, fmtWhen, fmtWhenFull, sortNewest, verdictOf, whenOf, type Severity } from './model';
 import { SeverityPill } from './SeverityPill';
 import { findingsState } from './state';
 import css from './findings.module.css';
@@ -152,15 +152,22 @@ export const Findings: Component = () => {
                     <div class={css.rowMeta}>
                       <span class={css.target}>{r.target || '—'}</span>
                       <span class={css.sep}>·</span>
-                      <span class={css.when} title={fmtWhenFull(r.at) ?? undefined}>
-                        {fmtWhen(r.at, now()) ?? '—'}
+                      <span class={css.when} title={fmtWhenFull(whenOf(r)) ?? undefined}>
+                        {fmtWhen(whenOf(r), now()) ?? '—'}
                       </span>
                       <Show when={r.origin === 'agent'}>
                         <span class={css.tag}>agent</span>
                       </Show>
                     </div>
                     <div class={css.rowRight}>
-                      <Show when={typeof r.passed === 'boolean'}>
+                      <Show
+                        when={verdictOf(r) !== 'not-run'}
+                        fallback={
+                          <span class={css.notRun} title="Not run yet">
+                            not run
+                          </span>
+                        }
+                      >
                         <span class={css.verdict} data-ok={r.passed ? 'true' : 'false'} title={r.passed ? 'Passed' : 'Failed'}>
                           <Icon name={r.passed ? 'check' : 'x'} size={12} label={r.passed ? 'Passed' : 'Failed'} />
                         </span>

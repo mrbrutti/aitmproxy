@@ -102,7 +102,15 @@ export const Viewport: Component = () => {
         <Show when={s.frame()}>{(f) => <img class={css.frame} src={f()} alt={`Screenshot of ${s.url() || 'the page'}`} draggable={false} />}</Show>
         <Show when={s.availability() === 'no'}>
           <p class={css.empty}>
-            No embedded browser on this server — start aitm with <code>browser.engine: obscura</code>.
+            <span>
+              No embedded browser on this server — start aitm with <code>browser.engine: obscura</code>.
+              <Show when={s.engineMissing()}>
+                {' '}
+                <button type="button" class={css.retry} disabled={s.probing()} onClick={() => void s.retry()}>
+                  Retry
+                </button>
+              </Show>
+            </span>
           </p>
         </Show>
       </div>

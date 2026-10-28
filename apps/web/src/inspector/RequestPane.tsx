@@ -22,6 +22,7 @@ import type { EditState } from './edit';
 import { HeaderTable } from './HeaderTable';
 import { BodyControls, Pane } from './Pane';
 import { QueryTable } from './QueryTable';
+import { requestDocument } from './rawdoc';
 import { SummaryTab } from './SummaryTab';
 import { TimingTab } from './TimingTab';
 import { Bars, Centered, copyText } from './ui';
@@ -63,11 +64,13 @@ export const RequestPane: Component<RequestPaneProps> = (props) => {
   const body = () => props.detail?.request.body ?? null;
   const codeTab = () => tab() === 'body' || tab() === 'raw';
 
+  // The Raw tab is the whole request document (rawdoc.ts), not a body view, so the body model
+  // only serves the Body tab.
   const model = createBodyModel({
     flowId: () => props.flow?.id ?? null,
     side: 'req',
     body,
-    tab: () => (tab() === 'body' ? 'body' : tab() === 'raw' ? 'raw' : 'other'),
+    tab: () => (tab() === 'body' ? 'body' : 'other'),
     format,
   });
 
@@ -83,8 +86,14 @@ export const RequestPane: Component<RequestPaneProps> = (props) => {
     }
     return null;
   });
+  /** Read-only raw request (request line, headers, blank line, body) for any flow that is not being edited. */
+  const rawDoc = createMemo<CodeDoc | null>(() => {
+    const d = props.detail;
+    if (props.editing || tab() !== 'raw' || !d) return null;
+    return { key: `${d.id}:req:raw:doc`, text: requestDocument(d), lang: 'text' };
+  });
   const view = () => model.view();
-  const codeDoc = createMemo<CodeDoc | null>(() => editDoc() ?? (view()?.type === 'code' ? (view() as { doc: CodeDoc }).doc : null));
+  const codeDoc = createMemo<CodeDoc | null>(() => editDoc() ?? rawDoc() ?? (view()?.type === 'code' ? (view() as { doc: CodeDoc }).doc : null));
   const ready = () => !!props.detail && !props.loading && !props.error;
   const codeActive = () => ready() && codeTab() && !!codeDoc();
 
@@ -115,6 +124,7 @@ export const RequestPane: Component<RequestPaneProps> = (props) => {
     },
     bodyText() {
       if (props.editing) return tab() === 'raw' ? props.edit.rawText() : props.edit.draft.body;
+      if (tab() === 'raw') return rawDoc()?.text ?? null;
       return body()?.text ?? null;
     },
   });
@@ -132,16 +142,8 @@ export const RequestPane: Component<RequestPaneProps> = (props) => {
             {headers().length} {headers().length === 1 ? 'header' : 'headers'}
           </span>
         </Match>
-        <Match when={codeTab() && !props.editing && body() && body()!.size > 0}>
-          <BodyControls
-            format={format()}
-            onFormat={setFormat}
-            label={model.label()}
-            prettyState={model.prettyState()}
-            truncatedAt={body()?.truncated ? body()!.size : null}
-            onFind={() => codeApi?.find()}
-            pickerless={tab() === 'raw'}
-          />
+        <Match when={tab() === 'body' && !props.editing && body() && body()!.size > 0}>
+          <BodyControls format={format()} onFormat={setFormat} label={model.label()} prettyState={model.prettyState()} truncatedAt={body()?.truncated ? body()!.size : null} onFind={() => codeApi?.find()} />
         </Match>
       </Switch>
     </>
@@ -178,6 +180,7 @@ export const RequestPane: Component<RequestPaneProps> = (props) => {
                           editable={props.editing}
                           original={props.editing ? props.edit.original().headers : undefined}
                           onChange={props.edit.setHeaders}
+                          onEdit={props.edit.setHeader}
                           onCopied={(n) => app.notice(`Copied ${n}`)}
                         />
                       </div>

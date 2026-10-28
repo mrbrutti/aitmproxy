@@ -103,6 +103,13 @@ export function createEditState(detail: Accessor<FlowDetail | null>) {
       setDraft('headers', h.map((x) => ({ ...x })));
       syncRaw();
     },
+    /** One cell of one row, patched by path so the row object (and its input) survives. */
+    setHeader(i: number, patch: Partial<Header>) {
+      if (i < 0 || i >= draft.headers.length) return;
+      if (patch.name !== undefined) setDraft('headers', i, 'name', patch.name);
+      if (patch.value !== undefined) setDraft('headers', i, 'value', patch.value);
+      syncRaw();
+    },
     setBody(text: string) {
       setDraft('body', text);
       syncRaw();

@@ -14,6 +14,7 @@ import { responseCookies } from './cookies';
 import { DiffTab } from './DiffTab';
 import { HeaderTable } from './HeaderTable';
 import { BodyControls, Pane } from './Pane';
+import { responseDocument } from './rawdoc';
 import { ErrorBlock, NonCodeView, type PaneApi } from './RequestPane';
 import { WsFrames } from './WsFrames';
 import { Bars, Centered, copyText } from './ui';
@@ -62,15 +63,23 @@ export const ResponsePane: Component<ResponsePaneProps> = (props) => {
   const body = () => source()?.body ?? null;
   const codeTab = () => tab() === 'body' || tab() === 'raw';
 
+  // The Raw tab is the whole response document (rawdoc.ts); the body model serves Body and JSON.
   const model = createBodyModel({
     flowId: sourceId,
     side: 'res',
     body,
-    tab: () => (tab() === 'body' ? 'body' : tab() === 'raw' ? 'raw' : tab() === 'json' ? 'tree' : 'other'),
+    tab: () => (tab() === 'body' ? 'body' : tab() === 'json' ? 'tree' : 'other'),
     format,
   });
+  /** Read-only raw response: status line, headers, blank line, body (of the reference flow while paused). */
+  const rawDoc = createMemo<CodeDoc | null>(() => {
+    if (tab() !== 'raw') return null;
+    const d = isReference() ? previousDetail() : props.detail;
+    const text = d ? responseDocument(d) : null;
+    return d && text != null ? { key: `${d.id}:res:raw:doc`, text, lang: 'text' } : null;
+  });
   const view = () => model.view();
-  const codeDoc = createMemo<CodeDoc | null>(() => (view()?.type === 'code' ? (view() as { doc: CodeDoc }).doc : null));
+  const codeDoc = createMemo<CodeDoc | null>(() => rawDoc() ?? (view()?.type === 'code' ? (view() as { doc: CodeDoc }).doc : null));
   const ready = () => !!props.detail && !props.loading && !props.error;
   const codeActive = () => ready() && codeTab() && !!codeDoc();
 
@@ -102,7 +111,7 @@ export const ResponsePane: Component<ResponsePaneProps> = (props) => {
       else return false;
       return true;
     },
-    bodyText: () => body()?.text ?? null,
+    bodyText: () => (tab() === 'raw' ? (rawDoc()?.text ?? null) : (body()?.text ?? null)),
   });
 
   const onCopy = (text: string, what: string) => void copyText(text).then((ok) => ok && app.notice(`Copied ${what}`));
@@ -114,16 +123,8 @@ export const ResponsePane: Component<ResponsePaneProps> = (props) => {
           {headers().length} {headers().length === 1 ? 'header' : 'headers'}
         </span>
       </Match>
-      <Match when={codeTab() && body() && body()!.size > 0}>
-        <BodyControls
-          format={format()}
-          onFormat={setFormat}
-          label={model.label()}
-          prettyState={model.prettyState()}
-          truncatedAt={body()?.truncated ? body()!.size : null}
-          onFind={() => codeApi?.find()}
-          pickerless={tab() === 'raw'}
-        />
+      <Match when={tab() === 'body' && body() && body()!.size > 0}>
+        <BodyControls format={format()} onFormat={setFormat} label={model.label()} prettyState={model.prettyState()} truncatedAt={body()?.truncated ? body()!.size : null} onFind={() => codeApi?.find()} />
       </Match>
     </Switch>
   );

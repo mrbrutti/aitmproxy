@@ -26,6 +26,24 @@ export function filterRuns(runs: readonly PocRun[], query: string, severities: R
   });
 }
 
+export type Verdict = 'passed' | 'failed' | 'not-run';
+
+/**
+ * The core keeps no run history, so a library entry has no verdict until `poc.run` happened in
+ * this session (`ran`); a PoC built here but not saved (`local`) cannot have run. A run that
+ * arrived with its own timestamp (fixtures, a future core) counts as run.
+ */
+export function verdictOf(r: Pick<PocRun, 'local' | 'ran' | 'at' | 'passed'>): Verdict {
+  if (r.local) return 'not-run';
+  if (!r.ran && !(r.at > 0)) return 'not-run';
+  return r.passed ? 'passed' : 'failed';
+}
+
+/** The entry's time (run time, or build time for a local PoC); `null` when it never ran. */
+export function whenOf(r: Pick<PocRun, 'at'>): number | null {
+  return r.at > 0 ? r.at : null;
+}
+
 export function matchedCount(evaluated: PocRun['evaluated'] | null | undefined): { matched: number; total: number } {
   const list = evaluated ?? [];
   let matched = 0;

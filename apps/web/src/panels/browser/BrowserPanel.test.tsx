@@ -10,7 +10,7 @@ import { browserState } from './state';
 const tool = (name: string): ToolDef => ({ name, description: '', inputSchema: { type: 'object' } });
 
 /** A stub app store: reactive `proxy.tools` / `ui.panel`, a recording `call`, a recording `notice`. */
-function stubApp(tools: string[], panel = 'browser') {
+function stubApp(tools: string[], panel = 'browser', opts: { engine?: () => boolean } = {}) {
   const [proxy, setProxy] = createStore({ tools: tools.map(tool) });
   const [ui, setUi] = createStore({ panel });
   const calls: { tool: string; args: Record<string, unknown> | undefined }[] = [];
@@ -19,6 +19,8 @@ function stubApp(tools: string[], panel = 'browser') {
     ui,
     call: vi.fn(async (t: string, args?: Record<string, unknown>) => {
       calls.push({ tool: t, args });
+      // Like the core without obscura: the tools are registered but every call fails the same way.
+      if (t.startsWith('browser.') && opts.engine && !opts.engine()) throw new Error('no browser is configured on this host');
       switch (t) {
         case 'browser.tabs':
           return [{ id: 'tab_1', url: 'https://shop-staging.test/', title: 'Shop (staging)', active: true }];
@@ -123,6 +125,49 @@ describe('BrowserPanel live polling', () => {
       s.setLive(true);
       await vi.advanceTimersByTimeAsync(0);
       expect(shots()).toBe(4);
+      expect(s.polling()).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('treats "no browser is configured" as no engine: honest empty state, one notice, poller off, Retry re-probes', async () => {
+    vi.useFakeTimers();
+    try {
+      let engine = false;
+      const { app, calls } = stubApp(['browser.navigate', 'browser.screenshot', 'browser.get_dom', 'browser.tabs'], 'browser', { engine: () => engine });
+      const r = mount(app);
+      const shots = () => calls.filter((c) => c.tool === 'browser.screenshot').length;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(shots()).toBe(1);
+      await vi.advanceTimersByTimeAsync(4000);
+      expect(shots()).toBe(1); // the poller stopped after the first "no engine" answer
+      expect(r.container.textContent).toContain('No embedded browser on this server — start aitm with browser.engine: obscura.');
+      expect(r.getByLabelText<HTMLInputElement>('Address').disabled).toBe(true);
+      const s = browserState(app);
+      expect(s.availability()).toBe('no');
+      expect(s.polling()).toBe(false);
+      // browser.tabs failed the same way on first contact; still one notice in total, and not an error toast.
+      expect(app.notice).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(app.notice).mock.calls[0]![0]).toContain('No embedded browser');
+      expect(vi.mocked(app.notice).mock.calls[0]![1]).toBeUndefined();
+
+      // Retry while the server is unchanged: still unavailable, one more (plain) notice, no polling.
+      r.getByRole('button', { name: 'Retry' }).click();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(s.availability()).toBe('no');
+      expect(app.notice).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(shots()).toBe(1);
+
+      // The operator restarts aitm with an engine: Retry brings the view back and polling resumes.
+      engine = true;
+      r.getByRole('button', { name: 'Retry' }).click();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(s.availability()).toBe('yes');
+      expect(r.container.textContent).not.toContain('No embedded browser');
+      await vi.advanceTimersByTimeAsync(1700);
+      expect(shots()).toBeGreaterThanOrEqual(3);
       expect(s.polling()).toBe(true);
     } finally {
       vi.useRealTimers();

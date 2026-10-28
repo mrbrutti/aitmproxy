@@ -26,6 +26,10 @@ export type Availability = 'unknown' | 'yes' | 'no';
 export const LIVE_INTERVAL_MS = 800;
 const EVAL_LOG_MAX = 200;
 
+/** The core registers `browser.*` even without an engine; every call then fails with one of these. */
+export const NO_ENGINE = /no browser is configured|browser unavailable|no obscura/i;
+export const NO_ENGINE_TEXT = 'No embedded browser on this server — start aitm with browser.engine: obscura.';
+
 /** `browser.screenshot` is a base64 PNG string today; accept the obvious envelopes too. */
 function asBase64(r: unknown): string | null {
   if (typeof r === 'string') return r || null;
@@ -71,7 +75,10 @@ function download(dataUrl: string, filename: string) {
 
 export function createBrowserState(app: AppStore) {
   const has = (n: string) => app.proxy.tools.some((t) => t.name === n);
-  const availability = createMemo<Availability>(() => (app.proxy.tools.length === 0 ? 'unknown' : has('browser.navigate') ? 'yes' : 'no'));
+  /** True once any browser.* call said there is no engine behind the registered tools. */
+  const [engineMissing, setEngineMissing] = createSignal(false);
+  const [probing, setProbing] = createSignal(false);
+  const availability = createMemo<Availability>(() => (app.proxy.tools.length === 0 ? 'unknown' : has('browser.navigate') && !engineMissing() ? 'yes' : 'no'));
   const available = () => availability() === 'yes';
   const hasTabs = createMemo(() => has('browser.tabs'));
 
@@ -92,7 +99,38 @@ export function createBrowserState(app: AppStore) {
   /** Without `browser.tabs` (F14) the strip shows one tab built from what this view knows. */
   const tabs = createMemo<BrowserTab[]>(() => (hasTabs() && remoteTabs().length ? remoteTabs() : [{ id: 'local', url: url(), title: title(), active: true }]));
 
-  const fail = (label: string, e: unknown) => app.notice(`${label}: ${(e as Error).message}`, 'error');
+  /** A bus error. "No engine" flips the view to its unavailable state (one notice, poller off) instead of toasting per call. */
+  let noEngineNoticed = false;
+  const fail = (label: string, e: unknown) => {
+    const msg = (e as Error)?.message ?? String(e);
+    if (NO_ENGINE.test(msg)) {
+      setEngineMissing(true);
+      if (!noEngineNoticed) {
+        noEngineNoticed = true;
+        app.notice(NO_ENGINE_TEXT);
+      }
+      return;
+    }
+    app.notice(`${label}: ${msg}`, 'error');
+  };
+
+  /** Re-probe once (a cheap read) after the operator fixed the server; success brings the view back. */
+  async function retry() {
+    if (probing()) return;
+    setProbing(true);
+    try {
+      await app.call<unknown>('browser.get_dom');
+      frameFailures = 0;
+      noEngineNoticed = false;
+      setEngineMissing(false);
+    } catch (e) {
+      const msg = (e as Error)?.message ?? String(e);
+      if (NO_ENGINE.test(msg)) app.notice('Still no embedded browser on this server');
+      else fail('browser', e);
+    } finally {
+      setProbing(false);
+    }
+  }
 
   async function refreshTabs() {
     if (!hasTabs()) return;
@@ -261,6 +299,9 @@ export function createBrowserState(app: AppStore) {
   return {
     availability,
     available,
+    engineMissing,
+    probing,
+    retry,
     hasTabs,
     tabs,
     url,

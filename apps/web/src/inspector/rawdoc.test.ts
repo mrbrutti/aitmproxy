@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { parseRaw, serializeRaw, type RawRequest } from './rawdoc';
+import type { FlowDetail } from '~/model/flow';
+import { parseRaw, requestDocument, responseDocument, serializeRaw, type RawRequest } from './rawdoc';
 
 const req: RawRequest = {
   method: 'POST',
@@ -46,5 +47,32 @@ describe('raw request document', () => {
   it('keeps a header value containing colons', () => {
     const r = parseRaw('GET / HTTP/1.1\nreferer: https://a.test/x?y=1\n\n');
     expect(r.ok && r.value.headers[0]).toEqual({ name: 'referer', value: 'https://a.test/x?y=1' });
+  });
+});
+
+describe('read-only raw documents', () => {
+  const body = (text: string | null, size = text?.length ?? 0) => ({ text, contentType: null, size, truncated: false });
+  const detail = {
+    id: 'f1',
+    method: 'GET',
+    path: '/api/me',
+    query: 'v=1',
+    httpVersion: 'HTTP/1.1',
+    status: 200,
+    statusText: 'OK',
+    request: { headers: [{ name: 'host', value: '127.0.0.1:1' }, { name: 'accept', value: '*/*' }], body: body(null, 0) },
+    response: { headers: [{ name: 'content-type', value: 'application/json' }], body: body('{"user":"ops"}') },
+  } as unknown as FlowDetail;
+
+  it('builds the request document: request line with the query, headers, blank line, (empty) body', () => {
+    expect(requestDocument(detail)).toBe('GET /api/me?v=1 HTTP/1.1\nhost: 127.0.0.1:1\naccept: */*\n\n');
+  });
+  it('builds the response document behind a status line', () => {
+    expect(responseDocument(detail)).toBe('HTTP/1.1 200 OK\ncontent-type: application/json\n\n{"user":"ops"}');
+  });
+  it('notes a binary body instead of dropping it, and has no response document without a response', () => {
+    const bin = { ...detail, request: { headers: [], body: body(null, 12) }, response: null } as unknown as FlowDetail;
+    expect(requestDocument(bin)).toBe('GET /api/me?v=1 HTTP/1.1\n\n[12 bytes — binary body, see Body › Hex]');
+    expect(responseDocument(bin)).toBeNull();
   });
 });

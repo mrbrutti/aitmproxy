@@ -681,7 +681,8 @@ try {
     const opt = await d.locate({ role: 'option', text: 'cua-reflected' }, { timeoutMs: 8000 });
     await d.mouse(opt.x, opt.y);
     const detail = await waitFor(() => d.q('text', '#aitm-lower'), { what: 'finding detail' });
-    const yamlShown = await d.q('find', { sel: '#aitm-lower pre[aria-label="PoC YAML"]' });
+    // The source arrives via poc.get a few ms after the click: wait for it like a human would.
+    const yamlShown = await waitFor(() => d.q('find', { sel: '#aitm-lower pre[aria-label="PoC YAML"]' }), { timeoutMs: 5000, what: 'PoC YAML' }).catch(() => null);
     if (yamlShown) pass('09b (seeded file) finding listed and YAML visible', yamlShown.text.slice(0, 80));
     else gap('09b (seeded file) finding listed but YAML not visible', `poc.list summaries carry only {id,title,severity,poc_path}; the detail shows "${/No YAML for this run\./.test(detail) ? 'No YAML for this run.' : detail.slice(0, 100)}" and the UI never calls poc.get`);
     await d.click({ role: 'button', text: 'Run again', match: 'startsWith', within: '#aitm-lower' });

@@ -37,6 +37,8 @@ export interface MenuProps {
   nested?: boolean | undefined;
   /** The parent menu's element id (submenus), so outside-click detection treats it as inside. */
   parentId?: string | undefined;
+  /** Submenu: choosing an item closes the whole tree through this (the root's `onClose`), not just the submenu. */
+  onCloseAll?: (() => void) | undefined;
   label?: string | undefined;
 }
 
@@ -137,6 +139,9 @@ export const Menu: Component<MenuProps> = (props) => {
     setSub({ index, anchor: { left: r.left, top: r.top, right: r.right, bottom: r.bottom }, fromKeyboard });
   };
 
+  /** An item was chosen: the whole menu tree goes, however deep this menu sits. */
+  const closeAll = () => (props.onCloseAll ?? props.onClose)();
+
   const activate = (index: number, fromKeyboard: boolean) => {
     const it = props.items[index];
     if (!it || !isItem(it) || it.disabled) return;
@@ -145,7 +150,7 @@ export const Menu: Component<MenuProps> = (props) => {
       openSub(index, fromKeyboard);
       return;
     }
-    props.onClose();
+    closeAll();
     it.onSelect?.();
   };
 
@@ -273,6 +278,7 @@ export const Menu: Component<MenuProps> = (props) => {
                 setSub(null);
                 root?.focus({ preventScroll: true });
               }}
+              onCloseAll={closeAll}
             />
           )}
         </Show>

@@ -10,6 +10,8 @@ export interface FindingsState {
   setSelectedId: Setter<string | null>;
   localYaml: Accessor<ReadonlyMap<string, string>>;
   setLocalYaml: Setter<ReadonlyMap<string, string>>;
+  /** PoC paths whose source was already requested through `poc.get` (asked once per session). */
+  yamlRequested: Set<string>;
 }
 
 const states = new WeakMap<AppStore, FindingsState>();
@@ -20,7 +22,7 @@ export function findingsState(app: AppStore): FindingsState {
     s = createRoot(() => {
       const [selectedId, setSelectedId] = createSignal<string | null>(null);
       const [localYaml, setLocalYaml] = createSignal<ReadonlyMap<string, string>>(new Map());
-      return { selectedId, setSelectedId, localYaml, setLocalYaml };
+      return { selectedId, setSelectedId, localYaml, setLocalYaml, yamlRequested: new Set<string>() };
     });
     states.set(app, s);
   }
