@@ -24,6 +24,38 @@ export function freePort() {
   });
 }
 
+/**
+ * Render an `l4:` config block from an options object (§M5/L4OPS). `enabled` turns the surface on;
+ * the `allow_agent_*` flags open per-capability agent gates; `scope` pre-declares L4 scope entries
+ * (the `L4ScopeEntry` YAML shape — see aitm-proto-l4/src/config.rs). Everything else fails closed.
+ */
+function l4Block(l4) {
+  const lines = ['l4:', `  enabled: ${l4.enabled !== false}`];
+  for (const flag of ['allow_agent_widen', 'allow_agent_inject', 'allow_agent_capture', 'allow_agent_intercept']) {
+    if (l4[flag] != null) lines.push(`  ${flag}: ${!!l4[flag]}`);
+  }
+  if (Array.isArray(l4.scope) && l4.scope.length) {
+    lines.push('  scope:');
+    for (const e of l4.scope) {
+      lines.push(
+        `    - cidr:`,
+        `        addr: ${e.addr}`,
+        `        prefix: ${e.prefix}`,
+        `      ports:`,
+        `        lo: ${e.portLo ?? 0}`,
+        `        hi: ${e.portHi ?? 65535}`,
+        `      interface: ${e.interface}`,
+        `      direction: ${e.direction ?? 'outbound'}`,
+        `      capability: ${e.capability}`,
+        `      inject_rate:`,
+        `        pps: ${e.pps ?? 100}`,
+        `        burst: ${e.burst ?? 100}`,
+      );
+    }
+  }
+  return lines;
+}
+
 /** A local target: JSON + cookies, a body/header echo, and a reflecting search page for PoCs. */
 export function startTarget() {
   const hits = [];
@@ -93,7 +125,7 @@ export function viaProxy(proxyPort, method, url, { headers = {}, body = null, ti
  * Spawns `aitm web` with its own config (all ports free, scope widening on, PoC dirs set).
  * Resolves once the bridge is up. `env.stop()` kills it.
  */
-export async function startAitm({ scope = [], aitmBin = process.env.AITM_BIN ?? join(REPO, 'target/debug/aitm'), log = () => {} } = {}) {
+export async function startAitm({ scope = [], l4 = null, aitmBin = process.env.AITM_BIN ?? join(REPO, 'target/debug/aitm'), log = () => {} } = {}) {
   if (!existsSync(aitmBin)) throw new Error(`aitm binary not found at ${aitmBin} — run: cargo build -p aitm (after npm run build in apps/web)`);
   const [proxyPort, browserProxyPort, webPort] = await Promise.all([freePort(), freePort(), freePort()]);
   const dir = mkdtempSync(join(tmpdir(), 'aitm-live-'));
@@ -118,6 +150,7 @@ export async function startAitm({ scope = [], aitmBin = process.env.AITM_BIN ?? 
       `    loopback_tcp:`,
       `      port: 0`,
       `      token: ${token}-mcp`,
+      ...(l4 ? l4Block(l4) : []),
       '',
     ].join('\n'),
   );

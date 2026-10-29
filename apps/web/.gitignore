@@ -6,3 +6,4 @@ src/styles/tokens.css
 src/viewers/lang/defs.gen.ts
 src/viewers/lang/conformance.gen.ts
 .cua-shots/
+.cua-l4-shots/
