@@ -13,7 +13,10 @@ use aitm::wire::{assemble_with, Features};
 use aitm_ca::testing::{MemoryAuditLog, ScriptedExecutor, FIXTURE_FP256};
 use aitm_ca::{AuditRecord, CaPlugin, Platform};
 use aitm_cli::{Cli, Confirmer, TtyConfirmer};
-use aitm_core::{CaConfig, Config, HttpFlow, HttpRequest, McpTransport, Proxy, ProxyClient, Value};
+use aitm_core::{
+    AgentPolicy, AgentState, CaConfig, Config, HttpFlow, HttpRequest, McpTransport, Proxy,
+    ProxyClient, Value,
+};
 use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
@@ -116,12 +119,14 @@ impl Harness {
 
     fn mcp(&self) -> McpServer {
         let client: Arc<dyn ProxyClient> = Arc::new(UnusedClient);
-        McpServer::new(self.proxy.registry_arc(), McpTransport::Stdio).with_services(
-            self.proxy.store(),
-            client,
-            self.proxy.guard(),
-            None,
-        )
+        // These CA tests exercise the agent reaching `ca.install`'s own config gate
+        // (CA-AC19/20/21). Per spec D2 the agent reaches a Sensitive command's gate
+        // only under `All` (or `Ask` with approval); the default `Auto` refuses every
+        // Sensitive command outright, never deferring to the gate. Run them under
+        // `All` so the config gate — not the policy — is what decides.
+        McpServer::new(self.proxy.registry_arc(), McpTransport::Stdio)
+            .with_services(self.proxy.store(), client, self.proxy.guard(), None)
+            .with_agent_state(Arc::new(AgentState::new(AgentPolicy::All)))
     }
 
     fn cli(&self) -> Cli {

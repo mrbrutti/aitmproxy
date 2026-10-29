@@ -1,0 +1,25 @@
+[package]
+name = "aitm-testtarget"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Hermetic, deliberately-vulnerable test target for authorized aitmproxy testing (M4). Grader-only manifest; no external network."
+publish = false
+
+[dependencies]
+aitm-findings.workspace = true
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+
+[dev-dependencies]
+aitm-core.workspace = true
+aitm-poc.workspace = true
+
+[lints]
+workspace = true

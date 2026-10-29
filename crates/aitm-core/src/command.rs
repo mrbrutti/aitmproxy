@@ -40,6 +40,21 @@ pub struct ParamSchema {
     pub result: TypeDesc,
 }
 
+/// How much authority running a command grants, used by the agent policy gate
+/// (F1/D2). The default (unclassified) is [`Sensitivity::Sensitive`] so a new
+/// command never silently runs autonomously — deny-by-default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sensitivity {
+    /// Observation only; changes no state (`flow.list`, `ca.status`, …).
+    Read,
+    /// A routine, scope/rate/SSRF-bounded testing verb (`flow.replay`,
+    /// `request.send`, `poc.run`, `browser.navigate`, …).
+    Write,
+    /// Trust, authorization, or irreversible-beyond-scope (`ca.install`,
+    /// `scope.add`, …); the fail-closed default for an unclassified command.
+    Sensitive,
+}
+
 /// A deterministic capability callable from any frontend.
 pub trait Command: Send + Sync {
     /// The dotted command name, e.g. `"flow.list"`.
@@ -53,6 +68,23 @@ pub trait Command: Send + Sync {
     /// needed; a frontend without a human never asks and relies on the
     /// command's own gate.
     fn confirm_prompt(&self, _args: &Params) -> Option<String> {
+        None
+    }
+    /// The authority tier the agent policy gate enforces (D2). The default is
+    /// fail-closed [`Sensitivity::Sensitive`]: an unclassified command never
+    /// runs autonomously.
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Sensitive
+    }
+    /// Whether running the command changes state. Derived: every tier except
+    /// [`Sensitivity::Read`] mutates.
+    fn mutates(&self) -> bool {
+        self.sensitivity() != Sensitivity::Read
+    }
+    /// An optional one-line, human-readable summary of an outcome for these
+    /// arguments and this result (e.g. `"replayed #52 → 200 OK"`). `None` (the
+    /// default) lets a surface fall back to the typed render.
+    fn summarize(&self, _args: &Params, _result: &Value) -> Option<String> {
         None
     }
 }

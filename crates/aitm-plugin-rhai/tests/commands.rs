@@ -1,5 +1,5 @@
 //! Spec §3/§8 (panel fix, M3): the three operator-facing commands the tier
-//! ships — `script.validate`, `script.reload` and `findings.list` — as real
+//! ships — `script.validate`, `script.reload` and `script.findings` — as real
 //! `aitm_core::Command`s registered by `ScriptCommands`, so MCP and the CLI
 //! pick them up like any other. Each test drives the command through the
 //! `Registry` exactly as a frontend does.
@@ -218,7 +218,7 @@ async fn script_validate_reports_meta_or_the_compile_error() {
     assert!(
         h.registry.command("script.validate").is_some()
             && h.registry.command("script.reload").is_some()
-            && h.registry.command("findings.list").is_some(),
+            && h.registry.command("script.findings").is_some(),
         "all three commands are registered"
     );
 
@@ -378,10 +378,10 @@ async fn script_reload_swaps_hooks_and_keeps_the_old_ast_on_error() {
 }
 
 /// Spec §3: what `finding(...)` records is read back through the command
-/// surface — `findings.list` returns every finding as an object, newest last,
+/// surface — `script.findings` returns every finding as an object, newest last,
 /// plus how many the bounded sink had to drop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn findings_list_reads_back_what_scripts_recorded() {
+async fn script_findings_reads_back_what_scripts_recorded() {
     let script = TempScript::new(
         "observer",
         r#"
@@ -397,8 +397,8 @@ async fn findings_list_reads_back_what_scripts_recorded() {
     assert_eq!(h.x_v().await.as_deref(), Some("seen"));
 
     let out = h
-        .invoke("findings.list", Params::default())
-        .expect("findings.list runs");
+        .invoke("script.findings", Params::default())
+        .expect("script.findings runs");
     assert_eq!(field(&out, "dropped"), &Value::Int(0));
     let Value::Array(items) = field(&out, "findings") else {
         panic!("findings is an array: {out:?}");
@@ -424,8 +424,8 @@ async fn findings_list_reads_back_what_scripts_recorded() {
 
     // `limit` keeps the newest.
     let out = h
-        .invoke("findings.list", params(&[("limit", Value::Int(1))]))
-        .expect("findings.list with a limit");
+        .invoke("script.findings", params(&[("limit", Value::Int(1))]))
+        .expect("script.findings with a limit");
     let Value::Array(items) = field(&out, "findings") else {
         panic!("findings is an array");
     };

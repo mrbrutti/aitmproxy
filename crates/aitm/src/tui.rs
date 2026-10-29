@@ -27,10 +27,10 @@ use std::time::Duration;
 
 use aitm_bus_client::InProcessHandler;
 use aitm_core::{
-    BrowserDriver, Config, FlowStore, McpTransport, PipelineClient, Proxy, ProxyClient, Registry,
-    ScopeRateGuard,
+    AgentState, BrowserDriver, Config, FlowStore, Frontend, McpTransport, PipelineClient, Proxy,
+    ProxyClient, Registry, ScopeRateGuard,
 };
-use aitm_mcp::McpServer;
+use aitm_mcp::{ConnCtx, McpServer};
 use aitm_tui::{RunOptions, TransportChoice};
 use tracing::{info, warn};
 
@@ -127,6 +127,12 @@ pub fn services(
 /// An `McpServer` over `services` on `transport`, carrying the SSRF policy
 /// and PoC dir — the one way every server in this binary is built (the
 /// server path's, and both of [`build_servers`]).
+///
+/// The M4 agent policy gate (and F4 push / F2 audit) are wired by the caller,
+/// not here, because they differ by surface: the bare-`aitm` server path and
+/// the `aitm tui` loopback **agent** transport carry the gate (seeded from
+/// `mcp.policy`); the TUI's own in-process server is the operator and bypasses
+/// it (see [`build_servers`]).
 pub fn server(cfg: &Config, transport: McpTransport, services: &Services) -> McpServer {
     McpServer::new(services.registry.clone(), transport)
         .with_ssrf_policy(cfg.browser.ssrf.clone())
@@ -211,7 +217,15 @@ pub fn init_tracing() -> TuiLog {
 /// Both are built by [`server`], exactly as the server path builds its one.
 pub fn build_servers(cfg: &Config, services: Services) -> (Option<McpServer>, InProcessHandler) {
     let agent = match &cfg.mcp.transport {
-        McpTransport::LoopbackTcp { .. } => Some(server(cfg, cfg.mcp.transport.clone(), &services)),
+        // The loopback transport is agent-facing, so it carries the M4 policy gate
+        // seeded from `mcp.policy` (default `auto`) and the operator/agent token
+        // classes — an external agent here is gated exactly as on the bare-`aitm`
+        // server path, not left ungated.
+        McpTransport::LoopbackTcp { .. } => Some(
+            server(cfg, cfg.mcp.transport.clone(), &services)
+                .with_agent_state(Arc::new(AgentState::new(cfg.mcp.policy)))
+                .with_mcp_roles(cfg.mcp.operator_token.clone(), cfg.mcp.stdio_role),
+        ),
         McpTransport::Stdio => {
             warn!("mcp.transport is stdio, which would share the terminal with the TUI; the agent transport is not served");
             None
@@ -219,9 +233,14 @@ pub fn build_servers(cfg: &Config, services: Services) -> (Option<McpServer>, In
     };
 
     // The TUI-facing server is never served on a transport, so the variant is
-    // only a label; `handle` is called directly through the handler.
+    // only a label; `handle` is called directly through the handler. The TUI is
+    // the operator's own control surface, so its calls run as
+    // `Frontend::Operator`, which bypasses the agent policy gate (an operator is
+    // the control) — otherwise the operator could not arm intercept, mutate or
+    // kill from their own UI.
     let ui = Arc::new(server(cfg, McpTransport::Stdio, &services));
-    let handler: InProcessHandler = Arc::new(move |line: &str| ui.handle(line));
+    let handler: InProcessHandler =
+        Arc::new(move |line: &str| ui.handle_on(&ConnCtx::new(Frontend::Operator), line));
     (agent, handler)
 }
 

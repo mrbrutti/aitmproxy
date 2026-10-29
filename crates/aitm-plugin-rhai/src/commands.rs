@@ -1,5 +1,5 @@
 //! The tier's own operator-facing commands (spec §3, §8): `script.validate`,
-//! `script.reload`, and `findings.list`, registered by [`ScriptCommands`] —
+//! `script.reload`, and `script.findings`, registered by [`ScriptCommands`] —
 //! one more `Plugin` whose `load` adds native `Command`s, so MCP `tools/list`
 //! and the CLI (`aitm script validate --path x.rhai`) pick them up with no
 //! special casing.
@@ -14,8 +14,11 @@
 //!   plugin; a recompile that fails leaves the previous good AST in service.
 //!   Commands and options the script's `load(reg)` registered are not
 //!   re-run — those still need a restart (the registry is sealed once built).
-//! - **`findings.list { limit? }`** reads the [`FindingSink`] back: every
-//!   finding as an object (newest last) and how many the bounded sink dropped.
+//! - **`script.findings { limit? }`** reads the in-memory [`FindingSink`] back:
+//!   every finding a script emitted with `finding(...)` this run, as an object
+//!   (newest last), and how many the bounded sink dropped. Distinct from the
+//!   persistent `findings.*` store (`aitm-findings`): this lists only the
+//!   current process's script-emitted findings and persists nothing.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -68,7 +71,7 @@ impl Plugin for ScriptCommands {
             loader: Arc::clone(&self.loader),
             scripts: self.scripts.clone(),
         }));
-        reg.add_command(Arc::new(FindingsList {
+        reg.add_command(Arc::new(ScriptFindings {
             findings: Arc::clone(&self.findings),
         }));
     }
@@ -83,7 +86,7 @@ struct Reload {
     scripts: Vec<Arc<ScriptHandle>>,
 }
 
-struct FindingsList {
+struct ScriptFindings {
     findings: Arc<dyn FindingSink>,
 }
 
@@ -208,15 +211,16 @@ impl Command for Reload {
     }
 }
 
-impl Command for FindingsList {
+impl Command for ScriptFindings {
     fn name(&self) -> &str {
-        "findings.list"
+        "script.findings"
     }
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "Findings scripts recorded with finding(...): each as an object, oldest \
-                          first, plus how many the bounded in-memory sink dropped."
+            description: "Findings scripts emitted with finding(...) this run (in-memory, not \
+                          persisted): each as an object, oldest first, plus how many the bounded \
+                          sink dropped. For the persistent store use findings.list/get/record."
                 .to_string(),
             params: vec![param(
                 "limit",

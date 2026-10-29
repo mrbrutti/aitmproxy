@@ -66,6 +66,9 @@ impl Command for ScopeAdd {
     fn name(&self) -> &str {
         "scope.add"
     }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Sensitive
+    }
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
@@ -99,6 +102,13 @@ impl Command for ScopeAdd {
         });
         Ok(Value::Str(entry))
     }
+
+    fn summarize(&self, _args: &Params, result: &Value) -> Option<String> {
+        match result {
+            Value::Str(host) => Some(format!("added {host} to scope")),
+            _ => None,
+        }
+    }
 }
 
 /// `scope.remove {host}` → remove a scope entry; returns whether one was removed.
@@ -131,6 +141,9 @@ struct ScopeList;
 impl Command for ScopeList {
     fn name(&self) -> &str {
         "scope.list"
+    }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Read
     }
 
     fn schema(&self) -> ParamSchema {

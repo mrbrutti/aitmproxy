@@ -12,14 +12,22 @@ use std::time::SystemTime;
 
 use aitm::wire::build_proxy;
 use aitm_core::{
-    Body, Config, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow, HttpRequest,
-    HttpVersion, InterceptState, McpTransport, ProxyClient, ScopeEntry,
+    AgentPolicy, AgentState, Body, Config, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, HeaderMap,
+    HttpFlow, HttpRequest, HttpVersion, InterceptState, McpTransport, ProxyClient, ScopeEntry,
 };
 use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 47] = [
+const EXPECTED_TOOLS: [&str; 53] = [
+    // M4 agent-control and F4 subscription tools, registered unconditionally by
+    // the `AgentPlugin` and `SubscriptionPlugin` in `wire.rs`.
+    "agent.status",
+    "agent.set",
+    "agent.activity",
+    "agent.approve",
+    "flow.subscribe",
+    "flow.unsubscribe",
     "flow.list",
     "flow.get",
     "flow.detail",
@@ -451,17 +459,17 @@ fn config_get_reaches_plugins_over_both_frontends() {
 #[test]
 fn scope_add_gate_is_wired_default_off() {
     // Default config: the flag is off, so the agent (MCP) frontend is refused.
+    // Run the agent under `All` so what decides is scope.add's own config gate, not
+    // the policy: under the default `Auto` every Sensitive command is refused
+    // outright (spec D2), which would mask the gate this test is proving.
     let mut cfg = config("gate-off");
     cfg.scope.allow_agent_widen = false;
     let proxy = build_proxy(&cfg).expect("build proxy");
     let store = proxy.store();
     let client: Arc<dyn ProxyClient> = Arc::new(UnusedClient);
-    let server = McpServer::new(proxy.registry_arc(), McpTransport::Stdio).with_services(
-        store,
-        client,
-        proxy.guard(),
-        None,
-    );
+    let server = McpServer::new(proxy.registry_arc(), McpTransport::Stdio)
+        .with_services(store, client, proxy.guard(), None)
+        .with_agent_state(Arc::new(AgentState::new(AgentPolicy::All)));
     let resp = rpc(
         &server,
         1,
@@ -480,12 +488,9 @@ fn scope_add_gate_is_wired_default_off() {
     let proxy2 = build_proxy(&cfg2).expect("build proxy");
     let store2 = proxy2.store();
     let client2: Arc<dyn ProxyClient> = Arc::new(UnusedClient);
-    let server2 = McpServer::new(proxy2.registry_arc(), McpTransport::Stdio).with_services(
-        store2,
-        client2,
-        proxy2.guard(),
-        None,
-    );
+    let server2 = McpServer::new(proxy2.registry_arc(), McpTransport::Stdio)
+        .with_services(store2, client2, proxy2.guard(), None)
+        .with_agent_state(Arc::new(AgentState::new(AgentPolicy::All)));
     let resp2 = rpc(
         &server2,
         1,

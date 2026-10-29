@@ -173,6 +173,9 @@ impl Command for FlowMutate {
     fn name(&self) -> &str {
         "flow.mutate"
     }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Write
+    }
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
@@ -270,6 +273,9 @@ impl Command for RequestSend {
     fn name(&self) -> &str {
         "request.send"
     }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Write
+    }
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
@@ -305,5 +311,13 @@ impl Command for RequestSend {
         // authority before sending; the command does not re-check.
         let sent = block_on(host.client().send(req))?;
         Ok(Value::Str(sent.id.to_string()))
+    }
+
+    fn summarize(&self, args: &Params, result: &Value) -> Option<String> {
+        let Value::Str(id) = result else {
+            return None;
+        };
+        let authority = args.get_str("authority").ok()?;
+        Some(format!("sent request to {authority} → captured as {id}"))
     }
 }

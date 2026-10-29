@@ -9,6 +9,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::agent::AgentPolicy;
+use crate::ctx::Frontend;
+
 /// Top-level configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -19,6 +22,7 @@ pub struct Config {
     pub mcp: McpConfig,
     pub browser: BrowserConfig,
     pub poc: PocConfig,
+    pub findings: FindingsConfig,
     /// Skip verification of upstream server certificates. **Off by default**:
     /// the proxy verifies upstream TLS against the platform roots. Turning this
     /// on (for a lab with self-signed targets) trusts any upstream certificate.
@@ -54,6 +58,7 @@ impl Default for Config {
             mcp: McpConfig::default(),
             browser: BrowserConfig::default(),
             poc: PocConfig::default(),
+            findings: FindingsConfig::default(),
             ssl_insecure: false,
             max_flows: crate::store::DEFAULT_MAX_FLOWS,
             max_flow_bytes: crate::store::DEFAULT_MAX_FLOW_BYTES,
@@ -128,6 +133,16 @@ pub struct PocConfig {
     /// `poc.artifact` only serves files confined to this directory, so a
     /// remote/web surface can read run artifacts safely.
     pub out_dir: Option<PathBuf>,
+}
+
+/// Persistent findings / run-history store configuration (M4 Stream B).
+#[derive(Debug, Clone, Default)]
+pub struct FindingsConfig {
+    /// Where the findings store writes one human-readable YAML per finding plus a
+    /// `runs.jsonl` run-history log. `None` (the default) disables persistence:
+    /// `findings.list`/`get` return nothing and `findings.record` errors. A
+    /// sensible deployment points this at a sibling of `poc.dir`.
+    pub dir: Option<PathBuf>,
 }
 
 /// Scope configuration. Deny-by-default: an empty list means nothing is active.
@@ -258,12 +273,32 @@ pub enum McpTransport {
 #[derive(Debug, Clone)]
 pub struct McpConfig {
     pub transport: McpTransport,
+    /// The token that marks a loopback-TCP connection as an autonomous agent
+    /// ([`Frontend::Mcp`]). For the loopback transport the required token also
+    /// lives on [`McpTransport::LoopbackTcp`]; this field is the canonical name
+    /// so wiring and audit can speak of "the agent token" directly.
+    pub agent_token: Option<String>,
+    /// The token that marks a loopback-TCP connection as a human operator
+    /// ([`Frontend::Operator`]). **Off by default**: without it, every
+    /// loopback connection is an agent, matching the M1/M2 posture.
+    pub operator_token: Option<String>,
+    /// The agent policy the server starts under (enforced from Task 4). Default
+    /// [`AgentPolicy::Auto`] per the milestone's adopted default.
+    pub policy: AgentPolicy,
+    /// The role a stdio connection is given (there is no token on stdio).
+    /// Default [`Frontend::Mcp`] — stdio is the agent-attach transport; an
+    /// operator attached over stdio sets this to [`Frontend::Operator`].
+    pub stdio_role: Frontend,
 }
 
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
             transport: McpTransport::Stdio,
+            agent_token: None,
+            operator_token: None,
+            policy: AgentPolicy::Auto,
+            stdio_role: Frontend::Mcp,
         }
     }
 }
@@ -277,6 +312,10 @@ pub enum BrowserEngine {
     Obscura,
     /// A system Chrome/Chromium (the M1 behaviour).
     Chrome,
+    /// A system Firefox, launched with a throwaway profile whose proxy prefs
+    /// point at aitmproxy and whose cert store trusts the MITM CA — the OS proxy
+    /// and OS trust store are never touched (M4 Task 13, Review Focus #5).
+    Firefox,
 }
 
 /// How to find and start the forked obscura.
@@ -301,6 +340,32 @@ impl Default for ObscuraConfig {
     }
 }
 
+/// How to find and start a system Firefox (used when `engine` is `Firefox`).
+///
+/// Firefox is driven over its remote-debugging (CDP) endpoint. Unlike obscura,
+/// trust and routing are configured per-profile (a throwaway profile), so this
+/// carries no CA flag: the launcher writes the proxy prefs and trusts the CA
+/// into that profile only.
+#[derive(Debug, Clone)]
+pub struct FirefoxConfig {
+    /// The `firefox` binary; a bare name is resolved on `PATH`. Default `firefox`.
+    pub binary: PathBuf,
+    /// Spawn → CDP connected; default 20 s (a cold Firefox profile is slow).
+    pub start_timeout: Duration,
+    /// Per-operation bound on the `BrowserDriver` primitives; default 30 s.
+    pub nav_timeout: Duration,
+}
+
+impl Default for FirefoxConfig {
+    fn default() -> Self {
+        Self {
+            binary: PathBuf::from("firefox"),
+            start_timeout: Duration::from_secs(20),
+            nav_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
 /// Embedded-browser configuration. Declared in `aitm-core` because `Config`
 /// references it; `aitm-browser` implements the driver against this type.
 #[derive(Debug, Clone)]
@@ -309,6 +374,8 @@ pub struct BrowserConfig {
     pub engine: BrowserEngine,
     /// Obscura launcher settings (used when `engine` is `Obscura`).
     pub obscura: ObscuraConfig,
+    /// Firefox launcher settings (used when `engine` is `Firefox`).
+    pub firefox: FirefoxConfig,
     /// The proxy upstream (`--proxy-server`).
     pub proxy_addr: SocketAddr,
     /// Chrome only: obscura has no head.
@@ -324,6 +391,7 @@ impl Default for BrowserConfig {
         Self {
             engine: BrowserEngine::default(),
             obscura: ObscuraConfig::default(),
+            firefox: FirefoxConfig::default(),
             // A dedicated loopback port, distinct from the main listener (8080):
             // the embedded browser dials this SSRF-filtered listener.
             proxy_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),

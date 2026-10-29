@@ -5,7 +5,7 @@
 //! aitm-tui --bus 127.0.0.1:9090 --token-file ~/.aitm/bus.token [--poc-dir dir]
 //! aitm-tui --fixture [path.json]
 //! aitm-tui --snapshot out.svg [--cols 200 --rows 50] [--fixture path]
-//! aitm-tui --snapshot-core out.svg      (the 50 core tools only)
+//! aitm-tui --snapshot-core out.svg      (the 56 core tools only)
 //! ```
 //! `--poc-dir` is where a built PoC (`P`) is written — `poc.build` answers
 //! with the YAML text; it should be the proxy's `poc.dir` so `poc.run` can
@@ -23,7 +23,7 @@ use aitm_tui::caps::TermCaps;
 use aitm_tui::theme::Theme;
 use aitm_tui::{fixture_app, fixture_app_core, snapshot, RunOptions, TransportChoice};
 
-const USAGE: &str = "usage: aitm-tui (--bus host:port (--token-file p | --token t (insecure: visible in ps)) [--allow-remote-bus] | --fixture [path]) [--poc-dir dir] [--ansi|--truecolor] [--poll ms]\n       aitm-tui --snapshot out.svg [--cols N --rows N]\n       aitm-tui --snapshot-core out.svg [--cols N --rows N]   (fixture limited to the 50 core tools)\n       --poc-dir: where P (poc.build) writes the PoC YAML; use the proxy's poc.dir so poc.run can read it";
+const USAGE: &str = "usage: aitm-tui (--bus host:port (--token-file p | --token t (insecure: visible in ps)) [--allow-remote-bus] | --fixture [path]) [--poc-dir dir] [--ansi|--truecolor] [--poll ms]\n       aitm-tui --snapshot out.svg [--cols N --rows N]\n       aitm-tui --snapshot-core out.svg [--cols N --rows N]   (fixture limited to the 56 core tools)\n       --poc-dir: where P (poc.build) writes the PoC YAML; use the proxy's poc.dir so poc.run can read it";
 
 /// Why a non-loopback bus is refused without the flag.
 const REMOTE_BUS_REFUSED: &str = "refusing a bus that is not on loopback: the token would travel in cleartext (the TLS bus is core follow-up F15). Pass --allow-remote-bus to do it anyway.";
@@ -34,7 +34,7 @@ struct Args {
     token_file: Option<PathBuf>,
     fixture: Option<Option<PathBuf>>,
     snapshot: Option<PathBuf>,
-    /// `--snapshot-core`: the fixture with only the 50 core tools.
+    /// `--snapshot-core`: the fixture with only the 56 core tools.
     snapshot_core: bool,
     cols: u16,
     rows: u16,
@@ -257,7 +257,7 @@ mod tests {
         );
         assert!(USAGE.contains("[--poc-dir dir]"), "{USAGE}");
         assert!(USAGE.contains("poc.build"), "{USAGE}");
-        assert!(USAGE.contains("50 core tools"), "{USAGE}");
+        assert!(USAGE.contains("56 core tools"), "{USAGE}");
     }
 
     #[test]

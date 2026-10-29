@@ -18,9 +18,9 @@ use anyhow::{bail, Context as _};
 use serde::Deserialize;
 
 use aitm_core::{
-    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, LimitConfig, MapsConfig,
-    McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SessionIoConfig,
-    SsrfPolicy, TlsConfig, Value,
+    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, FindingsConfig, FirefoxConfig,
+    Frontend, LimitConfig, MapsConfig, McpConfig, McpTransport, ObscuraConfig, PocConfig,
+    ScopeConfig, ScopeEntry, SessionIoConfig, SsrfPolicy, TlsConfig, Value,
 };
 use aitm_plugin_rhai::{RhaiConfig, ScriptEntry};
 use aitm_proto_l4::config::L4Config;
@@ -125,6 +125,7 @@ struct ConfigFile {
     mcp: Option<McpFile>,
     browser: Option<BrowserFile>,
     poc: Option<PocFile>,
+    findings: Option<FindingsFile>,
     ssl_insecure: Option<bool>,
     max_flows: Option<usize>,
     max_flow_bytes: Option<usize>,
@@ -165,6 +166,9 @@ impl ConfigFile {
         }
         if let Some(p) = self.poc {
             p.apply(&mut c.poc);
+        }
+        if let Some(f) = self.findings {
+            f.apply(&mut c.findings);
         }
         set(&mut c.ssl_insecure, self.ssl_insecure);
         set(&mut c.max_flows, self.max_flows);
@@ -452,12 +456,38 @@ struct McpFile {
     /// YAML tag. `default` keeps the key optional under `with`.
     #[serde(default, with = "serde_yaml::with::singleton_map")]
     transport: Option<TransportFile>,
+    /// A second loopback-TCP token; a connection presenting it is a human
+    /// operator ([`Frontend::Operator`]) rather than an agent.
+    operator_token: Option<String>,
+    /// The role a stdio connection speaks as (default `agent`).
+    stdio_role: Option<RoleFile>,
 }
 
 impl McpFile {
     fn apply(self, c: &mut McpConfig) {
         if let Some(t) = self.transport {
             c.transport = t.into();
+        }
+        if self.operator_token.is_some() {
+            c.operator_token = self.operator_token;
+        }
+        set(&mut c.stdio_role, self.stdio_role.map(Into::into));
+    }
+}
+
+/// `stdio_role: agent | operator`.
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RoleFile {
+    Agent,
+    Operator,
+}
+
+impl From<RoleFile> for Frontend {
+    fn from(r: RoleFile) -> Self {
+        match r {
+            RoleFile::Agent => Frontend::Mcp,
+            RoleFile::Operator => Frontend::Operator,
         }
     }
 }
@@ -484,6 +514,7 @@ impl From<TransportFile> for McpTransport {
 struct BrowserFile {
     engine: Option<EngineFile>,
     obscura: Option<ObscuraFile>,
+    firefox: Option<FirefoxFile>,
     proxy_addr: Option<SocketAddr>,
     headless: Option<bool>,
     ignore_cert_errors: Option<bool>,
@@ -497,6 +528,9 @@ impl BrowserFile {
         if let Some(o) = self.obscura {
             o.apply(&mut c.obscura);
         }
+        if let Some(f) = self.firefox {
+            f.apply(&mut c.firefox);
+        }
         set(&mut c.proxy_addr, self.proxy_addr);
         set(&mut c.headless, self.headless);
         set(&mut c.ignore_cert_errors, self.ignore_cert_errors);
@@ -507,12 +541,13 @@ impl BrowserFile {
     }
 }
 
-/// `engine: obscura | chrome`.
+/// `engine: obscura | chrome | firefox`.
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum EngineFile {
     Obscura,
     Chrome,
+    Firefox,
 }
 
 impl From<EngineFile> for BrowserEngine {
@@ -520,6 +555,7 @@ impl From<EngineFile> for BrowserEngine {
         match e {
             EngineFile::Obscura => BrowserEngine::Obscura,
             EngineFile::Chrome => BrowserEngine::Chrome,
+            EngineFile::Firefox => BrowserEngine::Firefox,
         }
     }
 }
@@ -539,6 +575,24 @@ impl ObscuraFile {
         }
         set_secs(&mut c.start_timeout, self.start_timeout);
         set_secs(&mut c.stop_timeout, self.stop_timeout);
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FirefoxFile {
+    binary: Option<PathBuf>,
+    start_timeout: Option<u64>,
+    nav_timeout: Option<u64>,
+}
+
+impl FirefoxFile {
+    fn apply(self, c: &mut FirefoxConfig) {
+        if let Some(b) = self.binary {
+            c.binary = b;
+        }
+        set_secs(&mut c.start_timeout, self.start_timeout);
+        set_secs(&mut c.nav_timeout, self.nav_timeout);
     }
 }
 
@@ -573,6 +627,21 @@ impl PocFile {
         }
         if let Some(d) = self.out_dir {
             c.out_dir = Some(d);
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FindingsFile {
+    /// Where the persistent findings store writes per-finding YAML + `runs.jsonl`.
+    dir: Option<PathBuf>,
+}
+
+impl FindingsFile {
+    fn apply(self, c: &mut FindingsConfig) {
+        if let Some(d) = self.dir {
+            c.dir = Some(d);
         }
     }
 }

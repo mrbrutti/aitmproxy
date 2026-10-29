@@ -85,6 +85,10 @@ impl Command for PocList {
         "poc.list"
     }
 
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Read
+    }
+
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description: "List the PoCs in the configured PoC directory (id, title, severity, \
@@ -141,6 +145,10 @@ struct PocGet;
 impl Command for PocGet {
     fn name(&self) -> &str {
         "poc.get"
+    }
+
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Read
     }
 
     fn schema(&self) -> ParamSchema {

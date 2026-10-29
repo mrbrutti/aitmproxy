@@ -769,6 +769,9 @@ impl Command for PocRunCommand {
     fn name(&self) -> &str {
         "poc.run"
     }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Write
+    }
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
@@ -802,6 +805,26 @@ impl Command for PocRunCommand {
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         run_poc_command(args, host, None)
     }
+
+    fn summarize(&self, _args: &Params, result: &Value) -> Option<String> {
+        poc_run_summary(result)
+    }
+}
+
+/// The one-line summary a `poc.run` result renders to (spec D3b), grounded in the
+/// verdict and the three artifacts the result carries.
+fn poc_run_summary(result: &Value) -> Option<String> {
+    let Value::Object(obj) = result else {
+        return None;
+    };
+    let passed = matches!(obj.get("passed"), Some(Value::Bool(true)));
+    let Some(Value::Str(capture)) = obj.get("finding_capture") else {
+        return None;
+    };
+    let verb = if passed { "passed" } else { "failed" };
+    Some(format!(
+        "PoC {verb} — finding capture {capture}, 3 artifacts"
+    ))
 }
 
 /// `poc.run` with the scripting tier wired in: identical to [`PocRunCommand`]
@@ -836,6 +859,10 @@ impl Command for ScriptedPocRunCommand {
 
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         run_poc_command(args, host, Some(&self.executor))
+    }
+
+    fn summarize(&self, _args: &Params, result: &Value) -> Option<String> {
+        poc_run_summary(result)
     }
 }
 

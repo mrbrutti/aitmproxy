@@ -100,6 +100,9 @@ impl Command for Navigate {
     fn name(&self) -> &str {
         "browser.navigate"
     }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Write
+    }
 
     fn schema(&self) -> ParamSchema {
         schema(
@@ -149,6 +152,9 @@ impl Command for Click {
     fn name(&self) -> &str {
         "browser.click"
     }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Write
+    }
 
     fn schema(&self) -> ParamSchema {
         schema(
@@ -181,6 +187,9 @@ impl Command for Type {
     fn name(&self) -> &str {
         "browser.type"
     }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Write
+    }
 
     fn schema(&self) -> ParamSchema {
         schema(
@@ -212,6 +221,9 @@ impl Command for Screenshot {
     fn name(&self) -> &str {
         "browser.screenshot"
     }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Read
+    }
 
     fn schema(&self) -> ParamSchema {
         schema(
@@ -231,6 +243,9 @@ struct Eval;
 impl Command for Eval {
     fn name(&self) -> &str {
         "browser.eval"
+    }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Write
     }
 
     fn schema(&self) -> ParamSchema {
@@ -252,6 +267,9 @@ struct GetDom;
 impl Command for GetDom {
     fn name(&self) -> &str {
         "browser.get_dom"
+    }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Read
     }
 
     fn schema(&self) -> ParamSchema {

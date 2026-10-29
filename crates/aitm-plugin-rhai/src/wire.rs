@@ -6,7 +6,7 @@
 //! the executor the PoC runner dispatches `script` steps through, the error
 //! sink the chain is bound into once it exists, and the plugin that registers
 //! the tier's own commands (`script.validate`, `script.reload`,
-//! `findings.list`). [`build`] returns all five; [`load_scripts`] is the
+//! `script.findings`). [`build`] returns all five; [`load_scripts`] is the
 //! one-line form for a host that only wants plugins, and [`executor`] builds
 //! the PoC-side half from a loader the caller already has.
 //!
@@ -38,7 +38,7 @@ pub struct ScriptTier {
     /// Bind the chain into this once it exists, so a failed hook's
     /// `Event::Error` reaches the bus instead of only the log.
     pub error_sink: Arc<ErrorSink>,
-    /// Registers `script.validate`, `script.reload` and `findings.list`; the
+    /// Registers `script.validate`, `script.reload` and `script.findings`; the
     /// host registers it among its command providers, after the scripts.
     pub commands: ScriptCommands,
     /// The sandbox limits the engine was built with, for a host to check its
