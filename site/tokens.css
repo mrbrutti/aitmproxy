@@ -10,7 +10,7 @@
 @import url("https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..600&family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap");
 
 :root {
-  color-scheme: light;
+  color-scheme: light dark;
 
   /* ground + ink (app light values) */
   --paper:    #FFFFFF;   /* body / panels */
@@ -108,6 +108,48 @@
   --dur: 200ms;
   --dur-press: 120ms;
   --dur-reveal: 600ms;
+}
+
+/* follow the system theme — the app's dark palette (docs/design/tokens.json) */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper:    #161618;
+    --paper-2:  #1E1E20;
+    --paper-3:  #262628;
+    --page:     #111113;
+    --hairline: #2E2E31;
+    --rule:     #252527;
+    --control:  #45454A;
+    --ink:      #E6E6E8;
+    --ink-2:    #B4B4B8;
+    --ink-3:    #8E8E93;
+
+    --accent:      #60A5FA;
+    --accent-deep: #3B82F6;
+    --accent-tint: #1E2A44;
+    --accent-ink:  #0B1220;
+    --link:        #7DB2F8;
+
+    --signal:      #F5A524;
+    --signal-deep: #FBBF24;
+    --signal-tint: #3A2E12;
+    --signal-ink:  #1F1300;
+
+    --agent:      #2DD4BF;
+    --agent-deep: #5EEAD4;
+    --agent-tint: #113A36;
+
+    --m-get-fg: #93C5FD;  --m-get-bg: #1E2A44;
+    --m-post-fg: #86EFAC; --m-post-bg: #14322A;
+    --m-put-fg: #FCD34D;  --m-put-bg: #3A2E12;
+    --m-patch-fg: #FDBA74;--m-patch-bg: #3B2516;
+    --m-del-fg: #FCA5A5;  --m-del-bg: #3B1C1C;
+    --m-ws-fg: #C4B5FD;   --m-ws-bg: #2E2550;
+    --st-ok: #4ADE80;     --st-warn: #FCD34D;  --st-err: #F87171;  --st-info: #C4B5FD;
+
+    --shadow-float: 0 12px 32px rgba(0,0,0,0.55), 0 1px 2px rgba(0,0,0,0.5);
+    --shadow-lift:  0 4px 14px rgba(0,0,0,0.45), 0 1px 2px rgba(0,0,0,0.4);
+  }
 }
 
 /* browser surfaces, themed from the palette */

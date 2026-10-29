@@ -153,10 +153,16 @@ em.hint { font-style: italic; }
 .flows .url { max-width: 0; width: 100%; overflow: hidden; text-overflow: ellipsis; }
 .flows tr.is-held td { background: var(--signal-tint); }
 .flows tr.is-held td:first-child { box-shadow: inset 3px 0 0 var(--signal); }
-.chip { display: inline-block; padding: 0 0.4em; border-radius: var(--radius); line-height: 1.45; }
+.chip { display: inline-block; padding: 0 0.42em; border-radius: var(--radius-badge); line-height: 1.5; font-weight: 500; }
 .chip--armed { background: var(--signal); color: var(--signal-ink); }
-.chip--ok { color: var(--ink); }
-.chip--ws { border: 1px solid var(--hairline); }
+.chip--ok { color: var(--st-ok); }
+.chip--ws { color: var(--m-ws-fg); background: var(--m-ws-bg); }
+/* method badges + status text carry the app's colours, so the list isn't flat */
+.flows td .m { font-weight: 600; }
+.flows .st-ok { color: var(--st-ok); }
+.flows .st-warn { color: var(--st-warn); }
+.flows .st-err { color: var(--st-err); }
+.flows .num { color: var(--ink-3); }
 .ui-detail { border-top: 1px solid var(--hairline); padding: 0.75rem 0.85rem; }
 .ui-detail .tabs { display: flex; gap: 1.25rem; font-family: var(--serif); font-size: var(--fs-small); margin-bottom: 0.6rem; }
 .ui-detail .tabs span[aria-current] { text-decoration: underline; text-decoration-color: var(--accent); text-decoration-thickness: 2px; text-underline-offset: 0.25em; }
