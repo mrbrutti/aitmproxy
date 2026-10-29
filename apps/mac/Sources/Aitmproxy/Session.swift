@@ -231,6 +231,21 @@ final class Session {
     var agentPolicy: AgentPolicy = .all
     var agentActionsLastMinute = 0
     var bus: BusState = .disconnected
+    /// The role the live connection resolved to (`"operator"`/`"agent"`), from
+    /// the server's `initialize` echo (spec Decision C). `nil` while
+    /// disconnected or when the server echoed no role. Surfaced in the status bar.
+    var resolvedRole: String?
+    /// Set when the operator's Expected role (Settings ▸ Bus) disagrees with the
+    /// resolved role, or the server echoed no role to confirm it (spec AC8).
+    var roleWarning = false
+    /// Bumped by Proxy ▸ Reconnect Bus (⌃⌘R) so the shell re-resolves the
+    /// endpoint and reconnects — picking up a newly pasted operator token.
+    var reconnectTick = 0
+    /// The single active core connection's id this launch (Task 5). Every flow
+    /// ingested over the bus is stamped with it; fixture/offline data uses the
+    /// well-known `.fixture` id. The seam for multi-core: a second connection is
+    /// additive because every stored flow already carries its originating id.
+    let activeCoreID: CoreID = Store.usesFixtures ? .fixture : CoreID()
     var scopeHosts: [String] = []
     var findingsCount = 0
     var browserTabs = 0
@@ -248,6 +263,12 @@ final class Session {
     var settingsTab: SettingsTab = SettingsTab(rawValue: UserDefaults.standard.string(forKey: "settings.tab") ?? "") ?? .general {
         didSet { if !Store.isOverridden { UserDefaults.standard.set(settingsTab.rawValue, forKey: "settings.tab") } }
     }
+
+    /// The switchable, persistent active-core choice (Task 7, AC10): embedded vs
+    /// external, driven from Settings ▸ Bus. Set once the live stack is built
+    /// (`ShellView`); `nil` in fixture/snapshot runs, where Bus settings show the
+    /// persisted default without a live core to switch.
+    @ObservationIgnored var connection: ActiveConnectionModel?
 
     /// Where actions go: the bus, or the fixture session itself.
     @ObservationIgnored lazy var actions: any FlowActions = FixtureActions(session: self)
@@ -343,6 +364,12 @@ final class Session {
     @ObservationIgnored lazy var browser = BrowserState(session: self)
     @ObservationIgnored lazy var activity = ActivityState(session: self)
     var activityLogVisible = false
+    /// The embedded core's health and captured logs (Task 8): the status-bar
+    /// health dot and the on-demand core-log panel read this. The
+    /// `EmbeddedCoreController` fills it; `nil` connection means no embedded core.
+    @ObservationIgnored lazy var coreHealth = CoreHealthState()
+    /// Proxy ▸ Core Log (⌃⌘L) toggles the on-demand core-log panel.
+    var coreLogVisible = false
     /// The flow a Build PoC sheet is for (S-053).
     var buildPoCFlowID: FlowID?
 
@@ -401,6 +428,19 @@ final class Session {
         focused = id
         ensureDetail(for: id)
     }
+
+    /// Records the role the bus reported for this connection and flags a mismatch
+    /// against the operator's Expected-role setting (client-side only, never sent
+    /// to the server). Called by the bus service on connect; `nil` on disconnect.
+    func applyResolvedRole(_ role: String?) {
+        resolvedRole = role
+        let expected = ExpectedRole(rawValue: UserDefaults.standard.string(forKey: "bus.expectedRole") ?? "")
+        roleWarning = roleMismatch(expected: expected, resolved: role)
+    }
+
+    /// Proxy ▸ Reconnect Bus: drop and re-open the connection so a newly pasted
+    /// operator token takes effect without restarting the app.
+    func reconnectBus() { reconnectTick += 1 }
 
     /// `3 selected · 24.1 KB · 1.47 s` while more than one row is selected (S-012).
     var selectionSummary: SelectionSummary? {
@@ -503,6 +543,7 @@ final class Session {
         upBytesPerSecond = 6_000
         downBytesPerSecond = 3_000
         bus = .connected("127.0.0.1:9090")
+        resolvedRole = "operator"
         select(Fixtures.rows[9].id)
         poc.load()
         findingsCount = poc.findings.count

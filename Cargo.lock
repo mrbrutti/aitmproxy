@@ -130,6 +130,7 @@ dependencies = [
  "futures",
  "indexmap",
  "regex",
+ "rustls",
  "tokio",
  "tracing",
  "uuid",
@@ -162,6 +163,7 @@ dependencies = [
  "futures",
  "serde_json",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

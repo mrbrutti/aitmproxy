@@ -477,6 +477,39 @@ fn initialize_handshake() {
     assert_eq!(rpc(&srv, 2, "ping", json!({}))["result"], json!({}));
 }
 
+/// AC6 + Decision C: `initialize` echoes a top-level `role` of `"operator"` for
+/// an operator connection (alongside `protocolVersion`, not inside `serverInfo`).
+#[test]
+fn initialize_echoes_operator_role() {
+    let srv = server();
+    let resp: JsonValue = serde_json::from_str(
+        &srv.handle_on(
+            &ConnCtx::new(Frontend::Operator),
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        )
+        .expect("initialize gets a reply"),
+    )
+    .expect("response is JSON");
+    assert_eq!(resp["result"]["role"], json!("operator"));
+    // It sits at the top level of the result, not inside `serverInfo`.
+    assert!(resp["result"]["serverInfo"]["role"].is_null());
+}
+
+/// AC6 + Decision C: `initialize` echoes `role: "agent"` for an agent connection.
+#[test]
+fn initialize_echoes_agent_role() {
+    let srv = server();
+    let resp: JsonValue = serde_json::from_str(
+        &srv.handle_on(
+            &ConnCtx::agent(),
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        )
+        .expect("initialize gets a reply"),
+    )
+    .expect("response is JSON");
+    assert_eq!(resp["result"]["role"], json!("agent"));
+}
+
 /// Minor (a): `initialize` answers with the server's own `PROTOCOL_VERSION`,
 /// not whatever version the client asked for.
 #[test]
@@ -815,7 +848,7 @@ async fn serve_lines_answers_each_request_on_its_own_line() {
 #[tokio::test]
 async fn loopback_requires_token() {
     let srv = Arc::new(server());
-    let listener = LoopbackTcp::bind(0, "s3cret".into())
+    let listener = LoopbackTcp::bind(0, "s3cret".into(), None)
         .await
         .expect("bind 127.0.0.1:0");
     let addr = listener.local_addr();
@@ -893,6 +926,7 @@ async fn serve_binds_loopback_from_config() {
         McpTransport::LoopbackTcp {
             port: 0,
             token: "tok".into(),
+            endpoint_file: None,
         },
     )
     .with_services(
@@ -940,6 +974,7 @@ async fn serve_role_server() -> SocketAddr {
         McpTransport::LoopbackTcp {
             port: 0,
             token: "agent".into(),
+            endpoint_file: None,
         },
     )
     .with_services(
@@ -1006,6 +1041,57 @@ async fn unknown_token_refused() {
     .await;
     assert_eq!(reply["error"]["code"], json!(-32001));
     assert_eq!(reply["error"]["message"], json!("unauthorized"));
+}
+
+/// Task 2 Review Focus: an empty-string `operator_token` is treated as *not
+/// configured*. It must not enable operator, and an empty presented token must
+/// match neither the agent token nor a (nonexistent) operator token, so it is
+/// refused `-32001` and never resolves to operator. Guards the transport's
+/// existing empty-token filter (`LoopbackTcp::with_operator_token`).
+#[tokio::test]
+async fn empty_operator_token_is_not_operator() {
+    let srv = McpServer::new(
+        role_registry(),
+        McpTransport::LoopbackTcp {
+            port: 0,
+            token: "agent".into(),
+            endpoint_file: None,
+        },
+    )
+    .with_services(
+        Arc::new(MemFlowStore::new()),
+        Arc::new(StubClient),
+        Arc::new(StdGuard::default()),
+        None,
+    )
+    .with_agent_state(ungated())
+    .with_mcp_roles(Some(String::new()), Frontend::Mcp);
+    let (tx, rx) = tokio::sync::oneshot::channel::<SocketAddr>();
+    tokio::spawn(
+        srv.on_bound(move |addr| {
+            let _ = tx.send(addr);
+        })
+        .serve(),
+    );
+    let addr = rx.await.expect("serve reports its bound address");
+
+    // An empty presented token matches neither token → refused, never operator.
+    let refused = first_reply(
+        addr,
+        "{\"token\":\"\"}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"demo.frontend\",\"arguments\":{}}}\n",
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], json!(-32001));
+    assert_eq!(refused["error"]["message"], json!("unauthorized"));
+
+    // The agent token still works and resolves to agent — an empty operator
+    // token is simply ignored, not treated as a second match.
+    let agent = first_reply(
+        addr,
+        "{\"token\":\"agent\"}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"demo.frontend\",\"arguments\":{}}}\n",
+    )
+    .await;
+    assert_eq!(agent["result"]["structuredContent"], json!("mcp"));
 }
 
 /// AC-M4-1: stdio defaults to the agent role, threaded through `serve_lines`.
@@ -1162,6 +1248,14 @@ fn policy_server(state: Arc<AgentState>, config: Option<Arc<Config>>) -> McpServ
         name: "scope.add",
         gate: |c| c.scope.allow_agent_widen,
     }));
+    // F8: a Sensitive authoring command with its own config gate that is
+    // deliberately NOT in `defers_to_command_gate`, so `All` must still refuse it
+    // (its gate is always on here, to prove the policy refuses before the gate is
+    // even consulted). Mirrors `script.save`/`reload`/`enable`/`disable`.
+    reg.add_command(Arc::new(GatedCmd {
+        name: "script.save",
+        gate: |_| true,
+    }));
     reg.add_plugin(Box::new(AgentPlugin::new(state.clone())));
     let mut srv = McpServer::new(Arc::new(reg), McpTransport::Stdio)
         .with_services(
@@ -1299,6 +1393,52 @@ fn agent_status_readable_by_any_role() {
             "policy reported to {role:?}"
         );
     }
+}
+
+/// F8 AC8: agent script-authoring is supported under `Ask` (parked for operator
+/// approval) and **refused under `All`**. `script.save` is `Sensitive` with its
+/// own config gate, but it is deliberately NOT in `defers_to_command_gate`, so an
+/// autonomous `All` agent cannot self-authorize it — even with its gate on — the
+/// way `ca.install` can. A human must be in the loop (`Ask`). `Auto` refuses it;
+/// an operator is never policy-gated. This locks the posture that an autonomous
+/// agent cannot write executable, live-traffic-mutating Rhai hooks on a flag alone.
+#[test]
+fn f8_script_authoring_not_auto_authorized_under_all() {
+    let cfg = config_gates_on(); // ca.install's gate is on, for the contrast below.
+
+    let all = policy_server(
+        Arc::new(AgentState::new(AgentPolicy::All)),
+        Some(cfg.clone()),
+    );
+    assert!(
+        is_refused(&call_as(&all, Frontend::Mcp, "script.save")),
+        "All must refuse script.save (not in defers_to_command_gate), even with its gate on"
+    );
+    assert!(
+        !is_refused(&call_as(&all, Frontend::Mcp, "ca.install")),
+        "contrast: ca.install IS auto-authorizable under All with its gate on"
+    );
+    assert!(
+        !is_refused(&call_as(&all, Frontend::Operator, "script.save")),
+        "an operator is never policy-gated and authors freely"
+    );
+
+    let auto = policy_server(
+        Arc::new(AgentState::new(AgentPolicy::Auto)),
+        Some(cfg.clone()),
+    );
+    assert!(
+        is_refused(&call_as(&auto, Frontend::Mcp, "script.save")),
+        "Auto refuses a Sensitive script command outright"
+    );
+
+    // `Ask` parks a Sensitive agent call for operator approval; until approved it
+    // does not run inline, so the call is not successful here.
+    let ask = policy_server(Arc::new(AgentState::new(AgentPolicy::Ask)), Some(cfg));
+    assert!(
+        is_refused(&call_as(&ask, Frontend::Mcp, "script.save")),
+        "Ask parks script.save for approval (not run inline)"
+    );
 }
 
 /// A config with both agent capability gates turned on, so a test can prove the

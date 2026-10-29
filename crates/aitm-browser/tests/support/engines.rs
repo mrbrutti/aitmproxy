@@ -10,7 +10,9 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use aitm_core::{BrowserConfig, BrowserEngine, ObscuraConfig};
+use aitm_core::{
+    engine_may_reach_private, BrowserConfig, BrowserEngine, ObscuraConfig, ScopeEntry, SsrfPolicy,
+};
 
 /// The engines the environment enables, in a fixed order: `Chrome` when
 /// `AITM_CHROME` is set, `Obscura` when `AITM_OBSCURA` is set. Prints the skip
@@ -37,14 +39,27 @@ pub fn engines() -> Vec<BrowserEngine> {
 
 /// A `BrowserConfig` for `engine` routed through `proxy`, with the obscura
 /// binary taken from `AITM_OBSCURA_BIN` (unset → the discovery order).
+///
+/// These tests drive loopback targets (the proxy listener doubles as the origin
+/// on `127.0.0.1`). They run under the **strict default** SSRF policy and
+/// authorize that target the real operator way — a scoped loopback host — so the
+/// engine's `--allow-private-network` flag is lifted via policy ∪ scope (audit
+/// I15), never by flipping `block_private`. Mirrors what the launch site (and the
+/// production `main`) computes with [`engine_may_reach_private`].
 pub fn config_for(engine: BrowserEngine, proxy: SocketAddr) -> BrowserConfig {
+    let ssrf = SsrfPolicy::default();
+    let scope = [ScopeEntry {
+        host: proxy.to_string(),
+    }];
     BrowserConfig {
         engine,
         obscura: ObscuraConfig {
             binary: std::env::var_os("AITM_OBSCURA_BIN").map(PathBuf::from),
+            allow_private: engine_may_reach_private(&ssrf, &scope),
             ..ObscuraConfig::default()
         },
         proxy_addr: proxy,
+        ssrf,
         ..BrowserConfig::default()
     }
 }

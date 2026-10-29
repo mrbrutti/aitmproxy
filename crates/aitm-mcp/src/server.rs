@@ -723,6 +723,16 @@ struct Services {
 
 type OnBound = Box<dyn FnOnce(SocketAddr) + Send>;
 
+/// The wire string for a connection's role in the `initialize` echo (Decision C):
+/// `"operator"` for the operator role, `"agent"` for every other frontend. The
+/// two strings are a fixed part of the additive protocol.
+fn role_str(role: Frontend) -> &'static str {
+    match role {
+        Frontend::Operator => "operator",
+        _ => "agent",
+    }
+}
+
 /// Registry handle + transport selection + the services commands run against.
 pub struct McpServer {
     registry: Arc<Registry>,
@@ -1057,8 +1067,12 @@ impl McpServer {
         }
         match selected {
             McpTransport::Stdio => transport::serve_stdio(server).await,
-            McpTransport::LoopbackTcp { port, token } => {
-                let listener = LoopbackTcp::bind(port, token)
+            McpTransport::LoopbackTcp {
+                port,
+                token,
+                endpoint_file,
+            } => {
+                let listener = LoopbackTcp::bind(port, token, endpoint_file)
                     .await?
                     .with_operator_token(operator_token.map(|t| t.to_string()));
                 if let Some(f) = on_bound {
@@ -1136,6 +1150,10 @@ impl McpServer {
                 // needs a different version sees the one we support.
                 Ok(json!({
                     "protocolVersion": PROTOCOL_VERSION,
+                    // The connection's resolved role, echoed so each frontend can
+                    // show it and warn on mismatch (Decision C). Additive and
+                    // top-level — it describes this connection, not the server.
+                    "role": role_str(conn.role),
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "aitmproxy", "version": aitm_core::VERSION},
                 }))

@@ -177,9 +177,12 @@ pub enum Level {
 #[derive(Debug, Clone, PartialEq)]
 pub enum BusEvent {
     /// The handshake succeeded: `initialize` answered and `tools/list` read.
+    /// `role` is the server-resolved role echoed in the `initialize` result
+    /// (`"operator"`/`"agent"`), or `None` when the server did not echo one.
     Connected {
         server: String,
         tools: Vec<ToolInfo>,
+        role: Option<String>,
     },
     /// `proxy.status` (F7), read at the handshake and on every slow pass.
     ProxyStatus(ProxyStatus),

@@ -112,6 +112,10 @@ public struct ClientInfo: Hashable, Sendable {
 /// does not report yet (F5) are optional and render as a grey dash.
 public struct FlowRow: Identifiable, Hashable, Sendable {
     public var id: FlowID
+    /// The core connection this flow came from (Task 5). One connection today,
+    /// so it is a constant per launch, but it is present on every stored flow so
+    /// a second connection is additive, not a migration.
+    public var coreID: CoreID
     /// 1-based position in the capture (the `#` column).
     public var seq: Int
     public var kind: FlowKind
@@ -151,9 +155,11 @@ public struct FlowRow: Identifiable, Hashable, Sendable {
         client: ClientInfo? = nil, startedAt: Date? = nil, duration: Duration? = nil,
         requestBytes: Int64? = nil, responseBytes: Int64? = nil, tls: TLSState = .decrypted,
         edited: Bool = false, comment: String? = nil, mark: MarkColor? = nil, inScope: Bool = true,
-        wsFrames: (sent: Int, received: Int)? = nil, l4: L4RowInfo? = nil
+        wsFrames: (sent: Int, received: Int)? = nil, l4: L4RowInfo? = nil,
+        coreID: CoreID = .fixture
     ) {
         self.id = id
+        self.coreID = coreID
         self.seq = seq
         self.kind = kind
         self.method = method

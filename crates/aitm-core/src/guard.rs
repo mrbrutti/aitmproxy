@@ -198,6 +198,32 @@ fn blocked_by_policy(class: HostClass, policy: &crate::config::SsrfPolicy) -> bo
     }
 }
 
+/// Whether the SSRF policy ∪ the current scope could ever permit the embedded
+/// engine to reach a private or loopback target — the input to obscura's
+/// `--allow-private-network` engine flag (audit I15). True when the policy does
+/// not block private ranges, or when scope lifts the block for at least one
+/// private/loopback **address** host: an IP literal or `localhost`. A scoped DNS
+/// *hostname* never counts (`classify_host` reports it `Public`), matching
+/// [`ssrf_check`], which refuses a scoped name that resolves private as a
+/// rebinding attempt — the engine flag must not widen past that.
+///
+/// This is only the coarse engine gate. The proxy connector's [`ssrf_check`]
+/// remains the authoritative per-connection enforcement: this decides whether to
+/// narrow the engine *below* it, never to widen past it. It is computed once at
+/// launch from the seed scope; a host added later (`scope.add`) is still gated
+/// correctly by the connector, but the engine only picks up a newly private
+/// target on relaunch.
+pub fn engine_may_reach_private(policy: &crate::config::SsrfPolicy, scope: &[ScopeEntry]) -> bool {
+    !policy.block_private
+        || (policy.allow_if_in_scope
+            && scope.iter().any(|e| {
+                matches!(
+                    classify_host(&e.host),
+                    HostClass::Private | HostClass::Loopback
+                )
+            }))
+}
+
 /// SSRF decision for an upstream connection: refuse a private/loopback target
 /// (by the requested `authority` or the resolved `dst`) unless an **IP literal /
 /// `localhost`** that matches `dst` is explicitly in scope (a wildcard, and —

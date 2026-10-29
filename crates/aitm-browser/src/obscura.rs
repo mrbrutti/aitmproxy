@@ -332,15 +332,20 @@ impl ObscuraProcess {
             ])
             .arg("--ca-cert")
             .arg(ca_cert);
-        // Mirror the SSRF policy at the engine (audit I15, defence in depth): the
-        // flag lets obscura's own navigations reach loopback/private ranges, so
-        // pass it only when the policy permits private targets. Under the default
-        // strict policy (`block_private = true`) the flag is omitted, so obscura
-        // refuses private targets on its own. The SSRF-filtering connector on the
-        // proxy port remains the authoritative enforcement and re-checks every
-        // connection (loopback included) after resolution; this flag never widens
-        // past it, it only narrows the engine to match.
-        if !config.ssrf.block_private {
+        // Mirror the SSRF posture at the engine (audit I15, defence in depth): the
+        // flag lets obscura's own navigations reach loopback/private ranges. It is
+        // passed only when `config.obscura.allow_private` — a value the launch site
+        // derived from the SSRF policy ∪ the seed scope via
+        // `aitm_core::engine_may_reach_private`, so a scoped loopback target lifts
+        // it even under the strict default (`block_private = true`), while a
+        // pure-public scope under that policy keeps it off and obscura refuses
+        // private targets on its own. The SSRF-filtering connector on the proxy
+        // port remains the authoritative enforcement and re-checks every connection
+        // (loopback included) after resolution; this flag never widens past it, it
+        // only narrows the engine to match. It is frozen at launch: a host added
+        // later (`scope.add`) is still gated by the connector, but the engine picks
+        // up a newly private target only on relaunch.
+        if config.obscura.allow_private {
             cmd.arg("--allow-private-network");
         }
         cmd.arg("--ready-file")

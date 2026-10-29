@@ -18,8 +18,41 @@ final class BusService: FlowActions {
     @ObservationIgnored private var runTask: Task<Void, Never>?
     @ObservationIgnored private var notificationTask: Task<Void, Never>?
     @ObservationIgnored private var summaries: [FlowID: FlowSummary] = [:]
+    /// The embedded core's bus (Task 6), once it has published its address. When
+    /// set it supersedes the config.yaml / Settings endpoint resolution.
+    @ObservationIgnored private var endpointOverride: BusEndpoint?
+    /// While the embedded core is the active connection (Task 7), the bus connects
+    /// only to the embedded endpoint and never falls back to a `config.yaml` /
+    /// Settings core — so waiting for the embedded core to come up does not latch
+    /// onto some other core the operator happens to be running.
+    @ObservationIgnored private var preferEmbedded = false
 
     init(session: Session) { self.session = session }
+
+    /// Wait for the embedded core before connecting (Task 7): connect only once it
+    /// publishes its endpoint, never to an external core in the meantime. Used when
+    /// embedded is the active choice but the core has not finished starting.
+    func awaitEmbeddedEndpoint() {
+        preferEmbedded = true
+        endpointOverride = nil
+        start()
+    }
+
+    /// Point the client at the embedded core's bus and reconnect at once, rather
+    /// than wait for the next back-off cycle.
+    func useEmbeddedEndpoint(_ endpoint: BusEndpoint) {
+        preferEmbedded = true
+        endpointOverride = endpoint
+        start()
+    }
+
+    /// Point the client at the operator's external core (Task 7): drop any
+    /// embedded override and resolve the endpoint from `config.yaml` / Settings.
+    func useExternalEndpoint() {
+        preferEmbedded = false
+        endpointOverride = nil
+        start()
+    }
 
     // MARK: Lifecycle
 
@@ -35,14 +68,16 @@ final class BusService: FlowActions {
         if let client { Task { await client.disconnect() } }
         client = nil
         session.bus = .disconnected
+        session.applyResolvedRole(nil)
     }
 
     private func run() async {
         var backoff: Duration = .seconds(1)
         while !Task.isCancelled {
-            guard let endpoint = Self.resolveEndpoint() else {
-                session.bus = .failed("no bus configured")
-                try? await Task.sleep(for: .seconds(5))
+            let resolved = preferEmbedded ? endpointOverride : (endpointOverride ?? Self.resolveEndpoint())
+            guard let endpoint = resolved else {
+                session.bus = preferEmbedded ? .connecting("embedded core") : .failed("no bus configured")
+                try? await Task.sleep(for: .seconds(preferEmbedded ? 1 : 5))
                 continue
             }
             let address = "\(endpoint.host):\(endpoint.port)"
@@ -58,8 +93,10 @@ final class BusService: FlowActions {
                 }
             }
             do {
-                serverInfo = try await client.connect()
+                let info = try await client.connect()
+                serverInfo = info
                 session.bus = .connected(address)
+                session.applyResolvedRole(info.role)
                 session.listenAddress = Self.listenAddress() ?? session.listenAddress
                 tools = (try? await client.listTools()) ?? []
                 session.tools = tools
@@ -72,6 +109,7 @@ final class BusService: FlowActions {
                 try await pollLoop(client)
             } catch {
                 session.bus = .failed(Self.describe(error))
+                session.applyResolvedRole(nil)
             }
             await client.disconnect()
             self.client = nil
@@ -96,7 +134,8 @@ final class BusService: FlowActions {
             }
             let known = Set(ids)
             summaries = summaries.filter { known.contains($0.key) }
-            let rows = ids.enumerated().compactMap { index, id in summaries[id]?.row(seq: index + 1) }
+            let coreID = session.activeCoreID
+            let rows = ids.enumerated().compactMap { index, id in summaries[id]?.row(seq: index + 1, coreID: coreID) }
                 .map { row in
                     var row = row
                     row.inScope = session.scopeHosts.isEmpty || session.scopeHosts.contains { Self.hostMatches(row.authority, $0) }
@@ -206,14 +245,24 @@ final class BusService: FlowActions {
     /// else the default path) by default; else Settings > Bus host/port/token file.
     static func resolveEndpoint() -> BusEndpoint? {
         let defaults = UserDefaults.standard
+        // A pasted operator token overrides the config/agent token; its class
+        // makes the server resolve the connection to operator (spec Decision E).
+        // Empty ⇒ not configured, so the app stays an agent by default.
+        let operatorToken = (defaults.string(forKey: "bus.operatorToken") ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         let fromConfig = defaults.object(forKey: "bus.fromConfig") as? Bool ?? true
-        if fromConfig, let endpoint = try? BusEndpoint.fromConfigFile(configURL) { return endpoint }
+        if fromConfig, var endpoint = try? BusEndpoint.fromConfigFile(configURL) {
+            if !operatorToken.isEmpty { endpoint.token = operatorToken }
+            return endpoint
+        }
         let host = defaults.string(forKey: "bus.host") ?? "127.0.0.1"
         let port = UInt16(clamping: defaults.integer(forKey: "bus.port"))
-        var token = ""
-        let tokenFile = (defaults.string(forKey: "bus.tokenFile") ?? "") as NSString
-        if tokenFile.length > 0, let text = try? String(contentsOfFile: tokenFile.expandingTildeInPath, encoding: .utf8) {
-            token = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        var token = operatorToken
+        if token.isEmpty {
+            let tokenFile = (defaults.string(forKey: "bus.tokenFile") ?? "") as NSString
+            if tokenFile.length > 0, let text = try? String(contentsOfFile: tokenFile.expandingTildeInPath, encoding: .utf8) {
+                token = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
         }
         guard port > 0, !token.isEmpty else { return nil }
         return BusEndpoint(host: host, port: port, token: token)

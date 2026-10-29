@@ -748,7 +748,13 @@ pub struct Toast {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BusStatus {
     Connecting,
-    Connected { server: String, address: String },
+    Connected {
+        server: String,
+        address: String,
+        /// The server-resolved role echoed in `initialize` (`"operator"`/
+        /// `"agent"`), or `None` when the server did not echo one.
+        role: Option<String>,
+    },
     Disconnected(String),
 }
 
@@ -804,6 +810,10 @@ pub struct App {
     pub agent: AgentState,
     pub bus: BusStatus,
     pub bus_address: String,
+    /// The role the operator expects the token to resolve to (`--expect-role`),
+    /// client-side only: never sent to the server, it only drives the status
+    /// line's mismatch warning. `None` means no expectation was set.
+    pub expect_role: Option<String>,
     pub tools: Vec<ToolInfo>,
     pub caps: TermCaps,
     /// The proxy's listen address: from `proxy.status` (F7) or the embed.
@@ -889,6 +899,7 @@ impl App {
             agent: AgentState::default(),
             bus: BusStatus::Connecting,
             bus_address: bus_address.into(),
+            expect_role: None,
             tools: Vec::new(),
             caps,
             listening: None,
@@ -929,6 +940,28 @@ impl App {
 
     pub fn narrow(&self) -> bool {
         self.width < NARROW_COLS
+    }
+
+    /// The server-resolved role for the live connection (`"operator"`/
+    /// `"agent"`), from the echoed `initialize` role; `None` when not connected
+    /// or the server did not echo one.
+    pub fn resolved_role(&self) -> Option<&str> {
+        match &self.bus {
+            BusStatus::Connected { role, .. } => role.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// AC8: an expectation was set (`--expect-role`) and the connection did not
+    /// resolve to it — a different role, or no role echoed at all. False when
+    /// no expectation was set or while the bus is not connected.
+    pub fn role_mismatch(&self) -> bool {
+        match (&self.expect_role, &self.bus) {
+            (Some(expect), BusStatus::Connected { role, .. }) => {
+                role.as_deref() != Some(expect.as_str())
+            }
+            _ => false,
+        }
     }
 
     /// The bus is on this machine: loopback TCP or the in-process channel.
@@ -3060,12 +3093,27 @@ impl App {
     pub fn on_bus(&mut self, event: BusEvent) -> Vec<BusRequest> {
         let mut out = Vec::new();
         match event {
-            BusEvent::Connected { server, tools } => {
+            BusEvent::Connected {
+                server,
+                tools,
+                role,
+            } => {
                 self.bus = BusStatus::Connected {
                     server,
                     address: self.bus_address.clone(),
+                    role,
                 };
                 self.tools = tools;
+                if self.role_mismatch() {
+                    let resolved = self.resolved_role().unwrap_or("unknown");
+                    let expected = self.expect_role.as_deref().unwrap_or("");
+                    self.toast(
+                        Level::Warn,
+                        format!(
+                            "expected to connect as {expected}, but the bus resolved this token as {resolved}"
+                        ),
+                    );
+                }
                 // A (re)connect is a new session: nothing sent before it
                 // will be answered.
                 self.browser_forget_inflight();
@@ -3873,6 +3921,43 @@ mod tests {
                 input_schema: json!({"type":"object","properties":{}}),
             })
             .collect()
+    }
+
+    /// AC7/AC8: `Connected` carries the resolved role; with `--expect-role`
+    /// set, a resolved role that differs (or a server that echoed none) is a
+    /// mismatch, while a matching role is not. No expectation never warns.
+    #[test]
+    fn role_mismatch_follows_expect_role_and_the_resolved_role() {
+        let connected = |role: Option<&str>| BusEvent::Connected {
+            server: "aitmproxy test".into(),
+            tools: Vec::new(),
+            role: role.map(str::to_string),
+        };
+
+        // Expect operator, resolve agent → mismatch.
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        app.expect_role = Some("operator".into());
+        let _ = app.on_bus(connected(Some("agent")));
+        assert_eq!(app.resolved_role(), Some("agent"));
+        assert!(app.role_mismatch());
+
+        // Expect operator, resolve operator → no mismatch.
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        app.expect_role = Some("operator".into());
+        let _ = app.on_bus(connected(Some("operator")));
+        assert!(!app.role_mismatch());
+
+        // Expect operator, server echoed no role → mismatch (cannot confirm).
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        app.expect_role = Some("operator".into());
+        let _ = app.on_bus(connected(None));
+        assert!(app.role_mismatch());
+
+        // No expectation → never a mismatch, whatever the role.
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        let _ = app.on_bus(connected(Some("agent")));
+        assert!(!app.role_mismatch());
+        assert_eq!(app.resolved_role(), Some("agent"));
     }
 
     fn summary(

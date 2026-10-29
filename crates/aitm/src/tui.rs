@@ -266,6 +266,9 @@ pub async fn run(cfg: &Config, proxy: &Proxy, services: Services) -> anyhow::Res
         startup_note: Some(startup_note),
         listening: Some(cfg.listen.to_string()),
         poc_dir: cfg.poc.dir.clone(),
+        // The embedded TUI shares the proxy process; its role follows the token
+        // it presents, and it sets no client-side expectation.
+        expect_role: None,
     });
 
     let main_listen = cfg.listen;

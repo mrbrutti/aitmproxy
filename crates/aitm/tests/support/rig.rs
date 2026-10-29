@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 use aitm::wire::{assemble_with_scripts, Assembled, Features, Http1Sender, ScriptWiring};
 use aitm_browser::{launch_owned, LaunchedBrowser};
 use aitm_core::{
-    AgentPolicy, BrowserEngine, Config, FlowStore, McpTransport, PipelineClient, ProxyClient,
-    ScopeEntry,
+    engine_may_reach_private, AgentPolicy, BrowserEngine, Config, FlowStore, McpTransport,
+    PipelineClient, ProxyClient, ScopeEntry,
 };
 use aitm_mcp::McpServer;
 use aitm_testtarget::{SeedMode, TestTarget};
@@ -184,8 +184,18 @@ impl Rig {
                 host: patched_authority.clone(),
             },
         ];
-        // The browser-facing listener's SSRF guard forwards loopback only for an
-        // in-scope host; this e2e authorizes the two loopback origins above.
+        // The seeded targets are deliberately on loopback, and this rig exercises
+        // the **real operator path**: the strict default SSRF policy stays in
+        // force at the proxy connector (the authoritative per-host gate), and the
+        // two scoped loopback origins lift the engine's `--allow-private-network`
+        // flag via policy ∪ scope (audit I15) — no `block_private = false`
+        // override. Recomputed from the scope just set, exactly as `main` does at
+        // its launch site, so obscura can reach the scoped origins without widening
+        // past them.
+        cfg.browser.obscura.allow_private =
+            engine_may_reach_private(&cfg.browser.ssrf, &cfg.scope.entries);
+        // The agent cannot widen scope on its own; this e2e authorizes the two
+        // loopback origins above up front.
         cfg.scope.allow_agent_widen = true;
         // Arm the agent fully (as the operator would with `agent.set {all}`).
         cfg.mcp.policy = AgentPolicy::All;
@@ -239,6 +249,7 @@ impl Rig {
             McpTransport::LoopbackTcp {
                 port: 0,
                 token: AGENT_TOKEN.to_string(),
+                endpoint_file: None,
             },
         )
         .with_ssrf_policy(cfg.browser.ssrf.clone())

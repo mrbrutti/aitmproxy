@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use aitm_browser::obscura::{discover_binary, probe, SCRUBBED_ENV};
 use aitm_browser::{BrowserConfig, ObscuraProcess};
-use aitm_core::{ObscuraConfig, SsrfPolicy};
+use aitm_core::{engine_may_reach_private, ObscuraConfig, ScopeEntry, SsrfPolicy};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -57,9 +57,9 @@ impl Drop for TempDir {
 /// the CA is passed as the certificate *file* (never the directory or the key),
 /// and every proxy/trust env var the operator's shell carries is removed.
 ///
-/// Audit I15 — under the default strict SSRF policy (`block_private = true`) the
+/// Audit I15 — with `obscura.allow_private = false` (the default) the
 /// `--allow-private-network` flag is **omitted**: the engine refuses private and
-/// loopback targets on its own, mirroring policy.
+/// loopback targets on its own, mirroring the strict policy.
 #[test]
 fn command_argv_and_env() {
     for var in SCRUBBED_ENV {
@@ -71,8 +71,8 @@ fn command_argv_and_env() {
         ..BrowserConfig::default()
     };
     assert!(
-        config.ssrf.block_private,
-        "default policy must block private targets"
+        !config.obscura.allow_private,
+        "default must not pre-authorize private targets at the engine"
     );
     let ca_dir = Path::new("/var/aitm/ca");
     let ca_cert = ca_dir.join("ca.crt");
@@ -131,35 +131,86 @@ fn command_argv_and_env() {
     }
 }
 
-/// Audit I15 — when the operator relaxes the policy to permit private targets
-/// (`block_private = false`), the `--allow-private-network` flag is passed, so
-/// the engine's own posture matches the loosened policy.
+/// The argv flag follows the derived `obscura.allow_private`: set it, and
+/// `--allow-private-network` is passed, so the engine matches a launch site that
+/// decided private targets are permitted.
 #[test]
-fn command_passes_allow_private_network_when_policy_permits() {
+fn command_passes_allow_private_network_when_allowed() {
     let config = BrowserConfig {
-        ssrf: SsrfPolicy {
-            block_private: false,
-            ..SsrfPolicy::default()
+        obscura: ObscuraConfig {
+            allow_private: true,
+            ..ObscuraConfig::default()
         },
         ..BrowserConfig::default()
     };
 
+    assert!(
+        allow_private_in_argv(&config),
+        "allow_private = true must pass --allow-private-network"
+    );
+}
+
+/// Audit I15 preserved, end to end at the argv level: under the strict default
+/// policy, a **pure-public** scope leaves `obscura.allow_private` false, so the
+/// flag is omitted — obscura refuses private/loopback targets on its own.
+#[test]
+fn command_omits_flag_for_pure_public_scope_under_strict_policy() {
+    let strict = SsrfPolicy::default();
+    let public_scope = [ScopeEntry {
+        host: "example.com:443".into(),
+    }];
+    let config = BrowserConfig {
+        ssrf: strict.clone(),
+        obscura: ObscuraConfig {
+            allow_private: engine_may_reach_private(&strict, &public_scope),
+            ..ObscuraConfig::default()
+        },
+        ..BrowserConfig::default()
+    };
+
+    assert!(
+        !allow_private_in_argv(&config),
+        "strict policy + public-only scope must omit --allow-private-network"
+    );
+}
+
+/// The real operator path, end to end at the argv level: under the strict
+/// default policy, a **scoped loopback** target lifts `obscura.allow_private` via
+/// policy ∪ scope, so the flag is passed — the engine can reach the scoped
+/// loopback target without `block_private = false` (the removed PR #32 workaround).
+#[test]
+fn command_passes_flag_for_scoped_loopback_under_strict_policy() {
+    let strict = SsrfPolicy::default();
+    let loopback_scope = [ScopeEntry {
+        host: "127.0.0.1:8085".into(),
+    }];
+    let config = BrowserConfig {
+        ssrf: strict.clone(),
+        obscura: ObscuraConfig {
+            allow_private: engine_may_reach_private(&strict, &loopback_scope),
+            ..ObscuraConfig::default()
+        },
+        ..BrowserConfig::default()
+    };
+
+    assert!(
+        allow_private_in_argv(&config),
+        "strict policy + scoped loopback must pass --allow-private-network"
+    );
+}
+
+/// Whether the spawn command for `config` carries `--allow-private-network`.
+fn allow_private_in_argv(config: &BrowserConfig) -> bool {
     let cmd = ObscuraProcess::command(
-        &config,
+        config,
         Path::new("/opt/aitm/obscura"),
         Path::new("/var/aitm/ca/ca.crt"),
         19222,
         Path::new("/tmp/aitm-ready-42"),
     );
-    let args: Vec<String> = cmd
-        .as_std()
+    cmd.as_std()
         .get_args()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    assert!(
-        args.iter().any(|a| a == "--allow-private-network"),
-        "permissive policy must pass --allow-private-network: {args:?}"
-    );
+        .any(|a| a == OsStr::new("--allow-private-network"))
 }
 
 /// M2-AC6 — a binary whose `--help` lacks `--ca-cert` is refused by name, and

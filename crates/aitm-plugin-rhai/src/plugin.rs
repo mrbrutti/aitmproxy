@@ -19,7 +19,9 @@
 //! runtime handle for what is left of the budget, and `browser.*` knows to
 //! refuse (spec §6).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use aitm_core::{
@@ -61,7 +63,14 @@ pub struct ScriptPlugin {
 pub struct ScriptHandle {
     name: String,
     path: PathBuf,
+    /// What the loader parsed from the script: its `API` and the hooks it defines.
+    /// Live like the AST: a reload can change the hook set, so it is swapped
+    /// with the AST. `name` and `path` above are stable across a reload.
+    meta: ArcSwap<ScriptMeta>,
     ast: ArcSwap<AST>,
+    /// Whether the script's hooks run. Advisory and read per event: no other
+    /// state depends on it, so relaxed ordering is enough.
+    enabled: AtomicBool,
 }
 
 impl ScriptHandle {
@@ -69,7 +78,9 @@ impl ScriptHandle {
         Self {
             name: meta.name.clone(),
             path: meta.path.clone(),
+            meta: ArcSwap::from_pointee(meta.clone()),
             ast: ArcSwap::from_pointee(named(ast, &meta.name)),
+            enabled: AtomicBool::new(true),
         }
     }
 
@@ -83,10 +94,29 @@ impl ScriptHandle {
         &self.path
     }
 
-    /// Put a freshly compiled AST in service. The caller keeps the old one by
-    /// simply not calling this when a recompile fails.
-    pub fn swap(&self, ast: AST) {
+    /// The script's declared metadata as of its latest compile: `api` and the
+    /// hooks it defines. A snapshot; a later swap does not change it.
+    pub fn meta(&self) -> Arc<ScriptMeta> {
+        self.meta.load_full()
+    }
+
+    /// Whether the script's hooks fire. A new handle is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Turn the script's hooks on or off; takes effect from the next event.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Put a freshly compiled AST in service together with the metadata it was
+    /// compiled to, so `meta()` never describes a different script than the one
+    /// running. The caller keeps the old pair by simply not calling this when a
+    /// recompile fails.
+    pub fn swap(&self, ast: AST, meta: ScriptMeta) {
         self.ast.store(Arc::new(named(ast, &self.name)));
+        self.meta.store(Arc::new(meta));
     }
 
     fn current(&self) -> Arc<AST> {
@@ -105,12 +135,41 @@ impl ScriptHandle {
 #[derive(Default)]
 pub struct ErrorSink {
     sink: RwLock<Option<Arc<dyn EventSink>>>,
+    /// Script name -> the message of its most recent failed hook, cleared when
+    /// the script next runs a hook cleanly or is reloaded. What `script.list`
+    /// reports as `last_error`.
+    last: Mutex<BTreeMap<String, String>>,
 }
 
 impl ErrorSink {
     /// Route emitted errors through `sink` (the chain) from now on.
     pub fn bind(&self, sink: Arc<dyn EventSink>) {
         *self.sink.write().unwrap_or_else(PoisonError::into_inner) = Some(sink);
+    }
+
+    /// Remember `message` as `script`'s most recent error.
+    pub fn record(&self, script: &str, message: String) {
+        self.last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(script.to_string(), message);
+    }
+
+    /// Forget `script`'s recorded error (it ran cleanly or was reloaded).
+    pub fn clear(&self, script: &str) {
+        self.last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(script);
+    }
+
+    /// `script`'s most recent recorded error, if it has one.
+    pub fn last_error(&self, script: &str) -> Option<String> {
+        self.last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(script)
+            .cloned()
     }
 
     fn current(&self) -> Option<Arc<dyn EventSink>> {
@@ -165,8 +224,8 @@ impl ScriptPlugin {
 
     /// Swap in a freshly compiled AST (the hot-reload seam; see
     /// [`ScriptHandle::swap`]).
-    pub fn reload(&self, ast: AST) {
-        self.handle.swap(ast);
+    pub fn reload(&self, ast: AST, meta: ScriptMeta) {
+        self.handle.swap(ast, meta);
     }
 
     /// The handle `script.reload` swaps the AST through. Taken by the wiring
@@ -207,6 +266,7 @@ impl ScriptPlugin {
     /// the hook its own failure forever.
     fn report(&self, ev: &Event, flow: FlowId, err: &ScriptError) {
         tracing::error!(target: SCRIPT_TARGET, script = %self.meta.name, "{err}");
+        self.errors.record(&self.meta.name, err.to_string());
         if matches!(ev, Event::Error { .. }) {
             return;
         }
@@ -249,6 +309,9 @@ impl Plugin for ScriptPlugin {
     }
 
     fn on_event(&mut self, ev: &Event, ctx: &mut FlowCtx<'_>) -> Verdict {
+        if !self.handle.is_enabled() {
+            return Verdict::Continue;
+        }
         let Some(hook) = hook_for(ev) else {
             return Verdict::Continue;
         };
@@ -266,7 +329,14 @@ impl Plugin for ScriptPlugin {
         let args = hook_args(ev, &state);
 
         match self.call_hook(&ast, hook, &state, args) {
-            Ok(()) => take(state).apply_to(ctx),
+            Ok(()) => {
+                // A clean `on_error` run is the script handling its own
+                // failure's `Event::Error`; it must not erase that failure.
+                if !matches!(ev, Event::Error { .. }) {
+                    self.errors.clear(&self.meta.name);
+                }
+                take(state).apply_to(ctx)
+            }
             Err(err) => {
                 // `state` is dropped unapplied: the flow stays as it was.
                 let err = ScriptError::from_eval(&self.meta.name, hook, &err, &self.budget);

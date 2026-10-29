@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Download — aitmproxy</title>
+<meta name="description" content="Install aitmproxy with Homebrew on macOS and Linux: the core proxy, the macOS app, the web UI, the terminal UI and the MCP server. Open source, MIT or Apache-2.0.">
+<link rel="stylesheet" href="styles.css">
+<script>(function(d){var c=" js";try{if(!matchMedia("(prefers-reduced-motion: reduce)").matches&&!sessionStorage.getItem("aitm.intro")){c+=" intro-on";sessionStorage.setItem("aitm.intro","1");}}catch(e){}d.className+=c;})(document.documentElement);</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="wordmark" href="index.html" aria-label="aitmproxy home">aitmproxy<i aria-hidden="true"></i></a>
+    <ul class="nav-links">
+      <li><a href="features.html">Features</a></li>
+      <li><a href="docs.html">Docs</a></li>
+      <li><a href="scripting.html">Scripting</a></li>
+      <li><a href="poc.html">PoC format</a></li>
+      <li><a class="btn" href="download.html" aria-current="page">Download</a></li>
+    </ul>
+    <details class="menu">
+      <summary>Menu</summary>
+      <ul class="nav-links">
+        <li><a href="features.html">Features</a></li>
+        <li><a href="docs.html">Docs</a></li>
+        <li><a href="scripting.html">Scripting</a></li>
+        <li><a href="poc.html">PoC format</a></li>
+        <li><a href="download.html" aria-current="page">Download</a></li>
+      </ul>
+    </details>
+  </div>
+</header>
+
+<main id="main">
+
+<!-- ============ DOWNLOAD HEAD ============ -->
+<section class="page-head">
+  <div class="wrap">
+    <h1 class="display">Install in one line. Capture in three.</h1>
+    <p class="lead">One Homebrew formula puts the core proxy, the terminal UI, the web UI and the MCP server on your machine. The macOS app is a cask that ships the same core. Everything is open source.</p>
+  </div>
+</section>
+
+<!-- ============ GET IT ============ -->
+<section class="section" id="install" style="padding-top:0">
+  <div class="wrap">
+    <div class="install">
+      <div>
+        <h2 class="h2" data-reveal>Homebrew</h2>
+        <p class="lead deck">macOS 13+ (Apple Silicon and Intel) and Linux (x86-64 and arm64). The formula installs the <code>aitm</code> binary with the web UI and the embedded browser bundled in — nothing else to fetch.</p>
+        <div class="steps">
+          <div class="cmd"><code><span class="pr">$ </span>brew install aitmproxy</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
+          <div class="cmd"><code><span class="pr">$ </span>brew install --cask aitmproxy</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
+        </div>
+        <p class="deck muted">The first line is the CLI and the three UIs. The second is the notarized macOS app, which drives the same core.</p>
+      </div>
+      <div>
+        <h2 class="h2" data-reveal>Then capture.</h2>
+        <p class="lead deck">Trust the local certificate once, start the proxy, and point your app, browser or client at <code>127.0.0.1:8080</code>.</p>
+        <div class="steps">
+          <div class="cmd"><code><span class="pr">$ </span>aitm ca install</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
+          <div class="cmd"><code><span class="pr">$ </span>aitm web</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
+        </div>
+        <p class="deck muted">Prefer the terminal? <code>aitm tui</code> starts the core and the TUI together. <a class="arrow" href="docs.html">Getting started, step by step</a></p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ PLATFORMS ============ -->
+<section class="section" id="platforms">
+  <div class="wrap">
+    <h2 class="h2" data-reveal>Every face, every platform.</h2>
+    <p class="lead deck">One core, written in memory-safe Rust. Pick the surface that fits the moment; they all speak to the same proxy.</p>
+    <div class="features">
+      <article class="feature" data-reveal>
+        <h3 class="h3">macOS app</h3>
+        <p>Native Swift and SwiftUI, universal for Apple Silicon and Intel, signed and notarized.</p>
+        <div class="ui"><div class="ui-lines">
+          <div><span class="k">install</span><span>brew install --cask aitmproxy</span></div>
+          <div><span class="k">needs</span><span>macOS 13 Ventura or later</span></div>
+          <div><span class="k">arch</span><span>arm64 · x86-64 (universal)</span></div>
+        </div></div>
+        <a class="arrow" href="index.html#apps">See the app</a>
+      </article>
+      <article class="feature" data-reveal data-d="1">
+        <h3 class="h3">Web &amp; CLI</h3>
+        <p>The <code>aitm</code> binary ships the SolidJS web UI and every command. Runs on macOS and Linux.</p>
+        <div class="ui"><div class="ui-lines">
+          <div><span class="k">install</span><span>brew install aitmproxy</span></div>
+          <div><span class="k">web</span><span>aitm web → 127.0.0.1:8082</span></div>
+          <div><span class="k">linux</span><span>x86-64 · arm64</span></div>
+        </div></div>
+        <a class="arrow" href="index.html#apps">See the web UI</a>
+      </article>
+      <article class="feature" data-reveal data-d="2">
+        <h3 class="h3">Terminal UI</h3>
+        <p>A ratatui interface in the same binary, keyboard-complete and happy over SSH.</p>
+        <div class="ui"><div class="ui-lines">
+          <div><span class="k">start</span><span>aitm tui</span></div>
+          <div><span class="k">needs</span><span>any truecolor terminal</span></div>
+          <div><span class="k">remote</span><span>works over SSH</span></div>
+        </div></div>
+        <a class="arrow" href="index.html#apps">See the TUI</a>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ============ WHAT'S IN THE BOX ============ -->
+<section class="section" id="included">
+  <div class="wrap">
+    <h2 class="h2" data-reveal>What you get.</h2>
+    <div class="stats">
+      <div class="stat" data-reveal><b>1</b><span>core proxy — HTTP, HTTPS and WebSocket, with TLS passthrough</span></div>
+      <div class="stat" data-reveal data-d="1"><b>3</b><span>user interfaces — macOS, web and terminal</span></div>
+      <div class="stat" data-reveal data-d="2"><b>1</b><span>embedded headless browser for reproducing findings</span></div>
+      <div class="stat" data-reveal><b>1</b><span>MCP server, so an assistant can drive all of it</span></div>
+      <div class="stat" data-reveal data-d="1"><b>2</b><span>small languages — Rhai plugins and YAML reproductions</span></div>
+      <div class="stat" data-reveal data-d="2"><b>0</b><span>cost — open source under MIT or Apache-2.0</span></div>
+    </div>
+    <p class="deck muted" style="margin-top:var(--gap)">Source, issues and the full changelog live on the project repository. Build from source with a recent Rust toolchain if you prefer.</p>
+    <p class="deck"><a class="btn" href="docs.html">Read the docs</a> <a class="arrow" href="index.html" style="margin-left:1rem">Back to the overview</a></p>
+  </div>
+</section>
+
+</main>
+
+<footer class="footer">
+  <div class="wrap">
+    <div>
+      <a class="wordmark" href="index.html">aitmproxy<i aria-hidden="true"></i></a>
+      <p class="fine">A fast, memory-safe intercepting proxy for inspecting and editing HTTP and WebSocket traffic during development and authorized testing. Use it on systems you own or are permitted to test.</p>
+    </div>
+    <div>
+      <h4>Product</h4>
+      <ul>
+        <li><a href="features.html">Features</a></li>
+        <li><a href="docs.html">Documentation</a></li>
+        <li><a href="scripting.html">Rhai scripting</a></li>
+        <li><a href="poc.html">PoC format</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Project</h4>
+      <ul>
+        <li><a href="#">Source</a></li>
+        <li><a href="#">Changelog</a></li>
+        <li><a href="#">MIT or Apache-2.0</a></li>
+        <li><a href="download.html">Download</a></li>
+      </ul>
+    </div>
+  </div>
+</footer>
+
+<script src="intro.js"></script>
+<script src="site.js"></script>
+</body>
+</html>
