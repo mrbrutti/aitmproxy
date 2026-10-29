@@ -47,6 +47,10 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 # driven through the registry so h2 interception is tested end to end against the
 # same plugin set the chain dispatches through (M7 Task 3).
 aitm-plugins.workspace = true
+# The real Map Local/Remote plugin + its map.add command, driven through the
+# registry so h2 Map Remote cross-origin is tested end to end against the same
+# plugin + scope guard the chain dispatches through (M7 Task 4).
+aitm-plugin-maprules.workspace = true
 
 [lints]
 workspace = true

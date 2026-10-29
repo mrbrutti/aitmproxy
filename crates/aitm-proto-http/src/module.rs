@@ -320,6 +320,11 @@ impl HttpModule {
         // Branch on the negotiated protocol: h2 runs the per-stream `serve_h2`
         // driver; everything else runs the unchanged h1 `serve` loop.
         if negotiated == b"h2" {
+            // A Map Remote rewrite to a different authority needs a SECOND upstream
+            // (an h2 connection is pinned to one `:authority`, spec §6). The TLS
+            // client config lives here (provider + insecure verifier), so hand
+            // `serve_h2` an h2-ALPN config it can dial new origins with (Task 4).
+            let upstream_h2_tls = self.upstream_tls_alpn(&[b"h2".to_vec()])?;
             crate::h2::serve_h2(
                 ctx,
                 Box::pin(client_tls),
@@ -327,6 +332,7 @@ impl HttpModule {
                 conn,
                 self.max_body_bytes,
                 self.max_concurrent_streams,
+                upstream_h2_tls,
             )
             .await
         } else {
