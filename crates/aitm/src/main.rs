@@ -21,6 +21,7 @@ use aitm::scripts::LateHandles;
 use aitm::wire::{assemble_with_scripts, Assembled, Features, Http1Sender, ScriptWiring};
 use aitm::{config_file, env};
 use aitm_core::{BrowserDriver, Chain, PipelineClient, Plugin, ProxyClient};
+use aitm_findings::FindingsPlugin;
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
 use tracing::{info, warn};
 
@@ -118,7 +119,11 @@ async fn run() -> anyhow::Result<()> {
                 .map(|p| Box::new(p.with_max_body(max_body)) as Box<dyn Plugin>)
                 .collect(),
             executor: Some(tier.executor.clone()),
-            commands: Some(Box::new(tier.commands)),
+            // Both command providers: the rhai tier (script.validate/reload,
+            // script.findings) and the persistent findings store, whose
+            // `findings.*` commands read the configured `findings.dir` from the
+            // command host at invocation time (`FindingsPlugin::store_for`).
+            commands: vec![Box::new(tier.commands), Box::new(FindingsPlugin::new())],
         },
     )?;
 

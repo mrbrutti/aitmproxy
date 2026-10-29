@@ -41,7 +41,7 @@ pub struct ScriptServices {
 }
 
 /// Where `finding(...)` deposits observations; the command surface
-/// (`findings.list`) reads them back. Reporting only — a sink never acts on
+/// (`script.findings`) reads them back. Reporting only — a sink never acts on
 /// what it is given.
 pub trait FindingSink: Send + Sync {
     fn record(&self, f: Finding);
@@ -340,7 +340,7 @@ fn str_field(
 }
 
 /// The nuclei severity vocabulary `Severity` serializes as — the inverse of
-/// [`parse_severity`], for `findings.list`.
+/// [`parse_severity`], for `script.findings`.
 pub fn severity_name(severity: Severity) -> &'static str {
     match severity {
         Severity::Info => "info",

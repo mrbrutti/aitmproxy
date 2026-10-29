@@ -79,9 +79,12 @@ pub struct ScriptWiring {
     /// Runs a PoC's `script` steps. `None` leaves `poc.run` declarative-only,
     /// erroring on a `script` step rather than skipping it.
     pub executor: Option<Arc<dyn aitm_poc::ScriptStepExecutor>>,
-    /// The tier's command plugin (`script.validate`, `script.reload`,
-    /// `findings.list`), registered among the command providers.
-    pub commands: Option<Box<dyn Plugin>>,
+    /// Command-provider plugins registered after the first-party ones, in order.
+    /// The binary fills this with the rhai tier's commands (`script.validate`,
+    /// `script.reload`, `script.findings`) **and** the persistent findings store
+    /// (`findings.record`/`get`/`remove`/`list`); each registers its own
+    /// commands, so the slot holds as many providers as a deployment wires.
+    pub commands: Vec<Box<dyn Plugin>>,
 }
 
 /// Assemble the proxy from configuration with the default feature set.
@@ -179,7 +182,7 @@ pub fn assemble_with_scripts(
         .register_plugin(Box::new(
             AgentPlugin::new(agent_state.clone()).with_audit_ring(audit_ring.clone()),
         ));
-    if let Some(commands) = scripts.commands {
+    for commands in scripts.commands {
         builder = builder.register_plugin(commands);
     }
 
