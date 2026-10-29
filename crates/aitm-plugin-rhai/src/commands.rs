@@ -327,16 +327,18 @@ impl Command for Reload {
             .loader
             .compile(handle.path())
             .map_err(|err| anyhow::anyhow!("{err}"))?;
-        handle.swap(ast);
+        let reply = meta_value(&meta);
+        let hooks = meta.hooks.clone();
+        handle.swap(ast, meta);
         self.errors.clear(&name);
         tracing::info!(
             target: "aitm_plugin_rhai::loader",
             script = %name,
             path = %handle.path().display(),
-            hooks = ?meta.hooks,
+            hooks = ?hooks,
             "script reloaded"
         );
-        Ok(meta_value(&meta))
+        Ok(reply)
     }
 }
 
@@ -539,11 +541,11 @@ impl Command for Save {
         let restart_required = match self.scripts.iter().find(|s| s.name() == name) {
             Some(handle) => {
                 // Overwrite: `script.reload` semantics over the file just written.
-                let (ast, _) = self
+                let (ast, fresh) = self
                     .loader
                     .compile(&path)
                     .map_err(|err| anyhow::anyhow!("{err}"))?;
-                handle.swap(ast);
+                handle.swap(ast, fresh);
                 handle.set_enabled(enable);
                 self.errors.clear(&name);
                 tracing::info!(
