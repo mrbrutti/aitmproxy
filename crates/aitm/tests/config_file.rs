@@ -213,3 +213,24 @@ fn session_io_gate_loads() {
     // Unknown keys under the section are rejected.
     assert!(parse("session_io:\n  bogus: 1\n").is_err());
 }
+
+/// M7 Task 5 (AC-H2.10): the additive `limits.max_concurrent_streams` knob parses
+/// from config into its `LimitConfig` field; absent, it keeps the safe default
+/// (128); an unknown sibling key under `limits` is still rejected
+/// (`deny_unknown_fields`).
+#[test]
+fn config_parses_max_concurrent_streams() {
+    redirect_home();
+    let cfg = parse("limits:\n  max_concurrent_streams: 64\n").expect("parse limits knob");
+    assert_eq!(cfg.limits.max_concurrent_streams, 64);
+    // Absent → the safe default.
+    assert_eq!(
+        parse("ssl_insecure: false\n")
+            .expect("parse")
+            .limits
+            .max_concurrent_streams,
+        128
+    );
+    // An unknown sibling key under `limits` is still an error.
+    assert!(parse("limits:\n  bogus: 1\n").is_err());
+}
