@@ -29,7 +29,8 @@ export interface L4Caps {
 }
 
 export function createL4Store(app: AppStore) {
-  const has = (n: string) => app.proxy.tools.some((t) => t.name === n);
+  // Tolerate a partial app (unit-test stubs that mount a bare AppProvider): no tools → no L4.
+  const has = (n: string) => (app.proxy?.tools ?? []).some((t) => t.name === n);
   /** The L4 flow kind is live iff its list command is advertised (ui-ext §3.1 feature-detect). */
   const present = createMemo(() => has('l4.flow.list'));
   const caps = createMemo<L4Caps>(() => ({
@@ -50,15 +51,21 @@ export function createL4Store(app: AppStore) {
   const [captureIds, setCaptureIds] = createSignal<string[]>([]);
   const [interceptParked, setInterceptParked] = createSignal(0);
   const [firstParkedId, setFirstParkedId] = createSignal<string | null>(null);
-  const [selectedId, setSelectedId] = createSignal<string | null>(null);
   const [error, setError] = createSignal<string | null>(null);
 
   async function refresh(): Promise<void> {
-    if (!present()) return;
+    if (!present()) {
+      setIds([]);
+      app.setL4Ids?.([]);
+      return;
+    }
     try {
       const list = await app.call<string[]>('l4.flow.list');
-      setIds(Array.isArray(list) ? list : []);
-      const got = await Promise.all((Array.isArray(list) ? list : []).map((id) => app.call<L4FlowWire>('l4.flow.get', { id }).catch(() => null)));
+      const ids = Array.isArray(list) ? list : [];
+      setIds(ids);
+      // Register with the app so the unified list and selection route L4 ids to the L4 inspector.
+      app.setL4Ids?.(ids);
+      const got = await Promise.all(ids.map((id) => app.call<L4FlowWire>('l4.flow.get', { id }).catch(() => null)));
       batch(() => {
         for (const f of got) if (f && typeof f.id === 'string') setFlowsById(f.id, f);
       });
@@ -79,8 +86,9 @@ export function createL4Store(app: AppStore) {
 
   /** The L4 rows for the union list; a flow whose detail failed to load is a labelled placeholder. */
   const rows = createMemo<UnionRow[]>(() => ids().map((id) => (flowsById[id] ? l4Row(flowsById[id]!, scope()) : placeholderRow(id, 'l4'))));
+  // Selection is the app's single `selectedId`; the L4 inspector shows it when it is an L4 flow.
   const selectedFlow = createMemo<L4FlowWire | null>(() => {
-    const id = selectedId();
+    const id = app.selectedId?.();
     return id ? (flowsById[id] ?? null) : null;
   });
   const selectedRow = createMemo<UnionRow | null>(() => {
@@ -119,8 +127,6 @@ export function createL4Store(app: AppStore) {
     captureIds,
     interceptParked,
     firstParkedId,
-    selectedId,
-    setSelectedId,
     selectedFlow,
     selectedRow,
     refresh,
