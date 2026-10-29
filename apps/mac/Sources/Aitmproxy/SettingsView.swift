@@ -100,8 +100,8 @@ struct BusSettings: View {
                 ForEach(ActiveCoreKind.allCases) { Text($0.title).tag($0) }
             }
             Text(usesExternal
-                 ? "Connect to an aitm core you run yourself. The embedded core is stopped while external is active, and starts again when you switch back."
-                 : "The app runs and manages its own bundled aitm core on launch and stops it on quit. No separate install.")
+                 ? "Connect to an aitm core you run yourself. Enter its address below, or launch the app with `--bus host:port` and `--token`/`--token-file`. The embedded core stops while External is active and starts again when you switch back."
+                 : "Embedded is the default: the app bundles its own aitm core and manages it, starting it on launch and stopping it on quit. Nothing to install separately. Choose External to point the app at a core you run yourself.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
