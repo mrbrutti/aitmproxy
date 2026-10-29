@@ -448,7 +448,8 @@ fn tool_schema_derives_from_param_schema() {
         json!({
             "name": "demo.ping",
             "description": "Replies pong.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+            "confirmable": false
         })
     );
 }
@@ -1660,4 +1661,275 @@ async fn slow_subscriber_lags_not_blocks() {
     b_task.abort();
     let _ = a_task.await;
     let _ = b_task.await;
+}
+
+// ------------------------------------------ M4 Task 5: confirm-over-the-wire
+
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+/// A confirmable command: `confirm_prompt` always returns `Some`, and each run
+/// bumps a shared counter so a test can tell "ran" from "refused" / "asked".
+struct ConfirmStub {
+    ran: Arc<AtomicUsize>,
+}
+
+impl Command for ConfirmStub {
+    fn name(&self) -> &str {
+        "demo.confirm"
+    }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Write
+    }
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "A confirmable stub.".into(),
+            params: vec![],
+            result: TypeDesc::Str,
+        }
+    }
+    fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+        self.ran.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(Value::Str("ran".into()))
+    }
+    fn confirm_prompt(&self, _args: &Params) -> Option<String> {
+        Some("Really do the thing?".into())
+    }
+}
+
+/// A Sensitive, confirmable, config-gated stub named like the real `ca.install`,
+/// so the `All` policy defers it to its own gate (via `defers_to_command_gate`)
+/// exactly as the real command — letting a test prove the agent is offered no
+/// handshake even though the command is confirmable.
+struct GatedConfirmStub {
+    ran: Arc<AtomicUsize>,
+    gate: fn(&Config) -> bool,
+}
+
+impl Command for GatedConfirmStub {
+    fn name(&self) -> &str {
+        "ca.install"
+    }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Sensitive
+    }
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "A gated, confirmable stub.".into(),
+            params: vec![],
+            result: TypeDesc::Str,
+        }
+    }
+    fn invoke(&self, _args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        let gate_on = host.config().is_some_and(self.gate);
+        if host.frontend() != Frontend::Cli && !gate_on {
+            anyhow::bail!("`ca.install` refused: its config gate is off");
+        }
+        self.ran.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(Value::Str("ran".into()))
+    }
+    fn confirm_prompt(&self, _args: &Params) -> Option<String> {
+        Some("Install the CA into the OS trust store?".into())
+    }
+}
+
+/// A stdio server over `reg` with services and an ungated (`All`) policy, so the
+/// agent role reaches a command's own config gate and the operator role is never
+/// policy-blocked. `confirm_ttl` overrides the default (short, for the expiry test).
+fn confirm_server(
+    reg: Arc<Registry>,
+    config: Option<Arc<Config>>,
+    confirm_ttl: Option<Duration>,
+) -> McpServer {
+    let mut srv = McpServer::new(reg, McpTransport::Stdio)
+        .with_agent_state(ungated())
+        .with_services(
+            Arc::new(MemFlowStore::new()),
+            Arc::new(StubClient),
+            Arc::new(StdGuard::default()),
+            None,
+        );
+    if let Some(cfg) = config {
+        srv = srv.with_config(cfg);
+    }
+    if let Some(ttl) = confirm_ttl {
+        srv = srv.with_confirm_ttl(ttl);
+    }
+    srv
+}
+
+/// AC-M4-8: `tools/list` marks a confirmable command `confirmable:true` and a
+/// plain one `false`.
+#[test]
+fn tools_list_marks_confirmable() {
+    let mut reg = Registry::new();
+    reg.add_command(Arc::new(ConfirmStub {
+        ran: Arc::new(AtomicUsize::new(0)),
+    }));
+    reg.add_command(Arc::new(PingCmd));
+    let srv = confirm_server(Arc::new(reg), None, None);
+
+    let resp = rpc(&srv, 1, "tools/list", json!({}));
+    let tools = resp["result"]["tools"].as_array().expect("tools");
+    let confirm = tools
+        .iter()
+        .find(|t| t["name"] == "demo.confirm")
+        .expect("demo.confirm listed");
+    assert_eq!(confirm["confirmable"], json!(true));
+    let ping = tools
+        .iter()
+        .find(|t| t["name"] == "demo.ping")
+        .expect("demo.ping listed");
+    assert_eq!(ping["confirmable"], json!(false));
+}
+
+/// AC-M4-7: an operator call to a confirm-gated command returns `needs_confirmation`
+/// with a prompt + token and does not run; re-sending with the token runs it.
+#[test]
+fn operator_confirm_handshake() {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let mut reg = Registry::new();
+    reg.add_command(Arc::new(ConfirmStub { ran: ran.clone() }));
+    let srv = confirm_server(Arc::new(reg), None, None);
+
+    let asked = call_as_args(&srv, Frontend::Operator, "demo.confirm", json!({}));
+    assert_eq!(asked["result"]["isError"], json!(false));
+    assert_eq!(
+        asked["result"]["structuredContent"]["status"],
+        json!("needs_confirmation")
+    );
+    let prompt = asked["result"]["structuredContent"]["prompt"]
+        .as_str()
+        .expect("prompt");
+    assert!(prompt.contains("Really"), "{prompt}");
+    let token = asked["result"]["structuredContent"]["confirm_token"]
+        .as_str()
+        .expect("confirm_token")
+        .to_string();
+    assert_eq!(
+        ran.load(AtomicOrdering::SeqCst),
+        0,
+        "the command must not run before confirmation"
+    );
+
+    let done = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "demo.confirm",
+        json!({ "_confirm": token }),
+    );
+    assert_eq!(done["result"]["isError"], json!(false));
+    assert_eq!(done["result"]["structuredContent"], json!("ran"));
+    assert_eq!(
+        ran.load(AtomicOrdering::SeqCst),
+        1,
+        "the re-send with a valid token runs the command once"
+    );
+}
+
+/// AC-M4-7: a wrong, replayed, or expired confirm token is refused and the
+/// command does not run.
+#[test]
+fn confirm_token_wrong_or_expired_or_replayed_refused() {
+    // Wrong token: refused, nothing runs.
+    let ran = Arc::new(AtomicUsize::new(0));
+    let mut reg = Registry::new();
+    reg.add_command(Arc::new(ConfirmStub { ran: ran.clone() }));
+    let srv = confirm_server(Arc::new(reg), None, None);
+    let wrong = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "demo.confirm",
+        json!({"_confirm": "cfm_deadbeefdeadbeef"}),
+    );
+    assert!(is_refused(&wrong), "a wrong token is refused: {wrong}");
+    assert_eq!(ran.load(AtomicOrdering::SeqCst), 0);
+
+    // Replayed token: valid once, refused on the second use (single-use).
+    let ran = Arc::new(AtomicUsize::new(0));
+    let mut reg = Registry::new();
+    reg.add_command(Arc::new(ConfirmStub { ran: ran.clone() }));
+    let srv = confirm_server(Arc::new(reg), None, None);
+    let asked = call_as_args(&srv, Frontend::Operator, "demo.confirm", json!({}));
+    let token = asked["result"]["structuredContent"]["confirm_token"]
+        .as_str()
+        .expect("confirm_token")
+        .to_string();
+    let first = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "demo.confirm",
+        json!({ "_confirm": token.clone() }),
+    );
+    assert!(!is_refused(&first), "the first use runs");
+    let replay = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "demo.confirm",
+        json!({ "_confirm": token }),
+    );
+    assert!(is_refused(&replay), "a replayed token is refused: {replay}");
+    assert_eq!(
+        ran.load(AtomicOrdering::SeqCst),
+        1,
+        "the command ran exactly once"
+    );
+
+    // Expired token: a short TTL, then a re-send after it lapses, refused.
+    let ran = Arc::new(AtomicUsize::new(0));
+    let mut reg = Registry::new();
+    reg.add_command(Arc::new(ConfirmStub { ran: ran.clone() }));
+    let srv = confirm_server(Arc::new(reg), None, Some(Duration::from_millis(20)));
+    let asked = call_as_args(&srv, Frontend::Operator, "demo.confirm", json!({}));
+    let token = asked["result"]["structuredContent"]["confirm_token"]
+        .as_str()
+        .expect("confirm_token")
+        .to_string();
+    std::thread::sleep(Duration::from_millis(60));
+    let expired = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "demo.confirm",
+        json!({ "_confirm": token }),
+    );
+    assert!(is_refused(&expired), "an expired token is refused: {expired}");
+    assert_eq!(ran.load(AtomicOrdering::SeqCst), 0);
+}
+
+/// Review Focus #2 / AC-M4-8: the agent is never offered the confirm handshake.
+/// A confirm-gated command stays governed by its config gate: refused with the
+/// gate off (no `needs_confirmation`), run with it on — still no handshake.
+#[test]
+fn agent_gets_no_confirm_handshake() {
+    // Gate off → refused outright, no handshake offered.
+    let ran = Arc::new(AtomicUsize::new(0));
+    let mut reg = Registry::new();
+    reg.add_command(Arc::new(GatedConfirmStub {
+        ran: ran.clone(),
+        gate: |c| c.ca.allow_agent_install,
+    }));
+    let srv = confirm_server(Arc::new(reg), Some(Arc::new(Config::default())), None);
+    let off = call_as(&srv, Frontend::Mcp, "ca.install");
+    assert!(
+        is_refused(&off),
+        "agent ca.install with the gate off is refused"
+    );
+    assert_ne!(
+        off["result"]["structuredContent"]["status"],
+        json!("needs_confirmation"),
+        "no handshake is offered to the agent"
+    );
+    assert_eq!(ran.load(AtomicOrdering::SeqCst), 0);
+
+    // Gate on → runs via its own config gate, still no handshake.
+    let ran = Arc::new(AtomicUsize::new(0));
+    let mut reg = Registry::new();
+    reg.add_command(Arc::new(GatedConfirmStub {
+        ran: ran.clone(),
+        gate: |c| c.ca.allow_agent_install,
+    }));
+    let srv = confirm_server(Arc::new(reg), Some(config_gates_on()), None);
+    let on = call_as(&srv, Frontend::Mcp, "ca.install");
+    assert!(!is_refused(&on), "agent ca.install with the gate on runs: {on}");
+    assert_eq!(on["result"]["structuredContent"], json!("ran"));
+    assert_eq!(ran.load(AtomicOrdering::SeqCst), 1);
 }
