@@ -212,12 +212,11 @@ impl McpServer {
     fn dispatch(&self, method: &str, params: &JsonValue) -> Result<JsonValue, RpcError> {
         match method {
             "initialize" => {
-                let version = params
-                    .get("protocolVersion")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or(PROTOCOL_VERSION);
+                // Answer with the version we speak rather than echoing the
+                // client's requested `protocolVersion` unchecked; a client that
+                // needs a different version sees the one we support.
                 Ok(json!({
-                    "protocolVersion": version,
+                    "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "aitmproxy", "version": aitm_core::VERSION},
                 }))
@@ -268,7 +267,11 @@ impl McpServer {
         })?;
         let args = match params_from_json(arguments, &cmd.schema(), name) {
             Ok(args) => args,
-            Err(e) => return Ok(tool_error(e.to_string())),
+            // Invalid arguments are a protocol error (per MCP), the same
+            // INVALID_PARAMS envelope as a missing `name` / non-object
+            // `arguments` / unknown tool above — not a tool result, because the
+            // command never ran.
+            Err(e) => return Err(RpcError::new(INVALID_PARAMS, e.to_string())),
         };
         let host = CommandHost::new(
             services.store.as_ref(),

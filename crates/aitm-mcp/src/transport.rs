@@ -126,12 +126,17 @@ async fn serve_connection(
     serve_lines(server, reader.into_inner(), write_half).await
 }
 
-/// Whether `line` is `{"token": "<expected>"}`. Compared in constant time
-/// relative to the expected token.
+/// Whether `line` is exactly `{"token": "<expected>"}` (one key, a string).
+/// Compared in constant time relative to the expected token. Extra keys are
+/// rejected, matching the web bridge's `token_line_matches`, so nothing can
+/// ride along with the auth line.
 fn authorized(line: &str, expected: &str) -> bool {
     let Ok(JsonValue::Object(obj)) = serde_json::from_str::<JsonValue>(line.trim()) else {
         return false;
     };
+    if obj.len() != 1 {
+        return false;
+    }
     let Some(JsonValue::String(given)) = obj.get("token") else {
         return false;
     };
@@ -185,6 +190,10 @@ mod tests {
         assert!(!authorized(r#"{"token":"x"}"#, "t"));
         assert!(!authorized(r#"{"tok":"t"}"#, "t"));
         assert!(!authorized(r#"{"token":1}"#, "t"));
+        // Minor (b): exactly one key — a correct token can't smuggle extra keys.
+        assert!(!authorized(r#"{"token":"t","x":1}"#, "t"));
+        assert!(!authorized(r#"{"token":"t","token2":"t"}"#, "t"));
+        assert!(!authorized(r#"{}"#, "t"));
         assert!(!authorized(r#"["t"]"#, "t"));
         assert!(!authorized("t", "t"));
         assert!(!authorized(
