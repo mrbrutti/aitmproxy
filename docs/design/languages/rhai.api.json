@@ -1,6 +1,7 @@
 {
   "_comment": "Rhai completion + hover catalog. THE SHIPPED ENGINE IS CANONICAL: crates/aitm-plugin-rhai/tests/api_catalog.rs asserts a bijection between the engine's registered host surface (gen_fn_signatures) and the IMPLEMENTED entries here, so every implemented entry must name a real registered token and every registered author-facing token must appear here. Entries with \"status\": \"planned\" (the dsl crypto/encoding helpers) are specced but not yet registered on the engine; they are excluded from the bijection until a production follow-up lands them. Entry names are fully qualified (`flow.request.headers.get`); a surface completes the last segment after the receiver chain. `kind` is object | property | method | function. In-script Rhai method names can differ from the MCP/CLI tool names (browser.type_text vs the browser.type tool, browser.evaluate vs browser.eval) because `type`/`eval` are Rhai reserved words.",
   "api_version": "1",
+  "namespaces": {},
   "hooks": [
     {
       "name": "load",
