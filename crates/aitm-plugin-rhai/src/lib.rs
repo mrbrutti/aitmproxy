@@ -35,7 +35,7 @@ pub use host_core::{
     Finding, FindingSink, MemoryFindingSink, Options, ScriptCapability, ScriptServices,
 };
 pub use loader::{RhaiLoader, SUPPORTED_API};
-pub use plugin::{ErrorSink, ScriptHandle, ScriptPlugin};
+pub use plugin::{ErrorSink, LoadedScript, ScriptHandle, ScriptHost, ScriptSet};
 pub use poc_step::{RhaiScriptExecutor, ScriptVars, VarsCapability};
 pub use prelude::PRELUDE_SRC;
 pub use wire::{build, executor, load_scripts, ScriptTier};

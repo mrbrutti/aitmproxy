@@ -53,17 +53,20 @@ use aitm_core::{
     TypeDesc, Value,
 };
 
-use crate::config::ScriptMeta;
+use crate::config::{ScriptEntry, ScriptMeta};
 use crate::host_core::{severity_name, Finding, FindingSink};
 use crate::loader::{Registers, RhaiLoader, Validated};
-use crate::plugin::{ErrorSink, ScriptHandle};
+use crate::plugin::{ErrorSink, ScriptHandle, ScriptSet};
 
-/// Registers the three commands. Built by `wire::build` over the same loader
-/// and sink the plugins use; the host registers it among the command
-/// providers, after the script plugins.
+/// Registers the tier's commands. Built by `wire::build` over the same loader,
+/// sink and script set the [`crate::plugin::ScriptHost`] uses; the host
+/// registers it among the command providers, after the host itself. Because it
+/// holds the live [`ScriptSet`] — not a snapshot of handles — `script.list` /
+/// `script.reload` / `script.enable` see a script appended at runtime, and a
+/// `script.save` of a new name appends to that same set.
 pub struct ScriptCommands {
     loader: Arc<RhaiLoader>,
-    scripts: Vec<Arc<ScriptHandle>>,
+    scripts: ScriptSet,
     findings: Arc<dyn FindingSink>,
     errors: Arc<ErrorSink>,
 }
@@ -71,7 +74,7 @@ pub struct ScriptCommands {
 impl ScriptCommands {
     pub fn new(
         loader: Arc<RhaiLoader>,
-        scripts: Vec<Arc<ScriptHandle>>,
+        scripts: ScriptSet,
         findings: Arc<dyn FindingSink>,
         errors: Arc<ErrorSink>,
     ) -> Self {
@@ -129,12 +132,12 @@ struct Validate {
 
 struct Reload {
     loader: Arc<RhaiLoader>,
-    scripts: Vec<Arc<ScriptHandle>>,
+    scripts: ScriptSet,
     errors: Arc<ErrorSink>,
 }
 
 struct List {
-    scripts: Vec<Arc<ScriptHandle>>,
+    scripts: ScriptSet,
     errors: Arc<ErrorSink>,
 }
 
@@ -143,7 +146,7 @@ struct List {
 /// drift apart.
 struct Toggle {
     loader: Arc<RhaiLoader>,
-    scripts: Vec<Arc<ScriptHandle>>,
+    scripts: ScriptSet,
     enable: bool,
 }
 
@@ -156,14 +159,17 @@ struct ScriptFindings {
 /// until the request has passed, in order: the `name` rule, the `scripts_dir`
 /// opt-in, the size cap, and a compile of the source.
 ///
-/// The plugin chain is sealed once built, so a brand-new script's hooks cannot
-/// join the running chain: that save persists the file (the config scan loads
-/// it next start) and answers `restart_required: true`. Saving over a script
-/// that is already loaded swaps its AST through the shared handle, exactly as
-/// `script.reload` does, so the new hooks run live.
+/// A brand-new script's hooks go live with no restart (F8 Option B): the saved
+/// file is compiled and its [`LoadedScript`] is appended to the live
+/// [`ScriptSet`] the [`crate::plugin::ScriptHost`] dispatches, so its
+/// `on_request` runs on the next event. `restart_required` is `true` only when
+/// the script registers commands or options — those still need a restart,
+/// because the command/option `Registry` is sealed once built. Saving over a
+/// script that is already loaded swaps its AST through the shared handle,
+/// exactly as `script.reload` does, so the new hooks run live too.
 struct Save {
     loader: Arc<RhaiLoader>,
-    scripts: Vec<Arc<ScriptHandle>>,
+    scripts: ScriptSet,
     errors: Arc<ErrorSink>,
 }
 
@@ -538,7 +544,7 @@ impl Command for Save {
 
         let registers = &validated.registers;
         let registers_present = !registers.commands.is_empty() || !registers.options.is_empty();
-        let restart_required = match self.scripts.iter().find(|s| s.name() == name) {
+        let restart_required = match self.scripts.find_handle(&name) {
             Some(handle) => {
                 // Overwrite: `script.reload` semantics over the file just written.
                 let (ast, fresh) = self
@@ -557,13 +563,26 @@ impl Command for Save {
                 registers_present
             }
             None => {
+                // New name: compile it into a LoadedScript and append it to the
+                // live set, so its hooks fire on the next event with no restart
+                // (F8 Option B). Only its registered commands/options still need
+                // a restart — the Registry is sealed — so `restart_required`
+                // tracks exactly that.
+                let entry = ScriptEntry::new(&path);
+                let script = self
+                    .loader
+                    .load_one(&entry)
+                    .map_err(|err| anyhow::anyhow!("{err}"))?;
+                script.handle().set_enabled(enable);
+                self.scripts.append(script);
                 tracing::info!(
                     target: "aitm_plugin_rhai::loader",
                     script = %name,
                     path = %path.display(),
-                    "script saved; its hooks join on the next start"
+                    restart_required = registers_present,
+                    "script saved and appended live; its hooks run with no restart"
                 );
-                true
+                registers_present
             }
         };
 
@@ -652,6 +671,7 @@ impl Command for List {
     fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
         Ok(Value::Array(
             self.scripts
+                .handles()
                 .iter()
                 .map(|s| {
                     let meta = s.meta();
@@ -681,14 +701,12 @@ impl Command for List {
     }
 }
 
-/// The loaded script called `name`, or the one error every by-name script
-/// command shares: it names the miss and lists what is loaded.
-fn find_script<'a>(
-    scripts: &'a [Arc<ScriptHandle>],
-    name: &str,
-) -> anyhow::Result<&'a Arc<ScriptHandle>> {
-    scripts.iter().find(|s| s.name() == name).ok_or_else(|| {
-        let loaded: Vec<&str> = scripts.iter().map(|s| s.name()).collect();
+/// The handle of the loaded script called `name`, or the one error every
+/// by-name script command shares: it names the miss and lists what is loaded.
+/// Read from the live set, so a script appended at runtime is found.
+fn find_script(scripts: &ScriptSet, name: &str) -> anyhow::Result<Arc<ScriptHandle>> {
+    scripts.find_handle(name).ok_or_else(|| {
+        let loaded = scripts.names();
         anyhow::anyhow!(
             "no loaded script is named `{name}`; loaded: {}",
             if loaded.is_empty() {

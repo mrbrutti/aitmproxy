@@ -2,8 +2,8 @@
 //!
 //! Earlier tasks built the parts and left the joins: the loader did not
 //! register the `reg` bridge (Task 10) or the PoC `vars` handle (Task 14),
-//! and `ScriptPlugin::load` was a stub, so a script's `load(reg)` never ran
-//! and its commands never reached the platform `Registry`. These tests pin
+//! and nothing ran a script's `load(reg)`, so its commands never ran
+//! and never reached the platform `Registry`. These tests pin
 //! the joined surface:
 //!
 //! - a script's `load(reg)` runs when the plugin is registered, so its command
@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aitm_core::{
-    CommandHost, HttpFlow, HttpRequest, MemFlowStore, Params, Plugin, ProxyClient, Registry,
-    StdGuard, Value,
+    CommandHost, HttpFlow, HttpRequest, MemFlowStore, Params, ProxyClient, Registry, StdGuard,
+    Value,
 };
 use aitm_plugin_rhai::config::{RhaiConfig, RhaiLimits, ScriptEntry};
 use aitm_plugin_rhai::host_core::{MemoryFindingSink, ScriptServices};
@@ -70,11 +70,11 @@ fn config(scripts: Vec<ScriptEntry>) -> RhaiConfig {
 async fn script_load_registers_its_command_and_option() {
     let tier = wire::build(config(vec![ScriptEntry::new(TAGGER)]), services())
         .expect("the scripting tier builds");
-    assert_eq!(tier.plugins.len(), 1, "one script, one plugin");
-    let plugin = tier.plugins.into_iter().next().expect("the one plugin");
+    assert_eq!(tier.host.set().len(), 1, "one script in the host");
 
     let mut registry = Registry::new();
-    registry.add_plugin(Box::new(plugin));
+    // Registering the host runs each loaded script's `load(reg)`.
+    registry.add_plugin(Box::new(tier.host));
 
     let cmd = registry
         .command("tagger.ping")
