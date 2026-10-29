@@ -119,6 +119,11 @@ final class Session {
     var details: [FlowID: FlowDetail] = [:] {
         didSet { rowsVersion &+= 1 }
     }
+    /// WebSocket details keyed by flow id (S-045). A WebSocket flow has no
+    /// `FlowDetail`; its handshake and message stream live here instead.
+    var wsDetails: [FlowID: WSDetail] = [:] {
+        didSet { rowsVersion &+= 1 }
+    }
     var selection: Set<FlowID> = []
     /// The flow the inspector shows: the last clicked row.
     var focused: FlowID?
@@ -252,6 +257,8 @@ final class Session {
     var paused: [FlowRow] { rows.filter { $0.state == .paused } }
     var focusedRow: FlowRow? { rows.first { $0.id == focused } }
     var focusedDetail: FlowDetail? { focused.flatMap { details[$0] } }
+    /// The WebSocket detail for the focused flow (S-045), when it is a WebSocket.
+    var focusedWSDetail: WSDetail? { focused.flatMap { wsDetails[$0] } }
 
     /// The list's query: scope page, group, chip, filter expression, sort (one Kit value, S-062 ready).
     var query: FlowQuery {
@@ -389,7 +396,10 @@ final class Session {
 
     /// The mockup's state: armed intercept, two paused, the login selected.
     func loadFixtures() {
-        details = Dictionary(uniqueKeysWithValues: Fixtures.rows.map { ($0.id, Fixtures.detail(for: $0)) })
+        details = Dictionary(uniqueKeysWithValues:
+            Fixtures.rows.filter { $0.kind != .websocket }.map { ($0.id, Fixtures.detail(for: $0)) })
+        wsDetails = Dictionary(uniqueKeysWithValues:
+            Fixtures.rows.filter { $0.kind == .websocket }.map { ($0.id, Fixtures.wsDetail(for: $0)) })
         rows = Fixtures.rows
         interceptArmed = true
         scopeHosts = Fixtures.scope

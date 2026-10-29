@@ -33,6 +33,7 @@ enum SnapshotScene: String, CaseIterable {
     case inspectDiff = "inspect-diff"
     case inspectTiming = "inspect-timing"
     case inspectFind = "inspect-find"
+    case inspectWebSocket = "inspect-websocket"
 
     func apply(to session: Session) {
         session.page = .apps
@@ -152,6 +153,8 @@ enum SnapshotScene: String, CaseIterable {
             session.select(session.extraRow { $0.timing != nil }?.id)
             session.requestTab = .timing
             session.responseTab = .headers
+        case .inspectWebSocket:
+            session.select(session.rows.first { $0.kind == .websocket }?.id)
         }
     }
 

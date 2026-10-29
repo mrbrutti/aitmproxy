@@ -11,7 +11,7 @@ import { artifactDataUrl, downloadBlob, exportFilename, pngBlob, toArtifact, yam
 import { fmtWhen, fmtWhenFull, matchedCount, parseVars, varsFromYaml, varsText, verdictOf, whenOf } from './model';
 import { SeverityPill } from './SeverityPill';
 import { findingsState } from './state';
-import { tokenizeYaml } from './yaml';
+import { CodeViewer, type CodeDoc } from '~/viewers/CodeViewer';
 import css from './findings.module.css';
 
 const anchorOf = (el: HTMLElement): AnchorRect => {
@@ -84,12 +84,16 @@ export const FindingDetail: Component<FindingDetailProps> = (props) => {
   const edited = () => localYaml().has(run().id) && localYaml().get(run().id) !== run().yaml;
   const [editing, setEditing] = createSignal(false);
   const [draft, setDraft] = createSignal('');
-  // A trailing newline is the file's terminator, not an extra numbered line.
-  const lines = createMemo(() => {
-    const l = tokenizeYaml(yaml());
-    if (l.length > 1 && l[l.length - 1]!.length === 0) l.pop();
-    return l;
-  });
+  // The PoC YAML editor: one CodeMirror host, highlight-only when reading, highlight + schema-aware
+  // completion when editing (viewers/lang/yaml). Local-only save stays as-is — poc.save is a core
+  // follow-up, out of this surface's scope.
+  const yamlDoc = createMemo<CodeDoc>(() =>
+    editing()
+      ? { key: `${run().id}:yaml:edit`, text: draft(), lang: 'yaml', editable: true, onChange: setDraft }
+      : { key: `${run().id}:yaml:view`, text: yaml(), lang: 'yaml' },
+  );
+  // Compact for short PoCs, scrolls internally for long ones.
+  const yamlHeight = createMemo(() => Math.min(640, Math.max(160, (yaml().split('\n').length + 1) * 20 + 16)));
   const startEdit = () => {
     setDraft(yaml());
     setEditing(true);
@@ -365,41 +369,25 @@ export const FindingDetail: Component<FindingDetailProps> = (props) => {
             </div>
           </div>
           <Show
-            when={editing()}
+            when={editing() || yaml()}
             fallback={
-              <Show
-                when={yaml()}
-                fallback={
-                  <Show when={yamlLoading()} fallback={<p class={css.muted}>No YAML for this run.</p>}>
-                    <div class={css.yamlLoading} role="progressbar" aria-label="Loading PoC YAML">
-                      <i />
-                      <i />
-                      <i />
-                      <i />
-                    </div>
-                  </Show>
-                }
-              >
-                <pre class={css.code} aria-label="PoC YAML">
-                  <For each={lines()}>
-                    {(toks) => (
-                      <div class={css.l}>
-                        <For each={toks}>{(t) => <span class={t.type === 'text' ? undefined : css[t.type]}>{t.text}</span>}</For>
-                      </div>
-                    )}
-                  </For>
-                </pre>
+              <Show when={yamlLoading()} fallback={<p class={css.muted}>No YAML for this run.</p>}>
+                <div class={css.yamlLoading} role="progressbar" aria-label="Loading PoC YAML">
+                  <i />
+                  <i />
+                  <i />
+                  <i />
+                </div>
               </Show>
             }
           >
-            <textarea
-              class={css.editor}
-              aria-label="Edit PoC YAML"
-              value={draft()}
-              rows={Math.min(40, Math.max(8, draft().split('\n').length + 1))}
-              spellcheck={false}
-              onInput={(e) => setDraft(e.currentTarget.value)}
+            <div
+              class={`${css.cmYaml} ${editing() ? css.cmYamlEditing : ''}`}
+              style={{ height: `${yamlHeight()}px` }}
               onKeyDown={(e) => {
+                // Escape with no completion popup open bubbles out of CodeMirror to cancel the edit;
+                // Cmd/Ctrl+Enter saves. (An open popup swallows Escape itself.)
+                if (!editing()) return;
                 if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
                   e.preventDefault();
                   save();
@@ -408,7 +396,9 @@ export const FindingDetail: Component<FindingDetailProps> = (props) => {
                   setEditing(false);
                 }
               }}
-            />
+            >
+              <CodeViewer active doc={yamlDoc()} label={editing() ? 'Edit PoC YAML' : 'PoC YAML'} />
+            </div>
           </Show>
         </section>
       </div>

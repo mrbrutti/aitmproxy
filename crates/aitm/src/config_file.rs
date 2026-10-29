@@ -23,6 +23,7 @@ use aitm_core::{
     SsrfPolicy, TlsConfig, Value,
 };
 use aitm_plugin_rhai::{RhaiConfig, ScriptEntry};
+use aitm_proto_l4::config::L4Config;
 
 /// `<config_dir>/aitmproxy/config.yaml`: a sibling of the CA dir with the
 /// same fallbacks, taken from the directory `CaConfig::default()` already
@@ -31,25 +32,32 @@ pub fn default_config_path() -> PathBuf {
     CaConfig::default().audit_log.with_file_name("config.yaml")
 }
 
-/// Everything one config file configures: the proxy itself and the scripting
-/// tier. They are separate types — `aitm_core` knows nothing about Rhai (spec:
-/// no `aitm-core` edits) — but they come from one file and one parse, so a
-/// misspelled scripting knob is refused the same way a misspelled browser one
-/// is.
+/// Everything one config file configures: the proxy itself, the scripting tier,
+/// and the L4 module. They are separate types — `aitm_core` knows nothing about
+/// Rhai or L4 (no `aitm-core` edits, AC19) — but come from one file and one parse,
+/// so a misspelled scripting or L4 knob is refused the same way a browser one is.
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub core: Config,
     pub rhai: RhaiConfig,
+    pub l4: L4Config,
 }
 
-/// Load the config file. `None` reads [`default_config_path`], where an absent
-/// file means `Config::default()` (today's behaviour); `Some(p)` must exist,
-/// and the error names `p`.
+/// Load the config file as the core [`Config`] only.
 pub fn load(path: Option<&Path>) -> anyhow::Result<Config> {
     load_settings(path).map(|s| s.core)
 }
 
-/// [`load`], keeping the scripting-tier settings too.
+/// Load the core [`Config`] and the L4 module [`L4Config`] (for callers that wire
+/// L4). The L4 section lives outside `aitm-core`, so it rides alongside here rather
+/// than inside `Config` (keeping `aitm-core` untouched, AC19).
+pub fn load_full(path: Option<&Path>) -> anyhow::Result<(Config, L4Config)> {
+    load_settings(path).map(|s| (s.core, s.l4))
+}
+
+/// [`load`], keeping the scripting-tier and L4 settings too. `None` reads
+/// [`default_config_path`], where an absent file means defaults (L4 disabled);
+/// `Some(p)` must exist, and the error names `p`.
 pub fn load_settings(path: Option<&Path>) -> anyhow::Result<Settings> {
     let Some(path) = path else {
         let path = default_config_path();
@@ -60,6 +68,7 @@ pub fn load_settings(path: Option<&Path>) -> anyhow::Result<Settings> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings {
                 core: Config::default(),
                 rhai: RhaiConfig::default(),
+                l4: L4Config::default(),
             }),
             Err(e) => Err(e).with_context(|| format!("reading config file {}", path.display())),
         };
@@ -69,20 +78,27 @@ pub fn load_settings(path: Option<&Path>) -> anyhow::Result<Settings> {
     parse_settings(&text).with_context(|| format!("in config file {}", path.display()))
 }
 
-/// Parse YAML into a `Config`: unknown keys are errors, as is a value the
-/// file may not set (`ca.key_mode` wider than the owner); absent keys keep
-/// their `Config::default()` value.
+/// Parse YAML into the core [`Config`] only. See [`parse_full`] for the L4 variant.
 pub fn parse(yaml: &str) -> anyhow::Result<Config> {
     parse_settings(yaml).map(|s| s.core)
 }
 
-/// [`parse`], keeping the scripting-tier settings too.
+/// Parse the core [`Config`] and the L4 module [`L4Config`].
+pub fn parse_full(yaml: &str) -> anyhow::Result<(Config, L4Config)> {
+    parse_settings(yaml).map(|s| (s.core, s.l4))
+}
+
+/// [`parse`], keeping the scripting-tier and L4 settings too: unknown keys are
+/// errors (including under `l4`, which maps to `L4Config`'s own
+/// `deny_unknown_fields`); absent keys keep their default value; an absent `l4`
+/// section is `L4Config::default()` — disabled, fail-closed.
 pub fn parse_settings(yaml: &str) -> anyhow::Result<Settings> {
     let file: ConfigFile = serde_yaml::from_str(yaml).context("parsing config YAML")?;
+    let l4 = file.l4.clone().unwrap_or_default();
     let mut core = Config::default();
     let mut rhai = RhaiConfig::default();
     file.apply(&mut core, &mut rhai)?;
-    Ok(Settings { core, rhai })
+    Ok(Settings { core, rhai, l4 })
 }
 
 /// Overwrite `slot` only when the file set the key.
@@ -112,6 +128,11 @@ struct ConfigFile {
     ssl_insecure: Option<bool>,
     max_flows: Option<usize>,
     max_flow_bytes: Option<usize>,
+    /// The L4 (raw packet) module config. Maps directly to the crate's `L4Config`
+    /// (its own `#[serde(default, deny_unknown_fields)]` applies), so missing keys
+    /// take their fail-closed defaults and a misspelled `l4.*` key is an error.
+    /// Lives outside `Config` to keep `aitm-core` untouched (AC19).
+    l4: Option<L4Config>,
     /// The scripts to load, in chain order (M3 spec §8).
     scripts: Option<Vec<ScriptFile>>,
     /// The scripting sandbox: limits, the per-hook budget, the error policy.

@@ -45,6 +45,16 @@ enum SelfTest {
             session.interceptArmed = false
             check("disarming clears the armed state", !session.interceptArmed)
 
+            // S-045: a WebSocket flow shows its frame stream, not a request/response.
+            let wsRow = session.rows.first { $0.kind == .websocket }
+            session.select(wsRow?.id)
+            let ws = session.focusedWSDetail
+            check("selecting the WebSocket flow loads its frames", (ws?.frames.count ?? 0) == 7)
+            check("the first frame pretty-prints as JSON", ws?.frames.first?.bodyKind == .json)
+            check("a binary frame is detected", ws?.frames.contains { $0.opcode == "binary" && $0.bodyKind == .binary } == true)
+            check("an injected frame is marked", ws?.frames.contains { $0.injected } == true)
+            session.select(session.rows[0].id)
+
             // S-009: sorting never moves the selection; status puts rows without a code last.
             session.sort = FlowSort(key: .status, ascending: false)
             check("sorting by status puts 502 first and paused last",

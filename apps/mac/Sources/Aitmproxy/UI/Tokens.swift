@@ -72,6 +72,20 @@ enum Tok {
         /// Row separators in tables and key-value lists; one step lighter than border.
         static let rule = DynamicColor(light: 0xF0F1F3, dark: 0x252527)
     }
+    /// The 11 flow mark colours (Proxyman's set = the macOS system colours, light/dark).
+    enum Mark {
+        static let blue = DynamicColor(light: 0x007AFF, dark: 0x0A84FF)
+        static let cyan = DynamicColor(light: 0x32ADE6, dark: 0x64D2FF)
+        static let green = DynamicColor(light: 0x34C759, dark: 0x30D158)
+        static let indigo = DynamicColor(light: 0x5856D6, dark: 0x5E5CE6)
+        static let mint = DynamicColor(light: 0x00C7BE, dark: 0x63E6E2)
+        static let orange = DynamicColor(light: 0xFF9500, dark: 0xFF9F0A)
+        static let pink = DynamicColor(light: 0xFF2D55, dark: 0xFF375F)
+        static let purple = DynamicColor(light: 0xAF52DE, dark: 0xBF5AF2)
+        static let red = DynamicColor(light: 0xFF3B30, dark: 0xFF453A)
+        static let teal = DynamicColor(light: 0x30B0C7, dark: 0x40C8E0)
+        static let yellow = DynamicColor(light: 0xFFCC00, dark: 0xFFD60A)
+    }
     /// HTTP method badge colors, Proxyman-WebUI convention.
     enum Method {
         static let connect = ColorPair(
@@ -140,10 +154,12 @@ enum Tok {
     }
     /// Body viewer syntax colors (JSON/XML/HTML/JS/headers), Proxyman-native-derived.
     enum Syntax {
-        /// true/false/null, keywords.
+        /// true/false/null literals.
         static let boolean = DynamicColor(light: 0x6D28D9, dark: 0xC4B5FD)
         /// Outer object/array brackets.
         static let bracket = DynamicColor(light: 0xA16207, dark: 0xE5C07B)
+        /// Line and block comments; additive for code editing.
+        static let comment = DynamicColor(light: 0x6E7A82, dark: 0x7D8590)
         static let currentLine = DynamicColor(light: 0xF3F4F6, dark: 0x232325)
         static let diffAdd = ColorPair(
             fg: DynamicColor(light: 0x15803D, dark: 0x86EFAC),
@@ -153,6 +169,8 @@ enum Tok {
             bg: DynamicColor(light: 0xFEE2E2, dark: 0x3B1C1C))
         /// JSON keys, header names, XML attribute names.
         static let key = DynamicColor(light: 0x9D174D, dark: 0xE58BC9)
+        /// Rhai control keywords (fn/let/if/…); additive for code editing.
+        static let keyword = DynamicColor(light: 0x1D4ED8, dark: 0x8AB4F8)
         static let lineNumber = DynamicColor(light: 0x9CA3AF, dark: 0x5C5C62)
         /// Find-in-body highlight.
         static let match = DynamicColor(light: 0xFDE68A, dark: 0x6B5312)

@@ -30,7 +30,10 @@ use aitm_plugins::{
     RateLimitPlugin, ReplayPlugin, ScopePlugin,
 };
 use aitm_proto_http::{CertAuthority, HttpModule};
+use aitm_proto_l4::config::L4Config;
+use aitm_proto_l4::{L4Module, L4Privilege};
 use aitm_proto_ws::{InjectRegistry, WsModule};
+use tracing::{info, warn};
 
 /// Which removable first-party feature plugins to register. Dropping one here is
 /// the whole of AC-P3: the command disappears from the registry with no core edit.
@@ -42,6 +45,13 @@ pub struct Features {
     /// (real executor, file audit log); `Some` registers the given plugin,
     /// which is how tests inject a scripted executor and an in-memory audit log.
     pub ca_plugin: Option<CaPlugin>,
+    /// The L4 (raw packet) module config. Opt-in and fail-closed: `enabled` is
+    /// false by default, so the default feature set registers no `l4.*` command.
+    /// When enabled, the module is registered on the live core (M5-AC17).
+    pub l4: L4Config,
+    /// An explicit L4 capability-probe result. `None` (production default) runs the
+    /// real cheap startup probe; tests force a known privilege state here.
+    pub l4_privilege: Option<L4Privilege>,
 }
 
 impl Default for Features {
@@ -49,6 +59,8 @@ impl Default for Features {
         Self {
             mutate: true,
             ca_plugin: None,
+            l4: L4Config::default(),
+            l4_privilege: None,
         }
     }
 }
@@ -191,6 +203,31 @@ pub fn assemble_with_scripts(
         .register_plugin(Box::new(ca_plugin));
     if let Some(commands) = scripts.commands {
         builder = builder.register_plugin(commands);
+    }
+
+    // L4 (raw packet) module: opt-in and fail-closed (M5-AC17). When disabled, it is
+    // not constructed and no `l4.*` command is registered. When enabled, it is always
+    // registered — even without the capture/inject or in-path privilege — so the
+    // operator who opted in sees an honest, drivable surface; the wire-touching verbs
+    // then fail closed with the specific missing-capability reason, cached from a
+    // cheap startup probe. The pure/read verbs work regardless. Registered before
+    // `build()` (which consumes the builder).
+    if features.l4.enabled {
+        let privilege = features
+            .l4_privilege
+            .clone()
+            .unwrap_or_else(L4Privilege::probe);
+        match (&privilege.capture_inject, &privilege.intercept) {
+            (None, None) => info!("L4 enabled; capture/inject and in-path privilege present"),
+            (ci, ip) => warn!(
+                capture_inject = ci.as_deref().unwrap_or("present"),
+                in_path = ip.as_deref().unwrap_or("present"),
+                "L4 enabled but some privilege is absent; affected l4.* commands will report \
+                 L4Unavailable"
+            ),
+        }
+        builder =
+            builder.register_plugin(Box::new(L4Module::with_privilege(&features.l4, privilege)));
     }
 
     let proxy = builder.build()?;

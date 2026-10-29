@@ -586,55 +586,6 @@
   }
 }
 
-/* code (the mockup's .code): mono 13/20, 44px gutter with CSS counters */
-.code {
-  margin: 0;
-  overflow: auto;
-  padding: var(--space-2) 0;
-  border-top: 1px solid var(--color-line-rule);
-  border-bottom: 1px solid var(--color-line-rule);
-  font: var(--font-size-md) / 20px var(--font-data);
-  color: var(--color-text-primary);
-  counter-reset: ln;
-  tab-size: 2;
-}
-.code .l {
-  display: flex;
-  min-height: 20px;
-  padding-right: var(--space-4);
-  white-space: pre;
-}
-.code .l::before {
-  counter-increment: ln;
-  content: counter(ln);
-  width: 44px;
-  flex: none;
-  text-align: right;
-  padding-right: 14px;
-  color: var(--color-syntax-line-number);
-  user-select: none;
-}
-.code .l > span {
-  white-space: pre;
-}
-.key {
-  color: var(--color-syntax-key);
-}
-.string {
-  color: var(--color-syntax-string);
-}
-.number {
-  color: var(--color-syntax-number);
-}
-.bool {
-  color: var(--color-syntax-boolean);
-}
-.punct {
-  color: var(--color-syntax-punct);
-}
-.comment {
-  color: var(--color-text-tertiary);
-}
 /* Grey bars while poc.get fetches the source (§2.8 skeleton: no shimmer). */
 .yamlLoading {
   display: grid;
@@ -661,26 +612,17 @@
 .yamlLoading > i:nth-child(4) {
   width: 71%;
 }
-.editor {
-  display: block;
-  width: 100%;
-  min-height: 200px;
-  margin: 0;
-  padding: var(--space-2) var(--space-3) var(--space-2) 44px;
-  border: 1px solid var(--color-line-control);
+/* PoC YAML CodeMirror host: a bordered, rounded frame; height is set inline from the line count. */
+.cmYaml {
+  border: 1px solid var(--color-line-rule);
   border-radius: var(--radius-control);
-  background: var(--color-ground-surface);
-  color: var(--color-text-primary);
-  font: var(--font-size-md) / 20px var(--font-data);
-  tab-size: 2;
-  resize: vertical;
-  white-space: pre;
-  caret-color: var(--color-accent-base);
+  overflow: hidden;
 }
-.editor:focus-visible {
-  outline: 2px solid var(--color-line-focus);
-  outline-offset: -1px;
-  border-radius: var(--radius-control);
+.cmYaml.cmYamlEditing {
+  border-color: var(--color-line-control);
+}
+.cmYaml:focus-within {
+  border-color: var(--color-line-focus);
 }
 
 /* ---------- Run-again popover ---------- */

@@ -2,4 +2,7 @@ node_modules/
 dist/
 # generated from docs/design/tokens.json by scripts/gen-tokens.mjs
 src/styles/tokens.css
+# generated from docs/design/languages/*.json by scripts/gen-langs.mjs
+src/viewers/lang/defs.gen.ts
+src/viewers/lang/conformance.gen.ts
 .cua-shots/
