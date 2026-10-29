@@ -36,7 +36,7 @@ use aitm::wire::{assemble, Assembled};
 use aitm_browser::{launch_owned, LaunchedBrowser};
 use aitm_core::{
     BrowserConfig, BrowserEngine, Config, FirefoxConfig, Flow, FlowStore, HttpFlow, ObscuraConfig,
-    ScopeEntry,
+    ScopeEntry, SsrfPolicy,
 };
 use aitm_testtarget::{SeedMode, TestTarget};
 use tokio::net::TcpStream;
@@ -108,6 +108,19 @@ fn config_for(engine: BrowserEngine, proxy: SocketAddr) -> BrowserConfig {
             ..FirefoxConfig::default()
         },
         proxy_addr: proxy,
+        // The test target is a loopback fixture. Since audit I15 (938c798) the
+        // obscura engine is given `--allow-private-network` only when the policy
+        // permits private targets; without it obscura refuses a loopback
+        // navigation on its own and `navigate` times out before it ever reaches
+        // the proxy. `block_private = false` lets the engine dial loopback; the
+        // proxy's SSRF connector stays the authoritative per-connection gate
+        // (`block_loopback` + `allow_if_in_scope`), so it still forwards only the
+        // in-scope target authority. Same posture the shared `engines::config_for`
+        // and `aitm/tests/support/rig.rs` adopted for loopback fixtures.
+        ssrf: SsrfPolicy {
+            block_private: false,
+            ..SsrfPolicy::default()
+        },
         ..BrowserConfig::default()
     }
 }
@@ -154,12 +167,15 @@ struct Rig {
 
 impl Rig {
     /// Assemble the proxy with `target_authority` in scope, run its browser-facing
-    /// listener, and launch `engine` pointed at `browser_proxy` (trusting the
-    /// generated MITM CA). The listener always comes up on its own free port; the
-    /// engine's upstream is `browser_proxy`, which the caller chooses.
+    /// listener on `listen`, and launch `engine` pointed at `browser_proxy`
+    /// (trusting the generated MITM CA). Both addresses are the caller's: the
+    /// positive leg passes `listen == browser_proxy` so the engine's upstream is
+    /// the live listener; the negative leg passes a live `listen` and a separate,
+    /// dead `browser_proxy`.
     async fn start(
         tag: &str,
         engine: BrowserEngine,
+        listen: SocketAddr,
         browser_proxy: SocketAddr,
         target_authority: &str,
     ) -> Rig {
@@ -175,10 +191,6 @@ impl Rig {
         // host is in scope; this e2e authorizes the loopback test target above.
         cfg.scope.allow_agent_widen = true;
 
-        // The browser-facing listener binds its own free port, independent of the
-        // engine's upstream (`browser_proxy`): the negative leg relies on them
-        // being different.
-        let listen = free_addr();
         let Assembled { proxy, ca, .. } = assemble(&cfg).expect("assemble the proxy");
         let store = proxy.store();
         tokio::spawn(async move {
@@ -316,9 +328,10 @@ async fn capture_through_custom_proxy_per_engine() {
         let target = TestTarget::start(SeedMode::Vulnerable).await;
         let authority = authority_of(target.base_url());
 
-        // The engine's upstream IS aitmproxy's browser-facing listener.
+        // The engine's upstream IS aitmproxy's browser-facing listener: bind the
+        // listener and point the browser at the same address.
         let aitm_listen = free_addr();
-        let rig = Rig::start("pos", engine, aitm_listen, &authority).await;
+        let rig = Rig::start("pos", engine, aitm_listen, aitm_listen, &authority).await;
 
         let url = format!("{}/", target.base_url());
         rig.browser
@@ -375,10 +388,12 @@ async fn no_capture_without_custom_proxy() {
         let target = TestTarget::start(SeedMode::Vulnerable).await;
         let authority = authority_of(target.base_url());
 
-        // A free loopback port with nothing listening: the browser is pointed
-        // here, not at aitmproxy — i.e. the custom proxy is effectively unset.
+        // aitmproxy's browser-facing listener comes up on its own live port, but
+        // the browser is pointed at a separate free loopback port with nothing
+        // listening — i.e. the custom proxy is effectively unset.
+        let aitm_listen = free_addr();
         let dead_proxy = free_addr();
-        let rig = Rig::start("neg", engine, dead_proxy, &authority).await;
+        let rig = Rig::start("neg", engine, aitm_listen, dead_proxy, &authority).await;
 
         // The navigation cannot succeed (its proxy is dead); tolerate the error.
         // What matters is whether anything reached aitmproxy's store.
