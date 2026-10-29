@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use aitm_core::{
@@ -36,6 +36,11 @@ pub const DEFAULT_BROADCAST_CAPACITY: usize = 8192;
 /// How long an operator confirm-over-the-wire token stays valid before it is
 /// rejected as expired (spec D4: "short TTL, single use").
 pub const DEFAULT_CONFIRM_TTL: Duration = Duration::from_secs(120);
+
+/// How long a Sensitive agent call parked under the `Ask` policy waits for an
+/// operator's `agent.approve` before it is refused on timeout (spec D4 / Review
+/// Focus #4: a parked call never hangs).
+pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The MCP protocol revision this server speaks when the client names none.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -301,6 +306,11 @@ fn host_eq(authority: &str, want: &str) -> bool {
 struct Subscription {
     sub_id: u64,
     conn_id: u64,
+    /// The role of the connection that owns this subscription, so the server can
+    /// tell whether an operator is present (to route `Ask`-policy approval
+    /// requests, and to refuse at once when none is) without a separate
+    /// connection registry.
+    role: Frontend,
     sink: NotificationSink,
     filter: FlowFilter,
 }
@@ -326,18 +336,39 @@ impl Subscriptions {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Register a subscription for `conn_id` over `sink`; returns its `sub_id`.
-    fn add(&self, conn_id: u64, sink: NotificationSink, filter: FlowFilter) -> u64 {
+    /// Register a subscription for `conn_id` (speaking as `role`) over `sink`;
+    /// returns its `sub_id`.
+    fn add(&self, conn_id: u64, role: Frontend, sink: NotificationSink, filter: FlowFilter) -> u64 {
         let mut st = self.lock();
         st.next_sub += 1;
         let sub_id = st.next_sub;
         st.subs.push(Subscription {
             sub_id,
             conn_id,
+            role,
             sink,
             filter,
         });
         sub_id
+    }
+
+    /// Whether any live subscription belongs to a connection of `role` (e.g. an
+    /// operator present to approve `Ask`-policy parked calls).
+    fn any_role(&self, role: Frontend) -> bool {
+        self.lock().subs.iter().any(|s| s.role == role)
+    }
+
+    /// Push `line` to each subscribed connection of `role` (once per connection).
+    fn fanout_role(&self, role: Frontend, line: &str) {
+        let st = self.lock();
+        let mut seen: Vec<u64> = Vec::new();
+        for sub in &st.subs {
+            if sub.role != role || seen.contains(&sub.conn_id) {
+                continue;
+            }
+            seen.push(sub.conn_id);
+            sub.sink.push(line.to_string());
+        }
     }
 
     /// Remove `sub_id` if it belongs to `conn_id`. Returns whether it existed.
@@ -494,6 +525,118 @@ fn needs_confirmation(prompt: &str, token: &str) -> JsonValue {
     })
 }
 
+/// The `Ask`-policy parked-request table (spec D4 / AC-M4-5b). When an agent makes
+/// a Sensitive call under `AgentPolicy::Ask`, the server parks it here — keyed by
+/// an opaque `request_id` — and the agent's call blocks on the entry's [`ParkSlot`]
+/// until an operator's `agent.approve {request_id, allow}` resolves it or the
+/// bounded approval timeout elapses. The waiting agent thread holds the command and
+/// its arguments on its own stack; this table holds only the resolution channel, so
+/// resolving never has to re-run anything itself.
+#[derive(Default)]
+struct ParkedRequests {
+    inner: Mutex<ParkState>,
+}
+
+#[derive(Default)]
+struct ParkState {
+    /// Monotonic counter folded into each `request_id`.
+    seq: u64,
+    entries: Vec<(String, Arc<ParkSlot>)>,
+}
+
+/// One parked call's resolution channel: `None` until resolved, then `Some(true)`
+/// (approved) or `Some(false)` (denied). The waiting agent thread blocks on `cv`
+/// with a timeout; `agent.approve` sets the state and notifies.
+struct ParkSlot {
+    state: Mutex<Option<bool>>,
+    cv: Condvar,
+}
+
+impl ParkSlot {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(None),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Record the decision and wake the waiting thread.
+    fn resolve(&self, allow: bool) {
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *st = Some(allow);
+        self.cv.notify_all();
+    }
+
+    /// Block until resolved or `timeout` elapses; `Some(allow)` if resolved,
+    /// `None` on timeout. Never hangs (Review Focus #4).
+    fn wait(&self, timeout: Duration) -> Option<bool> {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = match self.cv.wait_timeout_while(guard, timeout, |s| s.is_none()) {
+            Ok((g, _)) => g,
+            Err(poisoned) => poisoned.into_inner().0,
+        };
+        *guard
+    }
+}
+
+impl ParkedRequests {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ParkState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Park a new request: mint a `request_id`, register its slot, and return both.
+    fn park(&self) -> (String, Arc<ParkSlot>) {
+        let mut st = self.lock();
+        st.seq += 1;
+        let request_id = format!("apr_{}", st.seq);
+        let slot = Arc::new(ParkSlot::new());
+        st.entries.push((request_id.clone(), slot.clone()));
+        (request_id, slot)
+    }
+
+    /// Resolve `request_id` with `allow`, removing it from the table. Returns
+    /// whether a parked request by that id was found (so `agent.approve` can report
+    /// an unknown or already-resolved id).
+    fn resolve(&self, request_id: &str, allow: bool) -> bool {
+        let slot = {
+            let mut st = self.lock();
+            st.entries
+                .iter()
+                .position(|(id, _)| id == request_id)
+                .map(|pos| st.entries.remove(pos).1)
+        };
+        match slot {
+            Some(slot) => {
+                slot.resolve(allow);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Drop `request_id` if still present (idempotent; used by the waiting thread
+    /// to clean up after a timeout — a resolved entry was already removed).
+    fn forget(&self, request_id: &str) {
+        self.lock().entries.retain(|(id, _)| id != request_id);
+    }
+}
+
+/// The result of parking a Sensitive agent call under the `Ask` policy.
+enum ParkOutcome {
+    /// An operator approved it; the caller runs the command and returns its result.
+    Approved,
+    /// Denied, timed out, or no operator was connected — the agent call is refused.
+    Refused(String),
+}
+
 /// The core services a `CommandHost` borrows; shared handles so one server can
 /// answer many connections.
 struct Services {
@@ -548,6 +691,13 @@ pub struct McpServer {
     /// reconstructable after the fact (spec D3a.2); the CA plugin's log is a
     /// subset of this one format.
     durable_audit: Option<Arc<dyn AuditSink>>,
+    /// The `Ask`-policy parked-request table (spec D4). A Sensitive agent call under
+    /// `AgentPolicy::Ask` is parked here until an operator `agent.approve`s it or the
+    /// approval timeout elapses.
+    parked: Arc<ParkedRequests>,
+    /// How long a parked Sensitive agent call waits for operator approval before it
+    /// is refused on timeout (Review Focus #4: never hang).
+    approval_timeout: Duration,
 }
 
 /// A JSON-RPC level failure (as opposed to a tool's own error result).
@@ -589,7 +739,17 @@ impl McpServer {
             confirm_ttl: DEFAULT_CONFIRM_TTL,
             audit_ring: Arc::new(AuditRing::default()),
             durable_audit: None,
+            parked: Arc::new(ParkedRequests::default()),
+            approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
         }
+    }
+
+    /// Set how long a Sensitive agent call parked under the `Ask` policy waits for
+    /// an operator's `agent.approve` before it is refused on timeout (spec D4).
+    /// Defaults to [`DEFAULT_APPROVAL_TIMEOUT`].
+    pub fn with_approval_timeout(mut self, timeout: Duration) -> Self {
+        self.approval_timeout = timeout;
+        self
     }
 
     /// Share the F2 audit ring with the `AgentPlugin`, so `agent.activity` reads
@@ -776,6 +936,8 @@ impl McpServer {
             confirm_ttl,
             audit_ring,
             durable_audit,
+            parked,
+            approval_timeout,
         } = self;
         let on_bound = on_bound.into_inner().unwrap_or(None);
         let server = Arc::new(McpServer {
@@ -797,6 +959,8 @@ impl McpServer {
             confirm_ttl,
             audit_ring,
             durable_audit,
+            parked,
+            approval_timeout,
         });
         // The push dispatcher: for each core event, render + fan a flow
         // notification to matching subscriptions. One task per server, draining
@@ -992,6 +1156,13 @@ impl McpServer {
             }
             return ToolOutcome::Done(self.handle_subscription(conn, name, arguments));
         }
+        // `agent.approve` is server-handled (spec D4): it resolves a parked `Ask`
+        // request against the server's parked-request table, which a `CommandHost`
+        // cannot carry. It is registered (for `tools/list`) but intercepted here,
+        // before the registry/policy path. The agent role can never approve (RF#2).
+        if name == "agent.approve" {
+            return ToolOutcome::Done(self.handle_approve(conn, arguments));
+        }
         let cmd = match self.registry.command(name) {
             Some(cmd) => cmd,
             None => {
@@ -1001,10 +1172,17 @@ impl McpServer {
                 ))
             }
         };
-        // The agent policy gate (D2), before anything runs. Only the agent role
-        // is gated; an operator or the CLI is the control and bypasses it.
-        if let Some(reason) = self.policy_refusal(conn, cmd.as_ref()) {
-            return ToolOutcome::Done(tool_error(reason));
+        // The agent policy gate (D2), before anything runs. Only the agent role is
+        // gated; an operator or the CLI is the control and bypasses it. Under `Ask`,
+        // a Sensitive agent call is parked for operator approval rather than refused.
+        match self.policy_decision(conn, cmd.as_ref()) {
+            PolicyDecision::Allow => {}
+            PolicyDecision::Refuse(reason) => return ToolOutcome::Done(tool_error(reason)),
+            PolicyDecision::Park => match self.park_for_approval(cmd.as_ref(), arguments) {
+                // Approved: fall through and run the command as the agent.
+                ParkOutcome::Approved => {}
+                ParkOutcome::Refused(reason) => return ToolOutcome::Done(tool_error(reason)),
+            },
         }
         let services = match self.services.as_ref() {
             Some(services) => services,
@@ -1157,12 +1335,13 @@ impl McpServer {
         self.subscriptions.fanout_state(&line);
     }
 
-    /// The D2 policy decision for one command on one connection: `Some(reason)`
-    /// when the agent policy refuses it, `None` when it may proceed. Only the
-    /// agent role (`Frontend::Mcp`) is gated — `Operator`/`Cli` are the control.
-    fn policy_refusal(&self, conn: &ConnCtx, cmd: &dyn Command) -> Option<String> {
+    /// The D2 policy decision for one command on one connection. Only the agent
+    /// role (`Frontend::Mcp`) is gated — `Operator`/`Cli` are the control and always
+    /// [`PolicyDecision::Allow`]. Under `Ask`, a Sensitive agent call is
+    /// [`PolicyDecision::Park`]ed for operator approval instead of refused.
+    fn policy_decision(&self, conn: &ConnCtx, cmd: &dyn Command) -> PolicyDecision {
         if conn.role != Frontend::Mcp {
-            return None;
+            return PolicyDecision::Allow;
         }
         let policy = self.agent_state.policy();
         let sens = cmd.sensitivity();
@@ -1182,9 +1361,16 @@ impl McpServer {
             // `All` (unconditional) or `Ask` (operator approval) to permit one.
             (AgentPolicy::Auto, Sensitivity::Sensitive) => false,
             (AgentPolicy::Ask, Sensitivity::Read | Sensitivity::Write) => true,
-            // `Ask` parks a Sensitive call for operator approval (Task 9); until
-            // that lands it is refused rather than run.
-            (AgentPolicy::Ask, Sensitivity::Sensitive) => false,
+            // `Ask` parks a Sensitive agent call for operator approval (spec D4) —
+            // except the operator-only commands (`agent.set`/`agent.approve`), which
+            // the agent can never run and so are refused outright, never parked.
+            (AgentPolicy::Ask, Sensitivity::Sensitive) => {
+                if is_operator_only(cmd.name()) {
+                    false
+                } else {
+                    return PolicyDecision::Park;
+                }
+            }
             (AgentPolicy::ReadOnly, Sensitivity::Read) => true,
             (AgentPolicy::ReadOnly, _) => false,
             (AgentPolicy::Paused, _) => false,
@@ -1192,9 +1378,116 @@ impl McpServer {
             _ => false,
         };
         if allowed {
-            None
+            PolicyDecision::Allow
         } else {
-            Some(policy_refusal_reason(policy, sens, cmd.name()))
+            PolicyDecision::Refuse(policy_refusal_reason(policy, sens, cmd.name()))
+        }
+    }
+
+    /// Park a Sensitive agent call under the `Ask` policy and block until an
+    /// operator resolves it or the approval timeout elapses (spec D4 / RF#4). If no
+    /// operator is connected to receive the request, refuse at once rather than park
+    /// (an unseen request would only time out). On approval the caller runs the
+    /// command as the agent; otherwise the agent call is refused with a clear reason.
+    fn park_for_approval(
+        &self,
+        cmd: &dyn Command,
+        arguments: &Map<String, JsonValue>,
+    ) -> ParkOutcome {
+        if !self.subscriptions.any_role(Frontend::Operator) {
+            return ParkOutcome::Refused(format!(
+                "`{}` refused: the agent policy is `ask`, which parks a sensitive command for \
+                 operator approval, but no operator is connected to approve it. An operator can \
+                 connect and subscribe, or change the policy with agent.set.",
+                cmd.name()
+            ));
+        }
+        let prompt = self.approval_prompt(cmd, arguments);
+        let (request_id, slot) = self.parked.park();
+        self.push_approval_request(cmd.name(), arguments, &prompt, &request_id);
+        let outcome = slot.wait(self.approval_timeout);
+        // Clean up a timed-out entry (an approved/denied one was already removed).
+        self.parked.forget(&request_id);
+        match outcome {
+            Some(true) => ParkOutcome::Approved,
+            Some(false) => ParkOutcome::Refused(format!(
+                "`{}` refused: an operator denied the parked sensitive command.",
+                cmd.name()
+            )),
+            None => ParkOutcome::Refused(format!(
+                "`{}` refused: no operator approved the parked sensitive command within the \
+                 approval timeout.",
+                cmd.name()
+            )),
+        }
+    }
+
+    /// The human-readable approval prompt for a parked command: the command's own
+    /// `confirm_prompt` when it has one (the `Ask` policy reuses the confirm
+    /// handshake, spec D4), else a generic one. Argument coercion failures fall back
+    /// to the generic prompt — the operator still sees the redacted args and name.
+    fn approval_prompt(&self, cmd: &dyn Command, arguments: &Map<String, JsonValue>) -> String {
+        params_from_json(arguments, &cmd.schema(), cmd.name())
+            .ok()
+            .and_then(|args| cmd.confirm_prompt(&args))
+            .unwrap_or_else(|| {
+                format!(
+                    "The agent requests approval to run the sensitive command `{}`.",
+                    cmd.name()
+                )
+            })
+    }
+
+    /// Push a `notifications/aitm/agent {event:"approval_requested", …}` line to
+    /// every connected operator (spec D4). `args_summary` is redacted (RF#3), so a
+    /// secret in the parked call's arguments never reaches the operator's stream.
+    fn push_approval_request(
+        &self,
+        command: &str,
+        arguments: &Map<String, JsonValue>,
+        prompt: &str,
+        request_id: &str,
+    ) {
+        let line = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/aitm/agent",
+            "params": {
+                "event": "approval_requested",
+                "command": command,
+                "args_summary": redact_args(arguments),
+                "prompt": prompt,
+                "request_id": request_id,
+            },
+        })
+        .to_string();
+        self.subscriptions.fanout_role(Frontend::Operator, &line);
+    }
+
+    /// Resolve a parked `Ask` request (`agent.approve`, spec D4). Operator/CLI only:
+    /// the agent can never approve its own request (RF#2). `allow:true` wakes the
+    /// waiting agent to run the parked command; `allow:false` refuses it. An unknown
+    /// or already-resolved id is a plain error, not a role refusal.
+    fn handle_approve(&self, conn: &ConnCtx, arguments: &Map<String, JsonValue>) -> JsonValue {
+        if conn.role == Frontend::Mcp {
+            return tool_error(
+                "agent.approve refused: the agent cannot approve its own requests; only an \
+                 operator or the human CLI may approve a parked sensitive command."
+                    .to_string(),
+            );
+        }
+        let Some(request_id) = arguments.get("request_id").and_then(JsonValue::as_str) else {
+            return tool_error("agent.approve requires a string `request_id`.".to_string());
+        };
+        let Some(allow) = arguments.get("allow").and_then(JsonValue::as_bool) else {
+            return tool_error("agent.approve requires a boolean `allow`.".to_string());
+        };
+        if self.parked.resolve(request_id, allow) {
+            tool_ok(json!({}))
+        } else {
+            tool_error(format!(
+                "agent.approve: no parked request `{request_id}` is awaiting approval (it may have \
+                 already been resolved or timed out)."
+            ))
         }
     }
 
@@ -1229,7 +1522,7 @@ impl McpServer {
             ));
         };
         match name {
-            "flow.subscribe" => self.subscribe(conn.conn_id, sink, args),
+            "flow.subscribe" => self.subscribe(conn.conn_id, conn.role, sink, args),
             "flow.unsubscribe" => self.unsubscribe(conn.conn_id, args),
             _ => tool_error(format!("unknown subscription command `{name}`")),
         }
@@ -1240,6 +1533,7 @@ impl McpServer {
     fn subscribe(
         &self,
         conn_id: u64,
+        role: Frontend,
         sink: NotificationSink,
         args: &Map<String, JsonValue>,
     ) -> JsonValue {
@@ -1250,7 +1544,7 @@ impl McpServer {
             .and_then(|s| s.parse::<FlowId>().ok());
         let sub_id = self
             .subscriptions
-            .add(conn_id, sink.clone(), filter.clone());
+            .add(conn_id, role, sink.clone(), filter.clone());
         if let Some(since) = since {
             self.replay_since(&sink, &filter, since);
         }
@@ -1388,6 +1682,25 @@ fn is_secret_key(key: &str) -> bool {
 /// config gate is on"). Any other Sensitive command is refused by the policy gate.
 fn defers_to_command_gate(name: &str) -> bool {
     matches!(name, "ca.install" | "ca.uninstall" | "scope.add")
+}
+
+/// Whether `name` is an operator/CLI-only command the agent can never run — so it
+/// is refused for the agent rather than parked for approval under `Ask` (the agent
+/// must not be able to have its own `agent.set`/`agent.approve` approved, RF#2).
+/// `agent.approve` is also intercepted before the policy gate; this keeps `agent.set`
+/// (and any future operator-only Sensitive command) from being parked.
+fn is_operator_only(name: &str) -> bool {
+    matches!(name, "agent.set" | "agent.approve")
+}
+
+/// The agent-policy gate's decision for one command (spec D2/D4).
+enum PolicyDecision {
+    /// The command may run (allowed by policy, or a non-agent role).
+    Allow,
+    /// The command is refused with this reason.
+    Refuse(String),
+    /// A Sensitive agent call under `Ask`: park it for operator approval.
+    Park,
 }
 
 /// The refusal text for a command the agent policy blocked, tuned to why.
