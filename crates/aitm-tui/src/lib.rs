@@ -212,12 +212,15 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     result
 }
 
-/// The 37 commands the bus serves today — `tools/list` of the core as of
+/// The 50 commands the bus serves today — `tools/list` of the core as of
 /// the 2026-10-28 merge: foundation §4.1's 22, plus `flow.detail` (F5),
 /// `flow.mark` / `flow.comment` (F6), `proxy.status` / `proxy.pause` /
 /// `proxy.resume` / `flow.clear` / `config.get` (F7), `scope.remove` (F12),
-/// `poc.list` / `poc.get` / `poc.artifact` (F13) and the M3 Rhai commands
-/// `findings.list`, `script.reload`, `script.validate`. What
+/// `poc.list` / `poc.get` / `poc.artifact` (F13), the M3 Rhai commands
+/// `findings.list`, `script.reload`, `script.validate`, and the M6 parity
+/// additions — `ws.intercept` / `ws.frame` / `ws.send` (F9), `session.save` /
+/// `session.load` / `flow.export` / `flow.import` (F10), `tls.passthrough.*`
+/// (F11), `map.add` / `map.list` / `map.remove` (Map). What
 /// [`fixture_app_core`] limits the fixture to; `agent.status` / `agent.set`
 /// (F1) are the fixture's only tools still ahead of the core.
 pub const CORE_TOOLS: &[&str] = &[
@@ -258,6 +261,20 @@ pub const CORE_TOOLS: &[&str] = &[
     "ca.status",
     "ca.install",
     "ca.uninstall",
+    // M6 parity additions (Task 14 convergence).
+    "ws.intercept",
+    "ws.frame",
+    "ws.send",
+    "session.save",
+    "session.load",
+    "flow.export",
+    "flow.import",
+    "tls.passthrough.list",
+    "tls.passthrough.add",
+    "tls.passthrough.remove",
+    "map.add",
+    "map.list",
+    "map.remove",
 ];
 
 /// An [`App`] loaded synchronously from the built-in fixture, sized `cols`×`rows`,

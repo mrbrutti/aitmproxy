@@ -107,13 +107,25 @@ async fn handle_conn(
     peer: SocketAddr,
     ssrf: bool,
 ) -> anyhow::Result<()> {
-    let mut buf = [0u8; 64];
+    // Peek enough to carry a TLS ClientHello whole (so its SNI can pick a
+    // passthrough module) as well as an HTTP/CONNECT request line. The bytes stay
+    // in the stream — the module the acceptor picks re-reads them.
+    let mut buf = [0u8; 2048];
     let n = stream.peek(&mut buf).await.unwrap_or(0);
     let first = &buf[..n];
+    let is_tls = first.first() == Some(&0x16); // TLS handshake record
     let hint = NextLayerHint {
         dst: peer,
-        is_tls: first.first() == Some(&0x16), // TLS handshake record
-        client_hello_sni: None,
+        is_tls,
+        // Extract the ClientHello SNI so a passthrough module matches a pinned host
+        // when the client speaks TLS directly (no CONNECT authority to key on).
+        // Best-effort: if the full ClientHello has not arrived in the peek, SNI
+        // stays `None` and the connection is MITM'd as before.
+        client_hello_sni: if is_tls {
+            parse_client_hello_sni(first)
+        } else {
+            None
+        },
         alpn: Vec::new(),
         first_bytes: first.to_vec(),
         from_upgrade: false,
@@ -137,6 +149,60 @@ async fn handle_conn(
         .with_hint(hint);
     let io: ByteStream = Box::pin(stream);
     module.spawn(io, ctx).await
+}
+
+/// Best-effort SNI extraction from a peeked TLS ClientHello.
+///
+/// Returns the `host_name` carried in the ClientHello's `server_name` (SNI)
+/// extension, or `None` when `buf` is not a ClientHello, the extension is absent,
+/// or the record is not wholly present in the peeked prefix. Every index is
+/// bounds-checked through `get`/`?`, so a truncated or malformed hello yields
+/// `None`, never a panic — this runs on attacker-controlled bytes. No TLS library
+/// is pulled into `aitm-core`; this is a read-only walk of the handshake layout
+/// (RFC 8446 §4.1.2, RFC 6066 §3), not a TLS implementation.
+fn parse_client_hello_sni(buf: &[u8]) -> Option<String> {
+    // TLS record header: content_type(1)=0x16 handshake, version(2), length(2).
+    if buf.first() != Some(&0x16) {
+        return None;
+    }
+    let rec = buf.get(5..)?;
+    // Handshake header: msg_type(1)=0x01 ClientHello, length(3).
+    if rec.first() != Some(&0x01) {
+        return None;
+    }
+    // Skip handshake type(1) + length(3), then client_version(2) + random(32).
+    let mut p = rec.get(4 + 34..)?;
+    // session_id: length(1) + id.
+    let sid_len = *p.first()? as usize;
+    p = p.get(1 + sid_len..)?;
+    // cipher_suites: length(2) + suites.
+    let cs_len = u16::from_be_bytes([*p.first()?, *p.get(1)?]) as usize;
+    p = p.get(2 + cs_len..)?;
+    // compression_methods: length(1) + methods.
+    let cm_len = *p.first()? as usize;
+    p = p.get(1 + cm_len..)?;
+    // extensions: length(2) + extensions block.
+    let ext_total = u16::from_be_bytes([*p.first()?, *p.get(1)?]) as usize;
+    let mut ext = p.get(2..2 + ext_total)?;
+    while ext.len() >= 4 {
+        let ext_type = u16::from_be_bytes([ext[0], ext[1]]);
+        let ext_len = u16::from_be_bytes([ext[2], ext[3]]) as usize;
+        let body = ext.get(4..4 + ext_len)?;
+        if ext_type == 0x0000 {
+            // server_name extension: server_name_list length(2), then entries of
+            // name_type(1) + name_length(2) + name. host_name is type 0x00.
+            let list = body.get(2..)?;
+            let name_type = *list.first()?;
+            let name_len = u16::from_be_bytes([*list.get(1)?, *list.get(2)?]) as usize;
+            let name = list.get(3..3 + name_len)?;
+            if name_type == 0x00 {
+                return std::str::from_utf8(name).ok().map(str::to_string);
+            }
+            return None;
+        }
+        ext = ext.get(4 + ext_len..)?;
+    }
+    None
 }
 
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -244,5 +310,66 @@ impl ProxyBuilder {
                 browser_ssrf,
             }),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_client_hello_sni;
+
+    /// A minimal but well-formed TLS ClientHello carrying one SNI `host_name`.
+    fn client_hello_with_sni(host: &str) -> Vec<u8> {
+        let name = host.as_bytes();
+        let mut sni_entry = vec![0x00]; // name_type = host_name
+        sni_entry.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        sni_entry.extend_from_slice(name);
+        let mut sni_body = (sni_entry.len() as u16).to_be_bytes().to_vec(); // list length
+        sni_body.extend_from_slice(&sni_entry);
+        let mut ext = 0x0000u16.to_be_bytes().to_vec(); // server_name extension
+        ext.extend_from_slice(&(sni_body.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&sni_body);
+        let mut extensions = (ext.len() as u16).to_be_bytes().to_vec();
+        extensions.extend_from_slice(&ext);
+
+        let mut body = vec![0x03, 0x03]; // client_version TLS 1.2
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0x00); // session_id length
+        body.extend_from_slice(&2u16.to_be_bytes()); // cipher_suites length
+        body.extend_from_slice(&[0x00, 0x2f]); // one cipher suite
+        body.push(0x01); // compression_methods length
+        body.push(0x00); // null compression
+        body.extend_from_slice(&extensions);
+
+        let mut hs = vec![0x01]; // ClientHello
+        hs.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]); // 3-byte length
+        hs.extend_from_slice(&body);
+
+        let mut rec = vec![0x16, 0x03, 0x01]; // handshake record, version TLS 1.0
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    #[test]
+    fn extracts_sni_from_client_hello() {
+        let hello = client_hello_with_sni("pinned.example");
+        assert_eq!(
+            parse_client_hello_sni(&hello).as_deref(),
+            Some("pinned.example")
+        );
+    }
+
+    #[test]
+    fn truncated_client_hello_yields_none_not_panic() {
+        let hello = client_hello_with_sni("pinned.example");
+        for cut in [0, 1, 5, 10, 20, hello.len() / 2, hello.len() - 1] {
+            assert_eq!(parse_client_hello_sni(&hello[..cut]), None, "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn non_tls_bytes_yield_none() {
+        assert_eq!(parse_client_hello_sni(b"GET / HTTP/1.1\r\n\r\n"), None);
+        assert_eq!(parse_client_hello_sni(b""), None);
     }
 }

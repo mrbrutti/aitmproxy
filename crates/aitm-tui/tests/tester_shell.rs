@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::{Duration, Instant};
 
-use aitm_tui::action::{Action, BusEvent, Level, ToolInfo};
+use aitm_tui::action::{Action, BusEvent, Level};
 use aitm_tui::app::{App, Layout, Mode, Pane, PromptKind, RESPONSE_TABS};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::keys;
@@ -493,20 +493,18 @@ fn import_is_a_command_not_a_drop_target() {
         "{}",
         toast(&app)
     );
-    // The fixture bus has no flow.import: the control is labelled, never silent.
-    assert!(app.run_command("import /tmp/session.har").is_empty());
-    assert_eq!(toast(&app), "Import needs core follow-up F10 (flow.import)");
-    app.tools.push(ToolInfo {
-        name: "flow.import".into(),
-        description: String::new(),
-        input_schema: json!({}),
-    });
+    // flow.import is a core tool since M6 F10, so the control issues the request.
     assert_eq!(
         app.run_command("import /tmp/session.har"),
         vec![aitm_tui::action::BusRequest::Import(
             "/tmp/session.har".into()
         )]
     );
+    // A bus without flow.import (an older core) still degrades honestly, never
+    // silently — the label names the missing tool.
+    app.tools.retain(|t| t.name != "flow.import");
+    assert!(app.run_command("import /tmp/session.har").is_empty());
+    assert_eq!(toast(&app), "Import needs core follow-up F10 (flow.import)");
 }
 
 #[test]
@@ -917,18 +915,19 @@ fn inspector_frames_with_a_five_megabyte_body_stay_under_two_seconds() {
 }
 
 /// The honest second snapshot (`aitm-tui --snapshot-core`): the fixture
-/// limited to the 37 commands the bus serves today (the 2026-10-28 core
-/// merge). F5/F6/F7/F12/F13 and the M3 commands are lit; only the F1 agent
-/// tools are still ahead of the core, so the agent surface alone degrades.
+/// limited to the 50 commands the bus serves today (the 2026-10-28 core merge
+/// plus the M6 parity additions). F5/F6/F7/F12/F13, the M3 commands and the M6
+/// F9/F10/F11/Map commands are lit; only the F1 agent tools are still ahead of
+/// the core, so the agent surface alone degrades.
 #[test]
-fn fixture_app_core_offers_exactly_the_37_core_tools_and_only_f1_degrades() {
+fn fixture_app_core_offers_exactly_the_core_tools_and_only_f1_degrades() {
     let app = fixture_app_core(200, 50);
     let mut names: Vec<&str> = app.tools.iter().map(|t| t.name.as_str()).collect();
     names.sort_unstable();
     let mut want: Vec<&str> = CORE_TOOLS.to_vec();
     want.sort_unstable();
     assert_eq!(names, want);
-    assert_eq!(app.tools.len(), 37);
+    assert_eq!(app.tools.len(), 50);
     for lit in [
         "flow.detail",
         "flow.mark",
@@ -970,7 +969,7 @@ fn fixture_app_core_offers_exactly_the_37_core_tools_and_only_f1_degrades() {
     assert_eq!(app.selected.as_deref(), Some("f50"));
 
     // The full fixture only adds the F1 tools; the core one renders.
-    assert_eq!(fixture_app(200, 50).tools.len(), 39);
+    assert_eq!(fixture_app(200, 50).tools.len(), 52);
     let text = text_of(&app, 200, 50);
     assert!(text.contains("11 / 15 rows"), "{text}");
     assert!(text.contains("Agent · n/a (F1)"), "{text}");
