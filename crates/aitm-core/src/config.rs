@@ -9,6 +9,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::agent::AgentPolicy;
+use crate::ctx::Frontend;
+
 /// Top-level configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -19,6 +22,7 @@ pub struct Config {
     pub mcp: McpConfig,
     pub browser: BrowserConfig,
     pub poc: PocConfig,
+    pub findings: FindingsConfig,
     /// Skip verification of upstream server certificates. **Off by default**:
     /// the proxy verifies upstream TLS against the platform roots. Turning this
     /// on (for a lab with self-signed targets) trusts any upstream certificate.
@@ -30,6 +34,18 @@ pub struct Config {
     /// `max_flows`, so a few very large captures cannot exhaust memory while under
     /// the flow-count cap.
     pub max_flow_bytes: usize,
+    /// Per-host TLS passthrough (M6 F11). Deny-by-default: the list is empty and
+    /// agent authoring is off, so nothing is tunnelled past MITM until the
+    /// operator names a host.
+    pub tls: TlsConfig,
+    /// Map Local/Remote rules (M6). Deny-by-default: no map root and agent
+    /// authoring off, so Map Local is unusable and no agent may author maps until
+    /// the operator opts in.
+    pub maps: MapsConfig,
+    /// Session/flow file I/O (M6 F10). Deny-by-default: an agent (MCP) frontend
+    /// may not read or write a host path via `session.save`/`session.load`/
+    /// `flow.export`/`flow.import` until the operator opts in.
+    pub session_io: SessionIoConfig,
 }
 
 impl Default for Config {
@@ -42,11 +58,66 @@ impl Default for Config {
             mcp: McpConfig::default(),
             browser: BrowserConfig::default(),
             poc: PocConfig::default(),
+            findings: FindingsConfig::default(),
             ssl_insecure: false,
             max_flows: crate::store::DEFAULT_MAX_FLOWS,
             max_flow_bytes: crate::store::DEFAULT_MAX_FLOW_BYTES,
+            tls: TlsConfig::default(),
+            maps: MapsConfig::default(),
+            session_io: SessionIoConfig::default(),
         }
     }
+}
+
+/// Per-host TLS passthrough configuration (M6 F11). A passthrough host is
+/// tunnelled byte-for-byte without MITM, so the client speaks TLS to the real
+/// upstream and the proxy captures no decrypted flow for it.
+#[derive(Debug, Clone, Default)]
+pub struct TlsConfig {
+    /// Hosts (or `*.wildcard`) to tunnel past MITM. **Empty by default**: every
+    /// host is MITM'd until the operator pins one here.
+    pub passthrough: Vec<String>,
+    /// Let an agent frontend (MCP) change the passthrough list with
+    /// `tls.passthrough.add`/`remove`. **Off by default**: pinning a host out of
+    /// MITM is an authorisation decision, so only the human CLI may do it unless
+    /// the operator opts in — mirrors [`ScopeConfig::allow_agent_widen`].
+    pub allow_agent_passthrough: bool,
+}
+
+/// Map Local/Remote configuration (M6). Map rules rewrite or mock matching
+/// requests; both the map root (confining Map Local file reads) and agent
+/// authoring default to the deny-by-default posture.
+#[derive(Debug, Clone, Default)]
+pub struct MapsConfig {
+    /// The directory Map Local files are confined to. **`None` by default**: with
+    /// no root, a `map.add` for a local file is rejected (nothing to confine it
+    /// to), so Map Local is unusable until the operator sets a root.
+    pub root: Option<PathBuf>,
+    /// Let an agent frontend (MCP) author map rules with `map.add`/`map.remove`.
+    /// **Off by default**: a map rule redirects or mocks traffic, an
+    /// authorisation decision, so only the human CLI may author one unless the
+    /// operator opts in — mirrors [`ScopeConfig::allow_agent_widen`].
+    pub allow_agent_authoring: bool,
+}
+
+/// Session/flow file-I/O configuration (M6 F10). `session.save`/`session.load`/
+/// `flow.export`/`flow.import` can read or overwrite an arbitrary host path, so an
+/// agent (MCP) frontend is refused a path-bearing call unless the operator opts in.
+#[derive(Debug, Clone, Default)]
+pub struct SessionIoConfig {
+    /// Let an agent (MCP) frontend read/write a host path through the session/flow
+    /// I/O commands. **Off by default**: reading or overwriting a host file is an
+    /// authorisation decision, so only the human CLI may hand those commands a path
+    /// unless the operator opts in — mirrors [`ScopeConfig::allow_agent_widen`]. An
+    /// agent may still export to / import from in-memory `bytes` (no host path),
+    /// which stays passive.
+    pub allow_agent_file_io: bool,
+
+    /// Confine every path-bearing session/flow I/O call under this root
+    /// (traversal and absolute escapes are refused). `None` (the default) imposes
+    /// no confinement, so the human CLI keeps full path access; set it to safely
+    /// bound an agent frontend once [`Self::allow_agent_file_io`] is on.
+    pub root: Option<PathBuf>,
 }
 
 /// PoC-engine configuration.
@@ -62,6 +133,16 @@ pub struct PocConfig {
     /// `poc.artifact` only serves files confined to this directory, so a
     /// remote/web surface can read run artifacts safely.
     pub out_dir: Option<PathBuf>,
+}
+
+/// Persistent findings / run-history store configuration (M4 Stream B).
+#[derive(Debug, Clone, Default)]
+pub struct FindingsConfig {
+    /// Where the findings store writes one human-readable YAML per finding plus a
+    /// `runs.jsonl` run-history log. `None` (the default) disables persistence:
+    /// `findings.list`/`get` return nothing and `findings.record` errors. A
+    /// sensible deployment points this at a sibling of `poc.dir`.
+    pub dir: Option<PathBuf>,
 }
 
 /// Scope configuration. Deny-by-default: an empty list means nothing is active.
@@ -200,12 +281,32 @@ pub enum McpTransport {
 #[derive(Debug, Clone)]
 pub struct McpConfig {
     pub transport: McpTransport,
+    /// The token that marks a loopback-TCP connection as an autonomous agent
+    /// ([`Frontend::Mcp`]). For the loopback transport the required token also
+    /// lives on [`McpTransport::LoopbackTcp`]; this field is the canonical name
+    /// so wiring and audit can speak of "the agent token" directly.
+    pub agent_token: Option<String>,
+    /// The token that marks a loopback-TCP connection as a human operator
+    /// ([`Frontend::Operator`]). **Off by default**: without it, every
+    /// loopback connection is an agent, matching the M1/M2 posture.
+    pub operator_token: Option<String>,
+    /// The agent policy the server starts under (enforced from Task 4). Default
+    /// [`AgentPolicy::Auto`] per the milestone's adopted default.
+    pub policy: AgentPolicy,
+    /// The role a stdio connection is given (there is no token on stdio).
+    /// Default [`Frontend::Mcp`] — stdio is the agent-attach transport; an
+    /// operator attached over stdio sets this to [`Frontend::Operator`].
+    pub stdio_role: Frontend,
 }
 
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
             transport: McpTransport::Stdio,
+            agent_token: None,
+            operator_token: None,
+            policy: AgentPolicy::Auto,
+            stdio_role: Frontend::Mcp,
         }
     }
 }
@@ -219,6 +320,10 @@ pub enum BrowserEngine {
     Obscura,
     /// A system Chrome/Chromium (the M1 behaviour).
     Chrome,
+    /// A system Firefox, launched with a throwaway profile whose proxy prefs
+    /// point at aitmproxy and whose cert store trusts the MITM CA — the OS proxy
+    /// and OS trust store are never touched (M4 Task 13, Review Focus #5).
+    Firefox,
 }
 
 /// How to find and start the forked obscura.
@@ -243,6 +348,32 @@ impl Default for ObscuraConfig {
     }
 }
 
+/// How to find and start a system Firefox (used when `engine` is `Firefox`).
+///
+/// Firefox is driven over its remote-debugging (CDP) endpoint. Unlike obscura,
+/// trust and routing are configured per-profile (a throwaway profile), so this
+/// carries no CA flag: the launcher writes the proxy prefs and trusts the CA
+/// into that profile only.
+#[derive(Debug, Clone)]
+pub struct FirefoxConfig {
+    /// The `firefox` binary; a bare name is resolved on `PATH`. Default `firefox`.
+    pub binary: PathBuf,
+    /// Spawn → CDP connected; default 20 s (a cold Firefox profile is slow).
+    pub start_timeout: Duration,
+    /// Per-operation bound on the `BrowserDriver` primitives; default 30 s.
+    pub nav_timeout: Duration,
+}
+
+impl Default for FirefoxConfig {
+    fn default() -> Self {
+        Self {
+            binary: PathBuf::from("firefox"),
+            start_timeout: Duration::from_secs(20),
+            nav_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
 /// Embedded-browser configuration. Declared in `aitm-core` because `Config`
 /// references it; `aitm-browser` implements the driver against this type.
 #[derive(Debug, Clone)]
@@ -251,6 +382,8 @@ pub struct BrowserConfig {
     pub engine: BrowserEngine,
     /// Obscura launcher settings (used when `engine` is `Obscura`).
     pub obscura: ObscuraConfig,
+    /// Firefox launcher settings (used when `engine` is `Firefox`).
+    pub firefox: FirefoxConfig,
     /// The proxy upstream (`--proxy-server`).
     pub proxy_addr: SocketAddr,
     /// Chrome only: obscura has no head.
@@ -266,6 +399,7 @@ impl Default for BrowserConfig {
         Self {
             engine: BrowserEngine::default(),
             obscura: ObscuraConfig::default(),
+            firefox: FirefoxConfig::default(),
             // A dedicated loopback port, distinct from the main listener (8080):
             // the embedded browser dials this SSRF-filtered listener.
             proxy_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),

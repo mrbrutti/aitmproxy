@@ -15,7 +15,6 @@
 //! plus the embedded web UI and its `/bus` bridge (`aitm::web`, F15).
 
 use std::io::Write as _;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,6 +27,7 @@ use aitm::web::{self, WebArgs, WebCommand, WebState};
 use aitm::wire::{assemble_with_scripts, Assembled, Features, ScriptWiring};
 use aitm::{config_file, env, tui};
 use aitm_core::{BrowserDriver, Chain, McpTransport, Plugin};
+use aitm_findings::FindingsPlugin;
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -115,12 +115,17 @@ async fn run() -> anyhow::Result<()> {
     let Settings {
         core: mut cfg,
         rhai: mut rhai_cfg,
+        mut l4,
     } = config_file::load_settings(config_path.as_deref())?;
     env::apply(&mut cfg, |k| std::env::var(k).ok());
     env::apply_rhai(&mut rhai_cfg, |k| std::env::var(k).ok());
     // `--bus-endpoint-file` wins over the config's `endpoint_file`; it only means
     // anything for the loopback-TCP bus, so asking for it over stdio is an error.
     apply_bus_endpoint_file(&mut cfg.mcp.transport, bus_endpoint_file)?;
+    // The L4 module is opt-in (fail-closed) and carried outside `aitm-core`'s
+    // `Config`; `AITM_L4_*` env overrides win over the file (M5-AC17). It rides the
+    // binary-owned feature set below; `l4_privilege: None` runs the real startup probe.
+    env::apply_l4(&mut l4, |k| std::env::var(k).ok());
     // A script's `browser.navigate` decides SSRF under the same policy as the
     // `browser.navigate` command.
     rhai_cfg.ssrf = cfg.browser.ssrf.clone();
@@ -175,9 +180,15 @@ async fn run() -> anyhow::Result<()> {
         proxy,
         ca,
         listening,
+        agent_state,
+        push_tx,
+        audit_ring,
     } = assemble_with_scripts(
         &cfg,
-        &Features::default(),
+        &Features {
+            l4,
+            ..Features::default()
+        },
         ScriptWiring {
             plugins: tier
                 .plugins
@@ -185,7 +196,11 @@ async fn run() -> anyhow::Result<()> {
                 .map(|p| Box::new(p.with_max_body(max_body)) as Box<dyn Plugin>)
                 .collect(),
             executor: Some(tier.executor.clone()),
-            commands: Some(Box::new(tier.commands)),
+            // Both command providers: the rhai tier (script.validate/reload,
+            // script.findings) and the persistent findings store, whose
+            // `findings.*` commands read the configured `findings.dir` from the
+            // command host at invocation time (`FindingsPlugin::store_for`).
+            commands: vec![Box::new(tier.commands), Box::new(FindingsPlugin::new())],
         },
     )?;
 
@@ -254,7 +269,15 @@ async fn run() -> anyhow::Result<()> {
     let result = if mode == Mode::Tui {
         tui::run(&cfg, &proxy, services).await
     } else {
-        let mcp = tui::server(&cfg, cfg.mcp.transport.clone(), &services);
+        // The bare-`aitm` server path is the dedicated agent entry point, so it
+        // carries M4's operator/agent token classes, the shared agent policy
+        // gate, the F4 push fan-out and the F2 audit ring. The web bridge and
+        // the TUI are operator frontends, built by `tui::server` without the gate.
+        let mcp = tui::server(&cfg, cfg.mcp.transport.clone(), &services)
+            .with_mcp_roles(cfg.mcp.operator_token.clone(), cfg.mcp.stdio_role)
+            .with_agent_state(agent_state)
+            .with_push(push_tx)
+            .with_audit_ring(audit_ring);
 
         // `aitm web`: a second McpServer over the same registry and services
         // (`serve` consumes the first), driven by the bridge's `handle` calls.
@@ -286,9 +309,11 @@ async fn run() -> anyhow::Result<()> {
                     );
                 }
                 let listener = TcpListener::bind(settings.listen).await?;
-                let local_addr = listener.local_addr()?;
-                let url = web::ui_url(local_addr, &settings.token);
-                log_web_listening(local_addr);
+                let bound = listener.local_addr()?;
+                let url = web::ui_url(bound, &settings.token);
+                // Log only the bound address; the token must never reach a
+                // tracing sink. The one-time println is the operator's link.
+                web::log_listening(bound);
                 println!("web UI: {url}");
                 Some((listener, state))
             }
@@ -426,16 +451,6 @@ fn apply_bus_endpoint_file(
     }
 }
 
-/// Emit the `aitm web` "listening" lifecycle line.
-///
-/// AC2: the bridge token must never enter the structured log stream. This takes
-/// only the bound `addr`, so it *cannot* log the tokened URL even by accident;
-/// the full `http://addr/#t=<token>` URL is disclosed exactly once, to stdout,
-/// by the caller's `println!`.
-fn log_web_listening(addr: SocketAddr) {
-    info!(%addr, "web UI listening");
-}
-
 /// The curated default tracing directive used when `RUST_LOG` is unset (AC3).
 ///
 /// Operator-relevant lifecycle on the `aitm*` targets ("proxy listening", the
@@ -486,8 +501,8 @@ mod tests {
     use aitm_core::McpTransport;
 
     use super::{
-        apply_bus_endpoint_file, build_env_filter, log_web_listening, parse_mode,
-        split_bus_endpoint_file_arg, split_config_arg, split_script_args, Mode,
+        apply_bus_endpoint_file, build_env_filter, parse_mode, split_bus_endpoint_file_arg,
+        split_config_arg, split_script_args, Mode,
     };
 
     fn args(a: &[&str]) -> Vec<String> {
@@ -525,7 +540,7 @@ mod tests {
             .finish();
 
         let addr = "127.0.0.1:8082".parse().unwrap();
-        tracing::subscriber::with_default(subscriber, || log_web_listening(addr));
+        tracing::subscriber::with_default(subscriber, || crate::web::log_listening(addr));
 
         let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         // The lifecycle line records the bound address...

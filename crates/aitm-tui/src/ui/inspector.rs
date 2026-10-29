@@ -21,9 +21,7 @@ use crate::viewers;
 
 /// What a tab that waits on a core follow-up says instead of a viewer.
 pub fn follow_up_sentence(tab: &str, f: &str) -> String {
-    format!(
-        "{tab} need core follow-up {f} (flow.detail does not carry them yet); the bus serves headers and bodies only today."
-    )
+    format!("{tab} need core follow-up {f} (flow.detail does not carry phase timings yet).")
 }
 
 pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
@@ -347,7 +345,8 @@ fn content<'a>(
     if (which, tab) == (Pane::Request, "Query") {
         return viewers::query(theme, &row.path);
     }
-    // Cookies, Timing and Set-Cookie wait on core follow-up F5.
+    // Timing waits on core follow-up F5; Cookies and Set-Cookie render live
+    // from the served headers below.
     if let Some(f) = tab_follow_up(tab) {
         return vec![Line::styled(
             follow_up_sentence(tab, f),
@@ -374,6 +373,15 @@ fn content<'a>(
     match (which, tab) {
         (_, "Headers") => match msg {
             Some(m) => viewers::headers(theme, &m.headers),
+            None => pending_response(app, theme, row, d),
+        },
+        // Cookies / Set-Cookie parsed live from the served headers (I17a).
+        (Pane::Request, "Cookies") => match msg {
+            Some(m) => viewers::cookies(theme, &m.headers, false),
+            None => pending_response(app, theme, row, d),
+        },
+        (Pane::Response, "Set-Cookie") => match msg {
+            Some(m) => viewers::cookies(theme, &m.headers, true),
             None => pending_response(app, theme, row, d),
         },
         // A WebSocket flow's response is its `101` handshake (Headers tab); its
@@ -792,20 +800,24 @@ mod tests {
         }
     }
 
-    /// I1: the F5-dependent tabs are present, labelled, dim, and say why.
+    /// I1/I17a: only Timing waits on F5 — it is labelled, dim, and says why.
     #[test]
-    fn follow_up_tabs_are_labelled_and_explain_themselves() {
+    fn timing_tab_is_labelled_and_explains_itself() {
         let theme = Theme::new(true);
         let mut app = crate::fixture_app(200, 50);
         app.selected = Some("f41".into());
         app.mode = Mode::Inspector;
         let buf = snap(&app, &theme, 200, 50);
-        let text = to_text(&buf);
         let (y, req_tabs) = row_with(&buf, "Request  Headers").expect("request tab row");
-        assert!(req_tabs.contains("Cookies (F5)"), "{req_tabs}");
         assert!(req_tabs.contains("Timing (F5)"), "{req_tabs}");
+        // Cookies and Set-Cookie are live now: no F5 label on them.
+        assert!(
+            req_tabs.contains("Cookies  "),
+            "cookies is live: {req_tabs}"
+        );
+        assert!(!req_tabs.contains("Cookies (F5)"), "{req_tabs}");
         let x = req_tabs
-            .find("Cookies")
+            .find("Timing")
             .map(|b| req_tabs[..b].chars().count())
             .unwrap();
         assert_eq!(
@@ -814,33 +826,48 @@ mod tests {
             "disabled tab is dim"
         );
         let (_, resp_tabs) = row_with(&buf, "Response  Headers").expect("response tab row");
-        assert!(resp_tabs.contains("Set-Cookie (F5)"), "{resp_tabs}");
-        assert!(
-            !text.contains("need core follow-up F5"),
-            "nothing selected yet"
-        );
+        assert!(!resp_tabs.contains("Set-Cookie (F5)"), "{resp_tabs}");
 
-        for (pane, tab) in [
-            (Pane::Request, "Cookies"),
-            (Pane::Request, "Timing"),
-            (Pane::Response, "Set-Cookie"),
-        ] {
-            app.inspector.pane = pane;
-            let tabs = match pane {
-                Pane::Request => &crate::app::REQUEST_TABS[..],
-                Pane::Response => &RESPONSE_TABS[..],
-            };
-            let i = tabs.iter().position(|t| *t == tab).unwrap();
-            match pane {
-                Pane::Request => app.inspector.request_tab = i,
-                Pane::Response => app.inspector.response_tab = i,
-            }
-            let text = to_text(&snap(&app, &theme, 200, 50));
-            assert!(
-                text.contains(&format!("{tab} need core follow-up F5")),
-                "{tab}: {text}"
-            );
-        }
+        app.inspector.pane = Pane::Request;
+        app.inspector.request_tab = crate::app::REQUEST_TABS
+            .iter()
+            .position(|t| *t == "Timing")
+            .unwrap();
+        let text = to_text(&snap(&app, &theme, 200, 50));
+        assert!(
+            text.contains("Timing need core follow-up F5"),
+            "Timing sentence: {text}"
+        );
+        // The reworded sentence no longer claims headers/bodies only.
+        assert!(!text.contains("headers and bodies only"), "{text}");
+    }
+
+    /// I17a / minor (d): the Cookies tab parses the served `Cookie:` header
+    /// live, binding each value to its own name on the same row.
+    #[test]
+    fn cookies_tab_renders_served_cookies_bound_to_their_names() {
+        let theme = Theme::new(true);
+        let mut app = crate::fixture_app(200, 50);
+        app.selected = Some("f41".into());
+        app.mode = Mode::Inspector;
+        app.inspector.pane = Pane::Request;
+        app.inspector.request_tab = crate::app::REQUEST_TABS
+            .iter()
+            .position(|t| *t == "Cookies")
+            .unwrap();
+        let buf = snap(&app, &theme, 200, 50);
+        // f41 sends `cookie: session=9f1c…`: the value sits on the `session`
+        // row, not merely somewhere on the screen.
+        let (_, row) = row_with(&buf, "session").expect("cookie name row");
+        assert!(
+            row.contains("session") && row.contains("= 9f1c…"),
+            "value bound to its name: {row:?}"
+        );
+        // No follow-up placeholder on a live tab.
+        assert!(
+            !to_text(&buf).contains("need core follow-up F5"),
+            "cookies is live"
+        );
     }
 
     #[test]

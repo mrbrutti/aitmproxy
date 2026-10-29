@@ -1,0 +1,66 @@
+/* pages.css — the docs / reference shell (sidebar nav + article + on-page contents).
+   Structure is shared; palette and type come from each direction's tokens. */
+
+.docwrap {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr) 200px;
+  gap: clamp(2rem, 4vw, 4rem);
+  max-width: 1320px;
+  margin-inline: auto;
+  padding: 3rem var(--margin) 6rem;
+  align-items: start;
+}
+@media (max-width: 68em) { .docwrap { grid-template-columns: 220px minmax(0,1fr); } .doc-onthispage { display: none; } }
+@media (max-width: 48em) { .docwrap { grid-template-columns: 1fr; } .docnav { display: none; } }
+
+/* left: section tree */
+.docnav { position: sticky; top: 2rem; font-size: var(--step-small); }
+.docnav .group { margin-bottom: 1.6rem; }
+.docnav .group > p { color: var(--muted); font-weight: 600; margin-bottom: .5rem; letter-spacing: .01em; }
+.docnav a { display: block; color: var(--muted); text-decoration: none; padding: 3px 0; }
+.docnav a:hover { color: var(--ink); }
+.docnav a.cur { color: var(--ink); font-weight: 600; box-shadow: inset 2px 0 0 var(--accent); padding-left: 10px; margin-left: -12px; }
+
+/* middle: article */
+.article { min-width: 0; max-width: 46rem; }
+.article .crumb { font-size: var(--step-small); color: var(--muted); margin-bottom: 1rem; }
+.article h1 { font-size: var(--step-head); line-height: 1.05; margin-bottom: .6rem; }
+.article .sub { font-size: var(--step-lead); color: var(--muted); margin-bottom: 2.4rem; max-width: 42ch; }
+.article h2 { font-size: clamp(1.3rem, 1rem + 1.2vw, 1.7rem); margin: 2.8rem 0 .9rem; line-height: 1.1; }
+.article h3 { font-size: 1.125rem; margin: 1.8rem 0 .5rem; font-weight: 600; }
+.article p { margin-bottom: 1rem; max-width: 70ch; }
+.article p code, .article li code, .article td code {
+  font-family: var(--font-mono); font-size: .88em;
+  background: var(--surface); padding: 1px 6px; border-radius: 4px;
+}
+.article ul.bullets { margin: 0 0 1.2rem; padding-left: 1.1rem; list-style: disc; }
+.article ul.bullets li { margin-bottom: .4rem; max-width: 66ch; }
+.article .code, .article .codefile { margin-bottom: 1.4rem; }
+.article [data-ui] { margin-bottom: 1.6rem; }
+
+/* callout */
+.note {
+  background: var(--surface); border-radius: 6px;
+  padding: 14px 16px; margin-bottom: 1.4rem;
+  box-shadow: inset 3px 0 0 var(--accent);
+  font-size: var(--step-small);
+}
+.note b { font-weight: 600; }
+
+/* param / api tables */
+.apitable { width: 100%; border-collapse: collapse; margin-bottom: 1.6rem; font-size: var(--step-small); }
+.apitable th { text-align: left; color: var(--muted); font-weight: 600; padding: 8px 12px 8px 0; border-bottom: 1px solid var(--surface-2); }
+.apitable td { padding: 9px 12px 9px 0; border-bottom: 1px solid var(--surface-2); vertical-align: top; }
+.apitable td:first-child { white-space: nowrap; font-family: var(--font-mono); font-size: .88em; }
+.apitable td code { background: none; padding: 0; }
+
+/* right: on this page */
+.doc-onthispage { position: sticky; top: 2rem; font-size: var(--step-small); }
+.doc-onthispage p { color: var(--muted); font-weight: 600; margin-bottom: .6rem; }
+.doc-onthispage a { display: block; color: var(--muted); text-decoration: none; padding: 3px 0; }
+.doc-onthispage a:hover { color: var(--ink); }
+
+/* a "signature" chip pair for the two operators (human / agent) */
+.sigpair { display: flex; gap: 8px; margin-bottom: 1.4rem; }
+.sigpair .tab { font-size: var(--step-small); padding: 5px 12px; border-radius: 999px; background: var(--surface); color: var(--muted); }
+.sigpair .tab.on { background: var(--accent); color: var(--accent-ink); }

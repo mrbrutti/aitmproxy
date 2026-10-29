@@ -45,7 +45,7 @@ public enum Fixtures {
                 client: aitm, startedAt: at(5.947), duration: ms(412), requestBytes: 402, responseBytes: 22_700),
         FlowRow(id: id(47), seq: 47, kind: .websocket, method: .ws, scheme: "wss", authority: "api.shop-staging.test",
                 path: "/ws/notifications", status: 101, state: .complete, client: obscura, startedAt: at(6.846),
-                wsFrames: (sent: 21, received: 17)),
+                wsFrames: (sent: 3, received: 4)),
         FlowRow(id: id(48), seq: 48, method: .get, scheme: "https", authority: "api.shop-staging.test",
                 path: "/api/search", query: "q=%22%3E%3Cimg+src%3Dx+onerror%3Dalert(1)%3E", status: 200,
                 state: .complete, origin: .agent, client: aitm, startedAt: at(15.088), duration: ms(149),
@@ -175,6 +175,32 @@ public enum Fixtures {
             connection: ConnectionInfo(httpVersion: "HTTP/2", tlsVersion: row.tls == .none ? nil : "TLS 1.3",
                                        alpn: row.tls == .none ? nil : "h2", sni: row.authority,
                                        clientAddress: "127.0.0.1:\(52_000 + row.seq)", serverAddress: "10.0.4.12:443"))
+    }
+
+    /// The WebSocket detail for the `wss://…/ws/notifications` fixture row (S-045):
+    /// a subscribe, an ack, two server pushes, a binary frame, a ping, and one
+    /// operator-injected frame, so the frames viewer has every opcode and direction.
+    public static func wsDetail(for row: FlowRow) -> WSDetail {
+        func text(_ dir: WSFrameDetail.Direction, _ s: String, at time: Double, injected: Bool = false) -> WSFrameDetail {
+            let data = Data(s.utf8)
+            return WSFrameDetail(direction: dir, opcode: "text", length: data.count, injected: injected,
+                                 timestamp: Format.rfc3339(at(time)), data: data)
+        }
+        let frames: [WSFrameDetail] = [
+            text(.clientToServer, #"{"type":"subscribe","channel":"orders","since":1730000000}"#, at: 6.901),
+            text(.serverToClient, #"{"type":"ack","channel":"orders"}"#, at: 6.944),
+            text(.serverToClient, "{\n  \"type\": \"order.created\",\n  \"id\": 8841,\n  \"total\": 129.0,\n  \"currency\": \"USD\"\n}", at: 7.512),
+            text(.serverToClient, "{\n  \"type\": \"order.updated\",\n  \"id\": 8841,\n  \"status\": \"paid\"\n}", at: 9.133),
+            WSFrameDetail(direction: .serverToClient, opcode: "binary", length: 8, timestamp: Format.rfc3339(at(10.004)),
+                          data: Data([0x00, 0x01, 0x02, 0xFF, 0xFE, 0x03, 0x04, 0x05])),
+            WSFrameDetail(direction: .clientToServer, opcode: "ping", length: 0, timestamp: Format.rfc3339(at(12.600))),
+            text(.clientToServer, #"{"type":"unsubscribe","channel":"orders"}"#, at: 14.220, injected: true),
+        ]
+        return WSDetail(
+            id: row.id, handshakeFlowID: id(46).raw, frames: frames,
+            connection: ConnectionInfo(httpVersion: "HTTP/1.1", tlsVersion: "TLS 1.3", alpn: "http/1.1",
+                                       sni: row.authority, clientAddress: "127.0.0.1:\(52_000 + row.seq)",
+                                       serverAddress: "10.0.4.12:443"))
     }
 
     static func userAgent(_ client: ClientInfo?) -> String {

@@ -50,4 +50,37 @@ public enum Format {
 
     /// `6 KB/s`.
     public static func rate(_ bytesPerSecond: Int64) -> String { "\(bytes(bytesPerSecond))/s" }
+
+    /// An RFC 3339 / ISO 8601 timestamp with fractional seconds, as the core emits
+    /// for WebSocket frames. A local formatter, since `ISO8601DateFormatter` is not Sendable.
+    public static func rfc3339(_ date: Date) -> String {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f.string(from: date)
+    }
+
+    /// `11:04:58.120` for a frame's RFC 3339 timestamp, or nil when it does not parse.
+    /// The core (the `time` crate) writes variable sub-second precision — 0 to 9
+    /// fractional digits — but `ISO8601DateFormatter` accepts only exactly 3, so the
+    /// fraction is normalised to three digits before parsing.
+    public static func clock(rfc3339 string: String) -> String? {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        if let date = f.date(from: string) { return time(date) }
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let normalised = normalizedFraction(string), let date = f.date(from: normalised) { return time(date) }
+        return nil
+    }
+
+    /// Rewrites the sub-second fraction of an RFC 3339 string to exactly three
+    /// digits, padding or truncating. Returns nil when there is no fraction.
+    static func normalizedFraction(_ s: String) -> String? {
+        guard let dot = s.firstIndex(of: ".") else { return nil }
+        let start = s.index(after: dot)
+        let end = s[start...].firstIndex { !$0.isNumber } ?? s.endIndex
+        var digits = String(s[start..<end])
+        if digits.count > 3 { digits = String(digits.prefix(3)) }
+        else { digits += String(repeating: "0", count: 3 - digits.count) }
+        return String(s[..<start]) + digits + String(s[end...])
+    }
 }

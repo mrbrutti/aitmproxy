@@ -18,10 +18,12 @@ use anyhow::{bail, Context as _};
 use serde::Deserialize;
 
 use aitm_core::{
-    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, LimitConfig, McpConfig,
-    McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SsrfPolicy, Value,
+    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, FindingsConfig, FirefoxConfig,
+    Frontend, LimitConfig, MapsConfig, McpConfig, McpTransport, ObscuraConfig, PocConfig,
+    ScopeConfig, ScopeEntry, SessionIoConfig, SsrfPolicy, TlsConfig, Value,
 };
 use aitm_plugin_rhai::{RhaiConfig, ScriptEntry};
+use aitm_proto_l4::config::L4Config;
 
 /// `<config_dir>/aitmproxy/config.yaml`: a sibling of the CA dir with the
 /// same fallbacks, taken from the directory `CaConfig::default()` already
@@ -30,25 +32,32 @@ pub fn default_config_path() -> PathBuf {
     CaConfig::default().audit_log.with_file_name("config.yaml")
 }
 
-/// Everything one config file configures: the proxy itself and the scripting
-/// tier. They are separate types — `aitm_core` knows nothing about Rhai (spec:
-/// no `aitm-core` edits) — but they come from one file and one parse, so a
-/// misspelled scripting knob is refused the same way a misspelled browser one
-/// is.
+/// Everything one config file configures: the proxy itself, the scripting tier,
+/// and the L4 module. They are separate types — `aitm_core` knows nothing about
+/// Rhai or L4 (no `aitm-core` edits, AC19) — but come from one file and one parse,
+/// so a misspelled scripting or L4 knob is refused the same way a browser one is.
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub core: Config,
     pub rhai: RhaiConfig,
+    pub l4: L4Config,
 }
 
-/// Load the config file. `None` reads [`default_config_path`], where an absent
-/// file means `Config::default()` (today's behaviour); `Some(p)` must exist,
-/// and the error names `p`.
+/// Load the config file as the core [`Config`] only.
 pub fn load(path: Option<&Path>) -> anyhow::Result<Config> {
     load_settings(path).map(|s| s.core)
 }
 
-/// [`load`], keeping the scripting-tier settings too.
+/// Load the core [`Config`] and the L4 module [`L4Config`] (for callers that wire
+/// L4). The L4 section lives outside `aitm-core`, so it rides alongside here rather
+/// than inside `Config` (keeping `aitm-core` untouched, AC19).
+pub fn load_full(path: Option<&Path>) -> anyhow::Result<(Config, L4Config)> {
+    load_settings(path).map(|s| (s.core, s.l4))
+}
+
+/// [`load`], keeping the scripting-tier and L4 settings too. `None` reads
+/// [`default_config_path`], where an absent file means defaults (L4 disabled);
+/// `Some(p)` must exist, and the error names `p`.
 pub fn load_settings(path: Option<&Path>) -> anyhow::Result<Settings> {
     let Some(path) = path else {
         let path = default_config_path();
@@ -59,6 +68,7 @@ pub fn load_settings(path: Option<&Path>) -> anyhow::Result<Settings> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings {
                 core: Config::default(),
                 rhai: RhaiConfig::default(),
+                l4: L4Config::default(),
             }),
             Err(e) => Err(e).with_context(|| format!("reading config file {}", path.display())),
         };
@@ -68,20 +78,27 @@ pub fn load_settings(path: Option<&Path>) -> anyhow::Result<Settings> {
     parse_settings(&text).with_context(|| format!("in config file {}", path.display()))
 }
 
-/// Parse YAML into a `Config`: unknown keys are errors, as is a value the
-/// file may not set (`ca.key_mode` wider than the owner); absent keys keep
-/// their `Config::default()` value.
+/// Parse YAML into the core [`Config`] only. See [`parse_full`] for the L4 variant.
 pub fn parse(yaml: &str) -> anyhow::Result<Config> {
     parse_settings(yaml).map(|s| s.core)
 }
 
-/// [`parse`], keeping the scripting-tier settings too.
+/// Parse the core [`Config`] and the L4 module [`L4Config`].
+pub fn parse_full(yaml: &str) -> anyhow::Result<(Config, L4Config)> {
+    parse_settings(yaml).map(|s| (s.core, s.l4))
+}
+
+/// [`parse`], keeping the scripting-tier and L4 settings too: unknown keys are
+/// errors (including under `l4`, which maps to `L4Config`'s own
+/// `deny_unknown_fields`); absent keys keep their default value; an absent `l4`
+/// section is `L4Config::default()` — disabled, fail-closed.
 pub fn parse_settings(yaml: &str) -> anyhow::Result<Settings> {
     let file: ConfigFile = serde_yaml::from_str(yaml).context("parsing config YAML")?;
+    let l4 = file.l4.clone().unwrap_or_default();
     let mut core = Config::default();
     let mut rhai = RhaiConfig::default();
     file.apply(&mut core, &mut rhai)?;
-    Ok(Settings { core, rhai })
+    Ok(Settings { core, rhai, l4 })
 }
 
 /// Overwrite `slot` only when the file set the key.
@@ -108,13 +125,25 @@ struct ConfigFile {
     mcp: Option<McpFile>,
     browser: Option<BrowserFile>,
     poc: Option<PocFile>,
+    findings: Option<FindingsFile>,
     ssl_insecure: Option<bool>,
     max_flows: Option<usize>,
     max_flow_bytes: Option<usize>,
+    /// The L4 (raw packet) module config. Maps directly to the crate's `L4Config`
+    /// (its own `#[serde(default, deny_unknown_fields)]` applies), so missing keys
+    /// take their fail-closed defaults and a misspelled `l4.*` key is an error.
+    /// Lives outside `Config` to keep `aitm-core` untouched (AC19).
+    l4: Option<L4Config>,
     /// The scripts to load, in chain order (M3 spec §8).
     scripts: Option<Vec<ScriptFile>>,
     /// The scripting sandbox: limits, the per-hook budget, the error policy.
     rhai: Option<RhaiFile>,
+    /// Per-host TLS passthrough (M6 F11).
+    tls: Option<TlsFile>,
+    /// Map Local/Remote rules (M6).
+    maps: Option<MapsFile>,
+    /// Session/flow file I/O agent gate (M6 F10).
+    session_io: Option<SessionIoFile>,
 }
 
 impl ConfigFile {
@@ -138,6 +167,9 @@ impl ConfigFile {
         if let Some(p) = self.poc {
             p.apply(&mut c.poc);
         }
+        if let Some(f) = self.findings {
+            f.apply(&mut c.findings);
+        }
         set(&mut c.ssl_insecure, self.ssl_insecure);
         set(&mut c.max_flows, self.max_flows);
         set(&mut c.max_flow_bytes, self.max_flow_bytes);
@@ -150,7 +182,73 @@ impl ConfigFile {
         if let Some(rhai) = self.rhai {
             rhai.apply(r);
         }
+        if let Some(tls) = self.tls {
+            tls.apply(&mut c.tls);
+        }
+        if let Some(maps) = self.maps {
+            maps.apply(&mut c.maps);
+        }
+        if let Some(session_io) = self.session_io {
+            session_io.apply(&mut c.session_io);
+        }
         Ok(())
+    }
+}
+
+/// The `tls:` section (M6 F11): the passthrough host list and the agent gate.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TlsFile {
+    /// Hosts (or `*.wildcard`) tunnelled past MITM.
+    passthrough: Option<Vec<String>>,
+    /// Let an agent (MCP) frontend change the passthrough list. Off by default.
+    allow_agent_passthrough: Option<bool>,
+}
+
+impl TlsFile {
+    fn apply(self, c: &mut TlsConfig) {
+        set(&mut c.passthrough, self.passthrough);
+        set(&mut c.allow_agent_passthrough, self.allow_agent_passthrough);
+    }
+}
+
+/// The `maps:` section (M6): the Map Local confinement root and the agent gate.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MapsFile {
+    /// Directory Map Local files are confined to.
+    root: Option<PathBuf>,
+    /// Let an agent (MCP) frontend author map rules. Off by default.
+    allow_agent_authoring: Option<bool>,
+}
+
+impl MapsFile {
+    fn apply(self, c: &mut MapsConfig) {
+        if let Some(root) = self.root {
+            c.root = Some(root);
+        }
+        set(&mut c.allow_agent_authoring, self.allow_agent_authoring);
+    }
+}
+
+/// The `session_io:` section (M6 F10): the agent file-I/O gate.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionIoFile {
+    /// Let an agent (MCP) frontend read/write a host path via the session/flow I/O
+    /// commands. Off by default.
+    allow_agent_file_io: Option<bool>,
+    /// Confine every path-bearing session/flow I/O call under this root. Unset
+    /// imposes no confinement (the human CLI keeps full path access).
+    root: Option<PathBuf>,
+}
+
+impl SessionIoFile {
+    fn apply(self, c: &mut SessionIoConfig) {
+        set(&mut c.allow_agent_file_io, self.allow_agent_file_io);
+        if let Some(root) = self.root {
+            c.root = Some(root);
+        }
     }
 }
 
@@ -358,12 +456,38 @@ struct McpFile {
     /// YAML tag. `default` keeps the key optional under `with`.
     #[serde(default, with = "serde_yaml::with::singleton_map")]
     transport: Option<TransportFile>,
+    /// A second loopback-TCP token; a connection presenting it is a human
+    /// operator ([`Frontend::Operator`]) rather than an agent.
+    operator_token: Option<String>,
+    /// The role a stdio connection speaks as (default `agent`).
+    stdio_role: Option<RoleFile>,
 }
 
 impl McpFile {
     fn apply(self, c: &mut McpConfig) {
         if let Some(t) = self.transport {
             c.transport = t.into();
+        }
+        if self.operator_token.is_some() {
+            c.operator_token = self.operator_token;
+        }
+        set(&mut c.stdio_role, self.stdio_role.map(Into::into));
+    }
+}
+
+/// `stdio_role: agent | operator`.
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RoleFile {
+    Agent,
+    Operator,
+}
+
+impl From<RoleFile> for Frontend {
+    fn from(r: RoleFile) -> Self {
+        match r {
+            RoleFile::Agent => Frontend::Mcp,
+            RoleFile::Operator => Frontend::Operator,
         }
     }
 }
@@ -405,6 +529,7 @@ impl From<TransportFile> for McpTransport {
 struct BrowserFile {
     engine: Option<EngineFile>,
     obscura: Option<ObscuraFile>,
+    firefox: Option<FirefoxFile>,
     proxy_addr: Option<SocketAddr>,
     headless: Option<bool>,
     ignore_cert_errors: Option<bool>,
@@ -418,6 +543,9 @@ impl BrowserFile {
         if let Some(o) = self.obscura {
             o.apply(&mut c.obscura);
         }
+        if let Some(f) = self.firefox {
+            f.apply(&mut c.firefox);
+        }
         set(&mut c.proxy_addr, self.proxy_addr);
         set(&mut c.headless, self.headless);
         set(&mut c.ignore_cert_errors, self.ignore_cert_errors);
@@ -428,12 +556,13 @@ impl BrowserFile {
     }
 }
 
-/// `engine: obscura | chrome`.
+/// `engine: obscura | chrome | firefox`.
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum EngineFile {
     Obscura,
     Chrome,
+    Firefox,
 }
 
 impl From<EngineFile> for BrowserEngine {
@@ -441,6 +570,7 @@ impl From<EngineFile> for BrowserEngine {
         match e {
             EngineFile::Obscura => BrowserEngine::Obscura,
             EngineFile::Chrome => BrowserEngine::Chrome,
+            EngineFile::Firefox => BrowserEngine::Firefox,
         }
     }
 }
@@ -460,6 +590,24 @@ impl ObscuraFile {
         }
         set_secs(&mut c.start_timeout, self.start_timeout);
         set_secs(&mut c.stop_timeout, self.stop_timeout);
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FirefoxFile {
+    binary: Option<PathBuf>,
+    start_timeout: Option<u64>,
+    nav_timeout: Option<u64>,
+}
+
+impl FirefoxFile {
+    fn apply(self, c: &mut FirefoxConfig) {
+        if let Some(b) = self.binary {
+            c.binary = b;
+        }
+        set_secs(&mut c.start_timeout, self.start_timeout);
+        set_secs(&mut c.nav_timeout, self.nav_timeout);
     }
 }
 
@@ -494,6 +642,21 @@ impl PocFile {
         }
         if let Some(d) = self.out_dir {
             c.out_dir = Some(d);
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FindingsFile {
+    /// Where the persistent findings store writes per-finding YAML + `runs.jsonl`.
+    dir: Option<PathBuf>,
+}
+
+impl FindingsFile {
+    fn apply(self, c: &mut FindingsConfig) {
+        if let Some(d) = self.dir {
+            c.dir = Some(d);
         }
     }
 }

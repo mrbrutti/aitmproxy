@@ -21,9 +21,11 @@ pub mod clipboard;
 pub mod filter;
 pub mod fixture;
 pub mod keys;
+pub mod languages;
 pub mod model;
 pub mod open;
 pub mod snapshot;
+pub mod syntax;
 pub mod theme;
 pub mod tokens;
 pub mod ui;
@@ -210,14 +212,18 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     result
 }
 
-/// The 37 commands the bus serves today — `tools/list` of the core as of
-/// the 2026-10-28 merge: foundation §4.1's 22, plus `flow.detail` (F5),
+/// The 56 commands the bus serves today — `tools/list` of the core as of
+/// the 2026-10-29 M4 merge: foundation §4.1's 22, plus `flow.detail` (F5),
 /// `flow.mark` / `flow.comment` (F6), `proxy.status` / `proxy.pause` /
 /// `proxy.resume` / `flow.clear` / `config.get` (F7), `scope.remove` (F12),
-/// `poc.list` / `poc.get` / `poc.artifact` (F13) and the M3 Rhai commands
-/// `findings.list`, `script.reload`, `script.validate`. What
-/// [`fixture_app_core`] limits the fixture to; `agent.status` / `agent.set`
-/// (F1) are the fixture's only tools still ahead of the core.
+/// `poc.list` / `poc.get` / `poc.artifact` (F13), the M3 Rhai commands
+/// `findings.list`, `script.reload`, `script.validate`, the M6 parity
+/// additions — `ws.intercept` / `ws.frame` / `ws.send` (F9), `session.save` /
+/// `session.load` / `flow.export` / `flow.import` (F10), `tls.passthrough.*`
+/// (F11), `map.add` / `map.list` / `map.remove` (Map) — and the M4 additions:
+/// `agent.status` / `agent.set` / `agent.activity` / `agent.approve` (F1) and
+/// `flow.subscribe` / `flow.unsubscribe` (F4). What [`fixture_app_core`] limits
+/// the fixture to; with M4 merged the whole fixture is now core.
 pub const CORE_TOOLS: &[&str] = &[
     "flow.list",
     "flow.get",
@@ -256,6 +262,27 @@ pub const CORE_TOOLS: &[&str] = &[
     "ca.status",
     "ca.install",
     "ca.uninstall",
+    // M6 parity additions (Task 14 convergence).
+    "ws.intercept",
+    "ws.frame",
+    "ws.send",
+    "session.save",
+    "session.load",
+    "flow.export",
+    "flow.import",
+    "tls.passthrough.list",
+    "tls.passthrough.add",
+    "tls.passthrough.remove",
+    "map.add",
+    "map.list",
+    "map.remove",
+    // M4 additions: F1 agent control and F4 flow subscription, now core.
+    "agent.status",
+    "agent.set",
+    "agent.activity",
+    "agent.approve",
+    "flow.subscribe",
+    "flow.unsubscribe",
 ];
 
 /// An [`App`] loaded synchronously from the built-in fixture, sized `cols`×`rows`,

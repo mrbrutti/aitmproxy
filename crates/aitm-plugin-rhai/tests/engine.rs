@@ -59,6 +59,65 @@ fn timeout_and_oplimit_abort_distinctly() {
     );
 }
 
+/// I14 (DoS): nothing in Rhai bounds value nesting, and its recursive
+/// clone/size-check/drop overflow the worker stack — a Rust abort that kills the
+/// whole process — before any Rhai limit trips. The operation budget is the
+/// backstop: a script nests at ~4 operations per level, so the budget caps the
+/// reachable depth. Here a small budget stops `a=[a]` gracefully (an `OpLimit`
+/// abort, no crash) long before the depth could overflow even this thread; the
+/// companion test pins that the *shipped* budget keeps that cap inside the real
+/// worker stack.
+#[test]
+fn op_budget_stops_unbounded_value_nesting() {
+    // ~8_000 ops → ~2_000 levels, far inside a modest stack (which overflows in
+    // the low thousands only on a 2 MiB thread). A generous clock, so the
+    // operation budget — not the timeout — is what fires.
+    let limits = RhaiLimits {
+        max_operations: 8_000,
+        ..RhaiLimits::default()
+    };
+    let handle = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let engine = build_engine(&limits, Duration::from_secs(30));
+            let err = engine
+                .run("let a = []; for i in 0..400000 { a = [a]; }")
+                .expect_err("unbounded nesting must be refused, not run to a crash");
+            assert_eq!(
+                abort_kind(&err),
+                Some(AbortKind::OpLimit),
+                "the op budget must stop the nesting gracefully: {err}"
+            );
+        })
+        .expect("spawns the test thread");
+    handle
+        .join()
+        .expect("the nesting script did not abort the process");
+}
+
+/// I14 invariant: the *shipped* operation budget keeps the deepest value a run
+/// can nest well inside the worker stack scripts actually run on, so the default
+/// posture cannot overflow it. A regression that raised `max_operations` back
+/// toward the old 2_000_000 (≈500_000 reachable levels) trips this.
+#[test]
+fn default_budget_keeps_nesting_within_the_worker_stack() {
+    use aitm_plugin_rhai::engine::WORKER_STACK_SIZE;
+
+    // Measured on this engine: ~4 operations build each `a=[a]` nesting level.
+    const OPS_PER_LEVEL: u64 = 4;
+    // Measured: recursive clone/size-check/drop overflow the 64 MiB worker stack
+    // only past ~45_000 levels. Keep the reachable depth a wide margin below it.
+    const STACK_OVERFLOW_DEPTH: u64 = 45_000;
+    let reachable = RhaiLimits::default().max_operations / OPS_PER_LEVEL;
+    assert!(
+        reachable * 2 <= STACK_OVERFLOW_DEPTH,
+        "the default op budget lets a script nest to {reachable} levels; the {}-byte worker \
+         stack overflows past ~{STACK_OVERFLOW_DEPTH}. Lower max_operations or raise \
+         WORKER_STACK_SIZE together.",
+        WORKER_STACK_SIZE
+    );
+}
+
 /// The wall-clock budget belongs to the run the caller opened, not to the
 /// thread: a second run on the same thread starts its clock afresh, and the
 /// deadline it opened is what host calls read back.

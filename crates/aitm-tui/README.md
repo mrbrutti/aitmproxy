@@ -13,7 +13,7 @@ the same recorded fixture. Design, degradations and the bus contract are in
 ```
 usage: aitm-tui (--bus host:port (--token-file p | --token t (insecure: visible in ps)) [--allow-remote-bus] | --fixture [path]) [--poc-dir dir] [--ansi|--truecolor] [--poll ms]
        aitm-tui --snapshot out.svg [--cols N --rows N]
-       aitm-tui --snapshot-core out.svg [--cols N --rows N]   (fixture limited to the 37 core tools)
+       aitm-tui --snapshot-core out.svg [--cols N --rows N]   (fixture limited to the 56 core tools)
        --poc-dir: where P (poc.build) writes the PoC YAML; use the proxy's poc.dir so poc.run can read it
 ```
 
@@ -63,7 +63,7 @@ log because `RUST_LOG` is unset.
 main screen from the fixture and exits. The extension picks the format:
 `.svg`, `.ans`/`.ansi` (escape codes), anything else plain text. Default 200×50.
 `--snapshot-core` renders the same screen against the fixture limited to the
-37 tools the core serves today (`CORE_TOOLS`), so the two pictures show what
+50 tools the core serves today (`CORE_TOOLS`), so the two pictures show what
 is real now and what the remaining F-tools (the F1 agent pair) add.
 
 `--ansi` forces the 16-colour palette, `--truecolor` the hex palette;
@@ -365,11 +365,12 @@ base64-encodes them as `body` / `data` with `body_size` / `length` the way
 would (resume attaches the recorded `on_resume` response, kill marks the
 flow, replay and `request.send` append, `flow.clear` drops completed flows).
 In tests, `aitm_tui::fixture_app(cols, rows)` loads it into an `App`
-(`fixture_app_core` with only the 37 core tools); `snapshot::render` draws to
+(`fixture_app_core` with only the 56 core tools); `snapshot::render` draws to
 a buffer and `to_text` / `to_svg` / `to_ansi` serialise it.
 `docs/design/tui/main-screen.svg` is such a snapshot with every proposed tool
 present; `docs/design/tui/main-screen-core.svg` is the same screen against
-today's 37 core tools — the F1 agent toggle is the one labelled surface.
+today's 56 core tools — with M4 merged the F1 agent surface is lit, so the core
+screen now matches the full one.
 
 ## Development
 

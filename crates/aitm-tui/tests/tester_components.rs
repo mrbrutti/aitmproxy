@@ -587,18 +587,20 @@ fn ctrl_k_opens_the_palette_as_the_readme_promises() {
 
 /// §2.7 "Inspector": request tabs Headers · Cookies · Query · Body · Raw ·
 /// Summary · Timing · Connection and response tabs Headers · Set-Cookie ·
-/// Body · Raw · JSON · Hex · Diff, each drawing its viewer (the F5 tabs draw
-/// their follow-up sentence — fix pass 1, I1).
+/// Body · Raw · JSON · Hex · Diff, each drawing its viewer. Cookies and
+/// Set-Cookie parse the served headers live (I17a); only Timing draws its F5
+/// follow-up sentence.
 #[test]
 fn inspector_tabs_draw_their_viewers() {
     assert_eq!(REQUEST_TABS.len(), 8);
     assert_eq!(RESPONSE_TABS.len(), 7);
     let cases: &[(Pane, &str, &str, &[&str])] = &[
         (
+            // f41 sends `cookie: session=9f1c…`: parsed live onto its row.
             Pane::Request,
             "Cookies",
             "f41",
-            &["Cookies need core follow-up F5"],
+            &["session = 9f1c…"],
         ),
         (
             Pane::Request,
@@ -607,10 +609,11 @@ fn inspector_tabs_draw_their_viewers() {
             &["Timing need core follow-up F5"],
         ),
         (
+            // f41's response sets no cookie: the live empty state, not F5.
             Pane::Response,
             "Set-Cookie",
             "f41",
-            &["Set-Cookie need core follow-up F5"],
+            &["(no cookies set)"],
         ),
         (
             Pane::Request,
@@ -1623,10 +1626,12 @@ fn agent_toggle_and_panel_follow_the_policy() {
     let _ = app.run_command("agent");
     assert_eq!(app.mode, Mode::Agent);
 
-    // No agent.status on the bus: the control is read-only and says F1.
+    // No agent.status/set on the bus: the control is read-only and says F1.
+    // Since M4 `CORE_TOOLS` carries the agent tools, so the degraded case uses a
+    // pre-F1 bus (`PRE_MERGE_TOOLS`), the standard "a missing tool degrades" list.
     let mut bare = App::new(TermCaps::full(), "x");
     let _ = bare.update(Action::Resize(200, 50));
-    let _ = connect(&mut bare, CORE_TOOLS, None);
+    let _ = connect(&mut bare, PRE_MERGE_TOOLS, None);
     let text = text_of(&bare, 200, 50);
     assert!(text.contains("Agent · n/a (F1)"), "{text}");
     let sidebar: String = line_with(&text, "  Agent")

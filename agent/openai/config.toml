@@ -1,0 +1,22 @@
+# aitmproxy — OpenAI/Codex MCP server wiring.
+#
+# Merge this into your Codex config (e.g. ~/.codex/config.toml). It registers one
+# MCP server, `aitmproxy`, reached through the stdio<->loopback-TCP bridge. No
+# OpenAI SDK is involved; the adapter only points Codex at the bus.
+#
+# Replace the bridge path with the absolute path to agent/bridge.py in your
+# checkout, set the port to match your aitm config's
+# `mcp.transport.loopback_tcp.port`, and point --token-file at the file holding
+# the agent token (the same token as the aitm config; keep it mode 0600).
+
+[mcp_servers.aitmproxy]
+command = "python3"
+args = [
+  "/absolute/path/to/aitmproxy/agent/bridge.py",
+  "--host",
+  "127.0.0.1",
+  "--port",
+  "8084",
+  "--token-file",
+  "/home/you/.config/aitm/agent.token",
+]

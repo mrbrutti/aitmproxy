@@ -38,6 +38,7 @@ enum SnapshotScene: String, CaseIterable {
     case coreRestarting = "core-restarting"
     case coreFailed = "core-failed"
     case coreLog = "core-log"
+    case inspectWebSocket = "inspect-websocket"
 
     /// Task 8: a seeded embedded `CoreConnection` so the health dot and the
     /// core-log panel render without a live core (snapshots use fixtures).
@@ -182,6 +183,8 @@ enum SnapshotScene: String, CaseIterable {
                 "proxy: GET https://api.shop-staging.test/api/health → 200",
             ] { session.coreHealth.record(line) }
             session.coreLogVisible = true
+        case .inspectWebSocket:
+            session.select(session.rows.first { $0.kind == .websocket }?.id)
         }
     }
 

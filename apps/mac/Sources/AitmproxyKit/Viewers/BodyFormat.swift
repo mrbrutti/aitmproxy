@@ -149,6 +149,13 @@ public enum CodeAnalysis {
         public var foldableLines: Set<Int>
     }
 
+    /// Whether a content type has a tokenizer here, so the editor only pays for
+    /// live re-colouring when it will actually change the colours.
+    public static func colours(contentType: String?) -> Bool {
+        let type = contentType?.lowercased() ?? ""
+        return ["json", "graphql", "xml", "html", "yaml", "yml", "rhai"].contains { type.contains($0) }
+    }
+
     /// UTF-16 offset of every line's first character; `[0]` for an empty text.
     public static func lineStarts(_ text: String) -> [Int] {
         var starts = [0]
@@ -170,11 +177,15 @@ public enum CodeAnalysis {
         let type = contentType?.lowercased() ?? ""
         let isJSON = type.contains("json") || type.contains("graphql")
         let isXML = type.contains("xml") || type.contains("html")
+        let isYAML = type.contains("yaml") || type.contains("yml")
+        let isRhai = type.contains("rhai")
         var runs: [Run] = []
         var starts: [Int] = []
         var foldable = Set<Int>()
         var offset = 0
         var lineIndex = 0
+        // Rhai block comments and multiline strings carry across lines.
+        var rhaiState = Syntax.RhaiState.code
         for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
             if lineIndex % 2048 == 2047, Task.isCancelled { break }
             starts.append(offset)
@@ -185,13 +196,24 @@ public enum CodeAnalysis {
                       !trimmed.hasPrefix("<!"), !trimmed.hasSuffix("/>"), !trimmed.contains("</") {
                 foldable.insert(lineIndex)
             }
-            if isJSON {
-                var cursor = offset
-                for run in Syntax.runs(for: String(line), contentType: contentType) {
-                    let length = run.text.utf16.count
-                    if run.kind != .plain { runs.append(Run(range: NSRange(location: cursor, length: length), kind: run.kind)) }
-                    cursor += length
-                }
+            // The token runs for this line, by language. Rhai threads its state.
+            let lineRuns: [SyntaxRun]
+            if isRhai {
+                let tokenized = Syntax.rhai(line: String(line), continuing: rhaiState)
+                lineRuns = tokenized.runs
+                rhaiState = tokenized.next
+            } else if isYAML {
+                lineRuns = Syntax.yaml(line: String(line))
+            } else if isJSON {
+                lineRuns = Syntax.runs(for: String(line), contentType: contentType)
+            } else {
+                lineRuns = []
+            }
+            var cursor = offset
+            for run in lineRuns {
+                let length = run.text.utf16.count
+                if run.kind != .plain { runs.append(Run(range: NSRange(location: cursor, length: length), kind: run.kind)) }
+                cursor += length
             }
             offset += line.utf16.count + 1
             lineIndex += 1

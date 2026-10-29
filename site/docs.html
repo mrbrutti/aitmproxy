@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Getting started — aitmproxy docs</title>
+<meta name="description" content="Install aitmproxy, trust the local certificate, capture your first flows, then intercept and edit a request by hand or by agent.">
+<link rel="stylesheet" href="styles.css">
+<script>(function(d){var c=" js";try{if(!matchMedia("(prefers-reduced-motion: reduce)").matches&&!sessionStorage.getItem("aitm.intro")){c+=" intro-on";sessionStorage.setItem("aitm.intro","1");}}catch(e){}d.className+=c;})(document.documentElement);</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="wordmark" href="index.html" aria-label="aitmproxy home">aitmproxy<i aria-hidden="true"></i></a>
+    <ul class="nav-links">
+      <li><a href="features.html">Features</a></li>
+      <li><a href="docs.html" aria-current="page">Docs</a></li>
+      <li><a href="scripting.html">Scripting</a></li>
+      <li><a href="poc.html">PoC format</a></li>
+      <li><a class="btn" href="download.html">Download</a></li>
+    </ul>
+    <details class="menu">
+      <summary>Menu</summary>
+      <ul class="nav-links">
+        <li><a href="features.html">Features</a></li>
+        <li><a href="docs.html" aria-current="page">Docs</a></li>
+        <li><a href="scripting.html">Scripting</a></li>
+        <li><a href="poc.html">PoC format</a></li>
+        <li><a href="download.html">Download</a></li>
+      </ul>
+    </details>
+  </div>
+</header>
+
+<main id="main">
+<div class="wrap docs">
+
+  <nav class="docnav" aria-label="Documentation">
+    <details open>
+      <summary>Documentation</summary>
+      <div>
+        <h2>Start</h2>
+        <ul>
+          <li><a href="docs.html" aria-current="page">Getting started</a></li>
+          <li><a href="#">How aitmproxy works</a></li>
+          <li><a href="#">The macOS app</a></li>
+          <li><a href="#">The web UI</a></li>
+          <li><a href="#">The terminal UI</a></li>
+        </ul>
+        <h2>Work with traffic</h2>
+        <ul>
+          <li><a href="#">Flows</a></li>
+          <li><a href="#">Intercept rules</a></li>
+          <li><a href="#">Replay and compose</a></li>
+          <li><a href="#">Map Local and Map Remote</a></li>
+          <li><a href="#">WebSocket</a></li>
+          <li><a href="#">Sessions and HAR</a></li>
+          <li><a href="#">TLS passthrough</a></li>
+          <li><a href="#">Embedded browser</a></li>
+          <li><a href="#">Certificates</a></li>
+        </ul>
+        <h2>Automate</h2>
+        <ul>
+          <li><a href="#">CLI reference</a></li>
+          <li><a href="#">MCP server</a></li>
+          <li><a href="scripting.html">Rhai scripting</a></li>
+          <li><a href="poc.html">PoC format</a></li>
+          <li><a href="#">Audit log</a></li>
+        </ul>
+      </div>
+    </details>
+  </nav>
+
+  <article class="article">
+    <h1 class="display">Getting started</h1>
+    <p class="lead">Ten minutes from an empty terminal to a request held in mid-air and edited, first by you, then by an assistant. Everything here works the same in the macOS app, the web UI and the terminal UI.</p>
+
+    <div class="prose">
+      <h2 id="install">Install</h2>
+      <p>aitmproxy installs with Homebrew on macOS and Linux. The formula ships the <code>aitm</code> command, the terminal UI, the web UI and the MCP server. The macOS app is a separate cask that includes the same core.</p>
+      <figure class="code" data-reveal>
+        <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="pr">$ </span>brew install aitmproxy
+<span class="pr">$ </span>aitm --version
+<span class="out">aitm 1.4.0 (rust 1.91, unsafe: 0)</span></code></pre>
+      </figure>
+      <p>Prefer the app? <code>brew install --cask aitmproxy</code> puts <em>aitmproxy.app</em> in Applications. The app starts the same core and can be driven by the same CLI.</p>
+
+      <h2 id="trust">Trust the certificate</h2>
+      <p>To read HTTPS, aitmproxy terminates TLS with a certificate authority it generates on your machine, for your machine. Nothing leaves your computer. Before browsers and apps will accept it, that CA must be trusted.</p>
+      <figure class="code" data-reveal>
+        <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="pr">$ </span>aitm ca install
+<span class="out">aitmproxy local CA   created just now   fingerprint 3A:9F:…:C2</span>
+<span class="out">install into login keychain? [y/N] </span><span class="in">y</span>
+<span class="out">login keychain       trusted</span>
+<span class="pr">$ </span>aitm ca status
+<span class="out">login keychain       trusted</span>
+<span class="out">system keychain      not installed</span></code></pre>
+      </figure>
+      <div class="callout">
+        <p><strong>By agent:</strong> an assistant connected over MCP can call <code>ca.status()</code> and <code>ca.export()</code>, but <code>ca.install</code> is a human-only command. Trust decisions stay with the person at the keyboard.</p>
+      </div>
+      <p>For a device that is not this machine (a phone, a VM), export the certificate with <code>aitm ca export --out aitm-ca.pem</code> and install it there by the device's usual means. Hosts that pin their certificates can be excluded with <a href="features.html#tls">TLS passthrough</a>.</p>
+
+      <h2 id="capture">Capture</h2>
+      <p>Start the proxy. It listens on <code>127.0.0.1:8080</code> and serves the web UI on <code>127.0.0.1:8082</code>. Point a browser, a simulator or your app at the proxy and flows start arriving.</p>
+      <figure class="code" data-reveal>
+        <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="pr">$ </span>aitm start
+<span class="out">proxy    http://127.0.0.1:8080</span>
+<span class="out">web ui   http://127.0.0.1:8082</span>
+<span class="out">mcp      stdio (run `aitm mcp` from your assistant)</span>
+<span class="pr">$ </span>curl -x http://127.0.0.1:8080 https://shop.example.com/api/products?page=2
+<span class="pr">$ </span>aitm flow list --last 3
+<span class="out">42  GET   /api/users/me          200   12 ms</span>
+<span class="out">41  POST  /api/cart/items        200  198 ms</span>
+<span class="out">40  GET   /api/products?page=2   200   38 ms</span></code></pre>
+      </figure>
+      <p>The macOS app and the terminal UI (<code>aitm tui</code>) show the same list live. Select a flow to read the request and response, headers and body, timing and the TLS details of the connection.</p>
+      <table>
+        <thead><tr><th>Shortcut</th><th>Action</th></tr></thead>
+        <tbody>
+          <tr><td><kbd>/</kbd></td><td>Filter flows by method, host, path or status</td></tr>
+          <tr><td><kbd>↩</kbd></td><td>Resume the selected held flow</td></tr>
+          <tr><td><kbd>⌫</kbd></td><td>Drop the selected held flow</td></tr>
+          <tr><td><kbd>R</kbd></td><td>Replay the selected flow</td></tr>
+          <tr><td><kbd>I</kbd></td><td>Arm interception for the selected flow's path</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="intercept">Intercept and edit</h2>
+      <p>Interception pauses a request in mid-air. Add a rule for the traffic you care about, trigger it from the app, and the flow appears as <em>armed</em>: readable and editable, going nowhere until you say so.</p>
+      <figure class="code" data-reveal>
+        <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="pr">$ </span>aitm intercept add --match <span class="s">'POST /api/cart/*'</span>
+<span class="out">rule r1 armed · POST /api/cart/*</span>
+<span class="c"># …add something to the cart in the app…</span>
+<span class="pr">$ </span>aitm flow list --held
+<span class="out">41  POST  /api/cart/items  armed  —</span>
+<span class="pr">$ </span>aitm flow show --id 41 --body
+<span class="out">{ "sku": "A-1042", "qty": 1 }</span>
+<span class="pr">$ </span>aitm flow mutate --id 41 --set-body <span class="s">'{"qty":999}'</span>
+<span class="out">flow 41 body updated (27 B)</span>
+<span class="pr">$ </span>aitm flow resume --id 41
+<span class="out">flow 41 → 200 in 212 ms</span></code></pre>
+      </figure>
+      <p>In the app, the same four moves are: select the held row, edit the body in the detail pane, press <kbd>↩</kbd> to resume or <kbd>⌫</kbd> to drop. Response interception works the same way; add <code>--hold response</code> to the rule and the response pauses on its way back.</p>
+
+      <h3 id="by-agent">The same thing, by agent</h3>
+      <p>Connect an assistant to <code>aitm mcp</code> and it gets the same commands with the same names. Here is the sequence above as the assistant sees it:</p>
+      <figure class="code term">
+        <figcaption><span>mcp — aitmproxy</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="who">›</span> <span class="in">intercept.add({ match: <span class="s">"POST /api/cart/*"</span> })</span>
+<span class="who">‹</span> <span class="out">{ rule: "r1", state: "armed" }</span>
+<span class="who">›</span> <span class="in">flow.list({ held: <span class="n">true</span> })</span>
+<span class="who">‹</span> <span class="out">[{ id: 41, method: "POST", path: "/api/cart/items", state: "armed" }]</span>
+<span class="who">›</span> <span class="in">flow.mutate({ id: <span class="n">41</span>, set_body: <span class="s">'{"qty":999}'</span> })</span>
+<span class="who">‹</span> <span class="out">{ id: 41, body_bytes: 27 }</span>
+<span class="who">›</span> <span class="in">flow.resume({ id: <span class="n">41</span> })</span>
+<span class="who">‹</span> <span class="out">{ id: 41, status: 200, ms: 212 }</span></code></pre>
+      </figure>
+      <p>Whoever issued them, the commands land in one audit log with the operator named: <code>aitm log tail</code> shows it live.</p>
+
+      <h2 id="next">Next steps</h2>
+      <ul>
+        <li><a href="features.html#replay">Replay a flow with one change</a> and diff the responses.</li>
+        <li><a href="features.html#map">Serve a fixture with Map Local</a> while the backend is still being written.</li>
+        <li><a href="scripting.html">Write a ten-line Rhai plugin</a> that blocks or tags traffic as it passes.</li>
+        <li><a href="poc.html">Save a reproduction as a PoC</a> so the finding can be re-run next week.</li>
+      </ul>
+    </div>
+
+    <nav class="pager" aria-label="Previous and next">
+      <span></span>
+      <a href="#"><small>Next</small>How aitmproxy works</a>
+    </nav>
+  </article>
+
+  <aside class="rail" aria-label="On this page">
+    <h2>On this page</h2>
+    <ul>
+      <li><a href="#install">Install</a></li>
+      <li><a href="#trust">Trust the certificate</a></li>
+      <li><a href="#capture">Capture</a></li>
+      <li><a href="#intercept">Intercept and edit</a></li>
+      <li><a href="#next">Next steps</a></li>
+    </ul>
+  </aside>
+
+</div>
+</main>
+
+<footer class="footer">
+  <div class="wrap">
+    <div>
+      <a class="wordmark" href="index.html">aitmproxy<i aria-hidden="true"></i></a>
+      <p class="fine">A fast, memory-safe intercepting proxy for inspecting and editing HTTP and WebSocket traffic during development and authorized testing. Use it on systems you own or are permitted to test.</p>
+    </div>
+    <div>
+      <h4>Product</h4>
+      <ul>
+        <li><a href="features.html">Features</a></li>
+        <li><a href="docs.html">Documentation</a></li>
+        <li><a href="scripting.html">Rhai scripting</a></li>
+        <li><a href="poc.html">PoC format</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Project</h4>
+      <ul>
+        <li><a href="#">Source</a></li>
+        <li><a href="#">Changelog</a></li>
+        <li><a href="#">MIT or Apache-2.0</a></li>
+        <li><a href="index.html#install">Homebrew</a></li>
+      </ul>
+    </div>
+  </div>
+</footer>
+
+<script src="intro.js"></script>
+<script src="site.js"></script>
+</body>
+</html>

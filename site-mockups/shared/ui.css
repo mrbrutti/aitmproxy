@@ -1,0 +1,119 @@
+/* ui.css — real interface fragments of aitmproxy, built in HTML.
+   Every fragment root carries [data-ui]; inside it the product's own
+   conventions apply (borders, small radii). Themed by --ui-* tokens
+   so each direction renders its own flow viewer. */
+
+[data-ui] {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ui-text);
+  background: var(--ui-bg);
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 24px 60px -30px rgba(0,0,0,.55);
+  --pad: 12px;
+}
+[data-ui] * { box-sizing: border-box; }
+
+/* toolbar / listening bar */
+[data-ui] .ui-bar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 9px var(--pad);
+  background: var(--ui-bg);
+  border-bottom: 1px solid var(--ui-line);
+  font-size: 12px; color: var(--ui-muted);
+}
+[data-ui] .ui-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ui-ok); display: inline-block; }
+[data-ui] .ui-dot.armed { background: var(--ui-armed); }
+[data-ui] .ui-bar .ui-host { color: var(--ui-text); }
+[data-ui] .ui-bar .ui-right { margin-left: auto; display: flex; gap: 10px; }
+[data-ui] .ui-chip {
+  font-size: 11px; padding: 2px 8px; border-radius: 4px;
+  background: var(--ui-row-alt); color: var(--ui-muted);
+}
+[data-ui] .ui-chip.on { background: var(--ui-sel); color: var(--ui-sel-ink); }
+
+/* column header */
+[data-ui] .ui-head, [data-ui] .ui-row {
+  display: grid;
+  grid-template-columns: 54px 56px 1fr 68px 52px;
+  align-items: center;
+  gap: 10px;
+  padding: 0 var(--pad);
+}
+[data-ui] .ui-head {
+  height: 30px; font-size: 11px; color: var(--ui-muted);
+  text-transform: none; border-bottom: 1px solid var(--ui-line);
+}
+[data-ui] .ui-row { height: 30px; cursor: default; }
+[data-ui] .ui-row:nth-child(odd) { background: var(--ui-row-alt); }
+[data-ui] .ui-row.sel { background: var(--ui-sel); color: var(--ui-sel-ink); }
+[data-ui] .ui-row.sel .ui-m, [data-ui] .ui-row.sel .ui-s, [data-ui] .ui-row.sel .ui-t { color: inherit; opacity: .92; }
+[data-ui] .ui-row .ui-u { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+[data-ui] .ui-m { font-size: 11px; color: var(--ui-muted); }
+[data-ui] .ui-s { font-size: 12px; }
+[data-ui] .ui-s.ok { color: var(--ui-ok); }
+[data-ui] .ui-s.warn { color: var(--ui-warn); }
+[data-ui] .ui-s.armed { color: var(--ui-armed); }
+[data-ui] .ui-t { font-size: 11px; color: var(--ui-muted); text-align: right; }
+
+/* an armed/intercepted row carries a left marker */
+[data-ui] .ui-row.armed { box-shadow: inset 2px 0 0 var(--ui-armed); }
+
+/* inspector / editor pane */
+[data-ui] .ui-pane { border-top: 1px solid var(--ui-line); }
+[data-ui] .ui-tabs {
+  display: flex; gap: 16px; padding: 7px var(--pad);
+  font-size: 12px; color: var(--ui-muted);
+  border-bottom: 1px solid var(--ui-line);
+}
+[data-ui] .ui-tabs .on { color: var(--ui-text); }
+[data-ui] .ui-raw { padding: 10px var(--pad); font-size: 12.5px; white-space: pre; overflow-x: auto; }
+[data-ui] .ui-raw .k { color: #7fa7e6; }      /* request-line / keyword */
+[data-ui] .ui-raw .h { color: var(--ui-muted); }
+[data-ui] .ui-raw .v { color: var(--ui-text); }
+[data-ui] .ui-raw .edit { background: color-mix(in srgb, var(--ui-armed) 26%, transparent); border-radius: 3px; padding: 0 2px; }
+
+/* intercept action bar */
+[data-ui] .ui-actions {
+  display: flex; gap: 8px; padding: 9px var(--pad);
+  border-top: 1px solid var(--ui-line); background: var(--ui-bg);
+}
+[data-ui] .ui-btn {
+  font-size: 12px; padding: 4px 11px; border-radius: 5px;
+  background: var(--ui-row-alt); color: var(--ui-text); cursor: pointer;
+}
+[data-ui] .ui-btn.go { background: var(--ui-sel); color: var(--ui-sel-ink); }
+[data-ui] .ui-btn.kill { color: var(--ui-armed); }
+
+/* ---------- code blocks (real code — mono is correct here) ---------- */
+.code {
+  font-family: var(--font-mono);
+  font-size: 13.5px;
+  line-height: 1.65;
+  background: var(--ui-bg);
+  color: var(--ui-text);
+  border-radius: 8px;
+  padding: 16px 18px;
+  overflow-x: auto;
+  tab-size: 2;
+}
+.code .cm { color: var(--ui-muted); font-style: italic; }
+.code .kw { color: #c58fd8; }
+.code .fn { color: #e6c86e; }
+.code .str { color: #cf9c76; }
+.code .num { color: #8fbf7f; }
+.code .pr { color: #7fa7e6; }   /* property / key */
+.code .op { color: var(--ui-muted); }
+.code .yk { color: #7fa7e6; }   /* yaml key */
+.code .yv { color: #cf9c76; }   /* yaml string value */
+
+/* filename ribbon above a code block */
+.codefile {
+  font-family: var(--font-mono); font-size: 12px;
+  color: var(--ui-muted); background: var(--ui-row-alt);
+  padding: 7px 14px; border-radius: 8px 8px 0 0;
+  border-bottom: 1px solid var(--ui-line);
+}
+.codefile + .code { border-radius: 0 0 8px 8px; }

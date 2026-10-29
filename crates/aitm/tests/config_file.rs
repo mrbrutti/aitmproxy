@@ -228,3 +228,22 @@ fn operator_gate_knobs_load() {
     assert!(parse("scope:\n  bogus: 1\n").is_err());
     assert!(parse("poc:\n  bogus: 1\n").is_err());
 }
+
+/// Panel finding #2: the additive `session_io.allow_agent_file_io` gate parses from
+/// config (off by default), the way `Config.tls`/`Config.maps` do, and an unknown
+/// key under it is rejected (deny_unknown_fields).
+#[test]
+fn session_io_gate_loads() {
+    redirect_home();
+    let cfg = parse("session_io:\n  allow_agent_file_io: true\n").expect("parse session_io");
+    assert!(cfg.session_io.allow_agent_file_io);
+    // Default is off when the section is absent.
+    assert!(
+        !parse("ssl_insecure: false\n")
+            .expect("parse")
+            .session_io
+            .allow_agent_file_io
+    );
+    // Unknown keys under the section are rejected.
+    assert!(parse("session_io:\n  bogus: 1\n").is_err());
+}

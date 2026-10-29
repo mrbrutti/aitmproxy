@@ -1,0 +1,8 @@
+{
+  "name": "aitmproxy-agent",
+  "description": "Drive aitmproxy over its MCP bus to find, reproduce, and report vulnerabilities on an authorized, in-scope target. Thin adapter over the portable playbook; no provider SDK.",
+  "version": "0.1.0",
+  "author": {
+    "name": "aitmproxy"
+  }
+}

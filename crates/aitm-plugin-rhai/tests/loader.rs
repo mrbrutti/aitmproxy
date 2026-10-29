@@ -320,6 +320,68 @@ async fn disabled_skipped_and_api_mismatch_warns() {
     );
 }
 
+/// I13: `min_api` is enforced, not just logged. A capability whose `min_api`
+/// is newer than a script's declared `API` is withheld — and because the engine
+/// is shared, deny-by-default refuses to load the under-API script at all. A
+/// script that declares the required API loads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capability_min_api_denies_a_lower_api_script() {
+    use aitm_plugin_rhai::host_core::ScriptCapability;
+
+    struct NeedsApi2;
+    impl ScriptCapability for NeedsApi2 {
+        fn namespace(&self) -> &str {
+            "future_ns"
+        }
+        fn min_api(&self) -> &str {
+            "2"
+        }
+        fn register(&self, _engine: &mut rhai::Engine, _services: &ScriptServices) {}
+    }
+
+    let caps: Vec<Arc<dyn ScriptCapability>> = vec![Arc::new(NeedsApi2)];
+    let loader = RhaiLoader::new_with_capabilities(config(Vec::new(), false), services(), caps)
+        .expect("the loader builds with a custom capability");
+
+    let legacy = TempScript::new("legacy", r#"const API = "1"; fn on_request(flow) { }"#);
+    let err = match loader.load_one(&ScriptEntry::new(legacy.path())) {
+        Ok(_) => panic!("a lower-API script must be denied the higher-min_api namespace"),
+        Err(err) => err,
+    };
+    match &err {
+        ScriptError::CapabilityDenied {
+            namespace,
+            min_api,
+            declared,
+            ..
+        } => {
+            assert_eq!(namespace, "future_ns");
+            assert_eq!(min_api, "2");
+            assert_eq!(declared, "1");
+        }
+        other => panic!("expected CapabilityDenied, got {other:?}"),
+    }
+    assert!(err.to_string().contains("future_ns"), "{err}");
+
+    let modern = TempScript::new("modern", r#"const API = "2"; fn on_request(flow) { }"#);
+    loader
+        .load_one(&ScriptEntry::new(modern.path()))
+        .expect("an API-2 script meets the requirement and loads");
+}
+
+/// `api_satisfies` compares versions numerically, and falls back to exact match
+/// for a non-numeric version (deny-by-default).
+#[test]
+fn api_satisfies_compares_versions() {
+    use aitm_plugin_rhai::loader::api_satisfies;
+    assert!(api_satisfies("1", "1"));
+    assert!(api_satisfies("2", "1"));
+    assert!(!api_satisfies("1", "2"));
+    assert!(api_satisfies("10", "2"), "numeric, not lexicographic");
+    assert!(!api_satisfies("beta", "1"));
+    assert!(api_satisfies("beta", "beta"));
+}
+
 /// A path that does not exist is a `Compile` error naming the path, with the
 /// fix in its help line — never a panic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

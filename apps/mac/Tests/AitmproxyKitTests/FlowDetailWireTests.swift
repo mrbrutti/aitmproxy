@@ -74,4 +74,65 @@ import Testing
         #expect(frames[0].direction == .clientToServer && frames[0].data.flatMap { String(data: $0, encoding: .utf8) } == "hello")
         #expect(frames[1].injected && frames[1].opcode == "text")
     }
+
+    @Test func wsDetailDecodesHandshakeFramesAndConnection() throws {
+        let ws: JSONValue = [
+            "id": "22222222-2222-4222-8222-222222222222", "kind": "websocket",
+            "handshake": "33333333-3333-4333-8333-333333333333",
+            "client_conn": ["alpn": "http/1.1", "sni": "api.test", "peer": "127.0.0.1:51000"],
+            "server_conn": ["peer": "10.0.0.1:443"],
+            "messages": [
+                ["dir": "client_to_server", "opcode": "text", "length": 5, "injected": false, "data": Self.b64("hello")],
+                ["dir": "server_to_client", "opcode": "binary", "length": 3, "injected": false, "data": Self.b64("\u{01}\u{02}\u{03}")],
+            ],
+        ]
+        let d = try #require(WSDetail(detailJSON: ws))
+        #expect(d.handshakeFlowID == "33333333-3333-4333-8333-333333333333")
+        #expect(d.frames.count == 2)
+        #expect(d.sentCount == 1 && d.receivedCount == 1)
+        #expect(d.connection.clientAddress == "127.0.0.1:51000" && d.connection.serverAddress == "10.0.0.1:443")
+        // An HTTP result is not a WSDetail.
+        #expect(WSDetail(detailJSON: ["id": "x", "kind": "http", "request": ["method": "GET", "path": "/"]]) == nil)
+    }
+
+    @Test func wsFramePreviewAndBodyKind() {
+        let jsonFrame = WSFrameDetail(direction: .serverToClient, opcode: "text", length: 13,
+                                      data: Data(#"{"type":"ok"}"#.utf8))
+        #expect(jsonFrame.preview == #"{"type":"ok"}"#)
+        #expect(jsonFrame.bodyKind == .json)
+
+        let binary = WSFrameDetail(direction: .clientToServer, opcode: "binary", length: 3,
+                                   data: Data([0xFF, 0xFE, 0xFD]))
+        #expect(binary.preview == "3 bytes")
+        #expect(binary.bodyKind == .binary)
+
+        let ping = WSFrameDetail(direction: .clientToServer, opcode: "ping", length: 0)
+        #expect(ping.preview == "Ping")
+
+        // A text frame whose bytes are not valid UTF-8 reports its size, not "(empty)".
+        let badText = WSFrameDetail(direction: .serverToClient, opcode: "text", length: 4,
+                                    data: Data([0xFF, 0xFE, 0xFD, 0xFC]))
+        #expect(badText.preview == "4 bytes")
+    }
+
+    @Test func clockParsesVariableFractionalPrecision() {
+        // The core (`time` crate) emits 0 to 9 fractional digits; all must parse to a clock.
+        #expect(Format.clock(rfc3339: "2026-10-28T11:04:58Z") != nil)
+        #expect(Format.clock(rfc3339: "2026-10-28T11:04:58.1Z") != nil)
+        #expect(Format.clock(rfc3339: "2026-10-28T11:04:58.123Z") != nil)
+        #expect(Format.clock(rfc3339: "2026-10-28T11:04:58.123456789Z") != nil)
+        #expect(Format.clock(rfc3339: "not a timestamp") == nil)
+        // The clock is wall-clock HH:MM:SS.mmm; the millisecond truncates to three digits.
+        let threeAndNine = (Format.clock(rfc3339: "2026-10-28T11:04:58.123Z"),
+                            Format.clock(rfc3339: "2026-10-28T11:04:58.123999999Z"))
+        #expect(threeAndNine.0 == threeAndNine.1)
+    }
+
+    @Test func directionFilterKeepsOneSide() {
+        let sent = WSFrameDetail(direction: .clientToServer, opcode: "text", length: 1)
+        let received = WSFrameDetail(direction: .serverToClient, opcode: "text", length: 1)
+        #expect(WSDirectionFilter.both.keeps(sent) && WSDirectionFilter.both.keeps(received))
+        #expect(WSDirectionFilter.sent.keeps(sent) && !WSDirectionFilter.sent.keeps(received))
+        #expect(WSDirectionFilter.received.keeps(received) && !WSDirectionFilter.received.keeps(sent))
+    }
 }

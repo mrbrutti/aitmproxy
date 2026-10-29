@@ -2,14 +2,16 @@
 //!
 //! The driver trait and its types (`BrowserDriver`, `ClickTarget`, `NavOutcome`,
 //! `BrowserConfig`, `SsrfPolicy`) live in `aitm-core`; this crate implements the
-//! driver over chromiumoxide/CDP for two engines — the bundled obscura fork as
-//! a managed child (`ObscuraDriver`) and system Chromium (`ChromeDriver`) —
-//! selected by `BrowserConfig.engine` in [`launch`], and owns the SSRF guard
-//! and the commands.
+//! driver over chromiumoxide/CDP for three engines — the bundled obscura fork
+//! as a managed child (`ObscuraDriver`), system Chromium (`ChromeDriver`), and
+//! system Firefox with a throwaway profile (`FirefoxDriver`) — selected by
+//! `BrowserConfig.engine` in [`launch`], and owns the SSRF guard and the
+//! commands.
 
 mod commands;
 mod config;
 mod driver;
+pub mod firefox;
 pub mod obscura;
 mod ssrf;
 
@@ -22,6 +24,7 @@ pub use aitm_core::{BrowserDriver, ClickTarget, NavOutcome};
 pub use commands::{register_browser_commands, BrowserPlugin};
 pub use config::{BrowserConfig, SsrfPolicy};
 pub use driver::ChromeDriver;
+pub use firefox::FirefoxDriver;
 pub use obscura::{ObscuraDriver, ObscuraProcess, ProbeInfo};
 pub use ssrf::{check_url, HostResolver, ResolvedTarget, SsrfGuard, StdSsrfGuard, SystemResolver};
 
@@ -36,6 +39,7 @@ pub struct LaunchedBrowser {
 enum Closer {
     Obscura(Arc<ObscuraDriver>),
     Chrome(Arc<ChromeDriver>),
+    Firefox(Arc<FirefoxDriver>),
 }
 
 impl LaunchedBrowser {
@@ -48,13 +52,15 @@ impl LaunchedBrowser {
         match closer {
             Closer::Obscura(driver) => driver.shutdown().await,
             Closer::Chrome(driver) => driver.shutdown().await,
+            Closer::Firefox(driver) => driver.shutdown().await,
         }
     }
 }
 
 /// Launch the engine `config.engine` selects. `ca_cert` is the proxy CA's
-/// certificate **file**, passed to obscura as `--ca-cert`; Chrome trusts the
-/// proxy via `ignore_cert_errors` instead and ignores it.
+/// certificate **file**: obscura takes it as `--ca-cert` and Firefox imports it
+/// into its throwaway profile; Chrome trusts the proxy via `ignore_cert_errors`
+/// instead and ignores it.
 pub async fn launch_owned(
     config: &BrowserConfig,
     ca_cert: &Path,
@@ -72,6 +78,13 @@ pub async fn launch_owned(
             Ok(LaunchedBrowser {
                 driver: driver.clone(),
                 closer: Closer::Chrome(driver),
+            })
+        }
+        BrowserEngine::Firefox => {
+            let driver = Arc::new(FirefoxDriver::launch(config, ca_cert).await?);
+            Ok(LaunchedBrowser {
+                driver: driver.clone(),
+                closer: Closer::Firefox(driver),
             })
         }
     }

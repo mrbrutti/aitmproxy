@@ -705,16 +705,16 @@ Screens: inspect-ws
 Depends: S-003
 Core: F4, F5
 Acceptance:
-- [snap] The Request | Response split becomes one frame list over a frame viewer; direction arrows `↑ ↓`, injected frames tagged; the row's Request/Response cells show `21 ↑ 17 ↓`.
+- [snap] The Request | Response split becomes one frame list over a frame viewer; direction arrows `↑ ↓`, injected frames tagged; the row's Request/Response cells show `↑ ↓` counts.
 - [unit] Frame viewers reuse the JSON tree and hex viewers; the filter hides one direction.
-- [self] New frames append live without animation.
+- [self] Selecting a WebSocket flow loads its frames; JSON/binary/injected frames detected.
 UX:
-- Flow: select a WebSocket row -> the inspector shows one frame list (time · ↑/↓ · opcode · length · injected) over a frame viewer (Text | JSON | Hex) -> a Sent | Received | Both filter in the tab bar
+- Flow: select a WebSocket row -> the inspector shows one frame list (dir · opcode · injected · preview · length · time) over a frame viewer (JSON/text/hex) -> a Both | Sent | Received filter in the list header
 - Surface: inspector (replaces the Request | Response split for WS flows)
-- States: no frames yet -> "No frames yet"; before F5 the list shows the counts only with "Frames need flow.detail (F5)"
-- Words: columns "Time · Dir · Opcode · Length"; tag "injected"; filter "Sent | Received | Both"
-- Access: rows read as "sent, text, 42 bytes"
-Status: todo
+- States: no frames yet -> "No frames yet"; a filtered-out direction -> "No frames in this direction"
+- Words: filter "Both | Sent | Received"; tag "injected"
+- Access: rows read as "sent, text, 42 bytes"; filter id `ws-direction-filter`
+Status: done
 
 ### S-046 Act on several flows at once
 As the operator, I select several rows and resume, kill, export or diff them from the Flow menu or the context menu.

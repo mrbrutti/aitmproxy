@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PoC format — aitmproxy docs</title>
+<meta name="description" content="Reference for aitmproxy's YAML PoC format: a saved, re-runnable reproduction of a finding, with steps, matchers, variables and a success condition.">
+<link rel="stylesheet" href="styles.css">
+<script>(function(d){var c=" js";try{if(!matchMedia("(prefers-reduced-motion: reduce)").matches&&!sessionStorage.getItem("aitm.intro")){c+=" intro-on";sessionStorage.setItem("aitm.intro","1");}}catch(e){}d.className+=c;})(document.documentElement);</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="wordmark" href="index.html" aria-label="aitmproxy home">aitmproxy<i aria-hidden="true"></i></a>
+    <ul class="nav-links">
+      <li><a href="features.html">Features</a></li>
+      <li><a href="docs.html">Docs</a></li>
+      <li><a href="scripting.html">Scripting</a></li>
+      <li><a href="poc.html" aria-current="page">PoC format</a></li>
+      <li><a class="btn" href="download.html">Download</a></li>
+    </ul>
+    <details class="menu">
+      <summary>Menu</summary>
+      <ul class="nav-links">
+        <li><a href="features.html">Features</a></li>
+        <li><a href="docs.html">Docs</a></li>
+        <li><a href="scripting.html">Scripting</a></li>
+        <li><a href="poc.html" aria-current="page">PoC format</a></li>
+        <li><a href="download.html">Download</a></li>
+      </ul>
+    </details>
+  </div>
+</header>
+
+<main id="main">
+<div class="wrap docs">
+
+  <nav class="docnav" aria-label="Documentation">
+    <details open>
+      <summary>Documentation</summary>
+      <div>
+        <h2>Start</h2>
+        <ul>
+          <li><a href="docs.html">Getting started</a></li>
+          <li><a href="#">How aitmproxy works</a></li>
+        </ul>
+        <h2>Automate</h2>
+        <ul>
+          <li><a href="#">CLI reference</a></li>
+          <li><a href="#">MCP server</a></li>
+          <li><a href="scripting.html">Rhai scripting</a></li>
+          <li><a href="poc.html" aria-current="page">PoC format</a></li>
+          <li><a href="#">Audit log</a></li>
+        </ul>
+        <h2>PoC format</h2>
+        <ul>
+          <li><a href="#what">What a PoC is</a></li>
+          <li><a href="#schema">Schema</a></li>
+          <li><a href="#steps">Step types</a></li>
+          <li><a href="#matchers">Matchers and success</a></li>
+          <li><a href="#variables">Variables</a></li>
+          <li><a href="#example">Complete example</a></li>
+          <li><a href="#run">Running a PoC</a></li>
+        </ul>
+      </div>
+    </details>
+  </nav>
+
+  <article class="article">
+    <h1 class="display">The PoC format</h1>
+    <p class="lead">A PoC is a saved, re-runnable reproduction of a finding: a few steps, a few matchers and one success condition, in a YAML file a colleague can read top to bottom. Write one when you confirm something; run it again when you need to know whether it is still true.</p>
+
+    <div class="prose">
+      <h2 id="what">What a PoC is</h2>
+      <p>Findings decay. A screenshot proves what was true on Tuesday; a PoC proves what is true now. aitmproxy stores a PoC as a declarative file rather than a script so that it has no hidden state, can be diffed and reviewed like code, and can be written by a person first and an assistant second. Every PoC run passes through the proxy, so the flows it generates are captured, inspectable and auditable like any other traffic.</p>
+
+      <h2 id="schema">Schema</h2>
+      <table>
+        <thead><tr><th>Key</th><th>Type</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>id</code></td><td>string, required</td><td>A stable slug. Used in filenames, findings and the audit log.</td></tr>
+          <tr><td><code>info.name</code></td><td>string, required</td><td>One line a reader understands without opening anything else.</td></tr>
+          <tr><td><code>info.severity</code></td><td><code>info | low | medium | high</code></td><td>Carried onto the finding when the PoC succeeds.</td></tr>
+          <tr><td><code>info.tags</code></td><td>list of strings</td><td>Optional, filterable.</td></tr>
+          <tr><td><code>vars</code></td><td>map</td><td>Default values for <code>{{variables}}</code>; see <a href="#variables">Variables</a>.</td></tr>
+          <tr><td><code>steps</code></td><td>list, required</td><td>Run in order. Each step is one of the <a href="#steps">step types</a>. A step with matchers that fails stops the run.</td></tr>
+          <tr><td><code>success</code></td><td><code>all</code> or <code>any</code> of conditions</td><td>Evaluated after the last step. Decides whether the finding is confirmed.</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="steps">Step types</h2>
+      <div class="api" data-reveal>
+        <div><div class="sig">http<small>send one request through the proxy</small></div><div><code>url</code> (required), <code>method</code> (default <code>GET</code>), <code>headers</code>, <code>body</code>, <code>follow_redirects</code> (default <code>false</code>), <code>matchers</code>. The response is kept for later matchers and for <code>{{last.body}}</code>.</div></div>
+        <div><div class="sig">browser<small>drive the embedded headless browser</small></div><div><code>action</code> is one of <code>navigate</code> (<code>url</code>), <code>screenshot</code> (<code>label</code>), <code>eval</code> (<code>expr</code>, stores the result), <code>click</code> (<code>selector</code>), <code>fill</code> (<code>selector</code>, <code>value</code>). The browser already trusts the proxy and goes through it.</div></div>
+        <div><div class="sig">replay<small>re-send a captured flow</small></div><div><code>flow</code> (id from the session) with optional <code>set_header</code>, <code>set_body</code>, <code>set_query</code>. Useful for PoCs written from a live session.</div></div>
+        <div><div class="sig">ws<small>WebSocket exchange</small></div><div><code>url</code>, then a <code>send</code> list and an <code>expect</code> list of frames; <code>timeout_ms</code>.</div></div>
+        <div><div class="sig">wait<small>pause</small></div><div><code>ms</code>. For targets with eventual consistency.</div></div>
+      </div>
+
+      <h2 id="matchers">Matchers and success</h2>
+      <p>Matchers sit inside a step and check its result. Success conditions sit at the end and check the whole run. They share one vocabulary:</p>
+      <table>
+        <thead><tr><th>type</th><th>fields</th><th>true when</th></tr></thead>
+        <tbody>
+          <tr><td><code>word</code></td><td><code>part</code>, <code>word</code> (string or list), <code>condition</code> (<code>and</code> or <code>or</code>)</td><td>the given part contains the word(s)</td></tr>
+          <tr><td><code>regex</code></td><td><code>part</code>, <code>regex</code></td><td>the part matches</td></tr>
+          <tr><td><code>status</code></td><td><code>status</code> (int or list)</td><td>the response status is one of them</td></tr>
+          <tr><td><code>header</code></td><td><code>name</code>, <code>equals</code> or <code>contains</code></td><td>the header matches</td></tr>
+          <tr><td><code>browser-eval</code></td><td><code>expr</code>, <code>equals</code></td><td>the expression, evaluated in the page, equals the value</td></tr>
+          <tr><td><code>screenshot-exists</code></td><td><code>label</code></td><td>a screenshot with that label was taken</td></tr>
+        </tbody>
+      </table>
+      <p><code>part</code> is one of <code>body</code>, <code>header</code>, <code>status</code> or <code>all</code>. Any matcher takes <code>negative: true</code> to invert it.</p>
+
+      <h2 id="variables">Variables</h2>
+      <p>Anything in <code>{{double braces}}</code> is substituted before a step runs. Three names are reserved:</p>
+      <ul>
+        <li><code>{{target}}</code> — the base URL, always supplied on the command line so a PoC file never hard-codes a host.</li>
+        <li><code>{{marker}}</code> — a random token generated per run, so a reflection cannot be a coincidence or a cache.</li>
+        <li><code>{{payload}}</code> — by default the marker wrapped in the PoC's <code>vars.payload</code> template; override it per run.</li>
+      </ul>
+      <p>Everything else comes from <code>vars</code> in the file, overridden by <code>--var name=value</code>. Results of earlier steps are reachable as <code>{{last.body}}</code>, <code>{{last.status}}</code> and <code>{{steps.N.body}}</code>.</p>
+
+      <h2 id="example">Complete example</h2>
+      <p>A reflected value in a search parameter. The first step sends the marker and checks it comes back in the body. The second step opens the same page in the embedded browser and keeps a screenshot. Success requires that the page's own JavaScript saw the marker, which is a stronger claim than text in a body.</p>
+      <figure class="code" data-reveal>
+        <figcaption><span>pocs/reflected-xss-search-q.yaml</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="yk">id:</span> <span class="yv">reflected-xss-search-q</span>
+<span class="yk">info:</span>
+  <span class="yk">name:</span> <span class="yv">Reflected value in search 'q' parameter</span>
+  <span class="yk">severity:</span> <span class="yv">high</span>
+<span class="yk">steps:</span>
+  <span class="p">-</span> <span class="yk">http:</span>
+      <span class="yk">url:</span> <span class="s">"{{target}}/search?q={{payload}}"</span>
+      <span class="yk">matchers:</span>
+        <span class="p">-</span> <span class="yk">type:</span> <span class="yv">word</span>
+          <span class="yk">part:</span> <span class="yv">body</span>
+          <span class="yk">word:</span> <span class="s">"{{marker}}"</span>
+  <span class="p">-</span> <span class="yk">browser:</span>
+      <span class="yk">action:</span> <span class="yv">screenshot</span>
+      <span class="yk">label:</span> <span class="yv">confirmed</span>
+<span class="yk">success:</span>
+  <span class="yk">all:</span>
+    <span class="p">-</span> <span class="yk">type:</span> <span class="yv">browser-eval</span>
+      <span class="yk">expr:</span> <span class="s">"window.__marker"</span>
+      <span class="yk">equals:</span> <span class="s">"{{marker}}"</span></code></pre>
+      </figure>
+
+      <h2 id="run">Running a PoC</h2>
+      <p>Run one file or a directory of them. The exit code is <code>0</code> when every PoC's success condition holds, so a PoC can sit in CI as a regression test for a fix. By agent, the same call returns the result as structured data.</p>
+      <div class="pair">
+        <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm poc run pocs/reflected-xss-search-q.yaml --var target=https://staging.example.com</code></div>
+        <div class="pair-row"><span class="pair-who">agent</span><code>poc.run({ path: <span class="s">"pocs/reflected-xss-search-q.yaml"</span>, vars: { target: <span class="s">"https://staging.example.com"</span> } })</code></div>
+      </div>
+      <figure class="code term">
+        <figcaption><span>zsh — aitm</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="pr">$ </span><span class="in">aitm poc run pocs/reflected-xss-search-q.yaml --var target=https://staging.example.com</span>
+<span class="out">reflected-xss-search-q   marker k7x2m9</span>
+<span class="out">  step 1  http     GET /search?q=…        200  word:body  ok   (flow #51)</span>
+<span class="out">  step 2  browser  screenshot confirmed   ok   (flows #52–#67)</span>
+<span class="out">  success browser-eval window.__marker == "k7x2m9"   ok</span>
+<span class="out">confirmed · high · finding #3 · pocs/out/reflected-xss-search-q/confirmed.png</span></code></pre>
+      </figure>
+      <div class="callout">
+        <p>Like every command, a PoC run is recorded in the audit log with its operator, its variables and the flows it produced. A reproduction nobody can trace is not a reproduction.</p>
+      </div>
+    </div>
+
+    <nav class="pager" aria-label="Previous and next">
+      <a href="scripting.html"><small>Previous</small>Rhai scripting</a>
+      <a href="#"><small>Next</small>Audit log</a>
+    </nav>
+  </article>
+
+  <aside class="rail" aria-label="On this page">
+    <h2>On this page</h2>
+    <ul>
+      <li><a href="#what">What a PoC is</a></li>
+      <li><a href="#schema">Schema</a></li>
+      <li><a href="#steps">Step types</a></li>
+      <li><a href="#matchers">Matchers and success</a></li>
+      <li><a href="#variables">Variables</a></li>
+      <li><a href="#example">Complete example</a></li>
+      <li><a href="#run">Running a PoC</a></li>
+    </ul>
+  </aside>
+
+</div>
+</main>
+
+<footer class="footer">
+  <div class="wrap">
+    <div>
+      <a class="wordmark" href="index.html">aitmproxy<i aria-hidden="true"></i></a>
+      <p class="fine">A fast, memory-safe intercepting proxy for inspecting and editing HTTP and WebSocket traffic during development and authorized testing. Use it on systems you own or are permitted to test.</p>
+    </div>
+    <div>
+      <h4>Product</h4>
+      <ul>
+        <li><a href="features.html">Features</a></li>
+        <li><a href="docs.html">Documentation</a></li>
+        <li><a href="scripting.html">Rhai scripting</a></li>
+        <li><a href="poc.html">PoC format</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Project</h4>
+      <ul>
+        <li><a href="#">Source</a></li>
+        <li><a href="#">Changelog</a></li>
+        <li><a href="#">MIT or Apache-2.0</a></li>
+        <li><a href="index.html#install">Homebrew</a></li>
+      </ul>
+    </div>
+  </div>
+</footer>
+
+<script src="intro.js"></script>
+<script src="site.js"></script>
+</body>
+</html>

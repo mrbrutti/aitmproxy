@@ -117,6 +117,8 @@ extension SyntaxKind {
         case .bracket: Tok.Syntax.bracket
         case .method: Tok.Method.post.fg
         case .version: Tok.Syntax.string
+        case .keyword: Tok.Syntax.keyword
+        case .comment: Tok.Syntax.comment
         }
     }
 }

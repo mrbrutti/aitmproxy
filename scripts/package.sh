@@ -33,6 +33,13 @@ echo "package.sh: aitm ${version}, target ${target}, obscura ${tag}"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
+# Build the web UI FIRST. `aitm`'s build.rs embeds apps/web/dist at compile time;
+# dist/ is git-ignored, so without this step the release binary ships an empty
+# asset table and `aitm web` serves the "not built" placeholder. The prebuild
+# hook runs `npm run tokens`; `build` is `tsc --noEmit && vite build`.
+echo "package.sh: building the web UI (apps/web)"
+( cd apps/web && npm ci && npm run build )
+
 echo "package.sh: cargo build --release -p aitm"
 cargo build --release -p aitm
 

@@ -234,6 +234,7 @@ fn config_get_is_redacted_and_requires_config() {
                 token: "SECRET-TOKEN".into(),
                 endpoint_file: None,
             },
+            ..McpConfig::default()
         },
         ..Config::default()
     };

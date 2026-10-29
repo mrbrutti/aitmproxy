@@ -1,7 +1,7 @@
 //! MCP tool derivation: a command's transport-neutral `ParamSchema` becomes an
 //! MCP tool whose `inputSchema` is JSON Schema.
 
-use aitm_core::{Command, ParamDef, TypeDesc};
+use aitm_core::{Command, ParamDef, Params, TypeDesc};
 use serde_json::{json, Map, Value as JsonValue};
 
 /// Maps the transport-neutral `ParamSchema` onto an MCP tool with JSON Schema input.
@@ -17,6 +17,10 @@ pub struct McpTool {
     pub description: String,
     /// JSON Schema derived from `ParamSchema.params`.
     pub input_schema: JsonValue,
+    /// Whether this command may require an operator confirmation (its
+    /// `confirm_prompt` can return `Some`), so a surface knows which commands may
+    /// take the confirm-over-the-wire handshake (spec D4) without calling them.
+    pub confirmable: bool,
 }
 
 impl McpTool {
@@ -26,6 +30,7 @@ impl McpTool {
             "name": self.name,
             "description": self.description,
             "inputSchema": self.input_schema,
+            "confirmable": self.confirmable,
         })
     }
 }
@@ -42,6 +47,10 @@ impl McpSchemaDerive for StdSchemaDerive {
             name: cmd.name().to_string(),
             description: schema.description,
             input_schema: object_schema(&schema.params),
+            // Static for the surface: a command is confirmable iff it can return a
+            // `confirm_prompt` (probed with no arguments; `confirm_prompt` is
+            // read-only by contract). Drives the operator handshake (spec D4).
+            confirmable: cmd.confirm_prompt(&Params::default()).is_some(),
         }
     }
 }

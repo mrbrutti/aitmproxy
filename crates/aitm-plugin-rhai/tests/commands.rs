@@ -1,5 +1,5 @@
 //! Spec §3/§8 (panel fix, M3): the three operator-facing commands the tier
-//! ships — `script.validate`, `script.reload` and `findings.list` — as real
+//! ships — `script.validate`, `script.reload` and `script.findings` — as real
 //! `aitm_core::Command`s registered by `ScriptCommands`, so MCP and the CLI
 //! pick them up like any other. Each test drives the command through the
 //! `Registry` exactly as a frontend does.
@@ -11,8 +11,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aitm_core::{
-    Chain, CommandHost, Event, Flow, FlowId, FlowStore, HttpFlow, HttpRequest, MemFlowStore,
-    Params, ProxyClient, Registry, StdGuard, Value, Verdict,
+    Chain, CommandHost, Event, Flow, FlowId, FlowStore, Frontend, HttpFlow, HttpRequest,
+    MemFlowStore, Params, ProxyClient, Registry, StdGuard, Value, Verdict,
 };
 use aitm_plugin_rhai::config::{RhaiConfig, ScriptEntry};
 use aitm_plugin_rhai::host_core::{FindingSink, MemoryFindingSink, ScriptServices};
@@ -108,14 +108,29 @@ impl Harness {
         }
     }
 
+    /// Drive a command as the human CLI (unconfined), the way most tests want.
     fn invoke(&self, name: &str, params: Params) -> anyhow::Result<Value> {
+        self.invoke_as(Frontend::Cli, None, name, params)
+    }
+
+    /// Drive a command declaring a frontend and the configured PoC/scripts
+    /// confinement root, as a real frontend host does.
+    fn invoke_as(
+        &self,
+        frontend: Frontend,
+        poc_dir: Option<PathBuf>,
+        name: &str,
+        params: Params,
+    ) -> anyhow::Result<Value> {
         let cmd = self
             .registry
             .command(name)
             .unwrap_or_else(|| panic!("{name} is registered"));
         let client = StubClient;
         let guard = StdGuard::default();
-        let host = CommandHost::new(self.store.as_ref(), &client, &guard, None);
+        let host = CommandHost::new(self.store.as_ref(), &client, &guard, None)
+            .with_frontend(frontend)
+            .with_poc_dir(poc_dir);
         cmd.invoke(params, &host)
     }
 
@@ -203,7 +218,7 @@ async fn script_validate_reports_meta_or_the_compile_error() {
     assert!(
         h.registry.command("script.validate").is_some()
             && h.registry.command("script.reload").is_some()
-            && h.registry.command("findings.list").is_some(),
+            && h.registry.command("script.findings").is_some(),
         "all three commands are registered"
     );
 
@@ -249,6 +264,65 @@ async fn script_validate_reports_meta_or_the_compile_error() {
         )
         .expect_err("a non-.rhai path is refused");
     assert!(err.to_string().contains(".rhai"), "{err}");
+}
+
+/// Minor(a): `script.validate` is not a file oracle for an agent frontend. The
+/// human CLI may compile any `.rhai` path; an agent may reach only a file
+/// inside the configured scripts/PoC directory, and a path outside it — present
+/// or not — gets the one generic refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_validate_confines_an_agent_frontend() {
+    let inside = TempScript::new("inside", V1);
+    let outside = TempScript::new("outside", V1);
+    let root = inside.path().parent().expect("temp dir").to_path_buf();
+    let h = Harness::new(Vec::new());
+    let p = |path: &std::path::Path| params(&[("path", Value::Str(path.display().to_string()))]);
+
+    // Human CLI: any path validates, confined or not.
+    h.invoke_as(Frontend::Cli, None, "script.validate", p(outside.path()))
+        .expect("the CLI validates an arbitrary path");
+
+    // Agent confined to `root`: a file inside validates.
+    h.invoke_as(
+        Frontend::Mcp,
+        Some(root.clone()),
+        "script.validate",
+        p(inside.path()),
+    )
+    .expect("an agent validates a script inside the confined dir");
+
+    // Agent reaching a real file outside the root is refused.
+    let err = h
+        .invoke_as(
+            Frontend::Mcp,
+            Some(root.clone()),
+            "script.validate",
+            p(outside.path()),
+        )
+        .expect_err("an agent cannot read outside the confined dir");
+    assert!(err.to_string().contains("scripts/PoC directory"), "{err}");
+
+    // Agent with no confinement configured: refused even for an in-temp file.
+    let err = h
+        .invoke_as(Frontend::Mcp, None, "script.validate", p(inside.path()))
+        .expect_err("an unconfigured agent gets no raw-path access");
+    assert!(err.to_string().contains("scripts/PoC directory"), "{err}");
+
+    // No existence oracle: a missing .rhai outside the root returns the same
+    // refusal as an existing one, so an agent cannot probe for files.
+    let missing = root
+        .parent()
+        .expect("temp parent")
+        .join("aitm-rhai-ghost-does-not-exist.rhai");
+    let err = h
+        .invoke_as(
+            Frontend::Mcp,
+            Some(root.clone()),
+            "script.validate",
+            p(&missing),
+        )
+        .expect_err("a missing path outside the root is refused, not reported absent");
+    assert!(err.to_string().contains("scripts/PoC directory"), "{err}");
 }
 
 /// Spec §8 *Reload*: `script.reload { name }` recompiles the loaded script
@@ -304,10 +378,10 @@ async fn script_reload_swaps_hooks_and_keeps_the_old_ast_on_error() {
 }
 
 /// Spec §3: what `finding(...)` records is read back through the command
-/// surface — `findings.list` returns every finding as an object, newest last,
+/// surface — `script.findings` returns every finding as an object, newest last,
 /// plus how many the bounded sink had to drop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn findings_list_reads_back_what_scripts_recorded() {
+async fn script_findings_reads_back_what_scripts_recorded() {
     let script = TempScript::new(
         "observer",
         r#"
@@ -323,8 +397,8 @@ async fn findings_list_reads_back_what_scripts_recorded() {
     assert_eq!(h.x_v().await.as_deref(), Some("seen"));
 
     let out = h
-        .invoke("findings.list", Params::default())
-        .expect("findings.list runs");
+        .invoke("script.findings", Params::default())
+        .expect("script.findings runs");
     assert_eq!(field(&out, "dropped"), &Value::Int(0));
     let Value::Array(items) = field(&out, "findings") else {
         panic!("findings is an array: {out:?}");
@@ -350,8 +424,8 @@ async fn findings_list_reads_back_what_scripts_recorded() {
 
     // `limit` keeps the newest.
     let out = h
-        .invoke("findings.list", params(&[("limit", Value::Int(1))]))
-        .expect("findings.list with a limit");
+        .invoke("script.findings", params(&[("limit", Value::Int(1))]))
+        .expect("script.findings with a limit");
     let Value::Array(items) = field(&out, "findings") else {
         panic!("findings is an array");
     };

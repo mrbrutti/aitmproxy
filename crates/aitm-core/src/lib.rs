@@ -4,6 +4,8 @@
 //! registry, the flow store, the scope/rate guard, and the proxy acceptor. Every
 //! other crate in the workspace depends on this one.
 
+pub mod agent;
+pub mod audit;
 pub mod authority;
 pub mod body;
 pub mod chain;
@@ -19,19 +21,26 @@ pub mod header;
 pub mod plugin;
 pub mod protocol;
 pub mod proxy;
+pub mod redact;
 pub mod registry;
 pub mod store;
 pub mod stream;
 pub mod value;
 
+pub use agent::{AgentPolicy, AgentState};
+pub use audit::{
+    origin_label, AuditEntry, AuditResult, AuditRing, AuditSink, DEFAULT_ARGS_SUMMARY_CAP,
+    DEFAULT_AUDIT_CAPACITY,
+};
 pub use authority::{Authority, AuthorityError};
 pub use body::{Body, StreamBody};
 pub use chain::Chain;
 pub use client::{PipelineClient, RequestSender};
-pub use command::{Command, ParamDef, ParamSchema, TypeDesc};
+pub use command::{Command, ParamDef, ParamSchema, Sensitivity, TypeDesc};
 pub use config::{
-    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, LimitConfig, McpConfig,
-    McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SsrfPolicy,
+    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, FindingsConfig, FirefoxConfig,
+    LimitConfig, MapsConfig, McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig,
+    ScopeEntry, SessionIoConfig, SsrfPolicy, TlsConfig,
 };
 pub use ctx::{
     BrowserDriver, ClickTarget, CommandHost, FlowCtx, Frontend, NavOutcome, ProxyClient,

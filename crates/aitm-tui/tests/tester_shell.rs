@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::{Duration, Instant};
 
-use aitm_tui::action::{Action, BusEvent, Level, ToolInfo};
+use aitm_tui::action::{Action, BusEvent, Level};
 use aitm_tui::app::{App, Layout, Mode, Pane, PromptKind, RESPONSE_TABS};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::keys;
@@ -180,15 +180,15 @@ fn shell_regions_render_in_the_mockup_order_at_200x50() {
     assert!(summary.contains("TLS · h2"), "{summary}");
     assert!(summary.contains("client curl"), "{summary}");
     assert!(summary.contains("in scope"), "{summary}");
-    // Tab rows carry the F5-gated tabs as labelled placeholders (fix pass 1, I1).
+    // Cookies and Set-Cookie render live; only Timing stays F5-gated (I17a).
     assert!(
         text.contains(
-            "Request  Headers  Cookies (F5)  Query  Body  Raw  Summary  Timing (F5)  Connection"
+            "Request  Headers  Cookies  Query  Body  Raw  Summary  Timing (F5)  Connection"
         ),
         "{text}"
     );
     assert!(
-        text.contains("Response  Headers  Set-Cookie (F5)  Body  Raw  JSON  Hex  Diff"),
+        text.contains("Response  Headers  Set-Cookie  Body  Raw  JSON  Hex  Diff"),
         "{text}"
     );
     assert!(
@@ -493,20 +493,18 @@ fn import_is_a_command_not_a_drop_target() {
         "{}",
         toast(&app)
     );
-    // The fixture bus has no flow.import: the control is labelled, never silent.
-    assert!(app.run_command("import /tmp/session.har").is_empty());
-    assert_eq!(toast(&app), "Import needs core follow-up F10 (flow.import)");
-    app.tools.push(ToolInfo {
-        name: "flow.import".into(),
-        description: String::new(),
-        input_schema: json!({}),
-    });
+    // flow.import is a core tool since M6 F10, so the control issues the request.
     assert_eq!(
         app.run_command("import /tmp/session.har"),
         vec![aitm_tui::action::BusRequest::Import(
             "/tmp/session.har".into()
         )]
     );
+    // A bus without flow.import (an older core) still degrades honestly, never
+    // silently — the label names the missing tool.
+    app.tools.retain(|t| t.name != "flow.import");
+    assert!(app.run_command("import /tmp/session.har").is_empty());
+    assert_eq!(toast(&app), "Import needs core follow-up F10 (flow.import)");
 }
 
 #[test]
@@ -917,18 +915,19 @@ fn inspector_frames_with_a_five_megabyte_body_stay_under_two_seconds() {
 }
 
 /// The honest second snapshot (`aitm-tui --snapshot-core`): the fixture
-/// limited to the 37 commands the bus serves today (the 2026-10-28 core
-/// merge). F5/F6/F7/F12/F13 and the M3 commands are lit; only the F1 agent
-/// tools are still ahead of the core, so the agent surface alone degrades.
+/// limited to the 56 commands the bus serves today (the 2026-10-29 M4 merge on
+/// top of the M6 parity additions). F5/F6/F7/F12/F13, the M3 commands, the M6
+/// F9/F10/F11/Map commands and the M4 F1 agent / F4 subscription commands are
+/// all lit — with M4 merged nothing in the fixture is ahead of the core.
 #[test]
-fn fixture_app_core_offers_exactly_the_37_core_tools_and_only_f1_degrades() {
+fn fixture_app_core_offers_exactly_the_core_tools_with_the_agent_surface_lit() {
     let app = fixture_app_core(200, 50);
     let mut names: Vec<&str> = app.tools.iter().map(|t| t.name.as_str()).collect();
     names.sort_unstable();
     let mut want: Vec<&str> = CORE_TOOLS.to_vec();
     want.sort_unstable();
     assert_eq!(names, want);
-    assert_eq!(app.tools.len(), 37);
+    assert_eq!(app.tools.len(), 56);
     for lit in [
         "flow.detail",
         "flow.mark",
@@ -948,8 +947,15 @@ fn fixture_app_core_offers_exactly_the_37_core_tools_and_only_f1_degrades() {
     ] {
         assert!(app.has_tool(lit), "{lit} is on today's core");
     }
-    for gated in ["agent.status", "agent.set"] {
-        assert!(!app.has_tool(gated), "{gated} is still F1");
+    for agent in [
+        "agent.status",
+        "agent.set",
+        "agent.activity",
+        "agent.approve",
+        "flow.subscribe",
+        "flow.unsubscribe",
+    ] {
+        assert!(app.has_tool(agent), "{agent} is on the core since M4");
     }
     assert_eq!(app.flows.len(), 15, "the same recorded flows");
     assert_eq!(app.details.len(), 15, "flow.detail is on the core bus");
@@ -964,16 +970,23 @@ fn fixture_app_core_offers_exactly_the_37_core_tools_and_only_f1_degrades() {
         3,
         "the library plus the two recorded runs"
     );
-    assert_eq!(app.agent.policy, None, "agent.status is F-gated");
+    assert!(
+        app.agent.policy.is_some(),
+        "agent.status is on the core since M4, so the policy is loaded"
+    );
+    assert_eq!(
+        app.agent.actions_last_minute, 14,
+        "from the fixture's agent"
+    );
     assert_eq!(app.listening.as_deref(), Some("127.0.0.1:8080"));
     assert_eq!(app.serving, Some(true));
     assert_eq!(app.selected.as_deref(), Some("f50"));
 
-    // The full fixture only adds the F1 tools; the core one renders.
-    assert_eq!(fixture_app(200, 50).tools.len(), 39);
+    // With M4 merged the whole fixture is core: the core app equals the full one.
+    assert_eq!(fixture_app(200, 50).tools.len(), 56);
     let text = text_of(&app, 200, 50);
     assert!(text.contains("11 / 15 rows"), "{text}");
-    assert!(text.contains("Agent · n/a (F1)"), "{text}");
+    assert!(text.contains("Agent ● all tools · 14/min"), "{text}");
 }
 
 #[test]

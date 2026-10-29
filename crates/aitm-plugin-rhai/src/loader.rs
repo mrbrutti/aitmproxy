@@ -66,6 +66,12 @@ pub struct RhaiLoader {
     engine: Arc<Engine>,
     services: ScriptServices,
     cfg: RhaiConfig,
+    /// Each registered capability's `(namespace, min_api)`. A script that
+    /// declares an older `API` than a namespace's `min_api` is denied the whole
+    /// load — deny-by-default never hands a lower-API script a namespace written
+    /// for a newer contract (spec §6a; the forward-compat gate the host surface
+    /// relies on to expand capabilities).
+    capabilities: Vec<(String, String)>,
     /// Shared by every plugin this loader yields; the wiring binds the chain
     /// into it once the chain exists (see [`ErrorSink`]).
     errors: Arc<ErrorSink>,
@@ -77,12 +83,25 @@ impl RhaiLoader {
     /// (compiled under the same limits, so a config that cannot run the
     /// prelude cannot run anything and is refused here).
     pub fn new(cfg: RhaiConfig, services: ScriptServices) -> Result<Self, ScriptError> {
+        let capabilities = m3_capabilities(&cfg);
+        Self::new_with_capabilities(cfg, services, capabilities)
+    }
+
+    /// `new`, but with an explicit capability set instead of the M3 defaults —
+    /// the seam a future protocol crate adds its own provider through, and the
+    /// one a test drives the `min_api` gate with.
+    pub fn new_with_capabilities(
+        cfg: RhaiConfig,
+        services: ScriptServices,
+        capabilities: Vec<Arc<dyn ScriptCapability>>,
+    ) -> Result<Self, ScriptError> {
         let mut engine = build_engine(&cfg.limits, cfg.hook_timeout);
         register_flow_api(&mut engine);
         // The `load(reg)` bridge: without it a script's `reg.add_command` is an
         // unknown function and no script could register anything (Task 10).
         register_reg_api(&mut engine);
-        for capability in m3_capabilities(&cfg) {
+        let mut cap_requirements = Vec::with_capacity(capabilities.len());
+        for capability in &capabilities {
             tracing::debug!(
                 target: LOADER_TARGET,
                 namespace = capability.namespace(),
@@ -90,12 +109,17 @@ impl RhaiLoader {
                 "registered script capability"
             );
             capability.register(&mut engine, &services);
+            cap_requirements.push((
+                capability.namespace().to_string(),
+                capability.min_api().to_string(),
+            ));
         }
         register_prelude(&mut engine)?;
         Ok(Self {
             engine: Arc::new(engine),
             services,
             cfg,
+            capabilities: cap_requirements,
             errors: Arc::default(),
         })
     }
@@ -153,6 +177,7 @@ impl RhaiLoader {
     /// entry's options for `option(...)`.
     pub fn load_one(&self, entry: &ScriptEntry) -> Result<ScriptPlugin, ScriptError> {
         let (ast, meta) = self.compile(&entry.path)?;
+        self.check_api(&meta)?;
         tracing::info!(
             target: LOADER_TARGET,
             script = %meta.name,
@@ -170,6 +195,27 @@ impl RhaiLoader {
             &self.cfg,
         )
         .with_error_sink(Arc::clone(&self.errors)))
+    }
+
+    /// Refuse a script that declares an older `API` than any registered
+    /// capability's `min_api`: with one shared engine a namespace cannot be
+    /// stripped from a single script, so deny-by-default withholds the whole
+    /// script rather than silently hand it a capability written for a newer
+    /// contract (spec §6a, I13). Today every M3 capability is API `1`, so a
+    /// current script passes; the gate only bites when a future provider
+    /// raises its `min_api`.
+    fn check_api(&self, meta: &ScriptMeta) -> Result<(), ScriptError> {
+        for (namespace, min_api) in &self.capabilities {
+            if !api_satisfies(&meta.api, min_api) {
+                return Err(ScriptError::CapabilityDenied {
+                    script: meta.name.clone(),
+                    declared: meta.api.clone(),
+                    namespace: namespace.clone(),
+                    min_api: min_api.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Parse and compile only; no plugin is built and nothing is registered.
@@ -210,8 +256,8 @@ impl RhaiLoader {
 /// `vars` is here rather than in the PoC executor because the engine is built
 /// once and shared: its verbs must exist on the engine before any step runs,
 /// even though the handle itself is pushed per step.
-fn m3_capabilities(cfg: &RhaiConfig) -> [Arc<dyn ScriptCapability>; 7] {
-    [
+fn m3_capabilities(cfg: &RhaiConfig) -> Vec<Arc<dyn ScriptCapability>> {
+    vec![
         Arc::new(LogCapability),
         Arc::new(FindingCapability),
         Arc::new(HttpCapability),
@@ -220,6 +266,17 @@ fn m3_capabilities(cfg: &RhaiConfig) -> [Arc<dyn ScriptCapability>; 7] {
         Arc::new(ScopeCapability::new(cfg.allow_scope_add)),
         Arc::new(VarsCapability),
     ]
+}
+
+/// Whether a script declaring `declared` meets a capability's `min_api`.
+/// Versions are compared numerically where both parse as integers (so `"2"`
+/// satisfies `"1"` but `"1"` does not satisfy `"2"`); anything non-numeric must
+/// match exactly, which is deny-by-default for an unrecognized version string.
+pub fn api_satisfies(declared: &str, min_api: &str) -> bool {
+    match (declared.parse::<u32>(), min_api.parse::<u32>()) {
+        (Ok(declared), Ok(min_api)) => declared >= min_api,
+        _ => declared == min_api,
+    }
 }
 
 /// What the script is called when it declares no `NAME` (spec §2 rule 1).
