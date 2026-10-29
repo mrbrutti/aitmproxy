@@ -27,7 +27,9 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::config::L4Config;
-use crate::types::{IpCidr, L4Action, L4Capability, L4Proto, L4ScopeEntry, L4ScopeId};
+use crate::types::{
+    IpCidr, L4Action, L4Capability, L4Proto, L4ScopeEntry, L4ScopeId, L4ScopeSource,
+};
 
 /// A typed refusal from the L4 guard. Every wire-touching action passes the guard
 /// first; these are the ways it says no. Mirrors the core `GuardError` style
@@ -62,6 +64,10 @@ pub enum L4GuardError {
     /// The L4 subsystem is unavailable (disabled, no privilege, libpcap/nfq
     /// absent, or OS-unsupported). Reserved here for downstream tasks.
     L4Unavailable(String),
+    /// A runtime bus/MCP caller tried to widen the deny-by-default scope via
+    /// `l4.scope.add` while `l4.allow_agent_widen` is false. The one escape hatch
+    /// out of deny-by-default stays with the operator's config.
+    ScopeWideningDisabled,
 }
 
 impl fmt::Display for L4GuardError {
@@ -85,6 +91,11 @@ impl fmt::Display for L4GuardError {
                 write!(f, "more than {max} packets in one call")
             }
             L4GuardError::L4Unavailable(why) => write!(f, "L4 unavailable: {why}"),
+            L4GuardError::ScopeWideningDisabled => write!(
+                f,
+                "runtime L4 scope widening is disabled; declare scope in the `l4.scope` config \
+                 block or set `l4.allow_agent_widen`"
+            ),
         }
     }
 }
@@ -324,11 +335,18 @@ impl L4Guard {
             // refused unless a granting entry is *contained within* the dangerous
             // range (an explicit, deliberate scope — not a broad catch-all). The
             // override relaxes "contained" to "covers", never to "nothing".
+            //
+            // Only a **config-declared** entry (operator authority) can lift the
+            // denylist: a runtime bus `l4.scope.add` entry can never reach a
+            // control-plane destination the operator did not declare, even with
+            // `dangerous_dst_override` set. (SEC-2: deny-by-default's one escape
+            // hatch stays with config.)
             if let Some(dst) = target.dst {
                 if let Some((range_addr, range_prefix)) = danger_range(dst) {
                     let lifted = granting.iter().any(|e| {
-                        self.dangerous_dst_override
-                            || cidr_within(&e.cidr, range_addr, range_prefix)
+                        e.source == L4ScopeSource::Config
+                            && (self.dangerous_dst_override
+                                || cidr_within(&e.cidr, range_addr, range_prefix))
                     });
                     if !lifted {
                         return Err(L4GuardError::DangerousDestinationBlocked(dst.to_string()));
@@ -563,7 +581,7 @@ pub type L4Target = crate::types::L4Target;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{L4Direction, PortRange, RateCap};
+    use crate::types::{L4Direction, L4ScopeSource, PortRange, RateCap};
 
     fn cfg() -> L4Config {
         L4Config::default()
@@ -590,6 +608,7 @@ mod tests {
                 pps: rate.0,
                 burst: rate.1,
             },
+            source: L4ScopeSource::Config,
         }
     }
 
@@ -861,6 +880,50 @@ mod tests {
         assert_eq!(g.in_flight(), 1);
         drop(permit);
         assert_eq!(g.in_flight(), 0);
+    }
+
+    /// SEC-2 — a RUNTIME-sourced scope entry can never lift the dangerous-
+    /// destination denylist, even with `dangerous_dst_override` set, while a
+    /// CONFIG-sourced entry covering the same address does. This is the structural
+    /// guarantee that an unauthenticated bus `l4.scope.add` cannot self-authorize a
+    /// control-plane destination the operator did not declare.
+    #[test]
+    fn runtime_entry_cannot_lift_denylist() {
+        let mut c = cfg();
+        c.dangerous_dst_override = true;
+        let g = L4Guard::new(&c);
+        let t = target("eth0", L4Direction::Outbound, "169.254.169.254", 80);
+
+        // A runtime-added /32 entry covering the cloud-metadata address does NOT
+        // lift the denylist, override notwithstanding.
+        let mut runtime = entry(
+            ("169.254.169.254", 32),
+            "eth0",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (100, 100),
+        );
+        runtime.source = L4ScopeSource::Runtime;
+        g.add_scope(runtime).unwrap();
+        assert_eq!(
+            g.check(L4Action::Inject, &t).unwrap_err(),
+            L4GuardError::DangerousDestinationBlocked("169.254.169.254".into()),
+            "a runtime-added entry must not lift the denylist, even with override"
+        );
+
+        // The same entry declared in config (operator authority) DOES lift it.
+        let config = entry(
+            ("169.254.169.254", 32),
+            "eth0",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (100, 100),
+        ); // helper defaults `source: Config`
+        g.add_scope(config).unwrap();
+        assert!(
+            g.check(L4Action::Inject, &t).is_ok(),
+            "a config-declared entry must still lift the denylist"
+        );
     }
 
     /// `remove_scope` reverts to deny-by-default for that target.

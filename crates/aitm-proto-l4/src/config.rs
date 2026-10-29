@@ -35,6 +35,14 @@ pub struct L4Config {
     /// The dangerous-destination denylist is never globally disabled; this only
     /// relaxes it where an explicit scope entry already covers the target.
     pub dangerous_dst_override: bool,
+    /// Whether a runtime bus/MCP caller may widen the deny-by-default scope via
+    /// `l4.scope.add`. **Default false** (mirrors `ca.allow_agent_install`): the
+    /// one escape hatch out of deny-by-default stays with the operator, who
+    /// declares scope in the `scope` block above. Pre-M4 the bus cannot tell
+    /// operator from agent, so runtime widening is gated by this flag rather than
+    /// by caller identity. Even when true, a runtime-added entry can never lift the
+    /// dangerous-destination denylist (only config-declared scope can).
+    pub allow_agent_widen: bool,
 }
 
 impl Default for L4Config {
@@ -53,6 +61,9 @@ impl Default for L4Config {
             default_recv_timeout: Duration::from_secs(2),
             intercept: None,
             dangerous_dst_override: false,
+            // Deny-by-default: runtime bus scope widening is off until the operator
+            // opts in. Mirrors `ca.allow_agent_install`'s conservative default.
+            allow_agent_widen: false,
         }
     }
 }

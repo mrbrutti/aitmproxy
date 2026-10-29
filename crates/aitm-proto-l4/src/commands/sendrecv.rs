@@ -367,6 +367,7 @@ mod tests {
                     pps: 100,
                     burst: 100,
                 },
+                source: crate::types::L4ScopeSource::Config,
             })
             .unwrap();
         }
@@ -538,6 +539,7 @@ mod tests {
                         pps: 100,
                         burst: 100,
                     },
+                    source: crate::types::L4ScopeSource::Config,
                 })
                 .unwrap();
         }

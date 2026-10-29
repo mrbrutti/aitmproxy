@@ -89,6 +89,8 @@ fn udp_frame_spec(dst_port: i64, payload: &[u8]) -> Value {
 fn registry() -> Registry {
     let cfg = L4Config {
         enabled: true,
+        // Drives the real `l4.scope.add` round-trip ⇒ opt into runtime widening.
+        allow_agent_widen: true,
         ..L4Config::default()
     };
     let module = L4Module::with_privilege(&cfg, L4Privilege::available());

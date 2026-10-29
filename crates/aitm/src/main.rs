@@ -30,8 +30,9 @@ async fn main() -> anyhow::Result<()> {
 
     let (config_arg, argv) = split_config_arg(std::env::args().skip(1).collect())?;
     let config_path = config_arg.or_else(|| std::env::var_os(CONFIG_ENV).map(PathBuf::from));
-    let (mut cfg, l4) = config_file::load_full(config_path.as_deref())?;
+    let (mut cfg, mut l4) = config_file::load_full(config_path.as_deref())?;
     env::apply(&mut cfg, |k| std::env::var(k).ok());
+    env::apply_l4(&mut l4, |k| std::env::var(k).ok());
     // The L4 module is opt-in (fail-closed) and carried outside `aitm-core`'s `Config`,
     // so it rides the binary-owned feature set. `l4_privilege: None` runs the real
     // startup capability probe (M5-AC17).

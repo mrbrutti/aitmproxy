@@ -504,6 +504,7 @@ mod tests {
             direction: L4Direction::Outbound,
             capability: cap,
             inject_rate: RateCap { pps: 10, burst: 10 },
+            source: crate::types::L4ScopeSource::Config,
         }
     }
 
@@ -848,6 +849,7 @@ mod tests {
             direction: L4Direction::Outbound,
             capability: L4Capability::Capture,
             inject_rate: RateCap { pps: 10, burst: 10 },
+            source: crate::types::L4ScopeSource::Config,
         })
         .unwrap();
 
