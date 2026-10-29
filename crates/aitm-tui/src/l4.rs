@@ -148,8 +148,12 @@ impl L4Flow {
 
 /// The `TCP` / `UDP` / `ICMP` transport sub-label for a layer list, if any.
 pub fn proto_of(layers: &[String]) -> Option<&'static str> {
+    // Innermost transport wins — scan inner-to-outer, matching the web
+    // (`protoSubLabel`) and macOS (`L4Proto.fromLayers`) rule so the three
+    // surfaces print the same sub-label.
     layers
         .iter()
+        .rev()
         .find_map(|l| match l.to_ascii_uppercase().as_str() {
             "TCP" => Some("TCP"),
             "UDP" => Some("UDP"),
@@ -191,26 +195,22 @@ impl L4ScopeEntry {
     /// Parse one serialized `L4ScopeEntry`. `None` without an `interface`.
     pub fn from_json(v: &Value) -> Option<Self> {
         let interface = v.get("interface").and_then(Value::as_str)?.to_string();
+        // `l4.scope.list` serializes `cidr` and `ports` as STRINGS ("127.0.0.1/32",
+        // "0-65535") — see `commands::scope_entry_to_value`. Read them as such (the
+        // web + macOS surfaces do the same); collapse the port range to its display
+        // form.
         let cidr = v
             .get("cidr")
-            .map(|c| {
-                let addr = c.get("addr").and_then(Value::as_str).unwrap_or("?");
-                let prefix = c.get("prefix").and_then(Value::as_u64).unwrap_or(0);
-                format!("{addr}/{prefix}")
-            })
-            .unwrap_or_default();
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         let ports = v
             .get("ports")
-            .map(|p| {
-                let lo = p.get("lo").and_then(Value::as_u64).unwrap_or(0);
-                let hi = p.get("hi").and_then(Value::as_u64).unwrap_or(0);
-                if lo == 0 && hi == 65535 {
-                    "any".to_string()
-                } else if lo == hi {
-                    lo.to_string()
-                } else {
-                    format!("{lo}-{hi}")
-                }
+            .and_then(Value::as_str)
+            .map(|s| match s.split_once('-') {
+                Some(("0", "65535")) => "any".to_string(),
+                Some((lo, hi)) if lo == hi => lo.to_string(),
+                _ => s.to_string(),
             })
             .unwrap_or_else(|| "any".to_string());
         Some(Self {
@@ -536,10 +536,11 @@ mod tests {
 
     #[test]
     fn scope_covers_by_interface_and_gates_parse() {
+        // Strings, exactly as `l4.scope.list` emits them over the real bus.
         let e = L4ScopeEntry::from_json(&json!({
             "interface": "lo0", "capability": "inject",
-            "cidr": {"addr": "127.0.0.0", "prefix": 8},
-            "ports": {"lo": 0, "hi": 65535}, "direction": "outbound"
+            "cidr": "127.0.0.0/8",
+            "ports": "0-65535", "direction": "outbound"
         }))
         .unwrap();
         assert!(e.covers_interface("lo0"));

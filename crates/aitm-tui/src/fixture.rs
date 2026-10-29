@@ -664,8 +664,8 @@ impl Fixture {
                 let entry = json!({
                     "interface": args.get("interface").and_then(Value::as_str).unwrap_or("lo0"),
                     "capability": args.get("capability").and_then(Value::as_str).unwrap_or("capture"),
-                    "cidr": args.get("cidr").cloned().unwrap_or(json!({"addr":"127.0.0.0","prefix":8})),
-                    "ports": args.get("ports").cloned().unwrap_or(json!({"lo":0,"hi":65535})),
+                    "cidr": args.get("cidr").cloned().unwrap_or(json!("127.0.0.0/8")),
+                    "ports": args.get("ports").cloned().unwrap_or(json!("0-65535")),
                     "direction": args.get("direction").and_then(Value::as_str).unwrap_or("outbound"),
                 });
                 self.l4_scope.push(entry);
