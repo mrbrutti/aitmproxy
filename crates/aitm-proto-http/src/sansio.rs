@@ -797,8 +797,17 @@ fn encode_message(
             // when we frame by length (or close), drop `Transfer-Encoding`.
             if is_chunked(&headers).unwrap_or(false) {
                 headers.remove("content-length");
+                // Preserve the full coding list (it already ends in `chunked`, per
+                // `is_chunked`); only collapse duplicate `Transfer-Encoding` headers
+                // to the single canonical value, so a transfer-coding such as
+                // `gzip, chunked` is not silently dropped and left framed as plain
+                // chunked over still-compressed bytes.
+                let te = headers
+                    .get("transfer-encoding")
+                    .map(|v| v.trim().to_string())
+                    .unwrap_or_else(|| "chunked".to_string());
                 headers.remove("transfer-encoding");
-                headers.set("Transfer-Encoding", "chunked");
+                headers.set("Transfer-Encoding", &te);
                 (OutFraming::Chunked, None)
             } else {
                 headers.remove("transfer-encoding");
@@ -908,6 +917,26 @@ mod tests {
             te,
             vec![&"transfer-encoding: chunked".to_string()],
             "exactly one Transfer-Encoding: chunked expected, got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn streamed_chunked_egress_preserves_non_chunked_codings() {
+        // `Transfer-Encoding: gzip, chunked` must survive intact when framing a
+        // streamed chunked body: de-chunking does not un-gzip, so collapsing to
+        // bare `chunked` would leave the client framed-plain over gzipped bytes.
+        let h = headers(&[("Transfer-Encoding", "gzip, chunked")]);
+        let mut out = Vec::new();
+        let framing = encode_message("HTTP/1.1 200 OK", &h, &Body::Streamed(StreamBody), &mut out);
+        assert_eq!(framing, OutFraming::Chunked);
+        let te: Vec<_> = header_lines(&out)
+            .into_iter()
+            .filter(|l| l.starts_with("transfer-encoding"))
+            .collect();
+        assert_eq!(
+            te,
+            vec!["transfer-encoding: gzip, chunked".to_string()],
+            "the gzip coding must be preserved, not collapsed to bare chunked"
         );
     }
 

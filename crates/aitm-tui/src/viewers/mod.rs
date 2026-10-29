@@ -152,6 +152,17 @@ pub fn cookies<'a>(theme: &Theme, headers: &[(String, String)], set_cookie: bool
             .map(|(n, val)| (n, val, Vec::new()))
             .collect()
     };
+    // A `Cookie:` header that is present but empty/whitespace-only yields no
+    // pairs; fall back to the same empty-state line rather than drawing a blank
+    // tab (the header-absent case is handled above).
+    if pairs.is_empty() {
+        let empty = if set_cookie {
+            "(no cookies set)"
+        } else {
+            "(no cookies sent)"
+        };
+        return vec![Line::styled(empty, theme.text_tertiary())];
+    }
     let w = pairs
         .iter()
         .map(|(n, _, _)| n.len())
@@ -429,5 +440,20 @@ mod tests {
             render(&cookies(&theme, &headers, true)),
             vec!["(no cookies set)"]
         );
+    }
+
+    #[test]
+    fn present_but_empty_cookie_header_says_so() {
+        // A `Cookie:` header present but empty/whitespace-only yields no pairs;
+        // it must fall back to the empty-state line, not draw a blank tab.
+        let theme = Theme::new(true);
+        for value in ["", "   ", ";", " ; "] {
+            let headers = [hdr("Cookie", value)];
+            assert_eq!(
+                render(&cookies(&theme, &headers, false)),
+                vec!["(no cookies sent)"],
+                "empty Cookie value {value:?} should fall back to the empty-state line"
+            );
+        }
     }
 }

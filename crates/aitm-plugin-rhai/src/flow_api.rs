@@ -396,7 +396,7 @@ impl ScriptHeaders {
         // dropped silently when the host writes the flow back through
         // `HeaderMap::try_set`. Refuse it here with a catchable error so the
         // script learns its header never reached the wire, the way `http.send`
-        // does. Query pairs are not headers and are left to the URL/path checks.
+        // does.
         if matches!(
             side,
             HeaderSide::RequestHeaders | HeaderSide::ResponseHeaders
@@ -414,6 +414,15 @@ impl ScriptHeaders {
                     key.escape_default()
                 )));
             }
+        } else if matches!(side, HeaderSide::RequestQuery) {
+            // A query key/value is concatenated into the live request line
+            // (`path?k=v`) by `join_path_query` with no percent-encoding, so a
+            // CR/LF, space or other control byte would split the request line
+            // exactly as a bad path would (the original C2 smuggling vector was
+            // only closed for the path/url setters). Refuse it here with a
+            // catchable error; an author who needs such a byte percent-encodes it.
+            check_request_target(key)?;
+            check_request_target(value)?;
         }
         self.edit(|pairs| set_pair(pairs, side, key, value))
     }
