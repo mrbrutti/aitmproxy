@@ -305,8 +305,11 @@ async fn run() -> anyhow::Result<()> {
                     );
                 }
                 let listener = TcpListener::bind(settings.listen).await?;
-                let url = web::ui_url(listener.local_addr()?, &settings.token);
-                info!(url = %url, "web UI listening");
+                let bound = listener.local_addr()?;
+                let url = web::ui_url(bound, &settings.token);
+                // Log only the bound address; the token must never reach a
+                // tracing sink. The one-time println is the operator's link.
+                web::log_listening(bound);
                 println!("web UI: {url}");
                 Some((listener, state))
             }

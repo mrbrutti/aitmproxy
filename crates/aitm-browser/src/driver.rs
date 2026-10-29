@@ -211,6 +211,15 @@ impl ChromeDriver {
 
         let (browser, events) = Browser::launch(cdp_config).await?;
         let session = CdpSession::attach(browser, events, config.nav_timeout).await?;
+        // Audit minor a: `Security.setIgnoreCertificateErrors(true)` disables ALL
+        // upstream certificate validation for this Chrome session — it is a
+        // blanket bypass, not one scoped to the proxy CA, so a misissued or
+        // attacker certificate on any upstream is also accepted. It should
+        // default off and be opt-in. The default (`ignore_cert_errors: true`)
+        // lives in `aitm-core::config::BrowserConfig::default` (crate outside
+        // this fix's scope); flipping it to `false` belongs with that type.
+        // Only the obscura engine, which trusts the proxy CA via `--ca-cert`
+        // instead, avoids this bypass entirely.
         if config.ignore_cert_errors {
             session
                 .page

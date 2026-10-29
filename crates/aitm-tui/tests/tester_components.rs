@@ -587,18 +587,20 @@ fn ctrl_k_opens_the_palette_as_the_readme_promises() {
 
 /// §2.7 "Inspector": request tabs Headers · Cookies · Query · Body · Raw ·
 /// Summary · Timing · Connection and response tabs Headers · Set-Cookie ·
-/// Body · Raw · JSON · Hex · Diff, each drawing its viewer (the F5 tabs draw
-/// their follow-up sentence — fix pass 1, I1).
+/// Body · Raw · JSON · Hex · Diff, each drawing its viewer. Cookies and
+/// Set-Cookie parse the served headers live (I17a); only Timing draws its F5
+/// follow-up sentence.
 #[test]
 fn inspector_tabs_draw_their_viewers() {
     assert_eq!(REQUEST_TABS.len(), 8);
     assert_eq!(RESPONSE_TABS.len(), 7);
     let cases: &[(Pane, &str, &str, &[&str])] = &[
         (
+            // f41 sends `cookie: session=9f1c…`: parsed live onto its row.
             Pane::Request,
             "Cookies",
             "f41",
-            &["Cookies need core follow-up F5"],
+            &["session = 9f1c…"],
         ),
         (
             Pane::Request,
@@ -607,10 +609,11 @@ fn inspector_tabs_draw_their_viewers() {
             &["Timing need core follow-up F5"],
         ),
         (
+            // f41's response sets no cookie: the live empty state, not F5.
             Pane::Response,
             "Set-Cookie",
             "f41",
-            &["Set-Cookie need core follow-up F5"],
+            &["(no cookies set)"],
         ),
         (
             Pane::Request,

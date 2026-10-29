@@ -1,7 +1,9 @@
 //! Sans-IO WebSocket frame coder (RFC 6455 framing), mirroring the HTTP split:
 //! the module feeds it bytes from either side and writes out what it queues.
-//! Every decoded message is appended to an internal list so the module can
-//! copy it into `WsFlow.messages` and emit `WsMessage { index }`.
+//! Each decoded message is held just long enough for the driver to copy it into
+//! `WsFlow.messages` and emit `Message { index }`; the buffer is cleared at the
+//! start of the next `on_bytes`, so the coder never retains the whole
+//! conversation (the store owns the durable copy).
 //!
 //! Decoding accepts masked and unmasked frames from either side (a proxy
 //! should see what is on the wire, not be stricter than the endpoints);
@@ -107,12 +109,14 @@ impl WsFrameMachine {
         }
     }
 
-    /// The message appended at `index`.
+    /// The message at `index` within the current batch (the one the latest
+    /// `on_bytes` produced). Indices reset each `on_bytes` call.
     pub fn message(&self, index: usize) -> Option<&WsMessage> {
         self.messages.get(index)
     }
 
-    /// Every message decoded so far, in wire order across both directions.
+    /// The messages decoded by the latest `on_bytes` call (not the whole
+    /// conversation — the coder does not retain past batches).
     pub fn messages(&self) -> &[WsMessage] {
         &self.messages
     }
@@ -161,6 +165,14 @@ impl WsFrameMachine {
 
 impl WsStateMachine for WsFrameMachine {
     fn on_bytes(&mut self, from: Side, buf: &[u8]) -> Result<Vec<WsSansIoEvent>> {
+        // Messages from the previous batch have already been copied into the
+        // store and forwarded by the driver (it drains every event this call
+        // returns before calling `on_bytes` again). Keeping them here would make
+        // `messages` a pure duplicate of `WsFlow.messages` that grows without
+        // bound; drop them so retention is one read-buffer's worth of frames, not
+        // the whole conversation. `Message { index }` indices are therefore
+        // relative to the batch this call produces.
+        self.messages.clear();
         let mut events = Vec::new();
         if !self.opened {
             self.opened = true;

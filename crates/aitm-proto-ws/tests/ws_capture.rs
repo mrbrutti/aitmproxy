@@ -44,6 +44,39 @@ fn masked_client_text_frame_is_decoded() {
 }
 
 #[test]
+fn coder_does_not_retain_every_relayed_message() {
+    // I10: the coder's message buffer is a transient per-batch hand-off, not a
+    // growing duplicate of the store. Relay many single-frame messages, each in
+    // its own `on_bytes` (as the driver does), and the buffer must not grow with
+    // the conversation.
+    let mut m = WsFrameMachine::new();
+    const N: usize = 200;
+    for i in 0..N {
+        let frame = masked_text_frame(format!("m{i}").as_bytes(), [1, 2, 3, 4]);
+        let events = m.on_bytes(Side::Client, &frame).unwrap();
+        // Exactly one message is produced per batch; the driver reads it here.
+        let idx = events
+            .iter()
+            .find_map(|e| match e {
+                WsSansIoEvent::Message { index } => Some(*index),
+                _ => None,
+            })
+            .expect("a message event");
+        assert_eq!(m.message(idx).unwrap().data, format!("m{i}").into_bytes());
+    }
+    assert!(
+        m.messages().len() < N,
+        "coder retained {} of {N} relayed messages (should hold only the last batch)",
+        m.messages().len()
+    );
+    assert_eq!(
+        m.messages().len(),
+        1,
+        "only the latest batch's single message should remain"
+    );
+}
+
+#[test]
 fn frame_split_across_reads_is_decoded_once_complete() {
     let mut m = WsFrameMachine::new();
     let frame = masked_text_frame(b"split", [9, 9, 9, 9]);

@@ -222,10 +222,6 @@ pub struct L4Module {
     sessions: Arc<InterceptSessions>,
     /// The cached startup capability probe: wire verbs are gated on it, fail-closed.
     privilege: L4Privilege,
-    /// Whether a runtime bus caller may widen the deny-by-default scope via
-    /// `l4.scope.add`. Comes from `L4Config::allow_agent_widen` (default false);
-    /// handed to [`ScopeAdd`](crate::commands::ScopeAdd) at registration.
-    allow_agent_widen: bool,
 }
 
 impl L4Module {
@@ -248,7 +244,6 @@ impl L4Module {
             intercept_cfg: cfg.intercept.clone(),
             sessions: Arc::new(InterceptSessions::new()),
             privilege,
-            allow_agent_widen: cfg.allow_agent_widen,
         }
     }
 
@@ -268,9 +263,6 @@ impl L4Module {
             intercept_cfg,
             sessions: Arc::new(InterceptSessions::new()),
             privilege: L4Privilege::available(),
-            // Deny-by-default: a parts-wired module keeps runtime scope widening off
-            // unless the owner opts in via the config path (`with_privilege`).
-            allow_agent_widen: false,
         }
     }
 
@@ -295,9 +287,7 @@ impl Plugin for L4Module {
     fn load(&mut self, reg: &mut Registry) {
         // The pure/read verbs (`l4.interfaces`, `l4.scope.*`, `l4.flow.*`, `l4.craft`)
         // work regardless of privilege — never gated.
-        for cmd in
-            crate::commands::active_commands(self.guard(), self.store(), self.allow_agent_widen)
-        {
+        for cmd in crate::commands::active_commands(self.guard(), self.store()) {
             reg.add_command(cmd);
         }
         // M5 Task 10 — the wire-touching commands (`l4.capture.*`, `l4.inject`,

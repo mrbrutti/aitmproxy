@@ -245,10 +245,16 @@ async fn serve_connection(
 /// configured) wins and yields [`Frontend::Operator`], the agent token yields
 /// [`Frontend::Mcp`], and anything else (malformed, or an unknown token) is
 /// `None` — the caller refuses it `-32001`. Tokens are compared in constant time.
+/// The object must carry exactly the `token` key (extra keys are rejected,
+/// matching the web bridge's `token_line_matches`), so nothing can ride along
+/// with the auth line.
 fn classify_token(line: &str, agent: &str, operator: Option<&str>) -> Option<Frontend> {
     let Ok(JsonValue::Object(obj)) = serde_json::from_str::<JsonValue>(line.trim()) else {
         return None;
     };
+    if obj.len() != 1 {
+        return None;
+    }
     let Some(JsonValue::String(given)) = obj.get("token") else {
         return None;
     };
@@ -314,6 +320,13 @@ mod tests {
         assert_eq!(classify_token(r#"{"token":"x"}"#, "t", None), None);
         assert_eq!(classify_token(r#"{"tok":"t"}"#, "t", None), None);
         assert_eq!(classify_token(r#"{"token":1}"#, "t", None), None);
+        // Minor (b): exactly one key — a correct token can't smuggle extra keys.
+        assert_eq!(classify_token(r#"{"token":"t","x":1}"#, "t", None), None);
+        assert_eq!(
+            classify_token(r#"{"token":"t","token2":"t"}"#, "t", None),
+            None
+        );
+        assert_eq!(classify_token(r#"{}"#, "t", None), None);
         assert_eq!(classify_token(r#"["t"]"#, "t", None), None);
         assert_eq!(classify_token("t", "t", None), None);
         assert_eq!(

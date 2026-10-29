@@ -122,6 +122,102 @@ pub fn headers<'a>(theme: &Theme, headers: &'a [(String, String)]) -> Vec<Line<'
         .collect()
 }
 
+/// Cookies parsed from the served headers (§2.7). `set_cookie` picks the
+/// response `Set-Cookie:` headers (one cookie each, with attributes) over the
+/// request `Cookie:` headers (`a=1; b=2` pairs). Values keep their encoding —
+/// the table shows them as sent. Mirrors the web `cookies.ts` / `CookieTable`.
+pub fn cookies<'a>(theme: &Theme, headers: &[(String, String)], set_cookie: bool) -> Vec<Line<'a>> {
+    let wanted = if set_cookie { "set-cookie" } else { "cookie" };
+    // The empty-state line, shown both when no Cookie/Set-Cookie header is present
+    // and when a present header carries no parsable pairs.
+    let empty_state = || {
+        let msg = if set_cookie {
+            "(no cookies set)"
+        } else {
+            "(no cookies sent)"
+        };
+        vec![Line::styled(msg, theme.text_tertiary())]
+    };
+    let matching: Vec<&str> = headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case(wanted))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    if matching.is_empty() {
+        return empty_state();
+    }
+    // name=value pairs: one per Set-Cookie header, or every `;`-separated pair
+    // across the request's Cookie headers.
+    let pairs: Vec<(String, String, Vec<String>)> = if set_cookie {
+        matching.iter().map(|v| parse_set_cookie(v)).collect()
+    } else {
+        matching
+            .iter()
+            .flat_map(|v| parse_cookie_pairs(v))
+            .map(|(n, val)| (n, val, Vec::new()))
+            .collect()
+    };
+    // A `Cookie:` header that is present but empty/whitespace-only yields no
+    // pairs; fall back to the same empty-state line rather than drawing a blank
+    // tab (the header-absent case is handled above).
+    if pairs.is_empty() {
+        return empty_state();
+    }
+    let w = pairs
+        .iter()
+        .map(|(n, _, _)| n.len())
+        .max()
+        .unwrap_or(0)
+        .min(32);
+    pairs
+        .into_iter()
+        .map(|(name, val, attrs)| {
+            let mut spans = vec![
+                Span::styled(format!("{name:<w$}"), theme.syntax_key()),
+                Span::styled(" = ", theme.syntax_punct()),
+                Span::styled(val, theme.syntax_string()),
+            ];
+            if !attrs.is_empty() {
+                spans.push(Span::styled(
+                    format!("  · {}", attrs.join(" · ")),
+                    theme.text_tertiary(),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// `a=1; b=2` → name/value pairs. A pair with no `=` is a bare name.
+fn parse_cookie_pairs(value: &str) -> Vec<(String, String)> {
+    value
+        .split(';')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| match p.split_once('=') {
+            Some((n, v)) => (n.trim().to_string(), v.trim().to_string()),
+            None => (p.to_string(), String::new()),
+        })
+        .collect()
+}
+
+/// `session=abc; Path=/; HttpOnly` → (name, value, attributes). Attributes
+/// keep their `name=value` or bare-name form.
+fn parse_set_cookie(value: &str) -> (String, String, Vec<String>) {
+    let mut parts = value.split(';');
+    let first = parts.next().unwrap_or("").trim();
+    let (name, val) = match first.split_once('=') {
+        Some((n, v)) => (n.trim().to_string(), v.trim().to_string()),
+        None => (first.to_string(), String::new()),
+    };
+    let attrs = parts
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    (name, val, attrs)
+}
+
 /// Two-column `key  value` facts (Summary / Connection tabs).
 pub fn facts<'a>(theme: &Theme, rows: &[(&'a str, String)]) -> Vec<Line<'a>> {
     let w = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -284,4 +380,80 @@ fn with_truncated<'a>(theme: &Theme, mut lines: Vec<Line<'a>>, truncated: bool) 
         );
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The plain text of one rendered line (span contents joined).
+    fn text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn render(lines: &[Line]) -> Vec<String> {
+        lines.iter().map(text).collect()
+    }
+
+    fn hdr(name: &str, value: &str) -> (String, String) {
+        (name.to_string(), value.to_string())
+    }
+
+    #[test]
+    fn request_cookies_split_pairs_bound_to_their_names() {
+        let theme = Theme::new(true);
+        let headers = [
+            hdr("Host", "shop.test"),
+            hdr("Cookie", "session=9f1c; theme=dark"),
+        ];
+        let lines = render(&cookies(&theme, &headers, false));
+        assert_eq!(lines, vec!["session = 9f1c", "theme   = dark"]);
+    }
+
+    #[test]
+    fn set_cookie_keeps_value_and_attributes_on_its_row() {
+        let theme = Theme::new(true);
+        let headers = [
+            hdr("Content-Type", "application/json"),
+            hdr("Set-Cookie", "session=abc; Path=/; HttpOnly; SameSite=Lax"),
+            hdr("set-cookie", "csrf=xyz"),
+        ];
+        let lines = render(&cookies(&theme, &headers, true));
+        assert_eq!(
+            lines,
+            vec![
+                "session = abc  · Path=/ · HttpOnly · SameSite=Lax",
+                "csrf    = xyz",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_cookie_headers_say_so() {
+        let theme = Theme::new(true);
+        let headers = [hdr("Host", "shop.test")];
+        assert_eq!(
+            render(&cookies(&theme, &headers, false)),
+            vec!["(no cookies sent)"]
+        );
+        assert_eq!(
+            render(&cookies(&theme, &headers, true)),
+            vec!["(no cookies set)"]
+        );
+    }
+
+    #[test]
+    fn present_but_empty_cookie_header_says_so() {
+        // A `Cookie:` header present but empty/whitespace-only yields no pairs;
+        // it must fall back to the empty-state line, not draw a blank tab.
+        let theme = Theme::new(true);
+        for value in ["", "   ", ";", " ; "] {
+            let headers = [hdr("Cookie", value)];
+            assert_eq!(
+                render(&cookies(&theme, &headers, false)),
+                vec!["(no cookies sent)"],
+                "empty Cookie value {value:?} should fall back to the empty-state line"
+            );
+        }
+    }
 }

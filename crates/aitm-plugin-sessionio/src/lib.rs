@@ -23,6 +23,7 @@ pub mod har;
 pub mod mitmproxy;
 pub mod native;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aitm_core::{
@@ -32,6 +33,12 @@ use aitm_core::{
 use anyhow::Context;
 
 use native::{from_doc, to_doc, SessionDoc, SCHEMA};
+
+/// Default cap on a single session/flow document read from a host path. A file
+/// larger than this is refused before it is read, so a hostile document cannot
+/// force an unbounded allocation. Generous (1 GiB) so real sessions load; the
+/// operator can lower it via [`SessionIoPlugin::with_max_doc_bytes`].
+const DEFAULT_MAX_DOC_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// A serialization format for `flow.export`/`flow.import`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,22 +51,55 @@ enum Format {
     Mitmproxy,
 }
 
-/// Registers `session.save`, `session.load`, `flow.export`, `flow.import`.
-/// Observes no events — serialization is a pure view over the store.
-pub struct SessionIoPlugin {
+/// The file-I/O policy every session/flow command shares: the agent gate, the
+/// optional confinement root, and the read-size cap. Cloned into each command at
+/// `load`.
+#[derive(Clone)]
+struct FileIo {
     /// Whether an agent (MCP) frontend may hand these commands a host path.
     /// Off by default; see [`aitm_core::SessionIoConfig::allow_agent_file_io`].
     allow_agent_file_io: bool,
+    /// When set, every path argument must resolve under this directory (traversal
+    /// and absolute escapes are refused). `None` (the default) imposes no
+    /// confinement — the human CLI keeps full path access, as before.
+    session_root: Option<PathBuf>,
+    /// Cap on a document read from a host path; a larger file is refused before it
+    /// is read (DoS guard).
+    max_doc_bytes: u64,
+}
+
+/// Registers `session.save`, `session.load`, `flow.export`, `flow.import`.
+/// Observes no events — serialization is a pure view over the store.
+pub struct SessionIoPlugin {
+    io: FileIo,
 }
 
 impl SessionIoPlugin {
     /// Build the plugin with the agent file-I/O gate. `allow_agent_file_io` (off at
-    /// the call site by default) lets an agent frontend read/write a host path;
-    /// `Config.session_io` wires it in Task 14's additive-config pattern.
+    /// the call site by default) lets an agent frontend read/write a host path.
+    /// Confinement is off and the read cap is [`DEFAULT_MAX_DOC_BYTES`]; use
+    /// [`Self::with_session_root`] / [`Self::with_max_doc_bytes`] to tighten them.
     pub fn new(allow_agent_file_io: bool) -> Self {
         Self {
-            allow_agent_file_io,
+            io: FileIo {
+                allow_agent_file_io,
+                session_root: None,
+                max_doc_bytes: DEFAULT_MAX_DOC_BYTES,
+            },
         }
+    }
+
+    /// Confine every path argument under `root` (traversal/absolute escapes are
+    /// refused). `None` keeps the default of no confinement.
+    pub fn with_session_root(mut self, root: Option<PathBuf>) -> Self {
+        self.io.session_root = root;
+        self
+    }
+
+    /// Set the maximum size of a document read from a host path.
+    pub fn with_max_doc_bytes(mut self, max: u64) -> Self {
+        self.io.max_doc_bytes = max;
+        self
     }
 }
 
@@ -75,18 +115,17 @@ impl Plugin for SessionIoPlugin {
     }
 
     fn load(&mut self, reg: &mut Registry) {
-        let gate = self.allow_agent_file_io;
         reg.add_command(Arc::new(SessionSave {
-            allow_agent_file_io: gate,
+            io: self.io.clone(),
         }));
         reg.add_command(Arc::new(SessionLoad {
-            allow_agent_file_io: gate,
+            io: self.io.clone(),
         }));
         reg.add_command(Arc::new(FlowExport {
-            allow_agent_file_io: gate,
+            io: self.io.clone(),
         }));
         reg.add_command(Arc::new(FlowImport {
-            allow_agent_file_io: gate,
+            io: self.io.clone(),
         }));
     }
 }
@@ -104,6 +143,64 @@ fn check_file_io_gate(host: &CommandHost, allow_agent_file_io: bool) -> anyhow::
         );
     }
     Ok(())
+}
+
+/// Confine `path` under the configured session root. With no root (the default)
+/// the path is returned unchanged — the human CLI keeps full access. With a root,
+/// the path must resolve under it (the canonicalize + `starts_with` pattern Map
+/// Local uses), extended to confine a not-yet-existing write target by its parent
+/// directory. A traversal (`..`) or absolute path that escapes the root is refused.
+fn confine_path(io: &FileIo, path: &str) -> anyhow::Result<PathBuf> {
+    let Some(root) = io.session_root.as_deref() else {
+        return Ok(PathBuf::from(path));
+    };
+    let root = root.canonicalize().map_err(|err| {
+        anyhow::anyhow!("session root {} is not accessible: {err}", root.display())
+    })?;
+    // `join` with an absolute `path` replaces `root`; the prefix check below then
+    // rejects it, so an absolute escaping path is refused too.
+    let candidate = root.join(path);
+    let resolved = match candidate.canonicalize() {
+        // An existing file (reads, or an overwrite): resolve it directly.
+        Ok(resolved) => resolved,
+        // A not-yet-existing write target: confine its parent directory, then
+        // re-attach the final component (the parent must exist to write into).
+        Err(_) => {
+            let parent = candidate
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("path {path:?} has no parent directory"))?;
+            let file = candidate
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("path {path:?} has no file name"))?;
+            parent
+                .canonicalize()
+                .map_err(|err| {
+                    anyhow::anyhow!("path {path:?} parent directory is not accessible: {err}")
+                })?
+                .join(file)
+        }
+    };
+    if !resolved.starts_with(&root) {
+        anyhow::bail!("path {path:?} escapes the session root {}", root.display());
+    }
+    Ok(resolved)
+}
+
+/// Read a document from a confined path, refusing a file over the configured cap
+/// before reading it (stat, then read) so a hostile document cannot force an
+/// unbounded allocation.
+fn read_capped(io: &FileIo, path: &Path) -> anyhow::Result<Vec<u8>> {
+    let len = std::fs::metadata(path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .len();
+    if len > io.max_doc_bytes {
+        anyhow::bail!(
+            "document {} is {len} bytes, over the {}-byte limit",
+            path.display(),
+            io.max_doc_bytes
+        );
+    }
+    std::fs::read(path).with_context(|| format!("reading {}", path.display()))
 }
 
 /// The requested format, defaulting to native `aitm` when omitted.
@@ -220,7 +317,7 @@ fn path_param() -> ParamDef {
 
 /// `session.save {path}` → write the whole store to `path` as native JSON.
 struct SessionSave {
-    allow_agent_file_io: bool,
+    io: FileIo,
 }
 
 impl Command for SessionSave {
@@ -252,11 +349,13 @@ impl Command for SessionSave {
 
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         // Always writes a host path, so the agent gate always applies.
-        check_file_io_gate(host, self.allow_agent_file_io)?;
+        check_file_io_gate(host, self.io.allow_agent_file_io)?;
         let path = args.get_str("path")?.to_string();
+        let target = confine_path(&self.io, &path)?;
         let flows = collect_flows(host, None)?;
         let bytes = encode_native(&flows)?;
-        std::fs::write(&path, &bytes).with_context(|| format!("writing session to {path}"))?;
+        std::fs::write(&target, &bytes)
+            .with_context(|| format!("writing session to {}", target.display()))?;
         Ok(object([
             ("flows", Value::Int(flows.len() as i64)),
             ("path", Value::Str(path)),
@@ -266,7 +365,7 @@ impl Command for SessionSave {
 
 /// `session.load {path}` → replace the store with the flows in `path`.
 struct SessionLoad {
-    allow_agent_file_io: bool,
+    io: FileIo,
 }
 
 impl Command for SessionLoad {
@@ -291,9 +390,10 @@ impl Command for SessionLoad {
 
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         // Always reads a host path, so the agent gate always applies.
-        check_file_io_gate(host, self.allow_agent_file_io)?;
+        check_file_io_gate(host, self.io.allow_agent_file_io)?;
         let path = args.get_str("path")?;
-        let bytes = std::fs::read(path).with_context(|| format!("reading session from {path}"))?;
+        let target = confine_path(&self.io, path)?;
+        let bytes = read_capped(&self.io, &target)?;
         let doc = parse_native(&bytes)?;
         let flows = from_doc(&doc);
         let store = host.store();
@@ -311,7 +411,7 @@ impl Command for SessionLoad {
 
 /// `flow.export {ids?, format?, path?}` → serialize selected flows (or all).
 struct FlowExport {
-    allow_agent_file_io: bool,
+    io: FileIo,
 }
 
 impl Command for FlowExport {
@@ -377,9 +477,10 @@ impl Command for FlowExport {
             Some(Value::Str(path)) => {
                 // Writing a host path: gate an agent. Exporting without a `path`
                 // (returns bytes) stays allowed for any frontend — it is passive.
-                check_file_io_gate(host, self.allow_agent_file_io)?;
-                std::fs::write(path, &bytes)
-                    .with_context(|| format!("writing export to {path}"))?;
+                check_file_io_gate(host, self.io.allow_agent_file_io)?;
+                let target = confine_path(&self.io, path)?;
+                std::fs::write(&target, &bytes)
+                    .with_context(|| format!("writing export to {}", target.display()))?;
                 Ok(object([
                     ("path", Value::Str(path.clone())),
                     ("flows", count),
@@ -395,7 +496,7 @@ impl Command for FlowExport {
 
 /// `flow.import {path?, bytes?, format?}` → insert flows from a document. Passive.
 struct FlowImport {
-    allow_agent_file_io: bool,
+    io: FileIo,
 }
 
 impl Command for FlowImport {
@@ -446,8 +547,9 @@ impl Command for FlowImport {
             (_, Some(Value::Str(path))) => {
                 // Reading a host path: gate an agent. Importing from `bytes`
                 // (checked first above) stays allowed for any frontend — passive.
-                check_file_io_gate(host, self.allow_agent_file_io)?;
-                std::fs::read(path).with_context(|| format!("reading import from {path}"))?
+                check_file_io_gate(host, self.io.allow_agent_file_io)?;
+                let target = confine_path(&self.io, path)?;
+                read_capped(&self.io, &target)?
             }
             _ => anyhow::bail!("flow.import needs `bytes` or `path`"),
         };

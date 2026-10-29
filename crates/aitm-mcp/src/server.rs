@@ -1131,12 +1131,11 @@ impl McpServer {
     ) -> Result<JsonValue, RpcError> {
         match method {
             "initialize" => {
-                let version = params
-                    .get("protocolVersion")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or(PROTOCOL_VERSION);
+                // Answer with the version we speak rather than echoing the
+                // client's requested `protocolVersion` unchecked; a client that
+                // needs a different version sees the one we support.
                 Ok(json!({
-                    "protocolVersion": version,
+                    "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "aitmproxy", "version": aitm_core::VERSION},
                 }))
@@ -1275,7 +1274,12 @@ impl McpServer {
         };
         let args = match params_from_json(arguments, &cmd.schema(), name) {
             Ok(args) => args,
-            Err(e) => return ToolOutcome::Done(tool_error(e.to_string())),
+            // Invalid arguments are a protocol error (per MCP), the same
+            // INVALID_PARAMS envelope as the `unknown tool` / missing-`name` /
+            // non-object `arguments` checks above — not a tool result, because the
+            // command never ran (I16: one envelope for the whole arg-validation
+            // class, expressed here in main's `ToolOutcome` return type).
+            Err(e) => return ToolOutcome::Rpc(RpcError::new(INVALID_PARAMS, e.to_string())),
         };
         // D4 operator confirm-over-the-wire handshake. Only the operator role is
         // offered it; the agent is never handed a handshake — its confirm-gated

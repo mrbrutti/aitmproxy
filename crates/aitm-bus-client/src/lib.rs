@@ -287,11 +287,16 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         match reader.read_until(b'\n', &mut buf).await {
             Ok(0) => break "server closed the connection".to_string(),
             Ok(_) => {
-                if buf.last() != Some(&b'\n') && buf.len() > MAX_LINE_BYTES {
-                    break "reply line over 64 MiB".to_string();
+                if buf.last() != Some(&b'\n') {
+                    // No terminating newline: either the line blew the cap, or
+                    // the server hung up mid-line. Neither is a complete reply,
+                    // so the partial buffer is dropped and the connection
+                    // closes — a half-written line must not reach a waiter.
+                    if buf.len() > MAX_LINE_BYTES {
+                        break "reply line over 64 MiB".to_string();
+                    }
+                    break "server closed the connection mid-line".to_string();
                 }
-                // No trailing newline with room to spare is EOF mid-line: the
-                // partial line is handled and the next read reports the close.
                 let line = String::from_utf8_lossy(&buf).trim().to_string();
                 if line.is_empty() {
                     continue;
@@ -673,6 +678,36 @@ mod tests {
         assert!(matches!(
             pending.lock().unwrap().closed,
             Some(Closed::Gone(ref why)) if why == "server closed the connection"
+        ));
+    }
+
+    /// Minor (c): a complete-looking JSON reply with no terminating newline at
+    /// EOF is NOT dispatched — the connection closes as Gone and the waiter is
+    /// dropped, never handed the half-delivered line.
+    #[tokio::test]
+    async fn a_partial_line_at_eof_is_not_dispatched() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let (tx, mut rx) = oneshot::channel();
+        pending.lock().unwrap().waiters.insert("1".into(), tx);
+        let (client_end, mut server_end) = tokio::io::duplex(64 * 1024);
+        let (notify, _) = broadcast::channel(4);
+        let reader = tokio::spawn(read_loop(client_end, pending.clone(), notify));
+        tokio::spawn(async move {
+            // A syntactically complete reply, but the server dies before the
+            // newline; dropping `server_end` is EOF mid-line.
+            let _ = server_end
+                .write_all(br#"{"jsonrpc":"2.0","id":1,"result":"x"}"#)
+                .await;
+        });
+        reader.await.expect("read_loop ends on EOF");
+        // The waiter's sender was dropped by `close`, not completed with a line.
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        assert!(matches!(
+            pending.lock().unwrap().closed,
+            Some(Closed::Gone(ref why)) if why == "server closed the connection mid-line"
         ));
     }
 }

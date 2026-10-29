@@ -31,12 +31,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use etherparse::{NetSlice, SlicedPacket, TransportSlice};
+use etherparse::{NetSlice, TransportSlice};
 
 use crate::backend::{CaptureInjectBackend, L4Error};
 use crate::craft::PacketSpec;
 use crate::flow::{L4Bind, L4Flow, L4FlowId, L4FlowKind, L4FlowStore, L4Meta, L4Packet};
-use crate::guard::L4Guard;
+use crate::guard::{L4Guard, L4GuardError};
 use crate::types::{L4Action, L4Direction, L4Proto, L4Target};
 use crate::wire::send_on_wire;
 
@@ -127,19 +127,41 @@ pub fn send_recv(
         .build()
         .map_err(|e| L4Error::WireWrite(format!("stimulus craft failed: {e}")))?;
 
+    // C3: the guard must gate the destination actually put on the wire, not the
+    // `spec.dst` field. The crafted stimulus carries its own IP layer and the kernel
+    // routes by the packet's headers, so resolve the real target from the built bytes
+    // (as the intercept-forward path does via `ip_target`) and refuse a stimulus whose
+    // destination (or port) contradicts `spec.dst`/`spec.dst_port`, or that carries no
+    // decodable IP destination — the latter cannot be proven in scope (deny-by-default).
+    let real_target = crate::capture::packet_target(&bytes, &spec.interface, L4Direction::Outbound)
+        .ok_or_else(|| {
+            L4Error::Guard(L4GuardError::OutOfL4Scope(
+                "crafted stimulus has no decodable IP destination; cannot verify scope".into(),
+            ))
+        })?;
+    if real_target.dst != Some(spec.dst) {
+        return Err(L4Error::Guard(L4GuardError::OutOfL4Scope(
+            real_target
+                .dst
+                .map_or_else(|| spec.dst.to_string(), |d| d.to_string()),
+        )));
+    }
+    if let Some(p) = spec.dst_port {
+        if real_target.dst_port != Some(p) {
+            return Err(L4Error::Guard(L4GuardError::OutOfL4Scope(format!(
+                "{} (stimulus port {:?} ≠ declared {p})",
+                spec.dst, real_target.dst_port
+            ))));
+        }
+    }
+
     // (1) Authorization precedes any I/O. `Inject` (scope + denylist + rate) to
-    // send, then `Capture` on the interface to receive — deny-by-default refuses
-    // here, before the capture opens or a byte reaches the wire. Both permits are
-    // held for the operation's lifetime (moved into the worker thread).
+    // send, checked against the packet's *real* target, then `Capture` on the
+    // interface to receive — deny-by-default refuses here, before the capture opens or
+    // a byte reaches the wire. Both permits are held for the operation's lifetime
+    // (moved into the worker thread).
     let stimulus_proto = spec.packet.transport_proto();
-    let inject_target = L4Target {
-        interface: spec.interface.clone(),
-        direction: L4Direction::Outbound,
-        dst: Some(spec.dst),
-        dst_port: spec.dst_port,
-        proto: stimulus_proto,
-    };
-    let inject_permit = guard.check(L4Action::Inject, &inject_target)?;
+    let inject_permit = guard.check(L4Action::Inject, &real_target)?;
 
     // A send-and-receive observes the reply arriving on the interface; the bind
     // carries no single destination (mirrors `start_capture`), so the `Capture`
@@ -354,7 +376,7 @@ struct ReplyInfo {
 /// Mirrors the link-layer probing in the capture task (our crafted frames start at
 /// L3; a NIC delivers L2 Ethernet; BSD loopback prepends a 4-byte AF word).
 fn decode_reply(frame: &[u8]) -> Option<ReplyInfo> {
-    let parsed = parse_any(frame)?;
+    let parsed = crate::craft::parse_frame(frame)?;
     let src = match parsed.net? {
         NetSlice::Ipv4(ip) => IpAddr::V4(ip.header().source_addr()),
         NetSlice::Ipv6(ip) => IpAddr::V6(ip.header().source_addr()),
@@ -373,34 +395,6 @@ fn decode_reply(frame: &[u8]) -> Option<ReplyInfo> {
         proto,
         tcp_rst,
     })
-}
-
-/// Parse a frame whose link layer is not known in advance — L3 IP, L2 Ethernet,
-/// or a 4-byte BSD-loopback AF word before the IP header — and keep the first form
-/// that yields a network layer.
-fn parse_any(frame: &[u8]) -> Option<SlicedPacket<'_>> {
-    let is_ip_nibble = |b: u8| matches!(b >> 4, 4 | 6);
-
-    if frame.first().copied().is_some_and(is_ip_nibble) {
-        if let Ok(p) = SlicedPacket::from_ip(frame) {
-            if p.net.is_some() {
-                return Some(p);
-            }
-        }
-    }
-    if let Ok(p) = SlicedPacket::from_ethernet(frame) {
-        if p.net.is_some() {
-            return Some(p);
-        }
-    }
-    if frame.len() > 4 && is_ip_nibble(frame[4]) {
-        if let Ok(p) = SlicedPacket::from_ip(&frame[4..]) {
-            if p.net.is_some() {
-                return Some(p);
-            }
-        }
-    }
-    None
 }
 
 /// Build the flow record for a frame: its direction, a structural decode, and
@@ -733,6 +727,35 @@ mod tests {
             "the one recorded packet is the injected stimulus"
         );
         assert_eq!(g.in_flight(), 0, "both permits released");
+    }
+
+    /// C3 (security): a stimulus whose crafted IP destination is a denylisted host,
+    /// sent with an in-scope `spec.dst`, is refused — the guard gates the packet's real
+    /// destination, not the `dst` field. Nothing reaches the wire.
+    #[test]
+    fn send_recv_spec_dst_overrides_param_is_refused() {
+        let g = send_recv_guard(); // Inject+Capture scoped to 127.0.0.1/32.
+        let backend = MockBackend::with_replies(vec![]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+
+        // The stimulus crafts a packet to the cloud-metadata denylist address while
+        // declaring the in-scope `dst = 127.0.0.1` to satisfy the destination param.
+        let spec = SendRecvSpec {
+            packet: udp_packet("169.254.169.254", 9, b"probe"),
+            dst: "127.0.0.1".parse().unwrap(),
+            dst_port: Some(9),
+            interface: IFACE.to_string(),
+            timeout: Duration::from_secs(1),
+            expect: ReplyMatch::FiveTuple,
+        };
+
+        let err = send_recv(&g, backend.clone(), store, spec).unwrap_err();
+        assert!(
+            matches!(err, L4Error::Guard(L4GuardError::OutOfL4Scope(_))),
+            "a stimulus dst that contradicts the param must be refused, got {err:?}"
+        );
+        assert!(backend.injected().is_empty(), "nothing reached the wire");
+        assert_eq!(g.in_flight(), 0, "no permit leaks on a refused send_recv");
     }
 
     /// AC1 deny-by-default: an empty scope refuses send_recv with `OutOfL4Scope`

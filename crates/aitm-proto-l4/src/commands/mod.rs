@@ -344,11 +344,10 @@ fn scope_entry_fields() -> Vec<aitm_core::ParamDef> {
 pub(crate) fn active_commands(
     guard: Arc<crate::guard::L4Guard>,
     store: Arc<dyn crate::flow::L4FlowStore>,
-    allow_agent_widen: bool,
 ) -> Vec<Arc<dyn Command>> {
     vec![
         Arc::new(L4Interfaces),
-        Arc::new(ScopeAdd::new(guard.clone(), allow_agent_widen)),
+        Arc::new(ScopeAdd::new(guard.clone())),
         Arc::new(ScopeRemove::new(guard.clone())),
         Arc::new(ScopeList::new(guard)),
         Arc::new(FlowList::new(store.clone())),

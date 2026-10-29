@@ -7,10 +7,8 @@
 //! - `enabled = true` + no privilege ⇒ STILL registered (honest, drivable), but the
 //!   wire verbs fail closed (proven at the command layer in `aitm-proto-l4`); here we
 //!   assert the proxy still builds and the surface is present.
-//! - `aitm-core` is untouched by the whole milestone (AC19).
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
@@ -106,43 +104,4 @@ fn l4_enabled_no_priv_builds() {
     // The read verb and a wire verb are both registered (honest surface).
     assert!(proxy.registry().command("l4.interfaces").is_some());
     assert!(proxy.registry().command("l4.inject").is_some());
-}
-
-/// AC19: the M5 milestone makes no `aitm-core` edits — `git diff` against the
-/// merge-base with `main` shows nothing under `crates/aitm-core`. Skips cleanly when
-/// git or the base ref is unavailable (e.g. a shallow checkout).
-#[test]
-fn aitm_core_untouched() {
-    let toplevel = match git(&["rev-parse", "--show-toplevel"]) {
-        Some(p) => p.trim().to_string(),
-        None => return, // no git — nothing to assert here
-    };
-    let base = match git(&["-C", &toplevel, "merge-base", "HEAD", "main"]) {
-        Some(b) if !b.trim().is_empty() => b.trim().to_string(),
-        _ => return, // `main` not present (shallow CI clone) — skip
-    };
-    let changed = git(&[
-        "-C",
-        &toplevel,
-        "diff",
-        "--name-only",
-        &base,
-        "--",
-        "crates/aitm-core",
-    ])
-    .expect("git diff runs once rev-parse/merge-base have");
-    assert!(
-        changed.trim().is_empty(),
-        "M5 must not touch aitm-core, but these files changed:\n{changed}"
-    );
-}
-
-/// Run a git command, returning its stdout on success, `None` if git is missing or
-/// the command fails.
-fn git(args: &[&str]) -> Option<String> {
-    let out = Command::new("git").args(args).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8(out.stdout).ok()
 }

@@ -74,6 +74,46 @@ fn scope_add_then_list() {
     assert_eq!(listed, Value::Array(vec![Value::Str("ex.test".into())]));
 }
 
+/// Audit minor: `scope.add` validates the host before widening, mirroring the Rhai
+/// `scope.add` verb. An empty or malformed entry is refused and never reaches the
+/// guard; a `*.wildcard` and a `host:port` are accepted.
+#[test]
+fn scope_add_rejects_malformed_host() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(ScopePlugin::new(true)));
+    let store = Arc::new(MemFlowStore::new());
+    let guard = Arc::new(StdGuard::default());
+    let client = pipe(&store, &guard);
+    let host = CommandHost::new(store.as_ref(), &client, guard.as_ref(), None);
+
+    for bad in ["", "   ", "has space", "ex.test/path", "ex.test:notaport"] {
+        let err = reg
+            .command("scope.add")
+            .unwrap()
+            .invoke(params(&[("host", Value::Str(bad.into()))]), &host)
+            .expect_err("a malformed scope entry must be refused");
+        assert!(
+            err.to_string().contains("is not a host"),
+            "the refusal names the validation failure for {bad:?}: {err}"
+        );
+    }
+    // Nothing malformed widened the scope.
+    let listed = reg
+        .command("scope.list")
+        .unwrap()
+        .invoke(Params::default(), &host)
+        .unwrap();
+    assert_eq!(listed, Value::Array(vec![]), "no bad entry was added");
+
+    // Well-formed entries (wildcard, host:port) are accepted.
+    for good in ["*.ex.test", "api.test:8443"] {
+        reg.command("scope.add")
+            .unwrap()
+            .invoke(params(&[("host", Value::Str(good.into()))]), &host)
+            .unwrap_or_else(|e| panic!("{good:?} should be accepted: {e}"));
+    }
+}
+
 #[test]
 fn scope_remove_narrows_scope() {
     let mut reg = Registry::new();

@@ -15,6 +15,7 @@ use aitm_core::{
     Sensitivity, StdGuard, TypeDesc, Value,
 };
 use aitm_mcp::json::{from_json, to_json};
+use aitm_mcp::server::{INVALID_PARAMS, PROTOCOL_VERSION};
 use aitm_mcp::transport::LoopbackTcp;
 use aitm_mcp::{ConnCtx, McpSchemaDerive, McpServer, StdSchemaDerive};
 use aitm_plugins::AgentPlugin;
@@ -476,6 +477,21 @@ fn initialize_handshake() {
     assert_eq!(rpc(&srv, 2, "ping", json!({}))["result"], json!({}));
 }
 
+/// Minor (a): `initialize` answers with the server's own `PROTOCOL_VERSION`,
+/// not whatever version the client asked for.
+#[test]
+fn initialize_pins_the_server_protocol_version() {
+    let srv = server();
+    let resp = rpc(
+        &srv,
+        1,
+        "initialize",
+        json!({"protocolVersion": "1999-01-01"}),
+    );
+    assert_eq!(resp["result"]["protocolVersion"], PROTOCOL_VERSION);
+    assert_ne!(resp["result"]["protocolVersion"], "1999-01-01");
+}
+
 /// AC7-shaped: `tools/list` is exactly the registered command set (plugin
 /// commands included). The exact 18-tool M1 set is asserted at integration.
 #[test]
@@ -579,18 +595,21 @@ fn arguments_are_coerced_by_type_desc() {
         })
     );
 
-    // Wrong type, bad flow id, unknown argument, missing required: each is a
-    // tool error naming the parameter.
+    // Wrong type, bad flow id, unknown argument, missing required: each is an
+    // INVALID_PARAMS JSON-RPC error (the command never runs) naming the
+    // parameter — the same envelope as a missing `name` or unknown tool.
     let bad_type = rpc(
         &srv,
         2,
         "tools/call",
         json!({"name": "demo.echo", "arguments": {"id": id, "limit": "five"}}),
     );
-    assert_eq!(bad_type["result"]["isError"], json!(true));
-    let text = bad_type["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text");
+    assert_eq!(
+        bad_type["error"]["code"],
+        json!(INVALID_PARAMS),
+        "{bad_type}"
+    );
+    let text = bad_type["error"]["message"].as_str().expect("message");
     assert!(text.contains("limit") && text.contains("integer"), "{text}");
 
     let bad_id = rpc(
@@ -599,10 +618,10 @@ fn arguments_are_coerced_by_type_desc() {
         "tools/call",
         json!({"name": "demo.echo", "arguments": {"id": "not-a-uuid"}}),
     );
-    assert_eq!(bad_id["result"]["isError"], json!(true));
-    assert!(bad_id["result"]["content"][0]["text"]
+    assert_eq!(bad_id["error"]["code"], json!(INVALID_PARAMS), "{bad_id}");
+    assert!(bad_id["error"]["message"]
         .as_str()
-        .expect("text")
+        .expect("message")
         .contains("id"));
 
     let unknown = rpc(
@@ -611,10 +630,10 @@ fn arguments_are_coerced_by_type_desc() {
         "tools/call",
         json!({"name": "demo.echo", "arguments": {"id": id, "bogus": 1}}),
     );
-    assert_eq!(unknown["result"]["isError"], json!(true));
-    assert!(unknown["result"]["content"][0]["text"]
+    assert_eq!(unknown["error"]["code"], json!(INVALID_PARAMS), "{unknown}");
+    assert!(unknown["error"]["message"]
         .as_str()
-        .expect("text")
+        .expect("message")
         .contains("bogus"));
 
     let missing = rpc(
@@ -623,10 +642,8 @@ fn arguments_are_coerced_by_type_desc() {
         "tools/call",
         json!({"name": "demo.echo", "arguments": {}}),
     );
-    assert_eq!(missing["result"]["isError"], json!(true));
-    let text = missing["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text");
+    assert_eq!(missing["error"]["code"], json!(INVALID_PARAMS), "{missing}");
+    let text = missing["error"]["message"].as_str().expect("message");
     assert!(text.contains("missing") && text.contains("id"), "{text}");
 }
 

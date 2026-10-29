@@ -11,28 +11,20 @@ use std::sync::Arc;
 
 use aitm_core::{Command, CommandHost, ParamDef, ParamSchema, Params, TypeDesc, Value};
 
-use crate::guard::{L4Guard, L4GuardError};
+use crate::guard::L4Guard;
 use crate::types::{L4ScopeEntry, L4ScopeId, L4ScopeSource, RateCap};
 
 /// `l4.scope.add {..}` → add a scope entry; returns its minted id.
 pub struct ScopeAdd {
     guard: Arc<L4Guard>,
-    /// Whether a runtime bus caller may widen the deny-by-default scope. Mirrors
-    /// `ca.allow_agent_install`: **false** by default, so the one escape hatch out
-    /// of deny-by-default stays with the operator's config. Pre-M4 the bus cannot
-    /// tell operator from agent (`CommandHost` is always `Frontend::Mcp`), so the
-    /// gate is a construction-time flag from `L4Config`, not a host-identity check.
-    allow_agent_widen: bool,
 }
 
 impl ScopeAdd {
-    /// A command over the shared guard. `allow_agent_widen` comes from
-    /// `L4Config::allow_agent_widen` at module construction.
-    pub fn new(guard: Arc<L4Guard>, allow_agent_widen: bool) -> Self {
-        Self {
-            guard,
-            allow_agent_widen,
-        }
+    /// A command over the shared guard. The SEC-2 widen gate (and the forced
+    /// `source = Runtime`) now live in [`L4Guard::add_runtime_scope`], so the command
+    /// is a thin wrapper and carries no gate of its own.
+    pub fn new(guard: Arc<L4Guard>) -> Self {
+        Self { guard }
     }
 }
 
@@ -98,18 +90,14 @@ impl Command for ScopeAdd {
     }
 
     fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
-        // Deny-by-default: runtime bus widening is gated by config, not by caller
-        // identity (pre-M4 the bus cannot tell operator from agent). When the flag
-        // is off, refuse with the typed [`L4GuardError::ScopeWideningDisabled`] and
-        // add nothing — the operator declares scope in the `l4.scope` config block.
-        if !self.allow_agent_widen {
-            return Err(anyhow::Error::new(L4GuardError::ScopeWideningDisabled));
-        }
+        // Deny-by-default widening is enforced in the guard: `add_runtime_scope`
+        // refuses with the typed [`L4GuardError::ScopeWideningDisabled`] (adding
+        // nothing) when `allow_agent_widen` is off, and forces `source = Runtime`.
         let entry = entry_from_params(&args)?;
         let id = self
             .guard
-            .add_scope(entry)
-            .map_err(|e| anyhow::anyhow!("scope add refused: {e}"))?;
+            .add_runtime_scope(entry)
+            .map_err(anyhow::Error::new)?;
         Ok(Value::Str(super::scope_id_to_string(id)))
     }
 }
@@ -216,8 +204,9 @@ fn entry_from_params(args: &Params) -> anyhow::Result<L4ScopeEntry> {
         direction,
         capability,
         inject_rate: RateCap { pps, burst },
-        // Runtime bus adds are never operator-authorized: they cannot lift the
-        // dangerous-destination denylist (guard.rs enforces this on `source`).
+        // Provenance is set here for completeness, but `L4Guard::add_runtime_scope`
+        // re-forces `source = Runtime` at the boundary — a runtime add can never mint
+        // operator (`Config`) provenance and so can never lift the denylist.
         source: L4ScopeSource::Runtime,
     })
 }

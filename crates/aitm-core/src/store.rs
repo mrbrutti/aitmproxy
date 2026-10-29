@@ -182,23 +182,32 @@ impl MemFlowStore {
         }
     }
 
-    /// Drain the `remove` oldest flows, decrementing the resident-byte counter by
-    /// their estimated size and dropping any of them from the hidden set. This is
-    /// the only path that removes a hidden flow: paused captures age out here, so
-    /// memory stays bounded without a per-event cleanup step.
+    /// Evict up to `remove` of the oldest **terminal** flows, decrementing the
+    /// resident-byte counter by their size and dropping any of them from the
+    /// hidden set. In-flight and intercepted (parked) flows are passed over — the
+    /// same guard `clear` applies — because dropping one would strand the pipeline
+    /// (a proto module's `get` after dispatch would miss it) or its pending
+    /// resume. This is the only path that removes a hidden flow: paused captures
+    /// age out here, so memory stays bounded without a per-event cleanup step.
     fn drain_oldest(&self, flows: &mut IndexMap<FlowId, Flow>, remove: usize) {
-        let remove = remove.min(flows.len());
         if remove == 0 {
             return;
         }
         let mut hidden = self.hidden();
-        let freed: usize = flows
-            .drain(0..remove)
-            .map(|(id, f)| {
-                hidden.remove(&id);
-                flow_size(&f)
-            })
-            .sum();
+        let mut dropped = 0usize;
+        let mut freed = 0usize;
+        // `retain` visits in insertion order and preserves it, so this removes the
+        // oldest terminal flows first and stops once `remove` of them are gone.
+        flows.retain(|id, flow| {
+            if dropped < remove && is_terminal(flow) {
+                dropped += 1;
+                freed += flow_size(flow);
+                hidden.remove(id);
+                false
+            } else {
+                true
+            }
+        });
         self.resident.fetch_sub(freed, Ordering::Relaxed);
     }
 }

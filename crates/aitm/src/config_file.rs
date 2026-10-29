@@ -238,11 +238,17 @@ struct SessionIoFile {
     /// Let an agent (MCP) frontend read/write a host path via the session/flow I/O
     /// commands. Off by default.
     allow_agent_file_io: Option<bool>,
+    /// Confine every path-bearing session/flow I/O call under this root. Unset
+    /// imposes no confinement (the human CLI keeps full path access).
+    root: Option<PathBuf>,
 }
 
 impl SessionIoFile {
     fn apply(self, c: &mut SessionIoConfig) {
         set(&mut c.allow_agent_file_io, self.allow_agent_file_io);
+        if let Some(root) = self.root {
+            c.root = Some(root);
+        }
     }
 }
 

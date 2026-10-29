@@ -4,7 +4,8 @@ import SwiftUI
 /// The Timing tab (S-020): one bar per phase, proportional to the longest,
 /// in the tertiary tier with the duration printed beside it; the total under
 /// them. A missing phase prints a dash and no bar; a real zero prints `0 ms`.
-/// No timing yet: grey loading bars.
+/// No timing (the live bus does not carry phase timings yet, F5): a follow-up
+/// notice, not perpetual loading bars.
 struct TimingView: View {
     var timing: FlowTiming?
     /// The row's Duration column, when known; printed beside the sum if they differ.
@@ -25,7 +26,21 @@ struct TimingView: View {
             .padding(Space.md)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         } else {
-            LoadingLines()
+            // flow.detail never carries timing on the live bus yet, so a nil
+            // here means the core has not landed F5 — say so (like the web
+            // TimingTab and the TUI) rather than spinning loading bars forever.
+            VStack(spacing: Space.xs) {
+                Text("Timing needs core follow-up F5")
+                    .font(Tok.Face.ui(Tok.Typography.Size.md))
+                    .foregroundStyle(Tok.Ink.tertiary.color)
+                if let total {
+                    Text("total \(Format.duration(total))")
+                        .font(Tok.Face.ui(Tok.Typography.Size.sm))
+                        .foregroundStyle(Tok.Ink.tertiary.color)
+                }
+            }
+            .padding(Space.md)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
