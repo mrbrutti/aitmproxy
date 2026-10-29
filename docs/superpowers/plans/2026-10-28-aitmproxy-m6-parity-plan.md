@@ -16,7 +16,7 @@ Every task's requirements implicitly include these (verbatim from the spec/WORKF
 
 - **Gate:** `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test` must pass before any review, per task. TDD: write the failing test first, watch it fail, write the minimum to pass, watch it pass. The Coder's report includes both runs.
 - **`unsafe` stays forbidden.** The workspace sets `unsafe_code = "forbid"`. A task reaching for `unsafe` has mis-designed and must stop and report.
-- **Additive-only core.** New behaviour is new crates/plugins/commands registered into the existing `Registry`. `Flow`/`Event`/`InterceptState`/`FlowCtx`/`Command`/`ProtocolModule`/`NextLayerHint` shapes are **reused, not changed**. The only permitted `aitm-core` edits in M6 are **additive `Config` fields** (`Config.tls`, `Config.maps`), landed in Task 14 and named there; any other core touch means the task mis-read the seam — stop and report (WORKFLOW "stop on gaps").
+- **Additive-only core.** New behaviour is new crates/plugins/commands registered into the existing `Registry`. `Flow`/`Event`/`InterceptState`/`FlowCtx`/`Command`/`ProtocolModule`/`NextLayerHint` shapes are **reused, not changed**. The only permitted `aitm-core` edits in M6 are **additive `Config` fields** (`Config.tls`, `Config.maps`, and post-panel `Config.sessionio` for the agent file-I/O gate); any other core touch means the task mis-read the seam — stop and report (WORKFLOW "stop on gaps"). **Amendment (2026-10-28, accepted by Matt):** Task 14 additionally made a named additive touch to `crates/aitm-core/src/proxy.rs` + `lib.rs` to populate `NextLayerHint.client_hello_sni` in the acceptor (parse-only, bounds-checked, unit-tested), required for F11's direct-TLS passthrough because the spec's "the SNI the acceptor already peeks" assumption was false in the base — accepted as F11's named core touch.
 - **Deny-by-default, one guard.** Every command causing active egress (`ws.send`, Map Remote redirect) calls `ScopeRateGuard::check_active(authority)` and is refused (`invoke` returns `Err`, surfaced as `isError: true`) when out of scope. Agent (`Frontend::Mcp`) mutation of behaviour-changing config (`tls.passthrough.*`, `map.add`/`map.remove`) is gated by a bool defaulting **off** (`allow_agent_passthrough`, `maps.allow_agent_authoring`), mirroring `scope.allow_agent_widen`.
 - **Config via YAML, `deny_unknown_fields`.** New config parses from the same YAML file and errors on an unknown key (Task 14).
 - **Declared signatures are authoritative.** Types/signatures in each task's Interfaces block are copied exactly; bodies and in-module file layout are the builder's.
@@ -380,7 +380,28 @@ Kept by the main session during stage 6. One row per finding.
 | 1 | quality/spec | Important/Minor | URL clause matches path, not spec §0's `scheme://authority/path?query` | Resolved — path+query confirmed (consistent with authoritative AC-R2 `^/v…$`); spec §0 reconciled 2026-10-28 |
 | 1 | quality/spec | Minor | `CompiledRule::rule()` public accessor not in Interfaces block | Accepted — F3 needs `rule().id` as the remove handle; exposes only public data |
 | 1 | quality | Minor | Per-char `String` alloc in `wildcard_to_regex` (cold path) | Accepted — cold path (compile-time), not the per-event matcher |
+| whole-branch | security | **Important** | `mitmproxy.rs` tnetstring parser panics/stack-overflows on malformed `.flows` (unchecked length arith + unbounded recursion); agent-reachable via `flow.import` → DoS | FIX — checked length arith + recursion-depth cap + fuzz tests |
+| whole-branch | security | Minor | Map Remote scope check runs on both `RequestHeaders`+`Request` → double/triple-charges rate budget (no bypass) | FIX — act on one phase |
+| whole-branch | security | Minor | `session.save`/`load`, `flow.export`/`import` take an unconfined, ungated host path → agent can overwrite/read arbitrary files | FIX (Matt's call 2026-10-28) — gate the four file-I/O commands against `Frontend::Mcp`; operator keeps access; additive `SessionIoConfig.allow_agent_file_io` default off. Dispatched to m6-panel-fix |
+| whole-branch | quality | Minor | Rule wire-token diverged: `"wsframe"` (intercept) vs `"ws_frame"` (wsctl/maprules) — cross-command inconsistency | FIX — consolidate serde+tokens into `aitm-rules` |
+| whole-branch | quality | Minor | HAR/mitmproxy import silently discards base64 decode / status errors | FIX — propagate `Err` or mark the flow |
+| whole-branch | spec | **Important** | `aitm-core/src/proxy.rs` SNI parse+fill edited beyond plan's permitted core touch (spec-anticipated "acceptor already peeks" was false; code is sound + unit-tested) | **Accepted 2026-10-28 by Matt** — necessary for F11's direct-TLS path; the base code's hard-coded `client_hello_sni: None` contradicted the spec. Plan Global constraints amended to allow `proxy.rs`/`lib.rs` as F11's named additive core touch |
+| whole-branch | spec | Minor | New `base64` dep in `aitm-plugin-sessionio` (HAR 1.2 defines base64; not TLS/async) | **Accepted 2026-10-28 by Matt** |
+
+**Resolution (2026-10-28):** all five `FIX` items above landed in `dff9481` (merged to `feat/m6-parity` at `9427938`); the whole-workspace gate is green (`fmt` + `clippy -D warnings` + `cargo test` = 797 passed, 0 failed). A targeted security re-review CONFIRMED both security fixes resolved (tnetstring parser now overflow-safe + depth-bounded; agent file-I/O gate fires before any filesystem call, defaults off, cannot be flipped) with no new findings. The two `Accepted` items are recorded above; the Global-constraints amendment is in that section. **No open findings remain.**
 
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7.
+**Merged to `feat/m6-parity` (14 tasks + panel fixes), whole-workspace gate green (797 tests):**
+- **F3** — rule-based selective interception, response-phase park (at `ResponseHeaders`) + `flow.mutate {status}`, `flow.kill {mode: reset|429|503}` (`aitm-plugins`, `aitm-rules`).
+- **F9** — `ws.intercept`/`ws.frame` (edit/drop) + `ws.send` live inject via a shared `InjectRegistry` (`aitm-plugin-wsctl`, `aitm-proto-ws`).
+- **F10** — `session.save/load`, `flow.export/import` (native + HAR 1.2 + mitmproxy `.flows` import), passive (`aitm-plugin-sessionio`).
+- **F11** — `tls.passthrough.*` + `PassthroughModule` byte tunnel; acceptor now peeks the ClientHello SNI (`aitm-plugin-passthrough`, `aitm-core` acceptor).
+- **Map** — `map.add/list/remove`, Map Local (confined file serve) + Map Remote (scope-guarded rewrite) (`aitm-plugin-maprules`).
+- **Shared** — `aitm-rules` match model + `bus` wire-serde; additive `Config.tls`/`Config.maps`/`Config.sessionio`; binary wiring in `aitm/src/wire.rs`; MCP/TUI tool-catalogs reconciled.
+
+**Cut / deferred:** HTTP/2 — split to its own milestone (M7); §6 of the spec is the forward-pointing stub. No HTTP/3, gRPC decode, or SOCKS5.
+
+**Follow-ups (non-blocking, for later):**
+- The acceptor's direct-TLS SNI path (`parse_client_hello_sni`) has unit coverage but no end-to-end integration test — AC-F11.1 exercises passthrough via the CONNECT authority. An integration test of the no-CONNECT direct-TLS passthrough would close the gap.
+- A couple of doc-comment command counts (`CORE_TOOLS` "50", `EXPECTED_TOOLS` "47") are prose, not enforced; keep them in step as the surface grows (the set-equality test enforces the list itself).
