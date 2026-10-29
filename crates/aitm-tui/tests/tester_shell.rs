@@ -180,15 +180,15 @@ fn shell_regions_render_in_the_mockup_order_at_200x50() {
     assert!(summary.contains("TLS · h2"), "{summary}");
     assert!(summary.contains("client curl"), "{summary}");
     assert!(summary.contains("in scope"), "{summary}");
-    // Tab rows carry the F5-gated tabs as labelled placeholders (fix pass 1, I1).
+    // Cookies and Set-Cookie render live; only Timing stays F5-gated (I17a).
     assert!(
         text.contains(
-            "Request  Headers  Cookies (F5)  Query  Body  Raw  Summary  Timing (F5)  Connection"
+            "Request  Headers  Cookies  Query  Body  Raw  Summary  Timing (F5)  Connection"
         ),
         "{text}"
     );
     assert!(
-        text.contains("Response  Headers  Set-Cookie (F5)  Body  Raw  JSON  Hex  Diff"),
+        text.contains("Response  Headers  Set-Cookie  Body  Raw  JSON  Hex  Diff"),
         "{text}"
     );
     assert!(

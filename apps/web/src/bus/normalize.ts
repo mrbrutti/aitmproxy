@@ -54,7 +54,10 @@ function tlsOf(v: unknown, connTls: boolean | null, scheme: string): TlsState {
   const plain = scheme === 'http' || scheme === 'ws';
   if (connTls === true) return 'mitm';
   if (connTls === false) return plain ? 'plain' : 'tunnel';
-  return plain ? 'plain' : 'mitm';
+  // Unknown TLS: an https flow is a CONNECT tunnel until the core affirmatively
+  // reports interception (`tls: 'mitm'` or `conn.tls: true`, both handled above).
+  // Defaulting to 'mitm' here would mislabel a pinned/passed-through flow as decrypted.
+  return plain ? 'plain' : 'tunnel';
 }
 
 function originOf(v: unknown, isReplay: boolean): Origin {

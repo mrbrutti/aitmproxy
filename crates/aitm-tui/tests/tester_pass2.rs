@@ -273,16 +273,14 @@ fn finding_yaml_read_failure_is_shown_in_the_panel() {
 /// against the 50 core tools the screen carries the F5/F13 data the core
 /// now serves — sizes, durations, headers, the PoC library — and only the
 /// surfaces still ahead of the core (F1 agent, F3 rules, F4 push, F10
-/// sessions, M3 scripts, the F5 cookie/timing tabs) keep their labels.
+/// sessions, M3 scripts, the F5 timing tab) keep their labels.
 #[test]
 fn core_fixture_render_is_lit_except_for_what_is_still_ahead_of_the_core() {
     let mut app = fixture_app_core(200, 50);
     let text = text_of(&app, 200, 50);
     // Labels on the shell: what the core still lacks.
     for label in [
-        "Cookies (F5)",
         "Timing (F5)",
-        "Set-Cookie (F5)",
         "Agent · n/a (F1)",
         "↑ — ↓ — (F4)",
         // Two recorded flows are paused, so the bar is the saturated one.
