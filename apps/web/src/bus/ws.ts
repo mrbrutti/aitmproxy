@@ -7,9 +7,11 @@ import {
   CLIENT_INFO,
   PROTOCOL_VERSION,
   type BusClient,
+  type BusRole,
   type BusState,
   type JsonRpcResponse,
   type NotificationHandler,
+  type ServerInfo,
   type ToolCallResult,
   type ToolDef,
 } from './types';
@@ -17,6 +19,8 @@ import {
 export interface WsBusOptions {
   url: string;
   token?: string | null;
+  /** Client-side role expectation from the launch URL fragment (Decision B); never sent upstream. */
+  expect?: BusRole | null;
   /** Back-off schedule in ms; the last value repeats. */
   backoff?: number[];
 }
@@ -31,6 +35,8 @@ export function createWsBus(opts: WsBusOptions): BusClient {
   const backoff = opts.backoff ?? [250, 500, 1000, 2000, 5000];
   const [state, setState] = createSignal<BusState>('idle');
   const [lastError, setLastError] = createSignal<string | null>(null);
+  const [role, setRole] = createSignal<BusRole | null>(null);
+  const expectRole = opts.expect ?? null;
   const handlers = new Set<NotificationHandler>();
   const pending = new Map<number, Pending>();
   let ws: WebSocket | null = null;
@@ -127,11 +133,14 @@ export function createWsBus(opts: WsBusOptions): BusClient {
     sock.onopen = async () => {
       try {
         if (opts.token) sock.send(JSON.stringify({ token: opts.token }) + '\n');
-        await request('initialize', {
+        const info = await request<ServerInfo>('initialize', {
           protocolVersion: PROTOCOL_VERSION,
           capabilities: {},
           clientInfo: CLIENT_INFO,
         });
+        // Decision C: read the resolved role echoed in the result; a missing/unknown value is
+        // treated as "role unknown" (null), never asserted as a role.
+        setRole(info?.role === 'operator' || info?.role === 'agent' ? info.role : null);
         send({ jsonrpc: '2.0', method: 'notifications/initialized' });
         attempt = 0;
         setLastError(null);
@@ -148,6 +157,7 @@ export function createWsBus(opts: WsBusOptions): BusClient {
       if (ws !== sock) return;
       ws = null;
       toolsCache = null;
+      setRole(null); // role is per-connection; re-resolved on the next initialize.
       failAllPending(`bus closed (${ev.code})`);
       if (closedByUser) setState('closed');
       else scheduleReconnect();
@@ -158,6 +168,11 @@ export function createWsBus(opts: WsBusOptions): BusClient {
     address,
     state,
     lastError,
+    role,
+    expectRole,
+    // Warn whenever an expectation was set and the resolved role does not confirm it — including a
+    // null role (server echoed none), so an operator URL that connects as agent never passes silently.
+    roleMismatch: () => expectRole != null && role() !== expectRole,
     connect() {
       closedByUser = false;
       if (ws || timer) return;

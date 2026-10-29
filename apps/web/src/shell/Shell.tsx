@@ -13,6 +13,7 @@ import { CommandPalette } from '~/palette/CommandPalette';
 import { FlowList } from '~/flows/FlowList';
 import { Sidebar } from './Sidebar';
 import { Toolbar } from './Toolbar';
+import { RoleBanner } from './RoleBanner';
 import { ChipBar } from './ChipBar';
 import { FilterBar } from '~/flows/FilterBar';
 import { InterceptBar } from './InterceptBar';
@@ -103,6 +104,7 @@ export const Shell: Component = () => {
       <Sidebar class={css.sidebar!} />
       <section class={css.main}>
         <Toolbar />
+        <RoleBanner />
         <ChipBar />
         <Show when={app.ui.filtersOpen} fallback={<div />}>
           <FilterBar />
