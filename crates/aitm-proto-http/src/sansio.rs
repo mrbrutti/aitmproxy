@@ -686,16 +686,29 @@ fn upgrade_protocol(headers: &HeaderMap) -> Option<String> {
         .filter(|p| !p.is_empty())
 }
 
-/// `Content-Length` as a number, if present and well-formed.
+/// `Content-Length` as a number, if present and well-formed. More than one
+/// header with *distinct* values is rejected: silently trusting the first is a
+/// request/response-smuggling vector (RFC 7230 §3.3.3).
 fn content_length(headers: &HeaderMap) -> Result<Option<u64>> {
-    match headers.get("content-length") {
-        None => Ok(None),
-        Some(v) => v
-            .trim()
+    let parse = |v: &str| {
+        v.trim()
             .parse::<u64>()
-            .map(Some)
-            .map_err(|_| anyhow!("invalid Content-Length {v:?}")),
+            .map_err(|_| anyhow!("invalid Content-Length {v:?}"))
+    };
+    let mut values = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map(|(_, v)| v);
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    let n = parse(first)?;
+    for v in values {
+        if parse(v)? != n {
+            bail!("conflicting Content-Length headers");
+        }
     }
+    Ok(Some(n))
 }
 
 /// Whether `Transfer-Encoding` ends in `chunked`. Any other coding is rejected.
@@ -713,12 +726,19 @@ fn is_chunked(headers: &HeaderMap) -> Result<bool> {
     }
 }
 
-/// Body framing of a request: chunked, by length, or none.
+/// Body framing of a request: chunked, by length, or none. A message carrying
+/// both `Transfer-Encoding` and `Content-Length` is rejected (RFC 7230 §3.3.3):
+/// forwarding it lets the two ends disagree on the body boundary (smuggling).
 fn request_framing(headers: &HeaderMap) -> Result<Framing> {
-    if is_chunked(headers)? {
+    let chunked = is_chunked(headers)?;
+    let length = content_length(headers)?;
+    if chunked && length.is_some() {
+        bail!("both Transfer-Encoding and Content-Length present (RFC 7230 §3.3.3)");
+    }
+    if chunked {
         return Ok(Framing::Chunked);
     }
-    Ok(match content_length(headers)? {
+    Ok(match length {
         Some(0) | None => Framing::None,
         Some(n) => Framing::Length(n),
     })
@@ -729,10 +749,15 @@ fn response_framing(status: u16, method: &str, headers: &HeaderMap) -> Result<Fr
     if method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 || status == 101 {
         return Ok(Framing::None);
     }
-    if is_chunked(headers)? {
+    let chunked = is_chunked(headers)?;
+    let length = content_length(headers)?;
+    if chunked && length.is_some() {
+        bail!("both Transfer-Encoding and Content-Length present (RFC 7230 §3.3.3)");
+    }
+    if chunked {
         return Ok(Framing::Chunked);
     }
-    Ok(match content_length(headers)? {
+    Ok(match length {
         Some(0) => Framing::None,
         Some(n) => Framing::Length(n),
         None => Framing::UntilClose,
@@ -765,15 +790,29 @@ fn encode_message(
             (OutFraming::Raw, None)
         }
         Body::Streamed(_) => {
-            let chunked = is_chunked(&headers).unwrap_or(false);
-            (
-                if chunked {
-                    OutFraming::Chunked
-                } else {
-                    OutFraming::Raw
-                },
-                None,
-            )
+            // A streamed body keeps the head's own framing, but the header map
+            // must still carry exactly one coding, or a downstream parser can be
+            // desynchronised (response smuggling). When we frame chunked, drop any
+            // `Content-Length` and collapse to a single `Transfer-Encoding: chunked`;
+            // when we frame by length (or close), drop `Transfer-Encoding`.
+            if is_chunked(&headers).unwrap_or(false) {
+                headers.remove("content-length");
+                // Preserve the full coding list (it already ends in `chunked`, per
+                // `is_chunked`); only collapse duplicate `Transfer-Encoding` headers
+                // to the single canonical value, so a transfer-coding such as
+                // `gzip, chunked` is not silently dropped and left framed as plain
+                // chunked over still-compressed bytes.
+                let te = headers
+                    .get("transfer-encoding")
+                    .map(|v| v.trim().to_string())
+                    .unwrap_or_else(|| "chunked".to_string());
+                headers.remove("transfer-encoding");
+                headers.set("Transfer-Encoding", &te);
+                (OutFraming::Chunked, None)
+            } else {
+                headers.remove("transfer-encoding");
+                (OutFraming::Raw, None)
+            }
         }
     };
     out.extend_from_slice(first_line.as_bytes());
@@ -821,6 +860,138 @@ fn reason_phrase(status: u16) -> &'static str {
         502 => "Bad Gateway",
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
-        _ => "",
+        // An unknown code still gets a non-empty, class-appropriate phrase rather
+        // than a bare status line a strict client might reject.
+        _ => match status {
+            100..=199 => "Informational",
+            200..=299 => "OK",
+            300..=399 => "Redirection",
+            400..=499 => "Client Error",
+            500..=599 => "Server Error",
+            _ => "Unknown Status",
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aitm_core::StreamBody;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.set(k, v);
+        }
+        h
+    }
+
+    fn header_lines(out: &[u8]) -> Vec<String> {
+        String::from_utf8_lossy(out)
+            .split("\r\n")
+            .take_while(|l| !l.is_empty())
+            .skip(1) // the first line is the status/request line
+            .map(|l| l.to_ascii_lowercase())
+            .collect()
+    }
+
+    #[test]
+    fn streamed_chunked_egress_drops_competing_content_length() {
+        // A response head carrying BOTH Content-Length and Transfer-Encoding:
+        // chunked, with a streamed body framed chunked, must go out with exactly
+        // one framing header (I9: response smuggling otherwise).
+        let h = headers(&[("Content-Length", "100"), ("Transfer-Encoding", "chunked")]);
+        let mut out = Vec::new();
+        let framing = encode_message("HTTP/1.1 200 OK", &h, &Body::Streamed(StreamBody), &mut out);
+        assert_eq!(framing, OutFraming::Chunked);
+        let lines = header_lines(&out);
+        assert!(
+            !lines.iter().any(|l| l.starts_with("content-length")),
+            "Content-Length must be stripped when framing chunked, got {lines:?}"
+        );
+        let te: Vec<_> = lines
+            .iter()
+            .filter(|l| l.starts_with("transfer-encoding"))
+            .collect();
+        assert_eq!(
+            te,
+            vec![&"transfer-encoding: chunked".to_string()],
+            "exactly one Transfer-Encoding: chunked expected, got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn streamed_chunked_egress_preserves_non_chunked_codings() {
+        // `Transfer-Encoding: gzip, chunked` must survive intact when framing a
+        // streamed chunked body: de-chunking does not un-gzip, so collapsing to
+        // bare `chunked` would leave the client framed-plain over gzipped bytes.
+        let h = headers(&[("Transfer-Encoding", "gzip, chunked")]);
+        let mut out = Vec::new();
+        let framing = encode_message("HTTP/1.1 200 OK", &h, &Body::Streamed(StreamBody), &mut out);
+        assert_eq!(framing, OutFraming::Chunked);
+        let te: Vec<_> = header_lines(&out)
+            .into_iter()
+            .filter(|l| l.starts_with("transfer-encoding"))
+            .collect();
+        assert_eq!(
+            te,
+            vec!["transfer-encoding: gzip, chunked".to_string()],
+            "the gzip coding must be preserved, not collapsed to bare chunked"
+        );
+    }
+
+    #[test]
+    fn streamed_length_egress_drops_transfer_encoding() {
+        // Framed by length: Transfer-Encoding must go, Content-Length stays.
+        let h = headers(&[
+            ("Content-Length", "100"),
+            ("Transfer-Encoding", "gzip"), // not chunked -> length framing
+        ]);
+        let mut out = Vec::new();
+        let framing = encode_message("HTTP/1.1 200 OK", &h, &Body::Streamed(StreamBody), &mut out);
+        assert_eq!(framing, OutFraming::Raw);
+        let lines = header_lines(&out);
+        assert!(
+            !lines.iter().any(|l| l.starts_with("transfer-encoding")),
+            "Transfer-Encoding must be stripped when framing by length, got {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "content-length: 100"),
+            "Content-Length must be kept, got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn conflicting_content_length_is_rejected() {
+        let h = headers(&[("Content-Length", "10"), ("Content-Length", "20")]);
+        assert!(
+            content_length(&h).is_err(),
+            "distinct CL values must be rejected"
+        );
+        // Identical duplicates are not a conflict.
+        let same = headers(&[("Content-Length", "10"), ("Content-Length", "10")]);
+        assert_eq!(content_length(&same).unwrap(), Some(10));
+    }
+
+    #[test]
+    fn content_length_with_transfer_encoding_is_rejected() {
+        let h = headers(&[("Content-Length", "10"), ("Transfer-Encoding", "chunked")]);
+        assert!(
+            request_framing(&h).is_err(),
+            "CL + TE on a request must be rejected (RFC 7230 §3.3.3)"
+        );
+        assert!(
+            response_framing(200, "GET", &h).is_err(),
+            "CL + TE on a response must be rejected (RFC 7230 §3.3.3)"
+        );
+    }
+
+    #[test]
+    fn unknown_status_gets_a_class_phrase() {
+        assert_eq!(reason_phrase(299), "OK");
+        assert_eq!(reason_phrase(499), "Client Error");
+        assert_eq!(reason_phrase(599), "Server Error");
+        assert_eq!(reason_phrase(799), "Unknown Status");
+        assert!(!reason_phrase(218).is_empty());
     }
 }

@@ -41,9 +41,9 @@ pub struct Extractor {
 impl From<&ExtractStep> for Extractor {
     fn from(step: &ExtractStep) -> Self {
         let kind = match &step.source {
-            ExtractSource::Regex(p) => ExtractorKind::Regex {
-                pattern: p.clone(),
-                group: 1,
+            ExtractSource::Regex { pattern, group } => ExtractorKind::Regex {
+                pattern: pattern.clone(),
+                group: *group,
             },
             ExtractSource::Header(k) => ExtractorKind::Header(k.clone()),
             ExtractSource::JsonPath(p) => ExtractorKind::JsonPath(p.clone()),
@@ -114,9 +114,23 @@ fn kval_normalize(key: &str) -> String {
     key.to_ascii_lowercase().replace('-', "_")
 }
 
-/// A minimal dotted JSON/YAML path walk (`a.b.c`), enough for simple extractions.
+/// Largest response body `json_path` will parse. The body is target-controlled,
+/// so an unbounded parse is a DoS vector; a dotted path into a sane JSON response
+/// needs nothing like a megabyte, and larger bodies simply yield no binding.
+const MAX_JSON_PATH_BODY: usize = 1024 * 1024;
+
+/// A minimal dotted JSON path walk (`a.b.c`), enough for simple extractions.
+///
+/// Parsing uses `serde_json`, not `serde_yaml`: the body is controlled by the
+/// (possibly hostile) target, and `serde_json` bounds recursion depth and has no
+/// YAML anchors/aliases, so a deeply-nested or alias-bomb body is rejected as a
+/// parse error rather than overflowing the stack or exhausting memory. The body
+/// size is capped first so even a flat-but-huge document is not materialized.
 fn json_path(body: &str, path: &str) -> Option<Value> {
-    let doc: serde_yaml::Value = serde_yaml::from_str(body).ok()?;
+    if body.len() > MAX_JSON_PATH_BODY {
+        return None;
+    }
+    let doc: serde_json::Value = serde_json::from_str(body).ok()?;
     let mut cur = &doc;
     for seg in path
         .trim_start_matches('$')
@@ -125,5 +139,75 @@ fn json_path(body: &str, path: &str) -> Option<Value> {
     {
         cur = cur.get(seg)?;
     }
-    Some(crate::model::yaml_to_value(cur))
+    Some(json_to_value(cur))
+}
+
+/// Convert a parsed JSON value into the transport-neutral `Value`.
+fn json_to_value(json: &serde_json::Value) -> Value {
+    match json {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .map(Value::Int)
+            .or_else(|| n.as_f64().map(Value::Float))
+            .unwrap_or(Value::Null),
+        serde_json::Value::String(s) => Value::Str(s.clone()),
+        serde_json::Value::Array(items) => Value::Array(items.iter().map(json_to_value).collect()),
+        serde_json::Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_to_value(v)))
+                .collect(),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_path_reads_dotted_path() {
+        let body = r#"{"data": {"token": "abc123"}}"#;
+        assert_eq!(
+            json_path(body, "data.token"),
+            Some(Value::Str("abc123".into()))
+        );
+        assert_eq!(
+            json_path(body, "$.data.token"),
+            Some(Value::Str("abc123".into()))
+        );
+        assert_eq!(json_path(body, "data.missing"), None);
+    }
+
+    /// I4: a deeply-nested body is rejected (serde_json's recursion limit) instead
+    /// of overflowing the stack, and an over-cap body yields no binding — neither
+    /// panics or exhausts memory.
+    #[test]
+    fn json_path_rejects_hostile_body() {
+        // ~100k levels of nesting: serde_yaml would recurse and could overflow;
+        // serde_json returns a parse error, so we get `None`.
+        let deep = format!("{}1{}", "[".repeat(100_000), "]".repeat(100_000));
+        assert_eq!(json_path(&deep, "x"), None);
+
+        // Over the byte cap: not parsed at all.
+        let huge = format!(r#"{{"k":"{}"}}"#, "a".repeat(MAX_JSON_PATH_BODY + 10));
+        assert_eq!(json_path(&huge, "k"), None);
+    }
+
+    /// I7: a regex extractor with no capture group binds the whole match (group 0),
+    /// where the old hardcoded group 1 bound nothing.
+    #[test]
+    fn whole_match_regex_extracts_with_group_zero() {
+        let ctx = MatchContext::new(200, "id=4242 end");
+        let ex = Extractor {
+            name: "n".into(),
+            kind: ExtractorKind::Regex {
+                pattern: r"id=\d+".into(),
+                group: 0,
+            },
+            internal: false,
+        };
+        assert_eq!(apply(&ex, &ctx), Some(Value::Str("id=4242".into())));
+    }
 }

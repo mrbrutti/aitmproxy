@@ -15,6 +15,7 @@ pub mod commands;
 pub mod config;
 pub mod craft;
 pub mod flow;
+pub mod gates;
 pub mod guard;
 pub mod intercept;
 pub mod module;

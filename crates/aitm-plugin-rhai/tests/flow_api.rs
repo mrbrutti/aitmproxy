@@ -251,6 +251,96 @@ fn request_setters_are_validated() {
     assert_eq!(url, "http://ex.test/again", "a bare path keeps the origin");
 }
 
+/// C2 (Critical): the live request-line setters reject CR/LF, space, and other
+/// control characters, so an `on_request` hook cannot split the upstream
+/// request or inject a header through `flow.request.path` / `.url` — HTTP
+/// request smuggling from the sandboxed scripting surface.
+#[test]
+fn path_and_url_setters_reject_request_line_injection() {
+    let state = http_state();
+    let engine = engine();
+    for write in [
+        r#"flow.request.path = "/a HTTP/1.1\r\nHost: evil\r\n\r\nGET /b""#,
+        r#"flow.request.url = "/a HTTP/1.1\r\nHost: evil\r\n\r\nGET /b""#,
+        r#"flow.request.path = "/with space""#,
+    ] {
+        let mut scope = Scope::new();
+        scope.push("flow", ScriptFlow(Arc::clone(&state)));
+        let err = engine
+            .run_with_scope(&mut scope, write)
+            .expect_err("a control/space request target must be refused");
+        assert!(
+            err.to_string().contains("control character"),
+            "{write}: {err}"
+        );
+    }
+    let st = state.lock().unwrap();
+    let req = st.request.as_ref().unwrap();
+    assert_eq!(req.path, "/items", "the injected path was never written");
+    assert_eq!(
+        req.url, "http://ex.test/items?q=1",
+        "the injected url was never written"
+    );
+}
+
+/// C2 (query): the query-pair setter is concatenated into the live request line
+/// by `join_path_query` with no percent-encoding, so a CR/LF or space in a query
+/// key or value must be refused the same way the path/url setters are — otherwise
+/// an `on_request` hook can still smuggle a request via `flow.request.query`.
+#[test]
+fn query_setter_rejects_request_line_injection() {
+    let state = http_state();
+    let engine = engine();
+    for write in [
+        r#"flow.request.query["x"] = "a\r\nInjected-Header: evil""#,
+        r#"flow.request.query["a\r\nb"] = "1""#,
+        r#"flow.request.query["x"] = "with space""#,
+    ] {
+        let mut scope = Scope::new();
+        scope.push("flow", ScriptFlow(Arc::clone(&state)));
+        let err = engine
+            .run_with_scope(&mut scope, write)
+            .expect_err("a control/space query pair must be refused");
+        assert!(
+            err.to_string().contains("control character"),
+            "{write}: {err}"
+        );
+    }
+    let st = state.lock().unwrap();
+    let req = st.request.as_ref().unwrap();
+    assert_eq!(req.path, "/items", "the injected query was never written");
+    assert_eq!(
+        req.url, "http://ex.test/items?q=1",
+        "the injected query was never written"
+    );
+}
+
+/// Minor(b): a live header `set` with an invalid name or a control-bearing
+/// value is a catchable error, not a silent `Ok` whose value is dropped when
+/// the host writes the flow back through `HeaderMap::try_set`.
+#[test]
+fn header_set_rejects_invalid_name_or_value() {
+    let state = http_state();
+    let engine = engine();
+    for write in [
+        r#"flow.request.headers.set("X-Evil", "a\r\nInjected: 1")"#,
+        r#"flow.request.headers["X-Evil"] = "a\r\nInjected: 1""#,
+        r#"flow.request.headers.set("Bad Name", "ok")"#,
+    ] {
+        let mut scope = Scope::new();
+        scope.push("flow", ScriptFlow(Arc::clone(&state)));
+        let err = engine
+            .run_with_scope(&mut scope, write)
+            .expect_err("an invalid header must be refused");
+        assert!(err.to_string().contains("refused"), "{write}: {err}");
+    }
+    assert_eq!(
+        headers_of(&state),
+        vec![("Host".to_string(), "ex.test".to_string())],
+        "no invalid header was written"
+    );
+}
+
 /// Option C: a pure read of something absent is `""`, never an error.
 #[test]
 fn forgiving_missing_header_read() {

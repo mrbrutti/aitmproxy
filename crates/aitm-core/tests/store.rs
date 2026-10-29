@@ -2,10 +2,25 @@
 
 use aitm_core::{
     Body, ConnInfo, Flow, FlowId, FlowMeta, FlowQuery, FlowStore, HeaderMap, HttpFlow, HttpRequest,
-    HttpVersion, InterceptState, MemFlowStore,
+    HttpResponse, HttpVersion, InterceptState, MemFlowStore,
 };
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::SystemTime;
+
+/// A terminal flow: a fully-buffered response, so the store may evict it.
+fn http_flow_terminal(authority: &str, path: &str, body_len: usize) -> Flow {
+    let mut flow = http_flow(authority, path);
+    if let Flow::Http(h) = &mut flow {
+        h.response = Some(HttpResponse {
+            status: 200,
+            version: HttpVersion::Http11,
+            headers: HeaderMap::new(),
+            body: Body::Bytes(vec![b'x'; body_len]),
+            timestamp: SystemTime::now(),
+        });
+    }
+    flow
+}
 
 fn http_flow(authority: &str, path: &str) -> Flow {
     let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
@@ -35,22 +50,40 @@ fn http_flow(authority: &str, path: &str) -> Flow {
     })
 }
 
-fn http_flow_with_body(authority: &str, path: &str, body_len: usize) -> Flow {
-    let mut flow = http_flow(authority, path);
-    if let Flow::Http(h) = &mut flow {
-        h.request.body = Body::Bytes(vec![b'x'; body_len]);
+/// Eviction must not drop an in-flight (non-terminal) flow, even when it is the
+/// oldest — `clear` already guards this, and `drain_oldest` must too, or the
+/// pipeline is stranded when a module reads the flow back after dispatch.
+#[test]
+fn eviction_skips_in_flight_flows() {
+    // Tight count cap, generous byte budget so only the count cap fires.
+    let store = MemFlowStore::with_limits(3, 100_000_000);
+    // The oldest flow is still in flight (no response yet).
+    let inflight = store.insert(http_flow("a.test", "/inflight"));
+    // Then a run of terminal flows forces eviction past the cap.
+    let first_terminal = store.insert(http_flow_terminal("a.test", "/t0", 10));
+    for i in 1..20 {
+        store.insert(http_flow_terminal("a.test", &format!("/t{i}"), 10));
     }
-    flow
+    assert!(
+        store.get(inflight).is_some(),
+        "the oldest in-flight flow must survive eviction (it would strand the pipeline)"
+    );
+    assert!(
+        store.get(first_terminal).is_none(),
+        "the oldest terminal flow should have been evicted instead"
+    );
 }
 
 /// The store evicts on a resident-byte budget, not just flow count: a few large
 /// captures are dropped (oldest first) long before the count cap is reached.
 #[test]
 fn byte_budget_evicts_even_under_count_cap() {
-    // Generous count cap, small (10 KiB) byte budget.
+    // Generous count cap, small (10 KiB) byte budget. The captures are terminal
+    // (a buffered response), the realistic unit the budget evicts — in-flight and
+    // parked flows are passed over so the pipeline is never stranded.
     let store = MemFlowStore::with_limits(10_000, 10_000);
     for i in 0..50 {
-        store.insert(http_flow_with_body("a.test", &format!("/{i}"), 1000));
+        store.insert(http_flow_terminal("a.test", &format!("/{i}"), 1000));
     }
     assert!(
         store.list().len() < 50,
@@ -77,13 +110,17 @@ fn update_growth_counts_toward_byte_budget() {
     let store = MemFlowStore::with_limits(10_000, 10_000);
     let mut ids = Vec::new();
     for i in 0..20 {
-        ids.push(store.insert(http_flow("a.test", &format!("/{i}"))));
+        // Terminal (buffered response) so the budget may evict them; bodies are
+        // tiny so far.
+        ids.push(store.insert(http_flow_terminal("a.test", &format!("/{i}"), 0)));
     }
-    // Bodies are tiny so far; now grow each via update.
+    // Now grow each response body via update.
     for id in &ids {
         store.update(*id, &mut |f: &mut Flow| {
             if let Flow::Http(h) = f {
-                h.request.body = Body::Bytes(vec![b'x'; 1000]);
+                if let Some(r) = &mut h.response {
+                    r.body = Body::Bytes(vec![b'x'; 1000]);
+                }
             }
         });
     }

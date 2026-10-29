@@ -4,9 +4,13 @@
 //!
 //! Presence is what `find-certificate -a -Z` prints; trust settings are not
 //! verified (`verify-cert` and `dump-trust-settings` were inconclusive in
-//! research 07 §3.1), so `trusted` is always `Unknown` here. Every mutation
-//! is check-first, which keeps the design independent of what a duplicate
-//! `add-trusted-cert` does.
+//! research 07 §3.1 — `verify-cert` exited 1 for both a trusted Apple root and
+//! an untrusted self-signed CA, so its result is not a trust signal), so
+//! `trusted` is always `Unknown` here. Rather than leave that `Unknown`
+//! unexplained (audit minor e), a `status` that finds the certificate *present*
+//! says so in `detail`: present but trust UNCONFIRMED, with the one reliable way
+//! to confirm it (Keychain Access). Every mutation is check-first, which keeps
+//! the design independent of what a duplicate `add-trusted-cert` does.
 
 use crate::cert::CaCert;
 use crate::exec::{CmdLine, CmdOutput, Executor};
@@ -26,6 +30,15 @@ const LOGIN_KEYCHAIN: &str = "Library/Keychains/login.keychain-db";
 /// Shown on every status answer: presence is not trust on macOS.
 const DETAIL: &str = "macOS: keychain presence is reported; trust settings are not verified. \
                       Open Keychain Access to confirm \"Always Trust\".";
+
+/// Added when the certificate is present: name the UNCONFIRMED trust explicitly
+/// and how to confirm it, so `Trust::Unknown` is never a silent dead end (audit
+/// minor e). `security verify-cert` is not used: research 07 §3.1 found it
+/// exits 1 for a trusted root too, so it cannot confirm trust.
+const PRESENT_TRUST_UNCONFIRMED: &str =
+    "The certificate is present, but macOS exposes no reliable CLI check of its \
+     trust settings, so its trust is UNCONFIRMED here. Confirm \"Always Trust\" in \
+     Keychain Access (or that `aitm ca install` reported success).";
 
 const HEADLESS_HINT: &str = "macOS refused to change trust settings without a GUI session; run \
                              aitm ca install from a terminal in a logged-in desktop session";
@@ -187,13 +200,18 @@ impl TrustStore for MacOsStore {
         let (cmd, out) = op.query()?;
         let installed = parse_presence(&out, cert);
         let mut detail = vec![DETAIL.to_string()];
-        if installed == Presence::Unknown {
-            detail.push(failure_text(&cmd, &out));
+        match installed {
+            Presence::Present => detail.push(PRESENT_TRUST_UNCONFIRMED.to_string()),
+            Presence::Unknown => detail.push(failure_text(&cmd, &out)),
+            _ => {}
         }
         Ok(StoreStatus {
             scope,
             location: op.keychain,
             installed,
+            // Always `Unknown`: macOS has no reliable CLI trust check (see the
+            // module docs and `PRESENT_TRUST_UNCONFIRMED`). When present, `detail`
+            // now says so explicitly instead of leaving it unexplained.
             trusted: Trust::Unknown,
             detail,
         })

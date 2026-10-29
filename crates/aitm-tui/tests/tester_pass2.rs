@@ -271,21 +271,21 @@ fn finding_yaml_read_failure_is_shown_in_the_panel() {
 
 /// `--snapshot-core` (M-misc), re-pinned after the 2026-10-28 core merge:
 /// against the 56 core tools the screen carries the F5/F13 data the core
-/// now serves — sizes, durations, headers, the PoC library — plus the lit F1
-/// agent surface; only the surfaces still ahead of the core (F3 rules, the F4
-/// push throughput, F10 sessions, M3 scripts, the F5 cookie/timing tabs) keep
-/// their labels.
+/// now serves — sizes, durations, headers, cookies, the PoC library — plus the
+/// lit F1 agent surface; only the surfaces still ahead of the core (F3 rules, the
+/// F4 push throughput, F10 sessions, M3 scripts, the F5 timing tab) keep their
+/// labels (Cookies/Set-Cookie now render live from the served headers).
 #[test]
 fn core_fixture_render_is_lit_with_the_agent_surface_and_only_f3_f4_f10_still_ahead() {
     let mut app = fixture_app_core(200, 50);
     let text = text_of(&app, 200, 50);
     // Labels on the shell: what the core still lacks.
     for label in [
-        "Cookies (F5)",
         "Timing (F5)",
-        "Set-Cookie (F5)",
-        // The live push throughput still needs the F4 stream (tools are served,
-        // but the TUI does not consume the push stream yet).
+        // F1 is lit (main) so no "Agent · n/a (F1)" label; Cookies/Set-Cookie now
+        // render live (frontends fix) so no "Set-Cookie (F5)" label. The live push
+        // throughput still needs the F4 stream (tools are served, but the TUI does
+        // not consume the push stream yet).
         "↑ — ↓ — (F4)",
         // Two recorded flows are paused, so the bar is the saturated one.
         "[d Kill · abort mode: reset (429/503 need F3)]",

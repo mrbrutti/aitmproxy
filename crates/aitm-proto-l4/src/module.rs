@@ -33,7 +33,6 @@ use aitm_core::{Command, CommandHost, ParamSchema, Params, Plugin, Registry, Val
 
 use crate::backend::L4Error;
 use crate::commands::intercept::InterceptSessions;
-use crate::commands::L4AgentGates;
 use crate::config::{InterceptConfig, L4Config};
 use crate::flow::{InMemoryL4FlowStore, L4FlowStore};
 use crate::guard::L4Guard;
@@ -230,12 +229,6 @@ pub struct L4Module {
     sessions: Arc<InterceptSessions>,
     /// The cached startup capability probe: wire verbs are gated on it, fail-closed.
     privilege: L4Privilege,
-    /// The shared per-capability agent gates (inject / capture / intercept / widen),
-    /// seeded from `L4Config` (all default false). Shared by the Mcp-only
-    /// [`L4AgentGate`](crate::commands::agent::L4AgentGate) wrapper, `l4.scope.add`'s
-    /// widen gate, and the operator-only `l4.agent.set` / `l4.agent.status`, so the
-    /// operator's toggle governs the real agent path at once.
-    gates: Arc<L4AgentGates>,
 }
 
 impl L4Module {
@@ -258,7 +251,6 @@ impl L4Module {
             intercept_cfg: cfg.intercept.clone(),
             sessions: Arc::new(InterceptSessions::new()),
             privilege,
-            gates: L4AgentGates::from_config(cfg),
         }
     }
 
@@ -278,9 +270,6 @@ impl L4Module {
             intercept_cfg,
             sessions: Arc::new(InterceptSessions::new()),
             privilege: L4Privilege::available(),
-            // Deny-by-default: a parts-wired module keeps every per-capability agent
-            // gate off unless the owner opts in via the config path (`with_privilege`).
-            gates: L4AgentGates::from_config(&L4Config::default()),
         }
     }
 
@@ -303,11 +292,14 @@ impl Plugin for L4Module {
     }
 
     fn load(&mut self, reg: &mut Registry) {
+        // The single shared agent-gate object the guard owns: the Mcp-only wrapper and
+        // the `l4.agent.*` commands read/flip the same gates the guard's
+        // `add_runtime_scope` enforces, so an operator toggle is one live source of truth.
+        let gates = self.guard.agent_gates();
         // The pure/read verbs (`l4.interfaces`, `l4.scope.*`, `l4.flow.*`, `l4.craft`)
-        // work regardless of privilege — never privilege-gated. `l4.scope.add` carries
-        // its own widen gate (reading the shared [`L4AgentGates`]).
-        for cmd in crate::commands::active_commands(self.guard(), self.store(), self.gates.clone())
-        {
+        // work regardless of privilege — never privilege-gated. `l4.scope.add`'s widen
+        // gate lives in the guard (`add_runtime_scope`), so these are unwrapped.
+        for cmd in crate::commands::active_commands(self.guard(), self.store()) {
             reg.add_command(cmd);
         }
         // M5 Task 10 — the wire-touching commands (`l4.capture.*`, `l4.inject`,
@@ -319,7 +311,7 @@ impl Plugin for L4Module {
         for cmd in gate(
             crate::commands::agent_gate(
                 crate::commands::wire_commands(self.guard(), self.store()),
-                &self.gates,
+                &gates,
             ),
             self.privilege.capture_inject.as_deref(),
         ) {
@@ -337,7 +329,7 @@ impl Plugin for L4Module {
                     self.sessions.clone(),
                     self.intercept_cfg.clone(),
                 ),
-                &self.gates,
+                &gates,
             ),
             self.privilege.intercept.as_deref(),
         ) {
@@ -346,7 +338,7 @@ impl Plugin for L4Module {
         // The operator-only live toggle: `l4.agent.status` (read the four gates) and
         // `l4.agent.set` (flip one). Never privilege- or agent-gated here — the set
         // command self-gates to operator/CLI, and status is read-only.
-        for cmd in crate::commands::agent_commands(self.gates.clone()) {
+        for cmd in crate::commands::agent_commands(gates.clone()) {
             reg.add_command(cmd);
         }
     }

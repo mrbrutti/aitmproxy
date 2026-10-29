@@ -61,6 +61,15 @@ pub enum ScriptError {
         declared: String,
         supported: String,
     },
+    /// The script declares an `API` older than a capability's `min_api`, so it
+    /// is not loaded: deny-by-default never hands a lower-API script a namespace
+    /// written for a newer contract.
+    CapabilityDenied {
+        script: String,
+        declared: String,
+        namespace: String,
+        min_api: String,
+    },
 }
 
 impl ScriptError {
@@ -160,6 +169,10 @@ const HELP_RUNTIME: &str = "the flow was forwarded unchanged. Fix the hook and r
 
 const HELP_API: &str = "set the script's `const API` to the supported version, or upgrade aitm.";
 
+const HELP_CAP: &str = "raise the script's `const API` to the capability's version once the script \
+                        is written for that contract; a lower-API script is denied the namespace by \
+                        default.";
+
 impl std::fmt::Display for ScriptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -218,6 +231,16 @@ impl std::fmt::Display for ScriptError {
             } => write!(
                 f,
                 "error: {script} — declares API '{declared}' but this build supports '{supported}'\n  help: {HELP_API}"
+            ),
+            ScriptError::CapabilityDenied {
+                script,
+                declared,
+                namespace,
+                min_api,
+            } => write!(
+                f,
+                "error: {script} — declares API '{declared}' but the '{namespace}' capability \
+                 requires API '{min_api}' or newer\n  help: {HELP_CAP}"
             ),
         }
     }

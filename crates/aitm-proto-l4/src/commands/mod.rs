@@ -42,8 +42,8 @@ use aitm_core::{Command, CommandHost, ParamSchema, Params, TypeDesc, Value};
 use crate::flow::L4FlowId;
 use crate::types::{IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, PortRange};
 
+pub use crate::gates::{AgentGate, L4AgentGates};
 pub(crate) use agent::{agent_commands, L4AgentGate};
-pub use agent::{AgentGate, L4AgentGates};
 pub use capture::{CaptureStart, CaptureStatus, CaptureStop};
 pub use craft::Craft;
 pub use flow::{FlowGet, FlowList};
@@ -351,11 +351,12 @@ fn scope_entry_fields() -> Vec<aitm_core::ParamDef> {
 pub(crate) fn active_commands(
     guard: Arc<crate::guard::L4Guard>,
     store: Arc<dyn crate::flow::L4FlowStore>,
-    gates: Arc<L4AgentGates>,
 ) -> Vec<Arc<dyn Command>> {
     vec![
         Arc::new(L4Interfaces),
-        Arc::new(ScopeAdd::new(guard.clone(), gates)),
+        // `ScopeAdd` is thin: the widen gate (reading the shared gates) and the forced
+        // `source = Runtime` live in `L4Guard::add_runtime_scope`.
+        Arc::new(ScopeAdd::new(guard.clone())),
         Arc::new(ScopeRemove::new(guard.clone())),
         Arc::new(ScopeList::new(guard)),
         Arc::new(FlowList::new(store.clone())),

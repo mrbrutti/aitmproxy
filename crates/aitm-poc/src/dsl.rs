@@ -129,6 +129,11 @@ fn next_u64() -> u64 {
     })
 }
 
+/// Upper bound on a `rand_text_alpha` length. A unique marker needs only a
+/// handful of characters; the cap stops a hostile or mistyped length argument
+/// from allocating an arbitrarily large string (at precheck time, no less).
+pub const MAX_RAND_TEXT_ALPHA: usize = 4096;
+
 /// A random alphabetic string of length `n` (nuclei `rand_text_alpha`).
 pub fn rand_text_alpha(n: usize) -> String {
     const ALPHA: &[u8; 52] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -186,10 +191,20 @@ fn as_string(v: &Value) -> String {
     }
 }
 
+fn is_numeric(v: &Value) -> bool {
+    matches!(v, Value::Int(_) | Value::Float(_))
+}
+
 fn values_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x == y,
-        _ => as_string(a) == as_string(b),
+        (Value::Float(x), Value::Float(y)) => x == y,
+        (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => (*x as f64) == *y,
+        // A number never equals a non-number, so no cross-type stringify can make
+        // `Int(200) == Str("200")` true. Non-numeric values keep string-coercion
+        // equality, which preserves the `step("x") == ""` null-is-empty idiom.
+        (a, b) if is_numeric(a) || is_numeric(b) => false,
+        (a, b) => as_string(a) == as_string(b),
     }
 }
 
@@ -413,15 +428,63 @@ fn call(name: &str, args: Vec<Value>, ctx: &DslContext) -> anyhow::Result<Value>
         "base64" => Ok(Value::Str(base64(&arg_str(0)))),
         "html_escape" => Ok(Value::Str(html_escape(&arg_str(0)))),
         "to_lower" => Ok(Value::Str(arg_str(0).to_lowercase())),
-        "len" => Ok(Value::Int(arg_str(0).len() as i64)),
+        // `len` counts Unicode scalar values (characters), not UTF-8 bytes.
+        "len" => Ok(Value::Int(arg_str(0).chars().count() as i64)),
         "concat" => Ok(Value::Str(args.iter().map(as_string).collect())),
         "rand_text_alpha" => {
             let n = match args.first() {
-                Some(Value::Int(i)) => (*i).max(0) as usize,
+                Some(Value::Int(i)) => *i,
                 _ => 0,
             };
-            Ok(Value::Str(rand_text_alpha(n)))
+            if n < 0 {
+                anyhow::bail!("rand_text_alpha length must be non-negative, got {n}");
+            }
+            if n as u64 > MAX_RAND_TEXT_ALPHA as u64 {
+                anyhow::bail!(
+                    "rand_text_alpha length {n} exceeds the maximum of {MAX_RAND_TEXT_ALPHA}"
+                );
+            }
+            Ok(Value::Str(rand_text_alpha(n as usize)))
         }
         other => anyhow::bail!("unknown DSL function `{other}`"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// I6: a huge `rand_text_alpha` length errors at evaluation (which `check`
+    /// runs at precheck) instead of allocating; a small one still works.
+    #[test]
+    fn rand_text_alpha_caps_length() {
+        let ctx = DslContext::default();
+        let v = eval("rand_text_alpha(8)", &ctx).expect("a small length is fine");
+        assert_eq!(as_string(&v).chars().count(), 8);
+
+        let huge = format!("rand_text_alpha({})", MAX_RAND_TEXT_ALPHA as i64 + 1);
+        assert!(eval(&huge, &ctx).is_err(), "an oversize length must error");
+        // `check` is the precheck entry point; it must reject it too.
+        assert!(check(&huge).is_err());
+    }
+
+    /// Minor (a): `==` does not stringify across types — a number equals only a
+    /// number, so `200 == "200"` is false.
+    #[test]
+    fn equality_is_type_aware() {
+        let ctx = DslContext::default();
+        assert_eq!(eval("200 == 200", &ctx).unwrap(), Value::Bool(true));
+        assert_eq!(eval("200 == \"200\"", &ctx).unwrap(), Value::Bool(false));
+        assert_eq!(eval("\"x\" == \"x\"", &ctx).unwrap(), Value::Bool(true));
+        assert_eq!(eval("\"x\" != 1", &ctx).unwrap(), Value::Bool(true));
+    }
+
+    /// Minor (b): `len` counts characters, not UTF-8 bytes.
+    #[test]
+    fn len_counts_characters() {
+        let ctx = DslContext::default();
+        // "é" is two UTF-8 bytes but one character.
+        assert_eq!(eval("len(\"é\")", &ctx).unwrap(), Value::Int(1));
+        assert_eq!(eval("len(\"abc\")", &ctx).unwrap(), Value::Int(3));
     }
 }

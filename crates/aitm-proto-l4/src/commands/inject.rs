@@ -32,7 +32,7 @@ use aitm_core::{
 use crate::backend::CaptureInjectBackend;
 use crate::craft::PacketSpec;
 use crate::flow::{L4Bind, L4Flow, L4FlowId, L4FlowKind, L4FlowStore, L4Meta, L4Packet};
-use crate::guard::L4Guard;
+use crate::guard::{L4Guard, L4GuardError};
 use crate::types::{L4Action, L4Capability, L4Direction, L4Target};
 use crate::wire::send_on_wire;
 
@@ -208,20 +208,43 @@ impl Command for Inject {
             .build()
             .map_err(|e| anyhow::anyhow!("craft failed: {e}"))?;
 
-        let target = L4Target {
-            interface: interface.clone(),
-            direction: L4Direction::Outbound,
-            dst: Some(dst),
-            dst_port,
-            proto: spec.transport_proto(),
-        };
+        // C3: the guard must gate the destination actually put on the wire, not the
+        // `dst` parameter. `send_on_wire(&bytes)` ships the spec's own IP layer and the
+        // kernel routes by the packet's headers, so a spec crafting an out-of-scope or
+        // denylisted IP could otherwise ride an in-scope `dst` param past the guard.
+        // Resolve the real target from the built bytes (as the intercept-forward path
+        // does via `ip_target`) and refuse a spec whose destination (or port)
+        // contradicts the declared `dst`/`port`, or that carries no decodable IP
+        // destination — the latter cannot be proven in scope (deny-by-default).
+        let real_target = crate::capture::packet_target(&bytes, &interface, L4Direction::Outbound)
+            .ok_or_else(|| {
+                anyhow::Error::new(L4GuardError::OutOfL4Scope(
+                    "crafted packet has no decodable IP destination; cannot verify scope".into(),
+                ))
+            })?;
+        if real_target.dst != Some(dst) {
+            return Err(anyhow::Error::new(L4GuardError::OutOfL4Scope(
+                real_target
+                    .dst
+                    .map_or_else(|| dst.to_string(), |d| d.to_string()),
+            )));
+        }
+        if let Some(p) = dst_port {
+            if real_target.dst_port != Some(p) {
+                return Err(anyhow::Error::new(L4GuardError::OutOfL4Scope(format!(
+                    "{dst} (crafted port {:?} ≠ declared {p})",
+                    real_target.dst_port
+                ))));
+            }
+        }
 
         // (1) Primary gate: the L4 guard (scope + dangerous-destination denylist +
-        // rate) mints the injection permit the choke point requires. Checked first so
-        // the refusal an operator sees is the specific L4 one (deny-by-default).
+        // rate) mints the injection permit the choke point requires, checked against
+        // the packet's *real* target. Checked first so the refusal an operator sees is
+        // the specific L4 one (deny-by-default).
         let mut permit = self
             .guard
-            .check(L4Action::Inject, &target)
+            .check(L4Action::Inject, &real_target)
             .map_err(anyhow::Error::new)?;
         // (2) Defense in depth: the proxy-wide scope/rate/concurrency guard on the
         // destination host. The permit is held across the batch.
@@ -450,6 +473,58 @@ mod tests {
         assert!(
             matches!(typed, L4GuardError::OutOfL4Scope(_)),
             "want OutOfL4Scope, got {typed:?}"
+        );
+        assert!(backend.sent().is_empty(), "nothing reached the wire");
+        assert!(
+            store.list().is_empty(),
+            "no flow recorded for a refused inject"
+        );
+    }
+
+    /// C3 (security): a spec whose crafted IP destination is a denylisted host, sent
+    /// with an in-scope `dst` param, is refused — the guard gates the packet's real
+    /// destination, not the parameter. Nothing reaches the wire; no flow is recorded.
+    #[test]
+    fn inject_spec_dst_overrides_param_is_refused() {
+        // Scope grants Inject to the loopback host the param names...
+        let guard = Arc::new(L4Guard::new(&L4Config::default()));
+        guard
+            .add_scope(entry(
+                ("127.0.0.1", 32),
+                "lo0",
+                L4Capability::Inject,
+                (100, 100),
+            ))
+            .unwrap();
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let backend = MockBackend::available();
+        let cmd = Inject::new(guard, store.clone(), backend.clone());
+
+        let mem = MemFlowStore::new();
+        let client = StubClient;
+        let core = core_guard_scoped();
+        let host = CommandHost::new(&mem, &client, &core, None);
+
+        // ...but the spec crafts a packet to the cloud-metadata denylist address while
+        // passing the in-scope `dst = 127.0.0.1` to satisfy the param check.
+        let err = cmd
+            .invoke(
+                inject_params(
+                    udp_spec_value("169.254.169.254", 9),
+                    "127.0.0.1",
+                    "lo0",
+                    9,
+                    1,
+                ),
+                &host,
+            )
+            .unwrap_err();
+        let typed = err
+            .downcast_ref::<L4GuardError>()
+            .unwrap_or_else(|| panic!("want a typed L4GuardError, got {err:?}"));
+        assert!(
+            matches!(typed, L4GuardError::OutOfL4Scope(_)),
+            "a spec dst that contradicts the param must be refused, got {typed:?}"
         );
         assert!(backend.sent().is_empty(), "nothing reached the wire");
         assert!(
