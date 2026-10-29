@@ -64,7 +64,9 @@ pub struct ScriptHandle {
     name: String,
     path: PathBuf,
     /// What the loader parsed from the script: its `API` and the hooks it defines.
-    meta: ScriptMeta,
+    /// Live like the AST: a reload can change the hook set, so it is swapped
+    /// with the AST. `name` and `path` above are stable across a reload.
+    meta: ArcSwap<ScriptMeta>,
     ast: ArcSwap<AST>,
     /// Whether the script's hooks run. Advisory and read per event: no other
     /// state depends on it, so relaxed ordering is enough.
@@ -76,7 +78,7 @@ impl ScriptHandle {
         Self {
             name: meta.name.clone(),
             path: meta.path.clone(),
-            meta: meta.clone(),
+            meta: ArcSwap::from_pointee(meta.clone()),
             ast: ArcSwap::from_pointee(named(ast, &meta.name)),
             enabled: AtomicBool::new(true),
         }
@@ -92,9 +94,10 @@ impl ScriptHandle {
         &self.path
     }
 
-    /// The script's declared metadata: `api` and the hooks it defines.
-    pub fn meta(&self) -> &ScriptMeta {
-        &self.meta
+    /// The script's declared metadata as of its latest compile: `api` and the
+    /// hooks it defines. A snapshot; a later swap does not change it.
+    pub fn meta(&self) -> Arc<ScriptMeta> {
+        self.meta.load_full()
     }
 
     /// Whether the script's hooks fire. A new handle is enabled.
@@ -107,10 +110,13 @@ impl ScriptHandle {
         self.enabled.store(enabled, Ordering::Relaxed);
     }
 
-    /// Put a freshly compiled AST in service. The caller keeps the old one by
-    /// simply not calling this when a recompile fails.
-    pub fn swap(&self, ast: AST) {
+    /// Put a freshly compiled AST in service together with the metadata it was
+    /// compiled to, so `meta()` never describes a different script than the one
+    /// running. The caller keeps the old pair by simply not calling this when a
+    /// recompile fails.
+    pub fn swap(&self, ast: AST, meta: ScriptMeta) {
         self.ast.store(Arc::new(named(ast, &self.name)));
+        self.meta.store(Arc::new(meta));
     }
 
     fn current(&self) -> Arc<AST> {
@@ -218,8 +224,8 @@ impl ScriptPlugin {
 
     /// Swap in a freshly compiled AST (the hot-reload seam; see
     /// [`ScriptHandle::swap`]).
-    pub fn reload(&self, ast: AST) {
-        self.handle.swap(ast);
+    pub fn reload(&self, ast: AST, meta: ScriptMeta) {
+        self.handle.swap(ast, meta);
     }
 
     /// The handle `script.reload` swaps the AST through. Taken by the wiring

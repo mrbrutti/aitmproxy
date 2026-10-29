@@ -631,7 +631,7 @@ async fn reload_swaps_the_hooks() {
         .engine
         .compile(r#"fn on_request(flow) { flow.request.headers.set("X-Version", "2"); halt(); }"#)
         .expect("compiles");
-    plugin.reload(next);
+    plugin.reload(next, plugin.meta().clone());
 
     let mut flow = http_flow();
     let id = flow.id();
@@ -709,7 +709,7 @@ async fn handle_meta_returns_the_parsed_api_and_hooks() {
     );
 
     let handle = plugin.handle();
-    assert_eq!(handle.meta(), &declared);
+    assert_eq!(*handle.meta(), declared);
     assert_eq!(handle.meta().api, "1");
     assert_eq!(
         handle.meta().hooks,

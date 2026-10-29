@@ -1030,6 +1030,73 @@ async fn script_save_overwrite_swaps_the_loaded_hook_live() {
     assert_eq!(h.handles.len(), 1, "no handle is added or duplicated");
 }
 
+const SAVED_V3_WITH_RESPONSE: &str = r#"
+const NAME = "versioned";
+fn on_request(flow) { flow.request.headers.set("X-V", "3"); }
+fn on_response(flow) { }
+"#;
+
+/// The `hooks` array `script.list` reports for the one loaded script.
+fn listed_hooks(h: &Harness) -> Value {
+    let out = h
+        .invoke("script.list", Params::default())
+        .expect("script.list succeeds");
+    match out {
+        Value::Array(items) => {
+            assert_eq!(items.len(), 1, "exactly one loaded script: {items:?}");
+            field(&items[0], "hooks").clone()
+        }
+        other => panic!("expected an array, got {other:?}"),
+    }
+}
+
+fn hooks_value(names: &[&str]) -> Value {
+    Value::Array(names.iter().map(|n| Value::Str((*n).into())).collect())
+}
+
+/// `script.list` reports the hooks the script defines NOW: a reload that adds a
+/// hook shows it, not the set the script was first loaded with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_list_reports_fresh_hooks_after_reload() {
+    let script = TempScript::new("versioned", V1);
+    let h = Harness::new(vec![ScriptEntry::new(script.path())]);
+    assert_eq!(listed_hooks(&h), hooks_value(&["on_request"]));
+
+    script.rewrite(V2);
+    h.invoke(
+        "script.reload",
+        params(&[("name", Value::Str("versioned".into()))]),
+    )
+    .expect("reload succeeds");
+
+    assert_eq!(
+        listed_hooks(&h),
+        hooks_value(&["on_request", "on_response"]),
+        "script.list must follow the reloaded script, not the load-time meta"
+    );
+}
+
+/// The same freshness holds when an overwrite `script.save` swaps the script.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_list_reports_fresh_hooks_after_overwrite_save() {
+    let script = TempScript::new("versioned", V1);
+    let dir = script.path().parent().expect("dir").to_path_buf();
+    let h = save_harness(vec![ScriptEntry::new(script.path())], Some(dir));
+    assert_eq!(listed_hooks(&h), hooks_value(&["on_request"]));
+
+    h.invoke(
+        "script.save",
+        save_args("versioned", SAVED_V3_WITH_RESPONSE),
+    )
+    .expect("overwrite-save succeeds");
+
+    assert_eq!(
+        listed_hooks(&h),
+        hooks_value(&["on_request", "on_response"]),
+        "script.list must follow the overwritten script, not the load-time meta"
+    );
+}
+
 /// AC4 (new branch): a never-loaded name is written, compiled and validated,
 /// reports `restart_required: true`, and — the chain being sealed — its hook
 /// does not fire this session.
