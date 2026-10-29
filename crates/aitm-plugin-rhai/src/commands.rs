@@ -1,5 +1,5 @@
 //! The tier's own operator-facing commands (spec §3, §8): `script.validate`,
-//! `script.reload`, and `script.findings`, registered by [`ScriptCommands`] —
+//! `script.reload`, `script.findings`, and `script.list`, registered by [`ScriptCommands`] —
 //! one more `Plugin` whose `load` adds native `Command`s, so MCP `tools/list`
 //! and the CLI (`aitm script validate --path x.rhai`) pick them up with no
 //! special casing.
@@ -19,6 +19,10 @@
 //!   (newest last), and how many the bounded sink dropped. Distinct from the
 //!   persistent `findings.*` store (`aitm-findings`): this lists only the
 //!   current process's script-emitted findings and persists nothing.
+//! - **`script.list {}`** enumerates the loaded scripts in chain order:
+//!   `{ name, path, api, hooks, enabled, last_error }`, read from the live
+//!   handles and the shared [`ErrorSink`], so it reports current state, not
+//!   the config file. Read-tier, so an agent may call it.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -26,14 +30,14 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    Command, CommandHost, Frontend, ParamDef, ParamSchema, Params, Plugin, Registry, TypeDesc,
-    Value,
+    Command, CommandHost, Frontend, ParamDef, ParamSchema, Params, Plugin, Registry, Sensitivity,
+    TypeDesc, Value,
 };
 
 use crate::config::ScriptMeta;
 use crate::host_core::{severity_name, Finding, FindingSink};
 use crate::loader::RhaiLoader;
-use crate::plugin::ScriptHandle;
+use crate::plugin::{ErrorSink, ScriptHandle};
 
 /// Registers the three commands. Built by `wire::build` over the same loader
 /// and sink the plugins use; the host registers it among the command
@@ -42,6 +46,7 @@ pub struct ScriptCommands {
     loader: Arc<RhaiLoader>,
     scripts: Vec<Arc<ScriptHandle>>,
     findings: Arc<dyn FindingSink>,
+    errors: Arc<ErrorSink>,
 }
 
 impl ScriptCommands {
@@ -49,11 +54,13 @@ impl ScriptCommands {
         loader: Arc<RhaiLoader>,
         scripts: Vec<Arc<ScriptHandle>>,
         findings: Arc<dyn FindingSink>,
+        errors: Arc<ErrorSink>,
     ) -> Self {
         Self {
             loader,
             scripts,
             findings,
+            errors,
         }
     }
 }
@@ -70,9 +77,14 @@ impl Plugin for ScriptCommands {
         reg.add_command(Arc::new(Reload {
             loader: Arc::clone(&self.loader),
             scripts: self.scripts.clone(),
+            errors: Arc::clone(&self.errors),
         }));
         reg.add_command(Arc::new(ScriptFindings {
             findings: Arc::clone(&self.findings),
+        }));
+        reg.add_command(Arc::new(List {
+            scripts: self.scripts.clone(),
+            errors: Arc::clone(&self.errors),
         }));
     }
 }
@@ -84,6 +96,12 @@ struct Validate {
 struct Reload {
     loader: Arc<RhaiLoader>,
     scripts: Vec<Arc<ScriptHandle>>,
+    errors: Arc<ErrorSink>,
+}
+
+struct List {
+    scripts: Vec<Arc<ScriptHandle>>,
+    errors: Arc<ErrorSink>,
 }
 
 struct ScriptFindings {
@@ -200,6 +218,7 @@ impl Command for Reload {
             .compile(handle.path())
             .map_err(|err| anyhow::anyhow!("{err}"))?;
         handle.swap(ast);
+        self.errors.clear(&name);
         tracing::info!(
             target: "aitm_plugin_rhai::loader",
             script = %name,
@@ -249,6 +268,57 @@ impl Command for ScriptFindings {
                 Value::Int(i64::try_from(self.findings.dropped()).unwrap_or(i64::MAX)),
             ),
         ])))
+    }
+}
+
+impl Command for List {
+    fn name(&self) -> &str {
+        "script.list"
+    }
+
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "List the loaded scripts in chain order: name, path, API, hooks, \
+                          whether enabled, and the most recent hook error (null if none)."
+                .to_string(),
+            params: Vec::new(),
+            result: TypeDesc::Any,
+        }
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
+    }
+
+    fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+        Ok(Value::Array(
+            self.scripts
+                .iter()
+                .map(|s| {
+                    let meta = s.meta();
+                    Value::Object(BTreeMap::from([
+                        ("name".to_string(), Value::Str(s.name().to_string())),
+                        (
+                            "path".to_string(),
+                            Value::Str(s.path().display().to_string()),
+                        ),
+                        ("api".to_string(), Value::Str(meta.api.clone())),
+                        (
+                            "hooks".to_string(),
+                            Value::Array(meta.hooks.iter().cloned().map(Value::Str).collect()),
+                        ),
+                        ("enabled".to_string(), Value::Bool(s.is_enabled())),
+                        (
+                            "last_error".to_string(),
+                            self.errors
+                                .last_error(s.name())
+                                .map(Value::Str)
+                                .unwrap_or(Value::Null),
+                        ),
+                    ]))
+                })
+                .collect(),
+        ))
     }
 }
 

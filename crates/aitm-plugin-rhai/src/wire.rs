@@ -6,7 +6,7 @@
 //! the executor the PoC runner dispatches `script` steps through, the error
 //! sink the chain is bound into once it exists, and the plugin that registers
 //! the tier's own commands (`script.validate`, `script.reload`,
-//! `script.findings`). [`build`] returns all five; [`load_scripts`] is the
+//! `script.findings`, `script.list`). [`build`] returns all five; [`load_scripts`] is the
 //! one-line form for a host that only wants plugins, and [`executor`] builds
 //! the PoC-side half from a loader the caller already has.
 //!
@@ -59,12 +59,13 @@ pub fn build(cfg: RhaiConfig, services: ScriptServices) -> Result<ScriptTier, Sc
     let loader = Arc::new(RhaiLoader::new(cfg, services)?);
     let (plugins, errors) = loader.load_all();
     let handles = plugins.iter().map(ScriptPlugin::handle).collect();
+    let error_sink = loader.error_sink();
     Ok(ScriptTier {
         plugins,
         errors,
         executor: Arc::new(executor(&loader)),
-        error_sink: loader.error_sink(),
-        commands: ScriptCommands::new(loader, handles, findings),
+        error_sink: Arc::clone(&error_sink),
+        commands: ScriptCommands::new(loader, handles, findings, error_sink),
         limits,
     })
 }

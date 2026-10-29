@@ -16,7 +16,7 @@ use aitm_core::{
 };
 use aitm_plugin_rhai::config::{RhaiConfig, ScriptEntry};
 use aitm_plugin_rhai::host_core::{FindingSink, MemoryFindingSink, ScriptServices};
-use aitm_plugin_rhai::wire;
+use aitm_plugin_rhai::{wire, ScriptHandle};
 
 struct StubClient;
 
@@ -69,6 +69,8 @@ struct Harness {
     findings: Arc<MemoryFindingSink>,
     registry: Arc<Registry>,
     chain: Chain,
+    /// The live handles of the loaded scripts, in chain order.
+    handles: Vec<Arc<ScriptHandle>>,
 }
 
 impl Harness {
@@ -93,6 +95,11 @@ impl Harness {
         .expect("tier builds");
         assert!(tier.errors.is_empty(), "scripts compile: {:?}", tier.errors);
 
+        let handles: Vec<Arc<ScriptHandle>> = tier
+            .plugins
+            .iter()
+            .map(aitm_plugin_rhai::ScriptPlugin::handle)
+            .collect();
         let mut registry = Registry::new();
         for plugin in tier.plugins {
             registry.add_plugin(Box::new(plugin));
@@ -105,6 +112,7 @@ impl Harness {
             findings,
             registry,
             chain,
+            handles,
         }
     }
 
@@ -132,6 +140,16 @@ impl Harness {
             .with_frontend(frontend)
             .with_poc_dir(poc_dir);
         cmd.invoke(params, &host)
+    }
+
+    /// Dispatch a request carrying `header: value` through the chain.
+    async fn dispatch_with_header(&self, header: &str, value: &str) {
+        let mut flow = request();
+        if let Flow::Http(f) = &mut flow {
+            f.request.headers.set(header, value);
+        }
+        let id = self.store.insert(flow);
+        self.chain.dispatch(Event::Request(id)).await;
     }
 
     /// Dispatch a request through the chain and return the `X-V` header the
@@ -462,4 +480,128 @@ fn memory_sink_is_bounded_and_counts_drops() {
         0,
         "the default sink is bounded too (it just has a large capacity)"
     );
+}
+
+/// The `script.list` rows as `(name, row)` pairs, in the order returned.
+fn list_rows(h: &Harness) -> Vec<Value> {
+    match h
+        .invoke("script.list", Params::default())
+        .expect("script.list runs")
+    {
+        Value::Array(rows) => rows,
+        other => panic!("script.list is an array: {other:?}"),
+    }
+}
+
+const FAILS_ON_HEADER: &str = r#"
+const NAME = "flaky";
+fn on_request(flow) {
+    if flow.request.headers.has("X-Fail") { throw "boom from flaky"; }
+}
+"#;
+
+/// Spec F8a / AC1: `script.list` returns one object per loaded script in chain
+/// (declaration) order with its name, path, API, hooks, `enabled: true` and
+/// `last_error: null`, and is a read-tier command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_list_reports_every_loaded_script_in_chain_order() {
+    let first = TempScript::new("versioned", V2);
+    let second = TempScript::new("observer", "fn on_response(flow) { }\n");
+    let h = Harness::new(vec![
+        ScriptEntry::new(first.path()),
+        ScriptEntry::new(second.path()),
+    ]);
+    assert_eq!(
+        h.registry
+            .command("script.list")
+            .expect("script.list is registered")
+            .sensitivity(),
+        aitm_core::Sensitivity::Read
+    );
+
+    let rows = list_rows(&h);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(field(&rows[0], "name"), &Value::Str("versioned".into()));
+    assert_eq!(
+        field(&rows[0], "path"),
+        &Value::Str(first.path().display().to_string())
+    );
+    assert_eq!(field(&rows[0], "api"), &Value::Str("1".into()));
+    assert_eq!(
+        field(&rows[0], "hooks"),
+        &Value::Array(vec![
+            Value::Str("on_request".into()),
+            Value::Str("on_response".into())
+        ])
+    );
+    assert_eq!(field(&rows[0], "enabled"), &Value::Bool(true));
+    assert_eq!(field(&rows[0], "last_error"), &Value::Null);
+
+    assert_eq!(field(&rows[1], "name"), &Value::Str("observer".into()));
+    assert_eq!(
+        field(&rows[1], "hooks"),
+        &Value::Array(vec![Value::Str("on_response".into())])
+    );
+    assert_eq!(field(&rows[1], "enabled"), &Value::Bool(true));
+    assert_eq!(field(&rows[1], "last_error"), &Value::Null);
+}
+
+/// A hook that throws surfaces its message in `last_error`; a later clean run
+/// of the same hook clears it (no stale error).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_list_last_error_records_a_hook_failure_and_clears_on_success() {
+    let script = TempScript::new("flaky", FAILS_ON_HEADER);
+    let h = Harness::new(vec![ScriptEntry::new(script.path())]);
+
+    h.dispatch_with_header("X-Fail", "1").await;
+    let rows = list_rows(&h);
+    assert!(
+        matches!(field(&rows[0], "last_error"), Value::Str(m) if m.contains("boom from flaky")),
+        "the failed hook's message is reported: {:?}",
+        rows[0]
+    );
+
+    h.dispatch_with_header("X-Ok", "1").await;
+    assert_eq!(
+        field(&list_rows(&h)[0], "last_error"),
+        &Value::Null,
+        "a clean run clears the stale error"
+    );
+}
+
+/// An errored script that is fixed and reloaded no longer reports the old
+/// error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_list_last_error_clears_on_successful_reload() {
+    let script = TempScript::new("flaky", FAILS_ON_HEADER);
+    let h = Harness::new(vec![ScriptEntry::new(script.path())]);
+
+    h.dispatch_with_header("X-Fail", "1").await;
+    assert!(matches!(
+        field(&list_rows(&h)[0], "last_error"),
+        Value::Str(_)
+    ));
+
+    script.rewrite("const NAME = \"flaky\";\nfn on_request(flow) { }\n");
+    h.invoke(
+        "script.reload",
+        params(&[("name", Value::Str("flaky".into()))]),
+    )
+    .expect("reload of the fixed script succeeds");
+    assert_eq!(field(&list_rows(&h)[0], "last_error"), &Value::Null);
+}
+
+/// A script disabled through its handle lists `enabled: false`; the other
+/// stays `true`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_list_shows_a_disabled_script_as_not_enabled() {
+    let a = TempScript::new("alpha", "fn on_request(flow) { }\n");
+    let b = TempScript::new("beta", "fn on_request(flow) { }\n");
+    let h = Harness::new(vec![ScriptEntry::new(a.path()), ScriptEntry::new(b.path())]);
+    h.handles[0].set_enabled(false);
+
+    let rows = list_rows(&h);
+    assert_eq!(field(&rows[0], "name"), &Value::Str("alpha".into()));
+    assert_eq!(field(&rows[0], "enabled"), &Value::Bool(false));
+    assert_eq!(field(&rows[1], "enabled"), &Value::Bool(true));
 }

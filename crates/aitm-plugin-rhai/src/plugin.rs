@@ -19,6 +19,7 @@
 //! runtime handle for what is left of the budget, and `browser.*` knows to
 //! refuse (spec §6).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
@@ -128,12 +129,41 @@ impl ScriptHandle {
 #[derive(Default)]
 pub struct ErrorSink {
     sink: RwLock<Option<Arc<dyn EventSink>>>,
+    /// Script name -> the message of its most recent failed hook, cleared when
+    /// the script next runs a hook cleanly or is reloaded. What `script.list`
+    /// reports as `last_error`.
+    last: Mutex<BTreeMap<String, String>>,
 }
 
 impl ErrorSink {
     /// Route emitted errors through `sink` (the chain) from now on.
     pub fn bind(&self, sink: Arc<dyn EventSink>) {
         *self.sink.write().unwrap_or_else(PoisonError::into_inner) = Some(sink);
+    }
+
+    /// Remember `message` as `script`'s most recent error.
+    pub fn record(&self, script: &str, message: String) {
+        self.last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(script.to_string(), message);
+    }
+
+    /// Forget `script`'s recorded error (it ran cleanly or was reloaded).
+    pub fn clear(&self, script: &str) {
+        self.last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(script);
+    }
+
+    /// `script`'s most recent recorded error, if it has one.
+    pub fn last_error(&self, script: &str) -> Option<String> {
+        self.last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(script)
+            .cloned()
     }
 
     fn current(&self) -> Option<Arc<dyn EventSink>> {
@@ -230,6 +260,7 @@ impl ScriptPlugin {
     /// the hook its own failure forever.
     fn report(&self, ev: &Event, flow: FlowId, err: &ScriptError) {
         tracing::error!(target: SCRIPT_TARGET, script = %self.meta.name, "{err}");
+        self.errors.record(&self.meta.name, err.to_string());
         if matches!(ev, Event::Error { .. }) {
             return;
         }
@@ -292,7 +323,10 @@ impl Plugin for ScriptPlugin {
         let args = hook_args(ev, &state);
 
         match self.call_hook(&ast, hook, &state, args) {
-            Ok(()) => take(state).apply_to(ctx),
+            Ok(()) => {
+                self.errors.clear(&self.meta.name);
+                take(state).apply_to(ctx)
+            }
             Err(err) => {
                 // `state` is dropped unapplied: the flow stays as it was.
                 let err = ScriptError::from_eval(&self.meta.name, hook, &err, &self.budget);
