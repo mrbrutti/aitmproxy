@@ -141,6 +141,7 @@ fn config(tag: &str) -> Config {
     cfg.mcp.transport = McpTransport::LoopbackTcp {
         port: 0,
         token: AGENT_TOKEN.into(),
+        endpoint_file: None,
     };
     cfg.mcp.operator_token = Some(OPERATOR_TOKEN.into());
     cfg
