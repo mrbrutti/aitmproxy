@@ -1,0 +1,8 @@
+# The agent token is a secret: never commit it. The bridge reads it from a file
+# passed via --token-file; keep those files out of the repo.
+*.token
+agent.token
+
+# Python bytecode cache from running the bridge.
+__pycache__/
+*.pyc

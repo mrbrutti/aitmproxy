@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "aitmproxy": {
+      "command": "python3",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/../bridge.py",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8084",
+        "--token-file",
+        "${AITM_AGENT_TOKEN_FILE}"
+      ],
+      "env": {}
+    }
+  }
+}

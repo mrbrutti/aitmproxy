@@ -33,6 +33,7 @@ dependencies = [
  "aitm-ca",
  "aitm-cli",
  "aitm-core",
+ "aitm-findings",
  "aitm-mcp",
  "aitm-plugin",
  "aitm-plugin-rhai",
