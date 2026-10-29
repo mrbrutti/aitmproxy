@@ -1,0 +1,188 @@
+/* Direction D — "The wire", aligned to the aitmproxy operator-UI design system
+   (docs/design/tokens.json). Same palette, type and radii as the macOS app,
+   the web UI and the TUI, so the site and the product read as one thing.
+
+   Brand accent = BLUE (Proxyman WebUI active-tab blue).
+   Intercept/armed state = AMBER (the one saturated signal; "a flow is held").
+   AI agent over MCP = TEAL (distinct from every method/status hue).
+   Type: Inter (UI) + JetBrains Mono (all data/code). Restrained scale. */
+
+@import url("https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..600&family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap");
+
+:root {
+  color-scheme: light dark;
+
+  /* ground + ink (app light values) */
+  --paper:    #FFFFFF;   /* body / panels */
+  --paper-2:  #F3F4F6;   /* raised: bars, wells, chips, hover, row rules */
+  --paper-3:  #E8EAED;   /* deeper step */
+  --page:     #F7F8FA;   /* the app's page tone, behind screenshots */
+  --hairline: #E5E7EB;   /* border */
+  --rule:     #F0F1F3;   /* row separators, one step lighter than border */
+  --control:  #D1D5DB;   /* input / outlined-control borders */
+  --ink:      #111827;   /* text primary */
+  --ink-2:    #4B5563;   /* text secondary */
+  --ink-3:    #616A78;   /* text tertiary */
+
+  /* brand accent — blue */
+  --accent:      #2563EB;
+  --accent-deep: #1D4ED8;
+  --accent-tint: #DBEAFE;
+  --accent-ink:  #FFFFFF;
+  --link:        #1D4ED8;
+
+  /* intercept / armed — amber (the single saturated signal) */
+  --signal:      #D97706;
+  --signal-deep: #B45309;
+  --signal-tint: #FEF3C7;
+  --signal-ink:  #1F1300;
+
+  /* AI agent over MCP — teal */
+  --agent:      #0D9488;
+  --agent-deep: #0F766E;
+  --agent-tint: #CCFBF1;
+
+  /* method badge colours (fg/bg), app convention */
+  --m-get-fg: #1D4ED8;  --m-get-bg: #DBEAFE;
+  --m-post-fg: #15803D; --m-post-bg: #DCFCE7;
+  --m-put-fg: #B45309;  --m-put-bg: #FEF3C7;
+  --m-patch-fg: #C2410C;--m-patch-bg: #FFEDD5;
+  --m-del-fg: #B91C1C;  --m-del-bg: #FEE2E2;
+  --m-ws-fg: #6D28D9;   --m-ws-bg: #EDE9FE;
+  --st-ok: #15803D;     --st-warn: #B45309;  --st-err: #B91C1C;  --st-info: #6D28D9;
+
+  /* the product's dark surfaces (code, terminals, dark screenshots backdrop) */
+  --console:       #161618;
+  --console-2:     #1E1E20;
+  --console-line:  #2E2E31;
+  --console-text:  #E6E6E8;
+  --console-muted: #8E8E93;
+  --console-signal:#F5A524;   /* amber on dark */
+  --console-agent: #2DD4BF;   /* teal on dark */
+  --console-blue:  #60A5FA;
+
+  /* syntax palette — the app's CodeMirror body-viewer theme (dark values from tokens.json) */
+  --cm-key:     #E58BC9;  /* property names, YAML/JSON keys */
+  --cm-string:  #E8B86D;  /* string values */
+  --cm-number:  #7FD88F;  /* numbers */
+  --cm-boolean: #C4B5FD;  /* true/false/null, keywords */
+  --cm-punct:   #8E8E93;  /* braces, colons, commas, comments */
+  --cm-bracket: #E5C07B;  /* outer object/array brackets */
+  --cm-ln:      #5C5C62;  /* line numbers */
+  --cm-current: #232325;  /* current-line highlight */
+  --cm-match:   #6B5312;  /* find-in-body highlight */
+
+  /* type — two faces, one job each */
+  --serif: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;   /* UI face */
+  --mono:  "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  /* restrained scale — no oversized display type */
+  --fs-display: clamp(1.625rem, 1.2rem + 1.5vw, 2.25rem);   /* 26 → 36 px */
+  --fs-h2:      clamp(1.375rem, 1.15rem + 0.7vw, 1.625rem); /* 22 → 26 px */
+  --fs-h3:      clamp(1.125rem, 1.05rem + 0.35vw, 1.3125rem);/* 18 → 21 px */
+  --fs-lead:    clamp(1.0625rem, 1rem + 0.3vw, 1.1875rem);  /* 17 → 19 px */
+  --fs-body:    1rem;           /* 16 */
+  --fs-small:   0.875rem;       /* 14 */
+  --fs-mono:    0.8125rem;      /* 13 */
+  --fs-mono-s:  0.75rem;        /* 12 */
+
+  /* rhythm */
+  --margin: clamp(1.25rem, 4vw, 4rem);
+  --max: 1200px;
+  --section: clamp(4rem, 8vw, 7.5rem);
+  --gap: clamp(1.25rem, 2.5vw, 2.25rem);
+
+  /* radii — app family (badge 4, control 6, panel 8, floating 10) */
+  --radius: 6px;
+  --radius-badge: 4px;
+  --radius-panel: 8px;
+  --radius-float: 10px;
+
+  /* shadow — only on what floats (app shadow.floating) */
+  --shadow-float: 0 8px 24px rgba(17,24,39,0.12), 0 1px 2px rgba(17,24,39,0.08);
+  --shadow-lift:  0 2px 6px rgba(17,24,39,0.08), 0 1px 2px rgba(17,24,39,0.05);
+
+  /* motion — app curves; feedback + a few authored reveals, nothing loud */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --dur: 200ms;
+  --dur-press: 120ms;
+  --dur-reveal: 600ms;
+}
+
+/* follow the system theme — the app's dark palette (docs/design/tokens.json) */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper:    #161618;
+    --paper-2:  #1E1E20;
+    --paper-3:  #262628;
+    --page:     #111113;
+    --hairline: #2E2E31;
+    --rule:     #252527;
+    --control:  #45454A;
+    --ink:      #E6E6E8;
+    --ink-2:    #B4B4B8;
+    --ink-3:    #8E8E93;
+
+    --accent:      #60A5FA;
+    --accent-deep: #3B82F6;
+    --accent-tint: #1E2A44;
+    --accent-ink:  #0B1220;
+    --link:        #7DB2F8;
+
+    --signal:      #F5A524;
+    --signal-deep: #FBBF24;
+    --signal-tint: #3A2E12;
+    --signal-ink:  #1F1300;
+
+    --agent:      #2DD4BF;
+    --agent-deep: #5EEAD4;
+    --agent-tint: #113A36;
+
+    --m-get-fg: #93C5FD;  --m-get-bg: #1E2A44;
+    --m-post-fg: #86EFAC; --m-post-bg: #14322A;
+    --m-put-fg: #FCD34D;  --m-put-bg: #3A2E12;
+    --m-patch-fg: #FDBA74;--m-patch-bg: #3B2516;
+    --m-del-fg: #FCA5A5;  --m-del-bg: #3B1C1C;
+    --m-ws-fg: #C4B5FD;   --m-ws-bg: #2E2550;
+    --st-ok: #4ADE80;     --st-warn: #FCD34D;  --st-err: #F87171;  --st-info: #C4B5FD;
+
+    --shadow-float: 0 12px 32px rgba(0,0,0,0.55), 0 1px 2px rgba(0,0,0,0.5);
+    --shadow-lift:  0 4px 14px rgba(0,0,0,0.45), 0 1px 2px rgba(0,0,0,0.4);
+  }
+}
+
+/* browser surfaces, themed from the palette */
+::selection { background: var(--accent-tint); color: var(--ink); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: var(--radius-badge); }
+.console :focus-visible, .code :focus-visible, .term :focus-visible, .tui :focus-visible { outline-color: var(--console-blue); }
+html { scrollbar-color: var(--paper-3) var(--paper); }
+::-webkit-scrollbar { width: 12px; height: 12px; }
+::-webkit-scrollbar-track { background: var(--paper); }
+::-webkit-scrollbar-thumb { background: var(--paper-3); border: 3px solid var(--paper); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: var(--control); }
+
+/* reset */
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: var(--fs-body);
+  line-height: 1.5;
+  font-optical-sizing: auto;
+  font-kerning: normal;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+h1, h2, h3, h4 { margin: 0; font-weight: 600; letter-spacing: -0.018em; text-wrap: balance; }
+p { margin: 0; }
+a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: 0.16em; }
+button { font: inherit; color: inherit; }
+code, pre, kbd, samp { font-family: var(--mono); font-feature-settings: "liga" 0; }
+img, svg { display: block; max-width: 100%; }
+ul, ol { margin: 0; padding: 0; }
+table { border-collapse: collapse; }

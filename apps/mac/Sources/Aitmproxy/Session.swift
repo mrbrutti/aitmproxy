@@ -218,6 +218,11 @@ final class Session {
     /// Bumped by Proxy ▸ Reconnect Bus (⌃⌘R) so the shell re-resolves the
     /// endpoint and reconnects — picking up a newly pasted operator token.
     var reconnectTick = 0
+    /// The single active core connection's id this launch (Task 5). Every flow
+    /// ingested over the bus is stamped with it; fixture/offline data uses the
+    /// well-known `.fixture` id. The seam for multi-core: a second connection is
+    /// additive because every stored flow already carries its originating id.
+    let activeCoreID: CoreID = Store.usesFixtures ? .fixture : CoreID()
     var scopeHosts: [String] = []
     var findingsCount = 0
     var browserTabs = 0
@@ -235,6 +240,12 @@ final class Session {
     var settingsTab: SettingsTab = SettingsTab(rawValue: UserDefaults.standard.string(forKey: "settings.tab") ?? "") ?? .general {
         didSet { if !Store.isOverridden { UserDefaults.standard.set(settingsTab.rawValue, forKey: "settings.tab") } }
     }
+
+    /// The switchable, persistent active-core choice (Task 7, AC10): embedded vs
+    /// external, driven from Settings ▸ Bus. Set once the live stack is built
+    /// (`ShellView`); `nil` in fixture/snapshot runs, where Bus settings show the
+    /// persisted default without a live core to switch.
+    @ObservationIgnored var connection: ActiveConnectionModel?
 
     /// Where actions go: the bus, or the fixture session itself.
     @ObservationIgnored lazy var actions: any FlowActions = FixtureActions(session: self)
@@ -293,6 +304,12 @@ final class Session {
     @ObservationIgnored lazy var browser = BrowserState(session: self)
     @ObservationIgnored lazy var activity = ActivityState(session: self)
     var activityLogVisible = false
+    /// The embedded core's health and captured logs (Task 8): the status-bar
+    /// health dot and the on-demand core-log panel read this. The
+    /// `EmbeddedCoreController` fills it; `nil` connection means no embedded core.
+    @ObservationIgnored lazy var coreHealth = CoreHealthState()
+    /// Proxy ▸ Core Log (⌃⌘L) toggles the on-demand core-log panel.
+    var coreLogVisible = false
     /// The flow a Build PoC sheet is for (S-053).
     var buildPoCFlowID: FlowID?
 

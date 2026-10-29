@@ -44,9 +44,18 @@ impl TestTarget {
     /// listener is accepting. Each call is an independent origin with its own
     /// state, so a vulnerable target and its patched control can run at once.
     pub async fn start(mode: SeedMode) -> TestTarget {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        TestTarget::start_on(mode, 0)
             .await
-            .expect("bind loopback test target");
+            .expect("bind loopback test target")
+    }
+
+    /// Bind loopback `port` (0 = an ephemeral port), start serving `mode`, and
+    /// return once the listener is accepting. Like [`start`](Self::start) but with
+    /// the port chosen by the caller, so the standalone serve binary can expose a
+    /// fixed, operator-chosen port. Returns the bind error rather than panicking,
+    /// since a serve process must report a port clash cleanly.
+    pub async fn start_on(mode: SeedMode, port: u16) -> std::io::Result<TestTarget> {
+        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
         let addr = listener.local_addr().expect("local addr");
         let base_url = format!("http://{addr}");
         let state = Arc::new(app::AppState::new(mode));
@@ -64,10 +73,10 @@ impl TestTarget {
             }
         });
 
-        TestTarget {
+        Ok(TestTarget {
             base_url,
             _state: state,
-        }
+        })
     }
 
     /// The `http://127.0.0.1:PORT` origin this instance is serving on.

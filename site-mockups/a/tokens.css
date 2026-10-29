@@ -1,0 +1,51 @@
+/* Direction A — "The product performs"
+   Type: Schibsted Grotesk · Palette: Stone and blueprint
+   seed 1956337644 */
+@import url("https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;800&display=swap");
+
+:root {
+  /* palette — stone paper, near-black ink, one blueprint blue */
+  --bg: #dfdedb;
+  --surface: #d3d2ce;
+  --surface-2: #c8c7c2;
+  --ink: #26251e;
+  --muted: #5f5d55;
+  --accent: #2456d6;
+  --accent-ink: #ffffff;
+
+  /* the product's own dark interface (shown in fragments) */
+  --ui-bg: #1b1b18;
+  --ui-row: #201f1c;
+  --ui-row-alt: #262521;
+  --ui-line: #35342f;
+  --ui-text: #e6e4dd;
+  --ui-muted: #96938a;
+  --ui-sel: #2456d6;
+  --ui-sel-ink: #f3f5ff;
+  --ui-armed: #d64524;          /* intercept armed / paused */
+  --ui-ok: #6ab06a;
+  --ui-warn: #e0ab4e;
+
+  --font-display: "Schibsted Grotesk", system-ui, sans-serif;
+  --font-text: "Schibsted Grotesk", system-ui, sans-serif;
+  --font-mono: "SF Mono", "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
+
+  --step-small: clamp(0.8125rem, 0.79rem + 0.1vw, 0.875rem);
+  --step-body: clamp(1.0625rem, 1rem + 0.25vw, 1.1875rem);
+  --step-lead: clamp(1.25rem, 1.1rem + 0.7vw, 1.625rem);
+  --step-head: clamp(2rem, 1.3rem + 3.2vw, 4rem);
+  --step-display: clamp(3.25rem, 1.6rem + 5.2vw, 5rem);
+
+  --margin: clamp(1.25rem, 3vw, 2.5rem);
+  --gutter: clamp(1rem, 2vw, 2rem);
+  --section: clamp(6rem, 12vw, 12rem);
+  --radius: 4px;
+}
+
+/* display face is set heavy and tight in this direction */
+.display { font-weight: 800; letter-spacing: -0.045em; line-height: 0.92; }
+.head { font-weight: 800; letter-spacing: -0.03em; line-height: 1.0; }
+.lead { font-weight: 400; }
+h1, h2, h3 { font-weight: 800; }
+body { font-weight: 400; }
+strong, .fw-med { font-weight: 600; }
