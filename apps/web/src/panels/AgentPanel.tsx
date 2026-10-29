@@ -6,6 +6,8 @@ import { useApp } from '~/state/context';
 import { Icon } from '~/components';
 import { PolicyControl } from './agent/PolicyControl';
 import { ActivityLog } from './agent/ActivityLog';
+import { L4Toggles } from './agent/L4Toggles';
+import type { AgentCap, AgentGates } from './l4/model';
 import css from './agent/AgentPanel.module.css';
 
 export const AgentPanel: Component = () => {
@@ -20,6 +22,22 @@ export const AgentPanel: Component = () => {
     async (ok) => (ok ? await app.call<{ connected_clients?: number }>('agent.status').catch(() => null) : null),
   );
   const clients = () => status()?.connected_clients;
+
+  // L4 per-capability agent gates (ui-ext §3.5): read `l4.agent.status`, set via `l4.agent.set`
+  // when present. The L4 flow kind need not be enabled for the gate states to exist.
+  const hasL4Gates = createMemo(() => has('l4.agent.status'));
+  const canSetL4 = createMemo(() => has('l4.agent.set'));
+  const [l4Gates, { refetch: refetchL4 }] = createResource(
+    () => hasL4Gates(),
+    async (ok) => (ok ? await app.call<AgentGates>('l4.agent.status').catch(() => null) : null),
+  );
+  const setL4 = async (capability: AgentCap, allowed: boolean) => {
+    const r = await app.call<AgentGates>('l4.agent.set', { capability, allowed }).catch((e) => {
+      app.notice(`l4.agent.set: ${(e as Error).message}`, 'error');
+      return null;
+    });
+    if (r) void refetchL4();
+  };
 
   return (
     <section class={css.panel} aria-label="Agent">
@@ -45,6 +63,10 @@ export const AgentPanel: Component = () => {
           disabledReason="agent.set is a core follow-up (F1): the policy is read-only until the core exposes it."
           onChange={(p) => void app.setAgentPolicy(p).then(() => void refetch())}
         />
+
+        <Show when={hasL4Gates()}>
+          <L4Toggles gates={l4Gates() ?? null} canSet={canSetL4()} onSet={(cap, allowed) => void setL4(cap, allowed)} />
+        </Show>
 
         <section class={css.section} aria-label="Pending confirmations">
           <div class={css.sectionHead}>
