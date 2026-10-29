@@ -1,6 +1,10 @@
 # Protocol-general `CaptureIngress` — stream (TCP) dispatch path (prerequisite) implementation plan
 
-**Status:** draft
+**Status:** approved (2026-10-29, by the orchestrator on Matt's behalf). All five
+design calls (A1–A5 below) are **locked** as the architect proposed; none is
+Matt-only. Dispatch-ready: one coder for the whole 4-task plan, cut from current
+`main` (`d8837ed`), merged after a full Stage-6 panel (it touches scope-gating +
+deny-by-default, so it earns the whole panel).
 **Spec:** `docs/superpowers/specs/2026-10-28-aitmproxy-l4-operator-surfaces-design.md` (L4OPS-AC17, the protocol-general capture seam). Unblocks `docs/superpowers/plans/2026-10-29-aitmproxy-macos-network-extension-plan.md` Band B (Tasks 2–9).
 **Branch / worktree:** `feat/capture-ingress`
 
@@ -56,7 +60,10 @@ first — Tasks 2–4 depend on its accessors. Tasks 2, 3, 4 all edit
 `crates/aitm/src/ingress.rs` (2 and 3) or depend on them, so they are
 **sequential**, in the order given (no two writers share a file).
 
-## Flagged assumptions (confirm; see questions to Matt)
+## Resolved decisions (approved 2026-10-29)
+
+All five are **locked** — ruled by the orchestrator on Matt's behalf exactly as
+proposed; none is Matt-only (no Apple account, no product-direction call).
 
 - **A1** `CaptureIngress` already exists (L4-only); this plan **extends** it, not
   creates it.
