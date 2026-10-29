@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 use aitm::wire::{assemble_with_scripts, Assembled, Features, Http1Sender, ScriptWiring};
 use aitm_browser::{launch_owned, LaunchedBrowser};
 use aitm_core::{
-    AgentPolicy, BrowserEngine, Config, FlowStore, McpTransport, PipelineClient, ProxyClient,
-    ScopeEntry,
+    engine_may_reach_private, AgentPolicy, BrowserEngine, Config, FlowStore, McpTransport,
+    PipelineClient, ProxyClient, ScopeEntry,
 };
 use aitm_mcp::McpServer;
 use aitm_testtarget::{SeedMode, TestTarget};
@@ -176,14 +176,6 @@ impl Rig {
         let mut cfg = Config::default();
         cfg.ca.dir = ca_dir.path().to_path_buf();
         cfg.browser = engines::config_for(BrowserEngine::Obscura, browser_listen);
-        // The seeded targets are deliberately on loopback, so the e2e must permit
-        // private/loopback navigation: obscura honours `--allow-private-network`,
-        // which the engine passes only when the policy permits private targets, and
-        // without it the browser refuses a loopback navigation on its own (it never
-        // reaches the proxy). `block_private = false` permits private targets at both
-        // the engine and the proxy connector; the driver only ever navigates the two
-        // in-scope loopback origins scoped below, so nothing out of scope is reached.
-        cfg.browser.ssrf.block_private = false;
         cfg.scope.entries = vec![
             ScopeEntry {
                 host: vuln_authority.clone(),
@@ -192,6 +184,16 @@ impl Rig {
                 host: patched_authority.clone(),
             },
         ];
+        // The seeded targets are deliberately on loopback, and this rig exercises
+        // the **real operator path**: the strict default SSRF policy stays in
+        // force at the proxy connector (the authoritative per-host gate), and the
+        // two scoped loopback origins lift the engine's `--allow-private-network`
+        // flag via policy ∪ scope (audit I15) — no `block_private = false`
+        // override. Recomputed from the scope just set, exactly as `main` does at
+        // its launch site, so obscura can reach the scoped origins without widening
+        // past them.
+        cfg.browser.obscura.allow_private =
+            engine_may_reach_private(&cfg.browser.ssrf, &cfg.scope.entries);
         // The agent cannot widen scope on its own; this e2e authorizes the two
         // loopback origins above up front.
         cfg.scope.allow_agent_widen = true;

@@ -81,6 +81,16 @@ mcp:
   policy: auto   # autonomous loop, no Sensitive actions; use `all` to lift that
 ```
 
+The seeded targets are on loopback, yet this config keeps the **strict default
+SSRF policy** — do **not** set `browser.ssrf.block_private = false`. Scoping the
+two loopback origins is enough: the embedded engine's `--allow-private-network`
+flag is derived from policy ∪ scope (audit I15), so the scoped loopback targets
+lift it at launch while every out-of-scope private/loopback address stays blocked
+by the proxy connector, the authoritative per-host gate. (One consequence: that
+flag is computed once at launch from the seed scope, so a loopback host added
+later with `scope.add` needs an `aitm` relaunch before the engine can reach it —
+seed every loopback target in the config above, as this procedure does.)
+
 **3. Start `aitm` with that config** (the bare server path is the agent entry point):
 
 ```bash

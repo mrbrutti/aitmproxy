@@ -33,9 +33,9 @@ use std::time::{Duration, Instant};
 use aitm::wire::assemble;
 use aitm_browser::{launch_owned, LaunchedBrowser};
 use aitm_core::{
-    Body, BrowserDriver, ClickTarget, Command, CommandHost, Config, Flow, FlowStore, GuardError,
-    HttpFlow, HttpRequest, NavOutcome, Params, ProxyClient, Registry, ScopeEntry, ScopeRateGuard,
-    Value,
+    engine_may_reach_private, Body, BrowserDriver, ClickTarget, Command, CommandHost, Config, Flow,
+    FlowStore, GuardError, HttpFlow, HttpRequest, NavOutcome, Params, ProxyClient, Registry,
+    ScopeEntry, ScopeRateGuard, Value,
 };
 use futures::future::BoxFuture;
 use support::https_fixture::{HttpsFixture, PlainFixture, MARKER};
@@ -186,6 +186,12 @@ impl Rig {
         // they opt into agent scope-widening (F12 gate; off by default).
         cfg.scope.allow_agent_widen = true;
         cfg.browser.obscura.binary = std::env::var_os("AITM_OBSCURA_BIN").map(PathBuf::from);
+        // Derive obscura's private-network flag from policy ∪ scope (audit I15),
+        // as `main` does: the scoped loopback fixture lifts it under the strict
+        // default so obscura can dial the proxy, while the connector still refuses
+        // every out-of-scope loopback target (the authoritative per-host gate).
+        cfg.browser.obscura.allow_private =
+            engine_may_reach_private(&cfg.browser.ssrf, &cfg.scope.entries);
 
         let assembled = assemble(&cfg).expect("assemble the proxy");
         let proxy = assembled.proxy;
