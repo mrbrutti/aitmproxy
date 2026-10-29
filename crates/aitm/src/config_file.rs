@@ -377,6 +377,7 @@ struct LimitsFile {
     host_error_budget: Option<u32>,
     backoff: Option<BackoffFile>,
     max_body_bytes: Option<usize>,
+    max_concurrent_streams: Option<u32>,
 }
 
 impl LimitsFile {
@@ -389,6 +390,7 @@ impl LimitsFile {
             b.apply(&mut c.backoff);
         }
         set(&mut c.max_body_bytes, self.max_body_bytes);
+        set(&mut c.max_concurrent_streams, self.max_concurrent_streams);
     }
 }
 
