@@ -8,15 +8,23 @@
 //! compile-time half of AC2 (an unguarded effectful fn fails to type-check) is a
 //! `compile_fail` doctest on `aitm_plugin_rhai::host_registry`.
 
+use std::fs;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
-use aitm_core::Value;
+use aitm_core::{HttpFlow, HttpRequest, MemFlowStore, ProxyClient, StdGuard, Value};
 use aitm_plugin::language::{
     GuardHandle, Guarded, HostError, HostFn, NamespaceCatalog, PocStepHandler, ProtocolLanguage,
     RegisterError, ScriptHostRegistry,
 };
-use aitm_plugin_rhai::config::RhaiLimits;
+use aitm_plugin_rhai::config::{RhaiConfig, RhaiLimits, ScriptEntry};
 use aitm_plugin_rhai::engine::build_engine_with_languages;
+use aitm_plugin_rhai::error::ScriptError;
+use aitm_plugin_rhai::host_core::{MemoryFindingSink, ScriptServices};
+use aitm_plugin_rhai::loader::RhaiLoader;
 use aitm_proto_test::TestLanguage;
 use rhai::Engine;
 
@@ -134,4 +142,115 @@ impl ProtocolLanguage for OtherLanguage {
             sources: vec![],
         }
     }
+}
+
+/// A client that is never reached: the Task 7 loader tests never send.
+struct StubClient;
+
+impl ProxyClient for StubClient {
+    fn send(
+        &self,
+        _req: HttpRequest,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<HttpFlow>> + Send + '_>> {
+        Box::pin(async { anyhow::bail!("stub client") })
+    }
+}
+
+/// The stub services the loader registers its host surface against.
+fn services() -> ScriptServices {
+    ScriptServices {
+        store: Arc::new(MemFlowStore::new()),
+        client: Arc::new(StubClient),
+        browser: None,
+        guard: Arc::new(StdGuard::default()),
+        findings: Arc::new(MemoryFindingSink::new()),
+        rt: tokio::runtime::Handle::current(),
+    }
+}
+
+/// A default non-strict config with no scripts (the entries are loaded one at a
+/// time via `load_one`).
+fn config() -> RhaiConfig {
+    RhaiConfig {
+        hook_timeout: Duration::from_secs(5),
+        ..RhaiConfig::default()
+    }
+}
+
+/// A throwaway `.rhai` file outside the repo, named after the test so parallel
+/// tests never collide; removed on drop.
+struct TempScript(PathBuf);
+
+impl TempScript {
+    fn new(name: &str, src: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "aitm-host-registry-{}-{name}.rhai",
+            std::process::id()
+        ));
+        fs::write(&path, src).expect("the temp script is written");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempScript {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Task 7 / AC9: a seam namespace's `api_version` is enforced by the loader's
+/// version gate exactly like a built-in capability's `min_api`. The `test`
+/// namespace is registered at version `2`; a script declaring an older
+/// `const API` is refused the `test` namespace with the existing
+/// `CapabilityDenied` error (naming the namespace and the required version),
+/// while a script that meets the version loads and can call `test.ping()`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seam_namespace_api_version_gates_scripts() {
+    let lang = TestLanguage::with_api_version("2");
+    let loader = RhaiLoader::new_with_languages(config(), services(), &[&lang])
+        .expect("the loader builds with a protocol language");
+
+    // Too-old: the script is refused the seam namespace, never silently run.
+    let legacy = TempScript::new(
+        "legacy",
+        r#"const API = "1"; fn on_request(flow) { test.ping(); }"#,
+    );
+    let err = match loader.load_one(&ScriptEntry::new(legacy.path())) {
+        Ok(_) => panic!("a lower-API script must be denied the seam namespace"),
+        Err(err) => err,
+    };
+    match &err {
+        ScriptError::CapabilityDenied {
+            namespace,
+            min_api,
+            declared,
+            ..
+        } => {
+            assert_eq!(namespace, "test");
+            assert_eq!(min_api, "2");
+            assert_eq!(declared, "1");
+        }
+        other => panic!("expected CapabilityDenied, got {other:?}"),
+    }
+    let text = err.to_string();
+    assert!(text.contains("test"), "names the namespace: {text}");
+    assert!(text.contains('2'), "names the required version: {text}");
+
+    // Matching: the script loads and `test.ping()` is callable on the engine.
+    let modern = TempScript::new(
+        "modern",
+        r#"const API = "2"; fn on_request(flow) { test.ping(); }"#,
+    );
+    loader
+        .load_one(&ScriptEntry::new(modern.path()))
+        .expect("an API-2 script meets the seam namespace version and loads");
+    let pong: String = loader
+        .engine()
+        .eval("test.ping()")
+        .expect("test.ping runs on the loader engine");
+    assert_eq!(pong, "pong");
 }

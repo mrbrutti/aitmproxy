@@ -157,16 +157,24 @@ impl ScriptHostRegistry for HostRegistry<'_> {
 }
 
 /// Drive every language's `register_host_fns` through one shared registry, so a
-/// collision across languages (two crates claiming a namespace) is caught.
+/// collision across languages (two crates claiming a namespace) is caught, and
+/// return each installed namespace's `(namespace, api_version)` so the loader's
+/// version gate can enforce a seam namespace's `api_version` as its `min_api`,
+/// exactly like a built-in capability's (Task 7, AC9).
 pub(crate) fn install_languages(
     engine: &mut Engine,
     languages: &[&dyn ProtocolLanguage],
-) -> Result<(), RegisterError> {
+) -> Result<Vec<(String, String)>, RegisterError> {
     let mut registry = HostRegistry::new(engine);
+    let mut versions = Vec::with_capacity(languages.len());
     for language in languages {
         language.register_host_fns(&mut registry)?;
+        versions.push((
+            language.namespace().to_string(),
+            language.api_version().to_string(),
+        ));
     }
-    Ok(())
+    Ok(versions)
 }
 
 /// Keep the hand-written `arity!` overloads below in sync with [`MAX_ARITY`].

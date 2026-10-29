@@ -42,6 +42,11 @@ pub const ECHO_SOURCE: &str = "echo";
 /// (`test.ping()`'s guard always admits — it has no effect to gate).
 pub struct TestLanguage {
     effect_allowed: bool,
+    /// The namespace's API version, surfaced through [`ProtocolLanguage::api_version`]
+    /// and the catalog. Defaults to [`API_VERSION`]; a test overrides it with
+    /// [`TestLanguage::with_api_version`] to exercise the loader's version gate
+    /// (Task 7).
+    api_version: String,
 }
 
 impl TestLanguage {
@@ -49,6 +54,7 @@ impl TestLanguage {
     pub fn new() -> Self {
         Self {
             effect_allowed: true,
+            api_version: API_VERSION.to_string(),
         }
     }
 
@@ -57,6 +63,18 @@ impl TestLanguage {
     pub fn with_effect_allowed(allowed: bool) -> Self {
         Self {
             effect_allowed: allowed,
+            api_version: API_VERSION.to_string(),
+        }
+    }
+
+    /// A language that declares its `test` namespace at `api_version`, so a test
+    /// can drive the loader's per-namespace version gate (Task 7): a script
+    /// declaring an older `const API` is refused the namespace, a script meeting
+    /// it loads.
+    pub fn with_api_version(api_version: impl Into<String>) -> Self {
+        Self {
+            effect_allowed: true,
+            api_version: api_version.into(),
         }
     }
 }
@@ -98,7 +116,7 @@ impl ProtocolLanguage for TestLanguage {
     }
 
     fn api_version(&self) -> &str {
-        API_VERSION
+        &self.api_version
     }
 
     fn register_host_fns(&self, reg: &mut dyn ScriptHostRegistry) -> Result<(), RegisterError> {
@@ -134,7 +152,7 @@ impl ProtocolLanguage for TestLanguage {
     fn catalog(&self) -> NamespaceCatalog {
         NamespaceCatalog {
             namespace: NAMESPACE.to_string(),
-            api_version: API_VERSION.to_string(),
+            api_version: self.api_version.clone(),
             host_fns: vec![
                 HostFnSig {
                     name: "ping".to_string(),
