@@ -51,7 +51,9 @@ export const AgentPanel: Component = () => {
             <h3 class={css.sectionTitle}>Pending confirmations</h3>
           </div>
           {/* F1: map the confirmation stream to <PendingConfirmation …/> rows here. */}
-          <p class={css.quiet}>Nothing waiting for approval.</p>
+          <p class={css.quiet}>
+            Confirmations arrive with the agent stream (F1): this stays empty until the core exposes it — it is not a live “nothing pending”.
+          </p>
         </section>
 
         <ActivityLog entries={app.proxy.activity} />
