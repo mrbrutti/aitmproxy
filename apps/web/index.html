@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>aitmproxy</title>
+<script>
+  // Pin the theme before first paint so there is no flash; the app reads the same key.
+  (function () {
+    try {
+      // ?theme=light|dark pins a theme for this load (screenshots, tests) without touching storage.
+      var q = new URLSearchParams(location.search).get('theme');
+      var t = q === 'light' || q === 'dark' ? q : localStorage.getItem('aitm.theme');
+      if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+      var d = localStorage.getItem('aitm.density');
+      if (d) document.documentElement.setAttribute('data-density', d);
+    } catch (e) {}
+  })();
+</script>
+</head>
+<body>
+<div id="root"></div>
+<script type="module" src="/src/index.tsx"></script>
+</body>
+</html>

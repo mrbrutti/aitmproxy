@@ -1,0 +1,116 @@
+{
+  "_comment": "The one filter grammar all three surfaces parse and highlight from (UI spec §1.1 'filter.grammar.json', the TUI portability rule). Grammar form is canonicalised from the TUI's shipped crates/aitm-tui/src/filter.rs header; atom *names* and meanings follow the approved UI spec (§1.1) + foundation §2.7. filter.conformance.json is the test every surface must pass.",
+  "grammar": {
+    "expr": "or",
+    "or": "and ( '|' and )*",
+    "and": "not ( '&'? not )*",
+    "not": "'!' not | atom",
+    "atom": "'(' expr ')' | '~' name [arg] | word",
+    "notes": [
+      "Juxtaposition is AND: `~u login ~m POST` == `~u login & ~m POST`.",
+      "Precedence, tightest first: `!`, `&` (explicit or implicit), `|`. `(` `)` override it. `&` and `|` are left-associative.",
+      "A bare word (or bare /re/) is `~u word` (see bare_word).",
+      "An atom's argument is the next word, quoted string or /regex/ token. `pattern` atoms take any of the three; `literal` atoms refuse a /regex/ (error regex-not-allowed); `none` atoms take no argument, so a following word is a separate AND term.",
+      "Text arguments match case-insensitively as substrings, with `*` (any run) and `?` (one char) wildcards. A /…/ argument is a case-insensitive regex unless it says (?-i).",
+      "A quoted argument (\"…\" or '…') may contain spaces and delimiters; there are no escapes inside quotes. A word ends at whitespace or one of ( ) & |.",
+      "A /re/ token needs a closing `/` followed by a delimiter or the end; `\\` escapes the next character and both are kept in the regex source. Otherwise the text is an ordinary word (so `/api/login` is a word).",
+      "Atom aliases are normalised in the AST (`~t` parses to atom `~c`).",
+      "Empty or whitespace-only input is 'no filter' (null AST, no error).",
+      "Nesting of `!` and `(` is bounded at max_depth; deeper input is refused, not recursed into."
+    ]
+  },
+  "max_depth": 64,
+  "bare_word": "~u",
+  "atoms": [
+    { "atom": "~u", "name": "url", "args": "pattern", "description": "URL contains / matches the argument." },
+    { "atom": "~d", "name": "domain", "args": "pattern", "description": "Host (domain) contains / matches the argument." },
+    { "atom": "~m", "name": "method", "args": "literal", "description": "HTTP method equals the argument (GET, POST, ...)." },
+    { "atom": "~s", "name": "status", "args": "literal", "description": "Response status: an exact code (200) or a class (4xx)." },
+    { "atom": "~h", "name": "header", "args": "pattern", "description": "A header name or value contains / matches the argument. Needs flow detail (F5)." },
+    { "atom": "~b", "name": "body", "args": "pattern", "description": "The body contains / matches the argument. Needs flow detail (F5)." },
+    { "atom": "~q", "name": "query", "args": "pattern", "description": "The query string contains / matches the argument." },
+    { "atom": "~c", "name": "content-type", "args": "literal", "description": "Content-type contains the argument (json, html, ...)." },
+    { "atom": "~t", "name": "content-type-alias", "args": "literal", "alias_of": "~c", "description": "Alias of ~c (content-type)." },
+    { "atom": "~a", "name": "agent", "args": "none", "description": "The flow was produced by the agent (replay, request.send, poc.run)." },
+    { "atom": "~scope", "name": "scope", "args": "none", "description": "The flow's host is in the authorised scope." },
+    { "atom": "~ws", "name": "websocket", "args": "none", "description": "The flow is a WebSocket flow." },
+    { "atom": "~paused", "name": "paused", "args": "none", "description": "The flow is paused at an intercept." },
+    { "atom": "~killed", "name": "killed", "args": "none", "description": "The flow was killed." },
+    { "atom": "~l4", "name": "l4", "args": "none", "description": "The flow is an L4 (packet) flow. M5-gated." },
+    { "atom": "~tcp", "name": "tcp", "args": "none", "description": "An L4 flow whose decoded protocol is TCP. M5-gated." },
+    { "atom": "~udp", "name": "udp", "args": "none", "description": "An L4 flow whose decoded protocol is UDP. M5-gated." },
+    { "atom": "~icmp", "name": "icmp", "args": "none", "description": "An L4 flow whose decoded protocol is ICMP. M5-gated." }
+  ],
+  "combinators": [
+    { "symbol": "&", "name": "and", "description": "Both sides match. Optional: juxtaposition is also AND." },
+    { "symbol": "|", "name": "or", "description": "Either side matches. Lowest precedence." },
+    { "symbol": "!", "name": "not", "description": "Negation; prefix, binds tightest." },
+    { "symbol": "(", "name": "lparen", "description": "Open a group." },
+    { "symbol": ")", "name": "rparen", "description": "Close a group." }
+  ],
+  "token_types": ["atom", "word", "string", "regex", "and", "or", "not", "lparen", "rparen"],
+  "map_token": {
+    "atom": "key",
+    "word": "string",
+    "string": "string",
+    "regex": "string",
+    "and": "punct",
+    "or": "punct",
+    "not": "punct",
+    "lparen": "punct",
+    "rparen": "punct"
+  },
+  "error_codes": [
+    "missing-argument",
+    "regex-not-allowed",
+    "unknown-atom",
+    "unbalanced-paren",
+    "unexpected-token",
+    "unexpected-end",
+    "unterminated-quote",
+    "missing-atom-name"
+  ],
+  "stacked_fields": [
+    "URL", "Host", "Path", "Query", "Method", "Status",
+    "Request header", "Response header", "Request body", "Response body",
+    "Content-type", "Client", "Duration", "Size", "Colour", "Comment",
+    "Origin", "Scope", "WebSocket direction"
+  ],
+  "operators": [
+    { "name": "contains", "description": "The field contains the value." },
+    { "name": "equals", "description": "The field equals the value exactly." },
+    { "name": "wildcard", "description": "The value is a * / ? wildcard." },
+    { "name": "regex", "description": "The value is a regular expression." },
+    { "name": "jsonpath", "description": "A JSONPath / jq expression over a body field." },
+    { "name": "full-text", "description": "Full-text search of the field." }
+  ],
+  "bijection": {
+    "_comment": "The GUI stacked-filter model (Field · Operator · Value, rows joined AND/OR) <-> the ~-atom text form, so a GUI's 'advanced view' is exactly the TUI's native expression. The atom set the spec fixes covers only part of foundation §2.7's field list and operator list; the remainder is declared unmapped here (GUI-only, no portable text form yet) rather than invented. Widening the atom set is a spec change.",
+    "field_to_atom": {
+      "URL": "~u",
+      "Host": "~d",
+      "Query": "~q",
+      "Method": "~m",
+      "Status": "~s",
+      "Request header": "~h",
+      "Response header": "~h",
+      "Request body": "~b",
+      "Response body": "~b",
+      "Content-type": "~c",
+      "Origin": "~a",
+      "Scope": "~scope"
+    },
+    "unmapped_fields": ["Path", "Client", "Duration", "Size", "Colour", "Comment", "WebSocket direction"],
+    "operator_to_text": {
+      "contains": "bare argument: `~u login`",
+      "wildcard": "bare argument with * and ?: `~u *login*`",
+      "regex": "slash-delimited argument: `~u /^https:/`",
+      "equals": "pattern atoms: an anchored regex `~u /^exact$/`; literal atoms (~m ~s ~c): the bare argument"
+    },
+    "unmapped_operators": ["jsonpath", "full-text"],
+    "combine": { "AND": "&", "OR": "|" },
+    "origin_values": { "agent": "~a", "human": "!~a" },
+    "scope_values": { "in": "~scope", "out": "!~scope" },
+    "request_response_note": "~h and ~b match either side; the stacked Request/Response split has no distinct atom, so both fields map to the same atom."
+  }
+}

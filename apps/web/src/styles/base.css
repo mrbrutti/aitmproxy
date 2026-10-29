@@ -1,0 +1,111 @@
+/* Base: resets and the handful of global rules the foundation fixes (§2.3, §2.8).
+   Everything else is component-scoped CSS modules. Tokens come from tokens.css. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+html {
+  /* Density moves row pitch; cell padding and body size follow in the components. */
+  --row: var(--size-row-dense);
+}
+html[data-density='default'] {
+  --row: var(--size-row-default);
+}
+html[data-density='comfortable'] {
+  --row: var(--size-row-comfortable);
+}
+
+body {
+  background: var(--color-ground-page);
+  color: var(--color-text-primary);
+  font: var(--font-size-md) / var(--line-height-text) var(--font-ui);
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  cursor: default;
+  -webkit-user-select: none;
+  user-select: none;
+}
+button:disabled {
+  cursor: not-allowed;
+}
+
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+a {
+  color: var(--color-text-link);
+  text-decoration: none;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: var(--font-weight-semibold);
+}
+
+kbd {
+  font: var(--font-size-xs) var(--font-ui);
+  color: var(--color-text-tertiary);
+}
+
+:focus {
+  outline: none;
+}
+:focus-visible {
+  outline: 2px solid var(--color-line-focus);
+  outline-offset: 1px;
+  border-radius: var(--radius-badge);
+}
+
+::selection {
+  background: var(--color-accent-tint);
+}
+
+/* Lucide icons: 1.5px outline, grey, never in a tinted circle (§2.5). */
+svg.lucide {
+  width: var(--size-icon);
+  height: var(--size-icon);
+  stroke-width: 1.5;
+  flex: none;
+}
+
+/* Scrollbars: thin and neutral so dense panes keep their edges. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-control) transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
