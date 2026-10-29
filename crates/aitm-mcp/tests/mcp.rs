@@ -2336,3 +2336,254 @@ fn agent_activity_returns_recent() {
         "agent.activity"
     )));
 }
+
+// ------------------------------------------------ M4 Task 9: Ask policy
+
+/// A server under the `Ask` policy: one gateless Sensitive stub (`demo.sensitive`),
+/// the real `AgentPlugin` (so `agent.approve` is registered and exercised), and a
+/// bounded `approval_timeout` so `ask_timeout_refuses` is cheap. Returned as an
+/// `Arc` so an agent connection and an operator connection share the one
+/// parked-request table.
+fn ask_server(approval_timeout: Duration) -> Arc<McpServer> {
+    let mut reg = Registry::new();
+    reg.add_command(Arc::new(TierCmd {
+        name: "demo.sensitive",
+        sens: Sensitivity::Sensitive,
+    }));
+    let state = Arc::new(AgentState::new(AgentPolicy::Ask));
+    reg.add_plugin(Box::new(AgentPlugin::new(state.clone())));
+    Arc::new(
+        McpServer::new(Arc::new(reg), McpTransport::Stdio)
+            .with_agent_state(state)
+            .with_approval_timeout(approval_timeout)
+            .with_services(
+                Arc::new(MemFlowStore::new()),
+                Arc::new(StubClient),
+                Arc::new(StdGuard::default()),
+                None,
+            ),
+    )
+}
+
+/// Read JSON lines until one satisfies `pred` (skips interleaved audit
+/// notifications an operator connection also receives); panics after 100 reads.
+async fn read_until(lines: &mut ClientReader, pred: impl Fn(&JsonValue) -> bool) -> JsonValue {
+    for _ in 0..100 {
+        let v = next_json(lines).await;
+        if pred(&v) {
+            return v;
+        }
+    }
+    panic!("no matching line within 100 reads");
+}
+
+/// Open an operator connection and subscribe it, so it is a connected operator
+/// that receives `approval_requested` pushes. Returns its write half, reader, task.
+async fn operator_subscribed(
+    srv: Arc<McpServer>,
+) -> (
+    WriteHalf<DuplexStream>,
+    ClientReader,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let (mut w, mut lines, _sink, task) = open_push_conn(srv, Frontend::Operator, 64 * 1024, 1024);
+    write_req(
+        &mut w,
+        &json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"flow.subscribe","arguments":{}}}),
+    )
+    .await;
+    let reply = read_until(&mut lines, |v| v["id"] == json!(1)).await;
+    assert!(
+        reply["result"]["structuredContent"]["sub_id"]
+            .as_u64()
+            .is_some(),
+        "operator subscribe returns a sub_id: {reply}"
+    );
+    (w, lines, task)
+}
+
+/// AC-M4-5b / spec D4: under `Ask`, a Sensitive agent call is parked (not run, not
+/// returned as `needs_confirmation`); an operator sees `approval_requested`, and
+/// `agent.approve{allow:true}` runs the parked command, whose real result reaches
+/// the waiting agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ask_parks_then_approves() {
+    let srv = ask_server(Duration::from_secs(10));
+    let (mut op_w, mut op_lines, op_task) = operator_subscribed(srv.clone()).await;
+
+    // The agent, on its own connection, calls the Sensitive command — it parks.
+    let (mut ag_w, mut ag_lines, _sink, ag_task) =
+        open_push_conn(srv.clone(), Frontend::Mcp, 64 * 1024, 1024);
+    write_req(
+        &mut ag_w,
+        &json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":"demo.sensitive","arguments":{}}}),
+    )
+    .await;
+
+    // The operator receives the approval request naming the parked command.
+    let req = read_until(&mut op_lines, |v| {
+        v["method"] == "notifications/aitm/agent" && v["params"]["event"] == "approval_requested"
+    })
+    .await;
+    assert_eq!(req["params"]["command"], "demo.sensitive");
+    let request_id = req["params"]["request_id"]
+        .as_str()
+        .expect("approval request carries a request_id")
+        .to_string();
+
+    // The operator approves it.
+    write_req(
+        &mut op_w,
+        &json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                "name":"agent.approve","arguments":{"request_id":request_id,"allow":true}}}),
+    )
+    .await;
+
+    // The waiting agent call now completes with the command's real result.
+    let done = read_until(&mut ag_lines, |v| v["id"] == json!(2)).await;
+    assert_eq!(
+        done["result"]["isError"],
+        json!(false),
+        "the approved agent call ran: {done}"
+    );
+    assert_eq!(done["result"]["structuredContent"], json!("ran"));
+
+    let _ = ag_w.shutdown().await;
+    let _ = op_w.shutdown().await;
+    let _ = ag_task.await;
+    let _ = op_task.await;
+}
+
+/// AC-M4-5b: `agent.approve{allow:false}` refuses the parked call; the waiting
+/// agent gets a tool error, and the command never ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ask_deny_refuses() {
+    let srv = ask_server(Duration::from_secs(10));
+    let (mut op_w, mut op_lines, op_task) = operator_subscribed(srv.clone()).await;
+
+    let (mut ag_w, mut ag_lines, _sink, ag_task) =
+        open_push_conn(srv.clone(), Frontend::Mcp, 64 * 1024, 1024);
+    write_req(
+        &mut ag_w,
+        &json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":"demo.sensitive","arguments":{}}}),
+    )
+    .await;
+
+    let req = read_until(&mut op_lines, |v| {
+        v["params"]["event"] == "approval_requested"
+    })
+    .await;
+    let request_id = req["params"]["request_id"].as_str().unwrap().to_string();
+
+    write_req(
+        &mut op_w,
+        &json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                "name":"agent.approve","arguments":{"request_id":request_id,"allow":false}}}),
+    )
+    .await;
+
+    let done = read_until(&mut ag_lines, |v| v["id"] == json!(2)).await;
+    assert_eq!(
+        done["result"]["isError"],
+        json!(true),
+        "a denied agent call is refused: {done}"
+    );
+
+    let _ = ag_w.shutdown().await;
+    let _ = op_w.shutdown().await;
+    let _ = ag_task.await;
+    let _ = op_task.await;
+}
+
+/// RF#4 / spec D4: a parked call whose approval never arrives is refused on the
+/// bounded timeout — it never hangs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ask_timeout_refuses() {
+    let srv = ask_server(Duration::from_millis(300));
+    // An operator is present (subscribed) but never approves.
+    let (mut op_w, _op_lines, op_task) = operator_subscribed(srv.clone()).await;
+
+    let (mut ag_w, mut ag_lines, _sink, ag_task) =
+        open_push_conn(srv.clone(), Frontend::Mcp, 64 * 1024, 1024);
+    write_req(
+        &mut ag_w,
+        &json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":"demo.sensitive","arguments":{}}}),
+    )
+    .await;
+
+    let done = read_until(&mut ag_lines, |v| v["id"] == json!(2)).await;
+    assert_eq!(
+        done["result"]["isError"],
+        json!(true),
+        "a timed-out parked call is refused: {done}"
+    );
+    let text = done["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("timeout") || text.contains("approv"),
+        "the refusal explains the timeout: {text}"
+    );
+
+    let _ = ag_w.shutdown().await;
+    let _ = op_w.shutdown().await;
+    let _ = ag_task.await;
+    let _ = op_task.await;
+}
+
+/// RF#4 / spec D4: a Sensitive agent call under `Ask` with no operator connected is
+/// refused at once (not parked forever) with a clear reason.
+#[test]
+fn ask_without_operator_refuses() {
+    let srv = ask_server(Duration::from_secs(10));
+    let resp = call_as(&srv, Frontend::Mcp, "demo.sensitive");
+    assert!(is_refused(&resp), "no-operator Sensitive call is refused");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("operator"),
+        "the refusal explains no operator is connected: {text}"
+    );
+}
+
+/// RF#2: an agent calling `agent.approve` is refused — it can never approve its own
+/// parked request; an operator can call it (an unknown id is a plain error, not a
+/// role refusal).
+#[test]
+fn agent_cannot_approve_own_request() {
+    let srv = ask_server(Duration::from_secs(10));
+    let agent = call_as_args(
+        &srv,
+        Frontend::Mcp,
+        "agent.approve",
+        json!({"request_id": "apr_1", "allow": true}),
+    );
+    assert!(is_refused(&agent), "the agent cannot approve");
+    let text = agent["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("cannot approve") || text.contains("agent"),
+        "the refusal names the agent: {text}"
+    );
+
+    // The operator role is not role-refused; an unknown id is a plain error.
+    let op = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "agent.approve",
+        json!({"request_id": "nope", "allow": true}),
+    );
+    let text = op["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("no parked request"),
+        "operator gets a no-such-request error, not a role refusal: {text}"
+    );
+}

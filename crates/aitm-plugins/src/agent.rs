@@ -62,6 +62,7 @@ impl Plugin for AgentPlugin {
         }));
         reg.add_command(Arc::new(AgentSet(self.state.clone())));
         reg.add_command(Arc::new(AgentActivity(self.audit.clone())));
+        reg.add_command(Arc::new(AgentApprove));
     }
 }
 
@@ -278,5 +279,64 @@ impl Command for AgentActivity {
             .map(|e| e.to_value())
             .collect();
         Ok(Value::Array(entries))
+    }
+}
+
+/// `agent.approve {request_id, allow} -> {}` (Sensitive; operator/CLI only).
+///
+/// The operator's half of the `Ask` policy handshake (spec D4): it resolves a
+/// Sensitive agent call the server parked for approval. The command is
+/// **server-handled** — the MCP server intercepts it in `call_tool` and resolves
+/// the request against its own parked-request table (which this plugin, in a
+/// separate crate, cannot reach). This `invoke` is only a fallback for a context
+/// with no such table and always refuses; the agent role can never approve
+/// (Review Focus #2), refused both by the server's intercept and here.
+struct AgentApprove;
+
+impl Command for AgentApprove {
+    fn name(&self) -> &str {
+        "agent.approve"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Sensitive
+    }
+
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "Approve or deny a Sensitive agent command the server parked under the \
+                          `ask` policy. Operator/CLI only; the agent cannot approve its own \
+                          requests."
+                .to_string(),
+            params: vec![
+                param(
+                    "request_id",
+                    TypeDesc::Str,
+                    true,
+                    "The parked request's id, from the approval_requested notification.",
+                ),
+                param(
+                    "allow",
+                    TypeDesc::Bool,
+                    true,
+                    "true runs the parked command and returns its result to the waiting agent; \
+                     false refuses it.",
+                ),
+            ],
+            result: TypeDesc::Object(vec![]),
+        }
+    }
+
+    fn invoke(&self, _args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        if host.frontend() == Frontend::Mcp {
+            bail!(
+                "agent.approve refused: the agent cannot approve its own requests; only an \
+                 operator or the human CLI may approve a parked sensitive command."
+            );
+        }
+        bail!(
+            "agent.approve is resolved by the MCP server against its parked-request table; it \
+             cannot be invoked in this context."
+        );
     }
 }
