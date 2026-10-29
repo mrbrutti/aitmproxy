@@ -34,12 +34,12 @@ use crate::backend::L4Error;
 use crate::config::{InterceptConfig, Verdict};
 use crate::craft::PacketSpec;
 use crate::flow::{L4FlowId, L4FlowStore};
-use crate::guard::L4Guard;
+use crate::guard::{L4Guard, L4GuardError};
 use crate::intercept::{
     start_intercept, InterceptBackend, InterceptHandle, InterceptParams, NfqueueBackend, ParkedId,
     ParkedPacket,
 };
-use crate::types::L4Direction;
+use crate::types::{L4Action, L4Direction};
 
 /// How the `start` command obtains the in-path backend for a queue number. The
 /// production factory builds a Linux [`NfqueueBackend`]; tests substitute a mock so
@@ -69,6 +69,9 @@ struct PendingEdit {
 struct Session {
     handle: InterceptHandle,
     interface: String,
+    /// The direction the session bound with — needed to re-resolve and re-check a
+    /// mutated packet's target before a mangling `forward`.
+    direction: L4Direction,
     queue: u16,
     edits: HashMap<ParkedId, PendingEdit>,
 }
@@ -210,6 +213,7 @@ impl Command for InterceptStart {
             Session {
                 handle,
                 interface: interface.clone(),
+                direction,
                 queue,
                 edits: HashMap::new(),
             },
@@ -508,13 +512,15 @@ impl Command for InterceptRevert {
 
 /// `l4.intercept.forward {id}` — forward a parked packet (mangled iff mutated).
 pub(crate) struct InterceptForward {
+    guard: Arc<L4Guard>,
     sessions: Arc<InterceptSessions>,
 }
 
 impl InterceptForward {
-    /// A forward command over the shared session registry.
-    pub(crate) fn new(sessions: Arc<InterceptSessions>) -> Self {
-        Self { sessions }
+    /// A forward command over the shared guard + session registry. The guard
+    /// re-checks any staged mutation before it is reinjected.
+    pub(crate) fn new(guard: Arc<L4Guard>, sessions: Arc<InterceptSessions>) -> Self {
+        Self { guard, sessions }
     }
 }
 
@@ -548,10 +554,59 @@ impl Command for InterceptForward {
         };
         let session = map.get_mut(&flow).expect("located session is present");
         // A staged edit ⇒ reinject mangled; otherwise forward the kernel's original.
-        let mutated = session.edits.remove(&id).map(|e| e.mutated);
+        //
+        // The session's permit was minted at `start` with `dst: None`, so a mutation
+        // that changes the destination (or inflates the size) was never scope-checked
+        // against *that* target. Before issuing a mangling verdict, re-resolve the
+        // mutated packet's target and run it back through the guard + the size cap, so
+        // a reinjected mutation can never leave scope, hit the dangerous-destination
+        // denylist, or exceed `max_packet_bytes`. Refuse with a typed error (the edit
+        // stays staged; the operator can `revert`) — the packet is NOT delivered
+        // mangled. An unmutated forward reinjects the kernel's already-scoped original.
+        let mutated = match session.edits.get(&id) {
+            Some(edit) => {
+                recheck_mutation(
+                    &self.guard,
+                    &session.interface,
+                    session.direction,
+                    &edit.mutated,
+                )
+                .map_err(anyhow::Error::new)?;
+                session.edits.remove(&id).map(|e| e.mutated)
+            }
+            None => None,
+        };
         let ok = session.handle.submit_verdict(id, Verdict::Forward, mutated);
         Ok(Value::Bool(ok))
     }
+}
+
+/// Re-check a staged mutation before it is reinjected on `forward`: resolve the
+/// mutated bytes to their target and run it through the guard (scope + capability +
+/// dangerous-destination denylist) and the per-packet size cap. Returns the typed
+/// [`L4Error`] the refusal carries, so a mutation that leaves scope, hits the
+/// denylist, or exceeds `max_packet_bytes` can never be delivered mangled.
+///
+/// A mutation that no longer decodes to an IP destination cannot be proven in
+/// scope, so it is refused deny-by-default (treated as out of scope).
+fn recheck_mutation(
+    guard: &L4Guard,
+    interface: &str,
+    direction: L4Direction,
+    bytes: &[u8],
+) -> Result<(), L4Error> {
+    let target = crate::intercept::ip_target(bytes, interface, direction).ok_or_else(|| {
+        L4Error::Guard(L4GuardError::OutOfL4Scope(
+            "mutated packet has no decodable IP destination; cannot re-verify scope".into(),
+        ))
+    })?;
+    // Scope + capability + denylist for the mutation's (possibly new) destination.
+    // `Intercept` mints no injection rate, so this re-check spends no rate budget.
+    let mut permit = guard.check(L4Action::Intercept, &target)?;
+    // The per-packet size ceiling, enforced via the permit exactly as the wire choke
+    // point does (`PacketTooLarge` when the mutation inflates past `max_packet_bytes`).
+    permit.authorize_packet(bytes.len())?;
+    Ok(())
 }
 
 // ---- l4.intercept.drop --------------------------------------------------------
@@ -611,12 +666,17 @@ pub(crate) fn intercept_commands(
     sessions: Arc<InterceptSessions>,
     config: Option<InterceptConfig>,
 ) -> Vec<Arc<dyn Command>> {
-    let start = InterceptStart::new(guard, store, sessions.clone(), config);
-    commands_over(start, sessions)
+    let start = InterceptStart::new(guard.clone(), store, sessions.clone(), config);
+    commands_over(start, guard, sessions)
 }
 
-/// The eight intercept commands over one start command + session registry.
-fn commands_over(start: InterceptStart, sessions: Arc<InterceptSessions>) -> Vec<Arc<dyn Command>> {
+/// The eight intercept commands over one start command + session registry. The
+/// guard is threaded to `forward` so a staged mutation is re-checked before reinject.
+fn commands_over(
+    start: InterceptStart,
+    guard: Arc<L4Guard>,
+    sessions: Arc<InterceptSessions>,
+) -> Vec<Arc<dyn Command>> {
     vec![
         Arc::new(start),
         Arc::new(InterceptStop::new(sessions.clone())),
@@ -624,7 +684,7 @@ fn commands_over(start: InterceptStart, sessions: Arc<InterceptSessions>) -> Vec
         Arc::new(InterceptList::new(sessions.clone())),
         Arc::new(InterceptMutate::new(sessions.clone())),
         Arc::new(InterceptRevert::new(sessions.clone())),
-        Arc::new(InterceptForward::new(sessions.clone())),
+        Arc::new(InterceptForward::new(guard, sessions.clone())),
         Arc::new(InterceptDrop::new(sessions)),
     ]
 }
@@ -1157,7 +1217,7 @@ mod tests {
         let sessions = Arc::new(InterceptSessions::new());
         let (backend, verdicts) = MockBackend::with(vec![ip_udp("10.0.0.5", b"ORIG")]);
         let start = InterceptStart::with_backend(
-            guard,
+            guard.clone(),
             store,
             sessions.clone(),
             Some(cfg(0)),
@@ -1165,7 +1225,7 @@ mod tests {
         );
         let list = InterceptList::new(sessions.clone());
         let mutate = InterceptMutate::new(sessions.clone());
-        let forward = InterceptForward::new(sessions.clone());
+        let forward = InterceptForward::new(guard.clone(), sessions.clone());
 
         let parts = HostParts::new();
         let host = parts.host();
@@ -1200,6 +1260,97 @@ mod tests {
             verdicts.lock().unwrap().as_slice(),
             &[(0, VKind::ForwardMangled(mangled))],
             "a mutated-then-forwarded packet is reinjected mangled"
+        );
+    }
+
+    /// Panel finding (Important): the park-time `Intercept` permit was minted with
+    /// `dst: None`, so a mutation that re-aims the packet at a destination the
+    /// operator never scoped must be re-checked before it is reinjected. A mutation
+    /// onto the dangerous-destination denylist (cloud metadata) or out of the scoped
+    /// CIDR is refused with a typed error and is **never delivered mangled**; an
+    /// in-scope mutation still forwards. Hermetic via the mock queue.
+    #[test]
+    fn mutate_out_of_scope_forward_refused() {
+        // An interception session scoped to `scope_cidr`, with one in-scope packet
+        // (10.0.0.5) parked, used to test a mutation that re-aims it at `bad_dst`.
+        let run_case =
+            |scope_cidr: (&str, u8), bad_dst: &str| -> (anyhow::Result<Value>, Vec<(u32, VKind)>) {
+                let guard = guard_with(vec![scope_entry(scope_cidr, L4Capability::Intercept)]);
+                let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+                let sessions = Arc::new(InterceptSessions::new());
+                let (backend, verdicts) = MockBackend::with(vec![ip_udp("10.0.0.5", b"ORIG")]);
+                let start = InterceptStart::with_backend(
+                    guard.clone(),
+                    store,
+                    sessions.clone(),
+                    Some(cfg(0)),
+                    mock_factory(backend),
+                );
+                let list = InterceptList::new(sessions.clone());
+                let mutate = InterceptMutate::new(sessions.clone());
+                let forward = InterceptForward::new(guard.clone(), sessions.clone());
+
+                let parts = HostParts::new();
+                let host = parts.host();
+                start.invoke(start_params(0), &host).expect("start ok");
+                wait_until(|| list_ids(&list, &host).len() == 1, "one parked packet");
+                let id = list_ids(&list, &host).remove(0);
+
+                // Re-aim the parked packet at an out-of-scope / dangerous destination.
+                mutate
+                    .invoke(
+                        {
+                            let mut m = BTreeMap::new();
+                            m.insert("id".to_string(), Value::Str(id.clone()));
+                            m.insert(
+                                "bytes".to_string(),
+                                Value::Bytes(ip_udp(bad_dst, b"RE-AIMED")),
+                            );
+                            Params::new(m)
+                        },
+                        &host,
+                    )
+                    .expect("mutate stages the edit");
+
+                let result = forward.invoke(one_param("id", Value::Str(id)), &host);
+                // Give any (erroneously) submitted verdict a chance to land before we read.
+                std::thread::sleep(Duration::from_millis(20));
+                let log = verdicts.lock().unwrap().clone();
+                (result, log)
+            };
+
+        // (A) Cloud-metadata — covered by a broad scope, so it is the denylist (not a
+        // plain scope miss) that must block the re-aimed mutation.
+        let (res, log) = run_case(("0.0.0.0", 0), "169.254.169.254");
+        let err = res.expect_err("a mutation onto the denylist must be refused");
+        let l4 = err
+            .downcast_ref::<L4Error>()
+            .unwrap_or_else(|| panic!("want a typed L4Error, got {err:?}"));
+        assert!(
+            matches!(
+                l4,
+                L4Error::Guard(L4GuardError::DangerousDestinationBlocked(_))
+            ),
+            "want DangerousDestinationBlocked, got {l4:?}"
+        );
+        assert!(
+            log.is_empty(),
+            "a refused mutation is NEVER delivered mangled; got {log:?}"
+        );
+
+        // (B) A mutation that leaves the scoped CIDR entirely.
+        let (res, log) = run_case(("10.0.0.5", 32), "8.8.8.8");
+        let err = res.expect_err("a mutation leaving scope must be refused");
+        let l4 = err
+            .downcast_ref::<L4Error>()
+            .unwrap_or_else(|| panic!("want a typed L4Error, got {err:?}"));
+        assert!(
+            matches!(l4, L4Error::Guard(L4GuardError::OutOfL4Scope(_))),
+            "want OutOfL4Scope, got {l4:?}"
+        );
+        assert!(
+            log.is_empty(),
+            "a refused mutation is NEVER delivered mangled; got {log:?}"
         );
     }
 
@@ -1246,7 +1397,7 @@ mod tests {
         let sessions = Arc::new(InterceptSessions::new());
         let (backend, verdicts) = MockBackend::with(vec![ip_udp("10.0.0.5", b"ORIG")]);
         let start = InterceptStart::with_backend(
-            guard,
+            guard.clone(),
             store,
             sessions.clone(),
             Some(cfg(0)),
@@ -1255,7 +1406,7 @@ mod tests {
         let list = InterceptList::new(sessions.clone());
         let mutate = InterceptMutate::new(sessions.clone());
         let revert = InterceptRevert::new(sessions.clone());
-        let forward = InterceptForward::new(sessions.clone());
+        let forward = InterceptForward::new(guard.clone(), sessions.clone());
 
         let parts = HostParts::new();
         let host = parts.host();
@@ -1407,10 +1558,10 @@ mod tests {
         )]);
         let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
         let sessions = Arc::new(InterceptSessions::new());
-        let start = InterceptStart::new(guard, store, sessions.clone(), Some(cfg(QUEUE)));
+        let start = InterceptStart::new(guard.clone(), store, sessions.clone(), Some(cfg(QUEUE)));
         let list = InterceptList::new(sessions.clone());
         let mutate = InterceptMutate::new(sessions.clone());
-        let forward = InterceptForward::new(sessions.clone());
+        let forward = InterceptForward::new(guard.clone(), sessions.clone());
         let parts = HostParts::new();
         let host = parts.host();
 

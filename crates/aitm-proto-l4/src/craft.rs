@@ -219,6 +219,23 @@ impl PacketSpec {
         Ok(bytes)
     }
 
+    /// The transport protocol this spec declares, read from its layer stack — the
+    /// proto the guard uses for port matching and a `send_recv` reply must share.
+    /// `Raw` when the spec declares no transport layer.
+    #[must_use]
+    pub fn transport_proto(&self) -> crate::types::L4Proto {
+        use crate::types::L4Proto;
+        for layer in &self.layers {
+            match layer {
+                Layer::Tcp(_) => return L4Proto::Tcp,
+                Layer::Udp(_) => return L4Proto::Udp,
+                Layer::Icmp(_) => return L4Proto::Icmp,
+                _ => {}
+            }
+        }
+        L4Proto::Raw
+    }
+
     /// Parse `bytes` structurally and name its layers. Never fails: unparseable
     /// input yields an empty layer list with the correct length.
     #[must_use]

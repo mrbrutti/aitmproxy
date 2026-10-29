@@ -34,7 +34,7 @@ use std::time::{Duration, Instant, SystemTime};
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 
 use crate::backend::{CaptureInjectBackend, L4Error};
-use crate::craft::{Layer, PacketSpec};
+use crate::craft::PacketSpec;
 use crate::flow::{L4Bind, L4Flow, L4FlowId, L4FlowKind, L4FlowStore, L4Meta, L4Packet};
 use crate::guard::L4Guard;
 use crate::types::{L4Action, L4Direction, L4Proto, L4Target};
@@ -131,7 +131,7 @@ pub fn send_recv(
     // send, then `Capture` on the interface to receive — deny-by-default refuses
     // here, before the capture opens or a byte reaches the wire. Both permits are
     // held for the operation's lifetime (moved into the worker thread).
-    let stimulus_proto = spec_proto(&spec.packet);
+    let stimulus_proto = spec.packet.transport_proto();
     let inject_target = L4Target {
         interface: spec.interface.clone(),
         direction: L4Direction::Outbound,
@@ -168,42 +168,57 @@ pub fn send_recv(
     // awaited all on one dedicated thread: the handle never crosses a boundary and
     // the capture is open *before* the inject, so a fast reply is not missed. The
     // permits move in and are released when the thread (hence the operation) ends.
+    // The correlated reply is returned (not recorded here): the capture-scope
+    // re-check that gates recording needs the guard, which stays on this thread.
+    let worker_iface = iface.clone();
+    let worker_store = store.clone();
     let worker = thread::spawn(move || -> Result<(L4FlowId, SendRecvOutcome), L4Error> {
         let mut inject_permit = inject_permit;
         let _capture_permit = capture_permit;
 
         // Open the capture first (fail-closed on missing privilege/libpcap).
-        let mut source = backend.open_capture(&iface, None, poll)?;
+        let mut source = backend.open_capture(&worker_iface, None, poll)?;
 
         // Send the stimulus through the single guarded choke point.
-        send_on_wire(&mut inject_permit, backend.as_ref(), &iface, &bytes)?;
+        send_on_wire(&mut inject_permit, backend.as_ref(), &worker_iface, &bytes)?;
 
         // The stimulus is on the wire: record it in a fresh SendRecv flow (no stray
         // flow if the open or the inject failed above).
-        let flow_id = store.insert(L4Flow {
+        let flow_id = worker_store.insert(L4Flow {
             id: L4FlowId::new(),
             kind: L4FlowKind::SendRecv,
             bind: L4Bind {
-                interface: iface.clone(),
+                interface: worker_iface.clone(),
                 filter: None,
                 queue: None,
             },
             packets: Vec::new(),
             metadata: L4Meta::default(),
         });
-        store.append_packet(flow_id, make_packet(&bytes, L4Direction::Outbound, true));
+        worker_store.append_packet(flow_id, make_packet(&bytes, L4Direction::Outbound, true));
 
         // Await the correlated reply, bounded by the timeout — never hangs.
         let outcome = await_reply(source.as_mut(), &correlation, timeout);
-        if let SendRecvOutcome::Response(ref pkt) | SendRecvOutcome::Other(ref pkt) = outcome {
-            store.append_packet(flow_id, pkt.clone());
-        }
         Ok((flow_id, outcome))
     });
 
-    worker
+    let (flow_id, outcome) = worker
         .join()
-        .unwrap_or_else(|_| Err(L4Error::Unavailable("send_recv worker panicked".into())))
+        .unwrap_or_else(|_| Err(L4Error::Unavailable("send_recv worker panicked".into())))?;
+
+    // Capture-scope the correlated reply before recording it, exactly as the
+    // background capture re-checks every delivered frame (`capture::record_frame`):
+    // the bind-time `Capture` permit was minted with `dst: None`, so a reply must
+    // still resolve to a `Capture`-authorized target or it is dropped — never
+    // recorded. An undecodable reply (no IP target) is likewise not recorded.
+    if let SendRecvOutcome::Response(ref pkt) | SendRecvOutcome::Other(ref pkt) = outcome {
+        let authorized = crate::capture::packet_target(&pkt.bytes, &iface, L4Direction::Inbound)
+            .is_some_and(|t| guard.check(L4Action::Capture, &t).is_ok());
+        if authorized {
+            store.append_packet(flow_id, pkt.clone());
+        }
+    }
+    Ok((flow_id, outcome))
 }
 
 /// Block for up to `timeout` for a frame the `correlation` accepts, polling the
@@ -388,20 +403,6 @@ fn parse_any(frame: &[u8]) -> Option<SlicedPacket<'_>> {
     None
 }
 
-/// The stimulus transport protocol, read from its layer stack — the proto a
-/// `FiveTuple` reply must share.
-fn spec_proto(spec: &PacketSpec) -> L4Proto {
-    for layer in &spec.layers {
-        match layer {
-            Layer::Tcp(_) => return L4Proto::Tcp,
-            Layer::Udp(_) => return L4Proto::Udp,
-            Layer::Icmp(_) => return L4Proto::Icmp,
-            _ => {}
-        }
-    }
-    L4Proto::Raw
-}
-
 /// Build the flow record for a frame: its direction, a structural decode, and
 /// whether aitmproxy authored it.
 fn make_packet(bytes: &[u8], dir: L4Direction, injected: bool) -> L4Packet {
@@ -420,7 +421,7 @@ mod tests {
 
     use crate::backend::CaptureSource;
     use crate::config::L4Config;
-    use crate::craft::{Ipv4Spec, UdpSpec};
+    use crate::craft::{Ipv4Spec, Layer, UdpSpec};
     use crate::flow::InMemoryL4FlowStore;
     use crate::guard::L4GuardError;
     use crate::types::{IpCidr, L4Capability, L4ScopeEntry, L4ScopeId, PortRange, RateCap};
@@ -680,6 +681,57 @@ mod tests {
             matches!(outcome, SendRecvOutcome::Other(_)),
             "wrong-port reply from the host is Other, got {outcome:?}"
         );
+    }
+
+    /// Panel finding (Minor): a correlated reply is capture-scope re-checked before
+    /// it is recorded, exactly as the background capture re-checks each delivered
+    /// frame. With `expect = Any` a decodable reply whose target is outside the
+    /// `Capture` scope is dropped — the flow records only the stimulus.
+    #[test]
+    fn send_recv_out_of_scope_reply_not_recorded() {
+        // Capture scope is 127.0.0.1/32 (inbound); this reply is addressed to an
+        // out-of-scope destination, so the per-reply Capture check must drop it.
+        let out_of_scope = PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some("127.0.0.1".parse().unwrap()),
+                    dst: Some("10.9.9.9".parse().unwrap()),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    src_port: Some(9),
+                    dst_port: Some(40000),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(b"nope".to_vec()),
+            ],
+        }
+        .build()
+        .expect("reply builds");
+
+        let g = send_recv_guard();
+        let backend = MockBackend::with_replies(vec![out_of_scope]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+
+        let (flow_id, _outcome) = send_recv(
+            &g,
+            backend,
+            store.clone(),
+            spec(ReplyMatch::Any, Duration::from_secs(1)),
+        )
+        .expect("authorized send_recv runs");
+
+        let flow = store.get(flow_id).expect("send_recv flow present");
+        assert_eq!(
+            flow.packets.len(),
+            1,
+            "an out-of-scope reply is dropped; only the stimulus is recorded"
+        );
+        assert!(
+            flow.packets[0].injected,
+            "the one recorded packet is the injected stimulus"
+        );
+        assert_eq!(g.in_flight(), 0, "both permits released");
     }
 
     /// AC1 deny-by-default: an empty scope refuses send_recv with `OutOfL4Scope`

@@ -28,10 +28,10 @@ use std::time::SystemTime;
 use aitm_core::{Command, CommandHost, ParamDef, ParamSchema, Params, TypeDesc, Value};
 
 use crate::backend::CaptureInjectBackend;
-use crate::craft::{Layer, PacketSpec};
+use crate::craft::PacketSpec;
 use crate::flow::{L4Bind, L4Flow, L4FlowId, L4FlowKind, L4FlowStore, L4Meta, L4Packet};
 use crate::guard::L4Guard;
-use crate::types::{L4Action, L4Direction, L4Proto, L4Target};
+use crate::types::{L4Action, L4Direction, L4Target};
 use crate::wire::send_on_wire;
 
 /// `l4.inject {spec, dst, interface, port?, count?}` → inject a crafted spec to a
@@ -153,7 +153,7 @@ impl Command for Inject {
             direction: L4Direction::Outbound,
             dst: Some(dst),
             dst_port,
-            proto: proto_of(&spec),
+            proto: spec.transport_proto(),
         };
 
         // (1) Primary gate: the L4 guard (scope + dangerous-destination denylist +
@@ -212,20 +212,6 @@ impl Command for Inject {
         obj.insert("sent".to_string(), Value::Int(sent));
         Ok(Value::Object(obj))
     }
-}
-
-/// The stimulus transport protocol, read from its layer stack — the proto the guard
-/// uses for port matching. `Raw` when the spec declares no transport layer.
-fn proto_of(spec: &PacketSpec) -> L4Proto {
-    for layer in &spec.layers {
-        match layer {
-            Layer::Tcp(_) => return L4Proto::Tcp,
-            Layer::Udp(_) => return L4Proto::Udp,
-            Layer::Icmp(_) => return L4Proto::Icmp,
-            _ => {}
-        }
-    }
-    L4Proto::Raw
 }
 
 #[cfg(test)]
@@ -464,5 +450,62 @@ mod tests {
             "an injected packet is injected=true"
         );
         assert_eq!(flow.packets[0].dir, L4Direction::Outbound);
+    }
+
+    /// Panel finding (Important): the rate cap is **per packet**, not per `check`. A
+    /// single `l4.inject` with `count = pps + 1` must trip `InjectionRateExceeded` on
+    /// the (pps+1)-th packet — the batch loop threads one permit and spends a rate
+    /// token for every packet, so `inject_rate.pps` is packets/sec. The first `pps`
+    /// packets still reach the wire; the overflow one does not.
+    #[test]
+    fn inject_batch_trips_rate_cap_per_packet() {
+        const PPS: u32 = 2;
+        let guard = Arc::new(L4Guard::new(&L4Config::default()));
+        guard
+            .add_scope(entry(
+                ("127.0.0.1", 32),
+                "lo0",
+                L4Capability::Inject,
+                (PPS, PPS),
+            ))
+            .unwrap();
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let backend = MockBackend::available();
+        let cmd = Inject::new(guard, store.clone(), backend.clone());
+
+        let mem = MemFlowStore::new();
+        let client = StubClient;
+        let core = core_guard_scoped();
+        let host = CommandHost::new(&mem, &client, &core, None);
+
+        // count = pps + 1: the (pps+1)-th packet exhausts the per-entry rate bucket.
+        let err = cmd
+            .invoke(
+                inject_params(
+                    udp_spec_value("127.0.0.1", 9),
+                    "127.0.0.1",
+                    "lo0",
+                    9,
+                    i64::from(PPS) + 1,
+                ),
+                &host,
+            )
+            .unwrap_err();
+        let typed = err
+            .downcast_ref::<L4Error>()
+            .unwrap_or_else(|| panic!("want a typed L4Error, got {err:?}"));
+        assert!(
+            matches!(
+                typed,
+                L4Error::Guard(L4GuardError::InjectionRateExceeded { .. })
+            ),
+            "the (pps+1)-th packet must trip InjectionRateExceeded, got {typed:?}"
+        );
+        // Exactly `pps` packets reached the wire before the cap tripped.
+        assert_eq!(
+            backend.sent().len(),
+            PPS as usize,
+            "only pps packets are sent before the per-packet rate cap refuses"
+        );
     }
 }

@@ -104,17 +104,27 @@ pub struct L4Permit {
     budget: u32,
     /// Per-packet size ceiling.
     max_packet_bytes: usize,
+    /// Per-packet injection rate metering: `Some` for an injection permit (one token
+    /// spent per authorized packet), `None` for capture/interception permits, which
+    /// consume no injection rate.
+    rate: Option<RateSpender>,
     /// In-flight gauge, decremented on drop (RAII).
     in_flight: Arc<AtomicU32>,
 }
 
 impl L4Permit {
     /// Authorize one outgoing packet of `len` bytes against the permit's bounded
-    /// budget. Returns [`L4GuardError::PacketTooLarge`] if the packet is over the
-    /// size ceiling (no budget is consumed), [`L4GuardError::CountExceeded`] when
-    /// the per-call budget is exhausted, otherwise consumes one slot and succeeds.
+    /// budget. Returns, in order: [`L4GuardError::PacketTooLarge`] if the packet is
+    /// over the size ceiling, [`L4GuardError::CountExceeded`] when the per-call
+    /// budget is exhausted, [`L4GuardError::InjectionRateExceeded`] when the
+    /// per-packet injection rate (per-entry or global) has no token left — none of
+    /// which consume the per-call count slot; otherwise consumes one slot and
+    /// succeeds.
     ///
-    /// Called by the wire choke point (M5 Task 6) before every write.
+    /// Called by the wire choke point (M5 Task 6) before every write, so one minted
+    /// permit meters a whole batch: the count budget bounds the batch size and the
+    /// rate buckets are spent **per packet**, making `inject_rate.pps` mean
+    /// packets/sec rather than checks/sec.
     pub fn authorize_packet(&mut self, len: usize) -> Result<(), L4GuardError> {
         if len > self.max_packet_bytes {
             return Err(L4GuardError::PacketTooLarge {
@@ -123,6 +133,13 @@ impl L4Permit {
         }
         if self.remaining == 0 {
             return Err(L4GuardError::CountExceeded { max: self.budget });
+        }
+        // Per-packet injection rate: spend one token (per-entry then global) before
+        // this packet is admitted. Checked after the count budget so a count-exhausted
+        // call wastes no rate token, and before the count is decremented so a
+        // rate-refused packet consumes no count slot either.
+        if let Some(rate) = &self.rate {
+            rate.spend()?;
         }
         self.remaining -= 1;
         Ok(())
@@ -154,6 +171,40 @@ impl fmt::Debug for L4Permit {
 impl Drop for L4Permit {
     fn drop(&mut self) {
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Per-packet injection-rate metering carried by an injection [`L4Permit`]. It holds
+/// shared handles to the per-entry and tool-wide token buckets and spends one token
+/// from each per authorized packet, so a batch threading one permit is metered
+/// packet-by-packet (not once at `check` time).
+struct RateSpender {
+    /// The per-entry bucket for the scope entry that authorized this permit.
+    entry: Arc<Mutex<TokenBucket>>,
+    /// The tool-wide bucket, shared by every injection permit.
+    global: Arc<Mutex<TokenBucket>>,
+}
+
+impl RateSpender {
+    /// Spend one token from the per-entry bucket, then the tool-wide bucket. Returns
+    /// [`L4GuardError::InjectionRateExceeded`] (carrying the limiting bucket's retry
+    /// hint) the moment either bucket is empty.
+    fn spend(&self) -> Result<(), L4GuardError> {
+        {
+            let mut entry = self.entry.lock().unwrap_or_else(PoisonError::into_inner);
+            if !entry.try_take() {
+                return Err(L4GuardError::InjectionRateExceeded {
+                    retry_after: entry.retry_after(),
+                });
+            }
+        }
+        let mut global = self.global.lock().unwrap_or_else(PoisonError::into_inner);
+        if !global.try_take() {
+            return Err(L4GuardError::InjectionRateExceeded {
+                retry_after: global.retry_after(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -202,10 +253,11 @@ impl TokenBucket {
 /// The deny-by-default L4 authorization guard.
 pub struct L4Guard {
     scope: RwLock<Vec<L4ScopeEntry>>,
-    /// Per-entry injection buckets, keyed by scope id.
-    entry_buckets: Mutex<HashMap<L4ScopeId, TokenBucket>>,
-    /// Tool-wide injection bucket.
-    global_bucket: Mutex<TokenBucket>,
+    /// Per-entry injection buckets, keyed by scope id. Shared (`Arc`) so an injection
+    /// permit can spend a token per packet, not just once at `check` time.
+    entry_buckets: Mutex<HashMap<L4ScopeId, Arc<Mutex<TokenBucket>>>>,
+    /// Tool-wide injection bucket, shared with every injection permit.
+    global_bucket: Arc<Mutex<TokenBucket>>,
     global_inject_pps: u32,
     max_packet_bytes: usize,
     max_packets_per_call: u32,
@@ -223,10 +275,10 @@ impl L4Guard {
         Self {
             scope: RwLock::new(cfg.scope.clone()),
             entry_buckets: Mutex::new(HashMap::new()),
-            global_bucket: Mutex::new(TokenBucket::new(
+            global_bucket: Arc::new(Mutex::new(TokenBucket::new(
                 cfg.global_inject_pps,
                 cfg.global_inject_pps,
-            )),
+            ))),
             global_inject_pps: cfg.global_inject_pps,
             max_packet_bytes: cfg.max_packet_bytes,
             max_packets_per_call: cfg.max_packets_per_call,
@@ -238,8 +290,12 @@ impl L4Guard {
     /// The ONLY gate. Called before a capture/interception binds and before any
     /// packet is written to the wire or a mangling verdict is issued. Applies, in
     /// order: (1) scope + capability match, (2) dangerous-destination denylist,
-    /// (3) rate/size/count caps (rate consumed for `Inject` only), then mints an
-    /// [`L4Permit`] carrying the bounded send budget. There is no unchecked path.
+    /// (3) for `Inject`, refuse up front if the per-entry or tool-wide rate is
+    /// disabled (`pps == 0`), then mint an [`L4Permit`] carrying the bounded size +
+    /// count budget and — for injection — a per-packet rate meter over the per-entry
+    /// and tool-wide buckets. The size, count, and rate caps are spent **per packet**
+    /// at [`L4Permit::authorize_packet`] time (the wire choke point), so a batch
+    /// threading one permit is metered packet-by-packet. There is no unchecked path.
     pub fn check(&self, action: L4Action, target: &L4Target) -> Result<L4Permit, L4GuardError> {
         let want = capability_for(action);
 
@@ -283,44 +339,37 @@ impl L4Guard {
             (chosen.id, chosen.inject_rate)
         };
 
-        // Phase 3: rate caps apply to injection only (capture/interception bind
-        // without consuming an injection budget). Per-entry ceiling first, then the
-        // tool-wide ceiling; `pps == 0` means refuse.
-        if action == L4Action::Inject {
-            if inject_rate.pps == 0 {
+        // Phase 3: rate metering applies to injection only (capture/interception bind
+        // without consuming an injection budget). A disabled rate (`pps == 0`, per
+        // entry or tool-wide) refuses up front — no permit. Otherwise the permit
+        // carries a [`RateSpender`] over the per-entry + tool-wide buckets, and one
+        // token is spent **per packet** at `authorize_packet` time, so `inject_rate.pps`
+        // means packets/sec across the whole batch (not one token per `check`).
+        let rate = if action == L4Action::Inject {
+            if inject_rate.pps == 0 || self.global_inject_pps == 0 {
                 return Err(L4GuardError::InjectionRateExceeded {
                     retry_after: Duration::from_secs(1),
                 });
             }
-            {
-                let mut buckets = self
-                    .entry_buckets
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                let bucket = buckets
-                    .entry(entry_id)
-                    .or_insert_with(|| TokenBucket::new(inject_rate.pps, inject_rate.burst));
-                if !bucket.try_take() {
-                    return Err(L4GuardError::InjectionRateExceeded {
-                        retry_after: bucket.retry_after(),
-                    });
-                }
-            }
-            if self.global_inject_pps == 0 {
-                return Err(L4GuardError::InjectionRateExceeded {
-                    retry_after: Duration::from_secs(1),
-                });
-            }
-            let mut global = self
-                .global_bucket
+            let entry_bucket = self
+                .entry_buckets
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if !global.try_take() {
-                return Err(L4GuardError::InjectionRateExceeded {
-                    retry_after: global.retry_after(),
-                });
-            }
-        }
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(entry_id)
+                .or_insert_with(|| {
+                    Arc::new(Mutex::new(TokenBucket::new(
+                        inject_rate.pps,
+                        inject_rate.burst,
+                    )))
+                })
+                .clone();
+            Some(RateSpender {
+                entry: entry_bucket,
+                global: self.global_bucket.clone(),
+            })
+        } else {
+            None
+        };
 
         // Mint the permit (the only path that constructs one).
         self.in_flight.fetch_add(1, Ordering::SeqCst);
@@ -329,6 +378,7 @@ impl L4Guard {
             remaining: self.max_packets_per_call,
             budget: self.max_packets_per_call,
             max_packet_bytes: self.max_packet_bytes,
+            rate,
             in_flight: self.in_flight.clone(),
         })
     }
@@ -670,8 +720,10 @@ mod tests {
         assert!(g.check(L4Action::Inject, &t).is_ok());
     }
 
-    /// AC5 — with `inject_rate` N pps the (N+1)-th injection in the window is
-    /// refused with `InjectionRateExceeded`.
+    /// AC5 — rate is metered **per packet**: with `inject_rate` N pps the (N+1)-th
+    /// packet authorized against one permit is refused with `InjectionRateExceeded`.
+    /// (Minting the permit via `check` consumes no token; the tokens are spent at
+    /// `authorize_packet` time, so `pps` means packets/sec, not checks/sec.)
     #[test]
     fn rate_cap_trips() {
         let g = L4Guard::new(&cfg());
@@ -684,10 +736,40 @@ mod tests {
         ))
         .unwrap();
         let t = target("lo0", L4Direction::Outbound, "127.0.0.1", 1234);
-        assert!(g.check(L4Action::Inject, &t).is_ok());
-        assert!(g.check(L4Action::Inject, &t).is_ok());
+        let mut permit = g
+            .check(L4Action::Inject, &t)
+            .expect("mint injection permit");
+        assert!(permit.authorize_packet(64).is_ok());
+        assert!(permit.authorize_packet(64).is_ok());
         assert!(matches!(
-            g.check(L4Action::Inject, &t),
+            permit.authorize_packet(64),
+            Err(L4GuardError::InjectionRateExceeded { .. })
+        ));
+    }
+
+    /// AC5 (per-packet) — a *second* permit minted after the bucket is drained also
+    /// sees the exhaustion, proving the rate state is shared across permits (the bug
+    /// the panel caught: one `check` must not grant a fresh batch of `pps` writes).
+    #[test]
+    fn rate_cap_shared_across_permits() {
+        let g = L4Guard::new(&cfg());
+        g.add_scope(entry(
+            ("127.0.0.1", 32),
+            "lo0",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (2, 2),
+        ))
+        .unwrap();
+        let t = target("lo0", L4Direction::Outbound, "127.0.0.1", 1234);
+        // Drain the two-token bucket through the first permit.
+        let mut first = g.check(L4Action::Inject, &t).unwrap();
+        assert!(first.authorize_packet(64).is_ok());
+        assert!(first.authorize_packet(64).is_ok());
+        // A second permit cannot conjure more budget: the shared bucket is empty.
+        let mut second = g.check(L4Action::Inject, &t).unwrap();
+        assert!(matches!(
+            second.authorize_packet(64),
             Err(L4GuardError::InjectionRateExceeded { .. })
         ));
     }

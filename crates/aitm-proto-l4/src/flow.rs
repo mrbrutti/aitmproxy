@@ -20,7 +20,7 @@
 //! spec; the impl is the builder's.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -190,7 +190,7 @@ impl L4FlowStore for InMemoryL4FlowStore {
     fn insert(&self, mut flow: L4Flow) -> L4FlowId {
         let id = L4FlowId::new();
         flow.id = id;
-        let mut inner = self.inner.lock().expect("flow store mutex poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         inner.flows.insert(id, flow);
         inner.order.push_back(id);
         while inner.order.len() > self.max_flows {
@@ -202,17 +202,17 @@ impl L4FlowStore for InMemoryL4FlowStore {
     }
 
     fn get(&self, id: L4FlowId) -> Option<L4Flow> {
-        let inner = self.inner.lock().expect("flow store mutex poisoned");
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         inner.flows.get(&id).cloned()
     }
 
     fn list(&self) -> Vec<L4FlowId> {
-        let inner = self.inner.lock().expect("flow store mutex poisoned");
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         inner.order.iter().copied().collect()
     }
 
     fn append_packet(&self, id: L4FlowId, pkt: L4Packet) {
-        let mut inner = self.inner.lock().expect("flow store mutex poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(flow) = inner.flows.get_mut(&id) {
             flow.packets.push(pkt);
         }

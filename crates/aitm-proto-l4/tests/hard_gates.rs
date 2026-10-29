@@ -17,6 +17,17 @@
 //! tree and the merge-base with `main`, so it lives where the whole workspace is in
 //! scope: `crates/aitm/tests/l4_wiring.rs::aitm_core_untouched`. It is not duplicated
 //! here.
+//!
+//! **These text scans are supplementary, not the guarantee.** They grep the
+//! production source and would miss, for example, a wire write spelled differently
+//! or a verdict path refactored around the string they match. The *actual*
+//! one-choke-point and one-mangling-path guarantees are enforced by the **type
+//! system**, which no test can bypass: `L4Permit` has private fields minted only by
+//! `L4Guard::check`, `send_on_wire` takes one by
+//! type, `InterceptHandle` holds one for the session's life, and the `compile_fail`
+//! doctest in `wire.rs` proves the permit cannot be forged. These tests only guard
+//! against someone silently editing those structural properties away; read them as a
+//! tripwire over the type-level proof, not as the proof itself.
 
 use std::path::{Path, PathBuf};
 
