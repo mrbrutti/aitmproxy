@@ -297,6 +297,57 @@ pub struct PocStepSchema {
     pub sources: Vec<String>,
 }
 
+/// The assembled `namespaces` map of `rhai.api.json` (Task 4): each protocol's
+/// `NamespaceCatalog` concatenated by namespace. A protocol joins by returning
+/// its [`NamespaceCatalog`]; the assembler keys by namespace, so two namespaces
+/// with a same-named fn stay separate (Review Focus). These output types are
+/// pure data (serde-derived, rhai-free), living beside [`NamespaceCatalog`] so
+/// the rhai-free assembler can emit the shared operator-UI files.
+pub type NamespacesDoc = BTreeMap<String, NamespaceEntry>;
+
+/// One namespace's entry in [`NamespacesDoc`]: its API version and the `<ns>.*`
+/// host-fn signatures, in the shape `rhai.api.json`'s `namespaces` map expects.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NamespaceEntry {
+    /// The namespace's API version — matches [`ProtocolLanguage::api_version`].
+    pub api_version: String,
+    /// The `<ns>.*` host-fn signatures + descriptions, for Rhai completion.
+    #[serde(default)]
+    pub fns: Vec<HostFnSig>,
+}
+
+/// One `<ns>:` step node of `poc-yaml.schema.json` (Task 4), assembled from a
+/// namespace's [`PocStepSchema`]. Mirrors the schema's `map` node shape so the
+/// operator-UI schema can consume it directly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProtocolStepDoc {
+    /// Always `"map"`: a `<ns>:` step body is a map of fields.
+    #[serde(rename = "type")]
+    pub node_type: String,
+    /// A one-line human description for hover/help.
+    pub description: String,
+    /// The body's enumerated fields (e.g. `op` → its verb vocabulary), as schema
+    /// `enum` nodes.
+    #[serde(default)]
+    pub keys: BTreeMap<String, SchemaEnumNode>,
+    /// The matcher/extractor source names this step contributes (e.g. `"packet"`).
+    #[serde(default)]
+    pub sources: Vec<String>,
+}
+
+/// A schema `enum` node inside a [`ProtocolStepDoc`]'s `keys` map.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchemaEnumNode {
+    /// Always `"enum"`.
+    #[serde(rename = "type")]
+    pub node_type: String,
+    /// The allowed values for this field.
+    #[serde(rename = "enum")]
+    pub values: Vec<String>,
+    /// A one-line human description for hover/help.
+    pub description: String,
+}
+
 /// A failure registering a host fn into a [`ScriptHostRegistry`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegisterError {

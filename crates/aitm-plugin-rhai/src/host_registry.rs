@@ -177,6 +177,31 @@ pub(crate) fn install_languages(
     Ok(versions)
 }
 
+/// The `(namespace, name)` set a slice of languages registers, read back from a
+/// real [`HostRegistry`] store — the production registration path. The Task 4
+/// seam drift guard compares this against the assembled `namespaces` catalog so a
+/// registered namespace fn missing from the catalog (or vice versa) fails
+/// (AC7). Unlike the engine's `gen_fn_signatures`, which collapses every
+/// `<ns>.*` onto one `ProtoNamespace` type, this knows exactly what each
+/// namespace registered.
+pub fn registered_host_fns(
+    languages: &[&dyn ProtocolLanguage],
+) -> Result<std::collections::BTreeSet<(String, String)>, RegisterError> {
+    // A throwaway engine: registration only writes the shared fn table (and
+    // installs the namespace constants/dispatchers on this engine, which we
+    // drop). No standard packages or runtime are needed.
+    let mut engine = Engine::new_raw();
+    let mut registry = HostRegistry::new(&mut engine);
+    for language in languages {
+        language.register_host_fns(&mut registry)?;
+    }
+    let store = registry
+        .store
+        .read()
+        .unwrap_or_else(PoisonError::into_inner);
+    Ok(store.keys().cloned().collect())
+}
+
 /// Keep the hand-written `arity!` overloads below in sync with [`MAX_ARITY`].
 const _: () = assert!(
     MAX_ARITY == 8,

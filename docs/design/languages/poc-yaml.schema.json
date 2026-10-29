@@ -161,6 +161,23 @@
         "expr": { "type": "string", "description": "Expression to evaluate (dsl, browser-eval)." },
         "internal": { "type": "boolean", "description": "Pass between steps without printing." }
       }
+    },
+    "protocol_step": {
+      "type": "map",
+      "description": "A protocol namespace's native `<ns>:` step (extensibility seam). Its body keys are the namespace's verb vocabulary — the SAME names as the Rhai `<ns>.*` host fns (one vocabulary) — and a sibling `extract:` reads a field from one of the step's named sources. Concrete `<ns>` step entries under steps[].items.keys are generated from each protocol's NamespaceCatalog; this is the shared shape they take. Empty until Task 6 adds the l4 namespace.",
+      "keys": {
+        "op": { "type": "string", "description": "The verb to run; one of the namespace's host-fn names." }
+      }
+    },
+    "protocol_extractor": {
+      "type": "map",
+      "description": "A `<ns>:` step's sibling extractor: reads `field` from a named source the step produced (e.g. `type: packet, field: tcp.flags`).",
+      "keys": {
+        "name": { "type": "string", "description": "Binds a variable for later steps and success." },
+        "type": { "type": "string", "description": "The source name the step produced (e.g. packet, echo)." },
+        "field": { "type": "string", "description": "Dotted field path into the named source (e.g. tcp.flags)." },
+        "internal": { "type": "boolean", "description": "Pass between steps without printing." }
+      }
     }
   }
 }

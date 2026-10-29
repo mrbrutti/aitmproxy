@@ -17,16 +17,25 @@
 //! The comparison is factored into [`diff`] so the companion self-test can feed
 //! it a deliberately mutated catalog set and prove the guard bites (AC10).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use aitm_core::{HttpFlow, HttpRequest, MemFlowStore, ProxyClient, StdGuard};
+use aitm_core::{HttpFlow, HttpRequest, MemFlowStore, ProxyClient, StdGuard, Value};
+use aitm_plugin::language::{
+    GuardHandle, Guarded, HostError, HostFn, HostFnSig, NamespaceCatalog, NamespaceEntry,
+    PocStepHandler, PocStepSchema, ProtocolLanguage, RegisterError, ScriptHostRegistry,
+};
 use aitm_plugin_rhai::config::RhaiConfig;
 use aitm_plugin_rhai::host_core::{MemoryFindingSink, ScriptServices};
 use aitm_plugin_rhai::loader::RhaiLoader;
+use aitm_plugin_rhai::{
+    assemble_namespaces, assemble_poc_steps, production_languages, registered_host_fns,
+    vocabulary_consistent, AssembleError,
+};
+use aitm_proto_test::TestLanguage;
 
 /// A token in the common space both sides reduce to: `(receiver_type, member)`.
 /// The receiver is the engine's registered type name (`"Flow"`, `"Headers"`,
@@ -249,4 +258,311 @@ async fn diff_rejects_a_mutated_catalog() {
         unlisted.contains(&real),
         "a registered host token dropped from the catalog must be reported unlisted"
     );
+}
+
+// ===========================================================================
+// Task 4 (spec AC6 / AC7 / AC8, Review Focus) — the SEAM drift guard.
+//
+// F8's `catalog_matches_engine_host_surface` above pins the built-in host
+// surface via `gen_fn_signatures`, reducing to `(receiver_type, member)`. That
+// bijection CANNOT cover seam namespaces: every `<ns>.*` host fn registers on
+// one shared `ProtoNamespace` rhai type with runtime `(namespace, method)`
+// dispatch, so the engine only shows `("ProtoNamespace","ping")` and cannot
+// tell `test.ping` from another namespace's `ping`.
+//
+// So the seam guard compares a DIFFERENT pair of sets: the `HostRegistry`'s
+// explicitly-registered `(namespace, name)` set (`registered_host_fns`, read
+// back from the real production registry's store) against the assembled
+// `namespaces` map's `(namespace, fn.name)` set (`assemble_namespaces`, built
+// from each language's `catalog()`). A registered namespace/fn missing from the
+// catalog, or a catalogued fn the registry never registered, fails the guard.
+// ===========================================================================
+
+/// A guard that admits every call — the fakes below contribute effect-free host
+/// fns, so there is no effect to gate.
+struct AllowGuard;
+
+impl GuardHandle for AllowGuard {
+    fn guard_name(&self) -> &str {
+        "fake"
+    }
+
+    fn permit(&self, _fn_name: &str) -> Result<(), HostError> {
+        Ok(())
+    }
+}
+
+/// A minimal in-test `ProtocolLanguage` whose namespace, fns and optional PoC
+/// step are supplied directly, so a test can drive the assembler and the seam
+/// guard without depending on a real protocol crate.
+struct FakeLang {
+    ns: String,
+    api: String,
+    fns: Vec<String>,
+    step: Option<PocStepSchema>,
+    sources: Vec<String>,
+}
+
+impl FakeLang {
+    fn simple(ns: &str, fns: &[&str]) -> Self {
+        Self {
+            ns: ns.to_string(),
+            api: "1".to_string(),
+            fns: fns.iter().map(|s| s.to_string()).collect(),
+            step: None,
+            sources: Vec::new(),
+        }
+    }
+}
+
+impl ProtocolLanguage for FakeLang {
+    fn namespace(&self) -> &str {
+        &self.ns
+    }
+
+    fn api_version(&self) -> &str {
+        &self.api
+    }
+
+    fn register_host_fns(&self, reg: &mut dyn ScriptHostRegistry) -> Result<(), RegisterError> {
+        for name in &self.fns {
+            let f: HostFn = Box::new(|_args: &[Value]| Ok(Value::Null));
+            reg.register(&self.ns, name, Guarded::new(Box::new(AllowGuard), f))?;
+        }
+        Ok(())
+    }
+
+    fn poc_step(&self) -> Option<Box<dyn PocStepHandler>> {
+        None
+    }
+
+    fn catalog(&self) -> NamespaceCatalog {
+        NamespaceCatalog {
+            namespace: self.ns.clone(),
+            api_version: self.api.clone(),
+            host_fns: self
+                .fns
+                .iter()
+                .map(|n| HostFnSig {
+                    name: n.clone(),
+                    params: Vec::new(),
+                    returns: "null".to_string(),
+                    description: format!("fake `{}.{}`", self.ns, n),
+                })
+                .collect(),
+            poc_step: self.step.clone(),
+            sources: self.sources.clone(),
+        }
+    }
+}
+
+/// A seam token: `(namespace, fn_name)`. Unlike F8's `Token` (an engine
+/// `(receiver_type, member)`), the seam keys on the namespace the registry
+/// explicitly registered under.
+type NsPair = (String, String);
+
+/// The `(namespace, fn.name)` set an assembled `namespaces` map advertises.
+fn pairs_from_doc(doc: &BTreeMap<String, NamespaceEntry>) -> BTreeSet<NsPair> {
+    doc.iter()
+        .flat_map(|(ns, entry)| entry.fns.iter().map(move |f| (ns.clone(), f.name.clone())))
+        .collect()
+}
+
+/// `(registered but not catalogued, catalogued but not registered)`. Both empty
+/// means the seam registry and the assembled catalog are in exact correspondence
+/// — the seam analogue of F8's `diff`.
+fn seam_diff(
+    registered: &BTreeSet<NsPair>,
+    catalog: &BTreeSet<NsPair>,
+) -> (Vec<NsPair>, Vec<NsPair>) {
+    (
+        registered.difference(catalog).cloned().collect(),
+        catalog.difference(registered).cloned().collect(),
+    )
+}
+
+/// AC6 — registering the test namespace adds its fns to the assembled defs as
+/// data, with no hand-editing of a file.
+#[test]
+fn assembled_namespaces_include_the_test_namespace() {
+    let test = TestLanguage::new();
+    let doc = assemble_namespaces(&[&test]).expect("the test namespace assembles");
+    let entry = doc.get("test").expect("the `test` namespace is present");
+    assert_eq!(entry.api_version, "0.1.0");
+    let names: Vec<&str> = entry.fns.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, vec!["ping", "effect"]);
+}
+
+/// AC7 — the registry's explicitly-registered `(ns, name)` set is exactly the
+/// assembled catalog's `(ns, fn.name)` set. This is the seam bijection, read
+/// from the real `HostRegistry` store, not from `gen_fn_signatures`.
+#[test]
+fn seam_registry_matches_assembled_catalog() {
+    let test = TestLanguage::new();
+    let registered = registered_host_fns(&[&test]).expect("the test language registers");
+    let doc = assemble_namespaces(&[&test]).expect("the test namespace assembles");
+    let catalog = pairs_from_doc(&doc);
+
+    assert_eq!(
+        seam_diff(&registered, &catalog),
+        (Vec::new(), Vec::new()),
+        "the registry and the assembled catalog must correspond exactly"
+    );
+    assert!(registered.contains(&("test".to_string(), "ping".to_string())));
+    assert!(registered.contains(&("test".to_string(), "effect".to_string())));
+}
+
+/// AC7 self-test — the seam guard bites. The same `seam_diff` the real guard
+/// trusts must reject a catalog that dropped a registered fn and one that gained
+/// a fn the registry never registered. Mirrors F8's `diff_rejects_a_mutated_catalog`.
+#[test]
+fn seam_diff_rejects_a_mutated_catalog() {
+    let test = TestLanguage::new();
+    let registered = registered_host_fns(&[&test]).expect("register");
+    let doc = assemble_namespaces(&[&test]).expect("assemble");
+    let catalog = pairs_from_doc(&doc);
+    assert_eq!(
+        seam_diff(&registered, &catalog),
+        (Vec::new(), Vec::new()),
+        "the real seam surfaces must match before we test the mutations"
+    );
+
+    // A registered fn dropped from the catalog: registered-but-uncatalogued.
+    let mut without_effect = catalog.clone();
+    assert!(without_effect.remove(&("test".to_string(), "effect".to_string())));
+    let (registered_not_catalogued, _) = seam_diff(&registered, &without_effect);
+    assert!(
+        registered_not_catalogued.contains(&("test".to_string(), "effect".to_string())),
+        "a registered namespace fn missing from the catalog must fail the guard"
+    );
+
+    // A catalog fn the registry never registered: catalogued-but-unregistered.
+    let mut with_ghost = catalog.clone();
+    with_ghost.insert(("test".to_string(), "ghost".to_string()));
+    let (_, catalogued_not_registered) = seam_diff(&registered, &with_ghost);
+    assert!(
+        catalogued_not_registered.contains(&("test".to_string(), "ghost".to_string())),
+        "a catalogued fn the registry never registered must fail the guard"
+    );
+}
+
+/// Golden — the shipped `rhai.api.json` `namespaces` object equals
+/// `assemble_namespaces(production_languages())`. Empty in this task; Task 5/6
+/// populate `production_languages()` and re-verify against the shipped file.
+#[test]
+fn shipped_namespaces_equal_production_assembly() {
+    let langs = production_languages();
+    let refs: Vec<&dyn ProtocolLanguage> = langs.iter().map(|b| b.as_ref()).collect();
+    let doc = assemble_namespaces(&refs).expect("production assembles");
+    assert!(
+        doc.is_empty(),
+        "production namespaces are empty until Task 5 (http/browser) and Task 6 (l4) join"
+    );
+
+    let text = std::fs::read_to_string(catalog_path()).expect("the catalog is readable");
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&text).expect("the catalog is valid JSON");
+    let namespaces = parsed
+        .get("namespaces")
+        .expect("rhai.api.json has a top-level `namespaces` object");
+    let expected = serde_yaml::to_value(&doc).expect("the assembled doc serializes");
+    assert_eq!(
+        namespaces, &expected,
+        "shipped `namespaces` must equal assemble_namespaces(production_languages())"
+    );
+}
+
+/// Review Focus — two namespaces with a same-named fn stay namespaced; neither
+/// overwrites the other.
+#[test]
+fn same_named_fns_stay_namespaced() {
+    let alpha = FakeLang::simple("alpha", &["ping", "scan"]);
+    let beta = FakeLang::simple("beta", &["ping"]);
+    let doc = assemble_namespaces(&[&alpha, &beta]).expect("two namespaces assemble");
+
+    assert_eq!(doc.len(), 2);
+    assert!(doc["alpha"].fns.iter().any(|f| f.name == "ping"));
+    assert!(doc["alpha"].fns.iter().any(|f| f.name == "scan"));
+    assert!(doc["beta"].fns.iter().any(|f| f.name == "ping"));
+
+    let pairs = pairs_from_doc(&doc);
+    assert!(pairs.contains(&("alpha".to_string(), "ping".to_string())));
+    assert!(pairs.contains(&("beta".to_string(), "ping".to_string())));
+    assert_eq!(pairs.len(), 3, "no fn is dropped or overwritten");
+}
+
+/// A duplicate namespace key (two languages claiming the same namespace) is an
+/// assembly error — never last-wins (Review Focus).
+#[test]
+fn duplicate_namespace_is_an_error() {
+    let a = FakeLang::simple("dup", &["x"]);
+    let b = FakeLang::simple("dup", &["y"]);
+    let err = assemble_namespaces(&[&a, &b]).expect_err("a duplicate namespace is rejected");
+    assert_eq!(err, AssembleError::DuplicateNamespace("dup".to_string()));
+}
+
+/// AC8 (mechanism) — where a namespace contributes a PoC step, its `op` verb
+/// vocabulary equals its host-fn names: one vocabulary across the Rhai and PoC
+/// faces. The test namespace contributes no step, so the check holds vacuously;
+/// a synthetic namespace exercises both the match and the mismatch.
+#[test]
+fn one_vocabulary_across_script_and_poc() {
+    // `test` has no PoC step in its catalog — vacuously consistent.
+    assert!(vocabulary_consistent(&TestLanguage::new().catalog()));
+
+    let step = |verbs: &[&str]| PocStepSchema {
+        step: "demo".to_string(),
+        description: "a synthetic protocol step".to_string(),
+        enums: BTreeMap::from([(
+            "op".to_string(),
+            verbs.iter().map(|s| s.to_string()).collect(),
+        )]),
+        sources: vec!["packet".to_string()],
+    };
+
+    // op-enum == host-fn names: consistent.
+    let good = FakeLang {
+        step: Some(step(&["craft", "inject"])),
+        ..FakeLang::simple("demo", &["craft", "inject"])
+    };
+    assert!(vocabulary_consistent(&good.catalog()));
+
+    // op-enum diverges from the host-fn names: inconsistent — the guard bites.
+    let bad = FakeLang {
+        step: Some(step(&["craft", "WRONG"])),
+        ..FakeLang::simple("demo", &["craft", "inject"])
+    };
+    assert!(!vocabulary_consistent(&bad.catalog()));
+}
+
+/// The PoC-step assembler turns a namespace's `catalog().poc_step` into the
+/// per-`<ns>:` schema node shape (the mechanism Task 6's `l4:` step populates).
+/// A namespace with no PoC step contributes nothing.
+#[test]
+fn assemble_poc_steps_builds_the_per_namespace_node() {
+    let demo = FakeLang {
+        step: Some(PocStepSchema {
+            step: "demo".to_string(),
+            description: "a synthetic protocol step".to_string(),
+            enums: BTreeMap::from([(
+                "op".to_string(),
+                vec!["craft".to_string(), "inject".to_string()],
+            )]),
+            sources: vec!["packet".to_string()],
+        }),
+        ..FakeLang::simple("demo", &["craft", "inject"])
+    };
+    let steps = assemble_poc_steps(&[&demo]).expect("the step assembles");
+    let node = steps.get("demo").expect("the `demo:` step is present");
+    assert_eq!(node.node_type, "map");
+    assert_eq!(node.description, "a synthetic protocol step");
+    assert_eq!(
+        node.keys["op"].values,
+        vec!["craft".to_string(), "inject".to_string()]
+    );
+    assert_eq!(node.keys["op"].node_type, "enum");
+    assert_eq!(node.sources, vec!["packet".to_string()]);
+
+    // A namespace with no PoC step contributes no entry.
+    let none = FakeLang::simple("quiet", &["a"]);
+    assert!(assemble_poc_steps(&[&none]).expect("assembles").is_empty());
 }

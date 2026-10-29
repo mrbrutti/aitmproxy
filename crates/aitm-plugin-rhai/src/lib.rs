@@ -7,6 +7,7 @@
 //! Design: `docs/superpowers/specs/2026-10-27-aitmproxy-m3-rhai-scripting-design.md`.
 //! Every module is declared here up front so later tasks never re-touch this file.
 
+pub mod catalog_assembly;
 pub mod command;
 pub mod commands;
 pub mod config;
@@ -27,6 +28,10 @@ pub mod wire;
 // The curated surface a host program wires against (plan Task 15). The modules
 // stay public for tests and for a capability provider in another crate; these
 // are the names a binary needs.
+pub use catalog_assembly::{
+    assemble_namespaces, assemble_poc_steps, production_languages, vocabulary_consistent,
+    AssembleError,
+};
 pub use command::{register_reg_api, ScriptCommand, ScriptRegHandle};
 pub use commands::ScriptCommands;
 pub use config::{RhaiConfig, RhaiLimits, ScriptEntry, ScriptMeta};
@@ -35,7 +40,7 @@ pub use error::ScriptError;
 pub use host_core::{
     Finding, FindingSink, MemoryFindingSink, Options, ScriptCapability, ScriptServices,
 };
-pub use host_registry::HostRegistry;
+pub use host_registry::{registered_host_fns, HostRegistry};
 pub use loader::{RhaiLoader, SUPPORTED_API};
 pub use plugin::{ErrorSink, ScriptHandle, ScriptPlugin};
 pub use poc_step::{RhaiScriptExecutor, ScriptVars, VarsCapability};
