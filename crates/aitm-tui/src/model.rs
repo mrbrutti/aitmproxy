@@ -7,11 +7,35 @@ use std::collections::{BTreeMap, VecDeque};
 
 use serde_json::Value;
 
-/// `http` or `websocket`.
+/// `http`, `websocket`, or `l4` (ui-ext §3.1: the flow list and inspector
+/// iterate this enum with per-kind renderers, so a surface can never "only
+/// render HTTP" — an unknown/absent kind renders a labelled placeholder).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowKind {
     Http,
     WebSocket,
+    /// A raw-L4 flow (capture / craft / send-recv / intercept). Its list cells
+    /// come from [`L4Row`]; the full packet log lives in `App::l4`.
+    L4,
+}
+
+/// The list-row view of an L4 flow (ui-ext §3.2): the badge sub-label, target,
+/// session state, and packet / injected counts. Built by [`FlowRow::from_l4`];
+/// the full packet log lives in `App::l4.flows` keyed by the flow id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L4Row {
+    /// `TCP` / `UDP` / `ICMP` sub-label, when a transport layer decoded.
+    pub proto: Option<String>,
+    /// The bound interface (+ filter), the row's "URL" cell.
+    pub target: String,
+    /// The session state: `capture` / `craft` / `send_recv` / `intercept`.
+    pub state: String,
+    /// Packets recorded so far (the "Request" count cell).
+    pub packets: u64,
+    /// Of those, how many aitmproxy injected (the "Response" count cell).
+    pub injected: u64,
+    /// The interface, for scope-as-authorisation matching.
+    pub interface: String,
 }
 
 /// The core's `InterceptState`, as `flow.get` labels it.
@@ -83,6 +107,8 @@ pub struct FlowRow {
     pub origin: Origin,
     pub comment: Option<String>,
     pub marks: Vec<String>,
+    /// Present exactly when `kind == FlowKind::L4`: the L4 list cells.
+    pub l4: Option<L4Row>,
 }
 
 impl FlowRow {
@@ -100,10 +126,12 @@ impl FlowRow {
             kind,
             method: s("method").unwrap_or_else(|| match kind {
                 FlowKind::WebSocket => "WS".into(),
+                FlowKind::L4 => "L4".into(),
                 FlowKind::Http => "—".into(),
             }),
             scheme: s("scheme").unwrap_or_else(|| match kind {
                 FlowKind::WebSocket => "wss".into(),
+                FlowKind::L4 => "l4".into(),
                 FlowKind::Http => "http".into(),
             }),
             authority: s("authority").unwrap_or_default(),
@@ -128,7 +156,48 @@ impl FlowRow {
             origin: Origin::Unknown,
             comment: None,
             marks: Vec::new(),
+            l4: None,
         })
+    }
+
+    /// Build the list row of an L4 flow (ui-ext §3.2). Carries the L4 cells in
+    /// [`FlowRow::l4`]; the HTTP-shaped fields stay empty/defaulted so the shared
+    /// list machinery (selection, `visible`) treats it like any other row.
+    pub fn from_l4(flow: &crate::l4::L4Flow, seq: usize) -> Self {
+        Self {
+            id: flow.id.clone(),
+            seq,
+            kind: FlowKind::L4,
+            method: "L4".into(),
+            scheme: "l4".into(),
+            authority: String::new(),
+            path: String::new(),
+            status: None,
+            intercept: Intercept::Observed,
+            is_replay: false,
+            handshake: None,
+            ws_messages: None,
+            client: None,
+            time: None,
+            duration_ms: None,
+            req_size: None,
+            resp_size: None,
+            tls: None,
+            version: None,
+            content_type: None,
+            edited: false,
+            origin: Origin::Unknown,
+            comment: None,
+            marks: Vec::new(),
+            l4: Some(L4Row {
+                proto: flow.proto().map(str::to_string),
+                target: flow.target(),
+                state: flow.kind.clone(),
+                packets: flow.packet_count,
+                injected: flow.injected_count,
+                interface: flow.interface.clone(),
+            }),
+        }
     }
 
     /// Fold a `flow.detail` result into the row's detail-only columns.

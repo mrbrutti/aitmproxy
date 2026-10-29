@@ -21,6 +21,7 @@ pub mod clipboard;
 pub mod filter;
 pub mod fixture;
 pub mod keys;
+pub mod l4;
 pub mod languages;
 pub mod model;
 pub mod open;
@@ -358,6 +359,32 @@ fn load_fixture_app(mut fx: Fixture, cols: u16, rows: u16, core_only: bool) -> A
     }
     let _ = app.on_bus(BusEvent::Scope(fx.scope.clone()));
     let _ = app.on_bus(BusEvent::Intercept(fx.intercept_armed));
+    // The L4 operator surface (ui-ext Part 3), when the bus offers it.
+    if app.has_tool("l4.flow.list") {
+        let ids: Vec<String> = fx
+            .call("l4.flow.list", &serde_json::Map::new())
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        let flows: Vec<Value> = ids
+            .iter()
+            .filter_map(|id| fx.call("l4.flow.get", &arg(id)).ok())
+            .collect();
+        let _ = app.on_bus(BusEvent::L4Flows(flows));
+    }
+    if app.has_tool("l4.scope.list") {
+        if let Ok(Value::Array(entries)) = fx.call("l4.scope.list", &serde_json::Map::new()) {
+            let _ = app.on_bus(BusEvent::L4Scope(entries));
+        }
+    }
+    if app.has_tool("l4.agent.status") {
+        if let Ok(v) = fx.call("l4.agent.status", &serde_json::Map::new()) {
+            let _ = app.on_bus(BusEvent::L4Agent(v));
+        }
+    }
     if app.has_tool("agent.status") {
         let mut agent = AgentState::default();
         agent.apply_status(&fx.agent);

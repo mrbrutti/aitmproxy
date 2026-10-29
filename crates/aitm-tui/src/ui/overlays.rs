@@ -684,6 +684,45 @@ pub fn ca(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     lines_into(buf, inner, &lines, 0);
 }
 
+/// The per-feature L4 agent capability toggles (L4OPS-AC11). Each reflects the
+/// gate that governs the agent L4 path: settable where `l4.agent.set` is on the
+/// bus, read-only with an honest note where it is not. The L4 section is drawn
+/// only when the bus has the L4 surface; it stays silent on a plain HTTP bus.
+fn l4_capabilities(app: &App, theme: &Theme, lines: &mut Vec<Line<'static>>) {
+    if !app.has_tool("l4.agent.status") && !app.has_tool("l4.flow.list") {
+        return;
+    }
+    let settable = app.has_tool("l4.agent.set");
+    let keys = ["c", "i", "n", "w"];
+    lines.push(Line::styled(
+        " L4 agent capabilities — each toggle is the gate that governs the agent L4 path",
+        theme.accent().add_modifier(Modifier::BOLD),
+    ));
+    for (gate, key) in crate::l4::L4Gate::ALL.into_iter().zip(keys) {
+        let on = app.l4.gates.get(gate);
+        let dot = if on { "●" } else { "○" };
+        let state = if on { "on " } else { "off" };
+        let style = if on {
+            theme.l4().add_modifier(Modifier::BOLD)
+        } else {
+            theme.text_primary()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {dot} {key} {:<10} {state} ", gate.label()), style),
+            Span::styled(gate.describe().to_string(), theme.text_secondary()),
+        ]));
+    }
+    let note = if !app.l4.gates.present {
+        " (l4.agent.status is not on this bus — gate states unknown)"
+    } else if settable {
+        " Toggle with the key; the agent can never flip its own gates."
+    } else {
+        " Read-only here — set l4.allow_agent_* in config and restart (l4.agent.set is not on this bus)."
+    };
+    lines.push(Line::styled(note, theme.text_tertiary()));
+    lines.push(Line::raw(""));
+}
+
 pub fn agent(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     let inner = boxed(theme, "Agent (MCP) — policy and activity", area, buf);
     let policy_line = |p: AgentPolicy, key: &str, what: &str| -> Line<'static> {
@@ -715,8 +754,12 @@ pub fn agent(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         policy_line(AgentPolicy::ReadOnly, "2", "list/get/status only; mutations are refused"),
         policy_line(AgentPolicy::Paused, "3", "every tools/call from MCP returns \"paused by operator\""),
         Line::raw(""),
-        Line::styled(" Activity log — every command from every frontend (agent rows in teal)", theme.accent().add_modifier(Modifier::BOLD)),
     ];
+    l4_capabilities(app, theme, &mut lines);
+    lines.push(Line::styled(
+        " Activity log — every command from every frontend (agent rows in teal)",
+        theme.accent().add_modifier(Modifier::BOLD),
+    ));
     if app.agent.log.is_empty() {
         lines.push(Line::styled(
             "   (empty — needs core follow-up F2 for the audit ring)",

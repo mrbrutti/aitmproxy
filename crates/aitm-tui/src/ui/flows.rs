@@ -300,6 +300,9 @@ pub fn render(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut 
 }
 
 fn row_line<'a>(app: &App, theme: &Theme, r: &'a FlowRow, cols: &[Col]) -> Line<'a> {
+    if r.kind == FlowKind::L4 {
+        return l4_row_line(app, theme, r, cols);
+    }
     let in_scope = app.in_scope(r);
     let dim = theme.text_tertiary();
     // Out-of-scope rows are entirely tertiary (§2.7 "scope-as-authorisation").
@@ -452,6 +455,63 @@ fn row_line<'a>(app: &App, theme: &Theme, r: &'a FlowRow, cols: &[Col]) -> Line<
                 ),
                 _ => Span::raw(" ".repeat(c.w)),
             },
+        };
+        spans.push(span);
+        spans.push(Span::raw(" "));
+    }
+    Line::from(spans)
+}
+
+/// One L4 flow row (ui-ext §3.2): the L4 badge + `TCP`/`UDP`/`ICMP` sub-label,
+/// the target, the session state, and the packet / injected counts. An L4 row
+/// with no cells renders a labelled placeholder, never an empty line (AC7).
+fn l4_row_line<'a>(app: &App, theme: &Theme, r: &'a FlowRow, cols: &[Col]) -> Line<'a> {
+    let in_scope = app.in_scope(r);
+    let dim = theme.text_tertiary();
+    let s = |style: Style| if in_scope { style } else { dim };
+    let Some(l4) = &r.l4 else {
+        return Line::styled(format!("  L4 flow {} — details pending", r.id), dim);
+    };
+    let mut spans: Vec<Span<'a>> = Vec::with_capacity(cols.len() * 2);
+    for c in cols {
+        let span = match c.key {
+            ColKey::Tick => Span::raw(" "),
+            ColKey::Dot => Span::styled(glyph::RECORD, s(theme.l4())),
+            ColKey::Seq => Span::styled(right(&r.seq.to_string(), c.w), s(theme.text_secondary())),
+            ColKey::Url => {
+                let t = if l4.target.is_empty() {
+                    "(l4)".to_string()
+                } else {
+                    l4.target.clone()
+                };
+                Span::styled(fit(&elide_middle(&t, c.w), c.w), s(theme.l4()))
+            }
+            ColKey::Method => {
+                // The L4 badge + the transport sub-label, or a labelled `?`
+                // placeholder when the transport is not yet decoded (AC7).
+                let label = match &l4.proto {
+                    Some(p) => format!(" L4 {p}"),
+                    None => " L4 ?".to_string(),
+                };
+                Span::styled(fit(&label, c.w), s(theme.l4_badge()))
+            }
+            ColKey::Status => Span::styled(fit(&l4.state, c.w), s(theme.l4())),
+            ColKey::Req => Span::styled(
+                right(&l4.packets.to_string(), c.w),
+                s(theme.text_secondary()),
+            ),
+            ColKey::Resp => {
+                let t = if l4.injected > 0 {
+                    format!("{} ⇡", l4.injected)
+                } else {
+                    "0".to_string()
+                };
+                Span::styled(right(&t, c.w), s(theme.text_secondary()))
+            }
+            // Client / Time / Duration / SSL / Edited / Origin do not apply to L4.
+            ColKey::Dur => Span::styled(right("—", c.w), dim),
+            ColKey::Client | ColKey::Time => Span::styled(fit("—", c.w), dim),
+            ColKey::Ssl | ColKey::Edited | ColKey::Origin => Span::raw(" ".repeat(c.w)),
         };
         spans.push(span);
         spans.push(Span::raw(" "));
