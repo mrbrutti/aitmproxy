@@ -60,12 +60,15 @@ fn patterns() -> &'static [(Regex, &'static str)] {
             (Regex::new(r"(?i)(bearer\s+)\S+").unwrap(), "${1}[redacted]"),
             // A `key = value` / `key: value` pair whose key *contains* a secret
             // needle — including a prefixed key (`access_token`, `refresh_token`,
-            // `x-api-key`). The value runs to the next separator (`&`/`;`/`,`/
-            // whitespace), so a credential in a query string or form body is
-            // masked while the surrounding structure survives.
+            // `x-api-key`). The optional quotes around the key and around the
+            // separator also catch a JSON-encoded pair (`"password":"hunter2"`,
+            // `{"api_key": "sk-…"}`), which a query string / form body does not
+            // frame. The value runs to the next separator (`&`/`;`/`,`/
+            // whitespace) or the closing quote/brace of a JSON value, so the
+            // credential is masked while the surrounding structure survives.
             (
                 Regex::new(
-                    r"(?i)([\w.\-]*(?:api[_-]?key|apikey|token|secret|password|passwd|pwd|credential|cookie)[\w.\-]*\s*[:=]\s*)[^\s&;,]+",
+                    r#"(?i)(["']?[\w.\-]*(?:api[_-]?key|apikey|token|secret|password|passwd|pwd|credential|cookie)[\w.\-]*["']?\s*[:=]\s*["']?)[^\s&;,"'}]+"#,
                 )
                 .unwrap(),
                 "${1}[redacted]",
@@ -76,8 +79,9 @@ fn patterns() -> &'static [(Regex, &'static str)] {
 
 /// Mask credential material embedded anywhere in `text` by *content* (not by the
 /// key it is stored under): an `Authorization:` line, a `Bearer <token>`, and
-/// `…token`/`…api_key`/`secret`/`password`/`cookie`/`credential` `key=value` pairs
-/// in query strings, bodies, or free text. Redacted values become `[redacted]`.
+/// `…token`/`…api_key`/`secret`/`password`/`cookie`/`credential` pairs — both
+/// `key=value` (query strings, form bodies) and JSON-quoted `"key":"value"`
+/// (request bodies). Redacted values become `[redacted]`.
 ///
 /// Conservative by design: it over-redacts (any key *containing* a needle) rather
 /// than risk letting a secret through. Residual limit: a bare credential with no
@@ -131,6 +135,26 @@ mod tests {
             "non-secret field survives: {out}"
         );
         assert!(out.contains("password=[redacted]"), "{out}");
+    }
+
+    #[test]
+    fn scrubs_secret_in_json_body() {
+        // A JSON-encoded request body: the `"` between key and `:` used to break
+        // the `key=value` framing, so the value reached the audit log verbatim.
+        assert_eq!(
+            scrub_text(r#"{"password":"hunter2"}"#),
+            r#"{"password":"[redacted]"}"#
+        );
+        // A space after the colon and a different secret key, same result.
+        assert_eq!(
+            scrub_text(r#"{"api_key": "sk-9f8a7b6c5d4e"}"#),
+            r#"{"api_key": "[redacted]"}"#
+        );
+        // A non-secret JSON key is untouched, even beside a redacted one.
+        assert_eq!(
+            scrub_text(r#"{"user":"admin","password":"hunter2"}"#),
+            r#"{"user":"admin","password":"[redacted]"}"#
+        );
     }
 
     #[test]
