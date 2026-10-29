@@ -15,7 +15,8 @@ struct RawRequestEditor: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            CodeTextView(text: text, contentType: "message/http", bodySize: session.density.bodySize, editable: true) { new in
+            CodeTextView(text: text, contentType: "message/http", bodySize: session.density.bodySize, editable: true,
+                         onTextChange: { new in
                 text = new
                 do {
                     let message = try RawHTTP.parse(new)
@@ -24,7 +25,7 @@ struct RawRequestEditor: View {
                 } catch {
                     parseError = error as? RawHTTP.ParseError ?? RawHTTP.ParseError(line: 1, message: error.localizedDescription)
                 }
-            }
+            })
             Rule(color: Tok.Line.rule)
             HStack(spacing: Space.md) {
                 if let parseError {

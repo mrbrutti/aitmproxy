@@ -14,15 +14,20 @@ struct CodeTextView: NSViewRepresentable {
     var highlights: [Range<String.Index>] = []
     var currentHighlight: Int?
     var onTextChange: ((String) -> Void)?
+    /// Autocomplete source for the editable path: `(wholeText, caretUTF16Offset)`
+    /// → ordered candidates, triggered by ⌃Space (UI-ext spec AC3/AC4).
+    var completion: ((String, Int) -> [String])?
 
     init(text: String, contentType: String?, bodySize: CGFloat = Tok.Typography.Size.md, editable: Bool = false,
-         highlights: [Range<String.Index>] = [], currentHighlight: Int? = nil, onTextChange: ((String) -> Void)? = nil) {
+         highlights: [Range<String.Index>] = [], currentHighlight: Int? = nil,
+         completion: ((String, Int) -> [String])? = nil, onTextChange: ((String) -> Void)? = nil) {
         self.text = text
         self.contentType = contentType
         self.bodySize = bodySize
         self.editable = editable
         self.highlights = highlights
         self.currentHighlight = currentHighlight
+        self.completion = completion
         self.onTextChange = onTextChange
     }
 
@@ -48,7 +53,7 @@ struct CodeTextView: NSViewRepresentable {
         container.lineFragmentPadding = Tok.Metric.gapMeta
         layout.addTextContainer(container)
 
-        let textView = NSTextView(frame: .zero, textContainer: container)
+        let textView = CompletingTextView(frame: .zero, textContainer: container)
         textView.isEditable = editable
         // Stable identifier for the editable Raw request editor (CUA / accessibility).
         if editable { textView.setAccessibilityIdentifier("raw-request-editor") }
@@ -95,6 +100,7 @@ struct CodeTextView: NSViewRepresentable {
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         let c = context.coordinator
         c.onTextChange = onTextChange
+        c.completion = completion
         guard let textView = c.textView else { return }
         textView.isEditable = editable
         if c.text != text || c.contentType != contentType || c.bodySize != bodySize {
@@ -109,6 +115,7 @@ struct CodeTextView: NSViewRepresentable {
         weak var textView: NSTextView?
         weak var ruler: LineNumberRuler?
         var onTextChange: ((String) -> Void)?
+        var completion: ((String, Int) -> [String])?
         private(set) var text = ""
         private(set) var contentType: String?
         private(set) var bodySize: CGFloat = 0
@@ -253,12 +260,73 @@ struct CodeTextView: NSViewRepresentable {
             text = textView.string
             lineStarts = CodeAnalysis.lineStarts(text)
             ruler?.needsDisplay = true
+            recolor()
             onTextChange?(text)
+        }
+
+        /// Re-colours a code language as the operator types (UI-ext spec AC1/AC2),
+        /// applying foreground attributes in place so the caret and selection are
+        /// untouched. Bounded to editors small enough to re-tokenize per keystroke;
+        /// larger bodies keep their on-load colouring.
+        private func recolor() {
+            guard let textView, let storage = textView.textStorage,
+                  CodeAnalysis.colours(contentType: contentType),
+                  text.utf16.count < 200_000 else { return }
+            // Cancel any in-flight on-load analysis so it cannot overwrite this.
+            generation += 1
+            work?.cancel()
+            let analysis = CodeAnalysis.analyseNow(text: text, contentType: contentType)
+            let whole = NSRange(location: 0, length: storage.length)
+            storage.beginEditing()
+            storage.addAttribute(.foregroundColor, value: Tok.Ink.primary.nsColor, range: whole)
+            for run in analysis.runs where NSMaxRange(run.range) <= storage.length {
+                storage.addAttribute(.foregroundColor, value: colour(run.kind), range: run.range)
+            }
+            storage.endEditing()
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
             ruler?.needsDisplay = true
         }
+
+        /// Candidates for ⌃Space completion: the language provider decides from
+        /// the whole text and the caret (end of the partial word being typed).
+        /// The default spell-check completions are suppressed when a provider
+        /// is set but returns nothing.
+        func textView(_ textView: NSTextView, completions words: [String],
+                      forPartialWordRange charRange: NSRange, indexOfSelectedItem index: UnsafeMutablePointer<Int>?) -> [String] {
+            guard let completion else { return words }
+            index?.pointee = -1
+            return completion(textView.string, NSMaxRange(charRange))
+        }
+    }
+}
+
+/// An `NSTextView` that maps ⌃Space to `complete(_:)`, the manual-completion
+/// trigger the foundation specifies (§2.8 / UI-ext spec Part-1).
+final class CompletingTextView: NSTextView {
+    override func keyDown(with event: NSEvent) {
+        // Control-Space: keyCode 49 is Space; Control without the other modifiers.
+        if event.keyCode == 49, event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .control {
+            complete(nil)
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    /// Completion should break on `.` so a `flow.request.` member chain completes
+    /// its last segment, but keep `-` and `_` (PoC keys like `matchers-condition`,
+    /// Rhai identifiers like `on_request`).
+    override var rangeForUserCompletion: NSRange {
+        let string = self.string as NSString
+        var start = selectedRange().location
+        while start > 0 {
+            let c = string.character(at: start - 1)
+            guard let scalar = Unicode.Scalar(c) else { break }
+            let ch = Character(scalar)
+            if ch.isLetter || ch.isNumber || ch == "_" || ch == "-" { start -= 1 } else { break }
+        }
+        return NSRange(location: start, length: selectedRange().location - start)
     }
 }
 
