@@ -97,11 +97,12 @@ mod tests {
     #[test]
     fn tables_cover_every_token() {
         // Counted by hand from tokens.json (0.1.0, with the `mark` group the
-        // GUI surfaces added on 2026-10-28):
+        // GUI surfaces added on 2026-10-28 and the `syntax.currentLine` +
+        // `syntax.match` JSON-viewer tokens):
         //   single colours: ground 6 + line 4 + text 6 + accent 3 + intercept 4
-        //                 + agent 3 + status 7 + syntax 9 + mark 11 = 53
+        //                 + agent 3 + status 7 + syntax 11 + mark 11 = 55
         //   pairs:          method 9 + severity 5 + syntax 2 (diffAdd/diffRemove) = 16
-        assert_eq!(ALL_COLORS.len(), 53);
+        assert_eq!(ALL_COLORS.len(), 55);
         assert_eq!(ALL_PAIRS.len(), 16);
         assert_eq!(
             color::mark::TEAL.ansi,

@@ -107,6 +107,12 @@ pub struct SessionIoConfig {
     /// agent may still export to / import from in-memory `bytes` (no host path),
     /// which stays passive.
     pub allow_agent_file_io: bool,
+
+    /// Confine every path-bearing session/flow I/O call under this root
+    /// (traversal and absolute escapes are refused). `None` (the default) imposes
+    /// no confinement, so the human CLI keeps full path access; set it to safely
+    /// bound an agent frontend once [`Self::allow_agent_file_io`] is on.
+    pub root: Option<PathBuf>,
 }
 
 /// PoC-engine configuration.

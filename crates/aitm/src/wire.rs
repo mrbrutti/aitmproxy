@@ -184,9 +184,10 @@ pub fn assemble_with_scripts(
         // the core feature plugins and before the scripts, so a script sees a
         // flow once map rewrites and WS parks have acted.
         .register_plugin(Box::new(wsctl))
-        .register_plugin(Box::new(SessionIoPlugin::new(
-            cfg.session_io.allow_agent_file_io,
-        )))
+        .register_plugin(Box::new(
+            SessionIoPlugin::new(cfg.session_io.allow_agent_file_io)
+                .with_session_root(cfg.session_io.root.clone()),
+        ))
         .register_plugin(Box::new(passthrough))
         .register_plugin(Box::new(maprules));
     // Scripts take their chain positions here: after every native plugin that
