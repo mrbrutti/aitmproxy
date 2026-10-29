@@ -75,7 +75,7 @@ pub fn tools(names: &[&str]) -> Vec<ToolInfo> {
         .collect()
 }
 
-/// The commands the bus serves today (37 since the core merge of
+/// The commands the bus serves today (50 since the core merge of
 /// 2026-10-28). Every test binary compiles this module; not all use the list.
 #[allow(unused_imports)]
 pub use aitm_tui::CORE_TOOLS;

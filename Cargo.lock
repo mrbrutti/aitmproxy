@@ -36,11 +36,16 @@ dependencies = [
  "aitm-core",
  "aitm-mcp",
  "aitm-plugin",
+ "aitm-plugin-maprules",
+ "aitm-plugin-passthrough",
  "aitm-plugin-rhai",
+ "aitm-plugin-sessionio",
+ "aitm-plugin-wsctl",
  "aitm-plugins",
  "aitm-poc",
  "aitm-proto-http",
  "aitm-proto-ws",
+ "aitm-rules",
  "aitm-tui",
  "anyhow",
  "bytes",
@@ -147,6 +152,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aitm-plugin-maprules"
+version = "0.1.0"
+dependencies = [
+ "aitm-core",
+ "aitm-rules",
+ "anyhow",
+ "futures",
+]
+
+[[package]]
+name = "aitm-plugin-passthrough"
+version = "0.1.0"
+dependencies = [
+ "aitm-core",
+ "aitm-proto-http",
+ "anyhow",
+ "futures",
+ "rcgen",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
+ "uuid",
+]
+
+[[package]]
 name = "aitm-plugin-rhai"
 version = "0.1.0"
 dependencies = [
@@ -162,14 +192,47 @@ dependencies = [
 ]
 
 [[package]]
-name = "aitm-plugins"
+name = "aitm-plugin-sessionio"
 version = "0.1.0"
 dependencies = [
  "aitm-core",
  "anyhow",
+ "base64 0.22.1",
  "futures",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "aitm-plugin-wsctl"
+version = "0.1.0"
+dependencies = [
+ "aitm-core",
+ "aitm-proto-http",
+ "aitm-proto-ws",
+ "aitm-rules",
+ "anyhow",
+ "futures",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
+name = "aitm-plugins"
+version = "0.1.0"
+dependencies = [
+ "aitm-core",
+ "aitm-proto-http",
+ "aitm-rules",
+ "anyhow",
+ "futures",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
  "time",
  "tokio",
+ "tokio-rustls",
+ "uuid",
 ]
 
 [[package]]
@@ -226,6 +289,15 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "uuid",
+]
+
+[[package]]
+name = "aitm-rules"
+version = "0.1.0"
+dependencies = [
+ "aitm-core",
+ "anyhow",
+ "regex",
 ]
 
 [[package]]
