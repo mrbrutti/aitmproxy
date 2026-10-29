@@ -83,8 +83,9 @@ struct ShellView: View {
                 // AC10): embedded by default, external when the operator picks it in
                 // Settings ▸ Bus. The driver turns that choice into start/stop of the
                 // bundled core (when present — Task 9) and the matching bus endpoint;
-                // `activate()` applies the restored choice on launch.
-                let controller = EmbeddedCoreController(coreID: session.activeCoreID, bus: service)
+                // `activate()` applies the restored choice on launch. The health
+                // surface (Task 8) drives the status dot + core-log panel.
+                let controller = EmbeddedCoreController(coreID: session.activeCoreID, bus: service, health: session.coreHealth)
                 let driver = LiveConnectionDriver(embedded: controller, bus: service)
                 let model = ActiveConnectionModel(driver: driver, persistence: UserDefaultsActiveKindPersistence())
                 model.activate()
@@ -109,6 +110,9 @@ struct MainView: View {
             if session.activityLogVisible {
                 VRule()
                 ActivityLogPanel(state: session.activity).frame(width: ActivityLogPanel.panelWidth)
+            }
+            if session.coreLogVisible {
+                CoreLogPanel().environment(session).themed()
             }
         }
         .sheet(item: Binding(get: { session.buildPoCFlowID.map(BuildPoCTarget.init) }, set: { session.buildPoCFlowID = $0?.id })) { target in

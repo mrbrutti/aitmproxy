@@ -26,6 +26,9 @@ final class EmbeddedCoreController {
 
     private let core: EmbeddedCore
     private unowned let bus: BusService
+    /// The shared surface the health dot and core-log panel read (Task 8); the
+    /// controller mirrors status changes and captured output onto it.
+    private unowned let health: CoreHealthState
     @ObservationIgnored private var pump: Task<Void, Never>?
     @ObservationIgnored private var terminateObserver: (any NSObjectProtocol)?
 
@@ -33,9 +36,10 @@ final class EmbeddedCoreController {
     /// bundled (development / non-`.app` builds) so the caller keeps the external
     /// path. `coreID` ties the connection to the id flows are stamped with
     /// (Task 5), so embedded flows carry this connection's identity.
-    init?(coreID: CoreID, bus: BusService) {
+    init?(coreID: CoreID, bus: BusService, health: CoreHealthState) {
         guard let binaries = EmbeddedCore.discoverBundled() else { return nil }
         self.bus = bus
+        self.health = health
         self.core = EmbeddedCore(binaries: binaries)
         self.connection = CoreConnection(
             id: coreID,
@@ -47,6 +51,9 @@ final class EmbeddedCoreController {
         registry.insert(connection)
         // Not active until `start()` brings the core up (Task 7): a controller may
         // be built but left dormant while an external core is the active choice.
+        // Give the health surface (Task 8) the connection reference so the dot
+        // reflects the core's real status from the first frame.
+        health.connection = connection
     }
 
     /// Spawns and supervises the core, pumping its events onto the main actor,
@@ -102,10 +109,10 @@ final class EmbeddedCoreController {
             }
             // Point the live bus client at the core we just brought up.
             bus.useEmbeddedEndpoint(runtime.endpoint)
-        case .log:
+        case .log(let line):
             // Captured core output feeds the on-demand log panel (Task 8); the
-            // health dot reads `connection.status`. Nothing to do here yet.
-            break
+            // health dot reads `connection.status`.
+            health.record(line)
         }
     }
 
@@ -114,6 +121,8 @@ final class EmbeddedCoreController {
         mutate(&next)
         connection = next
         registry.insert(next)
+        // Keep the status-bar health dot current (Task 8).
+        health.connection = next
     }
 
     /// Blocks briefly during quit to SIGTERM→reap the child so none is orphaned
