@@ -11,9 +11,11 @@
 //! - Task 3 adds a `test:` PoC step.
 //! - Task 4 asserts the catalog is assembled into the shared defs.
 
+use std::collections::BTreeMap;
+
 use aitm_plugin::language::{
     GuardHandle, Guarded, HostError, HostFn, HostFnSig, NamespaceCatalog, PocStepHandler,
-    ProtocolLanguage, RegisterError, ScriptHostRegistry,
+    PocStepInputs, PocStepOutcome, ProtocolLanguage, RegisterError, ScriptHostRegistry,
 };
 use aitm_plugin::Value;
 
@@ -28,6 +30,10 @@ pub const PING_REPLY: &str = "pong";
 
 /// What `test.effect()` returns once its guard admits the call.
 pub const EFFECT_REPLY: &str = "effected";
+
+/// The source name the `test:` PoC step contributes: `op: echo` produces an
+/// `echo` source (an object with a `value` field) a PoC `extract` reads.
+pub const ECHO_SOURCE: &str = "echo";
 
 /// The test protocol's language contribution.
 ///
@@ -122,8 +128,7 @@ impl ProtocolLanguage for TestLanguage {
     }
 
     fn poc_step(&self) -> Option<Box<dyn PocStepHandler>> {
-        // Task 3 returns a `test:` step handler here.
-        None
+        Some(Box::new(TestStepHandler))
     }
 
     fn catalog(&self) -> NamespaceCatalog {
@@ -149,6 +154,81 @@ impl ProtocolLanguage for TestLanguage {
             sources: vec![],
         }
     }
+}
+
+/// The `test:` PoC step handler. A pure stand-in with one verb:
+///
+/// ```yaml
+/// - test:
+///     op: echo
+///     value: "{{greeting}}"      # {{placeholder}}s resolve from PocStepInputs
+///   extract:
+///     - name: pulled
+///       type: echo               # the source name
+///       field: value             # tcp.flags-style field path into the source
+/// ```
+///
+/// `op: echo` binds `echoed` directly to the (expanded) `value` and produces the
+/// `echo` source `{ value: <expanded> }`, so a PoC proves both the direct-binding
+/// and named-source-plus-field paths of the seam end to end.
+pub struct TestStepHandler;
+
+impl PocStepHandler for TestStepHandler {
+    fn ns(&self) -> &str {
+        NAMESPACE
+    }
+
+    fn sources(&self) -> Vec<String> {
+        vec![ECHO_SOURCE.to_string()]
+    }
+
+    fn run(
+        &self,
+        body: &serde_yaml::Value,
+        inputs: &PocStepInputs,
+    ) -> Result<PocStepOutcome, HostError> {
+        let op = body
+            .get("op")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| HostError::BadArgs("`test:` step missing `op`".to_string()))?;
+        match op {
+            "echo" => {
+                let raw = body.get("value").and_then(|v| v.as_str()).ok_or_else(|| {
+                    HostError::BadArgs("`test:` `echo` missing `value`".to_string())
+                })?;
+                let value = expand(raw, &inputs.vars);
+
+                let mut sources = BTreeMap::new();
+                let mut echo = BTreeMap::new();
+                echo.insert("value".to_string(), Value::Str(value.clone()));
+                sources.insert(ECHO_SOURCE.to_string(), Value::Object(echo));
+
+                let mut bindings = BTreeMap::new();
+                bindings.insert("echoed".to_string(), Value::Str(value));
+
+                Ok(PocStepOutcome { sources, bindings })
+            }
+            other => Err(HostError::BadArgs(format!(
+                "`test:` step: unknown op `{other}`"
+            ))),
+        }
+    }
+}
+
+/// Expand a whole-string `{{name}}` placeholder from `vars`; any other input is
+/// returned verbatim. Minimal on purpose — it only exists to prove the resolved
+/// variables reach the handler through [`PocStepInputs`].
+fn expand(input: &str, vars: &BTreeMap<String, Value>) -> String {
+    let trimmed = input.trim();
+    if let Some(name) = trimmed
+        .strip_prefix("{{")
+        .and_then(|s| s.strip_suffix("}}"))
+    {
+        if let Some(Value::Str(s)) = vars.get(name.trim()) {
+            return s.clone();
+        }
+    }
+    input.to_string()
 }
 
 #[cfg(test)]
@@ -207,7 +287,44 @@ mod tests {
     }
 
     #[test]
-    fn no_poc_step_yet() {
-        assert!(TestLanguage::new().poc_step().is_none());
+    fn poc_step_is_the_test_handler() {
+        let handler = TestLanguage::new()
+            .poc_step()
+            .expect("test namespace contributes a `test:` PoC step");
+        assert_eq!(handler.ns(), "test");
+        assert_eq!(handler.sources(), vec!["echo".to_string()]);
+    }
+
+    /// `op: echo` binds `echoed` and produces the `echo` source, expanding a
+    /// whole-string `{{placeholder}}` from the step inputs.
+    #[test]
+    fn echo_step_binds_and_sources() {
+        let body: serde_yaml::Value =
+            serde_yaml::from_str("op: echo\nvalue: \"{{greeting}}\"").expect("body");
+        let mut vars = BTreeMap::new();
+        vars.insert("greeting".to_string(), Value::Str("hello".to_string()));
+
+        let outcome = TestStepHandler
+            .run(&body, &PocStepInputs { vars })
+            .expect("echo runs");
+        assert_eq!(
+            outcome.bindings.get("echoed"),
+            Some(&Value::Str("hello".to_string()))
+        );
+        let echo = outcome.sources.get("echo").expect("echo source");
+        let Value::Object(fields) = echo else {
+            panic!("echo source must be an object, got {echo:?}");
+        };
+        assert_eq!(fields.get("value"), Some(&Value::Str("hello".to_string())));
+    }
+
+    /// An unknown op is a clear `BadArgs`, not a panic.
+    #[test]
+    fn unknown_op_errors() {
+        let body: serde_yaml::Value = serde_yaml::from_str("op: nope").expect("body");
+        let err = TestStepHandler
+            .run(&body, &PocStepInputs::default())
+            .expect_err("unknown op errors");
+        assert!(matches!(err, HostError::BadArgs(_)));
     }
 }

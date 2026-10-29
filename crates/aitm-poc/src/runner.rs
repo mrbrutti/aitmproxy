@@ -38,9 +38,12 @@ use aitm_core::{
 };
 use futures::future::BoxFuture;
 
+use aitm_plugin::language::PocStepInputs;
+
 use crate::extract::{apply, Extractor};
 use crate::matcher::{evaluate, MatchContext};
-use crate::model::{Assertion, BrowserAction, Poc, ScriptStep, Step};
+use crate::model::{Assertion, BrowserAction, Poc, ProtoExtract, ScriptStep, Step};
+use crate::step_registry::PocStepRegistry;
 use crate::template::{PocTemplate, Template, VarBindings};
 
 /// Execute a `Poc` with no agent and emit the three artifacts.
@@ -166,6 +169,7 @@ impl std::error::Error for ScriptStepError {}
 pub struct StdPocRunner {
     out_dir: PathBuf,
     script_executor: Option<Arc<dyn ScriptStepExecutor>>,
+    step_handlers: PocStepRegistry,
 }
 
 // Manual: the executor is an opaque trait object, so report only its presence.
@@ -174,6 +178,7 @@ impl fmt::Debug for StdPocRunner {
         f.debug_struct("StdPocRunner")
             .field("out_dir", &self.out_dir)
             .field("script_executor", &self.script_executor.is_some())
+            .field("step_handlers", &self.step_handlers.namespaces())
             .finish()
     }
 }
@@ -183,6 +188,7 @@ impl Default for StdPocRunner {
         Self {
             out_dir: std::env::temp_dir(),
             script_executor: None,
+            step_handlers: PocStepRegistry::new(),
         }
     }
 }
@@ -197,7 +203,7 @@ impl StdPocRunner {
     pub fn with_output_dir(dir: impl Into<PathBuf>) -> Self {
         Self {
             out_dir: dir.into(),
-            script_executor: None,
+            ..Self::default()
         }
     }
 
@@ -205,6 +211,26 @@ impl StdPocRunner {
     pub fn with_script_executor(self, exec: Arc<dyn ScriptStepExecutor>) -> Self {
         Self {
             script_executor: Some(exec),
+            ..self
+        }
+    }
+
+    /// Register a protocol step handler: a `Step::Protocol { ns, .. }` whose
+    /// `ns` matches `handler.ns()` dispatches through it (mirrors
+    /// [`with_script_executor`](Self::with_script_executor)).
+    pub fn with_step_handler(
+        mut self,
+        handler: Arc<dyn aitm_plugin::language::PocStepHandler>,
+    ) -> Self {
+        self.step_handlers.register(handler);
+        self
+    }
+
+    /// Wire a whole protocol-step registry at once (the binary assembles one
+    /// from every registered `ProtocolLanguage::poc_step`).
+    pub fn with_step_handlers(self, handlers: PocStepRegistry) -> Self {
+        Self {
+            step_handlers: handlers,
             ..self
         }
     }
@@ -352,6 +378,33 @@ impl StdPocRunner {
                             ctx.vars.insert(var.clone(), value.clone());
                         }
                     }
+                }
+                Step::Protocol { ns, body, extract } => {
+                    // Dispatch to the registered handler; an unregistered
+                    // namespace is a clear error, never a silent skip.
+                    let handler = self.step_handlers.get(ns).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "poc.run: no handler registered for protocol step `{ns}:` \
+                             (register the `{ns}` protocol's PocStepHandler)"
+                        )
+                    })?;
+                    // Hand the handler the resolved variables so it can expand
+                    // any `{{placeholder}}` inside its own body.
+                    let inputs = PocStepInputs {
+                        vars: live.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    };
+                    let outcome = handler.run(body, &inputs).map_err(|e| {
+                        anyhow::anyhow!("poc.run: protocol step `{ns}:` failed: {e}")
+                    })?;
+                    // Direct bindings reach later steps and `success` like an
+                    // extractor binding does.
+                    for (name, value) in &outcome.bindings {
+                        ctx.vars.insert(name.clone(), value.clone());
+                        live.insert(name.clone(), value.clone());
+                    }
+                    // Sibling extractors bind a `field` of a named source the
+                    // handler produced (the normative `l4:` shape).
+                    bind_proto_extracts(extract, &outcome.sources, &mut ctx, &mut live);
                 }
             }
         }
@@ -517,10 +570,46 @@ fn precheck(poc: &Poc) -> anyhow::Result<()> {
                 }
             }
             Step::Extract(ex) => check_extract(ex)?,
-            Step::Browser(_) | Step::Script(_) => {}
+            // A protocol step's body is late-parsed by its handler at run time;
+            // `aitm-poc` cannot statically validate a namespace it does not know.
+            Step::Browser(_) | Step::Script(_) | Step::Protocol { .. } => {}
         }
     }
     Ok(())
+}
+
+/// Bind each protocol-step extractor from a `field` of a named source the
+/// handler produced, visible to `dsl` matchers (`ctx.vars`) and later-step
+/// templating (`live`). An extractor naming an absent source or missing field
+/// simply binds nothing (like the response extractors).
+fn bind_proto_extracts(
+    extract: &[ProtoExtract],
+    sources: &BTreeMap<String, Value>,
+    ctx: &mut MatchContext,
+    live: &mut VarBindings,
+) {
+    for ex in extract {
+        let Some(source) = sources.get(&ex.source) else {
+            continue;
+        };
+        if let Some(value) = pluck_field(source, &ex.field) {
+            ctx.vars.insert(ex.name.clone(), value.clone());
+            live.insert(ex.name.clone(), value);
+        }
+    }
+}
+
+/// Walk a dotted `field` path (`tcp.flags`) into a source value; an empty path
+/// returns the whole source. A path through a non-object yields `None`.
+fn pluck_field(source: &Value, field: &str) -> Option<Value> {
+    let mut cur = source;
+    for seg in field.split('.').filter(|s| !s.is_empty()) {
+        match cur {
+            Value::Object(map) => cur = map.get(seg)?,
+            _ => return None,
+        }
+    }
+    Some(cur.clone())
 }
 
 fn check_assertion(assertion: &Assertion) -> anyhow::Result<()> {

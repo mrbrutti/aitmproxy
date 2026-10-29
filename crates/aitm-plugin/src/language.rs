@@ -167,27 +167,67 @@ pub trait GuardHandle: Send + Sync {
 /// The native `<ns>:` PoC step handler a protocol contributes. Object-safe so
 /// `aitm-poc` can hold `Box<dyn PocStepHandler>` and dispatch by `ns`.
 ///
-/// Task 3 finalizes the run/validate contract (the verb dispatch through the
-/// protocol's host verbs and the exact outcome type); here it is a skeleton
-/// with the stable shape: a handler names its namespace and validates/runs a
-/// **late-parsed** body (`serde_yaml::Value`, per the spec's "Left to the
-/// builder" recommendation), contributing matcher/extractor source names.
+/// The runner routes a [`Step::Protocol { ns, body, extract }`] to the handler
+/// whose [`ns`](PocStepHandler::ns) matches, hands it the late-parsed `body`
+/// (`serde_yaml::Value`, per the spec's "Left to the builder" recommendation)
+/// plus the resolved variables ([`PocStepInputs`]), and adapts the returned
+/// [`PocStepOutcome`] back into its own bindings/sources — the handler never
+/// references an `aitm-poc` type, so the dependency graph stays acyclic.
+///
+/// A handler contributes **named sources** (e.g. L4's `"packet"`) and/or direct
+/// **bindings**. A PoC's sibling `extract` reads a field from a named source
+/// (the normative `l4:` shape: `type: packet, field: tcp.flags`); the runner,
+/// not the handler, walks the field path. Task 6's L4 handler implements this
+/// `run` by dispatching the body's verb through the `l4.*` host functions and
+/// returning the received packet as the `"packet"` source.
 pub trait PocStepHandler: Send + Sync {
     /// The namespace this handler serves — matched against `Step::Protocol`'s
-    /// `ns` by the runner (Task 3).
+    /// `ns` by the runner.
     fn ns(&self) -> &str;
 
     /// The matcher/extractor source names this step contributes (e.g. L4's
-    /// `"packet"`), so a PoC can assert on what the verb produced.
+    /// `"packet"`, the test namespace's `"echo"`), so a PoC can assert on what
+    /// the verb produced and the catalog (Task 4) can advertise them.
     fn sources(&self) -> Vec<String> {
         Vec::new()
     }
 
-    /// Validate / run the late-parsed step body. **Skeleton** — Task 3 fills in
-    /// dispatch through the protocol's `<ns>.*` host verbs and finalizes the
-    /// outcome type; the signature (late-parsed `&serde_yaml::Value` in) is the
-    /// stable part.
-    fn run(&self, body: &serde_yaml::Value) -> Result<(), HostError>;
+    /// Run the late-parsed step `body` against the resolved `inputs`, returning
+    /// the sources and bindings it produced (or a [`HostError`] — e.g. the
+    /// protocol guard refused the verb, or the body was malformed). The runner
+    /// merges the outcome's bindings and feeds its sources to the step's
+    /// `extract`.
+    fn run(
+        &self,
+        body: &serde_yaml::Value,
+        inputs: &PocStepInputs,
+    ) -> Result<PocStepOutcome, HostError>;
+}
+
+/// What a [`PocStepHandler::run`] is handed: the PoC's resolved variables, so a
+/// handler can expand `{{placeholder}}`s inside its own body. Expressed purely
+/// in seam terms ([`aitm_core::Value`]) — it carries none of `aitm-poc`'s
+/// run context, keeping the seam acyclic.
+#[derive(Debug, Clone, Default)]
+pub struct PocStepInputs {
+    /// The variables resolved so far (caller bindings over variable defaults,
+    /// plus any earlier steps' bindings), by name.
+    pub vars: BTreeMap<String, Value>,
+}
+
+/// What a [`PocStepHandler::run`] produced, adapted by the runner into its match
+/// context: **named sources** a sibling `extract`/matcher reads a field from
+/// (e.g. `"packet"` → the received packet as a [`Value::Object`]), and direct
+/// **bindings** that reach later steps and `success` the way an extractor
+/// binding does.
+#[derive(Debug, Clone, Default)]
+pub struct PocStepOutcome {
+    /// Named sources the step produced; a PoC extractor/matcher reads a field
+    /// out of one (e.g. `extract { type: packet, field: tcp.flags }`).
+    pub sources: BTreeMap<String, Value>,
+    /// Variables bound directly by the step, visible to later steps and
+    /// `success`.
+    pub bindings: BTreeMap<String, Value>,
 }
 
 /// Pure data describing one namespace for the shared operator-UI definition

@@ -9,6 +9,8 @@ description = "A minimal test protocol crate exercising the ProtocolLanguage sea
 [dependencies]
 aitm-core.workspace = true
 aitm-plugin.workspace = true
+# PoC step bodies are late-parsed `serde_yaml::Value` (the seam's body type).
+serde_yaml = "0.9"
 
 [lints]
 workspace = true

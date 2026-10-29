@@ -270,6 +270,8 @@ version = "0.1.0"
 dependencies = [
  "aitm-browser",
  "aitm-core",
+ "aitm-plugin",
+ "aitm-proto-test",
  "anyhow",
  "bytes",
  "futures",
@@ -331,6 +333,7 @@ version = "0.1.0"
 dependencies = [
  "aitm-core",
  "aitm-plugin",
+ "serde_yaml",
 ]
 
 [[package]]
