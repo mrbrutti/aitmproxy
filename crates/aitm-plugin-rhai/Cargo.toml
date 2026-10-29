@@ -16,6 +16,11 @@ aitm-plugin.workspace = true
 # the Rust `browser.navigate` command makes, reused for the script verb.
 aitm-browser.workspace = true
 aitm-poc.workspace = true
+# `production_languages()` constructs the shipped `L4Language` so its
+# `NamespaceCatalog` assembles into `rhai.api.json` (plan Task 6). Only the
+# static catalog is needed here; `aitm-proto-l4` depends on `aitm-plugin` +
+# `aitm-core`, never back on this crate, so the library graph stays acyclic.
+aitm-proto-l4.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 # `time`: every guarded host call is wrapped in `tokio::time::timeout` for the

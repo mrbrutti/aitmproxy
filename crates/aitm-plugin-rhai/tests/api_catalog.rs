@@ -548,16 +548,17 @@ fn poc_face_drift_rejects_a_drifted_poc_step() {
 }
 
 /// Golden — the shipped `rhai.api.json` `namespaces` object equals
-/// `assemble_namespaces(production_languages())`. Empty in this task; Task 5/6
-/// populate `production_languages()` and re-verify against the shipped file.
+/// `assemble_namespaces(production_languages())`. Task 6 adds `l4`, so the `l4`
+/// namespace is present and its assembly must match the shipped file byte-for-byte
+/// (regenerated when the catalog changes).
 #[test]
 fn shipped_namespaces_equal_production_assembly() {
     let langs = production_languages();
     let refs: Vec<&dyn ProtocolLanguage> = langs.iter().map(|b| b.as_ref()).collect();
     let doc = assemble_namespaces(&refs).expect("production assembles");
     assert!(
-        doc.is_empty(),
-        "production namespaces are empty until Task 5 (http/browser) and Task 6 (l4) join"
+        doc.contains_key("l4"),
+        "Task 6 puts the `l4` namespace into production_languages()"
     );
 
     let text = std::fs::read_to_string(catalog_path()).expect("the catalog is readable");

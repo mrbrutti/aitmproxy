@@ -150,7 +150,7 @@ pub(crate) fn scope_id_to_string(id: L4ScopeId) -> String {
 }
 
 /// Parse a bus string back into a scope id (the inverse of [`scope_id_to_string`]).
-fn scope_id_from_str(s: &str) -> anyhow::Result<L4ScopeId> {
+pub(crate) fn scope_id_from_str(s: &str) -> anyhow::Result<L4ScopeId> {
     serde_json::from_value(serde_json::Value::String(s.to_string()))
         .map_err(|e| anyhow::anyhow!("not a valid scope id `{s}`: {e}"))
 }
@@ -164,14 +164,14 @@ pub(crate) fn flow_id_to_string(id: L4FlowId) -> String {
 }
 
 /// Parse a bus string into an L4 flow id.
-fn flow_id_from_str(s: &str) -> anyhow::Result<L4FlowId> {
+pub(crate) fn flow_id_from_str(s: &str) -> anyhow::Result<L4FlowId> {
     serde_json::from_value(serde_json::Value::String(s.to_string()))
         .map_err(|e| anyhow::anyhow!("not a valid L4 flow id `{s}`: {e}"))
 }
 
 /// Parse a human-friendly `addr/prefix` CIDR (e.g. `127.0.0.1/32`, `10.0.0.0/8`,
 /// `::1/128`). A bare address defaults to a host prefix (`/32` v4, `/128` v6).
-fn parse_cidr(s: &str) -> anyhow::Result<IpCidr> {
+pub(crate) fn parse_cidr(s: &str) -> anyhow::Result<IpCidr> {
     let (addr_str, prefix_str) = match s.split_once('/') {
         Some((a, p)) => (a, Some(p)),
         None => (s, None),
@@ -200,7 +200,7 @@ fn cidr_to_string(cidr: &IpCidr) -> String {
 }
 
 /// Parse a direction string (`inbound` / `outbound`).
-fn parse_direction(s: &str) -> anyhow::Result<L4Direction> {
+pub(crate) fn parse_direction(s: &str) -> anyhow::Result<L4Direction> {
     match s.trim().to_ascii_lowercase().as_str() {
         "inbound" => Ok(L4Direction::Inbound),
         "outbound" => Ok(L4Direction::Outbound),
@@ -217,7 +217,7 @@ fn direction_to_string(dir: L4Direction) -> &'static str {
 }
 
 /// Parse a capability string (`capture` / `inject` / `intercept`).
-fn parse_capability(s: &str) -> anyhow::Result<L4Capability> {
+pub(crate) fn parse_capability(s: &str) -> anyhow::Result<L4Capability> {
     match s.trim().to_ascii_lowercase().as_str() {
         "capture" => Ok(L4Capability::Capture),
         "inject" => Ok(L4Capability::Inject),
@@ -238,7 +238,7 @@ fn capability_to_string(cap: L4Capability) -> &'static str {
 }
 
 /// Parse a port range: `lo-hi`, a single `port`, or `*` / empty ⇒ any (`0-65535`).
-fn parse_ports(s: &str) -> anyhow::Result<PortRange> {
+pub(crate) fn parse_ports(s: &str) -> anyhow::Result<PortRange> {
     let s = s.trim();
     if s.is_empty() || s == "*" || s.eq_ignore_ascii_case("any") {
         return Ok(PortRange { lo: 0, hi: 65535 });
@@ -270,7 +270,7 @@ fn ports_to_string(ports: &PortRange) -> String {
 }
 
 /// A scope entry as a transport-neutral object for `l4.scope.list`.
-fn scope_entry_to_value(entry: &L4ScopeEntry) -> Value {
+pub(crate) fn scope_entry_to_value(entry: &L4ScopeEntry) -> Value {
     let mut rate = BTreeMap::new();
     rate.insert(
         "pps".to_string(),

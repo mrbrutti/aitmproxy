@@ -167,7 +167,7 @@ fn flow_fields() -> Vec<ParamDef> {
 }
 
 /// An [`L4Flow`] as a transport-neutral object.
-fn flow_to_value(flow: &L4Flow) -> Value {
+pub(crate) fn flow_to_value(flow: &L4Flow) -> Value {
     use crate::flow::L4FlowKind;
     use crate::types::L4Direction;
 
