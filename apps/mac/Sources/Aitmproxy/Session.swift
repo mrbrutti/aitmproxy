@@ -226,6 +226,12 @@ final class Session {
         didSet { if !Store.isOverridden { UserDefaults.standard.set(settingsTab.rawValue, forKey: "settings.tab") } }
     }
 
+    /// The switchable, persistent active-core choice (Task 7, AC10): embedded vs
+    /// external, driven from Settings ▸ Bus. Set once the live stack is built
+    /// (`ShellView`); `nil` in fixture/snapshot runs, where Bus settings show the
+    /// persisted default without a live core to switch.
+    @ObservationIgnored var connection: ActiveConnectionModel?
+
     /// Where actions go: the bus, or the fixture session itself.
     @ObservationIgnored lazy var actions: any FlowActions = FixtureActions(session: self)
     /// The last failed action, shown in the status bar until the next one succeeds.

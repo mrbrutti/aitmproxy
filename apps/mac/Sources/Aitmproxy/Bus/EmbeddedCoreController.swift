@@ -20,6 +20,9 @@ final class EmbeddedCoreController {
     /// The registry seam (Task 4): holds the embedded connection and tracks the
     /// single active one; shaped to hold more than one later.
     private(set) var registry = ConnectionRegistry()
+    /// Whether the embedded core is currently supervised (Task 7): read by the
+    /// active-connection driver to decide a switch and surface it in Settings.
+    private(set) var isRunning = false
 
     private let core: EmbeddedCore
     private unowned let bus: BusService
@@ -42,19 +45,44 @@ final class EmbeddedCoreController {
             label: "Embedded core"
         )
         registry.insert(connection)
-        registry.setActive(connection.id)
+        // Not active until `start()` brings the core up (Task 7): a controller may
+        // be built but left dormant while an external core is the active choice.
     }
 
     /// Spawns and supervises the core, pumping its events onto the main actor,
-    /// and arms the quit teardown.
+    /// and arms the quit teardown. Idempotent: calling it while already running
+    /// does nothing, so switching back to embedded (Task 7) re-starts only a
+    /// stopped core.
     func start() {
+        guard !isRunning else { return }
+        isRunning = true
+        update { $0.status = .starting }
+        registry.setActive(connection.id)
         pump = Task { [weak self, core] in
             for await event in core.events {
                 self?.handle(event)
             }
         }
         Task { [core] in await core.start() }
+        armTerminateObserver()
+    }
 
+    /// Stops the embedded core and makes it inactive (Task 7): used when the
+    /// operator switches to an external core. The core can be started again later
+    /// — external never permanently disables embedded.
+    func stop() {
+        guard isRunning else { return }
+        isRunning = false
+        pump?.cancel()
+        pump = nil
+        update { $0.status = .stopped }
+        Task { [core] in await core.stop() }
+    }
+
+    /// Arm the quit teardown once, for the controller's lifetime, so an
+    /// embedded→external→embedded cycle never stacks observers.
+    private func armTerminateObserver() {
+        guard terminateObserver == nil else { return }
         terminateObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main
         ) { [weak self] _ in

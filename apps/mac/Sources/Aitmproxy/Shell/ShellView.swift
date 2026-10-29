@@ -79,16 +79,17 @@ struct ShellView: View {
             } else {
                 let service = BusService(session: session)
                 session.actions = service
-                // Self-contained launch (AC6): when nothing external is configured
-                // and the core is bundled (Task 9), run our own embedded core and
-                // let it hand the bus its endpoint. An operator with a config.yaml
-                // bus keeps today's external path; the switchable choice is Task 7.
-                if BusService.resolveEndpoint() == nil,
-                   let controller = EmbeddedCoreController(coreID: session.activeCoreID, bus: service) {
-                    controller.start()
-                    embeddedCore = controller
-                }
-                service.start()
+                // The active connection is a switchable, persisted choice (Task 7,
+                // AC10): embedded by default, external when the operator picks it in
+                // Settings ▸ Bus. The driver turns that choice into start/stop of the
+                // bundled core (when present — Task 9) and the matching bus endpoint;
+                // `activate()` applies the restored choice on launch.
+                let controller = EmbeddedCoreController(coreID: session.activeCoreID, bus: service)
+                let driver = LiveConnectionDriver(embedded: controller, bus: service)
+                let model = ActiveConnectionModel(driver: driver, persistence: UserDefaultsActiveKindPersistence())
+                model.activate()
+                session.connection = model
+                embeddedCore = controller
                 bus = service
             }
             SelfTest.runIfRequested(session: session)
