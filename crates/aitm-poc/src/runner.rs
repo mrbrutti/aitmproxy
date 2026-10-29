@@ -359,9 +359,17 @@ impl StdPocRunner {
         // Resolve `{{placeholders}}` inside the success tree, then evaluate any
         // browser-eval it names through the driver.
         let success = render_assertion(&poc.success, &tmpl, &live)?;
+        // The rendered tree can differ from the one `precheck` validated: a
+        // template may have substituted a `{{var}}` into a regex or dsl. Re-check
+        // it so an invalid *rendered* pattern is a hard error, not a matcher that
+        // `evaluate` silently coerces to `false`. (I8)
+        check_assertion(&success)?;
         eval_browser_assertions(&success, host, &mut ctx).await?;
 
-        let mut evaluated = collect_outcomes(&success, &ctx);
+        // Describe outcomes from the pre-render (templated) tree so a bound secret
+        // (e.g. `word: "{{token}}"`) is not leaked into the output, but evaluate
+        // against the rendered tree so matching uses the real value. (minor c)
+        let mut evaluated = collect_outcomes(&poc.success, &success, &ctx);
         evaluated.extend(script_errors);
         let passed = evaluate(&success, &ctx);
 
@@ -522,17 +530,33 @@ fn check_assertion(assertion: &Assertion) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("poc.run: invalid regex matcher {regex:?}: {e}")),
         Assertion::Dsl(expr) => crate::dsl::check(expr)
             .map_err(|e| anyhow::anyhow!("poc.run: invalid dsl matcher {expr:?}: {e}")),
-        Assertion::All(items) | Assertion::Any(items) => items.iter().try_for_each(check_assertion),
+        Assertion::All(items) | Assertion::Any(items) => {
+            // An empty combinator asserts nothing: `all` is vacuously true (a
+            // false positive) and `any` vacuously false. Require a leaf. (I3)
+            if items.is_empty() {
+                anyhow::bail!("poc.run: an empty `all`/`any` matcher list asserts nothing");
+            }
+            items.iter().try_for_each(check_assertion)
+        }
         Assertion::Not(inner) => check_assertion(inner),
         Assertion::Status(_) | Assertion::Word { .. } | Assertion::BrowserEval { .. } => Ok(()),
     }
 }
 
 fn check_extract(step: &crate::model::ExtractStep) -> anyhow::Result<()> {
-    if let crate::model::ExtractSource::Regex(pattern) = &step.source {
-        regex::Regex::new(pattern)
-            .map(|_| ())
+    if let crate::model::ExtractSource::Regex { pattern, group } = &step.source {
+        let re = regex::Regex::new(pattern)
             .map_err(|e| anyhow::anyhow!("poc.run: invalid regex extractor {pattern:?}: {e}"))?;
+        // A group index past the pattern's capture count would bind nothing at
+        // run time; reject it here instead of failing silently. `captures_len`
+        // counts group 0 (the whole match), so index 0 is always valid. (I7)
+        if *group >= re.captures_len() {
+            anyhow::bail!(
+                "poc.run: regex extractor {pattern:?} has no capture group {group} \
+                 (the pattern has {} capture group(s))",
+                re.captures_len() - 1
+            );
+        }
     }
     Ok(())
 }
@@ -677,23 +701,37 @@ fn eval_browser_assertions<'a>(
 }
 
 /// Flatten the leaf assertions of `success` into reported outcomes.
-fn collect_outcomes(assertion: &Assertion, ctx: &MatchContext) -> Vec<AssertionOutcome> {
+///
+/// `templated` is the pre-render tree (its leaves describe the report, keeping
+/// `{{placeholders}}` intact), `rendered` is the substituted tree (its leaves are
+/// evaluated). `render_assertion` preserves the tree shape, so the two walk in
+/// lockstep.
+fn collect_outcomes(
+    templated: &Assertion,
+    rendered: &Assertion,
+    ctx: &MatchContext,
+) -> Vec<AssertionOutcome> {
     let mut out = Vec::new();
-    push_outcomes(assertion, ctx, &mut out);
+    push_outcomes(templated, rendered, ctx, &mut out);
     out
 }
 
-fn push_outcomes(assertion: &Assertion, ctx: &MatchContext, out: &mut Vec<AssertionOutcome>) {
-    match assertion {
-        Assertion::All(items) | Assertion::Any(items) => {
-            for item in items {
-                push_outcomes(item, ctx, out);
+fn push_outcomes(
+    templated: &Assertion,
+    rendered: &Assertion,
+    ctx: &MatchContext,
+    out: &mut Vec<AssertionOutcome>,
+) {
+    match (templated, rendered) {
+        (Assertion::All(t), Assertion::All(r)) | (Assertion::Any(t), Assertion::Any(r)) => {
+            for (t, r) in t.iter().zip(r.iter()) {
+                push_outcomes(t, r, ctx, out);
             }
         }
-        Assertion::Not(inner) => push_outcomes(inner, ctx, out),
-        leaf => out.push(AssertionOutcome {
-            assertion: describe(leaf),
-            matched: evaluate(leaf, ctx),
+        (Assertion::Not(t), Assertion::Not(r)) => push_outcomes(t, r, ctx, out),
+        (templated_leaf, rendered_leaf) => out.push(AssertionOutcome {
+            assertion: describe(templated_leaf),
+            matched: evaluate(rendered_leaf, ctx),
         }),
     }
 }
@@ -947,5 +985,73 @@ mod tests {
             ]),
         ))
         .is_ok());
+    }
+
+    /// I3: an empty `all`/`any` list is rejected at precheck (it would otherwise
+    /// evaluate vacuously and report a false positive).
+    #[test]
+    fn precheck_rejects_empty_matcher_lists() {
+        assert!(precheck(&poc_with("ok", Assertion::All(vec![]))).is_err());
+        assert!(precheck(&poc_with("ok", Assertion::Any(vec![]))).is_err());
+    }
+
+    /// I7: a regex extractor whose `group` index exceeds the pattern's capture
+    /// count is rejected; group 0 (whole match) and a present capture are accepted.
+    #[test]
+    fn check_extract_validates_group_range() {
+        use crate::model::{ExtractSource, ExtractStep};
+        let make = |pattern: &str, group: usize| ExtractStep {
+            name: "n".into(),
+            source: ExtractSource::Regex {
+                pattern: pattern.into(),
+                group,
+            },
+        };
+        assert!(check_extract(&make(r"id=\d+", 0)).is_ok());
+        assert!(check_extract(&make(r"id=(\d+)", 1)).is_ok());
+        assert!(
+            check_extract(&make(r"id=\d+", 3)).is_err(),
+            "a group past the capture count must be rejected"
+        );
+    }
+
+    /// I8: a template that renders a regex matcher into an invalid pattern is a
+    /// hard error when the rendered tree is re-checked, not a silent `false`.
+    #[test]
+    fn rendered_invalid_regex_is_an_error() {
+        let tmpl = PocTemplate::new(VarBindings::new());
+        let live = VarBindings::new().with("p", Value::Str("(".into()));
+        let templated = Assertion::regex("{{p}}");
+        let rendered = render_assertion(&templated, &tmpl, &live).expect("render");
+        assert!(
+            check_assertion(&rendered).is_err(),
+            "an invalid rendered regex must surface as an error"
+        );
+    }
+
+    /// Minor (c): a bound secret substituted into a matcher is not leaked into the
+    /// reported outcome description; the description keeps the `{{placeholder}}`,
+    /// while evaluation still uses the real value.
+    #[test]
+    fn outcome_description_does_not_leak_bound_secret() {
+        let tmpl = PocTemplate::new(VarBindings::new());
+        let live = VarBindings::new().with("token", Value::Str("s3cr3t".into()));
+        let templated = Assertion::word("{{token}}");
+        let rendered = render_assertion(&templated, &tmpl, &live).expect("render");
+        let ctx = MatchContext::new(200, "body contains s3cr3t here");
+
+        let outcomes = collect_outcomes(&templated, &rendered, &ctx);
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            outcomes[0].assertion.contains("{{token}}"),
+            "description must keep the placeholder, got: {}",
+            outcomes[0].assertion
+        );
+        assert!(
+            !outcomes[0].assertion.contains("s3cr3t"),
+            "description must not leak the bound secret, got: {}",
+            outcomes[0].assertion
+        );
+        assert!(outcomes[0].matched, "evaluation must use the real value");
     }
 }

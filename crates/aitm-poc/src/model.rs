@@ -177,7 +177,12 @@ pub struct ExtractStep {
 /// Where an extractor reads its value from.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExtractSource {
-    Regex(String),
+    /// A regex with a capture-group index. Group 0 (the default) is the whole
+    /// match; a higher index selects a parenthesized capture.
+    Regex {
+        pattern: String,
+        group: usize,
+    },
     JsonPath(String),
     Header(String),
     BrowserEval(String),
@@ -465,9 +470,16 @@ impl Serialize for ExtractStep {
         };
         put("name", &self.name);
         match &self.source {
-            ExtractSource::Regex(p) => {
+            ExtractSource::Regex { pattern, group } => {
                 put("type", "regex");
-                put("regex", p);
+                put("regex", pattern);
+                // Omit the default group (0, the whole match) to keep the YAML tidy.
+                if *group != 0 {
+                    m.insert(
+                        serde_yaml::Value::String("group".to_string()),
+                        serde_yaml::Value::Number((*group as u64).into()),
+                    );
+                }
             }
             ExtractSource::JsonPath(p) => {
                 put("type", "json");
@@ -506,7 +518,18 @@ fn extract_from_yaml(v: &serde_yaml::Value) -> Result<ExtractStep, String> {
             .ok_or_else(|| format!("extractor `{name}` of type requires `{k}`"))
     };
     let source = match v.get("type").and_then(|t| t.as_str()) {
-        Some("regex") => ExtractSource::Regex(payload("regex")?),
+        Some("regex") => ExtractSource::Regex {
+            pattern: payload("regex")?,
+            // Default to the whole match (group 0); an explicit `group:` selects
+            // a capture. Nuclei's regex extractor defaults the same way.
+            group: match v.get("group") {
+                None => 0,
+                Some(g) => g
+                    .as_u64()
+                    .ok_or_else(|| format!("extractor `{name}` has a non-integer `group`"))?
+                    as usize,
+            },
+        },
         Some("json") => ExtractSource::JsonPath(payload("json")?),
         Some("kval") => ExtractSource::Header(payload("kval")?),
         Some("browser-eval") => ExtractSource::BrowserEval(payload("expr")?),
@@ -600,6 +623,11 @@ fn assertion_to_yaml(a: &Assertion) -> serde_yaml::Value {
 fn assertion_from_yaml(v: &serde_yaml::Value) -> Result<Assertion, String> {
     // Sequence form (`success:` as a list) is an implicit `all`.
     if let serde_yaml::Value::Sequence(seq) = v {
+        // An empty list would evaluate vacuously true (it asserts nothing), so a
+        // PoC that reflects a target failure as success. A tree must have a leaf.
+        if seq.is_empty() {
+            return Err("matcher list must have at least one entry".to_string());
+        }
         let items = seq
             .iter()
             .map(assertion_from_yaml)
@@ -611,10 +639,10 @@ fn assertion_from_yaml(v: &serde_yaml::Value) -> Result<Assertion, String> {
         .ok_or("matcher must be a mapping or a list")?;
 
     if let Some(items) = map.get("all") {
-        return Ok(Assertion::All(seq_of(items)?));
+        return Ok(Assertion::All(non_empty_seq_of(items, "all")?));
     }
     if let Some(items) = map.get("any") {
-        return Ok(Assertion::Any(seq_of(items)?));
+        return Ok(Assertion::Any(non_empty_seq_of(items, "any")?));
     }
     if let Some(inner) = map.get("not") {
         return Ok(Assertion::Not(Box::new(assertion_from_yaml(inner)?)));
@@ -681,4 +709,15 @@ fn seq_of(v: &serde_yaml::Value) -> Result<Vec<Assertion>, String> {
         .iter()
         .map(assertion_from_yaml)
         .collect()
+}
+
+/// `seq_of`, additionally rejecting an empty list: an `all`/`any` with no
+/// children evaluates vacuously (`all` true, `any` false), which would turn a
+/// matcher-less PoC into a silent false positive. A combinator must have a leaf.
+fn non_empty_seq_of(v: &serde_yaml::Value, key: &str) -> Result<Vec<Assertion>, String> {
+    let items = seq_of(v)?;
+    if items.is_empty() {
+        return Err(format!("`{key}` must have at least one matcher"));
+    }
+    Ok(items)
 }
