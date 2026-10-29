@@ -73,10 +73,8 @@ impl OriginLog {
     }
 }
 
-/// A TLS origin on `127.0.0.1` offering `alpn`, answering every request with 200
-/// and `body`, and recording every request it received into `log`. Serves HTTP/2
-/// when `h2` is negotiated, HTTP/1.1 otherwise.
-async fn spawn_origin(alpn: Vec<Vec<u8>>, log: Arc<Mutex<OriginLog>>, body: Vec<u8>) -> SocketAddr {
+/// A forged-leaf TLS acceptor for a self-signed `127.0.0.1` origin offering `alpn`.
+fn origin_tls(alpn: Vec<Vec<u8>>) -> TlsAcceptor {
     let key = rcgen::KeyPair::generate().expect("fixture key");
     let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
         .expect("fixture params")
@@ -92,7 +90,14 @@ async fn spawn_origin(alpn: Vec<Vec<u8>>, log: Arc<Mutex<OriginLog>>, body: Vec<
         )
         .expect("fixture server config");
     cfg.alpn_protocols = alpn;
-    let acceptor = TlsAcceptor::from(Arc::new(cfg));
+    TlsAcceptor::from(Arc::new(cfg))
+}
+
+/// A TLS origin on `127.0.0.1` offering `alpn`, answering every request with 200
+/// and `body`, and recording every request it received into `log`. Serves HTTP/2
+/// when `h2` is negotiated, HTTP/1.1 otherwise.
+async fn spawn_origin(alpn: Vec<Vec<u8>>, log: Arc<Mutex<OriginLog>>, body: Vec<u8>) -> SocketAddr {
+    let acceptor = origin_tls(alpn);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
     let addr = listener.local_addr().expect("origin addr");
     tokio::spawn(async move {
@@ -186,6 +191,60 @@ where
     let _ = tls.write_all(resp.as_bytes()).await;
     let _ = tls.write_all(&body).await;
     let _ = tls.shutdown().await;
+}
+
+/// A TLS h2 origin that accepts one stream, reads its request, then drops the
+/// connection **without responding** — the proxy's upstream response future (or a
+/// later body read) then fails, which must surface as `Event::Error`.
+async fn spawn_closing_origin(alpn: Vec<Vec<u8>>) -> SocketAddr {
+    let acceptor = origin_tls(alpn);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
+    let addr = listener.local_addr().expect("origin addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let Ok(mut conn) = h2::server::handshake(tls).await else {
+                    return;
+                };
+                if let Some(Ok((req, _respond))) = conn.accept().await {
+                    let (_parts, mut rbody) = req.into_parts();
+                    while let Some(Ok(chunk)) = rbody.data().await {
+                        let _ = rbody.flow_control().release_capacity(chunk.len());
+                    }
+                }
+                // Drop `conn` (and the unused `SendResponse`) here: the connection
+                // closes with no response, so the proxy sees the upstream vanish.
+            });
+        }
+    });
+    addr
+}
+
+/// A plugin that records the flow id of every `Event::Error` the chain dispatches,
+/// so a test can assert a failed stream reached the typed error bus.
+struct ErrorRecorder {
+    errors: Arc<Mutex<Vec<FlowId>>>,
+}
+
+impl Plugin for ErrorRecorder {
+    fn name(&self) -> &str {
+        "error-recorder"
+    }
+    fn on_event(&mut self, ev: &Event, _ctx: &mut FlowCtx<'_>) -> Verdict {
+        if let Event::Error { flow, .. } = ev {
+            if let Ok(mut errs) = self.errors.lock() {
+                errs.push(*flow);
+            }
+        }
+        Verdict::Continue
+    }
 }
 
 async fn read_head<S: AsyncRead + Unpin>(s: &mut S) -> String {
@@ -1126,4 +1185,97 @@ async fn h2_kill_429_no_upstream() {
         0,
         "a synthesized 429 must open no upstream stream"
     );
+}
+
+// --- M7 Task 2 fix: oversized request body → 413, terminal, no upstream --------
+
+/// A request body larger than `max_body` is refused with `:status 413`; the flow
+/// is terminal and marked `truncated`, and the origin records zero requests (the
+/// refusal happens before any upstream stream is opened).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_body_over_cap_is_refused_413() {
+    let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
+    let root_pem = ca.root_cert_pem().to_string();
+    let log = Arc::new(Mutex::new(OriginLog::default()));
+    let cap = 64usize;
+    let origin = spawn_origin(vec![ALPN_H2.to_vec()], log.clone(), b"ok".to_vec()).await;
+    let (proxy, store) = run_proxy(ca, Vec::new(), Some(cap)).await;
+
+    let send_req = connect_h2(proxy, origin, &root_pem).await;
+    let mut sr = send_req.clone().ready().await.expect("h2 ready");
+    let req = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://{origin}/upload"))
+        .body(())
+        .unwrap();
+    // Open the stream with a body still to come, then stream well over the cap.
+    let (resp_fut, mut body) = sr.send_request(req, false).expect("send h2 request");
+    let _ = body.send_data(Bytes::from(vec![b'A'; cap * 8]), true);
+
+    let resp = resp_fut.await.expect("h2 response");
+    assert_eq!(
+        resp.status().as_u16(),
+        413,
+        "an over-cap request body must be refused with 413"
+    );
+
+    let flow = wait_for_flow(store.as_ref()).await;
+    assert!(
+        flow.metadata.truncated,
+        "the refused flow must be marked truncated"
+    );
+    assert_eq!(
+        flow.response.map(|r| r.status),
+        Some(413),
+        "the 413 must be recorded as the flow's terminal response"
+    );
+
+    // Give any (erroneous) upstream stream a moment to land before asserting zero.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        log.lock().unwrap().count(),
+        0,
+        "a 413-refused request must open no upstream stream"
+    );
+}
+
+// --- M7 Task 2 fix: upstream failure → Event::Error ---------------------------
+
+/// An upstream that accepts the request then closes without responding fails the
+/// stream, and that failure reaches the typed error bus as `Event::Error` rather
+/// than only a `tracing` line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_closing_early_emits_flow_error() {
+    let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
+    let root_pem = ca.root_cert_pem().to_string();
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let origin = spawn_closing_origin(vec![ALPN_H2.to_vec()]).await;
+    let (proxy, _store) = run_proxy(
+        ca,
+        vec![Box::new(ErrorRecorder {
+            errors: errors.clone(),
+        })],
+        None,
+    )
+    .await;
+
+    let send_req = connect_h2(proxy, origin, &root_pem).await;
+    let result = h2_try_get(&send_req, origin, "/dropme").await;
+    assert!(
+        result.is_err(),
+        "a stream whose upstream vanished must not return a 200"
+    );
+
+    // The failure was emitted on the error bus for the flow.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if !errors.lock().unwrap().is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no Event::Error was emitted for the failed flow"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
