@@ -123,6 +123,21 @@
     G = { in: seg(segIn), out: seg(segOut) };
     segIn.style.transform = saved[0]; segOut.style.transform = saved[1];
   }
+  /* the hero wire's two segments in viewport pixels, for the introduction's mark to fly into */
+  window.aitmWireTarget = function () {
+    if (!ctx || mqReduce && mqReduce.matches) return null;
+    var saved = [segIn.style.transform, segOut.style.transform];
+    segIn.style.transform = "none"; segOut.style.transform = "none";
+    var seg = function (el) {
+      var b = el.getBoundingClientRect(), vert = b.height > b.width;
+      return vert ? { a: [b.left + b.width / 2, b.top], b: [b.left + b.width / 2, b.bottom] }
+                  : { a: [b.left, b.top + b.height / 2], b: [b.right, b.top + b.height / 2] };
+    };
+    var t = { in: seg(segIn), out: seg(segOut) };
+    segIn.style.transform = saved[0]; segOut.style.transform = saved[1];
+    var r = wire.getBoundingClientRect(), vh = window.innerHeight || 800;
+    return r.bottom > 40 && r.top < vh - 40 ? t : null;
+  };
   function along(s, p) { return [s.a[0] + (s.b[0] - s.a[0]) * p, s.a[1] + (s.b[1] - s.a[1]) * p]; }
   function scaleSeg(el, s, p) { el.style.transform = (s && s.vert ? "scaleY(" : "scaleX(") + p.toFixed(4) + ")"; }
 
@@ -338,26 +353,39 @@
   function sync() { if (visible && onScreen) run(); else halt(); }
   document.addEventListener("visibilitychange", function () { visible = !document.hidden; sync(); });
 
-  /* the first run gets the introduction only if the wire is on screen now; otherwise a
-     request simply arrives when the hero is scrolled into view */
+  /* the first run gets the wire's own introduction only if the wire is on screen now;
+     otherwise a request simply arrives when the hero is scrolled into view. When the site's
+     introduction (intro.js) is playing, the scene waits for it: if the mark flew into the
+     hero, the scene takes over already held; if it was skipped, the wire draws itself. */
   var r0 = wire.getBoundingClientRect(), vh = window.innerHeight || document.documentElement.clientHeight || 800;
   var withIntro = !!ctx && r0.top < vh && r0.bottom > 0;
+  var siteIntro = document.documentElement.classList.contains("intro-on");
   setPhase(withIntro ? "intro" : "idle"); /* synchronously: the stylesheet's wait ends here */
-  function begin() {
+  function begin(first) {
     if (started || dead) return; started = true;
     readColors(); resize(); measure();
-    enter(withIntro ? "intro" : "arrive", performance.now());
+    first = first || (withIntro ? "intro" : "arrive");
+    enter(first, performance.now());
     sync(); /* runs only if on screen and visible; otherwise waits, on the beat, for the observer */
     /* if frames never come (a throttled renderer), the introduction must not keep the flow
        hidden: land it in the held state by timer, and the loop carries on from there */
-    if (withIntro) setTimeout(function () { if (phase === "intro") enter("held", performance.now()); }, PH.intro + 2500);
+    if (first === "intro") setTimeout(function () { if (phase === "intro") enter("held", performance.now()); }, PH.intro + 2500);
+  }
+  function fromSiteIntro(d) {
+    if (started) return;
+    begin(d && d.morphed && withIntro ? "held" : null);
   }
   if ("IntersectionObserver" in window) {
     new IntersectionObserver(function (es) {
-      es.forEach(function (e) { onScreen = e.isIntersecting; if (onScreen && !started) begin(); else sync(); });
+      es.forEach(function (e) { onScreen = e.isIntersecting; if (onScreen && !started && !siteIntro) begin(); else sync(); });
     }, { threshold: 0.15 }).observe(wire);
-    setTimeout(function () { if (!started) begin(); }, 2500); /* never leave the introduction waiting */
-  } else begin();
+  }
+  if (siteIntro) {
+    window.addEventListener("aitm:intro", function (e) { fromSiteIntro(e.detail || window.aitmIntro); });
+    if (window.aitmIntro) fromSiteIntro(window.aitmIntro);      /* it already ended */
+    setTimeout(function () { fromSiteIntro(null); }, 4200);      /* or it never will */
+  } else if (!("IntersectionObserver" in window)) begin();
+  else setTimeout(function () { if (!started) begin(); }, 2500); /* never leave the introduction waiting */
 
   /* the layout moves (fonts land, the window resizes): keep the light on the wire */
   if ("ResizeObserver" in window) {

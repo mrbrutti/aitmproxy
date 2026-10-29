@@ -6,7 +6,7 @@
 <title>Getting started — aitmproxy docs</title>
 <meta name="description" content="Install aitmproxy, trust the local certificate, capture your first flows, then intercept and edit a request by hand or by agent.">
 <link rel="stylesheet" href="styles.css">
-<script>document.documentElement.className += " js";</script>
+<script>(function(d){var c=" js";try{if(!matchMedia("(prefers-reduced-motion: reduce)").matches&&!sessionStorage.getItem("aitm.intro")){c+=" intro-on";sessionStorage.setItem("aitm.intro","1");}}catch(e){}d.className+=c;})(document.documentElement);</script>
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
@@ -80,7 +80,7 @@
     <div class="prose">
       <h2 id="install">Install</h2>
       <p>aitmproxy installs with Homebrew on macOS and Linux. The formula ships the <code>aitm</code> command, the terminal UI, the web UI and the MCP server. The macOS app is a separate cask that includes the same core.</p>
-      <figure class="code">
+      <figure class="code" data-reveal>
         <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
 <pre><code><span class="pr">$ </span>brew install aitmproxy
 <span class="pr">$ </span>aitm --version
@@ -90,7 +90,7 @@
 
       <h2 id="trust">Trust the certificate</h2>
       <p>To read HTTPS, aitmproxy terminates TLS with a certificate authority it generates on your machine, for your machine. Nothing leaves your computer. Before browsers and apps will accept it, that CA must be trusted.</p>
-      <figure class="code">
+      <figure class="code" data-reveal>
         <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
 <pre><code><span class="pr">$ </span>aitm ca install
 <span class="out">aitmproxy local CA   created just now   fingerprint 3A:9F:…:C2</span>
@@ -107,7 +107,7 @@
 
       <h2 id="capture">Capture</h2>
       <p>Start the proxy. It listens on <code>127.0.0.1:8080</code> and serves the web UI on <code>127.0.0.1:8082</code>. Point a browser, a simulator or your app at the proxy and flows start arriving.</p>
-      <figure class="code">
+      <figure class="code" data-reveal>
         <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
 <pre><code><span class="pr">$ </span>aitm start
 <span class="out">proxy    http://127.0.0.1:8080</span>
@@ -133,7 +133,7 @@
 
       <h2 id="intercept">Intercept and edit</h2>
       <p>Interception pauses a request in mid-air. Add a rule for the traffic you care about, trigger it from the app, and the flow appears as <em>armed</em>: readable and editable, going nowhere until you say so.</p>
-      <figure class="code">
+      <figure class="code" data-reveal>
         <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
 <pre><code><span class="pr">$ </span>aitm intercept add --match <span class="s">'POST /api/cart/*'</span>
 <span class="out">rule r1 armed · POST /api/cart/*</span>
@@ -220,6 +220,7 @@
   </div>
 </footer>
 
+<script src="intro.js"></script>
 <script src="site.js"></script>
 </body>
 </html>

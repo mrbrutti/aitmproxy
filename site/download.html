@@ -6,7 +6,7 @@
 <title>Download — aitmproxy</title>
 <meta name="description" content="Install aitmproxy with Homebrew on macOS and Linux: the core proxy, the macOS app, the web UI, the terminal UI and the MCP server. Open source, MIT or Apache-2.0.">
 <link rel="stylesheet" href="styles.css">
-<script>document.documentElement.className += " js";</script>
+<script>(function(d){var c=" js";try{if(!matchMedia("(prefers-reduced-motion: reduce)").matches&&!sessionStorage.getItem("aitm.intro")){c+=" intro-on";sessionStorage.setItem("aitm.intro","1");}}catch(e){}d.className+=c;})(document.documentElement);</script>
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
@@ -49,7 +49,7 @@
   <div class="wrap">
     <div class="install">
       <div>
-        <h2 class="h2">Homebrew</h2>
+        <h2 class="h2" data-reveal>Homebrew</h2>
         <p class="lead deck">macOS 13+ (Apple Silicon and Intel) and Linux (x86-64 and arm64). The formula installs the <code>aitm</code> binary with the web UI and the embedded browser bundled in — nothing else to fetch.</p>
         <div class="steps">
           <div class="cmd"><code><span class="pr">$ </span>brew install aitmproxy</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
@@ -58,7 +58,7 @@
         <p class="deck muted">The first line is the CLI and the three UIs. The second is the notarized macOS app, which drives the same core.</p>
       </div>
       <div>
-        <h2 class="h2">Then capture.</h2>
+        <h2 class="h2" data-reveal>Then capture.</h2>
         <p class="lead deck">Trust the local certificate once, start the proxy, and point your app, browser or client at <code>127.0.0.1:8080</code>.</p>
         <div class="steps">
           <div class="cmd"><code><span class="pr">$ </span>aitm ca install</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
@@ -73,7 +73,7 @@
 <!-- ============ PLATFORMS ============ -->
 <section class="section" id="platforms">
   <div class="wrap">
-    <h2 class="h2">Every face, every platform.</h2>
+    <h2 class="h2" data-reveal>Every face, every platform.</h2>
     <p class="lead deck">One core, written in memory-safe Rust. Pick the surface that fits the moment; they all speak to the same proxy.</p>
     <div class="features">
       <article class="feature" data-reveal>
@@ -113,7 +113,7 @@
 <!-- ============ WHAT'S IN THE BOX ============ -->
 <section class="section" id="included">
   <div class="wrap">
-    <h2 class="h2">What you get.</h2>
+    <h2 class="h2" data-reveal>What you get.</h2>
     <div class="stats">
       <div class="stat" data-reveal><b>1</b><span>core proxy — HTTP, HTTPS and WebSocket, with TLS passthrough</span></div>
       <div class="stat" data-reveal data-d="1"><b>3</b><span>user interfaces — macOS, web and terminal</span></div>
@@ -156,6 +156,7 @@
   </div>
 </footer>
 
+<script src="intro.js"></script>
 <script src="site.js"></script>
 </body>
 </html>

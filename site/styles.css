@@ -212,13 +212,13 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
 /* hero entrance: lines rise, the sentence fades up, the wire draws itself (wire.js),
    and only then the operators and the actions arrive — one cadence, once */
 .hero .display .line { display: block; overflow: hidden; padding-bottom: 0.06em; margin-bottom: -0.06em; }
-.hero .display .line > span { display: block; translate: 0 112%; animation: rise 900ms var(--ease-out) forwards; }
-.hero .display .line:nth-child(2) > span { animation-delay: 100ms; }
+.hero .display .line > span { display: block; translate: 0 112%; animation: rise 900ms var(--ease-out) var(--intro-lead) forwards; }
+.hero .display .line:nth-child(2) > span { animation-delay: calc(var(--intro-lead) + 100ms); }
 @keyframes rise { to { translate: 0 0; } }
-.hero .lead { animation: fade-up 700ms var(--ease-out) 360ms backwards; }
-.hero .operators { animation: fade-up 700ms var(--ease-out) 1200ms backwards; }
-.hero .hero-cta { animation: fade-up 700ms var(--ease-out) 1350ms backwards; }
-.hero .hero-foot { animation: fade-up 700ms var(--ease-out) 1450ms backwards; }
+.hero .lead { animation: fade-up 700ms var(--ease-out) calc(var(--intro-lead) + 360ms) backwards; }
+.hero .operators { animation: fade-up 700ms var(--ease-out) calc(var(--intro-lead) + 1200ms) backwards; }
+.hero .hero-cta { animation: fade-up 700ms var(--ease-out) calc(var(--intro-lead) + 1350ms) backwards; }
+.hero .hero-foot { animation: fade-up 700ms var(--ease-out) calc(var(--intro-lead) + 1450ms) backwards; }
 @keyframes fade-up { from { opacity: 0; translate: 0 12px; } }
 @keyframes word-in { from { opacity: 0; translate: 0 3px; } }
 
@@ -315,6 +315,8 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
 /* the head's rule warms while the flow is held */
 .held-head { transition: border-color 480ms var(--ease-out); }
 .held[data-state="armed"] .held-head { border-color: color-mix(in srgb, var(--signal) 55%, var(--hairline)); }
+.held[data-state="resuming"] .held-head { border-color: color-mix(in srgb, var(--accent) 40%, var(--hairline)); }
+.held[data-state="done"] .held-head { border-color: color-mix(in srgb, var(--st-ok) 45%, var(--hairline)); }
 /* the edited value lights only while the flow is held, and blooms once as the edit lands */
 .held .edit { background: transparent; transition: background 320ms var(--ease-out); }
 .held[data-state="armed"] .edit { background: var(--signal); }
@@ -604,8 +606,41 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
   @keyframes pulse { 0% { opacity: 0.7; transform: scale(1); } 70% { opacity: 0; transform: scale(1.35); } 100% { opacity: 0; } }
 
   /* inner pages share the hero's cadence: the title, then the lead */
-  .page-head .display, .article > .display { animation: fade-up 700ms var(--ease-out) backwards; }
-  .page-head .lead, .article > .lead { animation: fade-up 700ms var(--ease-out) 120ms backwards; }
+  .page-head .display, .article > .display { animation: fade-up 700ms var(--ease-out) var(--intro-lead) backwards; }
+  .page-head .lead, .article > .lead { animation: fade-up 700ms var(--ease-out) calc(var(--intro-lead) + 120ms) backwards; }
+}
+
+/* ---------- the introduction: the mark alone on a blank page, then the site ----------
+   The inline <head> script adds html.intro-on once per session (never under reduced
+   motion). The overlay is html::after in the page's own paper colour, so it is there
+   before any script and needs no markup; intro.js draws the mark on a canvas above it,
+   then adds .intro-lift (the page fades out from under the mark) and .intro-reveal (the
+   site fades in). Every hold here releases itself by animation after ~4s, so a script
+   that never runs, a canvas that never draws or a frame that never comes can leave
+   nothing covered or hidden. */
+:root { --intro-lead: 0ms; }
+html.intro-on { --intro-lead: 1650ms; }           /* the hero's entrance waits for the lift */
+html.intro-on.intro-skip { --intro-lead: 0ms; }   /* skipped: the entrance runs now */
+html.intro-on::after {
+  content: ""; position: fixed; inset: 0; z-index: 60; background: var(--paper);
+  pointer-events: none; /* the page never blocks input; intro.js skips on the first touch instead */
+  /* the resting state is "gone": it is the animation that holds the page up for 4.2s and
+     lets it down over 600ms, so if the animation ever stops applying, nothing is covered */
+  opacity: 0; visibility: hidden;
+  animation: intro-cover 4800ms var(--ease-out) both;
+}
+html.intro-on.intro-lift::after { animation: intro-lift 760ms var(--ease-out) both; }
+html.intro-on.intro-done::after { content: none; }
+@keyframes intro-cover { 0%, 87.5% { opacity: 1; visibility: visible; } 100% { opacity: 0; visibility: hidden; } }
+@keyframes intro-lift { from { opacity: 1; visibility: visible; } to { opacity: 0; visibility: hidden; } }
+.intro-canvas { position: fixed; inset: 0; z-index: 70; pointer-events: none; width: 100%; height: 100%; }
+html.intro-on:not(.intro-reveal) :is(.nav, main, .footer) { animation: intro-hold 1ms linear 4000ms both; }
+html.intro-on.intro-reveal :is(.nav, main, .footer) { animation: fade-in 900ms var(--ease-out) both; }
+@keyframes intro-hold { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  html.intro-on::after { content: none; }
+  html.intro-on :is(.nav, main, .footer) { animation: none; opacity: 1; }
+  .intro-canvas { display: none; }
 }
 
 /* ---------- responsive ---------- */

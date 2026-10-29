@@ -6,7 +6,7 @@
 <title>PoC format — aitmproxy docs</title>
 <meta name="description" content="Reference for aitmproxy's YAML PoC format: a saved, re-runnable reproduction of a finding, with steps, matchers, variables and a success condition.">
 <link rel="stylesheet" href="styles.css">
-<script>document.documentElement.className += " js";</script>
+<script>(function(d){var c=" js";try{if(!matchMedia("(prefers-reduced-motion: reduce)").matches&&!sessionStorage.getItem("aitm.intro")){c+=" intro-on";sessionStorage.setItem("aitm.intro","1");}}catch(e){}d.className+=c;})(document.documentElement);</script>
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
@@ -91,7 +91,7 @@
       </table>
 
       <h2 id="steps">Step types</h2>
-      <div class="api">
+      <div class="api" data-reveal>
         <div><div class="sig">http<small>send one request through the proxy</small></div><div><code>url</code> (required), <code>method</code> (default <code>GET</code>), <code>headers</code>, <code>body</code>, <code>follow_redirects</code> (default <code>false</code>), <code>matchers</code>. The response is kept for later matchers and for <code>{{last.body}}</code>.</div></div>
         <div><div class="sig">browser<small>drive the embedded headless browser</small></div><div><code>action</code> is one of <code>navigate</code> (<code>url</code>), <code>screenshot</code> (<code>label</code>), <code>eval</code> (<code>expr</code>, stores the result), <code>click</code> (<code>selector</code>), <code>fill</code> (<code>selector</code>, <code>value</code>). The browser already trusts the proxy and goes through it.</div></div>
         <div><div class="sig">replay<small>re-send a captured flow</small></div><div><code>flow</code> (id from the session) with optional <code>set_header</code>, <code>set_body</code>, <code>set_query</code>. Useful for PoCs written from a live session.</div></div>
@@ -125,7 +125,7 @@
 
       <h2 id="example">Complete example</h2>
       <p>A reflected value in a search parameter. The first step sends the marker and checks it comes back in the body. The second step opens the same page in the embedded browser and keeps a screenshot. Success requires that the page's own JavaScript saw the marker, which is a stronger claim than text in a body.</p>
-      <figure class="code">
+      <figure class="code" data-reveal>
         <figcaption><span>pocs/reflected-xss-search-q.yaml</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
 <pre><code><span class="yk">id:</span> <span class="yv">reflected-xss-search-q</span>
 <span class="yk">info:</span>
@@ -217,6 +217,7 @@
   </div>
 </footer>
 
+<script src="intro.js"></script>
 <script src="site.js"></script>
 </body>
 </html>

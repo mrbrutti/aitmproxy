@@ -6,7 +6,7 @@
 <title>Rhai scripting — aitmproxy docs</title>
 <meta name="description" content="Reference for aitmproxy plugins written in Rhai: the capability model, the hooks, the flow API and a complete example.">
 <link rel="stylesheet" href="styles.css">
-<script>document.documentElement.className += " js";</script>
+<script>(function(d){var c=" js";try{if(!matchMedia("(prefers-reduced-motion: reduce)").matches&&!sessionStorage.getItem("aitm.intro")){c+=" intro-on";sessionStorage.setItem("aitm.intro","1");}}catch(e){}d.className+=c;})(document.documentElement);</script>
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
@@ -87,7 +87,7 @@
         </tbody>
       </table>
       <p>There is no network capability, no shell capability and no path outside the declared directory. Time is available; the clock is not writable. The same guards apply whether a plugin was loaded by a person or by an agent, and the model is designed to grow as new protocols are added without loosening the default.</p>
-      <figure class="code">
+      <figure class="code" data-reveal>
         <figcaption><span>addons/header.rhai</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
 <pre><code><span class="c">//! name: guard-admin-writes</span>
 <span class="c">//! capabilities: flow.read, flow.write, findings</span>
@@ -96,7 +96,7 @@
 
       <h2 id="hooks">Hooks</h2>
       <p>A hook is a top-level function with a well-known name. Define only the ones you need. Hooks run in flow order, one plugin after another in load order, and a hook that returns <code>halt()</code> stops the chain for that flow.</p>
-      <div class="api">
+      <div class="api" data-reveal>
         <div><div class="sig">on_request(flow)<small>flow.read</small></div><div>Called when the request headers and body have been read, before the request is sent upstream. Edits here reach the server.</div></div>
         <div><div class="sig">on_response(flow)<small>flow.read</small></div><div>Called when the response has been read, before it is sent to the client. Edits here reach the client.</div></div>
         <div><div class="sig">on_ws_message(flow, msg)<small>ws</small></div><div>Called for each WebSocket frame in either direction. <code>msg.direction</code> is <code>"client"</code> or <code>"server"</code>; <code>msg.text</code> or <code>msg.bytes</code> is editable.</div></div>
@@ -107,7 +107,7 @@
 
       <h2 id="flow">The flow API</h2>
       <p>Every hook receives a <code>flow</code>. Reading never needs more than <code>flow.read</code>; each mutating call is listed with the capability it needs.</p>
-      <div class="api">
+      <div class="api" data-reveal>
         <div><div class="sig">flow.id<small>int</small></div><div>The flow number shown everywhere else in the tool, so a finding and a UI row match.</div></div>
         <div><div class="sig">flow.state<small>string</small></div><div><code>"observed"</code>, <code>"intercepted"</code>, <code>"resumed"</code> or <code>"dropped"</code>.</div></div>
         <div><div class="sig">flow.request<small>object</small></div><div><code>.method</code>, <code>.url</code>, <code>.host</code>, <code>.path</code>, <code>.query</code> (map), <code>.headers</code>, <code>.body</code> (string or bytes), <code>.json()</code> parsed on demand.</div></div>
@@ -122,7 +122,7 @@
 
       <h2 id="findings">Findings and halting</h2>
       <p>A finding is a structured note attached to the session and, optionally, to a flow. Findings show up in the app, in <code>aitm findings list</code>, and in a saved session or <a href="poc.html">PoC</a>. <code>halt()</code> ends processing of the current flow by later plugins; it does not drop the flow unless you also answered it.</p>
-      <figure class="code">
+      <figure class="code" data-reveal>
         <figcaption><span>finding(…)</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
 <pre><code>finding(#{
     name: <span class="s">"a short, specific title"</span>,       <span class="c">// required</span>
@@ -135,7 +135,7 @@
 
       <h2 id="example">Complete example</h2>
       <p>This plugin blocks any non-<code>GET</code> request under <code>/admin</code> that arrives without an <code>X-Admin-Token</code> header, answers the client with a plain <code>403</code>, records a medium finding tied to the flow, and stops. Authenticated admin writes are marked with a header and continue.</p>
-      <figure class="code">
+      <figure class="code" data-reveal>
         <figcaption><span>addons/guard-admin-writes.rhai</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
 <pre><code><span class="c">// addons/guard-admin-writes.rhai</span>
 <span class="k">fn</span> <span class="f">on_request</span>(flow) {
@@ -214,6 +214,7 @@
   </div>
 </footer>
 
+<script src="intro.js"></script>
 <script src="site.js"></script>
 </body>
 </html>
