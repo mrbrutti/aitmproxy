@@ -195,15 +195,7 @@ async fn run() -> anyhow::Result<()> {
     if let Mode::Cli(argv) = &mode {
         // One-shot CLI dispatch (no browser needed): the same service
         // handles the frontends share, without a browser or a log file.
-        let s = tui::services(
-            &proxy,
-            &cfg,
-            None,
-            TuiLog::Off,
-            agent_state.clone(),
-            push_tx.clone(),
-            audit_ring.clone(),
-        );
+        let s = tui::services(&proxy, &cfg, None, TuiLog::Off);
         handles.bind_proxy(s.store.clone(), s.client.clone(), s.guard.clone());
         tier.error_sink
             .bind(Arc::new(Chain::new(s.registry.clone(), s.store.clone())));
@@ -240,18 +232,8 @@ async fn run() -> anyhow::Result<()> {
         }
     };
     let browser: Option<Arc<dyn BrowserDriver>> = launched.as_ref().map(|l| l.driver.clone());
-    // Shared service handles for the frontends and the replay client. The M4
-    // agent state, F4 push and F2 audit ring ride along so `tui::server` wires
-    // them into every server it builds (server path, web bridge, tui).
-    let services = tui::services(
-        &proxy,
-        &cfg,
-        browser.clone(),
-        tui_log,
-        agent_state,
-        push_tx,
-        audit_ring,
-    );
+    // Shared service handles for the frontends and the replay client.
+    let services = tui::services(&proxy, &cfg, browser.clone(), tui_log);
 
     // The scripting tier now reaches exactly the proxy's store, client and
     // guard, and a failed hook's `Event::Error` reaches the chain rather than
@@ -275,7 +257,15 @@ async fn run() -> anyhow::Result<()> {
     let result = if mode == Mode::Tui {
         tui::run(&cfg, &proxy, services).await
     } else {
-        let mcp = tui::server(&cfg, cfg.mcp.transport.clone(), &services);
+        // The bare-`aitm` server path is the dedicated agent entry point, so it
+        // carries M4's operator/agent token classes, the shared agent policy
+        // gate, the F4 push fan-out and the F2 audit ring. The web bridge and
+        // the TUI are operator frontends, built by `tui::server` without the gate.
+        let mcp = tui::server(&cfg, cfg.mcp.transport.clone(), &services)
+            .with_mcp_roles(cfg.mcp.operator_token.clone(), cfg.mcp.stdio_role)
+            .with_agent_state(agent_state)
+            .with_push(push_tx)
+            .with_audit_ring(audit_ring);
 
         // `aitm web`: a second McpServer over the same registry and services
         // (`serve` consumes the first), driven by the bridge's `handle` calls.

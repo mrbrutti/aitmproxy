@@ -1623,10 +1623,12 @@ fn agent_toggle_and_panel_follow_the_policy() {
     let _ = app.run_command("agent");
     assert_eq!(app.mode, Mode::Agent);
 
-    // No agent.status on the bus: the control is read-only and says F1.
+    // No agent.status/set on the bus: the control is read-only and says F1.
+    // Since M4 `CORE_TOOLS` carries the agent tools, so the degraded case uses a
+    // pre-F1 bus (`PRE_MERGE_TOOLS`), the standard "a missing tool degrades" list.
     let mut bare = App::new(TermCaps::full(), "x");
     let _ = bare.update(Action::Resize(200, 50));
-    let _ = connect(&mut bare, CORE_TOOLS, None);
+    let _ = connect(&mut bare, PRE_MERGE_TOOLS, None);
     let text = text_of(&bare, 200, 50);
     assert!(text.contains("Agent · n/a (F1)"), "{text}");
     let sidebar: String = line_with(&text, "  Agent")

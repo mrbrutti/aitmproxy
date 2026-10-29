@@ -270,12 +270,13 @@ fn finding_yaml_read_failure_is_shown_in_the_panel() {
 // --------------------------------------------- the honest core snapshot
 
 /// `--snapshot-core` (M-misc), re-pinned after the 2026-10-28 core merge:
-/// against the 50 core tools the screen carries the F5/F13 data the core
-/// now serves — sizes, durations, headers, the PoC library — and only the
-/// surfaces still ahead of the core (F1 agent, F3 rules, F4 push, F10
-/// sessions, M3 scripts, the F5 cookie/timing tabs) keep their labels.
+/// against the 56 core tools the screen carries the F5/F13 data the core
+/// now serves — sizes, durations, headers, the PoC library — plus the lit F1
+/// agent surface; only the surfaces still ahead of the core (F3 rules, the F4
+/// push throughput, F10 sessions, M3 scripts, the F5 cookie/timing tabs) keep
+/// their labels.
 #[test]
-fn core_fixture_render_is_lit_except_for_what_is_still_ahead_of_the_core() {
+fn core_fixture_render_is_lit_with_the_agent_surface_and_only_f3_f4_f10_still_ahead() {
     let mut app = fixture_app_core(200, 50);
     let text = text_of(&app, 200, 50);
     // Labels on the shell: what the core still lacks.
@@ -283,7 +284,8 @@ fn core_fixture_render_is_lit_except_for_what_is_still_ahead_of_the_core() {
         "Cookies (F5)",
         "Timing (F5)",
         "Set-Cookie (F5)",
-        "Agent · n/a (F1)",
+        // The live push throughput still needs the F4 stream (tools are served,
+        // but the TUI does not consume the push stream yet).
         "↑ — ↓ — (F4)",
         // Two recorded flows are paused, so the bar is the saturated one.
         "[d Kill · abort mode: reset (429/503 need F3)]",
@@ -291,6 +293,11 @@ fn core_fixture_render_is_lit_except_for_what_is_still_ahead_of_the_core() {
     ] {
         assert!(text.contains(label), "{label:?} missing:\n{text}");
     }
+    // M4 lit the agent toggle: policy and rate from the fixture's agent.
+    assert!(
+        text.contains("Agent ● all tools · 14/min"),
+        "the agent toggle is lit since M4:\n{text}"
+    );
     assert!(!text.contains("F7"), "proxy.status is on the core: {text}");
     let sidebar = |needle: &str| -> String {
         line_with(&text, needle)
@@ -300,8 +307,8 @@ fn core_fixture_render_is_lit_except_for_what_is_still_ahead_of_the_core() {
             .collect()
     };
     assert!(
-        sidebar("  Agent").ends_with("F1│"),
-        "{:?}",
+        sidebar("  Agent").ends_with("14/min│"),
+        "the agent sidebar shows the rate since M4: {:?}",
         sidebar("  Agent")
     );
     assert!(
@@ -348,19 +355,20 @@ fn core_fixture_render_is_lit_except_for_what_is_still_ahead_of_the_core() {
         !text.contains("need core follow-up F5 (flow.detail)"),
         "{text}"
     );
-    // The status bar's counts: findings counted, no agent rate.
+    // The status bar's counts: findings counted; the agent rate rides the
+    // toolbar (checked above) now that agent.status is on the core.
     let status = text.lines().last().unwrap();
     assert!(status.contains("11 / 15 rows · 2 paused · "), "{status}");
     assert!(status.contains("3 findings"), "{status}");
     assert!(
-        !text.contains("/min"),
-        "no agent rate without agent.status: {text}"
+        text.contains("14/min"),
+        "the agent rate is shown since M4: {text}"
     );
-    // The same screen in the panels.
+    // The same screen in the panels: the agent overlay is lit, not labelled.
     let _ = app.update(Action::OpenAgent);
     let text = text_of(&app, 200, 50);
     assert!(
-        text.contains("agent.status is not on this bus (core follow-up F1)"),
+        text.contains("policy: all tools · 14 actions in the last minute · 1 client(s)"),
         "{text}"
     );
     let _ = app.update(Action::Back);

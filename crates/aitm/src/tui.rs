@@ -27,10 +27,10 @@ use std::time::Duration;
 
 use aitm_bus_client::InProcessHandler;
 use aitm_core::{
-    AgentState, AuditRing, BrowserDriver, Config, FlowStore, McpTransport, PipelineClient, Proxy,
+    AgentState, BrowserDriver, Config, FlowStore, Frontend, McpTransport, PipelineClient, Proxy,
     ProxyClient, Registry, ScopeRateGuard,
 };
-use aitm_mcp::McpServer;
+use aitm_mcp::{ConnCtx, McpServer};
 use aitm_tui::{RunOptions, TransportChoice};
 use tracing::{info, warn};
 
@@ -85,17 +85,6 @@ pub struct Services {
     pub client: Arc<dyn ProxyClient>,
     pub guard: Arc<dyn ScopeRateGuard>,
     pub browser: Option<Arc<dyn BrowserDriver>>,
-    /// The agent policy state, shared with the registered `AgentPlugin` and every
-    /// `McpServer`'s policy gate so it reads the same policy `agent.set` writes
-    /// (M4 F2/D2). Carried here so [`server`] wires it into every server the
-    /// binary builds — the server path's, the web bridge's, and `aitm tui`'s.
-    pub agent_state: Arc<AgentState>,
-    /// The F4 push broadcast the `SubscriptionPlugin` feeds; each server's
-    /// dispatcher fans it to its subscribers.
-    pub push_tx: tokio::sync::broadcast::Sender<aitm_core::Event>,
-    /// The F2 command-invocation audit ring, shared with the `AgentPlugin` and
-    /// each server's `call_tool`, which records one entry per invocation.
-    pub audit_ring: Arc<AuditRing>,
     /// Where tui-mode tracing went (see [`init_tracing`]), for the startup toast.
     pub log: TuiLog,
 }
@@ -109,9 +98,6 @@ pub fn services(
     cfg: &Config,
     browser: Option<Arc<dyn BrowserDriver>>,
     log: TuiLog,
-    agent_state: Arc<AgentState>,
-    push_tx: tokio::sync::broadcast::Sender<aitm_core::Event>,
-    audit_ring: Arc<AuditRing>,
 ) -> Services {
     let registry = proxy.registry_arc();
     let store = proxy.store();
@@ -127,28 +113,24 @@ pub fn services(
         client,
         guard,
         browser,
-        agent_state,
-        push_tx,
-        audit_ring,
         log,
     }
 }
 
-/// An `McpServer` over `services` on `transport`, carrying the SSRF policy and
-/// PoC dir, the operator/agent token classes (M4 D2), and the shared agent
-/// policy state, F4 push and F2 audit ring — the one way every server in this
-/// binary is built (the server path's, the web bridge's, and both of
-/// [`build_servers`]), so the agent gate, push and audit are applied uniformly
-/// however the proxy is run.
+/// An `McpServer` over `services` on `transport`, carrying the SSRF policy
+/// and PoC dir — the one way every server in this binary is built (the
+/// server path's, and both of [`build_servers`]).
+///
+/// The M4 agent policy gate (and F4 push / F2 audit) are wired by the caller,
+/// not here, because they differ by surface: the bare-`aitm` server path and
+/// the `aitm tui` loopback **agent** transport carry the gate (seeded from
+/// `mcp.policy`); the TUI's own in-process server is the operator and bypasses
+/// it (see [`build_servers`]).
 pub fn server(cfg: &Config, transport: McpTransport, services: &Services) -> McpServer {
     McpServer::new(services.registry.clone(), transport)
         .with_ssrf_policy(cfg.browser.ssrf.clone())
         .with_poc_dir(cfg.poc.dir.clone())
-        .with_mcp_roles(cfg.mcp.operator_token.clone(), cfg.mcp.stdio_role)
         .with_config(Arc::new(cfg.clone()))
-        .with_agent_state(services.agent_state.clone())
-        .with_push(services.push_tx.clone())
-        .with_audit_ring(services.audit_ring.clone())
         .with_services(
             services.store.clone(),
             services.client.clone(),
@@ -228,7 +210,15 @@ pub fn init_tracing() -> TuiLog {
 /// Both are built by [`server`], exactly as the server path builds its one.
 pub fn build_servers(cfg: &Config, services: Services) -> (Option<McpServer>, InProcessHandler) {
     let agent = match &cfg.mcp.transport {
-        McpTransport::LoopbackTcp { .. } => Some(server(cfg, cfg.mcp.transport.clone(), &services)),
+        // The loopback transport is agent-facing, so it carries the M4 policy gate
+        // seeded from `mcp.policy` (default `auto`) and the operator/agent token
+        // classes — an external agent here is gated exactly as on the bare-`aitm`
+        // server path, not left ungated.
+        McpTransport::LoopbackTcp { .. } => Some(
+            server(cfg, cfg.mcp.transport.clone(), &services)
+                .with_agent_state(Arc::new(AgentState::new(cfg.mcp.policy)))
+                .with_mcp_roles(cfg.mcp.operator_token.clone(), cfg.mcp.stdio_role),
+        ),
         McpTransport::Stdio => {
             warn!("mcp.transport is stdio, which would share the terminal with the TUI; the agent transport is not served");
             None
@@ -236,9 +226,14 @@ pub fn build_servers(cfg: &Config, services: Services) -> (Option<McpServer>, In
     };
 
     // The TUI-facing server is never served on a transport, so the variant is
-    // only a label; `handle` is called directly through the handler.
+    // only a label; `handle` is called directly through the handler. The TUI is
+    // the operator's own control surface, so its calls run as
+    // `Frontend::Operator`, which bypasses the agent policy gate (an operator is
+    // the control) — otherwise the operator could not arm intercept, mutate or
+    // kill from their own UI.
     let ui = Arc::new(server(cfg, McpTransport::Stdio, &services));
-    let handler: InProcessHandler = Arc::new(move |line: &str| ui.handle(line));
+    let handler: InProcessHandler =
+        Arc::new(move |line: &str| ui.handle_on(&ConnCtx::new(Frontend::Operator), line));
     (agent, handler)
 }
 
