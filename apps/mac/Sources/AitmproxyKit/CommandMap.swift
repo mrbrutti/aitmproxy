@@ -169,6 +169,7 @@ public enum CommandMap {
             E("Proxy", "Certificate Authority…", nil, items: one("Certificate Authority…", nil)),
             E("Proxy", "Configuration…", nil, items: one("Configuration…", nil)),
             E("Proxy", "Browser", "⇧⌘W", items: one("Browser", "⇧⌘W")),
+            E("Proxy", "Core Log…", "⌃⌘L", items: toggle(["Core Log…", "Hide Core Log"], "⌃⌘L")),
         ]
     }()
 

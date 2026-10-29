@@ -208,6 +208,8 @@ struct FlowCommands: Commands {
             Button("Connection Log") { session.show(.connections) }
             Button("Certificate Authority…") { session.show(.ca) }
             Button("Configuration…") { session.show(.config) }
+            Button(session.coreLogVisible ? "Hide Core Log" : "Core Log…") { session.coreLogVisible.toggle() }
+                .keyboardShortcut("l", modifiers: [.command, .control])
         }
         CommandMenu("Agent") {
             Picker("Policy", selection: Binding(get: { session.agentPolicy }, set: { session.activity.choose($0) })) {

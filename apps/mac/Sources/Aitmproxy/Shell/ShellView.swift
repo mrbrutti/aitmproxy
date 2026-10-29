@@ -84,7 +84,7 @@ struct ShellView: View {
                 // let it hand the bus its endpoint. An operator with a config.yaml
                 // bus keeps today's external path; the switchable choice is Task 7.
                 if BusService.resolveEndpoint() == nil,
-                   let controller = EmbeddedCoreController(coreID: session.activeCoreID, bus: service) {
+                   let controller = EmbeddedCoreController(coreID: session.activeCoreID, bus: service, health: session.coreHealth) {
                     controller.start()
                     embeddedCore = controller
                 }
@@ -108,6 +108,9 @@ struct MainView: View {
             if session.activityLogVisible {
                 VRule()
                 ActivityLogPanel(state: session.activity).frame(width: ActivityLogPanel.panelWidth)
+            }
+            if session.coreLogVisible {
+                CoreLogPanel().environment(session).themed()
             }
         }
         .sheet(item: Binding(get: { session.buildPoCFlowID.map(BuildPoCTarget.init) }, set: { session.buildPoCFlowID = $0?.id })) { target in

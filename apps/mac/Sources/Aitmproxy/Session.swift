@@ -281,6 +281,12 @@ final class Session {
     @ObservationIgnored lazy var browser = BrowserState(session: self)
     @ObservationIgnored lazy var activity = ActivityState(session: self)
     var activityLogVisible = false
+    /// The embedded core's health and captured logs (Task 8): the status-bar
+    /// health dot and the on-demand core-log panel read this. The
+    /// `EmbeddedCoreController` fills it; `nil` connection means no embedded core.
+    @ObservationIgnored lazy var coreHealth = CoreHealthState()
+    /// Proxy ▸ Core Log (⌃⌘L) toggles the on-demand core-log panel.
+    var coreLogVisible = false
     /// The flow a Build PoC sheet is for (S-053).
     var buildPoCFlowID: FlowID?
 
