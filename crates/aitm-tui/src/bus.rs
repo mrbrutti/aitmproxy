@@ -251,6 +251,17 @@ impl Session {
                     self.emit(BusEvent::Agent(a)).await?;
                 }
             }
+            if self.has("l4.scope.list") {
+                if let Value::Array(entries) = self.panel("l4.scope.list").await? {
+                    self.emit(BusEvent::L4Scope(entries)).await?;
+                }
+            }
+            if self.has("l4.agent.status") {
+                let v = self.panel("l4.agent.status").await?;
+                if v.is_object() {
+                    self.emit(BusEvent::L4Agent(v)).await?;
+                }
+            }
             if self.has("poc.list") {
                 if let Value::Array(items) = self.panel("poc.list").await? {
                     let findings = items.iter().filter_map(Finding::from_json).collect();
@@ -266,7 +277,37 @@ impl Session {
             }
             self.proxy_status().await?;
         }
+        // The L4 flow pass (ui-ext Part 3), feature-detected and polled every
+        // pass like the HTTP flow list; absent on a bus without the `l4.*`
+        // surface. Last, so it never reorders the HTTP fast/slow sequence.
+        if self.has("l4.flow.list") && self.has("l4.flow.get") {
+            self.l4_poll().await?;
+        }
         Ok(())
+    }
+
+    /// One pass over the L4 flow store (ui-ext Part 3): `l4.flow.list` → ids,
+    /// `l4.flow.get` per id. A per-flow tool error is skipped (the flow keeps
+    /// what the app has); only a dead transport ends the session.
+    async fn l4_poll(&mut self) -> Result<(), Outcome> {
+        let ids = match self.client.call("l4.flow.list", json!({})).await {
+            Ok(Value::Array(ids)) => ids
+                .into_iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>(),
+            Ok(_) => Vec::new(),
+            Err(BusError::Transport(e)) => return Err(Outcome::Lost(format!("{e:#}"))),
+            Err(e) => return self.call_failed("l4.flow.list", e).await,
+        };
+        let mut flows = Vec::with_capacity(ids.len());
+        for id in &ids {
+            match self.client.call("l4.flow.get", json!({ "id": id })).await {
+                Ok(v) => flows.push(v),
+                Err(BusError::Transport(e)) => return Err(Outcome::Lost(format!("{e:#}"))),
+                Err(_) => {}
+            }
+        }
+        self.emit(BusEvent::L4Flows(flows)).await
     }
 
     /// Read a slow-changing panel. A transport failure ends the session like
