@@ -96,6 +96,13 @@ impl Command for ScopeAdd {
         });
         Ok(Value::Str(entry))
     }
+
+    fn summarize(&self, _args: &Params, result: &Value) -> Option<String> {
+        match result {
+            Value::Str(host) => Some(format!("added {host} to scope")),
+            _ => None,
+        }
+    }
 }
 
 /// `scope.remove {host}` → remove a scope entry; returns whether one was removed.

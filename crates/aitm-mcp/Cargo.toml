@@ -14,6 +14,7 @@ tokio = { workspace = true, features = ["io-util", "io-std", "net", "rt", "sync"
 
 [dev-dependencies]
 aitm-plugins.workspace = true
+aitm-poc.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 

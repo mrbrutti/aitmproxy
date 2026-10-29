@@ -1006,11 +1006,20 @@ impl McpServer {
             Some(cfg) => host.with_config(cfg.clone()),
             None => host,
         };
+        // `summarize` reads the args and result, so keep a copy of the typed args
+        // before `invoke` consumes them (D3b).
+        let args_for_summary = args.clone();
         Ok(match cmd.invoke(args, &host) {
             Ok(value) => {
+                // `structuredContent` stays the exact machine value (contract
+                // unchanged); only `content` text becomes a readable rendering —
+                // the one-line summary (when the command provides one) plus pretty,
+                // stable-key JSON — so the agent transcript reads cleanly (D3b).
                 let structured = to_json(&value);
+                let summary = cmd.summarize(&args_for_summary, &value);
+                let text = crate::render::render_content(summary.as_deref(), &structured);
                 json!({
-                    "content": [{"type": "text", "text": structured.to_string()}],
+                    "content": [{"type": "text", "text": text}],
                     "structuredContent": structured,
                     "isError": false,
                 })

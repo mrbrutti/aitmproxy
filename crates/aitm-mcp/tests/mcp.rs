@@ -1891,7 +1891,10 @@ fn confirm_token_wrong_or_expired_or_replayed_refused() {
         "demo.confirm",
         json!({ "_confirm": token }),
     );
-    assert!(is_refused(&expired), "an expired token is refused: {expired}");
+    assert!(
+        is_refused(&expired),
+        "an expired token is refused: {expired}"
+    );
     assert_eq!(ran.load(AtomicOrdering::SeqCst), 0);
 }
 
@@ -1929,7 +1932,186 @@ fn agent_gets_no_confirm_handshake() {
     }));
     let srv = confirm_server(Arc::new(reg), Some(config_gates_on()), None);
     let on = call_as(&srv, Frontend::Mcp, "ca.install");
-    assert!(!is_refused(&on), "agent ca.install with the gate on runs: {on}");
+    assert!(
+        !is_refused(&on),
+        "agent ca.install with the gate on runs: {on}"
+    );
     assert_eq!(on["result"]["structuredContent"], json!("ran"));
     assert_eq!(ran.load(AtomicOrdering::SeqCst), 1);
+}
+
+// ----------------------------------------- M4 Task 6: result rendering (D3b)
+
+use aitm_plugins::{MutatePlugin, ReplayPlugin, ScopePlugin};
+
+/// Build a typed argument bag from `(name, value)` pairs.
+fn params(pairs: &[(&str, Value)]) -> Params {
+    Params::new(
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect(),
+    )
+}
+
+/// A `poc.run`-shaped result value (verdict + the three artifacts + evaluated).
+fn poc_shaped_value() -> Value {
+    let mut obj = BTreeMap::new();
+    obj.insert("passed".to_string(), Value::Bool(true));
+    obj.insert(
+        "finding_capture".to_string(),
+        Value::Str("cap-1".to_string()),
+    );
+    obj.insert(
+        "poc_path".to_string(),
+        Value::Str("/x/poc.yaml".to_string()),
+    );
+    obj.insert(
+        "screenshot_path".to_string(),
+        Value::Str("/x/shot.png".to_string()),
+    );
+    let mut ev = BTreeMap::new();
+    ev.insert(
+        "assertion".to_string(),
+        Value::Str("status == 200".to_string()),
+    );
+    ev.insert("matched".to_string(), Value::Bool(true));
+    obj.insert(
+        "evaluated".to_string(),
+        Value::Array(vec![Value::Object(ev)]),
+    );
+    Value::Object(obj)
+}
+
+/// A command that returns a `poc.run`-shaped result and a one-line summary, so the
+/// render path (summary + pretty JSON; `structuredContent` unchanged) can be
+/// asserted without running a real PoC.
+struct PocShapedCmd;
+
+impl Command for PocShapedCmd {
+    fn name(&self) -> &str {
+        "demo.poc"
+    }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
+    }
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "Returns a poc.run-shaped result.".into(),
+            params: vec![],
+            result: TypeDesc::Any,
+        }
+    }
+    fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+        Ok(poc_shaped_value())
+    }
+    fn summarize(&self, _args: &Params, _result: &Value) -> Option<String> {
+        Some("PoC passed — 3 artifacts".into())
+    }
+}
+
+/// AC-M4-8b: a success result's `content` text is the summary line followed by
+/// pretty, indented JSON, while `structuredContent` is the exact machine value.
+#[test]
+fn content_is_formatted_summary_plus_pretty() {
+    let mut reg = Registry::new();
+    reg.add_command(Arc::new(PocShapedCmd));
+    let srv = McpServer::new(Arc::new(reg), McpTransport::Stdio)
+        .with_agent_state(ungated())
+        .with_services(
+            Arc::new(MemFlowStore::new()),
+            Arc::new(StubClient),
+            Arc::new(StdGuard::default()),
+            None,
+        );
+
+    let resp = rpc(
+        &srv,
+        1,
+        "tools/call",
+        json!({"name": "demo.poc", "arguments": {}}),
+    );
+    assert_eq!(resp["result"]["isError"], json!(false));
+
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("content text");
+    // Starts with the summary line.
+    assert!(
+        text.starts_with("PoC passed — 3 artifacts\n"),
+        "content must open with the summary line: {text}"
+    );
+    // Contains indented (pretty) JSON, not a jammed one-liner.
+    assert!(
+        text.contains("\n  \""),
+        "content must contain indented JSON: {text}"
+    );
+    assert!(
+        text.contains("\"passed\": true"),
+        "pretty JSON names the verdict: {text}"
+    );
+
+    // `structuredContent` is the exact machine value, byte-for-byte (the raw
+    // value, not the rendered text).
+    assert_eq!(
+        resp["result"]["structuredContent"],
+        json!({
+            "passed": true,
+            "finding_capture": "cap-1",
+            "poc_path": "/x/poc.yaml",
+            "screenshot_path": "/x/shot.png",
+            "evaluated": [{"assertion": "status == 200", "matched": true}],
+        })
+    );
+    // And it is distinct from the rendered content text.
+    assert_ne!(
+        resp["result"]["structuredContent"].to_string(),
+        text,
+        "the structured value and the rendered text differ"
+    );
+}
+
+/// AC-M4-8b: the representative set (`flow.replay`, `request.send`, `scope.add`,
+/// `poc.run`) each provide a real `summarize`, grounded in their result fields.
+#[test]
+fn summarize_present_for_representative_set() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(ReplayPlugin::new()));
+    reg.add_plugin(Box::new(MutatePlugin));
+    reg.add_plugin(Box::new(ScopePlugin::new(true)));
+    reg.add_command(Arc::new(aitm_poc::PocRunCommand));
+
+    let src = aitm_core::FlowId::new().to_string();
+    let new = aitm_core::FlowId::new().to_string();
+
+    let replay = reg.command("flow.replay").expect("flow.replay registered");
+    assert!(replay
+        .summarize(
+            &params(&[("id", Value::Str(src.clone()))]),
+            &Value::Str(new.clone()),
+        )
+        .is_some());
+
+    let send = reg
+        .command("request.send")
+        .expect("request.send registered");
+    assert!(send
+        .summarize(
+            &params(&[("authority", Value::Str("api.example.com:443".into()))]),
+            &Value::Str(new.clone()),
+        )
+        .is_some());
+
+    let add = reg.command("scope.add").expect("scope.add registered");
+    assert!(add
+        .summarize(
+            &params(&[("host", Value::Str("example.com".into()))]),
+            &Value::Str("example.com".into()),
+        )
+        .is_some());
+
+    let run = reg.command("poc.run").expect("poc.run registered");
+    assert!(run
+        .summarize(&Params::default(), &poc_shaped_value())
+        .is_some());
 }
