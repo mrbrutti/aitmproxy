@@ -276,6 +276,13 @@ pub struct L4Guard {
     /// of "an entry contained within the dangerous range"; it can never globally
     /// disable the denylist (an explicit covering entry is still required).
     dangerous_dst_override: bool,
+    /// Whether a runtime (bus/MCP) caller may widen the deny-by-default scope via
+    /// [`add_runtime_scope`](L4Guard::add_runtime_scope). Comes from
+    /// `L4Config::allow_agent_widen` (default false). SEC-2 lives **here**, at the
+    /// security boundary — not in a command wrapper — so no in-process caller of the
+    /// shared guard can widen scope, or mint operator provenance, while the operator
+    /// has runtime widening off.
+    allow_agent_widen: bool,
     in_flight: Arc<AtomicU32>,
 }
 
@@ -294,6 +301,7 @@ impl L4Guard {
             max_packet_bytes: cfg.max_packet_bytes,
             max_packets_per_call: cfg.max_packets_per_call,
             dangerous_dst_override: cfg.dangerous_dst_override,
+            allow_agent_widen: cfg.allow_agent_widen,
             in_flight: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -401,14 +409,40 @@ impl L4Guard {
         })
     }
 
-    /// Add a scope entry; returns its id.
-    pub fn add_scope(&self, entry: L4ScopeEntry) -> Result<L4ScopeId, L4GuardError> {
+    /// Add a **runtime** (bus/MCP) scope entry — the one public widening path, and the
+    /// place SEC-2 is enforced. It refuses with [`L4GuardError::ScopeWideningDisabled`]
+    /// unless `allow_agent_widen` is set, and it forces `source = Runtime` so a runtime
+    /// caller can never mint operator (`Config`) provenance — the provenance the
+    /// dangerous-destination denylist trusts to be liftable. Because the gate and the
+    /// forced provenance live in the guard, a second in-process caller of the shared
+    /// guard cannot bypass them (the bug the command-wrapper-only check left open).
+    /// Returns the entry's id.
+    pub fn add_runtime_scope(&self, mut entry: L4ScopeEntry) -> Result<L4ScopeId, L4GuardError> {
+        if !self.allow_agent_widen {
+            return Err(L4GuardError::ScopeWideningDisabled);
+        }
+        entry.source = L4ScopeSource::Runtime;
+        Ok(self.push_scope(entry))
+    }
+
+    /// Seed a scope entry directly, trusting the caller's `source` — a **test-only**
+    /// helper (production config scope is seeded straight into the list by
+    /// [`L4Guard::new`]). A runtime widening path must go through
+    /// [`add_runtime_scope`](L4Guard::add_runtime_scope), which enforces SEC-2.
+    #[cfg(test)]
+    pub(crate) fn add_scope(&self, entry: L4ScopeEntry) -> Result<L4ScopeId, L4GuardError> {
+        Ok(self.push_scope(entry))
+    }
+
+    /// Push an entry onto the scope list; returns its id. The single mutation point
+    /// both add paths funnel through.
+    fn push_scope(&self, entry: L4ScopeEntry) -> L4ScopeId {
         let id = entry.id;
         self.scope
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .push(entry);
-        Ok(id)
+        id
     }
 
     /// Remove the scope entry with the given id; returns whether one was removed.
@@ -923,6 +957,66 @@ mod tests {
         assert!(
             g.check(L4Action::Inject, &t).is_ok(),
             "a config-declared entry must still lift the denylist"
+        );
+    }
+
+    /// I12 / SEC-2 — the widen gate lives in the guard: `add_runtime_scope` refuses
+    /// with `ScopeWideningDisabled` when `allow_agent_widen` is off (the default), and
+    /// adds nothing. This holds for any caller of the shared guard, not just the
+    /// `l4.scope.add` command wrapper.
+    #[test]
+    fn add_runtime_scope_refused_when_widen_disabled() {
+        let g = L4Guard::new(&cfg()); // default ⇒ allow_agent_widen false
+        let e = entry(
+            ("127.0.0.1", 32),
+            "lo0",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (100, 100),
+        );
+        assert_eq!(
+            g.add_runtime_scope(e).unwrap_err(),
+            L4GuardError::ScopeWideningDisabled
+        );
+        assert!(
+            g.list_scope().is_empty(),
+            "a refused runtime add widens nothing"
+        );
+    }
+
+    /// I12 / SEC-2 — `add_runtime_scope` forces `source = Runtime` in the guard, so a
+    /// runtime caller cannot mint operator (`Config`) provenance even by passing a
+    /// `Config`-sourced entry: the forced Runtime source means the denylist is not
+    /// lifted, override notwithstanding.
+    #[test]
+    fn add_runtime_scope_forces_runtime_source() {
+        let mut c = cfg();
+        c.allow_agent_widen = true;
+        c.dangerous_dst_override = true;
+        let g = L4Guard::new(&c);
+
+        // A caller passes a Config-sourced /32 covering the cloud-metadata address.
+        let mut spoofed = entry(
+            ("169.254.169.254", 32),
+            "eth0",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (100, 100),
+        );
+        spoofed.source = L4ScopeSource::Config;
+        g.add_runtime_scope(spoofed).unwrap();
+
+        // The guard forced it to Runtime, so the denylist still blocks the target.
+        let t = target("eth0", L4Direction::Outbound, "169.254.169.254", 80);
+        assert_eq!(
+            g.check(L4Action::Inject, &t).unwrap_err(),
+            L4GuardError::DangerousDestinationBlocked("169.254.169.254".into()),
+            "a runtime add must not mint Config provenance that lifts the denylist"
+        );
+        assert_eq!(
+            g.list_scope()[0].source,
+            L4ScopeSource::Runtime,
+            "the stored entry is forced to Runtime provenance"
         );
     }
 
