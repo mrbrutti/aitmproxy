@@ -1266,3 +1266,131 @@ async fn script_save_is_sensitive() {
     assert_eq!(cmd.sensitivity(), Sensitivity::Sensitive);
     assert!(cmd.mutates());
 }
+
+// ---------------------------------------------------------------------------
+// F8 Task 6: the `allow_agent_authoring` flag gate and explicit sensitivities.
+// This is the always-on per-command dimension; `AgentPolicy` (All/Auto/Ask/...)
+// is the dispatcher's and is tested there.
+// ---------------------------------------------------------------------------
+
+/// The four authoring commands with arguments that would succeed against the
+/// harness below (`versioned` loaded, `scripts_dir` set).
+fn authoring_calls() -> Vec<(&'static str, Params)> {
+    let name = params(&[("name", Value::Str("versioned".into()))]);
+    vec![
+        ("script.save", save_args("gated", SAVED_NEW)),
+        ("script.reload", name.clone()),
+        ("script.enable", name.clone()),
+        ("script.disable", name),
+    ]
+}
+
+/// A harness with one loaded script and a scripts dir, so every authoring
+/// command can succeed once past the gate. Keeps the temp files alive.
+fn gate_harness(allow_agent_authoring: bool) -> (Harness, TempScript, Sandbox) {
+    let script = TempScript::new("versioned", V1);
+    let sandbox = Sandbox::new();
+    let h = Harness::with_config(RhaiConfig {
+        scripts: vec![ScriptEntry::new(script.path())],
+        scripts_dir: Some(sandbox.scripts()),
+        allow_agent_authoring,
+        ..RhaiConfig::default()
+    });
+    (h, script, sandbox)
+}
+
+/// AC8: an agent frontend with the flag off is refused on every authoring
+/// command, and the refusal names the key an operator must set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_authoring_is_refused_when_the_flag_is_off() {
+    let (h, _script, sandbox) = gate_harness(false);
+    let before = sandbox.tree();
+    for (cmd, args) in authoring_calls() {
+        let err = h
+            .invoke_as(Frontend::Mcp, None, cmd, args)
+            .expect_err(&format!("{cmd} refused for an agent with the flag off"));
+        assert!(
+            err.to_string().contains("rhai.allow_agent_authoring"),
+            "{cmd}: {err}"
+        );
+    }
+    assert_eq!(sandbox.tree(), before, "a refused save writes nothing");
+    assert!(
+        h.handles[0].is_enabled(),
+        "a refused disable changed nothing"
+    );
+}
+
+/// AC8: with the flag on, an agent frontend passes the gate on each command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_authoring_passes_the_gate_when_the_flag_is_on() {
+    let (h, _script, sandbox) = gate_harness(true);
+    for (cmd, args) in authoring_calls() {
+        h.invoke_as(Frontend::Mcp, None, cmd, args)
+            .unwrap_or_else(|e| panic!("{cmd} allowed for an agent with the flag on: {e}"));
+    }
+    assert!(sandbox.scripts().join("gated.rhai").exists());
+    assert!(!h.handles[0].is_enabled(), "the last call, disable, ran");
+}
+
+/// AC8: the human CLI authors freely, flag off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_authoring_is_allowed_regardless_of_the_flag() {
+    let (h, _script, sandbox) = gate_harness(false);
+    for (cmd, args) in authoring_calls() {
+        h.invoke_as(Frontend::Cli, None, cmd, args)
+            .unwrap_or_else(|e| panic!("{cmd} allowed for the CLI with the flag off: {e}"));
+    }
+    assert!(sandbox.scripts().join("gated.rhai").exists());
+}
+
+/// Spec-critical: a human operator (operator-token connection) authors
+/// freely with the flag off — only an autonomous agent is gated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operator_authoring_is_allowed_regardless_of_the_flag() {
+    let (h, _script, sandbox) = gate_harness(false);
+    for (cmd, args) in authoring_calls() {
+        h.invoke_as(Frontend::Operator, None, cmd, args)
+            .unwrap_or_else(|e| panic!("{cmd} allowed for an operator with the flag off: {e}"));
+    }
+    assert!(sandbox.scripts().join("gated.rhai").exists());
+}
+
+/// AC8: the Read commands are never gated; an agent lists and validates with
+/// the flag off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_read_commands_are_not_gated() {
+    let (h, _script, _sandbox) = gate_harness(false);
+    let listed = h
+        .invoke_as(Frontend::Mcp, None, "script.list", params(&[]))
+        .expect("script.list is not gated");
+    assert!(
+        matches!(listed, Value::Array(ref a) if a.len() == 1),
+        "{listed:?}"
+    );
+    h.invoke_as(
+        Frontend::Mcp,
+        None,
+        "script.validate",
+        params(&[("source", Value::Str(SAVED_NEW.into()))]),
+    )
+    .expect("script.validate { source } is not gated");
+}
+
+/// AC9: `Sensitive` for the authoring commands, `Read` for the rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_commands_declare_their_sensitivity() {
+    let h = Harness::new(Vec::new());
+    let sensitivity = |name: &str| h.registry.command(name).expect("registered").sensitivity();
+    for name in [
+        "script.save",
+        "script.reload",
+        "script.enable",
+        "script.disable",
+    ] {
+        assert_eq!(sensitivity(name), Sensitivity::Sensitive, "{name}");
+    }
+    for name in ["script.list", "script.validate", "script.findings"] {
+        assert_eq!(sensitivity(name), Sensitivity::Read, "{name}");
+    }
+}

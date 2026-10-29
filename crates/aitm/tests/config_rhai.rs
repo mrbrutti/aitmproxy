@@ -197,6 +197,30 @@ fn scripts_dir_is_read_from_the_rhai_section() {
     );
 }
 
+/// F8 Task 6: `rhai.allow_agent_authoring` is read off the file and is off
+/// unless written.
+#[test]
+fn allow_agent_authoring_is_read_from_the_rhai_section() {
+    assert!(
+        settings("rhai:\n  allow_agent_authoring: true\n")
+            .rhai
+            .allow_agent_authoring,
+        "a `rhai.allow_agent_authoring: true` key reaches RhaiConfig"
+    );
+    assert!(
+        !settings("rhai:\n  strict: true\n")
+            .rhai
+            .allow_agent_authoring,
+        "absent in the rhai section defaults to false"
+    );
+    assert!(
+        !settings("listen: \"127.0.0.1:8080\"\n")
+            .rhai
+            .allow_agent_authoring,
+        "no rhai section defaults to false"
+    );
+}
+
 /// F8b persistence seam: every `*.rhai` in `scripts_dir` becomes an enabled
 /// entry after the declared ones, so a script `script.save` wrote loads on the
 /// next start. Other files are ignored.

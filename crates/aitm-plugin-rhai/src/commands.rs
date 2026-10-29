@@ -33,6 +33,12 @@
 //!   (see [`Save`] for the confinement and the overwrite-live / new-name split)
 //!   and answers `{ name, path, api, hooks, registers, restart_required }`.
 //!   `Sensitive`.
+//!
+//! **Agent gating.** `save`, `reload`, `enable` and `disable` are `Sensitive`
+//! (so `AgentPolicy` parks them under Ask) and additionally refuse a
+//! `Frontend::Mcp` caller unless `rhai.allow_agent_authoring` is set; the
+//! human CLI and an operator connection are never gated by the flag.
+//! `list`, `validate` and `findings` are `Read` and never gated.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -100,10 +106,12 @@ impl Plugin for ScriptCommands {
             errors: Arc::clone(&self.errors),
         }));
         reg.add_command(Arc::new(Toggle {
+            loader: Arc::clone(&self.loader),
             scripts: self.scripts.clone(),
             enable: true,
         }));
         reg.add_command(Arc::new(Toggle {
+            loader: Arc::clone(&self.loader),
             scripts: self.scripts.clone(),
             enable: false,
         }));
@@ -134,6 +142,7 @@ struct List {
 /// type, two registered commands, so the lookup and the answer shape cannot
 /// drift apart.
 struct Toggle {
+    loader: Arc<RhaiLoader>,
     scripts: Vec<Arc<ScriptHandle>>,
     enable: bool,
 }
@@ -194,6 +203,10 @@ impl Command for Validate {
         }
     }
 
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
+    }
+
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         match (
             optional_text(&args, "path")?,
@@ -237,6 +250,23 @@ impl Command for Validate {
             }
         }
     }
+}
+
+/// The per-command, always-on gate for the authoring commands (`save`,
+/// `reload`, `enable`, `disable`), independent of `AgentPolicy`: a human
+/// operator (`Frontend::Operator`) and the human CLI author freely; only an
+/// autonomous agent (`Frontend::Mcp`) is gated, by `rhai.allow_agent_authoring`.
+/// This deliberately exempts `Frontend::Operator`, unlike the map-rules gate,
+/// which exempts only `Cli`.
+fn check_agent_gate(host: &CommandHost, allow_agent_authoring: bool) -> anyhow::Result<()> {
+    if host.frontend() == Frontend::Mcp && !allow_agent_authoring {
+        anyhow::bail!(
+            "script authoring refused: an agent frontend may not author scripts. \
+             Set rhai.allow_agent_authoring = true in the aitmproxy config to allow it, \
+             or author from the human CLI / operator UI."
+        );
+    }
+    Ok(())
 }
 
 /// Keep `script.validate` from being a file-existence / content-disclosure
@@ -285,7 +315,12 @@ impl Command for Reload {
         }
     }
 
-    fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Sensitive
+    }
+
+    fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        check_agent_gate(host, self.loader.allow_agent_authoring())?;
         let name = text(&args, "name")?;
         let handle = find_script(&self.scripts, &name)?;
         let (ast, meta) = self
@@ -339,7 +374,8 @@ impl Command for Toggle {
         Sensitivity::Sensitive
     }
 
-    fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+    fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        check_agent_gate(host, self.loader.allow_agent_authoring())?;
         let name = text(&args, "name")?;
         let handle = find_script(&self.scripts, &name)?;
         handle.set_enabled(self.enable);
@@ -464,7 +500,8 @@ impl Command for Save {
         Sensitivity::Sensitive
     }
 
-    fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+    fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        check_agent_gate(host, self.loader.allow_agent_authoring())?;
         // Every refusal below happens before the disk is touched.
         let name = optional_text(&args, "name")?.unwrap_or_default();
         if !is_script_name(&name) {
@@ -565,6 +602,10 @@ impl Command for ScriptFindings {
             )],
             result: TypeDesc::Any,
         }
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
     }
 
     fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {

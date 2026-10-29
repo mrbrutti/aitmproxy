@@ -28,6 +28,11 @@ pub struct RhaiConfig {
     /// (the default) refuses `script.save` outright — authoring scripts from a
     /// client is the operator's opt-in, like `allow_scope_add` and `poc.dir`.
     pub scripts_dir: Option<PathBuf>,
+    /// Let an agent frontend (`Frontend::Mcp`) author scripts: `script.save`,
+    /// `script.reload`, `script.enable`, `script.disable`. Off by default; the
+    /// human CLI and an operator-token connection are never gated by it. This
+    /// is the always-on per-command gate, independent of `AgentPolicy`.
+    pub allow_agent_authoring: bool,
     /// The SSRF posture `browser.navigate` checks a target against — the
     /// host's own policy (`browser.ssrf` in the main config), so a script's
     /// navigation and the `browser.navigate` command decide alike.
@@ -48,6 +53,7 @@ impl Default for RhaiConfig {
             strict: false,
             allow_scope_add: false,
             scripts_dir: None,
+            allow_agent_authoring: false,
             ssrf: SsrfPolicy::default(),
         }
     }

@@ -335,6 +335,9 @@ struct RhaiFile {
     /// The directory `script.save` writes `<name>.rhai` into, and whose `*.rhai`
     /// files load at startup. Unset refuses `script.save`.
     scripts_dir: Option<PathBuf>,
+    /// Let an agent frontend (MCP) run `script.save`/`reload`/`enable`/`disable`
+    /// (off by default; the human CLI and operator UI are never gated).
+    allow_agent_authoring: Option<bool>,
     /// Seconds a single hook may run before it is aborted.
     hook_timeout: Option<u64>,
     max_operations: Option<u64>,
@@ -354,6 +357,7 @@ impl RhaiFile {
         if let Some(dir) = self.scripts_dir {
             r.scripts_dir = Some(dir);
         }
+        set(&mut r.allow_agent_authoring, self.allow_agent_authoring);
         set_secs(&mut r.hook_timeout, self.hook_timeout);
         let l = &mut r.limits;
         set(&mut l.max_operations, self.max_operations);

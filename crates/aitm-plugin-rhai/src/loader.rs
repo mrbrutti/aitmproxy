@@ -180,6 +180,12 @@ impl RhaiLoader {
         self.cfg.scripts_dir.as_deref()
     }
 
+    /// Whether an agent frontend may run the script-authoring commands
+    /// (`rhai.allow_agent_authoring`; off by default).
+    pub fn allow_agent_authoring(&self) -> bool {
+        self.cfg.allow_agent_authoring
+    }
+
     /// The run budget the configuration gives every hook, step and command.
     pub fn budget(&self) -> Budget {
         Budget::of(&self.cfg)
