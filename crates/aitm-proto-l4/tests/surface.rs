@@ -69,6 +69,9 @@ fn enabled_cfg() -> L4Config {
     L4Config {
         enabled: true,
         intercept: Some(InterceptConfig::default()),
+        // These exit-gate tests drive the real `l4.scope.add` round-trip, so they
+        // opt into runtime scope widening (the gate itself is covered in `module.rs`).
+        allow_agent_widen: true,
         ..L4Config::default()
     }
 }

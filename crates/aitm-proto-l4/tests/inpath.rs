@@ -64,6 +64,8 @@ fn enabled_cfg(queue_num: u16) -> L4Config {
             max_parked: 256,
             on_overflow: Verdict::Forward,
         }),
+        // Drives the real `l4.scope.add` round-trip ⇒ opt into runtime widening.
+        allow_agent_widen: true,
         ..L4Config::default()
     }
 }

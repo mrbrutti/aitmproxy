@@ -222,6 +222,10 @@ pub struct L4Module {
     sessions: Arc<InterceptSessions>,
     /// The cached startup capability probe: wire verbs are gated on it, fail-closed.
     privilege: L4Privilege,
+    /// Whether a runtime bus caller may widen the deny-by-default scope via
+    /// `l4.scope.add`. Comes from `L4Config::allow_agent_widen` (default false);
+    /// handed to [`ScopeAdd`](crate::commands::ScopeAdd) at registration.
+    allow_agent_widen: bool,
 }
 
 impl L4Module {
@@ -244,6 +248,7 @@ impl L4Module {
             intercept_cfg: cfg.intercept.clone(),
             sessions: Arc::new(InterceptSessions::new()),
             privilege,
+            allow_agent_widen: cfg.allow_agent_widen,
         }
     }
 
@@ -263,6 +268,9 @@ impl L4Module {
             intercept_cfg,
             sessions: Arc::new(InterceptSessions::new()),
             privilege: L4Privilege::available(),
+            // Deny-by-default: a parts-wired module keeps runtime scope widening off
+            // unless the owner opts in via the config path (`with_privilege`).
+            allow_agent_widen: false,
         }
     }
 
@@ -287,7 +295,9 @@ impl Plugin for L4Module {
     fn load(&mut self, reg: &mut Registry) {
         // The pure/read verbs (`l4.interfaces`, `l4.scope.*`, `l4.flow.*`, `l4.craft`)
         // work regardless of privilege — never gated.
-        for cmd in crate::commands::active_commands(self.guard(), self.store()) {
+        for cmd in
+            crate::commands::active_commands(self.guard(), self.store(), self.allow_agent_widen)
+        {
             reg.add_command(cmd);
         }
         // M5 Task 10 — the wire-touching commands (`l4.capture.*`, `l4.inject`,
@@ -462,7 +472,14 @@ mod tests {
     /// add result is its id.
     #[test]
     fn scope_add_then_list() {
-        let (reg, guard, _s) = registered(&L4Config::default());
+        // This test exercises the runtime add→list round-trip, so it opts into
+        // scope widening; the gate itself is covered by
+        // `scope_add_refused_when_widen_disabled`.
+        let cfg = L4Config {
+            allow_agent_widen: true,
+            ..L4Config::default()
+        };
+        let (reg, guard, _s) = registered(&cfg);
         let store = MemFlowStore::new();
         let client = StubClient;
         let core_guard = StdGuard::default();
@@ -513,7 +530,12 @@ mod tests {
     /// `l4.scope.remove` by id reverts to deny-by-default; an unknown id ⇒ `false`.
     #[test]
     fn scope_remove_by_id() {
-        let (reg, guard, _s) = registered(&L4Config::default());
+        // Needs a runtime add to then remove ⇒ opt into widening.
+        let cfg = L4Config {
+            allow_agent_widen: true,
+            ..L4Config::default()
+        };
+        let (reg, guard, _s) = registered(&cfg);
         let store = MemFlowStore::new();
         let client = StubClient;
         let core_guard = StdGuard::default();
@@ -553,6 +575,106 @@ mod tests {
             .invoke(Params::new(m), &h)
             .expect("remove ok");
         assert_eq!(removed, Value::Bool(false));
+    }
+
+    /// A single operator-declared scope entry (on `eth0`, `10.0.0.0/8`), carrying
+    /// `source: Config`, so tests can prove it survives a refused runtime add.
+    fn config_declared_entry() -> crate::types::L4ScopeEntry {
+        use crate::types::{IpCidr, L4ScopeEntry, L4ScopeId, L4ScopeSource, PortRange, RateCap};
+        L4ScopeEntry {
+            id: L4ScopeId::new(),
+            cidr: IpCidr {
+                addr: "10.0.0.0".parse().unwrap(),
+                prefix: 8,
+            },
+            ports: PortRange { lo: 0, hi: 65535 },
+            interface: "eth0".to_string(),
+            direction: crate::types::L4Direction::Outbound,
+            capability: crate::types::L4Capability::Inject,
+            inject_rate: RateCap {
+                pps: 100,
+                burst: 100,
+            },
+            source: L4ScopeSource::Config,
+        }
+    }
+
+    /// SEC-2 — with `allow_agent_widen` false (the default), a runtime `l4.scope.add`
+    /// over the bus is refused with a typed [`L4GuardError::ScopeWideningDisabled`]
+    /// and adds nothing; the operator's config-declared scope still loads and
+    /// remains the only entry.
+    #[test]
+    fn scope_add_refused_when_widen_disabled() {
+        use crate::guard::L4GuardError;
+
+        // Default config ⇒ allow_agent_widen is false; one operator-declared entry.
+        let cfg = L4Config {
+            scope: vec![config_declared_entry()],
+            ..L4Config::default()
+        };
+        assert!(!cfg.allow_agent_widen, "the default must be deny (false)");
+
+        let (reg, guard, _s) = registered(&cfg);
+        let store = MemFlowStore::new();
+        let client = StubClient;
+        let core_guard = StdGuard::default();
+        let h = host(&store, &client, &core_guard);
+
+        // The config-declared entry loaded regardless of the flag.
+        assert_eq!(guard.list_scope().len(), 1, "config scope must load");
+
+        // A runtime add is refused with the typed refusal, and adds nothing.
+        let err = reg
+            .command("l4.scope.add")
+            .expect("l4.scope.add registered")
+            .invoke(scope_add_params(), &h)
+            .expect_err("runtime scope widening must be refused when disabled");
+        let typed = err
+            .downcast_ref::<L4GuardError>()
+            .unwrap_or_else(|| panic!("want a typed L4GuardError, got {err:?}"));
+        assert_eq!(*typed, L4GuardError::ScopeWideningDisabled);
+
+        // No entry was added: only the operator's config entry remains, usable.
+        let scope = guard.list_scope();
+        assert_eq!(scope.len(), 1, "a refused add must not widen the scope");
+        assert_eq!(scope[0].cidr.prefix, 8, "the config entry still stands");
+    }
+
+    /// With `allow_agent_widen` true (operator opt-in), a runtime `l4.scope.add`
+    /// behaves as before: it succeeds and the entry is listed.
+    #[test]
+    fn scope_add_allowed_when_widen_enabled() {
+        let cfg = L4Config {
+            allow_agent_widen: true,
+            ..L4Config::default()
+        };
+        let (reg, guard, _s) = registered(&cfg);
+        let store = MemFlowStore::new();
+        let client = StubClient;
+        let core_guard = StdGuard::default();
+        let h = host(&store, &client, &core_guard);
+
+        assert!(guard.list_scope().is_empty(), "deny-by-default to start");
+
+        let added = reg
+            .command("l4.scope.add")
+            .expect("l4.scope.add registered")
+            .invoke(scope_add_params(), &h)
+            .expect("l4.scope.add must succeed when widening is enabled");
+        let Value::Str(id) = added else {
+            panic!("l4.scope.add must return the entry id");
+        };
+        assert!(!id.is_empty());
+
+        let listed = reg
+            .command("l4.scope.list")
+            .unwrap()
+            .invoke(Params::default(), &h)
+            .expect("l4.scope.list ok");
+        let Value::Array(entries) = listed else {
+            panic!("l4.scope.list must return an array");
+        };
+        assert_eq!(entries.len(), 1, "the added entry must be listed");
     }
 
     /// `l4.flow.get` round-trips a flow inserted into the module's own store:

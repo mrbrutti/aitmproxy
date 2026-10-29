@@ -271,6 +271,7 @@ mod tests {
             direction,
             capability: cap,
             inject_rate: RateCap { pps: 10, burst: 10 },
+            source: crate::types::L4ScopeSource::Config,
         })
         .unwrap();
         Arc::new(g)

@@ -162,6 +162,7 @@ mod tests {
                 pps: rate.0,
                 burst: rate.1,
             },
+            source: crate::types::L4ScopeSource::Config,
         }
     }
 

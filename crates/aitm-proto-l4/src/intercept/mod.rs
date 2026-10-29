@@ -645,6 +645,7 @@ mod tests {
             direction: L4Direction::Outbound,
             capability: L4Capability::Intercept,
             inject_rate: RateCap { pps: 10, burst: 10 },
+            source: crate::types::L4ScopeSource::Config,
         }
     }
 

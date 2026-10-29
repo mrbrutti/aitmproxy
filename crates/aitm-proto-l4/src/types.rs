@@ -69,6 +69,26 @@ pub struct L4ScopeEntry {
     pub capability: L4Capability,
     /// Per-entry injection ceiling (pps + burst).
     pub inject_rate: RateCap,
+    /// Provenance: operator config vs runtime bus add. `#[serde(default)]` ⇒ a
+    /// config-declared entry deserializes as [`L4ScopeSource::Config`] (operator
+    /// authority); `l4.scope.add` stamps [`L4ScopeSource::Runtime`]. Only a
+    /// `Config`-sourced entry may lift the dangerous-destination denylist.
+    #[serde(default)]
+    pub source: L4ScopeSource,
+}
+
+/// Where a scope entry came from. The operator's config block carries operator
+/// authority; a runtime bus add (`l4.scope.add`) does not, and can never lift the
+/// dangerous-destination denylist (deny-by-default's one escape hatch stays with
+/// the operator).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum L4ScopeSource {
+    /// Declared in the operator's `l4.scope` config block (operator authority).
+    #[default]
+    Config,
+    /// Added at runtime via `l4.scope.add` over the command bus.
+    Runtime,
 }
 
 /// Stable identifier for a scope entry (uuid-backed).
