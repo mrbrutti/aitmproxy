@@ -51,6 +51,10 @@ aitm-plugins.workspace = true
 # registry so h2 Map Remote cross-origin is tested end to end against the same
 # plugin + scope guard the chain dispatches through (M7 Task 4).
 aitm-plugin-maprules.workspace = true
+# The real session/flow-export plugin + its session.save/load + flow.export/import
+# commands, driven through a registry so an h2 flow's session/HAR version tag is
+# tested end to end over the actual serialization surface (M7 Task 6, AC-H2.11).
+aitm-plugin-sessionio.workspace = true
 
 [lints]
 workspace = true

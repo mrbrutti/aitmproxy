@@ -288,6 +288,7 @@ dependencies = [
  "aitm-core",
  "aitm-plugin",
  "aitm-plugin-maprules",
+ "aitm-plugin-sessionio",
  "aitm-plugins",
  "anyhow",
  "bytes",
