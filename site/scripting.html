@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rhai scripting — aitmproxy docs</title>
+<meta name="description" content="Reference for aitmproxy plugins written in Rhai: the capability model, the hooks, the flow API and a complete example.">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="wordmark" href="index.html" aria-label="aitmproxy home">aitmproxy<i aria-hidden="true"></i></a>
+    <ul class="nav-links">
+      <li><a href="features.html">Features</a></li>
+      <li><a href="docs.html">Docs</a></li>
+      <li><a href="scripting.html" aria-current="page">Scripting</a></li>
+      <li><a href="poc.html">PoC format</a></li>
+      <li><a class="btn" href="download.html">Download</a></li>
+    </ul>
+    <details class="menu">
+      <summary>Menu</summary>
+      <ul class="nav-links">
+        <li><a href="features.html">Features</a></li>
+        <li><a href="docs.html">Docs</a></li>
+        <li><a href="scripting.html" aria-current="page">Scripting</a></li>
+        <li><a href="poc.html">PoC format</a></li>
+        <li><a href="download.html">Download</a></li>
+      </ul>
+    </details>
+  </div>
+</header>
+
+<main id="main">
+<div class="wrap docs">
+
+  <nav class="docnav" aria-label="Documentation">
+    <details open>
+      <summary>Documentation</summary>
+      <div>
+        <h2>Start</h2>
+        <ul>
+          <li><a href="docs.html">Getting started</a></li>
+          <li><a href="#">How aitmproxy works</a></li>
+        </ul>
+        <h2>Automate</h2>
+        <ul>
+          <li><a href="#">CLI reference</a></li>
+          <li><a href="#">MCP server</a></li>
+          <li><a href="scripting.html" aria-current="page">Rhai scripting</a></li>
+          <li><a href="poc.html">PoC format</a></li>
+          <li><a href="#">Audit log</a></li>
+        </ul>
+        <h2>Scripting</h2>
+        <ul>
+          <li><a href="#model">Capability model</a></li>
+          <li><a href="#hooks">Hooks</a></li>
+          <li><a href="#flow">The flow API</a></li>
+          <li><a href="#findings">Findings and halting</a></li>
+          <li><a href="#example">Complete example</a></li>
+        </ul>
+      </div>
+    </details>
+  </nav>
+
+  <article class="article">
+    <h1 class="display">Rhai scripting</h1>
+    <p class="lead">A plugin is a small Rhai file with a capability header and one or more hooks. It sees every flow as it passes and can edit it, answer it, or record a finding. Rhai reads like a tidy scripting language; a plugin should fit on one screen.</p>
+
+    <div class="prose">
+      <p>Plugins live in <code>~/.config/aitm/addons/</code> or anywhere you point <code>aitm addon load</code> at. They are loaded by hand, by the app, or by an assistant over MCP, and each load is an audited command like any other.</p>
+
+      <h2 id="model">Capability model</h2>
+      <p>Plugins run inside a sandbox and start with nothing. A header comment declares what the plugin needs, and the host grants exactly that. Anything not declared is denied, and a plugin that asks for more than its hooks require is flagged when it loads.</p>
+      <table>
+        <thead><tr><th>Capability</th><th>Grants</th></tr></thead>
+        <tbody>
+          <tr><td><code>flow.read</code></td><td>Read requests, responses and metadata of flows the plugin sees.</td></tr>
+          <tr><td><code>flow.write</code></td><td>Edit headers, body, URL and status; call <code>set_response</code>; arm interception.</td></tr>
+          <tr><td><code>findings</code></td><td>Record findings into the session.</td></tr>
+          <tr><td><code>ws</code></td><td>See and edit WebSocket frames; inject frames.</td></tr>
+          <tr><td><code>fs.read:&lt;path&gt;</code></td><td>Read files under one directory, for fixtures and wordlists. No write access exists.</td></tr>
+          <tr><td><code>state</code></td><td>A small per-plugin key–value store that survives between flows.</td></tr>
+        </tbody>
+      </table>
+      <p>There is no network capability, no shell capability and no path outside the declared directory. Time is available; the clock is not writable. The same guards apply whether a plugin was loaded by a person or by an agent, and the model is designed to grow as new protocols are added without loosening the default.</p>
+      <figure class="code">
+        <figcaption><span>addons/header.rhai</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="c">//! name: guard-admin-writes</span>
+<span class="c">//! capabilities: flow.read, flow.write, findings</span>
+<span class="c">//! description: Block unauthenticated writes under /admin and record each one.</span></code></pre>
+      </figure>
+
+      <h2 id="hooks">Hooks</h2>
+      <p>A hook is a top-level function with a well-known name. Define only the ones you need. Hooks run in flow order, one plugin after another in load order, and a hook that returns <code>halt()</code> stops the chain for that flow.</p>
+      <div class="api">
+        <div><div class="sig">on_request(flow)<small>flow.read</small></div><div>Called when the request headers and body have been read, before the request is sent upstream. Edits here reach the server.</div></div>
+        <div><div class="sig">on_response(flow)<small>flow.read</small></div><div>Called when the response has been read, before it is sent to the client. Edits here reach the client.</div></div>
+        <div><div class="sig">on_ws_message(flow, msg)<small>ws</small></div><div>Called for each WebSocket frame in either direction. <code>msg.direction</code> is <code>"client"</code> or <code>"server"</code>; <code>msg.text</code> or <code>msg.bytes</code> is editable.</div></div>
+        <div><div class="sig">on_intercept(flow)<small>flow.read</small></div><div>Called when a flow becomes <em>armed</em> by a rule or by hand. Useful for tagging or for deciding to resume automatically.</div></div>
+        <div><div class="sig">on_flow_end(flow)<small>flow.read</small></div><div>Called when the flow is complete, dropped or errored. Read-only; good for metrics and findings that need the whole exchange.</div></div>
+        <div><div class="sig">on_load() / on_unload()<small>none</small></div><div>Plugin lifecycle. Initialise or persist <code>state</code> here.</div></div>
+      </div>
+
+      <h2 id="flow">The flow API</h2>
+      <p>Every hook receives a <code>flow</code>. Reading never needs more than <code>flow.read</code>; each mutating call is listed with the capability it needs.</p>
+      <div class="api">
+        <div><div class="sig">flow.id<small>int</small></div><div>The flow number shown everywhere else in the tool, so a finding and a UI row match.</div></div>
+        <div><div class="sig">flow.state<small>string</small></div><div><code>"observed"</code>, <code>"intercepted"</code>, <code>"resumed"</code> or <code>"dropped"</code>.</div></div>
+        <div><div class="sig">flow.request<small>object</small></div><div><code>.method</code>, <code>.url</code>, <code>.host</code>, <code>.path</code>, <code>.query</code> (map), <code>.headers</code>, <code>.body</code> (string or bytes), <code>.json()</code> parsed on demand.</div></div>
+        <div><div class="sig">flow.response<small>object, may be ()</small></div><div><code>.status</code>, <code>.headers</code>, <code>.body</code>, <code>.json()</code>. Empty in <code>on_request</code>.</div></div>
+        <div><div class="sig">headers.has(name) / get(name) / set(name, value) / remove(name)<small>flow.write to set or remove</small></div><div>Case-insensitive. <code>set</code> replaces all existing values.</div></div>
+        <div><div class="sig">flow.set_response(status, headers, body)<small>flow.write</small></div><div>Answer the client without going upstream. Usually followed by <code>return halt()</code>.</div></div>
+        <div><div class="sig">flow.intercept {}<small>flow.write</small></div><div>Arm this flow. It will pause as if a rule had matched, for a person or an agent to deal with.</div></div>
+        <div><div class="sig">flow.tag(name)<small>flow.write</small></div><div>Attach a tag visible in every UI and filterable with <code>tag:name</code>.</div></div>
+        <div><div class="sig">flow.tls<small>object</small></div><div><code>.sni</code>, <code>.version</code>, <code>.passthrough</code> (bool). Read-only.</div></div>
+        <div><div class="sig">state.get(key) / state.set(key, value)<small>state</small></div><div>Per-plugin storage that survives between flows and restarts.</div></div>
+      </div>
+
+      <h2 id="findings">Findings and halting</h2>
+      <p>A finding is a structured note attached to the session and, optionally, to a flow. Findings show up in the app, in <code>aitm findings list</code>, and in a saved session or <a href="poc.html">PoC</a>. <code>halt()</code> ends processing of the current flow by later plugins; it does not drop the flow unless you also answered it.</p>
+      <figure class="code">
+        <figcaption><span>finding(…)</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code>finding(#{
+    name: <span class="s">"a short, specific title"</span>,       <span class="c">// required</span>
+    severity: <span class="s">"info|low|medium|high"</span>,     <span class="c">// required</span>
+    flow_id: flow.id,                        <span class="c">// optional, links the finding to a row</span>
+    tags: [<span class="s">"access-control"</span>],               <span class="c">// optional</span>
+    note: <span class="s">"anything a reader will thank you for"</span>
+});</code></pre>
+      </figure>
+
+      <h2 id="example">Complete example</h2>
+      <p>This plugin blocks any non-<code>GET</code> request under <code>/admin</code> that arrives without an <code>X-Admin-Token</code> header, answers the client with a plain <code>403</code>, records a medium finding tied to the flow, and stops. Authenticated admin writes are marked with a header and continue.</p>
+      <figure class="code">
+        <figcaption><span>addons/guard-admin-writes.rhai</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="c">// addons/guard-admin-writes.rhai</span>
+<span class="k">fn</span> <span class="f">on_request</span>(flow) {
+    <span class="k">let</span> req = flow.request;
+    <span class="k">if</span> req.path.starts_with(<span class="s">"/admin"</span>) &amp;&amp; req.method != <span class="s">"GET"</span> {
+        <span class="k">if</span> !req.headers.has(<span class="s">"X-Admin-Token"</span>) {
+            flow.set_response(<span class="n">403</span>, #{ <span class="s">"Content-Type"</span>: <span class="s">"text/plain"</span> }, <span class="s">"blocked by aitm"</span>);
+            finding(#{ name: <span class="s">"unauthenticated admin write blocked"</span>, severity: <span class="s">"medium"</span>,
+                       flow_id: flow.id, tags: [<span class="s">"access-control"</span>] });
+            <span class="k">return</span> halt();
+        }
+        req.headers.set(<span class="s">"X-Reviewed"</span>, <span class="s">"aitm"</span>);
+    }
+}</code></pre>
+      </figure>
+      <p>Load it, by hand or by agent, and watch it work:</p>
+      <div class="pair">
+        <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm addon load ./addons/guard-admin-writes.rhai</code></div>
+        <div class="pair-row"><span class="pair-who">agent</span><code>addon.load({ path: <span class="s">"./addons/guard-admin-writes.rhai"</span> })</code></div>
+      </div>
+      <figure class="code term">
+        <figcaption><span>zsh — aitm</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="pr">$ </span><span class="in">aitm addon load ./addons/guard-admin-writes.rhai</span>
+<span class="out">loaded guard-admin-writes  capabilities: flow.read, flow.write, findings</span>
+<span class="pr">$ </span><span class="in">curl -x 127.0.0.1:8080 -X POST https://shop.example.com/admin/users</span>
+<span class="out">blocked by aitm</span>
+<span class="pr">$ </span><span class="in">aitm findings list --last 1</span>
+<span class="out">#38  medium  unauthenticated admin write blocked  access-control  guard-admin-writes</span></code></pre>
+      </figure>
+    </div>
+
+    <nav class="pager" aria-label="Previous and next">
+      <a href="docs.html"><small>Previous</small>Getting started</a>
+      <a href="poc.html"><small>Next</small>PoC format</a>
+    </nav>
+  </article>
+
+  <aside class="rail" aria-label="On this page">
+    <h2>On this page</h2>
+    <ul>
+      <li><a href="#model">Capability model</a></li>
+      <li><a href="#hooks">Hooks</a></li>
+      <li><a href="#flow">The flow API</a></li>
+      <li><a href="#findings">Findings and halting</a></li>
+      <li><a href="#example">Complete example</a></li>
+    </ul>
+  </aside>
+
+</div>
+</main>
+
+<footer class="footer">
+  <div class="wrap">
+    <div>
+      <a class="wordmark" href="index.html">aitmproxy<i aria-hidden="true"></i></a>
+      <p class="fine">A fast, memory-safe intercepting proxy for inspecting and editing HTTP and WebSocket traffic during development and authorized testing. Use it on systems you own or are permitted to test.</p>
+    </div>
+    <div>
+      <h4>Product</h4>
+      <ul>
+        <li><a href="features.html">Features</a></li>
+        <li><a href="docs.html">Documentation</a></li>
+        <li><a href="scripting.html">Rhai scripting</a></li>
+        <li><a href="poc.html">PoC format</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Project</h4>
+      <ul>
+        <li><a href="#">Source</a></li>
+        <li><a href="#">Changelog</a></li>
+        <li><a href="#">MIT or Apache-2.0</a></li>
+        <li><a href="index.html#install">Homebrew</a></li>
+      </ul>
+    </div>
+  </div>
+</footer>
+
+<script src="site.js"></script>
+</body>
+</html>

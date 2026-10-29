@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Features — aitmproxy</title>
+<meta name="description" content="Everything aitmproxy does between the client and the server: intercept rules, replay, Map Local and Map Remote, WebSocket editing, sessions and HAR, TLS passthrough, an embedded browser and certificate management. Each one by hand or by agent.">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="wordmark" href="index.html" aria-label="aitmproxy home">aitmproxy<i aria-hidden="true"></i></a>
+    <ul class="nav-links">
+      <li><a href="features.html" aria-current="page">Features</a></li>
+      <li><a href="docs.html">Docs</a></li>
+      <li><a href="scripting.html">Scripting</a></li>
+      <li><a href="poc.html">PoC format</a></li>
+      <li><a class="btn" href="download.html">Download</a></li>
+    </ul>
+    <details class="menu">
+      <summary>Menu</summary>
+      <ul class="nav-links">
+        <li><a href="features.html" aria-current="page">Features</a></li>
+        <li><a href="docs.html">Docs</a></li>
+        <li><a href="scripting.html">Scripting</a></li>
+        <li><a href="poc.html">PoC format</a></li>
+        <li><a href="download.html">Download</a></li>
+      </ul>
+    </details>
+  </div>
+</header>
+
+<main id="main">
+<section class="page-head">
+  <div class="wrap">
+    <h1 class="display">Every feature, by hand or by agent.</h1>
+    <p class="lead">What follows is the whole surface of aitmproxy. Under each one you will find the same action written twice: once as you would type it, once as an assistant would call it over MCP. They are the same call into the same core.</p>
+  </div>
+</section>
+
+<div class="wrap">
+
+<!-- Intercept -->
+<article class="feat" id="intercept">
+  <div class="prose">
+    <h2 class="h3">Intercept and edit by rule</h2>
+    <p>A rule says which flows to hold: by method, host, path pattern, header or body match, and whether to hold the request, the response, or both. When a rule fires, the flow stops inside the proxy and appears as <em>armed</em>. You can read it, change any part of it and resume, or drop it and answer the client yourself.</p>
+    <p>Rules can be armed and disarmed without restarting anything. A one-off hold on a single flow needs no rule at all: arm the flow from the list and the next matching request waits.</p>
+    <ul>
+      <li>Edit method, URL, headers and body of a held request.</li>
+      <li>Edit status, headers and body of a held response.</li>
+      <li>Every resume records a diff against the original in the flow's history.</li>
+    </ul>
+    <div class="pair">
+      <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm intercept add --match <span class="s">'POST /api/cart/*'</span> --hold request,response</code></div>
+      <div class="pair-row"><span class="pair-who">agent</span><code>intercept.add({ match: <span class="s">"POST /api/cart/*"</span>, hold: [<span class="s">"request"</span>, <span class="s">"response"</span>] })</code></div>
+    </div>
+  </div>
+  <div class="feat-stack">
+    <div class="ui">
+      <div class="ui-bar"><span class="dot" aria-hidden="true"></span><span>rules</span><span class="spacer"></span><span>2 armed · 1 off</span></div>
+      <table class="flows">
+        <thead><tr><th>rule</th><th>match</th><th>hold</th><th>state</th><th>held</th></tr></thead>
+        <tbody>
+          <tr class="is-held"><td class="num">r1</td><td class="url">POST /api/cart/*</td><td>req, res</td><td><span class="chip chip--armed">armed</span></td><td class="time">1</td></tr>
+          <tr><td class="num">r2</td><td class="url">host:auth.example.com</td><td>res</td><td><span class="chip chip--armed">armed</span></td><td class="time">0</td></tr>
+          <tr><td class="num">r3</td><td class="url">header:X-Feature=beta</td><td>req</td><td>off</td><td class="time">—</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="ui">
+      <div class="ui-detail">
+        <div class="tabs"><span>Request</span><span>Headers</span><span aria-current="true">Body</span><span>Response</span></div>
+<pre>{
+  "sku": "A-1042",
+  "qty": <span style="background:var(--signal)">999</span>,
+  "coupon": <span style="background:var(--signal)">"STAFF-100"</span>
+}</pre>
+      </div>
+      <div class="ui-actions"><span class="btnlike is-primary">Resume <kbd class="key">↩</kbd></span><span class="btnlike">Drop <kbd class="key">⌫</kbd></span><span class="btnlike">Revert edits <kbd class="key">⌘Z</kbd></span></div>
+    </div>
+  </div>
+</article>
+
+<!-- Replay -->
+<article class="feat" id="replay">
+  <div class="prose">
+    <h2 class="h3">Replay and compose</h2>
+    <p>Replay sends a captured request again, optionally with changes, and records the result as a new flow linked to the original. Compose builds a request from nothing: method, URL, headers, body. Both go through the same pipeline as live traffic, so rules and plugins apply to them too.</p>
+    <p>Replays are how you turn a hunch into evidence: change one header, one parameter, one byte, and compare the two responses side by side.</p>
+    <div class="pair">
+      <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm flow replay --id 41 --set-header <span class="s">'X-Debug: 1'</span></code></div>
+      <div class="pair-row"><span class="pair-who">agent</span><code>flow.replay({ id: 41, set_header: { <span class="s">"X-Debug"</span>: <span class="s">"1"</span> } })</code></div>
+    </div>
+  </div>
+  <div class="feat-stack">
+    <figure class="code term">
+      <figcaption><span>zsh — aitm</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="pr">$ </span><span class="in">aitm flow replay --id 41 --set-header <span class="s">'X-Debug: 1'</span></span>
+<span class="out">#44  POST  /api/cart/items  200  198 ms  (replay of #41)</span>
+<span class="pr">$ </span><span class="in">aitm flow diff 41 44</span>
+<span class="out">request.headers   + X-Debug: 1</span>
+<span class="out">response.headers  + X-Debug-Trace: 7f3a…</span>
+<span class="out">response.body     = identical (1,204 B)</span>
+<span class="pr">$ </span><span class="in">aitm compose POST https://shop.example.com/api/cart/items \</span>
+<span class="in">    -H <span class="s">'content-type: application/json'</span> -d <span class="s">'{"sku":"A-1042","qty":1}'</span></span>
+<span class="out">#45  POST  /api/cart/items  201  164 ms</span></code></pre>
+    </figure>
+  </div>
+</article>
+
+<!-- Map -->
+<article class="feat" id="map">
+  <div class="prose">
+    <h2 class="h3">Map Local and Map Remote</h2>
+    <p><strong>Map Local</strong> answers a matching request from a file on disk: a JSON fixture, an HTML page, an image. The client never knows. It is the fastest way to test a UI against a response that does not exist yet, or one that is hard to trigger.</p>
+    <p><strong>Map Remote</strong> rewrites where a request goes: send production hostnames to a local server, swap one API version for another, or point a mobile build at staging without rebuilding it.</p>
+    <div class="pair">
+      <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm map local add --match <span class="s">'GET /api/flags'</span> --file ./fixtures/flags.json</code></div>
+      <div class="pair-row"><span class="pair-who">agent</span><code>map.local.add({ match: <span class="s">"GET /api/flags"</span>, file: <span class="s">"./fixtures/flags.json"</span> })</code></div>
+    </div>
+    <div class="pair">
+      <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm map remote add --from <span class="s">'https://api.example.com/*'</span> --to <span class="s">'http://localhost:4000/*'</span></code></div>
+      <div class="pair-row"><span class="pair-who">agent</span><code>map.remote.add({ from: <span class="s">"https://api.example.com/*"</span>, to: <span class="s">"http://localhost:4000/*"</span> })</code></div>
+    </div>
+  </div>
+  <div class="feat-stack">
+    <div class="ui">
+      <div class="ui-bar"><span>map rules</span><span class="spacer"></span><span>60 hits this session</span></div>
+      <div class="ui-lines">
+        <div><span class="k">local</span><span>GET /api/flags → ./fixtures/flags.json · 12 hits</span></div>
+        <div><span class="k">local</span><span>GET /banner.png → ./fixtures/blank.png · 3 hits</span></div>
+        <div><span class="k">remote</span><span>https://api.example.com/* → http://localhost:4000/* · 45 hits</span></div>
+        <div><span class="k">remote</span><span>https://cdn.example.com/v2/* → https://cdn.example.com/v3/* · 0 hits</span></div>
+      </div>
+    </div>
+    <div class="ui">
+      <div class="ui-bar"><span>fixtures/flags.json</span><span class="spacer"></span><span>served 12×</span></div>
+      <div class="ui-detail"><pre>{ "checkout_v2": true, "gift_cards": true, "beta_search": <span style="background:var(--signal)">true</span> }</pre></div>
+    </div>
+  </div>
+</article>
+
+<!-- WebSocket -->
+<article class="feat" id="websocket">
+  <div class="prose">
+    <h2 class="h3">WebSocket inspect, inject and edit</h2>
+    <p>A WebSocket is a flow too. After the upgrade, aitmproxy shows every frame in both directions as it happens: text or binary, with size, timing and direction. Hold a frame with a rule, change it, and let it continue. Or inject a frame of your own toward the client or the server, from the app, the CLI or a plugin.</p>
+    <div class="pair">
+      <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm ws inject --flow 43 --to server --text <span class="s">'{"op":"subscribe","ch":"orders"}'</span></code></div>
+      <div class="pair-row"><span class="pair-who">agent</span><code>ws.inject({ flow: 43, to: <span class="s">"server"</span>, text: <span class="s">'{"op":"subscribe","ch":"orders"}'</span> })</code></div>
+    </div>
+  </div>
+  <div class="feat-stack">
+    <div class="ui">
+      <div class="ui-bar"><span class="dot" aria-hidden="true"></span><span><code>wss://api.example.com/live</code></span><span class="spacer"></span><span>#43 · open 00:12</span></div>
+      <table class="flows">
+        <thead><tr><th>dir</th><th>type</th><th>payload</th><th>size</th><th>time</th></tr></thead>
+        <tbody>
+          <tr><td>↑</td><td>text</td><td class="url">{"op":"ping"}</td><td>13 B</td><td class="time">+0.00</td></tr>
+          <tr><td>↓</td><td>text</td><td class="url">{"op":"pong"}</td><td>13 B</td><td class="time">+0.04</td></tr>
+          <tr class="is-held"><td>↑</td><td>inject</td><td class="url">{"op":"subscribe","ch":"orders"}</td><td>32 B</td><td class="time">+4.10</td></tr>
+          <tr><td>↓</td><td>text</td><td class="url">{"op":"ok","ch":"orders"}</td><td>25 B</td><td class="time">+4.16</td></tr>
+          <tr><td>↓</td><td>binary</td><td class="url">0x82 0x7e 0x01 0x9c …</td><td>412 B</td><td class="time">+5.02</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</article>
+
+<!-- Sessions -->
+<article class="feat" id="sessions">
+  <div class="prose">
+    <h2 class="h3">Sessions and HAR import and export</h2>
+    <p>A session is a saved capture: every flow, every edit, every finding, with the rules that were active. Save one at the end of a test, reopen it next month, replay from it. Sessions can be exported as HAR for any tool that reads it, and HAR files from a browser or another proxy can be imported and treated like live captures.</p>
+    <div class="pair">
+      <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm session save checkout.aitm &amp;&amp; aitm har export --session checkout.aitm &gt; checkout.har</code></div>
+      <div class="pair-row"><span class="pair-who">agent</span><code>session.save({ path: <span class="s">"checkout.aitm"</span> }); har.export({ session: <span class="s">"checkout.aitm"</span>, path: <span class="s">"checkout.har"</span> })</code></div>
+    </div>
+  </div>
+  <div class="feat-stack">
+    <div class="ui">
+      <div class="ui-bar"><span>sessions</span><span class="spacer"></span><span>~/aitm/sessions</span></div>
+      <table class="flows">
+        <thead><tr><th>name</th><th>flows</th><th>findings</th><th>size</th><th>saved</th></tr></thead>
+        <tbody>
+          <tr><td class="url">checkout.aitm</td><td>312</td><td>2</td><td>2.4 MB</td><td class="time">today 12:08</td></tr>
+          <tr><td class="url">login-flow.aitm</td><td>88</td><td>0</td><td>640 kB</td><td class="time">yesterday</td></tr>
+          <tr><td class="url">from-browser.har</td><td>88</td><td>—</td><td>1.1 MB</td><td class="time">imported</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</article>
+
+<!-- TLS -->
+<article class="feat" id="tls">
+  <div class="prose">
+    <h2 class="h3">TLS passthrough for pinned hosts</h2>
+    <p>Some hosts pin their certificates and will refuse any proxy. Rather than break them, list them: aitmproxy tunnels those connections through untouched and records only that they happened. Everything else is decrypted with the local CA and inspected as usual. Patterns accept wildcards, and the list can be changed while the proxy is running.</p>
+    <div class="pair">
+      <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm tls passthrough add <span class="s">'*.icloud.com'</span> <span class="s">'pinned.bank.example'</span></code></div>
+      <div class="pair-row"><span class="pair-who">agent</span><code>tls.passthrough.add({ hosts: [<span class="s">"*.icloud.com"</span>, <span class="s">"pinned.bank.example"</span>] })</code></div>
+    </div>
+  </div>
+  <div class="feat-stack">
+    <div class="ui">
+      <div class="ui-bar"><span>tls</span><span class="spacer"></span><span>2 passthrough patterns</span></div>
+      <div class="ui-lines">
+        <div><span class="k">pass</span><span>*.icloud.com · 14 tunnels</span></div>
+        <div><span class="k">pass</span><span>pinned.bank.example · 2 tunnels</span></div>
+        <div><span class="k">inspect</span><span>everything else · 1,207 flows</span></div>
+        <div><span class="k">ca</span><span>aitmproxy local CA · trusted</span></div>
+      </div>
+    </div>
+  </div>
+</article>
+
+<!-- Browser -->
+<article class="feat" id="browser">
+  <div class="prose">
+    <h2 class="h3">Embedded headless browser</h2>
+    <p>aitmproxy ships a headless browser that is already pointed at the proxy and already trusts its certificate. It exists for one reason: to reproduce a finding the way a user's browser would, and to take the screenshot that proves it. The browser is a step type in the <a href="poc.html">PoC format</a>, and a command like any other.</p>
+    <div class="pair">
+      <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm browser open <span class="s">'https://staging.example.com/search?q=k7x2'</span> --screenshot confirmed.png</code></div>
+      <div class="pair-row"><span class="pair-who">agent</span><code>browser.open({ url: <span class="s">"https://staging.example.com/search?q=k7x2"</span>, screenshot: <span class="s">"confirmed.png"</span> })</code></div>
+    </div>
+  </div>
+  <div class="feat-stack">
+    <figure class="code term">
+      <figcaption><span>zsh — aitm</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="pr">$ </span><span class="in">aitm browser open <span class="s">'https://staging.example.com/search?q=k7x2'</span> --eval <span class="s">'window.__marker'</span> --screenshot confirmed.png</span>
+<span class="out">navigated   200  1,842 ms  (flows #51–#67 captured)</span>
+<span class="out">eval        window.__marker → "k7x2"</span>
+<span class="out">screenshot  confirmed.png  1280×800</span></code></pre>
+    </figure>
+  </div>
+</article>
+
+<!-- Certificates -->
+<article class="feat" id="certs">
+  <div class="prose">
+    <h2 class="h3">Certificate management</h2>
+    <p>On first run aitmproxy generates a local certificate authority for your machine only. <code>aitm ca</code> can export it, report whether the system trusts it, install it, and remove it again. Installing into the system trust store always asks for confirmation. An assistant can export and check status, but installing is gated behind a human.</p>
+    <div class="pair">
+      <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm ca install</code></div>
+      <div class="pair-row"><span class="pair-who">agent</span><code>ca.status() <span class="pr">// install is a human-only command</span></code></div>
+    </div>
+  </div>
+  <div class="feat-stack">
+    <figure class="code term">
+      <figcaption><span>zsh — aitm</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="pr">$ </span><span class="in">aitm ca status</span>
+<span class="out">aitmproxy local CA   created 2026-01-14   fingerprint 3A:9F:…:C2</span>
+<span class="out">login keychain       trusted</span>
+<span class="out">system keychain      not installed</span>
+<span class="pr">$ </span><span class="in">aitm ca export --out aitm-ca.pem</span>
+<span class="out">wrote aitm-ca.pem (1,310 B)</span>
+<span class="pr">$ </span><span class="in">aitm ca uninstall</span>
+<span class="out">removed from login keychain</span></code></pre>
+    </figure>
+  </div>
+</article>
+
+<!-- Scriptable -->
+<article class="feat" id="scriptable">
+  <div class="prose">
+    <h2 class="h3">All of it, scriptable</h2>
+    <p>Everything on this page is reachable from a Rhai plugin, from the CLI, and from an assistant over MCP. Plugins run in a sandbox with a declared capability list; the MCP server exposes the same command set with the same names. Whatever the operator, the audit log records the command, its arguments and its effect.</p>
+    <p><a class="arrow" href="scripting.html">Scripting reference</a><br><a class="arrow" href="poc.html">PoC format reference</a></p>
+  </div>
+  <div class="feat-stack">
+    <div class="audit-wrap"><table class="audit">
+      <caption>A few minutes from one session's audit log.</caption>
+      <thead><tr><th>time</th><th>operator</th><th>command</th><th>target</th><th>result</th></tr></thead>
+      <tbody>
+        <tr><td class="t">12:03:58.110</td><td class="who">plugin</td><td>flow.set_response</td><td>#38</td><td>403 · finding</td></tr>
+        <tr><td class="t">12:04:17.221</td><td class="who">hand</td><td>intercept.add</td><td>r1</td><td>armed</td></tr>
+        <tr><td class="t">12:04:19.004</td><td class="who">agent</td><td>flow.list</td><td>held</td><td>1 flow</td></tr>
+        <tr class="same"><td class="t">12:04:21.310</td><td class="who">hand</td><td>flow.mutate</td><td>#41</td><td>body 27 B</td></tr>
+        <tr class="same"><td class="t">12:04:21.318</td><td class="who">agent</td><td>flow.mutate</td><td>#41</td><td>body 27 B</td></tr>
+        <tr><td class="t">12:04:23.902</td><td class="who">hand</td><td>flow.resume</td><td>#41</td><td>200 · 212 ms</td></tr>
+        <tr><td class="t">12:05:02.441</td><td class="who">agent</td><td>browser.open</td><td>/search</td><td>confirmed.png</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+</article>
+
+</div>
+
+<section class="section" id="install">
+  <div class="wrap">
+    <div class="install">
+      <div>
+        <h2 class="h2">Try it on your own traffic.</h2>
+        <p class="lead deck">One line to install, one to trust the certificate, one to start.</p>
+      </div>
+      <div>
+        <div class="steps">
+          <div class="cmd"><code><span class="pr">$ </span>brew install aitmproxy</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
+          <div class="cmd"><code><span class="pr">$ </span>aitm ca install</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
+          <div class="cmd"><code><span class="pr">$ </span>aitm start</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
+        </div>
+        <p class="deck"><a class="arrow" href="docs.html">Getting started, step by step</a></p>
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer class="footer">
+  <div class="wrap">
+    <div>
+      <a class="wordmark" href="index.html">aitmproxy<i aria-hidden="true"></i></a>
+      <p class="fine">A fast, memory-safe intercepting proxy for inspecting and editing HTTP and WebSocket traffic during development and authorized testing. Use it on systems you own or are permitted to test.</p>
+    </div>
+    <div>
+      <h4>Product</h4>
+      <ul>
+        <li><a href="features.html">Features</a></li>
+        <li><a href="docs.html">Documentation</a></li>
+        <li><a href="scripting.html">Rhai scripting</a></li>
+        <li><a href="poc.html">PoC format</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Project</h4>
+      <ul>
+        <li><a href="#">Source</a></li>
+        <li><a href="#">Changelog</a></li>
+        <li><a href="#">MIT or Apache-2.0</a></li>
+        <li><a href="index.html#install">Homebrew</a></li>
+      </ul>
+    </div>
+  </div>
+</footer>
+
+<script src="site.js"></script>
+</body>
+</html>
