@@ -319,6 +319,7 @@ steps:
       name: token
       type: regex
       regex: "token-([A-Z0-9]+)-end"
+      group: 1
 success:
   type: dsl
   dsl: "token == \"ABC123\""
@@ -361,7 +362,7 @@ fn poc_run_refuses_a_symlinked_poc_file() {
     let real = dir.join("real.yaml");
     std::fs::write(
         &real,
-        "id: demo\ninfo:\n  name: n\nsteps: []\nsuccess:\n  all: []\n",
+        "id: demo\ninfo:\n  name: n\nsteps: []\nsuccess:\n  type: status\n  status: 200\n",
     )
     .expect("write real");
     let link = dir.join("link.yaml");
@@ -411,7 +412,7 @@ fn poc_run_confines_to_configured_dir() {
     let outside = base.join("outside.yaml");
     std::fs::write(
         &outside,
-        "id: demo\ninfo:\n  name: n\nsteps: []\nsuccess:\n  all: []\n",
+        "id: demo\ninfo:\n  name: n\nsteps: []\nsuccess:\n  type: status\n  status: 200\n",
     )
     .expect("write outside");
 
