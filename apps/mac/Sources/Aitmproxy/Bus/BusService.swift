@@ -96,7 +96,8 @@ final class BusService: FlowActions {
             }
             let known = Set(ids)
             summaries = summaries.filter { known.contains($0.key) }
-            let rows = ids.enumerated().compactMap { index, id in summaries[id]?.row(seq: index + 1) }
+            let coreID = session.activeCoreID
+            let rows = ids.enumerated().compactMap { index, id in summaries[id]?.row(seq: index + 1, coreID: coreID) }
                 .map { row in
                     var row = row
                     row.inScope = session.scopeHosts.isEmpty || session.scopeHosts.contains { Self.hostMatches(row.authority, $0) }

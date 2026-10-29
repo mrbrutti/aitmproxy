@@ -9,14 +9,14 @@ import Foundation
 extension FlowDetail {
     /// Decodes a `flow.detail` HTTP result (the `structuredContent`). Returns
     /// nil for a WebSocket flow (its frames are decoded separately, S-045).
-    public init?(detailJSON json: JSONValue) {
+    public init?(detailJSON json: JSONValue, coreID: CoreID = .fixture) {
         guard let idRaw = json["id"]?.stringValue else { return nil }
         guard (json["kind"]?.stringValue ?? "http") == "http", let requestObj = json["request"] else { return nil }
         let request = HTTPMessage(requestObject: requestObj)
         let response = json["response"].flatMap { $0.isNull ? nil : HTTPMessage(responseObject: $0) }
         let connection = ConnectionInfo(
             detailJSON: json, requestVersion: requestObj["version"]?.stringValue ?? "HTTP/1.1")
-        self.init(id: FlowID(idRaw), request: request, response: response, connection: connection)
+        self.init(id: FlowID(idRaw), request: request, response: response, connection: connection, coreID: coreID)
     }
 }
 
