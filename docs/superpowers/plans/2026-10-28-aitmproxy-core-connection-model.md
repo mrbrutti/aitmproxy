@@ -241,7 +241,33 @@ edit in the tap, not a commit in this repo.
 
 ## Review log
 
-Kept by the main session during stage 6. One row per finding.
+Stage-6 panel ran 2026-10-29 on the whole branch (`ad47182..7e8c73d`): security-reviewer,
+quality-reviewer, spec-reviewer in parallel. Rust gate green (fmt + clippy -D + test, 116
+binaries, 0 fail). Consolidated verdict **FAIL** (1 Important + 3 Critical + dispositions).
+
+| # | Task | Reviewer | Severity | Finding | Disposition |
+|---|---|---|---|---|---|
+| S1 | 6 | security | Important | Child-stop grace 3s < core's obscura teardown budget (~6s); SIGKILL can orphan obscura (AC7 anti-goal) | FIX (fix-task cc-fix) |
+| SP1 | 9 | spec | Critical | AC6 cask-only embedded spawn has no committed test; `selftest-live.sh` still drives an external core | FIX — add embedded-path live self-test / capture run evidence |
+| SP2 | 6/9 | spec | Critical | AC7 teardown/no-orphans unverified (no process/file check) | FIX — post-quit process/file assertion |
+| SP3 | 6 | spec | Critical | AC8 restart/backoff/cap untested (only `.degraded→failed` mapping covered) | FIX — extract pure restart helper + unit tests |
+| Q1 | 8 | quality | Minor | Health→colour mapping duplicated (`CoreHealthDot` + `CoreLogPanel`) | FIX — extract `CoreHealth.dotColor` |
+| Q2 | 6 | quality | Minor | `failPermanently` keeps 40 tail lines, surfaces 8 (misleading constant) | FIX — name the surfaced count |
+| Q3 | 6 | quality | Minor | Backoff `min(restarts-1,16)` guard dead given restart cap | FIX — drop or comment |
+| S2 | 3/6 | security | Minor | Endpoint/config files opened without `O_NOFOLLOW` | FIX Swift (`O_NOFOLLOW`); Rust accepted — not reachable (0700 dir); document endpoint-file dir must be operator-writable only |
+| S3 | 6 | security | Minor | YAML config built by interpolation without escaping paths | FIX — escape `"`/`\`, reject newlines |
+| S4 | 6 | security | Minor | Rendezvous host trusted verbatim (not pinned loopback) | FIX — reject non-loopback host in `parseEndpoint` |
+| SR | — | security | Rec | `cargo audit` not in the gate | Accepted — follow-up, out of this branch's scope |
+| SP4 | 9 | spec | Important | `scripts/make-dmg.sh` undeclared file | Accepted — needed for packaging; declared here in Task 9 scope |
+| SP5 | 9 | spec | Important | `EmbeddedObscura.entitlements` undeclared; grants JIT to obscura | Accepted — JIT is intentional, scoped to obscura only (security-reviewer signed off); declared here |
+| SP6 | 9 | spec | Important | AC11 codesign/spctl evidence not captured in range | VERIFY at integration — capture `codesign --verify`/`spctl`/`stapler` output |
+| SP7 | 8 | spec | Minor | `CoreLogPanel` new view vs reusing Connection Log | Accepted — C4 is an Architect's-call area |
+| SP8 | 6/8 | spec | Minor | A few files outside their task's literal list (within feature dirs) | Accepted — within the feature's directories |
+| SP9 | 3 | spec | Minor | `tracing` dep added to `aitm-mcp` | Accepted — functionally justified (debug line on rendezvous removal) |
+
+Fix task **cc-fix** addresses S1–S4, Q1–Q3, SP1–SP3 (and documents the S2 Rust side). SP4/SP5/SP9/SP7/SP8/SR accepted above (pending Matt's ratification at integration); SP6/AC11 verified at integration.
+
+### Review log (template, for later rounds)
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
