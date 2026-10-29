@@ -240,19 +240,10 @@ impl PacketSpec {
     /// input yields an empty layer list with the correct length.
     #[must_use]
     pub fn summarize(bytes: &[u8]) -> PacketSummary {
-        use etherparse::{NetSlice, SlicedPacket, TransportSlice};
+        use etherparse::{NetSlice, TransportSlice};
 
         let mut layers = Vec::new();
-        // Our crafted frames can start at L2 (Ethernet) or L3 (IP). The first
-        // nibble distinguishes an IP version from an Ethernet destination MAC.
-        let version = bytes.first().map_or(0, |b| b >> 4);
-        let parsed = if version == 4 || version == 6 {
-            SlicedPacket::from_ip(bytes).ok()
-        } else {
-            SlicedPacket::from_ethernet(bytes).ok()
-        };
-
-        if let Some(p) = parsed {
+        if let Some(p) = parse_frame(bytes) {
             if p.link.is_some() {
                 layers.push("Ethernet".to_string());
             }
@@ -299,6 +290,60 @@ impl PacketSpec {
         }
         None
     }
+}
+
+/// Parse a frame whose link layer is not known in advance into an
+/// [`etherparse::SlicedPacket`] carrying a network layer, or `None`.
+///
+/// Our own crafted frames start at L3 (IP); a real NIC delivers L2 Ethernet; BSD/
+/// macOS loopback (`DLT_NULL`/`DLT_LOOP`) prepends a 4-byte address-family word
+/// before the IP header. A first-byte nibble check alone misreads a real Ethernet
+/// frame whose destination MAC starts with an IP-looking nibble (`0x4_`/`0x6_`) as
+/// raw IP, so when the frame is Ethernet-plausible — its EtherType field names a known
+/// L3 protocol — Ethernet is tried first; otherwise L3 IP, then plain Ethernet (an
+/// uncommon EtherType), then the loopback form, keeping the first that yields a net
+/// layer. (The ambiguity is only fully removable with the capture handle's datalink
+/// type; this disambiguates on the EtherType field, which the reported first-nibble
+/// collision ignored.)
+pub(crate) fn parse_frame(frame: &[u8]) -> Option<etherparse::SlicedPacket<'_>> {
+    use etherparse::SlicedPacket;
+    let is_ip_nibble = |b: u8| matches!(b >> 4, 4 | 6);
+
+    // Ethernet-plausible: at least a 14-byte header with a known L3 EtherType at
+    // bytes 12..14 (IPv4 `0x0800`, IPv6 `0x86DD`, ARP `0x0806`).
+    if frame.len() >= 14 {
+        let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+        if matches!(ethertype, 0x0800 | 0x86DD | 0x0806) {
+            if let Ok(p) = SlicedPacket::from_ethernet(frame) {
+                if p.net.is_some() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    // Our own crafted frames start at L3 (IP).
+    if frame.first().copied().is_some_and(is_ip_nibble) {
+        if let Ok(p) = SlicedPacket::from_ip(frame) {
+            if p.net.is_some() {
+                return Some(p);
+            }
+        }
+    }
+    // A real NIC frame with an uncommon EtherType, still Ethernet.
+    if let Ok(p) = SlicedPacket::from_ethernet(frame) {
+        if p.net.is_some() {
+            return Some(p);
+        }
+    }
+    // BSD/macOS loopback: a 4-byte AF word before the IP header.
+    if frame.len() > 4 && is_ip_nibble(frame[4]) {
+        if let Ok(p) = SlicedPacket::from_ip(&frame[4..]) {
+            if p.net.is_some() {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 /// The enclosing network-layer addresses, resolved once, for transport-layer
