@@ -52,6 +52,7 @@ dependencies = [
  "aitm-tui",
  "anyhow",
  "bytes",
+ "crossterm",
  "futures",
  "http-body-util",
  "hyper",
