@@ -30,8 +30,9 @@ use std::time::{Duration, Instant, SystemTime};
 use aitm::wire::{assemble_with_scripts, Assembled, Features, Http1Sender, ScriptWiring};
 use aitm_core::{
     AgentPolicy, AgentState, Body, Chain, Config, ConnInfo, Event, Flow, FlowCtx, FlowId, FlowMeta,
-    FlowStore, HeaderMap, HttpFlow, HttpRequest, HttpVersion, InterceptState, McpTransport,
-    MemFlowStore, PipelineClient, Plugin, ProxyClient, Registry, ScopeEntry, StdGuard, Verdict,
+    FlowStore, Frontend, HeaderMap, HttpFlow, HttpRequest, HttpVersion, InterceptState,
+    McpTransport, MemFlowStore, PipelineClient, Plugin, ProxyClient, Registry, ScopeEntry,
+    StdGuard, Verdict,
 };
 use aitm_plugin_rhai::{
     wire, MemoryFindingSink, RhaiConfig, ScriptEntry, ScriptPlugin, ScriptServices,
@@ -538,9 +539,12 @@ async fn script_command_over_frontends() {
     // MCP tools/list includes the script command — and the tier's own three
     // (spec §3/§8: `script.validate`, `script.reload`, `findings.list`).
     // A Rhai-registered command declares no `sensitivity()`, so it is the
-    // fail-closed `Sensitive` default; this test is about reachability over the
-    // frontends, not the M4 policy gate, so it runs under the permissive `All`
-    // policy where the agent may call a Sensitive command.
+    // fail-closed `Sensitive` default with no per-command config gate. Under the
+    // corrected policy (spec D2) the *agent* may not call such a command under any
+    // policy — `All` runs a Sensitive command only if it carries a config gate. This
+    // test is about reachability over the frontends, not the policy gate, so the
+    // MCP `tools/call` below is made over an operator connection, which is never
+    // policy-gated; the `All` agent state only affects the policy-free `tools/list`.
     let server = aitm_mcp::McpServer::new(registry.clone(), McpTransport::Stdio)
         .with_agent_state(Arc::new(AgentState::new(AgentPolicy::All)))
         .with_services(
@@ -570,14 +574,20 @@ async fn script_command_over_frontends() {
         );
     }
 
-    // MCP tools/call returns "pong".
+    // MCP tools/call returns "pong" (over an operator connection — see above).
     let call = serde_json::json!({
         "jsonrpc":"2.0","id":2,"method":"tools/call",
         "params":{"name":"tagger.ping","arguments":{}}
     });
-    let resp: serde_json::Value =
-        serde_json::from_str(&server.handle(&call.to_string()).expect("a response"))
-            .expect("json response");
+    let resp: serde_json::Value = serde_json::from_str(
+        &server
+            .handle_on(
+                &aitm_mcp::ConnCtx::new(Frontend::Operator),
+                &call.to_string(),
+            )
+            .expect("a response"),
+    )
+    .expect("json response");
     assert!(
         resp.to_string().contains("pong"),
         "MCP tools/call → pong; got {resp}",

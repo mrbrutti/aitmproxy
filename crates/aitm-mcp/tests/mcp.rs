@@ -32,6 +32,9 @@ impl Command for PingCmd {
     fn name(&self) -> &str {
         "demo.ping"
     }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
+    }
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description: "Replies pong.".into(),
@@ -63,6 +66,9 @@ struct CaptureCmd;
 impl Command for CaptureCmd {
     fn name(&self) -> &str {
         "demo.capture"
+    }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Write
     }
     fn schema(&self) -> ParamSchema {
         ParamSchema {
@@ -98,6 +104,9 @@ impl Command for FlowGetCmd {
     fn name(&self) -> &str {
         "flow.get"
     }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
+    }
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description: "Fetch one captured flow.".into(),
@@ -131,6 +140,9 @@ impl Command for FlowListCmd {
     fn name(&self) -> &str {
         "flow.list"
     }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
+    }
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description: "List captured flow ids.".into(),
@@ -155,6 +167,9 @@ struct EchoCmd;
 impl Command for EchoCmd {
     fn name(&self) -> &str {
         "demo.echo"
+    }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
     }
     fn schema(&self) -> ParamSchema {
         ParamSchema {
@@ -233,6 +248,9 @@ impl Command for FailCmd {
     fn name(&self) -> &str {
         "demo.fail"
     }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
+    }
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description: "Always fails.".into(),
@@ -251,6 +269,9 @@ struct FrontendCmd;
 impl Command for FrontendCmd {
     fn name(&self) -> &str {
         "demo.frontend"
+    }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
     }
     fn schema(&self) -> ParamSchema {
         ParamSchema {
@@ -277,6 +298,9 @@ struct ClientLabelCmd;
 impl Command for ClientLabelCmd {
     fn name(&self) -> &str {
         "demo.client"
+    }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
     }
     fn schema(&self) -> ParamSchema {
         ParamSchema {
@@ -340,9 +364,10 @@ fn registry() -> Arc<Registry> {
 }
 
 /// The ungated policy. Tests that predate the M4 Task 4 policy gate (transport,
-/// coercion, roles) drive stub commands that do not declare a tier, so they
-/// default to `Sensitive`; `All` lets them run as before. The policy gate itself
-/// is tested with an explicit `AgentState` in the Task 4 section.
+/// coercion, roles) drive stub commands that declare a `Read`/`Write` tier (not
+/// the fail-closed `Sensitive` default), so any non-restrictive policy runs them;
+/// `All` is used here. The policy gate itself is tested with the `Sensitive`
+/// `TierCmd`/`GatedCmd` and an explicit `AgentState` in the Task 4 section.
 fn ungated() -> Arc<AgentState> {
     Arc::new(AgentState::new(AgentPolicy::All))
 }
@@ -1057,11 +1082,46 @@ impl Command for TierCmd {
     }
 }
 
-/// A server whose registry carries one command per tier, two Sensitive stubs
-/// named after the config-gated commands (`ca.install`, `scope.add`), and the
+/// A Sensitive stub that self-governs on its own config gate, mirroring the real
+/// `ca.install`/`scope.add`: it refuses an agent (non-CLI) frontend unless the
+/// gate is on, exactly as `scope.rs`/`commands.rs` do. So a test can prove the
+/// `All` policy defers a config-gated Sensitive command *to the command* (gate
+/// off → refused, on → runs) instead of pre-empting it, while `Auto` refuses it
+/// outright before `invoke` ever runs.
+struct GatedCmd {
+    name: &'static str,
+    gate: fn(&Config) -> bool,
+}
+
+impl Command for GatedCmd {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Sensitive
+    }
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "gated stub".into(),
+            params: vec![],
+            result: TypeDesc::Str,
+        }
+    }
+    fn invoke(&self, _args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        let gate_on = host.config().is_some_and(self.gate);
+        if host.frontend() != Frontend::Cli && !gate_on {
+            anyhow::bail!("`{}` refused: its config gate is off", self.name);
+        }
+        Ok(Value::Str("ran".into()))
+    }
+}
+
+/// A server whose registry carries one command per tier, two config-gated
+/// Sensitive stubs named after the real config-gated commands (`ca.install` →
+/// `ca.allow_agent_install`, `scope.add` → `scope.allow_agent_widen`), and the
 /// real `AgentPlugin` (so `agent.status`/`agent.set` are exercised end to end).
-/// `state` is shared with the server's policy gate; `config` feeds the per-command
-/// config gates the `Auto` policy consults for Sensitive commands.
+/// `state` is shared with the server's policy gate; `config` feeds the
+/// per-command config gates that the `All` policy defers Sensitive commands to.
 fn policy_server(state: Arc<AgentState>, config: Option<Arc<Config>>) -> McpServer {
     let mut reg = Registry::new();
     reg.add_command(Arc::new(TierCmd {
@@ -1076,13 +1136,13 @@ fn policy_server(state: Arc<AgentState>, config: Option<Arc<Config>>) -> McpServ
         name: "demo.sensitive",
         sens: Sensitivity::Sensitive,
     }));
-    reg.add_command(Arc::new(TierCmd {
+    reg.add_command(Arc::new(GatedCmd {
         name: "ca.install",
-        sens: Sensitivity::Sensitive,
+        gate: |c| c.ca.allow_agent_install,
     }));
-    reg.add_command(Arc::new(TierCmd {
+    reg.add_command(Arc::new(GatedCmd {
         name: "scope.add",
-        sens: Sensitivity::Sensitive,
+        gate: |c| c.scope.allow_agent_widen,
     }));
     reg.add_plugin(Box::new(AgentPlugin::new(state.clone())));
     let mut srv = McpServer::new(Arc::new(reg), McpTransport::Stdio)
@@ -1121,17 +1181,23 @@ fn is_refused(resp: &JsonValue) -> bool {
 
 /// AC-M4-4: the five-mode policy matrix, enforced for the agent role, over a
 /// Read / Write / Sensitive (no config gate) command. Expected `[read, write,
-/// sensitive]` run-outcomes per the spec D2 table.
+/// sensitive]` run-outcomes per the spec D2 table. `demo.sensitive` carries no
+/// config gate, so every policy refuses it: `Auto`/`Ask` never run Sensitive, and
+/// `All` only defers *config-gated* Sensitive commands to their own gate — a
+/// gateless one is refused outright (proven on/off in `all_sensitive_honors_config_gate`).
 #[test]
 fn policy_matrix_for_agent() {
     let cases = [
         (AgentPolicy::Paused, [false, false, false]),
         (AgentPolicy::ReadOnly, [true, false, false]),
+        // `Auto` is autonomous: Read+Write run, Sensitive is always refused.
         (AgentPolicy::Auto, [true, true, false]),
         // `Ask` allows Read+Write; a Sensitive call is parked for operator
         // approval (Task 9) and until then refused, so it does not run here.
         (AgentPolicy::Ask, [true, true, false]),
-        (AgentPolicy::All, [true, true, true]),
+        // `All` allows Read+Write; a Sensitive command runs only if it has its own
+        // config gate — `demo.sensitive` has none, so it is refused.
+        (AgentPolicy::All, [true, true, false]),
     ];
     for (policy, [read, write, sensitive]) in cases {
         let srv = policy_server(Arc::new(AgentState::new(policy)), None);
@@ -1217,32 +1283,67 @@ fn agent_status_readable_by_any_role() {
     }
 }
 
-/// Review Focus #2: under `Auto`, the policy gate *defers* a config-gated
-/// Sensitive command (ca.install/uninstall, scope.add) to the command — which
-/// self-governs on its own `ca.allow_agent_install` / `scope.allow_agent_widen`
-/// flag, its dry-run escape, and its own audit — rather than pre-empting it, while
-/// any other Sensitive command is refused outright. (The flag-driven refuse/allow
-/// of the real commands is proven against the real wiring in `ca_frontends.rs`
-/// and the scope plugin's own tests; the stubs here carry no self-gate, so they
-/// run once the policy gate lets them through.) `Config::default()` is attached to
-/// prove the policy gate does not read the flag itself.
+/// A config with both agent capability gates turned on, so a test can prove the
+/// *policy* refuses Sensitive under `Auto` even when the command's own gate would
+/// permit it — the two dimensions (spec D2) are independent.
+fn config_gates_on() -> Arc<Config> {
+    let mut cfg = Config::default();
+    cfg.ca.allow_agent_install = true;
+    cfg.scope.allow_agent_widen = true;
+    Arc::new(cfg)
+}
+
+/// AC-M4-4 / spec D2: `Auto` is autonomous with *zero* Sensitive actions — it
+/// refuses every Sensitive command for the agent, config-gated or not, and does
+/// so **before** the command runs. Even with `ca.allow_agent_install` /
+/// `scope.allow_agent_widen` on (the command's own gate would permit it), the
+/// policy refuses: the policy dimension and the config gate are independent, and
+/// `Auto` never permits the policy dimension. (Operators are never policy-gated.)
 #[test]
-fn auto_defers_config_gated_sensitive_to_the_command() {
+fn auto_refuses_all_sensitive() {
     let srv = policy_server(
         Arc::new(AgentState::new(AgentPolicy::Auto)),
+        Some(config_gates_on()),
+    );
+    for name in ["ca.install", "scope.add", "demo.sensitive"] {
+        assert!(
+            is_refused(&call_as(&srv, Frontend::Mcp, name)),
+            "`{name}` must be refused under Auto even with its config gate on"
+        );
+    }
+}
+
+/// AC-M4-4 / spec D2: under `All` the policy permits the Sensitive dimension and
+/// *defers a config-gated command to its own gate* — it runs iff that gate is on.
+/// Proven both ways with the same command: gate off → refused, gate on → runs.
+/// A gateless Sensitive command (`demo.sensitive`) is refused regardless, since it
+/// carries no gate for `All` to defer to.
+#[test]
+fn all_sensitive_honors_config_gate() {
+    let gate_off = policy_server(
+        Arc::new(AgentState::new(AgentPolicy::All)),
         Some(Arc::new(Config::default())),
     );
     assert!(
-        !is_refused(&call_as(&srv, Frontend::Mcp, "ca.install")),
-        "ca.install is deferred to its own gate, not pre-empted by the policy gate"
+        is_refused(&call_as(&gate_off, Frontend::Mcp, "ca.install")),
+        "All + ca.install with ca.allow_agent_install off must be refused by the command gate"
     );
     assert!(
-        !is_refused(&call_as(&srv, Frontend::Mcp, "scope.add")),
-        "scope.add is deferred to its own gate"
+        is_refused(&call_as(&gate_off, Frontend::Mcp, "demo.sensitive")),
+        "All refuses a Sensitive command that has no config gate to defer to"
+    );
+
+    let gate_on = policy_server(
+        Arc::new(AgentState::new(AgentPolicy::All)),
+        Some(config_gates_on()),
     );
     assert!(
-        is_refused(&call_as(&srv, Frontend::Mcp, "demo.sensitive")),
-        "a Sensitive command with no config gate is refused outright under Auto"
+        !is_refused(&call_as(&gate_on, Frontend::Mcp, "ca.install")),
+        "All + ca.install with ca.allow_agent_install on must run"
+    );
+    assert!(
+        !is_refused(&call_as(&gate_on, Frontend::Mcp, "scope.add")),
+        "All + scope.add with scope.allow_agent_widen on must run"
     );
 }
 
