@@ -173,6 +173,8 @@ dependencies = [
  "aitm-core",
  "anyhow",
  "futures",
+ "serde",
+ "serde_yaml",
  "tokio",
 ]
 
@@ -319,6 +321,14 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.21",
  "uuid",
+]
+
+[[package]]
+name = "aitm-proto-test"
+version = "0.1.0"
+dependencies = [
+ "aitm-core",
+ "aitm-plugin",
 ]
 
 [[package]]
