@@ -913,3 +913,356 @@ async fn script_enable_and_disable_are_sensitive() {
         assert!(cmd.mutates(), "{name}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// F8b-2: `script.save` — scripts_dir confinement, compile-before-write, and the
+// overwrite-live / new-name-restart split (AC4, AC5, AC6).
+// ---------------------------------------------------------------------------
+
+/// A scratch directory tree, removed on drop. `root` holds `scripts/` (the
+/// configured scripts dir) so a traversal that escaped it would land in `root`
+/// where the tests can see it.
+struct Sandbox {
+    root: PathBuf,
+}
+
+impl Sandbox {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "aitm-rhai-save-{}-{}",
+            std::process::id(),
+            FlowId::new()
+        ));
+        std::fs::create_dir_all(root.join("scripts")).expect("sandbox dirs");
+        Self { root }
+    }
+
+    fn scripts(&self) -> PathBuf {
+        self.root.join("scripts")
+    }
+
+    /// Every entry under `root`, recursively, as paths relative to it: what the
+    /// tests compare before and after a refused save.
+    fn tree(&self) -> Vec<String> {
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                out.push(
+                    path.strip_prefix(root)
+                        .expect("under root")
+                        .display()
+                        .to_string(),
+                );
+                if path.is_dir() {
+                    walk(&path, root, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.root, &self.root, &mut out);
+        out.sort();
+        out
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn save_args(name: &str, source: &str) -> Params {
+    params(&[
+        ("name", Value::Str(name.into())),
+        ("source", Value::Str(source.into())),
+    ])
+}
+
+fn save_harness(scripts: Vec<ScriptEntry>, scripts_dir: Option<PathBuf>) -> Harness {
+    Harness::with_config(RhaiConfig {
+        scripts,
+        scripts_dir,
+        ..RhaiConfig::default()
+    })
+}
+
+const SAVED_V3: &str = r#"
+const NAME = "versioned";
+fn on_request(flow) { flow.request.headers.set("X-V", "3"); }
+"#;
+
+const SAVED_NEW: &str = r#"
+const NAME = "fresh";
+fn on_request(flow) { flow.request.headers.set("X-V", "new"); }
+"#;
+
+const SAVED_REGISTERING: &str = r#"
+const NAME = "versioned";
+fn load(reg) {
+    reg.add_command("versioned.ping", "ping", |args| "pong");
+}
+fn on_request(flow) { flow.request.headers.set("X-V", "4"); }
+"#;
+
+/// AC4 (overwrite branch): saving over an already-loaded script writes the file
+/// AND swaps its hooks live, observed through the real chain with no restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_save_overwrite_swaps_the_loaded_hook_live() {
+    let script = TempScript::new("versioned", V1);
+    let dir = script.path().parent().expect("dir").to_path_buf();
+    let h = save_harness(vec![ScriptEntry::new(script.path())], Some(dir.clone()));
+    assert_eq!(h.x_v().await.as_deref(), Some("1"));
+
+    let out = h
+        .invoke("script.save", save_args("versioned", SAVED_V3))
+        .expect("overwrite-save succeeds");
+
+    assert_eq!(
+        std::fs::read_to_string(dir.join("versioned.rhai")).expect("file"),
+        SAVED_V3
+    );
+    assert_eq!(field(&out, "restart_required"), &Value::Bool(false));
+    assert_eq!(
+        h.x_v().await.as_deref(),
+        Some("3"),
+        "the new on_request runs with no restart"
+    );
+    assert_eq!(h.handles.len(), 1, "no handle is added or duplicated");
+}
+
+/// AC4 (new branch): a never-loaded name is written, compiled and validated,
+/// reports `restart_required: true`, and — the chain being sealed — its hook
+/// does not fire this session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_save_new_name_writes_the_file_and_requires_a_restart() {
+    let sandbox = Sandbox::new();
+    let h = save_harness(Vec::new(), Some(sandbox.scripts()));
+
+    let out = h
+        .invoke("script.save", save_args("fresh", SAVED_NEW))
+        .expect("save of a new script succeeds");
+
+    let path = sandbox.scripts().join("fresh.rhai");
+    assert_eq!(std::fs::read_to_string(&path).expect("file"), SAVED_NEW);
+    assert_eq!(field(&out, "restart_required"), &Value::Bool(true));
+    assert_eq!(field(&out, "name"), &Value::Str("fresh".into()));
+    assert_eq!(field(&out, "path"), &Value::Str(path.display().to_string()));
+    assert_eq!(
+        field(&out, "hooks"),
+        &Value::Array(vec![Value::Str("on_request".into())]),
+        "the result reports the compiled meta"
+    );
+    assert_eq!(
+        h.x_v().await,
+        None,
+        "the chain is sealed: a new script's hook does not join this session"
+    );
+    assert_eq!(
+        sandbox.tree(),
+        ["scripts", "scripts/fresh.rhai"],
+        "exactly the one file, no temp leftovers"
+    );
+}
+
+/// AC4: a source that does not compile is refused with the positioned error and
+/// no file is written — not for a new name, and an existing file is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_save_refuses_a_non_compiling_source_and_writes_nothing() {
+    let sandbox = Sandbox::new();
+    let h = save_harness(Vec::new(), Some(sandbox.scripts()));
+    let before = sandbox.tree();
+
+    let err = h
+        .invoke("script.save", save_args("broken", BROKEN))
+        .expect_err("a broken source is refused");
+    assert!(err.to_string().contains("error: "), "{err}");
+    assert!(!sandbox.scripts().join("broken.rhai").exists());
+    assert_eq!(sandbox.tree(), before);
+
+    // An existing file is not clobbered by a broken overwrite.
+    std::fs::write(sandbox.scripts().join("keep.rhai"), V1).expect("seed");
+    h.invoke("script.save", save_args("keep", BROKEN))
+        .expect_err("a broken overwrite is refused");
+    assert_eq!(
+        std::fs::read_to_string(sandbox.scripts().join("keep.rhai")).expect("file"),
+        V1
+    );
+}
+
+/// AC5: a `name` that is not exactly one `[A-Za-z0-9_-]+` segment is rejected
+/// before any write, and nothing appears anywhere under the sandbox root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_save_rejects_names_that_could_leave_the_scripts_dir() {
+    let sandbox = Sandbox::new();
+    let h = save_harness(Vec::new(), Some(sandbox.scripts()));
+    let before = sandbox.tree();
+
+    let abs = sandbox.root.join("evil").display().to_string();
+    let bad = [
+        "../evil",
+        "..",
+        ".",
+        "a/b",
+        "/evil",
+        "/etc/passwd",
+        "..\\evil",
+        "a\\b",
+        "evil.rhai",
+        ".hidden",
+        "a b",
+        "a\0b",
+        "nul\u{0}",
+        "é",
+        "evil/..",
+        "",
+        abs.as_str(),
+    ];
+    for name in bad {
+        let err = h
+            .invoke("script.save", save_args(name, SAVED_NEW))
+            .expect_err(&format!("name {name:?} must be rejected"));
+        assert!(
+            err.to_string().contains("[A-Za-z0-9_-]"),
+            "{name:?} gets the name-rule error: {err}"
+        );
+        assert_eq!(sandbox.tree(), before, "{name:?} touched the disk");
+    }
+}
+
+/// AC5: no `scripts_dir` configured → a clear refusal, nothing written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_save_without_a_scripts_dir_refuses_clearly() {
+    let h = save_harness(Vec::new(), None);
+    let err = h
+        .invoke("script.save", save_args("fresh", SAVED_NEW))
+        .expect_err("no scripts dir");
+    assert_eq!(
+        err.to_string(),
+        "no scripts directory configured; set rhai.scripts_dir"
+    );
+}
+
+/// AC6: a script whose `load` registers a command needs a restart even when it
+/// overwrites a loaded script, and its hooks still go live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_save_of_a_registering_script_requires_a_restart_but_hooks_load() {
+    let script = TempScript::new("versioned", V1);
+    let dir = script.path().parent().expect("dir").to_path_buf();
+    let h = save_harness(vec![ScriptEntry::new(script.path())], Some(dir));
+
+    let out = h
+        .invoke("script.save", save_args("versioned", SAVED_REGISTERING))
+        .expect("save succeeds");
+    assert_eq!(field(&out, "restart_required"), &Value::Bool(true));
+    assert_eq!(
+        field(&out, "registers"),
+        &registers_value(&["versioned.ping"], &[])
+    );
+    assert_eq!(h.x_v().await.as_deref(), Some("4"), "hooks still load");
+}
+
+/// The answer is exactly `{ name, path, api, hooks, registers, restart_required }`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_save_result_has_exactly_the_documented_shape() {
+    let sandbox = Sandbox::new();
+    let h = save_harness(Vec::new(), Some(sandbox.scripts()));
+    let out = h
+        .invoke("script.save", save_args("fresh", SAVED_NEW))
+        .expect("save");
+    let Value::Object(fields) = &out else {
+        panic!("expected an object, got {out:?}")
+    };
+    let keys: Vec<&str> = fields.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        [
+            "api",
+            "hooks",
+            "name",
+            "path",
+            "registers",
+            "restart_required"
+        ]
+    );
+    assert_eq!(field(&out, "api"), &Value::Str("1".into()));
+    assert_eq!(field(&out, "registers"), &registers_value(&[], &[]));
+}
+
+/// `enable: false` on an overwrite leaves the script loaded but disabled;
+/// `enable: true` (and the default) ensures it is on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_save_enable_flag_controls_the_live_state_on_overwrite() {
+    let script = TempScript::new("versioned", V1);
+    let dir = script.path().parent().expect("dir").to_path_buf();
+    let h = save_harness(vec![ScriptEntry::new(script.path())], Some(dir));
+
+    let args = params(&[
+        ("name", Value::Str("versioned".into())),
+        ("source", Value::Str(SAVED_V3.into())),
+        ("enable", Value::Bool(false)),
+    ]);
+    h.invoke("script.save", args).expect("save disabled");
+    assert_eq!(h.x_v().await, None, "saved with enable: false is off");
+
+    h.invoke("script.save", save_args("versioned", SAVED_V3))
+        .expect("save with the default enable");
+    assert_eq!(
+        h.x_v().await.as_deref(),
+        Some("3"),
+        "enable defaults to true"
+    );
+
+    let bad = params(&[
+        ("name", Value::Str("versioned".into())),
+        ("source", Value::Str(SAVED_V3.into())),
+        ("enable", Value::Str("yes".into())),
+    ]);
+    h.invoke("script.save", bad)
+        .expect_err("enable must be a bool");
+}
+
+/// A source larger than the sandbox string cap is refused cleanly, nothing written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_save_source_is_bounded_by_max_string_size() {
+    let sandbox = Sandbox::new();
+    let h = Harness::with_config(RhaiConfig {
+        scripts_dir: Some(sandbox.scripts()),
+        limits: RhaiLimits {
+            max_string_size: 64,
+            ..RhaiLimits::default()
+        },
+        ..RhaiConfig::default()
+    });
+    let before = sandbox.tree();
+    let big = format!("// {}\nfn on_request(flow) {{ }}\n", "x".repeat(200));
+    let err = h
+        .invoke("script.save", save_args("big", &big))
+        .expect_err("over the cap");
+    assert!(err.to_string().contains("max_string_size"), "{err}");
+    assert_eq!(sandbox.tree(), before);
+}
+
+/// A pre-existing symlink at `<name>.rhai` is not followed out of the scripts
+/// dir: the save is refused and the link's target is untouched.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_save_does_not_follow_a_symlinked_target_out_of_the_dir() {
+    let sandbox = Sandbox::new();
+    let outside = sandbox.root.join("outside.txt");
+    std::fs::write(&outside, "precious").expect("seed");
+    std::os::unix::fs::symlink(&outside, sandbox.scripts().join("link.rhai")).expect("symlink");
+    let h = save_harness(Vec::new(), Some(sandbox.scripts()));
+
+    h.invoke("script.save", save_args("link", SAVED_NEW))
+        .expect_err("a symlinked target is refused");
+    assert_eq!(std::fs::read_to_string(&outside).expect("file"), "precious");
+}
+
+/// AC9: `script.save` is `Sensitive` (and so mutating).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_save_is_sensitive() {
+    let h = Harness::new(Vec::new());
+    let cmd = h.registry.command("script.save").expect("registered");
+    assert_eq!(cmd.sensitivity(), Sensitivity::Sensitive);
+    assert!(cmd.mutates());
+}

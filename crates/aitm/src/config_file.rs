@@ -98,7 +98,42 @@ pub fn parse_settings(yaml: &str) -> anyhow::Result<Settings> {
     let mut core = Config::default();
     let mut rhai = RhaiConfig::default();
     file.apply(&mut core, &mut rhai)?;
+    append_scripts_dir_entries(&mut rhai);
     Ok(Settings { core, rhai, l4 })
+}
+
+/// The "next start" half of `script.save`: a script it wrote into
+/// `rhai.scripts_dir` is not in `scripts:`, and the plugin chain is sealed once
+/// built, so it can only join at startup. Append every `*.rhai` regular file in
+/// the directory (name order) as an enabled entry, after the declared ones, and
+/// skip any file a declared entry already names (compared canonicalized, so
+/// `./a.rhai` and an absolute spelling are one script and the declared entry's
+/// options and `enabled` win). A missing or unreadable directory adds nothing:
+/// it is not fatal, and `script.save` creates it. Symlinks are not followed.
+fn append_scripts_dir_entries(rhai: &mut RhaiConfig) {
+    let Some(dir) = rhai.scripts_dir.clone() else {
+        return;
+    };
+    let Ok(read) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let mut declared: Vec<PathBuf> = rhai.scripts.iter().map(|e| canon(&e.path)).collect();
+    let mut found: Vec<PathBuf> = read
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rhai"))
+        .collect();
+    found.sort();
+    for path in found {
+        let resolved = canon(&path);
+        if declared.contains(&resolved) {
+            continue;
+        }
+        declared.push(resolved);
+        rhai.scripts.push(ScriptEntry::new(path));
+    }
 }
 
 /// Overwrite `slot` only when the file set the key.
@@ -297,6 +332,9 @@ struct RhaiFile {
     strict: Option<bool>,
     /// Let plugin scripts widen the scope with `scope.add(...)` (off by default).
     allow_scope_add: Option<bool>,
+    /// The directory `script.save` writes `<name>.rhai` into, and whose `*.rhai`
+    /// files load at startup. Unset refuses `script.save`.
+    scripts_dir: Option<PathBuf>,
     /// Seconds a single hook may run before it is aborted.
     hook_timeout: Option<u64>,
     max_operations: Option<u64>,
@@ -313,6 +351,9 @@ impl RhaiFile {
     fn apply(self, r: &mut RhaiConfig) {
         set(&mut r.strict, self.strict);
         set(&mut r.allow_scope_add, self.allow_scope_add);
+        if let Some(dir) = self.scripts_dir {
+            r.scripts_dir = Some(dir);
+        }
         set_secs(&mut r.hook_timeout, self.hook_timeout);
         let l = &mut r.limits;
         set(&mut l.max_operations, self.max_operations);

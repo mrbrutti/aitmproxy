@@ -175,6 +175,11 @@ impl RhaiLoader {
         self.cfg.limits.max_string_size
     }
 
+    /// The configured `script.save` directory, if the operator opted in.
+    pub fn scripts_dir(&self) -> Option<&Path> {
+        self.cfg.scripts_dir.as_deref()
+    }
+
     /// The run budget the configuration gives every hook, step and command.
     pub fn budget(&self) -> Budget {
         Budget::of(&self.cfg)

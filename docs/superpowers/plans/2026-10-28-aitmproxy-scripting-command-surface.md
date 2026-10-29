@@ -63,10 +63,10 @@
 ### Task 4: F8b-2 — `scripts_dir` config + `script.save`
 
 **Files:** Modify `crates/aitm-plugin-rhai/src/config.rs` (`RhaiConfig.scripts_dir: Option<PathBuf>`), `crates/aitm/src/config_file.rs` (surface it), `src/commands.rs` (`Save` command); Test: `tests/commands.rs`, `crates/aitm/tests/config_rhai.rs`.
-**Interfaces:** Consumes Task 3 `validate_source` + Task 1 handle set. Produces `script.save {name, source, enable?}` → `{name, path, api, hooks, registers, restart_required}`; writes `<scripts_dir>/<name>.rhai`, loads via `RhaiLoader::load_one`.
+**Interfaces:** Consumes Task 3 `validate_source` + Task 1 handle set. Produces `script.save {name, source, enable?}` → `{name, path, api, hooks, registers, restart_required}`; writes `<scripts_dir>/<name>.rhai`. **Overwrite of a loaded script** recompiles and `handle.swap`s it live (`restart_required` only if it registers commands/options); a **new name** is persisted and returns `restart_required: true` (the chain is sealed; `crates/aitm/src/config_file.rs` appends `scripts_dir/*.rhai` as enabled entries so it loads next start).
 
-- [ ] Step 1: failing tests — save writes the file and the script's `on_request` runs with no restart; a non-compiling `source` returns the error and writes **no file**; a `name` with `/`/`..` is rejected before any write; no `scripts_dir` → clear refusal; overwriting an existing name swaps hooks (no double-register, Review Focus); a command-registering script returns `restart_required:true`.
-- [ ] Step 2: run — FAIL. Step 3: implement (`name` validated to `[A-Za-z0-9_-]+`; compile-before-write; append handle). `sensitivity()=Sensitive`. Step 4: PASS; gate. Step 5: commit.
+- [ ] Step 1: failing tests — overwrite-save of a loaded script swaps its `on_request` live with no restart; a new-name save writes the file and returns `restart_required: true` (hook not live this session); a non-compiling `source` returns the error and writes **no file**; a `name` with `/`/`..` is rejected before any write; no `scripts_dir` → clear refusal; overwriting a loaded name swaps hooks (no double-register, Review Focus); the config scan appends `scripts_dir/*.rhai` once, deduped against declared entries; a command-registering script returns `restart_required:true`.
+- [ ] Step 2: run — FAIL. Step 3: implement (`name` validated to `[A-Za-z0-9_-]+`; compile-before-write; overwrite swaps the handle, new name returns `restart_required`). `sensitivity()=Sensitive`. Step 4: PASS; gate. Step 5: commit.
 
 ### Task 5: F8c — `script.enable` / `script.disable`
 

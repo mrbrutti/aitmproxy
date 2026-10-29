@@ -24,6 +24,10 @@ pub struct RhaiConfig {
     /// engagement scope lifts the SSRF block for the host named, so it is the
     /// operator's decision, not a script's. PoC steps never get it.
     pub allow_scope_add: bool,
+    /// The one directory `script.save` may write `<name>.rhai` into. `None`
+    /// (the default) refuses `script.save` outright — authoring scripts from a
+    /// client is the operator's opt-in, like `allow_scope_add` and `poc.dir`.
+    pub scripts_dir: Option<PathBuf>,
     /// The SSRF posture `browser.navigate` checks a target against — the
     /// host's own policy (`browser.ssrf` in the main config), so a script's
     /// navigation and the `browser.navigate` command decide alike.
@@ -43,6 +47,7 @@ impl Default for RhaiConfig {
             hot_reload: false,
             strict: false,
             allow_scope_add: false,
+            scripts_dir: None,
             ssrf: SsrfPolicy::default(),
         }
     }

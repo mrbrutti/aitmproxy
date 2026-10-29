@@ -153,3 +153,123 @@ fn env_absent_changes_nothing() {
     assert!(s.rhai.strict);
     assert!(s.rhai.scripts.is_empty());
 }
+
+/// A scratch directory removed on drop.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "aitm-config-rhai-{tag}-{}-{}",
+            std::process::id(),
+            aitm_core::FlowId::new()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        Self(dir)
+    }
+
+    fn touch(&self, file: &str) -> PathBuf {
+        let path = self.0.join(file);
+        std::fs::write(&path, "fn on_request(flow) { }\n").expect("write");
+        path
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// F8b: `rhai.scripts_dir` is read off the file; absent, it stays unset.
+#[test]
+fn scripts_dir_is_read_from_the_rhai_section() {
+    let s = settings("rhai:\n  scripts_dir: /var/aitm/scripts\n");
+    assert_eq!(
+        s.rhai.scripts_dir,
+        Some(PathBuf::from("/var/aitm/scripts")),
+        "a `rhai.scripts_dir` key reaches RhaiConfig"
+    );
+    assert_eq!(settings("rhai:\n  strict: true\n").rhai.scripts_dir, None);
+    assert_eq!(
+        settings("listen: \"127.0.0.1:8080\"\n").rhai.scripts_dir,
+        None
+    );
+}
+
+/// F8b persistence seam: every `*.rhai` in `scripts_dir` becomes an enabled
+/// entry after the declared ones, so a script `script.save` wrote loads on the
+/// next start. Other files are ignored.
+#[test]
+fn scripts_dir_files_are_appended_as_enabled_entries() {
+    let dir = ScratchDir::new("scan");
+    let a = dir.touch("alpha.rhai");
+    let b = dir.touch("beta.rhai");
+    dir.touch("notes.txt");
+    dir.touch(".hidden.tmp");
+    std::fs::create_dir(dir.0.join("sub.rhai")).expect("a directory named like a script");
+
+    let s = settings(&format!(
+        "scripts:\n  - path: declared.rhai\nrhai:\n  scripts_dir: {}\n",
+        dir.0.display()
+    ));
+
+    let paths: Vec<PathBuf> = s.rhai.scripts.iter().map(|e| e.path.clone()).collect();
+    assert_eq!(
+        paths,
+        [PathBuf::from("declared.rhai"), a, b],
+        "declared entries first, then the directory's scripts in name order"
+    );
+    assert!(s.rhai.scripts.iter().all(|e| e.enabled));
+    assert!(s.rhai.scripts[1].options.is_empty());
+}
+
+/// A script already declared in `scripts:` — even by a different spelling of
+/// the same file — is not loaded twice, and keeps its declared options and
+/// enabled flag (a declared `enabled: false` stays off).
+#[test]
+fn scripts_dir_scan_does_not_duplicate_a_declared_script() {
+    let dir = ScratchDir::new("dedupe");
+    let declared = dir.touch("declared.rhai");
+    let parked = dir.touch("parked.rhai");
+    let extra = dir.touch("extra.rhai");
+    // The same file as `declared`, spelled through a `..` detour.
+    let detour = dir
+        .0
+        .join("..")
+        .join(dir.0.file_name().expect("name"))
+        .join("declared.rhai");
+
+    let s = settings(&format!(
+        "scripts:\n  - path: {}\n    options:\n      tag: x\n  - path: {}\n    enabled: false\nrhai:\n  scripts_dir: {}\n",
+        detour.display(),
+        parked.display(),
+        dir.0.display()
+    ));
+
+    assert_eq!(s.rhai.scripts.len(), 3, "{:?}", s.rhai.scripts);
+    assert_eq!(s.rhai.scripts[0].path, detour);
+    assert_eq!(
+        s.rhai.scripts[0].options.get("tag"),
+        Some(&Value::Str("x".into())),
+        "the declared entry keeps its options"
+    );
+    assert!(
+        !s.rhai.scripts[1].enabled,
+        "a declared enabled: false stays off"
+    );
+    assert_eq!(s.rhai.scripts[2].path, extra);
+    assert!(!s.rhai.scripts.iter().any(|e| e.path == declared));
+}
+
+/// A missing or unreadable `scripts_dir` loads nothing extra and is not fatal.
+#[test]
+fn a_missing_scripts_dir_adds_no_entries_and_is_not_fatal() {
+    let s = settings("rhai:\n  scripts_dir: /nonexistent/aitm/scripts-dir\n");
+    assert!(s.rhai.scripts.is_empty());
+    assert_eq!(
+        s.rhai.scripts_dir,
+        Some(PathBuf::from("/nonexistent/aitm/scripts-dir")),
+        "the dir stays configured so script.save can create it"
+    );
+}
