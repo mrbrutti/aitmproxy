@@ -1,6 +1,6 @@
 # aitmproxy M7 — HTTP/2 MITM design
 
-**Status:** draft
+**Status:** approved (2026-10-29 by Matt — approved the spec and directed proceeding to the Stage-3 plan, accepting each Open-Question recommendation below)
 **Research inputs:** `docs/superpowers/specs/2026-10-28-aitmproxy-m6-parity-design.md` (§6 HTTP/2 stub, §0 rule-match model, the deny-by-default capability table), `docs/research/03-rust-proxy-stack.md` (§HTTP stack: `h2`/`hyper`, multiplexing correlation), `docs/research/01-mitmproxy.md` (HTTP/2 + TLS edge-case note), `docs/superpowers/specs/2026-10-27-aitmproxy-platform-design.md` (Flow/Event/ProtocolModule core types), `docs/superpowers/specs/2026-10-27-aitmproxy-plugin-system-design.md` (additive module/command seam). Source read: `crates/aitm-proto-http/src/{module.rs,sansio.rs,sender.rs}`, `crates/aitm-core/src/{flow.rs,event.rs,protocol.rs,ctx.rs,chain.rs,config.rs}`, `crates/aitm-proto-ws/src/module.rs`.
 
 ## Intent
@@ -430,7 +430,9 @@ client through the proxy; literal expected values are given where load-bearing.
 
 ## Open questions
 
-1. **h2 ↔ h1 cross-version bridging.** v1 **mirrors** the version (client gets what
+*(Resolved on approval, 2026-10-29 by Matt — approved the spec and directed proceeding to the Stage-3 plan, accepting each recommendation below.)*
+
+1. **h2 ↔ h1 cross-version bridging — resolved: mirror, fail-closed (a).** v1 **mirrors** the version (client gets what
    upstream negotiated), so the only unsatisfiable pair is *h1-only client ↔
    h2-only upstream*, which v1 **fails with a logged error**. Options: (a) accept
    the fail-closed behaviour for v1 (recommended — the pair is already broken
@@ -438,13 +440,13 @@ client through the proxy; literal expected values are given where load-bearing.
    matrix so the proxy can always bridge any pair. **(a)** keeps M7 to one
    translation surface (frames ↔ model); **(b)** is a materially larger, higher-risk
    build. **Recommend (a).** Matt to confirm.
-2. **Replay version.** v1 replays an h2 flow over **h1** (the existing
+2. **Replay version — resolved: h1 replay (a).** v1 replays an h2 flow over **h1** (the existing
    `Http1Sender`), capturing an h1 replay flow. Options: (a) keep h1 replay for v1
    (recommended — a replay is a fresh request; most origins accept h1; no new
    sender); (b) add an h2 replay path so a replayed h2 flow is re-sent over h2.
    **Recommend (a)**, with (b) as a follow-up if an origin rejects h1 replays. Matt
    to confirm.
-3. **Library choice confirmation.** The design is built on the **`h2` crate** (+
+3. **Library choice — resolved: the `h2` crate.** The design is built on the **`h2` crate** (+
    `http`), not hand-rolled and not the full `hyper` stack, because it is the vetted
    engine `hyper` itself uses, runs directly over our decrypted `tokio-rustls`
    streams, and exposes per-stream request/response handles that fit the
@@ -453,6 +455,6 @@ client through the proxy; literal expected values are given where load-bearing.
    server/client stack would fight the existing `ProtocolModule` seam and the
    sans-IO h1 machine. **Recommend the `h2` crate.** Matt to confirm before the
    dependency lands.
-4. **Server push.** v1 **disables** push both directions (§5). Confirm this is
+4. **Server push — resolved: disabled both directions.** v1 **disables** push both directions (§5). Confirm this is
    acceptable (recommended), versus capturing pushed streams as flows (a future
    milestone). Matt to confirm.
