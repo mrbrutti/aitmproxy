@@ -19,7 +19,9 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 40] = [
+const EXPECTED_TOOLS: [&str; 53] = [
+    // M4 agent-control and F4 subscription tools, registered unconditionally by
+    // the `AgentPlugin` and `SubscriptionPlugin` in `wire.rs`.
     "agent.status",
     "agent.set",
     "agent.activity",
@@ -60,6 +62,21 @@ const EXPECTED_TOOLS: [&str; 40] = [
     "ca.install",
     "ca.status",
     "ca.uninstall",
+    // M6 parity additions (Task 14 convergence): F9 WebSocket control, F10
+    // sessions/HAR import-export, F11 TLS passthrough, Map Local/Remote.
+    "ws.intercept",
+    "ws.frame",
+    "ws.send",
+    "session.save",
+    "session.load",
+    "flow.export",
+    "flow.import",
+    "tls.passthrough.list",
+    "tls.passthrough.add",
+    "tls.passthrough.remove",
+    "map.add",
+    "map.list",
+    "map.remove",
 ];
 
 /// The six `browser.*` tool schemas as M1 shipped them, keyed by tool name.

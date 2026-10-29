@@ -3,25 +3,60 @@
 //! handshake `HttpFlow`, and runs each frame through the plugin chain before
 //! forwarding it (platform spec data-flow 3).
 
-use aitm_core::{Event, Flow, FlowId, FlowMeta, InterceptState, WsFlow};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::SystemTime;
+
+use aitm_core::{
+    Event, Flow, FlowId, FlowMeta, InterceptState, WsDir, WsFlow, WsMessage, WsOpcode,
+};
 use aitm_plugin::{ByteStream, ModuleCtx, NextLayerHint, ProtocolModule};
 use anyhow::{anyhow, bail, Result};
 use futures::future::BoxFuture;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::sansio::{Side, WsFrameMachine, WsSansIoEvent, WsStateMachine};
 
 /// Socket read size.
 const READ_CHUNK: usize = 16 * 1024;
 
+/// A frame composed by a command (e.g. `ws.send`) for live injection onto an open
+/// WebSocket. The module frames it towards the side `dir` implies and records it
+/// as a `WsMessage { injected: true }`.
+#[derive(Debug, Clone)]
+pub struct InjectFrame {
+    pub dir: WsDir,
+    pub opcode: WsOpcode,
+    pub data: Vec<u8>,
+}
+
+/// Shared map from a live WebSocket flow to the sender that injects frames into
+/// its `drive` loop. The WS module owns the live connection's `select!`, so it
+/// registers a flow's sender when the conversation opens and removes it when the
+/// conversation ends; a plugin (`aitm-plugin-wsctl`'s `ws.send`) holds the same
+/// `Arc` and enqueues frames. Shared state via `Arc` — no `aitm-core` edit.
+pub type InjectRegistry = Arc<Mutex<HashMap<FlowId, UnboundedSender<InjectFrame>>>>;
+
 /// The WebSocket protocol module.
 #[derive(Default)]
-pub struct WsModule;
+pub struct WsModule {
+    /// When present, live conversations register an inject channel here so a
+    /// command can compose and send a frame onto the open socket.
+    inject: Option<InjectRegistry>,
+}
 
 impl WsModule {
     /// A module ready to be registered.
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Share an [`InjectRegistry`] so live conversations accept composed frames
+    /// (wired to `ws.send`'s plugin in the binary, Task 14).
+    pub fn with_inject_registry(mut self, reg: InjectRegistry) -> Self {
+        self.inject = Some(reg);
+        self
     }
 }
 
@@ -40,13 +75,17 @@ impl ProtocolModule for WsModule {
     }
 
     fn spawn(&self, io: ByteStream, ctx: ModuleCtx) -> BoxFuture<'_, Result<()>> {
-        Box::pin(drive(io, ctx))
+        Box::pin(drive(io, ctx, self.inject.clone()))
     }
 }
 
 /// Relay frames between the client and the already-upgraded upstream,
 /// capturing and dispatching each one, until either side closes.
-async fn drive(mut client: ByteStream, ctx: ModuleCtx) -> Result<()> {
+async fn drive(
+    mut client: ByteStream,
+    ctx: ModuleCtx,
+    inject: Option<InjectRegistry>,
+) -> Result<()> {
     let handshake = ctx
         .handshake()
         .ok_or_else(|| anyhow!("WebSocket module spawned without an upgrade handshake"))?;
@@ -59,6 +98,18 @@ async fn drive(mut client: ByteStream, ctx: ModuleCtx) -> Result<()> {
     };
 
     let id = FlowId::new();
+
+    // The inject channel: `tx` is kept local for the whole conversation (so the
+    // receiver never yields `None` while we relay), and — when a registry is
+    // shared — a clone is published under this flow id *before* the flow becomes
+    // visible in the store, so a command that finds the flow can always resolve
+    // its sender. It is removed before `WsEnd`.
+    let (tx, mut inject_rx) = mpsc::unbounded_channel::<InjectFrame>();
+    if let Some(reg) = &inject {
+        lock(reg).insert(id, tx.clone());
+    }
+    let _keep_tx = tx;
+
     ctx.store().insert(Flow::WebSocket(WsFlow {
         id,
         handshake,
@@ -87,37 +138,87 @@ async fn drive(mut client: ByteStream, ctx: ModuleCtx) -> Result<()> {
     .await?;
 
     while !closed {
-        let (from, events) = tokio::select! {
+        tokio::select! {
             read = client.read(&mut client_buf) => {
                 let n = read?;
                 if n == 0 {
                     break;
                 }
-                (Side::Client, machine.on_bytes(Side::Client, &client_buf[..n])?)
+                let events = machine.on_bytes(Side::Client, &client_buf[..n])?;
+                closed = handle(&ctx, id, &mut machine, Side::Client, events, &mut client, &mut upstream).await?;
             }
             read = upstream.read(&mut upstream_buf) => {
                 let n = read?;
                 if n == 0 {
                     break;
                 }
-                (Side::Server, machine.on_bytes(Side::Server, &upstream_buf[..n])?)
+                let events = machine.on_bytes(Side::Server, &upstream_buf[..n])?;
+                closed = handle(&ctx, id, &mut machine, Side::Server, events, &mut client, &mut upstream).await?;
             }
-        };
-        closed = handle(
-            &ctx,
-            id,
-            &mut machine,
-            from,
-            events,
-            &mut client,
-            &mut upstream,
-        )
-        .await?;
+            frame = recv_inject(&mut inject_rx) => {
+                if let Some(frame) = frame {
+                    inject_frame(&ctx, id, &mut machine, frame, &mut client, &mut upstream).await?;
+                }
+            }
+        }
     }
 
+    if let Some(reg) = &inject {
+        lock(reg).remove(&id);
+    }
     ctx.emit(Event::WsEnd(id)).await;
     let _ = client.shutdown().await;
     let _ = upstream.shutdown().await;
+    Ok(())
+}
+
+/// Await the next composed inject frame. A thin wrapper so the `select!` arm reads
+/// like the socket arms; the kept-alive sender means this only resolves to `None`
+/// if the registry entry is dropped mid-conversation, which the arm ignores.
+async fn recv_inject(rx: &mut UnboundedReceiver<InjectFrame>) -> Option<InjectFrame> {
+    rx.recv().await
+}
+
+/// Frame a composed [`InjectFrame`] towards the side its direction implies, record
+/// it as an injected `WsMessage`, and write it out. `ClientToServer` is sent to
+/// the server (upstream); `ServerToClient` to the client.
+async fn inject_frame(
+    ctx: &ModuleCtx,
+    id: FlowId,
+    machine: &mut WsFrameMachine,
+    frame: InjectFrame,
+    client: &mut ByteStream,
+    upstream: &mut ByteStream,
+) -> Result<()> {
+    let to = match frame.dir {
+        WsDir::ClientToServer => Side::Server,
+        WsDir::ServerToClient => Side::Client,
+    };
+    let msg = WsMessage {
+        dir: frame.dir,
+        opcode: frame.opcode,
+        data: frame.data,
+        timestamp: SystemTime::now(),
+        injected: true,
+    };
+
+    // Append to the stored conversation in wire order alongside captured frames.
+    let mut staged = Some(msg.clone());
+    ctx.store().update(id, &mut |f: &mut Flow| {
+        if let (Flow::WebSocket(w), Some(m)) = (f, staged.take()) {
+            w.messages.push(m);
+        }
+    });
+
+    machine.send_frame(to, msg);
+    if let Some(bytes) = machine.poll_outbound(to) {
+        let stream = match to {
+            Side::Client => &mut *client,
+            Side::Server => &mut *upstream,
+        };
+        stream.write_all(&bytes).await?;
+        stream.flush().await?;
+    }
     Ok(())
 }
 
@@ -162,7 +263,18 @@ async fn handle(
                     bail!("WsFlow {id} missing from the store after dispatch");
                 };
                 if matches!(flow.intercept, InterceptState::Killed) {
-                    return Ok(true);
+                    // Single-frame drop (`ws.frame {action:"drop"}`): skip
+                    // forwarding *this* frame but keep the conversation open —
+                    // mirroring the Rhai `msg.drop()` semantics. `Killed` is only
+                    // ever set on a WS flow by a frame drop (there is no command to
+                    // kill a whole WS conversation), so reset the park state to
+                    // `Resumed` and relay the next frame normally.
+                    ctx.store().update(id, &mut |f: &mut Flow| {
+                        if let Flow::WebSocket(w) = f {
+                            w.intercept = InterceptState::Resumed;
+                        }
+                    });
+                    continue;
                 }
                 let Some(forward) = flow.messages.get(at).cloned() else {
                     bail!("message {at} missing from WsFlow {id} after dispatch");
@@ -185,4 +297,10 @@ async fn handle(
         }
     }
     Ok(closed)
+}
+
+/// Lock a mutex, recovering a poisoned guard rather than panicking — a prior
+/// panic elsewhere must not drop the live WebSocket out of its relay loop.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }

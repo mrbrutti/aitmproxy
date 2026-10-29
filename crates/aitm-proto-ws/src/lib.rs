@@ -3,5 +3,5 @@
 pub mod module;
 pub mod sansio;
 
-pub use module::WsModule;
+pub use module::{InjectFrame, InjectRegistry, WsModule};
 pub use sansio::{Side, WsFrameMachine, WsSansIoEvent, WsStateMachine};

@@ -53,7 +53,7 @@ impl Chain {
             return Verdict::Continue;
         };
 
-        let (verdict, parked) = {
+        let (mut verdict, parked) = {
             let mut ctx = FlowCtx::new(&mut flow);
             let mut verdict = Verdict::Continue;
             for plugin in self.registry.plugins() {
@@ -82,14 +82,27 @@ impl Chain {
         // abandoned interception (e.g. the client vanished) cannot pin the flow.
         if let Some(rx) = parked {
             match tokio::time::timeout(self.intercept_timeout, rx).await {
-                Ok(_) => self.store.update(id, &mut |f: &mut Flow| {
-                    set_intercept(f, InterceptState::Resumed)
-                }),
+                Ok(_) => {
+                    // The releasing command (flow.resume / flow.kill) records the
+                    // authoritative intercept state in the store before it wakes
+                    // this future. A kill must survive the wake so the flow is
+                    // dropped, never forwarded — so honour a stored `Killed`
+                    // (halt the chain) instead of clobbering it back to
+                    // `Resumed`. Only a non-killed wake resumes and forwards.
+                    if is_killed(&self.store, id) {
+                        verdict = Verdict::Halt;
+                    } else {
+                        self.store.update(id, &mut |f: &mut Flow| {
+                            set_intercept(f, InterceptState::Resumed)
+                        });
+                    }
+                }
                 Err(_) => {
                     tracing::warn!(%id, "intercepted flow was never resumed; killing it");
                     self.store.update(id, &mut |f: &mut Flow| {
                         set_intercept(f, InterceptState::Killed)
                     });
+                    verdict = Verdict::Halt;
                 }
             }
         }
@@ -124,5 +137,15 @@ fn set_intercept(flow: &mut Flow, state: InterceptState) {
     match flow {
         Flow::Http(f) => f.intercept = state,
         Flow::WebSocket(f) => f.intercept = state,
+    }
+}
+
+/// Whether the stored flow is currently `Killed`, regardless of protocol. A flow
+/// that vanished from the store is treated as not killed (the resume path runs).
+fn is_killed(store: &Arc<dyn FlowStore>, id: FlowId) -> bool {
+    match store.get(id) {
+        Some(Flow::Http(f)) => matches!(f.intercept, InterceptState::Killed),
+        Some(Flow::WebSocket(f)) => matches!(f.intercept, InterceptState::Killed),
+        None => false,
     }
 }

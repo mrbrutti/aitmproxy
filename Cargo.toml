@@ -2,10 +2,15 @@
 resolver = "2"
 members = [
     "crates/aitm-core",
+    "crates/aitm-rules",
     "crates/aitm-plugin",
     "crates/aitm-proto-http",
     "crates/aitm-proto-ws",
     "crates/aitm-plugins",
+    "crates/aitm-plugin-sessionio",
+    "crates/aitm-plugin-passthrough",
+    "crates/aitm-plugin-wsctl",
+    "crates/aitm-plugin-maprules",
     "crates/aitm-browser",
     "crates/aitm-ca",
     "crates/aitm-poc",
@@ -14,6 +19,8 @@ members = [
     "crates/aitm-mcp",
     "crates/aitm-cli",
     "crates/aitm-testtarget",
+    "crates/aitm-bus-client",
+    "crates/aitm-tui",
     "crates/aitm",
 ]
 
@@ -40,10 +47,15 @@ uuid = { version = "1", features = ["v4"] }
 
 # Internal crates, referenced by path so the workspace builds in-tree.
 aitm-core = { path = "crates/aitm-core" }
+aitm-rules = { path = "crates/aitm-rules" }
 aitm-plugin = { path = "crates/aitm-plugin" }
 aitm-proto-http = { path = "crates/aitm-proto-http" }
 aitm-proto-ws = { path = "crates/aitm-proto-ws" }
 aitm-plugins = { path = "crates/aitm-plugins" }
+aitm-plugin-sessionio = { path = "crates/aitm-plugin-sessionio" }
+aitm-plugin-passthrough = { path = "crates/aitm-plugin-passthrough" }
+aitm-plugin-wsctl = { path = "crates/aitm-plugin-wsctl" }
+aitm-plugin-maprules = { path = "crates/aitm-plugin-maprules" }
 aitm-browser = { path = "crates/aitm-browser" }
 aitm-ca = { path = "crates/aitm-ca" }
 aitm-poc = { path = "crates/aitm-poc" }
@@ -52,3 +64,5 @@ aitm-plugin-rhai = { path = "crates/aitm-plugin-rhai" }
 aitm-mcp = { path = "crates/aitm-mcp" }
 aitm-cli = { path = "crates/aitm-cli" }
 aitm-testtarget = { path = "crates/aitm-testtarget" }
+aitm-bus-client = { path = "crates/aitm-bus-client" }
+aitm-tui = { path = "crates/aitm-tui" }

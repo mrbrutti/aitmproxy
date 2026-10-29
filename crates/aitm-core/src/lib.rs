@@ -39,8 +39,8 @@ pub use client::{PipelineClient, RequestSender};
 pub use command::{Command, ParamDef, ParamSchema, Sensitivity, TypeDesc};
 pub use config::{
     BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, FindingsConfig, FirefoxConfig,
-    LimitConfig, McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry,
-    SsrfPolicy,
+    LimitConfig, MapsConfig, McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig,
+    ScopeEntry, SessionIoConfig, SsrfPolicy, TlsConfig,
 };
 pub use ctx::{
     BrowserDriver, ClickTarget, CommandHost, FlowCtx, Frontend, NavOutcome, ProxyClient,

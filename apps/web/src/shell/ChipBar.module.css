@@ -1,0 +1,60 @@
+.chips {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--color-line-border);
+  overflow: hidden;
+  white-space: nowrap;
+  min-width: 0;
+}
+.chip {
+  height: 22px;
+  padding: 0 8px;
+  border-radius: var(--radius-pill);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  flex: none;
+  transition:
+    background-color var(--motion-hover) ease,
+    color var(--motion-hover) ease,
+    transform var(--motion-press) var(--motion-ease-out);
+}
+@media (hover: hover) and (pointer: fine) {
+  .chip:hover {
+    color: var(--color-text-primary);
+  }
+}
+.chip:active {
+  transform: scale(0.97);
+}
+.chip[aria-pressed='true'] {
+  background: var(--color-ground-raised);
+  color: var(--color-text-primary);
+  font-weight: var(--font-weight-medium);
+}
+.sep {
+  width: 1px;
+  height: 14px;
+  background: var(--color-line-border);
+  margin: 0 6px;
+  flex: none;
+}
+.filters {
+  margin-left: auto;
+  color: var(--color-text-tertiary);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.filters[aria-pressed='true'],
+.filters[data-count] {
+  color: var(--color-text-primary);
+}
+.filters .n {
+  font-size: var(--font-size-xs);
+  background: var(--color-ground-active);
+  border-radius: var(--radius-pill);
+  padding: 0 5px;
+  line-height: 16px;
+}

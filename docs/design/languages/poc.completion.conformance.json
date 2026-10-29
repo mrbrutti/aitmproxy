@@ -1,0 +1,130 @@
+[
+  {
+    "name": "key: top-level keys at an empty document",
+    "context": "",
+    "caret": 0,
+    "kind": "key",
+    "path": "",
+    "expected_candidates": [ "id", "info", "variables", "steps", "success" ]
+  },
+  {
+    "name": "key: top-level prefix",
+    "context": "id: demo\nst",
+    "caret": 11,
+    "kind": "key",
+    "path": "",
+    "expected_candidates": [ "steps" ]
+  },
+  {
+    "name": "key: info keys",
+    "context": "id: demo\ninfo:\n  ",
+    "caret": 17,
+    "kind": "key",
+    "path": "info",
+    "expected_candidates": [ "name", "author", "severity", "description", "reference", "tags", "cwe", "metadata" ]
+  },
+  {
+    "name": "key: info prefix",
+    "context": "id: demo\ninfo:\n  s",
+    "caret": 18,
+    "kind": "key",
+    "path": "info",
+    "expected_candidates": [ "severity" ]
+  },
+  {
+    "name": "enum: severity after the colon",
+    "context": "info:\n  severity: ",
+    "caret": 18,
+    "kind": "enum",
+    "path": "info.severity",
+    "expected_candidates": [ "info", "low", "medium", "high", "critical" ]
+  },
+  {
+    "name": "enum: severity prefix",
+    "context": "info:\n  severity: h",
+    "caret": 19,
+    "kind": "enum",
+    "path": "info.severity",
+    "expected_candidates": [ "high" ]
+  },
+  {
+    "name": "key: variable definition keys",
+    "context": "variables:\n  - ",
+    "caret": 15,
+    "kind": "key",
+    "path": "variables[]",
+    "expected_candidates": [ "name", "default", "description", "required" ]
+  },
+  {
+    "name": "key: a step offers the four step types",
+    "context": "steps:\n  - ",
+    "caret": 11,
+    "kind": "key",
+    "path": "steps[]",
+    "expected_candidates": [ "http", "browser", "extract", "script" ]
+  },
+  {
+    "name": "key: http step fields",
+    "context": "steps:\n  - http:\n      ",
+    "caret": 23,
+    "kind": "key",
+    "path": "steps[].http",
+    "expected_candidates": [ "method", "url", "path", "headers", "body", "raw", "extract", "matchers", "matchers-condition" ]
+  },
+  {
+    "name": "enum: browser action",
+    "context": "steps:\n  - browser:\n      action: ",
+    "caret": 34,
+    "kind": "enum",
+    "path": "steps[].browser.action",
+    "expected_candidates": [ "navigate", "click", "type", "eval", "screenshot" ]
+  },
+  {
+    "name": "enum: matchers-condition",
+    "context": "steps:\n  - http:\n      matchers-condition: ",
+    "caret": 43,
+    "kind": "enum",
+    "path": "steps[].http.matchers-condition",
+    "expected_candidates": [ "and", "or" ]
+  },
+  {
+    "name": "key: matcher fields",
+    "context": "steps:\n  - http:\n      matchers:\n        - ",
+    "caret": 43,
+    "kind": "key",
+    "path": "steps[].http.matchers[]",
+    "expected_candidates": [ "type", "status", "word", "regex", "size", "binary", "dsl", "expr", "equals", "encoding", "part", "condition", "negative", "internal", "name" ]
+  },
+  {
+    "name": "enum: matcher type",
+    "context": "steps:\n  - http:\n      matchers:\n        - type: ",
+    "caret": 49,
+    "kind": "enum",
+    "path": "steps[].http.matchers[].type",
+    "expected_candidates": [ "status", "word", "regex", "size", "binary", "dsl", "browser-eval" ]
+  },
+  {
+    "name": "enum: matcher part",
+    "context": "steps:\n  - http:\n      matchers:\n        - type: word\n          part: ",
+    "caret": 70,
+    "kind": "enum",
+    "path": "steps[].http.matchers[].part",
+    "expected_candidates": [ "body", "header", "all" ]
+  },
+  {
+    "name": "enum: extractor type",
+    "context": "steps:\n  - http:\n      extract:\n        - type: ",
+    "caret": 48,
+    "kind": "enum",
+    "path": "steps[].http.extract[].type",
+    "expected_candidates": [ "regex", "json", "kval", "dsl", "browser-eval" ]
+  },
+  {
+    "name": "key: success assertion combinators",
+    "context": "success:\n  ",
+    "caret": 11,
+    "kind": "key",
+    "path": "success",
+    "expected_candidates": [ "all", "any", "not" ]
+  }
+]

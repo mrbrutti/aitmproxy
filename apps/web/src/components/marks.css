@@ -1,0 +1,16 @@
+/* Mark colours (§2.7: "6px colour swatch, 11 colours as Proxyman"). The values are the
+   `color.mark.*` group in docs/design/tokens.json (generated into tokens.css); these short
+   aliases keep the swatch/menu CSS readable. */
+:root {
+  --mark-red: var(--color-mark-red);
+  --mark-orange: var(--color-mark-orange);
+  --mark-yellow: var(--color-mark-yellow);
+  --mark-green: var(--color-mark-green);
+  --mark-mint: var(--color-mark-mint);
+  --mark-teal: var(--color-mark-teal);
+  --mark-cyan: var(--color-mark-cyan);
+  --mark-blue: var(--color-mark-blue);
+  --mark-indigo: var(--color-mark-indigo);
+  --mark-purple: var(--color-mark-purple);
+  --mark-pink: var(--color-mark-pink);
+}

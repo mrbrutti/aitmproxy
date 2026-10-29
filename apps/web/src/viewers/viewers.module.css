@@ -1,0 +1,340 @@
+/* Body viewers: CodeMirror host, JSON tree, hex, image, diff. Tokens only. */
+
+.cmHost {
+  position: relative;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+.cmMount {
+  height: 100%;
+}
+.cmMount :global(.cm-editor) {
+  height: 100%;
+}
+.cmError {
+  padding: var(--space-3);
+  font: var(--font-size-sm) var(--font-ui);
+  color: var(--color-status-server-error);
+}
+
+/* ---- syntax tokens shared by the tree ---- */
+.synKey {
+  color: var(--color-syntax-key);
+}
+.synIndex {
+  color: var(--color-syntax-punct);
+}
+.synPunct {
+  color: var(--color-syntax-punct);
+}
+.synBracket {
+  color: var(--color-syntax-bracket);
+}
+.syn_string {
+  color: var(--color-syntax-string);
+}
+.syn_number {
+  color: var(--color-syntax-number);
+}
+.syn_boolean,
+.syn_null {
+  color: var(--color-syntax-boolean);
+}
+
+/* ---- JSON tree ---- */
+.tree {
+  display: grid;
+  grid-template-rows: var(--size-tab-bar) minmax(0, 1fr) 24px;
+  height: 100%;
+  min-height: 0;
+  font: var(--font-size-md) / 20px var(--font-data);
+}
+.treeBar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-3);
+  border-bottom: 1px solid var(--color-line-rule);
+  font: var(--font-size-sm) var(--font-ui);
+}
+.treeFilter {
+  height: var(--size-control);
+  width: 220px;
+  max-width: 50%;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--color-line-control);
+  border-radius: var(--radius-control);
+  background: var(--color-ground-surface);
+  color: var(--color-text-primary);
+  font: var(--font-size-sm) var(--font-ui);
+}
+.treeFilter::placeholder {
+  color: var(--color-text-tertiary);
+}
+.treeFilter::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+  appearance: none;
+}
+.treeMeta {
+  color: var(--color-text-tertiary);
+  white-space: nowrap;
+}
+.treeSpacer {
+  flex: 1;
+}
+.treeBtn {
+  height: 24px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-control);
+  color: var(--color-text-secondary);
+  font: var(--font-size-sm) var(--font-ui);
+  white-space: nowrap;
+  transition:
+    background-color var(--motion-hover) ease,
+    color var(--motion-hover) ease,
+    transform var(--motion-press) var(--motion-ease-out);
+}
+.treeBtn:hover {
+  background: var(--color-ground-hover);
+  color: var(--color-text-primary);
+}
+.treeBtn:active {
+  transform: scale(0.97);
+}
+.treeBtnOn {
+  color: var(--color-text-primary);
+  box-shadow: inset 0 0 0 1px var(--color-line-control);
+}
+.treeScroll {
+  position: relative;
+  overflow: auto;
+  outline: none;
+}
+.treeScroll:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--color-line-focus);
+  border-radius: 0;
+}
+.treeSpace {
+  position: relative;
+  min-height: 100%;
+}
+.treeRow {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  padding-right: var(--space-3);
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--color-text-primary);
+}
+.treeRow:hover {
+  background: var(--color-ground-hover);
+}
+.treeRowFocus {
+  background: var(--color-syntax-current-line);
+}
+.treeScroll:focus-visible .treeRowFocus {
+  background: var(--color-ground-active);
+}
+.treeRowMatch .synKey,
+.treeRowMatch .syn_string,
+.treeRowMatch .syn_number {
+  background: var(--color-syntax-match);
+  border-radius: 2px;
+}
+.treeChevron {
+  display: inline-block;
+  width: 14px;
+  flex: none;
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-xs);
+  text-align: center;
+  margin-left: -14px;
+}
+.treePreview {
+  color: var(--color-text-tertiary);
+  font: var(--font-size-sm) var(--font-ui);
+}
+.treeRowActions {
+  margin-left: auto;
+  display: none;
+  gap: 2px;
+  padding-left: var(--space-2);
+  flex: none;
+}
+.treeRow:hover .treeRowActions,
+.treeRowFocus .treeRowActions {
+  display: inline-flex;
+}
+.treeMini {
+  height: 16px;
+  padding: 0 5px;
+  border-radius: var(--radius-badge);
+  border: 1px solid var(--color-line-control);
+  background: var(--color-ground-surface);
+  color: var(--color-text-secondary);
+  font: var(--font-size-xs) var(--font-ui);
+  line-height: 14px;
+}
+.treeMini:hover {
+  color: var(--color-text-primary);
+  background: var(--color-ground-hover);
+}
+.treeEmpty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--color-text-tertiary);
+  font: var(--font-size-md) var(--font-ui);
+}
+.treeStatus {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  height: 24px;
+  padding: 0 var(--space-3);
+  border-top: 1px solid var(--color-line-rule);
+  font: var(--font-size-sm) var(--font-data);
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.treePath {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--color-text-primary);
+}
+.treeDesc {
+  color: var(--color-text-tertiary);
+  font-family: var(--font-ui);
+  flex: none;
+}
+
+/* ---- hex ---- */
+.hex {
+  height: 100%;
+  overflow: auto;
+  font: var(--font-size-md) / 20px var(--font-data);
+  padding: var(--space-2) 0;
+  outline: none;
+}
+.hexRow {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 20px;
+  display: flex;
+  white-space: pre;
+  padding: 0 var(--space-4) 0 var(--space-3);
+}
+.hexOffset {
+  color: var(--color-syntax-line-number);
+  padding-right: var(--space-4);
+}
+.hexBytes {
+  color: var(--color-text-primary);
+  padding-right: var(--space-4);
+}
+.hexAscii {
+  color: var(--color-syntax-string);
+}
+
+/* ---- image ---- */
+.image {
+  display: grid;
+  grid-template-rows: var(--size-tab-bar) minmax(0, 1fr);
+  height: 100%;
+}
+.imageBar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-3);
+  border-bottom: 1px solid var(--color-line-rule);
+}
+.imageMeta {
+  font: var(--font-size-sm) var(--font-data);
+  color: var(--color-text-secondary);
+}
+.imageSep {
+  color: var(--color-text-tertiary);
+  padding: 0 6px;
+}
+.imageStage {
+  overflow: auto;
+  display: grid;
+  place-items: center;
+  padding: var(--space-3);
+  background-color: var(--color-ground-surface);
+  background-image:
+    linear-gradient(45deg, var(--color-ground-raised) 25%, transparent 25%),
+    linear-gradient(-45deg, var(--color-ground-raised) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, var(--color-ground-raised) 75%),
+    linear-gradient(-45deg, transparent 75%, var(--color-ground-raised) 75%);
+  background-size: 16px 16px;
+  background-position:
+    0 0,
+    0 8px,
+    8px -8px,
+    -8px 0;
+}
+.imageFit {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.imageFull {
+  display: block;
+  place-self: start;
+}
+.imageEmpty {
+  font: var(--font-size-md) var(--font-ui);
+  color: var(--color-text-tertiary);
+  text-align: center;
+  padding: var(--space-4);
+}
+.dash {
+  color: var(--color-text-tertiary);
+}
+
+/* ---- diff ---- */
+.diff {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+}
+.diffLabels {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  height: 24px;
+  border-bottom: 1px solid var(--color-line-rule);
+  font: var(--font-size-sm) var(--font-data);
+  color: var(--color-text-secondary);
+}
+.diffLabel {
+  padding: 0 var(--space-3);
+  line-height: 24px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.diffLabel + .diffLabel {
+  border-left: 1px solid var(--color-line-border);
+}
+.diffHost {
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+.diffHost :global(.cm-mergeView),
+.diffHost :global(.cm-editor) {
+  height: 100%;
+}

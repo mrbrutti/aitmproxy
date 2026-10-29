@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    Body, Command, CommandHost, Flow, HeaderMap, HttpRequest, HttpVersion, ParamDef, ParamSchema,
-    Params, Plugin, Registry, TypeDesc, Value,
+    Body, Command, CommandHost, Flow, HeaderMap, HttpRequest, HttpResponse, HttpVersion,
+    InterceptState, ParamDef, ParamSchema, Params, Plugin, Registry, TypeDesc, Value,
 };
 
 use crate::block_on;
@@ -89,24 +89,65 @@ fn apply_edits(
             "authority" => req.authority = as_str(key, val)?.to_string(),
             "path" => req.path = as_str(key, val)?.to_string(),
             "body" => req.body = as_body(key, val)?,
-            "headers" => {
-                let Value::Object(headers) = val else {
-                    anyhow::bail!("edit `headers` must be an object, got {val:?}");
-                };
-                for (name, hval) in headers {
-                    let value = as_str(name, hval)?;
-                    // Validate before mutating so a CRLF-injected value is refused
-                    // and leaves the stored request unchanged.
-                    req.headers.remove(name);
-                    req.headers
-                        .try_set(name, value)
-                        .map_err(|e| anyhow::anyhow!("edit `headers`: {e}"))?;
-                }
-            }
+            "headers" => apply_header_edits(&mut req.headers, val)?,
+            "status" => anyhow::bail!(
+                "edit `status` is only valid for a response parked at the response phase"
+            ),
             other => anyhow::bail!("unknown edit key `{other}`"),
         }
     }
     Ok(())
+}
+
+/// Apply an `edits` object to a parked response: `status`, `headers`, `body`. The
+/// request-only keys (`method`, `scheme`, `authority`, `path`) are rejected — they
+/// have no meaning for a response.
+fn apply_response_edits(
+    resp: &mut HttpResponse,
+    edits: &std::collections::BTreeMap<String, Value>,
+) -> anyhow::Result<()> {
+    for (key, val) in edits {
+        match key.as_str() {
+            "status" => resp.status = as_status(key, val)?,
+            "body" => resp.body = as_body(key, val)?,
+            "headers" => apply_header_edits(&mut resp.headers, val)?,
+            other => anyhow::bail!(
+                "edit key `{other}` is not valid for a response (response edits: status, headers, body)"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Replace each named header (remove-then-set), validating before mutating so a
+/// CRLF-injected value is refused and leaves the map unchanged.
+fn apply_header_edits(headers: &mut HeaderMap, val: &Value) -> anyhow::Result<()> {
+    let Value::Object(edits) = val else {
+        anyhow::bail!("edit `headers` must be an object, got {val:?}");
+    };
+    for (name, hval) in edits {
+        let value = as_str(name, hval)?;
+        headers.remove(name);
+        headers
+            .try_set(name, value)
+            .map_err(|e| anyhow::anyhow!("edit `headers`: {e}"))?;
+    }
+    Ok(())
+}
+
+/// An HTTP status code edit: an integer in the valid status range.
+fn as_status(key: &str, val: &Value) -> anyhow::Result<u16> {
+    let n = match val {
+        Value::Int(n) => *n,
+        other => anyhow::bail!("`{key}` must be an integer, got {other:?}"),
+    };
+    let code =
+        u16::try_from(n).map_err(|_| anyhow::anyhow!("`{key}` {n} is not a valid HTTP status"))?;
+    if (100..=599).contains(&code) {
+        Ok(code)
+    } else {
+        anyhow::bail!("`{key}` {code} is outside the HTTP status range 100-599")
+    }
 }
 
 fn as_str<'a>(key: &str, val: &'a Value) -> anyhow::Result<&'a str> {
@@ -138,7 +179,9 @@ impl Command for FlowMutate {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "Edit a captured HTTP request in place (method, path, headers, body)."
+            description: "Edit a captured HTTP flow in place. Edits apply to the request \
+                          (method, path, headers, body); when the flow is parked at the response \
+                          phase they apply to the response and `status` is valid."
                 .into(),
             params: vec![
                 ParamDef {
@@ -149,7 +192,7 @@ impl Command for FlowMutate {
                 },
                 ParamDef {
                     name: "edits".into(),
-                    ty: TypeDesc::Object(request_fields(false)),
+                    ty: TypeDesc::Object(edit_fields()),
                     required: true,
                     description: "The fields to change.".into(),
                 },
@@ -161,21 +204,43 @@ impl Command for FlowMutate {
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         let id = args.get_flow_id("id")?;
         let edits = args.get_object("edits")?.clone();
-        if host.store().get(id).is_none() {
-            anyhow::bail!("no flow with id {id}");
-        }
-        // Validate against a snapshot before touching the store, so a bad edit
-        // (e.g. an unknown key) leaves the stored flow unchanged.
-        if let Some(Flow::Http(mut snapshot)) = host.store().get(id) {
-            apply_edits(&mut snapshot.request, &edits)?;
+        let Some(Flow::Http(snapshot)) = host.store().get(id) else {
+            match host.store().get(id) {
+                None => anyhow::bail!("no flow with id {id}"),
+                Some(_) => anyhow::bail!("flow {id} is not an HTTP flow"),
+            }
+        };
+
+        // A flow parked at the response phase (`Intercepted` and carrying a
+        // response) is edited on its response, where `status` is valid; every
+        // other flow is edited on its request, where `status` is rejected.
+        let edit_response = matches!(snapshot.intercept, InterceptState::Intercepted { .. })
+            && snapshot.response.is_some();
+
+        // Validate against the snapshot before touching the store, so a bad edit
+        // (an unknown key, a bad status, a CRLF header) leaves the flow unchanged.
+        if edit_response {
+            let mut resp = snapshot.response.clone().expect("response present");
+            apply_response_edits(&mut resp, &edits)?;
         } else {
-            anyhow::bail!("flow {id} is not an HTTP flow");
+            let mut req = snapshot.request.clone();
+            apply_edits(&mut req, &edits)?;
         }
+
         let mut result: anyhow::Result<()> = Ok(());
         host.store().update(id, &mut |flow: &mut Flow| {
             if let Flow::Http(f) = flow {
-                result = apply_edits(&mut f.request, &edits);
-                // Record that the request was edited, so the inspector's "Edited"
+                result = if edit_response {
+                    match f.response.as_mut() {
+                        Some(resp) => apply_response_edits(resp, &edits),
+                        None => Err(anyhow::anyhow!(
+                            "flow {id} lost its response before the edit"
+                        )),
+                    }
+                } else {
+                    apply_edits(&mut f.request, &edits)
+                };
+                // Record that the flow was edited, so the inspector's "Edited"
                 // flag (flow.detail.edited) reflects a real mutation.
                 if result.is_ok() {
                     f.metadata.edited = true;
@@ -185,6 +250,20 @@ impl Command for FlowMutate {
         result?;
         Ok(Value::Str(id.to_string()))
     }
+}
+
+/// The edit fields `flow.mutate` understands: the request fields plus `status`
+/// (valid only for a response parked at the response phase).
+fn edit_fields() -> Vec<ParamDef> {
+    let mut fields = request_fields(false);
+    fields.push(ParamDef {
+        name: "status".into(),
+        ty: TypeDesc::Int,
+        required: false,
+        description: "Response status code; only valid for a flow parked at the response phase."
+            .into(),
+    });
+    fields
 }
 
 /// `request.send {…}` → craft a request, guard it, send it, capture it.
