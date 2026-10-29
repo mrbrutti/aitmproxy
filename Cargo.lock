@@ -262,6 +262,7 @@ version = "0.1.0"
 dependencies = [
  "aitm-core",
  "aitm-plugin",
+ "aitm-plugins",
  "anyhow",
  "bytes",
  "futures",

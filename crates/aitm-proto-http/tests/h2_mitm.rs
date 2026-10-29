@@ -6,17 +6,21 @@
 //! CONNECT. These bind loopback ports, so they run under the Terminal panel, not
 //! the sandbox (CLAUDE.md).
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aitm_core::{
-    Body, Config, Event, Flow, FlowCtx, FlowStore, HeaderMap, HttpFlow, HttpResponse, HttpVersion,
-    Plugin, Proxy, ScopeConfig, ScopeEntry, Verdict,
+    Body, CommandHost, Config, Event, Flow, FlowCtx, FlowId, FlowStore, HeaderMap, HttpFlow,
+    HttpRequest, HttpResponse, HttpVersion, InterceptState, Params, Plugin, Proxy, ProxyClient,
+    Registry, ScopeConfig, ScopeEntry, ScopeRateGuard, Value, Verdict,
 };
+use aitm_plugins::{InterceptPlugin, MutatePlugin};
 use aitm_proto_http::{CertAuthority, HttpModule};
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -653,4 +657,473 @@ async fn body_over_cap_truncated_copy() {
         Some(len) => assert_eq!(len, cap, "stored response copy must be capped"),
         None => panic!("expected a buffered (truncated) response body"),
     }
+}
+
+// --- Task 3: interception semantics on h2 ------------------------------------
+//
+// Park / mutate / kill are exercised end to end through the real `InterceptPlugin`
+// and its `flow.intercept`/`flow.mutate`/`flow.resume`/`flow.kill` commands,
+// invoked through the shared registry — the same plugin set the chain dispatches
+// through. Each test stands up an h2 origin behind the forged-leaf TLS listener
+// and drives real h2 streams through the proxy.
+
+/// A proxy client the command host never actually sends through; present to
+/// satisfy `CommandHost` (the `flow.*` commands here touch only the store).
+struct StubClient;
+
+impl ProxyClient for StubClient {
+    fn send(&self, _req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+        Box::pin(async { anyhow::bail!("stub client") })
+    }
+}
+
+/// Like [`run_proxy`], but also hands back the shared registry and guard so a test
+/// can invoke `flow.*` commands against the same plugin set the chain dispatches
+/// through. `plugins` should include the real [`InterceptPlugin`].
+async fn run_proxy_intercept(
+    ca: Arc<CertAuthority>,
+    plugins: Vec<Box<dyn Plugin>>,
+) -> (
+    SocketAddr,
+    Arc<Registry>,
+    Arc<dyn FlowStore>,
+    Arc<dyn ScopeRateGuard>,
+) {
+    let config = Config {
+        scope: ScopeConfig {
+            entries: vec![ScopeEntry {
+                host: "127.0.0.1".to_string(),
+            }],
+            ..ScopeConfig::default()
+        },
+        ..Config::default()
+    };
+    let mut builder = Proxy::builder()
+        .with_config(config)
+        .register_module(Arc::new(HttpModule::with_ca(ca).with_insecure(true)));
+    for plugin in plugins {
+        builder = builder.register_plugin(plugin);
+    }
+    let proxy = builder.build().expect("build proxy");
+    let registry = proxy.registry_arc();
+    let store = proxy.store();
+    let guard = proxy.guard();
+    let addr = free_port();
+    tokio::spawn(async move {
+        let _ = proxy.run(addr).await;
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(addr).await.is_err() {
+        assert!(Instant::now() < deadline, "proxy never started listening");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    (addr, registry, store, guard)
+}
+
+fn params(pairs: &[(&str, Value)]) -> Params {
+    Params::new(
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect::<BTreeMap<_, _>>(),
+    )
+}
+
+fn obj(pairs: &[(&str, Value)]) -> Value {
+    Value::Object(
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect::<BTreeMap<_, _>>(),
+    )
+}
+
+/// Invoke a `flow.*` command through the registry, failing the test on any error.
+fn invoke(
+    registry: &Registry,
+    store: &dyn FlowStore,
+    guard: &dyn ScopeRateGuard,
+    command: &str,
+    args: Params,
+) {
+    let client = StubClient;
+    let host = CommandHost::new(store, &client, guard, None);
+    registry
+        .command(command)
+        .unwrap_or_else(|| panic!("{command} registered"))
+        .invoke(args, &host)
+        .unwrap_or_else(|e| panic!("{command} failed: {e}"));
+}
+
+/// Wait until the flow for `path` is parked (`Intercepted`); return its id.
+async fn wait_for_parked_path(store: &dyn FlowStore, path: &str) -> FlowId {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        for id in store.list() {
+            if let Some(Flow::Http(f)) = store.get(id) {
+                if f.request.path == path
+                    && matches!(f.intercept, InterceptState::Intercepted { .. })
+                {
+                    return id;
+                }
+            }
+        }
+        assert!(Instant::now() < deadline, "no flow parked for {path}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// One `GET path` over an existing h2 connection, surfacing a stream reset (or any
+/// h2 error) as `Err` rather than panicking — so a killed stream can be observed.
+async fn h2_try_get(
+    send_req: &h2::client::SendRequest<Bytes>,
+    upstream: SocketAddr,
+    path: &str,
+) -> anyhow::Result<(u16, Vec<u8>)> {
+    let mut sr = send_req.clone().ready().await?;
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(format!("https://{upstream}{path}"))
+        .body(())?;
+    let (resp_fut, _send_body) = sr.send_request(req, true)?;
+    let resp = resp_fut.await?;
+    let status = resp.status().as_u16();
+    let mut body = resp.into_body();
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk?;
+        let _ = body.flow_control().release_capacity(chunk.len());
+        buf.extend_from_slice(&chunk);
+    }
+    Ok((status, buf))
+}
+
+/// One request-phase rule object matching `url` (a glob), as it crosses the bus.
+fn request_rule(url: &str) -> Value {
+    obj(&[
+        ("url", Value::Str(url.into())),
+        ("phase", Value::Str("request".into())),
+    ])
+}
+
+// --- AC-H2.4 (per-stream park does not stall siblings) -----------------------
+
+/// Parking one stream at a request breakpoint must not block the connection or
+/// its sibling streams: `/admin` parks while `/a` and `/b` complete on the same
+/// h2 connection, and `/admin` completes only after `flow.resume`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn intercept_one_stream_others_complete() {
+    let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
+    let root_pem = ca.root_cert_pem().to_string();
+    let log = Arc::new(Mutex::new(OriginLog::default()));
+    let origin = spawn_origin(
+        vec![ALPN_H2.to_vec()],
+        log.clone(),
+        b"sibling-body".to_vec(),
+    )
+    .await;
+    let (proxy, registry, store, guard) =
+        run_proxy_intercept(ca, vec![Box::new(InterceptPlugin::new())]).await;
+
+    // Arm a request-phase breakpoint that matches only `/admin`.
+    invoke(
+        &registry,
+        store.as_ref(),
+        guard.as_ref(),
+        "flow.intercept",
+        params(&[
+            ("enabled", Value::Bool(true)),
+            ("rules", Value::Array(vec![request_rule("*/admin")])),
+        ]),
+    );
+
+    let send_req = connect_h2(proxy, origin, &root_pem).await;
+
+    // `/admin` parks; drive it on its own task so the test can proceed meanwhile.
+    let admin = {
+        let sr = send_req.clone();
+        tokio::spawn(async move { h2_try_get(&sr, origin, "/admin").await })
+    };
+    let admin_id = wait_for_parked_path(store.as_ref(), "/admin").await;
+
+    // While `/admin` is parked, two sibling streams complete on the same connection.
+    let (sa, ba) = h2_try_get(&send_req, origin, "/a")
+        .await
+        .expect("/a completes");
+    let (sb, bb) = h2_try_get(&send_req, origin, "/b")
+        .await
+        .expect("/b completes");
+    assert_eq!(sa, 200);
+    assert_eq!(sb, 200);
+    assert_eq!(ba, b"sibling-body");
+    assert_eq!(bb, b"sibling-body");
+
+    // `/admin` is still parked (its task has not finished).
+    assert!(
+        !admin.is_finished(),
+        "/admin must stay parked while siblings complete"
+    );
+    assert!(
+        matches!(store.get(admin_id), Some(Flow::Http(f)) if matches!(f.intercept, InterceptState::Intercepted { .. })),
+        "/admin must still be Intercepted"
+    );
+
+    // Resume `/admin`; it now completes too.
+    invoke(
+        &registry,
+        store.as_ref(),
+        guard.as_ref(),
+        "flow.resume",
+        params(&[("id", Value::Str(admin_id.to_string()))]),
+    );
+    let (sadmin, _) = admin.await.unwrap().expect("/admin completes after resume");
+    assert_eq!(sadmin, 200);
+}
+
+// --- AC-H2.5 (request-phase edit reaches the origin) -------------------------
+
+/// A request parked at the request phase, mutated with an added header, then
+/// resumed, reaches the origin with the injected header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_request_mutate_reaches_origin() {
+    let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
+    let root_pem = ca.root_cert_pem().to_string();
+    let log = Arc::new(Mutex::new(OriginLog::default()));
+    let origin = spawn_origin(vec![ALPN_H2.to_vec()], log.clone(), b"ok".to_vec()).await;
+    let (proxy, registry, store, guard) = run_proxy_intercept(
+        ca,
+        vec![
+            Box::new(InterceptPlugin::new()),
+            Box::new(MutatePlugin::new()),
+        ],
+    )
+    .await;
+
+    // Global request-phase arm: every request parks at the request phase.
+    invoke(
+        &registry,
+        store.as_ref(),
+        guard.as_ref(),
+        "flow.intercept",
+        params(&[("enabled", Value::Bool(true))]),
+    );
+
+    let send_req = connect_h2(proxy, origin, &root_pem).await;
+    let get = {
+        let sr = send_req.clone();
+        tokio::spawn(async move { h2_try_get(&sr, origin, "/edit").await })
+    };
+    let id = wait_for_parked_path(store.as_ref(), "/edit").await;
+
+    // Add a header to the parked request, then resume it.
+    invoke(
+        &registry,
+        store.as_ref(),
+        guard.as_ref(),
+        "flow.mutate",
+        params(&[
+            ("id", Value::Str(id.to_string())),
+            (
+                "edits",
+                obj(&[("headers", obj(&[("X-Edit", Value::Str("1".into()))]))]),
+            ),
+        ]),
+    );
+    invoke(
+        &registry,
+        store.as_ref(),
+        guard.as_ref(),
+        "flow.resume",
+        params(&[("id", Value::Str(id.to_string()))]),
+    );
+
+    let (status, _) = get.await.unwrap().expect("/edit completes after resume");
+    assert_eq!(status, 200);
+
+    let l = log.lock().unwrap();
+    assert_eq!(l.count(), 1, "the mutated request must reach the origin");
+    assert_eq!(
+        l.header(0, "x-edit").as_deref(),
+        Some("1"),
+        "the injected header must reach the origin"
+    );
+}
+
+// --- AC-H2.5 (response-phase edit reaches the client) ------------------------
+
+/// A response parked at the response phase (before any client byte), its status
+/// edited to 418 and resumed, is delivered to the client as h2 `:status 418` with
+/// the origin's body still forwarded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_response_status_418() {
+    let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
+    let root_pem = ca.root_cert_pem().to_string();
+    let log = Arc::new(Mutex::new(OriginLog::default()));
+    let origin = spawn_origin(vec![ALPN_H2.to_vec()], log.clone(), b"teapot-body".to_vec()).await;
+    let (proxy, registry, store, guard) = run_proxy_intercept(
+        ca,
+        vec![
+            Box::new(InterceptPlugin::new()),
+            Box::new(MutatePlugin::new()),
+        ],
+    )
+    .await;
+
+    // Response-phase rule: every flow parks at the response phase (none at request).
+    invoke(
+        &registry,
+        store.as_ref(),
+        guard.as_ref(),
+        "flow.intercept",
+        params(&[(
+            "rules",
+            Value::Array(vec![obj(&[("phase", Value::Str("response".into()))])]),
+        )]),
+    );
+
+    let send_req = connect_h2(proxy, origin, &root_pem).await;
+    let get = {
+        let sr = send_req.clone();
+        tokio::spawn(async move { h2_try_get(&sr, origin, "/page").await })
+    };
+    let id = wait_for_parked_path(store.as_ref(), "/page").await;
+
+    // Edit the parked response's status, then resume it.
+    invoke(
+        &registry,
+        store.as_ref(),
+        guard.as_ref(),
+        "flow.mutate",
+        params(&[
+            ("id", Value::Str(id.to_string())),
+            ("edits", obj(&[("status", Value::Int(418))])),
+        ]),
+    );
+    invoke(
+        &registry,
+        store.as_ref(),
+        guard.as_ref(),
+        "flow.resume",
+        params(&[("id", Value::Str(id.to_string()))]),
+    );
+
+    let (status, body) = get.await.unwrap().expect("/page completes after resume");
+    assert_eq!(status, 418, "client must receive the edited status");
+    assert_eq!(body, b"teapot-body", "the origin body is still forwarded");
+}
+
+// --- AC-H2.6 (kill → RST_STREAM) ---------------------------------------------
+
+/// `flow.kill {mode:"reset"}` resets the killed stream with RST_STREAM(CANCEL)
+/// while a second stream on the same connection still completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_kill_reset_is_rst_stream() {
+    let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
+    let root_pem = ca.root_cert_pem().to_string();
+    let log = Arc::new(Mutex::new(OriginLog::default()));
+    let origin = spawn_origin(vec![ALPN_H2.to_vec()], log.clone(), b"live-body".to_vec()).await;
+    let (proxy, registry, store, guard) =
+        run_proxy_intercept(ca, vec![Box::new(InterceptPlugin::new())]).await;
+
+    // Request-phase rule matching only `/kill`, so `/live` sails through.
+    invoke(
+        &registry,
+        store.as_ref(),
+        guard.as_ref(),
+        "flow.intercept",
+        params(&[
+            ("enabled", Value::Bool(true)),
+            ("rules", Value::Array(vec![request_rule("*/kill")])),
+        ]),
+    );
+
+    let send_req = connect_h2(proxy, origin, &root_pem).await;
+    let killed = {
+        let sr = send_req.clone();
+        tokio::spawn(async move { h2_try_get(&sr, origin, "/kill").await })
+    };
+    let kill_id = wait_for_parked_path(store.as_ref(), "/kill").await;
+
+    // A sibling stream completes normally while `/kill` is parked.
+    let (slive, blive) = h2_try_get(&send_req, origin, "/live")
+        .await
+        .expect("/live completes");
+    assert_eq!(slive, 200);
+    assert_eq!(blive, b"live-body");
+
+    // Kill `/kill` with a reset: the client observes RST_STREAM(CANCEL).
+    invoke(
+        &registry,
+        store.as_ref(),
+        guard.as_ref(),
+        "flow.kill",
+        params(&[
+            ("id", Value::Str(kill_id.to_string())),
+            ("mode", Value::Str("reset".into())),
+        ]),
+    );
+
+    let err = killed
+        .await
+        .unwrap()
+        .expect_err("a reset kill must surface as an h2 stream error");
+    let h2_err = err
+        .downcast_ref::<h2::Error>()
+        .unwrap_or_else(|| panic!("the error must be an h2 stream error, got {err:?}"));
+    assert_eq!(
+        h2_err.reason(),
+        Some(h2::Reason::CANCEL),
+        "the killed stream must be reset with CANCEL (RST_STREAM)"
+    );
+}
+
+// --- AC-H2.6 (kill 429 opens no upstream) ------------------------------------
+
+/// `flow.kill {mode:"429"}` answers the client with a synthesized `:status 429`
+/// and opens no upstream stream (the origin records zero requests).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_kill_429_no_upstream() {
+    let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
+    let root_pem = ca.root_cert_pem().to_string();
+    let log = Arc::new(Mutex::new(OriginLog::default()));
+    let origin = spawn_origin(vec![ALPN_H2.to_vec()], log.clone(), b"origin".to_vec()).await;
+    let (proxy, registry, store, guard) =
+        run_proxy_intercept(ca, vec![Box::new(InterceptPlugin::new())]).await;
+
+    invoke(
+        &registry,
+        store.as_ref(),
+        guard.as_ref(),
+        "flow.intercept",
+        params(&[("enabled", Value::Bool(true))]),
+    );
+
+    let send_req = connect_h2(proxy, origin, &root_pem).await;
+    let get = {
+        let sr = send_req.clone();
+        tokio::spawn(async move { h2_try_get(&sr, origin, "/gone").await })
+    };
+    let id = wait_for_parked_path(store.as_ref(), "/gone").await;
+
+    invoke(
+        &registry,
+        store.as_ref(),
+        guard.as_ref(),
+        "flow.kill",
+        params(&[
+            ("id", Value::Str(id.to_string())),
+            ("mode", Value::Str("429".into())),
+        ]),
+    );
+
+    let (status, _) = get.await.unwrap().expect("/gone gets a synthesized 429");
+    assert_eq!(status, 429, "client must receive a synthesized 429");
+
+    // Give any (erroneous) upstream stream a moment to land before asserting zero.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        log.lock().unwrap().count(),
+        0,
+        "a synthesized 429 must open no upstream stream"
+    );
 }
