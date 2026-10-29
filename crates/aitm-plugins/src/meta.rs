@@ -104,6 +104,10 @@ impl Command for FlowMark {
         "flow.mark"
     }
 
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Write
+    }
+
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description: "Replace a flow's highlight mark set (e.g. colour names); an empty \
@@ -151,6 +155,10 @@ struct FlowComment;
 impl Command for FlowComment {
     fn name(&self) -> &str {
         "flow.comment"
+    }
+
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Write
     }
 
     fn schema(&self) -> ParamSchema {

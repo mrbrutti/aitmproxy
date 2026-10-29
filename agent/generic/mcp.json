@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "aitmproxy": {
+      "command": "python3",
+      "args": [
+        "../bridge.py",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8084",
+        "--token-file",
+        "./agent.token"
+      ],
+      "description": "aitmproxy MCP bus over the stdio<->loopback-TCP bridge; see ../PLAYBOOK.md",
+      "transport": "stdio"
+    }
+  }
+}

@@ -26,8 +26,12 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
 
-/// The loopback token both ends agree on.
+/// The loopback agent token both ends agree on.
 const TOKEN: &str = "tui-live-bus-token";
+/// The operator token: a connection presenting it is `Frontend::Operator` and
+/// bypasses the agent policy gate, as a real operator's `aitm-tui --bus --token`
+/// does. The TUI is the operator, so it presents this.
+const OPERATOR_TOKEN: &str = "tui-live-bus-operator-token";
 /// Longest any single wait in this test is allowed to take.
 const STEP: Duration = Duration::from_secs(2);
 /// The TUI poll interval under test (the plan says 50 ms).
@@ -41,6 +45,11 @@ fn config(tag: &str) -> Config {
         port: 0,
         token: TOKEN.into(),
     };
+    // The loopback transport is agent-facing and gated by the M4 policy, so a
+    // Sensitive command like `flow.intercept` is refused to an agent. The TUI is
+    // the operator and connects with the operator token below, so it is served as
+    // `Frontend::Operator` and bypasses the gate.
+    cfg.mcp.operator_token = Some(OPERATOR_TOKEN.into());
     cfg
 }
 
@@ -142,7 +151,7 @@ async fn tui_bus_task_runs_against_the_live_loopback_server() {
 
     let (connect, label) = aitm_tui::connector(TransportChoice::Tcp {
         addr,
-        token: TOKEN.into(),
+        token: OPERATOR_TOKEN.into(),
     })
     .expect("build the TCP connector");
     assert_eq!(label, addr.to_string());

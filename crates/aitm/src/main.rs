@@ -27,6 +27,7 @@ use aitm::web::{self, WebArgs, WebCommand, WebState};
 use aitm::wire::{assemble_with_scripts, Assembled, Features, ScriptWiring};
 use aitm::{config_file, env, tui};
 use aitm_core::{BrowserDriver, Chain, Plugin};
+use aitm_findings::FindingsPlugin;
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -175,6 +176,9 @@ async fn run() -> anyhow::Result<()> {
         proxy,
         ca,
         listening,
+        agent_state,
+        push_tx,
+        audit_ring,
     } = assemble_with_scripts(
         &cfg,
         &Features {
@@ -188,7 +192,11 @@ async fn run() -> anyhow::Result<()> {
                 .map(|p| Box::new(p.with_max_body(max_body)) as Box<dyn Plugin>)
                 .collect(),
             executor: Some(tier.executor.clone()),
-            commands: Some(Box::new(tier.commands)),
+            // Both command providers: the rhai tier (script.validate/reload,
+            // script.findings) and the persistent findings store, whose
+            // `findings.*` commands read the configured `findings.dir` from the
+            // command host at invocation time (`FindingsPlugin::store_for`).
+            commands: vec![Box::new(tier.commands), Box::new(FindingsPlugin::new())],
         },
     )?;
 
@@ -257,7 +265,15 @@ async fn run() -> anyhow::Result<()> {
     let result = if mode == Mode::Tui {
         tui::run(&cfg, &proxy, services).await
     } else {
-        let mcp = tui::server(&cfg, cfg.mcp.transport.clone(), &services);
+        // The bare-`aitm` server path is the dedicated agent entry point, so it
+        // carries M4's operator/agent token classes, the shared agent policy
+        // gate, the F4 push fan-out and the F2 audit ring. The web bridge and
+        // the TUI are operator frontends, built by `tui::server` without the gate.
+        let mcp = tui::server(&cfg, cfg.mcp.transport.clone(), &services)
+            .with_mcp_roles(cfg.mcp.operator_token.clone(), cfg.mcp.stdio_role)
+            .with_agent_state(agent_state)
+            .with_push(push_tx)
+            .with_audit_ring(audit_ring);
 
         // `aitm web`: a second McpServer over the same registry and services
         // (`serve` consumes the first), driven by the bridge's `handle` calls.

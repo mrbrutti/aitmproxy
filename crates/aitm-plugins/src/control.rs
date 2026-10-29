@@ -63,6 +63,10 @@ impl Command for ProxyStatus {
         "proxy.status"
     }
 
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Read
+    }
+
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description:
@@ -193,6 +197,10 @@ impl Command for ConfigGet {
         "config.get"
     }
 
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Read
+    }
+
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description:
@@ -290,6 +298,7 @@ fn redacted(cfg: &Config) -> Value {
             match cfg.browser.engine {
                 BrowserEngine::Obscura => "obscura",
                 BrowserEngine::Chrome => "chrome",
+                BrowserEngine::Firefox => "firefox",
             }
             .into(),
         ),

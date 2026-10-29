@@ -204,6 +204,9 @@ impl Command for PocBuildCommand {
     fn name(&self) -> &str {
         "poc.build"
     }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Write
+    }
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {

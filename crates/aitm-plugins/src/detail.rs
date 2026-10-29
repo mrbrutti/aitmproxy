@@ -69,6 +69,10 @@ impl Command for FlowDetail {
         "flow.detail"
     }
 
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Read
+    }
+
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description: "Full detail for one flow: headers, bodies, connection info, timing and \

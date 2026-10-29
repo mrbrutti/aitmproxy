@@ -233,6 +233,7 @@ fn config_get_is_redacted_and_requires_config() {
                 port: 9090,
                 token: "SECRET-TOKEN".into(),
             },
+            ..McpConfig::default()
         },
         ..Config::default()
     };

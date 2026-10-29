@@ -549,6 +549,9 @@ impl Command for Status {
     fn name(&self) -> &str {
         "ca.status"
     }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Read
+    }
 
     fn schema(&self) -> ParamSchema {
         schema(
@@ -803,6 +806,11 @@ impl Change {
 impl Command for Change {
     fn name(&self) -> &str {
         self.op.name()
+    }
+
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        // Both `ca.install` and `ca.uninstall` touch the OS trust store.
+        aitm_core::Sensitivity::Sensitive
     }
 
     fn schema(&self) -> ParamSchema {
