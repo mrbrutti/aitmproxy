@@ -9,36 +9,43 @@
 
 use std::sync::Arc;
 
-use aitm_core::{Command, CommandHost, ParamDef, ParamSchema, Params, TypeDesc, Value};
+use aitm_core::{
+    Command, CommandHost, ParamDef, ParamSchema, Params, Sensitivity, TypeDesc, Value,
+};
 
+use crate::commands::agent::{AgentGate, L4AgentGates};
 use crate::guard::{L4Guard, L4GuardError};
 use crate::types::{L4ScopeEntry, L4ScopeId, L4ScopeSource, RateCap};
 
 /// `l4.scope.add {..}` → add a scope entry; returns its minted id.
 pub struct ScopeAdd {
     guard: Arc<L4Guard>,
-    /// Whether a runtime bus caller may widen the deny-by-default scope. Mirrors
-    /// `ca.allow_agent_install`: **false** by default, so the one escape hatch out
-    /// of deny-by-default stays with the operator's config. Pre-M4 the bus cannot
-    /// tell operator from agent (`CommandHost` is always `Frontend::Mcp`), so the
-    /// gate is a construction-time flag from `L4Config`, not a host-identity check.
-    allow_agent_widen: bool,
+    /// The shared per-capability agent gates; `scope.add` reads the **widen** gate.
+    /// Mirrors `ca.allow_agent_install`: **false** by default, so the one escape
+    /// hatch out of deny-by-default stays with the operator's config. The gate now
+    /// lives in the shared [`L4AgentGates`] (seeded from `L4Config::allow_agent_widen`)
+    /// so the operator's `l4.agent.set {capability:"widen"}` governs it live. Unlike
+    /// the wire verbs, widening is refused for **every** runtime bus caller when the
+    /// gate is off (the operator declares scope in config), not just the agent.
+    gates: Arc<L4AgentGates>,
 }
 
 impl ScopeAdd {
-    /// A command over the shared guard. `allow_agent_widen` comes from
-    /// `L4Config::allow_agent_widen` at module construction.
-    pub fn new(guard: Arc<L4Guard>, allow_agent_widen: bool) -> Self {
-        Self {
-            guard,
-            allow_agent_widen,
-        }
+    /// A command over the shared guard + agent gates.
+    pub fn new(guard: Arc<L4Guard>, gates: Arc<L4AgentGates>) -> Self {
+        Self { guard, gates }
     }
 }
 
 impl Command for ScopeAdd {
     fn name(&self) -> &str {
         "l4.scope.add"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        // Widens L4 authority (the one escape hatch out of deny-by-default) — gated
+        // like `scope.add` / `ca.install`.
+        Sensitivity::Sensitive
     }
 
     fn schema(&self) -> ParamSchema {
@@ -98,11 +105,13 @@ impl Command for ScopeAdd {
     }
 
     fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
-        // Deny-by-default: runtime bus widening is gated by config, not by caller
-        // identity (pre-M4 the bus cannot tell operator from agent). When the flag
-        // is off, refuse with the typed [`L4GuardError::ScopeWideningDisabled`] and
-        // add nothing — the operator declares scope in the `l4.scope` config block.
-        if !self.allow_agent_widen {
+        // Deny-by-default: runtime bus widening is gated by the shared **widen** gate.
+        // When it is off, refuse with the typed [`L4GuardError::ScopeWideningDisabled`]
+        // and add nothing — the operator declares scope in the `l4.scope` config block
+        // or opens the gate with `l4.agent.set`. Widening is the one escape hatch out
+        // of deny-by-default, so it is refused for every runtime caller when off (not
+        // operator-bypassed like the wire verbs, which are confirmed instead).
+        if !self.gates.allowed(AgentGate::Widen) {
             return Err(anyhow::Error::new(L4GuardError::ScopeWideningDisabled));
         }
         let entry = entry_from_params(&args)?;
@@ -129,6 +138,11 @@ impl ScopeRemove {
 impl Command for ScopeRemove {
     fn name(&self) -> &str {
         "l4.scope.remove"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        // Narrows authority: mutating, but safe-ward (never touches the wire).
+        Sensitivity::Write
     }
 
     fn schema(&self) -> ParamSchema {
@@ -166,6 +180,10 @@ impl ScopeList {
 impl Command for ScopeList {
     fn name(&self) -> &str {
         "l4.scope.list"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
     }
 
     fn schema(&self) -> ParamSchema {

@@ -15,6 +15,15 @@ pub const CA_ALLOW_AGENT_INSTALL: &str = "AITM_CA_ALLOW_AGENT_INSTALL";
 /// `l4.scope.add` (mirrors `AITM_CA_ALLOW_AGENT_INSTALL`).
 pub const L4_ALLOW_AGENT_WIDEN: &str = "AITM_L4_ALLOW_AGENT_WIDEN";
 
+/// Lets an agent frontend (MCP) drive `l4.inject` / `l4.send_recv`.
+pub const L4_ALLOW_AGENT_INJECT: &str = "AITM_L4_ALLOW_AGENT_INJECT";
+
+/// Lets an agent frontend (MCP) drive `l4.capture.start`.
+pub const L4_ALLOW_AGENT_CAPTURE: &str = "AITM_L4_ALLOW_AGENT_CAPTURE";
+
+/// Lets an agent frontend (MCP) drive the `l4.intercept.*` verdict verbs.
+pub const L4_ALLOW_AGENT_INTERCEPT: &str = "AITM_L4_ALLOW_AGENT_INTERCEPT";
+
 /// Lets an agent frontend (MCP) widen scope with `scope.add`.
 pub const SCOPE_ALLOW_AGENT_WIDEN: &str = "AITM_SCOPE_ALLOW_AGENT_WIDEN";
 
@@ -62,6 +71,15 @@ pub fn apply_rhai(cfg: &mut RhaiConfig, lookup: impl Fn(&str) -> Option<String>)
 pub fn apply_l4(l4: &mut L4Config, lookup: impl Fn(&str) -> Option<String>) {
     if let Some(raw) = lookup(L4_ALLOW_AGENT_WIDEN) {
         l4.allow_agent_widen = is_truthy(&raw);
+    }
+    if let Some(raw) = lookup(L4_ALLOW_AGENT_INJECT) {
+        l4.allow_agent_inject = is_truthy(&raw);
+    }
+    if let Some(raw) = lookup(L4_ALLOW_AGENT_CAPTURE) {
+        l4.allow_agent_capture = is_truthy(&raw);
+    }
+    if let Some(raw) = lookup(L4_ALLOW_AGENT_INTERCEPT) {
+        l4.allow_agent_intercept = is_truthy(&raw);
     }
 }
 
