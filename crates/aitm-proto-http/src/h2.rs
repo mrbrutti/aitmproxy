@@ -28,17 +28,21 @@
 //! never timed out here — a flow parked at a breakpoint is legitimately suspended
 //! and the chain owns that timeout, `intercept_timeout`.)
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use aitm_core::{
-    Body, Event, Flow, FlowId, FlowMeta, HeaderMap, HttpFlow, HttpRequest, HttpResponse,
+    Authority, Body, Event, Flow, FlowId, FlowMeta, HeaderMap, HttpFlow, HttpRequest, HttpResponse,
     HttpVersion, InterceptState, StreamBody,
 };
 use aitm_plugin::{ByteStream, ModuleCtx};
 use anyhow::{anyhow, bail, Context as _, Result};
 use bytes::Bytes;
+use rustls::pki_types::ServerName;
+use rustls::ClientConfig;
+use tokio_rustls::TlsConnector;
 
 use crate::module::Conn;
 use crate::translate;
@@ -72,6 +76,7 @@ pub(crate) async fn serve_h2(
     conn: Conn,
     max_body: usize,
     max_concurrent: usize,
+    upstream_h2_tls: Arc<ClientConfig>,
 ) -> Result<()> {
     // A `usize` cap wider than `u32` saturates rather than wrapping (a wrapped
     // small value would silently throttle the connection to a few streams).
@@ -115,6 +120,15 @@ pub(crate) async fn serve_h2(
     });
 
     let ctx = Arc::new(ctx);
+    // The per-connection upstream pool: the pinned origin's shared `send_req`, plus
+    // a lazily-opened, cached `SendRequest` per rewritten authority a Map Remote
+    // redirect targets (spec §6). Shared (cloned) into every stream task.
+    let upstreams = Upstreams {
+        pinned_authority: conn.tunnel_authority.clone().unwrap_or_default(),
+        pinned: send_req,
+        tls: upstream_h2_tls,
+        extra: Arc::new(Mutex::new(HashMap::new())),
+    };
     let conn = Arc::new(conn);
     // Number of stream tasks still running (including those parked at a
     // breakpoint). An idle accept window only tears the connection down when this
@@ -144,17 +158,121 @@ pub(crate) async fn serve_h2(
         };
         let ctx = ctx.clone();
         let conn = conn.clone();
-        let send_req = send_req.clone();
+        let upstreams = upstreams.clone();
         let in_flight = in_flight.clone();
         in_flight.fetch_add(1, Ordering::SeqCst);
         tokio::spawn(async move {
-            if let Err(e) = stream_task(ctx, conn, request, respond, send_req, max_body).await {
+            if let Err(e) = stream_task(ctx, conn, request, respond, upstreams, max_body).await {
                 tracing::debug!("h2 stream task ended: {e}");
             }
             in_flight.fetch_sub(1, Ordering::SeqCst);
         });
     }
     Ok(())
+}
+
+/// The per-connection upstream pool. The pinned origin (the connection's own
+/// authority) keeps using the shared `pinned` `SendRequest`; a Map Remote rewrite
+/// to a different authority opens — and caches for the connection's lifetime — a
+/// second upstream via [`Upstreams::for_authority`] (spec §6). Cloning shares the
+/// pinned handle and the (`Arc`-wrapped) cache across all stream tasks.
+#[derive(Clone)]
+struct Upstreams {
+    /// The connection's pinned origin (the CONNECT/SNI authority).
+    pinned_authority: String,
+    /// The shared `SendRequest` to the pinned origin.
+    pinned: h2::client::SendRequest<Bytes>,
+    /// An h2-ALPN TLS client config (built from the module's provider + insecure
+    /// posture) used to dial a cross-origin upstream.
+    tls: Arc<ClientConfig>,
+    /// Lazily-opened upstreams keyed by rewritten authority, shared connection-wide.
+    extra: Arc<Mutex<HashMap<String, h2::client::SendRequest<Bytes>>>>,
+}
+
+impl Upstreams {
+    /// The `SendRequest` to use for `authority`: the pinned origin's shared handle
+    /// when it matches the connection's origin (or is absent), else a cached — or
+    /// newly opened — upstream to the rewritten host.
+    async fn for_authority(
+        &self,
+        ctx: &ModuleCtx,
+        authority: &str,
+    ) -> Result<h2::client::SendRequest<Bytes>> {
+        if authority.is_empty() || authority == self.pinned_authority {
+            return Ok(self.pinned.clone());
+        }
+        // Fast path: an upstream for this authority already exists. The lock is
+        // released before any `.await`, so it never spans a suspension point.
+        if let Some(existing) = self
+            .extra
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(authority)
+            .cloned()
+        {
+            return Ok(existing);
+        }
+        // Open a fresh cross-origin upstream, then cache it. Two streams racing to
+        // open the same authority may each open one; the later `insert` wins and the
+        // loser's handle is dropped (its idle connection future ends) — benign.
+        let opened = self.open(ctx, authority).await?;
+        Ok(self
+            .extra
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(authority.to_string())
+            .or_insert(opened)
+            .clone())
+    }
+
+    /// Dial, TLS-connect (ALPN h2) and h2-handshake a new upstream to `authority`.
+    /// The dial goes through [`ModuleCtx::connect_upstream`] (the scope/SSRF guard on
+    /// the browser listener; on the passive MITM listener the maprules plugin is the
+    /// deny point, having already refused an out-of-scope target before any rewrite).
+    async fn open(
+        &self,
+        ctx: &ModuleCtx,
+        authority: &str,
+    ) -> Result<h2::client::SendRequest<Bytes>> {
+        let parsed = Authority::parse_with_default(authority, 443)
+            .map_err(|e| anyhow!("invalid Map Remote authority {authority:?}: {e}"))?;
+        let addr = wire(
+            "resolve cross-origin upstream",
+            tokio::net::lookup_host((parsed.host.as_str(), parsed.port)),
+        )
+        .await?
+        .with_context(|| format!("resolve {authority}"))?
+        .next()
+        .ok_or_else(|| anyhow!("no address for {authority}"))?;
+
+        // Scope/SSRF-guarded dial (raw TCP), then TLS with the mirrored h2 ALPN.
+        let tcp = ctx.connect_upstream(authority, addr).await?;
+        let server_name = ServerName::try_from(parsed.host.clone())
+            .map_err(|e| anyhow!("invalid upstream name {:?}: {e}", parsed.host))?;
+        let tls = wire(
+            "cross-origin TLS",
+            TlsConnector::from(self.tls.clone()).connect(server_name, tcp),
+        )
+        .await?
+        .with_context(|| format!("TLS to cross-origin upstream {authority}"))?;
+
+        let (send_req, up_conn) = wire(
+            "cross-origin h2 handshake",
+            h2::client::Builder::new()
+                .enable_push(false)
+                .max_header_list_size(MAX_HEADER_LIST_SIZE)
+                .header_table_size(HEADER_TABLE_SIZE)
+                .handshake::<_, Bytes>(tls),
+        )
+        .await?
+        .with_context(|| format!("cross-origin h2 handshake with {authority}"))?;
+        tokio::spawn(async move {
+            if let Err(e) = up_conn.await {
+                tracing::warn!("cross-origin upstream h2 connection ended with error: {e}");
+            }
+        });
+        Ok(send_req)
+    }
 }
 
 /// The full per-stream lifecycle, mirroring the h1 `serve` ordering so the emitted
@@ -168,7 +286,7 @@ async fn stream_task(
     conn: Arc<Conn>,
     request: http::Request<h2::RecvStream>,
     respond: h2::server::SendResponse<Bytes>,
-    send_req: h2::client::SendRequest<Bytes>,
+    upstreams: Upstreams,
     max_body: usize,
 ) -> Result<()> {
     let (parts, req_body) = request.into_parts();
@@ -191,7 +309,7 @@ async fn stream_task(
     }));
     ctx.emit(Event::RequestHeaders(id)).await;
 
-    if let Err(e) = drive_stream(&ctx, id, req_body, respond, send_req, max_body).await {
+    if let Err(e) = drive_stream(&ctx, id, req_body, respond, &upstreams, max_body).await {
         // Map the failure to the typed error bus for the still-open flow before
         // bailing, mirroring the h1 arm's `Event::Error` emission.
         ctx.emit(Event::Error {
@@ -213,7 +331,7 @@ async fn drive_stream(
     id: FlowId,
     mut req_body: h2::RecvStream,
     mut respond: h2::server::SendResponse<Bytes>,
-    send_req: h2::client::SendRequest<Bytes>,
+    upstreams: &Upstreams,
     max_body: usize,
 ) -> Result<()> {
     // Drain the request body, capped like h1; release flow-control as consumed.
@@ -318,6 +436,12 @@ async fn drive_stream(
         _ => Vec::new(),
     };
     let req_end = req_bytes.is_empty();
+    // Map Remote cross-origin: a request whose authority no longer matches the
+    // connection's pinned origin is sent over a second upstream to the rewritten
+    // host (opened/cached here); the pinned origin keeps the shared handle (spec §6).
+    // An out-of-scope target was already refused by the maprules plugin above (its
+    // 502 short-circuits before this point), so the original is never sent.
+    let send_req = upstreams.for_authority(ctx, &request.authority).await?;
     let mut send_req = wire("upstream ready", send_req.ready())
         .await?
         .context("upstream h2 not ready")?;

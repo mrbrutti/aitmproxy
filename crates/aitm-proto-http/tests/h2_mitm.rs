@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 use aitm_core::{
     Body, CommandHost, Config, Event, Flow, FlowCtx, FlowId, FlowStore, HeaderMap, HttpFlow,
     HttpRequest, HttpResponse, HttpVersion, InterceptState, Params, Plugin, Proxy, ProxyClient,
-    Registry, ScopeConfig, ScopeEntry, ScopeRateGuard, Value, Verdict,
+    Registry, ScopeConfig, ScopeEntry, ScopeRateGuard, StdGuard, Value, Verdict,
 };
+use aitm_plugin_maprules::MapRulesPlugin;
 use aitm_plugins::{InterceptPlugin, MutatePlugin};
 use aitm_proto_http::{CertAuthority, HttpModule};
 use bytes::Bytes;
@@ -1278,4 +1279,165 @@ async fn upstream_closing_early_emits_flow_error() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+// --- Task 4: Map Remote cross-origin over h2 (AC-H2.8) ------------------------
+//
+// A Map Remote rule rewrites a matching request's authority to a *different* host.
+// Because an h2 connection is pinned to one `:authority`, a cross-origin rewrite
+// needs a SECOND upstream (spec §6). The real `MapRulesPlugin` is driven through
+// the registry (its `map.add` command and its `on_event` rewrite), carrying its own
+// scope guard — the deny-by-default point for Map Remote on the MITM listener.
+
+/// A deny-by-default guard with `in_scope` hosts pre-added, as the maprules plugin
+/// consults before a rewrite (mirrors the binary's `LateGuard`-bound proxy guard).
+fn map_guard(in_scope: &[&str]) -> Arc<dyn ScopeRateGuard> {
+    let guard = Arc::new(StdGuard::default());
+    for host in in_scope {
+        guard.add_scope(ScopeEntry {
+            host: (*host).to_string(),
+        });
+    }
+    guard
+}
+
+/// Add a Map Remote rule `url glob` → `authority` through the registry.
+fn add_map_remote(
+    registry: &Registry,
+    store: &dyn FlowStore,
+    guard: &dyn ScopeRateGuard,
+    url_glob: &str,
+    to_authority: &str,
+) {
+    invoke(
+        registry,
+        store,
+        guard,
+        "map.add",
+        params(&[
+            ("kind", Value::Str("remote".into())),
+            (
+                "condition",
+                obj(&[("url", obj(&[("wildcard", Value::Str(url_glob.into()))]))]),
+            ),
+            (
+                "action",
+                obj(&[("to", obj(&[("authority", Value::Str(to_authority.into()))]))]),
+            ),
+        ]),
+    );
+}
+
+/// An in-scope Map Remote rewrite over h2 opens a second upstream to the rewritten
+/// host: the request reaches `new`, not the pinned origin `old`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn map_remote_h2_to_in_scope_host() {
+    let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
+    let root_pem = ca.root_cert_pem().to_string();
+    // Two recording h2 origins: `old` is the pinned CONNECT target, `new` is the
+    // cross-origin rewrite target (a different port ⇒ a different authority).
+    let old_log = Arc::new(Mutex::new(OriginLog::default()));
+    let new_log = Arc::new(Mutex::new(OriginLog::default()));
+    let old = spawn_origin(
+        vec![ALPN_H2.to_vec()],
+        old_log.clone(),
+        b"old-origin".to_vec(),
+    )
+    .await;
+    let new = spawn_origin(
+        vec![ALPN_H2.to_vec()],
+        new_log.clone(),
+        b"reached-new-origin".to_vec(),
+    )
+    .await;
+
+    // The maprules plugin's guard has `127.0.0.1` in scope, so the redirect to the
+    // `new` origin (also 127.0.0.1) is allowed.
+    let maprules = MapRulesPlugin::new(temp_dir(), true, map_guard(&["127.0.0.1"]));
+    let (proxy, registry, store, guard) = run_proxy_intercept(ca, vec![Box::new(maprules)]).await;
+    add_map_remote(
+        &registry,
+        store.as_ref(),
+        guard.as_ref(),
+        "*/cross",
+        &new.to_string(),
+    );
+
+    let send_req = connect_h2(proxy, old, &root_pem).await;
+    let (status, body) = h2_get(&send_req, old, "/cross").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body, b"reached-new-origin",
+        "an in-scope rewrite must reach the new origin, not the pinned one"
+    );
+
+    // Give any stray upstream stream a moment to land before counting.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let new_l = new_log.lock().unwrap();
+    assert_eq!(new_l.count(), 1, "the new origin must receive the request");
+    assert_eq!(new_l.requests[0].path, "/cross");
+    assert_eq!(
+        old_log.lock().unwrap().count(),
+        0,
+        "the pinned origin must not receive a rewritten request"
+    );
+}
+
+/// An out-of-scope Map Remote rewrite over h2 is refused by the scope guard: the
+/// stream gets an error response and NEITHER origin receives the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn map_remote_h2_out_of_scope_refused() {
+    let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
+    let root_pem = ca.root_cert_pem().to_string();
+    let old_log = Arc::new(Mutex::new(OriginLog::default()));
+    let new_log = Arc::new(Mutex::new(OriginLog::default()));
+    let old = spawn_origin(
+        vec![ALPN_H2.to_vec()],
+        old_log.clone(),
+        b"old-origin".to_vec(),
+    )
+    .await;
+    let new = spawn_origin(
+        vec![ALPN_H2.to_vec()],
+        new_log.clone(),
+        b"reached-new-origin".to_vec(),
+    )
+    .await;
+
+    // The maprules guard scopes `example.com` only, so the redirect to the `new`
+    // origin (127.0.0.1) is out of scope and must be refused.
+    let maprules = MapRulesPlugin::new(temp_dir(), true, map_guard(&["example.com"]));
+    let (proxy, registry, store, guard) = run_proxy_intercept(ca, vec![Box::new(maprules)]).await;
+    add_map_remote(
+        &registry,
+        store.as_ref(),
+        guard.as_ref(),
+        "*/cross",
+        &new.to_string(),
+    );
+
+    let send_req = connect_h2(proxy, old, &root_pem).await;
+    let (status, body) = h2_get(&send_req, old, "/cross").await;
+    assert_eq!(
+        status, 502,
+        "an out-of-scope redirect must be refused with an error status"
+    );
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains(&new.to_string()),
+        "the refusal must name the refused host: {body:?}"
+    );
+
+    // Neither the pinned origin nor the out-of-scope target may receive the request.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        old_log.lock().unwrap().count(),
+        0,
+        "the pinned origin must not receive a refused request"
+    );
+    assert_eq!(
+        new_log.lock().unwrap().count(),
+        0,
+        "the out-of-scope target must never be contacted"
+    );
 }
