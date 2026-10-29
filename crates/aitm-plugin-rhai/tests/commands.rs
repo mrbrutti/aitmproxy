@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use aitm_core::{
     Chain, CommandHost, Event, Flow, FlowId, FlowStore, Frontend, HttpFlow, HttpRequest,
-    MemFlowStore, Params, ProxyClient, Registry, StdGuard, Value, Verdict,
+    MemFlowStore, Params, ProxyClient, Registry, Sensitivity, StdGuard, Value, Verdict,
 };
 use aitm_plugin_rhai::config::{RhaiConfig, RhaiLimits, ScriptEntry};
 use aitm_plugin_rhai::host_core::{FindingSink, MemoryFindingSink, ScriptServices};
@@ -804,4 +804,112 @@ async fn script_list_last_error_survives_the_scripts_own_on_error_dispatch() {
         "on_error's clean run must not clear the recorded failure: {:?}",
         rows[0]
     );
+}
+
+/// `{ name }` as the toggle commands take it.
+fn name_arg(name: &str) -> Params {
+    params(&[("name", Value::Str(name.into()))])
+}
+
+/// The `{ name, enabled }` object a toggle command answers with.
+fn toggled(name: &str, enabled: bool) -> Value {
+    Value::Object(BTreeMap::from([
+        ("name".to_string(), Value::Str(name.into())),
+        ("enabled".to_string(), Value::Bool(enabled)),
+    ]))
+}
+
+/// F8c / AC7: `script.disable` stops the script's hook mutating flows,
+/// `script.enable` restores it; both answer `{ name, enabled }`. Observed
+/// through the real chain, not only the returned bool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_disable_and_enable_toggle_the_live_hook() {
+    let script = TempScript::new("versioned", V1);
+    let h = Harness::new(vec![ScriptEntry::new(script.path())]);
+    assert_eq!(h.x_v().await.as_deref(), Some("1"));
+
+    let out = h
+        .invoke("script.disable", name_arg("versioned"))
+        .expect("disable a loaded script");
+    assert_eq!(out, toggled("versioned", false));
+    assert_eq!(h.x_v().await, None, "a disabled script's hook is skipped");
+
+    let out = h
+        .invoke("script.enable", name_arg("versioned"))
+        .expect("enable a loaded script");
+    assert_eq!(out, toggled("versioned", true));
+    assert_eq!(
+        h.x_v().await.as_deref(),
+        Some("1"),
+        "the hook is live again"
+    );
+}
+
+/// F8c / AC7: an unknown name is the same error `script.reload` returns,
+/// listing what is loaded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_enable_and_disable_unknown_name_lists_loaded_scripts() {
+    let script = TempScript::new("versioned", V1);
+    let h = Harness::new(vec![ScriptEntry::new(script.path())]);
+    for cmd in ["script.enable", "script.disable", "script.reload"] {
+        let err = h
+            .invoke(cmd, name_arg("nope"))
+            .expect_err("an unknown script is an error");
+        assert_eq!(
+            err.to_string(),
+            "no loaded script is named `nope`; loaded: versioned",
+            "{cmd}"
+        );
+    }
+
+    let empty = Harness::new(Vec::new());
+    let err = empty
+        .invoke("script.disable", name_arg("nope"))
+        .expect_err("nothing is loaded");
+    assert_eq!(
+        err.to_string(),
+        "no loaded script is named `nope`; loaded: (none)"
+    );
+}
+
+/// Review Focus: toggling to the state a script is already in succeeds and
+/// reports that state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_enable_and_disable_are_idempotent() {
+    let script = TempScript::new("versioned", V1);
+    let h = Harness::new(vec![ScriptEntry::new(script.path())]);
+
+    // Already enabled: enable is a no-op that still answers.
+    assert_eq!(
+        h.invoke("script.enable", name_arg("versioned"))
+            .expect("enable when enabled"),
+        toggled("versioned", true)
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            h.invoke("script.disable", name_arg("versioned"))
+                .expect("disable, twice"),
+            toggled("versioned", false)
+        );
+    }
+    assert_eq!(h.x_v().await, None);
+    for _ in 0..2 {
+        assert_eq!(
+            h.invoke("script.enable", name_arg("versioned"))
+                .expect("enable, twice"),
+            toggled("versioned", true)
+        );
+    }
+    assert_eq!(h.x_v().await.as_deref(), Some("1"));
+}
+
+/// AC9: both toggle commands are `Sensitive`, so the agent policy gates them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_enable_and_disable_are_sensitive() {
+    let h = Harness::new(Vec::new());
+    for name in ["script.enable", "script.disable"] {
+        let cmd = h.registry.command(name).expect("registered");
+        assert_eq!(cmd.sensitivity(), Sensitivity::Sensitive, "{name}");
+        assert!(cmd.mutates(), "{name}");
+    }
 }

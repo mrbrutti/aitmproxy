@@ -25,6 +25,10 @@
 //!   `{ name, path, api, hooks, enabled, last_error }`, read from the live
 //!   handles and the shared [`ErrorSink`], so it reports current state, not
 //!   the config file. Read-tier, so an agent may call it.
+//! - **`script.enable { name }` / `script.disable { name }`** flip a loaded
+//!   script's live `enabled` flag (a disabled script's hooks are skipped; its
+//!   registered commands remain) and answer `{ name, enabled }`. Idempotent;
+//!   an unknown name gets `script.reload`'s error. `Sensitive`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -88,6 +92,14 @@ impl Plugin for ScriptCommands {
             scripts: self.scripts.clone(),
             errors: Arc::clone(&self.errors),
         }));
+        reg.add_command(Arc::new(Toggle {
+            scripts: self.scripts.clone(),
+            enable: true,
+        }));
+        reg.add_command(Arc::new(Toggle {
+            scripts: self.scripts.clone(),
+            enable: false,
+        }));
     }
 }
 
@@ -104,6 +116,14 @@ struct Reload {
 struct List {
     scripts: Vec<Arc<ScriptHandle>>,
     errors: Arc<ErrorSink>,
+}
+
+/// `script.enable` (`enable: true`) / `script.disable` (`enable: false`): one
+/// type, two registered commands, so the lookup and the answer shape cannot
+/// drift apart.
+struct Toggle {
+    scripts: Vec<Arc<ScriptHandle>>,
+    enable: bool,
 }
 
 struct ScriptFindings {
@@ -239,21 +259,7 @@ impl Command for Reload {
 
     fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
         let name = text(&args, "name")?;
-        let handle = self
-            .scripts
-            .iter()
-            .find(|s| s.name() == name)
-            .ok_or_else(|| {
-                let loaded: Vec<&str> = self.scripts.iter().map(|s| s.name()).collect();
-                anyhow::anyhow!(
-                    "no loaded script is named `{name}`; loaded: {}",
-                    if loaded.is_empty() {
-                        "(none)".to_string()
-                    } else {
-                        loaded.join(", ")
-                    }
-                )
-            })?;
+        let handle = find_script(&self.scripts, &name)?;
         let (ast, meta) = self
             .loader
             .compile(handle.path())
@@ -268,6 +274,51 @@ impl Command for Reload {
             "script reloaded"
         );
         Ok(meta_value(&meta))
+    }
+}
+
+impl Command for Toggle {
+    fn name(&self) -> &str {
+        if self.enable {
+            "script.enable"
+        } else {
+            "script.disable"
+        }
+    }
+
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: if self.enable {
+                "Turn a loaded script's hooks back on live. Idempotent. Answers { name, \
+                 enabled }."
+            } else {
+                "Turn a loaded script's hooks off live without unloading it; commands and \
+                 options it registered stay (the registry is sealed). Idempotent. Answers \
+                 { name, enabled }."
+            }
+            .to_string(),
+            params: vec![param(
+                "name",
+                TypeDesc::Str,
+                true,
+                "the script's NAME (or file stem) as loaded",
+            )],
+            result: TypeDesc::Any,
+        }
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Sensitive
+    }
+
+    fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+        let name = text(&args, "name")?;
+        let handle = find_script(&self.scripts, &name)?;
+        handle.set_enabled(self.enable);
+        Ok(Value::Object(BTreeMap::from([
+            ("name".to_string(), Value::Str(handle.name().to_string())),
+            ("enabled".to_string(), Value::Bool(handle.is_enabled())),
+        ])))
     }
 }
 
@@ -361,6 +412,25 @@ impl Command for List {
                 .collect(),
         ))
     }
+}
+
+/// The loaded script called `name`, or the one error every by-name script
+/// command shares: it names the miss and lists what is loaded.
+fn find_script<'a>(
+    scripts: &'a [Arc<ScriptHandle>],
+    name: &str,
+) -> anyhow::Result<&'a Arc<ScriptHandle>> {
+    scripts.iter().find(|s| s.name() == name).ok_or_else(|| {
+        let loaded: Vec<&str> = scripts.iter().map(|s| s.name()).collect();
+        anyhow::anyhow!(
+            "no loaded script is named `{name}`; loaded: {}",
+            if loaded.is_empty() {
+                "(none)".to_string()
+            } else {
+                loaded.join(", ")
+            }
+        )
+    })
 }
 
 /// A script's metadata as the frontends render it.
