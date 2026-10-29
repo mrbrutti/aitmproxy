@@ -250,7 +250,7 @@ pub fn start_capture(
             id: L4FlowId::new(),
             kind: L4FlowKind::Capture,
             bind,
-            packets: Vec::new(),
+            packets: std::collections::VecDeque::new(),
             metadata: L4Meta::default(),
         });
         if tx.send(Ok(flow_id)).is_err() {

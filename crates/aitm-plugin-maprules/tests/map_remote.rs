@@ -338,6 +338,41 @@ fn map_remote_url_non_http_scheme_refused() {
     );
 }
 
+/// A Map Remote URL whose path carries CR/LF (or a bare space) is refused (502)
+/// rather than rewritten: the path reaches the upstream request line verbatim,
+/// so it would otherwise smuggle a header or a second request.
+#[test]
+fn map_remote_url_crlf_path_refused() {
+    let reg = registry(guard_with_scope(&["evil.example"]));
+    add_remote(
+        &reg,
+        "old.example",
+        obj(&[(
+            "url",
+            Value::Str("http://evil.example/a HTTP/1.1\r\nX-Smuggled: 1\r\n\r\nGET /b".into()),
+        )]),
+    );
+
+    let (served, verdict) = dispatch(
+        &reg,
+        &Event::RequestHeaders(FlowId::new()),
+        http_flow("http", "old.example", "/orders"),
+    );
+
+    assert_eq!(
+        verdict,
+        Verdict::Halt,
+        "a CRLF-bearing redirect path is refused, not forwarded"
+    );
+    let f = as_http(&served);
+    assert_eq!(
+        f.request.authority, "old.example",
+        "the refused rewrite leaves the request target untouched"
+    );
+    let resp = f.response.as_ref().expect("a 502 error response");
+    assert_eq!(resp.status, 502, "the path refusal is a 502");
+}
+
 /// A guard that counts `check_active` calls, delegating scope/rate decisions to an
 /// inner [`StdGuard`]. Panel finding #4: a URL/path-matched Map Remote rule must
 /// consult the guard once per request, not once per request *event*.

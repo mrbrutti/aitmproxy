@@ -264,7 +264,7 @@ impl Command for Inject {
                 filter: None,
                 queue: None,
             },
-            packets: Vec::new(),
+            packets: std::collections::VecDeque::new(),
             metadata: L4Meta::default(),
         });
 

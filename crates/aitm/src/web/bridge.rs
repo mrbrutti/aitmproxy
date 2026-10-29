@@ -6,6 +6,7 @@
 //! the bridge authenticates, splits lines, and forwards.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use aitm_core::Frontend;
 use aitm_mcp::ConnCtx;
@@ -28,6 +29,13 @@ use super::WebState;
 
 /// Same bound as the MCP transports (`aitm-mcp` `MAX_MESSAGE_BYTES`).
 pub const MAX_MESSAGE_BYTES: usize = 16 << 20;
+
+/// A client must send its token within this budget after the upgrade. Without
+/// it a peer that upgrades then stalls — or sends only pings / whitespace — pins
+/// the connection and its task indefinitely, all *before* `classify_token`: an
+/// unauthenticated connection-exhaustion DoS (remote under
+/// `AITM_WEB_INSECURE_BIND`). The deadline is absolute, so pings cannot extend it.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// JSON-RPC error code for a refused token (matches `LoopbackTcp`).
 pub const UNAUTHORIZED: i64 = -32001;
@@ -119,8 +127,16 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
     // token's class picks the role every later line runs as.
     let mut pending: Vec<String> = Vec::new();
     let role;
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
     loop {
-        match ws.next().await {
+        let next = match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(next) => next,
+            Err(_) => {
+                debug!("web bus: authentication timed out before a token arrived");
+                return close(ws, CloseCode::Policy, "authentication timeout").await;
+            }
+        };
+        match next {
             Some(Ok(Message::Text(text))) => {
                 let mut lines = lines_of(text.as_str());
                 let Some(first) = lines.next() else {

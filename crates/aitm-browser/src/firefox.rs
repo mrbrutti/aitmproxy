@@ -15,7 +15,6 @@ use std::io;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -107,15 +106,18 @@ struct ProfileDir(PathBuf);
 
 impl ProfileDir {
     fn new() -> anyhow::Result<Self> {
-        // Unique per call within this process, so concurrent launches never share
-        // a profile dir.
-        static SEQ: AtomicU64 = AtomicU64::new(0);
+        // Mirror obscura's run-dir hardening: an unpredictable token (so a local
+        // attacker cannot pre-create the path) and an exclusive `0700` create
+        // (fails if the path already exists, and keeps other local users from
+        // reading the live profile — cookies, session storage — or planting a
+        // `user.js`/extension via a symlink). `create_dir_all` did neither, so
+        // on a multi-user host the profile was world-readable and pre-creatable.
         let dir = std::env::temp_dir().join(format!(
             "aitm-firefox-{}-{}",
             std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
+            crate::obscura::random_token()
         ));
-        std::fs::create_dir_all(&dir)
+        crate::obscura::create_private_dir(&dir)
             .with_context(|| format!("creating the Firefox profile dir {}", dir.display()))?;
         Ok(Self(dir))
     }
@@ -473,6 +475,24 @@ mod tests {
     use super::*;
     use aitm_core::FirefoxConfig;
     use std::ffi::OsStr;
+
+    /// The throwaway profile must be created private (`0700`) and exclusively,
+    /// not world-readable via `create_dir_all`: it holds the live session's
+    /// cookies/storage and a `user.js` a co-tenant must not be able to plant.
+    #[cfg(unix)]
+    #[test]
+    fn profile_dir_is_private_and_exclusive() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = ProfileDir::new().expect("create profile dir");
+        let mode = std::fs::metadata(p.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "profile dir must be 0700, got {mode:o}");
+        // Exclusive: a second create at the same path fails rather than reusing
+        // or resetting an attacker-planted directory.
+        assert!(
+            crate::obscura::create_private_dir(p.path()).is_err(),
+            "create must be exclusive (fail if the path already exists)"
+        );
+    }
 
     /// RF#5 — `user.js` sets the five proxy prefs the spec names, pointed at the
     /// configured port, so the throwaway profile routes through aitmproxy's

@@ -659,6 +659,25 @@ fn build_request(
     let url = tmpl.render(&http.url, live)?;
     let (scheme, authority, path) = parse_url(&url)?;
 
+    // Nothing reaches the request line unvalidated. The wire encoder formats
+    // `"{method} {path} HTTP/1.1"` with no CR/LF strip, so a control byte or
+    // space in the method or path — whether from the PoC document or templated
+    // from caller `vars` — would smuggle a header or a whole second request
+    // past the scope guard (which only vets the authority). This is the same
+    // check the Rhai `http.send` / `flow.request` paths run.
+    if !is_http_token(&http.method) {
+        anyhow::bail!(
+            "poc.run: http step method {:?} must be an HTTP token like GET or POST",
+            http.method
+        );
+    }
+    if path.bytes().any(|b| b <= b' ' || b == 0x7f) {
+        anyhow::bail!(
+            "poc.run: http step URL {url:?} has a space or control character in its path; \
+             percent-encode it"
+        );
+    }
+
     let mut headers = HeaderMap::new();
     for (name, value) in &http.headers {
         headers
@@ -681,6 +700,14 @@ fn build_request(
         body,
         timestamp: SystemTime::now(),
     })
+}
+
+/// RFC 9110 §5.6.2 `token`: one or more `tchar`. The HTTP method must be one so
+/// it cannot carry a space or CR/LF into the request line.
+fn is_http_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
 /// Split a URL into `(scheme, authority, path+query)`.
@@ -1073,6 +1100,42 @@ mod tests {
             steps: vec![],
             success,
         }
+    }
+
+    /// A PoC `http` step must not be able to smuggle a header or a second
+    /// request through the request line: the method must be an HTTP token and
+    /// the path must carry no space or control byte. The scope guard only vets
+    /// the authority, so this is the only gate on the request line.
+    #[test]
+    fn build_request_rejects_request_line_smuggling() {
+        use crate::model::HttpStep;
+        let tmpl = PocTemplate::new(VarBindings::new());
+        let live = VarBindings::new();
+        let step = |method: &str, url: &str| HttpStep {
+            method: method.into(),
+            url: url.into(),
+            headers: vec![],
+            body: None,
+            extract: vec![],
+            extra: Default::default(),
+        };
+        // CR/LF in the path: a smuggled header and a smuggled second request.
+        assert!(build_request(
+            &step(
+                "GET",
+                "http://scoped.host/a HTTP/1.1\r\nX-Smuggled: 1\r\n\r\nGET /admin"
+            ),
+            &tmpl,
+            &live
+        )
+        .is_err());
+        // A bare space in the path still splits the request line.
+        assert!(build_request(&step("GET", "http://h/a b"), &tmpl, &live).is_err());
+        // A non-token method, and CR/LF smuggled through the method.
+        assert!(build_request(&step("GE T", "http://h/a"), &tmpl, &live).is_err());
+        assert!(build_request(&step("GET\r\nEvil: 1", "http://h/a"), &tmpl, &live).is_err());
+        // A clean request still builds.
+        assert!(build_request(&step("POST", "http://h/a?b=c"), &tmpl, &live).is_ok());
     }
 
     #[test]
