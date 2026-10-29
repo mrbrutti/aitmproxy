@@ -6,10 +6,12 @@
 //! `tools/call` coerces the arguments by the command's schema and runs
 //! `Command::invoke` against a `CommandHost` built from the attached services.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use aitm_core::{
     AgentPolicy, AgentState, BrowserDriver, Command, CommandHost, Event, Flow, FlowId, FlowQuery,
@@ -30,6 +32,10 @@ pub const DEFAULT_PUSH_CAPACITY: usize = 4096;
 
 /// The default capacity of the core→server event broadcast ring.
 pub const DEFAULT_BROADCAST_CAPACITY: usize = 8192;
+
+/// How long an operator confirm-over-the-wire token stays valid before it is
+/// rejected as expired (spec D4: "short TTL, single use").
+pub const DEFAULT_CONFIRM_TTL: Duration = Duration::from_secs(120);
 
 /// The MCP protocol revision this server speaks when the client names none.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -377,6 +383,117 @@ impl Subscriptions {
     }
 }
 
+/// The operator confirm-over-the-wire token store (spec D4). A `needs_confirmation`
+/// reply mints one token bound to `{connection, command, arguments}`; the operator
+/// re-sends the identical call carrying `_confirm:"<token>"`, which is validated
+/// and consumed here. Tokens are single-use and expire after a short TTL, so a
+/// leaked or replayed token cannot run the gated command.
+#[derive(Default)]
+struct ConfirmTokens {
+    inner: Mutex<ConfirmState>,
+}
+
+#[derive(Default)]
+struct ConfirmState {
+    /// Monotonic counter, folded into each token so two tokens for the same
+    /// `{connection, command, arguments}` never collide.
+    seq: u64,
+    entries: Vec<ConfirmEntry>,
+}
+
+/// One outstanding confirmation, bound to the exact call it authorises.
+struct ConfirmEntry {
+    token: String,
+    conn_id: u64,
+    command: String,
+    /// A stable, order-independent fingerprint of the call's arguments.
+    fingerprint: String,
+    expires: Instant,
+}
+
+impl ConfirmTokens {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ConfirmState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Mint a token for this connection/command/arguments, valid for `ttl`.
+    /// Expired entries are swept first so the table never grows unbounded.
+    fn issue(&self, conn_id: u64, command: &str, fingerprint: &str, ttl: Duration) -> String {
+        let now = Instant::now();
+        let mut st = self.lock();
+        st.entries.retain(|e| e.expires > now);
+        st.seq += 1;
+        let token = confirm_token_value(conn_id, command, fingerprint, st.seq);
+        st.entries.push(ConfirmEntry {
+            token: token.clone(),
+            conn_id,
+            command: command.to_string(),
+            fingerprint: fingerprint.to_string(),
+            expires: now + ttl,
+        });
+        token
+    }
+
+    /// Validate and consume `token`: it must match this connection, command, and
+    /// argument fingerprint, and be unexpired. A match is removed (single-use).
+    /// Returns whether it was accepted.
+    fn consume(&self, conn_id: u64, command: &str, fingerprint: &str, token: &str) -> bool {
+        let now = Instant::now();
+        let mut st = self.lock();
+        st.entries.retain(|e| e.expires > now);
+        match st.entries.iter().position(|e| {
+            e.token == token
+                && e.conn_id == conn_id
+                && e.command == command
+                && e.fingerprint == fingerprint
+        }) {
+            Some(pos) => {
+                st.entries.remove(pos);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// An opaque, unguessable-enough token value. Security rests on the binding +
+/// single-use + TTL + the already-authenticated connection; this just folds the
+/// bound fields and the counter into a non-sequential string.
+fn confirm_token_value(conn_id: u64, command: &str, fingerprint: &str, seq: u64) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    conn_id.hash(&mut h);
+    command.hash(&mut h);
+    fingerprint.hash(&mut h);
+    seq.hash(&mut h);
+    // A monotonically-unique nanos stamp, so re-minting the same binding differs.
+    Instant::now().elapsed().as_nanos().hash(&mut h);
+    format!("cfm_{:016x}", h.finish())
+}
+
+/// A stable, key-order-independent fingerprint of a call's `arguments`, so the
+/// operator's re-send matches the mint even if its client reorders keys.
+fn confirm_fingerprint(args: &Map<String, JsonValue>) -> String {
+    let sorted: std::collections::BTreeMap<&String, &JsonValue> = args.iter().collect();
+    serde_json::to_string(&sorted).unwrap_or_default()
+}
+
+/// The structured `needs_confirmation` tool result an operator gets for a
+/// confirm-gated call that carried no valid `_confirm` (spec D4). Non-error.
+fn needs_confirmation(prompt: &str, token: &str) -> JsonValue {
+    json!({
+        "content": [{"type": "text", "text": prompt}],
+        "structuredContent": {
+            "status": "needs_confirmation",
+            "prompt": prompt,
+            "confirm_token": token,
+        },
+        "isError": false,
+    })
+}
+
 /// The core services a `CommandHost` borrows; shared handles so one server can
 /// answer many connections.
 struct Services {
@@ -417,6 +534,10 @@ pub struct McpServer {
     /// Monotonic source of per-connection ids, so each streaming connection's
     /// subscriptions can be dropped when it ends.
     conn_seq: Arc<AtomicU64>,
+    /// Outstanding operator confirm-over-the-wire tokens (spec D4).
+    confirm_tokens: Arc<ConfirmTokens>,
+    /// How long a minted confirm token stays valid.
+    confirm_ttl: Duration,
 }
 
 /// A JSON-RPC level failure (as opposed to a tool's own error result).
@@ -454,6 +575,8 @@ impl McpServer {
             push_tx: None,
             push_capacity: DEFAULT_PUSH_CAPACITY,
             conn_seq: Arc::new(AtomicU64::new(0)),
+            confirm_tokens: Arc::new(ConfirmTokens::default()),
+            confirm_ttl: DEFAULT_CONFIRM_TTL,
         }
     }
 
@@ -476,6 +599,13 @@ impl McpServer {
     /// size a connection's sink when the caller did not inject one.
     pub fn push_capacity(&self) -> usize {
         self.push_capacity
+    }
+
+    /// Set how long an operator confirm-over-the-wire token stays valid before it
+    /// is rejected as expired (spec D4). Defaults to [`DEFAULT_CONFIRM_TTL`].
+    pub fn with_confirm_ttl(mut self, ttl: Duration) -> Self {
+        self.confirm_ttl = ttl;
+        self
     }
 
     /// Mint the next per-connection id (the transport tags each connection so its
@@ -615,6 +745,8 @@ impl McpServer {
             push_tx,
             push_capacity,
             conn_seq,
+            confirm_tokens,
+            confirm_ttl,
         } = self;
         let on_bound = on_bound.into_inner().unwrap_or(None);
         let server = Arc::new(McpServer {
@@ -632,6 +764,8 @@ impl McpServer {
             push_tx: push_tx.clone(),
             push_capacity,
             conn_seq,
+            confirm_tokens,
+            confirm_ttl,
         });
         // The push dispatcher: for each core event, render + fan a flow
         // notification to matching subscriptions. One task per server, draining
@@ -761,7 +895,7 @@ impl McpServer {
             .and_then(JsonValue::as_str)
             .ok_or_else(|| RpcError::new(INVALID_PARAMS, "missing tool `name`"))?;
         let empty = Map::new();
-        let arguments = match params.get("arguments") {
+        let raw_arguments = match params.get("arguments") {
             None | Some(JsonValue::Null) => &empty,
             Some(JsonValue::Object(args)) => args,
             Some(other) => {
@@ -770,6 +904,21 @@ impl McpServer {
                     format!("`arguments` must be an object, got {other}"),
                 ))
             }
+        };
+        // Strip the reserved `_confirm` acknowledgment (spec D4) before anything
+        // typed is built: it is never a declared command parameter, so it must not
+        // reach `params_from_json` (which rejects unknown keys). Only the operator
+        // confirm handshake reads it; every other role and path simply ignores it.
+        let confirm_ack = raw_arguments
+            .get("_confirm")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
+        let arguments: Cow<Map<String, JsonValue>> = if confirm_ack.is_some() {
+            let mut m = raw_arguments.clone();
+            m.remove("_confirm");
+            Cow::Owned(m)
+        } else {
+            Cow::Borrowed(raw_arguments)
         };
         // F4 connection-scoped subscription management. These need the ConnCtx's
         // push sink and the server's subscription registry — neither of which a
@@ -780,7 +929,7 @@ impl McpServer {
             if let Some(reason) = self.read_refusal(conn, name) {
                 return Ok(tool_error(reason));
             }
-            return Ok(self.handle_subscription(conn, name, arguments));
+            return Ok(self.handle_subscription(conn, name, &arguments));
         }
         let cmd = self
             .registry
@@ -797,10 +946,46 @@ impl McpServer {
                 "no core services attached; call McpServer::with_services first",
             )
         })?;
-        let args = match params_from_json(arguments, &cmd.schema(), name) {
+        let args = match params_from_json(&arguments, &cmd.schema(), name) {
             Ok(args) => args,
             Err(e) => return Ok(tool_error(e.to_string())),
         };
+        // D4 operator confirm-over-the-wire handshake. Only the operator role is
+        // offered it; the agent is never handed a handshake — its confirm-gated
+        // commands stay governed by their own config gate (applied inside the
+        // command), so an agent can never self-confirm — and the CLI asks its own
+        // local human through the `Confirmer`.
+        if conn.role == Frontend::Operator {
+            if let Some(prompt) = cmd.confirm_prompt(&args) {
+                let fingerprint = confirm_fingerprint(&arguments);
+                match &confirm_ack {
+                    // A valid, matching, unexpired, single-use token: consume it
+                    // and fall through to run the command.
+                    Some(tok)
+                        if self
+                            .confirm_tokens
+                            .consume(conn.conn_id, name, &fingerprint, tok) => {}
+                    // A token was supplied but did not validate (wrong, expired,
+                    // already used, or for a different call): refuse, do not run.
+                    Some(_) => {
+                        return Ok(tool_error(format!(
+                            "`{name}` confirmation token is invalid, expired, or already used; \
+                             re-send the call without `_confirm` to obtain a fresh confirmation."
+                        )));
+                    }
+                    // No acknowledgment: mint a token and ask for confirmation.
+                    None => {
+                        let token = self.confirm_tokens.issue(
+                            conn.conn_id,
+                            name,
+                            &fingerprint,
+                            self.confirm_ttl,
+                        );
+                        return Ok(needs_confirmation(&prompt, &token));
+                    }
+                }
+            }
+        }
         let host = CommandHost::new(
             services.store.as_ref(),
             services.client.as_ref(),
@@ -821,11 +1006,20 @@ impl McpServer {
             Some(cfg) => host.with_config(cfg.clone()),
             None => host,
         };
+        // `summarize` reads the args and result, so keep a copy of the typed args
+        // before `invoke` consumes them (D3b).
+        let args_for_summary = args.clone();
         Ok(match cmd.invoke(args, &host) {
             Ok(value) => {
+                // `structuredContent` stays the exact machine value (contract
+                // unchanged); only `content` text becomes a readable rendering —
+                // the one-line summary (when the command provides one) plus pretty,
+                // stable-key JSON — so the agent transcript reads cleanly (D3b).
                 let structured = to_json(&value);
+                let summary = cmd.summarize(&args_for_summary, &value);
+                let text = crate::render::render_content(summary.as_deref(), &structured);
                 json!({
-                    "content": [{"type": "text", "text": structured.to_string()}],
+                    "content": [{"type": "text", "text": text}],
                     "structuredContent": structured,
                     "isError": false,
                 })

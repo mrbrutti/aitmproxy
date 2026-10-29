@@ -79,4 +79,12 @@ impl Command for FlowReplay {
         let replayed = block_on(host.client().send(request))?;
         Ok(Value::Str(replayed.id.to_string()))
     }
+
+    fn summarize(&self, args: &Params, result: &Value) -> Option<String> {
+        let Value::Str(new_id) = result else {
+            return None;
+        };
+        let src = args.get_flow_id("id").ok()?;
+        Some(format!("replayed flow {src} → captured as {new_id}"))
+    }
 }

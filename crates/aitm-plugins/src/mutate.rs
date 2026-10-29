@@ -233,4 +233,12 @@ impl Command for RequestSend {
         let sent = block_on(host.client().send(req))?;
         Ok(Value::Str(sent.id.to_string()))
     }
+
+    fn summarize(&self, args: &Params, result: &Value) -> Option<String> {
+        let Value::Str(id) = result else {
+            return None;
+        };
+        let authority = args.get_str("authority").ok()?;
+        Some(format!("sent request to {authority} → captured as {id}"))
+    }
 }

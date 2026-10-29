@@ -8,6 +8,7 @@
 
 mod base64;
 pub mod json;
+pub mod render;
 pub mod schema;
 pub mod server;
 pub mod transport;
