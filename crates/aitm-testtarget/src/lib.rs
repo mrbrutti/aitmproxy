@@ -16,9 +16,14 @@
 //!
 //! The planted-vuln [`manifest`] is grader-only ground truth: it is never served
 //! and nothing in [`app`] reads it (AC-M4-10).
+//!
+//! The [`l4`] module adds an **opt-in**, off-by-default loopback L4 service (UDP
+//! echo + minimal TCP) so the L4 operator surfaces have a real, in-scope target;
+//! its in-scope assets are declared in the grader-only [`l4_manifest`].
 
 mod app;
 pub mod grader;
+pub mod l4;
 pub mod manifest;
 mod seed;
 
@@ -27,7 +32,8 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 pub use grader::{grade, GradeReport};
-pub use manifest::{manifest, manifest_yaml, PlantedVuln};
+pub use l4::{L4Config, L4Service};
+pub use manifest::{l4_manifest, manifest, manifest_yaml, L4Asset, PlantedVuln};
 pub use seed::SeedMode;
 
 /// A running test target: the bound loopback address plus the per-instance state
