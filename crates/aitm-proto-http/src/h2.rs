@@ -7,9 +7,10 @@
 //! Each stream becomes an ordinary `Flow::Http` (`version: H2`) emitting the same
 //! `RequestHeaders → Request → ResponseHeaders → Response` sequence as the h1
 //! path, so every capability above the wire is protocol-agnostic. Task 2 handles
-//! capture, multiplexing, forward and short-circuit (Map Local); the kill-as-RST
-//! and response-phase-park semantics are Task 3, and Map Remote cross-origin is
-//! Task 4.
+//! capture, multiplexing, forward and short-circuit (Map Local); interception —
+//! per-stream park, response-phase edit, and kill-as-RST_STREAM — is Task 3 (a
+//! parked stream suspends only its own task, because `emit()` is awaited before
+//! any client byte is sent); Map Remote cross-origin is Task 4.
 //!
 //! Server push is disabled in both directions: the upstream client builder sets
 //! `enable_push(false)`, and this driver never calls `push_request`, so the
@@ -164,9 +165,13 @@ async fn stream_task(
         bail!("flow {id} missing from the store after dispatch");
     };
 
-    // Killed: drop the response handle, resetting this stream; the connection
-    // stays open for siblings. Explicit RST_STREAM kill modes are Task 3.
+    // Killed (a `reset` kill, or an abandoned interception the chain timed out):
+    // reset this stream with RST_STREAM(CANCEL). The h2 reset is per-stream, so the
+    // connection and its sibling streams stay alive. The `429`/`503` kill modes are
+    // not `Killed` — the kill command leaves them `Resumed` with a synthesized
+    // response, handled by the short-circuit branch below (no upstream opened).
     if matches!(flow.intercept, InterceptState::Killed) {
+        respond.send_reset(h2::Reason::CANCEL);
         return Ok(());
     }
 
