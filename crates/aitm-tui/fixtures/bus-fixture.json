@@ -63,7 +63,20 @@
     { "name": "flow.clear", "description": "(F7) Remove completed flows from the store (in-flight and intercepted flows are kept); returns {cleared, skipped_in_flight}.", "inputSchema": { "type": "object", "properties": {} } },
     { "name": "config.get", "description": "(F7) A redacted view of the proxy configuration (no MCP token or key material).", "inputSchema": { "type": "object", "properties": {} } },
     { "name": "flow.mark", "description": "(F6) Set a flow's mark colours.", "inputSchema": { "type": "object", "properties": { "id": { "type": "string" }, "marks": { "type": "array" } }, "required": ["id", "marks"] } },
-    { "name": "flow.comment", "description": "(F6) Set a flow's comment.", "inputSchema": { "type": "object", "properties": { "id": { "type": "string" }, "text": { "type": "string" } }, "required": ["id", "text"] } }
+    { "name": "flow.comment", "description": "(F6) Set a flow's comment.", "inputSchema": { "type": "object", "properties": { "id": { "type": "string" }, "text": { "type": "string" } }, "required": ["id", "text"] } },
+    { "name": "ws.intercept", "description": "(M6 F9) Arm WebSocket frame interception, optionally with rules.", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "ws.frame", "description": "(M6 F9) Forward or drop a parked WebSocket frame, optionally edited.", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "ws.send", "description": "(M6 F9) Inject a WebSocket frame into a live conversation.", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "session.save", "description": "(M6 F10) Save the flow store to a native session file.", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "session.load", "description": "(M6 F10) Replace the flow store from a native session file.", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "flow.export", "description": "(M6 F10) Export flows as a native or HAR document.", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "flow.import", "description": "(M6 F10) Import flows from a native, HAR or mitmproxy file (passive).", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "tls.passthrough.list", "description": "(M6 F11) List the TLS passthrough hosts.", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "tls.passthrough.add", "description": "(M6 F11) Add a host to the TLS passthrough list.", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "tls.passthrough.remove", "description": "(M6 F11) Remove a host from the TLS passthrough list.", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "map.add", "description": "(M6) Add a Map Local/Remote rule.", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "map.list", "description": "(M6) List the Map rules.", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "map.remove", "description": "(M6) Remove a Map rule.", "inputSchema": { "type": "object", "properties": {} } }
   ],
   "flows": [
     {

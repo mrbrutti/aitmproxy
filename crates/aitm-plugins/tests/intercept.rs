@@ -66,6 +66,17 @@ fn id_params(id: FlowId) -> Params {
     params(&[("id", Value::Str(id.to_string()))])
 }
 
+/// `flow.intercept` returns `{enabled, rules}`; read the armed flag out of it.
+fn intercept_enabled(value: &Value) -> bool {
+    match value {
+        Value::Object(o) => match o.get("enabled") {
+            Some(Value::Bool(b)) => *b,
+            other => panic!("flow.intercept result missing enabled bool, got {other:?}"),
+        },
+        other => panic!("flow.intercept should return an object, got {other:?}"),
+    }
+}
+
 fn registry() -> Registry {
     let mut reg = Registry::new();
     let plugin = InterceptPlugin::new();
@@ -122,7 +133,7 @@ fn park_then_resume() {
         .expect("flow.intercept registered")
         .invoke(Params::default(), &host)
         .expect("arming succeeds");
-    assert_eq!(armed, Value::Bool(true));
+    assert!(intercept_enabled(&armed));
 
     let id = store.insert(http_flow());
     let mut parked = dispatch_request(&reg, &store, id).expect("armed plugin parks the request");
@@ -186,7 +197,7 @@ fn disarmed_requests_pass_through() {
     let disarmed = intercept
         .invoke(params(&[("enabled", Value::Bool(false))]), &host)
         .expect("disarming succeeds");
-    assert_eq!(disarmed, Value::Bool(false));
+    assert!(!intercept_enabled(&disarmed));
     let id = store.insert(http_flow());
     assert!(dispatch_request(&reg, &store, id).is_none());
     assert_eq!(state_label(&store, id), "observed");

@@ -113,9 +113,14 @@ async fn run() -> anyhow::Result<()> {
     let Settings {
         core: mut cfg,
         rhai: mut rhai_cfg,
+        mut l4,
     } = config_file::load_settings(config_path.as_deref())?;
     env::apply(&mut cfg, |k| std::env::var(k).ok());
     env::apply_rhai(&mut rhai_cfg, |k| std::env::var(k).ok());
+    // The L4 module is opt-in (fail-closed) and carried outside `aitm-core`'s
+    // `Config`; `AITM_L4_*` env overrides win over the file (M5-AC17). It rides the
+    // binary-owned feature set below; `l4_privilege: None` runs the real startup probe.
+    env::apply_l4(&mut l4, |k| std::env::var(k).ok());
     // A script's `browser.navigate` decides SSRF under the same policy as the
     // `browser.navigate` command.
     rhai_cfg.ssrf = cfg.browser.ssrf.clone();
@@ -172,7 +177,10 @@ async fn run() -> anyhow::Result<()> {
         listening,
     } = assemble_with_scripts(
         &cfg,
-        &Features::default(),
+        &Features {
+            l4,
+            ..Features::default()
+        },
         ScriptWiring {
             plugins: tier
                 .plugins

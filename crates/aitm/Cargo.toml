@@ -19,7 +19,15 @@ aitm-core.workspace = true
 aitm-plugin.workspace = true
 aitm-proto-http.workspace = true
 aitm-proto-ws.workspace = true
+aitm-proto-l4.workspace = true
 aitm-plugins.workspace = true
+# M6 parity plugins (F9 WebSocket control, F10 sessions/HAR, F11 TLS passthrough,
+# Map Local/Remote). Registered in `wire.rs`; `aitm-rules` is their shared matcher.
+aitm-rules.workspace = true
+aitm-plugin-wsctl.workspace = true
+aitm-plugin-sessionio.workspace = true
+aitm-plugin-passthrough.workspace = true
+aitm-plugin-maprules.workspace = true
 aitm-browser.workspace = true
 aitm-ca.workspace = true
 aitm-poc.workspace = true
