@@ -4,11 +4,13 @@
 //! so MCP `tools/list` and the CLI (`aitm script validate --path x.rhai`) pick
 //! them up with no special casing.
 //!
-//! - **`script.validate { path }`** compiles the file on the shared engine
-//!   without registering anything and answers with the script's declared
-//!   metadata, or the positioned compile error in the pinned format. Only a
-//!   `.rhai` path is read, so the command is not a general file probe for an
-//!   agent frontend.
+//! - **`script.validate { path | source }`** compiles a file, or script text
+//!   given inline, on the shared engine without registering anything and
+//!   answers with the script's declared metadata and a best-effort static
+//!   `registers { commands, options }` scan, or the positioned compile error
+//!   in the pinned format. Exactly one of `path`/`source`. Only a `.rhai` path
+//!   is read, so the command is not a general file probe for an agent
+//!   frontend; `source` is bounded by the sandbox `max_string_size`.
 //! - **`script.reload { name }`** recompiles a loaded script from its file and
 //!   swaps its hooks live through the [`ScriptHandle`] it shares with the
 //!   plugin; a recompile that fails leaves the previous good AST in service.
@@ -36,7 +38,7 @@ use aitm_core::{
 
 use crate::config::ScriptMeta;
 use crate::host_core::{severity_name, Finding, FindingSink};
-use crate::loader::RhaiLoader;
+use crate::loader::{RhaiLoader, Validated};
 use crate::plugin::{ErrorSink, ScriptHandle};
 
 /// Registers the three commands. Built by `wire::build` over the same loader
@@ -119,34 +121,73 @@ impl Command for Validate {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "Compile a .rhai script without loading it; reports its name, API and \
-                          hooks, or the positioned compile error."
+            description: "Compile a .rhai script without loading it; reports its name, API, \
+                          hooks and the commands/options its load(reg) registers (a static \
+                          scan; empty when the names are not literals), or the positioned \
+                          compile error. Give exactly one of `path` (a file) or `source` (the \
+                          script text, compiled in the sandbox with nothing written)."
                 .to_string(),
-            params: vec![param(
-                "path",
-                TypeDesc::Str,
-                true,
-                "path to the .rhai file to check",
-            )],
+            params: vec![
+                param(
+                    "path",
+                    TypeDesc::Str,
+                    false,
+                    "path to the .rhai file to check; exactly one of `path` or `source`",
+                ),
+                param(
+                    "source",
+                    TypeDesc::Str,
+                    false,
+                    "the script text to check, at most the sandbox max_string_size bytes; \
+                     exactly one of `path` or `source`",
+                ),
+            ],
             result: TypeDesc::Any,
         }
     }
 
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
-        let path = text(&args, "path")?;
-        let path = Path::new(&path);
-        if path.extension().and_then(|e| e.to_str()) != Some(SCRIPT_EXT) {
-            anyhow::bail!(
-                "script.validate reads only .rhai files, got {}",
-                path.display()
-            );
+        match (
+            optional_text(&args, "path")?,
+            optional_text(&args, "source")?,
+        ) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("script.validate takes exactly one of `path` or `source`, got both")
+            }
+            (None, None) => anyhow::bail!(
+                "script.validate takes exactly one of `path` or `source`, got neither"
+            ),
+            (Some(path), None) => {
+                let path = Path::new(&path);
+                if path.extension().and_then(|e| e.to_str()) != Some(SCRIPT_EXT) {
+                    anyhow::bail!(
+                        "script.validate reads only .rhai files, got {}",
+                        path.display()
+                    );
+                }
+                confine_validate(host, path)?;
+                let validated = self
+                    .loader
+                    .validate_with_registers(path)
+                    .map_err(|err| anyhow::anyhow!("{err}"))?;
+                Ok(validate_value(&validated, true))
+            }
+            (None, Some(source)) => {
+                // No file to confine; the only bound is the sandbox's string cap.
+                let limit = self.loader.max_string_size();
+                if source.len() > limit {
+                    anyhow::bail!(
+                        "`source` is {} bytes, over the sandbox max_string_size ({limit})",
+                        source.len()
+                    );
+                }
+                let validated = self
+                    .loader
+                    .validate_source(&source)
+                    .map_err(|err| anyhow::anyhow!("{err}"))?;
+                Ok(validate_value(&validated, false))
+            }
         }
-        confine_validate(host, path)?;
-        let meta = self
-            .loader
-            .validate(path)
-            .map_err(|err| anyhow::anyhow!("{err}"))?;
-        Ok(meta_value(&meta))
     }
 }
 
@@ -338,6 +379,36 @@ fn meta_value(meta: &ScriptMeta) -> Value {
     ]))
 }
 
+/// What `script.validate` answers: the script's metadata (with `path` only
+/// when it came from a file) plus the `registers` scan. `script.reload` and
+/// `script.list` use [`meta_value`] alone and never carry `registers`.
+fn validate_value(validated: &Validated, with_path: bool) -> Value {
+    let meta = &validated.meta;
+    let mut fields = BTreeMap::from([
+        ("name".to_string(), Value::Str(meta.name.clone())),
+        ("api".to_string(), Value::Str(meta.api.clone())),
+        (
+            "hooks".to_string(),
+            Value::Array(meta.hooks.iter().cloned().map(Value::Str).collect()),
+        ),
+    ]);
+    if with_path {
+        fields.insert(
+            "path".to_string(),
+            Value::Str(meta.path.display().to_string()),
+        );
+    }
+    let names = |list: &[String]| Value::Array(list.iter().cloned().map(Value::Str).collect());
+    fields.insert(
+        "registers".to_string(),
+        Value::Object(BTreeMap::from([
+            ("commands".to_string(), names(&validated.registers.commands)),
+            ("options".to_string(), names(&validated.registers.options)),
+        ])),
+    );
+    Value::Object(fields)
+}
+
 /// One finding as the frontends render it: `at` is Unix milliseconds.
 fn finding_value(f: &Finding) -> Value {
     let at =
@@ -373,6 +444,16 @@ fn param(name: &str, ty: TypeDesc, required: bool, description: &str) -> ParamDe
         ty,
         required,
         description: description.to_string(),
+    }
+}
+
+/// An optional string argument: absent or null is `None`; anything but a
+/// string is an error.
+fn optional_text(args: &Params, key: &str) -> anyhow::Result<Option<String>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Str(s)) => Ok(Some(s.clone())),
+        Some(_) => anyhow::bail!("`{key}` must be a string"),
     }
 }
 

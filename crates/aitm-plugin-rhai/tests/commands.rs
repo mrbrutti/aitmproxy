@@ -14,7 +14,7 @@ use aitm_core::{
     Chain, CommandHost, Event, Flow, FlowId, FlowStore, Frontend, HttpFlow, HttpRequest,
     MemFlowStore, Params, ProxyClient, Registry, StdGuard, Value, Verdict,
 };
-use aitm_plugin_rhai::config::{RhaiConfig, ScriptEntry};
+use aitm_plugin_rhai::config::{RhaiConfig, RhaiLimits, ScriptEntry};
 use aitm_plugin_rhai::host_core::{FindingSink, MemoryFindingSink, ScriptServices};
 use aitm_plugin_rhai::{wire, ScriptHandle};
 
@@ -78,6 +78,13 @@ struct Harness {
 
 impl Harness {
     fn new(scripts: Vec<ScriptEntry>) -> Self {
+        Self::with_config(RhaiConfig {
+            scripts,
+            ..RhaiConfig::default()
+        })
+    }
+
+    fn with_config(config: RhaiConfig) -> Self {
         let store = Arc::new(MemFlowStore::new());
         let findings = Arc::new(MemoryFindingSink::new());
         let services = ScriptServices {
@@ -88,14 +95,7 @@ impl Harness {
             findings: findings.clone(),
             rt: tokio::runtime::Handle::current(),
         };
-        let tier = wire::build(
-            RhaiConfig {
-                scripts,
-                ..RhaiConfig::default()
-            },
-            services,
-        )
-        .expect("tier builds");
+        let tier = wire::build(config, services).expect("tier builds");
         assert!(tier.errors.is_empty(), "scripts compile: {:?}", tier.errors);
 
         let error_sink = Arc::clone(&tier.error_sink);
@@ -293,6 +293,166 @@ async fn script_validate_reports_meta_or_the_compile_error() {
         )
         .expect_err("a non-.rhai path is refused");
     assert!(err.to_string().contains(".rhai"), "{err}");
+}
+
+const REGISTERING: &str = r#"
+const NAME = "reg-demo";
+fn load(reg) {
+    reg.add_option("tag", "x", "a tag");
+    reg.add_command("demo.ping", "ping", |args| "pong");
+}
+fn on_request(flow) { }
+"#;
+
+fn names(list: &[&str]) -> Value {
+    Value::Array(list.iter().map(|s| Value::Str((*s).into())).collect())
+}
+
+fn registers_value(commands: &[&str], options: &[&str]) -> Value {
+    Value::Object(BTreeMap::from([
+        ("commands".to_string(), names(commands)),
+        ("options".to_string(), names(options)),
+    ]))
+}
+
+/// AC2/AC3: `script.validate { source }` compiles a string with nothing on
+/// disk and answers `{ name, api, hooks, registers }` (no `path`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_validate_source_reports_meta_and_registers() {
+    let h = Harness::new(Vec::new());
+    let out = h
+        .invoke(
+            "script.validate",
+            params(&[("source", Value::Str(REGISTERING.into()))]),
+        )
+        .expect("a compiling source validates");
+    assert_eq!(field(&out, "name"), &Value::Str("reg-demo".into()));
+    assert_eq!(field(&out, "api"), &Value::Str("1".into()));
+    assert_eq!(field(&out, "hooks"), &names(&["load", "on_request"]));
+    assert_eq!(
+        field(&out, "registers"),
+        &registers_value(&["demo.ping"], &["tag"])
+    );
+    match &out {
+        Value::Object(fields) => assert_eq!(
+            fields.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["api", "hooks", "name", "registers"],
+            "no `path`: there is no file"
+        ),
+        other => panic!("expected an object, got {other:?}"),
+    }
+    assert_eq!(h.registry.plugins().len(), 1, "validate registered nothing");
+
+    let hook_only = h
+        .invoke(
+            "script.validate",
+            params(&[("source", Value::Str(V1.into()))]),
+        )
+        .expect("a hook-only source validates");
+    assert_eq!(field(&hook_only, "registers"), &registers_value(&[], &[]));
+}
+
+/// AC2: a syntax error in `source` is the positioned compile error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_validate_source_syntax_error_is_positioned() {
+    let h = Harness::new(Vec::new());
+    let err = h
+        .invoke(
+            "script.validate",
+            params(&[("source", Value::Str(BROKEN.into()))]),
+        )
+        .expect_err("a broken source does not validate");
+    assert!(
+        err.to_string().contains("error: script:4:"),
+        "the compile error is positioned in the pinned format: {err}"
+    );
+}
+
+/// The `{ path }` arm keeps its fields and gains `registers`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_validate_path_arm_includes_registers() {
+    let h = Harness::new(Vec::new());
+    let script = TempScript::new("regs", REGISTERING);
+    let out = h
+        .invoke(
+            "script.validate",
+            params(&[("path", Value::Str(script.path().display().to_string()))]),
+        )
+        .expect("the file validates");
+    assert_eq!(field(&out, "name"), &Value::Str("reg-demo".into()));
+    assert_eq!(
+        field(&out, "path"),
+        &Value::Str(script.path().display().to_string())
+    );
+    assert_eq!(field(&out, "hooks"), &names(&["load", "on_request"]));
+    assert_eq!(
+        field(&out, "registers"),
+        &registers_value(&["demo.ping"], &["tag"])
+    );
+}
+
+/// Exactly one of `path`/`source`: both and neither are argument errors, never
+/// a silent pick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_validate_requires_exactly_one_of_path_and_source() {
+    let h = Harness::new(Vec::new());
+    let script = TempScript::new("both", V1);
+    let err = h
+        .invoke(
+            "script.validate",
+            params(&[
+                ("path", Value::Str(script.path().display().to_string())),
+                ("source", Value::Str(V1.into())),
+            ]),
+        )
+        .expect_err("both is refused");
+    assert!(
+        err.to_string()
+            .contains("exactly one of `path` or `source`")
+            && err.to_string().contains("both"),
+        "{err}"
+    );
+    let err = h
+        .invoke("script.validate", params(&[]))
+        .expect_err("neither is refused");
+    assert!(
+        err.to_string()
+            .contains("exactly one of `path` or `source`")
+            && err.to_string().contains("neither"),
+        "{err}"
+    );
+}
+
+/// A `source` longer than the sandbox `max_string_size` is a clean argument
+/// error before anything compiles; one at the limit still validates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_validate_source_is_bounded_by_max_string_size() {
+    let h = Harness::with_config(RhaiConfig {
+        limits: RhaiLimits {
+            max_string_size: 4096,
+            ..RhaiLimits::default()
+        },
+        ..RhaiConfig::default()
+    });
+    let padding = |len: usize| format!("//{}\n", "x".repeat(len - 3));
+    let at_limit = padding(4096);
+    assert_eq!(at_limit.len(), 4096);
+    h.invoke(
+        "script.validate",
+        params(&[("source", Value::Str(at_limit))]),
+    )
+    .expect("a source at the limit validates");
+
+    let err = h
+        .invoke(
+            "script.validate",
+            params(&[("source", Value::Str(padding(4097)))]),
+        )
+        .expect_err("a source over the limit is refused");
+    assert!(
+        err.to_string().contains("4097") && err.to_string().contains("max_string_size (4096)"),
+        "{err}"
+    );
 }
 
 /// Minor(a): `script.validate` is not a file oracle for an agent frontend. The

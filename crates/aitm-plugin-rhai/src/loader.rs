@@ -20,7 +20,7 @@
 //! (spec §8).
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rhai::{Dynamic, Engine, ParseError, ParseErrorType, AST};
@@ -59,6 +59,34 @@ const HOOKS: [(&str, &[&str]); 10] = [
 /// Log target for what the loader does and skips, so an operator can read
 /// "what is loaded" off the log as well as off the config.
 const LOADER_TARGET: &str = "aitm_plugin_rhai::loader";
+
+/// What a script's `load(reg)` registers, found by a static scan of its source
+/// (see [`scan_registers`]); empty when the names are not literals.
+///
+/// Kept apart from [`ScriptMeta`]: only `script.validate` reports it, and
+/// `script.reload` / `script.list` must not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Registers {
+    /// First arguments of `reg.add_command("...", ...)`, in source order.
+    pub commands: Vec<String>,
+    /// First arguments of `reg.add_option("...", ...)`, in source order.
+    pub options: Vec<String>,
+}
+
+/// A validated script: its declared metadata plus what it registers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Validated {
+    pub meta: ScriptMeta,
+    pub registers: Registers,
+}
+
+/// The path a script compiled from a string carries: [`ScriptMeta::path`] is
+/// required but there is no file.
+const SOURCE_PATH: &str = "<source>";
+
+/// What a script compiled from a string is called when it declares no `NAME`
+/// (the file-stem default has no file to come from).
+const SOURCE_STEM: &str = "script";
 
 /// The one sandboxed engine plus everything a compiled script needs to become
 /// a plugin.
@@ -139,6 +167,12 @@ impl RhaiLoader {
     /// executor is built from the same handles as the plugins.
     pub fn services(&self) -> &ScriptServices {
         &self.services
+    }
+
+    /// The longest string the sandbox lets a script hold, which also bounds a
+    /// script source the `script.validate { source }` command will compile.
+    pub fn max_string_size(&self) -> usize {
+        self.cfg.limits.max_string_size
     }
 
     /// The run budget the configuration gives every hook, step and command.
@@ -224,28 +258,256 @@ impl RhaiLoader {
         self.compile(path).map(|(_, meta)| meta)
     }
 
+    /// `validate`, plus what the file's `load(reg)` registers. The file is read
+    /// once and the same text is compiled and scanned. Backs `script.validate
+    /// { path }`.
+    pub fn validate_with_registers(&self, path: &Path) -> Result<Validated, ScriptError> {
+        let stem = file_stem(path);
+        let src = read_script(path, &stem)?;
+        let (_, meta) = self.compile_source(&src, path, stem)?;
+        Ok(Validated {
+            registers: scan_registers(&src),
+            meta,
+        })
+    }
+
+    /// Compile a script held in a string on the shared engine and describe it,
+    /// registering nothing, reading no file and building no plugin. A syntax
+    /// error is the same positioned [`ScriptError::Compile`] a file gives,
+    /// named `script` at path `<source>`. Backs `script.validate { source }`;
+    /// the caller bounds `source` by [`RhaiLoader::max_string_size`].
+    pub fn validate_source(&self, source: &str) -> Result<Validated, ScriptError> {
+        let path = PathBuf::from(SOURCE_PATH);
+        let (_, meta) = self.compile_source(source, &path, SOURCE_STEM.to_string())?;
+        Ok(Validated {
+            registers: scan_registers(source),
+            meta,
+        })
+    }
+
     /// Read, compile, and describe one script. The AST is named after the
     /// script so host verbs can attribute what they record to it. Backs
     /// `script.reload`, which swaps the AST into the running plugin.
     pub fn compile(&self, path: &Path) -> Result<(AST, ScriptMeta), ScriptError> {
         let stem = file_stem(path);
-        let src = fs::read_to_string(path).map_err(|err| ScriptError::Compile {
-            script: stem.clone(),
-            path: path.to_path_buf(),
-            line: 0,
-            column: 0,
-            message: format!("cannot read {}: {err}", path.display()),
-            hint: Some(
-                "check the path under `scripts:` in the config (or the `--script` flag)".into(),
-            ),
-        })?;
+        let src = read_script(path, &stem)?;
+        self.compile_source(&src, path, stem)
+    }
+
+    fn compile_source(
+        &self,
+        src: &str,
+        path: &Path,
+        stem: String,
+    ) -> Result<(AST, ScriptMeta), ScriptError> {
         let mut ast = self
             .engine
-            .compile(&src)
+            .compile(src)
             .map_err(|err| compile_error(stem.clone(), path, &err))?;
         let meta = extract_meta(&ast, path, stem);
         ast.set_source(meta.name.as_str());
         Ok((ast, meta))
+    }
+}
+
+/// Read a script file, or the positioned-format error saying why not.
+fn read_script(path: &Path, stem: &str) -> Result<String, ScriptError> {
+    fs::read_to_string(path).map_err(|err| ScriptError::Compile {
+        script: stem.to_string(),
+        path: path.to_path_buf(),
+        line: 0,
+        column: 0,
+        message: format!("cannot read {}: {err}", path.display()),
+        hint: Some("check the path under `scripts:` in the config (or the `--script` flag)".into()),
+    })
+}
+
+/// Best-effort static scan for what `load(reg)` registers, without running it.
+///
+/// Rhai exposes no AST walk without its `internals` feature, which the sandbox
+/// forbids (M3 spec §7), so this is a single lexical pass over the source. In
+/// code (not inside a comment or a string) it matches `. add_command (` or
+/// `. add_option (` followed by a plain `"..."` literal that is the whole
+/// first argument, and records that literal's decoded text. Skipped, so never
+/// matched inside: `//` and nested `/* */` comments, `"..."`, `'.'`, `` `...` ``
+/// and `#"..."#` literals. A first argument that is not a lone string literal
+/// (a variable, `"a" + b`) is left out — the lists are then shorter, never
+/// wrong. Names are de-duplicated and kept in source order.
+pub fn scan_registers(src: &str) -> Registers {
+    let b = src.as_bytes();
+    let mut out = Registers::default();
+    let mut i = 0;
+    while i < b.len() {
+        let next = b.get(i + 1).copied();
+        match b[i] {
+            b'/' if next == Some(b'/') => {
+                i = b[i..]
+                    .iter()
+                    .position(|&c| c == b'\n')
+                    .map_or(b.len(), |n| i + n);
+            }
+            b'/' if next == Some(b'*') => i = skip_block_comment(b, i),
+            b'"' | b'\'' => i = skip_quoted(b, i),
+            b'`' => {
+                i = b[i + 1..]
+                    .iter()
+                    .position(|&c| c == b'`')
+                    .map_or(b.len(), |n| i + n + 2)
+            }
+            b'#' => i = skip_raw_string(b, i),
+            b'.' => match register_call(b, i) {
+                Some((target, name, end)) => {
+                    let list = match target {
+                        RegisterKind::Command => &mut out.commands,
+                        RegisterKind::Option => &mut out.options,
+                    };
+                    if !list.contains(&name) {
+                        list.push(name);
+                    }
+                    i = end;
+                }
+                None => i += 1,
+            },
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+#[derive(Clone, Copy)]
+enum RegisterKind {
+    Command,
+    Option,
+}
+
+/// Index just past the `*/` closing the comment opened at `start` (comments
+/// nest in Rhai), or the end of the source.
+fn skip_block_comment(b: &[u8], start: usize) -> usize {
+    let (mut depth, mut i) = (0usize, start);
+    while i < b.len() {
+        match (b[i], b.get(i + 1).copied()) {
+            (b'/', Some(b'*')) => {
+                depth += 1;
+                i += 2;
+            }
+            (b'*', Some(b'/')) => {
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    b.len()
+}
+
+/// Index just past the closing quote of the `"` or `'` literal opened at
+/// `start`, honoring backslash escapes, or the end of the source.
+fn skip_quoted(b: &[u8], start: usize) -> usize {
+    let quote = b[start];
+    let mut i = start + 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            c if c == quote => return i + 1,
+            _ => i += 1,
+        }
+    }
+    b.len()
+}
+
+/// Past a raw string `#"..."#` (any number of `#`) opened at `start`; one
+/// step when the `#` is not a raw string (`#{` map literal, `#!` shebang).
+fn skip_raw_string(b: &[u8], start: usize) -> usize {
+    let hashes = b[start..].iter().take_while(|&&c| c == b'#').count();
+    if b.get(start + hashes) != Some(&b'"') {
+        return start + hashes;
+    }
+    let mut closing = vec![b'"'];
+    closing.extend(std::iter::repeat_n(b'#', hashes));
+    let body = start + hashes + 1;
+    b[body..]
+        .windows(closing.len())
+        .position(|w| w == closing.as_slice())
+        .map_or(b.len(), |n| body + n + closing.len())
+}
+
+fn skip_whitespace(b: &[u8], mut i: usize) -> usize {
+    while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    i
+}
+
+/// At a `.` in code: `add_command` / `add_option`, `(`, then a string literal
+/// that is the entire first argument. Returns which call, the literal's decoded
+/// text, and the index past the literal.
+fn register_call(b: &[u8], dot: usize) -> Option<(RegisterKind, String, usize)> {
+    let start = skip_whitespace(b, dot + 1);
+    let len = b[start..]
+        .iter()
+        .take_while(|c| c.is_ascii_alphanumeric() || **c == b'_')
+        .count();
+    let kind = match &b[start..start + len] {
+        b"add_command" => RegisterKind::Command,
+        b"add_option" => RegisterKind::Option,
+        _ => return None,
+    };
+    let open = skip_whitespace(b, start + len);
+    if b.get(open) != Some(&b'(') {
+        return None;
+    }
+    let quote = skip_whitespace(b, open + 1);
+    if b.get(quote) != Some(&b'"') {
+        return None;
+    }
+    let (name, end) = decode_string(b, quote + 1)?;
+    // `"a" + b` is an expression, not a literal name.
+    matches!(b.get(skip_whitespace(b, end)), Some(b',' | b')')).then_some((kind, name, end))
+}
+
+/// Decode a `"` string body starting just past its opening quote; returns the
+/// text and the index past the closing quote. `None` for an escape this does
+/// not understand or an unterminated string.
+fn decode_string(b: &[u8], start: usize) -> Option<(String, usize)> {
+    let mut out = Vec::new();
+    let mut i = start;
+    loop {
+        match *b.get(i)? {
+            b'"' => return Some((String::from_utf8_lossy(&out).into_owned(), i + 1)),
+            b'\\' => {
+                let escape = *b.get(i + 1)?;
+                i += 2;
+                let digits = match escape {
+                    b'n' => Some(b'\n'),
+                    b't' => Some(b'\t'),
+                    b'r' => Some(b'\r'),
+                    b'0' => Some(0),
+                    b'\\' | b'"' | b'\'' => Some(escape),
+                    _ => None,
+                };
+                if let Some(byte) = digits {
+                    out.push(byte);
+                    continue;
+                }
+                let width = match escape {
+                    b'x' => 2,
+                    b'u' => 4,
+                    b'U' => 8,
+                    _ => return None,
+                };
+                let hex = std::str::from_utf8(b.get(i..i + width)?).ok()?;
+                let ch = char::from_u32(u32::from_str_radix(hex, 16).ok()?)?;
+                out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+                i += width;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
     }
 }
 
