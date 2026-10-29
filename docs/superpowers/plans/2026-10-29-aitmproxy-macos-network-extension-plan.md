@@ -26,20 +26,27 @@ This plan builds the macOS capture path in three bands, in strict risk order.
   Rust tests against synthesized flows and need no Mac. They build the macOS
   capture *backend* in the `aitm` wiring layer that feeds the Phase-1
   protocol-general `CaptureIngress`. **Hard prerequisite:** that ingress
-  (parent spec L4OPS-AC17 / its Phase-1 Task 10) is **not in this worktree**
-  (there is no `ingress` module under `crates/aitm/src`, HEAD `44f02be`).
-  **Verified 2026-10-29:** the `CaptureIngress` seam exists **nowhere yet** — not
-  on `origin/main`, and not on `origin/feat/l4-operator-surfaces` (the Phase-1
-  branch, 29 commits ahead of main, unmerged, which carries only an L4-specific
-  `CaptureSource` trait in `aitm-proto-l4/src/backend`, not the cross-protocol
-  ingress). On `main` the foundation it builds on — `ProtocolModule`,
-  `NextLayerHint`, `Proxy::register_module`, and the `aitm-proto-l4` `L4Guard` —
-  is present. So Band B is blocked on the Phase-1 `CaptureIngress` being built and
-  landed in the implementation base. Every Band-B task **depends on that landing
-  first**; if its shape differs from spec §3.7's assumptions (notably that
-  `NextLayerHint` can carry an authoritative destination and a
-  passthrough-on-unclaimed obligation), that is a **Phase-1 gap to report, not to
-  patch here** (spec Constraints).
+  (parent spec L4OPS-AC17).
+  **Updated 2026-10-29:** L4 operator surfaces Phase 1 **landed on `main` (PR #45,
+  `d8837ed`)**, bringing an **L4-only** `CaptureIngress`/`CoreIngress` in
+  `crates/aitm/src/ingress.rs` (guarded by the real `L4Guard`). It **cannot** move
+  into `aitm-core` (that would cycle with `aitm-proto-l4`), so the seam stays in
+  `crates/aitm`. The missing **TCP/stream dispatch half** is delivered by a
+  standalone prerequisite plan,
+  `docs/superpowers/plans/2026-10-29-aitmproxy-capture-ingress-prereq-plan.md`,
+  which extends that ingress with `CapturedTcpFlow` (carrying `peer_identity:
+  Option<String>`), `dispatch_captured_tcp(ingress: &CoreIngress, …)` (authoritative
+  dst → `ProtocolModule`, out-of-scope refusal, in-scope-unclaimed verbatim
+  passthrough) and a `CapturedUdpFlow` adapter over the L4 path.
+  **Reconciliation (supersedes Tasks 2–4 below):** Band B **consumes** that API and
+  does **not** redeclare these types — the ingress is `CoreIngress` (not
+  `CaptureIngress`), and the macOS `source_app: SourceAppId` maps onto the ingress's
+  `peer_identity`. Because the prerequisite already realizes the seam-level dispatch,
+  deny-by-default, and passthrough (the substance of NE-AC1/AC2/AC3), Band B's
+  Tasks 2–4 **narrow to the macOS capture-backend adapter** (construct the
+  `Captured*Flow` from the NE handoff and call the ingress) plus verifying the macOS
+  path — to be re-scoped by the orchestrator when Band B is dispatched. **Band B is
+  blocked on the prerequisite plan landing, not on the spike.**
 - **Band C — `[Mac]` / `[Build]` Terminal-panel build (Tasks 10–18).** The
   Swift sysex, the host-app activation/approval UX, nested signing and
   notarization, version-bump reconcile, capture indicator/uninstall, and the
