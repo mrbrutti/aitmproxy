@@ -1,0 +1,96 @@
+/* Direction D — "The wire"
+   A request is a thing that travels along a wire from a client to a server.
+   aitmproxy cuts the wire and holds the request in mid-air; two operators
+   (a hand and an agent) reach into the same gap. The page is built around
+   that wire: it crosses the hero, draws the flow lifecycle, and merges the
+   two operators into one audit log.
+
+   Type: Newsreader (display + body, optical sizes 6–72) and IBM Plex Mono
+   (real code, terminals and data only). Serif on purpose: editorial, not SaaS.
+   Palette: white paper, near-black ink, one hold-signal yellow. Nothing else. */
+
+@import url("https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,300..800;1,6..72,300..800&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap");
+
+:root {
+  color-scheme: light;
+
+  /* paper and ink */
+  --paper: #ffffff;
+  --paper-2: #f3f3f1;
+  --paper-3: #e9e9e6;
+  --hairline: #d6d6d2;
+  --ink: #111111;
+  --ink-2: #3b3b39;
+
+  /* the single accent: the hold signal */
+  --signal: #f0c000;
+  --signal-deep: #d9ad00;
+  --signal-ink: #111111;
+
+  /* the product's dark surfaces (terminals, transcripts, code) */
+  --console: #121212;
+  --console-2: #1a1a19;
+  --console-line: #2b2b29;
+  --console-text: #ebebe7;
+  --console-muted: #93938d;
+  --console-signal: #f6cc1a;
+
+  /* type */
+  --serif: "Newsreader", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --fs-display: clamp(2.25rem, 0.95rem + 5.33vw, 5.75rem);  /* 36 → 92 px */
+  --fs-h2: clamp(1.9rem, 1.1rem + 2.6vw, 3.4rem);          /* 30 → 54 px */
+  --fs-h3: clamp(1.375rem, 1.15rem + 0.8vw, 1.75rem);      /* 22 → 28 px */
+  --fs-lead: clamp(1.1875rem, 1.05rem + 0.55vw, 1.4375rem);/* 19 → 23 px */
+  --fs-body: 1.0625rem;                                     /* 17 px */
+  --fs-small: 0.9375rem;                                    /* 15 px */
+  --fs-mono: 0.875rem;                                      /* 14 px */
+  --fs-mono-s: 0.8125rem;                                   /* 13 px */
+
+  /* rhythm */
+  --margin: clamp(1.25rem, 4vw, 4rem);
+  --max: 1280px;
+  --section: clamp(4.5rem, 9vw, 9rem);
+  --gap: clamp(1.25rem, 2.5vw, 2.5rem);
+  --radius: 2px;
+
+  /* motion: one authored curve */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur: 220ms;
+}
+
+/* browser surfaces, themed */
+::selection { background: var(--signal); color: var(--signal-ink); }
+:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; border-radius: var(--radius); }
+.console :focus-visible, .code :focus-visible, .term :focus-visible { outline-color: var(--console-signal); }
+html { scrollbar-color: #b8b8b3 var(--paper); }
+::-webkit-scrollbar { width: 12px; height: 12px; }
+::-webkit-scrollbar-track { background: var(--paper); }
+::-webkit-scrollbar-thumb { background: #b8b8b3; border: 3px solid var(--paper); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: var(--ink-2); }
+
+/* reset, light-handed */
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: var(--fs-body);
+  line-height: 1.5;
+  font-optical-sizing: auto;
+  font-kerning: normal;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+h1, h2, h3, h4 { margin: 0; font-weight: 500; letter-spacing: -0.015em; text-wrap: balance; }
+p { margin: 0; }
+a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: 0.16em; }
+button { font: inherit; color: inherit; }
+code, pre, kbd, samp { font-family: var(--mono); font-feature-settings: "liga" 0; }
+img, svg { display: block; max-width: 100%; }
+ul, ol { margin: 0; padding: 0; }
+table { border-collapse: collapse; }
