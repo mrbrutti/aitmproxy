@@ -1,6 +1,10 @@
 # macOS Network/System Extension capture path (L4 Phase 2) — design
 
-**Status:** draft
+**Status:** approved (2026-10-29, by the orchestrator on Matt's behalf, autonomous
+mode) — the seven default **(b)** decisions in Open questions are **locked** (see
+Resolved decisions). **Three account/scope items remain for Matt** ((a) A1 Apple-
+portal setup, A2 flow-level-L4 ceiling, A3 packaging C1-vs-C2); **implementation is
+held until Matt answers them**, and the Task-1 signing spike runs first.
 **Research inputs:** `docs/research/10-macos-network-extension.md` (primary),
 `docs/research/09-l4-inpath-interception.md`, `docs/research/08-l4-packet-rust.md`,
 `docs/research/07-ca-install.md`.
@@ -513,51 +517,68 @@ require a real Mac in the Terminal panel with a signed, approved extension;
   `aitm-testtarget` L4 service is loopback; loopback may not be capturable — see
   Open question — so a non-loopback in-scope target may be required).
 
+## Resolved decisions (locked 2026-10-29, orchestrator on Matt's behalf)
+
+The seven **(b)** open questions were ruled as recommended and are now binding on
+the plan:
+
+- **G1 (OQ1):** keep L4OPS-AC19's approved text; read it per §D2 (TCP → `ProtocolModule`
+  seam, UDP → flow-level L4 behind `L4Guard`, raw-packet L4 = `L4Unavailable`).
+- **Operator-only approval (OQ4):** sysex install/approval is operator-gated like
+  `ca.allow_agent_install`; no agent path.
+- **Parent bundle = `/Applications` (OQ6);** the Task-1 spike confirms `~/Applications`.
+- **Run the Task-1 signing spike (OQ7)** — but it stays blocked until A1 (needs Matt's
+  Developer ID), on his Mac via the Terminal panel.
+- **Developer ID direct only; App Store out of scope (OQ8).**
+- **QUIC left as direct UDP (OQ9)** — no forced QUIC→TCP fallback.
+- **Multi-user: filter by audit-token UID to the approving user (OQ10).**
+
 ## Open questions
 
-Only Matt (or his developer account / a real signing spike) can settle these.
-Ordered most important first.
+**Only three remain — held for Matt (the (a) items); nothing is built until he
+answers.** The seven (b) items above are resolved and kept here for provenance,
+tagged **[RESOLVED]**. Ordered most important first.
 
-1. **AC19 final wording.** Adopt **G1** (keep L4OPS-AC19's text, read it as D2:
+1. **[RESOLVED → G1]** **AC19 final wording.** Adopt **G1** (keep L4OPS-AC19's text, read it as D2:
    TCP → `ProtocolModule` seam, UDP → flow-level L4 behind `L4Guard`, raw-packet
    L4 = `L4Unavailable`), or reword to a **G2** phrasing that spells out "flows,
    not packets"? This is the central design question and may edit an
    already-approved spec's text.
-2. **Raw-packet-L4 ceiling acceptance.** Is flow-level-only on macOS (no raw
+2. **[PENDING MATT — (a) A2]** **Raw-packet-L4 ceiling acceptance.** Is flow-level-only on macOS (no raw
    packet craft/inject/mutate, no in-path interception; BPF capture-only is the
    theoretical ceiling and is not built) **acceptable** for AC19, or does Matt want
    a different bar (e.g. the packet-tunnel second-ingress route)? (research OQ15)
-3. **Packaging C1 vs C2.** Embed the sysex in `Aitmproxy.app` (C1, recommended —
+3. **[PENDING MATT — (a) A3]** **Packaging C1 vs C2.** Embed the sysex in `Aitmproxy.app` (C1, recommended —
    one bundle, serves the self-contained app) and accept that a **CLI-only macOS
    user cannot activate the extension**, or ship a separate capture-host app (C2)
    for the CLI-first story at the cost of a second bundle and a second approval?
    (research OQ12)
-4. **Operator-only approval.** Confirm that activating/approving the system
+4. **[RESOLVED → operator-only]** **Operator-only approval.** Confirm that activating/approving the system
    extension is an **operator-only** action (no agent-driven install), gated like
    `ca.allow_agent_install`. (research OQ5)
-5. **Developer-account state.** Does Matt's team have (or can mint) **two App IDs**
+5. **[PENDING MATT — (a) A1]** **Developer-account state.** Does Matt's team have (or can mint) **two App IDs**
    with *Network Extensions* on both and *System Extension* on the app, and **two
    Developer ID provisioning profiles** carrying
    `app-proxy-provider-systemextension` (+ `system-extension.install` on the app)?
    Nothing here was verified against the account. (research OQ2)
-6. **Parent-bundle location.** Is installing to **`/Applications`** (the cask
+6. **[RESOLVED → /Applications]** **Parent-bundle location.** Is installing to **`/Applications`** (the cask
    default) acceptable, or must `~/Applications` (where `build.sh` installs today)
    work? `OSSystemExtensionErrorUnsupportedParentBundleLocation` exists; sources
    only say "appropriate Applications directory." Cheap to settle with a spike.
    (research OQ1)
-7. **Run the activation/handoff spike before the plan?** Research Candidate H
+7. **[RESOLVED → yes, blocked on A1]** **Run the activation/handoff spike before the plan?** Research Candidate H
    proposes a throwaway `experiment/macos-ne-spike` that signs and activates a
    do-nothing `NETransparentProxyProvider` with Matt's team and proves one flow
    across an authenticated Unix socket. It would settle OQ4–6 above and research
    OQ3/6/7 (manual-`codesign` entitlement acceptance on macOS 27, peer-auth
    feasibility, self-exclusion identity) **before** any plan work. Recommend
    running it. Do you want it?
-8. **App Store out of scope — confirm.** Direct Developer ID only (appex is App
+8. **[RESOLVED → Developer ID only]** **App Store out of scope — confirm.** Direct Developer ID only (appex is App
    Store only and needs a sandboxed core). (research OQ13)
-9. **QUIC handling.** Native QUIC is not decrypted. Do you want QUIC forced to TCP
+9. **[RESOLVED → direct UDP]** **QUIC handling.** Native QUIC is not decrypted. Do you want QUIC forced to TCP
    fallback (needs the `return true` + immediate close-write workaround, with the
    UDP/Chromium flow quirks research §3.9 flags), or left as direct UDP?
    (research OQ9)
-10. **Multi-user filtering.** The sysex is global and root; flows from other
+10. **[RESOLVED → filter by audit-token UID]** **Multi-user filtering.** The sysex is global and root; flows from other
     logged-in users reach the provider. Filter by audit-token UID, or capture all?
     (research OQ14)

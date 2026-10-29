@@ -1,6 +1,11 @@
 # macOS Network/System Extension capture path (L4 Phase 2) implementation plan
 
-**Status:** draft
+**Status:** approved (2026-10-29, by the orchestrator on Matt's behalf, autonomous
+mode). **Implementation is HELD** until Matt answers the spec's three (a) items
+(A1 Apple-portal setup, A2 flow-level-L4 ceiling, A3 packaging C1-vs-C2). Task 1
+(the signing spike) runs first, on Matt's Mac via the Terminal panel, and is
+blocked on A1 (it needs his Developer ID). All seven (b) defaults are locked per
+the spec's Resolved decisions.
 **Spec:** `docs/superpowers/specs/2026-10-29-aitmproxy-macos-network-extension-design.md`
 **Branch / worktree:** `feat/macos-network-extension`
 
