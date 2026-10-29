@@ -13,6 +13,21 @@ import Security
 /// owns the `Process` lives in the app target and is covered by the live
 /// self-test (Task 9).
 public enum EmbeddedCoreLaunch {
+    // MARK: Teardown budgets
+
+    /// The obscura teardown budget (in whole seconds) the generated config asks
+    /// the embedded core for (`browser.obscura.stop_timeout`). The core's own
+    /// quit budget is this plus a 1 s reap margin (`crates/aitm/src/main.rs`), so
+    /// keeping it small bounds how long the core needs after `SIGTERM`.
+    public static let obscuraStopTimeoutSeconds = 2
+
+    /// The Swift-side `SIGTERM` → `SIGKILL` grace (in whole seconds) the embedded
+    /// core manager waits before force-killing the child. It MUST exceed the
+    /// core's whole obscura teardown budget (`obscuraStopTimeoutSeconds` + the
+    /// core's 1 s reap margin) so a clean `SIGTERM` is always enough and `SIGKILL`
+    /// never lands mid-teardown and orphans obscura (AC7).
+    public static let childStopGraceSeconds = 5
+
     // MARK: Token
 
     /// A fresh 256-bit bus token, rendered as lower-case hex, drawn from the
@@ -82,6 +97,39 @@ public enum EmbeddedCoreLaunch {
         return anyFreePort(host: host)
     }
 
+    // MARK: Restart backoff
+
+    /// What to do after an unexpected child exit: back off and retry, or give up.
+    public enum RestartDecision: Equatable, Sendable {
+        /// Respawn after this exponential-backoff delay.
+        case retry(after: Duration)
+        /// The cap is reached — stop retrying and report `.degraded`.
+        case giveUp
+    }
+
+    /// The restart decision for the `restarts`-th unexpected child exit (1-based):
+    /// give up once `restarts` exceeds `maxRestarts`, otherwise retry after an
+    /// exponential backoff `base * 2^(restarts - 1)` capped at `cap`. Pure, so the
+    /// backoff schedule and the give-up boundary are unit-tested without spawning a
+    /// process (AC8).
+    public static func restartDecision(
+        restarts: Int, maxRestarts: Int, base: Duration, cap: Duration
+    ) -> RestartDecision {
+        guard restarts <= maxRestarts else { return .giveUp }
+        // Clamp the shift so `1 << shift` can never overflow if `maxRestarts` is
+        // raised far in the future; at today's cap the backoff saturates long first.
+        let shift = min(max(restarts - 1, 0), 16)
+        return .retry(after: min(base * (1 << shift), cap))
+    }
+
+    /// The `.degraded` detail surfaced when restarts are exhausted: the failure
+    /// `reason` followed by the last `tailLines` captured stderr lines (AC8), so an
+    /// operator sees why the core gave up. Pure and unit-tested.
+    public static func giveUpDetail(reason: String, logTail: [String], tailLines: Int) -> String {
+        let tail = logTail.suffix(tailLines).joined(separator: "\n")
+        return tail.isEmpty ? reason : "\(reason)\n\(tail)"
+    }
+
     // MARK: Rendezvous-file parse
 
     /// Builds a `BusEndpoint` from the core's rendezvous file (Task 3): its
@@ -95,8 +143,19 @@ public enum EmbeddedCoreLaunch {
             .trimmingCharacters(in: .whitespaces) ?? ""
         guard let colon = line.lastIndex(of: ":") else { return nil }
         let host = String(line[..<colon])
-        guard !host.isEmpty, let port = UInt16(line[line.index(after: colon)...]) else { return nil }
+        // The embedded core always binds loopback; a non-loopback host means a
+        // tampered or stale rendezvous file and must never be dialed (S4).
+        guard !host.isEmpty, isLoopbackHost(host),
+              let port = UInt16(line[line.index(after: colon)...]) else { return nil }
         return BusEndpoint(host: host, port: port, token: token)
+    }
+
+    /// Whether `host` (as a rendezvous file writes it) is a loopback address: the
+    /// only hosts the embedded core is ever reached on. IPv6 is accepted both bare
+    /// (`::1`) and bracketed (`[::1]`) as `SocketAddr` prints it.
+    static func isLoopbackHost(_ host: String) -> Bool {
+        let bare = host.hasPrefix("[") && host.hasSuffix("]") ? String(host.dropFirst().dropLast()) : host
+        return bare == "127.0.0.1" || bare == "::1" || bare == "localhost"
     }
 
     // MARK: Per-launch config
@@ -134,21 +193,49 @@ public enum EmbeddedCoreLaunch {
         /// the token and both paths are double-quoted so hex/paths never trip the
         /// YAML parser. The curated default log level comes from the core itself
         /// (Task 3) when `RUST_LOG` is unset, so it is not configured here.
-        public func yaml() -> String {
-            """
+        ///
+        /// `obscura.stop_timeout` is pinned small (so the core's whole teardown
+        /// budget stays under the Swift-side `SIGKILL` grace — AC7), and both paths
+        /// are escaped for a double-quoted YAML scalar so a path with a quote or
+        /// backslash cannot break the file; a path with a newline is rejected.
+        public func yaml() throws -> String {
+            let obscuraPath = try EmbeddedCoreLaunch.yamlDoubleQuoted(obscuraBinary.path)
+            let endpointPath = try EmbeddedCoreLaunch.yamlDoubleQuoted(endpointFile.path)
+            return """
             listen: "127.0.0.1:\(proxyPort)"
             mcp:
               transport:
                 loopback_tcp:
                   port: 0
                   token: "\(token)"
-                  endpoint_file: "\(endpointFile.path)"
+                  endpoint_file: "\(endpointPath)"
             browser:
               proxy_addr: "127.0.0.1:\(browserProxyPort)"
               obscura:
-                binary: "\(obscuraBinary.path)"
+                binary: "\(obscuraPath)"
+                stop_timeout: \(EmbeddedCoreLaunch.obscuraStopTimeoutSeconds)
             """
         }
+    }
+
+    /// Something is wrong with a value spliced into the generated config.
+    public enum ConfigError: Error, Equatable {
+        /// A path carried a newline, which would break out of its YAML scalar.
+        case pathContainsNewline(String)
+    }
+
+    /// Escapes a filesystem path for embedding inside a double-quoted YAML scalar:
+    /// backslashes and double-quotes are backslash-escaped. A path containing a
+    /// newline (`\n` or `\r`) is rejected — a newline cannot be represented inside
+    /// a double-quoted scalar on one line, and allowing it would let a crafted path
+    /// inject arbitrary YAML (S3). Returns the inner text to splice between quotes.
+    static func yamlDoubleQuoted(_ path: String) throws -> String {
+        guard !path.contains("\n"), !path.contains("\r") else {
+            throw ConfigError.pathContainsNewline(path)
+        }
+        return path
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
     }
 
     /// Writes the per-launch config to `url` with mode `0600` and no window in
@@ -156,7 +243,9 @@ public enum EmbeddedCoreLaunch {
     /// `open(…, 0o600)` and re-enforced with `fchmod`, so the bus token it
     /// carries never sits in a world- or group-readable file.
     public static func writeConfig(_ yaml: String, to url: URL) throws {
-        let fd = open(url.path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
+        // O_NOFOLLOW: never write through a symlink planted at the config path, so
+        // a pre-seeded link can't redirect the token-bearing file elsewhere (S2).
+        let fd = open(url.path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0o600)
         guard fd >= 0 else {
             throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: url.path])
         }

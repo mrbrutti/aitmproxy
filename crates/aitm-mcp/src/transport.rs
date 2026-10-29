@@ -137,6 +137,12 @@ impl Drop for LoopbackTcp {
 /// Write `addr` (the bound `host:port`, never the token) to `path`, truncating
 /// any leftover, readable and writable by the owner only on Unix. A single
 /// trailing newline makes it `cat`-friendly and unambiguous to a line reader.
+///
+/// Security: the file is created/truncated through `path` without `O_NOFOLLOW`,
+/// so the caller MUST place `endpoint_file` in a directory only the operator can
+/// write (e.g. a `0700` per-launch dir, as the embedded macOS core does). In a
+/// world-writable directory an attacker could pre-plant a symlink and redirect
+/// this write; a private parent directory removes that exposure.
 fn write_endpoint_file(path: &Path, addr: SocketAddr) -> anyhow::Result<()> {
     use std::io::Write as _;
 

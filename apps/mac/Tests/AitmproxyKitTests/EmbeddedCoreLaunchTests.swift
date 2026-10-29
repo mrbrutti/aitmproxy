@@ -60,6 +60,87 @@ import Testing
         #expect(text.contains(config.obscuraBinary.path))       // bundled obscura
     }
 
+    @Test func config_pins_a_bounded_obscura_stop_timeout() throws {
+        // The generated config asks the embedded core for a small obscura
+        // teardown budget so the core's whole quit budget stays under the
+        // Swift-side SIGKILL grace (S1 / AC7).
+        let yaml = try sampleConfig(endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint")).yaml()
+        #expect(yaml.contains("stop_timeout: 2"))
+    }
+
+    @Test func swift_stop_grace_exceeds_the_embedded_core_obscura_budget() {
+        // The SIGTERM→SIGKILL grace must outlast the core's whole obscura teardown
+        // budget (stop_timeout + the core's 1 s reap margin) so a clean SIGTERM is
+        // always enough and SIGKILL never orphans obscura mid-teardown (S1 / AC7).
+        let coreBudget = EmbeddedCoreLaunch.obscuraStopTimeoutSeconds + 1
+        #expect(EmbeddedCoreLaunch.childStopGraceSeconds > coreBudget)
+    }
+
+    // MARK: Config path escaping (S3)
+
+    @Test func config_paths_are_escaped_for_a_double_quoted_scalar() throws {
+        // A quote and a backslash in a path are backslash-escaped, not left to
+        // break out of the double-quoted YAML scalar.
+        #expect(try EmbeddedCoreLaunch.yamlDoubleQuoted(#"/a/"b"/c"#) == #"/a/\"b\"/c"#)
+        #expect(try EmbeddedCoreLaunch.yamlDoubleQuoted(#"/a\b"#) == #"/a\\b"#)
+        // A clean path is unchanged.
+        #expect(try EmbeddedCoreLaunch.yamlDoubleQuoted("/Apps/obscura") == "/Apps/obscura")
+    }
+
+    @Test func config_rejects_a_path_with_a_newline() {
+        // A newline can't live inside a one-line double-quoted scalar; rather than
+        // emit broken/injectable YAML, rendering throws.
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.pathContainsNewline("/a/b\nlisten: evil")) {
+            try EmbeddedCoreLaunch.yamlDoubleQuoted("/a/b\nlisten: evil")
+        }
+        let bad = EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", endpointFile: URL(fileURLWithPath: "/tmp/with\nnewline")
+        )
+        #expect(throws: (any Error).self) { try bad.yaml() }
+    }
+
+    // MARK: Restart backoff (SP3 / AC8)
+
+    @Test func restart_backoff_follows_base_times_two_to_the_n_capped() {
+        let base: Duration = .milliseconds(500)
+        let cap: Duration = .seconds(10)
+        func decide(_ n: Int, max: Int = 5) -> EmbeddedCoreLaunch.RestartDecision {
+            EmbeddedCoreLaunch.restartDecision(restarts: n, maxRestarts: max, base: base, cap: cap)
+        }
+        // base * 2^(n-1): 500ms, 1s, 2s, 4s, 8s.
+        #expect(decide(1) == .retry(after: .milliseconds(500)))
+        #expect(decide(2) == .retry(after: .seconds(1)))
+        #expect(decide(3) == .retry(after: .seconds(2)))
+        #expect(decide(4) == .retry(after: .seconds(4)))
+        #expect(decide(5) == .retry(after: .seconds(8)))
+        // The cap engages once base * 2^(n-1) would exceed it (here with a higher
+        // maxRestarts so the attempt is still allowed): 500ms * 2^5 = 16s → 10s.
+        #expect(decide(6, max: 10) == .retry(after: .seconds(10)))
+    }
+
+    @Test func restart_gives_up_once_restarts_exceed_the_cap() {
+        let base: Duration = .milliseconds(500)
+        let cap: Duration = .seconds(10)
+        // At maxRestarts the attempt is still allowed; one past it gives up.
+        #expect(EmbeddedCoreLaunch.restartDecision(restarts: 5, maxRestarts: 5, base: base, cap: cap)
+            != .giveUp)
+        #expect(EmbeddedCoreLaunch.restartDecision(restarts: 6, maxRestarts: 5, base: base, cap: cap)
+            == .giveUp)
+    }
+
+    @Test func give_up_detail_carries_the_stderr_tail() {
+        // Give-up surfaces the reason followed by the last `tailLines` captured
+        // lines, so the degraded status shows why the core stopped (AC8).
+        #expect(EmbeddedCoreLaunch.giveUpDetail(
+            reason: "the core exited unexpectedly (status 1)",
+            logTail: ["line1", "line2", "line3"], tailLines: 2
+        ) == "the core exited unexpectedly (status 1)\nline2\nline3")
+        // With no captured output, the reason stands alone (no trailing newline).
+        #expect(EmbeddedCoreLaunch.giveUpDetail(reason: "boom", logTail: [], tailLines: 8) == "boom")
+    }
+
     // MARK: Rendezvous-file parse
 
     @Test func endpoint_file_parses_to_bus_endpoint() {
@@ -74,6 +155,22 @@ import Testing
         #expect(EmbeddedCoreLaunch.parseEndpoint(fromFileContents: "\n", token: token) == nil)
         #expect(EmbeddedCoreLaunch.parseEndpoint(fromFileContents: "not-an-addr", token: token) == nil)
         #expect(EmbeddedCoreLaunch.parseEndpoint(fromFileContents: "127.0.0.1:99999\n", token: token) == nil)
+    }
+
+    @Test func endpoint_file_rejects_a_non_loopback_host() {
+        let token = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+
+        // A well-formed but non-loopback address means a tampered or stale file —
+        // it must never be dialed (S4).
+        #expect(EmbeddedCoreLaunch.parseEndpoint(fromFileContents: "10.0.0.5:50512\n", token: token) == nil)
+        #expect(EmbeddedCoreLaunch.parseEndpoint(fromFileContents: "0.0.0.0:50512\n", token: token) == nil)
+        #expect(EmbeddedCoreLaunch.parseEndpoint(fromFileContents: "evil.example.com:50512\n", token: token) == nil)
+
+        // The loopback aliases the core may print are accepted.
+        #expect(EmbeddedCoreLaunch.parseEndpoint(fromFileContents: "localhost:50512\n", token: token)
+            == BusEndpoint(host: "localhost", port: 50512, token: token))
+        #expect(EmbeddedCoreLaunch.parseEndpoint(fromFileContents: "[::1]:50512\n", token: token)
+            == BusEndpoint(host: "[::1]", port: 50512, token: token))
     }
 
     // MARK: Free-port probe (binds a real socket — runs in the Terminal panel)
