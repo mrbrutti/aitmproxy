@@ -41,6 +41,7 @@ fn embed(tag: &str) -> Embedded {
     cfg.mcp.transport = McpTransport::LoopbackTcp {
         port: 0,
         token: "test-token".into(),
+        endpoint_file: None,
     };
     let (_proxy, services) = assemble_services(&cfg);
     let store = services.store.clone();

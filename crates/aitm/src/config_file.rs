@@ -368,19 +368,34 @@ impl McpFile {
     }
 }
 
-/// `transport: {stdio: {}}` or `transport: {loopback_tcp: {port, token}}`.
+/// `transport: {stdio: {}}` or
+/// `transport: {loopback_tcp: {port, token, endpoint_file?}}`.
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum TransportFile {
     Stdio {},
-    LoopbackTcp { port: u16, token: String },
+    LoopbackTcp {
+        port: u16,
+        token: String,
+        /// Optional rendezvous file for the bound bus `host:port` (no token).
+        #[serde(default)]
+        endpoint_file: Option<PathBuf>,
+    },
 }
 
 impl From<TransportFile> for McpTransport {
     fn from(t: TransportFile) -> Self {
         match t {
             TransportFile::Stdio {} => McpTransport::Stdio,
-            TransportFile::LoopbackTcp { port, token } => McpTransport::LoopbackTcp { port, token },
+            TransportFile::LoopbackTcp {
+                port,
+                token,
+                endpoint_file,
+            } => McpTransport::LoopbackTcp {
+                port,
+                token,
+                endpoint_file,
+            },
         }
     }
 }

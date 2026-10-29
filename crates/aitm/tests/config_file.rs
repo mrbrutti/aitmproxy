@@ -131,7 +131,7 @@ fn transport_map_forms_load() {
     assert!(
         matches!(
             &cfg.mcp.transport,
-            McpTransport::LoopbackTcp { port: 7001, token } if token == "t0k"
+            McpTransport::LoopbackTcp { port: 7001, token, .. } if token == "t0k"
         ),
         "{:?}",
         cfg.mcp.transport
@@ -140,6 +140,40 @@ fn transport_map_forms_load() {
     let cfg = parse("mcp:\n  transport:\n    stdio: {}\n").expect("stdio map form");
     assert!(
         matches!(cfg.mcp.transport, McpTransport::Stdio),
+        "{:?}",
+        cfg.mcp.transport
+    );
+}
+
+/// O5: the loopback transport takes an optional `endpoint_file` (the bus
+/// rendezvous path); it defaults to `None` and parses when given.
+#[test]
+fn loopback_endpoint_file_parses() {
+    redirect_home();
+    let cfg = parse(
+        "mcp:\n  transport:\n    loopback_tcp:\n      port: 0\n      token: t0k\n      endpoint_file: /tmp/aitm-bus.addr\n",
+    )
+    .expect("loopback_tcp with endpoint_file");
+    assert!(
+        matches!(
+            &cfg.mcp.transport,
+            McpTransport::LoopbackTcp { endpoint_file: Some(p), .. }
+                if p == std::path::Path::new("/tmp/aitm-bus.addr")
+        ),
+        "{:?}",
+        cfg.mcp.transport
+    );
+
+    let cfg = parse("mcp:\n  transport:\n    loopback_tcp:\n      port: 0\n      token: t0k\n")
+        .expect("loopback_tcp without endpoint_file");
+    assert!(
+        matches!(
+            &cfg.mcp.transport,
+            McpTransport::LoopbackTcp {
+                endpoint_file: None,
+                ..
+            }
+        ),
         "{:?}",
         cfg.mcp.transport
     );

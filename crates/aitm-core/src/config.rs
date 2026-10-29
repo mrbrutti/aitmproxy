@@ -185,7 +185,15 @@ pub enum McpTransport {
     /// Serve over stdio.
     Stdio,
     /// Serve over loopback TCP (127.0.0.1 only); the token is required.
-    LoopbackTcp { port: u16, token: String },
+    LoopbackTcp {
+        port: u16,
+        token: String,
+        /// Where to publish the bound bus `host:port` (never the token) once the
+        /// listener binds — the rendezvous file a parent process (the embedded-core
+        /// manager) watches to learn the ephemeral port without parsing stdout.
+        /// `None` writes nothing. Mirrors the obscura ready-file pattern.
+        endpoint_file: Option<PathBuf>,
+    },
 }
 
 /// MCP frontend configuration.

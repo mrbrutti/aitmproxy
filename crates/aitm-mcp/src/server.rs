@@ -154,8 +154,12 @@ impl McpServer {
         });
         match selected {
             McpTransport::Stdio => transport::serve_stdio(server).await,
-            McpTransport::LoopbackTcp { port, token } => {
-                let listener = LoopbackTcp::bind(port, token).await?;
+            McpTransport::LoopbackTcp {
+                port,
+                token,
+                endpoint_file,
+            } => {
+                let listener = LoopbackTcp::bind(port, token, endpoint_file).await?;
                 if let Some(f) = on_bound {
                     f(listener.local_addr());
                 }

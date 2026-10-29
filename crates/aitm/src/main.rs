@@ -27,7 +27,7 @@ use aitm::tui::TuiLog;
 use aitm::web::{self, WebArgs, WebCommand, WebState};
 use aitm::wire::{assemble_with_scripts, Assembled, Features, ScriptWiring};
 use aitm::{config_file, env, tui};
-use aitm_core::{BrowserDriver, Chain, Plugin};
+use aitm_core::{BrowserDriver, Chain, McpTransport, Plugin};
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -77,6 +77,7 @@ fn main() -> anyhow::Result<()> {
 async fn run() -> anyhow::Result<()> {
     let (config_arg, argv) = split_config_arg(std::env::args().skip(1).collect())?;
     let (script_args, argv) = split_script_args(argv)?;
+    let (bus_endpoint_file, argv) = split_bus_endpoint_file_arg(argv)?;
     // `aitm web …` is the server path with the web UI attached; its options
     // are resolved before any config is loaded so `--help` and bad flags are
     // answered immediately.
@@ -117,6 +118,9 @@ async fn run() -> anyhow::Result<()> {
     } = config_file::load_settings(config_path.as_deref())?;
     env::apply(&mut cfg, |k| std::env::var(k).ok());
     env::apply_rhai(&mut rhai_cfg, |k| std::env::var(k).ok());
+    // `--bus-endpoint-file` wins over the config's `endpoint_file`; it only means
+    // anything for the loopback-TCP bus, so asking for it over stdio is an error.
+    apply_bus_endpoint_file(&mut cfg.mcp.transport, bus_endpoint_file)?;
     // A script's `browser.navigate` decides SSRF under the same policy as the
     // `browser.navigate` command.
     rhai_cfg.ssrf = cfg.browser.ssrf.clone();
@@ -368,6 +372,60 @@ fn split_script_args(argv: Vec<String>) -> anyhow::Result<(Vec<PathBuf>, Vec<Str
     Ok((scripts, rest))
 }
 
+/// Split a single `--bus-endpoint-file <path>` / `--bus-endpoint-file=<path>`
+/// out of `argv`, returning the path (if given) and the remaining arguments.
+/// Recognised anywhere a subcommand is not, like `--script`. Specifying it more
+/// than once is an error; it applies only to the loopback-TCP bus (see `run`).
+fn split_bus_endpoint_file_arg(
+    argv: Vec<String>,
+) -> anyhow::Result<(Option<PathBuf>, Vec<String>)> {
+    const FLAG: &str = "--bus-endpoint-file";
+    let mut path: Option<PathBuf> = None;
+    let mut rest = Vec::new();
+    let mut args = argv.into_iter();
+    while let Some(arg) = args.next() {
+        let value = if arg == FLAG {
+            Some(
+                args.next()
+                    .ok_or_else(|| anyhow::anyhow!("{FLAG} requires a path"))?,
+            )
+        } else {
+            arg.strip_prefix("--bus-endpoint-file=")
+                .map(|v| v.to_string())
+        };
+        match value {
+            Some(v) => {
+                anyhow::ensure!(path.is_none(), "{FLAG} may be given at most once");
+                path = Some(PathBuf::from(v));
+            }
+            None => rest.push(arg),
+        }
+    }
+    Ok((path, rest))
+}
+
+/// Apply a `--bus-endpoint-file` value (if any) onto the configured transport:
+/// it overrides the loopback transport's `endpoint_file`, and over stdio — which
+/// has no bound bus to publish — it is a usage error naming the fix.
+fn apply_bus_endpoint_file(
+    transport: &mut McpTransport,
+    path: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    match transport {
+        McpTransport::LoopbackTcp { endpoint_file, .. } => {
+            *endpoint_file = Some(path);
+            Ok(())
+        }
+        McpTransport::Stdio => anyhow::bail!(
+            "--bus-endpoint-file needs the loopback-TCP bus; set mcp.transport.loopback_tcp \
+             in the config so the core has a bound address to publish"
+        ),
+    }
+}
+
 /// Emit the `aitm web` "listening" lifecycle line.
 ///
 /// AC2: the bridge token must never enter the structured log stream. This takes
@@ -378,10 +436,42 @@ fn log_web_listening(addr: SocketAddr) {
     info!(%addr, "web UI listening");
 }
 
-/// Install a tracing subscriber (RUST_LOG-driven, defaulting to `info`).
+/// The curated default tracing directive used when `RUST_LOG` is unset (AC3).
+///
+/// Operator-relevant lifecycle on the `aitm*` targets ("proxy listening", the
+/// obscura start/stop/attach lines) stays at `info`, while the noisy transport
+/// and browser dependencies are pinned to `warn` so a normal browsing session
+/// does not bury the useful lines under per-connection dependency chatter.
+/// Benign per-connection disconnects are already emitted at `debug` (Task 1),
+/// so the `info` baseline hides them without a per-target pin. `RUST_LOG`, when
+/// set, overrides this wholesale (see [`build_env_filter`]).
+const DEFAULT_LOG_DIRECTIVE: &str = "info,\
+    chromiumoxide=warn,\
+    tungstenite=warn,\
+    tokio_tungstenite=warn,\
+    hyper=warn,\
+    hyper_util=warn,\
+    rustls=warn,\
+    tower=warn,\
+    reqwest=warn";
+
+/// Build the server path's `EnvFilter`: `rust_log` (the `RUST_LOG` value) when it
+/// is set and non-empty overrides the default wholesale; otherwise the curated
+/// [`DEFAULT_LOG_DIRECTIVE`] is used. Both parse lossily, so a malformed
+/// directive drops the bad part rather than failing startup.
+fn build_env_filter(rust_log: Option<String>) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::EnvFilter;
+    match rust_log.filter(|v| !v.trim().is_empty()) {
+        Some(directive) => EnvFilter::new(directive),
+        None => EnvFilter::new(DEFAULT_LOG_DIRECTIVE),
+    }
+}
+
+/// Install a tracing subscriber: `RUST_LOG`-driven, defaulting to the curated
+/// quiet filter ([`DEFAULT_LOG_DIRECTIVE`]).
 fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    use tracing_subscriber::fmt;
+    let filter = build_env_filter(std::env::var("RUST_LOG").ok());
     let _ = fmt().with_env_filter(filter).try_init();
 }
 
@@ -393,7 +483,12 @@ mod tests {
 
     use tracing_subscriber::fmt::MakeWriter;
 
-    use super::{log_web_listening, parse_mode, split_config_arg, split_script_args, Mode};
+    use aitm_core::McpTransport;
+
+    use super::{
+        apply_bus_endpoint_file, build_env_filter, log_web_listening, parse_mode,
+        split_bus_endpoint_file_arg, split_config_arg, split_script_args, Mode,
+    };
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
@@ -473,6 +568,144 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Install a subscriber with `filter` over a buffer, run `f`, and return
+    /// everything it emitted — so a test can assert which targets/levels survive.
+    fn capture_with_filter(filter: tracing_subscriber::EnvFilter, f: impl FnOnce()) -> String {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_env_filter(filter)
+            .with_writer(BufWriter(buf.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn default_filter_quiets_connection_noise() {
+        // AC3: the curated default (no RUST_LOG) keeps operator lifecycle while
+        // silencing per-connection dependency chatter and benign disconnects.
+        let out = capture_with_filter(build_env_filter(None), || {
+            tracing::info!(target: "aitm_core::proxy", "proxy listening");
+            tracing::info!(target: "chromiumoxide", "cdp event spam");
+            tracing::debug!(target: "aitm_core::proxy", "connection closed before completion");
+        });
+        assert!(
+            out.contains("proxy listening"),
+            "operator lifecycle must survive the default filter: {out:?}"
+        );
+        assert!(
+            !out.contains("cdp event spam"),
+            "noisy dependency target must be pinned below info: {out:?}"
+        );
+        assert!(
+            !out.contains("connection closed before completion"),
+            "benign per-connection debug must stay hidden at the info baseline: {out:?}"
+        );
+    }
+
+    #[test]
+    fn rust_log_overrides_the_curated_default() {
+        // AC3: RUST_LOG overrides the curated default wholesale — a directive that
+        // raises a pinned dependency to trace makes its trace events appear.
+        let out = capture_with_filter(build_env_filter(Some("chromiumoxide=trace".into())), || {
+            tracing::trace!(target: "chromiumoxide", "cdp trace restored");
+        });
+        assert!(
+            out.contains("cdp trace restored"),
+            "RUST_LOG must override the curated default wholesale: {out:?}"
+        );
+    }
+
+    #[test]
+    fn empty_rust_log_falls_back_to_the_curated_default() {
+        // An empty RUST_LOG is treated as unset, not as "disable everything".
+        let out = capture_with_filter(build_env_filter(Some("   ".into())), || {
+            tracing::info!(target: "aitm_core::proxy", "proxy listening");
+        });
+        assert!(
+            out.contains("proxy listening"),
+            "an empty RUST_LOG must fall back to the curated default: {out:?}"
+        );
+    }
+
+    #[test]
+    fn bus_endpoint_file_flag_separate_value_is_stripped() {
+        let (path, rest) =
+            split_bus_endpoint_file_arg(args(&["--bus-endpoint-file", "/run/bus.addr", "tui"]))
+                .unwrap();
+        assert_eq!(path, Some(PathBuf::from("/run/bus.addr")));
+        assert_eq!(rest, args(&["tui"]));
+    }
+
+    #[test]
+    fn bus_endpoint_file_flag_with_equals_is_stripped() {
+        let (path, rest) =
+            split_bus_endpoint_file_arg(args(&["--bus-endpoint-file=/run/bus.addr"])).unwrap();
+        assert_eq!(path, Some(PathBuf::from("/run/bus.addr")));
+        assert_eq!(rest, Vec::<String>::new());
+    }
+
+    #[test]
+    fn no_bus_endpoint_file_flag_leaves_argv_alone() {
+        let (path, rest) = split_bus_endpoint_file_arg(args(&["flow", "list"])).unwrap();
+        assert_eq!(path, None);
+        assert_eq!(rest, args(&["flow", "list"]));
+    }
+
+    #[test]
+    fn bus_endpoint_file_flag_without_a_path_is_an_error() {
+        let err = split_bus_endpoint_file_arg(args(&["--bus-endpoint-file"])).unwrap_err();
+        assert_eq!(err.to_string(), "--bus-endpoint-file requires a path");
+    }
+
+    #[test]
+    fn bus_endpoint_file_flag_twice_is_an_error() {
+        let err = split_bus_endpoint_file_arg(args(&[
+            "--bus-endpoint-file",
+            "/a",
+            "--bus-endpoint-file=/b",
+        ]))
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "--bus-endpoint-file may be given at most once"
+        );
+    }
+
+    #[test]
+    fn bus_endpoint_file_sets_the_loopback_transport() {
+        let mut transport = McpTransport::LoopbackTcp {
+            port: 0,
+            token: "tok".into(),
+            endpoint_file: None,
+        };
+        apply_bus_endpoint_file(&mut transport, Some(PathBuf::from("/run/bus.addr"))).unwrap();
+        assert!(matches!(
+            transport,
+            McpTransport::LoopbackTcp { endpoint_file: Some(p), .. } if p == std::path::Path::new("/run/bus.addr")
+        ));
+    }
+
+    #[test]
+    fn bus_endpoint_file_over_stdio_is_an_error() {
+        let mut transport = McpTransport::Stdio;
+        let err = apply_bus_endpoint_file(&mut transport, Some(PathBuf::from("/run/bus.addr")))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("loopback-TCP bus"),
+            "error should explain the loopback requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn no_bus_endpoint_file_leaves_the_transport_unchanged() {
+        let mut transport = McpTransport::Stdio;
+        apply_bus_endpoint_file(&mut transport, None).unwrap();
+        assert!(matches!(transport, McpTransport::Stdio));
     }
 
     #[test]

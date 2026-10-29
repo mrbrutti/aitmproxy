@@ -2,9 +2,12 @@
 //! TCP listener that requires a token on every connection. Both run the same
 //! [`serve_lines`] loop; the TCP transport first consumes one auth line.
 
+use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use serde_json::Value as JsonValue;
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Take,
@@ -64,21 +67,37 @@ pub struct LoopbackTcp {
     listener: TcpListener,
     local_addr: SocketAddr,
     token: Arc<str>,
+    /// A rendezvous file to remove on drop; see [`LoopbackTcp::bind`].
+    endpoint_file: Option<PathBuf>,
 }
 
 impl LoopbackTcp {
     /// Bind `127.0.0.1:port` (`0` picks a free port). The token must be non-empty.
-    pub async fn bind(port: u16, token: String) -> anyhow::Result<Self> {
+    ///
+    /// When `endpoint_file` is `Some`, the bound `host:port` (never the token) is
+    /// written to that path `0600` once the listener binds, so a parent process
+    /// can learn the ephemeral port without parsing stdout; the file is removed
+    /// when this `LoopbackTcp` is dropped (clean exit or error). Mirrors the
+    /// obscura ready-file precedent.
+    pub async fn bind(
+        port: u16,
+        token: String,
+        endpoint_file: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !token.is_empty(),
             "the loopback TCP transport requires a non-empty token"
         );
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
         let local_addr = listener.local_addr()?;
+        if let Some(path) = &endpoint_file {
+            write_endpoint_file(path, local_addr)?;
+        }
         Ok(Self {
             listener,
             local_addr,
             token: token.into(),
+            endpoint_file,
         })
     }
 
@@ -101,6 +120,48 @@ impl LoopbackTcp {
                 // A failed connection is that client's problem, not the server's.
                 let _ = serve_connection(srv, stream, &token).await;
             });
+        }
+    }
+}
+
+impl Drop for LoopbackTcp {
+    /// Remove the rendezvous file, if any, so a bound address never outlives the
+    /// listener. Idempotent — a missing file is fine.
+    fn drop(&mut self) {
+        if let Some(path) = &self.endpoint_file {
+            remove_endpoint_file(path);
+        }
+    }
+}
+
+/// Write `addr` (the bound `host:port`, never the token) to `path`, truncating
+/// any leftover, readable and writable by the owner only on Unix. A single
+/// trailing newline makes it `cat`-friendly and unambiguous to a line reader.
+fn write_endpoint_file(path: &Path, addr: SocketAddr) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(path)
+        .with_context(|| format!("writing the bus endpoint file {}", path.display()))?;
+    writeln!(file, "{addr}")
+        .with_context(|| format!("writing the bus endpoint file {}", path.display()))?;
+    Ok(())
+}
+
+/// Remove the rendezvous file; a missing one is fine (idempotent).
+fn remove_endpoint_file(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::debug!(path = %path.display(), %err, "could not remove the bus endpoint file")
         }
     }
 }
@@ -168,6 +229,59 @@ async fn read_message<R: AsyncBufRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A unique temp path for one test, cleaned up by the test itself.
+    fn temp_endpoint_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "aitm-bus-endpoint-{}-{tag}.addr",
+            std::process::id()
+        ))
+    }
+
+    /// AC3/O5: after the loopback transport binds with an endpoint file, the file
+    /// holds exactly the bound `127.0.0.1:<port>` and never the token, and it is
+    /// removed when the listener is dropped.
+    #[tokio::test]
+    async fn endpoint_file_written_after_bind() {
+        let path = temp_endpoint_path("written");
+        let _ = std::fs::remove_file(&path);
+
+        let listener = LoopbackTcp::bind(0, "s3cret-token".into(), Some(path.clone()))
+            .await
+            .expect("bind 127.0.0.1:0 with an endpoint file");
+        let addr = listener.local_addr();
+        assert!(addr.ip().is_loopback());
+        assert_ne!(addr.port(), 0, "an ephemeral port was resolved");
+
+        let contents = std::fs::read_to_string(&path).expect("endpoint file exists after bind");
+        assert_eq!(
+            contents.trim(),
+            addr.to_string(),
+            "the file holds the bound host:port"
+        );
+        assert!(
+            !contents.contains("s3cret-token"),
+            "the token must never enter the endpoint file: {contents:?}"
+        );
+
+        drop(listener);
+        assert!(
+            !path.exists(),
+            "the endpoint file is removed when the listener is dropped"
+        );
+    }
+
+    /// With no endpoint file configured, binding writes no rendezvous file.
+    #[tokio::test]
+    async fn no_endpoint_file_writes_nothing() {
+        let listener = LoopbackTcp::bind(0, "tok".into(), None)
+            .await
+            .expect("bind 127.0.0.1:0 without an endpoint file");
+        assert!(listener.local_addr().ip().is_loopback());
+        // Nothing to assert beyond: there is no path, so nothing is written or
+        // leaked; dropping must not panic.
+        drop(listener);
+    }
 
     #[test]
     fn token_compare() {

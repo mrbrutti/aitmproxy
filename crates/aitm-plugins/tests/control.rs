@@ -232,6 +232,7 @@ fn config_get_is_redacted_and_requires_config() {
             transport: McpTransport::LoopbackTcp {
                 port: 9090,
                 token: "SECRET-TOKEN".into(),
+                endpoint_file: None,
             },
         },
         ..Config::default()

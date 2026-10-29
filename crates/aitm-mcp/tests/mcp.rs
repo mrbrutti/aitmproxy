@@ -736,7 +736,7 @@ async fn serve_lines_answers_each_request_on_its_own_line() {
 #[tokio::test]
 async fn loopback_requires_token() {
     let srv = Arc::new(server());
-    let listener = LoopbackTcp::bind(0, "s3cret".into())
+    let listener = LoopbackTcp::bind(0, "s3cret".into(), None)
         .await
         .expect("bind 127.0.0.1:0");
     let addr = listener.local_addr();
@@ -814,6 +814,7 @@ async fn serve_binds_loopback_from_config() {
         McpTransport::LoopbackTcp {
             port: 0,
             token: "tok".into(),
+            endpoint_file: None,
         },
     )
     .with_services(

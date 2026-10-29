@@ -40,6 +40,7 @@ fn config(tag: &str) -> Config {
     cfg.mcp.transport = McpTransport::LoopbackTcp {
         port: 0,
         token: TOKEN.into(),
+        endpoint_file: None,
     };
     cfg
 }

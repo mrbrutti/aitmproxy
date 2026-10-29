@@ -135,6 +135,7 @@ dependencies = [
  "futures",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
