@@ -1,5 +1,5 @@
 {
-  "_comment": "Rhai completion + hover catalog. Mirrors docs/superpowers/specs/2026-10-27-aitmproxy-plugin-system-design.md §'Tier 2 — Rhai scripting plugins' (hook table, 'flow object', 'Host functions') EXACTLY, so the drift guard (plan Task 12) can compare globals/flow/msg/dsl against the engine's registered set. Do not add an entry the plugin-system spec does not define. Entry names are fully qualified (`flow.request.headers.get`); a surface completes the last segment after the receiver chain. `kind` is object | property | method | function.",
+  "_comment": "Rhai completion + hover catalog. THE SHIPPED ENGINE IS CANONICAL: crates/aitm-plugin-rhai/tests/api_catalog.rs asserts a bijection between the engine's registered host surface (gen_fn_signatures) and the IMPLEMENTED entries here, so every implemented entry must name a real registered token and every registered author-facing token must appear here. Entries with \"status\": \"planned\" (the dsl crypto/encoding helpers) are specced but not yet registered on the engine; they are excluded from the bijection until a production follow-up lands them. Entry names are fully qualified (`flow.request.headers.get`); a surface completes the last segment after the receiver chain. `kind` is object | property | method | function. In-script Rhai method names can differ from the MCP/CLI tool names (browser.type_text vs the browser.type tool, browser.evaluate vs browser.eval) because `type`/`eval` are Rhai reserved words.",
   "api_version": "1",
   "hooks": [
     {
@@ -79,7 +79,9 @@
     { "name": "flow.request.headers.set", "kind": "method", "signature": "set(k, v)", "description": "Set header k to v." },
     { "name": "flow.request.headers.remove", "kind": "method", "signature": "remove(k)", "description": "Remove header k." },
     { "name": "flow.request.headers.has", "kind": "method", "signature": "has(k)", "description": "True when header k is present." },
+    { "name": "flow.request.headers.keys", "kind": "method", "signature": "keys()", "description": "The header names, as an array." },
     { "name": "flow.request.body", "kind": "property", "signature": "flow.request.body -> string | bytes", "description": "The request body (get/set)." },
+    { "name": "flow.request.bytes", "kind": "property", "signature": "flow.request.bytes -> bytes", "description": "The request body as raw bytes (get/set)." },
     { "name": "flow.request.set_json", "kind": "method", "signature": "set_json(obj)", "description": "Set the request body to the JSON encoding of obj." },
     { "name": "flow.request.query", "kind": "property", "signature": "flow.request.query -> map", "description": "The query parameters, a map-like object." },
 
@@ -90,7 +92,9 @@
     { "name": "flow.response.headers.set", "kind": "method", "signature": "set(k, v)", "description": "Set header k to v." },
     { "name": "flow.response.headers.remove", "kind": "method", "signature": "remove(k)", "description": "Remove header k." },
     { "name": "flow.response.headers.has", "kind": "method", "signature": "has(k)", "description": "True when header k is present." },
+    { "name": "flow.response.headers.keys", "kind": "method", "signature": "keys()", "description": "The header names, as an array." },
     { "name": "flow.response.body", "kind": "property", "signature": "flow.response.body -> string | bytes", "description": "The response body." },
+    { "name": "flow.response.bytes", "kind": "property", "signature": "flow.response.bytes -> bytes", "description": "The response body as raw bytes (get/set)." },
 
     { "name": "flow.set_response", "kind": "method", "signature": "flow.set_response(status, headers, body)", "description": "Short-circuit before upstream: answer the request with this response." },
     { "name": "flow.intercept", "kind": "method", "signature": "flow.intercept()", "description": "Pause this flow for operator intervention." },
@@ -119,9 +123,9 @@
 
     { "name": "browser.navigate", "kind": "function", "signature": "browser.navigate(url)", "description": "Navigate the embedded browser to url (scope- and SSRF-gated)." },
     { "name": "browser.click", "kind": "function", "signature": "browser.click(selector_or_xy)", "description": "Click an element by selector, or a point by coordinates." },
-    { "name": "browser.type", "kind": "function", "signature": "browser.type(selector, text)", "description": "Type text into the element matching selector." },
+    { "name": "browser.type_text", "kind": "function", "signature": "browser.type_text(selector, text)", "description": "Type text into the element matching selector. In-script Rhai method name is `type_text` (`type` is a Rhai reserved word); the MCP/CLI tool is still named `browser.type`." },
     { "name": "browser.screenshot", "kind": "function", "signature": "browser.screenshot() -> bytes", "description": "Capture the page as PNG bytes." },
-    { "name": "browser.eval", "kind": "function", "signature": "browser.eval(expr) -> value", "description": "Evaluate a JavaScript expression in the page." },
+    { "name": "browser.evaluate", "kind": "function", "signature": "browser.evaluate(expr) -> value", "description": "Evaluate a JavaScript expression in the page. In-script Rhai method name is `evaluate` (`eval` is a Rhai reserved word); the MCP/CLI tool is still named `browser.eval`." },
     { "name": "browser.get_dom", "kind": "function", "signature": "browser.get_dom() -> string", "description": "The page's DOM as a string." },
 
     { "name": "store.get", "kind": "function", "signature": "store.get(id) -> flow view", "description": "Read one flow from the flow store by id." },
@@ -131,18 +135,37 @@
     { "name": "scope.list", "kind": "function", "signature": "scope.list() -> array", "description": "The hosts currently in scope." },
 
     { "name": "option", "kind": "function", "signature": "option(name) -> value", "description": "The value of an option set at load." },
-    { "name": "halt", "kind": "function", "signature": "halt()", "description": "Return from a hook to halt the plugin chain (Verdict::Halt). Returning nothing continues the chain." }
+    { "name": "halt", "kind": "function", "signature": "halt()", "description": "Return from a hook to halt the plugin chain (Verdict::Halt). Returning nothing continues the chain." },
+
+    { "name": "finding", "kind": "function", "signature": "finding(#{ name, severity, flow_id, detail, tags })", "description": "Record a security finding; severity is info | low | medium | high | critical." },
+
+    { "name": "ok", "kind": "function", "signature": "ok(resp)", "description": "Prelude helper: wrap resp as a successful short-circuit response." },
+    { "name": "contains_ci", "kind": "function", "signature": "contains_ci(hay, needle)", "description": "Prelude helper: case-insensitive substring check." },
+    { "name": "json", "kind": "function", "signature": "json(m)", "description": "Prelude helper: encode the map m as a JSON string." }
   ],
   "dsl": [
-    { "name": "b64_encode", "kind": "function", "signature": "b64_encode(s)", "description": "Base64-encode s." },
-    { "name": "b64_decode", "kind": "function", "signature": "b64_decode(s)", "description": "Base64-decode s." },
-    { "name": "url_encode", "kind": "function", "signature": "url_encode(s)", "description": "Percent-encode s for use in a URL." },
-    { "name": "hex_encode", "kind": "function", "signature": "hex_encode(s)", "description": "Hex-encode s." },
-    { "name": "sha256", "kind": "function", "signature": "sha256(s)", "description": "SHA-256 digest of s." },
-    { "name": "md5", "kind": "function", "signature": "md5(s)", "description": "MD5 digest of s." },
-    { "name": "rand_text_alpha", "kind": "function", "signature": "rand_text_alpha(n)", "description": "A random string of n letters." },
-    { "name": "rand_int", "kind": "function", "signature": "rand_int(a, b)", "description": "A random integer between a and b." },
-    { "name": "regex_match", "kind": "function", "signature": "regex_match(pat, s)", "description": "True when pattern pat matches s." },
-    { "name": "regex_extract", "kind": "function", "signature": "regex_extract(pat, s, group)", "description": "The capture group of pat's match in s." }
+    { "name": "b64_encode", "kind": "function", "status": "planned", "signature": "b64_encode(s)", "description": "Base64-encode s. PLANNED: specced but not yet registered on the engine; a production follow-up implements it, at which point it leaves the planned bucket and the drift guard requires the engine token." },
+    { "name": "b64_decode", "kind": "function", "status": "planned", "signature": "b64_decode(s)", "description": "Base64-decode s. PLANNED: not yet registered on the engine." },
+    { "name": "url_encode", "kind": "function", "status": "planned", "signature": "url_encode(s)", "description": "Percent-encode s for use in a URL. PLANNED: not yet registered on the engine." },
+    { "name": "hex_encode", "kind": "function", "status": "planned", "signature": "hex_encode(s)", "description": "Hex-encode s. PLANNED: not yet registered on the engine." },
+    { "name": "sha256", "kind": "function", "status": "planned", "signature": "sha256(s)", "description": "SHA-256 digest of s. PLANNED: not yet registered on the engine." },
+    { "name": "md5", "kind": "function", "status": "planned", "signature": "md5(s)", "description": "MD5 digest of s. PLANNED: not yet registered on the engine." },
+    { "name": "rand_text_alpha", "kind": "function", "status": "planned", "signature": "rand_text_alpha(n)", "description": "A random string of n letters. PLANNED: not yet registered on the engine." },
+    { "name": "rand_int", "kind": "function", "status": "planned", "signature": "rand_int(a, b)", "description": "A random integer between a and b. PLANNED: not yet registered on the engine." },
+    { "name": "regex_match", "kind": "function", "status": "planned", "signature": "regex_match(pat, s)", "description": "True when pattern pat matches s. PLANNED: not yet registered on the engine." },
+    { "name": "regex_extract", "kind": "function", "status": "planned", "signature": "regex_extract(pat, s, group)", "description": "The capture group of pat's match in s. PLANNED: not yet registered on the engine." }
+  ],
+  "reg": [
+    { "name": "reg.add_command", "kind": "method", "signature": "reg.add_command(name, help, |args| { ... })", "description": "Register a script command, callable from `load(reg)`. `reg` is the registration handle passed to the load hook." },
+    { "name": "reg.add_option", "kind": "method", "signature": "reg.add_option(name, default, help)", "description": "Register a configurable option, callable from `load(reg)`; read it back later with `option(name)`." }
+  ],
+  "vars": [
+    { "name": "vars.get", "kind": "method", "signature": "vars.get(name) -> value", "description": "Read a PoC run variable by name. `vars` is the per-step handle a PoC `script:` step runs against." },
+    { "name": "vars.set", "kind": "method", "signature": "vars.set(name, value)", "description": "Set a PoC run variable, visible to later steps." }
+  ],
+  "denied": [
+    { "name": "denied.capability", "kind": "property", "signature": "denied.capability -> string", "description": "The capability that was denied. `denied` is the token a scope-/SSRF-gated host call returns when it is refused." },
+    { "name": "denied.host", "kind": "property", "signature": "denied.host -> string", "description": "The host the denied call targeted." },
+    { "name": "denied.reason", "kind": "property", "signature": "denied.reason -> string", "description": "Why the call was denied." }
   ]
 }
