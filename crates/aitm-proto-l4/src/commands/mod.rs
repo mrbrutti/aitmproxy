@@ -24,9 +24,12 @@
 //! [`L4Permit`]: crate::guard::L4Permit
 //! [`ScopeRateGuard::check_active`]: aitm_core::ScopeRateGuard::check_active
 
+pub mod capture;
 pub mod craft;
 pub mod flow;
+pub mod inject;
 pub mod scope;
+pub mod sendrecv;
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -37,9 +40,12 @@ use aitm_core::{Command, CommandHost, ParamSchema, Params, TypeDesc, Value};
 use crate::flow::L4FlowId;
 use crate::types::{IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, PortRange};
 
+pub use capture::{CaptureStart, CaptureStatus, CaptureStop};
 pub use craft::Craft;
 pub use flow::{FlowGet, FlowList};
+pub use inject::Inject;
 pub use scope::{ScopeAdd, ScopeList, ScopeRemove};
+pub use sendrecv::SendRecv;
 
 /// `l4.interfaces` → list the capture-capable interfaces libpcap can see.
 ///
@@ -347,6 +353,43 @@ pub(crate) fn active_commands(
         Arc::new(FlowGet::new(store)),
         Arc::new(Craft),
     ]
+}
+
+/// Build the ordered list of Task 10 wire commands (`l4.capture.*`, `l4.inject`,
+/// `l4.send_recv`) over the shared guard + store, a fresh libpcap wire backend, and
+/// one shared [`CaptureRegistry`](crate::capture::CaptureRegistry) the capture
+/// commands manage together. Kept additive to [`active_commands`] so the two
+/// registration lists merge cleanly; [`crate::module::L4Module::load`] registers
+/// both. The backend construction is pure (no privilege, fail-closed at call time).
+pub(crate) fn wire_commands(
+    guard: Arc<crate::guard::L4Guard>,
+    store: Arc<dyn crate::flow::L4FlowStore>,
+) -> Vec<Arc<dyn Command>> {
+    let backend: Arc<dyn crate::backend::CaptureInjectBackend> =
+        Arc::new(crate::backend::pcap::PcapBackend::new());
+    let registry = Arc::new(crate::capture::CaptureRegistry::new());
+    vec![
+        Arc::new(CaptureStart::new(
+            guard.clone(),
+            backend.clone(),
+            store.clone(),
+            registry.clone(),
+        )),
+        Arc::new(CaptureStop::new(registry.clone())),
+        Arc::new(CaptureStatus::new(registry)),
+        Arc::new(Inject::new(guard.clone(), store.clone(), backend.clone())),
+        Arc::new(SendRecv::new(guard, store, backend)),
+    ]
+}
+
+/// Deserialize a transport-neutral [`Value`] craft spec into a [`PacketSpec`] — the
+/// shared parser the wire commands (`l4.inject`, `l4.send_recv`) use, mirroring how
+/// `l4.craft` parses its `spec`.
+///
+/// [`PacketSpec`]: crate::craft::PacketSpec
+pub(crate) fn parse_packet_spec(spec: &Value) -> anyhow::Result<crate::craft::PacketSpec> {
+    let json = value_to_json(spec);
+    serde_json::from_value(json).map_err(|e| anyhow::anyhow!("invalid PacketSpec: {e}"))
 }
 
 /// A missing required value-typed argument (for params typed `Any`, which

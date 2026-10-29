@@ -83,6 +83,11 @@ impl Plugin for L4Module {
         for cmd in crate::commands::active_commands(self.guard(), self.store()) {
             reg.add_command(cmd);
         }
+        // M5 Task 10 — the wire-touching commands (`l4.capture.*`, `l4.inject`,
+        // `l4.send_recv`), registered additively over the same guard + store.
+        for cmd in crate::commands::wire_commands(self.guard(), self.store()) {
+            reg.add_command(cmd);
+        }
     }
 }
 
