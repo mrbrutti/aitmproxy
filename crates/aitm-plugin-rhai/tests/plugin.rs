@@ -27,7 +27,7 @@ use aitm_plugin_rhai::host_core::{
     FindingCapability, LogCapability, MemoryFindingSink, Options, ScriptCapability, ScriptServices,
 };
 use aitm_plugin_rhai::host_net::HttpCapability;
-use aitm_plugin_rhai::plugin::{ErrorSink, ScriptPlugin};
+use aitm_plugin_rhai::plugin::{ErrorSink, ScriptHandle, ScriptPlugin};
 use rhai::Engine;
 
 /// A loop that never ends and does real work each turn, so the optimizer
@@ -224,6 +224,8 @@ struct Harness {
     fixture: Fixture,
     chain: Arc<Chain>,
     probe: Arc<ProbeLog>,
+    /// The script's shared handle, taken before the plugin is boxed away.
+    handle: Arc<ScriptHandle>,
 }
 
 impl Harness {
@@ -233,6 +235,7 @@ impl Harness {
         let plugin = fixture
             .plugin("under-test", src)
             .with_error_sink(Arc::clone(&errors));
+        let handle = plugin.handle();
         let probe = Arc::new(ProbeLog::default());
 
         let mut registry = Registry::new();
@@ -246,6 +249,7 @@ impl Harness {
             fixture,
             chain,
             probe,
+            handle,
         }
     }
 
@@ -634,4 +638,81 @@ async fn reload_swaps_the_hooks() {
     let verdict = plugin.on_event(&Event::Request(id), &mut FlowCtx::new(&mut flow));
     assert_eq!(verdict, Verdict::Halt, "the new hook's halt() is honoured");
     assert_eq!(http(&flow).request.headers.get("X-Version"), Some("2"));
+}
+
+/// A disabled script's hooks do not fire; re-enabling restores them. The flag
+/// is the handle's, shared with the command surface, and read live per event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_handle_skips_hooks_until_re_enabled() {
+    let h = Harness::default(r#"fn on_request(flow) { flow.request.headers.set("X-Aitm", "1"); }"#);
+    assert!(h.handle.is_enabled(), "a loaded script starts enabled");
+
+    h.handle.set_enabled(false);
+    assert!(!h.handle.is_enabled());
+    let id = h.insert(http_flow());
+    assert_eq!(h.dispatch(Event::Request(id)).await, Verdict::Continue);
+    assert_eq!(
+        http(&h.flow(id)).request.headers.get("X-Aitm"),
+        None,
+        "a disabled script's on_request must not run"
+    );
+    assert_eq!(
+        h.probe.events(),
+        vec![Event::Request(id)],
+        "the chain still reaches the next plugin"
+    );
+
+    h.handle.set_enabled(true);
+    assert!(h.handle.is_enabled());
+    let id = h.insert(http_flow());
+    assert_eq!(h.dispatch(Event::Request(id)).await, Verdict::Continue);
+    assert_eq!(
+        http(&h.flow(id)).request.headers.get("X-Aitm"),
+        Some("1"),
+        "re-enabled, the hook fires again"
+    );
+}
+
+/// A disabled script that would `halt()` does not short-circuit the chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_handle_does_not_halt_the_chain() {
+    let h = Harness::default(r#"fn on_request(flow) { halt(); }"#);
+    h.handle.set_enabled(false);
+    let id = h.insert(http_flow());
+
+    assert_eq!(h.dispatch(Event::Request(id)).await, Verdict::Continue);
+    assert_eq!(h.probe.events(), vec![Event::Request(id)]);
+}
+
+/// `ScriptHandle::meta()` exposes the declared `api` and the hooks the script
+/// defines, exactly as the loader parsed them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handle_meta_returns_the_parsed_api_and_hooks() {
+    let fixture = Fixture::new(config(RhaiLimits::default(), Duration::from_secs(5)));
+    let ast = fixture
+        .engine
+        .compile("fn on_request(flow) {} fn on_response(flow) {}")
+        .expect("compiles");
+    let declared = ScriptMeta {
+        name: "declared".to_string(),
+        api: "1".to_string(),
+        path: "declared.rhai".into(),
+        hooks: vec!["on_request".to_string(), "on_response".to_string()],
+    };
+    let plugin = ScriptPlugin::new(
+        declared.clone(),
+        Arc::clone(&fixture.engine),
+        ast,
+        fixture.services.clone(),
+        Options::default(),
+        &fixture.cfg,
+    );
+
+    let handle = plugin.handle();
+    assert_eq!(handle.meta(), &declared);
+    assert_eq!(handle.meta().api, "1");
+    assert_eq!(
+        handle.meta().hooks,
+        vec!["on_request".to_string(), "on_response".to_string()]
+    );
 }

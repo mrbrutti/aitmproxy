@@ -6,8 +6,8 @@
 //! the executor the PoC runner dispatches `script` steps through, the error
 //! sink the chain is bound into once it exists, and the plugin that registers
 //! the tier's own commands (`script.validate`, `script.reload`,
-//! `script.findings`). [`build`] returns all five; [`load_scripts`] is the
-//! one-line form for a host that only wants plugins, and [`executor`] builds
+//! `script.findings`, `script.list`). [`build`] returns all five;
+//! [`load_scripts`] is the one-line form for a host that only wants plugins, and [`executor`] builds
 //! the PoC-side half from a loader the caller already has.
 //!
 //! Sharing the engine is not an optimization — it is what makes "one scripting
@@ -38,8 +38,9 @@ pub struct ScriptTier {
     /// Bind the chain into this once it exists, so a failed hook's
     /// `Event::Error` reaches the bus instead of only the log.
     pub error_sink: Arc<ErrorSink>,
-    /// Registers `script.validate`, `script.reload` and `script.findings`; the
-    /// host registers it among its command providers, after the scripts.
+    /// Registers `script.validate`, `script.reload`, `script.findings` and
+    /// `script.list`; the host registers it among its command providers, after
+    /// the scripts.
     pub commands: ScriptCommands,
     /// The sandbox limits the engine was built with, for a host to check its
     /// own body cap against.
@@ -59,12 +60,13 @@ pub fn build(cfg: RhaiConfig, services: ScriptServices) -> Result<ScriptTier, Sc
     let loader = Arc::new(RhaiLoader::new(cfg, services)?);
     let (plugins, errors) = loader.load_all();
     let handles = plugins.iter().map(ScriptPlugin::handle).collect();
+    let error_sink = loader.error_sink();
     Ok(ScriptTier {
         plugins,
         errors,
         executor: Arc::new(executor(&loader)),
-        error_sink: loader.error_sink(),
-        commands: ScriptCommands::new(loader, handles, findings),
+        error_sink: Arc::clone(&error_sink),
+        commands: ScriptCommands::new(loader, handles, findings, error_sink),
         limits,
     })
 }
