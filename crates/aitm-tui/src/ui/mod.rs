@@ -7,6 +7,7 @@
 
 pub mod bars;
 pub mod browser;
+pub mod complete;
 pub mod flows;
 pub mod inspector;
 pub mod overlays;
