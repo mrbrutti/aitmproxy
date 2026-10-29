@@ -175,15 +175,12 @@ impl Rig {
         let browser_listen = free_addr();
         let mut cfg = Config::default();
         cfg.ca.dir = ca_dir.path().to_path_buf();
+        // `config_for` permits private/loopback navigation (`block_private = false`)
+        // because the seeded targets are on loopback: since audit I15 obscura only
+        // gets `--allow-private-network` when the policy permits private targets, and
+        // without it it refuses a loopback navigation. The driver only ever navigates
+        // the two in-scope loopback origins scoped below.
         cfg.browser = engines::config_for(BrowserEngine::Obscura, browser_listen);
-        // The seeded targets are deliberately on loopback, so the e2e must permit
-        // private/loopback navigation: obscura honours `--allow-private-network`,
-        // which the engine passes only when the policy permits private targets, and
-        // without it the browser refuses a loopback navigation on its own (it never
-        // reaches the proxy). `block_private = false` permits private targets at both
-        // the engine and the proxy connector; the driver only ever navigates the two
-        // in-scope loopback origins scoped below, so nothing out of scope is reached.
-        cfg.browser.ssrf.block_private = false;
         cfg.scope.entries = vec![
             ScopeEntry {
                 host: vuln_authority.clone(),

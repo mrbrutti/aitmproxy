@@ -73,6 +73,9 @@ can fail on it), the loopback-TCP bus with the agent token, and an autonomous po
 scope:
   entries: ["127.0.0.1:8085", "127.0.0.1:8086"]
   allow_agent_widen: false
+browser:
+  ssrf:
+    block_private: false   # the target is loopback; see note below
 mcp:
   transport:
     loopback_tcp:
@@ -80,6 +83,14 @@ mcp:
       token: "<a long random agent token>"
   policy: auto   # autonomous loop, no Sensitive actions; use `all` to lift that
 ```
+
+> **Loopback target → `browser.ssrf.block_private: false`.** The seeded target runs on
+> loopback. Since the obscura engine mirrors the SSRF policy (audit I15), it is given
+> `--allow-private-network` only when `block_private` is off; under the strict default
+> the engine refuses to navigate a loopback/private host and `browser.navigate` times
+> out. Set `block_private: false` so the engine can reach the scoped loopback target —
+> the proxy's SSRF connector remains the authoritative gate and still forwards only the
+> in-scope origins. (For a non-loopback remote target, keep the strict default.)
 
 **3. Start `aitm` with that config** (the bare server path is the agent entry point):
 
