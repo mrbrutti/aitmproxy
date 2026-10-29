@@ -1,14 +1,17 @@
-//! Task 8 — `ScriptPlugin` + hook dispatch: a compiled script is one `Plugin`
-//! in the ordered chain. Its hook edits apply back through the effect model
-//! (AC-M3-1), `halt()` short-circuits the chain like `Verdict::Halt` (AC-M3-2,
-//! RF#3), a hook that errors leaves the flow untouched and surfaces an
-//! `Event::Error` (AC-M3-12, RF#1), and a runaway hook is aborted by the
-//! budget without stalling the chain (AC-M3-6).
+//! `ScriptHost` + `LoadedScript` hook dispatch (F8 Option-B dispatch model):
+//! one `ScriptHost` plugin owns a `ScriptSet` of compiled `LoadedScript`s and
+//! dispatches each from a single chain position. A hook's edits apply back
+//! through the effect model (AC-M3-1), `halt()` short-circuits the set and the
+//! chain like `Verdict::Halt` (AC-M3-2, RF#3), a hook that errors leaves the
+//! flow untouched and surfaces an `Event::Error` (AC-M3-12, RF#1), a runaway
+//! hook is aborted by the budget without stalling the chain (AC-M3-6), and a
+//! script appended to the set at runtime goes live with no rebuild (original
+//! F8 AC4).
 //!
 //! Every test drives the real `aitm_core::Chain` over a `Registry` holding the
-//! script plugin followed by a probe plugin, so the short-circuit and the
-//! chain's plugin locking are exercised as the proxy exercises them. Hooks run
-//! under `block_in_place`, so every test runs on a multi-thread runtime.
+//! script host followed by a probe plugin, so the short-circuit and the chain's
+//! plugin locking are exercised as the proxy exercises them. Hooks run under
+//! `block_in_place`, so every test runs on a multi-thread runtime.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -825,5 +828,45 @@ async fn appended_script_runs_after_the_loaded_ones() {
         h.probe.events().is_empty(),
         "the native plugin after the host must not run either: {:?}",
         h.probe.events()
+    );
+}
+
+/// `append_if_absent` refuses a second script of the same brand-new name — the
+/// race fix for two concurrent `script.save`s of one new name. The set holds
+/// exactly one script by that name, and its hook runs once per event, not twice
+/// (which would mean double traffic mutation).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn append_if_absent_refuses_a_duplicate_name() {
+    let h = Harness::default(r#"fn on_request(flow) { flow.mark("base"); }"#);
+    assert_eq!(h.set.len(), 1);
+
+    let first = h
+        .fixture
+        .plugin("dup", r#"fn on_request(flow) { flow.mark("dup"); }"#)
+        .with_error_sink(Arc::clone(&h.errors));
+    assert!(
+        h.set.append_if_absent(first),
+        "a brand-new name is appended"
+    );
+    assert_eq!(h.set.len(), 2);
+
+    let second = h
+        .fixture
+        .plugin("dup", r#"fn on_request(flow) { flow.mark("dup"); }"#)
+        .with_error_sink(Arc::clone(&h.errors));
+    assert!(
+        !h.set.append_if_absent(second),
+        "a second script of the same name is refused"
+    );
+    assert_eq!(h.set.len(), 2, "no duplicate was added");
+
+    let id = h.insert(http_flow());
+    assert_eq!(h.dispatch(Event::Request(id)).await, Verdict::Continue);
+    let flow = h.flow(id);
+    let marks = &http(&flow).metadata.marks;
+    assert_eq!(
+        marks.iter().filter(|m| m.as_str() == "dup").count(),
+        1,
+        "the deduped hook ran exactly once: {marks:?}"
     );
 }

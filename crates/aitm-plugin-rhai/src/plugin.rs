@@ -269,7 +269,7 @@ impl LoadedScript {
     /// A `load` that throws is logged and installs nothing; the script keeps
     /// its hooks, because a broken registration is no reason to drop a working
     /// `on_request` (spec §8's error policy, applied to load).
-    pub fn run_load(&self, reg: &mut Registry) {
+    pub(crate) fn run_load(&self, reg: &mut Registry) {
         let ast = self.handle.current();
         let mut handle = ScriptRegHandle::new(reg)
             .with_options((**self.options.load()).clone())
@@ -406,6 +406,34 @@ impl ScriptSet {
             next.push(Arc::clone(&script));
             next
         });
+    }
+
+    /// Append `script` only if no loaded script already has its name, deciding
+    /// and pushing in one copy-on-write step. Returns `true` if it appended,
+    /// `false` if a script of that name was already present.
+    ///
+    /// This closes the check-then-append race on `script.save` of a brand-new
+    /// name: two concurrent saves of the same not-yet-loaded name must not both
+    /// append, or the hook would run twice per event (double traffic mutation)
+    /// and `script.list` would show a duplicate. The name check runs inside the
+    /// `rcu` closure, so it sees the same snapshot the push extends and `rcu`
+    /// retries the whole decision if another writer swapped in between — the
+    /// last, committed run is the one `appended` reflects.
+    pub fn append_if_absent(&self, script: LoadedScript) -> bool {
+        let script = Arc::new(script);
+        let mut appended = false;
+        self.0.rcu(|current| {
+            if current.iter().any(|s| s.name() == script.name()) {
+                appended = false;
+                (**current).clone()
+            } else {
+                let mut next = (**current).clone();
+                next.push(Arc::clone(&script));
+                appended = true;
+                next
+            }
+        });
+        appended
     }
 
     /// Whether any script is loaded.

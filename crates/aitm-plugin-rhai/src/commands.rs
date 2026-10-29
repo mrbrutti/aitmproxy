@@ -201,7 +201,7 @@ impl Command for Validate {
                     "source",
                     TypeDesc::Str,
                     false,
-                    "the script text to check, at most the sandbox max_string_size bytes; \
+                    "the script text to check, at most the sandbox max_string_size characters; \
                      exactly one of `path` or `source`",
                 ),
             ],
@@ -242,10 +242,10 @@ impl Command for Validate {
             (None, Some(source)) => {
                 // No file to confine; the only bound is the sandbox's string cap.
                 let limit = self.loader.max_string_size();
-                if source.len() > limit {
+                let chars = source.chars().count();
+                if chars > limit {
                     anyhow::bail!(
-                        "`source` is {} bytes, over the sandbox max_string_size ({limit})",
-                        source.len()
+                        "`source` is {chars} characters, over the sandbox max_string_size ({limit})"
                     );
                 }
                 let validated = self
@@ -472,12 +472,13 @@ impl Command for Save {
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description: "Write a script to <scripts_dir>/<name>.rhai after checking it \
-                          compiles (a non-compiling source writes nothing). Saving over a \
-                          loaded script swaps its hooks live; a new name is persisted for the \
-                          next start (restart_required: true, the plugin chain is sealed). A \
-                          script that registers commands/options also needs a restart. Answers \
-                          { name, path, api, hooks, registers, restart_required }. Needs \
-                          rhai.scripts_dir."
+                          compiles (a non-compiling source writes nothing). Its hooks go live \
+                          immediately with no restart — for a brand-new name (appended to the \
+                          running script host) as well as a save over a loaded script (swapped \
+                          live). restart_required is true ONLY when the script registers \
+                          commands or options, which the sealed registry cannot add until a \
+                          restart; its hooks still run this session. Answers { name, path, api, \
+                          hooks, registers, restart_required }. Needs rhai.scripts_dir."
                 .to_string(),
             params: vec![
                 param(
@@ -490,14 +491,15 @@ impl Command for Save {
                     "source",
                     TypeDesc::Str,
                     true,
-                    "the script text, at most the sandbox max_string_size bytes",
+                    "the script text, at most the sandbox max_string_size characters",
                 ),
                 param(
                     "enable",
                     TypeDesc::Bool,
                     false,
-                    "keep a loaded script enabled (default true) or disable it after the \
-                     swap; no live effect for a new name",
+                    "sets the saved script's live enabled flag (default true): a disabled \
+                     script's hooks do not fire until `script.enable`. Applies to a brand-new \
+                     name as well as a save over a loaded script",
                 ),
             ],
             result: TypeDesc::Any,
@@ -528,10 +530,10 @@ impl Command for Save {
             anyhow::bail!("no scripts directory configured; set rhai.scripts_dir");
         };
         let limit = self.loader.max_string_size();
-        if source.len() > limit {
+        let chars = source.chars().count();
+        if chars > limit {
             anyhow::bail!(
-                "`source` is {} bytes, over the sandbox max_string_size ({limit})",
-                source.len()
+                "`source` is {chars} characters, over the sandbox max_string_size ({limit})"
             );
         }
         // Compile-before-write: a source that does not compile writes no file.
@@ -574,14 +576,35 @@ impl Command for Save {
                     .load_one(&entry)
                     .map_err(|err| anyhow::anyhow!("{err}"))?;
                 script.handle().set_enabled(enable);
-                self.scripts.append(script);
-                tracing::info!(
-                    target: "aitm_plugin_rhai::loader",
-                    script = %name,
-                    path = %path.display(),
-                    restart_required = registers_present,
-                    "script saved and appended live; its hooks run with no restart"
-                );
+                // Append atomically: `find_handle` above and this append are not
+                // one step, so a concurrent save of the same brand-new name could
+                // have appended between them. `append_if_absent` refuses the
+                // second push; we then fall through to the overwrite path so the
+                // latest save still wins (and the script is never doubled).
+                if self.scripts.append_if_absent(script) {
+                    tracing::info!(
+                        target: "aitm_plugin_rhai::loader",
+                        script = %name,
+                        path = %path.display(),
+                        restart_required = registers_present,
+                        "script saved and appended live; its hooks run with no restart"
+                    );
+                } else if let Some(handle) = self.scripts.find_handle(&name) {
+                    let (ast, fresh) = self
+                        .loader
+                        .compile(&path)
+                        .map_err(|err| anyhow::anyhow!("{err}"))?;
+                    handle.swap(ast, fresh);
+                    handle.set_enabled(enable);
+                    self.errors.clear(&name);
+                    tracing::info!(
+                        target: "aitm_plugin_rhai::loader",
+                        script = %name,
+                        path = %path.display(),
+                        "script saved; a concurrent save added this name first, so it was \
+                         swapped live instead of appended"
+                    );
+                }
                 registers_present
             }
         };

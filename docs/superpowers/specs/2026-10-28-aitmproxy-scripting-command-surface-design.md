@@ -112,16 +112,26 @@ Resolved at approval (2026-10-28, Matt):
 
 1. **Hot command/option registration** → **accepted** the sealed-registry limitation for commands/options only: a newly-saved script's commands/options need a restart, signalled by `restart_required`. Hot command/option registration is deferred (matches UI-spec OQ3). **Hooks, by contrast, load/reload/append live** — including for a brand-new `script.save` — via the dynamic `ScriptHost` (see below); the earlier interim position that a new script's hooks also needed a restart is superseded.
 
+2. **`scripts.allow_agent_authoring` default** → **off**, mirroring `ca.allow_agent_install`.
+
 ### Dynamic script-host (delivered after F8's base, same PR series)
 
 The scripting tier dispatches through one `ScriptHost` plugin that owns an
 `ArcSwap<Vec<Arc<LoadedScript>>>` set and iterates it per event in chain order,
 rather than registering one sealed `ScriptPlugin` per script. `script.save` of a
-brand-new name appends a compiled `LoadedScript` to that set (copy-on-write), so
-its hooks fire on the next event with no restart. This changes only
+brand-new name appends a compiled `LoadedScript` to that set (copy-on-write,
+check-and-append atomic so two concurrent saves of one new name cannot double
+it), so its hooks fire on the next event with no restart. This changes only
 `aitm-plugin-rhai` (no `aitm-core` edits) and preserves chain order (new script
 appended last), the per-handle `enabled` flag, the shared `ErrorSink`,
 `script.reload`'s AST swap, and per-hook error isolation. The command/option
 `Registry` seal is unchanged — which is why commands/options a new script
 registers still need a restart.
-2. **`scripts.allow_agent_authoring` default** → **off**, mirroring `ca.allow_agent_install`.
+
+**Documented-accept — no cap on live-appended scripts.** `script.save` does not
+bound how many scripts may be appended to the live set. Accepted: the caller is
+an authorized actor (operator, or an agent only under `rhai.allow_agent_authoring`
++ a `Sensitive`-permitting policy), and the same actor can already write
+unbounded `.rhai` files that load at the next start; a live append is no larger a
+resource than that restart-time load. A configurable cap can be added later if an
+abuse case appears.

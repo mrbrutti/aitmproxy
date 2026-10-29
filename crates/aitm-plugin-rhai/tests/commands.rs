@@ -1273,6 +1273,44 @@ async fn script_save_new_name_registering_is_live_but_requires_a_restart() {
     );
 }
 
+/// `enable: false` on a brand-new name appends the script DISABLED: its
+/// `on_request` does not fire until `script.enable` turns it on. (`enable` sets
+/// the saved script's live flag on the new-name branch too, not just overwrite.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_save_new_name_enable_false_appends_disabled() {
+    let sandbox = Sandbox::new();
+    let h = save_harness(Vec::new(), Some(sandbox.scripts()));
+
+    let out = h
+        .invoke(
+            "script.save",
+            params(&[
+                ("name", Value::Str("fresh".into())),
+                ("source", Value::Str(SAVED_NEW.into())),
+                ("enable", Value::Bool(false)),
+            ]),
+        )
+        .expect("save of a new disabled script succeeds");
+    assert_eq!(field(&out, "restart_required"), &Value::Bool(false));
+
+    assert_eq!(
+        h.x_v().await,
+        None,
+        "a new script saved with enable:false must not fire until enabled"
+    );
+
+    h.invoke(
+        "script.enable",
+        params(&[("name", Value::Str("fresh".into()))]),
+    )
+    .expect("enable succeeds");
+    assert_eq!(
+        h.x_v().await.as_deref(),
+        Some("new"),
+        "after script.enable the appended hook runs"
+    );
+}
+
 /// The answer is exactly `{ name, path, api, hooks, registers, restart_required }`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn script_save_result_has_exactly_the_documented_shape() {
