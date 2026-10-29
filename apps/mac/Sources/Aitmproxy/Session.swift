@@ -484,6 +484,12 @@ final class Session {
         l4Details = Dictionary(uniqueKeysWithValues:
             Fixtures.l4Rows.compactMap { row in Fixtures.l4Detail(for: row).map { (row.id, $0) } })
         l4AgentGates = L4AgentGates(capture: true, inject: false, intercept: false, widen: false)
+        // AC18 CUA affordance: APP_L4_EMBEDDED=1 launches the fixture session as the
+        // self-contained app's embedded user-level core, which cannot do raw L4. This
+        // flips the already-built honest-degradation surface (banner + disabled wire
+        // verbs) so the macOS CUA harness can drive it with real clicks. Test-only:
+        // the real connection model sets `l4EmbeddedCore` from the core it drives.
+        if ProcessInfo.processInfo.environment["APP_L4_EMBEDDED"] == "1" { l4EmbeddedCore = true }
         rows = Fixtures.rows + Fixtures.l4Rows
         interceptArmed = true
         scopeHosts = Fixtures.scope
