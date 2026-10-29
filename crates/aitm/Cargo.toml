@@ -35,6 +35,10 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+# Task 16's agent-surface validator assembles the full agent command surface,
+# which includes the M4 findings store (`findings.*`), to check the portable
+# playbook references only real commands.
+aitm-findings.workspace = true
 serde_json = "1"
 hyper = { version = "1", features = ["server", "http1"] }
 http-body-util = "0.1"
