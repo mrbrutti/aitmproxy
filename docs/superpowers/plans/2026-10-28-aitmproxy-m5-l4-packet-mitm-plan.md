@@ -4,10 +4,16 @@
 > (recommended) or `superpowers:executing-plans` to implement this plan task-by-task.
 > Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** draft
+**Status:** shipped (2026-10-28) — whole-branch Stage-6 panel passed with all findings
+resolved; branch synced to current `main` (M4 + M6) with a green gate; landing on `main`
+as Stage A of the L4 operator-surfaces milestone.
 **Spec:** `docs/superpowers/specs/2026-10-27-aitmproxy-m5-l4-packet-mitm-design.md`
 (approved 2026-10-28; M5-AC1–AC21)
 **Branch / worktree:** `feat/aitmproxy-m5` in a fresh worktree cut from `main`.
+**Note (M5 Task 14 deferred):** the Rhai `l4.*` host functions are **not** built here;
+they are owned by the protocol-extensibility seam (approved spec
+`docs/superpowers/specs/2026-10-28-aitmproxy-protocol-extensible-languages-design.md`).
+M5 lands the `l4.*` **command** surface only.
 
 **Goal:** Ship `aitm-proto-l4` — raw-packet **capture**, scapy-style **craft +
 guarded inject**, **send-and-receive** (`sr`/`sr1`), and Linux **in-path packet
@@ -318,11 +324,36 @@ Longest sequential chain: 1 → 4 → 5 → 6 → 7 → 8 → 10 → 13 → 15 (
 
 ## Review log
 
-Kept by the main session during stage 6. One row per finding.
+Whole-branch Stage-6 panel (security, quality, spec) run 2026-10-28 on the assembled
+branch; findings and dispositions below. All fixes verified by a focused security
+re-review before landing.
 
-| Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
+| Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
+| whole-branch | security | Important | In-path `mutate`→`forward` reinjected mutated bytes without re-checking scope/denylist/size | Fixed in `97912a1` — `forward` now re-runs `L4Guard::check(Intercept)` + size on the mutated bytes; re-review CONFIRMED CLOSED |
+| whole-branch | security/quality | Important | Injection rate cap counted `check` calls, not packets (`pps × max_packets_per_call`) | Fixed in `97912a1` — one rate token spent per packet in `authorize_packet`; re-review CONFIRMED CLOSED |
+| whole-branch | security | Important | `l4.scope.add` had no agent gate (bus caller could self-authorize any dst) | Fixed in `0e14521` — gated by new `l4.allow_agent_widen` (default false); runtime entries can't lift the denylist. Approved by Matt 2026-10-28; forward-compatible with Stage B. Re-review CONFIRMED CLOSED |
+| whole-branch | security | Minor | `send_recv` reply capture skipped the per-packet capture-scope check | Fixed in `97912a1` (`guard.check(Capture, reply_target)` before recording) |
+| whole-branch | security/quality | Minor | `flow.rs` panicked on lock poison while the rest of the crate recovers | Fixed in `97912a1` (`PoisonError::into_inner`) |
+| whole-branch | quality | Minor | `proto_of`/`spec_proto` duplicated verbatim | Fixed in `97912a1` (hoisted to `PacketSpec::transport_proto`) |
+| whole-branch | quality | Minor | AC21 hard-gate tests are source-text greps, weaker than they read | Fixed in `97912a1` (doc note: supplementary to the type-level guarantee) |
+| whole-branch | quality/spec/security | Important | Branch cut from a stale `main`; `wire.rs`/`config_file.rs`/`main.rs`/`Cargo.toml` conflict with M4+M6 | Resolved by the orchestrator: merged current `main` (`b64c488`) into the branch (`7d5b65b`), conflicts resolved keeping both sides' features, gate green |
+| whole-branch | spec | Minor | plan `Status` draft; `platform-design.md` roadmap edit undeclared; `serde_json` not in tech-stack line | Accepted (doc bookkeeping): Status flipped; roadmap edit accepted; `serde_json` already in the lockfile |
+
+Task 14 (Rhai `l4.*`) absence is **not** a finding — deferred by approved decision to the
+protocol-extensibility seam.
 
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7.
+- **Merged to `main`:** `aitm-proto-l4` (scoped capture, scapy-style craft, guard-gated
+  inject, send-and-receive, Linux NFQUEUE in-path interception) behind a deny-by-default
+  `L4Guard`/`L4Permit` with one `send_on_wire` choke point and an l4-owned `L4FlowStore`;
+  the `l4.*` command surface registered on the live loopback-TCP bus (opt-in via
+  `l4.enabled`, fail-closed `L4Unavailable` when unprivileged); `l4.scope.add` gated by
+  `l4.allow_agent_widen` (deny-by-default). All M5-AC1–AC21 green; no `aitm-core` edits
+  (AC19); `#![forbid(unsafe_code)]` (AC20).
+- **Cut / deferred:** Rhai `l4.*` host functions and the native `l4:` PoC step → the
+  protocol-extensibility seam. The `l4.scope.add` operator/agent split (operator path +
+  confirm) → L4 operator-surfaces Stage B (needs M4's `Frontend::Operator`).
+- **Follow-ups:** L4 operator-surfaces Stages B–G (bus policy classification, the three
+  UI surfaces, live two-way testing) are now unblocked (M4 + M6 + M5 on main).
