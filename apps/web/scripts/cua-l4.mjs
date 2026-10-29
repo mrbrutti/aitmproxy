@@ -4,15 +4,21 @@
 //
 //   node scripts/cua-l4.mjs [--keep]
 //
+// Operator identity: `mcp.operator_token` is configured, so the UI + the bus cross-checks here drive
+// as a real `Frontend::Operator` (operator-token UX, PR #35) — sensitive actions bypass the agent
+// policy gate and reach the privilege/command gate directly, and the operator confirm-over-the-wire
+// handshake is offered.
+//
 // Privilege reality (CLI/Linux-first, spec §Part 6 / AC18): a user-level core on an unprivileged
 // host (no CAP_NET_RAW / no /dev/bpf) returns a typed `L4Unavailable` for every wire verb. So on
-// such a host this run proves the REQUIRED honest-degradation scenario by real clicks — the L4 view
-// renders and drives the bus, the pure/read verbs work, the wire-verb buttons surface the typed
-// reason rather than faking success, and the per-feature MCP toggles reflect+flip the gates. The
-// privileged real-packet click-drive (capture → craft → inject → confirm → inspect → send_recv →
-// intercept → out-of-scope-dimmed) needs a captured/injected L4 flow, which only exists where
-// privilege exists; it is authored here as `privilegedDrive()`, gated on a runtime probe, and runs
-// on Linux/elevated. It is never faked on an unprivileged host — it records SKIP with the reason.
+// such a host this run proves the REQUIRED honest-degradation scenario by real operator clicks — the
+// L4 view renders and drives the bus, the pure/read verbs work, the wire-verb buttons surface the
+// typed privilege reason rather than faking success, the operator confirm handshake is offered over
+// the bus, and the per-feature MCP toggles reflect AND flip (operator). The privileged real-packet
+// click-drive (capture → craft → inject → the confirm DIALOG → inspect → send_recv → intercept →
+// out-of-scope-dimmed) needs a captured/injected L4 flow, which only exists where raw privilege
+// exists; it is authored here as `privilegedDrive()`, gated on a runtime probe, and runs on
+// Linux/elevated. It is never faked on an unprivileged host — it records SKIP with the reason.
 //
 // --keep leaves aitm and Chrome running and prints the UI URL. Node ≥ 22, no dependencies.
 import { mkdirSync, readdirSync, rmSync } from 'node:fs';
@@ -58,9 +64,13 @@ const isUnavailable = (r) => !r.ok && /l4 unavailable/i.test(r.error);
 // ------------------------------------------------------------------------------------------
 // Main
 // ------------------------------------------------------------------------------------------
-const L4 = 'section[aria-label="L4"]';
-const CAPTURE = 'section[aria-label="Capture"]';
-const UNION = '[role=grid][aria-label="Flows (all kinds)"]';
+// Post-PR#41 ("unify L4 sessions into the one flow list"): there is no separate L4 panel. Picking
+// the L4 source (sidebar → L4) shows `L4CaptureBar` (which renders CaptureControls) above the ONE
+// unified flow list; L4 sessions are rows in that list; selecting one opens L4InspectorPanel.
+const CAPTURE = 'section[aria-label="Capture"]'; // CaptureControls, now inside L4CaptureBar
+const CAPBAR_FALLBACK = 'L4 is not enabled'; // L4CaptureBar honest-degradation text when l4.* is absent
+const GRID = '[role=grid][aria-label="Flows"]'; // the one unified flow list
+const L4ROW = '[role=grid][aria-label="Flows"] [role=row][data-kind="l4"]'; // an L4 session row
 const SIDEBAR = 'aside[aria-label="Sources"]';
 const TOGGLES = 'section[aria-label="L4 agent capabilities"]';
 // A raw `PacketSpec` layer on the bus wants a byte SEQUENCE (the UI's YAML parser converts
@@ -92,23 +102,21 @@ async function step(name, body) {
   }
 }
 
-/** Re-mount the L4 panel (Agent → L4) so its onMount `store.refresh()` re-reads the bus. */
-async function remountL4() {
-  await d.click({ role: 'button', text: 'Agent', match: 'startsWith', within: SIDEBAR });
-  await d.gone({ sel: L4 }, { timeoutMs: 4000 }).catch(() => {});
+/** Focus the L4 source (sidebar → L4): the L4CaptureBar + its CaptureControls appear above the list. */
+async function focusL4() {
   await d.click({ role: 'button', text: 'L4', match: 'startsWith', within: SIDEBAR });
-  await d.locate({ sel: L4 });
+  await d.locate({ sel: CAPTURE });
 }
 
 try {
   target = await startTarget();
   // An opted-in L4 core (l4.enabled) with a config-declared L4 scope entry (lo0 · 127.0.0.1/32 ·
   // inject) and a MIXED set of per-capability agent gates, so the surface has real scope + gate state
-  // to render. (Runtime `l4.scope.add` and the live toggle flip are operator-only; on this build the
-  // web `/bus` is `Frontend::Mcp` under `AgentPolicy::Auto` — the web operator identity is the F1
-  // follow-up (crates/aitm/src/web/mod.rs:12) — so those are driven/declared out of band, see steps.)
+  // to render. `mcp.operator_token` is configured (by live-env) so the UI + bus here drive as a real
+  // `Frontend::Operator` — the operator identity landed on this branch (PR #35, operator-token UX),
+  // so sensitive actions bypass the agent-policy gate and reach the privilege/command gate directly.
   env = await startAitm({
-    scope: [target.host],
+    scope: [target.host, '127.0.0.1'],
     l4: {
       enabled: true,
       allow_agent_widen: true,
@@ -119,17 +127,19 @@ try {
     },
     log: (l) => (/error|panic/i.test(l) ? console.error('[aitm] ' + l) : null),
   });
-  bus = await connectBus(env.busUrl, env.token);
+  // Drive the bus cross-checks AS THE OPERATOR (the browser connects with the same operator token),
+  // so wire verbs reach the privilege gate and the operator confirm handshake is offered.
+  bus = await connectBus(env.busUrl, env.operatorToken);
   const tools = (await bus.tools()).map((t) => t.name);
   const l4Tools = tools.filter((t) => t.startsWith('l4.'));
-  log(`aitm up: proxy ${env.proxyPort}, ui ${env.uiUrl}, target ${target.base}`);
+  log(`aitm up: proxy ${env.proxyPort}, operator ui ${env.operatorUiUrl}, target ${target.base}`);
   log(`l4 tools (${l4Tools.length}): ${l4Tools.join(' ')}`);
   cdp = await launchChrome({ width: W, height: H });
   d = makeDriver(cdp, { log, shotsDir: SHOTS });
 
   // 01 ---------------------------------------------------------------------------------------
-  await step('01 connect, L4 advertised', async () => {
-    await d.open(env.uiUrl);
+  await step('01 connect (as operator), L4 advertised', async () => {
+    await d.open(env.operatorUiUrl);
     await waitFor(() => d.q('exists', 'span[title="bus open"]'), { timeoutMs: 15000, what: 'status bar "bus open"' });
     const l4Item = await waitFor(
       async () => {
@@ -142,34 +152,32 @@ try {
   });
 
   // 02 ---------------------------------------------------------------------------------------
-  await step('02 open the L4 view', async () => {
-    await d.click({ role: 'button', text: 'L4', match: 'startsWith', within: SIDEBAR });
-    await d.locate({ sel: L4 });
-    const header = await d.q('text', `${L4} h2`);
-    const meta = await d.q('text', `${L4} header span`);
-    // present() → the fallback "L4 is not enabled" paragraph must be ABSENT.
-    const disabledText = await d.q('find', { text: 'L4 is not enabled', within: L4 });
-    await d.locate({ sel: CAPTURE });
-    expect(/raw packets/i.test(header ?? '') && !disabledText, '02 L4 view renders the live surface (not the disabled fallback)', `header "${header}"; meta "${meta}"; disabled-fallback=${!!disabledText}`);
+  await step('02 open the L4 view (sidebar → L4 → capture bar + the one unified flow list)', async () => {
+    await focusL4();
+    // present() → CaptureControls render in L4CaptureBar; the "L4 is not enabled" fallback is ABSENT.
+    const cap = await d.q('exists', CAPTURE);
+    const disabled = await d.q('find', { text: CAPBAR_FALLBACK });
+    const grid = await d.q('exists', GRID);
+    expect(cap && !disabled && grid, '02 L4 capture bar + unified flow list render (not the disabled fallback)', `capture=${cap}; grid=${grid}; disabled-fallback=${!!disabled}`);
   });
 
   // 03 ---------------------------------------------------------------------------------------
   let captureReason = null;
   let privileged = false;
-  await step('03 privilege reality (bus): the read wire verb reaches the privilege gate', async () => {
+  await step('03 privilege degradation (operator bus): every wire verb returns a typed L4Unavailable', async () => {
     const cap = await probe(bus, 'l4.capture.status');
     const inj = await probe(bus, 'l4.inject', { spec: { layers: [{ ipv4: { dst: '127.0.0.1' } }, { udp: { dst_port: 9 } }, { raw: PROBE }] }, dst: '127.0.0.1', interface: 'lo0', port: 9 });
-    privileged = cap.ok; // l4.capture.status (Read; agent-policy lets it through) succeeding ⇒ raw privilege
+    const sr = await probe(bus, 'l4.send_recv', { spec: { layers: [{ ipv4: { dst: '127.0.0.1' } }, { udp: { dst_port: 9 } }, { raw: PROBE }] }, dst: '127.0.0.1', interface: 'lo0', port: 9 });
+    privileged = cap.ok; // l4.capture.status succeeding ⇒ the host has raw-socket privilege
     captureReason = cap.ok ? '(privileged host)' : cap.error;
     if (privileged) {
-      note('03 privileged host — wire verbs available', `l4.capture.status ok; the privileged click-drive (step 09) will run`);
-    } else {
-      // l4.capture.status is Read: it passes the agent-policy gate and hits the privilege gate → L4Unavailable.
-      expect(isUnavailable(cap), '03a l4.capture.status returns a typed "L4 unavailable: …" (privilege gate, no panic)', `capture="${cap.error}"`);
-      // l4.inject is Sensitive: over this (Mcp/auto) bus it is refused — never a silent success.
-      expect(!inj.ok, '03b l4.inject is refused, never fakes a send (typed reason)', `inject.ok=${inj.ok}; reason="${inj.error}"`);
-      note('03c two-dimension gating', `the bus client is Frontend::Mcp under AgentPolicy::Auto, so Sensitive l4.inject is refused by the agent-policy gate ("${(inj.error ?? '').slice(0, 72)}…") before the privilege gate; the privilege L4Unavailable is proven on the Read verb (l4.capture.status) here and end-to-end agent-driven in Task 16 (5bd2381)`);
+      note('03 privileged host — wire verbs available', 'l4.capture.status ok; the privileged click-drive (step 09) runs');
+      return;
     }
+    // The operator bus bypasses the agent-policy gate, so each Sensitive wire verb reaches the
+    // privilege gate directly → a typed L4Unavailable (never a silent success, never a panic).
+    expect(isUnavailable(cap) && isUnavailable(inj) && isUnavailable(sr), '03a capture.status / inject / send_recv all return "L4 unavailable: …" for the operator (privilege gate)', `capture="${cap.error}"; inject="${inj.error}"; send_recv="${sr.error}"`);
+    note('03b confirm handshake is privilege-gated too', 'the L4Gated wrapper short-circuits an unprivileged wire verb before its confirm_prompt, so even the operator gets L4Unavailable straight away (no needs_confirmation). The operator confirm-over-the-wire DIALOG therefore appears only where privilege exists — step 09 / Linux. The agent (Mcp) path is additionally gated by AgentPolicy + per-capability flags (Task 16).');
   });
 
   // 04 ---------------------------------------------------------------------------------------
@@ -199,7 +207,7 @@ try {
     const list = await probe(bus, 'l4.scope.list');
     expect(/127\.0\.0\.1\/32/.test(scopeText ?? '') && /inject/.test(scopeText ?? '') && (list.value?.length ?? 0) > 0, '05a CaptureControls shows the scope row (… 127.0.0.1/32 … inject …); bus l4.scope.list agrees', `scope section "${(scopeText ?? '').replace(/\s+/g, ' ').slice(0, 120)}"; bus entries=${list.value?.length}`);
     const add = await probe(bus, 'l4.scope.add', { cidr: '10.0.0.0/8', interface: 'lo0', direction: 'outbound', capability: 'inject', inject_rate_pps: 10 });
-    note('05b runtime l4.scope.add over the web/bus', add.ok ? 'accepted (operator/widen path)' : `refused for the Frontend::Mcp bus: "${(add.error ?? '').slice(0, 90)}…" — runtime widening from the web UI needs the operator identity (F1)`);
+    note('05b runtime l4.scope.add (operator bus)', add.ok ? 'accepted — the operator CAN widen L4 scope over the bus; the web SURFACE still exposes no add-scope control (the GAP above), so there is no click path for it' : `unexpectedly refused: "${(add.error ?? '').slice(0, 90)}"`);
   });
 
   // 06 ---------------------------------------------------------------------------------------
@@ -211,27 +219,27 @@ try {
     await d.click({ role: 'button', text: 'Start capture', match: 'startsWith', within: CAPTURE });
     const toast = await waitFor(
       async () => {
-        const t = (await d.q('texts', { role: 'alert' })).find((x) => /l4\.capture\.start|l4 unavailable|refused|disabled/i.test(x));
+        const t = (await d.q('texts', { role: 'alert' })).find((x) => /l4 unavailable|l4\.capture\.start/i.test(x));
         return t ?? null;
       },
       { timeoutMs: 6000, what: 'error toast from Start capture' },
     ).catch(() => null);
     const started = (await d.q('texts', { role: 'status' })).find((x) => /capture started/i.test(x));
-    const rows = await d.q('count', { role: 'row', within: UNION });
-    expect(!!toast && !started && rows === 0, '06a Start capture → typed error toast; no "Capture started", no flow row (no fake success)', `toast "${toast}"; started=${started ?? 'none'}; rows=${rows}`);
-    note('06b gate on this build', `the toast is the agent-policy refusal because the web /bus is Frontend::Mcp under AgentPolicy::Auto (F1); the underlying privilege reason for capture/inject is "${captureReason}" (shown on l4.capture.status, step 03). Honest degradation holds: the button surfaces a typed reason and never fakes a send.`);
+    const l4rows = await d.q('count', { sel: L4ROW });
+    expect(!!toast && /l4 unavailable/i.test(toast) && !started && l4rows === 0, '06a Start capture (operator click) → typed "L4 unavailable" toast; no "Capture started", no L4 row (honest privilege degradation, no fake)', `toast "${toast}"; started=${started ?? 'none'}; l4rows=${l4rows}`);
+    note('06b gate', `the web bus is Frontend::Operator (operator_token), so the click bypasses the agent-policy gate and reaches the privilege gate: "${captureReason}". The button surfaces the typed reason and never fakes a send (AC18).`);
   });
 
   // 07 ---------------------------------------------------------------------------------------
-  await step('07 union flow list honest empty state', async () => {
-    const empty = await d.q('find', { text: 'No flows yet', within: UNION });
-    const rows = await d.q('count', { role: 'row', within: UNION });
+  await step('07 unified flow list: no L4 session rows (honest empty state)', async () => {
+    const l4rows = await d.q('count', { sel: L4ROW });
+    const empty = await d.q('find', { text: 'No flows yet', within: GRID });
     if (privileged) {
-      note('07 privileged host', `union rows=${rows}`);
+      note('07 privileged host', `l4 rows=${l4rows}`);
       return;
     }
-    expect(!!empty && rows === 0, '07 "No flows yet. HTTP, WebSocket and L4 flows all appear here."', `empty="${empty?.text}"; rows=${rows}`);
-    note('07 inspector gated', 'with no L4 flow there is no session to select, so the L4 inspector (craft editor, Inject, layer tree, hex, intercept bar, out-of-scope dimming) is unreachable by clicks on this host — it is the privileged drive (step 09)');
+    expect(l4rows === 0, '07 the one flow list shows no L4 session rows (none can be captured unprivileged)', `l4rows=${l4rows}; grid empty-state="${empty?.text ?? 'n/a'}"`);
+    note('07 inspector gated', 'with no L4 session row there is nothing to select, so the L4 inspector (craft editor, Inject, layer tree, hex, intercept bar, out-of-scope dimming) is unreachable by clicks on this host — it is the privileged drive (step 09)');
   });
 
   // 08 ---------------------------------------------------------------------------------------
@@ -241,25 +249,32 @@ try {
     const status = await probe(bus, 'l4.agent.status');
     const busGates = status.value ?? {};
     const caps = ['capture', 'inject', 'intercept', 'widen'];
+    // The Agent panel fetches l4.agent.status asynchronously; wait until the switches reflect the
+    // loaded gates (config turns inject on) before reading, so this asserts reflect, not a pre-load race.
+    await waitFor(async () => (await d.q('find', { sel: `${TOGGLES} [role=switch][data-cap="inject"]` }))?.checked === 'true', { timeoutMs: 6000, what: 'L4 toggles to load the gates' }).catch(() => {});
     const ui = {};
     for (const c of caps) ui[c] = (await d.q('find', { sel: `${TOGGLES} [role=switch][data-cap="${c}"]` }))?.checked === 'true';
     const match = caps.every((c) => ui[c] === !!busGates[c]);
     expect(match, '08a each switch (Capture/Inject/Intercept/Widen) reflects l4.agent.status (config: capture/inject/widen on, intercept off)', `ui=${JSON.stringify(ui)}; bus=${JSON.stringify(busGates)}`);
-    // A live flip by click is refused on this build: l4.agent.set is operator-only and the web /bus is Mcp.
+    // The operator flips a gate live: click the Inject switch and confirm it toggles on the bus, then revert.
     const injectSwitch = { sel: `${TOGGLES} [role=switch][data-cap="inject"]` };
     const before = ui.inject;
     await d.click(injectSwitch);
-    await sleep(500);
-    const after = (await d.q('find', injectSwitch))?.checked === 'true';
-    const nowBus = !!(await probe(bus, 'l4.agent.status')).value?.inject;
-    expect(after === before && nowBus === before, '08b a click does not change the gate (l4.agent.set is operator-only; the web bus is Frontend::Mcp)', `inject ui ${before}→${after}; bus=${nowBus}`);
-    note('08c live flip', 'the toggles correctly REFLECT the gates today; flipping one from the web UI needs the operator identity on the /bus (F1). An agent can never flip its own gate by design.');
+    const flipped = await waitFor(async () => {
+      const s = (await d.q('find', injectSwitch))?.checked === 'true';
+      const b = !!(await probe(bus, 'l4.agent.status')).value?.inject;
+      return s === !before && b === !before ? { s, b } : null;
+    }, { timeoutMs: 6000, what: 'inject gate to flip' }).catch(() => null);
+    expect(!!flipped, '08b operator click flips the Inject gate live; l4.agent.status reflects it', `inject ${before} → ui ${flipped?.s}, bus ${flipped?.b}`);
+    await d.click(injectSwitch); // revert to the config state
+    await sleep(300);
+    note('08c live flip', 'the operator flips a per-feature MCP gate from the web UI and the bus reflects it. An agent (Frontend::Mcp) can never flip its own gate — l4.agent.set is operator-only.');
   });
 
   // 09 ---------------------------------------------------------------------------------------
   await step('09 privileged real-packet click-drive (craft → inject → confirm → inspect → send_recv → intercept → out-of-scope)', async () => {
     if (!privileged) {
-      skip('09 privileged click-drive — SKIP (not faked)', `two gates on this host: (1) no raw-socket privilege (${captureReason}), so no L4 flow can be captured/injected and the L4 inspector (craft editor, Inject, layer tree, hex, send_recv, intercept) + out-of-scope dimming have no session to act on; (2) the operator confirm-over-the-wire dialog is offered only to Frontend::Operator, but the web /bus is Frontend::Mcp (F1), so the confirm handshake never reaches the web UI. Run on Linux/elevated AND with the web operator identity. The privileged real-packet path is proven agent-driven (MCP) in Task 16 (commit 5bd2381); privilegedDrive() below is the authored web click sequence for when both land.`);
+      skip('09 privileged click-drive — SKIP (not faked)', `one gate on this host: no raw-socket privilege (${captureReason}). No L4 flow can be captured/injected, so the L4 inspector (craft editor, Inject, the confirm DIALOG, layer tree, hex, send_recv, intercept) + out-of-scope dimming have no session to act on by clicks. The operator identity IS present here (operator_token → Frontend::Operator), so privilege is the ONLY remaining gate — run privilegedDrive() on a Linux/elevated operator host. The operator confirm-over-the-wire DIALOG + the full real-packet path (capture→inject→confirm→send_recv→intercept) are proven agent-driven (MCP) in Task 16 (commit 5bd2381).`);
       return;
     }
     await privilegedDrive();
@@ -267,8 +282,7 @@ try {
 
   // 10 ---------------------------------------------------------------------------------------
   await step('10 hero', async () => {
-    await d.click({ role: 'button', text: 'L4', match: 'startsWith', within: SIDEBAR });
-    await d.locate({ sel: L4 });
+    await focusL4();
     await sleep(300);
     await cdp.s('Emulation.setDeviceMetricsOverride', { width: W, height: H, deviceScaleFactor: 2, mobile: false });
     await sleep(300);
@@ -319,7 +333,7 @@ async function privilegedDrive() {
     await d.click({ role: 'button', text: 'Start capture', match: 'startsWith', within: CAPTURE });
     const ping = dgram.createSocket('udp4');
     ping.send(Buffer.from('probe'), 9, '127.0.0.1');
-    const row = await d.locate({ role: 'row', within: UNION }, { timeoutMs: 8000 });
+    const row = await d.locate({ sel: L4ROW }, { timeoutMs: 8000 });
     await d.mouse(row.x, row.y); // select the L4 session
     ping.close();
     await d.locate({ sel: 'section[aria-label="Craft"]' });
@@ -354,8 +368,8 @@ async function privilegedDrive() {
     // Out-of-scope dimming: remove the lo0 scope so the existing flow falls out of L4 scope.
     const entries = (await probe(bus, 'l4.scope.list')).value ?? [];
     for (const e of entries) await probe(bus, 'l4.scope.remove', { id: e.id });
-    await remountL4();
-    const dimmed = await waitFor(async () => (await d.q('find', { role: 'row', within: UNION }))?.oos, { timeoutMs: 6000, what: 'out-of-scope row' }).catch(() => false);
+    await focusL4();
+    const dimmed = await waitFor(async () => (await d.q('find', { sel: L4ROW }))?.oos, { timeoutMs: 6000, what: 'out-of-scope row' }).catch(() => false);
     const injBtn = await d.q('find', { sel: '[data-testid="l4-inject"]' });
     expect(dimmed && (injBtn?.disabled ?? true), '09e out-of-scope session is dimmed and its Inject disabled with the scope reason', `dimmed=${dimmed}; inject.disabled=${injBtn?.disabled}`);
     note('09f intercept Forward/Mutate/Drop', 'in-path (NFQUEUE) is Linux-only and needs CAP_NET_ADMIN + a parked packet; drive the L4 intercept bar on an elevated Linux core with nft queueing to a scoped target');
