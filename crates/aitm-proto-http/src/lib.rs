@@ -1,6 +1,7 @@
 //! `aitm-proto-http` — HTTP/1.1 protocol module (TLS MITM + sans-IO HTTP).
 
 pub mod ca;
+mod h2;
 pub mod module;
 pub mod sansio;
 pub mod sender;

@@ -4,10 +4,6 @@
 //!
 //! The `serve_h2` driver (Task 2) consumes these; they carry no async and touch
 //! no sockets, so they are unit-tested in isolation.
-//!
-//! `#[allow(dead_code)]`: these are the public surface Task 2 (`serve_h2`) calls;
-//! until that lands the lib build sees them as unused. The attribute is removed
-//! once the driver consumes them.
 
 use std::time::SystemTime;
 
@@ -17,7 +13,6 @@ use aitm_core::{Body, HeaderMap, HttpRequest, HttpResponse, HttpVersion};
 /// HTTP/2 (RFC 9113 §8.2.2). Carrying any of these into an h2 frame makes the
 /// `h2` encoder emit a `PROTOCOL_ERROR` and drop the stream, so they are stripped
 /// on encode. All entries are lowercase for case-insensitive matching.
-#[allow(dead_code)]
 pub(crate) const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
@@ -34,7 +29,6 @@ pub(crate) const HOP_BY_HOP: &[&str] = &[
 /// `http::Uri` (`:scheme`, `:authority`, `:path`) are read from there, falling back
 /// to the connection's scheme/authority when a pseudo-header is absent. `version`
 /// is always `H2`; the body is filled in by the caller as it drains the stream.
-#[allow(dead_code)]
 pub(crate) fn request_from_h2(
     head: &http::request::Parts,
     conn_scheme: &str,
@@ -70,7 +64,6 @@ pub(crate) fn request_from_h2(
 
 /// The core model → an h2 outbound request head. Strips the h1-only hop-by-hop
 /// headers ([`HOP_BY_HOP`]) and lowercases every name, as HTTP/2 requires.
-#[allow(dead_code)]
 pub(crate) fn h2_request_from(req: &HttpRequest) -> http::Request<()> {
     let mut out = http::Request::new(());
     *out.method_mut() =
@@ -82,7 +75,6 @@ pub(crate) fn h2_request_from(req: &HttpRequest) -> http::Request<()> {
 }
 
 /// An h2 inbound response head → the core model (`version` is always `H2`).
-#[allow(dead_code)]
 pub(crate) fn response_from_h2(head: &http::response::Parts) -> HttpResponse {
     HttpResponse {
         status: head.status.as_u16(),
@@ -95,7 +87,6 @@ pub(crate) fn response_from_h2(head: &http::response::Parts) -> HttpResponse {
 
 /// The core model → an h2 outbound response head. Strips hop-by-hop headers and
 /// lowercases names, as HTTP/2 requires. An out-of-range status falls back to 200.
-#[allow(dead_code)]
 pub(crate) fn h2_response_from(resp: &HttpResponse) -> http::Response<()> {
     let mut out = http::Response::new(());
     *out.status_mut() = http::StatusCode::from_u16(resp.status).unwrap_or(http::StatusCode::OK);

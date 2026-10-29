@@ -263,6 +263,7 @@ dependencies = [
  "aitm-core",
  "aitm-plugin",
  "anyhow",
+ "bytes",
  "futures",
  "h2",
  "http",

@@ -16,6 +16,9 @@ futures.workspace = true
 # proto-http sibling-session convention. (M7)
 h2 = "0.4"
 http = "1"
+# The byte buffer type `h2`'s `SendStream`/`RecvStream` speak (re-exported by
+# neither `h2` nor `http`); required to drive the h2 body frames. (M7 Task 2)
+bytes = "1"
 tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
 # Certificate authority: root generation + leaf minting, and the leaf cache.
 rcgen = { version = "0.14", features = ["x509-parser"] }
