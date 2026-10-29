@@ -39,8 +39,8 @@ fn repo_root() -> PathBuf {
 }
 
 /// The command surface an agent drives: the default wired plugins plus the M4
-/// findings store (`findings.*`), which the binary wires through the scripting
-/// tier's command provider. This is the authoritative tool list the playbook is
+/// findings store (`findings.*`), which the binary registers among its command
+/// providers (`main.rs`). This is the authoritative tool list the playbook is
 /// validated against.
 fn agent_command_surface() -> BTreeSet<String> {
     let mut cfg = Config::default();
@@ -56,7 +56,7 @@ fn agent_command_surface() -> BTreeSet<String> {
         &cfg,
         &Features::default(),
         ScriptWiring {
-            commands: Some(Box::new(FindingsPlugin::new())),
+            commands: vec![Box::new(FindingsPlugin::new())],
             ..Default::default()
         },
     )

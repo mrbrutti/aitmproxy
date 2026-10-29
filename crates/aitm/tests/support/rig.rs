@@ -156,8 +156,9 @@ impl Rig {
         // Where `findings.record` persists and the report is rendered from.
         cfg.findings.dir = Some(findings_tmp.path().to_path_buf());
 
-        // Assemble WITH the findings store commands wired in (the binary does not
-        // yet; Task 16's validator wires them the same way).
+        // Assemble WITH the findings store commands wired in, the same way the
+        // binary does (`main.rs` registers `FindingsPlugin` among its command
+        // providers).
         let Assembled {
             proxy,
             ca,
@@ -170,7 +171,7 @@ impl Rig {
             ScriptWiring {
                 plugins: Vec::new(),
                 executor: None,
-                commands: Some(Box::new(aitm_findings::FindingsPlugin::new())),
+                commands: vec![Box::new(aitm_findings::FindingsPlugin::new())],
             },
         )
         .expect("assemble the proxy with the findings store");

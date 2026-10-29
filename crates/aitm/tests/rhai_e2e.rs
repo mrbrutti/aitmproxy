@@ -468,7 +468,7 @@ async fn natives_and_scripts_run_in_registration_order() {
                 .map(|p| Box::new(p) as Box<dyn Plugin>)
                 .collect(),
             executor: Some(tier.executor.clone()),
-            commands: Some(Box::new(tier.commands)),
+            commands: vec![Box::new(tier.commands)],
         },
     )
     .expect("assemble");
@@ -530,14 +530,14 @@ async fn script_command_over_frontends() {
                 .map(|p| Box::new(p) as Box<dyn Plugin>)
                 .collect(),
             executor: Some(tier.executor.clone()),
-            commands: Some(Box::new(tier.commands)),
+            commands: vec![Box::new(tier.commands)],
         },
     )
     .expect("assemble with the tagger script");
     let registry = proxy.registry_arc();
 
     // MCP tools/list includes the script command — and the tier's own three
-    // (spec §3/§8: `script.validate`, `script.reload`, `findings.list`).
+    // (spec §3/§8: `script.validate`, `script.reload`, `script.findings`).
     // A Rhai-registered command declares no `sensitivity()`, so it is the
     // fail-closed `Sensitive` default with no per-command config gate. Under the
     // corrected policy (spec D2) the *agent* may not call such a command under any
@@ -567,7 +567,7 @@ async fn script_command_over_frontends() {
         names.contains(&"tagger.ping"),
         "the script command is an MCP tool; got {names:?}",
     );
-    for tool in ["script.validate", "script.reload", "findings.list"] {
+    for tool in ["script.validate", "script.reload", "script.findings"] {
         assert!(
             names.contains(&tool),
             "{tool} is an MCP tool; got {names:?}"
@@ -808,7 +808,7 @@ async fn poc_script_step_pass_vs_patched() {
                 ScriptWiring {
                     plugins: Vec::new(),
                     executor: Some(tier.executor.clone()),
-                    commands: Some(Box::new(tier.commands)),
+                    commands: vec![Box::new(tier.commands)],
                 },
             )
             .expect("assemble proxy");
