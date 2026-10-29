@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use aitm_core::Frontend;
+use aitm_mcp::ConnCtx;
 use bytes::Bytes;
 use futures::{SinkExt as _, StreamExt as _};
 use http_body_util::Full;
@@ -113,8 +115,10 @@ pub async fn run(on_upgrade: hyper::upgrade::OnUpgrade, state: Arc<WebState>) {
 type Ws = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 
 async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
-    // Authentication: the first non-empty line of the first text frame.
+    // Authentication: the first non-empty line of the first text frame. The
+    // token's class picks the role every later line runs as.
     let mut pending: Vec<String> = Vec::new();
+    let role;
     loop {
         match ws.next().await {
             Some(Ok(Message::Text(text))) => {
@@ -122,11 +126,12 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
                 let Some(first) = lines.next() else {
                     continue; // whitespace only; wait for a real first line
                 };
-                if !token_line_matches(first, &state.token) {
+                let Some(resolved) = classify_token(first, state) else {
                     warn!("web bus: refused a connection with a bad token");
                     ws.send(Message::text(UNAUTHORIZED_REPLY)).await?;
                     return close(ws, CloseCode::Policy, "unauthorized").await;
-                }
+                };
+                role = resolved;
                 pending.extend(lines.map(str::to_owned));
                 break;
             }
@@ -142,18 +147,18 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
             None => return Ok(()),
         }
     }
-    debug!("web bus: connection authenticated");
+    debug!(?role, "web bus: connection authenticated");
 
     // Any lines that shared the token's frame are ordinary messages.
     for line in pending {
-        dispatch(&mut ws, state, line).await?;
+        dispatch(&mut ws, state, role, line).await?;
     }
 
     while let Some(frame) = ws.next().await {
         match frame? {
             Message::Text(text) => {
                 for line in lines_of(text.as_str()) {
-                    dispatch(&mut ws, state, line.to_owned()).await?;
+                    dispatch(&mut ws, state, role, line.to_owned()).await?;
                 }
             }
             Message::Binary(_) => {
@@ -171,15 +176,39 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
 }
 
 /// Hand one JSON-RPC line to the core on a blocking thread (the command's
-/// `invoke` runs synchronously there, as `transport::serve_lines` does) and
-/// send its reply, if any, as one text frame.
-async fn dispatch(ws: &mut Ws, state: &WebState, line: String) -> anyhow::Result<()> {
+/// `invoke` runs synchronously there, as `transport::serve_lines` does) under
+/// the connection's resolved `role` and send its reply, if any, as one text
+/// frame. The role makes the browser's own `initialize` reply carry the right
+/// `role` echo, and gates commands exactly as the other frontends do.
+async fn dispatch(
+    ws: &mut Ws,
+    state: &WebState,
+    role: Frontend,
+    line: String,
+) -> anyhow::Result<()> {
     let srv = state.mcp.clone();
-    let reply = tokio::task::spawn_blocking(move || srv.handle(&line)).await?;
+    let reply =
+        tokio::task::spawn_blocking(move || srv.handle_on(&ConnCtx::new(role), &line)).await?;
     if let Some(reply) = reply {
         ws.send(Message::text(reply)).await?;
     }
     Ok(())
+}
+
+/// Resolve the first-line token to a role, comparing in constant time against
+/// each configured bridge token. The agent token is tried first; the operator
+/// token only when `mcp.operator_token` was configured (so it is `Some`).
+/// `None` ⇒ the token matched neither and the connection must be refused.
+fn classify_token(first: &str, state: &WebState) -> Option<Frontend> {
+    if token_line_matches(first, &state.agent_token) {
+        return Some(Frontend::Mcp);
+    }
+    if let Some(op) = state.operator_token.as_deref() {
+        if token_line_matches(first, op) {
+            return Some(Frontend::Operator);
+        }
+    }
+    None
 }
 
 async fn close(mut ws: Ws, code: CloseCode, reason: &'static str) -> anyhow::Result<()> {

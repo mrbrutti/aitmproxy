@@ -207,7 +207,7 @@ async fn connect_sequence_identifies_as_aitm_tui_and_builds_features_from_tools_
     let mut r = start(Fixture::builtin().shared(), Duration::from_millis(50));
 
     let first = timeout(WAIT, r.ev_rx.recv()).await.unwrap().unwrap();
-    let BusEvent::Connected { server, tools } = first else {
+    let BusEvent::Connected { server, tools, .. } = first else {
         panic!("the first event must be Connected, got {first:?}");
     };
     assert_eq!(server, "aitmproxy 0.3.0-fixture");
@@ -837,10 +837,7 @@ async fn a_refused_token_during_the_handshake_is_reported_once_and_not_retried()
         Arc::new(Mutex::new(Vec::new())),
     );
     let first = timeout(WAIT, r.ev_rx.recv()).await.unwrap().unwrap();
-    assert_eq!(
-        first,
-        BusEvent::Disconnected("bus refused the token — check --token-file".into())
-    );
+    assert_eq!(first, BusEvent::Disconnected(bus::REFUSED.into()));
     // The task ends on its own: no second connect, no back-off loop. Both
     // channels are still open here, so this is the task's decision.
     timeout(WAIT, r.task)
