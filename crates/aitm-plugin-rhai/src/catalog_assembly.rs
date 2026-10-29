@@ -38,6 +38,10 @@ pub enum AssembleError {
     /// Two registered languages claim the same namespace. Assembly never
     /// last-wins; a clash is a hard error (Review Focus).
     DuplicateNamespace(String),
+    /// A namespace's PoC `op` verb vocabulary diverges from its Rhai host-fn
+    /// names (AC8, "one vocabulary"). Enforced at assembly so a divergent
+    /// catalog fails the build rather than shipping two drifting vocabularies.
+    VocabularyInconsistent(String),
 }
 
 impl std::fmt::Display for AssembleError {
@@ -46,6 +50,10 @@ impl std::fmt::Display for AssembleError {
             AssembleError::DuplicateNamespace(ns) => {
                 write!(f, "two languages claim the namespace `{ns}`")
             }
+            AssembleError::VocabularyInconsistent(ns) => write!(
+                f,
+                "namespace `{ns}`'s PoC `op` vocabulary diverges from its host-fn names (AC8)"
+            ),
         }
     }
 }
@@ -100,6 +108,12 @@ pub fn assemble_poc_steps(
         let Some(step) = cat.poc_step.clone() else {
             continue;
         };
+        // AC8 is enforced, not advisory: a namespace whose PoC `op` vocabulary
+        // diverges from its host-fn names fails the build here rather than
+        // shipping a catalog whose two faces teach different verbs.
+        if !vocabulary_consistent(&cat) {
+            return Err(AssembleError::VocabularyInconsistent(cat.namespace));
+        }
         if doc.contains_key(&cat.namespace) {
             return Err(AssembleError::DuplicateNamespace(cat.namespace));
         }
@@ -153,4 +167,48 @@ pub fn vocabulary_consistent(cat: &NamespaceCatalog) -> bool {
     let fn_names: BTreeSet<&str> = cat.host_fns.iter().map(|f| f.name.as_str()).collect();
     let verbs: BTreeSet<&str> = verbs.iter().map(|s| s.as_str()).collect();
     verbs == fn_names
+}
+
+/// One namespace whose runnable `<ns>:` PoC step and catalogued PoC step
+/// disagree — a violation of the PoC-face seam bijection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PocFaceDrift {
+    /// `poc_step()` returns a handler but `catalog().poc_step` is `None`: a
+    /// runnable `<ns>:` step that no completion / `poc-yaml.schema.json` entry
+    /// advertises — the spec's "a catalog that silently lags the engine"
+    /// anti-goal, on the PoC face.
+    RunnableButUncatalogued(String),
+    /// `catalog().poc_step` is `Some` but `poc_step()` is `None`: a catalogued
+    /// `<ns>:` step with no handler to run it — completion offers a step the
+    /// engine would reject.
+    CataloguedButNotRunnable(String),
+}
+
+/// The PoC-step analogue of the host-fn seam bijection
+/// (`registered_host_fns` ↔ `assemble_namespaces`). The host-fn guard pins the
+/// registry's `(ns, name)` set to the catalog, but says nothing about the
+/// `<ns>:` PoC step; this guard pins the other face: for every registered
+/// language, a runnable PoC step (`poc_step().is_some()`) must be catalogued
+/// (`catalog().poc_step.is_some()`) and vice versa. Returns every namespace that
+/// breaks the bijection (empty = the PoC faces correspond exactly).
+pub fn poc_face_drift(languages: &[&dyn ProtocolLanguage]) -> Vec<PocFaceDrift> {
+    let mut out = Vec::new();
+    for language in languages {
+        let runnable = language.poc_step().is_some();
+        let catalogued = language.catalog().poc_step.is_some();
+        match (runnable, catalogued) {
+            (true, false) => {
+                out.push(PocFaceDrift::RunnableButUncatalogued(
+                    language.namespace().to_string(),
+                ));
+            }
+            (false, true) => {
+                out.push(PocFaceDrift::CataloguedButNotRunnable(
+                    language.namespace().to_string(),
+                ));
+            }
+            (true, true) | (false, false) => {}
+        }
+    }
+    out
 }

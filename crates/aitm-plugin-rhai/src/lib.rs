@@ -29,8 +29,8 @@ pub mod wire;
 // stay public for tests and for a capability provider in another crate; these
 // are the names a binary needs.
 pub use catalog_assembly::{
-    assemble_namespaces, assemble_poc_steps, production_languages, vocabulary_consistent,
-    AssembleError,
+    assemble_namespaces, assemble_poc_steps, poc_face_drift, production_languages,
+    vocabulary_consistent, AssembleError, PocFaceDrift,
 };
 pub use command::{register_reg_api, ScriptCommand, ScriptRegHandle};
 pub use commands::ScriptCommands;
