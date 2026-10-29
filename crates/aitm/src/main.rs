@@ -179,6 +179,10 @@ async fn run() -> anyhow::Result<()> {
         agent_state,
         push_tx,
         audit_ring,
+        // The protocol-general capture ingress is bound to the live L4 module here but
+        // not fed in Phase 1 (the pcap capture path is `l4.capture.*`'s own; a backend
+        // that calls `accept` is Phase 2's macOS Network/System Extension).
+        l4_ingress: _,
     } = assemble_with_scripts(
         &cfg,
         &Features {

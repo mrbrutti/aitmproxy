@@ -85,6 +85,13 @@ pub struct Assembled {
     /// hand it to `McpServer::with_audit_ring` so the server's `call_tool` records
     /// into the same ring.
     pub audit_ring: Arc<AuditRing>,
+    /// The protocol-general capture/ingress boundary (L4OPS-AC17), bound to the live
+    /// L4 guard + flow store when `l4.enabled`. `None` when L4 is off. It is the one
+    /// seam a future capture backend (Phase 2's macOS Network/System Extension) feeds:
+    /// an ingress-fed packet is guarded by the *same* `L4Guard` and lands in the *same*
+    /// `L4FlowStore` the operator reads via `l4.flow.*`. Phase 1 lights up only the
+    /// Linux/CLI L4 path; the boundary assumes no single protocol or backend.
+    pub l4_ingress: Option<crate::ingress::CoreIngress>,
 }
 
 /// The scripting tier, ready to take its place in the chain (M3 spec §8).
@@ -245,6 +252,7 @@ pub fn assemble_with_scripts(
     // then fail closed with the specific missing-capability reason, cached from a
     // cheap startup probe. The pure/read verbs work regardless. Registered before
     // `build()` (which consumes the builder).
+    let mut l4_ingress = None;
     if features.l4.enabled {
         let privilege = features
             .l4_privilege
@@ -259,8 +267,15 @@ pub fn assemble_with_scripts(
                  L4Unavailable"
             ),
         }
-        builder =
-            builder.register_plugin(Box::new(L4Module::with_privilege(&features.l4, privilege)));
+        let module = L4Module::with_privilege(&features.l4, privilege);
+        // Bind the protocol-general capture ingress (L4OPS-AC17) to this module's own
+        // guard + store, so an ingress-fed packet is guarded identically to a pcap-fed
+        // one and lands where `l4.flow.*` reads. Phase 1 wires only the L4 backend.
+        l4_ingress = Some(crate::ingress::CoreIngress::with_l4(
+            module.guard(),
+            module.store(),
+        ));
+        builder = builder.register_plugin(Box::new(module));
     }
 
     let proxy = builder.build()?;
@@ -276,6 +291,7 @@ pub fn assemble_with_scripts(
         agent_state,
         push_tx,
         audit_ring,
+        l4_ingress,
     })
 }
 
