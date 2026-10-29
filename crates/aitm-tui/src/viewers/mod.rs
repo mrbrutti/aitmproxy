@@ -128,18 +128,23 @@ pub fn headers<'a>(theme: &Theme, headers: &'a [(String, String)]) -> Vec<Line<'
 /// the table shows them as sent. Mirrors the web `cookies.ts` / `CookieTable`.
 pub fn cookies<'a>(theme: &Theme, headers: &[(String, String)], set_cookie: bool) -> Vec<Line<'a>> {
     let wanted = if set_cookie { "set-cookie" } else { "cookie" };
+    // The empty-state line, shown both when no Cookie/Set-Cookie header is present
+    // and when a present header carries no parsable pairs.
+    let empty_state = || {
+        let msg = if set_cookie {
+            "(no cookies set)"
+        } else {
+            "(no cookies sent)"
+        };
+        vec![Line::styled(msg, theme.text_tertiary())]
+    };
     let matching: Vec<&str> = headers
         .iter()
         .filter(|(n, _)| n.eq_ignore_ascii_case(wanted))
         .map(|(_, v)| v.as_str())
         .collect();
     if matching.is_empty() {
-        let empty = if set_cookie {
-            "(no cookies set)"
-        } else {
-            "(no cookies sent)"
-        };
-        return vec![Line::styled(empty, theme.text_tertiary())];
+        return empty_state();
     }
     // name=value pairs: one per Set-Cookie header, or every `;`-separated pair
     // across the request's Cookie headers.
@@ -156,12 +161,7 @@ pub fn cookies<'a>(theme: &Theme, headers: &[(String, String)], set_cookie: bool
     // pairs; fall back to the same empty-state line rather than drawing a blank
     // tab (the header-absent case is handled above).
     if pairs.is_empty() {
-        let empty = if set_cookie {
-            "(no cookies set)"
-        } else {
-            "(no cookies sent)"
-        };
-        return vec![Line::styled(empty, theme.text_tertiary())];
+        return empty_state();
     }
     let w = pairs
         .iter()
