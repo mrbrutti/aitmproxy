@@ -30,6 +30,14 @@ pub struct Config {
     /// `max_flows`, so a few very large captures cannot exhaust memory while under
     /// the flow-count cap.
     pub max_flow_bytes: usize,
+    /// Per-host TLS passthrough (M6 F11). Deny-by-default: the list is empty and
+    /// agent authoring is off, so nothing is tunnelled past MITM until the
+    /// operator names a host.
+    pub tls: TlsConfig,
+    /// Map Local/Remote rules (M6). Deny-by-default: no map root and agent
+    /// authoring off, so Map Local is unusable and no agent may author maps until
+    /// the operator opts in.
+    pub maps: MapsConfig,
 }
 
 impl Default for Config {
@@ -45,8 +53,41 @@ impl Default for Config {
             ssl_insecure: false,
             max_flows: crate::store::DEFAULT_MAX_FLOWS,
             max_flow_bytes: crate::store::DEFAULT_MAX_FLOW_BYTES,
+            tls: TlsConfig::default(),
+            maps: MapsConfig::default(),
         }
     }
+}
+
+/// Per-host TLS passthrough configuration (M6 F11). A passthrough host is
+/// tunnelled byte-for-byte without MITM, so the client speaks TLS to the real
+/// upstream and the proxy captures no decrypted flow for it.
+#[derive(Debug, Clone, Default)]
+pub struct TlsConfig {
+    /// Hosts (or `*.wildcard`) to tunnel past MITM. **Empty by default**: every
+    /// host is MITM'd until the operator pins one here.
+    pub passthrough: Vec<String>,
+    /// Let an agent frontend (MCP) change the passthrough list with
+    /// `tls.passthrough.add`/`remove`. **Off by default**: pinning a host out of
+    /// MITM is an authorisation decision, so only the human CLI may do it unless
+    /// the operator opts in — mirrors [`ScopeConfig::allow_agent_widen`].
+    pub allow_agent_passthrough: bool,
+}
+
+/// Map Local/Remote configuration (M6). Map rules rewrite or mock matching
+/// requests; both the map root (confining Map Local file reads) and agent
+/// authoring default to the deny-by-default posture.
+#[derive(Debug, Clone, Default)]
+pub struct MapsConfig {
+    /// The directory Map Local files are confined to. **`None` by default**: with
+    /// no root, a `map.add` for a local file is rejected (nothing to confine it
+    /// to), so Map Local is unusable until the operator sets a root.
+    pub root: Option<PathBuf>,
+    /// Let an agent frontend (MCP) author map rules with `map.add`/`map.remove`.
+    /// **Off by default**: a map rule redirects or mocks traffic, an
+    /// authorisation decision, so only the human CLI may author one unless the
+    /// operator opts in — mirrors [`ScopeConfig::allow_agent_widen`].
+    pub allow_agent_authoring: bool,
 }
 
 /// PoC-engine configuration.
