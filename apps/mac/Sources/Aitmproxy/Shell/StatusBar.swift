@@ -37,6 +37,14 @@ struct StatusBar: View {
                     Circle().fill(busColor.color).frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
                     Text(busText)
                 }
+                if let role = session.resolvedRole {
+                    Label(role, systemImage: roleSymbol(role))
+                        .labelStyle(.titleAndIcon)
+                        .foregroundStyle(session.roleWarning ? Tok.Status.serverError.color : Tok.Ink.secondary.color)
+                        .help(session.roleWarning
+                            ? "Connected as \(role), not the role you expected (Settings ▸ Bus)"
+                            : "Connected as \(role)")
+                }
             }
             .font(Tok.Face.data(Tok.Typography.Size.sm))
         }
@@ -56,6 +64,12 @@ struct StatusBar: View {
         case .disconnected: Tok.Ink.tertiary
         case .failed: Tok.Status.serverError
         }
+    }
+
+    /// A key badge for operator, a plain person for agent, a warning triangle on mismatch.
+    private func roleSymbol(_ role: String) -> String {
+        if session.roleWarning { return "exclamationmark.triangle.fill" }
+        return role == "operator" ? "person.badge.key.fill" : "person.fill"
     }
 
     private var busText: String {

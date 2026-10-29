@@ -208,6 +208,9 @@ struct FlowCommands: Commands {
             Button("Connection Log") { session.show(.connections) }
             Button("Certificate Authority…") { session.show(.ca) }
             Button("Configuration…") { session.show(.config) }
+            Divider()
+            Button("Reconnect Bus") { session.reconnectBus() }
+                .keyboardShortcut("r", modifiers: [.command, .control])
         }
         CommandMenu("Agent") {
             Picker("Policy", selection: Binding(get: { session.agentPolicy }, set: { session.activity.choose($0) })) {

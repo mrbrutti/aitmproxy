@@ -477,6 +477,39 @@ fn initialize_handshake() {
     assert_eq!(rpc(&srv, 2, "ping", json!({}))["result"], json!({}));
 }
 
+/// AC6 + Decision C: `initialize` echoes a top-level `role` of `"operator"` for
+/// an operator connection (alongside `protocolVersion`, not inside `serverInfo`).
+#[test]
+fn initialize_echoes_operator_role() {
+    let srv = server();
+    let resp: JsonValue = serde_json::from_str(
+        &srv.handle_on(
+            &ConnCtx::new(Frontend::Operator),
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        )
+        .expect("initialize gets a reply"),
+    )
+    .expect("response is JSON");
+    assert_eq!(resp["result"]["role"], json!("operator"));
+    // It sits at the top level of the result, not inside `serverInfo`.
+    assert!(resp["result"]["serverInfo"]["role"].is_null());
+}
+
+/// AC6 + Decision C: `initialize` echoes `role: "agent"` for an agent connection.
+#[test]
+fn initialize_echoes_agent_role() {
+    let srv = server();
+    let resp: JsonValue = serde_json::from_str(
+        &srv.handle_on(
+            &ConnCtx::agent(),
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        )
+        .expect("initialize gets a reply"),
+    )
+    .expect("response is JSON");
+    assert_eq!(resp["result"]["role"], json!("agent"));
+}
+
 /// Minor (a): `initialize` answers with the server's own `PROTOCOL_VERSION`,
 /// not whatever version the client asked for.
 #[test]
@@ -1006,6 +1039,56 @@ async fn unknown_token_refused() {
     .await;
     assert_eq!(reply["error"]["code"], json!(-32001));
     assert_eq!(reply["error"]["message"], json!("unauthorized"));
+}
+
+/// Task 2 Review Focus: an empty-string `operator_token` is treated as *not
+/// configured*. It must not enable operator, and an empty presented token must
+/// match neither the agent token nor a (nonexistent) operator token, so it is
+/// refused `-32001` and never resolves to operator. Guards the transport's
+/// existing empty-token filter (`LoopbackTcp::with_operator_token`).
+#[tokio::test]
+async fn empty_operator_token_is_not_operator() {
+    let srv = McpServer::new(
+        role_registry(),
+        McpTransport::LoopbackTcp {
+            port: 0,
+            token: "agent".into(),
+        },
+    )
+    .with_services(
+        Arc::new(MemFlowStore::new()),
+        Arc::new(StubClient),
+        Arc::new(StdGuard::default()),
+        None,
+    )
+    .with_agent_state(ungated())
+    .with_mcp_roles(Some(String::new()), Frontend::Mcp);
+    let (tx, rx) = tokio::sync::oneshot::channel::<SocketAddr>();
+    tokio::spawn(
+        srv.on_bound(move |addr| {
+            let _ = tx.send(addr);
+        })
+        .serve(),
+    );
+    let addr = rx.await.expect("serve reports its bound address");
+
+    // An empty presented token matches neither token → refused, never operator.
+    let refused = first_reply(
+        addr,
+        "{\"token\":\"\"}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"demo.frontend\",\"arguments\":{}}}\n",
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], json!(-32001));
+    assert_eq!(refused["error"]["message"], json!("unauthorized"));
+
+    // The agent token still works and resolves to agent — an empty operator
+    // token is simply ignored, not treated as a second match.
+    let agent = first_reply(
+        addr,
+        "{\"token\":\"agent\"}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"demo.frontend\",\"arguments\":{}}}\n",
+    )
+    .await;
+    assert_eq!(agent["result"]["structuredContent"], json!("mcp"));
 }
 
 /// AC-M4-1: stdio defaults to the agent role, threaded through `serve_lines`.
