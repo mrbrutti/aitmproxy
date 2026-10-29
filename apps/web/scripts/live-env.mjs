@@ -130,6 +130,11 @@ export async function startAitm({ scope = [], l4 = null, aitmBin = process.env.A
   const [proxyPort, browserProxyPort, webPort] = await Promise.all([freePort(), freePort(), freePort()]);
   const dir = mkdtempSync(join(tmpdir(), 'aitm-live-'));
   const token = 'live-' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  // Configuring `mcp.operator_token` (any non-empty secret) ENABLES operator access: the server then
+  // mints a FRESH per-run operator *bridge* token and prints `web UI (operator): http://…/#t=<tok>`
+  // on stdout (the secret itself never appears in a URL/log). We parse that URL + token below so the
+  // CUA can drive the web surface as a real `Frontend::Operator` (vs the agent `--token` = Mcp).
+  const operatorSecret = 'opsecret-' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
   const pocDir = join(dir, 'poc');
   const pocOut = join(dir, 'poc-out');
   const cfg = join(dir, 'config.yaml');
@@ -146,6 +151,7 @@ export async function startAitm({ scope = [], l4 = null, aitmBin = process.env.A
       `  dir: ${pocDir}`,
       `  out_dir: ${pocOut}`,
       `mcp:`,
+      `  operator_token: ${operatorSecret}`,
       `  transport:`,
       `    loopback_tcp:`,
       `      port: 0`,
@@ -160,30 +166,52 @@ export async function startAitm({ scope = [], l4 = null, aitmBin = process.env.A
     env: { ...process.env, RUST_LOG: process.env.RUST_LOG ?? 'info' },
   });
   let stderr = '';
+  let out = '';
+  let operatorUiUrl = null;
+  const opMatch = () => out.match(/web UI \(operator\):\s*(\S+)/);
   child.stderr.on('data', (d) => {
     stderr += d;
     log(String(d).trimEnd());
   });
   await new Promise((res, rej) => {
-    let out = '';
+    // Readiness: the server logs "web UI listening" via tracing (stderr) and prints the agent +
+    // operator URLs on stdout. Resolve once the operator URL is captured, or on the generic
+    // listen/agent line (older builds / operator disabled).
+    const check = () => {
+      const m = opMatch();
+      if (m) operatorUiUrl = m[1];
+      if (operatorUiUrl || /web UI (listening|: http|\(agent\))/i.test(out + stderr)) res();
+    };
     child.stdout.on('data', (d) => {
       out += d;
-      if (/web UI: http/.test(out)) res();
+      check();
     });
+    child.stderr.on('data', check);
     child.on('exit', (code) => rej(new Error(`aitm exited ${code}\n${stderr}`)));
     setTimeout(() => rej(new Error('aitm did not start in 20 s\n' + stderr)), 20000);
   });
+  // The operator URL println can trail the stderr "listening" log we resolved on; give stdout a beat.
+  for (let i = 0; i < 20 && !operatorUiUrl; i++) {
+    const m = opMatch();
+    if (m) operatorUiUrl = m[1];
+    else await new Promise((r) => setTimeout(r, 50));
+  }
+  // The operator URL fragment is query-shaped: `#t=<token>&expect=operator`. The bus token is only `t`.
+  const opHash = operatorUiUrl ? new URL(operatorUiUrl).hash.replace(/^#/, '') : '';
+  const operatorToken = opHash ? new URLSearchParams(opHash).get('t') : null;
   return {
     child,
     dir,
     cfg,
     token,
+    operatorToken, // the fresh per-run operator BRIDGE token parsed from stdout (not the mcp secret)
     proxyPort,
     webPort,
     pocDir,
     pocOut,
     webUrl: `http://127.0.0.1:${webPort}/`,
     uiUrl: `http://127.0.0.1:${webPort}/#t=${token}`,
+    operatorUiUrl,
     busUrl: `ws://127.0.0.1:${webPort}/bus`,
     stderr: () => stderr,
     stop: () =>
