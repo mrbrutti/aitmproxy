@@ -118,6 +118,63 @@ async fn ordered_events_and_halt() {
     );
 }
 
+/// On `Request`, writes a mark to the *live* store copy (standing in for a
+/// concurrent `flow.mark` command) and a different mark to its own working copy.
+struct ConcurrentMarker {
+    store: Arc<dyn FlowStore>,
+}
+
+impl Plugin for ConcurrentMarker {
+    fn name(&self) -> &str {
+        "concurrent-marker"
+    }
+    fn on_event(&mut self, ev: &Event, ctx: &mut FlowCtx<'_>) -> Verdict {
+        if matches!(ev, Event::Request(_)) {
+            let id = ctx.flow().id();
+            // A concurrent operator annotation lands on the stored flow while this
+            // dispatch still holds its own copy.
+            self.store.update(id, &mut |f: &mut Flow| {
+                f.metadata_mut().marks.push("concurrent".into());
+            });
+            // The plugin's own edit, applied to its working copy.
+            ctx.flow_mut().metadata_mut().marks.push("plugin".into());
+        }
+        Verdict::Continue
+    }
+}
+
+/// A concurrent `flow.mark` that lands while the chain is dispatching must not be
+/// clobbered by the plugins' write-back.
+///
+/// Regression: dispatch cloned the flow out, ran plugins on the clone, then
+/// blind-inserted it over the store — discarding any mark/comment a command set
+/// in between.
+#[tokio::test]
+async fn concurrent_mark_survives_plugin_writeback() {
+    let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+    let id = store.insert(http_flow());
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(ConcurrentMarker {
+        store: store.clone(),
+    }));
+    let chain = Chain::new(Arc::new(reg), store.clone());
+
+    chain.dispatch(Event::Request(id)).await;
+
+    let marks = match store.get(id) {
+        Some(Flow::Http(f)) => f.metadata.marks,
+        other => panic!("expected http flow, got {other:?}"),
+    };
+    assert!(
+        marks.iter().any(|m| m == "plugin"),
+        "the plugin's own mark must be persisted, got {marks:?}"
+    );
+    assert!(
+        marks.iter().any(|m| m == "concurrent"),
+        "a concurrent mark must survive the plugin write-back, got {marks:?}"
+    );
+}
+
 /// Intercepts the request: backs the flow up and parks it.
 struct Interceptor;
 

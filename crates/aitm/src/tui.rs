@@ -105,7 +105,14 @@ pub fn services(
     let client: Arc<dyn ProxyClient> = Arc::new(PipelineClient::new(
         store.clone(),
         guard.clone(),
-        Arc::new(Http1Sender::new().with_insecure(cfg.ssl_insecure)),
+        // SSRF-gate the reissue path with the same policy + scope the browser
+        // connector uses, so flow.replay / request.send / http.send cannot reach a
+        // private/loopback/metadata host or rebind a scoped name to one (C1).
+        Arc::new(
+            Http1Sender::new()
+                .with_insecure(cfg.ssl_insecure)
+                .with_ssrf(cfg.browser.ssrf.clone(), guard.clone()),
+        ),
     ));
     Services {
         registry,

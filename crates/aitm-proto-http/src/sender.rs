@@ -7,10 +7,14 @@
 //! duplicate `Content-Length`/`Transfer-Encoding` is emitted) over a TCP stream,
 //! wrapped in rustls for `https` with the webpki roots verified by default.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use aitm_core::{Body, HeaderMap, HttpRequest, HttpResponse, RequestSender};
+use aitm_core::{
+    ssrf_check, Authority, Body, HeaderMap, HttpRequest, HttpResponse, RequestSender,
+    ScopeRateGuard, SsrfPolicy,
+};
 use anyhow::{anyhow, Context, Result};
 use futures::future::BoxFuture;
 use rustls::crypto::CryptoProvider;
@@ -32,11 +36,40 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const READ_CHUNK: usize = 16 * 1024;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Name → addresses. A seam so the SSRF gate is testable without real DNS; the
+/// default resolves through tokio's non-blocking resolver.
+pub trait HostResolver: Send + Sync {
+    fn resolve(&self, host: String, port: u16) -> BoxFuture<'static, Result<Vec<IpAddr>>>;
+}
+
+/// The operating system's resolver, driven on tokio's blocking pool.
+struct SystemResolver;
+
+impl HostResolver for SystemResolver {
+    fn resolve(&self, host: String, port: u16) -> BoxFuture<'static, Result<Vec<IpAddr>>> {
+        Box::pin(async move {
+            let addrs = tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .with_context(|| format!("resolve {host}:{port}"))?;
+            Ok(addrs.map(|a| a.ip()).collect())
+        })
+    }
+}
+
+/// The SSRF gate for the reissue path: the same policy + live scope the browser
+/// connector uses.
+struct SsrfGate {
+    policy: SsrfPolicy,
+    scope: Arc<dyn ScopeRateGuard>,
+}
+
 /// Reissues requests over real HTTP/1.1 (+ TLS for `https`).
 pub struct Http1Sender {
     provider: Arc<CryptoProvider>,
     insecure: bool,
     response_timeout: Duration,
+    resolver: Arc<dyn HostResolver>,
+    ssrf: Option<SsrfGate>,
 }
 
 impl Default for Http1Sender {
@@ -52,6 +85,8 @@ impl Http1Sender {
             provider: Arc::new(rustls::crypto::ring::default_provider()),
             insecure: false,
             response_timeout: RESPONSE_TIMEOUT,
+            resolver: Arc::new(SystemResolver),
+            ssrf: None,
         }
     }
 
@@ -59,6 +94,23 @@ impl Http1Sender {
     /// `Config.ssl_insecure`).
     pub fn with_insecure(mut self, insecure: bool) -> Self {
         self.insecure = insecure;
+        self
+    }
+
+    /// Enforce the SSRF policy against `scope` on every reissue: resolve the
+    /// target and refuse a private/loopback/metadata address unless an in-scope
+    /// IP literal lifts it — exactly as the browser connector does, so
+    /// `flow.replay`, `request.send` and the script `http.send` (which all share
+    /// this sender) cannot reach an internal host or rebind a scoped name to one.
+    pub fn with_ssrf(mut self, policy: SsrfPolicy, scope: Arc<dyn ScopeRateGuard>) -> Self {
+        self.ssrf = Some(SsrfGate { policy, scope });
+        self
+    }
+
+    /// Replace the DNS resolver. A seam for tests; production uses the default
+    /// system resolver.
+    pub fn with_resolver(mut self, resolver: Arc<dyn HostResolver>) -> Self {
+        self.resolver = resolver;
         self
     }
 
@@ -96,10 +148,24 @@ impl RequestSender for Http1Sender {
         let scheme = req.scheme.to_ascii_lowercase();
         Box::pin(async move {
             let (host, port) = split_authority(&req.authority, &scheme)?;
-            let addr = tokio::net::lookup_host((host.as_str(), port))
-                .await
-                .with_context(|| format!("resolve {host}:{port}"))?
+            // Resolve once, then (when the SSRF gate is configured) refuse a
+            // private/loopback/metadata address before connecting, and connect to
+            // an address we actually validated — so the resolve-then-connect
+            // (DNS-rebinding) window is closed and every reissue path that shares
+            // this sender is covered.
+            let ips = self.resolver.resolve(host.clone(), port).await?;
+            if let Some(gate) = &self.ssrf {
+                let scope = gate.scope.list_scope();
+                let authority = Authority::new(&host, port).to_string();
+                for ip in &ips {
+                    ssrf_check(&gate.policy, &scope, &authority, *ip)
+                        .map_err(|e| anyhow!("SSRF: refusing reissue to {host}: {e}"))?;
+                }
+            }
+            let addr = ips
+                .into_iter()
                 .next()
+                .map(|ip| SocketAddr::new(ip, port))
                 .ok_or_else(|| anyhow!("no address for {host}:{port}"))?;
             let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
                 .await

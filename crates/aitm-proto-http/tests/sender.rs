@@ -1,12 +1,88 @@
 //! The replay request sender drives a real HTTP/1.1 exchange: it decodes a
 //! chunked response body and sends a request body with correct framing.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
-use aitm_core::{Body, HeaderMap, HttpRequest, HttpVersion, RequestSender};
-use aitm_proto_http::Http1Sender;
+use aitm_core::{
+    Body, HeaderMap, HttpRequest, HttpVersion, RequestSender, ScopeEntry, ScopeRateGuard,
+    SsrfPolicy, StdGuard,
+};
+use aitm_proto_http::{HostResolver, Http1Sender};
+use anyhow::Result;
+use futures::future::BoxFuture;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+/// A resolver that returns fixed addresses, so the SSRF gate can be exercised
+/// without real DNS (and a refusal is proven to happen before any connect).
+struct FixedResolver(Vec<IpAddr>);
+
+impl HostResolver for FixedResolver {
+    fn resolve(&self, _host: String, _port: u16) -> BoxFuture<'static, Result<Vec<IpAddr>>> {
+        let ips = self.0.clone();
+        Box::pin(async move { Ok(ips) })
+    }
+}
+
+/// A GET for a hostname authority (no port), scheme `http`.
+fn get_host(authority: &str) -> HttpRequest {
+    HttpRequest {
+        method: "GET".into(),
+        scheme: "http".into(),
+        authority: authority.into(),
+        path: "/".into(),
+        version: HttpVersion::Http11,
+        headers: HeaderMap::new(),
+        body: Body::Empty,
+        timestamp: std::time::SystemTime::now(),
+    }
+}
+
+/// C1: a scoped *name* that resolves to a private address (DNS rebinding) is
+/// refused on the reissue path before any connection is attempted. The name is in
+/// scope, so the rate/scope guard alone would let it through — only the SSRF gate
+/// stops it.
+#[tokio::test]
+async fn ssrf_refuses_scoped_name_resolving_to_private() {
+    let guard = Arc::new(StdGuard::default());
+    guard.add_scope(ScopeEntry {
+        host: "evil.test".into(),
+    });
+    let sender = Http1Sender::new()
+        .with_ssrf(SsrfPolicy::default(), guard)
+        .with_resolver(Arc::new(FixedResolver(vec!["10.0.0.5".parse().unwrap()])));
+
+    let err = sender
+        .send(&get_host("evil.test"))
+        .await
+        .expect_err("a scoped name resolving to a private IP must be refused");
+    assert!(
+        err.to_string().contains("SSRF"),
+        "the refusal names the SSRF gate: {err}"
+    );
+}
+
+/// C1: the metadata address (link-local 169.254.169.254) is refused too, even
+/// when the operator scoped the hostname that points at it.
+#[tokio::test]
+async fn ssrf_refuses_scoped_name_resolving_to_metadata() {
+    let guard = Arc::new(StdGuard::default());
+    guard.add_scope(ScopeEntry {
+        host: "metadata.test".into(),
+    });
+    let sender = Http1Sender::new()
+        .with_ssrf(SsrfPolicy::default(), guard)
+        .with_resolver(Arc::new(FixedResolver(vec!["169.254.169.254"
+            .parse()
+            .unwrap()])));
+
+    let err = sender
+        .send(&get_host("metadata.test"))
+        .await
+        .expect_err("the cloud metadata address must be refused");
+    assert!(err.to_string().contains("SSRF"), "got: {err}");
+}
 
 /// Read the request head and (if `Content-Length`) its body; return (head, body).
 async fn read_request(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
@@ -151,4 +227,34 @@ async fn sends_a_body_with_single_content_length() {
         !head.to_ascii_lowercase().contains("transfer-encoding:"),
         "a buffered body must not also carry Transfer-Encoding:\n{head}"
     );
+}
+
+/// C1: the SSRF gate must not break a *legitimately scoped* loopback target. An
+/// IP literal in scope lifts the private/loopback block, so a replay to a scoped
+/// local server still connects and succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssrf_allows_a_scoped_loopback_literal() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut s).await;
+        let _ = s
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi")
+            .await;
+        let _ = s.shutdown().await;
+    });
+
+    let guard = Arc::new(StdGuard::default());
+    // Scope the IP literal the target resolves to — this is what lifts the block.
+    guard.add_scope(ScopeEntry {
+        host: addr.to_string(),
+    });
+    let sender = Http1Sender::new().with_ssrf(SsrfPolicy::default(), guard);
+
+    let resp = sender
+        .send(&get(addr, "/"))
+        .await
+        .expect("a scoped loopback literal must be allowed through the SSRF gate");
+    assert_eq!(resp.status, 200);
 }
