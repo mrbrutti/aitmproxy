@@ -490,8 +490,11 @@ struct ResponsePane: View {
     }
 
     /// Fixture-only reference while the live detail (F5) cannot look up the previous flow.
+    /// Guarded by `Store.usesFixtures` so a live flow that happens to hit the fixture
+    /// hostname never shows a canned "previous response".
     private var previousResponse: HTTPMessage? {
-        row.authority == "auth.shop-staging.test" && row.path == "/api/auth/login" ? Fixtures.previousLoginResponse : nil
+        guard Store.usesFixtures else { return nil }
+        return row.authority == "auth.shop-staging.test" && row.path == "/api/auth/login" ? Fixtures.previousLoginResponse : nil
     }
 }
 

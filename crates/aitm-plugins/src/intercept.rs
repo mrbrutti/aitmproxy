@@ -248,7 +248,7 @@ fn rule_param_fields() -> Vec<ParamDef> {
         field(
             "phase",
             TypeDesc::Str,
-            "Lifecycle point: request (default), response, wsframe, or any.",
+            "Lifecycle point: request (default), response, ws_frame, or any.",
         ),
         field(
             "url",
@@ -313,6 +313,9 @@ impl Command for FlowResume {
     fn name(&self) -> &str {
         "flow.resume"
     }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Write
+    }
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
@@ -338,6 +341,9 @@ struct FlowKill {
 impl Command for FlowKill {
     fn name(&self) -> &str {
         "flow.kill"
+    }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Write
     }
 
     fn schema(&self) -> ParamSchema {

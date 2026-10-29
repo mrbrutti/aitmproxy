@@ -29,9 +29,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use aitm::wire::{assemble_with_scripts, Assembled, Features, Http1Sender, ScriptWiring};
 use aitm_core::{
-    Body, Chain, Config, ConnInfo, Event, Flow, FlowCtx, FlowId, FlowMeta, FlowStore, HeaderMap,
-    HttpFlow, HttpRequest, HttpVersion, InterceptState, McpTransport, MemFlowStore, PipelineClient,
-    Plugin, ProxyClient, Registry, ScopeEntry, StdGuard, Verdict,
+    AgentPolicy, AgentState, Body, Chain, Config, ConnInfo, Event, Flow, FlowCtx, FlowId, FlowMeta,
+    FlowStore, Frontend, HeaderMap, HttpFlow, HttpRequest, HttpVersion, InterceptState,
+    McpTransport, MemFlowStore, PipelineClient, Plugin, ProxyClient, Registry, ScopeEntry,
+    StdGuard, Verdict,
 };
 use aitm_plugin_rhai::{
     wire, MemoryFindingSink, RhaiConfig, ScriptEntry, ScriptPlugin, ScriptServices,
@@ -467,7 +468,7 @@ async fn natives_and_scripts_run_in_registration_order() {
                 .map(|p| Box::new(p) as Box<dyn Plugin>)
                 .collect(),
             executor: Some(tier.executor.clone()),
-            commands: Some(Box::new(tier.commands)),
+            commands: vec![Box::new(tier.commands)],
         },
     )
     .expect("assemble");
@@ -529,20 +530,29 @@ async fn script_command_over_frontends() {
                 .map(|p| Box::new(p) as Box<dyn Plugin>)
                 .collect(),
             executor: Some(tier.executor.clone()),
-            commands: Some(Box::new(tier.commands)),
+            commands: vec![Box::new(tier.commands)],
         },
     )
     .expect("assemble with the tagger script");
     let registry = proxy.registry_arc();
 
     // MCP tools/list includes the script command — and the tier's own three
-    // (spec §3/§8: `script.validate`, `script.reload`, `findings.list`).
-    let server = aitm_mcp::McpServer::new(registry.clone(), McpTransport::Stdio).with_services(
-        Arc::new(MemFlowStore::new()),
-        Arc::new(StubClient) as Arc<dyn ProxyClient>,
-        Arc::new(StdGuard::default()),
-        None,
-    );
+    // (spec §3/§8: `script.validate`, `script.reload`, `script.findings`).
+    // A Rhai-registered command declares no `sensitivity()`, so it is the
+    // fail-closed `Sensitive` default with no per-command config gate. Under the
+    // corrected policy (spec D2) the *agent* may not call such a command under any
+    // policy — `All` runs a Sensitive command only if it carries a config gate. This
+    // test is about reachability over the frontends, not the policy gate, so the
+    // MCP `tools/call` below is made over an operator connection, which is never
+    // policy-gated; the `All` agent state only affects the policy-free `tools/list`.
+    let server = aitm_mcp::McpServer::new(registry.clone(), McpTransport::Stdio)
+        .with_agent_state(Arc::new(AgentState::new(AgentPolicy::All)))
+        .with_services(
+            Arc::new(MemFlowStore::new()),
+            Arc::new(StubClient) as Arc<dyn ProxyClient>,
+            Arc::new(StdGuard::default()),
+            None,
+        );
     let req = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}});
     let resp: serde_json::Value =
         serde_json::from_str(&server.handle(&req.to_string()).expect("a response"))
@@ -557,21 +567,27 @@ async fn script_command_over_frontends() {
         names.contains(&"tagger.ping"),
         "the script command is an MCP tool; got {names:?}",
     );
-    for tool in ["script.validate", "script.reload", "findings.list"] {
+    for tool in ["script.validate", "script.reload", "script.findings"] {
         assert!(
             names.contains(&tool),
             "{tool} is an MCP tool; got {names:?}"
         );
     }
 
-    // MCP tools/call returns "pong".
+    // MCP tools/call returns "pong" (over an operator connection — see above).
     let call = serde_json::json!({
         "jsonrpc":"2.0","id":2,"method":"tools/call",
         "params":{"name":"tagger.ping","arguments":{}}
     });
-    let resp: serde_json::Value =
-        serde_json::from_str(&server.handle(&call.to_string()).expect("a response"))
-            .expect("json response");
+    let resp: serde_json::Value = serde_json::from_str(
+        &server
+            .handle_on(
+                &aitm_mcp::ConnCtx::new(Frontend::Operator),
+                &call.to_string(),
+            )
+            .expect("a response"),
+    )
+    .expect("json response");
     assert!(
         resp.to_string().contains("pong"),
         "MCP tools/call → pong; got {resp}",
@@ -792,7 +808,7 @@ async fn poc_script_step_pass_vs_patched() {
                 ScriptWiring {
                     plugins: Vec::new(),
                     executor: Some(tier.executor.clone()),
-                    commands: Some(Box::new(tier.commands)),
+                    commands: vec![Box::new(tier.commands)],
                 },
             )
             .expect("assemble proxy");

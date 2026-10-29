@@ -34,6 +34,7 @@ dependencies = [
  "aitm-ca",
  "aitm-cli",
  "aitm-core",
+ "aitm-findings",
  "aitm-mcp",
  "aitm-plugin",
  "aitm-plugin-maprules",
@@ -47,6 +48,7 @@ dependencies = [
  "aitm-proto-l4",
  "aitm-proto-ws",
  "aitm-rules",
+ "aitm-testtarget",
  "aitm-tui",
  "anyhow",
  "bytes",
@@ -126,7 +128,24 @@ dependencies = [
  "dirs",
  "futures",
  "indexmap",
+ "regex",
  "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "aitm-findings"
+version = "0.1.0"
+dependencies = [
+ "aitm-core",
+ "aitm-poc",
+ "anyhow",
+ "futures",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "time",
  "tracing",
  "uuid",
 ]
@@ -136,10 +155,13 @@ name = "aitm-mcp"
 version = "0.1.0"
 dependencies = [
  "aitm-core",
+ "aitm-plugins",
+ "aitm-poc",
  "anyhow",
  "futures",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -251,6 +273,7 @@ dependencies = [
  "libc",
  "regex",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tokio",
  "tracing",
@@ -321,6 +344,22 @@ dependencies = [
  "aitm-core",
  "anyhow",
  "regex",
+]
+
+[[package]]
+name = "aitm-testtarget"
+version = "0.1.0"
+dependencies = [
+ "aitm-core",
+ "aitm-findings",
+ "aitm-poc",
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde",
+ "serde_yaml",
+ "tokio",
 ]
 
 [[package]]

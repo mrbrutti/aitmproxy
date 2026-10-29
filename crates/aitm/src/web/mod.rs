@@ -174,6 +174,15 @@ pub fn ui_url(bound: SocketAddr, token: &str) -> String {
     format!("http://{bound}/#t={token}")
 }
 
+/// Log that `aitm web` is listening. Takes ONLY the bound address: the token is
+/// the one bus-auth secret and lives in the URL fragment ([`ui_url`]), so it is
+/// deliberately out of scope here and can never reach a tracing sink. The
+/// operator gets the full link from the one-time `println!` in `main`, which is
+/// not a logging sink, not from the logs.
+pub fn log_listening(bound: SocketAddr) {
+    tracing::info!(%bound, "web UI listening");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +304,49 @@ mod tests {
     fn ui_url_carries_the_token_in_the_fragment() {
         let url = ui_url("127.0.0.1:8081".parse().unwrap(), "abc");
         assert_eq!(url, "http://127.0.0.1:8081/#t=abc");
+    }
+
+    /// C4 regression: the "listening" log carries the bound address but never
+    /// the bus token, even though the operator URL for the same bind does.
+    #[test]
+    fn log_listening_never_carries_the_token() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl tracing_subscriber::fmt::MakeWriter<'_> for Buf {
+            type Writer = Buf;
+            fn make_writer(&self) -> Buf {
+                self.clone()
+            }
+        }
+
+        // A stand-in secret shaped like a real token (64 hex chars).
+        let token = "deadbeefcafebabe".repeat(4);
+        let bound: SocketAddr = "127.0.0.1:8082".parse().unwrap();
+        // The operator URL does carry the token; the log must not.
+        assert!(ui_url(bound, &token).contains(&token));
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(Buf(sink.clone()))
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || log_listening(bound));
+
+        let logged = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("web UI listening"), "{logged}");
+        assert!(logged.contains("127.0.0.1:8082"), "{logged}");
+        assert!(!logged.contains(&token), "token leaked into logs: {logged}");
     }
 }

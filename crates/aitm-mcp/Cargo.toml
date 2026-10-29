@@ -10,11 +10,14 @@ description = "MCP frontend: derives an MCP tool per registered command; stdio a
 aitm-core.workspace = true
 anyhow.workspace = true
 serde_json = "1"
-tokio = { workspace = true, features = ["io-util", "io-std", "net", "rt"] }
+uuid.workspace = true
+tokio = { workspace = true, features = ["io-util", "io-std", "net", "rt", "sync"] }
 
 [dev-dependencies]
+aitm-plugins.workspace = true
+aitm-poc.workspace = true
 futures.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [lints]
 workspace = true

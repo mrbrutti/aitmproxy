@@ -10,7 +10,7 @@ use futures::future::BoxFuture;
 
 use crate::ctx::FlowCtx;
 use crate::event::{Event, Verdict};
-use crate::flow::{Flow, FlowId, InterceptState};
+use crate::flow::{Flow, FlowId, FlowMeta, InterceptState};
 use crate::protocol::EventSink;
 use crate::registry::Registry;
 use crate::store::FlowStore;
@@ -52,6 +52,10 @@ impl Chain {
         let Some(mut flow) = self.store.get(id) else {
             return Verdict::Continue;
         };
+        // Snapshot the operator annotations as they were when we took our copy, so
+        // the write-back can tell a plugin's change to them from a concurrent
+        // `flow.mark` / `flow.comment` that landed while the plugins ran.
+        let base_meta = flow.metadata().clone();
 
         let (mut verdict, parked) = {
             let mut ctx = FlowCtx::new(&mut flow);
@@ -74,8 +78,13 @@ impl Chain {
             (verdict, ctx.take_parked())
         };
 
-        // Persist any in-place edits the plugins made.
-        self.store.insert(flow);
+        // Persist the plugins' edits onto the *live* stored flow, rather than
+        // blind-inserting our (possibly stale) copy over it: a `flow.mark` /
+        // `flow.comment` that ran concurrently would otherwise be clobbered. The
+        // plugins own request/response/intercept; operator annotations are merged.
+        self.store.update(id, &mut |live: &mut Flow| {
+            merge_plugin_edits(live, &flow, &base_meta)
+        });
 
         // Pausable future: a parked flow waits for a resume command to fire the
         // handle stored in its `Intercepted` state, bounded by a timeout so an
@@ -130,6 +139,41 @@ fn event_flow_id(ev: &Event) -> Option<FlowId> {
         | Event::WsEnd(id) => Some(*id),
         Event::WsMessage { flow, .. } | Event::Error { flow, .. } => Some(*flow),
     }
+}
+
+/// Write the plugins' `edited` copy onto the `live` stored flow, keeping the
+/// operator annotations (marks / comment) that a concurrent `flow.mark` /
+/// `flow.comment` may have set while the plugins ran. The plugins own everything
+/// else (request, response, interception), so those fields take the edited value
+/// exactly as a blind re-insert would have.
+///
+/// `base` is the annotation state the plugins started from: a mark they *added*
+/// (not in `base`) is unioned in, and a comment they *changed* wins; otherwise the
+/// live value is preserved so a concurrent operator edit is not lost.
+fn merge_plugin_edits(live: &mut Flow, edited: &Flow, base: &FlowMeta) {
+    let live_meta = live.metadata().clone();
+    *live = edited.clone();
+    let meta = live.metadata_mut();
+
+    // Union of marks: every mark the live flow carried (including any added
+    // concurrently) plus every mark the plugins produced, de-duplicated.
+    let mut marks = live_meta.marks.clone();
+    for m in std::mem::take(&mut meta.marks) {
+        if !marks.contains(&m) {
+            marks.push(m);
+        }
+    }
+    meta.marks = marks;
+
+    // Comment: a plugin that changed it wins; otherwise keep the live comment,
+    // which may have been set concurrently.
+    if meta.comment == base.comment {
+        meta.comment = live_meta.comment;
+    }
+
+    // Capture-time fields a plugin edit never owns.
+    meta.created = live_meta.created;
+    meta.is_replay = live_meta.is_replay;
 }
 
 /// Set a flow's interception state regardless of protocol.

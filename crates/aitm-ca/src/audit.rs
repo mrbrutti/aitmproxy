@@ -155,6 +155,58 @@ impl AuditLog for FileAuditLog {
     }
 }
 
+/// Route the core F2 audit through the CA plugin's JSONL file machinery (spec
+/// D3a.2): the general command-invocation audit reuses the same append-only,
+/// fail-closed JSONL the CA log uses, so **every** command's [`aitm_core::AuditEntry`]
+/// — the `ca.*` ones among them — is a line of one format, not a second log.
+///
+/// Durable audit is best-effort: it must never break the command that produced
+/// the entry, so a write failure is logged and the line dropped (the always-on
+/// in-memory ring remains the authoritative live view).
+impl aitm_core::AuditSink for FileAuditLog {
+    fn append(&self, entry: aitm_core::AuditEntry) {
+        let mut line = entry_to_jsonl(&entry);
+        line.push('\n');
+        match self.append_handle() {
+            Ok(mut file) => {
+                if let Err(err) = file.write_all(line.as_bytes()) {
+                    tracing::warn!(
+                        target: "aitm::audit",
+                        path = %self.path.display(),
+                        error = %err,
+                        "durable audit append failed; entry kept only in the in-memory ring"
+                    );
+                }
+            }
+            Err(err) => tracing::warn!(
+                target: "aitm::audit",
+                path = %self.path.display(),
+                error = %err,
+                "durable audit log not writable; entry kept only in the in-memory ring"
+            ),
+        }
+    }
+}
+
+/// One core [`aitm_core::AuditEntry`] as a JSON Lines object — the general-audit
+/// format, shared by the in-memory ring's rendering (`to_value`), the agent
+/// stream, and this durable log so CA entries are a subset of one shape.
+pub fn entry_to_jsonl(entry: &aitm_core::AuditEntry) -> String {
+    let result = match &entry.result {
+        aitm_core::AuditResult::Ok => serde_json::json!("ok"),
+        aitm_core::AuditResult::Error(reason) => serde_json::json!({ "error": reason }),
+    };
+    serde_json::json!({
+        "at": entry.at_millis(),
+        "origin": aitm_core::origin_label(entry.origin),
+        "client_label": entry.client_label,
+        "command": entry.command,
+        "args": entry.args_summary,
+        "result": result,
+    })
+    .to_string()
+}
+
 /// The current UTC time as `AuditRecord::ts` wants it: RFC 3339, seconds
 /// precision, `Z` suffix — e.g. `2026-10-27T21:03:14Z`.
 pub fn now_rfc3339() -> String {

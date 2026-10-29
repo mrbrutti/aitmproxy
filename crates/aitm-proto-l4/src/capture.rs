@@ -33,7 +33,7 @@ use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
-use etherparse::{NetSlice, SlicedPacket, TransportSlice};
+use etherparse::{NetSlice, TransportSlice};
 
 use crate::backend::{CaptureInjectBackend, L4Error};
 use crate::craft::PacketSpec;
@@ -377,7 +377,7 @@ pub(crate) fn packet_target(
     interface: &str,
     direction: L4Direction,
 ) -> Option<L4Target> {
-    let parsed = parse_any(frame)?;
+    let parsed = crate::craft::parse_frame(frame)?;
     let dst = match parsed.net? {
         NetSlice::Ipv4(ip) => IpAddr::V4(ip.header().destination_addr()),
         NetSlice::Ipv6(ip) => IpAddr::V6(ip.header().destination_addr()),
@@ -397,35 +397,6 @@ pub(crate) fn packet_target(
         dst_port,
         proto,
     })
-}
-
-/// Parse a frame whose link layer we do not know in advance: our own crafted
-/// frames start at L3 (IP); a real NIC delivers L2 Ethernet; BSD/macOS loopback
-/// (`DLT_NULL`/`DLT_LOOP`) prepends a 4-byte address-family word before the IP
-/// header. Try each in turn and keep the first that yields a network layer.
-fn parse_any(frame: &[u8]) -> Option<SlicedPacket<'_>> {
-    let is_ip_nibble = |b: u8| matches!(b >> 4, 4 | 6);
-
-    if frame.first().copied().is_some_and(is_ip_nibble) {
-        if let Ok(p) = SlicedPacket::from_ip(frame) {
-            if p.net.is_some() {
-                return Some(p);
-            }
-        }
-    }
-    if let Ok(p) = SlicedPacket::from_ethernet(frame) {
-        if p.net.is_some() {
-            return Some(p);
-        }
-    }
-    if frame.len() > 4 && is_ip_nibble(frame[4]) {
-        if let Ok(p) = SlicedPacket::from_ip(&frame[4..]) {
-            if p.net.is_some() {
-                return Some(p);
-            }
-        }
-    }
-    None
 }
 
 /// The BPF clause for one scope entry: its address predicate AND its port
@@ -787,6 +758,40 @@ mod tests {
         let t = packet_target(&pkt.bytes, MOCK_IFACE, L4Direction::Outbound).unwrap();
         assert_eq!(t.dst, Some("127.0.0.1".parse().unwrap()));
         assert_eq!(g.in_flight(), 0, "stopping the capture releases its permit");
+    }
+
+    /// MINOR (link-layer autodetect): a real Ethernet frame whose destination MAC
+    /// starts with an IP-looking nibble (here `0x45`, which a first-byte check misreads
+    /// as an IPv4 header) is parsed as Ethernet, so `packet_target` resolves the true
+    /// IPv4 destination rather than a byte-offset artifact.
+    #[test]
+    fn packet_target_ethernet_with_ip_like_dst_mac() {
+        use crate::craft::EtherSpec;
+        let frame = PacketSpec {
+            layers: vec![
+                Layer::Ether(EtherSpec {
+                    dst: Some([0x45, 0x00, 0x00, 0x00, 0x00, 0x01]),
+                    src: Some([0x00, 0x00, 0x00, 0x00, 0x00, 0x02]),
+                    ..EtherSpec::default()
+                }),
+                Layer::Ipv4(Ipv4Spec {
+                    dst: Some("10.1.2.3".parse::<Ipv4Addr>().unwrap()),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    dst_port: Some(9),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(b"probe".to_vec()),
+            ],
+        }
+        .build()
+        .expect("craft builds");
+
+        let target = packet_target(&frame, MOCK_IFACE, L4Direction::Outbound)
+            .expect("an Ethernet frame resolves to its IPv4 target");
+        assert_eq!(target.dst, Some("10.1.2.3".parse().unwrap()));
+        assert_eq!(target.dst_port, Some(9));
     }
 
     /// The registry tracks a live capture, lists it, and stops it on request.

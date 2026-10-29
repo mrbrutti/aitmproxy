@@ -8,10 +8,13 @@
 
 mod base64;
 pub mod json;
+pub mod render;
 pub mod schema;
 pub mod server;
 pub mod transport;
 
 pub use aitm_core::McpTransport;
 pub use schema::{McpSchemaDerive, McpTool, StdSchemaDerive};
-pub use server::McpServer;
+pub use server::{
+    ConnCtx, McpServer, NotificationSink, DEFAULT_BROADCAST_CAPACITY, DEFAULT_PUSH_CAPACITY,
+};

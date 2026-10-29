@@ -105,8 +105,122 @@ pub fn read_confined(
 
 /// Parse and validate a PoC document, without echoing the offending content.
 pub fn parse_poc(text: &str) -> anyhow::Result<Poc> {
+    // The byte cap bounds the *source*, but `serde_yaml` expands aliases while
+    // parsing, so a kilobyte of `&a`/`*a` references can materialize gigabytes
+    // (a "billion laughs" bomb) before any size check downstream could help.
+    // Reject anchors/aliases up front, before `from_str` ever expands them.
+    if contains_anchor_or_alias(text) {
+        anyhow::bail!("PoC uses YAML anchors/aliases, which are not allowed");
+    }
     let raw: serde_yaml::Value =
         serde_yaml::from_str(text).map_err(|_| anyhow::anyhow!("not valid YAML"))?;
     crate::schema::validate(&raw).map_err(|e| anyhow::anyhow!("failed validation: {e}"))?;
     serde_yaml::from_value(raw).map_err(|_| anyhow::anyhow!("not a valid PoC document"))
+}
+
+/// Whether `text` contains a YAML anchor (`&name`) or alias (`*name`) indicator.
+///
+/// It scans outside of quoted scalars and comments, and only treats `&`/`*` as an
+/// indicator when it opens a token (start of line, or after whitespace or a flow
+/// indicator) and is followed by a name character. That keeps a legitimate `&` in
+/// an unquoted URL (`?a=1&b=2`) or a `*` in a regex from being misread as YAML.
+fn contains_anchor_or_alias(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    // `prev` is the last meaningful byte; start-of-input counts as a line start.
+    let mut prev = b'\n';
+    let mut in_squote = false;
+    let mut in_dquote = false;
+    let mut in_comment = false;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_comment {
+            if c == b'\n' {
+                in_comment = false;
+                prev = b'\n';
+            }
+            i += 1;
+            continue;
+        }
+        if in_squote {
+            if c == b'\'' {
+                in_squote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dquote {
+            if c == b'\\' {
+                i += 2; // skip an escaped character (e.g. `\"`)
+                continue;
+            }
+            if c == b'"' {
+                in_dquote = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        let at_token_start = matches!(
+            prev,
+            b'\n' | b' ' | b'\t' | b':' | b',' | b'-' | b'[' | b'{'
+        );
+        match c {
+            b'\'' => in_squote = true,
+            b'"' => in_dquote = true,
+            b'#' if matches!(prev, b'\n' | b' ' | b'\t') => in_comment = true,
+            b'&' | b'*' if at_token_start => {
+                let name = bytes
+                    .get(i + 1)
+                    .is_some_and(|&n| n.is_ascii_alphanumeric() || n == b'_' || n == b'-');
+                if name {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        prev = match c {
+            b'\t' | b'\r' => b' ',
+            other => other,
+        };
+        i += 1;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HEADER: &str = "id: demo\ninfo:\n  name: n\n  severity: low\n";
+
+    /// I5: a small alias bomb is rejected before `serde_yaml` can expand it.
+    #[test]
+    fn alias_bomb_rejected() {
+        let bomb = format!(
+            "{HEADER}steps: []\nsuccess:\n  type: status\n  status: 200\n\
+             a: &a [\"x\",\"x\",\"x\",\"x\"]\nb: &b [*a,*a,*a,*a]\nc: [*b,*b,*b,*b]\n"
+        );
+        let err = parse_poc(&bomb).expect_err("an alias bomb must be rejected");
+        assert!(
+            err.to_string().contains("anchors/aliases"),
+            "want an anchor/alias refusal, got: {err}"
+        );
+    }
+
+    /// A normal PoC — whose values legitimately contain `&` (a URL query) and `*`
+    /// (a regex) — is not misread as using anchors/aliases, and parses.
+    #[test]
+    fn ampersand_and_star_in_values_parse() {
+        let yaml = format!(
+            "{HEADER}steps:\n  - http:\n      method: GET\n      url: \"http://x.test/?a=1&b=2\"\n\
+             success:\n  - type: regex\n    regex: \"a*b\"\n"
+        );
+        assert!(
+            !contains_anchor_or_alias(&yaml),
+            "`&`/`*` inside quoted scalars must not be read as YAML indicators"
+        );
+        parse_poc(&yaml).expect("a plain PoC with `&`/`*` in values must parse");
+    }
 }

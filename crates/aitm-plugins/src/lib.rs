@@ -1,6 +1,8 @@
 //! `aitm-plugins` — first-party feature plugins (capture, replay, intercept,
-//! mutate, scope, rate-limit). Each registers its own commands; none lives in core.
+//! mutate, scope, rate-limit, agent). Each registers its own commands; none lives
+//! in core.
 
+pub mod agent;
 pub mod capture;
 pub mod control;
 pub mod detail;
@@ -10,7 +12,9 @@ pub mod mutate;
 pub mod ratelimit;
 pub mod replay;
 pub mod scope;
+pub mod subscription;
 
+pub use agent::AgentPlugin;
 pub use capture::CapturePlugin;
 pub use control::ControlPlugin;
 pub use detail::DetailPlugin;
@@ -20,6 +24,7 @@ pub use mutate::MutatePlugin;
 pub use ratelimit::RateLimitPlugin;
 pub use replay::ReplayPlugin;
 pub use scope::ScopePlugin;
+pub use subscription::SubscriptionPlugin;
 
 /// Drive a future to completion from a synchronous `Command::invoke`.
 ///

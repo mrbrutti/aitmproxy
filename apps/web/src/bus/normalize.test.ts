@@ -47,6 +47,20 @@ describe('toSummary (bus flow.get)', () => {
     expect(s).toMatchObject({ id: 'f_2', seq: 7, method: 'GET', authority: 'api.shop-staging.test', path: '/api/me', status: null, intercept: 'paused', isReplay: true, origin: 'human' });
     expect(s.reqSize).toBeNull();
     expect(s.client.id).toBe('unknown');
+    // Unknown TLS on an https flow is a tunnel, not decrypted (MITM): the core
+    // did not report interception, so we must not claim it.
+    expect(s.tls).toBe('tunnel');
+  });
+
+  it('labels an unknown-TLS https flow as a tunnel, and a decrypted one as mitm', () => {
+    const base = { id: 'f_3', kind: 'http', intercept: 'observed', is_replay: false, method: 'GET', authority: 'h.test', path: '/' };
+    // No tls field, no client_conn → unknown → tunnel (pinned/passthrough safe default).
+    expect(toSummary({ ...base, scheme: 'https' }, 1).tls).toBe('tunnel');
+    // A plain http flow is plain.
+    expect(toSummary({ ...base, scheme: 'http' }, 2).tls).toBe('plain');
+    // The core affirmatively reporting interception → mitm.
+    expect(toSummary({ ...base, scheme: 'https', tls: 'mitm' }, 3).tls).toBe('mitm');
+    expect(toSummary({ ...base, scheme: 'https', client_conn: { tls: true } }, 4).tls).toBe('mitm');
   });
 
   it('reads a websocket summary (handshake id, message count)', () => {

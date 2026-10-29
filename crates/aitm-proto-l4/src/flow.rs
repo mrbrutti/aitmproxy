@@ -146,11 +146,16 @@ pub trait L4FlowStore: Send + Sync {
 
 /// A bounded, in-memory [`L4FlowStore`]. Keeps at most [`Self::DEFAULT_MAX_FLOWS`]
 /// flows (or the cap passed to [`Self::with_capacity`]), evicting the oldest when
-/// full — a testing tool holds bounded, controlled state, never an unbounded sink.
+/// full, **and** at most [`Self::DEFAULT_MAX_PACKETS_PER_FLOW`] packets per flow,
+/// ring-buffering out the oldest packet when a flow is full — a testing tool holds
+/// bounded, controlled state, never an unbounded sink. Without the per-flow cap a
+/// single long `l4.capture` on a busy interface grows one flow's packet log without
+/// limit (the flow-count cap alone does not bound it).
 #[derive(Debug)]
 pub struct InMemoryL4FlowStore {
     inner: Mutex<Inner>,
     max_flows: usize,
+    max_packets_per_flow: usize,
 }
 
 #[derive(Debug, Default)]
@@ -164,18 +169,32 @@ impl InMemoryL4FlowStore {
     /// Default retained-flow ceiling.
     pub const DEFAULT_MAX_FLOWS: usize = 4096;
 
-    /// A store with the default capacity.
+    /// Default retained-packet ceiling **per flow**. Bounds a single long capture's
+    /// packet log: once a flow holds this many packets, `append_packet` evicts the
+    /// oldest to make room for the newest (ring-buffer).
+    pub const DEFAULT_MAX_PACKETS_PER_FLOW: usize = 65_536;
+
+    /// A store with the default capacities.
     #[must_use]
     pub fn new() -> Self {
         Self::with_capacity(Self::DEFAULT_MAX_FLOWS)
     }
 
-    /// A store that retains at most `max_flows` flows (clamped to at least 1).
+    /// A store that retains at most `max_flows` flows (clamped to at least 1), with the
+    /// default per-flow packet cap.
     #[must_use]
     pub fn with_capacity(max_flows: usize) -> Self {
+        Self::with_limits(max_flows, Self::DEFAULT_MAX_PACKETS_PER_FLOW)
+    }
+
+    /// A store that retains at most `max_flows` flows and at most
+    /// `max_packets_per_flow` packets per flow (each clamped to at least 1).
+    #[must_use]
+    pub fn with_limits(max_flows: usize, max_packets_per_flow: usize) -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
             max_flows: max_flows.max(1),
+            max_packets_per_flow: max_packets_per_flow.max(1),
         }
     }
 }
@@ -212,9 +231,15 @@ impl L4FlowStore for InMemoryL4FlowStore {
     }
 
     fn append_packet(&self, id: L4FlowId, pkt: L4Packet) {
+        let max = self.max_packets_per_flow;
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(flow) = inner.flows.get_mut(&id) {
             flow.packets.push(pkt);
+            // Ring-buffer: a long capture never grows one flow's log without bound —
+            // past the cap, the oldest packet is evicted to make room for the newest.
+            while flow.packets.len() > max {
+                flow.packets.remove(0);
+            }
         }
     }
 }
@@ -283,6 +308,27 @@ mod tests {
         assert!(store.get(ghost).is_none());
         store.append_packet(ghost, injected_packet()); // must not panic
         assert!(store.list().is_empty());
+    }
+
+    /// I11 — the per-flow packet log is bounded: past the per-flow cap the oldest
+    /// packet is ring-buffered out, so a single long capture can never grow one flow
+    /// without limit. The retained packets are the newest `cap`, newest last.
+    #[test]
+    fn per_flow_packet_log_is_bounded() {
+        let store = InMemoryL4FlowStore::with_limits(16, 2);
+        let id = store.insert(craft_flow());
+
+        for marker in 0u8..5 {
+            let mut pkt = injected_packet();
+            pkt.bytes = vec![marker]; // a distinguishable per-packet marker
+            store.append_packet(id, pkt);
+        }
+
+        let flow = store.get(id).expect("flow present");
+        assert_eq!(flow.packets.len(), 2, "the per-flow cap holds");
+        // Only the two newest survive, in arrival order (markers 3 then 4).
+        assert_eq!(flow.packets[0].bytes, vec![3]);
+        assert_eq!(flow.packets[1].bytes, vec![4]);
     }
 
     /// Bounded storage: past capacity the oldest flow is evicted, newest kept,

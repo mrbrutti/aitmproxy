@@ -1,0 +1,30 @@
+id: reflected-xss-search-q
+info:
+  name: Reflected XSS in search 'q' parameter
+  severity: high
+  description: The 'q' parameter is reflected unescaped into the HTML response.
+  reference:
+    - https://owasp.org/www-community/attacks/xss/
+  cwe: CWE-79
+  tags: [xss, reflected]
+
+variables:
+  - name: target
+    description: Base URL of the vulnerable app
+    required: true
+  - name: param
+    default: q
+    description: Reflected query parameter
+
+steps:
+  - http:
+      method: GET
+      url: "{{target}}/search?{{param}}=x"
+      matchers:
+        - type: status
+          status: 200
+
+success:
+  all:
+    - type: status
+      status: 200

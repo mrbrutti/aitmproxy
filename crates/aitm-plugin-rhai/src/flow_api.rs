@@ -199,13 +199,18 @@ fn register_request(engine: &mut Engine) {
             |r: &mut ScriptRequest, v: ImmutableString| -> ScriptResult {
                 let current: String = r.read(|q| q.url.clone());
                 let url = same_origin_url(&current, &v)?;
+                let (_, target) = split_origin(&url);
+                check_request_target(target)?;
                 r.edit(|q| q.url = url)
             },
         )
         .register_get_set(
             "path",
             |r: &mut ScriptRequest| -> ImmutableString { r.read(|q| q.path.as_str().into()) },
-            |r: &mut ScriptRequest, v: ImmutableString| r.edit(|q| q.path = v.to_string()),
+            |r: &mut ScriptRequest, v: ImmutableString| -> ScriptResult {
+                check_request_target(&v)?;
+                r.edit(|q| q.path = v.to_string())
+            },
         )
         .register_get("query", |r: &mut ScriptRequest| {
             ScriptHeaders(Arc::clone(&r.0), HeaderSide::RequestQuery)
@@ -387,6 +392,38 @@ impl ScriptHeaders {
 
     fn set(&self, key: &str, value: &str) -> ScriptResult {
         let side = self.1;
+        // A header name/value with a stray control character (notably CR/LF) is
+        // dropped silently when the host writes the flow back through
+        // `HeaderMap::try_set`. Refuse it here with a catchable error so the
+        // script learns its header never reached the wire, the way `http.send`
+        // does.
+        if matches!(
+            side,
+            HeaderSide::RequestHeaders | HeaderSide::ResponseHeaders
+        ) {
+            if !aitm_core::header::is_valid_name(key) {
+                return Err(error(format!(
+                    "flow header name \"{}\" is not a valid HTTP token; the set is refused",
+                    key.escape_default()
+                )));
+            }
+            if !aitm_core::header::is_valid_value(value) {
+                return Err(error(format!(
+                    "flow header \"{}\" has a control character or stray whitespace in its value; \
+                     the set is refused",
+                    key.escape_default()
+                )));
+            }
+        } else if matches!(side, HeaderSide::RequestQuery) {
+            // A query key/value is concatenated into the live request line
+            // (`path?k=v`) by `join_path_query` with no percent-encoding, so a
+            // CR/LF, space or other control byte would split the request line
+            // exactly as a bad path would (the original C2 smuggling vector was
+            // only closed for the path/url setters). Refuse it here with a
+            // catchable error; an author who needs such a byte percent-encodes it.
+            check_request_target(key)?;
+            check_request_target(value)?;
+        }
         self.edit(|pairs| set_pair(pairs, side, key, value))
     }
 
@@ -487,6 +524,23 @@ fn is_token(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// Reject a request target (the path and query) that would split the request
+/// line: a space or any control byte — CR, LF, `0x00`–`0x1F`, or `0x7F`. The
+/// live wire encoder formats `"{method} {path} HTTP/1.1"` with no CR/LF strip,
+/// so such a byte in `flow.request.path` / `.url` smuggles a header or a whole
+/// second request from an `on_request` hook. This is the same check
+/// `http.send`'s `parse_request` runs on its path (`host_net.rs`).
+fn check_request_target(target: &str) -> ScriptResult {
+    if target.bytes().any(|b| b <= b' ' || b == 0x7f) {
+        return Err(error(format!(
+            "flow.request path \"{}\" has a space or control character; it would split the \
+             request line. Percent-encode it.",
+            target.escape_default()
+        )));
+    }
+    Ok(())
 }
 
 /// The URL a `flow.request.url = …` write stores: a bare path (and query) is

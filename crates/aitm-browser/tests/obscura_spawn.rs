@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use aitm_browser::obscura::{discover_binary, probe, SCRUBBED_ENV};
 use aitm_browser::{BrowserConfig, ObscuraProcess};
-use aitm_core::ObscuraConfig;
+use aitm_core::{ObscuraConfig, SsrfPolicy};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -56,6 +56,10 @@ impl Drop for TempDir {
 /// M2-AC7, M2-AC16 — the spawned argv is exactly the spec's `serve …` line,
 /// the CA is passed as the certificate *file* (never the directory or the key),
 /// and every proxy/trust env var the operator's shell carries is removed.
+///
+/// Audit I15 — under the default strict SSRF policy (`block_private = true`) the
+/// `--allow-private-network` flag is **omitted**: the engine refuses private and
+/// loopback targets on its own, mirroring policy.
 #[test]
 fn command_argv_and_env() {
     for var in SCRUBBED_ENV {
@@ -66,6 +70,10 @@ fn command_argv_and_env() {
         proxy_addr: "127.0.0.1:18081".parse().expect("socket addr"),
         ..BrowserConfig::default()
     };
+    assert!(
+        config.ssrf.block_private,
+        "default policy must block private targets"
+    );
     let ca_dir = Path::new("/var/aitm/ca");
     let ca_cert = ca_dir.join("ca.crt");
     let ready_file = Path::new("/tmp/aitm-ready-42");
@@ -93,11 +101,14 @@ fn command_argv_and_env() {
             "http://127.0.0.1:18081",
             "--ca-cert",
             "/var/aitm/ca/ca.crt",
-            "--allow-private-network",
             "--ready-file",
             "/tmp/aitm-ready-42",
         ]
         .map(OsStr::new)
+    );
+    assert!(
+        !args.contains(&OsStr::new("--allow-private-network")),
+        "strict policy must omit --allow-private-network: {args:?}"
     );
 
     // The certificate file is in argv; the directory alone and the key are not.
@@ -118,6 +129,37 @@ fn command_argv_and_env() {
     for var in SCRUBBED_ENV {
         std::env::remove_var(var);
     }
+}
+
+/// Audit I15 — when the operator relaxes the policy to permit private targets
+/// (`block_private = false`), the `--allow-private-network` flag is passed, so
+/// the engine's own posture matches the loosened policy.
+#[test]
+fn command_passes_allow_private_network_when_policy_permits() {
+    let config = BrowserConfig {
+        ssrf: SsrfPolicy {
+            block_private: false,
+            ..SsrfPolicy::default()
+        },
+        ..BrowserConfig::default()
+    };
+
+    let cmd = ObscuraProcess::command(
+        &config,
+        Path::new("/opt/aitm/obscura"),
+        Path::new("/var/aitm/ca/ca.crt"),
+        19222,
+        Path::new("/tmp/aitm-ready-42"),
+    );
+    let args: Vec<String> = cmd
+        .as_std()
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        args.iter().any(|a| a == "--allow-private-network"),
+        "permissive policy must pass --allow-private-network: {args:?}"
+    );
 }
 
 /// M2-AC6 — a binary whose `--help` lacks `--ca-cert` is refused by name, and

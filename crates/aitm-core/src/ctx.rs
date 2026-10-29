@@ -58,6 +58,12 @@ pub enum Frontend {
     Cli,
     /// An agent over MCP.
     Mcp,
+    /// A human operator over MCP (an operator-token connection, e.g. the
+    /// `aitm-mac`/`aitm-web`/`aitm-tui` surfaces). Distinct from [`Frontend::Mcp`]
+    /// so policy and confirmation decisions can treat a present human differently
+    /// from an autonomous agent. The role stays `Copy`; the human-readable client
+    /// label rides [`CommandHost`] separately.
+    Operator,
 }
 
 /// Core services a command may use, without depending on any protocol crate.
@@ -69,6 +75,7 @@ pub struct CommandHost<'a> {
     ssrf: crate::config::SsrfPolicy,
     poc_dir: Option<std::path::PathBuf>,
     frontend: Frontend,
+    client_label: Option<String>,
     config: Option<std::sync::Arc<crate::config::Config>>,
 }
 
@@ -93,6 +100,7 @@ impl<'a> CommandHost<'a> {
             // The gated posture: a host that did not declare itself the human
             // CLI is treated as agent-driven.
             frontend: Frontend::Mcp,
+            client_label: None,
             config: None,
         }
     }
@@ -124,6 +132,20 @@ impl<'a> CommandHost<'a> {
     /// The frontend invoking the command; [`Frontend::Mcp`] when never set.
     pub fn frontend(&self) -> Frontend {
         self.frontend
+    }
+
+    /// Attach the connection's human-readable client label (from
+    /// `initialize.clientInfo.name`, e.g. `aitm-mac`). Carried for audit only;
+    /// policy and confirmation decisions key off [`CommandHost::frontend`], not
+    /// this label.
+    pub fn with_client_label(mut self, label: impl Into<String>) -> Self {
+        self.client_label = Some(label.into());
+        self
+    }
+
+    /// The connection's client label, if one was declared (`None` otherwise).
+    pub fn client_label(&self) -> Option<&str> {
+        self.client_label.as_deref()
     }
 
     /// Confine `poc.run` to loading PoC files under `dir` (opt-in). `None` leaves

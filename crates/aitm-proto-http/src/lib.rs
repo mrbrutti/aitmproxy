@@ -10,4 +10,4 @@ mod translate;
 pub use ca::{CertAuthority, LeafCert};
 pub use module::HttpModule;
 pub use sansio::{Http1Machine, HttpSansIoEvent, HttpStateMachine, Side};
-pub use sender::Http1Sender;
+pub use sender::{HostResolver, Http1Sender};

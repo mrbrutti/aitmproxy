@@ -124,3 +124,58 @@ fn rfc3339_parses() {
     assert_eq!(parsed.nanosecond(), 0);
     assert!(parsed.year() >= 2026);
 }
+
+// ------------------------------------------------- F2 subset (M4 Task 8)
+
+use aitm_ca::audit::entry_to_jsonl;
+use aitm_core::{AuditEntry, AuditResult, AuditRing, AuditSink, Frontend};
+use std::time::SystemTime;
+
+/// A core F2 audit entry for a `ca.status` invocation.
+fn ca_status_entry() -> AuditEntry {
+    AuditEntry {
+        at: SystemTime::now(),
+        origin: Frontend::Mcp,
+        client_label: Some("aitm-mac".to_string()),
+        command: "ca.status".to_string(),
+        args_summary: "{}".to_string(),
+        result: AuditResult::Ok,
+    }
+}
+
+/// AC-M4-6b / spec D3a.2: a `ca.*` invocation appears in the always-on in-memory
+/// ring and, with durable audit on, in the CA plugin's JSONL — routed through the
+/// core `AuditSink`, so CA entries are a subset of **one** format, not a second
+/// log shape.
+#[test]
+fn ca_audit_is_a_subset() {
+    let entry = ca_status_entry();
+
+    // In the always-on ring.
+    let ring = AuditRing::default();
+    ring.append(entry.clone());
+    let recent = ring.recent(None, None);
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].command, "ca.status");
+
+    // And in the durable JSONL, via the CA's `FileAuditLog` as a core `AuditSink`.
+    let dir = scratch("subset");
+    let path = dir.join("audit.jsonl");
+    let log = FileAuditLog::new(path.clone());
+    AuditLog::open(&log).unwrap();
+    AuditSink::append(&log, entry.clone());
+
+    let contents = fs::read_to_string(&path).unwrap();
+    assert!(contents.ends_with('\n'), "append-only JSONL line");
+    let line = contents.lines().next().expect("one durable line");
+    let value: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert_eq!(value["command"], "ca.status");
+    assert_eq!(value["origin"], "mcp");
+    assert_eq!(value["result"], "ok");
+    assert_eq!(value["client_label"], "aitm-mac");
+
+    // The durable line is exactly the one shared format (same renderer), so the
+    // ring and the JSONL agree field for field.
+    let expected: serde_json::Value = serde_json::from_str(&entry_to_jsonl(&entry)).unwrap();
+    assert_eq!(value, expected);
+}

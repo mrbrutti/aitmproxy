@@ -18,16 +18,16 @@ use std::sync::{Arc, OnceLock};
 use aitm_browser::BrowserPlugin;
 use aitm_ca::CaPlugin;
 use aitm_core::{
-    ActionPermit, Config, GuardError, Plugin, ProtocolModule, Proxy, Registry, ScopeEntry,
-    ScopeRateGuard,
+    ActionPermit, AgentState, AuditRing, Config, GuardError, Plugin, ProtocolModule, Proxy,
+    Registry, ScopeEntry, ScopeRateGuard,
 };
 use aitm_plugin_maprules::MapRulesPlugin;
 use aitm_plugin_passthrough::{PassthroughList, PassthroughModule, PassthroughPlugin};
 use aitm_plugin_sessionio::SessionIoPlugin;
 use aitm_plugin_wsctl::WsCtlPlugin;
 use aitm_plugins::{
-    CapturePlugin, ControlPlugin, DetailPlugin, InterceptPlugin, MetaPlugin, MutatePlugin,
-    RateLimitPlugin, ReplayPlugin, ScopePlugin,
+    AgentPlugin, CapturePlugin, ControlPlugin, DetailPlugin, InterceptPlugin, MetaPlugin,
+    MutatePlugin, RateLimitPlugin, ReplayPlugin, ScopePlugin, SubscriptionPlugin,
 };
 use aitm_proto_http::{CertAuthority, HttpModule};
 use aitm_proto_l4::config::L4Config;
@@ -72,6 +72,19 @@ pub struct Assembled {
     /// Set `true` once the proxy is actually serving, so `proxy.status.listening`
     /// is honest (a one-shot `aitm proxy status` that never serves reports `false`).
     pub listening: Arc<std::sync::atomic::AtomicBool>,
+    /// The agent policy state, seeded from `cfg.mcp.policy` and shared with the
+    /// `AgentPlugin` already registered; hand it to `McpServer::with_agent_state`
+    /// so the server's policy gate reads the same policy `agent.set` writes.
+    pub agent_state: Arc<AgentState>,
+    /// The F4 push broadcast: the `SubscriptionPlugin` registered in the chain
+    /// forwards lifecycle events to it; hand it to `McpServer::with_push` so the
+    /// server's dispatcher fans `notifications/aitm/flow` to subscribers.
+    pub push_tx: tokio::sync::broadcast::Sender<aitm_core::Event>,
+    /// The F2 command-invocation audit ring, shared with the `AgentPlugin`
+    /// already registered (which serves `agent.activity`/`agent.status` from it);
+    /// hand it to `McpServer::with_audit_ring` so the server's `call_tool` records
+    /// into the same ring.
+    pub audit_ring: Arc<AuditRing>,
 }
 
 /// The scripting tier, ready to take its place in the chain (M3 spec §8).
@@ -85,9 +98,12 @@ pub struct ScriptWiring {
     /// Runs a PoC's `script` steps. `None` leaves `poc.run` declarative-only,
     /// erroring on a `script` step rather than skipping it.
     pub executor: Option<Arc<dyn aitm_poc::ScriptStepExecutor>>,
-    /// The tier's command plugin (`script.validate`, `script.reload`,
-    /// `findings.list`), registered among the command providers.
-    pub commands: Option<Box<dyn Plugin>>,
+    /// Command-provider plugins registered after the first-party ones, in order.
+    /// The binary fills this with the rhai tier's commands (`script.validate`,
+    /// `script.reload`, `script.findings`) **and** the persistent findings store
+    /// (`findings.record`/`get`/`remove`/`list`); each registers its own
+    /// commands, so the slot holds as many providers as a deployment wires.
+    pub commands: Vec<Box<dyn Plugin>>,
 }
 
 /// Assemble the proxy from configuration with the default feature set.
@@ -134,6 +150,10 @@ pub fn assemble_with_scripts(
     let armed = intercept.armed_flag();
     let listening = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // The F4 push tap: a chain plugin forwards lifecycle events to this broadcast,
+    // which the MCP server's dispatcher drains into per-connection push sinks.
+    let (push_tx, _push_rx) = tokio::sync::broadcast::channel(aitm_mcp::DEFAULT_BROADCAST_CAPACITY);
+
     // M6 shared handles. The WS control plugin and the live WS module share one
     // inject registry so `ws.send` reaches a conversation's `select!` loop; the
     // passthrough plugin and its protocol module share one host list so a
@@ -165,6 +185,9 @@ pub fn assemble_with_scripts(
         // First-party plugins, in chain order. Intercept precedes mutate so a
         // request is parked before mutate would act (data-flow 2).
         .register_plugin(Box::new(CapturePlugin::new()))
+        // The subscription tap sits right after capture so it sees every captured
+        // flow (the summary is rendered from the store at dispatch time).
+        .register_plugin(Box::new(SubscriptionPlugin::new(push_tx.clone())))
         .register_plugin(Box::new(DetailPlugin::new()))
         .register_plugin(Box::new(MetaPlugin::new()))
         .register_plugin(Box::new(ReplayPlugin::new()))
@@ -185,9 +208,10 @@ pub fn assemble_with_scripts(
         // the core feature plugins and before the scripts, so a script sees a
         // flow once map rewrites and WS parks have acted.
         .register_plugin(Box::new(wsctl))
-        .register_plugin(Box::new(SessionIoPlugin::new(
-            cfg.session_io.allow_agent_file_io,
-        )))
+        .register_plugin(Box::new(
+            SessionIoPlugin::new(cfg.session_io.allow_agent_file_io)
+                .with_session_root(cfg.session_io.root.clone()),
+        ))
         .register_plugin(Box::new(passthrough))
         .register_plugin(Box::new(maprules));
     // Scripts take their chain positions here: after every native plugin that
@@ -195,14 +219,24 @@ pub fn assemble_with_scripts(
     for plugin in scripts.plugins {
         builder = builder.register_plugin(plugin);
     }
+    // The agent policy state, shared between the `AgentPlugin` (agent.status/set)
+    // and the MCP server's policy gate; seeded from config.
+    let agent_state = Arc::new(AgentState::new(cfg.mcp.policy));
+    // The F2 audit ring, shared between the `AgentPlugin` (agent.activity /
+    // agent.status.actions_last_minute) and the MCP server's `call_tool`, which
+    // appends one entry per invocation.
+    let audit_ring = Arc::new(AuditRing::default());
     builder = builder
-        // Command providers: the browser, poc and ca commands.
+        // Command providers: the browser, poc, ca and agent commands.
         .register_plugin(Box::new(BrowserPlugin::new(cfg.browser.ssrf.clone())))
         .register_plugin(Box::new(PocCommands {
             executor: scripts.executor,
         }))
-        .register_plugin(Box::new(ca_plugin));
-    if let Some(commands) = scripts.commands {
+        .register_plugin(Box::new(ca_plugin))
+        .register_plugin(Box::new(
+            AgentPlugin::new(agent_state.clone()).with_audit_ring(audit_ring.clone()),
+        ));
+    for commands in scripts.commands {
         builder = builder.register_plugin(commands);
     }
 
@@ -241,6 +275,9 @@ pub fn assemble_with_scripts(
         proxy,
         ca,
         listening,
+        agent_state,
+        push_tx,
+        audit_ring,
     })
 }
 

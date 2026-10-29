@@ -349,9 +349,11 @@ pub enum Pane {
     Response,
 }
 
-/// Inspector tabs, in the foundation's order (§2.7). `Cookies`, `Timing` and
-/// `Set-Cookie` wait on core follow-up F5 and render disabled with that label
-/// (see [`tab_follow_up`]); they are listed so the absence is never silent.
+/// Inspector tabs, in the foundation's order (§2.7). `Cookies` and
+/// `Set-Cookie` parse the served `Cookie:` / `Set-Cookie:` headers and render
+/// live. Only `Timing` waits on core follow-up F5 and renders disabled with
+/// that label (see [`tab_follow_up`]); it is listed so the absence is never
+/// silent.
 pub const REQUEST_TABS: [&str; 8] = [
     "Headers",
     "Cookies",
@@ -375,7 +377,7 @@ pub const RESPONSE_TABS: [&str; 7] = [
 /// The core follow-up a tab waits on, if any.
 pub fn tab_follow_up(tab: &str) -> Option<&'static str> {
     match tab {
-        "Cookies" | "Timing" | "Set-Cookie" => Some("F5"),
+        "Timing" => Some("F5"),
         _ => None,
     }
 }
