@@ -54,7 +54,6 @@ em.hint { font-style: italic; }
   transition: transform var(--dur) var(--ease-out), background-color var(--dur) var(--ease-out);
 }
 .btn:hover { background: var(--ink-2); }
-.btn:active { transform: translateY(1px); }
 .btn--ghost { background: transparent; color: var(--ink); border-color: var(--hairline); }
 .btn--ghost:hover { background: var(--paper-2); }
 .btn--signal { background: var(--signal); color: var(--signal-ink); border-color: var(--signal); }
@@ -75,7 +74,7 @@ em.hint { font-style: italic; }
   color: var(--ink);
 }
 .copy:hover { background: var(--paper-2); }
-.copy svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 1.5; }
+.copy svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; overflow: visible; }
 .copy[data-done] .copy-label::after { content: "Copied"; }
 .copy .copy-label::after { content: "Copy"; }
 
@@ -210,20 +209,24 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
 .hero .display { text-wrap: wrap; max-width: 20ch; }
 .hero .lead { margin-top: 1.25rem; }
 
-/* hero entrance: lines rise, then the sentence and actions fade up (rupu cadence) */
+/* hero entrance: lines rise, the sentence fades up, the wire draws itself (wire.js),
+   and only then the operators and the actions arrive — one cadence, once */
 .hero .display .line { display: block; overflow: hidden; padding-bottom: 0.06em; margin-bottom: -0.06em; }
 .hero .display .line > span { display: block; translate: 0 112%; animation: rise 900ms var(--ease-out) forwards; }
 .hero .display .line:nth-child(2) > span { animation-delay: 100ms; }
 @keyframes rise { to { translate: 0 0; } }
 .hero .lead { animation: fade-up 700ms var(--ease-out) 360ms backwards; }
-.hero .hero-cta { animation: fade-up 700ms var(--ease-out) 440ms backwards; }
-.hero .hero-foot { animation: fade-up 700ms var(--ease-out) 520ms backwards; }
+.hero .operators { animation: fade-up 700ms var(--ease-out) 1200ms backwards; }
+.hero .hero-cta { animation: fade-up 700ms var(--ease-out) 1350ms backwards; }
+.hero .hero-foot { animation: fade-up 700ms var(--ease-out) 1450ms backwards; }
 @keyframes fade-up { from { opacity: 0; translate: 0 12px; } }
+@keyframes word-in { from { opacity: 0; translate: 0 3px; } }
 
-.wire { display: flex; align-items: center; margin-top: clamp(2rem, 4vw, 3.25rem); margin-inline: calc(-1 * var(--margin)); }
+.wire { position: relative; display: flex; align-items: center; margin-top: clamp(2rem, 4vw, 3.25rem); margin-inline: calc(-1 * var(--margin)); --wire-pad: 72px; }
 .wire-end { flex: none; padding-inline: var(--margin) 1rem; font-style: italic; font-size: var(--fs-small); color: var(--ink-2); }
 .wire-end--server { padding-inline: 1rem var(--margin); }
-.wire-seg { position: relative; flex: 1 1 0; height: 2px; background: var(--ink); min-width: 2rem; }
+.wire-seg { position: relative; flex: 1 1 0; height: 2px; background: var(--ink); min-width: 2rem; transform-origin: 0 50%; }
+.wire-seg--out { transform-origin: 100% 50%; }
 .wire-seg--in::after, .wire-seg--out::before {
   content: ""; position: absolute; top: 50%; width: 2px; height: 1.25rem; margin-top: -0.625rem;
   background: var(--signal); opacity: 0;
@@ -232,6 +235,14 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
 .wire-seg--out::before { left: 0; }
 .packet-track { position: absolute; inset: 0; transform: translateX(-100%); }
 .packet { position: absolute; right: -6px; top: 50%; width: 12px; height: 12px; margin-top: -6px; border-radius: 50%; background: var(--ink); }
+
+/* the light layer: wire.js draws the comet, its trail, the blooms and the gather here.
+   Decorative only; the DOM underneath is the scene's source of truth. */
+.wire-canvas {
+  position: absolute; z-index: 2; pointer-events: none;
+  left: calc(-1 * var(--wire-pad)); top: calc(-1 * var(--wire-pad));
+  width: calc(100% + 2 * var(--wire-pad)); height: calc(100% + 2 * var(--wire-pad));
+}
 
 .held { flex: 0 1 auto; width: min(36rem, 56vw); margin-inline: 1.5rem; font-family: var(--mono); font-size: var(--fs-mono); line-height: 1.55; }
 .held-head { display: flex; align-items: baseline; gap: 1rem; padding-bottom: 0.45rem; margin-bottom: 0.45rem; border-bottom: 1px solid var(--hairline); }
@@ -242,50 +253,91 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
 .state::before { content: ""; position: absolute; inset: -1px; background: var(--signal); border-radius: var(--radius); opacity: 0; z-index: -1; }
 .held-body { margin: 0; white-space: pre; overflow-x: auto; }
 .held-body .h { color: var(--ink-2); }
-.held-body .edit { background: var(--signal); padding: 0 0.15em; }
+.held-body .edit { background: var(--signal); padding: 0 0.15em; border-radius: 2px; }
 
-/* ---- the hero wire: a live, looping scene (JS sets data-phase on .wire) ----
-   request arrives → flow is held & armed (amber) → edited → resumed → 200 (green) → loop */
+/* ---- the hero wire: a live, looping scene (wire.js sets data-phase on .wire) ----
+   intro: the wire draws itself and the comet ignites the held flow (first run only)
+   then: arrive → held & armed (amber) → edited → resume → 200 (green) → idle → loop.
+   Without JS there is no data-phase and the scene rests at its end state: held, armed. */
+
+/* intro: the segments grow from their ends (wire.js scales them per frame), the held flow
+   and the labels are not there yet; they gather when the comet lands */
+.wire[data-phase="intro"] .wire-seg { transform: scaleX(0); }
+/* before wire.js has taken over (html.js is set inline, the script arrives a moment later) the
+   wire waits unseen — but only for 2.4s: these animations then show it on their own, so a
+   script that never arrives can never leave it hidden */
+@media (prefers-reduced-motion: no-preference) {
+  .js .hero .wire:not([data-phase]) .wire-seg { animation: seg-wait 1ms linear 2400ms both; }
+  .js .hero .wire:not([data-phase]) .held { animation: held-wait 600ms var(--ease-out) 2400ms both; }
+  .js .hero .wire:not([data-phase]) .wire-end { animation: fade-in 600ms var(--ease-out) 2400ms both; }
+}
+@keyframes seg-wait { from { transform: scaleX(0); } to { transform: none; } }
+@keyframes held-wait { from { opacity: 0; translate: 0 10px; filter: blur(8px); } }
+@keyframes fade-in { from { opacity: 0; } }
+.held { opacity: 1; translate: 0 0; filter: blur(0); transition: opacity 720ms var(--ease-out), translate 720ms var(--ease-out), filter 720ms var(--ease-out); }
+.wire[data-phase="intro"] .held { opacity: 0; translate: 0 10px; filter: blur(8px); }
+.wire-end { transition: opacity 600ms var(--ease-out); }
+.wire[data-phase="intro"] .wire-end { opacity: 0; }
+
+/* the CSS packet: the fallback when the canvas is not there (wire.js hides it otherwise).
+   It carries a glow and a short tail while it moves. */
 .wire-seg .packet-track { --p: -100%; transform: translateX(var(--p)); }
-.wire[data-anim] .wire-seg .packet-track { transition: transform 1100ms var(--ease-out); }
-.packet { opacity: 0; transition: opacity 200ms var(--ease-out); }
-.wire[data-phase] .wire-seg--in .packet { opacity: 1; }
-/* in-packet reaches the cut on arrive and stays through held/edit */
 .wire[data-phase="arrive"] .wire-seg--in .packet-track,
-.wire[data-phase="held"]   .wire-seg--in .packet-track,
-.wire[data-phase="edit"]   .wire-seg--in .packet-track { --p: 0; }
-/* on resume the in-packet is consumed; the out-packet carries the edited request on */
-.wire[data-phase="resume"] .wire-seg--in .packet, .wire[data-phase="done"] .wire-seg--in .packet { opacity: 0; }
+.wire[data-phase="resume"] .wire-seg--out .packet-track { transition: transform 1100ms var(--ease-in-out); }
+.packet { opacity: 0; transition: opacity 240ms var(--ease-out); box-shadow: 0 0 12px color-mix(in srgb, var(--accent) 70%, transparent); }
+.packet::before {
+  content: ""; position: absolute; right: 100%; top: 50%; width: 3rem; height: 2px; margin-top: -1px;
+  background: linear-gradient(90deg, transparent, var(--accent)); opacity: 0; transition: opacity 300ms var(--ease-out);
+}
+.wire[data-phase="arrive"] .wire-seg--in .packet::before, .wire[data-phase="resume"] .wire-seg--out .packet::before { opacity: 0.85; }
+.wire[data-canvas] .packet { display: none; }
+.wire[data-phase="arrive"] .wire-seg--in .packet, .wire[data-phase="held"] .wire-seg--in .packet,
+.wire:not([data-phase]) .wire-seg--in .packet { opacity: 1; }
+.wire[data-phase="arrive"] .wire-seg--in .packet-track, .wire[data-phase="held"] .wire-seg--in .packet-track,
+.wire[data-phase="resume"] .wire-seg--in .packet-track, .wire[data-phase="done"] .wire-seg--in .packet-track,
+.wire:not([data-phase]) .wire-seg--in .packet-track { --p: 0; }
 .wire[data-phase="resume"] .wire-seg--out .packet, .wire[data-phase="done"] .wire-seg--out .packet { opacity: 1; }
-.wire[data-phase="resume"] .wire-seg--out .packet-track,
-.wire[data-phase="done"]   .wire-seg--out .packet-track { --p: 0; }
+.wire[data-phase="resume"] .wire-seg--out .packet-track, .wire[data-phase="done"] .wire-seg--out .packet-track { --p: 0; }
+.wire[data-phase="held"] .wire-seg--in .packet { box-shadow: 0 0 14px color-mix(in srgb, var(--signal) 80%, transparent); }
 
-/* the amber arm ticks flank the cut while the flow is held */
-.wire-seg--in::after, .wire-seg--out::before { opacity: 0; transition: opacity 320ms var(--ease-out); }
-.wire[data-phase="held"] .wire-seg--in::after, .wire[data-phase="edit"] .wire-seg--in::after,
-.wire[data-phase="held"] .wire-seg--out::before, .wire[data-phase="edit"] .wire-seg--out::before { opacity: 1; }
+/* the amber arm ticks flank the cut while the flow is held: they pop in, then fade */
+.wire-seg--in::after, .wire-seg--out::before { opacity: 0; transform: scale(0.2); transition: opacity 280ms var(--ease-out), transform 460ms var(--ease-out); }
+.wire[data-phase="held"] .wire-seg--in::after, .wire[data-phase="held"] .wire-seg--out::before,
+.wire:not([data-phase]) .wire-seg--in::after, .wire:not([data-phase]) .wire-seg--out::before { opacity: 1; transform: none; }
 
-/* the held flow's state badge: armed (amber) → done (green) */
+/* the held flow's state badge: — → armed (amber) → resuming (blue) → 200 (green) */
 .held .state { transition: color 320ms var(--ease-out), border-color 320ms var(--ease-out); }
+.held .state[data-cue="swap"] { animation: word-in 240ms var(--ease-out); }
 .held .state::before { opacity: 0; transition: opacity 320ms var(--ease-out); }
 .held[data-state="armed"] .state::before { opacity: 1; background: var(--signal); }
-.held[data-state="done"]  .state { color: var(--st-ok); border-color: color-mix(in srgb, var(--st-ok) 40%, transparent); }
-/* the edited value lights only while the flow is held */
+.held[data-state="resuming"] .state { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+.held[data-state="done"]  .state { color: var(--st-ok); border-color: color-mix(in srgb, var(--st-ok) 45%, transparent); }
+/* the head's rule warms while the flow is held */
+.held-head { transition: border-color 480ms var(--ease-out); }
+.held[data-state="armed"] .held-head { border-color: color-mix(in srgb, var(--signal) 55%, var(--hairline)); }
+/* the edited value lights only while the flow is held, and blooms once as the edit lands */
 .held .edit { background: transparent; transition: background 320ms var(--ease-out); }
 .held[data-state="armed"] .edit { background: var(--signal); }
-/* a live ring on the armed badge */
-.held[data-state="armed"] .state::after {
-  content: ""; position: absolute; inset: -2px; border-radius: var(--radius-badge);
-  border: 1.5px solid var(--signal); opacity: 0; animation: live-ring 2000ms var(--ease-out) infinite;
-}
-@keyframes live-ring { 0% { opacity: .7; transform: scale(1); } 70% { opacity: 0; transform: scale(1.3); } 100% { opacity: 0; } }
+.held[data-cue="edit"] .edit { animation: edit-bloom 760ms var(--ease-out); }
+@keyframes edit-bloom { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--signal) 60%, transparent); } 100% { box-shadow: 0 0 0 12px transparent; } }
+/* a live ring on the armed badge; one settling ring when it lands 200 */
+.held .state::after { content: ""; position: absolute; inset: -2px; border-radius: calc(var(--radius) + 2px); border: 1.5px solid var(--signal); opacity: 0; }
+.held[data-state="armed"] .state::after { animation: ring-badge 2000ms var(--ease-out) infinite; }
+.held[data-state="done"] .state::after { border-color: var(--st-ok); animation: ring-badge 900ms var(--ease-out) 1; }
+@keyframes ring-badge { 0% { opacity: .7; transform: scale(1); } 70% { opacity: 0; transform: scale(1.3); } 100% { opacity: 0; } }
+@keyframes ring-dot { 0% { opacity: .9; transform: scale(.6); } 100% { opacity: 0; transform: scale(1.9); } }
 
-/* the live dot on captions (showcase, hero) pulses while in view */
-.live { position: relative; }
-.live::after {
+/* the live dot on captions and the listening dot in fragment bars pulse — only while in view
+   (site.js toggles .on from an IntersectionObserver), so nothing loops off screen */
+.live, .ui-bar .dot { position: relative; }
+.frame figcaption .dot.live { color: var(--st-ok); }
+.ui-bar .dot { color: var(--signal); }
+.live::after, .ui-bar .dot::after {
   content: ""; position: absolute; inset: -4px; border-radius: 50%;
-  border: 1px solid currentColor; opacity: 0; animation: live-ring 2200ms var(--ease-out) infinite;
+  border: 1px solid currentColor; opacity: 0;
+  animation: ring-dot 2200ms var(--ease-out) infinite; animation-play-state: paused;
 }
+.live.on::after, .ui-bar .dot.on::after { animation-play-state: running; }
 
 .operators { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap); margin-top: clamp(2rem, 4vw, 3rem); width: min(100%, 60rem); margin-inline: auto; }
 .operator { position: relative; padding-top: 1.25rem; }
@@ -477,29 +529,70 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
 .m-del { color: var(--m-del-fg); background: var(--m-del-bg); }
 .m-ws { color: var(--m-ws-fg); background: var(--m-ws-bg); }
 
+/* ---------- micro-interactions: press, lift, copy ---------- */
+/* buttons: a light lift on hover, a firm press; the press is quicker than the release */
+.btn { transition: transform var(--dur) var(--ease-out), background-color var(--dur) var(--ease-out), box-shadow var(--dur) var(--ease-out); }
+.btn:active { transform: translateY(0) scale(0.97); box-shadow: none; transition-duration: var(--dur-press); }
+@media (hover: hover) and (pointer: fine) {
+  .btn:hover { transform: translateY(-1px); box-shadow: var(--shadow-lift); }
+  .btn:hover:active { transform: translateY(0) scale(0.97); box-shadow: none; }
+}
+/* copy: the clipboard glyph gives way to a check that draws itself; the word swaps */
+.copy { transition: background-color var(--dur) var(--ease-out), color var(--dur) var(--ease-out), transform var(--dur-press) var(--ease-out); }
+.copy:active { transform: scale(0.95); }
+.copy svg :not(.chk) { transition: opacity 140ms var(--ease-out); }
+.copy svg .chk { stroke-dasharray: 14; stroke-dashoffset: 14; opacity: 0; stroke-width: 1.75; }
+.copy[data-done] { color: var(--st-ok); }
+.copy[data-done] svg :not(.chk) { opacity: 0; }
+.copy[data-done] svg .chk { opacity: 1; stroke-dashoffset: 0; transition: stroke-dashoffset 380ms var(--ease-out) 60ms, opacity 80ms var(--ease-out); }
+.copy[data-done] .copy-label { display: inline-block; animation: word-in 240ms var(--ease-out); }
 /* card hover lift — resting fragments have no shadow (app rule); hover earns one */
 @media (hover: hover) and (pointer: fine) {
-  .feature .ui, .face .ui, .lang-intro + .code, .feat .ui {
-    transition: box-shadow var(--dur) var(--ease-out), transform var(--dur) var(--ease-out), border-color var(--dur) var(--ease-out);
+  .feature .ui, .face .ui, .lang-intro + .code, .feat .ui, .feature .pair {
+    transition: box-shadow 260ms var(--ease-out), transform 260ms var(--ease-out), border-color 260ms var(--ease-out);
   }
-  .feature:hover .ui, .face:hover .ui { box-shadow: var(--shadow-lift); transform: translateY(-2px); border-color: var(--control); }
+  .feature:hover .ui, .face:hover .ui, .feature:hover .pair { box-shadow: var(--shadow-lift); transform: translateY(-2px); border-color: var(--control); }
   .feature a, .lang-intro a { transition: color var(--dur) var(--ease-out); }
-  .frame { transition: box-shadow var(--dur) var(--ease-out); }
-  .shot-grid .frame:hover { box-shadow: var(--shadow-float); }
+  .frame { transition: box-shadow 320ms var(--ease-out), transform 320ms var(--ease-out); }
+  .shot-grid .frame:hover, .face .frame:hover { box-shadow: var(--shadow-float); transform: translateY(-2px); }
+  .arrow::after { display: inline-block; transition: translate var(--dur) var(--ease-out); }
+  .arrow:hover::after { translate: 3px 0; }
 }
-.btn:active { transform: scale(0.98); }
-.ui-bar .dot { transition: none; }
 
-/* ---------- motion: subtle, authored reveals (feedback, not spectacle) ---------- */
+/* ---------- motion: subtle, authored reveals (feedback, not spectacle) ----------
+   Everything here is gated on html.js (set inline in <head>) and on the motion preference,
+   so content is never hidden when scripts or animation do not run. */
 @media (prefers-reduced-motion: no-preference) {
-  [data-reveal] { opacity: 0; transform: translateY(14px); }
-  [data-reveal].in {
-    opacity: 1; transform: none;
-    transition: opacity var(--dur-reveal) var(--ease-out), transform var(--dur-reveal) var(--ease-out);
+  .js [data-reveal] {
+    opacity: 0; transform: translateY(16px);
+    transition: opacity 760ms var(--ease-out), transform 760ms var(--ease-out);
   }
-  [data-reveal][data-d="1"].in { transition-delay: 60ms; }
-  [data-reveal][data-d="2"].in { transition-delay: 120ms; }
-  [data-reveal][data-d="3"].in { transition-delay: 180ms; }
+  .js [data-reveal].in { opacity: 1; transform: none; }
+  .js [data-reveal][data-d="1"] { transition-delay: 80ms; }
+  .js [data-reveal][data-d="2"] { transition-delay: 160ms; }
+  .js [data-reveal][data-d="3"] { transition-delay: 240ms; }
+
+  /* a drawn figure: the block stays put, its strokes draw in (hand and agent meet the audit log) */
+  .js [data-reveal][data-fx="draw"] { opacity: 1; transform: none; }
+  .js [data-fx="draw"] :is(path, line) { stroke-dasharray: 1; stroke-dashoffset: 1; transition: stroke-dashoffset 1100ms var(--ease-in-out); }
+  .js [data-fx="draw"].in :is(path, line) { stroke-dashoffset: 0; }
+  .js [data-fx="draw"].in .sig { transition-delay: 800ms; transition-duration: 600ms; }
+  .js [data-fx="draw"] text { opacity: 0; transition: opacity 500ms var(--ease-out); }
+  .js [data-fx="draw"].in text { opacity: 1; }
+  .js [data-fx="draw"].in text:last-of-type { transition-delay: 1100ms; }
+
+  /* the lifecycle line: the line draws, each station lands on it, the arrow and the drop arrive last */
+  .js [data-reveal][data-fx="line"] { opacity: 1; transform: none; }
+  .js [data-fx="line"] .life-line { background: linear-gradient(var(--ink), var(--ink)) left / 0% 100% no-repeat; transition: background-size 1200ms var(--ease-in-out) 100ms; }
+  .js [data-fx="line"].in .life-line { background-size: 100% 100%; }
+  .js [data-fx="line"] .life-line::after { opacity: 0; transition: opacity 320ms var(--ease-out) 1100ms; }
+  .js [data-fx="line"].in .life-line::after { opacity: 1; }
+  .js [data-fx="line"] .station::before { transform: scale(0); transition: transform 520ms var(--ease-out); }
+  .js [data-fx="line"].in .station:nth-child(1)::before { transform: none; transition-delay: 150ms; }
+  .js [data-fx="line"].in .station:nth-child(2)::before { transform: none; transition-delay: 600ms; }
+  .js [data-fx="line"].in .station:nth-child(3)::before { transform: none; transition-delay: 1050ms; }
+  .js [data-fx="line"] .station--held::after, .js [data-fx="line"] .drop-label { opacity: 0; transition: opacity 420ms var(--ease-out) 1200ms; }
+  .js [data-fx="line"].in .station--held::after, .js [data-fx="line"].in .drop-label { opacity: 1; }
 
   /* the armed-intercept dot pulses, like the app's intercept bar */
   .pulse { position: relative; }
@@ -509,6 +602,10 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
     animation: pulse 2000ms var(--ease-out) 1600ms infinite;
   }
   @keyframes pulse { 0% { opacity: 0.7; transform: scale(1); } 70% { opacity: 0; transform: scale(1.35); } 100% { opacity: 0; } }
+
+  /* inner pages share the hero's cadence: the title, then the lead */
+  .page-head .display, .article > .display { animation: fade-up 700ms var(--ease-out) backwards; }
+  .page-head .lead, .article > .lead { animation: fade-up 700ms var(--ease-out) 120ms backwards; }
 }
 
 /* ---------- responsive ---------- */
@@ -547,12 +644,16 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
   .wire { flex-direction: column; align-items: stretch; margin-inline: 0; }
   .wire-end { padding: 0 0 0.5rem; text-align: center; }
   .wire-end--server { padding: 0.5rem 0 0; }
-  .wire-seg { flex: none; height: 4.5rem; width: 2px; margin-inline: auto; min-width: 0; }
+  .wire-seg { flex: none; height: 4.5rem; width: 2px; margin-inline: auto; min-width: 0; transform-origin: 50% 0; }
+  .wire-seg--out { transform-origin: 50% 100%; }
+  .wire[data-phase="intro"] .wire-seg { transform: scaleY(0); }
   .wire-seg--in::after, .wire-seg--out::before { width: 1.25rem; height: 2px; margin: 0 0 0 -0.625rem; top: auto; left: 50%; }
   .wire-seg--in::after { bottom: 0; right: auto; }
   .wire-seg--out::before { top: 0; }
   .wire-seg .packet-track { transform: translateY(var(--p)); }
   .packet { right: auto; top: auto; bottom: -6px; left: 50%; margin: 0 0 0 -6px; }
+  .packet::before { right: auto; top: auto; bottom: 100%; left: 50%; width: 2px; height: 3rem; margin: 0 0 0 -1px; background: linear-gradient(180deg, transparent, var(--accent)); }
+  .wire { --wire-pad: 48px; }
   .held { width: 100%; margin-inline: 0; font-size: var(--fs-mono-s); }
   .operators { grid-template-columns: 1fr; }
   .operator code, .pair-row code { white-space: pre-wrap; word-break: break-word; }
@@ -579,11 +680,16 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
   .audit th:first-child, .audit td.t { display: none; }
 }
 
+/* ---------- reduced motion: the scene rests at its end state; nothing loops, nothing travels ---------- */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.001ms !important; animation-delay: 0ms !important; transition-duration: 0.001ms !important; animation-iteration-count: 1 !important; }
+  .wire-seg, .held, .wire-end { transform: none !important; opacity: 1 !important; filter: none !important; translate: none !important; }
   .wire-seg--in .packet-track { --p: 0; }
-  .wire-seg--in .packet { opacity: 1; }
-  .wire-seg--in::after, .wire-seg--out::before { opacity: 1; }
+  .wire-seg--in .packet { opacity: 1; box-shadow: none; }
+  .wire-seg--in .packet::before { display: none; }
+  .wire-seg--in::after, .wire-seg--out::before { opacity: 1; transform: none; }
   .held .state::before { opacity: 1; background: var(--signal); }
+  .held .state::after, .live::after, .ui-bar .dot::after, .pulse::after { display: none; }
   .held .edit { background: var(--signal); }
+  .wire-canvas { display: none; }
 }

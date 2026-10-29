@@ -6,6 +6,7 @@
 <title>aitmproxy — Intercept anything, by hand or by agent</title>
 <meta name="description" content="aitmproxy is a fast, memory-safe proxy for inspecting and editing HTTP and WebSocket traffic during development and authorized testing. One control surface that a person or an AI assistant can drive completely.">
 <link rel="stylesheet" href="styles.css">
+<script>document.documentElement.className += " js";</script>
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
@@ -104,11 +105,11 @@
 <!-- ============ DUALITY ============ -->
 <section class="section" id="operators">
   <div class="wrap">
-    <h2 class="h2">Two operators. One control surface.</h2>
-    <p class="lead deck">Every action in aitmproxy is a command. A person runs it from the CLI or a GUI; an AI assistant calls the very same command over MCP. There is no second API for agents and no hidden menu for humans — one core, and one record of who did what.</p>
+    <h2 class="h2" data-reveal>Two operators. One control surface.</h2>
+    <p class="lead deck" data-reveal data-d="1">Every action in aitmproxy is a command. A person runs it from the CLI or a GUI; an AI assistant calls the very same command over MCP. There is no second API for agents and no hidden menu for humans — one core, and one record of who did what.</p>
 
     <div class="split">
-      <div class="split-col">
+      <div class="split-col" data-reveal>
         <h3>By hand, in a terminal</h3>
         <figure class="code term">
           <figcaption><span>zsh — aitm</span><button class="copy" type="button" data-copy aria-label="Copy transcript"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
@@ -122,7 +123,7 @@
 <span class="out">flow 41 → 200 in 212 ms</span></code></pre>
         </figure>
       </div>
-      <div class="split-col">
+      <div class="split-col" data-reveal data-d="1">
         <h3>By agent, over MCP</h3>
         <figure class="code term">
           <figcaption><span>mcp — aitmproxy</span><button class="copy" type="button" data-copy aria-label="Copy transcript"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
@@ -139,15 +140,15 @@
     </div>
 
     <div class="merge">
-      <svg viewBox="0 0 560 150" aria-label="Two wires, labelled hand and agent, merge into one wire labelled audit log.">
+      <svg viewBox="0 0 560 150" aria-label="Two wires, labelled hand and agent, merge into one wire labelled audit log." data-reveal data-fx="draw">
         <text x="0" y="36">hand</text>
         <text x="0" y="128">agent</text>
-        <path d="M60 30 H220 C300 30 300 75 380 75"/>
-        <path d="M60 122 H220 C300 122 300 75 380 75"/>
-        <line class="sig" x1="380" y1="75" x2="470" y2="75"/>
+        <path d="M60 30 H220 C300 30 300 75 380 75" pathLength="1"/>
+        <path d="M60 122 H220 C300 122 300 75 380 75" pathLength="1"/>
+        <line class="sig" x1="380" y1="75" x2="470" y2="75" pathLength="1"/>
         <text x="480" y="80">audit log</text>
       </svg>
-      <div class="audit-wrap"><table class="audit">
+      <div class="audit-wrap" data-reveal data-d="2"><table class="audit">
         <caption>One log. Every command, whoever issued it.</caption>
         <thead><tr><th>time</th><th>operator</th><th>command</th><th>target</th><th>result</th></tr></thead>
         <tbody>
@@ -165,12 +166,12 @@
 <!-- ============ LIFECYCLE ============ -->
 <section class="section" id="flows">
   <div class="wrap">
-    <h2 class="h2">A request, held in mid-air.</h2>
-    <p class="lead deck">Everything aitmproxy sees is a Flow with a short lifecycle. Observed flows pass straight through and are recorded. A rule can intercept one: the request pauses, readable and editable, until you resume it or drop it.</p>
+    <h2 class="h2" data-reveal>A request, held in mid-air.</h2>
+    <p class="lead deck" data-reveal data-d="1">Everything aitmproxy sees is a Flow with a short lifecycle. Observed flows pass straight through and are recorded. A rule can intercept one: the request pauses, readable and editable, until you resume it or drop it.</p>
 
     <div class="life">
       <div>
-        <div class="life-diagram" role="img" aria-label="Flow lifecycle: observed, then intercepted, then resumed; an intercepted flow can also be dropped.">
+        <div class="life-diagram" role="img" aria-label="Flow lifecycle: observed, then intercepted, then resumed; an intercepted flow can also be dropped." data-reveal data-fx="line">
           <div class="stations">
             <div class="station"><b>observed</b><span>seen, recorded, forwarded</span></div>
             <div class="station station--held"><b>intercepted</b><span>held, readable, editable</span><em class="drop-label">dropped</em></div>
@@ -178,14 +179,14 @@
           </div>
           <div class="life-line"></div>
         </div>
-        <dl class="life-defs">
+        <dl class="life-defs" data-reveal data-d="1">
           <div><dt>observed</dt><dd>The default. The flow is logged with full request and response, timing and TLS details, and forwarded untouched.</dd></div>
           <div><dt>intercepted</dt><dd>A rule matched, or you armed the flow by hand. The request (or the response) waits inside the proxy. Edit headers, body, URL or status; nothing moves until you say so.</dd></div>
           <div><dt>resumed or dropped</dt><dd>Resume sends the edited flow on its way and records the diff. Drop answers the client yourself, or not at all.</dd></div>
         </dl>
       </div>
 
-      <div class="ui" aria-label="Flow list with one intercepted flow selected">
+      <div class="ui" aria-label="Flow list with one intercepted flow selected" data-reveal data-d="2">
         <div class="ui-bar"><span class="dot" aria-hidden="true"></span><span>listening on <code>127.0.0.1:8080</code></span><span class="spacer"></span><span>1 held</span></div>
         <table class="flows">
           <thead><tr><th>#</th><th>method</th><th>url</th><th>status</th><th>time</th></tr></thead>
@@ -218,8 +219,8 @@ content-type: application/json
 <!-- ============ FEATURES ============ -->
 <section class="section" id="features">
   <div class="wrap">
-    <h2 class="h2">Everything on the wire is yours to change.</h2>
-    <p class="lead deck">Each capability is a command, so each one works from the app, the terminal, a script or an assistant. The fragments below are the real shape of the tool.</p>
+    <h2 class="h2" data-reveal>Everything on the wire is yours to change.</h2>
+    <p class="lead deck" data-reveal data-d="1">Each capability is a command, so each one works from the app, the terminal, a script or an assistant. The fragments below are the real shape of the tool.</p>
 
     <div class="features">
       <article class="feature" data-reveal>
@@ -329,8 +330,8 @@ content-type: application/json
 <!-- ============ THREE FACES ============ -->
 <section class="section" id="apps">
   <div class="wrap">
-    <h2 class="h2">Three faces. One core.</h2>
-    <p class="lead deck">A native macOS app, a web UI and a terminal UI. All three are clients of the same core, showing the same flows, and so is your assistant.</p>
+    <h2 class="h2" data-reveal>Three faces. One core.</h2>
+    <p class="lead deck" data-reveal data-d="1">A native macOS app, a web UI and a terminal UI. All three are clients of the same core, showing the same flows, and so is your assistant.</p>
 
     <div class="faces">
       <div class="face" data-reveal>
@@ -358,11 +359,11 @@ content-type: application/json
 <!-- ============ TWO LANGUAGES ============ -->
 <section class="section" id="languages">
   <div class="wrap">
-    <h2 class="h2">Two small languages, written for people.</h2>
-    <p class="lead deck">Plugins are Rhai scripts with a few hooks and a capability list. Reproductions are YAML files you can read top to bottom. Both are meant to be written by hand first, and by an assistant second.</p>
+    <h2 class="h2" data-reveal>Two small languages, written for people.</h2>
+    <p class="lead deck" data-reveal data-d="1">Plugins are Rhai scripts with a few hooks and a capability list. Reproductions are YAML files you can read top to bottom. Both are meant to be written by hand first, and by an assistant second.</p>
 
     <div class="langs">
-      <div>
+      <div data-reveal>
         <div class="lang-intro">
           <h3 class="h3">Rhai for plugins</h3>
           <p>A plugin sees each flow as it passes, can edit it, answer it, or record a finding. It runs in a sandbox and gets only the capabilities it declares. <a class="arrow" href="scripting.html">Scripting reference</a></p>
@@ -384,7 +385,7 @@ content-type: application/json
 }</code></pre>
         </figure>
       </div>
-      <div>
+      <div data-reveal data-d="1">
         <div class="lang-intro">
           <h3 class="h3">YAML for reproductions</h3>
           <p>A PoC is a saved, re-runnable reproduction of a finding: a few steps, a few matchers, and a success condition. Run it again next week and get the same answer. <a class="arrow" href="poc.html">PoC format reference</a></p>
@@ -419,14 +420,14 @@ content-type: application/json
 <!-- ============ STATS ============ -->
 <section class="section" id="numbers">
   <div class="wrap">
-    <h2 class="h2">Built to be trusted on the wire.</h2>
+    <h2 class="h2" data-reveal>Built to be trusted on the wire.</h2>
     <div class="stats">
-      <div class="stat"><b>0</b><span>lines of <code>unsafe</code> Rust in the whole tool</span></div>
-      <div class="stat"><b>~10,000</b><span>requests per second, sustained, with flat memory</span></div>
-      <div class="stat"><b>100<small>%</small></b><span>of the tool is scriptable and controllable, by hand or by agent</span></div>
-      <div class="stat"><b>3</b><span>user interfaces: macOS, web and terminal, on one core</span></div>
-      <div class="stat"><b>2</b><span>protocols, HTTP and WebSocket, with TLS passthrough for pinned hosts</span></div>
-      <div class="stat"><b>2</b><span>licences to choose from, MIT or Apache-2.0; macOS and Linux</span></div>
+      <div class="stat" data-reveal><b>0</b><span>lines of <code>unsafe</code> Rust in the whole tool</span></div>
+      <div class="stat" data-reveal data-d="1"><b>~10,000</b><span>requests per second, sustained, with flat memory</span></div>
+      <div class="stat" data-reveal data-d="2"><b>100<small>%</small></b><span>of the tool is scriptable and controllable, by hand or by agent</span></div>
+      <div class="stat" data-reveal><b>3</b><span>user interfaces: macOS, web and terminal, on one core</span></div>
+      <div class="stat" data-reveal data-d="1"><b>2</b><span>protocols, HTTP and WebSocket, with TLS passthrough for pinned hosts</span></div>
+      <div class="stat" data-reveal data-d="2"><b>2</b><span>licences to choose from, MIT or Apache-2.0; macOS and Linux</span></div>
     </div>
   </div>
 </section>
@@ -435,12 +436,12 @@ content-type: application/json
 <section class="section" id="install">
   <div class="wrap">
     <div class="install">
-      <div>
+      <div data-reveal>
         <h2 class="h2">Install in one line. Capture in three.</h2>
         <p class="lead deck">Homebrew on macOS and Linux. Trust the local certificate once, start the proxy, and point your app or browser at it.</p>
         <p class="deck"><a class="arrow" href="docs.html">Getting started, step by step</a></p>
       </div>
-      <div>
+      <div data-reveal data-d="1">
         <div class="steps">
           <div class="cmd"><code><span class="pr">$ </span>brew install aitmproxy</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
           <div class="cmd"><code><span class="pr">$ </span>aitm ca install</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
@@ -482,5 +483,6 @@ content-type: application/json
 </footer>
 
 <script src="site.js"></script>
+<script src="wire.js"></script>
 </body>
 </html>

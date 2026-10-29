@@ -1,6 +1,11 @@
-/* Direction D — tiny progressive enhancements. No libraries. */
+/* aitmproxy site — small progressive enhancements. No libraries, no build step.
+   Everything here is additive: the page is complete and readable before this runs,
+   and nothing stays hidden if it never does (reveals are gated on html.js, set inline). */
 (function () {
   "use strict";
+
+  var reduce = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  var hasIO = "IntersectionObserver" in window;
 
   /* Numbered lines on code viewers (not terminals): wrap each line, CSS counts them. */
   document.querySelectorAll(".code:not(.term) pre > code").forEach(function (code) {
@@ -13,17 +18,27 @@
     }).join("");
   });
 
-  /* Copy buttons: copy the nearest code/pre text. */
+  /* Copy buttons: copy the nearest code/pre text. The check glyph the feedback draws is
+     added here, so the markup stays a plain clipboard icon. */
+  var SVG = "http://www.w3.org/2000/svg";
   document.querySelectorAll("[data-copy]").forEach(function (btn) {
+    var svg = btn.querySelector("svg");
+    if (svg && !svg.querySelector(".chk")) {
+      var chk = document.createElementNS(SVG, "path");
+      chk.setAttribute("class", "chk");
+      chk.setAttribute("d", "M3.5 8.5 L6.5 11.5 L12.5 4.5");
+      svg.appendChild(chk);
+    }
     btn.addEventListener("click", function () {
       var scope = btn.closest(".code, .cmd, .pair-row");
       var src = scope && (scope.querySelector("pre") || scope.querySelector("code"));
       if (!src) return;
       var text = src.innerText.replace(/^\$ /gm, "").trim();
       var done = function () {
+        btn.removeAttribute("data-done"); void btn.offsetWidth; /* restart the draw on a second click */
         btn.setAttribute("data-done", "");
         clearTimeout(btn._t);
-        btn._t = setTimeout(function () { btn.removeAttribute("data-done"); }, 1400);
+        btn._t = setTimeout(function () { btn.removeAttribute("data-done"); }, 1600);
       };
       if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(text).then(done, done);
@@ -38,7 +53,7 @@
 
   /* On-this-page rail: mark the heading currently in view. */
   var rail = document.querySelector(".rail");
-  if (rail && "IntersectionObserver" in window) {
+  if (rail && hasIO) {
     var links = Array.prototype.slice.call(rail.querySelectorAll("a[href^='#']"));
     var byId = {};
     links.forEach(function (a) { byId[a.getAttribute("href").slice(1)] = a; });
@@ -66,48 +81,39 @@
     if (mq.addEventListener) mq.addEventListener("change", sync);
   }
 
-  /* Subtle reveal-on-scroll. Content is visible without JS; this only adds the entrance. */
-  var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  /* Entrances: each [data-reveal] rises once as it comes into view (CSS does the motion;
+     data-d staggers siblings). Reveal everything at once when there is no observer or no
+     motion, and as a last resort reveal anything already on screen after a moment, so a
+     missed observation can never leave content hidden. */
   var reveals = Array.prototype.slice.call(document.querySelectorAll("[data-reveal]"));
-  if (reveals.length && "IntersectionObserver" in window && !reduce) {
+  function revealAll() { reveals.forEach(function (el) { el.classList.add("in"); }); }
+  if (reveals.length && hasIO && !reduce) {
     var ro = new IntersectionObserver(function (entries) {
       entries.forEach(function (e) {
         if (e.isIntersecting) { e.target.classList.add("in"); ro.unobserve(e.target); }
       });
     }, { rootMargin: "0px 0px -8% 0px", threshold: 0.08 });
     reveals.forEach(function (el) { ro.observe(el); });
+    setTimeout(function () {
+      var vh = window.innerHeight || document.documentElement.clientHeight;
+      reveals.forEach(function (el) {
+        if (el.classList.contains("in")) return;
+        var r = el.getBoundingClientRect();
+        if (r.top < vh && r.bottom > 0) el.classList.add("in");
+      });
+    }, 2500);
   } else {
-    reveals.forEach(function (el) { el.classList.add("in"); });
+    revealAll();
   }
 
-  /* Hero wire: a live, looping scene. A request arrives and is held & armed,
-     then resumed; it completes 200. Pauses off screen; static under reduced motion. */
-  (function () {
-    var wire = document.querySelector(".hero .wire");
-    if (!wire) return;
-    var held = wire.querySelector(".held");
-    var stateEl = wire.querySelector(".state");
-    if (!held || !stateEl) return;
-    function set(phase, st, txt) { wire.setAttribute("data-phase", phase); held.setAttribute("data-state", st); stateEl.textContent = txt; }
-    if (reduce) { set("held", "armed", "armed"); return; }
-    // [phase, held-state, badge text, ms]
-    var steps = [["arrive", "", "—", 1300], ["held", "armed", "armed", 2600], ["resume", "armed", "resuming…", 1150], ["done", "done", "200", 2000]];
-    var timer = null, running = false;
-    function step(i) {
-      var s = steps[i]; set(s[0], s[1], s[2]);
-      timer = setTimeout(function () { if (i + 1 < steps.length) step(i + 1); else cycle(); }, s[3]);
-    }
-    function cycle() {
-      wire.removeAttribute("data-anim"); set("reset", "", "—");
-      requestAnimationFrame(function () { requestAnimationFrame(function () { wire.setAttribute("data-anim", ""); step(0); }); });
-    }
-    function start() { if (running) return; running = true; cycle(); }
-    function stop() { running = false; clearTimeout(timer); }
-    if ("IntersectionObserver" in window) {
-      new IntersectionObserver(function (es) { es.forEach(function (e) { if (e.isIntersecting) start(); else stop(); }); }, { threshold: 0.25 }).observe(wire);
-    }
-    start();
-  })();
+  /* Live dots: the rings on captions and fragment bars run only while on screen. */
+  var dots = Array.prototype.slice.call(document.querySelectorAll(".live, .ui-bar .dot"));
+  if (dots.length && hasIO && !reduce) {
+    var lo = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) { e.target.classList.toggle("on", e.isIntersecting); });
+    }, { threshold: 0 });
+    dots.forEach(function (d) { lo.observe(d); });
+  }
 
   /* Close the small-screen menu when a link inside it is chosen. */
   var menu = document.querySelector("details.menu");

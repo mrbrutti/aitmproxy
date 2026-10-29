@@ -6,6 +6,7 @@
 <title>Features — aitmproxy</title>
 <meta name="description" content="Everything aitmproxy does between the client and the server: intercept rules, replay, Map Local and Map Remote, WebSocket editing, sessions and HAR, TLS passthrough, an embedded browser and certificate management. Each one by hand or by agent.">
 <link rel="stylesheet" href="styles.css">
+<script>document.documentElement.className += " js";</script>
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
@@ -44,7 +45,7 @@
 <div class="wrap">
 
 <!-- Intercept -->
-<article class="feat" id="intercept">
+<article class="feat" data-reveal id="intercept">
   <div class="prose">
     <h2 class="h3">Intercept and edit by rule</h2>
     <p>A rule says which flows to hold: by method, host, path pattern, header or body match, and whether to hold the request, the response, or both. When a rule fires, the flow stops inside the proxy and appears as <em>armed</em>. You can read it, change any part of it and resume, or drop it and answer the client yourself.</p>
@@ -86,7 +87,7 @@
 </article>
 
 <!-- Replay -->
-<article class="feat" id="replay">
+<article class="feat" data-reveal id="replay">
   <div class="prose">
     <h2 class="h3">Replay and compose</h2>
     <p>Replay sends a captured request again, optionally with changes, and records the result as a new flow linked to the original. Compose builds a request from nothing: method, URL, headers, body. Both go through the same pipeline as live traffic, so rules and plugins apply to them too.</p>
@@ -113,7 +114,7 @@
 </article>
 
 <!-- Map -->
-<article class="feat" id="map">
+<article class="feat" data-reveal id="map">
   <div class="prose">
     <h2 class="h3">Map Local and Map Remote</h2>
     <p><strong>Map Local</strong> answers a matching request from a file on disk: a JSON fixture, an HTML page, an image. The client never knows. It is the fastest way to test a UI against a response that does not exist yet, or one that is hard to trigger.</p>
@@ -145,7 +146,7 @@
 </article>
 
 <!-- WebSocket -->
-<article class="feat" id="websocket">
+<article class="feat" data-reveal id="websocket">
   <div class="prose">
     <h2 class="h3">WebSocket inspect, inject and edit</h2>
     <p>A WebSocket is a flow too. After the upgrade, aitmproxy shows every frame in both directions as it happens: text or binary, with size, timing and direction. Hold a frame with a rule, change it, and let it continue. Or inject a frame of your own toward the client or the server, from the app, the CLI or a plugin.</p>
@@ -172,7 +173,7 @@
 </article>
 
 <!-- Sessions -->
-<article class="feat" id="sessions">
+<article class="feat" data-reveal id="sessions">
   <div class="prose">
     <h2 class="h3">Sessions and HAR import and export</h2>
     <p>A session is a saved capture: every flow, every edit, every finding, with the rules that were active. Save one at the end of a test, reopen it next month, replay from it. Sessions can be exported as HAR for any tool that reads it, and HAR files from a browser or another proxy can be imported and treated like live captures.</p>
@@ -197,7 +198,7 @@
 </article>
 
 <!-- TLS -->
-<article class="feat" id="tls">
+<article class="feat" data-reveal id="tls">
   <div class="prose">
     <h2 class="h3">TLS passthrough for pinned hosts</h2>
     <p>Some hosts pin their certificates and will refuse any proxy. Rather than break them, list them: aitmproxy tunnels those connections through untouched and records only that they happened. Everything else is decrypted with the local CA and inspected as usual. Patterns accept wildcards, and the list can be changed while the proxy is running.</p>
@@ -220,7 +221,7 @@
 </article>
 
 <!-- Browser -->
-<article class="feat" id="browser">
+<article class="feat" data-reveal id="browser">
   <div class="prose">
     <h2 class="h3">Embedded headless browser</h2>
     <p>aitmproxy ships a headless browser that is already pointed at the proxy and already trusts its certificate. It exists for one reason: to reproduce a finding the way a user's browser would, and to take the screenshot that proves it. The browser is a step type in the <a href="poc.html">PoC format</a>, and a command like any other.</p>
@@ -241,7 +242,7 @@
 </article>
 
 <!-- Certificates -->
-<article class="feat" id="certs">
+<article class="feat" data-reveal id="certs">
   <div class="prose">
     <h2 class="h3">Certificate management</h2>
     <p>On first run aitmproxy generates a local certificate authority for your machine only. <code>aitm ca</code> can export it, report whether the system trusts it, install it, and remove it again. Installing into the system trust store always asks for confirmation. An assistant can export and check status, but installing is gated behind a human.</p>
@@ -266,7 +267,7 @@
 </article>
 
 <!-- Scriptable -->
-<article class="feat" id="scriptable">
+<article class="feat" data-reveal id="scriptable">
   <div class="prose">
     <h2 class="h3">All of it, scriptable</h2>
     <p>Everything on this page is reachable from a Rhai plugin, from the CLI, and from an assistant over MCP. Plugins run in a sandbox with a declared capability list; the MCP server exposes the same command set with the same names. Whatever the operator, the audit log records the command, its arguments and its effect.</p>
