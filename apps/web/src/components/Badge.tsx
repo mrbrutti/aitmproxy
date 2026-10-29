@@ -5,7 +5,7 @@ import type { ParentComponent } from 'solid-js';
 import type { MethodHue, StatusHue } from '~/model/flow';
 import css from './components.module.css';
 
-export type BadgeHue = MethodHue | StatusHue | 'agent';
+export type BadgeHue = MethodHue | StatusHue | 'agent' | 'l4';
 
 export interface BadgeProps {
   hue: BadgeHue;

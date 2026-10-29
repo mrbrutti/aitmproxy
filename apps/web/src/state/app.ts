@@ -31,6 +31,7 @@ export type SidebarItem =
   | { kind: 'findings' }
   | { kind: 'browser' }
   | { kind: 'scripts' }
+  | { kind: 'l4' }
   | { kind: 'agent' };
 
 export type FilterField =
@@ -64,7 +65,7 @@ export type Theme = 'system' | 'light' | 'dark';
 export type Density = 'dense' | 'default' | 'comfortable';
 export type AgentPolicy = StateNotification['agent'];
 export type KillMode = 'reset' | '429' | '503';
-export type Panel = 'inspector' | 'findings' | 'browser' | 'scope' | 'agent' | 'scripts';
+export type Panel = 'inspector' | 'findings' | 'browser' | 'scope' | 'agent' | 'scripts' | 'l4';
 
 export interface FlowEntry {
   readonly id: FlowId;
@@ -771,7 +772,7 @@ export function createAppStore(bus: BusClient) {
       setSidebar: (s: SidebarItem) => batch(() => {
         setUi('sidebar', s);
         const panel: Panel =
-          s.kind === 'findings' ? 'findings' : s.kind === 'browser' ? 'browser' : s.kind === 'scope' ? 'scope' : s.kind === 'agent' ? 'agent' : s.kind === 'scripts' ? 'scripts' : 'inspector';
+          s.kind === 'findings' ? 'findings' : s.kind === 'browser' ? 'browser' : s.kind === 'scope' ? 'scope' : s.kind === 'agent' ? 'agent' : s.kind === 'scripts' ? 'scripts' : s.kind === 'l4' ? 'l4' : 'inspector';
         setUi('panel', panel);
       }),
       setPanel: (p: Panel) => setUi('panel', p),

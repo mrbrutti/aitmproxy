@@ -8,6 +8,7 @@ import { BrowserPanel } from '~/panels/BrowserPanel';
 import { ScopePanel } from '~/panels/ScopePanel';
 import { AgentPanel } from '~/panels/AgentPanel';
 import { ScriptsPanel } from '~/panels/ScriptsPanel';
+import { L4Panel } from '~/panels/l4/L4Panel';
 import { ComposeSheet } from '~/compose/ComposeSheet';
 import { CommandPalette } from '~/palette/CommandPalette';
 import { FlowList } from '~/flows/FlowList';
@@ -139,6 +140,9 @@ export const Shell: Component = () => {
               </Match>
               <Match when={app.ui.panel === 'scripts'}>
                 <ScriptsPanel />
+              </Match>
+              <Match when={app.ui.panel === 'l4'}>
+                <L4Panel />
               </Match>
             </Switch>
           </div>
