@@ -55,8 +55,9 @@ public struct FlowSummary: Hashable, Sendable {
         self.messages = json["messages"]?.intValue
     }
 
-    /// A row with the fields the summary carries; the rest stay nil and draw as dashes.
-    public func row(seq: Int) -> FlowRow {
+    /// A row with the fields the summary carries; the rest stay nil and draw as
+    /// dashes. `coreID` stamps the originating connection (Task 5).
+    public func row(seq: Int, coreID: CoreID = .fixture) -> FlowRow {
         let (p, q) = Self.splitQuery(path ?? "/")
         let state: FlowState
         switch intercept {
@@ -73,7 +74,8 @@ public struct FlowSummary: Hashable, Sendable {
             state: state, isReplay: isReplay, origin: isReplay ? .human : .client,
             tls: scheme == "https" || scheme == "wss" ? .decrypted : .none,
             edited: intercept == .resumed,
-            wsFrames: messages.map { (sent: $0, received: 0) }
+            wsFrames: messages.map { (sent: $0, received: 0) },
+            coreID: coreID
         )
     }
 

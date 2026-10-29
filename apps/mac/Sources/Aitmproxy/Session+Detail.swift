@@ -17,7 +17,7 @@ extension Session {
     /// response that arrived after the first look shows up.
     func loadDetail(_ id: FlowID) async {
         guard let value = try? await runCommand("flow.detail", ["id": .string(id.raw), "body": .string("inline")]),
-              let detail = FlowDetail(detailJSON: value) else { return }
+              let detail = FlowDetail(detailJSON: value, coreID: activeCoreID) else { return }
         details[id] = detail
     }
 }

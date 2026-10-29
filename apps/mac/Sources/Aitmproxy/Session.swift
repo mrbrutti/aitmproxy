@@ -203,6 +203,11 @@ final class Session {
     var agentPolicy: AgentPolicy = .all
     var agentActionsLastMinute = 0
     var bus: BusState = .disconnected
+    /// The single active core connection's id this launch (Task 5). Every flow
+    /// ingested over the bus is stamped with it; fixture/offline data uses the
+    /// well-known `.fixture` id. The seam for multi-core: a second connection is
+    /// additive because every stored flow already carries its originating id.
+    let activeCoreID: CoreID = Store.usesFixtures ? .fixture : CoreID()
     var scopeHosts: [String] = []
     var findingsCount = 0
     var browserTabs = 0
