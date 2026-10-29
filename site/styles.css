@@ -360,7 +360,7 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
 .rail a { text-decoration: none; color: var(--ink-2); }
 .rail a:hover { color: var(--ink); text-decoration: underline; }
 .rail a[aria-current] { color: var(--ink); font-weight: 500; }
-.callout { border-left: 2px solid var(--accent); padding: 0.6rem 0 0.6rem 1rem; background: var(--accent-tint); border-radius: 0 var(--radius) var(--radius) 0; }
+.callout { padding: 0.85rem 1rem; background: var(--accent-tint); color: var(--ink); border-radius: var(--radius); }
 .api { display: grid; gap: 0; border-top: 1px solid var(--hairline); }
 .api > div { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.4fr); gap: 1rem 2rem; padding: 0.85rem 0; border-bottom: 1px solid var(--hairline); }
 .api code { font-size: var(--fs-mono-s); word-break: break-word; }
