@@ -18,8 +18,18 @@ final class BusService: FlowActions {
     @ObservationIgnored private var runTask: Task<Void, Never>?
     @ObservationIgnored private var notificationTask: Task<Void, Never>?
     @ObservationIgnored private var summaries: [FlowID: FlowSummary] = [:]
+    /// The embedded core's bus (Task 6), once it has published its address. When
+    /// set it supersedes the config.yaml / Settings endpoint resolution.
+    @ObservationIgnored private var endpointOverride: BusEndpoint?
 
     init(session: Session) { self.session = session }
+
+    /// Point the client at the embedded core's bus and reconnect at once, rather
+    /// than wait for the next back-off cycle.
+    func useEmbeddedEndpoint(_ endpoint: BusEndpoint) {
+        endpointOverride = endpoint
+        start()
+    }
 
     // MARK: Lifecycle
 
@@ -40,7 +50,7 @@ final class BusService: FlowActions {
     private func run() async {
         var backoff: Duration = .seconds(1)
         while !Task.isCancelled {
-            guard let endpoint = Self.resolveEndpoint() else {
+            guard let endpoint = endpointOverride ?? Self.resolveEndpoint() else {
                 session.bus = .failed("no bus configured")
                 try? await Task.sleep(for: .seconds(5))
                 continue

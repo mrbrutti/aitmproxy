@@ -8,6 +8,7 @@ struct ShellView: View {
     @Environment(\.openSettings) private var openSettings
     @Environment(\.openWindow) private var openWindow
     @State private var bus: BusService?
+    @State private var embeddedCore: EmbeddedCoreController?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -78,6 +79,15 @@ struct ShellView: View {
             } else {
                 let service = BusService(session: session)
                 session.actions = service
+                // Self-contained launch (AC6): when nothing external is configured
+                // and the core is bundled (Task 9), run our own embedded core and
+                // let it hand the bus its endpoint. An operator with a config.yaml
+                // bus keeps today's external path; the switchable choice is Task 7.
+                if BusService.resolveEndpoint() == nil,
+                   let controller = EmbeddedCoreController(coreID: session.activeCoreID, bus: service) {
+                    controller.start()
+                    embeddedCore = controller
+                }
                 service.start()
                 bus = service
             }
