@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
-use aitm::wire::{build_proxy_with, Features};
+use aitm::wire::{assemble_with, build_proxy_with, Features};
 use aitm_core::Config;
 use aitm_proto_l4::config::L4Config;
 use aitm_proto_l4::L4Privilege;
@@ -104,4 +104,34 @@ fn l4_enabled_no_priv_builds() {
     // The read verb and a wire verb are both registered (honest surface).
     assert!(proxy.registry().command("l4.interfaces").is_some());
     assert!(proxy.registry().command("l4.inject").is_some());
+}
+
+/// L4OPS-AC17: with L4 enabled, the assembly binds the protocol-general capture
+/// ingress to the live module, so a future capture backend (Phase 2's macOS Network
+/// Extension) feeds the same guard + store the operator reads via `l4.flow.*`.
+#[test]
+fn l4_ingress_bound_when_enabled() {
+    let cfg = config_with_ca("ingress-on");
+    let features = Features {
+        l4: l4_enabled(),
+        l4_privilege: Some(L4Privilege::available()),
+        ..Features::default()
+    };
+    let assembled = assemble_with(&cfg, &features).expect("assemble with l4 enabled");
+    assert!(
+        assembled.l4_ingress.is_some(),
+        "the capture ingress is wired when L4 is enabled"
+    );
+}
+
+/// L4OPS-AC17 (zero-footprint default): with L4 disabled there is no ingress — the
+/// boundary is constructed only for the opted-in path.
+#[test]
+fn l4_ingress_absent_when_disabled() {
+    let cfg = config_with_ca("ingress-off");
+    let assembled = assemble_with(&cfg, &Features::default()).expect("assemble with l4 disabled");
+    assert!(
+        assembled.l4_ingress.is_none(),
+        "no capture ingress when L4 is disabled"
+    );
 }
