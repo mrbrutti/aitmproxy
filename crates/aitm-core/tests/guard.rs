@@ -1,8 +1,8 @@
 //! Task 6: the scope/rate guard, SSRF address classification, and config types.
 
 use aitm_core::{
-    classify_host, ssrf_check, BackoffConfig, GuardError, HostClass, LimitConfig, ScopeEntry,
-    ScopeRateGuard, SsrfPolicy, StdGuard,
+    classify_host, engine_may_reach_private, ssrf_check, BackoffConfig, GuardError, HostClass,
+    LimitConfig, ScopeEntry, ScopeRateGuard, SsrfPolicy, StdGuard,
 };
 
 /// Once a host's error budget is exhausted it is disabled, then eligible again
@@ -152,6 +152,60 @@ fn scoped_hostname_does_not_lift_private() {
     // A scoped `localhost` authority to a loopback dst is still allowed.
     let lh = vec![scoped("localhost")];
     assert!(ssrf_check(&policy, &lh, "localhost:3000", "127.0.0.1".parse().unwrap()).is_ok());
+}
+
+/// Audit I15: the engine's `--allow-private-network` input is policy ∪ scope.
+/// Under the strict default a pure-public scope keeps it off; a scoped
+/// private/loopback **address** turns it on; a scoped DNS *hostname* does not
+/// (it classifies `Public`, mirroring the connector's rebinding refusal).
+#[test]
+fn engine_may_reach_private_is_policy_union_scope() {
+    let strict = SsrfPolicy::default();
+    assert!(strict.block_private, "default policy must block private");
+
+    // I15 preserved: strict policy + no private host in scope → off.
+    assert!(!engine_may_reach_private(&strict, &[]));
+    assert!(!engine_may_reach_private(
+        &strict,
+        &[scoped("example.com"), scoped("api.example.com:443")]
+    ));
+
+    // A scoped loopback / private **address** lifts it under the strict default.
+    assert!(engine_may_reach_private(
+        &strict,
+        &[scoped("127.0.0.1:8085")]
+    ));
+    assert!(engine_may_reach_private(&strict, &[scoped("localhost")]));
+    assert!(engine_may_reach_private(&strict, &[scoped("10.0.0.5")]));
+    assert!(engine_may_reach_private(&strict, &[scoped("[::1]:9000")]));
+    // Mixed scope: one private address among public entries is enough.
+    assert!(engine_may_reach_private(
+        &strict,
+        &[scoped("example.com"), scoped("127.0.0.1:8085")]
+    ));
+
+    // A scoped DNS hostname is `Public` and must NOT lift it (DNS rebinding).
+    assert!(!engine_may_reach_private(
+        &strict,
+        &[scoped("internal.corp")]
+    ));
+
+    // Relaxed policy lifts it regardless of scope.
+    let relaxed = SsrfPolicy {
+        block_private: false,
+        ..SsrfPolicy::default()
+    };
+    assert!(engine_may_reach_private(&relaxed, &[]));
+
+    // When scope cannot lift blocks at all, only the policy half applies.
+    let no_scope_lift = SsrfPolicy {
+        allow_if_in_scope: false,
+        ..SsrfPolicy::default()
+    };
+    assert!(!engine_may_reach_private(
+        &no_scope_lift,
+        &[scoped("127.0.0.1:8085")]
+    ));
 }
 
 #[test]

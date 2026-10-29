@@ -26,7 +26,7 @@ use aitm::tui::TuiLog;
 use aitm::web::{self, WebArgs, WebCommand, WebState};
 use aitm::wire::{assemble_with_scripts, Assembled, Features, ScriptWiring};
 use aitm::{config_file, env, tui};
-use aitm_core::{BrowserDriver, Chain, McpTransport, Plugin};
+use aitm_core::{engine_may_reach_private, BrowserDriver, Chain, McpTransport, Plugin};
 use aitm_findings::FindingsPlugin;
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
 use tokio::net::TcpListener;
@@ -232,7 +232,19 @@ async fn run() -> anyhow::Result<()> {
 
     // Server path: launch the configured engine so the browser.* commands reach
     // a live driver. No fallback to the other engine.
-    let launched = match aitm_browser::launch_owned(&cfg.browser, ca.cert_path()).await {
+    //
+    // Derive obscura's `--allow-private-network` from the SSRF policy ∪ the seed
+    // scope (audit I15): a scoped loopback/private target lifts the engine flag
+    // under the strict default, while a pure-public scope keeps the engine as
+    // narrow as the policy. The SSRF-filtering proxy connector stays the
+    // authoritative per-host gate; this only narrows the engine below it. It is
+    // frozen here at launch — a host added later (`scope.add`) is still gated by
+    // the connector, but the engine reaches a newly private target only on
+    // relaunch.
+    let mut browser_cfg = cfg.browser.clone();
+    browser_cfg.obscura.allow_private =
+        engine_may_reach_private(&cfg.browser.ssrf, &cfg.scope.entries);
+    let launched = match aitm_browser::launch_owned(&browser_cfg, ca.cert_path()).await {
         Ok(l) => Some(l),
         Err(e) => {
             warn!(
