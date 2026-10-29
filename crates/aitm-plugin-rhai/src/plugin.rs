@@ -20,6 +20,7 @@
 //! refuse (spec §6).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use aitm_core::{
@@ -61,7 +62,12 @@ pub struct ScriptPlugin {
 pub struct ScriptHandle {
     name: String,
     path: PathBuf,
+    /// What the loader parsed from the script: its `API` and the hooks it defines.
+    meta: ScriptMeta,
     ast: ArcSwap<AST>,
+    /// Whether the script's hooks run. Advisory and read per event: no other
+    /// state depends on it, so relaxed ordering is enough.
+    enabled: AtomicBool,
 }
 
 impl ScriptHandle {
@@ -69,7 +75,9 @@ impl ScriptHandle {
         Self {
             name: meta.name.clone(),
             path: meta.path.clone(),
+            meta: meta.clone(),
             ast: ArcSwap::from_pointee(named(ast, &meta.name)),
+            enabled: AtomicBool::new(true),
         }
     }
 
@@ -81,6 +89,21 @@ impl ScriptHandle {
     /// The file it was compiled from — what a reload recompiles.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The script's declared metadata: `api` and the hooks it defines.
+    pub fn meta(&self) -> &ScriptMeta {
+        &self.meta
+    }
+
+    /// Whether the script's hooks fire. A new handle is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Turn the script's hooks on or off; takes effect from the next event.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
     }
 
     /// Put a freshly compiled AST in service. The caller keeps the old one by
@@ -249,6 +272,9 @@ impl Plugin for ScriptPlugin {
     }
 
     fn on_event(&mut self, ev: &Event, ctx: &mut FlowCtx<'_>) -> Verdict {
+        if !self.handle.is_enabled() {
+            return Verdict::Continue;
+        }
         let Some(hook) = hook_for(ev) else {
             return Verdict::Continue;
         };
