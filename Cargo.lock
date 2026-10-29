@@ -24,6 +24,7 @@ dependencies = [
  "aitm-plugins",
  "aitm-poc",
  "aitm-proto-http",
+ "aitm-proto-l4",
  "aitm-proto-ws",
  "anyhow",
  "bytes",

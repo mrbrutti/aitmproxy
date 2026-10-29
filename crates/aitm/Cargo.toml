@@ -19,6 +19,7 @@ aitm-core.workspace = true
 aitm-plugin.workspace = true
 aitm-proto-http.workspace = true
 aitm-proto-ws.workspace = true
+aitm-proto-l4.workspace = true
 aitm-plugins.workspace = true
 aitm-browser.workspace = true
 aitm-ca.workspace = true
