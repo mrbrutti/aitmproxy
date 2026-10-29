@@ -14,7 +14,7 @@ use crate::types::L4ScopeEntry;
 /// The L4 module configuration. Missing keys fall back to [`L4Config::default`],
 /// so an operator writes only what they want to change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct L4Config {
     /// Opt-in: the module is not even constructed while this is false.
     pub enabled: bool,

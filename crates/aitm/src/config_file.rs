@@ -20,6 +20,7 @@ use aitm_core::{
     BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, LimitConfig, McpConfig,
     McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SsrfPolicy,
 };
+use aitm_proto_l4::config::L4Config;
 
 /// `<config_dir>/aitmproxy/config.yaml`: a sibling of the CA dir with the
 /// same fallbacks, taken from the directory `CaConfig::default()` already
@@ -28,31 +29,51 @@ pub fn default_config_path() -> PathBuf {
     CaConfig::default().audit_log.with_file_name("config.yaml")
 }
 
-/// Load the config file. `None` reads [`default_config_path`], where an absent
-/// file means `Config::default()` (today's behaviour); `Some(p)` must exist,
-/// and the error names `p`.
+/// Load the config file as the core [`Config`] only. See [`load_full`] for the
+/// variant that also returns the L4 module config.
 pub fn load(path: Option<&Path>) -> anyhow::Result<Config> {
+    load_full(path).map(|(cfg, _l4)| cfg)
+}
+
+/// Load the config file into the core [`Config`] and the L4 module [`L4Config`].
+/// `None` reads [`default_config_path`], where an absent file means the defaults
+/// (today's behaviour, with L4 disabled); `Some(p)` must exist, and the error names
+/// `p`. The L4 section lives outside `aitm-core`, so it rides alongside here rather
+/// than inside `Config` (keeping `aitm-core` untouched, AC19).
+pub fn load_full(path: Option<&Path>) -> anyhow::Result<(Config, L4Config)> {
     let Some(path) = path else {
         let path = default_config_path();
         return match std::fs::read_to_string(&path) {
-            Ok(text) => parse(&text).with_context(|| format!("in config file {}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+            Ok(text) => {
+                parse_full(&text).with_context(|| format!("in config file {}", path.display()))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok((Config::default(), L4Config::default()))
+            }
             Err(e) => Err(e).with_context(|| format!("reading config file {}", path.display())),
         };
     };
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading config file {}", path.display()))?;
-    parse(&text).with_context(|| format!("in config file {}", path.display()))
+    parse_full(&text).with_context(|| format!("in config file {}", path.display()))
 }
 
-/// Parse YAML into a `Config`: unknown keys are errors, as is a value the
-/// file may not set (`ca.key_mode` wider than the owner); absent keys keep
-/// their `Config::default()` value.
+/// Parse YAML into the core [`Config`] only. See [`parse_full`] for the L4 variant.
 pub fn parse(yaml: &str) -> anyhow::Result<Config> {
+    parse_full(yaml).map(|(cfg, _l4)| cfg)
+}
+
+/// Parse YAML into the core [`Config`] and the L4 module [`L4Config`]: unknown keys
+/// are errors (including under `l4`, which maps to `L4Config`'s own
+/// `deny_unknown_fields`), as is a value the file may not set (`ca.key_mode` wider
+/// than the owner); absent keys keep their default value. An absent `l4` section is
+/// `L4Config::default()` — disabled, fail-closed.
+pub fn parse_full(yaml: &str) -> anyhow::Result<(Config, L4Config)> {
     let file: ConfigFile = serde_yaml::from_str(yaml).context("parsing config YAML")?;
+    let l4 = file.l4.clone().unwrap_or_default();
     let mut cfg = Config::default();
     file.apply(&mut cfg)?;
-    Ok(cfg)
+    Ok((cfg, l4))
 }
 
 /// Overwrite `slot` only when the file set the key.
@@ -82,6 +103,11 @@ struct ConfigFile {
     ssl_insecure: Option<bool>,
     max_flows: Option<usize>,
     max_flow_bytes: Option<usize>,
+    /// The L4 (raw packet) module config. Maps directly to the crate's `L4Config`
+    /// (its own `#[serde(default, deny_unknown_fields)]` applies), so missing keys
+    /// take their fail-closed defaults and a misspelled `l4.*` key is an error.
+    /// Lives outside `Config` to keep `aitm-core` untouched (AC19).
+    l4: Option<L4Config>,
 }
 
 impl ConfigFile {

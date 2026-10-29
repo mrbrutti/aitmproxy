@@ -29,12 +29,186 @@
 
 use std::sync::Arc;
 
-use aitm_core::{Plugin, Registry};
+use aitm_core::{Command, CommandHost, ParamSchema, Params, Plugin, Registry, Value};
 
+use crate::backend::L4Error;
 use crate::commands::intercept::InterceptSessions;
 use crate::config::{InterceptConfig, L4Config};
 use crate::flow::{InMemoryL4FlowStore, L4FlowStore};
 use crate::guard::L4Guard;
+
+/// The result of the cheap startup capability probe, cached into [`L4Module`] so
+/// each wire-touching command returns the specific missing-capability reason without
+/// re-probing. `Some(reason)` means that class of capability is **unavailable**.
+///
+/// The two classes mirror the spec's privilege model:
+/// - `capture_inject` — raw capture/inject (`l4.capture.*`, `l4.inject`,
+///   `l4.send_recv`): Linux `CAP_NET_RAW`, macOS `/dev/bpf*` read+write.
+/// - `intercept` — in-path NFQUEUE (`l4.intercept.*`): Linux `CAP_NET_ADMIN`;
+///   unsupported on macOS and other platforms.
+#[derive(Debug, Clone)]
+pub struct L4Privilege {
+    /// `Some(reason)` ⇒ raw capture/inject is unavailable (names the missing cap).
+    pub capture_inject: Option<String>,
+    /// `Some(reason)` ⇒ in-path interception is unavailable (names the missing cap).
+    pub intercept: Option<String>,
+}
+
+impl L4Privilege {
+    /// Both capability classes present (for wiring/tests that know they are).
+    #[must_use]
+    pub fn available() -> Self {
+        Self {
+            capture_inject: None,
+            intercept: None,
+        }
+    }
+
+    /// Both classes unavailable for one reason (unsupported platform / no process
+    /// capability info). Only the Linux and fallback probes use it; macOS always
+    /// splits capture/inject from the (unsupported) in-path class.
+    #[cfg(not(target_os = "macos"))]
+    fn unavailable_both(reason: &str) -> Self {
+        Self {
+            capture_inject: Some(reason.to_string()),
+            intercept: Some(reason.to_string()),
+        }
+    }
+
+    /// Run the cheap startup capability probe for this platform. Never opens a raw
+    /// socket against a target; fails **closed** (reports unavailable) on any doubt.
+    #[must_use]
+    pub fn probe() -> Self {
+        probe()
+    }
+}
+
+/// Linux: read the effective capability set from `/proc/self/status` and check the
+/// `CAP_NET_RAW` / `CAP_NET_ADMIN` bits. Unreadable / unparsable ⇒ fail-closed.
+#[cfg(target_os = "linux")]
+fn probe() -> L4Privilege {
+    const CAP_NET_ADMIN: u32 = 12;
+    const CAP_NET_RAW: u32 = 13;
+
+    let status = match std::fs::read_to_string("/proc/self/status") {
+        Ok(s) => s,
+        Err(e) => {
+            return L4Privilege::unavailable_both(&format!(
+                "could not read process capabilities (/proc/self/status: {e})"
+            ))
+        }
+    };
+    let Some(bits) = status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapEff:"))
+        .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+    else {
+        return L4Privilege::unavailable_both(
+            "could not read effective capabilities from /proc/self/status",
+        );
+    };
+    let has = |cap: u32| bits & (1u64 << cap) != 0;
+    L4Privilege {
+        capture_inject: (!has(CAP_NET_RAW)).then(|| {
+            "missing CAP_NET_RAW (raw capture/inject needs `setcap cap_net_raw+ep` on the \
+             binary, or root)"
+                .to_string()
+        }),
+        intercept: (!has(CAP_NET_ADMIN)).then(|| {
+            "missing CAP_NET_ADMIN (in-path NFQUEUE needs `setcap cap_net_admin+ep` on the \
+             binary, or root)"
+                .to_string()
+        }),
+    }
+}
+
+/// macOS: capture/inject goes through `/dev/bpf*` (read=capture, write=inject), so
+/// the first device node that opens read+write proves the capability. In-path
+/// interception is unsupported (no NFQUEUE), matching the fail-closed spec.
+#[cfg(target_os = "macos")]
+fn probe() -> L4Privilege {
+    use std::io::ErrorKind;
+
+    let mut capture_inject = Some(
+        "no read+write access to any /dev/bpf* device (capture/inject needs it; install \
+         ChmodBPF or run with privilege)"
+            .to_string(),
+    );
+    for n in 0..256u32 {
+        let path = format!("/dev/bpf{n}");
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            // Opened read+write ⇒ capture+inject available; the handle drops at once.
+            Ok(_f) => {
+                capture_inject = None;
+                break;
+            }
+            Err(e) => match e.kind() {
+                ErrorKind::NotFound => break, // past the last device node
+                _ => continue,                // denied / busy: try the next node
+            },
+        }
+    }
+    L4Privilege {
+        capture_inject,
+        intercept: Some(
+            "in-path interception is unsupported on macOS (Linux CAP_NET_ADMIN / NFQUEUE only)"
+                .to_string(),
+        ),
+    }
+}
+
+/// Other platforms have no supported capture/inject or in-path backend: fail-closed.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn probe() -> L4Privilege {
+    L4Privilege::unavailable_both("no supported L4 capture/inject backend on this platform")
+}
+
+/// A wire-touching `l4.*` command wrapped so that, when the startup probe found the
+/// required capability absent, every invocation returns a typed
+/// [`L4Error::Unavailable`] naming the missing capability — without touching the wire
+/// or re-probing. `name`/`schema` delegate to the inner command, so the command still
+/// appears, honestly, in `tools/list`.
+struct L4Gated {
+    inner: Arc<dyn Command>,
+    reason: String,
+}
+
+impl Command for L4Gated {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn schema(&self) -> ParamSchema {
+        self.inner.schema()
+    }
+
+    fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+        Err(anyhow::Error::new(L4Error::Unavailable(
+            self.reason.clone(),
+        )))
+    }
+}
+
+/// Wrap each command in `cmds` as [`L4Gated`] when `reason` is `Some` (the capability
+/// is unavailable); otherwise leave them live.
+fn gate(cmds: Vec<Arc<dyn Command>>, reason: Option<&str>) -> Vec<Arc<dyn Command>> {
+    match reason {
+        None => cmds,
+        Some(reason) => cmds
+            .into_iter()
+            .map(|inner| {
+                Arc::new(L4Gated {
+                    inner,
+                    reason: reason.to_string(),
+                }) as Arc<dyn Command>
+            })
+            .collect(),
+    }
+}
 
 /// The L4 protocol feature as a core [`Plugin`]. Holds the shared guard + flow
 /// store and registers the `l4.*` command surface.
@@ -46,26 +220,37 @@ pub struct L4Module {
     /// Live `l4.intercept` sessions, shared with the intercept commands so a
     /// session started by one call outlives it.
     sessions: Arc<InterceptSessions>,
+    /// The cached startup capability probe: wire verbs are gated on it, fail-closed.
+    privilege: L4Privilege,
 }
 
 impl L4Module {
-    /// Build a module from config: a guard seeded from `cfg.scope`, a fresh bounded
-    /// in-memory flow store, and the in-path interception settings (if any). The
-    /// binary (M5 Task 13) is the only caller in production; tests construct it
-    /// directly.
+    /// Build a module from config, running the cheap startup capability probe. The
+    /// binary (M5 Task 13) is the only caller in production; tests that want a known
+    /// privilege state use [`with_privilege`](L4Module::with_privilege).
     #[must_use]
     pub fn new(cfg: &L4Config) -> Self {
+        Self::with_privilege(cfg, L4Privilege::probe())
+    }
+
+    /// Build a module from config over an explicit capability probe result. The
+    /// binary passes the real probe (or a configured override); tests force a known
+    /// privilege state. Wire-touching verbs are gated on `privilege`, fail-closed.
+    #[must_use]
+    pub fn with_privilege(cfg: &L4Config, privilege: L4Privilege) -> Self {
         Self {
             guard: Arc::new(L4Guard::new(cfg)),
             store: Arc::new(InMemoryL4FlowStore::new()),
             intercept_cfg: cfg.intercept.clone(),
             sessions: Arc::new(InterceptSessions::new()),
+            privilege,
         }
     }
 
     /// Build a module over an already-shared guard + store (for wiring that owns
     /// the guard elsewhere, and for tests). `intercept_cfg` carries the in-path
-    /// settings; `None` disables `l4.intercept.*`.
+    /// settings; `None` disables `l4.intercept.*`. Assumes privilege is present
+    /// (the caller owns the guard and the capability decision).
     #[must_use]
     pub fn with_parts(
         guard: Arc<L4Guard>,
@@ -77,6 +262,7 @@ impl L4Module {
             store,
             intercept_cfg,
             sessions: Arc::new(InterceptSessions::new()),
+            privilege: L4Privilege::available(),
         }
     }
 
@@ -99,22 +285,33 @@ impl Plugin for L4Module {
     }
 
     fn load(&mut self, reg: &mut Registry) {
+        // The pure/read verbs (`l4.interfaces`, `l4.scope.*`, `l4.flow.*`, `l4.craft`)
+        // work regardless of privilege — never gated.
         for cmd in crate::commands::active_commands(self.guard(), self.store()) {
             reg.add_command(cmd);
         }
         // M5 Task 10 — the wire-touching commands (`l4.capture.*`, `l4.inject`,
-        // `l4.send_recv`), registered additively over the same guard + store.
-        for cmd in crate::commands::wire_commands(self.guard(), self.store()) {
+        // `l4.send_recv`). Registered even when raw capture/inject is unavailable, but
+        // gated to a fail-closed `L4Unavailable` naming the missing capability so the
+        // operator who opted in sees an honest, drivable surface (amended M5 Task 13).
+        for cmd in gate(
+            crate::commands::wire_commands(self.guard(), self.store()),
+            self.privilege.capture_inject.as_deref(),
+        ) {
             reg.add_command(cmd);
         }
         // The in-path interception commands (M5 Task 12) register additively over
         // the shared session registry, so a `start` outlives the call and the later
-        // verdict commands reach it.
-        for cmd in crate::commands::intercept::intercept_commands(
-            self.guard(),
-            self.store(),
-            self.sessions.clone(),
-            self.intercept_cfg.clone(),
+        // verdict commands reach it. Gated on in-path (`CAP_NET_ADMIN`) privilege the
+        // same way.
+        for cmd in gate(
+            crate::commands::intercept::intercept_commands(
+                self.guard(),
+                self.store(),
+                self.sessions.clone(),
+                self.intercept_cfg.clone(),
+            ),
+            self.privilege.intercept.as_deref(),
         ) {
             reg.add_command(cmd);
         }
@@ -153,7 +350,9 @@ mod tests {
     }
 
     fn registered(cfg: &L4Config) -> (Registry, Arc<L4Guard>, Arc<dyn L4FlowStore>) {
-        let module = L4Module::new(cfg);
+        // Known privilege state: these tests exercise the command surface, not the
+        // real platform probe (which they must not depend on).
+        let module = L4Module::with_privilege(cfg, L4Privilege::available());
         let guard = module.guard();
         let store = module.store();
         let mut reg = Registry::new();
@@ -415,5 +614,81 @@ mod tests {
         assert_eq!(obj.get("interface"), Some(&Value::Str("lo0".into())));
         assert_eq!(obj.get("packet_count"), Some(&Value::Int(1)));
         assert_eq!(obj.get("injected_count"), Some(&Value::Int(1)));
+    }
+
+    /// An `l4.inject` params object (spec + dst + interface). The gate short-circuits
+    /// before these are parsed, so a representative-but-minimal set suffices.
+    fn inject_params() -> Params {
+        let mut m = BTreeMap::new();
+        m.insert("spec".to_string(), craft_spec());
+        m.insert("dst".to_string(), Value::Str("127.0.0.1".into()));
+        m.insert("interface".to_string(), Value::Str("lo0".into()));
+        Params::new(m)
+    }
+
+    /// Amended M5 Task 13 (AC17): with the module enabled but the startup capability
+    /// probe reporting no privilege, the module STILL registers its full surface; the
+    /// pure/read verbs still work (`l4.interfaces`), but the wire-touching verbs
+    /// (`l4.inject`) return a typed `L4Unavailable` naming the missing capability —
+    /// without a panic and without re-probing.
+    #[test]
+    fn enabled_no_priv_wire_unavailable() {
+        use crate::backend::L4Error;
+
+        let cfg = L4Config {
+            enabled: true,
+            ..L4Config::default()
+        };
+        let privilege = L4Privilege {
+            capture_inject: Some("missing CAP_NET_RAW / /dev/bpf access".into()),
+            intercept: Some("missing CAP_NET_ADMIN".into()),
+        };
+        let module = L4Module::with_privilege(&cfg, privilege);
+        let mut reg = Registry::new();
+        reg.add_plugin(Box::new(module));
+
+        // The full surface is registered (an honest, drivable surface for the operator
+        // who opted in), wire verbs included.
+        assert!(reg.command("l4.inject").is_some(), "l4.inject registered");
+        assert!(
+            reg.command("l4.interfaces").is_some(),
+            "l4.interfaces registered"
+        );
+        assert!(reg.command("l4.craft").is_some(), "l4.craft registered");
+
+        let store = MemFlowStore::new();
+        let client = StubClient;
+        let guard = StdGuard::default();
+        let h = host(&store, &client, &guard);
+
+        // A pure/read verb works regardless of privilege.
+        reg.command("l4.interfaces")
+            .expect("l4.interfaces registered")
+            .invoke(Params::default(), &h)
+            .expect("l4.interfaces works without privilege");
+
+        // A wire verb fails closed with the specific capability reason.
+        let err = reg
+            .command("l4.inject")
+            .expect("l4.inject registered")
+            .invoke(inject_params(), &h)
+            .unwrap_err();
+        let l4 = err
+            .downcast_ref::<L4Error>()
+            .unwrap_or_else(|| panic!("want a typed L4Error, got {err:?}"));
+        match l4 {
+            L4Error::Unavailable(why) => assert!(
+                why.contains("CAP_NET_RAW") || why.contains("/dev/bpf"),
+                "the reason must name the missing capability, got {why:?}"
+            ),
+            other => panic!("want L4Error::Unavailable, got {other:?}"),
+        }
+    }
+
+    /// The real startup probe is defensive: it never panics, whatever the platform
+    /// or privilege. (Behaviour is platform-dependent; this only pins "no panic".)
+    #[test]
+    fn probe_does_not_panic() {
+        let _ = L4Privilege::probe();
     }
 }

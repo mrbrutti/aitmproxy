@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aitm::render::render_cli_value;
-use aitm::wire::{assemble, Assembled, Http1Sender};
+use aitm::wire::{assemble_with, Assembled, Features, Http1Sender};
 use aitm::{config_file, env};
 use aitm_core::{BrowserDriver, PipelineClient, ProxyClient};
 use tracing::{info, warn};
@@ -30,9 +30,16 @@ async fn main() -> anyhow::Result<()> {
 
     let (config_arg, argv) = split_config_arg(std::env::args().skip(1).collect())?;
     let config_path = config_arg.or_else(|| std::env::var_os(CONFIG_ENV).map(PathBuf::from));
-    let mut cfg = config_file::load(config_path.as_deref())?;
+    let (mut cfg, l4) = config_file::load_full(config_path.as_deref())?;
     env::apply(&mut cfg, |k| std::env::var(k).ok());
-    let Assembled { proxy, ca } = assemble(&cfg)?;
+    // The L4 module is opt-in (fail-closed) and carried outside `aitm-core`'s `Config`,
+    // so it rides the binary-owned feature set. `l4_privilege: None` runs the real
+    // startup capability probe (M5-AC17).
+    let features = Features {
+        l4,
+        ..Features::default()
+    };
+    let Assembled { proxy, ca } = assemble_with(&cfg, &features)?;
 
     // Shared service handles for the frontends and the replay client.
     let registry = proxy.registry_arc();
