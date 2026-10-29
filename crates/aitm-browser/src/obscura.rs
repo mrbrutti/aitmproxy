@@ -7,6 +7,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
@@ -19,7 +20,6 @@ use anyhow::Context as _;
 use chromiumoxide::browser::Browser;
 use futures::future::BoxFuture;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -58,8 +58,11 @@ const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// The fork's CDP WebSocket path (`obscura serve` prints it when it listens).
 const CDP_WS_PATH: &str = "/devtools/browser";
 
-/// Ready-file name: `<prefix><aitm pid>-<cdp port><suffix>` under the OS temp dir.
-const READY_FILE_PREFIX: &str = "aitm-obscura-";
+/// Prefix of the per-run directory (`<prefix><aitm pid>-<token>`) under the OS
+/// temp dir that holds one child's ready-file. The directory is created `0700`
+/// and the token is unpredictable, so no other local user can pre-create the
+/// path the child treats as its readiness signal, nor read it.
+const RUN_DIR_PREFIX: &str = "aitm-obscura-";
 const READY_FILE_SUFFIX: &str = ".ready";
 
 /// What the probe learned about the binary.
@@ -186,36 +189,86 @@ fn lookup_on_path(name: &str) -> Option<PathBuf> {
 }
 
 /// A loopback port nothing listens on right now (bind-and-release).
+///
+/// Residual race (documented, accepted): the listener is dropped here and the
+/// child binds the same port moments later, so a local process could grab it in
+/// between. There is no inherited-FD path through `obscura serve --port`, and
+/// `obscura` does not report a `--port 0` choice, so the window cannot be closed
+/// from this side. It is mitigated: readiness is gated on the child's own
+/// ready-file in a `0700` per-run directory (see [`wait_ready`]), never on a
+/// bare TCP accept, so a stranger that stole the port is not mistaken for a
+/// ready obscura, and the child that fails to bind exits with an error the
+/// caller sees.
 fn free_loopback_port() -> anyhow::Result<u16> {
     let listener =
         TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).context("picking a free loopback port")?;
     Ok(listener.local_addr()?.port())
 }
 
-/// Log any ready-file an earlier `aitm` left behind (it was killed, so no
+/// An unpredictable 128-bit token as hex, seeded from the OS RNG (std's
+/// `RandomState`), for the per-run directory and ready-file names. Not a secret;
+/// just enough entropy that the path a local attacker would have to pre-create
+/// is unguessable.
+fn random_token() -> String {
+    let a = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    let b = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    format!("{a:016x}{b:016x}")
+}
+
+/// Create a `0700` per-run directory under the OS temp dir with an unpredictable
+/// name and return it together with the ready-file path inside it. The child is
+/// the only writer of the ready-file, and the private directory keeps any other
+/// local user from reading it or pre-creating it.
+fn make_run_dir() -> io::Result<(PathBuf, PathBuf)> {
+    let token = random_token();
+    let dir = std::env::temp_dir().join(format!("{RUN_DIR_PREFIX}{}-{token}", std::process::id()));
+    create_private_dir(&dir)?;
+    let ready_file = dir.join(format!("ready-{token}{READY_FILE_SUFFIX}"));
+    Ok((dir, ready_file))
+}
+
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(dir)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir(dir)
+}
+
+/// Log any per-run directory an earlier `aitm` left behind (it was killed, so no
 /// destructor ran); the operator decides whether an obscura is still running.
-fn warn_stale_ready_files() {
+fn warn_stale_run_dirs() {
     let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
         return;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with(READY_FILE_PREFIX) && name.ends_with(READY_FILE_SUFFIX) {
+        if name.starts_with(RUN_DIR_PREFIX) && entry.path().is_dir() {
             warn!(
                 path = %entry.path().display(),
-                "stale obscura ready-file from an earlier run; remove it if no obscura is running"
+                "stale obscura run directory from an earlier run; remove it if no obscura is running"
             );
         }
     }
 }
 
-/// Remove the ready-file; a missing one is fine (idempotent).
-fn remove_ready_file(path: &Path) {
-    match std::fs::remove_file(path) {
+/// Remove the per-run directory and its ready-file; a missing one is fine
+/// (idempotent).
+fn remove_run_dir(dir: &Path) {
+    match std::fs::remove_dir_all(dir) {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => debug!(path = %path.display(), %err, "could not remove the obscura ready-file"),
+        Err(err) => {
+            debug!(path = %dir.display(), %err, "could not remove the obscura run directory")
+        }
     }
 }
 
@@ -246,6 +299,8 @@ pub struct ObscuraProcess {
     /// The pid at spawn; `Child::id` is `None` once the child is reaped.
     pid: u32,
     cdp_port: u16,
+    /// The `0700` per-run directory that holds `ready_file`; removed on stop/drop.
+    run_dir: PathBuf,
     ready_file: PathBuf,
     spawned_at: Instant,
     stop_timeout: Duration,
@@ -276,9 +331,19 @@ impl ObscuraProcess {
                 &format!("http://127.0.0.1:{}", config.proxy_addr.port()),
             ])
             .arg("--ca-cert")
-            .arg(ca_cert)
-            .arg("--allow-private-network")
-            .arg("--ready-file")
+            .arg(ca_cert);
+        // Mirror the SSRF policy at the engine (audit I15, defence in depth): the
+        // flag lets obscura's own navigations reach loopback/private ranges, so
+        // pass it only when the policy permits private targets. Under the default
+        // strict policy (`block_private = true`) the flag is omitted, so obscura
+        // refuses private targets on its own. The SSRF-filtering connector on the
+        // proxy port remains the authoritative enforcement and re-checks every
+        // connection (loopback included) after resolution; this flag never widens
+        // past it, it only narrows the engine to match.
+        if !config.ssrf.block_private {
+            cmd.arg("--allow-private-network");
+        }
+        cmd.arg("--ready-file")
             .arg(ready_file)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -309,14 +374,13 @@ impl ObscuraProcess {
         let probed = probe(&binary).await?;
         info!(binary = %binary.display(), version = %probed.version, "obscura probed");
 
-        warn_stale_ready_files();
+        warn_stale_run_dirs();
         let cdp_port = free_loopback_port()?;
-        let ready_file = std::env::temp_dir().join(format!(
-            "{READY_FILE_PREFIX}{}-{cdp_port}{READY_FILE_SUFFIX}",
-            std::process::id()
-        ));
-        // A leftover with this name would read as "ready" before the child is.
-        remove_ready_file(&ready_file);
+        // A fresh 0700 directory with an unpredictable name: the ready-file path
+        // inside it cannot pre-exist (so a leftover cannot read as "ready" before
+        // the child is) and no other local user can read or forge it.
+        let (run_dir, ready_file) =
+            make_run_dir().context("creating the obscura per-run directory")?;
 
         let mut child = Self::command(config, &binary, ca_cert, cdp_port, &ready_file)
             .spawn()
@@ -340,6 +404,7 @@ impl ObscuraProcess {
             child,
             pid,
             cdp_port,
+            run_dir,
             ready_file,
             spawned_at,
             stop_timeout: config.obscura.stop_timeout,
@@ -351,8 +416,14 @@ impl ObscuraProcess {
         Ok((process, format!("ws://127.0.0.1:{cdp_port}{CDP_WS_PATH}")))
     }
 
-    /// Poll until the ready-file appears or the CDP port accepts a connection,
-    /// whichever first; a child that exits first is an immediate error.
+    /// Poll until the child writes its ready-file; a child that exits first is
+    /// an immediate error. Readiness is the child's own signal — written only
+    /// once its CDP server listens — not a bare TCP accept (audit minor b): a
+    /// stranger that grabbed the port after [`free_loopback_port`] released it
+    /// can accept a connection, but it cannot write the ready-file in our `0700`
+    /// directory. The authoritative CDP handshake is the `Browser::connect` in
+    /// [`ObscuraDriver::launch`], which runs as soon as this returns and fails
+    /// loudly if the listener is not in fact obscura.
     async fn wait_ready(
         &mut self,
         start_timeout: Duration,
@@ -370,11 +441,7 @@ impl ObscuraProcess {
                     self.stderr_tail_text()
                 );
             }
-            if self.ready_file.exists()
-                || TcpStream::connect((Ipv4Addr::LOCALHOST, self.cdp_port))
-                    .await
-                    .is_ok()
-            {
+            if self.ready_file.exists() {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -439,7 +506,7 @@ impl ObscuraProcess {
             }
         }
         info!(pid = self.pid, "obscura stopped");
-        remove_ready_file(&self.ready_file);
+        remove_run_dir(&self.run_dir);
         Ok(())
     }
 
@@ -466,9 +533,9 @@ impl ObscuraProcess {
 }
 
 impl Drop for ObscuraProcess {
-    /// `kill_on_drop` reaps the child; the ready-file is ours to remove.
+    /// `kill_on_drop` reaps the child; the per-run directory is ours to remove.
     fn drop(&mut self) {
-        remove_ready_file(&self.ready_file);
+        remove_run_dir(&self.run_dir);
     }
 }
 
@@ -638,5 +705,78 @@ impl BrowserDriver for ObscuraDriver {
 
     fn get_dom(&self) -> BoxFuture<'_, anyhow::Result<String>> {
         Box::pin(self.timed("get_dom", self.session.get_dom()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audit minor b: the per-run directory is created private (`0700` on unix),
+    /// the ready-file lives inside it, and its name is unpredictable — two runs
+    /// never collide — so no other local user can read or forge the child's
+    /// readiness signal.
+    #[test]
+    fn run_dir_is_private_and_unpredictable() {
+        let (dir_a, ready_a) = make_run_dir().expect("create run dir a");
+        let (dir_b, ready_b) = make_run_dir().expect("create run dir b");
+
+        // Clean up whatever we created, whatever the assertions do.
+        struct Cleanup<'a>(&'a Path, &'a Path);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                remove_run_dir(self.0);
+                remove_run_dir(self.1);
+            }
+        }
+        let _guard = Cleanup(&dir_a, &dir_b);
+
+        assert!(
+            dir_a.is_dir(),
+            "run dir was not created: {}",
+            dir_a.display()
+        );
+        assert!(
+            ready_a.starts_with(&dir_a),
+            "ready-file {} is not inside its run dir {}",
+            ready_a.display(),
+            dir_a.display()
+        );
+        assert!(
+            ready_a.to_string_lossy().ends_with(READY_FILE_SUFFIX),
+            "ready-file does not end in {READY_FILE_SUFFIX}: {}",
+            ready_a.display()
+        );
+        assert!(
+            !ready_a.exists(),
+            "ready-file must not pre-exist: {}",
+            ready_a.display()
+        );
+        assert_ne!(dir_a, dir_b, "two runs produced the same directory");
+        assert_ne!(ready_a, ready_b, "two runs produced the same ready-file");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir_a)
+                .expect("stat run dir")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o700,
+                "run dir is not 0700: {:o}",
+                mode & 0o777
+            );
+        }
+    }
+
+    /// The token has real entropy: a batch of them is all-distinct.
+    #[test]
+    fn random_token_does_not_repeat() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            assert!(seen.insert(random_token()), "random_token repeated");
+        }
     }
 }

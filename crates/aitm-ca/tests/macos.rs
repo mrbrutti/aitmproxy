@@ -552,3 +552,38 @@ fn store_model_surface() {
     let as_anyhow: anyhow::Error = e.clone().into();
     assert_eq!(kind_of(&as_anyhow), TrustErrorKind::NeedsRoot);
 }
+
+/// Audit minor e — a present certificate's trust is reported as `Unknown`
+/// (macOS has no reliable CLI trust check), but the `detail` now says so
+/// explicitly: present yet UNCONFIRMED, with how to confirm it. An absent
+/// certificate carries no such claim.
+#[test]
+fn status_present_detail_names_unconfirmed_trust() {
+    let cert = fixture_cert();
+    let store = MacOsStore;
+
+    let exec = ScriptedExecutor::new().respond(Q_USER, 0, &present_output(), "");
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.installed, Presence::Present);
+    assert_eq!(st.trusted, Trust::Unknown);
+    assert!(
+        st.detail.iter().any(|d| d.contains("UNCONFIRMED")),
+        "present status must name the unconfirmed trust: {:?}",
+        st.detail
+    );
+    assert!(
+        st.detail.iter().any(|d| d.contains(MACOS_DETAIL)),
+        "detail: {:?}",
+        st.detail
+    );
+
+    // Absent: no "present but unconfirmed" claim.
+    let exec = ScriptedExecutor::new().respond(Q_USER, 0, &other_output(), "");
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.installed, Presence::Absent);
+    assert!(
+        !st.detail.iter().any(|d| d.contains("UNCONFIRMED")),
+        "absent status must not claim an unconfirmed present cert: {:?}",
+        st.detail
+    );
+}

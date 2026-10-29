@@ -119,6 +119,17 @@ impl Command for Navigate {
 
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         let url = args.get_str("url")?;
+        // This check is defence in depth, NOT the authoritative SSRF control
+        // (audit minor d). It resolves `url` once, then hands the *raw* `url` to
+        // the browser, which re-resolves it at connect time — a DNS-rebinding
+        // TOCTOU window where the second lookup could return a private address
+        // this check never saw. We cannot close it by pinning navigation to
+        // `target.addr`: a browser dialing an IP literal breaks TLS SNI, the
+        // Host header, and certificate validation, so the rewrite would fail
+        // every HTTPS target. The authoritative enforcement is the SSRF-filtering
+        // connector on the proxy port, which re-resolves and re-checks every
+        // connection the browser makes (the rebind-safe path); this command-level
+        // check only rejects the obvious cases early, before touching the driver.
         let target = check_url(
             url,
             &self.policy,
