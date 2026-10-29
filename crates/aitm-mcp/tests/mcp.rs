@@ -1663,6 +1663,101 @@ async fn slow_subscriber_lags_not_blocks() {
     let _ = b_task.await;
 }
 
+/// RF#3 (fix, unit): `await_reply_capacity` parks while the reply lane is at its
+/// high-water mark and releases once a drain frees room — or the sink closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn await_reply_capacity_releases_on_drain_and_close() {
+    let sink = NotificationSink::with_limits(16, 2);
+    sink.push_reply("a".into());
+    sink.push_reply("b".into()); // reply lane now at the high-water mark (2)
+
+    let s2 = sink.clone();
+    let waiter = tokio::spawn(async move { s2.await_reply_capacity().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !waiter.is_finished(),
+        "a reader parks while the reply lane is full"
+    );
+
+    let _ = sink.drain(); // frees the lane and wakes the waiter
+    tokio::time::timeout(Duration::from_millis(500), waiter)
+        .await
+        .expect("the waiter is released after a drain")
+        .expect("waiter task");
+
+    // When the sink is closed, capacity is granted at once even while full, so a
+    // reader never hangs on a writer that has gone.
+    sink.push_reply("x".into());
+    sink.push_reply("y".into());
+    sink.close();
+    tokio::time::timeout(Duration::from_millis(500), sink.await_reply_capacity())
+        .await
+        .expect("await returns at once once the sink is closed");
+}
+
+/// RF#3 (fix, end-to-end): a client that pipelines requests but never reads its
+/// socket does not grow the reply lane without bound — the server read loop
+/// backpressures (pauses) at the reply high-water mark, and no reply is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_without_read_client_backpressures_not_unbounded() {
+    const HIGH_WATER: usize = 8;
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store, 64);
+
+    // A tiny duplex so the writer blocks almost at once once the client stops
+    // reading; a small reply high-water so the reader parks quickly.
+    let (client, server_side) = duplex(256);
+    let (s_r, s_w) = split(server_side);
+    let sink = NotificationSink::with_limits(64, HIGH_WATER);
+    let mut conn = ConnCtx::new(Frontend::Operator);
+    conn.out = Some(sink.clone());
+    let task = tokio::spawn(aitm_mcp::transport::serve_lines(
+        srv,
+        BufReader::new(s_r),
+        s_w,
+        conn,
+    ));
+
+    // The client writes many tiny requests and NEVER reads replies. Its own writes
+    // will themselves block once the server stops reading (end-to-end backpressure),
+    // so drive them from a task we simply let run as far as it can.
+    let (c_r, mut c_w) = split(client);
+    let writer = tokio::spawn(async move {
+        for i in 0..5_000u32 {
+            let line = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{i},\"method\":\"tools/call\",\
+                 \"params\":{{\"name\":\"nope\",\"arguments\":{{}}}}}}\n"
+            );
+            if c_w.write_all(line.as_bytes()).await.is_err() {
+                break;
+            }
+            let _ = c_w.flush().await;
+        }
+        c_w
+    });
+
+    // Give the pipeline time to fill and the reader to park.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(
+        sink.reply_queued_len() <= HIGH_WATER,
+        "the reply lane grew past the high-water mark ({HIGH_WATER}): {}",
+        sink.reply_queued_len()
+    );
+    assert!(
+        !task.is_finished(),
+        "the server read loop is parked (backpressured), not finished/crashed"
+    );
+
+    // Teardown: closing the client fully makes the server writer error and close
+    // the sink, which unblocks the parked reader so it exits.
+    drop(c_r);
+    writer.abort();
+    task.abort();
+    let _ = task.await;
+    let _ = writer.await;
+}
+
 // ------------------------------------------ M4 Task 5: confirm-over-the-wire
 
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -2166,6 +2261,35 @@ impl Command for SecretEchoCmd {
     }
 }
 
+/// A Read command whose `invoke` always fails, returning the caller-supplied
+/// `reason` verbatim as the error — so a test can prove the audited error reason
+/// is scrubbed by content before it is recorded.
+struct ErrEchoCmd;
+
+impl Command for ErrEchoCmd {
+    fn name(&self) -> &str {
+        "demo.errecho"
+    }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
+    }
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "Fail with the given reason.".into(),
+            params: vec![ParamDef {
+                name: "reason".into(),
+                ty: TypeDesc::Str,
+                required: true,
+                description: String::new(),
+            }],
+            result: TypeDesc::Any,
+        }
+    }
+    fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+        Err(anyhow::anyhow!(args.get_str("reason")?.to_string()))
+    }
+}
+
 /// A server whose registry carries a Read command (`demo.read`), a gateless
 /// Sensitive command (`demo.sensitive`), the secret-echo command, and the real
 /// `AgentPlugin` — all sharing `ring`, so `agent.activity` reads exactly what
@@ -2293,6 +2417,175 @@ fn audit_redacts_secrets() {
         "token leaked into push"
     );
     assert!(!pushed.contains("SECRET-AUTH-XYZ"), "auth leaked into push");
+}
+
+/// RF#3 (fix): a secret carried inside a *non-secret-named* value — a token in a
+/// query string, a credential in a form body — must be masked by content, not
+/// just by key. The audit entry and the pushed `agent` line must both be clean.
+#[test]
+fn audit_redacts_secret_inside_non_secret_named_value() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+
+    // A subscribed operator so the pushed line can be inspected too.
+    let watcher = ConnCtx {
+        role: Frontend::Operator,
+        client_label: None,
+        conn_id: srv.next_conn_id(),
+        out: Some(aitm_mcp::NotificationSink::new(64)),
+    };
+    srv.handle_on(
+        &watcher,
+        &json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"flow.subscribe","arguments":{}}})
+        .to_string(),
+    )
+    .expect("subscribe reply");
+
+    // `note` is a plain string arg (NOT a secret-named key), carrying both a
+    // query-string token and a form-body credential.
+    srv.handle_on(
+        &ConnCtx::new(Frontend::Mcp),
+        &json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+        "name":"demo.secret",
+        "arguments":{
+            "note":"GET /v1?access_token=sk-SECRET-IN-QUERY then body user=admin&password=hunter2"
+        }}})
+        .to_string(),
+    )
+    .expect("call reply");
+
+    let entry = ring
+        .recent(None, None)
+        .into_iter()
+        .find(|e| e.command == "demo.secret")
+        .expect("the call was audited");
+    assert!(
+        !entry.args_summary.contains("sk-SECRET-IN-QUERY"),
+        "query-string token leaked into the audit entry: {}",
+        entry.args_summary
+    );
+    assert!(
+        !entry.args_summary.contains("hunter2"),
+        "body credential leaked into the audit entry: {}",
+        entry.args_summary
+    );
+    assert!(
+        entry.args_summary.contains("[redacted]"),
+        "redaction marker present: {}",
+        entry.args_summary
+    );
+
+    let pushed = watcher.out.as_ref().unwrap().drain().join("\n");
+    assert!(
+        !pushed.contains("sk-SECRET-IN-QUERY"),
+        "token leaked into push"
+    );
+    assert!(!pushed.contains("hunter2"), "credential leaked into push");
+}
+
+/// RF#3 (fix): an error/refusal *reason* that echoes a bad argument value is
+/// scrubbed by content before it is recorded (a header-error or coercion error
+/// must not persist a secret fragment). Driven by a command whose `invoke`
+/// returns an error reason quoting a credential.
+#[test]
+fn audit_redacts_secret_in_error_reason() {
+    let ring = Arc::new(AuditRing::default());
+    let mut reg = Registry::new();
+    reg.add_command(Arc::new(ErrEchoCmd));
+    let state = Arc::new(AgentState::new(AgentPolicy::Auto));
+    reg.add_plugin(Box::new(
+        AgentPlugin::new(state.clone()).with_audit_ring(ring.clone()),
+    ));
+    let srv = McpServer::new(Arc::new(reg), McpTransport::Stdio)
+        .with_services(
+            Arc::new(MemFlowStore::new()),
+            Arc::new(StubClient),
+            Arc::new(StdGuard::default()),
+            None,
+        )
+        .with_agent_state(state)
+        .with_audit_ring(ring.clone());
+
+    srv.handle_on(
+        &ConnCtx::new(Frontend::Mcp),
+        &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"demo.errecho",
+            "arguments":{"reason":"rejected header value token=sk-LEAK-IN-ERR"}}})
+        .to_string(),
+    )
+    .expect("call reply");
+
+    let entry = ring
+        .recent(None, None)
+        .into_iter()
+        .find(|e| e.command == "demo.errecho")
+        .expect("the failed call was audited");
+    match &entry.result {
+        aitm_core::AuditResult::Error(reason) => {
+            assert!(
+                !reason.contains("sk-LEAK-IN-ERR"),
+                "secret leaked into the error reason: {reason}"
+            );
+            assert!(reason.contains("[redacted]"), "reason scrubbed: {reason}");
+        }
+        other => panic!("expected an error result, got {other:?}"),
+    }
+}
+
+/// RF#6: a refused subscription verb is audited (a gate decision), while a
+/// successful one is not (it is connection management, not a command invocation).
+#[test]
+fn subscription_refusal_is_audited_but_success_is_not() {
+    let ring = Arc::new(AuditRing::default());
+    let state = Arc::new(AgentState::new(AgentPolicy::Paused));
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(
+        AgentPlugin::new(state.clone()).with_audit_ring(ring.clone()),
+    ));
+    let srv = McpServer::new(Arc::new(reg), McpTransport::Stdio)
+        .with_services(
+            Arc::new(MemFlowStore::new()),
+            Arc::new(StubClient),
+            Arc::new(StdGuard::default()),
+            None,
+        )
+        .with_agent_state(state)
+        .with_audit_ring(ring.clone());
+
+    // Agent `flow.subscribe` under `Paused` is refused — and now audited.
+    assert!(is_refused(&call_as(&srv, Frontend::Mcp, "flow.subscribe")));
+    let subs: Vec<_> = ring
+        .recent(None, None)
+        .into_iter()
+        .filter(|e| e.command == "flow.subscribe")
+        .collect();
+    assert_eq!(subs.len(), 1, "a refused subscribe is audited");
+    assert!(
+        matches!(subs[0].result, aitm_core::AuditResult::Error(_)),
+        "the audited subscribe refusal carries an error result"
+    );
+
+    // Operator `flow.subscribe` (with a push sink) succeeds — and is NOT audited.
+    let watcher = ConnCtx {
+        role: Frontend::Operator,
+        client_label: None,
+        conn_id: srv.next_conn_id(),
+        out: Some(aitm_mcp::NotificationSink::new(16)),
+    };
+    srv.handle_on(
+        &watcher,
+        &json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"flow.subscribe","arguments":{}}})
+        .to_string(),
+    )
+    .expect("subscribe reply");
+    let after = ring
+        .recent(None, None)
+        .into_iter()
+        .filter(|e| e.command == "flow.subscribe")
+        .count();
+    assert_eq!(after, 1, "a successful subscribe is not audited");
 }
 
 /// AC-M4-6b / spec D3a.4: `agent.activity` reads recent entries, honouring

@@ -14,9 +14,6 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::OnceLock;
-
-use regex::Regex;
 
 use crate::record::{
     fmt_time, origin_str, FindingFilter, FindingRecord, FindingSummary, StoredRecord,
@@ -84,8 +81,8 @@ impl FindingStore for DiskFindingStore {
         }
         // Secrets never reach disk: redact the free-text fields (poc_ref/paths are
         // references, not credential-bearing).
-        r.title = redact(&r.title);
-        r.notes = r.notes.as_deref().map(redact);
+        r.title = aitm_core::redact::scrub_text(&r.title);
+        r.notes = r.notes.as_deref().map(aitm_core::redact::scrub_text);
 
         std::fs::create_dir_all(&self.dir)?;
         let stored = StoredRecord::from(&r);
@@ -191,35 +188,4 @@ fn slug(s: &str) -> String {
         }
     }
     out.trim_matches('-').to_string()
-}
-
-/// Mask credential material in free text before it is persisted. Covers an
-/// `Authorization:`/`=` value (to end of line), a `Bearer <token>`, and a
-/// `token`/`api_key`/`secret`/`password`-style `key: value` pair.
-fn redact(text: &str) -> String {
-    static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
-    let patterns = PATTERNS.get_or_init(|| {
-        vec![
-            (
-                Regex::new(r"(?i)(authorization\s*[:=]\s*).+").unwrap(),
-                "${1}[redacted]",
-            ),
-            (
-                Regex::new(r"(?i)(bearer\s+)\S+").unwrap(),
-                "${1}[redacted]",
-            ),
-            (
-                Regex::new(
-                    r"(?i)(\b(?:api[_-]?key|apikey|token|secret|password|passwd|pwd)\b\s*[:=]\s*)\S+",
-                )
-                .unwrap(),
-                "${1}[redacted]",
-            ),
-        ]
-    });
-    let mut out = text.to_string();
-    for (re, rep) in patterns {
-        out = re.replace_all(&out, *rep).into_owned();
-    }
-    out
 }

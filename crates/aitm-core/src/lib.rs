@@ -21,6 +21,7 @@ pub mod header;
 pub mod plugin;
 pub mod protocol;
 pub mod proxy;
+pub mod redact;
 pub mod registry;
 pub mod store;
 pub mod stream;

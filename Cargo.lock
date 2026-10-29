@@ -108,6 +108,7 @@ dependencies = [
  "dirs",
  "futures",
  "indexmap",
+ "regex",
  "tokio",
  "tracing",
  "uuid",
@@ -121,7 +122,6 @@ dependencies = [
  "aitm-poc",
  "anyhow",
  "futures",
- "regex",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -141,6 +141,7 @@ dependencies = [
  "futures",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
