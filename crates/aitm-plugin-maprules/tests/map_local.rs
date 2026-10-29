@@ -299,9 +299,147 @@ fn map_local_path_escape_rejected() {
             &host,
         )
         .expect_err("a path escaping the map root is rejected at map.add");
+    // Assert the *distinctive* escape message, not just "map root" (which the
+    // not-found branch also emits), so the test pins the confinement branch.
     assert!(
-        err.to_string().contains("map root"),
+        err.to_string().contains("escapes the map root"),
         "the error names the confinement violation: {err}"
+    );
+}
+
+/// A sibling file that resolves *inside* the map root is accepted at `map.add`
+/// (the confinement rejects escapes, not every relative path).
+#[test]
+fn map_local_sibling_path_accepted() {
+    let root = TempDir::new("sibling");
+    std::fs::write(root.path().join("ok.json"), b"{}").expect("write sibling fixture");
+
+    let reg = registry(root.path(), true);
+    let store = MemFlowStore::new();
+    let guard = StdGuard::default();
+    let client = CountingClient::default();
+    let host = CommandHost::new(&store, &client, &guard, None).with_frontend(Frontend::Cli);
+
+    reg.command("map.add")
+        .expect("map.add registered")
+        .invoke(
+            params(&[
+                ("kind", Value::Str("local".into())),
+                (
+                    "condition",
+                    obj(&[("url", obj(&[("wildcard", Value::Str("*".into()))]))]),
+                ),
+                ("action", obj(&[("path", Value::Str("ok.json".into()))])),
+            ]),
+            &host,
+        )
+        .expect("a file resolving inside the map root is accepted");
+}
+
+/// Add a `*`-matching Map Local rule serving `path` via a CLI frontend.
+fn add_local(reg: &Registry, path: &str) {
+    let store = MemFlowStore::new();
+    let guard = StdGuard::default();
+    let client = CountingClient::default();
+    let host = CommandHost::new(&store, &client, &guard, None).with_frontend(Frontend::Cli);
+    reg.command("map.add")
+        .expect("map.add registered")
+        .invoke(
+            params(&[
+                ("kind", Value::Str("local".into())),
+                (
+                    "condition",
+                    obj(&[("url", obj(&[("wildcard", Value::Str("*".into()))]))]),
+                ),
+                ("action", obj(&[("path", Value::Str(path.into()))])),
+            ]),
+            &host,
+        )
+        .expect("map.add succeeds");
+}
+
+/// Audit minor (b): a Map Local file over the serve cap is refused with a 502,
+/// before its bytes are read into the response.
+#[test]
+fn map_local_over_cap_refused() {
+    let root = TempDir::new("cap");
+    // A file of 2048 bytes against a 1024-byte cap.
+    std::fs::write(root.path().join("big.bin"), vec![b'x'; 2048]).expect("write big fixture");
+
+    let mut reg = Registry::new();
+    let guard: Arc<dyn aitm_core::ScopeRateGuard> = Arc::new(StdGuard::default());
+    reg.add_plugin(Box::new(
+        MapRulesPlugin::new(root.path().to_path_buf(), true, guard).with_max_local_bytes(1024),
+    ));
+    add_local(&reg, "big.bin");
+
+    let (served, verdict) = dispatch(
+        &reg,
+        &Event::RequestHeaders(FlowId::new()),
+        http_flow("/big.bin"),
+    );
+    assert_eq!(verdict, Verdict::Halt, "a cap miss still short-circuits");
+    let Flow::Http(f) = &served else {
+        panic!("expected an HTTP flow")
+    };
+    let resp = f.response.as_ref().expect("a 502 is synthesized");
+    assert_eq!(resp.status, 502, "an oversized file is refused, not served");
+    assert!(
+        String::from_utf8_lossy(resp.body_bytes()).contains("over the 1024-byte serve limit"),
+        "the 502 body names the cap: {}",
+        String::from_utf8_lossy(resp.body_bytes())
+    );
+}
+
+/// Audit minor (c): confinement is re-checked at serve time (TOCTOU). A file that
+/// resolved inside the root at `map.add` but is later swapped for a symlink escaping
+/// the root is refused at serve time — the outside file's contents are not served.
+#[cfg(unix)]
+#[test]
+fn map_local_serve_time_symlink_escape_refused() {
+    let parent = TempDir::new("toctou");
+    let root = parent.path().join("root");
+    std::fs::create_dir_all(&root).expect("create map root");
+    // A legitimate in-root file, mapped at add time.
+    std::fs::write(root.join("served.bin"), b"IN-ROOT").expect("write in-root fixture");
+    // A secret outside the root, the symlink's future target.
+    let secret = parent.path().join("secret.bin");
+    std::fs::write(&secret, b"TOP SECRET").expect("write secret");
+
+    let reg = registry(&root, true);
+    add_local(&reg, "served.bin");
+
+    // Swap the in-root file for a symlink pointing outside the root (the TOCTOU).
+    std::fs::remove_file(root.join("served.bin")).expect("remove in-root file");
+    std::os::unix::fs::symlink(&secret, root.join("served.bin")).expect("plant symlink");
+
+    let (served, verdict) = dispatch(
+        &reg,
+        &Event::RequestHeaders(FlowId::new()),
+        http_flow("/served.bin"),
+    );
+    assert_eq!(
+        verdict,
+        Verdict::Halt,
+        "a refused serve still short-circuits"
+    );
+    let Flow::Http(f) = &served else {
+        panic!("expected an HTTP flow")
+    };
+    let resp = f.response.as_ref().expect("a 502 is synthesized");
+    assert_eq!(
+        resp.status, 502,
+        "the escaping symlink is refused at serve time"
+    );
+    assert_ne!(
+        resp.body_bytes(),
+        b"TOP SECRET",
+        "the outside file's contents are never served"
+    );
+    assert!(
+        String::from_utf8_lossy(resp.body_bytes()).contains("escapes the map root"),
+        "the 502 names the confinement violation: {}",
+        String::from_utf8_lossy(resp.body_bytes())
     );
 }
 

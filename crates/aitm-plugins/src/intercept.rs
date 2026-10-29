@@ -248,7 +248,7 @@ fn rule_param_fields() -> Vec<ParamDef> {
         field(
             "phase",
             TypeDesc::Str,
-            "Lifecycle point: request (default), response, wsframe, or any.",
+            "Lifecycle point: request (default), response, ws_frame, or any.",
         ),
         field(
             "url",

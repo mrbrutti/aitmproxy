@@ -3,9 +3,8 @@
 //!
 //! The condition is the shared [`aitm_rules::MatchCondition`] (so Map reuses F3's
 //! matcher); only the *action* is Map-specific. Map Local serves a confined local
-//! file as the response; Map Remote rewrites the target host before upstream
-//! (the serve-side of Remote lands in Task 13 — the type is defined here so that
-//! task extends it rather than re-shaping the stored entry).
+//! file as the response; Map Remote rewrites the target host before upstream, after
+//! the rewritten authority passes the scope guard.
 
 use aitm_core::Value;
 use aitm_rules::{bus, MatchCondition, Phase};
@@ -21,8 +20,8 @@ pub enum MapAction {
         status: Option<u16>,
         headers: Vec<(String, String)>,
     },
-    /// Rewrite the request's target before it goes upstream (a redirect). The
-    /// serve-side (scope-guarded rewrite) is Task 13; the shape is fixed here.
+    /// Rewrite the request's target before it goes upstream (a redirect), after the
+    /// rewritten authority passes the scope guard.
     Remote { to: RemoteTarget },
 }
 
