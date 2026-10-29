@@ -147,6 +147,40 @@ html[data-density='comfortable'] .row {
   color: var(--color-text-tertiary);
 }
 
+/* ---------- L4 session rows (appended after the virtualised HTTP rows, like macOS `rows + l4Rows`) ---------- */
+.l4Rows {
+  position: relative;
+  min-width: var(--cols-min);
+  width: 100%;
+}
+.l4Row {
+  /* Static flow (not virtualised): L4 sessions are few. Same grid + height as `.row`. */
+  position: relative;
+  transform: none;
+  contain: layout paint style;
+}
+.l4Dot {
+  width: var(--size-status-dot);
+  height: var(--size-status-dot);
+  border-radius: 50%;
+  background: var(--color-l4-deep);
+  display: inline-block;
+  flex: none;
+}
+.l4Method {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.l4Sub {
+  color: var(--color-l4-deep);
+  font-family: var(--font-ui);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: 0.02em;
+}
+
 .cell {
   padding: 0 8px;
   overflow: hidden;

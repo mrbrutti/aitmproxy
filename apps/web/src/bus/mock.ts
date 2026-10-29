@@ -102,6 +102,80 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
   const activity: AgentNotification[] = [];
   const agentTimes: number[] = [];
   let browserUrl = 'https://shop-staging.test/';
+
+  // ---- L4 session fixtures (M5) ----------------------------------------------------------------
+  // A few `l4.*` sessions so the unified flow list shows L4 rows alongside HTTP, with packet
+  // drill-down. Wire shapes mirror `panels/l4/model` (L4FlowWire / L4ScopeEntryWire). The en0
+  // session is intentionally out of L4 scope so scope dimming is visible.
+  interface L4PacketFx {
+    dir: 'inbound' | 'outbound';
+    length: number;
+    injected: boolean;
+    layers: string[];
+  }
+  interface L4FlowFx {
+    id: string;
+    kind: 'capture' | 'craft' | 'send_recv' | 'intercept';
+    interface: string;
+    filter: string | null;
+    queue: number | null;
+    injected_count: number;
+    packets: L4PacketFx[];
+  }
+  const l4Flows: L4FlowFx[] = [
+    {
+      id: 'l4-cap-1',
+      kind: 'capture',
+      interface: 'lo0',
+      filter: 'udp port 9',
+      queue: null,
+      injected_count: 0,
+      packets: [
+        { dir: 'outbound', length: 42, injected: false, layers: ['Ether', 'IPv4', 'UDP', 'Raw'] },
+        { dir: 'inbound', length: 42, injected: false, layers: ['Ether', 'IPv4', 'ICMP'] },
+        { dir: 'outbound', length: 50, injected: false, layers: ['Ether', 'IPv4', 'UDP', 'Raw'] },
+        { dir: 'inbound', length: 66, injected: false, layers: ['Ether', 'IPv4', 'TCP'] },
+      ],
+    },
+    {
+      id: 'l4-craft-1',
+      kind: 'craft',
+      interface: 'lo0',
+      filter: null,
+      queue: null,
+      injected_count: 1,
+      packets: [{ dir: 'outbound', length: 33, injected: true, layers: ['IPv4', 'UDP', 'Raw'] }],
+    },
+    {
+      id: 'l4-icept-1',
+      kind: 'intercept',
+      interface: 'en0',
+      filter: 'tcp port 443',
+      queue: 0,
+      injected_count: 0,
+      packets: [
+        { dir: 'inbound', length: 74, injected: false, layers: ['Ether', 'IPv4', 'TCP'] },
+        { dir: 'outbound', length: 74, injected: false, layers: ['Ether', 'IPv4', 'TCP'] },
+      ],
+    },
+  ];
+  const l4Scope = [
+    { id: 's1', cidr: '127.0.0.1/32', ports: '0-65535', interface: 'lo0', direction: 'outbound', capability: 'inject', inject_rate: { pps: 100, burst: 100 } },
+    { id: 's2', cidr: '127.0.0.1/32', ports: '0-65535', interface: 'lo0', direction: 'inbound', capability: 'capture', inject_rate: { pps: 0, burst: 0 } },
+  ];
+  let l4Gates = { capture: true, inject: false, intercept: false, widen: false };
+  let l4CraftSeq = 0;
+  const l4Wire = (f: L4FlowFx) => ({
+    id: f.id,
+    kind: f.kind,
+    interface: f.interface,
+    filter: f.filter,
+    queue: f.queue,
+    packet_count: f.packets.length,
+    injected_count: f.injected_count,
+    packets: f.packets,
+  });
+
   const timers = new Set<ReturnType<typeof setTimeout>>();
   let loop: ReturnType<typeof setInterval> | null = null;
   let stateLoop: ReturnType<typeof setInterval> | null = null;
@@ -590,6 +664,76 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
         return { pem: '-----BEGIN CERTIFICATE-----\nMIIB…\n-----END CERTIFICATE-----\n' };
       case 'config.get':
         return { listen: '127.0.0.1:8080', max_flows: 10000, mcp: { transport: { loopback_tcp: { port: 9090 } } }, browser: { engine: 'obscura' } };
+
+      // ---- L4 (M5): raw packet sessions in the unified flow list ----
+      case 'l4.flow.list':
+        return l4Flows.map((f) => f.id);
+      case 'l4.flow.get': {
+        const f = l4Flows.find((x) => x.id === need(args, 'id'));
+        if (!f) throw new BusError(`unknown l4 flow ${args.id}`);
+        return l4Wire(f);
+      }
+      case 'l4.scope.list':
+        return l4Scope.map((e) => ({ ...e }));
+      case 'l4.capture.status':
+        return l4Flows.filter((f) => f.kind === 'capture').map((f) => f.id);
+      case 'l4.capture.start': {
+        const iface = need(args, 'interface');
+        const filter = typeof args.filter === 'string' && args.filter ? args.filter : null;
+        const f: L4FlowFx = { id: `l4-cap-${l4Flows.length + 1}`, kind: 'capture', interface: iface, filter, queue: null, injected_count: 0, packets: [] };
+        l4Flows.push(f);
+        recordActivity(tool, args, 'web');
+        return { id: f.id };
+      }
+      case 'l4.interfaces':
+        return [{ name: 'lo0' }, { name: 'en0' }];
+      case 'l4.agent.status':
+        return { ...l4Gates };
+      case 'l4.agent.set': {
+        const cap = need(args, 'capability') as keyof typeof l4Gates;
+        if (!(cap in l4Gates)) throw new BusError(`unknown capability ${cap}`, -32602);
+        l4Gates = { ...l4Gates, [cap]: !!args.allowed };
+        recordActivity(tool, args, 'web');
+        return { ...l4Gates };
+      }
+      case 'l4.craft': {
+        // A crafted packet's bytes + decoded summary; the only path that yields hex (l4.flow.get has none).
+        const spec = (args.spec ?? {}) as { layers?: unknown[] };
+        const layers = Array.isArray(spec.layers) ? spec.layers.map((l) => Object.keys(l as object)[0] ?? 'raw') : [];
+        l4CraftSeq++;
+        const length = 20 + l4CraftSeq;
+        const bytes = btoa(String.fromCharCode(...Array.from({ length }, (_, i) => (i * 7 + l4CraftSeq) & 0xff)));
+        return { length, bytes, summary: { layers, length } };
+      }
+      case 'l4.inject': {
+        // Operator confirm-over-the-wire: first call → needs_confirmation; `_confirm` → sent.
+        const iface = need(args, 'interface');
+        if (!l4Scope.some((e) => e.interface === iface || e.interface === '*' || e.interface === 'any'))
+          throw new BusError(`out of L4 scope: no scope entry covers interface ${iface}`);
+        if (typeof args._confirm === 'string') {
+          const count = typeof args.count === 'number' ? args.count : 1;
+          const craft = l4Flows.find((f) => f.id === 'l4-craft-1');
+          if (craft) {
+            craft.injected_count += count;
+            craft.packets.push({ dir: 'outbound', length: 33, injected: true, layers: ['IPv4', 'UDP', 'Raw'] });
+          }
+          recordActivity(tool, { interface: iface, dst: args.dst }, 'web');
+          return { flow_id: 'l4-craft-1', sent: count };
+        }
+        return { status: 'needs_confirmation', prompt: `Inject ${args.count ?? 1} packet(s) to ${args.dst} on ${iface}. This writes to the wire.`, confirm_token: `l4-${Date.now()}` };
+      }
+      case 'l4.intercept.status':
+        return l4Flows.filter((f) => f.kind === 'intercept').map((f) => ({ id: f.id, parked: 0 }));
+      case 'l4.intercept.list':
+        return [];
+      case 'l4.intercept.forward':
+      case 'l4.intercept.drop':
+        if (typeof args._confirm === 'string') {
+          recordActivity(tool, args, 'web');
+          return { ok: true };
+        }
+        return { status: 'needs_confirmation', prompt: `${tool === 'l4.intercept.drop' ? 'Drop' : 'Forward'} the parked packet.`, confirm_token: `l4-${Date.now()}` };
+
       default:
         throw new BusError(`unknown tool ${tool}`, -32602);
     }
@@ -634,6 +778,20 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
     ['proxy.pause', 'Stop capturing new flows.', {}],
     ['proxy.resume', 'Resume capturing.', {}],
     ['config.get', 'Effective configuration.', {}],
+    ['l4.flow.list', 'List L4 session ids (capture / craft / intercept).', {}],
+    ['l4.flow.get', 'One L4 session with its packets.', { id: { type: 'string' } }, ['id']],
+    ['l4.scope.list', 'L4 scope entries that authorise capture / inject / intercept.', {}],
+    ['l4.capture.status', 'Active L4 capture session ids.', {}],
+    ['l4.capture.start', 'Start an L4 capture on an interface (optional BPF filter).', { interface: { type: 'string' }, filter: { type: 'string' } }, ['interface']],
+    ['l4.interfaces', 'Interfaces available for L4 capture.', {}],
+    ['l4.agent.status', 'Per-capability L4 agent (MCP) gate states.', {}],
+    ['l4.agent.set', 'Set one L4 agent gate (operator only).', { capability: { type: 'string' }, allowed: { type: 'boolean' } }, ['capability', 'allowed']],
+    ['l4.craft', 'Build a packet from a PacketSpec; returns bytes + decoded summary.', { spec: { type: 'object' } }, ['spec']],
+    ['l4.inject', 'Inject a crafted packet to the wire (operator confirm-gated).', { spec: { type: 'object' }, dst: { type: 'string' }, interface: { type: 'string' }, port: { type: 'integer' }, count: { type: 'integer' } }, ['spec', 'dst', 'interface']],
+    ['l4.intercept.status', 'In-path L4 intercept sessions and their parked packet counts.', {}],
+    ['l4.intercept.list', 'Parked L4 packets awaiting a decision.', {}],
+    ['l4.intercept.forward', 'Forward a parked L4 packet (confirm-gated).', { id: { type: 'string' } }, ['id']],
+    ['l4.intercept.drop', 'Drop a parked L4 packet (confirm-gated).', { id: { type: 'string' } }, ['id']],
   ].map(([name, description, properties, required]) => ({
     name: name as string,
     description: description as string,

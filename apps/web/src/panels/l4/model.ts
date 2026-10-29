@@ -179,36 +179,6 @@ export interface UnionRow {
   scopeReason: string;
 }
 
-/** A minimal HTTP/WebSocket flow shape, mapped to a union row for the all-kinds list. */
-export interface SummaryLike {
-  id: string;
-  kind: 'http' | 'websocket';
-  method: string;
-  scheme: string;
-  authority: string;
-  path: string;
-  status: number | null;
-  inScope: boolean;
-}
-
-const METHOD_HUES: Record<string, string> = { GET: 'get', POST: 'post', PUT: 'put', PATCH: 'patch', DELETE: 'delete' };
-
-/** Map an http/ws flow summary to a union row, so one list renders every kind (AC7). */
-export function summaryRow(f: SummaryLike): UnionRow {
-  const ws = f.kind === 'websocket';
-  return {
-    id: f.id,
-    kind: f.kind,
-    known: true,
-    badge: ws ? 'WS' : f.method,
-    badgeHue: ws ? 'ws' : (METHOD_HUES[f.method] ?? 'grey'),
-    subLabel: f.status != null ? String(f.status) : null,
-    label: `${f.scheme}://${f.authority}${f.path}`,
-    inScope: f.inScope,
-    scopeReason: '',
-  };
-}
-
 /** Map one `l4.flow.get` flow + the current L4 scope to a union row. */
 export function l4Row(flow: L4FlowWire, scope: readonly L4ScopeEntryWire[]): UnionRow {
   const { inScope, reason } = flowScope(flow, scope);
