@@ -4,6 +4,7 @@ pub mod ca;
 pub mod module;
 pub mod sansio;
 pub mod sender;
+mod translate;
 
 pub use ca::{CertAuthority, LeafCert};
 pub use module::HttpModule;

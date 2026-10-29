@@ -11,6 +11,11 @@ aitm-core.workspace = true
 aitm-plugin.workspace = true
 anyhow.workspace = true
 futures.workspace = true
+# HTTP/2 engine (the one `hyper` uses) + the `http` request/response/pseudo-header
+# types it speaks. Versions are pinned here, not in the root manifest, per the
+# proto-http sibling-session convention. (M7)
+h2 = "0.4"
+http = "1"
 tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
 # Certificate authority: root generation + leaf minting, and the leaf cache.
 rcgen = { version = "0.14", features = ["x509-parser"] }
