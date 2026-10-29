@@ -111,7 +111,11 @@ pub fn insert_operator_token(
         if child_indent.is_none() {
             child_indent = Some(indent_of(lg).to_string());
         }
-        if trimmed.starts_with("operator_token:") {
+        // Only a DIRECT child of `mcp:` is the mcp-level `operator_token`: its
+        // indent must equal the block's child indent. A deeper `operator_token:`
+        // (e.g. under `mcp.transport`) is a different key and is left untouched.
+        let is_direct_child = child_indent.as_deref().map(str::len) == Some(indent_of(lg).len());
+        if is_direct_child && trimmed.starts_with("operator_token:") {
             existing_ot = Some(idx);
             break;
         }
@@ -157,9 +161,31 @@ pub fn generate_and_store(config_path: &Path, force: bool) -> anyhow::Result<Pat
     };
     let token = generate_operator_token();
     let updated = insert_operator_token(&yaml, &token, force)?;
-    std::fs::write(config_path, updated)
+    write_atomically(config_path, &updated)
         .with_context(|| format!("writing config file {}", config_path.display()))?;
     Ok(config_path.to_path_buf())
+}
+
+/// Replace `path`'s contents with `data` via a sibling temp file and an atomic
+/// `rename`, so a crash or full disk can never truncate the operator's config to
+/// an empty or half-written file. The rename also replaces the target in place
+/// without following a symlink into another inode. Both files share `path`'s
+/// parent directory, so the rename stays within one filesystem (where it is
+/// atomic). The temp file is removed if the rename fails.
+fn write_atomically(path: &Path, data: &str) -> std::io::Result<()> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let dir = dir.unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = dir.join(format!(".{stem}.{}.tmp", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&tmp, data)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// The non-sensitive confirmation printed after a successful write. It names the
@@ -175,8 +201,9 @@ pub fn confirmation_message(path: &Path) -> String {
 
 /// A fresh operator token from the platform CSPRNG. `uuid::Uuid::new_v4` draws
 /// from the OS CSPRNG (the same source `aitm_mcp` uses for confirm tokens); two
-/// concatenated give a 256-bit, 64-hex-character secret with no YAML-special
-/// characters, so it is safe to write unquoted.
+/// concatenated give a 64-hex-character secret carrying ~244 bits of entropy
+/// (each v4 UUID fixes 6 of its 128 bits as version/variant, so ~122 bits
+/// each). It has no YAML-special characters, so it is safe to write unquoted.
 fn generate_operator_token() -> String {
     format!(
         "{}{}",
@@ -341,6 +368,68 @@ mod tests {
             "confirmation must not echo a token"
         );
         assert!(msg.to_lowercase().contains("restart"));
+    }
+
+    #[test]
+    fn nested_operator_token_is_not_treated_as_the_mcp_key() {
+        // A deeper `operator_token:` (here indented under `mcp.transport`) is NOT
+        // a direct child of `mcp:`, so it must be left intact and a fresh
+        // mcp-level `operator_token` inserted directly under `mcp:`.
+        let input = "mcp:\n  transport:\n    operator_token: nested\n";
+        let out = insert_operator_token(input, "abc123", false).unwrap();
+        assert!(
+            out.contains("    operator_token: nested"),
+            "nested key was rewritten:\n{out}"
+        );
+        assert!(
+            out.contains("\n  operator_token: abc123"),
+            "mcp-level token not inserted as a direct child:\n{out}"
+        );
+    }
+
+    #[test]
+    fn generate_and_store_writes_the_token_and_keeps_other_keys() {
+        let dir =
+            std::env::temp_dir().join(format!("aitm-optok-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            "listen: 127.0.0.1:8080\nmcp:\n  transport:\n    loopback_tcp:\n      port: 9090\n      token: abc\n",
+        )
+        .unwrap();
+
+        generate_and_store(&path, false).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let cfg = config_file::parse(&text).unwrap();
+        let tok = cfg
+            .mcp
+            .operator_token
+            .as_deref()
+            .expect("operator token written");
+        assert_eq!(tok.len(), 64, "token is 64 hex chars: {tok}");
+        assert!(
+            tok.chars().all(|c| c.is_ascii_hexdigit()),
+            "token is hex: {tok}"
+        );
+        assert!(
+            text.contains("listen: 127.0.0.1:8080") && text.contains("port: 9090"),
+            "unrelated keys dropped:\n{text}"
+        );
+        // The atomic rename leaves no temp sibling behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name() != "config.yaml")
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp sibling left behind: {leftovers:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

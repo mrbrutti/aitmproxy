@@ -319,11 +319,19 @@ async fn run() -> anyhow::Result<()> {
             Some(settings) => {
                 let bus = tui::server(&cfg, cfg.mcp.transport.clone(), &services);
                 // Operator access on the web UI is tied to `mcp.operator_token`
-                // being configured (operator role exists at all); there is no
-                // separate `aitm web` opt-in. The operator *bridge* token is a
-                // fresh per-run token — never the secret mcp operator token,
-                // which stays out of every URL and log.
-                let operator_token = cfg.mcp.operator_token.is_some().then(web::generate_token);
+                // being configured to a NON-EMPTY value (operator role exists at
+                // all); there is no separate `aitm web` opt-in. An empty token is
+                // treated as "not configured", mirroring the loopback transport,
+                // so a hand-edited `operator_token: ""` never enables operator
+                // access. The operator *bridge* token is a fresh per-run token —
+                // never the secret mcp operator token, which stays out of every
+                // URL and log.
+                let operator_token = cfg
+                    .mcp
+                    .operator_token
+                    .as_deref()
+                    .is_some_and(|t| !t.is_empty())
+                    .then(web::generate_token);
                 let state = Arc::new(WebState {
                     mcp: Arc::new(bus),
                     agent_token: settings.token.clone(),

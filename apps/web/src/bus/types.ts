@@ -167,3 +167,12 @@ export interface BusClient {
 
 export const CLIENT_INFO = { name: 'aitm-web', version: '0.1.0' } as const;
 export const PROTOCOL_VERSION = '2025-06-18';
+
+/**
+ * Narrow an untrusted role value — a URL/sessionStorage `#expect=` fragment or the `initialize`
+ * result's `role` echo — to a known {@link BusRole}, returning `null` for anything else (absent,
+ * unknown, or a role we do not model). The single source of truth for this check (Decision B/C).
+ */
+export function asRole(v: string | null | undefined): BusRole | null {
+  return v === 'operator' || v === 'agent' ? v : null;
+}

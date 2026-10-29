@@ -197,13 +197,16 @@ async fn dispatch(
 
 /// Resolve the first-line token to a role, comparing in constant time against
 /// each configured bridge token. The agent token is tried first; the operator
-/// token only when `mcp.operator_token` was configured (so it is `Some`).
-/// `None` ⇒ the token matched neither and the connection must be refused.
+/// token only when `mcp.operator_token` was configured to a non-empty value (so
+/// it is `Some` and not `""`). An empty operator token means "not configured",
+/// mirroring `LoopbackTcp::with_operator_token`, so a `{"token":""}` line never
+/// resolves to operator. `None` ⇒ the token matched neither and the connection
+/// must be refused.
 fn classify_token(first: &str, state: &WebState) -> Option<Frontend> {
     if token_line_matches(first, &state.agent_token) {
         return Some(Frontend::Mcp);
     }
-    if let Some(op) = state.operator_token.as_deref() {
+    if let Some(op) = state.operator_token.as_deref().filter(|t| !t.is_empty()) {
         if token_line_matches(first, op) {
             return Some(Frontend::Operator);
         }
