@@ -652,6 +652,9 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
     address: 'fixtures',
     state,
     lastError,
+    role: () => 'operator', // fixtures run the full command set, so the mock is always operator.
+    expectRole: null,
+    roleMismatch: () => false,
     connect() {
       if (state() === 'open') return;
       setState('open');

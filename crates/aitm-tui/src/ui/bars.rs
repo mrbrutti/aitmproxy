@@ -389,10 +389,29 @@ pub fn status(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut 
     };
 
     let (bus_dot, bus_text) = match &app.bus {
-        BusStatus::Connected { address, .. } => (
-            theme.fg(&crate::tokens::color::status::SUCCESS),
-            format!("bus {address}"),
-        ),
+        BusStatus::Connected { address, role, .. } => {
+            if app.role_mismatch() {
+                // AC8: the token did not resolve to the expected role (or no
+                // role was echoed) — warn rather than proceed silently.
+                let resolved = role.as_deref().unwrap_or("role unknown");
+                let expected = app.expect_role.as_deref().unwrap_or("");
+                (
+                    theme.fg(&crate::tokens::color::status::SERVER_ERROR),
+                    format!("bus {address} · {resolved} ⚠ expected {expected}"),
+                )
+            } else {
+                // AC7: surface the resolved role when the server echoed one;
+                // older cores echo none, so the line stays as it was.
+                let suffix = role
+                    .as_deref()
+                    .map(|r| format!(" · {r}"))
+                    .unwrap_or_default();
+                (
+                    theme.fg(&crate::tokens::color::status::SUCCESS),
+                    format!("bus {address}{suffix}"),
+                )
+            }
+        }
         BusStatus::Connecting => (theme.text_tertiary(), "bus connecting…".to_string()),
         BusStatus::Disconnected(_) => (
             theme.fg(&crate::tokens::color::status::SERVER_ERROR),

@@ -210,6 +210,9 @@ struct FlowCommands: Commands {
             Button("Configuration…") { session.show(.config) }
             Button(session.coreLogVisible ? "Hide Core Log" : "Core Log…") { session.coreLogVisible.toggle() }
                 .keyboardShortcut("l", modifiers: [.command, .control])
+            Divider()
+            Button("Reconnect Bus") { session.reconnectBus() }
+                .keyboardShortcut("r", modifiers: [.command, .control])
         }
         CommandMenu("Agent") {
             Picker("Policy", selection: Binding(get: { session.agentPolicy }, set: { session.activity.choose($0) })) {

@@ -25,7 +25,7 @@ use aitm::scripts::LateHandles;
 use aitm::tui::TuiLog;
 use aitm::web::{self, WebArgs, WebCommand, WebState};
 use aitm::wire::{assemble_with_scripts, Assembled, Features, ScriptWiring};
-use aitm::{config_file, env, tui};
+use aitm::{config_file, env, operator_token, tui};
 use aitm_core::{engine_may_reach_private, BrowserDriver, Chain, McpTransport, Plugin};
 use aitm_findings::FindingsPlugin;
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
@@ -47,6 +47,10 @@ enum Mode {
     /// `web …`: the server path plus the embedded web UI and its `/bus`
     /// bridge; the options live beside in `WebArgs`.
     Web,
+    /// `operator-token generate [--force]`: write a CSPRNG `mcp.operator_token`
+    /// into the config file and exit, before any service is built (spec F2).
+    /// CLI-only; never dispatched through the registry, so no agent can run it.
+    OperatorToken { force: bool },
 }
 
 /// Classify `argv`. `tui` takes no arguments; anything after it is a usage
@@ -58,7 +62,28 @@ fn parse_mode(argv: Vec<String>) -> Result<Mode, String> {
         Some("tui") if argv.len() == 1 => Ok(Mode::Tui),
         Some("tui") => Err(tui::USAGE.to_string()),
         Some("web") => Ok(Mode::Web),
+        Some("operator-token") => parse_operator_token(&argv[1..]),
         Some(_) => Ok(Mode::Cli(argv)),
+    }
+}
+
+/// Classify the arguments after `operator-token`. Only `generate [--force]` is
+/// valid; an unknown sub-verb or flag is a usage error carrying the line to
+/// print. This stays out of the CLI registry (spec F2) so no agent reaches it.
+fn parse_operator_token(rest: &[String]) -> Result<Mode, String> {
+    const USAGE: &str = "usage: aitm [--config <path>] operator-token generate [--force]";
+    match rest.first().map(String::as_str) {
+        Some("generate") => {
+            let mut force = false;
+            for arg in &rest[1..] {
+                match arg.as_str() {
+                    "--force" => force = true,
+                    other => return Err(format!("unknown argument `{other}`\n{USAGE}")),
+                }
+            }
+            Ok(Mode::OperatorToken { force })
+        }
+        _ => Err(USAGE.to_string()),
     }
 }
 
@@ -102,10 +127,23 @@ async fn run() -> anyhow::Result<()> {
             std::process::exit(2);
         }
     };
+    // `operator-token generate` edits the config file and exits before any
+    // service, tracing sink or scripting tier is built — it never needs them,
+    // and it must run even if the current config would fail to assemble. The
+    // path is resolved exactly as the rest of the binary does.
+    if let Mode::OperatorToken { force } = mode {
+        let config_path = config_arg
+            .or_else(|| std::env::var_os(CONFIG_ENV).map(PathBuf::from))
+            .unwrap_or_else(config_file::default_config_path);
+        let written = operator_token::generate_and_store(&config_path, force)?;
+        println!("{}", operator_token::confirmation_message(&written));
+        return Ok(());
+    }
+
     // The TUI owns the terminal, so its subscriber must not write there.
     let tui_log = match mode {
         Mode::Tui => tui::init_tracing(),
-        Mode::Server | Mode::Cli(_) | Mode::Web => {
+        Mode::Server | Mode::Cli(_) | Mode::Web | Mode::OperatorToken { .. } => {
             init_tracing();
             TuiLog::Off
         }
@@ -296,9 +334,24 @@ async fn run() -> anyhow::Result<()> {
         let web_server = match web_settings {
             Some(settings) => {
                 let bus = tui::server(&cfg, cfg.mcp.transport.clone(), &services);
+                // Operator access on the web UI is tied to `mcp.operator_token`
+                // being configured to a NON-EMPTY value (operator role exists at
+                // all); there is no separate `aitm web` opt-in. An empty token is
+                // treated as "not configured", mirroring the loopback transport,
+                // so a hand-edited `operator_token: ""` never enables operator
+                // access. The operator *bridge* token is a fresh per-run token —
+                // never the secret mcp operator token, which stays out of every
+                // URL and log.
+                let operator_token = cfg
+                    .mcp
+                    .operator_token
+                    .as_deref()
+                    .is_some_and(|t| !t.is_empty())
+                    .then(web::generate_token);
                 let state = Arc::new(WebState {
                     mcp: Arc::new(bus),
-                    token: settings.token.clone(),
+                    agent_token: settings.token.clone(),
+                    operator_token: operator_token.clone(),
                 });
                 if settings.insecure_bind {
                     warn!(
@@ -326,7 +379,13 @@ async fn run() -> anyhow::Result<()> {
                 // Log only the bound address; the token must never reach a
                 // tracing sink. The one-time println is the operator's link.
                 web::log_listening(bound);
-                println!("web UI: {url}");
+                println!("web UI (agent): {url}");
+                // When operator access is configured, print its URL too; it
+                // carries the ephemeral operator bridge token in the fragment,
+                // never the mcp operator token.
+                if let Some(op) = &operator_token {
+                    println!("web UI (operator): {}", web::operator_ui_url(bound, op));
+                }
                 Some((listener, state))
             }
             None => None,
@@ -789,6 +848,32 @@ mod tests {
             Ok(Mode::Web),
             "web's own flags are parsed by web::parse_args, not here"
         );
+    }
+
+    #[test]
+    fn operator_token_generate_is_its_own_mode() {
+        assert_eq!(
+            parse_mode(args(&["operator-token", "generate"])),
+            Ok(Mode::OperatorToken { force: false })
+        );
+    }
+
+    #[test]
+    fn operator_token_generate_accepts_force() {
+        assert_eq!(
+            parse_mode(args(&["operator-token", "generate", "--force"])),
+            Ok(Mode::OperatorToken { force: true })
+        );
+    }
+
+    #[test]
+    fn operator_token_rejects_unknown_subverb_and_flag() {
+        let err = parse_mode(args(&["operator-token", "rotate"])).unwrap_err();
+        assert!(err.contains("operator-token generate"), "{err}");
+        let err = parse_mode(args(&["operator-token"])).unwrap_err();
+        assert!(err.contains("operator-token generate"), "{err}");
+        let err = parse_mode(args(&["operator-token", "generate", "--oops"])).unwrap_err();
+        assert!(err.contains("--oops"), "{err}");
     }
 
     #[test]

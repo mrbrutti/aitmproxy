@@ -7,9 +7,11 @@
 //! - This module: the subcommand's arguments and their resolution.
 //!
 //! The bridge is deliberately thin. It authenticates with the same token line
-//! `LoopbackTcp` uses and hands every line to `McpServer::handle`; all command
-//! policy lives in the core. (The core still identifies these calls as
-//! `Frontend::Mcp` — the `Operator` identity is F1.)
+//! `LoopbackTcp` uses, classifies that token against the two bridge tokens in
+//! [`WebState`] to resolve the connection's role, and hands every line to
+//! `McpServer::handle_on` under that role; all command policy lives in the core.
+//! An operator bridge token exists only when `mcp.operator_token` is configured;
+//! otherwise the bridge is agent-only (`Frontend::Mcp`).
 
 pub mod assets;
 pub mod bridge;
@@ -51,10 +53,20 @@ Non-loopback addresses are refused until TLS for remote access lands (F15);
 use an SSH tunnel, or set AITM_WEB_INSECURE_BIND=1 to bind anyway.
 ";
 
-/// Shared by every connection: the bus to relay into and the token to demand.
+/// Shared by every connection: the bus to relay into and the bridge tokens to
+/// demand. Both tokens are the bridge's own ephemeral per-run tokens, NOT the
+/// mcp agent/operator tokens (those never travel to the browser). A first-line
+/// match on `agent_token` resolves the connection to [`aitm_core::Frontend::Mcp`];
+/// a match on `operator_token` (when configured) to
+/// [`aitm_core::Frontend::Operator`].
 pub struct WebState {
     pub mcp: Arc<McpServer>,
-    pub token: String,
+    /// The agent bridge token, always present.
+    pub agent_token: String,
+    /// The operator bridge token; `Some` only when `mcp.operator_token` is
+    /// configured (operator role exists at all). `None` ⇒ the web UI is
+    /// agent-only, exactly as before this change.
+    pub operator_token: Option<String>,
 }
 
 /// `aitm web …` after argument parsing.
@@ -172,6 +184,14 @@ pub fn generate_token() -> String {
 /// browser never sends to the server; the UI moves it into sessionStorage.
 pub fn ui_url(bound: SocketAddr, token: &str) -> String {
     format!("http://{bound}/#t={token}")
+}
+
+/// The URL that connects as an operator: like [`ui_url`] but with an
+/// `expect=operator` fragment the UI checks against the resolved role (a
+/// client-side expectation only, never sent to the server). `token` is the
+/// ephemeral operator *bridge* token, not the mcp operator token.
+pub fn operator_ui_url(bound: SocketAddr, token: &str) -> String {
+    format!("http://{bound}/#t={token}&expect=operator")
 }
 
 /// Log that `aitm web` is listening. Takes ONLY the bound address: the token is
@@ -304,6 +324,12 @@ mod tests {
     fn ui_url_carries_the_token_in_the_fragment() {
         let url = ui_url("127.0.0.1:8081".parse().unwrap(), "abc");
         assert_eq!(url, "http://127.0.0.1:8081/#t=abc");
+    }
+
+    #[test]
+    fn operator_ui_url_adds_the_expect_operator_fragment() {
+        let url = operator_ui_url("127.0.0.1:8082".parse().unwrap(), "deadbeef");
+        assert_eq!(url, "http://127.0.0.1:8082/#t=deadbeef&expect=operator");
     }
 
     /// C4 regression: the "listening" log carries the bound address but never

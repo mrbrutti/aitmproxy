@@ -63,6 +63,23 @@ export interface ToolCallResult {
 
 export type BusState = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed';
 
+/**
+ * The connection role the server/bridge resolves from the presented token (Decision A/C). The
+ * client never declares it; it is read back from the `initialize` result's `role` echo.
+ */
+export type BusRole = 'operator' | 'agent';
+
+/**
+ * The `initialize` result (§4.1). `role` is the additive Decision C echo describing *this*
+ * connection; it is absent on servers predating the echo, in which case the role is unknown.
+ */
+export interface ServerInfo {
+  protocolVersion?: string;
+  capabilities?: unknown;
+  serverInfo?: { name?: string; version?: string };
+  role?: BusRole;
+}
+
 /** Push events (§4.4, F4). The bridge relays them verbatim; the mock bus emits the same shapes. */
 export type FlowEventKind =
   | 'created'
@@ -122,6 +139,22 @@ export interface BusClient {
   readonly state: Accessor<BusState>;
   /** Last connection error text, for the status bar tooltip. */
   readonly lastError: Accessor<string | null>;
+  /**
+   * The role this connection resolved to, from the `initialize` result `role` echo (Decision C).
+   * `null` until `initialize` succeeds, after a disconnect, or when the server echoed no role.
+   */
+  readonly role: Accessor<BusRole | null>;
+  /**
+   * The client-side role *expectation* carried in the launch URL's `#expect=` fragment (Decision
+   * B). Never sent to the server; it only drives the mismatch warning. `null` when none was set.
+   */
+  readonly expectRole: BusRole | null;
+  /**
+   * `true` when an expectation was set and the resolved role differs from it — including when the
+   * server echoed no role, so the expectation cannot be confirmed (AC8). `false` when no
+   * expectation was set.
+   */
+  readonly roleMismatch: Accessor<boolean>;
   connect(): void;
   close(): void;
   /** `tools/list`, cached after the first success. */
@@ -134,3 +167,12 @@ export interface BusClient {
 
 export const CLIENT_INFO = { name: 'aitm-web', version: '0.1.0' } as const;
 export const PROTOCOL_VERSION = '2025-06-18';
+
+/**
+ * Narrow an untrusted role value — a URL/sessionStorage `#expect=` fragment or the `initialize`
+ * result's `role` echo — to a known {@link BusRole}, returning `null` for anything else (absent,
+ * unknown, or a role we do not model). The single source of truth for this check (Decision B/C).
+ */
+export function asRole(v: string | null | undefined): BusRole | null {
+  return v === 'operator' || v === 'agent' ? v : null;
+}

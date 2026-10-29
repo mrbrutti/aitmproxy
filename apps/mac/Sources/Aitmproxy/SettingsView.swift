@@ -1,3 +1,4 @@
+import AitmBusClient
 import AitmproxyKit
 import SwiftUI
 
@@ -82,6 +83,13 @@ struct BusSettings: View {
     @AppStorage("bus.port") private var port = 9090
     @AppStorage("bus.tokenFile") private var tokenFile = ""
     @AppStorage("bus.fromConfig") private var fromConfig = true
+    /// The operator token, pasted by a human. Empty ⇒ connect as agent with the
+    /// config token (spec Decision E). A `SecureField` keeps it off the screen;
+    /// it is never printed or logged.
+    @AppStorage("bus.operatorToken") private var operatorToken = ""
+    /// What role the operator expects the connection to resolve to. Client-side
+    /// only — it never travels to the server, it only drives the warning.
+    @AppStorage("bus.expectedRole") private var expectedRole = ExpectedRole.agent.rawValue
 
     private var activeKind: ActiveCoreKind { ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded }
     private var usesExternal: Bool { activeKind == .external }
@@ -113,8 +121,21 @@ struct BusSettings: View {
                 .disabled(fromConfig)
         }
         .disabled(!usesExternal)
+        Section("Role") {
+            SecureField("Operator token", text: $operatorToken, prompt: Text("Paste to connect as operator"))
+            Picker("Expected role", selection: $expectedRole) {
+                ForEach(ExpectedRole.allCases) { role in
+                    Text(role.title).tag(role.rawValue)
+                }
+            }
+        }
         Section {
-            Text("The app connects as an operator (clientInfo `aitm-mac`) over loopback TCP and never acts as the agent.")
+            Text("""
+                With no operator token the app connects as an agent using the token in config.yaml, \
+                and is gated exactly as an agent. Paste the operator token to connect as operator; \
+                reconnect (Proxy ▸ Reconnect Bus, ⌃⌘R) to apply it. The role the bus assigns is \
+                shown in the status bar, with a warning when it differs from the expected role.
+                """)
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }

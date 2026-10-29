@@ -375,6 +375,11 @@ pub struct ServerInfo {
     pub version: String,
     /// The protocol revision the server agreed to.
     pub protocol_version: String,
+    /// The role this connection resolved to, echoed by the server as a
+    /// top-level `role` (`"operator"` or `"agent"`). `None` when the server
+    /// did not echo one (a server predating the role echo); a missing `role`
+    /// means "role unknown", never an error.
+    pub role: Option<String>,
 }
 
 /// One entry of `tools/list`: a bus command and the JSON Schema of its arguments.
@@ -447,6 +452,10 @@ impl BusClient {
             name: required_str(info, "name", "serverInfo")?,
             version: required_str(info, "version", "serverInfo")?,
             protocol_version: required_str(&result, "protocolVersion", "initialize result")?,
+            role: result
+                .get("role")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         };
         self.notify("notifications/initialized").await?;
         Ok(server)
@@ -679,6 +688,53 @@ mod tests {
             pending.lock().unwrap().closed,
             Some(Closed::Gone(ref why)) if why == "server closed the connection"
         ));
+    }
+
+    /// A stub transport whose `initialize` reply is a fixed JSON `result`
+    /// object. It echoes the request id so `BusClient::request` matches the
+    /// reply, and answers the trailing `notifications/initialized` notice (no
+    /// `id`) with `Ok(None)`.
+    struct StubInitTransport {
+        result: Value,
+    }
+
+    impl BusTransport for StubInitTransport {
+        fn send(&self, line: String) -> BoxFuture<'_, anyhow::Result<Option<String>>> {
+            let parsed: Value = serde_json::from_str(&line).expect("stub got valid JSON");
+            let reply = parsed.get("id").filter(|id| !id.is_null()).map(|id| {
+                json!({"jsonrpc": "2.0", "id": id, "result": self.result.clone()}).to_string()
+            });
+            Box::pin(async move { Ok(reply) })
+        }
+    }
+
+    /// AC7: `initialize` reads a top-level `role` from the result and exposes it
+    /// on `ServerInfo`.
+    #[tokio::test]
+    async fn test_initialize_reads_role() {
+        let client = BusClient::new(Box::new(StubInitTransport {
+            result: json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "serverInfo": {"name": "aitmproxy", "version": "x"},
+                "role": "operator",
+            }),
+        }));
+        let info = client.initialize("test", "0").await.expect("initialize");
+        assert_eq!(info.role, Some("operator".to_string()));
+    }
+
+    /// AC10: a missing `role` is `None`, never an error — the handshake still
+    /// succeeds against a server that predates the role echo.
+    #[tokio::test]
+    async fn test_initialize_missing_role_is_none() {
+        let client = BusClient::new(Box::new(StubInitTransport {
+            result: json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "serverInfo": {"name": "aitmproxy", "version": "x"},
+            }),
+        }));
+        let info = client.initialize("test", "0").await.expect("initialize");
+        assert_eq!(info.role, None);
     }
 
     /// Minor (c): a complete-looking JSON reply with no terminating newline at

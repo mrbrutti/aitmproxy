@@ -23,7 +23,7 @@ use aitm_tui::caps::TermCaps;
 use aitm_tui::theme::Theme;
 use aitm_tui::{fixture_app, fixture_app_core, snapshot, RunOptions, TransportChoice};
 
-const USAGE: &str = "usage: aitm-tui (--bus host:port (--token-file p | --token t (insecure: visible in ps)) [--allow-remote-bus] | --fixture [path]) [--poc-dir dir] [--ansi|--truecolor] [--poll ms]\n       aitm-tui --snapshot out.svg [--cols N --rows N]\n       aitm-tui --snapshot-core out.svg [--cols N --rows N]   (fixture limited to the 56 core tools)\n       --poc-dir: where P (poc.build) writes the PoC YAML; use the proxy's poc.dir so poc.run can read it";
+const USAGE: &str = "usage: aitm-tui (--bus host:port (--token-file p | --token t (insecure: visible in ps)) [--allow-remote-bus] [--expect-role agent|operator] | --fixture [path]) [--poc-dir dir] [--ansi|--truecolor] [--poll ms]\n       aitm-tui --snapshot out.svg [--cols N --rows N]\n       aitm-tui --snapshot-core out.svg [--cols N --rows N]   (fixture limited to the 56 core tools)\n       --poc-dir: where P (poc.build) writes the PoC YAML; use the proxy's poc.dir so poc.run can read it\n       --expect-role: the role you expect the token to resolve to; the status line warns if it does not (it is never sent to the server)";
 
 /// Why a non-loopback bus is refused without the flag.
 const REMOTE_BUS_REFUSED: &str = "refusing a bus that is not on loopback: the token would travel in cleartext (the TLS bus is core follow-up F15). Pass --allow-remote-bus to do it anyway.";
@@ -43,6 +43,9 @@ struct Args {
     allow_remote_bus: bool,
     /// `--poc-dir`: where a built PoC's YAML is written.
     poc_dir: Option<PathBuf>,
+    /// `--expect-role`: the role the operator expects the token to resolve to
+    /// (`agent`/`operator`); client-side only, drives the mismatch warning.
+    expect_role: Option<String>,
 }
 
 /// S5: a bus address off loopback needs an explicit opt-in.
@@ -68,6 +71,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         poll_ms: 500,
         allow_remote_bus: false,
         poc_dir: None,
+        expect_role: None,
     };
     let mut i = 0;
     let value = |i: &mut usize, flag: &str| -> Result<String, String> {
@@ -95,6 +99,15 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "--allow-remote-bus" => a.allow_remote_bus = true,
             "--poc-dir" => a.poc_dir = Some(PathBuf::from(value(&mut i, "--poc-dir")?)),
+            "--expect-role" => {
+                let v = value(&mut i, "--expect-role")?;
+                if v != "agent" && v != "operator" {
+                    return Err(format!(
+                        "--expect-role must be `agent` or `operator`, not `{v}`"
+                    ));
+                }
+                a.expect_role = Some(v);
+            }
             "--cols" => {
                 a.cols = value(&mut i, "--cols")?
                     .parse()
@@ -188,6 +201,7 @@ async fn main() -> anyhow::Result<()> {
         startup_note: None,
         listening: None,
         poc_dir: args.poc_dir,
+        expect_role: args.expect_role,
     })
     .await
 }
@@ -258,6 +272,37 @@ mod tests {
         assert!(USAGE.contains("[--poc-dir dir]"), "{USAGE}");
         assert!(USAGE.contains("poc.build"), "{USAGE}");
         assert!(USAGE.contains("56 core tools"), "{USAGE}");
+    }
+
+    /// Decision B: `--expect-role` is a client-side expectation, accepting
+    /// only the two role words and documented in USAGE; any other value is a
+    /// usage error rather than a silently ignored flag.
+    #[test]
+    fn expect_role_accepts_the_two_roles_and_rejects_anything_else() {
+        let a = parse(&argv(
+            "--bus 127.0.0.1:9090 --token t --expect-role operator",
+        ))
+        .unwrap();
+        assert_eq!(a.expect_role.as_deref(), Some("operator"));
+        let a = parse(&argv("--bus 127.0.0.1:9090 --token t --expect-role agent")).unwrap();
+        assert_eq!(a.expect_role.as_deref(), Some("agent"));
+        assert_eq!(
+            parse(&argv("--bus 127.0.0.1:9090 --token t"))
+                .unwrap()
+                .expect_role,
+            None
+        );
+        let err = parse(&argv("--bus 127.0.0.1:9090 --token t --expect-role admin"))
+            .err()
+            .unwrap();
+        assert!(err.contains("expect-role"), "{err}");
+        assert_eq!(
+            parse(&argv("--bus 127.0.0.1:9090 --token t --expect-role"))
+                .err()
+                .as_deref(),
+            Some("--expect-role needs a value")
+        );
+        assert!(USAGE.contains("--expect-role"), "{USAGE}");
     }
 
     #[test]

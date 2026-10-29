@@ -77,6 +77,10 @@ pub struct RunOptions {
     /// `--poc-dir`. `None` falls back to `config.get`'s `poc_dir`, then a
     /// temp directory the toast names.
     pub poc_dir: Option<PathBuf>,
+    /// The role the operator expects the token to resolve to (`--expect-role`):
+    /// client-side only, it drives the status line's mismatch warning and is
+    /// never sent to the server. `None` means no expectation.
+    pub expect_role: Option<String>,
 }
 
 /// Restores the terminal when dropped, so a caller that drops the `run`
@@ -147,6 +151,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         app.listening = Some(listening);
     }
     app.poc_dir = opts.poc_dir;
+    app.expect_role = opts.expect_role;
 
     let mut terminal = ratatui::init();
     let _guard = TerminalGuard { bus_task };
@@ -322,6 +327,7 @@ fn load_fixture_app(mut fx: Fixture, cols: u16, rows: u16, core_only: bool) -> A
     let _ = app.on_bus(BusEvent::Connected {
         server: format!("{} {}", fx.server_name, fx.server_version),
         tools,
+        role: None,
     });
     // The handshake reads `proxy.status` (F7) when the bus has it.
     if app.has_tool("proxy.status") {

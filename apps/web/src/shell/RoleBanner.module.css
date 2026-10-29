@@ -1,0 +1,27 @@
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--color-line-border);
+  background: var(--color-accent-tint);
+  color: var(--color-text-primary);
+  font-size: var(--font-size-sm);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.banner svg {
+  flex: none;
+  color: var(--color-text-secondary);
+}
+
+/* Mismatch: an operator URL that connected as agent (or an unconfirmed role) — loud, amber. */
+.warn {
+  background: var(--color-intercept-tint);
+  color: var(--color-intercept-deep);
+  font-weight: 500;
+}
+.warn svg {
+  color: var(--color-intercept-deep);
+}

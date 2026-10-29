@@ -28,7 +28,9 @@ pub type Connector =
 const UNAUTHORIZED: i64 = -32001;
 
 /// What the app is told when the bus refuses the token; retrying cannot fix it.
-pub const REFUSED: &str = "bus refused the token — check --token-file";
+/// Worded for either intended role and without implying the token came from a
+/// file (it may be `--token`, `--token-file`, or `AITM_BUS_TOKEN`).
+pub const REFUSED: &str = "bus refused the token: it matched neither the agent nor the operator token (check the token you supplied)";
 
 /// Run until the app goes away: the request channel closes, or an event
 /// cannot be delivered because its receiver is gone. A failed connect or a
@@ -163,6 +165,7 @@ impl Session {
         self.emit(BusEvent::Connected {
             server: format!("{} {}", info.name, info.version),
             tools: self.tools.clone(),
+            role: info.role.clone(),
         })
         .await?;
         // `proxy.status` is read-only: a tool error here leaves the state
@@ -445,5 +448,23 @@ fn error_text(e: BusError) -> String {
         BusError::Transport(e) => format!("{e:#}"),
         BusError::Tool(m) | BusError::Protocol(m) => m,
         BusError::Rpc { code, message } => format!("{message} ({code})"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The refusal reads for either intended role and never names a file as
+    /// the only token source (AC1/AC2 surface, Decision B wording). Pinned so
+    /// the reword is not silently reverted.
+    #[test]
+    fn refused_message_reads_for_either_role_without_implying_a_file() {
+        assert_eq!(
+            REFUSED,
+            "bus refused the token: it matched neither the agent nor the operator token (check the token you supplied)"
+        );
+        assert!(REFUSED.contains("agent") && REFUSED.contains("operator"));
+        assert!(!REFUSED.contains("--token-file"));
     }
 }
