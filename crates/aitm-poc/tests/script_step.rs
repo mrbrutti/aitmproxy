@@ -80,10 +80,15 @@ success:
     );
 }
 
-/// Adding the `script` arm must not loosen the fallback: an unknown step type
-/// is still rejected with `unknown step type`.
+/// The additive `Step::Protocol` seam makes any non-fixed step key a protocol
+/// namespace, not a parse error (a registry-less deserializer cannot know which
+/// namespaces are registered). So `frobnicate:` now parses into
+/// `Step::Protocol { ns: "frobnicate", .. }`. This is never a silent skip: an
+/// unregistered namespace is rejected with a clear error at *run* time (covered
+/// by `protocol_step::unknown_protocol_step_errors_at_run`), which the seam
+/// spec's "clear error at parse/run" contract allows.
 #[test]
-fn unknown_step_still_errors() {
+fn unknown_step_parses_as_protocol_namespace() {
     let yaml = r#"
 id: unknown-step
 info:
@@ -95,14 +100,14 @@ success:
   - type: status
     status: 200
 "#;
-    let err = serde_yaml::from_str::<Poc>(yaml).expect_err("unknown step type must be rejected");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("unknown step type"),
-        "error must say `unknown step type`, got: {msg}"
-    );
-    assert!(
-        msg.contains("frobnicate"),
-        "error must name the unknown step, got: {msg}"
-    );
+    let poc: Poc =
+        serde_yaml::from_str(yaml).expect("a non-fixed step key parses as a protocol step");
+    assert_eq!(poc.steps.len(), 1);
+    let Step::Protocol { ns, .. } = &poc.steps[0] else {
+        panic!(
+            "an unknown step key must become Step::Protocol, got: {:?}",
+            poc.steps[0]
+        );
+    };
+    assert_eq!(ns, "frobnicate", "the protocol namespace is the step key");
 }
