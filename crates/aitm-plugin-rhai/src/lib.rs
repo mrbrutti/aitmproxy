@@ -42,7 +42,7 @@ pub use host_core::{
 };
 pub use host_registry::{registered_host_fns, HostRegistry};
 pub use loader::{RhaiLoader, SUPPORTED_API};
-pub use plugin::{ErrorSink, ScriptHandle, ScriptPlugin};
+pub use plugin::{ErrorSink, LoadedScript, ScriptHandle, ScriptHost, ScriptSet};
 pub use poc_step::{RhaiScriptExecutor, ScriptVars, VarsCapability};
 pub use prelude::PRELUDE_SRC;
 pub use wire::{build, executor, load_scripts, ScriptTier};

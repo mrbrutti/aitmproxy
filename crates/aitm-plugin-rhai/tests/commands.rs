@@ -99,15 +99,11 @@ impl Harness {
         assert!(tier.errors.is_empty(), "scripts compile: {:?}", tier.errors);
 
         let error_sink = Arc::clone(&tier.error_sink);
-        let handles: Vec<Arc<ScriptHandle>> = tier
-            .plugins
-            .iter()
-            .map(aitm_plugin_rhai::ScriptPlugin::handle)
-            .collect();
+        // The live handles come off the host's shared set, in chain order.
+        let handles: Vec<Arc<ScriptHandle>> = tier.host.set().handles();
         let mut registry = Registry::new();
-        for plugin in tier.plugins {
-            registry.add_plugin(Box::new(plugin));
-        }
+        // One host plugin dispatches every script from a single chain position.
+        registry.add_plugin(Box::new(tier.host));
         registry.add_plugin(Box::new(tier.commands));
         let registry = Arc::new(registry);
         let chain = Arc::new(Chain::new(registry.clone(), store.clone()));
@@ -268,8 +264,8 @@ async fn script_validate_reports_meta_or_the_compile_error() {
         ])
     );
     assert!(
-        h.registry.plugins().len() == 1,
-        "validate registered nothing (only the command plugin is present)"
+        h.registry.plugins().len() == 2,
+        "validate registered nothing (only the script host and the command plugin are present)"
     );
 
     let broken = TempScript::new("broken", BROKEN);
@@ -341,7 +337,11 @@ async fn script_validate_source_reports_meta_and_registers() {
         ),
         other => panic!("expected an object, got {other:?}"),
     }
-    assert_eq!(h.registry.plugins().len(), 1, "validate registered nothing");
+    assert_eq!(
+        h.registry.plugins().len(),
+        2,
+        "validate registered nothing (the script host and the command plugin are present)"
+    );
 
     let hook_only = h
         .invoke(
@@ -1004,6 +1004,14 @@ fn load(reg) {
 fn on_request(flow) { flow.request.headers.set("X-V", "4"); }
 "#;
 
+const SAVED_NEW_REGISTERING: &str = r#"
+const NAME = "brandnew";
+fn load(reg) {
+    reg.add_command("brandnew.ping", "ping", |args| "pong");
+}
+fn on_request(flow) { flow.request.headers.set("X-V", "live"); }
+"#;
+
 /// AC4 (overwrite branch): saving over an already-loaded script writes the file
 /// AND swaps its hooks live, observed through the real chain with no restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1097,11 +1105,11 @@ async fn script_list_reports_fresh_hooks_after_overwrite_save() {
     );
 }
 
-/// AC4 (new branch): a never-loaded name is written, compiled and validated,
-/// reports `restart_required: true`, and — the chain being sealed — its hook
-/// does not fire this session.
+/// AC4 (new branch, F8 Option B): a never-loaded name is written, compiled, and
+/// appended to the live set, so its `on_request` runs this session with no
+/// restart. A hook-only new script needs no restart at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn script_save_new_name_writes_the_file_and_requires_a_restart() {
+async fn script_save_new_name_goes_live_with_no_restart() {
     let sandbox = Sandbox::new();
     let h = save_harness(Vec::new(), Some(sandbox.scripts()));
 
@@ -1111,7 +1119,11 @@ async fn script_save_new_name_writes_the_file_and_requires_a_restart() {
 
     let path = sandbox.scripts().join("fresh.rhai");
     assert_eq!(std::fs::read_to_string(&path).expect("file"), SAVED_NEW);
-    assert_eq!(field(&out, "restart_required"), &Value::Bool(true));
+    assert_eq!(
+        field(&out, "restart_required"),
+        &Value::Bool(false),
+        "a hook-only new script needs no restart"
+    );
     assert_eq!(field(&out, "name"), &Value::Str("fresh".into()));
     assert_eq!(field(&out, "path"), &Value::Str(path.display().to_string()));
     assert_eq!(
@@ -1120,9 +1132,9 @@ async fn script_save_new_name_writes_the_file_and_requires_a_restart() {
         "the result reports the compiled meta"
     );
     assert_eq!(
-        h.x_v().await,
-        None,
-        "the chain is sealed: a new script's hook does not join this session"
+        h.x_v().await.as_deref(),
+        Some("new"),
+        "the new script's on_request runs this session with no restart"
     );
     assert_eq!(
         sandbox.tree(),
@@ -1226,6 +1238,77 @@ async fn script_save_of_a_registering_script_requires_a_restart_but_hooks_load()
         &registers_value(&["versioned.ping"], &[])
     );
     assert_eq!(h.x_v().await.as_deref(), Some("4"), "hooks still load");
+}
+
+/// AC6 (new branch, F8 Option B): a brand-new save whose `load` registers a
+/// command is appended live — its `on_request` runs this session — but still
+/// reports `restart_required: true`, because the command/option Registry is
+/// sealed and its `load` never ran, so `brandnew.ping` is not callable yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_save_new_name_registering_is_live_but_requires_a_restart() {
+    let sandbox = Sandbox::new();
+    let h = save_harness(Vec::new(), Some(sandbox.scripts()));
+
+    let out = h
+        .invoke("script.save", save_args("brandnew", SAVED_NEW_REGISTERING))
+        .expect("save of a new registering script succeeds");
+
+    assert_eq!(
+        field(&out, "restart_required"),
+        &Value::Bool(true),
+        "the registered command needs a restart (the Registry is sealed)"
+    );
+    assert_eq!(
+        field(&out, "registers"),
+        &registers_value(&["brandnew.ping"], &[])
+    );
+    assert!(
+        h.registry.command("brandnew.ping").is_none(),
+        "the command is not callable until a restart runs the script's load"
+    );
+    assert_eq!(
+        h.x_v().await.as_deref(),
+        Some("live"),
+        "its hooks still go live this session with no restart"
+    );
+}
+
+/// `enable: false` on a brand-new name appends the script DISABLED: its
+/// `on_request` does not fire until `script.enable` turns it on. (`enable` sets
+/// the saved script's live flag on the new-name branch too, not just overwrite.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_save_new_name_enable_false_appends_disabled() {
+    let sandbox = Sandbox::new();
+    let h = save_harness(Vec::new(), Some(sandbox.scripts()));
+
+    let out = h
+        .invoke(
+            "script.save",
+            params(&[
+                ("name", Value::Str("fresh".into())),
+                ("source", Value::Str(SAVED_NEW.into())),
+                ("enable", Value::Bool(false)),
+            ]),
+        )
+        .expect("save of a new disabled script succeeds");
+    assert_eq!(field(&out, "restart_required"), &Value::Bool(false));
+
+    assert_eq!(
+        h.x_v().await,
+        None,
+        "a new script saved with enable:false must not fire until enabled"
+    );
+
+    h.invoke(
+        "script.enable",
+        params(&[("name", Value::Str("fresh".into()))]),
+    )
+    .expect("enable succeeds");
+    assert_eq!(
+        h.x_v().await.as_deref(),
+        Some("new"),
+        "after script.enable the appended hook runs"
+    );
 }
 
 /// The answer is exactly `{ name, path, api, hooks, registers, restart_required }`.
