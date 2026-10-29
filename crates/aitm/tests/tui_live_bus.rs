@@ -165,10 +165,18 @@ async fn tui_bus_task_runs_against_the_live_loopback_server() {
     //    core serves (the 2026-10-28 merge: F5/F6/F7/F12/F13 and the M3
     //    commands), `flow.detail` among them.
     let first = next_event(&mut ev_rx).await;
-    let BusEvent::Connected { server, tools } = first else {
+    let BusEvent::Connected {
+        server,
+        tools,
+        role,
+    } = first
+    else {
         panic!("the first event must be Connected, got {first:?}");
     };
     assert_eq!(server, format!("aitmproxy {}", aitm_core::VERSION));
+    // AC6: the operator token resolves to operator and the role is echoed in
+    // the `initialize` result the TUI's bus client now reads.
+    assert_eq!(role.as_deref(), Some("operator"));
     let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     names.sort_unstable();
     // This harness assembles the proxy without the M3 script tier, so the

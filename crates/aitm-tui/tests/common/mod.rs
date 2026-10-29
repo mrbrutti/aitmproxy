@@ -131,6 +131,7 @@ pub fn connect(app: &mut App, tool_names: &[&str], listening: Option<&str>) -> V
     let mut out = app.on_bus(BusEvent::Connected {
         server: "aitmproxy test".into(),
         tools: tools(tool_names),
+        role: None,
     });
     if let Some(addr) = listening {
         out.extend(app.on_bus(BusEvent::ProxyStatus(ProxyStatus {
