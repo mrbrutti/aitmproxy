@@ -3,11 +3,17 @@ public struct ServerInfo: Hashable, Sendable {
     public let name: String
     public let version: String
     public let protocolVersion: String
+    /// The role the server resolved this connection to from the token it
+    /// presented — `"operator"` or `"agent"` — echoed at the top level of the
+    /// `initialize` result. `nil` when the server did not echo a role (a server
+    /// built before the echo): "role unknown", never an assertion of a role.
+    public let role: String?
 
-    public init(name: String, version: String, protocolVersion: String) {
+    public init(name: String, version: String, protocolVersion: String, role: String? = nil) {
         self.name = name
         self.version = version
         self.protocolVersion = protocolVersion
+        self.role = role
     }
 
     init(initializeResult result: JSONValue) throws(BusError) {
@@ -17,8 +23,35 @@ public struct ServerInfo: Hashable, Sendable {
         self.init(
             name: name,
             version: server["version"]?.stringValue ?? "",
-            protocolVersion: result["protocolVersion"]?.stringValue ?? "")
+            protocolVersion: result["protocolVersion"]?.stringValue ?? "",
+            role: result["role"]?.stringValue)
     }
+}
+
+/// The role a human operator told a frontend to expect (spec Decision B).
+/// Client-side only: it is never sent to the server and never decides the
+/// role — the token's class does that. It only drives the mismatch warning.
+public enum ExpectedRole: String, CaseIterable, Sendable, Identifiable {
+    case agent
+    case `operator`
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .agent: "Agent"
+        case .operator: "Operator"
+        }
+    }
+}
+
+/// Whether the connection's resolved role contradicts what the operator
+/// expected. `nil` resolved (the server echoed no role) counts as unconfirmed
+/// and therefore a mismatch when any expectation was set, so the frontend warns
+/// rather than silently asserting a role (spec AC8). No expectation never warns.
+public func roleMismatch(expected: ExpectedRole?, resolved: String?) -> Bool {
+    guard let expected else { return false }
+    return resolved != expected.rawValue
 }
 
 /// The core's `TypeDesc`, recovered from the JSON Schema `tools/list` emits
