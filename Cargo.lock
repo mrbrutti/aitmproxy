@@ -209,7 +209,9 @@ version = "0.1.0"
 dependencies = [
  "aitm-browser",
  "aitm-core",
+ "aitm-plugin",
  "aitm-poc",
+ "aitm-proto-test",
  "anyhow",
  "arc-swap",
  "rhai",

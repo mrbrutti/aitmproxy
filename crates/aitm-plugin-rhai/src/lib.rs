@@ -16,6 +16,7 @@ pub mod flow_api;
 pub mod flow_state;
 pub mod host_core;
 pub mod host_net;
+pub mod host_registry;
 pub mod loader;
 pub mod marshal;
 pub mod plugin;
@@ -29,11 +30,12 @@ pub mod wire;
 pub use command::{register_reg_api, ScriptCommand, ScriptRegHandle};
 pub use commands::ScriptCommands;
 pub use config::{RhaiConfig, RhaiLimits, ScriptEntry, ScriptMeta};
-pub use engine::{Budget, RunKind, WORKER_STACK_SIZE};
+pub use engine::{build_engine_with_languages, Budget, RunKind, WORKER_STACK_SIZE};
 pub use error::ScriptError;
 pub use host_core::{
     Finding, FindingSink, MemoryFindingSink, Options, ScriptCapability, ScriptServices,
 };
+pub use host_registry::HostRegistry;
 pub use loader::{RhaiLoader, SUPPORTED_API};
 pub use plugin::{ErrorSink, ScriptHandle, ScriptPlugin};
 pub use poc_step::{RhaiScriptExecutor, ScriptVars, VarsCapability};

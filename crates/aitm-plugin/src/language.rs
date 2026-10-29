@@ -142,6 +142,26 @@ pub trait GuardHandle: Send + Sync {
     /// A short name for the guard, for diagnostics and the catalog
     /// (e.g. `"l4"`, `"scope"`).
     fn guard_name(&self) -> &str;
+
+    /// Decide whether a call to `<ns>.<fn_name>` may proceed. The engine (Task
+    /// 2) calls this **before** the wrapped [`HostFn`] runs, so a refusal stops
+    /// the effect from ever reaching the wire; on `Ok(())` the host fn runs.
+    ///
+    /// **Deny-by-default.** The provided implementation refuses every call with
+    /// [`HostError::GuardRefused`], so a guard that admits nothing is the safe
+    /// default and a protocol's guard must *opt in* a verb by overriding this.
+    ///
+    /// Task 6's `L4Guard` overrides this to enforce the per-verb
+    /// `allow_agent_*` / sensitivity gates (an agent-driven run may be denied a
+    /// verb a human-driven one is allowed); it is not implemented here. The
+    /// `fn_name` is the unqualified verb (`"craft"`, `"ping"`), so one guard can
+    /// make per-verb decisions.
+    fn permit(&self, fn_name: &str) -> Result<(), HostError> {
+        Err(HostError::GuardRefused {
+            namespace: self.guard_name().to_string(),
+            reason: format!("deny-by-default: `{fn_name}` is not permitted by this guard"),
+        })
+    }
 }
 
 /// The native `<ns>:` PoC step handler a protocol contributes. Object-safe so
