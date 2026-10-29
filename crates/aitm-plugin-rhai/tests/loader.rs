@@ -22,7 +22,7 @@ use aitm_core::{
 use aitm_plugin_rhai::config::{RhaiConfig, RhaiLimits, ScriptEntry};
 use aitm_plugin_rhai::error::ScriptError;
 use aitm_plugin_rhai::host_core::{MemoryFindingSink, ScriptServices};
-use aitm_plugin_rhai::loader::RhaiLoader;
+use aitm_plugin_rhai::loader::{Registers, RhaiLoader};
 
 const TAGGER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tagger.rhai");
 const BROKEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/broken.rhai");
@@ -221,6 +221,108 @@ async fn validate_good_and_bad() {
     assert_eq!(path, Path::new(BROKEN));
     assert_eq!(line, 5);
     assert!(column > 0);
+}
+
+/// A script whose `load(reg)` registers two commands and one option.
+const REGISTERING: &str = r#"
+const NAME = "reg-demo";
+const API = "1";
+fn load(reg) {
+    reg.add_option("tag", "x", "a tag");
+    reg.add_command("demo.ping", "ping", |args| "pong");
+    reg.add_command("demo.two", "two", |args| "2");
+}
+fn on_request(flow) { }
+"#;
+
+/// `validate_source` compiles a string on the shared engine and reads the same
+/// metadata a file gives; there is no file, so the path is the `<source>`
+/// placeholder. `registers` lists what `load(reg)` registers, found statically.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_source_reports_meta_and_registers() {
+    let loader = loader(Vec::new(), false);
+    let validated = loader
+        .validate_source(REGISTERING)
+        .expect("the registering script validates");
+    assert_eq!(validated.meta.name, "reg-demo");
+    assert_eq!(validated.meta.api, "1");
+    assert_eq!(validated.meta.path, PathBuf::from("<source>"));
+    assert_eq!(validated.meta.hooks, vec!["load", "on_request"]);
+    assert_eq!(
+        validated.registers,
+        Registers {
+            commands: vec!["demo.ping".to_string(), "demo.two".to_string()],
+            options: vec!["tag".to_string()],
+        }
+    );
+}
+
+/// A hook-only script registers nothing: `registers` is empty (AC3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_source_hook_only_registers_nothing() {
+    let loader = loader(Vec::new(), false);
+    let validated = loader
+        .validate_source("fn on_request(flow) { flow.mark(\"x\"); }\n")
+        .expect("a hook-only script validates");
+    assert_eq!(
+        validated.meta.name, "script",
+        "no NAME: the placeholder stem"
+    );
+    assert_eq!(validated.registers, Registers::default());
+    assert!(validated.registers.commands.is_empty() && validated.registers.options.is_empty());
+}
+
+/// A syntax error in a string is the same positioned `Compile` error a file
+/// gives, with the placeholder script name and path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_source_syntax_error_is_positioned() {
+    let loader = loader(Vec::new(), false);
+    let err = loader
+        .validate_source("fn on_request(flow) {\n  flow.request.headers.set(\"X\", \"1\";\n}\n")
+        .expect_err("a syntax error does not validate");
+    let (script, path, line, column) = compile_parts(&err);
+    assert_eq!(script, "script");
+    assert_eq!(path, Path::new("<source>"));
+    assert_eq!(line, 2);
+    assert!(column > 0, "column {column}");
+    assert!(
+        err.to_string().starts_with("error: script:2:"),
+        "pinned format: {err}"
+    );
+}
+
+/// The registers scan is lexical, not a substring match: names inside line,
+/// block (nested) and string/template/char literals are ignored, a
+/// non-literal first argument is skipped, spacing is tolerated, and a repeat
+/// is listed once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registers_scan_ignores_comments_and_strings() {
+    let loader = loader(Vec::new(), false);
+    let src = r##"
+// reg.add_command("fake-line", "d", |a| 1);
+/* reg.add_command("fake-block", "d", |a| 1); /* nested reg.add_command("fake-nested", "d", |a| 1) */ */
+const DOC = "reg.add_command(\"fake-string\", \"d\", |a| 1)";
+const TPL = `reg.add_command("fake-template", "d", |a| 1)`;
+const RAW = #"reg.add_command("fake-raw", "d", |a| 1)"#;
+const Q = '"';
+fn load(reg) {
+    let dynamic = "built" + "-at-runtime";
+    reg.add_command(dynamic, "d", |a| 1);
+    reg.add_command("a" + "b", "d", |a| 1);
+    reg . add_command (
+        "real-cmd\tTab", "d", |a| 1);
+    reg.add_option("real-opt", 1, "d");
+    reg.add_option("real-opt", 2, "dup");
+}
+"##;
+    let validated = loader.validate_source(src).expect("the script validates");
+    assert_eq!(
+        validated.registers,
+        Registers {
+            commands: vec!["real-cmd\tTab".to_string()],
+            options: vec!["real-opt".to_string()],
+        }
+    );
 }
 
 /// `load_one` yields a working plugin over the shared engine: the config

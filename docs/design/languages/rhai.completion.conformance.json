@@ -53,7 +53,7 @@
     "caret": 39,
     "kind": "member",
     "path": "flow.request",
-    "expected_candidates": [ "method", "url", "path", "headers", "body", "set_json", "query" ]
+    "expected_candidates": [ "method", "url", "path", "headers", "body", "bytes", "set_json", "query" ]
   },
   {
     "name": "member: flow.request.headers. offers the map-like methods",
@@ -61,7 +61,7 @@
     "caret": 47,
     "kind": "member",
     "path": "flow.request.headers",
-    "expected_candidates": [ "get", "set", "remove", "has" ]
+    "expected_candidates": [ "get", "set", "remove", "has", "keys" ]
   },
   {
     "name": "member: flow.response. offers the response members",
@@ -69,7 +69,7 @@
     "caret": 41,
     "kind": "member",
     "path": "flow.response",
-    "expected_candidates": [ "status", "headers", "body" ]
+    "expected_candidates": [ "status", "headers", "body", "bytes" ]
   },
   {
     "name": "member: msg. inside on_ws_message offers the message members",
@@ -101,7 +101,7 @@
     "caret": 35,
     "kind": "member",
     "path": "browser",
-    "expected_candidates": [ "navigate", "click", "type", "screenshot", "eval", "get_dom" ]
+    "expected_candidates": [ "navigate", "click", "type_text", "screenshot", "evaluate", "get_dom" ]
   },
   {
     "name": "member: http. offers send",
