@@ -1,17 +1,30 @@
-//! `ScriptPlugin`: one compiled script as one `aitm_core::Plugin`, with hook
-//! dispatch under `block_in_place`, snapshot/apply, and error isolation
-//! (plan Task 8).
+//! `ScriptHost`: the one `aitm_core::Plugin` the scripting tier registers, and
+//! `LoadedScript`: one compiled script inside it, with hook dispatch under
+//! `block_in_place`, snapshot/apply, and error isolation (plan Task 8).
+//!
+//! **The dynamic dispatch model (F8 Option B).** M3 shipped one `ScriptPlugin`
+//! per script, each a separate member of the sealed `Registry` chain — so a
+//! script saved at runtime could never join the running chain. Instead one
+//! [`ScriptHost`] takes a single chain position and owns a [`ScriptSet`]: a
+//! lock-free, copy-on-write list of [`LoadedScript`]s it iterates in order on
+//! every event. `script.save` of a brand-new name appends to that set, so the
+//! new script's hooks fire with no restart. The host reads the set on the hot
+//! path via `ArcSwap`, so an append never blocks dispatch and dispatch never
+//! blocks an append.
 //!
 //! A script takes a real position in the ordered chain: the `Event` is mapped
 //! to its hook name, and if the script defines that hook it runs over a
 //! [`FlowState`] snapshot of the flow. When the hook returns, the snapshot's
 //! edits and effects are applied to the live flow (spec §5, the effect model)
 //! and a recorded `halt()` becomes `Verdict::Halt` — the same short-circuit a
-//! Rust plugin's verdict is. When the hook fails — a throw, a runtime fault,
-//! the operation or time budget — the snapshot is dropped unapplied, so the
-//! flow is byte-for-byte as it was, the [`ScriptError`] is logged, an
-//! `Event::Error` reaches the bus, and the chain continues (spec §8,
-//! AC-M3-12).
+//! Rust plugin's verdict is, and it stops the scripts after it in the set just
+//! as it stops the plugins after the host in the chain. When the hook fails — a
+//! throw, a runtime fault, the operation or time budget — the snapshot is
+//! dropped unapplied, so the flow is byte-for-byte as it was, the
+//! [`ScriptError`] is logged, an `Event::Error` reaches the bus, and the host
+//! goes on to the next script (spec §8, AC-M3-12). One script's failure never
+//! touches another's: each runs over its own snapshot and the host holds no
+//! mutable state a panic could poison.
 //!
 //! The whole hook runs inside `engine::blocking` (`block_in_place`) with a
 //! run of kind `Hook` open ([`crate::engine::begin_run`]), so a slow script
@@ -41,25 +54,36 @@ use crate::host_core::{Options, ScriptServices};
 /// Log target for hook failures, so an operator can filter script errors.
 const SCRIPT_TARGET: &str = "aitm_plugin_rhai::script";
 
-/// One `.rhai` file, compiled once, as a plugin in the ordered chain.
-pub struct ScriptPlugin {
+/// The name the host reports to the chain. One entry, whatever the script
+/// count; per-script identity lives on the [`ScriptHandle`]s, not here.
+const HOST_NAME: &str = "script-host";
+
+/// One `.rhai` file, compiled once, as one script inside the [`ScriptHost`].
+///
+/// Not an `aitm_core::Plugin`: the host is the single plugin, and it holds
+/// every `LoadedScript` behind an `Arc` in its [`ScriptSet`] so it can iterate
+/// and dispatch them by shared reference. Everything a hook needs is here; the
+/// body cap is the host's and arrives per dispatch, so a script appended at
+/// runtime (which the loader builds with the default cap) still honours the
+/// proxy's configured cap.
+pub struct LoadedScript {
     meta: ScriptMeta,
     engine: Arc<Engine>,
     /// The compiled script, shared with the `script.reload` command.
     handle: Arc<ScriptHandle>,
     services: ScriptServices,
     /// Passed to every hook run as its Rhai tag, where `option(name)` reads it.
-    options: Options,
+    /// Behind an `ArcSwap` because `run_load` merges the script's declared
+    /// option defaults in after the script is already shared in the set.
+    options: ArcSwap<Options>,
     budget: Budget,
-    /// How much of a body the snapshot materializes for the script.
-    max_body: usize,
     errors: Arc<ErrorSink>,
 }
 
 /// A loaded script's identity and its live AST — the hot-reload seam. The
-/// plugin reads the AST per event; `script.reload` swaps it from outside the
-/// chain, which owns the plugin itself behind its lock. A hook already running
-/// finishes on the AST it started with; the next event sees the new one.
+/// script reads the AST per event; `script.reload` swaps it from outside the
+/// chain. A hook already running finishes on the AST it started with; the next
+/// event sees the new one.
 pub struct ScriptHandle {
     name: String,
     path: PathBuf,
@@ -118,14 +142,18 @@ impl ScriptHandle {
     }
 }
 
-/// Where a failed hook's `Event::Error` goes. Late-bound: plugins are
+/// Where a failed hook's `Event::Error` goes. Late-bound: the host is
 /// registered before the chain that dispatches events exists, so the loader
 /// hands every script the same unbound sink and the wiring binds the chain
 /// into it once built. Until then a failure is logged only.
 ///
+/// One sink is shared by every script (it is keyed by script name), so a
+/// script appended at runtime records and clears through the same instance with
+/// no extra wiring — the append path does not need to rebind anything.
+///
 /// Emission is spawned on the runtime, not run inline: the chain holds the
-/// plugin's lock while a hook runs, so dispatching through it synchronously
-/// would deadlock on the plugin itself.
+/// host's lock while a hook runs, so dispatching through it synchronously would
+/// deadlock on the host itself.
 #[derive(Default)]
 pub struct ErrorSink {
     sink: RwLock<Option<Arc<dyn EventSink>>>,
@@ -174,11 +202,10 @@ impl ErrorSink {
     }
 }
 
-impl ScriptPlugin {
+impl LoadedScript {
     /// Wrap a compiled script. The AST is named after the script when the
     /// loader has not already done so, so `finding(...)` can attribute what it
-    /// records. Bodies are snapshotted up to the proxy's default body cap;
-    /// [`ScriptPlugin::with_max_body`] overrides it.
+    /// records.
     pub fn new(
         meta: ScriptMeta,
         engine: Arc<Engine>,
@@ -193,27 +220,23 @@ impl ScriptPlugin {
             engine,
             handle,
             services,
-            options,
+            options: ArcSwap::from_pointee(options),
             budget: Budget::of(cfg),
-            max_body: LimitConfig::default().max_body_bytes,
             errors: Arc::default(),
         }
     }
 
     /// Share the sink that failed hooks emit `Event::Error` through.
-    pub fn with_error_sink(mut self, errors: Arc<ErrorSink>) -> Self {
-        self.errors = errors;
-        self
-    }
-
-    /// Cap the body bytes a snapshot copies for the script.
-    pub fn with_max_body(mut self, max_body: usize) -> Self {
-        self.max_body = max_body;
-        self
+    pub fn with_error_sink(self, errors: Arc<ErrorSink>) -> Self {
+        Self { errors, ..self }
     }
 
     pub fn meta(&self) -> &ScriptMeta {
         &self.meta
+    }
+
+    pub fn name(&self) -> &str {
+        &self.meta.name
     }
 
     /// Swap in a freshly compiled AST (the hot-reload seam; see
@@ -222,10 +245,34 @@ impl ScriptPlugin {
         self.handle.swap(ast);
     }
 
-    /// The handle `script.reload` swaps the AST through. Taken by the wiring
-    /// before the plugin is boxed into the registry.
+    /// The handle `script.reload` / `script.enable` act through, and the one the
+    /// command surface reads `script.list` off. Shared, so a change through it
+    /// is seen by the running script.
     pub fn handle(&self) -> Arc<ScriptHandle> {
         Arc::clone(&self.handle)
+    }
+
+    /// Run the script's `load(reg)` through the command/option bridge
+    /// (`command.rs`), so what it registers lands in the platform registry the
+    /// frontends read — a script command is an MCP tool and a CLI subcommand
+    /// with no special casing (spec §9). Called once, at startup, by
+    /// [`ScriptHost::load`]; a script appended at runtime never reaches it,
+    /// because the registry is sealed by then (why such a script's
+    /// commands/options still need a restart).
+    ///
+    /// A `load` that throws is logged and installs nothing; the script keeps
+    /// its hooks, because a broken registration is no reason to drop a working
+    /// `on_request` (spec §8's error policy, applied to load).
+    pub fn run_load(&self, reg: &mut Registry) {
+        let ast = self.handle.current();
+        let mut handle = ScriptRegHandle::new(reg)
+            .with_options((**self.options.load()).clone())
+            .with_budget(self.budget);
+        if let Err(err) = handle.run_load(&self.engine, &ast) {
+            tracing::error!(target: SCRIPT_TARGET, script = %self.meta.name, "{err}");
+        }
+        // Defaults the script declared join the options its hooks read.
+        self.options.store(Arc::new(handle.into_options()));
     }
 
     /// Run `hook` over `state` the way the spec's bridge describes: the whole
@@ -239,12 +286,13 @@ impl ScriptPlugin {
         state: &Arc<Mutex<FlowState>>,
         args: Vec<Dynamic>,
     ) -> Result<(), Box<EvalAltResult>> {
+        let options = (**self.options.load()).clone();
         blocking(|| {
             let _run = begin_run(RunKind::Hook, self.budget.hook_timeout);
             let _active = ActiveFlow::enter(Arc::clone(state));
             self.engine
                 .call_fn_with_options::<Dynamic>(
-                    CallFnOptions::new().with_tag(self.options.clone()),
+                    CallFnOptions::new().with_tag(options),
                     &mut Scope::new(),
                     ast,
                     hook,
@@ -252,6 +300,45 @@ impl ScriptPlugin {
                 )
                 .map(drop)
         })
+    }
+
+    /// Dispatch one event to this script: map it to its hook, run the hook over
+    /// a `max_body`-capped snapshot, and apply or discard the result. `max_body`
+    /// is the host's configured body cap, passed in so an appended script
+    /// honours it too. The [`ScriptHost`] calls this for each loaded script;
+    /// it is public so a test can drive one script in isolation.
+    pub fn dispatch(&self, ev: &Event, ctx: &mut FlowCtx<'_>, max_body: usize) -> Verdict {
+        if !self.handle.is_enabled() {
+            return Verdict::Continue;
+        }
+        let Some(hook) = hook_for(ev) else {
+            return Verdict::Continue;
+        };
+        let ast = self.handle.current();
+        if !defines(&ast, hook) {
+            return Verdict::Continue;
+        }
+
+        let state = Arc::new(Mutex::new(FlowState::snapshot(ctx.flow(), ev, max_body)));
+        let flow_id = lock(&state).id;
+        let args = hook_args(ev, &state);
+
+        match self.call_hook(&ast, hook, &state, args) {
+            Ok(()) => {
+                // A clean `on_error` run is the script handling its own
+                // failure's `Event::Error`; it must not erase that failure.
+                if !matches!(ev, Event::Error { .. }) {
+                    self.errors.clear(&self.meta.name);
+                }
+                take(state).apply_to(ctx)
+            }
+            Err(err) => {
+                // `state` is dropped unapplied: the flow stays as it was.
+                let err = ScriptError::from_eval(&self.meta.name, hook, &err, &self.budget);
+                self.report(ev, flow_id, &err);
+                Verdict::Continue
+            }
+        }
     }
 
     /// Log the failure and surface it on the bus as
@@ -277,67 +364,133 @@ impl ScriptPlugin {
     }
 }
 
-impl Plugin for ScriptPlugin {
+/// The ordered, swappable set of loaded scripts the [`ScriptHost`] dispatches
+/// and the command surface appends to. A clone shares the same backing list, so
+/// a `script.save` through the command's handle is seen by the host's.
+///
+/// Reads (`snapshot`, on every event) are lock-free `ArcSwap` loads; a write
+/// (`append`, on `script.save` of a new name) is a copy-on-write swap, so the
+/// hot path never waits on a save and the order a save produces — the new
+/// script last — is what the next event sees.
+#[derive(Clone, Default)]
+pub struct ScriptSet(Arc<ArcSwap<Vec<Arc<LoadedScript>>>>);
+
+impl ScriptSet {
+    /// A set over `scripts`, in the order given (declaration order from the
+    /// loader, which is chain order).
+    pub fn new(scripts: Vec<LoadedScript>) -> Self {
+        let scripts: Vec<Arc<LoadedScript>> = scripts.into_iter().map(Arc::new).collect();
+        Self(Arc::new(ArcSwap::from_pointee(scripts)))
+    }
+
+    /// The current list, for one event's dispatch or one command's read. A
+    /// lock-free load: a concurrent `append` either is or is not visible, never
+    /// a torn list.
+    fn snapshot(&self) -> Arc<Vec<Arc<LoadedScript>>> {
+        self.0.load_full()
+    }
+
+    /// Append `script` at the end — its chain position after every script
+    /// already loaded (spec §8 order). Copy-on-write, so a dispatch reading the
+    /// old list finishes on it and the next reads the new.
+    pub fn append(&self, script: LoadedScript) {
+        let script = Arc::new(script);
+        self.0.rcu(|current| {
+            let mut next = (**current).clone();
+            next.push(Arc::clone(&script));
+            next
+        });
+    }
+
+    /// Whether any script is loaded.
+    pub fn is_empty(&self) -> bool {
+        self.0.load().is_empty()
+    }
+
+    /// How many scripts are loaded.
+    pub fn len(&self) -> usize {
+        self.0.load().len()
+    }
+
+    /// Every loaded script's handle, in chain order — what `script.list` reads.
+    pub fn handles(&self) -> Vec<Arc<ScriptHandle>> {
+        self.snapshot().iter().map(|s| s.handle()).collect()
+    }
+
+    /// The handle of the loaded script named `name`, if any — the lookup
+    /// `script.reload` / `script.enable` / `script.disable` share.
+    pub fn find_handle(&self, name: &str) -> Option<Arc<ScriptHandle>> {
+        self.snapshot()
+            .iter()
+            .find(|s| s.name() == name)
+            .map(|s| s.handle())
+    }
+
+    /// The loaded script names, in chain order — for the "no such script" miss
+    /// message and for logging what is loaded.
+    pub fn names(&self) -> Vec<String> {
+        self.snapshot()
+            .iter()
+            .map(|s| s.name().to_string())
+            .collect()
+    }
+}
+
+/// The one `aitm_core::Plugin` the scripting tier registers: it holds the whole
+/// [`ScriptSet`] and dispatches every loaded script in order from its single
+/// chain position (the F8 Option-B dispatch model — see the module docs).
+pub struct ScriptHost {
+    set: ScriptSet,
+    /// How much of a body each script's snapshot materializes — the proxy's
+    /// configured cap, shared by every script including any appended at runtime.
+    max_body: usize,
+}
+
+impl ScriptHost {
+    /// A host over `set`. The body cap starts at the engine default;
+    /// [`ScriptHost::with_max_body`] raises it to the proxy's configured cap.
+    pub fn new(set: ScriptSet) -> Self {
+        Self {
+            set,
+            max_body: LimitConfig::default().max_body_bytes,
+        }
+    }
+
+    /// Cap the body bytes each script's snapshot copies.
+    pub fn with_max_body(mut self, max_body: usize) -> Self {
+        self.max_body = max_body;
+        self
+    }
+
+    /// The set this host dispatches — the same one the command surface appends
+    /// to.
+    pub fn set(&self) -> &ScriptSet {
+        &self.set
+    }
+}
+
+impl Plugin for ScriptHost {
     fn name(&self) -> &str {
-        &self.meta.name
+        HOST_NAME
     }
 
-    /// Run the script's `load(reg)` through the command/option bridge
-    /// (`command.rs`), so what it registers lands in the platform registry the
-    /// frontends read — a script command is an MCP tool and a CLI subcommand
-    /// with no special casing (spec §9).
-    ///
-    /// A `load` that throws is logged and installs nothing; the script keeps
-    /// its hooks, because a broken registration is no reason to drop a working
-    /// `on_request` (spec §8's error policy, applied to load).
+    /// Run every loaded script's `load(reg)` once, in order, at startup.
     fn load(&mut self, reg: &mut Registry) {
-        let ast = self.handle.current();
-        let mut handle = ScriptRegHandle::new(reg)
-            .with_options(self.options.clone())
-            .with_budget(self.budget);
-        if let Err(err) = handle.run_load(&self.engine, &ast) {
-            tracing::error!(target: SCRIPT_TARGET, script = %self.meta.name, "{err}");
+        for script in self.set.snapshot().iter() {
+            script.run_load(reg);
         }
-        // Defaults the script declared join the options its hooks read.
-        self.options = handle.into_options();
     }
 
+    /// Dispatch the event to each loaded script in chain order. A script's
+    /// `halt()` short-circuits the rest, exactly as it short-circuits the chain
+    /// after the host; a script's error is isolated and the host goes on.
     fn on_event(&mut self, ev: &Event, ctx: &mut FlowCtx<'_>) -> Verdict {
-        if !self.handle.is_enabled() {
-            return Verdict::Continue;
-        }
-        let Some(hook) = hook_for(ev) else {
-            return Verdict::Continue;
-        };
-        let ast = self.handle.current();
-        if !defines(&ast, hook) {
-            return Verdict::Continue;
-        }
-
-        let state = Arc::new(Mutex::new(FlowState::snapshot(
-            ctx.flow(),
-            ev,
-            self.max_body,
-        )));
-        let flow_id = lock(&state).id;
-        let args = hook_args(ev, &state);
-
-        match self.call_hook(&ast, hook, &state, args) {
-            Ok(()) => {
-                // A clean `on_error` run is the script handling its own
-                // failure's `Event::Error`; it must not erase that failure.
-                if !matches!(ev, Event::Error { .. }) {
-                    self.errors.clear(&self.meta.name);
-                }
-                take(state).apply_to(ctx)
-            }
-            Err(err) => {
-                // `state` is dropped unapplied: the flow stays as it was.
-                let err = ScriptError::from_eval(&self.meta.name, hook, &err, &self.budget);
-                self.report(ev, flow_id, &err);
-                Verdict::Continue
+        for script in self.set.snapshot().iter() {
+            if script.dispatch(ev, ctx, self.max_body) == Verdict::Halt {
+                return Verdict::Halt;
             }
         }
+        Verdict::Continue
     }
 }
 

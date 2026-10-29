@@ -35,7 +35,7 @@ use aitm_core::{
     StdGuard, Verdict,
 };
 use aitm_plugin_rhai::{
-    wire, MemoryFindingSink, RhaiConfig, ScriptEntry, ScriptPlugin, ScriptServices,
+    wire, MemoryFindingSink, RhaiConfig, ScriptEntry, ScriptHost, ScriptServices,
 };
 
 const TAGGER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/addons/tagger.rhai");
@@ -140,19 +140,13 @@ impl Plugin for Probe {
 }
 
 /// Drive the exact registration order the binary uses — native plugins, then
-/// the tier's script plugins in declaration order — plus a trailing native
-/// probe, over a real `Chain`.
-fn chain_with(
-    scripts: Vec<ScriptPlugin>,
-    probe: Arc<ProbeLog>,
-    store: Arc<dyn FlowStore>,
-) -> Chain {
+/// the tier's one script host (every script, in declaration order) — plus a
+/// trailing native probe, over a real `Chain`.
+fn chain_with(host: ScriptHost, probe: Arc<ProbeLog>, store: Arc<dyn FlowStore>) -> Chain {
     let mut registry = Registry::new();
     // A native plugin ahead of the scripts (stands in for capture/scope/…).
     registry.add_plugin(Box::new(Probe(Arc::new(ProbeLog::default()))));
-    for plugin in scripts {
-        registry.add_plugin(Box::new(plugin));
-    }
+    registry.add_plugin(Box::new(host));
     // A native plugin after the scripts: a script halt() must stop it.
     registry.add_plugin(Box::new(Probe(probe)));
     Chain::new(Arc::new(registry), store)
@@ -177,7 +171,7 @@ async fn chain_order_natives_then_scripts() {
     );
 
     let probe = Arc::new(ProbeLog::default());
-    let chain = chain_with(tier.plugins, probe.clone(), store.clone());
+    let chain = chain_with(tier.host, probe.clone(), store.clone());
 
     // A blocked admin write: the script set_response(403) + halt().
     let blocked = insert_request(store.as_ref(), "POST", "/admin/users");
@@ -222,7 +216,7 @@ async fn script_added_without_rebuild() {
     // No scripts: nothing tags the request.
     let bare = wire::build(rhai_cfg(vec![]), services(store.clone(), guard.clone()))
         .expect("bare tier builds");
-    assert!(bare.plugins.is_empty());
+    assert!(bare.host.set().is_empty());
 
     // Add the tagger by config entry — the running binary would do exactly this
     // from `scripts:` or `--script`, with no rebuild.
@@ -233,7 +227,7 @@ async fn script_added_without_rebuild() {
     .expect("tier with tagger builds");
 
     let probe = Arc::new(ProbeLog::default());
-    let chain = chain_with(with_tagger.plugins, probe, store.clone());
+    let chain = chain_with(with_tagger.host, probe, store.clone());
     let id = insert_request(store.as_ref(), "GET", "/");
     chain.dispatch(Event::Request(id)).await;
 
@@ -296,7 +290,7 @@ async fn script_cannot_escape_or_exceed_scope() {
     assert!(tier.errors.is_empty(), "{:?}", tier.errors);
 
     let probe = Arc::new(ProbeLog::default());
-    let chain = Arc::new(chain_with(tier.plugins, probe.clone(), store.clone()));
+    let chain = Arc::new(chain_with(tier.host, probe.clone(), store.clone()));
     // The chain is also where the scripts' `Event::Error`s go, so the trailing
     // probe sees them as a native plugin would.
     tier.error_sink.bind(chain.clone());
@@ -428,9 +422,7 @@ async fn natives_and_scripts_run_in_registration_order() {
         name: "lead",
         seen: seen.clone(),
     }));
-    for plugin in tier.plugins {
-        registry.add_plugin(Box::new(plugin));
-    }
+    registry.add_plugin(Box::new(tier.host));
     registry.add_plugin(Box::new(SeqProbe {
         name: "trail",
         seen: seen.clone(),
@@ -462,11 +454,7 @@ async fn natives_and_scripts_run_in_registration_order() {
         &cfg,
         &Features::default(),
         ScriptWiring {
-            plugins: tier
-                .plugins
-                .into_iter()
-                .map(|p| Box::new(p) as Box<dyn Plugin>)
-                .collect(),
+            plugins: vec![Box::new(tier.host) as Box<dyn Plugin>],
             executor: Some(tier.executor.clone()),
             commands: vec![Box::new(tier.commands)],
         },
@@ -484,7 +472,10 @@ async fn natives_and_scripts_run_in_registration_order() {
             .position(|n| n == name)
             .unwrap_or_else(|| panic!("{name} is registered: {names:?}"))
     };
-    assert_eq!(at("seq-b"), at("seq-a") + 1, "declaration order: {names:?}");
+    // Every script lives inside the one `script-host` plugin now; its single
+    // chain position is what must fall after the flow-acting natives and before
+    // the command providers. The scripts' own declaration order is an internal
+    // property of the host, proven by the `X-Seq` = "a,b" assertion above.
     for native in [
         "capture",
         "replay",
@@ -494,14 +485,14 @@ async fn natives_and_scripts_run_in_registration_order() {
         "rate-limit",
     ] {
         assert!(
-            at(native) < at("seq-a"),
-            "{native} precedes the scripts: {names:?}"
+            at(native) < at("script-host"),
+            "{native} precedes the script host: {names:?}"
         );
     }
     for provider in ["browser", "poc", "scripts"] {
         assert!(
-            at("seq-b") < at(provider),
-            "{provider} follows the scripts: {names:?}"
+            at("script-host") < at(provider),
+            "{provider} follows the script host: {names:?}"
         );
     }
 }
@@ -524,11 +515,7 @@ async fn script_command_over_frontends() {
         &cfg,
         &Features::default(),
         ScriptWiring {
-            plugins: tier
-                .plugins
-                .into_iter()
-                .map(|p| Box::new(p) as Box<dyn Plugin>)
-                .collect(),
+            plugins: vec![Box::new(tier.host) as Box<dyn Plugin>],
             executor: Some(tier.executor.clone()),
             commands: vec![Box::new(tier.commands)],
         },
