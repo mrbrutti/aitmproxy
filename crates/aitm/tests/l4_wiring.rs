@@ -7,10 +7,12 @@
 //! - `enabled = true` + no privilege ⇒ STILL registered (honest, drivable), but the
 //!   wire verbs fail closed (proven at the command layer in `aitm-proto-l4`); here we
 //!   assert the proxy still builds and the surface is present.
-//! - `aitm-core` is untouched by the whole milestone (AC19).
+//!
+//! AC19 ("`aitm-core` is untouched by the whole M5 milestone") was guarded here by a
+//! git-diff test; it has been retired (see the note below the `l4_*` tests) now that
+//! later milestones legitimately edit `aitm-core`.
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
@@ -108,41 +110,10 @@ fn l4_enabled_no_priv_builds() {
     assert!(proxy.registry().command("l4.inject").is_some());
 }
 
-/// AC19: the M5 milestone makes no `aitm-core` edits — `git diff` against the
-/// merge-base with `main` shows nothing under `crates/aitm-core`. Skips cleanly when
-/// git or the base ref is unavailable (e.g. a shallow checkout).
-#[test]
-fn aitm_core_untouched() {
-    let toplevel = match git(&["rev-parse", "--show-toplevel"]) {
-        Some(p) => p.trim().to_string(),
-        None => return, // no git — nothing to assert here
-    };
-    let base = match git(&["-C", &toplevel, "merge-base", "HEAD", "main"]) {
-        Some(b) if !b.trim().is_empty() => b.trim().to_string(),
-        _ => return, // `main` not present (shallow CI clone) — skip
-    };
-    let changed = git(&[
-        "-C",
-        &toplevel,
-        "diff",
-        "--name-only",
-        &base,
-        "--",
-        "crates/aitm-core",
-    ])
-    .expect("git diff runs once rev-parse/merge-base have");
-    assert!(
-        changed.trim().is_empty(),
-        "M5 must not touch aitm-core, but these files changed:\n{changed}"
-    );
-}
-
-/// Run a git command, returning its stdout on success, `None` if git is missing or
-/// the command fails.
-fn git(args: &[&str]) -> Option<String> {
-    let out = Command::new("git").args(args).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8(out.stdout).ok()
-}
+// AC19 ("the M5 milestone makes no `aitm-core` edits") was guarded here by an
+// `aitm_core_untouched` test that diffed `crates/aitm-core` against the merge-base
+// with `main`. That check is obsolete now that later, authorized milestones edit
+// `aitm-core` (e.g. M7 Task 5 adds `LimitConfig.max_concurrent_streams`): the diff
+// no longer isolates M5's commits, so it would fail on any legitimate post-M5
+// `aitm-core` change. M5's no-`aitm-core`-edit property is settled in its merged
+// history (PR #15); the guard has been removed rather than pinned to fragile SHAs.
