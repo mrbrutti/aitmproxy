@@ -193,6 +193,13 @@ async fn live_acceptance_harness_reproduces_all_zero_false_positives() {
         .collect();
     let report = grade(&records);
 
+    // A one-line summary of the live-acceptance result (visible under --nocapture).
+    let classes: Vec<&str> = findings.iter().map(|f| f.class.as_str()).collect();
+    eprintln!(
+        "AC-M4-17 live-acceptance: planted={} reproduced={} false_positives={} classes={:?}",
+        report.planted, report.reproduced, report.false_positives, classes
+    );
+
     assert_eq!(
         report.reproduced, report.planted,
         "live-acceptance gate: reproduced {} of {} planted vulns (missing {:?})",
