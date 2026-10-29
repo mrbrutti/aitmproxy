@@ -270,7 +270,7 @@ fn finding_yaml_read_failure_is_shown_in_the_panel() {
 // --------------------------------------------- the honest core snapshot
 
 /// `--snapshot-core` (M-misc), re-pinned after the 2026-10-28 core merge:
-/// against the 37 core tools the screen carries the F5/F13 data the core
+/// against the 50 core tools the screen carries the F5/F13 data the core
 /// now serves — sizes, durations, headers, the PoC library — and only the
 /// surfaces still ahead of the core (F1 agent, F3 rules, F4 push, F10
 /// sessions, M3 scripts, the F5 cookie/timing tabs) keep their labels.

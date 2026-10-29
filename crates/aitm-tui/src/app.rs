@@ -3067,7 +3067,14 @@ impl App {
                     "flow.resume" => self.toast(Level::Info, "Resumed"),
                     "flow.kill" => self.toast(Level::Info, "Killed"),
                     "flow.intercept" => {
-                        self.intercept_armed = value.as_bool().unwrap_or(self.intercept_armed);
+                        // M6 F3: `flow.intercept` now returns `{enabled, rules}`
+                        // (was a bare bool). Read `enabled`; tolerate the old bool
+                        // shape so a mixed-version bus does not wedge the toggle.
+                        self.intercept_armed = value
+                            .get("enabled")
+                            .and_then(Value::as_bool)
+                            .or_else(|| value.as_bool())
+                            .unwrap_or(self.intercept_armed);
                         let msg = if self.intercept_armed {
                             "Intercept armed — every request pauses"
                         } else {
@@ -4674,6 +4681,25 @@ mod tests {
             app.current_toast().map(|t| t.text.as_str()),
             Some("capture resumed")
         );
+    }
+
+    /// M6 F3: `flow.intercept` answers with `{enabled, rules}` (was a bare bool).
+    /// The toggle reads `enabled` from the object shape, not `as_bool()` on the
+    /// whole value (which would now always be `None` and freeze the armed state).
+    #[test]
+    fn flow_intercept_result_reads_enabled_from_object() {
+        let mut app = app_with_flows();
+        assert!(!app.intercept_armed);
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "flow.intercept".into(),
+            value: json!({"enabled": true, "rules": []}),
+        });
+        assert!(app.intercept_armed, "enabled:true must arm the toggle");
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "flow.intercept".into(),
+            value: json!({"enabled": false, "rules": [{"url": {"wildcard": "*/admin"}}]}),
+        });
+        assert!(!app.intercept_armed, "enabled:false must disarm the toggle");
     }
 
     /// C5: `flow.clear` answers with counts; the toast says both.
