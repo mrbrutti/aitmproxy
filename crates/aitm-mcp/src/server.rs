@@ -96,13 +96,21 @@ impl ConnCtx {
     }
 }
 
+/// How many replies may be queued before the read loop stops consuming new
+/// requests (backpressure, RF#3). Replies are never dropped — the reader pauses
+/// until the writer has drained the lane below this mark, so a client that sends
+/// without reading cannot grow the reply queue without bound.
+pub const DEFAULT_REPLY_HIGH_WATER: usize = 1024;
+
 /// A bounded, per-connection push sink feeding one connection's writer task.
 ///
 /// Two lanes share the sink so a slow subscriber can never grow core memory or
 /// block the proxy data path:
-/// - **replies** to the connection's own requests are unbounded (a stalled reader
-///   stops sending requests, so replies cannot grow without bound) and are
-///   **never dropped**;
+/// - **replies** to the connection's own requests are **never dropped**, but the
+///   lane is bounded by backpressure: once `reply_high_water` replies are queued,
+///   the read loop stops consuming new requests ([`await_reply_capacity`]) until
+///   the writer drains below the mark. A client that pipelines requests and never
+///   reads therefore stalls (TCP backpressure) instead of growing memory (RF#3);
 /// - **notifications** (`notifications/aitm/{flow,state}`) are bounded to
 ///   `capacity` lines; on overflow the *oldest* notification is dropped and the
 ///   connection is flagged `lagged`, surfaced on the next drain as a
@@ -118,9 +126,14 @@ pub struct NotificationSink {
 struct SinkInner {
     queues: Mutex<SinkQueues>,
     capacity: usize,
+    reply_high_water: usize,
     lagged: AtomicBool,
     closed: AtomicBool,
+    /// Wakes the writer task when there may be something new to write.
     notify: Notify,
+    /// Wakes a read loop parked in [`NotificationSink::await_reply_capacity`] once
+    /// the reply lane has drained below the high-water mark (or the sink closed).
+    drained: Notify,
 }
 
 #[derive(Default)]
@@ -141,15 +154,25 @@ impl std::fmt::Debug for NotificationSink {
 
 impl NotificationSink {
     /// A sink whose notification lane holds at most `capacity` lines (clamped to
-    /// at least 1) before dropping the oldest.
+    /// at least 1) before dropping the oldest, and whose reply lane backpressures
+    /// the reader at [`DEFAULT_REPLY_HIGH_WATER`].
     pub fn new(capacity: usize) -> Self {
+        Self::with_limits(capacity, DEFAULT_REPLY_HIGH_WATER)
+    }
+
+    /// As [`NotificationSink::new`], but with an explicit reply-lane high-water
+    /// mark (both clamped to at least 1). Used by tests to force backpressure
+    /// cheaply.
+    pub fn with_limits(capacity: usize, reply_high_water: usize) -> Self {
         Self {
             inner: Arc::new(SinkInner {
                 queues: Mutex::new(SinkQueues::default()),
                 capacity: capacity.max(1),
+                reply_high_water: reply_high_water.max(1),
                 lagged: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 notify: Notify::new(),
+                drained: Notify::new(),
             }),
         }
     }
@@ -183,14 +206,20 @@ impl NotificationSink {
 
     /// Take everything queued, replies first (priority), then — if the lag flag
     /// is set — a `lagged` state marker, then the surviving notifications. Clears
-    /// the lag flag.
+    /// the lag flag, and wakes a reader parked for reply-lane capacity, since the
+    /// reply lane is now empty.
     pub fn drain(&self) -> Vec<String> {
-        let mut q = self.lock();
-        let mut out: Vec<String> = q.replies.drain(..).collect();
-        if self.inner.lagged.swap(false, Ordering::Relaxed) {
-            out.push(lagged_state_line());
-        }
-        out.extend(q.notes.drain(..));
+        let out: Vec<String> = {
+            let mut q = self.lock();
+            let mut out: Vec<String> = q.replies.drain(..).collect();
+            if self.inner.lagged.swap(false, Ordering::Relaxed) {
+                out.push(lagged_state_line());
+            }
+            out.extend(q.notes.drain(..));
+            out
+        };
+        // Replies drained → a backpressured reader has room again.
+        self.inner.drained.notify_one();
         out
     }
 
@@ -199,15 +228,42 @@ impl NotificationSink {
         self.lock().notes.len()
     }
 
+    /// How many replies are currently queued (for tests / introspection).
+    pub fn reply_queued_len(&self) -> usize {
+        self.lock().replies.len()
+    }
+
+    /// Pause the read loop until the reply lane has room (below its high-water
+    /// mark) or the sink is closed. This is the backpressure lever (RF#3): while a
+    /// client is not reading its socket the writer cannot drain, so replies stay
+    /// queued; the reader stops consuming new requests until the writer catches
+    /// up, bounding memory without ever dropping a reply.
+    pub async fn await_reply_capacity(&self) {
+        loop {
+            if self.inner.closed.load(Ordering::Relaxed)
+                || self.lock().replies.len() < self.inner.reply_high_water
+            {
+                return;
+            }
+            // `drain`/`close` call `drained.notify_one`, which stores a permit even
+            // if no waiter is parked yet, so a wake between the check above and the
+            // await below is not lost; the loop then re-checks the condition.
+            self.inner.drained.notified().await;
+        }
+    }
+
     /// Whether the notification lane has overflowed since the last drain.
     pub fn lagged(&self) -> bool {
         self.inner.lagged.load(Ordering::Relaxed)
     }
 
-    /// Mark the sink closed and wake the writer so it can drain and exit.
+    /// Mark the sink closed and wake both the writer (so it can drain and exit)
+    /// and any read loop parked for reply-lane capacity (so it unblocks when the
+    /// connection is torn down rather than hanging on a writer that has gone).
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::Relaxed);
         self.inner.notify.notify_one();
+        self.inner.drained.notify_one();
     }
 
     /// Whether the sink is closed and holds nothing more to write.
@@ -426,9 +482,6 @@ struct ConfirmTokens {
 
 #[derive(Default)]
 struct ConfirmState {
-    /// Monotonic counter, folded into each token so two tokens for the same
-    /// `{connection, command, arguments}` never collide.
-    seq: u64,
     entries: Vec<ConfirmEntry>,
 }
 
@@ -455,8 +508,7 @@ impl ConfirmTokens {
         let now = Instant::now();
         let mut st = self.lock();
         st.entries.retain(|e| e.expires > now);
-        st.seq += 1;
-        let token = confirm_token_value(conn_id, command, fingerprint, st.seq);
+        let token = confirm_token_value();
         st.entries.push(ConfirmEntry {
             token: token.clone(),
             conn_id,
@@ -489,19 +541,13 @@ impl ConfirmTokens {
     }
 }
 
-/// An opaque, unguessable-enough token value. Security rests on the binding +
-/// single-use + TTL + the already-authenticated connection; this just folds the
-/// bound fields and the counter into a non-sequential string.
-fn confirm_token_value(conn_id: u64, command: &str, fingerprint: &str, seq: u64) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    conn_id.hash(&mut h);
-    command.hash(&mut h);
-    fingerprint.hash(&mut h);
-    seq.hash(&mut h);
-    // A monotonically-unique nanos stamp, so re-minting the same binding differs.
-    Instant::now().elapsed().as_nanos().hash(&mut h);
-    format!("cfm_{:016x}", h.finish())
+/// A fresh, opaque confirm-token value from a CSPRNG (`uuid::Uuid::new_v4`), so
+/// the value is non-sequential and unguessable (RF: tokens must be opaque).
+/// Security still rests on the entry's `{conn_id, command, fingerprint}` binding,
+/// single-use, TTL, and the already-authenticated connection; this value is just
+/// the opaque handle to that entry.
+fn confirm_token_value() -> String {
+    format!("cfm_{}", uuid::Uuid::new_v4().simple())
 }
 
 /// A stable, key-order-independent fingerprint of a call's `arguments`, so the
@@ -532,15 +578,32 @@ fn needs_confirmation(prompt: &str, token: &str) -> JsonValue {
 /// bounded approval timeout elapses. The waiting agent thread holds the command and
 /// its arguments on its own stack; this table holds only the resolution channel, so
 /// resolving never has to re-run anything itself.
-#[derive(Default)]
+/// The default ceiling on concurrently parked `Ask` requests. Each parked call
+/// occupies one blocking-pool thread (the agent's `spawn_blocking` task awaiting
+/// the operator), so an uncapped table lets a runaway or compromised agent open
+/// many connections, park one Sensitive call on each, and saturate the pool —
+/// starving the operator's own `agent.approve`/`agent.set`/`agent.set paused` and
+/// defeating oversight during the window. Capping well below Tokio's default 512
+/// blocking threads leaves ample headroom for the operator's control path (RF#5).
+const MAX_PARKED_REQUESTS: usize = 64;
+
 struct ParkedRequests {
     inner: Mutex<ParkState>,
+    /// Maximum number of requests parked at once; a further park is refused.
+    cap: usize,
+}
+
+impl Default for ParkedRequests {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(ParkState::default()),
+            cap: MAX_PARKED_REQUESTS,
+        }
+    }
 }
 
 #[derive(Default)]
 struct ParkState {
-    /// Monotonic counter folded into each `request_id`.
-    seq: u64,
     entries: Vec<(String, Arc<ParkSlot>)>,
 }
 
@@ -592,14 +655,26 @@ impl ParkedRequests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Park a new request: mint a `request_id`, register its slot, and return both.
-    fn park(&self) -> (String, Arc<ParkSlot>) {
+    /// Park a new request: if the table is below its cap, mint an opaque,
+    /// non-sequential `request_id` (CSPRNG, RF#4), register its slot, and return
+    /// both. `None` when the cap is reached — the caller refuses the call rather
+    /// than parking it, so a flood cannot grow the table or the blocking pool
+    /// without bound (RF#5).
+    fn try_park(&self) -> Option<(String, Arc<ParkSlot>)> {
         let mut st = self.lock();
-        st.seq += 1;
-        let request_id = format!("apr_{}", st.seq);
+        if st.entries.len() >= self.cap {
+            return None;
+        }
+        let request_id = format!("apr_{}", uuid::Uuid::new_v4().simple());
         let slot = Arc::new(ParkSlot::new());
         st.entries.push((request_id.clone(), slot.clone()));
-        (request_id, slot)
+        Some((request_id, slot))
+    }
+
+    /// How many requests are currently parked (for tests / introspection).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lock().entries.len()
     }
 
     /// Resolve `request_id` with `allow`, removing it from the table. Returns
@@ -1126,7 +1201,12 @@ impl McpServer {
             ToolOutcome::Rpc(e) => Err(e),
             ToolOutcome::Pending(value) => Ok(value),
             ToolOutcome::Done(value) => {
-                if !is_subscription_verb(name) {
+                // A subscription verb's *successful* run is connection management,
+                // not a command invocation, so it is not audited (pushing its own
+                // line back to the subscriber would be self-referential noise). A
+                // *refusal* (e.g. the agent blocked under `Paused`) is a gate
+                // decision, so it is audited like any refused command (RF#6).
+                if !is_subscription_verb(name) || is_error_result(&value) {
                     self.record_audit(conn, name, &arguments, &value);
                 }
                 Ok(value)
@@ -1300,9 +1380,11 @@ impl McpServer {
                 .and_then(|c| c.first())
                 .and_then(|m| m.get("text"))
                 .and_then(JsonValue::as_str)
-                .unwrap_or("error")
-                .to_string();
-            AuditResult::Error(reason)
+                .unwrap_or("error");
+            // A refusal/error reason can echo a bad argument value (a header error
+            // that quotes the offending value, a coercion error), so it is scrubbed
+            // by content before it reaches the ring/durable log/pushed line (RF#3).
+            AuditResult::Error(aitm_core::redact::scrub_text(reason))
         } else {
             AuditResult::Ok
         };
@@ -1403,7 +1485,15 @@ impl McpServer {
             ));
         }
         let prompt = self.approval_prompt(cmd, arguments);
-        let (request_id, slot) = self.parked.park();
+        let Some((request_id, slot)) = self.parked.try_park() else {
+            return ParkOutcome::Refused(format!(
+                "`{}` refused: too many sensitive agent commands ({}) are already awaiting \
+                 operator approval. Wait for pending requests to resolve, or change the policy \
+                 with agent.set.",
+                cmd.name(),
+                MAX_PARKED_REQUESTS,
+            ));
+        };
         self.push_approval_request(cmd.name(), arguments, &prompt, &request_id);
         let outcome = slot.wait(self.approval_timeout);
         // Clean up a timed-out entry (an approved/denied one was already removed).
@@ -1611,6 +1701,14 @@ fn is_subscription_verb(name: &str) -> bool {
     name == "flow.subscribe" || name == "flow.unsubscribe"
 }
 
+/// Whether a `tools/call` result carries `isError: true` (a refusal or failure).
+fn is_error_result(value: &JsonValue) -> bool {
+    value
+        .get("isError")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+}
+
 /// How long an argument summary may be (bytes of its JSON rendering) before it is
 /// truncated, so a verbose or hostile argument set cannot grow an audit entry
 /// without bound.
@@ -1619,8 +1717,11 @@ const ARGS_SUMMARY_CAP: usize = aitm_core::DEFAULT_ARGS_SUMMARY_CAP;
 /// A redacted, size-capped rendering of a call's arguments for the audit entry.
 /// Secret-named keys (auth headers, tokens, the confirm acknowledgment, and the
 /// like) are replaced by `"<redacted>"` — recursively, so a secret nested inside
-/// a `headers` object is caught too — and the result is truncated at a UTF-8
-/// boundary. Secrets never reach the ring, the durable log, or the pushed line.
+/// a `headers` object is caught too — and every surviving string value is run
+/// through the content scrubber, so a token in a `path` query string or a
+/// credential in a `body` is masked even though those keys are not secret-named
+/// (RF#3). The result is truncated at a UTF-8 boundary. Secrets never reach the
+/// ring, the durable log, or the pushed line.
 fn redact_args(arguments: &Map<String, JsonValue>) -> String {
     let redacted = redact_value(&JsonValue::Object(arguments.clone()));
     let mut rendered = redacted.to_string();
@@ -1635,7 +1736,11 @@ fn redact_args(arguments: &Map<String, JsonValue>) -> String {
     rendered
 }
 
-/// Recursively replace the value of every secret-named key with `"<redacted>"`.
+/// Redact a value for the audit entry, by key *and* by content. A secret-named
+/// key's value is dropped whole (`"<redacted>"`); every surviving string leaf is
+/// run through the shared content scrubber, so a secret carried inside a
+/// non-secret-named value — a token in a `path` query string, a credential in a
+/// `body` — is masked too (RF#3). Recurses into objects and arrays.
 fn redact_value(value: &JsonValue) -> JsonValue {
     match value {
         JsonValue::Object(map) => JsonValue::Object(
@@ -1650,30 +1755,17 @@ fn redact_value(value: &JsonValue) -> JsonValue {
                 .collect(),
         ),
         JsonValue::Array(items) => JsonValue::Array(items.iter().map(redact_value).collect()),
+        JsonValue::String(s) => JsonValue::String(aitm_core::redact::scrub_text(s)),
         other => other.clone(),
     }
 }
 
-/// Whether an argument key names a secret whose value must never be audited.
-/// Matched case-insensitively as a substring, so `Authorization`, `X-Api-Key`,
-/// `access_token`, and the reserved `_confirm` are all caught.
+/// Whether an argument key names a secret whose value must never be audited. The
+/// vocabulary is the shared one in `aitm-core` (so audit and findings redaction
+/// never diverge again); the reserved `_confirm` acknowledgment is an MCP-local
+/// addition (it is already stripped before redaction, so this is belt and braces).
 fn is_secret_key(key: &str) -> bool {
-    const NEEDLES: &[&str] = &[
-        "authorization",
-        "token",
-        "_confirm",
-        "password",
-        "passwd",
-        "secret",
-        "cookie",
-        "api_key",
-        "apikey",
-        "api-key",
-        "bearer",
-        "credential",
-    ];
-    let lower = key.to_ascii_lowercase();
-    NEEDLES.iter().any(|needle| lower.contains(needle))
+    aitm_core::redact::is_secret_key(key) || key.to_ascii_lowercase().contains("_confirm")
 }
 
 /// Whether a Sensitive command carries its own per-command agent config gate, so
@@ -1807,5 +1899,58 @@ fn flow_summary(flow: &Flow) -> JsonValue {
             "handshake": f.handshake.to_string(),
             "messages": f.messages.len(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RF#5: the parked-request table refuses to park beyond its cap, so a flood
+    /// of Sensitive `Ask` calls cannot grow the table (and the blocking pool)
+    /// without bound.
+    #[test]
+    fn parked_requests_cap_refuses_beyond_limit() {
+        let parked = ParkedRequests {
+            inner: Mutex::new(ParkState::default()),
+            cap: 2,
+        };
+        let first = parked.try_park();
+        let second = parked.try_park();
+        assert!(first.is_some() && second.is_some(), "first two park");
+        assert_eq!(parked.len(), 2);
+        assert!(
+            parked.try_park().is_none(),
+            "a third park is refused at the cap"
+        );
+        assert_eq!(parked.len(), 2, "a refused park does not grow the table");
+
+        // Resolving one frees a slot, so a later park succeeds again (self-heals).
+        let (id, _slot) = first.unwrap();
+        assert!(parked.resolve(&id, true));
+        assert_eq!(parked.len(), 1);
+        assert!(parked.try_park().is_some(), "a slot frees up after resolve");
+    }
+
+    /// RF#4: confirm-token and parked-request-id values are opaque (CSPRNG) — not
+    /// the old sequential counter / zero-entropy hash — and unique per mint.
+    #[test]
+    fn minted_ids_are_opaque_and_unique() {
+        let a = confirm_token_value();
+        let b = confirm_token_value();
+        assert!(a.starts_with("cfm_") && b.starts_with("cfm_"));
+        assert_ne!(a, b, "confirm tokens are unique");
+        // A v4 UUID simple form is 32 hex chars after the prefix.
+        assert_eq!(a.len(), "cfm_".len() + 32);
+
+        let parked = ParkedRequests::default();
+        let (id1, _) = parked.try_park().unwrap();
+        let (id2, _) = parked.try_park().unwrap();
+        assert!(id1.starts_with("apr_") && id2.starts_with("apr_"));
+        assert_ne!(id1, id2, "request ids are unique");
+        assert_ne!(
+            id1, "apr_1",
+            "request ids are not the old sequential counter"
+        );
     }
 }

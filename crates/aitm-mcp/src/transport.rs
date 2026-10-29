@@ -53,7 +53,18 @@ where
     if conn.conn_id == 0 {
         conn.conn_id = server.next_conn_id();
     }
-    let writer_task = tokio::spawn(write_loop(writer, sink.clone()));
+    // When the writer task ends — the socket closed, or `write_all` errored
+    // because the client disconnected — close the sink. That unblocks a read loop
+    // parked in `await_reply_capacity` (which would otherwise wait forever for a
+    // writer that has gone) so the connection tears down cleanly.
+    let writer_task = tokio::spawn({
+        let sink = sink.clone();
+        async move {
+            let r = write_loop(writer, sink.clone()).await;
+            sink.close();
+            r
+        }
+    });
 
     let mut reader = reader.take(MAX_MESSAGE_BYTES as u64);
     let mut line = String::new();
@@ -78,6 +89,12 @@ where
                 // serializes them with any interleaved notifications.
                 sink.push_reply(reply);
             }
+            // Backpressure (RF#3): if the client is not draining its socket the
+            // writer cannot flush, so replies accumulate. Once the reply lane hits
+            // its high-water mark, stop reading new requests until the writer has
+            // drained below it — bounding memory without dropping any reply. If the
+            // sink has closed (client gone), this returns at once so the loop ends.
+            sink.await_reply_capacity().await;
         }
         Ok(())
     }
