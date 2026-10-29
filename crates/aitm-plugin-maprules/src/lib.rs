@@ -21,8 +21,8 @@
 //! — the deny-by-default point for Map Remote. An out-of-scope target is refused:
 //! the request is left untouched and the flow is short-circuited with an error
 //! response, so the original is not forwarded to the new host (or the old one).
-//! `FlowCtx` does not carry the guard, so the plugin holds its own handle
-//! (constructor-injected, wired in Task 14).
+//! `FlowCtx` does not carry the guard, so the plugin holds its own
+//! constructor-injected handle.
 //!
 //! **Agent gate:** `map.add`/`map.remove` shape live traffic, so an agent
 //! (`Frontend::Mcp`) frontend is refused unless `maps.allow_agent_authoring` is
@@ -55,6 +55,11 @@ use crate::action::{action_to_value, condition_to_value, content_type_for, parse
 /// mark makes the guard consultation idempotent: once marked, the flow is skipped.
 const MAP_REMOTE_MARK: &str = "map-remote";
 
+/// Cap on a Map Local file served as a response body. A larger file is refused
+/// (502) before it is read, so a mapped file cannot exhaust memory per request —
+/// mirrors the default message-body cap ([`aitm_core::LimitConfig::max_body_bytes`]).
+const MAX_MAP_LOCAL_BYTES: u64 = 10 * 1024 * 1024;
+
 /// One stored Map rule: its id, kind, compiled match condition, action, and —
 /// for a `local` rule — the resolved, confinement-checked file path.
 struct MapEntry {
@@ -73,11 +78,15 @@ struct Shared {
     maps: Mutex<Vec<MapEntry>>,
     map_root: PathBuf,
     allow_agent_authoring: bool,
+    /// Cap on a Map Local file served as a response body (default
+    /// [`MAX_MAP_LOCAL_BYTES`]); a larger file is refused with a 502 before it is
+    /// read, so a mapped file cannot exhaust memory per request.
+    max_local_bytes: u64,
     next_id: AtomicU64,
     /// The one scope/rate guard every active egress passes. Map Remote redirects
     /// to a new host, so it calls [`ScopeRateGuard::check_active`] on the rewritten
     /// authority before touching the request. `FlowCtx` does not carry the guard,
-    /// so the plugin holds its own handle (constructor-injected, wired in Task 14).
+    /// so the plugin holds its own constructor-injected handle.
     guard: Arc<dyn ScopeRateGuard>,
 }
 
@@ -102,8 +111,7 @@ impl MapRulesPlugin {
     /// Build the plugin over `map_root` (the directory Map Local files are
     /// confined to) with the agent-authoring gate `allow_agent_authoring`
     /// (default off at the call site) and the shared scope `guard` Map Remote
-    /// redirects pass. `Config.maps` and the proxy's `guard()` wire all three in
-    /// Task 14.
+    /// redirects pass. `Config.maps` and the proxy's `guard()` supply all three.
     pub fn new(
         map_root: PathBuf,
         allow_agent_authoring: bool,
@@ -114,10 +122,21 @@ impl MapRulesPlugin {
                 maps: Mutex::new(Vec::new()),
                 map_root,
                 allow_agent_authoring,
+                max_local_bytes: MAX_MAP_LOCAL_BYTES,
                 next_id: AtomicU64::new(1),
                 guard,
             }),
         }
+    }
+
+    /// Set the maximum size of a Map Local file served as a response body (default
+    /// [`MAX_MAP_LOCAL_BYTES`]).
+    pub fn with_max_local_bytes(mut self, max: u64) -> Self {
+        // The plugin is not shared yet at construction, so this unwrap is infallible.
+        Arc::get_mut(&mut self.shared)
+            .expect("plugin not yet shared")
+            .max_local_bytes = max;
+        self
     }
 }
 
@@ -167,7 +186,11 @@ impl Plugin for MapRulesPlugin {
                 return None;
             }
             Some(match &entry.action {
-                MapAction::Local { .. } => Decision::Serve(local_response(entry)),
+                MapAction::Local { .. } => Decision::Serve(local_response(
+                    &self.shared.map_root,
+                    self.shared.max_local_bytes,
+                    entry,
+                )),
                 MapAction::Remote { to } => decide_remote(to, guard),
             })
         });
@@ -270,6 +293,11 @@ fn split_url(url: &str) -> anyhow::Result<(String, String, String)> {
     if scheme.is_empty() {
         anyhow::bail!("redirect url {url:?} is missing a scheme");
     }
+    // Map Remote redirects to another HTTP origin; restrict the scheme so a
+    // non-web scheme (e.g. `file`, `gopher`) cannot be forwarded upstream.
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        anyhow::bail!("redirect url {url:?} scheme must be http or https, got {scheme:?}");
+    }
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
@@ -302,10 +330,11 @@ fn apply_remote(flow: &mut Flow, plan: &RemotePlan) {
     }
 }
 
-/// Build the response a `local` rule serves. Reads the confined file; a read
-/// failure still short-circuits (Map Local never falls through to upstream) with
-/// a 502 so the miss is visible rather than silently leaking the request egress.
-fn local_response(entry: &MapEntry) -> HttpResponse {
+/// Build the response a `local` rule serves. Re-confines the file and caps its
+/// size at serve time (not just at `map.add`), then reads it; any failure still
+/// short-circuits (Map Local never falls through to upstream) with a 502 so the
+/// miss is visible rather than silently leaking the request egress.
+fn local_response(map_root: &Path, max_bytes: u64, entry: &MapEntry) -> HttpResponse {
     let (status, headers) = match &entry.action {
         MapAction::Local {
             status, headers, ..
@@ -318,13 +347,42 @@ fn local_response(entry: &MapEntry) -> HttpResponse {
         .as_deref()
         .expect("a local map always resolves a file at map.add");
 
-    match std::fs::read(path) {
+    match read_confined(map_root, max_bytes, path) {
         Ok(bytes) => http_response(status, headers, path, bytes),
-        Err(err) => text_response(
-            502,
-            &format!("map local: cannot read {}: {err}", path.display()),
-        ),
+        Err(err) => text_response(502, &format!("map local: {err}")),
     }
+}
+
+/// Re-confine and size-cap a Map Local file at serve time, then read it. The path
+/// was confined at `map.add`, but the file it names could since have been replaced
+/// by a symlink escaping the root (a TOCTOU window), so re-canonicalize and re-check
+/// `starts_with` the map root on every serve; refuse a file over the size cap before
+/// reading it.
+fn read_confined(map_root: &Path, max_bytes: u64, path: &Path) -> anyhow::Result<Vec<u8>> {
+    let root = map_root.canonicalize().map_err(|err| {
+        anyhow::anyhow!("map root {} is not accessible: {err}", map_root.display())
+    })?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|err| anyhow::anyhow!("cannot read {}: {err}", path.display()))?;
+    if !canonical.starts_with(&root) {
+        anyhow::bail!(
+            "{} escapes the map root {}",
+            canonical.display(),
+            root.display()
+        );
+    }
+    let len = std::fs::metadata(&canonical)
+        .map_err(|err| anyhow::anyhow!("cannot read {}: {err}", canonical.display()))?
+        .len();
+    if len > max_bytes {
+        anyhow::bail!(
+            "{} is {len} bytes, over the {max_bytes}-byte serve limit",
+            canonical.display()
+        );
+    }
+    std::fs::read(&canonical)
+        .map_err(|err| anyhow::anyhow!("cannot read {}: {err}", canonical.display()))
 }
 
 /// A plain-text response, used for a Map Local read miss and a Map Remote scope

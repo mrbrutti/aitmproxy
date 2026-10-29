@@ -11,8 +11,8 @@
 use std::sync::Arc;
 
 use aitm_core::{
-    Command, CommandHost, Frontend, ParamDef, ParamSchema, Params, Plugin, Registry, ScopeEntry,
-    TypeDesc, Value,
+    Authority, Command, CommandHost, Frontend, ParamDef, ParamSchema, Params, Plugin, Registry,
+    ScopeEntry, TypeDesc, Value,
 };
 
 /// Registers `scope.add`, `scope.remove`, and `scope.list`. Observes no events.
@@ -87,7 +87,13 @@ impl Command for ScopeAdd {
                  host from the human CLI."
             );
         }
-        let entry = args.get_str("host")?.to_string();
+        // Validate the host before widening scope, mirroring the Rhai `scope.add`
+        // verb: a scope entry is a `host`, `host:port`, or `*.wildcard`. Reject an
+        // empty or malformed value so a bogus entry can never silently widen scope.
+        let entry = args.get_str("host")?.trim().to_string();
+        if entry.is_empty() || Authority::parse_with_default(&entry, 0).is_err() {
+            anyhow::bail!("scope.add: {entry:?} is not a host, host:port, or *.wildcard");
+        }
         host.guard().add_scope(ScopeEntry {
             host: entry.clone(),
         });

@@ -297,6 +297,47 @@ fn map_remote_url_target_rewrites() {
     );
 }
 
+/// Audit minor (a): a Map Remote URL target with a non-http(s) scheme is refused
+/// (502), and the request is not rewritten or forwarded.
+#[test]
+fn map_remote_url_non_http_scheme_refused() {
+    // The target host is in scope so the refusal is about the scheme, not scope.
+    let reg = registry(guard_with_scope(&["evil.example"]));
+    add_remote(
+        &reg,
+        "old.example",
+        obj(&[("url", Value::Str("file://evil.example/etc/passwd".into()))]),
+    );
+
+    let (served, verdict) = dispatch(
+        &reg,
+        &Event::RequestHeaders(FlowId::new()),
+        http_flow("http", "old.example", "/orders"),
+    );
+
+    assert_eq!(
+        verdict,
+        Verdict::Halt,
+        "a non-http(s) scheme is refused, not forwarded"
+    );
+    let f = as_http(&served);
+    assert_eq!(
+        f.request.authority, "old.example",
+        "the refused rewrite leaves the request target untouched"
+    );
+    assert_eq!(f.request.scheme, "http", "the bogus scheme is not applied");
+    let resp = f.response.as_ref().expect("a 502 error response");
+    assert_eq!(resp.status, 502, "the scheme refusal is a 502");
+    let body = match &resp.body {
+        Body::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+        other => panic!("expected a buffered error body, got {other:?}"),
+    };
+    assert!(
+        body.contains("http or https"),
+        "the refusal names the scheme restriction: {body:?}"
+    );
+}
+
 /// A guard that counts `check_active` calls, delegating scope/rate decisions to an
 /// inner [`StdGuard`]. Panel finding #4: a URL/path-matched Map Remote rule must
 /// consult the guard once per request, not once per request *event*.
