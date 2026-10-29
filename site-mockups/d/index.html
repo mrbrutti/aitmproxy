@@ -50,7 +50,7 @@
           <span class="id">#41</span>
           <span class="method">POST</span>
           <span class="path">/api/cart/items</span>
-          <span class="state">armed</span>
+          <span class="state pulse">armed</span>
         </div>
 <pre class="held-body"><span class="h">host:</span> shop.example.com
 <span class="h">content-type:</span> application/json
@@ -68,7 +68,7 @@
         <p class="operator-who">by hand</p>
         <code><span class="pr">$ </span>aitm flow mutate --id 41 --set-body <span class="s">'{"qty":999}'</span></code>
       </div>
-      <div class="operator">
+      <div class="operator operator--agent">
         <p class="operator-who">by agent</p>
         <code>flow.mutate({ id: 41, set_body: <span class="s">'{"qty":999}'</span> })</code>
       </div>
@@ -81,6 +81,20 @@
       <div class="cmd"><code><span class="pr">$ </span>brew install aitmproxy</code><button class="copy" type="button" data-copy aria-label="Copy install command"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
     </div>
     <p class="hero-foot">Written in memory-safe Rust. Runs on macOS and Linux. Open source under MIT or Apache-2.0.</p>
+  </div>
+</section>
+
+<!-- ============ SEE IT (real screenshot) ============ -->
+<section class="section" id="see">
+  <div class="wrap">
+    <h2 class="h2" data-reveal>The same flow, in the real thing.</h2>
+    <p class="lead deck" data-reveal data-d="1">Not a mockup. This is the web UI armed on a staging host — eleven requests paused on the wire, the intercept bar lit amber, the agent toggle idle in the corner.</p>
+    <figure class="shot" data-reveal data-d="2">
+      <div class="frame">
+        <img src="assets/web-light.png" width="1600" height="1000" alt="The aitmproxy web UI: a flow list with eleven paused requests marked with an amber edge, method and status badges, the amber intercept bar reading 11 paused with Resume and Kill, and the request and response inspector below." loading="lazy">
+        <figcaption><span class="dot" aria-hidden="true"></span>aitmproxy web UI &middot; <code>aitm web</code> &middot; intercept armed</figcaption>
+      </div>
+    </figure>
   </div>
 </section>
 
@@ -201,11 +215,11 @@ content-type: application/json
 <!-- ============ FEATURES ============ -->
 <section class="section" id="features">
   <div class="wrap">
-    <h2 class="h2">Everything between the client and the server is yours to change.</h2>
+    <h2 class="h2">Everything on the wire is yours to change.</h2>
     <p class="lead deck">Each capability is a command, so each one works from the app, the terminal, a script or an assistant. The fragments below are the real shape of the tool.</p>
 
     <div class="features">
-      <article class="feature">
+      <article class="feature" data-reveal>
         <h3 class="h3">Intercept and edit by rule</h3>
         <p>Hold requests or responses that match a method, path, host or header. Edit, then resume.</p>
         <div class="ui"><div class="ui-lines">
@@ -217,7 +231,7 @@ content-type: application/json
         <a class="arrow" href="features.html#intercept">Intercept rules</a>
       </article>
 
-      <article class="feature">
+      <article class="feature" data-reveal>
         <h3 class="h3">Replay and compose</h3>
         <p>Send any flow again with changes, or compose a request from scratch. Each replay is a new flow.</p>
         <div class="ui"><div class="ui-lines">
@@ -229,7 +243,7 @@ content-type: application/json
         <a class="arrow" href="features.html#replay">Replay</a>
       </article>
 
-      <article class="feature">
+      <article class="feature" data-reveal>
         <h3 class="h3">Map Local and Map Remote</h3>
         <p>Answer a request from a file on disk, or redirect it to another upstream, without touching the app.</p>
         <div class="ui"><div class="ui-lines">
@@ -240,7 +254,7 @@ content-type: application/json
         <a class="arrow" href="features.html#map">Map rules</a>
       </article>
 
-      <article class="feature">
+      <article class="feature" data-reveal>
         <h3 class="h3">WebSocket inspect, inject and edit</h3>
         <p>Frames in both directions, live. Hold a frame, change it, or inject your own into either side.</p>
         <div class="ui"><div class="ui-lines">
@@ -252,7 +266,7 @@ content-type: application/json
         <a class="arrow" href="features.html#websocket">WebSocket</a>
       </article>
 
-      <article class="feature">
+      <article class="feature" data-reveal>
         <h3 class="h3">Sessions and HAR</h3>
         <p>Save a capture as a session, reopen it later, and move traffic in or out as HAR.</p>
         <div class="ui"><div class="ui-lines">
@@ -263,7 +277,7 @@ content-type: application/json
         <a class="arrow" href="features.html#sessions">Sessions</a>
       </article>
 
-      <article class="feature">
+      <article class="feature" data-reveal>
         <h3 class="h3">TLS passthrough</h3>
         <p>Let pinned hosts through untouched, by pattern, while everything else is decrypted and inspected.</p>
         <div class="ui"><div class="ui-lines">
@@ -274,7 +288,7 @@ content-type: application/json
         <a class="arrow" href="features.html#tls">TLS</a>
       </article>
 
-      <article class="feature">
+      <article class="feature" data-reveal>
         <h3 class="h3">Embedded headless browser</h3>
         <p>A browser that already trusts the proxy, for reproducing findings and taking the screenshot that proves them.</p>
         <div class="ui"><div class="ui-lines">
@@ -285,7 +299,7 @@ content-type: application/json
         <a class="arrow" href="features.html#browser">Browser</a>
       </article>
 
-      <article class="feature">
+      <article class="feature" data-reveal>
         <h3 class="h3">Certificate management</h3>
         <p>Generate, export, install and remove the local CA from the CLI or the app. Nothing is installed without asking.</p>
         <div class="ui"><div class="ui-lines">
@@ -296,12 +310,12 @@ content-type: application/json
         <a class="arrow" href="features.html#certs">Certificates</a>
       </article>
 
-      <article class="feature">
+      <article class="feature" data-reveal>
         <h3 class="h3">Scriptable, all of it</h3>
         <p>Every command above has a CLI form and an MCP form, and all of them can be called from a Rhai plugin.</p>
         <div class="pair">
           <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm flow resume --id 41</code></div>
-          <div class="pair-row"><span class="pair-who">agent</span><code>flow.resume({ id: 41 })</code></div>
+          <div class="pair-row is-agent"><span class="pair-who">agent</span><code>flow.resume({ id: 41 })</code></div>
         </div>
         <a class="arrow" href="scripting.html">Scripting</a>
       </article>
@@ -316,48 +330,23 @@ content-type: application/json
     <p class="lead deck">A native macOS app, a web UI and a terminal UI. All three are clients of the same core, showing the same flows, and so is your assistant.</p>
 
     <div class="faces">
-      <div class="face">
+      <div class="face" data-reveal>
         <h3>macOS <small>native, SwiftUI</small></h3>
-        <div class="ui mac">
-          <div class="mac-side">
-            <div aria-current="true">Flows</div><div>Intercept</div><div>Replay</div><div>Map</div><div>WebSocket</div><div>Sessions</div><div>Plugins</div>
-          </div>
-          <div class="mac-main">
-            <div class="ui-bar"><span>checkout.aitm</span><span class="spacer"></span><span>1 held</span></div>
-            <table class="flows">
-              <tbody>
-                <tr><td class="num">42</td><td>GET</td><td class="url">/api/users/me</td><td>200</td><td class="time">12 ms</td></tr>
-                <tr class="is-held"><td class="num">41</td><td>POST</td><td class="url">/api/cart/items</td><td><span class="chip chip--armed">armed</span></td><td class="time">—</td></tr>
-                <tr><td class="num">40</td><td>GET</td><td class="url">/api/products?page=2</td><td>200</td><td class="time">38 ms</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
+        <figure class="frame">
+          <img src="assets/mac-dark.png" width="1600" height="1000" alt="The aitmproxy macOS app in dark mode: a sidebar of apps and domains, a dense flow table, and the request inspector." loading="lazy">
+        </figure>
       </div>
-      <div class="face">
+      <div class="face" data-reveal data-d="1">
         <h3>Web <small>SolidJS, any browser</small></h3>
-        <div class="ui">
-          <div class="webui-tabs"><span aria-current="true">Flows</span><span>Rules</span><span>Sessions</span><span>Log</span></div>
-          <table class="flows">
-            <tbody>
-              <tr><td class="num">42</td><td>GET</td><td class="url">/api/users/me</td><td>200</td><td class="time">12 ms</td></tr>
-              <tr class="is-held"><td class="num">41</td><td>POST</td><td class="url">/api/cart/items</td><td><span class="chip chip--armed">armed</span></td><td class="time">—</td></tr>
-              <tr><td class="num">40</td><td>GET</td><td class="url">/api/products?page=2</td><td>200</td><td class="time">38 ms</td></tr>
-            </tbody>
-          </table>
-          <div class="ui-actions"><span class="btnlike is-primary">Resume <kbd class="key">↩</kbd></span><span class="btnlike">Drop <kbd class="key">⌫</kbd></span></div>
-        </div>
+        <figure class="frame">
+          <img src="assets/web-dark.png" width="1600" height="1000" alt="The aitmproxy web UI in dark mode: the same flow list and inspector, served by aitm web." loading="lazy">
+        </figure>
       </div>
-      <div class="face">
+      <div class="face" data-reveal data-d="2">
         <h3>Terminal <small>ratatui, over SSH if you like</small></h3>
-        <div class="ui tui">
-<pre>┌ flows ──────────────────────── 1 held ┐
-│ 42  GET   /api/users/me        200 12ms│
-│<span class="armed"> 41  POST  /api/cart/items    armed   — </span>│
-│ 40  GET   /api/products?page=2 200 38ms│
-└────────────────────────────────────────┘
-<span class="dim">↩ resume  ⌫ drop  r replay  / filter  ? help</span></pre>
-        </div>
+        <figure class="frame">
+          <img src="assets/tui.png" width="1600" height="864" alt="The aitmproxy terminal UI: the flow list, an intercept bar and key hints, drawn with ratatui." loading="lazy">
+        </figure>
       </div>
     </div>
   </div>

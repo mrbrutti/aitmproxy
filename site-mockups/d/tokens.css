@@ -1,76 +1,115 @@
-/* Direction D — "The wire"
-   A request is a thing that travels along a wire from a client to a server.
-   aitmproxy cuts the wire and holds the request in mid-air; two operators
-   (a hand and an agent) reach into the same gap. The page is built around
-   that wire: it crosses the hero, draws the flow lifecycle, and merges the
-   two operators into one audit log.
+/* Direction D — "The wire", aligned to the aitmproxy operator-UI design system
+   (docs/design/tokens.json). Same palette, type and radii as the macOS app,
+   the web UI and the TUI, so the site and the product read as one thing.
 
-   Type: Newsreader (display + body, optical sizes 6–72) and IBM Plex Mono
-   (real code, terminals and data only). Serif on purpose: editorial, not SaaS.
-   Palette: white paper, near-black ink, one hold-signal yellow. Nothing else. */
+   Brand accent = BLUE (Proxyman WebUI active-tab blue).
+   Intercept/armed state = AMBER (the one saturated signal; "a flow is held").
+   AI agent over MCP = TEAL (distinct from every method/status hue).
+   Type: Inter (UI) + JetBrains Mono (all data/code). Restrained scale. */
 
-@import url("https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,300..800;1,6..72,300..800&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..600&family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap");
 
 :root {
   color-scheme: light;
 
-  /* paper and ink */
-  --paper: #ffffff;
-  --paper-2: #f3f3f1;
-  --paper-3: #e9e9e6;
-  --hairline: #d6d6d2;
-  --ink: #111111;
-  --ink-2: #3b3b39;
+  /* ground + ink (app light values) */
+  --paper:    #FFFFFF;   /* body / panels */
+  --paper-2:  #F3F4F6;   /* raised: bars, wells, chips, hover, row rules */
+  --paper-3:  #E8EAED;   /* deeper step */
+  --page:     #F7F8FA;   /* the app's page tone, behind screenshots */
+  --hairline: #E5E7EB;   /* border */
+  --rule:     #F0F1F3;   /* row separators, one step lighter than border */
+  --control:  #D1D5DB;   /* input / outlined-control borders */
+  --ink:      #111827;   /* text primary */
+  --ink-2:    #4B5563;   /* text secondary */
+  --ink-3:    #616A78;   /* text tertiary */
 
-  /* the single accent: the hold signal */
-  --signal: #f0c000;
-  --signal-deep: #d9ad00;
-  --signal-ink: #111111;
+  /* brand accent — blue */
+  --accent:      #2563EB;
+  --accent-deep: #1D4ED8;
+  --accent-tint: #DBEAFE;
+  --accent-ink:  #FFFFFF;
+  --link:        #1D4ED8;
 
-  /* the product's dark surfaces (terminals, transcripts, code) */
-  --console: #121212;
-  --console-2: #1a1a19;
-  --console-line: #2b2b29;
-  --console-text: #ebebe7;
-  --console-muted: #93938d;
-  --console-signal: #f6cc1a;
+  /* intercept / armed — amber (the single saturated signal) */
+  --signal:      #D97706;
+  --signal-deep: #B45309;
+  --signal-tint: #FEF3C7;
+  --signal-ink:  #1F1300;
 
-  /* type */
-  --serif: "Newsreader", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
-  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  /* AI agent over MCP — teal */
+  --agent:      #0D9488;
+  --agent-deep: #0F766E;
+  --agent-tint: #CCFBF1;
 
-  --fs-display: clamp(2.25rem, 0.95rem + 5.33vw, 5.75rem);  /* 36 → 92 px */
-  --fs-h2: clamp(1.9rem, 1.1rem + 2.6vw, 3.4rem);          /* 30 → 54 px */
-  --fs-h3: clamp(1.375rem, 1.15rem + 0.8vw, 1.75rem);      /* 22 → 28 px */
-  --fs-lead: clamp(1.1875rem, 1.05rem + 0.55vw, 1.4375rem);/* 19 → 23 px */
-  --fs-body: 1.0625rem;                                     /* 17 px */
-  --fs-small: 0.9375rem;                                    /* 15 px */
-  --fs-mono: 0.875rem;                                      /* 14 px */
-  --fs-mono-s: 0.8125rem;                                   /* 13 px */
+  /* method badge colours (fg/bg), app convention */
+  --m-get-fg: #1D4ED8;  --m-get-bg: #DBEAFE;
+  --m-post-fg: #15803D; --m-post-bg: #DCFCE7;
+  --m-put-fg: #B45309;  --m-put-bg: #FEF3C7;
+  --m-patch-fg: #C2410C;--m-patch-bg: #FFEDD5;
+  --m-del-fg: #B91C1C;  --m-del-bg: #FEE2E2;
+  --m-ws-fg: #6D28D9;   --m-ws-bg: #EDE9FE;
+  --st-ok: #15803D;     --st-warn: #B45309;  --st-err: #B91C1C;  --st-info: #6D28D9;
+
+  /* the product's dark surfaces (code, terminals, dark screenshots backdrop) */
+  --console:       #161618;
+  --console-2:     #1E1E20;
+  --console-line:  #2E2E31;
+  --console-text:  #E6E6E8;
+  --console-muted: #8E8E93;
+  --console-signal:#F5A524;   /* amber on dark */
+  --console-agent: #2DD4BF;   /* teal on dark */
+  --console-blue:  #60A5FA;
+
+  /* type — two faces, one job each */
+  --serif: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;   /* UI face */
+  --mono:  "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  /* restrained scale — no oversized display type */
+  --fs-display: clamp(1.625rem, 1.2rem + 1.5vw, 2.25rem);   /* 26 → 36 px */
+  --fs-h2:      clamp(1.375rem, 1.15rem + 0.7vw, 1.625rem); /* 22 → 26 px */
+  --fs-h3:      clamp(1.125rem, 1.05rem + 0.35vw, 1.3125rem);/* 18 → 21 px */
+  --fs-lead:    clamp(1.0625rem, 1rem + 0.3vw, 1.1875rem);  /* 17 → 19 px */
+  --fs-body:    1rem;           /* 16 */
+  --fs-small:   0.875rem;       /* 14 */
+  --fs-mono:    0.8125rem;      /* 13 */
+  --fs-mono-s:  0.75rem;        /* 12 */
 
   /* rhythm */
   --margin: clamp(1.25rem, 4vw, 4rem);
-  --max: 1280px;
-  --section: clamp(4.5rem, 9vw, 9rem);
-  --gap: clamp(1.25rem, 2.5vw, 2.5rem);
-  --radius: 2px;
+  --max: 1200px;
+  --section: clamp(4rem, 8vw, 7.5rem);
+  --gap: clamp(1.25rem, 2.5vw, 2.25rem);
 
-  /* motion: one authored curve */
-  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
-  --dur: 220ms;
+  /* radii — app family (badge 4, control 6, panel 8, floating 10) */
+  --radius: 6px;
+  --radius-badge: 4px;
+  --radius-panel: 8px;
+  --radius-float: 10px;
+
+  /* shadow — only on what floats (app shadow.floating) */
+  --shadow-float: 0 8px 24px rgba(17,24,39,0.12), 0 1px 2px rgba(17,24,39,0.08);
+  --shadow-lift:  0 2px 6px rgba(17,24,39,0.08), 0 1px 2px rgba(17,24,39,0.05);
+
+  /* motion — app curves; feedback + a few authored reveals, nothing loud */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --dur: 200ms;
+  --dur-press: 120ms;
+  --dur-reveal: 600ms;
 }
 
-/* browser surfaces, themed */
-::selection { background: var(--signal); color: var(--signal-ink); }
-:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; border-radius: var(--radius); }
-.console :focus-visible, .code :focus-visible, .term :focus-visible { outline-color: var(--console-signal); }
-html { scrollbar-color: #b8b8b3 var(--paper); }
+/* browser surfaces, themed from the palette */
+::selection { background: var(--accent-tint); color: var(--ink); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: var(--radius-badge); }
+.console :focus-visible, .code :focus-visible, .term :focus-visible, .tui :focus-visible { outline-color: var(--console-blue); }
+html { scrollbar-color: var(--paper-3) var(--paper); }
 ::-webkit-scrollbar { width: 12px; height: 12px; }
 ::-webkit-scrollbar-track { background: var(--paper); }
-::-webkit-scrollbar-thumb { background: #b8b8b3; border: 3px solid var(--paper); border-radius: 8px; }
-::-webkit-scrollbar-thumb:hover { background: var(--ink-2); }
+::-webkit-scrollbar-thumb { background: var(--paper-3); border: 3px solid var(--paper); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: var(--control); }
 
-/* reset, light-handed */
+/* reset */
 *, *::before, *::after { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 body {
@@ -86,7 +125,7 @@ body {
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
 }
-h1, h2, h3, h4 { margin: 0; font-weight: 500; letter-spacing: -0.015em; text-wrap: balance; }
+h1, h2, h3, h4 { margin: 0; font-weight: 600; letter-spacing: -0.018em; text-wrap: balance; }
 p { margin: 0; }
 a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: 0.16em; }
 button { font: inherit; color: inherit; }
