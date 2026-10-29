@@ -19,7 +19,7 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 34] = [
+const EXPECTED_TOOLS: [&str; 47] = [
     "flow.list",
     "flow.get",
     "flow.detail",
@@ -54,6 +54,21 @@ const EXPECTED_TOOLS: [&str; 34] = [
     "ca.install",
     "ca.status",
     "ca.uninstall",
+    // M6 parity additions (Task 14 convergence): F9 WebSocket control, F10
+    // sessions/HAR import-export, F11 TLS passthrough, Map Local/Remote.
+    "ws.intercept",
+    "ws.frame",
+    "ws.send",
+    "session.save",
+    "session.load",
+    "flow.export",
+    "flow.import",
+    "tls.passthrough.list",
+    "tls.passthrough.add",
+    "tls.passthrough.remove",
+    "map.add",
+    "map.list",
+    "map.remove",
 ];
 
 /// The six `browser.*` tool schemas as M1 shipped them, keyed by tool name.

@@ -18,8 +18,9 @@ use anyhow::{bail, Context as _};
 use serde::Deserialize;
 
 use aitm_core::{
-    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, LimitConfig, McpConfig,
-    McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SsrfPolicy, Value,
+    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, LimitConfig, MapsConfig,
+    McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SsrfPolicy,
+    TlsConfig, Value,
 };
 use aitm_plugin_rhai::{RhaiConfig, ScriptEntry};
 
@@ -115,6 +116,10 @@ struct ConfigFile {
     scripts: Option<Vec<ScriptFile>>,
     /// The scripting sandbox: limits, the per-hook budget, the error policy.
     rhai: Option<RhaiFile>,
+    /// Per-host TLS passthrough (M6 F11).
+    tls: Option<TlsFile>,
+    /// Map Local/Remote rules (M6).
+    maps: Option<MapsFile>,
 }
 
 impl ConfigFile {
@@ -150,7 +155,49 @@ impl ConfigFile {
         if let Some(rhai) = self.rhai {
             rhai.apply(r);
         }
+        if let Some(tls) = self.tls {
+            tls.apply(&mut c.tls);
+        }
+        if let Some(maps) = self.maps {
+            maps.apply(&mut c.maps);
+        }
         Ok(())
+    }
+}
+
+/// The `tls:` section (M6 F11): the passthrough host list and the agent gate.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TlsFile {
+    /// Hosts (or `*.wildcard`) tunnelled past MITM.
+    passthrough: Option<Vec<String>>,
+    /// Let an agent (MCP) frontend change the passthrough list. Off by default.
+    allow_agent_passthrough: Option<bool>,
+}
+
+impl TlsFile {
+    fn apply(self, c: &mut TlsConfig) {
+        set(&mut c.passthrough, self.passthrough);
+        set(&mut c.allow_agent_passthrough, self.allow_agent_passthrough);
+    }
+}
+
+/// The `maps:` section (M6): the Map Local confinement root and the agent gate.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MapsFile {
+    /// Directory Map Local files are confined to.
+    root: Option<PathBuf>,
+    /// Let an agent (MCP) frontend author map rules. Off by default.
+    allow_agent_authoring: Option<bool>,
+}
+
+impl MapsFile {
+    fn apply(self, c: &mut MapsConfig) {
+        if let Some(root) = self.root {
+            c.root = Some(root);
+        }
+        set(&mut c.allow_agent_authoring, self.allow_agent_authoring);
     }
 }
 
