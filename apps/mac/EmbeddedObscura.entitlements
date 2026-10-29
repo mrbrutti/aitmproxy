@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for the bundled `obscura` browser engine only (never for `aitm`).
+  obscura is Chromium-based: under the hardened runtime that notarization
+  requires, V8 maps writable+executable memory for its JIT. Without these two
+  entitlements the process crashes with SIGTRAP on startup ("embedded browser
+  unavailable"), verified against the notarized bundle. This is the standard
+  Chromium/Electron JIT exception; it does not disable library validation or the
+  rest of the hardened runtime.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+</dict>
+</plist>

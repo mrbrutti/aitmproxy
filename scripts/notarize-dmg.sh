@@ -39,8 +39,16 @@ asc_key_id=${ASC_KEY_ID:-$(basename "$asc_key" | sed -E 's/^AuthKey_(.*)\.p8$/\1
 echo "notarize-dmg.sh: identity   $dev_id"
 echo "notarize-dmg.sh: asc key    $asc_key (id $asc_key_id)"
 
-# 1. Re-sign the app: hardened runtime + secure timestamp are required for
-#    notarization. The bundle has no nested code, so one pass seals it.
+# 1. Re-sign inside-out with Developer ID + hardened runtime + secure timestamp
+#    (all required for notarization). The embedded core (aitm + obscura) lives in
+#    Contents/Resources/core; nested Mach-O there must be signed before the app,
+#    since signing the outer bundle does not seal executables under Resources.
+core="$app/Contents/Resources/core"
+# obscura (Chromium-based) needs JIT entitlements under the hardened runtime or
+# it SIGTRAPs on V8 init ("embedded browser unavailable"); aitm needs none.
+obscura_ent="$repo_root/apps/mac/EmbeddedObscura.entitlements"
+[ -f "$core/obscura" ] && codesign --force --options runtime --timestamp --entitlements "$obscura_ent" --sign "$dev_id" "$core/obscura"
+[ -f "$core/aitm" ] && codesign --force --options runtime --timestamp --sign "$dev_id" "$core/aitm"
 codesign --force --options runtime --timestamp --sign "$dev_id" "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
 
