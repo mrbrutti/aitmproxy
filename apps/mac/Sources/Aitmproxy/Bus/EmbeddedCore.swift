@@ -50,16 +50,22 @@ actor EmbeddedCore {
 
     private let defaultProxyPort: UInt16
     private let defaultBrowserProxyPort: UInt16
-    /// `SIGTERM` → wait this long → `SIGKILL`.
-    private let stopGrace: Duration = .seconds(3)
+    /// `SIGTERM` → wait this long → `SIGKILL`. Must exceed the embedded core's own
+    /// obscura teardown budget (`EmbeddedCoreLaunch.obscuraStopTimeoutSeconds` + the
+    /// core's 1 s reap margin) so a clean `SIGTERM` always suffices and `SIGKILL`
+    /// never lands mid-teardown and orphans obscura (AC7).
+    private let stopGrace: Duration = .seconds(EmbeddedCoreLaunch.childStopGraceSeconds)
     /// How long to wait for the rendezvous file after a spawn before giving up on it.
     private let rendezvousTimeout: Duration = .seconds(15)
     /// Restart backoff: `base * factor^(n-1)`, capped, up to `maxRestarts` tries.
     private let backoffBase: Duration = .milliseconds(500)
     private let backoffCap: Duration = .seconds(10)
     private let maxRestarts = 5
-    /// How many trailing captured lines to keep for a `.degraded` reason.
+    /// How many trailing captured lines to keep in the rolling buffer.
     private let tailLines = 40
+    /// How many of those trailing lines to surface in a `.degraded` reason when a
+    /// restart gives up — a short, legible tail, not the whole buffer.
+    private let degradedTailLines = 8
 
     // MARK: State
 
@@ -162,7 +168,7 @@ actor EmbeddedCore {
                 token: token,
                 endpointFile: endpointURL
             )
-            try EmbeddedCoreLaunch.writeConfig(config.yaml(), to: configURL)
+            try EmbeddedCoreLaunch.writeConfig(config.yaml(), to: configURL)  // yaml() escapes/validates spliced paths
         } catch {
             await retryOrFail("writing the core config failed: \(error.localizedDescription)")
             return
@@ -238,26 +244,27 @@ actor EmbeddedCore {
         await retryOrFail("the core exited unexpectedly (status \(status))")
     }
 
-    /// Backoff-and-respawn, or give up past the cap.
+    /// Backoff-and-respawn, or give up past the cap. The retry/backoff/cap
+    /// decision is the pure, unit-tested `EmbeddedCoreLaunch.restartDecision`.
     private func retryOrFail(_ reason: String) async {
         guard !stopping else { return }
         emit.yield(.log(reason))
         restarts += 1
-        guard restarts <= maxRestarts else {
+        switch EmbeddedCoreLaunch.restartDecision(
+            restarts: restarts, maxRestarts: maxRestarts, base: backoffBase, cap: backoffCap
+        ) {
+        case .giveUp:
             await failPermanently(reason)
-            return
+        case .retry(let backoff):
+            emit.yield(.status(.degraded(reason: "restarting (\(restarts)/\(maxRestarts)): \(reason)")))
+            try? await Task.sleep(for: backoff)
+            await spawn()
         }
-        let shift = min(restarts - 1, 16)
-        let backoff = min(backoffBase * (1 << shift), backoffCap)
-        emit.yield(.status(.degraded(reason: "restarting (\(restarts)/\(maxRestarts)): \(reason)")))
-        try? await Task.sleep(for: backoff)
-        await spawn()
     }
 
     private func failPermanently(_ reason: String) async {
         started = false
-        let tail = logTail.suffix(8).joined(separator: "\n")
-        let detail = tail.isEmpty ? reason : "\(reason)\n\(tail)"
+        let detail = EmbeddedCoreLaunch.giveUpDetail(reason: reason, logTail: logTail, tailLines: degradedTailLines)
         emit.yield(.status(.degraded(reason: detail)))
     }
 

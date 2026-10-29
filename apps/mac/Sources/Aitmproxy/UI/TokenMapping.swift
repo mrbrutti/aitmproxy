@@ -74,6 +74,19 @@ extension FlowRow {
     }
 }
 
+extension CoreHealth {
+    /// The embedded-core health dot's colour. One place both the status-bar dot
+    /// (`CoreHealthDot`) and the core-log panel (`CoreLogPanel`) read, so the two
+    /// surfaces never drift (Q1).
+    var dotColor: DynamicColor {
+        switch self {
+        case .running: Tok.Status.success
+        case .restarting: Tok.Intercept.base
+        case .failed: Tok.Status.serverError
+        }
+    }
+}
+
 extension MarkColor {
     var color: NSColor {
         switch self {

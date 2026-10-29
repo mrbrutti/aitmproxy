@@ -127,7 +127,11 @@ final class EmbeddedCoreController {
 
     /// Blocks briefly during quit to SIGTERM→reap the child so none is orphaned
     /// (AC7). `applicationWillTerminate` is synchronous, so the async stop runs
-    /// on a detached task we wait on with a bounded timeout.
+    /// on a detached task we wait on with a bounded timeout. The wait must exceed
+    /// the child's full `SIGTERM`→grace→`SIGKILL` teardown so a force-kill always
+    /// lands before the app exits even if the core ignores `SIGTERM`; hence the
+    /// grace plus a 2 s margin.
+    private static let quitWaitSeconds = EmbeddedCoreLaunch.childStopGraceSeconds + 2
     private func terminateSynchronously() {
         if let terminateObserver {
             NotificationCenter.default.removeObserver(terminateObserver)
@@ -139,7 +143,7 @@ final class EmbeddedCoreController {
             await core.stop()
             done.signal()
         }
-        _ = done.wait(timeout: .now() + 5)
+        _ = done.wait(timeout: .now() + .seconds(Self.quitWaitSeconds))
     }
 
     isolated deinit {

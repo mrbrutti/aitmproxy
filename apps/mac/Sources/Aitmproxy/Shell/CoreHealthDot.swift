@@ -21,7 +21,7 @@ struct CoreHealthDot: View {
         Button(action: openLog) {
             HStack(spacing: Tok.Metric.gapTight) {
                 Circle()
-                    .fill(color.color)
+                    .fill(health.dotColor.color)
                     .frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
                 Text("core \(connection.status.healthTitle.lowercased())")
             }
@@ -33,14 +33,6 @@ struct CoreHealthDot: View {
         .accessibilityLabel("Embedded core: \(health.title)")
         .accessibilityValue(connection.status.degradedReason ?? connection.label)
         .accessibilityHint("Opens the core log")
-    }
-
-    private var color: DynamicColor {
-        switch health {
-        case .running: Tok.Status.success
-        case .restarting: Tok.Intercept.base
-        case .failed: Tok.Status.serverError
-        }
     }
 
     /// The label (which carries the bound proxy port once ready) plus the

@@ -69,7 +69,7 @@ struct CoreLogPanel: View {
             Spacer(minLength: Space.sm)
             if let connection = state.connection {
                 HStack(spacing: Tok.Metric.gapTight) {
-                    Circle().fill(dotColor(connection.health).color)
+                    Circle().fill(connection.health.dotColor.color)
                         .frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
                     Text(connection.status.healthTitle)
                         .font(Tok.Face.data(Tok.Typography.Size.sm))
@@ -95,13 +95,5 @@ struct CoreLogPanel: View {
         state.connection == nil
             ? "No embedded core — the app is connected to an external core."
             : "No core output yet."
-    }
-
-    private func dotColor(_ health: CoreHealth) -> DynamicColor {
-        switch health {
-        case .running: Tok.Status.success
-        case .restarting: Tok.Intercept.base
-        case .failed: Tok.Status.serverError
-        }
     }
 }
