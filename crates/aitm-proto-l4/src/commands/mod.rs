@@ -26,6 +26,7 @@
 
 pub mod craft;
 pub mod flow;
+pub mod intercept;
 pub mod scope;
 
 use std::collections::BTreeMap;

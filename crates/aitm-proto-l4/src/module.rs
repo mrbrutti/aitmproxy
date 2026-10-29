@@ -31,7 +31,8 @@ use std::sync::Arc;
 
 use aitm_core::{Plugin, Registry};
 
-use crate::config::L4Config;
+use crate::commands::intercept::InterceptSessions;
+use crate::config::{InterceptConfig, L4Config};
 use crate::flow::{InMemoryL4FlowStore, L4FlowStore};
 use crate::guard::L4Guard;
 
@@ -40,25 +41,43 @@ use crate::guard::L4Guard;
 pub struct L4Module {
     guard: Arc<L4Guard>,
     store: Arc<dyn L4FlowStore>,
+    /// In-path interception config; `None` ⇒ `l4.intercept.*` is `L4Unavailable`.
+    intercept_cfg: Option<InterceptConfig>,
+    /// Live `l4.intercept` sessions, shared with the intercept commands so a
+    /// session started by one call outlives it.
+    sessions: Arc<InterceptSessions>,
 }
 
 impl L4Module {
-    /// Build a module from config: a guard seeded from `cfg.scope` and a fresh
-    /// bounded in-memory flow store. The binary (M5 Task 13) is the only caller in
-    /// production; tests construct it directly.
+    /// Build a module from config: a guard seeded from `cfg.scope`, a fresh bounded
+    /// in-memory flow store, and the in-path interception settings (if any). The
+    /// binary (M5 Task 13) is the only caller in production; tests construct it
+    /// directly.
     #[must_use]
     pub fn new(cfg: &L4Config) -> Self {
         Self {
             guard: Arc::new(L4Guard::new(cfg)),
             store: Arc::new(InMemoryL4FlowStore::new()),
+            intercept_cfg: cfg.intercept.clone(),
+            sessions: Arc::new(InterceptSessions::new()),
         }
     }
 
     /// Build a module over an already-shared guard + store (for wiring that owns
-    /// the guard elsewhere, and for tests).
+    /// the guard elsewhere, and for tests). `intercept_cfg` carries the in-path
+    /// settings; `None` disables `l4.intercept.*`.
     #[must_use]
-    pub fn with_parts(guard: Arc<L4Guard>, store: Arc<dyn L4FlowStore>) -> Self {
-        Self { guard, store }
+    pub fn with_parts(
+        guard: Arc<L4Guard>,
+        store: Arc<dyn L4FlowStore>,
+        intercept_cfg: Option<InterceptConfig>,
+    ) -> Self {
+        Self {
+            guard,
+            store,
+            intercept_cfg,
+            sessions: Arc::new(InterceptSessions::new()),
+        }
     }
 
     /// The shared deny-by-default guard (an `Arc` clone).
@@ -81,6 +100,17 @@ impl Plugin for L4Module {
 
     fn load(&mut self, reg: &mut Registry) {
         for cmd in crate::commands::active_commands(self.guard(), self.store()) {
+            reg.add_command(cmd);
+        }
+        // The in-path interception commands (M5 Task 12) register additively over
+        // the shared session registry, so a `start` outlives the call and the later
+        // verdict commands reach it.
+        for cmd in crate::commands::intercept::intercept_commands(
+            self.guard(),
+            self.store(),
+            self.sessions.clone(),
+            self.intercept_cfg.clone(),
+        ) {
             reg.add_command(cmd);
         }
     }
