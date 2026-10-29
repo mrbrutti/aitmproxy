@@ -13,11 +13,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aitm_core::{
-    Body, CommandHost, Config, Event, Flow, FlowCtx, FlowId, FlowStore, HeaderMap, HttpFlow,
-    HttpRequest, HttpResponse, HttpVersion, InterceptState, Params, Plugin, Proxy, ProxyClient,
-    Registry, ScopeConfig, ScopeEntry, ScopeRateGuard, StdGuard, Value, Verdict,
+    Body, CommandHost, Config, Event, Flow, FlowCtx, FlowId, FlowStore, Frontend, HeaderMap,
+    HttpFlow, HttpRequest, HttpResponse, HttpVersion, InterceptState, MemFlowStore, Params, Plugin,
+    Proxy, ProxyClient, Registry, ScopeConfig, ScopeEntry, ScopeRateGuard, StdGuard, Value,
+    Verdict,
 };
 use aitm_plugin_maprules::MapRulesPlugin;
+use aitm_plugin_sessionio::SessionIoPlugin;
 use aitm_plugins::{InterceptPlugin, MutatePlugin};
 use aitm_proto_http::{CertAuthority, HttpModule};
 use bytes::Bytes;
@@ -1439,5 +1441,269 @@ async fn map_remote_h2_out_of_scope_refused() {
         new_log.lock().unwrap().count(),
         0,
         "the out-of-scope target must never be contacted"
+    );
+}
+
+// --- Task 6: whole-branch integration sweep + session/HAR version tag ----------
+//
+// AC-H2.11 asks that an h2 flow captured through the proxy round-trips its version
+// through the native session format and tags HAR `httpVersion` as `"HTTP/2"`. These
+// tests capture a REAL h2 flow (the Task 2–5 engine) and then drive the actual
+// `aitm-plugin-sessionio` serialization surface over it via a standalone registry,
+// so the version tag is proven end to end rather than from a hand-built fixture.
+// `full_h2_acceptance_sweep` is a smoke guard over Tasks 2–3 (capture → intercept →
+// mutate → resume → response) in one test.
+
+/// A standalone registry carrying only the session/flow-export commands, so a test
+/// can serialize a captured store the way a frontend does.
+fn sessionio_registry() -> Registry {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(SessionIoPlugin::new(false)));
+    reg
+}
+
+/// Invoke a `session.*`/`flow.*` command through `reg` against `store` as the human
+/// CLI (so host-path reads/writes pass the agent file-I/O gate), returning its
+/// result value. The guard/client are passive stubs — these commands never egress.
+fn sessionio_invoke(reg: &Registry, store: &dyn FlowStore, command: &str, args: Params) -> Value {
+    let client = StubClient;
+    let guard = StdGuard::default();
+    let host = CommandHost::new(store, &client, &guard, None).with_frontend(Frontend::Cli);
+    reg.command(command)
+        .unwrap_or_else(|| panic!("{command} registered"))
+        .invoke(args, &host)
+        .unwrap_or_else(|e| panic!("{command} failed: {e}"))
+}
+
+/// The single captured HTTP flow in `store` (panics if there is not exactly one).
+fn only_http_flow(store: &dyn FlowStore) -> HttpFlow {
+    let flows: Vec<HttpFlow> = store
+        .list()
+        .into_iter()
+        .filter_map(|id| match store.get(id) {
+            Some(Flow::Http(f)) => Some(f),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(flows.len(), 1, "expected exactly one captured http flow");
+    flows.into_iter().next().unwrap()
+}
+
+/// AC-H2.11 (native session) — an h2 flow captured through the proxy, saved with
+/// `session.save` and loaded with `session.load` into a fresh store, keeps
+/// `version == HttpVersion::H2` on both its request and response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_flow_session_round_trips() {
+    let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
+    let root_pem = ca.root_cert_pem().to_string();
+    let log = Arc::new(Mutex::new(OriginLog::default()));
+    let origin = spawn_origin(
+        vec![ALPN_H2.to_vec()],
+        log.clone(),
+        b"session-body".to_vec(),
+    )
+    .await;
+    let (proxy, store) = run_proxy(ca, Vec::new(), None).await;
+
+    let send_req = connect_h2(proxy, origin, &root_pem).await;
+    let (status, _) = h2_get(&send_req, origin, "/captured").await;
+    assert_eq!(status, 200);
+
+    let captured = wait_for_flow(store.as_ref()).await;
+    assert_eq!(
+        captured.request.version,
+        HttpVersion::H2,
+        "precondition: the captured flow is h2"
+    );
+
+    // Save the whole store, then load it into a brand-new, empty store.
+    let reg = sessionio_registry();
+    let path = temp_dir().join("h2-session.json");
+    let path_str = path.to_string_lossy().to_string();
+    sessionio_invoke(
+        &reg,
+        store.as_ref(),
+        "session.save",
+        params(&[("path", Value::Str(path_str.clone()))]),
+    );
+
+    let fresh = MemFlowStore::new();
+    sessionio_invoke(
+        &reg,
+        &fresh,
+        "session.load",
+        params(&[("path", Value::Str(path_str.clone()))]),
+    );
+
+    let reloaded = only_http_flow(&fresh);
+    assert_eq!(
+        reloaded.request.version,
+        HttpVersion::H2,
+        "session.load must restore the request as HTTP/2"
+    );
+    assert_eq!(
+        reloaded.response.as_ref().map(|r| r.version),
+        Some(HttpVersion::H2),
+        "session.load must restore the response as HTTP/2"
+    );
+    assert_eq!(
+        reloaded.client_conn.alpn.as_deref(),
+        Some("h2"),
+        "the reloaded flow keeps its negotiated h2 ALPN"
+    );
+}
+
+/// AC-H2.11 (HAR) — `flow.export {format:"har"}` of an h2 flow tags both the
+/// request and the response `httpVersion` as `"HTTP/2"`, and `flow.import` of those
+/// same HAR bytes round-trips the flow back as `HttpVersion::H2`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_flow_har_version_tag() {
+    let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
+    let root_pem = ca.root_cert_pem().to_string();
+    let log = Arc::new(Mutex::new(OriginLog::default()));
+    let origin = spawn_origin(vec![ALPN_H2.to_vec()], log.clone(), b"har-body".to_vec()).await;
+    let (proxy, store) = run_proxy(ca, Vec::new(), None).await;
+
+    let send_req = connect_h2(proxy, origin, &root_pem).await;
+    let (status, _) = h2_get(&send_req, origin, "/har").await;
+    assert_eq!(status, 200);
+    let captured = wait_for_flow(store.as_ref()).await;
+    assert_eq!(
+        captured.request.version,
+        HttpVersion::H2,
+        "precondition: h2"
+    );
+
+    // Export the store as HAR and read the version tag out of the document bytes.
+    let reg = sessionio_registry();
+    let result = sessionio_invoke(
+        &reg,
+        store.as_ref(),
+        "flow.export",
+        params(&[("format", Value::Str("har".into()))]),
+    );
+    let bytes = match result {
+        Value::Object(fields) => match fields.get("bytes") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("flow.export must return `bytes`, got {other:?}"),
+        },
+        other => panic!("flow.export must return an object, got {other:?}"),
+    };
+    let doc = String::from_utf8(bytes.clone()).expect("HAR document is UTF-8 JSON");
+    // The one entry carries httpVersion on BOTH its request and response, so the
+    // exact pretty-printed tag must appear twice and the h1 tag never.
+    assert_eq!(
+        doc.matches("\"httpVersion\": \"HTTP/2\"").count(),
+        2,
+        "HAR must tag the h2 request and response as HTTP/2: {doc}"
+    );
+    assert!(
+        !doc.contains("\"httpVersion\": \"HTTP/1.1\""),
+        "no part of an h2 flow may be tagged HTTP/1.1: {doc}"
+    );
+
+    // The same HAR bytes import back into a fresh store as an h2 flow.
+    let fresh = MemFlowStore::new();
+    sessionio_invoke(
+        &reg,
+        &fresh,
+        "flow.import",
+        params(&[
+            ("bytes", Value::Bytes(bytes)),
+            ("format", Value::Str("har".into())),
+        ]),
+    );
+    let imported = only_http_flow(&fresh);
+    assert_eq!(
+        imported.request.version,
+        HttpVersion::H2,
+        "flow.import of the HAR must round-trip the request as HTTP/2"
+    );
+    assert_eq!(
+        imported.response.as_ref().map(|r| r.version),
+        Some(HttpVersion::H2),
+        "flow.import of the HAR must round-trip the response as HTTP/2"
+    );
+}
+
+/// Smoke / regression guard (Tasks 2–3): one h2 stream driven the whole way —
+/// captured, parked by an armed request-phase breakpoint, mutated with an injected
+/// header, resumed, forwarded to the origin, and answered — all over HTTP/2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_h2_acceptance_sweep() {
+    let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
+    let root_pem = ca.root_cert_pem().to_string();
+    let log = Arc::new(Mutex::new(OriginLog::default()));
+    let origin = spawn_origin(vec![ALPN_H2.to_vec()], log.clone(), b"swept".to_vec()).await;
+    let (proxy, registry, store, guard) = run_proxy_intercept(
+        ca,
+        vec![
+            Box::new(InterceptPlugin::new()),
+            Box::new(MutatePlugin::new()),
+        ],
+    )
+    .await;
+
+    // Arm a request-phase breakpoint matching the swept path only.
+    invoke(
+        &registry,
+        store.as_ref(),
+        guard.as_ref(),
+        "flow.intercept",
+        params(&[
+            ("enabled", Value::Bool(true)),
+            ("rules", Value::Array(vec![request_rule("*/sweep")])),
+        ]),
+    );
+
+    let send_req = connect_h2(proxy, origin, &root_pem).await;
+    let swept = {
+        let sr = send_req.clone();
+        tokio::spawn(async move { h2_try_get(&sr, origin, "/sweep").await })
+    };
+    let id = wait_for_parked_path(store.as_ref(), "/sweep").await;
+
+    // Mutate the parked request (inject a header), then resume it.
+    invoke(
+        &registry,
+        store.as_ref(),
+        guard.as_ref(),
+        "flow.mutate",
+        params(&[
+            ("id", Value::Str(id.to_string())),
+            (
+                "edits",
+                obj(&[("headers", obj(&[("X-Sweep", Value::Str("1".into()))]))]),
+            ),
+        ]),
+    );
+    invoke(
+        &registry,
+        store.as_ref(),
+        guard.as_ref(),
+        "flow.resume",
+        params(&[("id", Value::Str(id.to_string()))]),
+    );
+
+    // The client gets the origin's answer end to end over h2.
+    let (status, body) = swept.await.unwrap().expect("/sweep completes after resume");
+    assert_eq!(status, 200);
+    assert_eq!(body, b"swept");
+
+    // The mutation reached the origin, and the captured flow is HTTP/2.
+    let l = log.lock().unwrap();
+    assert_eq!(l.count(), 1, "the resumed request must reach the origin");
+    assert_eq!(l.requests[0].path, "/sweep");
+    assert_eq!(
+        l.header(0, "x-sweep").as_deref(),
+        Some("1"),
+        "the injected header must reach the origin"
+    );
+    drop(l);
+    let captured = only_http_flow(store.as_ref());
+    assert_eq!(
+        captured.request.version,
+        HttpVersion::H2,
+        "the swept flow is captured as HTTP/2"
     );
 }
