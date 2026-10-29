@@ -101,10 +101,20 @@ pub struct RhaiLimits {
 /// unnoticed (`tests/types.rs::limits_default` pins the equality).
 pub const SNAPSHOT_CAP: usize = 10 * 1024 * 1024;
 
+/// The default operation budget. Nothing in Rhai bounds how deeply a value may
+/// nest, and its recursive clone/size-check/drop overflow the worker stack a
+/// few levels before a Rust abort kills the whole process. A script builds
+/// nesting at ~4 operations per level (`let a=[]; for .. { a=[a]; }`), so this
+/// budget caps the *reachable* nesting depth at `MAX_OPERATIONS / 4` ≈ 16 000 —
+/// well under the ~45 000 levels that overflow the [`WORKER_STACK_SIZE`] (64
+/// MiB) thread scripts run on. Raising it means sizing that stack to match
+/// (`WORKER_STACK_SIZE`). See `aitm_plugin_rhai::engine::WORKER_STACK_SIZE`.
+pub const MAX_OPERATIONS: u64 = 64_000;
+
 impl Default for RhaiLimits {
     fn default() -> Self {
         Self {
-            max_operations: 2_000_000,
+            max_operations: MAX_OPERATIONS,
             max_call_levels: 64,
             max_expr_depth: 128,
             max_function_expr_depth: 64,

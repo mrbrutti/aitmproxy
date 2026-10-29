@@ -23,7 +23,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    Command, CommandHost, ParamDef, ParamSchema, Params, Plugin, Registry, TypeDesc, Value,
+    Command, CommandHost, Frontend, ParamDef, ParamSchema, Params, Plugin, Registry, TypeDesc,
+    Value,
 };
 
 use crate::config::ScriptMeta;
@@ -110,7 +111,7 @@ impl Command for Validate {
         }
     }
 
-    fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+    fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         let path = text(&args, "path")?;
         let path = Path::new(&path);
         if path.extension().and_then(|e| e.to_str()) != Some(SCRIPT_EXT) {
@@ -119,12 +120,38 @@ impl Command for Validate {
                 path.display()
             );
         }
+        confine_validate(host, path)?;
         let meta = self
             .loader
             .validate(path)
             .map_err(|err| anyhow::anyhow!("{err}"))?;
         Ok(meta_value(&meta))
     }
+}
+
+/// Keep `script.validate` from being a file-existence / content-disclosure
+/// oracle. The human CLI (`Frontend::Cli`) may compile any `.rhai` path; an
+/// agent frontend may reach only a file inside the configured scripts/PoC
+/// directory (`poc.dir`). Both "outside the directory" and "does not resolve"
+/// return the one generic refusal, so the command never confirms the presence
+/// of a file it would not read.
+fn confine_validate(host: &CommandHost, path: &Path) -> anyhow::Result<()> {
+    if host.frontend() == Frontend::Cli {
+        return Ok(());
+    }
+    let within = host
+        .poc_dir()
+        .and_then(|root| root.canonicalize().ok())
+        .zip(path.canonicalize().ok())
+        .is_some_and(|(root, target)| target.starts_with(root));
+    if !within {
+        anyhow::bail!(
+            "script.validate from an agent frontend may read only a .rhai file inside the \
+             configured scripts/PoC directory (poc.dir); run it from the human CLI for an \
+             arbitrary path"
+        );
+    }
+    Ok(())
 }
 
 impl Command for Reload {

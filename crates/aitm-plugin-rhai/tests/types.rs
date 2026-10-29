@@ -40,7 +40,14 @@ fn denied_display_has_help_line() {
 #[test]
 fn limits_default() {
     let limits = RhaiLimits::default();
-    assert_eq!(limits.max_operations, 2_000_000);
+    // The op budget caps reachable value-nesting depth within the worker stack
+    // (I14): MAX_OPERATIONS / ~4 ops-per-level stays well under the ~45 000
+    // levels that overflow it.
+    assert_eq!(limits.max_operations, 64_000);
+    assert_eq!(
+        limits.max_operations,
+        aitm_plugin_rhai::config::MAX_OPERATIONS
+    );
     assert_eq!(limits.max_modules, 0);
     // Security review (M3, Important): the string and blob limits agree with
     // the body cap the snapshot copies, so a body the proxy buffered is a body

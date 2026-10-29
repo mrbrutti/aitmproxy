@@ -98,9 +98,14 @@ pub fn blocking<T>(f: impl FnOnce() -> T) -> T {
 }
 
 /// The stack a thread that evaluates scripts should have. Rhai recurses once
-/// per nesting level of a value; the operation and time budgets bound how deep
-/// a script can nest within one run to the tens of thousands, which this
-/// accommodates with margin where a default 2 MiB worker stack does not.
+/// per nesting level of a value — on clone, on the data-size check, and on drop
+/// — and no Rhai limit bounds that nesting, so the stack is the only backstop
+/// against a deeply-nested value overflowing it and aborting the process. The
+/// default operation budget ([`crate::config::MAX_OPERATIONS`]) is tuned so the
+/// deepest nesting a run can build (~`MAX_OPERATIONS / 4` ≈ 16 000 levels)
+/// stays well inside this stack, which overflows only past ~45 000 levels —
+/// where a default 2 MiB worker stack overflows in the low thousands. Raise the
+/// budget and this stack together, never one alone.
 pub const WORKER_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// How many strings the engine interns; the figure `Engine::new` uses.
