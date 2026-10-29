@@ -54,6 +54,19 @@ pub enum IngressOutcome {
     Unhandled,
 }
 
+/// One captured **UDP** flow: a batch of datagrams to one [`L4Target`], tagged with
+/// the dispatch context the L4 guard authorizes against. A thin, symmetric companion
+/// to [`CapturedTcpFlow`] over the existing deny-by-default L4 path.
+pub struct CapturedUdpFlow {
+    /// What [`L4Guard::check`](aitm_proto_l4::guard::L4Guard::check) decides on
+    /// (interface / direction / dst / port / proto).
+    pub target: aitm_proto_l4::types::L4Target,
+    /// The raw on-wire bytes of each captured datagram.
+    pub datagrams: Vec<Vec<u8>>,
+    /// The source-app signing identity, if the backend knows it.
+    pub peer_identity: Option<String>,
+}
+
 /// The protocol-general capture / ingress boundary. A capture backend — Phase 1: the
 /// Linux/CLI L4 `pcap` backend; Phase 2: the macOS Network/System Extension — calls
 /// [`accept`](CaptureIngress::accept) with each captured unit, and the implementation
@@ -215,6 +228,36 @@ impl CoreIngress {
                 }
                 StreamOutcome::PassedThrough
             }
+        }
+    }
+
+    /// Dispatch a captured UDP flow over the **existing** L4 path: each datagram goes
+    /// through the same [`L4Guard::check`](aitm_proto_l4::guard::L4Guard::check)
+    /// `(Capture, target)` a `pcap`-fed packet passes — no new guard. [`Captured`] if at
+    /// least one datagram was authorized and stored, else [`Refused`]; [`Unhandled`] when
+    /// no L4 backend is wired.
+    ///
+    /// [`Captured`]: IngressOutcome::Captured
+    /// [`Refused`]: IngressOutcome::Refused
+    /// [`Unhandled`]: IngressOutcome::Unhandled
+    pub fn dispatch_udp(&self, flow: CapturedUdpFlow) -> IngressOutcome {
+        if self.l4.is_none() {
+            return IngressOutcome::Unhandled;
+        }
+        let mut captured = 0usize;
+        for datagram in flow.datagrams {
+            if self.accept(CapturedUnit::L4 {
+                target: flow.target.clone(),
+                bytes: datagram,
+            }) == IngressOutcome::Captured
+            {
+                captured += 1;
+            }
+        }
+        if captured >= 1 {
+            IngressOutcome::Captured
+        } else {
+            IngressOutcome::Refused
         }
     }
 }
@@ -657,6 +700,44 @@ mod tests {
             dial_calls.load(Ordering::SeqCst),
             1,
             "the original dst is dialled once"
+        );
+    }
+
+    /// AC17 (symmetry): a captured UDP flow rides the **same** deny-by-default L4 path.
+    /// An in-scope datagram is admitted and stored; an out-of-scope one on the same
+    /// interface is refused and reaches no store.
+    #[test]
+    fn udp_in_scope_admitted_out_of_scope_refused() {
+        let mut cfg = L4Config::default();
+        cfg.scope.push(capture_entry("127.0.0.1"));
+        let guard = Arc::new(L4Guard::new(&cfg));
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let ingress = CoreIngress::with_l4(guard, store.clone());
+
+        // In scope → admitted through the real L4 guard and stored.
+        let in_flow = CapturedUdpFlow {
+            target: l4_target("127.0.0.1"),
+            datagrams: vec![b"probe".to_vec()],
+            peer_identity: None,
+        };
+        assert_eq!(ingress.dispatch_udp(in_flow), IngressOutcome::Captured);
+        assert_eq!(
+            store.list().len(),
+            1,
+            "one capture flow holds the admitted datagram"
+        );
+
+        // Out of scope → refused by the same guard; nothing new is stored.
+        let out_flow = CapturedUdpFlow {
+            target: l4_target("127.0.0.2"),
+            datagrams: vec![b"probe".to_vec()],
+            peer_identity: None,
+        };
+        assert_eq!(ingress.dispatch_udp(out_flow), IngressOutcome::Refused);
+        assert_eq!(
+            store.list().len(),
+            1,
+            "the out-of-scope datagram reached no store"
         );
     }
 
