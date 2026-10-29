@@ -41,6 +41,7 @@ dependencies = [
  "aitm-poc",
  "aitm-proto-http",
  "aitm-proto-ws",
+ "aitm-testtarget",
  "anyhow",
  "bytes",
  "futures",
@@ -135,6 +136,7 @@ version = "0.1.0"
 dependencies = [
  "aitm-core",
  "aitm-plugins",
+ "aitm-poc",
  "anyhow",
  "futures",
  "serde_json",
