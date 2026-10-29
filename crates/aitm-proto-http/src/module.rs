@@ -56,16 +56,21 @@ pub struct HttpModule {
     ca: OnceLock<Arc<CertAuthority>>,
     ca_config: CaConfig,
     provider: Arc<CryptoProvider>,
-    upstream_tls: OnceLock<Arc<ClientConfig>>,
     /// Skip upstream certificate verification (lab self-signed targets). Off by
     /// default: upstream TLS is verified against the webpki roots.
     insecure: bool,
     /// Cap on a buffered request body and the captured copy of a response body.
     max_body_bytes: usize,
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` advertised to an h2 client, bounding how
+    /// many streams one connection may run in parallel.
+    max_concurrent_streams: usize,
 }
 
 /// Default per-message body cap, matching `LimitConfig::default().max_body_bytes`.
 const DEFAULT_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// Default cap on concurrent h2 streams per connection.
+const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 128;
 
 impl Default for HttpModule {
     fn default() -> Self {
@@ -86,15 +91,22 @@ impl HttpModule {
             ca: OnceLock::new(),
             ca_config: cfg,
             provider: Arc::new(rustls::crypto::ring::default_provider()),
-            upstream_tls: OnceLock::new(),
             insecure: false,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
         }
     }
 
     /// Set the per-message body cap (maps to `LimitConfig.max_body_bytes`).
     pub fn with_max_body_bytes(mut self, max: usize) -> Self {
         self.max_body_bytes = max;
+        self
+    }
+
+    /// Set the per-connection concurrent-stream cap for h2 (maps to
+    /// `LimitConfig.max_concurrent_streams`; wired to config in Task 5).
+    pub fn with_max_concurrent_streams(mut self, max: usize) -> Self {
+        self.max_concurrent_streams = max;
         self
     }
 
@@ -133,10 +145,7 @@ impl HttpModule {
     /// could not itself authenticate. `Config.ssl_insecure` (via
     /// [`HttpModule::with_insecure`]) turns verification off for a lab of
     /// self-signed targets.
-    fn upstream_tls(&self) -> Result<Arc<ClientConfig>> {
-        if let Some(cfg) = self.upstream_tls.get() {
-            return Ok(cfg.clone());
-        }
+    fn upstream_tls_alpn(&self, offer: &[Vec<u8>]) -> Result<Arc<ClientConfig>> {
         let builder = ClientConfig::builder_with_provider(self.provider.clone())
             .with_safe_default_protocol_versions()
             .context("upstream TLS versions")?;
@@ -152,13 +161,19 @@ impl HttpModule {
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             builder.with_root_certificates(roots).with_no_client_auth()
         };
-        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let cfg = Arc::new(cfg);
-        Ok(self.upstream_tls.get_or_init(|| cfg).clone())
+        // Offer upstream exactly what the client offered (the ALPN mirror, spec §1).
+        cfg.alpn_protocols = offer.to_vec();
+        Ok(Arc::new(cfg))
     }
 
-    /// A server config presenting `leaf` to the client.
-    fn impersonating_config(&self, leaf: &LeafCert) -> Result<Arc<ServerConfig>> {
+    /// A server config presenting `leaf` to the client, offering only the
+    /// protocol the upstream negotiated (`negotiated`), so the client lands on the
+    /// same version as upstream (the ALPN mirror, spec §1).
+    fn impersonating_config(
+        &self,
+        leaf: &LeafCert,
+        negotiated: &[u8],
+    ) -> Result<Arc<ServerConfig>> {
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf.key_der.clone()));
         let mut cfg = ServerConfig::builder_with_provider(self.provider.clone())
             .with_safe_default_protocol_versions()
@@ -166,7 +181,7 @@ impl HttpModule {
             .with_no_client_auth()
             .with_single_cert(vec![CertificateDer::from(leaf.cert_der.clone())], key)
             .context("client-facing TLS leaf")?;
-        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        cfg.alpn_protocols = vec![negotiated.to_vec()];
         Ok(Arc::new(cfg))
     }
 
@@ -219,6 +234,13 @@ impl HttpModule {
             .await
             .context("read ClientHello")?;
         let sni = start.client_hello().server_name().map(str::to_string);
+        // The client's ALPN offer (an absent extension ⇒ assume `http/1.1`). We
+        // offer upstream exactly this list and mirror whatever it negotiates.
+        let client_alpn: Vec<Vec<u8>> = start
+            .client_hello()
+            .alpn()
+            .map(|offers| offers.map(|p| p.to_vec()).collect())
+            .unwrap_or_else(|| vec![b"http/1.1".to_vec()]);
         let target = match target {
             Some(t) => t,
             None => {
@@ -234,10 +256,32 @@ impl HttpModule {
             .await?;
         let server_name = ServerName::try_from(target.host.clone())
             .map_err(|e| anyhow!("invalid upstream name {:?}: {e}", target.host))?;
-        let upstream = TlsConnector::from(self.upstream_tls()?)
+        let upstream = TlsConnector::from(self.upstream_tls_alpn(&client_alpn)?)
             .connect(server_name, tcp)
             .await
             .with_context(|| format!("TLS to upstream {}", target.authority()))?;
+        // What upstream agreed to; mirror it down to the client (absent ⇒ h1).
+        let negotiated: Vec<u8> = upstream
+            .get_ref()
+            .1
+            .alpn_protocol()
+            .map(|p| p.to_vec())
+            .unwrap_or_else(|| b"http/1.1".to_vec());
+
+        // Fail closed: an h1-only client cannot be mirrored to an h2-only upstream
+        // (spec §1 edge case). The mirror offers upstream the client's list, so
+        // this is only reachable defensively; log and drop rather than bridge.
+        if negotiated == b"h2" && !client_alpn.iter().any(|p| p.as_slice() == b"h2") {
+            tracing::warn!(
+                authority = %target.authority(),
+                "upstream negotiated h2 but the client cannot speak it; failing closed"
+            );
+            bail!(
+                "cannot mirror h2 to an h1-only client for {}",
+                target.authority()
+            );
+        }
+
         let sans = upstream
             .get_ref()
             .1
@@ -248,10 +292,11 @@ impl HttpModule {
 
         let leaf = self.ca()?.leaf_for(&target.host, &sans)?;
         let client_tls = start
-            .into_stream(self.impersonating_config(&leaf)?)
+            .into_stream(self.impersonating_config(&leaf, &negotiated)?)
             .await
             .context("client TLS handshake")?;
 
+        let alpn = String::from_utf8_lossy(&negotiated).into_owned();
         let now = SystemTime::now();
         let conn = Conn {
             scheme: "https".to_string(),
@@ -259,26 +304,41 @@ impl HttpModule {
             client_conn: ConnInfo {
                 peer,
                 sni,
-                alpn: Some("http/1.1".to_string()),
+                alpn: Some(alpn.clone()),
                 tls: true,
                 established: now,
             },
             server_conn: Some(ConnInfo {
                 peer: target.addr,
                 sni: Some(target.host.clone()),
-                alpn: Some("http/1.1".to_string()),
+                alpn: Some(alpn),
                 tls: true,
                 established: now,
             }),
         };
-        serve(
-            &ctx,
-            Box::pin(client_tls),
-            Some(Box::pin(upstream)),
-            conn,
-            self.max_body_bytes,
-        )
-        .await
+
+        // Branch on the negotiated protocol: h2 runs the per-stream `serve_h2`
+        // driver; everything else runs the unchanged h1 `serve` loop.
+        if negotiated == b"h2" {
+            crate::h2::serve_h2(
+                ctx,
+                Box::pin(client_tls),
+                Box::pin(upstream),
+                conn,
+                self.max_body_bytes,
+                self.max_concurrent_streams,
+            )
+            .await
+        } else {
+            serve(
+                &ctx,
+                Box::pin(client_tls),
+                Some(Box::pin(upstream)),
+                conn,
+                self.max_body_bytes,
+            )
+            .await
+        }
     }
 }
 
@@ -317,12 +377,12 @@ fn looks_like_http(first: &[u8]) -> bool {
 }
 
 /// Per-connection facts every flow on it shares.
-struct Conn {
-    scheme: String,
+pub(crate) struct Conn {
+    pub(crate) scheme: String,
     /// The CONNECT authority, when the connection is a tunnel.
-    tunnel_authority: Option<String>,
-    client_conn: ConnInfo,
-    server_conn: Option<ConnInfo>,
+    pub(crate) tunnel_authority: Option<String>,
+    pub(crate) client_conn: ConnInfo,
+    pub(crate) server_conn: Option<ConnInfo>,
 }
 
 impl Conn {
