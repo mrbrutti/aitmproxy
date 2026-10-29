@@ -5,7 +5,7 @@
 > superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** draft
+**Status:** approved (2026-10-29 by Matt); implemented, panel-reviewed, fixes applied
 **Spec:** `docs/superpowers/specs/2026-10-29-operator-token-ux-design.md` (approved 2026-10-29)
 **Branch / worktree:** `feat/operator-token-ux` (one worktree, cut from the plan
 branch; parallel tasks get child worktrees per
@@ -337,9 +337,23 @@ first. Each has a test added to the owning task.
 
 Kept by the main session during stage 6. One row per finding.
 
-| Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
+| Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
+| whole branch | security + spec | **Important** | Empty-string `operator_token: ""` enabled the web operator path (`main.rs` gated on `.is_some()` while loopback filters empty); violates AC12 | Fixed in 2e96e5a — non-empty gate + web empty-string test |
+| whole branch | security | Minor | `generate_and_store` overwrote config non-atomically / followed symlinks | Fixed in 2e96e5a — write-temp-then-rename |
+| whole branch | quality | Minor | `asRole` role-narrowing duplicated in web `ws.ts` | Fixed in 2e96e5a — exported and reused |
+| whole branch | quality | Minor | YAML editor matched `operator_token:` at any depth in the `mcp:` block | Fixed in 2e96e5a — direct-child indent check + nested-key test |
+| whole branch | quality | Minor | `generate_operator_token` comment overstated entropy (256 vs ~244 bits) | Fixed in 2e96e5a — comment reworded |
+| whole branch | spec | **Important** | Unrequested mac "Reconnect Bus" command + `⌃⌘R` in undeclared files | Accepted by Matt 2026-10-29 — it applies a pasted operator token without an app restart; `apps/mac/CLAUDE.md` requires a menu item + shortcut per action |
+| whole branch | quality | Minor | mac picker cannot return to "no expectation" once set | Accepted by Matt 2026-10-29 — default-unset reads as no-warning; behavior safe |
+| whole branch | quality | Minor | mac mismatch warning recomputed only on (re)connect | Accepted by Matt 2026-10-29 — explicit Reconnect affordance covers it |
+| whole branch | spec | Minor | status-line role indicator landed in `ui/bars.rs`, not the plan's named `render.rs` | Accepted 2026-10-29 — plan filename was wrong; code is in the correct place |
+| whole branch | spec | Minor | several undeclared files touched to propagate declared interface changes | Accepted 2026-10-29 — required consequence of the declared signatures, not scope creep |
+| whole branch | spec | Minor | AC3/AC4/AC13 covered indirectly (role echo + pre-existing M4 `Frontend` gate) rather than a literal `flow.intercept` assertion | Accepted 2026-10-29 — causal chain holds; the gate is M4-tested on `Frontend` |
 
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7.
+- **Merged into `feat/operator-token-ux`** (Waves 1–3 + panel fix): the additive `initialize` `role` echo (server); `ServerInfo.role` in the Rust bus client; TUI `--expect-role`, status-line role indicator and reworded refusal; web `/bus` role routing (two bridge tokens, `handle_on` dispatch) + resolved-role banner; mac operator-token Settings entry, resolved-role display, mismatch warning and Reconnect Bus; and the CLI-only `aitm operator-token generate [--force]`. All 16 acceptance criteria implemented and tested.
+- **Gate:** whole-branch `cargo fmt --check && cargo clippy --all-targets -D warnings && cargo test` green (one load-sensitive flake, green in isolation); web `typecheck` + 293 vitest green.
+- **Cut:** nothing.
+- **Follow-ups:** `main` advanced ~40 commits during the work; landing this branch needs a merge-conflict resolution in 4 files (`crates/aitm/src/main.rs` + 3 `apps/mac` Swift files). PR opened against `main`; conflicts to be resolved at merge time.
