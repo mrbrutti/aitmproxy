@@ -25,9 +25,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    Body, CommandHost, ConnInfo, Event, Flow, FlowCtx, FlowId, FlowMeta, Frontend, HeaderMap,
-    HttpFlow, HttpRequest, HttpVersion, InterceptState, MemFlowStore, Params, ProxyClient,
-    Registry, ScopeEntry, ScopeRateGuard, StdGuard, Value, Verdict,
+    ActionPermit, Body, CommandHost, ConnInfo, Event, Flow, FlowCtx, FlowId, FlowMeta, Frontend,
+    GuardError, HeaderMap, HttpFlow, HttpRequest, HttpVersion, InterceptState, MemFlowStore,
+    Params, ProxyClient, Registry, ScopeEntry, ScopeRateGuard, StdGuard, Value, Verdict,
 };
 use aitm_plugin_maprules::MapRulesPlugin;
 use futures::future::BoxFuture;
@@ -294,5 +294,104 @@ fn map_remote_url_target_rewrites() {
         f.request.headers.get("host"),
         Some("cdn.example"),
         "the Host header follows the URL authority"
+    );
+}
+
+/// A guard that counts `check_active` calls, delegating scope/rate decisions to an
+/// inner [`StdGuard`]. Panel finding #4: a URL/path-matched Map Remote rule must
+/// consult the guard once per request, not once per request *event*.
+struct CountingGuard {
+    inner: StdGuard,
+    checks: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ScopeRateGuard for CountingGuard {
+    fn check_active(&self, host: &str) -> Result<ActionPermit, GuardError> {
+        self.checks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.check_active(host)
+    }
+    fn add_scope(&self, entry: ScopeEntry) {
+        self.inner.add_scope(entry);
+    }
+    fn remove_scope(&self, entry: &str) -> bool {
+        self.inner.remove_scope(entry)
+    }
+    fn list_scope(&self) -> Vec<ScopeEntry> {
+        self.inner.list_scope()
+    }
+    fn record_error(&self, host: &str) {
+        self.inner.record_error(host);
+    }
+}
+
+#[test]
+fn map_remote_charges_the_guard_once_per_request() {
+    // A URL/path-matched remote rule (host clause absent) still matches after the
+    // host swap, because the path is unchanged. The proxy fires RequestHeaders then
+    // Request for one request; the guard must be charged exactly once across both.
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let inner = StdGuard::default();
+    inner.add_scope(ScopeEntry {
+        host: "new.example".to_string(),
+    });
+    let guard: Arc<dyn ScopeRateGuard> = Arc::new(CountingGuard {
+        inner,
+        checks: checks.clone(),
+    });
+    let reg = registry(guard);
+
+    // Match on the request path, rewrite the host — the path survives the rewrite.
+    let store = MemFlowStore::new();
+    let client = CountingClient::default();
+    let dummy = StdGuard::default();
+    let host = CommandHost::new(&store, &client, &dummy, None).with_frontend(Frontend::Cli);
+    reg.command("map.add")
+        .expect("map.add registered")
+        .invoke(
+            params(&[
+                ("kind", Value::Str("remote".into())),
+                (
+                    "condition",
+                    obj(&[("url", obj(&[("wildcard", Value::Str("*/orders".into()))]))]),
+                ),
+                (
+                    "action",
+                    obj(&[(
+                        "to",
+                        obj(&[("authority", Value::Str("new.example".into()))]),
+                    )]),
+                ),
+            ]),
+            &host,
+        )
+        .expect("map.add remote succeeds");
+
+    let id = FlowId::new();
+    let (after_headers, v1) = dispatch(
+        &reg,
+        &Event::RequestHeaders(id),
+        http_flow("http", "old.example", "/orders"),
+    );
+    assert_eq!(v1, Verdict::Continue, "an in-scope rewrite continues");
+    assert_eq!(
+        as_http(&after_headers).request.authority,
+        "new.example",
+        "rewritten at the headers event"
+    );
+
+    // The same flow (carrying the rewrite mark) flows into the Request event.
+    let (after_request, v2) = dispatch(&reg, &Event::Request(id), after_headers);
+    assert_eq!(v2, Verdict::Continue);
+    assert_eq!(
+        as_http(&after_request).request.authority,
+        "new.example",
+        "still rewritten, not double-applied"
+    );
+
+    assert_eq!(
+        checks.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the scope guard is consulted once per request, not once per request event"
     );
 }

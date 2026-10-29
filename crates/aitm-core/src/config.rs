@@ -38,6 +38,10 @@ pub struct Config {
     /// authoring off, so Map Local is unusable and no agent may author maps until
     /// the operator opts in.
     pub maps: MapsConfig,
+    /// Session/flow file I/O (M6 F10). Deny-by-default: an agent (MCP) frontend
+    /// may not read or write a host path via `session.save`/`session.load`/
+    /// `flow.export`/`flow.import` until the operator opts in.
+    pub session_io: SessionIoConfig,
 }
 
 impl Default for Config {
@@ -55,6 +59,7 @@ impl Default for Config {
             max_flow_bytes: crate::store::DEFAULT_MAX_FLOW_BYTES,
             tls: TlsConfig::default(),
             maps: MapsConfig::default(),
+            session_io: SessionIoConfig::default(),
         }
     }
 }
@@ -88,6 +93,20 @@ pub struct MapsConfig {
     /// authorisation decision, so only the human CLI may author one unless the
     /// operator opts in — mirrors [`ScopeConfig::allow_agent_widen`].
     pub allow_agent_authoring: bool,
+}
+
+/// Session/flow file-I/O configuration (M6 F10). `session.save`/`session.load`/
+/// `flow.export`/`flow.import` can read or overwrite an arbitrary host path, so an
+/// agent (MCP) frontend is refused a path-bearing call unless the operator opts in.
+#[derive(Debug, Clone, Default)]
+pub struct SessionIoConfig {
+    /// Let an agent (MCP) frontend read/write a host path through the session/flow
+    /// I/O commands. **Off by default**: reading or overwriting a host file is an
+    /// authorisation decision, so only the human CLI may hand those commands a path
+    /// unless the operator opts in — mirrors [`ScopeConfig::allow_agent_widen`]. An
+    /// agent may still export to / import from in-memory `bytes` (no host path),
+    /// which stays passive.
+    pub allow_agent_file_io: bool,
 }
 
 /// PoC-engine configuration.

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 use aitm_core::{
-    Body, CommandHost, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow,
+    Body, CommandHost, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, Frontend, HeaderMap, HttpFlow,
     HttpRequest, HttpResponse, HttpVersion, InterceptState, MemFlowStore, Params, ProxyClient,
     Registry, StdGuard, Value,
 };
@@ -34,7 +34,7 @@ impl ProxyClient for CountingClient {
 
 fn registry() -> Registry {
     let mut reg = Registry::new();
-    reg.add_plugin(Box::new(SessionIoPlugin));
+    reg.add_plugin(Box::new(SessionIoPlugin::new(false)));
     reg
 }
 
@@ -153,8 +153,8 @@ fn native_session_roundtrips() {
     let path = std::env::temp_dir().join(format!("aitm-sess-{}.json", FlowId::new()));
     let path_str = path.to_string_lossy().to_string();
 
-    // Save.
-    let host = CommandHost::new(&store, &client, &guard, None);
+    // Save. session.save writes a host path, so it runs as the operator (CLI).
+    let host = CommandHost::new(&store, &client, &guard, None).with_frontend(Frontend::Cli);
     let mut args = BTreeMap::new();
     args.insert("path".to_string(), Value::Str(path_str.clone()));
     let saved = reg
@@ -168,9 +168,9 @@ fn native_session_roundtrips() {
     assert_eq!(saved.get("flows"), Some(&Value::Int(3)));
     assert_eq!(saved.get("path"), Some(&Value::Str(path_str.clone())));
 
-    // Load into a fresh store.
+    // Load into a fresh store, again as the operator (CLI) reading a host path.
     let fresh = MemFlowStore::new();
-    let host = CommandHost::new(&fresh, &client, &guard, None);
+    let host = CommandHost::new(&fresh, &client, &guard, None).with_frontend(Frontend::Cli);
     let mut args = BTreeMap::new();
     args.insert("path".to_string(), Value::Str(path_str.clone()));
     let loaded = reg

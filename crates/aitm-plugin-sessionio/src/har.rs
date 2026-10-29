@@ -14,6 +14,7 @@ use aitm_core::{
     Body, ConnInfo, Flow, FlowId, FlowMeta, HeaderMap, HttpFlow, HttpRequest, HttpResponse,
     HttpVersion, InterceptState, WsDir, WsFlow, WsMessage, WsOpcode,
 };
+use anyhow::Context as _;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -172,8 +173,10 @@ pub fn flows_to_har(flows: &[Flow]) -> Har {
 }
 
 /// Rebuild flows from a parsed HAR document. An entry carrying
-/// `_webSocketMessages` becomes a `WsFlow`; every other entry an `HttpFlow`.
-pub fn har_to_flows(har: &Har) -> Vec<Flow> {
+/// `_webSocketMessages` becomes a `WsFlow`; every other entry an `HttpFlow`. A
+/// body (or WS frame) that declares `encoding: "base64"` but cannot be decoded
+/// is a corrupt document: the import fails rather than silently dropping bytes.
+pub fn har_to_flows(har: &Har) -> anyhow::Result<Vec<Flow>> {
     har.log.entries.iter().map(entry_to_flow).collect()
 }
 
@@ -242,15 +245,15 @@ fn ws_to_entry(f: &WsFlow) -> HarEntry {
     }
 }
 
-fn entry_to_flow(entry: &HarEntry) -> Flow {
-    if entry.web_socket_messages.is_empty() {
-        Flow::Http(entry_to_http(entry))
+fn entry_to_flow(entry: &HarEntry) -> anyhow::Result<Flow> {
+    Ok(if entry.web_socket_messages.is_empty() {
+        Flow::Http(entry_to_http(entry)?)
     } else {
-        Flow::WebSocket(entry_to_ws(entry))
-    }
+        Flow::WebSocket(entry_to_ws(entry)?)
+    })
 }
 
-fn entry_to_http(entry: &HarEntry) -> HttpFlow {
+fn entry_to_http(entry: &HarEntry) -> anyhow::Result<HttpFlow> {
     let (scheme, authority, path) = split_url(&entry.request.url);
     let request = HttpRequest {
         method: entry.request.method.clone(),
@@ -259,17 +262,17 @@ fn entry_to_http(entry: &HarEntry) -> HttpFlow {
         path,
         version: parse_version(&entry.request.http_version),
         headers: har_headers(&entry.request.headers),
-        body: post_data_to_body(&entry.request.post_data),
+        body: post_data_to_body(&entry.request.post_data)?,
         timestamp: UNIX_EPOCH,
     };
     let response = HttpResponse {
         status: entry.response.status,
         version: parse_version(&entry.response.http_version),
         headers: har_headers(&entry.response.headers),
-        body: content_to_body(&entry.response.content),
+        body: content_to_body(&entry.response.content)?,
         timestamp: UNIX_EPOCH,
     };
-    HttpFlow {
+    Ok(HttpFlow {
         id: FlowId::new(),
         request,
         response: Some(response),
@@ -277,24 +280,24 @@ fn entry_to_http(entry: &HarEntry) -> HttpFlow {
         server_conn: None,
         metadata: FlowMeta::default(),
         intercept: InterceptState::Observed,
-    }
+    })
 }
 
-fn entry_to_ws(entry: &HarEntry) -> WsFlow {
+fn entry_to_ws(entry: &HarEntry) -> anyhow::Result<WsFlow> {
     let tls = entry.request.url.starts_with("wss") || entry.request.url.starts_with("https");
-    WsFlow {
+    Ok(WsFlow {
         id: FlowId::new(),
         handshake: FlowId::new(),
         messages: entry
             .web_socket_messages
             .iter()
             .map(har_to_ws_msg)
-            .collect(),
+            .collect::<anyhow::Result<_>>()?,
         client_conn: synth_conn(tls),
         server_conn: None,
         metadata: FlowMeta::default(),
         intercept: InterceptState::Observed,
-    }
+    })
 }
 
 fn req_to_har(r: &HttpRequest) -> HarRequest {
@@ -364,18 +367,20 @@ fn ws_msg_to_har(m: &WsMessage) -> HarWsMessage {
     }
 }
 
-fn har_to_ws_msg(m: &HarWsMessage) -> WsMessage {
-    WsMessage {
+fn har_to_ws_msg(m: &HarWsMessage) -> anyhow::Result<WsMessage> {
+    Ok(WsMessage {
         dir: if m.kind == "send" {
             WsDir::ClientToServer
         } else {
             WsDir::ServerToClient
         },
         opcode: u8_to_opcode(m.opcode),
-        data: STANDARD.decode(&m.data).unwrap_or_default(),
+        data: STANDARD
+            .decode(&m.data)
+            .context("HAR _webSocketMessages: frame data is not valid base64")?,
         timestamp: UNIX_EPOCH,
         injected: m.injected,
-    }
+    })
 }
 
 fn headers_to_har(h: &HeaderMap) -> Vec<HarHeader> {
@@ -423,28 +428,32 @@ fn encode_body(b: &Body) -> (i64, Option<String>, Option<String>) {
     }
 }
 
-fn content_to_body(c: &HarContent) -> Body {
+fn content_to_body(c: &HarContent) -> anyhow::Result<Body> {
     decode_text(c.text.as_deref(), c.encoding.as_deref())
 }
 
-fn post_data_to_body(p: &Option<HarPostData>) -> Body {
+fn post_data_to_body(p: &Option<HarPostData>) -> anyhow::Result<Body> {
     match p {
         Some(p) => decode_text(Some(&p.text), p.encoding.as_deref()),
-        None => Body::Empty,
+        None => Ok(Body::Empty),
     }
 }
 
-fn decode_text(text: Option<&str>, encoding: Option<&str>) -> Body {
-    match text {
+fn decode_text(text: Option<&str>, encoding: Option<&str>) -> anyhow::Result<Body> {
+    Ok(match text {
         None => Body::Empty,
         Some("") => Body::Empty,
         Some(t) => match encoding {
-            Some("base64") => {
-                Body::Bytes(STANDARD.decode(t).unwrap_or_else(|_| t.as_bytes().to_vec()))
-            }
+            // A body tagged base64 that will not decode is corrupt: fail the import
+            // rather than silently storing the raw tag bytes as if they were the body.
+            Some("base64") => Body::Bytes(
+                STANDARD
+                    .decode(t)
+                    .context("HAR body declared encoding base64 but is not valid base64")?,
+            ),
             _ => Body::Bytes(t.as_bytes().to_vec()),
         },
-    }
+    })
 }
 
 fn version_str(v: HttpVersion) -> String {

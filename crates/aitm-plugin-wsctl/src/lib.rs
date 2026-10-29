@@ -46,7 +46,7 @@ use aitm_core::{
     ParamSchema, Params, Plugin, Registry, ResumeHandle, TypeDesc, Value, Verdict, WsDir, WsOpcode,
 };
 use aitm_proto_ws::{InjectFrame, InjectRegistry};
-use aitm_rules::{compile, CompiledRule, HostMatch, MatchCondition, Phase, Rule, UrlMatch};
+use aitm_rules::{bus, compile, CompiledRule, Phase, Rule};
 
 /// State the plugin (which parks frames on events) shares with its commands
 /// (which arm it and release parked frames).
@@ -514,129 +514,35 @@ fn rule_fields() -> Vec<ParamDef> {
     ]
 }
 
-/// Parse one rule object from the command bus into an [`aitm_rules::Rule`]. `pos`
-/// seeds a default id when none is supplied.
+/// Parse one rule object from the command bus into an [`aitm_rules::Rule`] via the
+/// shared [`aitm_rules::bus`] serde. `pos` seeds a default id when none is supplied;
+/// a WS-frame rule is the default phase for this surface.
 fn parse_rule(obj: &std::collections::BTreeMap<String, Value>, pos: usize) -> anyhow::Result<Rule> {
-    let id = match obj.get("id") {
-        None => format!("ws-{pos}"),
-        Some(Value::Str(s)) => s.clone(),
-        Some(other) => anyhow::bail!("rule `id` must be a string, got {other:?}"),
-    };
-    let name = match obj.get("name") {
-        None => None,
-        Some(Value::Str(s)) => Some(s.clone()),
-        Some(other) => anyhow::bail!("rule `name` must be a string, got {other:?}"),
-    };
-    let enabled = match obj.get("enabled") {
-        None => true,
-        Some(Value::Bool(b)) => *b,
-        Some(other) => anyhow::bail!("rule `enabled` must be a boolean, got {other:?}"),
-    };
-    let phase = match obj.get("phase") {
-        None => Phase::WsFrame,
-        Some(Value::Str(s)) => parse_phase(s)?,
-        Some(other) => anyhow::bail!("rule `phase` must be a string, got {other:?}"),
-    };
-    let ws_dir = match obj.get("ws_dir") {
-        None => None,
-        Some(Value::Str(s)) => Some(parse_dir(s)?),
-        Some(other) => anyhow::bail!("rule `ws_dir` must be a string, got {other:?}"),
-    };
-    let method = match obj.get("method") {
-        None => None,
-        Some(Value::Str(s)) => Some(s.clone()),
-        Some(other) => anyhow::bail!("rule `method` must be a string, got {other:?}"),
-    };
-    let url = parse_url(obj.get("url"))?;
-    let host = parse_host(obj.get("host"))?;
-
-    Ok(Rule {
-        id,
-        name,
-        enabled,
-        condition: MatchCondition {
-            url,
-            method,
-            host,
-            phase,
-            ws_dir,
-        },
-    })
+    bus::parse_rule(obj, &format!("ws-{pos}"), Phase::WsFrame)
 }
 
-fn parse_phase(s: &str) -> anyhow::Result<Phase> {
-    match s.to_ascii_lowercase().as_str() {
-        "request" => Ok(Phase::Request),
-        "response" => Ok(Phase::Response),
-        "ws_frame" | "wsframe" | "frame" => Ok(Phase::WsFrame),
-        "any" => Ok(Phase::Any),
-        other => anyhow::bail!("unknown phase {other:?} (request|response|ws_frame|any)"),
-    }
-}
-
+/// Parse a ws_dir token via the shared helper; also the `dir` arg of `ws.send`.
 fn parse_dir(s: &str) -> anyhow::Result<WsDir> {
-    match s.to_ascii_lowercase().as_str() {
-        "c2s" | "client_to_server" | "clienttoserver" => Ok(WsDir::ClientToServer),
-        "s2c" | "server_to_client" | "servertoclient" => Ok(WsDir::ServerToClient),
-        other => anyhow::bail!("unknown ws_dir {other:?} (c2s|s2c)"),
-    }
+    bus::parse_ws_dir(s)
 }
 
-fn parse_url(v: Option<&Value>) -> anyhow::Result<Option<UrlMatch>> {
-    match v {
-        None => Ok(None),
-        Some(Value::Str(s)) => Ok(Some(UrlMatch::Wildcard(s.clone()))),
-        Some(Value::Object(o)) => match (o.get("wildcard"), o.get("regex")) {
-            (Some(Value::Str(s)), None) => Ok(Some(UrlMatch::Wildcard(s.clone()))),
-            (None, Some(Value::Str(s))) => Ok(Some(UrlMatch::Regex(s.clone()))),
-            _ => anyhow::bail!("rule `url` object must be {{wildcard:str}} or {{regex:str}}"),
-        },
-        Some(other) => anyhow::bail!("rule `url` must be a string or object, got {other:?}"),
-    }
-}
-
-fn parse_host(v: Option<&Value>) -> anyhow::Result<Option<HostMatch>> {
-    match v {
-        None => Ok(None),
-        Some(Value::Str(s)) => Ok(Some(HostMatch::Exact(s.clone()))),
-        Some(Value::Object(o)) => match (o.get("exact"), o.get("wildcard")) {
-            (Some(Value::Str(s)), None) => Ok(Some(HostMatch::Exact(s.clone()))),
-            (None, Some(Value::Str(s))) => Ok(Some(HostMatch::Wildcard(s.clone()))),
-            _ => anyhow::bail!("rule `host` object must be {{exact:str}} or {{wildcard:str}}"),
-        },
-        Some(other) => anyhow::bail!("rule `host` must be a string or object, got {other:?}"),
-    }
-}
-
-/// Echo a compiled rule back to the caller as `{id, phase, ws_dir?}`.
+/// Echo a compiled rule back to the caller as `{id, phase, ws_dir?}`, using the
+/// shared canonical tokens so every rule surface agrees.
 fn echo_rule(cr: &CompiledRule) -> Value {
     let rule = cr.rule();
     let mut obj = std::collections::BTreeMap::new();
     obj.insert("id".to_string(), Value::Str(rule.id.clone()));
     obj.insert(
         "phase".to_string(),
-        Value::Str(phase_str(rule.condition.phase).to_string()),
+        Value::Str(bus::phase_token(rule.condition.phase).to_string()),
     );
     if let Some(dir) = rule.condition.ws_dir {
-        obj.insert("ws_dir".to_string(), Value::Str(dir_str(dir).to_string()));
+        obj.insert(
+            "ws_dir".to_string(),
+            Value::Str(bus::ws_dir_token(dir).to_string()),
+        );
     }
     Value::Object(obj)
-}
-
-fn phase_str(p: Phase) -> &'static str {
-    match p {
-        Phase::Request => "request",
-        Phase::Response => "response",
-        Phase::WsFrame => "ws_frame",
-        Phase::Any => "any",
-    }
-}
-
-fn dir_str(d: WsDir) -> &'static str {
-    match d {
-        WsDir::ClientToServer => "c2s",
-        WsDir::ServerToClient => "s2c",
-    }
 }
 
 fn parse_opcode(s: &str) -> anyhow::Result<WsOpcode> {
@@ -677,6 +583,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aitm_rules::{HostMatch, UrlMatch};
     use std::collections::BTreeMap;
 
     fn obj(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
@@ -726,7 +633,7 @@ mod tests {
 
     #[test]
     fn unknown_phase_and_dir_are_errors() {
-        assert!(parse_phase("bogus").is_err());
+        assert!(bus::parse_phase("bogus").is_err());
         assert!(parse_dir("sideways").is_err());
         assert!(parse_opcode("nope").is_err());
     }

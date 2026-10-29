@@ -47,6 +47,14 @@ use aitm_rules::{compile, CompiledRule, Phase, Rule};
 
 use crate::action::{action_to_value, condition_to_value, content_type_for, parse_map};
 
+/// Flow mark set once a Map Remote rewrite has been applied to a request. The proxy
+/// fires both `Event::RequestHeaders` and `Event::Request` for one request; a
+/// URL/path-matched remote rule still matches the (path-unchanged) flow on the
+/// second event, so without this mark its rewritten authority would pass
+/// [`ScopeRateGuard::check_active`] twice — double-charging the rate budget. The
+/// mark makes the guard consultation idempotent: once marked, the flow is skipped.
+const MAP_REMOTE_MARK: &str = "map-remote";
+
 /// One stored Map rule: its id, kind, compiled match condition, action, and —
 /// for a `local` rule — the resolved, confinement-checked file path.
 struct MapEntry {
@@ -142,8 +150,13 @@ impl Plugin for MapRulesPlugin {
             return Verdict::Continue;
         }
         match ctx.flow() {
-            Flow::Http(f) if f.response.is_none() => {}
-            // A non-HTTP flow or one already answered: nothing to serve.
+            // A fresh HTTP flow with no response yet, not already rewritten. Once a
+            // Map Remote rewrite has marked the flow, skip it: re-matching on the
+            // second request event would charge the scope guard a second time.
+            Flow::Http(f)
+                if f.response.is_none()
+                    && !f.metadata.marks.iter().any(|m| m == MAP_REMOTE_MARK) => {}
+            // A non-HTTP flow, one already answered, or one already rewritten.
             _ => return Verdict::Continue,
         }
 
@@ -282,6 +295,11 @@ fn apply_remote(flow: &mut Flow, plan: &RemotePlan) {
     // first to replace it rather than leave the old host ahead of the new one.
     f.request.headers.remove("host");
     f.request.headers.set("host", &plan.authority);
+    // Mark the rewrite so the next request event does not re-match and re-charge
+    // the scope guard for this same request.
+    if !f.metadata.marks.iter().any(|m| m == MAP_REMOTE_MARK) {
+        f.metadata.marks.push(MAP_REMOTE_MARK.to_string());
+    }
 }
 
 /// Build the response a `local` rule serves. Reads the confined file; a read
