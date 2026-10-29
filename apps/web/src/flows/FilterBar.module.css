@@ -1,0 +1,109 @@
+.bar {
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--color-line-border);
+  background: var(--color-ground-surface);
+  padding: 4px 10px;
+  gap: 2px;
+}
+.row {
+  height: var(--size-control);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.mode {
+  display: inline-flex;
+  border: 1px solid var(--color-line-control);
+  border-radius: var(--radius-control);
+  overflow: hidden;
+  flex: none;
+  height: 24px;
+}
+.mode button {
+  height: 100%;
+  padding: 0 7px;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+  letter-spacing: 0.02em;
+}
+.mode button + button {
+  border-left: 1px solid var(--color-line-control);
+}
+.mode button[aria-pressed='true'] {
+  background: var(--color-ground-raised);
+  color: var(--color-text-primary);
+}
+.modeGhost {
+  width: 56px;
+  flex: none;
+}
+.select,
+.input {
+  height: 24px;
+  border: 1px solid var(--color-line-control);
+  border-radius: var(--radius-control);
+  background: var(--color-ground-surface);
+  color: var(--color-text-primary);
+  font-size: var(--font-size-sm);
+  padding: 0 6px;
+}
+.selectWrap {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+}
+.selectWrap > svg {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--color-text-tertiary);
+  pointer-events: none;
+}
+.select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 20px;
+  width: 100%;
+}
+.field {
+  width: 132px;
+  flex: none;
+}
+.op {
+  width: 120px;
+  flex: none;
+}
+.input {
+  flex: 1;
+  min-width: 80px;
+  max-width: 420px;
+  font-family: var(--font-data);
+  caret-color: var(--color-accent-base);
+}
+.input::placeholder {
+  color: var(--color-text-tertiary);
+  font-family: var(--font-ui);
+}
+.select:focus-visible,
+.input:focus-visible {
+  outline: 2px solid var(--color-line-focus);
+  outline-offset: -1px;
+  border-radius: var(--radius-control);
+}
+.iconBtn {
+  width: 24px;
+  height: 24px;
+  min-width: 0;
+  padding: 0;
+  color: var(--color-text-tertiary);
+}
+.hint {
+  margin-left: auto;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-tertiary);
+  white-space: nowrap;
+}

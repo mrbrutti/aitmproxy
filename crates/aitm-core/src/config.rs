@@ -30,6 +30,18 @@ pub struct Config {
     /// `max_flows`, so a few very large captures cannot exhaust memory while under
     /// the flow-count cap.
     pub max_flow_bytes: usize,
+    /// Per-host TLS passthrough (M6 F11). Deny-by-default: the list is empty and
+    /// agent authoring is off, so nothing is tunnelled past MITM until the
+    /// operator names a host.
+    pub tls: TlsConfig,
+    /// Map Local/Remote rules (M6). Deny-by-default: no map root and agent
+    /// authoring off, so Map Local is unusable and no agent may author maps until
+    /// the operator opts in.
+    pub maps: MapsConfig,
+    /// Session/flow file I/O (M6 F10). Deny-by-default: an agent (MCP) frontend
+    /// may not read or write a host path via `session.save`/`session.load`/
+    /// `flow.export`/`flow.import` until the operator opts in.
+    pub session_io: SessionIoConfig,
 }
 
 impl Default for Config {
@@ -45,8 +57,56 @@ impl Default for Config {
             ssl_insecure: false,
             max_flows: crate::store::DEFAULT_MAX_FLOWS,
             max_flow_bytes: crate::store::DEFAULT_MAX_FLOW_BYTES,
+            tls: TlsConfig::default(),
+            maps: MapsConfig::default(),
+            session_io: SessionIoConfig::default(),
         }
     }
+}
+
+/// Per-host TLS passthrough configuration (M6 F11). A passthrough host is
+/// tunnelled byte-for-byte without MITM, so the client speaks TLS to the real
+/// upstream and the proxy captures no decrypted flow for it.
+#[derive(Debug, Clone, Default)]
+pub struct TlsConfig {
+    /// Hosts (or `*.wildcard`) to tunnel past MITM. **Empty by default**: every
+    /// host is MITM'd until the operator pins one here.
+    pub passthrough: Vec<String>,
+    /// Let an agent frontend (MCP) change the passthrough list with
+    /// `tls.passthrough.add`/`remove`. **Off by default**: pinning a host out of
+    /// MITM is an authorisation decision, so only the human CLI may do it unless
+    /// the operator opts in — mirrors [`ScopeConfig::allow_agent_widen`].
+    pub allow_agent_passthrough: bool,
+}
+
+/// Map Local/Remote configuration (M6). Map rules rewrite or mock matching
+/// requests; both the map root (confining Map Local file reads) and agent
+/// authoring default to the deny-by-default posture.
+#[derive(Debug, Clone, Default)]
+pub struct MapsConfig {
+    /// The directory Map Local files are confined to. **`None` by default**: with
+    /// no root, a `map.add` for a local file is rejected (nothing to confine it
+    /// to), so Map Local is unusable until the operator sets a root.
+    pub root: Option<PathBuf>,
+    /// Let an agent frontend (MCP) author map rules with `map.add`/`map.remove`.
+    /// **Off by default**: a map rule redirects or mocks traffic, an
+    /// authorisation decision, so only the human CLI may author one unless the
+    /// operator opts in — mirrors [`ScopeConfig::allow_agent_widen`].
+    pub allow_agent_authoring: bool,
+}
+
+/// Session/flow file-I/O configuration (M6 F10). `session.save`/`session.load`/
+/// `flow.export`/`flow.import` can read or overwrite an arbitrary host path, so an
+/// agent (MCP) frontend is refused a path-bearing call unless the operator opts in.
+#[derive(Debug, Clone, Default)]
+pub struct SessionIoConfig {
+    /// Let an agent (MCP) frontend read/write a host path through the session/flow
+    /// I/O commands. **Off by default**: reading or overwriting a host file is an
+    /// authorisation decision, so only the human CLI may hand those commands a path
+    /// unless the operator opts in — mirrors [`ScopeConfig::allow_agent_widen`]. An
+    /// agent may still export to / import from in-memory `bytes` (no host path),
+    /// which stays passive.
+    pub allow_agent_file_io: bool,
 }
 
 /// PoC-engine configuration.
@@ -54,14 +114,26 @@ impl Default for Config {
 pub struct PocConfig {
     /// When set, `poc.run` only loads a PoC file that resolves (canonicalized)
     /// to a path under this directory. `None` (the default) imposes no
-    /// confinement — a PoC may be loaded from any path, as before.
+    /// confinement — a PoC may be loaded from any path, as before. `poc.list`
+    /// and `poc.get` enumerate/read the PoC library under this directory.
     pub dir: Option<PathBuf>,
+    /// Where `poc.run` writes its artifacts (the YAML copy and screenshot).
+    /// `None` (the default) writes to the system temp directory as before.
+    /// `poc.artifact` only serves files confined to this directory, so a
+    /// remote/web surface can read run artifacts safely.
+    pub out_dir: Option<PathBuf>,
 }
 
 /// Scope configuration. Deny-by-default: an empty list means nothing is active.
 #[derive(Debug, Clone, Default)]
 pub struct ScopeConfig {
     pub entries: Vec<ScopeEntry>,
+    /// Let an agent frontend (MCP) widen scope with `scope.add`. **Off by
+    /// default**: adding a host to scope is an authorisation decision, so only
+    /// the human CLI may do it unless the operator opts in — mirrors
+    /// [`CaConfig::allow_agent_install`]. `scope.remove` (which only narrows
+    /// scope) is never gated.
+    pub allow_agent_widen: bool,
 }
 
 /// One scope entry: a host, `host:port`, or `*.wildcard`.

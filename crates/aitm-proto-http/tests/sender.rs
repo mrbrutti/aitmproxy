@@ -58,6 +58,43 @@ fn get(addr: SocketAddr, path: &str) -> HttpRequest {
     }
 }
 
+/// M3 security review: an upstream that accepts and never answers (or
+/// trickles bytes) cannot hold the sender open past its overall response
+/// deadline — the per-read timeout alone would reset on every byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_upstream_hits_the_response_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut s).await;
+        // Trickle one header byte every 50ms, forever: each read succeeds, so
+        // only the overall deadline can end this.
+        for b in b"HTTP/1.1 200 OK\r\nX-Slow: ".iter().cycle() {
+            if s.write_all(&[*b]).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let err = Http1Sender::new()
+        .with_response_timeout(std::time::Duration::from_millis(400))
+        .send(&get(addr, "/"))
+        .await
+        .expect_err("a response that never completes must time out");
+    let elapsed = started.elapsed();
+    assert!(
+        err.to_string().contains("timed out"),
+        "the error names the deadline: {err}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "the deadline, not the trickle, ends the exchange: {elapsed:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn decodes_a_chunked_response() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

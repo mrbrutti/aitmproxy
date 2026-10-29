@@ -1,0 +1,5 @@
+node_modules/
+dist/
+# generated from docs/design/tokens.json by scripts/gen-tokens.mjs
+src/styles/tokens.css
+.cua-shots/

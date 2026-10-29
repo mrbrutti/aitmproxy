@@ -1,6 +1,6 @@
 //! Task 28 / AC7 / AC8, M2 Task 21 / M2-AC17: the real wired command set,
-//! exercised through both frontends. Proves the exact 22-tool `tools/list`
-//! (the 18 M1 tools plus `ca.*`), that the six `browser.*` schemas match the
+//! exercised through both frontends. Proves the exact `tools/list` (the M2 tools
+//! plus the operator-command additions), that the six `browser.*` schemas match the
 //! checked-in snapshot, that an open `headers` map (TypeDesc::Map) round-trips
 //! through MCP and the CLI into a mutated flow, and that poc.run's `vars` map
 //! is coerced rather than rejected.
@@ -19,14 +19,22 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 22] = [
+const EXPECTED_TOOLS: [&str; 47] = [
     "flow.list",
     "flow.get",
+    "flow.detail",
     "flow.replay",
     "flow.intercept",
     "flow.resume",
     "flow.kill",
     "flow.mutate",
+    "flow.mark",
+    "flow.comment",
+    "flow.clear",
+    "proxy.status",
+    "proxy.pause",
+    "proxy.resume",
+    "config.get",
     "request.send",
     "browser.navigate",
     "browser.click",
@@ -36,12 +44,31 @@ const EXPECTED_TOOLS: [&str; 22] = [
     "browser.get_dom",
     "poc.build",
     "poc.run",
+    "poc.list",
+    "poc.get",
+    "poc.artifact",
     "scope.add",
+    "scope.remove",
     "scope.list",
     "ca.export",
     "ca.install",
     "ca.status",
     "ca.uninstall",
+    // M6 parity additions (Task 14 convergence): F9 WebSocket control, F10
+    // sessions/HAR import-export, F11 TLS passthrough, Map Local/Remote.
+    "ws.intercept",
+    "ws.frame",
+    "ws.send",
+    "session.save",
+    "session.load",
+    "flow.export",
+    "flow.import",
+    "tls.passthrough.list",
+    "tls.passthrough.add",
+    "tls.passthrough.remove",
+    "map.add",
+    "map.list",
+    "map.remove",
 ];
 
 /// The six `browser.*` tool schemas as M1 shipped them, keyed by tool name.
@@ -49,6 +76,28 @@ const EXPECTED_TOOLS: [&str; 22] = [
 const BROWSER_SCHEMAS_SNAPSHOT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/browser-tool-schemas.json"
+);
+
+/// The 12 operator-command tools (F5/F6/F7/F12/F13) whose input schemas the three
+/// surfaces build their forms from; pinned so a shape change is a deliberate edit.
+const OPERATOR_TOOLS: [&str; 12] = [
+    "flow.detail",
+    "flow.mark",
+    "flow.comment",
+    "flow.clear",
+    "proxy.status",
+    "proxy.pause",
+    "proxy.resume",
+    "config.get",
+    "scope.remove",
+    "poc.list",
+    "poc.get",
+    "poc.artifact",
+];
+
+const OPERATOR_SCHEMAS_SNAPSHOT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/operator-tool-schemas.json"
 );
 
 fn temp_ca_dir(tag: &str) -> PathBuf {
@@ -117,7 +166,7 @@ fn rpc(server: &McpServer, id: u64, method: &str, params: JsonValue) -> JsonValu
 }
 
 #[test]
-fn ac7_exact_twenty_two_tools() {
+fn ac7_exact_tool_set() {
     let proxy = build_proxy(&config("ac7")).expect("build proxy");
     let server = McpServer::new(proxy.registry_arc(), McpTransport::Stdio);
     let resp = rpc(&server, 1, "tools/list", json!({}));
@@ -131,7 +180,7 @@ fn ac7_exact_twenty_two_tools() {
     expected.sort();
     assert_eq!(
         names, expected,
-        "tools/list must be exactly the 18 M1 tools plus the four ca.* tools"
+        "tools/list must be exactly the M2 tools plus the operator-command additions"
     );
 
     // The browser.* schemas are byte-for-byte M1's: compare the six
@@ -161,6 +210,37 @@ fn ac7_exact_twenty_two_tools() {
         JsonValue::Object(actual),
         snapshot,
         "browser.* schemas drifted from the M1 snapshot; actual:\n{actual_text}\n"
+    );
+
+    // The 12 operator-command input schemas, keyed by name, against their snapshot.
+    let operator: serde_json::Map<String, JsonValue> = tools
+        .iter()
+        .filter(|t| {
+            t["name"]
+                .as_str()
+                .is_some_and(|n| OPERATOR_TOOLS.contains(&n))
+        })
+        .map(|t| {
+            (
+                t["name"].as_str().unwrap().to_string(),
+                t["inputSchema"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        operator.len(),
+        OPERATOR_TOOLS.len(),
+        "all operator tools present: {:?}",
+        operator.keys()
+    );
+    let operator_text = serde_json::to_string_pretty(&operator).expect("serialize schemas");
+    let operator_snapshot = std::fs::read_to_string(OPERATOR_SCHEMAS_SNAPSHOT).unwrap_or_else(|e| {
+        panic!("read snapshot {OPERATOR_SCHEMAS_SNAPSHOT}: {e}\nactual schemas:\n{operator_text}\n")
+    });
+    assert_eq!(
+        JsonValue::Object(operator),
+        serde_json::from_str::<JsonValue>(&operator_snapshot).expect("snapshot is JSON"),
+        "operator-command schemas drifted; actual:\n{operator_text}\n"
     );
 
     // The headers map derives an open-object JSON Schema (TypeDesc::Map).
@@ -306,4 +386,138 @@ fn poc_run_vars_map_is_coerced_not_rejected() {
             || text.contains("stat"),
         "vars must coerce and the command fail on the file, got: {text}"
     );
+}
+
+/// config.get reaches the control plugin over BOTH frontends only when the
+/// frontend attached the config — the plumbing main.rs does for each.
+#[test]
+fn config_get_reaches_plugins_over_both_frontends() {
+    let cfg = config("cfgget");
+    let proxy = build_proxy(&cfg).expect("build proxy");
+    let store = proxy.store();
+    let client: Arc<dyn ProxyClient> = Arc::new(UnusedClient);
+
+    // MCP: with_config set -> redacted config comes back; the token never does.
+    let server = McpServer::new(proxy.registry_arc(), McpTransport::Stdio)
+        .with_config(Arc::new(cfg.clone()))
+        .with_services(store.clone(), client.clone(), proxy.guard(), None);
+    let resp = rpc(
+        &server,
+        1,
+        "tools/call",
+        json!({"name": "config.get", "arguments": {}}),
+    );
+    assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+    let got = &resp["result"]["structuredContent"];
+    assert_eq!(got["listen"], json!(cfg.listen.to_string()));
+    assert_eq!(got["scope"]["entries"][0], json!("ex.test:80"));
+    assert!(
+        !resp.to_string().contains("token"),
+        "config.get must not leak any token field"
+    );
+
+    // MCP without config -> a clear tool error, not a panic or empty object.
+    let server_no_cfg = McpServer::new(proxy.registry_arc(), McpTransport::Stdio).with_services(
+        store.clone(),
+        client.clone(),
+        proxy.guard(),
+        None,
+    );
+    let resp = rpc(
+        &server_no_cfg,
+        2,
+        "tools/call",
+        json!({"name": "config.get", "arguments": {}}),
+    );
+    assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+
+    // CLI: with_config set -> the same redacted view.
+    let cli = aitm_cli::Cli::new(proxy.registry_arc())
+        .with_config(Arc::new(cfg.clone()))
+        .with_services(store, client, proxy.guard(), None);
+    let value = cli
+        .dispatch(&["config".to_string(), "get".to_string()])
+        .expect("cli config.get");
+    let text = format!("{value:?}");
+    assert!(
+        text.contains(&cfg.listen.to_string()),
+        "cli config.get: {text}"
+    );
+}
+
+/// Wire-level proof of the default-off scope gate: an assembled proxy refuses an
+/// MCP `scope.add` under `Config::default()`, and accepts it once the operator
+/// sets `scope.allow_agent_widen` (covers the wire.rs plumbing of the flag).
+#[test]
+fn scope_add_gate_is_wired_default_off() {
+    // Default config: the flag is off, so the agent (MCP) frontend is refused.
+    let mut cfg = config("gate-off");
+    cfg.scope.allow_agent_widen = false;
+    let proxy = build_proxy(&cfg).expect("build proxy");
+    let store = proxy.store();
+    let client: Arc<dyn ProxyClient> = Arc::new(UnusedClient);
+    let server = McpServer::new(proxy.registry_arc(), McpTransport::Stdio).with_services(
+        store,
+        client,
+        proxy.guard(),
+        None,
+    );
+    let resp = rpc(
+        &server,
+        1,
+        "tools/call",
+        json!({"name": "scope.add", "arguments": {"host": "new.test"}}),
+    );
+    assert_eq!(
+        resp["result"]["isError"],
+        json!(true),
+        "MCP scope.add must be refused when allow_agent_widen is off: {resp}"
+    );
+
+    // With the flag on, the same MCP call is accepted.
+    let mut cfg2 = config("gate-on");
+    cfg2.scope.allow_agent_widen = true;
+    let proxy2 = build_proxy(&cfg2).expect("build proxy");
+    let store2 = proxy2.store();
+    let client2: Arc<dyn ProxyClient> = Arc::new(UnusedClient);
+    let server2 = McpServer::new(proxy2.registry_arc(), McpTransport::Stdio).with_services(
+        store2,
+        client2,
+        proxy2.guard(),
+        None,
+    );
+    let resp2 = rpc(
+        &server2,
+        1,
+        "tools/call",
+        json!({"name": "scope.add", "arguments": {"host": "new.test"}}),
+    );
+    assert_eq!(
+        resp2["result"]["isError"],
+        json!(false),
+        "MCP scope.add must be accepted when allow_agent_widen is on: {resp2}"
+    );
+}
+
+/// Startup guard: a PoC output dir that equals (or contains) the CA directory is
+/// refused, so `poc.artifact` can never be pointed at the CA key.
+#[test]
+fn assemble_rejects_out_dir_containing_ca_dir() {
+    let assemble_err = |cfg: &Config| match aitm::wire::assemble(cfg) {
+        Ok(_) => panic!("assemble should have been refused"),
+        Err(e) => e.to_string(),
+    };
+
+    // out_dir == ca.dir is the clearest footgun.
+    let mut cfg = config("ca-guard");
+    cfg.poc.out_dir = Some(cfg.ca.dir.clone());
+    assert!(
+        assemble_err(&cfg).contains("poc.out_dir"),
+        "error should name poc.out_dir"
+    );
+
+    // A parent-of-ca.dir out_dir is refused too.
+    let mut cfg2 = config("ca-guard2");
+    cfg2.poc.out_dir = cfg2.ca.dir.parent().map(|p| p.to_path_buf());
+    assert!(assemble_err(&cfg2).contains("poc.out_dir"));
 }

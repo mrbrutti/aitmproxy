@@ -30,8 +30,9 @@ pub use chain::Chain;
 pub use client::{PipelineClient, RequestSender};
 pub use command::{Command, ParamDef, ParamSchema, TypeDesc};
 pub use config::{
-    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, LimitConfig, McpConfig,
-    McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SsrfPolicy,
+    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, LimitConfig, MapsConfig,
+    McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SessionIoConfig,
+    SsrfPolicy, TlsConfig,
 };
 pub use ctx::{
     BrowserDriver, ClickTarget, CommandHost, FlowCtx, Frontend, NavOutcome, ProxyClient,
@@ -48,7 +49,7 @@ pub use plugin::Plugin;
 pub use protocol::{EventSink, ModuleCtx, NextLayerHint, ProtocolModule, UpstreamConnector};
 pub use proxy::{Proxy, ProxyBuilder};
 pub use registry::Registry;
-pub use store::{FlowKind, FlowQuery, FlowStore, MemFlowStore};
+pub use store::{ClearOutcome, FlowKind, FlowQuery, FlowStore, MemFlowStore};
 pub use stream::{AsyncReadWrite, ByteStream};
 pub use value::{Params, Value};
 

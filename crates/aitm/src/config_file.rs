@@ -9,6 +9,7 @@
 //!
 //! Keys mirror the Rust field names. Durations are integer seconds.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -17,9 +18,11 @@ use anyhow::{bail, Context as _};
 use serde::Deserialize;
 
 use aitm_core::{
-    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, LimitConfig, McpConfig,
-    McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SsrfPolicy,
+    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, LimitConfig, MapsConfig,
+    McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SessionIoConfig,
+    SsrfPolicy, TlsConfig, Value,
 };
+use aitm_plugin_rhai::{RhaiConfig, ScriptEntry};
 use aitm_proto_l4::config::L4Config;
 
 /// `<config_dir>/aitmproxy/config.yaml`: a sibling of the CA dir with the
@@ -29,51 +32,73 @@ pub fn default_config_path() -> PathBuf {
     CaConfig::default().audit_log.with_file_name("config.yaml")
 }
 
-/// Load the config file as the core [`Config`] only. See [`load_full`] for the
-/// variant that also returns the L4 module config.
-pub fn load(path: Option<&Path>) -> anyhow::Result<Config> {
-    load_full(path).map(|(cfg, _l4)| cfg)
+/// Everything one config file configures: the proxy itself, the scripting tier,
+/// and the L4 module. They are separate types — `aitm_core` knows nothing about
+/// Rhai or L4 (no `aitm-core` edits, AC19) — but come from one file and one parse,
+/// so a misspelled scripting or L4 knob is refused the same way a browser one is.
+#[derive(Debug, Clone)]
+pub struct Settings {
+    pub core: Config,
+    pub rhai: RhaiConfig,
+    pub l4: L4Config,
 }
 
-/// Load the config file into the core [`Config`] and the L4 module [`L4Config`].
-/// `None` reads [`default_config_path`], where an absent file means the defaults
-/// (today's behaviour, with L4 disabled); `Some(p)` must exist, and the error names
-/// `p`. The L4 section lives outside `aitm-core`, so it rides alongside here rather
+/// Load the config file as the core [`Config`] only.
+pub fn load(path: Option<&Path>) -> anyhow::Result<Config> {
+    load_settings(path).map(|s| s.core)
+}
+
+/// Load the core [`Config`] and the L4 module [`L4Config`] (for callers that wire
+/// L4). The L4 section lives outside `aitm-core`, so it rides alongside here rather
 /// than inside `Config` (keeping `aitm-core` untouched, AC19).
 pub fn load_full(path: Option<&Path>) -> anyhow::Result<(Config, L4Config)> {
+    load_settings(path).map(|s| (s.core, s.l4))
+}
+
+/// [`load`], keeping the scripting-tier and L4 settings too. `None` reads
+/// [`default_config_path`], where an absent file means defaults (L4 disabled);
+/// `Some(p)` must exist, and the error names `p`.
+pub fn load_settings(path: Option<&Path>) -> anyhow::Result<Settings> {
     let Some(path) = path else {
         let path = default_config_path();
         return match std::fs::read_to_string(&path) {
             Ok(text) => {
-                parse_full(&text).with_context(|| format!("in config file {}", path.display()))
+                parse_settings(&text).with_context(|| format!("in config file {}", path.display()))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Ok((Config::default(), L4Config::default()))
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings {
+                core: Config::default(),
+                rhai: RhaiConfig::default(),
+                l4: L4Config::default(),
+            }),
             Err(e) => Err(e).with_context(|| format!("reading config file {}", path.display())),
         };
     };
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading config file {}", path.display()))?;
-    parse_full(&text).with_context(|| format!("in config file {}", path.display()))
+    parse_settings(&text).with_context(|| format!("in config file {}", path.display()))
 }
 
 /// Parse YAML into the core [`Config`] only. See [`parse_full`] for the L4 variant.
 pub fn parse(yaml: &str) -> anyhow::Result<Config> {
-    parse_full(yaml).map(|(cfg, _l4)| cfg)
+    parse_settings(yaml).map(|s| s.core)
 }
 
-/// Parse YAML into the core [`Config`] and the L4 module [`L4Config`]: unknown keys
-/// are errors (including under `l4`, which maps to `L4Config`'s own
-/// `deny_unknown_fields`), as is a value the file may not set (`ca.key_mode` wider
-/// than the owner); absent keys keep their default value. An absent `l4` section is
-/// `L4Config::default()` — disabled, fail-closed.
+/// Parse the core [`Config`] and the L4 module [`L4Config`].
 pub fn parse_full(yaml: &str) -> anyhow::Result<(Config, L4Config)> {
+    parse_settings(yaml).map(|s| (s.core, s.l4))
+}
+
+/// [`parse`], keeping the scripting-tier and L4 settings too: unknown keys are
+/// errors (including under `l4`, which maps to `L4Config`'s own
+/// `deny_unknown_fields`); absent keys keep their default value; an absent `l4`
+/// section is `L4Config::default()` — disabled, fail-closed.
+pub fn parse_settings(yaml: &str) -> anyhow::Result<Settings> {
     let file: ConfigFile = serde_yaml::from_str(yaml).context("parsing config YAML")?;
     let l4 = file.l4.clone().unwrap_or_default();
-    let mut cfg = Config::default();
-    file.apply(&mut cfg)?;
-    Ok((cfg, l4))
+    let mut core = Config::default();
+    let mut rhai = RhaiConfig::default();
+    file.apply(&mut core, &mut rhai)?;
+    Ok(Settings { core, rhai, l4 })
 }
 
 /// Overwrite `slot` only when the file set the key.
@@ -108,10 +133,20 @@ struct ConfigFile {
     /// take their fail-closed defaults and a misspelled `l4.*` key is an error.
     /// Lives outside `Config` to keep `aitm-core` untouched (AC19).
     l4: Option<L4Config>,
+    /// The scripts to load, in chain order (M3 spec §8).
+    scripts: Option<Vec<ScriptFile>>,
+    /// The scripting sandbox: limits, the per-hook budget, the error policy.
+    rhai: Option<RhaiFile>,
+    /// Per-host TLS passthrough (M6 F11).
+    tls: Option<TlsFile>,
+    /// Map Local/Remote rules (M6).
+    maps: Option<MapsFile>,
+    /// Session/flow file I/O agent gate (M6 F10).
+    session_io: Option<SessionIoFile>,
 }
 
 impl ConfigFile {
-    fn apply(self, c: &mut Config) -> anyhow::Result<()> {
+    fn apply(self, c: &mut Config, r: &mut RhaiConfig) -> anyhow::Result<()> {
         set(&mut c.listen, self.listen);
         if let Some(s) = self.scope {
             s.apply(&mut c.scope);
@@ -134,8 +169,185 @@ impl ConfigFile {
         set(&mut c.ssl_insecure, self.ssl_insecure);
         set(&mut c.max_flows, self.max_flows);
         set(&mut c.max_flow_bytes, self.max_flow_bytes);
+        if let Some(scripts) = self.scripts {
+            r.scripts = scripts
+                .into_iter()
+                .map(ScriptFile::into_entry)
+                .collect::<anyhow::Result<_>>()?;
+        }
+        if let Some(rhai) = self.rhai {
+            rhai.apply(r);
+        }
+        if let Some(tls) = self.tls {
+            tls.apply(&mut c.tls);
+        }
+        if let Some(maps) = self.maps {
+            maps.apply(&mut c.maps);
+        }
+        if let Some(session_io) = self.session_io {
+            session_io.apply(&mut c.session_io);
+        }
         Ok(())
     }
+}
+
+/// The `tls:` section (M6 F11): the passthrough host list and the agent gate.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TlsFile {
+    /// Hosts (or `*.wildcard`) tunnelled past MITM.
+    passthrough: Option<Vec<String>>,
+    /// Let an agent (MCP) frontend change the passthrough list. Off by default.
+    allow_agent_passthrough: Option<bool>,
+}
+
+impl TlsFile {
+    fn apply(self, c: &mut TlsConfig) {
+        set(&mut c.passthrough, self.passthrough);
+        set(&mut c.allow_agent_passthrough, self.allow_agent_passthrough);
+    }
+}
+
+/// The `maps:` section (M6): the Map Local confinement root and the agent gate.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MapsFile {
+    /// Directory Map Local files are confined to.
+    root: Option<PathBuf>,
+    /// Let an agent (MCP) frontend author map rules. Off by default.
+    allow_agent_authoring: Option<bool>,
+}
+
+impl MapsFile {
+    fn apply(self, c: &mut MapsConfig) {
+        if let Some(root) = self.root {
+            c.root = Some(root);
+        }
+        set(&mut c.allow_agent_authoring, self.allow_agent_authoring);
+    }
+}
+
+/// The `session_io:` section (M6 F10): the agent file-I/O gate.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionIoFile {
+    /// Let an agent (MCP) frontend read/write a host path via the session/flow I/O
+    /// commands. Off by default.
+    allow_agent_file_io: Option<bool>,
+}
+
+impl SessionIoFile {
+    fn apply(self, c: &mut SessionIoConfig) {
+        set(&mut c.allow_agent_file_io, self.allow_agent_file_io);
+    }
+}
+
+/// One `scripts:` entry: `- path: addons/tagger.rhai` plus the options handed
+/// to that script and whether it is loaded at all.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScriptFile {
+    path: PathBuf,
+    options: Option<serde_yaml::Mapping>,
+    enabled: Option<bool>,
+}
+
+impl ScriptFile {
+    fn into_entry(self) -> anyhow::Result<ScriptEntry> {
+        let mut options = BTreeMap::new();
+        for (key, value) in self.options.unwrap_or_default() {
+            let name = key.as_str().map(str::to_string).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "script option names under `{}` must be strings",
+                    self.path.display()
+                )
+            })?;
+            let value = yaml_to_value(value).with_context(|| {
+                format!(
+                    "script option `{name}` of `{}` is not a value a script can read",
+                    self.path.display()
+                )
+            })?;
+            options.insert(name, value);
+        }
+        Ok(ScriptEntry {
+            path: self.path,
+            options,
+            enabled: self.enabled.unwrap_or(true),
+        })
+    }
+}
+
+/// The `rhai:` section: the sandbox limits (spec §7), the per-hook wall-clock
+/// budget, and the compile-error policy.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RhaiFile {
+    /// Fail startup on a compile error instead of skipping the script.
+    strict: Option<bool>,
+    /// Let plugin scripts widen the scope with `scope.add(...)` (off by default).
+    allow_scope_add: Option<bool>,
+    /// Seconds a single hook may run before it is aborted.
+    hook_timeout: Option<u64>,
+    max_operations: Option<u64>,
+    max_call_levels: Option<usize>,
+    max_expr_depth: Option<usize>,
+    max_function_expr_depth: Option<usize>,
+    max_string_size: Option<usize>,
+    max_array_size: Option<usize>,
+    max_map_size: Option<usize>,
+    max_modules: Option<usize>,
+}
+
+impl RhaiFile {
+    fn apply(self, r: &mut RhaiConfig) {
+        set(&mut r.strict, self.strict);
+        set(&mut r.allow_scope_add, self.allow_scope_add);
+        set_secs(&mut r.hook_timeout, self.hook_timeout);
+        let l = &mut r.limits;
+        set(&mut l.max_operations, self.max_operations);
+        set(&mut l.max_call_levels, self.max_call_levels);
+        set(&mut l.max_expr_depth, self.max_expr_depth);
+        set(&mut l.max_function_expr_depth, self.max_function_expr_depth);
+        set(&mut l.max_string_size, self.max_string_size);
+        set(&mut l.max_array_size, self.max_array_size);
+        set(&mut l.max_map_size, self.max_map_size);
+        set(&mut l.max_modules, self.max_modules);
+    }
+}
+
+/// A script option as written in YAML, as the `Value` a script reads back
+/// through `option(name)`. Anything without a `Value` counterpart (a YAML tag)
+/// is refused rather than silently dropped.
+fn yaml_to_value(y: serde_yaml::Value) -> anyhow::Result<Value> {
+    Ok(match y {
+        serde_yaml::Value::Null => Value::Null,
+        serde_yaml::Value::Bool(b) => Value::Bool(b),
+        serde_yaml::Value::Number(n) => match (n.as_i64(), n.as_f64()) {
+            (Some(i), _) => Value::Int(i),
+            (None, Some(f)) => Value::Float(f),
+            (None, None) => bail!("`{n}` is not a number a script can read"),
+        },
+        serde_yaml::Value::String(s) => Value::Str(s),
+        serde_yaml::Value::Sequence(items) => Value::Array(
+            items
+                .into_iter()
+                .map(yaml_to_value)
+                .collect::<anyhow::Result<_>>()?,
+        ),
+        serde_yaml::Value::Mapping(map) => {
+            let mut out = BTreeMap::new();
+            for (key, value) in map {
+                let name = key
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow::anyhow!("map keys must be strings"))?;
+                out.insert(name, yaml_to_value(value)?);
+            }
+            Value::Object(out)
+        }
+        serde_yaml::Value::Tagged(_) => bail!("tagged YAML values are not script options"),
+    })
 }
 
 #[derive(Deserialize)]
@@ -143,6 +355,8 @@ impl ConfigFile {
 struct ScopeFile {
     /// `["host", "host:port", "*.wildcard"]`.
     entries: Option<Vec<String>>,
+    /// Let an agent (MCP) frontend widen scope with `scope.add`. Off by default.
+    allow_agent_widen: Option<bool>,
 }
 
 impl ScopeFile {
@@ -150,6 +364,7 @@ impl ScopeFile {
         if let Some(hosts) = self.entries {
             c.entries = hosts.into_iter().map(|host| ScopeEntry { host }).collect();
         }
+        set(&mut c.allow_agent_widen, self.allow_agent_widen);
     }
 }
 
@@ -341,12 +556,17 @@ impl SsrfFile {
 #[serde(deny_unknown_fields)]
 struct PocFile {
     dir: Option<PathBuf>,
+    /// Where `poc.run` writes artifacts and `poc.artifact` reads them from.
+    out_dir: Option<PathBuf>,
 }
 
 impl PocFile {
     fn apply(self, c: &mut PocConfig) {
         if let Some(d) = self.dir {
             c.dir = Some(d);
+        }
+        if let Some(d) = self.out_dir {
+            c.out_dir = Some(d);
         }
     }
 }

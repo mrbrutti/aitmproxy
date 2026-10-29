@@ -1,0 +1,70 @@
+[
+  {
+    "kind": "http",
+    "badge": { "label": "{method}", "token": "method.{method}" },
+    "list_cells": {
+      "url": "host (ink) + path (accent) + query (dimmed)",
+      "status": "response status code in class colour; Paused / Killed badges when applicable",
+      "req_size": "request body size",
+      "resp_size": "response body size",
+      "ssl": "padlock: open = MITM'd, closed = tunnelled, warning = pinned/failed"
+    },
+    "inspector": {
+      "panes": ["request", "response"],
+      "request_tabs": ["Headers", "Cookies", "Query", "Body", "Raw", "Summary", "Timing", "Connection"],
+      "response_tabs": ["Headers", "Set-Cookie", "Body", "Raw", "JSON/Tree", "Diff"],
+      "viewers": ["pretty", "json-tree", "image", "hex", "protobuf", "msgpack", "sse", "markdown", "diff", "raw"]
+    },
+    "detail_cmd": { "command": "flow.detail", "gate": "F5", "fallback": "flow.get (summary only: no headers, bodies, timing or metadata)" },
+    "realtime": { "subscription": "F4", "events": ["created", "request", "response", "intercepted", "released", "killed", "mutated", "meta"] },
+    "status": "shipped"
+  },
+  {
+    "kind": "websocket",
+    "badge": { "label": "WS", "token": "method.ws" },
+    "list_cells": {
+      "url": "the WebSocket URL",
+      "status": "101",
+      "frames": "frame count",
+      "ssl": "padlock as http"
+    },
+    "inspector": {
+      "panes": ["handshake", "frames"],
+      "frame_columns": ["dir", "opcode", "length", "data", "time", "injected"],
+      "viewers": ["text", "json-tree", "hex", "protobuf"],
+      "shared_list": "message-stream",
+      "compose": { "controls": ["send", "inject", "drop"], "gate": "F9", "disabled_text": "needs core F9" }
+    },
+    "detail_cmd": { "command": "flow.detail.messages", "gate": "F5", "fallback": "handshake only; frames show 'frames need core F5'" },
+    "realtime": { "subscription": "F4", "events": ["created", "ws_message", "released", "killed"] },
+    "status": "frames-gated"
+  },
+  {
+    "kind": "l4",
+    "badge": { "label": "L4", "token": "l4", "sub_labels": ["TCP", "UDP", "ICMP"] },
+    "list_cells": {
+      "url": "L4 target: `iface cidr:port ↕dir`",
+      "status": "session state: capture / craft / intercept",
+      "req_size": "packet count",
+      "resp_size": "injected count",
+      "ssl": "blank (n/a)"
+    },
+    "inspector": {
+      "panes": ["packets", "packet-detail", "craft", "intercept"],
+      "packet_columns": ["dir", "time", "length", "summary", "injected"],
+      "viewers": ["layer-tree", "hex"],
+      "shared_list": "message-stream",
+      "layers": ["Ether", "Ipv4", "Ipv6", "Tcp", "Udp", "Icmp", "Raw"],
+      "craft": { "formats": ["yaml", "rhai"], "preview": "hex" },
+      "intercept": { "verbs": ["forward", "mutate", "drop"], "timeout": "intercept_timeout with on_timeout: Forward | Drop" },
+      "scope": "out-of-L4-scope sessions and packets are dimmed; every craft, inject, forward and drop action is disabled with the scope tooltip"
+    },
+    "detail_cmd": {
+      "command": "l4.flow.get",
+      "gate": "M5",
+      "fallback": "labelled placeholder row; unified core Flow::L4 or l4.flow.* store, whichever M5 ships, is read through this indirection"
+    },
+    "realtime": { "subscription": "l4 capture stream", "events": "fixed by M5 (aitm-proto-l4); not defined here" },
+    "status": "m5-gated"
+  }
+]

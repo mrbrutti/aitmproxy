@@ -48,7 +48,9 @@ fn params(pairs: &[(&str, Value)]) -> Params {
 #[test]
 fn scope_add_then_list() {
     let mut reg = Registry::new();
-    let plugin = ScopePlugin::new();
+    // Agent-widen allowed so this mechanics test (default MCP host) can add scope;
+    // the gate itself is covered by `scope_add_gated_from_agent_frontend`.
+    let plugin = ScopePlugin::new(true);
     assert_eq!(plugin.name(), "scope");
     reg.add_plugin(Box::new(plugin));
 
@@ -70,6 +72,91 @@ fn scope_add_then_list() {
         .invoke(Params::default(), &host)
         .expect("scope.list ok");
     assert_eq!(listed, Value::Array(vec![Value::Str("ex.test".into())]));
+}
+
+#[test]
+fn scope_remove_narrows_scope() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(ScopePlugin::new(true)));
+    let store = Arc::new(MemFlowStore::new());
+    let guard = Arc::new(StdGuard::default());
+    let client = pipe(&store, &guard);
+    let host = CommandHost::new(store.as_ref(), &client, guard.as_ref(), None);
+
+    reg.command("scope.add")
+        .unwrap()
+        .invoke(params(&[("host", Value::Str("ex.test".into()))]), &host)
+        .expect("scope.add ok");
+    // Removing a present entry reports true and drops it from the list.
+    let removed = reg
+        .command("scope.remove")
+        .expect("scope.remove registered")
+        .invoke(params(&[("host", Value::Str("ex.test".into()))]), &host)
+        .expect("scope.remove ok");
+    assert_eq!(removed, Value::Bool(true));
+    let listed = reg
+        .command("scope.list")
+        .unwrap()
+        .invoke(Params::default(), &host)
+        .unwrap();
+    assert_eq!(listed, Value::Array(vec![]));
+    // Removing an absent entry is idempotent: false, no error.
+    let again = reg
+        .command("scope.remove")
+        .unwrap()
+        .invoke(params(&[("host", Value::Str("ex.test".into()))]), &host)
+        .expect("scope.remove idempotent");
+    assert_eq!(again, Value::Bool(false));
+}
+
+#[test]
+fn scope_add_gated_from_agent_frontend() {
+    use aitm_core::Frontend;
+
+    let store = Arc::new(MemFlowStore::new());
+    let guard = Arc::new(StdGuard::default());
+    let client = pipe(&store, &guard);
+
+    // Gate ON (allow_agent_widen = false): an MCP (agent) host is refused, a CLI
+    // (human) host is allowed; scope.remove stays allowed from either.
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(ScopePlugin::new(false)));
+
+    let agent = CommandHost::new(store.as_ref(), &client, guard.as_ref(), None)
+        .with_frontend(Frontend::Mcp);
+    let err = reg
+        .command("scope.add")
+        .unwrap()
+        .invoke(params(&[("host", Value::Str("ex.test".into()))]), &agent)
+        .expect_err("agent scope.add must be refused when the gate is on");
+    assert!(
+        err.to_string().contains("scope.allow_agent_widen"),
+        "refusal should name the config flag: {err}"
+    );
+
+    let human = CommandHost::new(store.as_ref(), &client, guard.as_ref(), None)
+        .with_frontend(Frontend::Cli);
+    reg.command("scope.add")
+        .unwrap()
+        .invoke(params(&[("host", Value::Str("ex.test".into()))]), &human)
+        .expect("human CLI scope.add is always allowed");
+
+    // Even the gated agent may narrow scope.
+    let removed = reg
+        .command("scope.remove")
+        .unwrap()
+        .invoke(params(&[("host", Value::Str("ex.test".into()))]), &agent)
+        .expect("scope.remove is never gated");
+    assert_eq!(removed, Value::Bool(true));
+
+    // Gate OFF (allow_agent_widen = true): the agent host may add scope.
+    let mut reg_open = Registry::new();
+    reg_open.add_plugin(Box::new(ScopePlugin::new(true)));
+    reg_open
+        .command("scope.add")
+        .unwrap()
+        .invoke(params(&[("host", Value::Str("ex.test".into()))]), &agent)
+        .expect("agent scope.add allowed when scope.allow_agent_widen is set");
 }
 
 /// A guard whose only limiter is the per-host bucket: global and concurrency
@@ -109,7 +196,7 @@ fn burst_rate_limited(reg: &Registry, host: &CommandHost, n: usize) -> usize {
 
 fn registry_with_option(default_rps: u32) -> Registry {
     let mut reg = Registry::new();
-    reg.add_plugin(Box::new(ScopePlugin::new()));
+    reg.add_plugin(Box::new(ScopePlugin::new(true)));
     reg.add_plugin(Box::new(MutatePlugin::new()));
     let plugin = RateLimitPlugin::new(default_rps);
     assert_eq!(plugin.name(), "rate-limit");

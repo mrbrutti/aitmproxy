@@ -182,6 +182,9 @@ impl Rig {
         cfg.scope.entries = vec![ScopeEntry {
             host: fixture.authority(),
         }];
+        // These tests drive scope.add through the default (MCP) command host, so
+        // they opt into agent scope-widening (F12 gate; off by default).
+        cfg.scope.allow_agent_widen = true;
         cfg.browser.obscura.binary = std::env::var_os("AITM_OBSCURA_BIN").map(PathBuf::from);
 
         let assembled = assemble(&cfg).expect("assemble the proxy");

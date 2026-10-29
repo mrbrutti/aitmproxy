@@ -1,0 +1,87 @@
+/* The one saturated element (§2.2, §2.7). */
+.bar {
+  height: var(--size-intercept-bar);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+  border-top: 1px solid var(--color-line-border);
+  font-size: var(--font-size-md);
+  min-width: 0;
+  background: var(--color-intercept-tint);
+  color: var(--color-intercept-deep);
+}
+.bar[data-paused='true'] {
+  background: var(--color-intercept-base);
+  color: var(--color-intercept-on-base);
+}
+.icon {
+  flex: none;
+  color: inherit;
+}
+.pulse {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+  animation: pulse var(--motion-intercept-pulse) ease-in-out infinite;
+}
+@keyframes pulse {
+  50% {
+    opacity: 0.45;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pulse {
+    animation: none;
+  }
+}
+.count {
+  font-weight: var(--font-weight-semibold);
+  white-space: nowrap;
+}
+.target {
+  font-family: var(--font-data);
+  opacity: 0.9;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.target b {
+  font-weight: var(--font-weight-semibold);
+}
+.text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+  flex: none;
+}
+.actions > button {
+  height: 26px;
+}
+.bar[data-paused='true'] .actions button[data-variant='ghost'] {
+  background: color-mix(in srgb, var(--color-intercept-on-base) 12%, transparent);
+  color: var(--color-intercept-on-base);
+}
+@media (hover: hover) and (pointer: fine) {
+  .bar[data-paused='true'] .actions button[data-variant='ghost']:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--color-intercept-on-base) 20%, transparent);
+  }
+}
+.bar[data-paused='false'] .actions button[data-variant='ghost'] {
+  background: color-mix(in srgb, var(--color-intercept-deep) 10%, transparent);
+  color: var(--color-intercept-deep);
+}
+@media (hover: hover) and (pointer: fine) {
+  .bar[data-paused='false'] .actions button[data-variant='ghost']:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--color-intercept-deep) 18%, transparent);
+  }
+}
