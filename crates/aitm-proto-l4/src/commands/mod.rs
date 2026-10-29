@@ -28,6 +28,7 @@ pub mod capture;
 pub mod craft;
 pub mod flow;
 pub mod inject;
+pub mod intercept;
 pub mod scope;
 pub mod sendrecv;
 
