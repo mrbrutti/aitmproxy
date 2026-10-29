@@ -24,6 +24,7 @@
 //! [`L4Permit`]: crate::guard::L4Permit
 //! [`ScopeRateGuard::check_active`]: aitm_core::ScopeRateGuard::check_active
 
+pub mod agent;
 pub mod capture;
 pub mod craft;
 pub mod flow;
@@ -41,6 +42,8 @@ use aitm_core::{Command, CommandHost, ParamSchema, Params, TypeDesc, Value};
 use crate::flow::L4FlowId;
 use crate::types::{IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, PortRange};
 
+pub use crate::gates::{AgentGate, L4AgentGates};
+pub(crate) use agent::{agent_commands, L4AgentGate};
 pub use capture::{CaptureStart, CaptureStatus, CaptureStop};
 pub use craft::Craft;
 pub use flow::{FlowGet, FlowList};
@@ -59,6 +62,10 @@ pub struct L4Interfaces;
 impl Command for L4Interfaces {
     fn name(&self) -> &str {
         "l4.interfaces"
+    }
+
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Read
     }
 
     fn schema(&self) -> ParamSchema {
@@ -347,6 +354,8 @@ pub(crate) fn active_commands(
 ) -> Vec<Arc<dyn Command>> {
     vec![
         Arc::new(L4Interfaces),
+        // `ScopeAdd` is thin: the widen gate (reading the shared gates) and the forced
+        // `source = Runtime` live in `L4Guard::add_runtime_scope`.
         Arc::new(ScopeAdd::new(guard.clone())),
         Arc::new(ScopeRemove::new(guard.clone())),
         Arc::new(ScopeList::new(guard)),
@@ -354,6 +363,40 @@ pub(crate) fn active_commands(
         Arc::new(FlowGet::new(store)),
         Arc::new(Craft),
     ]
+}
+
+/// Wrap the Sensitive, per-capability-gated `l4.*` commands in `cmds` with their
+/// [`L4AgentGate`] (the second M4 dimension), leaving the rest untouched. The module
+/// applies this to the wire + intercept command lists before the privilege gate, so
+/// an agent (`Frontend::Mcp`) call to a gated verb is refused unless its
+/// `l4.allow_agent_*` flag is on; the operator and CLI roles bypass it. Scope-add's
+/// widen gate lives inside the command (it refuses every runtime caller when off);
+/// everything here is Mcp-only.
+pub(crate) fn agent_gate(
+    cmds: Vec<Arc<dyn Command>>,
+    gates: &Arc<L4AgentGates>,
+) -> Vec<Arc<dyn Command>> {
+    cmds.into_iter()
+        .map(|cmd| match gate_for(cmd.name()) {
+            Some(gate) => Arc::new(L4AgentGate::new(cmd, gate, gates.clone())) as Arc<dyn Command>,
+            None => cmd,
+        })
+        .collect()
+}
+
+/// The per-capability [`AgentGate`] that governs a command, if it is one of the
+/// Mcp-only gated verbs. Read-only / `Write` commands return `None` (never gated by a
+/// flag), as does `l4.scope.add` (its widen gate lives in the command itself).
+fn gate_for(name: &str) -> Option<AgentGate> {
+    match name {
+        "l4.inject" | "l4.send_recv" => Some(AgentGate::Inject),
+        "l4.capture.start" => Some(AgentGate::Capture),
+        "l4.intercept.start"
+        | "l4.intercept.mutate"
+        | "l4.intercept.forward"
+        | "l4.intercept.drop" => Some(AgentGate::Intercept),
+        _ => None,
+    }
 }
 
 /// Build the ordered list of Task 10 wire commands (`l4.capture.*`, `l4.inject`,
@@ -398,4 +441,96 @@ pub(crate) fn parse_packet_spec(spec: &Value) -> anyhow::Result<crate::craft::Pa
 fn require<'a>(args: &'a Params, name: &str) -> anyhow::Result<&'a Value> {
     args.get(name)
         .ok_or_else(|| anyhow::anyhow!("missing required param `{name}`"))
+}
+
+/// The scope entry that covers `target` for `cap` (interface + direction + CIDR +
+/// port), for **display only** in the operator confirm summary. Enforcement is the
+/// guard (whose `check` the caller already ran); this just surfaces the authorizing
+/// entry so the operator sees exactly what makes the target in-scope. Returns the
+/// first match, mirroring the guard's "first granting entry" selection.
+pub(crate) fn covering_scope_entry(
+    guard: &crate::guard::L4Guard,
+    iface: &str,
+    dir: L4Direction,
+    cap: L4Capability,
+    dst: Option<IpAddr>,
+    port: Option<u16>,
+) -> Option<L4ScopeEntry> {
+    guard.list_scope().into_iter().find(|e| {
+        e.interface == iface
+            && e.direction == dir
+            && e.capability == cap
+            && dst.is_none_or(|ip| cidr_display_contains(&e.cidr, ip))
+            && port.is_none_or(|p| p >= e.ports.lo && p <= e.ports.hi)
+    })
+}
+
+/// A display-only CIDR membership test for [`covering_scope_entry`] (the guard owns
+/// the authoritative one). Same family required.
+fn cidr_display_contains(cidr: &IpCidr, ip: IpAddr) -> bool {
+    fn mask_v4(bits: u32, prefix: u8) -> u32 {
+        match prefix {
+            0 => 0,
+            p if p >= 32 => bits,
+            p => bits & (!0u32 << (32 - p)),
+        }
+    }
+    fn mask_v6(bits: u128, prefix: u8) -> u128 {
+        match prefix {
+            0 => 0,
+            p if p >= 128 => bits,
+            p => bits & (!0u128 << (128 - p)),
+        }
+    }
+    match (cidr.addr, ip) {
+        (IpAddr::V4(net), IpAddr::V4(host)) => {
+            mask_v4(host.into(), cidr.prefix) == mask_v4(net.into(), cidr.prefix)
+        }
+        (IpAddr::V6(net), IpAddr::V6(host)) => {
+            mask_v6(host.into(), cidr.prefix) == mask_v6(net.into(), cidr.prefix)
+        }
+        _ => false,
+    }
+}
+
+/// Render the operator confirm-over-the-wire summary for a wire-writing verb: what
+/// will hit the wire (destination addr/port/iface/direction, the [`PacketSummary`]
+/// layers + length, the copy count), the matched scope entry, and the minted
+/// permit's per-call budget. The server returns this as the `needs_confirmation`
+/// prompt; re-issuing with `_confirm` proceeds.
+///
+/// [`PacketSummary`]: crate::craft::PacketSummary
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wire_confirm_summary(
+    verb: &str,
+    dst: IpAddr,
+    port: Option<u16>,
+    interface: &str,
+    direction: L4Direction,
+    layers: &[String],
+    length: usize,
+    count: u32,
+    budget: u32,
+    entry: Option<&L4ScopeEntry>,
+) -> String {
+    let port = port.map_or_else(|| "*".to_string(), |p| p.to_string());
+    let scope = entry.map_or_else(
+        || "in L4 scope".to_string(),
+        |e| {
+            format!(
+                "scope {}  ports {}  rate {}pps/{}burst",
+                cidr_to_string(&e.cidr),
+                ports_to_string(&e.ports),
+                e.inject_rate.pps,
+                e.inject_rate.burst,
+            )
+        },
+    );
+    format!(
+        "Confirm {verb}: {count}× [{}] ({length} bytes) → {dst}:{port} on {interface} \
+         ({}). Matched {scope}; permit budget {budget} packets/call. \
+         Re-issue with `_confirm` to send.",
+        layers.join("/"),
+        direction_to_string(direction),
+    )
 }

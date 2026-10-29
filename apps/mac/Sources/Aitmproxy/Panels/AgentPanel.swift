@@ -110,6 +110,48 @@ final class ActivityState {
 
     private func hasTool(_ name: String) -> Bool { session.tools.contains { $0.name == name } }
 
+    // MARK: L4 per-capability agent gates (AC11)
+
+    /// The core advertises `l4.*` and reports per-capability gates.
+    var l4Advertised: Bool { session.l4Enabled }
+    /// The operator-only setter is present, so the toggles are live (else read-only).
+    var l4SetterPresent: Bool { session.l4HasSetter }
+
+    /// `l4.agent.status` → the four per-capability gate states.
+    func refreshL4Gates() async {
+        guard session.l4Enabled, hasTool("l4.agent.status"),
+              let json = try? await session.runCommand("l4.agent.status", [:]),
+              let gates = L4AgentGates(json: json) else { return }
+        session.l4AgentGates = gates
+    }
+
+    /// Flip one L4 agent gate via the operator-only `l4.agent.set`, then re-read it.
+    /// The agent can never flip its own — the setter refuses a `Frontend::Mcp` caller.
+    func setL4Capability(_ capability: L4AgentGates.Capability, _ allowed: Bool) {
+        let args: [String: JSONValue] = ["capability": .string(capability.rawValue), "allowed": .bool(allowed)]
+        Task {
+            if Store.usesFixtures {
+                session.setL4Gate(capability.rawValue, allowed)
+                record(command: "l4.agent.set", args: args, result: .ok)
+                return
+            }
+            guard hasTool("l4.agent.set") else {
+                session.lastError = "l4.agent.set needs an operator-gated core setter"
+                return
+            }
+            do {
+                let json = try await session.runCommand("l4.agent.set", args)
+                if let gates = L4AgentGates(json: json) { session.l4AgentGates = gates }
+                record(command: "l4.agent.set", args: args, result: .ok)
+                session.lastError = nil
+            } catch {
+                let message = BusService.describe(error)
+                record(command: "l4.agent.set", args: args, result: .error(message))
+                session.lastError = "l4.agent.set: \(message)"
+            }
+        }
+    }
+
     /// The synchronous entry for a control's binding: `setPolicy` in a task.
     func choose(_ policy: AgentPolicy) {
         Task { await setPolicy(policy) }
@@ -196,6 +238,9 @@ struct AgentPanel: View {
                     stat("Actions / min", "\(session.agentActionsLastMinute)")
                     stat("Pending", "\(state.pending.count)")
                 }
+                if state.l4Advertised {
+                    L4CapabilitySection(state: state, gates: session.l4AgentGates)
+                }
             }
             .padding(.horizontal, Space.margin)
             .padding(.vertical, Space.lg)
@@ -207,6 +252,7 @@ struct AgentPanel: View {
         .background(Tok.Ground.surface.color)
         .gridArea("agent")
         .task { await state.refreshStatus() }
+        .task { await state.refreshL4Gates() }
     }
 
     private func stat(_ label: String, _ value: String) -> some View {
@@ -215,5 +261,44 @@ struct AgentPanel: View {
             Text(value).font(Tok.Face.data(Tok.Typography.Size.lg, .medium)).foregroundStyle(Tok.Ink.primary.color)
         }
         .accessibilityElement(children: .combine)
+    }
+
+}
+
+/// The Agent panel's L4 capability section (AC11): one toggle per gate
+/// (Capture / Inject / Intercept / Widen) reflecting the `l4.allow_agent_*` gate
+/// that governs the agent (MCP) L4 path. The operator sets each; where the core
+/// exposes no `l4.agent.set`, the toggles are read-only with an honest note. An
+/// agent can never flip its own.
+struct L4CapabilitySection: View {
+    @Bindable var state: ActivityState
+    var gates: L4AgentGates?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.sm) {
+            Rule().padding(.vertical, Space.xs)
+            HStack(spacing: Space.sm) {
+                Badge(text: "L4", pair: Tok.L4.badge)
+                TrackedLabel("Agent L4 capabilities")
+            }
+            Text(state.l4SetterPresent
+                ? "Turn agent (MCP) access to each raw-L4 capability on or off. Each reflects the l4.allow_agent_* gate that actually governs the agent path."
+                : "Read-only: this core has no l4.agent.set — set l4.allow_agent_* in config and restart. An agent can never flip its own gates.")
+                .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach(L4AgentGates.Capability.allCases, id: \.self) { cap in
+                Toggle(isOn: Binding(
+                    get: { gates?.allowed(cap) ?? false },
+                    set: { state.setL4Capability(cap, $0) }
+                )) {
+                    Text(cap.title).font(Tok.Face.ui(Tok.Typography.Size.base)).foregroundStyle(Tok.Ink.primary.color)
+                }
+                .toggleStyle(.switch)
+                .tint(Tok.L4.base.color)
+                .disabled(!state.l4SetterPresent)
+                .accessibilityIdentifier("l4-gate-\(cap.rawValue)")
+            }
+        }
+        .padding(.top, Space.sm)
     }
 }

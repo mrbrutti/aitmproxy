@@ -103,6 +103,16 @@ pub enum Action {
     ScopeRemoveSelected,
     /// Compose `Ctrl-S` / `Ctrl-Enter`: send the form whichever field has focus.
     ComposeSend,
+    // L4 operator surface (ui-ext Part 3). Routed in the reducer by the selected
+    // flow kind; a no-op on a non-L4 flow.
+    /// Build the craft YAML into a hex preview (`l4.craft`).
+    L4Build,
+    /// Inject the crafted packet (`l4.inject`), triggering confirm-over-the-wire.
+    L4Inject,
+    /// Answer the inject confirm overlay: `true` re-issues with `_confirm`.
+    L4Confirm(bool),
+    /// Toggle one per-feature agent gate in the Agent view (`l4.agent.set`).
+    L4ToggleGate(crate::l4::L4Gate),
 }
 
 /// Work for the bus task.
@@ -207,6 +217,13 @@ pub enum BusEvent {
     Toast(Level, String),
     /// An unsolicited server line (F4).
     Notification(Value),
+    /// A pass over `l4.flow.list` + `l4.flow.get` (ui-ext Part 3): each value is
+    /// an `l4.flow.get` object. Emitted only when the bus offers `l4.flow.list`.
+    L4Flows(Vec<Value>),
+    /// `l4.scope.list`: the L4 scope entries, as serialized `L4ScopeEntry`s.
+    L4Scope(Vec<Value>),
+    /// `l4.agent.status`: the four per-feature agent gate states.
+    L4Agent(Value),
 }
 
 /// One declared parameter of a tool's `inputSchema`, as a form row.

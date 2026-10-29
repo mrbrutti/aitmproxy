@@ -7,8 +7,8 @@ public struct FlowID: Hashable, Sendable, Codable, CustomStringConvertible {
     public var description: String { raw }
 }
 
-public enum FlowKind: String, Sendable, Codable {
-    case http, websocket
+public enum FlowKind: String, Sendable, Codable, CaseIterable {
+    case http, websocket, l4
 }
 
 /// HTTP methods carry their own badge colour (foundation §2.7). `ws` is the
@@ -144,6 +144,9 @@ public struct FlowRow: Identifiable, Hashable, Sendable {
     public var inScope: Bool
     /// WebSocket frames so far (sent, received).
     public var wsFrames: (sent: Int, received: Int)?
+    /// Raw-L4 row fields (target, session state, protocol sub-label, counts) when
+    /// `kind == .l4`; nil for HTTP/WebSocket.
+    public var l4: L4RowInfo?
 
     public init(
         id: FlowID, seq: Int, kind: FlowKind = .http, method: HTTPMethod, scheme: String,
@@ -152,7 +155,8 @@ public struct FlowRow: Identifiable, Hashable, Sendable {
         client: ClientInfo? = nil, startedAt: Date? = nil, duration: Duration? = nil,
         requestBytes: Int64? = nil, responseBytes: Int64? = nil, tls: TLSState = .decrypted,
         edited: Bool = false, comment: String? = nil, mark: MarkColor? = nil, inScope: Bool = true,
-        wsFrames: (sent: Int, received: Int)? = nil, coreID: CoreID = .fixture
+        wsFrames: (sent: Int, received: Int)? = nil, l4: L4RowInfo? = nil,
+        coreID: CoreID = .fixture
     ) {
         self.id = id
         self.coreID = coreID
@@ -178,6 +182,7 @@ public struct FlowRow: Identifiable, Hashable, Sendable {
         self.mark = mark
         self.inScope = inScope
         self.wsFrames = wsFrames
+        self.l4 = l4
     }
 
     /// `https://host` — the part drawn in ink.
@@ -194,7 +199,7 @@ public struct FlowRow: Identifiable, Hashable, Sendable {
             && lhs.edited == rhs.edited && lhs.comment == rhs.comment && lhs.mark == rhs.mark
             && lhs.duration == rhs.duration && lhs.responseBytes == rhs.responseBytes
             && lhs.inScope == rhs.inScope && lhs.wsFrames?.sent == rhs.wsFrames?.sent
-            && lhs.wsFrames?.received == rhs.wsFrames?.received
+            && lhs.wsFrames?.received == rhs.wsFrames?.received && lhs.l4 == rhs.l4
     }
 
     public func hash(into hasher: inout Hasher) {

@@ -9,6 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::action::Action;
 use crate::app::{Mode, PromptKind};
+use crate::l4::L4Gate;
 use crate::model::AgentPolicy;
 
 /// Resolve a key for the current mode. `None` when the key means nothing here.
@@ -34,6 +35,7 @@ pub fn map(key: KeyEvent, mode: Mode) -> Option<Action> {
         Mode::Browser => browser(key),
         // Read-only: back, palette, help.
         Mode::Config => panel(key),
+        Mode::L4Confirm => l4_confirm(key),
         // Any key closes help (README); `:` goes straight to the palette.
         Mode::Help => Some(match key.code {
             KeyCode::Char(':') => Action::PaletteOpen,
@@ -166,9 +168,22 @@ fn inspector(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('y') => Action::CopyUrl,
         KeyCode::Char('o') => Action::OpenExternally,
         KeyCode::Char('i') => Action::ToggleIntercept,
+        // L4 inspector (a no-op on a non-L4 flow): b build craft, s inject.
+        KeyCode::Char('b') => Action::L4Build,
+        KeyCode::Char('s') => Action::L4Inject,
         KeyCode::Char(':') => Action::PaletteOpen,
         KeyCode::Char('/') => Action::FilterOpen,
         KeyCode::Char('?') => Action::Help,
+        _ => return None,
+    })
+}
+
+/// The L4 inject confirm overlay: `y` confirms (re-issues with `_confirm`),
+/// `n` / Esc cancels.
+fn l4_confirm(key: KeyEvent) -> Option<Action> {
+    Some(match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => Action::L4Confirm(true),
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Action::L4Confirm(false),
         _ => return None,
     })
 }
@@ -256,6 +271,11 @@ fn agent(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('1') | KeyCode::Char('a') => Action::AgentSet(AgentPolicy::All),
         KeyCode::Char('2') | KeyCode::Char('r') => Action::AgentSet(AgentPolicy::ReadOnly),
         KeyCode::Char('3') | KeyCode::Char('p') => Action::AgentSet(AgentPolicy::Paused),
+        // The per-feature L4 agent gates (L4OPS-AC11).
+        KeyCode::Char('c') => Action::L4ToggleGate(L4Gate::Capture),
+        KeyCode::Char('i') => Action::L4ToggleGate(L4Gate::Inject),
+        KeyCode::Char('n') => Action::L4ToggleGate(L4Gate::Intercept),
+        KeyCode::Char('w') => Action::L4ToggleGate(L4Gate::Widen),
         KeyCode::Up | KeyCode::Char('k') => Action::Up,
         KeyCode::Down | KeyCode::Char('j') => Action::Down,
         KeyCode::Char(':') => Action::PaletteOpen,
