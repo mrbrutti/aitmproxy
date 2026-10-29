@@ -124,6 +124,29 @@ final class Session {
     var wsDetails: [FlowID: WSDetail] = [:] {
         didSet { rowsVersion &+= 1 }
     }
+    /// Raw-L4 flow details keyed by flow id (M5 `l4.flow.get`). An L4 flow has no
+    /// `FlowDetail`; its packet log and bind live here instead.
+    var l4Details: [FlowID: L4Flow] = [:] {
+        didSet { rowsVersion &+= 1 }
+    }
+    /// Whether this app is driving its own embedded user-level core, which cannot do
+    /// raw L4 (AC18) — set by the connection model. The self-contained embedded core
+    /// degrades every wire verb to `L4Unavailable`; a privileged / remote core over
+    /// the bus drives L4 fully.
+    var l4EmbeddedCore = false
+    /// The last `L4Unavailable` reason a wire verb returned, surfaced in the banner.
+    var l4LastWireError: String?
+    /// The four per-capability agent gates read from `l4.agent.status` (AC11).
+    var l4AgentGates: L4AgentGates?
+
+    /// Whether the macOS L4 surface can drive the wire against the current core.
+    var l4Availability: L4Availability {
+        L4Availability.resolve(embeddedCore: l4EmbeddedCore, wireError: l4LastWireError)
+    }
+    /// The L4 commands are advertised by the current core (feature-detected).
+    var l4Enabled: Bool { tools.contains { $0.name == "l4.flow.list" } }
+    var l4HasSetter: Bool { tools.contains { $0.name == "l4.agent.set" } }
+    var l4HasIntercept: Bool { tools.contains { $0.name == "l4.intercept.start" } }
     var selection: Set<FlowID> = []
     /// The flow the inspector shows: the last clicked row.
     var focused: FlowID?
@@ -248,6 +271,41 @@ final class Session {
                 case "flow.list": return .array(rows.map { .string($0.id.raw) })
                 case "scope.list": return .array(scopeHosts.map { .string($0) })
                 case "scope.add": if let h = args["host"]?.stringValue { addScope(h) }; return .string(args["host"]?.stringValue ?? "")
+                case "l4.flow.list": return .array(l4Details.keys.map { .string($0.raw) })
+                case "l4.flow.get":
+                    guard let id = args["id"]?.stringValue, let flow = l4Details[FlowID(id)] else { throw BusError.tool(message: "no such L4 flow") }
+                    return Fixtures.l4FlowJSON(flow)
+                case "l4.craft":
+                    return .object([
+                        "length": .number(Double(Fixtures.l4CraftBytes.count)),
+                        "bytes": .string(Fixtures.l4CraftBytes.base64EncodedString()),
+                        "summary": .object(["layers": .array([.string("IPv4"), .string("UDP")]),
+                                            "length": .number(Double(Fixtures.l4CraftBytes.count))]),
+                    ])
+                case "l4.inject", "l4.send_recv":
+                    // The guard refuses an out-of-scope target before any confirm token.
+                    let dst = args["dst"]?.stringValue ?? ""
+                    guard dst == "127.0.0.1" else {
+                        throw BusError.tool(message: "\(name) refused: OutOfL4Scope — \(dst) is not in the L4 scope "
+                            + "(deny-by-default). Add it with l4.scope.add (operator-confirmed).")
+                    }
+                    if args["_confirm"] != nil { return .object(["status": .string("ok"), "sent": .number(1)]) }
+                    let count = args["count"]?.intValue ?? 1
+                    return .object([
+                        "status": .string("needs_confirmation"),
+                        "prompt": .string("Inject \(count)× IPv4/UDP (37 B) to \(dst):\(args["port"]?.intValue ?? 9) "
+                            + "on \(args["interface"]?.stringValue ?? "lo0") — in scope \(Fixtures.l4Scope) · permit budget "
+                            + "64 pps. Re-send with _confirm to put it on the wire."),
+                        "confirm_token": .string("l4-\(UUID().uuidString.prefix(8))"),
+                    ])
+                case "l4.agent.status": return l4AgentGatesJSON()
+                case "l4.agent.set":
+                    if let cap = args["capability"]?.stringValue, let allowed = args["allowed"]?.boolValue {
+                        setL4Gate(cap, allowed)
+                    }
+                    return l4AgentGatesJSON()
+                case "l4.capture.start", "l4.capture.stop", "l4.scope.add", "l4.scope.list", "l4.interfaces", "l4.capture.status":
+                    return .string("ok (fixture)")
                 default: return .string("ok (fixture)")
                 }
             }
@@ -259,6 +317,8 @@ final class Session {
     var focusedDetail: FlowDetail? { focused.flatMap { details[$0] } }
     /// The WebSocket detail for the focused flow (S-045), when it is a WebSocket.
     var focusedWSDetail: WSDetail? { focused.flatMap { wsDetails[$0] } }
+    /// The L4 detail for the focused flow, when it is an L4 flow.
+    var focusedL4Detail: L4Flow? { focused.flatMap { l4Details[$0] } }
 
     /// The list's query: scope page, group, chip, filter expression, sort (one Kit value, S-062 ready).
     var query: FlowQuery {
@@ -394,13 +454,37 @@ final class Session {
     /// The operator's unsent edits per paused flow; nil = as the proxy holds it.
     var editDrafts: [FlowID: HTTPMessage] = [:]
 
+    /// The current L4 agent gates as the `l4.agent.status` / `.set` JSON object.
+    func l4AgentGatesJSON() -> JSONValue {
+        let gates = l4AgentGates ?? L4AgentGates(capture: false, inject: false, intercept: false, widen: false)
+        return .object([
+            "capture": .bool(gates.capture), "inject": .bool(gates.inject),
+            "intercept": .bool(gates.intercept), "widen": .bool(gates.widen),
+        ])
+    }
+
+    /// Flip one fixture L4 agent gate (the operator act `l4.agent.set` performs).
+    func setL4Gate(_ capability: String, _ allowed: Bool) {
+        guard var gates = l4AgentGates, let cap = L4AgentGates.Capability(rawValue: capability) else { return }
+        switch cap {
+        case .capture: gates.capture = allowed
+        case .inject: gates.inject = allowed
+        case .intercept: gates.intercept = allowed
+        case .widen: gates.widen = allowed
+        }
+        l4AgentGates = gates
+    }
+
     /// The mockup's state: armed intercept, two paused, the login selected.
     func loadFixtures() {
         details = Dictionary(uniqueKeysWithValues:
             Fixtures.rows.filter { $0.kind != .websocket }.map { ($0.id, Fixtures.detail(for: $0)) })
         wsDetails = Dictionary(uniqueKeysWithValues:
             Fixtures.rows.filter { $0.kind == .websocket }.map { ($0.id, Fixtures.wsDetail(for: $0)) })
-        rows = Fixtures.rows
+        l4Details = Dictionary(uniqueKeysWithValues:
+            Fixtures.l4Rows.compactMap { row in Fixtures.l4Detail(for: row).map { (row.id, $0) } })
+        l4AgentGates = L4AgentGates(capture: true, inject: false, intercept: false, widen: false)
+        rows = Fixtures.rows + Fixtures.l4Rows
         interceptArmed = true
         scopeHosts = Fixtures.scope
         pins = Pins(hosts: ["api.shop-staging.test", "auth.shop-staging.test"])
