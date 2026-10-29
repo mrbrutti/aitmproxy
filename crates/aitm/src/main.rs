@@ -25,8 +25,8 @@ use aitm::scripts::LateHandles;
 use aitm::tui::TuiLog;
 use aitm::web::{self, WebArgs, WebCommand, WebState};
 use aitm::wire::{assemble_with_scripts, Assembled, Features, ScriptWiring};
-use aitm::{config_file, env, tui};
-use aitm_core::{BrowserDriver, Chain, Plugin};
+use aitm::{config_file, env, operator_token, tui};
+use aitm_core::{engine_may_reach_private, BrowserDriver, Chain, McpTransport, Plugin};
 use aitm_findings::FindingsPlugin;
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
 use tokio::net::TcpListener;
@@ -47,6 +47,10 @@ enum Mode {
     /// `web …`: the server path plus the embedded web UI and its `/bus`
     /// bridge; the options live beside in `WebArgs`.
     Web,
+    /// `operator-token generate [--force]`: write a CSPRNG `mcp.operator_token`
+    /// into the config file and exit, before any service is built (spec F2).
+    /// CLI-only; never dispatched through the registry, so no agent can run it.
+    OperatorToken { force: bool },
 }
 
 /// Classify `argv`. `tui` takes no arguments; anything after it is a usage
@@ -58,7 +62,28 @@ fn parse_mode(argv: Vec<String>) -> Result<Mode, String> {
         Some("tui") if argv.len() == 1 => Ok(Mode::Tui),
         Some("tui") => Err(tui::USAGE.to_string()),
         Some("web") => Ok(Mode::Web),
+        Some("operator-token") => parse_operator_token(&argv[1..]),
         Some(_) => Ok(Mode::Cli(argv)),
+    }
+}
+
+/// Classify the arguments after `operator-token`. Only `generate [--force]` is
+/// valid; an unknown sub-verb or flag is a usage error carrying the line to
+/// print. This stays out of the CLI registry (spec F2) so no agent reaches it.
+fn parse_operator_token(rest: &[String]) -> Result<Mode, String> {
+    const USAGE: &str = "usage: aitm [--config <path>] operator-token generate [--force]";
+    match rest.first().map(String::as_str) {
+        Some("generate") => {
+            let mut force = false;
+            for arg in &rest[1..] {
+                match arg.as_str() {
+                    "--force" => force = true,
+                    other => return Err(format!("unknown argument `{other}`\n{USAGE}")),
+                }
+            }
+            Ok(Mode::OperatorToken { force })
+        }
+        _ => Err(USAGE.to_string()),
     }
 }
 
@@ -77,6 +102,7 @@ fn main() -> anyhow::Result<()> {
 async fn run() -> anyhow::Result<()> {
     let (config_arg, argv) = split_config_arg(std::env::args().skip(1).collect())?;
     let (script_args, argv) = split_script_args(argv)?;
+    let (bus_endpoint_file, argv) = split_bus_endpoint_file_arg(argv)?;
     // `aitm web …` is the server path with the web UI attached; its options
     // are resolved before any config is loaded so `--help` and bad flags are
     // answered immediately.
@@ -101,10 +127,23 @@ async fn run() -> anyhow::Result<()> {
             std::process::exit(2);
         }
     };
+    // `operator-token generate` edits the config file and exits before any
+    // service, tracing sink or scripting tier is built — it never needs them,
+    // and it must run even if the current config would fail to assemble. The
+    // path is resolved exactly as the rest of the binary does.
+    if let Mode::OperatorToken { force } = mode {
+        let config_path = config_arg
+            .or_else(|| std::env::var_os(CONFIG_ENV).map(PathBuf::from))
+            .unwrap_or_else(config_file::default_config_path);
+        let written = operator_token::generate_and_store(&config_path, force)?;
+        println!("{}", operator_token::confirmation_message(&written));
+        return Ok(());
+    }
+
     // The TUI owns the terminal, so its subscriber must not write there.
     let tui_log = match mode {
         Mode::Tui => tui::init_tracing(),
-        Mode::Server | Mode::Cli(_) | Mode::Web => {
+        Mode::Server | Mode::Cli(_) | Mode::Web | Mode::OperatorToken { .. } => {
             init_tracing();
             TuiLog::Off
         }
@@ -118,6 +157,9 @@ async fn run() -> anyhow::Result<()> {
     } = config_file::load_settings(config_path.as_deref())?;
     env::apply(&mut cfg, |k| std::env::var(k).ok());
     env::apply_rhai(&mut rhai_cfg, |k| std::env::var(k).ok());
+    // `--bus-endpoint-file` wins over the config's `endpoint_file`; it only means
+    // anything for the loopback-TCP bus, so asking for it over stdio is an error.
+    apply_bus_endpoint_file(&mut cfg.mcp.transport, bus_endpoint_file)?;
     // The L4 module is opt-in (fail-closed) and carried outside `aitm-core`'s
     // `Config`; `AITM_L4_*` env overrides win over the file (M5-AC17). It rides the
     // binary-owned feature set below; `l4_privilege: None` runs the real startup probe.
@@ -228,7 +270,19 @@ async fn run() -> anyhow::Result<()> {
 
     // Server path: launch the configured engine so the browser.* commands reach
     // a live driver. No fallback to the other engine.
-    let launched = match aitm_browser::launch_owned(&cfg.browser, ca.cert_path()).await {
+    //
+    // Derive obscura's `--allow-private-network` from the SSRF policy ∪ the seed
+    // scope (audit I15): a scoped loopback/private target lifts the engine flag
+    // under the strict default, while a pure-public scope keeps the engine as
+    // narrow as the policy. The SSRF-filtering proxy connector stays the
+    // authoritative per-host gate; this only narrows the engine below it. It is
+    // frozen here at launch — a host added later (`scope.add`) is still gated by
+    // the connector, but the engine reaches a newly private target only on
+    // relaunch.
+    let mut browser_cfg = cfg.browser.clone();
+    browser_cfg.obscura.allow_private =
+        engine_may_reach_private(&cfg.browser.ssrf, &cfg.scope.entries);
+    let launched = match aitm_browser::launch_owned(&browser_cfg, ca.cert_path()).await {
         Ok(l) => Some(l),
         Err(e) => {
             warn!(
@@ -280,9 +334,24 @@ async fn run() -> anyhow::Result<()> {
         let web_server = match web_settings {
             Some(settings) => {
                 let bus = tui::server(&cfg, cfg.mcp.transport.clone(), &services);
+                // Operator access on the web UI is tied to `mcp.operator_token`
+                // being configured to a NON-EMPTY value (operator role exists at
+                // all); there is no separate `aitm web` opt-in. An empty token is
+                // treated as "not configured", mirroring the loopback transport,
+                // so a hand-edited `operator_token: ""` never enables operator
+                // access. The operator *bridge* token is a fresh per-run token —
+                // never the secret mcp operator token, which stays out of every
+                // URL and log.
+                let operator_token = cfg
+                    .mcp
+                    .operator_token
+                    .as_deref()
+                    .is_some_and(|t| !t.is_empty())
+                    .then(web::generate_token);
                 let state = Arc::new(WebState {
                     mcp: Arc::new(bus),
-                    token: settings.token.clone(),
+                    agent_token: settings.token.clone(),
+                    operator_token: operator_token.clone(),
                 });
                 if settings.insecure_bind {
                     warn!(
@@ -310,7 +379,13 @@ async fn run() -> anyhow::Result<()> {
                 // Log only the bound address; the token must never reach a
                 // tracing sink. The one-time println is the operator's link.
                 web::log_listening(bound);
-                println!("web UI: {url}");
+                println!("web UI (agent): {url}");
+                // When operator access is configured, print its URL too; it
+                // carries the ephemeral operator bridge token in the fragment,
+                // never the mcp operator token.
+                if let Some(op) = &operator_token {
+                    println!("web UI (operator): {}", web::operator_ui_url(bound, op));
+                }
                 Some((listener, state))
             }
             None => None,
@@ -393,21 +468,330 @@ fn split_script_args(argv: Vec<String>) -> anyhow::Result<(Vec<PathBuf>, Vec<Str
     Ok((scripts, rest))
 }
 
-/// Install a tracing subscriber (RUST_LOG-driven, defaulting to `info`).
+/// Split a single `--bus-endpoint-file <path>` / `--bus-endpoint-file=<path>`
+/// out of `argv`, returning the path (if given) and the remaining arguments.
+/// Recognised anywhere a subcommand is not, like `--script`. Specifying it more
+/// than once is an error; it applies only to the loopback-TCP bus (see `run`).
+fn split_bus_endpoint_file_arg(
+    argv: Vec<String>,
+) -> anyhow::Result<(Option<PathBuf>, Vec<String>)> {
+    const FLAG: &str = "--bus-endpoint-file";
+    let mut path: Option<PathBuf> = None;
+    let mut rest = Vec::new();
+    let mut args = argv.into_iter();
+    while let Some(arg) = args.next() {
+        let value = if arg == FLAG {
+            Some(
+                args.next()
+                    .ok_or_else(|| anyhow::anyhow!("{FLAG} requires a path"))?,
+            )
+        } else {
+            arg.strip_prefix("--bus-endpoint-file=")
+                .map(|v| v.to_string())
+        };
+        match value {
+            Some(v) => {
+                anyhow::ensure!(path.is_none(), "{FLAG} may be given at most once");
+                path = Some(PathBuf::from(v));
+            }
+            None => rest.push(arg),
+        }
+    }
+    Ok((path, rest))
+}
+
+/// Apply a `--bus-endpoint-file` value (if any) onto the configured transport:
+/// it overrides the loopback transport's `endpoint_file`, and over stdio — which
+/// has no bound bus to publish — it is a usage error naming the fix.
+fn apply_bus_endpoint_file(
+    transport: &mut McpTransport,
+    path: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    match transport {
+        McpTransport::LoopbackTcp { endpoint_file, .. } => {
+            *endpoint_file = Some(path);
+            Ok(())
+        }
+        McpTransport::Stdio => anyhow::bail!(
+            "--bus-endpoint-file needs the loopback-TCP bus; set mcp.transport.loopback_tcp \
+             in the config so the core has a bound address to publish"
+        ),
+    }
+}
+
+/// The curated default tracing directive used when `RUST_LOG` is unset (AC3).
+///
+/// Operator-relevant lifecycle on the `aitm*` targets ("proxy listening", the
+/// obscura start/stop/attach lines) stays at `info`, while the noisy transport
+/// and browser dependencies are pinned to `warn` so a normal browsing session
+/// does not bury the useful lines under per-connection dependency chatter.
+/// Benign per-connection disconnects are already emitted at `debug` (Task 1),
+/// so the `info` baseline hides them without a per-target pin. `RUST_LOG`, when
+/// set, overrides this wholesale (see [`build_env_filter`]).
+const DEFAULT_LOG_DIRECTIVE: &str = "info,\
+    chromiumoxide=warn,\
+    tungstenite=warn,\
+    tokio_tungstenite=warn,\
+    hyper=warn,\
+    hyper_util=warn,\
+    rustls=warn,\
+    tower=warn,\
+    reqwest=warn";
+
+/// Build the server path's `EnvFilter`: `rust_log` (the `RUST_LOG` value) when it
+/// is set and non-empty overrides the default wholesale; otherwise the curated
+/// [`DEFAULT_LOG_DIRECTIVE`] is used. Both parse lossily, so a malformed
+/// directive drops the bad part rather than failing startup.
+fn build_env_filter(rust_log: Option<String>) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::EnvFilter;
+    match rust_log.filter(|v| !v.trim().is_empty()) {
+        Some(directive) => EnvFilter::new(directive),
+        None => EnvFilter::new(DEFAULT_LOG_DIRECTIVE),
+    }
+}
+
+/// Install a tracing subscriber: `RUST_LOG`-driven, defaulting to the curated
+/// quiet filter ([`DEFAULT_LOG_DIRECTIVE`]).
 fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    use tracing_subscriber::fmt;
+    let filter = build_env_filter(std::env::var("RUST_LOG").ok());
     let _ = fmt().with_env_filter(filter).try_init();
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Write};
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
-    use super::{parse_mode, split_config_arg, split_script_args, Mode};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    use aitm_core::McpTransport;
+
+    use super::{
+        apply_bus_endpoint_file, build_env_filter, parse_mode, split_bus_endpoint_file_arg,
+        split_config_arg, split_script_args, Mode,
+    };
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A `MakeWriter` that appends every formatted log line to a shared buffer,
+    /// so a test can read back exactly what the subscriber emitted.
+    #[derive(Clone)]
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for BufWriter {
+        type Writer = BufWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn web_listening_log_has_no_token() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(BufWriter(buf.clone()))
+            .finish();
+
+        let addr = "127.0.0.1:8082".parse().unwrap();
+        tracing::subscriber::with_default(subscriber, || crate::web::log_listening(addr));
+
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        // The lifecycle line records the bound address...
+        assert!(out.contains("web UI listening"), "missing event: {out:?}");
+        assert!(out.contains("127.0.0.1:8082"), "missing addr: {out:?}");
+        // ...and never the token or the tokened URL that carries it.
+        let token = crate::web::generate_token();
+        let tokened_url = crate::web::ui_url(addr, &token);
+        assert!(!out.contains(&token), "token leaked into log: {out:?}");
+        assert!(
+            !out.contains("#t="),
+            "token fragment leaked into log: {out:?}"
+        );
+        assert!(
+            !out.contains(&tokened_url),
+            "tokened URL leaked into log: {out:?}"
+        );
+    }
+
+    #[test]
+    fn no_tracing_call_site_logs_a_tokened_url() {
+        // AC2's second clause: no `tracing` macro in the server/web/tui paths may
+        // carry a token-bearing URL. `web::ui_url` is the only tokened-URL builder
+        // and `#t=` is the token fragment marker, so a log macro referencing
+        // either would be leaking the token.
+        const SOURCES: &[(&str, &str)] = &[
+            ("main.rs", include_str!("main.rs")),
+            ("tui.rs", include_str!("tui.rs")),
+            ("web/mod.rs", include_str!("web/mod.rs")),
+            ("web/bridge.rs", include_str!("web/bridge.rs")),
+            ("web/http.rs", include_str!("web/http.rs")),
+        ];
+        const MACROS: &[&str] = &["info!", "warn!", "debug!", "trace!", "error!"];
+
+        for (name, src) in SOURCES {
+            for (lineno, line) in src.lines().enumerate() {
+                let is_log_call = MACROS.iter().any(|m| line.contains(m));
+                if is_log_call && (line.contains("ui_url") || line.contains("#t=")) {
+                    panic!("{name}:{} logs a tokened URL: {line:?}", lineno + 1);
+                }
+            }
+        }
+    }
+
+    /// Install a subscriber with `filter` over a buffer, run `f`, and return
+    /// everything it emitted — so a test can assert which targets/levels survive.
+    fn capture_with_filter(filter: tracing_subscriber::EnvFilter, f: impl FnOnce()) -> String {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_env_filter(filter)
+            .with_writer(BufWriter(buf.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn default_filter_quiets_connection_noise() {
+        // AC3: the curated default (no RUST_LOG) keeps operator lifecycle while
+        // silencing per-connection dependency chatter and benign disconnects.
+        let out = capture_with_filter(build_env_filter(None), || {
+            tracing::info!(target: "aitm_core::proxy", "proxy listening");
+            tracing::info!(target: "chromiumoxide", "cdp event spam");
+            tracing::debug!(target: "aitm_core::proxy", "connection closed before completion");
+        });
+        assert!(
+            out.contains("proxy listening"),
+            "operator lifecycle must survive the default filter: {out:?}"
+        );
+        assert!(
+            !out.contains("cdp event spam"),
+            "noisy dependency target must be pinned below info: {out:?}"
+        );
+        assert!(
+            !out.contains("connection closed before completion"),
+            "benign per-connection debug must stay hidden at the info baseline: {out:?}"
+        );
+    }
+
+    #[test]
+    fn rust_log_overrides_the_curated_default() {
+        // AC3: RUST_LOG overrides the curated default wholesale — a directive that
+        // raises a pinned dependency to trace makes its trace events appear.
+        let out = capture_with_filter(build_env_filter(Some("chromiumoxide=trace".into())), || {
+            tracing::trace!(target: "chromiumoxide", "cdp trace restored");
+        });
+        assert!(
+            out.contains("cdp trace restored"),
+            "RUST_LOG must override the curated default wholesale: {out:?}"
+        );
+    }
+
+    #[test]
+    fn empty_rust_log_falls_back_to_the_curated_default() {
+        // An empty RUST_LOG is treated as unset, not as "disable everything".
+        let out = capture_with_filter(build_env_filter(Some("   ".into())), || {
+            tracing::info!(target: "aitm_core::proxy", "proxy listening");
+        });
+        assert!(
+            out.contains("proxy listening"),
+            "an empty RUST_LOG must fall back to the curated default: {out:?}"
+        );
+    }
+
+    #[test]
+    fn bus_endpoint_file_flag_separate_value_is_stripped() {
+        let (path, rest) =
+            split_bus_endpoint_file_arg(args(&["--bus-endpoint-file", "/run/bus.addr", "tui"]))
+                .unwrap();
+        assert_eq!(path, Some(PathBuf::from("/run/bus.addr")));
+        assert_eq!(rest, args(&["tui"]));
+    }
+
+    #[test]
+    fn bus_endpoint_file_flag_with_equals_is_stripped() {
+        let (path, rest) =
+            split_bus_endpoint_file_arg(args(&["--bus-endpoint-file=/run/bus.addr"])).unwrap();
+        assert_eq!(path, Some(PathBuf::from("/run/bus.addr")));
+        assert_eq!(rest, Vec::<String>::new());
+    }
+
+    #[test]
+    fn no_bus_endpoint_file_flag_leaves_argv_alone() {
+        let (path, rest) = split_bus_endpoint_file_arg(args(&["flow", "list"])).unwrap();
+        assert_eq!(path, None);
+        assert_eq!(rest, args(&["flow", "list"]));
+    }
+
+    #[test]
+    fn bus_endpoint_file_flag_without_a_path_is_an_error() {
+        let err = split_bus_endpoint_file_arg(args(&["--bus-endpoint-file"])).unwrap_err();
+        assert_eq!(err.to_string(), "--bus-endpoint-file requires a path");
+    }
+
+    #[test]
+    fn bus_endpoint_file_flag_twice_is_an_error() {
+        let err = split_bus_endpoint_file_arg(args(&[
+            "--bus-endpoint-file",
+            "/a",
+            "--bus-endpoint-file=/b",
+        ]))
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "--bus-endpoint-file may be given at most once"
+        );
+    }
+
+    #[test]
+    fn bus_endpoint_file_sets_the_loopback_transport() {
+        let mut transport = McpTransport::LoopbackTcp {
+            port: 0,
+            token: "tok".into(),
+            endpoint_file: None,
+        };
+        apply_bus_endpoint_file(&mut transport, Some(PathBuf::from("/run/bus.addr"))).unwrap();
+        assert!(matches!(
+            transport,
+            McpTransport::LoopbackTcp { endpoint_file: Some(p), .. } if p == std::path::Path::new("/run/bus.addr")
+        ));
+    }
+
+    #[test]
+    fn bus_endpoint_file_over_stdio_is_an_error() {
+        let mut transport = McpTransport::Stdio;
+        let err = apply_bus_endpoint_file(&mut transport, Some(PathBuf::from("/run/bus.addr")))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("loopback-TCP bus"),
+            "error should explain the loopback requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn no_bus_endpoint_file_leaves_the_transport_unchanged() {
+        let mut transport = McpTransport::Stdio;
+        apply_bus_endpoint_file(&mut transport, None).unwrap();
+        assert!(matches!(transport, McpTransport::Stdio));
     }
 
     #[test]
@@ -464,6 +848,32 @@ mod tests {
             Ok(Mode::Web),
             "web's own flags are parsed by web::parse_args, not here"
         );
+    }
+
+    #[test]
+    fn operator_token_generate_is_its_own_mode() {
+        assert_eq!(
+            parse_mode(args(&["operator-token", "generate"])),
+            Ok(Mode::OperatorToken { force: false })
+        );
+    }
+
+    #[test]
+    fn operator_token_generate_accepts_force() {
+        assert_eq!(
+            parse_mode(args(&["operator-token", "generate", "--force"])),
+            Ok(Mode::OperatorToken { force: true })
+        );
+    }
+
+    #[test]
+    fn operator_token_rejects_unknown_subverb_and_flag() {
+        let err = parse_mode(args(&["operator-token", "rotate"])).unwrap_err();
+        assert!(err.contains("operator-token generate"), "{err}");
+        let err = parse_mode(args(&["operator-token"])).unwrap_err();
+        assert!(err.contains("operator-token generate"), "{err}");
+        let err = parse_mode(args(&["operator-token", "generate", "--oops"])).unwrap_err();
+        assert!(err.contains("--oops"), "{err}");
     }
 
     #[test]

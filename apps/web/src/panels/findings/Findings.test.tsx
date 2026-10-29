@@ -29,6 +29,9 @@ function fakeBus(runs: PocRun[]): BusClient {
     address: 'fixtures',
     state,
     lastError: () => null,
+    role: () => 'operator',
+    expectRole: null,
+    roleMismatch: () => false,
     connect() {},
     close() {},
     async tools() {
@@ -65,6 +68,9 @@ function coreBus(summaries: { id: string; title: string; severity: PocRun['sever
     address: 'fixtures',
     state,
     lastError: () => null,
+    role: () => 'operator',
+    expectRole: null,
+    roleMismatch: () => false,
     connect() {},
     close() {},
     async tools() {

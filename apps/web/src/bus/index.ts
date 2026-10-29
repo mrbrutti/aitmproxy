@@ -1,4 +1,5 @@
 import type { BusClient } from './types';
+import { asRole } from './types';
 import { createMockBus } from './mock';
 import { createWsBus } from './ws';
 
@@ -21,10 +22,18 @@ export function createBus(): BusClient {
   }
   const hash = new URLSearchParams(location.hash.replace(/^#/, ''));
   let token = hash.get('t');
+  // The `expect` fragment (Decision B) rides the same launch URL as the token; keep it beside the
+  // token in sessionStorage and strip it from the address bar exactly as the token is stripped.
+  let expect = asRole(hash.get('expect'));
   if (token) {
     sessionStorage.setItem('aitm.bus.token', token);
+    if (expect) sessionStorage.setItem('aitm.bus.expect', expect);
+    else sessionStorage.removeItem('aitm.bus.expect');
     history.replaceState(null, '', location.pathname + location.search);
-  } else token = sessionStorage.getItem('aitm.bus.token');
+  } else {
+    token = sessionStorage.getItem('aitm.bus.token');
+    expect = asRole(sessionStorage.getItem('aitm.bus.expect'));
+  }
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  return createWsBus({ url: `${proto}://${location.host}/bus`, token });
+  return createWsBus({ url: `${proto}://${location.host}/bus`, token, expect });
 }

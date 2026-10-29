@@ -271,7 +271,15 @@ pub enum McpTransport {
     /// Serve over stdio.
     Stdio,
     /// Serve over loopback TCP (127.0.0.1 only); the token is required.
-    LoopbackTcp { port: u16, token: String },
+    LoopbackTcp {
+        port: u16,
+        token: String,
+        /// Where to publish the bound bus `host:port` (never the token) once the
+        /// listener binds — the rendezvous file a parent process (the embedded-core
+        /// manager) watches to learn the ephemeral port without parsing stdout.
+        /// `None` writes nothing. Mirrors the obscura ready-file pattern.
+        endpoint_file: Option<PathBuf>,
+    },
 }
 
 /// MCP frontend configuration.
@@ -333,6 +341,15 @@ pub struct ObscuraConfig {
     pub start_timeout: Duration,
     /// Graceful stop → SIGKILL; default 5 s.
     pub stop_timeout: Duration,
+    /// Pass obscura `--allow-private-network`, letting the engine reach
+    /// private/loopback ranges (audit I15). **Derived, not configured:** the
+    /// launch site computes it from the SSRF policy ∪ the seed scope via
+    /// [`crate::engine_may_reach_private`] (so a scoped loopback target lifts it
+    /// under the strict default), never from the config file. Off by default so a
+    /// pure-public scope under strict policy keeps the engine as narrow as the
+    /// policy; the proxy connector's SSRF check stays the authoritative per-host
+    /// gate regardless.
+    pub allow_private: bool,
 }
 
 impl Default for ObscuraConfig {
@@ -341,6 +358,7 @@ impl Default for ObscuraConfig {
             binary: None,
             start_timeout: Duration::from_secs(15),
             stop_timeout: Duration::from_secs(5),
+            allow_private: false,
         }
     }
 }

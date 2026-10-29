@@ -26,7 +26,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use aitm::wire::{assemble, Assembled, Http1Sender};
-use aitm_core::{BrowserEngine, Config, McpTransport, PipelineClient, ProxyClient, ScopeEntry};
+use aitm_core::{
+    AgentPolicy, AgentState, BrowserEngine, Config, McpTransport, PipelineClient, ProxyClient,
+    ScopeEntry,
+};
 use aitm_mcp::McpServer;
 use bytes::Bytes;
 use http_body_util::Full;
@@ -200,6 +203,12 @@ async fn run_case(engine: BrowserEngine, mode: Mode, poc_path: &std::path::Path)
     // This e2e is agent-driven (scope.add + poc.run over MCP), so it opts into
     // letting the MCP frontend widen scope (F12 gate; off by default).
     cfg.scope.allow_agent_widen = true;
+    // The widen gate alone is not enough: `scope.add` is a Sensitive command, and
+    // under the default `Auto` policy the agent is refused every Sensitive call
+    // outright, config gate on or not (spec D2). So the agent that is meant to
+    // exercise the widen path runs under `All`, where a Sensitive command defers
+    // to its own config gate — here `allow_agent_widen`, set above. This mirrors
+    // `frontends::scope_add_gate_is_wired_default_off`.
     // `assemble` (not `build_proxy`): the engine needs the CA's certificate
     // file, which is how `main` launches it too (spec §D6).
     let Assembled { proxy, ca, .. } = assemble(&cfg).expect("assemble proxy");
@@ -224,12 +233,9 @@ async fn run_case(engine: BrowserEngine, mode: Mode, poc_path: &std::path::Path)
         .await
         .unwrap_or_else(|err| panic!("[{engine:?}] launch: {err:#}"));
 
-    let server = McpServer::new(registry, McpTransport::Stdio).with_services(
-        store.clone(),
-        client,
-        guard,
-        Some(driver),
-    );
+    let server = McpServer::new(registry, McpTransport::Stdio)
+        .with_agent_state(Arc::new(AgentState::new(AgentPolicy::All)))
+        .with_services(store.clone(), client, guard, Some(driver));
     let server = Arc::new(server);
 
     // scope.add over MCP.

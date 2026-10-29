@@ -71,7 +71,7 @@ test("rhai.grammar.json: shape + map_token targets", () => {
 // rhai.api.json — must mirror the plugin-system spec catalog exactly
 // ---------------------------------------------------------------------------
 
-const API_SECTIONS = ["hooks", "flow", "msg", "globals", "dsl"];
+const API_SECTIONS = ["hooks", "flow", "msg", "globals", "dsl", "reg", "vars", "denied"];
 const HOOKS = [
   "configure",
   "load",
@@ -86,17 +86,21 @@ const HOOKS = [
 ];
 const GLOBALS = [
   "browser.click",
-  "browser.eval",
+  "browser.evaluate",
   "browser.get_dom",
   "browser.navigate",
   "browser.screenshot",
-  "browser.type",
+  "browser.type_text",
+  "contains_ci",
+  "finding",
   "halt",
   "http.send",
+  "json",
   "log",
   "log.error",
   "log.info",
   "log.warn",
+  "ok",
   "option",
   "scope.add",
   "scope.list",
@@ -178,7 +182,7 @@ test("rhai.api.json: every dotted member's parent object is catalogued", () => {
   const api = load("rhai.api.json");
   const names = new Set(apiNames(api));
   // namespaces: objects the engine injects that have members but are not themselves callable
-  for (const ns of ["flow", "msg", "http", "browser", "store", "scope"]) names.add(ns);
+  for (const ns of ["flow", "msg", "http", "browser", "store", "scope", "reg", "vars", "denied"]) names.add(ns);
   for (const n of names) {
     const parts = n.split(".");
     if (parts.length > 1) {

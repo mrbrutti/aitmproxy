@@ -1,3 +1,4 @@
+import AitmBusClient
 import AitmproxyKit
 import AppKit
 import Foundation
@@ -33,7 +34,17 @@ enum SnapshotScene: String, CaseIterable {
     case inspectDiff = "inspect-diff"
     case inspectTiming = "inspect-timing"
     case inspectFind = "inspect-find"
+    case coreRunning = "core-running"
+    case coreRestarting = "core-restarting"
+    case coreFailed = "core-failed"
+    case coreLog = "core-log"
     case inspectWebSocket = "inspect-websocket"
+
+    /// Task 8: a seeded embedded `CoreConnection` so the health dot and the
+    /// core-log panel render without a live core (snapshots use fixtures).
+    private static func core(_ status: CoreConnection.Status, label: String) -> CoreConnection {
+        CoreConnection(id: .fixture, kind: .embedded, endpoint: BusEndpoint(port: 0, token: ""), status: status, label: label)
+    }
 
     func apply(to session: Session) {
         session.page = .apps
@@ -153,6 +164,25 @@ enum SnapshotScene: String, CaseIterable {
             session.select(session.extraRow { $0.timing != nil }?.id)
             session.requestTab = .timing
             session.responseTab = .headers
+        case .coreRunning:
+            session.coreHealth.connection = Self.core(.ready, label: "Embedded core · proxy 127.0.0.1:8080")
+        case .coreRestarting:
+            session.coreHealth.connection = Self.core(.starting, label: "Embedded core")
+        case .coreFailed:
+            session.coreHealth.connection = Self.core(
+                .degraded(reason: "the core exited unexpectedly (status 1)\naitm: address already in use (os error 48)"),
+                label: "Embedded core")
+        case .coreLog:
+            session.coreHealth.connection = Self.core(.ready, label: "Embedded core · proxy 127.0.0.1:8081")
+            for line in [
+                "aitm 0.1.0 starting",
+                "proxy listening on 127.0.0.1:8081 (8080 was in use)",
+                "browser proxy listening on 127.0.0.1:8083",
+                "bus listening on 127.0.0.1:52118",
+                "obscura engine ready",
+                "proxy: GET https://api.shop-staging.test/api/health → 200",
+            ] { session.coreHealth.record(line) }
+            session.coreLogVisible = true
         case .inspectWebSocket:
             session.select(session.rows.first { $0.kind == .websocket }?.id)
         }
@@ -180,6 +210,9 @@ enum SnapshotScene: String, CaseIterable {
         session.requestTab = .raw
         session.responseTab = .body
         session.editDrafts = [:]
+        session.coreLogVisible = false
+        session.coreHealth.connection = nil
+        session.coreHealth.log.removeAll()
         session.select(session.rows.first { $0.seq == 50 }?.id)
     }
 }

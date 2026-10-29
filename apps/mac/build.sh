@@ -46,7 +46,56 @@ if [[ -d "$here/Icon/AppIcon.icon" ]]; then
   fi
   cp -X "$car" "$here/Resources/AppIcon.icns" "$app/Contents/Resources/"
 fi
+
+# Bundle the embedded core (aitm + obscura) so the app spawns it from inside the
+# bundle with no separate install (core-connection spec AC6/AC11). EmbeddedCore
+# discovers them at Contents/Resources/core/{aitm,obscura}. The binaries are the
+# release artifacts from scripts/package.sh; point at them with AITM_CORE_DIR (a
+# directory holding both) or CORE_TARBALL (a package.sh tarball), else the newest
+# dist/aitm-*-<target>.tar.gz is used. Absent => skip, and the app falls back to
+# an external core (EmbeddedCore.discoverBundled returns nil off-bundle).
+coredir="$app/Contents/Resources/core"
+target=$(rustc -vV 2>/dev/null | sed -n 's/host: //p')
+src_aitm="" src_obscura=""
+if [[ -n "${AITM_CORE_DIR:-}" ]]; then
+  src_aitm="$AITM_CORE_DIR/aitm"; src_obscura="$AITM_CORE_DIR/obscura"
+else
+  tarball="${CORE_TARBALL:-}"
+  if [[ -z "$tarball" ]]; then
+    repo_root=$(cd "$here/../.." && pwd)
+    tarball=$(ls -t "$repo_root"/dist/aitm-*-"${target:-}".tar.gz 2>/dev/null | head -1 || true)
+  fi
+  if [[ -n "$tarball" && -f "$tarball" ]]; then
+    coretmp=$(mktemp -d)
+    tar -xzf "$tarball" -C "$coretmp"
+    src_aitm="$coretmp/aitm"; src_obscura="$coretmp/obscura"
+  fi
+fi
+if [[ -x "$src_aitm" && -x "$src_obscura" ]]; then
+  mkdir -p "$coredir"
+  cp "$src_aitm" "$coredir/aitm"
+  cp "$src_obscura" "$coredir/obscura"
+  chmod 755 "$coredir/aitm" "$coredir/obscura"
+  echo "bundled embedded core: $coredir/{aitm,obscura}"
+else
+  echo "no embedded core bundled (set AITM_CORE_DIR or CORE_TARBALL, or run scripts/package.sh); app will use an external core"
+fi
+
 xattr -cr "$app"
+# Sign inside-out: Mach-O binaries nested in Resources are not sealed by signing
+# the outer bundle, so sign the embedded core first (hardened runtime), then the
+# app. notarize-dmg.sh repeats this with the Developer ID identity for release.
+runtime_opts=(--options runtime)
+[[ "$identity" != "-" ]] && runtime_opts+=(--timestamp)
+# obscura is Chromium-based: under the hardened runtime it needs JIT entitlements
+# or it crashes (SIGTRAP) on V8 init. aitm (plain Rust) needs none.
+obscura_ent="$here/EmbeddedObscura.entitlements"
+if [[ -f "$coredir/obscura" ]]; then
+  codesign --force "${runtime_opts[@]}" --entitlements "$obscura_ent" --sign "$identity" "$coredir/obscura" 2>&1 | grep -v "replacing existing signature" || true
+fi
+if [[ -f "$coredir/aitm" ]]; then
+  codesign --force "${runtime_opts[@]}" --sign "$identity" "$coredir/aitm" 2>&1 | grep -v "replacing existing signature" || true
+fi
 codesign --force --sign "$identity" "$app" 2>&1 | grep -v "replacing existing signature" || true
 echo "installed $app (signed: ${identity})"
 
