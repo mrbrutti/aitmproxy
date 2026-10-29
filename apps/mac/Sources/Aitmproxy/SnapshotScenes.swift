@@ -34,6 +34,8 @@ enum SnapshotScene: String, CaseIterable {
     case inspectTiming = "inspect-timing"
     case inspectFind = "inspect-find"
     case inspectWebSocket = "inspect-websocket"
+    case inspectL4 = "inspect-l4"
+    case inspectL4OutOfScope = "inspect-l4-oos"
 
     func apply(to session: Session) {
         session.page = .apps
@@ -155,6 +157,12 @@ enum SnapshotScene: String, CaseIterable {
             session.responseTab = .headers
         case .inspectWebSocket:
             session.select(session.rows.first { $0.kind == .websocket }?.id)
+        case .inspectL4:
+            // The in-scope loopback capture: packet list, layer tree, craft editor.
+            session.select(session.rows.first { $0.kind == .l4 && $0.inScope }?.id)
+        case .inspectL4OutOfScope:
+            // The out-of-L4-scope session: dimmed, mutating actions disabled (AC9).
+            session.select(session.rows.first { $0.kind == .l4 && !$0.inScope }?.id)
         }
     }
 

@@ -62,6 +62,16 @@ enum Tok {
         static let onBase = DynamicColor(light: 0x1F1300, dark: 0x1F1300)
         static let tint = DynamicColor(light: 0xFEF3C7, dark: 0x3A2E12)
     }
+    /// Raw L4 (transport-layer) flows: capture, craft, inject, in-path intercept.
+    enum L4 {
+        /// The L4 kind badge and TCP/UDP/ICMP sub-label: tint background + deep text.
+        static let badge = ColorPair(
+            fg: DynamicColor(light: 0x4338CA, dark: 0xA5B4FC),
+            bg: DynamicColor(light: 0xE0E7FF, dark: 0x27254D))
+        static let base = DynamicColor(light: 0x4F46E5, dark: 0x818CF8)
+        static let deep = DynamicColor(light: 0x4338CA, dark: 0xA5B4FC)
+        static let tint = DynamicColor(light: 0xE0E7FF, dark: 0x27254D)
+    }
     enum Line {
         /// Panel edges, pane splitters, the rule under tab bars.
         static let border = DynamicColor(light: 0xE5E7EB, dark: 0x2E2E31)
