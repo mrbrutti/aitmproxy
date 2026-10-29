@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="440" viewBox="0 0 2000 440">
+  
+  <image href="glyph-dark.svg" x="40" y="40" width="360" height="360"/>
+  <text x="470" y="272" font-family="Menlo, monospace" font-size="168" letter-spacing="-3"><tspan fill="#F7F8FA" font-weight="bold">aitm</tspan><tspan fill="#7E8794" font-weight="normal">proxy</tspan></text>
+</svg>
