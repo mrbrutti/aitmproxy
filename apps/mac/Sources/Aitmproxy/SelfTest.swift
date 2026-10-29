@@ -1,3 +1,4 @@
+import AitmBusClient
 import AitmproxyKit
 import AppKit
 
@@ -281,6 +282,24 @@ enum SelfTest {
                 session.rows.removeLast(2)
                 session.select(session.rows.first { $0.seq == 50 }?.id)
             }
+
+            // Task 8: the embedded core's health dot and on-demand log panel.
+            session.coreHealth.connection = CoreConnection(
+                id: .fixture, kind: .embedded, endpoint: BusEndpoint(port: 0, token: ""),
+                status: .starting, label: "Embedded core")
+            check("the health dot maps starting to restarting", session.coreHealth.health == .restarting)
+            session.coreHealth.connection?.status = .ready
+            check("the health dot maps ready to running", session.coreHealth.health == .running)
+            session.coreHealth.connection?.status = .degraded(reason: "gave up")
+            check("the health dot maps degraded to failed", session.coreHealth.health == .failed)
+            check("the core log is empty and hidden before any output", session.coreHealth.log.isEmpty && !session.coreLogVisible)
+            session.coreHealth.record("proxy listening on 127.0.0.1:8080")
+            check("the core log captures a line", session.coreHealth.log.lines.last?.text == "proxy listening on 127.0.0.1:8080")
+            session.coreLogVisible = true
+            check("Core Log opens the on-demand panel", session.coreLogVisible)
+            session.coreLogVisible = false
+            session.coreHealth.connection = nil
+            session.coreHealth.log.removeAll()
 
             // S-069: the menu bar carries the brief's command map, and a bare-letter
             // shortcut never takes a letter from a text field.

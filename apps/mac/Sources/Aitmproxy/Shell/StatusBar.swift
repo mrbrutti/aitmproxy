@@ -33,6 +33,11 @@ struct StatusBar: View {
                 if session.memoryBytes > 0 { Text(Format.bytes(session.memoryBytes)) }
                 Text("↑ \(Format.rate(session.upBytesPerSecond))")
                 Text("↓ \(Format.rate(session.downBytesPerSecond))")
+                // The embedded core's health (Task 8): present only when the app
+                // manages its own core; an external connection shows the bus dot alone.
+                if let connection = session.coreHealth.connection {
+                    CoreHealthDot(connection: connection) { session.coreLogVisible.toggle() }
+                }
                 HStack(spacing: Tok.Metric.gapTight) {
                     Circle().fill(busColor.color).frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
                     Text(busText)

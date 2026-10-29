@@ -1057,8 +1057,12 @@ impl McpServer {
         }
         match selected {
             McpTransport::Stdio => transport::serve_stdio(server).await,
-            McpTransport::LoopbackTcp { port, token } => {
-                let listener = LoopbackTcp::bind(port, token)
+            McpTransport::LoopbackTcp {
+                port,
+                token,
+                endpoint_file,
+            } => {
+                let listener = LoopbackTcp::bind(port, token, endpoint_file)
                     .await?
                     .with_operator_token(operator_token.map(|t| t.to_string()));
                 if let Some(f) = on_bound {

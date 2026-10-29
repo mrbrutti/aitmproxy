@@ -44,6 +44,7 @@ fn config(tag: &str) -> Config {
     cfg.mcp.transport = McpTransport::LoopbackTcp {
         port: 0,
         token: TOKEN.into(),
+        endpoint_file: None,
     };
     // The loopback transport is agent-facing and gated by the M4 policy, so a
     // Sensitive command like `flow.intercept` is refused to an agent. The TUI is

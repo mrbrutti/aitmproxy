@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en" class="js">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aitmproxy — intercept anything, by hand or by agent</title>
+<meta name="description" content="A fast, memory-safe Rust intercepting proxy for authorized security testing. One console; every command available to a person or an AI over MCP.">
+<link rel="stylesheet" href="../shared/base.css">
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="../shared/ui.css">
+<link rel="stylesheet" href="../shared/site.css">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+
+<header>
+  <nav class="nav">
+    <a class="mark" href="index.html">aitm<span class="dot">·</span>proxy</a>
+    <div class="links">
+      <a href="#features">Features</a>
+      <a href="docs.html">Docs</a>
+      <a href="scripting.html">Scripting</a>
+      <a href="#languages">PoC</a>
+      <a class="button" href="#install">Install</a>
+    </div>
+  </nav>
+</header>
+
+<main>
+  <!-- HERO: headline + the console performing -->
+  <section class="hero">
+    <div class="h-text" data-in>
+      <h1 class="display">Intercept anything.<br>By hand or by agent.</h1>
+      <p class="lead">Capture, intercept, edit, replay and reproduce HTTP and WebSocket traffic — a fast, memory-safe Rust proxy that an operator or an AI can drive to 100%.</p>
+      <div class="cta">
+        <a class="btn-signal" href="#install">Install</a>
+        <a class="btn-ghost" href="docs.html">Read the docs →</a>
+      </div>
+      <p class="platform">macOS &amp; Linux · Homebrew · MIT / Apache-2.0</p>
+    </div>
+    <div class="console" data-in data-d="1">
+      <div data-ui aria-label="aitmproxy console with one request intercepted">
+        <div class="ui-bar">
+          <span class="ui-dot armed"></span>
+          <span class="ui-host">aitmproxy · listening on 127.0.0.1:8080</span>
+          <span class="ui-right">
+            <span class="ui-chip on">Intercept</span>
+            <span class="ui-chip">Agent · all</span>
+          </span>
+        </div>
+        <div class="ui-head"><span>#</span><span>Method</span><span>URL</span><span>Status</span><span>Time</span></div>
+        <div class="ui-row"><span class="ui-m">40</span><span>GET</span><span class="ui-u">/api/products?page=2</span><span class="ui-s ok">200</span><span class="ui-t">38ms</span></div>
+        <div class="ui-row armed sel"><span class="ui-m">41</span><span>POST</span><span class="ui-u">/api/cart/items</span><span class="ui-s armed">armed</span><span class="ui-t">—</span></div>
+        <div class="ui-row"><span class="ui-m">42</span><span>GET</span><span class="ui-u">wss://api.example.com/ws/chat</span><span class="ui-s warn">101</span><span class="ui-t">—</span></div>
+        <div class="ui-pane">
+          <div class="ui-tabs"><span class="on">Request</span><span>Headers</span><span>Body</span><span>Response</span></div>
+          <div class="ui-raw"><span class="k">POST /api/cart/items HTTP/1.1</span>
+<span class="h">host:</span> <span class="v">shop.example.com</span>
+<span class="h">content-type:</span> <span class="v">application/json</span>
+
+<span class="v">{ "sku": "A-1042", "qty": <span class="edit">999</span> }</span></div>
+        </div>
+        <div class="ui-actions" id="hero-actions">
+          <button class="ui-btn go" data-resume>Resume <span class="kbd">⌘⏎</span></button>
+          <button class="ui-btn kill" data-kill>Kill · reset</button>
+          <button class="ui-btn">Replay</button>
+          <span style="margin-left:auto" class="ui-m" data-status>parked at request</span>
+        </div>
+      </div>
+      <p class="caption"><span class="pulse"></span> a live flow, held in the middle — edit it, or hand it to an agent</p>
+    </div>
+  </section>
+
+  <!-- SIGNATURE: one command, two operators -->
+  <section class="sec rule" id="agent">
+    <h2 class="sec-h" data-in>One command surface. Two operators.</h2>
+    <p class="sec-p" data-in>Every capability is a registered command. The CLI, all three UIs and the MCP server invoke the same ones — so an AI can drive 100% of the tool. The only difference is the origin in the audit log, and the agent can't un-pause itself.</p>
+    <div class="ops2" data-in data-d="1">
+      <div class="pane">
+        <div class="pane-h">By hand <span class="who">operator · terminal</span><span class="badge">origin: cli</span></div>
+        <pre class="code"><code><span class="op">$</span> aitm flow mutate --id 41 \
+    --set-body '{"sku":"A-1042","qty":999}'
+<span class="cm"># edit applied · parked at request</span></code></pre>
+      </div>
+      <div class="pane">
+        <div class="pane-h">By agent <span class="who">MCP tool call</span><span class="badge">origin: mcp</span></div>
+        <pre class="code"><code><span class="pr">flow.mutate</span>({ <span class="pr">id</span>: <span class="num">41</span>,
+  <span class="pr">set_body</span>: <span class="str">'{"sku":"A-1042","qty":999}'</span> })
+<span class="cm"># edit applied · parked at request</span></code></pre>
+      </div>
+      <div class="same">→ both resolve to the <b>same flow #41</b>, held at the request phase, logged to the same audit trail.</div>
+    </div>
+  </section>
+
+  <!-- FEATURES: alternating rows with real fragments -->
+  <section class="sec rule" id="features">
+    <h2 class="sec-h" data-in>Everything you reach for, in one proxy</h2>
+    <p class="sec-p" data-in>mitmproxy- and Proxyman-class parity, built as plugins over a thin core.</p>
+
+    <div class="frow" data-in>
+      <div class="fr-text">
+        <h3>Intercept &amp; edit</h3>
+        <p>Park flows by rule — URL, method, host, phase — and edit the request <em>or</em> the response before it reaches the client. A reverted copy is always kept.</p>
+        <div class="chips"><span class="chip">request</span><span class="chip">response</span><span class="chip">by rule</span></div>
+        <a class="docs" href="docs.html">Docs →</a>
+      </div>
+      <div class="fr-media">
+        <div data-ui>
+          <div class="ui-tabs"><span class="on">Request</span><span>Headers</span><span>Body</span></div>
+          <div class="ui-raw"><span class="k">POST /api/cart/items</span>
+<span class="h">x-debug:</span> <span class="edit">1</span>
+<span class="v">{ "qty": <span class="edit">999</span> }</span></div>
+          <div class="ui-actions"><button class="ui-btn go">Resume</button><button class="ui-btn kill">Kill</button></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="frow flip" data-in>
+      <div class="fr-text">
+        <h3>Map Local &amp; Map Remote</h3>
+        <p>Serve a local file as the response for matching requests, or rewrite a request's target host before it goes upstream — both scope-gated.</p>
+        <div class="chips"><span class="chip">mock</span><span class="chip">rewrite</span><span class="chip">path-confined</span></div>
+        <a class="docs" href="docs.html">Docs →</a>
+      </div>
+      <div class="fr-media">
+        <div data-ui>
+          <div class="ui-bar"><span class="ui-dot"></span><span class="ui-host">map rules</span></div>
+          <div class="ui-raw"><span class="h">local</span>  /api/flags   <span class="v">→ ./mocks/flags.json</span>
+<span class="h">remote</span> api.prod.*   <span class="v">→ api.staging.internal</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="frow" data-in>
+      <div class="fr-text">
+        <h3>WebSocket control</h3>
+        <p>Compose and inject frames onto a live socket; intercept, edit or drop frames in flight, each direction marked.</p>
+        <div class="chips"><span class="chip">ws.send</span><span class="chip">ws.intercept</span><span class="chip">drop</span></div>
+        <a class="docs" href="docs.html">Docs →</a>
+      </div>
+      <div class="fr-media">
+        <div data-ui>
+          <div class="ui-bar"><span class="ui-dot"></span><span class="ui-host">wss://api.example.com/ws/chat</span></div>
+          <div class="ui-raw"><span class="h">↓ s2c</span> <span class="v">{"type":"ping"}</span>
+<span class="h">↑ c2s</span> <span class="v">{"type":"join","room":"<span class="edit">general</span>"}</span>
+<span class="h">↑ c2s</span> <span class="v" style="color:var(--ui-armed)">injected frame →</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="frow flip" data-in>
+      <div class="fr-text">
+        <h3>Sessions, HAR &amp; TLS passthrough</h3>
+        <p>Save and load full-fidelity sessions; import and export HAR 1.2 and mitmproxy <code>.flows</code>. Tunnel pinned hosts byte-for-byte instead of decrypting them.</p>
+        <div class="chips"><span class="chip">.aitm</span><span class="chip">HAR 1.2</span><span class="chip">passthrough</span></div>
+        <a class="docs" href="docs.html">Docs →</a>
+      </div>
+      <div class="fr-media">
+        <div data-ui>
+          <div class="ui-bar"><span class="ui-dot"></span><span class="ui-host">session · 56 flows</span><span class="ui-right"><span class="ui-chip">export HAR</span></span></div>
+          <div class="ui-raw"><span class="h">passthrough</span> *.pinned-bank.com  <span class="v" style="color:var(--ui-ok)">tunnelled</span>
+<span class="h">tls</span>         shop.example.com   <span class="v">decrypted</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- OBSERVE / ACT / REPRODUCE -->
+  <section class="sec rule" id="loop">
+    <h2 class="sec-h" data-in>Observe, act, reproduce</h2>
+    <p class="sec-p" data-in>Find a flaw by hand or let an agent explore — then turn the finding into a self-contained PoC that reruns with only aitmproxy and writes three artifacts.</p>
+    <div class="repro" data-in data-d="1">
+      <pre class="code"><code><span class="op">$</span> aitm flow list --host shop.example.com
+<span class="op">$</span> aitm request send --from 41 \
+    --set qty=999
+<span class="op">$</span> aitm poc build --from 41 \
+    --out cart-overflow.yaml
+<span class="op">$</span> aitm poc run cart-overflow.yaml</code></pre>
+      <div data-ui>
+        <div class="ui-bar"><span class="ui-dot"></span><span class="ui-host">poc.run · cart-overflow</span><span class="ui-right"><span class="ui-chip on">pass</span></span></div>
+        <div class="ui-raw"><span class="h">step 1</span> http POST /api/cart/items     <span class="v" style="color:var(--ui-ok)">matched status 200</span>
+<span class="h">step 2</span> browser navigate + screenshot   <span class="v" style="color:var(--ui-ok)">artifact saved</span>
+<span class="h">wrote </span> finding.json · cart-overflow.yaml · screenshot.png</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- THREE UIS -->
+  <section class="sec rule" id="uis">
+    <h2 class="sec-h" data-in>Three surfaces. One bus.</h2>
+    <p class="sec-p" data-in>All three are thin clients of the same command bus. One token vocabulary styles every surface; a human connects with the operator token, never the agent's.</p>
+    <div class="uis">
+      <div class="uicard" data-in>
+        <h3>macOS app</h3>
+        <div class="meta">Swift · SwiftUI · AppKit table</div>
+        <p>Fully native — a dense flow list in an NSTableView. No web view, no Electron.</p>
+      </div>
+      <div class="uicard" data-in data-d="1">
+        <h3>Web UI</h3>
+        <div class="meta">SolidJS · aitm web</div>
+        <p>Built once and embedded in the binary; served over a WebSocket bridge at native-grade snappiness.</p>
+      </div>
+      <div class="uicard" data-in data-d="2">
+        <h3>Terminal (TUI)</h3>
+        <div class="meta">Rust · ratatui · aitm tui</div>
+        <p>One binary for macOS and Linux. Keyboard-complete; degrades gracefully to a DOM outline.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- LANGUAGES -->
+  <section class="sec rule" id="languages">
+    <h2 class="sec-h" data-in>Two languages, made to read</h2>
+    <p class="sec-p" data-in>Extend the proxy in Rhai, and capture findings as declarative PoC YAML. Both are written to be read and written by people, not only agents.</p>
+    <div class="langs">
+      <div data-in>
+        <p class="lead-in">Rhai plugin</p>
+        <p class="sub">A default-deny sandbox; every hook optional; JS-like idioms. Load it without recompiling the core.</p>
+        <div class="codefile">addons/guard-admin-writes.rhai</div>
+        <pre class="code"><code><span class="kw">fn</span> <span class="fn">on_request</span>(flow) {
+    <span class="kw">let</span> req = flow.request;
+    <span class="kw">if</span> req.path.starts_with(<span class="str">"/admin"</span>)
+        &amp;&amp; req.method != <span class="str">"GET"</span> {
+        <span class="kw">if</span> !req.headers.has(<span class="str">"X-Admin-Token"</span>) {
+            flow.set_response(<span class="num">403</span>, #{}, <span class="str">"blocked"</span>);
+            <span class="kw">return</span> <span class="fn">halt</span>();
+        }
+    }
+}</code></pre>
+        <a class="docs" href="scripting.html">Rhai reference →</a>
+      </div>
+      <div data-in data-d="1">
+        <p class="lead-in">PoC YAML</p>
+        <p class="sub">A nuclei-style matcher/extractor engine with a Rhai escape hatch. Reproduces a finding deterministically.</p>
+        <div class="codefile">reflected-xss-search-q.yaml</div>
+        <pre class="code"><code><span class="yk">id</span><span class="op">:</span> reflected-xss-search-q
+<span class="yk">info</span><span class="op">:</span>
+  <span class="yk">name</span><span class="op">:</span> <span class="yv">Reflected XSS in search 'q'</span>
+  <span class="yk">severity</span><span class="op">:</span> <span class="yv">high</span>
+<span class="yk">steps</span><span class="op">:</span>
+  <span class="op">-</span> <span class="yk">http</span><span class="op">:</span>
+      <span class="yk">url</span><span class="op">:</span> <span class="yv">"{{target}}/search?q={{payload}}"</span>
+  <span class="op">-</span> <span class="yk">browser</span><span class="op">:</span>
+      <span class="yk">action</span><span class="op">:</span> <span class="yv">screenshot</span></code></pre>
+        <a class="docs" href="docs.html#poc">PoC reference →</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- STATS -->
+  <section class="sec rule" id="why">
+    <h2 class="sec-h" data-in>Built for sustained, serious load</h2>
+    <p class="sec-p" data-in>Rust, memory-safe by construction — <code>unsafe</code> is forbidden workspace-wide. Bodies stream with backpressure so peak memory stays flat.</p>
+    <div class="stats" data-in data-d="1">
+      <div class="stat"><div class="fig sig">100%</div><div class="lbl">of the tool controllable over MCP</div></div>
+      <div class="stat"><div class="fig">~10k</div><div class="lbl">requests/second, bounded memory</div></div>
+      <div class="stat"><div class="fig">3</div><div class="lbl">UIs over one command bus</div></div>
+      <div class="stat"><div class="fig">0</div><div class="lbl">lines of <code>unsafe</code> Rust</div></div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="cta" id="install">
+    <div class="cta-grid">
+      <div data-in>
+        <h2>Capture your first flow in a minute.</h2>
+        <div class="row">
+          <span class="install">brew install mrbrutti/aitmproxy/aitm <span class="cp" data-copy>⧉</span></span>
+          <a class="btn-ghost" href="docs.html">Read the docs →</a>
+        </div>
+        <p class="platform">macOS &amp; Linux · no account · free &amp; open source</p>
+      </div>
+      <div class="console" data-in data-d="1">
+        <div data-ui>
+          <div class="ui-bar"><span class="ui-dot"></span><span class="ui-host">aitm web · http://127.0.0.1:8082</span><span class="ui-right"><span class="ui-chip on">ready</span></span></div>
+          <div class="ui-raw"><span class="h">$</span> aitm web
+<span class="v">serving web UI + bus bridge</span>
+<span class="v" style="color:var(--ui-ok)">listening on 127.0.0.1:8080 · UI on :8082</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="foot">
+    <div class="footline-c" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem;max-width:1280px;margin:0 auto;padding:1rem var(--margin) 2.5rem;font-size:var(--step-small);color:var(--muted)">
+      <span><b style="color:var(--ink);font-weight:600">aitm<span style="color:var(--signal)">·</span>proxy</b> — authorized testing only</span>
+      <span style="display:flex;gap:1.4rem">
+        <a href="docs.html" style="color:var(--ink);text-decoration:none">Docs</a>
+        <a href="scripting.html" style="color:var(--ink);text-decoration:none">Scripting</a>
+        <a href="#" style="color:var(--ink);text-decoration:none">GitHub</a>
+      </span>
+      <span>2026 · MIT / Apache-2.0</span>
+    </div>
+  </div>
+</footer>
+
+<script src="../shared/app.js"></script>
+<script>
+/* C: entrance (one authored moment), copy buttons */
+(function(){
+  if (matchMedia("(prefers-reduced-motion: no-preference)").matches) {
+    var io = new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){e.target.classList.add("is-in");io.unobserve(e.target);}});},{threshold:0.14});
+    document.querySelectorAll("[data-in]").forEach(function(el){io.observe(el);});
+  } else {
+    document.querySelectorAll("[data-in]").forEach(function(el){el.classList.add("is-in");});
+  }
+})();
+</script>
+</body>
+</html>
