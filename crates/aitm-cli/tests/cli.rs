@@ -248,8 +248,11 @@ fn cli_matches_mcp() {
         .expect("cli dispatch ok");
 
     // The local `flow.list` stub declares no `sensitivity()`, so it is the
-    // fail-closed `Sensitive` default; this test compares the CLI and MCP result
-    // values, not the M4 policy gate, so it runs ungated (`All`).
+    // fail-closed `Sensitive` default with no config gate. Under the corrected
+    // policy (spec D2) the *agent* may not call such a command under any policy, so
+    // — since this test compares the CLI and MCP result values, not the policy gate
+    // — the MCP call is made over an operator connection, which is never
+    // policy-gated. (`All` agent state kept only to exercise the policy-free path.)
     let mcp = McpServer::new(reg, McpTransport::Stdio)
         .with_agent_state(Arc::new(AgentState::new(AgentPolicy::All)))
         .with_services(
@@ -260,8 +263,14 @@ fn cli_matches_mcp() {
         );
     let req = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                      "params": {"name": "flow.list", "arguments": {}}});
-    let resp: JsonValue =
-        serde_json::from_str(&mcp.handle(&req.to_string()).expect("reply")).expect("json");
+    let resp: JsonValue = serde_json::from_str(
+        &mcp.handle_on(
+            &aitm_mcp::ConnCtx::new(Frontend::Operator),
+            &req.to_string(),
+        )
+        .expect("reply"),
+    )
+    .expect("json");
     assert_eq!(resp["result"]["isError"], json!(false));
     let via_mcp =
         from_json(&resp["result"]["structuredContent"], &TypeDesc::Any).expect("to Value");

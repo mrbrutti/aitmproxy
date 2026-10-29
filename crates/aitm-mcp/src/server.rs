@@ -845,16 +845,20 @@ impl McpServer {
         let policy = self.agent_state.policy();
         let sens = cmd.sensitivity();
         let allowed = match (policy, sens) {
-            (AgentPolicy::All, _) => true,
+            (AgentPolicy::All, Sensitivity::Read | Sensitivity::Write) => true,
+            // `All` permits the Sensitive dimension, but only for a command that
+            // carries its own per-command agent config gate (ca.install/uninstall →
+            // ca.allow_agent_install, scope.add → scope.allow_agent_widen): the call
+            // is deferred to the command, which self-governs — honouring its config
+            // flag (runs iff on), dry-run escape, and its own audit/refusal — so the
+            // two dimensions (policy + config gate) stay independent (spec D2). A
+            // Sensitive command with no such gate is refused here (deny-by-default).
+            (AgentPolicy::All, Sensitivity::Sensitive) => defers_to_command_gate(cmd.name()),
             (AgentPolicy::Auto, Sensitivity::Read | Sensitivity::Write) => true,
-            // Autonomous: a Sensitive command is refused unless it carries its own
-            // per-command agent config gate (ca.install/uninstall → ca.allow_agent_install,
-            // scope.add → scope.allow_agent_widen). Those are deferred to the
-            // command, which self-governs — honouring its config flag, dry-run
-            // escape, and its own audit/refusal — so the policy gate never pre-empts
-            // the command-level posture. A Sensitive command with no such gate is
-            // refused here (deny-by-default).
-            (AgentPolicy::Auto, Sensitivity::Sensitive) => defers_to_command_gate(cmd.name()),
+            // Autonomous with zero Sensitive actions: `Auto` always refuses a
+            // Sensitive command for the agent, config gate on or not — switch to
+            // `All` (unconditional) or `Ask` (operator approval) to permit one.
+            (AgentPolicy::Auto, Sensitivity::Sensitive) => false,
             (AgentPolicy::Ask, Sensitivity::Read | Sensitivity::Write) => true,
             // `Ask` parks a Sensitive call for operator approval (Task 9); until
             // that lands it is refused rather than run.
@@ -972,9 +976,9 @@ impl McpServer {
 }
 
 /// Whether a Sensitive command carries its own per-command agent config gate, so
-/// the `Auto` policy defers the agent's call to the command (which enforces the
-/// flag, dry-run, and audit) instead of pre-empting it (spec D2, "unless its
-/// config gate allows"). Any other Sensitive command is refused by the policy gate.
+/// the `All` policy defers the agent's call to the command (which enforces the
+/// flag, dry-run, and audit) instead of pre-empting it (spec D2, "runs iff its
+/// config gate is on"). Any other Sensitive command is refused by the policy gate.
 fn defers_to_command_gate(name: &str) -> bool {
     matches!(name, "ca.install" | "ca.uninstall" | "scope.add")
 }
@@ -989,6 +993,13 @@ fn policy_refusal_reason(policy: AgentPolicy, sens: Sensitivity, name: &str) -> 
         AgentPolicy::ReadOnly => format!(
             "`{name}` refused: the agent policy is `readonly`; only read-only commands run. An \
              operator can change it with agent.set."
+        ),
+        // `Auto` runs read/write autonomously but permits no sensitive actions at
+        // all — its config gate is irrelevant here (spec D2).
+        AgentPolicy::Auto if sens == Sensitivity::Sensitive => format!(
+            "`{name}` refused: the agent policy is `auto`, which runs read and write commands \
+             autonomously but permits no sensitive actions. An operator can switch to `all` or \
+             `ask` with agent.set to allow sensitive commands."
         ),
         _ if sens == Sensitivity::Sensitive => format!(
             "`{name}` refused: a sensitive command is not allowed to the agent under the `{}` \
