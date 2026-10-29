@@ -7,6 +7,12 @@ rust-version.workspace = true
 description = "Hermetic, deliberately-vulnerable test target for authorized aitmproxy testing (M4). Grader-only manifest; no external network."
 publish = false
 
+# The standalone serve binary (AC-M4-17 operator path); the crate is otherwise a
+# library the deterministic suites link in-process.
+[[bin]]
+name = "aitm-testtarget-serve"
+path = "src/main.rs"
+
 [dependencies]
 aitm-findings.workspace = true
 bytes = "1"
