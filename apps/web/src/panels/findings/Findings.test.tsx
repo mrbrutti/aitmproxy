@@ -1,4 +1,4 @@
-import { createSignal } from 'solid-js';
+import { createSignal, Show } from 'solid-js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@solidjs/testing-library';
 import type { PocRun } from '~/bus/mock';
@@ -6,6 +6,20 @@ import type { BusClient, BusState, ToolDef } from '~/bus/types';
 import { AppProvider } from '~/state/context';
 import { createAppStore } from '~/state/app';
 import { FindingsPanel } from '~/panels/FindingsPanel';
+
+// CodeMirror does not lay out in jsdom (and the Rhai/YAML colorizers + completion have their own unit
+// tests in src/viewers/lang). Stub CodeViewer with a plain element so these tests cover the Findings
+// behaviour — which YAML is shown, the loading state, the local edit/save flow — not the editor chrome.
+vi.mock('~/viewers/CodeViewer', () => ({
+  CodeViewer: (props: { doc: { text: string; editable?: boolean; onChange?: (t: string) => void } | null; label?: string }) => (
+    <Show
+      when={props.doc?.editable}
+      fallback={<div aria-label={props.label}>{props.doc?.text}</div>}
+    >
+      <textarea aria-label={props.label} value={props.doc?.text ?? ''} onInput={(e) => props.doc?.onChange?.(e.currentTarget.value)} />
+    </Show>
+  ),
+}));
 
 /** A bus that serves `poc.list` from a fixed array and nothing else; `address: 'fixtures'` keeps the store from polling. */
 function fakeBus(runs: PocRun[]): BusClient {
@@ -216,7 +230,7 @@ describe('FindingsPanel', () => {
     const runAgain = screen.getByRole('button', { name: /Run again/ }) as HTMLButtonElement;
     expect(runAgain.disabled).toBe(true);
     expect(runAgain.title).toContain('export the YAML into poc.dir');
-    expect(screen.getByLabelText('PoC YAML').textContent).toBe('name: cua-reflectedvars:  q: probe');
+    expect(screen.getByLabelText('PoC YAML').textContent).toBe('name: cua-reflected\nvars:\n  q: probe\n');
 
     // Export › YAML downloads the text (jsdom has no object URLs or Blob.text(); read it with a FileReader).
     const blobs: Blob[] = [];
@@ -246,7 +260,7 @@ describe('FindingsPanel', () => {
     expect(screen.getByText('Run the PoC to evaluate its assertions.')).toBeTruthy();
     expect(screen.queryByText('No YAML for this run.')).toBeNull();
     expect(screen.getByRole('progressbar', { name: 'Loading PoC YAML' })).toBeTruthy();
-    await waitFor(() => expect(screen.getByLabelText('PoC YAML').textContent).toBe('name: libvars:  q: probe'));
+    await waitFor(() => expect(screen.getByLabelText('PoC YAML').textContent).toBe('name: lib\nvars:\n  q: probe\n'));
     expect(calls.filter((c) => c === 'poc.get')).toHaveLength(1);
 
     const runAgain = screen.getByRole('button', { name: /Run again/ }) as HTMLButtonElement;
@@ -265,17 +279,15 @@ describe('FindingsPanel', () => {
     expect(calls.filter((c) => c === 'poc.get')).toHaveLength(1);
   });
 
-  it('highlights the YAML and edits it locally', async () => {
+  it('shows the YAML in the editor and edits it locally', async () => {
     mount(RUNS);
     await screen.findAllByRole('option');
-    const pre = screen.getByLabelText('PoC YAML');
-    expect(pre.textContent).toBe('name: x');
-    expect(pre.querySelectorAll('[class]').length).toBeGreaterThanOrEqual(3); // key, punct, string
+    expect(screen.getByLabelText('PoC YAML').textContent).toBe('name: x\n');
     fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
     const ta = screen.getByLabelText('Edit PoC YAML') as HTMLTextAreaElement;
     fireEvent.input(ta, { target: { value: 'name: y\n' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
-    await waitFor(() => expect(screen.getByLabelText('PoC YAML').textContent).toBe('name: y'));
+    await waitFor(() => expect(screen.getByLabelText('PoC YAML').textContent).toBe('name: y\n'));
     expect(screen.getByText(/Edited locally/)).toBeTruthy();
   });
 });
