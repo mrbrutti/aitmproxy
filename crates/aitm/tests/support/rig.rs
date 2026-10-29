@@ -239,6 +239,7 @@ impl Rig {
             McpTransport::LoopbackTcp {
                 port: 0,
                 token: AGENT_TOKEN.to_string(),
+                endpoint_file: None,
             },
         )
         .with_ssrf_policy(cfg.browser.ssrf.clone())

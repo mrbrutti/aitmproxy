@@ -56,6 +56,8 @@ public struct ConnectionInfo: Hashable, Sendable {
 /// Everything the inspector needs for one flow.
 public struct FlowDetail: Hashable, Sendable {
     public var id: FlowID
+    /// The core connection this flow came from (Task 5), mirroring `FlowRow.coreID`.
+    public var coreID: CoreID
     public var request: HTTPMessage
     public var response: HTTPMessage?
     public var connection: ConnectionInfo
@@ -69,8 +71,10 @@ public struct FlowDetail: Hashable, Sendable {
 
     public init(id: FlowID, request: HTTPMessage, response: HTTPMessage? = nil,
                 connection: ConnectionInfo, originalRequest: HTTPMessage? = nil, timing: FlowTiming? = nil,
-                requestBodyExtent: BodyExtent? = nil, responseBodyExtent: BodyExtent? = nil) {
+                requestBodyExtent: BodyExtent? = nil, responseBodyExtent: BodyExtent? = nil,
+                coreID: CoreID = .fixture) {
         self.id = id
+        self.coreID = coreID
         self.request = request
         self.response = response
         self.connection = connection

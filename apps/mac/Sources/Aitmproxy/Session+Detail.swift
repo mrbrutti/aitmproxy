@@ -18,7 +18,7 @@ extension Session {
     /// decodes into `wsDetails` (handshake + frames, S-045); HTTP into `details`.
     func loadDetail(_ id: FlowID) async {
         guard let value = try? await runCommand("flow.detail", ["id": .string(id.raw), "body": .string("inline")]) else { return }
-        if let detail = FlowDetail(detailJSON: value) {
+        if let detail = FlowDetail(detailJSON: value, coreID: activeCoreID) {
             details[id] = detail
         } else if let ws = WSDetail(detailJSON: value) {
             wsDetails[id] = ws

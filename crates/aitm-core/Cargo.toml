@@ -14,6 +14,10 @@ indexmap.workspace = true
 regex = "1"
 tokio = { workspace = true, features = ["sync", "io-util", "net", "rt", "time"] }
 tracing.workspace = true
+# Downcast target for the connection-error classifier: a client that aborts the
+# TLS handshake surfaces a `rustls::Error` (e.g. a received alert) wrapped by the
+# TLS layer; we read its type, never its message, to demote it to `debug`.
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 # Per-user config dir for the CA material, so the key is never written into the
 # launch directory where another process could read or plant it.
 dirs = "5"
