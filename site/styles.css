@@ -79,32 +79,52 @@ em.hint { font-style: italic; }
 .copy[data-done] .copy-label::after { content: "Copied"; }
 .copy .copy-label::after { content: "Copy"; }
 
-/* ---------- code blocks (dark ink, one accent) ---------- */
+/* ---------- code blocks = the app's body viewer (CodeMirror theme) ---------- */
 .code {
-  margin: 0; background: var(--console); color: var(--console-text);
-  border-radius: var(--radius-panel); overflow: hidden; font-size: var(--fs-mono); line-height: 1.6;
+  margin: 0; background: var(--console-2); color: var(--console-text);
+  border: 1px solid var(--console-line); border-radius: var(--radius-panel);
+  overflow: hidden; font-size: var(--fs-mono); line-height: 1.55;
 }
 .code figcaption {
   display: flex; align-items: center; justify-content: space-between; gap: 1rem;
-  padding: 0.55rem 0.5rem 0.55rem 1rem; border-bottom: 1px solid var(--console-line);
+  padding: 0.5rem 0.5rem 0.5rem 0.9rem; background: var(--console);
+  border-bottom: 1px solid var(--console-line);
   font-family: var(--mono); font-size: var(--fs-mono-s); color: var(--console-muted);
 }
-.code figcaption .copy { color: var(--console-text); border-left: 0; padding: 0.25rem 0.5rem; border-radius: var(--radius); }
-.code figcaption .copy:hover { background: var(--console-2); }
-.code pre { margin: 0; padding: 1rem 1.25rem 1.1rem; overflow-x: auto; tab-size: 4; }
-.code code { display: block; min-width: max-content; }
-.code .c { color: var(--console-muted); font-style: italic; }
-.code .k { color: #ffffff; font-weight: 500; }
-.code .s { color: var(--console-signal); }
-.code .n { color: var(--console-signal); }
-.code .f { color: #ffffff; }
-.code .p { color: #a9a9a3; }
-.code .yk { color: #ffffff; }
+.code figcaption .copy { color: var(--console-muted); border-left: 0; padding: 0.25rem 0.55rem; border-radius: var(--radius); }
+.code figcaption .copy:hover { background: var(--console-2); color: var(--console-text); }
+.code pre { margin: 0; padding: 0.75rem 0; overflow-x: auto; tab-size: 2; counter-reset: ln; }
+.code code { display: block; }
+/* line gutter — the viewer's numbered lines; JS wraps each line in .cl > .lc */
+.code .cl { display: grid; grid-template-columns: 3rem 1fr; align-items: baseline; }
+.code .cl::before {
+  content: counter(ln); counter-increment: ln;
+  color: var(--cm-ln); text-align: right; padding-right: 1rem;
+  font-variant-numeric: tabular-nums; -webkit-user-select: none; user-select: none;
+}
+.code .cl > .lc { white-space: pre-wrap; overflow-wrap: anywhere; padding-right: 1.1rem; }
+.code .cl.cur { background: var(--cm-current); }
+/* when JS hasn't run (no .cl), fall back to simple padded code */
+.code code:not(:has(.cl)) { padding: 0 1.1rem; white-space: pre; }
+/* syntax — the app's CodeMirror highlight style */
+.code .c  { color: var(--cm-punct); font-style: italic; }
+.code .k  { color: var(--cm-boolean); }
+.code .s  { color: var(--cm-string); }
+.code .n  { color: var(--cm-number); }
+.code .f  { color: var(--cm-key); }
+.code .p  { color: var(--cm-punct); }
+.code .yk { color: var(--cm-key); }
 .code .yv { color: var(--console-text); }
-.code .pr { color: var(--console-muted); user-select: none; }
-.code .out { color: #c9c9c3; }
-.code .hl { background: #2a2611; box-shadow: 0 0 0 0.25rem #2a2611; }
-.code .mark { background: var(--console-signal); color: var(--signal-ink); padding: 0 0.2em; }
+.code .pr { color: var(--cm-punct); -webkit-user-select: none; user-select: none; }
+.code .out { color: var(--console-muted); }
+.code .hl { background: var(--cm-current); box-shadow: 0 0 0 0.25rem var(--cm-current); }
+.code .mark { background: var(--cm-match); color: var(--console-text); padding: 0 0.2em; border-radius: 2px; }
+/* a terminal transcript is NOT the editor: darker ground, no line gutter */
+.code.term { background: var(--console); }
+.code.term pre { padding: 0.85rem 0; }
+.code.term .cl { grid-template-columns: 1.25rem 1fr; }
+.code.term .cl::before { content: ""; counter-increment: none; padding-right: 0; }
+.code.term .lc { padding-left: 0.4rem; }
 
 /* a terminal transcript or MCP transcript */
 .term .who { color: var(--console-muted); display: inline-block; min-width: 1.4ch; }
@@ -184,6 +204,16 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
 .hero .display { text-wrap: wrap; max-width: 20ch; }
 .hero .lead { margin-top: 1.25rem; }
 
+/* hero entrance: lines rise, then the sentence and actions fade up (rupu cadence) */
+.hero .display .line { display: block; overflow: hidden; padding-bottom: 0.06em; margin-bottom: -0.06em; }
+.hero .display .line > span { display: block; translate: 0 112%; animation: rise 900ms var(--ease-out) forwards; }
+.hero .display .line:nth-child(2) > span { animation-delay: 100ms; }
+@keyframes rise { to { translate: 0 0; } }
+.hero .lead { animation: fade-up 700ms var(--ease-out) 360ms backwards; }
+.hero .hero-cta { animation: fade-up 700ms var(--ease-out) 440ms backwards; }
+.hero .hero-foot { animation: fade-up 700ms var(--ease-out) 520ms backwards; }
+@keyframes fade-up { from { opacity: 0; translate: 0 12px; } }
+
 .wire { display: flex; align-items: center; margin-top: clamp(2rem, 4vw, 3.25rem); margin-inline: calc(-1 * var(--margin)); }
 .wire-end { flex: none; padding-inline: var(--margin) 1rem; font-style: italic; font-size: var(--fs-small); color: var(--ink-2); }
 .wire-end--server { padding-inline: 1rem var(--margin); }
@@ -208,12 +238,48 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
 .held-body .h { color: var(--ink-2); }
 .held-body .edit { background: var(--signal); padding: 0 0.15em; }
 
-/* the authored motion: a packet travels to the cut, and the flow arms */
-@keyframes travel { to { transform: translateX(0); } }
-@keyframes travel-v { to { transform: translateY(0); } }
-@keyframes arm { to { opacity: 1; } }
-.packet-track { animation: travel 1200ms var(--ease-out) 350ms forwards; }
-.state::before, .wire-seg--in::after, .wire-seg--out::before { animation: arm 300ms var(--ease-out) 1450ms forwards; }
+/* ---- the hero wire: a live, looping scene (JS sets data-phase on .wire) ----
+   request arrives → flow is held & armed (amber) → edited → resumed → 200 (green) → loop */
+.wire-seg .packet-track { --p: -100%; transform: translateX(var(--p)); }
+.wire[data-anim] .wire-seg .packet-track { transition: transform 1100ms var(--ease-out); }
+.packet { opacity: 0; transition: opacity 200ms var(--ease-out); }
+.wire[data-phase] .wire-seg--in .packet { opacity: 1; }
+/* in-packet reaches the cut on arrive and stays through held/edit */
+.wire[data-phase="arrive"] .wire-seg--in .packet-track,
+.wire[data-phase="held"]   .wire-seg--in .packet-track,
+.wire[data-phase="edit"]   .wire-seg--in .packet-track { --p: 0; }
+/* on resume the in-packet is consumed; the out-packet carries the edited request on */
+.wire[data-phase="resume"] .wire-seg--in .packet, .wire[data-phase="done"] .wire-seg--in .packet { opacity: 0; }
+.wire[data-phase="resume"] .wire-seg--out .packet, .wire[data-phase="done"] .wire-seg--out .packet { opacity: 1; }
+.wire[data-phase="resume"] .wire-seg--out .packet-track,
+.wire[data-phase="done"]   .wire-seg--out .packet-track { --p: 0; }
+
+/* the amber arm ticks flank the cut while the flow is held */
+.wire-seg--in::after, .wire-seg--out::before { opacity: 0; transition: opacity 320ms var(--ease-out); }
+.wire[data-phase="held"] .wire-seg--in::after, .wire[data-phase="edit"] .wire-seg--in::after,
+.wire[data-phase="held"] .wire-seg--out::before, .wire[data-phase="edit"] .wire-seg--out::before { opacity: 1; }
+
+/* the held flow's state badge: armed (amber) → done (green) */
+.held .state { transition: color 320ms var(--ease-out), border-color 320ms var(--ease-out); }
+.held .state::before { opacity: 0; transition: opacity 320ms var(--ease-out); }
+.held[data-state="armed"] .state::before { opacity: 1; background: var(--signal); }
+.held[data-state="done"]  .state { color: var(--st-ok); border-color: color-mix(in srgb, var(--st-ok) 40%, transparent); }
+/* the edited value lights only while the flow is held */
+.held .edit { background: transparent; transition: background 320ms var(--ease-out); }
+.held[data-state="armed"] .edit { background: var(--signal); }
+/* a live ring on the armed badge */
+.held[data-state="armed"] .state::after {
+  content: ""; position: absolute; inset: -2px; border-radius: var(--radius-badge);
+  border: 1.5px solid var(--signal); opacity: 0; animation: live-ring 2000ms var(--ease-out) infinite;
+}
+@keyframes live-ring { 0% { opacity: .7; transform: scale(1); } 70% { opacity: 0; transform: scale(1.3); } 100% { opacity: 0; } }
+
+/* the live dot on captions (showcase, hero) pulses while in view */
+.live { position: relative; }
+.live::after {
+  content: ""; position: absolute; inset: -4px; border-radius: 50%;
+  border: 1px solid currentColor; opacity: 0; animation: live-ring 2200ms var(--ease-out) infinite;
+}
 
 .operators { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap); margin-top: clamp(2rem, 4vw, 3rem); width: min(100%, 60rem); margin-inline: auto; }
 .operator { position: relative; padding-top: 1.25rem; }
@@ -479,7 +545,7 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
   .wire-seg--in::after, .wire-seg--out::before { width: 1.25rem; height: 2px; margin: 0 0 0 -0.625rem; top: auto; left: 50%; }
   .wire-seg--in::after { bottom: 0; right: auto; }
   .wire-seg--out::before { top: 0; }
-  .packet-track { transform: translateY(-100%); animation-name: travel-v; }
+  .wire-seg .packet-track { transform: translateY(var(--p)); }
   .packet { right: auto; top: auto; bottom: -6px; left: 50%; margin: 0 0 0 -6px; }
   .held { width: 100%; margin-inline: 0; font-size: var(--fs-mono-s); }
   .operators { grid-template-columns: 1fr; }
@@ -508,7 +574,10 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
 }
 
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation-duration: 0.001ms !important; animation-delay: 0ms !important; transition-duration: 0.001ms !important; }
-  .packet-track { transform: none; }
-  .state::before, .wire-seg--in::after, .wire-seg--out::before { opacity: 1; }
+  *, *::before, *::after { animation-duration: 0.001ms !important; animation-delay: 0ms !important; transition-duration: 0.001ms !important; animation-iteration-count: 1 !important; }
+  .wire-seg--in .packet-track { --p: 0; }
+  .wire-seg--in .packet { opacity: 1; }
+  .wire-seg--in::after, .wire-seg--out::before { opacity: 1; }
+  .held .state::before { opacity: 1; background: var(--signal); }
+  .held .edit { background: var(--signal); }
 }

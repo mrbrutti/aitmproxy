@@ -61,6 +61,17 @@
   --console-agent: #2DD4BF;   /* teal on dark */
   --console-blue:  #60A5FA;
 
+  /* syntax palette — the app's CodeMirror body-viewer theme (dark values from tokens.json) */
+  --cm-key:     #E58BC9;  /* property names, YAML/JSON keys */
+  --cm-string:  #E8B86D;  /* string values */
+  --cm-number:  #7FD88F;  /* numbers */
+  --cm-boolean: #C4B5FD;  /* true/false/null, keywords */
+  --cm-punct:   #8E8E93;  /* braces, colons, commas, comments */
+  --cm-bracket: #E5C07B;  /* outer object/array brackets */
+  --cm-ln:      #5C5C62;  /* line numbers */
+  --cm-current: #232325;  /* current-line highlight */
+  --cm-match:   #6B5312;  /* find-in-body highlight */
+
   /* type — two faces, one job each */
   --serif: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;   /* UI face */
   --mono:  "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;

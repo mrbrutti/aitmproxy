@@ -2,6 +2,17 @@
 (function () {
   "use strict";
 
+  /* Numbered lines on code viewers (not terminals): wrap each line, CSS counts them. */
+  document.querySelectorAll(".code:not(.term) pre > code").forEach(function (code) {
+    if (code.querySelector(".cl")) return;
+    var lines = code.innerHTML.split("\n");
+    // drop a single trailing empty line from a closing newline
+    if (lines.length > 1 && lines[lines.length - 1].trim() === "") lines.pop();
+    code.innerHTML = lines.map(function (ln) {
+      return '<span class="cl"><span class="lc">' + (ln.length ? ln : "&#8203;") + "</span></span>";
+    }).join("");
+  });
+
   /* Copy buttons: copy the nearest code/pre text. */
   document.querySelectorAll("[data-copy]").forEach(function (btn) {
     btn.addEventListener("click", function () {
@@ -68,6 +79,35 @@
   } else {
     reveals.forEach(function (el) { el.classList.add("in"); });
   }
+
+  /* Hero wire: a live, looping scene. A request arrives and is held & armed,
+     then resumed; it completes 200. Pauses off screen; static under reduced motion. */
+  (function () {
+    var wire = document.querySelector(".hero .wire");
+    if (!wire) return;
+    var held = wire.querySelector(".held");
+    var stateEl = wire.querySelector(".state");
+    if (!held || !stateEl) return;
+    function set(phase, st, txt) { wire.setAttribute("data-phase", phase); held.setAttribute("data-state", st); stateEl.textContent = txt; }
+    if (reduce) { set("held", "armed", "armed"); return; }
+    // [phase, held-state, badge text, ms]
+    var steps = [["arrive", "", "—", 1300], ["held", "armed", "armed", 2600], ["resume", "armed", "resuming…", 1150], ["done", "done", "200", 2000]];
+    var timer = null, running = false;
+    function step(i) {
+      var s = steps[i]; set(s[0], s[1], s[2]);
+      timer = setTimeout(function () { if (i + 1 < steps.length) step(i + 1); else cycle(); }, s[3]);
+    }
+    function cycle() {
+      wire.removeAttribute("data-anim"); set("reset", "", "—");
+      requestAnimationFrame(function () { requestAnimationFrame(function () { wire.setAttribute("data-anim", ""); step(0); }); });
+    }
+    function start() { if (running) return; running = true; cycle(); }
+    function stop() { running = false; clearTimeout(timer); }
+    if ("IntersectionObserver" in window) {
+      new IntersectionObserver(function (es) { es.forEach(function (e) { if (e.isIntersecting) start(); else stop(); }); }, { threshold: 0.25 }).observe(wire);
+    }
+    start();
+  })();
 
   /* Close the small-screen menu when a link inside it is chosen. */
   var menu = document.querySelector("details.menu");

@@ -38,19 +38,19 @@
 <!-- ============ HERO: the wire ============ -->
 <section class="hero">
   <div class="wrap">
-    <h1 class="display">Intercept anything&nbsp;—<br>by&nbsp;hand or by&nbsp;agent.</h1>
+    <h1 class="display"><span class="line"><span>Intercept anything&nbsp;—</span></span><span class="line"><span>by&nbsp;hand or by&nbsp;agent.</span></span></h1>
     <p class="lead">aitmproxy captures, intercepts, edits, replays and reproduces HTTP and WebSocket traffic. One core, driven completely by an operator or by an AI assistant: the same commands over the CLI, the GUI and MCP.</p>
 
     <div class="wire" role="img" aria-label="A request travelling from a client toward a server is held in mid-air by aitmproxy, where its body has been edited.">
       <span class="wire-end wire-end--client" aria-hidden="true">client</span>
       <span class="wire-seg wire-seg--in" aria-hidden="true"><span class="packet-track"><span class="packet"></span></span></span>
 
-      <div class="held" aria-hidden="true">
+      <div class="held" aria-hidden="true" data-state="armed">
         <div class="held-head">
           <span class="id">#41</span>
           <span class="method">POST</span>
           <span class="path">/api/cart/items</span>
-          <span class="state pulse">armed</span>
+          <span class="state">armed</span>
         </div>
 <pre class="held-body"><span class="h">host:</span> shop.example.com
 <span class="h">content-type:</span> application/json
@@ -59,7 +59,7 @@
 { "sku": "A-1042", "qty": <span class="edit">999</span> }</pre>
       </div>
 
-      <span class="wire-seg wire-seg--out" aria-hidden="true"></span>
+      <span class="wire-seg wire-seg--out" aria-hidden="true"><span class="packet-track"><span class="packet"></span></span></span>
       <span class="wire-end wire-end--server" aria-hidden="true">server</span>
     </div>
 
