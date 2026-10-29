@@ -166,6 +166,13 @@ export const Sidebar: Component<{ class?: string }> = (props) => {
         <Item icon="globe" label="Browser" count="1 tab" current={is({ kind: 'browser' })} onClick={pick({ kind: 'browser' })} />
         <Item icon="code" label="Scripts" count="0 active" current={is({ kind: 'scripts' })} onClick={pick({ kind: 'scripts' })} />
         <Item
+          icon="circle-dot"
+          label="L4"
+          count={app.proxy.tools.some((t) => t.name === 'l4.flow.list') ? 'on' : 'off'}
+          current={is({ kind: 'l4' })}
+          onClick={pick({ kind: 'l4' })}
+        />
+        <Item
           icon="bot"
           label="Agent"
           count={`${app.proxy.agentActionsLastMinute}/min`}

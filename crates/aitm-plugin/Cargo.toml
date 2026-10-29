@@ -8,6 +8,11 @@ description = "Ergonomic re-export of the aitm-core protocol seam for external p
 
 [dependencies]
 aitm-core.workspace = true
+# Seam catalog types derive serde for the shared `rhai.api.json` /
+# `poc-yaml.schema.json`; PoC step bodies are late-parsed `serde_yaml::Value`.
+# `aitm-plugin` stays rhai-free: host fns speak `aitm_core::Value` only.
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
 
 [dev-dependencies]
 anyhow.workspace = true

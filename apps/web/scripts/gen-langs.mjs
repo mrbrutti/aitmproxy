@@ -32,6 +32,10 @@ const read = (name) => strip(JSON.parse(readFileSync(resolve(langs, name), 'utf8
 const rhaiGrammar = read('rhai.grammar.json');
 const rhaiApi = read('rhai.api.json');
 const pocSchema = read('poc-yaml.schema.json');
+// The shared flow-kind descriptors (ui-ext Part 3 §3.1, with the `list_cmd`/`detail_cmd`
+// amendment): the surface's flow list and inspector render each kind against this, so adding a
+// kind (L4) is data + renderers, never a rewrite, and a surface can never "only render HTTP".
+const flowKinds = read('flow-kinds.json');
 
 const lit = (v) => JSON.stringify(v, null, 2);
 
@@ -44,6 +48,8 @@ export const rhaiGrammar = ${lit(rhaiGrammar)} as const;
 export const rhaiApi = ${lit(rhaiApi)} as const;
 
 export const pocSchema = ${lit(pocSchema)} as const;
+
+export const flowKinds = ${lit(flowKinds)} as const;
 `;
 
 mkdirSync(dirname(out), { recursive: true });
@@ -72,5 +78,5 @@ export const pocCompletionFixtures: CompletionFixture[] = ${lit(pocCompletion)};
 writeFileSync(confOut, confTs);
 
 console.log(
-  `defs.gen.ts: rhai ${rhaiGrammar.keywords.length} keywords, api ${rhaiApi.hooks.length} hooks + ${rhaiApi.flow.length} flow members, poc ${Object.keys(pocSchema.keys).length} top-level keys`,
+  `defs.gen.ts: rhai ${rhaiGrammar.keywords.length} keywords, api ${rhaiApi.hooks.length} hooks + ${rhaiApi.flow.length} flow members, poc ${Object.keys(pocSchema.keys).length} top-level keys, ${flowKinds.length} flow kinds`,
 );

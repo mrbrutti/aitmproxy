@@ -1,0 +1,16 @@
+[package]
+name = "aitm-proto-test"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "A minimal test protocol crate exercising the ProtocolLanguage seam (no real wire effects)."
+
+[dependencies]
+aitm-core.workspace = true
+aitm-plugin.workspace = true
+# PoC step bodies are late-parsed `serde_yaml::Value` (the seam's body type).
+serde_yaml = "0.9"
+
+[lints]
+workspace = true

@@ -1,5 +1,5 @@
 //! Task 9 — `RhaiLoader`: one shared hardened engine with the whole host
-//! surface registered, each `.rhai` file compiled once into a `ScriptPlugin`.
+//! surface registered, each `.rhai` file compiled once into a `LoadedScript`.
 //! A script that does not compile is skipped with a positioned
 //! `ScriptError::Compile` and the rest still load (AC-M3-9); under `strict`
 //! the load fails fast instead. `validate` compiles without building a plugin.
@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime};
 
 use aitm_core::{
     Body, ConnInfo, Event, Flow, FlowCtx, FlowId, FlowMeta, HeaderMap, HttpFlow, HttpRequest,
-    HttpVersion, InterceptState, MemFlowStore, Plugin, ProxyClient, StdGuard, Value, Verdict,
+    HttpVersion, InterceptState, MemFlowStore, ProxyClient, StdGuard, Value, Verdict,
 };
 use aitm_plugin_rhai::config::{RhaiConfig, RhaiLimits, ScriptEntry};
 use aitm_plugin_rhai::error::ScriptError;
@@ -26,6 +26,10 @@ use aitm_plugin_rhai::loader::{Registers, RhaiLoader};
 
 const TAGGER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tagger.rhai");
 const BROKEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/broken.rhai");
+
+/// A body cap comfortably larger than any test body, passed to
+/// `LoadedScript::dispatch` (the host supplies the proxy's configured cap).
+const MAX_BODY: usize = 1 << 20;
 
 /// A client that is never reached: no test sends.
 struct StubClient;
@@ -336,12 +340,12 @@ async fn load_one_wires_options_and_hooks() {
         .options
         .insert("tag".to_string(), Value::Str("from-config".to_string()));
 
-    let mut plugin = loader.load_one(&entry).expect("tagger loads");
+    let plugin = loader.load_one(&entry).expect("tagger loads");
     assert_eq!(plugin.meta().path, PathBuf::from(TAGGER));
 
     let mut flow = http_flow();
     let id = flow.id();
-    let verdict = plugin.on_event(&Event::Request(id), &mut FlowCtx::new(&mut flow));
+    let verdict = plugin.dispatch(&Event::Request(id), &mut FlowCtx::new(&mut flow), MAX_BODY);
 
     assert_eq!(verdict, Verdict::Continue);
     assert_eq!(
@@ -388,10 +392,10 @@ async fn bare_script_defaults_and_declaration_order() {
         "declaration order is chain order"
     );
 
-    let mut plugin = plugins.into_iter().nth(1).expect("the bare plugin");
+    let plugin = plugins.into_iter().nth(1).expect("the bare plugin");
     let mut flow = http_flow();
     let id = flow.id();
-    plugin.on_event(&Event::Request(id), &mut FlowCtx::new(&mut flow));
+    plugin.dispatch(&Event::Request(id), &mut FlowCtx::new(&mut flow), MAX_BODY);
     assert_eq!(
         http(&flow).request.headers.get("X-Bare"),
         Some("1"),

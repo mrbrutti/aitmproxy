@@ -55,6 +55,15 @@ pub struct Fixture {
     pub browser_screenshot: String,
     /// The last `browser.navigate` URL.
     pub browser_url: String,
+    /// The L4 flow store (`l4_flows` key): each entry is an `l4.flow.get`
+    /// object. Served by `l4.flow.list` (ids) and `l4.flow.get` (ui-ext Part 3).
+    pub l4_flows: Vec<Value>,
+    /// The L4 scope entries (`l4_scope` key), as serialized `L4ScopeEntry`s.
+    pub l4_scope: Vec<Value>,
+    /// The four per-feature agent gate states (`l4_agent` key).
+    pub l4_agent: Value,
+    /// L4-capable interfaces (`l4_interfaces` key).
+    pub l4_interfaces: Vec<Value>,
     next_id: u64,
 }
 
@@ -135,6 +144,12 @@ impl Fixture {
                 .unwrap_or("")
                 .to_string(),
             browser_url: String::new(),
+            l4_flows: arr("l4_flows"),
+            l4_scope: arr("l4_scope"),
+            l4_agent: v.get("l4_agent").cloned().unwrap_or_else(
+                || json!({"capture": false, "inject": false, "intercept": false, "widen": false}),
+            ),
+            l4_interfaces: arr("l4_interfaces"),
             next_id,
         })
     }
@@ -628,6 +643,84 @@ impl Fixture {
                 }))
             }
             "browser.get_dom" => Ok(Value::String(self.browser_dom.clone())),
+            // ----- L4 operator surface (ui-ext Part 3) -----
+            "l4.interfaces" => Ok(Value::Array(self.l4_interfaces.clone())),
+            "l4.flow.list" => Ok(Value::Array(
+                self.l4_flows
+                    .iter()
+                    .filter_map(|f| f.get("id").cloned())
+                    .collect(),
+            )),
+            "l4.flow.get" => {
+                let id = id_arg()?;
+                self.l4_flows
+                    .iter()
+                    .find(|f| f.get("id").and_then(Value::as_str) == Some(id.as_str()))
+                    .cloned()
+                    .ok_or_else(|| format!("no L4 flow with id {id}"))
+            }
+            "l4.scope.list" => Ok(Value::Array(self.l4_scope.clone())),
+            "l4.scope.add" => {
+                let entry = json!({
+                    "interface": args.get("interface").and_then(Value::as_str).unwrap_or("lo0"),
+                    "capability": args.get("capability").and_then(Value::as_str).unwrap_or("capture"),
+                    "cidr": args.get("cidr").cloned().unwrap_or(json!("127.0.0.0/8")),
+                    "ports": args.get("ports").cloned().unwrap_or(json!("0-65535")),
+                    "direction": args.get("direction").and_then(Value::as_str).unwrap_or("outbound"),
+                });
+                self.l4_scope.push(entry);
+                Ok(Value::String("l4-scope-new".into()))
+            }
+            "l4.scope.remove" => Ok(Value::Bool(true)),
+            "l4.craft" => {
+                // A pure build; the fixture returns canned bytes + summary.
+                let bytes = b"probe";
+                Ok(json!({
+                    "length": bytes.len(),
+                    "bytes": base64::encode(bytes),
+                    "summary": {"layers": ["IPv4", "UDP", "Raw"], "length": bytes.len()},
+                }))
+            }
+            "l4.capture.start" => Ok(json!({
+                "id": "l4-cap",
+                "interface": args.get("interface").and_then(Value::as_str).unwrap_or("lo0"),
+            })),
+            "l4.capture.stop" => Ok(Value::String("ok".into())),
+            "l4.capture.status" => Ok(json!({"running": false})),
+            "l4.intercept.start" => Ok(json!({"id": "l4-4", "queue": 100})),
+            "l4.intercept.stop" => Ok(Value::String("ok".into())),
+            "l4.intercept.status" => Ok(json!({"running": true})),
+            "l4.intercept.list" => Ok(Value::Array(Vec::new())),
+            "l4.intercept.mutate" => Ok(Value::String("ok".into())),
+            // The guarded wire verbs run the confirm-over-the-wire handshake:
+            // a first call (no `_confirm`) returns `needs_confirmation`; the
+            // re-issue with `_confirm` proceeds (M4 D4).
+            "l4.inject" | "l4.send_recv" | "l4.intercept.forward" | "l4.intercept.drop" => {
+                if args.get("_confirm").is_none() {
+                    return Ok(l4_needs_confirmation(name, args));
+                }
+                match name {
+                    "l4.inject" => Ok(json!({"injected": 1, "flow_id": "l4-2"})),
+                    "l4.send_recv" => Ok(json!({"outcome": "response", "flow_id": "l4-1"})),
+                    _ => Ok(Value::String("ok".into())),
+                }
+            }
+            "l4.agent.status" => Ok(self.l4_agent.clone()),
+            "l4.agent.set" => {
+                let cap = args
+                    .get("capability")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing `capability`".to_string())?;
+                if !matches!(cap, "inject" | "capture" | "intercept" | "widen") {
+                    return Err(format!("unknown capability `{cap}`"));
+                }
+                let allowed = args
+                    .get("allowed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.l4_agent[cap] = Value::Bool(allowed);
+                Ok(self.l4_agent.clone())
+            }
             n if n.starts_with("ca.") => Err("CA changes are not simulated by the fixture".into()),
             other => Err(format!("fixture does not implement `{other}`")),
         }
@@ -698,6 +791,38 @@ fn encode_body(m: &mut Map<String, Value>) {
     if !m.contains_key("body_truncated") {
         m.insert("body_truncated".into(), Value::Bool(false));
     }
+}
+
+/// The M4 confirm-over-the-wire reply: the wire summary a guarded L4 verb
+/// returns when it carries no `_confirm` (destination, count, scope, budget).
+fn l4_needs_confirmation(name: &str, args: &Map<String, Value>) -> Value {
+    let dst = args
+        .get("dst")
+        .and_then(Value::as_str)
+        .unwrap_or("127.0.0.1");
+    let iface = args
+        .get("interface")
+        .and_then(Value::as_str)
+        .unwrap_or("lo0");
+    let count = args.get("count").and_then(Value::as_u64).unwrap_or(1);
+    let prompt = match name {
+        "l4.inject" | "l4.send_recv" => format!(
+            "{name}: {count} packet(s) to destination {dst} on {iface} — matched scope entry \
+             lo0 127.0.0.0/8 (inject), minted permit budget 10 pps. Confirm?"
+        ),
+        _ => {
+            let id = args.get("id").and_then(Value::as_str).unwrap_or("?");
+            format!(
+                "{name}: parked packet {id} on destination {dst} ({iface}) — matched scope \
+                 entry lo0 127.0.0.0/8, permit budget 10 pps. Confirm?"
+            )
+        }
+    };
+    json!({
+        "status": "needs_confirmation",
+        "prompt": prompt,
+        "confirm_token": "tok-fixture",
+    })
 }
 
 fn rpc_error(id: Value, code: i64, message: String) -> String {

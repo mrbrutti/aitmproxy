@@ -17,6 +17,7 @@ pub mod matcher;
 pub mod model;
 pub mod runner;
 pub mod schema;
+pub mod step_registry;
 pub mod template;
 
 pub use builder::{PocBuildCommand, PocBuilder, PocSpec, StdPocBuilder};
@@ -24,11 +25,12 @@ pub use extract::{run_extractors, Extraction, Extractor, ExtractorKind};
 pub use matcher::{evaluate, MatchContext};
 pub use model::{
     Assertion, BrowserAction, BrowserStep, ExtractSource, ExtractStep, HttpStep, MatchPart, Poc,
-    PocInfo, ScriptStep, Severity, Step, Variable,
+    PocInfo, ProtoExtract, ScriptStep, Severity, Step, Variable,
 };
 pub use runner::{
     AssertionOutcome, PocRunCommand, PocRunResult, PocRunner, ScriptStepCtx, ScriptStepError,
     ScriptStepExecutor, ScriptVerdict, ScriptedPocRunCommand, StdPocRunner, StepOutcome,
 };
 pub use schema::{validate, PocError};
+pub use step_registry::PocStepRegistry;
 pub use template::{PocTemplate, Template, VarBindings};

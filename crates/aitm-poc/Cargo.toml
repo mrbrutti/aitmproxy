@@ -9,6 +9,10 @@ description = "Reproducible-PoC engine: artifact model, YAML serde, templating, 
 [dependencies]
 aitm-core.workspace = true
 aitm-browser.workspace = true
+# The `ProtocolLanguage` seam (`PocStepHandler`, `PocStepInputs/Outcome`) a
+# `Step::Protocol { ns, .. }` dispatches to. `aitm-plugin` depends only on
+# `aitm-core`, so this stays acyclic.
+aitm-plugin.workspace = true
 anyhow = "1"
 tracing.workspace = true
 futures = "0.3"
@@ -24,6 +28,9 @@ regex = "1"
 libc = "0.2"
 
 [dev-dependencies]
+# The seam's test consumer supplies the `test:` PoC step handler for the
+# protocol-step dispatch test (no real wire effects).
+aitm-proto-test.workspace = true
 tokio = { version = "1", features = ["rt", "net", "macros", "io-util"] }
 hyper = { version = "1", features = ["server", "http1"] }
 http-body-util = "0.1"

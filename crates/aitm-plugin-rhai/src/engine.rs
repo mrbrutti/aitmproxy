@@ -21,6 +21,7 @@ use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use aitm_plugin::language::{ProtocolLanguage, RegisterError};
 use rhai::module_resolvers::DummyModuleResolver;
 use rhai::packages::{
     BasicArrayPackage, BasicBlobPackage, BasicMapPackage, BasicMathPackage, BitFieldPackage,
@@ -190,6 +191,21 @@ pub fn build_engine(limits: &RhaiLimits, hook_timeout: Duration) -> Engine {
         .register_global_module(MoreStringPackage::new().as_shared_module());
     harden(&mut engine, limits, hook_timeout);
     engine
+}
+
+/// A hardened engine (as [`build_engine`]) with each protocol language's
+/// `<ns>.*` host fns installed through the [`crate::host_registry`] seam, so a
+/// script can call `<ns>.fn(...)` with no per-protocol edit to this crate (plan
+/// Task 2, AC1). Returns [`RegisterError::Collision`] if two languages claim the
+/// same `<ns>.<name>` — registration never last-wins.
+pub fn build_engine_with_languages(
+    limits: &RhaiLimits,
+    hook_timeout: Duration,
+    languages: &[&dyn ProtocolLanguage],
+) -> Result<Engine, RegisterError> {
+    let mut engine = build_engine(limits, hook_timeout);
+    crate::host_registry::install_languages(&mut engine, languages)?;
+    Ok(engine)
 }
 
 /// Apply `RhaiLimits` and the budget to an engine (spec §7): size and depth

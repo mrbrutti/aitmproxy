@@ -28,7 +28,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use aitm_core::{Command, CommandHost, ParamDef, ParamSchema, Params, TypeDesc, Value};
+use aitm_core::{
+    Command, CommandHost, ParamDef, ParamSchema, Params, Sensitivity, TypeDesc, Value,
+};
 
 use crate::backend::L4Error;
 use crate::config::{InterceptConfig, Verdict};
@@ -143,6 +145,11 @@ impl Command for InterceptStart {
         "l4.intercept.start"
     }
 
+    fn sensitivity(&self) -> Sensitivity {
+        // Binds the NFQUEUE and can hold live traffic.
+        Sensitivity::Sensitive
+    }
+
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description: "Bind the in-path NFQUEUE and open a guarded interception session \
@@ -246,6 +253,11 @@ impl Command for InterceptStop {
         "l4.intercept.stop"
     }
 
+    fn sensitivity(&self) -> Sensitivity {
+        // Ends a session the operator started (fail-open); no new wire write.
+        Sensitivity::Write
+    }
+
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description: "End an interception session by flow id; fail-open forwards anything \
@@ -296,6 +308,10 @@ impl Command for InterceptStatus {
         "l4.intercept.status"
     }
 
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
+    }
+
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description: "List the live interception sessions and their parked-packet counts \
@@ -339,6 +355,10 @@ impl InterceptList {
 impl Command for InterceptList {
     fn name(&self) -> &str {
         "l4.intercept.list"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
     }
 
     fn schema(&self) -> ParamSchema {
@@ -396,6 +416,11 @@ impl InterceptMutate {
 impl Command for InterceptMutate {
     fn name(&self) -> &str {
         "l4.intercept.mutate"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        // Alters a parked live packet's bytes (reinjected on a later forward).
+        Sensitivity::Sensitive
     }
 
     fn schema(&self) -> ParamSchema {
@@ -481,6 +506,11 @@ impl Command for InterceptRevert {
         "l4.intercept.revert"
     }
 
+    fn sensitivity(&self) -> Sensitivity {
+        // Restores a parked packet's backup; no new wire write.
+        Sensitivity::Write
+    }
+
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description: "Discard a staged mutation on a parked packet, restoring its original \
@@ -527,6 +557,18 @@ impl InterceptForward {
 impl Command for InterceptForward {
     fn name(&self) -> &str {
         "l4.intercept.forward"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        // Releases a (possibly mangled) packet to the wire.
+        Sensitivity::Sensitive
+    }
+
+    /// The operator confirm-over-the-wire prompt (spec §2.4): what will be released
+    /// to the wire — the staged mutation if one exists, else the kernel's original.
+    /// `None` when the id is not parked (the call is a no-op `false` with no token).
+    fn confirm_prompt(&self, args: &Params) -> Option<String> {
+        verdict_confirm_summary(&self.sessions, args, "l4.intercept.forward", true)
     }
 
     fn schema(&self) -> ParamSchema {
@@ -626,6 +668,17 @@ impl InterceptDrop {
 impl Command for InterceptDrop {
     fn name(&self) -> &str {
         "l4.intercept.drop"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        // Drops live traffic.
+        Sensitivity::Sensitive
+    }
+
+    /// The operator confirm-over-the-wire prompt (spec §2.4): which parked packet is
+    /// being dropped. `None` when the id is not parked (the call is a no-op `false`).
+    fn confirm_prompt(&self, args: &Params) -> Option<String> {
+        verdict_confirm_summary(&self.sessions, args, "l4.intercept.drop", false)
     }
 
     fn schema(&self) -> ParamSchema {
@@ -845,6 +898,44 @@ fn locate(map: &HashMap<L4FlowId, Session>, id: ParkedId) -> Option<(L4FlowId, P
             .find(|p| p.id == id)
             .map(|p| (*fid, p))
     })
+}
+
+/// Build the operator confirm-over-the-wire summary for a parked-packet verdict
+/// (`forward` / `drop`): the packet that will be acted on — its direction, decoded
+/// layers, length, and (decoded) destination — plus whether it carries a staged
+/// mutation. `use_mutation` picks the mutated bytes when a `forward` would reinject
+/// them, so the operator sees exactly what hits the wire. `None` when the id is not
+/// parked, so the server offers no confirmation (and mints no token) for a no-op.
+fn verdict_confirm_summary(
+    sessions: &InterceptSessions,
+    args: &Params,
+    verb: &str,
+    use_mutation: bool,
+) -> Option<String> {
+    let id = parked_id_from_str(args.get_str("id").ok()?).ok()?;
+    let map = sessions.lock();
+    let (_flow, session) = map
+        .iter()
+        .find(|(_, s)| s.handle.parked().iter().any(|p| p.id == id))?;
+    let parked = session.handle.parked().into_iter().find(|p| p.id == id)?;
+    let edit = session.edits.get(&id);
+    let (bytes, state) = match (use_mutation, edit) {
+        (true, Some(e)) => (e.mutated.clone(), "mutated"),
+        _ => (parked.packet.bytes.clone(), "original"),
+    };
+    let summary = PacketSpec::summarize(&bytes);
+    let dst = crate::intercept::ip_target(&bytes, &session.interface, session.direction)
+        .and_then(|t| t.dst)
+        .map_or_else(|| "?".to_string(), |ip| ip.to_string());
+    Some(format!(
+        "Confirm {verb}: {state} {} packet [{}] ({} bytes) → {dst} on {} (queue {}). \
+         Re-issue with `_confirm` to proceed.",
+        direction_str(parked.packet.dir),
+        summary.layers.join("/"),
+        bytes.len(),
+        session.interface,
+        session.queue,
+    ))
 }
 
 /// A session as a transport-neutral object (`start` result, `status` elements).

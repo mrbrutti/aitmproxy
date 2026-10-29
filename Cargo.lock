@@ -52,6 +52,7 @@ dependencies = [
  "aitm-tui",
  "anyhow",
  "bytes",
+ "crossterm",
  "futures",
  "http-body-util",
  "hyper",
@@ -173,6 +174,8 @@ dependencies = [
  "aitm-core",
  "anyhow",
  "futures",
+ "serde",
+ "serde_yaml",
  "tokio",
 ]
 
@@ -207,7 +210,9 @@ version = "0.1.0"
 dependencies = [
  "aitm-browser",
  "aitm-core",
+ "aitm-plugin",
  "aitm-poc",
+ "aitm-proto-test",
  "anyhow",
  "arc-swap",
  "rhai",
@@ -266,6 +271,8 @@ version = "0.1.0"
 dependencies = [
  "aitm-browser",
  "aitm-core",
+ "aitm-plugin",
+ "aitm-proto-test",
  "anyhow",
  "bytes",
  "futures",
@@ -328,6 +335,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aitm-proto-test"
+version = "0.1.0"
+dependencies = [
+ "aitm-core",
+ "aitm-plugin",
+ "serde_yaml",
+]
+
+[[package]]
 name = "aitm-proto-ws"
 version = "0.1.0"
 dependencies = [
@@ -378,6 +394,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "serde_yaml",
  "similar",
  "tokio",
  "unicode-width",

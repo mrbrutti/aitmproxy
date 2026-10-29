@@ -17,7 +17,8 @@
     "test": "npm run gen && vitest run",
     "size": "node scripts/size.mjs",
     "selftest:live": "node scripts/selftest-live.mjs",
-    "cua:live": "node scripts/cua-live.mjs"
+    "cua:live": "node scripts/cua-live.mjs",
+    "cua:l4": "node scripts/cua-l4.mjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.4",
