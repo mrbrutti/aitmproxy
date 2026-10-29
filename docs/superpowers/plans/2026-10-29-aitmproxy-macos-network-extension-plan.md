@@ -27,11 +27,19 @@ This plan builds the macOS capture path in three bands, in strict risk order.
   capture *backend* in the `aitm` wiring layer that feeds the Phase-1
   protocol-general `CaptureIngress`. **Hard prerequisite:** that ingress
   (parent spec L4OPS-AC17 / its Phase-1 Task 10) is **not in this worktree**
-  (there is no `ingress` module under `crates/aitm/src`, HEAD `44f02be`). Every
-  Band-B task **depends on the Phase-1 `CaptureIngress` landing first**; if its
-  shape differs from spec §3.7's assumptions (notably that `NextLayerHint` can
-  carry an authoritative destination and a passthrough-on-unclaimed obligation),
-  that is a **Phase-1 gap to report, not to patch here** (spec Constraints).
+  (there is no `ingress` module under `crates/aitm/src`, HEAD `44f02be`).
+  **Verified 2026-10-29:** the `CaptureIngress` seam exists **nowhere yet** — not
+  on `origin/main`, and not on `origin/feat/l4-operator-surfaces` (the Phase-1
+  branch, 29 commits ahead of main, unmerged, which carries only an L4-specific
+  `CaptureSource` trait in `aitm-proto-l4/src/backend`, not the cross-protocol
+  ingress). On `main` the foundation it builds on — `ProtocolModule`,
+  `NextLayerHint`, `Proxy::register_module`, and the `aitm-proto-l4` `L4Guard` —
+  is present. So Band B is blocked on the Phase-1 `CaptureIngress` being built and
+  landed in the implementation base. Every Band-B task **depends on that landing
+  first**; if its shape differs from spec §3.7's assumptions (notably that
+  `NextLayerHint` can carry an authoritative destination and a
+  passthrough-on-unclaimed obligation), that is a **Phase-1 gap to report, not to
+  patch here** (spec Constraints).
 - **Band C — `[Mac]` / `[Build]` Terminal-panel build (Tasks 10–18).** The
   Swift sysex, the host-app activation/approval UX, nested signing and
   notarization, version-bump reconcile, capture indicator/uninstall, and the
