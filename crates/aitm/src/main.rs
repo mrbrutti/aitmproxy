@@ -280,9 +280,16 @@ async fn run() -> anyhow::Result<()> {
         let web_server = match web_settings {
             Some(settings) => {
                 let bus = tui::server(&cfg, cfg.mcp.transport.clone(), &services);
+                // Operator access on the web UI is tied to `mcp.operator_token`
+                // being configured (operator role exists at all); there is no
+                // separate `aitm web` opt-in. The operator *bridge* token is a
+                // fresh per-run token — never the secret mcp operator token,
+                // which stays out of every URL and log.
+                let operator_token = cfg.mcp.operator_token.is_some().then(web::generate_token);
                 let state = Arc::new(WebState {
                     mcp: Arc::new(bus),
-                    token: settings.token.clone(),
+                    agent_token: settings.token.clone(),
+                    operator_token: operator_token.clone(),
                 });
                 if settings.insecure_bind {
                     warn!(
@@ -310,7 +317,13 @@ async fn run() -> anyhow::Result<()> {
                 // Log only the bound address; the token must never reach a
                 // tracing sink. The one-time println is the operator's link.
                 web::log_listening(bound);
-                println!("web UI: {url}");
+                println!("web UI (agent): {url}");
+                // When operator access is configured, print its URL too; it
+                // carries the ephemeral operator bridge token in the fragment,
+                // never the mcp operator token.
+                if let Some(op) = &operator_token {
+                    println!("web UI (operator): {}", web::operator_ui_url(bound, op));
+                }
                 Some((listener, state))
             }
             None => None,
