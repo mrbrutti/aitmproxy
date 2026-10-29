@@ -1,14 +1,10 @@
-import type { BusClient, BusRole } from './types';
+import type { BusClient } from './types';
+import { asRole } from './types';
 import { createMockBus } from './mock';
 import { createWsBus } from './ws';
 
 export type { BusClient } from './types';
 export * from './types';
-
-/** `aitm web`'s operator URL carries `#expect=operator`; anything else means no expectation. */
-function asRole(v: string | null): BusRole | null {
-  return v === 'operator' || v === 'agent' ? v : null;
-}
 
 /**
  * Picks the bus for this page load. `?bus=mock` / `?bus=live` force one; otherwise a production

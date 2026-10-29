@@ -180,3 +180,34 @@ async fn operator_token_unconfigured_refuses_the_operator_token() {
     let result = role_after_initialize(&mut ws, AGENT_TOKEN).await;
     assert_eq!(result["role"], "agent", "initialize result: {result}");
 }
+
+#[tokio::test]
+async fn operator_token_empty_refuses_the_operator_path() {
+    // AC12 empty-string sub-case: a hand-edited `operator_token: ""` deserializes
+    // to `Some("")` but must behave exactly like "not configured" (it is filtered
+    // as empty, mirroring the loopback transport). An empty `{"token":""}` line
+    // therefore never resolves to operator, and the real operator token is
+    // refused too — the operator path is not offered.
+    let server = start("operator-empty", Some("")).await;
+
+    // An empty bridge-token line is refused, not classified as operator.
+    let mut ws = ws_connect(&server).await.expect("handshake");
+    send_text(&mut ws, json!({"token": ""}).to_string()).await;
+    let first = recv_text(&mut ws).await.expect("an error reply");
+    let v: JsonValue = serde_json::from_str(&first).expect("JSON");
+    assert_eq!(v["error"]["code"], -32001, "{v}");
+    assert_eq!(recv_text(&mut ws).await, None, "nothing after the refusal");
+
+    // The fixed OPERATOR_TOKEN is refused as well: empty means operator-off.
+    let mut ws = ws_connect(&server).await.expect("handshake");
+    send_text(&mut ws, json!({"token": OPERATOR_TOKEN}).to_string()).await;
+    let first = recv_text(&mut ws).await.expect("an error reply");
+    let v: JsonValue = serde_json::from_str(&first).expect("JSON");
+    assert_eq!(v["error"]["code"], -32001, "{v}");
+    assert_eq!(recv_text(&mut ws).await, None, "nothing after the refusal");
+
+    // The agent token still works on the same agent-only server.
+    let mut ws = ws_connect(&server).await.expect("handshake");
+    let result = role_after_initialize(&mut ws, AGENT_TOKEN).await;
+    assert_eq!(result["role"], "agent", "initialize result: {result}");
+}

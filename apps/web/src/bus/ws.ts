@@ -3,6 +3,7 @@
 
 import { createSignal } from 'solid-js';
 import {
+  asRole,
   BusError,
   CLIENT_INFO,
   PROTOCOL_VERSION,
@@ -140,7 +141,7 @@ export function createWsBus(opts: WsBusOptions): BusClient {
         });
         // Decision C: read the resolved role echoed in the result; a missing/unknown value is
         // treated as "role unknown" (null), never asserted as a role.
-        setRole(info?.role === 'operator' || info?.role === 'agent' ? info.role : null);
+        setRole(asRole(info?.role));
         send({ jsonrpc: '2.0', method: 'notifications/initialized' });
         attempt = 0;
         setLastError(null);
