@@ -31,8 +31,8 @@ pub use client::{PipelineClient, RequestSender};
 pub use command::{Command, ParamDef, ParamSchema, TypeDesc};
 pub use config::{
     BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, LimitConfig, MapsConfig,
-    McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SsrfPolicy,
-    TlsConfig,
+    McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SessionIoConfig,
+    SsrfPolicy, TlsConfig,
 };
 pub use ctx::{
     BrowserDriver, ClickTarget, CommandHost, FlowCtx, Frontend, NavOutcome, ProxyClient,

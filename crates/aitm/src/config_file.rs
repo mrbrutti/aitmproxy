@@ -19,8 +19,8 @@ use serde::Deserialize;
 
 use aitm_core::{
     BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, LimitConfig, MapsConfig,
-    McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SsrfPolicy,
-    TlsConfig, Value,
+    McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig, ScopeEntry, SessionIoConfig,
+    SsrfPolicy, TlsConfig, Value,
 };
 use aitm_plugin_rhai::{RhaiConfig, ScriptEntry};
 
@@ -120,6 +120,8 @@ struct ConfigFile {
     tls: Option<TlsFile>,
     /// Map Local/Remote rules (M6).
     maps: Option<MapsFile>,
+    /// Session/flow file I/O agent gate (M6 F10).
+    session_io: Option<SessionIoFile>,
 }
 
 impl ConfigFile {
@@ -161,6 +163,9 @@ impl ConfigFile {
         if let Some(maps) = self.maps {
             maps.apply(&mut c.maps);
         }
+        if let Some(session_io) = self.session_io {
+            session_io.apply(&mut c.session_io);
+        }
         Ok(())
     }
 }
@@ -198,6 +203,21 @@ impl MapsFile {
             c.root = Some(root);
         }
         set(&mut c.allow_agent_authoring, self.allow_agent_authoring);
+    }
+}
+
+/// The `session_io:` section (M6 F10): the agent file-I/O gate.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionIoFile {
+    /// Let an agent (MCP) frontend read/write a host path via the session/flow I/O
+    /// commands. Off by default.
+    allow_agent_file_io: Option<bool>,
+}
+
+impl SessionIoFile {
+    fn apply(self, c: &mut SessionIoConfig) {
+        set(&mut c.allow_agent_file_io, self.allow_agent_file_io);
     }
 }
 

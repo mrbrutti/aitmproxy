@@ -36,7 +36,7 @@ impl ProxyClient for CountingClient {
 
 fn registry() -> Registry {
     let mut reg = Registry::new();
-    reg.add_plugin(Box::new(SessionIoPlugin));
+    reg.add_plugin(Box::new(SessionIoPlugin::new(false)));
     reg
 }
 
@@ -282,4 +282,38 @@ fn mitmproxy_flows_import() {
         imported.metadata().marks.iter().any(|m| m == "imported"),
         "imported flow carries the `imported` mark"
     );
+}
+
+/// Panel finding #5: a HAR body tagged `encoding: "base64"` that will not decode is
+/// a corrupt document — `flow.import` must fail (not silently drop the body and
+/// report success). Nothing is inserted on the failed import.
+#[test]
+fn har_import_corrupt_base64_body_is_error() {
+    let reg = registry();
+    let har = r#"{"log":{"version":"1.2","creator":{"name":"t","version":"0"},"entries":[
+      {"startedDateTime":"1970-01-01T00:00:00.000Z","time":-1,
+       "request":{"method":"GET","url":"https://ex.test/","httpVersion":"HTTP/1.1","headers":[],"headersSize":-1,"bodySize":-1},
+       "response":{"status":200,"statusText":"OK","httpVersion":"HTTP/1.1","headers":[],
+         "content":{"size":3,"mimeType":"application/octet-stream","text":"!!!not-valid-base64!!!","encoding":"base64"},
+         "headersSize":-1,"bodySize":-1},
+       "timings":{"send":-1,"wait":-1,"receive":-1}}
+    ]}}"#;
+
+    let guard = StdGuard::default();
+    let client = CountingClient::default();
+    let fresh = MemFlowStore::new();
+    let host = CommandHost::new(&fresh, &client, &guard, None);
+    let mut args = BTreeMap::new();
+    args.insert("bytes".to_string(), Value::Bytes(har.as_bytes().to_vec()));
+    args.insert("format".to_string(), Value::Str("har".to_string()));
+    let err = reg
+        .command("flow.import")
+        .expect("flow.import registered")
+        .invoke(Params::new(args), &host)
+        .expect_err("a corrupt base64 body must fail the import, not be silently dropped");
+    assert!(
+        err.chain().any(|e| e.to_string().contains("base64")),
+        "the error names the base64 decode failure: {err:#}"
+    );
+    assert_eq!(fresh.count(), 0, "a failed import inserts nothing");
 }

@@ -296,6 +296,7 @@ name = "aitm-rules"
 version = "0.1.0"
 dependencies = [
  "aitm-core",
+ "anyhow",
  "regex",
 ]
 

@@ -75,12 +75,19 @@ impl Tns {
     }
 }
 
+/// Maximum tnetstring nesting the parser will descend before refusing. A `.flows`
+/// blob is attacker-supplied (`flow.import {format:"mitmproxy"}` is agent-reachable),
+/// so a pathologically nested document must return `Err` rather than recurse until
+/// the thread's stack overflows. 64 matches serde_json's default recursion posture;
+/// a genuine mitmproxy flow nests only a handful of levels deep.
+const MAX_DEPTH: usize = 64;
+
 /// Import every HTTP flow from a mitmproxy `.flows` byte blob.
 pub fn mitmproxy_to_flows(bytes: &[u8]) -> anyhow::Result<Vec<Flow>> {
     let mut out = Vec::new();
     let mut data = bytes;
     while !data.is_empty() {
-        let (value, rest) = pop(data).context("decoding mitmproxy .flows stream")?;
+        let (value, rest) = pop(data, 0).context("decoding mitmproxy .flows stream")?;
         data = rest;
         if let Some(flow) = flow_from_state(&value)? {
             out.push(flow);
@@ -89,8 +96,12 @@ pub fn mitmproxy_to_flows(bytes: &[u8]) -> anyhow::Result<Vec<Flow>> {
     Ok(out)
 }
 
-/// Pop one tnetstring off the front, returning it and the remaining bytes.
-fn pop(data: &[u8]) -> anyhow::Result<(Tns, &[u8])> {
+/// Pop one tnetstring off the front, returning it and the remaining bytes. `depth`
+/// is the current nesting level; a list/dict payload is parsed one level deeper.
+fn pop(data: &[u8], depth: usize) -> anyhow::Result<(Tns, &[u8])> {
+    // Refuse before descending past the cap so a deeply nested blob cannot drive
+    // the recursion into a stack overflow.
+    ensure!(depth <= MAX_DEPTH, "tnetstring: nesting exceeds depth cap");
     let colon = data
         .iter()
         .position(|&b| b == b':')
@@ -100,15 +111,21 @@ fn pop(data: &[u8]) -> anyhow::Result<(Tns, &[u8])> {
         .and_then(|s| s.parse().ok())
         .context("tnetstring: invalid length prefix")?;
     let payload_start = colon + 1;
-    let payload_end = payload_start + len;
-    ensure!(data.len() > payload_end, "tnetstring: truncated payload");
+    // Checked: a length that overflows `usize` or runs to/past the end of the
+    // buffer is rejected instead of slicing or indexing out of bounds.
+    // `payload_end` must be strictly less than `data.len()` to leave room for the
+    // trailing type byte at `data[payload_end]`.
+    let payload_end = payload_start
+        .checked_add(len)
+        .filter(|&end| end < data.len())
+        .context("tnetstring: length overruns input")?;
     let payload = &data[payload_start..payload_end];
     let type_byte = data[payload_end];
-    let value = parse(type_byte, payload)?;
+    let value = parse(type_byte, payload, depth)?;
     Ok((value, &data[payload_end + 1..]))
 }
 
-fn parse(type_byte: u8, payload: &[u8]) -> anyhow::Result<Tns> {
+fn parse(type_byte: u8, payload: &[u8], depth: usize) -> anyhow::Result<Tns> {
     Ok(match type_byte {
         b',' => Tns::Bytes(payload.to_vec()),
         b';' => Tns::Str(String::from_utf8(payload.to_vec()).context("tnetstring: bad utf8")?),
@@ -137,7 +154,7 @@ fn parse(type_byte: u8, payload: &[u8]) -> anyhow::Result<Tns> {
             let mut items = Vec::new();
             let mut rest = payload;
             while !rest.is_empty() {
-                let (item, next) = pop(rest)?;
+                let (item, next) = pop(rest, depth + 1)?;
                 items.push(item);
                 rest = next;
             }
@@ -147,8 +164,8 @@ fn parse(type_byte: u8, payload: &[u8]) -> anyhow::Result<Tns> {
             let mut kvs = Vec::new();
             let mut rest = payload;
             while !rest.is_empty() {
-                let (key, next) = pop(rest)?;
-                let (val, next) = pop(next)?;
+                let (key, next) = pop(rest, depth + 1)?;
+                let (val, next) = pop(next, depth + 1)?;
                 kvs.push((key.as_text().unwrap_or_default(), val));
                 rest = next;
             }
@@ -204,8 +221,13 @@ fn mitm_response(r: &Tns) -> anyhow::Result<HttpResponse> {
         .get("status_code")
         .and_then(Tns::as_i64)
         .context("mitmproxy response missing status_code")?;
+    // An out-of-range status is a corrupt flow, not a 0-or-wrapped one: refuse the
+    // import rather than silently truncating `status as u16`.
+    let status = u16::try_from(status).map_err(|_| {
+        anyhow::anyhow!("mitmproxy response status_code {status} out of range (0..=65535)")
+    })?;
     Ok(HttpResponse {
-        status: status as u16,
+        status,
         version: mitm_version(r),
         headers: mitm_headers(r),
         body: mitm_body(r),
@@ -258,5 +280,66 @@ fn conn(tls: bool) -> ConnInfo {
         alpn: None,
         tls,
         established: UNIX_EPOCH,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tnetstring whose length prefix overflows `usize` must be rejected, not
+    /// used to index past the buffer. `18446744073709551615` is `u64::MAX`.
+    #[test]
+    fn oversized_length_prefix_is_rejected() {
+        let err = mitmproxy_to_flows(b"18446744073709551615:x,").unwrap_err();
+        assert!(
+            err.to_string().contains("mitmproxy")
+                || err.chain().any(|e| e.to_string().contains("overruns")),
+            "an overflowing length prefix must error, got: {err:#}"
+        );
+    }
+
+    /// A length one byte past the buffer (no room for the trailing type byte) is a
+    /// truncated payload: it must error rather than slice out of bounds.
+    #[test]
+    fn length_one_past_buffer_is_rejected() {
+        // `5:abcd,` claims a 5-byte payload but only `abcd` (4) precedes the type
+        // byte, so the payload would run onto the `,` and the type byte off the end.
+        assert!(pop(b"5:abcd,", 0).is_err());
+        assert!(mitmproxy_to_flows(b"5:abcd,").is_err());
+    }
+
+    /// Build `levels` of nested empty lists as a single tnetstring blob.
+    fn nested_lists(levels: usize) -> Vec<u8> {
+        let mut s = String::from("0:]"); // one empty list
+        for _ in 0..levels {
+            s = format!("{}:{}]", s.len(), s);
+        }
+        s.into_bytes()
+    }
+
+    /// A shallow blob parses; one nested past the depth cap returns `Err` instead
+    /// of recursing until the stack overflows.
+    #[test]
+    fn deeply_nested_input_is_rejected() {
+        // A handful of levels is fine (and maps to no HTTP flow, so an empty Vec).
+        assert!(mitmproxy_to_flows(&nested_lists(5)).is_ok());
+        // Well past MAX_DEPTH: refused, no panic, no stack overflow.
+        let err = mitmproxy_to_flows(&nested_lists(MAX_DEPTH + 8)).unwrap_err();
+        assert!(
+            err.chain().any(|e| e.to_string().contains("depth")),
+            "a too-deeply-nested blob must error on the depth cap, got: {err:#}"
+        );
+    }
+
+    /// An out-of-range response status is a corrupt flow: it must error rather than
+    /// silently truncating via `as u16` (70000 would wrap to 4464).
+    #[test]
+    fn out_of_range_status_is_rejected() {
+        let resp = Tns::Dict(vec![("status_code".to_string(), Tns::Int(70_000))]);
+        assert!(mitm_response(&resp).is_err());
+
+        let ok = Tns::Dict(vec![("status_code".to_string(), Tns::Int(200))]);
+        assert_eq!(mitm_response(&ok).expect("200 parses").status, 200);
     }
 }

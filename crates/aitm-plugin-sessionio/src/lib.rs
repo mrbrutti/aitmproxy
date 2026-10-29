@@ -26,8 +26,8 @@ pub mod native;
 use std::sync::Arc;
 
 use aitm_core::{
-    Command, CommandHost, Flow, FlowId, ParamDef, ParamSchema, Params, Plugin, Registry, TypeDesc,
-    Value,
+    Command, CommandHost, Flow, FlowId, Frontend, ParamDef, ParamSchema, Params, Plugin, Registry,
+    TypeDesc, Value,
 };
 use anyhow::Context;
 
@@ -46,7 +46,28 @@ enum Format {
 
 /// Registers `session.save`, `session.load`, `flow.export`, `flow.import`.
 /// Observes no events — serialization is a pure view over the store.
-pub struct SessionIoPlugin;
+pub struct SessionIoPlugin {
+    /// Whether an agent (MCP) frontend may hand these commands a host path.
+    /// Off by default; see [`aitm_core::SessionIoConfig::allow_agent_file_io`].
+    allow_agent_file_io: bool,
+}
+
+impl SessionIoPlugin {
+    /// Build the plugin with the agent file-I/O gate. `allow_agent_file_io` (off at
+    /// the call site by default) lets an agent frontend read/write a host path;
+    /// `Config.session_io` wires it in Task 14's additive-config pattern.
+    pub fn new(allow_agent_file_io: bool) -> Self {
+        Self {
+            allow_agent_file_io,
+        }
+    }
+}
+
+impl Default for SessionIoPlugin {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
 
 impl Plugin for SessionIoPlugin {
     fn name(&self) -> &str {
@@ -54,11 +75,35 @@ impl Plugin for SessionIoPlugin {
     }
 
     fn load(&mut self, reg: &mut Registry) {
-        reg.add_command(Arc::new(SessionSave));
-        reg.add_command(Arc::new(SessionLoad));
-        reg.add_command(Arc::new(FlowExport));
-        reg.add_command(Arc::new(FlowImport));
+        let gate = self.allow_agent_file_io;
+        reg.add_command(Arc::new(SessionSave {
+            allow_agent_file_io: gate,
+        }));
+        reg.add_command(Arc::new(SessionLoad {
+            allow_agent_file_io: gate,
+        }));
+        reg.add_command(Arc::new(FlowExport {
+            allow_agent_file_io: gate,
+        }));
+        reg.add_command(Arc::new(FlowImport {
+            allow_agent_file_io: gate,
+        }));
     }
+}
+
+/// Refuse a host-path file operation from an agent frontend unless the gate is
+/// open. `session.save`/`session.load`/`flow.export`/`flow.import` can read or
+/// overwrite an arbitrary host file, so they mirror `scope.add`'s agent gate; the
+/// human CLI (`Frontend::Cli`) always keeps full path access.
+fn check_file_io_gate(host: &CommandHost, allow_agent_file_io: bool) -> anyhow::Result<()> {
+    if host.frontend() != Frontend::Cli && !allow_agent_file_io {
+        anyhow::bail!(
+            "file I/O refused: reading or writing a host path from an agent frontend is \
+             disabled. Set session_io.allow_agent_file_io = true in the aitmproxy config to \
+             allow it, run the command from the human CLI, or pass `bytes` instead of `path`."
+        );
+    }
+    Ok(())
 }
 
 /// The requested format, defaulting to native `aitm` when omitted.
@@ -97,7 +142,7 @@ fn decode(format: Format, bytes: &[u8]) -> anyhow::Result<Vec<Flow>> {
         Format::Har => {
             let doc: har::Har =
                 serde_json::from_slice(bytes).context("parsing HAR 1.2 document")?;
-            Ok(har::har_to_flows(&doc))
+            har::har_to_flows(&doc)
         }
         Format::Mitmproxy => mitmproxy::mitmproxy_to_flows(bytes),
     }
@@ -174,7 +219,9 @@ fn path_param() -> ParamDef {
 }
 
 /// `session.save {path}` → write the whole store to `path` as native JSON.
-struct SessionSave;
+struct SessionSave {
+    allow_agent_file_io: bool,
+}
 
 impl Command for SessionSave {
     fn name(&self) -> &str {
@@ -204,6 +251,8 @@ impl Command for SessionSave {
     }
 
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        // Always writes a host path, so the agent gate always applies.
+        check_file_io_gate(host, self.allow_agent_file_io)?;
         let path = args.get_str("path")?.to_string();
         let flows = collect_flows(host, None)?;
         let bytes = encode_native(&flows)?;
@@ -216,7 +265,9 @@ impl Command for SessionSave {
 }
 
 /// `session.load {path}` → replace the store with the flows in `path`.
-struct SessionLoad;
+struct SessionLoad {
+    allow_agent_file_io: bool,
+}
 
 impl Command for SessionLoad {
     fn name(&self) -> &str {
@@ -239,6 +290,8 @@ impl Command for SessionLoad {
     }
 
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        // Always reads a host path, so the agent gate always applies.
+        check_file_io_gate(host, self.allow_agent_file_io)?;
         let path = args.get_str("path")?;
         let bytes = std::fs::read(path).with_context(|| format!("reading session from {path}"))?;
         let doc = parse_native(&bytes)?;
@@ -257,7 +310,9 @@ impl Command for SessionLoad {
 }
 
 /// `flow.export {ids?, format?, path?}` → serialize selected flows (or all).
-struct FlowExport;
+struct FlowExport {
+    allow_agent_file_io: bool,
+}
 
 impl Command for FlowExport {
     fn name(&self) -> &str {
@@ -320,6 +375,9 @@ impl Command for FlowExport {
         let count = Value::Int(flows.len() as i64);
         match args.get("path") {
             Some(Value::Str(path)) => {
+                // Writing a host path: gate an agent. Exporting without a `path`
+                // (returns bytes) stays allowed for any frontend — it is passive.
+                check_file_io_gate(host, self.allow_agent_file_io)?;
                 std::fs::write(path, &bytes)
                     .with_context(|| format!("writing export to {path}"))?;
                 Ok(object([
@@ -336,7 +394,9 @@ impl Command for FlowExport {
 }
 
 /// `flow.import {path?, bytes?, format?}` → insert flows from a document. Passive.
-struct FlowImport;
+struct FlowImport {
+    allow_agent_file_io: bool,
+}
 
 impl Command for FlowImport {
     fn name(&self) -> &str {
@@ -384,6 +444,9 @@ impl Command for FlowImport {
         let bytes = match (args.get("bytes"), args.get("path")) {
             (Some(Value::Bytes(b)), _) => b.clone(),
             (_, Some(Value::Str(path))) => {
+                // Reading a host path: gate an agent. Importing from `bytes`
+                // (checked first above) stays allowed for any frontend — passive.
+                check_file_io_gate(host, self.allow_agent_file_io)?;
                 std::fs::read(path).with_context(|| format!("reading import from {path}"))?
             }
             _ => anyhow::bail!("flow.import needs `bytes` or `path`"),

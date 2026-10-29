@@ -8,7 +8,7 @@
 //! task extends it rather than re-shaping the stored entry).
 
 use aitm_core::Value;
-use aitm_rules::{HostMatch, MatchCondition, Phase, UrlMatch};
+use aitm_rules::{bus, MatchCondition, Phase};
 
 /// What a matching Map rule does.
 #[derive(Debug, Clone)]
@@ -104,70 +104,13 @@ pub fn parse_map(
     })
 }
 
-/// Parse the shared [`MatchCondition`]. `phase` defaults to `Request` (a Map rule
-/// fires on the request), so a Map Local condition need only carry a `url`/`host`.
+/// Parse the shared [`MatchCondition`] via the shared [`aitm_rules::bus`] serde.
+/// `phase` defaults to `Request` (a Map rule fires on the request), so a Map Local
+/// condition need only carry a `url`/`host`.
 fn parse_condition(
     obj: &std::collections::BTreeMap<String, Value>,
 ) -> anyhow::Result<MatchCondition> {
-    let url = match obj.get("url") {
-        None | Some(Value::Null) => None,
-        Some(Value::Object(o)) => Some(parse_url_match(o)?),
-        Some(other) => anyhow::bail!("`condition.url` must be an object, got {other:?}"),
-    };
-    let method = match obj.get("method") {
-        None | Some(Value::Null) => None,
-        Some(Value::Str(s)) => Some(s.clone()),
-        Some(other) => anyhow::bail!("`condition.method` must be a string, got {other:?}"),
-    };
-    let host = match obj.get("host") {
-        None | Some(Value::Null) => None,
-        Some(Value::Object(o)) => Some(parse_host_match(o)?),
-        Some(other) => anyhow::bail!("`condition.host` must be an object, got {other:?}"),
-    };
-    let phase = match obj.get("phase") {
-        None | Some(Value::Null) => Phase::Request,
-        Some(Value::Str(s)) => parse_phase(s)?,
-        Some(other) => anyhow::bail!("`condition.phase` must be a string, got {other:?}"),
-    };
-    Ok(MatchCondition {
-        url,
-        method,
-        host,
-        phase,
-        ws_dir: None,
-    })
-}
-
-fn parse_url_match(obj: &std::collections::BTreeMap<String, Value>) -> anyhow::Result<UrlMatch> {
-    if let Ok(w) = obj_str(obj, "wildcard") {
-        Ok(UrlMatch::Wildcard(w.to_string()))
-    } else if let Ok(r) = obj_str(obj, "regex") {
-        Ok(UrlMatch::Regex(r.to_string()))
-    } else {
-        anyhow::bail!("`condition.url` needs a `wildcard` or `regex` field")
-    }
-}
-
-fn parse_host_match(obj: &std::collections::BTreeMap<String, Value>) -> anyhow::Result<HostMatch> {
-    if let Ok(e) = obj_str(obj, "exact") {
-        Ok(HostMatch::Exact(e.to_string()))
-    } else if let Ok(w) = obj_str(obj, "wildcard") {
-        Ok(HostMatch::Wildcard(w.to_string()))
-    } else {
-        anyhow::bail!("`condition.host` needs an `exact` or `wildcard` field")
-    }
-}
-
-fn parse_phase(s: &str) -> anyhow::Result<Phase> {
-    match s {
-        "request" => Ok(Phase::Request),
-        "response" => Ok(Phase::Response),
-        "ws_frame" => Ok(Phase::WsFrame),
-        "any" => Ok(Phase::Any),
-        other => {
-            anyhow::bail!("`condition.phase` must be request|response|ws_frame|any, got {other:?}")
-        }
-    }
+    bus::parse_condition(obj, Phase::Request)
 }
 
 fn parse_local(obj: &std::collections::BTreeMap<String, Value>) -> anyhow::Result<MapAction> {
@@ -233,54 +176,10 @@ fn parse_remote_target(
     }
 }
 
-/// Render a [`MatchCondition`] back to a bus value for `map.list`.
+/// Render a [`MatchCondition`] back to a bus value for `map.list` via the shared
+/// [`aitm_rules::bus`] echo, so Map's tokens match every other rule surface.
 pub fn condition_to_value(cond: &MatchCondition) -> Value {
-    let mut obj = std::collections::BTreeMap::new();
-    if let Some(url) = &cond.url {
-        let (k, v) = match url {
-            UrlMatch::Wildcard(p) => ("wildcard", p),
-            UrlMatch::Regex(p) => ("regex", p),
-        };
-        obj.insert(
-            "url".to_string(),
-            Value::Object(
-                [(k.to_string(), Value::Str(v.clone()))]
-                    .into_iter()
-                    .collect(),
-            ),
-        );
-    }
-    if let Some(method) = &cond.method {
-        obj.insert("method".to_string(), Value::Str(method.clone()));
-    }
-    if let Some(host) = &cond.host {
-        let (k, v) = match host {
-            HostMatch::Exact(h) => ("exact", h),
-            HostMatch::Wildcard(h) => ("wildcard", h),
-        };
-        obj.insert(
-            "host".to_string(),
-            Value::Object(
-                [(k.to_string(), Value::Str(v.clone()))]
-                    .into_iter()
-                    .collect(),
-            ),
-        );
-    }
-    obj.insert(
-        "phase".to_string(),
-        Value::Str(phase_str(cond.phase).to_string()),
-    );
-    Value::Object(obj)
-}
-
-fn phase_str(phase: Phase) -> &'static str {
-    match phase {
-        Phase::Request => "request",
-        Phase::Response => "response",
-        Phase::WsFrame => "ws_frame",
-        Phase::Any => "any",
-    }
+    bus::condition_to_value(cond)
 }
 
 /// Render a [`MapAction`] back to a bus value for `map.list`.

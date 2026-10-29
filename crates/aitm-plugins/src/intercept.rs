@@ -24,7 +24,7 @@ use aitm_core::{
     InterceptState, ParamDef, ParamSchema, Params, Plugin, Registry, ResumeHandle, TypeDesc, Value,
     Verdict,
 };
-use aitm_rules::{CompiledRule, HostMatch, MatchCondition, Phase, Rule, UrlMatch};
+use aitm_rules::{bus, compile, CompiledRule, Phase, Rule};
 
 /// State the plugin (which parks flows on events) shares with its commands
 /// (which release them).
@@ -284,186 +284,24 @@ fn compile_rules(value: &Value) -> anyhow::Result<Vec<CompiledRule>> {
         .enumerate()
         .map(|(idx, item)| {
             let rule = rule_from_value(item, idx)?;
-            aitm_rules::compile(rule).map_err(|e| anyhow::anyhow!(e))
+            compile(rule).map_err(|e| anyhow::anyhow!(e))
         })
         .collect()
 }
 
-/// Parse one rule object off the bus. `idx` seeds a stable id when none is given.
+/// Parse one rule object off the bus via the shared [`aitm_rules::bus`] serde.
+/// `idx` seeds a stable id when none is given; a request-phase rule is the default.
 fn rule_from_value(value: &Value, idx: usize) -> anyhow::Result<Rule> {
     let Value::Object(obj) = value else {
         anyhow::bail!("each rule must be an object");
     };
-    let str_field = |key: &str| -> anyhow::Result<Option<String>> {
-        match obj.get(key) {
-            None | Some(Value::Null) => Ok(None),
-            Some(Value::Str(s)) => Ok(Some(s.clone())),
-            Some(other) => anyhow::bail!("rule field `{key}` must be a string, got {other:?}"),
-        }
-    };
-
-    let id = str_field("id")?.unwrap_or_else(|| format!("rule-{idx}"));
-    let name = str_field("name")?;
-    let enabled = match obj.get("enabled") {
-        None | Some(Value::Null) => true,
-        Some(Value::Bool(b)) => *b,
-        Some(other) => anyhow::bail!("rule field `enabled` must be a boolean, got {other:?}"),
-    };
-    let phase = parse_phase(str_field("phase")?.as_deref())?;
-    let url = obj.get("url").map(parse_url_match).transpose()?;
-    let method = str_field("method")?;
-    let host = obj.get("host").map(parse_host_match).transpose()?;
-    let ws_dir = parse_ws_dir(str_field("ws_dir")?.as_deref())?;
-
-    Ok(Rule {
-        id,
-        name,
-        enabled,
-        condition: MatchCondition {
-            url,
-            method,
-            host,
-            phase,
-            ws_dir,
-        },
-    })
+    bus::parse_rule(obj, &format!("rule-{idx}"), Phase::Request)
 }
 
-fn parse_phase(phase: Option<&str>) -> anyhow::Result<Phase> {
-    match phase {
-        None => Ok(Phase::Request),
-        Some(s) => match s.to_ascii_lowercase().as_str() {
-            "request" => Ok(Phase::Request),
-            "response" => Ok(Phase::Response),
-            "wsframe" => Ok(Phase::WsFrame),
-            "any" => Ok(Phase::Any),
-            other => anyhow::bail!("unknown rule phase `{other}`"),
-        },
-    }
-}
-
-fn parse_ws_dir(dir: Option<&str>) -> anyhow::Result<Option<aitm_core::WsDir>> {
-    match dir {
-        None => Ok(None),
-        Some(s) => match s.to_ascii_lowercase().as_str() {
-            "c2s" => Ok(Some(aitm_core::WsDir::ClientToServer)),
-            "s2c" => Ok(Some(aitm_core::WsDir::ServerToClient)),
-            other => anyhow::bail!("unknown ws_dir `{other}` (want c2s or s2c)"),
-        },
-    }
-}
-
-/// A URL clause: a bare string is a wildcard; an object selects wildcard/regex.
-fn parse_url_match(value: &Value) -> anyhow::Result<UrlMatch> {
-    match value {
-        Value::Str(s) => Ok(UrlMatch::Wildcard(s.clone())),
-        Value::Object(o) => match single_variant(o, "url")? {
-            ("wildcard", s) => Ok(UrlMatch::Wildcard(s)),
-            ("regex", s) => Ok(UrlMatch::Regex(s)),
-            (other, _) => {
-                anyhow::bail!("url match key must be `wildcard` or `regex`, got `{other}`")
-            }
-        },
-        other => anyhow::bail!("rule field `url` must be a string or object, got {other:?}"),
-    }
-}
-
-/// A host clause: a bare string is an exact authority; an object selects
-/// exact/wildcard.
-fn parse_host_match(value: &Value) -> anyhow::Result<HostMatch> {
-    match value {
-        Value::Str(s) => Ok(HostMatch::Exact(s.clone())),
-        Value::Object(o) => match single_variant(o, "host")? {
-            ("exact", s) => Ok(HostMatch::Exact(s)),
-            ("wildcard", s) => Ok(HostMatch::Wildcard(s)),
-            (other, _) => {
-                anyhow::bail!("host match key must be `exact` or `wildcard`, got `{other}`")
-            }
-        },
-        other => anyhow::bail!("rule field `host` must be a string or object, got {other:?}"),
-    }
-}
-
-/// Read a single-key `{key: "pattern"}` object into `(key, pattern)`.
-fn single_variant<'a>(
-    obj: &'a BTreeMap<String, Value>,
-    field: &str,
-) -> anyhow::Result<(&'a str, String)> {
-    let mut entries = obj.iter();
-    let (key, value) = entries
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("rule field `{field}` object is empty"))?;
-    if entries.next().is_some() {
-        anyhow::bail!("rule field `{field}` object must have exactly one key");
-    }
-    match value {
-        Value::Str(s) => Ok((key.as_str(), s.clone())),
-        other => anyhow::bail!("rule field `{field}.{key}` must be a string, got {other:?}"),
-    }
-}
-
-/// Serialize the active rules back to the bus, round-tripping with
-/// [`rule_from_value`].
+/// Serialize the active rules back to the bus through the shared echo, so the
+/// phase/ws_dir/url/host tokens match every other rule surface.
 fn rules_to_value(rules: &[CompiledRule]) -> Value {
-    Value::Array(rules.iter().map(|r| rule_to_value(r.rule())).collect())
-}
-
-fn rule_to_value(rule: &Rule) -> Value {
-    let mut obj = BTreeMap::new();
-    obj.insert("id".into(), Value::Str(rule.id.clone()));
-    if let Some(name) = &rule.name {
-        obj.insert("name".into(), Value::Str(name.clone()));
-    }
-    obj.insert("enabled".into(), Value::Bool(rule.enabled));
-    obj.insert(
-        "phase".into(),
-        Value::Str(phase_label(rule.condition.phase).into()),
-    );
-    if let Some(url) = &rule.condition.url {
-        obj.insert("url".into(), url_match_value(url));
-    }
-    if let Some(method) = &rule.condition.method {
-        obj.insert("method".into(), Value::Str(method.clone()));
-    }
-    if let Some(host) = &rule.condition.host {
-        obj.insert("host".into(), host_match_value(host));
-    }
-    if let Some(dir) = rule.condition.ws_dir {
-        obj.insert("ws_dir".into(), Value::Str(ws_dir_label(dir).into()));
-    }
-    Value::Object(obj)
-}
-
-fn phase_label(phase: Phase) -> &'static str {
-    match phase {
-        Phase::Request => "request",
-        Phase::Response => "response",
-        Phase::WsFrame => "wsframe",
-        Phase::Any => "any",
-    }
-}
-
-fn ws_dir_label(dir: aitm_core::WsDir) -> &'static str {
-    match dir {
-        aitm_core::WsDir::ClientToServer => "c2s",
-        aitm_core::WsDir::ServerToClient => "s2c",
-    }
-}
-
-fn url_match_value(url: &UrlMatch) -> Value {
-    let (key, pat) = match url {
-        UrlMatch::Wildcard(s) => ("wildcard", s),
-        UrlMatch::Regex(s) => ("regex", s),
-    };
-    Value::Object(BTreeMap::from([(key.into(), Value::Str(pat.clone()))]))
-}
-
-fn host_match_value(host: &HostMatch) -> Value {
-    let (key, pat) = match host {
-        HostMatch::Exact(s) => ("exact", s),
-        HostMatch::Wildcard(s) => ("wildcard", s),
-    };
-    Value::Object(BTreeMap::from([(key.into(), Value::Str(pat.clone()))]))
+    Value::Array(rules.iter().map(|r| bus::rule_to_value(r.rule())).collect())
 }
 
 /// `flow.resume {id}` → fire the parked flow's handle; it forwards.

@@ -20,6 +20,8 @@
 use aitm_core::{Flow, HttpRequest, WsDir};
 use regex::{Regex, RegexBuilder};
 
+pub mod bus;
+
 /// Compiled-program size cap for a single pattern. Rules can be agent-supplied,
 /// so a pattern that would compile to a larger automaton than this is rejected
 /// (`RuleError::BadRegex`) rather than ballooning to the crate's 10 MiB default.
