@@ -71,25 +71,75 @@ pub struct Variable {
 
 /// One ordered step. A single-key map names the step type (`http:`/`browser:`/
 /// `extract:`/`script:`), the nuclei shape — not serde's `!Tag` external tagging.
+///
+/// A protocol contributes a native `<ns>:` step through the extensibility seam
+/// rather than a new hard-coded arm: any namespace key that is not one of the
+/// four fixed types parses into [`Step::Protocol`], whose late-parsed `body` the
+/// registered `PocStepHandler` interprets at run time. The enum is
+/// `#[non_exhaustive]` so adding `Step::Protocol` (and any future seam arm) is a
+/// minor, additive change.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Step {
     Http(HttpStep),
     Browser(BrowserStep),
     Extract(ExtractStep),
     Script(ScriptStep),
+    /// A native protocol step (`l4:`, `dns:`, `test:`, …). `ns` selects the
+    /// registered `PocStepHandler`; `body` is the handler's late-parsed
+    /// human-friendly YAML; `extract` are optional sibling extractors binding a
+    /// variable from a `field` of a named source the handler produced (the
+    /// normative `l4:` shape). Unknown to `aitm-poc` until a handler is wired —
+    /// an unregistered namespace is a run-time error, never a parse error, so a
+    /// PoC authored against a protocol still round-trips without that protocol.
+    Protocol {
+        ns: String,
+        body: serde_yaml::Value,
+        extract: Vec<ProtoExtract>,
+    },
+}
+
+/// A sibling extractor on a [`Step::Protocol`] step: bind `name` from `field` of
+/// a named `source` the step's handler produced. On-disk it is the nuclei
+/// extractor shape with the source name as `type` (`{ name, type: packet, field:
+/// tcp.flags }`); an empty `field` binds the whole source.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProtoExtract {
+    /// The variable the extracted value binds to.
+    pub name: String,
+    /// The named source to read from (the on-disk `type:`), e.g. `"packet"`.
+    pub source: String,
+    /// A dotted path into the source value (`tcp.flags`); empty = whole source.
+    pub field: String,
 }
 
 impl Serialize for Step {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let (key, inner) = match self {
-            Step::Http(h) => ("http", serde_yaml::to_value(h)),
-            Step::Browser(b) => ("browser", serde_yaml::to_value(b)),
-            Step::Extract(e) => ("extract", serde_yaml::to_value(e)),
-            Step::Script(s) => ("script", serde_yaml::to_value(s)),
-        };
-        let inner = inner.map_err(serde::ser::Error::custom)?;
         let mut m = serde_yaml::Mapping::new();
-        m.insert(serde_yaml::Value::String(key.to_string()), inner);
+        let str_key = |k: &str| serde_yaml::Value::String(k.to_string());
+        match self {
+            Step::Http(h) => {
+                m.insert(str_key("http"), to_yaml(h)?);
+            }
+            Step::Browser(b) => {
+                m.insert(str_key("browser"), to_yaml(b)?);
+            }
+            Step::Extract(e) => {
+                m.insert(str_key("extract"), to_yaml(e)?);
+            }
+            Step::Script(sc) => {
+                m.insert(str_key("script"), to_yaml(sc)?);
+            }
+            Step::Protocol { ns, body, extract } => {
+                // `{ <ns>: <body> }`, with the optional sibling `extract` list
+                // the normative protocol shape carries.
+                m.insert(serde_yaml::Value::String(ns.clone()), body.clone());
+                if !extract.is_empty() {
+                    let seq = extract.iter().map(proto_extract_to_yaml).collect();
+                    m.insert(str_key("extract"), serde_yaml::Value::Sequence(seq));
+                }
+            }
+        }
         serde_yaml::Value::Mapping(m).serialize(s)
     }
 }
@@ -121,11 +171,90 @@ impl<'de> Deserialize<'de> for Step {
             "script" => Ok(Step::Script(
                 serde_yaml::from_value(inner).map_err(serde::de::Error::custom)?,
             )),
-            other => Err(serde::de::Error::custom(format!(
-                "unknown step type `{other}`"
-            ))),
+            // Any other leading key is a native protocol step `<ns>:`. The
+            // namespace is unknown to `aitm-poc`; the registered handler parses
+            // `body` at run time (an unregistered namespace is a run-time error,
+            // not a parse error). A sibling `extract:` list is picked up; any
+            // other sibling key is rejected.
+            other => {
+                let ns = other.to_string();
+                let mut extract = Vec::new();
+                for (sibling_k, sibling_v) in map.iter() {
+                    let sibling = sibling_k.as_str().ok_or_else(|| {
+                        serde::de::Error::custom("protocol step sibling key must be a string")
+                    })?;
+                    if sibling == other {
+                        continue;
+                    }
+                    if sibling == "extract" {
+                        extract = proto_extracts_from_yaml(sibling_v)
+                            .map_err(serde::de::Error::custom)?;
+                    } else {
+                        return Err(serde::de::Error::custom(format!(
+                            "protocol step `{ns}:` has an unexpected sibling key `{sibling}`"
+                        )));
+                    }
+                }
+                Ok(Step::Protocol {
+                    ns,
+                    body: inner,
+                    extract,
+                })
+            }
         }
     }
+}
+
+/// Serialize a step inner value, mapping the error into the serializer's.
+fn to_yaml<T: Serialize, E: serde::ser::Error>(v: &T) -> Result<serde_yaml::Value, E> {
+    serde_yaml::to_value(v).map_err(serde::ser::Error::custom)
+}
+
+fn proto_extract_to_yaml(e: &ProtoExtract) -> serde_yaml::Value {
+    let mut m = serde_yaml::Mapping::new();
+    let put = |m: &mut serde_yaml::Mapping, k: &str, v: &str| {
+        m.insert(
+            serde_yaml::Value::String(k.to_string()),
+            serde_yaml::Value::String(v.to_string()),
+        );
+    };
+    put(&mut m, "name", &e.name);
+    put(&mut m, "type", &e.source);
+    if !e.field.is_empty() {
+        put(&mut m, "field", &e.field);
+    }
+    serde_yaml::Value::Mapping(m)
+}
+
+fn proto_extracts_from_yaml(v: &serde_yaml::Value) -> Result<Vec<ProtoExtract>, String> {
+    v.as_sequence()
+        .ok_or("`extract` on a protocol step must be a list")?
+        .iter()
+        .map(proto_extract_from_yaml)
+        .collect()
+}
+
+fn proto_extract_from_yaml(v: &serde_yaml::Value) -> Result<ProtoExtract, String> {
+    let name = v
+        .get("name")
+        .and_then(|n| n.as_str())
+        .ok_or("protocol extractor missing `name`")?
+        .to_string();
+    let source = v
+        .get("type")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| format!("protocol extractor `{name}` missing `type` (the source name)"))?
+        .to_string();
+    let field = v
+        .get("field")
+        .and_then(|f| f.as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok(ProtoExtract {
+        name,
+        source,
+        field,
+    })
 }
 
 /// An HTTP request step. The model carries the request shape; on-disk keys it
