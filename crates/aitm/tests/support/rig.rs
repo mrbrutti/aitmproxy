@@ -62,6 +62,20 @@ pub fn obscura_enabled() -> bool {
     true
 }
 
+/// Whether the opt-in live-acceptance harness is enabled. It spawns the target as
+/// a real external process, so it is gated *in addition to* `AITM_OBSCURA`: unset,
+/// the live-acceptance suite returns early and nothing external is spawned.
+#[allow(dead_code)] // only the live-acceptance suite consults this gate
+pub fn live_enabled() -> bool {
+    if std::env::var_os("AITM_LIVE").is_none() {
+        eprintln!(
+            "skipped; set AITM_LIVE=1 (with AITM_OBSCURA) to run the live-acceptance harness"
+        );
+        return false;
+    }
+    true
+}
+
 /// One real browser at a time within a test binary: each launches obscura, whose
 /// start timeout is a function of host load if several race.
 pub fn obscura_lock() -> &'static tokio::sync::Mutex<()> {
@@ -115,20 +129,42 @@ pub struct Rig {
     pub findings_dir: PathBuf,
     poc_dir: PathBuf,
     browser: LaunchedBrowser,
-    // Kept alive for the run.
-    _vuln: TestTarget,
-    _patched: TestTarget,
+    // Kept alive for the run. `None` when the origins run as external processes the
+    // caller owns (the live-acceptance harness), `Some` for the in-process targets.
+    _vuln: Option<TestTarget>,
+    _patched: Option<TestTarget>,
     _ca_dir: TempDir,
     _findings_tmp: TempDir,
     _poc_tmp: TempDir,
 }
 
 impl Rig {
+    /// The default rig: two in-process [`TestTarget`]s (vulnerable + patched).
     pub async fn start() -> Rig {
         let vuln = TestTarget::start(SeedMode::Vulnerable).await;
         let patched = TestTarget::start(SeedMode::Patched).await;
         let vuln_base = vuln.base_url().to_string();
         let patched_base = patched.base_url().to_string();
+        Rig::assemble(vuln_base, patched_base, Some(vuln), Some(patched)).await
+    }
+
+    /// The same rig standing against two origins that already run elsewhere — e.g.
+    /// the `aitm-testtarget-serve` binary as an external process, for the live
+    /// acceptance harness. The caller owns the origin processes' lifetimes; the rig
+    /// only needs their `http://host:port` base URLs to scope and reproduce against.
+    #[allow(dead_code)] // only the live-acceptance suite drives external origins
+    pub async fn start_against(vuln_base: String, patched_base: String) -> Rig {
+        Rig::assemble(vuln_base, patched_base, None, None).await
+    }
+
+    /// Shared assembly: scope the two origins, wire the findings store, launch the
+    /// browser through the proxy, and stand the MCP bus on loopback TCP.
+    async fn assemble(
+        vuln_base: String,
+        patched_base: String,
+        vuln: Option<TestTarget>,
+        patched: Option<TestTarget>,
+    ) -> Rig {
         let vuln_authority = authority_of(&vuln_base);
         let patched_authority = authority_of(&patched_base);
 
