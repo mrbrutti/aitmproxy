@@ -369,7 +369,14 @@ fn record_frame(
 /// address, destination port (for TCP/UDP), and protocol. `None` for a frame that
 /// carries no IP layer (ARP, or an undecodable buffer) — such a frame is out of a
 /// CIDR-scoped capture by definition.
-fn packet_target(frame: &[u8], interface: &str, direction: L4Direction) -> Option<L4Target> {
+///
+/// `pub(crate)` so `send_recv` re-checks a correlated reply with the *same* target
+/// resolution the background capture uses before recording it ([`record_frame`]).
+pub(crate) fn packet_target(
+    frame: &[u8],
+    interface: &str,
+    direction: L4Direction,
+) -> Option<L4Target> {
     let parsed = parse_any(frame)?;
     let dst = match parsed.net? {
         NetSlice::Ipv4(ip) => IpAddr::V4(ip.header().destination_addr()),

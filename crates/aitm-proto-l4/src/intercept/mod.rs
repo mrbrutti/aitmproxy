@@ -582,7 +582,14 @@ fn wire_of(verdict: Verdict, mutated: Option<Vec<u8>>) -> WireVerdict {
 /// guard checks: destination address, destination port (TCP/UDP), and protocol.
 /// `None` for a buffer that carries no IP layer (such a packet is out of a
 /// CIDR-scoped interception by definition).
-fn ip_target(payload: &[u8], interface: &str, direction: L4Direction) -> Option<L4Target> {
+///
+/// `pub(crate)` so the command layer can re-resolve a *mutated* packet's target and
+/// re-check it against the guard before reinjecting it (M5 Task 12 forward path).
+pub(crate) fn ip_target(
+    payload: &[u8],
+    interface: &str,
+    direction: L4Direction,
+) -> Option<L4Target> {
     let parsed = SlicedPacket::from_ip(payload).ok()?;
     let dst = match parsed.net? {
         NetSlice::Ipv4(ip) => IpAddr::V4(ip.header().destination_addr()),
