@@ -68,9 +68,12 @@ struct Harness {
     store: Arc<MemFlowStore>,
     findings: Arc<MemoryFindingSink>,
     registry: Arc<Registry>,
-    chain: Chain,
+    chain: Arc<Chain>,
     /// The live handles of the loaded scripts, in chain order.
     handles: Vec<Arc<ScriptHandle>>,
+    /// The tier's error sink; bind it to the chain to make a failed hook's
+    /// `Event::Error` actually dispatch back through the chain.
+    error_sink: Arc<aitm_plugin_rhai::ErrorSink>,
 }
 
 impl Harness {
@@ -95,6 +98,7 @@ impl Harness {
         .expect("tier builds");
         assert!(tier.errors.is_empty(), "scripts compile: {:?}", tier.errors);
 
+        let error_sink = Arc::clone(&tier.error_sink);
         let handles: Vec<Arc<ScriptHandle>> = tier
             .plugins
             .iter()
@@ -106,14 +110,21 @@ impl Harness {
         }
         registry.add_plugin(Box::new(tier.commands));
         let registry = Arc::new(registry);
-        let chain = Chain::new(registry.clone(), store.clone());
+        let chain = Arc::new(Chain::new(registry.clone(), store.clone()));
         Self {
             store,
             findings,
             registry,
             chain,
             handles,
+            error_sink,
         }
+    }
+
+    /// Bind the chain into the tier's error sink, as the real wiring does, so
+    /// failed hooks emit `Event::Error` back through the chain.
+    fn bind_error_sink(&self) {
+        self.error_sink.bind(self.chain.clone());
     }
 
     /// Drive a command as the human CLI (unconfined), the way most tests want.
@@ -604,4 +615,33 @@ async fn script_list_shows_a_disabled_script_as_not_enabled() {
     assert_eq!(field(&rows[0], "name"), &Value::Str("alpha".into()));
     assert_eq!(field(&rows[0], "enabled"), &Value::Bool(false));
     assert_eq!(field(&rows[1], "enabled"), &Value::Bool(true));
+}
+
+/// A script that throws in a normal hook and defines `on_error`: with the error
+/// sink bound, the failure's `Event::Error` is dispatched back to the same
+/// script, whose `on_error` returns cleanly. That clean `on_error` run must not
+/// wipe the `last_error` the failure just recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_list_last_error_survives_the_scripts_own_on_error_dispatch() {
+    let script = TempScript::new(
+        "handler",
+        r#"
+        const NAME = "handler";
+        fn on_request(flow) { throw "boom from handler"; }
+        fn on_error(flow, err) { }
+        "#,
+    );
+    let h = Harness::new(vec![ScriptEntry::new(script.path())]);
+    h.bind_error_sink();
+
+    h.dispatch_with_header("X-Any", "1").await;
+    // The error event is emitted on a spawned task; let it run to completion.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let rows = list_rows(&h);
+    assert!(
+        matches!(field(&rows[0], "last_error"), Value::Str(m) if m.contains("boom from handler")),
+        "on_error's clean run must not clear the recorded failure: {:?}",
+        rows[0]
+    );
 }

@@ -1,8 +1,8 @@
 //! The tier's own operator-facing commands (spec §3, §8): `script.validate`,
-//! `script.reload`, `script.findings`, and `script.list`, registered by [`ScriptCommands`] —
-//! one more `Plugin` whose `load` adds native `Command`s, so MCP `tools/list`
-//! and the CLI (`aitm script validate --path x.rhai`) pick them up with no
-//! special casing.
+//! `script.reload`, `script.findings`, and `script.list`, registered by
+//! [`ScriptCommands`] — one more `Plugin` whose `load` adds native `Command`s,
+//! so MCP `tools/list` and the CLI (`aitm script validate --path x.rhai`) pick
+//! them up with no special casing.
 //!
 //! - **`script.validate { path }`** compiles the file on the shared engine
 //!   without registering anything and answers with the script's declared

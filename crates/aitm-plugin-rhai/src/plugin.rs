@@ -324,7 +324,11 @@ impl Plugin for ScriptPlugin {
 
         match self.call_hook(&ast, hook, &state, args) {
             Ok(()) => {
-                self.errors.clear(&self.meta.name);
+                // A clean `on_error` run is the script handling its own
+                // failure's `Event::Error`; it must not erase that failure.
+                if !matches!(ev, Event::Error { .. }) {
+                    self.errors.clear(&self.meta.name);
+                }
                 take(state).apply_to(ctx)
             }
             Err(err) => {
