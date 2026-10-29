@@ -1162,6 +1162,14 @@ fn policy_server(state: Arc<AgentState>, config: Option<Arc<Config>>) -> McpServ
         name: "scope.add",
         gate: |c| c.scope.allow_agent_widen,
     }));
+    // F8: a Sensitive authoring command with its own config gate that is
+    // deliberately NOT in `defers_to_command_gate`, so `All` must still refuse it
+    // (its gate is always on here, to prove the policy refuses before the gate is
+    // even consulted). Mirrors `script.save`/`reload`/`enable`/`disable`.
+    reg.add_command(Arc::new(GatedCmd {
+        name: "script.save",
+        gate: |_| true,
+    }));
     reg.add_plugin(Box::new(AgentPlugin::new(state.clone())));
     let mut srv = McpServer::new(Arc::new(reg), McpTransport::Stdio)
         .with_services(
@@ -1299,6 +1307,52 @@ fn agent_status_readable_by_any_role() {
             "policy reported to {role:?}"
         );
     }
+}
+
+/// F8 AC8: agent script-authoring is supported under `Ask` (parked for operator
+/// approval) and **refused under `All`**. `script.save` is `Sensitive` with its
+/// own config gate, but it is deliberately NOT in `defers_to_command_gate`, so an
+/// autonomous `All` agent cannot self-authorize it — even with its gate on — the
+/// way `ca.install` can. A human must be in the loop (`Ask`). `Auto` refuses it;
+/// an operator is never policy-gated. This locks the posture that an autonomous
+/// agent cannot write executable, live-traffic-mutating Rhai hooks on a flag alone.
+#[test]
+fn f8_script_authoring_not_auto_authorized_under_all() {
+    let cfg = config_gates_on(); // ca.install's gate is on, for the contrast below.
+
+    let all = policy_server(
+        Arc::new(AgentState::new(AgentPolicy::All)),
+        Some(cfg.clone()),
+    );
+    assert!(
+        is_refused(&call_as(&all, Frontend::Mcp, "script.save")),
+        "All must refuse script.save (not in defers_to_command_gate), even with its gate on"
+    );
+    assert!(
+        !is_refused(&call_as(&all, Frontend::Mcp, "ca.install")),
+        "contrast: ca.install IS auto-authorizable under All with its gate on"
+    );
+    assert!(
+        !is_refused(&call_as(&all, Frontend::Operator, "script.save")),
+        "an operator is never policy-gated and authors freely"
+    );
+
+    let auto = policy_server(
+        Arc::new(AgentState::new(AgentPolicy::Auto)),
+        Some(cfg.clone()),
+    );
+    assert!(
+        is_refused(&call_as(&auto, Frontend::Mcp, "script.save")),
+        "Auto refuses a Sensitive script command outright"
+    );
+
+    // `Ask` parks a Sensitive agent call for operator approval; until approved it
+    // does not run inline, so the call is not successful here.
+    let ask = policy_server(Arc::new(AgentState::new(AgentPolicy::Ask)), Some(cfg));
+    assert!(
+        is_refused(&call_as(&ask, Frontend::Mcp, "script.save")),
+        "Ask parks script.save for approval (not run inline)"
+    );
 }
 
 /// A config with both agent capability gates turned on, so a test can prove the
