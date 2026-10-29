@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    AgentPolicy, AgentState, Body, Command, CommandHost, Config, ConnInfo, Flow, FlowMeta,
-    FlowStore, Frontend, HeaderMap, HttpFlow, HttpRequest, HttpVersion, InterceptState,
+    AgentPolicy, AgentState, AuditRing, Body, Command, CommandHost, Config, ConnInfo, Flow,
+    FlowMeta, FlowStore, Frontend, HeaderMap, HttpFlow, HttpRequest, HttpVersion, InterceptState,
     McpTransport, MemFlowStore, ParamDef, ParamSchema, Params, Plugin, ProxyClient, Registry,
     Sensitivity, StdGuard, TypeDesc, Value,
 };
@@ -2114,4 +2114,225 @@ fn summarize_present_for_representative_set() {
     assert!(run
         .summarize(&Params::default(), &poc_shaped_value())
         .is_some());
+}
+
+// ------------------------------------------------- F2 audit ring (Task 8)
+
+/// A Read command that accepts a `token` arg and a `headers` map, so a test can
+/// drive secrets through the audit path and prove they are redacted. Echoes its
+/// arguments so a careless implementation that logged the raw value would be
+/// caught both in the result and (if unredacted) the audit entry.
+struct SecretEchoCmd;
+
+impl Command for SecretEchoCmd {
+    fn name(&self) -> &str {
+        "demo.secret"
+    }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
+    }
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "Echo, accepting a token and headers.".into(),
+            params: vec![
+                ParamDef {
+                    name: "token".into(),
+                    ty: TypeDesc::Str,
+                    required: false,
+                    description: String::new(),
+                },
+                ParamDef {
+                    name: "headers".into(),
+                    ty: TypeDesc::Map(Box::new(TypeDesc::Str)),
+                    required: false,
+                    description: String::new(),
+                },
+                ParamDef {
+                    name: "note".into(),
+                    ty: TypeDesc::Str,
+                    required: false,
+                    description: String::new(),
+                },
+            ],
+            result: TypeDesc::Any,
+        }
+    }
+    fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+        Ok(Value::Object(
+            args.iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        ))
+    }
+}
+
+/// A server whose registry carries a Read command (`demo.read`), a gateless
+/// Sensitive command (`demo.sensitive`), the secret-echo command, and the real
+/// `AgentPlugin` — all sharing `ring`, so `agent.activity` reads exactly what
+/// `call_tool` appends. The policy is `Auto`, so Read runs and Sensitive is
+/// refused (both are audited).
+fn audit_server(ring: Arc<AuditRing>) -> McpServer {
+    let mut reg = Registry::new();
+    reg.add_command(Arc::new(TierCmd {
+        name: "demo.read",
+        sens: Sensitivity::Read,
+    }));
+    reg.add_command(Arc::new(TierCmd {
+        name: "demo.sensitive",
+        sens: Sensitivity::Sensitive,
+    }));
+    reg.add_command(Arc::new(SecretEchoCmd));
+    let state = Arc::new(AgentState::new(AgentPolicy::Auto));
+    reg.add_plugin(Box::new(
+        AgentPlugin::new(state.clone()).with_audit_ring(ring.clone()),
+    ));
+    McpServer::new(Arc::new(reg), McpTransport::Stdio)
+        .with_services(
+            Arc::new(MemFlowStore::new()),
+            Arc::new(StubClient),
+            Arc::new(StdGuard::default()),
+            None,
+        )
+        .with_agent_state(state)
+        .with_audit_ring(ring)
+}
+
+/// AC-M4-6b / spec D3a.1: every invocation is recorded after the gates — a
+/// successful call and a policy-refused one each produce one entry, and the
+/// refusal carries its reason as an error.
+#[test]
+fn every_invoke_is_audited_including_refusals() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+
+    // A Read runs under Auto; a gateless Sensitive is refused under Auto.
+    assert!(!is_refused(&call_as(&srv, Frontend::Mcp, "demo.read")));
+    assert!(is_refused(&call_as(&srv, Frontend::Mcp, "demo.sensitive")));
+
+    let entries = ring.recent(None, None);
+    assert_eq!(
+        entries.len(),
+        2,
+        "one entry per invocation, refusals included"
+    );
+
+    let ok = &entries[0];
+    assert_eq!(ok.command, "demo.read");
+    assert_eq!(ok.origin, Frontend::Mcp);
+    assert_eq!(ok.result, aitm_core::AuditResult::Ok);
+
+    let refused = &entries[1];
+    assert_eq!(refused.command, "demo.sensitive");
+    match &refused.result {
+        aitm_core::AuditResult::Error(reason) => {
+            assert!(reason.contains("auto"), "refusal reason carried: {reason}");
+        }
+        other => panic!("expected an error result, got {other:?}"),
+    }
+}
+
+/// AC-M4-6b / Review Focus #3: an `Authorization` header and a token argument
+/// must not appear in the audit entry or the pushed `agent` line. The redaction
+/// is by key name, recursively, so a secret nested in `headers` is caught too.
+#[test]
+fn audit_redacts_secrets() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+
+    // Subscribe a second connection so the pushed `agent` line can be inspected.
+    let watcher = ConnCtx {
+        role: Frontend::Operator,
+        client_label: None,
+        conn_id: srv.next_conn_id(),
+        out: Some(aitm_mcp::NotificationSink::new(64)),
+    };
+    let sub = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+        "params":{"name":"flow.subscribe","arguments":{}}});
+    srv.handle_on(&watcher, &sub.to_string())
+        .expect("subscribe reply");
+
+    let call = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+    "name":"demo.secret",
+    "arguments":{
+        "token":"SECRET-TOKEN-123",
+        "headers":{"Authorization":"Bearer SECRET-AUTH-XYZ"},
+        "note":"keep-this"
+    }}});
+    srv.handle_on(&ConnCtx::new(Frontend::Mcp), &call.to_string())
+        .expect("secret call reply");
+
+    let entry = ring
+        .recent(None, None)
+        .into_iter()
+        .find(|e| e.command == "demo.secret")
+        .expect("the secret call was audited");
+    assert!(
+        !entry.args_summary.contains("SECRET-TOKEN-123"),
+        "token value leaked into the audit entry: {}",
+        entry.args_summary
+    );
+    assert!(
+        !entry.args_summary.contains("SECRET-AUTH-XYZ"),
+        "auth header leaked into the audit entry: {}",
+        entry.args_summary
+    );
+    assert!(
+        entry.args_summary.contains("keep-this"),
+        "non-secret args should survive redaction: {}",
+        entry.args_summary
+    );
+
+    // The pushed `notifications/aitm/agent` line must be redacted too.
+    let pushed = watcher.out.as_ref().unwrap().drain().join("\n");
+    assert!(
+        pushed.contains("notifications/aitm/agent"),
+        "agent line pushed"
+    );
+    assert!(
+        !pushed.contains("SECRET-TOKEN-123"),
+        "token leaked into push"
+    );
+    assert!(!pushed.contains("SECRET-AUTH-XYZ"), "auth leaked into push");
+}
+
+/// AC-M4-6b / spec D3a.4: `agent.activity` reads recent entries, honouring
+/// `since` and `limit`.
+#[test]
+fn agent_activity_returns_recent() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+
+    // Three invocations.
+    call_as(&srv, Frontend::Mcp, "demo.read");
+    call_as(&srv, Frontend::Mcp, "demo.read");
+    call_as(&srv, Frontend::Mcp, "demo.read");
+
+    // `limit` keeps the most recent N (plus the agent.activity call itself).
+    let resp = call_as_args(&srv, Frontend::Mcp, "agent.activity", json!({"limit": 2}));
+    let activity = &resp["result"]["structuredContent"];
+    let list = activity.as_array().expect("activity is an array");
+    assert_eq!(list.len(), 2, "limit honoured");
+
+    // `since` in the future returns nothing.
+    let future_ms = (std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let resp = call_as_args(
+        &srv,
+        Frontend::Mcp,
+        "agent.activity",
+        json!({"since": future_ms}),
+    );
+    let list = resp["result"]["structuredContent"]
+        .as_array()
+        .expect("activity is an array");
+    assert!(list.is_empty(), "since in the future returns nothing");
+
+    // `agent.activity` is readable by any role (Read, not policy-gated).
+    assert!(!is_refused(&call_as(
+        &srv,
+        Frontend::Operator,
+        "agent.activity"
+    )));
 }

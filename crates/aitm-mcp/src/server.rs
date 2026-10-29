@@ -11,12 +11,12 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use aitm_core::{
-    AgentPolicy, AgentState, BrowserDriver, Command, CommandHost, Event, Flow, FlowId, FlowQuery,
-    FlowStore, Frontend, McpTransport, ProxyClient, Registry, ScopeRateGuard, Sensitivity,
-    SsrfPolicy,
+    AgentPolicy, AgentState, AuditEntry, AuditResult, AuditRing, AuditSink, BrowserDriver, Command,
+    CommandHost, Event, Flow, FlowId, FlowQuery, FlowStore, Frontend, McpTransport, ProxyClient,
+    Registry, ScopeRateGuard, Sensitivity, SsrfPolicy,
 };
 use serde_json::{json, Map, Value as JsonValue};
 use tokio::sync::{broadcast, Notify};
@@ -538,6 +538,16 @@ pub struct McpServer {
     confirm_tokens: Arc<ConfirmTokens>,
     /// How long a minted confirm token stays valid.
     confirm_ttl: Duration,
+    /// The F2 command-invocation audit ring (spec D3a). Always on; `call_tool`
+    /// appends one entry per invocation (including refusals) after the gates, and
+    /// `agent.activity` reads it. Shared with the `AgentPlugin` so both see the
+    /// same entries.
+    audit_ring: Arc<AuditRing>,
+    /// An optional durable audit sink (a JSONL log, opt-in by config). When set,
+    /// each entry is appended here as well as to the ring, so the full session is
+    /// reconstructable after the fact (spec D3a.2); the CA plugin's log is a
+    /// subset of this one format.
+    durable_audit: Option<Arc<dyn AuditSink>>,
 }
 
 /// A JSON-RPC level failure (as opposed to a tool's own error result).
@@ -577,7 +587,24 @@ impl McpServer {
             conn_seq: Arc::new(AtomicU64::new(0)),
             confirm_tokens: Arc::new(ConfirmTokens::default()),
             confirm_ttl: DEFAULT_CONFIRM_TTL,
+            audit_ring: Arc::new(AuditRing::default()),
+            durable_audit: None,
         }
+    }
+
+    /// Share the F2 audit ring with the `AgentPlugin`, so `agent.activity` reads
+    /// the very entries `call_tool` records. Wiring creates one ring, hands it
+    /// here and to `AgentPlugin::with_audit_ring`.
+    pub fn with_audit_ring(mut self, audit_ring: Arc<AuditRing>) -> Self {
+        self.audit_ring = audit_ring;
+        self
+    }
+
+    /// Attach a durable audit sink (a JSONL log). Opt-in: when absent, only the
+    /// in-memory ring records. Every entry the ring gets is appended here too.
+    pub fn with_durable_audit(mut self, sink: Arc<dyn AuditSink>) -> Self {
+        self.durable_audit = Some(sink);
+        self
     }
 
     /// Attach the core→server event broadcast (the `SubscriptionPlugin`'s chain
@@ -747,6 +774,8 @@ impl McpServer {
             conn_seq,
             confirm_tokens,
             confirm_ttl,
+            audit_ring,
+            durable_audit,
         } = self;
         let on_bound = on_bound.into_inner().unwrap_or(None);
         let server = Arc::new(McpServer {
@@ -766,6 +795,8 @@ impl McpServer {
             conn_seq,
             confirm_tokens,
             confirm_ttl,
+            audit_ring,
+            durable_audit,
         });
         // The push dispatcher: for each core event, render + fan a flow
         // notification to matching subscriptions. One task per server, draining
@@ -920,6 +951,36 @@ impl McpServer {
         } else {
             Cow::Borrowed(raw_arguments)
         };
+        // Run the tool (gates, handshake, invoke); then audit every command
+        // invocation that ran or was refused (F2, spec D3a.1). Two outcomes are
+        // not audited: a `needs_confirmation` handshake step (it neither ran nor
+        // was refused), and the server-handled subscription verbs
+        // (`flow.subscribe`/`unsubscribe`) — those are connection management, not
+        // registry command invocations, and pushing their line back to the very
+        // subscriber would be self-referential noise.
+        match self.run_tool(conn, name, &arguments, confirm_ack.as_deref()) {
+            ToolOutcome::Rpc(e) => Err(e),
+            ToolOutcome::Pending(value) => Ok(value),
+            ToolOutcome::Done(value) => {
+                if !is_subscription_verb(name) {
+                    self.record_audit(conn, name, &arguments, &value);
+                }
+                Ok(value)
+            }
+        }
+    }
+
+    /// The tool-call core: the subscription shortcut, the policy/confirm gates,
+    /// and `Command::invoke`. Returns a [`ToolOutcome`] so `call_tool` can audit
+    /// what ran or was refused (`Done`) without auditing a protocol-level failure
+    /// (`Rpc`) or a pending confirmation handshake (`Pending`).
+    fn run_tool(
+        &self,
+        conn: &ConnCtx,
+        name: &str,
+        arguments: &Map<String, JsonValue>,
+        confirm_ack: Option<&str>,
+    ) -> ToolOutcome {
         // F4 connection-scoped subscription management. These need the ConnCtx's
         // push sink and the server's subscription registry — neither of which a
         // `CommandHost` can carry — so the server handles them directly instead
@@ -927,28 +988,36 @@ impl McpServer {
         // (blocked only under `Paused`, and only for the agent role).
         if name == "flow.subscribe" || name == "flow.unsubscribe" {
             if let Some(reason) = self.read_refusal(conn, name) {
-                return Ok(tool_error(reason));
+                return ToolOutcome::Done(tool_error(reason));
             }
-            return Ok(self.handle_subscription(conn, name, &arguments));
+            return ToolOutcome::Done(self.handle_subscription(conn, name, arguments));
         }
-        let cmd = self
-            .registry
-            .command(name)
-            .ok_or_else(|| RpcError::new(INVALID_PARAMS, format!("unknown tool `{name}`")))?;
+        let cmd = match self.registry.command(name) {
+            Some(cmd) => cmd,
+            None => {
+                return ToolOutcome::Rpc(RpcError::new(
+                    INVALID_PARAMS,
+                    format!("unknown tool `{name}`"),
+                ))
+            }
+        };
         // The agent policy gate (D2), before anything runs. Only the agent role
         // is gated; an operator or the CLI is the control and bypasses it.
         if let Some(reason) = self.policy_refusal(conn, cmd.as_ref()) {
-            return Ok(tool_error(reason));
+            return ToolOutcome::Done(tool_error(reason));
         }
-        let services = self.services.as_ref().ok_or_else(|| {
-            RpcError::new(
-                INTERNAL_ERROR,
-                "no core services attached; call McpServer::with_services first",
-            )
-        })?;
-        let args = match params_from_json(&arguments, &cmd.schema(), name) {
+        let services = match self.services.as_ref() {
+            Some(services) => services,
+            None => {
+                return ToolOutcome::Rpc(RpcError::new(
+                    INTERNAL_ERROR,
+                    "no core services attached; call McpServer::with_services first",
+                ))
+            }
+        };
+        let args = match params_from_json(arguments, &cmd.schema(), name) {
             Ok(args) => args,
-            Err(e) => return Ok(tool_error(e.to_string())),
+            Err(e) => return ToolOutcome::Done(tool_error(e.to_string())),
         };
         // D4 operator confirm-over-the-wire handshake. Only the operator role is
         // offered it; the agent is never handed a handshake — its confirm-gated
@@ -957,8 +1026,8 @@ impl McpServer {
         // local human through the `Confirmer`.
         if conn.role == Frontend::Operator {
             if let Some(prompt) = cmd.confirm_prompt(&args) {
-                let fingerprint = confirm_fingerprint(&arguments);
-                match &confirm_ack {
+                let fingerprint = confirm_fingerprint(arguments);
+                match confirm_ack {
                     // A valid, matching, unexpired, single-use token: consume it
                     // and fall through to run the command.
                     Some(tok)
@@ -968,7 +1037,7 @@ impl McpServer {
                     // A token was supplied but did not validate (wrong, expired,
                     // already used, or for a different call): refuse, do not run.
                     Some(_) => {
-                        return Ok(tool_error(format!(
+                        return ToolOutcome::Done(tool_error(format!(
                             "`{name}` confirmation token is invalid, expired, or already used; \
                              re-send the call without `_confirm` to obtain a fresh confirmation."
                         )));
@@ -981,7 +1050,7 @@ impl McpServer {
                             &fingerprint,
                             self.confirm_ttl,
                         );
-                        return Ok(needs_confirmation(&prompt, &token));
+                        return ToolOutcome::Pending(needs_confirmation(&prompt, &token));
                     }
                 }
             }
@@ -1009,7 +1078,7 @@ impl McpServer {
         // `summarize` reads the args and result, so keep a copy of the typed args
         // before `invoke` consumes them (D3b).
         let args_for_summary = args.clone();
-        Ok(match cmd.invoke(args, &host) {
+        ToolOutcome::Done(match cmd.invoke(args, &host) {
             Ok(value) => {
                 // `structuredContent` stays the exact machine value (contract
                 // unchanged); only `content` text becomes a readable rendering —
@@ -1027,6 +1096,65 @@ impl McpServer {
             // A failing command is a tool result, not a protocol failure.
             Err(e) => tool_error(format!("{e:#}")),
         })
+    }
+
+    /// Append one [`AuditEntry`] for an invocation that ran or was refused (F2,
+    /// spec D3a). `args_summary` is the arguments **redacted** (tokens, auth
+    /// headers, and other secret-marked keys dropped) and size-capped, so a secret
+    /// never reaches the ring, the durable log, or the pushed `agent` line. Each
+    /// entry goes to the always-on ring, the optional durable sink, and the F4
+    /// agent stream.
+    fn record_audit(
+        &self,
+        conn: &ConnCtx,
+        name: &str,
+        arguments: &Map<String, JsonValue>,
+        result: &JsonValue,
+    ) {
+        let outcome = if result
+            .get("isError")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false)
+        {
+            let reason = result
+                .get("content")
+                .and_then(JsonValue::as_array)
+                .and_then(|c| c.first())
+                .and_then(|m| m.get("text"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("error")
+                .to_string();
+            AuditResult::Error(reason)
+        } else {
+            AuditResult::Ok
+        };
+        let entry = AuditEntry {
+            at: SystemTime::now(),
+            origin: conn.role,
+            client_label: conn.client_label.clone(),
+            command: name.to_string(),
+            args_summary: redact_args(arguments),
+            result: outcome,
+        };
+        self.audit_ring.append(entry.clone());
+        if let Some(durable) = &self.durable_audit {
+            durable.append(entry.clone());
+        }
+        self.push_agent(&entry);
+    }
+
+    /// Render `entry` as a `notifications/aitm/agent` line and fan it to every
+    /// subscribed connection (the agent stream concerns the whole session, so it
+    /// is not flow-filtered). Non-blocking; a slow subscriber's sink absorbs or
+    /// drops the line without stalling the caller (spec D3a.3).
+    pub fn push_agent(&self, entry: &AuditEntry) {
+        let line = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/aitm/agent",
+            "params": to_json(&entry.to_value()),
+        })
+        .to_string();
+        self.subscriptions.fanout_state(&line);
     }
 
     /// The D2 policy decision for one command on one connection: `Some(reason)`
@@ -1167,6 +1295,91 @@ impl McpServer {
             sink.push(line);
         }
     }
+}
+
+/// The result of [`McpServer::run_tool`], distinguishing what `call_tool` must do
+/// next: `Done` ran or was refused and is audited; `Pending` is a confirmation
+/// handshake step that neither ran nor was refused (not audited); `Rpc` is a
+/// protocol-level failure returned as a JSON-RPC error (not audited).
+enum ToolOutcome {
+    /// A tool result (success or `isError`) — audit it, then return it.
+    Done(JsonValue),
+    /// A `needs_confirmation` handshake reply — return it without auditing.
+    Pending(JsonValue),
+    /// A JSON-RPC level error (unknown tool, no services attached).
+    Rpc(RpcError),
+}
+
+/// Whether `name` is a server-handled subscription verb rather than a registry
+/// command. These manage the connection's push subscriptions directly (never
+/// reaching `Command::invoke`), so they sit outside the command-invocation audit.
+fn is_subscription_verb(name: &str) -> bool {
+    name == "flow.subscribe" || name == "flow.unsubscribe"
+}
+
+/// How long an argument summary may be (bytes of its JSON rendering) before it is
+/// truncated, so a verbose or hostile argument set cannot grow an audit entry
+/// without bound.
+const ARGS_SUMMARY_CAP: usize = aitm_core::DEFAULT_ARGS_SUMMARY_CAP;
+
+/// A redacted, size-capped rendering of a call's arguments for the audit entry.
+/// Secret-named keys (auth headers, tokens, the confirm acknowledgment, and the
+/// like) are replaced by `"<redacted>"` — recursively, so a secret nested inside
+/// a `headers` object is caught too — and the result is truncated at a UTF-8
+/// boundary. Secrets never reach the ring, the durable log, or the pushed line.
+fn redact_args(arguments: &Map<String, JsonValue>) -> String {
+    let redacted = redact_value(&JsonValue::Object(arguments.clone()));
+    let mut rendered = redacted.to_string();
+    if rendered.len() > ARGS_SUMMARY_CAP {
+        let mut cut = ARGS_SUMMARY_CAP;
+        while cut > 0 && !rendered.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        rendered.truncate(cut);
+        rendered.push('…');
+    }
+    rendered
+}
+
+/// Recursively replace the value of every secret-named key with `"<redacted>"`.
+fn redact_value(value: &JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(map) => JsonValue::Object(
+            map.iter()
+                .map(|(key, val)| {
+                    if is_secret_key(key) {
+                        (key.clone(), JsonValue::from("<redacted>"))
+                    } else {
+                        (key.clone(), redact_value(val))
+                    }
+                })
+                .collect(),
+        ),
+        JsonValue::Array(items) => JsonValue::Array(items.iter().map(redact_value).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Whether an argument key names a secret whose value must never be audited.
+/// Matched case-insensitively as a substring, so `Authorization`, `X-Api-Key`,
+/// `access_token`, and the reserved `_confirm` are all caught.
+fn is_secret_key(key: &str) -> bool {
+    const NEEDLES: &[&str] = &[
+        "authorization",
+        "token",
+        "_confirm",
+        "password",
+        "passwd",
+        "secret",
+        "cookie",
+        "api_key",
+        "apikey",
+        "api-key",
+        "bearer",
+        "credential",
+    ];
+    let lower = key.to_ascii_lowercase();
+    NEEDLES.iter().any(|needle| lower.contains(needle))
 }
 
 /// Whether a Sensitive command carries its own per-command agent config gate, so

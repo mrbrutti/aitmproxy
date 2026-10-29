@@ -5,6 +5,7 @@
 //! other crate in the workspace depends on this one.
 
 pub mod agent;
+pub mod audit;
 pub mod authority;
 pub mod body;
 pub mod chain;
@@ -26,6 +27,10 @@ pub mod stream;
 pub mod value;
 
 pub use agent::{AgentPolicy, AgentState};
+pub use audit::{
+    origin_label, AuditEntry, AuditResult, AuditRing, AuditSink, DEFAULT_ARGS_SUMMARY_CAP,
+    DEFAULT_AUDIT_CAPACITY,
+};
 pub use authority::{Authority, AuthorityError};
 pub use body::{Body, StreamBody};
 pub use chain::Chain;

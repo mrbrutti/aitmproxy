@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use aitm_browser::BrowserPlugin;
 use aitm_ca::CaPlugin;
-use aitm_core::{AgentState, Config, Plugin, Proxy, Registry};
+use aitm_core::{AgentState, AuditRing, Config, Plugin, Proxy, Registry};
 use aitm_plugins::{
     AgentPlugin, CapturePlugin, ControlPlugin, DetailPlugin, InterceptPlugin, MetaPlugin,
     MutatePlugin, RateLimitPlugin, ReplayPlugin, ScopePlugin, SubscriptionPlugin,
@@ -61,6 +61,11 @@ pub struct Assembled {
     /// forwards lifecycle events to it; hand it to `McpServer::with_push` so the
     /// server's dispatcher fans `notifications/aitm/flow` to subscribers.
     pub push_tx: tokio::sync::broadcast::Sender<aitm_core::Event>,
+    /// The F2 command-invocation audit ring, shared with the `AgentPlugin`
+    /// already registered (which serves `agent.activity`/`agent.status` from it);
+    /// hand it to `McpServer::with_audit_ring` so the server's `call_tool` records
+    /// into the same ring.
+    pub audit_ring: Arc<AuditRing>,
 }
 
 /// The scripting tier, ready to take its place in the chain (M3 spec §8).
@@ -160,6 +165,10 @@ pub fn assemble_with_scripts(
     // The agent policy state, shared between the `AgentPlugin` (agent.status/set)
     // and the MCP server's policy gate; seeded from config.
     let agent_state = Arc::new(AgentState::new(cfg.mcp.policy));
+    // The F2 audit ring, shared between the `AgentPlugin` (agent.activity /
+    // agent.status.actions_last_minute) and the MCP server's `call_tool`, which
+    // appends one entry per invocation.
+    let audit_ring = Arc::new(AuditRing::default());
     builder = builder
         // Command providers: the browser, poc, ca and agent commands.
         .register_plugin(Box::new(BrowserPlugin::new(cfg.browser.ssrf.clone())))
@@ -167,7 +176,9 @@ pub fn assemble_with_scripts(
             executor: scripts.executor,
         }))
         .register_plugin(Box::new(ca_plugin))
-        .register_plugin(Box::new(AgentPlugin::new(agent_state.clone())));
+        .register_plugin(Box::new(
+            AgentPlugin::new(agent_state.clone()).with_audit_ring(audit_ring.clone()),
+        ));
     if let Some(commands) = scripts.commands {
         builder = builder.register_plugin(commands);
     }
@@ -178,6 +189,7 @@ pub fn assemble_with_scripts(
         listening,
         agent_state,
         push_tx,
+        audit_ring,
     })
 }
 

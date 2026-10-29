@@ -107,6 +107,7 @@ async fn run() -> anyhow::Result<()> {
         listening,
         agent_state,
         push_tx,
+        audit_ring,
     } = assemble_with_scripts(
         &cfg,
         &Features::default(),
@@ -185,6 +186,7 @@ async fn run() -> anyhow::Result<()> {
         .with_config(Arc::new(cfg.clone()))
         .with_agent_state(agent_state)
         .with_push(push_tx)
+        .with_audit_ring(audit_ring)
         .with_services(store, client, guard, browser);
 
     // The main listener relays client traffic; the browser listener is
