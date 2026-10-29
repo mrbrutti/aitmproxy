@@ -209,6 +209,18 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 2 | spec | PASS | All 6 Task-2 ACs implemented + tested with literal values; deviations justified; scope clean; h1 `serve()` byte-for-byte unchanged. | No action. |
+| 2 | security | Important | `serve_h2` applies no idle/read timeout (bare awaits on handshakes, `accept`, `req_body.data`, `resp_fut`, `resp_body.data`, `poll_capacity`); slowloris / hung-upstream pins stream tasks + connection forever (spec §4; h1 uses `READ_TIMEOUT`). | **Open → fix task** (Task 2-fix). |
+| 2 | quality | Important | h2 stream/connection errors swallowed into `tracing::debug!` with no `Event::Error` on the still-open flow, unlike h1 (`module.rs:684-691`); operator/agent + M4 error bus never learn the flow failed (spec §2). | **Open → fix task** (Task 2-fix). |
+| 2 | security | Minor | Oversized request body fully drained (keeps granting window) instead of reset at the cap; the 413 flow emits only `RequestHeaders`, left non-terminal. | **Open → fix task** (bundle: reset at cap + emit terminal event). |
+| 2 | quality | Minor | Request-oversized 413 branch untested (only the response cap is covered). | **Open → fix task** (add the 413 request-cap test). |
+| 2 | quality | Minor | Plugin-replaced response body drops the upstream `RecvStream` undrained (no capacity release); reachable once Task 3 response-edit is active. | **Open → fix task** (drain/reset or document). |
+| 2 | security | Minor | `max_concurrent as u32` truncates for values > u32::MAX (latent; default 128). | **Accepted → Task 5** clamps/validates when wiring `LimitConfig.max_concurrent_streams`. |
+| 2 | security | Minor | Explicit HPACK / max-header-list caps not yet set (relies on `h2` finite defaults). | **Accepted → Task 5** (plan already assigns the explicit caps). |
+| 2 | quality | Minor | Duplicated cap-and-send scaffolding (`cap_extend` / `send_buffered` not factored). | **Accepted** (optional cleanup; fix task may factor it). |
+| 2 | quality | Minor | `three_concurrent_streams_three_flows` proves fan-out, not in-flight independence. | **Accepted** — Task 3's `intercept_one_stream_others_complete` proves stall-independence. |
+
+**Task 2 panel disposition (2026-10-29):** spec PASS; security + quality FAIL on two Important findings (no idle/read timeout; errors not surfaced as `Event::Error`). Both are `serve_h2` error/stall-path gaps vs the h1 arm, confirmed against spec §2/§4 — happy path, ALPN, guard routing, hop-by-hop all clean. Dispatched as a single fresh-Coder **fix task** on `h2.rs` (bundling the three related Minors) before the milestone moves on; two Minors deferred to Task 5, two accepted. Task 3 (kill→RST_STREAM, response-phase park) merged at `3d2ee37`; its own review folds into the whole-branch panel.
 
 ## Shipped
 
