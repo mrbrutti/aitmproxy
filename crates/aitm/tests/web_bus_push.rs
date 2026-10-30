@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
+use aitm::web::bridge::MAX_IN_FLIGHT;
 use aitm::web::{self, WebState};
 use aitm::wire::{assemble_with_scripts, Assembled, Features, ScriptWiring};
 use aitm_core::{
@@ -877,6 +878,10 @@ async fn a_frame_still_running_at_disconnect_cannot_resubscribe() {
         0,
         "test.block is still parked"
     );
+    // The teardown has already run: the subscription made above is gone. So the
+    // `flow.subscribe` released below really runs after it, against the closed
+    // sink, rather than before a slow teardown that would then sweep it.
+    assert_refused_without_operator(&probe_ask_gate(&server.mcp).await);
 
     // The detached frame finishes: test.block returns, then flow.subscribe runs
     // against the torn-down connection.
@@ -1077,4 +1082,120 @@ async fn agent_role_never_gets_operator_only_pushes() {
         "the refusal names the denial: {text}"
     );
     assert_eq!(commands.sensitive_runs(), 0, "a denied command never ran");
+}
+
+/// Spec D3, added by the tester: the drain arm is not gated on the in-flight cap.
+/// With `MAX_IN_FLIGHT` frames parked the bridge has stopped reading, yet a push
+/// still reaches the subscriber; the parked frames are answered once released.
+#[tokio::test]
+async fn pushes_flow_while_the_read_branch_is_paused_at_the_cap() {
+    let commands = TestCommands::new();
+    let release = commands.release_guard();
+    let server = start("at-cap", &commands, ServerOptions::default()).await;
+    let mut ws = open_agent(&server).await;
+    subscribe(&mut ws).await;
+
+    // One frame per parked command, exactly the cap: the read branch is now off.
+    let cap = u64::try_from(MAX_IN_FLIGHT).expect("small");
+    let first_id = 100;
+    for id in first_id..first_id + cap {
+        send_text(&mut ws, call_line(id, "test.block")).await;
+    }
+    wait_until("every in-flight frame to park in test.block", || {
+        commands.parking.entered() == MAX_IN_FLIGHT
+    })
+    .await;
+
+    let id = push_flow(&server, "/at-cap");
+    let note = recv_within(&mut ws, FAST, "a push while the bridge is at the cap").await;
+    assert_eq!(
+        note["method"], "notifications/aitm/flow",
+        "while every frame is parked only a push can arrive: {note}"
+    );
+    assert_eq!(note["params"]["id"], id.to_string(), "{note}");
+
+    release.release();
+    let mut replies = Vec::new();
+    while replies.len() < MAX_IN_FLIGHT {
+        let reply = recv_until(&mut ws, "a released test.block reply", |v| v["id"].is_u64()).await;
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        replies.push(reply["id"].as_u64().unwrap_or_default());
+    }
+    replies.sort_unstable();
+    assert_eq!(
+        replies,
+        (first_id..first_id + cap).collect::<Vec<_>>(),
+        "every parked frame is answered exactly once"
+    );
+}
+
+/// Spec Intent ("exactly as over loopback TCP"), added by the tester: the
+/// connection's one `ConnCtx` spans frames, so a `flow.unsubscribe` sent in a later
+/// frame removes the subscription an earlier frame made, and pushes stop.
+#[tokio::test]
+async fn unsubscribe_in_a_later_frame_stops_pushes() {
+    let commands = TestCommands::new();
+    let server = start("unsubscribe", &commands, ServerOptions::default()).await;
+    let mut ws = open_agent(&server).await;
+    let sub_id = subscribe(&mut ws).await;
+
+    // Control: while subscribed, a push arrives.
+    let before = push_flow(&server, "/before");
+    let note = recv_until(&mut ws, "the push before unsubscribing", |v| {
+        v["method"] == "notifications/aitm/flow"
+    })
+    .await;
+    assert_eq!(note["params"]["id"], before.to_string(), "{note}");
+
+    send_text(
+        &mut ws,
+        call_line_with(2, "flow.unsubscribe", json!({ "sub_id": sub_id })),
+    )
+    .await;
+    let reply = recv_until(&mut ws, "the flow.unsubscribe reply", |v| v["id"] == 2).await;
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+
+    push_flow(&server, "/after");
+    let after = drain_for(&mut ws, QUIET).await;
+    assert!(
+        after
+            .iter()
+            .all(|f| f["method"] != "notifications/aitm/flow"),
+        "no flow push reaches a connection that unsubscribed: {after:?}"
+    );
+}
+
+/// Spec D4's refusal exit path, added by the tester: a post-auth refusal drops the
+/// connection's subscriptions before its close handshake (`refuse` drops the guard
+/// first), so a peer that never answers our Close is not counted as a subscribed
+/// operator for the drain budget. The client reads the server's Close and then
+/// stops reading, so its answer is never flushed and the server is still inside
+/// the handshake when the probe runs; the probe must be refused at once anyway.
+#[tokio::test]
+async fn a_refused_connection_is_unsubscribed_before_the_close_handshake() {
+    let commands = TestCommands::new();
+    let server = start(
+        "refused",
+        &commands,
+        ServerOptions {
+            policy: AgentPolicy::Ask,
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    let mut operator = open_operator(&server).await;
+    subscribe(&mut operator).await;
+
+    // A binary frame after auth is refused (`Unsupported`).
+    operator
+        .send(Message::binary(vec![0u8; 4]))
+        .await
+        .expect("send");
+    assert!(
+        stream_ends_within(&mut operator, FAST).await,
+        "the server must refuse a binary frame by closing"
+    );
+    let probe = probe_ask_gate(&server.mcp).await;
+    assert_refused_without_operator(&probe);
+    assert_eq!(commands.sensitive_runs(), 0, "no probe ever ran");
 }

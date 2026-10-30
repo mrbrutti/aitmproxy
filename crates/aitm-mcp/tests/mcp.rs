@@ -1738,6 +1738,73 @@ fn subscribe_on_an_open_sink_still_works() {
     assert_eq!(note["params"]["id"], id.to_string());
 }
 
+/// Web `/bus` push, spec Goals (bounded push memory), added by the tester: the
+/// `since` replay rides the same bounded notification lane as live pushes. A
+/// subscribe that replays more flows than `push_capacity` keeps only the newest
+/// `push_capacity`, flagged `lagged`, and a drain puts the `lagged` marker before
+/// the surviving events. Also the positive control for
+/// `subscribe_on_a_closed_sink_is_refused_and_registers_nothing`: the same `since`
+/// argument does replay on an open sink, so that test's "no replay" is not vacuous.
+#[test]
+fn since_replay_is_bounded_by_the_sink_and_flags_lag() {
+    const CAPACITY: usize = 4;
+    const REPLAYABLE: usize = 10;
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store.clone(), CAPACITY);
+    let since = store.insert(http_flow("example.com:443", "/since"));
+    let replayable: Vec<String> = (0..REPLAYABLE)
+        .map(|i| {
+            store
+                .insert(http_flow("example.com:443", &format!("/replay/{i}")))
+                .to_string()
+        })
+        .collect();
+
+    // Sized exactly as the web bridge sizes a connection's sink.
+    let sink = NotificationSink::new(srv.push_capacity());
+    let conn = conn_over(&srv, &sink);
+    let reply = subscribe_on(&srv, &conn, json!({"since": since.to_string()}));
+    assert!(
+        reply["result"]["structuredContent"]["sub_id"]
+            .as_u64()
+            .is_some(),
+        "an open sink subscribes: {reply}"
+    );
+    assert_eq!(
+        sink.queued_len(),
+        CAPACITY,
+        "the replay of {REPLAYABLE} flows is held to push_capacity"
+    );
+    assert!(sink.lagged(), "a replay that overflowed is flagged lagged");
+
+    let lines: Vec<JsonValue> = sink
+        .drain()
+        .iter()
+        .map(|l| serde_json::from_str(l).expect("a drained line is JSON"))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        CAPACITY + 1,
+        "marker then survivors: {lines:?}"
+    );
+    assert_eq!(lines[0]["method"], "notifications/aitm/state", "{lines:?}");
+    assert_eq!(lines[0]["params"]["lagged"], true, "{lines:?}");
+    let mut survivors = Vec::new();
+    for note in &lines[1..] {
+        assert_eq!(note["method"], "notifications/aitm/flow", "{note}");
+        assert_eq!(note["params"]["event"], "created", "{note}");
+        survivors.push(note["params"]["id"].as_str().unwrap_or_default());
+    }
+    assert_eq!(
+        survivors,
+        replayable[REPLAYABLE - CAPACITY..]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        "drop-oldest keeps the newest replayed flows, oldest first"
+    );
+}
+
 /// Web `/bus` push AC9 / spec D1: `spawn_push_dispatcher` feeds a server that is
 /// never `serve`d (the web bridge drives its own `McpServer` through `handle_on`):
 /// a core `Event` sent on the broadcast reaches that server's subscriber as one
@@ -1789,6 +1856,79 @@ async fn spawn_push_dispatcher_delivers_a_broadcast_event() {
     assert_eq!(note["method"], "notifications/aitm/flow");
     assert_eq!(note["params"]["event"], "created");
     assert_eq!(note["params"]["id"], id.to_string());
+}
+
+/// Web `/bus` push AC9, second clause, added by the tester: `serve` still spawns
+/// the push dispatcher now that the spawn lives in `spawn_push_dispatcher`. The
+/// primary server's loopback-TCP subscribers depend on it, and no other
+/// default-gate test drives `serve` with a broadcast attached (the scripted e2e
+/// that does is gated on `AITM_OBSCURA`). Binds loopback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_still_spawns_the_push_dispatcher() {
+    let store = Arc::new(MemFlowStore::new());
+    // The channel's own receiver is dropped at once, so a successful `send`
+    // below proves `serve` subscribed a dispatcher of its own.
+    let (tx, _) = broadcast::channel::<Event>(16);
+    let srv = McpServer::new(
+        push_registry(),
+        McpTransport::LoopbackTcp {
+            port: 0,
+            token: "tok".into(),
+            endpoint_file: None,
+        },
+    )
+    .with_agent_state(ungated())
+    .with_services(
+        store.clone(),
+        Arc::new(StubClient),
+        Arc::new(StdGuard::default()),
+        None,
+    )
+    .with_push(tx.clone());
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel::<SocketAddr>();
+    tokio::spawn(
+        srv.on_bound(move |addr| {
+            let _ = bound_tx.send(addr);
+        })
+        .serve(),
+    );
+    let addr = bound_rx.await.expect("serve reports its bound address");
+
+    let mut s = TcpStream::connect(addr).await.expect("connect");
+    s.write_all(b"{\"token\":\"tok\"}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"flow.subscribe\",\"arguments\":{}}}\n")
+        .await
+        .expect("write");
+    let (r, _w) = s.split();
+    let mut lines = BufReader::new(r).lines();
+    let reply: JsonValue = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("the subscribe reply within the deadline")
+            .expect("io")
+            .expect("a reply line"),
+    )
+    .expect("json");
+    assert!(
+        reply["result"]["structuredContent"]["sub_id"]
+            .as_u64()
+            .is_some(),
+        "flow.subscribe over loopback TCP returns a sub_id: {reply}"
+    );
+
+    let id = store.insert(http_flow("example.com:443", "/served"));
+    tx.send(Event::RequestHeaders(id))
+        .expect("serve's dispatcher holds a broadcast receiver");
+    let note: JsonValue = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("the dispatched push within the deadline")
+            .expect("io")
+            .expect("a pushed line"),
+    )
+    .expect("json");
+    assert_eq!(note["method"], "notifications/aitm/flow", "{note}");
+    assert_eq!(note["params"]["event"], "created", "{note}");
+    assert_eq!(note["params"]["id"], id.to_string(), "{note}");
 }
 
 /// After `flow.subscribe`, a new flow through the proxy produces a
