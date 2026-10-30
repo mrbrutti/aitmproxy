@@ -29,8 +29,8 @@ pub mod wire;
 // stay public for tests and for a capability provider in another crate; these
 // are the names a binary needs.
 pub use catalog_assembly::{
-    assemble_namespaces, assemble_poc_steps, production_languages, vocabulary_consistent,
-    AssembleError,
+    assemble_namespaces, assemble_poc_steps, poc_face_drift, production_languages,
+    vocabulary_consistent, AssembleError, PocFaceDrift,
 };
 pub use command::{register_reg_api, ScriptCommand, ScriptRegHandle};
 pub use commands::ScriptCommands;
@@ -42,7 +42,7 @@ pub use host_core::{
 };
 pub use host_registry::{registered_host_fns, HostRegistry};
 pub use loader::{RhaiLoader, SUPPORTED_API};
-pub use plugin::{ErrorSink, ScriptHandle, ScriptPlugin};
+pub use plugin::{ErrorSink, LoadedScript, ScriptHandle, ScriptHost, ScriptSet};
 pub use poc_step::{RhaiScriptExecutor, ScriptVars, VarsCapability};
 pub use prelude::PRELUDE_SRC;
 pub use wire::{build, executor, load_scripts, ScriptTier};

@@ -26,14 +26,15 @@ use std::sync::Arc;
 use aitm_core::{HttpFlow, HttpRequest, MemFlowStore, ProxyClient, StdGuard, Value};
 use aitm_plugin::language::{
     GuardHandle, Guarded, HostError, HostFn, HostFnSig, NamespaceCatalog, NamespaceEntry,
-    PocStepHandler, PocStepSchema, ProtocolLanguage, RegisterError, ScriptHostRegistry,
+    PocStepHandler, PocStepInputs, PocStepOutcome, PocStepSchema, ProtocolLanguage, RegisterError,
+    ScriptHostRegistry,
 };
 use aitm_plugin_rhai::config::RhaiConfig;
 use aitm_plugin_rhai::host_core::{MemoryFindingSink, ScriptServices};
 use aitm_plugin_rhai::loader::RhaiLoader;
 use aitm_plugin_rhai::{
-    assemble_namespaces, assemble_poc_steps, production_languages, registered_host_fns,
-    vocabulary_consistent, AssembleError,
+    assemble_namespaces, assemble_poc_steps, poc_face_drift, production_languages,
+    registered_host_fns, vocabulary_consistent, AssembleError, PocFaceDrift,
 };
 use aitm_proto_test::TestLanguage;
 
@@ -292,14 +293,18 @@ impl GuardHandle for AllowGuard {
     }
 }
 
-/// A minimal in-test `ProtocolLanguage` whose namespace, fns and optional PoC
-/// step are supplied directly, so a test can drive the assembler and the seam
-/// guard without depending on a real protocol crate.
+/// A minimal in-test `ProtocolLanguage` whose namespace, fns, optional PoC step
+/// schema and optional runnable handler are supplied directly, so a test can
+/// drive the assembler and both seam guards without depending on a real protocol
+/// crate. `has_handler` toggles whether `poc_step()` returns a handler, separate
+/// from whether `step` catalogs one — so a test can forge each side of the
+/// PoC-face bijection independently.
 struct FakeLang {
     ns: String,
     api: String,
     fns: Vec<String>,
     step: Option<PocStepSchema>,
+    has_handler: bool,
     sources: Vec<String>,
 }
 
@@ -310,8 +315,27 @@ impl FakeLang {
             api: "1".to_string(),
             fns: fns.iter().map(|s| s.to_string()).collect(),
             step: None,
+            has_handler: false,
             sources: Vec::new(),
         }
+    }
+}
+
+/// A do-nothing `<ns>:` PoC step handler, so a `FakeLang` can report a runnable
+/// step the PoC-face guard can see.
+struct FakePocStep(String);
+
+impl PocStepHandler for FakePocStep {
+    fn ns(&self) -> &str {
+        &self.0
+    }
+
+    fn run(
+        &self,
+        _body: &serde_yaml::Value,
+        _inputs: &PocStepInputs,
+    ) -> Result<PocStepOutcome, HostError> {
+        Ok(PocStepOutcome::default())
     }
 }
 
@@ -333,7 +357,11 @@ impl ProtocolLanguage for FakeLang {
     }
 
     fn poc_step(&self) -> Option<Box<dyn PocStepHandler>> {
-        None
+        if self.has_handler {
+            Some(Box::new(FakePocStep(self.ns.clone())))
+        } else {
+            None
+        }
     }
 
     fn catalog(&self) -> NamespaceCatalog {
@@ -446,6 +474,79 @@ fn seam_diff_rejects_a_mutated_catalog() {
     );
 }
 
+// ===========================================================================
+// PoC-face seam guard — the analogue of the host-fn bijection above, on the
+// `<ns>:` PoC step. The host-fn guard pins the registry's `(ns, name)` set to
+// the catalog but is blind to the PoC step: a `ProtocolLanguage` whose
+// `poc_step().is_some()` can ship a runnable `<ns>:` step that never appears in
+// `catalog().poc_step` (and so never in `poc-yaml.schema.json` / operator PoC
+// completion) — undetected. This guard pins that face: a runnable step must be
+// catalogued and a catalogued step must be runnable.
+// ===========================================================================
+
+/// The PoC-face bijection holds for every registered language: the test
+/// namespace catalogs its runnable `test:` step, and `production_languages()`
+/// (empty here) is trivially in correspondence.
+#[test]
+fn poc_face_registry_matches_catalog() {
+    let test = TestLanguage::new();
+    assert_eq!(
+        poc_face_drift(&[&test]),
+        Vec::new(),
+        "the test namespace's runnable `test:` step must be catalogued"
+    );
+
+    let langs = production_languages();
+    let refs: Vec<&dyn ProtocolLanguage> = langs.iter().map(|b| b.as_ref()).collect();
+    assert_eq!(
+        poc_face_drift(&refs),
+        Vec::new(),
+        "every shipped namespace's runnable PoC step must be catalogued"
+    );
+}
+
+/// PoC-face self-test — the guard bites, both ways. A language whose `poc_step()`
+/// returns a handler but whose `catalog().poc_step` is `None` is exactly the
+/// pre-fix `TestLanguage` bug (a runnable step that silently lags the catalog);
+/// the reverse — a catalogued step with no handler — is the mirror drift. The
+/// same `poc_face_drift` the real guard trusts must report each. Mirrors the
+/// host-fn `seam_diff_rejects_a_mutated_catalog`.
+#[test]
+fn poc_face_drift_rejects_a_drifted_poc_step() {
+    // Runnable but uncatalogued (the pre-fix TestLanguage shape): must bite.
+    let runnable_uncatalogued = FakeLang {
+        has_handler: true,
+        step: None,
+        ..FakeLang::simple("ghoststep", &["a"])
+    };
+    assert_eq!(
+        poc_face_drift(&[&runnable_uncatalogued]),
+        vec![PocFaceDrift::RunnableButUncatalogued(
+            "ghoststep".to_string()
+        )],
+        "a runnable PoC step missing from the catalog must fail the guard"
+    );
+
+    // Catalogued but not runnable: the other direction must bite too.
+    let catalogued_not_runnable = FakeLang {
+        has_handler: false,
+        step: Some(PocStepSchema {
+            step: "phantom".to_string(),
+            description: "a catalogued step with no handler".to_string(),
+            enums: BTreeMap::new(),
+            sources: Vec::new(),
+        }),
+        ..FakeLang::simple("phantom", &["a"])
+    };
+    assert_eq!(
+        poc_face_drift(&[&catalogued_not_runnable]),
+        vec![PocFaceDrift::CataloguedButNotRunnable(
+            "phantom".to_string()
+        )],
+        "a catalogued PoC step with no handler must fail the guard"
+    );
+}
+
 /// Golden — the shipped `rhai.api.json` `namespaces` object equals
 /// `assemble_namespaces(production_languages())`. Empty in this task; Task 5/6
 /// populate `production_languages()` and re-verify against the shipped file.
@@ -502,11 +603,12 @@ fn duplicate_namespace_is_an_error() {
 
 /// AC8 (mechanism) — where a namespace contributes a PoC step, its `op` verb
 /// vocabulary equals its host-fn names: one vocabulary across the Rhai and PoC
-/// faces. The test namespace contributes no step, so the check holds vacuously;
-/// a synthetic namespace exercises both the match and the mismatch.
+/// faces. The test namespace catalogs a step with no `op` enum, so the check
+/// holds vacuously; a synthetic namespace exercises both the match and the
+/// mismatch.
 #[test]
 fn one_vocabulary_across_script_and_poc() {
-    // `test` has no PoC step in its catalog — vacuously consistent.
+    // `test`'s catalogued step declares no `op` enum — vacuously consistent.
     assert!(vocabulary_consistent(&TestLanguage::new().catalog()));
 
     let step = |verbs: &[&str]| PocStepSchema {
@@ -565,4 +667,38 @@ fn assemble_poc_steps_builds_the_per_namespace_node() {
     // A namespace with no PoC step contributes no entry.
     let none = FakeLang::simple("quiet", &["a"]);
     assert!(assemble_poc_steps(&[&none]).expect("assembles").is_empty());
+}
+
+/// AC8 is enforced at assembly, not merely advisory: a namespace whose PoC `op`
+/// vocabulary diverges from its host-fn names fails `assemble_poc_steps` (the
+/// build), rather than silently shipping two drifting vocabularies. The
+/// consistent sibling still assembles.
+#[test]
+fn assemble_poc_steps_rejects_a_divergent_vocabulary() {
+    let diverge = |verbs: &[&str], fns: &[&str]| FakeLang {
+        step: Some(PocStepSchema {
+            step: "demo".to_string(),
+            description: "a synthetic protocol step".to_string(),
+            enums: BTreeMap::from([(
+                "op".to_string(),
+                verbs.iter().map(|s| s.to_string()).collect(),
+            )]),
+            sources: vec!["packet".to_string()],
+        }),
+        ..FakeLang::simple("demo", fns)
+    };
+
+    // op-enum diverges from host-fn names: assembly is a hard error.
+    let bad = diverge(&["craft", "WRONG"], &["craft", "inject"]);
+    let err = assemble_poc_steps(&[&bad]).expect_err("a divergent vocabulary is rejected");
+    assert_eq!(
+        err,
+        AssembleError::VocabularyInconsistent("demo".to_string())
+    );
+
+    // op-enum == host-fn names: assembly succeeds.
+    let good = diverge(&["craft", "inject"], &["craft", "inject"]);
+    assert!(assemble_poc_steps(&[&good])
+        .expect("a consistent vocabulary assembles")
+        .contains_key("demo"));
 }

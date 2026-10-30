@@ -2,13 +2,14 @@
 //!
 //! A host (the `aitm` binary, or a test) needs five things out of one build of
 //! the scripting tier, and they must all come from the **same** engine: the
-//! plugins to register in the chain, the errors of whatever did not compile,
-//! the executor the PoC runner dispatches `script` steps through, the error
-//! sink the chain is bound into once it exists, and the plugin that registers
-//! the tier's own commands (`script.validate`, `script.reload`,
-//! `script.findings`, `script.list`). [`build`] returns all five;
-//! [`load_scripts`] is the one-line form for a host that only wants plugins, and [`executor`] builds
-//! the PoC-side half from a loader the caller already has.
+//! [`ScriptHost`] to register in the chain (one plugin, every script), the
+//! errors of whatever did not compile, the executor the PoC runner dispatches
+//! `script` steps through, the error sink the chain is bound into once it
+//! exists, and the plugin that registers the tier's own commands
+//! (`script.validate`, `script.reload`, `script.findings`, `script.list`).
+//! [`build`] returns all five; [`load_scripts`] is the one-line form for a host
+//! that only wants the compiled scripts, and [`executor`] builds the PoC-side
+//! half from a loader the caller already has.
 //!
 //! Sharing the engine is not an optimization — it is what makes "one scripting
 //! surface, reused" (spec Goals) true: a PoC `script` step sees exactly the
@@ -22,14 +23,16 @@ use crate::config::{RhaiConfig, RhaiLimits};
 use crate::error::ScriptError;
 use crate::host_core::ScriptServices;
 use crate::loader::RhaiLoader;
-use crate::plugin::{ErrorSink, ScriptPlugin};
+use crate::plugin::{ErrorSink, LoadedScript, ScriptHost, ScriptSet};
 use crate::poc_step::RhaiScriptExecutor;
 
 /// One built scripting tier, ready to wire.
 pub struct ScriptTier {
-    /// Compiled scripts, in declaration order — the order they take in the
-    /// chain after the native plugins (spec §8).
-    pub plugins: Vec<ScriptPlugin>,
+    /// The one plugin the tier registers: it holds every compiled script in
+    /// declaration order and dispatches them from a single chain position after
+    /// the native plugins (spec §8). A `script.save` appends to the set behind
+    /// it, so a new script's hooks go live with no restart.
+    pub host: ScriptHost,
     /// What did not compile. Non-empty is survivable unless the config is
     /// `strict`, which is the caller's call to make (spec §8).
     pub errors: Vec<ScriptError>,
@@ -58,26 +61,28 @@ pub fn build(cfg: RhaiConfig, services: ScriptServices) -> Result<ScriptTier, Sc
     let limits = cfg.limits.clone();
     let findings = Arc::clone(&services.findings);
     let loader = Arc::new(RhaiLoader::new(cfg, services)?);
-    let (plugins, errors) = loader.load_all();
-    let handles = plugins.iter().map(ScriptPlugin::handle).collect();
+    let (scripts, errors) = loader.load_all();
+    let set = ScriptSet::new(scripts);
     let error_sink = loader.error_sink();
     Ok(ScriptTier {
-        plugins,
-        errors,
         executor: Arc::new(executor(&loader)),
-        error_sink: Arc::clone(&error_sink),
-        commands: ScriptCommands::new(loader, handles, findings, error_sink),
+        // The command surface and the host share one set, so a `script.save`
+        // through the command appends to the set the host dispatches.
+        commands: ScriptCommands::new(loader, set.clone(), findings, Arc::clone(&error_sink)),
+        error_sink,
+        host: ScriptHost::new(set),
+        errors,
         limits,
     })
 }
 
 /// Compile every enabled script in `cfg` and report what did not, for a host
-/// that wants plugins and nothing else. An engine that cannot be built is
-/// reported as the single error.
+/// that wants the compiled scripts and nothing else. An engine that cannot be
+/// built is reported as the single error.
 pub fn load_scripts(
     cfg: RhaiConfig,
     services: ScriptServices,
-) -> (Vec<ScriptPlugin>, Vec<ScriptError>) {
+) -> (Vec<LoadedScript>, Vec<ScriptError>) {
     match RhaiLoader::new(cfg, services) {
         Ok(loader) => loader.load_all(),
         Err(err) => (Vec::new(), vec![err]),

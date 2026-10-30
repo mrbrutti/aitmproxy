@@ -185,13 +185,6 @@ pub trait PocStepHandler: Send + Sync {
     /// `ns` by the runner.
     fn ns(&self) -> &str;
 
-    /// The matcher/extractor source names this step contributes (e.g. L4's
-    /// `"packet"`, the test namespace's `"echo"`), so a PoC can assert on what
-    /// the verb produced and the catalog (Task 4) can advertise them.
-    fn sources(&self) -> Vec<String> {
-        Vec::new()
-    }
-
     /// Run the late-parsed step `body` against the resolved `inputs`, returning
     /// the sources and bindings it produced (or a [`HostError`] — e.g. the
     /// protocol guard refused the verb, or the body was malformed). The runner

@@ -85,12 +85,15 @@ pub struct Assembled {
     /// hand it to `McpServer::with_audit_ring` so the server's `call_tool` records
     /// into the same ring.
     pub audit_ring: Arc<AuditRing>,
-    /// The protocol-general capture/ingress boundary (L4OPS-AC17), bound to the live
-    /// L4 guard + flow store when `l4.enabled`. `None` when L4 is off. It is the one
-    /// seam a future capture backend (Phase 2's macOS Network/System Extension) feeds:
-    /// an ingress-fed packet is guarded by the *same* `L4Guard` and lands in the *same*
-    /// `L4FlowStore` the operator reads via `l4.flow.*`. Phase 1 lights up only the
-    /// Linux/CLI L4 path; the boundary assumes no single protocol or backend.
+    /// The protocol-general capture/ingress boundary (L4OPS-AC17). Its stream/TCP half
+    /// is wired for every build (from the live proxy's shared modules, store, chain,
+    /// SSRF-guarded connector, and scope guard), so it is `Some` whenever assembly
+    /// succeeds; the L4/UDP half is additionally bound to the live `L4Guard` + flow
+    /// store when `l4.enabled`. It is the one seam a future capture backend (Phase 2's
+    /// macOS Network/System Extension) feeds: an ingress-fed TCP flow is scope-gated,
+    /// dispatched, and dialled exactly as a proxied one, and an ingress-fed L4 packet is
+    /// guarded by the *same* `L4Guard` and lands in the *same* `L4FlowStore` the operator
+    /// reads via `l4.flow.*`. The boundary assumes no single protocol or backend.
     pub l4_ingress: Option<crate::ingress::CoreIngress>,
 }
 
@@ -253,7 +256,9 @@ pub fn assemble_with_scripts(
     // then fail closed with the specific missing-capability reason, cached from a
     // cheap startup probe. The pure/read verbs work regardless. Registered before
     // `build()` (which consumes the builder).
-    let mut l4_ingress = None;
+    // Capture the L4 module's guard + store before `build()` consumes the module via
+    // `register_plugin`; the L4/UDP half of the capture ingress is bound to them below.
+    let mut l4_half = None;
     if features.l4.enabled {
         let privilege = features
             .l4_privilege
@@ -269,13 +274,7 @@ pub fn assemble_with_scripts(
             ),
         }
         let module = L4Module::with_privilege(&features.l4, privilege);
-        // Bind the protocol-general capture ingress (L4OPS-AC17) to this module's own
-        // guard + store, so an ingress-fed packet is guarded identically to a pcap-fed
-        // one and lands where `l4.flow.*` reads. Phase 1 wires only the L4 backend.
-        l4_ingress = Some(crate::ingress::CoreIngress::with_l4(
-            module.guard(),
-            module.store(),
-        ));
+        l4_half = Some((module.guard(), module.store()));
         builder = builder.register_plugin(Box::new(module));
     }
 
@@ -284,6 +283,25 @@ pub fn assemble_with_scripts(
     // Map Remote's `check_active` rides the same scope/rate guard the client path
     // and every other command enforce.
     map_guard.bind(proxy.guard());
+
+    // The protocol-general capture ingress (L4OPS-AC17). Its stream/TCP half is wired
+    // for **every** build, from the live proxy's shared module list, flow store, event
+    // chain, SSRF-guarded upstream connector, and scope guard — so a capture backend
+    // (Phase 2's macOS Network/System Extension) can feed captured TCP whether or not
+    // L4/UDP is enabled. The L4/UDP half is added only when L4 is enabled, bound to the
+    // module's own guard + store so an ingress-fed packet is guarded identically to a
+    // pcap-fed one and lands where `l4.flow.*` reads.
+    let ingress = match l4_half {
+        Some((guard, store)) => crate::ingress::CoreIngress::with_l4(guard, store),
+        None => crate::ingress::CoreIngress::empty(),
+    };
+    let l4_ingress = Some(ingress.with_stream(
+        proxy.modules(),
+        proxy.store(),
+        proxy.event_sink(),
+        proxy.upstream_connector(true),
+        proxy.guard(),
+    ));
 
     Ok(Assembled {
         proxy,
@@ -399,3 +417,48 @@ impl Plugin for PocCommands {
 /// `aitm-proto-http`'s `Http1Machine` (chunked decode, clean framing) with TLS
 /// for `https`. Re-exported from `aitm-proto-http`.
 pub use aitm_proto_http::Http1Sender;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::SystemTime;
+
+    /// A unique temp directory for a test's CA material (assembly generates a CA).
+    fn temp_ca_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("aitm-wire-{tag}-{nanos}-{n}"))
+    }
+
+    /// L4OPS-AC17 (wiring): the assembled ingress carries its stream half for every
+    /// build (default features, L4 off), and deny-by-default holds — a captured TCP flow
+    /// to an out-of-scope host (empty scope) is `Refused` before any module match or
+    /// dial, so no network is reached.
+    #[tokio::test]
+    async fn assembled_ingress_dispatches_or_refuses_tcp() {
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("ingress-tcp");
+        let assembled = assemble(&cfg).expect("assemble with default features");
+        let ingress = assembled
+            .l4_ingress
+            .expect("the stream half of the capture ingress is wired for every build");
+
+        let flow = crate::ingress::CapturedTcpFlow {
+            stream: Box::pin(tokio::io::duplex(16).0),
+            dst: "93.184.216.34:443".parse().unwrap(),
+            sni: Some("example.com".to_string()),
+            first_bytes: vec![0x16, 0x03, 0x01],
+            peer_identity: None,
+        };
+        assert_eq!(
+            ingress.dispatch_tcp(flow).await,
+            crate::ingress::StreamOutcome::Refused,
+            "empty scope means out of scope: refused before any dial, no network"
+        );
+    }
+}
