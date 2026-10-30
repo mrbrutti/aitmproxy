@@ -85,9 +85,25 @@ pub fn register_dsl(engine: &mut Engine) {
     // --- Random family ------------------------------------------------------
     // Non-cryptographic: the shared thread-local xorshift, for unique markers,
     // not secrets.
-    engine.register_fn("rand_text_alpha", |n: i64| -> String {
-        aitm_poc::dsl::rand_text_alpha(n.max(0) as usize)
-    });
+    engine.register_fn(
+        "rand_text_alpha",
+        |n: i64| -> Result<String, Box<EvalAltResult>> {
+            // Cap the length like the PoC precheck does (`MAX_RAND_TEXT_ALPHA`):
+            // the engine's `max_operations` counts this as a single native op and
+            // `hook_timeout` only fires between ops, so neither bounds the one
+            // allocation — an unbounded `n` would reserve gigabytes or panic with
+            // a capacity overflow. Error (catchable) rather than silently clamp,
+            // to match `rand_int` / `b64_decode` and the PoC precheck.
+            let n = n.max(0) as usize;
+            if n > aitm_poc::dsl::MAX_RAND_TEXT_ALPHA {
+                return Err(dsl_error(format!(
+                    "rand_text_alpha: length {n} exceeds the maximum {}",
+                    aitm_poc::dsl::MAX_RAND_TEXT_ALPHA
+                )));
+            }
+            Ok(aitm_poc::dsl::rand_text_alpha(n))
+        },
+    );
     engine.register_fn(
         "rand_int",
         |a: i64, b: i64| -> Result<i64, Box<EvalAltResult>> {

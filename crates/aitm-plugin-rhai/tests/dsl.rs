@@ -3,16 +3,24 @@
 //! (AC2–AC4). Engine ≡ catalogue (AC5) is the pre-existing
 //! `tests/api_catalog.rs` bijection, not a bespoke test here.
 //!
-//! These register `register_dsl` onto a bare hardened `build_engine` — the pure
-//! helpers need no store / client / guard — which is also why the bare-engine
-//! audit (`tests/engine.rs`) does not see them.
+//! Most tests register `register_dsl` onto a bare hardened `build_engine` — the
+//! pure helpers need no store / client / guard — which is also why the
+//! bare-engine audit (`tests/engine.rs`) does not see them. One test
+//! (`dsl_reachable_through_real_loader`, AC3) goes through the real `RhaiLoader`
+//! engine built from `m3_capabilities()`, proving the helpers are wired in for
+//! actual loaded scripts, not just via the free `register_dsl`.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
-use aitm_plugin_rhai::config::RhaiLimits;
+use aitm_core::{HttpFlow, HttpRequest, MemFlowStore, ProxyClient, StdGuard};
+use aitm_plugin_rhai::config::{RhaiConfig, RhaiLimits};
 use aitm_plugin_rhai::dsl::{register_dsl, DslCapability};
 use aitm_plugin_rhai::engine::build_engine;
-use aitm_plugin_rhai::host_core::ScriptCapability;
+use aitm_plugin_rhai::host_core::{MemoryFindingSink, ScriptCapability, ScriptServices};
+use aitm_plugin_rhai::loader::RhaiLoader;
 use rhai::Engine;
 
 /// AC1: the capability advertises the `dsl` namespace at API 1.
@@ -55,7 +63,8 @@ fn encoding_helpers_run() {
 }
 
 /// AC4: a bad base64 input is a *catchable* `ErrorRuntime`, never a corrupted or
-/// empty string that hides the bug.
+/// empty string that hides the bug — both the invalid-base64 branch and the
+/// distinct valid-base64-but-non-UTF-8-bytes branch (`"/w=="` decodes to `0xFF`).
 #[test]
 fn b64_decode_errors_are_catchable() {
     let engine = dsl_engine();
@@ -67,6 +76,21 @@ fn b64_decode_errors_are_catchable() {
         engine
             .eval::<String>(
                 r#"let r = "no-error"; try { b64_decode("!!!"); } catch(e) { r = "caught"; } r"#
+            )
+            .unwrap(),
+        "caught"
+    );
+
+    // Valid base64 whose decoded bytes are not valid UTF-8 (0xFF): a distinct,
+    // catchable error, never a lossy string.
+    assert!(
+        engine.eval::<String>(r#"b64_decode("/w==")"#).is_err(),
+        "non-UTF-8 decoded bytes must error"
+    );
+    assert_eq!(
+        engine
+            .eval::<String>(
+                r#"let r = "no-error"; try { b64_decode("/w=="); } catch(e) { r = "caught"; } r"#
             )
             .unwrap(),
         "caught"
@@ -120,6 +144,41 @@ fn random_helpers_run() {
     );
 }
 
+/// `rand_text_alpha` is bounded at `MAX_RAND_TEXT_ALPHA` (4096): the cap length
+/// still works, and any larger length is a *catchable* error — never a multi-GB
+/// allocation or a capacity-overflow panic (the gating panel finding).
+#[test]
+fn rand_text_alpha_is_bounded() {
+    let engine = dsl_engine();
+    assert_eq!(
+        engine
+            .eval::<String>(r#"rand_text_alpha(4096)"#)
+            .unwrap()
+            .chars()
+            .count(),
+        4096
+    );
+
+    assert!(
+        engine.eval::<String>(r#"rand_text_alpha(4097)"#).is_err(),
+        "one over the cap must error"
+    );
+    assert!(
+        engine
+            .eval::<String>(r#"rand_text_alpha(2000000000)"#)
+            .is_err(),
+        "a huge length must error, not allocate"
+    );
+    assert_eq!(
+        engine
+            .eval::<String>(
+                r#"let r = "no-error"; try { rand_text_alpha(2000000000); } catch(e) { r = "caught"; } r"#
+            )
+            .unwrap(),
+        "caught"
+    );
+}
+
 /// AC2 (regex rows), AC4 (invalid pattern errors, out-of-range group is empty).
 #[test]
 fn regex_helpers_run() {
@@ -141,6 +200,20 @@ fn regex_helpers_run() {
     assert_eq!(
         engine
             .eval::<String>(r#"regex_extract("z+", "abc", 0)"#)
+            .unwrap(),
+        ""
+    );
+    // Out-of-range group on a pattern that DID match → "".
+    assert_eq!(
+        engine
+            .eval::<String>(r#"regex_extract("(a)(b)", "ab", 5)"#)
+            .unwrap(),
+        ""
+    );
+    // A negative group index → "".
+    assert_eq!(
+        engine
+            .eval::<String>(r#"regex_extract("(a)", "a", -1)"#)
             .unwrap(),
         ""
     );
@@ -179,4 +252,38 @@ fn all_ten_dsl_helpers_are_callable() {
         "ok"
     "#;
     assert_eq!(engine.eval::<String>(script).unwrap(), "ok");
+}
+
+/// A client no test reaches — the `dsl` helpers are pure.
+struct StubClient;
+
+impl ProxyClient for StubClient {
+    fn send(
+        &self,
+        _req: HttpRequest,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<HttpFlow>> + Send + '_>> {
+        Box::pin(async { anyhow::bail!("stub client") })
+    }
+}
+
+/// AC3: the helpers are reachable through the real `RhaiLoader` engine (built via
+/// `m3_capabilities()`), not only through the free `register_dsl` — so an actual
+/// loaded script / PoC `script:` step gets them. The loader's shared engine is
+/// the same one every loaded script runs on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dsl_reachable_through_real_loader() {
+    let services = ScriptServices {
+        store: Arc::new(MemFlowStore::new()),
+        client: Arc::new(StubClient),
+        browser: None,
+        guard: Arc::new(StdGuard::default()),
+        findings: Arc::new(MemoryFindingSink::new()),
+        rt: tokio::runtime::Handle::current(),
+    };
+    let loader = RhaiLoader::new(RhaiConfig::default(), services).expect("the loader builds");
+    let out = loader
+        .engine()
+        .eval::<String>(r#"b64_encode("foobar")"#)
+        .expect("a dsl helper is callable on the loader's engine");
+    assert_eq!(out, "Zm9vYmFy");
 }
