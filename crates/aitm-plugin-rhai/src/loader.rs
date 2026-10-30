@@ -286,12 +286,18 @@ impl RhaiLoader {
             options,
             &self.cfg,
         )
-        // A script loaded from disk via config is operator-authored: the operator
-        // placed it (or pointed config at it), so its hooks/`load` seam calls are
-        // operator-trust. `script.save` by an agent overrides this to `Agent` on
-        // the returned script (commands.rs), so an agent-saved script keeps agent
-        // trust in-session (spec AC6, Open-Q 1).
-        .with_authoring_trust(CallerTrust::Operator)
+        // A config entry names a file PATH, not evidence of who authored its
+        // CONTENTS, so a config-loaded (startup / reload) script's authorship is
+        // genuinely UNKNOWN. Fail-closed to the LEAST privilege `Agent`, never
+        // `Operator`: an agent-authored hook persisted and reloaded after a
+        // restart must not regain operator trust and run agent-gated L4 effects
+        // (architect ruling). Worst case is an operator script over-restricted
+        // after a restart (safe deny), never an agent script over-privileged
+        // (unsafe allow). An in-session `script.save` carries positive evidence
+        // of the saving frontend and overrides this on the live script
+        // (commands.rs). Persisting TRUE operator authorship across restart is a
+        // separate follow-up (spec Open-Q 1).
+        .with_authoring_trust(CallerTrust::Agent)
         .with_error_sink(Arc::clone(&self.errors)))
     }
 

@@ -11,8 +11,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aitm_core::{
-    Chain, CommandHost, Event, Flow, FlowId, FlowStore, Frontend, HttpFlow, HttpRequest,
-    MemFlowStore, Params, ProxyClient, Registry, Sensitivity, StdGuard, Value, Verdict,
+    CallerTrust, Chain, CommandHost, Event, Flow, FlowId, FlowStore, Frontend, HttpFlow,
+    HttpRequest, MemFlowStore, Params, ProxyClient, Registry, Sensitivity, StdGuard, Value,
+    Verdict,
 };
 use aitm_plugin_rhai::config::{RhaiConfig, RhaiLimits, ScriptEntry};
 use aitm_plugin_rhai::host_core::{FindingSink, MemoryFindingSink, ScriptServices};
@@ -1036,6 +1037,37 @@ async fn script_save_overwrite_swaps_the_loaded_hook_live() {
         "the new on_request runs with no restart"
     );
     assert_eq!(h.handles.len(), 1, "no handle is added or duplicated");
+}
+
+/// Security (architect ruling): the least-privilege config default is a
+/// fail-closed floor for UNKNOWN provenance only — it must not demote the
+/// in-session path. A config-loaded script starts `Agent` (unknown authorship),
+/// but an **operator**-frontend `script.save` carries positive evidence of
+/// operator authorship and overrides the live script to `Operator`. "Operator
+/// stays operator" in-session; the flip only downgrades genuinely-unknown
+/// reloads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operator_save_overrides_config_default_to_operator() {
+    let script = TempScript::new("versioned", V1);
+    let dir = script.path().parent().expect("dir").to_path_buf();
+    let h = save_harness(vec![ScriptEntry::new(script.path())], Some(dir));
+
+    // Config-loaded: unknown provenance → least-privilege Agent.
+    assert_eq!(
+        h.handles[0].authoring_trust(),
+        CallerTrust::Agent,
+        "a config-loaded script starts Agent (unknown provenance)"
+    );
+
+    // An operator (CLI) save over it is positive evidence of operator authorship;
+    // the overwrite path reuses the same live handle and re-authors it.
+    h.invoke("script.save", save_args("versioned", SAVED_V3))
+        .expect("operator overwrite-save succeeds");
+    assert_eq!(
+        h.handles[0].authoring_trust(),
+        CallerTrust::Operator,
+        "an operator in-session save must re-author the live script as Operator"
+    );
 }
 
 const SAVED_V3_WITH_RESPONSE: &str = r#"
