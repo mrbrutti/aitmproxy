@@ -267,6 +267,14 @@ impl NotificationSink {
         self.inner.drained.notify_one();
     }
 
+    /// Whether [`NotificationSink::close`] has been called. The subscription
+    /// registry checks this before registering, so a `flow.subscribe` from a frame
+    /// that outlived its connection (a detached web `/bus` frame) is refused
+    /// instead of registering a subscription nothing will ever drain.
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Relaxed)
+    }
+
     /// Whether the sink is closed and holds nothing more to write.
     pub fn is_closed_and_drained(&self) -> bool {
         if !self.inner.closed.load(Ordering::Relaxed) {
@@ -394,9 +402,22 @@ impl Subscriptions {
     }
 
     /// Register a subscription for `conn_id` (speaking as `role`) over `sink`;
-    /// returns its `sub_id`.
-    fn add(&self, conn_id: u64, role: Frontend, sink: NotificationSink, filter: FlowFilter) -> u64 {
+    /// returns its `sub_id`, or `None` without registering when `sink` is already
+    /// closed. The check runs under the registry lock so that, with a transport
+    /// that closes the sink before `drop_connection`, a subscribe racing the
+    /// teardown is either refused here or swept by the pending drop; it cannot
+    /// slip in between and outlive its connection (spec D4).
+    fn add(
+        &self,
+        conn_id: u64,
+        role: Frontend,
+        sink: NotificationSink,
+        filter: FlowFilter,
+    ) -> Option<u64> {
         let mut st = self.lock();
+        if sink.is_closed() {
+            return None;
+        }
         st.next_sub += 1;
         let sub_id = st.next_sub;
         st.subs.push(Subscription {
@@ -406,7 +427,7 @@ impl Subscriptions {
             sink,
             filter,
         });
-        sub_id
+        Some(sub_id)
     }
 
     /// Whether any live subscription belongs to a connection of `role` (e.g. an
@@ -763,8 +784,9 @@ pub struct McpServer {
     /// `flow.unsubscribe` manage it; the dispatcher fans notifications to it.
     subscriptions: Arc<Subscriptions>,
     /// The core→server event broadcast sender; a connection built from the
-    /// `SubscriptionPlugin`'s chain tap. `serve` subscribes a dispatcher task to
-    /// it. `None` disables live flow push (the in-process path).
+    /// `SubscriptionPlugin`'s chain tap. [`McpServer::spawn_push_dispatcher`]
+    /// (called by `serve`) subscribes a dispatcher task to it. `None` disables
+    /// live flow push (the in-process path).
     push_tx: Option<broadcast::Sender<Event>>,
     /// Per-connection push-sink capacity (notification lines) before drop-oldest.
     push_capacity: usize,
@@ -864,8 +886,9 @@ impl McpServer {
     }
 
     /// Attach the core→server event broadcast (the `SubscriptionPlugin`'s chain
-    /// tap). `serve` spawns a dispatcher that renders each event as a
-    /// `notifications/aitm/flow` line and fans it to matching subscriptions.
+    /// tap). [`McpServer::spawn_push_dispatcher`] (which `serve` calls) spawns a
+    /// dispatcher that renders each event as a `notifications/aitm/flow` line and
+    /// fans it to matching subscriptions.
     pub fn with_push(mut self, tx: broadcast::Sender<Event>) -> Self {
         self.push_tx = Some(tx);
         self
@@ -882,6 +905,37 @@ impl McpServer {
     /// size a connection's sink when the caller did not inject one.
     pub fn push_capacity(&self) -> usize {
         self.push_capacity
+    }
+
+    /// Spawn this server's push dispatcher: one task that drains the core event
+    /// broadcast attached by [`McpServer::with_push`] and fans each event to the
+    /// matching subscriptions through [`McpServer::push_flow_event`]. It skips the
+    /// events it missed when the ring lagged rather than block the chain (spec
+    /// D3.5) and ends when every sender drops. A no-op when no broadcast was
+    /// attached.
+    ///
+    /// `serve` calls this once before it listens. A server that is driven without
+    /// `serve` (the web `/bus` bridge, which calls `handle_on` directly) must call
+    /// it itself, or its subscriptions sit in a registry nothing ever feeds. Call
+    /// it exactly once per server: a second call spawns a second dispatcher and
+    /// every subscriber then receives each event twice.
+    pub fn spawn_push_dispatcher(self: &Arc<Self>) {
+        let Some(tx) = &self.push_tx else {
+            return;
+        };
+        let dispatch_server = Arc::clone(self);
+        let mut rx = tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => dispatch_server.push_flow_event(&ev),
+                    // The dispatcher fell behind the ring: skip the missed
+                    // events rather than block the chain (spec D3.5).
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
     }
 
     /// Set how long an operator confirm-over-the-wire token stays valid before it
@@ -1067,7 +1121,7 @@ impl McpServer {
             stdio_role,
             agent_state,
             subscriptions,
-            push_tx: push_tx.clone(),
+            push_tx,
             push_capacity,
             conn_seq,
             confirm_tokens,
@@ -1077,24 +1131,7 @@ impl McpServer {
             parked,
             approval_timeout,
         });
-        // The push dispatcher: for each core event, render + fan a flow
-        // notification to matching subscriptions. One task per server, draining
-        // the broadcast ring; it ends when every sender drops.
-        if let Some(tx) = &push_tx {
-            let dispatch_server = server.clone();
-            let mut rx = tx.subscribe();
-            tokio::spawn(async move {
-                loop {
-                    match rx.recv().await {
-                        Ok(ev) => dispatch_server.push_flow_event(&ev),
-                        // The dispatcher fell behind the ring: skip the missed
-                        // events rather than block the chain (spec D3.5).
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            });
-        }
+        server.spawn_push_dispatcher();
         match selected {
             McpTransport::Stdio => transport::serve_stdio(server).await,
             McpTransport::LoopbackTcp {
@@ -1750,7 +1787,9 @@ impl McpServer {
     }
 
     /// Register a subscription for this connection; optionally replay matching
-    /// store entries after `since` before live events. Returns `{sub_id}`.
+    /// store entries after `since` before live events. Returns `{sub_id}`, or a
+    /// tool error (and replays nothing) when the connection's sink is already
+    /// closed.
     fn subscribe(
         &self,
         conn_id: u64,
@@ -1763,9 +1802,12 @@ impl McpServer {
             .get("since")
             .and_then(JsonValue::as_str)
             .and_then(|s| s.parse::<FlowId>().ok());
-        let sub_id = self
+        let Some(sub_id) = self
             .subscriptions
-            .add(conn_id, role, sink.clone(), filter.clone());
+            .add(conn_id, role, sink.clone(), filter.clone())
+        else {
+            return tool_error("flow.subscribe refused: this connection is closed".to_string());
+        };
         if let Some(since) = since {
             self.replay_since(&sink, &filter, since);
         }

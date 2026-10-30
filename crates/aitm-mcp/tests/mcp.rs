@@ -1635,6 +1635,162 @@ fn notification_sink_never_drops_replies() {
     assert!(!drained.iter().any(|l| l == "n1"));
 }
 
+/// Web `/bus` push AC8: `is_closed` reports the close flag, so the registry can
+/// tell a torn-down connection from a live one before accepting a subscription.
+#[test]
+fn sink_is_closed_after_close() {
+    let sink = NotificationSink::new(4);
+    assert!(!sink.is_closed(), "a fresh sink is open");
+    sink.close();
+    assert!(sink.is_closed(), "close() marks the sink closed");
+}
+
+/// A streaming operator connection over `sink` for `srv`, as a transport builds
+/// it after auth (a minted `conn_id`, the sink as `out`).
+fn conn_over(srv: &McpServer, sink: &NotificationSink) -> ConnCtx {
+    ConnCtx {
+        role: Frontend::Operator,
+        client_label: None,
+        conn_id: srv.next_conn_id(),
+        out: Some(sink.clone()),
+    }
+}
+
+/// `tools/call flow.subscribe` with `args` on `conn`, parsed.
+fn subscribe_on(srv: &McpServer, conn: &ConnCtx, args: JsonValue) -> JsonValue {
+    let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+        "params":{"name":"flow.subscribe","arguments":args}});
+    let reply = srv
+        .handle_on(conn, &req.to_string())
+        .expect("flow.subscribe replies");
+    serde_json::from_str(&reply).expect("the reply is JSON")
+}
+
+/// Web `/bus` push AC8 / spec D4: a `flow.subscribe` that reaches the registry
+/// after its connection's sink was closed (a detached frame still running at
+/// disconnect) is refused as a tool error and registers nothing: neither the
+/// `since` replay nor a later live push lands in the dead sink.
+#[test]
+fn subscribe_on_a_closed_sink_is_refused_and_registers_nothing() {
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store.clone(), 16);
+    let early = store.insert(http_flow("example.com:443", "/early"));
+    let replayable = store.insert(http_flow("example.com:443", "/replayable"));
+
+    let sink = NotificationSink::new(16);
+    let conn = conn_over(&srv, &sink);
+    sink.close();
+
+    let reply = subscribe_on(&srv, &conn, json!({"since": early.to_string()}));
+    assert!(
+        is_refused(&reply),
+        "subscribe on a closed sink is a tool error: {reply}"
+    );
+    assert_eq!(
+        reply["result"]["content"][0]["text"],
+        "flow.subscribe refused: this connection is closed"
+    );
+    assert!(
+        reply["result"].get("structuredContent").is_none(),
+        "no sub_id is minted for a refused subscribe: {reply}"
+    );
+    assert_eq!(
+        sink.queued_len(),
+        0,
+        "the since replay of {replayable} must not run for a refused subscribe"
+    );
+
+    let live = store.insert(http_flow("example.com:443", "/live"));
+    srv.push_flow_event(&Event::RequestHeaders(live));
+    assert_eq!(
+        sink.queued_len(),
+        0,
+        "nothing was registered, so a live flow push has nowhere to land"
+    );
+}
+
+/// Web `/bus` push AC8 (regression): an open sink subscribes exactly as before:
+/// `{sub_id}` comes back and a pushed flow lands in the sink as one
+/// `notifications/aitm/flow` line for that flow.
+#[test]
+fn subscribe_on_an_open_sink_still_works() {
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store.clone(), 16);
+    let sink = NotificationSink::new(16);
+    let conn = conn_over(&srv, &sink);
+
+    let reply = subscribe_on(&srv, &conn, json!({}));
+    assert!(!is_refused(&reply), "an open sink subscribes: {reply}");
+    assert!(
+        reply["result"]["structuredContent"]["sub_id"]
+            .as_u64()
+            .is_some(),
+        "subscribe returns a sub_id: {reply}"
+    );
+
+    let id = store.insert(http_flow("example.com:443", "/live"));
+    srv.push_flow_event(&Event::RequestHeaders(id));
+    assert_eq!(sink.queued_len(), 1, "exactly one line was pushed");
+    let lines = sink.drain();
+    let note: JsonValue = serde_json::from_str(&lines[0]).expect("the push is JSON");
+    assert_eq!(note["method"], "notifications/aitm/flow");
+    assert_eq!(note["params"]["event"], "created");
+    assert_eq!(note["params"]["id"], id.to_string());
+}
+
+/// Web `/bus` push AC9 / spec D1: `spawn_push_dispatcher` feeds a server that is
+/// never `serve`d (the web bridge drives its own `McpServer` through `handle_on`):
+/// a core `Event` sent on the broadcast reaches that server's subscriber as one
+/// `notifications/aitm/flow` line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_push_dispatcher_delivers_a_broadcast_event() {
+    let store = Arc::new(MemFlowStore::new());
+    // The channel's own receiver is dropped at once, so a successful `send`
+    // below proves the dispatcher subscribed its own.
+    let (tx, _) = broadcast::channel::<Event>(16);
+    let srv = Arc::new(
+        McpServer::new(push_registry(), McpTransport::Stdio)
+            .with_agent_state(ungated())
+            .with_services(
+                store.clone(),
+                Arc::new(StubClient),
+                Arc::new(StdGuard::default()),
+                None,
+            )
+            .with_push(tx.clone()),
+    );
+    srv.spawn_push_dispatcher();
+
+    let sink = NotificationSink::new(16);
+    let conn = conn_over(&srv, &sink);
+    let reply = subscribe_on(&srv, &conn, json!({}));
+    assert!(
+        reply["result"]["structuredContent"]["sub_id"]
+            .as_u64()
+            .is_some(),
+        "subscribe returns a sub_id: {reply}"
+    );
+
+    let id = store.insert(http_flow("example.com:443", "/bus"));
+    tx.send(Event::RequestHeaders(id))
+        .expect("the dispatcher holds a broadcast receiver");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while sink.queued_len() == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        sink.queued_len(),
+        1,
+        "the dispatcher delivered exactly one line within the deadline"
+    );
+    let lines = sink.drain();
+    let note: JsonValue = serde_json::from_str(&lines[0]).expect("the push is JSON");
+    assert_eq!(note["method"], "notifications/aitm/flow");
+    assert_eq!(note["params"]["event"], "created");
+    assert_eq!(note["params"]["id"], id.to_string());
+}
+
 /// After `flow.subscribe`, a new flow through the proxy produces a
 /// `notifications/aitm/flow {event:"created"}` line on that connection with no
 /// further request (AC-M4-6).
