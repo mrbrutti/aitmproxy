@@ -127,7 +127,10 @@ pub fn help(_app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
         ),
         k("p / m / c", "pin host / mark / comment"),
         k("P", "build a PoC from the selected flow"),
-        k("F / S / @", "findings · scope · agent panels"),
+        k(
+            "F / S / @",
+            "findings · scope · agent panels · :scan scan panel (r crawls, ⏎ opens a point's flow)",
+        ),
         k("1-9 0 Tab", "content-type chips"),
         k("[ ]", "sidebar items (Apps, Domains, Scope, …)"),
         k(

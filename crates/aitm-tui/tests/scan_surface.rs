@@ -1,0 +1,347 @@
+//! Component tests for the TUI Scan operator surface (scanner-integration
+//! Stage 1, AC4). They drive the reducer and render against the core fixture
+//! (`scan.discover` is in `CORE_TOOLS`), the way the other `aitm-tui` component
+//! tests run. The scanner engine is `aitm-plugin-scanner`; these only exercise
+//! the UI that surfaces its `scan.discover` result.
+
+use aitm_tui::action::{Action, BusEvent, BusRequest};
+use aitm_tui::app::{App, InjectionPointRow, Mode, SidebarItem};
+use aitm_tui::fixture_app_core;
+use aitm_tui::keys;
+use aitm_tui::snapshot::{render, to_text};
+use aitm_tui::theme::Theme;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use serde_json::{json, Value};
+
+fn screen(app: &App) -> String {
+    to_text(&render(app, &Theme::new(true), app.width, app.height))
+}
+
+fn press(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+/// The `scan.discover` requests among `reqs`, as their `target` arguments.
+fn discover_targets(reqs: &[BusRequest]) -> Vec<String> {
+    reqs.iter()
+        .filter_map(|r| match r {
+            BusRequest::Call { name, args } if name == "scan.discover" => Some(
+                args.get("target")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A `scan.discover` result: two endpoints, two injection points (one redacted
+/// cookie), mirroring the scanner's `endpoints` + `injection_points` JSON.
+fn discover_result() -> Value {
+    json!({
+        "endpoints": [
+            "http://auth.shop-staging.test/",
+            "http://auth.shop-staging.test/login"
+        ],
+        "injection_points": [
+            { "flow": "f50", "location": "query", "name": "next", "example": "/dashboard" },
+            { "flow": "f50", "location": "cookie", "name": "session", "example": "<redacted>" }
+        ],
+        "pages_crawled": 2,
+        "stopped_reason": Value::Null
+    })
+}
+
+/// Viewing the Scan panel never crawls: a `scan.discover` is up to hundreds of
+/// real browser navigations against the target. `OpenScan` (the sidebar item,
+/// bare `:scan`) opens the view and shows the scope-bound target `r` would
+/// crawl, and sends nothing.
+#[test]
+fn open_scan_opens_without_launching() {
+    let mut app = fixture_app_core(200, 50);
+    assert!(
+        app.has_tool("scan.discover"),
+        "fixture offers scan.discover"
+    );
+
+    let reqs = app.update(Action::OpenScan);
+    assert_eq!(app.mode, Mode::Scan, "OpenScan enters the Scan view");
+    assert_eq!(app.sidebar, SidebarItem::Scan);
+    assert!(!app.scan.running, "viewing the panel starts no crawl");
+    assert!(
+        discover_targets(&reqs).is_empty(),
+        "no scan.discover request on open: {reqs:?}"
+    );
+    // The header shows the scope-bound target an explicit launch would crawl:
+    // the selected flow's host (f50, in scope).
+    assert_eq!(
+        app.scan.target.as_deref(),
+        Some("http://auth.shop-staging.test/"),
+        "the target is seeded for display, not launched"
+    );
+    let text = screen(&app);
+    assert!(text.contains("idle"), "the open state reads idle: {text}");
+
+    // Bare `:scan` is the same open-only path.
+    let mut app = fixture_app_core(200, 50);
+    let reqs = app.run_command("scan");
+    assert_eq!(app.mode, Mode::Scan);
+    assert!(!app.scan.running, "`:scan` alone starts no crawl");
+    assert!(
+        discover_targets(&reqs).is_empty(),
+        "no scan.discover request from bare `:scan`: {reqs:?}"
+    );
+}
+
+/// AC4 (reducer): the explicit `r` launch sends one scope-bound
+/// `scan.discover` (running); a second launch while running sends nothing; the
+/// matching `CallOk` populates `endpoints`/`points` and clears running.
+#[test]
+fn explicit_launch_emits_discover_and_result_populates_state() {
+    let mut app = fixture_app_core(200, 50);
+    let _ = app.update(Action::OpenScan);
+    // `r` is the launch key the header hint names.
+    assert_eq!(
+        keys::map(press(KeyCode::Char('r')), Mode::Scan),
+        Some(Action::ScanLaunch)
+    );
+
+    let reqs = app.update(Action::ScanLaunch);
+    assert!(app.scan.running, "the launch sets the running flag");
+    assert_eq!(
+        discover_targets(&reqs),
+        vec!["http://auth.shop-staging.test/".to_string()],
+        "one scope-bound scan.discover was launched: {reqs:?}"
+    );
+
+    // The running flag disables re-launch while the crawl is in flight.
+    let again = app.update(Action::ScanLaunch);
+    assert!(
+        discover_targets(&again).is_empty(),
+        "no second crawl while one is running: {again:?}"
+    );
+
+    let _ = app.on_bus(BusEvent::CallOk {
+        name: "scan.discover".into(),
+        value: discover_result(),
+    });
+    assert!(!app.scan.running, "the CallOk clears the running flag");
+    assert_eq!(
+        app.scan.endpoints,
+        vec![
+            "http://auth.shop-staging.test/".to_string(),
+            "http://auth.shop-staging.test/login".to_string(),
+        ],
+        "endpoints populate from the result"
+    );
+    assert_eq!(app.scan.points.len(), 2, "both injection points populate");
+    assert_eq!(app.scan.points[0].location, "query");
+    assert_eq!(app.scan.points[0].name, "next");
+    assert_eq!(app.scan.points[0].example, "/dashboard");
+    assert_eq!(app.scan.points[1].location, "cookie");
+    assert_eq!(app.scan.points[1].name, "session");
+    assert_eq!(
+        app.scan.points[1].example, "<redacted>",
+        "the redacted cookie example is carried through verbatim, not re-derived"
+    );
+
+    // A failed/refused crawl settles the flag and keeps the reason.
+    let _ = app.update(Action::ScanLaunch);
+    assert!(app.scan.running);
+    let _ = app.on_bus(BusEvent::CallFailed {
+        name: "scan.discover".into(),
+        message: "out of scope".into(),
+    });
+    assert!(!app.scan.running, "a CallFailed clears the running flag");
+    assert_eq!(app.scan.error.as_deref(), Some("out of scope"));
+}
+
+/// `:scan <target>` launches against that target, scope-gated: an in-scope
+/// host (in any spelling) is crawled, an out-of-scope host is refused with a
+/// toast and nothing reaches the wire (deny-by-default).
+#[test]
+fn scan_command_with_target_is_scope_gated() {
+    let mut app = fixture_app_core(200, 50);
+    let reqs = app.run_command("scan https://api.shop-staging.test:8443/admin?x=1");
+    assert_eq!(app.mode, Mode::Scan);
+    assert!(app.scan.running);
+    assert_eq!(
+        discover_targets(&reqs),
+        vec!["http://api.shop-staging.test/".to_string()],
+        "the typed target is reduced to its in-scope host: {reqs:?}"
+    );
+
+    let mut app = fixture_app_core(200, 50);
+    let reqs = app.run_command("scan evil.example");
+    assert_eq!(app.mode, Mode::Scan, "the view still opens");
+    assert!(!app.scan.running, "an out-of-scope target is not launched");
+    assert!(
+        discover_targets(&reqs).is_empty(),
+        "nothing reaches the wire for an out-of-scope host: {reqs:?}"
+    );
+    let toast = app
+        .toasts
+        .back()
+        .map(|t| t.text.clone())
+        .unwrap_or_default();
+    assert!(
+        toast.contains("Out of scope") && toast.contains("evil.example"),
+        "the refusal names the host: {toast:?}"
+    );
+}
+
+/// AC4 (snapshot): the sidebar `Scan` row renders when `scan.discover` is
+/// offered, and after an explicit launch lands its result the Scan view
+/// renders its launch header, the discovered endpoints and the discovered
+/// injection points.
+#[test]
+fn scan_sidebar_row_and_view_regions_render() {
+    let mut app = fixture_app_core(200, 50);
+
+    // The sidebar (drawn with the flow list) shows a Scan row when the tool is
+    // offered.
+    let sidebar = screen(&app);
+    assert!(
+        sidebar.lines().any(|l| l.contains("Scan")),
+        "the sidebar lists a Scan row: {sidebar}"
+    );
+
+    // Open, launch explicitly, land a result, then render the Scan view.
+    let _ = app.update(Action::OpenScan);
+    let _ = app.update(Action::ScanLaunch);
+    let _ = app.on_bus(BusEvent::CallOk {
+        name: "scan.discover".into(),
+        value: discover_result(),
+    });
+    assert_eq!(app.mode, Mode::Scan);
+    assert_eq!(app.sidebar, SidebarItem::Scan);
+
+    let text = screen(&app);
+    assert!(text.contains("Endpoints"), "endpoints region: {text}");
+    assert!(
+        text.contains("Injection points"),
+        "injection-points region: {text}"
+    );
+    assert!(
+        text.contains("login"),
+        "a discovered endpoint renders: {text}"
+    );
+    assert!(
+        text.contains("query") && text.contains("next"),
+        "a discovered injection point renders its location + name: {text}"
+    );
+}
+
+/// Parity with the web view's endpoint→flow links: the selected injection
+/// point's `flow` (from the scanner's result) opens in the existing inspector
+/// on ⏎ / →; an id no longer in the list is refused with a toast, not a crash.
+#[test]
+fn enter_opens_the_selected_injection_points_flow() {
+    for code in [KeyCode::Enter, KeyCode::Right] {
+        assert_eq!(
+            keys::map(press(code), Mode::Scan),
+            Some(Action::Enter),
+            "{code:?} opens the point's flow"
+        );
+    }
+    let mut app = fixture_app_core(200, 50);
+    let _ = app.update(Action::OpenScan);
+    let _ = app.update(Action::ScanLaunch);
+    let _ = app.on_bus(BusEvent::CallOk {
+        name: "scan.discover".into(),
+        value: discover_result(),
+    });
+    app.scan.points[1].flow = "f-missing".into();
+    app.selected = None;
+
+    assert_eq!(app.scan.cursor, 0);
+    let _ = app.update(Action::Enter);
+    assert_eq!(
+        app.selected.as_deref(),
+        Some("f50"),
+        "the point's flow becomes the selection"
+    );
+    assert_eq!(app.mode, Mode::Inspector, "and opens in the inspector");
+
+    // A point whose flow is gone from the list: stay put, say why.
+    app.mode = Mode::Scan;
+    let _ = app.update(Action::Down);
+    assert_eq!(app.scan.cursor, 1);
+    let _ = app.update(Action::Enter);
+    assert_eq!(app.mode, Mode::Scan, "no inspector for a missing flow");
+    assert_eq!(app.selected.as_deref(), Some("f50"), "selection unchanged");
+    let toast = app
+        .toasts
+        .back()
+        .map(|t| t.text.clone())
+        .unwrap_or_default();
+    assert!(
+        toast.contains("f-missing") && toast.contains("not in the flow list"),
+        "the refusal names the flow: {toast:?}"
+    );
+}
+
+/// PgUp/PgDn page the injection-point cursor like the flow and findings lists
+/// (a page is the list body: the terminal height minus the panel chrome).
+#[test]
+fn page_keys_move_the_injection_point_cursor() {
+    let mut app = fixture_app_core(200, 50);
+    let _ = app.update(Action::OpenScan);
+    app.scan.points = (0..60)
+        .map(|i| InjectionPointRow {
+            flow: "f50".into(),
+            location: "query".into(),
+            name: format!("p{i}"),
+            example: String::new(),
+        })
+        .collect();
+    assert_eq!(
+        keys::map(press(KeyCode::PageDown), Mode::Scan),
+        Some(Action::PageDown)
+    );
+    // 50 rows − 8 chrome rows (three bars, two box edges, target, hint,
+    // list heading) = a 42-row page.
+    let _ = app.update(Action::PageDown);
+    assert_eq!(app.scan.cursor, 42, "one page down");
+    let _ = app.update(Action::PageDown);
+    assert_eq!(app.scan.cursor, 59, "clamped at the last point");
+    let _ = app.update(Action::PageUp);
+    assert_eq!(app.scan.cursor, 17, "one page up");
+    let _ = app.update(Action::Home);
+    assert_eq!(app.scan.cursor, 0);
+    let _ = app.update(Action::End);
+    assert_eq!(app.scan.cursor, 59);
+}
+
+/// `]`/`[` never land on the Scan row when the bus does not offer
+/// `scan.discover` (the row is not drawn then); with the tool they do.
+#[test]
+fn sidebar_step_skips_scan_when_the_tool_is_absent() {
+    let mut app = fixture_app_core(200, 50);
+    app.tools.retain(|t| t.name != "scan.discover");
+    assert!(!app.has_tool("scan.discover"));
+    app.sidebar = SidebarItem::Agent;
+    let _ = app.update(Action::SidebarNext);
+    assert_eq!(
+        app.sidebar,
+        SidebarItem::Pinned,
+        "] skips the invisible Scan row and wraps"
+    );
+    let _ = app.update(Action::SidebarPrev);
+    assert_eq!(
+        app.sidebar,
+        SidebarItem::Agent,
+        "[ skips it on the way back"
+    );
+
+    let mut app = fixture_app_core(200, 50);
+    app.sidebar = SidebarItem::Agent;
+    let _ = app.update(Action::SidebarNext);
+    assert_eq!(
+        app.sidebar,
+        SidebarItem::Scan,
+        "with scan.discover offered, ] lands on Scan"
+    );
+    assert_eq!(app.mode, Mode::Scan);
+}

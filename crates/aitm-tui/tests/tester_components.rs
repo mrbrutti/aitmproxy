@@ -319,13 +319,18 @@ fn sidebar_items_group_the_list_and_open_the_panels() {
     assert!(toast(&app).contains("F8"), "{}", toast(&app));
     let _ = app.update(Action::SidebarNext);
     assert_eq!(app.mode, Mode::Agent);
+    // Scan (scanner-integration Stage 1): the Scan view opens when the bus
+    // offers `scan.discover`.
+    let _ = app.update(Action::SidebarNext);
+    assert_eq!(app.sidebar, SidebarItem::Scan, "the Scan surface");
+    assert_eq!(app.mode, Mode::Scan);
     let _ = app.update(Action::SidebarNext);
     assert_eq!(app.sidebar, SidebarItem::Pinned, "wraps around");
     let _ = app.update(Action::SidebarNext);
     assert!(toast(&app).contains("F10"), "Saved: {}", toast(&app));
     let _ = app.update(Action::SidebarPrev);
     let _ = app.update(Action::SidebarPrev);
-    assert_eq!(app.sidebar, SidebarItem::Agent);
+    assert_eq!(app.sidebar, SidebarItem::Scan);
 }
 
 /// §2.7 "working-session pinning": `p` pins the selected host to the top.

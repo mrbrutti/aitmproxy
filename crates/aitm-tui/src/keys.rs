@@ -33,6 +33,7 @@ pub fn map(key: KeyEvent, mode: Mode) -> Option<Action> {
         Mode::Agent => agent(key),
         Mode::Ca => ca(key),
         Mode::Browser => browser(key),
+        Mode::Scan => scan(key),
         // Read-only: back, palette, help.
         Mode::Config => panel(key),
         Mode::L4Confirm => l4_confirm(key),
@@ -83,6 +84,25 @@ fn browser(key: KeyEvent) -> Option<Action> {
         KeyCode::Home => Action::Home,
         KeyCode::End | KeyCode::Char('G') => Action::End,
         _ => return panel(key),
+    })
+}
+
+/// The Scan view (scanner-integration Stage 1): ↑↓ walk the injection points,
+/// `r` launches the scope-bound crawl (the only key that does), `F` jumps to
+/// the findings pane, `:` palette, `?` help, Esc/`q` back.
+fn scan(key: KeyEvent) -> Option<Action> {
+    if let Some(a) = nav(key) {
+        return Some(a);
+    }
+    Some(match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => Action::Back,
+        KeyCode::Char('r') => Action::ScanLaunch,
+        // Open the selected injection point's flow in the inspector.
+        KeyCode::Enter | KeyCode::Right => Action::Enter,
+        KeyCode::Char('F') => Action::OpenFindings,
+        KeyCode::Char(':') => Action::PaletteOpen,
+        KeyCode::Char('?') => Action::Help,
+        _ => return None,
     })
 }
 
