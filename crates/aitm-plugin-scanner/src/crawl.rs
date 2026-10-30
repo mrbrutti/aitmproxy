@@ -1,105 +1,205 @@
 //! Breadth-first crawl of an in-scope target through the embedded browser.
 //!
 //! Read-only link discovery: every page is reached by a plain navigation, its
-//! DOM is scanned for `href` and form `action` attributes, and only links that
-//! are same-origin with the target **and** in the guard's scope are followed.
-//! Off-origin or out-of-scope links are dropped without being fetched or
-//! recorded. The crawl is bounded by `max_pages`, `max_depth` and
-//! `time_budget` from [`ScannerConfig`].
+//! DOM is scanned for anchor `href` and form `action` attributes, and only links
+//! that are same-origin with the target **and** in the guard's scope are
+//! followed. Off-origin or out-of-scope links are dropped without being fetched
+//! or recorded. Every navigation takes an [`aitm_core::ActionPermit`] from
+//! `check_active`, so the scan is rate-, concurrency- and error-budget-bound the
+//! same way `browser.navigate` is, and it is capped by `max_pages`, `max_depth`
+//! and `time_budget` from [`ScannerConfig`].
+//!
+//! URLs are parsed with the `url` crate — the same WHATWG parser the browser
+//! resolves a link with — so the host the scope check is made about is exactly
+//! the host the browser would connect to (`http://evil.com\.target.test/` has
+//! host `evil.com`, not `evil.com\.target.test`).
 
 use std::collections::{HashSet, VecDeque};
-use std::fmt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aitm_core::{CommandHost, Flow, GuardError};
+use url::Url;
 
 use crate::ScannerConfig;
+
+/// Links harvested from one page. A hostile page with a million anchors cannot
+/// grow the frontier past this per visit.
+const MAX_LINKS_PER_PAGE: usize = 512;
+
+/// Hard ceiling on the pending frontier, independent of `max_pages`: the queue
+/// and the visited set cannot grow without bound on a page that links to a
+/// combinatorial URL space.
+const MAX_FRONTIER: usize = 4096;
+
+/// Bytes of a page's DOM that are scanned for links. The rest is ignored.
+const MAX_DOM_BYTES: usize = 2 * 1024 * 1024;
 
 /// What a crawl reached and why it stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrawlOutcome {
     /// Normalized in-scope URLs reached, in crawl order, deduplicated.
     pub endpoints: Vec<String>,
-    /// Pages successfully navigated.
+    /// Pages successfully navigated. Failed navigations are **not** counted
+    /// here, but they do count against `max_pages` (see [`crawl`]).
     pub pages_crawled: usize,
-    /// `"max_pages"`, `"max_depth"`, `"time_budget"`, `"no_browser"`, or
+    /// `"max_pages"`, `"max_depth"`, `"time_budget"`, `"no_browser"`,
+    /// `"navigation_failed"` (the browser was there but every navigation
+    /// failed), `"guard_refused"` (the guard refused every enqueued link), or
     /// `None` when the reachable graph was exhausted.
     pub stopped_reason: Option<String>,
 }
 
 /// Crawl breadth-first from `target`, following only same-origin, in-scope links.
 ///
-/// The target itself must be an absolute `http(s)` URL whose host the guard has
-/// in scope; otherwise this returns [`GuardError::OutOfScope`] (deny-by-default)
-/// and navigates nothing. Without a browser on the host the crawl falls back
-/// to listing the distinct same-origin, in-scope request URLs already captured
-/// in the flow store and reports `stopped_reason = Some("no_browser")`.
+/// The target itself must be an absolute, credential-free `http(s)` URL whose
+/// host the guard has in scope; otherwise this returns [`GuardError::OutOfScope`]
+/// (deny-by-default) and navigates nothing. Without a browser on the host the
+/// crawl falls back to listing the distinct same-origin, in-scope request URLs
+/// already captured in the flow store and reports
+/// `stopped_reason = Some("no_browser")`.
+///
+/// Every navigation is gated: `check_active` is called for the page's authority
+/// and its permit is held across the navigation, so each page consumes a rate
+/// token and a concurrency slot. A navigation that fails records an error
+/// against the host (feeding the guard's back-off) and counts against
+/// `max_pages`, so a target that refuses connections cannot be retried
+/// unboundedly under the time budget alone. A guard refusal on the seed is
+/// propagated; a refusal on an enqueued link skips that link.
 pub async fn crawl(
     host: &CommandHost<'_>,
     target: &str,
     cfg: &ScannerConfig,
 ) -> anyhow::Result<CrawlOutcome> {
-    let seed = Url::parse(target)
-        .ok_or_else(|| anyhow::anyhow!("target is not an absolute http(s) URL: {target:?}"))?;
-    let authority = seed.authority();
+    let seed = parse_target(target).ok_or_else(|| {
+        anyhow::anyhow!(
+            "target is not an absolute, credential-free http(s) URL: {}",
+            safe_target(target)
+        )
+    })?;
+    let authority = guard_authority(&seed);
     if !host.guard().in_scope(&authority) {
         return Err(GuardError::OutOfScope(authority).into());
     }
     let origin = seed.origin();
     let Some(browser) = host.browser() else {
-        return Ok(stored_endpoints(host, &seed));
+        return Ok(stored_endpoints(host, &seed, cfg));
     };
 
     let started = Instant::now();
     let mut queue: VecDeque<(Url, usize)> = VecDeque::from([(seed.clone(), 0)]);
-    let mut visited: HashSet<String> = HashSet::from([seed.to_string()]);
+    let mut visited: HashSet<String> = HashSet::from([seed.as_str().to_string()]);
     let mut endpoints: Vec<String> = Vec::new();
+    let mut seen_endpoints: HashSet<String> = HashSet::new();
+    // Navigations attempted, successful or not — what `max_pages` bounds, so a
+    // target that refuses every connection cannot be retried unboundedly.
+    let mut attempts = 0usize;
     let mut pages_crawled = 0usize;
+    let mut nav_failures = 0usize;
+    let mut guard_refusals = 0usize;
     let mut depth_hit = false;
     let mut stopped: Option<&str> = None;
+    let mut is_seed = true;
 
     while let Some((url, depth)) = queue.pop_front() {
-        if started.elapsed() >= cfg.time_budget {
+        let Some(remaining) = remaining_budget(cfg.time_budget, started) else {
             stopped = Some("time_budget");
             break;
-        }
-        if pages_crawled >= cfg.max_pages {
+        };
+        if attempts >= cfg.max_pages {
             stopped = Some("max_pages");
             break;
         }
-        let Ok(nav) = browser.navigate(&url.to_string()).await else {
-            // An unreachable page is skipped; the crawl is best-effort.
-            continue;
-        };
-        pages_crawled += 1;
-        // A redirect may have landed somewhere else. Only a same-origin,
-        // in-scope landing page is recorded and harvested.
-        let Some(page) = Url::parse(&nav.final_url)
-            .filter(|u| u.origin() == origin && host.guard().in_scope(&u.authority()))
-        else {
-            continue;
-        };
-        let page_key = page.to_string();
-        visited.insert(page_key.clone());
-        if !endpoints.contains(&page_key) {
-            endpoints.push(page_key);
-        }
-        let Ok(dom) = browser.get_dom().await else {
-            continue;
-        };
-        for link in harvest_links(&dom) {
-            let Some(resolved) = page.resolve(&link) else {
-                continue;
-            };
-            if resolved.origin() != origin || !host.guard().in_scope(&resolved.authority()) {
+
+        let page_authority = guard_authority(&url);
+        // Per-navigation gate: scope, rate, concurrency and the host's error
+        // budget, exactly as `browser.navigate` does for a single call. The
+        // permit is held until this page is done and released by `drop`.
+        let permit = match host.guard().check_active(&page_authority) {
+            Ok(permit) => permit,
+            // Deny-by-default on the seed is the caller's answer; a refusal on
+            // a link found mid-crawl only drops that link.
+            Err(err) if is_seed => return Err(err.into()),
+            Err(_) => {
+                guard_refusals += 1;
                 continue;
             }
-            let key = resolved.to_string();
+        };
+        is_seed = false;
+
+        attempts += 1;
+        let nav = match tokio::time::timeout(remaining, browser.navigate(url.as_str())).await {
+            Ok(Ok(nav)) => nav,
+            Ok(Err(_err)) => {
+                // Best-effort: an unreachable page is skipped, but it is counted
+                // and reported to the guard so a refusing host backs off.
+                nav_failures += 1;
+                host.guard().record_error(&page_authority);
+                drop(permit);
+                continue;
+            }
+            Err(_elapsed) => {
+                drop(permit);
+                stopped = Some("time_budget");
+                break;
+            }
+        };
+        pages_crawled += 1;
+
+        // A redirect may have landed somewhere else. Only a same-origin,
+        // in-scope landing page is recorded and harvested.
+        let Some(page) = parse_target(&nav.final_url)
+            .filter(|u| u.origin() == origin && host.guard().in_scope(&guard_authority(u)))
+        else {
+            drop(permit);
+            continue;
+        };
+        let page_key = page.as_str().to_string();
+        visited.insert(page_key.clone());
+        if seen_endpoints.insert(page_key.clone()) {
+            endpoints.push(page_key);
+        }
+
+        let Some(remaining) = remaining_budget(cfg.time_budget, started) else {
+            drop(permit);
+            stopped = Some("time_budget");
+            break;
+        };
+        let dom = match tokio::time::timeout(remaining, browser.get_dom()).await {
+            Ok(Ok(dom)) => dom,
+            Ok(Err(_err)) => {
+                host.guard().record_error(&page_authority);
+                drop(permit);
+                continue;
+            }
+            Err(_elapsed) => {
+                drop(permit);
+                stopped = Some("time_budget");
+                break;
+            }
+        };
+        drop(permit);
+
+        for link in harvest_links(truncate_on_char_boundary(&dom, MAX_DOM_BYTES)) {
+            let Ok(resolved) = page.join(&link) else {
+                continue;
+            };
+            let Some(resolved) = normalize(resolved) else {
+                continue;
+            };
+            // Re-checked per link, not only per origin: scope can be revoked
+            // mid-crawl (`remove_scope`), and the crawl must honour that.
+            if resolved.origin() != origin || !host.guard().in_scope(&guard_authority(&resolved)) {
+                continue;
+            }
+            let key = resolved.as_str().to_string();
             if visited.contains(&key) {
                 continue;
             }
             if depth + 1 > cfg.max_depth {
                 depth_hit = true;
+                continue;
+            }
+            if queue.len() >= MAX_FRONTIER {
                 continue;
             }
             visited.insert(key);
@@ -108,7 +208,10 @@ pub async fn crawl(
     }
 
     let stopped_reason = stopped
-        .or(if depth_hit { Some("max_depth") } else { None })
+        .or(depth_hit.then_some("max_depth"))
+        // A crawl that reached nothing must not look like an exhausted graph.
+        .or((pages_crawled == 0 && nav_failures > 0).then_some("navigation_failed"))
+        .or((pages_crawled == 0 && guard_refusals > 0).then_some("guard_refused"))
         .map(str::to_string);
     Ok(CrawlOutcome {
         endpoints,
@@ -118,48 +221,149 @@ pub async fn crawl(
 }
 
 /// Normalize an absolute `http(s)` URL to the same canonical form the crawl
-/// records its endpoints in (lowercase scheme/host, default port elided,
-/// dot-segments removed, fragment dropped, query kept). Returns `None` for a
-/// value that is not an absolute `http(s)` URL.
+/// records its endpoints in (WHATWG normalization: lowercase scheme and host,
+/// default port elided, dot-segments removed, fragment dropped, query kept).
+/// Returns `None` for anything that is not an absolute, credential-free
+/// `http(s)` URL.
 ///
 /// `scan.discover` uses this to match a captured flow's request URL against the
 /// crawl's endpoint set, so the two are compared in one normal form.
 pub(crate) fn normalize_url(s: &str) -> Option<String> {
-    Url::parse(s).map(|u| u.to_string())
+    parse_target(s).map(|u| u.as_str().to_string())
 }
 
-/// Bridge a `crawl` future from a synchronous command. Copied from
-/// `aitm-plugins`: on a multi-thread runtime, block in place so the blocking
-/// call cannot starve the reactor; anywhere else, drive a local executor.
-pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    use tokio::runtime::{Handle, RuntimeFlavor};
-    match Handle::try_current() {
-        Ok(h) if matches!(h.runtime_flavor(), RuntimeFlavor::MultiThread) => {
-            tokio::task::block_in_place(|| h.block_on(fut))
+/// The `host:port` the scope guard is asked about for `target`, parsed once with
+/// the WHATWG parser. `scan.discover` gates on this before the crawl begins, so
+/// the gate and the crawl always agree about which host is being asked for.
+pub(crate) fn target_authority(target: &str) -> anyhow::Result<String> {
+    let url = parse_target(target).ok_or_else(|| {
+        anyhow::anyhow!(
+            "target is not an absolute, credential-free http(s) URL: {}",
+            safe_target(target)
+        )
+    })?;
+    Ok(guard_authority(&url))
+}
+
+/// A target string that is safe to put in an error message: userinfo removed,
+/// embedded credential material scrubbed, and length-capped.
+pub(crate) fn safe_target(target: &str) -> String {
+    let bare = match Url::parse(target.trim()) {
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_fragment(None);
+            url.to_string()
         }
-        _ => futures::executor::block_on(fut),
+        Err(_) => target.to_string(),
+    };
+    let scrubbed = aitm_core::redact::scrub_text(&bare);
+    truncate_on_char_boundary(&scrubbed, 256).to_string()
+}
+
+/// Parse an absolute `http(s)` URL the way the browser does, with the fragment
+/// dropped. A URL that carries userinfo is refused outright: a crawl never
+/// carries credentials, and `http://target.test@evil.com/` reads as the target
+/// to a human while the browser connects to `evil.com`.
+fn parse_target(s: &str) -> Option<Url> {
+    Url::parse(s.trim()).ok().and_then(normalize)
+}
+
+/// The shared post-parse checks and normalization for a parsed URL.
+fn normalize(mut url: Url) -> Option<Url> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    match url.host_str() {
+        Some(host) if !host.is_empty() => {}
+        _ => return None,
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    url.set_fragment(None);
+    Some(url)
+}
+
+/// The `host[:port]` the scope guard is asked about, always with an explicit
+/// port (the scheme's default when the URL elides it) so an explicit
+/// `target.test:443` scope entry matches a portless `https://target.test/`.
+/// A portless scope entry still covers every port of its host.
+fn guard_authority(url: &Url) -> String {
+    let host = url.host_str().unwrap_or_default();
+    let port = url.port_or_known_default().unwrap_or(0);
+    format!("{host}:{port}")
+}
+
+/// The time left in the budget, or `None` when it is spent.
+fn remaining_budget(budget: Duration, started: Instant) -> Option<Duration> {
+    budget
+        .checked_sub(started.elapsed())
+        .filter(|left| !left.is_zero())
+}
+
+/// The longest prefix of `s` that is at most `max` bytes and ends on a `char`
+/// boundary.
+fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Bridge a `crawl` future from a synchronous command.
+///
+/// On a multi-thread runtime, block in place so the blocking call cannot starve
+/// the reactor (the browser's CDP futures need the reactor turning, which a bare
+/// `futures::executor` would not do). With no runtime at all, drive the future on
+/// a private current-thread runtime **with timers enabled** — the crawl arms a
+/// `tokio::time::timeout` on every navigation and there would otherwise be no
+/// timer to fire it.
+///
+/// Calling this from inside a *current-thread* runtime is not supported: tokio
+/// refuses to block a runtime thread. The binary always runs multi-threaded and
+/// invokes commands through `spawn_blocking`.
+pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    use tokio::runtime::{Builder, Handle, RuntimeFlavor};
+    if let Ok(handle) = Handle::try_current() {
+        if matches!(handle.runtime_flavor(), RuntimeFlavor::MultiThread) {
+            return tokio::task::block_in_place(|| handle.block_on(fut));
+        }
+    }
+    match Builder::new_current_thread().enable_time().build() {
+        Ok(rt) => rt.block_on(fut),
+        // No OS resources for a runtime: fall back to a bare executor. Timers
+        // never fire there, so the per-page budget checks are the only bound.
+        Err(_) => futures::executor::block_on(fut),
     }
 }
 
 /// The no-browser fallback: distinct same-origin, in-scope request URLs already
-/// in the store, in insertion order.
-fn stored_endpoints(host: &CommandHost<'_>, seed: &Url) -> CrawlOutcome {
+/// in the store, in insertion order, capped at `max_pages`.
+fn stored_endpoints(host: &CommandHost<'_>, seed: &Url, cfg: &ScannerConfig) -> CrawlOutcome {
     let origin = seed.origin();
     let mut seen: HashSet<String> = HashSet::new();
     let mut endpoints = Vec::new();
     for id in host.store().list() {
+        if endpoints.len() >= cfg.max_pages {
+            break;
+        }
         let Some(Flow::Http(flow)) = host.store().get(id) else {
             continue;
         };
         let req = &flow.request;
-        let Some(url) = Url::parse(&format!("{}://{}{}", req.scheme, req.authority, req.path))
+        let Some(url) = parse_target(&format!("{}://{}{}", req.scheme, req.authority, req.path))
         else {
             continue;
         };
-        if url.origin() != origin || !host.guard().in_scope(&url.authority()) {
+        if url.origin() != origin || !host.guard().in_scope(&guard_authority(&url)) {
             continue;
         }
-        let key = url.to_string();
+        let key = url.as_str().to_string();
         if seen.insert(key.clone()) {
             endpoints.push(key);
         }
@@ -171,278 +375,165 @@ fn stored_endpoints(host: &CommandHost<'_>, seed: &Url) -> CrawlOutcome {
     }
 }
 
-/// A parsed, normalized absolute `http(s)` URL: lowercase scheme and host,
-/// default port elided, dot-segments removed, fragment dropped, query kept.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Url {
-    scheme: String,
-    host: String,
-    /// Only an explicit, non-default port.
-    port: Option<u16>,
-    path: String,
-    query: Option<String>,
-}
-
-impl Url {
-    /// Parse an absolute URL. Only `http` and `https` are accepted; anything
-    /// without a scheme and host, or with an unparseable port, is `None`.
-    fn parse(s: &str) -> Option<Url> {
-        let s = s.trim();
-        let (scheme, rest) = s.split_once("://")?;
-        let scheme = scheme.to_ascii_lowercase();
-        let default_port = match scheme.as_str() {
-            "http" => 80,
-            "https" => 443,
-            _ => return None,
-        };
-        let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        let (authority, tail) = rest.split_at(auth_end);
-        // Drop any userinfo; a crawl never carries credentials in a URL.
-        let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-        let (host, port) = split_host_port(authority)?;
-        if host.is_empty() {
-            return None;
-        }
-        let host = host.to_ascii_lowercase();
-        let port = match port {
-            Some(p) => {
-                let p: u16 = p.parse().ok()?;
-                (p != default_port).then_some(p)
-            }
-            None => None,
-        };
-        let (path, query) = split_path_query(tail);
-        Some(Url {
-            scheme,
-            host,
-            port,
-            path: remove_dot_segments(path),
-            query,
-        })
-    }
-
-    /// `scheme://host[:port]` — what same-origin comparison uses.
-    fn origin(&self) -> String {
-        format!("{}://{}", self.scheme, self.authority())
-    }
-
-    /// `host[:port]` — what the scope guard is asked about.
-    fn authority(&self) -> String {
-        match self.port {
-            Some(p) => format!("{}:{p}", self.host),
-            None => self.host.clone(),
-        }
-    }
-
-    /// Resolve an `href`/`action` value against this page (RFC 3986 §5.2,
-    /// the subset HTML links use). Non-navigational schemes (`javascript:`,
-    /// `mailto:`, `data:`, …) resolve to `None`; a fragment-only reference
-    /// resolves to this page.
-    fn resolve(&self, reference: &str) -> Option<Url> {
-        let reference = reference.trim();
-        let reference = reference.split('#').next().unwrap_or("");
-        if reference.is_empty() {
-            return Some(self.clone());
-        }
-        if has_scheme(reference) {
-            return Url::parse(reference);
-        }
-        if let Some(rest) = reference.strip_prefix("//") {
-            return Url::parse(&format!("{}://{rest}", self.scheme));
-        }
-        let (path, query) = if reference.starts_with('/') {
-            split_path_query(reference)
-        } else if let Some(q) = reference.strip_prefix('?') {
-            (self.path.as_str(), Some(q.to_string()))
-        } else {
-            let dir_end = self.path.rfind('/').map_or(0, |i| i + 1);
-            let merged = format!("{}{reference}", &self.path[..dir_end]);
-            let (p, q) = split_path_query(&merged);
-            return Some(Url {
-                path: remove_dot_segments(p),
-                query: q,
-                ..self.clone()
-            });
-        };
-        Some(Url {
-            path: remove_dot_segments(path),
-            query,
-            ..self.clone()
-        })
-    }
-}
-
-impl fmt::Display for Url {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}{}", self.origin(), self.path)?;
-        if let Some(q) = &self.query {
-            write!(f, "?{q}")?;
-        }
-        Ok(())
-    }
-}
-
-/// Split `host[:port]`, keeping an IPv6 literal's brackets with the host.
-fn split_host_port(authority: &str) -> Option<(&str, Option<&str>)> {
-    if authority.starts_with('[') {
-        let close = authority.find(']')?;
-        let host = &authority[..=close];
-        let rest = &authority[close + 1..];
-        if rest.is_empty() {
-            return Some((host, None));
-        }
-        return rest.strip_prefix(':').map(|p| (host, Some(p)));
-    }
-    Some(match authority.rsplit_once(':') {
-        Some((h, p)) => (h, Some(p)),
-        None => (authority, None),
-    })
-}
-
-/// Split `path[?query][#fragment]` into the path (never empty) and the query;
-/// the fragment is dropped.
-fn split_path_query(tail: &str) -> (&str, Option<String>) {
-    let tail = tail.split('#').next().unwrap_or("");
-    let (path, query) = match tail.split_once('?') {
-        Some((p, q)) => (p, Some(q.to_string())),
-        None => (tail, None),
-    };
-    let path = if path.is_empty() { "/" } else { path };
-    (path, query)
-}
-
-/// RFC 3986 §5.2.4 on an absolute path; a trailing `.`/`..` keeps the slash.
-fn remove_dot_segments(path: &str) -> String {
-    let segments: Vec<&str> = path.split('/').collect();
-    let last = segments.len().saturating_sub(1);
-    let mut out: Vec<&str> = Vec::new();
-    for (i, seg) in segments.iter().enumerate().skip(1) {
-        match *seg {
-            "." => {
-                if i == last {
-                    out.push("");
-                }
-            }
-            ".." => {
-                out.pop();
-                if i == last {
-                    out.push("");
-                }
-            }
-            s => out.push(s),
-        }
-    }
-    format!("/{}", out.join("/"))
-}
-
-/// Whether `reference` starts with a URI scheme (`alpha *(alnum / + / - / .) :`)
-/// before any path or query delimiter.
-fn has_scheme(reference: &str) -> bool {
-    let Some(colon) = reference.find(':') else {
-        return false;
-    };
-    let scheme = &reference[..colon];
-    let mut chars = scheme.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    first.is_ascii_alphabetic()
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-        && !reference[..colon].contains(['/', '?'])
-}
-
-/// Every `href` and form `action` attribute value in `html`, in document
-/// order, with the common HTML entities decoded. Plain string scanning —
-/// case-insensitive attribute names, single/double/unquoted values.
+/// Every `<a href=…>`, `<area href=…>` and `<form action=…>` value in `html`, in
+/// document order, with the common HTML entities decoded.
+///
+/// Tag-aware by construction: the scan walks tag openings and reads the
+/// attribute only from an anchor or a form, so `data-href`, `<link href>`,
+/// `<base href>`, `<script>` contents and HTML comments are never harvested. At
+/// most [`MAX_LINKS_PER_PAGE`] links are returned.
 fn harvest_links(html: &str) -> Vec<String> {
-    let lower = html.to_ascii_lowercase();
-    let bytes = lower.as_bytes();
+    let bytes = html.as_bytes();
     let mut links = Vec::new();
-    for attr in ["href", "action"] {
-        let mut from = 0;
-        while let Some(found) = lower[from..].find(attr) {
-            let start = from + found;
-            let end = start + attr.len();
-            from = end;
-            // Must be a whole attribute name: preceded by whitespace or a
-            // quote-less tag boundary, not part of a longer word.
-            let preceded_ok = start > 0 && !bytes[start - 1].is_ascii_alphanumeric();
-            if !preceded_ok {
+    let mut i = 0;
+    while i < bytes.len() && links.len() < MAX_LINKS_PER_PAGE {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        // A comment is not markup: a commented-out anchor is not a link.
+        if html[i..].starts_with("<!--") {
+            i = html[i..].find("-->").map_or(bytes.len(), |off| i + off + 3);
+            continue;
+        }
+        let name_start = i + 1;
+        let mut j = name_start;
+        while j < bytes.len() && bytes[j].is_ascii_alphanumeric() {
+            j += 1;
+        }
+        if j == name_start {
+            i += 1;
+            continue;
+        }
+        let tag = html[name_start..j].to_ascii_lowercase();
+        // Raw-text elements: their content is script or CSS, not markup, so
+        // `var action = "/api/delete"` inside one is not a link.
+        if tag == "script" || tag == "style" {
+            i = find_close_tag(html, &tag, j).unwrap_or(bytes.len());
+            continue;
+        }
+        let wanted = match tag.as_str() {
+            "a" | "area" => "href",
+            "form" => "action",
+            _ => {
+                i = j;
                 continue;
             }
-            let Some(value) = attribute_value(html, &lower, end) else {
-                continue;
-            };
+        };
+        let (after_tag, value) = tag_attribute(html, j, wanted);
+        if let Some(value) = value {
             links.push(decode_entities(value));
         }
+        i = after_tag;
     }
     links
 }
 
-/// The value of the attribute whose name ends at `after_name`, if what follows
-/// is `[ws] = [ws] value`.
-fn attribute_value<'a>(html: &'a str, lower: &str, after_name: usize) -> Option<&'a str> {
-    let bytes = lower.as_bytes();
-    let mut i = after_name;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i >= bytes.len() || bytes[i] != b'=' {
-        return None;
-    }
-    i += 1;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i >= bytes.len() {
-        return None;
-    }
-    match bytes[i] {
-        quote @ (b'"' | b'\'') => {
-            let start = i + 1;
-            let len = lower[start..].find(quote as char)?;
-            Some(&html[start..start + len])
-        }
-        b'>' => None,
-        _ => {
-            let start = i;
-            let len = lower[start..]
-                .find(|c: char| c.is_ascii_whitespace() || c == '>')
-                .unwrap_or(lower.len() - start);
-            Some(&html[start..start + len])
-        }
-    }
+/// The index just past `</tag`, searched case-insensitively from `from`.
+fn find_close_tag(html: &str, tag: &str, from: usize) -> Option<usize> {
+    let needle = format!("</{tag}");
+    let hay = html[from..].to_ascii_lowercase();
+    hay.find(&needle).map(|off| from + off + needle.len())
 }
 
-/// Decode the entities an attribute value commonly carries.
+/// Walk the attributes of the tag whose name ends at `from`, returning the index
+/// just past the tag's `>` and the first value of the `wanted` attribute.
+/// Attribute names are matched whole, so `data-href` is not `href`.
+fn tag_attribute<'a>(html: &'a str, from: usize, wanted: &str) -> (usize, Option<&'a str>) {
+    let bytes = html.as_bytes();
+    let mut i = from;
+    let mut found: Option<&'a str> = None;
+    while i < bytes.len() {
+        if bytes[i] == b'>' {
+            return (i + 1, found);
+        }
+        if bytes[i].is_ascii_whitespace() || bytes[i] == b'/' {
+            i += 1;
+            continue;
+        }
+        // An attribute name runs to whitespace, `=`, `/` or `>`.
+        let name_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && !matches!(bytes[i], b'=' | b'>')
+        {
+            i += 1;
+        }
+        let name = &html[name_start..i];
+        let mut k = i;
+        while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if k >= bytes.len() {
+            return (bytes.len(), found);
+        }
+        if bytes[k] != b'=' {
+            // A valueless attribute; `i` already points past its name.
+            continue;
+        }
+        k += 1;
+        while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if k >= bytes.len() {
+            return (bytes.len(), found);
+        }
+        let (value, next) = match bytes[k] {
+            quote @ (b'"' | b'\'') => {
+                let start = k + 1;
+                match html[start..].find(quote as char) {
+                    Some(len) => (&html[start..start + len], start + len + 1),
+                    None => return (bytes.len(), found),
+                }
+            }
+            b'>' => {
+                i = k;
+                continue;
+            }
+            _ => {
+                let start = k;
+                let len = html[start..]
+                    .find(|c: char| c.is_ascii_whitespace() || c == '>')
+                    .unwrap_or(html.len() - start);
+                (&html[start..start + len], start + len)
+            }
+        };
+        if found.is_none() && name.eq_ignore_ascii_case(wanted) {
+            found = Some(value);
+        }
+        i = next;
+    }
+    (bytes.len(), found)
+}
+
+/// Decode the entities an attribute value commonly carries. `&amp;` is decoded
+/// **last**, so `&amp;lt;` decodes to the text `&lt;` and never to `<`.
 fn decode_entities(value: &str) -> String {
     if !value.contains('&') {
         return value.to_string();
     }
     value
-        .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&#39;", "'")
         .replace("&#x27;", "'")
+        .replace("&amp;", "&")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use aitm_core::{
-        Body, ClickTarget, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow,
-        HttpRequest, HttpVersion, InterceptState, MemFlowStore, NavOutcome, ProxyClient,
+        ActionPermit, Body, ClickTarget, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, HeaderMap,
+        HttpFlow, HttpRequest, HttpVersion, InterceptState, MemFlowStore, NavOutcome, ProxyClient,
         ScopeEntry, ScopeRateGuard, StdGuard, Value,
     };
-    use futures::executor::block_on;
     use futures::future::BoxFuture;
     use std::collections::BTreeMap;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
-    use std::time::{Duration, SystemTime};
+    use std::time::SystemTime;
 
     const TARGET: &str = "http://target.test/";
 
@@ -487,10 +578,12 @@ mod tests {
     }
 
     /// A browser that serves crafted HTML per normalized URL (falling back to
-    /// `default_html`) and records every navigation it is asked for.
+    /// `default_html`) and records every navigation it is asked for. With
+    /// `fail_after(n)` set, every navigation from the `n`th on fails.
     struct StubBrowser {
         pages: BTreeMap<String, String>,
         default_html: String,
+        fail_after: usize,
         current: Mutex<Option<String>>,
         navigated: Mutex<Vec<String>>,
     }
@@ -500,6 +593,7 @@ mod tests {
             Self {
                 pages: BTreeMap::new(),
                 default_html: default_html.to_string(),
+                fail_after: usize::MAX,
                 current: Mutex::new(None),
                 navigated: Mutex::new(Vec::new()),
             }
@@ -507,6 +601,11 @@ mod tests {
 
         fn page(mut self, url: &str, html: &str) -> Self {
             self.pages.insert(url.to_string(), html.to_string());
+            self
+        }
+
+        fn fail_after(mut self, n: usize) -> Self {
+            self.fail_after = n;
             self
         }
 
@@ -519,10 +618,14 @@ mod tests {
         fn navigate(&self, url: &str) -> BoxFuture<'_, anyhow::Result<NavOutcome>> {
             let url = url.to_string();
             Box::pin(async move {
-                self.navigated
-                    .lock()
-                    .expect("navigated lock")
-                    .push(url.clone());
+                let nth = {
+                    let mut log = self.navigated.lock().expect("navigated lock");
+                    log.push(url.clone());
+                    log.len() - 1
+                };
+                if nth >= self.fail_after {
+                    anyhow::bail!("stub navigation refused: {url}");
+                }
                 *self.current.lock().expect("current lock") = Some(url.clone());
                 Ok(NavOutcome {
                     final_url: url,
@@ -558,6 +661,72 @@ mod tests {
         }
     }
 
+    /// A guard that grants the first `allow` `check_active` calls and refuses
+    /// every later one, counting the calls and the errors recorded.
+    struct CountingGuard {
+        inner: StdGuard,
+        allow: usize,
+        checks: AtomicUsize,
+        errors: Mutex<Vec<String>>,
+    }
+
+    impl CountingGuard {
+        fn new(host: &str, allow: usize) -> Self {
+            let inner = StdGuard::default();
+            inner.add_scope(ScopeEntry { host: host.into() });
+            Self {
+                inner,
+                allow,
+                checks: AtomicUsize::new(0),
+                errors: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn checks(&self) -> usize {
+            self.checks.load(Ordering::SeqCst)
+        }
+
+        fn errors(&self) -> Vec<String> {
+            self.errors.lock().expect("errors lock").clone()
+        }
+    }
+
+    impl ScopeRateGuard for CountingGuard {
+        fn check_active(&self, host: &str) -> Result<ActionPermit, GuardError> {
+            let n = self.checks.fetch_add(1, Ordering::SeqCst);
+            if n >= self.allow {
+                return Err(GuardError::RateLimited {
+                    retry_after: Duration::from_secs(1),
+                });
+            }
+            self.inner.check_active(host)
+        }
+
+        fn add_scope(&self, entry: ScopeEntry) {
+            self.inner.add_scope(entry);
+        }
+
+        fn remove_scope(&self, entry: &str) -> bool {
+            self.inner.remove_scope(entry)
+        }
+
+        fn list_scope(&self) -> Vec<ScopeEntry> {
+            self.inner.list_scope()
+        }
+
+        fn in_scope(&self, host: &str) -> bool {
+            self.inner.in_scope(host)
+        }
+
+        fn record_error(&self, host: &str) {
+            self.errors
+                .lock()
+                .expect("errors lock")
+                .push(host.to_string());
+            self.inner.record_error(host);
+        }
+    }
+
     fn scoped_guard(host: &str) -> StdGuard {
         let guard = StdGuard::default();
         guard.add_scope(ScopeEntry { host: host.into() });
@@ -572,8 +741,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn crawl_respects_max_pages() {
+    #[tokio::test]
+    async fn crawl_respects_max_pages() {
         let html = r#"<html><body>
             <a href="/a">a</a> <a href="/b">b</a> <a href="/c">c</a>
             <a href="/d">d</a> <a href="/e">e</a>
@@ -584,7 +753,9 @@ mod tests {
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, Some(&browser));
 
-        let out = block_on(crawl(&host, TARGET, &cfg(2, 3))).expect("crawl succeeds");
+        let out = crawl(&host, TARGET, &cfg(2, 3))
+            .await
+            .expect("crawl succeeds");
 
         assert_eq!(out.stopped_reason, Some("max_pages".into()));
         assert_eq!(out.pages_crawled, 2);
@@ -602,8 +773,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn crawl_skips_out_of_scope() {
+    #[tokio::test]
+    async fn crawl_skips_out_of_scope() {
         let html = r#"<html><body>
             <a href="/ok">same origin</a>
             <a href="http://evil.example/x">off origin</a>
@@ -617,8 +788,9 @@ mod tests {
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, Some(&browser));
 
-        let out =
-            block_on(crawl(&host, TARGET, &ScannerConfig::default())).expect("crawl succeeds");
+        let out = crawl(&host, TARGET, &ScannerConfig::default())
+            .await
+            .expect("crawl succeeds");
 
         assert_eq!(
             out.endpoints,
@@ -643,8 +815,49 @@ mod tests {
         );
     }
 
-    #[test]
-    fn crawl_skips_same_origin_links_the_guard_rejects() {
+    /// `\` is a path separator to a WHATWG browser, so the host of
+    /// `http://evil.com\.target.test/` is `evil.com` — it must not pass a
+    /// `*.target.test` scope entry by looking like a subdomain.
+    #[tokio::test]
+    async fn crawl_rejects_backslash_host_scope_bypass() {
+        let hostile = "http://evil.com\\.target.test/";
+        assert_eq!(
+            target_authority(hostile).expect("the URL parses"),
+            "evil.com:80",
+            "the backslash ends the host, as the browser reads it"
+        );
+
+        let browser = StubBrowser::new(&format!(r#"<a href="{hostile}">bypass</a>"#));
+        let store = MemFlowStore::new();
+        let guard = scoped_guard("*.target.test");
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, Some(&browser));
+
+        // As a seed: refused outright, nothing is navigated.
+        let err = crawl(&host, hostile, &ScannerConfig::default())
+            .await
+            .expect_err("the real host evil.com is out of scope");
+        assert_eq!(
+            err.downcast_ref::<GuardError>(),
+            Some(&GuardError::OutOfScope("evil.com:80".into()))
+        );
+        assert!(browser.navigated().is_empty(), "nothing was navigated");
+
+        // As a link on an in-scope page: dropped before any navigation.
+        let out = crawl(&host, "http://app.target.test/", &ScannerConfig::default())
+            .await
+            .expect("the in-scope seed crawls");
+        assert_eq!(out.endpoints, vec!["http://app.target.test/".to_string()]);
+        for url in browser.navigated() {
+            assert!(
+                !url.contains("evil.com"),
+                "the crawler navigated the real host of the bypass URL: {url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn crawl_skips_same_origin_links_the_guard_rejects() {
         // Same origin as the target, but the guard has no entry for the host:
         // deny-by-default means not even the seed is navigated.
         let browser = StubBrowser::new(r#"<a href="/a">a</a>"#);
@@ -653,17 +866,127 @@ mod tests {
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, Some(&browser));
 
-        let err = block_on(crawl(&host, TARGET, &ScannerConfig::default()))
+        let err = crawl(&host, TARGET, &ScannerConfig::default())
+            .await
             .expect_err("an out-of-scope target is refused");
         assert_eq!(
-            err.downcast_ref::<aitm_core::GuardError>(),
-            Some(&aitm_core::GuardError::OutOfScope("target.test".into()))
+            err.downcast_ref::<GuardError>(),
+            Some(&GuardError::OutOfScope("target.test:80".into()))
         );
         assert!(browser.navigated().is_empty(), "nothing was navigated");
     }
 
-    #[test]
-    fn crawl_stops_at_max_depth() {
+    /// Every navigation takes a permit: a guard that stops granting them stops
+    /// the crawl's navigations, and the seed's refusal is propagated.
+    #[tokio::test]
+    async fn crawl_gates_every_navigation_on_check_active() {
+        let browser = StubBrowser::new("<p>leaf</p>").page(
+            TARGET,
+            r#"<a href="/a">a</a> <a href="/b">b</a> <a href="/c">c</a>"#,
+        );
+        let store = MemFlowStore::new();
+        // Two permits: the seed and one link. The rest are refused.
+        let guard = CountingGuard::new("target.test", 2);
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, Some(&browser));
+
+        let out = crawl(&host, TARGET, &ScannerConfig::default())
+            .await
+            .expect("a refusal on a link is not a crawl failure");
+
+        assert_eq!(
+            browser.navigated(),
+            vec![
+                "http://target.test/".to_string(),
+                "http://target.test/a".to_string()
+            ],
+            "only the permitted navigations ran"
+        );
+        assert_eq!(out.pages_crawled, 2);
+        assert_eq!(
+            guard.checks(),
+            4,
+            "one check per dequeued page: seed, /a, /b, /c"
+        );
+
+        // The seed's own refusal is the caller's answer.
+        let browser = StubBrowser::new("<p>leaf</p>");
+        let guard = CountingGuard::new("target.test", 0);
+        let host = CommandHost::new(&store, &client, &guard, Some(&browser));
+        let err = crawl(&host, TARGET, &ScannerConfig::default())
+            .await
+            .expect_err("a refused seed fails the command");
+        assert_eq!(
+            err.downcast_ref::<GuardError>(),
+            Some(&GuardError::RateLimited {
+                retry_after: Duration::from_secs(1)
+            })
+        );
+        assert!(browser.navigated().is_empty());
+    }
+
+    /// A target that refuses every connection is bounded by `max_pages`, not by
+    /// the time budget alone, and each failure is reported to the guard.
+    #[tokio::test]
+    async fn crawl_counts_failed_navigations_toward_max_pages() {
+        let browser = StubBrowser::new("<p>leaf</p>")
+            .page(
+                TARGET,
+                r#"<a href="/a">a</a> <a href="/b">b</a> <a href="/c">c</a>
+                   <a href="/d">d</a> <a href="/e">e</a>"#,
+            )
+            // The seed loads; every later navigation fails.
+            .fail_after(1);
+        let store = MemFlowStore::new();
+        let guard = CountingGuard::new("target.test", usize::MAX);
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, Some(&browser));
+
+        let out = crawl(&host, TARGET, &cfg(3, 5))
+            .await
+            .expect("a failed navigation is not a crawl failure");
+
+        assert_eq!(
+            browser.navigated(),
+            vec![
+                "http://target.test/".to_string(),
+                "http://target.test/a".to_string(),
+                "http://target.test/b".to_string(),
+            ],
+            "failed attempts count against max_pages"
+        );
+        assert_eq!(out.pages_crawled, 1);
+        assert_eq!(out.endpoints, vec!["http://target.test/".to_string()]);
+        assert_eq!(out.stopped_reason, Some("max_pages".into()));
+        assert_eq!(
+            guard.errors(),
+            vec!["target.test:80".to_string(), "target.test:80".to_string()],
+            "each failure is recorded against the host's error budget"
+        );
+    }
+
+    /// A crawl that navigated nothing successfully says so, instead of looking
+    /// like an exhausted graph.
+    #[tokio::test]
+    async fn crawl_reports_navigation_failed_when_nothing_loaded() {
+        let browser = StubBrowser::new(r#"<a href="/a">a</a>"#).fail_after(0);
+        let store = MemFlowStore::new();
+        let guard = scoped_guard("target.test");
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, Some(&browser));
+
+        let out = crawl(&host, TARGET, &ScannerConfig::default())
+            .await
+            .expect("a failed navigation is not a crawl failure");
+
+        assert_eq!(browser.navigated(), vec!["http://target.test/".to_string()]);
+        assert_eq!(out.pages_crawled, 0);
+        assert!(out.endpoints.is_empty());
+        assert_eq!(out.stopped_reason, Some("navigation_failed".into()));
+    }
+
+    #[tokio::test]
+    async fn crawl_stops_at_max_depth() {
         let browser = StubBrowser::new("<p>leaf</p>")
             .page(TARGET, r#"<a href="/l1">l1</a>"#)
             .page("http://target.test/l1", r#"<a href="/l2">l2</a>"#)
@@ -673,7 +996,9 @@ mod tests {
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, Some(&browser));
 
-        let out = block_on(crawl(&host, TARGET, &cfg(50, 1))).expect("crawl succeeds");
+        let out = crawl(&host, TARGET, &cfg(50, 1))
+            .await
+            .expect("crawl succeeds");
 
         assert_eq!(
             out.endpoints,
@@ -686,8 +1011,8 @@ mod tests {
         assert_eq!(out.stopped_reason, Some("max_depth".into()));
     }
 
-    #[test]
-    fn crawl_exhausts_graph_with_no_stop_reason() {
+    #[tokio::test]
+    async fn crawl_exhausts_graph_with_no_stop_reason() {
         let browser = StubBrowser::new("<p>leaf</p>").page(
             TARGET,
             r##"<a href="/a#frag">a</a> <a href="a">a again</a> <a href="./b?x=1&amp;y=2">b</a>
@@ -699,8 +1024,9 @@ mod tests {
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, Some(&browser));
 
-        let out =
-            block_on(crawl(&host, TARGET, &ScannerConfig::default())).expect("crawl succeeds");
+        let out = crawl(&host, TARGET, &ScannerConfig::default())
+            .await
+            .expect("crawl succeeds");
 
         assert_eq!(
             out.endpoints,
@@ -715,8 +1041,8 @@ mod tests {
         assert_eq!(out.stopped_reason, None);
     }
 
-    #[test]
-    fn crawl_stops_on_time_budget() {
+    #[tokio::test]
+    async fn crawl_stops_on_time_budget() {
         let browser = StubBrowser::new(r#"<a href="/a">a</a> <a href="/b">b</a>"#);
         let store = MemFlowStore::new();
         let guard = scoped_guard("target.test");
@@ -727,15 +1053,70 @@ mod tests {
             ..ScannerConfig::default()
         };
 
-        let out = block_on(crawl(&host, TARGET, &cfg)).expect("crawl succeeds");
+        let out = crawl(&host, TARGET, &cfg).await.expect("crawl succeeds");
 
         assert_eq!(out.stopped_reason, Some("time_budget".into()));
         assert_eq!(out.pages_crawled, 0);
         assert!(browser.navigated().is_empty());
     }
 
-    #[test]
-    fn crawl_without_browser_lists_stored_in_scope_urls() {
+    /// A navigation that never completes is cut off at the remaining budget
+    /// instead of blocking the command forever.
+    #[tokio::test]
+    async fn crawl_times_out_a_hung_navigation() {
+        /// A browser whose navigation never resolves.
+        struct HungBrowser;
+
+        impl aitm_core::BrowserDriver for HungBrowser {
+            fn navigate(&self, _url: &str) -> BoxFuture<'_, anyhow::Result<NavOutcome>> {
+                Box::pin(std::future::pending())
+            }
+
+            fn click(&self, _target: ClickTarget) -> BoxFuture<'_, anyhow::Result<()>> {
+                Box::pin(async { unimplemented!() })
+            }
+
+            fn type_text(&self, _selector: &str, _text: &str) -> BoxFuture<'_, anyhow::Result<()>> {
+                Box::pin(async { unimplemented!() })
+            }
+
+            fn screenshot(&self) -> BoxFuture<'_, anyhow::Result<Vec<u8>>> {
+                Box::pin(async { unimplemented!() })
+            }
+
+            fn eval(&self, _expr: &str) -> BoxFuture<'_, anyhow::Result<Value>> {
+                Box::pin(async { unimplemented!() })
+            }
+
+            fn get_dom(&self) -> BoxFuture<'_, anyhow::Result<String>> {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        let browser = HungBrowser;
+        let store = MemFlowStore::new();
+        let guard = scoped_guard("target.test");
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, Some(&browser));
+        let cfg = ScannerConfig {
+            time_budget: Duration::from_millis(50),
+            ..ScannerConfig::default()
+        };
+
+        let started = Instant::now();
+        let out = crawl(&host, TARGET, &cfg).await.expect("crawl succeeds");
+
+        assert_eq!(out.stopped_reason, Some("time_budget".into()));
+        assert_eq!(out.pages_crawled, 0);
+        assert!(out.endpoints.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the hung navigation was cut off at the budget, not waited out"
+        );
+    }
+
+    #[tokio::test]
+    async fn crawl_without_browser_lists_stored_in_scope_urls() {
         let store = MemFlowStore::new();
         store.insert(captured("http", "target.test", "/one?q=1"));
         store.insert(captured("http", "target.test", "/one?q=1")); // duplicate
@@ -746,8 +1127,9 @@ mod tests {
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
 
-        let out =
-            block_on(crawl(&host, TARGET, &ScannerConfig::default())).expect("crawl succeeds");
+        let out = crawl(&host, TARGET, &ScannerConfig::default())
+            .await
+            .expect("crawl succeeds");
 
         assert_eq!(out.stopped_reason, Some("no_browser".into()));
         assert_eq!(out.pages_crawled, 0);
@@ -760,18 +1142,92 @@ mod tests {
         );
     }
 
-    #[test]
-    fn crawl_rejects_unparseable_target() {
+    #[tokio::test]
+    async fn crawl_rejects_unparseable_target() {
         let store = MemFlowStore::new();
         let guard = scoped_guard("target.test");
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
 
-        let err = block_on(crawl(&host, "not a url", &ScannerConfig::default()))
+        let err = crawl(&host, "not a url", &ScannerConfig::default())
+            .await
             .expect_err("a target without scheme://host is refused");
         assert!(
             err.to_string().contains("not a url"),
             "names the input: {err}"
         );
+    }
+
+    /// A credentialed target is refused, and the refusal does not echo the
+    /// credential back to the caller.
+    #[tokio::test]
+    async fn crawl_refuses_credentials_in_the_target_without_echoing_them() {
+        let store = MemFlowStore::new();
+        let guard = scoped_guard("target.test");
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, None);
+
+        let err = crawl(
+            &host,
+            "http://admin:hunter2@target.test/",
+            &ScannerConfig::default(),
+        )
+        .await
+        .expect_err("a target carrying userinfo is refused");
+        let text = err.to_string();
+        assert!(!text.contains("hunter2"), "password echoed back: {text}");
+        assert!(!text.contains("admin"), "username echoed back: {text}");
+        assert!(text.contains("target.test"), "names the host: {text}");
+    }
+
+    /// Only real anchor and form targets are links: `data-href`, `<link>`,
+    /// `<base>`, script bodies, comments and prose are not.
+    #[test]
+    fn harvest_links_is_tag_aware() {
+        let html = r#"<html><head>
+            <base href="/base">
+            <link rel="stylesheet" href="/style.css">
+            <script>var action = "/api/delete-all"; var href = "/js-href";</script>
+          </head><body>
+            <div data-href="/data-href" data-action="/data-action">the form's action = "/prose"</div>
+            <!-- <a href="/commented">old</a> -->
+            <a href="/real">real</a>
+            <A HREF='/upper'>upper</A>
+            <a class="x" href=/unquoted >unquoted</a>
+            <area href="/area">
+            <form method="post" action="/submit"></form>
+            <a name="anchor-only">no href</a>
+            <a href="/amp?x=1&amp;y=2">amp</a>
+          </body></html>"#;
+
+        assert_eq!(
+            harvest_links(html),
+            vec![
+                "/real".to_string(),
+                "/upper".to_string(),
+                "/unquoted".to_string(),
+                "/area".to_string(),
+                "/submit".to_string(),
+                "/amp?x=1&y=2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_entities_does_not_double_decode() {
+        assert_eq!(decode_entities("&amp;lt;"), "&lt;");
+        assert_eq!(decode_entities("a&amp;b"), "a&b");
+        assert_eq!(decode_entities("&lt;tag&gt;"), "<tag>");
+    }
+
+    /// A page with far more links than the per-page cap cannot grow the
+    /// frontier without bound.
+    #[test]
+    fn harvest_links_caps_a_hostile_page() {
+        let mut html = String::new();
+        for i in 0..(MAX_LINKS_PER_PAGE * 3) {
+            html.push_str(&format!("<a href=\"/p{i}\">x</a>"));
+        }
+        assert_eq!(harvest_links(&html).len(), MAX_LINKS_PER_PAGE);
     }
 }

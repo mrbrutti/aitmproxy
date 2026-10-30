@@ -231,13 +231,12 @@ dependencies = [
 name = "aitm-plugin-scanner"
 version = "0.1.0"
 dependencies = [
- "aitm",
- "aitm-browser",
  "aitm-core",
- "aitm-testtarget",
  "anyhow",
  "futures",
+ "serde_json",
  "tokio",
+ "url",
 ]
 
 [[package]]

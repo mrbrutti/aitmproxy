@@ -8,17 +8,29 @@
 //!
 //! Deny-by-default throughout: the target host is gated through
 //! [`aitm_core::ScopeRateGuard::check_active`] before any navigation, so an
-//! out-of-scope target is refused before the crawl begins.
+//! out-of-scope target is refused before the crawl begins, and every page the
+//! crawl then visits takes its own permit.
+//!
+//! The result carries no credentials: [`crate::discover::enumerate`] replaces a
+//! secret-named point's example with a placeholder, and every free-text string
+//! that reaches the caller is additionally run through
+//! [`aitm_core::redact::scrub_text`], so a token embedded in a URL's query is
+//! masked as well.
 
 use std::collections::{BTreeMap, HashSet};
 
+use aitm_core::redact::scrub_text;
 use aitm_core::{
     Command, CommandHost, Flow, ParamDef, ParamSchema, Params, Sensitivity, TypeDesc, Value,
 };
 
-use crate::crawl::{block_on, crawl, normalize_url};
-use crate::discover::{enumerate, Location};
+use crate::crawl::{block_on, crawl, normalize_url, target_authority};
+use crate::discover::enumerate;
 use crate::ScannerConfig;
+
+/// Upper bound on each array in the result, so a long crawl cannot return an
+/// unbounded object to the caller.
+const MAX_RESULT_ITEMS: usize = 1024;
 
 /// `scan.discover` — list reachable in-scope URLs and the parameter names
 /// present in captured requests. Registered by [`crate::ScannerPlugin`].
@@ -88,21 +100,27 @@ impl Command for ScanDiscover {
 
         // Deny-by-default: gate the target host through the scope/rate guard
         // before any navigation. An out-of-scope target returns
-        // `GuardError::OutOfScope` here, before the crawl begins. The permit is
-        // dropped immediately — we only need the gate check.
+        // `GuardError::OutOfScope` here, before the crawl begins. The authority
+        // is derived with the same WHATWG parser the crawl and the browser use,
+        // so the host gated here is the host that is navigated.
+        //
+        // The permit is held across the crawl: this command occupies one
+        // concurrency slot for its whole run, and every page inside the crawl
+        // takes a further permit of its own.
         let authority = target_authority(target)?;
-        let _permit = host
-            .guard()
-            .check_active(authority)
-            .map_err(anyhow::Error::new)?;
+        let permit = host.guard().check_active(&authority)?;
 
         let outcome = block_on(crawl(host, target, &cfg))?;
+        drop(permit);
 
         // Enumerate injection points from the captured requests whose normalized
         // URL is one of the reached endpoints — observed traffic only.
         let endpoint_set: HashSet<&str> = outcome.endpoints.iter().map(String::as_str).collect();
         let mut injection_points: Vec<Value> = Vec::new();
         for id in host.store().list() {
+            if injection_points.len() >= MAX_RESULT_ITEMS {
+                break;
+            }
             let Some(Flow::Http(flow)) = host.store().get(id) else {
                 continue;
             };
@@ -115,14 +133,20 @@ impl Command for ScanDiscover {
                 continue;
             }
             for point in enumerate(&flow) {
+                if injection_points.len() >= MAX_RESULT_ITEMS {
+                    break;
+                }
                 let mut obj = BTreeMap::new();
                 obj.insert("flow".into(), Value::Str(point.flow.to_string()));
                 obj.insert(
                     "location".into(),
-                    Value::Str(location_token(&point.location).to_string()),
+                    Value::Str(point.location.as_str().to_string()),
                 );
                 obj.insert("name".into(), Value::Str(point.name));
-                obj.insert("example".into(), Value::Str(point.example));
+                // `enumerate` has already replaced a secret-named example; this
+                // catches a credential embedded inside an otherwise innocent
+                // value (`next=…?access_token=…`).
+                obj.insert("example".into(), Value::Str(scrub_text(&point.example)));
                 injection_points.push(Value::Object(obj));
             }
         }
@@ -130,7 +154,15 @@ impl Command for ScanDiscover {
         let mut result = BTreeMap::new();
         result.insert(
             "endpoints".into(),
-            Value::Array(outcome.endpoints.into_iter().map(Value::Str).collect()),
+            Value::Array(
+                outcome
+                    .endpoints
+                    .iter()
+                    .take(MAX_RESULT_ITEMS)
+                    // A reached URL can carry a token in its query string.
+                    .map(|url| Value::Str(scrub_text(url)))
+                    .collect(),
+            ),
         );
         result.insert("injection_points".into(), Value::Array(injection_points));
         result.insert(
@@ -145,39 +177,17 @@ impl Command for ScanDiscover {
     }
 }
 
-/// The lowercase wire token for a discovered injection point's location.
-fn location_token(location: &Location) -> &'static str {
-    match location {
-        Location::Query => "query",
-        Location::BodyParam => "body_param",
-        Location::Header => "header",
-        Location::Cookie => "cookie",
-        Location::PathSegment => "path_segment",
-        Location::Redirect => "redirect",
-    }
-}
-
-/// The `host[:port]` authority the scope guard is asked about, parsed from an
-/// absolute `http(s)` target URL. Userinfo is dropped; nothing is lowercased
-/// here — the guard normalizes.
-fn target_authority(target: &str) -> anyhow::Result<&str> {
-    let (_scheme, rest) = target
-        .split_once("://")
-        .ok_or_else(|| anyhow::anyhow!("target is not an absolute http(s) URL: {target:?}"))?;
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..end];
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    if authority.is_empty() {
-        anyhow::bail!("target has no host: {target:?}");
-    }
-    Ok(authority)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aitm_core::{HttpFlow, HttpRequest, MemFlowStore, ProxyClient, StdGuard};
+    use aitm_core::{
+        Body, ConnInfo, FlowId, FlowMeta, FlowStore, GuardError, HeaderMap, HttpFlow, HttpRequest,
+        HttpVersion, InterceptState, MemFlowStore, ProxyClient, ScopeEntry, ScopeRateGuard,
+        StdGuard,
+    };
     use futures::future::BoxFuture;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::time::SystemTime;
 
     /// A `ProxyClient` the command must never reach: discovery is read-only and
     /// crawls through the browser, never the proxy client.
@@ -196,6 +206,74 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect(),
         )
+    }
+
+    fn conn() -> ConnInfo {
+        ConnInfo {
+            peer: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            sni: None,
+            alpn: None,
+            tls: false,
+            established: SystemTime::now(),
+        }
+    }
+
+    fn captured(path: &str, headers: HeaderMap) -> Flow {
+        Flow::Http(HttpFlow {
+            id: FlowId::new(),
+            request: HttpRequest {
+                method: "GET".into(),
+                scheme: "http".into(),
+                authority: "target.test".into(),
+                path: path.into(),
+                version: HttpVersion::Http11,
+                headers,
+                body: Body::Empty,
+                timestamp: SystemTime::now(),
+            },
+            response: None,
+            client_conn: conn(),
+            server_conn: None,
+            metadata: FlowMeta::default(),
+            intercept: InterceptState::Observed,
+        })
+    }
+
+    fn scoped_guard() -> StdGuard {
+        let guard = StdGuard::default();
+        guard.add_scope(ScopeEntry {
+            host: "target.test".into(),
+        });
+        guard
+    }
+
+    /// Every string anywhere in a result value.
+    fn strings(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::Str(s) => out.push(s.clone()),
+            Value::Array(items) => items.iter().for_each(|v| strings(v, out)),
+            Value::Object(map) => map.iter().for_each(|(k, v)| {
+                out.push(k.clone());
+                strings(v, out);
+            }),
+            _ => {}
+        }
+    }
+
+    fn endpoints_of(result: &Value) -> Vec<String> {
+        let Value::Object(map) = result else {
+            panic!("the result is an object: {result:?}");
+        };
+        let Some(Value::Array(items)) = map.get("endpoints") else {
+            panic!("the result carries an endpoints array: {result:?}");
+        };
+        items
+            .iter()
+            .filter_map(|v| match v {
+                Value::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -222,11 +300,165 @@ mod tests {
                 &host,
             )
             .expect_err("an out-of-scope target is refused before any crawl");
-        let guard_err = err.downcast_ref::<aitm_core::GuardError>();
+        assert_eq!(
+            err.downcast_ref::<GuardError>(),
+            Some(&GuardError::OutOfScope("unscoped.example:80".into()))
+        );
+    }
+
+    /// The anti-goal, at the command boundary: no secret the operator's captured
+    /// traffic carried may appear anywhere in the structured result.
+    #[test]
+    fn discover_result_has_no_secret() {
+        let mut headers = HeaderMap::new();
+        headers.set("Authorization", "Bearer s3cr3t-value");
+        headers.set("Cookie", "session_token=s3cr3t-value; theme=dark");
+        let store = MemFlowStore::new();
+        store.insert(captured("/x?access_token=s3cr3t-value&q=1", headers));
+        let guard = scoped_guard();
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, None);
+        let cmd = ScanDiscover {
+            cfg: ScannerConfig::default(),
+        };
+
+        let result = cmd
+            .invoke(
+                params(&[("target", Value::Str("http://target.test/".into()))]),
+                &host,
+            )
+            .expect("an in-scope target with no browser falls back to the store");
+
+        let mut found = Vec::new();
+        strings(&result, &mut found);
         assert!(
-            matches!(guard_err, Some(aitm_core::GuardError::OutOfScope(_)))
-                || err.to_string().to_lowercase().contains("scope"),
-            "expected an out-of-scope refusal, got: {err}"
+            !found.iter().any(|s| s.contains("s3cr3t-value")),
+            "a captured secret reached the result: {found:?}"
+        );
+        // The shape is still useful: the names survive, only the values go.
+        assert!(
+            found.iter().any(|s| s == "access_token"),
+            "the injection point name must survive redaction: {found:?}"
+        );
+        assert!(
+            found.iter().any(|s| s == "Authorization"),
+            "the header point name must survive redaction: {found:?}"
+        );
+    }
+
+    /// `max_pages` may lower the configured cap.
+    #[test]
+    fn scan_discover_max_pages_lowers_the_cap() {
+        let store = MemFlowStore::new();
+        store.insert(captured("/one", HeaderMap::new()));
+        store.insert(captured("/two", HeaderMap::new()));
+        store.insert(captured("/three", HeaderMap::new()));
+        let guard = scoped_guard();
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, None);
+        let cmd = ScanDiscover {
+            cfg: ScannerConfig::default(),
+        };
+
+        let result = cmd
+            .invoke(
+                params(&[
+                    ("target", Value::Str("http://target.test/".into())),
+                    ("max_pages", Value::Int(1)),
+                ]),
+                &host,
+            )
+            .expect("scan.discover succeeds");
+
+        assert_eq!(endpoints_of(&result), vec!["http://target.test/one"]);
+    }
+
+    /// `max_pages` may never raise it.
+    #[test]
+    fn scan_discover_max_pages_cannot_raise_the_cap() {
+        let store = MemFlowStore::new();
+        store.insert(captured("/one", HeaderMap::new()));
+        store.insert(captured("/two", HeaderMap::new()));
+        store.insert(captured("/three", HeaderMap::new()));
+        let guard = scoped_guard();
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, None);
+        let cmd = ScanDiscover {
+            cfg: ScannerConfig {
+                max_pages: 2,
+                ..ScannerConfig::default()
+            },
+        };
+
+        let result = cmd
+            .invoke(
+                params(&[
+                    ("target", Value::Str("http://target.test/".into())),
+                    ("max_pages", Value::Int(500)),
+                ]),
+                &host,
+            )
+            .expect("scan.discover succeeds");
+
+        assert_eq!(
+            endpoints_of(&result),
+            vec!["http://target.test/one", "http://target.test/two"],
+            "the configured cap of 2 holds against a request for 500"
+        );
+    }
+
+    #[test]
+    fn scan_discover_rejects_a_negative_budget() {
+        let store = MemFlowStore::new();
+        let guard = scoped_guard();
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, None);
+        let cmd = ScanDiscover {
+            cfg: ScannerConfig::default(),
+        };
+
+        let err = cmd
+            .invoke(
+                params(&[
+                    ("target", Value::Str("http://target.test/".into())),
+                    ("max_depth", Value::Int(-1)),
+                ]),
+                &host,
+            )
+            .expect_err("a negative budget is an error, not a wrap-around");
+        assert!(
+            err.to_string().contains("non-negative"),
+            "explains the refusal: {err}"
+        );
+    }
+
+    /// The target gate and the crawl use one parser, so a URL whose real host is
+    /// `evil.com` is refused even under a `*.target.test` scope entry.
+    #[test]
+    fn scan_discover_refuses_a_backslash_host_bypass() {
+        let store = MemFlowStore::new();
+        let guard = StdGuard::default();
+        guard.add_scope(ScopeEntry {
+            host: "*.target.test".into(),
+        });
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, None);
+        let cmd = ScanDiscover {
+            cfg: ScannerConfig::default(),
+        };
+
+        let err = cmd
+            .invoke(
+                params(&[(
+                    "target",
+                    Value::Str("http://evil.com\\.target.test/".into()),
+                )]),
+                &host,
+            )
+            .expect_err("the real host is out of scope");
+        assert_eq!(
+            err.downcast_ref::<GuardError>(),
+            Some(&GuardError::OutOfScope("evil.com:80".into()))
         );
     }
 }

@@ -5,14 +5,30 @@
 //! routed via the proxy, and asserts the discovered endpoints cover the seeded
 //! paths and that the `q` query parameter shows up as an injection point.
 //!
-//! Gated on a real browser the M4 way (`crates/aitm/tests/support/rig.rs`):
-//! with `AITM_OBSCURA` unset the test returns early, so the default `cargo test`
-//! stays hermetic and fast. Run it for real with:
+//! Gated on a real browser the M4 way, through the shared rig's
+//! [`obscura_enabled`](rig::obscura_enabled): with `AITM_OBSCURA` unset the test
+//! returns early, so the default `cargo test` stays hermetic and fast. Run it
+//! for real with:
 //!
 //! ```text
 //! AITM_OBSCURA=1 AITM_OBSCURA_BIN=/path/to/obscura \
-//!   cargo test -p aitm-plugin-scanner --test discover_e2e -- --nocapture
+//!   cargo test -p aitm --test discover_e2e -- --nocapture
 //! ```
+//!
+//! It lives here, beside the rig, rather than in `aitm-plugin-scanner/tests/`:
+//! it needs `aitm::wire::assemble`, and a dev-dependency on `aitm` from a crate
+//! `aitm` itself depends on would close a crate-graph cycle.
+
+// The rig's two sibling support modules, which `rig.rs` refers to by crate path.
+#[path = "../../aitm-browser/tests/support/engines.rs"]
+#[allow(dead_code)]
+mod engines;
+#[path = "support/rig.rs"]
+#[allow(dead_code)]
+mod rig;
+#[path = "support/scripted_driver.rs"]
+#[allow(dead_code)]
+mod scripted_driver;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -28,6 +44,7 @@ use aitm_core::{
 use aitm_plugin_scanner::{ScannerConfig, ScannerPlugin};
 use aitm_testtarget::{SeedMode, TestTarget};
 use futures::future::BoxFuture;
+use rig::obscura_enabled;
 use tokio::net::TcpStream;
 
 /// A `ProxyClient` the command never reaches: discovery crawls through the
@@ -61,17 +78,6 @@ async fn wait_listening(addr: SocketAddr) {
         assert!(Instant::now() < deadline, "listener never came up");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-}
-
-/// Whether the environment enables the real obscura engine (`AITM_OBSCURA=1`,
-/// with `AITM_OBSCURA_BIN`). Prints the skip note when it does not — a local
-/// copy of `rig.rs::obscura_enabled`, so this crate takes no test-support dep.
-fn obscura_enabled() -> bool {
-    if std::env::var_os("AITM_OBSCURA").is_none() {
-        eprintln!("skipped; set AITM_OBSCURA=1 (with AITM_OBSCURA_BIN) to run the discovery e2e");
-        return false;
-    }
-    true
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

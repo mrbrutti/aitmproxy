@@ -4,11 +4,28 @@
 //! This reads ONLY the passed flow — never a test-target manifest or any other
 //! out-of-band source. The same request shape a client could observe is all the
 //! scanner is allowed to see.
+//!
+//! Credentials never leave here: a point whose name reads as a secret
+//! ([`aitm_core::redact::is_secret_key`] — `Authorization`, `Cookie`, `token`,
+//! `api-key`, `password`, …) carries [`REDACTED`] as its example instead of the
+//! observed value, so an auth header or session cookie seen in captured traffic
+//! cannot reach a structured `scan.*` result.
 
+use std::collections::HashSet;
+
+use aitm_core::redact::is_secret_key;
 use aitm_core::Body;
 
+/// The example value a secret-named injection point carries.
+pub const REDACTED: &str = "<redacted>";
+
+/// Upper bound on the injection points enumerated from one flow. A hostile
+/// client can POST a multi-megabyte body of distinct parameters; past this many
+/// points the rest are dropped rather than enumerated.
+const MAX_POINTS_PER_FLOW: usize = 1024;
+
 /// Where a candidate injection point lives in the request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Location {
     /// A `?k=v` query-string parameter.
     Query,
@@ -24,6 +41,20 @@ pub enum Location {
     Redirect,
 }
 
+impl Location {
+    /// The lowercase wire token for this location.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Location::Query => "query",
+            Location::BodyParam => "body_param",
+            Location::Header => "header",
+            Location::Cookie => "cookie",
+            Location::PathSegment => "path_segment",
+            Location::Redirect => "redirect",
+        }
+    }
+}
+
 /// One candidate injection point discovered in a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InjectionPoint {
@@ -33,29 +64,41 @@ pub struct InjectionPoint {
     pub location: Location,
     /// The parameter / header / segment name.
     pub name: String,
-    /// The observed value (or segment) at that point.
+    /// The observed value (or segment) at that point, or [`REDACTED`] when the
+    /// name reads as a secret.
     pub example: String,
 }
 
 /// Enumerate candidate injection points from the request shape of `flow`.
 ///
-/// Reads ONLY the passed flow. Never calls any `aitm_testtarget` API.
+/// Reads ONLY the passed flow. Never calls any `aitm_testtarget` API. At most
+/// [`MAX_POINTS_PER_FLOW`] points are returned, deduplicated on
+/// `(location, name)`, and the example of a secret-named point is [`REDACTED`].
 pub fn enumerate(flow: &aitm_core::HttpFlow) -> Vec<InjectionPoint> {
     let id = flow.id;
     let req = &flow.request;
     let mut points: Vec<InjectionPoint> = Vec::new();
+    // O(1) dedupe: a linear scan per point is quadratic in the parameter count,
+    // which a single large captured body controls.
+    let mut seen: HashSet<(Location, String)> = HashSet::new();
     let mut push = |location: Location, name: String, example: String| {
-        if !points
-            .iter()
-            .any(|p| p.location == location && p.name == name)
-        {
-            points.push(InjectionPoint {
-                flow: id,
-                location,
-                name,
-                example,
-            });
+        if points.len() >= MAX_POINTS_PER_FLOW {
+            return;
         }
+        if !seen.insert((location.clone(), name.clone())) {
+            return;
+        }
+        let example = if is_secret_key(&name) {
+            REDACTED.to_string()
+        } else {
+            example
+        };
+        points.push(InjectionPoint {
+            flow: id,
+            location,
+            name,
+            example,
+        });
     };
 
     // Split the path into the raw path and its query string.
@@ -64,21 +107,18 @@ pub fn enumerate(flow: &aitm_core::HttpFlow) -> Vec<InjectionPoint> {
         None => (req.path.as_str(), None),
     };
 
-    // Query parameters.
+    // Query parameters, percent-decoded: a browser-encoded
+    // `next=https%3A%2F%2Fevil.test` is an open-redirect candidate, not a plain
+    // query parameter.
     if let Some(query) = query {
-        for (name, value) in parse_pairs(query, '&') {
-            let location = if is_url(&value) {
-                Location::Redirect
-            } else {
-                Location::Query
-            };
-            push(location, name, value);
+        for (name, value) in form_pairs(query) {
+            push(classify(&value, Location::Query), name, value);
         }
     }
 
     // Numeric object-id path segments.
     for segment in raw_path.split('/').filter(|s| !s.is_empty()) {
-        if !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit()) {
+        if segment.bytes().all(|b| b.is_ascii_digit()) {
             push(
                 Location::PathSegment,
                 segment.to_string(),
@@ -87,30 +127,18 @@ pub fn enumerate(flow: &aitm_core::HttpFlow) -> Vec<InjectionPoint> {
         }
     }
 
-    // Body parameters (form-urlencoded or a flat JSON object).
+    // Body parameters (form-urlencoded, or the top-level keys of a JSON object).
     if let Some(bytes) = body_bytes(&req.body) {
         let ctype = req.headers.get("content-type").unwrap_or("");
         if ctype.contains("application/x-www-form-urlencoded") {
             if let Ok(text) = std::str::from_utf8(bytes) {
-                for (name, value) in parse_pairs(text, '&') {
-                    let location = if is_url(&value) {
-                        Location::Redirect
-                    } else {
-                        Location::BodyParam
-                    };
-                    push(location, name, value);
+                for (name, value) in form_pairs(text) {
+                    push(classify(&value, Location::BodyParam), name, value);
                 }
             }
         } else if ctype.contains("application/json") {
-            if let Ok(text) = std::str::from_utf8(bytes) {
-                for (name, value) in parse_json_object(text) {
-                    let location = if is_url(&value) {
-                        Location::Redirect
-                    } else {
-                        Location::BodyParam
-                    };
-                    push(location, name, value);
-                }
+            for (name, value) in json_pairs(bytes) {
+                push(classify(&value, Location::BodyParam), name, value);
             }
         }
     }
@@ -118,7 +146,7 @@ pub fn enumerate(flow: &aitm_core::HttpFlow) -> Vec<InjectionPoint> {
     // Cookies and other headers.
     for (name, value) in req.headers.iter() {
         if name.eq_ignore_ascii_case("cookie") {
-            for (cname, cvalue) in parse_pairs(value, ';') {
+            for (cname, cvalue) in cookie_pairs(value) {
                 push(Location::Cookie, cname, cvalue);
             }
         } else if name.eq_ignore_ascii_case("host") {
@@ -130,6 +158,16 @@ pub fn enumerate(flow: &aitm_core::HttpFlow) -> Vec<InjectionPoint> {
     }
 
     points
+}
+
+/// A URL-valued parameter is an open-redirect candidate wherever it was found;
+/// anything else keeps its own location.
+fn classify(value: &str, default: Location) -> Location {
+    if is_url(value) {
+        Location::Redirect
+    } else {
+        default
+    }
 }
 
 /// Whether `value` looks like a URL for open-redirect purposes.
@@ -147,113 +185,55 @@ fn body_bytes(body: &Body) -> Option<&[u8]> {
     }
 }
 
-/// Split `input` on `sep`, trim each entry, and parse `k=v` pairs. Entries
-/// without a `=` are skipped; empty keys are skipped.
-fn parse_pairs(input: &str, sep: char) -> Vec<(String, String)> {
+/// Parse an `application/x-www-form-urlencoded` string (a query string or a form
+/// body) into decoded `name`/`value` pairs, the way a browser encodes one: `%xx`
+/// is decoded and `+` is a space. Empty names are skipped and the count is
+/// capped at [`MAX_POINTS_PER_FLOW`].
+fn form_pairs(input: &str) -> Vec<(String, String)> {
+    url::form_urlencoded::parse(input.as_bytes())
+        .filter(|(name, _)| !name.is_empty())
+        .take(MAX_POINTS_PER_FLOW)
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect()
+}
+
+/// Split a `Cookie` header into its `name=value` pairs. Cookie values are not
+/// form-encoded, so they are taken verbatim; entries without a `=`, and empty
+/// names, are skipped.
+fn cookie_pairs(input: &str) -> Vec<(String, String)> {
     input
-        .split(sep)
+        .split(';')
         .filter_map(|pair| {
-            let pair = pair.trim();
-            let (k, v) = pair.split_once('=')?;
+            let (k, v) = pair.trim().split_once('=')?;
             let k = k.trim();
             if k.is_empty() {
                 return None;
             }
             Some((k.to_string(), v.trim().to_string()))
         })
+        .take(MAX_POINTS_PER_FLOW)
         .collect()
 }
 
-/// Extract the top-level string-valued keys from a flat JSON object. Values that
-/// are strings are returned unquoted; other scalar values are returned as their
-/// raw token. Returns nothing for anything that is not a `{ ... }` object.
-fn parse_json_object(text: &str) -> Vec<(String, String)> {
-    let text = text.trim();
-    let inner = match text.strip_prefix('{').and_then(|t| t.strip_suffix('}')) {
-        Some(inner) => inner,
-        None => return Vec::new(),
+/// The **top-level** keys of a JSON object body, with scalar values rendered as
+/// text and nested values as their compact JSON. Anything that is not a JSON
+/// object (an array, a scalar, malformed bytes) yields nothing; a nested key is
+/// never reported as a top-level parameter.
+fn json_pairs(bytes: &[u8]) -> Vec<(String, String)> {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_slice::<serde_json::Value>(bytes)
+    else {
+        return Vec::new();
     };
-
-    let mut out = Vec::new();
-    let bytes = inner.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Skip whitespace and separators.
-        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
-            i += 1;
-        }
-        if i >= bytes.len() || bytes[i] != b'"' {
-            break;
-        }
-        // Parse the quoted key.
-        let (key, next) = match parse_json_string(bytes, i) {
-            Some(res) => res,
-            None => break,
-        };
-        i = next;
-        // Expect a colon.
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() || bytes[i] != b':' {
-            break;
-        }
-        i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        // Parse the value.
-        let (value, next) = if bytes[i] == b'"' {
-            match parse_json_string(bytes, i) {
-                Some(res) => res,
-                None => break,
-            }
-        } else {
-            // A scalar token up to the next comma / brace / whitespace.
-            let start = i;
-            while i < bytes.len() && bytes[i] != b',' {
-                i += 1;
-            }
-            (inner[start..i].trim().to_string(), i)
-        };
-        i = next;
-        out.push((key, value));
-    }
-    out
-}
-
-/// Parse a JSON string literal starting at `start` (which must be `"`). Returns
-/// the unescaped content and the index just past the closing quote.
-fn parse_json_string(bytes: &[u8], start: usize) -> Option<(String, usize)> {
-    debug_assert_eq!(bytes[start], b'"');
-    let mut i = start + 1;
-    let mut s = String::new();
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' => return Some((s, i + 1)),
-            b'\\' if i + 1 < bytes.len() => {
-                let esc = bytes[i + 1];
-                match esc {
-                    b'"' => s.push('"'),
-                    b'\\' => s.push('\\'),
-                    b'/' => s.push('/'),
-                    b'n' => s.push('\n'),
-                    b't' => s.push('\t'),
-                    b'r' => s.push('\r'),
-                    other => s.push(other as char),
-                }
-                i += 2;
-            }
-            other => {
-                s.push(other as char);
-                i += 1;
-            }
-        }
-    }
-    None
+    map.into_iter()
+        .take(MAX_POINTS_PER_FLOW)
+        .map(|(name, value)| {
+            let text = match value {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            };
+            (name, text)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -264,7 +244,7 @@ mod tests {
         InterceptState,
     };
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-    use std::time::SystemTime;
+    use std::time::{Instant, SystemTime};
 
     fn conn() -> ConnInfo {
         ConnInfo {
@@ -277,6 +257,10 @@ mod tests {
     }
 
     fn captured(path: &str, headers: HeaderMap) -> HttpFlow {
+        captured_body(path, headers, Body::Empty)
+    }
+
+    fn captured_body(path: &str, headers: HeaderMap, body: Body) -> HttpFlow {
         HttpFlow {
             id: FlowId::new(),
             request: HttpRequest {
@@ -286,7 +270,7 @@ mod tests {
                 path: path.into(),
                 version: HttpVersion::Http11,
                 headers,
-                body: Body::Empty,
+                body,
                 timestamp: SystemTime::now(),
             },
             response: None,
@@ -301,6 +285,14 @@ mod tests {
         points
             .iter()
             .any(|p| p.location == location && p.name == name)
+    }
+
+    fn example_of(points: &[InjectionPoint], location: Location, name: &str) -> String {
+        points
+            .iter()
+            .find(|p| p.location == location && p.name == name)
+            .map(|p| p.example.clone())
+            .unwrap_or_else(|| panic!("no {location:?} point named {name}: {points:?}"))
     }
 
     #[test]
@@ -334,6 +326,211 @@ mod tests {
             !has(&points, Location::Header, "Cookie"),
             "the Cookie header is not also emitted as a Header point"
         );
+    }
+
+    /// A browser percent-encodes a URL-valued parameter; the open-redirect
+    /// candidate must survive the encoding.
+    #[test]
+    fn enumerate_classifies_encoded_url_value_as_redirect() {
+        let flow = captured("/go?next=https%3A%2F%2Fevil.test%2Fpwn", HeaderMap::new());
+
+        let points = enumerate(&flow);
+
+        assert_eq!(points.len(), 1, "one point: {points:?}");
+        assert!(
+            has(&points, Location::Redirect, "next"),
+            "the decoded value is a URL, so the point is a redirect: {points:?}"
+        );
+        assert_eq!(
+            example_of(&points, Location::Redirect, "next"),
+            "https://evil.test/pwn",
+            "the example is the decoded value"
+        );
+    }
+
+    #[test]
+    fn enumerate_finds_form_body_params() {
+        let mut headers = HeaderMap::new();
+        headers.set("Content-Type", "application/x-www-form-urlencoded");
+        let flow = captured_body(
+            "/login",
+            headers,
+            Body::Bytes(b"user=alice&where=http%3A%2F%2Fx.test%2F&note=a+b".to_vec()),
+        );
+
+        let points = enumerate(&flow);
+
+        assert_eq!(points.len(), 4, "three body params + content-type header");
+        assert_eq!(example_of(&points, Location::BodyParam, "user"), "alice");
+        assert_eq!(example_of(&points, Location::BodyParam, "note"), "a b");
+        assert_eq!(
+            example_of(&points, Location::Redirect, "where"),
+            "http://x.test/"
+        );
+        assert!(
+            has(&points, Location::Header, "Content-Type"),
+            "the content-type header is a point too: {points:?}"
+        );
+    }
+
+    /// Only the top-level keys of a JSON object are parameters; a nested
+    /// object's keys are not.
+    #[test]
+    fn enumerate_reads_only_top_level_json_keys() {
+        let mut headers = HeaderMap::new();
+        headers.set("Content-Type", "application/json");
+        let flow = captured_body(
+            "/api",
+            headers,
+            Body::Bytes(
+                br#"{"user":{"id":1,"role":"admin"},"q":"a","n":3,"to":"https://x.test/"}"#
+                    .to_vec(),
+            ),
+        );
+
+        let points = enumerate(&flow);
+
+        assert!(has(&points, Location::BodyParam, "user"));
+        assert!(has(&points, Location::BodyParam, "q"));
+        assert!(has(&points, Location::BodyParam, "n"));
+        assert!(has(&points, Location::Redirect, "to"));
+        assert!(
+            !has(&points, Location::BodyParam, "role"),
+            "a nested key is not a top-level parameter: {points:?}"
+        );
+        assert!(
+            !has(&points, Location::BodyParam, "id"),
+            "a nested key is not a top-level parameter: {points:?}"
+        );
+        assert_eq!(example_of(&points, Location::BodyParam, "q"), "a");
+        assert_eq!(example_of(&points, Location::BodyParam, "n"), "3");
+        assert_eq!(
+            example_of(&points, Location::BodyParam, "user"),
+            r#"{"id":1,"role":"admin"}"#
+        );
+    }
+
+    #[test]
+    fn enumerate_ignores_a_malformed_json_body() {
+        let mut headers = HeaderMap::new();
+        headers.set("Content-Type", "application/json");
+        let flow = captured_body("/api", headers, Body::Bytes(b"{not json".to_vec()));
+
+        let points = enumerate(&flow);
+
+        assert!(
+            !points.iter().any(|p| p.location == Location::BodyParam),
+            "a malformed body yields no body params: {points:?}"
+        );
+    }
+
+    /// The anti-goal: an auth header must never come back as an example value.
+    #[test]
+    fn enumerate_redacts_secret_header() {
+        let mut headers = HeaderMap::new();
+        headers.set("Authorization", "Bearer abc123");
+        headers.set("X-Api-Key", "abc123");
+        headers.set("Accept", "text/html");
+        let flow = captured("/x", headers);
+
+        let points = enumerate(&flow);
+
+        assert_eq!(
+            example_of(&points, Location::Header, "Authorization"),
+            REDACTED
+        );
+        assert_eq!(example_of(&points, Location::Header, "X-Api-Key"), REDACTED);
+        assert_eq!(
+            example_of(&points, Location::Header, "Accept"),
+            "text/html",
+            "a non-secret header keeps its observed value"
+        );
+        assert!(
+            !points.iter().any(|p| p.example.contains("abc123")),
+            "the token leaked: {points:?}"
+        );
+    }
+
+    #[test]
+    fn enumerate_redacts_secret_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.set("Cookie", "session_token=abc123; theme=dark");
+        let flow = captured("/x?access_token=abc123", headers);
+
+        let points = enumerate(&flow);
+
+        assert_eq!(
+            example_of(&points, Location::Cookie, "session_token"),
+            REDACTED
+        );
+        assert_eq!(
+            example_of(&points, Location::Cookie, "theme"),
+            "dark",
+            "a non-secret cookie keeps its observed value"
+        );
+        assert_eq!(
+            example_of(&points, Location::Query, "access_token"),
+            REDACTED
+        );
+        assert!(
+            !points.iter().any(|p| p.example.contains("abc123")),
+            "the session value leaked: {points:?}"
+        );
+    }
+
+    /// A hostile body of a million parameters must be capped, and the dedupe
+    /// must not be quadratic.
+    #[test]
+    fn enumerate_caps_points_from_a_huge_body() {
+        let mut headers = HeaderMap::new();
+        headers.set("Content-Type", "application/x-www-form-urlencoded");
+        let mut body = String::new();
+        for i in 0..50_000 {
+            body.push_str(&format!("k{i}=v&"));
+        }
+        let flow = captured_body("/bulk", headers, Body::Bytes(body.into_bytes()));
+
+        let started = Instant::now();
+        let points = enumerate(&flow);
+        let elapsed = started.elapsed();
+
+        assert!(
+            points.len() <= MAX_POINTS_PER_FLOW,
+            "capped at {MAX_POINTS_PER_FLOW}, got {}",
+            points.len()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "enumerate took {elapsed:?} on 50k params"
+        );
+    }
+
+    #[test]
+    fn enumerate_deduplicates_repeated_names() {
+        let flow = captured("/x?q=1&q=2&q=3", HeaderMap::new());
+
+        let points = enumerate(&flow);
+
+        assert_eq!(
+            points.len(),
+            1,
+            "one point per (location, name): {points:?}"
+        );
+        assert_eq!(
+            example_of(&points, Location::Query, "q"),
+            "1",
+            "the first observed value is kept"
+        );
+    }
+
+    #[test]
+    fn location_tokens_are_stable() {
+        assert_eq!(Location::Query.as_str(), "query");
+        assert_eq!(Location::BodyParam.as_str(), "body_param");
+        assert_eq!(Location::Header.as_str(), "header");
+        assert_eq!(Location::Cookie.as_str(), "cookie");
+        assert_eq!(Location::PathSegment.as_str(), "path_segment");
+        assert_eq!(Location::Redirect.as_str(), "redirect");
     }
 
     #[test]

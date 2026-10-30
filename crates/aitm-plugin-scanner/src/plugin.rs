@@ -35,11 +35,25 @@ impl Plugin for ScannerPlugin {
 mod tests {
     use super::*;
     use crate::config::ScannerConfig;
-    use aitm_core::Plugin;
+    use aitm_core::{Plugin, Sensitivity};
 
     #[test]
     fn plugin_name_is_scanner() {
         let plugin = ScannerPlugin::new(ScannerConfig::default());
         assert_eq!(plugin.name(), "scanner");
+    }
+
+    /// Loading the plugin puts `scan.discover` on the registry at the `Write`
+    /// tier — the only hermetic proof that the command is reachable at all.
+    #[test]
+    fn plugin_registers_scan_discover() {
+        let mut reg = Registry::new();
+        reg.add_plugin(Box::new(ScannerPlugin::new(ScannerConfig::default())));
+
+        let cmd = reg
+            .command("scan.discover")
+            .expect("scan.discover is registered");
+        assert_eq!(cmd.name(), "scan.discover");
+        assert_eq!(cmd.sensitivity(), Sensitivity::Write);
     }
 }
