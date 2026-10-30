@@ -39,6 +39,8 @@ enum SnapshotScene: String, CaseIterable {
     case coreFailed = "core-failed"
     case coreLog = "core-log"
     case inspectWebSocket = "inspect-websocket"
+    case inspectL4 = "inspect-l4"
+    case inspectL4OutOfScope = "inspect-l4-oos"
 
     /// Task 8: a seeded embedded `CoreConnection` so the health dot and the
     /// core-log panel render without a live core (snapshots use fixtures).
@@ -185,6 +187,12 @@ enum SnapshotScene: String, CaseIterable {
             session.coreLogVisible = true
         case .inspectWebSocket:
             session.select(session.rows.first { $0.kind == .websocket }?.id)
+        case .inspectL4:
+            // The in-scope loopback capture: packet list, layer tree, craft editor.
+            session.select(session.rows.first { $0.kind == .l4 && $0.inScope }?.id)
+        case .inspectL4OutOfScope:
+            // The out-of-L4-scope session: dimmed, mutating actions disabled (AC9).
+            session.select(session.rows.first { $0.kind == .l4 && !$0.inScope }?.id)
         }
     }
 

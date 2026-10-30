@@ -7,6 +7,7 @@
 
 pub mod config_file;
 pub mod env;
+pub mod ingress;
 pub mod operator_token;
 pub mod render;
 pub mod scripts;

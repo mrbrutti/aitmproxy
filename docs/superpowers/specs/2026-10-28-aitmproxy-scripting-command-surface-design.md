@@ -60,7 +60,7 @@ All three verbs are added to the existing `ScriptCommands` plugin (`crates/aitm-
 **`script.save { name, source, enable?: bool }`:**
 - Writes `<scripts_dir>/<name>.rhai` with `source`, where `scripts_dir` is a new confined `RhaiConfig.scripts_dir` (opt-in; `None` → `script.save` refuses with "no scripts dir configured", like `poc.run` without `poc.dir`). `name` is validated to a single path segment (`[A-Za-z0-9_-]+`); any separator or `..` is rejected before touching disk.
 - Compiles before writing (reusing `validate_source`); a script that fails to compile is **not** written — the error is returned.
-- **Overwrite of an already-loaded script** (a loaded script with that `name`): the file is written, recompiled, and swapped into the live handle (`script.reload` semantics), so its updated **hooks** run immediately; `restart_required` is `false` unless the script registers commands/options (`registers` non-empty), which need a restart because the registry is sealed. **A brand-new name:** the file is written, compiled, validated and persisted, but the plugin chain is sealed once built, so its hooks cannot join this session — the result is `restart_required: true` and the script loads on the next start (the config loader appends every `*.rhai` in `scripts_dir` as an enabled entry). `enable` has a live effect only on the overwrite branch; a durable disabled state for a brand-new script is out of scope. The result carries `registers` + `restart_required: bool`.
+- The file is compiled, validated, and its **hooks become live immediately** — for a brand-new name as well as an overwrite — because the scripting tier dispatches through a single dynamic **`ScriptHost`** that owns a swappable set of loaded scripts (not a sealed per-script plugin chain; see the dynamic-script-host change below). **Overwrite of an already-loaded script** (a loaded script with that `name`) recompiles and swaps its live handle (`script.reload` semantics). **A brand-new name** is compiled into a `LoadedScript` and appended to that live set, so its `on_request` runs this session with no restart. The file is also persisted, so it loads on the next start too (the config loader appends every `*.rhai` in `scripts_dir` as an enabled entry). `restart_required` is `false` unless the script registers commands/options (`registers` non-empty): those still need a restart, because the command/option `Registry` is sealed once built — a new script's `load(reg)` does not run this session. `enable` sets the new/overwritten script's live enabled flag. The result carries `registers` + `restart_required: bool`.
 - Overwriting an existing `<name>.rhai` is allowed (it is the editor's Save); the prior version's hooks are swapped out via the handle, same as `script.reload`.
 - **Result:** `{ name, path, api, hooks, registers, restart_required }`.
 - **Mutating; operator-gated** (see Security).
@@ -89,7 +89,7 @@ Observable via `cargo test` (integration tests load/validate/save/toggle test sc
 1. **AC1 — `script.list`:** With two scripts loaded, `script.list` returns both with correct `name`, `path`, `api`, `hooks`, `enabled: true`, `last_error: null`; a script whose hook raised an error reports that error in `last_error`.
 2. **AC2 — validate by source:** `script.validate { source }` compiles a valid string and returns `{ name, api, hooks, registers }`; a syntax error returns the positioned compile error; neither-or-both of `path`/`source` is a clear argument error.
 3. **AC3 — `registers` field:** a script whose `load` calls `reg.add_command`/`reg.add_option` reports those in `registers`; a hook-only script reports empty `registers`.
-4. **AC4 — `script.save` writes + loads hooks:** `script.save { name, source }` writes `<scripts_dir>/<name>.rhai`. An **overwrite-save of an already-loaded script** runs its updated `on_request` with no restart (handle swap, reload semantics); a **brand-new script name** is written, compiled, validated and persisted and returns `restart_required: true` — its hooks join on the next start (the same sealed-chain limitation accepted for newly-registered commands/options, Open Question 1). A non-compiling `source` is refused and **no file is written**.
+4. **AC4 — `script.save` writes + loads hooks live:** `script.save { name, source }` writes `<scripts_dir>/<name>.rhai`, and the script's `on_request` then runs against an echo server with **no restart** — for a **brand-new script name** (appended to the live `ScriptHost` set) as well as an **overwrite-save of an already-loaded script** (handle swap, reload semantics). `restart_required` is `true` only when the script registers commands/options (those are sealed; the hooks are live regardless). A non-compiling `source` is refused and **no file is written**.
 5. **AC5 — save confinement:** `script.save` with a `name` containing `/`, `..`, or other separators is rejected before any write; with no `scripts_dir` configured it refuses clearly.
 6. **AC6 — restart signalled:** `script.save` of a script that registers a command returns `restart_required: true`; its hooks still load.
 7. **AC7 — enable/disable:** `script.disable { name }` stops that script's hooks firing (observable: its mutation no longer applies); `script.enable` restores them; unknown name errors clearly.
@@ -110,5 +110,28 @@ Observable via `cargo test` (integration tests load/validate/save/toggle test sc
 
 Resolved at approval (2026-10-28, Matt):
 
-1. **Hot command/option registration** → **accepted** the sealed-registry limitation: hooks load/reload live; a newly-saved script's commands/options need a restart, signalled by `restart_required`. Hot-registration is deferred (matches UI-spec OQ3).
+1. **Hot command/option registration** → **accepted** the sealed-registry limitation for commands/options only: a newly-saved script's commands/options need a restart, signalled by `restart_required`. Hot command/option registration is deferred (matches UI-spec OQ3). **Hooks, by contrast, load/reload/append live** — including for a brand-new `script.save` — via the dynamic `ScriptHost` (see below); the earlier interim position that a new script's hooks also needed a restart is superseded.
+
 2. **`scripts.allow_agent_authoring` default** → **off**, mirroring `ca.allow_agent_install`.
+
+### Dynamic script-host (delivered after F8's base, same PR series)
+
+The scripting tier dispatches through one `ScriptHost` plugin that owns an
+`ArcSwap<Vec<Arc<LoadedScript>>>` set and iterates it per event in chain order,
+rather than registering one sealed `ScriptPlugin` per script. `script.save` of a
+brand-new name appends a compiled `LoadedScript` to that set (copy-on-write,
+check-and-append atomic so two concurrent saves of one new name cannot double
+it), so its hooks fire on the next event with no restart. This changes only
+`aitm-plugin-rhai` (no `aitm-core` edits) and preserves chain order (new script
+appended last), the per-handle `enabled` flag, the shared `ErrorSink`,
+`script.reload`'s AST swap, and per-hook error isolation. The command/option
+`Registry` seal is unchanged — which is why commands/options a new script
+registers still need a restart.
+
+**Documented-accept — no cap on live-appended scripts.** `script.save` does not
+bound how many scripts may be appended to the live set. Accepted: the caller is
+an authorized actor (operator, or an agent only under `rhai.allow_agent_authoring`
++ a `Sensitive`-permitting policy), and the same actor can already write
+unbounded `.rhai` files that load at the next start; a live append is no larger a
+resource than that restart-time load. A configurable cap can be added later if an
+abuse case appears.

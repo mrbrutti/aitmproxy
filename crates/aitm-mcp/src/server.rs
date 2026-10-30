@@ -1795,7 +1795,26 @@ fn is_secret_key(key: &str) -> bool {
 /// flag, dry-run, and audit) instead of pre-empting it (spec D2, "runs iff its
 /// config gate is on"). Any other Sensitive command is refused by the policy gate.
 fn defers_to_command_gate(name: &str) -> bool {
-    matches!(name, "ca.install" | "ca.uninstall" | "scope.add")
+    matches!(
+        name,
+        "ca.install"
+            | "ca.uninstall"
+            | "scope.add"
+            // The L4 Sensitive verbs each carry a per-capability agent gate
+            // (`l4.allow_agent_*`, surfaced as the Mcp-only `L4AgentGate` wrapper and,
+            // for widen, inside `l4.scope.add`): under `All` the call is deferred to
+            // the command, which runs iff its flag is on — the two dimensions (policy
+            // + per-capability flag) stay independent. `l4.agent.set` is deliberately
+            // excluded (operator-only; the agent can never flip its own gates).
+            | "l4.scope.add"
+            | "l4.capture.start"
+            | "l4.inject"
+            | "l4.send_recv"
+            | "l4.intercept.start"
+            | "l4.intercept.mutate"
+            | "l4.intercept.forward"
+            | "l4.intercept.drop"
+    )
 }
 
 /// Whether `name` is an operator/CLI-only command the agent can never run — so it
@@ -1804,7 +1823,7 @@ fn defers_to_command_gate(name: &str) -> bool {
 /// `agent.approve` is also intercepted before the policy gate; this keeps `agent.set`
 /// (and any future operator-only Sensitive command) from being parked.
 fn is_operator_only(name: &str) -> bool {
-    matches!(name, "agent.set" | "agent.approve")
+    matches!(name, "agent.set" | "agent.approve" | "l4.agent.set")
 }
 
 /// The agent-policy gate's decision for one command (spec D2/D4).

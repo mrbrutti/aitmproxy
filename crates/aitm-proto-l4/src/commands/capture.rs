@@ -18,7 +18,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aitm_core::{Command, CommandHost, ParamDef, ParamSchema, Params, TypeDesc, Value};
+use aitm_core::{
+    Command, CommandHost, ParamDef, ParamSchema, Params, Sensitivity, TypeDesc, Value,
+};
 
 use crate::backend::CaptureInjectBackend;
 use crate::capture::{start_capture, CaptureParams, CaptureRegistry};
@@ -55,6 +57,11 @@ impl CaptureStart {
 impl Command for CaptureStart {
     fn name(&self) -> &str {
         "l4.capture.start"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        // Promiscuous/privileged capture — stronger than L7 passive observation.
+        Sensitivity::Sensitive
     }
 
     fn schema(&self) -> ParamSchema {
@@ -126,6 +133,11 @@ impl Command for CaptureStop {
         "l4.capture.stop"
     }
 
+    fn sensitivity(&self) -> Sensitivity {
+        // Stops a session the operator started; mutating but no wire effect.
+        Sensitivity::Write
+    }
+
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description:
@@ -163,6 +175,10 @@ impl CaptureStatus {
 impl Command for CaptureStatus {
     fn name(&self) -> &str {
         "l4.capture.status"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
     }
 
     fn schema(&self) -> ParamSchema {
