@@ -42,26 +42,31 @@
     <h1 class="display"><span class="line"><span>Intercept anything&nbsp;—</span></span><span class="line"><span>by&nbsp;hand or by&nbsp;agent.</span></span></h1>
     <p class="lead">aitmproxy captures, intercepts, edits, replays and reproduces HTTP and WebSocket traffic. One core, driven completely by an operator or by an AI assistant: the same commands over the CLI, the GUI and MCP.</p>
 
-    <div class="wire" role="img" aria-label="A request travelling from a client toward a server is held in mid-air by aitmproxy, where its body has been edited.">
-      <span class="wire-end wire-end--client" aria-hidden="true">client</span>
-      <span class="wire-seg wire-seg--in" aria-hidden="true"><span class="packet-track"><span class="packet"></span></span></span>
-
-      <div class="held" aria-hidden="true" data-state="armed">
-        <div class="held-head">
+    <div class="weave" role="img" aria-label="A request is pulled off the wire into aitmproxy, where it is rebuilt, edited and sent back on in a changed form, while other traffic flows past untouched.">
+      <span class="node node--client" aria-hidden="true"><span class="node-label">client</span></span>
+      <span class="node node--server" aria-hidden="true"><span class="node-label">server</span></span>
+      <div class="weave-panel" aria-hidden="true" data-state="armed" data-ui>
+        <div class="wp-head flow-row" style="--i:0">
           <span class="id">#41</span>
-          <span class="method">POST</span>
+          <span class="m m-post">POST</span>
           <span class="path">/api/cart/items</span>
           <span class="state">armed</span>
         </div>
-<pre class="held-body"><span class="h">host:</span> shop.example.com
-<span class="h">content-type:</span> application/json
-<span class="h">authorization:</span> Bearer eyJhbGciOiJIUzI1NiJ9…
-
-{ "sku": "A-1042", "qty": <span class="edit">999</span> }</pre>
+        <div class="wp-body">
+          <div class="flow-row" style="--i:1"><span class="h">host:</span> shop.example.com</div>
+          <div class="flow-row" style="--i:2"><span class="h">content-type:</span> application/json</div>
+          <div class="flow-row" style="--i:3"><span class="h">authorization:</span> Bearer eyJhbGciOiJIUzI1NiJ9…</div>
+          <div class="flow-row" style="--i:4">&nbsp;</div>
+          <div class="flow-row" style="--i:5">{ "sku": "A-1042", "qty": <span class="edit">999</span> }</div>
+        </div>
+        <div class="wp-bar flow-row" style="--i:6">
+          <span class="dot" aria-hidden="true"></span>
+          <span class="wp-bar-label">held · <code>127.0.0.1:8080</code></span>
+          <span class="spacer"></span>
+          <span class="wp-act wp-act--go">Resume</span>
+          <span class="wp-act wp-act--kill">Kill</span>
+        </div>
       </div>
-
-      <span class="wire-seg wire-seg--out" aria-hidden="true"><span class="packet-track"><span class="packet"></span></span></span>
-      <span class="wire-end wire-end--server" aria-hidden="true">server</span>
     </div>
 
     <div class="operators">
@@ -484,6 +489,6 @@ content-type: application/json
 
 <script src="intro.js"></script>
 <script src="site.js"></script>
-<script src="wire.js"></script>
+<script src="weave.js"></script>
 </body>
 </html>

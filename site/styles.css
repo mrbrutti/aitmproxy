@@ -205,9 +205,9 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
 .audit-wrap { overflow-x: auto; }
 
 /* ---------- hero: the wire ---------- */
-.hero { padding-top: clamp(2.25rem, 4.5vw, 3.75rem); padding-bottom: clamp(2.5rem, 5vw, 4rem); overflow: hidden; }
-.hero .display { text-wrap: wrap; max-width: 20ch; }
-.hero .lead { margin-top: 1.25rem; }
+.hero { padding-top: clamp(2.25rem, 4.5vw, 3.75rem); padding-bottom: clamp(3rem, 6vw, 5rem); overflow: clip; }
+.hero .display { text-wrap: wrap; max-width: 17ch; font-size: clamp(2.25rem, 1.1rem + 4.6vw, 4.5rem); line-height: 0.96; letter-spacing: -0.03em; }
+.hero .lead { margin-top: clamp(1.1rem, 2vw, 1.5rem); max-width: 48ch; }
 
 /* hero entrance: lines rise, the sentence fades up, the wire draws itself (wire.js),
    and only then the operators and the actions arrive — one cadence, once */
@@ -222,111 +222,66 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
 @keyframes fade-up { from { opacity: 0; translate: 0 12px; } }
 @keyframes word-in { from { opacity: 0; translate: 0 3px; } }
 
-.wire { position: relative; display: flex; align-items: center; margin-top: clamp(2rem, 4vw, 3.25rem); margin-inline: calc(-1 * var(--margin)); --wire-pad: 72px; }
-.wire-end { flex: none; padding-inline: var(--margin) 1rem; font-style: italic; font-size: var(--fs-small); color: var(--ink-2); }
-.wire-end--server { padding-inline: 1rem var(--margin); }
-.wire-seg { position: relative; flex: 1 1 0; height: 2px; background: var(--ink); min-width: 2rem; transform-origin: 0 50%; }
-.wire-seg--out { transform-origin: 100% 50%; }
-.wire-seg--in::after, .wire-seg--out::before {
-  content: ""; position: absolute; top: 50%; width: 2px; height: 1.25rem; margin-top: -0.625rem;
-  background: var(--signal); opacity: 0;
-}
-.wire-seg--in::after { right: 0; }
-.wire-seg--out::before { left: 0; }
-.packet-track { position: absolute; inset: 0; transform: translateX(-100%); }
-.packet { position: absolute; right: -6px; top: 50%; width: 12px; height: 12px; margin-top: -6px; border-radius: 50%; background: var(--ink); }
-
-/* the light layer: wire.js draws the comet, its trail, the blooms and the gather here.
-   Decorative only; the DOM underneath is the scene's source of truth. */
-.wire-canvas {
-  position: absolute; z-index: 2; pointer-events: none;
-  left: calc(-1 * var(--wire-pad)); top: calc(-1 * var(--wire-pad));
-  width: calc(100% + 2 * var(--wire-pad)); height: calc(100% + 2 * var(--wire-pad));
-}
-
-.held { flex: 0 1 auto; width: min(36rem, 56vw); margin-inline: 1.5rem; font-family: var(--mono); font-size: var(--fs-mono); line-height: 1.55; }
-.held-head { display: flex; align-items: baseline; gap: 1rem; padding-bottom: 0.45rem; margin-bottom: 0.45rem; border-bottom: 1px solid var(--hairline); }
-.held-head .id { color: var(--ink-2); }
-.held-head .method { font-weight: 600; }
-.held-head .path { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.state { position: relative; display: inline-block; padding: 0 0.45em; border: 1px solid var(--hairline); border-radius: var(--radius); line-height: 1.5; isolation: isolate; }
-.state::before { content: ""; position: absolute; inset: -1px; background: var(--signal); border-radius: var(--radius); opacity: 0; z-index: -1; }
-.held-body { margin: 0; white-space: pre; overflow-x: auto; }
-.held-body .h { color: var(--ink-2); }
-.held-body .edit { background: var(--signal); padding: 0 0.15em; border-radius: 2px; }
-
-/* ---- the hero wire: a live, looping scene (wire.js sets data-phase on .wire) ----
-   intro: the wire draws itself and the comet ignites the held flow (first run only)
-   then: arrive → held & armed (amber) → edited → resume → 200 (green) → idle → loop.
-   Without JS there is no data-phase and the scene rests at its end state: held, armed. */
-
-/* intro: the segments grow from their ends (wire.js scales them per frame), the held flow
-   and the labels are not there yet; they gather when the comet lands */
-.wire[data-phase="intro"] .wire-seg { transform: scaleX(0); }
-/* before wire.js has taken over (html.js is set inline, the script arrives a moment later) the
-   wire waits unseen — but only for 2.4s: these animations then show it on their own, so a
-   script that never arrives can never leave it hidden */
-@media (prefers-reduced-motion: no-preference) {
-  .js .hero .wire:not([data-phase]) .wire-seg { animation: seg-wait 1ms linear 2400ms both; }
-  .js .hero .wire:not([data-phase]) .held { animation: held-wait 600ms var(--ease-out) 2400ms both; }
-  .js .hero .wire:not([data-phase]) .wire-end { animation: fade-in 600ms var(--ease-out) 2400ms both; }
-}
-@keyframes seg-wait { from { transform: scaleX(0); } to { transform: none; } }
-@keyframes held-wait { from { opacity: 0; translate: 0 10px; filter: blur(8px); } }
+/* ---- the hero weave: the interceptor panel on the wire, over a field of plasma
+   (other traffic we are not touching). weave.js sets data-phase on .weave and draws the
+   plasma strands, their packets, the travelling request and its light; the DOM panel builds
+   and holds the readable request. Without JS, or under reduced motion, the panel rests
+   built and armed. ---- */
 @keyframes fade-in { from { opacity: 0; } }
-.held { opacity: 1; translate: 0 0; filter: blur(0); transition: opacity 720ms var(--ease-out), translate 720ms var(--ease-out), filter 720ms var(--ease-out); }
-.wire[data-phase="intro"] .held { opacity: 0; translate: 0 10px; filter: blur(8px); }
-.wire-end { transition: opacity 600ms var(--ease-out); }
-.wire[data-phase="intro"] .wire-end { opacity: 0; }
 
-/* the CSS packet: the fallback when the canvas is not there (wire.js hides it otherwise).
-   It carries a glow and a short tail while it moves. */
-.wire-seg .packet-track { --p: -100%; transform: translateX(var(--p)); }
-.wire[data-phase="arrive"] .wire-seg--in .packet-track,
-.wire[data-phase="resume"] .wire-seg--out .packet-track { transition: transform 1100ms var(--ease-in-out); }
-.packet { opacity: 0; transition: opacity 240ms var(--ease-out); box-shadow: 0 0 12px color-mix(in srgb, var(--accent) 70%, transparent); }
-.packet::before {
-  content: ""; position: absolute; right: 100%; top: 50%; width: 3rem; height: 2px; margin-top: -1px;
-  background: linear-gradient(90deg, transparent, var(--accent)); opacity: 0; transition: opacity 300ms var(--ease-out);
+/* the canvas light + plasma layer */
+.scene-canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; z-index: 1; pointer-events: none; }
+
+/* the field band: full-bleed, tall enough for the plasma depth + the panel */
+.weave {
+  position: relative; z-index: 2;
+  width: 100vw; margin-inline: calc(50% - 50vw);
+  margin-block: clamp(2rem, 5vw, 3.5rem);
+  height: clamp(320px, 48vh, 480px);
 }
-.wire[data-phase="arrive"] .wire-seg--in .packet::before, .wire[data-phase="resume"] .wire-seg--out .packet::before { opacity: 0.85; }
-.wire[data-canvas] .packet { display: none; }
-.wire[data-phase="arrive"] .wire-seg--in .packet, .wire[data-phase="held"] .wire-seg--in .packet,
-.wire:not([data-phase]) .wire-seg--in .packet { opacity: 1; }
-.wire[data-phase="arrive"] .wire-seg--in .packet-track, .wire[data-phase="held"] .wire-seg--in .packet-track,
-.wire[data-phase="resume"] .wire-seg--in .packet-track, .wire[data-phase="done"] .wire-seg--in .packet-track,
-.wire:not([data-phase]) .wire-seg--in .packet-track { --p: 0; }
-.wire[data-phase="resume"] .wire-seg--out .packet, .wire[data-phase="done"] .wire-seg--out .packet { opacity: 1; }
-.wire[data-phase="resume"] .wire-seg--out .packet-track, .wire[data-phase="done"] .wire-seg--out .packet-track { --p: 0; }
-.wire[data-phase="held"] .wire-seg--in .packet { box-shadow: 0 0 14px color-mix(in srgb, var(--signal) 80%, transparent); }
+.weave .node { position: absolute; top: 50%; transform: translateY(-50%); font-style: italic; font-size: var(--fs-small); color: var(--ink-2); z-index: 2; }
+.weave .node--client { left: var(--margin); }
+.weave .node--server { right: var(--margin); }
 
-/* the amber arm ticks flank the cut while the flow is held: they pop in, then fade */
-.wire-seg--in::after, .wire-seg--out::before { opacity: 0; transform: scale(0.2); transition: opacity 280ms var(--ease-out), transform 460ms var(--ease-out); }
-.wire[data-phase="held"] .wire-seg--in::after, .wire[data-phase="held"] .wire-seg--out::before,
-.wire:not([data-phase]) .wire-seg--in::after, .wire:not([data-phase]) .wire-seg--out::before { opacity: 1; transform: none; }
+/* the interceptor: the flow-viewer panel, centred on the wire (its own product chrome) */
+.weave-panel {
+  position: absolute; left: 50%; top: 50%; z-index: 3; transform: translate(-50%, -50%);
+  width: min(36rem, 62vw);
+  background: var(--paper); border: 1px solid var(--hairline); border-radius: var(--radius-panel);
+  box-shadow: var(--shadow-float);
+  font-family: var(--mono); font-size: var(--fs-mono); line-height: 1.55; overflow: hidden;
+}
+.wp-head { display: flex; align-items: baseline; gap: 0.7rem; padding: 0.6rem 0.9rem; border-bottom: 1px solid var(--hairline); }
+.wp-head .id { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.wp-head .path { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wp-head .state { position: relative; display: inline-block; padding: 0 0.42em; border: 1px solid var(--hairline); border-radius: var(--radius-badge); line-height: 1.5; font-weight: 500; transition: color 320ms var(--ease-out), border-color 320ms var(--ease-out), background 320ms var(--ease-out); }
+.weave-panel[data-state="building"] .state { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+.weave-panel[data-state="armed"] .state { color: var(--signal-ink); background: var(--signal); border-color: var(--signal); }
+.weave-panel[data-state="resuming"] .state { color: var(--signal-deep); border-color: color-mix(in srgb, var(--signal) 55%, transparent); }
+.weave-panel[data-state="done"] .state { color: var(--st-ok); border-color: color-mix(in srgb, var(--st-ok) 45%, transparent); }
+.wp-body { padding: 0.85rem 0.95rem; }
+.wp-body .flow-row { white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+.wp-body .h { color: var(--ink-2); }
+.wp-body .edit { background: var(--signal); color: var(--signal-ink); padding: 0 0.15em; border-radius: 2px; }
+.wp-bar { display: flex; align-items: center; gap: 0.7rem; padding: 0.5rem 0.9rem; border-top: 1px solid var(--hairline); background: var(--paper-2); font-family: var(--serif); font-size: var(--fs-small); color: var(--ink-2); }
+.wp-bar .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--signal); flex: none; }
+.wp-bar code { font-size: var(--fs-mono-s); color: var(--ink-2); }
+.wp-bar .spacer { flex: 1; }
+.wp-act { font-weight: 500; color: var(--ink); padding: 0.12rem 0.55rem; border: 1px solid var(--control); border-radius: var(--radius-badge); }
+.wp-act--go { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
+.wp-act--kill { color: var(--st-err); border-color: color-mix(in srgb, var(--st-err) 40%, var(--hairline)); }
 
-/* the held flow's state badge: — → armed (amber) → resuming (blue) → 200 (green) */
-.held .state { transition: color 320ms var(--ease-out), border-color 320ms var(--ease-out); }
-.held .state[data-cue="swap"] { animation: word-in 240ms var(--ease-out); }
-.held .state::before { opacity: 0; transition: opacity 320ms var(--ease-out); }
-.held[data-state="armed"] .state::before { opacity: 1; background: var(--signal); }
-.held[data-state="resuming"] .state { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
-.held[data-state="done"]  .state { color: var(--st-ok); border-color: color-mix(in srgb, var(--st-ok) 45%, transparent); }
-/* the head's rule warms while the flow is held */
-.held-head { transition: border-color 480ms var(--ease-out); }
-.held[data-state="armed"] .held-head { border-color: color-mix(in srgb, var(--signal) 55%, var(--hairline)); }
-.held[data-state="resuming"] .held-head { border-color: color-mix(in srgb, var(--accent) 40%, var(--hairline)); }
-.held[data-state="done"] .held-head { border-color: color-mix(in srgb, var(--st-ok) 45%, var(--hairline)); }
-/* the edited value lights only while the flow is held, and blooms once as the edit lands */
-.held .edit { background: transparent; transition: background 320ms var(--ease-out); }
-.held[data-state="armed"] .edit { background: var(--signal); }
-.held[data-cue="edit"] .edit { animation: edit-bloom 760ms var(--ease-out); }
-@keyframes edit-bloom { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--signal) 60%, transparent); } 100% { box-shadow: 0 0 0 12px transparent; } }
-/* a live ring on the armed badge; one settling ring when it lands 200 */
-.held .state::after { content: ""; position: absolute; inset: -2px; border-radius: calc(var(--radius) + 2px); border: 1.5px solid var(--signal); opacity: 0; }
-.held[data-state="armed"] .state::after { animation: ring-badge 2000ms var(--ease-out) infinite; }
-.held[data-state="done"] .state::after { border-color: var(--st-ok); animation: ring-badge 900ms var(--ease-out) 1; }
-@keyframes ring-badge { 0% { opacity: .7; transform: scale(1); } 70% { opacity: 0; transform: scale(1.3); } 100% { opacity: 0; } }
+/* the build: the request assembles row by row when the packet lands, clears before the next */
+.flow-row { opacity: 0; transform: translateY(7px); }
+.weave[data-phase="build"] .flow-row { animation: wp-row-in 480ms var(--ease-out) calc(var(--i, 0) * 70ms) both; }
+.weave[data-phase="held"] .flow-row, .weave[data-phase="release"] .flow-row, .weave[data-phase="done"] .flow-row { opacity: 1; transform: none; }
+.weave[data-phase="arrive"] .flow-row, .weave[data-phase="idle"] .flow-row { opacity: 0; transform: translateY(7px); }
+@keyframes wp-row-in { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: none; } }
+.weave[data-phase="held"] .edit { animation: wp-edit-bloom 820ms var(--ease-out) 240ms; }
+@keyframes wp-edit-bloom { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--signal) 60%, transparent); } 100% { box-shadow: 0 0 0 11px transparent; } }
+
+/* no canvas / reduced motion: the panel rests built + armed */
+.weave:not([data-canvas]) .flow-row { opacity: 1; transform: none; }
 @keyframes ring-dot { 0% { opacity: .9; transform: scale(.6); } 100% { opacity: 0; transform: scale(1.9); } }
 
 /* the live dot on captions and the listening dot in fragment bars pulse — only while in view
@@ -658,7 +613,7 @@ html.intro-on.intro-reveal :is(.nav, main, .footer) { animation: fade-in 900ms v
     display: grid; gap: 0.75rem; position: absolute; right: 0; top: 2.5rem; z-index: 20;
     background: var(--paper); border: 1px solid var(--hairline); padding: 1rem 1.25rem; min-width: 12rem;
   }
-  .held { width: min(32rem, 54vw); }
+  .weave-panel { width: min(34rem, 72vw); }
   .operators { grid-template-columns: 1fr; }
   .life { grid-template-columns: 1fr; }
   .faces { grid-template-columns: 1fr; }
@@ -676,20 +631,10 @@ html.intro-on.intro-reveal :is(.nav, main, .footer) { animation: fade-in 900ms v
 }
 
 @media (max-width: 640px) {
-  .wire { flex-direction: column; align-items: stretch; margin-inline: 0; }
-  .wire-end { padding: 0 0 0.5rem; text-align: center; }
-  .wire-end--server { padding: 0.5rem 0 0; }
-  .wire-seg { flex: none; height: 4.5rem; width: 2px; margin-inline: auto; min-width: 0; transform-origin: 50% 0; }
-  .wire-seg--out { transform-origin: 50% 100%; }
-  .wire[data-phase="intro"] .wire-seg { transform: scaleY(0); }
-  .wire-seg--in::after, .wire-seg--out::before { width: 1.25rem; height: 2px; margin: 0 0 0 -0.625rem; top: auto; left: 50%; }
-  .wire-seg--in::after { bottom: 0; right: auto; }
-  .wire-seg--out::before { top: 0; }
-  .wire-seg .packet-track { transform: translateY(var(--p)); }
-  .packet { right: auto; top: auto; bottom: -6px; left: 50%; margin: 0 0 0 -6px; }
-  .packet::before { right: auto; top: auto; bottom: 100%; left: 50%; width: 2px; height: 3rem; margin: 0 0 0 -1px; background: linear-gradient(180deg, transparent, var(--accent)); }
-  .wire { --wire-pad: 48px; }
-  .held { width: 100%; margin-inline: 0; font-size: var(--fs-mono-s); }
+  .weave { height: auto; min-height: 220px; margin-inline: 0; width: auto; padding-block: 1.25rem; }
+  .weave .node { position: static; display: block; text-align: center; transform: none; }
+  .weave-panel { position: static; transform: none; width: 100%; margin: 1rem auto; font-size: var(--fs-mono-s); }
+  .weave .flow-row { opacity: 1; transform: none; }
   .operators { grid-template-columns: 1fr; }
   .operator code, .pair-row code { white-space: pre-wrap; word-break: break-word; }
   .hero-cta .cmd { margin-left: 0; width: 100%; }
@@ -718,13 +663,7 @@ html.intro-on.intro-reveal :is(.nav, main, .footer) { animation: fade-in 900ms v
 /* ---------- reduced motion: the scene rests at its end state; nothing loops, nothing travels ---------- */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.001ms !important; animation-delay: 0ms !important; transition-duration: 0.001ms !important; animation-iteration-count: 1 !important; }
-  .wire-seg, .held, .wire-end { transform: none !important; opacity: 1 !important; filter: none !important; translate: none !important; }
-  .wire-seg--in .packet-track { --p: 0; }
-  .wire-seg--in .packet { opacity: 1; box-shadow: none; }
-  .wire-seg--in .packet::before { display: none; }
-  .wire-seg--in::after, .wire-seg--out::before { opacity: 1; transform: none; }
-  .held .state::before { opacity: 1; background: var(--signal); }
-  .held .state::after, .live::after, .ui-bar .dot::after, .pulse::after { display: none; }
-  .held .edit { background: var(--signal); }
-  .wire-canvas { display: none; }
+  .weave-panel .flow-row { opacity: 1 !important; transform: none !important; }
+  .live::after, .ui-bar .dot::after, .pulse::after { display: none; }
+  .scene-canvas { display: none; }
 }
