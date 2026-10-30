@@ -235,6 +235,8 @@ name = "aitm-plugin-scanner"
 version = "0.1.0"
 dependencies = [
  "aitm-core",
+ "aitm-findings",
+ "aitm-poc",
  "anyhow",
  "futures",
  "serde_json",
