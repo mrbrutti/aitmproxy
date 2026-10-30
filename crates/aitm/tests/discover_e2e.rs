@@ -38,8 +38,8 @@ use std::time::{Duration, Instant};
 use aitm::wire::{assemble, Assembled};
 use aitm_browser::launch;
 use aitm_core::{
-    engine_may_reach_private, CommandHost, Config, HttpFlow, HttpRequest, Params, ProxyClient,
-    Registry, ScopeEntry, Value,
+    engine_may_reach_private, CommandHost, Config, HttpFlow, HttpRequest, McpTransport, Params,
+    ProxyClient, Registry, ScopeEntry, Value,
 };
 use aitm_plugin_scanner::{ScannerConfig, ScannerPlugin};
 use aitm_testtarget::{SeedMode, TestTarget};
@@ -80,12 +80,22 @@ async fn wait_listening(addr: SocketAddr) {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scan_discover_end_to_end() {
-    if !obscura_enabled() {
-        return;
-    }
+/// Everything one end-to-end scan needs: the vulnerable target, the proxy's
+/// store and guard, the launched engine, and the resolved `scan.discover`.
+struct ScanRig {
+    /// Held so the target keeps serving for the rig's lifetime.
+    _target: TestTarget,
+    target_url: String,
+    store: Arc<dyn aitm_core::FlowStore>,
+    guard: Arc<dyn aitm_core::ScopeRateGuard>,
+    driver: Arc<dyn aitm_core::BrowserDriver>,
+    cmd: Arc<dyn aitm_core::Command>,
+    /// The bus the web bridge relays into, built from the same shared services
+    /// (and the same engine) as `main` does for `aitm web`.
+    mcp: Arc<aitm_mcp::McpServer>,
+}
 
+async fn scan_rig() -> ScanRig {
     // The deliberately-vulnerable target, on its own loopback origin.
     let target = TestTarget::start(SeedMode::Vulnerable).await;
     let target_url = target.base_url().to_string();
@@ -112,12 +122,12 @@ async fn scan_discover_end_to_end() {
     let Assembled { proxy, ca, .. } = assemble(&cfg).expect("assemble the proxy");
     let store = proxy.store();
     let guard = proxy.guard();
+    let mut services = aitm::tui::services(&proxy, &cfg, None, aitm::tui::TuiLog::Off);
     let listen = cfg.browser.proxy_addr;
     tokio::spawn(async move {
         let _ = proxy.run_browser(listen).await;
     });
     wait_listening(listen).await;
-
     let driver = launch(&cfg.browser, ca.cert_path())
         .await
         .expect("launch obscura through the proxy");
@@ -131,15 +141,32 @@ async fn scan_discover_end_to_end() {
         .expect("scan.discover registered")
         .clone();
 
-    // `invoke` is synchronous and blocks on the crawl internally, so run it off
-    // the reactor via spawn_blocking while the multi-thread runtime turns the
-    // browser futures.
+    services.browser = Some(driver.clone());
+    let mcp = Arc::new(aitm::tui::server(&cfg, McpTransport::Stdio, &services));
+
+    ScanRig {
+        _target: target,
+        target_url,
+        store,
+        guard,
+        driver,
+        cmd,
+        mcp,
+    }
+}
+
+/// Run `scan.discover` against the rig's target once and return its result
+/// object. `invoke` is synchronous and blocks on the crawl internally, so it
+/// runs off the reactor via spawn_blocking while the multi-thread runtime turns
+/// the browser futures.
+async fn discover(rig: &ScanRig) -> std::collections::BTreeMap<String, Value> {
     let client: Arc<dyn ProxyClient> = Arc::new(UnusedClient);
     let result = tokio::task::spawn_blocking({
-        let store = store.clone();
-        let guard = guard.clone();
-        let driver = driver.clone();
-        let target_url = target_url.clone();
+        let store = rig.store.clone();
+        let guard = rig.guard.clone();
+        let driver = rig.driver.clone();
+        let cmd = rig.cmd.clone();
+        let target_url = rig.target_url.clone();
         move || {
             let host = CommandHost::new(
                 store.as_ref(),
@@ -153,10 +180,19 @@ async fn scan_discover_end_to_end() {
     .await
     .expect("scan.discover task")
     .expect("scan.discover succeeds");
-
     let Value::Object(result) = result else {
         panic!("scan.discover must return an object, got {result:?}");
     };
+    result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scan_discover_end_to_end() {
+    if !obscura_enabled() {
+        return;
+    }
+    let rig = scan_rig().await;
+    let result = discover(&rig).await;
     let Some(Value::Array(endpoints)) = result.get("endpoints") else {
         panic!("result must carry an endpoints array: {result:?}");
     };
@@ -193,4 +229,107 @@ async fn scan_discover_end_to_end() {
         has_query_q,
         "a query injection point named `q` must be discovered: {points:?}"
     );
+}
+
+/// The browser survives a scan: a second `scan.discover` in the same session
+/// must crawl as well as the first, not stop at `navigation_failed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scan_discover_twice_reuses_the_browser() {
+    if !obscura_enabled() {
+        return;
+    }
+    let rig = scan_rig().await;
+    for run in 1..=3 {
+        let result = discover(&rig).await;
+        eprintln!(
+            "run {run}: stopped_reason={:?} pages_crawled={:?}",
+            result.get("stopped_reason"),
+            result.get("pages_crawled")
+        );
+        assert_ne!(
+            result.get("stopped_reason"),
+            Some(&Value::Str("navigation_failed".into())),
+            "run {run} could not navigate: {result:?}"
+        );
+        let Some(Value::Array(endpoints)) = result.get("endpoints") else {
+            panic!("run {run}: no endpoints array: {result:?}");
+        };
+        assert!(
+            endpoints.len() > 1,
+            "run {run} crawled only {} endpoint(s): {result:?}",
+            endpoints.len()
+        );
+    }
+}
+
+/// `scan.discover` returns to a web-bridge client: the Scan panel drives it over
+/// the `/bus` WebSocket, so a long-running command's result must reach it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scan_discover_over_the_web_bridge_returns() {
+    use futures::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    use tokio_tungstenite::tungstenite::Message;
+
+    if !obscura_enabled() {
+        return;
+    }
+    let rig = scan_rig().await;
+    let operator = "b".repeat(64);
+    let state = Arc::new(aitm::web::WebState {
+        mcp: rig.mcp.clone(),
+        agent_token: "a".repeat(64),
+        operator_token: Some(operator.clone()),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let server = tokio::spawn(aitm::web::serve(listener, state));
+
+    let req = format!("ws://{addr}/bus")
+        .into_client_request()
+        .expect("request");
+    let (mut ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("connect");
+    let send = |v: serde_json::Value| Message::text(format!("{v}\n"));
+    ws.send(Message::text(format!(
+        "{}\n",
+        serde_json::json!({ "token": operator })
+    )))
+    .await
+    .expect("token");
+    ws.send(send(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+        "params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"aitm-web","version":"0"}}})))
+        .await
+        .expect("initialize");
+    ws.next().await.expect("initialize reply").expect("frame");
+
+    for run in 1..=2 {
+        let started = Instant::now();
+        ws.send(send(
+            serde_json::json!({"jsonrpc":"2.0","id":10 + run,"method":"tools/call",
+            "params":{"name":"scan.discover","arguments":{"target": rig.target_url}}}),
+        ))
+        .await
+        .expect("send scan");
+        let reply = tokio::time::timeout(Duration::from_secs(120), ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("run {run}: scan.discover never answered over the bridge"))
+            .expect("frame")
+            .expect("ws ok");
+        let text = reply.into_text().expect("text frame").to_string();
+        let v: serde_json::Value = serde_json::from_str(&text).expect("json reply");
+        eprintln!(
+            "bridge run {run}: {:?} in {:?}; stopped_reason={}",
+            v["id"],
+            started.elapsed(),
+            v["result"]["structuredContent"]["stopped_reason"]
+        );
+        let n = v["result"]["structuredContent"]["endpoints"]
+            .as_array()
+            .map_or(0, Vec::len);
+        assert!(n > 1, "run {run} reached only {n} endpoint(s): {text}");
+    }
+    server.abort();
 }
