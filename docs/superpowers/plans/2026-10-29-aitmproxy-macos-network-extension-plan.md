@@ -344,11 +344,24 @@ assert the macOS path routes through it (NE-AC3); no separate choke is added. Su
 
 - **Satisfies:** NE-AC8.
 - **Depends on:** Task 1, Task 11.
-- **Files:** `apps/mac/Extension/Sources/TransparentProxyProvider.swift` (modify).
-- **Change:** in `handleNewFlow`, exclude flows whose **source-app identity**
-  (audit-token signing identifier) is `aitm` or the embedded `obscura` (predicate
-  left to the builder within "not pid-based"); rely on wildcard rules already
-  excluding loopback (the bus, obscura↔core on 127.0.0.1).
+- **Files:** `apps/mac/Extension/Sources/TransparentProxyProvider.swift` (modify — the
+  two entry-point call sites) and `apps/mac/Extension/Sources/FlowHandoff.swift` (modify —
+  the `SelfExclusion` predicate, placed beside the sibling identity/auth helpers in the
+  same Extension target and testable from the DEBUG self-check; Files line expanded
+  2026-10-30 per the Task-12 spec-panel finding).
+- **Change:** in `handleNewFlow` **and** `handleNewUDPFlow`, exclude flows whose
+  **source app is signed by our Developer ID team** — the source-app **audit token**
+  resolved to a `SecCode` and checked against the team requirement (OU `995PCLM9KH`),
+  reusing Task 11's `PeerAuth.verifyPeer`. Keyed on the code signature, not pid and not a
+  guessed identifier string; rely on wildcard rules already excluding loopback (the bus,
+  obscura↔core on 127.0.0.1).
+- **Why by team code signature (security panel, 2026-10-30):** aitm and obscura are both
+  team-signed, so both are excluded regardless of their specific signing identifier — this
+  **eliminates** the self-DoS a guessed "aitm"/"obscura" string risked (a wrong guess would
+  silently self-capture and loop). It over-excludes any other `995PCLM9KH`-signed binary,
+  which in practice is only aitmproxy's own — acceptable; narrowing to aitm's full
+  designated requirement (spec D4 "aitm and obscura specifically") is a tracked GA-hardening
+  item. NE-AC8's live confirmation (zero self-/loopback flows) still happens at Task 18.
 - **Test / pass condition (Terminal panel, real Mac):** run a capture session with
   the core dialing upstream and obscura browsing; inspect the flow list and
   confirm **no** flow is attributed to `aitm` or `obscura` and no loopback flow
@@ -504,7 +517,22 @@ Kept by the main session during stage 6. One row per finding.
 | 14 | security, quality | Minor | `codesign … \| grep -v … \|\| true` swallows codesign's exit status; a failed restricted-entitlement sign still prints "installed (signed)" | fixed — new `cs()` wrapper aborts the build on codesign failure |
 | 14 | quality | Minor | "no sysex embedded" hint named `SIGN_IDENTITY`, but the code reads `NE_SIGN_IDENTITY` | fixed — hint corrected to `NE_SIGN_IDENTITY` |
 | 10 | quality | Minor | Deprecated `NENetworkRule(remoteNetwork:…)` init (macOS 15) emits a build warning; Task 10 says "not deprecated NWHostEndpoint" | fixed — switched to the non-deprecated `remoteNetworkEndpoint:` init; `swiftc` compiles clean (no warning) |
-| 10 | spec | Minor | `swiftc` build replaces the plan's `apps/mac/Extension/Aitmproxy.xcodeproj` (spec D6) | **pending Matt's ratification** — repo convention is "no Xcode project" (apps/mac/CLAUDE.md) and the Task-1 spike proved swiftc+manual codesign handles the `-systemextension` entitlement; recommend amending spec D6 to swiftc |
+| 10 | spec | Minor | `swiftc` build replaces the plan's `apps/mac/Extension/Aitmproxy.xcodeproj` (spec D6) | **accepted by Matt 2026-10-30** (via orchestrator) — repo is SwiftPM-only ("no Xcode project", apps/mac/CLAUDE.md) and the Task-1 spike proved swiftc + manual codesign handles the `-systemextension` entitlement on Xcode 27.1; spec D6 to be amended to swiftc |
+| 11 | spec, security, quality | n/a | **PASS panel 2026-10-30** — no Critical/Important; security signed off the code + model (NE-AC6/AC7). | — |
+| 11 | quality | Minor | `decodeCore` was stricter than its forward-compat doc (non-object payload tore the channel down) | fixed — accepts any single-key object as ignored |
+| 11 | quality | Minor | Unowned `TODO(tighten)` on the team-wide requirement | fixed — TODO now references the plan Review log / Task 11 hardening |
+| 11 | quality | Minor | ~680-line DEBUG self-check co-located in `FlowHandoff.swift` | noted in-code as deliberate (no separate test target; `#if DEBUG` excludes it from release); splitting tracked as cleanup |
+| 11 | security | Minor | Code requirement is team-wide (`OU=995PCLM9KH`), not aitm's full designated requirement | **accepted (hardening TODO)** — plan Task 11 specifies the team requirement; narrow to aitm's identifier before GA (TODO in code) |
+| 11 | security | Minor | Inherent `LOCAL_PEERTOKEN` TOCTOU (verified core passing its fd on) — outside threat model; pidversion defeats pid-reuse | **accepted** — confirm at Task 18 the real core passes no accepted fds to unverified children |
+| 11 | security | Minor | `claim()` can block the NE queue up to ~4s under a wedged (verified) core before fail-open | **accepted (low priority)** — bounded + self-gated; optional move off-queue / lower timeout as hardening |
+| 11 | security | Minor | No cap on concurrent claimed flows (threads/memory per flow in the root sysex) | **accepted (hardening TODO)** — add a soft cap (fail open past it) as a follow-up |
+| 11 | security | Minor (info) | `FD_CLOEXEC` set result ignored (no exec in the sysex today) | accepted — informational |
+| 11 | spec, security, quality | Minor | Live decoy/real-core round-trip + core-side rendezvous writer + scope-spec emitter not exercised here | **deferred by design** — live decoy run → Task 18; rendezvous writer + scope emitter are core-side follow-ups (flagged in code + PR #100) |
+| 12 | spec | Important | `SelfExclusion` added to `FlowHandoff.swift`, not named in Task 12's Files list (undeclared file) | fixed — Task 12 Files line expanded to declare `FlowHandoff.swift` (placement beside the sibling identity helpers, testable from the DEBUG self-check); no cross-task leak |
+| 12 | security | Important | Self-exclusion rested on *guessed* signing identifiers; a wrong/under-match silently self-captures → loop (self-DoS) | **FIXED (orchestrator override of the tracked-acceptance)** — re-hardened to check the source-app **audit token** against the team requirement (OU `995PCLM9KH`) via Task 11's `PeerAuth.verifyPeer`; aitm/obscura are both team-signed so the guess is eliminated. Security panel re-run for a clean sign-off |
+| 12 | security | Minor | Over-match: now excludes ANY `995PCLM9KH`-signed binary, broader than spec D4 "aitm/obscura specifically" | **accepted** — in practice the only team-signed binaries a user runs are aitmproxy's own; GA-narrowing uses the decoupled `SelfExclusion.selfRequirement` and MUST cover both aitm AND obscura designated requirements (next row) |
+| 12 | security (re-review) | Minor | Self-exclusion reused `PeerAuth.coreRequirement`; narrowing that to aitm-only at GA would silently stop excluding obscura → loop | **FIXED (pre-merge)** — gave self-exclusion its own `SelfExclusion.selfRequirement` constant, decoupled from the core-peer requirement, so the two GA-narrowings cannot entangle; obscura stays excluded. Security re-review verdict: **PASS / clean sign-off** |
+| 12 | security | Minor | No automated unit test for `isSelf` | **accepted** — it is now a `SecCode` call (needs a real process), not a pure predicate; live confirmation of zero self/loopback flows at Task 18 |
 
 ## Shipped
 
