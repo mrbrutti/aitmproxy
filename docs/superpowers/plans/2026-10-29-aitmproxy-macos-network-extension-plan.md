@@ -504,7 +504,7 @@ Kept by the main session during stage 6. One row per finding.
 | 14 | security, quality | Minor | `codesign … \| grep -v … \|\| true` swallows codesign's exit status; a failed restricted-entitlement sign still prints "installed (signed)" | fixed — new `cs()` wrapper aborts the build on codesign failure |
 | 14 | quality | Minor | "no sysex embedded" hint named `SIGN_IDENTITY`, but the code reads `NE_SIGN_IDENTITY` | fixed — hint corrected to `NE_SIGN_IDENTITY` |
 | 10 | quality | Minor | Deprecated `NENetworkRule(remoteNetwork:…)` init (macOS 15) emits a build warning; Task 10 says "not deprecated NWHostEndpoint" | fixed — switched to the non-deprecated `remoteNetworkEndpoint:` init; `swiftc` compiles clean (no warning) |
-| 10 | spec | Minor | `swiftc` build replaces the plan's `apps/mac/Extension/Aitmproxy.xcodeproj` (spec D6) | **pending Matt's ratification** — repo convention is "no Xcode project" (apps/mac/CLAUDE.md) and the Task-1 spike proved swiftc+manual codesign handles the `-systemextension` entitlement; recommend amending spec D6 to swiftc |
+| 10 | spec | Minor | `swiftc` build replaces the plan's `apps/mac/Extension/Aitmproxy.xcodeproj` (spec D6) | **accepted by Matt 2026-10-30** (via orchestrator) — repo is SwiftPM-only ("no Xcode project", apps/mac/CLAUDE.md) and the Task-1 spike proved swiftc + manual codesign handles the `-systemextension` entitlement on Xcode 27.1; spec D6 to be amended to swiftc |
 
 ## Shipped
 
