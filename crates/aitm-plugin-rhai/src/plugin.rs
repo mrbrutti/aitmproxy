@@ -294,7 +294,7 @@ impl LoadedScript {
     ) -> Result<(), Box<EvalAltResult>> {
         let options = (**self.options.load()).clone();
         blocking(|| {
-            let _run = begin_run(RunKind::Hook, self.budget.hook_timeout);
+            let _run = begin_run(RunKind::Hook, self.budget);
             let _active = ActiveFlow::enter(Arc::clone(state));
             self.engine
                 .call_fn_with_options::<Dynamic>(

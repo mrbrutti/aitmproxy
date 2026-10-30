@@ -340,6 +340,9 @@ struct RhaiFile {
     allow_agent_authoring: Option<bool>,
     /// Seconds a single hook may run before it is aborted.
     hook_timeout: Option<u64>,
+    /// Seconds a single `browser.*` host call may take (T9); a navigation
+    /// legitimately outlives a hook, so it has its own budget.
+    browser_timeout: Option<u64>,
     max_operations: Option<u64>,
     max_call_levels: Option<usize>,
     max_expr_depth: Option<usize>,
@@ -359,6 +362,7 @@ impl RhaiFile {
         }
         set(&mut r.allow_agent_authoring, self.allow_agent_authoring);
         set_secs(&mut r.hook_timeout, self.hook_timeout);
+        set_secs(&mut r.browser_timeout, self.browser_timeout);
         let l = &mut r.limits;
         set(&mut l.max_operations, self.max_operations);
         set(&mut l.max_call_levels, self.max_call_levels);

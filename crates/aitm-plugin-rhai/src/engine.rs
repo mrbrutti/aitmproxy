@@ -40,6 +40,8 @@ pub enum AbortKind {
     OpLimit,
     /// The hook ran past `hook_timeout` wall-clock.
     Timeout,
+    /// A `browser.*` host call ran past `browser_timeout` wall-clock (T9).
+    BrowserTimeout,
 }
 
 /// Which entry point is evaluating on this thread. Host functions consult it:
@@ -58,12 +60,15 @@ pub enum RunKind {
     PocStep,
 }
 
-/// The two budgets one run gets, as configured; the dispatchers hand it to
+/// The budgets one run gets, as configured: the operation cap, the hook
+/// wall-clock, and the wall-clock one `browser.*` host call may take (T9).
+/// The dispatchers open the run with it ([`begin_run`]) and hand it to
 /// [`crate::error::ScriptError::from_eval`] so an abort names the right number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budget {
     pub max_operations: u64,
     pub hook_timeout: Duration,
+    pub browser_timeout: Duration,
 }
 
 impl Budget {
@@ -71,6 +76,7 @@ impl Budget {
         Self {
             max_operations: cfg.limits.max_operations,
             hook_timeout: cfg.hook_timeout,
+            browser_timeout: cfg.browser_timeout,
         }
     }
 }
@@ -112,11 +118,15 @@ pub const WORKER_STACK_SIZE: usize = 64 * 1024 * 1024;
 /// How many strings the engine interns; the figure `Engine::new` uses.
 const MAX_STRINGS_INTERNED: usize = 1024;
 
-/// The run on this thread: what kind, and when its wall-clock budget ends.
+/// The run on this thread: what kind, when its wall-clock budget ends, and
+/// the two wall-clock figures it was opened with — the hook budget a browser
+/// call renews the deadline by, and the budget a browser call itself gets.
 #[derive(Debug, Clone, Copy)]
 struct Run {
     kind: RunKind,
     deadline: Instant,
+    hook_timeout: Duration,
+    browser_timeout: Duration,
 }
 
 thread_local! {
@@ -142,12 +152,16 @@ pub struct RunGuard {
     previous: Option<Run>,
 }
 
-/// Open a run of `kind` with `budget` of wall-clock from now. Every dispatcher
-/// (hook, `load`, command, PoC step) calls this before evaluating.
-pub fn begin_run(kind: RunKind, budget: Duration) -> RunGuard {
+/// Open a run of `kind` under `budget`: its deadline is `hook_timeout` from
+/// now, and its `browser_timeout` is what each `browser.*` host call gets.
+/// Every dispatcher (hook, `load`, command, PoC step) calls this before
+/// evaluating.
+pub fn begin_run(kind: RunKind, budget: Budget) -> RunGuard {
     let run = Run {
         kind,
-        deadline: Instant::now() + budget,
+        deadline: Instant::now() + budget.hook_timeout,
+        hook_timeout: budget.hook_timeout,
+        browser_timeout: budget.browser_timeout,
     };
     let previous = RUN.with(|cell| cell.replace(Some(run)));
     RunGuard { previous }
@@ -172,6 +186,28 @@ pub fn remaining_budget() -> Option<Duration> {
         cell.get()
             .map(|run| run.deadline.saturating_duration_since(Instant::now()))
     })
+}
+
+/// The wall-clock one `browser.*` host call may take in the current run
+/// (T9), or `None` outside any run. A per-call figure, not a remainder: each
+/// browser call gets the whole of it.
+pub fn browser_budget() -> Option<Duration> {
+    RUN.with(|cell| cell.get().map(|run| run.browser_timeout))
+}
+
+/// Push the current run's deadline out to at least one `hook_timeout` from
+/// now (never earlier than it already is). A completed `browser.*` call does
+/// this before returning, so the script's next operation is not aborted by
+/// `on_progress` merely because the browser took longer than the hook budget
+/// — the hook budget bounds the script's own work between host calls, and
+/// `browser_timeout` bounds each browser call. No-op outside a run.
+pub fn extend_deadline() {
+    RUN.with(|cell| {
+        if let Some(mut run) = cell.get() {
+            run.deadline = run.deadline.max(Instant::now() + run.hook_timeout);
+            cell.set(Some(run));
+        }
+    });
 }
 
 /// A fresh engine with every sandbox limit applied; the one engine shared by

@@ -34,6 +34,7 @@ rhai:
   strict: true
   allow_scope_add: true
   hook_timeout: 5
+  browser_timeout: 45
   max_operations: 500000
   max_string_size: 4096
 "#,
@@ -69,6 +70,11 @@ rhai:
         "the operator opted plugin scripts into scope.add"
     );
     assert_eq!(s.rhai.hook_timeout, Duration::from_secs(5));
+    assert_eq!(
+        s.rhai.browser_timeout,
+        Duration::from_secs(45),
+        "T9: the browser host-call budget is its own knob"
+    );
     assert_eq!(s.rhai.limits.max_operations, 500_000);
     assert_eq!(s.rhai.limits.max_string_size, 4096);
     assert_eq!(
@@ -93,6 +99,11 @@ fn absent_sections_keep_defaults() {
         "scripts may not widen the scope unless the operator says so"
     );
     assert_eq!(s.rhai.hook_timeout, Duration::from_secs(2));
+    assert_eq!(
+        s.rhai.browser_timeout,
+        Duration::from_secs(30),
+        "T9: a browser call gets 30s by default"
+    );
     assert_eq!(
         s.rhai.limits,
         aitm_plugin_rhai::RhaiLimits::default(),

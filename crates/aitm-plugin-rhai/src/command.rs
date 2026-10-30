@@ -82,7 +82,7 @@ impl Command for ScriptCommand {
         call_args.push(Dynamic::from_map(args_map(&args)));
 
         let result = blocking(|| {
-            let _run = begin_run(RunKind::Command, self.budget.hook_timeout);
+            let _run = begin_run(RunKind::Command, self.budget);
             self.engine.call_fn_with_options::<Dynamic>(
                 CallFnOptions::new().with_tag(self.options.clone()),
                 &mut Scope::new(),
@@ -158,7 +158,7 @@ impl<'a> ScriptRegHandle<'a> {
         let collector = RegCollector::default();
 
         blocking(|| {
-            let _run = begin_run(RunKind::Load, self.budget.hook_timeout);
+            let _run = begin_run(RunKind::Load, self.budget);
             engine.call_fn_with_options::<Dynamic>(
                 CallFnOptions::new().with_tag(self.options.clone()),
                 &mut Scope::new(),
