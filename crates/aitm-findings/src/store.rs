@@ -79,10 +79,15 @@ impl FindingStore for DiskFindingStore {
         if !valid_id(&r.id) {
             anyhow::bail!("invalid finding id `{}`", r.id);
         }
-        // Secrets never reach disk: redact the free-text fields (poc_ref/paths are
-        // references, not credential-bearing).
+        // Secrets never reach disk: redact every free-text and caller-controlled
+        // field with the shared scrubber. `target` is a URL that routinely carries
+        // query-string credentials (?api_key=, ?access_token=), and `client_label`
+        // is caller-supplied; both leaked verbatim before. poc_ref/paths are
+        // references, not credential-bearing.
         r.title = aitm_core::redact::scrub_text(&r.title);
         r.notes = r.notes.as_deref().map(aitm_core::redact::scrub_text);
+        r.target = aitm_core::redact::scrub_text(&r.target);
+        r.client_label = r.client_label.as_deref().map(aitm_core::redact::scrub_text);
 
         std::fs::create_dir_all(&self.dir)?;
         let stored = StoredRecord::from(&r);
