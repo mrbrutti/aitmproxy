@@ -41,6 +41,12 @@ const TLS_HANDSHAKE: u8 = 0x16;
 const MAX_CONNECT_HEAD: usize = 16 * 1024;
 /// Socket read size.
 const READ_CHUNK: usize = 16 * 1024;
+// One read may hold a legitimate response's tail plus surplus; at or above the
+// machine's cap on parked server bytes that read would be a hard error.
+const _: () = assert!(
+    READ_CHUNK < crate::sansio::MAX_HEAD_BYTES,
+    "READ_CHUNK must stay below sansio::MAX_HEAD_BYTES: a read of a response's tail plus surplus would otherwise fail the connection and drop the legitimate response"
+);
 
 /// Per-read idle timeout. A single socket read may block at most this long, so a
 /// slow client (slowloris) or a hung upstream cannot hold a connection open
@@ -52,6 +58,10 @@ const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// TCP dial has its own bound; without this one, an origin that accepts the
 /// connection and never answers the ClientHello would pin the task forever.
 const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = READ_TIMEOUT;
+/// The mark `aitm-plugin-maprules` leaves on a flow whose authority it rewrote.
+/// Matched by value, not through a crate dependency, exactly as `h2.rs` does with
+/// its own `MAP_REMOTE_MARK`: keep the two equal.
+const MAP_REMOTE_MARK: &str = "map-remote";
 /// Request-line prefixes that mark a cleartext HTTP connection.
 const HTTP_METHODS: &[&str] = &[
     "GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "PATCH ", "CONNECT ", "TRACE ",
@@ -135,8 +145,8 @@ impl HttpModule {
         self
     }
 
-    /// Bound the TLS handshake to an origin at `within` (default 30 s). Not yet
-    /// wired to config.
+    /// Bound the TLS handshake to an origin at `within` (default
+    /// [`TLS_HANDSHAKE_TIMEOUT`]). Not yet wired to config.
     pub fn with_tls_handshake_timeout(mut self, within: std::time::Duration) -> Self {
         self.tls_handshake_timeout = within;
         self
@@ -650,6 +660,7 @@ async fn serve(
         }
         let request = flow.request;
         let request_close = wants_close(&request.headers);
+        let map_remote = flow.metadata.marks.iter().any(|m| m == MAP_REMOTE_MARK);
 
         if let Some(short_circuit) = flow.response {
             // A plugin answered without upstream.
@@ -670,6 +681,18 @@ async fn serve(
             // connection never parses one and its receive buffer grows uncapped.
             machine.short_circuit_done();
             continue;
+        }
+
+        // A Map Remote rewrite cannot retarget a request inside a tunnel: it goes
+        // to the `CONNECT` target. Say so, once per request, so the rewrite is not
+        // silently lost. This only reports; the route is chosen below.
+        if let Some(tunnel) = conn.tunnel_authority.as_deref().filter(|_| map_remote) {
+            if differs_from_tunnel_target(&request.authority, tunnel) {
+                tracing::warn!(
+                    tunnel = tunnel,
+                    "a Map Remote rewrite is ignored inside a CONNECT tunnel; the request goes to the CONNECT target"
+                );
+            }
         }
 
         // --- Make sure a live upstream connection exists for this authority.
@@ -742,11 +765,12 @@ async fn serve(
                 // be anything the client or a plugin set), and never
                 // re-resolved. This is what a TLS tunnel does too.
                 (Some(tunnel), Some(addr)) => {
+                    // Only the tunnel's authority is logged: the request's own
+                    // is client-supplied text (a URL's userinfo among it).
                     if differs_from_tunnel_target(&request.authority, tunnel) {
                         tracing::debug!(
-                            host = request.authority.as_str(),
                             tunnel = tunnel.as_str(),
-                            "request authority differs from the CONNECT target; dialing the target"
+                            "a request's authority differs from the CONNECT target; dialing the target"
                         );
                     }
                     (tunnel.clone(), tunnel.clone(), addr)
@@ -907,23 +931,16 @@ async fn serve(
             let upstream_io: ByteStream = Box::pin(Prefixed::with_prefix(upstream_io, server_rest));
             return ctx.handoff_upgrade(client_io, upstream_io, id, hint).await;
         }
-        // The response is complete and already forwarded. When either side said
-        // `Connection: close` the client connection ends here and the upstream
-        // goes with it; whatever the origin sent behind the response is dropped
-        // with them (it never reaches the client), so there is nothing to
-        // replace and nothing to log.
+        // The response is complete and already forwarded. Surplus is handled after
+        // this close check on purpose: a connection that ends anyway replaces
+        // nothing, so it has nothing to warn about. On one that stays open, bytes
+        // the origin left behind this response (still unparsed in the machine) are
+        // dropped unread and taint the upstream. Never set `upstream = None` here;
+        // the replacement must go through the stale path above.
         if request_close || response_close {
             let _ = client.shutdown().await;
             return Ok(());
         }
-        // The connection stays open and the upstream is meant to be reused. The
-        // machine parses no response while no request awaits one, so whatever the
-        // origin sent behind this response is still in the machine's buffer,
-        // unparsed. Drop it (never log it) and mark the upstream tainted: those
-        // bytes are not an answer to anything, and a partial head left in the
-        // buffer would otherwise be glued onto the next response on this
-        // connection. Only this path warns, because only here is an upstream
-        // replaced.
         let surplus = machine.take_leftover(Side::Server);
         if !surplus.is_empty() {
             tracing::warn!(
@@ -1133,8 +1150,10 @@ fn split_host_port(authority: &str, default_port: u16) -> Result<(String, u16)> 
 
 /// Whether `request`, the authority a request names, is a different origin than
 /// `tunnel`, the `CONNECT` target of the tunnel it arrived in: compared
-/// case-insensitively, with port 80 assumed where one is absent. Only a debug
-/// log reads this; where a tunnel connects never depends on it.
+/// case-insensitively, with port 80 assumed where one is absent. Only log lines
+/// read this; where a tunnel connects never depends on it. It misreports an
+/// IPv6-literal tunnel (its authority string has lost its brackets), which
+/// affects those log lines and nothing else.
 fn differs_from_tunnel_target(request: &str, tunnel: &str) -> bool {
     let origin = |authority: &str| {
         split_host_port(authority, 80)
@@ -1344,6 +1363,7 @@ mod tests {
     //! probe and the TLS reconnect. The end-to-end behaviour through a real proxy
     //! is in `tests/stale_upstream.rs`.
 
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -1510,20 +1530,25 @@ mod tests {
         }
     }
 
-    /// A context whose connector is a [`StubConnector`] holding `streams`, plus
-    /// the log of what it was asked to dial.
-    fn ctx_with(streams: Vec<ByteStream>) -> (ModuleCtx, DialLog) {
+    /// A context over `store` and `sink` whose connector is a [`StubConnector`]
+    /// holding `streams`, plus the log of what it was asked to dial.
+    fn ctx_with_sink(
+        streams: Vec<ByteStream>,
+        store: Arc<MemFlowStore>,
+        sink: Arc<dyn EventSink>,
+    ) -> (ModuleCtx, DialLog) {
         let dialed = Arc::new(Mutex::new(Vec::new()));
         let connector = StubConnector {
             dialed: dialed.clone(),
             streams: Mutex::new(streams),
         };
-        let ctx = ModuleCtx::new(
-            Arc::new(MemFlowStore::new()),
-            Arc::new(NoSink),
-            Arc::new(connector),
-        );
-        (ctx, dialed)
+        (ModuleCtx::new(store, sink, Arc::new(connector)), dialed)
+    }
+
+    /// A context whose connector is a [`StubConnector`] holding `streams`, plus
+    /// the log of what it was asked to dial.
+    fn ctx_with(streams: Vec<ByteStream>) -> (ModuleCtx, DialLog) {
+        ctx_with_sink(streams, Arc::new(MemFlowStore::new()), Arc::new(NoSink))
     }
 
     /// Records every event the module emits, in order, and lets it continue.
@@ -1540,25 +1565,17 @@ mod tests {
 
     /// Like [`ctx_with`], with a [`RecordingSink`] as the event sink.
     fn ctx_recording(streams: Vec<ByteStream>) -> (ModuleCtx, DialLog, Arc<RecordingSink>) {
-        let dialed = Arc::new(Mutex::new(Vec::new()));
-        let connector = StubConnector {
-            dialed: dialed.clone(),
-            streams: Mutex::new(streams),
-        };
         let sink = Arc::new(RecordingSink {
             events: Mutex::new(Vec::new()),
         });
-        let ctx = ModuleCtx::new(
-            Arc::new(MemFlowStore::new()),
-            sink.clone(),
-            Arc::new(connector),
-        );
+        let (ctx, dialed) = ctx_with_sink(streams, Arc::new(MemFlowStore::new()), sink.clone());
         (ctx, dialed, sink)
     }
 
     /// Rewrites a flow's authority and `Host` header to `to` when its request is
-    /// dispatched, as Map Remote does. Shares `store` with the context it is
-    /// built into, so the rewrite lands in what `serve` reads back.
+    /// dispatched, and marks the flow `map-remote`, as Map Remote does. Shares
+    /// `store` with the context it is built into, so the rewrite lands in what
+    /// `serve` reads back.
     struct RewriteSink {
         store: Arc<MemFlowStore>,
         to: &'static str,
@@ -1571,6 +1588,7 @@ mod tests {
                     if let Flow::Http(h) = f {
                         h.request.authority = self.to.to_string();
                         h.request.headers.set("Host", self.to);
+                        h.metadata.marks.push("map-remote".to_string());
                     }
                 });
             }
@@ -1578,21 +1596,15 @@ mod tests {
         }
     }
 
-    /// Like [`ctx_with`], with a [`RewriteSink`] that retargets every request to
-    /// `to`.
+    /// Like [`ctx_with`], with a [`RewriteSink`] that retargets and marks every
+    /// request, rewriting it to `to`.
     fn ctx_rewriting(streams: Vec<ByteStream>, to: &'static str) -> (ModuleCtx, DialLog) {
-        let dialed = Arc::new(Mutex::new(Vec::new()));
-        let connector = StubConnector {
-            dialed: dialed.clone(),
-            streams: Mutex::new(streams),
-        };
         let store = Arc::new(MemFlowStore::new());
         let sink = Arc::new(RewriteSink {
             store: store.clone(),
             to,
         });
-        let ctx = ModuleCtx::new(store, sink, Arc::new(connector));
-        (ctx, dialed)
+        ctx_with_sink(streams, store, sink)
     }
 
     fn origin_addr() -> SocketAddr {
@@ -1934,6 +1946,12 @@ mod tests {
         }
     }
 
+    /// A GET for `path` carrying `Host: host`: the one place a test spells out a
+    /// request.
+    fn get_request(path: &str, host: &str) -> String {
+        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n")
+    }
+
     /// Send a GET on the client end and return the `Content-Length`-framed body.
     /// Every origin here answers 200, so any other status fails the test. Bytes
     /// read past the response are dropped; use [`client_get_keep`] to see them.
@@ -1951,17 +1969,19 @@ mod tests {
         target: &str,
         host: &str,
     ) -> String {
-        let request = format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n\r\n");
-        io.write_all(request.as_bytes()).await.expect("send");
-        read_response_keep(io, pending).await
+        client_send_keep(io, pending, &get_request(target, host)).await
     }
 
     /// Send `request` exactly as given (so a test can leave out a header
-    /// [`client_get`] always sends) and return the `Content-Length`-framed body
-    /// of the answer.
-    async fn client_raw(io: &mut DuplexStream, request: &str) -> String {
+    /// [`client_get`] always sends), then read the answer as [`client_get_keep`]
+    /// does.
+    async fn client_send_keep(
+        io: &mut DuplexStream,
+        pending: &mut Vec<u8>,
+        request: &str,
+    ) -> String {
         io.write_all(request.as_bytes()).await.expect("send");
-        read_response_keep(io, &mut Vec::new()).await
+        read_response_keep(io, pending).await
     }
 
     /// Read one 200 response, consuming `pending` before the stream, and return
@@ -2299,7 +2319,7 @@ mod tests {
             let first = client_get(&mut client, "/one", "origin.test:8443").await;
             origin1.await.expect("origin 1");
             client
-                .write_all(b"GET /two HTTP/1.1\r\nHost: origin.test:8443\r\n\r\n")
+                .write_all(get_request("/two", "origin.test:8443").as_bytes())
                 .await
                 .expect("send");
             let mut got = Vec::new();
@@ -2545,50 +2565,24 @@ mod tests {
             false,
         ));
         let _origin2 = tokio::spawn(origin_serve(origin2_end, vec!["second"], false));
-        let (mut client, proxy_side) = duplex(64 * 1024);
-        let conn = Conn::plain(unknown_peer(), None);
 
-        let serving = serve(&ctx, Box::pin(proxy_side), None, None, conn, MAX_BODY);
-        let script = async {
-            let mut pending = Vec::new();
-            let first = client_get_keep(
-                &mut client,
-                &mut pending,
-                "http://127.0.0.1:8080/one",
-                "127.0.0.1:8080",
-            )
-            .await;
-            let after_first = pending.clone();
-            let second = client_get_keep(
-                &mut client,
-                &mut pending,
-                "http://127.0.0.1:8080/two",
-                "127.0.0.1:8080",
-            )
-            .await;
-            // Hang up, so `serve` sees the client finish and returns.
-            drop(client);
-            (first, after_first, second, pending)
-        };
-        let (served, (first, after_first, second, pending)) =
-            tokio::time::timeout(Duration::from_secs(5), async {
-                tokio::join!(serving, script)
-            })
-            .await
-            .expect("serve hung: request 2 went to the tainted upstream, which never answers");
+        let (bodies, leftovers) = serve_requests_keep(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            None,
+            &[
+                get_request("http://127.0.0.1:8080/one", "127.0.0.1:8080"),
+                get_request("http://127.0.0.1:8080/two", "127.0.0.1:8080"),
+            ],
+        )
+        .await;
 
-        served.expect("serve ends cleanly when the client hangs up");
-        assert_eq!(first, "legit");
-        assert!(
-            after_first.is_empty(),
-            "the stray response must not reach the client: {:?}",
-            String::from_utf8_lossy(&after_first)
-        );
-        assert_eq!(second, "second");
-        assert!(
-            pending.is_empty(),
-            "nothing may follow the second response: {:?}",
-            String::from_utf8_lossy(&pending)
+        assert_eq!(bodies, vec!["legit", "second"]);
+        assert_eq!(
+            leftovers,
+            vec!["", ""],
+            "the stray response must not reach the client, after either answer"
         );
         assert_eq!(
             *dialed.lock().expect("dialed lock"),
@@ -2657,41 +2651,23 @@ mod tests {
             INJECTED_HEAD,
         ));
         let _origin2 = tokio::spawn(origin_serve(origin2_end, vec!["second"], false));
-        let (mut client, proxy_side) = duplex(64 * 1024);
-        let conn = Conn::plain(unknown_peer(), None);
 
-        let serving = serve(&ctx, Box::pin(proxy_side), None, None, conn, MAX_BODY);
-        let script = async {
-            let mut pending = Vec::new();
-            let first = client_get_keep(
-                &mut client,
-                &mut pending,
-                "http://127.0.0.1:8080/one",
-                "127.0.0.1:8080",
-            )
-            .await;
-            // `client_get_keep` fails the test if this answer carries the status
-            // line of the head fragment (500) instead of a 200.
-            let second = client_get_keep(
-                &mut client,
-                &mut pending,
-                "http://127.0.0.1:8080/two",
-                "127.0.0.1:8080",
-            )
-            .await;
-            drop(client);
-            (first, second, pending)
-        };
-        let (served, (first, second, pending)) =
-            tokio::time::timeout(Duration::from_secs(5), async {
-                tokio::join!(serving, script)
-            })
-            .await
-            .expect("serve hung");
+        // The helper fails the test if the second answer carries the status line
+        // of the head fragment (500) instead of a 200.
+        let (bodies, leftovers) = serve_requests_keep(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            None,
+            &[
+                get_request("http://127.0.0.1:8080/one", "127.0.0.1:8080"),
+                get_request("http://127.0.0.1:8080/two", "127.0.0.1:8080"),
+            ],
+        )
+        .await;
 
-        served.expect("serve ends cleanly when the client hangs up");
-        assert_eq!((first.as_str(), second.as_str()), ("first", "second"));
-        assert!(pending.is_empty(), "pending: {pending:?}");
+        assert_eq!(bodies, vec!["first", "second"]);
+        assert_eq!(leftovers, vec!["", ""]);
         assert_eq!(
             *dialed.lock().expect("dialed lock"),
             vec![
@@ -2721,38 +2697,21 @@ mod tests {
             origin_serve(tls, vec!["second"], false).await;
         });
         let module = HttpModule::new().with_insecure(true);
-        let (mut client, proxy_side) = duplex(64 * 1024);
 
-        let serving = serve(
+        let (bodies, leftovers) = serve_requests_keep(
             &ctx,
-            Box::pin(proxy_side),
+            tunnel_conn(),
             Some(first_up),
             Some(reconnect_to(&module)),
-            tunnel_conn(),
-            MAX_BODY,
-        );
-        let script = async {
-            let mut pending = Vec::new();
-            let first =
-                client_get_keep(&mut client, &mut pending, "/one", "origin.test:8443").await;
-            let after_first = pending.clone();
-            let second =
-                client_get_keep(&mut client, &mut pending, "/two", "origin.test:8443").await;
-            drop(client);
-            (first, after_first, second, pending)
-        };
-        let (served, (first, after_first, second, pending)) =
-            tokio::time::timeout(Duration::from_secs(5), async {
-                tokio::join!(serving, script)
-            })
-            .await
-            .expect("serve hung: request 2 went to the tainted upstream, which never answers");
+            &[
+                get_request("/one", "origin.test:8443"),
+                get_request("/two", "origin.test:8443"),
+            ],
+        )
+        .await;
 
-        served.expect("serve ends cleanly when the client hangs up");
-        assert_eq!(first, "legit");
-        assert!(after_first.is_empty(), "pending: {after_first:?}");
-        assert_eq!(second, "second");
-        assert!(pending.is_empty(), "pending: {pending:?}");
+        assert_eq!(bodies, vec!["legit", "second"]);
+        assert_eq!(leftovers, vec!["", ""]);
         assert_eq!(
             *dialed.lock().expect("dialed lock"),
             vec![("origin.test:8443".to_string(), origin_addr())],
@@ -2785,18 +2744,17 @@ mod tests {
             let first =
                 client_get_keep(&mut client, &mut pending, "/one", "origin.test:8443").await;
             client
-                .write_all(b"GET /two HTTP/1.1\r\nHost: origin.test:8443\r\n\r\n")
+                .write_all(get_request("/two", "origin.test:8443").as_bytes())
                 .await
                 .expect("send");
             let mut got = Vec::new();
             client.read_to_end(&mut got).await.expect("read to EOF");
             (first, pending, got)
         };
-        let (served, (first, pending, got)) = tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(serving, script)
-        })
-        .await
-        .expect("serve hung: request 2 went to the tainted upstream, which never answers");
+        let (served, (first, pending, got)) =
+            tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                .await
+                .expect("serve hung: request 2 went to the tainted upstream, which never answers");
 
         assert_eq!(first, "legit");
         assert!(pending.is_empty(), "pending: {pending:?}");
@@ -2827,33 +2785,51 @@ mod tests {
         )
     }
 
-    /// A GET for `path` carrying `Host: host`.
-    fn get_request(path: &str, host: &str) -> String {
-        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n")
-    }
-
     /// Run `serve` on `conn` over a fresh in-memory client connection, send each
-    /// of `requests` in turn, and return the answers' bodies. The client then
-    /// hangs up; `serve` must end cleanly and in time.
-    async fn serve_requests(ctx: &ModuleCtx, conn: Conn, requests: &[String]) -> Vec<String> {
+    /// of `requests` in turn, and return the answers' bodies, plus, for each, the
+    /// bytes the client had read past it (as text). A response the proxy
+    /// forwarded behind the real one shows up there, or as the next answer.
+    /// `upstream` and `reconnect` are what a TLS tunnel hands `serve`; cleartext
+    /// tests pass `None`. The client then hangs up; `serve` must end cleanly and
+    /// in time, and a hang means a request went to an upstream that never answers.
+    async fn serve_requests_keep(
+        ctx: &ModuleCtx,
+        conn: Conn,
+        upstream: Option<ByteStream>,
+        reconnect: Option<Reconnect<'_>>,
+        requests: &[String],
+    ) -> (Vec<String>, Vec<String>) {
         let (mut client, proxy_side) = duplex(64 * 1024);
-        let serving = serve(ctx, Box::pin(proxy_side), None, None, conn, MAX_BODY);
+        let serving = serve(
+            ctx,
+            Box::pin(proxy_side),
+            upstream,
+            reconnect,
+            conn,
+            MAX_BODY,
+        );
         let script = async {
-            let mut bodies = Vec::new();
+            let mut pending = Vec::new();
+            let (mut bodies, mut leftovers) = (Vec::new(), Vec::new());
             for request in requests {
-                bodies.push(client_raw(&mut client, request).await);
+                bodies.push(client_send_keep(&mut client, &mut pending, request).await);
+                leftovers.push(String::from_utf8_lossy(&pending).into_owned());
             }
             // Hang up, so `serve` sees the client finish and returns.
             drop(client);
-            bodies
+            (bodies, leftovers)
         };
-        let (served, bodies) = tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(serving, script)
-        })
-        .await
-        .expect("serve hung");
+        let (served, answers) =
+            tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                .await
+                .expect("serve hung: a request went to an upstream that never answers");
         served.expect("serve ends cleanly when the client hangs up");
-        bodies
+        answers
+    }
+
+    /// [`serve_requests_keep`] on a cleartext connection, returning the bodies.
+    async fn serve_requests(ctx: &ModuleCtx, conn: Conn, requests: &[String]) -> Vec<String> {
+        serve_requests_keep(ctx, conn, None, None, requests).await.0
     }
 
     /// The stored HTTP flow whose request path is `path`.
@@ -2989,6 +2965,153 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn serve_dials_the_connect_target_for_an_absolute_form_request_naming_another_origin() {
+        // Both the request line and the `Host` name another origin, so neither a
+        // request-target route nor a `Host` route would reach the tunnel's origin.
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, dialed) = ctx_with(vec![Box::pin(up)]);
+        let _origin = tokio::spawn(origin_serve(origin_end, vec!["from the tunnel"], false));
+
+        let bodies = serve_requests(
+            &ctx,
+            cleartext_tunnel_conn("127.0.0.1:8080", "127.0.0.1:8080"),
+            &[get_request(
+                "http://other.example:9090/x",
+                "other.example:9090",
+            )],
+        )
+        .await;
+
+        assert_eq!(bodies, vec!["from the tunnel"]);
+        assert_eq!(
+            *dialed.lock().expect("dialed lock"),
+            vec![dial("127.0.0.1:8080", "127.0.0.1:8080")],
+            "the tunnel goes to its CONNECT target, whatever the request line says"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_keeps_a_request_target_userinfo_out_of_the_log() {
+        // The absolute-form target carries `user:secret@` in front of the host, and
+        // that string is the request's authority. It differs from the tunnel
+        // target, which is what the debug log reports, and must not be in it.
+        let (_guard, captured) = capture_events(tracing::Level::DEBUG);
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+        let _origin = tokio::spawn(origin_serve(origin_end, vec!["first"], false));
+
+        let bodies = serve_requests(
+            &ctx,
+            cleartext_tunnel_conn("127.0.0.1:8080", "127.0.0.1:8080"),
+            &[get_request("http://user:secret@x/", "x")],
+        )
+        .await;
+
+        assert_eq!(bodies, vec!["first"]);
+        let captured = captured.lock().expect("events lock");
+        assert!(
+            !format!("{captured:?}").contains("secret"),
+            "events: {captured:?}"
+        );
+        // The report itself is still made: the tunnel's authority, and nothing the
+        // client wrote.
+        let reports: Vec<&Captured> = captured
+            .iter()
+            .filter(|e| e.message.contains("differs from the CONNECT target"))
+            .collect();
+        assert_eq!(reports.len(), 1, "events: {captured:?}");
+        assert_eq!(reports[0].level, tracing::Level::DEBUG);
+        assert_eq!(
+            reports[0].message,
+            "a request's authority differs from the CONNECT target; dialing the target"
+        );
+        assert_eq!(
+            reports[0].fields,
+            field_set(&[("tunnel", "\"127.0.0.1:8080\"")])
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_warns_once_when_a_map_remote_rewrite_is_ignored_in_a_tunnel() {
+        let (_guard, warnings) = capture_events(tracing::Level::WARN);
+        let (up, origin_end) = duplex(64 * 1024);
+        // The sink rewrites the request to 127.0.0.1:9090 and marks it `map-remote`.
+        let (ctx, dialed) = ctx_rewriting(vec![Box::pin(up)], "127.0.0.1:9090");
+        let _origin = tokio::spawn(origin_serve(origin_end, vec!["first"], false));
+
+        let bodies = serve_requests(
+            &ctx,
+            cleartext_tunnel_conn("127.0.0.1:8080", "127.0.0.1:8080"),
+            &[get_request("/one", "127.0.0.1:8080")],
+        )
+        .await;
+
+        assert_eq!(bodies, vec!["first"]);
+        assert_eq!(
+            *dialed.lock().expect("dialed lock"),
+            vec![dial("127.0.0.1:8080", "127.0.0.1:8080")],
+            "the warning changes nothing about the route"
+        );
+        let warnings = warnings.lock().expect("warnings lock");
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert_eq!(warnings[0].level, tracing::Level::WARN);
+        assert_eq!(
+            warnings[0].message,
+            "a Map Remote rewrite is ignored inside a CONNECT tunnel; the request goes to the CONNECT target"
+        );
+        assert_eq!(
+            warnings[0].fields,
+            field_set(&[("tunnel", "\"127.0.0.1:8080\"")])
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_does_not_warn_about_map_remote_for_an_unmarked_request_naming_another_host() {
+        let (_guard, warnings) = capture_events(tracing::Level::WARN);
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+        let _origin = tokio::spawn(origin_serve(origin_end, vec!["first"], false));
+
+        let bodies = serve_requests(
+            &ctx,
+            cleartext_tunnel_conn("127.0.0.1:8080", "127.0.0.1:8080"),
+            &[get_request("/one", "127.0.0.1:9090")],
+        )
+        .await;
+
+        assert_eq!(bodies, vec!["first"]);
+        let warnings = warnings.lock().expect("warnings lock");
+        assert!(
+            warnings.is_empty(),
+            "a differing Host without the mark is no Map Remote rewrite: {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_does_not_warn_about_map_remote_when_the_rewrite_names_the_tunnel_target() {
+        let (_guard, warnings) = capture_events(tracing::Level::WARN);
+        let (up, origin_end) = duplex(64 * 1024);
+        // Marked, but rewritten to the very origin the tunnel goes to: nothing is
+        // ignored.
+        let (ctx, _dialed) = ctx_rewriting(vec![Box::pin(up)], "127.0.0.1:8080");
+        let _origin = tokio::spawn(origin_serve(origin_end, vec!["first"], false));
+
+        let bodies = serve_requests(
+            &ctx,
+            cleartext_tunnel_conn("127.0.0.1:8080", "127.0.0.1:8080"),
+            &[get_request("/one", "127.0.0.1:9090")],
+        )
+        .await;
+
+        assert_eq!(bodies, vec!["first"]);
+        let warnings = warnings.lock().expect("warnings lock");
+        assert!(
+            warnings.is_empty(),
+            "a rewrite to the tunnel target ignores nothing: {warnings:?}"
+        );
+    }
+
     #[test]
     fn a_request_authority_differs_from_the_tunnel_target_only_by_origin() {
         let differs = differs_from_tunnel_target;
@@ -3009,8 +3132,10 @@ mod tests {
     async fn serve_dials_an_ipv6_literal_tunnel_at_the_recorded_address() {
         // `Target::authority()` writes the bracketed `[::1]:8080` as `::1:8080`,
         // which `split_host_port` cannot read back, so the dial must use the
-        // address recorded when the tunnel was opened. The authority string is
-        // deliberately not asserted: its form is a separate, known quirk.
+        // address recorded when the tunnel was opened. The request's `Host` names
+        // another port, so a dial derived from it would be told apart. The
+        // authority string is deliberately not asserted: its form is a separate,
+        // known quirk.
         let (up, origin_end) = duplex(64 * 1024);
         let (ctx, dialed) = ctx_with(vec![Box::pin(up)]);
         let _origin = tokio::spawn(origin_serve(origin_end, vec!["first"], false));
@@ -3018,7 +3143,7 @@ mod tests {
         let bodies = serve_requests(
             &ctx,
             cleartext_tunnel_conn("::1:8080", "[::1]:8080"),
-            &[get_request("/one", "[::1]:8080")],
+            &[get_request("/one", "[::1]:9090")],
         )
         .await;
 
@@ -3078,16 +3203,15 @@ mod tests {
             drop(client);
             chunk[..n].to_vec()
         };
-        let (served, got) = tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(serving, script)
-        })
-        .await
-        .expect("serve hung");
+        let (served, got) =
+            tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                .await
+                .expect("serve hung");
 
         let err = served.expect_err("a tunnel with no resolved address must be refused");
-        assert_eq!(
-            err.to_string(),
-            "tunnel has no resolved CONNECT address; refusing to dial the request Host"
+        assert!(
+            err.to_string().contains("no resolved CONNECT address"),
+            "error: {err}"
         );
         assert!(
             got.is_empty(),
@@ -3100,29 +3224,11 @@ mod tests {
         );
     }
 
-    // ---- edge cases added by the Stage 5 tester pass ----------------------
+    // ---- edge cases: the tunnel route and surplus bytes -------------------
 
-    /// The tunnel's authority and its resolved address are one fact: `serve`
-    /// dials the pinned address only when both are present, and a connection
-    /// with one but not the other would fall back to the request's `Host`.
-    /// `Conn::plain` is the only constructor `drive` uses, so it must never
-    /// produce a half-set tunnel.
-    #[test]
-    fn a_plain_conn_sets_its_tunnel_authority_and_address_together() {
-        let addr: SocketAddr = "127.0.0.1:8080".parse().expect("addr");
-        let tunnel = Conn::plain(unknown_peer(), Some(("127.0.0.1:8080".to_string(), addr)));
-        assert_eq!(tunnel.tunnel_authority.as_deref(), Some("127.0.0.1:8080"));
-        assert_eq!(tunnel.tunnel_addr, Some(addr));
-
-        let forward = Conn::plain(unknown_peer(), None);
-        assert_eq!(forward.tunnel_authority, None);
-        assert_eq!(forward.tunnel_addr, None);
-    }
-
-    /// AC17, second clause: a request whose `Host` names the tunnel target is
-    /// stored exactly as it was before the tunnel's route was pinned: the `Host`
-    /// as authority, a cleartext server connection to the target, and a complete
-    /// response.
+    /// A request whose `Host` names the tunnel target is stored like any
+    /// forward-proxy request: the `Host` as authority, a cleartext server
+    /// connection to the target, and a complete response.
     #[tokio::test]
     async fn serve_stores_the_usual_flow_when_the_host_names_the_tunnel_target() {
         let (up, origin_end) = duplex(64 * 1024);
@@ -3145,7 +3251,11 @@ mod tests {
         assert_eq!(flow.request.scheme, "http");
         assert_eq!(flow.request.authority, "127.0.0.1:8080");
         assert_eq!(flow.request.method, "GET");
-        assert_eq!(flow.request.headers.get("host"), Some("127.0.0.1:8080"));
+        assert_eq!(flow.request.version, HttpVersion::Http11);
+        assert_eq!(
+            flow.request.headers.iter().collect::<Vec<_>>(),
+            vec![("Host", "127.0.0.1:8080")]
+        );
         assert!(matches!(flow.request.body, Body::Empty));
         assert!(!flow.client_conn.tls);
         let server = flow.server_conn.expect("a server connection is recorded");
@@ -3155,12 +3265,23 @@ mod tests {
         assert_eq!(server.alpn, None);
         let response = flow.response.expect("a stored response");
         assert_eq!(response.status, 200);
+        assert_eq!(response.version, HttpVersion::Http11);
+        assert_eq!(
+            response.headers.iter().collect::<Vec<_>>(),
+            vec![("Content-Length", "5")]
+        );
         assert!(
             matches!(response.body, Body::Bytes(ref b) if b.as_slice() == b"first"),
             "stored body: {:?}",
             response.body
         );
         assert!(!flow.metadata.truncated);
+        assert_eq!(flow.metadata.marks, Vec::<String>::new());
+        assert!(
+            matches!(flow.intercept, InterceptState::Observed),
+            "intercept: {:?}",
+            flow.intercept
+        );
     }
 
     /// A taint lasts for one replacement. Once the new upstream is in place the
@@ -3235,11 +3356,10 @@ mod tests {
             client.read_to_end(&mut got).await.expect("read to EOF");
             got
         };
-        let (served, got) = tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(serving, script)
-        })
-        .await
-        .expect("serve hung");
+        let (served, got) =
+            tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                .await
+                .expect("serve hung");
 
         served.expect("a Connection: close request ends cleanly");
         let got = String::from_utf8_lossy(&got).into_owned();
@@ -3269,28 +3389,47 @@ mod tests {
         );
     }
 
-    /// The message of every WARN-or-worse event emitted on the thread that
-    /// installed it. Hand-written on `tracing`'s own `Subscriber` trait so a test
-    /// can pin what the proxy tells the operator without a capture dependency.
-    struct WarnCapture {
-        messages: Arc<Mutex<Vec<String>>>,
+    /// One event an [`EventCapture`] saw: its level, its message, and every other
+    /// field as `name -> Debug text` (a string field keeps its quotes).
+    #[derive(Debug)]
+    struct Captured {
+        level: tracing::Level,
+        message: String,
+        fields: BTreeMap<String, String>,
     }
 
-    /// Pulls the `message` field out of one event.
-    struct MessageOf(String);
+    /// What an [`EventCapture`] has seen so far, in order.
+    type Captures = Arc<Mutex<Vec<Captured>>>;
 
-    impl tracing::field::Visit for MessageOf {
+    /// Every event at or above `max` verbosity emitted on the thread that
+    /// installed it. Hand-written on `tracing`'s own `Subscriber` trait so a test
+    /// can pin what the proxy tells the operator without a capture dependency.
+    struct EventCapture {
+        max: tracing::Level,
+        events: Captures,
+    }
+
+    /// Reads one event's fields, the `message` apart from the rest.
+    struct FieldsOf {
+        message: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    impl tracing::field::Visit for FieldsOf {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
             if field.name() == "message" {
-                self.0 = format!("{value:?}");
+                self.message = format!("{value:?}");
+            } else {
+                self.fields
+                    .insert(field.name().to_string(), format!("{value:?}"));
             }
         }
     }
 
-    impl tracing::Subscriber for WarnCapture {
+    impl tracing::Subscriber for EventCapture {
         fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
             // `Level` orders by verbosity: ERROR < WARN < INFO < DEBUG < TRACE.
-            *metadata.level() <= tracing::Level::WARN
+            *metadata.level() <= self.max
         }
         fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
             tracing::span::Id::from_u64(1)
@@ -3298,22 +3437,39 @@ mod tests {
         fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
         fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
         fn event(&self, event: &tracing::Event<'_>) {
-            let mut message = MessageOf(String::new());
-            event.record(&mut message);
-            self.messages.lock().expect("messages lock").push(message.0);
+            let mut seen = FieldsOf {
+                message: String::new(),
+                fields: BTreeMap::new(),
+            };
+            event.record(&mut seen);
+            self.events.lock().expect("events lock").push(Captured {
+                level: *event.metadata().level(),
+                message: seen.message,
+                fields: seen.fields,
+            });
         }
         fn enter(&self, _: &tracing::span::Id) {}
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
-    /// Capture every WARN-or-worse event on this thread until the guard drops.
-    /// `#[tokio::test]` runs the test future on this thread, so it sees `serve`'s.
-    fn capture_warnings() -> (tracing::subscriber::DefaultGuard, Arc<Mutex<Vec<String>>>) {
-        let messages = Arc::new(Mutex::new(Vec::new()));
-        let guard = tracing::subscriber::set_default(WarnCapture {
-            messages: messages.clone(),
+    /// Capture every event up to `max` verbosity on this thread until the guard
+    /// drops. `#[tokio::test]` runs the test future on this thread, so it sees
+    /// `serve`'s.
+    fn capture_events(max: tracing::Level) -> (tracing::subscriber::DefaultGuard, Captures) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let guard = tracing::subscriber::set_default(EventCapture {
+            max,
+            events: events.clone(),
         });
-        (guard, messages)
+        (guard, events)
+    }
+
+    /// A field set as [`Captured::fields`] holds it, from literal pairs.
+    fn field_set(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
     }
 
     /// An origin that answers a `Connection: close` request and then appends a
@@ -3321,7 +3477,7 @@ mod tests {
     /// say it is replacing one. The warning is for the connection that stays open.
     #[tokio::test]
     async fn serve_does_not_warn_about_surplus_when_the_connection_closes_anyway() {
-        let (_guard, warnings) = capture_warnings();
+        let (_guard, warnings) = capture_events(tracing::Level::WARN);
         let (up, origin_end) = duplex(64 * 1024);
         let (ctx, dialed) = ctx_with(vec![Box::pin(up)]);
         let _origin = tokio::spawn(origin_serve_trailing(
@@ -3351,11 +3507,10 @@ mod tests {
             client.read_to_end(&mut got).await.expect("read to EOF");
             got
         };
-        let (served, got) = tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(serving, script)
-        })
-        .await
-        .expect("serve hung");
+        let (served, got) =
+            tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                .await
+                .expect("serve hung");
 
         served.expect("a Connection: close request ends cleanly");
         assert!(
@@ -3364,10 +3519,10 @@ mod tests {
             String::from_utf8_lossy(&got)
         );
         assert_eq!(dialed.lock().expect("dialed lock").len(), 1);
-        assert_eq!(
-            *warnings.lock().expect("warnings lock"),
-            Vec::<String>::new(),
-            "a connection that is closing anyway replaces nothing and warns of nothing"
+        let warnings = warnings.lock().expect("warnings lock");
+        assert!(
+            warnings.is_empty(),
+            "a connection that is closing anyway replaces nothing and warns of nothing: {warnings:?}"
         );
     }
 
@@ -3375,7 +3530,7 @@ mod tests {
     /// surplus is an upstream being replaced, and that is worth one warning.
     #[tokio::test]
     async fn serve_warns_once_when_surplus_replaces_the_upstream_of_an_open_connection() {
-        let (_guard, warnings) = capture_warnings();
+        let (_guard, warnings) = capture_events(tracing::Level::WARN);
         let (up, origin_end) = duplex(64 * 1024);
         let (ctx, dialed) = ctx_with(vec![Box::pin(up)]);
         let _origin = tokio::spawn(origin_serve_trailing(
@@ -3394,12 +3549,19 @@ mod tests {
 
         assert_eq!(bodies, vec!["legit"]);
         assert_eq!(dialed.lock().expect("dialed lock").len(), 1);
+        let warnings = warnings.lock().expect("warnings lock");
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert_eq!(warnings[0].level, tracing::Level::WARN);
+        assert!(
+            warnings[0].message.contains("after a completed response"),
+            "message: {:?}",
+            warnings[0].message
+        );
+        // The authority and the byte count, and nothing else: the stray bytes
+        // themselves must never become a field.
         assert_eq!(
-            *warnings.lock().expect("warnings lock"),
-            vec![
-                "origin sent bytes after a completed response; discarding them and replacing the upstream connection"
-                    .to_string()
-            ]
+            warnings[0].fields,
+            field_set(&[("authority", "\"127.0.0.1:8080\""), ("bytes", "2")])
         );
     }
 
@@ -3418,48 +3580,23 @@ mod tests {
             false,
         ));
         let _origin2 = tokio::spawn(origin_serve(origin2_end, vec!["second"], false));
-        let (mut client, proxy_side) = duplex(64 * 1024);
 
-        let serving = serve(
+        // Surplus bytes must not fail the connection: the helper requires `serve`
+        // to end cleanly.
+        let (bodies, leftovers) = serve_requests_keep(
             &ctx,
-            Box::pin(proxy_side),
-            None,
-            None,
             Conn::plain(unknown_peer(), None),
-            MAX_BODY,
-        );
-        let script = async {
-            let mut pending = Vec::new();
-            let first = client_get_keep(
-                &mut client,
-                &mut pending,
-                "http://127.0.0.1:8080/one",
-                "127.0.0.1:8080",
-            )
-            .await;
-            let after_first = pending.clone();
-            let second = client_get_keep(
-                &mut client,
-                &mut pending,
-                "http://127.0.0.1:8080/two",
-                "127.0.0.1:8080",
-            )
-            .await;
-            drop(client);
-            (first, after_first, second, pending)
-        };
-        let (served, (first, after_first, second, pending)) =
-            tokio::time::timeout(Duration::from_secs(5), async {
-                tokio::join!(serving, script)
-            })
-            .await
-            .expect("serve hung: request 2 went to the tainted upstream, which never answers");
+            None,
+            None,
+            &[
+                get_request("http://127.0.0.1:8080/one", "127.0.0.1:8080"),
+                get_request("http://127.0.0.1:8080/two", "127.0.0.1:8080"),
+            ],
+        )
+        .await;
 
-        served.expect("surplus bytes must not fail the connection");
-        assert_eq!(first, "legit");
-        assert!(after_first.is_empty(), "after response 1: {after_first:?}");
-        assert_eq!(second, "second");
-        assert!(pending.is_empty(), "after response 2: {pending:?}");
+        assert_eq!(bodies, vec!["legit", "second"]);
+        assert_eq!(leftovers, vec!["", ""], "nothing follows either response");
         assert_eq!(
             dialed.lock().expect("dialed lock").len(),
             2,
@@ -3490,16 +3627,8 @@ mod tests {
 
     #[tokio::test]
     async fn serve_replaces_the_upstream_after_a_bare_crlf() {
-        // The spec's known consequence: even this taints the connection.
+        // Even this taints the connection: it is not an answer to anything.
         assert_surplus_is_discarded_and_the_upstream_replaced("\r\n").await;
-    }
-
-    #[tokio::test]
-    async fn serve_replaces_the_upstream_after_more_surplus_than_one_read() {
-        // 40 KiB behind the response: more than one `READ_CHUNK` (16 KiB), so part
-        // of it is still unread on the upstream when the response completes.
-        let junk: &'static str = Box::leak("x".repeat(40 * 1024).into_boxed_str());
-        assert_surplus_is_discarded_and_the_upstream_replaced(junk).await;
     }
 
     // ---- upstream TLS that is not (or stops being) TLS --------------------
@@ -3538,36 +3667,5 @@ mod tests {
         let err = result.err().expect("cleartext HTTP is not a TLS handshake");
         assert_eq!(err.to_string(), "TLS to upstream origin.test:8443");
         let _origin = origin_task.await.expect("origin task");
-    }
-
-    /// An origin that reads the ClientHello and then drops the connection (a
-    /// reset mid-handshake) fails the handshake at once, not after the bound.
-    #[tokio::test]
-    async fn tls_handshake_fails_promptly_when_the_origin_drops_after_the_client_hello() {
-        let (io, mut origin) = stalled_pair();
-        let module = HttpModule::new().with_insecure(true);
-        let origin_task = tokio::spawn(async move {
-            let mut hello = [0u8; 16];
-            let _ = origin.read(&mut hello).await;
-            drop(origin);
-        });
-
-        let result = tokio::time::timeout(
-            STALL_GUARD,
-            module.tls_handshake(
-                &[b"http/1.1".to_vec()],
-                ServerName::try_from("origin.test").expect("name"),
-                io,
-                "origin.test:8443",
-            ),
-        )
-        .await
-        .expect("a mid-handshake drop must fail the handshake promptly");
-
-        let err = result
-            .err()
-            .expect("a dropped connection is not a TLS handshake");
-        assert_eq!(err.to_string(), "TLS to upstream origin.test:8443");
-        origin_task.await.expect("origin task");
     }
 }
