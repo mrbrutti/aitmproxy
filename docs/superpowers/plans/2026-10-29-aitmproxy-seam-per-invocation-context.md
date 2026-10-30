@@ -85,6 +85,16 @@
 | 5 | Build (coder) | Blocker | `option`/`finding` migration can't recover the per-eval tag/source at dispatch within the host_core/prelude-only file set — would silently regress | Architect-ratified scope amendment: thread the real tag/source through `seed_call_context` at the `plugin.rs`/`command.rs` boundaries (Task 3's seeding boundaries); no behaviour change beyond a faithful migration |
 | — | Build (self) | fast-follow | Native `l4:` PoC-step handler not yet registered into the production `poc.run` runner (gate logic correct once wired) | Pre-existing, out of this build's scope; flagged for a separate follow-up PR |
 
+Stage-6 panel on PR #63 (origin/claude/seam-call-context-3151ba):
+
+| Task | Reviewer | Severity | Finding | Disposition |
+|---|---|---|---|---|
+| all | Security | — | PASS, zero findings. Fail-closed (strict `seed.caller`, no fallback) + thread-local non-leakage (`#[must_use]` RAII `CallContextGuard`, survives early-return/`?`/panic) both verified; `agent_sourced` gone from both faces; rhai-free seam; no `unsafe` | PASS |
+| all | Spec | — | PASS, all 10 ACs met+tested; both follow-ups deferred not folded in; three rulings honored | PASS |
+| 3 | Quality + Spec | Minor | Four doc comments say the loader records `Operator` for a config-placed script; code correctly seeds `Agent` (loader.rs:300) — inverts the dd568cc security ruling in prose | FIX required (comment-only): plugin.rs with_authoring_trust/set_authoring_trust, command.rs with_caller, commands.rs load_one → say least-privilege `Agent` for unknown provenance |
+| 4 | Spec | Minor | `aitm/src/wire.rs` + `aitm-proto-l4/src/module.rs` touched beyond Task-4's file list (the `L4Shared`/`with_shared` wiring) | Accepted — spec "left to the builder" anticipated the shared-guard wire change; recorded here |
+| 1,5 | Quality | Minor | Duplicated probe-language/AdmitGuard test scaffold across 4 files; `finding_error`/`host_error` byte-identical; `VecDeque::new()` vs main's `Vec::new().into()` | Optional / no-action — builder's discretion, not gating |
+
 ## Shipped
 
 Filled at stage 7.
