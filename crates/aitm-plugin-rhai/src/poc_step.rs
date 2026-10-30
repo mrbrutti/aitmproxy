@@ -37,15 +37,17 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use aitm_core::CallerTrust;
 use aitm_poc::{
     ScriptStep, ScriptStepCtx, ScriptStepError, ScriptStepExecutor, ScriptVerdict, VarBindings,
 };
 use rhai::{Dynamic, Engine, EvalAltResult, Position, Scope, AST};
 
-use crate::config::DEFAULT_HOOK_TIMEOUT;
+use crate::config::{DEFAULT_BROWSER_TIMEOUT, DEFAULT_HOOK_TIMEOUT};
 use crate::engine::{begin_run, blocking, Budget, RunKind};
 use crate::error::ScriptError;
 use crate::host_core::{ScriptCapability, ScriptServices};
+use crate::host_registry::seed_call_context;
 use crate::marshal::{dynamic_to_value, value_to_dynamic};
 
 /// Runs PoC `script` steps on the shared engine.
@@ -73,13 +75,15 @@ impl RhaiScriptExecutor {
     /// Run steps on `engine`, which must already carry the host surface and
     /// [`VarsCapability`]; `services` are the handles that surface is wired to.
     /// The budget defaults to the engine's operation cap and the default hook
-    /// timeout; [`RhaiScriptExecutor::with_budget`] sets the configured one.
+    /// and browser timeouts; [`RhaiScriptExecutor::with_budget`] sets the
+    /// configured one.
     pub fn new(engine: Arc<Engine>, services: ScriptServices) -> Self {
         let budget = Budget {
             // `engine::harden` sets the hard cap one above the configured
             // budget so the named token fires first.
             max_operations: engine.max_operations().saturating_sub(1),
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
+            browser_timeout: DEFAULT_BROWSER_TIMEOUT,
         };
         Self {
             engine,
@@ -158,8 +162,21 @@ impl ScriptStepExecutor for RhaiScriptExecutor {
             // constant, and `vars.set(...)` is one.
             .push("vars", vars.clone());
 
+        // Seed the per-eval caller trust from the PoC run's frontend before the
+        // step evaluates, so a seam host fn the step calls (`l4.*`, …) is gated on
+        // the live caller — `Agent` for an agent-driven `poc.run`, `Operator` for
+        // a human one — and never fails closed for a missing context (spec AC5
+        // script face, AC3). The guard is held across the whole eval, so a seam
+        // call nested in the step still observes it.
+        let caller = CallerTrust::from(ctx.host.frontend());
+        // A PoC `script:` step carries no options, so the per-eval tag stays `None`
+        // (`option(...)` reads `()`); the call source is the step's name, which the
+        // seam-migrated `finding(...)` records off `HostCallCtx::call_source()` —
+        // identical to the pre-seam `NativeCallContext` AST source set at compile.
+        let source = Some(name.to_string());
         let result = blocking(|| {
-            let _run = begin_run(RunKind::PocStep, self.budget.hook_timeout);
+            let _run = begin_run(RunKind::PocStep, self.budget);
+            let _seed = seed_call_context(caller, None, source);
             self.engine.eval_ast_with_scope::<Dynamic>(&mut scope, &ast)
         });
 

@@ -143,7 +143,13 @@ actor EmbeddedCore {
         guard !stopping else { return }
         emit.yield(.status(.starting))
 
+        // Two distinct per-launch tokens: the agent token the loopback transport
+        // requires (left for an agent that may attach), and the operator token the
+        // app itself connects with so it is classified `Frontend::Operator` — a
+        // present human that may widen scope from the Scope panel. Both are 256-bit
+        // CSPRNG draws, so they never collide in practice.
         let token = EmbeddedCoreLaunch.freshToken()
+        let operatorToken = EmbeddedCoreLaunch.freshToken()
         guard let proxyPort = EmbeddedCoreLaunch.pickProxyPort(preferred: defaultProxyPort),
               let browserProxyPort = EmbeddedCoreLaunch.pickProxyPort(preferred: defaultBrowserProxyPort)
         else {
@@ -166,6 +172,7 @@ actor EmbeddedCore {
                 proxyPort: proxyPort,
                 browserProxyPort: browserProxyPort,
                 token: token,
+                operatorToken: operatorToken,
                 endpointFile: endpointURL
             )
             try EmbeddedCoreLaunch.writeConfig(config.yaml(), to: configURL)  // yaml() escapes/validates spliced paths
@@ -205,7 +212,9 @@ actor EmbeddedCore {
 
         child = Child(process: process, configURL: configURL, endpointURL: endpointURL, workDir: workDir)
         emit.yield(.status(.connecting))
-        await awaitRendezvous(generation: thisGeneration, token: token,
+        // Dial the embedded bus with the OPERATOR token: the app is a present human,
+        // so it connects as `Frontend::Operator` and its Scope panel may widen scope.
+        await awaitRendezvous(generation: thisGeneration, token: operatorToken,
                               proxyPort: proxyPort, browserProxyPort: browserProxyPort,
                               endpointURL: endpointURL)
     }

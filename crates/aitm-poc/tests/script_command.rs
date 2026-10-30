@@ -102,7 +102,10 @@ fn invoke_poc_run(registry: &Registry, path: &Path) -> anyhow::Result<Value> {
         host: "poc.test".to_string(),
     });
     let client = PipelineClient::new(store.clone(), guard.clone(), Arc::new(OkSender));
-    let host = CommandHost::new(store.as_ref(), &client, guard.as_ref(), None);
+    // A human-CLI frontend: these tests exercise the executor wiring, not the T3
+    // agent-run gate (which only applies to Frontend::Mcp).
+    let host = CommandHost::new(store.as_ref(), &client, guard.as_ref(), None)
+        .with_frontend(aitm_core::Frontend::Cli);
 
     let args = Params::new(
         [(

@@ -17,6 +17,11 @@ pub struct RhaiConfig {
     pub limits: RhaiLimits,
     /// Wall-clock budget per hook invocation.
     pub hook_timeout: Duration,
+    /// Wall-clock budget for one `browser.*` host call (T9). A navigation or
+    /// a DOM fetch legitimately outlives a hook budget, so a browser call is
+    /// bounded by this instead of the hook remainder; `http.*`, `store.*` and
+    /// `scope.*` stay on the hook budget.
+    pub browser_timeout: Duration,
     pub hot_reload: bool,
     /// Fail fast on a compile error instead of skip-and-log.
     pub strict: bool,
@@ -40,15 +45,16 @@ pub struct RhaiConfig {
 }
 
 impl Default for RhaiConfig {
-    /// No scripts, the shipped sandbox limits, a two-second hook budget,
-    /// skip-and-log compile errors, no scope widening, and the deny-by-default
-    /// SSRF policy — the posture an operator gets by writing nothing (spec §2
-    /// rule 5, §7, §8).
+    /// No scripts, the shipped sandbox limits, a two-second hook budget, a
+    /// thirty-second browser-call budget, skip-and-log compile errors, no
+    /// scope widening, and the deny-by-default SSRF policy — the posture an
+    /// operator gets by writing nothing (spec §2 rule 5, §7, §8).
     fn default() -> Self {
         Self {
             scripts: Vec::new(),
             limits: RhaiLimits::default(),
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
+            browser_timeout: DEFAULT_BROWSER_TIMEOUT,
             hot_reload: false,
             strict: false,
             allow_scope_add: false,
@@ -62,6 +68,10 @@ impl Default for RhaiConfig {
 /// The wall-clock budget one hook gets before it is aborted; the figure the
 /// spec's pinned timeout message quotes.
 pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The wall-clock budget one `browser.*` host call gets (T9): the order of
+/// magnitude of the browser's own navigation timeout, not of a hook.
+pub const DEFAULT_BROWSER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One declared script and the options handed to it.
 #[derive(Debug, Clone, PartialEq)]

@@ -57,6 +57,28 @@ unknown kind renders a labelled placeholder rather than nothing. Web
 (`flow-kinds.ts`), TUI (`flow_kinds.rs`) and macOS (`FlowKind.swift`) build their
 per-kind renderers from it.
 
+## Browser-side authoring gotchas
+
+Two foot-guns when authoring `browser.eval` / `browser.click` from Rhai or the
+MCP/CLI tools. These document real engine behaviour, not a knob to change.
+
+- **Author browser-side POSTs as `await fetch(...)`, not a sync XHR (T4).** In
+  obscura, a synchronous `XMLHttpRequest` inside `browser.eval` returns
+  `status 0` (the request is blocked), so it looks like a silent failure. The
+  eval path awaits a returned Promise, so an awaited `fetch()` works: write
+  `await fetch(url, { method: "POST", body: ... })` and read its result, rather
+  than a blocking `XMLHttpRequest`.
+
+- **`click` param name differs by surface, and backslashes mangle in eval'd JS
+  (T8).** The MCP/CLI `browser.click` tool takes a named `selector` argument;
+  the in-script Rhai method is positional — `browser.click("#submit")`. Separately,
+  a backslash in a Rhai string literal reaches the eval'd JavaScript mangled, so
+  a JS regex such as `/x=(\d+)/` built from a Rhai string silently fails to
+  match. Prefer string operations (e.g. `split`) over regex in eval'd JS. (This
+  is the same reserved-word/surface-naming family noted in `rhai.api.json`, where
+  the Rhai methods are `type_text`/`evaluate` while the tools stay
+  `browser.type`/`browser.eval`.)
+
 ## Conformance fixtures
 
 Each fixture proves the three surfaces stay identical; a surface test fails

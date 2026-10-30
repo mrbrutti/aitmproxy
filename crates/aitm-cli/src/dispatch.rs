@@ -38,6 +38,7 @@ pub struct Cli {
     ssrf: SsrfPolicy,
     poc_dir: Option<std::path::PathBuf>,
     config: Option<Arc<aitm_core::Config>>,
+    finding_recorder: Option<Arc<dyn aitm_core::FindingRecorder>>,
     confirmer: Arc<dyn Confirmer>,
 }
 
@@ -52,6 +53,7 @@ impl Cli {
             ssrf: SsrfPolicy::default(),
             poc_dir: None,
             config: None,
+            finding_recorder: None,
             confirmer: Arc::new(TtyConfirmer::from_stdin()),
         }
     }
@@ -59,6 +61,13 @@ impl Cli {
     /// Attach the proxy configuration so `config.get`/`proxy.status` can read it.
     pub fn with_config(mut self, config: Arc<aitm_core::Config>) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    /// Wire the finding recorder so a CLI `poc.run` persists a finding (T7);
+    /// gated on `findings.dir`.
+    pub fn with_finding_recorder(mut self, recorder: Arc<dyn aitm_core::FindingRecorder>) -> Self {
+        self.finding_recorder = Some(recorder);
         self
     }
 
@@ -121,6 +130,10 @@ impl Cli {
         .with_frontend(Frontend::Cli);
         let host = match &self.config {
             Some(cfg) => host.with_config(cfg.clone()),
+            None => host,
+        };
+        let host = match &self.finding_recorder {
+            Some(rec) => host.with_finding_recorder(rec.as_ref()),
             None => host,
         };
         if !yes {

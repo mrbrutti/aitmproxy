@@ -30,6 +30,7 @@ import Testing
             proxyPort: 8080,
             browserProxyPort: 8083,
             token: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            operatorToken: "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100",
             endpointFile: endpointFile
         )
     }
@@ -58,6 +59,24 @@ import Testing
         #expect(text.contains("proxy_addr: \"127.0.0.1:8083\""))
         #expect(text.contains(endpointFile.path))               // rendezvous path
         #expect(text.contains(config.obscuraBinary.path))       // bundled obscura
+    }
+
+    @Test func generated_config_emits_the_operator_token_alongside_the_agent_token() throws {
+        // The app connects as a present human (`Frontend::Operator`) so its Scope
+        // panel can widen scope at runtime; the core still requires the agent token
+        // on the loopback transport. So the generated YAML must carry BOTH a
+        // `mcp.operator_token` and the agent `loopback_tcp.token`, and they must be
+        // distinct (the operator route is only meaningful if the two differ).
+        let config = sampleConfig(endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"))
+        let yaml = try config.yaml()
+
+        #expect(config.token != config.operatorToken)
+        #expect(yaml.contains("operator_token: \"\(config.operatorToken)\""))
+        #expect(yaml.contains("token: \"\(config.token)\""))        // agent token still present
+        // Startup stays deny-by-default: no `scope:` block is emitted, so the core
+        // comes up with empty scope and only a present operator may widen it.
+        #expect(!yaml.contains("scope:"))
+        #expect(!yaml.contains("allow_agent_widen"))
     }
 
     @Test func config_pins_a_bounded_obscura_stop_timeout() throws {
@@ -96,7 +115,7 @@ import Testing
         let bad = EmbeddedCoreLaunch.Config(
             obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
             proxyPort: 8080, browserProxyPort: 8083,
-            token: "00", endpointFile: URL(fileURLWithPath: "/tmp/with\nnewline")
+            token: "00", operatorToken: "11", endpointFile: URL(fileURLWithPath: "/tmp/with\nnewline")
         )
         #expect(throws: (any Error).self) { try bad.yaml() }
     }

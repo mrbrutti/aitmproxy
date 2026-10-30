@@ -22,7 +22,8 @@ pub struct ScopePlugin {
 
 impl ScopePlugin {
     /// `allow_agent_widen` lets an MCP (agent) frontend call `scope.add`; off by
-    /// default the human CLI is the only frontend that may widen scope.
+    /// default only a present human — the CLI or an operator-token connection
+    /// (`Frontend::Operator`) — may widen scope.
     pub fn new(allow_agent_widen: bool) -> Self {
         Self { allow_agent_widen }
     }
@@ -81,13 +82,15 @@ impl Command for ScopeAdd {
     }
 
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
-        // Widening scope is a human authorisation decision: refuse it from a
-        // non-CLI frontend unless the operator opted in (mirrors ca.install).
-        if host.frontend() != Frontend::Cli && !self.allow_agent_widen {
+        // Widening scope is a human authorisation decision: refuse it from an
+        // agent frontend (MCP) unless the operator opted in (mirrors ca.install).
+        // A present human — the CLI or an operator-token connection
+        // (`Frontend::Operator`, e.g. the mac/web/tui surfaces) — may always widen.
+        if host.frontend() == Frontend::Mcp && !self.allow_agent_widen {
             anyhow::bail!(
                 "scope.add refused: widening scope from an agent frontend is disabled. Set \
                  scope.allow_agent_widen = true in the aitmproxy config to allow it, or add the \
-                 host from the human CLI."
+                 host from the human CLI or an operator surface."
             );
         }
         // Validate the host before widening scope, mirroring the Rhai `scope.add`

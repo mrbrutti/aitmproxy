@@ -53,6 +53,7 @@ fn tool_names() -> Vec<String> {
             // The binary's wiring: BOTH the rhai tier's commands and the
             // persistent findings store, in one command-provider slot.
             commands: vec![Box::new(tier.commands), Box::new(FindingsPlugin::new())],
+            ..ScriptWiring::default()
         },
     )
     .expect("assemble the proxy with the binary's command wiring");

@@ -138,6 +138,9 @@ pub fn server(cfg: &Config, transport: McpTransport, services: &Services) -> Mcp
         .with_ssrf_policy(cfg.browser.ssrf.clone())
         .with_poc_dir(cfg.poc.dir.clone())
         .with_config(Arc::new(cfg.clone()))
+        // Wire the persistent finding recorder so a poc.run records on pass (T7);
+        // persistence stays gated on findings.dir.
+        .with_finding_recorder(Arc::new(aitm_findings::DiskFindingRecorder))
         .with_services(
             services.store.clone(),
             services.client.clone(),

@@ -273,6 +273,29 @@ impl L4Module {
         }
     }
 
+    /// Build a module over an **already-shared** guard + store, keeping the
+    /// fail-closed privilege gate. Unlike [`with_parts`](L4Module::with_parts)
+    /// (which assumes privilege present), this takes the real startup probe so the
+    /// wire verbs still fail closed when a capability is absent — the production
+    /// path when the binary owns the guard/store so the scripting engine's
+    /// [`L4Language`](crate::language::L4Language) and this command module act over
+    /// the **same** L4 engagement state (no divergent guard/store).
+    #[must_use]
+    pub fn with_shared(
+        guard: Arc<L4Guard>,
+        store: Arc<dyn L4FlowStore>,
+        intercept_cfg: Option<InterceptConfig>,
+        privilege: L4Privilege,
+    ) -> Self {
+        Self {
+            guard,
+            store,
+            intercept_cfg,
+            sessions: Arc::new(InterceptSessions::new()),
+            privilege,
+        }
+    }
+
     /// The shared deny-by-default guard (an `Arc` clone).
     #[must_use]
     pub fn guard(&self) -> Arc<L4Guard> {

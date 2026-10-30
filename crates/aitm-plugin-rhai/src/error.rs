@@ -37,7 +37,9 @@ pub enum ScriptError {
         line: usize,
         message: String,
     },
-    /// A hook ran past `hook_timeout` wall-clock and was aborted.
+    /// A hook ran past `hook_timeout` wall-clock — or one of its `browser.*`
+    /// calls past `browser_timeout` — and was aborted. `elapsed` is the budget
+    /// that fired.
     Timeout {
         script: String,
         hook: String,
@@ -109,6 +111,13 @@ impl ScriptError {
                             script,
                             hook,
                             elapsed: budget.hook_timeout,
+                        }
+                    }
+                    Some(AbortKind::BrowserTimeout) => {
+                        return ScriptError::Timeout {
+                            script,
+                            hook,
+                            elapsed: budget.browser_timeout,
                         }
                     }
                     None => {}

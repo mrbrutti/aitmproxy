@@ -8,8 +8,8 @@
 //! no `aitm-core` edit.
 
 pub use aitm_core::{
-    AsyncReadWrite, ByteStream, EventSink, ModuleCtx, NextLayerHint, ProtocolModule,
-    UpstreamConnector, Value,
+    AsyncReadWrite, ByteStream, CallerTrust, EventSink, Frontend, ModuleCtx, NextLayerHint,
+    ProtocolModule, UpstreamConnector, Value,
 };
 
 pub mod language;

@@ -21,7 +21,7 @@ use aitm_core::{
     ProxyClient, ScopeEntry, ScopeRateGuard, SsrfPolicy, StdGuard, Value,
 };
 use aitm_plugin_rhai::config::RhaiLimits;
-use aitm_plugin_rhai::engine::{begin_run, build_engine, AbortKind, RunKind};
+use aitm_plugin_rhai::engine::{begin_run, build_engine, AbortKind, Budget, RunKind};
 use aitm_plugin_rhai::host_core::{MemoryFindingSink, ScriptCapability, ScriptServices};
 use aitm_plugin_rhai::host_net::{
     BrowserCapability, HttpCapability, ScopeCapability, StoreCapability,
@@ -274,7 +274,8 @@ impl Harness {
 
 /// Run a script the way a dispatcher does: inside `block_in_place`, so the
 /// host verbs may block on the runtime handle, with a run of `kind` open so
-/// they know who is calling and how long is left.
+/// they know who is calling and how long is left (`budget` is the hook
+/// wall-clock; the browser budget is the shipped default).
 fn run_as<T: Clone + Send + Sync + 'static>(
     kind: RunKind,
     budget: Duration,
@@ -282,7 +283,13 @@ fn run_as<T: Clone + Send + Sync + 'static>(
     src: &str,
 ) -> Result<T, Box<EvalAltResult>> {
     tokio::task::block_in_place(|| {
-        let _run = begin_run(kind, budget);
+        let _run = begin_run(
+            kind,
+            Budget {
+                hook_timeout: budget,
+                ..Budget::default()
+            },
+        );
         engine.eval::<T>(src)
     })
 }

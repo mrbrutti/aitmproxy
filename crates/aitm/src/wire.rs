@@ -31,6 +31,8 @@ use aitm_plugins::{
 };
 use aitm_proto_http::{CertAuthority, HttpModule};
 use aitm_proto_l4::config::L4Config;
+use aitm_proto_l4::flow::L4FlowStore;
+use aitm_proto_l4::guard::L4Guard;
 use aitm_proto_l4::{L4Module, L4Privilege};
 use aitm_proto_ws::{InjectRegistry, WsModule};
 use tracing::{info, warn};
@@ -52,6 +54,23 @@ pub struct Features {
     /// An explicit L4 capability-probe result. `None` (production default) runs the
     /// real cheap startup probe; tests force a known privilege state here.
     pub l4_privilege: Option<L4Privilege>,
+    /// A pre-built, shared L4 guard + flow store the `l4.*` command module must act
+    /// over. `None` (every caller using `..Features::default()`) ⇒ the module builds
+    /// its own; `Some` ⇒ the binary already built the state and installed a live
+    /// [`L4Language`](aitm_proto_l4::L4Language) over the **same** guard/store on the
+    /// scripting engine, so a script's `l4.scope.add` and the bus see one state (no
+    /// divergent L4 engagement state).
+    pub l4_shared: Option<L4Shared>,
+}
+
+/// A shared L4 guard + flow store, built once by the binary and threaded into both
+/// the `l4.*` command module ([`Features::l4_shared`]) and the live
+/// [`L4Language`](aitm_proto_l4::L4Language) on the scripting engine, so both faces
+/// act over one L4 engagement state.
+#[derive(Clone)]
+pub struct L4Shared {
+    pub guard: Arc<L4Guard>,
+    pub store: Arc<dyn L4FlowStore>,
 }
 
 impl Default for Features {
@@ -61,6 +80,7 @@ impl Default for Features {
             ca_plugin: None,
             l4: L4Config::default(),
             l4_privilege: None,
+            l4_shared: None,
         }
     }
 }
@@ -108,6 +128,11 @@ pub struct ScriptWiring {
     /// Runs a PoC's `script` steps. `None` leaves `poc.run` declarative-only,
     /// erroring on a `script` step rather than skipping it.
     pub executor: Option<Arc<dyn aitm_poc::ScriptStepExecutor>>,
+    /// Native protocol `<ns>:` PoC-step handlers (e.g. `l4:`), built by the binary
+    /// from the same live language instance that owns the shared guard + store.
+    /// Threaded into `poc.run` alongside `executor`; empty leaves every protocol
+    /// namespace step a runtime error ("no handler registered").
+    pub poc_step_handlers: aitm_poc::step_registry::PocStepRegistry,
     /// Command-provider plugins registered after the first-party ones, in order.
     /// The binary fills this with the rhai tier's commands (`script.validate`,
     /// `script.reload`, `script.findings`) **and** the persistent findings store
@@ -246,6 +271,7 @@ pub fn assemble_with_scripts(
         .register_plugin(Box::new(BrowserPlugin::new(cfg.browser.ssrf.clone())))
         .register_plugin(Box::new(PocCommands {
             executor: scripts.executor,
+            step_handlers: scripts.poc_step_handlers,
         }))
         .register_plugin(Box::new(ca_plugin))
         .register_plugin(Box::new(
@@ -279,7 +305,18 @@ pub fn assemble_with_scripts(
                  L4Unavailable"
             ),
         }
-        let module = L4Module::with_privilege(&features.l4, privilege);
+        // When the binary pre-built the L4 state (so the scripting engine's live
+        // `L4Language` shares it), build the module over that same guard + store;
+        // otherwise the module owns its own. Either way the privilege gate stands.
+        let module = match &features.l4_shared {
+            Some(shared) => L4Module::with_shared(
+                shared.guard.clone(),
+                shared.store.clone(),
+                features.l4.intercept.clone(),
+                privilege,
+            ),
+            None => L4Module::with_privilege(&features.l4, privilege),
+        };
         l4_half = Some((module.guard(), module.store()));
         builder = builder.register_plugin(Box::new(module));
     }
@@ -410,6 +447,9 @@ pub fn build_proxy_with(cfg: &Config, features: &Features) -> anyhow::Result<Pro
 /// tier; without one it is the declarative M1 command.
 struct PocCommands {
     executor: Option<Arc<dyn aitm_poc::ScriptStepExecutor>>,
+    /// Native protocol-namespace step handlers (`l4:`), threaded to `poc.run`
+    /// together with the executor (the production path always supplies both).
+    step_handlers: aitm_poc::step_registry::PocStepRegistry,
 }
 
 impl Plugin for PocCommands {
@@ -420,7 +460,11 @@ impl Plugin for PocCommands {
     fn load(&mut self, reg: &mut Registry) {
         aitm_poc::builder::register(reg);
         match self.executor.clone() {
-            Some(exec) => aitm_poc::runner::register_with_executor(reg, exec),
+            Some(exec) => aitm_poc::runner::register_with_executor_and_steps(
+                reg,
+                exec,
+                self.step_handlers.clone(),
+            ),
             None => aitm_poc::runner::register(reg),
         }
         aitm_poc::library::register(reg);
