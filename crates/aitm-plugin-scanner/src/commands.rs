@@ -5,6 +5,9 @@
 //! present in the requests already captured for the reached endpoints (see
 //! [`crate::discover`]). It performs **no** injection and **no** fuzzing: it only
 //! lists reachable URLs and the injection points visible in observed traffic.
+//! Repeated scans of one target do not accumulate: each endpoint links to the
+//! newest captured flow that served it, and injection points are de-duplicated
+//! on (URL, location, name) across captures.
 //!
 //! Deny-by-default throughout: the crawl gates the target host through
 //! [`aitm_core::ScopeRateGuard::check_active`] before its first navigation, so
@@ -21,7 +24,7 @@
 //! [`aitm_core::redact::scrub_text`], so a token embedded in a URL's query is
 //! masked as well.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use aitm_core::redact::scrub_text;
 use aitm_core::{
@@ -29,7 +32,7 @@ use aitm_core::{
 };
 
 use crate::crawl::{block_on, crawl, normalize_url};
-use crate::discover::enumerate;
+use crate::discover::{enumerate, Location};
 use crate::ScannerConfig;
 
 /// Upper bound on each array in the result, so a long crawl cannot return an
@@ -138,18 +141,22 @@ impl Command for ScanDiscover {
             .map(String::as_str)
             .collect();
         let mut injection_points: Vec<Value> = Vec::new();
+        // (normalized URL, location, name) -> index into `injection_points`. The
+        // store keeps every earlier scan's captures of the same site, so the
+        // same point turns up once per capture; it is reported once, at the
+        // position of its first appearance, carrying the newest capture's flow
+        // and example. The cap bounds distinct keys; replacing an existing
+        // entry is always allowed.
+        let mut point_index: HashMap<(String, Location, String), usize> = HashMap::new();
         // Map each reached endpoint (keyed by the same scrubbed URL the result
-        // exposes in `endpoints`) to the first captured flow that served it, so a UI
-        // can link an endpoint row to its flow (AC3). Bounded by `endpoint_set` (<=
-        // MAX_RESULT_ITEMS), i.e. capped like the arrays; an endpoint with no captured
-        // flow is simply absent from the map.
+        // exposes in `endpoints`) to the newest captured flow that served it, so
+        // a UI can link an endpoint row to its flow (AC3). `list()` is in
+        // insertion order, so overwriting on every hit leaves the latest capture
+        // without consulting clocks. Bounded by `endpoint_set` (<=
+        // MAX_RESULT_ITEMS), i.e. capped like the arrays; an endpoint with no
+        // captured flow is simply absent from the map.
         let mut endpoint_flows: BTreeMap<String, Value> = BTreeMap::new();
         for id in host.store().list() {
-            if injection_points.len() >= MAX_RESULT_ITEMS
-                && endpoint_flows.len() >= endpoint_set.len()
-            {
-                break;
-            }
             let Some(Flow::Http(flow)) = host.store().get(id) else {
                 continue;
             };
@@ -161,16 +168,13 @@ impl Command for ScanDiscover {
             if !endpoint_set.contains(normalized.as_str()) {
                 continue;
             }
-            endpoint_flows
-                .entry(scrub_text(&normalized))
-                .or_insert_with(|| Value::Str(id.to_string()));
-            if injection_points.len() >= MAX_RESULT_ITEMS {
-                continue;
-            }
+            endpoint_flows.insert(scrub_text(&normalized), Value::Str(id.to_string()));
             for point in enumerate(&flow) {
-                if injection_points.len() >= MAX_RESULT_ITEMS {
-                    break;
-                }
+                let key = (
+                    normalized.clone(),
+                    point.location.clone(),
+                    point.name.clone(),
+                );
                 let mut obj = BTreeMap::new();
                 obj.insert("flow".into(), Value::Str(point.flow.to_string()));
                 obj.insert(
@@ -182,7 +186,17 @@ impl Command for ScanDiscover {
                 // catches a credential embedded inside an otherwise innocent
                 // value (`next=…?access_token=…`).
                 obj.insert("example".into(), Value::Str(scrub_text(&point.example)));
-                injection_points.push(Value::Object(obj));
+                if let Some(slot) = point_index
+                    .get(&key)
+                    .and_then(|&idx| injection_points.get_mut(idx))
+                {
+                    // Seen in an earlier capture: keep its place, take the
+                    // newer flow's id and example.
+                    *slot = Value::Object(obj);
+                } else if injection_points.len() < MAX_RESULT_ITEMS {
+                    point_index.insert(key, injection_points.len());
+                    injection_points.push(Value::Object(obj));
+                }
             }
         }
 
@@ -285,6 +299,84 @@ mod tests {
         }
     }
 
+    /// A browser that behaves like the real one sitting behind the proxy: every
+    /// `navigate()` leaves a freshly captured flow for the navigated URL in the
+    /// store shared with the host (as the proxy would), and `get_dom()` serves
+    /// that URL's page. Each captured flow carries one header, so every
+    /// endpoint yields a header injection point as well.
+    struct CapturingBrowser {
+        store: Arc<MemFlowStore>,
+        /// path+query -> HTML served for it; unknown pages serve an empty body.
+        pages: HashMap<String, String>,
+        current: Mutex<Option<String>>,
+        /// Ids of the flows this browser inserted, in navigation order.
+        inserted: Mutex<Vec<FlowId>>,
+    }
+
+    impl CapturingBrowser {
+        fn new(store: Arc<MemFlowStore>, pages: &[(&str, &str)]) -> Self {
+            Self {
+                store,
+                pages: pages
+                    .iter()
+                    .map(|(path, html)| (path.to_string(), html.to_string()))
+                    .collect(),
+                current: Mutex::new(None),
+                inserted: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn inserted(&self) -> Vec<FlowId> {
+            self.inserted.lock().expect("inserted lock").clone()
+        }
+    }
+
+    impl BrowserDriver for CapturingBrowser {
+        fn navigate(&self, url: &str) -> BoxFuture<'_, anyhow::Result<NavOutcome>> {
+            let url = url.to_string();
+            Box::pin(async move {
+                let path = url
+                    .strip_prefix("http://target.test")
+                    .unwrap_or_else(|| panic!("the crawl stays on the target origin: {url}"))
+                    .to_string();
+                let mut headers = HeaderMap::new();
+                headers.set("X-Trace", "trace-1");
+                let id = self.store.insert(captured(&path, headers));
+                self.inserted.lock().expect("inserted lock").push(id);
+                *self.current.lock().expect("current lock") = Some(path);
+                Ok(NavOutcome {
+                    final_url: url,
+                    status: Some(200),
+                })
+            })
+        }
+
+        fn click(&self, _target: ClickTarget) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { unimplemented!("the crawler never clicks") })
+        }
+
+        fn type_text(&self, _selector: &str, _text: &str) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { unimplemented!("the crawler never types") })
+        }
+
+        fn screenshot(&self) -> BoxFuture<'_, anyhow::Result<Vec<u8>>> {
+            Box::pin(async { unimplemented!("the crawler never screenshots") })
+        }
+
+        fn eval(&self, _expr: &str) -> BoxFuture<'_, anyhow::Result<Value>> {
+            Box::pin(async { unimplemented!("the crawler never evals") })
+        }
+
+        fn get_dom(&self) -> BoxFuture<'_, anyhow::Result<String>> {
+            Box::pin(async {
+                let current = self.current.lock().expect("current lock").clone();
+                Ok(current
+                    .and_then(|path| self.pages.get(&path).cloned())
+                    .unwrap_or_default())
+            })
+        }
+    }
+
     /// A `ProxyClient` the command must never reach: discovery is read-only and
     /// crawls through the browser, never the proxy client.
     struct NoSendClient;
@@ -371,6 +463,90 @@ mod tests {
             })
             .collect()
     }
+
+    /// One `injection_points` entry, as the caller sees it.
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct Point {
+        flow: String,
+        location: String,
+        name: String,
+        example: String,
+    }
+
+    fn points_of(result: &Value) -> Vec<Point> {
+        let Value::Object(map) = result else {
+            panic!("the result is an object: {result:?}");
+        };
+        let Some(Value::Array(items)) = map.get("injection_points") else {
+            panic!("the result carries an injection_points array: {result:?}");
+        };
+        items
+            .iter()
+            .map(|item| {
+                let Value::Object(o) = item else {
+                    panic!("each injection point is an object: {item:?}");
+                };
+                let field = |key: &str| match o.get(key) {
+                    Some(Value::Str(s)) => s.clone(),
+                    other => panic!("injection point `{key}` is a string: {other:?}"),
+                };
+                Point {
+                    flow: field("flow"),
+                    location: field("location"),
+                    name: field("name"),
+                    example: field("example"),
+                }
+            })
+            .collect()
+    }
+
+    /// `endpoint_flows` as endpoint URL -> flow id.
+    fn endpoint_flows_of(result: &Value) -> BTreeMap<String, String> {
+        let Value::Object(map) = result else {
+            panic!("the result is an object: {result:?}");
+        };
+        let Some(Value::Object(ef)) = map.get("endpoint_flows") else {
+            panic!("the result carries an endpoint_flows map: {result:?}");
+        };
+        ef.iter()
+            .map(|(endpoint, id)| match id {
+                Value::Str(s) => (endpoint.clone(), s.clone()),
+                other => panic!("endpoint_flows values are flow ids: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Every stored flow's id -> the request URL it captured.
+    fn flow_urls(store: &MemFlowStore) -> BTreeMap<String, String> {
+        store
+            .list()
+            .into_iter()
+            .filter_map(|id| match store.get(id) {
+                Some(Flow::Http(flow)) => {
+                    let req = &flow.request;
+                    Some((
+                        id.to_string(),
+                        format!("{}://{}{}", req.scheme, req.authority, req.path),
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `(location, name, example)` of each point, sorted: the shape of a scan's
+    /// output independent of which capture each point was read from.
+    fn shape(points: &[Point]) -> Vec<(String, String, String)> {
+        let mut shape: Vec<_> = points
+            .iter()
+            .map(|p| (p.location.clone(), p.name.clone(), p.example.clone()))
+            .collect();
+        shape.sort();
+        shape
+    }
+
+    const SITE_ROOT: &str =
+        r#"<a href="/search?q=hello">search</a> <a href="/account/1">account</a>"#;
 
     #[test]
     fn scan_discover_is_write() {
@@ -716,5 +892,189 @@ mod tests {
             err.downcast_ref::<GuardError>(),
             Some(&GuardError::OutOfScope("evil.com:80".into()))
         );
+    }
+
+    /// Scanning the same site again must report the same thing, not the sum of
+    /// every scan so far: the store still holds the earlier scans' captures, and
+    /// each of them serves the same endpoints.
+    #[test]
+    fn repeated_identical_scans_equal_one_scan() {
+        let store = Arc::new(MemFlowStore::new());
+        let browser = CapturingBrowser::new(store.clone(), &[("/", SITE_ROOT)]);
+        let guard = scoped_guard();
+        let client = NoSendClient;
+        let host = CommandHost::new(&*store, &client, &guard, Some(&browser));
+        let cmd = ScanDiscover {
+            cfg: ScannerConfig::default(),
+        };
+        let scan = || {
+            cmd.invoke(
+                params(&[("target", Value::Str("http://target.test/".into()))]),
+                &host,
+            )
+            .expect("an in-scope seed crawls")
+        };
+
+        let first = scan();
+        let _second = scan();
+        let third = scan();
+        assert_eq!(store.count(), 9, "three scans captured three pages each");
+
+        assert_eq!(
+            endpoints_of(&first),
+            vec![
+                "http://target.test/",
+                "http://target.test/search?q=hello",
+                "http://target.test/account/1",
+            ]
+        );
+        assert_eq!(endpoints_of(&third), endpoints_of(&first));
+
+        let first_points = points_of(&first);
+        let third_points = points_of(&third);
+        // One `X-Trace` header point per page, `q` on /search, the `1` segment
+        // on /account/1.
+        assert_eq!(first_points.len(), 5, "{first_points:?}");
+        assert_eq!(
+            third_points.len(),
+            first_points.len(),
+            "a rescan must not accumulate the earlier scans' points: {third_points:?}"
+        );
+        assert_eq!(shape(&third_points), shape(&first_points));
+
+        // No (url, location, name) key appears twice.
+        let urls = flow_urls(&store);
+        let mut keys = HashSet::new();
+        for p in &third_points {
+            let key = (urls[&p.flow].clone(), p.location.clone(), p.name.clone());
+            assert!(
+                keys.insert(key.clone()),
+                "injection point repeated across rescans: {key:?} in {third_points:?}"
+            );
+        }
+    }
+
+    /// With several captures of one endpoint in the store, the result links to
+    /// the newest (the one this scan just made), not the oldest.
+    #[test]
+    fn endpoint_flows_prefers_the_newest_flow() {
+        let store = Arc::new(MemFlowStore::new());
+        let browser = CapturingBrowser::new(store.clone(), &[("/", SITE_ROOT)]);
+        let guard = scoped_guard();
+        let client = NoSendClient;
+        let host = CommandHost::new(&*store, &client, &guard, Some(&browser));
+        let cmd = ScanDiscover {
+            cfg: ScannerConfig::default(),
+        };
+        let scan = || {
+            cmd.invoke(
+                params(&[("target", Value::Str("http://target.test/".into()))]),
+                &host,
+            )
+            .expect("an in-scope seed crawls")
+        };
+
+        let _first = scan();
+        let after_first = browser.inserted();
+        assert_eq!(after_first.len(), 3, "scan 1 captured three pages");
+        let second = scan();
+        let all = browser.inserted();
+        assert_eq!(all.len(), 6, "scan 2 captured the same three pages again");
+
+        let urls = flow_urls(&store);
+        // Scan 2's flow for each URL.
+        let newest: BTreeMap<String, String> = all[3..]
+            .iter()
+            .map(|id| (urls[&id.to_string()].clone(), id.to_string()))
+            .collect();
+        assert_eq!(newest.len(), 3);
+        let oldest: HashSet<String> = after_first.iter().map(ToString::to_string).collect();
+
+        // Every endpoint links to the flow scan 2 inserted for it...
+        let ef = endpoint_flows_of(&second);
+        assert_eq!(
+            ef, newest,
+            "endpoint_flows must point at the latest capture of each endpoint"
+        );
+
+        // ...and every injection point was read from scan 2's flow for its URL.
+        let points = points_of(&second);
+        assert_eq!(points.len(), 5, "{points:?}");
+        for p in &points {
+            assert!(
+                !oldest.contains(&p.flow),
+                "injection point still reads from scan 1's flow: {p:?}"
+            );
+            assert_eq!(
+                newest.get(&urls[&p.flow]),
+                Some(&p.flow),
+                "injection point must carry scan 2's flow for its URL: {p:?}"
+            );
+        }
+    }
+
+    /// The dedupe key includes the URL: the same `(location, name)` on two
+    /// different endpoints stays two points, each read from its own flow.
+    #[test]
+    fn rescan_dedupe_does_not_merge_distinct_urls() {
+        let store = Arc::new(MemFlowStore::new());
+        let browser = CapturingBrowser::new(
+            store.clone(),
+            &[("/", r#"<a href="/a?q=1">a</a> <a href="/b?q=2">b</a>"#)],
+        );
+        let guard = scoped_guard();
+        let client = NoSendClient;
+        let host = CommandHost::new(&*store, &client, &guard, Some(&browser));
+        let cmd = ScanDiscover {
+            cfg: ScannerConfig::default(),
+        };
+        let scan = || {
+            cmd.invoke(
+                params(&[("target", Value::Str("http://target.test/".into()))]),
+                &host,
+            )
+            .expect("an in-scope seed crawls")
+        };
+
+        let _first = scan();
+        let second = scan();
+
+        let points = points_of(&second);
+        let urls = flow_urls(&store);
+        let q: Vec<&Point> = points
+            .iter()
+            .filter(|p| p.location == "query" && p.name == "q")
+            .collect();
+        assert_eq!(
+            q.len(),
+            2,
+            "`q` on /a and on /b are two distinct points: {points:?}"
+        );
+        let q_urls: Vec<(&str, &str)> = {
+            let mut v: Vec<_> = q
+                .iter()
+                .map(|p| (urls[&p.flow].as_str(), p.example.as_str()))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            q_urls,
+            vec![
+                ("http://target.test/a?q=1", "1"),
+                ("http://target.test/b?q=2", "2"),
+            ]
+        );
+        // The shared header stays one point per endpoint: three endpoints,
+        // three `X-Trace` points.
+        assert_eq!(
+            points
+                .iter()
+                .filter(|p| p.location == "header" && p.name == "X-Trace")
+                .count(),
+            3,
+            "{points:?}"
+        );
+        assert_eq!(points.len(), 5, "{points:?}");
     }
 }
