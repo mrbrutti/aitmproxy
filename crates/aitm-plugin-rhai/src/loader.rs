@@ -29,6 +29,7 @@ use rhai::{Dynamic, Engine, ParseError, ParseErrorType, AST};
 
 use crate::command::register_reg_api;
 use crate::config::{RhaiConfig, ScriptEntry, ScriptMeta};
+use crate::dsl::DslCapability;
 use crate::engine::{build_engine, Budget};
 use crate::error::ScriptError;
 use crate::flow_api::register_flow_api;
@@ -584,6 +585,9 @@ fn m3_capabilities(cfg: &RhaiConfig) -> Vec<Arc<dyn ScriptCapability>> {
         Arc::new(StoreCapability),
         Arc::new(ScopeCapability::new(cfg.allow_scope_add)),
         Arc::new(VarsCapability),
+        // Pure prelude helpers (encode / hash / match / random); always offered,
+        // no services, no guard (see `crate::dsl`).
+        Arc::new(DslCapability),
     ]
 }
 

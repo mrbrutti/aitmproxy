@@ -142,6 +142,19 @@ pub fn rand_text_alpha(n: usize) -> String {
         .collect()
 }
 
+/// A random integer in the **inclusive** range `[a.min(b), a.max(b)]`, drawn
+/// from the module's shared thread-local xorshift RNG (non-cryptographic). The
+/// helper is total and order-insensitive — `rand_int(9, 3)` spans the same
+/// `[3, 9]` as `rand_int(3, 9)`; the Rhai `dsl` layer is where a reversed
+/// `a > b` becomes a script error. `i128` arithmetic keeps the inclusive width
+/// from overflowing even at the `i64::MIN..=i64::MAX` extreme.
+pub fn rand_int(a: i64, b: i64) -> i64 {
+    let (lo, hi) = (a.min(b), a.max(b));
+    let span = (hi as i128 - lo as i128 + 1) as u128;
+    let offset = (next_u64() as u128 % span) as i128;
+    (lo as i128 + offset) as i64
+}
+
 // --- Expression evaluation --------------------------------------------------
 
 /// Evaluate a DSL expression to a `Value` against `ctx`.
@@ -477,6 +490,20 @@ mod tests {
         assert_eq!(eval("200 == \"200\"", &ctx).unwrap(), Value::Bool(false));
         assert_eq!(eval("\"x\" == \"x\"", &ctx).unwrap(), Value::Bool(true));
         assert_eq!(eval("\"x\" != 1", &ctx).unwrap(), Value::Bool(true));
+    }
+
+    /// AC7: `rand_int` is inclusive, draws from the shared RNG, and is
+    /// order-insensitive — a degenerate `[7, 7]` is pinned, a span stays in
+    /// bounds over many draws, and a reversed `[9, 3]` spans the same `[3, 9]`.
+    #[test]
+    fn rand_int_is_within_inclusive_bounds() {
+        assert_eq!(rand_int(7, 7), 7);
+        for _ in 0..1000 {
+            let n = rand_int(3, 9);
+            assert!((3..=9).contains(&n), "rand_int(3, 9) out of range: {n}");
+            let r = rand_int(9, 3);
+            assert!((3..=9).contains(&r), "rand_int(9, 3) out of range: {r}");
+        }
     }
 
     /// Minor (b): `len` counts characters, not UTF-8 bytes.

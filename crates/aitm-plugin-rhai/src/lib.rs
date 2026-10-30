@@ -11,6 +11,7 @@ pub mod catalog_assembly;
 pub mod command;
 pub mod commands;
 pub mod config;
+pub mod dsl;
 pub mod engine;
 pub mod error;
 pub mod flow_api;
@@ -35,6 +36,7 @@ pub use catalog_assembly::{
 pub use command::{register_reg_api, ScriptCommand, ScriptRegHandle};
 pub use commands::ScriptCommands;
 pub use config::{RhaiConfig, RhaiLimits, ScriptEntry, ScriptMeta};
+pub use dsl::{register_dsl, DslCapability, DSL_FUNCTIONS};
 pub use engine::{build_engine_with_languages, Budget, RunKind, WORKER_STACK_SIZE};
 pub use error::ScriptError;
 pub use host_core::{
