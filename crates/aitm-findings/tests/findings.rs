@@ -339,6 +339,161 @@ fn findings_record_is_policy_gated() {
     .expect("operator remove");
 }
 
+/// Record one finding as the operator and return its id.
+fn record_as_operator(reg: &Registry, cfg: &Config, title: &str) -> String {
+    let rec = call_as(
+        reg,
+        cfg,
+        Frontend::Operator,
+        "findings.record",
+        &[
+            ("title", Value::Str(title.into())),
+            ("class", Value::Str("idor".into())),
+            ("severity", Value::Str("high".into())),
+            (
+                "target",
+                Value::Str("http://localhost:9000/account/2".into()),
+            ),
+            ("poc_ref", Value::Str("idor-account".into())),
+        ],
+    )
+    .expect("operator record");
+    record_id(&rec)
+}
+
+#[test]
+fn findings_remove_refuses_the_agent_and_admits_operator_and_cli() {
+    let reg = findings_reg();
+    let dir = unique_dir("remove-roles");
+    let cfg = cfg_with_findings(dir.clone());
+
+    let a = record_as_operator(&reg, &cfg, "IDOR on /account/2");
+    let b = record_as_operator(&reg, &cfg, "IDOR on /account/3");
+    assert_ne!(a, b);
+    assert!(dir.join(format!("{a}.yaml")).exists());
+    assert!(dir.join(format!("{b}.yaml")).exists());
+
+    // The agent (Mcp) is refused with the literal text, and the file survives.
+    let err = call_as(
+        &reg,
+        &cfg,
+        Frontend::Mcp,
+        "findings.remove",
+        &[("id", Value::Str(a.clone()))],
+    )
+    .expect_err("agent cannot remove");
+    assert_eq!(err.to_string(), "findings.remove is operator/CLI-only");
+    assert!(
+        dir.join(format!("{a}.yaml")).exists(),
+        "the refused remove must not delete {a}.yaml"
+    );
+
+    // The human CLI may remove.
+    let out = call_as(
+        &reg,
+        &cfg,
+        Frontend::Cli,
+        "findings.remove",
+        &[("id", Value::Str(a.clone()))],
+    )
+    .expect("cli remove");
+    assert_eq!(out, Value::Object(BTreeMap::new()));
+    assert!(
+        !dir.join(format!("{a}.yaml")).exists(),
+        "the CLI remove must delete {a}.yaml"
+    );
+
+    // The operator may remove.
+    let out = call_as(
+        &reg,
+        &cfg,
+        Frontend::Operator,
+        "findings.remove",
+        &[("id", Value::Str(b.clone()))],
+    )
+    .expect("operator remove");
+    assert_eq!(out, Value::Object(BTreeMap::new()));
+    assert!(
+        !dir.join(format!("{b}.yaml")).exists(),
+        "the operator remove must delete {b}.yaml"
+    );
+}
+
+/// The role gate runs before any argument or id validation: the agent sees the same
+/// refusal for a malformed, oversized, traversal or unknown id as for a good one, and
+/// learns nothing about the store; a trusted caller with the same input is past the
+/// gate, so it never gets the role refusal. What the store then says about a bad id
+/// (its wording, its length limit, whether an unknown id is an error) is the store's
+/// contract and is tested at the store level, not pinned here.
+#[test]
+fn findings_remove_gate_precedes_param_and_id_validation() {
+    let reg = findings_reg();
+    let dir = unique_dir("remove-order");
+    let cfg = cfg_with_findings(dir.clone());
+    let survivor = record_as_operator(&reg, &cfg, "IDOR on /account/9");
+    let survivor_yaml = dir.join(format!("{survivor}.yaml"));
+    assert!(survivor_yaml.exists());
+    let refusal = "findings.remove is operator/CLI-only";
+
+    // Far past any plausible id-length limit, so the vector stays "oversized" if the
+    // store's limit moves.
+    let oversized = "a".repeat(4096);
+    let bad_args: Vec<(&str, Vec<(&str, Value)>)> = vec![
+        ("no id param", vec![]),
+        ("empty id", vec![("id", Value::Str(String::new()))]),
+        ("traversal id", vec![("id", Value::Str("../escape".into()))]),
+        ("oversized id", vec![("id", Value::Str(oversized))]),
+        ("non-string id", vec![("id", Value::Int(7))]),
+        (
+            "unknown id",
+            vec![("id", Value::Str("no-such-finding".into()))],
+        ),
+    ];
+
+    for (what, args) in &bad_args {
+        // The agent: always the role refusal, whatever the arguments.
+        let err = call_as(&reg, &cfg, Frontend::Mcp, "findings.remove", args)
+            .expect_err("the agent is refused before the arguments are read");
+        assert_eq!(err.to_string(), refusal, "agent with {what}");
+
+        // Operator and CLI: past the role gate. Whatever the store makes of the
+        // input (an error of its own wording, or success), it is never the refusal.
+        for frontend in [Frontend::Operator, Frontend::Cli] {
+            if let Err(e) = call_as(&reg, &cfg, frontend, "findings.remove", args) {
+                assert_ne!(
+                    e.to_string(),
+                    refusal,
+                    "{frontend:?} with {what} must not get the role refusal"
+                );
+            }
+        }
+    }
+
+    // A path-traversal id never succeeds for a trusted caller either: the gate being
+    // ahead of validation must not mean validation is skipped for those who pass it.
+    for frontend in [Frontend::Operator, Frontend::Cli] {
+        let err = call_as(
+            &reg,
+            &cfg,
+            frontend,
+            "findings.remove",
+            &[("id", Value::Str("../escape".into()))],
+        )
+        .expect_err("a traversal id is rejected for a trusted caller");
+        assert_ne!(
+            err.to_string(),
+            refusal,
+            "{frontend:?} with a traversal id is past the gate"
+        );
+    }
+
+    // Nothing the agent (or a rejected request) did touched the stored finding.
+    assert!(
+        survivor_yaml.exists(),
+        "no refused or rejected remove may delete {survivor}.yaml"
+    );
+}
+
 #[test]
 fn record_command_roundtrips_through_list_and_get() {
     let reg = findings_reg();

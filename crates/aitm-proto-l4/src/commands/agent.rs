@@ -11,7 +11,7 @@
 //!    `All` — deferred to the command's own gate (the server's
 //!    `defers_to_command_gate` lists the L4 Sensitive verbs).
 //! 2. **The per-capability flag** — enforced *here*, in [`L4AgentGate`], a thin
-//!    wrapper the module places around each gated wire verb. For a `Frontend::Mcp`
+//!    wrapper the module places around each gated wire verb. For an untrusted (agent)
 //!    caller it refuses unless the matching gate is open; the operator and CLI roles
 //!    bypass it (the wire verbs are confirmed over the wire instead). The **widen**
 //!    gate for `l4.scope.add` is enforced in the guard
@@ -21,14 +21,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aitm_core::{
-    Command, CommandHost, Frontend, ParamDef, ParamSchema, Params, Sensitivity, TypeDesc, Value,
+    Command, CommandHost, ParamDef, ParamSchema, Params, Sensitivity, TypeDesc, Value,
 };
 
 use crate::gates::{AgentGate, L4AgentGates};
 
 /// A per-capability agent gate wrapped around one Sensitive `l4.*` command (the
-/// second M4 dimension). For a `Frontend::Mcp` caller it refuses unless the matching
-/// gate is open; the operator and CLI roles bypass it. `name` / `schema` /
+/// second M4 dimension). For an untrusted (agent) caller it refuses unless the matching
+/// gate is open; the trusted-control roles (operator and CLI) bypass it. `name` / `schema` /
 /// `sensitivity` / `confirm_prompt` delegate to the inner command, so the command
 /// still appears and classifies honestly in `tools/list` and the operator confirm
 /// handshake still runs.
@@ -62,10 +62,10 @@ impl Command for L4AgentGate {
     }
 
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
-        // Only the agent (`Frontend::Mcp`) is flag-gated; the operator and CLI are
+        // Only an untrusted (agent) caller is flag-gated; the operator and CLI are
         // the control and author freely (the hardest verbs ask the operator for
         // confirm-over-the-wire instead).
-        if host.frontend() == Frontend::Mcp && !self.gates.allowed(self.gate) {
+        if !host.caller_is_trusted_control() && !self.gates.allowed(self.gate) {
             anyhow::bail!(
                 "`{}` refused: agent access to the L4 `{}` capability is disabled. An operator can \
                  enable it with `l4.agent.set {{capability: \"{}\", allowed: true}}` (or the \
@@ -169,7 +169,7 @@ impl Command for AgentSet {
         // `All` would let a Sensitive call through — so the command self-gates too:
         // the agent can never flip its own gates (and `l4.agent.set` is deliberately
         // kept out of `defers_to_command_gate`, so `All` never defers it here).
-        if host.frontend() == Frontend::Mcp {
+        if !host.caller_is_trusted_control() {
             anyhow::bail!(
                 "l4.agent.set refused: the agent cannot change its own L4 gates; only an operator \
                  or the human CLI may set them."

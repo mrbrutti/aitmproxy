@@ -33,8 +33,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    Body, CallerTrust, ClickTarget, Command, CommandHost, FindingDraft, FlowId, Frontend,
-    HeaderMap, HttpRequest, HttpVersion, ParamDef, ParamSchema, Params, Registry, TypeDesc, Value,
+    Body, CallerTrust, ClickTarget, Command, CommandHost, FindingDraft, FlowId, HeaderMap,
+    HttpRequest, HttpVersion, ParamDef, ParamSchema, Params, Registry, TypeDesc, Value,
 };
 use futures::future::BoxFuture;
 
@@ -1100,10 +1100,11 @@ fn run_poc_command(
     executor: Option<&Arc<dyn ScriptStepExecutor>>,
     step_handlers: &PocStepRegistry,
 ) -> anyhow::Result<Value> {
-    // T3: an agent frontend may run `poc.run` only when the operator opted in via
-    // `poc.allow_agent_run`. `Frontend::Operator` and `Frontend::Cli` are never
-    // gated. Deny-by-default (mirrors scope.add / ca.install).
-    if host.frontend() == Frontend::Mcp
+    // T3: an untrusted (agent) caller may run `poc.run` only when the operator
+    // opted in via `poc.allow_agent_run`. A trusted-control caller (`Cli`,
+    // `Operator`) is never gated: see `CommandHost::caller_is_trusted_control`.
+    // Deny-by-default (mirrors scope.add / ca.install).
+    if !host.caller_is_trusted_control()
         && !host
             .config()
             .map(|c| c.poc.allow_agent_run)

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use aitm_core::{
-    Body, CommandHost, HeaderMap, HttpRequest, HttpResponse, HttpVersion, LimitConfig,
+    Body, CommandHost, Frontend, HeaderMap, HttpRequest, HttpResponse, HttpVersion, LimitConfig,
     MemFlowStore, Params, PipelineClient, Registry, RequestSender, ScopeEntry, ScopeRateGuard,
     StdGuard, Value,
 };
@@ -95,17 +95,27 @@ success:
     path
 }
 
+/// Invoke `poc.run` as a human CLI: these tests exercise the executor wiring, not
+/// the T3 agent-run gate (which only refuses the untrusted agent role).
 fn invoke_poc_run(registry: &Registry, path: &Path) -> anyhow::Result<Value> {
+    invoke_poc_run_as(registry, path, Frontend::Cli)
+}
+
+/// Invoke `poc.run` as `frontend`, with no config attached, so
+/// `poc.allow_agent_run` is off.
+fn invoke_poc_run_as(
+    registry: &Registry,
+    path: &Path,
+    frontend: Frontend,
+) -> anyhow::Result<Value> {
     let store = Arc::new(MemFlowStore::new());
     let guard = Arc::new(StdGuard::new(LimitConfig::default()));
     guard.add_scope(ScopeEntry {
         host: "poc.test".to_string(),
     });
     let client = PipelineClient::new(store.clone(), guard.clone(), Arc::new(OkSender));
-    // A human-CLI frontend: these tests exercise the executor wiring, not the T3
-    // agent-run gate (which only applies to Frontend::Mcp).
-    let host = CommandHost::new(store.as_ref(), &client, guard.as_ref(), None)
-        .with_frontend(aitm_core::Frontend::Cli);
+    let host =
+        CommandHost::new(store.as_ref(), &client, guard.as_ref(), None).with_frontend(frontend);
 
     let args = Params::new(
         [(
@@ -163,4 +173,58 @@ async fn poc_run_without_an_executor_still_errors_clearly() {
         err.to_string().contains("require the Rhai runtime"),
         "want the wiring hint, got: {err}",
     );
+}
+
+/// The `poc.run` agent gate on the *scripted* registration (the one the binary
+/// wires): the untrusted agent is refused before any step runs, and both human
+/// roles reach the executor. No config is attached, so `poc.allow_agent_run` is
+/// off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scripted_poc_run_is_gated_for_the_agent_only() {
+    // The agent: refused, and the executor never ran.
+    let exec = FixedExecutor::returning(ScriptVerdict::Pass);
+    let mut registry = Registry::new();
+    aitm_poc::runner::register_with_executor(&mut registry, exec.clone());
+    let path = poc_file("scripted-mcp");
+    let err = invoke_poc_run_as(&registry, &path, Frontend::Mcp)
+        .expect_err("the agent is refused while poc.allow_agent_run is off");
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        err.to_string()
+            .starts_with("poc.run refused: running a PoC from an agent frontend is disabled."),
+        "want the agent-run refusal, got: {err}",
+    );
+    assert_eq!(
+        exec.seen.lock().expect("seen lock").len(),
+        0,
+        "a refused agent must not reach the executor",
+    );
+
+    // Each human role: runs, and the executor ran the one script step.
+    for (tag, frontend) in [
+        ("scripted-operator", Frontend::Operator),
+        ("scripted-cli", Frontend::Cli),
+    ] {
+        let exec = FixedExecutor::returning(ScriptVerdict::Pass);
+        let mut registry = Registry::new();
+        aitm_poc::runner::register_with_executor(&mut registry, exec.clone());
+        let path = poc_file(tag);
+        let out = invoke_poc_run_as(&registry, &path, frontend)
+            .unwrap_or_else(|e| panic!("{frontend:?} must reach poc.run, got: {e}"));
+        let _ = std::fs::remove_file(&path);
+
+        let Value::Object(obj) = out else {
+            panic!("poc.run returns an object for {frontend:?}");
+        };
+        assert_eq!(
+            obj.get("passed"),
+            Some(&Value::Bool(true)),
+            "{frontend:?} reaches the script step's Pass",
+        );
+        assert_eq!(
+            exec.seen.lock().expect("seen lock").len(),
+            1,
+            "{frontend:?} ran the one script step",
+        );
+    }
 }

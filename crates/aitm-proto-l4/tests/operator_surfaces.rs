@@ -263,6 +263,28 @@ fn inject_agent_gate_flag_then_operator_bypass() {
     );
 }
 
+/// The human CLI, like the operator, is a trusted control role: with every agent flag
+/// OFF, a `Frontend::Cli` inject bypasses the per-capability agent gate and is refused
+/// only by the L4 guard (`out of L4 scope`), never by the gate.
+#[test]
+fn cli_inject_bypasses_the_agent_gate_and_reaches_the_guard() {
+    let parts = Parts::new();
+    let reg = registry(&cfg_with_inject_scope());
+    let err = reg
+        .command("l4.inject")
+        .unwrap()
+        .invoke(inject_params("8.8.8.8", 443), &parts.host(Frontend::Cli))
+        .unwrap_err();
+    assert!(
+        guard_refused(&err),
+        "cli inject must bypass the flag and reach the guard, got: {err:#}"
+    );
+    assert!(
+        !agent_gate_refused(&err),
+        "cli inject must not be refused by the agent gate, got: {err:#}"
+    );
+}
+
 /// Whether an invoke error is the agent gate's refusal (flag off).
 fn agent_gate_refused(err: &anyhow::Error) -> bool {
     format!("{err:#}").contains("capability is disabled")
@@ -358,6 +380,144 @@ fn agent_toggle_is_operator_only_and_governs_the_gate() {
         guard_refused(&err),
         "after the operator opened the gate, the agent inject must reach the guard, got: {err:#}"
     );
+}
+
+/// The human CLI may open an agent L4 gate, like the operator: `l4.agent.set` as
+/// `Frontend::Cli` succeeds and `l4.agent.status` then reports the gate open.
+#[test]
+fn cli_may_set_l4_agent_gates() {
+    let reg = registry(&cfg_with_inject_scope());
+    let parts = Parts::new();
+
+    let mut set_args = BTreeMap::new();
+    set_args.insert("capability".to_string(), Value::Str("inject".into()));
+    set_args.insert("allowed".to_string(), Value::Bool(true));
+    reg.command("l4.agent.set")
+        .unwrap()
+        .invoke(Params::new(set_args), &parts.host(Frontend::Cli))
+        .expect("cli l4.agent.set must be allowed");
+
+    let status = reg
+        .command("l4.agent.status")
+        .unwrap()
+        .invoke(Params::default(), &parts.host(Frontend::Operator))
+        .expect("status ok");
+    assert_eq!(
+        gate(&status, "inject"),
+        Some(true),
+        "the cli's toggle must be reflected in status"
+    );
+}
+
+/// AC7 exact text: the agent's `l4.agent.set` refusal is byte-for-byte the pinned
+/// sentence, it is the same refusal for a malformed call (the role gate runs before
+/// any argument is read), and no refused call opened or closed a gate. A trusted
+/// caller with the same malformed call gets the command's own argument error, never
+/// the role refusal.
+#[test]
+fn agent_set_refusal_text_is_exact_and_precedes_argument_validation() {
+    let reg = registry(&cfg_with_inject_scope());
+    let parts = Parts::new();
+    let refusal =
+        "l4.agent.set refused: the agent cannot change its own L4 gates; only an operator \
+                   or the human CLI may set them.";
+
+    let well_formed = {
+        let mut m = BTreeMap::new();
+        m.insert("capability".to_string(), Value::Str("inject".into()));
+        m.insert("allowed".to_string(), Value::Bool(true));
+        Params::new(m)
+    };
+    let malformed: [(&str, Params); 3] = [
+        ("no params", Params::default()),
+        ("unknown capability", {
+            let mut m = BTreeMap::new();
+            m.insert("capability".to_string(), Value::Str("bogus".into()));
+            m.insert("allowed".to_string(), Value::Bool(true));
+            Params::new(m)
+        }),
+        ("non-boolean allowed", {
+            let mut m = BTreeMap::new();
+            m.insert("capability".to_string(), Value::Str("inject".into()));
+            m.insert("allowed".to_string(), Value::Str("yes".into()));
+            Params::new(m)
+        }),
+    ];
+
+    let err = reg
+        .command("l4.agent.set")
+        .unwrap()
+        .invoke(well_formed, &parts.host(Frontend::Mcp))
+        .expect_err("the agent cannot flip a gate");
+    assert_eq!(err.to_string(), refusal);
+
+    for (what, args) in malformed {
+        let err = reg
+            .command("l4.agent.set")
+            .unwrap()
+            .invoke(args.clone(), &parts.host(Frontend::Mcp))
+            .expect_err("the agent is refused before its arguments are read");
+        assert_eq!(err.to_string(), refusal, "agent with {what}");
+
+        for frontend in [Frontend::Operator, Frontend::Cli] {
+            let err = reg
+                .command("l4.agent.set")
+                .unwrap()
+                .invoke(args.clone(), &parts.host(frontend))
+                .expect_err("a malformed call is rejected for a trusted caller");
+            assert_ne!(
+                err.to_string(),
+                refusal,
+                "{frontend:?} with {what} must not get the role refusal"
+            );
+        }
+    }
+
+    // No refused or rejected call changed any gate.
+    let status = reg
+        .command("l4.agent.status")
+        .unwrap()
+        .invoke(Params::default(), &parts.host(Frontend::Operator))
+        .expect("status ok");
+    for cap in ["inject", "capture", "intercept", "widen"] {
+        assert_eq!(
+            gate(&status, cap),
+            Some(false),
+            "gate `{cap}` stayed closed"
+        );
+    }
+}
+
+/// The per-capability agent gate wrapper runs before the inner verb reads its
+/// arguments: with the flag off, a malformed `l4.inject` from the agent is refused by
+/// the gate (so the agent learns nothing about the verb's argument checks); the same
+/// malformed call from `Operator` or `Cli` gets the verb's own argument error.
+#[test]
+fn inject_agent_gate_precedes_argument_validation() {
+    let reg = registry(&cfg_with_inject_scope());
+    let parts = Parts::new();
+
+    let err = reg
+        .command("l4.inject")
+        .unwrap()
+        .invoke(Params::default(), &parts.host(Frontend::Mcp))
+        .expect_err("a malformed agent inject is refused");
+    assert!(
+        agent_gate_refused(&err),
+        "the agent gate must refuse before the arguments are read, got: {err:#}"
+    );
+
+    for frontend in [Frontend::Operator, Frontend::Cli] {
+        let err = reg
+            .command("l4.inject")
+            .unwrap()
+            .invoke(Params::default(), &parts.host(frontend))
+            .expect_err("a malformed inject is rejected for a trusted caller");
+        assert!(
+            !agent_gate_refused(&err),
+            "{frontend:?} must never be refused by the agent gate, got: {err:#}"
+        );
+    }
 }
 
 fn gate(status: &Value, cap: &str) -> Option<bool> {

@@ -11,8 +11,8 @@
 use std::sync::Arc;
 
 use aitm_core::{
-    Authority, Command, CommandHost, Frontend, ParamDef, ParamSchema, Params, Plugin, Registry,
-    ScopeEntry, TypeDesc, Value,
+    Authority, Command, CommandHost, ParamDef, ParamSchema, Params, Plugin, Registry, ScopeEntry,
+    TypeDesc, Value,
 };
 
 /// Registers `scope.add`, `scope.remove`, and `scope.list`. Observes no events.
@@ -85,8 +85,9 @@ impl Command for ScopeAdd {
         // Widening scope is a human authorisation decision: refuse it from an
         // agent frontend (MCP) unless the operator opted in (mirrors ca.install).
         // A present human — the CLI or an operator-token connection
-        // (`Frontend::Operator`, e.g. the mac/web/tui surfaces) — may always widen.
-        if host.frontend() == Frontend::Mcp && !self.allow_agent_widen {
+        // (`Frontend::Operator`, e.g. the mac/web/tui surfaces) — may always widen:
+        // see `CommandHost::caller_is_trusted_control`.
+        if !host.caller_is_trusted_control() && !self.allow_agent_widen {
             anyhow::bail!(
                 "scope.add refused: widening scope from an agent frontend is disabled. Set \
                  scope.allow_agent_widen = true in the aitmproxy config to allow it, or add the \

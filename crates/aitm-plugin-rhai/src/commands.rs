@@ -35,9 +35,10 @@
 //!   `Sensitive`.
 //!
 //! **Agent gating.** `save`, `reload`, `enable` and `disable` are `Sensitive`
-//! (so `AgentPolicy` parks them under Ask) and additionally refuse a
-//! `Frontend::Mcp` caller unless `rhai.allow_agent_authoring` is set; the
-//! human CLI and an operator connection are never gated by the flag.
+//! (so `AgentPolicy` parks them under Ask) and additionally refuse an untrusted
+//! (agent) caller, any caller `Frontend::is_trusted_control` does not trust, unless
+//! `rhai.allow_agent_authoring` is set; the human CLI and an operator connection
+//! are never gated by the flag.
 //! `list`, `validate` and `findings` are `Read` and never gated.
 
 use std::collections::BTreeMap;
@@ -261,11 +262,11 @@ impl Command for Validate {
 /// The per-command, always-on gate for the authoring commands (`save`,
 /// `reload`, `enable`, `disable`), independent of `AgentPolicy`: a human
 /// operator (`Frontend::Operator`) and the human CLI author freely; only an
-/// autonomous agent (`Frontend::Mcp`) is gated, by `rhai.allow_agent_authoring`.
+/// untrusted (agent) caller is gated, by `rhai.allow_agent_authoring`.
 /// This deliberately exempts `Frontend::Operator`, unlike the map-rules gate,
 /// which exempts only `Cli`.
 fn check_agent_gate(host: &CommandHost, allow_agent_authoring: bool) -> anyhow::Result<()> {
-    if host.frontend() == Frontend::Mcp && !allow_agent_authoring {
+    if !host.caller_is_trusted_control() && !allow_agent_authoring {
         anyhow::bail!(
             "script authoring refused: an agent frontend may not author scripts. \
              Set rhai.allow_agent_authoring = true in the aitmproxy config to allow it, \
