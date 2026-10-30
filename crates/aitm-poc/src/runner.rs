@@ -1345,7 +1345,13 @@ mod tests {
         let store = MemFlowStore::new();
         let client = NoClient;
         let guard = StdGuard::default();
-        let host = CommandHost::new(&store, &client, &guard, None);
+        // This test exercises protocol-step dispatch, not the agent-run gate,
+        // so build the host as a present operator. `poc.run` only refuses a
+        // `Frontend::Mcp` caller when `poc.allow_agent_run` is false, and the
+        // default `CommandHost::new` frontend is `Mcp`; without this the control
+        // assertion below never reaches the "no handler" path.
+        let host =
+            CommandHost::new(&store, &client, &guard, None).with_frontend(Frontend::Operator);
         let args = || {
             Params::new(
                 [(
