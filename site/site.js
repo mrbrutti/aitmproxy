@@ -121,4 +121,73 @@
     menu.addEventListener("click", function (e) { if (e.target.closest("a")) menu.removeAttribute("open"); });
     document.addEventListener("keydown", function (e) { if (e.key === "Escape") menu.removeAttribute("open"); });
   }
+
+  /* Download table: fetch downloads.json (the release manifest) and render one row
+     per asset into [data-downloads]. Progressive enhancement — if the manifest is
+     absent or fails to load or parse, the container stays hidden and the static
+     Homebrew / build-from-source instructions remain the download path. On failure
+     we change nothing and say nothing (no console output). */
+  var dlHost = document.querySelector("[data-downloads]");
+  if (dlHost && window.fetch) {
+    var td = function (text) {
+      var cell = document.createElement("td");
+      cell.textContent = text == null ? "" : String(text);
+      return cell;
+    };
+    var shortSha = function (sha) {
+      var s = sha == null ? "" : String(sha);
+      return s.length > 12 ? s.slice(0, 12) + "…" : s;
+    };
+    var renderDownloads = function (data) {
+      if (!data || !data.assets || !data.assets.length) return;
+      var ui = document.createElement("div");
+      ui.className = "ui";
+      var table = document.createElement("table");
+      table.className = "flows";
+      var thead = document.createElement("thead");
+      var hr = document.createElement("tr");
+      ["Platform", "Arch", "Format", "SHA-256", "Download"].forEach(function (h) {
+        var th = document.createElement("th");
+        th.textContent = h;
+        hr.appendChild(th);
+      });
+      thead.appendChild(hr);
+      table.appendChild(thead);
+      var tbody = document.createElement("tbody");
+      data.assets.forEach(function (a) {
+        var tr = document.createElement("tr");
+        tr.appendChild(td(a.platform));
+        tr.appendChild(td(a.arch));
+        tr.appendChild(td(a.format));
+        var shaCell = document.createElement("td");
+        var code = document.createElement("code");
+        code.textContent = shortSha(a.sha256);
+        shaCell.appendChild(code);
+        tr.appendChild(shaCell);
+        var dlCell = document.createElement("td");
+        if (a.url) {
+          var link = document.createElement("a");
+          link.href = a.url;
+          link.textContent = a.name || a.url;
+          link.setAttribute("rel", "noopener");
+          dlCell.appendChild(link);
+        } else {
+          dlCell.textContent = a.name || "";
+        }
+        tr.appendChild(dlCell);
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      ui.appendChild(table);
+      dlHost.appendChild(ui);
+      dlHost.removeAttribute("hidden");
+    };
+    try {
+      window.fetch("downloads.json", { cache: "no-cache" }).then(function (res) {
+        return res && res.ok ? res.json() : null;
+      }).then(function (data) {
+        if (data) renderDownloads(data);
+      })["catch"](function () { /* no manifest / network / parse error: keep the fallback */ });
+    } catch (e) { /* fetch threw synchronously: keep the fallback */ }
+  }
 })();

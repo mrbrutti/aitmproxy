@@ -1,0 +1,197 @@
+name: Release
+
+# Builds every Linux release artifact for a `v*` tag, attaches them to the
+# GitHub Release, writes a combined SHA256SUMS, and regenerates the website
+# downloads manifest (distribution spec §C). macOS signed artifacts (DMG +
+# aarch64 tarball) are built and uploaded by Matt on his Mac per the runbook;
+# this workflow never signs. There is no Windows job — obscura ships no Windows
+# asset (spec non-goals / AC11).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to operate on (e.g. v0.1.0)"
+        required: true
+        type: string
+      finalize_only:
+        description: "Skip the Linux build and only (re)run finalize — use after Matt uploads the macOS assets"
+        required: false
+        default: false
+        type: boolean
+
+# Least privilege: write is needed to upload Release assets and to commit the
+# refreshed site/downloads.json back to main (so pages.yml redeploys).
+permissions:
+  contents: write
+
+# One release run per tag; never cancel an in-progress run so a publish always
+# finishes.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Fail fast unless the tag `v<X>` equals the aitm crate version (AC6), and
+  # make sure the Release exists before the build jobs upload to it.
+  version-guard:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve the tag
+        id: vars
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "resolved tag: ${tag}"
+
+      - name: Guard tag equals the aitm crate version
+        run: |
+          tag="${{ steps.vars.outputs.tag }}"
+          # `cargo pkgid` prints `…/crates/aitm#0.1.0` (or `…#aitm@0.1.0`);
+          # keep the version after the last `#` or `@`.
+          version=$(cargo pkgid -p aitm | sed 's/.*[#@]//')
+          echo "tag=${tag} crate=v${version}"
+          if [ "$tag" != "v${version}" ]; then
+            echo "::error::release tag ${tag} does not match aitm crate version v${version}"
+            exit 1
+          fi
+
+      - name: Ensure the GitHub Release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.vars.outputs.tag }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release ${tag} already exists"
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+              --title "$tag" --generate-notes
+          fi
+
+  # Build the generic tarball + nfpm .deb/.rpm for each Linux arch and upload
+  # them to the Release (AC5). aarch64 uses a native arm64 runner so the
+  # host-triple package.sh and package-linux.sh build correctly without cross
+  # (spec §C: "an aarch64 runner — builder's choice").
+  linux:
+    needs: version-guard
+    if: ${{ !inputs.finalize_only }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - triple: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install nfpm
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Build the generic tarball (scripts/package.sh)
+        env:
+          # obscura lives in a separate private repo; the default GITHUB_TOKEN
+          # cannot read it, so a PAT with read access to mrbrutti/obscura must
+          # be configured as OBSCURA_GH_TOKEN.
+          GH_TOKEN: ${{ secrets.OBSCURA_GH_TOKEN }}
+        run: bash scripts/package.sh
+
+      - name: Build the Linux packages (scripts/package-linux.sh)
+        env:
+          GH_TOKEN: ${{ secrets.OBSCURA_GH_TOKEN }}
+        run: bash scripts/package-linux.sh "${{ matrix.triple }}"
+
+      - name: Upload artifacts to the Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ needs.version-guard.outputs.tag }}"
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber \
+            dist/*.tar.gz dist/*.deb dist/*.rpm
+
+  # Combine every Release asset into SHA256SUMS (AC7) and regenerate
+  # site/downloads.json. Runnable standalone (finalize_only) after Matt uploads
+  # the macOS DMG + tarball, so the checksums and manifest cover them too.
+  finalize:
+    needs: [version-guard, linux]
+    if: ${{ always() && needs.version-guard.result == 'success' && (needs.linux.result == 'success' || needs.linux.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Download every Release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ needs.version-guard.outputs.tag }}"
+          mkdir -p dist-assets
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir dist-assets
+          # Drop any SHA256SUMS from a previous finalize so it is neither
+          # checksummed nor treated as a downloadable asset.
+          rm -f dist-assets/SHA256SUMS
+
+      - name: Build combined SHA256SUMS
+        run: |
+          : > SHA256SUMS
+          ( cd dist-assets && for f in *; do shasum -a 256 "$f"; done ) >> SHA256SUMS
+          echo "SHA256SUMS:"
+          cat SHA256SUMS
+
+      - name: Upload SHA256SUMS to the Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ needs.version-guard.outputs.tag }}"
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber SHA256SUMS
+
+      - name: Generate site/downloads.json
+        run: |
+          tag="${{ needs.version-guard.outputs.tag }}"
+          names=()
+          for f in dist-assets/*; do
+            names+=("$(basename "$f")")
+          done
+          bash scripts/gen-downloads-manifest.sh \
+            "$tag" "$GITHUB_REPOSITORY" SHA256SUMS "${names[@]}" > site/downloads.json
+          echo "site/downloads.json:"
+          cat site/downloads.json
+
+      - name: Commit the refreshed manifest to main
+        run: |
+          tag="${{ needs.version-guard.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add site/downloads.json
+          if git diff --cached --quiet; then
+            echo "site/downloads.json unchanged; nothing to commit"
+          else
+            git commit -m "chore(site): refresh downloads manifest for ${tag}"
+            git push origin HEAD:main
+          fi

@@ -1,0 +1,72 @@
+{
+  "version": "0.1.0",
+  "tag": "v0.1.0",
+  "released": "2026-10-29",
+  "release_url": "https://github.com/mrbrutti/aitmproxy/releases/tag/v0.1.0",
+  "assets": [
+    {
+      "platform": "linux",
+      "arch": "x86_64",
+      "format": "tar.gz",
+      "name": "aitm-0.1.0-x86_64-unknown-linux-gnu.tar.gz",
+      "url": "https://github.com/mrbrutti/aitmproxy/releases/download/v0.1.0/aitm-0.1.0-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+    },
+    {
+      "platform": "linux",
+      "arch": "x86_64",
+      "format": "deb",
+      "name": "aitm-0.1.0-amd64.deb",
+      "url": "https://github.com/mrbrutti/aitmproxy/releases/download/v0.1.0/aitm-0.1.0-amd64.deb",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac"
+    },
+    {
+      "platform": "linux",
+      "arch": "x86_64",
+      "format": "rpm",
+      "name": "aitm-0.1.0-x86_64.rpm",
+      "url": "https://github.com/mrbrutti/aitmproxy/releases/download/v0.1.0/aitm-0.1.0-x86_64.rpm",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad"
+    },
+    {
+      "platform": "linux",
+      "arch": "aarch64",
+      "format": "tar.gz",
+      "name": "aitm-0.1.0-aarch64-unknown-linux-gnu.tar.gz",
+      "url": "https://github.com/mrbrutti/aitmproxy/releases/download/v0.1.0/aitm-0.1.0-aarch64-unknown-linux-gnu.tar.gz",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae"
+    },
+    {
+      "platform": "linux",
+      "arch": "aarch64",
+      "format": "deb",
+      "name": "aitm-0.1.0-arm64.deb",
+      "url": "https://github.com/mrbrutti/aitmproxy/releases/download/v0.1.0/aitm-0.1.0-arm64.deb",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaf"
+    },
+    {
+      "platform": "linux",
+      "arch": "aarch64",
+      "format": "rpm",
+      "name": "aitm-0.1.0-aarch64.rpm",
+      "url": "https://github.com/mrbrutti/aitmproxy/releases/download/v0.1.0/aitm-0.1.0-aarch64.rpm",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0"
+    },
+    {
+      "platform": "macos",
+      "arch": "aarch64",
+      "format": "tar.gz",
+      "name": "aitm-0.1.0-aarch64-apple-darwin.tar.gz",
+      "url": "https://github.com/mrbrutti/aitmproxy/releases/download/v0.1.0/aitm-0.1.0-aarch64-apple-darwin.tar.gz",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1"
+    },
+    {
+      "platform": "macos",
+      "arch": "aarch64",
+      "format": "dmg",
+      "name": "Aitmproxy-0.1.0.dmg",
+      "url": "https://github.com/mrbrutti/aitmproxy/releases/download/v0.1.0/Aitmproxy-0.1.0.dmg",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2"
+    }
+  ]
+}

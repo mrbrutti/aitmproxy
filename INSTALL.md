@@ -80,14 +80,60 @@ So after building from source, make `obscura` reachable by any one of:
 Chromium will be rejected at probe time. On macOS, clear the download quarantine
 with `xattr -d com.apple.quarantine /path/to/obscura` or it will fail to spawn.
 
-## Linux and other platforms
+## Linux native packages
 
-The Homebrew formula and cask above are Apple-Silicon macOS only. On Linux (and
-other targets), build from source as above: `obscura` ships Linux release assets
-for both `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` at
-`mrbrutti/obscura@aitm-v1`, so `scripts/package.sh` run **on the Linux host**
-produces a `dist/aitm-<version>-<target>.tar.gz` with `aitm` and `obscura`
-bundled together, exactly as on macOS.
+The Homebrew formula and cask above are Apple-Silicon macOS only. On Linux, the
+primary install route is a native `.deb` or `.rpm` package — download the one for
+your distro family and CPU from the release page, then:
+
+**Debian / Ubuntu (`.deb`):**
+
+```bash
+sudo apt install ./aitm-<ver>-<arch>.deb
+# or, without apt resolving dependencies:
+sudo dpkg -i ./aitm-<ver>-<arch>.deb
+```
+
+**Fedora / RHEL (`.rpm`):**
+
+```bash
+sudo dnf install ./aitm-<ver>-<arch>.rpm
+```
+
+Packages are published for **x86_64** and **aarch64**. **Windows is not
+supported.**
+
+### What the package installs
+
+```
+/usr/lib/aitmproxy/aitm        the proxy / web / CLI core
+/usr/lib/aitmproxy/aitm-tui    the detached operator TUI
+/usr/lib/aitmproxy/obscura     the browser engine
+/usr/bin/aitm      → /usr/lib/aitmproxy/aitm        (on PATH)
+/usr/bin/aitm-tui  → /usr/lib/aitmproxy/aitm-tui    (on PATH)
+```
+
+After install, `aitm` and `aitm-tui` are on your `PATH`; just run `aitm`.
+**`aitm-tui` is included** (unlike a bare `cargo build`), so the standalone
+operator UI is available out of the box.
+
+**`obscura` is auto-discovered** — you do **not** set `AITM_OBSCURA_BIN`, a
+config key, or a `PATH` entry. `obscura` is intentionally not placed on `PATH`
+(it is not a user command); instead it sits beside the core in
+`/usr/lib/aitmproxy`. Running `/usr/bin/aitm` resolves through the symlink to
+`/usr/lib/aitmproxy/aitm`, so discovery step 3 (`obscura` next to the resolved
+`aitm`) finds `/usr/lib/aitmproxy/obscura` automatically. This is the same
+"bundle obscura beside aitm" arrangement described under
+[Building from source](#building-from-source-cargo--bare-binary) above, done for
+you by the package.
+
+### Linux from source (fallback)
+
+If no native package fits your system, build from source as above: `obscura`
+ships Linux release assets for both `x86_64-unknown-linux-gnu` and
+`aarch64-unknown-linux-gnu` at `mrbrutti/obscura@aitm-v1`, so `scripts/package.sh`
+run **on the Linux host** produces a `dist/aitm-<version>-<target>.tar.gz` with
+`aitm`, `aitm-tui`, and `obscura` bundled together, exactly as on macOS.
 
 ---
 

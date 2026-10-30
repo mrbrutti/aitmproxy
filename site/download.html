@@ -70,6 +70,19 @@
   </div>
 </section>
 
+<!-- ============ DIRECT DOWNLOADS ============
+     Progressive enhancement: site.js fetches downloads.json and fills the
+     [data-downloads] container with one row per release asset. When the manifest
+     is missing (or fails to load) the container stays hidden and the Homebrew /
+     build-from-source instructions above remain the download path. -->
+<section class="section" id="downloads" style="padding-top:0">
+  <div class="wrap">
+    <h2 class="h2" data-reveal>Packages and archives</h2>
+    <p class="lead deck">Prefer a native package or a plain archive? Each release attaches a <code>.deb</code>, an <code>.rpm</code> and a <code>.tar.gz</code> for Linux (x86-64 and arm64), and a signed <code>.dmg</code> and tarball for macOS. Not seeing a build you need? Use Homebrew above or build from source.</p>
+    <div class="downloads" data-downloads hidden></div>
+  </div>
+</section>
+
 <!-- ============ PLATFORMS ============ -->
 <section class="section" id="platforms">
   <div class="wrap">
