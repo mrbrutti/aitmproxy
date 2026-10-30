@@ -5,6 +5,12 @@ name: CI
 # lint-dirty main can never land silently again. Before this, the repo had
 # only pages.yml (site deploy) and release.yml (tag releases); nothing
 # compiled the workspace in CI, which let a broken main slip in once.
+#
+# The gate only compiles/tests Rust, so a PR that touches no Rust — the
+# marketing site, docs, markdown, or CI/workflow config — skips the heavy
+# fmt/clippy/test steps. The job still runs and reports success, so a
+# required "Rust gate" status check is satisfied either way. Pushes to main
+# and manual dispatches always run the full gate.
 on:
   pull_request:
   push:
@@ -34,26 +40,63 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Decide whether the Rust gate applies to this change. Site-only, docs-only,
+      # markdown-only and CI/workflow-only PRs cannot affect the Rust build, so they
+      # skip the heavy steps below (the job still reports success). Anything else —
+      # any .rs, Cargo.toml/lock, rust-toolchain, scripts, etc. — runs the full gate.
+      # Pushes to main and manual dispatches always run it.
+      - name: Detect whether the Rust gate applies
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "Event is ${{ github.event_name }} — running the full gate."
+            exit 0
+          fi
+          git fetch --no-tags origin "${{ github.base_ref }}"
+          base="$(git merge-base "origin/${{ github.base_ref }}" HEAD)"
+          changed="$(git diff --name-only "$base" HEAD)"
+          printf 'Changed files:\n%s\n' "$changed"
+          if printf '%s\n' "$changed" | grep -qvE '^(site/|docs/|\.github/|.*\.md$)'; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "Rust/build files changed — running the full gate."
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+            echo "Only site/docs/CI/markdown changed — skipping fmt/clippy/test."
+          fi
 
       # The workspace links libpcap (the `pcap` crate, L4 capture). macOS ships
       # it; Ubuntu runners need the -dev package or the test link step fails
       # with `unable to find library -lpcap`.
       - name: Install system build deps
+        if: steps.changes.outputs.rust == 'true'
         run: sudo apt-get update && sudo apt-get install -y libpcap-dev
 
       - name: Install Rust toolchain (stable + rustfmt + clippy)
+        if: steps.changes.outputs.rust == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
       - name: Cache cargo registry and build
+        if: steps.changes.outputs.rust == 'true'
         uses: Swatinem/rust-cache@v2
 
       - name: Format check
+        if: steps.changes.outputs.rust == 'true'
         run: cargo fmt --check
 
       - name: Clippy (deny warnings)
+        if: steps.changes.outputs.rust == 'true'
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Tests
+        if: steps.changes.outputs.rust == 'true'
         run: cargo test
+
+      - name: Rust gate not applicable (no Rust changes)
+        if: steps.changes.outputs.rust != 'true'
+        run: echo "This PR changes no Rust/build files; the Rust gate does not apply. Skipped fmt/clippy/test."
