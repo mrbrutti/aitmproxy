@@ -10,7 +10,7 @@
 use futures::future::BoxFuture;
 use tokio::sync::oneshot;
 
-use crate::flow::{Flow, HttpFlow, HttpRequest, HttpResponse, InterceptState, ResumeHandle};
+use crate::flow::{Flow, FlowId, HttpFlow, HttpRequest, HttpResponse, InterceptState, ResumeHandle};
 use crate::guard::ScopeRateGuard;
 use crate::store::FlowStore;
 use crate::value::Value;
@@ -66,6 +66,39 @@ pub enum Frontend {
     Operator,
 }
 
+/// A finding a `poc.run` produces, in the shape the persistence layer records.
+/// Declared in `aitm-core` (the bottom of the dependency graph) so the PoC runner
+/// can build one without depending on `aitm-findings`; `aitm-findings` provides the
+/// [`FindingRecorder`] that turns it into a durable record. `severity` is a
+/// lowercase string (`info|low|medium|high|critical`) because core cannot name
+/// `aitm_poc::Severity`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingDraft {
+    pub title: String,
+    pub class: String,
+    pub severity: String,
+    pub target: String,
+    pub poc_ref: String,
+    pub passed: bool,
+    pub finding_capture: FlowId,
+    pub flows: Vec<FlowId>,
+    pub poc_path: String,
+    pub screenshot_path: String,
+    pub origin: Frontend,
+    pub client_label: Option<String>,
+}
+
+/// Persists a [`FindingDraft`] into the configured findings store, returning the
+/// recorded finding's id. Implemented by `aitm-findings` (`DiskFindingRecorder`)
+/// and wired onto [`CommandHost`] by the binary — the same seam shape as
+/// `FindingSink` / `ScriptStepExecutor`: `aitm-core` stays the bottom of the graph
+/// and the PoC runner records through the trait with no findings-crate dependency.
+pub trait FindingRecorder: Send + Sync {
+    /// Record `draft` under `dir` (the configured `findings.dir`); returns the
+    /// recorded finding's id.
+    fn record(&self, draft: &FindingDraft, dir: &std::path::Path) -> anyhow::Result<String>;
+}
+
 /// Core services a command may use, without depending on any protocol crate.
 pub struct CommandHost<'a> {
     store: &'a dyn FlowStore,
@@ -77,6 +110,7 @@ pub struct CommandHost<'a> {
     frontend: Frontend,
     client_label: Option<String>,
     config: Option<std::sync::Arc<crate::config::Config>>,
+    finding_recorder: Option<&'a dyn FindingRecorder>,
 }
 
 impl<'a> CommandHost<'a> {
@@ -102,6 +136,7 @@ impl<'a> CommandHost<'a> {
             frontend: Frontend::Mcp,
             client_label: None,
             config: None,
+            finding_recorder: None,
         }
     }
 
@@ -115,6 +150,20 @@ impl<'a> CommandHost<'a> {
     /// The attached proxy configuration, if the frontend provided it.
     pub fn config(&self) -> Option<&crate::config::Config> {
         self.config.as_deref()
+    }
+
+    /// Wire the finding recorder (the binary's `DiskFindingRecorder`), so
+    /// `poc.run` can persist a [`FindingDraft`]. `None` (the default) means no
+    /// persistence — the deny-by-default posture; recording is additionally gated
+    /// on a configured `findings.dir`.
+    pub fn with_finding_recorder(mut self, recorder: &'a dyn FindingRecorder) -> Self {
+        self.finding_recorder = Some(recorder);
+        self
+    }
+
+    /// The wired finding recorder, if any (`None` = no persistence).
+    pub fn finding_recorder(&self) -> Option<&dyn FindingRecorder> {
+        self.finding_recorder
     }
 
     /// Use the configured SSRF policy instead of the default.
@@ -268,5 +317,67 @@ fn set_intercept(flow: &mut Flow, state: InterceptState) {
     match flow {
         Flow::Http(f) => f.intercept = state,
         Flow::WebSocket(f) => f.intercept = state,
+    }
+}
+
+#[cfg(test)]
+mod finding_recorder_tests {
+    use super::*;
+    use crate::guard::StdGuard;
+    use crate::store::MemFlowStore;
+
+    /// A `ProxyClient` that is never called in these tests.
+    struct NoopClient;
+    impl ProxyClient for NoopClient {
+        fn send(&self, _req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+            Box::pin(async { anyhow::bail!("NoopClient: send not supported in this test") })
+        }
+    }
+
+    /// A recorder that asserts on the draft it is given and returns a fixed id.
+    struct StubRecorder;
+    impl FindingRecorder for StubRecorder {
+        fn record(&self, draft: &FindingDraft, _dir: &std::path::Path) -> anyhow::Result<String> {
+            assert_eq!(draft.title, "SQLi");
+            assert_eq!(draft.severity, "critical");
+            assert!(draft.passed);
+            Ok("rec-1".to_string())
+        }
+    }
+
+    fn sample_draft() -> FindingDraft {
+        FindingDraft {
+            title: "SQLi".to_string(),
+            class: "cwe-89".to_string(),
+            severity: "critical".to_string(),
+            target: "http://127.0.0.1".to_string(),
+            poc_ref: "dvwa-01-sqli".to_string(),
+            passed: true,
+            finding_capture: FlowId::new(),
+            flows: vec![FlowId::new()],
+            poc_path: "/tmp/x.poc.yaml".to_string(),
+            screenshot_path: String::new(),
+            origin: Frontend::Operator,
+            client_label: Some("aitm-mac".to_string()),
+        }
+    }
+
+    #[test]
+    fn finding_recorder_opt_in() {
+        let store = MemFlowStore::new();
+        let client = NoopClient;
+        let guard = StdGuard::default();
+        let host = CommandHost::new(&store, &client, &guard, None);
+        // Deny-by-default: no recorder unless one is wired.
+        assert!(host.finding_recorder().is_none());
+
+        // Once wired, it is reachable and records through the trait.
+        let rec = StubRecorder;
+        let host = host.with_finding_recorder(&rec);
+        let recorder = host.finding_recorder().expect("recorder wired");
+        let id = recorder
+            .record(&sample_draft(), std::path::Path::new("/tmp"))
+            .expect("record ok");
+        assert_eq!(id, "rec-1");
     }
 }

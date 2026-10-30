@@ -43,7 +43,8 @@ pub use config::{
     ScopeEntry, SessionIoConfig, SsrfPolicy, TlsConfig,
 };
 pub use ctx::{
-    BrowserDriver, ClickTarget, CommandHost, FlowCtx, Frontend, NavOutcome, ProxyClient,
+    BrowserDriver, ClickTarget, CommandHost, FindingDraft, FindingRecorder, FlowCtx, Frontend,
+    NavOutcome, ProxyClient,
 };
 pub use error::{FlowError, GuardError};
 pub use event::{Event, Verdict};
