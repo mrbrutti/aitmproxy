@@ -224,8 +224,10 @@ mod tests {
     };
     use futures::future::BoxFuture;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-    use std::sync::{Arc, Mutex};
-    use std::time::SystemTime;
+    use std::panic::AssertUnwindSafe;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::{Duration, SystemTime};
 
     /// A browser that serves one fixed page and, at every `navigate()`, records
     /// whether the shared egress posture was confined at that instant — the
@@ -257,6 +259,112 @@ mod tests {
                     .lock()
                     .expect("observed lock")
                     .push(self.posture.confined());
+                Ok(NavOutcome {
+                    final_url: url,
+                    status: Some(200),
+                })
+            })
+        }
+
+        fn click(&self, _target: ClickTarget) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { unimplemented!("the crawler never clicks") })
+        }
+
+        fn type_text(&self, _selector: &str, _text: &str) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { unimplemented!("the crawler never types") })
+        }
+
+        fn screenshot(&self) -> BoxFuture<'_, anyhow::Result<Vec<u8>>> {
+            Box::pin(async { unimplemented!("the crawler never screenshots") })
+        }
+
+        fn eval(&self, _expr: &str) -> BoxFuture<'_, anyhow::Result<Value>> {
+            Box::pin(async { unimplemented!("the crawler never evals") })
+        }
+
+        fn get_dom(&self) -> BoxFuture<'_, anyhow::Result<String>> {
+            Box::pin(async { Ok(r#"<a href="/one">one</a>"#.to_string()) })
+        }
+    }
+
+    /// The test's end of a gated [`StubBrowser`].
+    struct Gate {
+        /// Receives one message every time the browser is navigated, so the test
+        /// can wait until a crawl is genuinely parked inside the browser.
+        entered: mpsc::Receiver<()>,
+        /// Dropping this releases every held navigation, and every later one.
+        release: mpsc::Sender<()>,
+    }
+
+    /// The browser's end of a [`Gate`]: it announces each navigation on `entered`,
+    /// then parks on `release`.
+    struct BrowserGate {
+        entered: Mutex<mpsc::Sender<()>>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    /// A browser that serves one fixed page (`<a href="/one">`, so a crawl of the
+    /// seed reaches the seed and `/one`) and counts the navigations it is asked
+    /// for. It can be gated (each navigation parks until the test releases it) or
+    /// made to panic on navigate.
+    struct StubBrowser {
+        navigations: AtomicUsize,
+        gate: Option<BrowserGate>,
+        panics: bool,
+    }
+
+    impl StubBrowser {
+        fn open() -> Self {
+            Self {
+                navigations: AtomicUsize::new(0),
+                gate: None,
+                panics: false,
+            }
+        }
+
+        fn panicking() -> Self {
+            Self {
+                panics: true,
+                ..Self::open()
+            }
+        }
+
+        fn gated() -> (Self, Gate) {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let browser = Self {
+                gate: Some(BrowserGate {
+                    entered: Mutex::new(entered_tx),
+                    release: Mutex::new(release_rx),
+                }),
+                ..Self::open()
+            };
+            let gate = Gate {
+                entered: entered_rx,
+                release: release_tx,
+            };
+            (browser, gate)
+        }
+
+        fn navigations(&self) -> usize {
+            self.navigations.load(Ordering::SeqCst)
+        }
+    }
+
+    impl BrowserDriver for StubBrowser {
+        fn navigate(&self, url: &str) -> BoxFuture<'_, anyhow::Result<NavOutcome>> {
+            let url = url.to_string();
+            Box::pin(async move {
+                self.navigations.fetch_add(1, Ordering::SeqCst);
+                if self.panics {
+                    panic!("the stub browser was told to panic mid-crawl");
+                }
+                if let Some(gate) = &self.gate {
+                    let _ = gate.entered.lock().expect("entered lock").send(());
+                    // Parks this thread, deliberately: the crawl is "in flight"
+                    // until the test drops `Gate::release` (recv then errors).
+                    let _ = gate.release.lock().expect("release lock").recv();
+                }
                 Ok(NavOutcome {
                     final_url: url,
                     status: Some(200),
@@ -715,6 +823,159 @@ mod tests {
         assert_eq!(
             err.downcast_ref::<GuardError>(),
             Some(&GuardError::OutOfScope("evil.com:80".into()))
+        );
+    }
+
+    /// The seed every single-flight test scans.
+    fn seed() -> Params {
+        params(&[("target", Value::Str("http://target.test/".into()))])
+    }
+
+    /// There is one browser page, shared by every crawl. Two scans at once would
+    /// interleave their navigations on it (one scan harvests the other's pages),
+    /// so a second `scan.discover` is refused up front — before it touches the
+    /// browser — and the one already running is unharmed.
+    #[test]
+    fn overlapping_scan_is_refused_without_touching_the_browser() {
+        let cmd = ScanDiscover {
+            cfg: ScannerConfig::default(),
+        };
+        let (first_browser, gate) = StubBrowser::gated();
+        let second_browser = StubBrowser::open();
+        let client = NoSendClient;
+        let first_store = MemFlowStore::new();
+        let first_guard = scoped_guard();
+        let second_store = MemFlowStore::new();
+        let second_guard = scoped_guard();
+
+        let (entered, second, first) = std::thread::scope(|s| {
+            let first = s.spawn(|| {
+                let host =
+                    CommandHost::new(&first_store, &client, &first_guard, Some(&first_browser));
+                cmd.invoke(seed(), &host)
+            });
+            // Scan #1 is now parked inside the browser, mid-crawl.
+            let entered = gate.entered.recv_timeout(Duration::from_secs(10));
+
+            let host =
+                CommandHost::new(&second_store, &client, &second_guard, Some(&second_browser));
+            let second = cmd.invoke(seed(), &host);
+
+            // Release #1 *before* any assertion: a failing assertion must not
+            // leave it parked, or the scope's join would hang the test run.
+            drop(gate.release);
+            let first = first.join().expect("scan #1's thread did not panic");
+            (entered, second, first)
+        });
+
+        entered.expect("scan #1 reached the browser");
+        let err = second.expect_err("an overlapping scan is refused, not run");
+        assert_eq!(
+            err.to_string(),
+            "scan.discover is already running; wait for it to finish before starting \
+             another (concurrent crawls share one browser page and would corrupt each other)"
+        );
+        assert_eq!(
+            second_browser.navigations(),
+            0,
+            "the refused scan must not touch the browser"
+        );
+
+        let first = first.expect("scan #1 is unharmed by the refused overlap");
+        assert_eq!(
+            endpoints_of(&first),
+            vec!["http://target.test/", "http://target.test/one"]
+        );
+        assert_eq!(first_browser.navigations(), 2);
+    }
+
+    /// The browser needs no reset between crawls: scans run one after another on
+    /// the same command each see the whole target, so single-flight must hold the
+    /// slot only while a scan is running.
+    #[test]
+    fn scan_runs_again_after_the_previous_one_finished() {
+        let cmd = ScanDiscover {
+            cfg: ScannerConfig::default(),
+        };
+        let browser = StubBrowser::open();
+        let store = MemFlowStore::new();
+        let guard = scoped_guard();
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, Some(&browser));
+
+        for round in 1..=3 {
+            let result = cmd
+                .invoke(seed(), &host)
+                .unwrap_or_else(|err| panic!("scan #{round} must run: {err}"));
+            assert_eq!(
+                endpoints_of(&result),
+                vec!["http://target.test/", "http://target.test/one"],
+                "scan #{round} crawls the whole target"
+            );
+        }
+        assert_eq!(browser.navigations(), 6, "three scans, two pages each");
+    }
+
+    /// A scan that ends in an error must give the slot back: the next scan is
+    /// not refused as "already running".
+    #[test]
+    fn slot_is_released_when_a_scan_errors() {
+        let cmd = ScanDiscover {
+            cfg: ScannerConfig::default(),
+        };
+        let browser = StubBrowser::open();
+        let store = MemFlowStore::new();
+        let guard = scoped_guard();
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, Some(&browser));
+
+        // An out-of-scope seed fails the crawl itself, after the slot is taken.
+        let err = cmd
+            .invoke(
+                params(&[("target", Value::Str("http://unscoped.example/".into()))]),
+                &host,
+            )
+            .expect_err("an out-of-scope target is refused");
+        assert_eq!(
+            err.downcast_ref::<GuardError>(),
+            Some(&GuardError::OutOfScope("unscoped.example:80".into()))
+        );
+
+        let result = cmd
+            .invoke(seed(), &host)
+            .expect("the failed scan released the slot");
+        assert_eq!(
+            endpoints_of(&result),
+            vec!["http://target.test/", "http://target.test/one"]
+        );
+    }
+
+    /// Nor may a scan that panics wedge the command: unwinding releases the slot.
+    #[test]
+    fn slot_is_released_when_a_scan_panics() {
+        let cmd = ScanDiscover {
+            cfg: ScannerConfig::default(),
+        };
+        let client = NoSendClient;
+
+        let panicking = StubBrowser::panicking();
+        let store = MemFlowStore::new();
+        let guard = scoped_guard();
+        let host = CommandHost::new(&store, &client, &guard, Some(&panicking));
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| cmd.invoke(seed(), &host)));
+        assert!(outcome.is_err(), "the browser panicked mid-crawl");
+        assert_eq!(panicking.navigations(), 1);
+
+        let browser = StubBrowser::open();
+        let store = MemFlowStore::new();
+        let guard = scoped_guard();
+        let host = CommandHost::new(&store, &client, &guard, Some(&browser));
+        let result = cmd
+            .invoke(seed(), &host)
+            .expect("the unwound scan released the slot");
+        assert_eq!(
+            endpoints_of(&result),
+            vec!["http://target.test/", "http://target.test/one"]
         );
     }
 }
