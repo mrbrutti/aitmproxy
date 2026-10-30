@@ -9,8 +9,11 @@
 //! inject engine's own notion of "triggered" can therefore never drift apart.
 //!
 //! A PoC is shareable, so it must never carry a credential from the captured
-//! request. [`StdPocBuilder`] only masks four credential headers; `build_poc`
-//! scrubs the rest of what it copies (see `Scrubber`): every secret-named
+//! request. [`StdPocBuilder`] masks credential headers and runs a text scrub
+//! over the step's URL and body — a scrub that erases the inject payload at a
+//! secret-named point and corrupts a JSON body — so `build_poc` re-derives the
+//! URL and body from the mutated request and scrubs them, and the rest of what
+//! it copies, itself (see `Scrubber`): every secret-named
 //! header, query parameter, form field and JSON key becomes a required `{{var}}`
 //! placeholder the runner must be given at run time, and every other value is
 //! passed through `scrub_embedded` — [`aitm_core::redact::scrub_text`] plus the
@@ -24,7 +27,7 @@
 use std::collections::HashSet;
 
 use aitm_core::redact::scrub_text;
-use aitm_core::{CommandHost, HttpFlow};
+use aitm_core::{Body, CommandHost, HttpFlow, HttpRequest};
 use aitm_findings::{DiskFindingStore, FindingRecord, FindingStore};
 use aitm_poc::{
     HttpStep, Poc, PocBuilder, PocInfo, PocSpec, Severity, StdPocBuilder, Step, Variable,
@@ -73,6 +76,28 @@ fn severity_for(class: &str) -> Severity {
 /// The first `max` characters of `s`.
 fn cap_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
+}
+
+/// The request's URL with its concrete `scheme://authority` replaced by
+/// `{{target}}` — the same parameterization [`StdPocBuilder`] applies when the
+/// `target` variable is declared, so the PoC reproduces against any host. Path
+/// and query are untouched (the caller scrubs them).
+fn target_url(request: &HttpRequest) -> String {
+    let url = format!("{}://{}{}", request.scheme, request.authority, request.path);
+    let prefix = format!("{}://{}", request.scheme, request.authority);
+    url.replacen(&prefix, "{{target}}", 1)
+}
+
+/// A buffered, non-empty request body as text (invalid UTF-8 replaced, never an
+/// error); `None` for no body or one still streaming — what [`StdPocBuilder`]
+/// puts in a step.
+fn body_text(body: &Body) -> Option<String> {
+    match body {
+        Body::Bytes(bytes) if !bytes.is_empty() => {
+            Some(String::from_utf8_lossy(bytes).into_owned())
+        }
+        _ => None,
+    }
 }
 
 /// Build a reproducible, credential-free PoC for one confirmed
@@ -127,7 +152,7 @@ pub fn build_poc(
     let mut scrubber = Scrubber::new(&payload.value);
     for step in &mut poc.steps {
         if let Step::Http(http) = step {
-            scrubber.scrub_step(http);
+            scrubber.scrub_step(http, &mutated.request);
         }
     }
     // A name the builder already declared (a credential header it templated) is
@@ -184,15 +209,26 @@ impl<'a> Scrubber<'a> {
         }
     }
 
-    fn scrub_step(&mut self, step: &mut HttpStep) {
-        let content_type = step
+    /// Scrub `step`, the [`StdPocBuilder`] step built from `request` (the
+    /// mutated request).
+    ///
+    /// The step's `url` and `body` are *re-derived from `request`*, not read
+    /// from `step`: the builder has already run [`scrub_text`] over both, and
+    /// that text pass is unsafe here. It reads `return_token=<payload>` as a
+    /// credential and erases the injected payload, and its `Bearer\s+\S+` rule
+    /// swallows the closing `"}` of a JSON string value, leaving a body no JSON
+    /// parser accepts. Re-deriving the two lets this scrubber do it
+    /// structurally instead (payload exempt, JSON kept valid). The headers are
+    /// the builder's own — it has already placeholdered the credential ones —
+    /// and are scrubbed further below.
+    fn scrub_step(&mut self, step: &mut HttpStep, request: &HttpRequest) {
+        let content_type = request
             .headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-            .map(|(_, value)| value.to_ascii_lowercase())
+            .get("content-type")
+            .map(str::to_ascii_lowercase)
             .unwrap_or_default();
 
-        step.url = self.scrub_url(&step.url);
+        step.url = self.scrub_url(&target_url(request));
         for (name, value) in &mut step.headers {
             *value = if is_secret_name(name) {
                 self.placeholder(name)
@@ -205,9 +241,7 @@ impl<'a> Scrubber<'a> {
                 scrub_embedded(value)
             };
         }
-        if let Some(body) = step.body.take() {
-            step.body = Some(self.scrub_body(&body, &content_type));
-        }
+        step.body = body_text(&request.body).map(|body| self.scrub_body(&body, &content_type));
     }
 
     /// The `{{var}}` placeholder for a redacted `key`, recording its variable.
@@ -1069,6 +1103,55 @@ mod tests {
         );
         assert!(!url.contains("ZZSECRET"), "{url}");
         assert!(url.contains("sid={{sid}}"), "{url}");
+    }
+
+    #[test]
+    fn build_poc_keeps_payload_at_a_secret_named_json_body_point() {
+        // The body half of the same rule: a JSON key named like a secret that is
+        // the injection point still carries the payload, the neighbouring secret
+        // is masked, and the document stays valid JSON.
+        let def = CheckDefinition::open_redirect();
+        let payload = def.payloads.first().expect("a payload");
+        let flow = flow_with(
+            "POST",
+            "/cb",
+            &[("Content-Type", "application/json")],
+            Some(r#"{"return_token":"https://app.example/","password":"JSONPW9"}"#),
+        );
+        let p = point(
+            &flow,
+            Location::Redirect,
+            "return_token",
+            "https://app.example/",
+        );
+
+        let poc = build_poc(&flow, &def, &p, payload).expect("poc builds");
+
+        let step = http_step(&poc);
+        let body: serde_json::Value =
+            serde_json::from_str(step.body.as_deref().expect("a json body")).expect("valid json");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "return_token": "https://aitm-scan-sentinel.invalid/",
+                "password": "{{password}}",
+            })
+        );
+        assert_eq!(step.url, "{{target}}/cb");
+    }
+
+    #[test]
+    fn build_poc_gives_a_bodyless_request_no_body() {
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let flow = flow_with_query("/search?q=hello");
+        let q = point(&flow, Location::Query, "q", "hello");
+
+        let poc = build_poc(&flow, &def, &q, payload).expect("poc builds");
+
+        let step = http_step(&poc);
+        assert_eq!(step.body, None);
+        assert!(step.url.starts_with("{{target}}/search?q="), "{}", step.url);
     }
 
     #[test]
