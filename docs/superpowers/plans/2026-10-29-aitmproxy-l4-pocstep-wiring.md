@@ -204,6 +204,15 @@ Kept by the main session during stage 6. One row per finding.
 |---|---|---|---|---|
 | 1 | Build (coder) | Blocker | Spec premise wrong: an `l4:` PoC file fails at `schema::validate` (`KNOWN_STEPS` allow-list), not at "no handler registered" — the #44 seam is unreachable from a PoC file; the loader allow-list is a pre-seam leftover | Architect-ratified scope widening: added Task 1b to relax `validate` to a protocol-shaped step (deny-by-default preserved at runtime); AC1/AC7/AC-L7 + the spec premise corrected; schema.rs + serde.rs added to scope |
 
+Stage-6 panel on PR #68 (origin/claude/unruffled-bun-4f7135):
+
+| Task | Reviewer | Severity | Finding | Disposition |
+|---|---|---|---|---|
+| all | Security | — | PASS, zero findings. Deny-by-default-after-relaxation holds (validate rejects empty/multi-key/malformed; unregistered ns refused at runtime); one-engagement-state (AC6), fail-closed, no `unsafe`/panic path all verified | PASS |
+| all | Spec | — | PASS, all ACs met + tested; AC-L7 shift asserts both halves; scope held; `PocError::UnknownStep` has zero users; drift handled per workflow | PASS |
+| 2,3 | Quality | Minor | (a) test temp-dirs leak on panic / aren't cleaned on the l4 path; (b) `main.rs` uses UFCS `ProtocolLanguage::poc_step(lang)` where the tree uses `lang.poc_step()` | Optional, non-gating — recorded for a future tidy; not a merge blocker |
+| — | Security | note | Pre-existing (not a regression): a multi-key FIXED step (`{http:…, l4:…}`) parses as the first key, silently dropping siblings; the relaxation makes the protocol branch stricter | Out of scope; possible future symmetry fix |
+
 ## Shipped
 
 What merged, what was cut, follow-ups. Filled at stage 7.
