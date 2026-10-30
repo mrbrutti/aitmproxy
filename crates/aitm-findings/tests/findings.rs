@@ -339,6 +339,86 @@ fn findings_record_is_policy_gated() {
     .expect("operator remove");
 }
 
+/// Record one finding as the operator and return its id.
+fn record_as_operator(reg: &Registry, cfg: &Config, title: &str) -> String {
+    let rec = call_as(
+        reg,
+        cfg,
+        Frontend::Operator,
+        "findings.record",
+        &[
+            ("title", Value::Str(title.into())),
+            ("class", Value::Str("idor".into())),
+            ("severity", Value::Str("high".into())),
+            (
+                "target",
+                Value::Str("http://localhost:9000/account/2".into()),
+            ),
+            ("poc_ref", Value::Str("idor-account".into())),
+        ],
+    )
+    .expect("operator record");
+    record_id(&rec)
+}
+
+#[test]
+fn findings_remove_refuses_the_agent_and_admits_operator_and_cli() {
+    let reg = findings_reg();
+    let dir = unique_dir("remove-roles");
+    let cfg = cfg_with_findings(dir.clone());
+
+    let a = record_as_operator(&reg, &cfg, "IDOR on /account/2");
+    let b = record_as_operator(&reg, &cfg, "IDOR on /account/3");
+    assert_ne!(a, b);
+    assert!(dir.join(format!("{a}.yaml")).exists());
+    assert!(dir.join(format!("{b}.yaml")).exists());
+
+    // The agent (Mcp) is refused with the literal text, and the file survives.
+    let err = call_as(
+        &reg,
+        &cfg,
+        Frontend::Mcp,
+        "findings.remove",
+        &[("id", Value::Str(a.clone()))],
+    )
+    .expect_err("agent cannot remove");
+    assert_eq!(err.to_string(), "findings.remove is operator/CLI-only");
+    assert!(
+        dir.join(format!("{a}.yaml")).exists(),
+        "the refused remove must not delete {a}.yaml"
+    );
+
+    // The human CLI may remove.
+    let out = call_as(
+        &reg,
+        &cfg,
+        Frontend::Cli,
+        "findings.remove",
+        &[("id", Value::Str(a.clone()))],
+    )
+    .expect("cli remove");
+    assert_eq!(out, Value::Object(BTreeMap::new()));
+    assert!(
+        !dir.join(format!("{a}.yaml")).exists(),
+        "the CLI remove must delete {a}.yaml"
+    );
+
+    // The operator may remove.
+    let out = call_as(
+        &reg,
+        &cfg,
+        Frontend::Operator,
+        "findings.remove",
+        &[("id", Value::Str(b.clone()))],
+    )
+    .expect("operator remove");
+    assert_eq!(out, Value::Object(BTreeMap::new()));
+    assert!(
+        !dir.join(format!("{b}.yaml")).exists(),
+        "the operator remove must delete {b}.yaml"
+    );
+}
+
 #[test]
 fn record_command_roundtrips_through_list_and_get() {
     let reg = findings_reg();
