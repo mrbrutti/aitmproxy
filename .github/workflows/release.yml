@@ -6,6 +6,10 @@ name: Release
 # aarch64 tarball) are built and uploaded by Matt on his Mac per the runbook;
 # this workflow never signs. There is no Windows job — obscura ships no Windows
 # asset (spec non-goals / AC11).
+#
+# The release tag is untrusted input (a pushed ref or a workflow_dispatch
+# string), so it is passed into every `run` step through `env:` and referenced
+# as "$TAG"/"$INPUT_TAG" rather than interpolated as `${{ }}` into the shell.
 on:
   push:
     tags:
@@ -46,9 +50,11 @@ jobs:
 
       - name: Resolve the tag
         id: vars
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [ -n "${{ inputs.tag }}" ]; then
-            tag="${{ inputs.tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
           else
             tag="${GITHUB_REF_NAME}"
           fi
@@ -56,27 +62,28 @@ jobs:
           echo "resolved tag: ${tag}"
 
       - name: Guard tag equals the aitm crate version
+        env:
+          TAG: ${{ steps.vars.outputs.tag }}
         run: |
-          tag="${{ steps.vars.outputs.tag }}"
           # `cargo pkgid` prints `…/crates/aitm#0.1.0` (or `…#aitm@0.1.0`);
           # keep the version after the last `#` or `@`.
           version=$(cargo pkgid -p aitm | sed 's/.*[#@]//')
-          echo "tag=${tag} crate=v${version}"
-          if [ "$tag" != "v${version}" ]; then
-            echo "::error::release tag ${tag} does not match aitm crate version v${version}"
+          echo "tag=${TAG} crate=v${version}"
+          if [ "$TAG" != "v${version}" ]; then
+            echo "::error::release tag ${TAG} does not match aitm crate version v${version}"
             exit 1
           fi
 
       - name: Ensure the GitHub Release exists
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.vars.outputs.tag }}
         run: |
-          tag="${{ steps.vars.outputs.tag }}"
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release ${tag} already exists"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release ${TAG} already exists"
           else
-            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
-              --title "$tag" --generate-notes
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" --generate-notes
           fi
 
   # Build the generic tarball + nfpm .deb/.rpm for each Linux arch and upload
@@ -132,9 +139,9 @@ jobs:
       - name: Upload artifacts to the Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version-guard.outputs.tag }}
         run: |
-          tag="${{ needs.version-guard.outputs.tag }}"
-          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber \
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
             dist/*.tar.gz dist/*.deb dist/*.rpm
 
   # Combine every Release asset into SHA256SUMS (AC7) and regenerate
@@ -154,10 +161,10 @@ jobs:
       - name: Download every Release asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version-guard.outputs.tag }}
         run: |
-          tag="${{ needs.version-guard.outputs.tag }}"
           mkdir -p dist-assets
-          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir dist-assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist-assets
           # Drop any SHA256SUMS from a previous finalize so it is neither
           # checksummed nor treated as a downloadable asset.
           rm -f dist-assets/SHA256SUMS
@@ -172,31 +179,44 @@ jobs:
       - name: Upload SHA256SUMS to the Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version-guard.outputs.tag }}
         run: |
-          tag="${{ needs.version-guard.outputs.tag }}"
-          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber SHA256SUMS
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber SHA256SUMS
 
       - name: Generate site/downloads.json
+        env:
+          TAG: ${{ needs.version-guard.outputs.tag }}
         run: |
-          tag="${{ needs.version-guard.outputs.tag }}"
           names=()
           for f in dist-assets/*; do
             names+=("$(basename "$f")")
           done
           bash scripts/gen-downloads-manifest.sh \
-            "$tag" "$GITHUB_REPOSITORY" SHA256SUMS "${names[@]}" > site/downloads.json
+            "$TAG" "$GITHUB_REPOSITORY" SHA256SUMS "${names[@]}" > site/downloads.json
           echo "site/downloads.json:"
           cat site/downloads.json
 
       - name: Commit the refreshed manifest to main
+        env:
+          TAG: ${{ needs.version-guard.outputs.tag }}
         run: |
-          tag="${{ needs.version-guard.outputs.tag }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add site/downloads.json
           if git diff --cached --quiet; then
             echo "site/downloads.json unchanged; nothing to commit"
-          else
-            git commit -m "chore(site): refresh downloads manifest for ${tag}"
-            git push origin HEAD:main
+            exit 0
           fi
+          git commit -m "chore(site): refresh downloads manifest for ${TAG}"
+          # main may have advanced while this release ran; rebase the one-file
+          # commit and retry the push a few times rather than fail the release.
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              echo "pushed manifest on attempt ${attempt}"
+              exit 0
+            fi
+            echo "push failed (attempt ${attempt}); rebasing on origin/main"
+            git pull --rebase origin main
+          done
+          echo "::error::could not push the refreshed downloads manifest after 3 attempts"
+          exit 1

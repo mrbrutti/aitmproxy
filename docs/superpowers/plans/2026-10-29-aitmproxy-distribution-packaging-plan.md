@@ -87,8 +87,24 @@ cargo clippy --all-targets -- -D warnings && cargo test` still passes unchanged
 
 ## Review log
 
+Stage-6 panel on PR #57 (security + quality + spec, 2026-10-29). All three
+verdicts: PASS / spec-compliant — no Critical or blocking findings. Low/Minor
+items fixed in-branch; the three "Important" spec findings are scope/process
+(undeclared files) and accepted with rationale below.
+
 | Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
+| 5 | security | Low | `site.js` set `href` from the manifest with no scheme check (`javascript:` URL in a tampered same-origin manifest) | Fixed — gate on `^https?://` |
+| 4 | security | Low | release.yml interpolated the tag via `${{ }}` into `run` shells (Actions script-injection pattern) | Fixed — tag passed through `env:` as `$TAG`/`$INPUT_TAG` in every run step |
+| 5 | security/quality | Low/Minor | `site/downloads.json` shipped placeholder `aaaa…` sha256 + URLs to a non-existent release | Fixed — ships `"assets": []` (JS hides the empty table; `finalize` populates it) |
+| 3 | quality | Minor | unquoted `0755` modes in `nfpm.yaml` (go-yaml octal parsing) | Fixed — quoted `"0755"` |
+| 5 | quality | Minor | `gen-downloads-manifest.sh` comment overstated control-char escaping | Fixed — comment corrected |
+| 4 | quality | Minor | finalize `git push HEAD:main` had no rebase/retry (races a concurrent main advance) | Fixed — rebase + 3-attempt retry |
+| 2/3 | quality | Minor | `package.sh` and `package-linux.sh` duplicate the web-build + obscura download/verify/stage logic (spec anti-goal "two code paths that can drift") | Accepted as follow-up — both verified working; a shared sourced helper is a safer separate refactor than editing two release-critical scripts without a live Linux build |
+| — | spec | Important | `crates/aitm-ca/tests/real_os.rs` is an undeclared Rust change | Accepted — a test-only cfg-gate that makes Linux clippy pass; the gate-enabler for AC12 on CI |
+| — | spec | Important | `.github/workflows/ci.yml` is an undeclared new workflow | Accepted — the build+test CI the orchestrator requested be folded into this PR |
+| — | spec | Important | `scripts/notarize-dmg.sh` core-less guard is an undeclared behaviour change | Accepted — PR #57's original obscura-everywhere scope (predates the milestone expansion); documented in `docs/RELEASE.md` |
+| — | spec | Minor | spec §D example deb name `aitm-0.1.0-x86_64.deb` ≠ actual `amd64` | Fixed — spec §D example corrected to `amd64` (code already followed §A) |
 
 ## Shipped
 

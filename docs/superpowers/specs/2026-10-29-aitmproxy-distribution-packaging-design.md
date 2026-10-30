@@ -87,7 +87,7 @@ The workflow is net-new: `.github/workflows/release.yml`. Least-privilege `permi
 { "version": "0.1.0", "tag": "v0.1.0", "released": "2026-10-29",
   "release_url": "https://github.com/<owner>/<repo>/releases/tag/v0.1.0",
   "assets": [ { "platform": "linux", "arch": "x86_64", "format": "deb",
-               "name": "aitm-0.1.0-x86_64.deb", "url": "https://…", "sha256": "…" }, … ] }
+               "name": "aitm-0.1.0-amd64.deb", "url": "https://…", "sha256": "…" }, … ] }
 ```
 
 `download.html` gains a `data-downloads` container; `site/site.js` fetches `downloads.json` and renders a per-platform/format table with name, size/arch, and SHA-256. If the fetch fails or predates the manifest, the existing static Homebrew/source instructions remain as the fallback (progressive enhancement; no JS-only dead end).

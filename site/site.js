@@ -165,7 +165,7 @@
         shaCell.appendChild(code);
         tr.appendChild(shaCell);
         var dlCell = document.createElement("td");
-        if (a.url) {
+        if (a.url && /^https?:\/\//i.test(a.url)) {
           var link = document.createElement("a");
           link.href = a.url;
           link.textContent = a.name || a.url;

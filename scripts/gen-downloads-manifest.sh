@@ -37,7 +37,8 @@ version=${tag#v}
 released=${RELEASED:-$(date -u +%Y-%m-%d)}
 release_url="https://github.com/${repo}/releases/tag/${tag}"
 
-# JSON string escaper (backslash, double-quote, control chars we may plausibly meet).
+# JSON string escaper: backslash and double-quote. The inputs here (asset names,
+# tag, release URL) contain no control characters, so none are escaped.
 json_str() {
   local s=$1
   s=${s//\\/\\\\}
