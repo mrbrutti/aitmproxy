@@ -74,7 +74,7 @@ fn severity_str(s: Severity) -> &'static str {
     }
 }
 
-fn parse_severity(s: &str) -> anyhow::Result<Severity> {
+pub(crate) fn parse_severity(s: &str) -> anyhow::Result<Severity> {
     Ok(match s.to_ascii_lowercase().as_str() {
         "info" => Severity::Info,
         "low" => Severity::Low,

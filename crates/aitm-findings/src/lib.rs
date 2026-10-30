@@ -14,10 +14,12 @@
 
 pub mod commands;
 pub mod record;
+pub mod recorder;
 pub mod report;
 pub mod store;
 
 pub use commands::FindingsPlugin;
 pub use record::{FindingArtifacts, FindingFilter, FindingRecord, FindingSummary, Reproduction};
+pub use recorder::DiskFindingRecorder;
 pub use report::{render_index, render_report};
 pub use store::{DiskFindingStore, FindingStore};

@@ -8,9 +8,18 @@ use std::time::{Duration, Instant};
 
 use aitm_plugin_rhai::config::RhaiLimits;
 use aitm_plugin_rhai::engine::{
-    begin_run, build_engine, current_run, print_sink, remaining_budget, AbortKind, RunKind,
+    begin_run, build_engine, current_run, print_sink, remaining_budget, AbortKind, Budget, RunKind,
 };
 use rhai::EvalAltResult;
+
+/// A run budget with `hook_timeout` of wall-clock and the shipped defaults
+/// for the rest.
+fn budget(hook_timeout: Duration) -> Budget {
+    Budget {
+        hook_timeout,
+        ..Budget::default()
+    }
+}
 
 /// A loop that never ends and does real work each turn, so the optimizer
 /// cannot fold it away and every iteration costs operations.
@@ -133,7 +142,7 @@ fn each_run_gets_a_fresh_budget_and_exposes_its_deadline() {
     let busy = "let t = 0; for i in 0..400000 { t += i; } t";
 
     for _ in 0..2 {
-        let _run = begin_run(RunKind::Hook, Duration::from_millis(1500));
+        let _run = begin_run(RunKind::Hook, budget(Duration::from_millis(1500)));
         let started = Instant::now();
         engine
             .eval::<i64>(busy)
@@ -143,7 +152,7 @@ fn each_run_gets_a_fresh_budget_and_exposes_its_deadline() {
 
     // A run whose budget is already spent is aborted with the Timeout token.
     {
-        let _run = begin_run(RunKind::Hook, Duration::from_millis(20));
+        let _run = begin_run(RunKind::Hook, budget(Duration::from_millis(20)));
         std::thread::sleep(Duration::from_millis(40));
         let err = engine
             .eval::<i64>(busy)
@@ -156,12 +165,12 @@ fn each_run_gets_a_fresh_budget_and_exposes_its_deadline() {
     assert_eq!(current_run(), None);
     assert_eq!(remaining_budget(), None);
     {
-        let _run = begin_run(RunKind::PocStep, Duration::from_millis(500));
+        let _run = begin_run(RunKind::PocStep, budget(Duration::from_millis(500)));
         assert_eq!(current_run(), Some(RunKind::PocStep));
         let left = remaining_budget().expect("a run is active");
         assert!(left <= Duration::from_millis(500), "{left:?}");
         {
-            let _inner = begin_run(RunKind::Command, Duration::from_secs(1));
+            let _inner = begin_run(RunKind::Command, budget(Duration::from_secs(1)));
             assert_eq!(current_run(), Some(RunKind::Command));
         }
         assert_eq!(current_run(), Some(RunKind::PocStep), "nesting restores");

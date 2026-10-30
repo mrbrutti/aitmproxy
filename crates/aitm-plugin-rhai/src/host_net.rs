@@ -15,9 +15,14 @@
 //! `tokio::time::timeout` for what is left of the run's wall-clock budget
 //! ([`crate::engine::remaining_budget`]), so a peer that never answers ends
 //! the hook at its deadline exactly as a busy loop would — the handle must
-//! therefore come from a runtime with timers enabled. No second network path
-//! exists: every verb here passes the same `ScopeRateGuard` / SSRF guard a
-//! Rust plugin passes.
+//! therefore come from a runtime with timers enabled. `browser.*` is the one
+//! exception (T9): a navigation or DOM fetch legitimately outlives a hook
+//! budget, so each browser call is bounded by the run's own
+//! [`crate::engine::browser_budget`] instead, and on completion renews the
+//! run's deadline ([`crate::engine::extend_deadline`]) so the script's next
+//! operation is not aborted for the time the browser took. No second network
+//! path exists: every verb here passes the same `ScopeRateGuard` / SSRF guard
+//! a Rust plugin passes.
 //!
 //! **Who is calling matters** ([`crate::engine::current_run`]). `browser.*` is
 //! refused inside a flow hook: the embedded browser routes through this proxy,
@@ -45,8 +50,10 @@ use rhai::{
     Position,
 };
 
-use crate::config::DEFAULT_HOOK_TIMEOUT;
-use crate::engine::{current_run, remaining_budget, AbortKind, RunKind};
+use crate::config::{DEFAULT_BROWSER_TIMEOUT, DEFAULT_HOOK_TIMEOUT};
+use crate::engine::{
+    browser_budget, current_run, extend_deadline, remaining_budget, AbortKind, RunKind,
+};
 use crate::host_core::{ScriptCapability, ScriptServices};
 use crate::marshal::{dynamic_to_value, value_to_dynamic};
 
@@ -214,7 +221,7 @@ impl ScriptCapability for BrowserCapability {
             })
             .register_fn("click", |ns: &mut BrowserNs, target: &str| {
                 let driver = driver(ns, "browser.click")?;
-                block_on(
+                block_on_browser(
                     "browser.click",
                     &ns.services,
                     driver.click(ClickTarget::Selector(target.to_string())),
@@ -224,7 +231,7 @@ impl ScriptCapability for BrowserCapability {
                 "type_text",
                 |ns: &mut BrowserNs, selector: &str, text: &str| {
                     let driver = driver(ns, "browser.type_text")?;
-                    block_on(
+                    block_on_browser(
                         "browser.type_text",
                         &ns.services,
                         driver.type_text(selector, text),
@@ -233,7 +240,7 @@ impl ScriptCapability for BrowserCapability {
             )
             .register_fn("screenshot", |ns: &mut BrowserNs| -> ScriptResult<Blob> {
                 let driver = driver(ns, "browser.screenshot")?;
-                block_on("browser.screenshot", &ns.services, driver.screenshot())
+                block_on_browser("browser.screenshot", &ns.services, driver.screenshot())
             })
             // `evaluate`, not `eval`: `eval` is a Rhai reserved word and cannot
             // be a method name, so no script could call it (spec §6). The MCP
@@ -241,14 +248,14 @@ impl ScriptCapability for BrowserCapability {
             // Rhai identifier.
             .register_fn("evaluate", |ns: &mut BrowserNs, expr: &str| {
                 let driver = driver(ns, "browser.evaluate")?;
-                block_on("browser.evaluate", &ns.services, driver.eval(expr))
+                block_on_browser("browser.evaluate", &ns.services, driver.eval(expr))
                     .map(|value| value_to_dynamic(&value))
             })
             .register_fn(
                 "get_dom",
                 |ns: &mut BrowserNs| -> ScriptResult<ImmutableString> {
                     let driver = driver(ns, "browser.get_dom")?;
-                    block_on("browser.get_dom", &ns.services, driver.get_dom())
+                    block_on_browser("browser.get_dom", &ns.services, driver.get_dom())
                         .map(ImmutableString::from)
                 },
             );
@@ -340,6 +347,43 @@ fn block_on<T>(
     fut: impl Future<Output = anyhow::Result<T>>,
 ) -> ScriptResult<T> {
     let budget = remaining_budget().unwrap_or(DEFAULT_HOOK_TIMEOUT);
+    drive(capability, services, budget, AbortKind::Timeout, fut)
+}
+
+/// [`block_on`] for a `browser.*` verb (T9): the future gets the run's whole
+/// `browser_timeout` rather than the hook remainder, and once it has
+/// completed — succeeded or failed — the run's deadline is renewed, so the
+/// script's follow-up work (reading the DOM it just fetched, the next
+/// navigation) is not aborted for the time the browser legitimately took. A
+/// browser that never answers still ends the run, at `browser_timeout`, with
+/// a termination naming that budget. Outside any run the default browser
+/// budget applies.
+fn block_on_browser<T>(
+    capability: &str,
+    services: &ScriptServices,
+    fut: impl Future<Output = anyhow::Result<T>>,
+) -> ScriptResult<T> {
+    let budget = browser_budget().unwrap_or(DEFAULT_BROWSER_TIMEOUT);
+    let result = drive(capability, services, budget, AbortKind::BrowserTimeout, fut);
+    match &result {
+        // The browser never answered: the run is over, nothing to renew.
+        Err(err) if matches!(**err, EvalAltResult::ErrorTerminated(..)) => {}
+        // Answered (or failed, catchably): the script carries on with a
+        // fresh hook budget for its own work.
+        _ => extend_deadline(),
+    }
+    result
+}
+
+/// The bridge itself: block this worker on `fut` for at most `budget`; a
+/// future that outlives it terminates the run with `abort`.
+fn drive<T>(
+    capability: &str,
+    services: &ScriptServices,
+    budget: std::time::Duration,
+    abort: AbortKind,
+    fut: impl Future<Output = anyhow::Result<T>>,
+) -> ScriptResult<T> {
     match services.rt.block_on(tokio::time::timeout(budget, fut)) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(err)) => Err(failed(capability, err)),
@@ -348,12 +392,9 @@ fn block_on<T>(
                 target: HOST_TARGET,
                 capability,
                 ?budget,
-                "host call outlived the run's budget; aborting the run"
+                "host call outlived its budget; aborting the run"
             );
-            Err(
-                EvalAltResult::ErrorTerminated(Dynamic::from(AbortKind::Timeout), Position::NONE)
-                    .into(),
-            )
+            Err(EvalAltResult::ErrorTerminated(Dynamic::from(abort), Position::NONE).into())
         }
     }
 }
@@ -537,7 +578,7 @@ fn navigate(ns: &BrowserNs, url: &str) -> ScriptResult<()> {
         .check_active(&authority)
         .map_err(|reason| denied("browser.navigate", &authority, &reason))?;
 
-    block_on("browser.navigate", &ns.services, driver.navigate(url)).map(|_| ())
+    block_on_browser("browser.navigate", &ns.services, driver.navigate(url)).map(|_| ())
 }
 
 // -------------------------------------------------------------------- store

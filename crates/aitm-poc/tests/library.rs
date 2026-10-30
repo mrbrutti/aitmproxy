@@ -63,7 +63,11 @@ fn call(reg: &Registry, cfg: Config, name: &str, args: &[(&str, Value)]) -> anyh
 
 fn cfg_with(dir: Option<PathBuf>, out_dir: Option<PathBuf>) -> Config {
     Config {
-        poc: PocConfig { dir, out_dir },
+        poc: PocConfig {
+            dir,
+            out_dir,
+            ..Default::default()
+        },
         ..Config::default()
     }
 }

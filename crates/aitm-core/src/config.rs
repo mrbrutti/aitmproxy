@@ -133,6 +133,12 @@ pub struct PocConfig {
     /// `poc.artifact` only serves files confined to this directory, so a
     /// remote/web surface can read run artifacts safely.
     pub out_dir: Option<PathBuf>,
+    /// Let an agent frontend (`Frontend::Mcp`) run `poc.run`. **Off by default**:
+    /// running a PoC is a sensitive action, so only the human CLI or a present
+    /// operator may run it unless the operator opts in — mirrors
+    /// [`ScopeConfig::allow_agent_widen`] / [`CaConfig::allow_agent_install`].
+    /// `Frontend::Operator` and `Frontend::Cli` are never gated by it. (T3)
+    pub allow_agent_run: bool,
 }
 
 /// Persistent findings / run-history store configuration (M4 Stream B).

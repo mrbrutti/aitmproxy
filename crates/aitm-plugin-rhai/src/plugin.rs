@@ -379,7 +379,7 @@ impl LoadedScript {
         let tag = options.to_value();
         let source = ast.source().map(str::to_string);
         blocking(|| {
-            let _run = begin_run(RunKind::Hook, self.budget.hook_timeout);
+            let _run = begin_run(RunKind::Hook, self.budget);
             let _active = ActiveFlow::enter(Arc::clone(state));
             let _seed = seed_call_context(authoring, Some(tag), source);
             self.engine

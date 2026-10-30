@@ -404,6 +404,7 @@ fn findings_distinct_from_poc_library() {
         poc: PocConfig {
             dir: Some(poc_dir),
             out_dir: None,
+            ..Default::default()
         },
         findings: FindingsConfig {
             dir: Some(find_dir),

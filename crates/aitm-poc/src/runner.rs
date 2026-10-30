@@ -33,8 +33,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    Body, CallerTrust, ClickTarget, Command, CommandHost, FlowId, HeaderMap, HttpRequest,
-    HttpVersion, ParamDef, ParamSchema, Params, Registry, TypeDesc, Value,
+    Body, CallerTrust, ClickTarget, Command, CommandHost, FindingDraft, FlowId, Frontend,
+    HeaderMap, HttpRequest, HttpVersion, ParamDef, ParamSchema, Params, Registry, TypeDesc, Value,
 };
 use futures::future::BoxFuture;
 
@@ -69,6 +69,10 @@ pub struct PocRunResult {
     pub screenshot_path: PathBuf,
     /// Each leaf assertion of `success` and whether it matched.
     pub evaluated: Vec<AssertionOutcome>,
+    /// The id of the durable finding recorded for this run, when one was persisted
+    /// (a passing run, a wired recorder, and a configured `findings.dir`). `None`
+    /// otherwise. (T7)
+    pub recorded_id: Option<String>,
 }
 
 /// One leaf assertion of `success` and its verdict.
@@ -261,6 +265,15 @@ impl StdPocRunner {
 
         // Bindings grow as extractors bind variables for later steps.
         let mut live = bindings;
+        // Seed the PoC's `variables:` defaults into the live bindings so a
+        // `script:` step's `vars.get()` sees a default, not only `{{template}}`
+        // rendering. Caller `--vars` already in `live` win — only seed a default
+        // the caller did not supply. (T2)
+        for (name, value) in tmpl.defaults().iter() {
+            if live.get(name).is_none() {
+                live.insert(name.clone(), value.clone());
+            }
+        }
         let mut ctx = MatchContext::default();
         let mut finding: Option<FlowId> = None;
         let mut screenshot: Option<Vec<u8>> = None;
@@ -431,9 +444,15 @@ impl StdPocRunner {
         evaluated.extend(script_errors);
         let passed = evaluate(&success, &ctx);
 
-        let finding_capture = finding.ok_or_else(|| {
-            anyhow::anyhow!("poc.run: no HTTP flow was captured to anchor the finding")
-        })?;
+        // Anchor the finding: a declarative `http:` step's flow if one ran, else
+        // the newest flow captured in the store during the run (so a pure-`script:`
+        // PoC that drove `http.send`/`browser.*` still anchors), else a hard error
+        // only when nothing at all was captured. (T1)
+        let finding_capture = finding
+            .or_else(|| host.store().list().last().copied())
+            .ok_or_else(|| {
+                anyhow::anyhow!("poc.run: no HTTP flow was captured to anchor the finding")
+            })?;
 
         let (poc_path, mut screenshot_path) = self.write_artifacts(poc, screenshot.as_deref())?;
         // A script's screenshot joins the same artifact set as a declarative one:
@@ -444,12 +463,59 @@ impl StdPocRunner {
             }
         }
 
+        // Persist a durable finding on a passing run, when a recorder is wired and
+        // `findings.dir` is configured. Deny-by-default: no recorder or no dir means
+        // no persistence. A record failure is logged, never fatal to the run. So the
+        // UIs (`findings.list`) populate from an agent-driven `poc.run`. (T7)
+        let recorded_id = if passed {
+            match (
+                host.finding_recorder(),
+                host.config().and_then(|c| c.findings.dir.clone()),
+            ) {
+                (Some(recorder), Some(dir)) => {
+                    let draft = FindingDraft {
+                        title: poc.info.name.clone(),
+                        class: poc
+                            .info
+                            .cwe
+                            .clone()
+                            .or_else(|| poc.info.tags.first().cloned())
+                            .unwrap_or_else(|| poc.id.clone()),
+                        severity: severity_str(poc.info.severity).to_string(),
+                        target: live
+                            .get("target")
+                            .map(value_to_plain_string)
+                            .unwrap_or_default(),
+                        poc_ref: poc.id.clone(),
+                        passed,
+                        finding_capture,
+                        flows: vec![finding_capture],
+                        poc_path: poc_path.display().to_string(),
+                        screenshot_path: screenshot_path.display().to_string(),
+                        origin: host.frontend(),
+                        client_label: host.client_label().map(|s| s.to_string()),
+                    };
+                    match recorder.record(&draft, &dir) {
+                        Ok(id) => Some(id),
+                        Err(e) => {
+                            tracing::warn!("poc.run: failed to record finding: {e}");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         Ok(PocRunResult {
             passed,
             finding_capture,
             poc_path,
             screenshot_path,
             evaluated,
+            recorded_id,
         })
     }
 
@@ -743,6 +809,28 @@ fn body_to_string(body: &Body) -> String {
     }
 }
 
+/// The lowercase severity string a `FindingDraft` carries (core cannot name
+/// `Severity`). Mirrors the `aitm-findings` `severity_str`. (T7)
+fn severity_str(s: crate::model::Severity) -> &'static str {
+    use crate::model::Severity;
+    match s {
+        Severity::Info => "info",
+        Severity::Low => "low",
+        Severity::Medium => "medium",
+        Severity::High => "high",
+        Severity::Critical => "critical",
+    }
+}
+
+/// A bound variable's plain string value for the finding draft's `target`
+/// (the `target` binding is a string; fall back to a debug form otherwise). (T7)
+fn value_to_plain_string(v: &Value) -> String {
+    match v {
+        Value::Str(s) => s.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
 /// Render `{{placeholders}}` inside an assertion tree against the bindings.
 fn render_assertion(
     assertion: &Assertion,
@@ -1012,6 +1100,21 @@ fn run_poc_command(
     executor: Option<&Arc<dyn ScriptStepExecutor>>,
     step_handlers: &PocStepRegistry,
 ) -> anyhow::Result<Value> {
+    // T3: an agent frontend may run `poc.run` only when the operator opted in via
+    // `poc.allow_agent_run`. `Frontend::Operator` and `Frontend::Cli` are never
+    // gated. Deny-by-default (mirrors scope.add / ca.install).
+    if host.frontend() == Frontend::Mcp
+        && !host
+            .config()
+            .map(|c| c.poc.allow_agent_run)
+            .unwrap_or(false)
+    {
+        anyhow::bail!(
+            "poc.run refused: running a PoC from an agent frontend is disabled. Set \
+             poc.allow_agent_run = true in the aitmproxy config to allow it, or run it from \
+             the operator/CLI."
+        );
+    }
     let poc_path = args.get_str("poc_path")?;
     let path = std::path::Path::new(poc_path);
     // Only load a plainly-named YAML file.
@@ -1087,6 +1190,9 @@ fn run_poc_command(
                 .collect(),
         ),
     );
+    if let Some(id) = result.recorded_id {
+        obj.insert("recorded_id".to_string(), Value::Str(id));
+    }
     Ok(Value::Object(obj))
 }
 

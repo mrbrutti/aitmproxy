@@ -397,6 +397,7 @@ async fn slow_step_names_the_configured_time_budget() {
     let budget = Budget {
         max_operations: 0,
         hook_timeout: Duration::from_millis(50),
+        browser_timeout: Duration::from_secs(30),
     };
     let exec = RhaiScriptExecutor::new(h.engine(&limits), h.services.clone()).with_budget(budget);
     let mut vars = aitm_poc::VarBindings::new();

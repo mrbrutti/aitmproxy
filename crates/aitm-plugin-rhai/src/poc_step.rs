@@ -43,7 +43,7 @@ use aitm_poc::{
 };
 use rhai::{Dynamic, Engine, EvalAltResult, Position, Scope, AST};
 
-use crate::config::DEFAULT_HOOK_TIMEOUT;
+use crate::config::{DEFAULT_BROWSER_TIMEOUT, DEFAULT_HOOK_TIMEOUT};
 use crate::engine::{begin_run, blocking, Budget, RunKind};
 use crate::error::ScriptError;
 use crate::host_core::{ScriptCapability, ScriptServices};
@@ -75,13 +75,15 @@ impl RhaiScriptExecutor {
     /// Run steps on `engine`, which must already carry the host surface and
     /// [`VarsCapability`]; `services` are the handles that surface is wired to.
     /// The budget defaults to the engine's operation cap and the default hook
-    /// timeout; [`RhaiScriptExecutor::with_budget`] sets the configured one.
+    /// and browser timeouts; [`RhaiScriptExecutor::with_budget`] sets the
+    /// configured one.
     pub fn new(engine: Arc<Engine>, services: ScriptServices) -> Self {
         let budget = Budget {
             // `engine::harden` sets the hard cap one above the configured
             // budget so the named token fires first.
             max_operations: engine.max_operations().saturating_sub(1),
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
+            browser_timeout: DEFAULT_BROWSER_TIMEOUT,
         };
         Self {
             engine,
@@ -173,7 +175,7 @@ impl ScriptStepExecutor for RhaiScriptExecutor {
         // identical to the pre-seam `NativeCallContext` AST source set at compile.
         let source = Some(name.to_string());
         let result = blocking(|| {
-            let _run = begin_run(RunKind::PocStep, self.budget.hook_timeout);
+            let _run = begin_run(RunKind::PocStep, self.budget);
             let _seed = seed_call_context(caller, None, source);
             self.engine.eval_ast_with_scope::<Dynamic>(&mut scope, &ast)
         });

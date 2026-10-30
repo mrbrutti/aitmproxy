@@ -98,7 +98,7 @@ impl Command for ScriptCommand {
         let tag = self.options.to_value();
         let source = self.ast.source().map(str::to_string);
         let result = blocking(|| {
-            let _run = begin_run(RunKind::Command, self.budget.hook_timeout);
+            let _run = begin_run(RunKind::Command, self.budget);
             let _seed = seed_call_context(caller, Some(tag), source);
             self.engine.call_fn_with_options::<Dynamic>(
                 CallFnOptions::new(),
@@ -203,7 +203,7 @@ impl<'a> ScriptRegHandle<'a> {
         let tag = self.options.to_value();
         let source = ast.source().map(str::to_string);
         blocking(|| {
-            let _run = begin_run(RunKind::Load, self.budget.hook_timeout);
+            let _run = begin_run(RunKind::Load, self.budget);
             let _seed = seed_call_context(caller, Some(tag), source);
             engine.call_fn_with_options::<Dynamic>(
                 CallFnOptions::new(),
