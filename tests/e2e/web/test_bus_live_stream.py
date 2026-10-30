@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 # e2e: tier=T1 surface=web
-"""Regression canary: the web /bus bridge must PUSH live flow events to a subscriber.
+"""Future guard: the web /bus bridge should PUSH live flow events to a subscriber.
 
-The shipped web UI's flow list freezes because it never subscribes and the /bus
-bridge pushes nothing (the F4 gap). This drives the REAL /bus WebSocket the way a
-fixed UI would: subscribe, generate real traffic through the proxy, and assert a
-`notifications/aitm/flow` push arrives live. If none arrives, that IS the shipped
-bug — a loud SKIP until the /bus push fix lands; once it pushes, flip the SKIP to
-fail() and it becomes a hard regression guard.
+Note on the shipped un-freeze: PR #124 fixed the user-visible freeze CLIENT-SIDE
+(apps/web polls flow.list) — guarded here by test_bus_poll_reflects_traffic.py —
+NOT by adding push to the bridge. So flow.subscribe over /bus is still refused and
+this canary stays a loud SKIP. Push-over-bridge (a per-connection NotificationSink
+drained onto the WS) is a separate, larger change on top of PR #103 (the
+concurrent-frames rewrite of the /bus relay loop). This canary drives the real
+/bus WebSocket the way a push-capable UI would — subscribe, generate traffic,
+expect a `notifications/aitm/flow` push — and auto-flips from SKIP to PASS the
+moment that lands; flip the SKIP to fail() then to make it a hard guard.
 """
 
 import sys
@@ -40,11 +43,13 @@ def main() -> int:
         try:
             sub = ws.call("flow.subscribe", {})
         except ToolError as e:
-            # The shipped F4 bug: the /bus bridge connection carries no push sink,
-            # so the core refuses to subscribe. This is the web flow-list freeze,
-            # reproduced at the real boundary with the core's own error.
-            skip(f"KNOWN BUG (F4 web /bus freeze): the bridge rejects flow.subscribe — {e} "
-                 "Flip this SKIP to fail() once the /bus bridge gains a push sink.")
+            # Push-over-bridge gap: the /bus bridge connection carries no push sink,
+            # so the core refuses to subscribe, reproduced at the real boundary with
+            # the core's own error. The shipped un-freeze (PR #124) is client-side
+            # polling (see test_bus_poll_reflects_traffic), not push.
+            skip(f"DESIGN GAP (push-over-bridge): the /bus bridge rejects flow.subscribe — {e} "
+                 "Shipped un-freeze is client-side polling (PR #124); push-over-bridge is a "
+                 "separate change on PR #103. Flip this SKIP to fail() when the bridge gains a sink.")
         ok(f"flow.subscribe over /bus succeeded: {sub}")
 
         section("generate real traffic, then wait for a LIVE push")
