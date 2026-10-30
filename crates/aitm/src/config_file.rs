@@ -680,6 +680,8 @@ struct PocFile {
     dir: Option<PathBuf>,
     /// Where `poc.run` writes artifacts and `poc.artifact` reads them from.
     out_dir: Option<PathBuf>,
+    /// Let an agent (MCP) frontend run `poc.run` (default false). (T3)
+    allow_agent_run: Option<bool>,
 }
 
 impl PocFile {
@@ -689,6 +691,9 @@ impl PocFile {
         }
         if let Some(d) = self.out_dir {
             c.out_dir = Some(d);
+        }
+        if let Some(v) = self.allow_agent_run {
+            c.allow_agent_run = v;
         }
     }
 }

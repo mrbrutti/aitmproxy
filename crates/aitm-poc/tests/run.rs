@@ -486,6 +486,7 @@ async fn run_honors_out_dir_and_artifact_reads_it_back() {
         poc: PocConfig {
             dir: None,
             out_dir: Some(out_dir.clone()),
+            ..Default::default()
         },
         ..Config::default()
     };

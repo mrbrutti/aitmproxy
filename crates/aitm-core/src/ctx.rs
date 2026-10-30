@@ -10,7 +10,9 @@
 use futures::future::BoxFuture;
 use tokio::sync::oneshot;
 
-use crate::flow::{Flow, FlowId, HttpFlow, HttpRequest, HttpResponse, InterceptState, ResumeHandle};
+use crate::flow::{
+    Flow, FlowId, HttpFlow, HttpRequest, HttpResponse, InterceptState, ResumeHandle,
+};
 use crate::guard::ScopeRateGuard;
 use crate::store::FlowStore;
 use crate::value::Value;

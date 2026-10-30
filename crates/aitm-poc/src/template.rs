@@ -65,6 +65,15 @@ impl PocTemplate {
         Self { defaults }
     }
 
+    /// The PoC's evaluated `variables:` defaults, so the runner can seed them into
+    /// the run's live bindings — so a `script:` step's `vars.get()` sees a default,
+    /// not only `{{template}}` rendering. Caller-supplied `--vars` still win,
+    /// because the runner only seeds a default the live bindings do not already
+    /// hold. (T2)
+    pub fn defaults(&self) -> &VarBindings {
+        &self.defaults
+    }
+
     /// Build a templater from a PoC, evaluating DSL-wrapped `variables` defaults
     /// (e.g. `{{rand_text_alpha(8)}}`) once, in declaration order so later
     /// defaults may reference earlier ones.
