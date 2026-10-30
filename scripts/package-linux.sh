@@ -107,7 +107,11 @@ chmod 755 "$libdir/aitm" "$libdir/aitm-tui" "$libdir/obscura"
 
 mkdir -p dist
 
-# These four are consumed by scripts/nfpm.yaml via ${...} expansion.
+# These four feed scripts/nfpm.yaml. nfpm does NOT reliably expand ${...} in
+# contents[].src globs (it fails with "Glob failed: ${STAGEDIR}/... no matching
+# files"), so pre-expand the config ourselves with envsubst — restricted to just
+# these four names so nothing else in the YAML is touched — and hand nfpm the
+# concrete staged paths.
 export VERSION="$version"
 export ARCH="$goarch"
 export STAGEDIR="$proto"
@@ -115,10 +119,13 @@ export STAGEDIR="$proto"
 deb_out="dist/aitm-${version}-${debarch}.deb"
 rpm_out="dist/aitm-${version}-${rpmarch}.rpm"
 
+nfpm_cfg="$work/nfpm.expanded.yaml"
+envsubst '$ARCH $VERSION $MAINTAINER $STAGEDIR' < scripts/nfpm.yaml > "$nfpm_cfg"
+
 echo "package-linux.sh: nfpm pkg --packager deb -> ${deb_out}"
-nfpm pkg --config scripts/nfpm.yaml --packager deb --target "$deb_out"
+nfpm pkg --config "$nfpm_cfg" --packager deb --target "$deb_out"
 
 echo "package-linux.sh: nfpm pkg --packager rpm -> ${rpm_out}"
-nfpm pkg --config scripts/nfpm.yaml --packager rpm --target "$rpm_out"
+nfpm pkg --config "$nfpm_cfg" --packager rpm --target "$rpm_out"
 
 echo "package-linux.sh: wrote ${deb_out} and ${rpm_out}"
