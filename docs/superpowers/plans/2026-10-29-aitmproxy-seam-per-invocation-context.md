@@ -64,9 +64,10 @@
 - [ ] Step 2: run — FAIL. Step 3: implement. Step 4: PASS; gate (Terminal panel for loopback/privilege). Step 5: commit.
 
 ### Task 5: Migrate `log.option` + `finding` onto the seam using the context (distinct task)
-**Files:** Modify `crates/aitm-plugin-rhai/src/{host_core,prelude}.rs` (move `log.option`/`finding` from in-crate registration to a first-party `ProtocolLanguage`/core-namespace registration, each `Guarded`), delete the old registration; Test: `crates/aitm-plugin-rhai/tests/{host_core,prelude}.rs` (existing behaviour unchanged).
+**Files:** Modify `crates/aitm-plugin-rhai/src/{host_core,prelude}.rs` (move `log.option`/`finding` from in-crate registration to a first-party `ProtocolLanguage`/core-namespace registration, each `Guarded`), delete the old registration; **and thread the real per-eval tag/source through `seed_call_context` at the invocation boundaries (`crates/aitm-plugin-rhai/src/plugin.rs`, the `poc.run`/`command.rs` wiring)** — the original file set was insufficient: `option`'s tag and `finding`'s source are seeded through rhai's `NativeCallContext`, not through `seed_call_context`, so dispatch can't recover them and the migration would silently regress. Test: `crates/aitm-plugin-rhai/tests/{host_core,prelude}.rs` (existing behaviour unchanged) + a boundary test that the migrated `option`/`finding` see the real tag/source.
 **Interfaces:** `log.option` reads `ctx.tag()` (the script options); `finding` reads `ctx.call_source()`. Both move behind the seam, proving the context-needing (AC7) path moves. (Effectful-fn proof: migrating one effectful namespace such as `store`/`scope` is an incremental follow-up per the ruling — NOT required here.)
 **Depends on:** Tasks 1–2.
+**Scope amendment (architect-ratified):** the coder correctly BLOCKED on the original host_core/prelude-only file set because the per-eval tag/source are not reachable at dispatch without threading them from the eval boundary; the fix widens the file set to `plugin.rs`/`command.rs` (the same boundaries Task 3 seeds trust at) to thread the real tag/source through `seed_call_context`. No behaviour change beyond making the migration faithful.
 
 - [ ] Step 1: failing tests — AC7: `log.option` (via `ctx.tag()`) and `finding` (via `ctx.call_source()`) run identically after moving onto the seam; the old in-crate registration is gone (not double-registered). Step 2: run — FAIL. Step 3: implement + delete old path. Step 4: PASS; gate. Step 5: commit.
 
@@ -80,6 +81,9 @@
 
 | Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
+| 3 | Build (self) | — | Cross-restart authoring-trust default seeded `Operator` for unknown-provenance reloads (agent→operator escalation) | FIXED (dd568cc) per architect ruling — unknown provenance seeds least-privilege `Agent`; in-session operator authorship preserved |
+| 5 | Build (coder) | Blocker | `option`/`finding` migration can't recover the per-eval tag/source at dispatch within the host_core/prelude-only file set — would silently regress | Architect-ratified scope amendment: thread the real tag/source through `seed_call_context` at the `plugin.rs`/`command.rs` boundaries (Task 3's seeding boundaries); no behaviour change beyond a faithful migration |
+| — | Build (self) | fast-follow | Native `l4:` PoC-step handler not yet registered into the production `poc.run` runner (gate logic correct once wired) | Pre-existing, out of this build's scope; flagged for a separate follow-up PR |
 
 ## Shipped
 
