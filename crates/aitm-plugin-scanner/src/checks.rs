@@ -60,7 +60,7 @@ pub(crate) const OPEN_REDIRECT_SENTINEL: &str = "aitm-scan-sentinel.invalid";
 /// matches. Case-insensitive, because host names are. Paired with a 3xx status
 /// check in `confirm`.
 const OPEN_REDIRECT_LOCATION_REGEX: &str =
-    r"(?im)^location:\s*(?:https?:)?//aitm-scan-sentinel\.invalid(?:[:/?#]|$)";
+    r"(?im)^location:[ \t]*(?:https?:)?//aitm-scan-sentinel\.invalid(?:[:/?#]|$)";
 
 /// One vulnerability class: where to inject, the inert payloads to try, and
 /// how `confirm` judges a response.
@@ -100,6 +100,19 @@ const REFLECTED_XSS_MARKERS: &[&str] = &[
 /// does not collapse them.
 const OPEN_REDIRECT_PATHS: &[&str] = &["/", "/x", "/a/b", "/?n=1", "/redir", "/go"];
 
+/// Whether a response's `Content-Type` marks it as a document a browser renders
+/// as HTML — the only context a reflected marker could execute in. A
+/// correctly-typed JSON or plain-text API response is not HTML-exploitable, so a
+/// marker echoed there is not a confirmed reflected-XSS hit.
+fn response_is_html(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("content-type") && {
+            let v = value.to_ascii_lowercase();
+            v.contains("text/html") || v.contains("application/xhtml+xml")
+        }
+    })
+}
+
 impl CheckDefinition {
     /// Judge one response against this class's confirming assertion for
     /// `payload`. `None` means no hit.
@@ -111,18 +124,26 @@ impl CheckDefinition {
         payload: &Payload,
     ) -> Option<Evidence> {
         // Open-redirect only fires on a real redirect: a stray off-origin URL
-        // echoed into a 2xx response's headers is not a redirect.
-        if self.class == CLASS_OPEN_REDIRECT && !(300..=399).contains(&status) {
+        // echoed into a non-redirect response's headers is not a redirect. Gate
+        // on the statuses a user agent actually follows (not 300/304/305/306).
+        if self.class == CLASS_OPEN_REDIRECT && !matches!(status, 301 | 302 | 303 | 307 | 308) {
             return None;
         }
         let assertion = self.success_assertion(payload);
         // An empty word matches every response; never confirm on one (a
         // hand-built `Payload` with an empty value and no marker would
-        // otherwise report every response as a hit).
+        // otherwise report every response as a hit). Checked before the HTML
+        // gate below so the empty-word guard is what rejects it.
         if let Assertion::Word { word, .. } = &assertion {
             if word.is_empty() {
                 return None;
             }
+        }
+        // Reflected-XSS only matters where the marker renders as HTML: an API
+        // that echoes it into a correctly-typed JSON/text response is not
+        // browser-exploitable, so it is not a confirmed hit.
+        if self.class == CLASS_REFLECTED_XSS && !response_is_html(headers) {
+            return None;
         }
         let mut ctx = MatchContext::new(status, body.to_string());
         for (name, value) in headers {
@@ -231,13 +252,14 @@ mod tests {
             .first()
             .expect("reflected_xss ships at least one payload");
         let marker = payload.marker.clone().expect("a reflection marker");
+        let html = vec![("Content-Type".to_string(), "text/html".to_string())];
 
-        // Reflected verbatim (unencoded): a hit.
+        // Reflected verbatim (unencoded) in an HTML response: a hit.
         let hit_body = format!("<h1>Results for {marker}</h1>");
-        assert!(def.confirm(200, &hit_body, &[], payload).is_some());
+        assert!(def.confirm(200, &hit_body, &html, payload).is_some());
 
         // Not reflected at all: no hit.
-        assert!(def.confirm(200, "nothing here", &[], payload).is_none());
+        assert!(def.confirm(200, "nothing here", &html, payload).is_none());
     }
 
     #[test]
@@ -254,9 +276,38 @@ mod tests {
         );
 
         let patched_body = format!("<h1>Results for {escaped}</h1>");
+        let html = vec![("Content-Type".to_string(), "text/html".to_string())];
         assert!(
-            def.confirm(200, &patched_body, &[], payload).is_none(),
+            def.confirm(200, &patched_body, &html, payload).is_none(),
             "escaped reflection must not confirm: a patched target is not vulnerable"
+        );
+    }
+
+    #[test]
+    fn reflected_xss_requires_an_html_content_type() {
+        // The same raw marker reflected into a correctly-typed JSON (or
+        // typeless) API response is not browser-exploitable, so it is not a hit.
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let marker = payload.marker.clone().expect("a marker");
+        let body = format!("{{\"q\":\"{marker}\"}}");
+
+        let json = vec![("Content-Type".to_string(), "application/json".to_string())];
+        assert!(
+            def.confirm(200, &body, &json, payload).is_none(),
+            "a JSON echo of the marker is not HTML-exploitable"
+        );
+        assert!(
+            def.confirm(200, &body, &[], payload).is_none(),
+            "no Content-Type: do not confirm an XSS hit"
+        );
+        let html = vec![(
+            "Content-Type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        )];
+        assert!(
+            def.confirm(200, &body, &html, payload).is_some(),
+            "the same reflection in an HTML response is a hit"
         );
     }
 
@@ -319,6 +370,15 @@ mod tests {
         assert!(def
             .confirm(
                 200,
+                "",
+                &loc("https://aitm-scan-sentinel.invalid/x"),
+                payload
+            )
+            .is_none());
+        // 304 is not a user-agent-followed redirect: no hit even with the host.
+        assert!(def
+            .confirm(
+                304,
                 "",
                 &loc("https://aitm-scan-sentinel.invalid/x"),
                 payload
