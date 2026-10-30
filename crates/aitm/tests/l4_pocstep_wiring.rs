@@ -49,6 +49,27 @@ success:
   - dsl: 'l4_outcome == "no_response"'
 "#;
 
+/// The same PoC with a FULL L2 frame (`ether` first), for the real-wire test only.
+/// libpcap injects the bytes verbatim and Linux `lo` is Ethernet (`DLT_EN10MB`), so
+/// the real backend needs the link-layer header; the mock backend ignores framing,
+/// which is why the hermetic tests keep the L3-only body above.
+const L4_POC_L2: &str = r#"id: l4-send-recv-l2
+info:
+  name: l4 send_recv real-wire wiring
+  severity: low
+steps:
+  - l4:
+      op: send_recv
+      packet:
+        layers:
+          - ether: {}
+          - ipv4: { dst: "127.0.0.1" }
+          - tcp:  { dport: 80, flags: S }
+      timeout_ms: 1000
+success:
+  - dsl: 'l4_outcome == "no_response"'
+"#;
+
 // --- a hermetic capture/inject backend (no socket, no privilege) ------------
 
 struct MockBackend {
@@ -211,7 +232,7 @@ async fn run_poc(
     frontend: Option<Frontend>,
 ) -> (anyhow::Result<Value>, Arc<MockBackend>) {
     let backend = MockBackend::new();
-    let result = run_poc_with(allow_agent_inject, frontend, backend.clone()).await;
+    let result = run_poc_with(allow_agent_inject, frontend, backend.clone(), L4_POC).await;
     (result, backend)
 }
 
@@ -220,6 +241,7 @@ async fn run_poc_with(
     allow_agent_inject: bool,
     frontend: Option<Frontend>,
     backend: Arc<dyn CaptureInjectBackend>,
+    poc_body: &'static str,
 ) -> anyhow::Result<Value> {
     let assembled = assemble_l4_poc_run(allow_agent_inject, backend);
     let proxy = assembled.proxy;
@@ -231,7 +253,7 @@ async fn run_poc_with(
     let dir = unique_dir("poc");
     std::fs::create_dir_all(&dir).expect("poc dir");
     let path = dir.join("l4-send-recv.poc.yaml");
-    std::fs::write(&path, L4_POC).expect("write poc");
+    std::fs::write(&path, poc_body).expect("write poc");
 
     tokio::task::spawn_blocking(move || {
         let mut host = CommandHost::new(store.as_ref(), client.as_ref(), guard.as_ref(), None);
@@ -321,7 +343,8 @@ async fn unseeded_host_is_fail_closed() {
 /// real wire still ends in the finding-anchor's "no HTTP flow" error. That error is
 /// the success signal here: it proves the stimulus went through the assembled
 /// `poc.run` past the registration, scope and agent gates onto a real libpcap
-/// backend. A gate or registration failure would instead read "no handler
+/// backend. Either real outcome (RST => response, silence => no_response) ends at
+/// the anchor, so no `l4_outcome` is asserted. A gate or registration failure would instead read "no handler
 /// registered", "disabled" or "out of L4 scope".
 #[test]
 #[ignore = "needs raw L4 privilege + Linux loopback; run with AITM_L4_TESTS=1 via the Terminal panel"]
@@ -336,7 +359,12 @@ fn operator_l4_step_injects_on_real_loopback() {
         .build()
         .expect("runtime");
     let backend: Arc<dyn CaptureInjectBackend> = Arc::new(PcapBackend::new());
-    let result = rt.block_on(run_poc_with(false, Some(Frontend::Operator), backend));
+    let result = rt.block_on(run_poc_with(
+        false,
+        Some(Frontend::Operator),
+        backend,
+        L4_POC_L2,
+    ));
     let msg = err_text(result);
     if msg.to_ascii_lowercase().contains("unavailable") {
         // No raw privilege / libpcap on this host: fail-closed, skip.
