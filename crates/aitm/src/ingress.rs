@@ -245,6 +245,32 @@ impl CoreIngress {
     /// [`Captured`]: IngressOutcome::Captured
     /// [`Refused`]: IngressOutcome::Refused
     /// [`Unhandled`]: IngressOutcome::Unhandled
+    /// The admission decision for a captured UDP flow to `target`, taken **without**
+    /// any datagram payload — the same `(Capture, target)` check
+    /// [`dispatch_udp`](CoreIngress::dispatch_udp) applies per datagram, exposed so a
+    /// capture backend refuses an out-of-scope flow *before* buffering its payload
+    /// (guard-before-work, mirroring [`dispatch_tcp`](CoreIngress::dispatch_tcp)).
+    /// [`Unhandled`] when no L4 backend is wired; [`Refused`] when the guard refuses;
+    /// [`Captured`] means **admitted** (the guard passed) — nothing is stored by this
+    /// check, the caller then streams and dispatches the datagrams.
+    ///
+    /// [`Captured`]: IngressOutcome::Captured
+    /// [`Refused`]: IngressOutcome::Refused
+    /// [`Unhandled`]: IngressOutcome::Unhandled
+    #[must_use]
+    pub fn udp_admits(&self, target: &L4Target) -> IngressOutcome {
+        match &self.l4 {
+            None => IngressOutcome::Unhandled,
+            Some(l4) => {
+                if l4.guard.check(L4Action::Capture, target).is_ok() {
+                    IngressOutcome::Captured
+                } else {
+                    IngressOutcome::Refused
+                }
+            }
+        }
+    }
+
     pub fn dispatch_udp(&self, flow: CapturedUdpFlow) -> IngressOutcome {
         if self.l4.is_none() {
             return IngressOutcome::Unhandled;
@@ -797,6 +823,39 @@ mod tests {
         );
     }
 
+    /// Guard-before-work: `udp_admits` decides from the target alone — an in-scope
+    /// target is admitted (`Captured`), an out-of-scope one on the same interface is
+    /// `Refused`, and an ingress with no L4 backend is `Unhandled` — all **without**
+    /// storing anything, so a backend refuses before buffering a flow's payload.
+    #[test]
+    fn udp_admits_decides_from_target_without_storing() {
+        let mut cfg = L4Config::default();
+        cfg.scope.push(capture_entry("127.0.0.1"));
+        let guard = Arc::new(L4Guard::new(&cfg));
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let ingress = CoreIngress::with_l4(guard, store.clone());
+
+        assert_eq!(
+            ingress.udp_admits(&l4_target("127.0.0.1")),
+            IngressOutcome::Captured,
+            "an in-scope target is admitted"
+        );
+        assert_eq!(
+            ingress.udp_admits(&l4_target("127.0.0.2")),
+            IngressOutcome::Refused,
+            "an out-of-scope target is refused"
+        );
+        assert_eq!(
+            CoreIngress::empty().udp_admits(&l4_target("127.0.0.1")),
+            IngressOutcome::Unhandled,
+            "no L4 backend wired is unhandled"
+        );
+        assert!(
+            store.list().is_empty(),
+            "an admission check stores nothing — the guard ran, no payload was buffered"
+        );
+    }
+
     /// The production (non-test) prefix of a source file — everything before the
     /// trailing `#[cfg(test)]` block — so the scan never trips over test code.
     fn production_prefix(source: &str) -> &str {
@@ -807,26 +866,31 @@ mod tests {
     }
 
     /// AC17 / M5-AC21: adding the ingress introduces **no** new wire-write path. The
-    /// ingress source neither injects (`.inject(`) nor calls the choke point
-    /// (`send_on_wire(`); the single guarded wire write remains
-    /// `aitm_proto_l4::wire::send_on_wire`, an `L4Permit` by type. A structural
-    /// tripwire over the type-level proof (the permit is unforgeable), not the proof.
+    /// ingress source — and the macOS capture adapter that feeds it — neither inject
+    /// (`.inject(`) nor call the choke point (`send_on_wire(`); the single guarded
+    /// wire write remains `aitm_proto_l4::wire::send_on_wire`, an `L4Permit` by type.
+    /// A structural tripwire over the type-level proof (the permit is unforgeable),
+    /// not the proof.
     #[test]
     fn one_choke_point_survives_ingress() {
         let aitm_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let ingress =
-            std::fs::read_to_string(aitm_src.join("ingress.rs")).expect("read ingress.rs");
-        let prod = production_prefix(&ingress);
-        assert_eq!(
-            prod.matches(".inject(").count(),
-            0,
-            "the capture ingress must not write to the wire"
-        );
-        assert_eq!(
-            prod.matches("send_on_wire(").count(),
-            0,
-            "the capture ingress must not reach the wire-write choke point"
-        );
+        // Every capture source that reaches the ingress must stay read-only on the
+        // wire: the ingress itself and the macOS capture-backend adapter.
+        for rel in ["ingress.rs", "macos_capture/adapter.rs"] {
+            let source = std::fs::read_to_string(aitm_src.join(rel))
+                .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+            let prod = production_prefix(&source);
+            assert_eq!(
+                prod.matches(".inject(").count(),
+                0,
+                "{rel} must not write to the wire"
+            );
+            assert_eq!(
+                prod.matches("send_on_wire(").count(),
+                0,
+                "{rel} must not reach the wire-write choke point"
+            );
+        }
 
         // The one choke point still exists, still gated by an `L4Permit` by type.
         let l4_wire: PathBuf = aitm_src

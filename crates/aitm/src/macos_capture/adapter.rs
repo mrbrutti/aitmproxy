@@ -31,7 +31,9 @@ use crate::ingress::{
     dispatch_captured_tcp, CapturedTcpFlow, CapturedUdpFlow, CoreIngress, IngressOutcome,
     StreamOutcome,
 };
-use crate::macos_capture::listener::{DataConnection, FlowKind, FlowOpen, Hello};
+use crate::macos_capture::listener::{
+    ControlChannel, ControlMessage, DataConnection, FlowKind, FlowOpen, Hello,
+};
 
 /// The handoff protocol version this core speaks. A provider announcing a
 /// different version in its [`Hello`] is refused ([`check_hello`]) — a mismatched
@@ -79,6 +81,32 @@ pub fn check_hello(hello: &Hello) -> io::Result<()> {
     Ok(())
 }
 
+/// Read and validate the provider's opening frame on the control channel: it must
+/// be a [`Hello`], and its `protocol_version` must match ([`check_hello`]). This is
+/// the adapter's control-channel entry point — the live feeder (plan Task 9) calls
+/// it before reading any [`FlowOpen`], so the version gate runs for real on every
+/// session, not just in isolation.
+///
+/// # Errors
+/// Fails if the channel closes before a frame, the first frame is not a `Hello`, or
+/// the announced version does not match [`HANDOFF_PROTOCOL_VERSION`].
+pub async fn recv_hello(control: &mut ControlChannel) -> io::Result<Hello> {
+    match control.recv().await? {
+        Some(ControlMessage::Hello(hello)) => {
+            check_hello(&hello)?;
+            Ok(hello)
+        }
+        Some(other) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected Hello as the first control frame, got {other:?}"),
+        )),
+        None => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "control channel closed before the Hello",
+        )),
+    }
+}
+
 /// Adapt one captured flow onto the ingress and dispatch it. `open` is its
 /// control-channel metadata; `data` is its correlated per-flow data socket. The
 /// kind in `open` selects the TCP (stream) or UDP (L4) path. The caller pairs the
@@ -121,23 +149,43 @@ async fn adapt_tcp(
 }
 
 /// Adapt a captured **UDP** handoff flow onto [`CapturedUdpFlow`] and dispatch it
-/// over the existing deny-by-default L4 path (the shared `L4Guard`). Datagrams are
-/// drained from the per-flow data socket's length-delimited framing.
+/// over the existing deny-by-default L4 path (the shared `L4Guard`).
+///
+/// **Guard-before-work (mirroring the TCP path):** the scope guard is consulted
+/// *first*, from the [`FlowOpen`] metadata alone, so an out-of-scope (or
+/// no-backend) flow is refused before a single datagram payload is read — never
+/// buffered. An admitted flow is then streamed and dispatched **one datagram at a
+/// time**, so the adapter never accumulates an unbounded buffer: live memory is a
+/// single datagram (the listener caps each at 64 KiB), whatever the flow's length.
 async fn adapt_udp(
     ingress: &CoreIngress,
     open: &FlowOpen,
     mut data: DataConnection,
 ) -> io::Result<IngressOutcome> {
-    let mut datagrams = Vec::new();
-    while let Some(datagram) = data.recv_datagram().await? {
-        datagrams.push(datagram);
+    let target = udp_target(open);
+    // Refuse before buffering: an out-of-scope or no-backend flow is decided from
+    // metadata alone, draining no payload.
+    match ingress.udp_admits(&target) {
+        IngressOutcome::Unhandled => return Ok(IngressOutcome::Unhandled),
+        IngressOutcome::Refused => return Ok(IngressOutcome::Refused),
+        IngressOutcome::Captured => {} // admitted — stream the datagrams, bounded.
     }
-    let flow = CapturedUdpFlow {
-        target: udp_target(open),
-        datagrams,
-        peer_identity: open.source_app.clone(),
-    };
-    Ok(ingress.dispatch_udp(flow))
+
+    // Admitted: dispatch each datagram as it arrives. Each `dispatch_udp` call
+    // re-applies the same `L4Guard` check (the guard below the ingress stays
+    // authoritative) and appends to the one shared capture flow.
+    let mut outcome = IngressOutcome::Refused;
+    while let Some(datagram) = data.recv_datagram().await? {
+        if ingress.dispatch_udp(CapturedUdpFlow {
+            target: target.clone(),
+            datagrams: vec![datagram],
+            peer_identity: open.source_app.clone(),
+        }) == IngressOutcome::Captured
+        {
+            outcome = IngressOutcome::Captured;
+        }
+    }
+    Ok(outcome)
 }
 
 /// Map a TCP [`FlowOpen`] and its sniffed stream onto the ingress's own
@@ -267,6 +315,68 @@ mod tests {
         })
         .expect_err("a mismatched handoff version must be refused");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// `recv_hello` runs the version gate on the live control channel: it accepts a
+    /// matching `Hello`, refuses a mismatched version, and rejects a non-`Hello`
+    /// first frame — so the gate runs for real, not just in isolation.
+    #[tokio::test]
+    async fn recv_hello_gates_the_control_channel() {
+        use crate::macos_capture::listener::ScopeSpec;
+
+        // Matching version → accepted.
+        let (provider, core) = tokio::net::UnixStream::pair().unwrap();
+        let mut provider = ControlChannel::from_stream(provider);
+        let mut core = ControlChannel::from_stream(core);
+        provider
+            .send(&ControlMessage::Hello(Hello {
+                protocol_version: HANDOFF_PROTOCOL_VERSION,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_hello(&mut core)
+                .await
+                .expect("hello accepted")
+                .protocol_version,
+            HANDOFF_PROTOCOL_VERSION
+        );
+
+        // Mismatched version → refused.
+        let (provider, core) = tokio::net::UnixStream::pair().unwrap();
+        let mut provider = ControlChannel::from_stream(provider);
+        let mut core = ControlChannel::from_stream(core);
+        provider
+            .send(&ControlMessage::Hello(Hello {
+                protocol_version: HANDOFF_PROTOCOL_VERSION + 1,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_hello(&mut core)
+                .await
+                .expect_err("mismatch refused")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // A non-Hello first frame → refused.
+        let (provider, core) = tokio::net::UnixStream::pair().unwrap();
+        let mut provider = ControlChannel::from_stream(provider);
+        let mut core = ControlChannel::from_stream(core);
+        provider
+            .send(&ControlMessage::Scope(ScopeSpec {
+                spec: "scope".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_hello(&mut core)
+                .await
+                .expect_err("non-hello refused")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     /// The TCP mapping carries the authoritative remote, the SNI, the source-app
