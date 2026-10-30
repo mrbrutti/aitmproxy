@@ -1,16 +1,23 @@
 //! The `/bus` WebSocket bridge (design §4.9): a dumb relay of newline-delimited
 //! JSON-RPC lines between a browser and the in-process `McpServer`. The first
 //! text frame must be the token line `{"token":"…"}`, exactly as `LoopbackTcp`
-//! requires on its first line; every later text frame holds one or more lines,
-//! each answered (in order) with one text frame. All policy stays in the core:
-//! the bridge authenticates, splits lines, and forwards.
+//! requires on its first line; every later text frame holds one or more lines.
+//!
+//! A frame is the unit of work. The lines inside one frame run in order and are
+//! answered in order, one text frame per reply, once the whole frame is done.
+//! Frames run concurrently (up to `MAX_IN_FLIGHT` per connection), so a
+//! long-running command — `scan.discover` can run for minutes — never freezes the
+//! other requests on the same socket; replies across frames arrive in completion
+//! order and clients correlate them by JSON-RPC `id`. All policy stays in the
+//! core: the bridge authenticates, splits lines, and forwards.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use aitm_core::Frontend;
-use aitm_mcp::ConnCtx;
+use aitm_mcp::{ConnCtx, McpServer};
 use bytes::Bytes;
+use futures::stream::FuturesUnordered;
 use futures::{SinkExt as _, StreamExt as _};
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -36,6 +43,12 @@ pub const MAX_MESSAGE_BYTES: usize = 16 << 20;
 /// unauthenticated connection-exhaustion DoS (remote under
 /// `AITM_WEB_INSECURE_BIND`). The deadline is absolute, so pings cannot extend it.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The most frames one connection may have running at once. At the cap the relay
+/// stops reading further frames (TCP backpressure) until one finishes, so neither
+/// blocking tasks nor queued frames can grow without bound however fast a peer
+/// sends. Each frame holds one blocking-pool thread while its commands run.
+const MAX_IN_FLIGHT: usize = 16;
 
 /// JSON-RPC error code for a refused token (matches `LoopbackTcp`).
 pub const UNAUTHORIZED: i64 = -32001;
@@ -165,50 +178,75 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
     }
     debug!(?role, "web bus: connection authenticated");
 
-    // Any lines that shared the token's frame are ordinary messages.
-    for line in pending {
-        dispatch(&mut ws, state, role, line).await?;
+    // One task per frame, so a slow command (its blocking `invoke`) cannot stall
+    // the reads and replies of the other frames on this socket. At most
+    // `MAX_IN_FLIGHT` run at once; at the cap the loop stops reading (the read
+    // branch below is disabled) until one finishes.
+    //
+    // When this function returns — client close, a transport error, a command that
+    // panicked — the still-running frames are detached, not cancelled: a blocking
+    // `Command::invoke` cannot be interrupted, so each runs to completion on its
+    // blocking thread and its replies are dropped with the connection.
+    let mut in_flight: FuturesUnordered<FrameTask> = FuturesUnordered::new();
+
+    // Any lines that shared the token's frame are the first frame in flight.
+    if !pending.is_empty() {
+        in_flight.push(dispatch_frame(&state.mcp, role, pending));
     }
 
-    while let Some(frame) = ws.next().await {
-        match frame? {
-            Message::Text(text) => {
-                for line in lines_of(text.as_str()) {
-                    dispatch(&mut ws, state, role, line.to_owned()).await?;
+    loop {
+        tokio::select! {
+            // A frame finished: send its replies, in line order, one text frame
+            // each. A panicked command surfaces as a `JoinError` and ends the
+            // connection with an error.
+            Some(done) = in_flight.next(), if !in_flight.is_empty() => {
+                for reply in done? {
+                    ws.send(Message::text(reply)).await?;
                 }
             }
-            Message::Binary(_) => {
-                return close(ws, CloseCode::Unsupported, "text frames only").await;
-            }
-            Message::Close(frame) => {
-                debug!(?frame, "websocket closed by the client");
-                return Ok(());
-            }
-            Message::Ping(_) | Message::Pong(_) => debug!("websocket ping/pong"),
-            Message::Frame(_) => {} // never surfaced on read
+            frame = ws.next(), if in_flight.len() < MAX_IN_FLIGHT => match frame {
+                Some(Ok(Message::Text(text))) => {
+                    let lines: Vec<String> = lines_of(text.as_str()).map(str::to_owned).collect();
+                    if !lines.is_empty() {
+                        in_flight.push(dispatch_frame(&state.mcp, role, lines));
+                    }
+                }
+                Some(Ok(Message::Binary(_))) => {
+                    return close(ws, CloseCode::Unsupported, "text frames only").await;
+                }
+                Some(Ok(Message::Close(frame))) => {
+                    debug!(?frame, "websocket closed by the client");
+                    return Ok(());
+                }
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => debug!("websocket ping/pong"),
+                Some(Ok(Message::Frame(_))) => {} // never surfaced on read
+                Some(Err(e)) => return Err(e.into()),
+                None => return Ok(()),
+            },
         }
     }
-    Ok(())
 }
 
-/// Hand one JSON-RPC line to the core on a blocking thread (the command's
-/// `invoke` runs synchronously there, as `transport::serve_lines` does) under
-/// the connection's resolved `role` and send its reply, if any, as one text
-/// frame. The role makes the browser's own `initialize` reply carry the right
-/// `role` echo, and gates commands exactly as the other frontends do.
-async fn dispatch(
-    ws: &mut Ws,
-    state: &WebState,
-    role: Frontend,
-    line: String,
-) -> anyhow::Result<()> {
-    let srv = state.mcp.clone();
-    let reply =
-        tokio::task::spawn_blocking(move || srv.handle_on(&ConnCtx::new(role), &line)).await?;
-    if let Some(reply) = reply {
-        ws.send(Message::text(reply)).await?;
-    }
-    Ok(())
+/// A frame's worth of work in flight: the replies its lines produced, in line
+/// order (a notification yields none).
+type FrameTask = tokio::task::JoinHandle<Vec<String>>;
+
+/// Hand one frame's JSON-RPC lines to the core on a blocking thread (each
+/// command's `invoke` runs synchronously there, as `transport::serve_lines` does)
+/// under the connection's resolved `role`. The lines run **in order**, so the
+/// returned replies are in the order the lines were sent; the caller sends them as
+/// one text frame each once the whole frame is done. The role makes the browser's
+/// own `initialize` reply carry the right `role` echo, and gates commands exactly
+/// as the other frontends do. Concurrency is across frames, never within one.
+fn dispatch_frame(mcp: &Arc<McpServer>, role: Frontend, lines: Vec<String>) -> FrameTask {
+    let mcp = Arc::clone(mcp);
+    tokio::task::spawn_blocking(move || {
+        let conn = ConnCtx::new(role);
+        lines
+            .iter()
+            .filter_map(|line| mcp.handle_on(&conn, line))
+            .collect()
+    })
 }
 
 /// Resolve the first-line token to a role, comparing in constant time against
