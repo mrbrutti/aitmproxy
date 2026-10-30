@@ -775,7 +775,17 @@ async fn poc_script_step_pass_vs_patched() {
             cfg.scope.entries.push(ScopeEntry {
                 host: target.to_string(),
             });
-            cfg.browser = engines::config_for(engine, cfg.browser.proxy_addr);
+            // A browser-facing proxy listener on a FREE port (mirrors
+            // e2e_reflected_xss::run_case). The previous code reused the default
+            // `cfg.browser.proxy_addr`, a fixed port that collides with other
+            // aitmproxy sessions' browser proxies on the same machine; obscura
+            // then routes through the wrong/absent listener and `browser.navigate`
+            // times out (the script's direct `http.send` still reaches the target,
+            // which is what made this look like an XSS-detection miss).
+            let free_browser = std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|l| l.local_addr())
+                .expect("free browser proxy port");
+            cfg.browser = engines::config_for(engine, free_browser);
 
             // Exactly `main`'s path: build the tier against late-bound handles,
             // assemble the proxy with it, then bind the real handles and the
@@ -835,12 +845,19 @@ async fn poc_script_step_pass_vs_patched() {
             let run_guard = guard.clone();
             let run_browser = browser.clone();
             let out = tokio::task::spawn_blocking(move || {
+                // This test exercises the executor/browser/poc.run wiring, not
+                // the T3 agent-run gate (which only applies to the default
+                // Frontend::Mcp). Run as the human CLI frontend so poc.run is not
+                // refused before it reaches the browser path. (PR #66 gate
+                // casualty, only reachable with a real engine; same approach as
+                // aitm-poc/tests/script_command.rs.)
                 let host = aitm_core::CommandHost::new(
                     run_host_store.as_ref(),
                     run_client.as_ref(),
                     run_guard.as_ref(),
                     Some(run_browser.as_ref()),
-                );
+                )
+                .with_frontend(aitm_core::Frontend::Cli);
                 let args = Params::new(
                     [
                         ("poc_path".to_string(), Value::Str(XSS_POC.to_string())),

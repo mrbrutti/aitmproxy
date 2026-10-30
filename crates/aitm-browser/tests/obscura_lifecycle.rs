@@ -334,11 +334,19 @@ async fn wait_until(timeout: Duration, check: impl Fn() -> bool) -> bool {
     check()
 }
 
-/// No `obscura serve … --ready-file` process is left on the machine.
+/// No obscura child spawned by THIS test process is left running.
+///
+/// Scoped to this process's own children: each child's `--ready-file` lives in a
+/// per-run dir named `aitm-obscura-<our pid>-<token>` (see `obscura.rs`
+/// `make_run_dir`), so the pattern matches only obscura we spawned. A
+/// machine-global `obscura.*--ready-file` match false-fails whenever another
+/// aitmproxy session on the same machine runs its own obscura — which happens
+/// routinely when sibling sessions drive a browser.
 fn no_obscura_child_remains() -> bool {
     // pgrep exits 1 when nothing matches.
+    let pattern = format!("aitm-obscura-{}-", std::process::id());
     std::process::Command::new("pgrep")
-        .args(["-f", "obscura.*--ready-file"])
+        .args(["-f", &pattern])
         .output()
         .map(|o| !o.status.success() && o.stdout.is_empty())
         .unwrap_or(false)
