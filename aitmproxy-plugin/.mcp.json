@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "aitmproxy": {
-      "command": "aitm",
+      "command": "${AITM_BIN:-aitm}",
       "args": [],
       "env": {}
     }
