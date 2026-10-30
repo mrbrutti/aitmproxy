@@ -372,7 +372,10 @@ fn poc_run_refuses_a_symlinked_poc_file() {
     let store = MemFlowStore::new();
     let client = NoClient;
     let guard = StdGuard::default();
-    let host = CommandHost::new(&store, &client, &guard, None);
+    // A human-CLI frontend so the loader-security check is reached (the T3 agent
+    // gate only applies to Frontend::Mcp).
+    let host = CommandHost::new(&store, &client, &guard, None)
+        .with_frontend(aitm_core::Frontend::Cli);
 
     let args = Params::new(
         [(
@@ -419,7 +422,9 @@ fn poc_run_confines_to_configured_dir() {
     let store = MemFlowStore::new();
     let client = NoClient;
     let guard = StdGuard::default();
-    let host = CommandHost::new(&store, &client, &guard, None).with_poc_dir(Some(inside.clone()));
+    let host = CommandHost::new(&store, &client, &guard, None)
+        .with_poc_dir(Some(inside.clone()))
+        .with_frontend(aitm_core::Frontend::Cli);
 
     let args = Params::new(
         [(
