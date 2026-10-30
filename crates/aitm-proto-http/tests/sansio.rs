@@ -231,8 +231,8 @@ fn completed_exchange() -> (Http1Machine, FlowId) {
 }
 
 // ---------------------------------------------------------------------------
-// Characterization: how the machine answers well-behaved server traffic. These
-// pin today's behaviour so the surplus-bytes guard cannot change it.
+// Well-behaved server traffic: how the machine answers it. Each of these keeps
+// working while server bytes that no request awaits are left unparsed.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -592,7 +592,7 @@ fn a_response_while_the_request_body_is_arriving_waits_for_the_request() {
 
 // ---------------------------------------------------------------------------
 // Edge cases a proxy must survive: what a hostile or broken origin can leave
-// behind a completed response. Added by the Stage 5 tester pass.
+// behind a completed response.
 // ---------------------------------------------------------------------------
 
 /// The head cap is a limit on what is buffered, so exactly the cap is fine and

@@ -51,8 +51,10 @@ pub enum HttpSansIoEvent {
     },
 }
 
-/// Largest head (request/status line + headers) accepted before erroring.
-const MAX_HEAD_BYTES: usize = 64 * 1024;
+/// Largest head (request/status line + headers) accepted before erroring. Also
+/// the cap on server bytes parked while no request awaits a response, which the
+/// driver's read size must stay below (see `READ_CHUNK` in `module.rs`).
+pub(crate) const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// Largest chunk-size line (hex size plus extensions) accepted.
 const MAX_CHUNK_LINE_BYTES: usize = 1024;
 
