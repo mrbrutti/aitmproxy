@@ -1,8 +1,9 @@
 # nfpm package definition for aitmproxy Linux .deb/.rpm packages.
 #
 # Templated: scripts/package-linux.sh exports VERSION, ARCH, STAGEDIR and
-# MAINTAINER before invoking `nfpm pkg`; nfpm expands ${...} from the
-# environment. One config emits both formats and both arches
+# MAINTAINER, then pre-expands these ${...} refs with envsubst before invoking
+# `nfpm pkg` (nfpm does not reliably expand ${...} in contents[].src globs).
+# One config emits both formats and both arches
 # (spec §B, docs/research/10-linux-packaging.md).
 # Schema: https://nfpm.goreleaser.com/configuration/
 #
