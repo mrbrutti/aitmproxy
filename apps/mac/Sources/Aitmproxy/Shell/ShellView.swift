@@ -9,6 +9,7 @@ struct ShellView: View {
     @Environment(\.openWindow) private var openWindow
     @State private var bus: BusService?
     @State private var embeddedCore: EmbeddedCoreController?
+    @State private var captureExtension: ExtensionController?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -93,6 +94,14 @@ struct ShellView: View {
                 session.connection = model
                 embeddedCore = controller
                 bus = service
+                // Operator-launch activation of the macOS capture extension (Task 13,
+                // NE-AC11): the only call site, so no bus/MCP/agent path can trigger it.
+                // Inert unless this build embeds the extension.
+                if captureExtension == nil {
+                    let capture = ExtensionController(health: session.coreHealth)
+                    capture.start()
+                    captureExtension = capture
+                }
             }
             SelfTest.runIfRequested(session: session)
             Snapshot.runIfRequested(session: session, openSettings: openSettings)
