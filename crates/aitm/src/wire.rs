@@ -225,6 +225,11 @@ pub fn assemble_with_scripts(
         .register_plugin(Box::new(SubscriptionPlugin::new(push_tx.clone())))
         .register_plugin(Box::new(DetailPlugin::new()))
         .register_plugin(Box::new(MetaPlugin::new()))
+        // The deterministic scanner's command set (scan.discover): a command-only
+        // provider that observes no events. Stage 1 uses the default budgets.
+        .register_plugin(Box::new(aitm_plugin_scanner::ScannerPlugin::new(
+            aitm_plugin_scanner::ScannerConfig::default(),
+        )))
         .register_plugin(Box::new(ReplayPlugin::new()))
         .register_plugin(Box::new(intercept))
         .register_plugin(Box::new(ControlPlugin::new(armed, listening.clone())));

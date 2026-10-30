@@ -150,7 +150,7 @@ impl Cli {
             None => host,
         };
         let host = match &self.egress {
-            Some(egress) => host.with_egress(egress.as_ref()),
+            Some(egress) => host.with_egress(egress.clone()),
             None => host,
         };
         if !yes {

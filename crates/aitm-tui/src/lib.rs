@@ -290,6 +290,8 @@ pub const CORE_TOOLS: &[&str] = &[
     "agent.approve",
     "flow.subscribe",
     "flow.unsubscribe",
+    // Scanner plugin (Stage 1): read-only crawl + injection-point discovery.
+    "scan.discover",
 ];
 
 /// An [`App`] loaded synchronously from the built-in fixture, sized `cols`×`rows`,

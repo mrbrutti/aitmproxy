@@ -19,7 +19,7 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 54] = [
+const EXPECTED_TOOLS: [&str; 55] = [
     // M4 agent-control and F4 subscription tools, registered unconditionally by
     // the `AgentPlugin` and `SubscriptionPlugin` in `wire.rs`.
     "agent.status",
@@ -78,6 +78,9 @@ const EXPECTED_TOOLS: [&str; 54] = [
     "map.add",
     "map.list",
     "map.remove",
+    // The deterministic scanner (Stage 1): `ScannerPlugin` is registered
+    // unconditionally in `wire.rs`, so its one command is on every surface.
+    "scan.discover",
 ];
 
 /// The six `browser.*` tool schemas as M1 shipped them, keyed by tool name.

@@ -1377,7 +1377,7 @@ impl McpServer {
         // agent, so gated commands and policy decide by who is actually on the end.
         .with_frontend(conn.role);
         let host = match &self.egress {
-            Some(egress) => host.with_egress(egress.as_ref()),
+            Some(egress) => host.with_egress(egress.clone()),
             None => host,
         };
         let host = match &conn.client_label {

@@ -368,8 +368,8 @@ mod tests {
     fn browser_confine_toggles_posture() {
         let store = MemFlowStore::new();
         let guard = StdGuard::default();
-        let egress = EgressConfinement::new(false);
-        let host = CommandHost::new(&store, &NoClient, &guard, None).with_egress(&egress);
+        let egress = std::sync::Arc::new(EgressConfinement::new(false));
+        let host = CommandHost::new(&store, &NoClient, &guard, None).with_egress(egress.clone());
         assert!(!egress.confined(), "fixture starts free");
 
         let result = Confine.invoke(on(true), &host).expect("toggle on");

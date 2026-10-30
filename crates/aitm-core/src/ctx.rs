@@ -140,7 +140,7 @@ pub struct CommandHost<'a> {
     client_label: Option<String>,
     config: Option<std::sync::Arc<crate::config::Config>>,
     finding_recorder: Option<&'a dyn FindingRecorder>,
-    egress: Option<&'a crate::egress::EgressConfinement>,
+    egress: Option<std::sync::Arc<crate::egress::EgressConfinement>>,
 }
 
 impl<'a> CommandHost<'a> {
@@ -203,18 +203,28 @@ impl<'a> CommandHost<'a> {
         self
     }
 
-    /// Attach the proxy's live browser-egress posture, so `browser.confine`
-    /// (and later the scanner) can toggle it. `None` (the default) means the
-    /// toggle is unavailable on this host — a frontend that never invokes
-    /// `browser.confine` need not wire it.
-    pub fn with_egress(mut self, egress: &'a crate::egress::EgressConfinement) -> Self {
+    /// Attach the proxy's live browser-egress posture (`Proxy::egress()`), so
+    /// `browser.confine` can toggle its base and a campaign command (the
+    /// scanner's crawl) can take an RAII hold on it. Shared by `Arc` because
+    /// [`EgressConfinement::confine`](crate::egress::EgressConfinement::confine)
+    /// needs an owned handle to hand the token. `None` (the default) means the
+    /// posture is unavailable on this host — a frontend that never invokes
+    /// `browser.confine` or a campaign need not wire it.
+    pub fn with_egress(mut self, egress: std::sync::Arc<crate::egress::EgressConfinement>) -> Self {
         self.egress = Some(egress);
         self
     }
 
     /// The attached browser-egress posture, if the frontend wired one.
     pub fn egress(&self) -> Option<&crate::egress::EgressConfinement> {
-        self.egress
+        self.egress.as_deref()
+    }
+
+    /// An owned handle to the attached posture, for a command that must hold
+    /// a campaign-scoped confinement across its run (`EgressConfinement::confine`
+    /// takes `&Arc<Self>`). `None` when no posture is wired.
+    pub fn egress_handle(&self) -> Option<std::sync::Arc<crate::egress::EgressConfinement>> {
+        self.egress.clone()
     }
 
     /// Declare which frontend built this host (defaults to [`Frontend::Mcp`]).
