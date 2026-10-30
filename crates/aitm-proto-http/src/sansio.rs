@@ -51,8 +51,10 @@ pub enum HttpSansIoEvent {
     },
 }
 
-/// Largest head (request/status line + headers) accepted before erroring.
-const MAX_HEAD_BYTES: usize = 64 * 1024;
+/// Largest head (request/status line + headers) accepted before erroring. Also
+/// the cap on server bytes parked while no request awaits a response, which the
+/// driver's read size must stay below (see `READ_CHUNK` in `module.rs`).
+pub(crate) const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// Largest chunk-size line (hex size plus extensions) accepted.
 const MAX_CHUNK_LINE_BYTES: usize = 1024;
 
@@ -89,7 +91,9 @@ enum Phase {
     Chunked(ChunkPhase),
     /// Response body runs to connection close.
     UntilClose,
-    /// Client only: request complete, response pending.
+    /// Client only: request complete, response pending. The server reader
+    /// parses a response head only while the client reader is here; server bytes
+    /// that arrive in any other client phase are left unparsed in its buffer.
     Waiting,
     /// After a 101: bytes belong to the next protocol.
     Upgraded,
@@ -185,8 +189,11 @@ impl Http1Machine {
         self.upgraded
     }
 
-    /// Bytes received from `side` that this machine will not parse (anything
-    /// after a 101). The driver hands them to the next protocol.
+    /// Bytes received from `side` that this machine will not parse: anything
+    /// after a 101 (the driver hands those to the next protocol), and server bytes
+    /// that arrive while no request awaits a response, such as a second response
+    /// in the same read as a completed one or the start of one nobody asked for
+    /// (the driver decides what an unsolicited byte means).
     pub fn take_leftover(&mut self, side: Side) -> Vec<u8> {
         std::mem::take(&mut self.reader_mut(side).buf)
     }
@@ -344,6 +351,19 @@ impl Http1Machine {
             match self.server.phase {
                 Phase::Head => {
                     let id = self.current_flow()?;
+                    // A response head is parsed only while a request is complete
+                    // and unanswered. Any other time the server has nothing
+                    // legitimate to say, and parsing what it sent would attribute
+                    // a stray response to an exchange that already finished
+                    // (finish_response leaves the client reader in `Head`). Leave
+                    // the bytes in the buffer for the driver to inspect through
+                    // `take_leftover`, but never let them grow without bound.
+                    if !matches!(self.client.phase, Phase::Waiting) {
+                        if self.server.buf.len() > MAX_HEAD_BYTES {
+                            bail!("unsolicited server bytes exceed {MAX_HEAD_BYTES} bytes");
+                        }
+                        break;
+                    }
                     let Some(head) = take_head(&mut self.server.buf)? else {
                         break;
                     };
