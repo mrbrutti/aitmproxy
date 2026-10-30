@@ -924,7 +924,7 @@ impl Command for PocRunCommand {
     }
 
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
-        run_poc_command(args, host, None)
+        run_poc_command(args, host, None, &PocStepRegistry::new())
     }
 
     fn summarize(&self, _args: &Params, result: &Value) -> Option<String> {
@@ -954,12 +954,28 @@ fn poc_run_summary(result: &Value) -> Option<String> {
 /// script step runs over MCP and the CLI exactly as a declarative one does.
 pub struct ScriptedPocRunCommand {
     executor: Arc<dyn ScriptStepExecutor>,
+    step_handlers: PocStepRegistry,
 }
 
 impl ScriptedPocRunCommand {
     /// Wrap `poc.run` around the executor that runs its `script` steps.
     pub fn new(executor: Arc<dyn ScriptStepExecutor>) -> Self {
-        Self { executor }
+        Self {
+            executor,
+            step_handlers: PocStepRegistry::new(),
+        }
+    }
+
+    /// Like [`Self::new`], and also route protocol (`<ns>:`) steps to the
+    /// handlers in `step_handlers`.
+    pub fn with_steps(
+        executor: Arc<dyn ScriptStepExecutor>,
+        step_handlers: PocStepRegistry,
+    ) -> Self {
+        Self {
+            executor,
+            step_handlers,
+        }
     }
 }
 
@@ -979,7 +995,7 @@ impl Command for ScriptedPocRunCommand {
     }
 
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
-        run_poc_command(args, host, Some(&self.executor))
+        run_poc_command(args, host, Some(&self.executor), &self.step_handlers)
     }
 
     fn summarize(&self, _args: &Params, result: &Value) -> Option<String> {
@@ -994,6 +1010,7 @@ fn run_poc_command(
     args: Params,
     host: &CommandHost,
     executor: Option<&Arc<dyn ScriptStepExecutor>>,
+    step_handlers: &PocStepRegistry,
 ) -> anyhow::Result<Value> {
     let poc_path = args.get_str("poc_path")?;
     let path = std::path::Path::new(poc_path);
@@ -1035,6 +1052,9 @@ fn run_poc_command(
     };
     if let Some(exec) = executor {
         runner = runner.with_script_executor(Arc::clone(exec));
+    }
+    if !step_handlers.is_empty() {
+        runner = runner.with_step_handlers(step_handlers.clone());
     }
     let result = futures::executor::block_on(runner.run(&poc, bindings, host))?;
 
@@ -1081,6 +1101,19 @@ pub fn register(registry: &mut Registry) {
 /// tier loaded; both register the same command name and schema.
 pub fn register_with_executor(registry: &mut Registry, executor: Arc<dyn ScriptStepExecutor>) {
     registry.add_command(Arc::new(ScriptedPocRunCommand::new(executor)));
+}
+
+/// Register `poc.run` with the scripting tier and a protocol-step registry wired
+/// in, so `<ns>:` steps dispatch to their registered `PocStepHandler`.
+pub fn register_with_executor_and_steps(
+    registry: &mut Registry,
+    executor: Arc<dyn ScriptStepExecutor>,
+    step_handlers: PocStepRegistry,
+) {
+    registry.add_command(Arc::new(ScriptedPocRunCommand::with_steps(
+        executor,
+        step_handlers,
+    )));
 }
 
 #[cfg(test)]
@@ -1141,6 +1174,106 @@ mod tests {
         assert!(build_request(&step("GET\r\nEvil: 1", "http://h/a"), &tmpl, &live).is_err());
         // A clean request still builds.
         assert!(build_request(&step("POST", "http://h/a?b=c"), &tmpl, &live).is_ok());
+    }
+
+    /// A tiny `fake:` protocol step handler: binds `fake_ran = true`.
+    struct FakeStep;
+
+    impl aitm_plugin::language::PocStepHandler for FakeStep {
+        fn ns(&self) -> &str {
+            "fake"
+        }
+        fn run(
+            &self,
+            _body: &serde_yaml::Value,
+            _inputs: &aitm_plugin::language::PocStepInputs,
+        ) -> Result<aitm_plugin::language::PocStepOutcome, aitm_plugin::language::HostError>
+        {
+            let mut bindings = BTreeMap::new();
+            bindings.insert("fake_ran".to_string(), Value::Bool(true));
+            Ok(aitm_plugin::language::PocStepOutcome {
+                sources: BTreeMap::new(),
+                bindings,
+            })
+        }
+    }
+
+    /// A script executor that is never reached by a protocol-only PoC.
+    struct NoopExecutor;
+
+    impl ScriptStepExecutor for NoopExecutor {
+        fn run_step(
+            &self,
+            _step: &ScriptStep,
+            _ctx: &mut ScriptStepCtx<'_>,
+        ) -> Result<ScriptVerdict, ScriptStepError> {
+            unreachable!("a protocol-only PoC runs no script step")
+        }
+    }
+
+    /// The `PocStepRegistry` handed to `register_with_executor_and_steps` reaches
+    /// the runner: a `fake:` step dispatches to the registered handler instead of
+    /// failing with "no handler registered". The empty-registry registration is the
+    /// control that proves the assertion can fail.
+    #[test]
+    fn protocol_step_dispatches_through_registered_command() {
+        use aitm_core::{HttpFlow, HttpRequest, MemFlowStore, StdGuard};
+        use futures::future::BoxFuture;
+
+        struct NoClient;
+        impl aitm_core::ProxyClient for NoClient {
+            fn send(&self, _req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+                Box::pin(async { anyhow::bail!("unused") })
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("aitm-poc-steps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("fake.yaml");
+        std::fs::write(
+            &path,
+            "id: fake-step\ninfo:\n  name: n\n  severity: low\nsteps:\n  - fake:\n      op: note\nsuccess:\n  - dsl: 'fake_ran == true'\n",
+        )
+        .expect("write poc");
+
+        let store = MemFlowStore::new();
+        let client = NoClient;
+        let guard = StdGuard::default();
+        let host = CommandHost::new(&store, &client, &guard, None);
+        let args = || {
+            Params::new(
+                [(
+                    "poc_path".to_string(),
+                    Value::Str(path.display().to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            )
+        };
+        let no_handler = "no handler registered for protocol step `fake:`";
+
+        // Control: the empty-registry registration cannot dispatch `fake:`.
+        let mut empty = Registry::new();
+        register_with_executor(&mut empty, Arc::new(NoopExecutor));
+        let err = empty
+            .command("poc.run")
+            .expect("poc.run registered")
+            .invoke(args(), &host)
+            .expect_err("no handler is registered");
+        assert!(err.to_string().contains(no_handler), "control: {err}");
+
+        // With the registry threaded through, the fake handler runs.
+        let mut handlers = PocStepRegistry::new();
+        handlers.register(Arc::new(FakeStep));
+        let mut reg = Registry::new();
+        register_with_executor_and_steps(&mut reg, Arc::new(NoopExecutor), handlers);
+        let cmd = reg.command("poc.run").expect("poc.run registered");
+        // The run may still fail later (no anchoring http step); only the
+        // absence of the no-handler error matters.
+        if let Err(e) = cmd.invoke(args(), &host) {
+            assert!(!e.to_string().contains(no_handler), "fake not run: {e}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
