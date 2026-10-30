@@ -169,6 +169,9 @@ impl<'a> ScriptRegHandle<'a> {
     /// The caller trust `load` evaluates under (the script's authoring trust),
     /// which [`run_load`](Self::run_load) seeds so a seam host fn `load` reaches
     /// (`option`, a guarded verb) is gated on the author — never left unseeded.
+    /// The loader seeds the least-privilege [`CallerTrust::Agent`] for an
+    /// unknown-provenance config-placed script; only an in-session `script.save`
+    /// carries the saving frontend's true trust.
     pub fn with_caller(mut self, caller: CallerTrust) -> Self {
         self.caller = caller;
         self

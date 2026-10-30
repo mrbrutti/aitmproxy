@@ -579,10 +579,11 @@ impl Command for Save {
                     .loader
                     .load_one(&entry)
                     .map_err(|err| anyhow::anyhow!("{err}"))?
-                    // `load_one` defaults to operator authorship (config-placed);
-                    // a runtime save carries the saving frontend's trust instead,
-                    // so an agent-saved script's hooks are gated `Agent` this
-                    // session (spec AC6, Open-Q 1).
+                    // `load_one` defaults to the least-privilege `Agent`
+                    // (config-placed = unknown provenance); this in-session save
+                    // carries the saving frontend's true trust instead, so an
+                    // operator-saved script's hooks are gated `Operator` and an
+                    // agent-saved script's `Agent` this session (spec AC6, Open-Q 1).
                     .with_authoring_trust(CallerTrust::from(host.frontend()));
                 script.handle().set_enabled(enable);
                 // Append atomically: `find_handle` above and this append are not

@@ -154,10 +154,12 @@ impl ScriptHandle {
         trust_from_code(self.authoring.load(Ordering::Relaxed))
     }
 
-    /// Record who authored (or last saved) the script: the loader sets
-    /// [`CallerTrust::Operator`] for a script placed on disk via config; a
-    /// `script.save` sets the saving frontend's trust. Read live, so a re-save
-    /// takes effect on the next hook.
+    /// Record who authored (or last saved) the script: the loader seeds the
+    /// least-privilege [`CallerTrust::Agent`] for a config-placed script (its
+    /// provenance is unknown — a config entry names a file path, not its
+    /// author), and only an in-session `script.save` records the saving
+    /// frontend's true trust. Read live, so a re-save takes effect on the next
+    /// hook.
     pub fn set_authoring_trust(&self, trust: CallerTrust) {
         self.authoring.store(trust_code(trust), Ordering::Relaxed);
     }
@@ -291,11 +293,12 @@ impl LoadedScript {
         Self { errors, ..self }
     }
 
-    /// Record the script's authoring trust on its handle (the loader sets
-    /// [`CallerTrust::Operator`] for a config-placed script; `script.save` sets
-    /// the saving frontend's trust). This is the trust a hook and `load(reg)`
-    /// seed, since both run detached from any frontend (spec Open-Q 1). Omitting
-    /// it leaves the fail-closed [`CallerTrust::Agent`] default.
+    /// Record the script's authoring trust on its handle (the loader seeds the
+    /// least-privilege [`CallerTrust::Agent`] for a config-placed script of
+    /// unknown provenance; only an in-session `script.save` records the saving
+    /// frontend's true trust). This is the trust a hook and `load(reg)` seed,
+    /// since both run detached from any frontend (spec Open-Q 1). Omitting it
+    /// leaves the fail-closed [`CallerTrust::Agent`] default.
     pub fn with_authoring_trust(self, trust: CallerTrust) -> Self {
         self.handle.set_authoring_trust(trust);
         self
