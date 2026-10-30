@@ -10,6 +10,7 @@ pub mod browser;
 pub mod complete;
 pub mod flows;
 pub mod inspector;
+pub mod l4;
 pub mod overlays;
 pub mod sidebar;
 pub mod text;
@@ -128,6 +129,7 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     match app.mode {
         Mode::Help => overlays::help(app, theme, area, buf),
         Mode::QuickLook => overlays::quick_look(app, theme, area, buf),
+        Mode::L4Confirm => l4::confirm(app, theme, area, buf),
         _ => {}
     }
 }

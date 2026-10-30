@@ -53,6 +53,9 @@ const L4_COMMANDS: &[&str] = &[
     "l4.intercept.revert",
     "l4.intercept.forward",
     "l4.intercept.drop",
+    // operator-only per-capability agent gate toggle (Stage B)
+    "l4.agent.status",
+    "l4.agent.set",
 ];
 
 /// The l4 commands never reissue HTTP; the core host still requires a client.

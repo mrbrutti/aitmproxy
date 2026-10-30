@@ -276,13 +276,15 @@ pub struct L4Guard {
     /// of "an entry contained within the dangerous range"; it can never globally
     /// disable the denylist (an explicit covering entry is still required).
     dangerous_dst_override: bool,
-    /// Whether a runtime (bus/MCP) caller may widen the deny-by-default scope via
-    /// [`add_runtime_scope`](L4Guard::add_runtime_scope). Comes from
-    /// `L4Config::allow_agent_widen` (default false). SEC-2 lives **here**, at the
-    /// security boundary — not in a command wrapper — so no in-process caller of the
-    /// shared guard can widen scope, or mint operator provenance, while the operator
-    /// has runtime widening off.
-    allow_agent_widen: bool,
+    /// The shared per-capability agent gates (inject / capture / intercept / widen),
+    /// seeded from `L4Config` (all default false). The guard owns the single instance
+    /// so it is the one source of truth: the guard reads the **widen** gate here (SEC-2
+    /// stays at the security boundary — not in a command wrapper — so no in-process
+    /// caller of the shared guard can widen scope while the operator has it off), while
+    /// the module shares this very `Arc` with the Mcp-only command wrapper and the
+    /// operator-only `l4.agent.set`/`status`, so an operator toggle governs every
+    /// enforcement point at once (a live, non-cosmetic switch).
+    agent_gates: Arc<crate::gates::L4AgentGates>,
     in_flight: Arc<AtomicU32>,
 }
 
@@ -301,9 +303,18 @@ impl L4Guard {
             max_packet_bytes: cfg.max_packet_bytes,
             max_packets_per_call: cfg.max_packets_per_call,
             dangerous_dst_override: cfg.dangerous_dst_override,
-            allow_agent_widen: cfg.allow_agent_widen,
+            agent_gates: crate::gates::L4AgentGates::from_config(cfg),
             in_flight: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    /// The shared per-capability agent gates (an `Arc` clone). The module hands this
+    /// same object to the Mcp-only command wrapper and the `l4.agent.*` commands, so
+    /// the widen gate the guard enforces here and the inject/capture/intercept gates
+    /// the wrapper enforces are one live source of truth.
+    #[must_use]
+    pub fn agent_gates(&self) -> Arc<crate::gates::L4AgentGates> {
+        self.agent_gates.clone()
     }
 
     /// The ONLY gate. Called before a capture/interception binds and before any
@@ -418,7 +429,7 @@ impl L4Guard {
     /// guard cannot bypass them (the bug the command-wrapper-only check left open).
     /// Returns the entry's id.
     pub fn add_runtime_scope(&self, mut entry: L4ScopeEntry) -> Result<L4ScopeId, L4GuardError> {
-        if !self.allow_agent_widen {
+        if !self.agent_gates.allowed(crate::gates::AgentGate::Widen) {
             return Err(L4GuardError::ScopeWideningDisabled);
         }
         entry.source = L4ScopeSource::Runtime;

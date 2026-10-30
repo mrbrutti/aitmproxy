@@ -1,14 +1,17 @@
-//! Task 8 — `ScriptPlugin` + hook dispatch: a compiled script is one `Plugin`
-//! in the ordered chain. Its hook edits apply back through the effect model
-//! (AC-M3-1), `halt()` short-circuits the chain like `Verdict::Halt` (AC-M3-2,
-//! RF#3), a hook that errors leaves the flow untouched and surfaces an
-//! `Event::Error` (AC-M3-12, RF#1), and a runaway hook is aborted by the
-//! budget without stalling the chain (AC-M3-6).
+//! `ScriptHost` + `LoadedScript` hook dispatch (F8 Option-B dispatch model):
+//! one `ScriptHost` plugin owns a `ScriptSet` of compiled `LoadedScript`s and
+//! dispatches each from a single chain position. A hook's edits apply back
+//! through the effect model (AC-M3-1), `halt()` short-circuits the set and the
+//! chain like `Verdict::Halt` (AC-M3-2, RF#3), a hook that errors leaves the
+//! flow untouched and surfaces an `Event::Error` (AC-M3-12, RF#1), a runaway
+//! hook is aborted by the budget without stalling the chain (AC-M3-6), and a
+//! script appended to the set at runtime goes live with no rebuild (original
+//! F8 AC4).
 //!
 //! Every test drives the real `aitm_core::Chain` over a `Registry` holding the
-//! script plugin followed by a probe plugin, so the short-circuit and the
-//! chain's plugin locking are exercised as the proxy exercises them. Hooks run
-//! under `block_in_place`, so every test runs on a multi-thread runtime.
+//! script host followed by a probe plugin, so the short-circuit and the chain's
+//! plugin locking are exercised as the proxy exercises them. Hooks run under
+//! `block_in_place`, so every test runs on a multi-thread runtime.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -27,12 +30,16 @@ use aitm_plugin_rhai::host_core::{
     FindingCapability, LogCapability, MemoryFindingSink, Options, ScriptCapability, ScriptServices,
 };
 use aitm_plugin_rhai::host_net::HttpCapability;
-use aitm_plugin_rhai::plugin::{ErrorSink, ScriptHandle, ScriptPlugin};
+use aitm_plugin_rhai::plugin::{ErrorSink, LoadedScript, ScriptHandle, ScriptHost, ScriptSet};
 use rhai::Engine;
 
 /// A loop that never ends and does real work each turn, so the optimizer
 /// cannot fold it away and every iteration costs operations.
 const RUNAWAY_HOOK: &str = "fn on_request(flow) { let n = 0; loop { n += 1; } }";
+
+/// A body cap larger than any test body, for the direct `LoadedScript::dispatch`
+/// tests (the host supplies the proxy's configured cap in production).
+const MAX_BODY: usize = 1 << 20;
 
 /// A client that is never reached: no test sends.
 struct StubClient;
@@ -204,9 +211,9 @@ impl Fixture {
         }
     }
 
-    fn plugin(&self, name: &str, src: &str) -> ScriptPlugin {
+    fn plugin(&self, name: &str, src: &str) -> LoadedScript {
         let ast = self.engine.compile(src).expect("the script compiles");
-        ScriptPlugin::new(
+        LoadedScript::new(
             meta(name),
             Arc::clone(&self.engine),
             ast,
@@ -217,29 +224,38 @@ impl Fixture {
     }
 }
 
-/// The script plugin followed by the probe, in a real chain over the fixture's
-/// store; the chain itself is the sink the script's `Event::Error`s go to, so
-/// the probe sees them the way a native plugin would.
+/// The script host (one script loaded) followed by the probe, in a real chain
+/// over the fixture's store; the chain itself is the sink the script's
+/// `Event::Error`s go to, so the probe sees them the way a native plugin would.
+/// The shared [`ScriptSet`] and error sink are kept so a test can append a new
+/// script at runtime, exactly as `script.save` does.
 struct Harness {
     fixture: Fixture,
     chain: Arc<Chain>,
     probe: Arc<ProbeLog>,
-    /// The script's shared handle, taken before the plugin is boxed away.
+    /// The first script's shared handle, taken before the host is boxed away.
     handle: Arc<ScriptHandle>,
+    /// The host's set, for appending a script live.
+    set: ScriptSet,
+    /// The shared error sink an appended script wires into.
+    errors: Arc<ErrorSink>,
 }
 
 impl Harness {
     fn new(src: &str, cfg: RhaiConfig) -> Self {
         let fixture = Fixture::new(cfg);
         let errors = Arc::new(ErrorSink::default());
-        let plugin = fixture
+        let script = fixture
             .plugin("under-test", src)
             .with_error_sink(Arc::clone(&errors));
-        let handle = plugin.handle();
+        let handle = script.handle();
         let probe = Arc::new(ProbeLog::default());
 
+        let set = ScriptSet::new(vec![script]);
+        let host = ScriptHost::new(set.clone());
+
         let mut registry = Registry::new();
-        registry.add_plugin(Box::new(plugin));
+        registry.add_plugin(Box::new(host));
         registry.add_plugin(Box::new(Probe(Arc::clone(&probe))));
         let chain = Arc::new(Chain::new(Arc::new(registry), fixture.store.clone()));
         // The chain exists only once the plugins are registered, so the
@@ -250,7 +266,21 @@ impl Harness {
             chain,
             probe,
             handle,
+            set,
+            errors,
         }
+    }
+
+    /// Append a brand-new script to the running host's set and return its
+    /// handle — the live-activation path `script.save` of a new name takes.
+    fn append(&self, name: &str, src: &str) -> Arc<ScriptHandle> {
+        let script = self
+            .fixture
+            .plugin(name, src)
+            .with_error_sink(Arc::clone(&self.errors));
+        let handle = script.handle();
+        self.set.append(script);
+        handle
     }
 
     fn default(src: &str) -> Self {
@@ -613,7 +643,7 @@ async fn undefined_hooks_pass_through_and_ws_hook_gets_the_frame() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reload_swaps_the_hooks() {
     let fixture = Fixture::new(config(RhaiLimits::default(), Duration::from_secs(5)));
-    let mut plugin = fixture.plugin(
+    let plugin = fixture.plugin(
         "tagger",
         r#"fn on_request(flow) { flow.request.headers.set("X-Version", "1"); }"#,
     );
@@ -623,7 +653,7 @@ async fn reload_swaps_the_hooks() {
 
     let mut flow = http_flow();
     let id = flow.id();
-    let verdict = plugin.on_event(&Event::Request(id), &mut FlowCtx::new(&mut flow));
+    let verdict = plugin.dispatch(&Event::Request(id), &mut FlowCtx::new(&mut flow), MAX_BODY);
     assert_eq!(verdict, Verdict::Continue);
     assert_eq!(http(&flow).request.headers.get("X-Version"), Some("1"));
 
@@ -635,7 +665,7 @@ async fn reload_swaps_the_hooks() {
 
     let mut flow = http_flow();
     let id = flow.id();
-    let verdict = plugin.on_event(&Event::Request(id), &mut FlowCtx::new(&mut flow));
+    let verdict = plugin.dispatch(&Event::Request(id), &mut FlowCtx::new(&mut flow), MAX_BODY);
     assert_eq!(verdict, Verdict::Halt, "the new hook's halt() is honoured");
     assert_eq!(http(&flow).request.headers.get("X-Version"), Some("2"));
 }
@@ -699,7 +729,7 @@ async fn handle_meta_returns_the_parsed_api_and_hooks() {
         path: "declared.rhai".into(),
         hooks: vec!["on_request".to_string(), "on_response".to_string()],
     };
-    let plugin = ScriptPlugin::new(
+    let plugin = LoadedScript::new(
         declared.clone(),
         Arc::clone(&fixture.engine),
         ast,
@@ -714,5 +744,129 @@ async fn handle_meta_returns_the_parsed_api_and_hooks() {
     assert_eq!(
         handle.meta().hooks,
         vec!["on_request".to_string(), "on_response".to_string()]
+    );
+}
+
+/// F8 Option B / original AC4: a brand-new script appended to the running
+/// host's set — exactly what `script.save` of a new name does — has its
+/// `on_request` run on the NEXT event, with no chain rebuild and no restart.
+/// The script already loaded keeps running, and the new one joins at the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn appended_script_goes_live_without_rebuild() {
+    // One script loaded at build time: it tags X-First.
+    let h =
+        Harness::default(r#"fn on_request(flow) { flow.request.headers.set("X-First", "1"); }"#);
+    assert_eq!(h.set.len(), 1);
+
+    let id = h.insert(http_flow());
+    assert_eq!(h.dispatch(Event::Request(id)).await, Verdict::Continue);
+    let flow = h.flow(id);
+    assert_eq!(http(&flow).request.headers.get("X-First"), Some("1"));
+    assert_eq!(
+        http(&flow).request.headers.get("X-Second"),
+        None,
+        "the second script is not loaded yet"
+    );
+
+    // Append a brand-new script to the SAME host — no rebuild, no restart.
+    let appended = h.append(
+        "appended",
+        r#"fn on_request(flow) { flow.request.headers.set("X-Second", "2"); }"#,
+    );
+    assert_eq!(h.set.len(), 2, "the host now holds both scripts");
+    assert!(appended.is_enabled(), "an appended script starts enabled");
+
+    // The very next event runs BOTH, the original first then the appended.
+    let id2 = h.insert(http_flow());
+    assert_eq!(h.dispatch(Event::Request(id2)).await, Verdict::Continue);
+    let flow2 = h.flow(id2);
+    assert_eq!(
+        http(&flow2).request.headers.get("X-First"),
+        Some("1"),
+        "the originally-loaded script still runs"
+    );
+    assert_eq!(
+        http(&flow2).request.headers.get("X-Second"),
+        Some("2"),
+        "the appended script's hook is live with no rebuild"
+    );
+    assert_eq!(
+        h.probe.events(),
+        vec![Event::Request(id), Event::Request(id2)],
+        "the chain reached the trailing native plugin both times"
+    );
+}
+
+/// An appended script joins at the END of the chain: when the script already
+/// loaded `halt()`s, the appended one — and the native plugin after the host —
+/// never run. This pins the order half of the append semantics (spec §8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn appended_script_runs_after_the_loaded_ones() {
+    let h = Harness::default(
+        r#"fn on_request(flow) { flow.set_response(403, #{}, "blocked"); halt(); }"#,
+    );
+
+    let tripwire = h.append(
+        "tripwire",
+        r#"fn on_request(flow) { flow.request.headers.set("X-Tripwire", "ran"); }"#,
+    );
+    assert!(tripwire.is_enabled());
+
+    let id = h.insert(http_flow());
+    assert_eq!(
+        h.dispatch(Event::Request(id)).await,
+        Verdict::Halt,
+        "the first script's halt short-circuits the set"
+    );
+    let flow = h.flow(id);
+    assert_eq!(
+        http(&flow).request.headers.get("X-Tripwire"),
+        None,
+        "the appended script, being after the halting one, must not run"
+    );
+    assert!(
+        h.probe.events().is_empty(),
+        "the native plugin after the host must not run either: {:?}",
+        h.probe.events()
+    );
+}
+
+/// `append_if_absent` refuses a second script of the same brand-new name — the
+/// race fix for two concurrent `script.save`s of one new name. The set holds
+/// exactly one script by that name, and its hook runs once per event, not twice
+/// (which would mean double traffic mutation).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn append_if_absent_refuses_a_duplicate_name() {
+    let h = Harness::default(r#"fn on_request(flow) { flow.mark("base"); }"#);
+    assert_eq!(h.set.len(), 1);
+
+    let first = h
+        .fixture
+        .plugin("dup", r#"fn on_request(flow) { flow.mark("dup"); }"#)
+        .with_error_sink(Arc::clone(&h.errors));
+    assert!(
+        h.set.append_if_absent(first),
+        "a brand-new name is appended"
+    );
+    assert_eq!(h.set.len(), 2);
+
+    let second = h
+        .fixture
+        .plugin("dup", r#"fn on_request(flow) { flow.mark("dup"); }"#)
+        .with_error_sink(Arc::clone(&h.errors));
+    assert!(
+        !h.set.append_if_absent(second),
+        "a second script of the same name is refused"
+    );
+    assert_eq!(h.set.len(), 2, "no duplicate was added");
+
+    let id = h.insert(http_flow());
+    assert_eq!(h.dispatch(Event::Request(id)).await, Verdict::Continue);
+    let flow = h.flow(id);
+    let marks = &http(&flow).metadata.marks;
+    assert_eq!(
+        marks.iter().filter(|m| m.as_str() == "dup").count(),
+        1,
+        "the deduped hook ran exactly once: {marks:?}"
     );
 }

@@ -26,6 +26,8 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: a body viewer must show JSON keys in wire order.
 serde_json = { version = "1", features = ["preserve_order"] }
+# The L4 craft editor authors a PacketSpec as human-friendly YAML (ui-ext §3.2).
+serde_yaml = "0.9"
 similar = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs"] }
 unicode-width = "0.2"

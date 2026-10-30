@@ -9,7 +9,9 @@
 
 use std::sync::Arc;
 
-use aitm_core::{Command, CommandHost, ParamDef, ParamSchema, Params, TypeDesc, Value};
+use aitm_core::{
+    Command, CommandHost, ParamDef, ParamSchema, Params, Sensitivity, TypeDesc, Value,
+};
 
 use crate::guard::L4Guard;
 use crate::types::{L4ScopeEntry, L4ScopeId, L4ScopeSource, RateCap};
@@ -20,8 +22,10 @@ pub struct ScopeAdd {
 }
 
 impl ScopeAdd {
-    /// A command over the shared guard. The SEC-2 widen gate (and the forced
-    /// `source = Runtime`) now live in [`L4Guard::add_runtime_scope`], so the command
+    /// A command over the shared guard. The SEC-2 widen gate (reading the shared
+    /// [`L4AgentGates`](crate::gates::L4AgentGates) **widen** gate, so
+    /// `l4.agent.set {capability:"widen"}` governs it live) and the forced
+    /// `source = Runtime` both live in [`L4Guard::add_runtime_scope`], so the command
     /// is a thin wrapper and carries no gate of its own.
     pub fn new(guard: Arc<L4Guard>) -> Self {
         Self { guard }
@@ -31,6 +35,12 @@ impl ScopeAdd {
 impl Command for ScopeAdd {
     fn name(&self) -> &str {
         "l4.scope.add"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        // Widens L4 authority (the one escape hatch out of deny-by-default) — gated
+        // like `scope.add` / `ca.install`.
+        Sensitivity::Sensitive
     }
 
     fn schema(&self) -> ParamSchema {
@@ -91,8 +101,11 @@ impl Command for ScopeAdd {
 
     fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
         // Deny-by-default widening is enforced in the guard: `add_runtime_scope`
-        // refuses with the typed [`L4GuardError::ScopeWideningDisabled`] (adding
-        // nothing) when `allow_agent_widen` is off, and forces `source = Runtime`.
+        // refuses with the typed `L4GuardError::ScopeWideningDisabled` (adding nothing)
+        // when the shared **widen** gate is off, and forces `source = Runtime`. Keeping
+        // the gate in the guard (not this command) is SEC-2: no second in-process
+        // caller of the shared guard can bypass it, and an operator `l4.agent.set`
+        // flips the very gate the guard reads.
         let entry = entry_from_params(&args)?;
         let id = self
             .guard
@@ -117,6 +130,11 @@ impl ScopeRemove {
 impl Command for ScopeRemove {
     fn name(&self) -> &str {
         "l4.scope.remove"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        // Narrows authority: mutating, but safe-ward (never touches the wire).
+        Sensitivity::Write
     }
 
     fn schema(&self) -> ParamSchema {
@@ -154,6 +172,10 @@ impl ScopeList {
 impl Command for ScopeList {
     fn name(&self) -> &str {
         "l4.scope.list"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
     }
 
     fn schema(&self) -> ParamSchema {

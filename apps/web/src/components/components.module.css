@@ -89,6 +89,11 @@
   font-family: var(--font-ui);
   font-weight: var(--font-weight-medium);
 }
+/* L4 kind badge: the slate/indigo hue (base.css), distinct from every HTTP/WS/agent hue. */
+.badge[data-hue='l4'] {
+  color: var(--color-l4-deep);
+  background: var(--color-l4-tint);
+}
 
 /* ---------- StatusDot ---------- */
 .dot {

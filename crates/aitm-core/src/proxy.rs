@@ -13,7 +13,7 @@ use crate::chain::Chain;
 use crate::config::Config;
 use crate::guard::{ScopeRateGuard, StdGuard};
 use crate::plugin::Plugin;
-use crate::protocol::{ModuleCtx, NextLayerHint, ProtocolModule, UpstreamConnector};
+use crate::protocol::{EventSink, ModuleCtx, NextLayerHint, ProtocolModule, UpstreamConnector};
 use crate::registry::Registry;
 use crate::store::{FlowStore, MemFlowStore};
 use crate::stream::ByteStream;
@@ -60,6 +60,35 @@ impl Proxy {
     /// The scope/rate guard (for assembling a `CommandHost`).
     pub fn guard(&self) -> Arc<dyn ScopeRateGuard> {
         self.inner.guard.clone()
+    }
+
+    /// The registered protocol modules, shared. The capture ingress dispatches a
+    /// captured stream through the **same** ordered module list the acceptor uses,
+    /// so a captured HTTP/TLS/WS flow is claimed exactly as a proxied one is.
+    pub fn modules(&self) -> Arc<[Arc<dyn ProtocolModule>]> {
+        self.inner.modules.clone()
+    }
+
+    /// The event sink (the ordered plugin chain), shared. A dispatched capture
+    /// flow emits through the **same** chain the acceptor drives — no parallel
+    /// plugin path.
+    pub fn event_sink(&self) -> Arc<dyn EventSink> {
+        self.inner.chain.clone()
+    }
+
+    /// A guarded upstream connector, built exactly as [`handle_conn`] builds it:
+    /// the SSRF/scope-checked [`SsrfConnector`] when `ssrf`, else the
+    /// [`PassiveConnector`]. This only shares the existing construction — it adds
+    /// no new, unguarded dial path (a private/loopback target still needs scope).
+    pub fn upstream_connector(&self, ssrf: bool) -> Arc<dyn UpstreamConnector> {
+        if ssrf {
+            Arc::new(SsrfConnector {
+                policy: self.inner.browser_ssrf.clone(),
+                guard: self.inner.guard.clone(),
+            })
+        } else {
+            Arc::new(PassiveConnector)
+        }
     }
 
     /// Bind and run the main client-facing accept loop. Passive capture here is
@@ -370,8 +399,64 @@ impl ProxyBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_benign_disconnect, parse_client_hello_sni};
+    use super::{is_benign_disconnect, parse_client_hello_sni, Proxy};
+    use crate::config::Config;
+    use crate::protocol::{ModuleCtx, NextLayerHint, ProtocolModule};
+    use crate::stream::ByteStream;
+    use futures::future::BoxFuture;
     use std::io;
+    use std::sync::Arc;
+
+    /// A no-op protocol module that claims nothing — enough to assert the proxy
+    /// exposes its registered module list, event sink, and a guarded connector.
+    struct StubModule;
+
+    impl ProtocolModule for StubModule {
+        fn id(&self) -> &str {
+            "stub"
+        }
+        fn matches(&self, _hint: &NextLayerHint) -> bool {
+            false
+        }
+        fn spawn(&self, _io: ByteStream, _ctx: ModuleCtx) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[test]
+    fn proxy_exposes_stream_dispatch_wiring() {
+        let proxy = Proxy::builder()
+            .with_config(Config::default())
+            .register_module(Arc::new(StubModule))
+            .build()
+            .expect("build proxy");
+        assert_eq!(
+            proxy.modules().len(),
+            1,
+            "the one registered module is exposed to the ingress"
+        );
+        // The sink and a guarded connector construct without panicking.
+        let _sink = proxy.event_sink();
+        let _conn = proxy.upstream_connector(true);
+    }
+
+    #[tokio::test]
+    async fn upstream_connector_true_is_ssrf_guarded() {
+        // Empty scope + default SSRF policy (block_private = true): a private,
+        // out-of-scope target is refused before any dial — no network reached.
+        let proxy = Proxy::builder()
+            .with_config(Config::default())
+            .build()
+            .expect("build proxy");
+        let result = proxy
+            .upstream_connector(true)
+            .connect("10.1.2.3", "10.1.2.3:80".parse().unwrap())
+            .await;
+        assert!(
+            result.is_err(),
+            "a private, out-of-scope target must be refused by the SSRF-guarded connector"
+        );
+    }
 
     /// A `std::io::Error` of the given kind, wrapped in an `anyhow` context the
     /// same way the handler does — the classifier must see through the context.

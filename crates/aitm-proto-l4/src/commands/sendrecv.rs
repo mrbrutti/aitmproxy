@@ -20,12 +20,16 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aitm_core::{Command, CommandHost, ParamDef, ParamSchema, Params, TypeDesc, Value};
+use aitm_core::{
+    Command, CommandHost, ParamDef, ParamSchema, Params, Sensitivity, TypeDesc, Value,
+};
 
 use crate::backend::CaptureInjectBackend;
+use crate::craft::PacketSpec;
 use crate::flow::L4FlowStore;
 use crate::guard::L4Guard;
 use crate::sendrecv::{send_recv, ReplyMatch, SendRecvOutcome, SendRecvSpec};
+use crate::types::{L4Action, L4Capability, L4Direction, L4Target};
 
 /// Default await before reporting silence when `timeout_ms` is omitted.
 const DEFAULT_TIMEOUT_MS: i64 = 1000;
@@ -56,6 +60,55 @@ impl SendRecv {
 impl Command for SendRecv {
     fn name(&self) -> &str {
         "l4.send_recv"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        // Writes a stimulus packet to the wire (and captures the reply).
+        Sensitivity::Sensitive
+    }
+
+    /// The operator confirm-over-the-wire prompt (spec §2.4) for the stimulus that
+    /// will hit the wire. `None` (no token minted) when the guard would refuse the
+    /// `Inject` of the stimulus — `invoke` then surfaces the typed refusal. Only the
+    /// operator role is offered this handshake.
+    fn confirm_prompt(&self, args: &Params) -> Option<String> {
+        let spec = super::parse_packet_spec(super::require(args, "spec").ok()?).ok()?;
+        let dst: IpAddr = args.get_str("dst").ok()?.parse().ok()?;
+        let interface = args.get_str("interface").ok()?.to_string();
+        let dst_port = match args.get("port") {
+            Some(_) => Some(u16::try_from(args.get_int("port").ok()?).ok()?),
+            None => None,
+        };
+        let bytes = spec.build().ok()?;
+        let target = L4Target {
+            interface: interface.clone(),
+            direction: L4Direction::Outbound,
+            dst: Some(dst),
+            dst_port,
+            proto: spec.transport_proto(),
+        };
+        let permit = self.guard.check(L4Action::Inject, &target).ok()?;
+        let summary = PacketSpec::summarize(&bytes);
+        let entry = super::covering_scope_entry(
+            &self.guard,
+            &interface,
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            Some(dst),
+            dst_port,
+        );
+        Some(super::wire_confirm_summary(
+            "l4.send_recv",
+            dst,
+            dst_port,
+            &interface,
+            L4Direction::Outbound,
+            &summary.layers,
+            summary.length,
+            1,
+            permit.remaining(),
+            entry.as_ref(),
+        ))
     }
 
     fn schema(&self) -> ParamSchema {
