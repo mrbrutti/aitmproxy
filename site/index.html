@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>aitmproxy — Intercept anything, by hand or by agent</title>
-<meta name="description" content="aitmproxy is a fast, memory-safe proxy for inspecting and editing HTTP and WebSocket traffic during development and authorized testing. One control surface that a person or an AI assistant can drive completely.">
+<meta name="description" content="aitmproxy is a fast, memory-safe proxy for inspecting and editing HTTP, WebSocket, HTTP/2 and raw L4 traffic during development and authorized testing. One control surface that a person or an AI assistant can drive completely.">
 <link rel="stylesheet" href="styles.css">
 <script>(function(d){var c=" js";try{if(!matchMedia("(prefers-reduced-motion: reduce)").matches&&!sessionStorage.getItem("aitm.intro")){c+=" intro-on";sessionStorage.setItem("aitm.intro","1");}}catch(e){}d.className+=c;})(document.documentElement);</script>
 </head>
@@ -40,14 +40,15 @@
 <section class="hero">
   <div class="wrap">
     <h1 class="display"><span class="line"><span>Intercept anything&nbsp;—</span></span><span class="line"><span>by&nbsp;hand or by&nbsp;agent.</span></span></h1>
-    <p class="lead">aitmproxy captures, intercepts, edits, replays and reproduces HTTP and WebSocket traffic. One core, driven completely by an operator or by an AI assistant: the same commands over the CLI, the GUI and MCP.</p>
+    <p class="lead">aitmproxy captures, intercepts, edits, replays and reproduces traffic across four layers of the wire — HTTP, WebSocket, HTTP/2 and raw L4 packets. One core, driven completely by an operator or by an AI assistant: the same commands over the CLI, the GUI and MCP.</p>
 
-    <div class="weave" role="img" aria-label="A request is pulled off the wire into aitmproxy, where it is rebuilt, edited and sent back on in a changed form, while other traffic flows past untouched.">
+    <div class="weave" role="img" aria-label="aitmproxy sits on the wire as an interceptor. One message at a time — an HTTP request, a WebSocket frame, an HTTP/2 frame, a raw L4 packet — is pulled off the wire, rebuilt in the flow viewer, held and edited, then sent back on in a changed form, while other traffic flows past untouched.">
       <span class="node node--client" aria-hidden="true"><span class="node-label">client</span></span>
       <span class="node node--server" aria-hidden="true"><span class="node-label">server</span></span>
-      <div class="weave-panel" aria-hidden="true" data-state="armed" data-ui>
+      <div class="weave-panel" aria-hidden="true" data-state="armed" data-proto="http" data-ui>
         <div class="wp-head flow-row" style="--i:0">
           <span class="id">#41</span>
+          <span class="wp-proto">HTTP/1.1</span>
           <span class="m m-post">POST</span>
           <span class="path">/api/cart/items</span>
           <span class="state">armed</span>
@@ -67,6 +68,12 @@
           <span class="wp-act wp-act--kill">Kill</span>
         </div>
       </div>
+      <ul class="proto-legend" aria-hidden="true">
+        <li data-proto="http" class="is-active">HTTP</li>
+        <li data-proto="ws">WebSocket</li>
+        <li data-proto="h2">HTTP/2</li>
+        <li data-proto="l4">raw L4</li>
+      </ul>
     </div>
 
     <div class="operators">
@@ -84,7 +91,7 @@
     <div class="hero-cta">
       <a class="btn" href="#install">Install</a>
       <a class="arrow" href="docs.html">Read the docs</a>
-      <div class="cmd"><code><span class="pr">$ </span>brew install aitmproxy</code><button class="copy" type="button" data-copy aria-label="Copy install command"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
+      <div class="cmd"><code><span class="pr">$ </span>brew install mrbrutti/aitmproxy/aitm</code><button class="copy" type="button" data-copy aria-label="Copy install command"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
     </div>
     <p class="hero-foot">Written in memory-safe Rust. Runs on macOS and Linux. Open source under MIT or Apache-2.0.</p>
   </div>
@@ -276,6 +283,28 @@ content-type: application/json
       </article>
 
       <article class="feature" data-reveal>
+        <h3 class="h3">HTTP/2, per stream</h3>
+        <p>Negotiated over ALPN and decrypted with the local CA. Each multiplexed stream is an ordinary flow you can hold and edit.</p>
+        <div class="ui"><div class="ui-lines">
+          <div><span class="k">stream</span><span>5 · <span class="chip chip--armed">armed</span></span></div>
+          <div><span class="k">:method</span><span>POST · :path /graphql</span></div>
+          <div><span class="k">frame</span><span>DATA · editable</span></div>
+        </div></div>
+        <a class="arrow" href="features.html#http2">HTTP/2</a>
+      </article>
+
+      <article class="feature" data-reveal>
+        <h3 class="h3">Raw L4 packets</h3>
+        <p>Sit on a raw TCP stream, capture the bytes both ways, and hold a segment to read, edit and release — any protocol, not just HTTP.</p>
+        <div class="ui"><div class="ui-lines">
+          <div><span class="k">listen</span><span>tcp :5432 → db.internal:5432</span></div>
+          <div><span class="k">held</span><span>#58 · 24 bytes · PSH, ACK</span></div>
+          <div><span class="k">edit</span><span>database <span class="edit">market_prod</span></span></div>
+        </div></div>
+        <a class="arrow" href="features.html#l4">Raw L4</a>
+      </article>
+
+      <article class="feature" data-reveal>
         <h3 class="h3">Sessions and HAR</h3>
         <p>Save a capture as a session, reopen it later, and move traffic in or out as HAR.</p>
         <div class="ui"><div class="ui-lines">
@@ -371,7 +400,7 @@ content-type: application/json
       <div data-reveal>
         <div class="lang-intro">
           <h3 class="h3">Rhai for plugins</h3>
-          <p>A plugin sees each flow as it passes, can edit it, answer it, or record a finding. It runs in a sandbox and gets only the capabilities it declares. <a class="arrow" href="scripting.html">Scripting reference</a></p>
+          <p>A plugin sees each flow as it passes, can edit it, answer it, or record a finding. It runs in a sandbox and gets only the capabilities it declares. One flow API spans HTTP, WebSocket, HTTP/2 and L4, so a new protocol needs no new language. <a class="arrow" href="scripting.html">Scripting reference</a></p>
         </div>
         <figure class="code">
           <figcaption><span>addons/guard-admin-writes.rhai</span><button class="copy" type="button" data-copy aria-label="Copy Rhai example"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
@@ -422,6 +451,37 @@ content-type: application/json
   </div>
 </section>
 
+<!-- ============ SCANNER ============ -->
+<section class="section" id="scanner">
+  <div class="wrap">
+    <h2 class="h2" data-reveal>Map the attack surface, by command.</h2>
+    <p class="lead deck" data-reveal data-d="1">The scanner is a plugin, not a mode. <code>scan.discover</code> drives the embedded browser to crawl an authorized, in-scope target, then reads the captured flows back for injection points — query and body parameters, headers, path segments. Like everything else it is one command, so an operator runs it and an assistant can be tasked with the very same call.</p>
+
+    <div class="split">
+      <div class="split-col" data-reveal>
+        <h3>Run it, by hand or by agent</h3>
+        <div class="pair">
+          <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm scan discover --target <span class="s">'https://staging.example.com'</span></code></div>
+          <div class="pair-row is-agent"><span class="pair-who">agent</span><code>scan.discover({ target: <span class="s">"https://staging.example.com"</span> })</code></div>
+        </div>
+        <p class="deck muted">Deny-by-default: a target outside the session scope is refused before the crawler opens a single page. Discovery today; injection and PoC generation build on the same seam.</p>
+      </div>
+      <div class="split-col" data-reveal data-d="1">
+        <h3>What it hands back</h3>
+        <div class="ui">
+          <div class="ui-bar"><span class="dot" aria-hidden="true"></span><span>scan.discover</span><span class="spacer"></span><span>staging.example.com</span></div>
+          <div class="ui-lines">
+            <div><span class="k">endpoints</span><span>37 across 9 hosts</span></div>
+            <div><span class="k">injection</span><span>84 points · query, body, header</span></div>
+            <div><span class="k">crawled</span><span>42 pages · same-origin, in-scope</span></div>
+            <div><span class="k">stopped</span><span>page cap reached</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
 <!-- ============ STATS ============ -->
 <section class="section" id="numbers">
   <div class="wrap">
@@ -431,7 +491,7 @@ content-type: application/json
       <div class="stat" data-reveal data-d="1"><b>~10,000</b><span>requests per second, sustained, with flat memory</span></div>
       <div class="stat" data-reveal data-d="2"><b>100<small>%</small></b><span>of the tool is scriptable and controllable, by hand or by agent</span></div>
       <div class="stat" data-reveal><b>3</b><span>user interfaces: macOS, web and terminal, on one core</span></div>
-      <div class="stat" data-reveal data-d="1"><b>2</b><span>protocols, HTTP and WebSocket, with TLS passthrough for pinned hosts</span></div>
+      <div class="stat" data-reveal data-d="1"><b>4</b><span>layers on the wire — HTTP, WebSocket, HTTP/2 and raw L4 packets, each editable</span></div>
       <div class="stat" data-reveal data-d="2"><b>2</b><span>licences to choose from, MIT or Apache-2.0; macOS and Linux</span></div>
     </div>
   </div>
@@ -443,16 +503,16 @@ content-type: application/json
     <div class="install">
       <div data-reveal>
         <h2 class="h2">Install in one line. Capture in three.</h2>
-        <p class="lead deck">Homebrew on macOS and Linux. Trust the local certificate once, start the proxy, and point your app or browser at it.</p>
-        <p class="deck"><a class="arrow" href="docs.html">Getting started, step by step</a></p>
+        <p class="lead deck">Homebrew or Cargo on macOS and Linux, or a native Linux package. Trust the local certificate once, start the proxy, and point your app or browser at it.</p>
+        <p class="deck"><a class="arrow" href="download.html">All the ways to install v0.1.0</a></p>
       </div>
       <div data-reveal data-d="1">
         <div class="steps">
-          <div class="cmd"><code><span class="pr">$ </span>brew install aitmproxy</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
+          <div class="cmd"><code><span class="pr">$ </span>brew install mrbrutti/aitmproxy/aitm</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
           <div class="cmd"><code><span class="pr">$ </span>aitm ca install</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
           <div class="cmd"><code><span class="pr">$ </span>aitm start</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
         </div>
-        <p class="deck muted">The proxy listens on <code>127.0.0.1:8080</code>; the web UI opens on <code>:8082</code>. Prefer the macOS app? It ships the same core and installs the same way.</p>
+        <p class="deck muted">The proxy listens on <code>127.0.0.1:8080</code>; the web UI opens on <code>:8082</code>. The v0.1.0 tap is private for now — the <a href="download.html">download page</a> covers the token, Cargo and native packages.</p>
       </div>
     </div>
   </div>
@@ -464,7 +524,7 @@ content-type: application/json
   <div class="wrap">
     <div>
       <a class="wordmark" href="index.html">aitmproxy<i aria-hidden="true"></i></a>
-      <p class="fine">A fast, memory-safe intercepting proxy for inspecting and editing HTTP and WebSocket traffic during development and authorized testing. Use it on systems you own or are permitted to test.</p>
+      <p class="fine">A fast, memory-safe intercepting proxy for inspecting and editing HTTP, WebSocket, HTTP/2 and raw L4 traffic during development and authorized testing. Use it on systems you own or are permitted to test.</p>
     </div>
     <div>
       <h4>Product</h4>

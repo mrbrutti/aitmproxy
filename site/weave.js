@@ -18,11 +18,71 @@
   var host = document.querySelector(".hero .weave"); if (!host) return;
   var panel = host.querySelector(".weave-panel");
   var badge = panel && panel.querySelector(".state");
+  var legend = Array.prototype.slice.call(host.querySelectorAll(".proto-legend li"));
   var html = document.documentElement;
   var mm = function (q) { return window.matchMedia ? window.matchMedia(q) : null; };
   var mqReduce = mm("(prefers-reduced-motion: reduce)"), mqDark = mm("(prefers-color-scheme: dark)");
 
+  /* the four message types on the wire. Each cycle of the loop builds, holds and
+     releases one of them, so a viewer sees the breadth: an HTTP request, a WebSocket
+     frame, an HTTP/2 frame, a raw L4 packet — each with its own badge and its own
+     representative on-the-wire shape. The incoming packet and the panel chip take the
+     protocol's hue; "held" is always amber and "200" is always green, whatever the type. */
+  var PROTOCOLS = [
+    { key: "http", proto: "HTTP/1.1", id: "#41", m: "POST", mc: "m-post", path: "/api/cart/items", edit: "99", rows: [
+      '<span class="h">host:</span> shop.example.com',
+      '<span class="h">content-type:</span> application/json',
+      '<span class="h">authorization:</span> Bearer eyJhbGciOiJIUzI1NiJ9…',
+      '&nbsp;',
+      '{ "sku": "A-1042", "qty": <span class="edit">999</span> }'
+    ] },
+    { key: "ws", proto: "WebSocket", id: "#43", m: "WS", mc: "m-ws", path: "wss://api.example.com/live", rows: [
+      '<span class="dir">↓</span> <span class="h">text</span> {"op":"welcome","id":"c-7f2"}',
+      '<span class="dir">↑</span> <span class="h">text</span> {"op":"subscribe","ch":"orders"}',
+      '<span class="dir">↑</span> <span class="h">inject</span> {"op":"subscribe","ch":<span class="edit">"admin"</span>}',
+      '<span class="dir">↓</span> <span class="h">text</span> {"op":"ack","ch":"admin"}'
+    ] },
+    { key: "h2", proto: "HTTP/2", id: "#52", m: "POST", mc: "m-post", path: "/graphql · stream 5", rows: [
+      '<span class="h">HEADERS</span> stream=5 flags=END_HEADERS',
+      '<span class="h">:method</span> POST&nbsp;&nbsp;<span class="h">:scheme</span> https',
+      '<span class="h">:path</span> /graphql',
+      '<span class="h">DATA</span> stream=5',
+      '{ "query": "mutation { setRole(<span class="edit">admin</span>) }" }'
+    ] },
+    { key: "l4", proto: "L4 · TCP", id: "#58", m: "TCP", mc: "m-tcp", path: "10.0.0.4:51514 → :5432", rows: [
+      '<span class="h">seq</span> 1&nbsp;&nbsp;24 bytes&nbsp;&nbsp;PSH, ACK',
+      '<span class="h">0000</span>&nbsp;&nbsp;00 00 00 17 00 03 00 00',
+      '<span class="h">0008</span>&nbsp;&nbsp;user·postgres·database',
+      '<span class="h">0016</span>&nbsp;&nbsp;<span class="edit">market_prod</span>·00'
+    ] }
+  ];
+  var protoIdx = 0, curCol = null;
+
   function setState(s, word) { if (!panel) return; panel.setAttribute("data-state", s); if (badge && word != null && badge.textContent !== word) badge.textContent = word; }
+  function applyProto(p) {
+    if (!panel) return;
+    panel.setAttribute("data-proto", p.key);
+    var body = p.rows.map(function (r, i) { return '<div class="flow-row" style="--i:' + (i + 1) + '">' + r + "</div>"; }).join("");
+    panel.innerHTML =
+      '<div class="wp-head flow-row" style="--i:0">' +
+        '<span class="id">' + p.id + '</span>' +
+        '<span class="wp-proto">' + p.proto + '</span>' +
+        '<span class="m ' + p.mc + '">' + p.m + '</span>' +
+        '<span class="path">' + p.path + '</span>' +
+        '<span class="state">armed</span>' +
+      '</div>' +
+      '<div class="wp-body">' + body + '</div>' +
+      '<div class="wp-bar flow-row" style="--i:' + (p.rows.length + 1) + '">' +
+        '<span class="dot" aria-hidden="true"></span>' +
+        '<span class="wp-bar-label">held · <code>127.0.0.1:8080</code></span>' +
+        '<span class="spacer"></span>' +
+        '<span class="wp-act wp-act--go">Resume</span>' +
+        '<span class="wp-act wp-act--kill">Kill</span>' +
+      '</div>';
+    badge = panel.querySelector(".state");
+    curCol = (C.proto && C.proto[p.key]) || C.accent;
+    for (var i = 0; i < legend.length; i++) legend[i].classList.toggle("is-active", legend[i].getAttribute("data-proto") === p.key);
+  }
   function rest() { host.setAttribute("data-phase", "held"); setState("armed", "armed"); }
   if (mqReduce && mqReduce.matches) { rest(); return; }
 
@@ -48,7 +108,12 @@
     C.ink = v("--ink", [17, 24, 39]); C.accent = v("--accent", [37, 99, 235]);
     C.signal = v("--signal", [217, 119, 6]); C.ok = v("--st-ok", [21, 128, 61]);
     C.agent = v("--agent", [13, 148, 136]); C.paper = v("--paper", [255, 255, 255]);
+    C.proto = {
+      http: v("--proto-http", [37, 99, 235]), ws: v("--proto-ws", [124, 58, 237]),
+      h2: v("--proto-h2", [13, 148, 136]), l4: v("--proto-l4", [8, 145, 178])
+    };
     C.dark = (0.2126 * C.paper[0] + 0.7152 * C.paper[1] + 0.0722 * C.paper[2]) / 255 < 0.5;
+    if (PROTOCOLS[protoIdx]) curCol = C.proto[PROTOCOLS[protoIdx].key] || C.accent;
     tints = {};
   }
   function rgba(c, a) { return "rgba(" + (c[0] | 0) + "," + (c[1] | 0) + "," + (c[2] | 0) + "," + Math.max(0, Math.min(1, a)).toFixed(3) + ")"; }
@@ -82,7 +147,10 @@
   function resize() {
     var r = cv.getBoundingClientRect(); cw = r.width; ch = r.height;
     dpr = Math.min(2, window.devicePixelRatio || 1);
-    cv.width = Math.round(cw * dpr); cv.height = Math.round(ch * dpr);
+    var w = Math.round(cw * dpr), h = Math.round(ch * dpr);
+    /* reallocating the backing store clears the canvas — only do it on a real size change,
+       not every time the panel height changes under us as protocols cycle */
+    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
     measure();
   }
   function strandY(s, x, now) { return s.baseY + s.amp * Math.sin(x / s.wl + s.ph + now * 0.001 * s.sp); }
@@ -105,7 +173,10 @@
   function measure() {
     var centerY = ch / 2, halfP = (panel ? panel.offsetWidth : Math.min(cw * 0.5, 520)) / 2;
     var x0 = Math.max(18, cw * 0.03), x1 = cw - x0, center = cw / 2;
-    G = { centerY: centerY, x0: x0, x1: x1, center: center, panelL: center - halfP, panelR: center + halfP, strands: buildField(centerY) };
+    /* keep the plasma field stable when only the panel height changes (it does, each cycle,
+       as protocols with different row counts recentre); rebuild it only on a real canvas resize */
+    var strands = (G && G._cw === cw && G._ch === ch) ? G.strands : buildField(centerY);
+    G = { centerY: centerY, x0: x0, x1: x1, center: center, panelL: center - halfP, panelR: center + halfP, strands: strands, _cw: cw, _ch: ch };
   }
 
   /* the hero wire's two foreground segments, in viewport pixels, for intro.js to fly into */
@@ -127,7 +198,12 @@
     phase = p; dur = PH[p]; t0 = now; trail = [];
     host.setAttribute("data-phase", p);
     if (p === "arrive") setState("building", "—");
-    else if (p === "build") { setState("building", "building…"); ingest = []; for (var i = 0; i < 10; i++) ingest.push({ t: i / 10, off: (Math.random() - 0.5) * 18, sp: 0.6 + Math.random() * 0.5 }); }
+    else if (p === "build") {
+      applyProto(PROTOCOLS[protoIdx]);                 /* this cycle's message type */
+      protoIdx = (protoIdx + 1) % PROTOCOLS.length;    /* next cycle shows the next one */
+      setState("building", "building…");
+      ingest = []; for (var i = 0; i < 10; i++) ingest.push({ t: i / 10, off: (Math.random() - 0.5) * 18, sp: 0.6 + Math.random() * 0.5 });
+    }
     else if (p === "held") setState("armed", "armed");
     else if (p === "release") setState("resuming", "resuming…");
     else if (p === "done") { setState("done", "200"); if (G) bloom(G.x1, G.centerY, C.ok, 0.7); }
@@ -163,7 +239,8 @@
 
     /* 3 — the choreography on the foreground wire */
     var head = null;
-    if (phase === "arrive") { head = { x: lerp(x0, pL, eOut4(u)), c: C.accent, from: x0 }; }
+    var inCol = curCol || C.accent;
+    if (phase === "arrive") { head = { x: lerp(x0, pL, eOut4(u)), c: inCol, from: x0 }; }
     else if (phase === "release") { head = { x: lerp(pR, x1, eInOut(u)), c: mix(C.signal, C.ok, clamp01((u - 0.25) / 0.6)), from: pR }; }
 
     if (head) {
@@ -182,11 +259,11 @@
     for (var i = 0; i < trail.length; i++) { var T = trail[i], w = (i + 1) / (trail.length + 1); blob(T.c, T.x, cY, 3 + 9 * w, 0.34 * w * w * lum); }
 
     if (phase === "build") {
-      ctx.globalCompositeOperation = glowOp; blob(C.accent, pL, cY, 24, 0.3 * lum * (0.7 + 0.3 * Math.sin(now / 240)));
+      ctx.globalCompositeOperation = glowOp; blob(inCol, pL, cY, 24, 0.3 * lum * (0.7 + 0.3 * Math.sin(now / 240)));
       ingest.forEach(function (p) {
         var pp = (u * p.sp + p.t) % 1, x = lerp(pL - 26, pL + 10, pp), y = cY + p.off * (1 - pp);
-        blob(C.accent, x, y, 5, 0.4 * (1 - pp) * lum);
-        ctx.globalCompositeOperation = "source-over"; dot(C.accent, x, y, 1.4, (1 - pp) * 0.9); ctx.globalCompositeOperation = glowOp;
+        blob(inCol, x, y, 5, 0.4 * (1 - pp) * lum);
+        ctx.globalCompositeOperation = "source-over"; dot(inCol, x, y, 1.4, (1 - pp) * 0.9); ctx.globalCompositeOperation = glowOp;
       });
     }
     if (phase === "held") {
@@ -241,7 +318,11 @@
   if ("IntersectionObserver" in window) {
     new IntersectionObserver(function (es) { es.forEach(function (e) { onScreen = e.isIntersecting; if (onScreen && !started && !siteIntro) begin(); else if (started) sync(); }); }, { threshold: 0.12 }).observe(host);
   }
-  if ("ResizeObserver" in window) { var ro = new ResizeObserver(function () { resize(); }); ro.observe(host); if (panel) ro.observe(panel); }
+  if ("ResizeObserver" in window) {
+    new ResizeObserver(function () { resize(); }).observe(host);
+    /* the panel's height changes every cycle; recompute geometry only, don't touch the canvas buffer */
+    if (panel) new ResizeObserver(function () { measure(); }).observe(panel);
+  }
   else window.addEventListener("resize", resize);
   if (mqDark && mqDark.addEventListener) mqDark.addEventListener("change", readColors);
   if (mqReduce && mqReduce.addEventListener) mqReduce.addEventListener("change", function (e) {

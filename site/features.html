@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Features — aitmproxy</title>
-<meta name="description" content="Everything aitmproxy does between the client and the server: intercept rules, replay, Map Local and Map Remote, WebSocket editing, sessions and HAR, TLS passthrough, an embedded browser and certificate management. Each one by hand or by agent.">
+<meta name="description" content="Everything aitmproxy does between the client and the server: intercept rules, replay, Map Local and Map Remote, WebSocket editing, HTTP/2 per stream, raw L4 packet interception, an attack-surface scanner, sessions and HAR, TLS passthrough, an embedded browser and certificate management. Each one by hand or by agent.">
 <link rel="stylesheet" href="styles.css">
 <script>(function(d){var c=" js";try{if(!matchMedia("(prefers-reduced-motion: reduce)").matches&&!sessionStorage.getItem("aitm.intro")){c+=" intro-on";sessionStorage.setItem("aitm.intro","1");}}catch(e){}d.className+=c;})(document.documentElement);</script>
 </head>
@@ -172,6 +172,90 @@
   </div>
 </article>
 
+<!-- HTTP/2 -->
+<article class="feat" data-reveal id="http2">
+  <div class="prose">
+    <h2 class="h3">HTTP/2, decrypted per stream</h2>
+    <p>Modern apps speak HTTP/2, so aitmproxy does too. It negotiates h2 with the client over ALPN, decrypts the connection with the local CA, and presents each multiplexed stream as an ordinary flow — request and response, headers and body — that you read and edit before it goes on. The HEADERS and DATA frames <em>are</em> the flow; the multiplexing is handled for you.</p>
+    <ul>
+      <li>ALPN-negotiated h2 on both sides, falling back to HTTP/1.1 when the server only offers it.</li>
+      <li>Pseudo-headers (<code>:method</code>, <code>:path</code>, <code>:authority</code>) are editable like any other header.</li>
+      <li>Intercept rules, replay, Map Local and Remote, and plugins all apply unchanged.</li>
+    </ul>
+    <div class="pair">
+      <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm flow mutate --id 52 --set-body <span class="s">'{"query":"query { me { role } }"}'</span></code></div>
+      <div class="pair-row"><span class="pair-who">agent</span><code>flow.mutate({ id: 52, set_body: <span class="s">'{"query":"query { me { role } }"}'</span> })</code></div>
+    </div>
+  </div>
+  <div class="feat-stack">
+    <div class="ui">
+      <div class="ui-bar"><span class="dot" aria-hidden="true"></span><span><code>https://api.example.com</code> · h2</span><span class="spacer"></span><span>3 streams</span></div>
+      <table class="flows">
+        <thead><tr><th>stream</th><th>method</th><th>path</th><th>status</th><th>time</th></tr></thead>
+        <tbody>
+          <tr><td class="num">1</td><td><span class="m m-get">GET</span></td><td class="url">/app.js</td><td class="st-ok">200</td><td class="time">14 ms</td></tr>
+          <tr><td class="num">3</td><td><span class="m m-get">GET</span></td><td class="url">/api/me</td><td class="st-ok">200</td><td class="time">9 ms</td></tr>
+          <tr class="is-held"><td class="num">5</td><td><span class="m m-post">POST</span></td><td class="url">/graphql</td><td><span class="chip chip--armed">armed</span></td><td class="time">—</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</article>
+
+<!-- L4 -->
+<article class="feat" data-reveal id="l4">
+  <div class="prose">
+    <h2 class="h3">Raw L4 packet interception</h2>
+    <p>Not everything is HTTP. aitmproxy can sit on a raw TCP stream at layer 4, capture the bytes in both directions, and hold a segment the same way it holds a request — so you can read, edit and release the wire bytes of any protocol, from an encrypted database driver to a custom binary RPC. L4 flows carry the same lifecycle, the same commands and the same scripting as HTTP.</p>
+    <ul>
+      <li>Per-direction byte capture with a hex and ASCII view, by connection.</li>
+      <li>Hold, edit and resume raw segments; or drop a connection outright.</li>
+      <li>L4 steps are scriptable in the same Rhai and PoC surface as HTTP.</li>
+    </ul>
+    <div class="pair">
+      <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm l4 add --listen 5432 --upstream <span class="s">'db.internal:5432'</span></code></div>
+      <div class="pair-row"><span class="pair-who">agent</span><code>l4.add({ listen: 5432, upstream: <span class="s">"db.internal:5432"</span> })</code></div>
+    </div>
+  </div>
+  <div class="feat-stack">
+    <div class="ui">
+      <div class="ui-bar"><span class="dot" aria-hidden="true"></span><span><code>tcp 10.0.0.4:51514 → :5432</code></span><span class="spacer"></span><span>#58 · held</span></div>
+      <div class="ui-detail"><pre>0000  00 00 00 17 00 03 00 00  user postgres
+0008  64 61 74 61 62 61 73 65  database
+0016  <span style="background:var(--signal)">market_prod</span> 00           ← edited</pre></div>
+      <div class="ui-actions"><span class="btnlike is-primary">Resume <kbd class="key">↩</kbd></span><span class="btnlike">Drop <kbd class="key">⌫</kbd></span></div>
+    </div>
+  </div>
+</article>
+
+<!-- Scanner -->
+<article class="feat" data-reveal id="scanner">
+  <div class="prose">
+    <h2 class="h3">Attack-surface scanner</h2>
+    <p>The scanner is a plugin that maps a target before you test it. <code>scan.discover</code> drives the embedded browser to crawl an authorized, in-scope target breadth-first, then reads the captured flows back to enumerate injection points — query and body parameters, headers, path segments. It is a command like any other, so an operator runs it and an assistant can be tasked with the same call over MCP.</p>
+    <ul>
+      <li>Deny-by-default: a target outside the session scope is refused before the crawler opens a page.</li>
+      <li>Returns the endpoints found, the injection points, pages crawled and why it stopped.</li>
+      <li>Discovery today; injection and PoC generation build on the same seam.</li>
+    </ul>
+    <div class="pair">
+      <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm scan discover --target <span class="s">'https://staging.example.com'</span></code></div>
+      <div class="pair-row"><span class="pair-who">agent</span><code>scan.discover({ target: <span class="s">"https://staging.example.com"</span> })</code></div>
+    </div>
+  </div>
+  <div class="feat-stack">
+    <div class="ui">
+      <div class="ui-bar"><span class="dot" aria-hidden="true"></span><span>scan.discover</span><span class="spacer"></span><span>staging.example.com</span></div>
+      <div class="ui-lines">
+        <div><span class="k">endpoints</span><span>37 across 9 hosts</span></div>
+        <div><span class="k">injection</span><span>84 points · query, body, header</span></div>
+        <div><span class="k">crawled</span><span>42 pages · same-origin, in-scope</span></div>
+        <div><span class="k">stopped</span><span>page cap reached</span></div>
+      </div>
+    </div>
+  </div>
+</article>
+
 <!-- Sessions -->
 <article class="feat" data-reveal id="sessions">
   <div class="prose">
@@ -316,7 +400,7 @@
   <div class="wrap">
     <div>
       <a class="wordmark" href="index.html">aitmproxy<i aria-hidden="true"></i></a>
-      <p class="fine">A fast, memory-safe intercepting proxy for inspecting and editing HTTP and WebSocket traffic during development and authorized testing. Use it on systems you own or are permitted to test.</p>
+      <p class="fine">A fast, memory-safe intercepting proxy for inspecting and editing HTTP, WebSocket, HTTP/2 and raw L4 traffic during development and authorized testing. Use it on systems you own or are permitted to test.</p>
     </div>
     <div>
       <h4>Product</h4>
