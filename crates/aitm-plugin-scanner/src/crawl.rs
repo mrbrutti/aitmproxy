@@ -253,6 +253,10 @@ pub(crate) fn normalize_url(s: &str) -> Option<String> {
 
 /// A target string that is safe to put in an error message: userinfo removed,
 /// embedded credential material scrubbed, and length-capped.
+///
+/// A target that does not parse as a URL has no structure to rely on, so its
+/// userinfo is stripped textually ([`strip_unparsed_userinfo`]) rather than the
+/// string being echoed verbatim.
 pub(crate) fn safe_target(target: &str) -> String {
     let bare = match Url::parse(target.trim()) {
         Ok(mut url) => {
@@ -261,10 +265,77 @@ pub(crate) fn safe_target(target: &str) -> String {
             url.set_fragment(None);
             url.to_string()
         }
-        Err(_) => target.to_string(),
+        Err(_) => strip_unparsed_userinfo(target),
     };
     let scrubbed = aitm_core::redact::scrub_text(&bare);
     truncate_on_char_boundary(&scrubbed, 256).to_string()
+}
+
+/// Bytes that can never appear raw inside a URL's userinfo once it is
+/// percent-encoded the WHATWG way, and so end an authority in free text:
+/// whitespace, the path/query/fragment delimiters, and quoting characters.
+/// Sub-delimiters (`&`, `;`, `,`, `'`) are *not* here — they are legal raw in a
+/// password, and treating one as the end of the authority would leave the rest
+/// of that password in the output.
+fn ends_authority(b: u8) -> bool {
+    b.is_ascii_whitespace()
+        || matches!(
+            b,
+            b'/' | b'?' | b'#' | b'\\' | b'"' | b'<' | b'>' | b'`' | b'{' | b'}'
+        )
+}
+
+/// Remove URL userinfo from free text: for every `//authority` in `text`,
+/// everything up to the *last* `@` of that authority is dropped
+/// (`http://user:pw@host/x` → `http://host/x`). The last `@` wins because an
+/// unencoded `@` inside a password is still credential. An `@` after the
+/// authority has ended (path, query) is left alone.
+///
+/// One linear pass: each authority is scanned once and the scan resumes where it
+/// ended, so a hostile body cannot make this quadratic.
+pub(crate) fn strip_userinfo(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    // Start of the text not yet copied into `out`.
+    let mut copied = 0;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] != b'/' || bytes[i + 1] != b'/' {
+            i += 1;
+            continue;
+        }
+        let start = i + 2;
+        let mut end = start;
+        let mut last_at = None;
+        while end < bytes.len() && !ends_authority(bytes[end]) {
+            if bytes[end] == b'@' {
+                last_at = Some(end);
+            }
+            end += 1;
+        }
+        if let Some(at) = last_at {
+            // Every index here follows an ASCII byte (`/` or `@`), so it is a
+            // char boundary.
+            out.push_str(&text[copied..start]);
+            copied = at + 1;
+        }
+        i = end;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// Strip userinfo from a target that did not parse as a URL: every
+/// `//authority@` ([`strip_userinfo`]), then — for a scheme-less `user@host/…`,
+/// which has no `//` to anchor on — everything up to the last `@` that precedes
+/// the first `/`. Over-strips on garbage input rather than leaving a credential.
+fn strip_unparsed_userinfo(target: &str) -> String {
+    let stripped = strip_userinfo(target);
+    let head_end = stripped.find('/').unwrap_or(stripped.len());
+    match stripped[..head_end].rfind('@') {
+        Some(at) => stripped[at + 1..].to_string(),
+        None => stripped,
+    }
 }
 
 /// Parse an absolute `http(s)` URL the way the browser does, with the fragment
@@ -299,6 +370,15 @@ fn guard_authority(url: &Url) -> String {
     let host = url.host_str().unwrap_or_default();
     let port = url.port_or_known_default().unwrap_or(0);
     format!("{host}:{port}")
+}
+
+/// The guard `host:port` for a bare target string: [`parse_target`] then
+/// [`guard_authority`], so a target is parsed, refused (userinfo, non-`http(s)`
+/// scheme, no host) and folded to an authority exactly the way the crawl's own
+/// seed is. The one entry point other engines (`inject`) use, so they cannot
+/// grow a second, laxer parser.
+pub(crate) fn guard_authority_for(target: &str) -> Option<String> {
+    parse_target(target).map(|url| guard_authority(&url))
 }
 
 /// The time left in the budget, or `None` when it is spent.
@@ -888,6 +968,32 @@ mod tests {
         );
     }
 
+    /// `guard_authority_for` is the one place a bare target string becomes the
+    /// `host:port` the guard is asked about, shared with `inject`: it folds the
+    /// default port in, and refuses what `parse_target` refuses (userinfo, a
+    /// non-http scheme, no host).
+    #[test]
+    fn guard_authority_for_folds_port_and_rejects_userinfo() {
+        assert_eq!(
+            guard_authority_for("http://target.test/"),
+            Some("target.test:80".to_string())
+        );
+        assert_eq!(
+            guard_authority_for(" https://Target.Test/a/b?q=1 "),
+            Some("target.test:443".to_string())
+        );
+        assert_eq!(
+            guard_authority_for("http://target.test:8080/"),
+            Some("target.test:8080".to_string())
+        );
+        // `http://target.test@evil.com/` reads as the target to a human while the
+        // client connects to `evil.com`: refused outright, as are credentials.
+        assert_eq!(guard_authority_for("http://user:pw@target.test/"), None);
+        assert_eq!(guard_authority_for("http://target.test@evil.com/"), None);
+        assert_eq!(guard_authority_for("ftp://target.test/"), None);
+        assert_eq!(guard_authority_for("not a url"), None);
+    }
+
     /// A same-origin, in-scope redirect is a reachable endpoint in its own
     /// right: the requested URL is recorded as well as the page it landed on,
     /// and the crawl carries on past it.
@@ -1360,6 +1466,59 @@ mod tests {
                 "/submit".to_string(),
                 "/amp?x=1&y=2".to_string(),
             ]
+        );
+    }
+
+    /// `http://user:pw@host:99999/` has an out-of-range port, so `Url::parse`
+    /// fails; the fallback arm used to echo the target verbatim, userinfo and all.
+    #[test]
+    fn safe_target_strips_userinfo_when_the_target_does_not_parse() {
+        assert_eq!(
+            safe_target("http://user:pw@host:99999/"),
+            "http://host:99999/"
+        );
+        // Another parse failure (bad IPv6 literal): userinfo gone, and the
+        // credential-material mask still applies to the rest.
+        assert_eq!(
+            safe_target("http://u:p@[::1/?access_token=T1"),
+            "http://[::1/?access_token=[redacted]"
+        );
+        // Scheme-relative and scheme-less forms both fail to parse too.
+        assert_eq!(safe_target("//user:pw@host/x"), "//host/x");
+        assert_eq!(safe_target("user@host:99999/x"), "host:99999/x");
+        // The crawl's own refusal message must not echo the credential either.
+        assert!(!safe_target("http://user:hunter2@host:99999/").contains("hunter2"));
+        // A target that parses keeps the existing behavior.
+        assert_eq!(
+            safe_target("http://user:pw@target.test/p#frag"),
+            "http://target.test/p"
+        );
+    }
+
+    #[test]
+    fn strip_userinfo_drops_credentials_before_the_last_at_of_each_authority() {
+        assert_eq!(
+            strip_userinfo("see http://user:pw@host:8080/p?x=1 now"),
+            "see http://host:8080/p?x=1 now"
+        );
+        // The last `@` wins: an unencoded `@` inside the password is credential.
+        assert_eq!(strip_userinfo("//u:p@ss@host/x"), "//host/x");
+        // Every authority in the text, not just the first.
+        assert_eq!(
+            strip_userinfo("a=//u1:p1@h1/x&b=//u2@h2"),
+            "a=//h1/x&b=//h2"
+        );
+        // An `@` after the authority ends is path or query, not userinfo.
+        assert_eq!(
+            strip_userinfo("http://host/a@b?e=me@x.com"),
+            "http://host/a@b?e=me@x.com"
+        );
+        assert_eq!(strip_userinfo("no urls here"), "no urls here");
+        assert_eq!(strip_userinfo(""), "");
+        // Non-ASCII text around the authority is preserved intact.
+        assert_eq!(
+            strip_userinfo("h\u{e9}llo //u\u{e9}:p@h\u{f6}st/\u{fc}"),
+            "h\u{e9}llo //h\u{f6}st/\u{fc}"
         );
     }
 
