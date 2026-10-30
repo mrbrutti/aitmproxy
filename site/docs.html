@@ -64,7 +64,7 @@
         <h2>Automate</h2>
         <ul>
           <li><a href="#">CLI reference</a></li>
-          <li><a href="#">MCP server</a></li>
+          <li><a href="#mcp">Connect an assistant (MCP)</a></li>
           <li><a href="scripting.html">Rhai scripting</a></li>
           <li><a href="poc.html">PoC format</a></li>
           <li><a href="#">Audit log</a></li>
@@ -79,14 +79,33 @@
 
     <div class="prose">
       <h2 id="install">Install</h2>
-      <p>aitmproxy installs with Homebrew on macOS and Linux. The formula ships the <code>aitm</code> command, the terminal UI, the web UI and the MCP server. The macOS app is a separate cask that includes the same core.</p>
+      <p>aitmproxy is open source and ships for macOS and Linux; Windows is not supported. The <code>aitm</code> command bundles the proxy, the terminal UI, the web UI, the embedded browser and the MCP server. Pick the path for your OS — the <a href="download.html">download page</a> lists every package and checksum for v0.1.0.</p>
+
+      <h3 id="install-macos">macOS (Apple Silicon)</h3>
+      <p>Install from the project's Homebrew tap. While the v0.1.0 tap is private, export a token first so Homebrew can fetch it.</p>
       <figure class="code" data-reveal>
         <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="pr">$ </span>brew install aitmproxy
+<pre><code><span class="pr">$ </span>export HOMEBREW_GITHUB_API_TOKEN=$(gh auth token)
+<span class="pr">$ </span>brew install mrbrutti/aitmproxy/aitm            <span class="out"># CLI + web + TUI</span>
+<span class="pr">$ </span>brew install --cask mrbrutti/aitmproxy/aitmproxy  <span class="out"># the macOS app</span>
 <span class="pr">$ </span>aitm --version
-<span class="out">aitm 1.4.0 (rust 1.91, unsafe: 0)</span></code></pre>
+<span class="out">aitm 0.1.0 (unsafe: 0)</span></code></pre>
       </figure>
-      <p>Prefer the app? <code>brew install --cask aitmproxy</code> puts <em>aitmproxy.app</em> in Applications. The app starts the same core and can be driven by the same CLI.</p>
+
+      <h3 id="install-linux">Linux (x86-64 and aarch64)</h3>
+      <p>Install the native package for your distribution. It places <code>aitm</code> and <code>aitm-tui</code> on your <code>PATH</code> (installed under <code>/usr/lib/aitmproxy</code>, symlinked from <code>/usr/bin</code>), with the embedded browser alongside.</p>
+      <figure class="code" data-reveal>
+        <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="pr">$ </span>sudo apt install ./aitm-0.1.0-amd64.deb     <span class="out"># Debian / Ubuntu</span>
+<span class="pr">$ </span>sudo dnf install ./aitm-0.1.0-x86_64.rpm    <span class="out"># Fedora / RHEL</span></code></pre>
+      </figure>
+
+      <h3 id="install-cargo">Cargo, or from source</h3>
+      <p>With a recent Rust toolchain, install the binary directly. A bare build produces <code>aitm</code>; the packaged builds above add <code>aitm-tui</code> and the browser.</p>
+      <figure class="code" data-reveal>
+        <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="pr">$ </span>cargo install --git https://github.com/mrbrutti/aitmproxy aitm</code></pre>
+      </figure>
 
       <h2 id="trust">Trust the certificate</h2>
       <p>To read HTTPS, aitmproxy terminates TLS with a certificate authority it generates on your machine, for your machine. Nothing leaves your computer. Before browsers and apps will accept it, that CA must be trusted.</p>
@@ -164,6 +183,40 @@
       </figure>
       <p>Whoever issued them, the commands land in one audit log with the operator named: <code>aitm log tail</code> shows it live.</p>
 
+      <h2 id="mcp">Connect an assistant (MCP)</h2>
+      <p>aitmproxy is an MCP server: every command on this page is exposed to an assistant under the same name and shape. Connect one and it drives the proxy — hold, edit, replay, script, reproduce — through the same audited core you use by hand. How you connect depends on whether the client launches a command or reaches a URL.</p>
+
+      <h3 id="mcp-claude">Claude Code and Claude Desktop</h3>
+      <p>Claude speaks MCP over stdio, so it launches <code>aitm mcp</code> directly. In Claude Code, add it in one line:</p>
+      <figure class="code" data-reveal>
+        <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="pr">$ </span>claude mcp add aitmproxy -- aitm mcp</code></pre>
+      </figure>
+      <p>For Claude Desktop, add the server to <code>claude_desktop_config.json</code>:</p>
+      <figure class="code" data-reveal>
+        <figcaption><span>claude_desktop_config.json</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="p">{</span>
+  <span class="yk">"mcpServers"</span>: <span class="p">{</span>
+    <span class="yk">"aitmproxy"</span>: <span class="p">{</span> <span class="yk">"command"</span>: <span class="s">"aitm"</span>, <span class="yk">"args"</span>: [<span class="s">"mcp"</span>] <span class="p">}</span>
+  <span class="p">}</span>
+<span class="p">}</span></code></pre>
+      </figure>
+
+      <h3 id="mcp-chatgpt">ChatGPT and other URL connectors</h3>
+      <p>Some clients — ChatGPT's connectors among them — reach an MCP server over a URL rather than launching a command. For those, run aitmproxy's MCP on a loopback TCP port guarded by a token and point the connector at it. Set it in <code>config.yaml</code>:</p>
+      <figure class="code" data-reveal>
+        <figcaption><span>config.yaml</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="yk">mcp:</span>
+  <span class="yk">transport:</span>
+    <span class="yk">loopback_tcp:</span>
+      <span class="yk">port:</span> <span class="n">8083</span>
+      <span class="yk">token:</span> <span class="s">"a long random secret"</span></code></pre>
+      </figure>
+      <p>Start <code>aitm</code> and the MCP server listens on <code>127.0.0.1:8083</code>; the first line of every connection must present <code>{"token":"…"}</code> or it is refused with <code>-32001</code>. The connector has to reach that address, so this fits an assistant running on the same machine. Keep the token secret — it carries the full command surface.</p>
+      <div class="callout">
+        <p><strong>Least privilege:</strong> an assistant gets the agent command set by default. The sensitive verbs — installing the CA, widening scope, running a PoC — stay off until you opt in, and every call lands in the one audit log with the operator named.</p>
+      </div>
+
       <h2 id="next">Next steps</h2>
       <ul>
         <li><a href="features.html#replay">Replay a flow with one change</a> and diff the responses.</li>
@@ -197,7 +250,7 @@
   <div class="wrap">
     <div>
       <a class="wordmark" href="index.html">aitmproxy<i aria-hidden="true"></i></a>
-      <p class="fine">A fast, memory-safe intercepting proxy for inspecting and editing HTTP and WebSocket traffic during development and authorized testing. Use it on systems you own or are permitted to test.</p>
+      <p class="fine">A fast, memory-safe intercepting proxy for inspecting and editing HTTP, WebSocket, HTTP/2 and raw L4 traffic during development and authorized testing. Use it on systems you own or are permitted to test.</p>
     </div>
     <div>
       <h4>Product</h4>

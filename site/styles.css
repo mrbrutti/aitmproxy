@@ -215,10 +215,10 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
 .hero .display .line > span { display: block; translate: 0 112%; animation: rise 900ms var(--ease-out) var(--intro-lead) forwards; }
 .hero .display .line:nth-child(2) > span { animation-delay: calc(var(--intro-lead) + 100ms); }
 @keyframes rise { to { translate: 0 0; } }
-.hero .lead { animation: fade-up 700ms var(--ease-out) calc(var(--intro-lead) + 360ms) backwards; }
-.hero .operators { animation: fade-up 700ms var(--ease-out) calc(var(--intro-lead) + 1200ms) backwards; }
-.hero .hero-cta { animation: fade-up 700ms var(--ease-out) calc(var(--intro-lead) + 1350ms) backwards; }
-.hero .hero-foot { animation: fade-up 700ms var(--ease-out) calc(var(--intro-lead) + 1450ms) backwards; }
+.hero .lead { animation: fade-up 680ms var(--ease-out) calc(var(--intro-lead) + 300ms) backwards; }
+.hero .operators { animation: fade-up 680ms var(--ease-out) calc(var(--intro-lead) + 560ms) backwards; }
+.hero .hero-cta { animation: fade-up 680ms var(--ease-out) calc(var(--intro-lead) + 680ms) backwards; }
+.hero .hero-foot { animation: fade-up 680ms var(--ease-out) calc(var(--intro-lead) + 800ms) backwards; }
 @keyframes fade-up { from { opacity: 0; translate: 0 12px; } }
 @keyframes word-in { from { opacity: 0; translate: 0 3px; } }
 
@@ -239,9 +239,23 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
   margin-block: clamp(2rem, 5vw, 3.5rem);
   height: clamp(320px, 48vh, 480px);
 }
-.weave .node { position: absolute; top: 50%; transform: translateY(-50%); font-style: italic; font-size: var(--fs-small); color: var(--ink-2); z-index: 2; }
-.weave .node--client { left: var(--margin); }
-.weave .node--server { right: var(--margin); }
+/* the two endpoints of the wire: client ↔ aitmproxy (the panel) ↔ server.
+   Flat monochrome chips that the wire plugs into, each with a role and a concrete sub-label. */
+.weave .endpoint { position: absolute; top: 50%; transform: translateY(-50%); z-index: 3; }
+.weave .endpoint--client { left: var(--margin); }
+.weave .endpoint--server { right: var(--margin); }
+.endpoint-chip {
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  background: var(--paper); border: 1px solid var(--hairline); border-radius: var(--radius);
+  padding: 0.4rem 0.65rem; box-shadow: var(--shadow-lift);
+  font-family: var(--serif); color: var(--ink);
+}
+.endpoint-chip svg { width: 15px; height: 15px; stroke: currentColor; color: var(--ink-2); fill: none; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+.endpoint-chip b { font-weight: 500; font-size: var(--fs-small); letter-spacing: 0.06em; text-transform: uppercase; }
+.endpoint--server .endpoint-chip { flex-direction: row-reverse; }
+.endpoint-sub { position: absolute; top: 100%; margin-top: 0.5rem; white-space: nowrap; font-family: var(--mono); font-size: var(--fs-mono-s); color: var(--ink-3); }
+.endpoint--client .endpoint-sub { left: 0.15rem; }
+.endpoint--server .endpoint-sub { right: 0.15rem; text-align: right; }
 
 /* the interceptor: the flow-viewer panel, centred on the wire (its own product chrome) */
 .weave-panel {
@@ -262,6 +276,7 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
 .wp-body { padding: 0.85rem 0.95rem; }
 .wp-body .flow-row { white-space: pre; overflow: hidden; text-overflow: ellipsis; }
 .wp-body .h { color: var(--ink-2); }
+.wp-body .dir { color: var(--proto); font-weight: 600; }
 .wp-body .edit { background: var(--signal); color: var(--signal-ink); padding: 0 0.15em; border-radius: 2px; }
 .wp-bar { display: flex; align-items: center; gap: 0.7rem; padding: 0.5rem 0.9rem; border-top: 1px solid var(--hairline); background: var(--paper-2); font-family: var(--serif); font-size: var(--fs-small); color: var(--ink-2); }
 .wp-bar .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--signal); flex: none; }
@@ -270,6 +285,71 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
 .wp-act { font-weight: 500; color: var(--ink); padding: 0.12rem 0.55rem; border: 1px solid var(--control); border-radius: var(--radius-badge); }
 .wp-act--go { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
 .wp-act--kill { color: var(--st-err); border-color: color-mix(in srgb, var(--st-err) 40%, var(--hairline)); }
+
+/* protocol chip in the panel head — tinted to the message type currently on the wire */
+.wp-proto {
+  font-weight: 600; font-size: 0.6875rem; letter-spacing: 0.01em;
+  padding: 0 0.42em; border-radius: var(--radius-badge); line-height: 1.5;
+  color: var(--proto); background: color-mix(in srgb, var(--proto) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--proto) 40%, transparent);
+  transition: color 320ms var(--ease-out), background 320ms var(--ease-out), border-color 320ms var(--ease-out);
+}
+.m-tcp { color: var(--proto-l4); background: color-mix(in srgb, var(--proto-l4) 16%, transparent); }
+/* the panel carries its current protocol hue in --proto, swapped by weave.js via data-proto */
+.weave-panel { --proto: var(--proto-http); }
+.weave-panel[data-proto="http"] { --proto: var(--proto-http); }
+.weave-panel[data-proto="ws"]   { --proto: var(--proto-ws); }
+.weave-panel[data-proto="h2"]   { --proto: var(--proto-h2); }
+.weave-panel[data-proto="l4"]   { --proto: var(--proto-l4); }
+
+/* the protocol legend under the wire — visible breadth; weave.js lights the current one */
+.proto-legend {
+  position: absolute; left: 0; right: 0; bottom: clamp(0.25rem, 2vh, 1rem); z-index: 3;
+  display: flex; flex-wrap: wrap; justify-content: center; gap: 0.5rem 1.4rem;
+  list-style: none; font-size: var(--fs-small); color: var(--ink-3);
+}
+.proto-legend li {
+  position: relative; display: inline-flex; align-items: center; gap: 0.45em;
+  padding-block: 0.15rem; transition: color 360ms var(--ease-out);
+}
+.proto-legend li::before {
+  content: ""; width: 7px; height: 7px; border-radius: 50%; flex: none;
+  background: color-mix(in srgb, var(--p) 55%, var(--ink-3));
+  --p: var(--proto-http); opacity: 0.45;
+  transition: opacity 360ms var(--ease-out), transform 360ms var(--ease-out), box-shadow 360ms var(--ease-out);
+}
+.proto-legend li[data-proto="http"]::before { --p: var(--proto-http); }
+.proto-legend li[data-proto="ws"]::before   { --p: var(--proto-ws); }
+.proto-legend li[data-proto="h2"]::before   { --p: var(--proto-h2); }
+.proto-legend li[data-proto="l4"]::before    { --p: var(--proto-l4); }
+.proto-legend li.is-active { color: var(--ink); }
+.proto-legend li.is-active::before { background: var(--p); opacity: 1; transform: scale(1.25); box-shadow: 0 0 0 4px color-mix(in srgb, var(--p) 22%, transparent); }
+
+/* ---- feature showcase: a timeline stepper driving one demo video (showcase.js) ---- */
+.showcase-grid { display: grid; grid-template-columns: minmax(12rem, 1fr) 1.9fr; gap: var(--gap); margin-top: clamp(1.5rem, 3vw, 2.5rem); align-items: start; }
+.showcase-steps { list-style: none; border-top: 1px solid var(--hairline); }
+.showcase-step { border-bottom: 1px solid var(--hairline); }
+.showcase-step > button {
+  display: grid; grid-template-columns: auto 1fr; align-items: baseline; gap: 0.8rem;
+  width: 100%; text-align: left; background: none; border: 0; cursor: pointer;
+  padding: 0.9rem 0.3rem; color: var(--ink-2); position: relative;
+  transition: color var(--dur) var(--ease-out);
+}
+.showcase-step > button:hover { color: var(--ink); }
+.showcase-step.is-active > button { color: var(--ink); }
+.s-num { font-family: var(--mono); font-size: var(--fs-mono-s); color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.showcase-step.is-active .s-num { color: var(--accent); }
+.s-text { display: flex; flex-direction: column; gap: 0.15rem; min-width: 0; }
+.s-feature { font-size: var(--fs-lead); font-weight: 500; line-height: 1.2; letter-spacing: -0.01em; }
+.s-mode { font-family: var(--mono); font-size: 0.6875rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--agent-deep); }
+.s-bar { position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; overflow: hidden; }
+.showcase-step.is-active .s-bar { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.s-bar > i { display: block; height: 100%; background: var(--accent); transform: scaleX(0); transform-origin: left; }
+.showcase-stage .frame { margin: 0; }
+.showcase-media { position: relative; aspect-ratio: 16 / 10; background: var(--page); }
+.showcase-video { width: 100%; height: 100%; object-fit: cover; display: block; background: var(--page); transition: opacity 240ms var(--ease-out); }
+.showcase-video.is-switching { opacity: 0; }
+.showcase-cap { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* the build: the request assembles row by row when the packet lands, clears before the next */
 .flow-row { opacity: 0; transform: translateY(7px); }
@@ -417,6 +497,7 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
 /* ---------- documentation layout ---------- */
 .page-head { padding-top: clamp(2.5rem, 5vw, 4.5rem); padding-bottom: clamp(2rem, 4vw, 3rem); }
 .page-head .lead { margin-top: 1rem; }
+.ver { font-family: var(--mono); font-size: 0.5em; font-weight: 500; vertical-align: 0.35em; color: var(--accent); letter-spacing: 0; margin-left: 0.3em; }
 .docs { display: grid; grid-template-columns: 13.5rem minmax(0, 1fr) 11rem; gap: clamp(2rem, 4vw, 4.5rem); padding-block: clamp(2.5rem, 5vw, 4rem); align-items: start; }
 .docnav { position: sticky; top: 1.5rem; font-size: var(--fs-small); }
 .docnav h2 { font-size: var(--fs-small); font-style: italic; font-weight: 400; color: var(--ink-2); margin: 1.25rem 0 0.5rem; }
@@ -521,34 +602,34 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
    so content is never hidden when scripts or animation do not run. */
 @media (prefers-reduced-motion: no-preference) {
   .js [data-reveal] {
-    opacity: 0; transform: translateY(16px);
-    transition: opacity 760ms var(--ease-out), transform 760ms var(--ease-out);
+    opacity: 0; transform: translateY(14px);
+    transition: opacity 600ms var(--ease-out), transform 600ms var(--ease-out);
   }
   .js [data-reveal].in { opacity: 1; transform: none; }
-  .js [data-reveal][data-d="1"] { transition-delay: 80ms; }
-  .js [data-reveal][data-d="2"] { transition-delay: 160ms; }
-  .js [data-reveal][data-d="3"] { transition-delay: 240ms; }
+  .js [data-reveal][data-d="1"] { transition-delay: 70ms; }
+  .js [data-reveal][data-d="2"] { transition-delay: 140ms; }
+  .js [data-reveal][data-d="3"] { transition-delay: 210ms; }
 
   /* a drawn figure: the block stays put, its strokes draw in (hand and agent meet the audit log) */
   .js [data-reveal][data-fx="draw"] { opacity: 1; transform: none; }
-  .js [data-fx="draw"] :is(path, line) { stroke-dasharray: 1; stroke-dashoffset: 1; transition: stroke-dashoffset 1100ms var(--ease-in-out); }
+  .js [data-fx="draw"] :is(path, line) { stroke-dasharray: 1; stroke-dashoffset: 1; transition: stroke-dashoffset 900ms var(--ease-in-out); }
   .js [data-fx="draw"].in :is(path, line) { stroke-dashoffset: 0; }
-  .js [data-fx="draw"].in .sig { transition-delay: 800ms; transition-duration: 600ms; }
-  .js [data-fx="draw"] text { opacity: 0; transition: opacity 500ms var(--ease-out); }
+  .js [data-fx="draw"].in .sig { transition-delay: 640ms; transition-duration: 520ms; }
+  .js [data-fx="draw"] text { opacity: 0; transition: opacity 440ms var(--ease-out); }
   .js [data-fx="draw"].in text { opacity: 1; }
-  .js [data-fx="draw"].in text:last-of-type { transition-delay: 1100ms; }
+  .js [data-fx="draw"].in text:last-of-type { transition-delay: 920ms; }
 
   /* the lifecycle line: the line draws, each station lands on it, the arrow and the drop arrive last */
   .js [data-reveal][data-fx="line"] { opacity: 1; transform: none; }
-  .js [data-fx="line"] .life-line { background: linear-gradient(var(--ink), var(--ink)) left / 0% 100% no-repeat; transition: background-size 1200ms var(--ease-in-out) 100ms; }
+  .js [data-fx="line"] .life-line { background: linear-gradient(var(--ink), var(--ink)) left / 0% 100% no-repeat; transition: background-size 1000ms var(--ease-in-out) 80ms; }
   .js [data-fx="line"].in .life-line { background-size: 100% 100%; }
-  .js [data-fx="line"] .life-line::after { opacity: 0; transition: opacity 320ms var(--ease-out) 1100ms; }
+  .js [data-fx="line"] .life-line::after { opacity: 0; transition: opacity 300ms var(--ease-out) 920ms; }
   .js [data-fx="line"].in .life-line::after { opacity: 1; }
-  .js [data-fx="line"] .station::before { transform: scale(0); transition: transform 520ms var(--ease-out); }
-  .js [data-fx="line"].in .station:nth-child(1)::before { transform: none; transition-delay: 150ms; }
-  .js [data-fx="line"].in .station:nth-child(2)::before { transform: none; transition-delay: 600ms; }
-  .js [data-fx="line"].in .station:nth-child(3)::before { transform: none; transition-delay: 1050ms; }
-  .js [data-fx="line"] .station--held::after, .js [data-fx="line"] .drop-label { opacity: 0; transition: opacity 420ms var(--ease-out) 1200ms; }
+  .js [data-fx="line"] .station::before { transform: scale(0); transition: transform 460ms var(--ease-out); }
+  .js [data-fx="line"].in .station:nth-child(1)::before { transform: none; transition-delay: 120ms; }
+  .js [data-fx="line"].in .station:nth-child(2)::before { transform: none; transition-delay: 480ms; }
+  .js [data-fx="line"].in .station:nth-child(3)::before { transform: none; transition-delay: 840ms; }
+  .js [data-fx="line"] .station--held::after, .js [data-fx="line"] .drop-label { opacity: 0; transition: opacity 380ms var(--ease-out) 980ms; }
   .js [data-fx="line"].in .station--held::after, .js [data-fx="line"].in .drop-label { opacity: 1; }
 
   /* the armed-intercept dot pulses, like the app's intercept bar */
@@ -616,6 +697,7 @@ html.intro-on.intro-reveal :is(.nav, main, .footer) { animation: fade-in 900ms v
   .weave-panel { width: min(34rem, 72vw); }
   .operators { grid-template-columns: 1fr; }
   .life { grid-template-columns: 1fr; }
+  .showcase-grid { grid-template-columns: 1fr; }
   .faces { grid-template-columns: 1fr; }
   .shot-grid { grid-template-columns: 1fr; }
   .langs { grid-template-columns: 1fr; }
@@ -632,9 +714,18 @@ html.intro-on.intro-reveal :is(.nav, main, .footer) { animation: fade-in 900ms v
 
 @media (max-width: 640px) {
   .weave { height: auto; min-height: 220px; margin-inline: 0; width: auto; padding-block: 1.25rem; }
-  .weave .node { position: static; display: block; text-align: center; transform: none; }
+  .weave { display: flex; flex-direction: column; align-items: center; gap: 0.25rem; }
+  .weave .endpoint { position: static; transform: none; display: inline-flex; flex-direction: column; align-items: center; }
+  .weave .endpoint--client { order: 1; }
+  .weave-panel { order: 2; }
+  .weave .endpoint--server { order: 3; }
+  .proto-legend { order: 4; }
+  .endpoint-sub { position: static; margin-top: 0.3rem; text-align: center; left: auto; right: auto; }
+  .endpoint--server .endpoint-chip { flex-direction: row; }
   .weave-panel { position: static; transform: none; width: 100%; margin: 1rem auto; font-size: var(--fs-mono-s); }
-  .weave .flow-row { opacity: 1; transform: none; }
+  /* the static mobile panel always shows its message — override the phase-based hide/build */
+  .weave[data-phase] .flow-row { opacity: 1; transform: none; animation: none; }
+  .proto-legend { position: static; margin: 0.5rem 0 0; }
   .operators { grid-template-columns: 1fr; }
   .operator code, .pair-row code { white-space: pre-wrap; word-break: break-word; }
   .hero-cta .cmd { margin-left: 0; width: 100%; }

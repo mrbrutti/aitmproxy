@@ -42,6 +42,14 @@
   --agent-deep: #0F766E;
   --agent-tint: #CCFBF1;
 
+  /* protocol hues — the four packet/message types on the wire (hero weave +
+     protocol legend). Each is a distinct, well-separated cool hue; amber stays
+     reserved for "held", green for "200 ok". */
+  --proto-http: #2563EB;  /* blue   — HTTP/1.1 */
+  --proto-ws:   #7C3AED;  /* violet — WebSocket */
+  --proto-h2:   #0D9488;  /* teal   — HTTP/2 */
+  --proto-l4:   #0891B2;  /* cyan   — raw L4 / TCP */
+
   /* method badge colours (fg/bg), app convention */
   --m-get-fg: #1D4ED8;  --m-get-bg: #DBEAFE;
   --m-post-fg: #15803D; --m-post-bg: #DCFCE7;
@@ -138,6 +146,11 @@
     --agent:      #2DD4BF;
     --agent-deep: #5EEAD4;
     --agent-tint: #113A36;
+
+    --proto-http: #60A5FA;  /* blue   */
+    --proto-ws:   #A78BFA;  /* violet */
+    --proto-h2:   #2DD4BF;  /* teal   */
+    --proto-l4:   #22D3EE;  /* cyan   */
 
     --m-get-fg: #93C5FD;  --m-get-bg: #1E2A44;
     --m-post-fg: #86EFAC; --m-post-bg: #14322A;
