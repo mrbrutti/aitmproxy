@@ -37,7 +37,11 @@ mkdir -p "$HOME/Applications"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin" "$app/Contents/MacOS/$name"
-sed -e "s/__BUILD__/$(date +%Y%m%d%H%M)/" "$here/Info.plist.in" > "$app/Contents/Info.plist"
+# The app version tracks the workspace release (Cargo.toml [workspace.package]) so
+# the DMG name, the bus handshake, and the cask all agree; APP_VERSION overrides.
+version="${APP_VERSION:-$(sed -n '/^\[workspace.package\]/,/^\[/ s/^version *= *"\([^"]*\)".*/\1/p' "${here:h:h}/Cargo.toml" | head -1)}"
+[[ -n "$version" ]] || { echo "build failed: no app version (set APP_VERSION)"; exit 1; }
+sed -e "s/__BUILD__/$(date +%Y%m%d%H%M)/" -e "s/__VERSION__/$version/" "$here/Info.plist.in" > "$app/Contents/Info.plist"
 # The icon: Icon/AppIcon.icon -> Resources/Assets.car + AppIcon.icns, rebuilt when it changed.
 if [[ -d "$here/Icon/AppIcon.icon" ]]; then
   car="$here/Resources/Assets.car"
