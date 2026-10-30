@@ -55,7 +55,7 @@
 //! [`send_recv`]: crate::sendrecv::send_recv
 //! [`send_on_wire`]: crate::wire::send_on_wire
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -514,7 +514,7 @@ fn do_inject(
             filter: None,
             queue: None,
         },
-        packets: Vec::new(),
+        packets: VecDeque::new(),
         metadata: L4Meta::default(),
     });
     // `count` already defaults to 1 for an *absent* arg (the Rhai/PoC callers use
