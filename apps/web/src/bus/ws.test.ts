@@ -80,3 +80,105 @@ describe('createWsBus role echo', () => {
     client.close();
   });
 });
+
+/** Resolves to `{ok}` / `{err}` when `p` settles, or `'hung'` if it has not within `ms`. */
+const outcome = <T>(p: Promise<T>, ms = 300) =>
+  Promise.race([
+    p.then(
+      (ok) => ({ ok }),
+      (e: Error) => ({ err: e.message }),
+    ),
+    new Promise<'hung'>((r) => setTimeout(() => r('hung'), ms)),
+  ]);
+
+/** Reply to the next `method` request the client sent on `sock`. */
+async function answer(sock: FakeWebSocket, method: string, result: unknown) {
+  const sent = () => sock.sent.find((l) => l.includes(`"method":"${method}"`));
+  await vi.waitFor(() => {
+    if (!sent()) throw new Error(`no ${method} sent`);
+  });
+  const { id } = JSON.parse(sent()!) as { id: number };
+  sock.onmessage?.({ data: JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n' });
+}
+
+/** The attempt is refused: the socket errors and closes without ever opening. */
+const refuse = (sock: FakeWebSocket) => {
+  sock.onerror?.();
+  sock.readyState = 3;
+  sock.onclose?.({ code: 1006 });
+};
+
+/** Let the back-off timer fire and bring the NEXT attempt up: handshake answered, state open. */
+async function openNextAttempt(client: ReturnType<typeof createWsBus>, previous: FakeWebSocket) {
+  await vi.waitFor(() => {
+    if (FakeWebSocket.last === previous) throw new Error('next attempt not started');
+  });
+  const next = FakeWebSocket.last!;
+  next.onopen?.();
+  await answer(next, 'initialize', { protocolVersion: '2025-06-18', role: 'operator' });
+  await vi.waitFor(() => {
+    if (client.state() !== 'open') throw new Error('not open yet');
+  });
+  return next;
+}
+
+describe('createWsBus calls across a failed connect attempt', () => {
+  let clients: ReturnType<typeof createWsBus>[] = [];
+  const bus = () => {
+    const c = createWsBus({ url: 'ws://127.0.0.1/bus', token: 'bridge-token', backoff: [5] });
+    clients.push(c);
+    return c;
+  };
+  beforeEach(() => {
+    FakeWebSocket.last = null;
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+  });
+  afterEach(() => {
+    for (const c of clients) c.close();
+    clients = [];
+    vi.unstubAllGlobals();
+  });
+
+  it('a call made while an attempt is failing resolves after the next successful open', async () => {
+    const client = bus();
+    client.connect();
+    const first = FakeWebSocket.last!;
+    refuse(first);
+    expect(client.state()).toBe('reconnecting');
+
+    // A caller arrives between the refused attempt and the next one…
+    const call = client.call<string[]>('flow.list');
+    // …the next attempt succeeds…
+    const second = await openNextAttempt(client, first);
+    await answer(second, 'tools/call', { structuredContent: ['f_1', 'f_2'] });
+
+    // …and the call made earlier is answered, not stranded on the first attempt's ready-promise.
+    expect(await outcome(call)).toEqual({ ok: ['f_1', 'f_2'] });
+    const sentCall = JSON.parse(second.sent.find((l) => l.includes('"method":"tools/call"'))!);
+    expect(sentCall.params).toEqual({ name: 'flow.list', arguments: {} });
+  });
+
+  it('tools() awaited at bootstrap survives a refused first connect', async () => {
+    const client = bus();
+    client.connect();
+    const first = FakeWebSocket.last!;
+    const tools = client.tools(); // bootstrap: connect(), then await bus.tools() — before anything fails
+    refuse(first);
+
+    const second = await openNextAttempt(client, first);
+    await answer(second, 'tools/list', { tools: [{ name: 'flow.list', description: '', inputSchema: { type: 'object' } }] });
+
+    expect(await outcome(tools)).toEqual({ ok: [{ name: 'flow.list', description: '', inputSchema: { type: 'object' } }] });
+  });
+
+  it('close() releases a call that is still waiting for a connection, with an error', async () => {
+    const client = bus();
+    client.connect();
+    refuse(FakeWebSocket.last!);
+    const call = client.call('flow.list');
+
+    client.close();
+
+    expect(await outcome(call)).toEqual({ err: 'bus not connected' });
+  });
+});

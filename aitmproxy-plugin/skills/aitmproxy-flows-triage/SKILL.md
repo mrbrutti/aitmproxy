@@ -49,6 +49,12 @@ All tools here are passive (read / annotate / export) — no upstream requests.
 - **`session.save --path` / `session.load --path`** persist or restore the whole
   flow store as a native session file (load is passive, no upstream requests).
 
+Reading or writing a host file with `path` (`flow.export`, `flow.import`,
+`session.save`, `session.load`) is refused from an agent frontend unless the
+operator set `session_io.allow_agent_file_io: true` in `config.yaml` (and, if
+`session_io.root` is set, the path must stay under it). Without it, `flow.export`
+without `path` returns the bytes and `flow.import` takes `bytes`.
+
 ## Triage flow
 
 Scan `flow.table` → `flow.mark` the candidates → `flow.detail` each to confirm →

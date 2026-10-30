@@ -39,21 +39,20 @@
     { key: "ws", proto: "WebSocket", id: "#43", m: "WS", mc: "m-ws", path: "wss://api.example.com/live", rows: [
       '<span class="dir">↓</span> <span class="h">text</span> {"op":"welcome","id":"c-7f2"}',
       '<span class="dir">↑</span> <span class="h">text</span> {"op":"subscribe","ch":"orders"}',
-      '<span class="dir">↑</span> <span class="h">inject</span> {"op":"subscribe","ch":<span class="edit">"admin"</span>}',
+      '<span class="dir">↑</span> <span class="h">injected</span> {"op":"subscribe","ch":<span class="edit">"admin"</span>}',
       '<span class="dir">↓</span> <span class="h">text</span> {"op":"ack","ch":"admin"}'
     ] },
     { key: "h2", proto: "HTTP/2", id: "#52", m: "POST", mc: "m-post", path: "/graphql · stream 5", rows: [
-      '<span class="h">HEADERS</span> stream=5 flags=END_HEADERS',
-      '<span class="h">:method</span> POST&nbsp;&nbsp;<span class="h">:scheme</span> https',
-      '<span class="h">:path</span> /graphql',
-      '<span class="h">DATA</span> stream=5',
+      '<span class="h">content-type:</span> application/json',
+      '<span class="h">authorization:</span> Bearer eyJhbGciOiJIUzI1NiJ9…',
+      '&nbsp;',
       '{ "query": "mutation { setRole(<span class="edit">admin</span>) }" }'
     ] },
     { key: "l4", proto: "L4 · TCP", id: "#58", m: "TCP", mc: "m-tcp", path: "10.0.0.4:51514 → :5432", rows: [
-      '<span class="h">seq</span> 1&nbsp;&nbsp;24 bytes&nbsp;&nbsp;PSH, ACK',
-      '<span class="h">0000</span>&nbsp;&nbsp;00 00 00 17 00 03 00 00',
-      '<span class="h">0008</span>&nbsp;&nbsp;user·postgres·database',
-      '<span class="h">0016</span>&nbsp;&nbsp;<span class="edit">market_prod</span>·00'
+      '<span class="h">44 bytes</span>&nbsp;&nbsp;in-path',
+      '<span class="h">0000</span>&nbsp;&nbsp;00 00 00 2c 00 03 00 00',
+      '<span class="h">0008</span>&nbsp;&nbsp;user·postgres·database·',
+      '<span class="h">001f</span>&nbsp;&nbsp;<span class="edit">market_prod</span>··'
     ] }
   ];
   var protoIdx = 0, curCol = null;
@@ -69,12 +68,12 @@
         '<span class="wp-proto">' + p.proto + '</span>' +
         '<span class="m ' + p.mc + '">' + p.m + '</span>' +
         '<span class="path">' + p.path + '</span>' +
-        '<span class="state">armed</span>' +
+        '<span class="state">paused</span>' +
       '</div>' +
       '<div class="wp-body">' + body + '</div>' +
       '<div class="wp-bar flow-row" style="--i:' + (p.rows.length + 1) + '">' +
         '<span class="dot" aria-hidden="true"></span>' +
-        '<span class="wp-bar-label">held · <code>127.0.0.1:8080</code></span>' +
+        '<span class="wp-bar-label">paused · <code>127.0.0.1:8080</code></span>' +
         '<span class="spacer"></span>' +
         '<span class="wp-act wp-act--go">Resume</span>' +
         '<span class="wp-act wp-act--kill">Kill</span>' +
@@ -83,7 +82,7 @@
     curCol = (C.proto && C.proto[p.key]) || C.accent;
     for (var i = 0; i < legend.length; i++) legend[i].classList.toggle("is-active", legend[i].getAttribute("data-proto") === p.key);
   }
-  function rest() { host.setAttribute("data-phase", "held"); setState("armed", "armed"); }
+  function rest() { host.setAttribute("data-phase", "held"); setState("armed", "paused"); }
   if (mqReduce && mqReduce.matches) { rest(); return; }
 
   /* ── the canvas ────────────────────────────────────────────── */
@@ -207,7 +206,7 @@
       setState("building", "building…");
       ingest = []; for (var i = 0; i < 10; i++) ingest.push({ t: i / 10, off: (Math.random() - 0.5) * 18, sp: 0.6 + Math.random() * 0.5 });
     }
-    else if (p === "held") setState("armed", "armed");
+    else if (p === "held") setState("armed", "paused");
     else if (p === "release") setState("resuming", "resuming…");
     else if (p === "done") { setState("done", "200"); if (G) bloom(G.x1, G.centerY, C.ok, 0.7); }
     else if (p === "idle") setState("armed", "—");

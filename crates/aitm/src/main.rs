@@ -317,6 +317,56 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
+    // Pre-bind every service port up front, before obscura is spawned and before
+    // any "listening" success line. A port conflict is then ONE clear, actionable
+    // error here — which port, who likely holds it, how to change it — never a
+    // cryptic os-error-48 printed after `aitm web` already announced the UI. This
+    // covers bare `aitm`, `aitm tui` and `aitm web` alike: the proxy and the
+    // browser's proxy port here, and the web UI port just below for `aitm web`.
+    let config_display = config_path
+        .unwrap_or_else(config_file::default_config_path)
+        .display()
+        .to_string();
+    let proxy_listener = bind_service_port(
+        cfg.listen,
+        "the proxy",
+        &format!("Free it, or set `listen:` to another address in {config_display}."),
+    )
+    .await?;
+    let browser_listener = bind_service_port(
+        cfg.browser.proxy_addr,
+        "the embedded browser's proxy",
+        &format!("Free it, or set `browser.proxy_addr:` to another address in {config_display}."),
+    )
+    .await?;
+    // `aitm web`: the UI port is pre-bound here too, so a web-port conflict is
+    // caught before obscura spawns, not after. The collision against the proxy /
+    // browser ports is named here because a shared address would otherwise
+    // surface only as a bare "address in use".
+    let web_listener = match &web_settings {
+        Some(settings) => {
+            for (what, addr) in [
+                ("proxy listen", cfg.listen),
+                ("browser.proxy_addr", cfg.browser.proxy_addr),
+            ] {
+                anyhow::ensure!(
+                    settings.listen != addr,
+                    "web UI --listen {} collides with {what} ({addr}); pick another port",
+                    settings.listen
+                );
+            }
+            Some(
+                bind_service_port(
+                    settings.listen,
+                    "the web UI",
+                    "Free it, or pass `--listen 127.0.0.1:<port>` (env AITM_WEB_LISTEN).",
+                )
+                .await?,
+            )
+        }
+        None => None,
+    };
+
     // Server path: launch the configured engine so the browser.* commands reach
     // a live driver. No fallback to the other engine.
     //
@@ -366,7 +416,7 @@ async fn run() -> anyhow::Result<()> {
     // We are about to serve: `proxy.status.listening` now reports the truth.
     listening.store(true, std::sync::atomic::Ordering::Relaxed);
     let result = if mode == Mode::Tui {
-        tui::run(&cfg, &proxy, services).await
+        tui::run(&cfg, &proxy, services, proxy_listener, browser_listener).await
     } else {
         // The bare-`aitm` server path is the dedicated agent entry point, so it
         // carries M4's operator/agent token classes, the shared agent policy
@@ -380,8 +430,8 @@ async fn run() -> anyhow::Result<()> {
 
         // `aitm web`: a second McpServer over the same registry and services
         // (`serve` consumes the first), driven by the bridge's `handle` calls.
-        let web_server = match web_settings {
-            Some(settings) => {
+        let web_server = match (web_settings, web_listener) {
+            (Some(settings), Some(listener)) => {
                 let bus = tui::server(&cfg, cfg.mcp.transport.clone(), &services);
                 // Operator access on the web UI is tied to `mcp.operator_token`
                 // being configured to a NON-EMPTY value (operator role exists at
@@ -410,19 +460,8 @@ async fn run() -> anyhow::Result<()> {
                         web::INSECURE_BIND_ENV
                     );
                 }
-                // The proxy and the browser's proxy port bind later in the select; a shared
-                // address would surface as a bare "address in use" there, so name it here.
-                for (what, addr) in [
-                    ("proxy listen", cfg.listen),
-                    ("browser.proxy_addr", cfg.browser.proxy_addr),
-                ] {
-                    anyhow::ensure!(
-                        settings.listen != addr,
-                        "web UI --listen {} collides with {what} ({addr}); pick another port",
-                        settings.listen
-                    );
-                }
-                let listener = TcpListener::bind(settings.listen).await?;
+                // The UI listener was pre-bound up front (collision checks and
+                // all), so here we just read its address and serve on it.
                 let bound = listener.local_addr()?;
                 let url = web::ui_url(bound, &settings.token);
                 // Log only the bound address; the token must never reach a
@@ -437,7 +476,7 @@ async fn run() -> anyhow::Result<()> {
                 }
                 Some((listener, state))
             }
-            None => None,
+            _ => None,
         };
         let web_run = async move {
             match web_server {
@@ -448,11 +487,10 @@ async fn run() -> anyhow::Result<()> {
 
         // The main listener relays client traffic; the browser listener is
         // SSRF-filtered (the embedded browser dials `cfg.browser.proxy_addr`).
-        let main_listen = cfg.listen;
-        let browser_listen = cfg.browser.proxy_addr;
+        // Both sockets were pre-bound above, so the accept loops just run on them.
         tokio::select! {
-            result = proxy.run(main_listen) => result,
-            result = proxy.run_browser(browser_listen) => result,
+            result = proxy.run_on(proxy_listener) => result,
+            result = proxy.run_browser_on(browser_listener) => result,
             result = mcp.serve() => result,
             result = web_run => result,
             () = aitm::shutdown_signal() => {
@@ -611,6 +649,31 @@ fn init_tracing() {
     use tracing_subscriber::fmt;
     let filter = build_env_filter(std::env::var("RUST_LOG").ok());
     let _ = fmt().with_env_filter(filter).try_init();
+}
+
+/// Bind one service port up front, turning "address already in use" into a
+/// single clear, actionable error — the port, who most likely holds it, and how
+/// to change it — so a conflict surfaces here, before obscura is spawned and
+/// before any "listening" success line, instead of as a cryptic os-error after
+/// one. `role` names the port ("the proxy"); `remedy` is the one-line fix hint.
+/// Any other bind error is returned with context.
+async fn bind_service_port(
+    addr: std::net::SocketAddr,
+    role: &str,
+    remedy: &str,
+) -> anyhow::Result<TcpListener> {
+    match TcpListener::bind(addr).await {
+        Ok(listener) => Ok(listener),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => anyhow::bail!(
+            "cannot start: {role} port {addr} is already in use.\n\
+             It is most likely held by another running `aitm`, the aitmproxy macOS app's \
+             embedded core, or another program.\n\
+             {remedy}\n\
+             Find the holder with:  lsof -nP -iTCP:{port} -sTCP:LISTEN",
+            port = addr.port(),
+        ),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("binding {role} on {addr}"))),
+    }
 }
 
 #[cfg(test)]

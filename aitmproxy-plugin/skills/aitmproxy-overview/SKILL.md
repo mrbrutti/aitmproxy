@@ -25,10 +25,19 @@ enabled it. Never use these tools to reach systems outside your authorization.
 `agent.status` reports the current policy; only the operator can change it with
 `agent.set --policy <all|auto|ask|readonly|paused>`:
 
-- `all` / `auto` — the agent may run tools (auto parks nothing extra);
-- `ask` — Sensitive tools park for operator `agent.approve`;
+- `all` — every agent call runs (still subject to scope, rate, SSRF and the
+  per-command config opt-ins below);
+- `auto` — read and write tools run; Sensitive tools (`scope.add`, `ca.install`,
+  `script.save`, …) are refused unless their own config opt-in allows them;
+- `ask` — read and write tools run; a Sensitive tool parks for operator
+  `agent.approve`;
 - `readonly` — only read-only tools run;
 - `paused` — the agent runs nothing.
+
+Some tools are also gated by a config opt-in the operator must have set, whatever
+the policy: `scope.allow_agent_widen` (`scope.add`), `tls.allow_agent_passthrough`,
+`maps.allow_agent_authoring` (`map.add`/`map.remove`), `ca.allow_agent_install`
+(`ca.install`/`ca.uninstall`) and `poc.allow_agent_run` (`poc.run`).
 
 The agent cannot change its own policy or approve its own requests. Check
 `agent.status` first and respect a restrictive policy instead of working around it.
@@ -60,6 +69,10 @@ The agent cannot change its own policy or approve its own requests. Check
 `flow.mark` and `flow.comment` annotate flows; `flow.export` emits native JSON or
 HAR; `flow.clear` drops completed flows; `proxy.pause` / `proxy.resume` hide or
 show new captures.
+
+`scan.discover --target <url>` crawls an in-scope target through the embedded
+browser and returns the reachable endpoints and the injection points seen in
+captured requests. It is **discovery only** — it never fuzzes or injects.
 
 ## How output renders
 

@@ -17,6 +17,11 @@ tools park for operator `agent.approve`; under `readonly`/`paused` they do not r
 - **`flow.intercept [--enabled true|false] [--rules <json-array>]`** arms (default)
   or disarms parking. With no rules every request is parked (global arm); with
   rules only a request matching a rule at its phase is parked. A parked flow waits.
+  A rule is an object with optional fields: `phase` (`request` default, `response`,
+  `ws_frame`, `any`), `url` (a `*` wildcard string, or `{wildcard}` / `{regex}`),
+  `method`, `host` (an exact authority string, or `{exact}` / `{wildcard}`),
+  `ws_dir` (`c2s` / `s2c`), plus `id`, `name`, `enabled`. For example
+  `rules: [{ "method": "POST", "url": "*/api/cart/*" }]`.
 - **`ws.intercept [--enabled] [--rules]`** does the same for WebSocket frames
   (Phase::WsFrame): which live frames are parked for `ws.frame`.
 
@@ -52,8 +57,9 @@ Check `proxy.status` (`intercept_armed`, `paused` count) to see what is parked.
 
 Because `flow.replay`, `request.send` and `ws.send` emit real traffic, confirm the
 target host is in the authorized scope first (`scope.list`); add it only if your
-engagement covers it (`scope.add`, operator-gated from an agent frontend). Prefer
-`flow.kill` with `429`/`503` over `reset` when you want a clean, non-upstream stop.
+engagement covers it (`scope.add`, operator-gated from an agent frontend). `flow.kill`
+with `429`/`503` gives the client an explicit status instead of a dropped
+connection.
 
 Once you have a working manipulation, capture it reproducibly with
 **aitmproxy-findings-poc**.

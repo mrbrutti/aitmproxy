@@ -449,7 +449,14 @@ assert the macOS path routes through it (NE-AC3); no separate choke is added. Su
 - **Satisfies:** NE-AC14.
 - **Depends on:** Task 1, Task 11.
 - **Files:** `apps/mac/Sources/Aitmproxy/Bus/ExtensionController.swift` (modify),
-  `apps/mac/Extension/Info.plist` (modify — bump `CFBundleVersion`).
+  `apps/mac/Extension/Info.plist` (modify — `CFBundleVersion` comment; `build.sh`
+  already stamps `__BUILD__` with a timestamp, so no literal bump is needed).
+  Beyond the declared list (recorded here per workflow): the settle/backoff/
+  connected-check schedule is extracted as the pure, unit-tested
+  `TunnelReconcilePolicy` in `apps/mac/Sources/AitmproxyKit/CaptureCapability.swift`
+  (modify), with coverage in
+  `apps/mac/Tests/AitmproxyKitTests/CaptureCapabilityTests.swift` (modify) — keeping
+  the framework-facing controller thin, matching the Task-13 split.
 - **Change:** `actionForReplacingExtension` returns `.replace`; after a
   replacement, reconcile the saved `NETransparentProxyManager` configuration
   (settle delay + connected-check) so a version bump does not leave it disabled
@@ -467,7 +474,17 @@ assert the macOS path routes through it (NE-AC3); no separate choke is added. Su
 - **Depends on:** Task 1, Task 11.
 - **Files:** `apps/mac/Sources/Aitmproxy/Bus/ExtensionController.swift` (modify),
   `apps/mac/Sources/Aitmproxy/SettingsView.swift` (modify — indicator + uninstall
-  control).
+  control). Beyond the declared list (recorded here per workflow):
+  `apps/mac/Sources/AitmproxyKit/CaptureCapability.swift` (modify — the `.uninstalled`
+  event and the `isCaptureOn` / `isInstalledOrInstalling` / `canUninstall` predicates
+  the indicator and button read) + its tests in
+  `apps/mac/Tests/AitmproxyKitTests/CaptureCapabilityTests.swift` (modify); and
+  `apps/mac/Sources/Aitmproxy/Bus/CoreHealthState.swift` (modify — a weak
+  `extensionController` handle, published by `start()`, so the Settings window, a
+  separate scene, can reach the controller to uninstall without a global singleton
+  and without touching `ShellView`). The build owner replaced the coder's first cut
+  (a `static weak var current` on the controller) with this handle: same operator-only
+  reachability, no global mutable state.
 - **Change:** show a visible "capture is on" indicator while the extension is
   active and attached; an uninstall path that submits `deactivationRequest` and
   removes the `NETransparentProxyManager` configuration. Indicator obeys the
@@ -496,9 +513,38 @@ assert the macOS path routes through it (NE-AC3); no separate choke is added. Su
   3. **Out-of-scope** traffic is **not** captured.
   4. With the core stopped, ordinary browsing is **unaffected** (fail-open,
      NE-AC5).
-  Pass: all four observed on a real Mac — the milestone's "real packets, not
+  5. **CROSS-UI (Matt's explicit mandate, 2026-10-30):** the captured in-scope flow
+     (HTTPS + the L4/UDP flow) must appear in **all three UIs reading the same core**:
+     (a) the **macOS app**, (b) **`aitm web`**, (c) **`aitm tui`** — not just at the
+     provider. Capture proof + a shot/assertion from each UI.
+  Pass: all five observed on a real Mac — the milestone's "real packets, not
   screenshots" bar.
-- **Done when:** all four conditions hold (Terminal panel).
+- **REPEATABLE E2E SCRIPT (Matt's mandate, 2026-10-30):** everything about the NE that
+  CAN be automated is scripted + asserted on ground truth under **`tests/e2e/ne/`**
+  (aligning with the `e2e-test-arch` `tests/e2e/` runner once it lands): build/sign/
+  notarize/install checks (codesign -d entitlements, stapler/spctl, systemextensionsctl
+  parse), the provider↔core handoff (the Rust `CaptureListener` round-trip, already in
+  `macos_capture_*` tests), loop-avoidance self-exclusion, and the capability state
+  machine (the `CaptureCapabilityTests`). The **ONLY** manual step allowed is the **two
+  System Settings approval clicks** (Apple requires a human); the script pauses for them
+  and resumes, asserting `[activated enabled]` + the cross-UI appearance afterward.
+  **Depends on:** the `e2e-test-arch` runner + the orchestrator's core-side rendezvous
+  writer + Task-2 scope-spec emitter landing first.
+- **LIVE-VERIFICATION CARRY-FORWARDS (from the 16/17 panel, 2026-10-30):**
+  - Confirm whether a real Mac emits a transient `NEVPNStatus.invalid` during a version-bump
+    replacement. If it does NOT, map `.invalid` to a degrade in
+    `ExtensionController.applyTunnelStatus` so an externally-removed proxy configuration stops
+    reading "Capture is on" (today `.invalid` is advisory to avoid a sticky degrade on a
+    replacement blip).
+  - Confirm whether `OSSystemExtensionRequest` deactivation is ever human-gated (a System
+    Settings prompt). If NEVER, harden `deactivate()` with a bounded timeout guarded by
+    `deactivation != nil` (so a late real callback cannot double-resume) against a dropped
+    terminal callback; if it IS human-gated, surface a "needs approval" state during uninstall
+    instead of a silent "Removing…".
+  - Confirm the `NEVPNError.code → TunnelFailure` classification against real reconcile
+    failures — especially that refusing "Add Proxy Configurations" is permanent (not retried).
+- **Done when:** all five conditions hold on a real Mac AND the repeatable `tests/e2e/ne/`
+  script passes every automatable assertion (Terminal panel).
 
 ### Task 19: Mandatory Stage-6 security review
 
@@ -546,6 +592,14 @@ Kept by the main session during stage 6. One row per finding.
 | 13 | quality | Minor | `applyTunnelStatus` called synchronously after `startVPNTunnel` is a no-op in the common path | **FIXED** — comment added noting it only catches a reused already-connected manager |
 | 13 | quality | Minor | `applying(.activated)`/`.needsUserApproval` reset away from `.capturing` unguarded (asymmetric with tunnel events) | **FIXED (doc)** — `applying(_:)` doc now states activation events are authoritative and intentionally override `.capturing` (a real re-approval), while tunnel events are advisory |
 | 13 | security | Minor | "single call site" of `ExtensionController.start()` is convention, not compiler-enforced; a future second caller could reach activation | **accepted (non-exploitable)** — the reviewer confirmed FOUR independent layers protect NE-AC11 (one call site; agents can't drive GUI lifecycle; any future bus path still hits the Rust `allow_agent_sysex_install` gate; macOS requires interactive approval). Strong in-code comment present; a CI/test grep guard is an optional future hardening |
+| 16, 17 | spec, security, quality | n/a | **PASS panel 2026-10-30** — all three PASS, no Critical/Important. NE-AC14/AC15 met at the code level; live `[Mac]` checks HELD to Task 18. The build-owner's singleton→`CoreHealthState.extensionController` weak handle was reviewed clean ("the right idiom… no cleaner approach worth the churn"); operator-only invariant confirmed (grep: no bus/MCP/Session/palette path to `start()`/`uninstall()`/the handle). | — |
+| 16, 17 | quality | Minor | `waitUntilConnected` duplicated its connected-check inside and after the loop | **FIXED (verified swift test green)** — single sample site (`for sample in 0...pollCount`, sleep only when `sample < pollCount`); same sample/sleep counts, no behaviour change |
+| 16, 17 | quality | Minor | `NEVPNStatus.invalid` folds into `.tunnelDisconnected`, so an externally-removed config can still read "Capture is on" | **documented + Task-18 carry-forward** — kept advisory to avoid a *sticky* degrade on a transient mid-replacement `.invalid`; code comment + a Task 18 live item to map `.invalid`→degrade if a real Mac never emits it transiently |
+| 16, 17 | quality | Minor | Two test gaps: `.capturing.applying(.tunnelConnected)` idempotency; `TunnelReconcilePolicy.pollCount` `max(1,…)` floor | **FIXED (verified)** — added `anAlreadyCapturingStateIsUnchangedByAnotherTunnelConnectedEvent` + `theConnectedCheckAlwaysSamplesAtLeastOnce` (318 tests green) |
+| 16, 17 | security | Minor | Deactivation continuation has no timeout; a dropped terminal callback would hang `uninstall()` with the activity assertion held | **accepted + Task-18 carry-forward** — `OSSystemExtensionRequest` delivers exactly one terminal callback and deactivation may itself wait on a human prompt (a blind timeout could fail a legitimate wait); code comment records the decision; revisit with a guarded timeout at Task 18 if deactivation proves never human-gated |
+| 16, 17 | security | Minor (info) | `removeSavedConfiguration` left `tunnelManager` non-nil on a mid-loop throw | **FIXED** — `tunnelManager = nil` up front (torn down regardless) |
+| 16, 17 | spec | Minor | `isTransient` leash-#58 classifier was pure logic but untested in app-target code | **FIXED (verified)** — hoisted the retry policy to `TunnelFailure` in AitmproxyKit with a table test; `ExtensionController` maps `NEVPNError.code`→`TunnelFailure` via a compiler-checked exhaustive switch |
+| 16, 17 | spec | Minor (info) | `build.sh` stamps `CFBundleVersion` at minute resolution; two builds in one minute would not trigger a replace | **accepted (out of range)** — `build.sh` is not a Task 16/17 file; a rebuild+reactivate cycle exceeds a minute. Note for the orchestrator: switch to `%Y%m%d%H%M%S` |
 
 ## Shipped
 

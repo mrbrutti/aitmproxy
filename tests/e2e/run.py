@@ -13,9 +13,13 @@ under a surface directory. A suite may tag itself in its first ~20 lines:
     # e2e: needs=obscura      -> informational (the suite itself SKIPs 77 if absent)
 
 Usage:
-    python3 tests/e2e/run.py [SURFACE ...] [--manual] [--list]
+    python3 tests/e2e/run.py [SURFACE ...] [--jobs N] [--build] [--manual] [--list]
 
   SURFACE   limit to these surface dirs (e.g. `web proxy`); default: all
+  --jobs N  run up to N suites at once (default 4, capped at 6). Each suite picks
+            its own free ports so parallel runs don't collide. --manual forces 1.
+  --build   cargo build -p aitm -p aitm-testtarget first (preflight). Without it,
+            a missing aitm is fatal and a missing aitm-testtarget-serve warns.
   --manual  include tier=manual suites and let them prompt the operator
   --list    list discovered suites and exit
 """
@@ -26,6 +30,7 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 E2E_DIR = os.path.dirname(os.path.abspath(__file__))
 SKIP_EXIT = 77
@@ -79,11 +84,79 @@ def discover(surfaces: list[str]) -> list[dict]:
     return suites
 
 
+def run_suite(suite: dict, child_env: dict) -> tuple:
+    """Run one suite as a subprocess; classify by exit code. Thread-safe (no shared
+    state): safe to call concurrently from the --jobs pool."""
+    label = f"{suite['surface']}/{suite['name']}"
+    t0 = time.time()
+    proc = subprocess.run(
+        suite["runner"], cwd=E2E_DIR, env=child_env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    dt = time.time() - t0
+    code = proc.returncode
+    if code == 0:
+        return ("pass", label, "", dt, proc.stdout)
+    if code == SKIP_EXIT:
+        return ("skip", label, _last_line(proc.stdout, "[SKIP]"), dt, proc.stdout)
+    return ("fail", label, f"exit {code}", dt, proc.stdout)
+
+
+def _repo_root() -> str:
+    return os.path.dirname(os.path.dirname(E2E_DIR))
+
+
+def preflight(build: bool) -> None:
+    """Ensure the binaries the suites need exist. `aitm` is required by every
+    suite; `aitm-testtarget-serve` only by ca/poc/findings/scripting, so a miss
+    there is a loud warning, not a hard stop. `--build` builds both first."""
+    repo = _repo_root()
+    aitm = os.environ.get("AITM_BIN") or os.path.join(repo, "target", "debug", "aitm")
+    tgt = (os.environ.get("AITM_TESTTARGET_BIN")
+           or os.path.join(repo, "target", "debug", "aitm-testtarget-serve"))
+    if build:
+        print("preflight: cargo build -p aitm -p aitm-testtarget ...", flush=True)
+        if subprocess.run(["cargo", "build", "-p", "aitm", "-p", "aitm-testtarget"],
+                          cwd=repo).returncode != 0:
+            print("FATAL: cargo build failed", flush=True)
+            sys.exit(1)
+    if not os.path.exists(aitm):
+        print(f"FATAL: aitm binary missing: {aitm}\n"
+              "  build it: cargo build -p aitm  (or pass --build, or set AITM_BIN)", flush=True)
+        sys.exit(1)
+    if not os.path.exists(tgt):
+        print(f"WARNING: aitm-testtarget-serve missing: {tgt}\n"
+              "  ca/poc/findings/scripting will FAIL without it — "
+              "build: cargo build -p aitm-testtarget  (or --build, or set AITM_TESTTARGET_BIN)",
+              flush=True)
+
+
 def main() -> int:
     args = sys.argv[1:]
     manual = "--manual" in args
     do_list = "--list" in args
-    surfaces = [a for a in args if not a.startswith("--")]
+    build = "--build" in args
+    jobs = 4
+    surfaces: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--jobs":
+            i += 1
+            if i < len(args):
+                try:
+                    jobs = int(args[i])
+                except ValueError:
+                    pass
+        elif a.startswith("--jobs="):
+            try:
+                jobs = int(a.split("=", 1)[1])
+            except ValueError:
+                pass
+        elif not a.startswith("--"):
+            surfaces.append(a)
+        i += 1
+    jobs = 1 if manual else max(1, min(jobs, 6))
 
     suites = discover(surfaces)
     if do_list:
@@ -96,37 +169,44 @@ def main() -> int:
         print("no e2e suites found (looked for test_*.py / *.sh under tests/e2e/<surface>/)")
         return 1
 
+    preflight(build)
+
     child_env = dict(os.environ)
     child_env["PYTHONPATH"] = E2E_DIR + os.pathsep + child_env.get("PYTHONPATH", "")
     if manual:
         child_env["AITM_E2E_MANUAL"] = "1"
 
-    results = []
+    results: list[tuple] = []
+    to_run = []
     for s in suites:
         label = f"{s['surface']}/{s['name']}"
         if s["tags"].get("tier") == "manual" and not manual:
             print(f"SKIP  {label}  (tier=manual; re-run with --manual)")
             results.append(("skip", label, "tier=manual"))
-            continue
-        print(f"RUN   {label} ...", flush=True)
-        t0 = time.time()
-        proc = subprocess.run(
-            s["runner"], cwd=E2E_DIR, env=child_env,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        )
-        dt = time.time() - t0
-        code = proc.returncode
-        if code == 0:
-            print(f"PASS  {label}  ({dt:.1f}s)")
-            results.append(("pass", label, ""))
-        elif code == SKIP_EXIT:
-            reason = _last_line(proc.stdout, "[SKIP]")
-            print(f"SKIP  {label}  ({reason})")
-            results.append(("skip", label, reason))
         else:
-            print(f"FAIL  {label}  (exit {code}, {dt:.1f}s)")
-            print(_indent(proc.stdout))
-            results.append(("fail", label, f"exit {code}"))
+            to_run.append(s)
+
+    def emit(r: tuple) -> None:
+        kind, label, why, dt, out = r
+        if kind == "pass":
+            print(f"PASS  {label}  ({dt:.1f}s)", flush=True)
+        elif kind == "skip":
+            print(f"SKIP  {label}  ({why})", flush=True)
+        else:
+            print(f"FAIL  {label}  (exit after {dt:.1f}s)", flush=True)
+            print(_indent(out), flush=True)
+        results.append((kind, label, why))
+
+    if jobs == 1:
+        for s in to_run:
+            print(f"RUN   {s['surface']}/{s['name']} ...", flush=True)
+            emit(run_suite(s, child_env))
+    else:
+        print(f"running {len(to_run)} suites, up to {jobs} at once ...", flush=True)
+        with ThreadPoolExecutor(max_workers=jobs) as ex:
+            futures = [ex.submit(run_suite, s, child_env) for s in to_run]
+            for fut in as_completed(futures):
+                emit(fut.result())
 
     npass = sum(1 for r in results if r[0] == "pass")
     nskip = sum(1 for r in results if r[0] == "skip")

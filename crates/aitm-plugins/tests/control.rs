@@ -147,6 +147,40 @@ fn proxy_status_reports_armed_capturing_paused_and_listening() {
     assert_eq!(field(&status, "address"), &Value::Null);
 }
 
+/// The web sidebar shows the core's version from here, so it must be the real build's version, not a
+/// number baked into a UI. `env!("CARGO_PKG_VERSION")` here is this crate's version, which is the
+/// workspace version (every crate sets `version.workspace = true`) and so the binary's.
+#[test]
+fn proxy_status_reports_the_workspace_crate_version() {
+    let reg = reg();
+    let store = MemFlowStore::new();
+    let guard = StdGuard::default();
+
+    let status = call(&reg, &store, &guard, None, "proxy.status");
+    assert_eq!(
+        field(&status, "version"),
+        &Value::Str(env!("CARGO_PKG_VERSION").into())
+    );
+    // Not an empty or placeholder string. Deliberately no semver-shape check: a pre-release such as
+    // `0.6.0-rc.1` or a build-metadata suffix is a legitimate version and must not break this test.
+    let Value::Str(v) = field(&status, "version") else {
+        panic!("version is a string");
+    };
+    assert!(!v.is_empty(), "version is empty");
+    assert!(
+        v.starts_with(|c: char| c.is_ascii_digit()),
+        "version should start with a digit: {v}"
+    );
+
+    // The schema documents it, so tools/list tells a client the key exists.
+    let schema = reg.command("proxy.status").expect("registered").schema();
+    assert!(
+        schema.description.contains("`version`"),
+        "schema should mention version: {}",
+        schema.description
+    );
+}
+
 #[test]
 fn pause_resume_marks_inserts_hidden() {
     let reg = reg();

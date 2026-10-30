@@ -124,14 +124,21 @@ struct BrowserPanel: View {
     private var page: some View {
         GeometryReader { proxy in
             let frame = state.current?.lastFrame.flatMap(PageFrame.init)
+            // Mat the page inside the well so the aspect-fit gutters read as a deliberate
+            // frame, not a broken/empty pane: a consistent inset, then a bordered, rounded page.
+            let matted = CGSize(width: max(proxy.size.width - Space.md * 2, 0),
+                                height: max(proxy.size.height - Space.md * 2, 0))
             ZStack(alignment: .topTrailing) {
                 Tok.Ground.page.color
                 if let frame {
-                    let fit = frame.fit(in: proxy.size)
+                    let fit = frame.fit(in: matted)
                     Image(nsImage: frame.image)
                         .resizable()
                         .interpolation(frame.pixelSize.width < 64 ? .none : .medium)
                         .frame(width: fit.size.width, height: fit.size.height)
+                        .clipShape(RoundedRectangle(cornerRadius: Tok.Radius.panel))
+                        .overlay(RoundedRectangle(cornerRadius: Tok.Radius.panel)
+                            .strokeBorder(Tok.Line.border.color, lineWidth: 1))
                         .contentShape(Rectangle())
                         .onTapGesture { location in
                             pageFocused = true
@@ -142,10 +149,13 @@ struct BrowserPanel: View {
                         .accessibilityAddTraits(.isImage)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
-                    // No frames yet: a grey block at a 16:10 size, so the first frame lands without a shift.
-                    let fit = PageFrame.placeholder(in: proxy.size)
-                    RoundedRectangle(cornerRadius: Tok.Radius.badge)
+                    // No frames yet: a placeholder at the default window aspect, framed like a
+                    // real page so the first frame lands without a visual jump.
+                    let fit = PageFrame.placeholder(in: matted)
+                    RoundedRectangle(cornerRadius: Tok.Radius.panel)
                         .fill(Tok.Ground.raised.color)
+                        .overlay(RoundedRectangle(cornerRadius: Tok.Radius.panel)
+                            .strokeBorder(Tok.Line.border.color, lineWidth: 1))
                         .frame(width: fit.size.width, height: fit.size.height)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }

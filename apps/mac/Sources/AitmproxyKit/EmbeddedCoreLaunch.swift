@@ -182,6 +182,10 @@ public enum EmbeddedCoreLaunch {
         /// lets an operator widen; agents stay gated). Distinct from `token`.
         public var operatorToken: String
         public var endpointFile: URL
+        /// When true, emit `upstream.ssl_insecure: true` so the proxy accepts any
+        /// upstream certificate (operator opt-in from Settings ▸ Proxy; a footgun
+        /// for reaching self-signed servers, never for untrusted networks).
+        public var sslInsecure: Bool
 
         public init(
             obscuraBinary: URL,
@@ -189,7 +193,8 @@ public enum EmbeddedCoreLaunch {
             browserProxyPort: UInt16,
             token: String,
             operatorToken: String,
-            endpointFile: URL
+            endpointFile: URL,
+            sslInsecure: Bool = false
         ) {
             self.obscuraBinary = obscuraBinary
             self.proxyPort = proxyPort
@@ -197,6 +202,7 @@ public enum EmbeddedCoreLaunch {
             self.token = token
             self.operatorToken = operatorToken
             self.endpointFile = endpointFile
+            self.sslInsecure = sslInsecure
         }
 
         /// The `config.yaml` body. The bus binds `port: 0` (ephemeral, so it
@@ -217,7 +223,7 @@ public enum EmbeddedCoreLaunch {
         public func yaml() throws -> String {
             let obscuraPath = try EmbeddedCoreLaunch.yamlDoubleQuoted(obscuraBinary.path)
             let endpointPath = try EmbeddedCoreLaunch.yamlDoubleQuoted(endpointFile.path)
-            return """
+            let base = """
             listen: "127.0.0.1:\(proxyPort)"
             mcp:
               transport:
@@ -232,6 +238,10 @@ public enum EmbeddedCoreLaunch {
                 binary: "\(obscuraPath)"
                 stop_timeout: \(EmbeddedCoreLaunch.obscuraStopTimeoutSeconds)
             """
+            // `ssl_insecure` is a top-level config key (sibling of `listen`); the core's
+            // `deny_unknown_fields` rejects any wrapper object, so it must stay unindented.
+            // Emitted only when the operator opts out of upstream TLS verification.
+            return sslInsecure ? base + "\nssl_insecure: true\n" : base
         }
     }
 

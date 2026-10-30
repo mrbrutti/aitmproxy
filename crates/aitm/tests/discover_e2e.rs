@@ -135,24 +135,29 @@ async fn scan_discover_end_to_end() {
     // the reactor via spawn_blocking while the multi-thread runtime turns the
     // browser futures.
     let client: Arc<dyn ProxyClient> = Arc::new(UnusedClient);
-    let result = tokio::task::spawn_blocking({
+    let scan = || {
         let store = store.clone();
         let guard = guard.clone();
         let driver = driver.clone();
         let target_url = target_url.clone();
-        move || {
-            let host = CommandHost::new(
-                store.as_ref(),
-                client.as_ref(),
-                guard.as_ref(),
-                Some(&*driver),
-            );
-            cmd.invoke(params(&[("target", Value::Str(target_url))]), &host)
+        let cmd = cmd.clone();
+        let client = client.clone();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let host = CommandHost::new(
+                    store.as_ref(),
+                    client.as_ref(),
+                    guard.as_ref(),
+                    Some(&*driver),
+                );
+                cmd.invoke(params(&[("target", Value::Str(target_url))]), &host)
+            })
+            .await
+            .expect("scan.discover task")
+            .expect("scan.discover succeeds")
         }
-    })
-    .await
-    .expect("scan.discover task")
-    .expect("scan.discover succeeds");
+    };
+    let result = scan().await;
 
     let Value::Object(result) = result else {
         panic!("scan.discover must return an object, got {result:?}");
@@ -193,4 +198,52 @@ async fn scan_discover_end_to_end() {
         has_query_q,
         "a query injection point named `q` must be discovered: {points:?}"
     );
+
+    // `/redirect?next=/` itself 302s to `/`; the redirecting URL must still be a
+    // reached endpoint, or the `next` parameter on it is never enumerated.
+    let has_query_next = points.iter().any(|p| {
+        let Value::Object(p) = p else { return false };
+        p.get("location") == Some(&Value::Str("query".into()))
+            && p.get("name") == Some(&Value::Str("next".into()))
+    });
+    assert!(
+        has_query_next,
+        "the redirector's `next` parameter must be discovered: {points:?}"
+    );
+
+    // A re-scan of the same site must return the same points, not those plus
+    // the previous scan's captures: the same `(location, name)` multiset, which
+    // also pins the count.
+    let Value::Object(rescan) = scan().await else {
+        panic!("scan.discover must return an object on a re-scan");
+    };
+    let Some(Value::Array(rescan_points)) = rescan.get("injection_points") else {
+        panic!("re-scan must carry an injection_points array: {rescan:?}");
+    };
+    assert_eq!(
+        point_keys(rescan_points),
+        point_keys(points),
+        "a re-scan of the same site must return the same injection points, not accumulate"
+    );
+}
+
+/// The `(location, name)` of every injection point, sorted, so two scans'
+/// outputs compare as multisets.
+fn point_keys(points: &[Value]) -> Vec<(String, String)> {
+    let mut keys: Vec<(String, String)> = points
+        .iter()
+        .map(|p| {
+            let Value::Object(p) = p else {
+                panic!("an injection point must be an object: {p:?}");
+            };
+            match (p.get("location"), p.get("name")) {
+                (Some(Value::Str(location)), Some(Value::Str(name))) => {
+                    (location.clone(), name.clone())
+                }
+                _ => panic!("an injection point must carry a location and a name: {p:?}"),
+            }
+        })
+        .collect();
+    keys.sort();
+    keys
 }

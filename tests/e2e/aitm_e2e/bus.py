@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import socket
+import time
 
 PROTOCOL_VERSION = "2025-06-18"
 
@@ -142,16 +143,53 @@ class BusClient:
         self.notifications.extend(got)
         return got
 
+    def wait_notification(self, method_contains: str, timeout: float = 6.0):
+        """Block up to `timeout` for a server-pushed notification whose `method`
+        contains `method_contains` (e.g. 'notifications/aitm/flow'). Returns the
+        message dict or None. Already-stashed notifications are checked first."""
+        for m in self.notifications:
+            if method_contains in (m.get("method") or ""):
+                return m
+        deadline = time.time() + timeout
+        found = None
+        while time.time() < deadline:
+            self._set_read_timeout(max(0.1, deadline - time.time()))
+            try:
+                m = self._recv()
+            except (socket.timeout, TimeoutError, OSError):
+                break
+            if m.get("id") is None and method_contains in (m.get("method") or ""):
+                found = m
+                break
+            self.notifications.append(m)
+        self._restore_read_timeout()
+        return found
+
     def _send(self, obj: dict) -> None:
-        assert self._sock
-        self._sock.sendall((json.dumps(obj) + "\n").encode("utf-8"))
+        self._write_line(json.dumps(obj))
 
     def _recv(self) -> dict:
+        return json.loads(self._read_line())
+
+    # --- transport primitives (overridden by WsBusClient for the /bus bridge) ---
+
+    def _write_line(self, text: str) -> None:
+        assert self._sock
+        self._sock.sendall((text + "\n").encode("utf-8"))
+
+    def _read_line(self) -> str:
         assert self._rfile
         line = self._rfile.readline()
         if not line:
             raise BusError("bus connection closed by the core")
-        return json.loads(line)
+        return line
+
+    def _set_read_timeout(self, seconds: float) -> None:
+        if self._sock:
+            self._sock.settimeout(seconds)
+
+    def _restore_read_timeout(self) -> None:
+        self._set_read_timeout(20)
 
     def close(self) -> None:
         try:

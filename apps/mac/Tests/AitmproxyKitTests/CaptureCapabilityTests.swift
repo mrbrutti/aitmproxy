@@ -50,6 +50,11 @@ import Testing
         #expect(CaptureCapability.pendingApproval.applying(.tunnelDisconnected) == .pendingApproval)
     }
 
+    @Test func anAlreadyCapturingStateIsUnchangedByAnotherTunnelConnectedEvent() {
+        // A repeated `.connected` observation while capturing is idempotent, not a reset.
+        #expect(CaptureCapability.capturing.applying(.tunnelConnected) == .capturing)
+    }
+
     @Test func aTunnelFailureAfterApprovalDegrades() {
         let state = CaptureCapability.approvedAttached
             .applying(.failed("Could not start the capture tunnel: permission denied"))
@@ -73,6 +78,112 @@ import Testing
         #expect(CaptureCapability.degraded("needs restart").degradedReason == "needs restart")
         #expect(CaptureCapability.capturing.degradedReason == nil)
         #expect(CaptureCapability.pendingApproval.degradedReason == nil)
+    }
+
+    // MARK: uninstall + indicator (Task 17, NE-AC15)
+
+    @Test func anUninstallLandsOnNotInstalledFromEveryState() {
+        let everyState: [CaptureCapability] = [
+            .extensionNotInstalled, .pendingApproval, .approvedAttached, .capturing,
+            .degraded("Could not start the capture tunnel: boom"),
+        ]
+        for state in everyState {
+            #expect(state.applying(.uninstalled) == .extensionNotInstalled)
+        }
+    }
+
+    @Test func anUninstalledExtensionIsNotResurrectedByALateTunnelEvent() {
+        // The tunnel observer can fire once more while the configuration is torn down.
+        let state = CaptureCapability.capturing.applying(.uninstalled)
+        #expect(state.applying(.tunnelConnected) == .extensionNotInstalled)
+        #expect(state.applying(.tunnelDisconnected) == .extensionNotInstalled)
+    }
+
+    @Test func theCaptureIndicatorIsOnOnlyWhileApprovedAndAttached() {
+        #expect(CaptureCapability.approvedAttached.isCaptureOn == true)
+        #expect(CaptureCapability.capturing.isCaptureOn == true)
+        #expect(CaptureCapability.extensionNotInstalled.isCaptureOn == false)
+        #expect(CaptureCapability.pendingApproval.isCaptureOn == false)
+        #expect(CaptureCapability.degraded("boom").isCaptureOn == false)
+    }
+
+    @Test func theIndicatorSectionShowsOnlyWhenThereIsAnExtensionToReportOn() {
+        #expect(CaptureCapability.extensionNotInstalled.isInstalledOrInstalling == false)
+        #expect(CaptureCapability.pendingApproval.isInstalledOrInstalling == true)
+        #expect(CaptureCapability.approvedAttached.isInstalledOrInstalling == true)
+        #expect(CaptureCapability.capturing.isInstalledOrInstalling == true)
+        #expect(CaptureCapability.degraded("boom").isInstalledOrInstalling == true)
+    }
+
+    @Test func uninstallIsOfferedOnceApprovedAndAlsoToCleanUpADegradedInstall() {
+        #expect(CaptureCapability.capturing.canUninstall == true)
+        #expect(CaptureCapability.approvedAttached.canUninstall == true)
+        #expect(CaptureCapability.degraded("activation failed").canUninstall == true)
+        // Nothing to remove yet, and an outstanding approval request is not removable.
+        #expect(CaptureCapability.extensionNotInstalled.canUninstall == false)
+        #expect(CaptureCapability.pendingApproval.canUninstall == false)
+    }
+
+    // MARK: tunnel reconcile policy (Task 16, NE-AC14)
+
+    @Test func aReplacedExtensionGetsASettleDelayAndAFreshInstallDoesNot() {
+        let policy = TunnelReconcilePolicy.standard
+        #expect(policy.settleDelay(afterReplacement: true) == .seconds(2))
+        #expect(policy.settleDelay(afterReplacement: false) == .zero)
+    }
+
+    @Test func backoffDoublesFromOneSecondAndStopsAtTheCap() {
+        let policy = TunnelReconcilePolicy.standard
+        #expect(policy.backoff(afterAttempt: 1) == .seconds(1))
+        #expect(policy.backoff(afterAttempt: 2) == .seconds(2))
+        #expect(policy.backoff(afterAttempt: 3) == .seconds(4))
+        #expect(policy.backoff(afterAttempt: 4) == .seconds(8))
+        #expect(policy.backoff(afterAttempt: 5) == .seconds(8))
+        #expect(policy.backoff(afterAttempt: 40) == .seconds(8))
+    }
+
+    @Test func aTransientFailureRetriesWithBackoffUntilTheAttemptsRunOut() {
+        let policy = TunnelReconcilePolicy.standard
+        #expect(policy.maxAttempts == 4)
+        #expect(policy.decision(afterFailedAttempt: 1, retryable: true) == .retry(after: .seconds(1)))
+        #expect(policy.decision(afterFailedAttempt: 2, retryable: true) == .retry(after: .seconds(2)))
+        #expect(policy.decision(afterFailedAttempt: 3, retryable: true) == .retry(after: .seconds(4)))
+        #expect(policy.decision(afterFailedAttempt: 4, retryable: true) == .giveUp)
+        #expect(policy.decision(afterFailedAttempt: 9, retryable: true) == .giveUp)
+    }
+
+    @Test func aPermanentFailureNeverRetries() {
+        // E.g. the operator refused the "Add Proxy Configurations" prompt: retrying would
+        // just re-prompt them.
+        #expect(TunnelReconcilePolicy.standard.decision(afterFailedAttempt: 1, retryable: false) == .giveUp)
+    }
+
+    @Test func theConnectedCheckPollsWithinItsWindow() {
+        let policy = TunnelReconcilePolicy.standard
+        #expect(policy.connectWindow == .seconds(6))
+        #expect(policy.pollInterval == .milliseconds(500))
+        #expect(policy.pollCount == 12)
+    }
+
+    @Test func theConnectedCheckAlwaysSamplesAtLeastOnce() {
+        // A window shorter than one poll interval must still sample once, never zero times.
+        let policy = TunnelReconcilePolicy(
+            settleAfterReplacement: .seconds(2),
+            maxAttempts: 4,
+            connectWindow: .milliseconds(100),
+            pollInterval: .seconds(1),
+            firstBackoff: .seconds(1),
+            maxBackoff: .seconds(8))
+        #expect(policy.pollCount == 1)
+    }
+
+    @Test func transientReconcileFailuresRetryAndPermanentOnesDoNot() {
+        // The retry policy ExtensionController maps each NEVPNError.code onto.
+        #expect(TunnelFailure.configurationDisabled.isTransient)
+        #expect(TunnelFailure.configurationStale.isTransient)
+        #expect(TunnelFailure.configurationUnknown.isTransient)
+        #expect(TunnelFailure.connectionFailed.isTransient)
+        #expect(!TunnelFailure.permanent.isTransient)
     }
 
     // MARK: embedded-extension gate

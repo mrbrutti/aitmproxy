@@ -1,5 +1,7 @@
-/* Scripts placeholder (§2.7 "Script editor", §3.8): the foundation's shape — list | editor |
-   console — as grey bars at real size (§2.8 loading rule), honest about what is not here yet. */
+/* The Scripts panel (§2.7 "Script editor", §3.8). Editorial: hairlines not boxes, mono on data only
+   (script names, hooks, paths, source, compile errors), one 12px gutter. No hue but the existing
+   critical pair on the error badge and error text. Left: the loaded scripts. Right: the new-script
+   editor over the console. Stacks under 720px. */
 .panel {
   display: flex;
   flex-direction: column;
@@ -7,7 +9,10 @@
   min-width: 0;
   background: var(--color-ground-surface);
   color: var(--color-text-primary);
+  container-type: inline-size;
 }
+
+/* Header line, the inspector summary strip's 40px. */
 .header {
   flex: none;
   height: var(--size-inspector-header);
@@ -28,43 +33,400 @@
 .count {
   font-size: var(--font-size-base);
   color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
 }
 .count::before {
   content: '·';
   margin-right: 8px;
   color: var(--color-text-tertiary);
 }
-.header .new {
-  margin-left: auto;
+
+.note,
+.notOffered,
+.empty,
+.quiet {
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-md);
+  line-height: 1.5;
 }
+.note {
+  flex: none;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--color-line-rule);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+}
+.notOffered {
+  max-width: 64ch;
+  padding: var(--space-6) var(--space-3);
+}
+.empty,
+.quiet {
+  padding: var(--space-4) var(--space-3);
+  max-width: 32ch;
+}
+
 .body {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: var(--size-sidebar) minmax(0, 1fr) minmax(200px, 0.6fr);
+  grid-template-columns: minmax(240px, var(--size-sidebar)) minmax(0, 1fr);
 }
 .list {
+  min-height: 0;
+  overflow: auto;
   border-right: 1px solid var(--color-line-border);
-  padding: var(--space-4) var(--space-3);
 }
-.empty {
-  max-width: 28ch;
-  font-size: var(--font-size-md);
-  line-height: 1.5;
+.work {
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+}
+@container (max-width: 720px) {
+  .body {
+    grid-template-columns: minmax(0, 1fr);
+    overflow: auto;
+  }
+  .list {
+    overflow: visible;
+    border-right: 0;
+    border-bottom: 1px solid var(--color-line-border);
+  }
+  .work {
+    overflow: visible;
+  }
+}
+
+.sectionTitle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: var(--size-column-header);
+  padding: 0 var(--space-3);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-regular);
+  color: var(--color-text-secondary);
+  border-bottom: 1px solid var(--color-line-border);
+}
+.sectionTitle h3,
+.groupTitle h4 {
+  margin: 0;
+  font: inherit;
+}
+.sectionTitle .n {
   color: var(--color-text-tertiary);
+  font-variant-numeric: tabular-nums;
 }
-.editor,
-.console {
-  padding: var(--space-4) var(--space-3);
+.sectionTitle .spacer {
+  margin-left: auto;
+}
+
+/* ---- List ---- */
+.rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 0 var(--space-3);
+  align-items: start;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--color-line-rule);
+}
+.name {
+  font: var(--font-weight-medium) var(--font-size-md) / 20px var(--font-data);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row[data-enabled='false'] .name {
+  color: var(--color-text-secondary);
+  font-weight: var(--font-weight-regular);
+}
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  margin-top: 2px;
+}
+.hook {
+  display: inline-flex;
+  align-items: center;
+  height: 16px;
+  padding: 0 6px;
+  border-radius: var(--radius-badge);
+  background: var(--color-ground-raised);
+  color: var(--color-text-secondary);
+  font: var(--font-size-xs) / 16px var(--font-data);
+}
+.api {
+  color: var(--color-text-tertiary);
+  font: var(--font-size-xs) var(--font-data);
+}
+.errBadge {
+  display: inline-flex;
+  align-items: center;
+  height: 16px;
+  padding: 0 6px;
+  border-radius: var(--radius-badge);
+  background: var(--color-severity-critical-bg);
+  color: var(--color-severity-critical-fg);
+  font: var(--font-weight-semibold) var(--font-size-xs) / 16px var(--font-data);
+  text-transform: uppercase;
+}
+
+/* The enable/disable switch: a flat track, the knob carries the state (position, not just colour). */
+.switch {
+  position: relative;
+  flex: none;
+  width: 26px;
+  height: 14px;
+  margin-top: 3px;
+  border-radius: var(--radius-pill);
+  background: var(--color-ground-active);
+  transition: background-color var(--motion-hover) ease;
+}
+.switch::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--color-text-tertiary);
+  transition:
+    transform var(--motion-hover) var(--motion-ease-out),
+    background-color var(--motion-hover) ease;
+}
+.switch[aria-checked='true'] {
+  background: var(--color-ground-inverse);
+}
+.switch[aria-checked='true']::after {
+  transform: translateX(12px);
+  background: var(--color-text-on-inverse);
+}
+.switch:focus-visible {
+  outline: 2px solid var(--color-line-focus);
+  outline-offset: 2px;
+}
+.switch:disabled,
+.switch[aria-disabled='true'],
+.guarded[aria-disabled='true'] {
+  opacity: 0.45;
+}
+
+/* A failed script.list: the core's text and a Retry, in place of the rows it could not read. */
+.listError {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-bottom: 1px solid var(--color-line-rule);
 }
+.listErrorTitle {
+  margin: 0;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-medium);
+}
+
+/* ---- Editor ---- */
+.editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-line-border);
+}
+.editor .heading {
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.label {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+}
+.input,
+.source {
+  width: 100%;
+  border: 1px solid var(--color-line-control);
+  border-radius: var(--radius-control);
+  background: var(--color-ground-surface);
+  color: var(--color-text-primary);
+  font: var(--font-size-md) var(--font-data);
+  caret-color: var(--color-accent-base);
+  transition: border-color var(--motion-hover) ease;
+}
+.input {
+  max-width: 360px;
+  height: var(--size-control);
+  padding: 0 8px;
+}
+.source {
+  min-height: 168px;
+  padding: var(--space-2);
+  line-height: var(--line-height-code);
+  tab-size: 2;
+  white-space: pre;
+  overflow: auto;
+  resize: vertical;
+}
+.input::placeholder,
+.source::placeholder {
+  color: var(--color-text-tertiary);
+}
+.input:focus-visible,
+.source:focus-visible {
+  outline: 2px solid var(--color-line-focus);
+  outline-offset: -1px;
+  border-color: transparent;
+}
+.input[aria-invalid='true'] {
+  border-color: var(--color-status-server-error);
+}
+.fieldError {
+  font-size: var(--font-size-sm);
+  line-height: 1.35;
+  color: var(--color-status-server-error);
+}
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* The result region: validate summary, save result, or the core's text verbatim. */
+.result {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-line-rule);
+  font-size: var(--font-size-md);
+}
+.result[data-empty='true'] {
+  gap: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+.verdict {
+  font-weight: var(--font-weight-semibold);
+}
+.fields {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px var(--space-4);
+  margin: 0;
+}
+.fields dt {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  line-height: 20px;
+}
+.fields dd {
+  margin: 0;
+  min-width: 0;
+  font: var(--font-size-md) / 20px var(--font-data);
+  overflow-wrap: anywhere;
+}
+.fields dd[data-none] {
+  color: var(--color-text-tertiary);
+}
+.restart {
+  font-size: var(--font-size-sm);
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+}
+.restart[data-required='true'] {
+  color: var(--color-text-primary);
+  font-weight: var(--font-weight-medium);
+}
+.pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: var(--font-size-sm) / var(--line-height-code) var(--font-data);
+  color: var(--color-status-server-error);
+}
+
+/* ---- Console ---- */
 .console {
-  border-left: 1px solid var(--color-line-border);
+  padding-bottom: var(--space-6);
 }
-.bar {
-  height: 13px;
-  border-radius: 3px;
-  background: var(--color-ground-raised);
+.consoleGroup {
+  padding: 0 var(--space-3);
+}
+.groupTitle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: var(--size-column-header);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  border-bottom: 1px solid var(--color-line-border);
+}
+.groupTitle .n {
+  color: var(--color-text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+.consoleGroup .quiet {
+  padding-left: 0;
+  padding-right: 0;
+}
+.errorItem,
+.finding {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--color-line-rule);
+}
+.errName {
+  font: var(--font-weight-medium) var(--font-size-md) / 20px var(--font-data);
+}
+.finding {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 2px var(--space-2);
+  align-items: baseline;
+}
+.findingName {
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-medium);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.when {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-tertiary);
+  white-space: nowrap;
+}
+.findingMeta {
+  grid-column: 2 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px var(--space-2);
+  font: var(--font-size-xs) var(--font-data);
+  color: var(--color-text-tertiary);
+}
+.findingDetail {
+  grid-column: 2 / -1;
+  font-size: var(--font-size-sm);
+  line-height: 1.4;
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+}
+.list ul,
+.consoleGroup ul,
+.consoleGroup ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
 }

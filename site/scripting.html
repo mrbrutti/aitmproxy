@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Rhai scripting — aitmproxy docs</title>
-<meta name="description" content="Reference for aitmproxy plugins written in Rhai: the capability model, the hooks, the flow API and a complete example.">
+<meta name="description" content="Reference for aitmproxy scripts written in Rhai: the sandbox and what gates it, the hooks, the flow API, a complete example and how to load a script.">
 <link rel="stylesheet" href="styles.css">
 <script>(function(d){var c=" js";try{if(!matchMedia("(prefers-reduced-motion: reduce)").matches&&!sessionStorage.getItem("aitm.intro")){c+=" intro-on";sessionStorage.setItem("aitm.intro","1");}}catch(e){}d.className+=c;})(document.documentElement);</script>
 </head>
@@ -61,6 +61,7 @@
           <li><a href="#flow">The flow API</a></li>
           <li><a href="#findings">Findings and halting</a></li>
           <li><a href="#example">Complete example</a></li>
+          <li><a href="#loading">Loading and managing</a></li>
         </ul>
       </div>
     </details>
@@ -68,103 +69,209 @@
 
   <article class="article">
     <h1 class="display">Rhai scripting</h1>
-    <p class="lead">A plugin is a small Rhai file with a capability header and one or more hooks. It sees every flow as it passes and can edit it, answer it, or record a finding. Rhai reads like a tidy scripting language; a plugin should fit on one screen.</p>
+    <p class="lead">A script is a small Rhai file that defines hooks, functions the proxy calls as each flow passes. A hook can edit the flow, answer it, pause it, or record a finding. Rhai reads like a tidy scripting language, and a script should fit on one screen.</p>
 
     <div class="prose">
-      <p>Plugins live in <code>~/.config/aitm/addons/</code> or anywhere you point <code>aitm addon load</code> at. They are loaded by hand, by the app, or by an assistant over MCP, and each load is an audited command like any other.</p>
+      <p>There is no install directory and no manifest. Point the proxy at a <code>.rhai</code> file with <code>--script</code>, list it under <code>scripts:</code> in the config, or keep it in the configured <code>rhai.scripts_dir</code>; <a href="#loading">Loading and managing</a> has the details. Scripts are read when the proxy starts, and an agent that is allowed to can add or replace one while it runs.</p>
 
       <h2 id="model">Capability model</h2>
-      <p>Plugins run inside a sandbox and start with nothing. A header comment declares what the plugin needs, and the host grants exactly that. Anything not declared is denied, and a plugin that asks for more than its hooks require is flagged when it loads.</p>
+      <p>A script starts with nothing, and it cannot ask for more: there is no capability header, and a script cannot grant itself anything. What it can reach is fixed by the engine and by a few switches in the config, all off by default. Every host call passes the same scope, rate and SSRF guards a built-in plugin does.</p>
       <table>
-        <thead><tr><th>Capability</th><th>Grants</th></tr></thead>
+        <thead><tr><th>Reach</th><th>What a script gets</th></tr></thead>
         <tbody>
-          <tr><td><code>flow.read</code></td><td>Read requests, responses and metadata of flows the plugin sees.</td></tr>
-          <tr><td><code>flow.write</code></td><td>Edit headers, body, URL and status; call <code>set_response</code>; arm interception.</td></tr>
-          <tr><td><code>findings</code></td><td>Record findings into the session.</td></tr>
-          <tr><td><code>ws</code></td><td>See and edit WebSocket frames; inject frames.</td></tr>
-          <tr><td><code>fs.read:&lt;path&gt;</code></td><td>Read files under one directory, for fixtures and wordlists. No write access exists.</td></tr>
-          <tr><td><code>state</code></td><td>A small per-plugin key–value store that survives between flows.</td></tr>
+          <tr><td>The language</td><td>Strings, numbers, arrays, maps, blobs and closures. No <code>import</code>, no <code>eval</code>, no clock, and <code>sleep</code> is refused. <code>print</code> and <code>debug</code> write to the log. The language has no file, shell, environment or socket access; the host calls below are the only way out.</td></tr>
+          <tr><td>The flow in the hook</td><td>A snapshot of the flow being dispatched: read it, edit it, answer it, pause it or kill it. Edits are applied only if the hook finishes without an error.</td></tr>
+          <tr><td><code>finding</code>, <code>log</code>, <code>option</code></td><td>Always available. <code>finding</code> and <code>log</code> only report; <code>option</code> reads the options set for this script.</td></tr>
+          <tr><td><code>http.send</code></td><td>Sent through the proxy's own client, and refused unless the host is in scope. Rate-limited; the exchange is captured as a flow. <code>http</code> and <code>https</code> URLs only.</td></tr>
+          <tr><td><code>browser.*</code></td><td>Needs the embedded browser. <code>navigate</code> is checked against scope and the SSRF policy, like the <code>browser.navigate</code> command. Refused inside a flow hook, because the browser's own traffic passes through the chain that hook is holding; use it from a script command or a PoC <code>script</code> step.</td></tr>
+          <tr><td><code>store.get</code>, <code>store.query</code></td><td>Read-only access to captured flows.</td></tr>
+          <tr><td><code>scope.list</code>, <code>scope.add</code></td><td><code>scope.list</code> reads. <code>scope.add</code> is refused unless the config sets <code>rhai.allow_scope_add</code>, and it never works from a PoC step. Every call is logged at warn level with the script's name.</td></tr>
+          <tr><td>Helpers</td><td>Encoding, hashing, random and regex functions. They are pure functions of their arguments and touch nothing outside the engine, so nothing gates them.</td></tr>
+          <tr><td><code>l4.*</code></td><td>Present only when the L4 module is enabled. Its calls pass L4's own scope and per-capability agent gates, and a script loaded from a file counts as agent-authored for them.</td></tr>
         </tbody>
       </table>
-      <p>There is no network capability, no shell capability and no path outside the declared directory. Time is available; the clock is not writable. The same guards apply whether a plugin was loaded by a person or by an agent, and the model is designed to grow as new protocols are added without loosening the default.</p>
+      <p>Each hook gets two seconds of wall-clock time and 64,000 operations; one <code>browser.*</code> call gets thirty seconds of its own. Strings and blobs are capped at 10 MiB, the default body cap, maps at 16,384 entries, and call depth at 64. A hook that runs over, throws, or is refused by a guard is aborted: its edits are discarded and the flow carries on unchanged. A refused host call raises a catchable error that carries <code>capability</code>, <code>host</code> and <code>reason</code>.</p>
+      <p>The switches live under <code>rhai:</code> in the config file.</p>
+      <ul>
+        <li><code>allow_scope_add</code>: scripts may call <code>scope.add</code>. Off by default, because widening scope also lifts the SSRF block for the host named.</li>
+        <li><code>scripts_dir</code>: the one directory <code>script.save</code> may write <code>&lt;name&gt;.rhai</code> into. Unset, <code>script.save</code> is refused. Its <code>*.rhai</code> files also load at startup.</li>
+        <li><code>allow_agent_authoring</code>: an agent over MCP may run <code>script.save</code>, <code>script.reload</code>, <code>script.enable</code> and <code>script.disable</code>. Off by default. The human CLI and an operator-token connection are not gated by it.</li>
+        <li><code>strict</code>: a script that fails to compile stops startup. By default it is skipped and the error is logged.</li>
+        <li><code>hook_timeout</code> and <code>browser_timeout</code> (seconds), <code>max_operations</code>, <code>max_string_size</code>, <code>max_array_size</code>, <code>max_map_size</code>, <code>max_call_levels</code>, <code>max_expr_depth</code>, <code>max_function_expr_depth</code> and <code>max_modules</code>: the limits above.</li>
+      </ul>
+      <p>The model is built to grow. A new protocol adds its own namespace, as L4 does, behind the same deny-by-default guards and without a change to the language. A script may name itself and pin the API version it was written for; one that declares an older version than a namespace needs is not loaded. Both constants are read without running the script, so both must be literal strings. <code>NAME</code> also identifies the script in <code>script.list</code>, in <code>script.reload</code> and as the source of its findings.</p>
       <figure class="code" data-reveal>
-        <figcaption><span>addons/header.rhai</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="c">//! name: guard-admin-writes</span>
-<span class="c">//! capabilities: flow.read, flow.write, findings</span>
-<span class="c">//! description: Block unauthenticated writes under /admin and record each one.</span></code></pre>
+        <figcaption><span>script header</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="k">const</span> NAME = <span class="s">"guard-admin-writes"</span>;  <span class="c">// optional; defaults to the file name</span>
+<span class="k">const</span> API  = <span class="s">"1"</span>;                   <span class="c">// the only version; leaving it out logs a warning</span></code></pre>
       </figure>
 
       <h2 id="hooks">Hooks</h2>
-      <p>A hook is a top-level function with a well-known name. Define only the ones you need. Hooks run in flow order, one plugin after another in load order, and a hook that returns <code>halt()</code> stops the chain for that flow.</p>
+      <p>A hook is a top-level function with one of the names below, and these are the only hooks. Define the ones you need. A misspelled <code>on_&hellip;</code> name or the wrong number of arguments is not an error, but the loader warns about it and <code>aitm script validate</code> prints the warning.</p>
+      <p>Scripts run after the built-in plugins, so a script sees a flow once Map rules have rewritten it. They run in the order they were loaded: <code>scripts:</code> entries first, then <code>scripts_dir</code> files by name, then <code>--script</code> flags. A hook that calls <code>halt()</code> stops the remaining scripts and plugins for that event.</p>
       <div class="api" data-reveal>
-        <div><div class="sig">on_request(flow)<small>flow.read</small></div><div>Called when the request headers and body have been read, before the request is sent upstream. Edits here reach the server.</div></div>
-        <div><div class="sig">on_response(flow)<small>flow.read</small></div><div>Called when the response has been read, before it is sent to the client. Edits here reach the client.</div></div>
-        <div><div class="sig">on_ws_message(flow, msg)<small>ws</small></div><div>Called for each WebSocket frame in either direction. <code>msg.direction</code> is <code>"client"</code> or <code>"server"</code>; <code>msg.text</code> or <code>msg.bytes</code> is editable.</div></div>
-        <div><div class="sig">on_intercept(flow)<small>flow.read</small></div><div>Called when a flow becomes <em>armed</em> by a rule or by hand. Useful for tagging or for deciding to resume automatically.</div></div>
-        <div><div class="sig">on_flow_end(flow)<small>flow.read</small></div><div>Called when the flow is complete, dropped or errored. Read-only; good for metrics and findings that need the whole exchange.</div></div>
-        <div><div class="sig">on_load() / on_unload()<small>none</small></div><div>Plugin lifecycle. Initialise or persist <code>state</code> here.</div></div>
+        <div><div class="sig">load(reg)<small>once, at startup</small></div><div>Called once when the proxy starts, with the registration handle. Register commands with <code>reg.add_command(name, help, |args| &hellip;)</code> and options with <code>reg.add_option(name, default, help)</code>. A script added later with <code>script.save</code> never gets <code>load</code> run, so its commands and options appear after a restart; its other hooks run at once.</div></div>
+        <div><div class="sig">configure()<small>not called today</small></div><div>The loader accepts the name and the catalog lists it, but nothing in the engine calls it yet. Do not rely on it.</div></div>
+        <div><div class="sig">on_request_headers(flow)<small>HTTP</small></div><div>The request headers are parsed; the body has not been read.</div></div>
+        <div><div class="sig">on_request(flow)<small>HTTP</small></div><div>The whole request is available, before it goes upstream. Edits here reach the server, and <code>flow.set_response(&hellip;)</code> answers the client and skips upstream. Most scripts live here.</div></div>
+        <div><div class="sig">on_response_headers(flow)<small>HTTP</small></div><div>The response headers are parsed; the body has not been read.</div></div>
+        <div><div class="sig">on_response(flow)<small>HTTP</small></div><div>The whole response is available, before it goes to the client. Edits here reach the client.</div></div>
+        <div><div class="sig">on_ws_start(flow)<small>WebSocket</small></div><div>A WebSocket connection was established.</div></div>
+        <div><div class="sig">on_ws_message(flow, msg)<small>WebSocket</small></div><div>Called for each frame, in either direction. <code>msg.direction</code> is <code>"c2s"</code> or <code>"s2c"</code>; replace the payload with <code>msg.set_text</code> or <code>msg.set_bytes</code>, or call <code>msg.drop()</code> to stop the frame being forwarded.</div></div>
+        <div><div class="sig">on_ws_end(flow)<small>WebSocket</small></div><div>The WebSocket connection closed.</div></div>
+        <div><div class="sig">on_error(flow, err)<small>any flow</small></div><div>A flow-level error. <code>err</code> is the error text. A failure inside <code>on_error</code> is logged and nothing more, so it cannot feed itself.</div></div>
       </div>
+      <p>A hook works on a snapshot of the flow. Field edits, and calls such as <code>set_response</code>, <code>intercept</code> and <code>kill</code>, are applied when the hook returns, in the order you made them. If the hook throws, times out or runs out of operations, none of it is applied: the flow carries on exactly as it was, the error is logged and published on the bus as a flow error, <code>script.list</code> shows it as <code>last_error</code>, and the next script still runs.</p>
 
       <h2 id="flow">The flow API</h2>
-      <p>Every hook receives a <code>flow</code>. Reading never needs more than <code>flow.read</code>; each mutating call is listed with the capability it needs.</p>
+      <p>Every hook receives a <code>flow</code>. A read with an obvious empty answer, such as a missing header or the response in <code>on_request</code>, returns an empty value instead of failing. A write that cannot work fails with the fix in the message.</p>
+
+      <h3>The flow</h3>
       <div class="api" data-reveal>
-        <div><div class="sig">flow.id<small>int</small></div><div>The flow number shown everywhere else in the tool, so a finding and a UI row match.</div></div>
-        <div><div class="sig">flow.state<small>string</small></div><div><code>"observed"</code>, <code>"intercepted"</code>, <code>"resumed"</code> or <code>"dropped"</code>.</div></div>
-        <div><div class="sig">flow.request<small>object</small></div><div><code>.method</code>, <code>.url</code>, <code>.host</code>, <code>.path</code>, <code>.query</code> (map), <code>.headers</code>, <code>.body</code> (string or bytes), <code>.json()</code> parsed on demand.</div></div>
-        <div><div class="sig">flow.response<small>object, may be ()</small></div><div><code>.status</code>, <code>.headers</code>, <code>.body</code>, <code>.json()</code>. Empty in <code>on_request</code>.</div></div>
-        <div><div class="sig">headers.has(name) / get(name) / set(name, value) / remove(name)<small>flow.write to set or remove</small></div><div>Case-insensitive. <code>set</code> replaces all existing values.</div></div>
-        <div><div class="sig">flow.set_response(status, headers, body)<small>flow.write</small></div><div>Answer the client without going upstream. Usually followed by <code>return halt()</code>.</div></div>
-        <div><div class="sig">flow.intercept {}<small>flow.write</small></div><div>Arm this flow. It will pause as if a rule had matched, for a person or an agent to deal with.</div></div>
-        <div><div class="sig">flow.tag(name)<small>flow.write</small></div><div>Attach a tag visible in every UI and filterable with <code>tag:name</code>.</div></div>
-        <div><div class="sig">flow.tls<small>object</small></div><div><code>.sni</code>, <code>.version</code>, <code>.passthrough</code> (bool). Read-only.</div></div>
-        <div><div class="sig">state.get(key) / state.set(key, value)<small>state</small></div><div>Per-plugin storage that survives between flows and restarts.</div></div>
+        <div><div class="sig">flow.id<small>string</small></div><div>The flow's id, as the rest of the tool prints it. Pass it to <code>finding</code> as <code>flow_id</code>.</div></div>
+        <div><div class="sig">flow.kind<small>"http" or "ws"</small></div><div>Whether this is an HTTP or a WebSocket flow.</div></div>
+        <div><div class="sig">flow.is_replay<small>bool</small></div><div>True when this flow is a replay.</div></div>
+        <div><div class="sig">flow.marks<small>array</small></div><div>The marks on the flow. <code>flow.mark(tag)</code> adds one, once.</div></div>
+        <div><div class="sig">flow.comment<small>string, settable</small></div><div>The operator's comment on the flow.</div></div>
+        <div><div class="sig">flow.request<small>object</small></div><div>The request side. On a WebSocket flow it reads as empty and writes fail.</div></div>
+        <div><div class="sig">flow.response<small>object</small></div><div>The response side. It reads as empty in <code>on_request</code> and <code>on_request_headers</code>, and writing to it before a response exists is an error: answer with <code>flow.set_response</code> instead.</div></div>
+      </div>
+
+      <h3>Request and response</h3>
+      <div class="api" data-reveal>
+        <div><div class="sig">request.method<small>string, settable</small></div><div>Must be an HTTP token such as <code>GET</code>.</div></div>
+        <div><div class="sig">request.url<small>string, settable</small></div><div><code>scheme://authority/path?query</code>. A new value may change the path and query only; changing the host is refused. Reach another host with <code>http.send</code>.</div></div>
+        <div><div class="sig">request.path<small>string, settable</small></div><div>The path without the query. A space or control character is refused; percent-encode it.</div></div>
+        <div><div class="sig">request.query<small>map-like</small></div><div><code>get</code>, <code>set</code>, <code>remove</code>, <code>has</code> and <code>keys</code>, or <code>query["name"]</code>. Keys match exactly.</div></div>
+        <div><div class="sig">request.headers<br>response.headers<small>map-like</small></div><div><code>get(k)</code> returns an empty string when the header is absent. <code>set(k, v)</code> changes an existing header or adds one. Also <code>remove(k)</code>, <code>has(k)</code>, <code>keys()</code> and <code>headers["Name"]</code>. Names match case-insensitively, and a name or value with a control character is refused.</div></div>
+        <div><div class="sig">request.body<br>response.body<small>string, settable</small></div><div>The body as text. A binary body reads as lossy UTF-8; use <code>bytes</code> for the raw data.</div></div>
+        <div><div class="sig">request.bytes<br>response.bytes<small>blob, settable</small></div><div>The body as raw bytes.</div></div>
+        <div><div class="sig">request.set_json(map)<small>method</small></div><div>Set the body to the JSON encoding of the map, and <code>Content-Type</code> to <code>application/json</code>.</div></div>
+        <div><div class="sig">response.status<small>int, settable</small></div><div>The response status code.</div></div>
+      </div>
+      <p>A script sees a body up to the proxy's body cap, <code>limits.max_body_bytes</code>; a body that was streamed rather than buffered reads as empty.</p>
+
+      <h3>Controlling the flow</h3>
+      <div class="api" data-reveal>
+        <div><div class="sig">flow.set_response(status, headers, body)<small>method</small></div><div>Answer the client with this response and skip upstream. <code>headers</code> is a map and <code>body</code> a string. Use it in <code>on_request</code>, often followed by <code>halt()</code> so later scripts leave the flow alone.</div></div>
+        <div><div class="sig">flow.intercept()<small>method</small></div><div>Pause this flow, as an intercept rule would, for a person or an agent to resume, mutate or kill.</div></div>
+        <div><div class="sig">flow.resume()<br>flow.kill()<small>method</small></div><div>Resume a paused flow, or kill it so the client sees a closed connection.</div></div>
+        <div><div class="sig">flow.backup()<br>flow.revert()<small>method</small></div><div>Snapshot the flow so it can be reverted; restore the flow to its last backup.</div></div>
+      </div>
+
+      <h3>WebSocket frames</h3>
+      <p>The <code>msg</code> argument of <code>on_ws_message</code>.</p>
+      <div class="api" data-reveal>
+        <div><div class="sig">msg.direction<small>"c2s" or "s2c"</small></div><div>Client to server, or server to client.</div></div>
+        <div><div class="sig">msg.opcode<small>string</small></div><div><code>"text"</code>, <code>"binary"</code>, <code>"ping"</code>, <code>"pong"</code> or <code>"close"</code>.</div></div>
+        <div><div class="sig">msg.text<small>string, settable</small></div><div>The payload as text.</div></div>
+        <div><div class="sig">msg.data<small>blob</small></div><div>The payload as bytes.</div></div>
+        <div><div class="sig">msg.set_text(s)<br>msg.set_bytes(b)<small>method</small></div><div>Replace the payload.</div></div>
+        <div><div class="sig">msg.drop()<small>method</small></div><div>Do not forward this frame.</div></div>
+      </div>
+
+      <h3>Host functions</h3>
+      <div class="api" data-reveal>
+        <div><div class="sig">log(msg)<br>log.info(msg)<br>log.warn(msg)<br>log.error(msg)<small>log</small></div><div>Write to the script log. <code>log(msg)</code> is the same as <code>log.info</code>.</div></div>
+        <div><div class="sig">option(name)<small>value</small></div><div>One of this script's options: the default from <code>reg.add_option</code>, overridden by <code>options:</code> on its <code>scripts:</code> entry. An option that is not set reads as <code>()</code>.</div></div>
+        <div><div class="sig">finding(map)<br>halt()<small>see below</small></div><div>Record a finding; stop the chain for this event.</div></div>
+        <div><div class="sig">http.send(#{ method, url, headers, body })<small>&rarr; #{ status, headers, body, flow_id }</small></div><div>Send a request through the proxy's client. <code>url</code> is required and <code>method</code> defaults to <code>GET</code>. A refused host raises a catchable error.</div></div>
+        <div><div class="sig">store.get(id)<br>store.query(#{ &hellip; })<small>flow maps</small></div><div><code>get</code> returns one flow, or <code>()</code> if it is not stored. <code>query</code> takes any of <code>host</code>, <code>method</code>, <code>status</code>, <code>kind</code> and <code>is_replay</code> and returns an array. A flow map has <code>id</code>, <code>kind</code>, <code>is_replay</code>, <code>marks</code>, <code>request</code> and <code>response</code>.</div></div>
+        <div><div class="sig">scope.list()<br>scope.add(host)<small>gated</small></div><div>The hosts in scope; add one. <code>scope.add</code> needs <code>rhai.allow_scope_add</code>.</div></div>
+        <div><div class="sig">browser.navigate(url)<br>browser.click(selector)<br>browser.type_text(selector, text)<br>browser.screenshot()<br>browser.evaluate(expr)<br>browser.get_dom()<small>not inside a flow hook</small></div><div>Drive the embedded browser. <code>screenshot</code> returns PNG bytes. In a script the names are <code>type_text</code> and <code>evaluate</code> because <code>type</code> and <code>eval</code> are reserved words in Rhai; the commands are still <code>browser.type</code> and <code>browser.eval</code>.</div></div>
+        <div><div class="sig">b64_encode(s)<br>b64_decode(s)<br>url_encode(s)<br>hex_encode(s)<br>sha256(s)<br>md5(s)<small>encoding and hashing</small></div><div>Strings in, strings out; digests are lowercase hex. <code>b64_decode</code> raises an error on invalid base64 or bytes that are not UTF-8. <code>md5</code> is there because targets still use it, not as a security primitive.</div></div>
+        <div><div class="sig">rand_text_alpha(n)<br>rand_int(a, b)<br>regex_match(pat, s)<br>regex_extract(pat, s, group)<small>random and regex</small></div><div>Random values are not cryptographic. <code>regex_extract</code> returns an empty string when nothing matches; an invalid pattern raises an error.</div></div>
+        <div><div class="sig">ok(resp)<br>contains_ci(hay, needle)<br>json(map)<small>prelude</small></div><div><code>ok</code> is true for a 2xx <code>status</code>, on an <code>http.send</code> result or a <code>flow.response</code>. <code>contains_ci</code> is a case-insensitive substring test. <code>json</code> is the JSON text of a map.</div></div>
       </div>
 
       <h2 id="findings">Findings and halting</h2>
-      <p>A finding is a structured note attached to the session and, optionally, to a flow. Findings show up in the app, in <code>aitm findings list</code>, and in a saved session or <a href="poc.html">PoC</a>. <code>halt()</code> ends processing of the current flow by later plugins; it does not drop the flow unless you also answered it.</p>
+      <p>A finding is a structured note recorded with <code>finding(...)</code>. Findings are held in memory for the current run, the newest 10,000, and read back with <code>script.findings</code>; nothing is written to disk. The persistent store, <code>findings.list</code>, <code>findings.get</code> and <code>findings.record</code>, is separate, and <code>finding(...)</code> does not write to it. To keep a finding, record it there.</p>
       <figure class="code" data-reveal>
-        <figcaption><span>finding(…)</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+        <figcaption><span>finding(&hellip;)</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
 <pre><code>finding(#{
-    name: <span class="s">"a short, specific title"</span>,       <span class="c">// required</span>
-    severity: <span class="s">"info|low|medium|high"</span>,     <span class="c">// required</span>
-    flow_id: flow.id,                        <span class="c">// optional, links the finding to a row</span>
-    tags: [<span class="s">"access-control"</span>],               <span class="c">// optional</span>
-    note: <span class="s">"anything a reader will thank you for"</span>
+    name: <span class="s">"a short, specific title"</span>,                 <span class="c">// required</span>
+    severity: <span class="s">"info|low|medium|high|critical"</span>,       <span class="c">// required</span>
+    flow_id: flow.id,                                <span class="c">// optional, links the finding to a flow</span>
+    detail: <span class="s">"anything a reader will thank you for"</span>,  <span class="c">// optional</span>
+    tags: [<span class="s">"access-control"</span>]                         <span class="c">// optional, an array of strings</span>
 });</code></pre>
       </figure>
+      <p>A field it does not know is refused with a message that lists the valid ones, and so is an unknown severity. <code>halt()</code> ends processing of the current event by later scripts and later plugins. It does not answer, pause or drop the flow: do that with <code>set_response</code>, <code>intercept</code> or <code>kill</code>. Only the call counts. A hook's return value is ignored, so the way to continue is to not call <code>halt()</code>.</p>
 
       <h2 id="example">Complete example</h2>
-      <p>This plugin blocks any non-<code>GET</code> request under <code>/admin</code> that arrives without an <code>X-Admin-Token</code> header, answers the client with a plain <code>403</code>, records a medium finding tied to the flow, and stops. Authenticated admin writes are marked with a header and continue.</p>
+      <p>This script lets a non-<code>GET</code> request under <code>/admin</code> through only if it carries an <code>X-Admin-Token</code> header, and marks the ones that do. Any other write is answered with a plain <code>403</code> without going upstream, recorded as a medium finding tied to the flow, and the chain stops.</p>
       <figure class="code" data-reveal>
-        <figcaption><span>addons/guard-admin-writes.rhai</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="c">// addons/guard-admin-writes.rhai</span>
+        <figcaption><span>guard-admin-writes.rhai</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="k">const</span> NAME = <span class="s">"guard-admin-writes"</span>;
+<span class="k">const</span> API = <span class="s">"1"</span>;
+
+<span class="c">// Block unauthenticated writes under /admin, record each one, and stop.</span>
 <span class="k">fn</span> <span class="f">on_request</span>(flow) {
     <span class="k">let</span> req = flow.request;
-    <span class="k">if</span> req.path.starts_with(<span class="s">"/admin"</span>) &amp;&amp; req.method != <span class="s">"GET"</span> {
-        <span class="k">if</span> !req.headers.has(<span class="s">"X-Admin-Token"</span>) {
-            flow.set_response(<span class="n">403</span>, #{ <span class="s">"Content-Type"</span>: <span class="s">"text/plain"</span> }, <span class="s">"blocked by aitm"</span>);
-            finding(#{ name: <span class="s">"unauthenticated admin write blocked"</span>, severity: <span class="s">"medium"</span>,
-                       flow_id: flow.id, tags: [<span class="s">"access-control"</span>] });
-            <span class="k">return</span> halt();
-        }
-        req.headers.set(<span class="s">"X-Reviewed"</span>, <span class="s">"aitm"</span>);
+    <span class="k">if</span> req.method == <span class="s">"GET"</span> || !req.path.starts_with(<span class="s">"/admin"</span>) {
+        <span class="k">return</span>;
     }
+    <span class="k">if</span> req.headers.has(<span class="s">"X-Admin-Token"</span>) {
+        flow.mark(<span class="s">"admin-write"</span>);
+        <span class="k">return</span>;
+    }
+    flow.set_response(<span class="n">403</span>, #{ <span class="s">"Content-Type"</span>: <span class="s">"text/plain"</span> }, <span class="s">"blocked by aitm"</span>);
+    finding(#{
+        name: <span class="s">"unauthenticated admin write blocked"</span>,
+        severity: <span class="s">"medium"</span>,
+        flow_id: flow.id,
+        detail: req.method + <span class="s">" "</span> + req.path + <span class="s">" had no X-Admin-Token"</span>,
+        tags: [<span class="s">"access-control"</span>]
+    });
+    halt();
 }</code></pre>
       </figure>
-      <p>Load it, by hand or by agent, and watch it work:</p>
-      <div class="pair">
-        <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm addon load ./addons/guard-admin-writes.rhai</code></div>
-        <div class="pair-row"><span class="pair-who">agent</span><code>addon.load({ path: <span class="s">"./addons/guard-admin-writes.rhai"</span> })</code></div>
-      </div>
+      <p>Check that it compiles before you load it. <code>aitm script validate</code> compiles the file in the same sandbox and registers nothing. If something is wrong it prints the line, the column and the fix.</p>
       <figure class="code term">
-        <figcaption><span>zsh — aitm</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="pr">$ </span><span class="in">aitm addon load ./addons/guard-admin-writes.rhai</span>
-<span class="out">loaded guard-admin-writes  capabilities: flow.read, flow.write, findings</span>
-<span class="pr">$ </span><span class="in">curl -x 127.0.0.1:8080 -X POST https://shop.example.com/admin/users</span>
-<span class="out">blocked by aitm</span>
-<span class="pr">$ </span><span class="in">aitm findings list --last 1</span>
-<span class="out">#38  medium  unauthenticated admin write blocked  access-control  guard-admin-writes</span></code></pre>
+        <figcaption><span>zsh &mdash; aitm</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="pr">$ </span><span class="in">aitm script validate --path ./guard-admin-writes.rhai</span>
+<span class="out">{
+  "api": "1",
+  "hooks": [
+    "on_request"
+  ],
+  "name": "guard-admin-writes",
+  "path": "./guard-admin-writes.rhai",
+  "registers": {
+    "commands": [],
+    "options": []
+  }
+}</span></code></pre>
       </figure>
+
+      <h2 id="loading">Loading and managing</h2>
+      <p>A script loads at startup three ways: with <code>--script &lt;path&gt;</code> on <code>aitm</code>, <code>aitm web</code> or <code>aitm tui</code>, repeated for more than one; from <code>scripts:</code> in the config file; or from the <code>*.rhai</code> files in <code>rhai.scripts_dir</code>. An agent can also add one while the proxy runs.</p>
+      <div class="pair">
+        <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm web --script ./guard-admin-writes.rhai</code></div>
+        <div class="pair-row is-agent"><span class="pair-who">agent</span><code>script.save({ name: <span class="s">"guard-admin-writes"</span>, source: <span class="s">"&hellip;"</span> })</code></div>
+      </div>
+      <p><code>script.save</code> checks that the source compiles, writes <code>&lt;scripts_dir&gt;/&lt;name&gt;.rhai</code> and puts the script into the running chain, so its hooks fire on the next event with no restart. The name may use letters, digits, <code>_</code> and <code>-</code>. An optional <code>enable: false</code> saves it switched off. The reply carries <code>restart_required</code>, which is true only when the script registers commands or options. An agent can do this only when <code>rhai.scripts_dir</code> is set and <code>rhai.allow_agent_authoring</code> is true, and under the <code>ask</code> policy each call waits for approval. Its calls land in the audit log like any other.</p>
+      <figure class="code" data-reveal>
+        <figcaption><span>config.yaml</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="yk">scripts:</span>
+  <span class="p">-</span> <span class="yk">path:</span> <span class="yv">./guard-admin-writes.rhai</span>
+    <span class="yk">enabled:</span> <span class="yv">true</span>
+<span class="yk">rhai:</span>
+  <span class="yk">scripts_dir:</span> <span class="yv">./scripts</span>        <span class="c"># where script.save writes; its files load at startup</span>
+  <span class="yk">allow_agent_authoring:</span> <span class="yv">false</span>  <span class="c"># let an agent run script.save and friends</span>
+  <span class="yk">allow_scope_add:</span> <span class="yv">false</span>        <span class="c"># let scripts call scope.add</span>
+  <span class="yk">strict:</span> <span class="yv">false</span>                 <span class="c"># a script that fails to compile stops startup</span></code></pre>
+      </figure>
+      <p>An entry under <code>scripts:</code> may also carry <code>options:</code>, which the script reads with <code>option(name)</code>. Relative paths are taken from the directory you start <code>aitm</code> in.</p>
+      <div class="api" data-reveal>
+        <div><div class="sig">script.list<small>read</small></div><div>The loaded scripts in chain order: <code>name</code>, <code>path</code>, <code>api</code>, <code>hooks</code>, <code>enabled</code> and <code>last_error</code>.</div></div>
+        <div><div class="sig">script.validate { path | source }<small>read</small></div><div>Compile a file, or script text given inline, without loading it. Reports the name, API, hooks and the commands and options <code>load</code> registers, or the positioned compile error. From an agent, a <code>path</code> must be a <code>.rhai</code> file inside the configured scripts or PoC directory.</div></div>
+        <div><div class="sig">script.save { name, source, enable? }<small>sensitive</small></div><div>Compile, write and load, as above.</div></div>
+        <div><div class="sig">script.reload { name }<small>sensitive</small></div><div>Recompile a loaded script from its file and swap its hooks in live. A failed recompile keeps the previous version. Commands and options registered in <code>load</code> do not change until a restart.</div></div>
+        <div><div class="sig">script.enable { name }<br>script.disable { name }<small>sensitive</small></div><div>Switch a loaded script's hooks on or off live. Its registered commands stay.</div></div>
+        <div><div class="sig">script.findings { limit? }<small>read</small></div><div>What scripts recorded with <code>finding(...)</code> this run, oldest first, and how many the bounded buffer dropped.</div></div>
+      </div>
+      <p>From a terminal, <code>aitm script validate</code> is the useful one-shot. The one-shot CLI builds a fresh core of its own and exits, so it cannot see or change the scripts of a proxy that is already running; drive the live commands through MCP, or any other client of the running core.</p>
     </div>
 
     <nav class="pager" aria-label="Previous and next">
@@ -181,6 +288,7 @@
       <li><a href="#flow">The flow API</a></li>
       <li><a href="#findings">Findings and halting</a></li>
       <li><a href="#example">Complete example</a></li>
+      <li><a href="#loading">Loading and managing</a></li>
     </ul>
   </aside>
 

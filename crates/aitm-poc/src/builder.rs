@@ -38,14 +38,18 @@ pub struct StdPocBuilder;
 impl PocBuilder for StdPocBuilder {
     fn build(&self, flow: &HttpFlow, spec: PocSpec) -> anyhow::Result<Poc> {
         let req = &flow.request;
-        let url = parameterize_url(req, &spec.variables);
+        // Credentials in the query string (?access_token=, ?api_key=) and request
+        // body (password=, {"token":...}) are scrubbed with the shared scrubber so
+        // no secret is baked into a shareable PoC; the `{{target}}`/`{{param}}`
+        // placeholders parameterize_url inserts are left intact.
+        let url = aitm_core::redact::scrub_text(&parameterize_url(req, &spec.variables));
         let (headers, secret_vars) = request_headers(&req.headers);
 
         let step = HttpStep {
             method: req.method.clone(),
             url,
             headers,
-            body: body_text(&req.body),
+            body: body_text(&req.body).map(|b| aitm_core::redact::scrub_text(&b)),
             extract: Vec::new(),
             extra: serde_yaml::Mapping::new(),
         };
@@ -69,14 +73,23 @@ impl PocBuilder for StdPocBuilder {
     }
 }
 
-/// Request headers whose value is a credential: replaced with a placeholder in a
-/// built PoC so the secret is never written to disk.
+/// Request headers whose value is always a credential: replaced with a placeholder
+/// in a built PoC so the secret is never written to disk. Beyond this fixed list,
+/// any header whose name the shared scrubber recognises as secret-bearing
+/// (`aitm_core::redact::is_secret_key`, e.g. `X-Auth-Token`, `X-Session-Token`) is
+/// redacted the same way.
 const SECRET_HEADERS: [&str; 4] = [
     "cookie",
     "authorization",
     "proxy-authorization",
     "x-api-key",
 ];
+
+/// Whether a request header carries a credential and must not be baked into a PoC.
+fn is_secret_header(name: &str) -> bool {
+    SECRET_HEADERS.iter().any(|s| name.eq_ignore_ascii_case(s))
+        || aitm_core::redact::is_secret_key(name)
+}
 
 /// Replace the flow's concrete URL pieces with `{{var}}` placeholders.
 fn parameterize_url(req: &HttpRequest, variables: &[Variable]) -> String {
@@ -120,7 +133,7 @@ fn request_headers(headers: &HeaderMap) -> (Vec<(String, String)>, Vec<Variable>
         if name.eq_ignore_ascii_case("host") {
             continue;
         }
-        if SECRET_HEADERS.iter().any(|s| name.eq_ignore_ascii_case(s)) {
+        if is_secret_header(name) {
             let var = secret_var_name(name);
             out.push((name.to_string(), format!("{{{{{var}}}}}")));
             if !vars.iter().any(|v: &Variable| v.name == var) {

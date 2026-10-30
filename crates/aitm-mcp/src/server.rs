@@ -1341,7 +1341,9 @@ impl McpServer {
         // push sink and the server's subscription registry — neither of which a
         // `CommandHost` can carry — so the server handles them directly instead
         // of through `Command::invoke`. They are `Read`: gated like any read
-        // (blocked only under `Paused`, and only for the agent role).
+        // (blocked only under `Paused`; only trusted control —
+        // `Frontend::is_trusted_control`: Operator, Cli — bypasses, every other
+        // role, including any variant added later, is gated as an agent).
         if name == "flow.subscribe" || name == "flow.unsubscribe" {
             if let Some(reason) = self.read_refusal(conn, name) {
                 return ToolOutcome::Done(tool_error(reason));
@@ -1364,9 +1366,10 @@ impl McpServer {
                 ))
             }
         };
-        // The agent policy gate (D2), before anything runs. Only the agent role is
-        // gated; an operator or the CLI is the control and bypasses it. Under `Ask`,
-        // a Sensitive agent call is parked for operator approval rather than refused.
+        // The agent policy gate (D2), before anything runs. Only trusted control
+        // (`Frontend::is_trusted_control`: Operator, Cli) bypasses it; every other
+        // role, including any variant added later, is gated as an agent. Under `Ask`, a
+        // Sensitive agent call is parked for operator approval rather than refused.
         match self.policy_decision(conn, cmd.as_ref()) {
             PolicyDecision::Allow => {}
             PolicyDecision::Refuse(reason) => return ToolOutcome::Done(tool_error(reason)),
@@ -1542,12 +1545,14 @@ impl McpServer {
         self.subscriptions.fanout_state(&line);
     }
 
-    /// The D2 policy decision for one command on one connection. Only the agent
-    /// role (`Frontend::Mcp`) is gated — `Operator`/`Cli` are the control and always
-    /// [`PolicyDecision::Allow`]. Under `Ask`, a Sensitive agent call is
-    /// [`PolicyDecision::Park`]ed for operator approval instead of refused.
+    /// The D2 policy decision for one command on one connection. Every role that is
+    /// not trusted control ([`Frontend::is_trusted_control`]: the agent role
+    /// `Frontend::Mcp`, and any frontend added later) is gated — `Operator`/`Cli`
+    /// are the control and always [`PolicyDecision::Allow`]. Under `Ask`, a
+    /// Sensitive agent call is [`PolicyDecision::Park`]ed for operator approval
+    /// instead of refused.
     fn policy_decision(&self, conn: &ConnCtx, cmd: &dyn Command) -> PolicyDecision {
-        if conn.role != Frontend::Mcp {
+        if conn.role.is_trusted_control() {
             return PolicyDecision::Allow;
         }
         let policy = self.agent_state.policy();
@@ -1683,7 +1688,7 @@ impl McpServer {
     /// waiting agent to run the parked command; `allow:false` refuses it. An unknown
     /// or already-resolved id is a plain error, not a role refusal.
     fn handle_approve(&self, conn: &ConnCtx, arguments: &Map<String, JsonValue>) -> JsonValue {
-        if conn.role == Frontend::Mcp {
+        if !conn.role.is_trusted_control() {
             return tool_error(
                 "agent.approve refused: the agent cannot approve its own requests; only an \
                  operator or the human CLI may approve a parked sensitive command."
@@ -1707,10 +1712,11 @@ impl McpServer {
     }
 
     /// The policy decision for a `Read` command (`flow.subscribe`/`unsubscribe`):
-    /// `Some(reason)` only when the agent role is `Paused` (which refuses all),
-    /// `None` otherwise. Operator/CLI always pass.
+    /// `Some(reason)` only when the agent policy is `Paused` (which refuses all) and
+    /// the role is not trusted control ([`Frontend::is_trusted_control`]), `None`
+    /// otherwise. Operator/CLI always pass.
     fn read_refusal(&self, conn: &ConnCtx, name: &str) -> Option<String> {
-        if conn.role != Frontend::Mcp {
+        if conn.role.is_trusted_control() {
             return None;
         }
         match self.agent_state.policy() {
@@ -1931,7 +1937,8 @@ fn is_operator_only(name: &str) -> bool {
 
 /// The agent-policy gate's decision for one command (spec D2/D4).
 enum PolicyDecision {
-    /// The command may run (allowed by policy, or a non-agent role).
+    /// The command may run: trusted control (`Frontend::is_trusted_control`), or
+    /// an agent call the policy allows.
     Allow,
     /// The command is refused with this reason.
     Refuse(String),

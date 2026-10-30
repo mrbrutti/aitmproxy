@@ -30,10 +30,12 @@ the bind address as credentials to the MITM itself.
 
 ### Loopback-default bind
 
-- Default bind is `127.0.0.1:8084`. There is **no "bind all" default** and no code
-  path that widens the bind implicitly.
+- `bind` is a required key of the transport block in `config.yaml`
+  (`mcp.transport.streamable_http.bind`); the documented value is the loopback
+  `127.0.0.1:8084`. There is **no "bind all" default** and no code path that
+  widens the bind implicitly.
 - Binding any non-loopback interface is an **explicit operator decision** made by
-  setting `bind` in config/CLI. Doing so widens the blast radius above to every
+  setting `bind` in `config.yaml`. Doing so widens the blast radius above to every
   host that can reach that interface — make that choice deliberately and state it.
 
 ### Origin allowlist + Host / DNS-rebinding guards
@@ -47,9 +49,11 @@ fail-closed, in this fixed order:
    **empty**, so any present `Origin` is rejected (same-origin / no-Origin tools
    still work).
 3. **Host check** — the `Host` header must be a loopback literal
-   (`127.0.0.1[:port]`, `[::1][:port]`, `localhost[:port]`) or an explicitly
-   allowlisted host; otherwise `403`. This blocks a rebound DNS name that resolves
-   to loopback.
+   (`127.0.0.1[:port]`, `[::1][:port]`, `localhost[:port]`) or the authority
+   (`host[:port]`) of an origin in `allowed_origins`; otherwise `403` (a missing
+   `Host` also fails). This blocks a rebound DNS name that resolves to loopback.
+   A fronting tunnel that forwards its public `Host` therefore needs that host's
+   origin in `allowed_origins`.
 4. **Method / path** — anything but `POST` / `GET` on the configured `path` →
    `405` / `404`.
 
