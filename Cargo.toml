@@ -13,6 +13,7 @@ members = [
     "crates/aitm-plugin-passthrough",
     "crates/aitm-plugin-wsctl",
     "crates/aitm-plugin-maprules",
+    "crates/aitm-plugin-scanner",
     "crates/aitm-browser",
     "crates/aitm-ca",
     "crates/aitm-poc",
