@@ -742,6 +742,10 @@ pub struct McpServer {
     ssrf: SsrfPolicy,
     poc_dir: Option<std::path::PathBuf>,
     config: Option<Arc<aitm_core::Config>>,
+    /// The finding recorder a `poc.run` persists through (the binary's
+    /// `DiskFindingRecorder`). `None` = no persistence (deny-by-default; also
+    /// gated on `findings.dir`). (T7)
+    finding_recorder: Option<Arc<dyn aitm_core::FindingRecorder>>,
     /// The second loopback-TCP token; a connection presenting it is an operator.
     operator_token: Option<Arc<str>>,
     /// The role a stdio connection speaks as (default [`Frontend::Mcp`]).
@@ -812,6 +816,7 @@ impl McpServer {
             ssrf: SsrfPolicy::default(),
             poc_dir: None,
             config: None,
+            finding_recorder: None,
             operator_token: None,
             stdio_role: Frontend::Mcp,
             // The milestone default; wiring overrides it from `McpConfig.policy`.
@@ -958,6 +963,13 @@ impl McpServer {
         self
     }
 
+    /// Wire the finding recorder so a `poc.run` persists a durable finding (T7).
+    /// Persistence stays gated on `findings.dir`; `None` records nothing.
+    pub fn with_finding_recorder(mut self, recorder: Arc<dyn aitm_core::FindingRecorder>) -> Self {
+        self.finding_recorder = Some(recorder);
+        self
+    }
+
     /// Use the configured SSRF policy for command-side pre-flights (the PoC
     /// runner's browser navigation), so it matches the connector instead of
     /// silently falling back to the default.
@@ -1010,6 +1022,7 @@ impl McpServer {
             ssrf,
             poc_dir,
             config,
+            finding_recorder,
             operator_token,
             stdio_role,
             agent_state,
@@ -1033,6 +1046,7 @@ impl McpServer {
             ssrf,
             poc_dir,
             config,
+            finding_recorder,
             operator_token: operator_token.clone(),
             stdio_role,
             agent_state,
@@ -1353,6 +1367,10 @@ impl McpServer {
         };
         let host = match &self.config {
             Some(cfg) => host.with_config(cfg.clone()),
+            None => host,
+        };
+        let host = match &self.finding_recorder {
+            Some(rec) => host.with_finding_recorder(rec.as_ref()),
             None => host,
         };
         // `summarize` reads the args and result, so keep a copy of the typed args

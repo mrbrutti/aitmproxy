@@ -285,6 +285,7 @@ async fn run() -> anyhow::Result<()> {
             .with_ssrf_policy(cfg.browser.ssrf.clone())
             .with_poc_dir(cfg.poc.dir.clone())
             .with_config(Arc::new(cfg.clone()))
+            .with_finding_recorder(Arc::new(aitm_findings::DiskFindingRecorder))
             .with_services(s.store, s.client, s.guard, None);
         match cli.dispatch(argv) {
             Ok(value) => {

@@ -371,12 +371,11 @@ fn poc_run_vars_map_is_coerced_not_rejected() {
     let proxy = build_proxy(&cfg).expect("build proxy");
     let store = proxy.store();
     let client: Arc<dyn ProxyClient> = Arc::new(UnusedClient);
-    let server = McpServer::new(proxy.registry_arc(), McpTransport::Stdio).with_services(
-        store,
-        client,
-        proxy.guard(),
-        None,
-    );
+    // Attach the config so the per-invocation CommandHost carries it (as the real
+    // binary does via `with_config`); the T3 gate reads `poc.allow_agent_run` off it.
+    let server = McpServer::new(proxy.registry_arc(), McpTransport::Stdio)
+        .with_config(Arc::new(cfg))
+        .with_services(store, client, proxy.guard(), None);
     // A vars map of arbitrary values is accepted by the schema (Map(Any)); the
     // command then fails on the missing file, not on an argument shape error.
     let resp = rpc(
