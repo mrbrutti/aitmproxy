@@ -182,6 +182,60 @@ fn host_fn_and_guard_observe_caller_trust() {
     assert_eq!(ctx.tag(), None);
 }
 
+/// A guard that admits every call, overriding the deny-by-default `permit`, so
+/// the backward-compat test can exercise the full permit-then-call path.
+struct AdmitGuard;
+
+impl GuardHandle for AdmitGuard {
+    fn guard_name(&self) -> &str {
+        "admit"
+    }
+
+    fn permit(&self, _ctx: &HostCallCtx, _fn_name: &str) -> Result<(), HostError> {
+        Ok(())
+    }
+}
+
+/// AC10 (backward-compat): a host fn that ignores the per-invocation context is
+/// still a single one-line closure — the `&HostCallCtx` parameter is purely
+/// additive. The entire fn body here is `|_ctx, _args| Ok(Value::Null)`: it
+/// names neither parameter and reads nothing from the ctx. We register it
+/// through the seam's `register` (proving a context-ignoring one-liner still
+/// satisfies `Guarded<HostFn>`) and run it through the full permit-then-call
+/// path for both caller trusts, asserting it returns exactly `Value::Null`
+/// either way. If the context stopped being additive (e.g. the signature forced
+/// reading the ctx, or the closure's return were anything else), this test would
+/// fail — it is not a tautology that survives deleting the closure body.
+#[test]
+fn context_ignoring_host_fn_is_still_a_one_line_closure() {
+    // The whole function body — the backward-compat promise is this stays a
+    // single context-ignoring line.
+    let f: HostFn = Box::new(|_ctx, _args| Ok(Value::Null));
+
+    // It still satisfies `register`'s `Guarded<HostFn>`-only contract (AC9) and
+    // registers through a `ScriptHostRegistry` with no extra ceremony.
+    let mut reg = CollectingRegistry::default();
+    let reg_fn: HostFn = Box::new(|_ctx, _args| Ok(Value::Null));
+    reg.register("test", "noop", Guarded::new(Box::new(AdmitGuard), reg_fn))
+        .expect("context-ignoring one-liner registers through the seam");
+    assert_eq!(
+        reg.registered,
+        vec![("test".to_string(), "noop".to_string())]
+    );
+
+    // And runs through the real permit-then-call path, identically for either
+    // caller trust, because it reads nothing from the ctx.
+    let guarded = Guarded::new(Box::new(AdmitGuard), f);
+    let (g, func) = guarded.into_parts();
+    let source = StubSource;
+    for caller in [CallerTrust::Operator, CallerTrust::Agent] {
+        let ctx = HostCallCtx::new(caller, &source);
+        g.permit(&ctx, "noop").expect("admit guard permits");
+        let out = func(&ctx, &[]).expect("context-ignoring host fn runs");
+        assert_eq!(out, Value::Null);
+    }
+}
+
 /// `CallerTrust::from(Frontend)` maps an agent iff `Frontend::Mcp`; the human
 /// CLI and an operator-token connection are both `Operator`.
 #[test]
