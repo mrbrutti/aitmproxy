@@ -35,7 +35,7 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -46,6 +46,15 @@ use tokio::net::{UnixListener, UnixStream};
 /// Filenames of the two sockets inside the capture directory.
 const CONTROL_SOCK: &str = "control.sock";
 const DATA_SOCK: &str = "data.sock";
+
+/// Upper bound on a control-frame body we will allocate for from a peer-declared
+/// `u32` length prefix. Control frames are metadata (a [`Hello`], a [`ScopeSpec`],
+/// a [`FlowOpen`]) — kilobytes, not megabytes; 1 MiB is ample headroom.
+const MAX_FRAME_LEN: usize = 1 << 20;
+
+/// Upper bound on a length-delimited datagram body. A UDP datagram cannot exceed
+/// 64 KiB, so any larger declared length is corrupt or hostile.
+const MAX_DATAGRAM_LEN: usize = 64 * 1024;
 
 /// Whether a captured flow is a TCP/stream flow or a UDP datagram flow. Maps to
 /// the two ingress flow types (`CapturedTcpFlow` / `CapturedUdpFlow`).
@@ -136,8 +145,15 @@ impl CaptureListener {
     /// be bound.
     pub fn bind(dir: impl AsRef<Path>) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        fs::create_dir_all(&dir)?;
-        // Lock the directory private whether we created it or inherited it.
+        // Create the directory **atomically private** (mode 0700 at creation), so
+        // there is no create→chmod window in which another uid could reach it.
+        // `recursive(true)` makes an existing directory a no-op (it does not widen
+        // it); the explicit `set_permissions` below then narrows an inherited dir —
+        // and fails closed (EPERM) if that dir is owned by another uid.
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&dir)?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
 
         let control_path = dir.join(CONTROL_SOCK);
@@ -240,16 +256,10 @@ impl ControlChannel {
     /// # Errors
     /// Fails on a short read mid-frame or a malformed frame.
     pub async fn recv(&mut self) -> io::Result<Option<ControlMessage>> {
-        let mut len_buf = [0u8; 4];
-        match self.stream.read_exact(&mut len_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
-        }
-        let len = u32::from_be_bytes(len_buf) as usize;
-        let mut buf = vec![0u8; len];
-        self.stream.read_exact(&mut buf).await?;
-        self.bytes_read += 4 + len as u64;
+        let Some(buf) = read_capped(&mut self.stream, MAX_FRAME_LEN).await? else {
+            return Ok(None);
+        };
+        self.bytes_read += 4 + buf.len() as u64;
         let msg = serde_json::from_slice(&buf)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Ok(Some(msg))
@@ -312,6 +322,12 @@ pub async fn write_datagram<W>(w: &mut W, datagram: &[u8]) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
+    if datagram.len() > MAX_DATAGRAM_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "datagram exceeds maximum",
+        ));
+    }
     let len = u32::try_from(datagram.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "datagram too large"))?;
     w.write_all(&len.to_be_bytes()).await?;
@@ -328,16 +344,7 @@ pub async fn read_datagram<R>(r: &mut R) -> io::Result<Option<Vec<u8>>>
 where
     R: AsyncRead + Unpin,
 {
-    let mut len_buf = [0u8; 4];
-    match r.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).await?;
-    Ok(Some(buf))
+    read_capped(r, MAX_DATAGRAM_LEN).await
 }
 
 /// Write a `u32`-length-prefixed JSON frame.
@@ -348,6 +355,12 @@ where
 {
     let bytes =
         serde_json::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if bytes.len() > MAX_FRAME_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "control frame exceeds maximum",
+        ));
+    }
     let len = u32::try_from(bytes.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "control frame too large"))?;
     w.write_all(&len.to_be_bytes()).await?;
@@ -362,6 +375,24 @@ where
     T: DeserializeOwned,
     R: AsyncRead + Unpin,
 {
+    let Some(buf) = read_capped(r, MAX_FRAME_LEN).await? else {
+        return Ok(None);
+    };
+    let msg =
+        serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(Some(msg))
+}
+
+/// Read a `u32`-big-endian length prefix and that many bytes.
+///
+/// Rejects any declared length above `max` with `InvalidData` **before
+/// allocating**, so a corrupt or hostile 4-byte prefix (e.g. `0xFFFFFFFF`) cannot
+/// drive the core to allocate up to 4 GiB. Returns `Ok(None)` at a clean end of
+/// stream (EOF before the length prefix). Shared by every length-prefixed reader.
+async fn read_capped<R>(r: &mut R, max: usize) -> io::Result<Option<Vec<u8>>>
+where
+    R: AsyncRead + Unpin,
+{
     let mut len_buf = [0u8; 4];
     match r.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -369,9 +400,13 @@ where
         Err(e) => return Err(e),
     }
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame length exceeds maximum",
+        ));
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await?;
-    let msg =
-        serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(Some(msg))
+    Ok(Some(buf))
 }
