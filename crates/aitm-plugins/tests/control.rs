@@ -147,6 +147,38 @@ fn proxy_status_reports_armed_capturing_paused_and_listening() {
     assert_eq!(field(&status, "address"), &Value::Null);
 }
 
+/// The web sidebar shows the core's version from here, so it must be the real build's version
+/// (the workspace version every crate shares), not a number baked into a UI.
+#[test]
+fn proxy_status_reports_the_binary_version() {
+    let reg = reg();
+    let store = MemFlowStore::new();
+    let guard = StdGuard::default();
+
+    let status = call(&reg, &store, &guard, None, "proxy.status");
+    assert_eq!(
+        field(&status, "version"),
+        &Value::Str(env!("CARGO_PKG_VERSION").into())
+    );
+    // Not an empty or placeholder string: a dotted semver triple.
+    let Value::Str(v) = field(&status, "version") else {
+        panic!("version is a string");
+    };
+    assert_eq!(v.split('.').count(), 3, "not a semver version: {v}");
+    assert!(
+        v.split('.').all(|p| p.parse::<u32>().is_ok()),
+        "not a semver version: {v}"
+    );
+
+    // The schema documents it, so tools/list tells a client the key exists.
+    let schema = reg.command("proxy.status").expect("registered").schema();
+    assert!(
+        schema.description.contains("`version`"),
+        "schema should mention version: {}",
+        schema.description
+    );
+}
+
 #[test]
 fn pause_resume_marks_inserts_hidden() {
     let reg = reg();
