@@ -73,9 +73,16 @@ pub struct ProbeInfo {
 }
 
 /// Find the obscura binary: `browser.obscura.binary` → `AITM_OBSCURA_BIN`
-/// (`env_bin`) → `<exe_dir>/obscura` → `path_lookup("obscura")`. The first
-/// candidate that exists is final; a configured path that does not exist is
-/// an error, not a fall-through.
+/// (`env_bin`) → `<exe_dir>/obscura` → `<exe_dir>/../libexec/obscura` →
+/// `path_lookup("obscura")`. The first candidate that exists is final; a
+/// configured path that does not exist is an error, not a fall-through.
+///
+/// The `libexec` sibling is for package layouts that keep `aitm` on the PATH
+/// (`<prefix>/bin/aitm`) but tuck the engine beside the other internals
+/// (`<prefix>/libexec/obscura`) — e.g. a Homebrew install whose `bin/aitm` is a
+/// symlink whose target `exe_dir` the platform did not resolve. `start` also
+/// canonicalizes the exe first, so the common "all three in `libexec`" layout is
+/// already found by the `<exe_dir>/obscura` candidate.
 pub fn discover_binary(
     cfg: &ObscuraConfig,
     env_bin: Option<PathBuf>,
@@ -96,6 +103,9 @@ pub fn discover_binary(
     let candidates = [
         env_bin,
         exe_dir.map(|dir| dir.join("obscura")),
+        // `<exe_dir>/../libexec/obscura`: aitm in `bin/`, engine in a sibling
+        // `libexec/` (Homebrew when the exe symlink was not resolved).
+        exe_dir.map(|dir| dir.join("..").join("libexec").join("obscura")),
         path_lookup("obscura"),
     ];
     for candidate in candidates.into_iter().flatten() {
@@ -372,8 +382,16 @@ impl ObscuraProcess {
     /// and wait — bounded by `start_timeout` — until it listens. Returns the
     /// process and the CDP WebSocket URL to connect to.
     pub async fn start(config: &BrowserConfig, ca_cert: &Path) -> anyhow::Result<(Self, String)> {
+        // Resolve the exe path through any symlinks before taking its directory:
+        // on macOS `current_exe()` returns the path as invoked, so a Homebrew
+        // `bin/aitm` symlink leaves `exe_dir` as `bin/` and the engine beside the
+        // real binary in `libexec/` is missed. Canonicalizing lands `exe_dir` on
+        // the real directory; if it fails (e.g. the exe was removed) fall back to
+        // the unresolved path, and `discover_binary` still probes the `libexec`
+        // sibling.
         let exe_dir = std::env::current_exe()
             .ok()
+            .map(|exe| std::fs::canonicalize(&exe).unwrap_or(exe))
             .and_then(|exe| exe.parent().map(Path::to_path_buf));
         let binary = discover_binary(
             &config.obscura,
@@ -787,6 +805,120 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..1000 {
             assert!(seen.insert(random_token()), "random_token repeated");
+        }
+    }
+
+    /// `discover_binary` candidate order and the package layouts it must cover.
+    mod discovery {
+        use super::*;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        /// A unique temp directory for one test, removed on drop.
+        struct TmpDir(PathBuf);
+
+        impl TmpDir {
+            fn new() -> Self {
+                static N: AtomicU32 = AtomicU32::new(0);
+                let dir = std::env::temp_dir().join(format!(
+                    "aitm-disco-{}-{}",
+                    std::process::id(),
+                    N.fetch_add(1, Ordering::Relaxed)
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                TmpDir(dir)
+            }
+            fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+
+        impl Drop for TmpDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn touch(path: &Path) {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, b"#!/bin/sh\n").unwrap();
+        }
+
+        fn never_on_path(_: &str) -> Option<PathBuf> {
+            None
+        }
+
+        /// `<exe_dir>/obscura` is found: the engine bundled beside the binary
+        /// (dev checkout, and the canonicalized `libexec` install).
+        #[test]
+        fn finds_obscura_beside_the_exe() {
+            let tmp = TmpDir::new();
+            let bin = tmp.path().join("bin");
+            touch(&bin.join("obscura"));
+            let found =
+                discover_binary(&ObscuraConfig::default(), None, Some(&bin), &never_on_path)
+                    .unwrap();
+            assert_eq!(found, bin.join("obscura"));
+        }
+
+        /// `<prefix>/bin/aitm` with the engine in `<prefix>/libexec/obscura`:
+        /// the Homebrew layout when the exe symlink was not resolved. The
+        /// sibling-`libexec` candidate must find it.
+        #[test]
+        fn finds_obscura_in_sibling_libexec() {
+            let tmp = TmpDir::new();
+            let bin = tmp.path().join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let staged = tmp.path().join("libexec").join("obscura");
+            touch(&staged);
+            let found =
+                discover_binary(&ObscuraConfig::default(), None, Some(&bin), &never_on_path)
+                    .unwrap();
+            // Assert the file it found resolves to the staged engine, not the
+            // exact (un-normalised) path the implementation happened to build.
+            assert_eq!(
+                std::fs::canonicalize(&found).unwrap(),
+                std::fs::canonicalize(&staged).unwrap(),
+                "discovered {found:?} should resolve to the staged libexec engine",
+            );
+        }
+
+        /// `AITM_OBSCURA_BIN` (`env_bin`) wins over the bundled paths.
+        #[test]
+        fn env_bin_wins_over_exe_dir() {
+            let tmp = TmpDir::new();
+            let bin = tmp.path().join("bin");
+            touch(&bin.join("obscura"));
+            let env_bin = tmp.path().join("custom-obscura");
+            touch(&env_bin);
+            let found = discover_binary(
+                &ObscuraConfig::default(),
+                Some(env_bin.clone()),
+                Some(&bin),
+                &never_on_path,
+            )
+            .unwrap();
+            assert_eq!(found, env_bin);
+        }
+
+        /// When nothing is found, the error names every candidate that was
+        /// probed, including the `libexec` sibling, so the operator can see
+        /// exactly where it looked.
+        #[test]
+        fn error_lists_every_candidate() {
+            let tmp = TmpDir::new();
+            let bin = tmp.path().join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let err = discover_binary(&ObscuraConfig::default(), None, Some(&bin), &never_on_path)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("was not found"), "{err}");
+            assert!(
+                err.contains(&bin.join("obscura").display().to_string()),
+                "{err}"
+            );
+            assert!(err.contains("libexec"), "{err}");
         }
     }
 }
