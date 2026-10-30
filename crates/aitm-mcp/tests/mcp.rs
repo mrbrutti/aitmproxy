@@ -2745,6 +2745,51 @@ fn subscription_refusal_is_audited_but_success_is_not() {
     assert_eq!(after, 1, "a successful subscribe is not audited");
 }
 
+/// Fast-follow #3: the trusted-control allow-list on `flow.subscribe`. Under
+/// `Paused` only the agent role is refused; `Operator` and the `Cli` subscribe
+/// (each with a push sink, so a success is distinguishable from the "no sink"
+/// error the verb returns on a non-streaming connection).
+#[test]
+fn subscribe_under_paused_refuses_only_the_agent() {
+    let srv = policy_server(Arc::new(AgentState::new(AgentPolicy::Paused)), None);
+    let subscribe = |role: Frontend| -> JsonValue {
+        let conn = ConnCtx {
+            role,
+            client_label: None,
+            conn_id: srv.next_conn_id(),
+            out: Some(aitm_mcp::NotificationSink::new(16)),
+        };
+        let resp = srv
+            .handle_on(
+                &conn,
+                &json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":"flow.subscribe","arguments":{}}})
+                .to_string(),
+            )
+            .expect("subscribe reply");
+        serde_json::from_str(&resp).expect("response is JSON")
+    };
+
+    let agent = subscribe(Frontend::Mcp);
+    assert!(is_refused(&agent), "agent subscribe refused under Paused");
+    let text = agent["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("the agent policy is `paused`"),
+        "the refusal names the paused policy: {text}"
+    );
+
+    for role in [Frontend::Operator, Frontend::Cli] {
+        let resp = subscribe(role);
+        assert!(!is_refused(&resp), "{role:?} subscribe runs under Paused");
+        assert!(
+            resp["result"]["structuredContent"]["sub_id"].is_u64(),
+            "{role:?} gets a sub_id: {resp}"
+        );
+    }
+}
+
 /// AC-M4-6b / spec D3a.4: `agent.activity` reads recent entries, honouring
 /// `since` and `limit`.
 #[test]
@@ -3036,6 +3081,39 @@ fn agent_cannot_approve_own_request() {
         text.contains("no parked request"),
         "operator gets a no-such-request error, not a role refusal: {text}"
     );
+}
+
+/// Fast-follow #3: the trusted-control allow-list on `agent.approve`. The agent
+/// role is role-refused; both human control roles (`Operator` and the `Cli`) pass
+/// the role gate and reach the parked-request table (an unknown id is then a plain
+/// "no parked request" error, which proves the role gate was cleared).
+#[test]
+fn agent_approve_is_refused_for_the_agent_only() {
+    let srv = ask_server(Duration::from_secs(10));
+    let text_of = |role: Frontend| -> String {
+        let resp = call_as_args(
+            &srv,
+            role,
+            "agent.approve",
+            json!({"request_id": "nope", "allow": true}),
+        );
+        assert!(is_refused(&resp), "unknown id is an error for {role:?}");
+        resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(
+        text_of(Frontend::Mcp).contains("agent cannot approve its own requests"),
+        "the agent role is role-refused"
+    );
+    for role in [Frontend::Operator, Frontend::Cli] {
+        let text = text_of(role);
+        assert!(
+            text.contains("no parked request `nope`"),
+            "{role:?} clears the role gate and gets a no-such-request error: {text}"
+        );
+    }
 }
 
 // --------------------------------------------------- Task 3 (W2): resources/*

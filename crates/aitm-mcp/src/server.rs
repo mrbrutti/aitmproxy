@@ -734,6 +734,21 @@ fn role_str(role: Frontend) -> &'static str {
     }
 }
 
+/// Only the human control roles bypass the agent gates (allow-list). `Frontend` is
+/// `#[non_exhaustive]`, so the wildcard arm is what makes a variant added later
+/// fail CLOSED: it is gated like an agent until someone classifies it here.
+///
+/// The single definition the agent-policy gate ([`McpServer::policy_decision`]),
+/// the `Paused` read gate (`read_refusal`) and the `agent.approve` role check
+/// (`handle_approve`) all share.
+fn is_trusted_control(role: Frontend) -> bool {
+    match role {
+        Frontend::Cli | Frontend::Operator => true,
+        Frontend::Mcp => false,
+        _ => false,
+    }
+}
+
 /// Registry handle + transport selection + the services commands run against.
 pub struct McpServer {
     registry: Arc<Registry>,
@@ -1542,12 +1557,13 @@ impl McpServer {
         self.subscriptions.fanout_state(&line);
     }
 
-    /// The D2 policy decision for one command on one connection. Only the agent
-    /// role (`Frontend::Mcp`) is gated — `Operator`/`Cli` are the control and always
-    /// [`PolicyDecision::Allow`]. Under `Ask`, a Sensitive agent call is
+    /// The D2 policy decision for one command on one connection. Every role that is
+    /// not trusted control ([`is_trusted_control`]: the agent role `Frontend::Mcp`,
+    /// and any frontend added later) is gated — `Operator`/`Cli` are the control and
+    /// always [`PolicyDecision::Allow`]. Under `Ask`, a Sensitive agent call is
     /// [`PolicyDecision::Park`]ed for operator approval instead of refused.
     fn policy_decision(&self, conn: &ConnCtx, cmd: &dyn Command) -> PolicyDecision {
-        if conn.role != Frontend::Mcp {
+        if is_trusted_control(conn.role) {
             return PolicyDecision::Allow;
         }
         let policy = self.agent_state.policy();
@@ -1683,7 +1699,7 @@ impl McpServer {
     /// waiting agent to run the parked command; `allow:false` refuses it. An unknown
     /// or already-resolved id is a plain error, not a role refusal.
     fn handle_approve(&self, conn: &ConnCtx, arguments: &Map<String, JsonValue>) -> JsonValue {
-        if conn.role == Frontend::Mcp {
+        if !is_trusted_control(conn.role) {
             return tool_error(
                 "agent.approve refused: the agent cannot approve its own requests; only an \
                  operator or the human CLI may approve a parked sensitive command."
@@ -1707,10 +1723,11 @@ impl McpServer {
     }
 
     /// The policy decision for a `Read` command (`flow.subscribe`/`unsubscribe`):
-    /// `Some(reason)` only when the agent role is `Paused` (which refuses all),
-    /// `None` otherwise. Operator/CLI always pass.
+    /// `Some(reason)` only when the agent policy is `Paused` (which refuses all) and
+    /// the role is not trusted control ([`is_trusted_control`]), `None` otherwise.
+    /// Operator/CLI always pass.
     fn read_refusal(&self, conn: &ConnCtx, name: &str) -> Option<String> {
-        if conn.role != Frontend::Mcp {
+        if is_trusted_control(conn.role) {
             return None;
         }
         match self.agent_state.policy() {
@@ -2186,5 +2203,31 @@ mod tests {
     #[test]
     fn mcp_host_without_wiring_carries_no_posture() {
         assert_eq!(probe(&probe_server()), json!("absent"));
+    }
+
+    // ------------------------------------- fast-follow #3: trusted-control allow-list
+
+    /// The trusted-control allow-list: exactly the human control roles (`Cli`,
+    /// `Operator`) bypass the agent gates; the agent role (`Mcp`) is gated. This
+    /// table pins today's three variants — the fail-closed arm for a variant added
+    /// later cannot be built from outside `aitm-core` (`Frontend` is
+    /// `#[non_exhaustive]`), so it is documented on the helper. A new variant also
+    /// breaks `aitm-core`'s own build until it is classified in the wildcard-free
+    /// matches `From<Frontend> for CallerTrust` (`ctx.rs`) and `origin_label`
+    /// (`audit.rs`), which prompts its author to classify it here too.
+    #[test]
+    fn is_trusted_control_allows_only_cli_and_operator() {
+        assert!(
+            is_trusted_control(Frontend::Cli),
+            "the human CLI is control"
+        );
+        assert!(
+            is_trusted_control(Frontend::Operator),
+            "an operator connection is control"
+        );
+        assert!(
+            !is_trusted_control(Frontend::Mcp),
+            "the agent role is never control"
+        );
     }
 }
