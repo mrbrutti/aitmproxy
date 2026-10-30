@@ -124,14 +124,34 @@ fn l4_ingress_bound_when_enabled() {
     );
 }
 
-/// L4OPS-AC17 (zero-footprint default): with L4 disabled there is no ingress — the
-/// boundary is constructed only for the opted-in path.
+/// L4OPS-AC17: the capture ingress is assembled for **every** build — its stream/TCP
+/// half is wired so a capture backend (Phase 2's macOS Network Extension) can feed
+/// captured TCP whether or not L4/UDP is enabled. With L4 disabled, only the L4/UDP
+/// half is absent: a UDP dispatch is `Unhandled`.
 #[test]
-fn l4_ingress_absent_when_disabled() {
+fn l4_ingress_stream_half_present_udp_absent_when_disabled() {
+    use aitm_proto_l4::types::{L4Direction, L4Proto, L4Target};
+
     let cfg = config_with_ca("ingress-off");
     let assembled = assemble_with(&cfg, &Features::default()).expect("assemble with l4 disabled");
-    assert!(
-        assembled.l4_ingress.is_none(),
-        "no capture ingress when L4 is disabled"
+    let ingress = assembled
+        .l4_ingress
+        .expect("the stream half of the capture ingress is wired for every build");
+
+    let flow = aitm::ingress::CapturedUdpFlow {
+        target: L4Target {
+            interface: "lo0".to_string(),
+            direction: L4Direction::Outbound,
+            dst: Some("127.0.0.1".parse().unwrap()),
+            dst_port: Some(9),
+            proto: L4Proto::Udp,
+        },
+        datagrams: vec![b"probe".to_vec()],
+        peer_identity: None,
+    };
+    assert_eq!(
+        ingress.dispatch_udp(flow),
+        aitm::ingress::IngressOutcome::Unhandled,
+        "no L4/UDP half when L4 is disabled"
     );
 }

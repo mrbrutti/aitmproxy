@@ -27,6 +27,14 @@ pub trait ScopeRateGuard: Send + Sync {
     fn remove_scope(&self, entry: &str) -> bool;
     /// The current scope entries.
     fn list_scope(&self) -> Vec<ScopeEntry>;
+    /// Whether `host` is currently in the scope allowlist — a read-only predicate
+    /// with no rate, concurrency, or error-budget effect. The capture ingress
+    /// scope-gates a captured stream on this (authority = SNI else dst IP) before
+    /// any module match or upstream dial. Default is **deny-by-default**, so a
+    /// guard that does not implement it refuses every host.
+    fn in_scope(&self, _host: &str) -> bool {
+        false
+    }
     /// Record an error against `host`; once its budget is exhausted the guard
     /// disables it (with backoff) and `check_active` refuses it. Default: no-op.
     fn record_error(&self, _host: &str) {}
@@ -395,16 +403,6 @@ impl StdGuard {
             .clear();
     }
 
-    fn in_scope(&self, host: &str) -> bool {
-        // Recover from a poisoned lock rather than silently refusing/allowing:
-        // deny-by-default still holds, every entry is still consulted.
-        self.scope
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .any(|e| host_in_scope(host, &e.host))
-    }
-
     fn is_disabled(&self, host: &str) -> bool {
         if self.host_error_budget == 0 {
             return false;
@@ -541,6 +539,17 @@ impl ScopeRateGuard for StdGuard {
             .clone()
     }
 
+    fn in_scope(&self, host: &str) -> bool {
+        // Recover from a poisoned lock rather than silently refusing/allowing:
+        // deny-by-default still holds, every entry is still consulted. Same
+        // normalized host matching `check_active` uses — no new matching logic.
+        self.scope
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|e| host_in_scope(host, &e.host))
+    }
+
     /// Record an error. On reaching the per-host budget the host is disabled for
     /// a backoff window (exponential per disable); after the window it is eligible
     /// again. The error counter resets so the next budget triggers the next,
@@ -579,5 +588,25 @@ impl ScopeRateGuard for StdGuard {
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(key, until);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The read-only `in_scope` predicate reflects the scope allowlist exactly: a
+    /// scoped host is in scope, an unscoped host is not (deny-by-default).
+    #[test]
+    fn std_guard_in_scope_predicate() {
+        let guard = StdGuard::default();
+        guard.add_scope(ScopeEntry {
+            host: "example.com".to_string(),
+        });
+        assert!(guard.in_scope("example.com"), "a scoped host is in scope");
+        assert!(
+            !guard.in_scope("evil.com"),
+            "an unscoped host is out of scope (deny-by-default)"
+        );
     }
 }
