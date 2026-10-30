@@ -1,6 +1,6 @@
 //! Task 20: `aitm-poc` YAML serde round-trip (AC-L1/AC13) and schema validation (AC-L7).
 
-use aitm_poc::{validate, Poc, Severity};
+use aitm_poc::{validate, Poc, Severity, Step};
 
 const EXAMPLE1: &str = include_str!("fixtures/reflected-xss-search-q.yaml");
 
@@ -100,13 +100,16 @@ success:
     );
 }
 
-/// AC-L7: an unknown step type is rejected, not silently ignored.
+/// AC-L7: a step whose key is not one of the four fixed types is a protocol
+/// `<ns>:` step: it validates and parses into `Step::Protocol`, never silently
+/// dropped. Runtime rejection of an *unregistered* namespace is covered by
+/// `protocol_step.rs::unknown_protocol_step_errors_at_run`.
 #[test]
-fn unknown_step_rejected() {
+fn unknown_namespace_parses_as_protocol_step() {
     let yaml = r#"
-id: has-bad-step
+id: has-protocol-step
 info:
-  name: bad step
+  name: protocol step
   severity: low
 steps:
   - telnet:
@@ -116,9 +119,42 @@ success:
     status: 200
 "#;
     let raw: serde_yaml::Value = serde_yaml::from_str(yaml).expect("valid YAML");
-    let err = validate(&raw).expect_err("unknown step type must be rejected");
+    validate(&raw).expect("a protocol-namespace step must validate");
+    let poc = aitm_poc::loader::parse_poc(yaml).expect("protocol step parses");
+    match &poc.steps[0] {
+        Step::Protocol { ns, .. } => assert_eq!(ns, "telnet"),
+        other => panic!("expected Step::Protocol, got {other:?}"),
+    }
+}
+
+/// A malformed protocol-namespace step is still rejected at validation with a
+/// clear, key-naming error: an unknown sibling beside the namespace key, or an
+/// empty step map. A well-formed `<ns>:` plus the permitted `extract:` sibling
+/// validates.
+#[test]
+fn malformed_protocol_step_rejected_with_clear_error() {
+    let doc = |step: &str| {
+        let yaml = format!(
+            "id: p\ninfo:\n  name: n\n  severity: low\nsteps:\n  - {step}\nsuccess:\n  - dsl: 'true'\n"
+        );
+        serde_yaml::from_str::<serde_yaml::Value>(&yaml).expect("valid YAML")
+    };
+
+    let err = validate(&doc("{ telnet: { host: x }, bogus: 1 }"))
+        .expect_err("an unknown sibling key must be rejected");
     assert!(
-        err.to_string().contains("telnet"),
-        "error must name the unknown step `telnet`, got: {err}"
+        err.to_string().contains("bogus") && err.to_string().contains("telnet"),
+        "error must name the ns and the stray key, got: {err}"
     );
+
+    let err = validate(&doc(
+        "{ telnet: { host: x }, extract: [], other: 1, more: 2 }",
+    ))
+    .expect_err("more than ns + extract must be rejected");
+    assert!(err.to_string().contains("other"), "got: {err}");
+
+    validate(&doc("{ telnet: { host: x }, extract: [] }"))
+        .expect("ns + extract sibling is the permitted protocol shape");
+
+    validate(&doc("{}")).expect_err("an empty step map must be rejected");
 }
