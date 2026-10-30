@@ -17,6 +17,11 @@ final class CoreHealthState {
     var connection: CoreConnection?
     /// The captured core output, oldest first, bounded.
     var log = CoreLogBuffer()
+    /// Whether the macOS capture extension is installed, approved and capturing
+    /// (Task 13, spec D9). The `ExtensionController` pushes it here; the Task 17
+    /// indicator and any capture-dependent UI read it. A build with no embedded
+    /// extension stays at `.extensionNotInstalled`.
+    var captureCapability: CaptureCapability = .extensionNotInstalled
 
     /// The current health bucket, or `nil` when no embedded core is running.
     var health: CoreHealth? { connection?.health }
