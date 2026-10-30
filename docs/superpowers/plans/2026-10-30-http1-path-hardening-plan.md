@@ -510,7 +510,7 @@ Kept by the main session during stage 6. One row per finding.
 
 ## Shipped
 
-Stage 7 (merge to `main`) is Matt's. The branch is `fix/http1-path-hardening`, opened as a PR stacked on PR #108 (base `fix/proxy-stale-upstream-keepalive`); retarget to `main` once #108 merges.
+The first PR (129, branch `fix/http1-path-hardening`) was stacked on PR 108's branch and was merged into it after PR 108 had already been squash-merged to `main`, so these fixes never reached `main`. They were re-landed by cherry-picking the same commits onto `main` (branch `fix/http1-hardening-on-main`, a new PR with base `main`); `crates/aitm-proto-http` is identical to PR 129's reviewed head. Merge to `main` is the integration step.
 
 What shipped on the branch: the three fixes (T1 to T4), 16 tester-added tests, the loopback file `tests/http1_hardening.rs` (7 tests), and the spec amendments after the panel. Gate at the head: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --no-fail-fast` all exit 0.
 
