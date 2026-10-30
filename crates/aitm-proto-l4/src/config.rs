@@ -43,6 +43,19 @@ pub struct L4Config {
     /// by caller identity. Even when true, a runtime-added entry can never lift the
     /// dangerous-destination denylist (only config-declared scope can).
     pub allow_agent_widen: bool,
+    /// Whether an agent (`Frontend::Mcp`) may drive `l4.inject` / `l4.send_recv`
+    /// (the send side). **Default false** (M4 per-capability gate, mirrors
+    /// `ca.allow_agent_install` / `allow_agent_widen`): one of the two dimensions a
+    /// Sensitive agent L4 call must pass (the other is `AgentPolicy`). The operator
+    /// role is never subject to it; it governs the agent path only.
+    pub allow_agent_inject: bool,
+    /// Whether an agent (`Frontend::Mcp`) may drive `l4.capture.start`. **Default
+    /// false** (see [`allow_agent_inject`](Self::allow_agent_inject)).
+    pub allow_agent_capture: bool,
+    /// Whether an agent (`Frontend::Mcp`) may drive the in-path verdict verbs
+    /// (`l4.intercept.start` / `.mutate` / `.forward` / `.drop`). **Default false**
+    /// (see [`allow_agent_inject`](Self::allow_agent_inject)).
+    pub allow_agent_intercept: bool,
 }
 
 impl Default for L4Config {
@@ -64,6 +77,11 @@ impl Default for L4Config {
             // Deny-by-default: runtime bus scope widening is off until the operator
             // opts in. Mirrors `ca.allow_agent_install`'s conservative default.
             allow_agent_widen: false,
+            // Deny-by-default per-capability agent gates: every Sensitive L4 verb
+            // is closed to the agent until the operator opts that capability in.
+            allow_agent_inject: false,
+            allow_agent_capture: false,
+            allow_agent_intercept: false,
         }
     }
 }

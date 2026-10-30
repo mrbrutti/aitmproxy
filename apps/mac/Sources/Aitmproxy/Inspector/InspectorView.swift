@@ -19,6 +19,10 @@ struct InspectorView: View {
                         // `.id(row.id)` gives each flow a fresh frame selection and filter.
                         WebSocketInspector(row: row, detail: session.focusedWSDetail)
                             .id(row.id).environment(session).themed()
+                    } else if row.kind == .l4 {
+                        // A raw-L4 flow is a packet log + craft/inject, not request/response.
+                        L4Inspector(row: row, detail: session.focusedL4Detail)
+                            .id(row.id).environment(session).themed()
                     } else {
                         // A real split: the operator drags the divider; the position is remembered.
                         SplitPane(axis: .vertical, firstMinimum: 240, secondMinimum: 240, initialSecondFraction: 0.5,

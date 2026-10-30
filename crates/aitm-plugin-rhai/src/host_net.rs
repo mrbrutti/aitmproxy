@@ -9,7 +9,7 @@
 //!
 //! **The bridge.** Rhai is synchronous; the guarded capabilities are async. A
 //! verb drives its future with the stored runtime handle (`services.rt`), and
-//! the caller — `ScriptPlugin::on_event`, or a test — has already entered
+//! the caller — `LoadedScript::dispatch`, or a test — has already entered
 //! `tokio::task::block_in_place`, so blocking this worker is legal and tokio
 //! moves other tasks elsewhere. Every future is driven under
 //! `tokio::time::timeout` for what is left of the run's wall-clock budget

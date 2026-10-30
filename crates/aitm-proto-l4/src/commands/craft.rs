@@ -8,7 +8,9 @@
 
 use std::collections::BTreeMap;
 
-use aitm_core::{Command, CommandHost, ParamDef, ParamSchema, Params, TypeDesc, Value};
+use aitm_core::{
+    Command, CommandHost, ParamDef, ParamSchema, Params, Sensitivity, TypeDesc, Value,
+};
 
 use crate::craft::PacketSpec;
 
@@ -18,6 +20,13 @@ pub struct Craft;
 impl Command for Craft {
     fn name(&self) -> &str {
         "l4.craft"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        // Pure `PacketSpec::build`: produces bytes/summary only — no wire, no
+        // privilege, no flow-store mutation (the UI pairs a craft preview with an
+        // explicit inject). Classified Read per spec §2.2.
+        Sensitivity::Read
     }
 
     fn schema(&self) -> ParamSchema {

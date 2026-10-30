@@ -1,12 +1,13 @@
 //! `RhaiLoader`: builds the shared engine, compiles each script once, validates,
-//! and yields one `ScriptPlugin` per script (plan Task 9).
+//! and yields one `LoadedScript` per script (plan Task 9).
 //!
 //! One hardened engine (Task 2) carries the whole host surface — the flow API
 //! (Task 5), every `ScriptCapability` provider M3 ships (Tasks 6, 7) and the
 //! bundled prelude (Task 11) — registered once in [`RhaiLoader::new`]. Each
 //! `.rhai` file is then compiled once into an `AST`, its metadata read off the
 //! AST without running it (`const NAME`, `const API`, the hooks it defines),
-//! and wrapped as a [`ScriptPlugin`] that takes its own place in the chain.
+//! and wrapped as a [`LoadedScript`] the [`crate::plugin::ScriptHost`] dispatches
+//! from its single chain position.
 //!
 //! **Error policy (spec §8).** A script that does not compile is skipped with
 //! a logged, positioned [`ScriptError::Compile`] and the rest still load, so a
@@ -23,6 +24,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use aitm_plugin::language::ProtocolLanguage;
 use rhai::{Dynamic, Engine, ParseError, ParseErrorType, AST};
 
 use crate::command::register_reg_api;
@@ -34,7 +36,7 @@ use crate::host_core::{
     FindingCapability, LogCapability, Options, ScriptCapability, ScriptServices,
 };
 use crate::host_net::{BrowserCapability, HttpCapability, ScopeCapability, StoreCapability};
-use crate::plugin::{ErrorSink, ScriptPlugin};
+use crate::plugin::{ErrorSink, LoadedScript};
 use crate::poc_step::VarsCapability;
 use crate::prelude::register_prelude;
 
@@ -123,12 +125,43 @@ impl RhaiLoader {
         services: ScriptServices,
         capabilities: Vec<Arc<dyn ScriptCapability>>,
     ) -> Result<Self, ScriptError> {
+        Self::build(cfg, services, capabilities, &[])
+    }
+
+    /// `new`, but with the M3 built-in capabilities **plus** a set of seam
+    /// [`ProtocolLanguage`]s installed on the same engine (Task 7). Each
+    /// language's `<ns>.*` host fns are registered through the
+    /// [`crate::host_registry`] seam, and each namespace's
+    /// [`ProtocolLanguage::api_version`] joins the loader's version gate as its
+    /// `min_api`, so a script whose `const API` is older than a seam namespace's
+    /// version is refused that namespace exactly like a built-in one (AC9).
+    pub fn new_with_languages(
+        cfg: RhaiConfig,
+        services: ScriptServices,
+        languages: &[&dyn ProtocolLanguage],
+    ) -> Result<Self, ScriptError> {
+        let capabilities = m3_capabilities(&cfg);
+        Self::build(cfg, services, capabilities, languages)
+    }
+
+    /// Build the shared engine: register the flow API, the `load(reg)` bridge,
+    /// each built-in capability's namespace, then every seam language's `<ns>.*`
+    /// host fns, then the prelude. The version gate (`capabilities`) collects
+    /// both the built-in capabilities' `(namespace, min_api)` and each seam
+    /// namespace's `(namespace, api_version)`, so `check_api` enforces them with
+    /// one rule (Task 7, AC9).
+    fn build(
+        cfg: RhaiConfig,
+        services: ScriptServices,
+        capabilities: Vec<Arc<dyn ScriptCapability>>,
+        languages: &[&dyn ProtocolLanguage],
+    ) -> Result<Self, ScriptError> {
         let mut engine = build_engine(&cfg.limits, cfg.hook_timeout);
         register_flow_api(&mut engine);
         // The `load(reg)` bridge: without it a script's `reg.add_command` is an
         // unknown function and no script could register anything (Task 10).
         register_reg_api(&mut engine);
-        let mut cap_requirements = Vec::with_capacity(capabilities.len());
+        let mut cap_requirements = Vec::with_capacity(capabilities.len() + languages.len());
         for capability in &capabilities {
             tracing::debug!(
                 target: LOADER_TARGET,
@@ -141,6 +174,19 @@ impl RhaiLoader {
                 capability.namespace().to_string(),
                 capability.min_api().to_string(),
             ));
+        }
+        // Seam-registered protocol languages: install their `<ns>.*` host fns on
+        // the same engine, and record each namespace's `api_version` as its
+        // `min_api` so the version gate covers seam namespaces too (AC9).
+        let language_versions = crate::host_registry::install_languages(&mut engine, languages)?;
+        for (namespace, api_version) in language_versions {
+            tracing::debug!(
+                target: LOADER_TARGET,
+                namespace = %namespace,
+                api_version = %api_version,
+                "registered protocol language namespace"
+            );
+            cap_requirements.push((namespace, api_version));
         }
         register_prelude(&mut engine)?;
         Ok(Self {
@@ -195,7 +241,7 @@ impl RhaiLoader {
     /// Returns one plugin per script that compiled plus the errors of those
     /// that did not; with `strict`, any error means no plugins and every
     /// error, so the caller fails fast.
-    pub fn load_all(&self) -> (Vec<ScriptPlugin>, Vec<ScriptError>) {
+    pub fn load_all(&self) -> (Vec<LoadedScript>, Vec<ScriptError>) {
         let mut plugins = Vec::new();
         let mut errors = Vec::new();
         for entry in self.cfg.scripts.iter().filter(|entry| entry.enabled) {
@@ -220,7 +266,7 @@ impl RhaiLoader {
 
     /// Compile one file into a plugin over the shared engine, carrying the
     /// entry's options for `option(...)`.
-    pub fn load_one(&self, entry: &ScriptEntry) -> Result<ScriptPlugin, ScriptError> {
+    pub fn load_one(&self, entry: &ScriptEntry) -> Result<LoadedScript, ScriptError> {
         let (ast, meta) = self.compile(&entry.path)?;
         self.check_api(&meta)?;
         tracing::info!(
@@ -231,7 +277,7 @@ impl RhaiLoader {
             "loaded script"
         );
         let options = Options::new(entry.options.clone());
-        Ok(ScriptPlugin::new(
+        Ok(LoadedScript::new(
             meta,
             Arc::clone(&self.engine),
             ast,

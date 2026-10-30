@@ -176,6 +176,10 @@ pub struct LimitConfig {
     /// Larger bodies are refused (requests) or truncated in the stored copy
     /// (responses) so a hostile peer cannot exhaust memory. Default 10 MiB.
     pub max_body_bytes: usize,
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` advertised to an HTTP/2 client, bounding
+    /// how many streams one connection may run in parallel so a hostile peer
+    /// cannot open unbounded streams. Default 128.
+    pub max_concurrent_streams: u32,
 }
 
 impl Default for LimitConfig {
@@ -187,6 +191,7 @@ impl Default for LimitConfig {
             host_error_budget: 10,
             backoff: BackoffConfig::default(),
             max_body_bytes: 10 * 1024 * 1024,
+            max_concurrent_streams: 128,
         }
     }
 }
