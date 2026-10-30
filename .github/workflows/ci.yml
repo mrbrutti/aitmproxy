@@ -24,6 +24,13 @@ jobs:
   rust-gate:
     name: Rust gate (fmt + clippy + test)
     runs-on: ubuntu-latest
+    # Drop debuginfo: `cargo test` links every test binary (chromiumoxide + rhai
+    # + the full graph), and with debug symbols the parallel link step exhausts
+    # the runner's memory/disk — the linker dies with "ld ... signal 7 (Bus
+    # error)". A pass/fail gate needs no symbols, so this is a safe, standard cut.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
