@@ -19,7 +19,11 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 
-use aitm_ca::exec::{Executor, RealExecutor};
+use aitm_ca::exec::RealExecutor;
+// `Executor`'s trait methods (`run`, `home_dir`) are called only by the
+// macOS-gated test below, so the import is unused on Linux (`-D warnings`).
+#[cfg(target_os = "macos")]
+use aitm_ca::exec::Executor;
 use aitm_ca::store::Platform;
 use aitm_ca::CaPlugin;
 use aitm_core::{
@@ -48,6 +52,8 @@ impl ProxyClient for StubClient {
 /// it, driven through the real plugin from the human CLI.
 struct RealHarness {
     base: PathBuf,
+    // Read only by the macOS-gated test (macos_round_trip); dead on Linux.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     cert_path: PathBuf,
     audit_path: PathBuf,
     reg: Registry,

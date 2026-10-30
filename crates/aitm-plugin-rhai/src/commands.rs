@@ -49,8 +49,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    Command, CommandHost, Frontend, ParamDef, ParamSchema, Params, Plugin, Registry, Sensitivity,
-    TypeDesc, Value,
+    CallerTrust, Command, CommandHost, Frontend, ParamDef, ParamSchema, Params, Plugin, Registry,
+    Sensitivity, TypeDesc, Value,
 };
 
 use crate::config::{ScriptEntry, ScriptMeta};
@@ -555,6 +555,10 @@ impl Command for Save {
                     .map_err(|err| anyhow::anyhow!("{err}"))?;
                 handle.swap(ast, fresh);
                 handle.set_enabled(enable);
+                // The save re-authors the script: its hooks now carry the saving
+                // frontend's trust, so an agent re-saving an operator script
+                // cannot keep its operator-level seam powers (fail-closed).
+                handle.set_authoring_trust(CallerTrust::from(host.frontend()));
                 self.errors.clear(&name);
                 tracing::info!(
                     target: "aitm_plugin_rhai::loader",
@@ -574,7 +578,13 @@ impl Command for Save {
                 let script = self
                     .loader
                     .load_one(&entry)
-                    .map_err(|err| anyhow::anyhow!("{err}"))?;
+                    .map_err(|err| anyhow::anyhow!("{err}"))?
+                    // `load_one` defaults to the least-privilege `Agent`
+                    // (config-placed = unknown provenance); this in-session save
+                    // carries the saving frontend's true trust instead, so an
+                    // operator-saved script's hooks are gated `Operator` and an
+                    // agent-saved script's `Agent` this session (spec AC6, Open-Q 1).
+                    .with_authoring_trust(CallerTrust::from(host.frontend()));
                 script.handle().set_enabled(enable);
                 // Append atomically: `find_handle` above and this append are not
                 // one step, so a concurrent save of the same brand-new name could
@@ -596,6 +606,7 @@ impl Command for Save {
                         .map_err(|err| anyhow::anyhow!("{err}"))?;
                     handle.swap(ast, fresh);
                     handle.set_enabled(enable);
+                    handle.set_authoring_trust(CallerTrust::from(host.frontend()));
                     self.errors.clear(&name);
                     tracing::info!(
                         target: "aitm_plugin_rhai::loader",

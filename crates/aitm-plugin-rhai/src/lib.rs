@@ -42,7 +42,7 @@ pub use error::ScriptError;
 pub use host_core::{
     Finding, FindingSink, MemoryFindingSink, Options, ScriptCapability, ScriptServices,
 };
-pub use host_registry::{registered_host_fns, HostRegistry};
+pub use host_registry::{registered_host_fns, seed_call_context, CallContextGuard, HostRegistry};
 pub use loader::{RhaiLoader, SUPPORTED_API};
 pub use plugin::{ErrorSink, LoadedScript, ScriptHandle, ScriptHost, ScriptSet};
 pub use poc_step::{RhaiScriptExecutor, ScriptVars, VarsCapability};

@@ -24,6 +24,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use aitm_core::CallerTrust;
 use aitm_plugin::language::ProtocolLanguage;
 use rhai::{Dynamic, Engine, ParseError, ParseErrorType, AST};
 
@@ -286,6 +287,18 @@ impl RhaiLoader {
             options,
             &self.cfg,
         )
+        // A config entry names a file PATH, not evidence of who authored its
+        // CONTENTS, so a config-loaded (startup / reload) script's authorship is
+        // genuinely UNKNOWN. Fail-closed to the LEAST privilege `Agent`, never
+        // `Operator`: an agent-authored hook persisted and reloaded after a
+        // restart must not regain operator trust and run agent-gated L4 effects
+        // (architect ruling). Worst case is an operator script over-restricted
+        // after a restart (safe deny), never an agent script over-privileged
+        // (unsafe allow). An in-session `script.save` carries positive evidence
+        // of the saving frontend and overrides this on the live script
+        // (commands.rs). Persisting TRUE operator authorship across restart is a
+        // separate follow-up (spec Open-Q 1).
+        .with_authoring_trust(CallerTrust::Agent)
         .with_error_sink(Arc::clone(&self.errors)))
     }
 

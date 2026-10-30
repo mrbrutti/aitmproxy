@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use aitm_core::{
-    Body, ConnInfo, Event, Flow, FlowCtx, FlowId, FlowMeta, HeaderMap, HttpFlow, HttpRequest,
-    HttpVersion, InterceptState, MemFlowStore, ProxyClient, StdGuard, Value, Verdict,
+    Body, CallerTrust, ConnInfo, Event, Flow, FlowCtx, FlowId, FlowMeta, HeaderMap, HttpFlow,
+    HttpRequest, HttpVersion, InterceptState, MemFlowStore, ProxyClient, StdGuard, Value, Verdict,
 };
 use aitm_plugin_rhai::config::{RhaiConfig, RhaiLimits, ScriptEntry};
 use aitm_plugin_rhai::error::ScriptError;
@@ -532,5 +532,39 @@ async fn new_reports_an_unbuildable_engine() {
     assert_eq!(
         script, "prelude",
         "the error names the prelude, not a user script"
+    );
+}
+
+/// Security (architect ruling): a script loaded from **config** carries no proof
+/// of who authored its *contents* — a config entry names a file PATH only. Such
+/// unknown/unprovable authorship must seed the **least privilege**
+/// `CallerTrust::Agent`, never `Operator`: an agent-authored hook persisted and
+/// reloaded after a restart must NOT regain operator trust and run agent-gated
+/// L4 effects. The worst case is an operator script over-restricted after a
+/// restart (safe deny), never an agent script over-privileged (unsafe allow).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_loaded_script_defaults_to_agent_authorship() {
+    let script = TempScript::new("provenance", r#"fn on_request(flow) {}"#);
+
+    // `load_one`: a single config entry.
+    let one = loader(vec![], false);
+    let loaded = one
+        .load_one(&ScriptEntry::new(script.path()))
+        .expect("the script loads");
+    assert_eq!(
+        loaded.handle().authoring_trust(),
+        CallerTrust::Agent,
+        "a config-loaded script of unknown provenance must seed least-privilege Agent"
+    );
+
+    // `load_all`: the startup path the proxy uses.
+    let all = loader(vec![ScriptEntry::new(script.path())], false);
+    let (plugins, errors) = all.load_all();
+    assert!(errors.is_empty(), "the script compiles: {errors:?}");
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(
+        plugins[0].handle().authoring_trust(),
+        CallerTrust::Agent,
+        "load_all must seed a config-loaded script's authorship as Agent, never Operator"
     );
 }

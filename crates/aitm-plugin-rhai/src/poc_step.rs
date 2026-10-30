@@ -37,6 +37,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use aitm_core::CallerTrust;
 use aitm_poc::{
     ScriptStep, ScriptStepCtx, ScriptStepError, ScriptStepExecutor, ScriptVerdict, VarBindings,
 };
@@ -46,6 +47,7 @@ use crate::config::{DEFAULT_BROWSER_TIMEOUT, DEFAULT_HOOK_TIMEOUT};
 use crate::engine::{begin_run, blocking, Budget, RunKind};
 use crate::error::ScriptError;
 use crate::host_core::{ScriptCapability, ScriptServices};
+use crate::host_registry::seed_call_context;
 use crate::marshal::{dynamic_to_value, value_to_dynamic};
 
 /// Runs PoC `script` steps on the shared engine.
@@ -160,8 +162,21 @@ impl ScriptStepExecutor for RhaiScriptExecutor {
             // constant, and `vars.set(...)` is one.
             .push("vars", vars.clone());
 
+        // Seed the per-eval caller trust from the PoC run's frontend before the
+        // step evaluates, so a seam host fn the step calls (`l4.*`, …) is gated on
+        // the live caller — `Agent` for an agent-driven `poc.run`, `Operator` for
+        // a human one — and never fails closed for a missing context (spec AC5
+        // script face, AC3). The guard is held across the whole eval, so a seam
+        // call nested in the step still observes it.
+        let caller = CallerTrust::from(ctx.host.frontend());
+        // A PoC `script:` step carries no options, so the per-eval tag stays `None`
+        // (`option(...)` reads `()`); the call source is the step's name, which the
+        // seam-migrated `finding(...)` records off `HostCallCtx::call_source()` —
+        // identical to the pre-seam `NativeCallContext` AST source set at compile.
+        let source = Some(name.to_string());
         let result = blocking(|| {
             let _run = begin_run(RunKind::PocStep, self.budget);
+            let _seed = seed_call_context(caller, None, source);
             self.engine.eval_ast_with_scope::<Dynamic>(&mut scope, &ast)
         });
 

@@ -1,0 +1,66 @@
+# nfpm package definition for aitmproxy Linux .deb/.rpm packages.
+#
+# Templated: scripts/package-linux.sh exports VERSION, ARCH, STAGEDIR and
+# MAINTAINER before invoking `nfpm pkg`; nfpm expands ${...} from the
+# environment. One config emits both formats and both arches
+# (spec §B, docs/research/10-linux-packaging.md).
+# Schema: https://nfpm.goreleaser.com/configuration/
+#
+# Install layout (spec §B / research §3):
+#   /usr/lib/aitmproxy/{aitm,obscura,aitm-tui}  — the three binaries
+#   /usr/bin/aitm      -> /usr/lib/aitmproxy/aitm       (symlink)
+#   /usr/bin/aitm-tui  -> /usr/lib/aitmproxy/aitm-tui   (symlink)
+# obscura is deliberately NOT symlinked into /usr/bin: it is not a user
+# command. aitm's discovery resolves /usr/bin/aitm via current_exe() to
+# /usr/lib/aitmproxy/aitm and finds obscura beside it.
+
+name: "aitmproxy"
+# ARCH is a GOARCH value (amd64|arm64); nfpm emits the right deb arch and
+# maps arm64->aarch64 / amd64->x86_64 for rpm automatically.
+arch: "${ARCH}"
+platform: "linux"
+version: "${VERSION}"
+section: "net"
+priority: "optional"
+maintainer: "${MAINTAINER}"
+vendor: "aitmproxy"
+homepage: "https://github.com/mrbrutti/aitmproxy"
+license: "MIT OR Apache-2.0"
+description: |
+  aitmproxy intercepting-proxy platform for authorized security testing.
+  Bundles the aitm CLI/proxy, the aitm-tui operator UI, and the obscura
+  browser engine (auto-discovered beside aitm).
+
+# obscura's direct DT_NEEDED is glibc + libgcc + the dynamic loader only
+# (docs/research/10-linux-packaging.md §2). nfpm does not auto-scan ELF
+# dependencies, so they are declared explicitly. Debian/Ubuntu names:
+depends:
+  - libc6
+  - libgcc-s1
+
+overrides:
+  rpm:
+    # Fedora/RHEL family package names for the same libraries.
+    depends:
+      - glibc
+      - libgcc
+
+contents:
+  - src: "${STAGEDIR}/usr/lib/aitmproxy/aitm"
+    dst: "/usr/lib/aitmproxy/aitm"
+    file_info:
+      mode: "0755"
+  - src: "${STAGEDIR}/usr/lib/aitmproxy/obscura"
+    dst: "/usr/lib/aitmproxy/obscura"
+    file_info:
+      mode: "0755"
+  - src: "${STAGEDIR}/usr/lib/aitmproxy/aitm-tui"
+    dst: "/usr/lib/aitmproxy/aitm-tui"
+    file_info:
+      mode: "0755"
+  - src: "/usr/lib/aitmproxy/aitm"
+    dst: "/usr/bin/aitm"
+    type: symlink
+  - src: "/usr/lib/aitmproxy/aitm-tui"
+    dst: "/usr/bin/aitm-tui"
+    type: symlink

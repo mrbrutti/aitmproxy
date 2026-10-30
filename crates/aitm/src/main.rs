@@ -187,7 +187,35 @@ async fn run() -> anyhow::Result<()> {
         rt: tokio::runtime::Handle::current(),
     };
     let strict = rhai_cfg.strict;
-    let tier = aitm_plugin_rhai::wire::build(rhai_cfg, script_services)?;
+    // L4 goes live on the ONE shared scripting engine (hooks, PoC `script:` steps,
+    // `ScriptCommands`) when `l4.enabled`. The live `L4Language` shares the SAME
+    // deny-by-default guard + flow store the `l4.*` command module will own (threaded
+    // in via `Features::l4_shared` below), so a script's `l4.scope.add` and the bus
+    // see one L4 engagement state. The agent gate is enforced per call on the live
+    // caller trust — no build-time `agent_sourced` bool. Built before the tier because
+    // the engine must install the language at build time; `None` when L4 is disabled
+    // leaves the scripting engine without an `l4.*` namespace (deny-by-default).
+    let l4_shared = l4.enabled.then(|| aitm::wire::L4Shared {
+        guard: Arc::new(aitm_proto_l4::guard::L4Guard::new(&l4)),
+        store: Arc::new(aitm_proto_l4::flow::InMemoryL4FlowStore::new()),
+    });
+    let l4_language = l4_shared.as_ref().map(|shared| {
+        aitm_proto_l4::L4Language::new(
+            shared.guard.clone(),
+            Arc::new(aitm_proto_l4::backend::pcap::PcapBackend::new()),
+            shared.store.clone(),
+        )
+    });
+    let languages: Vec<&dyn aitm_plugin::language::ProtocolLanguage> = match &l4_language {
+        Some(lang) => vec![lang],
+        None => Vec::new(),
+    };
+    let tier = aitm_plugin_rhai::wire::build_with_languages(rhai_cfg, script_services, &languages)?;
+    // The language only had to live long enough to install its host fns on the engine
+    // (which holds its own `Arc` clones of the shared state); drop the borrow so the
+    // shared handle can move into `Features` below.
+    drop(languages);
+    drop(l4_language);
     for err in &tier.errors {
         warn!(target: "aitm::scripts", "{err}");
     }
@@ -229,6 +257,7 @@ async fn run() -> anyhow::Result<()> {
         &cfg,
         &Features {
             l4,
+            l4_shared,
             ..Features::default()
         },
         ScriptWiring {

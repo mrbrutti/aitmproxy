@@ -2,16 +2,26 @@
 //! `ScriptCapability` seam (spec §6a), and its first two providers — the
 //! `log`/`finding`/`option` verbs (plan Task 6).
 //!
-//! Two per-run facts reach a host verb through Rhai itself, so the one shared
-//! engine never has to know which script is calling:
+//! Two per-run facts reach `option`/`finding` through the per-invocation
+//! [`HostCallCtx`] the seam threads (plan `2026-10-29-aitmproxy-seam-per-invocation-context`
+//! Task 5), so the one shared engine never has to know which script is calling,
+//! and these verbs read them off the seam rather than rhai's `NativeCallContext`:
 //!
-//! - **Who is calling.** The loader names each compiled `AST` after its script
-//!   (`AST::set_source`); `finding(...)` reads it back as the caller's source
-//!   and records it as `Finding::source`.
-//! - **The script's options.** The hook dispatcher passes the script's
-//!   [`Options`] as the run's *tag* (`CallFnOptions::with_tag`); `option(name)`
-//!   reads the tag. A run with no tag (a PoC step, a bare `run`) has no options
-//!   and every `option(...)` is `()`.
+//! - **Who is calling.** Each invocation boundary (hook dispatch, command invoke,
+//!   `load`, a PoC `script:` step) seeds the script's source into the per-eval
+//!   context (`seed_call_context`); `finding(...)` reads it back off
+//!   [`HostCallCtx::call_source`] and records it as [`Finding::source`] (an
+//!   unnamed source stays `"<unnamed script>"`).
+//! - **The script's options.** The same boundary seeds the script's [`Options`]
+//!   as the per-eval *tag* (a rhai-free [`Value::Object`], via [`Options::to_value`]);
+//!   `option(name)` reads it off [`HostCallCtx::tag`]. A run whose boundary seeded
+//!   no options (a PoC step, a bare run) has no tag and every `option(...)` is `()`.
+//!
+//! Both verbs are [`Guarded`] host fns dispatched through
+//! [`run_seam_global`](crate::host_registry::run_seam_global) — kept GLOBAL rhai
+//! functions so the call syntax `option(...)` / `finding(#{…})` is unchanged — and
+//! are refused fail-closed when an eval reaches them without a seeded caller
+//! context (never defaulted to operator).
 //!
 //! The guarded async namespaces (`http`, `browser`, `store`, `scope`) are
 //! Task 7's providers in `host_net`.
@@ -23,9 +33,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
 use aitm_core::{BrowserDriver, FlowId, FlowStore, ProxyClient, ScopeRateGuard, Value};
+use aitm_plugin::language::{GuardHandle, Guarded, HostCallCtx, HostError, HostFn};
 use aitm_poc::Severity;
-use rhai::{Dynamic, Engine, EvalAltResult, Module, NativeCallContext, Position};
+use rhai::{Dynamic, Engine, EvalAltResult, Module, Position};
 
+use crate::host_registry::run_seam_global;
 use crate::marshal::{dynamic_to_value, value_to_dynamic};
 
 /// The host services a script may reach: exactly the handles `CommandHost`
@@ -142,6 +154,35 @@ impl Options {
     pub fn insert(&mut self, name: impl Into<String>, value: Value) -> Option<Value> {
         self.0.insert(name.into(), value)
     }
+
+    /// This option set as a seam [`Value::Object`], the shape an invocation
+    /// boundary seeds as the per-eval **tag** (`seed_call_context`) so the
+    /// seam-migrated `option(name)` can read it via [`HostCallCtx::tag`]. Replaces
+    /// the pre-seam rhai `CallFnOptions::with_tag(Options)` custom-type tag, which
+    /// the rhai-free seam could not carry.
+    pub fn to_value(&self) -> Value {
+        Value::Object(self.0.clone())
+    }
+}
+
+/// The guard for the first-party `option`/`finding` verbs. `option` is a forgiving
+/// read of the run's options and `finding` is a report-only sink — neither reaches
+/// the wire nor is agent-gated, so this guard deliberately **overrides** the seam's
+/// deny-by-default to admit every call. The per-call caller trust still rides in
+/// [`HostCallCtx`], and [`run_seam_global`] still refuses an *unseeded* eval
+/// fail-closed before this guard is consulted; what this guard documents is that,
+/// *once seeded*, these two verbs are open to operator and agent alike (unlike an
+/// `l4.*` effect).
+struct FirstPartyGuard;
+
+impl GuardHandle for FirstPartyGuard {
+    fn guard_name(&self) -> &str {
+        "core"
+    }
+
+    fn permit(&self, _ctx: &HostCallCtx, _fn_name: &str) -> Result<(), HostError> {
+        Ok(())
+    }
 }
 
 /// One capability == one namespace of script verbs (spec §6a). The engine
@@ -204,15 +245,41 @@ impl ScriptCapability for LogCapability {
             })
             .register_fn("log", |msg: &str| {
                 tracing::info!(target: SCRIPT_TARGET, "{msg}");
-            })
-            .register_fn("option", |ctx: NativeCallContext, name: &str| -> Dynamic {
-                // Option C: an unset option — or a run with no options at all
-                // — reads as `()`, never an error.
-                ctx.tag()
-                    .and_then(|tag| tag.read_lock::<Options>())
-                    .and_then(|options| options.get(name).map(value_to_dynamic))
-                    .unwrap_or(Dynamic::UNIT)
             });
+
+        // `option(name)` on the host-fn seam: a `Guarded<HostFn>` reading the
+        // per-eval tag off `HostCallCtx` (the options the boundary seeds), kept a
+        // GLOBAL rhai fn so `option("x")` is unchanged (AC7). Option C: an unset
+        // option — or a run whose boundary seeded no options — reads as `()`,
+        // never an error.
+        let option_fn: HostFn = Box::new(|ctx: &HostCallCtx, args: &[Value]| {
+            let name = match args.first() {
+                Some(Value::Str(name)) => name.as_str(),
+                _ => return Ok(Value::Null),
+            };
+            match ctx.tag() {
+                Some(Value::Object(options)) => {
+                    Ok(options.get(name).cloned().unwrap_or(Value::Null))
+                }
+                _ => Ok(Value::Null),
+            }
+        });
+        let (option_guard, option_fn) =
+            Guarded::new(Box::new(FirstPartyGuard), option_fn).into_parts();
+        engine.register_fn(
+            "option",
+            move |name: &str| -> Result<Dynamic, Box<EvalAltResult>> {
+                let out = run_seam_global(
+                    "log",
+                    "option",
+                    option_guard.as_ref(),
+                    &option_fn,
+                    &[Value::Str(name.to_string())],
+                )
+                .map_err(host_error)?;
+                Ok(value_to_dynamic(&out))
+            },
+        );
 
         // `log` is a global constant so `log.warn("…")` reads as a namespace.
         let mut module = Module::new();
@@ -232,13 +299,43 @@ impl ScriptCapability for FindingCapability {
 
     fn register(&self, engine: &mut Engine, services: &ScriptServices) {
         let sink = Arc::clone(&services.findings);
+        // `finding(...)` on the host-fn seam: a `Guarded<HostFn>` reading the
+        // call's provenance off `HostCallCtx::call_source()` (the source the
+        // boundary seeds), kept a GLOBAL rhai fn so `finding(#{…})` is unchanged
+        // (AC7). The seam context carries no source for a boundary that named none
+        // (empty string), preserved as the historical `"<unnamed script>"`.
+        let finding_fn: HostFn = Box::new(move |ctx: &HostCallCtx, args: &[Value]| {
+            let source = ctx.call_source();
+            let source = if source.is_empty() {
+                "<unnamed script>"
+            } else {
+                source
+            };
+            let map = args
+                .first()
+                .ok_or_else(|| HostError::BadArgs("finding(...) takes a map".to_string()))?;
+            let finding = parse_finding(map, source)?;
+            sink.record(finding);
+            Ok(Value::Null)
+        });
+        let (guard, finding_fn) = Guarded::new(Box::new(FirstPartyGuard), finding_fn).into_parts();
         engine.register_fn(
             "finding",
-            move |ctx: NativeCallContext, map: rhai::Map| -> Result<(), Box<EvalAltResult>> {
-                let source = ctx.call_source().unwrap_or("<unnamed script>");
-                let finding = parse_finding(map, source)?;
-                sink.record(finding);
-                Ok(())
+            move |map: rhai::Map| -> Result<Dynamic, Box<EvalAltResult>> {
+                // Marshal the rhai map to a rhai-free `Value` before it crosses the
+                // seam; a value the bus cannot carry is the same catchable error as
+                // before the migration.
+                let value = dynamic_to_value(&Dynamic::from_map(map))
+                    .map_err(|err| finding_error(format!("finding(...): {err}")))?;
+                let out = run_seam_global(
+                    "finding",
+                    "finding",
+                    guard.as_ref(),
+                    &finding_fn,
+                    std::slice::from_ref(&value),
+                )
+                .map_err(host_error)?;
+                Ok(value_to_dynamic(&out))
             },
         );
     }
@@ -250,48 +347,43 @@ const FINDING_KEYS: [&str; 5] = ["name", "severity", "flow_id", "detail", "tags"
 /// Turn the script's `#{ … }` into a [`Finding`], or an error that says which
 /// field is wrong and what it should be (ergonomics rule 6). Reporting is an
 /// action, so malformed input is refused, not forgiven.
-fn parse_finding(map: rhai::Map, source: &str) -> Result<Finding, Box<EvalAltResult>> {
-    let fields = match dynamic_to_value(&Dynamic::from_map(map)) {
-        Ok(Value::Object(fields)) => fields,
-        Ok(_) => return Err(finding_error("finding(...) takes a map")),
-        Err(err) => return Err(finding_error(format!("finding(...): {err}"))),
+fn parse_finding(map: &Value, source: &str) -> Result<Finding, HostError> {
+    let fields = match map {
+        Value::Object(fields) => fields,
+        _ => return Err(bad("finding(...) takes a map")),
     };
 
     if let Some(unknown) = fields.keys().find(|k| !FINDING_KEYS.contains(&k.as_str())) {
-        return Err(finding_error(format!(
+        return Err(bad(format!(
             "finding(...) has no field '{unknown}'; the fields are {}",
             FINDING_KEYS.join(", ")
         )));
     }
 
-    let name = match str_field(&fields, "name")? {
+    let name = match str_field(fields, "name")? {
         Some(name) if !name.is_empty() => name,
-        _ => {
-            return Err(finding_error(
-                "finding(...) needs a non-empty 'name' string",
-            ))
-        }
+        _ => return Err(bad("finding(...) needs a non-empty 'name' string")),
     };
 
-    let severity = match str_field(&fields, "severity")? {
+    let severity = match str_field(fields, "severity")? {
         Some(text) => parse_severity(&text).ok_or_else(|| {
-            finding_error(format!(
+            bad(format!(
                 "finding(...) has unknown severity \"{text}\"; use info, low, medium, high or critical"
             ))
         })?,
-        None => return Err(finding_error("finding(...) needs a 'severity' string")),
+        None => return Err(bad("finding(...) needs a 'severity' string")),
     };
 
-    let flow = match str_field(&fields, "flow_id")? {
+    let flow = match str_field(fields, "flow_id")? {
         Some(id) => Some(FlowId::from_str(&id).map_err(|_| {
-            finding_error(format!(
+            bad(format!(
                 "finding(...) 'flow_id' must be a flow id like flow.id, got \"{id}\""
             ))
         })?),
         None => None,
     };
 
-    let detail = str_field(&fields, "detail")?;
+    let detail = str_field(fields, "detail")?;
 
     let tags = match fields.get("tags") {
         None | Some(Value::Null) => Vec::new(),
@@ -299,14 +391,14 @@ fn parse_finding(map: rhai::Map, source: &str) -> Result<Finding, Box<EvalAltRes
             .iter()
             .map(|item| match item {
                 Value::Str(tag) => Ok(tag.clone()),
-                other => Err(finding_error(format!(
+                other => Err(bad(format!(
                     "finding(...) 'tags' must be an array of strings, found {}",
                     value_kind(other)
                 ))),
             })
             .collect::<Result<Vec<_>, _>>()?,
         Some(other) => {
-            return Err(finding_error(format!(
+            return Err(bad(format!(
                 "finding(...) 'tags' must be an array of strings, got {}",
                 value_kind(other)
             )))
@@ -325,14 +417,11 @@ fn parse_finding(map: rhai::Map, source: &str) -> Result<Finding, Box<EvalAltRes
 }
 
 /// An optional string field; present-but-not-a-string is an error naming it.
-fn str_field(
-    fields: &BTreeMap<String, Value>,
-    key: &str,
-) -> Result<Option<String>, Box<EvalAltResult>> {
+fn str_field(fields: &BTreeMap<String, Value>, key: &str) -> Result<Option<String>, HostError> {
     match fields.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Str(s)) => Ok(Some(s.clone())),
-        Some(other) => Err(finding_error(format!(
+        Some(other) => Err(bad(format!(
             "finding(...) '{key}' must be a string, got {}",
             value_kind(other)
         ))),
@@ -377,7 +466,25 @@ fn value_kind(v: &Value) -> &'static str {
     }
 }
 
-/// A catchable runtime error; the engine fills in the call position.
+/// A seam [`HostError`] for a malformed `finding(...)` argument: the host-fn body
+/// reads only `aitm_core` types, so its parse failures surface as the seam's
+/// rhai-free [`HostError::BadArgs`]. [`run_seam_global`]'s caller turns it into the
+/// same catchable Rhai runtime error [`finding_error`] builds, so the script sees
+/// an identical message before and after the migration.
+fn bad(message: impl Into<String>) -> HostError {
+    HostError::BadArgs(message.into())
+}
+
+/// A seam [`HostError`] as the script catches it: a catchable Rhai runtime error
+/// carrying the one-line message. Used where the global `option`/`finding` bridge
+/// turns a seam result back into a Rhai value.
+fn host_error(err: HostError) -> Box<EvalAltResult> {
+    EvalAltResult::ErrorRuntime(Dynamic::from(err.to_string()), Position::NONE).into()
+}
+
+/// A catchable runtime error; the engine fills in the call position. Kept for the
+/// `finding` bridge's pre-seam marshalling step (a rhai map the bus cannot carry),
+/// which fails before the value crosses into the rhai-free host fn.
 fn finding_error(message: impl Into<String>) -> Box<EvalAltResult> {
     EvalAltResult::ErrorRuntime(Dynamic::from(message.into()), Position::NONE).into()
 }
