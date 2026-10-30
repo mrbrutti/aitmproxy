@@ -79,10 +79,17 @@ that scripts and PoCs lean on.
   browser, clock, or filesystem, and are therefore **not** routed through
   `ScopeRateGuard` or the SSRF check. This is a deliberate security property:
   deny-by-default is unaffected because nothing here reaches outside the engine.
-- **Output is bounded** by the engine's existing operation/time budget: every
-  helper's output is a bounded function of its input length (`rand_text_alpha(n)`
-  by `n`), and a runaway script is already aborted by `max_operations` /
-  `hook_timeout`. No new amplification path.
+- **Output is bounded.** For helpers whose output tracks an existing *string*
+  input (`b64_*`, `hex_encode`, `sha256`, `md5`, `url_encode`), the input is
+  already capped by the engine's `max_string_size` (10 MB) and the expansion is a
+  bounded constant factor. **`rand_text_alpha(n)` is the exception: its size is a
+  script-supplied integer, NOT a string, so the op/time budget does not bound it
+  — a single native allocation completes before `max_operations`/`hook_timeout`
+  can fire.** It MUST therefore enforce the existing `aitm_poc::dsl::MAX_RAND_TEXT_ALPHA`
+  (4096) cap and return a catchable error above it (mirroring the PoC precheck).
+  With that cap in place there is no new amplification path. *(Corrected after
+  the Stage-6 security+quality review of PR #59, which caught the draft's flawed
+  "bounded by the op budget" premise.)*
 - **Determinism.** Every helper is deterministic except `rand_text_alpha` and
   `rand_int`, which draw from `aitm-poc::dsl`'s thread-local xorshift RNG seeded
   once from process start time. This is **not** cryptographically secure and is

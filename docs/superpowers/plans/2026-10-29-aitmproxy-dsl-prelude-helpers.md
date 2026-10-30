@@ -122,7 +122,13 @@ Literal digests used below are the published test vectors:
     `rand_int`)
 - **Change:** register in `register_dsl`:
   - `rand_text_alpha(i64) -> String` delegating to
-    `aitm_poc::dsl::rand_text_alpha(n.max(0) as usize)`.
+    `aitm_poc::dsl::rand_text_alpha(n as usize)` for `0 <= n <=
+    aitm_poc::dsl::MAX_RAND_TEXT_ALPHA`; when `n > MAX_RAND_TEXT_ALPHA` return a
+    catchable `dsl_error` (do NOT clamp silently — error, mirroring the PoC
+    precheck and `rand_int`/`b64_decode`). Negative `n` → `""`. **Without the cap
+    this is a single-call unbounded allocation that `max_operations`/`hook_timeout`
+    cannot interrupt — a memory-exhaustion/panic path (Stage-6 security+quality,
+    PR #59).**
   - `rand_int(i64, i64) -> Result<i64, Box<EvalAltResult>>` — `a > b` →
     catchable `ErrorRuntime`; otherwise `aitm_poc::dsl::rand_int(a, b)`
     (inclusive).
@@ -131,6 +137,9 @@ Literal digests used below are the published test vectors:
     `is_ascii_alphabetic()`.
   - `rand_int(5, 5)` == `5`.
   - a `try { rand_int(5, 1) } catch(e) { "caught" }` script yields `"caught"`.
+  - `rand_text_alpha(MAX_RAND_TEXT_ALPHA)` is length `MAX_RAND_TEXT_ALPHA`; an
+    oversize length (e.g. `MAX_RAND_TEXT_ALPHA + 1` and a huge value) is a
+    catchable error, NOT an allocation.
 - **Done when:** the test passes.
 
 ### Task 5: Regex family (`regex_match`, `regex_extract`)
@@ -189,8 +198,16 @@ Literal digests used below are the published test vectors:
 
 ## Review log
 
+Stage-6 panel on PR #59 (origin/claude/dsl-prelude-helpers-523ec9):
+
 | Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
+| 4 | Security + Quality | Important (gating) | `rand_text_alpha(n)` uncapped in the Rhai layer → single-call ~2 GB alloc / capacity-overflow panic, outside the op/time budget; drops the PoC's `MAX_RAND_TEXT_ALPHA` cap | FIX required — error (not clamp) above `MAX_RAND_TEXT_ALPHA` + Rhai-side test; plan Task 4 + spec Constraint corrected |
+| 5 | Quality | Minor | AC4 edge branches untested: `regex_extract` out-of-range / negative group; `b64_decode` non-UTF-8 | FIX — add the three edge tests |
+| 3 | Quality | Minor | No end-to-end `RhaiLoader`/PoC `script:` test for AC3 (only bare `register_dsl` + api_catalog bijection) | FIX — add one end-to-end helper-call test |
+| 1 | Quality | Minor | Bundled proto-l4 `VecDeque` pre-flight fix widens the diff | Accepted (declared allowance) — recorded in PR body |
+| 5 | Security | Minor | `regex::Regex::new` compiles a script pattern inside one op | No action — regex crate's 10 MB `size_limit` + linear matching + 10 MB `max_string_size` bound it; catchable error, not OOM |
+| all | Spec | — | Fully conformant; all ACs met and tested; nothing unrequested | PASS |
 
 ## Shipped
 
