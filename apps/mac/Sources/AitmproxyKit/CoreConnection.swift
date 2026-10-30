@@ -71,19 +71,25 @@ public struct CoreConnection: Identifiable, Hashable, Sendable {
     public var status: Status
     /// Operator-facing name, e.g. "Embedded core" or a `host:port`.
     public var label: String
+    /// The proxy's actual bound `host:port` — may be an auto-chosen alternate when
+    /// the preferred port was taken (AC9), which is what the toolbar must show. nil
+    /// until the core reports ready.
+    public var proxyAddress: String?
 
     public init(
         id: CoreID = CoreID(),
         kind: Kind,
         endpoint: BusEndpoint,
         status: Status,
-        label: String
+        label: String,
+        proxyAddress: String? = nil
     ) {
         self.id = id
         self.kind = kind
         self.endpoint = endpoint
         self.status = status
         self.label = label
+        self.proxyAddress = proxyAddress
     }
 }
 

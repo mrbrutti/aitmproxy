@@ -2,47 +2,38 @@ import AitmBusClient
 import AitmproxyKit
 import SwiftUI
 
-/// The Scripts page (S-060): one row per Rhai script — name, rule summary,
-/// phases, status dot + text, a flat switch. `script.list/enable/disable`
-/// are F8; until then the fixture list stands in, with a note.
+/// The Scripts page (S-060): a master list of Rhai scripts on the left (name,
+/// rule, phases, status dot, enable switch) and a detail pane on the right that
+/// shows the selected script's status, its *full* error (the list shows only a
+/// one-line summary), its rule and phases. Live source and console land when the
+/// core serves `script.get` / `script.log` (F8).
 struct ScriptsPanel: View {
     @Environment(Session.self) private var session
     @State private var scripts: [ScriptInfo] = []
+    @State private var selected: String?
     @State private var note: String?
 
     private static let phaseChip = ColorPair(fg: Tok.Ink.secondary, bg: Tok.Ground.raised)
 
     private var hasBusList: Bool { session.tools.contains { $0.name == "script.list" } }
     private var hasBusToggle: Bool { session.tools.contains { $0.name == "script.enable" } }
+    private var selectedScript: ScriptInfo? { scripts.first { $0.id == selected } }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: Space.md) {
-                TrackedLabel("Scripts")
-                Spacer(minLength: Space.sm)
-                Text("\(scripts.filter(\.isActive).count) active")
-                    .font(Tok.Face.ui(Tok.Typography.Size.sm))
-                    .foregroundStyle(Tok.Ink.secondary.color)
-            }
-            .padding(.horizontal, Space.margin)
-            .frame(height: Tok.Size.filterBar)
+            header
             Rule()
             if let note {
                 Hint(text: note).padding(.leading, Space.margin).frame(maxWidth: .infinity, alignment: .leading)
                 Rule(color: Tok.Line.rule)
             }
             if scripts.isEmpty {
-                VStack(spacing: Space.sm) {
-                    Text("No scripts loaded.").font(Tok.Face.ui(Tok.Typography.Size.xl, .medium)).foregroundStyle(Tok.Ink.primary.color)
-                    Text("Drop a .rhai file into the proxy's scripts folder; it lists here.")
-                        .font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.tertiary.color)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                empty
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(scripts) { script in row(script) }
-                    }
+                HStack(spacing: 0) {
+                    list.frame(width: 360)
+                    VRule()
+                    ScriptDetail(script: selectedScript).frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
         }
@@ -53,41 +44,66 @@ struct ScriptsPanel: View {
         .onChange(of: session.tools) { Task { await load() } }
     }
 
-    private func row(_ script: ScriptInfo) -> some View {
-        HStack(alignment: .center, spacing: Space.md) {
-            Circle().fill(dotColor(script).color).frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
-            VStack(alignment: .leading, spacing: Space.xs) {
-                HStack(spacing: Space.sm) {
-                    Text(script.name).font(Tok.Face.ui(Tok.Typography.Size.md, .medium)).foregroundStyle(Tok.Ink.primary.color)
-                    ForEach(script.phases, id: \.self) { phase in
-                        Badge(text: phase, pair: Self.phaseChip, uppercase: false)
-                    }
-                }
-                Text(script.ruleSummary)
-                    .font(Tok.Face.data(Tok.Typography.Size.sm))
-                    .foregroundStyle(Tok.Ink.tertiary.color)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
+    private var header: some View {
+        HStack(spacing: Space.md) {
+            TrackedLabel("Scripts")
             Spacer(minLength: Space.sm)
-            Text(script.statusText)
+            Text("\(scripts.filter(\.isActive).count) active")
                 .font(Tok.Face.ui(Tok.Typography.Size.sm))
-                .foregroundStyle(script.error == nil ? Tok.Ink.secondary.color : Tok.Status.serverError.color)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: 320, alignment: .trailing)
-                .help(script.statusText)
-            Toggle(script.name, isOn: Binding(get: { script.enabled }, set: { setEnabled(script, $0) }))
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .labelsHidden()
-                .accessibilityLabel(script.name)
+                .foregroundStyle(Tok.Ink.secondary.color)
         }
         .padding(.horizontal, Space.margin)
-        .padding(.vertical, Space.sm)
-        .frame(minHeight: Tok.Size.Row.comfortable)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .overlay(alignment: .bottom) { Rule(color: Tok.Line.rule) }
+        .frame(height: Tok.Size.filterBar)
+    }
+
+    private var empty: some View {
+        VStack(spacing: Space.sm) {
+            Text("No scripts loaded.").font(Tok.Face.ui(Tok.Typography.Size.xl, .medium)).foregroundStyle(Tok.Ink.primary.color)
+            Text("Drop a .rhai file into the proxy's scripts folder; it lists here.")
+                .font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.tertiary.color)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var list: some View {
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                ForEach(scripts) { script in row(script) }
+            }
+        }
+    }
+
+    private func row(_ script: ScriptInfo) -> some View {
+        Button { selected = script.id } label: {
+            HStack(alignment: .center, spacing: Space.md) {
+                Circle().fill(dotColor(script).color).frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
+                VStack(alignment: .leading, spacing: Space.xs) {
+                    HStack(spacing: Space.sm) {
+                        Text(script.name).font(Tok.Face.ui(Tok.Typography.Size.md, .medium))
+                            .foregroundStyle(Tok.Ink.primary.color).lineLimit(1)
+                        ForEach(script.phases, id: \.self) { phase in
+                            Badge(text: phase, pair: Self.phaseChip, uppercase: false)
+                        }
+                    }
+                    Text(script.ruleSummary)
+                        .font(Tok.Face.data(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+                Spacer(minLength: Space.sm)
+                Toggle(script.name, isOn: Binding(get: { script.enabled }, set: { setEnabled(script, $0) }))
+                    .toggleStyle(.switch).controlSize(.small).labelsHidden()
+                    .accessibilityLabel(script.name)
+            }
+            .padding(.horizontal, Space.md)
+            .padding(.vertical, Space.sm)
+            .frame(minHeight: Tok.Size.Row.comfortable)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(script.id == selected ? Tok.Ground.active.color : .clear)
+            .overlay(alignment: .bottom) { Rule(color: Tok.Line.rule) }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(script.id == selected ? .isSelected : [])
     }
 
     private func dotColor(_ script: ScriptInfo) -> DynamicColor {
@@ -110,6 +126,10 @@ struct ScriptsPanel: View {
         } else {
             scripts = []
             note = "Scripts need script.list on the bus (F8)"
+        }
+        // Lead with a failing script so its fault is visible, else the first script.
+        if selected == nil || !scripts.contains(where: { $0.id == selected }) {
+            selected = scripts.first(where: { $0.error != nil })?.id ?? scripts.first?.id
         }
         syncCount()
     }
@@ -140,4 +160,77 @@ struct ScriptsPanel: View {
     }
 
     private func syncCount() { session.activeScripts = scripts.filter(\.isActive).count }
+}
+
+/// The selected script in full: status, its complete error (not the list's one-line
+/// summary), rule and phases, and placeholders for the source and live console that
+/// arrive with the F8 `script.get` / `script.log` bus verbs.
+private struct ScriptDetail: View {
+    var script: ScriptInfo?
+
+    var body: some View {
+        if let script {
+            ScrollView {
+                VStack(alignment: .leading, spacing: Space.lg) {
+                    header(script)
+                    if let error = script.error, !error.isEmpty {
+                        section("Error")
+                        Text(error)
+                            .font(Tok.Face.data(Tok.Typography.Size.md))
+                            .foregroundStyle(Tok.Method.delete.fg.color)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(Space.md)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Tok.Method.delete.bg.color, in: RoundedRectangle(cornerRadius: Tok.Radius.control))
+                    }
+                    section("Rule")
+                    Text(script.ruleSummary)
+                        .font(Tok.Face.data(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.primary.color)
+                        .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    if !script.phases.isEmpty {
+                        section("Phases")
+                        HStack(spacing: Space.sm) {
+                            ForEach(script.phases, id: \.self) { phase in
+                                Badge(text: phase, pair: ColorPair(fg: Tok.Ink.secondary, bg: Tok.Ground.raised), uppercase: false)
+                            }
+                        }
+                    }
+                    section("Source")
+                    Hint(text: "The script's source appears here once the core serves script.get (F8).")
+                    section("Console")
+                    Hint(text: "Live script output appears here once the core serves script.log (F8).")
+                }
+                .padding(Space.md)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        } else {
+            VStack(spacing: Space.sm) {
+                Text("No script selected").font(Tok.Face.ui(Tok.Typography.Size.xl, .medium)).foregroundStyle(Tok.Ink.primary.color)
+                Text("Pick a script on the left to see its status, rule and any error in full.")
+                    .font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.tertiary.color)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private func header(_ script: ScriptInfo) -> some View {
+        HStack(spacing: Space.md) {
+            Circle()
+                .fill((script.error != nil ? Tok.Status.serverError
+                       : script.enabled ? Tok.Status.success : Tok.Ink.tertiary).color)
+                .frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
+            Text(script.name).font(Tok.Face.ui(Tok.Typography.Size.xl, .medium))
+                .foregroundStyle(Tok.Ink.primary.color).lineLimit(1)
+            Spacer(minLength: Space.sm)
+            Text(script.enabled ? "Enabled" : "Disabled")
+                .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.secondary.color)
+        }
+    }
+
+    private func section(_ title: String) -> some View {
+        Text(title.uppercased()).font(Tok.Face.ui(Tok.Typography.Size.xs, .medium)).tracking(0.6)
+            .foregroundStyle(Tok.Ink.tertiary.color)
+    }
 }

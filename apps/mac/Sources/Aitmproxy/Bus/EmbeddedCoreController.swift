@@ -105,7 +105,9 @@ final class EmbeddedCoreController {
             update {
                 $0.endpoint = runtime.endpoint
                 $0.status = .ready
-                $0.label = "Embedded core · proxy 127.0.0.1:\(runtime.proxyPort)"
+                let proxy = "127.0.0.1:\(runtime.proxyPort)"
+                $0.proxyAddress = proxy
+                $0.label = "Embedded core · proxy \(proxy)"
             }
             // Point the live bus client at the core we just brought up.
             bus.useEmbeddedEndpoint(runtime.endpoint)

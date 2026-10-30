@@ -91,7 +91,7 @@ All three operator UIs â€” the **web UI**, the **TUI**, and the **macOS app** â€
 have a **Scan** view that launches `scan.discover` against an in-scope target and
 renders the result: the discovered endpoints and injection points. The
 injection-point rows **link back to the flow** they were found in, and an endpoint
-row links to the first captured flow that served it (`endpoint_flows`), so an
+row links to the newest captured flow that served it (`endpoint_flows`), so an
 operator can jump straight from a discovered point to the captured request
 behind it. In the web UI the Scan item appears in the sidebar only when the
 connected core offers the `scan.discover` tool; in the TUI, `r` launches a scan
@@ -116,9 +116,9 @@ tighten a scan but never exceed them.
 
 | Key | Type | Description |
 |---|---|---|
-| `endpoints` | array of strings | The in-scope URLs the crawl reached. |
-| `injection_points` | array of objects | The discovered injection points (below). |
-| `endpoint_flows` | object | Maps an endpoint URL (as it appears in `endpoints`) to the id of the first captured flow that served it. An endpoint with no captured flow is absent. |
+| `endpoints` | array of strings | The in-scope URLs the crawl reached. A link that redirects within the origin contributes both the URL the crawl requested and the page it landed on. |
+| `injection_points` | array of objects | The discovered injection points (below). Repeated scans of the same site do not accumulate: a point is unique per `(endpoint URL, location, name)` and carries the newest captured flow that showed it. |
+| `endpoint_flows` | object (URL to flow id) | Maps each endpoint URL (as in `endpoints`) to the id of the newest captured flow that served it. An endpoint with no capture is absent. |
 | `pages_crawled` | int | Number of pages successfully navigated. |
 | `stopped_reason` | string or null | Why the crawl stopped early: `"max_pages"`, `"max_depth"`, `"time_budget"`, `"left_scope"` (a navigation landed off-origin or out of scope, such as a redirect, and the crawl aborted there), `"navigation_failed"` (every navigation failed), `"guard_refused"` (the guard refused every link), or `"no_browser"` (no browser engine attached; see below). `null` if the reachable graph was exhausted. |
 
