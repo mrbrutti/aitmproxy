@@ -194,12 +194,13 @@ impl CoreIngress {
             is_tls: flow.first_bytes.first() == Some(&0x16),
             client_hello_sni: flow.sni.clone(),
             alpn: Vec::new(),
-            first_bytes: flow.first_bytes.clone(),
+            first_bytes: flow.first_bytes,
             from_upgrade: false,
         };
 
         match sd.modules.iter().find(|m| m.matches(&hint)).cloned() {
             Some(module) => {
+                let dst = flow.dst;
                 let ctx = aitm_core::ModuleCtx::new(
                     sd.store.clone(),
                     sd.sink.clone(),
@@ -207,7 +208,11 @@ impl CoreIngress {
                 )
                 .with_modules(sd.modules.clone())
                 .with_hint(hint);
-                let _ = module.spawn(flow.stream, ctx).await;
+                // Log a module-spawn error the way the acceptor's `handle_conn` does
+                // (warn with the dst + error), rather than silently dropping it.
+                if let Err(e) = module.spawn(flow.stream, ctx).await {
+                    tracing::warn!(%dst, error = %e, "captured-stream dispatch: module ended with an error");
+                }
                 StreamOutcome::Dispatched
             }
             None => {
@@ -700,6 +705,57 @@ mod tests {
             dial_calls.load(Ordering::SeqCst),
             1,
             "the original dst is dialled once"
+        );
+    }
+
+    /// AC17 (stream half): an in-scope flow no module claims whose upstream **dial
+    /// fails** is still reported [`StreamOutcome::PassedThrough`] (the flow was taken,
+    /// not silently dropped), and the dial was attempted exactly once. Carry-over
+    /// Minor (c) from the PR #47 panel.
+    #[tokio::test]
+    async fn in_scope_unclaimed_tcp_passthrough_survives_dial_failure() {
+        let spawn_calls = Arc::new(AtomicUsize::new(0));
+        let module: Arc<dyn ProtocolModule> = Arc::new(StubModule {
+            claims: false,
+            spawn_calls: spawn_calls.clone(),
+            recorded: Arc::new(Mutex::new(None)),
+        });
+        // No upstream seeded → the connector returns an error on dial.
+        let dial_calls = Arc::new(AtomicUsize::new(0));
+        let connector: Arc<dyn UpstreamConnector> = Arc::new(MockConnector {
+            dial_calls: dial_calls.clone(),
+            upstream: Mutex::new(None),
+        });
+        let ingress = CoreIngress::empty().with_stream(
+            Arc::from(vec![module]),
+            store(),
+            Arc::new(MockSink),
+            connector,
+            Arc::new(MockGuard { in_scope: true }),
+        );
+
+        let flow = CapturedTcpFlow {
+            stream: dummy_stream(),
+            dst: "93.184.216.34:443".parse().unwrap(),
+            sni: Some("example.com".to_string()),
+            first_bytes: b"GET / HTTP/1.1\r\n".to_vec(),
+            peer_identity: None,
+        };
+
+        assert_eq!(
+            ingress.dispatch_tcp(flow).await,
+            StreamOutcome::PassedThrough,
+            "a dial failure is still a taken flow, not a drop"
+        );
+        assert_eq!(
+            spawn_calls.load(Ordering::SeqCst),
+            0,
+            "no module claimed it"
+        );
+        assert_eq!(
+            dial_calls.load(Ordering::SeqCst),
+            1,
+            "the original dst is dialled exactly once, even when it fails"
         );
     }
 

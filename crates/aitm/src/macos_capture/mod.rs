@@ -11,6 +11,7 @@
 //! handoff onto those types rather than redeclaring them.
 
 pub mod activation_gate;
+pub mod adapter;
 pub mod availability;
 pub mod capability;
 pub mod listener;
