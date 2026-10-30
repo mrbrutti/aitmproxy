@@ -6,10 +6,10 @@
 //! [`crate::discover`]). It performs **no** injection and **no** fuzzing: it only
 //! lists reachable URLs and the injection points visible in observed traffic.
 //!
-//! Deny-by-default throughout: the target host is gated through
-//! [`aitm_core::ScopeRateGuard::check_active`] before any navigation, so an
-//! out-of-scope target is refused before the crawl begins, and every page the
-//! crawl then visits takes its own permit.
+//! Deny-by-default throughout: the crawl gates the target host through
+//! [`aitm_core::ScopeRateGuard::check_active`] before its first navigation, so
+//! an out-of-scope target is refused before anything is fetched, and every page
+//! the crawl then visits takes its own permit.
 //!
 //! The result carries no credentials: [`crate::discover::enumerate`] replaces a
 //! secret-named point's example with a placeholder, and every free-text string
@@ -24,7 +24,7 @@ use aitm_core::{
     Command, CommandHost, Flow, ParamDef, ParamSchema, Params, Sensitivity, TypeDesc, Value,
 };
 
-use crate::crawl::{block_on, crawl, normalize_url, target_authority};
+use crate::crawl::{block_on, crawl, normalize_url};
 use crate::discover::enumerate;
 use crate::ScannerConfig;
 
@@ -98,20 +98,14 @@ impl Command for ScanDiscover {
             cfg.max_pages = cfg.max_pages.min(requested);
         }
 
-        // Deny-by-default: gate the target host through the scope/rate guard
-        // before any navigation. An out-of-scope target returns
-        // `GuardError::OutOfScope` here, before the crawl begins. The authority
-        // is derived with the same WHATWG parser the crawl and the browser use,
-        // so the host gated here is the host that is navigated.
-        //
-        // The permit is held across the crawl: this command occupies one
-        // concurrency slot for its whole run, and every page inside the crawl
-        // takes a further permit of its own.
-        let authority = target_authority(target)?;
-        let permit = host.guard().check_active(&authority)?;
-
+        // Deny-by-default: the crawl gates the seed through the scope/rate
+        // guard before its first navigation (and the no-browser fallback takes
+        // one permit of its own), so an out-of-scope target returns
+        // `GuardError::OutOfScope` before anything is fetched. The gate lives in
+        // one place on purpose: a second `check_active` here for the same seed
+        // would spend a second rate token and a second concurrency slot, and
+        // with `max_concurrency == 1` would refuse the crawl's own permit.
         let outcome = block_on(crawl(host, target, &cfg))?;
-        drop(permit);
 
         // Enumerate injection points from the captured requests whose normalized
         // URL is one of the reached endpoints — observed traffic only.
@@ -312,7 +306,12 @@ mod tests {
     fn discover_result_has_no_secret() {
         let mut headers = HeaderMap::new();
         headers.set("Authorization", "Bearer s3cr3t-value");
-        headers.set("Cookie", "session_token=s3cr3t-value; theme=dark");
+        // `PHPSESSID` carries no secret keyword in its name: it is caught only
+        // because every cookie value is redacted.
+        headers.set(
+            "Cookie",
+            "session_token=s3cr3t-value; PHPSESSID=s3cr3t-value; theme=dark",
+        );
         let store = MemFlowStore::new();
         store.insert(captured("/x?access_token=s3cr3t-value&q=1", headers));
         let guard = scoped_guard();
@@ -344,6 +343,35 @@ mod tests {
             found.iter().any(|s| s == "Authorization"),
             "the header point name must survive redaction: {found:?}"
         );
+    }
+
+    /// The seed is gated exactly once: with a concurrency cap of one, a second
+    /// `check_active` for the same seed would refuse the command's own crawl.
+    #[test]
+    fn scan_discover_runs_under_max_concurrency_one() {
+        let store = MemFlowStore::new();
+        store.insert(captured("/one", HeaderMap::new()));
+        let guard = StdGuard::new(aitm_core::LimitConfig {
+            max_concurrency: 1,
+            ..aitm_core::LimitConfig::default()
+        });
+        guard.add_scope(ScopeEntry {
+            host: "target.test".into(),
+        });
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, None);
+        let cmd = ScanDiscover {
+            cfg: ScannerConfig::default(),
+        };
+
+        let result = cmd
+            .invoke(
+                params(&[("target", Value::Str("http://target.test/".into()))]),
+                &host,
+            )
+            .expect("one permit for the seed, not two");
+
+        assert_eq!(endpoints_of(&result), vec!["http://target.test/one"]);
     }
 
     /// `max_pages` may lower the configured cap.

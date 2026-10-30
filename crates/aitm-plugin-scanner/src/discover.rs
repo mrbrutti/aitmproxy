@@ -5,11 +5,14 @@
 //! out-of-band source. The same request shape a client could observe is all the
 //! scanner is allowed to see.
 //!
-//! Credentials never leave here: a point whose name reads as a secret
-//! ([`aitm_core::redact::is_secret_key`] — `Authorization`, `Cookie`, `token`,
-//! `api-key`, `password`, …) carries [`REDACTED`] as its example instead of the
-//! observed value, so an auth header or session cookie seen in captured traffic
-//! cannot reach a structured `scan.*` result.
+//! Credentials never leave here. **Every** cookie point carries [`REDACTED`] as
+//! its example — a cookie value is session or credential material whatever its
+//! name (`PHPSESSID`, `sid`, `JSESSIONID`), so no name list is trusted to spot
+//! it. A header, query or body point whose *name* reads as a secret
+//! ([`aitm_core::redact::is_secret_key`] — `Authorization`, `token`, `api-key`,
+//! `password`, … — widened locally by [`is_secret_name`] with the common auth
+//! parameter names) is redacted the same way. So an auth header or session
+//! cookie seen in captured traffic cannot reach a structured `scan.*` result.
 
 use std::collections::HashSet;
 
@@ -18,6 +21,24 @@ use aitm_core::Body;
 
 /// The example value a secret-named injection point carries.
 pub const REDACTED: &str = "<redacted>";
+
+/// Auth-parameter name fragments the shared vocabulary in `aitm_core::redact`
+/// does not carry, matched the same way (case-insensitive substring). They
+/// over-match on purpose (`sid` catches `subsidiary`): a redacted example costs
+/// nothing, a leaked session id does.
+const EXTRA_SECRET_NEEDLES: &[&str] = &["sid", "jwt", "csrf", "session", "auth"];
+
+/// Whether a header / query / body parameter name reads as a secret: the shared
+/// vocabulary plus [`EXTRA_SECRET_NEEDLES`].
+fn is_secret_name(name: &str) -> bool {
+    if is_secret_key(name) {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    EXTRA_SECRET_NEEDLES
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
 
 /// Upper bound on the injection points enumerated from one flow. A hostile
 /// client can POST a multi-megabyte body of distinct parameters; past this many
@@ -64,8 +85,8 @@ pub struct InjectionPoint {
     pub location: Location,
     /// The parameter / header / segment name.
     pub name: String,
-    /// The observed value (or segment) at that point, or [`REDACTED`] when the
-    /// name reads as a secret.
+    /// The observed value (or segment) at that point, or [`REDACTED`] for every
+    /// cookie and for any other point whose name reads as a secret.
     pub example: String,
 }
 
@@ -73,7 +94,8 @@ pub struct InjectionPoint {
 ///
 /// Reads ONLY the passed flow. Never calls any `aitm_testtarget` API. At most
 /// [`MAX_POINTS_PER_FLOW`] points are returned, deduplicated on
-/// `(location, name)`, and the example of a secret-named point is [`REDACTED`].
+/// `(location, name)`; every cookie's example, and the example of any other
+/// secret-named point, is [`REDACTED`].
 pub fn enumerate(flow: &aitm_core::HttpFlow) -> Vec<InjectionPoint> {
     let id = flow.id;
     let req = &flow.request;
@@ -88,7 +110,9 @@ pub fn enumerate(flow: &aitm_core::HttpFlow) -> Vec<InjectionPoint> {
         if !seen.insert((location.clone(), name.clone())) {
             return;
         }
-        let example = if is_secret_key(&name) {
+        // A cookie is credential material regardless of its name; everything
+        // else is redacted when its name says so.
+        let example = if location == Location::Cookie || is_secret_name(&name) {
             REDACTED.to_string()
         } else {
             example
@@ -465,8 +489,8 @@ mod tests {
         );
         assert_eq!(
             example_of(&points, Location::Cookie, "theme"),
-            "dark",
-            "a non-secret cookie keeps its observed value"
+            REDACTED,
+            "even an innocently named cookie is credential material"
         );
         assert_eq!(
             example_of(&points, Location::Query, "access_token"),
@@ -476,6 +500,77 @@ mod tests {
             !points.iter().any(|p| p.example.contains("abc123")),
             "the session value leaked: {points:?}"
         );
+    }
+
+    /// A session cookie's name need not contain a secret keyword
+    /// (`PHPSESSID`, `sid`): every cookie value is redacted, unconditionally.
+    #[test]
+    fn enumerate_redacts_cookie_by_value_regardless_of_name() {
+        let mut headers = HeaderMap::new();
+        headers.set(
+            "Cookie",
+            "PHPSESSID=secretvalue; sid=abc; JSESSIONID=jsv; lang=en",
+        );
+        let flow = captured("/x", headers);
+
+        let points = enumerate(&flow);
+
+        for name in ["PHPSESSID", "sid", "JSESSIONID", "lang"] {
+            assert_eq!(
+                example_of(&points, Location::Cookie, name),
+                REDACTED,
+                "cookie {name} must be redacted"
+            );
+        }
+        for leaked in ["secretvalue", "abc", "jsv"] {
+            assert!(
+                !points.iter().any(|p| p.example.contains(leaked)),
+                "cookie value {leaked} leaked: {points:?}"
+            );
+        }
+        assert_eq!(points.len(), 4, "the cookie *names* survive: {points:?}");
+    }
+
+    /// Common auth parameter names outside the shared vocabulary are caught
+    /// for headers, query and body parameters too.
+    #[test]
+    fn enumerate_redacts_common_auth_parameter_names() {
+        let mut headers = HeaderMap::new();
+        headers.set("X-CSRF-Token", "csrfv");
+        headers.set("X-Auth", "authv");
+        headers.set("Accept", "text/html");
+        let flow = captured("/x?sid=sidv&jwt=jwtv&session=sessv&page=2", headers);
+
+        let points = enumerate(&flow);
+
+        for name in ["sid", "jwt", "session"] {
+            assert_eq!(
+                example_of(&points, Location::Query, name),
+                REDACTED,
+                "query {name} must be redacted"
+            );
+        }
+        assert_eq!(
+            example_of(&points, Location::Header, "X-CSRF-Token"),
+            REDACTED
+        );
+        assert_eq!(example_of(&points, Location::Header, "X-Auth"), REDACTED);
+        assert_eq!(
+            example_of(&points, Location::Query, "page"),
+            "2",
+            "a plain parameter keeps its value"
+        );
+        assert_eq!(
+            example_of(&points, Location::Header, "Accept"),
+            "text/html",
+            "a plain header keeps its value"
+        );
+        for leaked in ["sidv", "jwtv", "sessv", "csrfv", "authv"] {
+            assert!(
+                !points.iter().any(|p| p.example.contains(leaked)),
+                "{leaked} leaked: {points:?}"
+            );
+        }
     }
 
     /// A hostile body of a million parameters must be capped, and the dedupe

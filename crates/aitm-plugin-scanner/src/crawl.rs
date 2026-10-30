@@ -82,6 +82,10 @@ pub async fn crawl(
     }
     let origin = seed.origin();
     let Some(browser) = host.browser() else {
+        // Nothing is fetched on this path, but the host must still be one the
+        // guard would let us act on (not disabled, not rate-exhausted). This is
+        // the command's single gate check for a store-only discovery.
+        drop(host.guard().check_active(&authority)?);
         return Ok(stored_endpoints(host, &seed, cfg));
     };
 
@@ -230,19 +234,6 @@ pub async fn crawl(
 /// crawl's endpoint set, so the two are compared in one normal form.
 pub(crate) fn normalize_url(s: &str) -> Option<String> {
     parse_target(s).map(|u| u.as_str().to_string())
-}
-
-/// The `host:port` the scope guard is asked about for `target`, parsed once with
-/// the WHATWG parser. `scan.discover` gates on this before the crawl begins, so
-/// the gate and the crawl always agree about which host is being asked for.
-pub(crate) fn target_authority(target: &str) -> anyhow::Result<String> {
-    let url = parse_target(target).ok_or_else(|| {
-        anyhow::anyhow!(
-            "target is not an absolute, credential-free http(s) URL: {}",
-            safe_target(target)
-        )
-    })?;
-    Ok(guard_authority(&url))
 }
 
 /// A target string that is safe to put in an error message: userinfo removed,
@@ -430,10 +421,26 @@ fn harvest_links(html: &str) -> Vec<String> {
 }
 
 /// The index just past `</tag`, searched case-insensitively from `from`.
+///
+/// A single forward pass over the bytes, comparing in place: nothing is
+/// allocated or lowercased per call, so a page of a hundred thousand empty
+/// `<script></script>` pairs costs one linear scan in total, not one copy of
+/// the remaining DOM per tag. (This runs synchronously between awaits, where the
+/// time budget cannot interrupt it, so it has to be linear.)
 fn find_close_tag(html: &str, tag: &str, from: usize) -> Option<usize> {
-    let needle = format!("</{tag}");
-    let hay = html[from..].to_ascii_lowercase();
-    hay.find(&needle).map(|off| from + off + needle.len())
+    let hay = &html.as_bytes()[from.min(html.len())..];
+    let tag = tag.as_bytes();
+    let needle_len = tag.len() + 2;
+    if hay.len() < needle_len {
+        return None;
+    }
+    (0..=hay.len() - needle_len)
+        .find(|&i| {
+            hay[i] == b'<'
+                && hay[i + 1] == b'/'
+                && hay[i + 2..i + needle_len].eq_ignore_ascii_case(tag)
+        })
+        .map(|i| from + i + needle_len)
 }
 
 /// Walk the attributes of the tag whose name ends at `from`, returning the index
@@ -822,7 +829,9 @@ mod tests {
     async fn crawl_rejects_backslash_host_scope_bypass() {
         let hostile = "http://evil.com\\.target.test/";
         assert_eq!(
-            target_authority(hostile).expect("the URL parses"),
+            parse_target(hostile)
+                .map(|u| guard_authority(&u))
+                .expect("the URL parses"),
             "evil.com:80",
             "the backslash ends the host, as the browser reads it"
         );
@@ -1218,6 +1227,30 @@ mod tests {
         assert_eq!(decode_entities("&amp;lt;"), "&lt;");
         assert_eq!(decode_entities("a&amp;b"), "a&b");
         assert_eq!(decode_entities("&lt;tag&gt;"), "<tag>");
+    }
+
+    /// A page of a hundred thousand `<script></script>` pairs is scanned in one
+    /// linear pass: the close-tag search must not copy the remaining DOM per
+    /// tag, because this runs synchronously where the time budget cannot
+    /// interrupt it.
+    #[test]
+    fn harvest_links_is_linear_on_many_script_tags() {
+        let mut html = String::from(r#"<a href="/first">first</a>"#);
+        for _ in 0..100_000 {
+            html.push_str("<script></script>");
+        }
+        html.push_str(r#"<SCRIPT>var href = "/not-a-link";</SCRIPT><a href="/last">last</a>"#);
+        assert!(html.len() > 1_700_000, "a realistically large page");
+
+        let started = Instant::now();
+        let links = harvest_links(&html);
+        let elapsed = started.elapsed();
+
+        assert_eq!(links, vec!["/first".to_string(), "/last".to_string()]);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "harvest took {elapsed:?} on 100k script tags"
+        );
     }
 
     /// A page with far more links than the per-page cap cannot grow the
