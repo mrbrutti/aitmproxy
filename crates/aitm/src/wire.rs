@@ -128,6 +128,11 @@ pub struct ScriptWiring {
     /// Runs a PoC's `script` steps. `None` leaves `poc.run` declarative-only,
     /// erroring on a `script` step rather than skipping it.
     pub executor: Option<Arc<dyn aitm_poc::ScriptStepExecutor>>,
+    /// Native protocol `<ns>:` PoC-step handlers (e.g. `l4:`), built by the binary
+    /// from the same live language instance that owns the shared guard + store.
+    /// Threaded into `poc.run` alongside `executor`; empty leaves every protocol
+    /// namespace step a runtime error ("no handler registered").
+    pub poc_step_handlers: aitm_poc::step_registry::PocStepRegistry,
     /// Command-provider plugins registered after the first-party ones, in order.
     /// The binary fills this with the rhai tier's commands (`script.validate`,
     /// `script.reload`, `script.findings`) **and** the persistent findings store
@@ -261,6 +266,7 @@ pub fn assemble_with_scripts(
         .register_plugin(Box::new(BrowserPlugin::new(cfg.browser.ssrf.clone())))
         .register_plugin(Box::new(PocCommands {
             executor: scripts.executor,
+            step_handlers: scripts.poc_step_handlers,
         }))
         .register_plugin(Box::new(ca_plugin))
         .register_plugin(Box::new(
@@ -436,6 +442,9 @@ pub fn build_proxy_with(cfg: &Config, features: &Features) -> anyhow::Result<Pro
 /// tier; without one it is the declarative M1 command.
 struct PocCommands {
     executor: Option<Arc<dyn aitm_poc::ScriptStepExecutor>>,
+    /// Native protocol-namespace step handlers (`l4:`), threaded to `poc.run`
+    /// together with the executor (the production path always supplies both).
+    step_handlers: aitm_poc::step_registry::PocStepRegistry,
 }
 
 impl Plugin for PocCommands {
@@ -446,7 +455,11 @@ impl Plugin for PocCommands {
     fn load(&mut self, reg: &mut Registry) {
         aitm_poc::builder::register(reg);
         match self.executor.clone() {
-            Some(exec) => aitm_poc::runner::register_with_executor(reg, exec),
+            Some(exec) => aitm_poc::runner::register_with_executor_and_steps(
+                reg,
+                exec,
+                self.step_handlers.clone(),
+            ),
             None => aitm_poc::runner::register(reg),
         }
         aitm_poc::library::register(reg);
