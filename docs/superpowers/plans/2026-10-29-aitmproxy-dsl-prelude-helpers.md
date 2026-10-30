@@ -11,8 +11,13 @@ new crate dependencies to `aitm-plugin-rhai` and grows `aitm-poc::dsl` with a
 `pub rand_int` reusing the existing RNG. Tasks 2–5 build the `dsl` namespace one
 family at a time, all editing the single new file
 `crates/aitm-plugin-rhai/src/dsl.rs`, so they are **sequential** (shared file),
-not parallel. Task 6 adds the registration + drift-guard test. Order:
-1 → 2 → 3 → 4 → 5 → 6. Task 1 and Task 2 could in principle start in parallel
+not parallel. Each of Tasks 2–5 also drops `"status": "planned"` from exactly the
+`dsl` catalogue entries it registers, so the pre-existing
+`tests/api_catalog.rs::catalog_matches_engine_host_surface` bijection stays green
+at every task boundary (that guard, not a bespoke test, is the catalogue ≡ engine
+check — amended in after the draft, which had specced a redundant `dsl` drift
+guard, missed it). Task 6 adds the callable sweep and confirms the bijection.
+Order: 1 → 2 → 3 → 4 → 5 → 6. Task 1 and Task 2 could in principle start in parallel
 (disjoint files) but Task 2 compiles against Task 1's deps, so run 1 first.
 All tests are written before the code they prove (TDD).
 
@@ -58,6 +63,9 @@ Literal digests used below are the published test vectors:
     `m3_capabilities`, array `[…; 7]` → `[…; 8]`)
   - `crates/aitm-plugin-rhai/tests/dsl.rs` (create — encoding cases now; later
     tasks extend the same file)
+  - `docs/design/languages/rhai.api.json` (modify — drop `"status": "planned"`
+    from the four encoding entries: `b64_encode`, `b64_decode`, `url_encode`,
+    `hex_encode`; names/signatures/order unchanged)
 - **Change:**
   - New module with `pub struct DslCapability;`, `impl ScriptCapability`
     (`namespace() -> "dsl"`, `min_api() -> "1"`, `register` delegating to
@@ -78,8 +86,11 @@ Literal digests used below are the published test vectors:
   - `url_encode("a b/c")` == `"a%20b%2Fc"`
   - `hex_encode("AB")` == `"4142"`
   - `b64_decode("!!!")` returns `Err`, and a `try { b64_decode("!!!") } catch(e) { "caught" }` script yields `"caught"` (catchable).
-- **Done when:** the test passes and the crate compiles with the new capability
-  wired in.
+- **Done when:** the test passes, the crate compiles with the new capability
+  wired in, and — with the four encoding entries un-planned — `cargo test -p
+  aitm-plugin-rhai --test api_catalog` and `node --test docs/design/languages/`
+  are both green. (Every later task keeps both green by un-planning exactly the
+  entries it registers.)
 
 ### Task 3: Hashing family (`sha256`, `md5`)
 
@@ -88,6 +99,7 @@ Literal digests used below are the published test vectors:
 - **Files:**
   - `crates/aitm-plugin-rhai/src/dsl.rs` (modify)
   - `crates/aitm-plugin-rhai/tests/dsl.rs` (modify — add hashing cases)
+  - `docs/design/languages/rhai.api.json` (modify — un-plan `sha256`, `md5`)
 - **Change:** register in `register_dsl`:
   - `sha256(&str) -> String` via `sha2::Sha256`, rendered with `to_hex`
     (lowercase, 64 chars).
@@ -106,6 +118,8 @@ Literal digests used below are the published test vectors:
 - **Files:**
   - `crates/aitm-plugin-rhai/src/dsl.rs` (modify)
   - `crates/aitm-plugin-rhai/tests/dsl.rs` (modify — add random cases)
+  - `docs/design/languages/rhai.api.json` (modify — un-plan `rand_text_alpha`,
+    `rand_int`)
 - **Change:** register in `register_dsl`:
   - `rand_text_alpha(i64) -> String` delegating to
     `aitm_poc::dsl::rand_text_alpha(n.max(0) as usize)`.
@@ -126,6 +140,8 @@ Literal digests used below are the published test vectors:
 - **Files:**
   - `crates/aitm-plugin-rhai/src/dsl.rs` (modify)
   - `crates/aitm-plugin-rhai/tests/dsl.rs` (modify — add regex cases)
+  - `docs/design/languages/rhai.api.json` (modify — un-plan `regex_match`,
+    `regex_extract`)
 - **Change:** register in `register_dsl`:
   - `regex_match(&str, &str) -> Result<bool, Box<EvalAltResult>>` — compile
     `pat` (invalid → catchable `ErrorRuntime`), return `re.is_match(s)`.
@@ -141,29 +157,27 @@ Literal digests used below are the published test vectors:
     `"caught"`.
 - **Done when:** the test passes.
 
-### Task 6: Registration test + `dsl` drift guard
+### Task 6: Callable sweep + confirm the `api_catalog.rs` bijection
 
 - **Satisfies:** AC1 (full set), AC3, AC5, AC6
-- **Depends on:** Tasks 2–5 (all ten registered)
+- **Depends on:** Tasks 2–5 (all ten registered and un-planned)
 - **Files:**
-  - `crates/aitm-plugin-rhai/tests/dsl.rs` (modify — add the guard + full
-    callable sweep)
+  - `crates/aitm-plugin-rhai/tests/dsl.rs` (modify — add the full callable sweep)
 - **Change:**
   - `all_ten_dsl_helpers_are_callable` — register `register_dsl`, run one Rhai
     script that calls all ten helpers and returns a success sentinel; assert it
     evaluates without `ErrorFunctionNotFound`.
-  - `dsl_catalogue_matches_engine` — parse `rhai.api.json` (located via
-    `concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/design/languages/rhai.api.json")`)
-    with the existing `serde_yaml` dev-dependency into a `serde_yaml::Value`,
-    collect `["dsl"][*]["name"]` into a `BTreeSet<String>`, and assert it equals
-    `DSL_FUNCTIONS.iter().map(ToString::to_string).collect::<BTreeSet<_>>()`.
-- **Test:** both tests above pass; the expected equal set is exactly the ten
-  names `{b64_encode, b64_decode, url_encode, hex_encode, sha256, md5,
-  rand_text_alpha, rand_int, regex_match, regex_extract}`.
-- **Done when:** both tests pass, `node --test docs/design/languages/` is green
-  with `rhai.api.json` unedited, and the full gate
-  (`cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`)
-  passes.
+  - Do NOT add a bespoke `dsl` drift guard: the pre-existing
+    `tests/api_catalog.rs::catalog_matches_engine_host_surface` already proves
+    engine ≡ catalogue for `dsl` once the entries are un-planned (Tasks 2–5). If
+    `DSL_FUNCTIONS` is left unused after this, remove it (clippy `-D warnings`).
+- **Test:** the callable sweep passes; `cargo test -p aitm-plugin-rhai --test
+  api_catalog` is green (bijection holds with all ten `dsl` helpers registered
+  and un-planned).
+- **Done when:** the callable sweep + `api_catalog` guard pass, `node --test
+  docs/design/languages/` is green (only `"status": "planned"` removed from the
+  ten `dsl` entries), and the full gate (`cargo fmt --check && cargo clippy
+  --all-targets -- -D warnings && cargo test`) passes.
 
 ## Independence
 

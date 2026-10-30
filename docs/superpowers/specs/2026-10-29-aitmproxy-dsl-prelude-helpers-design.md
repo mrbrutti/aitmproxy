@@ -24,17 +24,28 @@ that scripts and PoCs lean on.
   (`b64_encode(s)`, not `dsl.b64_encode(s)`), from any Rhai script and from a
   PoC Rhai `script:` step, because they are registered on the one shared engine.
 - A Rust test proves each of the ten runs and returns the specified value.
-- A Rust drift guard proves the engine's `dsl` function set equals the `dsl[]`
-  names in `rhai.api.json` — catalogue ≡ engine, in both directions.
-- The existing node golden (`validate.test.mjs`) stays green; the catalogue is
-  not edited.
+- The pre-existing Rust bijection guard
+  (`tests/api_catalog.rs::catalog_matches_engine_host_surface`) proves the
+  engine's registered `dsl` set equals the catalogue's — catalogue ≡ engine, in
+  both directions. This guard already exists and already covers `dsl`; the only
+  change it needs is that each helper's catalogue entry moves out of the
+  `"status": "planned"` bucket as the helper lands (that is how the guard's own
+  doc comment prescribes "planned → built").
+- The existing node golden (`validate.test.mjs`) stays green; `rhai.api.json` is
+  edited **only** to drop the `"status": "planned"` field from the ten `dsl`
+  entries (names, signatures, order, and structure unchanged — the golden checks
+  name + shape, not status).
 - Behaviour matches the parallel `aitm-poc::dsl` implementations where one
   exists (`url_encode`, base64 alphabet, `rand_text_alpha` charset).
 
 ## Non-goals
 
-- No change to the catalogue (`rhai.api.json`) or the node golden. The ten
-  names and signatures are fixed input; this change makes the engine match them.
+- No change to the ten `dsl` **names or signatures** in the catalogue
+  (`rhai.api.json`), and no change to the node golden. The ten names and
+  signatures are fixed input; this change makes the engine match them. The one
+  permitted catalogue edit is dropping `"status": "planned"` from each `dsl`
+  entry as its helper lands (required by the pre-existing `api_catalog.rs`
+  bijection guard — see Drift guard).
 - No new helper, no renamed helper, no changed signature. The vocabulary is
   exactly the plugin-system spec's ten.
 - **No change to the PoC `{{...}}` template / matcher DSL evaluator**
@@ -194,22 +205,24 @@ the table above is the chosen default.
   call: empty-on-no-match is the ergonomic nuclei-style behaviour; a bad pattern
   is still an error because it is a script defect.)*
 
-### Drift guard
+### Drift guard — reuse the pre-existing `api_catalog.rs` bijection
 
-A new Rust test (`crates/aitm-plugin-rhai/tests/dsl.rs`) that:
+The project already has the canonical catalogue ≡ engine guard:
+`crates/aitm-plugin-rhai/tests/api_catalog.rs::catalog_matches_engine_host_surface`.
+It enumerates every registered host token and fails on a catalogue entry the
+engine does not register OR a registered token missing from the catalogue —
+**excluding** entries marked `"status": "planned"` (its doc comment names the
+`dsl` crypto/encoding helpers as exactly that bucket, and says "when they land
+they move out of `planned`"). So once `DslCapability` is wired into
+`m3_capabilities()` and each helper's `"status": "planned"` is dropped, this
+existing guard proves the `dsl` bijection with no new drift test needed.
 
-1. Parses `rhai.api.json`'s `dsl[]` names (via the existing `serde_yaml`
-   dev-dependency — JSON is valid YAML — so no new dev-dep), located relative to
-   `CARGO_MANIFEST_DIR`.
-2. Asserts `set(dsl[].name) == set(DSL_FUNCTIONS)` — bidirectional catalogue ≡
-   engine-intent.
-3. Registers `register_dsl` on a bare `build_engine` and runs a Rhai snippet
-   calling each of the ten, asserting the literal results below.
-
-This is the `dsl` slice of the plugin-system plan's "Task 12" drift guard; the
-`globals`/`flow`/`msg` slices stay unbuilt and out of scope. It is also the host
-surface audit for `dsl` (the bare-engine function pin in `tests/engine.rs`
-intentionally does not see capabilities).
+A **bespoke** `dsl`-slice drift test is therefore NOT built — it would duplicate
+`api_catalog.rs` for one invariant. What `tests/dsl.rs` adds instead is the
+behaviour proof: it registers `register_dsl` on a bare `build_engine` and runs a
+Rhai snippet calling each of the ten, asserting the literal results below (the
+callable sweep). The full-catalogue `globals`/`flow`/`msg` reconciliation (the
+plugin-system plan's unbuilt "Task 12") remains out of scope and is unaffected.
 
 ## Acceptance criteria
 
@@ -233,10 +246,14 @@ intentionally does not see capabilities).
 4. **AC4** — Error behaviour: `b64_decode("!!!")` and `regex_match("(", "x")`
    and `rand_int(5, 1)` each raise a **catchable** `EvalAltResult::ErrorRuntime`;
    `regex_extract("z+", "abc", 0) == ""`.
-5. **AC5** — Drift guard: `set` of `dsl[].name` in `rhai.api.json` equals
-   `set(DSL_FUNCTIONS)`.
+5. **AC5** — Bijection: with `DslCapability` wired into `m3_capabilities()` and
+   the ten `dsl` entries un-planned, the pre-existing
+   `tests/api_catalog.rs::catalog_matches_engine_host_surface` passes (engine ≡
+   catalogue, both directions). No bespoke `dsl` drift test is added.
 6. **AC6** — The node golden `docs/design/languages/validate.test.mjs` passes
-   unchanged; `rhai.api.json` is not edited.
+   unchanged; `rhai.api.json` is edited **only** to remove `"status": "planned"`
+   from the ten `dsl` entries (names, signatures, order, and structure
+   unchanged).
 7. **AC7** — `aitm_poc::dsl::rand_int(a, b)` exists, is `pub`, returns a value in
    `[a, b]`, uses the module's existing thread-local RNG, and `rand_int(7, 7) == 7`.
 8. **AC8** — Parity: `url_encode`, the base64 alphabet, and the
@@ -296,6 +313,10 @@ guard precisely because they are pure.
 - `rand_int` is inclusive `[a, b]` and errors when `a > b`.
 - `regex_extract` returns `""` on no-match / out-of-range group but errors on an
   invalid pattern; `regex_match` errors on an invalid pattern.
-- Build only the `dsl` slice of the drift guard; leave the `globals/flow/msg`
-  slice (plugin-system "Task 12") out of scope.
+- Reuse the pre-existing `api_catalog.rs` bijection as the catalogue ≡ engine
+  guard (un-plan the `dsl` entries as helpers land); do NOT add a bespoke `dsl`
+  drift test — `tests/dsl.rs` adds only the callable sweep. Leave the
+  `globals/flow/msg` full-catalogue reconciliation (plugin-system "Task 12") out
+  of scope. *(Amends the original "build the `dsl` slice" call after the
+  `api_catalog.rs` mechanism, which the draft missed, was found.)*
 - PoC `{{...}}` template DSL alignment is out of scope (open question 1).
