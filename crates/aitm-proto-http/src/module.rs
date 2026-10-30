@@ -3017,4 +3017,341 @@ mod tests {
             vec!["[::1]:8080".parse::<SocketAddr>().expect("addr")]
         );
     }
+
+    // ---- edge cases added by the Stage 5 tester pass ----------------------
+
+    /// The tunnel's authority and its resolved address are one fact: `serve`
+    /// dials the pinned address only when both are present, and a connection
+    /// with one but not the other would fall back to the request's `Host`.
+    /// `Conn::plain` is the only constructor `drive` uses, so it must never
+    /// produce a half-set tunnel.
+    #[test]
+    fn a_plain_conn_sets_its_tunnel_authority_and_address_together() {
+        let addr: SocketAddr = "127.0.0.1:8080".parse().expect("addr");
+        let tunnel = Conn::plain(unknown_peer(), Some(("127.0.0.1:8080".to_string(), addr)));
+        assert_eq!(tunnel.tunnel_authority.as_deref(), Some("127.0.0.1:8080"));
+        assert_eq!(tunnel.tunnel_addr, Some(addr));
+
+        let forward = Conn::plain(unknown_peer(), None);
+        assert_eq!(forward.tunnel_authority, None);
+        assert_eq!(forward.tunnel_addr, None);
+    }
+
+    /// AC17, second clause: a request whose `Host` names the tunnel target is
+    /// stored exactly as it was before the tunnel's route was pinned: the `Host`
+    /// as authority, a cleartext server connection to the target, and a complete
+    /// response.
+    #[tokio::test]
+    async fn serve_stores_the_usual_flow_when_the_host_names_the_tunnel_target() {
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, dialed) = ctx_with(vec![Box::pin(up)]);
+        let _origin = tokio::spawn(origin_serve(origin_end, vec!["first"], false));
+
+        let bodies = serve_requests(
+            &ctx,
+            cleartext_tunnel_conn("127.0.0.1:8080", "127.0.0.1:8080"),
+            &[get_request("/one", "127.0.0.1:8080")],
+        )
+        .await;
+
+        assert_eq!(bodies, vec!["first"]);
+        assert_eq!(
+            *dialed.lock().expect("dialed lock"),
+            vec![dial("127.0.0.1:8080", "127.0.0.1:8080")]
+        );
+        let flow = stored_http(&ctx, "/one");
+        assert_eq!(flow.request.scheme, "http");
+        assert_eq!(flow.request.authority, "127.0.0.1:8080");
+        assert_eq!(flow.request.method, "GET");
+        assert_eq!(flow.request.headers.get("host"), Some("127.0.0.1:8080"));
+        assert!(matches!(flow.request.body, Body::Empty));
+        assert!(!flow.client_conn.tls);
+        let server = flow.server_conn.expect("a server connection is recorded");
+        assert_eq!(server.peer, "127.0.0.1:8080".parse().expect("addr"));
+        assert!(!server.tls);
+        assert_eq!(server.sni, None);
+        assert_eq!(server.alpn, None);
+        let response = flow.response.expect("a stored response");
+        assert_eq!(response.status, 200);
+        assert!(
+            matches!(response.body, Body::Bytes(ref b) if b.as_slice() == b"first"),
+            "stored body: {:?}",
+            response.body
+        );
+        assert!(!flow.metadata.truncated);
+    }
+
+    /// A taint lasts for one replacement. Once the new upstream is in place the
+    /// connection is reused again: a flag that was never cleared would redial
+    /// for every later request.
+    #[tokio::test]
+    async fn serve_reuses_the_replacement_upstream_after_a_taint() {
+        let (up1, origin1_end) = duplex(64 * 1024);
+        let (up2, origin2_end) = duplex(64 * 1024);
+        let (ctx, dialed) = ctx_with(vec![Box::pin(up1), Box::pin(up2)]);
+        let _origin1 = tokio::spawn(origin_serve_trailing(
+            origin1_end,
+            vec!["legit"],
+            STRAY_RESPONSE,
+            false,
+        ));
+        let _origin2 = tokio::spawn(origin_serve(origin2_end, vec!["second", "third"], false));
+
+        let bodies = serve_requests(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            &[
+                get_request("http://127.0.0.1:8080/one", "127.0.0.1:8080"),
+                get_request("http://127.0.0.1:8080/two", "127.0.0.1:8080"),
+                get_request("http://127.0.0.1:8080/three", "127.0.0.1:8080"),
+            ],
+        )
+        .await;
+
+        assert_eq!(bodies, vec!["legit", "second", "third"]);
+        assert_eq!(
+            *dialed.lock().expect("dialed lock"),
+            vec![
+                dial("127.0.0.1:8080", "127.0.0.1:8080"),
+                dial("127.0.0.1:8080", "127.0.0.1:8080")
+            ],
+            "one replacement for the taint, then the new connection is reused"
+        );
+    }
+
+    /// With `Connection: close` the connection ends after the response whatever
+    /// the origin left behind, but the stray must still not reach the client: it
+    /// reads exactly the legitimate response, then EOF.
+    #[tokio::test]
+    async fn serve_does_not_forward_a_stray_response_when_the_connection_closes_anyway() {
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, dialed, sink) = ctx_recording(vec![Box::pin(up)]);
+        let _origin = tokio::spawn(origin_serve_trailing(
+            origin_end,
+            vec!["legit"],
+            STRAY_RESPONSE,
+            false,
+        ));
+        let (mut client, proxy_side) = duplex(64 * 1024);
+
+        let serving = serve(
+            &ctx,
+            Box::pin(proxy_side),
+            None,
+            None,
+            Conn::plain(unknown_peer(), None),
+            MAX_BODY,
+        );
+        let script = async {
+            client
+                .write_all(
+                    b"GET http://127.0.0.1:8080/one HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("send");
+            let mut got = Vec::new();
+            client.read_to_end(&mut got).await.expect("read to EOF");
+            got
+        };
+        let (served, got) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(serving, script)
+        })
+        .await
+        .expect("serve hung");
+
+        served.expect("a Connection: close request ends cleanly");
+        let got = String::from_utf8_lossy(&got).into_owned();
+        assert!(got.starts_with("HTTP/1.1 200"), "response: {got:?}");
+        assert!(
+            got.ends_with("\r\n\r\nlegit"),
+            "nothing may follow the legitimate body: {got:?}"
+        );
+        assert_eq!(
+            got.matches("HTTP/1.1").count(),
+            1,
+            "exactly one response head reached the client: {got:?}"
+        );
+        assert_eq!(dialed.lock().expect("dialed lock").len(), 1);
+        let events = sink.events.lock().expect("events lock");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::Response(_)))
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Error { .. })),
+            "events: {events:?}"
+        );
+    }
+
+    /// An origin writes a legitimate response with `trailer` behind it in the
+    /// same write, and stays open. Whatever `trailer` is, the client reads only
+    /// the legitimate response, the next request is answered by a replacement
+    /// upstream, and `serve` never fails the connection.
+    async fn assert_surplus_is_discarded_and_the_upstream_replaced(trailer: &'static str) {
+        let (up1, origin1_end) = duplex(64 * 1024);
+        let (up2, origin2_end) = duplex(64 * 1024);
+        let (ctx, dialed, sink) = ctx_recording(vec![Box::pin(up1), Box::pin(up2)]);
+        let _origin1 = tokio::spawn(origin_serve_trailing(
+            origin1_end,
+            vec!["legit"],
+            trailer,
+            false,
+        ));
+        let _origin2 = tokio::spawn(origin_serve(origin2_end, vec!["second"], false));
+        let (mut client, proxy_side) = duplex(64 * 1024);
+
+        let serving = serve(
+            &ctx,
+            Box::pin(proxy_side),
+            None,
+            None,
+            Conn::plain(unknown_peer(), None),
+            MAX_BODY,
+        );
+        let script = async {
+            let mut pending = Vec::new();
+            let first = client_get_keep(
+                &mut client,
+                &mut pending,
+                "http://127.0.0.1:8080/one",
+                "127.0.0.1:8080",
+            )
+            .await;
+            let after_first = pending.clone();
+            let second = client_get_keep(
+                &mut client,
+                &mut pending,
+                "http://127.0.0.1:8080/two",
+                "127.0.0.1:8080",
+            )
+            .await;
+            drop(client);
+            (first, after_first, second, pending)
+        };
+        let (served, (first, after_first, second, pending)) =
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(serving, script)
+            })
+            .await
+            .expect("serve hung: request 2 went to the tainted upstream, which never answers");
+
+        served.expect("surplus bytes must not fail the connection");
+        assert_eq!(first, "legit");
+        assert!(after_first.is_empty(), "after response 1: {after_first:?}");
+        assert_eq!(second, "second");
+        assert!(pending.is_empty(), "after response 2: {pending:?}");
+        assert_eq!(
+            dialed.lock().expect("dialed lock").len(),
+            2,
+            "the upstream that left bytes behind is replaced"
+        );
+        let events = sink.events.lock().expect("events lock");
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Error { .. })),
+            "events: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::Response(_)))
+                .count(),
+            2,
+            "events: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_replaces_the_upstream_after_garbage_that_is_not_http() {
+        // Ends in a blank line, so a parser that took it for a response head would
+        // reject it and fail the connection.
+        assert_surplus_is_discarded_and_the_upstream_replaced("\u{0}\u{1}\u{2} not http\r\n\r\n")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn serve_replaces_the_upstream_after_a_bare_crlf() {
+        // The spec's known consequence: even this taints the connection.
+        assert_surplus_is_discarded_and_the_upstream_replaced("\r\n").await;
+    }
+
+    #[tokio::test]
+    async fn serve_replaces_the_upstream_after_more_surplus_than_one_read() {
+        // 40 KiB behind the response: more than one `READ_CHUNK` (16 KiB), so part
+        // of it is still unread on the upstream when the response completes.
+        let junk: &'static str = Box::leak("x".repeat(40 * 1024).into_boxed_str());
+        assert_surplus_is_discarded_and_the_upstream_replaced(junk).await;
+    }
+
+    // ---- upstream TLS that is not (or stops being) TLS --------------------
+
+    /// An origin that answers the ClientHello with cleartext HTTP (a plain server
+    /// behind a TLS port) fails the handshake at once, with the handshake's own
+    /// context rather than the timeout's.
+    #[tokio::test]
+    async fn tls_handshake_rejects_an_origin_that_answers_in_cleartext() {
+        let (io, mut origin) = stalled_pair();
+        let module = HttpModule::new().with_insecure(true);
+        // Holds the origin's end open (returned, not dropped) so the failure is
+        // the bytes, not an EOF.
+        let origin_task = tokio::spawn(async move {
+            let mut hello = [0u8; 16];
+            let _ = origin.read(&mut hello).await;
+            let _ = origin
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            let _ = origin.flush().await;
+            origin
+        });
+
+        let result = tokio::time::timeout(
+            STALL_GUARD,
+            module.tls_handshake(
+                &[b"http/1.1".to_vec()],
+                ServerName::try_from("origin.test").expect("name"),
+                io,
+                "origin.test:8443",
+            ),
+        )
+        .await
+        .expect("a cleartext answer must fail the handshake promptly");
+
+        let err = result.err().expect("cleartext HTTP is not a TLS handshake");
+        assert_eq!(err.to_string(), "TLS to upstream origin.test:8443");
+        let _origin = origin_task.await.expect("origin task");
+    }
+
+    /// An origin that reads the ClientHello and then drops the connection (a
+    /// reset mid-handshake) fails the handshake at once, not after the bound.
+    #[tokio::test]
+    async fn tls_handshake_fails_promptly_when_the_origin_drops_after_the_client_hello() {
+        let (io, mut origin) = stalled_pair();
+        let module = HttpModule::new().with_insecure(true);
+        let origin_task = tokio::spawn(async move {
+            let mut hello = [0u8; 16];
+            let _ = origin.read(&mut hello).await;
+            drop(origin);
+        });
+
+        let result = tokio::time::timeout(
+            STALL_GUARD,
+            module.tls_handshake(
+                &[b"http/1.1".to_vec()],
+                ServerName::try_from("origin.test").expect("name"),
+                io,
+                "origin.test:8443",
+            ),
+        )
+        .await
+        .expect("a mid-handshake drop must fail the handshake promptly");
+
+        let err = result
+            .err()
+            .expect("a dropped connection is not a TLS handshake");
+        assert_eq!(err.to_string(), "TLS to upstream origin.test:8443");
+        origin_task.await.expect("origin task");
+    }
 }
