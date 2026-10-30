@@ -560,6 +560,10 @@ async fn serve(
                 let _ = client.shutdown().await;
                 return Ok(());
             }
+            // No upstream response ran, so the machine is still parked in
+            // `Phase::Waiting`; ready it for the next request or the kept-alive
+            // connection never parses one and its receive buffer grows uncapped.
+            machine.short_circuit_done();
             continue;
         }
 

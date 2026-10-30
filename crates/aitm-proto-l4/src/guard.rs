@@ -601,6 +601,21 @@ fn danger_range(ip: IpAddr) -> Option<(IpAddr, u8)> {
             }
         }
         IpAddr::V6(v6) => {
+            // An IPv4-mapped (`::ffff:a.b.c.d`) or NAT64 (`64:ff9b::/96`) address
+            // routes to the embedded IPv4, so classify that: otherwise the v4
+            // control-plane denylist (loopback, 169.254 metadata, ...) is
+            // bypassable by sending the v6 form of the same target. Report the
+            // block in v6 space (the v4 prefix shifted into the low 32 bits) so
+            // a config scope override declared against the v6 dst still lifts it.
+            if let Some(v4) = mapped_ipv4_dst(v6) {
+                if let Some((IpAddr::V4(net), p4)) = danger_range(IpAddr::V4(v4)) {
+                    let mut seg = v6.segments();
+                    let n = net.octets();
+                    seg[6] = u16::from_be_bytes([n[0], n[1]]);
+                    seg[7] = u16::from_be_bytes([n[2], n[3]]);
+                    return Some((IpAddr::V6(Ipv6Addr::from(seg)), 96 + p4));
+                }
+            }
             if v6.is_loopback() {
                 Some((IpAddr::V6(Ipv6Addr::LOCALHOST), 128))
             } else if v6.is_unspecified() {
@@ -619,6 +634,21 @@ fn danger_range(ip: IpAddr) -> Option<(IpAddr, u8)> {
     }
 }
 
+/// The embedded IPv4 of an IPv4-mapped (`::ffff:a.b.c.d`) or NAT64
+/// (`64:ff9b::/96`) IPv6 address — both of which route to that v4 destination.
+fn mapped_ipv4_dst(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let s = v6.segments();
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6].iter().all(|&x| x == 0) {
+        let hi = s[6].to_be_bytes();
+        let lo = s[7].to_be_bytes();
+        return Some(Ipv4Addr::new(hi[0], hi[1], lo[0], lo[1]));
+    }
+    None
+}
+
 /// The target of a guard check — resolved from a capture/interception bind or a
 /// decoded packet.
 pub type L4Target = crate::types::L4Target;
@@ -627,6 +657,31 @@ pub type L4Target = crate::types::L4Target;
 mod tests {
     use super::*;
     use crate::types::{L4Direction, L4ScopeSource, PortRange, RateCap};
+
+    /// An IPv4-mapped or NAT64 IPv6 destination must be classified by its
+    /// embedded IPv4, so the v4 control-plane denylist cannot be bypassed by
+    /// sending the v6 form of the same target.
+    #[test]
+    fn mapped_and_nat64_dangerous_v4_are_blocked() {
+        let m = |s: &str| danger_range(s.parse::<IpAddr>().unwrap());
+        // IPv4-mapped forms of dangerous v4 targets.
+        assert!(m("::ffff:169.254.169.254").is_some(), "mapped metadata");
+        assert!(m("::ffff:127.0.0.1").is_some(), "mapped loopback");
+        assert!(m("::ffff:0.0.0.0").is_some(), "mapped unspecified");
+        // NAT64 well-known prefix form.
+        assert!(m("64:ff9b::169.254.169.254").is_some(), "nat64 metadata");
+        // A mapped *public* address is not blocked (and neither is a public v6).
+        assert!(m("::ffff:93.184.216.34").is_none(), "mapped public v4");
+        assert!(
+            m("2606:2800:220:1:248:1893:25c8:1946").is_none(),
+            "public v6"
+        );
+        // The reported block stays in v6 space so a v6 scope override can match.
+        if let Some((addr, prefix)) = m("::ffff:169.254.169.254") {
+            assert!(matches!(addr, IpAddr::V6(_)), "block reported in v6 space");
+            assert_eq!(prefix, 96 + 16, "169.254.0.0/16 mapped to a /112");
+        }
+    }
 
     fn cfg() -> L4Config {
         L4Config::default()

@@ -340,7 +340,7 @@ impl L4Dispatch {
                 filter: None,
                 queue: None,
             },
-            packets: Vec::new(),
+            packets: std::collections::VecDeque::new(),
             metadata: L4Meta::default(),
         });
         *slot = Some(id);

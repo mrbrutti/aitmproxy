@@ -716,7 +716,7 @@ mod tests {
                 filter: None,
                 queue: None,
             },
-            packets: vec![L4Packet {
+            packets: std::collections::VecDeque::from(vec![L4Packet {
                 dir: L4Direction::Outbound,
                 timestamp: std::time::SystemTime::now(),
                 bytes: vec![0u8; 33],
@@ -725,7 +725,7 @@ mod tests {
                     length: 33,
                 },
                 injected: true,
-            }],
+            }]),
             metadata: L4Meta::default(),
         });
 

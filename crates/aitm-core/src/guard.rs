@@ -388,8 +388,14 @@ impl StdGuard {
             .factor
             .max(1.0)
             .powi(n.saturating_sub(1) as i32);
-        let secs = self.backoff.base.as_secs_f64() * factor;
-        Duration::from_secs_f64(secs).min(self.backoff.max)
+        // Clamp the (unbounded, possibly infinite) exponential to the cap
+        // *before* converting: `Duration::from_secs_f64` panics on a value that
+        // overflows `Duration`, and `disable_count` grows without bound, so a
+        // host disabled enough times (~69 with the shipped defaults) would panic
+        // the command task here — before the `.min(max)` cap could run.
+        let max = self.backoff.max;
+        let secs = (self.backoff.base.as_secs_f64() * factor).min(max.as_secs_f64());
+        Duration::try_from_secs_f64(secs).unwrap_or(max).min(max)
     }
 
     /// Reconfigure the per-host rate at runtime (drives AC-P4: changing the
@@ -587,6 +593,27 @@ impl ScopeRateGuard for StdGuard {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(key, until);
+        }
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+
+    /// `backoff_for` must stay bounded by the cap for any disable count, never
+    /// panicking in `Duration::from_secs_f64` when the exponential overflows a
+    /// `Duration` (regression: the cap was applied only after the conversion).
+    #[test]
+    fn backoff_never_overflows_and_stays_capped() {
+        let g = StdGuard::default();
+        let max = g.backoff.max;
+        for n in [1u32, 10, 69, 70, 128, 1000, u32::MAX] {
+            let d = g.backoff_for(n);
+            assert!(
+                d <= max,
+                "backoff for n={n} exceeded the cap: {d:?} > {max:?}"
+            );
         }
     }
 }

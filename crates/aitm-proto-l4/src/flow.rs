@@ -38,8 +38,11 @@ pub struct L4Flow {
     pub kind: L4FlowKind,
     /// The interface / filter / target this flow is bound to.
     pub bind: L4Bind,
-    /// Packets in arrival order; `append_packet` pushes to the back.
-    pub packets: Vec<L4Packet>,
+    /// Packets in arrival order; `append_packet` pushes to the back and evicts
+    /// from the front at the cap. A `VecDeque` so that eviction is O(1): a
+    /// `Vec::remove(0)` shifted the whole log on every packet past the cap,
+    /// under the shared store lock (quadratic stall on a busy capture).
+    pub packets: VecDeque<L4Packet>,
     /// Marks, comment, and creation time.
     pub metadata: L4Meta,
 }
@@ -234,11 +237,11 @@ impl L4FlowStore for InMemoryL4FlowStore {
         let max = self.max_packets_per_flow;
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(flow) = inner.flows.get_mut(&id) {
-            flow.packets.push(pkt);
+            flow.packets.push_back(pkt);
             // Ring-buffer: a long capture never grows one flow's log without bound —
-            // past the cap, the oldest packet is evicted to make room for the newest.
+            // past the cap, the oldest packet is evicted (O(1)) to make room for the newest.
             while flow.packets.len() > max {
-                flow.packets.remove(0);
+                flow.packets.pop_front();
             }
         }
     }
@@ -257,7 +260,7 @@ mod tests {
                 filter: None,
                 queue: None,
             },
-            packets: Vec::new(),
+            packets: VecDeque::new(),
             metadata: L4Meta::default(),
         }
     }
@@ -286,7 +289,7 @@ mod tests {
 
         let flow = store.get(id).expect("flow present after insert");
         assert_eq!(flow.packets.len(), 1);
-        assert!(flow.packets.last().expect("one packet").injected);
+        assert!(flow.packets.back().expect("one packet").injected);
         assert_eq!(flow.kind, L4FlowKind::Craft);
     }
 

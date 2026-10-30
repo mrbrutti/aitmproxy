@@ -4,6 +4,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -26,6 +27,14 @@ pub const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'
 style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; \
 connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'";
 
+/// Brief pause after a failed `accept()` so a persistent error (e.g. fd
+/// exhaustion) does not spin the loop at full speed.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
+
+/// How long a client may take to send its request head before the connection is
+/// dropped (slowloris guard on the pre-upgrade HTTP request).
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Accept connections forever (until the future is dropped).
 pub async fn serve(listener: TcpListener, state: Arc<WebState>) -> anyhow::Result<()> {
     let (_tx, rx) = watch::channel(false);
@@ -41,7 +50,20 @@ pub async fn serve_until(
 ) -> anyhow::Result<()> {
     loop {
         let (stream, peer) = tokio::select! {
-            accepted = listener.accept() => accepted?,
+            accepted = listener.accept() => match accepted {
+                Ok(pair) => pair,
+                Err(e) => {
+                    // A transient accept error (ECONNABORTED, or fd exhaustion
+                    // EMFILE/ENFILE) must not end the accept loop: this future
+                    // is a top-level `select!` arm in `main`, so returning `Err`
+                    // here would tear down the whole process — proxy, browser
+                    // and MCP included. Log, back off briefly so we don't spin
+                    // while fds are scarce, and keep serving.
+                    debug!(error = %e, "web: accept failed; continuing");
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                    continue;
+                }
+            },
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return Ok(());
@@ -58,6 +80,9 @@ pub async fn serve_until(
             });
             let conn = http1::Builder::new()
                 .timer(TokioTimer::new())
+                // Bound how long a client may dribble request headers before the
+                // upgrade (slowloris on the pre-upgrade HTTP request).
+                .header_read_timeout(HEADER_READ_TIMEOUT)
                 .keep_alive(true)
                 .serve_connection(TokioIo::new(stream), service)
                 .with_upgrades();
