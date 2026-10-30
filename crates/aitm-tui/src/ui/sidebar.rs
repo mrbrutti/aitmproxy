@@ -185,6 +185,16 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         None => "F1".to_string(),
     };
     line(buf, item(app, SidebarItem::Agent, Some(agent_count), true));
+    // The Scan surface appears only when the bus offers the scanner plugin
+    // (`scan.discover`); its count is the injection points found this session.
+    if app.has_tool("scan.discover") {
+        let scan_count = if !app.scan.points.is_empty() {
+            app.scan.points.len().to_string()
+        } else {
+            "—".to_string()
+        };
+        line(buf, item(app, SidebarItem::Scan, Some(scan_count), false));
+    }
 
     // Footer: the sidebar filter hint, pinned to the bottom.
     if area.height > 2 {

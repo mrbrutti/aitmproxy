@@ -63,6 +63,12 @@ pub enum Action {
     /// The browser view (§2.7); asks the bus for the DOM and a screenshot
     /// the first time, when it offers `browser.*`.
     OpenBrowser,
+    /// The Scan view (scanner-integration Stage 1). Opens the view only and
+    /// shows the scope-bound target; viewing never crawls.
+    OpenScan,
+    /// Scan view `r`: launch a scope-bound `scan.discover` (deny-by-default:
+    /// an out-of-scope target is refused; a running crawl blocks re-launch).
+    ScanLaunch,
     AgentSet(AgentPolicy),
     // Text prompts
     PaletteOpen,

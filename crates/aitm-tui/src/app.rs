@@ -72,6 +72,10 @@ pub enum Mode {
     /// The config panel (`:config`, F7): the redacted `config.get` object,
     /// read-only.
     Config,
+    /// The Scan view (scanner-integration Stage 1): a scope-bound
+    /// `scan.discover` launch header, the discovered endpoints and the
+    /// discovered injection points. Inert until the bus offers `scan.discover`.
+    Scan,
     Help,
     QuickLook,
     /// The L4 inject confirm-over-the-wire overlay (ui-ext §3.4, L4OPS-AC10):
@@ -151,6 +155,57 @@ pub struct BrowserState {
     pub error: Option<String>,
 }
 
+/// One discovered injection point, mirroring an entry of `scan.discover`'s
+/// `injection_points` array (`{flow, location, name, example}`). The `example`
+/// is whatever the scanner handed us (redacted at the source for cookies and
+/// secret-named parameters); the UI renders it verbatim and never re-derives a
+/// raw value.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InjectionPointRow {
+    /// The flow this point was discovered in.
+    pub flow: String,
+    /// Where it lives (`query`, `body_param`, `header`, `cookie`,
+    /// `path_segment`, `redirect`).
+    pub location: String,
+    /// The parameter / header / segment name.
+    pub name: String,
+    /// The observed (already-redacted) example value.
+    pub example: String,
+}
+
+impl InjectionPointRow {
+    /// Read one `injection_points` entry; missing fields read as empty.
+    fn from_json(v: &Value) -> Self {
+        let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        Self {
+            flow: s("flow"),
+            location: s("location"),
+            name: s("name"),
+            example: s("example"),
+        }
+    }
+}
+
+/// The Scan view's state (scanner-integration Stage 1): what `scan.discover`
+/// has reported so far. Plain data; `App::on_bus` fills it and `ui::scan` draws
+/// it. The model mirrors the scanner's `endpoints` + `injection_points` JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScanState {
+    /// A `scan.discover` crawl is in flight; disables re-launch until it
+    /// settles (the Browser `busy` precedent).
+    pub running: bool,
+    /// The scope-bound target URL the last launch sent.
+    pub target: Option<String>,
+    /// The reached endpoints from the last result (each resolves to a flow).
+    pub endpoints: Vec<String>,
+    /// The discovered injection points from the last result.
+    pub points: Vec<InjectionPointRow>,
+    /// The injection-point list cursor.
+    pub cursor: usize,
+    /// The last `scan.discover` failure, shown until the next launch.
+    pub error: Option<String>,
+}
+
 /// Whether the browser view counts a call as in flight: exactly the calls
 /// [`browser_busy_label`] has a word for. The same predicate gates the
 /// increment in `call_tool` and the decrements on `CallOk`/`CallFailed`, so
@@ -170,6 +225,20 @@ fn browser_busy_label(name: &str) -> Option<&'static str> {
         "browser.type" => "typing",
         _ => return None,
     })
+}
+
+/// The seed URL `scan.discover` is given for an in-scope host.
+fn scan_target_url(host: &str) -> String {
+    format!("http://{host}/")
+}
+
+/// Reduce a scan target (`host`, `host:port`, `http://host/path?q`) to the bare
+/// host the scope guard checks.
+fn scan_host(raw: &str) -> String {
+    let s = raw.trim();
+    let s = s.split_once("://").map_or(s, |(_, rest)| rest);
+    let s = s.split(['/', '?', '#']).next().unwrap_or(s);
+    s.rsplit_once(':').map_or(s, |(h, _)| h).to_string()
 }
 
 /// A tool call held back for the operator's `y/N`.
@@ -306,10 +375,11 @@ pub enum SidebarItem {
     Browser,
     Scripts,
     Agent,
+    Scan,
 }
 
 impl SidebarItem {
-    pub const ALL: [SidebarItem; 10] = [
+    pub const ALL: [SidebarItem; 11] = [
         SidebarItem::Pinned,
         SidebarItem::Saved,
         SidebarItem::All,
@@ -320,6 +390,7 @@ impl SidebarItem {
         SidebarItem::Browser,
         SidebarItem::Scripts,
         SidebarItem::Agent,
+        SidebarItem::Scan,
     ];
 
     pub fn label(self) -> &'static str {
@@ -334,6 +405,7 @@ impl SidebarItem {
             SidebarItem::Browser => "Browser",
             SidebarItem::Scripts => "Scripts",
             SidebarItem::Agent => "Agent",
+            SidebarItem::Scan => "Scan",
         }
     }
 }
@@ -867,6 +939,9 @@ pub struct App {
     /// The L4 operator surface's state (ui-ext Part 3): flows, scope, agent
     /// gates, craft editor, inject confirm. Inert until the bus offers `l4.*`.
     pub l4: crate::l4::L4State,
+    /// The Scan view's state (scanner-integration Stage 1). Inert until the bus
+    /// offers `scan.discover`.
+    pub scan: ScanState,
 }
 
 impl App {
@@ -928,6 +1003,7 @@ impl App {
             pending_artifact: None,
             poc_build_pending: VecDeque::new(),
             l4: crate::l4::L4State::default(),
+            scan: ScanState::default(),
         }
     }
 
@@ -1638,6 +1714,26 @@ impl App {
                     self.browser.busy = Some("loading the page");
                 }
             }
+            Action::OpenScan => {
+                self.mode = Mode::Scan;
+                self.sidebar = SidebarItem::Scan;
+                // Viewing the panel never crawls: a `scan.discover` is up to
+                // hundreds of real browser navigations against the target. Seed
+                // the scope-bound target the header shows, so `r` (ScanLaunch)
+                // and `:scan <host>` are the only paths that reach the wire.
+                if self.scan.target.is_none() {
+                    if let Some(host) = self.scan_target_host() {
+                        self.scan.target = Some(scan_target_url(&host));
+                    }
+                }
+            }
+            Action::ScanLaunch => {
+                if self.scan.running {
+                    self.toast(Level::Info, "a scan is already running");
+                } else {
+                    self.scan_launch(None, &mut out);
+                }
+            }
             Action::AgentSet(p) => {
                 if self.has_tool("agent.set") {
                     out.push(BusRequest::AgentSet(p));
@@ -2143,6 +2239,61 @@ impl App {
         self.browser.busy = None;
     }
 
+    /// Launch a scope-bound `scan.discover`. The target is bound to the
+    /// authorized scope (deny-by-default): a host no scope entry covers is
+    /// refused with a toast and nothing reaches the wire. `explicit` is a
+    /// user-typed target (`:scan <host>`); `None` picks the selected flow's host
+    /// when it is in scope, else the first concrete in-scope host.
+    fn scan_launch(&mut self, explicit: Option<String>, out: &mut Vec<BusRequest>) {
+        if !self.has_tool("scan.discover") {
+            self.toast(
+                Level::Warn,
+                "scan.discover is not on this bus (needs the scanner plugin)",
+            );
+            return;
+        }
+        let host = match explicit {
+            Some(raw) => scan_host(&raw),
+            None => match self.scan_target_host() {
+                Some(h) => h,
+                None => {
+                    self.toast(
+                        Level::Warn,
+                        "Scan needs an in-scope host — add one to scope (S) first",
+                    );
+                    return;
+                }
+            },
+        };
+        if host.is_empty() || !scope_covers(&self.scope, &host) {
+            self.toast(
+                Level::Warn,
+                format!("Out of scope — add `{host}` to scope to scan it"),
+            );
+            return;
+        }
+        let target = scan_target_url(&host);
+        self.scan.running = true;
+        self.scan.error = None;
+        self.scan.target = Some(target.clone());
+        out.extend(self.call_tool("scan.discover", json!({ "target": target })));
+    }
+
+    /// The host a scan targets when none is typed: the selected flow's host when
+    /// it is in scope, else the first concrete (non-wildcard) scope entry.
+    fn scan_target_host(&self) -> Option<String> {
+        if let Some(row) = self.selected_row() {
+            let host = row.host();
+            if !host.is_empty() && self.in_scope(row) {
+                return Some(host.to_string());
+            }
+        }
+        self.scope
+            .iter()
+            .find(|e| !e.starts_with("*.") && !e.is_empty())
+            .map(|e| scan_host(e))
+    }
+
     /// The operator answered the confirm prompt.
     fn answer_confirm(&mut self, yes: bool) -> Vec<BusRequest> {
         self.prompt.clear();
@@ -2502,6 +2653,18 @@ impl App {
                     };
                 }
             }
+            Mode::Scan => {
+                let n = self.scan.points.len();
+                if n > 0 {
+                    self.scan.cursor = match action {
+                        Action::Up => self.scan.cursor.saturating_sub(1),
+                        Action::Down => (self.scan.cursor + 1).min(n - 1),
+                        Action::Home => 0,
+                        Action::End => n - 1,
+                        _ => self.scan.cursor,
+                    };
+                }
+            }
             Mode::Compose => {
                 self.compose.field = match action {
                     Action::Up => self.compose.field.saturating_sub(1),
@@ -2623,6 +2786,7 @@ impl App {
             SidebarItem::Findings => self.mode = Mode::Findings,
             SidebarItem::Agent => self.mode = Mode::Agent,
             SidebarItem::Browser => out.extend(self.update(Action::OpenBrowser)),
+            SidebarItem::Scan => out.extend(self.update(Action::OpenScan)),
             SidebarItem::Scripts => {
                 self.mode = Mode::Flows;
                 self.toast(Level::Info, "Scripts arrive with M3 (core follow-up F8)");
@@ -3010,6 +3174,19 @@ impl App {
                 }
             }
             "browser" => out.extend(self.update(Action::OpenBrowser)),
+            // `:scan` opens the Scan view only (viewing never crawls; `r`
+            // launches); `:scan <host>` opens it and crawls that host,
+            // scope-gated.
+            "scan" => {
+                out.extend(self.update(Action::OpenScan));
+                if !rest.is_empty() {
+                    if self.scan.running {
+                        self.toast(Level::Info, "a scan is already running");
+                    } else {
+                        self.scan_launch(Some(rest.to_string()), &mut out);
+                    }
+                }
+            }
             "curl" => match ComposeForm::from_curl(line) {
                 Some(f) => {
                     self.compose = f;
@@ -3532,6 +3709,38 @@ impl App {
                         self.l4.gates = crate::l4::L4Gates::from_json(&value);
                         self.toast(Level::Info, "L4 agent gate updated");
                     }
+                    // Scanner Stage 1: the crawl result — reached endpoints and
+                    // the injection points enumerated from captured requests.
+                    "scan.discover" => {
+                        self.scan.running = false;
+                        self.scan.error = None;
+                        self.scan.endpoints = value
+                            .get("endpoints")
+                            .and_then(Value::as_array)
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        self.scan.points = value
+                            .get("injection_points")
+                            .and_then(Value::as_array)
+                            .map(|a| a.iter().map(InjectionPointRow::from_json).collect())
+                            .unwrap_or_default();
+                        self.scan.cursor = self
+                            .scan
+                            .cursor
+                            .min(self.scan.points.len().saturating_sub(1));
+                        self.toast(
+                            Level::Info,
+                            format!(
+                                "scan.discover → {} endpoints · {} injection points",
+                                self.scan.endpoints.len(),
+                                self.scan.points.len()
+                            ),
+                        );
+                    }
                     n if is_tracked_browser_call(n) => {
                         self.browser_settled();
                         self.on_browser_ok(n, &value, &mut out);
@@ -3574,6 +3783,12 @@ impl App {
                     // count) is surfaced verbatim; drop the pending confirm.
                     "l4.inject" | "l4.send_recv" | "l4.intercept.forward" | "l4.intercept.drop" => {
                         self.l4.pending = None;
+                    }
+                    // A refused or failed crawl clears the running flag and keeps
+                    // the reason in the Scan view until the next launch.
+                    "scan.discover" => {
+                        self.scan.running = false;
+                        self.scan.error = Some(message.clone());
                     }
                     _ => {}
                 }
