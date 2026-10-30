@@ -431,10 +431,17 @@ fn release(shared: &Shared, host: &CommandHost, id: FlowId, how: Release) -> any
 /// [`FlowCtx::set_response`] for a flow released outside an event.
 fn set_short_circuit(flow: &mut Flow, status: u16) {
     if let Flow::Http(f) = flow {
+        // Declare the empty body with `Content-Length: 0`. Without it the HTTP/1
+        // egress encoder emits the response with no `Content-Length` and no
+        // `Transfer-Encoding`, so a keep-alive client cannot tell the (empty) body
+        // has ended and waits for bytes that never come (a `flow.kill mode=429|503`
+        // then hangs the client instead of answering it).
+        let mut headers = HeaderMap::new();
+        headers.set("Content-Length", "0");
         f.response = Some(HttpResponse {
             status,
             version: f.request.version,
-            headers: HeaderMap::new(),
+            headers,
             body: Body::Empty,
             timestamp: SystemTime::now(),
         });
@@ -461,5 +468,56 @@ fn set_intercept(flow: &mut Flow, state: InterceptState) {
     match flow {
         Flow::Http(f) => f.intercept = state,
         Flow::WebSocket(f) => f.intercept = state,
+    }
+}
+
+#[cfg(test)]
+mod short_circuit_tests {
+    use super::*;
+    use aitm_core::{ConnInfo, FlowMeta, HttpFlow, HttpRequest, HttpVersion};
+
+    fn http_flow() -> Flow {
+        let conn = ConnInfo {
+            peer: "127.0.0.1:0".parse().unwrap(),
+            sni: None,
+            alpn: None,
+            tls: false,
+            established: SystemTime::now(),
+        };
+        Flow::Http(HttpFlow {
+            id: FlowId::new(),
+            request: HttpRequest {
+                method: "GET".into(),
+                scheme: "http".into(),
+                authority: "example.test".into(),
+                path: "/".into(),
+                version: HttpVersion::Http11,
+                headers: HeaderMap::new(),
+                body: Body::Empty,
+                timestamp: SystemTime::now(),
+            },
+            response: None,
+            client_conn: conn,
+            server_conn: None,
+            metadata: FlowMeta::default(),
+            intercept: InterceptState::Observed,
+        })
+    }
+
+    #[test]
+    fn synthesized_abort_is_self_delimiting() {
+        // `flow.kill mode=429|503` synthesizes an empty response. It must carry an
+        // explicit `Content-Length: 0`: without body framing a keep-alive HTTP/1
+        // client waits forever for a body that never arrives (the kill hangs the
+        // client instead of answering it).
+        let mut flow = http_flow();
+        set_short_circuit(&mut flow, 503);
+        let Flow::Http(f) = &flow else {
+            panic!("expected http flow")
+        };
+        let resp = f.response.as_ref().expect("short-circuit response set");
+        assert_eq!(resp.status, 503);
+        assert!(matches!(resp.body, Body::Empty));
+        assert_eq!(resp.headers.get("content-length"), Some("0"));
     }
 }
