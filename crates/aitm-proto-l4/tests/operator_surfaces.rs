@@ -263,6 +263,28 @@ fn inject_agent_gate_flag_then_operator_bypass() {
     );
 }
 
+/// The human CLI, like the operator, is a trusted control role: with every agent flag
+/// OFF, a `Frontend::Cli` inject bypasses the per-capability agent gate and is refused
+/// only by the L4 guard (`out of L4 scope`), never by the gate.
+#[test]
+fn cli_inject_bypasses_the_agent_gate_and_reaches_the_guard() {
+    let parts = Parts::new();
+    let reg = registry(&cfg_with_inject_scope());
+    let err = reg
+        .command("l4.inject")
+        .unwrap()
+        .invoke(inject_params("8.8.8.8", 443), &parts.host(Frontend::Cli))
+        .unwrap_err();
+    assert!(
+        guard_refused(&err),
+        "cli inject must bypass the flag and reach the guard, got: {err:#}"
+    );
+    assert!(
+        !agent_gate_refused(&err),
+        "cli inject must not be refused by the agent gate, got: {err:#}"
+    );
+}
+
 /// Whether an invoke error is the agent gate's refusal (flag off).
 fn agent_gate_refused(err: &anyhow::Error) -> bool {
     format!("{err:#}").contains("capability is disabled")
@@ -357,6 +379,33 @@ fn agent_toggle_is_operator_only_and_governs_the_gate() {
     assert!(
         guard_refused(&err),
         "after the operator opened the gate, the agent inject must reach the guard, got: {err:#}"
+    );
+}
+
+/// The human CLI may open an agent L4 gate, like the operator: `l4.agent.set` as
+/// `Frontend::Cli` succeeds and `l4.agent.status` then reports the gate open.
+#[test]
+fn cli_may_set_l4_agent_gates() {
+    let reg = registry(&cfg_with_inject_scope());
+    let parts = Parts::new();
+
+    let mut set_args = BTreeMap::new();
+    set_args.insert("capability".to_string(), Value::Str("inject".into()));
+    set_args.insert("allowed".to_string(), Value::Bool(true));
+    reg.command("l4.agent.set")
+        .unwrap()
+        .invoke(Params::new(set_args), &parts.host(Frontend::Cli))
+        .expect("cli l4.agent.set must be allowed");
+
+    let status = reg
+        .command("l4.agent.status")
+        .unwrap()
+        .invoke(Params::default(), &parts.host(Frontend::Operator))
+        .expect("status ok");
+    assert_eq!(
+        gate(&status, "inject"),
+        Some(true),
+        "the cli's toggle must be reflected in status"
     );
 }
 
