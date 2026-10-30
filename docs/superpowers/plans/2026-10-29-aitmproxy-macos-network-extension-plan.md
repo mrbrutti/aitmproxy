@@ -344,11 +344,22 @@ assert the macOS path routes through it (NE-AC3); no separate choke is added. Su
 
 - **Satisfies:** NE-AC8.
 - **Depends on:** Task 1, Task 11.
-- **Files:** `apps/mac/Extension/Sources/TransparentProxyProvider.swift` (modify).
-- **Change:** in `handleNewFlow`, exclude flows whose **source-app identity**
-  (audit-token signing identifier) is `aitm` or the embedded `obscura` (predicate
-  left to the builder within "not pid-based"); rely on wildcard rules already
-  excluding loopback (the bus, obscura↔core on 127.0.0.1).
+- **Files:** `apps/mac/Extension/Sources/TransparentProxyProvider.swift` (modify — the
+  two entry-point call sites) and `apps/mac/Extension/Sources/FlowHandoff.swift` (modify —
+  the `SelfExclusion` predicate, placed beside the sibling identity/auth helpers in the
+  same Extension target and testable from the DEBUG self-check; Files line expanded
+  2026-10-30 per the Task-12 spec-panel finding).
+- **Change:** in `handleNewFlow` **and** `handleNewUDPFlow`, exclude flows whose
+  **source-app identity** (audit-token signing identifier) is `aitm` or the embedded
+  `obscura` (predicate left to the builder within "not pid-based"); rely on wildcard
+  rules already excluding loopback (the bus, obscura↔core on 127.0.0.1).
+- **HARD Task-18 gate (security panel, 2026-10-30):** the predicate matches the
+  *expected* signing identifiers (bare Mach-O → filename `aitm`/`obscura`, with an
+  ad-hoc `<name>-<hash>` fallback) but cannot be confirmed against the real signed
+  binaries until the live run. NE-AC8 is **not** claimed satisfied until Task 18
+  confirms the real identifiers and shows zero self-/loopback flows; a wrong guess
+  self-captures and loops (self-DoS), so this is a blocking acceptance item, not a
+  silent comment.
 - **Test / pass condition (Terminal panel, real Mac):** run a capture session with
   the core dialing upstream and obscura browsing; inspect the flow list and
   confirm **no** flow is attributed to `aitm` or `obscura` and no loopback flow
@@ -515,6 +526,10 @@ Kept by the main session during stage 6. One row per finding.
 | 11 | security | Minor | No cap on concurrent claimed flows (threads/memory per flow in the root sysex) | **accepted (hardening TODO)** — add a soft cap (fail open past it) as a follow-up |
 | 11 | security | Minor (info) | `FD_CLOEXEC` set result ignored (no exec in the sysex today) | accepted — informational |
 | 11 | spec, security, quality | Minor | Live decoy/real-core round-trip + core-side rendezvous writer + scope-spec emitter not exercised here | **deferred by design** — live decoy run → Task 18; rendezvous writer + scope emitter are core-side follow-ups (flagged in code + PR #100) |
+| 12 | spec | Important | `SelfExclusion` added to `FlowHandoff.swift`, not named in Task 12's Files list (undeclared file) | fixed — Task 12 Files line expanded to declare `FlowHandoff.swift` (placement beside the sibling identity helpers, testable from the DEBUG self-check); no cross-task leak |
+| 12 | security | Important | Self-exclusion rests on *guessed* signing identifiers; a wrong/under-match silently self-captures → loop (self-DoS), with nothing automated to catch it before the live run | **accepted + tracked as a HARD Task-18 gate** (reviewer-sanctioned, mirrors the Task 11 TODO handling) — the real identifiers are only knowable from the signed binaries; NE-AC8 is NOT claimed until Task 18 confirms them + shows zero self/loopback flows. Predicate reasoning (bare Mach-O → filename identifier) documented in code |
+| 12 | security | Minor | Over-match: a third-party binary named `aitm`/`obscura`/`<name>-…` is excluded (capture gap, never a disclosure) | **accepted** — low-risk; narrows once exact identifiers are pinned at Task 18 |
+| 12 | security | Minor | No automated test for `isSelf` (pure predicate) | **accepted** — consistent with the Extension's compile + live-run strategy; `isSelf` logic is trivial; live confirmation at Task 18 |
 
 ## Shipped
 

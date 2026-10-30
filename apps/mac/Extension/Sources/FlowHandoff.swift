@@ -156,8 +156,17 @@ enum PeerAuth {
 enum SelfExclusion {
     /// Signing identifiers of our own binaries. A Developer-ID-signed bare Mach-O
     /// takes its file name as its signing identifier ("aitm", "obscura"); an ad-hoc
-    /// dev build appends a hash ("aitm-<hash>"), so the "<name>-" prefix is matched
-    /// too. The exact signed identifiers are confirmed at the Task-18 live run.
+    /// dev build appends a hash ("aitm-<hash>"), so the "<name>-" prefix is matched too.
+    ///
+    /// SECURITY — HARD Task-18 GATE: these are the *expected* identifiers, not yet
+    /// confirmed against the real signed binaries. If the shipped aitm/obscura present a
+    /// different identifier (a reverse-DNS id, or obscura emits an empty one), `isSelf`
+    /// returns false, the flow is NOT excluded, and the core's own dial is fed back to
+    /// the core and LOOPS (self-DoS). NE-AC8 is therefore not claimed satisfied until the
+    /// Task-18 live run confirms the real identifiers and shows zero self/loopback flows
+    /// (tracked in the plan Review log). The "<name>-" prefix also over-matches a
+    /// third-party binary named e.g. "obscura-cli" — an accepted low-risk capture gap
+    /// (never a disclosure), not a bug.
     static let selfNames = ["aitm", "obscura"]
 
     /// True if `signingIdentifier` names one of our own binaries.
