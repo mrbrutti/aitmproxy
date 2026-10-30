@@ -97,6 +97,8 @@ fn scan(key: KeyEvent) -> Option<Action> {
     Some(match key.code {
         KeyCode::Esc | KeyCode::Char('q') => Action::Back,
         KeyCode::Char('r') => Action::ScanLaunch,
+        // Open the selected injection point's flow in the inspector.
+        KeyCode::Enter | KeyCode::Right => Action::Enter,
         KeyCode::Char('F') => Action::OpenFindings,
         KeyCode::Char(':') => Action::PaletteOpen,
         KeyCode::Char('?') => Action::Help,

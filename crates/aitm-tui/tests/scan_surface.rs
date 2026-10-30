@@ -5,7 +5,7 @@
 //! the UI that surfaces its `scan.discover` result.
 
 use aitm_tui::action::{Action, BusEvent, BusRequest};
-use aitm_tui::app::{App, Mode, SidebarItem};
+use aitm_tui::app::{App, InjectionPointRow, Mode, SidebarItem};
 use aitm_tui::fixture_app_core;
 use aitm_tui::keys;
 use aitm_tui::snapshot::{render, to_text};
@@ -231,4 +231,117 @@ fn scan_sidebar_row_and_view_regions_render() {
         text.contains("query") && text.contains("next"),
         "a discovered injection point renders its location + name: {text}"
     );
+}
+
+/// Parity with the web view's endpoint→flow links: the selected injection
+/// point's `flow` (from the scanner's result) opens in the existing inspector
+/// on ⏎ / →; an id no longer in the list is refused with a toast, not a crash.
+#[test]
+fn enter_opens_the_selected_injection_points_flow() {
+    for code in [KeyCode::Enter, KeyCode::Right] {
+        assert_eq!(
+            keys::map(press(code), Mode::Scan),
+            Some(Action::Enter),
+            "{code:?} opens the point's flow"
+        );
+    }
+    let mut app = fixture_app_core(200, 50);
+    let _ = app.update(Action::OpenScan);
+    let _ = app.update(Action::ScanLaunch);
+    let _ = app.on_bus(BusEvent::CallOk {
+        name: "scan.discover".into(),
+        value: discover_result(),
+    });
+    app.scan.points[1].flow = "f-missing".into();
+    app.selected = None;
+
+    assert_eq!(app.scan.cursor, 0);
+    let _ = app.update(Action::Enter);
+    assert_eq!(
+        app.selected.as_deref(),
+        Some("f50"),
+        "the point's flow becomes the selection"
+    );
+    assert_eq!(app.mode, Mode::Inspector, "and opens in the inspector");
+
+    // A point whose flow is gone from the list: stay put, say why.
+    app.mode = Mode::Scan;
+    let _ = app.update(Action::Down);
+    assert_eq!(app.scan.cursor, 1);
+    let _ = app.update(Action::Enter);
+    assert_eq!(app.mode, Mode::Scan, "no inspector for a missing flow");
+    assert_eq!(app.selected.as_deref(), Some("f50"), "selection unchanged");
+    let toast = app
+        .toasts
+        .back()
+        .map(|t| t.text.clone())
+        .unwrap_or_default();
+    assert!(
+        toast.contains("f-missing") && toast.contains("not in the flow list"),
+        "the refusal names the flow: {toast:?}"
+    );
+}
+
+/// PgUp/PgDn page the injection-point cursor like the flow and findings lists
+/// (a page is the list body: the terminal height minus the panel chrome).
+#[test]
+fn page_keys_move_the_injection_point_cursor() {
+    let mut app = fixture_app_core(200, 50);
+    let _ = app.update(Action::OpenScan);
+    app.scan.points = (0..60)
+        .map(|i| InjectionPointRow {
+            flow: "f50".into(),
+            location: "query".into(),
+            name: format!("p{i}"),
+            example: String::new(),
+        })
+        .collect();
+    assert_eq!(
+        keys::map(press(KeyCode::PageDown), Mode::Scan),
+        Some(Action::PageDown)
+    );
+    // 50 rows − 8 chrome rows (three bars, two box edges, target, hint,
+    // list heading) = a 42-row page.
+    let _ = app.update(Action::PageDown);
+    assert_eq!(app.scan.cursor, 42, "one page down");
+    let _ = app.update(Action::PageDown);
+    assert_eq!(app.scan.cursor, 59, "clamped at the last point");
+    let _ = app.update(Action::PageUp);
+    assert_eq!(app.scan.cursor, 17, "one page up");
+    let _ = app.update(Action::Home);
+    assert_eq!(app.scan.cursor, 0);
+    let _ = app.update(Action::End);
+    assert_eq!(app.scan.cursor, 59);
+}
+
+/// `]`/`[` never land on the Scan row when the bus does not offer
+/// `scan.discover` (the row is not drawn then); with the tool they do.
+#[test]
+fn sidebar_step_skips_scan_when_the_tool_is_absent() {
+    let mut app = fixture_app_core(200, 50);
+    app.tools.retain(|t| t.name != "scan.discover");
+    assert!(!app.has_tool("scan.discover"));
+    app.sidebar = SidebarItem::Agent;
+    let _ = app.update(Action::SidebarNext);
+    assert_eq!(
+        app.sidebar,
+        SidebarItem::Pinned,
+        "] skips the invisible Scan row and wraps"
+    );
+    let _ = app.update(Action::SidebarPrev);
+    assert_eq!(
+        app.sidebar,
+        SidebarItem::Agent,
+        "[ skips it on the way back"
+    );
+
+    let mut app = fixture_app_core(200, 50);
+    app.sidebar = SidebarItem::Agent;
+    let _ = app.update(Action::SidebarNext);
+    assert_eq!(
+        app.sidebar,
+        SidebarItem::Scan,
+        "with scan.discover offered, ] lands on Scan"
+    );
+    assert_eq!(app.mode, Mode::Scan);
 }

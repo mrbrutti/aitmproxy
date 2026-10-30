@@ -1455,6 +1455,28 @@ impl App {
                         }
                     }
                 }
+                // Scan: the selected injection point's flow (the id the scanner
+                // reported) opens in the inspector — parity with the web view's
+                // endpoint→flow links. An id no longer listed is refused, not
+                // selected.
+                Mode::Scan => {
+                    if let Some(p) = self.scan.points.get(self.scan.cursor) {
+                        let id = p.flow.clone();
+                        if self.row(&id).is_some() {
+                            self.selected = Some(id);
+                            self.mode = Mode::Inspector;
+                            self.inspector.reset_view();
+                            self.ensure_detail(&mut out);
+                        } else {
+                            self.toast(
+                                Level::Warn,
+                                format!(
+                                    "flow {id} is not in the flow list (cleared, or not captured here)"
+                                ),
+                            );
+                        }
+                    }
+                }
                 Mode::Prompt(_) | Mode::Compose => out.extend(self.submit()),
                 Mode::Edit => {
                     if let Some(e) = &mut self.edit {
@@ -2656,12 +2678,19 @@ impl App {
             Mode::Scan => {
                 let n = self.scan.points.len();
                 if n > 0 {
+                    // A page is the points list body: the terminal minus the
+                    // panel chrome (three bars, two box edges, the target and
+                    // hint lines, the list heading).
+                    let page = usize::from(self.height.saturating_sub(8)).max(1);
+                    let c = self.scan.cursor;
                     self.scan.cursor = match action {
-                        Action::Up => self.scan.cursor.saturating_sub(1),
-                        Action::Down => (self.scan.cursor + 1).min(n - 1),
+                        Action::Up => c.saturating_sub(1),
+                        Action::Down => (c + 1).min(n - 1),
+                        Action::PageUp => c.saturating_sub(page),
+                        Action::PageDown => (c + page).min(n - 1),
                         Action::Home => 0,
                         Action::End => n - 1,
-                        _ => self.scan.cursor,
+                        _ => c,
                     };
                 }
             }
@@ -2781,7 +2810,13 @@ impl App {
     /// `]`/`[`: the Scope item filters the list (§2.7 "The flow list's
     /// `Scope` sidebar item filters to in-scope"); the panel is `S`/`:scope`.
     fn sidebar_step(&mut self, d: i32, out: &mut Vec<BusRequest>) {
-        self.sidebar = step(&SidebarItem::ALL, self.sidebar, d);
+        let mut next = step(&SidebarItem::ALL, self.sidebar, d);
+        // The Scan row is drawn only when the bus offers `scan.discover`;
+        // never land on a row the operator cannot see.
+        if next == SidebarItem::Scan && !self.has_tool("scan.discover") {
+            next = step(&SidebarItem::ALL, next, d);
+        }
+        self.sidebar = next;
         match self.sidebar {
             SidebarItem::Findings => self.mode = Mode::Findings,
             SidebarItem::Agent => self.mode = Mode::Agent,
@@ -3994,6 +4029,10 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     (
         "browser",
         "Browser view: URL, DOM outline, screenshot; navigate and eval",
+    ),
+    (
+        "scan",
+        "Scan view: scope-bound scan.discover (r crawls; :scan <host> crawls a host)",
     ),
     ("layout h|v", "Inspector below or right"),
     ("split", "Split view (not built in this pass)"),

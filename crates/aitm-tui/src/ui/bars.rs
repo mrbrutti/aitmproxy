@@ -331,6 +331,13 @@ pub fn status(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut 
             ("o", "open"),
             ("Esc", "back"),
         ],
+        Mode::Scan => vec![
+            ("r", "scan"),
+            ("↑↓", "points"),
+            ("⏎", "flow"),
+            ("F", "findings"),
+            ("Esc", "back"),
+        ],
         _ => vec![("Esc", "back")],
     };
     let hint_line = |hints: &[(&str, &str)]| -> Line<'static> {

@@ -78,15 +78,15 @@ fn header(app: &App, theme: &Theme, target_area: Rect, hint_area: Rect, buf: &mu
     let target = app
         .scan
         .target
-        .clone()
-        .unwrap_or_else(|| "no in-scope host — add one to scope (S)".to_string());
+        .as_deref()
+        .unwrap_or("no in-scope host — add one to scope (S)");
     put(
         buf,
         target_area,
         Line::from(vec![
             Span::styled(" target ", theme.accent().add_modifier(Modifier::BOLD)),
             Span::styled(
-                truncate(&target, usize::from(target_area.width).saturating_sub(24)),
+                truncate(target, usize::from(target_area.width).saturating_sub(24)),
                 theme.text_primary(),
             ),
             Span::raw("   "),
