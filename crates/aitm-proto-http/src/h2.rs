@@ -64,6 +64,21 @@ const MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
 /// table size, pinned so the bound is explicit rather than implied.)
 const HEADER_TABLE_SIZE: u32 = 4 * 1024;
 
+/// The flow mark `aitm-plugin-maprules` sets once it has actually rewritten a
+/// request's authority (`MAP_REMOTE_MARK` there). It is matched here *by value* — a
+/// plain string on `flow.metadata.marks`, not a crate dependency — so the
+/// cross-origin upstream branch is entered only for a genuine Map Remote rewrite,
+/// never for a normal request whose `:authority` merely omits the default port
+/// (spec §6 / Anti-goals: an h2 flow is not a loophole around scope).
+const MAP_REMOTE_MARK: &str = "map-remote";
+
+/// Finite cap on the number of *extra* cross-origin upstreams a single h2
+/// connection may open (spec §4 / Anti-goals "Unbounded memory"). Even legitimate
+/// Map Remote fan-out — and any attempt to cycle distinct rewrite targets — is held
+/// to this many second upstreams per connection; beyond it, a further distinct
+/// target is refused rather than opening an unbounded number of TLS+h2 connections.
+const MAX_EXTRA_UPSTREAMS: usize = 8;
+
 /// Drive one already-decrypted h2 connection. Both halves speak h2 (the ALPN
 /// mirror guarantees it). Spawns one task per accepted client stream; returns
 /// when the client stops accepting (GOAWAY / close) or the connection sits idle
@@ -191,14 +206,24 @@ struct Upstreams {
 
 impl Upstreams {
     /// The `SendRequest` to use for `authority`: the pinned origin's shared handle
-    /// when it matches the connection's origin (or is absent), else a cached — or
-    /// newly opened — upstream to the rewritten host.
+    /// for every request that was not genuinely rewritten cross-origin, and for any
+    /// rewrite whose target is the pinned origin once default ports are applied; a
+    /// cached — or newly opened, pool-bounded — upstream only for a real Map Remote
+    /// rewrite to a *different* origin.
+    ///
+    /// `rewritten` is whether the maprules plugin actually redirected this request
+    /// (the [`MAP_REMOTE_MARK`] on the flow). Without it, a browser's portless
+    /// `:authority` (`example.com`) would never equal the pinned `example.com:443`
+    /// on a raw compare and *every* normal request would wrongly open a second
+    /// upstream — bypassing the vetted pinned connection and, on the passive
+    /// listener, fanning out unbounded upstreams (the panel's two Importants).
     async fn for_authority(
         &self,
         ctx: &ModuleCtx,
         authority: &str,
+        rewritten: bool,
     ) -> Result<h2::client::SendRequest<Bytes>> {
-        if authority.is_empty() || authority == self.pinned_authority {
+        if !rewritten || authority.is_empty() || same_origin(authority, &self.pinned_authority) {
             return Ok(self.pinned.clone());
         }
         // Fast path: an upstream for this authority already exists. The lock is
@@ -212,17 +237,30 @@ impl Upstreams {
         {
             return Ok(existing);
         }
+        // Refuse to open a new cross-origin upstream once the per-connection pool is
+        // full (an already-pooled authority is served by the fast path above, so a
+        // full pool only blocks a *new* target). Checked again under the lock after
+        // the dial, since the pool may fill while this stream handshakes.
+        {
+            let pool = self.extra.lock().unwrap_or_else(PoisonError::into_inner);
+            if pool.len() >= MAX_EXTRA_UPSTREAMS {
+                bail!(
+                    "cross-origin upstream pool full ({MAX_EXTRA_UPSTREAMS}); refusing {authority}"
+                );
+            }
+        }
         // Open a fresh cross-origin upstream, then cache it. Two streams racing to
         // open the same authority may each open one; the later `insert` wins and the
         // loser's handle is dropped (its idle connection future ends) — benign.
         let opened = self.open(ctx, authority).await?;
-        Ok(self
-            .extra
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(authority.to_string())
-            .or_insert(opened)
-            .clone())
+        let mut pool = self.extra.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(existing) = pool.get(authority) {
+            return Ok(existing.clone());
+        }
+        if pool.len() >= MAX_EXTRA_UPSTREAMS {
+            bail!("cross-origin upstream pool full ({MAX_EXTRA_UPSTREAMS}); refusing {authority}");
+        }
+        Ok(pool.entry(authority.to_string()).or_insert(opened).clone())
     }
 
     /// Dial, TLS-connect (ALPN h2) and h2-handshake a new upstream to `authority`.
@@ -272,6 +310,21 @@ impl Upstreams {
             }
         });
         Ok(send_req)
+    }
+}
+
+/// Whether two authorities name the same https origin once the default port (443) is
+/// applied and the host is normalised: `example.com` and `example.com:443` compare
+/// equal, so a browser's portless `:authority` is recognised as the pinned origin.
+/// If either side fails to parse (it should not — both are real authorities), fall
+/// back to a raw compare rather than risk treating distinct hosts as one.
+fn same_origin(a: &str, b: &str) -> bool {
+    match (
+        Authority::parse_with_default(a, 443),
+        Authority::parse_with_default(b, 443),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
     }
 }
 
@@ -414,6 +467,10 @@ async fn drive_stream(
         return Ok(());
     }
 
+    // Whether the maprules plugin actually rewrote this request's authority
+    // cross-origin (the MAP_REMOTE_MARK it set during `Event::Request`). Only then is
+    // the second-upstream branch eligible; a normal request rides the pinned handle.
+    let rewritten = flow.metadata.marks.iter().any(|m| m == MAP_REMOTE_MARK);
     let request = flow.request;
 
     // Short-circuit (Map Local, a plugin-authored reply): answer without upstream.
@@ -441,7 +498,9 @@ async fn drive_stream(
     // host (opened/cached here); the pinned origin keeps the shared handle (spec §6).
     // An out-of-scope target was already refused by the maprules plugin above (its
     // 502 short-circuits before this point), so the original is never sent.
-    let send_req = upstreams.for_authority(ctx, &request.authority).await?;
+    let send_req = upstreams
+        .for_authority(ctx, &request.authority, rewritten)
+        .await?;
     let mut send_req = wire("upstream ready", send_req.ready())
         .await?
         .context("upstream h2 not ready")?;
@@ -650,5 +709,19 @@ mod tests {
     async fn wire_passes_through_a_ready_value() {
         let r: Result<u8> = wire_within("ready", Duration::from_secs(5), async { 7u8 }).await;
         assert_eq!(r.expect("a ready await must not time out"), 7);
+    }
+
+    /// A portless authority and the same host with the https default port are the
+    /// same origin (the browser-`:authority` case the panel flagged); a different
+    /// host or a different explicit port is not.
+    #[test]
+    fn same_origin_applies_the_default_port() {
+        assert!(same_origin("example.com", "example.com:443"));
+        assert!(same_origin("example.com:443", "example.com"));
+        assert!(same_origin("Example.COM", "example.com:443"));
+        assert!(same_origin("127.0.0.1:8443", "127.0.0.1:8443"));
+        assert!(!same_origin("example.com", "example.com:8443"));
+        assert!(!same_origin("example.com", "evil.com"));
+        assert!(!same_origin("example.com:8443", "example.com:9443"));
     }
 }

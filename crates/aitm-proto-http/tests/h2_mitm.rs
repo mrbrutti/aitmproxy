@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1441,6 +1442,119 @@ async fn map_remote_h2_out_of_scope_refused() {
         new_log.lock().unwrap().count(),
         0,
         "the out-of-scope target must never be contacted"
+    );
+}
+
+// --- M7 panel fix: a normal h2 request reuses the single pinned upstream --------
+//
+// A browser omits the default port from `:authority` (`example.com`, not
+// `example.com:443`), while the connection is pinned to the CONNECT authority
+// (`host:port`). A raw string compare in `Upstreams::for_authority` made EVERY such
+// request look cross-origin — opening a second upstream, bypassing the vetted
+// pinned connection, and (on the passive listener) letting unique authorities fan
+// out unbounded upstreams (spec §6 / Anti-goals: an h2 flow is not a scope
+// loophole). A normal (un-rewritten) request must ride the shared pinned upstream.
+
+/// An h2 TLS origin that counts how many upstream *connections* it accepts (one per
+/// TCP+TLS handshake), answering every request 200 + `body`. A single pinned
+/// upstream multiplexes all streams, so a correct proxy opens exactly one.
+async fn spawn_counting_origin(connections: Arc<AtomicUsize>, body: Vec<u8>) -> SocketAddr {
+    let acceptor = origin_tls(vec![ALPN_H2.to_vec()]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
+    let addr = listener.local_addr().expect("origin addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            let connections = connections.clone();
+            let body = body.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                // Count the upstream connection only once its h2 handshake succeeds,
+                // so a bare TCP probe does not inflate the count.
+                let Ok(mut conn) = h2::server::handshake(tls).await else {
+                    return;
+                };
+                connections.fetch_add(1, Ordering::SeqCst);
+                while let Some(accepted) = conn.accept().await {
+                    let Ok((req, mut respond)) = accepted else {
+                        break;
+                    };
+                    let (_parts, mut rbody) = req.into_parts();
+                    while let Some(Ok(chunk)) = rbody.data().await {
+                        let _ = rbody.flow_control().release_capacity(chunk.len());
+                    }
+                    let resp = http::Response::builder().status(200).body(()).unwrap();
+                    if let Ok(mut send) = respond.send_response(resp, false) {
+                        let _ = send.send_data(Bytes::from(body.clone()), true);
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// One `GET path` over an existing h2 connection whose request `:authority` is set
+/// explicitly (e.g. the host with no port), returning (status, body).
+async fn h2_get_with_authority(
+    send_req: &h2::client::SendRequest<Bytes>,
+    authority: &str,
+    path: &str,
+) -> anyhow::Result<(u16, Vec<u8>)> {
+    let mut sr = send_req.clone().ready().await?;
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(format!("https://{authority}{path}"))
+        .body(())?;
+    let (resp_fut, _send_body) = sr.send_request(req, true)?;
+    let resp = resp_fut.await?;
+    let status = resp.status().as_u16();
+    let mut body = resp.into_body();
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk?;
+        let _ = body.flow_control().release_capacity(chunk.len());
+        buf.extend_from_slice(&chunk);
+    }
+    Ok((status, buf))
+}
+
+/// A normal h2 request whose `:authority` is the host WITHOUT the default port
+/// (`127.0.0.1`), while the connection is pinned to the CONNECT authority
+/// (`127.0.0.1:port`), must be served over the SHARED pinned upstream — the origin
+/// accepts exactly one upstream connection, and no second upstream is opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn normal_h2_request_reuses_pinned_upstream() {
+    let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
+    let root_pem = ca.root_cert_pem().to_string();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let origin = spawn_counting_origin(connections.clone(), b"pinned-body".to_vec()).await;
+    let (proxy, _store) = run_proxy(ca, Vec::new(), None).await;
+
+    // Pin the connection to `127.0.0.1:<port>` via CONNECT.
+    let send_req = connect_h2(proxy, origin, &root_pem).await;
+    // Send a browser-style request: `:authority` is the bare host, no port.
+    let host_only = origin.ip().to_string();
+    let (status, body) = h2_get_with_authority(&send_req, &host_only, "/normal")
+        .await
+        .expect("a normal h2 request must complete over the pinned upstream");
+    assert_eq!(status, 200);
+    assert_eq!(
+        body, b"pinned-body",
+        "the request must reach the pinned origin, not a second upstream"
+    );
+
+    // Give any (erroneous) second upstream a moment to land before asserting one.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        1,
+        "a normal h2 request must reuse the single pinned upstream, not open a second"
     );
 }
 
