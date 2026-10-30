@@ -69,6 +69,9 @@ final class TransparentProxyProvider: NETransparentProxyProvider, NEAppProxyUDPF
         // claimed. (UDP flows arrive via `handleNewUDPFlow` below, which carries the
         // initial remote endpoint; a UDP flow that reaches here has none, so it
         // cannot be scoped and fails open.)
+        // Loop avoidance (NE-AC8): never capture flows our own binaries originate,
+        // or the core's upstream dials / obscura's browsing would be fed back and loop.
+        if SelfExclusion.isSelf(flow.metaData.sourceAppSigningIdentifier) { return false }
         guard let tcp = flow as? NEAppProxyTCPFlow else { return false }
         return handoff.handleTCP(tcp)
     }
@@ -77,6 +80,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider, NEAppProxyUDPF
     /// scoped and handed off exactly like a TCP flow. Same fail-open contract.
     func handleNewUDPFlow(_ flow: NEAppProxyUDPFlow,
                           initialRemoteFlowEndpoint remoteEndpoint: Network.NWEndpoint) -> Bool {
+        if SelfExclusion.isSelf(flow.metaData.sourceAppSigningIdentifier) { return false }
         return handoff.handleUDP(flow, initialRemote: remoteEndpoint)
     }
 }

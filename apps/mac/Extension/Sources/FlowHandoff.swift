@@ -144,6 +144,29 @@ enum PeerAuth {
     }
 }
 
+// MARK: - Self-exclusion (loop avoidance, Band C Task 12 / NE-AC8)
+
+/// Flows originated by our OWN capturing/dialing binaries must never be captured,
+/// or the tool captures itself: the core's upstream dials and the embedded obscura
+/// browser would be handed back to the core and loop. Excluded by SOURCE-APP SIGNING
+/// IDENTITY (the audit-token signing identifier NE already resolves), NOT by pid
+/// (pid reuse/ordering hazards — spec D4). Loopback (the bus; obscura↔core on
+/// 127.0.0.1) is separately excluded by the provider's outbound wildcard rule, which
+/// keeps the proxy port out of the loop.
+enum SelfExclusion {
+    /// Signing identifiers of our own binaries. A Developer-ID-signed bare Mach-O
+    /// takes its file name as its signing identifier ("aitm", "obscura"); an ad-hoc
+    /// dev build appends a hash ("aitm-<hash>"), so the "<name>-" prefix is matched
+    /// too. The exact signed identifiers are confirmed at the Task-18 live run.
+    static let selfNames = ["aitm", "obscura"]
+
+    /// True if `signingIdentifier` names one of our own binaries.
+    static func isSelf(_ signingIdentifier: String) -> Bool {
+        guard !signingIdentifier.isEmpty else { return false }
+        return selfNames.contains { signingIdentifier == $0 || signingIdentifier.hasPrefix($0 + "-") }
+    }
+}
+
 // MARK: - Wire codec (pure; mirrors listener.rs)
 
 enum HandoffWire {
