@@ -95,7 +95,7 @@ but never exceed the operator-set bounds.
 |---|---|---|
 | `endpoints` | array of strings | The in-scope URLs the crawl reached. A link that redirects within the origin contributes both the URL the crawl requested and the page it landed on. |
 | `injection_points` | array of objects | The discovered injection points (below). Repeated scans of the same site do not accumulate: a point is unique per `(endpoint URL, location, name)` and carries the newest captured flow that showed it. |
-| `endpoint_flows` | object | endpoint URL (as in `endpoints`) -> id of the newest captured flow that served it; an endpoint with no capture is absent. |
+| `endpoint_flows` | object (URL to flow id) | Maps each endpoint URL (as in `endpoints`) to the id of the newest captured flow that served it. An endpoint with no capture is absent. |
 | `pages_crawled` | int | Number of pages successfully navigated. |
 | `stopped_reason` | string or null | Why the crawl stopped early (e.g. `"navigation_failed"`, `"guard_refused"`, or a cap being hit); `null` if it completed normally. |
 

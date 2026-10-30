@@ -232,13 +232,15 @@ async fn scan_discover_end_to_end() {
 fn point_keys(points: &[Value]) -> Vec<(String, String)> {
     let mut keys: Vec<(String, String)> = points
         .iter()
-        .filter_map(|p| {
-            let Value::Object(p) = p else { return None };
+        .map(|p| {
+            let Value::Object(p) = p else {
+                panic!("an injection point must be an object: {p:?}");
+            };
             match (p.get("location"), p.get("name")) {
                 (Some(Value::Str(location)), Some(Value::Str(name))) => {
-                    Some((location.clone(), name.clone()))
+                    (location.clone(), name.clone())
                 }
-                _ => None,
+                _ => panic!("an injection point must carry a location and a name: {p:?}"),
             }
         })
         .collect();

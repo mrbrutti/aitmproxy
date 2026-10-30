@@ -145,9 +145,7 @@ impl Command for ScanDiscover {
         // store keeps every earlier scan's captures of the same site, so the
         // same point turns up once per capture; it is reported once, at the
         // position of its first appearance, carrying the newest capture's flow
-        // and example. The cap bounds distinct keys; replacing an existing
-        // entry is always allowed. The URL is borrowed from `outcome` through
-        // `endpoint_set`, so no per-point copy of it is made.
+        // and example.
         let mut point_index: HashMap<(&str, Location, String), usize> = HashMap::new();
         // Map each reached endpoint (keyed by the same scrubbed URL the result
         // exposes in `endpoints`) to the newest captured flow that served it, so
@@ -175,8 +173,9 @@ impl Command for ScanDiscover {
             endpoint_flows.insert(scrub_text(url), Value::Str(id.to_string()));
             for point in enumerate(&flow) {
                 let key = (url, point.location.clone(), point.name.clone());
-                // Decide before building anything: once the cap is full a new
-                // key is dropped here, unbuilt, rather than assembled and
+                // The cap bounds distinct keys; overwriting an existing one is
+                // always allowed. Decide before building anything, so a new key
+                // past the cap is dropped unbuilt rather than assembled and
                 // scrubbed only to be thrown away.
                 let slot = point_index.get(&key).copied();
                 if slot.is_none() && injection_points.len() >= MAX_RESULT_ITEMS {
@@ -1028,8 +1027,9 @@ mod tests {
     }
 
     /// Output order is stable across rescans: a point sits where it first
-    /// appeared, and a repeat key overwrites it there rather than moving it.
-    /// Compared as the ordered sequence, not sorted.
+    /// appeared (store order, then `enumerate`'s query, path, header order), and
+    /// a repeat key overwrites it there rather than moving it. Compared as the
+    /// ordered sequence against a literal, not sorted.
     #[test]
     fn rescan_keeps_each_injection_point_in_its_place() {
         let site = Site::new(&[("/", SITE_ROOT)]);
@@ -1037,16 +1037,27 @@ mod tests {
         let first = points_of(&site.scan());
         let second = points_of(&site.scan());
 
-        let order = |points: &[Point]| -> Vec<(String, String)> {
+        let urls = flow_urls(&site.store);
+        let order = |points: &[Point]| -> Vec<(String, String, String)> {
             points
                 .iter()
-                .map(|p| (p.location.clone(), p.name.clone()))
+                .map(|p| (urls[&p.flow].clone(), p.location.clone(), p.name.clone()))
                 .collect()
         };
-        assert_eq!(first.len(), 5, "{first:?}");
+        let expected: Vec<(String, String, String)> = [
+            ("http://target.test/", "header", "X-Trace"),
+            ("http://target.test/search?q=hello", "query", "q"),
+            ("http://target.test/search?q=hello", "header", "X-Trace"),
+            ("http://target.test/account/1", "path_segment", "1"),
+            ("http://target.test/account/1", "header", "X-Trace"),
+        ]
+        .into_iter()
+        .map(|(url, location, name)| (url.to_string(), location.to_string(), name.to_string()))
+        .collect();
+        assert_eq!(order(&first), expected, "scan 1 order");
         assert_eq!(
             order(&second),
-            order(&first),
+            expected,
             "scan 2 must list the same points in the same positions as scan 1"
         );
         // ...and each position really was overwritten: it now carries scan 2's
@@ -1069,8 +1080,13 @@ mod tests {
     /// when the cap is already full.
     #[test]
     fn cap_bounds_distinct_keys_but_an_existing_key_is_still_overwritten() {
+        const ENDPOINTS: usize = 600;
+        const _: () = assert!(
+            ENDPOINTS * 2 > MAX_RESULT_ITEMS,
+            "the fixture must exceed the cap"
+        );
         let store = MemFlowStore::new();
-        for i in 0..600 {
+        for i in 0..ENDPOINTS {
             store.insert(captured(&format!("/p{i}?a=1&b=2"), HeaderMap::new()));
         }
         let newest = store
@@ -1098,7 +1114,7 @@ mod tests {
 
         assert_eq!(
             endpoints_of(&result).len(),
-            600,
+            ENDPOINTS,
             "every endpoint is reached"
         );
         let points = points_of(&result);
