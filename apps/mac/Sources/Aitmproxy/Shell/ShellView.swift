@@ -191,6 +191,10 @@ struct MainView: View {
                 // Viz-first Connection page: the waterfall replaces the flow table; the
                 // inspector opens on select. The dashboard band sits above (see above).
                 ConnectionWaterfall()
+            } else if session.page == .apps, session.clients.isEmpty {
+                // No Network/System Extension ⇒ no source-app attribution, so the Apps
+                // grouping is empty. Explain it rather than showing a bare "0".
+                AppsNeedsExtension()
             } else {
                 flowTable
             }
@@ -279,6 +283,21 @@ struct EmptyFlows: View {
         .padding(.top, Tok.Size.columnHeader)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .allowsHitTesting(false)
+    }
+}
+
+/// The Apps page before the Network/System Extension lands: proxy capture carries
+/// no source-app attribution, so there is nothing to group by. Explain it rather
+/// than showing a bare "0".
+struct AppsNeedsExtension: View {
+    var body: some View {
+        ContentUnavailableView {
+            Label("No app attribution yet", systemImage: "app.badge")
+        } description: {
+            Text("Grouping flows by source app needs the macOS capture extension. Proxy capture alone cannot tell which app each flow came from.")
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Tok.Ground.surface.color)
     }
 }
 
