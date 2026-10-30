@@ -1,10 +1,11 @@
 # Release runbook
 
-How to cut a public aitmproxy release: one tag drives CI, which builds and
-attaches every Linux artifact; Matt builds, signs, and uploads the macOS
-artifacts on his Mac; a re-run of the `finalize` job rolls the macOS assets
-into `SHA256SUMS` and the website manifest; and the private Homebrew tap is
-updated out-of-band.
+How to cut an aitmproxy release: one tag drives CI, which builds and uploads
+every Linux artifact to the (private) source-repo Release; Matt builds, signs,
+and uploads the macOS artifacts on his Mac; a re-run of the `finalize` job rolls
+the macOS assets into `SHA256SUMS`, **mirrors every asset to the public tap repo**
+(`mrbrutti/homebrew-aitmproxy`) so downloads are tokenless, and writes the website
+manifest; and the public Homebrew tap's formula/cask are bumped out-of-band.
 
 A release produces, on a public GitHub Release for tag `v<ver>`:
 
@@ -31,14 +32,20 @@ If any changes, this runbook changes with it:
    App Store Connect `.p8` key are Matt's identity and live only on his Mac;
    they are deliberately kept out of CI secrets. So CI builds Linux only, and
    steps 3 below run on Matt's Mac.
-2. **The public Release lives in the main `aitmproxy` repo (KEY #2).** The
-   website's download links must be fetchable by a tokenless visitor, so the
-   Release and its assets are public, in the main repo — not in the private
-   tap repo.
-3. **The Homebrew tap is updated manually (KEY #3).** `mrbrutti/homebrew-aitmproxy`
-   is a separate private repo. The release workflow does **not** push to it (that
-   would need a write-scoped token as a CI secret); Matt bumps the formula and
-   cask by hand per step 5.
+2. **Binaries are public; the source repo is private (KEY #2, updated
+   2026-10-30).** The website's download links must be fetchable by a tokenless
+   visitor. The source repo `mrbrutti/aitmproxy` stays **private**; CI builds and
+   uploads there, then `finalize` **mirrors** every release asset to the
+   **public** tap repo `mrbrutti/homebrew-aitmproxy`'s release, and
+   `site/downloads.json` points at those public tap URLs. (Originally the public
+   Release was to live in the main repo; it now lives on the public tap so the
+   source can stay private.)
+3. **The tap repo is public and hosts the binaries; the formula/cask are still
+   bumped by hand (KEY #3, updated 2026-10-30).** `mrbrutti/homebrew-aitmproxy`
+   is now **public**. CI mirrors the binaries to its release (via
+   `TAP_PUBLISH_TOKEN`), but the `Formula/aitm.rb` + `Casks/aitmproxy.rb`
+   version/`sha256` bump is still manual (step 5). They use plain public tap URLs
+   — no download strategy and no `HOMEBREW_GITHUB_API_TOKEN`.
 4. **macOS is arm64-only for now (KEY #4).** Only `aarch64-apple-darwin`
    artifacts ship. An Intel macOS tarball can be added later cheaply; a
    universal notarized app is deferred.
@@ -58,6 +65,14 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   `secrets.OBSCURA_GH_TOKEN` — a read-scoped GitHub PAT with access to
   `mrbrutti/obscura`. Add it under **Settings ▸ Secrets and variables ▸ Actions**
   before the first release, or the obscura download fails. Never commit the token.
+- **`TAP_PUBLISH_TOKEN` repository secret.** The `finalize` job mirrors every
+  release asset + `SHA256SUMS` to the **public** tap repo
+  `mrbrutti/homebrew-aitmproxy` so tokenless visitors (and the website) can
+  download them while the source repo `mrbrutti/aitmproxy` stays private. CI's
+  default `GITHUB_TOKEN` cannot write to another repo, so this uses
+  `secrets.TAP_PUBLISH_TOKEN` — a PAT with `contents:write` on the tap repo. Add
+  it the same way; without it the release fails at the "Mirror … to the public
+  tap" step. Never commit the token.
 
 ## Steps
 
@@ -121,18 +136,23 @@ Now that every asset (Linux from CI + macOS from step 3) is attached, re-run the
 Release assets, writes a combined `SHA256SUMS` (one line per asset) and uploads
 it, then runs `scripts/gen-downloads-manifest.sh` to regenerate
 `site/downloads.json` and commits it to `main` so `pages.yml` redeploys the
-download page with the macOS rows included.
+download page with the macOS rows included. It also **mirrors every asset +
+`SHA256SUMS` to the public tap repo's release** (creating that release if absent,
+via `TAP_PUBLISH_TOKEN`) and generates the manifest with **public tap URLs**.
 
 Confirm `SHA256SUMS` and the updated `site/downloads.json` list the macOS DMG and
-tarball.
+tarball, and that the assets appear on the public tap release
+(`mrbrutti/homebrew-aitmproxy`).
 
-### 5. Update the private Homebrew tap  **[Terminal, out-of-band]**
+### 5. Update the public Homebrew tap  **[Terminal, out-of-band]**
 
-In the private tap repo `mrbrutti/homebrew-aitmproxy`, bump the formula and the
-cask to the new release: update the version and the `sha256` values to match the
-new Release assets (take the hashes from the `SHA256SUMS` from step 4), then
-commit and push the tap repo. This is manual by decision (KEY #3); the release
-workflow does not touch the tap.
+In the public tap repo `mrbrutti/homebrew-aitmproxy`, bump the formula and the
+cask to the new release: update the `version` and the `sha256` values to match
+the new assets (take the hashes from the `SHA256SUMS` from step 4), then commit
+and push. The `url`s are plain public tap paths
+(`https://github.com/mrbrutti/homebrew-aitmproxy/releases/download/v<ver>/…`) with
+a fixed host, so only `version`/`sha256` change. This bump is manual by decision
+(KEY #3); CI mirrors the binaries to the tap but does not edit the formula/cask.
 
 ### 6. Verify
 
@@ -142,5 +162,8 @@ workflow does not touch the tap.
   `dpkg -i ./aitm-<ver>-<arch>.deb` on Debian/Ubuntu or
   `rpm -qlp` / `sudo dnf install ./aitm-<ver>-<arch>.rpm` on Fedora/RHEL, and
   confirm `aitm` launches and finds `obscura` at `/usr/lib/aitmproxy/obscura`.
+- Tokenless: with no `HOMEBREW_GITHUB_API_TOKEN` set, `curl -sIL` a tap asset URL
+  returns 200, and `brew tap mrbrutti/aitmproxy && brew install aitm` resolves
+  without auth.
 - Website: open the download page and confirm the new version's links resolve.
 - Checksums: `shasum -a 256 -c SHA256SUMS` against the downloaded assets.
