@@ -25,9 +25,9 @@ impl Plugin for ScannerPlugin {
     }
 
     fn load(&mut self, reg: &mut Registry) {
-        reg.add_command(std::sync::Arc::new(crate::commands::ScanDiscover {
-            cfg: self.cfg.clone(),
-        }));
+        reg.add_command(std::sync::Arc::new(crate::commands::ScanDiscover::new(
+            self.cfg.clone(),
+        )));
     }
 }
 

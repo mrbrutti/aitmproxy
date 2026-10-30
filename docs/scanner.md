@@ -50,6 +50,14 @@ or auth material) are returned as `<redacted>`, never echoed in the result.
 **auto-surfaced over MCP, the CLI, and the UIs** at once, with the same scope and
 sensitivity rules. It is **operator-run and agent-taskable**.
 
+**One discovery at a time.** All crawls share the one embedded-browser page, so
+two at once would interleave their navigations and each would harvest the
+other's pages. A `scan.discover` started while another is still running is
+therefore **refused immediately** with `scan.discover is already running; wait
+for it to finish before starting another …` — it never touches the browser.
+Wait for the running scan to finish (it ends on success, error, or panic, and the
+next one then runs normally); scans run back to back need no reset in between.
+
 ### CLI
 
 ```bash

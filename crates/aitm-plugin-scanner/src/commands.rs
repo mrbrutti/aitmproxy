@@ -15,6 +15,15 @@
 //! refuses an out-of-scope public host before dialing it; the hold is an RAII
 //! token released when the command returns.
 //!
+//! Single-flight: there is exactly one browser page, so two crawls running at
+//! once would interleave their navigations on it (each harvesting the other's
+//! pages, or losing its seed navigation to the other). `scan.discover` is
+//! therefore refused **immediately** while another discovery is running on the
+//! same command, before it takes an egress hold or touches the browser, and the
+//! next one runs normally as soon as the running one ends — on success, error,
+//! or unwind (the claim is an RAII token, see [`InFlightSlot`]). Sequential scans
+//! need no browser reset between them.
+//!
 //! The result carries no credentials: [`crate::discover::enumerate`] replaces a
 //! secret-named point's example with a placeholder, and every free-text string
 //! that reaches the caller is additionally run through
@@ -22,6 +31,7 @@
 //! masked as well.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aitm_core::redact::scrub_text;
 use aitm_core::{
@@ -40,6 +50,40 @@ const MAX_RESULT_ITEMS: usize = 1024;
 /// present in captured requests. Registered by [`crate::ScannerPlugin`].
 pub(crate) struct ScanDiscover {
     pub(crate) cfg: ScannerConfig,
+    /// Set while a discovery is running. The command is created once per
+    /// registry and shared (behind an `Arc`) by every frontend built over it, so
+    /// this one flag serializes every `scan.discover` that can reach the one
+    /// shared browser page.
+    in_flight: AtomicBool,
+}
+
+impl ScanDiscover {
+    pub(crate) fn new(cfg: ScannerConfig) -> Self {
+        Self {
+            cfg,
+            in_flight: AtomicBool::new(false),
+        }
+    }
+}
+
+/// The claim on [`ScanDiscover::in_flight`], held for the whole discovery. It
+/// releases the flag when dropped, so the slot is given back on success, on
+/// error, and on unwind alike.
+struct InFlightSlot<'a>(&'a AtomicBool);
+
+impl<'a> InFlightSlot<'a> {
+    /// Claim the slot, or `None` if a discovery already holds it.
+    fn claim(flag: &'a AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(flag))
+    }
+}
+
+impl Drop for InFlightSlot<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl Command for ScanDiscover {
@@ -115,6 +159,21 @@ impl Command for ScanDiscover {
         // would spend a second rate token and a second concurrency slot, and
         // with `max_concurrency == 1` would refuse the crawl's own permit.
         //
+        // Single-flight: one browser page is shared by every crawl, so a second
+        // discovery now would interleave its navigations with the running one.
+        // Refuse it here — after argument validation (a bad argument is still
+        // reported as such) but before the egress hold and the browser — so the
+        // refused call touches nothing. Declared before `_confine` on purpose:
+        // locals drop in reverse order, so the egress hold is released first and
+        // the slot last, and a new scan can never start while the old hold is
+        // still in place.
+        let Some(_slot) = InFlightSlot::claim(&self.in_flight) else {
+            anyhow::bail!(
+                "scan.discover is already running; wait for it to finish before starting \
+                 another (concurrent crawls share one browser page and would corrupt each other)"
+            );
+        };
+
         // S2: run the whole crawl under a campaign hold on the proxy's
         // browser-egress posture, so the `SsrfConnector` refuses any
         // out-of-scope public host the browser is sent to (a redirect, a
@@ -482,9 +541,7 @@ mod tests {
 
     #[test]
     fn scan_discover_is_write() {
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
         assert_eq!(cmd.sensitivity(), Sensitivity::Write);
     }
 
@@ -494,9 +551,7 @@ mod tests {
         let guard = StdGuard::default(); // empty scope: deny-by-default
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
 
         let err = cmd
             .invoke(
@@ -527,9 +582,7 @@ mod tests {
         let guard = scoped_guard();
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
 
         let result = cmd
             .invoke(
@@ -565,9 +618,7 @@ mod tests {
         let guard = scoped_guard();
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
 
         let result = cmd
             .invoke(
@@ -628,9 +679,7 @@ mod tests {
         });
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
 
         let result = cmd
             .invoke(
@@ -652,9 +701,7 @@ mod tests {
         let guard = scoped_guard();
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
 
         let result = cmd
             .invoke(
@@ -679,12 +726,10 @@ mod tests {
         let guard = scoped_guard();
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig {
-                max_pages: 2,
-                ..ScannerConfig::default()
-            },
-        };
+        let cmd = ScanDiscover::new(ScannerConfig {
+            max_pages: 2,
+            ..ScannerConfig::default()
+        });
 
         let result = cmd
             .invoke(
@@ -709,9 +754,7 @@ mod tests {
         let guard = scoped_guard();
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
 
         let err = cmd
             .invoke(
@@ -742,9 +785,7 @@ mod tests {
         let client = NoSendClient;
         let host =
             CommandHost::new(&store, &client, &guard, Some(&browser)).with_egress(posture.clone());
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
         assert!(!posture.confined(), "fixture starts with the free posture");
 
         let result = cmd
@@ -783,9 +824,7 @@ mod tests {
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
         assert!(host.egress_handle().is_none());
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
 
         let result = cmd
             .invoke(
@@ -807,9 +846,7 @@ mod tests {
         });
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
 
         let err = cmd
             .invoke(
@@ -837,9 +874,7 @@ mod tests {
     /// browser — and the one already running is unharmed.
     #[test]
     fn overlapping_scan_is_refused_without_touching_the_browser() {
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
         let (first_browser, gate) = StubBrowser::gated();
         let second_browser = StubBrowser::open();
         let client = NoSendClient;
@@ -894,9 +929,7 @@ mod tests {
     /// slot only while a scan is running.
     #[test]
     fn scan_runs_again_after_the_previous_one_finished() {
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
         let browser = StubBrowser::open();
         let store = MemFlowStore::new();
         let guard = scoped_guard();
@@ -920,9 +953,7 @@ mod tests {
     /// not refused as "already running".
     #[test]
     fn slot_is_released_when_a_scan_errors() {
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
         let browser = StubBrowser::open();
         let store = MemFlowStore::new();
         let guard = scoped_guard();
@@ -953,9 +984,7 @@ mod tests {
     /// Nor may a scan that panics wedge the command: unwinding releases the slot.
     #[test]
     fn slot_is_released_when_a_scan_panics() {
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
         let client = NoSendClient;
 
         let panicking = StubBrowser::panicking();
