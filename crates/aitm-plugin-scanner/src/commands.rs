@@ -55,7 +55,12 @@ impl Command for ScanDiscover {
             description: "Discover reachable in-scope URLs under `target` (same-origin, \
                           scope-bound, budget-capped) and enumerate the injection points \
                           visible in captured requests. No injection or fuzzing is performed. \
-                          `max_depth`/`max_pages` may lower the configured caps, never raise them."
+                          `max_depth`/`max_pages` may lower the configured caps, never raise them. \
+                          A navigation that lands off-origin or out of scope (a redirect) aborts \
+                          the crawl with `stopped_reason = \"left_scope\"`. Note: the embedded \
+                          browser may still fetch out-of-scope sub-resources/redirect targets \
+                          before the crawl aborts; a proxy-level scope-confined egress gate is \
+                          the full fix (tracked separately)."
                 .into(),
             params: vec![
                 ParamDef {

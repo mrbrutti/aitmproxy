@@ -43,6 +43,8 @@ pub struct CrawlOutcome {
     /// here, but they do count against `max_pages` (see [`crawl`]).
     pub pages_crawled: usize,
     /// `"max_pages"`, `"max_depth"`, `"time_budget"`, `"no_browser"`,
+    /// `"left_scope"` (a navigation landed off-origin or out of scope — a
+    /// redirect — and the crawl aborted there),
     /// `"navigation_failed"` (the browser was there but every navigation
     /// failed), `"guard_refused"` (the guard refused every enqueued link), or
     /// `None` when the reachable graph was exhausted.
@@ -149,13 +151,17 @@ pub async fn crawl(
         };
         pages_crawled += 1;
 
-        // A redirect may have landed somewhere else. Only a same-origin,
-        // in-scope landing page is recorded and harvested.
+        // A redirect or meta-refresh may have taken the browser somewhere else.
+        // A landing page that is off-origin or out of scope ends the crawl on
+        // the spot (`left_scope`): it is neither recorded nor harvested, and no
+        // further page is navigated. Silently continuing would let a target
+        // walk the browser around other hosts one redirect at a time.
         let Some(page) = parse_target(&nav.final_url)
             .filter(|u| u.origin() == origin && host.guard().in_scope(&guard_authority(u)))
         else {
             drop(permit);
-            continue;
+            stopped = Some("left_scope");
+            break;
         };
         let page_key = page.as_str().to_string();
         visited.insert(page_key.clone());
@@ -589,6 +595,8 @@ mod tests {
     /// `fail_after(n)` set, every navigation from the `n`th on fails.
     struct StubBrowser {
         pages: BTreeMap<String, String>,
+        /// Navigated URL → the `final_url` the browser reports (a redirect).
+        redirects: BTreeMap<String, String>,
         default_html: String,
         fail_after: usize,
         current: Mutex<Option<String>>,
@@ -599,6 +607,7 @@ mod tests {
         fn new(default_html: &str) -> Self {
             Self {
                 pages: BTreeMap::new(),
+                redirects: BTreeMap::new(),
                 default_html: default_html.to_string(),
                 fail_after: usize::MAX,
                 current: Mutex::new(None),
@@ -613,6 +622,13 @@ mod tests {
 
         fn fail_after(mut self, n: usize) -> Self {
             self.fail_after = n;
+            self
+        }
+
+        /// Navigating `url` lands on `final_url`, as after a server redirect.
+        fn redirect(mut self, url: &str, final_url: &str) -> Self {
+            self.redirects
+                .insert(url.to_string(), final_url.to_string());
             self
         }
 
@@ -633,9 +649,10 @@ mod tests {
                 if nth >= self.fail_after {
                     anyhow::bail!("stub navigation refused: {url}");
                 }
-                *self.current.lock().expect("current lock") = Some(url.clone());
+                let final_url = self.redirects.get(&url).cloned().unwrap_or(url);
+                *self.current.lock().expect("current lock") = Some(final_url.clone());
                 Ok(NavOutcome {
-                    final_url: url,
+                    final_url,
                     status: Some(200),
                 })
             })
@@ -818,6 +835,46 @@ mod tests {
         assert!(
             !out.endpoints.iter().any(|u| u.contains("evil.example")),
             "off-origin URL leaked into endpoints: {:?}",
+            out.endpoints
+        );
+    }
+
+    /// A navigation whose landing page is off-origin or out of scope (a server
+    /// redirect) aborts the crawl: the landing page is not recorded, nothing
+    /// is harvested from it, and no further page is navigated.
+    #[tokio::test]
+    async fn crawl_aborts_on_off_scope_landing() {
+        let browser = StubBrowser::new(r#"<a href="/after">after</a>"#)
+            .page(TARGET, r#"<a href="/go">go</a> <a href="/stay">stay</a>"#)
+            // The in-scope link `/go` is navigated, but the server sends the
+            // browser to another host.
+            .redirect("http://target.test/go", "http://evil.example/landing");
+        let store = MemFlowStore::new();
+        let guard = scoped_guard("target.test");
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, Some(&browser));
+
+        let out = crawl(&host, TARGET, &ScannerConfig::default())
+            .await
+            .expect("leaving scope is an outcome, not an error");
+
+        assert_eq!(out.stopped_reason, Some("left_scope".into()));
+        assert_eq!(
+            out.endpoints,
+            vec!["http://target.test/".to_string()],
+            "the off-scope landing page is not recorded"
+        );
+        assert_eq!(
+            browser.navigated(),
+            vec![
+                "http://target.test/".to_string(),
+                "http://target.test/go".to_string()
+            ],
+            "the crawl stopped at the redirect: `/stay` was never navigated"
+        );
+        assert!(
+            !out.endpoints.iter().any(|u| u.contains("evil.example")),
+            "off-scope URL leaked into endpoints: {:?}",
             out.endpoints
         );
     }
