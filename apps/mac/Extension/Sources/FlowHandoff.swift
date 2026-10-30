@@ -148,31 +148,33 @@ enum PeerAuth {
 
 /// Flows originated by our OWN capturing/dialing binaries must never be captured,
 /// or the tool captures itself: the core's upstream dials and the embedded obscura
-/// browser would be handed back to the core and loop. Excluded by SOURCE-APP SIGNING
-/// IDENTITY (the audit-token signing identifier NE already resolves), NOT by pid
-/// (pid reuse/ordering hazards — spec D4). Loopback (the bus; obscura↔core on
-/// 127.0.0.1) is separately excluded by the provider's outbound wildcard rule, which
-/// keeps the proxy port out of the loop.
+/// browser would be handed back to the core and loop. Excluded by the SOURCE APP's
+/// CODE SIGNATURE — its audit token (which NE already resolves) checked against our
+/// Developer ID team requirement — NOT by pid (pid reuse/ordering hazards — spec D4),
+/// and NOT by a guessed signing-identifier string (a wrong guess would silently
+/// self-capture and loop). Loopback (the bus; obscura↔core on 127.0.0.1) is separately
+/// excluded by the provider's outbound wildcard rule, which keeps the proxy port out of
+/// the loop.
 enum SelfExclusion {
-    /// Signing identifiers of our own binaries. A Developer-ID-signed bare Mach-O
-    /// takes its file name as its signing identifier ("aitm", "obscura"); an ad-hoc
-    /// dev build appends a hash ("aitm-<hash>"), so the "<name>-" prefix is matched too.
+    /// True if the flow's SOURCE APP is signed by our Developer ID team. aitm and the
+    /// embedded obscura are both team-signed, so they are excluded regardless of their
+    /// specific signing identifier — there is NO reliance on guessing "aitm"/"obscura",
+    /// so a renamed/reverse-DNS/empty identifier cannot slip through and loop (the
+    /// self-DoS the string guess risked). Reuses the same audit-token → SecCode → team
+    /// requirement check Task 11 uses for the core peer; the SecCode cost is per NEW flow
+    /// (connection), not per packet.
     ///
-    /// SECURITY — HARD Task-18 GATE: these are the *expected* identifiers, not yet
-    /// confirmed against the real signed binaries. If the shipped aitm/obscura present a
-    /// different identifier (a reverse-DNS id, or obscura emits an empty one), `isSelf`
-    /// returns false, the flow is NOT excluded, and the core's own dial is fed back to
-    /// the core and LOOPS (self-DoS). NE-AC8 is therefore not claimed satisfied until the
-    /// Task-18 live run confirms the real identifiers and shows zero self/loopback flows
-    /// (tracked in the plan Review log). The "<name>-" prefix also over-matches a
-    /// third-party binary named e.g. "obscura-cli" — an accepted low-risk capture gap
-    /// (never a disclosure), not a bug.
-    static let selfNames = ["aitm", "obscura"]
-
-    /// True if `signingIdentifier` names one of our own binaries.
-    static func isSelf(_ signingIdentifier: String) -> Bool {
-        guard !signingIdentifier.isEmpty else { return false }
-        return selfNames.contains { signingIdentifier == $0 || signingIdentifier.hasPrefix($0 + "-") }
+    /// Over-exclusion: this also excludes any OTHER 995PCLM9KH-signed binary. In practice
+    /// the only such binaries a user runs are aitmproxy's own, which is exactly what must
+    /// be excluded. Narrowing to aitm's full designated requirement (spec D4 "aitm and
+    /// obscura specifically") is a tracked GA-hardening item (plan Review log), as for the
+    /// Task 11 core requirement. A missing/malformed audit token cannot be verified, so
+    /// such a flow is NOT treated as self (local flows reliably carry the token).
+    static func isSelf(sourceAppAuditToken data: Data?) -> Bool {
+        guard let data, data.count == MemoryLayout<audit_token_t>.size else { return false }
+        var token = audit_token_t()
+        _ = withUnsafeMutableBytes(of: &token) { data.copyBytes(to: $0) }
+        return PeerAuth.verifyPeer(auditToken: token, requirement: PeerAuth.coreRequirement)
     }
 }
 
