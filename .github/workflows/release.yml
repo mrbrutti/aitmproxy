@@ -99,6 +99,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The workspace links libpcap (the `pcap` crate, L4 capture); Ubuntu
+      # runners need the -dev package or the aitm build fails to link.
+      - name: Install system build deps
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:

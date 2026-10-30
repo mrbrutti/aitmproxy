@@ -28,6 +28,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The workspace links libpcap (the `pcap` crate, L4 capture). macOS ships
+      # it; Ubuntu runners need the -dev package or the test link step fails
+      # with `unable to find library -lpcap`.
+      - name: Install system build deps
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
       - name: Install Rust toolchain (stable + rustfmt + clippy)
         uses: dtolnay/rust-toolchain@stable
         with:
