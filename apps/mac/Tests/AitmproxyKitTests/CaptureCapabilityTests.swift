@@ -50,6 +50,11 @@ import Testing
         #expect(CaptureCapability.pendingApproval.applying(.tunnelDisconnected) == .pendingApproval)
     }
 
+    @Test func anAlreadyCapturingStateIsUnchangedByAnotherTunnelConnectedEvent() {
+        // A repeated `.connected` observation while capturing is idempotent, not a reset.
+        #expect(CaptureCapability.capturing.applying(.tunnelConnected) == .capturing)
+    }
+
     @Test func aTunnelFailureAfterApprovalDegrades() {
         let state = CaptureCapability.approvedAttached
             .applying(.failed("Could not start the capture tunnel: permission denied"))
@@ -158,6 +163,27 @@ import Testing
         #expect(policy.connectWindow == .seconds(6))
         #expect(policy.pollInterval == .milliseconds(500))
         #expect(policy.pollCount == 12)
+    }
+
+    @Test func theConnectedCheckAlwaysSamplesAtLeastOnce() {
+        // A window shorter than one poll interval must still sample once, never zero times.
+        let policy = TunnelReconcilePolicy(
+            settleAfterReplacement: .seconds(2),
+            maxAttempts: 4,
+            connectWindow: .milliseconds(100),
+            pollInterval: .seconds(1),
+            firstBackoff: .seconds(1),
+            maxBackoff: .seconds(8))
+        #expect(policy.pollCount == 1)
+    }
+
+    @Test func transientReconcileFailuresRetryAndPermanentOnesDoNot() {
+        // The retry policy ExtensionController maps each NEVPNError.code onto.
+        #expect(TunnelFailure.configurationDisabled.isTransient)
+        #expect(TunnelFailure.configurationStale.isTransient)
+        #expect(TunnelFailure.configurationUnknown.isTransient)
+        #expect(TunnelFailure.connectionFailed.isTransient)
+        #expect(!TunnelFailure.permanent.isTransient)
     }
 
     // MARK: embedded-extension gate

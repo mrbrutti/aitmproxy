@@ -181,6 +181,32 @@ public struct TunnelReconcilePolicy: Equatable, Sendable {
     }
 }
 
+/// How the reconcile classifies a failed attempt (Task 16, NE-AC14). Pure, so the
+/// retry policy is unit-tested without NetworkExtension; `ExtensionController` maps each
+/// `NEVPNError.code` onto a case with a compiler-checked exhaustive switch, and the exact
+/// code-to-case mapping is verified live at Task 18.
+public enum TunnelFailure: Sendable {
+    /// The leash #58 symptom: a replacement left the saved configuration disabled.
+    case configurationDisabled
+    /// The configuration is stale — reload and try again.
+    case configurationStale
+    /// The configuration state is unknown — reload and try again.
+    case configurationUnknown
+    /// The provider is not up yet.
+    case connectionFailed
+    /// Permanent, notably the operator refusing the "Add Proxy Configurations" prompt:
+    /// retrying would only re-show it.
+    case permanent
+
+    /// Whether this failure can clear by itself, so retrying is worthwhile.
+    public var isTransient: Bool {
+        switch self {
+        case .configurationDisabled, .configurationStale, .configurationUnknown, .connectionFailed: true
+        case .permanent: false
+        }
+    }
+}
+
 /// Where the capture system extension lives in the app bundle, and whether this
 /// build carries it. `build.sh` embeds it only for a Developer ID NE build (Task
 /// 14); a development build has none, and the host app stays inert there.

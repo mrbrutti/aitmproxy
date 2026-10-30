@@ -138,18 +138,29 @@ final class ExtensionController: NSObject {
             == CaptureExtension.identifier
     }
 
-    /// Whether a failed attempt can clear by itself, so retrying is worthwhile.
-    /// `configurationDisabled` is the leash #58 symptom (the replacement left the saved
-    /// configuration off), `configurationStale` and `configurationUnknown` mean "reload
-    /// and try again", and `connectionFailed` is a provider that is not up yet. Anything
-    /// else is permanent, notably `configurationReadWriteFailed`, which is what the
-    /// operator refusing the "Add Proxy Configurations" prompt looks like: retrying would
-    /// only show them the prompt again.
+    /// Whether a failed attempt can clear by itself, so retrying is worthwhile. Maps the
+    /// framework error onto the pure, unit-tested `TunnelFailure` retry policy: a
+    /// non-`NEVPNError` is permanent (fail-closed), and the `NEVPNError.code` switch is
+    /// exhaustive via its `default`, so an unrecognised code is permanent too.
     private static func isTransient(_ error: any Error) -> Bool {
         guard let vpnError = error as? NEVPNError else { return false }
-        switch vpnError.code {
-        case .configurationDisabled, .configurationStale, .configurationUnknown, .connectionFailed: return true
-        default: return false
+        return Self.failure(for: vpnError).isTransient
+    }
+
+    /// Classifies an `NEVPNError` into the pure `TunnelFailure` policy. `configurationDisabled`
+    /// is the leash #58 symptom (the replacement left the saved configuration off),
+    /// `configurationStale`/`configurationUnknown` mean "reload and try again", and
+    /// `connectionFailed` is a provider not up yet; everything else is permanent, notably
+    /// `configurationReadWriteFailed`, which is what the operator refusing the "Add Proxy
+    /// Configurations" prompt looks like. The exact code-to-case mapping is verified live at
+    /// Task 18.
+    private static func failure(for error: NEVPNError) -> TunnelFailure {
+        switch error.code {
+        case .configurationDisabled: return .configurationDisabled
+        case .configurationStale: return .configurationStale
+        case .configurationUnknown: return .configurationUnknown
+        case .connectionFailed: return .connectionFailed
+        default: return .permanent
         }
     }
 
@@ -220,16 +231,17 @@ final class ExtensionController: NSObject {
     /// The connected-check: samples the tunnel status until it reads `.connected` or the
     /// policy's window runs out. Throws only `CancellationError`.
     private func waitUntilConnected(_ manager: NETransparentProxyManager, policy: TunnelReconcilePolicy) async throws -> Bool {
-        for _ in 0..<policy.pollCount {
+        // Sample pollCount + 1 times from one site: once up front, then after each of the
+        // pollCount sleeps, so a connection that completes during the final sleep is still
+        // caught. The last iteration does not sleep (nothing would sample after it).
+        for sample in 0...policy.pollCount {
             if manager.connection.status == .connected {
                 applyTunnelStatus(.connected)
                 return true
             }
-            try await Task.sleep(for: policy.pollInterval)
+            if sample < policy.pollCount { try await Task.sleep(for: policy.pollInterval) }
         }
-        guard manager.connection.status == .connected else { return false }
-        applyTunnelStatus(.connected)
-        return true
+        return false
     }
 
     private func observeTunnel(_ manager: NETransparentProxyManager) {
@@ -255,6 +267,13 @@ final class ExtensionController: NSObject {
     private func applyTunnelStatus(_ status: NEVPNStatus) {
         switch status {
         case .connected: apply(.tunnelConnected)
+        // `.invalid` (the saved configuration no longer exists) is treated as an advisory
+        // disconnect, not an authoritative degrade: during a version-bump replacement the OS
+        // can briefly report `.invalid` before the reconcile re-saves, and `.degraded` is
+        // authoritative and would stick even after capture recovers. Whether a real Mac emits
+        // a transient `.invalid` mid-replacement is verified at Task 18; if it does not, map
+        // `.invalid` to a degrade there so an externally-removed configuration reads correctly
+        // rather than still showing "Capture is on".
         case .disconnected, .invalid: apply(.tunnelDisconnected)
         case .connecting, .reasserting, .disconnecting: break
         @unknown default: break
@@ -309,12 +328,14 @@ final class ExtensionController: NSObject {
     /// Stops and removes this extension's saved configuration. The failure text, or `nil`
     /// when it is gone (including when there was none to remove).
     private func removeSavedConfiguration() async -> String? {
+        // We are tearing our configuration down regardless of the outcome; drop the cached
+        // manager up front so a mid-loop failure cannot leave a stale reference behind.
+        tunnelManager = nil
         do {
             for manager in try await NETransparentProxyManager.loadAllFromPreferences() where Self.isOurs(manager) {
                 manager.connection.stopVPNTunnel()
                 try await manager.removeFromPreferences()
             }
-            tunnelManager = nil
             return nil
         } catch {
             return error.localizedDescription
@@ -322,6 +343,11 @@ final class ExtensionController: NSObject {
     }
 
     /// Submits the deactivation request and waits for the shared delegate to report it.
+    /// No timeout: `OSSystemExtensionRequest` contractually delivers exactly one terminal
+    /// callback per request, and a deactivation can itself wait on a System Settings prompt,
+    /// so a bounded timeout could fail a legitimate human wait. If Task 18 shows deactivation
+    /// is never human-gated, race this against a timeout — guarded by `deactivation != nil` so
+    /// a late real callback cannot double-resume — to harden against a dropped callback.
     private func deactivate() async -> DeactivationOutcome {
         await withCheckedContinuation { continuation in
             deactivation = continuation
