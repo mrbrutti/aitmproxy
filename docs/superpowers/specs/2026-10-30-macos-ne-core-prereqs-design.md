@@ -186,7 +186,12 @@ match semantics `Authority::matches_scope_entry`, authority.rs:83):
 
 A host label is **emittable** only if it is a valid hostname by the provider's own
 rule (`FlowHandoff.swift:577-583` `isValidHostname`): non-empty, ≤253 chars, no
-leading `.`, no `..`, and every char in `[a-z0-9.\-_]`. This is the crux of the
+leading `.`, no `..`, and every char in `[a-z0-9.\-_]` — **plus a trailing-dot skip**
+(security re-review): the provider strips a trailing `.` (`normalizeHost`,
+FlowHandoff.swift:537-541) but the core's `matches_scope_entry` does not
+(authority.rs:83-93), so an entry like `example.com.` would match `example.com` flows
+at the provider yet nothing at the core (over-inclusive); emit no token for it. This
+is the crux of the
 two security findings below — the provider **splits the whole spec on `,`, `;`, and
 whitespace _before_ parsing** (`FlowHandoff.swift:514-517`), so a token that
 contains any of those (which `Authority` does **not** reject in a host —

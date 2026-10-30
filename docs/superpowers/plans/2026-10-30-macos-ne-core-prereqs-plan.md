@@ -173,6 +173,8 @@ Kept by the main session during stage 6. One row per finding.
 | 2 | quality | Minor (optional) | `bracket_ip` reimplements `SocketAddr`'s Display | FIX: replace with `std::net::SocketAddr::new(addr, port).to_string()` (stdlib guarantees correct bracketing). |
 | 1 | spec | Minor | Unrequested `#[derive(Debug)]` + `#[must_use]` on `RendezvousFile` not in the plan's Change list | ACCEPTED 2026-10-30 (orchestrator, per Matt's autonomous mandate): both are idiomatic and harmless on a one-field RAII guard; `Debug` is needed for `.unwrap_err()` in AC4; quality reviewer endorsed. No code change. |
 | 2 | spec | (adjudicated) | `skips_unrepresentable_l4_entries` uses `10.0.0.0` instead of the plan's self-colliding `10.0.0.` literal | ACCEPTED 2026-10-30: coder's discriminator is correct and better; AC11 coverage complete. |
+| 2 | security (re-review) | Minor | Trailing-dot FQDN (`example.com.`) still over-inclusive: the provider strips the trailing dot, the core does not → provider claims, core refuses → broken connection | FIXED 2026-10-30 (orchestrator): `is_emittable_host` now also skips a trailing-dot host on every L7 path; test `trailing_dot_host_is_skipped`; spec §Piece 2 L7 rule amended. Security + spec + quality otherwise PASS on 8989cf4. |
+| 2 | quality (re-review) | Minor | Redundant `use std::net::IpAddr;` in the test module (same class as the removed `CAPTURE_INTERFACE` import) | FIXED 2026-10-30 (orchestrator): deleted; `use super::*` supplies it. |
 
 ## Shipped
 

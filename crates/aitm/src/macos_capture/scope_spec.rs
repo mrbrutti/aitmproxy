@@ -112,16 +112,26 @@ fn is_ip_valued(s: &str) -> bool {
     s.parse::<IpAddr>().is_ok() || s.parse::<SocketAddr>().is_ok()
 }
 
-/// Mirror of the provider's `isValidHostname` (`FlowHandoff.swift:577-583`): a host
-/// label is emittable only if it is non-empty, ≤253 chars, has no leading `.` and no
-/// `..`, and every char is in `[a-z0-9.\-_]`. The provider splits the whole spec on
-/// `,`/`;`/whitespace *before* parsing (FlowHandoff.swift:514-517), so any token
-/// bearing one of those — which `Authority` does not reject (authority.rs:70) — must
-/// be skipped here or it fragments the provider's spec (security finding 1).
+/// The emitter's host gate: the provider's `isValidHostname`
+/// (`FlowHandoff.swift:577-583`) — non-empty, ≤253 chars, no leading `.`, no `..`,
+/// every char in `[a-z0-9.\-_]` — **plus** a deliberate trailing-dot skip. The
+/// provider splits the whole spec on `,`/`;`/whitespace *before* parsing
+/// (FlowHandoff.swift:514-517), so any token bearing one of those — which `Authority`
+/// does not reject (authority.rs:70) — must be skipped here or it fragments the
+/// provider's spec (security finding 1).
+///
+/// Trailing dot (security re-review Minor): the provider strips a trailing `.`
+/// (`normalizeHost`, FlowHandoff.swift:537-541) so `example.com.` would match
+/// `example.com` flows, but the core's `matches_scope_entry` does **not** strip it
+/// (authority.rs:83-93) so the same entry matches nothing. Emitting the token would
+/// make the provider claim a flow the core then refuses (over-inclusive, broken
+/// connection); stripping it here would not help (the core is the refuser), so an
+/// FQDN with a trailing dot is skipped — faithful to the core's no-op on it.
 fn is_emittable_host(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 253
         && !s.starts_with('.')
+        && !s.ends_with('.')
         && !s.contains("..")
         && s.chars().all(|c| {
             c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.' || c == '_'
@@ -170,8 +180,6 @@ fn l4_token(entry: &aitm_proto_l4::types::L4ScopeEntry) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::IpAddr;
-
     use aitm_proto_l4::types::{
         IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, L4ScopeSource, PortRange,
         RateCap,
@@ -391,6 +399,30 @@ mod tests {
         // `10.0.0.0`; the partial-range discriminator is the `192.0.2.` prefix.
         assert!(!spec.contains("10.0.0.0"), "non-host CIDR leaked: {spec}");
         assert!(!spec.contains("192.0.2."), "partial-range leaked: {spec}");
+    }
+
+    /// Security re-review Minor: a trailing-dot FQDN is skipped on every L7 path. The
+    /// provider strips a trailing `.` (would match `example.com` flows) but the core
+    /// does not (matches nothing), so emitting the token would make the provider claim
+    /// a flow the core then refuses — breaking the connection. Skipping it is faithful
+    /// to the core's own no-op on such an entry.
+    #[test]
+    fn trailing_dot_host_is_skipped() {
+        let entry = |host: &str| aitm_core::ScopeEntry {
+            host: host.to_string(),
+        };
+        for host in [
+            "example.com.",
+            "sub.example.com.",
+            "example.com.:443",
+            "*.example.com.",
+        ] {
+            assert_eq!(
+                provider_scope_spec(&[entry(host)], &[]).spec,
+                "",
+                "trailing-dot L7 entry {host:?} must emit no token"
+            );
+        }
     }
 
     // ----------------------------------------------------------------------------
