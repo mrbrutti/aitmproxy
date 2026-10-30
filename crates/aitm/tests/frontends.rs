@@ -363,7 +363,12 @@ fn mutate_rejects_crlf_in_header_value() {
 
 #[test]
 fn poc_run_vars_map_is_coerced_not_rejected() {
-    let proxy = build_proxy(&config("vars")).expect("build proxy");
+    // This test drives poc.run over the agent (MCP) frontend to check vars
+    // coercion, so it must opt past the T3 agent-run gate (poc.allow_agent_run);
+    // otherwise the run is refused before it reaches the vars/file path.
+    let mut cfg = config("vars");
+    cfg.poc.allow_agent_run = true;
+    let proxy = build_proxy(&cfg).expect("build proxy");
     let store = proxy.store();
     let client: Arc<dyn ProxyClient> = Arc::new(UnusedClient);
     let server = McpServer::new(proxy.registry_arc(), McpTransport::Stdio).with_services(
