@@ -514,7 +514,7 @@ fn do_inject(
             filter: None,
             queue: None,
         },
-        packets: Vec::new(),
+        packets: Vec::new().into(),
         metadata: L4Meta::default(),
     });
     // `count` already defaults to 1 for an *absent* arg (the Rhai/PoC callers use
