@@ -104,14 +104,18 @@ pub fn discover_binary(
         }
         tried.push(candidate.display().to_string());
     }
+    let tried = if tried.is_empty() {
+        "nothing".to_string()
+    } else {
+        tried.join(", ")
+    };
     anyhow::bail!(
-        "no obscura binary found (tried: {}); install the bundled binary next to aitm, \
-         set AITM_OBSCURA_BIN, or set browser.obscura.binary",
-        if tried.is_empty() {
-            "nothing".to_string()
-        } else {
-            tried.join(", ")
-        }
+        "obscura (the embedded browser engine) was not found.\n\
+         Looked in: {tried}.\n\
+         To get it:\n\
+         \x20 - dev checkout: run `scripts/fetch-obscura-dev.sh` to drop obscura next to the aitm binary\n\
+         \x20 - installed:    install an aitmproxy package (.deb/.rpm) or the release tarball, which bundle obscura beside aitm\n\
+         \x20 - custom path:  set AITM_OBSCURA_BIN=/path/to/obscura, or browser.obscura.binary in your config"
     )
 }
 
@@ -121,8 +125,9 @@ pub async fn probe(binary: &Path) -> anyhow::Result<ProbeInfo> {
     let help = run_probe_flag(binary, "--help").await?;
     if !help.contains("--ca-cert") {
         anyhow::bail!(
-            "{} is not the aitmproxy obscura fork: its --help does not list --ca-cert; \
-             install the bundled binary or set browser.obscura.binary",
+            "{} is not the aitmproxy obscura fork: its --help does not list --ca-cert. \
+             Get the fork with `scripts/fetch-obscura-dev.sh` (dev checkout) or install an \
+             aitmproxy package; or point AITM_OBSCURA_BIN / browser.obscura.binary at the fork.",
             binary.display()
         );
     }

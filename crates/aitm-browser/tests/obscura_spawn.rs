@@ -313,8 +313,21 @@ fn discovery_order() {
         discover_binary(&unconfigured, None, None, &lookup).expect("PATH binary"),
         path_bin
     );
-    // Nothing anywhere → an error.
-    assert!(discover_binary(&unconfigured, None, None, &none_lookup).is_err());
+    // Nothing anywhere → an actionable error that names the fixes (AC3): the
+    // dev-fetch script, the AITM_OBSCURA_BIN override, and the config key.
+    let not_found = discover_binary(&unconfigured, None, None, &none_lookup)
+        .expect_err("no binary anywhere must be an error");
+    let not_found = format!("{not_found:#}");
+    for needle in [
+        "scripts/fetch-obscura-dev.sh",
+        "AITM_OBSCURA_BIN",
+        "browser.obscura.binary",
+    ] {
+        assert!(
+            not_found.contains(needle),
+            "not-found error is not actionable (missing {needle:?}): {not_found}"
+        );
+    }
 
     // A configured path that does not exist is reported, not skipped.
     let missing = cfg_dir.path().join("does-not-exist");
