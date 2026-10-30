@@ -250,7 +250,7 @@ impl HttpModule {
             if next.first() == Some(&TLS_HANDSHAKE) {
                 self.mitm(client, ctx, peer, Some(target)).await
             } else {
-                let conn = Conn::plain(peer, Some(target.authority()));
+                let conn = Conn::plain(peer, Some((target.authority(), target.addr)));
                 serve(
                     &ctx,
                     Box::pin(client),
@@ -356,6 +356,7 @@ impl HttpModule {
         let conn = Conn {
             scheme: "https".to_string(),
             tunnel_authority: Some(target.authority()),
+            tunnel_addr: Some(target.addr),
             client_conn: ConnInfo {
                 peer,
                 sni,
@@ -454,17 +455,32 @@ fn looks_like_http(first: &[u8]) -> bool {
 /// Per-connection facts every flow on it shares.
 pub(crate) struct Conn {
     pub(crate) scheme: String,
-    /// The CONNECT authority, when the connection is a tunnel.
+    /// The CONNECT authority, when the connection is a tunnel. A tunnel's route
+    /// is its CONNECT target: the `Host` of a request inside it is forwarded
+    /// untouched and never chooses where the tunnel connects.
     pub(crate) tunnel_authority: Option<String>,
+    /// Where `tunnel_authority` resolved to when the tunnel was opened. Set
+    /// together with it, and dialed as is, never re-resolved, so a changed DNS
+    /// answer (or an authority string that cannot be parsed back, such as an
+    /// IPv6 literal) cannot redirect the tunnel.
+    pub(crate) tunnel_addr: Option<SocketAddr>,
     pub(crate) client_conn: ConnInfo,
     pub(crate) server_conn: Option<ConnInfo>,
 }
 
 impl Conn {
-    fn plain(peer: SocketAddr, tunnel_authority: Option<String>) -> Self {
+    /// A cleartext connection. `tunnel` is the `CONNECT` authority and the
+    /// address it resolved to, for a connection inside a tunnel, and `None` for
+    /// a forward-proxy connection.
+    fn plain(peer: SocketAddr, tunnel: Option<(String, SocketAddr)>) -> Self {
+        let (tunnel_authority, tunnel_addr) = match tunnel {
+            Some((authority, addr)) => (Some(authority), Some(addr)),
+            None => (None, None),
+        };
         Self {
             scheme: "http".to_string(),
             tunnel_authority,
+            tunnel_addr,
             client_conn: ConnInfo {
                 peer,
                 sni: None,
@@ -479,15 +495,22 @@ impl Conn {
 
 /// Serve HTTP exchanges between `client` and `upstream` until either side
 /// closes, or until a 101 hands both streams to the upgraded protocol's
-/// module. With no `upstream` (cleartext forward proxy), one is opened for the
-/// first request's authority and reopened when the authority changes.
+/// module. With no `upstream`, one is opened.
+///
+/// A tunnel's route is its `CONNECT` target. On a connection inside a tunnel
+/// (`conn.tunnel_authority` and `conn.tunnel_addr` set) every dial, the first
+/// and every replacement, goes to the address the tunnel resolved to when it was
+/// opened, through the connector, whatever `Host` the requests carry. Without a
+/// tunnel (cleartext forward proxy) the upstream is the request's own authority,
+/// opened for the first request and reopened when the authority changes.
 ///
 /// An upstream the origin closed while the client idled is replaced before the
 /// next request is forwarded on it, and so is one whose origin sent bytes after
 /// a completed response (those bytes are discarded, never forwarded or parsed).
 /// `reconnect` is how a TLS tunnel (which hands in an already-handshaken
 /// `upstream`) redoes its TLS connection; the cleartext paths pass `None` and
-/// redial through the ordinary connect step.
+/// redial through the ordinary connect step, which for a cleartext tunnel dials
+/// the `CONNECT` target again.
 async fn serve(
     ctx: &ModuleCtx,
     mut client: ByteStream,
@@ -665,7 +688,6 @@ async fn serve(
         // below) is replaced here too, never by clearing `upstream` where the
         // taint is found: in a TLS tunnel that would skip the `reconnect` arm and
         // the ordinary connect step below would dial the origin in cleartext.
-        let mut redial: Option<String> = None;
         if upstream_tainted || upstream.as_mut().is_some_and(upstream_is_stale) {
             tracing::debug!(
                 authority = current_authority.as_deref().unwrap_or_default(),
@@ -693,10 +715,9 @@ async fn serve(
                 None if conn.scheme == "https" => {
                     bail!("upstream TLS connection closed and cannot be re-established")
                 }
-                // A cleartext tunnel was opened to one origin: redial the origin
-                // the replaced connection served, even if a later request in the
-                // tunnel names a different Host.
-                None if conn.tunnel_authority.is_some() => redial = current_authority.clone(),
+                // Cleartext: the ordinary connect step below dials the new
+                // connection (a tunnel's `CONNECT` target, else the request's
+                // authority).
                 None => {}
             }
             upstream_tainted = false;
@@ -710,15 +731,35 @@ async fn serve(
             // A new connection starts with an empty response buffer, whatever
             // made the old one go (an authority change, or the discard above).
             let _ = machine.take_leftover(Side::Server);
-            let dial = redial.unwrap_or_else(|| request.authority.clone());
-            let target = Target::resolve(&dial, 80).await?;
-            upstream = Some(
-                ctx.connect_upstream(&target.authority(), target.addr)
-                    .await?,
-            );
+            // `dial` is the authority remembered for the authority-change check,
+            // `connector_authority` the one handed to the connector's scope and
+            // SSRF check, `addr` where the connection goes.
+            let (dial, connector_authority, addr) = match (&conn.tunnel_authority, conn.tunnel_addr)
+            {
+                // A tunnel dials its `CONNECT` target at the address recorded
+                // when it was opened: never the request's `Host` (which may
+                // be anything the client or a plugin set), and never
+                // re-resolved. This is what a TLS tunnel does too.
+                (Some(tunnel), Some(addr)) => {
+                    if differs_from_tunnel_target(&request.authority, tunnel) {
+                        tracing::debug!(
+                            host = request.authority.as_str(),
+                            tunnel = tunnel.as_str(),
+                            "request authority differs from the CONNECT target; dialing the target"
+                        );
+                    }
+                    (tunnel.clone(), tunnel.clone(), addr)
+                }
+                // Forward proxy: the request's own authority is the route.
+                _ => {
+                    let target = Target::resolve(&request.authority, 80).await?;
+                    (request.authority.clone(), target.authority(), target.addr)
+                }
+            };
+            upstream = Some(ctx.connect_upstream(&connector_authority, addr).await?);
             current_authority = Some(dial);
             let server_conn = ConnInfo {
-                peer: target.addr,
+                peer: addr,
                 sni: None,
                 alpn: None,
                 tls: false,
@@ -1073,6 +1114,23 @@ fn split_host_port(authority: &str, default_port: u16) -> Result<(String, u16)> 
     }
 }
 
+/// Whether `request`, the authority a request names, is a different origin than
+/// `tunnel`, the `CONNECT` target of the tunnel it arrived in: compared
+/// case-insensitively, with port 80 assumed where one is absent. Only a debug
+/// log reads this; where a tunnel connects never depends on it.
+fn differs_from_tunnel_target(request: &str, tunnel: &str) -> bool {
+    let origin = |authority: &str| {
+        split_host_port(authority, 80)
+            .ok()
+            .map(|(host, port)| (host.to_ascii_lowercase(), port))
+    };
+    match (origin(request), origin(tunnel)) {
+        (Some(request), Some(tunnel)) => request != tunnel,
+        // Not splittable (a malformed `Host`): compare the strings.
+        _ => !request.eq_ignore_ascii_case(tunnel),
+    }
+}
+
 /// The placeholder peer when the acceptor attached no hint.
 fn unknown_peer() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
@@ -1272,7 +1330,7 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use aitm_core::{MemFlowStore, Verdict};
+    use aitm_core::{FlowStore, MemFlowStore, Verdict};
     use aitm_plugin::{EventSink, UpstreamConnector};
     use tokio::io::{duplex, DuplexStream};
     use tokio_rustls::server::TlsStream as ServerTls;
@@ -1479,6 +1537,45 @@ mod tests {
             Arc::new(connector),
         );
         (ctx, dialed, sink)
+    }
+
+    /// Rewrites a flow's authority and `Host` header to `to` when its request is
+    /// dispatched, as Map Remote does. Shares `store` with the context it is
+    /// built into, so the rewrite lands in what `serve` reads back.
+    struct RewriteSink {
+        store: Arc<MemFlowStore>,
+        to: &'static str,
+    }
+
+    impl EventSink for RewriteSink {
+        fn emit(&self, ev: Event) -> BoxFuture<'_, Verdict> {
+            if let Event::Request(id) = ev {
+                self.store.update(id, &mut |f: &mut Flow| {
+                    if let Flow::Http(h) = f {
+                        h.request.authority = self.to.to_string();
+                        h.request.headers.set("Host", self.to);
+                    }
+                });
+            }
+            Box::pin(async { Verdict::Continue })
+        }
+    }
+
+    /// Like [`ctx_with`], with a [`RewriteSink`] that retargets every request to
+    /// `to`.
+    fn ctx_rewriting(streams: Vec<ByteStream>, to: &'static str) -> (ModuleCtx, DialLog) {
+        let dialed = Arc::new(Mutex::new(Vec::new()));
+        let connector = StubConnector {
+            dialed: dialed.clone(),
+            streams: Mutex::new(streams),
+        };
+        let store = Arc::new(MemFlowStore::new());
+        let sink = Arc::new(RewriteSink {
+            store: store.clone(),
+            to,
+        });
+        let ctx = ModuleCtx::new(store, sink, Arc::new(connector));
+        (ctx, dialed)
     }
 
     fn origin_addr() -> SocketAddr {
@@ -1839,6 +1936,20 @@ mod tests {
     ) -> String {
         let request = format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n\r\n");
         io.write_all(request.as_bytes()).await.expect("send");
+        read_response_keep(io, pending).await
+    }
+
+    /// Send `request` exactly as given (so a test can leave out a header
+    /// [`client_get`] always sends) and return the `Content-Length`-framed body
+    /// of the answer.
+    async fn client_raw(io: &mut DuplexStream, request: &str) -> String {
+        io.write_all(request.as_bytes()).await.expect("send");
+        read_response_keep(io, &mut Vec::new()).await
+    }
+
+    /// Read one 200 response, consuming `pending` before the stream, and return
+    /// its `Content-Length`-framed body. Bytes read past it stay in `pending`.
+    async fn read_response_keep(io: &mut DuplexStream, pending: &mut Vec<u8>) -> String {
         let mut chunk = [0u8; 512];
         loop {
             if let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -1874,6 +1985,7 @@ mod tests {
         Conn {
             scheme: "https".to_string(),
             tunnel_authority: Some("origin.test:8443".to_string()),
+            tunnel_addr: Some(origin_addr()),
             client_conn: ConnInfo {
                 peer: unknown_peer(),
                 sni: None,
@@ -1973,7 +2085,13 @@ mod tests {
         let origin1 = tokio::spawn(origin_serve(origin1_end, vec!["first"], true));
         let _origin2 = tokio::spawn(origin_serve(origin2_end, vec!["second"], false));
         let (mut client, proxy_side) = duplex(64 * 1024);
-        let conn = Conn::plain(unknown_peer(), Some("127.0.0.1:8080".to_string()));
+        let conn = Conn::plain(
+            unknown_peer(),
+            Some((
+                "127.0.0.1:8080".to_string(),
+                "127.0.0.1:8080".parse().expect("addr"),
+            )),
+        );
 
         let serving = serve(&ctx, Box::pin(proxy_side), None, None, conn, MAX_BODY);
         let script = async {
@@ -2678,6 +2796,225 @@ mod tests {
         assert!(
             dialed.lock().expect("dialed lock").is_empty(),
             "nothing may be dialed, in particular not in cleartext"
+        );
+    }
+
+    // ---- a cleartext tunnel dials its CONNECT target ----------------------
+
+    /// A cleartext `CONNECT` tunnel opened to `authority`, which resolved to
+    /// `addr`, as `drive` sets it up.
+    fn cleartext_tunnel_conn(authority: &str, addr: &str) -> Conn {
+        Conn::plain(
+            unknown_peer(),
+            Some((authority.to_string(), addr.parse().expect("addr"))),
+        )
+    }
+
+    /// A GET for `path` carrying `Host: host`.
+    fn get_request(path: &str, host: &str) -> String {
+        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n")
+    }
+
+    /// Run `serve` on `conn` over a fresh in-memory client connection, send each
+    /// of `requests` in turn, and return the answers' bodies. The client then
+    /// hangs up; `serve` must end cleanly and in time.
+    async fn serve_requests(ctx: &ModuleCtx, conn: Conn, requests: &[String]) -> Vec<String> {
+        let (mut client, proxy_side) = duplex(64 * 1024);
+        let serving = serve(ctx, Box::pin(proxy_side), None, None, conn, MAX_BODY);
+        let script = async {
+            let mut bodies = Vec::new();
+            for request in requests {
+                bodies.push(client_raw(&mut client, request).await);
+            }
+            // Hang up, so `serve` sees the client finish and returns.
+            drop(client);
+            bodies
+        };
+        let (served, bodies) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(serving, script)
+        })
+        .await
+        .expect("serve hung");
+        served.expect("serve ends cleanly when the client hangs up");
+        bodies
+    }
+
+    /// The stored HTTP flow whose request path is `path`.
+    fn stored_http(ctx: &ModuleCtx, path: &str) -> HttpFlow {
+        ctx.store()
+            .list()
+            .into_iter()
+            .find_map(|id| match ctx.store().get(id) {
+                Some(Flow::Http(f)) if f.request.path == path => Some(f),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no stored flow for {path}"))
+    }
+
+    #[tokio::test]
+    async fn serve_dials_the_connect_target_not_the_host_header_in_a_cleartext_tunnel() {
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, dialed) = ctx_with(vec![Box::pin(up)]);
+        let _origin = tokio::spawn(origin_serve(origin_end, vec!["first"], false));
+
+        let bodies = serve_requests(
+            &ctx,
+            cleartext_tunnel_conn("127.0.0.1:8080", "127.0.0.1:8080"),
+            &[get_request("/one", "127.0.0.1:9090")],
+        )
+        .await;
+
+        assert_eq!(bodies, vec!["first"]);
+        assert_eq!(
+            *dialed.lock().expect("dialed lock"),
+            vec![dial("127.0.0.1:8080", "127.0.0.1:8080")],
+            "the tunnel goes to its CONNECT target, whatever the request's Host says"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_keeps_one_tunnel_connection_for_requests_naming_different_hosts() {
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, dialed) = ctx_with(vec![Box::pin(up)]);
+        let _origin = tokio::spawn(origin_serve(origin_end, vec!["first", "second"], false));
+
+        let bodies = serve_requests(
+            &ctx,
+            cleartext_tunnel_conn("127.0.0.1:8080", "127.0.0.1:8080"),
+            &[
+                get_request("/one", "127.0.0.1:9090"),
+                get_request("/two", "127.0.0.1:7070"),
+            ],
+        )
+        .await;
+
+        assert_eq!(bodies, vec!["first", "second"]);
+        assert_eq!(
+            *dialed.lock().expect("dialed lock"),
+            vec![dial("127.0.0.1:8080", "127.0.0.1:8080")],
+            "one tunnel, one upstream connection, dialed at the CONNECT target"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_records_the_host_authority_and_the_tunnel_peer_on_the_flow() {
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+        let _origin = tokio::spawn(origin_serve(origin_end, vec!["first"], false));
+
+        serve_requests(
+            &ctx,
+            cleartext_tunnel_conn("127.0.0.1:8080", "127.0.0.1:8080"),
+            &[get_request("/one", "127.0.0.1:9090")],
+        )
+        .await;
+
+        let flow = stored_http(&ctx, "/one");
+        assert_eq!(
+            flow.request.authority, "127.0.0.1:9090",
+            "the request keeps the authority the client sent"
+        );
+        assert_eq!(
+            flow.server_conn.map(|c| c.peer),
+            Some("127.0.0.1:8080".parse().expect("addr")),
+            "the flow records where the traffic actually went"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plugin_authority_rewrite_does_not_retarget_a_cleartext_tunnel() {
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, dialed) = ctx_rewriting(vec![Box::pin(up)], "127.0.0.1:9090");
+        let _origin = tokio::spawn(origin_serve(origin_end, vec!["first"], false));
+
+        let bodies = serve_requests(
+            &ctx,
+            cleartext_tunnel_conn("127.0.0.1:8080", "127.0.0.1:8080"),
+            &[get_request("/one", "127.0.0.1:8080")],
+        )
+        .await;
+
+        assert_eq!(bodies, vec!["first"]);
+        assert_eq!(
+            *dialed.lock().expect("dialed lock"),
+            vec![dial("127.0.0.1:8080", "127.0.0.1:8080")],
+            "a rewritten authority must not choose the upstream of a tunnel"
+        );
+        assert_eq!(
+            stored_http(&ctx, "/one").request.authority,
+            "127.0.0.1:9090",
+            "the stored flow keeps the rewritten authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_records_the_tunnel_authority_for_a_request_without_a_host() {
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, dialed) = ctx_with(vec![Box::pin(up)]);
+        let _origin = tokio::spawn(origin_serve(origin_end, vec!["first"], false));
+
+        let bodies = serve_requests(
+            &ctx,
+            cleartext_tunnel_conn("127.0.0.1:8080", "127.0.0.1:8080"),
+            &["GET /x HTTP/1.1\r\n\r\n".to_string()],
+        )
+        .await;
+
+        assert_eq!(bodies, vec!["first"]);
+        assert_eq!(
+            stored_http(&ctx, "/x").request.authority,
+            "127.0.0.1:8080",
+            "a request with no Host is recorded under the tunnel's authority"
+        );
+        assert_eq!(
+            *dialed.lock().expect("dialed lock"),
+            vec![dial("127.0.0.1:8080", "127.0.0.1:8080")]
+        );
+    }
+
+    #[test]
+    fn a_request_authority_differs_from_the_tunnel_target_only_by_origin() {
+        let differs = differs_from_tunnel_target;
+        // The same origin, spelled the way clients spell it.
+        assert!(!differs("127.0.0.1:8080", "127.0.0.1:8080"));
+        assert!(!differs("EXAMPLE.test:80", "example.test:80"));
+        assert!(!differs("example.test", "example.test:80"));
+        // A different port or host is a different origin.
+        assert!(differs("example.test:8080", "example.test:80"));
+        assert!(differs("example.test", "example.test:8080"));
+        assert!(differs("other.test:80", "example.test:80"));
+        // An authority that cannot be split falls back to a case-insensitive match.
+        assert!(!differs("[::1", "[::1"));
+        assert!(differs("[::1", "example.test:80"));
+    }
+
+    #[tokio::test]
+    async fn serve_dials_an_ipv6_literal_tunnel_at_the_recorded_address() {
+        // `Target::authority()` writes the bracketed `[::1]:8080` as `::1:8080`,
+        // which `split_host_port` cannot read back, so the dial must use the
+        // address recorded when the tunnel was opened. The authority string is
+        // deliberately not asserted: its form is a separate, known quirk.
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, dialed) = ctx_with(vec![Box::pin(up)]);
+        let _origin = tokio::spawn(origin_serve(origin_end, vec!["first"], false));
+
+        let bodies = serve_requests(
+            &ctx,
+            cleartext_tunnel_conn("::1:8080", "[::1]:8080"),
+            &[get_request("/one", "[::1]:8080")],
+        )
+        .await;
+
+        assert_eq!(bodies, vec!["first"]);
+        let dialed_addrs: Vec<SocketAddr> = dialed
+            .lock()
+            .expect("dialed lock")
+            .iter()
+            .map(|(_, addr)| *addr)
+            .collect();
+        assert_eq!(
+            dialed_addrs,
+            vec!["[::1]:8080".parse::<SocketAddr>().expect("addr")]
         );
     }
 }
