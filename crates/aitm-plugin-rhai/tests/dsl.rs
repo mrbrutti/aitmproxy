@@ -1,19 +1,27 @@
-//! The `dsl` prelude helper namespace: each of the ten flat global functions
-//! runs and returns its specified value (AC1–AC4), and the engine's registered
-//! set equals the catalogue's `dsl[]` in both directions (AC5, the `dsl` slice
-//! of the plugin-system drift guard).
+//! The `dsl` prelude helper namespace: `DslCapability`'s identity (AC1) and each
+//! of the ten flat global functions running and returning its specified value
+//! (AC2–AC4). Engine ≡ catalogue (AC5) is the pre-existing
+//! `tests/api_catalog.rs` bijection, not a bespoke test here.
 //!
 //! These register `register_dsl` onto a bare hardened `build_engine` — the pure
 //! helpers need no store / client / guard — which is also why the bare-engine
 //! audit (`tests/engine.rs`) does not see them.
 
-use std::collections::BTreeSet;
 use std::time::Duration;
 
 use aitm_plugin_rhai::config::RhaiLimits;
-use aitm_plugin_rhai::dsl::{register_dsl, DSL_FUNCTIONS};
+use aitm_plugin_rhai::dsl::{register_dsl, DslCapability};
 use aitm_plugin_rhai::engine::build_engine;
+use aitm_plugin_rhai::host_core::ScriptCapability;
 use rhai::Engine;
+
+/// AC1: the capability advertises the `dsl` namespace at API 1.
+#[test]
+fn dsl_capability_identity() {
+    let cap = DslCapability;
+    assert_eq!(cap.namespace(), "dsl");
+    assert_eq!(cap.min_api(), "1");
+}
 
 /// A hardened engine with the `dsl` helpers registered, as a loaded script or a
 /// PoC `script:` step would see them.
@@ -171,37 +179,4 @@ fn all_ten_dsl_helpers_are_callable() {
         "ok"
     "#;
     assert_eq!(engine.eval::<String>(script).unwrap(), "ok");
-}
-
-/// AC5: the drift guard — the engine's intended `dsl` set (`DSL_FUNCTIONS`)
-/// equals the catalogue's `dsl[]` names in both directions. `rhai.api.json` is
-/// valid YAML, so the existing `serde_yaml` dev-dependency parses it with no new
-/// dev-dep.
-#[test]
-fn dsl_catalogue_matches_engine() {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/design/languages/rhai.api.json"
-    );
-    let text = std::fs::read_to_string(path).expect("read rhai.api.json");
-    let doc: serde_yaml::Value = serde_yaml::from_str(&text).expect("parse rhai.api.json");
-
-    let catalogue: BTreeSet<String> = doc["dsl"]
-        .as_sequence()
-        .expect("dsl[] is a sequence")
-        .iter()
-        .map(|entry| {
-            entry["name"]
-                .as_str()
-                .expect("each dsl entry has a string name")
-                .to_string()
-        })
-        .collect();
-
-    let engine: BTreeSet<String> = DSL_FUNCTIONS.iter().map(ToString::to_string).collect();
-
-    assert_eq!(
-        catalogue, engine,
-        "catalogue dsl[] names must equal DSL_FUNCTIONS (both directions)"
-    );
 }

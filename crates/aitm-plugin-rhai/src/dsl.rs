@@ -21,22 +21,6 @@ use sha2::Digest as _;
 
 use crate::host_core::{ScriptCapability, ScriptServices};
 
-/// The ten `dsl` helper names — the single source the drift guard compares
-/// against the catalogue's `dsl[]`. Every name here must be registered by
-/// [`register_dsl`] and present in `rhai.api.json`, in both directions.
-pub const DSL_FUNCTIONS: &[&str] = &[
-    "b64_encode",
-    "b64_decode",
-    "url_encode",
-    "hex_encode",
-    "sha256",
-    "md5",
-    "rand_text_alpha",
-    "rand_int",
-    "regex_match",
-    "regex_extract",
-];
-
 /// The `dsl` namespace capability: a pure helper set, always offered (like
 /// `log`), needing no [`ScriptServices`]. Deny-by-default does not apply because
 /// these helpers add no ambient authority.
@@ -58,9 +42,9 @@ impl ScriptCapability for DslCapability {
 }
 
 /// Register the ten `dsl` helpers onto `engine` as flat global functions. Split
-/// from [`DslCapability`] so the registration and drift-guard tests can exercise
-/// the pure helpers on a bare [`crate::engine::build_engine`] without assembling
-/// a store / client / guard.
+/// from [`DslCapability`] so the behaviour tests can exercise the pure helpers on
+/// a bare [`crate::engine::build_engine`] without assembling a store / client /
+/// guard.
 pub fn register_dsl(engine: &mut Engine) {
     // --- Encoding family ----------------------------------------------------
     engine.register_fn("b64_encode", |s: &str| -> String {

@@ -36,7 +36,7 @@ pub use catalog_assembly::{
 pub use command::{register_reg_api, ScriptCommand, ScriptRegHandle};
 pub use commands::ScriptCommands;
 pub use config::{RhaiConfig, RhaiLimits, ScriptEntry, ScriptMeta};
-pub use dsl::{register_dsl, DslCapability, DSL_FUNCTIONS};
+pub use dsl::{register_dsl, DslCapability};
 pub use engine::{build_engine_with_languages, Budget, RunKind, WORKER_STACK_SIZE};
 pub use error::ScriptError;
 pub use host_core::{
