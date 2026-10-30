@@ -414,27 +414,115 @@ struct ScanPointDetail: View {
                         Hint(text: "Shown as the scanner returned it; secrets are redacted at the source.")
 
                         section("Flow")
-                        Text(point.flow)
-                            .font(Tok.Face.data(Tok.Typography.Size.md))
-                            .foregroundStyle(Tok.Ink.secondary.color)
-                            .textSelection(.enabled)
+                        flowReference(point)
                         if !state.canOpen(point) {
                             Hint(text: "This flow is no longer in the flow list (cleared, or not captured here).")
                         }
+
+                        section("Injection points by type")
+                        typeBreakdown
                     }
                     .padding(Space.md)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        } else if state.model.hasResult {
+            scanSummary
         } else {
             VStack(spacing: Space.sm) {
-                Text("No injection point selected").font(Tok.Face.ui(Tok.Typography.Size.xl, .medium))
+                Text("No scan yet").font(Tok.Face.ui(Tok.Typography.Size.xl, .medium))
                     .foregroundStyle(Tok.Ink.primary.color)
-                Text("Pick one on the left to see its example and open its flow.")
+                Text("Scan an in-scope target above to crawl its endpoints and injection points.")
                     .font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.tertiary.color)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    /// With a result but nothing selected, the detail pane shows the crawl's coverage
+    /// instead of sitting empty: counts and the injection points broken down by type.
+    private var scanSummary: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: Space.lg) {
+                section("Coverage")
+                HStack(alignment: .top, spacing: Space.section) {
+                    stat("Endpoints", "\(state.endpoints.count)")
+                    stat("Injection points", "\(state.points.count)")
+                }
+                if !state.points.isEmpty {
+                    section("Injection points by type")
+                    typeBreakdown
+                }
+                if let reason = state.model.stoppedReason {
+                    Hint(text: "Crawl stopped: \(reason)")
+                }
+                Hint(text: "Pick an injection point on the left to see its example and open its flow.")
+            }
+            .padding(Space.md)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    /// Injection points grouped by `location` (query / body_param / cookie / …), each a
+    /// colored proportion bar — the audit's injection-type distribution.
+    private var typeBreakdown: some View {
+        let groups: [(location: String, count: Int)] = Dictionary(grouping: state.points, by: \.location)
+            .map { (location: $0.key, count: $0.value.count) }
+            .sorted { $0.count == $1.count ? $0.location < $1.location : $0.count > $1.count }
+        let total = max(1, state.points.count)
+        return VStack(alignment: .leading, spacing: Space.sm) {
+            ForEach(Array(groups.enumerated()), id: \.offset) { item in
+                let group = item.element
+                HStack(spacing: Space.md) {
+                    Text(group.location)
+                        .font(Tok.Face.data(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.secondary.color)
+                        .frame(width: 120, alignment: .leading).lineLimit(1).truncationMode(.tail)
+                    GeometryReader { geo in
+                        RoundedRectangle(cornerRadius: Tok.Radius.badge)
+                            .fill(Self.typeColor(item.offset))
+                            .frame(width: max(2, geo.size.width * Double(group.count) / Double(total)))
+                    }
+                    .frame(height: 8)
+                    Text("\(group.count)")
+                        .font(Tok.Face.data(Tok.Typography.Size.sm, .medium)).foregroundStyle(Tok.Ink.primary.color)
+                        .frame(width: 32, alignment: .trailing)
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(group.location), \(group.count)")
+            }
+        }
+    }
+
+    private static let typeColors: [Color] = [
+        Tok.Mark.blue.color, Tok.Mark.green.color, Tok.Mark.orange.color,
+        Tok.Mark.purple.color, Tok.Mark.teal.color, Tok.Mark.pink.color,
+    ]
+
+    private static func typeColor(_ index: Int) -> Color { typeColors[index % typeColors.count] }
+
+    private func stat(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: Space.xs) {
+            Text(label.uppercased()).font(Tok.Face.ui(Tok.Typography.Size.xs, .medium)).tracking(0.6)
+                .foregroundStyle(Tok.Ink.tertiary.color)
+            Text(value).font(Tok.Face.data(Tok.Typography.Size.xl, .medium)).foregroundStyle(Tok.Ink.primary.color)
+                .lineLimit(1).minimumScaleFactor(0.7)
+        }
+    }
+
+    /// The injection point's flow as a method badge + URL (when still listed), not a raw UUID.
+    @ViewBuilder private func flowReference(_ point: InjectionPoint) -> some View {
+        if let row = state.session.rows.first(where: { $0.id == point.flowID }) {
+            HStack(spacing: Space.sm) {
+                Badge(text: row.method.label, pair: row.method.badge)
+                Text("\(row.authority)\(row.path)")
+                    .font(Tok.Face.data(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.primary.color)
+                    .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+            }
+        } else {
+            Text(point.flow)
+                .font(Tok.Face.data(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
+                .textSelection(.enabled)
         }
     }
 
