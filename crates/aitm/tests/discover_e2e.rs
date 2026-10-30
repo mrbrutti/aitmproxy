@@ -5,15 +5,17 @@
 //! obscura engine routed via the proxy:
 //!
 //! - `scan_discover_end_to_end`: the discovered endpoints cover the seeded
-//!   paths and the `q` query parameter shows up as an injection point;
+//!   paths, the `q` query parameter and the redirector's `next` parameter show
+//!   up as injection points, and a re-scan returns the same points instead of
+//!   accumulating them;
 //! - `scan_discover_three_times_reuses_the_browser`: sequential scans in one
 //!   session all crawl (the browser needs no reset between them);
 //! - `scan_discover_over_the_web_bridge_returns`: the result reaches a `/bus`
 //!   WebSocket client, as the web Scan panel drives it.
 //!
 //! Gated on a real browser the M4 way, through the shared rig's
-//! [`obscura_enabled`](rig::obscura_enabled): with `AITM_OBSCURA` unset the test
-//! returns early, so the default `cargo test` stays hermetic and fast. Run it
+//! [`obscura_enabled`](rig::obscura_enabled): with `AITM_OBSCURA` unset each test
+//! returns early, so the default `cargo test` stays hermetic and fast. Run them
 //! for real with:
 //!
 //! ```text

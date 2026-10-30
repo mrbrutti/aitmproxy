@@ -54,19 +54,6 @@ or auth material) are returned as `<redacted>`, never echoed in the result.
 registered once and reachable from MCP, the one-shot CLI and the UIs, with the
 same scope and sensitivity rules. It is **operator-run and agent-taskable**.
 
-**One discovery at a time.** All crawls share the one embedded-browser page, so
-two at once would interleave their navigations and each would harvest the
-other's pages. A `scan.discover` started while another is still running is
-therefore **refused immediately** with `scan.discover is already running; wait
-for it to finish before starting another …` — it never touches the browser.
-The running scan gives the slot back however it ends, and the next one then runs
-normally; scans run back to back need no reset in between.
-
-A scan is **not cancelled when its client goes away**. If you Ctrl-C the CLI or
-close the panel, the crawl keeps running and keeps the slot until it finishes or
-hits its time budget (default **10 minutes**), so you can be refused by your own
-earlier scan. Wait for it to end rather than retrying.
-
 A real crawl needs a **running proxy with its embedded browser**: the bare `aitm`
 server (the MCP server), `aitm web` and `aitm tui` each launch the configured
 engine (obscura by default; see [INSTALL.md](../INSTALL.md) if it is not found)
@@ -109,6 +96,21 @@ operator can jump straight from a discovered point to the captured request
 behind it. In the web UI the Scan item appears in the sidebar only when the
 connected core offers the `scan.discover` tool; in the TUI, `r` launches a scan
 from the Scan view.
+
+### One discovery at a time
+
+All crawls share the one embedded-browser page, so two at once would interleave
+their navigations and each would harvest the other's pages. A `scan.discover`
+started while another is still running is therefore **refused immediately** with
+`scan.discover is already running; wait for it to finish before starting
+another …` — it never touches the browser. The running scan gives the slot back
+however it ends, and the next one then runs normally; scans run back to back
+need no reset in between.
+
+A scan is **not cancelled when its client goes away**. If you disconnect the MCP
+client or close the panel, the crawl keeps running and keeps the slot until it
+finishes or hits its time budget (default **10 minutes**), so you can be refused
+by your own earlier scan. Wait for it to end rather than retrying.
 
 ## Inputs
 
