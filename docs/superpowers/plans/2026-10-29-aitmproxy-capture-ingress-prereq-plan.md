@@ -280,11 +280,24 @@ proposed; none is Matt-only (no Apple account, no product-direction call).
 
 ## Review log
 
-Kept by the main session during stage 6. One row per finding.
+Full Stage-6 panel on PR #47 (range `24bbb68..6854458`): **security PASS, quality
+PASS, spec PASS** — no Critical or Important on any dimension. 7 Minors, none
+blocking; dispositions below (orchestrator, 2026-10-29).
 
-| Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
+| Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
+| 1 | security | Minor | `LateGuard` (wire.rs) / `LateHandles` (scripts.rs) delegate every scope facet but not the new `in_scope`, so they inherit the default `false` — inert today (ingress uses the real `StdGuard`), a trap once a live capture path routes through a delegating guard | **Fold into Band B** — the macOS feeder wiring forwards `in_scope` on both delegating guards before any live-wired capture path uses them (becomes reachable in Phase 2) |
+| 2 | security | Minor | SNI-else-dst authority: a TLS flow carrying SNI is scoped by SNI only, so an IP-literal-only scope entry won't admit a SNI-bearing capture to that IP | **Accepted** — by-design hostname-scope semantics; fails safe (under-admission, never over-admission); documented in spec §D2 |
+| 2 | quality | Minor | `dispatch_tcp` swallows the module-spawn error where `handle_conn` logs it | **Fold into Band B** — match `handle_conn`'s logged path when the adapter/feeder is wired |
+| 2 | quality | Minor | hint/ctx construction duplicated from `handle_conn`; plus the by-design SNI divergence | **Partly accepted** (SNI divergence = finding above); **fold the hint/ctx dedup into Band B** if the adapter touches that block |
+| 2 | quality | Minor | passthrough dial-failure branch is untested | **Fold into Band B** — add the dial-failure test when the adapter exercises passthrough |
+| 2 | quality | Minor | needless `first_bytes` clone | **Fold into Band B** — trivial cleanup when touching the ingress |
+| 4 | spec | Minor | Task 4 also edited `tests/l4_wiring.rs`, outside its single declared file | **Accepted** — forced (wiring needs its own test) and documented; no scope creep |
 
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7.
+PR #47 merged to `main` (2026-10-29) after the all-PASS panel above. Delivered the
+protocol-general `CaptureIngress` stream/TCP-dispatch half (authoritative-dst →
+`ProtocolModule`, out-of-scope refusal, in-scope-unclaimed SSRF-guarded passthrough,
+UDP→`L4Guard` adapter, live wiring), 9 tests, full gate green. **Unblocks macOS-NE
+Band B.** Carry-over Minors folded into Band B per the Review log.

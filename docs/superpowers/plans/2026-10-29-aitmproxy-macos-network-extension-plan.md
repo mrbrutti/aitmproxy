@@ -45,8 +45,21 @@ This plan builds the macOS capture path in three bands, in strict risk order.
   deny-by-default, and passthrough (the substance of NE-AC1/AC2/AC3), Band B's
   Tasks 2–4 **narrow to the macOS capture-backend adapter** (construct the
   `Captured*Flow` from the NE handoff and call the ingress) plus verifying the macOS
-  path — to be re-scoped by the orchestrator when Band B is dispatched. **Band B is
-  blocked on the prerequisite plan landing, not on the spike.**
+  path — to be re-scoped when Band B is dispatched.
+  **UNBLOCKED 2026-10-29:** the prerequisite merged (PR #47, all-PASS panel). Band B
+  may proceed; it is independent of the signing spike (which gates only Band C). Launch
+  order: the independent Rust pieces first — **Task 8** (core-listener handoff topology;
+  peer-auth defaulted to `LOCAL_PEERTOKEN` pending the spike), **Task 5**
+  (L4Unavailable mapping), **Task 6** (capability-state), **Task 7** (operator-gate) —
+  in parallel (disjoint files); **Task 9** after Task 8; the **macOS flow adapter**
+  (narrowed ex-Tasks 2–4: map the handoff flow representation → `CapturedTcpFlow`/
+  `CapturedUdpFlow`, `source_app`→`peer_identity`, call `dispatch_captured_tcp(&CoreIngress,…)`/
+  `dispatch_udp`) **after Task 8 pins the flow representation** — no spike dependency.
+  **Carry-over Minors from the PR #47 panel, to address in the Band B task that touches
+  the code:** forward `in_scope` on `LateGuard`/`LateHandles` before any live capture
+  routes through them (wiring task); match `handle_conn`'s logged path for the
+  module-spawn error and dedup the hint/ctx block (adapter); add the passthrough
+  dial-failure test and drop the needless `first_bytes` clone (adapter).
 - **Band C — `[Mac]` / `[Build]` Terminal-panel build (Tasks 10–18).** The
   Swift sysex, the host-app activation/approval UX, nested signing and
   notarization, version-bump reconcile, capture indicator/uninstall, and the
