@@ -25,8 +25,9 @@ pub const REDACTED: &str = "<redacted>";
 /// Auth-parameter name fragments the shared vocabulary in `aitm_core::redact`
 /// does not carry, matched the same way (case-insensitive substring). They
 /// over-match on purpose (`sid` catches `subsidiary`): a redacted example costs
-/// nothing, a leaked session id does.
-const EXTRA_SECRET_NEEDLES: &[&str] = &["sid", "jwt", "csrf", "session", "auth"];
+/// nothing, a leaked session id does. `pub(crate)` so `reproduce`'s embedded-value
+/// scrub is built from this very slice rather than a second copy of the list.
+pub(crate) const EXTRA_SECRET_NEEDLES: &[&str] = &["sid", "jwt", "csrf", "session", "auth"];
 
 /// Whether a header / query / body parameter name reads as a secret: the shared
 /// vocabulary plus [`EXTRA_SECRET_NEEDLES`]. `pub(crate)` so `reproduce`'s PoC

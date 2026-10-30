@@ -13,10 +13,15 @@
 //! scrubs the rest of what it copies (see `Scrubber`): every secret-named
 //! header, query parameter, form field and JSON key becomes a required `{{var}}`
 //! placeholder the runner must be given at run time, and every other value is
-//! passed through [`aitm_core::redact::scrub_text`]. `record_finding` is a thin
+//! passed through `scrub_embedded` — [`aitm_core::redact::scrub_text`] plus the
+//! same widened name vocabulary ([`is_secret_name`]) the name scrub uses, so a
+//! credential embedded in an innocuously named value cannot slip past a
+//! narrower list. `record_finding` is a thin
 //! wrapper over [`aitm_findings::DiskFindingStore`]: the store itself scrubs
 //! `title`/`notes` of credential material before anything reaches disk, and the
 //! record's `target` is scrubbed here.
+
+use std::collections::HashSet;
 
 use aitm_core::redact::scrub_text;
 use aitm_core::{CommandHost, HttpFlow};
@@ -26,7 +31,8 @@ use aitm_poc::{
 };
 
 use crate::checks::{CheckDefinition, Payload};
-use crate::discover::{is_secret_name, InjectionPoint};
+use crate::crawl::strip_userinfo;
+use crate::discover::{is_secret_name, InjectionPoint, EXTRA_SECRET_NEEDLES};
 
 /// Characters of the (network-supplied) injection-point name that feed the PoC
 /// name and, through its slug, the PoC id. Bounded so the id always fits
@@ -36,6 +42,22 @@ const MAX_POINT_NAME_CHARS: usize = 32;
 
 /// Characters kept of a header / parameter name when it becomes a variable name.
 const MAX_VAR_NAME_CHARS: usize = 48;
+
+/// Distinct secret-named variables one PoC may declare. A hostile captured body
+/// can carry a huge number of distinct `tokenN=` keys; past this many, every
+/// further secret folds into the single [`CATCH_ALL_VAR`] instead of minting a
+/// variable each (so a PoC carries at most `MAX_SECRET_VARS + 1` secret
+/// variables, plus `target`).
+const MAX_SECRET_VARS: usize = 64;
+
+/// The one variable every secret past [`MAX_SECRET_VARS`] shares. Not a secret
+/// name itself, so no real key can claim it before the cap is reached.
+const CATCH_ALL_VAR: &str = "redacted";
+
+/// Total percent-decode iterations applied to a form value before it is
+/// scrubbed: the first is `form_urlencoded`'s own parse, the rest catch a secret
+/// that was encoded more than once (`next=%252Fcb%253Fsid%253D…`).
+const MAX_DECODE_PASSES: usize = 3;
 
 /// Severity assigned to a built PoC, keyed by class. A class with no mapping
 /// here (a future `CheckDefinition::for_class` addition) defaults to `Medium`
@@ -108,8 +130,12 @@ pub fn build_poc(
             scrubber.scrub_step(http);
         }
     }
+    // A name the builder already declared (a credential header it templated) is
+    // not declared twice. O(1) per secret: a linear scan here would be quadratic
+    // in the number of secret-named keys the captured request controls.
+    let mut declared: HashSet<String> = poc.variables.iter().map(|v| v.name.clone()).collect();
     for var in scrubber.secrets {
-        if !poc.variables.iter().any(|v| v.name == var.name) {
+        if declared.insert(var.name.clone()) {
             poc.variables.push(var);
         }
     }
@@ -123,13 +149,15 @@ pub fn build_poc(
 ///    secret ([`is_secret_name`]) has its value replaced by a `{{var}}`
 ///    placeholder, and the variable is recorded in `secrets` (required, no
 ///    default) so the runner must be handed the credential at run time;
-/// 2. every other value is decoded and passed through [`scrub_text`], which
-///    catches a credential embedded in an innocuously named value
-///    (`next=%2Fcb%3Faccess_token%3D…`, `Referer: …?token=…`, `Bearer …`);
-/// 3. a body that is neither a form nor JSON is passed through [`scrub_text`]
-///    whole.
+/// 2. every other value is decoded (repeatedly, for a form value) and passed
+///    through [`scrub_embedded`], which catches a credential embedded in an
+///    innocuously named value (`next=%2Fcb%3Fsid%3D…`, `X-Return-To: …?jwt=…`,
+///    `Bearer …`) under the *same* name vocabulary layer 1 uses;
+/// 3. a body that is neither a form nor JSON is passed through
+///    [`scrub_embedded`] whole, and a `Referer` / `Referrer` header is cut back
+///    to origin + path first (a PoC does not need its query).
 ///
-/// `scrub_text` is applied per decoded component, never over the finished
+/// `scrub_embedded` is applied per decoded component, never over the finished
 /// string: a whole-string pass would corrupt the `{{var}}` placeholders
 /// (`access_token={{access_token}}` reads as a `key=value` credential) and mask
 /// the injected payload at a secret-named point.
@@ -137,9 +165,14 @@ pub fn build_poc(
 /// `payload` is the scanner's own inert constant, never a request secret, so a
 /// value equal to it is left alone — a redirect parameter named `return_token`
 /// must still carry the payload or the PoC could not reproduce.
+///
+/// Distinct secret variables are tracked in `seen` (O(1) dedupe) and capped at
+/// [`MAX_SECRET_VARS`]; see [`Scrubber::placeholder`].
 struct Scrubber<'a> {
     payload: &'a str,
     secrets: Vec<Variable>,
+    /// Names already declared in `secrets`.
+    seen: HashSet<String>,
 }
 
 impl<'a> Scrubber<'a> {
@@ -147,6 +180,7 @@ impl<'a> Scrubber<'a> {
         Self {
             payload,
             secrets: Vec::new(),
+            seen: HashSet::new(),
         }
     }
 
@@ -162,8 +196,13 @@ impl<'a> Scrubber<'a> {
         for (name, value) in &mut step.headers {
             *value = if is_secret_name(name) {
                 self.placeholder(name)
+            } else if name.eq_ignore_ascii_case("referer") || name.eq_ignore_ascii_case("referrer")
+            {
+                // A PoC does not need the Referer's query (or fragment), and it
+                // is exactly where a session id rides along: keep origin + path.
+                scrub_embedded(origin_and_path(value))
             } else {
-                scrub_text(value)
+                scrub_embedded(value)
             };
         }
         if let Some(body) = step.body.take() {
@@ -172,15 +211,30 @@ impl<'a> Scrubber<'a> {
     }
 
     /// The `{{var}}` placeholder for a redacted `key`, recording its variable.
+    ///
+    /// Dedupe is a `HashSet` lookup, not a scan of `secrets`. Once
+    /// [`MAX_SECRET_VARS`] distinct names are declared, a *new* name reuses the
+    /// single [`CATCH_ALL_VAR`] placeholder instead of minting a variable — an
+    /// already-declared name still gets its own placeholder back.
     fn placeholder(&mut self, key: &str) -> String {
-        let name = secret_var_name(key);
-        if !self.secrets.iter().any(|v| v.name == name) {
+        let mut name = secret_var_name(key);
+        if !self.seen.contains(&name) && self.secrets.len() >= MAX_SECRET_VARS {
+            name = CATCH_ALL_VAR.to_string();
+        }
+        if self.seen.insert(name.clone()) {
+            let description = if name == CATCH_ALL_VAR {
+                format!(
+                    "Credentials redacted from the captured request beyond the first {MAX_SECRET_VARS} distinct names (not stored in the PoC)"
+                )
+            } else {
+                format!(
+                    "Credential redacted from the captured request: `{name}` (not stored in the PoC)"
+                )
+            };
             self.secrets.push(Variable {
                 name: name.clone(),
                 default: None,
-                description: format!(
-                    "Credential redacted from the captured request: `{name}` (not stored in the PoC)"
-                ),
+                description,
                 required: true,
             });
         }
@@ -203,6 +257,13 @@ impl<'a> Scrubber<'a> {
                 .next()
                 .map(|(k, v)| (k.into_owned(), v.into_owned()))
                 .unwrap_or_default();
+            if !segment.contains('=') {
+                // A key-only segment is not a pair. A body labelled as a form
+                // that is not one (a JSON document, a bare token) arrives here
+                // whole, so its "key" is scrubbed as free text.
+                out.push(form_encode(&scrub_decoded(&key)));
+                continue;
+            }
             let is_payload = value == self.payload;
             if is_secret_name(&key) && !value.is_empty() && !is_payload {
                 out.push(format!("{}={}", form_encode(&key), self.placeholder(&key)));
@@ -211,13 +272,9 @@ impl<'a> Scrubber<'a> {
             let value = if is_payload {
                 value
             } else {
-                scrub_text(&value)
+                scrub_decoded(&value)
             };
-            out.push(if segment.contains('=') {
-                format!("{}={}", form_encode(&key), form_encode(&value))
-            } else {
-                form_encode(&key)
-            });
+            out.push(format!("{}={}", form_encode(&key), form_encode(&value)));
         }
         out.join("&")
     }
@@ -234,7 +291,7 @@ impl<'a> Scrubber<'a> {
                 }
             }
         }
-        scrub_text(body)
+        scrub_embedded(body)
     }
 
     fn scrub_json(&mut self, value: &mut serde_json::Value) {
@@ -257,12 +314,219 @@ impl<'a> Scrubber<'a> {
             }
             Value::String(text) => {
                 if text != self.payload {
-                    *text = scrub_text(text);
+                    *text = scrub_embedded(text);
                 }
             }
             Value::Null | Value::Bool(_) | Value::Number(_) => {}
         }
     }
+}
+
+/// Mask credential material embedded in a value that is *not* itself under a
+/// secret name, using the one vocabulary the name scrub uses.
+///
+/// [`scrub_text`] alone only knows `api_key` / `token` / `secret` / `password` /
+/// `pwd` / `credential` / `cookie` and `Bearer`, so a `sid=`, `jwt=`, `csrf=`,
+/// `session=` or `auth=` pair — all of which [`is_secret_name`] masks when they
+/// are the *name* of a header or parameter — passed straight through when
+/// embedded in a `Referer`-style or URL-valued value. This closes that gap in
+/// three steps:
+///
+/// 1. URL userinfo is stripped ([`strip_userinfo`]: `//user:pw@host` →
+///    `//host`) — first, so a `user:pw@` prefix cannot make the next steps
+///    swallow the host;
+/// 2. [`scrub_text`] masks its own base vocabulary;
+/// 3. every `key=value` / `key: value` whose *key* contains an
+///    [`EXTRA_SECRET_NEEDLES`] needle has its value replaced by `[redacted]`
+///    ([`redact_needle_pairs`]).
+fn scrub_embedded(text: &str) -> String {
+    redact_needle_pairs(&scrub_text(&strip_userinfo(text)))
+}
+
+/// Whether `b` can be part of a `key` in a `key=value` pair.
+fn is_key_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')
+}
+
+/// Whether `b` ends an unquoted value: ASCII whitespace or a pair, list or JSON
+/// delimiter. A non-ASCII byte never does, so a value is over- rather than
+/// under-redacted.
+fn ends_value(b: u8) -> bool {
+    b.is_ascii_whitespace() || matches!(b, b'&' | b';' | b',' | b'"' | b'\'' | b'}')
+}
+
+/// Whether `key` contains an [`EXTRA_SECRET_NEEDLES`] needle (ASCII
+/// case-insensitive, as a substring — exactly how `discover::is_secret_name`
+/// matches the same slice).
+fn names_a_secret(key: &str) -> bool {
+    let key = key.as_bytes();
+    // No per-key allocation: this runs once per key run of a body that may be
+    // megabytes long. (`windows(0)` would panic, so an empty needle is skipped.)
+    EXTRA_SECRET_NEEDLES.iter().any(|needle| {
+        let needle = needle.as_bytes();
+        !needle.is_empty()
+            && key
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle))
+    })
+}
+
+/// Redact the value of every `key=value` / `key: value` pair in `text` whose key
+/// reads as a secret under [`EXTRA_SECRET_NEEDLES`].
+///
+/// Equivalent to replacing, case-insensitively,
+/// `(["']?[a-z0-9_.-]*(?:needle…)[a-z0-9_.-]*["']?[ \t]*[=:][ \t]*["']?)<value>`
+/// with `${1}[redacted]`, where `<value>` is a run up to `[\s&;,"'}]` — or, when
+/// it opens with a quote, everything up to the matching unescaped quote, so a
+/// JSON value holding spaces is masked whole. Optional quotes around the key
+/// and value make a JSON-encoded pair (`"sid":"…"`) match the way
+/// `scrub_text`'s own pass does.
+///
+/// Written as one linear scan, not a regex: the crate carries no `regex`
+/// dependency, and each key run and each value is consumed exactly once, so a
+/// hostile ~10 MiB body cannot make this quadratic. An empty value is left
+/// alone (nothing to leak).
+fn redact_needle_pairs(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(text.len());
+    // Start of the text not yet copied into `out`.
+    let mut copied = 0;
+    let mut i = 0;
+    while i < len {
+        if !is_key_byte(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let key_start = i;
+        while i < len && is_key_byte(bytes[i]) {
+            i += 1;
+        }
+        // `key_start..i` is all ASCII, so these are char boundaries.
+        if !names_a_secret(&text[key_start..i]) {
+            continue;
+        }
+
+        // key, optional closing quote, blanks, `=` or `:`, blanks, optional
+        // opening quote, then the value.
+        let mut j = i;
+        if j < len && matches!(bytes[j], b'"' | b'\'') {
+            j += 1;
+        }
+        while j < len && matches!(bytes[j], b' ' | b'\t') {
+            j += 1;
+        }
+        if j >= len || !matches!(bytes[j], b'=' | b':') {
+            continue;
+        }
+        j += 1;
+        while j < len && matches!(bytes[j], b' ' | b'\t') {
+            j += 1;
+        }
+        let quote = match bytes.get(j) {
+            Some(&q) if matches!(q, b'"' | b'\'') => {
+                j += 1;
+                Some(q)
+            }
+            _ => None,
+        };
+        let value_start = j;
+        let value_end = match quote.and_then(|q| closing_quote(bytes, value_start, q)) {
+            Some(end) => end,
+            // Unquoted, or an opening quote that never closes: the plain rule.
+            None => {
+                let mut end = value_start;
+                while end < len && !ends_value(bytes[end]) {
+                    end += 1;
+                }
+                end
+            }
+        };
+        if value_end == value_start {
+            continue;
+        }
+        // `value_start` follows an ASCII byte and `value_end` precedes one (or
+        // is the end of the text), so both are char boundaries.
+        out.push_str(&text[copied..value_start]);
+        out.push_str("[redacted]");
+        copied = value_end;
+        i = value_end;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// The index of the unescaped `quote` byte that closes a quoted value starting
+/// at `from`, or `None` if it never closes.
+fn closing_quote(bytes: &[u8], from: usize, quote: u8) -> Option<usize> {
+    let mut k = from;
+    while k < bytes.len() {
+        match bytes[k] {
+            b'\\' => k += 2,
+            b if b == quote => return Some(k),
+            _ => k += 1,
+        }
+    }
+    None
+}
+
+/// `value` with a `Referer` / `Referrer` header cut back to origin + path: the
+/// query and the fragment, where a session id or token rides along, are dropped.
+fn origin_and_path(value: &str) -> &str {
+    let end = value.find(['?', '#']).unwrap_or(value.len());
+    &value[..end]
+}
+
+/// [`scrub_embedded`] for a form value (or key-only segment) that
+/// `form_urlencoded` has already decoded once. A decoded value that still
+/// carries an encoded `=` / `:` is a secret hidden under a second layer of
+/// encoding (`next=%252Fcb%253Fsid%253D…` decodes to `%2Fcb%3Fsid%3D…`, which no
+/// `key=value` scan can see), so it is decoded again — [`MAX_DECODE_PASSES`]
+/// iterations in total, counting the first.
+fn scrub_decoded(decoded: &str) -> String {
+    let mut text = decoded.to_string();
+    for _ in 1..MAX_DECODE_PASSES {
+        if !has_encoded_separator(&text) {
+            break;
+        }
+        text = percent_decode(&text);
+    }
+    scrub_embedded(&text)
+}
+
+/// Whether `s` contains a percent-encoded `=` (`%3D`) or `:` (`%3A`), in either
+/// hex case.
+fn has_encoded_separator(s: &str) -> bool {
+    s.as_bytes()
+        .windows(3)
+        .any(|w| w[0] == b'%' && w[1] == b'3' && matches!(w[2], b'D' | b'd' | b'A' | b'a'))
+}
+
+/// Percent-decode `s`: each valid `%XX` becomes its byte; a malformed or
+/// truncated sequence and every other byte (including `+`, which is a literal
+/// plus here, not a space) is kept as written. Invalid UTF-8 in the result is
+/// replaced, never an error.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = |b: u8| {
+                char::from(b)
+                    .to_digit(16)
+                    .and_then(|d| u8::try_from(d).ok())
+            };
+            if let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(high * 16 + low);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `application/x-www-form-urlencoded` percent-encoding, the same serializer
@@ -702,10 +966,9 @@ mod tests {
             .iter()
             .find(|(n, _)| n == "Referer")
             .map(|(_, v)| v.as_str());
-        assert_eq!(
-            referer,
-            Some("http://target.test/app?access_token=[redacted]")
-        );
+        // The Referer query is dropped outright (a PoC does not need it): only
+        // origin + path survive, so nothing in the query can leak.
+        assert_eq!(referer, Some("http://target.test/app"));
     }
 
     #[test]
@@ -896,5 +1159,384 @@ mod tests {
             stored.target,
             "http://target.test/p?access_token=[redacted]"
         );
+    }
+
+    // ---- N1: the embedded-value scrub shares the name scrub's vocabulary -----
+
+    /// A header value of `step`, by case-insensitive name.
+    fn header_of<'a>(step: &'a aitm_poc::HttpStep, name: &str) -> Option<&'a str> {
+        step.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The reviewer's measured leak: every one of these names is in the shared
+    /// name vocabulary, but none is in `scrub_text`'s, so a `Referer` carrying
+    /// them was emitted verbatim.
+    #[test]
+    fn build_poc_drops_the_referer_query_and_leaks_no_session_id() {
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let flow = flow_with(
+            "GET",
+            "/search?access_token=QSECRET654&q=hello",
+            &[
+                (
+                    "Referer",
+                    "http://t/app?PHPSESSID=REFPHP1&sid=REFSID2&jwt=REFJWT3&auth=REFAUTH4&session=REFSESS5&csrf=REFCSRF6",
+                ),
+                ("Referrer", "http://t/cb#sid=FRAGSID7"),
+            ],
+            None,
+        );
+        let q = point(&flow, Location::Query, "q", "hello");
+
+        let poc = build_poc(&flow, &def, &q, payload).expect("poc builds");
+        let serialized = serde_json::to_string(&poc).expect("poc serializes");
+
+        for leaked in [
+            "REFPHP1",
+            "REFSID2",
+            "REFJWT3",
+            "REFAUTH4",
+            "REFSESS5",
+            "REFCSRF6",
+            "FRAGSID7",
+            "QSECRET654",
+        ] {
+            assert!(
+                !serialized.contains(leaked),
+                "the shareable PoC leaked `{leaked}`: {serialized}"
+            );
+        }
+        let step = http_step(&poc);
+        // Only origin + path survive: the query (and a fragment) is gone.
+        assert_eq!(header_of(step, "Referer"), Some("http://t/app"));
+        assert_eq!(header_of(step, "Referrer"), Some("http://t/cb"));
+        // Controls: a token-named param is still masked and the PoC still
+        // carries the payload, so it reproduces.
+        assert!(
+            step.url.contains("access_token={{access_token}}"),
+            "{}",
+            step.url
+        );
+        assert!(
+            step.url.contains("q=%3Caitm-canary-0001%3E"),
+            "the step URL must carry the payload at `q`: {}",
+            step.url
+        );
+        assert_eq!(poc.success, def.success_assertion(payload));
+    }
+
+    /// The needle layer on its own: a non-`Referer` header whose name is not a
+    /// secret, so only the embedded-value scrub can mask what it carries.
+    #[test]
+    fn build_poc_scrubs_session_ids_embedded_in_a_non_secret_header() {
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let flow = flow_with(
+            "GET",
+            "/search?q=hello",
+            &[(
+                "X-Return-To",
+                "http://t/cb?PHPSESSID=HDRPHP1&sid=HDRSID2&jwt=HDRJWT3&auth=HDRAUTH4&session=HDRSESS5&csrf=HDRCSRF6&access_token=HDRTOK7&page=2",
+            )],
+            None,
+        );
+        let q = point(&flow, Location::Query, "q", "hello");
+
+        let poc = build_poc(&flow, &def, &q, payload).expect("poc builds");
+
+        assert_eq!(
+            header_of(http_step(&poc), "X-Return-To"),
+            Some(
+                "http://t/cb?PHPSESSID=[redacted]&sid=[redacted]&jwt=[redacted]&auth=[redacted]&session=[redacted]&csrf=[redacted]&access_token=[redacted]&page=2"
+            )
+        );
+    }
+
+    #[test]
+    fn build_poc_scrubs_session_ids_embedded_in_a_redirect_param() {
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let flow = flow_with_query(
+            "/go?q=hello&next=%2Fcb%3Fsid%3DNEXTSID%26jwt%3DNEXTJWT%26session%3DNEXTSESS",
+        );
+        let q = point(&flow, Location::Query, "q", "hello");
+
+        let poc = build_poc(&flow, &def, &q, payload).expect("poc builds");
+
+        let url = &http_step(&poc).url;
+        for leaked in ["NEXTSID", "NEXTJWT", "NEXTSESS"] {
+            assert!(!url.contains(leaked), "embedded `{leaked}` leaked: {url}");
+        }
+        assert!(
+            url.contains(
+                "next=%2Fcb%3Fsid%3D%5Bredacted%5D%26jwt%3D%5Bredacted%5D%26session%3D%5Bredacted%5D"
+            ),
+            "{url}"
+        );
+        // Control: the payload is still injected.
+        assert!(url.contains("q=%3Caitm-canary-0001%3E"), "{url}");
+    }
+
+    #[test]
+    fn build_poc_scrubs_session_ids_in_a_json_string_leaf() {
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let flow = flow_with(
+            "POST",
+            "/search?q=hello",
+            &[("Content-Type", "application/json")],
+            Some(r#"{"redirect":"http://t/cb?sid=JSONSID1&jwt=JSONJWT2","msg":"csrf: JSONCSRF3"}"#),
+        );
+        let q = point(&flow, Location::Query, "q", "hello");
+
+        let poc = build_poc(&flow, &def, &q, payload).expect("poc builds");
+
+        let body: serde_json::Value =
+            serde_json::from_str(http_step(&poc).body.as_deref().expect("a json body"))
+                .expect("valid json");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "redirect": "http://t/cb?sid=[redacted]&jwt=[redacted]",
+                "msg": "csrf: [redacted]",
+            })
+        );
+    }
+
+    #[test]
+    fn build_poc_scrubs_session_ids_in_an_untyped_body() {
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let flow = flow_with(
+            "POST",
+            "/search?q=hello",
+            &[],
+            Some("username=admin&sid=BODYSID1&jwt=BODYJWT2"),
+        );
+        let q = point(&flow, Location::Query, "q", "hello");
+
+        let poc = build_poc(&flow, &def, &q, payload).expect("poc builds");
+
+        assert_eq!(
+            http_step(&poc).body.as_deref(),
+            Some("username=admin&sid=[redacted]&jwt=[redacted]")
+        );
+    }
+
+    /// A regression guard: the `Cookie` header is masked by name (it was before
+    /// this change too), and a session cookie value never reaches the PoC.
+    #[test]
+    fn build_poc_masks_a_session_cookie_header() {
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let flow = flow_with(
+            "GET",
+            "/search?q=hello",
+            &[("Cookie", "PHPSESSID=COOKIESID1; theme=dark")],
+            None,
+        );
+        let q = point(&flow, Location::Query, "q", "hello");
+
+        let poc = build_poc(&flow, &def, &q, payload).expect("poc builds");
+        let serialized = serde_json::to_string(&poc).expect("poc serializes");
+
+        assert!(!serialized.contains("COOKIESID1"), "{serialized}");
+        assert_eq!(header_of(http_step(&poc), "Cookie"), Some("{{cookie}}"));
+    }
+
+    #[test]
+    fn scrub_embedded_masks_every_shared_vocabulary_name() {
+        assert_eq!(
+            scrub_embedded("PHPSESSID=A&sid=B&jwt=C&auth=D&session=E&csrf=F&page=2"),
+            "PHPSESSID=[redacted]&sid=[redacted]&jwt=[redacted]&auth=[redacted]&session=[redacted]&csrf=[redacted]&page=2"
+        );
+        // `key: value` framing, with and without spacing.
+        assert_eq!(scrub_embedded("X-CSRF: abc"), "X-CSRF: [redacted]");
+        assert_eq!(scrub_embedded("sid:abc"), "sid:[redacted]");
+        assert_eq!(scrub_embedded("sid = abc"), "sid = [redacted]");
+        // JSON framing, including a quoted value that holds spaces.
+        assert_eq!(
+            scrub_embedded(r#"{"sid":"S1","jwt": "J2", "n":1}"#),
+            r#"{"sid":"[redacted]","jwt": "[redacted]", "n":1}"#
+        );
+        assert_eq!(
+            scrub_embedded(r#"{"session":"a b c","n":1}"#),
+            r#"{"session":"[redacted]","n":1}"#
+        );
+        // The base vocabulary still applies (one pass, two vocabularies).
+        assert_eq!(
+            scrub_embedded("access_token=T&sid=S"),
+            "access_token=[redacted]&sid=[redacted]"
+        );
+        // URL userinfo is stripped.
+        assert_eq!(
+            scrub_embedded("go to http://user:pw@host/p?x=1"),
+            "go to http://host/p?x=1"
+        );
+    }
+
+    /// One vocabulary: the embedded-value scrub is built from the very slice
+    /// `is_secret_name` matches, so a needle added there is masked here too.
+    #[test]
+    fn scrub_embedded_covers_every_extra_secret_needle() {
+        for needle in EXTRA_SECRET_NEEDLES {
+            assert!(is_secret_name(needle), "`{needle}` is a secret name");
+            assert_eq!(
+                scrub_embedded(&format!("x_{needle}_y=V1&z=2")),
+                format!("x_{needle}_y=[redacted]&z=2")
+            );
+            let upper = needle.to_ascii_uppercase();
+            assert_eq!(
+                scrub_embedded(&format!("{upper}: V1")),
+                format!("{upper}: [redacted]")
+            );
+        }
+    }
+
+    #[test]
+    fn scrub_embedded_handles_quotes_and_escapes() {
+        // An escaped quote inside a quoted value does not end it early.
+        assert_eq!(
+            scrub_embedded(r#"{"sid":"a\"b c","n":1}"#),
+            r#"{"sid":"[redacted]","n":1}"#
+        );
+        // Single quotes, and a quote with blanks around the separator.
+        assert_eq!(
+            scrub_embedded("{'jwt' : 'a b','n':1}"),
+            "{'jwt' : '[redacted]','n':1}"
+        );
+        // An opening quote that never closes falls back to the plain rule: the
+        // value still ends at `&`, and the rest of the text survives.
+        assert_eq!(scrub_embedded("sid=\"abc&x=1"), "sid=\"[redacted]&x=1");
+        // An empty quoted value has nothing to redact.
+        assert_eq!(scrub_embedded(r#"{"sid":"","n":1}"#), r#"{"sid":"","n":1}"#);
+    }
+
+    #[test]
+    fn scrub_embedded_leaves_innocent_text_and_empty_values_alone() {
+        for untouched in [
+            "page=2&q=hello",
+            "sid=&x=1",
+            "session expired",
+            "auth",
+            "",
+            "plain text with no pairs",
+        ] {
+            assert_eq!(scrub_embedded(untouched), untouched);
+        }
+        // Over-matching is deliberate (a leaked session id costs more than a
+        // redacted `subsidiary`), as in `discover::is_secret_name`.
+        assert_eq!(scrub_embedded("subsidiary=acme"), "subsidiary=[redacted]");
+        // Non-ASCII around a match never panics on a char boundary.
+        assert_eq!(
+            scrub_embedded("h\u{e9}llo sid=w\u{f6}rld \u{fc}n\u{ef}"),
+            "h\u{e9}llo sid=[redacted] \u{fc}n\u{ef}"
+        );
+    }
+
+    // ---- M1: secret variables are deduped in O(1) and bounded ---------------
+
+    #[test]
+    fn build_poc_bounds_the_secret_variables_a_hostile_request_can_mint() {
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let mut path = String::from("/search?q=hello");
+        for i in 0..200 {
+            path.push_str(&format!("&token{i}=BULK{i:03}SECRET"));
+        }
+        // A name declared before the cap is hit keeps its own placeholder after
+        // it; only a *new* name past the cap folds into the catch-all.
+        path.push_str("&token3=AGAINSECRET");
+        let flow = flow_with_query(&path);
+        let q = point(&flow, Location::Query, "q", "hello");
+
+        let poc = build_poc(&flow, &def, &q, payload).expect("poc builds");
+        let serialized = serde_json::to_string(&poc).expect("poc serializes");
+
+        for i in 0..200 {
+            let value = format!("BULK{i:03}SECRET");
+            assert!(!serialized.contains(&value), "`{value}` leaked");
+        }
+        // `target` + 64 named secret variables + one catch-all.
+        assert_eq!(poc.variables.len(), 66, "{:?}", poc.variables);
+        let names: std::collections::HashSet<&str> =
+            poc.variables.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names.len(), 66, "variable names must stay unique");
+        assert!(names.contains("token0") && names.contains("token63"));
+        assert!(!names.contains("token64"), "past the cap, no new variable");
+        assert!(names.contains("redacted"), "the catch-all is declared");
+        let redacted = poc
+            .variables
+            .iter()
+            .find(|v| v.name == "redacted")
+            .expect("catch-all variable");
+        assert!(redacted.required && redacted.default.is_none());
+        let url = &http_step(&poc).url;
+        assert!(url.contains("token63={{token63}}"), "{url}");
+        assert!(url.contains("token64={{redacted}}"), "{url}");
+        assert!(url.contains("token199={{redacted}}"), "{url}");
+        assert!(url.ends_with("&token3={{token3}}"), "{url}");
+        assert!(!serialized.contains("AGAINSECRET"), "repeat value leaked");
+    }
+
+    // ---- M4: key-only segments and nested encodings --------------------------
+
+    #[test]
+    fn build_poc_scrubs_a_json_body_mislabelled_as_a_form() {
+        // Not form data at all: the whole body is one key-only segment, which
+        // used to be re-emitted unscrubbed.
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let flow = flow_with(
+            "POST",
+            "/search?q=hello",
+            &[("Content-Type", "application/x-www-form-urlencoded")],
+            Some(r#"{"password":"FORMJSONPW1"}"#),
+        );
+        let q = point(&flow, Location::Query, "q", "hello");
+
+        let poc = build_poc(&flow, &def, &q, payload).expect("poc builds");
+
+        let serialized = serde_json::to_string(&poc).expect("poc serializes");
+        assert!(!serialized.contains("FORMJSONPW1"), "{serialized}");
+        assert_eq!(
+            http_step(&poc).body.as_deref(),
+            Some("%7B%22password%22%3A%22%5Bredacted%5D%22%7D")
+        );
+    }
+
+    #[test]
+    fn build_poc_scrubs_a_double_encoded_embedded_secret() {
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let flow = flow_with_query("/go?q=hello&next=%252Fcb%253Faccess_token%253DDBLSECRET1");
+        let q = point(&flow, Location::Query, "q", "hello");
+
+        let poc = build_poc(&flow, &def, &q, payload).expect("poc builds");
+
+        let url = &http_step(&poc).url;
+        assert!(
+            !url.contains("DBLSECRET1"),
+            "double-encoded secret leaked: {url}"
+        );
+        assert!(
+            url.contains("next=%2Fcb%3Faccess_token%3D%5Bredacted%5D"),
+            "{url}"
+        );
+        assert!(url.contains("q=%3Caitm-canary-0001%3E"), "{url}");
+    }
+
+    #[test]
+    fn percent_decode_decodes_valid_sequences_only() {
+        assert_eq!(percent_decode("%2Fcb%3Fa%3dB%3A"), "/cb?a=B:");
+        assert_eq!(percent_decode("%C3%A9"), "\u{e9}");
+        // Malformed sequences and a trailing `%` stay as written; `+` is not a space.
+        assert_eq!(percent_decode("100%zz%4"), "100%zz%4");
+        assert_eq!(percent_decode("a+b%"), "a+b%");
+        assert_eq!(percent_decode(""), "");
     }
 }
