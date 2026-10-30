@@ -7,19 +7,26 @@
 # spawn and supervise the child itself, pushes a real flow THROUGH the embedded
 # proxy, then quits the app the normal way and checks nothing was orphaned.
 #
-# Why not reuse SelfTest+Live (runLive)? Two reasons it is the wrong harness here:
-#   1. The embedded config is secure-by-default: the app connects as an agent
-#      frontend (Frontend::Mcp) and `scope.allow_agent_widen` is OFF, so the
-#      agent-driven scope.add / request.send pass is refused BY DESIGN. Driving a
-#      flow through the proxy with curl needs no scope widening.
-#   2. `--selftest` quits via `exit(code)` in applicationWillTerminate, which hard-
-#      exits and bypasses the embedded-core teardown. AC7 is about the NORMAL quit
-#      path (the willTerminate teardown that S1 fixes), so we quit the app for real.
+# Why not reuse SelfTest+Live (runLive)? `--selftest` quits via `exit(code)` in
+# applicationWillTerminate, which hard-exits and bypasses the embedded-core
+# teardown. AC7 is about the NORMAL quit path (the willTerminate teardown that S1
+# fixes), so we quit the app for real.
+#
+# Scope posture (embedded-core-scope, Task 12): the generated embedded config now
+# emits `mcp.operator_token` alongside the agent token, and the app connects with
+# the OPERATOR token, so it is classified `Frontend::Operator` — a present human.
+# Startup scope stays deny-by-default/empty (no `scope:` block). A runtime
+# `scope.add` over the operator connection (what the app's Scope panel does) now
+# SUCCEEDS against the embedded core, while an agent-token connection is still
+# refused (scope.allow_agent_widen OFF). Both are asserted below (step 7b). This
+# needs the core half (operator-may-widen-scope) in the bundled `aitm`.
 #
 # What it exercises:
 #   AC6  the app discovers the bundled core, spawns it, it publishes its bus
 #        rendezvous, binds its proxy, and a real HTTP request routed THROUGH that
 #        embedded proxy reaches the upstream and comes back 200.
+#   AC14 a runtime scope.add over the OPERATOR connection succeeds against the
+#        embedded core; the same call over the AGENT connection is still refused.
 #   AC7  on a normal quit (osascript 'quit'), the willTerminate teardown reaps the
 #        child: no bundled `aitm` survives and no per-launch workDir is left behind.
 #
@@ -30,9 +37,6 @@
 #     inside-out signing runs its real path; no browser flow is driven, so it never
 #     executes. The obscura side of AC7 (no orphaned browser) needs a full
 #     scripts/package.sh core on a machine with `gh` access.
-#   - the agent-driven FlowActions pass (scope.add/request.send/resume/kill): see
-#     reason 1 above. Run tools/selftest-live.sh against a config with
-#     scope.allow_agent_widen=true for that surface.
 #
 # Usage: tools/selftest-live-embedded.sh [upstream host:port]   (default 127.0.0.1:8099)
 set -u
@@ -122,6 +126,67 @@ done
 [[ -n "$ok" ]] || fail "AC6: a request through the embedded proxy ($proxy -> $upstream) did not succeed"
 note "AC6: a live HTTP flow went through the embedded proxy to the upstream (200)"
 
+# 7b. AC14 (embedded-core-scope): a runtime scope.add over the OPERATOR connection
+#     succeeds against the embedded core (what the app's Scope panel does), while
+#     the same call over the AGENT connection is still refused. Reads both tokens
+#     from this run's 0600 config and the bus address from the rendezvous file,
+#     then drives the MCP loopback bus directly (newline-delimited JSON-RPC, token
+#     line first — the same protocol the app and scripts/bus-agent-check.py use).
+#     Needs the core half (operator-may-widen-scope) in the bundled aitm.
+bus_addr=""
+[[ -s "$rendezvous" ]] && bus_addr=$(head -1 "$rendezvous" | tr -d '[:space:]')
+[[ -n "$bus_addr" ]] || fail "AC14: no bus rendezvous address at $rendezvous (cannot reach the embedded bus)"
+agent_token=$(sed -n 's/^[[:space:]]*token: "\(.*\)"/\1/p' "$core_cfg" | head -1)
+op_token=$(sed -n 's/^[[:space:]]*operator_token: "\(.*\)"/\1/p' "$core_cfg" | head -1)
+[[ -n "$op_token" ]] || fail "AC14: the generated config carries no mcp.operator_token"
+[[ -n "$agent_token" && "$agent_token" != "$op_token" ]] || fail "AC14: agent/operator tokens missing or identical (must be distinct)"
+
+python3 - "$bus_addr" "$op_token" "$agent_token" <<'PY' || fail "AC14: operator scope.add did not succeed, or agent gating is broken, against the embedded core (is the core half present?)"
+import json, socket, sys
+bus, op_token, agent_token = sys.argv[1], sys.argv[2], sys.argv[3]
+host, port = bus.rsplit(":", 1)
+host = host.strip("[]")  # bracketed IPv6 literal, if the core ever prints one
+
+def scope_add(token, entry):
+    s = socket.create_connection((host, int(port)), timeout=10)
+    f = s.makefile("rwb")
+    f.write((json.dumps({"token": token}) + "\n").encode()); f.flush()
+    n = [0]
+    def rpc(method, params=None):
+        n[0] += 1
+        f.write((json.dumps({"jsonrpc": "2.0", "id": n[0], "method": method,
+                             "params": params or {}}) + "\n").encode()); f.flush()
+        while True:
+            line = f.readline()
+            if not line:
+                raise SystemExit("bus closed before reply")
+            r = json.loads(line)
+            if r.get("id") == n[0]:
+                if "error" in r:
+                    raise SystemExit("rpc error: " + json.dumps(r["error"]))
+                return r["result"]
+    rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "embedded-scope-check", "version": "0"}})
+    r = rpc("tools/call", {"name": "scope.add", "arguments": {"host": entry}})
+    f.close(); s.close()
+    text = (r.get("content") or [{}])[0].get("text", "")
+    return (not r.get("isError")), text
+
+ok_op, msg_op = scope_add(op_token, "operator-added.test")
+print("embedded-live: AC14 operator scope.add ->", "OK" if ok_op else "REFUSED", "--", msg_op[:120])
+ok_agent, msg_agent = scope_add(agent_token, "agent-added.test")
+print("embedded-live: AC14 agent scope.add ->", "OK" if ok_agent else "REFUSED", "--", msg_agent[:120])
+
+if not ok_op:
+    print("FAIL: operator scope.add was refused — the embedded core does not accept operator widening (core half missing?)")
+    sys.exit(1)
+if ok_agent:
+    print("FAIL: agent scope.add SUCCEEDED — agents must stay gated (scope.allow_agent_widen off)")
+    sys.exit(1)
+print("embedded-live: AC14 PASS: a present operator may widen embedded scope; an agent still cannot")
+PY
+note "AC14: operator scope.add succeeds against the embedded core; agent is still gated"
+
 # 8. AC7: quit the app the normal way so the willTerminate teardown (S1) runs, then
 #    assert no orphaned core and no leftover per-launch workDir.
 note "quitting the app (normal terminate -> willTerminate teardown)"
@@ -147,5 +212,5 @@ workdir="${core_cfg:h}"
 note "AC7: this run's per-launch config/rendezvous workDir was removed"
 
 cleanup
-print -r -- "EMBEDDED LIVE SELFTEST PASS (AC6 embedded spawn+rendezvous+live proxy flow; AC7 clean teardown, no orphan/leftover)"
+print -r -- "EMBEDDED LIVE SELFTEST PASS (AC6 embedded spawn+rendezvous+live proxy flow; AC14 operator may widen scope, agent gated; AC7 clean teardown, no orphan/leftover)"
 exit 0
