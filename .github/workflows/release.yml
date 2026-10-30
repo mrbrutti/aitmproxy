@@ -183,16 +183,41 @@ jobs:
         run: |
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber SHA256SUMS
 
+      # Publish the binaries to the PUBLIC tap repo so tokenless visitors (and the
+      # website) can download them while the source repo stays private. CI's
+      # default GITHUB_TOKEN cannot write to another repo, so this uses a PAT with
+      # contents:write on the tap, stored as the TAP_PUBLISH_TOKEN secret
+      # (docs/RELEASE.md). The macOS DMG + tarball that Matt uploads to the source
+      # release are mirrored here too, since this downloads every source asset.
+      - name: Mirror the release assets to the public tap
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PUBLISH_TOKEN }}
+          TAG: ${{ needs.version-guard.outputs.tag }}
+          TAP_REPO: mrbrutti/homebrew-aitmproxy
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::TAP_PUBLISH_TOKEN is not set. Add a PAT with contents:write on ${TAP_REPO} (Settings > Secrets and variables > Actions) so releases publish publicly; see docs/RELEASE.md."
+            exit 1
+          fi
+          if ! gh release view "$TAG" --repo "$TAP_REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$TAP_REPO" --title "$TAG" \
+              --notes "Public aitmproxy ${TAG} binaries. The source repository is private; these are the downloadable artifacts."
+          fi
+          gh release upload "$TAG" --repo "$TAP_REPO" --clobber dist-assets/* SHA256SUMS
+
+      # The website links must resolve for a tokenless visitor, so the manifest
+      # points at the PUBLIC tap repo's assets, not the private source repo's.
       - name: Generate site/downloads.json
         env:
           TAG: ${{ needs.version-guard.outputs.tag }}
+          TAP_REPO: mrbrutti/homebrew-aitmproxy
         run: |
           names=()
           for f in dist-assets/*; do
             names+=("$(basename "$f")")
           done
           bash scripts/gen-downloads-manifest.sh \
-            "$TAG" "$GITHUB_REPOSITORY" SHA256SUMS "${names[@]}" > site/downloads.json
+            "$TAG" "$TAP_REPO" SHA256SUMS "${names[@]}" > site/downloads.json
           echo "site/downloads.json:"
           cat site/downloads.json
 
