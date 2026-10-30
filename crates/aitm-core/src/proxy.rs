@@ -125,8 +125,16 @@ impl Proxy {
     /// `aitm` pre-binds every service port at startup so a port conflict is one
     /// clear error before any "listening" success, never a cryptic os-error
     /// after it; this hands the pre-bound socket straight to the accept loop.
-    pub async fn run_on(&self, listener: TcpListener, ssrf: bool) -> anyhow::Result<()> {
-        self.accept_loop(listener, ssrf).await
+    /// Mirrors [`Proxy::run`] (not SSRF-filtered).
+    pub async fn run_on(&self, listener: TcpListener) -> anyhow::Result<()> {
+        self.accept_loop(listener, false).await
+    }
+
+    /// Run the **browser-facing** accept loop on an already-bound listener.
+    /// Mirrors [`Proxy::run_browser`] (SSRF-filtered); the named pair keeps the
+    /// SSRF posture at the call site instead of a transposable bool.
+    pub async fn run_browser_on(&self, listener: TcpListener) -> anyhow::Result<()> {
+        self.accept_loop(listener, true).await
     }
 
     async fn accept_loop(&self, listener: TcpListener, ssrf: bool) -> anyhow::Result<()> {

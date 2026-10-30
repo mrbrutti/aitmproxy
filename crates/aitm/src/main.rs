@@ -321,10 +321,9 @@ async fn run() -> anyhow::Result<()> {
     // any "listening" success line. A port conflict is then ONE clear, actionable
     // error here — which port, who likely holds it, how to change it — never a
     // cryptic os-error-48 printed after `aitm web` already announced the UI. This
-    // covers bare `aitm`, `aitm tui` and `aitm web` alike: all three serve the
-    // proxy and the browser's proxy port below.
+    // covers bare `aitm`, `aitm tui` and `aitm web` alike: the proxy and the
+    // browser's proxy port here, and the web UI port just below for `aitm web`.
     let config_display = config_path
-        .clone()
         .unwrap_or_else(config_file::default_config_path)
         .display()
         .to_string();
@@ -340,6 +339,33 @@ async fn run() -> anyhow::Result<()> {
         &format!("Free it, or set `browser.proxy_addr:` to another address in {config_display}."),
     )
     .await?;
+    // `aitm web`: the UI port is pre-bound here too, so a web-port conflict is
+    // caught before obscura spawns, not after. The collision against the proxy /
+    // browser ports is named here because a shared address would otherwise
+    // surface only as a bare "address in use".
+    let web_listener = match &web_settings {
+        Some(settings) => {
+            for (what, addr) in [
+                ("proxy listen", cfg.listen),
+                ("browser.proxy_addr", cfg.browser.proxy_addr),
+            ] {
+                anyhow::ensure!(
+                    settings.listen != addr,
+                    "web UI --listen {} collides with {what} ({addr}); pick another port",
+                    settings.listen
+                );
+            }
+            Some(
+                bind_service_port(
+                    settings.listen,
+                    "the web UI",
+                    "Free it, or pass `--listen 127.0.0.1:<port>` (env AITM_WEB_LISTEN).",
+                )
+                .await?,
+            )
+        }
+        None => None,
+    };
 
     // Server path: launch the configured engine so the browser.* commands reach
     // a live driver. No fallback to the other engine.
@@ -404,8 +430,8 @@ async fn run() -> anyhow::Result<()> {
 
         // `aitm web`: a second McpServer over the same registry and services
         // (`serve` consumes the first), driven by the bridge's `handle` calls.
-        let web_server = match web_settings {
-            Some(settings) => {
+        let web_server = match (web_settings, web_listener) {
+            (Some(settings), Some(listener)) => {
                 let bus = tui::server(&cfg, cfg.mcp.transport.clone(), &services);
                 // Operator access on the web UI is tied to `mcp.operator_token`
                 // being configured to a NON-EMPTY value (operator role exists at
@@ -434,24 +460,8 @@ async fn run() -> anyhow::Result<()> {
                         web::INSECURE_BIND_ENV
                     );
                 }
-                // The proxy and the browser's proxy port bind later in the select; a shared
-                // address would surface as a bare "address in use" there, so name it here.
-                for (what, addr) in [
-                    ("proxy listen", cfg.listen),
-                    ("browser.proxy_addr", cfg.browser.proxy_addr),
-                ] {
-                    anyhow::ensure!(
-                        settings.listen != addr,
-                        "web UI --listen {} collides with {what} ({addr}); pick another port",
-                        settings.listen
-                    );
-                }
-                let listener = bind_service_port(
-                    settings.listen,
-                    "the web UI",
-                    "Free it, or pass `--listen 127.0.0.1:<port>` (env AITM_WEB_LISTEN).",
-                )
-                .await?;
+                // The UI listener was pre-bound up front (collision checks and
+                // all), so here we just read its address and serve on it.
                 let bound = listener.local_addr()?;
                 let url = web::ui_url(bound, &settings.token);
                 // Log only the bound address; the token must never reach a
@@ -466,7 +476,7 @@ async fn run() -> anyhow::Result<()> {
                 }
                 Some((listener, state))
             }
-            None => None,
+            _ => None,
         };
         let web_run = async move {
             match web_server {
@@ -479,8 +489,8 @@ async fn run() -> anyhow::Result<()> {
         // SSRF-filtered (the embedded browser dials `cfg.browser.proxy_addr`).
         // Both sockets were pre-bound above, so the accept loops just run on them.
         tokio::select! {
-            result = proxy.run_on(proxy_listener, false) => result,
-            result = proxy.run_on(browser_listener, true) => result,
+            result = proxy.run_on(proxy_listener) => result,
+            result = proxy.run_browser_on(browser_listener) => result,
             result = mcp.serve() => result,
             result = web_run => result,
             () = aitm::shutdown_signal() => {

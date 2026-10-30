@@ -870,11 +870,18 @@ mod tests {
             let tmp = TmpDir::new();
             let bin = tmp.path().join("bin");
             std::fs::create_dir_all(&bin).unwrap();
-            touch(&tmp.path().join("libexec").join("obscura"));
+            let staged = tmp.path().join("libexec").join("obscura");
+            touch(&staged);
             let found =
                 discover_binary(&ObscuraConfig::default(), None, Some(&bin), &never_on_path)
                     .unwrap();
-            assert_eq!(found, bin.join("..").join("libexec").join("obscura"));
+            // Assert the file it found resolves to the staged engine, not the
+            // exact (un-normalised) path the implementation happened to build.
+            assert_eq!(
+                std::fs::canonicalize(&found).unwrap(),
+                std::fs::canonicalize(&staged).unwrap(),
+                "discovered {found:?} should resolve to the staged libexec engine",
+            );
         }
 
         /// `AITM_OBSCURA_BIN` (`env_bin`) wins over the bundled paths.

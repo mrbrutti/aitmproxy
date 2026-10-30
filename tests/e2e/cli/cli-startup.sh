@@ -124,6 +124,30 @@ stop_server() {
 # Start, wait for ready, then stop — for tests that only assert startup lines.
 run_server() { local log="$1" secs="$2"; shift 2; start_server "$log" "$@"; wait_ready "$log" "$secs"; stop_server; }
 
+# Wait up to $2 seconds until something is actually accepting on 127.0.0.1:$1.
+wait_port_listening() {
+  local port="$1" secs="$2" i=0
+  while [ "$i" -lt "$((secs*4))" ]; do
+    python3 -c 'import socket,sys; s=socket.socket(); s.settimeout(0.3); sys.exit(0 if s.connect_ex(("127.0.0.1",int(sys.argv[1])))==0 else 1)' "$port" 2>/dev/null && return 0
+    sleep 0.25; i=$((i+1))
+  done
+  return 1
+}
+
+# Run a command expected to EXIT on its own (e.g. fail fast on a port conflict),
+# bounded by $2 seconds so a lost race or a regression is a FAIL, never a hang.
+# Sets RC to the exit status, or 124 if it had to be killed for exceeding $2.
+run_bounded() {
+  local log="$1" secs="$2"; shift 2
+  HOME="$HOME_DIR" "$@" >"$log" 2>&1 </dev/null &
+  local pid=$! i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    [ "$i" -ge "$((secs*4))" ] && { kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; RC=124; return; }
+    sleep 0.25; i=$((i+1))
+  done
+  wait "$pid" 2>/dev/null; RC=$?
+}
+
 in_log()  { grep -qiE "$2" "$1"; }
 
 # ===========================================================================
@@ -218,31 +242,39 @@ if [ "$code" = "200" ]; then pass "web UI reachable over HTTP (200)"; else fail 
 # ===========================================================================
 echo "### port conflict is graceful (one clear error, no success-then-crash) ###"
 
-# web: hold the proxy port, then start aitm web.
+# web: hold the proxy port (wait until it is really listening), then start aitm web.
 new_env conf_web
-holder="$(hold_port "$PROXY_PORT")"; sleep 0.5
-HOME="$HOME_DIR" "$AITM_BIN" --config "$CFG" web --no-open --listen 127.0.0.1:"$WEB_PORT" >"$ROOT/conf_web.log" 2>&1; rc=$?
-kill "$holder" 2>/dev/null
-if [ "$rc" -ne 0 ] \
-   && in_log "$ROOT/conf_web.log" "already in use" \
-   && in_log "$ROOT/conf_web.log" "$PROXY_PORT" \
-   && ! in_log "$ROOT/conf_web.log" "os error 48" \
-   && ! in_log "$ROOT/conf_web.log" "web UI \(agent\):"; then
-  pass "aitm web: one clear port error, no success line, no raw os-error, non-zero exit"
+holder="$(hold_port "$PROXY_PORT")"
+if wait_port_listening "$PROXY_PORT" 10; then
+  run_bounded "$ROOT/conf_web.log" 20 "$AITM_BIN" --config "$CFG" web --no-open --listen 127.0.0.1:"$WEB_PORT"
+  if [ "$RC" -ne 0 ] && [ "$RC" -ne 124 ] \
+     && in_log "$ROOT/conf_web.log" "already in use" \
+     && in_log "$ROOT/conf_web.log" "$PROXY_PORT" \
+     && ! in_log "$ROOT/conf_web.log" "os error 48" \
+     && ! in_log "$ROOT/conf_web.log" "web UI \(agent\):"; then
+    pass "aitm web: one clear port error, no success line, no raw os-error, non-zero exit"
+  else
+    fail "aitm web port conflict not graceful (RC=$RC)"; sed -n '1,25p' "$ROOT/conf_web.log"
+  fi
 else
-  fail "aitm web port conflict not graceful (rc=$rc)"; sed -n '1,25p' "$ROOT/conf_web.log"
+  fail "test setup: holder never listened on $PROXY_PORT"
 fi
+kill "$holder" 2>/dev/null
 
 # bare aitm (stdio MCP server): same pre-bind guard.
 new_env conf_bare
-holder="$(hold_port "$PROXY_PORT")"; sleep 0.5
-HOME="$HOME_DIR" "$AITM_BIN" --config "$CFG" </dev/null >"$ROOT/conf_bare.log" 2>&1; rc=$?
-kill "$holder" 2>/dev/null
-if [ "$rc" -ne 0 ] && in_log "$ROOT/conf_bare.log" "already in use" && ! in_log "$ROOT/conf_bare.log" "os error 48"; then
-  pass "bare aitm: clear port error, non-zero exit"
+holder="$(hold_port "$PROXY_PORT")"
+if wait_port_listening "$PROXY_PORT" 10; then
+  run_bounded "$ROOT/conf_bare.log" 20 "$AITM_BIN" --config "$CFG"
+  if [ "$RC" -ne 0 ] && [ "$RC" -ne 124 ] && in_log "$ROOT/conf_bare.log" "already in use" && ! in_log "$ROOT/conf_bare.log" "os error 48"; then
+    pass "bare aitm: clear port error, non-zero exit"
+  else
+    fail "bare aitm port conflict not graceful (RC=$RC)"; sed -n '1,25p' "$ROOT/conf_bare.log"
+  fi
 else
-  fail "bare aitm port conflict not graceful (rc=$rc)"; sed -n '1,25p' "$ROOT/conf_bare.log"
+  fail "test setup: holder never listened on $PROXY_PORT"
 fi
+kill "$holder" 2>/dev/null
 
 # ===========================================================================
 echo "### one-shot verbs and operator-token ###"

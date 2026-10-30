@@ -294,8 +294,8 @@ pub async fn run(
     });
 
     tokio::select! {
-        result = proxy.run_on(main_listener, false) => result,
-        result = proxy.run_on(browser_listener, true) => result,
+        result = proxy.run_on(main_listener) => result,
+        result = proxy.run_browser_on(browser_listener) => result,
         result = agent_serve => result,
         result = tui => result,
         () = crate::shutdown_signal() => {
