@@ -47,6 +47,11 @@ const READ_CHUNK: usize = 16 * 1024;
 /// indefinitely. It resets each read, so a legitimately slow large transfer that
 /// keeps delivering chunks is unaffected.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// The bound on the TLS handshake to an origin, on the first connection
+/// ([`HttpModule::mitm`]) and on a reconnect ([`Reconnect::connect`]) alike. The
+/// TCP dial has its own bound; without this one, an origin that accepts the
+/// connection and never answers the ClientHello would pin the task forever.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = READ_TIMEOUT;
 /// Request-line prefixes that mark a cleartext HTTP connection.
 const HTTP_METHODS: &[&str] = &[
     "GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "PATCH ", "CONNECT ", "TRACE ",
@@ -65,6 +70,9 @@ pub struct HttpModule {
     /// `SETTINGS_MAX_CONCURRENT_STREAMS` advertised to an h2 client, bounding how
     /// many streams one connection may run in parallel.
     max_concurrent_streams: usize,
+    /// How long the TLS handshake to an origin may take before it is abandoned
+    /// (see [`TLS_HANDSHAKE_TIMEOUT`]).
+    tls_handshake_timeout: std::time::Duration,
 }
 
 /// Default per-message body cap, matching `LimitConfig::default().max_body_bytes`.
@@ -95,6 +103,7 @@ impl HttpModule {
             insecure: false,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
+            tls_handshake_timeout: TLS_HANDSHAKE_TIMEOUT,
         }
     }
 
@@ -123,6 +132,13 @@ impl HttpModule {
     /// `Config.ssl_insecure`; default false verifies against the webpki roots).
     pub fn with_insecure(mut self, insecure: bool) -> Self {
         self.insecure = insecure;
+        self
+    }
+
+    /// Bound the TLS handshake to an origin at `within` (default 30 s). Not yet
+    /// wired to config.
+    pub fn with_tls_handshake_timeout(mut self, within: std::time::Duration) -> Self {
+        self.tls_handshake_timeout = within;
         self
     }
 
@@ -165,6 +181,36 @@ impl HttpModule {
         // Offer upstream exactly what the client offered (the ALPN mirror, spec §1).
         cfg.alpn_protocols = offer.to_vec();
         Ok(Arc::new(cfg))
+    }
+
+    /// Run the TLS handshake to an origin over `io`, offering `alpn`, and give up
+    /// after `tls_handshake_timeout`. The one place either upstream connection
+    /// awaits an origin handshake, so both share its bound and its error text.
+    /// `authority` (`host:port`) names the origin in the error. Dropping the
+    /// timed-out handshake drops `io`, which closes the origin's socket.
+    async fn tls_handshake<IO>(
+        &self,
+        alpn: &[Vec<u8>],
+        server_name: ServerName<'static>,
+        io: IO,
+        authority: &str,
+    ) -> Result<tokio_rustls::client::TlsStream<IO>>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin,
+    {
+        let connector = TlsConnector::from(self.upstream_tls_alpn(alpn)?);
+        match tokio::time::timeout(
+            self.tls_handshake_timeout,
+            connector.connect(server_name, io),
+        )
+        .await
+        {
+            Ok(handshake) => handshake.with_context(|| format!("TLS to upstream {authority}")),
+            Err(_elapsed) => Err(anyhow!(
+                "TLS to upstream {authority} timed out after {:?}",
+                self.tls_handshake_timeout
+            )),
+        }
     }
 
     /// A server config presenting `leaf` to the client, offering only the
@@ -266,10 +312,9 @@ impl HttpModule {
             .await?;
         let server_name = ServerName::try_from(target.host.clone())
             .map_err(|e| anyhow!("invalid upstream name {:?}: {e}", target.host))?;
-        let upstream = TlsConnector::from(self.upstream_tls_alpn(&client_alpn)?)
-            .connect(server_name.clone(), tcp)
-            .await
-            .with_context(|| format!("TLS to upstream {}", target.authority()))?;
+        let upstream = self
+            .tls_handshake(&client_alpn, server_name.clone(), tcp, &target.authority())
+            .await?;
         // What upstream agreed to; mirror it down to the client (absent ⇒ h1).
         let negotiated: Vec<u8> = upstream
             .get_ref()
@@ -863,14 +908,20 @@ impl Reconnect<'_> {
     /// `ctx.connect_upstream` exactly as the first connection did, so the scope
     /// and SSRF guard applies again. Only `http/1.1` is offered, since the
     /// tunnel is already committed to HTTP/1; a server that answers with any
-    /// other protocol fails the request rather than being bridged.
+    /// other protocol fails the request rather than being bridged. The
+    /// handshake is bounded by [`HttpModule::tls_handshake`]; a timeout fails the
+    /// request like any handshake error, and nothing is dialled afterwards.
     async fn connect(&self, ctx: &ModuleCtx) -> Result<ByteStream> {
         let tcp = ctx.connect_upstream(&self.authority, self.addr).await?;
-        let connector = TlsConnector::from(self.module.upstream_tls_alpn(&[b"http/1.1".to_vec()])?);
-        let tls = connector
-            .connect(self.server_name.clone(), tcp)
-            .await
-            .with_context(|| format!("TLS to upstream {}", self.authority))?;
+        let tls = self
+            .module
+            .tls_handshake(
+                &[b"http/1.1".to_vec()],
+                self.server_name.clone(),
+                tcp,
+                &self.authority,
+            )
+            .await?;
         // No ALPN at all is HTTP/1.1, as on the first connection.
         match tls.get_ref().1.alpn_protocol() {
             None | Some(b"http/1.1") => Ok(Box::pin(tls)),
@@ -1434,6 +1485,195 @@ mod tests {
         );
     }
 
+    // ---- the bounded upstream TLS handshake -------------------------------
+
+    /// The bound the stall tests give the handshake.
+    const SHORT_BOUND: Duration = Duration::from_millis(50);
+
+    /// The most a stall test waits for the bounded call to return. An unbounded
+    /// handshake blows through it, so it fails the test instead of hanging it.
+    const STALL_GUARD: Duration = Duration::from_secs(5);
+
+    /// A module that gives up on an origin's handshake after [`SHORT_BOUND`].
+    fn short_bound_module() -> HttpModule {
+        HttpModule::new()
+            .with_insecure(true)
+            .with_tls_handshake_timeout(SHORT_BOUND)
+    }
+
+    /// An origin that accepted the TCP connection and will never speak: our end
+    /// boxed as an upstream stream, and the origin's end. The caller must hold
+    /// the origin's end for the whole test; dropping it would be an EOF, not a
+    /// stall.
+    fn stalled_pair() -> (ByteStream, DuplexStream) {
+        let (ours, origin) = duplex(64 * 1024);
+        (Box::pin(ours), origin)
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_gives_up_on_an_origin_that_never_answers() {
+        let (io, _origin) = stalled_pair();
+        let module = short_bound_module();
+
+        let result = tokio::time::timeout(
+            STALL_GUARD,
+            module.tls_handshake(
+                &[b"http/1.1".to_vec()],
+                ServerName::try_from("origin.test").expect("name"),
+                io,
+                "origin.test:8443",
+            ),
+        )
+        .await
+        .expect("the handshake was never bounded");
+
+        let err = result
+            .err()
+            .expect("a stalled handshake must fail, not succeed");
+        assert_eq!(
+            err.to_string(),
+            "TLS to upstream origin.test:8443 timed out after 50ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_failure_keeps_its_context() {
+        let (io, origin) = stalled_pair();
+        // The origin hung up before the handshake: a prompt failure, not a stall.
+        drop(origin);
+        let module = HttpModule::new().with_insecure(true);
+
+        let result = tokio::time::timeout(
+            STALL_GUARD,
+            module.tls_handshake(
+                &[b"http/1.1".to_vec()],
+                ServerName::try_from("origin.test").expect("name"),
+                io,
+                "origin.test:8443",
+            ),
+        )
+        .await
+        .expect("a handshake against a closed peer must fail promptly");
+
+        let err = result
+            .err()
+            .expect("a handshake against a closed peer must fail");
+        assert_eq!(err.to_string(), "TLS to upstream origin.test:8443");
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_succeeds_against_a_live_origin() {
+        let (c, s) = duplex(64 * 1024);
+        let module = HttpModule::new().with_insecure(true);
+        // An origin that would pick h2 if it were offered.
+        let acceptor = TlsAcceptor::from(server_config(&[b"h2", b"http/1.1"]));
+        let offer = [b"http/1.1".to_vec()];
+
+        let (client, server) = tokio::join!(
+            module.tls_handshake(
+                &offer,
+                ServerName::try_from("origin.test").expect("name"),
+                c,
+                "origin.test:8443",
+            ),
+            acceptor.accept(s),
+        );
+
+        let client = client.expect("client handshake");
+        let server = server.expect("origin handshake");
+        // The offer reached the connector: only http/1.1 was on the table.
+        assert_eq!(client.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
+        assert_eq!(server.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
+    }
+
+    #[test]
+    fn a_new_module_bounds_the_upstream_handshake_at_the_read_timeout() {
+        let module = HttpModule::new();
+        assert_eq!(module.tls_handshake_timeout, READ_TIMEOUT);
+        assert_eq!(module.tls_handshake_timeout, Duration::from_secs(30));
+        // The other constructors share the default.
+        assert_eq!(
+            HttpModule::with_ca_config(CaConfig::default()).tls_handshake_timeout,
+            Duration::from_secs(30)
+        );
+    }
+
+    #[tokio::test]
+    async fn mitm_gives_up_on_an_origin_that_stalls_the_upstream_handshake() {
+        let (stalled, _origin) = stalled_pair();
+        let (ctx, dialed) = ctx_with(vec![stalled]);
+        let module = short_bound_module();
+
+        // A real client handshake, so the proxy side reads a real ClientHello.
+        let (client_end, proxy_side) = duplex(64 * 1024);
+        let client_cfg = HttpModule::new()
+            .with_insecure(true)
+            .upstream_tls_alpn(&[b"http/1.1".to_vec()])
+            .expect("client config");
+        let _client = tokio::spawn(async move {
+            // It ends in an error once the proxy gives up and drops its end.
+            let _ = TlsConnector::from(client_cfg)
+                .connect(
+                    ServerName::try_from("origin.test").expect("name"),
+                    client_end,
+                )
+                .await;
+        });
+        let proxy_side: ByteStream = Box::pin(proxy_side);
+
+        let result = tokio::time::timeout(
+            STALL_GUARD,
+            module.mitm(
+                Prefixed::new(proxy_side),
+                ctx,
+                unknown_peer(),
+                Some(Target {
+                    host: "origin.test".into(),
+                    port: 8443,
+                    addr: origin_addr(),
+                }),
+            ),
+        )
+        .await
+        .expect("the handshake was never bounded");
+
+        let err = result.expect_err("a stalled upstream handshake must fail the connection");
+        assert_eq!(
+            err.to_string(),
+            "TLS to upstream origin.test:8443 timed out after 50ms"
+        );
+        assert_eq!(
+            *dialed.lock().expect("dialed lock"),
+            vec![("origin.test:8443".to_string(), origin_addr())],
+            "one dial, and nothing after the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_gives_up_on_an_origin_that_stalls_the_handshake() {
+        let (stalled, _origin) = stalled_pair();
+        let (ctx, dialed) = ctx_with(vec![stalled]);
+        let module = short_bound_module();
+        let reconnect = reconnect_to(&module);
+
+        let result = tokio::time::timeout(STALL_GUARD, reconnect.connect(&ctx))
+            .await
+            .expect("the handshake was never bounded");
+
+        let err = result
+            .err()
+            .expect("a stalled handshake must fail the reconnect");
+        assert_eq!(
+            err.to_string(),
+            "TLS to upstream origin.test:8443 timed out after 50ms"
+        );
+        assert_eq!(
+            dialed.lock().expect("dialed lock").len(),
+            1,
+            "the dial went through the connector once"
+        );
+    }
+
     // ---- `serve` end to end over in-memory streams ------------------------
 
     const MAX_BODY: usize = 1024 * 1024;
@@ -1794,6 +2034,57 @@ mod tests {
             *dialed.lock().expect("dialed lock"),
             vec![("origin.test:8443".to_string(), origin_addr())],
             "exactly one dial attempt, the refused reconnect, and no fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_fails_the_request_when_the_tls_reconnect_handshake_stalls() {
+        let (first_up, first_server) = tls_pair().await;
+        // The reconnect dial succeeds, but the origin never answers the handshake.
+        let (stalled, _origin) = stalled_pair();
+        let (ctx, dialed) = ctx_with(vec![stalled]);
+        let origin1 = tokio::spawn(origin_serve(first_server, vec!["first"], true));
+        let module = short_bound_module();
+        let (mut client, proxy_side) = duplex(64 * 1024);
+
+        let serving = serve(
+            &ctx,
+            Box::pin(proxy_side),
+            Some(first_up),
+            Some(reconnect_to(&module)),
+            tunnel_conn(),
+            MAX_BODY,
+        );
+        let script = async {
+            let first = client_get(&mut client, "/one", "origin.test:8443").await;
+            origin1.await.expect("origin 1");
+            client
+                .write_all(b"GET /two HTTP/1.1\r\nHost: origin.test:8443\r\n\r\n")
+                .await
+                .expect("send");
+            let mut got = Vec::new();
+            client.read_to_end(&mut got).await.expect("read to EOF");
+            (first, got)
+        };
+        let (served, (first, got)) =
+            tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                .await
+                .expect("the handshake was never bounded");
+
+        assert_eq!(first, "first");
+        let err = served.expect_err("a stalled reconnect handshake must fail the request");
+        assert_eq!(
+            err.to_string(),
+            "TLS to upstream origin.test:8443 timed out after 50ms"
+        );
+        assert!(
+            got.is_empty(),
+            "the client must see no bytes for the failed request"
+        );
+        assert_eq!(
+            *dialed.lock().expect("dialed lock"),
+            vec![("origin.test:8443".to_string(), origin_addr())],
+            "one dial, the stalled reconnect, and no cleartext fallback"
         );
     }
 
