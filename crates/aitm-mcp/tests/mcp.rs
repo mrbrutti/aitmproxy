@@ -2745,7 +2745,7 @@ fn subscription_refusal_is_audited_but_success_is_not() {
     assert_eq!(after, 1, "a successful subscribe is not audited");
 }
 
-/// Fast-follow #3: the trusted-control allow-list on `flow.subscribe`. Under
+/// Trusted-control allow-list (agent gates fail closed), on `flow.subscribe`. Under
 /// `Paused` only the agent role is refused; `Operator` and the `Cli` subscribe
 /// (each with a push sink, so a success is distinguishable from the "no sink"
 /// error the verb returns on a non-streaming connection).
@@ -3047,50 +3047,13 @@ fn ask_without_operator_refuses() {
 }
 
 /// RF#2: an agent calling `agent.approve` is refused — it can never approve its own
-/// parked request; an operator can call it (an unknown id is a plain error, not a
-/// role refusal).
+/// parked request. Only trusted control (`Operator` and the `Cli`) clears the role
+/// gate; an unknown id is then a plain "no parked request" error, which is how a
+/// role refusal is told apart from a request that merely does not exist.
 #[test]
 fn agent_cannot_approve_own_request() {
     let srv = ask_server(Duration::from_secs(10));
-    let agent = call_as_args(
-        &srv,
-        Frontend::Mcp,
-        "agent.approve",
-        json!({"request_id": "apr_1", "allow": true}),
-    );
-    assert!(is_refused(&agent), "the agent cannot approve");
-    let text = agent["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        text.contains("cannot approve") || text.contains("agent"),
-        "the refusal names the agent: {text}"
-    );
-
-    // The operator role is not role-refused; an unknown id is a plain error.
-    let op = call_as_args(
-        &srv,
-        Frontend::Operator,
-        "agent.approve",
-        json!({"request_id": "nope", "allow": true}),
-    );
-    let text = op["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        text.contains("no parked request"),
-        "operator gets a no-such-request error, not a role refusal: {text}"
-    );
-}
-
-/// Fast-follow #3: the trusted-control allow-list on `agent.approve`. The agent
-/// role is role-refused; both human control roles (`Operator` and the `Cli`) pass
-/// the role gate and reach the parked-request table (an unknown id is then a plain
-/// "no parked request" error, which proves the role gate was cleared).
-#[test]
-fn agent_approve_is_refused_for_the_agent_only() {
-    let srv = ask_server(Duration::from_secs(10));
-    let text_of = |role: Frontend| -> String {
+    let error_text = |role: Frontend| -> String {
         let resp = call_as_args(
             &srv,
             role,
@@ -3104,11 +3067,11 @@ fn agent_approve_is_refused_for_the_agent_only() {
             .to_string()
     };
     assert!(
-        text_of(Frontend::Mcp).contains("agent cannot approve its own requests"),
+        error_text(Frontend::Mcp).contains("agent cannot approve its own requests"),
         "the agent role is role-refused"
     );
     for role in [Frontend::Operator, Frontend::Cli] {
-        let text = text_of(role);
+        let text = error_text(role);
         assert!(
             text.contains("no parked request `nope`"),
             "{role:?} clears the role gate and gets a no-such-request error: {text}"

@@ -745,7 +745,7 @@ fn is_trusted_control(role: Frontend) -> bool {
     match role {
         Frontend::Cli | Frontend::Operator => true,
         Frontend::Mcp => false,
-        _ => false,
+        _ => false, // a variant added later fails closed
     }
 }
 
@@ -1356,7 +1356,9 @@ impl McpServer {
         // push sink and the server's subscription registry — neither of which a
         // `CommandHost` can carry — so the server handles them directly instead
         // of through `Command::invoke`. They are `Read`: gated like any read
-        // (blocked only under `Paused`, and only for the agent role).
+        // (blocked only under `Paused`; only trusted control — `is_trusted_control`:
+        // Operator, Cli — bypasses, every other role, including any variant added
+        // later, is gated as an agent).
         if name == "flow.subscribe" || name == "flow.unsubscribe" {
             if let Some(reason) = self.read_refusal(conn, name) {
                 return ToolOutcome::Done(tool_error(reason));
@@ -1379,9 +1381,10 @@ impl McpServer {
                 ))
             }
         };
-        // The agent policy gate (D2), before anything runs. Only the agent role is
-        // gated; an operator or the CLI is the control and bypasses it. Under `Ask`,
-        // a Sensitive agent call is parked for operator approval rather than refused.
+        // The agent policy gate (D2), before anything runs. Only trusted control
+        // (`is_trusted_control`: Operator, Cli) bypasses it; every other role,
+        // including any variant added later, is gated as an agent. Under `Ask`, a
+        // Sensitive agent call is parked for operator approval rather than refused.
         match self.policy_decision(conn, cmd.as_ref()) {
             PolicyDecision::Allow => {}
             PolicyDecision::Refuse(reason) => return ToolOutcome::Done(tool_error(reason)),
@@ -1948,7 +1951,8 @@ fn is_operator_only(name: &str) -> bool {
 
 /// The agent-policy gate's decision for one command (spec D2/D4).
 enum PolicyDecision {
-    /// The command may run (allowed by policy, or a non-agent role).
+    /// The command may run: trusted control (`is_trusted_control`), or an agent
+    /// call the policy allows.
     Allow,
     /// The command is refused with this reason.
     Refuse(String),
@@ -2205,16 +2209,10 @@ mod tests {
         assert_eq!(probe(&probe_server()), json!("absent"));
     }
 
-    // ------------------------------------- fast-follow #3: trusted-control allow-list
+    // ------------------- trusted-control allow-list (agent gates fail closed)
 
-    /// The trusted-control allow-list: exactly the human control roles (`Cli`,
-    /// `Operator`) bypass the agent gates; the agent role (`Mcp`) is gated. This
-    /// table pins today's three variants — the fail-closed arm for a variant added
-    /// later cannot be built from outside `aitm-core` (`Frontend` is
-    /// `#[non_exhaustive]`), so it is documented on the helper. A new variant also
-    /// breaks `aitm-core`'s own build until it is classified in the wildcard-free
-    /// matches `From<Frontend> for CallerTrust` (`ctx.rs`) and `origin_label`
-    /// (`audit.rs`), which prompts its author to classify it here too.
+    /// Pins which of today's variants are trusted control; what a new variant must
+    /// update is in the "Adding a variant" note on the `Frontend` docs.
     #[test]
     fn is_trusted_control_allows_only_cli_and_operator() {
         assert!(

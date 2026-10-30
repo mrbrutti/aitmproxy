@@ -53,6 +53,16 @@ pub trait BrowserDriver: Send + Sync {
 /// Which frontend is invoking a command. A command that gates an active
 /// capability on a human being present (the `ca.*` trust-store changes) reads
 /// this from the host; the frontends never learn command names.
+///
+/// # Adding a variant
+///
+/// A new variant must be classified in each place that decides what a frontend may
+/// do: `CallerTrust::from` (this file), `origin_label` (`audit.rs`), and the MCP
+/// trust gate `is_trusted_control` (`aitm-mcp`, `server.rs`). The first two are
+/// wildcard-free matches, so `aitm-core` fails to build until you classify it. The
+/// enum is `#[non_exhaustive]`, so the compiler cannot check the MCP gate from
+/// another crate: left unclassified there, the variant is treated as an agent and
+/// gated (it fails closed).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Frontend {
