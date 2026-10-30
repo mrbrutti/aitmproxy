@@ -457,6 +457,7 @@ async fn natives_and_scripts_run_in_registration_order() {
             plugins: vec![Box::new(tier.host) as Box<dyn Plugin>],
             executor: Some(tier.executor.clone()),
             commands: vec![Box::new(tier.commands)],
+            ..ScriptWiring::default()
         },
     )
     .expect("assemble");
@@ -518,6 +519,7 @@ async fn script_command_over_frontends() {
             plugins: vec![Box::new(tier.host) as Box<dyn Plugin>],
             executor: Some(tier.executor.clone()),
             commands: vec![Box::new(tier.commands)],
+            ..ScriptWiring::default()
         },
     )
     .expect("assemble with the tagger script");
@@ -796,6 +798,7 @@ async fn poc_script_step_pass_vs_patched() {
                     plugins: Vec::new(),
                     executor: Some(tier.executor.clone()),
                     commands: vec![Box::new(tier.commands)],
+                    ..ScriptWiring::default()
                 },
             )
             .expect("assemble proxy");

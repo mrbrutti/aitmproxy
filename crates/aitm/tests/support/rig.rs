@@ -218,6 +218,7 @@ impl Rig {
                 plugins: Vec::new(),
                 executor: None,
                 commands: vec![Box::new(aitm_findings::FindingsPlugin::new())],
+                ..ScriptWiring::default()
             },
         )
         .expect("assemble the proxy with the findings store");
