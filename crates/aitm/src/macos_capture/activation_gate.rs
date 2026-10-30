@@ -50,20 +50,22 @@ impl std::error::Error for ActivationRefused {}
 
 /// Gate the macOS system-extension install/activation on the caller's origin.
 ///
-/// Human-present origins (`Frontend::Cli`, `Frontend::Operator`) may always
-/// trigger the operator action. Every other origin — the agent (`Frontend::Mcp`)
-/// and, because [`Frontend`] is `#[non_exhaustive]`, any future non-human
-/// frontend — is treated as agent-driven and refused unless the operator has set
+/// Who counts as a human-present, trusted origin is decided in one place,
+/// [`Frontend::is_trusted_control`] (which delegates to
+/// `aitm_core::CallerTrust::is_trusted_control`). A trusted origin may always
+/// trigger the operator action; every other origin is treated as agent-driven
+/// and refused unless the operator has set
 /// [`SysexActivationConfig::allow_agent_sysex_install`]. Deny-by-default: a new
-/// origin is never silently allowed through.
+/// origin is classified as an agent in `aitm-core`, so it is never silently
+/// allowed through.
 pub fn check_activation_caller(
     origin: Frontend,
     cfg: &SysexActivationConfig,
 ) -> Result<(), ActivationRefused> {
-    match origin {
-        Frontend::Cli | Frontend::Operator => Ok(()),
-        _ if cfg.allow_agent_sysex_install => Ok(()),
-        _ => Err(ActivationRefused),
+    if origin.is_trusted_control() || cfg.allow_agent_sysex_install {
+        Ok(())
+    } else {
+        Err(ActivationRefused)
     }
 }
 
@@ -94,6 +96,30 @@ mod tests {
         let off = SysexActivationConfig::default();
         assert!(check_activation_caller(Frontend::Cli, &off).is_ok());
         assert!(check_activation_caller(Frontend::Operator, &off).is_ok());
+    }
+
+    #[test]
+    fn activation_matrix_covers_every_variant_and_flag() {
+        let off = SysexActivationConfig::default();
+        let on = SysexActivationConfig {
+            allow_agent_sysex_install: true,
+        };
+        let cells = [
+            (Frontend::Cli, off, Ok(())),
+            (Frontend::Cli, on, Ok(())),
+            (Frontend::Operator, off, Ok(())),
+            (Frontend::Operator, on, Ok(())),
+            (Frontend::Mcp, off, Err(ActivationRefused)),
+            (Frontend::Mcp, on, Ok(())),
+        ];
+        for (origin, cfg, expected) in cells {
+            assert_eq!(
+                check_activation_caller(origin, &cfg),
+                expected,
+                "origin {origin:?}, allow_agent_sysex_install {}",
+                cfg.allow_agent_sysex_install
+            );
+        }
     }
 
     #[test]
