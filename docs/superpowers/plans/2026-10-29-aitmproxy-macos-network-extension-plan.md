@@ -67,6 +67,13 @@ This plan builds the macOS capture path in three bands, in strict risk order.
   Swift/Xcode, reach Apple, or run the extension**, so every Band-C task's test
   is a Terminal-panel command with an observable pass condition. Every Band-C
   task **depends on Task 1 (the spike)**.
+  **Readiness (2026-10-29):** Band C's briefs (Tasks 10–18) are prepped and
+  dispatch-ready; they are gated on **Task 1 (the signing spike)** which is gated on
+  **Matt's Apple-portal setup (A1, confirmed he will do it)** — the two App IDs + two
+  Developer ID profiles with the NE entitlement. Decisions are locked: **C1** (A3,
+  embedded sysex), **operator-only** approval, **`/Applications`**, **Developer ID
+  direct**. Fire these coders on a user turn once the portal + spike are done; each is
+  `[Mac]`/`[Build]`, runs ONLY in the Terminal panel on a real Mac.
 - **Final gate — Task 19**, the mandatory Stage-6 security review (NE-AC18).
 
 **Parallelism.** Band-B tasks 2–9 are largely independent: each owns its own
@@ -238,8 +245,8 @@ assert the macOS path routes through it (NE-AC3); no separate choke is added. Su
   `fn check_activation_caller(origin, cfg) -> Result<(), ActivationRefused>` that
   refuses the sysex install/activation command when the caller is the **agent
   frontend** (the same caller-origin discriminator the bus already carries for
-  `ca.allow_agent_install`) and the flag is false. **Assumes OQ4's operator-only
-  default — pending Matt.**
+  `ca.allow_agent_install`) and the flag is false. **Operator-only confirmed
+  (Matt's A-answers). SHIPPED on `main` via PR #60.**
 - **Test:** `agent_cannot_trigger_sysex_install` — with default config, an
   agent-origin call returns `Err(ActivationRefused)`; an operator-origin call
   returns `Ok(())`; with `allow_agent_sysex_install = true`, the agent-origin
@@ -291,7 +298,7 @@ assert the macOS path routes through it (NE-AC3); no separate choke is added. Su
 - **Satisfies:** NE-AC5 (fail-open behaviour implemented; end-to-end verified in
   Task 18). **[Mac]/[Build].**
 - **Depends on:** Task 1 (spike).
-- **Files (C1 assumption):** `apps/mac/Extension/Aitmproxy.xcodeproj` (create),
+- **Files (C1 — confirmed, Matt's A3: sysex embedded in `Aitmproxy.app`):** `apps/mac/Extension/Aitmproxy.xcodeproj` (create),
   `apps/mac/Extension/Sources/TransparentProxyProvider.swift` (create),
   `apps/mac/Extension/Sources/main.swift` (create),
   `apps/mac/Extension/Info.plist` (create).
@@ -360,8 +367,9 @@ assert the macOS path routes through it (NE-AC3); no separate choke is added. Su
   `OSSystemExtensionManager.shared` early; keep the app alive while pending;
   surface `CaptureCapability` transitions `extension-not-installed → pending-approval
   → approved-attached → capturing`; wire the trigger to the **operator** path only
-  (agent/`Frontend::Mcp` cannot invoke it — Task 7 gate). **Assumes OQ4
-  operator-only default — pending Matt.**
+  (agent/`Frontend::Mcp` cannot invoke it — Task 7 gate). **Operator-only is
+  confirmed (Matt's A-answers); the gate is Task 7's `allow_agent_sysex_install`
+  (default off), now on `main`.**
 - **Test / pass condition (Terminal panel, real Mac):** launch the app; complete
   the two System Settings prompts (Network Extensions approve + Add Proxy
   Configurations Allow); confirm the UI capability reaches **`approved-attached`**
@@ -383,8 +391,9 @@ assert the macOS path routes through it (NE-AC3); no separate choke is added. Su
   entitlements carry the NE array + the App-ID/team claims. `build.sh`: assemble
   the sysex at `Contents/Library/SystemExtensions/<sysex-id>.systemextension`,
   copy each `embedded.provisionprofile`, **sign the sysex first (inside-out) then
-  the app**, each with an explicit `--entitlements`. Install to `/Applications`
-  (or `~/Applications` **iff** the spike proved it). Fixes today's `--force` /
+  the app**, each with an explicit `--entitlements`. Install to **`/Applications`**
+  (B3 default; the Task-1 spike confirms whether `~/Applications` also satisfies the
+  parent-bundle check). Fixes today's `--force` /
   no-`--entitlements` re-sign (the app currently ships with no entitlements).
 - **Test / pass condition (Terminal panel):** after `apps/mac/build.sh`,
   `codesign -d --entitlements :- <app>` and `… <sysex>` each show the NE array
