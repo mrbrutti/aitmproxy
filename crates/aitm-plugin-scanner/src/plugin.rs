@@ -3,12 +3,12 @@
 use crate::config::ScannerConfig;
 use aitm_core::{Plugin, Registry};
 
-/// The scanner plugin. Stage 1: it holds its config and registers nothing.
+/// The scanner plugin. It holds its config and registers the `scan.*` command
+/// set.
 ///
-/// The scanner observes no events — it drives traffic itself from commands
-/// registered in later stages — so it takes the default `Plugin::on_event`.
+/// The scanner observes no events — it drives traffic itself from commands — so
+/// it takes the default `Plugin::on_event`.
 pub struct ScannerPlugin {
-    #[allow(dead_code)] // read by the scan commands added in later tasks
     cfg: ScannerConfig,
 }
 
@@ -24,8 +24,10 @@ impl Plugin for ScannerPlugin {
         "scanner"
     }
 
-    fn load(&mut self, _reg: &mut Registry) {
-        // No commands yet; the scan command set lands in a later task.
+    fn load(&mut self, reg: &mut Registry) {
+        reg.add_command(std::sync::Arc::new(crate::commands::ScanDiscover {
+            cfg: self.cfg.clone(),
+        }));
     }
 }
 

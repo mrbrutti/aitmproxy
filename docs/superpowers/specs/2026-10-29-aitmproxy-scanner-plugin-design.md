@@ -1,6 +1,6 @@
 # Deterministic automated-scanner plugin design
 
-**Status:** draft
+**Status:** Approved (orchestrator, on Matt's greenlight, Stage 1 only)
 **Research inputs:** `docs/research/02-nuclei.md`, `docs/research/05-synthesis.md`,
 `docs/superpowers/specs/2026-10-27-aitmproxy-platform-design.md` (§Goals/Non-goals,
 the scanner-fitness seam analysis at ~1132-1162), `docs/superpowers/specs/2026-10-27-aitmproxy-poc-language-design.md`

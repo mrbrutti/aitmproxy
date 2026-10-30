@@ -117,6 +117,30 @@ pub async fn crawl(
     })
 }
 
+/// Normalize an absolute `http(s)` URL to the same canonical form the crawl
+/// records its endpoints in (lowercase scheme/host, default port elided,
+/// dot-segments removed, fragment dropped, query kept). Returns `None` for a
+/// value that is not an absolute `http(s)` URL.
+///
+/// `scan.discover` uses this to match a captured flow's request URL against the
+/// crawl's endpoint set, so the two are compared in one normal form.
+pub(crate) fn normalize_url(s: &str) -> Option<String> {
+    Url::parse(s).map(|u| u.to_string())
+}
+
+/// Bridge a `crawl` future from a synchronous command. Copied from
+/// `aitm-plugins`: on a multi-thread runtime, block in place so the blocking
+/// call cannot starve the reactor; anywhere else, drive a local executor.
+pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(h) if matches!(h.runtime_flavor(), RuntimeFlavor::MultiThread) => {
+            tokio::task::block_in_place(|| h.block_on(fut))
+        }
+        _ => futures::executor::block_on(fut),
+    }
+}
+
 /// The no-browser fallback: distinct same-origin, in-scope request URLs already
 /// in the store, in insertion order.
 fn stored_endpoints(host: &CommandHost<'_>, seed: &Url) -> CrawlOutcome {

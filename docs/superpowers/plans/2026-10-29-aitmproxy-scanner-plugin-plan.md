@@ -1,6 +1,6 @@
 # Deterministic scanner plugin implementation plan
 
-**Status:** draft
+**Status:** Approved (orchestrator, on Matt's greenlight, Stage 1 only)
 **Spec:** `docs/superpowers/specs/2026-10-29-aitmproxy-scanner-plugin-design.md`
 **Branch / worktree:** `claude/scanner-plugin-scope-6fa7ad`
 

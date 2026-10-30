@@ -1,5 +1,6 @@
 //! `aitm-plugin-scanner` — the deterministic scanner plugin (Stage 1 skeleton).
 
+pub mod commands;
 pub mod config;
 pub mod crawl;
 pub mod discover;

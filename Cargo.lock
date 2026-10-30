@@ -40,6 +40,7 @@ dependencies = [
  "aitm-plugin-maprules",
  "aitm-plugin-passthrough",
  "aitm-plugin-rhai",
+ "aitm-plugin-scanner",
  "aitm-plugin-sessionio",
  "aitm-plugin-wsctl",
  "aitm-plugins",
@@ -230,9 +231,13 @@ dependencies = [
 name = "aitm-plugin-scanner"
 version = "0.1.0"
 dependencies = [
+ "aitm",
+ "aitm-browser",
  "aitm-core",
+ "aitm-testtarget",
  "anyhow",
  "futures",
+ "tokio",
 ]
 
 [[package]]

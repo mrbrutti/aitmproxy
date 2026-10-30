@@ -28,6 +28,9 @@ aitm-plugin-wsctl.workspace = true
 aitm-plugin-sessionio.workspace = true
 aitm-plugin-passthrough.workspace = true
 aitm-plugin-maprules.workspace = true
+# The deterministic scanner (scan.discover): a command-only plugin registered in
+# `wire.rs` so discovery auto-exposes over MCP/CLI/UI.
+aitm-plugin-scanner.workspace = true
 aitm-browser.workspace = true
 aitm-ca.workspace = true
 aitm-poc.workspace = true

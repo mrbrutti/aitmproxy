@@ -11,6 +11,11 @@ workspace = true
 [dependencies]
 aitm-core = { workspace = true }
 anyhow = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 
 [dev-dependencies]
-futures = { workspace = true }
+aitm = { workspace = true }
+aitm-browser = { workspace = true }
+aitm-testtarget = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
