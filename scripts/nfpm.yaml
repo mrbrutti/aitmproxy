@@ -49,15 +49,15 @@ contents:
   - src: "${STAGEDIR}/usr/lib/aitmproxy/aitm"
     dst: "/usr/lib/aitmproxy/aitm"
     file_info:
-      mode: "0755"
+      mode: 0o755
   - src: "${STAGEDIR}/usr/lib/aitmproxy/obscura"
     dst: "/usr/lib/aitmproxy/obscura"
     file_info:
-      mode: "0755"
+      mode: 0o755
   - src: "${STAGEDIR}/usr/lib/aitmproxy/aitm-tui"
     dst: "/usr/lib/aitmproxy/aitm-tui"
     file_info:
-      mode: "0755"
+      mode: 0o755
   - src: "/usr/lib/aitmproxy/aitm"
     dst: "/usr/bin/aitm"
     type: symlink
