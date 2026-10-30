@@ -9,13 +9,17 @@
 //! attaches the same session to a managed obscura child.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use aitm_core::{BrowserConfig, BrowserDriver, ClickTarget, NavOutcome, Value};
 use chromiumoxide::browser::{Browser, BrowserConfig as CdpConfig};
 use chromiumoxide::cdp::browser_protocol::security::SetIgnoreCertificateErrorsParams;
+use chromiumoxide::cdp::js_protocol::runtime::{ExecutionContextId, RemoteObject};
+use chromiumoxide::error::CdpError;
 use chromiumoxide::handler::Handler;
+use chromiumoxide::js::Evaluation;
 use chromiumoxide::layout::Point;
 use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::future::BoxFuture;
@@ -25,6 +29,41 @@ use tokio::task::JoinHandle;
 /// Bound on the CDP `Browser.close` round trip of a graceful close; an engine
 /// that does not answer is then stopped by its launcher.
 const CDP_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Which execution context one `eval` attempt names (T5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EvalContext {
+    /// The main-frame context chromiumoxide tracks, resolved afresh for this
+    /// call rather than carried over from an earlier one.
+    Tracked,
+    /// No explicit context id: the engine evaluates in the page's live
+    /// default context, so a tracked id the engine has since discarded (as
+    /// happens with no `navigate` before the first `eval`) cannot be named.
+    PageDefault,
+}
+
+/// The engine's answer to `Runtime.evaluate` naming a context it no longer
+/// has. Both the JSON-RPC code and the message are matched, as the two
+/// engines word it differently.
+fn is_stale_context_error(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}");
+    text.contains("Cannot find context") || text.contains("-32601")
+}
+
+/// Run `attempt` against the tracked context; if the engine reports that
+/// context stale, run it once more against the page's default context and
+/// return that result. Any other error, and a second stale error, are the
+/// caller's: there is no retry loop.
+pub(crate) async fn eval_with_context_retry<F, Fut>(mut attempt: F) -> anyhow::Result<Value>
+where
+    F: FnMut(EvalContext) -> Fut,
+    Fut: Future<Output = anyhow::Result<Value>>,
+{
+    match attempt(EvalContext::Tracked).await {
+        Err(err) if is_stale_context_error(&err) => attempt(EvalContext::PageDefault).await,
+        first => first,
+    }
+}
 
 /// One connected CDP session, shared by both engines.
 pub(crate) struct CdpSession {
@@ -138,9 +177,50 @@ impl CdpSession {
         Ok(png)
     }
 
+    /// Evaluate `expr` in the page (T5): the execution context is resolved
+    /// per call, and a stale-context error earns one retry in the page's
+    /// default context (see [`eval_with_context_retry`]).
     pub(crate) async fn eval(&self, expr: &str) -> anyhow::Result<Value> {
-        let result = self.page.evaluate(expr).await?;
-        Ok(result.value().map(json_to_value).unwrap_or(Value::Null))
+        eval_with_context_retry(|ctx| self.eval_in(expr, ctx)).await
+    }
+
+    /// One `eval` attempt in `ctx`. Mirrors chromiumoxide's `Page::evaluate`
+    /// (function-vs-expression detection, awaited promises, by-value results,
+    /// a JS exception as the error) but owns the context id: chromiumoxide
+    /// substitutes its tracked id for a `None`, which is exactly what a
+    /// [`EvalContext::PageDefault`] retry must not do.
+    async fn eval_in(&self, expr: &str, ctx: EvalContext) -> anyhow::Result<Value> {
+        let context_id: Option<ExecutionContextId> = match ctx {
+            EvalContext::Tracked => self.page.execution_context().await?,
+            EvalContext::PageDefault => None,
+        };
+        let object: RemoteObject = match Evaluation::from(expr) {
+            Evaluation::Expression(mut params) => {
+                params.context_id = context_id;
+                params.await_promise = Some(true);
+                params.return_by_value = Some(true);
+                let returns = self.page.execute(params).await?.result;
+                if let Some(exception) = returns.exception_details {
+                    return Err(CdpError::JavascriptException(Box::new(exception)).into());
+                }
+                returns.result
+            }
+            Evaluation::Function(mut params) => {
+                params.execution_context_id = context_id;
+                params.await_promise = Some(true);
+                params.return_by_value = Some(true);
+                let returns = self.page.execute(params).await?.result;
+                if let Some(exception) = returns.exception_details {
+                    return Err(CdpError::JavascriptException(Box::new(exception)).into());
+                }
+                returns.result
+            }
+        };
+        Ok(object
+            .value
+            .as_ref()
+            .map(json_to_value)
+            .unwrap_or(Value::Null))
     }
 
     pub(crate) async fn get_dom(&self) -> anyhow::Result<String> {
@@ -311,6 +391,69 @@ mod tests {
             panic!("expected an object");
         };
         assert_eq!(obj.get("k"), Some(&Value::Int(3)));
+    }
+
+    /// AC10 (T5): an eval whose first attempt fails because the engine no
+    /// longer knows the execution context chromiumoxide handed us is retried
+    /// exactly once, against the page's own default context, and the retry's
+    /// value is what the caller gets.
+    #[tokio::test]
+    async fn eval_retries_on_stale_context() {
+        let seen = std::sync::Mutex::new(Vec::new());
+        let result = eval_with_context_retry(|ctx| {
+            seen.lock().expect("seen lock").push(ctx);
+            let attempt = seen.lock().expect("seen lock").len();
+            async move {
+                if attempt == 1 {
+                    Err(anyhow::anyhow!(
+                        "Error -32601: Cannot find context with specified id"
+                    ))
+                } else {
+                    Ok(Value::Int(7))
+                }
+            }
+        })
+        .await
+        .expect("the retry's value is returned");
+        assert_eq!(result, Value::Int(7));
+        assert_eq!(
+            *seen.lock().expect("seen lock"),
+            vec![EvalContext::Tracked, EvalContext::PageDefault],
+            "exactly two attempts: the tracked context, then the page default"
+        );
+    }
+
+    /// Only a stale-context error earns the retry: any other failure (a JS
+    /// exception, a dead socket) is returned as-is after one attempt.
+    #[tokio::test]
+    async fn eval_does_not_retry_other_errors() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let err = eval_with_context_retry(|_ctx| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err::<Value, _>(anyhow::anyhow!("ReferenceError: nope is not defined")) }
+        })
+        .await
+        .expect_err("a non-context error is not retried");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            err.to_string().contains("ReferenceError"),
+            "original error preserved: {err:#}"
+        );
+    }
+
+    /// A context that is gone on the retry too is the caller's error, after
+    /// exactly two attempts (no unbounded retry loop).
+    #[tokio::test]
+    async fn eval_stale_twice_returns_second_error() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let err = eval_with_context_retry(|_ctx| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err::<Value, _>(anyhow::anyhow!("Cannot find context with specified id")) }
+        })
+        .await
+        .expect_err("still stale after the retry");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(err.to_string().contains("Cannot find context"), "{err:#}");
     }
 
     /// M2-AC13: JS has one number type, and obscura serialises every number as
