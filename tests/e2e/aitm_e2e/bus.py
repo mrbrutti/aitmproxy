@@ -96,6 +96,22 @@ class BusClient:
         except ToolError as e:
             return ("error", str(e))
 
+    def confirm(self, name: str, arguments: dict | None = None):
+        """Operator two-phase confirm handshake (M4 D4): call a confirm-prompt
+        command; if it returns {status: needs_confirmation, confirm_token}, re-send
+        with the reserved `_confirm` argument. Returns the final result.
+
+        Use from an operator BusClient for ca.install/uninstall, l4.inject, etc."""
+        args = dict(arguments or {})
+        r = self.call(name, args)
+        if isinstance(r, dict) and r.get("status") == "needs_confirmation":
+            token = r.get("confirm_token")
+            if not token:
+                raise BusError(f"{name}: needs_confirmation without a confirm_token")
+            args["_confirm"] = token
+            return self.call(name, args)
+        return r
+
     # ---- JSON-RPC plumbing ----------------------------------------------
 
     def rpc(self, method: str, params: dict) -> dict:
