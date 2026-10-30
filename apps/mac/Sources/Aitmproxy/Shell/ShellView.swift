@@ -125,6 +125,7 @@ struct MainView: View {
     @ViewBuilder private var content: some View {
         switch session.page ?? .apps {
         case .overview: OverviewPanel()
+        case .scan: ScanPanel(state: session.scan)
         case .findings: FindingsPanel(state: session.poc)
         case .browser: BrowserPanel(state: session.browser)
         case .scripts: ScriptsPanel()

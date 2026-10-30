@@ -198,6 +198,9 @@ struct FlowCommands: Commands {
                 .keyboardShortcut("b", modifiers: [.command, .shift])
             Button("Scope…") { if session.page == .scope { session.scopeSheetVisible = true } else { session.show(.scope) } }
                 .keyboardShortcut("o", modifiers: [.command, .shift])
+            Button("Scan") { session.show(.scan) }
+                .keyboardShortcut("s", modifiers: [.command, .option])
+                .disabled(!session.scanEnabled)
             Divider()
             Button("Browser") { session.show(.browser) }
                 .keyboardShortcut("w", modifiers: [.command, .shift])

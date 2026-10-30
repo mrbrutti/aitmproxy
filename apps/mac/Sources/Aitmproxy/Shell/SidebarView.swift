@@ -2,8 +2,8 @@ import AitmproxyKit
 import AppKit
 import SwiftUI
 
-/// Working: Pinned, Saved · All: Apps, Domains · aitmproxy: Scope, Findings,
-/// Browser, Scripts, Agent (foundation §2.6). Flat `surface`, 28px rows,
+/// Working: Pinned, Saved · All: Apps, Domains · aitmproxy: Scope, Scan,
+/// Findings, Browser, Scripts, Agent (foundation §2.6). Flat `surface`, 28px rows,
 /// counts only on queues. Apps and Domains expand to one sub-item per
 /// client / host; a sub-item narrows the list (S-013); ⇧P pins one (S-014).
 struct SidebarView: View {
@@ -61,6 +61,8 @@ struct SidebarView: View {
 
                     group("aitmproxy")
                     item(.scope, count: session.scopeHosts.count, queue: true)
+                    // Offered only when the core lists scan.discover; the count is the injection points found.
+                    if session.scanEnabled { item(.scan, count: session.scan.points.count, queue: true) }
                     item(.findings, count: session.findingsCount, queue: true)
                     item(.browser, text: session.browserTabs == 1 ? "1 tab" : "\(session.browserTabs) tabs")
                     item(.scripts, text: "\(session.activeScripts) active")
