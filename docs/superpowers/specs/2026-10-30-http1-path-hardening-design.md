@@ -96,8 +96,9 @@ guard. It also scopes (does not fix) the same stale-connection exposure in
   cleartext tunnel (`conn.scheme == "http"`) for two reasons: a TLS h1 tunnel keeps
   its pre-existing silent ignore (F2), and the Host-versus-tunnel comparison assumes
   default port 80, which would misreport a portless same-host rewrite inside an
-  HTTPS tunnel (Architect's call 11). The `debug` site is a `Host`-versus-tunnel
-  mismatch; it names the tunnel authority only (call 12).
+  HTTPS tunnel (Architect's call 11). The `debug` site is emitted when a dial is made
+  for a request whose authority differs from the tunnel target; it names the tunnel
+  authority only (call 12).
 - Rust gate: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`.
 - `unsafe` is forbidden workspace-wide; none is needed.
 - Only `module.rs`, `sansio.rs`, their tests, and one new test file change. `h2.rs`,
@@ -169,8 +170,8 @@ anti-goal. h2 already records the client's `:authority` while dialling the pinne
 origin, so this makes h1 cleartext consistent with h2. One consequence, stated so it
 is not a surprise: `flow.replay` re-sends to the recorded authority, so replaying a
 mismatched-`Host` flow goes to the `Host`, through the scope guard, not to the
-tunnel target. When a request's authority differs from the tunnel target (compared
-case-insensitively with default port 80 applied), the proxy logs one `tracing::debug!`
+tunnel target. When a dial is made for a request whose authority differs from the tunnel
+target (compared case-insensitively with default port 80 applied), the proxy logs one `tracing::debug!`
 naming the tunnel authority only (Architect's call 12). The request's own authority is
 client text, and an absolute-form target keeps its URL userinfo in `request.authority`
 (`http://user:secret@x/`), so logging it would put credentials in a log
@@ -212,8 +213,10 @@ are redundant and are removed; a cleartext tunnel with no upstream simply flows 
 the ordinary connect step, which dials the tunnel target. The existing test
 `serve_redials_a_cleartext_tunnel_to_the_origin_it_was_opened_to` keeps its
 assertions (only its `Conn` construction changes) and still proves the redial case.
-`current_authority` stays (it drives the non-tunnel authority-change check and the
-debug log).
+`current_authority` stays (it drives the non-tunnel authority-change check, the
+existing "discarding an upstream connection" debug line, and the `authority` field of
+the surplus `warn` (`module.rs` ~727, ~760, ~958). It does NOT feed the
+Host-versus-tunnel debug, which logs the tunnel authority only).
 
 ### Defect 2: a stray response in the same upstream read is forwarded
 
@@ -254,8 +257,9 @@ this defect is the same-read case, which the probe cannot see.
    without bound; the same class of bug `short_circuit_done` was added for). That `Err`
 must never fire on the surplus behind a legitimate response, because the caller's
 `on_bytes(...)?` would drop the whole `Vec`, tail included. The surplus is part of one
-socket read, so the cap is safe exactly while a read is smaller than the cap. A
-compile-time assert in `module.rs` encodes that invariant:
+socket read, so the cap is safe while a read is no larger than the cap (the machine
+errors only when parked bytes EXCEED `MAX_HEAD_BYTES`). The assert is stricter by one,
+as a margin. A compile-time assert in `module.rs` encodes that invariant:
 `const _: () = assert!(READ_CHUNK < crate::sansio::MAX_HEAD_BYTES)` (`MAX_HEAD_BYTES`
 is now `pub(crate)`). A later change to either constant that breaks the invariant
 fails the build instead of failing connections at run time (Architect's call 15). The 101
@@ -421,7 +425,7 @@ Defect 1 (tunnel target)
 15. AC15: In a cleartext tunnel opened to `127.0.0.1:8080`, a first request with `Host: 127.0.0.1:9090` dials exactly `("127.0.0.1:8080", 127.0.0.1:8080)` and is answered by that origin (unit). Over loopback, with a `CONNECT` target origin A and a different `Host` origin B, A accepts one connection and B accepts none.
 16. AC16: Two requests in one tunnel naming different `Host`s share one upstream connection (one dial); after the origin closes it, the redial goes to the tunnel target (`serve_redials_a_cleartext_tunnel_to_the_origin_it_was_opened_to` passes with its assertions unchanged).
 17. AC17: For a request in a tunnel the stored flow has `request.authority` equal to the `Host` value (the tunnel authority when the request has no `Host`) and `server_conn.peer` equal to the tunnel address. For a request whose `Host` equals the tunnel target the stored flow is field-for-field what it was before this change.
-18. AC18: A plugin that rewrites `request.authority` and `Host` during `Event::Request` does not retarget a cleartext tunnel: the dial is still the tunnel target, and the stored flow keeps the rewritten authority. When the flow carries the `map-remote` mark and the rewritten authority differs from the tunnel target, exactly one `warn` is logged for the request, whose only field is the tunnel authority (the rewritten authority and any userinfo in it never appear); a request that is unmarked, or whose rewrite names the tunnel target, logs none (call 11).
+18. AC18: A plugin that rewrites `request.authority` and `Host` during `Event::Request` does not retarget a cleartext tunnel: the dial is still the tunnel target, and the stored flow keeps the rewritten authority. When the flow carries the `map-remote` mark and the rewritten authority differs from the tunnel target, exactly one `warn` is logged for the request, whose only field is the tunnel authority (the rewritten authority and any userinfo in it never appear); a request that is unmarked, or whose rewrite names the tunnel target, logs none (call 11). Inside a TLS tunnel the Map Remote `warn` is not emitted at all (`serve_does_not_warn_about_map_remote_inside_a_tls_tunnel`).
 19. AC19: Outside a tunnel (`tunnel_authority` None) the dial is still the request's authority, and a change of authority between requests still replaces the connection (the existing tests `serve_replaces_an_upstream_the_origin_closed` and `serve_drops_response_bytes_left_over_when_the_authority_changes` pass unchanged).
 20. AC20: A tunnel opened to an IPv6 literal dials the resolved address recorded at `CONNECT` time (`[::1]:8080` in the test), with no re-parse of the authority string.
 
@@ -587,7 +591,8 @@ sites.
   are set together, `h2.rs` is not touched, and `Conn::plain(peer, None)` call sites
   keep compiling.
 - The name and storage of the "tainted" flag, and the wording of the `warn`, `debug`
-  and error strings other than the timeout message fixed in AC1.
+  and error strings other than the timeout message fixed in AC1 and the substring
+  `no resolved CONNECT address` fixed in AC25.
 - Whether to add a small `fn` for the Host-versus-tunnel comparison, or inline it.
 - Whether the shared handshake helper lives as a method on `HttpModule` or a free
   function taking the timeout, provided the field and
@@ -602,7 +607,7 @@ None. Every decision above that Matt could reasonably reverse is marked
 
 1. Defect 1: dial the `CONNECT` target; `Host` is never routing input in a tunnel; do not require `Host == CONNECT target`.
 2. Defect 1: pin the resolved address (`Conn.tunnel_addr`) instead of re-resolving.
-3. Defect 1: `HttpRequest.authority` keeps the `Host` value; `server_conn.peer` shows the destination; one `debug` log on mismatch.
+3. Defect 1: `HttpRequest.authority` keeps the `Host` value; `server_conn.peer` shows the destination; one `debug` log when a dial is made for a request whose authority differs from the tunnel target.
 4. Defect 1: Map Remote / plugin authority rewrites no longer retarget a cleartext tunnel (changes the first-request-only accident; follow-up F2). Alternative on request: honour the `map-remote` mark.
 5. Defect 2: guard in the machine (parse a response head only while a request awaits one) plus surplus handling in `serve`; cap on the parked buffer.
 6. Defect 2: a tainted upstream is replaced through the existing stale path; never set `upstream = None` directly.
