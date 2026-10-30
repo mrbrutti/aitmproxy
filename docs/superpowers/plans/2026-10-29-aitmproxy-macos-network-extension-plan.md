@@ -134,8 +134,8 @@ the spec's recommended default and flags it).**
 ### Task 2: macOS capture-backend adapter → `CaptureIngress` (folds old Tasks 2–4)
 
 - **Satisfies:** NE-AC1, NE-AC2, NE-AC3.
-- **Depends on:** `CaptureIngress` (on `main`, PR #47) **and Task 8** (which pins the
-  handoff flow representation this adapter maps from). **Deferred until Task 8 lands.**
+- **Depends on:** `CaptureIngress` **and Task 8 — both now on `main`** (PR #47 and
+  PR #60). **Launchable now;** cut the worktree from current `main`.
 - **Scope note (why this folds old Tasks 2–4):** the ingress TCP/UDP dispatch,
   deny-by-default, authoritative-dst `NextLayerHint`, and in-scope-unclaimed passthrough
   **already exist on `main`** (prereq plan, PR #47). This task is the **thin macOS
@@ -148,14 +148,22 @@ the spec's recommended default and flags it).**
   `crates/aitm/src/macos_capture/mod.rs` (create-or-extend — `mod adapter;`; trivial
   parallel-merge with the other Band-B tasks' one-line appends),
   `crates/aitm/src/ingress.rs` (modify — carry-over Minor fixes only, below).
-- **Change:** map Task 8's per-flow handoff (control-channel `NewFlow` metadata + the
-  per-flow data socket) to the ingress types **defined in `crates/aitm/src/ingress.rs`**:
-  build `CapturedTcpFlow { stream, dst, sni, first_bytes, peer_identity }` and
-  `CapturedUdpFlow { target, datagrams, peer_identity }`, mapping the macOS
-  `source_app: SourceAppId` → `peer_identity: Option<String>`; then call
+- **Change:** consume Task 8's landed handoff in `crate::macos_capture::listener`:
+  accept the provider's control channel (`CaptureListener::accept_control` →
+  `ControlChannel`), read each `ControlMessage::FlowOpen { flow_id, kind, remote,
+  remote_hostname, source_app, local }`, and take its per-flow data socket
+  (`accept_data` → `DataConnection`, correlated by `flow_id`). Map onto the ingress
+  types **defined in `crates/aitm/src/ingress.rs`** (do not redeclare): for `FlowKind::Tcp`,
+  build `CapturedTcpFlow { stream, dst, sni, first_bytes, peer_identity }` from
+  `remote → dst`, `remote_hostname → sni`, `source_app → peer_identity`,
+  `DataConnection::into_stream() → stream` (peeking its leading bytes for `first_bytes`);
+  for `FlowKind::Udp`, build `CapturedUdpFlow { target, datagrams, peer_identity }` from
+  `remote → target` and `DataConnection::recv_datagram` → `datagrams`. Then call
   `dispatch_captured_tcp(&CoreIngress, flow)` (TCP) and `CoreIngress::dispatch_udp(&flow)`
   (UDP). **No new guard** — deny-by-default is enforced inside the ingress (`dispatch_tcp`
-  refuses out-of-scope before any dispatch; `dispatch_udp` via `L4Guard`).
+  refuses out-of-scope before any dispatch; `dispatch_udp` via `L4Guard`). Validate
+  `Hello.protocol_version` here (the version check the listener deferred to the adapter)
+  and refuse a mismatch.
   **Carry-over Minors from the PR #47 panel, fix here in `ingress.rs`:** (b) log the
   module-spawn error the way `handle_conn` does, and dedup the duplicated hint/ctx block;
   (c) add the passthrough dial-failure test; (d) drop the needless `first_bytes` clone.
@@ -264,7 +272,7 @@ assert the macOS path routes through it (NE-AC3); no separate choke is added. Su
 ### Task 9: No CA key reaches the capture backend
 
 - **Satisfies:** NE-AC16 (Rust / no-key side).
-- **Depends on:** Task 8 (uses the control hello + listener).
+- **Depends on:** Task 8 — **on `main`** (PR #60). **Launchable now;** cut from current `main`.
 - **Files:** `crates/aitm/tests/macos_capture_no_key.rs` (create). (Behavioural
   assertion only; no production change expected if Tasks 2 & 8 already exclude
   the key.)
