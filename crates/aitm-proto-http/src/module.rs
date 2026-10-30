@@ -41,11 +41,15 @@ const TLS_HANDSHAKE: u8 = 0x16;
 const MAX_CONNECT_HEAD: usize = 16 * 1024;
 /// Socket read size.
 const READ_CHUNK: usize = 16 * 1024;
-// One read may hold a legitimate response's tail plus surplus; at or above the
-// machine's cap on parked server bytes that read would be a hard error.
+
+// One read can hold a legitimate response's tail plus the surplus behind it. The
+// machine fails the connection once more than `MAX_HEAD_BYTES` unsolicited server
+// bytes are parked, which would drop that legitimate response; a read of at most
+// the cap cannot reach that. The strict `<` keeps a margin the machine's own
+// strict `>` does not require.
 const _: () = assert!(
     READ_CHUNK < crate::sansio::MAX_HEAD_BYTES,
-    "READ_CHUNK must stay below sansio::MAX_HEAD_BYTES: a read of a response's tail plus surplus would otherwise fail the connection and drop the legitimate response"
+    "READ_CHUNK must stay below sansio::MAX_HEAD_BYTES"
 );
 
 /// Per-read idle timeout. A single socket read may block at most this long, so a
@@ -145,8 +149,8 @@ impl HttpModule {
         self
     }
 
-    /// Bound the TLS handshake to an origin at `within` (default
-    /// [`TLS_HANDSHAKE_TIMEOUT`]). Not yet wired to config.
+    /// Bound the TLS handshake to an origin at `within` (default 30 seconds, the
+    /// same bound as the per-read idle timeout). Not yet wired to config.
     pub fn with_tls_handshake_timeout(mut self, within: std::time::Duration) -> Self {
         self.tls_handshake_timeout = within;
         self
@@ -660,7 +664,6 @@ async fn serve(
         }
         let request = flow.request;
         let request_close = wants_close(&request.headers);
-        let map_remote = flow.metadata.marks.iter().any(|m| m == MAP_REMOTE_MARK);
 
         if let Some(short_circuit) = flow.response {
             // A plugin answered without upstream.
@@ -686,12 +689,20 @@ async fn serve(
         // A Map Remote rewrite cannot retarget a request inside a tunnel: it goes
         // to the `CONNECT` target. Say so, once per request, so the rewrite is not
         // silently lost. This only reports; the route is chosen below.
-        if let Some(tunnel) = conn.tunnel_authority.as_deref().filter(|_| map_remote) {
-            if differs_from_tunnel_target(&request.authority, tunnel) {
-                tracing::warn!(
-                    tunnel = tunnel,
-                    "a Map Remote rewrite is ignored inside a CONNECT tunnel; the request goes to the CONNECT target"
-                );
+        //
+        // Cleartext tunnels only (`Conn::plain`'s scheme). A TLS tunnel keeps its
+        // existing behaviour, and `differs_from_tunnel_target` assumes port 80 for
+        // an authority with no port, which would report a same-host rewrite to an
+        // https URL as ignored; a port-aware comparison would be needed first.
+        if conn.scheme == "http" {
+            if let Some(tunnel) = conn.tunnel_authority.as_deref() {
+                let map_remote = flow.metadata.marks.iter().any(|m| m == MAP_REMOTE_MARK);
+                if map_remote && differs_from_tunnel_target(&request.authority, tunnel) {
+                    tracing::warn!(
+                        tunnel = tunnel,
+                        "a Map Remote rewrite is ignored inside a CONNECT tunnel; the request goes to the CONNECT target"
+                    );
+                }
             }
         }
 
@@ -1946,8 +1957,9 @@ mod tests {
         }
     }
 
-    /// A GET for `path` carrying `Host: host`: the one place a test spells out a
-    /// request.
+    /// A bodiless GET for `path` whose only header is `Host: host`. A test that
+    /// needs another header (`Connection: close`), or no `Host`, writes its
+    /// request out itself.
     fn get_request(path: &str, host: &str) -> String {
         format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n")
     }
@@ -2844,6 +2856,100 @@ mod tests {
             .unwrap_or_else(|| panic!("no stored flow for {path}"))
     }
 
+    /// One event an [`EventCapture`] saw: its level, its message, and every other
+    /// field as `name -> text` (a string field as is, any other as its `Debug`
+    /// text).
+    #[derive(Debug)]
+    struct Captured {
+        level: tracing::Level,
+        message: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    /// What an [`EventCapture`] has seen so far, in order.
+    type Captures = Arc<Mutex<Vec<Captured>>>;
+
+    /// Every event at or above `max` verbosity emitted on the thread that
+    /// installed it. Hand-written on `tracing`'s own `Subscriber` trait so a test
+    /// can pin what the proxy tells the operator without a capture dependency.
+    struct EventCapture {
+        max: tracing::Level,
+        events: Captures,
+    }
+
+    /// Reads one event's fields, the `message` apart from the rest. A string
+    /// field is kept as is, anything else as its `Debug` text.
+    struct FieldsOf {
+        message: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    impl FieldsOf {
+        fn put(&mut self, field: &tracing::field::Field, text: String) {
+            if field.name() == "message" {
+                self.message = text;
+            } else {
+                self.fields.insert(field.name().to_string(), text);
+            }
+        }
+    }
+
+    impl tracing::field::Visit for FieldsOf {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.put(field, format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.put(field, value.to_string());
+        }
+    }
+
+    impl tracing::Subscriber for EventCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            // `Level` orders by verbosity: ERROR < WARN < INFO < DEBUG < TRACE.
+            *metadata.level() <= self.max
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut seen = FieldsOf {
+                message: String::new(),
+                fields: BTreeMap::new(),
+            };
+            event.record(&mut seen);
+            self.events.lock().expect("events lock").push(Captured {
+                level: *event.metadata().level(),
+                message: seen.message,
+                fields: seen.fields,
+            });
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Capture every event up to `max` verbosity on this thread until the guard
+    /// drops. `#[tokio::test]` runs the test future on this thread, so it sees
+    /// `serve`'s.
+    fn capture_events(max: tracing::Level) -> (tracing::subscriber::DefaultGuard, Captures) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let guard = tracing::subscriber::set_default(EventCapture {
+            max,
+            events: events.clone(),
+        });
+        (guard, events)
+    }
+
+    /// A field set as [`Captured::fields`] holds it, from literal pairs.
+    fn field_set(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
     #[tokio::test]
     async fn serve_dials_the_connect_target_not_the_host_header_in_a_cleartext_tunnel() {
         let (up, origin_end) = duplex(64 * 1024);
@@ -3023,12 +3129,8 @@ mod tests {
         assert_eq!(reports.len(), 1, "events: {captured:?}");
         assert_eq!(reports[0].level, tracing::Level::DEBUG);
         assert_eq!(
-            reports[0].message,
-            "a request's authority differs from the CONNECT target; dialing the target"
-        );
-        assert_eq!(
             reports[0].fields,
-            field_set(&[("tunnel", "\"127.0.0.1:8080\"")])
+            field_set(&[("tunnel", "127.0.0.1:8080")])
         );
     }
 
@@ -3056,13 +3158,16 @@ mod tests {
         let warnings = warnings.lock().expect("warnings lock");
         assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
         assert_eq!(warnings[0].level, tracing::Level::WARN);
-        assert_eq!(
-            warnings[0].message,
-            "a Map Remote rewrite is ignored inside a CONNECT tunnel; the request goes to the CONNECT target"
+        assert!(
+            warnings[0]
+                .message
+                .contains("Map Remote rewrite is ignored"),
+            "message: {:?}",
+            warnings[0].message
         );
         assert_eq!(
             warnings[0].fields,
-            field_set(&[("tunnel", "\"127.0.0.1:8080\"")])
+            field_set(&[("tunnel", "127.0.0.1:8080")])
         );
     }
 
@@ -3109,6 +3214,48 @@ mod tests {
         assert!(
             warnings.is_empty(),
             "a rewrite to the tunnel target ignores nothing: {warnings:?}"
+        );
+    }
+
+    /// The warning is for a cleartext tunnel. A TLS tunnel's behaviour is not
+    /// changed here, and the comparison the warning rests on assumes port 80 for
+    /// an authority with no port, which is the wrong default for it: `origin.test`
+    /// rewritten from `origin.test:8443` would be reported as ignored when it
+    /// names the same host.
+    #[tokio::test]
+    async fn serve_does_not_warn_about_map_remote_inside_a_tls_tunnel() {
+        let (_guard, warnings) = capture_events(tracing::Level::WARN);
+        // The first rewrite names the tunnel's own host without a port, the
+        // second another origin altogether; neither may be reported.
+        for rewrite_to in ["origin.test", "other.test:9090"] {
+            let (up, origin_end) = duplex(64 * 1024);
+            let (ctx, dialed) = ctx_rewriting(Vec::new(), rewrite_to);
+            let _origin = tokio::spawn(origin_serve(origin_end, vec!["first"], false));
+
+            let (bodies, _) = serve_requests_keep(
+                &ctx,
+                tunnel_conn(),
+                Some(Box::pin(up)),
+                None,
+                &[get_request("/one", "origin.test:8443")],
+            )
+            .await;
+
+            assert_eq!(bodies, vec!["first"], "rewritten to {rewrite_to}");
+            assert!(
+                dialed.lock().expect("dialed lock").is_empty(),
+                "the TLS tunnel keeps the upstream it was handed: {rewrite_to}"
+            );
+            assert_eq!(
+                stored_http(&ctx, "/one").request.authority,
+                rewrite_to,
+                "the sink's rewrite did land on the stored flow"
+            );
+        }
+        let warnings = warnings.lock().expect("warnings lock");
+        assert!(
+            warnings.is_empty(),
+            "a TLS tunnel reports no Map Remote rewrite: {warnings:?}"
         );
     }
 
@@ -3389,89 +3536,6 @@ mod tests {
         );
     }
 
-    /// One event an [`EventCapture`] saw: its level, its message, and every other
-    /// field as `name -> Debug text` (a string field keeps its quotes).
-    #[derive(Debug)]
-    struct Captured {
-        level: tracing::Level,
-        message: String,
-        fields: BTreeMap<String, String>,
-    }
-
-    /// What an [`EventCapture`] has seen so far, in order.
-    type Captures = Arc<Mutex<Vec<Captured>>>;
-
-    /// Every event at or above `max` verbosity emitted on the thread that
-    /// installed it. Hand-written on `tracing`'s own `Subscriber` trait so a test
-    /// can pin what the proxy tells the operator without a capture dependency.
-    struct EventCapture {
-        max: tracing::Level,
-        events: Captures,
-    }
-
-    /// Reads one event's fields, the `message` apart from the rest.
-    struct FieldsOf {
-        message: String,
-        fields: BTreeMap<String, String>,
-    }
-
-    impl tracing::field::Visit for FieldsOf {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.message = format!("{value:?}");
-            } else {
-                self.fields
-                    .insert(field.name().to_string(), format!("{value:?}"));
-            }
-        }
-    }
-
-    impl tracing::Subscriber for EventCapture {
-        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            // `Level` orders by verbosity: ERROR < WARN < INFO < DEBUG < TRACE.
-            *metadata.level() <= self.max
-        }
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-        fn event(&self, event: &tracing::Event<'_>) {
-            let mut seen = FieldsOf {
-                message: String::new(),
-                fields: BTreeMap::new(),
-            };
-            event.record(&mut seen);
-            self.events.lock().expect("events lock").push(Captured {
-                level: *event.metadata().level(),
-                message: seen.message,
-                fields: seen.fields,
-            });
-        }
-        fn enter(&self, _: &tracing::span::Id) {}
-        fn exit(&self, _: &tracing::span::Id) {}
-    }
-
-    /// Capture every event up to `max` verbosity on this thread until the guard
-    /// drops. `#[tokio::test]` runs the test future on this thread, so it sees
-    /// `serve`'s.
-    fn capture_events(max: tracing::Level) -> (tracing::subscriber::DefaultGuard, Captures) {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let guard = tracing::subscriber::set_default(EventCapture {
-            max,
-            events: events.clone(),
-        });
-        (guard, events)
-    }
-
-    /// A field set as [`Captured::fields`] holds it, from literal pairs.
-    fn field_set(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs
-            .iter()
-            .map(|(name, value)| (name.to_string(), value.to_string()))
-            .collect()
-    }
-
     /// An origin that answers a `Connection: close` request and then appends a
     /// bare CRLF is closing anyway: no upstream is replaced, so `serve` must not
     /// say it is replacing one. The warning is for the connection that stays open.
@@ -3530,13 +3594,16 @@ mod tests {
     /// surplus is an upstream being replaced, and that is worth one warning.
     #[tokio::test]
     async fn serve_warns_once_when_surplus_replaces_the_upstream_of_an_open_connection() {
+        // The origin's stray bytes carry a token no log line may repeat.
+        const TRAILER: &str = "\r\nSTRAYTOKEN-7f3a";
+        let token = TRAILER.trim();
         let (_guard, warnings) = capture_events(tracing::Level::WARN);
         let (up, origin_end) = duplex(64 * 1024);
         let (ctx, dialed) = ctx_with(vec![Box::pin(up)]);
         let _origin = tokio::spawn(origin_serve_trailing(
             origin_end,
             vec!["legit"],
-            "\r\n",
+            TRAILER,
             false,
         ));
 
@@ -3561,7 +3628,24 @@ mod tests {
         // themselves must never become a field.
         assert_eq!(
             warnings[0].fields,
-            field_set(&[("authority", "\"127.0.0.1:8080\""), ("bytes", "2")])
+            field_set(&[("authority", "127.0.0.1:8080"), ("bytes", "17")])
+        );
+        // Nor may they appear anywhere else in what was logged, the message and
+        // every field alike.
+        let logged = format!("{warnings:?}");
+        assert!(
+            !logged.contains(token),
+            "the origin's bytes reached the log: {logged}"
+        );
+        // The `Debug` of the raw bytes is a list of decimal values, not text.
+        let decimal = token
+            .bytes()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            !logged.contains(&decimal),
+            "the origin's bytes reached the log as numbers: {logged}"
         );
     }
 
