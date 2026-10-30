@@ -42,12 +42,19 @@ test-first and leaves the full gate green.
 
 ### Task 2: confinement branch in `ssrf_check`
 
-- **Satisfies:** AC1, AC2, AC3, AC4, AC5
+- **Satisfies:** AC1, AC2, AC3, AC4, AC5, AC10
 - **Depends on:** none (pure-function change; may run parallel to Task 1)
-- **Files:** `crates/aitm-core/src/guard.rs` (modify `ssrf_check`; update its one
-  production call site is Task 3, but update existing **test** call sites here to
-  pass the new arg), `crates/aitm-core/tests/ssrf.rs` (modify: thread the new arg
-  through existing cases as `false`; add the confinement cases).
+- **Files:** `crates/aitm-core/src/guard.rs` (modify `ssrf_check`),
+  `crates/aitm-core/tests/ssrf.rs` (create: the confinement cases),
+  `crates/aitm-core/tests/guard.rs` (modify: thread the new `false` arg through
+  the 12 pre-existing `ssrf_check` cases — this, not a pre-existing `tests/ssrf.rs`,
+  is where they live), and the **two non-browser production callers** pass `false`:
+  `crates/aitm-proto-http/src/sender.rs` (reissue sender — active path, not
+  confined per the anti-goal) and `crates/aitm-browser/src/ssrf.rs` (`browser.navigate`
+  pre-flight — authoritative gate is the connector). `crates/aitm-core/src/proxy.rs`
+  carries a `false` stub here, swapped for the live posture in Task 3. *(Resolved
+  during implementation: `ssrf_check` had three production callers, not one; see
+  the spec's "`ssrf_check`'s other callers" section.)*
 - **Change:** add `confine_to_scope: bool` as the 3rd parameter of `ssrf_check`
   (after `scope`, before `authority`). In the `if !blocked` branch, before
   `return Ok(())`, insert: `if confine_to_scope && !scope.iter().any(|e|
