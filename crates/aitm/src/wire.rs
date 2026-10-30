@@ -31,6 +31,8 @@ use aitm_plugins::{
 };
 use aitm_proto_http::{CertAuthority, HttpModule};
 use aitm_proto_l4::config::L4Config;
+use aitm_proto_l4::flow::L4FlowStore;
+use aitm_proto_l4::guard::L4Guard;
 use aitm_proto_l4::{L4Module, L4Privilege};
 use aitm_proto_ws::{InjectRegistry, WsModule};
 use tracing::{info, warn};
@@ -52,6 +54,23 @@ pub struct Features {
     /// An explicit L4 capability-probe result. `None` (production default) runs the
     /// real cheap startup probe; tests force a known privilege state here.
     pub l4_privilege: Option<L4Privilege>,
+    /// A pre-built, shared L4 guard + flow store the `l4.*` command module must act
+    /// over. `None` (every caller using `..Features::default()`) ⇒ the module builds
+    /// its own; `Some` ⇒ the binary already built the state and installed a live
+    /// [`L4Language`](aitm_proto_l4::L4Language) over the **same** guard/store on the
+    /// scripting engine, so a script's `l4.scope.add` and the bus see one state (no
+    /// divergent L4 engagement state).
+    pub l4_shared: Option<L4Shared>,
+}
+
+/// A shared L4 guard + flow store, built once by the binary and threaded into both
+/// the `l4.*` command module ([`Features::l4_shared`]) and the live
+/// [`L4Language`](aitm_proto_l4::L4Language) on the scripting engine, so both faces
+/// act over one L4 engagement state.
+#[derive(Clone)]
+pub struct L4Shared {
+    pub guard: Arc<L4Guard>,
+    pub store: Arc<dyn L4FlowStore>,
 }
 
 impl Default for Features {
@@ -61,6 +80,7 @@ impl Default for Features {
             ca_plugin: None,
             l4: L4Config::default(),
             l4_privilege: None,
+            l4_shared: None,
         }
     }
 }
@@ -274,7 +294,18 @@ pub fn assemble_with_scripts(
                  L4Unavailable"
             ),
         }
-        let module = L4Module::with_privilege(&features.l4, privilege);
+        // When the binary pre-built the L4 state (so the scripting engine's live
+        // `L4Language` shares it), build the module over that same guard + store;
+        // otherwise the module owns its own. Either way the privilege gate stands.
+        let module = match &features.l4_shared {
+            Some(shared) => L4Module::with_shared(
+                shared.guard.clone(),
+                shared.store.clone(),
+                features.l4.intercept.clone(),
+                privilege,
+            ),
+            None => L4Module::with_privilege(&features.l4, privilege),
+        };
         l4_half = Some((module.guard(), module.store()));
         builder = builder.register_plugin(Box::new(module));
     }

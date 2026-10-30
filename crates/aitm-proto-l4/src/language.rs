@@ -21,8 +21,12 @@
 //!
 //! 1. The **agent gate** (`l4.allow_agent_*`) is enforced here, in
 //!    [`agent_gate_check`], exactly as the command path's
-//!    [`L4AgentGate`](crate::commands) enforces it — but only when the engine is
-//!    **agent-sourced** (`Frontend::Mcp`), never for operator-authored scripts.
+//!    [`L4AgentGate`](crate::commands) enforces it — but only when **this call's
+//!    live caller trust** is [`Agent`](aitm_core::CallerTrust::Agent)
+//!    (`Frontend::Mcp`), never for an operator caller. The trust is read per call
+//!    (`HostCallCtx::caller()` for the Rhai face, `PocStepInputs::caller` for the
+//!    `l4:` step), so the one shared engine gates each invocation on its real
+//!    caller rather than any build-time snapshot.
 //!    The verb→gate map is the command path's `gate_for`: `inject` / `send_recv`
 //!    → [`AgentGate::Inject`]; `scope.add`'s **widen** gate is enforced inside
 //!    [`L4Guard::add_runtime_scope`] for every runtime caller (so it is not an
@@ -60,7 +64,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use aitm_core::Value;
+use aitm_core::{CallerTrust, Value};
 use aitm_plugin::language::{
     GuardHandle, Guarded, HostCallCtx, HostError, HostFn, HostFnSig, NamespaceCatalog, ParamSig,
     PocStepHandler, PocStepInputs, PocStepOutcome, PocStepSchema, ProtocolLanguage, RegisterError,
@@ -147,22 +151,23 @@ struct L4Live {
 /// `api_version()`.
 pub struct L4Language {
     live: L4Live,
-    /// Whether the engine this language is installed on is **agent-sourced**
-    /// (`Frontend::Mcp`). Only then do the `l4.allow_agent_*` gates apply (an
-    /// operator-authored script is the control, exactly like the command path).
-    agent_sourced: bool,
 }
 
 impl L4Language {
     /// A live L4 language over the shared guard, wire backend, and flow store.
-    /// `agent_sourced` marks the engine as agent-driven (`Frontend::Mcp`), the
-    /// only case where the per-capability agent gates apply.
+    ///
+    /// The engine this language is installed on is **shared across every frontend**
+    /// (`wire::build` builds one engine for the host hooks, the PoC `script:` step
+    /// executor, and the `l4.*` command path). There is therefore no single
+    /// build-time "agent vs operator" answer for it: the `l4.allow_agent_*` gates
+    /// are enforced per call on the **live caller trust** (`HostCallCtx::caller()`
+    /// for the Rhai face, `PocStepInputs::caller` for the `l4:` step face), exactly
+    /// as the command path reads the per-invocation `Frontend`.
     #[must_use]
     pub fn new(
         guard: Arc<L4Guard>,
         backend: Arc<dyn CaptureInjectBackend>,
         store: Arc<dyn L4FlowStore>,
-        agent_sourced: bool,
     ) -> Self {
         Self {
             live: L4Live {
@@ -170,7 +175,6 @@ impl L4Language {
                 backend,
                 store,
             },
-            agent_sourced,
         }
     }
 
@@ -186,7 +190,6 @@ impl L4Language {
             Arc::new(L4Guard::new(&cfg)),
             Arc::new(PcapBackend::new()),
             Arc::new(InMemoryL4FlowStore::new()),
-            false,
         )
     }
 }
@@ -204,14 +207,10 @@ impl ProtocolLanguage for L4Language {
         for (verb, gate) in VERBS {
             let live = self.live.clone();
             let verb_name = (*verb).to_string();
-            // TODO(Task 4): read `ctx.caller()` for the live agent gate instead
-            // of the build-time `agent_sourced` bool. Task 1 only threads the
-            // signature; the gate decision is unchanged.
             let f: HostFn = Box::new(move |_ctx: &HostCallCtx, args: &[Value]| {
                 host_fn(&live, &verb_name, args)
             });
             let guard = L4SeamGuard {
-                agent_sourced: self.agent_sourced,
                 gates: self.live.guard.agent_gates(),
                 gate: *gate,
             };
@@ -223,7 +222,6 @@ impl ProtocolLanguage for L4Language {
     fn poc_step(&self) -> Option<Box<dyn PocStepHandler>> {
         Some(Box::new(L4StepHandler {
             live: self.live.clone(),
-            agent_sourced: self.agent_sourced,
         }))
     }
 
@@ -244,7 +242,6 @@ impl ProtocolLanguage for L4Language {
 /// `L4Guard` scope/denylist/rate check (the second), so the two dimensions match
 /// the command path over the same shared objects.
 struct L4SeamGuard {
-    agent_sourced: bool,
     gates: Arc<L4AgentGates>,
     gate: Option<AgentGate>,
 }
@@ -254,28 +251,34 @@ impl GuardHandle for L4SeamGuard {
         NAMESPACE
     }
 
-    fn permit(&self, _ctx: &HostCallCtx, fn_name: &str) -> Result<(), HostError> {
-        // TODO(Task 4): gate on `_ctx.caller()` (the live per-call trust) and drop
-        // the build-time `agent_sourced` bool. Task 1 only threads the signature;
-        // the decision is unchanged.
-        agent_gate_check(self.agent_sourced, &self.gates, fn_name, self.gate)
+    fn permit(&self, ctx: &HostCallCtx, fn_name: &str) -> Result<(), HostError> {
+        // Gate on the **live per-call caller trust** (`ctx.caller()`), not a
+        // build-time bool: the shared engine serves operator and agent callers
+        // alike, so only the trust of *this* invocation can decide the agent gate.
+        agent_gate_check(
+            ctx.caller() == CallerTrust::Agent,
+            &self.gates,
+            fn_name,
+            self.gate,
+        )
     }
 }
 
 /// Enforce the per-capability agent gate for `verb`, exactly as the command
-/// path's [`L4AgentGate`](crate::commands) does: a `Frontend::Mcp` (agent) caller
-/// is refused a Sensitive verb whose `l4.allow_agent_*` gate is closed; an
-/// operator-authored engine (`agent_sourced == false`) bypasses it, as the
-/// operator/CLI roles do on the command path. A verb with no agent gate (`None`)
-/// is always admitted here (its own guard, e.g. `scope.add`'s widen, runs in the
-/// verb body).
+/// path's [`L4AgentGate`](crate::commands) does: an **agent** caller (`is_agent`,
+/// i.e. the live `CallerTrust::Agent` of this invocation) is refused a Sensitive
+/// verb whose `l4.allow_agent_*` gate is closed; an **operator** caller bypasses
+/// it, as the operator/CLI roles do on the command path. The input is the *live
+/// per-call trust*, never a build-time snapshot, so one shared engine gates each
+/// call correctly. A verb with no agent gate (`None`) is always admitted here
+/// (its own guard, e.g. `scope.add`'s widen, runs in the verb body).
 fn agent_gate_check(
-    agent_sourced: bool,
+    is_agent: bool,
     gates: &L4AgentGates,
     verb: &str,
     gate: Option<AgentGate>,
 ) -> Result<(), HostError> {
-    if !agent_sourced {
+    if !is_agent {
         return Ok(());
     }
     if let Some(gate) = gate {
@@ -619,13 +622,12 @@ fn send_recv_value(flow_id: L4FlowId, outcome: &SendRecvOutcome) -> Value {
 /// ```
 ///
 /// `op: send_recv` injects the stimulus (fully gated by the shared `L4Guard` and,
-/// for an agent-sourced engine, the `allow_agent_inject` gate) and binds the
+/// for an agent caller, the `allow_agent_inject` gate) and binds the
 /// received reply as the [`PACKET_SOURCE`] source — an object whose `tcp.flags`
 /// renders scapy-style (`"SA"` for SYN-ACK), so a sibling `extract` + a `dsl`
 /// success assert on it.
 pub(crate) struct L4StepHandler {
     live: L4Live,
-    agent_sourced: bool,
 }
 
 impl PocStepHandler for L4StepHandler {
@@ -645,9 +647,11 @@ impl PocStepHandler for L4StepHandler {
             .to_string();
 
         // The agent gate (first dimension) runs here, mirroring the command path,
-        // before the verb's own `L4Guard` scope check (second dimension).
+        // before the verb's own `L4Guard` scope check (second dimension). It reads
+        // the **live caller trust of this PoC run** (`inputs.caller`, seeded by the
+        // runner from the `poc.run` `CommandHost` frontend), never a build-time bool.
         agent_gate_check(
-            self.agent_sourced,
+            inputs.caller == CallerTrust::Agent,
             &self.live.guard.agent_gates(),
             &op,
             gate_for(&op),

@@ -170,21 +170,18 @@ const SEND_RECV_SCRIPT: &str = r#"
 
 #[test]
 fn ac4_sensitive_verb_refused_when_agent_gate_closed() {
-    // Agent-sourced engine, inject gate CLOSED (deny-by-default).
+    // Inject gate CLOSED (deny-by-default).
     let lang = L4Language::new(
         loopback_guard(false),
         MockBackend::with_replies(vec![]),
         Arc::new(InMemoryL4FlowStore::new()),
-        true,
     );
     let engine =
         build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(5), &[&lang])
             .expect("engine builds with l4 installed");
 
-    // Task 2 fail-closed: the seam now requires a seeded caller context. L4's
-    // guard still reads its build-time `agent_sourced` here (migrated in Task 4),
-    // so the seeded trust only keeps dispatch from refusing fail-closed; the
-    // assertions below are unchanged. Seeded `Agent` to match `agent_sourced=true`.
+    // The gate now reads the live per-call trust (`ctx.caller()`): seed `Agent`, so
+    // the closed inject gate refuses this call.
     let _seed = seed_call_context(CallerTrust::Agent, None, None);
     let err = engine
         .eval::<rhai::Dynamic>(SEND_RECV_SCRIPT)
@@ -198,21 +195,19 @@ fn ac4_sensitive_verb_refused_when_agent_gate_closed() {
 
 #[test]
 fn ac4_sensitive_verb_runs_when_agent_gate_open() {
-    // Agent-sourced engine, inject gate OPEN; MockBackend has no reply, so the
-    // call SUCCEEDS with a no_response outcome (the gate + scope admitted it).
+    // Inject gate OPEN; MockBackend has no reply, so the call SUCCEEDS with a
+    // no_response outcome (the gate + scope admitted it).
     let backend = MockBackend::with_replies(vec![]);
     let lang = L4Language::new(
         loopback_guard(true),
         backend.clone(),
         Arc::new(InMemoryL4FlowStore::new()),
-        true,
     );
     let engine =
         build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(5), &[&lang])
             .expect("engine builds");
 
-    // Task 2 fail-closed: seed a caller context (Agent, matching
-    // `agent_sourced=true`) so dispatch proceeds to L4's build-time gate.
+    // Seed `Agent`: with the inject gate open, the live-trust gate admits the call.
     let _seed = seed_call_context(CallerTrust::Agent, None, None);
     let out = engine
         .eval::<rhai::Dynamic>(SEND_RECV_SCRIPT)
@@ -238,13 +233,11 @@ fn ac4_read_verb_is_ungated() {
         loopback_guard(false),
         MockBackend::with_replies(vec![]),
         Arc::new(InMemoryL4FlowStore::new()),
-        true,
     );
     let engine =
         build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(5), &[&lang])
             .expect("engine builds");
-    // Task 2 fail-closed: seed a caller context (Agent, matching
-    // `agent_sourced=true`) so dispatch reaches the ungated Read verb.
+    // Seed `Agent`: a Read verb is ungated regardless of trust.
     let _seed = seed_call_context(CallerTrust::Agent, None, None);
     let out = engine
         .eval::<rhai::Dynamic>("l4.interfaces()")
@@ -254,19 +247,17 @@ fn ac4_read_verb_is_ungated() {
 
 #[test]
 fn ac4_operator_engine_bypasses_the_agent_gate() {
-    // An operator-authored engine (agent_sourced = false) is the control: the
-    // closed agent gate does not apply, so the in-scope send_recv runs.
+    // An Operator caller is the control: even with the inject gate CLOSED, the agent
+    // gate does not apply to operator trust, so the in-scope send_recv runs.
     let lang = L4Language::new(
         loopback_guard(false),
         MockBackend::with_replies(vec![]),
         Arc::new(InMemoryL4FlowStore::new()),
-        false,
     );
     let engine =
         build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(5), &[&lang])
             .expect("engine builds");
-    // Task 2 fail-closed: seed a caller context (Operator, matching
-    // `agent_sourced=false`) so dispatch proceeds to L4's build-time gate.
+    // Seed `Operator`: the closed agent gate is bypassed for operator trust.
     let _seed = seed_call_context(CallerTrust::Operator, None, None);
     let _ = engine
         .eval::<rhai::Dynamic>(SEND_RECV_SCRIPT)
@@ -284,7 +275,6 @@ fn ac4_out_of_scope_send_recv_refusal_surfaces_to_the_script() {
         loopback_guard(true),
         backend.clone(),
         Arc::new(InMemoryL4FlowStore::new()),
-        true,
     );
     let engine =
         build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(5), &[&lang])
@@ -293,9 +283,8 @@ fn ac4_out_of_scope_send_recv_refusal_surfaces_to_the_script() {
         let spec = #{ layers: [ #{ ipv4: #{ dst: "10.9.9.9" } }, #{ udp: #{ dst_port: 9 } } ] };
         l4.send_recv(spec, "10.9.9.9", "lo", 9, 50)
     "#;
-    // Task 2 fail-closed: seed a caller context (Agent, matching
-    // `agent_sourced=true`) so the refusal under test is the scope check, not the
-    // missing-context fail-closed.
+    // Seed `Agent` with the inject gate OPEN, so the refusal under test is the scope
+    // check, not the agent gate or the missing-context fail-closed.
     let _seed = seed_call_context(CallerTrust::Agent, None, None);
     let err = engine
         .eval::<rhai::Dynamic>(script)
@@ -320,7 +309,6 @@ fn inject_count_zero_is_a_no_op() {
         loopback_guard(true),
         backend.clone(),
         Arc::new(InMemoryL4FlowStore::new()),
-        false,
     );
     let engine =
         build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(5), &[&lang])
@@ -329,8 +317,7 @@ fn inject_count_zero_is_a_no_op() {
         let spec = #{ layers: [ #{ ipv4: #{ dst: "127.0.0.1" } }, #{ udp: #{ dst_port: 9 } } ] };
         l4.inject(spec, "127.0.0.1", "lo", 0)
     "#;
-    // Task 2 fail-closed: seed a caller context (Operator, matching
-    // `agent_sourced=false`) so dispatch reaches the inject no-op.
+    // Seed `Operator` so dispatch reaches the inject no-op.
     let _seed = seed_call_context(CallerTrust::Operator, None, None);
     let out = engine
         .eval::<rhai::Dynamic>(script)
@@ -350,6 +337,72 @@ fn inject_count_zero_is_a_no_op() {
 }
 
 // ===========================================================================
+// AC4 (Task 4) — the gate decides on the LIVE per-call trust, not a build-time bool
+// ===========================================================================
+
+/// The build-time `agent_sourced` bool is fully retired from the L4 gate decision:
+/// the gate reads `ctx.caller()` (Rhai face) / `inputs.caller` (`l4:` step face), so
+/// the token must not survive anywhere in the module.
+#[test]
+fn agent_sourced_is_gone_from_the_gate_decision() {
+    let src = include_str!("../src/language.rs");
+    assert!(
+        !src.contains("agent_sourced"),
+        "the build-time `agent_sourced` bool must be gone from the L4 gate decision"
+    );
+}
+
+/// The heart of Task 4 on the Rhai face: ONE engine, ONE `L4Language` registration,
+/// the inject gate CLOSED. The SAME `l4.send_recv` is **refused** for an `Agent`
+/// caller and **admitted** for an `Operator` caller — decided per call from
+/// `ctx.caller()`, which a build-time bool on a shared engine could never do. The
+/// Agent refusal is socket-free: the agent gate refuses before anything reaches the
+/// (mock) wire.
+#[test]
+fn per_call_trust_decides_on_one_rhai_registration() {
+    let backend = MockBackend::with_replies(vec![]);
+    let lang = L4Language::new(
+        loopback_guard(false), // inject gate CLOSED
+        backend.clone(),
+        Arc::new(InMemoryL4FlowStore::new()),
+    );
+    let engine =
+        build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(5), &[&lang])
+            .expect("engine builds with l4 installed");
+
+    // Agent trust: the closed inject gate refuses BEFORE the wire (socket-free).
+    {
+        let _seed = seed_call_context(CallerTrust::Agent, None, None);
+        let err = engine
+            .eval::<rhai::Dynamic>(SEND_RECV_SCRIPT)
+            .expect_err("an Agent caller is refused by the closed inject gate");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("disabled") && msg.contains("inject"),
+            "the Agent refusal names the disabled inject capability, got: {msg}"
+        );
+    }
+    assert!(
+        backend.injected().is_empty(),
+        "the refused Agent call put nothing on the wire"
+    );
+
+    // Operator trust on the SAME engine + registration: the agent gate is bypassed,
+    // so the in-scope send_recv runs (no reply queued ⇒ no_response over the mock).
+    {
+        let _seed = seed_call_context(CallerTrust::Operator, None, None);
+        let _ok = engine
+            .eval::<rhai::Dynamic>(SEND_RECV_SCRIPT)
+            .expect("an Operator caller bypasses the agent gate on the same registration");
+    }
+    assert_eq!(
+        backend.injected().len(),
+        1,
+        "the admitted Operator call reached the (mock) wire exactly once"
+    );
+}
+
+// ===========================================================================
 // AC5 — the native l4: PoC step
 // ===========================================================================
 
@@ -362,6 +415,59 @@ packet:
     - tcp:  { dport: 80, flags: S }
 timeout_ms: 1000
 "#;
+
+/// The heart of Task 4 on the native `l4:` step face: the SAME handler is **refused**
+/// for an `Agent` PoC run (closed inject gate, socket-free) and **admitted** for an
+/// `Operator` run — decided per call from `inputs.caller`, not a build-time bool.
+#[test]
+fn per_call_trust_decides_on_the_native_l4_step_face() {
+    let backend = MockBackend::with_replies(vec![]);
+    let lang = L4Language::new(
+        loopback_guard(false), // inject gate CLOSED
+        backend.clone(),
+        Arc::new(InMemoryL4FlowStore::new()),
+    );
+    let handler = lang.poc_step().expect("l4 contributes a poc step");
+    let body: serde_yaml::Value = serde_yaml::from_str(L4_STEP_BODY).expect("body");
+    let mut vars = BTreeMap::new();
+    vars.insert("target_ip".to_string(), Value::Str("127.0.0.1".to_string()));
+
+    // Agent caller: refused by the closed inject gate, nothing reaches the wire.
+    let err = handler
+        .run(
+            &body,
+            &PocStepInputs {
+                vars: vars.clone(),
+                caller: CallerTrust::Agent,
+            },
+        )
+        .expect_err("an Agent l4: step is refused by the closed inject gate");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("disabled") && msg.contains("inject"),
+        "the Agent refusal names the disabled inject capability, got: {msg}"
+    );
+    assert!(
+        backend.injected().is_empty(),
+        "the refused Agent l4: step put nothing on the wire"
+    );
+
+    // Operator caller on the SAME handler: the agent gate is bypassed, so the step
+    // runs (no reply queued ⇒ no_response over the mock backend).
+    let outcome = handler
+        .run(
+            &body,
+            &PocStepInputs {
+                vars,
+                caller: CallerTrust::Operator,
+            },
+        )
+        .expect("an Operator l4: step bypasses the agent gate on the same handler");
+    assert_eq!(
+        outcome.bindings.get("l4_outcome"),
+        Some(&Value::Str("no_response".to_string()))
+    );
+}
 
 #[test]
 fn ac5_l4_step_body_round_trips() {
@@ -391,7 +497,6 @@ fn ac5_send_recv_step_binds_packet_tcp_flags() {
         loopback_guard(true),
         MockBackend::with_replies(vec![synack_reply()]),
         Arc::new(InMemoryL4FlowStore::new()),
-        false,
     );
     let handler = lang.poc_step().expect("l4 contributes a poc step");
 
@@ -436,7 +541,6 @@ fn ac5_out_of_scope_target_is_refused() {
         loopback_guard(true),
         backend.clone(),
         Arc::new(InMemoryL4FlowStore::new()),
-        false,
     );
     let handler = lang.poc_step().expect("poc step");
 

@@ -18,6 +18,8 @@
 
 use std::sync::Arc;
 
+use aitm_plugin::language::ProtocolLanguage;
+
 use crate::commands::ScriptCommands;
 use crate::config::{RhaiConfig, RhaiLimits};
 use crate::error::ScriptError;
@@ -58,9 +60,23 @@ pub struct ScriptTier {
 /// [`ScriptTier::errors`]; whether that is fatal is `cfg.strict`, which the
 /// caller enforces because only it knows how to exit.
 pub fn build(cfg: RhaiConfig, services: ScriptServices) -> Result<ScriptTier, ScriptError> {
+    build_with_languages(cfg, services, &[])
+}
+
+/// [`build`], but with a set of seam [`ProtocolLanguage`]s installed live on the
+/// **one shared engine** the host hooks, the PoC `script:` executor, and
+/// `ScriptCommands` all use. This is how a protocol (e.g. L4) goes production-live
+/// on the real engine: each language's `<ns>.*` host fns are registered through the
+/// host-registry seam and gate on the per-call caller trust seeded at each
+/// invocation boundary. `build(cfg, services)` is `build_with_languages(.., &[])`.
+pub fn build_with_languages(
+    cfg: RhaiConfig,
+    services: ScriptServices,
+    languages: &[&dyn ProtocolLanguage],
+) -> Result<ScriptTier, ScriptError> {
     let limits = cfg.limits.clone();
     let findings = Arc::clone(&services.findings);
-    let loader = Arc::new(RhaiLoader::new(cfg, services)?);
+    let loader = Arc::new(RhaiLoader::new_with_languages(cfg, services, languages)?);
     let (scripts, errors) = loader.load_all();
     let set = ScriptSet::new(scripts);
     let error_sink = loader.error_sink();
