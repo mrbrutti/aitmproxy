@@ -16,6 +16,7 @@ mod engines;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use aitm_browser::ClickTarget;
 use aitm_core::{BrowserEngine, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -87,5 +88,64 @@ async fn eval_without_navigate() {
             driver.eval("1+1").await,
         );
         assert_eq!(two, Value::Int(2), "[{engine:?}] eval before any navigate");
+    }
+}
+
+/// The page a click navigates away from: a link to `/next`, plus a button
+/// that only runs page script (the no-navigation half of AC11).
+const INDEX_PAGE: &str = "<html><body>\
+    <a id=\"go\" href=\"/next\">go</a>\
+    <button id=\"stay\" onclick=\"window.__stayed = true\">stay</button>\
+    </body></html>";
+
+/// What `/next` serves; `get_dom` after the click must contain the marker.
+const NEXT_PAGE: &str = "<html><body><p id=\"result\">RESULT-PAGE</p></body></html>";
+
+/// AC11 (T6), live half: `click` on a link awaits the navigation it triggers,
+/// so the next `get_dom` is the post-navigation document; `click` on a button
+/// that navigates nothing still returns `Ok` and the handler ran.
+#[tokio::test]
+#[ignore = "needs a real engine: AITM_OBSCURA=1 AITM_OBSCURA_BIN=... (or AITM_CHROME=1)"]
+async fn click_then_get_dom_sees_result_page() {
+    let engines = engines();
+    assert!(!engines.is_empty(), "enable an engine to run this check");
+    let proxy = serve_as_proxy(INDEX_PAGE, NEXT_PAGE).await;
+    let ca_cert = ca_cert_fixture();
+
+    for engine in engines {
+        let driver = ok(
+            engine,
+            "launch",
+            aitm_browser::launch(&config_for(engine, proxy), &ca_cert).await,
+        );
+        let url = format!("http://127.0.0.1:{}/", proxy.port());
+        ok(engine, "navigate to the index", driver.navigate(&url).await);
+
+        ok(
+            engine,
+            "click #stay (no navigation)",
+            driver.click(ClickTarget::Selector("#stay".into())).await,
+        );
+        let stayed = ok(
+            engine,
+            "eval __stayed",
+            driver.eval("window.__stayed").await,
+        );
+        assert_eq!(
+            stayed,
+            Value::Bool(true),
+            "[{engine:?}] handler did not run"
+        );
+
+        ok(
+            engine,
+            "click #go (navigates)",
+            driver.click(ClickTarget::Selector("#go".into())).await,
+        );
+        let dom = ok(engine, "get_dom after click", driver.get_dom().await);
+        assert!(
+            dom.contains("RESULT-PAGE"),
+            "[{engine:?}] get_dom still shows the pre-click page: {dom}"
+        );
     }
 }

@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use aitm_core::{BrowserConfig, BrowserDriver, ClickTarget, NavOutcome, Value};
 use chromiumoxide::browser::{Browser, BrowserConfig as CdpConfig};
+use chromiumoxide::cdp::browser_protocol::page::EventFrameStartedLoading;
 use chromiumoxide::cdp::browser_protocol::security::SetIgnoreCertificateErrorsParams;
 use chromiumoxide::cdp::js_protocol::runtime::{ExecutionContextId, RemoteObject};
 use chromiumoxide::error::CdpError;
@@ -62,6 +63,41 @@ where
     match attempt(EvalContext::Tracked).await {
         Err(err) if is_stale_context_error(&err) => attempt(EvalContext::PageDefault).await,
         first => first,
+    }
+}
+
+/// How long after a click the driver waits for a navigation to begin before
+/// concluding the click navigated nothing (T6). `Page.frameStartedLoading`
+/// fires as the browser commits to the navigation, before any network round
+/// trip, so a form submit or link shows up well inside this bound; a click
+/// that only runs page script costs at most this much.
+const CLICK_NAV_GRACE: Duration = Duration::from_millis(500);
+
+/// Settle a click (T6): if `started` reports a navigation within `grace`,
+/// await `finished()` bounded by `nav_timeout` (an unfinished navigation is
+/// the same error `navigate` gives); otherwise the click navigated nothing
+/// and is simply `Ok`. `finished` is a constructor, not a future, because
+/// `Page::wait_for_navigation` resolves immediately on a frame that is still
+/// in its previous loaded state — it must only be created once the new load
+/// has begun.
+pub(crate) async fn settle_after_click<S, F, N>(
+    started: S,
+    finished: F,
+    grace: Duration,
+    nav_timeout: Duration,
+) -> anyhow::Result<()>
+where
+    S: Future<Output = bool>,
+    F: FnOnce() -> N,
+    N: Future<Output = anyhow::Result<()>>,
+{
+    match tokio::time::timeout(grace, started).await {
+        Ok(true) => tokio::time::timeout(nav_timeout, finished())
+            .await
+            .map_err(|_| anyhow::anyhow!("navigation triggered by click timed out"))?,
+        // `Ok(false)`: the event stream ended (session closing) — nothing to
+        // await. `Err(_)`: no navigation began within the grace bound.
+        Ok(false) | Err(_) => Ok(()),
     }
 }
 
@@ -146,7 +182,16 @@ impl CdpSession {
         })
     }
 
+    /// Click, then await the navigation it triggers, if any (T6): a following
+    /// `get_dom` sees the post-submit page. The listener is registered before
+    /// the click so a fast navigation cannot slip past it; only the main
+    /// frame counts, so a subframe load does not hold the click.
     pub(crate) async fn click(&self, target: ClickTarget) -> anyhow::Result<()> {
+        let mut loading = self
+            .page
+            .event_listener::<EventFrameStartedLoading>()
+            .await?;
+        let main_frame = self.page.mainframe().await?;
         match target {
             ClickTarget::Selector(selector) => {
                 self.page.find_element(selector).await?.click().await?;
@@ -155,7 +200,22 @@ impl CdpSession {
                 self.page.click(Point { x, y }).await?;
             }
         }
-        Ok(())
+        let started = async move {
+            while let Some(event) = loading.next().await {
+                if main_frame
+                    .as_ref()
+                    .is_none_or(|frame| *frame == event.frame_id)
+                {
+                    return true;
+                }
+            }
+            false
+        };
+        let finished = || async {
+            self.page.wait_for_navigation().await?;
+            anyhow::Ok(())
+        };
+        settle_after_click(started, finished, CLICK_NAV_GRACE, self.nav_timeout).await
     }
 
     pub(crate) async fn type_text(&self, selector: &str, text: &str) -> anyhow::Result<()> {
@@ -454,6 +514,85 @@ mod tests {
         .expect_err("still stale after the retry");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(err.to_string().contains("Cannot find context"), "{err:#}");
+    }
+
+    /// AC11 (T6): a click that navigates nothing returns `Ok` once the short
+    /// grace bound passes with no navigation started — well inside
+    /// `nav_timeout`, and without ever awaiting the navigation path.
+    #[tokio::test]
+    async fn click_no_nav_returns_within_bound() {
+        let grace = Duration::from_millis(50);
+        let nav_timeout = Duration::from_secs(5);
+        let awaited_nav = std::sync::atomic::AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        settle_after_click(
+            futures::future::pending::<bool>(),
+            || {
+                awaited_nav.store(true, std::sync::atomic::Ordering::SeqCst);
+                async { anyhow::Ok(()) }
+            },
+            grace,
+            nav_timeout,
+        )
+        .await
+        .expect("a click that navigates nothing still succeeds");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= grace,
+            "returned before the grace bound: {elapsed:?}"
+        );
+        assert!(
+            elapsed < nav_timeout,
+            "waited the whole nav_timeout: {elapsed:?}"
+        );
+        assert!(
+            !awaited_nav.load(std::sync::atomic::Ordering::SeqCst),
+            "no navigation started, so none must be awaited"
+        );
+    }
+
+    /// AC11 (T6): once a navigation starts within the grace bound, the click
+    /// awaits it to completion before returning.
+    #[tokio::test]
+    async fn click_nav_awaits_completion() {
+        let finished = std::sync::atomic::AtomicBool::new(false);
+        settle_after_click(
+            futures::future::ready(true),
+            || async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                anyhow::Ok(())
+            },
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a completed navigation is Ok");
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "click returned before the navigation it triggered had finished"
+        );
+    }
+
+    /// AC11 (T6): a navigation that starts but never finishes is bounded by
+    /// `nav_timeout` and reported as such, like `navigate`'s own timeout.
+    #[tokio::test]
+    async fn click_nav_timeout_is_bounded() {
+        let nav_timeout = Duration::from_millis(50);
+        let started = std::time::Instant::now();
+        let err = settle_after_click(
+            futures::future::ready(true),
+            futures::future::pending::<anyhow::Result<()>>,
+            Duration::from_millis(10),
+            nav_timeout,
+        )
+        .await
+        .expect_err("an unfinished navigation times out");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            err.to_string().contains("timed out"),
+            "timeout named in the error: {err:#}"
+        );
     }
 
     /// M2-AC13: JS has one number type, and obscura serialises every number as
