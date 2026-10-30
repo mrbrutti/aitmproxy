@@ -286,6 +286,36 @@ pub enum McpTransport {
         /// `None` writes nothing. Mirrors the obscura ready-file pattern.
         endpoint_file: Option<PathBuf>,
     },
+    /// Serve over streamable HTTP (loopback by default); a non-empty Bearer
+    /// `token` is required, cross-origin requests are gated by an exact
+    /// `allowed_origins` allowlist (empty = none allowed), and requests are
+    /// served at `path`. See [`McpTransport::streamable_http_default`].
+    StreamableHttp {
+        /// The interface/port to bind. Defaults to `127.0.0.1:8084`; binding a
+        /// non-loopback interface is an explicit operator decision.
+        bind: SocketAddr,
+        /// The Bearer token required on every request. Must be non-empty.
+        token: String,
+        /// Exact `Origin` header allowlist. Empty means no cross-origin request
+        /// is accepted (same-origin / no-Origin requests still work).
+        allowed_origins: Vec<String>,
+        /// The request path the endpoint is served at (e.g. `/mcp`).
+        path: String,
+    },
+}
+
+impl McpTransport {
+    /// Build a [`McpTransport::StreamableHttp`] with the secure defaults: a
+    /// loopback bind on `127.0.0.1:8084`, an empty `Origin` allowlist, and the
+    /// `/mcp` path. The caller supplies the required non-empty Bearer `token`.
+    pub fn streamable_http_default(token: String) -> Self {
+        McpTransport::StreamableHttp {
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8084),
+            token,
+            allowed_origins: Vec::new(),
+            path: "/mcp".into(),
+        }
+    }
 }
 
 /// MCP frontend configuration.
@@ -455,6 +485,34 @@ impl Default for SsrfPolicy {
             block_private: true,
             block_loopback: true,
             allow_if_in_scope: true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streamable_http_default_binds_loopback() {
+        let transport = McpTransport::streamable_http_default("t".into());
+        assert!(matches!(
+            &transport,
+            McpTransport::StreamableHttp { bind, .. }
+                if bind.ip().is_loopback() && bind.port() == 8084
+        ));
+        match transport {
+            McpTransport::StreamableHttp {
+                token,
+                allowed_origins,
+                path,
+                ..
+            } => {
+                assert_eq!(token, "t");
+                assert!(allowed_origins.is_empty());
+                assert_eq!(path, "/mcp");
+            }
+            other => panic!("expected StreamableHttp, got {other:?}"),
         }
     }
 }

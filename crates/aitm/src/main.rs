@@ -564,7 +564,10 @@ fn apply_bus_endpoint_file(
             *endpoint_file = Some(path);
             Ok(())
         }
-        McpTransport::Stdio => anyhow::bail!(
+        // Neither stdio nor streamable-HTTP publishes a loopback-bus endpoint
+        // file: stdio has no bound bus, and the HTTP transport serves at its own
+        // configured `bind`, not an ephemeral rendezvous the parent must discover.
+        McpTransport::Stdio | McpTransport::StreamableHttp { .. } => anyhow::bail!(
             "--bus-endpoint-file needs the loopback-TCP bus; set mcp.transport.loopback_tcp \
              in the config so the core has a bound address to publish"
         ),

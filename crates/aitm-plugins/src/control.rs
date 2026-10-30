@@ -288,6 +288,13 @@ fn redacted(cfg: &Config) -> Value {
             mcp.insert("transport".into(), Value::Str("loopback_tcp".into()));
             mcp.insert("port".into(), Value::Int(i64::from(*port)));
         }
+        // Report the kind and bound address, never the token (same posture as
+        // loopback TCP, which reports its port but not its token).
+        McpTransport::StreamableHttp { bind, path, .. } => {
+            mcp.insert("transport".into(), Value::Str("streamable_http".into()));
+            mcp.insert("bind".into(), Value::Str(bind.to_string()));
+            mcp.insert("path".into(), Value::Str(path.clone()));
+        }
     }
     obj.insert("mcp".into(), Value::Object(mcp));
 

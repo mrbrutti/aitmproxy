@@ -1,0 +1,135 @@
+expected a command before flags, got `--help`
+usage: aitm <command> [--flag value]...
+(a value that itself starts with `--` must be given as --flag=value;
+--yes answers a command's confirmation prompt without asking)
+
+commands:
+  flow list
+      List the ids of every captured flow, oldest first.
+  flow get --id <flow-id>
+      Summarize one captured flow: kind, request line, status, state.
+  flow subscribe [--filter <json-object>] [--since <flow-id>]
+      Subscribe to live flow notifications on this connection. Returns a sub_id; matching flows then arrive as notifications/aitm/flow lines with no further request. Read-only.
+  flow unsubscribe --sub_id <int>
+      Cancel a flow subscription on this connection. Read-only.
+  flow detail --id <flow-id> [--body <string>] [--offset <int>] [--length <int>]
+      Full detail for one flow: headers, bodies, connection info, timing and edit state. `body` selects none|inline|range (default inline).
+  flow mark --id <flow-id> --marks <json-array>
+      Replace a flow's highlight mark set (e.g. colour names); an empty array clears it.
+  flow comment --id <flow-id> --text <string>
+      Set a flow's free-text comment; an empty string clears it.
+  flow replay --id <flow-id>
+      Reissue a captured HTTP request through the proxy client; returns the new flow's id.
+  flow intercept [--enabled <true|false>] [--rules <json-array>]
+      Arm (default) or disarm interception. With no rules every request is parked (global arm); with rules only a request matching a rule at its phase is parked. A parked flow waits for flow.resume or flow.kill.
+  flow resume --id <flow-id>
+      Release an intercepted flow so its (possibly mutated) request is forwarded.
+  flow kill --id <flow-id> [--mode <string>]
+      Abort an intercepted flow. mode=reset (default) drops it so the client sees a reset/closed connection; mode=429 or mode=503 answers the client with that status and an empty body, with no upstream request.
+  proxy status
+      The proxy's live state: `listening` (bool) + `address`, `intercept_armed`, `paused` (parked-flow count), `capturing`, and `flows` (visible count).
+  proxy pause
+      Pause capture: new flows are hidden from list/status/count. Traffic still flows and each hidden flow stays in memory, reachable by id, until it ages out via normal eviction (use flow.clear to drop completed ones). While paused, continued traffic can evict older visible flows under the store's capacity bound, so resume or clear to reclaim history. Returns the capture state.
+  proxy resume
+      Resume capture: new flows are shown again. Returns the capture state.
+  flow clear
+      Remove completed flows from the store (in-flight and intercepted flows are kept); returns {cleared, skipped_in_flight}.
+  config get
+      A redacted view of the proxy configuration (no MCP token or key material).
+  flow mutate --id <flow-id> --edits <json-object>
+      Edit a captured HTTP flow in place. Edits apply to the request (method, path, headers, body); when the flow is parked at the response phase they apply to the response and `status` is valid.
+  request send [--method <string>] [--scheme <string>] --authority <string> [--path <string>] [--headers <json-object>] [--body <value>]
+      Craft an HTTP request and send it through the proxy's guarded client; returns the captured flow's id.
+  scope add --host <string>
+      Add a host, host:port, or *.wildcard to the active scope. Refused from an agent frontend (MCP) unless scope.allow_agent_widen is set.
+  scope remove --host <string>
+      Remove a scope entry (exact match). Narrowing scope is allowed from any frontend; returns true if an entry was removed.
+  scope list
+      List the current scope entries.
+  ws intercept [--enabled <true|false>] [--rules <json-array>]
+      Arm (default) or disarm WebSocket frame interception and set the Phase::WsFrame rules that select which live frames are parked for ws.frame to edit/forward or drop.
+  ws frame --id <flow-id> --index <int> --action <string> [--data <text>] [--opcode <string>]
+      Act on a parked WebSocket frame: forward it (optionally editing its data/opcode first) or drop it so the peer never receives it.
+  ws send --id <flow-id> --dir <string> --opcode <string> --data <text>
+      Compose a new WebSocket frame and inject it onto a live conversation. Active egress: refused unless the flow's host is in scope.
+  session save --path <string>
+      Persist the whole flow store to a native `aitm-session/1` JSON file.
+  session load --path <string>
+      Replace the flow store with a native `aitm-session/1` JSON file. Passive: no upstream requests.
+  flow export [--ids <json-array>] [--format <string>] [--path <string>]
+      Export selected flows (or the whole store) as `aitm` native JSON or HAR 1.2. Returns bytes, or writes to `path` when given.
+  flow import [--path <string>] [--bytes <text>] [--format <string>]
+      Import flows (by `path` or `bytes`) into the store, marked `imported`. Formats: `aitm`, `har`, or mitmproxy `.flows`. Passive: no upstream requests, never replays.
+  tls passthrough list
+      List the hosts whose TLS is tunnelled (not decrypted).
+  tls passthrough add --host <string>
+      Add a host or *.wildcard to the TLS passthrough list (tunnel, do not decrypt). Refused from an agent frontend (MCP) unless tls.allow_agent_passthrough is set.
+  tls passthrough remove --host <string>
+      Remove an entry from the TLS passthrough list. Refused from an agent frontend (MCP) unless tls.allow_agent_passthrough is set.
+  map add --kind <string> --condition <json-object> --action <json-object>
+      Add a Map rule. kind "local" serves a confined local file as the response (a mock); kind "remote" rewrites the request target before upstream. Refused from an agent frontend unless maps.allow_agent_authoring is set.
+  map list
+      List the configured Map rules.
+  map remove --id <string>
+      Remove a Map rule by id. Refused from an agent frontend unless maps.allow_agent_authoring is set.
+  browser navigate --url <string>
+      Load a URL in the embedded browser (SSRF- and scope-guarded).
+  browser click [--selector <string>] [--x <number>] [--y <number>]
+      Click an element by CSS selector, or a point by viewport coordinates.
+  browser type --selector <string> --text <string>
+      Type text into the element matching a CSS selector.
+  browser screenshot
+      Capture the current page as PNG bytes.
+  browser eval --expr <string>
+      Evaluate a JavaScript expression in the page and return its value.
+  browser get_dom
+      The page's current outer HTML.
+  poc build --flow_id <flow-id> [--name <string>] [--param <string>]
+      Build a parameterized reproducible PoC (YAML) from a captured flow.
+  poc run --poc_path <string> [--target <string>] [--vars <json-object>]
+      Run a reproducible PoC (YAML) with no agent and emit the three artifacts.
+  poc list
+      List the PoCs in the configured PoC directory (id, title, severity, path). Empty when no PoC directory is configured.
+  poc get --poc_path <string>
+      Read one PoC by path (confined to the PoC directory): id, title, severity, description, and the YAML source.
+  poc artifact --path <string>
+      Read a PoC run artifact (YAML copy or screenshot) as bytes, confined to the configured PoC output directory.
+  ca export [--format <string>] [--out <string>]
+      Export the aitmproxy root CA certificate (never its key) as PEM or DER, with its SHA-256 and SHA-1 fingerprints and the CA directory. Always available. This is for TLS clients you bring yourself; the embedded obscura browser already trusts the CA through --ca-cert and needs no export.
+  ca status
+      Report the aitmproxy root CA: whether ca.crt exists, its fingerprints and path, and, per trust-store scope on this platform, whether a certificate with its fingerprint is installed and trusted. Read-only, always available, not audited. The embedded obscura browser does not use the OS store (it trusts the CA through --ca-cert), so these fields say nothing about it.
+  ca install [--scope <string>] [--dry_run <true|false>]
+      Install the aitmproxy root CA into the OS trust store (macOS keychain via `security`, Linux ca-certificates anchors, Windows Root store via certutil); every TLS client that uses that store will then trust certificates this proxy mints. Idempotent; identifies the certificate by fingerprint; never reads the CA key. Refused from an agent frontend (MCP) unless ca.allow_agent_install is set in the aitmproxy config; dry_run is always allowed and lists the commands that would run. The embedded obscura browser does not use the OS store (it trusts the CA through --ca-cert) and is unaffected.
+  ca uninstall [--scope <string>] [--dry_run <true|false>]
+      Remove the aitmproxy root CA from the OS trust store (macOS keychain via `security`, Linux ca-certificates anchors, Windows Root store via certutil); TLS clients that use that store stop trusting certificates this proxy mints. Idempotent; identifies the certificate by fingerprint; never reads the CA key. Refused from an agent frontend (MCP) unless ca.allow_agent_install is set in the aitmproxy config; dry_run is always allowed and lists the commands that would run. The embedded obscura browser does not use the OS store (it trusts the CA through --ca-cert) and is unaffected.
+  agent status
+      Report the current agent policy and recent agent activity. Read-only and readable by any role.
+  agent set --policy <string>
+      Set the agent policy (all | auto | ask | readonly | paused). The deliberate operator act that governs the agent — operator/CLI only; the agent cannot change its own policy.
+  agent activity [--since <int>] [--limit <int>]
+      Recent command-invocation audit entries (who ran what, with what redacted arguments, and the outcome), oldest first. Read-only and readable by any role.
+  agent approve --request_id <string> --allow <true|false>
+      Approve or deny a Sensitive agent command the server parked under the `ask` policy. Operator/CLI only; the agent cannot approve its own requests.
+  script validate [--path <string>] [--source <string>]
+      Compile a .rhai script without loading it; reports its name, API, hooks and the commands/options its load(reg) registers (a static scan; empty when the names are not literals), or the positioned compile error. Give exactly one of `path` (a file) or `source` (the script text, compiled in the sandbox with nothing written).
+  script reload --name <string>
+      Recompile a loaded script from its file and swap its hooks live; a failed recompile keeps the previous version. Commands and options it registered at load are unchanged until restart.
+  script findings [--limit <int>]
+      Findings scripts emitted with finding(...) this run (in-memory, not persisted): each as an object, oldest first, plus how many the bounded sink dropped. For the persistent store use findings.list/get/record.
+  script list
+      List the loaded scripts in chain order: name, path, API, hooks, whether enabled, and the most recent hook error (null if none).
+  script enable --name <string>
+      Turn a loaded script's hooks back on live. Idempotent. Answers { name, enabled }.
+  script disable --name <string>
+      Turn a loaded script's hooks off live without unloading it; commands and options it registered stay (the registry is sealed). Idempotent. Answers { name, enabled }.
+  script save --name <string> --source <string> [--enable <true|false>]
+      Write a script to <scripts_dir>/<name>.rhai after checking it compiles (a non-compiling source writes nothing). Its hooks go live immediately with no restart — for a brand-new name (appended to the running script host) as well as a save over a loaded script (swapped live). restart_required is true ONLY when the script registers commands or options, which the sealed registry cannot add until a restart; its hooks still run this session. Answers { name, path, api, hooks, registers, restart_required }. Needs rhai.scripts_dir.
+  findings list [--filter <json-object>]
+      List recorded findings (id, title, class, severity, target, when, reproduction), filterable by target/class/severity/since. Empty when no findings directory is configured.
+  findings get --id <string>
+      Read one recorded finding by id (full record incl. reproduction, artifacts, flows, notes).
+  findings record --title <string> --class <string> --severity <string> --target <string> --poc_ref <string> [--flows <json-array>] [--notes <string>] [--passed <true|false>] [--control_passed <true|false>] [--run_at <string>] [--finding_capture <flow-id>] [--poc_path <string>] [--screenshot_path <string>]
+      Record a finding (after a passing poc.run): writes a human-readable YAML record and a runs.jsonl line, returns its id.
+  findings remove --id <string>
+      Delete a recorded finding's YAML (the runs.jsonl history is kept). Operator/CLI only.
+

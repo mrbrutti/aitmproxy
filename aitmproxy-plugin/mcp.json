@@ -1,0 +1,10 @@
+{
+  "type": "stdio",
+  "command": "aitm",
+  "args": [],
+  "_submission_remote": {
+    "comment": "Design H submission transport. JSON has no comments, so this sibling block documents the remote form: for a hosted ChatGPT endpoint, replace the stdio fields above (type/command/args) with these. The stdio form above is the committed local default.",
+    "type": "streamable-http",
+    "url": "https://<host>/mcp"
+  }
+}

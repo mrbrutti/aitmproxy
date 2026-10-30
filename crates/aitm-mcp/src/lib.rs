@@ -7,14 +7,18 @@
 //! over stdio, or over a loopback-only TCP socket that requires a token.
 
 mod base64;
+pub mod http;
 pub mod json;
 pub mod render;
 pub mod schema;
 pub mod server;
 pub mod transport;
+pub mod widgets;
 
 pub use aitm_core::McpTransport;
+pub use http::{StreamableHttp, StreamableHttpCfg};
 pub use schema::{McpSchemaDerive, McpTool, StdSchemaDerive};
 pub use server::{
     ConnCtx, McpServer, NotificationSink, DEFAULT_BROADCAST_CAPACITY, DEFAULT_PUSH_CAPACITY,
 };
+pub use widgets::{widget_meta_for, widgets, Widget, WidgetMeta};

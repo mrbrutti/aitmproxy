@@ -543,8 +543,9 @@ impl From<RoleFile> for Frontend {
     }
 }
 
-/// `transport: {stdio: {}}` or
-/// `transport: {loopback_tcp: {port, token, endpoint_file?}}`.
+/// `transport: {stdio: {}}`,
+/// `transport: {loopback_tcp: {port, token, endpoint_file?}}`, or
+/// `transport: {streamable_http: {bind, token, allowed_origins?, path?}}`.
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum TransportFile {
@@ -556,6 +557,25 @@ enum TransportFile {
         #[serde(default)]
         endpoint_file: Option<PathBuf>,
     },
+    StreamableHttp {
+        /// The interface/port to bind; loopback is an explicit operator choice
+        /// here (there is no implicit "bind all").
+        bind: SocketAddr,
+        /// The required non-empty Bearer token (every request must present it).
+        token: String,
+        /// The exact `Origin` allowlist; empty (the default) accepts no
+        /// cross-origin request.
+        #[serde(default)]
+        allowed_origins: Vec<String>,
+        /// The request path; defaults to `/mcp`.
+        #[serde(default = "default_mcp_path")]
+        path: String,
+    },
+}
+
+/// The default request path for the streamable-HTTP transport.
+fn default_mcp_path() -> String {
+    "/mcp".into()
 }
 
 impl From<TransportFile> for McpTransport {
@@ -570,6 +590,17 @@ impl From<TransportFile> for McpTransport {
                 port,
                 token,
                 endpoint_file,
+            },
+            TransportFile::StreamableHttp {
+                bind,
+                token,
+                allowed_origins,
+                path,
+            } => McpTransport::StreamableHttp {
+                bind,
+                token,
+                allowed_origins,
+                path,
             },
         }
     }
@@ -713,6 +744,57 @@ impl FindingsFile {
     fn apply(self, c: &mut FindingsConfig) {
         if let Some(d) = self.dir {
             c.dir = Some(d);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse;
+    use aitm_core::McpTransport;
+
+    /// The streamable-HTTP transport is selectable from config as a `snake_case`
+    /// map; `bind`/`token` are read, `allowed_origins` and `path` take their
+    /// documented defaults when omitted. The token is carried through unchanged.
+    #[test]
+    fn streamable_http_transport_round_trips() {
+        let cfg = parse(
+            "mcp:\n  transport:\n    streamable_http:\n      bind: 127.0.0.1:8084\n      token: s3cret\n",
+        )
+        .expect("streamable_http map form");
+        match &cfg.mcp.transport {
+            McpTransport::StreamableHttp {
+                bind,
+                token,
+                allowed_origins,
+                path,
+            } => {
+                assert_eq!(bind.to_string(), "127.0.0.1:8084");
+                assert_eq!(token, "s3cret");
+                assert!(allowed_origins.is_empty(), "default allowlist is empty");
+                assert_eq!(path, "/mcp", "path defaults to /mcp");
+            }
+            other => panic!("expected StreamableHttp, got {other:?}"),
+        }
+    }
+
+    /// `allowed_origins` and `path` are read when given.
+    #[test]
+    fn streamable_http_transport_reads_origins_and_path() {
+        let cfg = parse(
+            "mcp:\n  transport:\n    streamable_http:\n      bind: 127.0.0.1:0\n      token: t0k\n      allowed_origins:\n        - https://chatgpt.com\n      path: /rpc\n",
+        )
+        .expect("streamable_http with origins and path");
+        match &cfg.mcp.transport {
+            McpTransport::StreamableHttp {
+                allowed_origins,
+                path,
+                ..
+            } => {
+                assert_eq!(allowed_origins, &["https://chatgpt.com".to_string()]);
+                assert_eq!(path, "/rpc");
+            }
+            other => panic!("expected StreamableHttp, got {other:?}"),
         }
     }
 }

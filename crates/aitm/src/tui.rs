@@ -231,7 +231,11 @@ pub fn build_servers(cfg: &Config, services: Services) -> (Option<McpServer>, In
         // seeded from `mcp.policy` (default `auto`) and the operator/agent token
         // classes — an external agent here is gated exactly as on the bare-`aitm`
         // server path, not left ungated.
-        McpTransport::LoopbackTcp { .. } => Some(
+        // Both loopback-TCP and streamable-HTTP are addressable agent endpoints
+        // that do not share the terminal with the TUI, so they carry the policy
+        // gate and the operator/agent token classes exactly as on the bare-`aitm`
+        // server path.
+        McpTransport::LoopbackTcp { .. } | McpTransport::StreamableHttp { .. } => Some(
             server(cfg, cfg.mcp.transport.clone(), &services)
                 .with_agent_state(Arc::new(AgentState::new(cfg.mcp.policy)))
                 .with_mcp_roles(cfg.mcp.operator_token.clone(), cfg.mcp.stdio_role),

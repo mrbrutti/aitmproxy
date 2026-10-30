@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "aitmproxy",
+  "version": "0.1.0",
+  "description": "aitmproxy — an intercepting proxy for authorized security testing. Capture, inspect, intercept and mutate, replay, and turn traffic into findings and proof-of-concept exploits, driven over MCP.",
+  "extensions": {
+    "com.openai": {
+      "interface": "mcp",
+      "onboardingSkill": "aitmproxy-overview"
+    }
+  }
+}

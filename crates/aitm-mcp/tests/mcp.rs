@@ -3037,3 +3037,332 @@ fn agent_cannot_approve_own_request() {
         "operator gets a no-such-request error, not a role refusal: {text}"
     );
 }
+
+// --------------------------------------------------- Task 3 (W2): resources/*
+
+/// AC1: `initialize` advertises both `tools` and `resources` capabilities and
+/// the `io.modelcontextprotocol/ui` extension, while keeping the existing
+/// top-level `role` and `serverInfo`.
+#[test]
+fn initialize_advertises_resources() {
+    let srv = server();
+    let resp = rpc(&srv, 1, "initialize", json!({}));
+    let caps = &resp["result"]["capabilities"];
+    assert!(caps["tools"].is_object(), "tools capability kept: {resp}");
+    assert!(
+        caps["resources"].is_object(),
+        "resources capability: {resp}"
+    );
+    assert_eq!(
+        caps["extensions"]["io.modelcontextprotocol/ui"]["mimeTypes"][0],
+        "text/html;profile=mcp-app",
+        "ui extension advertised: {resp}"
+    );
+    // Existing fields survive.
+    assert_eq!(resp["result"]["serverInfo"]["name"], "aitmproxy");
+    assert!(
+        resp["result"]["role"].is_string(),
+        "top-level role kept: {resp}"
+    );
+}
+
+/// AC2: `resources/list` returns exactly seven widget entries, each with the
+/// MCP-app mime, a `ui://aitm/` uri, and the resource `_meta` keys.
+#[test]
+fn resources_list_seven() {
+    let srv = server();
+    let resp = rpc(&srv, 1, "resources/list", json!({}));
+    let list = resp["result"]["resources"]
+        .as_array()
+        .expect("resources array");
+    assert_eq!(list.len(), 7, "seven widgets: {resp}");
+    for entry in list {
+        assert_eq!(
+            entry["mimeType"], "text/html;profile=mcp-app",
+            "mime: {entry}"
+        );
+        assert!(
+            entry["uri"]
+                .as_str()
+                .expect("uri")
+                .starts_with("ui://aitm/"),
+            "uri scheme: {entry}"
+        );
+        let meta = &entry["_meta"];
+        assert_eq!(meta["ui"]["csp"]["connectDomains"], json!([]), "{entry}");
+        assert_eq!(meta["ui"]["csp"]["resourceDomains"], json!([]), "{entry}");
+        assert_eq!(
+            meta["openai/widgetCSP"]["connect_domains"],
+            json!([]),
+            "{entry}"
+        );
+        assert_eq!(meta["ui"]["domain"], "aitmproxy.widget", "{entry}");
+        assert_eq!(meta["openai/widgetDomain"], "aitmproxy.widget", "{entry}");
+        assert!(meta["ui"]["prefersBorder"].is_boolean(), "{entry}");
+        assert_eq!(
+            meta["openai/ui"]["availableDisplayModes"],
+            json!(["inline"]),
+            "{entry}"
+        );
+    }
+}
+
+/// AC3: `resources/read` for each widget uri returns the MCP-app mime and a
+/// `<!DOCTYPE html>` body; an unknown uri is a JSON-RPC INVALID_PARAMS error.
+#[test]
+fn resources_read_doctype_and_unknown() {
+    let srv = server();
+    let list = rpc(&srv, 1, "resources/list", json!({}));
+    let uris: Vec<String> = list["result"]["resources"]
+        .as_array()
+        .expect("resources array")
+        .iter()
+        .map(|e| e["uri"].as_str().expect("uri").to_string())
+        .collect();
+    assert_eq!(uris.len(), 7);
+    for uri in &uris {
+        let resp = rpc(&srv, 2, "resources/read", json!({"uri": uri}));
+        let item = &resp["result"]["contents"][0];
+        assert_eq!(item["mimeType"], "text/html;profile=mcp-app", "{resp}");
+        assert_eq!(item["uri"], json!(uri), "{resp}");
+        assert!(
+            item["text"]
+                .as_str()
+                .expect("text")
+                .starts_with("<!DOCTYPE html>"),
+            "doctype: {resp}"
+        );
+        // Design B: the read item carries the same resource `_meta` as the list
+        // entry (CSP, domain, border, display modes — standard + `openai/*`).
+        let meta = &item["_meta"];
+        assert_eq!(meta["ui"]["csp"]["connectDomains"], json!([]), "{resp}");
+        assert_eq!(meta["ui"]["csp"]["resourceDomains"], json!([]), "{resp}");
+        assert_eq!(
+            meta["openai/widgetCSP"]["connect_domains"],
+            json!([]),
+            "{resp}"
+        );
+        assert_eq!(meta["ui"]["domain"], "aitmproxy.widget", "{resp}");
+        assert_eq!(meta["openai/widgetDomain"], "aitmproxy.widget", "{resp}");
+        assert!(meta["ui"]["prefersBorder"].is_boolean(), "{resp}");
+        assert_eq!(
+            meta["openai/ui"]["availableDisplayModes"],
+            json!(["inline"]),
+            "{resp}"
+        );
+    }
+    // Unknown uri → INVALID_PARAMS.
+    let bad = rpc(&srv, 3, "resources/read", json!({"uri": "ui://aitm/nope"}));
+    assert_eq!(bad["error"]["code"], json!(INVALID_PARAMS), "{bad}");
+    // Missing uri → INVALID_PARAMS.
+    let missing = rpc(&srv, 4, "resources/read", json!({}));
+    assert_eq!(missing["error"]["code"], json!(INVALID_PARAMS), "{missing}");
+}
+
+// ------------------------------------------------- Task 5: widget tool overlay
+
+/// A name/result-only stub so `tools/list` carries a given tool name through the
+/// `widget_meta_for` overlay (the overlay keys off `Command::name()` and uses the
+/// command's `schema().result` for `outputSchema`).
+struct WidgetStub {
+    tool: &'static str,
+    result: TypeDesc,
+}
+
+impl Command for WidgetStub {
+    fn name(&self) -> &str {
+        self.tool
+    }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
+    }
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "widget stub".into(),
+            params: vec![],
+            result: self.result.clone(),
+        }
+    }
+    fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+        match &self.result {
+            TypeDesc::Array(_) => Ok(Value::Array(vec![])),
+            _ => Ok(Value::Object(BTreeMap::new())),
+        }
+    }
+}
+
+/// A server whose registry carries the widget-named stub tools (object-result
+/// unless the name is an array tool), so `tools/list` exercises the overlay.
+fn widget_server() -> McpServer {
+    let obj = || TypeDesc::Object(vec![]);
+    let arr = || TypeDesc::Array(Box::new(TypeDesc::Str));
+    let mut reg = Registry::new();
+    for (tool, result) in [
+        ("flow.table", obj()),
+        ("flow.detail", obj()),
+        ("findings.list", arr()),
+        ("findings.get", obj()),
+        ("scope.list", arr()),
+        ("poc.run", obj()),
+        ("poc.get", obj()),
+        ("proxy.status", obj()),
+        ("tls.passthrough.list", arr()),
+    ] {
+        reg.add_command(Arc::new(WidgetStub { tool, result }));
+    }
+    McpServer::new(Arc::new(reg), McpTransport::Stdio)
+        .with_agent_state(ungated())
+        .with_services(
+            Arc::new(MemFlowStore::new()),
+            Arc::new(StubClient),
+            Arc::new(StdGuard::default()),
+            None,
+        )
+}
+
+/// Find the `tools/list` entry for `name`.
+fn tool_entry(list_resp: &JsonValue, name: &str) -> JsonValue {
+    list_resp["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .find(|t| t["name"] == name)
+        .unwrap_or_else(|| panic!("{name} listed: {list_resp}"))
+        .clone()
+}
+
+/// AC4: a render widget tool carries its `_meta` link (standard + `openai/*`
+/// alias, equal), ≤ 64-char invocation strings; the data-only widget-accessible
+/// tool carries `ui.visibility` + legacy `openai/widgetAccessible` and **no**
+/// resource link.
+#[test]
+fn widget_tools_carry_meta() {
+    let srv = widget_server();
+    let resp = rpc(&srv, 1, "tools/list", json!({}));
+
+    let table = tool_entry(&resp, "flow.table");
+    let meta = &table["_meta"];
+    assert_eq!(meta["ui"]["resourceUri"], "ui://aitm/flows", "{table}");
+    assert_eq!(
+        meta["openai/outputTemplate"], "ui://aitm/flows",
+        "alias: {table}"
+    );
+    assert_eq!(
+        meta["ui"]["resourceUri"], meta["openai/outputTemplate"],
+        "standard == alias: {table}"
+    );
+    let invoking = meta["openai/toolInvocation/invoking"]
+        .as_str()
+        .expect("invoking string");
+    let invoked = meta["openai/toolInvocation/invoked"]
+        .as_str()
+        .expect("invoked string");
+    assert_eq!(invoking, "Fetching flows", "{table}");
+    assert_eq!(invoked, "Flows ready", "{table}");
+    assert!(invoking.len() <= 64 && invoked.len() <= 64, "<=64: {table}");
+
+    let tls = tool_entry(&resp, "tls.passthrough.list");
+    let tmeta = &tls["_meta"];
+    assert_eq!(tmeta["ui"]["visibility"], json!(["model", "app"]), "{tls}");
+    assert_eq!(tmeta["openai/widgetAccessible"], json!(true), "{tls}");
+    assert!(
+        tmeta["ui"]["resourceUri"].is_null(),
+        "no resourceUri: {tls}"
+    );
+    assert!(
+        tmeta["openai/outputTemplate"].is_null(),
+        "no output template: {tls}"
+    );
+}
+
+/// AC5: every widget tool carries all three annotation hints; all read-only
+/// except `poc.run`; `outputSchema.type` is `object` for object tools and
+/// `array` for `findings.list`/`scope.list`.
+#[test]
+fn widget_annotations_and_output_schema() {
+    let srv = widget_server();
+    let resp = rpc(&srv, 1, "tools/list", json!({}));
+
+    for name in [
+        "flow.table",
+        "flow.detail",
+        "findings.list",
+        "findings.get",
+        "scope.list",
+        "poc.run",
+        "poc.get",
+        "proxy.status",
+    ] {
+        let e = tool_entry(&resp, name);
+        let ann = &e["annotations"];
+        assert!(ann["readOnlyHint"].is_boolean(), "readOnlyHint: {e}");
+        assert!(ann["destructiveHint"].is_boolean(), "destructiveHint: {e}");
+        assert!(ann["openWorldHint"].is_boolean(), "openWorldHint: {e}");
+        assert_eq!(ann["destructiveHint"], json!(false), "{e}");
+        if name == "poc.run" {
+            assert_eq!(ann["readOnlyHint"], json!(false), "{e}");
+            assert_eq!(ann["openWorldHint"], json!(true), "{e}");
+        } else {
+            assert_eq!(ann["readOnlyHint"], json!(true), "{e}");
+            assert_eq!(ann["openWorldHint"], json!(false), "{e}");
+        }
+    }
+
+    for name in ["flow.table", "flow.detail", "findings.get", "poc.run"] {
+        let e = tool_entry(&resp, name);
+        assert_eq!(e["outputSchema"]["type"], "object", "object tool: {e}");
+    }
+    for name in ["findings.list", "scope.list"] {
+        let e = tool_entry(&resp, name);
+        assert_eq!(e["outputSchema"]["type"], "array", "array tool: {e}");
+    }
+}
+
+/// AC6 no-regression: a non-widget tool's `tools/list` entry gains no overlay
+/// keys and is byte-identical to `to_mcp_tool(..).to_json()`; a widget tool's
+/// `tools/call` result gains no `_meta`.
+#[test]
+fn non_widget_tools_byte_identical() {
+    let srv = server();
+    let resp = rpc(&srv, 1, "tools/list", json!({}));
+
+    let non_widget: Vec<(&str, Box<dyn Command>)> = vec![
+        ("demo.ping", Box::new(PingCmd)),
+        ("demo.echo", Box::new(EchoCmd)),
+        ("demo.fail", Box::new(FailCmd)),
+        ("demo.capture", Box::new(CaptureCmd)),
+        ("flow.get", Box::new(FlowGetCmd)),
+        ("flow.list", Box::new(FlowListCmd)),
+    ];
+    for (name, cmd) in &non_widget {
+        let entry = tool_entry(&resp, name);
+        assert!(
+            entry.get("annotations").is_none(),
+            "no annotations: {entry}"
+        );
+        assert!(
+            entry.get("outputSchema").is_none(),
+            "no outputSchema: {entry}"
+        );
+        assert!(entry.get("_meta").is_none(), "no _meta: {entry}");
+        assert_eq!(
+            entry,
+            StdSchemaDerive.to_mcp_tool(cmd.as_ref()).to_json(),
+            "byte-identical to the overlay-free derivation: {name}"
+        );
+    }
+
+    // A widget tool's tools/call result gains NO `_meta`.
+    let wsrv = widget_server();
+    let call = rpc(
+        &wsrv,
+        2,
+        "tools/call",
+        json!({"name": "proxy.status", "arguments": {}}),
+    );
+    assert_eq!(call["result"]["isError"], json!(false), "{call}");
+    assert!(
+        call["result"].get("_meta").is_none(),
+        "no result _meta: {call}"
+    );
+}

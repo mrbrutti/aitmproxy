@@ -19,7 +19,7 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 55] = [
+const EXPECTED_TOOLS: [&str; 56] = [
     // M4 agent-control and F4 subscription tools, registered unconditionally by
     // the `AgentPlugin` and `SubscriptionPlugin` in `wire.rs`.
     "agent.status",
@@ -29,6 +29,8 @@ const EXPECTED_TOOLS: [&str; 55] = [
     "flow.subscribe",
     "flow.unsubscribe",
     "flow.list",
+    // aitmproxy-plugin (W4): read-only bulk flow summary that backs the flows widget.
+    "flow.table",
     "flow.get",
     "flow.detail",
     "flow.replay",

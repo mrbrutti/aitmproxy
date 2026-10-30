@@ -34,6 +34,7 @@ impl Plugin for CapturePlugin {
     fn load(&mut self, reg: &mut Registry) {
         reg.add_command(Arc::new(FlowList));
         reg.add_command(Arc::new(FlowGet));
+        reg.add_command(Arc::new(FlowTable));
     }
 }
 
@@ -179,6 +180,139 @@ fn summarize(flow: &Flow) -> Value {
             put("messages", Value::Int(f.messages.len() as i64));
             put("is_replay", Value::Bool(f.metadata.is_replay));
             put("intercept", Value::Str(f.intercept.label().into()));
+        }
+    }
+    Value::Object(obj)
+}
+
+/// `flow.table` → one summary row per stored flow, oldest first, for a flows
+/// table: method, URL parts, status, duration, state, and marks. Read-only; no
+/// headers or bodies, so the result stays small and model-safe.
+struct FlowTable;
+
+impl Command for FlowTable {
+    fn name(&self) -> &str {
+        "flow.table"
+    }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Read
+    }
+
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "Per-flow summaries for a flows table: method, URL, status, \
+                 duration, state, and marks, oldest first. Read-only."
+                .into(),
+            params: vec![],
+            result: TypeDesc::Object(vec![ParamDef {
+                name: "flows".into(),
+                ty: TypeDesc::Array(Box::new(TypeDesc::Object(row_fields()))),
+                required: true,
+                description: "One summary row per captured flow, oldest first.".into(),
+            }]),
+        }
+    }
+
+    fn invoke(&self, _args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        let rows = host
+            .store()
+            .list()
+            .into_iter()
+            .filter_map(|id| host.store().get(id))
+            .map(|flow| flow_row(&flow))
+            .collect();
+        let mut obj = BTreeMap::new();
+        obj.insert("flows".to_string(), Value::Array(rows));
+        Ok(Value::Object(obj))
+    }
+}
+
+/// The fields `flow_row` emits. HTTP-only fields are nullable: a WebSocket row
+/// reports `id`/`kind`/`state`/`marks` and leaves the HTTP fields null.
+fn row_fields() -> Vec<ParamDef> {
+    let field = |name: &str, ty: TypeDesc, required: bool, description: &str| ParamDef {
+        name: name.into(),
+        ty,
+        required,
+        description: description.into(),
+    };
+    vec![
+        field("id", TypeDesc::FlowId, true, "The flow id."),
+        field("kind", TypeDesc::Str, true, "`http` or `websocket`."),
+        field("state", TypeDesc::Str, true, "Interception state."),
+        field(
+            "marks",
+            TypeDesc::Array(Box::new(TypeDesc::Str)),
+            true,
+            "Marks applied to the flow.",
+        ),
+        field("method", TypeDesc::Str, false, "HTTP request method."),
+        field(
+            "authority",
+            TypeDesc::Str,
+            false,
+            "HTTP request host[:port].",
+        ),
+        field("path", TypeDesc::Str, false, "HTTP request path and query."),
+        field(
+            "status",
+            TypeDesc::Int,
+            false,
+            "Response status; null until it arrives.",
+        ),
+        field(
+            "duration_ms",
+            TypeDesc::Int,
+            false,
+            "Flow duration in whole milliseconds; null if unknown.",
+        ),
+    ]
+}
+
+/// A single flows-table row: identity, state, marks, and (HTTP only) the request
+/// line and response status. No headers, no bodies.
+fn flow_row(flow: &Flow) -> Value {
+    let mut obj = BTreeMap::new();
+    let mut put = |k: &str, v: Value| {
+        obj.insert(k.to_string(), v);
+    };
+    put("id", Value::Str(flow.id().to_string()));
+    put("state", Value::Str(flow.intercept().label().into()));
+    put(
+        "marks",
+        Value::Array(
+            flow.metadata()
+                .marks
+                .iter()
+                .map(|m| Value::Str(m.clone()))
+                .collect(),
+        ),
+    );
+    put(
+        "duration_ms",
+        flow.metadata().duration.map_or(Value::Null, |d| {
+            Value::Int(d.as_millis().min(i64::MAX as u128) as i64)
+        }),
+    );
+    match flow {
+        Flow::Http(f) => {
+            put("kind", Value::Str("http".into()));
+            put("method", Value::Str(f.request.method.clone()));
+            put("authority", Value::Str(f.request.authority.clone()));
+            put("path", Value::Str(f.request.path.clone()));
+            put(
+                "status",
+                f.response
+                    .as_ref()
+                    .map_or(Value::Null, |r| Value::Int(i64::from(r.status))),
+            );
+        }
+        Flow::WebSocket(_) => {
+            put("kind", Value::Str("websocket".into()));
+            put("method", Value::Null);
+            put("authority", Value::Null);
+            put("path", Value::Null);
+            put("status", Value::Null);
         }
     }
     Value::Object(obj)

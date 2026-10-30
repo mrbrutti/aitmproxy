@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "aitmproxy": {
+      "command": "aitm",
+      "args": [],
+      "env": {}
+    }
+  }
+}
