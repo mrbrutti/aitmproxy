@@ -171,7 +171,16 @@ public enum EmbeddedCoreLaunch {
         public var obscuraBinary: URL
         public var proxyPort: UInt16
         public var browserProxyPort: UInt16
+        /// The agent bus token (`mcp.transport.loopback_tcp.token`): a connection
+        /// presenting it is classified `Frontend::Mcp`. The app does NOT connect
+        /// with this — it is required by the loopback transport and left for an
+        /// autonomous agent that may attach later.
         public var token: String
+        /// The operator bus token (`mcp.operator_token`): a connection presenting
+        /// it is classified `Frontend::Operator`, a present human. The app connects
+        /// with THIS token so its Scope panel can widen scope at runtime (the core
+        /// lets an operator widen; agents stay gated). Distinct from `token`.
+        public var operatorToken: String
         public var endpointFile: URL
 
         public init(
@@ -179,12 +188,14 @@ public enum EmbeddedCoreLaunch {
             proxyPort: UInt16,
             browserProxyPort: UInt16,
             token: String,
+            operatorToken: String,
             endpointFile: URL
         ) {
             self.obscuraBinary = obscuraBinary
             self.proxyPort = proxyPort
             self.browserProxyPort = browserProxyPort
             self.token = token
+            self.operatorToken = operatorToken
             self.endpointFile = endpointFile
         }
 
@@ -198,6 +209,11 @@ public enum EmbeddedCoreLaunch {
         /// budget stays under the Swift-side `SIGKILL` grace — AC7), and both paths
         /// are escaped for a double-quoted YAML scalar so a path with a quote or
         /// backslash cannot break the file; a path with a newline is rejected.
+        ///
+        /// `mcp.operator_token` is emitted alongside the agent token so the app can
+        /// connect as a present human (`Frontend::Operator`) and widen scope from
+        /// its Scope panel; no `scope:` block is emitted, so startup scope stays
+        /// deny-by-default/empty and agents remain gated.
         public func yaml() throws -> String {
             let obscuraPath = try EmbeddedCoreLaunch.yamlDoubleQuoted(obscuraBinary.path)
             let endpointPath = try EmbeddedCoreLaunch.yamlDoubleQuoted(endpointFile.path)
@@ -209,6 +225,7 @@ public enum EmbeddedCoreLaunch {
                   port: 0
                   token: "\(token)"
                   endpoint_file: "\(endpointPath)"
+              operator_token: "\(operatorToken)"
             browser:
               proxy_addr: "127.0.0.1:\(browserProxyPort)"
               obscura:
