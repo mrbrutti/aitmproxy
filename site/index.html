@@ -93,13 +93,13 @@
     <div class="operators">
       <div class="operator">
         <p class="operator-who">by hand</p>
-        <code><span class="pr">$ </span>aitm flow mutate --id 41 --set-body <span class="s">'{"qty":999}'</span></code>
+        <code>edit the body in the app → <span class="s">Resume</span></code>
       </div>
       <div class="operator operator--agent">
         <p class="operator-who">by agent</p>
-        <code>flow.mutate({ id: 41, set_body: <span class="s">'{"qty":999}'</span> })</code>
+        <code>flow.mutate({ id: 41, edits: { body: <span class="s">'{"qty":999}'</span> } })</code>
       </div>
-      <p class="operators-note">Two operators, one command. Both reach the same held flow, and both land in the same audit log.</p>
+      <p class="operators-note">One command, two operators: a person holds and edits the flow in the app or terminal UI; an agent calls the same <code>flow.mutate</code> over MCP. Same flow, same audit log.</p>
     </div>
 
     <div class="hero-cta">
@@ -153,32 +153,29 @@
 <section class="section" id="operators">
   <div class="wrap">
     <h2 class="h2" data-reveal>Two operators. One control surface.</h2>
-    <p class="lead deck" data-reveal data-d="1">Every action in aitmproxy is a command. A person runs it from the CLI or a GUI; an AI assistant calls the very same command over MCP. There is no second API for agents and no hidden menu for humans — one core, and one record of who did what.</p>
+    <p class="lead deck" data-reveal data-d="1">Every action in aitmproxy is a registered command, and the command is the same whoever runs it. A person works in the app or the terminal UI; an AI assistant calls the very same command over MCP; the <code>aitm</code> CLI runs any command one-shot, for setup and scripting. One core, one audit log — and a live, held flow is steered from a UI or over MCP, not from a second shell.</p>
 
     <div class="split">
       <div class="split-col" data-reveal>
-        <h3>By hand, in a terminal</h3>
+        <h3>By hand, in the app</h3>
         <figure class="code term">
-          <figcaption><span>zsh — aitm</span><button class="copy" type="button" data-copy aria-label="Copy transcript"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="pr">$ </span><span class="in">aitm intercept add --match <span class="s">'POST /api/cart/*'</span></span>
-<span class="out">rule r1 armed · POST /api/cart/*</span>
-<span class="pr">$ </span><span class="in">aitm flow list --held</span>
-<span class="out">41  POST  /api/cart/items  armed  —</span>
-<span class="pr">$ </span><span class="in">aitm flow mutate --id 41 --set-body <span class="s">'{"qty":999}'</span></span>
-<span class="out">flow 41 body updated (27 B)</span>
-<span class="pr">$ </span><span class="in">aitm flow resume --id 41</span>
-<span class="out">flow 41 → 200 in 212 ms</span></code></pre>
+          <figcaption><span>app — aitmproxy</span></figcaption>
+<pre><code><span class="out">arm intercept</span>  <span class="in">POST /api/cart/*</span>
+<span class="out">held</span>          <span class="in">#41  POST /api/cart/items</span>
+<span class="out">edit body</span>     <span class="in">{ "qty": 999 }</span>
+<span class="out">press</span> <span class="in">Resume</span>  <span class="out">#41 → 200 in 212 ms</span></code></pre>
         </figure>
+        <p class="deck muted">The buttons run the same commands below — <code>flow.intercept</code>, <code>flow.mutate</code>, <code>flow.resume</code> — in the web UI, the terminal UI or the macOS app.</p>
       </div>
       <div class="split-col" data-reveal data-d="1">
         <h3>By agent, over MCP</h3>
         <figure class="code term">
           <figcaption><span>mcp — aitmproxy</span><button class="copy" type="button" data-copy aria-label="Copy transcript"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="who">›</span> <span class="in">intercept.add({ match: <span class="s">"POST /api/cart/*"</span> })</span>
-<span class="who">‹</span> <span class="out">{ rule: "r1", state: "armed" }</span>
+<pre><code><span class="who">›</span> <span class="in">flow.intercept({ enabled: <span class="n">true</span> })</span>
+<span class="who">‹</span> <span class="out">{ enabled: true }</span>
 <span class="who">›</span> <span class="in">flow.list({ held: <span class="n">true</span> })</span>
 <span class="who">‹</span> <span class="out">[{ id: 41, method: "POST", path: "/api/cart/items", state: "armed" }]</span>
-<span class="who">›</span> <span class="in">flow.mutate({ id: <span class="n">41</span>, set_body: <span class="s">'{"qty":999}'</span> })</span>
+<span class="who">›</span> <span class="in">flow.mutate({ id: <span class="n">41</span>, edits: { body: <span class="s">'{"qty":999}'</span> } })</span>
 <span class="who">‹</span> <span class="out">{ id: 41, body_bytes: 27 }</span>
 <span class="who">›</span> <span class="in">flow.resume({ id: <span class="n">41</span> })</span>
 <span class="who">‹</span> <span class="out">{ id: 41, status: 200, ms: 212 }</span></code></pre>
@@ -199,7 +196,7 @@
         <caption>One log. Every command, whoever issued it.</caption>
         <thead><tr><th>time</th><th>operator</th><th>command</th><th>target</th><th>result</th></tr></thead>
         <tbody>
-          <tr><td class="t">12:04:17.221</td><td class="who">hand</td><td>intercept.add</td><td>r1</td><td>armed</td></tr>
+          <tr><td class="t">12:04:17.221</td><td class="who">hand</td><td>flow.intercept</td><td>r1</td><td>armed</td></tr>
           <tr><td class="t">12:04:19.004</td><td class="who">agent</td><td>flow.list</td><td>held</td><td>1 flow</td></tr>
           <tr class="same"><td class="t">12:04:21.310</td><td class="who">hand</td><td>flow.mutate</td><td>#41</td><td>body 27 B</td></tr>
           <tr class="same"><td class="t">12:04:21.318</td><td class="who">agent</td><td>flow.mutate</td><td>#41</td><td>body 27 B</td></tr>
@@ -385,10 +382,10 @@ content-type: application/json
 
       <article class="feature" data-reveal>
         <h3 class="h3">Scriptable, all of it</h3>
-        <p>Every command above has a CLI form and an MCP form, and all of them can be called from a Rhai plugin.</p>
+        <p>Every command has a CLI form, an MCP tool and a Rhai call — the same name and shape. One-shot from the shell for setup and scripting; live flows are driven from a UI or an agent.</p>
         <div class="pair">
-          <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm flow resume --id 41</code></div>
-          <div class="pair-row is-agent"><span class="pair-who">agent</span><code>flow.resume({ id: 41 })</code></div>
+          <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm scope add --host shop.example.com</code></div>
+          <div class="pair-row is-agent"><span class="pair-who">agent</span><code>scope.add({ host: <span class="s">"shop.example.com"</span> })</code></div>
         </div>
         <a class="arrow" href="scripting.html">Scripting</a>
       </article>
@@ -545,7 +542,7 @@ content-type: application/json
         <div class="steps">
           <div class="cmd"><code><span class="pr">$ </span>brew install mrbrutti/aitmproxy/aitm</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
           <div class="cmd"><code><span class="pr">$ </span>aitm ca install</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
-          <div class="cmd"><code><span class="pr">$ </span>aitm start</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
+          <div class="cmd"><code><span class="pr">$ </span>aitm web</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
         </div>
         <p class="deck muted">The proxy listens on <code>127.0.0.1:8080</code>; the web UI opens on <code>:8082</code>. Prefer the macOS app, Linux packages or Cargo? The <a href="download.html">download page</a> has every option.</p>
       </div>

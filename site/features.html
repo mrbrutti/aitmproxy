@@ -38,7 +38,7 @@
 <section class="page-head">
   <div class="wrap">
     <h1 class="display">Every feature, by hand or by agent.</h1>
-    <p class="lead">What follows is the whole surface of aitmproxy. Under each one you will find the same action written twice: once as you would type it, once as an assistant would call it over MCP. They are the same call into the same core.</p>
+    <p class="lead">What follows is the whole surface of aitmproxy. Every action is one registered command, the same on every surface: a person runs it in the app or the terminal UI (and one-shot on the CLI for setup and scripting), an assistant calls it over MCP. A live, held flow is driven from a UI or over MCP — the one-shot <code>aitm</code> CLI does not attach to a running proxy. Each feature below shows the command by hand and as an agent calls it.</p>
   </div>
 </section>
 
@@ -56,8 +56,8 @@
       <li>Every resume records a diff against the original in the flow's history.</li>
     </ul>
     <div class="pair">
-      <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm intercept add --match <span class="s">'POST /api/cart/*'</span> --hold request,response</code></div>
-      <div class="pair-row"><span class="pair-who">agent</span><code>intercept.add({ match: <span class="s">"POST /api/cart/*"</span>, hold: [<span class="s">"request"</span>, <span class="s">"response"</span>] })</code></div>
+      <div class="pair-row"><span class="pair-who">in app</span><code>arm interception → edit the held flow → <span class="s">Resume</span></code></div>
+      <div class="pair-row is-agent"><span class="pair-who">agent</span><code>flow.intercept({ enabled: <span class="n">true</span> })</code></div>
     </div>
   </div>
   <div class="feat-stack">
@@ -93,22 +93,19 @@
     <p>Replay sends a captured request again, optionally with changes, and records the result as a new flow linked to the original. Compose builds a request from nothing: method, URL, headers, body. Both go through the same pipeline as live traffic, so rules and plugins apply to them too.</p>
     <p>Replays are how you turn a hunch into evidence: change one header, one parameter, one byte, and compare the two responses side by side.</p>
     <div class="pair">
-      <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm flow replay --id 41 --set-header <span class="s">'X-Debug: 1'</span></code></div>
-      <div class="pair-row"><span class="pair-who">agent</span><code>flow.replay({ id: 41, set_header: { <span class="s">"X-Debug"</span>: <span class="s">"1"</span> } })</code></div>
+      <div class="pair-row"><span class="pair-who">in app</span><code>select flow #41 → add a header → <span class="s">Replay</span></code></div>
+      <div class="pair-row is-agent"><span class="pair-who">agent</span><code>flow.replay({ id: 41, edits: { headers: { <span class="s">"X-Debug"</span>: <span class="s">"1"</span> } } })</code></div>
     </div>
   </div>
   <div class="feat-stack">
     <figure class="code term">
-      <figcaption><span>zsh — aitm</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="pr">$ </span><span class="in">aitm flow replay --id 41 --set-header <span class="s">'X-Debug: 1'</span></span>
-<span class="out">#44  POST  /api/cart/items  200  198 ms  (replay of #41)</span>
-<span class="pr">$ </span><span class="in">aitm flow diff 41 44</span>
-<span class="out">request.headers   + X-Debug: 1</span>
-<span class="out">response.headers  + X-Debug-Trace: 7f3a…</span>
-<span class="out">response.body     = identical (1,204 B)</span>
-<span class="pr">$ </span><span class="in">aitm compose POST https://shop.example.com/api/cart/items \</span>
-<span class="in">    -H <span class="s">'content-type: application/json'</span> -d <span class="s">'{"sku":"A-1042","qty":1}'</span></span>
-<span class="out">#45  POST  /api/cart/items  201  164 ms</span></code></pre>
+      <figcaption><span>mcp — aitmproxy</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="who">›</span> <span class="in">flow.replay({ id: <span class="n">41</span>, edits: { headers: { <span class="s">"X-Debug"</span>: <span class="s">"1"</span> } } })</span>
+<span class="who">‹</span> <span class="out">{ id: 44, status: 200, ms: 198 }          // replay of #41</span>
+<span class="who">›</span> <span class="in">flow.detail({ id: <span class="n">44</span> })</span>
+<span class="who">‹</span> <span class="out">{ response: { headers: { "X-Debug-Trace": "7f3a…" }, body_bytes: 1204 } }</span>
+<span class="who">›</span> <span class="in">request.send({ method: <span class="s">"POST"</span>, url: <span class="s">"https://shop.example.com/api/cart/items"</span>, body: <span class="s">'{"sku":"A-1042","qty":1}'</span> })</span>
+<span class="who">‹</span> <span class="out">{ id: 45, status: 201, ms: 164 }</span></code></pre>
     </figure>
   </div>
 </article>
@@ -151,8 +148,8 @@
     <h2 class="h3">WebSocket inspect, inject and edit</h2>
     <p>A WebSocket is a flow too. After the upgrade, aitmproxy shows every frame in both directions as it happens: text or binary, with size, timing and direction. Hold a frame with a rule, change it, and let it continue. Or inject a frame of your own toward the client or the server, from the app, the CLI or a plugin.</p>
     <div class="pair">
-      <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm ws inject --flow 43 --to server --text <span class="s">'{"op":"subscribe","ch":"orders"}'</span></code></div>
-      <div class="pair-row"><span class="pair-who">agent</span><code>ws.inject({ flow: 43, to: <span class="s">"server"</span>, text: <span class="s">'{"op":"subscribe","ch":"orders"}'</span> })</code></div>
+      <div class="pair-row"><span class="pair-who">in app</span><code>on socket #43 → inject a frame toward the <span class="s">server</span></code></div>
+      <div class="pair-row is-agent"><span class="pair-who">agent</span><code>ws.send({ flow: 43, to: <span class="s">"server"</span>, text: <span class="s">'{"op":"subscribe","ch":"orders"}'</span> })</code></div>
     </div>
   </div>
   <div class="feat-stack">
@@ -183,8 +180,8 @@
       <li>Intercept rules, replay, Map Local and Remote, and plugins all apply unchanged.</li>
     </ul>
     <div class="pair">
-      <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm flow mutate --id 52 --set-body <span class="s">'{"query":"query { me { role } }"}'</span></code></div>
-      <div class="pair-row"><span class="pair-who">agent</span><code>flow.mutate({ id: 52, set_body: <span class="s">'{"query":"query { me { role } }"}'</span> })</code></div>
+      <div class="pair-row"><span class="pair-who">in app</span><code>hold stream 5 → edit the DATA frame → <span class="s">Resume</span></code></div>
+      <div class="pair-row is-agent"><span class="pair-who">agent</span><code>flow.mutate({ id: 52, edits: { body: <span class="s">'{"query":"query { me { role } }"}'</span> } })</code></div>
     </div>
   </div>
   <div class="feat-stack">
@@ -363,7 +360,7 @@
       <thead><tr><th>time</th><th>operator</th><th>command</th><th>target</th><th>result</th></tr></thead>
       <tbody>
         <tr><td class="t">12:03:58.110</td><td class="who">plugin</td><td>flow.set_response</td><td>#38</td><td>403 · finding</td></tr>
-        <tr><td class="t">12:04:17.221</td><td class="who">hand</td><td>intercept.add</td><td>r1</td><td>armed</td></tr>
+        <tr><td class="t">12:04:17.221</td><td class="who">hand</td><td>flow.intercept</td><td>r1</td><td>armed</td></tr>
         <tr><td class="t">12:04:19.004</td><td class="who">agent</td><td>flow.list</td><td>held</td><td>1 flow</td></tr>
         <tr class="same"><td class="t">12:04:21.310</td><td class="who">hand</td><td>flow.mutate</td><td>#41</td><td>body 27 B</td></tr>
         <tr class="same"><td class="t">12:04:21.318</td><td class="who">agent</td><td>flow.mutate</td><td>#41</td><td>body 27 B</td></tr>
@@ -387,7 +384,7 @@
         <div class="steps">
           <div class="cmd"><code><span class="pr">$ </span>brew install mrbrutti/aitmproxy/aitm</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
           <div class="cmd"><code><span class="pr">$ </span>aitm ca install</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
-          <div class="cmd"><code><span class="pr">$ </span>aitm start</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
+          <div class="cmd"><code><span class="pr">$ </span>aitm web</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
         </div>
         <p class="deck"><a class="arrow" href="docs.html">Getting started, step by step</a></p>
       </div>

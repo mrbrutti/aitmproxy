@@ -128,17 +128,13 @@
       <p>Start the proxy. It listens on <code>127.0.0.1:8080</code> and serves the web UI on <code>127.0.0.1:8082</code>. Point a browser, a simulator or your app at the proxy and flows start arriving.</p>
       <figure class="code" data-reveal>
         <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="pr">$ </span>aitm start
+<pre><code><span class="pr">$ </span>aitm web
 <span class="out">proxy    http://127.0.0.1:8080</span>
 <span class="out">web ui   http://127.0.0.1:8082</span>
-<span class="out">mcp      stdio (run `aitm mcp` from your assistant)</span>
 <span class="pr">$ </span>curl -x http://127.0.0.1:8080 https://shop.example.com/api/products?page=2
-<span class="pr">$ </span>aitm flow list --last 3
-<span class="out">42  GET   /api/users/me          200   12 ms</span>
-<span class="out">41  POST  /api/cart/items        200  198 ms</span>
-<span class="out">40  GET   /api/products?page=2   200   38 ms</span></code></pre>
+<span class="c"># the flow appears live in the web UI — no second command needed</span></code></pre>
       </figure>
-      <p>The macOS app and the terminal UI (<code>aitm tui</code>) show the same list live. Select a flow to read the request and response, headers and body, timing and the TLS details of the connection.</p>
+      <p><code>aitm web</code> runs the proxy and serves the web UI; <code>aitm tui</code> runs it with the terminal UI, and the macOS app bundles its own core. Each invocation is its own process — a bare <code>aitm</code> command is one-shot and does not attach to a proxy already running in another window; to drive a live session, use a UI or connect an agent over <a href="#mcp">MCP</a>. The flow list is live in whichever UI you launched: select a flow to read the request and response, headers and body, timing and the TLS details of the connection.</p>
       <table>
         <thead><tr><th>Shortcut</th><th>Action</th></tr></thead>
         <tbody>
@@ -154,29 +150,24 @@
       <p>Interception pauses a request in mid-air. Add a rule for the traffic you care about, trigger it from the app, and the flow appears as <em>armed</em>: readable and editable, going nowhere until you say so.</p>
       <figure class="code" data-reveal>
         <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="pr">$ </span>aitm intercept add --match <span class="s">'POST /api/cart/*'</span>
-<span class="out">rule r1 armed · POST /api/cart/*</span>
+<pre><code><span class="out">arm intercept</span>  <span class="in">POST /api/cart/*</span>
 <span class="c"># …add something to the cart in the app…</span>
-<span class="pr">$ </span>aitm flow list --held
-<span class="out">41  POST  /api/cart/items  armed  —</span>
-<span class="pr">$ </span>aitm flow show --id 41 --body
-<span class="out">{ "sku": "A-1042", "qty": 1 }</span>
-<span class="pr">$ </span>aitm flow mutate --id 41 --set-body <span class="s">'{"qty":999}'</span>
-<span class="out">flow 41 body updated (27 B)</span>
-<span class="pr">$ </span>aitm flow resume --id 41
-<span class="out">flow 41 → 200 in 212 ms</span></code></pre>
+<span class="out">held</span>          <span class="in">#41  POST /api/cart/items</span>
+<span class="out">body</span>          <span class="in">{ "sku": "A-1042", "qty": 1 }</span>
+<span class="out">edit →</span>        <span class="in">{ "qty": 999 }</span>
+<span class="out">Resume</span>        <span class="in">#41 → 200 in 212 ms</span></code></pre>
       </figure>
-      <p>In the app, the same four moves are: select the held row, edit the body in the detail pane, press <kbd>↩</kbd> to resume or <kbd>⌫</kbd> to drop. Response interception works the same way; add <code>--hold response</code> to the rule and the response pauses on its way back.</p>
+      <p>Those are the moves in the UI: select the held row, edit the body in the detail pane, press <kbd>↩</kbd> to resume or <kbd>⌫</kbd> to drop. Each is a command — <code>flow.intercept</code>, <code>flow.mutate</code>, <code>flow.resume</code> — so an agent does exactly the same over MCP (<a href="#by-agent">below</a>). Response interception works the same way: hold the response as well as the request.</p>
 
       <h3 id="by-agent">The same thing, by agent</h3>
-      <p>Connect an assistant to <code>aitm mcp</code> and it gets the same commands with the same names. Here is the sequence above as the assistant sees it:</p>
+      <p>Connect an assistant over MCP and it gets the same commands with the same names. Here is the sequence above as the assistant sees it:</p>
       <figure class="code term">
         <figcaption><span>mcp — aitmproxy</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="who">›</span> <span class="in">intercept.add({ match: <span class="s">"POST /api/cart/*"</span> })</span>
-<span class="who">‹</span> <span class="out">{ rule: "r1", state: "armed" }</span>
+<pre><code><span class="who">›</span> <span class="in">flow.intercept({ enabled: <span class="n">true</span> })</span>
+<span class="who">‹</span> <span class="out">{ enabled: true }</span>
 <span class="who">›</span> <span class="in">flow.list({ held: <span class="n">true</span> })</span>
 <span class="who">‹</span> <span class="out">[{ id: 41, method: "POST", path: "/api/cart/items", state: "armed" }]</span>
-<span class="who">›</span> <span class="in">flow.mutate({ id: <span class="n">41</span>, set_body: <span class="s">'{"qty":999}'</span> })</span>
+<span class="who">›</span> <span class="in">flow.mutate({ id: <span class="n">41</span>, edits: { body: <span class="s">'{"qty":999}'</span> } })</span>
 <span class="who">‹</span> <span class="out">{ id: 41, body_bytes: 27 }</span>
 <span class="who">›</span> <span class="in">flow.resume({ id: <span class="n">41</span> })</span>
 <span class="who">‹</span> <span class="out">{ id: 41, status: 200, ms: 212 }</span></code></pre>
@@ -187,17 +178,17 @@
       <p>aitmproxy is an MCP server: every command on this page is exposed to an assistant under the same name and shape. Connect one and it drives the proxy — hold, edit, replay, script, reproduce — through the same audited core you use by hand. How you connect depends on whether the client launches a command or reaches a URL.</p>
 
       <h3 id="mcp-claude">Claude Code and Claude Desktop</h3>
-      <p>Claude speaks MCP over stdio, so it launches <code>aitm mcp</code> directly. In Claude Code, add it in one line:</p>
+      <p>Claude speaks MCP over stdio, so it launches <code>aitm</code> directly (a bare <code>aitm</code> serves the stdio MCP server). In Claude Code, add it in one line:</p>
       <figure class="code" data-reveal>
         <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="pr">$ </span>claude mcp add aitmproxy -- aitm mcp</code></pre>
+<pre><code><span class="pr">$ </span>claude mcp add aitmproxy -- aitm</code></pre>
       </figure>
       <p>For Claude Desktop, add the server to <code>claude_desktop_config.json</code>:</p>
       <figure class="code" data-reveal>
         <figcaption><span>claude_desktop_config.json</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
 <pre><code><span class="p">{</span>
   <span class="yk">"mcpServers"</span>: <span class="p">{</span>
-    <span class="yk">"aitmproxy"</span>: <span class="p">{</span> <span class="yk">"command"</span>: <span class="s">"aitm"</span>, <span class="yk">"args"</span>: [<span class="s">"mcp"</span>] <span class="p">}</span>
+    <span class="yk">"aitmproxy"</span>: <span class="p">{</span> <span class="yk">"command"</span>: <span class="s">"aitm"</span> <span class="p">}</span>
   <span class="p">}</span>
 <span class="p">}</span></code></pre>
       </figure>
