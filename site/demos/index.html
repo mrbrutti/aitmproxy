@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Demos — aitmproxy</title>
+<meta name="description" content="Watch aitmproxy in action: capture and inspect traffic, intercept and modify a live request, replay, tamper WebSocket frames, scope, run a PoC into a finding, and crawl with the scanner — the real product driven feature by feature.">
+<link rel="stylesheet" href="../styles.css">
+<style>
+  .demos-intro { padding-top: clamp(5.5rem, 10vw, 8rem); padding-bottom: 0; }
+  .demos-intro .lead { max-width: 54ch; }
+
+  .player { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(0, 1fr);
+    gap: clamp(1.25rem, 2.5vw, 2.25rem); margin-top: clamp(2rem, 4vw, 3rem); align-items: start; }
+  @media (max-width: 920px) { .player { grid-template-columns: 1fr; } }
+
+  .stage { position: sticky; top: 90px; }
+  @media (max-width: 920px) { .stage { position: static; } }
+  .screen { position: relative; border: 1px solid var(--hairline); border-radius: var(--radius-panel);
+    overflow: hidden; background: #0b0e14; aspect-ratio: 16 / 10; }
+  .screen video { display: block; width: 100%; height: 100%; object-fit: contain; background: #0b0e14; }
+  .scrub { height: 3px; background: var(--paper-3); }
+  .scrub > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .1s linear; }
+  .nowplaying { margin-top: 0.9rem; display: flex; align-items: baseline; gap: 0.75rem; flex-wrap: wrap; }
+  .nowplaying h2 { font-size: var(--fs-h3); font-weight: 560; letter-spacing: -0.01em; }
+  .nowplaying p { color: var(--ink-2); margin-top: 0.4rem; font-size: var(--fs-small); line-height: 1.5; max-width: 60ch; }
+
+  .reel { display: flex; flex-direction: column; gap: 2px; }
+  .chapter { display: grid; grid-template-columns: 1.6rem 1fr auto; align-items: center; gap: 0.75rem;
+    width: 100%; text-align: left; background: none; border: 0; border-radius: var(--radius);
+    padding: 0.8rem 0.8rem; color: var(--ink-2); cursor: pointer; border-left: 2px solid transparent;
+    transition: background-color var(--dur, .18s) ease, color var(--dur, .18s) ease; font: inherit; }
+  .chapter:hover { background: var(--paper-2); color: var(--ink); }
+  .chapter[aria-current="true"] { background: var(--paper-2); color: var(--ink); border-left-color: var(--accent); }
+  .chapter .n { font-variant-numeric: tabular-nums; font-size: var(--fs-mono-s); color: var(--ink-3); }
+  .chapter .t { font-weight: 520; }
+  .chapter .t small { display: block; font-weight: 400; color: var(--ink-3); font-size: var(--fs-mono-s); margin-top: 1px; }
+  .chip { flex: none; font-size: var(--fs-mono-s); font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase;
+    padding: 0.18em 0.5em; border-radius: var(--radius-badge); }
+  .chip--operator { color: var(--accent); background: var(--accent-tint); }
+  .chip--agent { color: #0E7C6B; background: #CFF4EC; }
+  @media (prefers-color-scheme: dark) { .chip--agent { color: #4FD6BE; background: #10302B; } }
+
+  .demos-note { margin-top: clamp(2.5rem, 5vw, 4rem); color: var(--ink-3); font-size: var(--fs-small); max-width: 72ch; }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="wordmark" href="../index.html" aria-label="aitmproxy home">aitmproxy<i aria-hidden="true"></i></a>
+    <ul class="nav-links">
+      <li><a href="../features.html">Features</a></li>
+      <li><a href="../docs.html">Docs</a></li>
+      <li><a href="../scripting.html">Scripting</a></li>
+      <li><a href="../poc.html">PoC format</a></li>
+      <li><a class="btn" href="../download.html">Download</a></li>
+    </ul>
+    <details class="menu">
+      <summary>Menu</summary>
+      <ul class="nav-links">
+        <li><a href="../features.html">Features</a></li>
+        <li><a href="../docs.html">Docs</a></li>
+        <li><a href="../scripting.html">Scripting</a></li>
+        <li><a href="../poc.html">PoC format</a></li>
+        <li><a href="../download.html">Download</a></li>
+      </ul>
+    </details>
+  </div>
+</header>
+
+<main id="main">
+<section class="section demos-intro">
+  <div class="wrap">
+    <h1 class="display">See it work.</h1>
+    <p class="lead">The real aitmproxy, feature by feature — capturing and inspecting traffic, holding a request to rewrite it on the wire, tampering live WebSocket frames, replaying, enforcing deny-by-default scope, turning a proof-of-concept into a finding, and crawling a target to discover its endpoints. Pick a feature to watch it.</p>
+
+    <div class="player">
+      <div class="stage">
+        <div class="screen">
+          <video id="screen" autoplay muted loop playsinline preload="metadata"></video>
+          <div class="scrub"><i id="scrub"></i></div>
+        </div>
+        <div class="nowplaying">
+          <h2 id="np-title"></h2><span id="np-chip" class="chip"></span>
+        </div>
+        <p id="np-desc"></p>
+      </div>
+
+      <div class="reel" id="reel" role="tablist" aria-label="Features"></div>
+    </div>
+
+    <p class="demos-note">Recorded live on macOS: the real aitmproxy core and its operator web UI, driving a local test target (deny-by-default, loopback only). aitmproxy is for systems you own or are authorized to test.</p>
+  </div>
+</section>
+</main>
+
+<footer class="footer">
+  <div class="wrap">
+    <div>
+      <a class="wordmark" href="../index.html">aitmproxy<i aria-hidden="true"></i></a>
+      <p class="fine">A fast, memory-safe intercepting proxy for inspecting and editing HTTP and WebSocket traffic during development and authorized testing. Use it on systems you own or are permitted to test.</p>
+    </div>
+    <div>
+      <h4>Product</h4>
+      <ul>
+        <li><a href="../features.html">Features</a></li>
+        <li><a href="../docs.html">Documentation</a></li>
+        <li><a href="../scripting.html">Rhai scripting</a></li>
+        <li><a href="../poc.html">PoC format</a></li>
+        <li><a href="index.html">Demos</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Project</h4>
+      <ul>
+        <li><a href="#">Source</a></li>
+        <li><a href="#">Changelog</a></li>
+        <li><a href="#">MIT or Apache-2.0</a></li>
+      </ul>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // Feature reel — consumes the shared manifest (site/demos/demos.json) so the
+  // homepage timeline and this page stay in sync. Degrades gracefully when empty.
+  const reel = document.getElementById('reel');
+  const video = document.getElementById('screen');
+  const scrub = document.getElementById('scrub');
+  const npT = document.getElementById('np-title'), npC = document.getElementById('np-chip'), npD = document.getElementById('np-desc');
+  let CLIPS = [], current = -1;
+
+  function select(i) {
+    if (i === current || !CLIPS[i]) return;
+    current = i;
+    const c = CLIPS[i];
+    video.src = c.video;
+    video.poster = c.poster;
+    video.load(); video.play().catch(() => {});
+    npT.textContent = c.feature;
+    npD.textContent = c.caption;
+    npC.textContent = c.mode;
+    npC.className = 'chip chip--' + c.mode;
+    [...reel.children].forEach((el, j) => el.setAttribute('aria-current', j === i ? 'true' : 'false'));
+  }
+
+  fetch('demos.json').then((r) => r.ok ? r.json() : { clips: [] }).then((data) => {
+    CLIPS = (data && data.clips) || [];
+    if (!CLIPS.length) {
+      reel.innerHTML = '<p style="color:var(--ink-3)">Demo clips are being recorded — check back shortly.</p>';
+      return;
+    }
+    CLIPS.forEach((c, i) => {
+      const b = document.createElement('button');
+      b.className = 'chapter'; b.setAttribute('role', 'tab');
+      b.innerHTML = `<span class="n">${String(i + 1).padStart(2, '0')}</span>`
+        + `<span class="t">${c.feature}<small>${c.caption}</small></span>`
+        + `<span class="chip chip--${c.mode}">${c.mode}</span>`;
+      b.addEventListener('click', () => select(i));
+      reel.appendChild(b);
+    });
+    select(0);
+  }).catch(() => { reel.innerHTML = '<p style="color:var(--ink-3)">Demos unavailable.</p>'; });
+
+  video.addEventListener('timeupdate', () => {
+    if (video.duration) scrub.style.width = (100 * video.currentTime / video.duration) + '%';
+  });
+</script>
+</body>
+</html>

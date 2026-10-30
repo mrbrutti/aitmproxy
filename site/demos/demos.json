@@ -1,0 +1,60 @@
+{
+  "clips": [
+    {
+      "id": "intercept",
+      "feature": "Intercept & modify",
+      "mode": "operator",
+      "video": "clips/intercept.mp4",
+      "poster": "clips/posters/intercept.jpg",
+      "caption": "Hold a live request and rewrite its body before it is forwarded"
+    },
+    {
+      "id": "flows",
+      "feature": "Capture & inspect",
+      "mode": "operator",
+      "video": "clips/flows.mp4",
+      "poster": "clips/posters/flows.jpg",
+      "caption": "Live flows captured through the proxy; read the request and response"
+    },
+    {
+      "id": "websocket",
+      "feature": "WebSocket frames",
+      "mode": "operator",
+      "video": "clips/websocket.mp4",
+      "poster": "clips/posters/websocket.jpg",
+      "caption": "Inspect a live WebSocket conversation and inject a frame in either direction"
+    },
+    {
+      "id": "replay",
+      "feature": "Replay",
+      "mode": "operator",
+      "video": "clips/replay.mp4",
+      "poster": "clips/posters/replay.jpg",
+      "caption": "Re-issue any captured request through the proxy"
+    },
+    {
+      "id": "scope",
+      "feature": "Scope",
+      "mode": "operator",
+      "video": "clips/scope.mp4",
+      "poster": "clips/posters/scope.jpg",
+      "caption": "Deny-by-default: only authorized hosts can be touched"
+    },
+    {
+      "id": "poc",
+      "feature": "PoC → finding",
+      "mode": "operator",
+      "video": "clips/poc.mp4",
+      "poster": "clips/posters/poc.jpg",
+      "caption": "Run a human-readable proof-of-concept and record it as a finding"
+    },
+    {
+      "id": "scanner",
+      "feature": "Scanner",
+      "mode": "operator",
+      "video": "clips/scanner.mp4",
+      "poster": "clips/posters/scanner.jpg",
+      "caption": "Crawl an in-scope target to discover its endpoints and injection points"
+    }
+  ]
+}
