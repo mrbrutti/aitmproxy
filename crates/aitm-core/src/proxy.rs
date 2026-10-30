@@ -107,7 +107,8 @@ impl Proxy {
     /// not SSRF-filtered (the operator controls the client); scope/rate apply to
     /// active reissue only.
     pub async fn run(&self, listen: SocketAddr) -> anyhow::Result<()> {
-        self.accept_loop(listen, false).await
+        let listener = TcpListener::bind(listen).await?;
+        self.accept_loop(listener, false).await
     }
 
     /// Bind and run the **browser-facing** accept loop. The embedded browser dials
@@ -116,11 +117,20 @@ impl Proxy {
     /// SSRF-filtered: a private/loopback target is refused unless the host or IP
     /// is explicitly in scope.
     pub async fn run_browser(&self, listen: SocketAddr) -> anyhow::Result<()> {
-        self.accept_loop(listen, true).await
+        let listener = TcpListener::bind(listen).await?;
+        self.accept_loop(listener, true).await
     }
 
-    async fn accept_loop(&self, listen: SocketAddr, ssrf: bool) -> anyhow::Result<()> {
-        let listener = TcpListener::bind(listen).await?;
+    /// Run the main client-facing accept loop on an **already-bound** listener.
+    /// `aitm` pre-binds every service port at startup so a port conflict is one
+    /// clear error before any "listening" success, never a cryptic os-error
+    /// after it; this hands the pre-bound socket straight to the accept loop.
+    pub async fn run_on(&self, listener: TcpListener, ssrf: bool) -> anyhow::Result<()> {
+        self.accept_loop(listener, ssrf).await
+    }
+
+    async fn accept_loop(&self, listener: TcpListener, ssrf: bool) -> anyhow::Result<()> {
+        let listen = listener.local_addr()?;
         tracing::info!(%listen, ssrf, "proxy listening");
         loop {
             let (stream, peer) = match listener.accept().await {

@@ -262,8 +262,16 @@ pub fn build_servers(cfg: &Config, services: Services) -> (Option<McpServer>, In
 /// agent transport (loopback TCP only) and the TUI side by side until one of
 /// them ends — the TUI returning on operator quit is the ordinary exit.
 ///
-/// The caller launches and reaps the browser, as it does for the server path.
-pub async fn run(cfg: &Config, proxy: &Proxy, services: Services) -> anyhow::Result<()> {
+/// The caller launches and reaps the browser, as it does for the server path,
+/// and pre-binds the proxy and browser listeners so a port conflict is reported
+/// before the terminal UI takes over the screen.
+pub async fn run(
+    cfg: &Config,
+    proxy: &Proxy,
+    services: Services,
+    main_listener: tokio::net::TcpListener,
+    browser_listener: tokio::net::TcpListener,
+) -> anyhow::Result<()> {
     let startup_note = services.log.startup_note();
     let (agent, handler) = build_servers(cfg, services);
     let agent_serve = async move {
@@ -285,11 +293,9 @@ pub async fn run(cfg: &Config, proxy: &Proxy, services: Services) -> anyhow::Res
         expect_role: None,
     });
 
-    let main_listen = cfg.listen;
-    let browser_listen = cfg.browser.proxy_addr;
     tokio::select! {
-        result = proxy.run(main_listen) => result,
-        result = proxy.run_browser(browser_listen) => result,
+        result = proxy.run_on(main_listener, false) => result,
+        result = proxy.run_on(browser_listener, true) => result,
         result = agent_serve => result,
         result = tui => result,
         () = crate::shutdown_signal() => {
