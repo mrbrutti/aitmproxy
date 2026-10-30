@@ -328,8 +328,12 @@ impl HttpModule {
         };
 
         // Branch on the negotiated protocol: h2 runs the per-stream `serve_h2`
-        // driver; everything else runs the unchanged h1 `serve` loop.
+        // driver; everything else runs the h1 `serve` loop.
         if negotiated == b"h2" {
+            // Unlike the h1 branch below, an h2 upstream gets no stale-connection
+            // probe or reconnect. That is out of scope here; `serve_h2` has the
+            // same exposure and is a follow-up.
+
             // A Map Remote rewrite to a different authority needs a SECOND upstream
             // (an h2 connection is pinned to one `:authority`, spec §6). The TLS
             // client config lives here (provider + insecure verifier), so hand
@@ -599,29 +603,43 @@ async fn serve(
         // timeout) while this client connection sat idle. Nothing reads the
         // upstream between requests, so the first sign would be writing the
         // request to the dead socket and reading EOF, which fails the request
-        // before any byte reaches the client. Probe once, without blocking, and
-        // replace a dead connection before it is used. This costs no I/O when the
-        // upstream is alive. Not covered: the origin closing in the instant
-        // between this probe and the write below (retrying an idempotent,
-        // bodyless request would be a separate change).
+        // before any byte reaches the client. Probe once and replace a dead
+        // connection before it is used. With a live upstream the probe is one
+        // non-blocking readiness poll: no blocking I/O, no added latency. Not
+        // covered: the origin closing in the instant between this probe and the
+        // write below (retrying an idempotent, bodyless request would be a
+        // separate change).
         let mut redial: Option<String> = None;
         if upstream.as_mut().is_some_and(upstream_is_stale) {
             tracing::debug!(
                 authority = current_authority.as_deref().unwrap_or_default(),
-                "discarding a stale upstream connection the origin closed"
+                "discarding an upstream connection that was closed or is no longer usable"
             );
             upstream = None;
+            // Response bytes already read from the discarded connection must not
+            // be glued onto the head of the replacement's response.
+            let _ = machine.take_leftover(Side::Server);
             match &reconnect {
                 // A TLS tunnel redoes its TLS connection to the same origin. A
                 // failure surfaces as this request's error, like a failed first
                 // connect.
-                Some(reconnect) => upstream = Some(reconnect.connect(ctx).await?),
+                Some(reconnect) => {
+                    upstream = Some(reconnect.connect(ctx).await?);
+                    if let Some(previous) = conn.server_conn.clone() {
+                        let replacement = ConnInfo {
+                            established: SystemTime::now(),
+                            ..previous
+                        };
+                        record_server_conn(ctx, &mut conn, id, replacement);
+                    }
+                }
                 // Never fall back to cleartext for a connection that was TLS.
                 None if conn.scheme == "https" => {
                     bail!("upstream TLS connection closed and cannot be re-established")
                 }
-                // A cleartext tunnel was opened to one origin; redial that origin
-                // even if a later request in it names a different Host.
+                // A cleartext tunnel was opened to one origin: redial the origin
+                // the replaced connection served, even if a later request in the
+                // tunnel names a different Host.
                 None if conn.tunnel_authority.is_some() => redial = current_authority.clone(),
                 None => {}
             }
@@ -632,6 +650,9 @@ async fn serve(
             _ => false,
         };
         if needs_connect {
+            // A new connection starts with an empty response buffer, whatever
+            // made the old one go (an authority change, or the discard above).
+            let _ = machine.take_leftover(Side::Server);
             let dial = redial.unwrap_or_else(|| request.authority.clone());
             let target = Target::resolve(&dial, 80).await?;
             upstream = Some(
@@ -646,12 +667,7 @@ async fn serve(
                 tls: false,
                 established: SystemTime::now(),
             };
-            conn.server_conn = Some(server_conn.clone());
-            ctx.store().update(id, &mut |f: &mut Flow| {
-                if let Flow::Http(h) = f {
-                    h.server_conn = Some(server_conn.clone());
-                }
-            });
+            record_server_conn(ctx, &mut conn, id, server_conn);
         }
         let Some(up) = upstream.as_mut() else {
             bail!("no upstream connection");
@@ -790,6 +806,19 @@ async fn serve(
     }
 }
 
+/// Record `server_conn` as the connection serving the current request: on the
+/// connection facts later flows on this client connection inherit, and on the
+/// stored flow `id`. Used wherever the upstream connection is replaced, so every
+/// replacement path reports the same metadata.
+fn record_server_conn(ctx: &ModuleCtx, conn: &mut Conn, id: FlowId, server_conn: ConnInfo) {
+    conn.server_conn = Some(server_conn.clone());
+    ctx.store().update(id, &mut |f: &mut Flow| {
+        if let Flow::Http(h) = f {
+            h.server_conn = Some(server_conn.clone());
+        }
+    });
+}
+
 /// Whether an idle, kept-alive upstream connection can no longer be used.
 ///
 /// Polls the stream for readability exactly once, without blocking. Between
@@ -799,9 +828,21 @@ async fn serve(
 /// read as the answer to the next request and desynchronise the framing, so they
 /// are not trusted. The one byte a probe may consume is irrelevant because an
 /// unusable connection is discarded.
+///
+/// A single poll through `now_or_never`, whose waker does nothing, is sound
+/// because `read` is cancel-safe and the future is dropped right after the
+/// poll: a `Pending` result leaves the readiness state in the I/O driver (and
+/// the TLS state in the stream), so the next real read re-checks it and
+/// registers its own waker, and no wakeup can be lost. The poll is
+/// `unconstrained` because tokio answers an I/O poll with `Pending` once the
+/// task has spent its cooperative budget, even when the socket is ready, which
+/// would pass for "quiet and open" and miss a stale upstream after a burst of
+/// ready operations. This exempts only this one poll.
 fn upstream_is_stale(up: &mut ByteStream) -> bool {
     let mut probe = [0u8; 1];
-    up.read(&mut probe).now_or_never().is_some()
+    tokio::task::coop::unconstrained(up.read(&mut probe))
+        .now_or_never()
+        .is_some()
 }
 
 /// How to re-establish the upstream TLS connection of an HTTP/1 MITM tunnel after
@@ -833,6 +874,10 @@ impl Reconnect<'_> {
         // No ALPN at all is HTTP/1.1, as on the first connection.
         match tls.get_ref().1.alpn_protocol() {
             None | Some(b"http/1.1") => Ok(Box::pin(tls)),
+            // rustls already refuses a protocol we did not offer, so with an
+            // offer of only `http/1.1` this is unreachable today. It guards a
+            // future widening of the offer: never bridge a protocol this HTTP/1
+            // tunnel cannot speak.
             Some(other) => bail!(
                 "upstream {} negotiated {:?} on reconnect, expected http/1.1",
                 self.authority,
@@ -1182,6 +1227,30 @@ mod tests {
         assert!(upstream_is_stale(&mut up));
     }
 
+    #[tokio::test]
+    async fn probe_sees_a_closed_stream_even_when_the_task_budget_is_spent() {
+        // Tokio makes an I/O poll report `Pending` once the task has used up its
+        // cooperative budget, whether or not the socket is ready. After a burst of
+        // ready operations the probe must not mistake that for "quiet and open".
+        let (mut burner, mut feeder) = duplex(4096);
+        feeder.write_all(&[0u8; 1024]).await.expect("feed");
+        let (ours, peer) = duplex(64);
+        drop(peer);
+        let mut up: ByteStream = Box::pin(ours);
+
+        // Spend the whole budget with ready reads, within this one poll.
+        let mut byte = [0u8; 1];
+        while tokio::task::coop::has_budget_remaining() {
+            let _ = burner.read(&mut byte).now_or_never();
+        }
+        assert!(
+            up.read(&mut byte).now_or_never().is_none(),
+            "premise: a budget-constrained poll of a closed stream reports Pending"
+        );
+
+        assert!(upstream_is_stale(&mut up));
+    }
+
     // ---- the liveness probe on a TLS session ------------------------------
 
     /// A server config for `origin.test` offering `alpn` in preference order.
@@ -1372,11 +1441,31 @@ mod tests {
     /// An in-memory origin: for each of `bodies`, read one request head and answer
     /// it with a keep-alive 200 carrying that body. Then close the connection if
     /// `then_close`, else hold it open until the proxy hangs up.
-    async fn origin_serve<S>(mut io: S, bodies: Vec<&'static str>, then_close: bool)
+    async fn origin_serve<S>(io: S, bodies: Vec<&'static str>, then_close: bool)
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        for body in bodies {
+        origin_serve_trailing(io, bodies, "", then_close).await;
+    }
+
+    /// A partial response head (no blank line yet) that an origin leaves after its
+    /// last response. A proxy that carried it over to a replacement connection
+    /// would prepend it to that connection's response head and let this origin
+    /// choose the status line.
+    const INJECTED_HEAD: &str = "HTTP/1.1 500 Injected\r\nX-Junk: ";
+
+    /// Like [`origin_serve`], with `trailer` appended to the last response in the
+    /// same write, so the proxy reads it together with that response.
+    async fn origin_serve_trailing<S>(
+        mut io: S,
+        bodies: Vec<&'static str>,
+        trailer: &'static str,
+        then_close: bool,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let last = bodies.len().saturating_sub(1);
+        for (i, body) in bodies.into_iter().enumerate() {
             let mut seen = Vec::new();
             let mut chunk = [0u8; 256];
             while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -1385,8 +1474,9 @@ mod tests {
                     Ok(n) => seen.extend_from_slice(&chunk[..n]),
                 }
             }
+            let trailer = if i == last { trailer } else { "" };
             let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}{trailer}",
                 body.len()
             );
             if io.write_all(resp.as_bytes()).await.is_err() || io.flush().await.is_err() {
@@ -1402,6 +1492,7 @@ mod tests {
     }
 
     /// Send a GET on the client end and return the `Content-Length`-framed body.
+    /// Every origin here answers 200, so any other status fails the test.
     async fn client_get(io: &mut DuplexStream, target: &str, host: &str) -> String {
         let request = format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n\r\n");
         io.write_all(request.as_bytes()).await.expect("send");
@@ -1410,6 +1501,8 @@ mod tests {
         loop {
             if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                 let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                let status = head.split(' ').nth(1).unwrap_or_default();
+                assert_eq!(status, "200", "unexpected response head {head:?}");
                 let len: usize = head
                     .lines()
                     .find_map(|l| l.strip_prefix("content-length: "))
@@ -1429,7 +1522,9 @@ mod tests {
         (authority.to_string(), addr.parse().expect("addr"))
     }
 
-    /// The connection facts of an HTTPS tunnel to `origin.test:8443`.
+    /// The connection facts of an HTTPS tunnel to `origin.test:8443`, as `mitm()`
+    /// sets them. The server connection is stamped as established at the epoch so
+    /// a test can tell a refreshed record from the original.
     fn tunnel_conn() -> Conn {
         Conn {
             scheme: "https".to_string(),
@@ -1441,7 +1536,13 @@ mod tests {
                 tls: true,
                 established: SystemTime::now(),
             },
-            server_conn: None,
+            server_conn: Some(ConnInfo {
+                peer: origin_addr(),
+                sni: Some("origin.test".to_string()),
+                alpn: Some("http/1.1".to_string()),
+                tls: true,
+                established: SystemTime::UNIX_EPOCH,
+            }),
         }
     }
 
@@ -1645,6 +1746,255 @@ mod tests {
         assert!(
             dialed.lock().expect("dialed lock").is_empty(),
             "nothing may be dialed, in particular not in cleartext"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_fails_the_request_when_the_tls_reconnect_is_refused() {
+        let (first_up, first_server) = tls_pair().await;
+        // The connector has no stream to give, so the reconnect dial is refused.
+        let (ctx, dialed) = ctx_with(Vec::new());
+        let origin1 = tokio::spawn(origin_serve(first_server, vec!["first"], true));
+        let module = HttpModule::new().with_insecure(true);
+        let (mut client, proxy_side) = duplex(64 * 1024);
+
+        let serving = serve(
+            &ctx,
+            Box::pin(proxy_side),
+            Some(first_up),
+            Some(reconnect_to(&module)),
+            tunnel_conn(),
+            MAX_BODY,
+        );
+        let script = async {
+            let first = client_get(&mut client, "/one", "origin.test:8443").await;
+            origin1.await.expect("origin 1");
+            client
+                .write_all(b"GET /two HTTP/1.1\r\nHost: origin.test:8443\r\n\r\n")
+                .await
+                .expect("send");
+            let mut got = Vec::new();
+            client.read_to_end(&mut got).await.expect("read to EOF");
+            (first, got)
+        };
+        let (served, (first, got)) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(serving, script)
+        })
+        .await
+        .expect("serve hung");
+
+        assert_eq!(first, "first");
+        let err = served.expect_err("a refused reconnect must fail the request");
+        assert_eq!(err.to_string(), "scope guard refused the dial");
+        assert!(
+            got.is_empty(),
+            "the client must see no bytes for the failed request"
+        );
+        assert_eq!(
+            *dialed.lock().expect("dialed lock"),
+            vec![("origin.test:8443".to_string(), origin_addr())],
+            "exactly one dial attempt, the refused reconnect, and no fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_drops_response_bytes_left_over_from_a_discarded_upstream() {
+        let (up1, origin1_end) = duplex(64 * 1024);
+        let (up2, origin2_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(up1), Box::pin(up2)]);
+        // Origin 1 answers, leaves a partial response head behind in the same
+        // write, then closes. The proxy reads that head fragment with the answer.
+        let origin1 = tokio::spawn(origin_serve_trailing(
+            origin1_end,
+            vec!["first"],
+            INJECTED_HEAD,
+            true,
+        ));
+        let _origin2 = tokio::spawn(origin_serve(origin2_end, vec!["second"], false));
+        let (mut client, proxy_side) = duplex(64 * 1024);
+        let conn = Conn::plain(unknown_peer(), None);
+
+        let serving = serve(&ctx, Box::pin(proxy_side), None, None, conn, MAX_BODY);
+        let script = async {
+            let first =
+                client_get(&mut client, "http://127.0.0.1:8080/one", "127.0.0.1:8080").await;
+            origin1.await.expect("origin 1");
+            // `client_get` fails the test if the replacement's response arrives
+            // with the leftover fragment's 500 status line in front of it.
+            let second =
+                client_get(&mut client, "http://127.0.0.1:8080/two", "127.0.0.1:8080").await;
+            drop(client);
+            (first, second)
+        };
+        let (served, (first, second)) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(serving, script)
+        })
+        .await
+        .expect("serve hung");
+
+        served.expect("serve ends cleanly when the client hangs up");
+        assert_eq!((first.as_str(), second.as_str()), ("first", "second"));
+    }
+
+    #[tokio::test]
+    async fn serve_drops_response_bytes_left_over_across_a_tls_reconnect() {
+        // The TLS reconnect never reaches the cleartext connect step, so the
+        // discard itself has to empty the response buffer.
+        let (first_up, first_server) = tls_pair().await;
+        let (second_c, second_s) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(second_c)]);
+        let origin1 = tokio::spawn(origin_serve_trailing(
+            first_server,
+            vec!["first"],
+            INJECTED_HEAD,
+            true,
+        ));
+        let _origin2 = tokio::spawn(async move {
+            let tls = TlsAcceptor::from(server_config(&[]))
+                .accept(second_s)
+                .await
+                .expect("origin 2 handshake");
+            origin_serve(tls, vec!["second"], false).await;
+        });
+        let module = HttpModule::new().with_insecure(true);
+        let (mut client, proxy_side) = duplex(64 * 1024);
+
+        let serving = serve(
+            &ctx,
+            Box::pin(proxy_side),
+            Some(first_up),
+            Some(reconnect_to(&module)),
+            tunnel_conn(),
+            MAX_BODY,
+        );
+        let script = async {
+            let first = client_get(&mut client, "/one", "origin.test:8443").await;
+            origin1.await.expect("origin 1");
+            let second = client_get(&mut client, "/two", "origin.test:8443").await;
+            drop(client);
+            (first, second)
+        };
+        let (served, (first, second)) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(serving, script)
+        })
+        .await
+        .expect("serve hung");
+
+        served.expect("serve ends cleanly when the client hangs up");
+        assert_eq!((first.as_str(), second.as_str()), ("first", "second"));
+    }
+
+    #[tokio::test]
+    async fn serve_drops_response_bytes_left_over_when_the_authority_changes() {
+        let (up1, origin1_end) = duplex(64 * 1024);
+        let (up2, origin2_end) = duplex(64 * 1024);
+        let (ctx, dialed) = ctx_with(vec![Box::pin(up1), Box::pin(up2)]);
+        // Origin 1 stays open, so nothing is stale; the second request simply
+        // names another authority and gets a new connection.
+        let _origin1 = tokio::spawn(origin_serve_trailing(
+            origin1_end,
+            vec!["first"],
+            INJECTED_HEAD,
+            false,
+        ));
+        let _origin2 = tokio::spawn(origin_serve(origin2_end, vec!["second"], false));
+        let (mut client, proxy_side) = duplex(64 * 1024);
+        let conn = Conn::plain(unknown_peer(), None);
+
+        let serving = serve(&ctx, Box::pin(proxy_side), None, None, conn, MAX_BODY);
+        let script = async {
+            let first =
+                client_get(&mut client, "http://127.0.0.1:8080/one", "127.0.0.1:8080").await;
+            let second =
+                client_get(&mut client, "http://127.0.0.1:9090/two", "127.0.0.1:9090").await;
+            drop(client);
+            (first, second)
+        };
+        let (served, (first, second)) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(serving, script)
+        })
+        .await
+        .expect("serve hung");
+
+        served.expect("serve ends cleanly when the client hangs up");
+        assert_eq!((first.as_str(), second.as_str()), ("first", "second"));
+        assert_eq!(
+            *dialed.lock().expect("dialed lock"),
+            vec![
+                dial("127.0.0.1:8080", "127.0.0.1:8080"),
+                dial("127.0.0.1:9090", "127.0.0.1:9090")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_refreshes_the_server_connection_record_after_a_tls_reconnect() {
+        let (first_up, first_server) = tls_pair().await;
+        let (second_c, second_s) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(second_c)]);
+        let origin1 = tokio::spawn(origin_serve(first_server, vec!["first"], true));
+        let _origin2 = tokio::spawn(async move {
+            let tls = TlsAcceptor::from(server_config(&[]))
+                .accept(second_s)
+                .await
+                .expect("origin 2 handshake");
+            origin_serve(tls, vec!["second"], false).await;
+        });
+        let module = HttpModule::new().with_insecure(true);
+        let (mut client, proxy_side) = duplex(64 * 1024);
+
+        let serving = serve(
+            &ctx,
+            Box::pin(proxy_side),
+            Some(first_up),
+            Some(reconnect_to(&module)),
+            tunnel_conn(),
+            MAX_BODY,
+        );
+        let script = async {
+            client_get(&mut client, "/one", "origin.test:8443").await;
+            origin1.await.expect("origin 1");
+            client_get(&mut client, "/two", "origin.test:8443").await;
+            drop(client);
+        };
+        let (served, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(serving, script)
+        })
+        .await
+        .expect("serve hung");
+        served.expect("serve ends cleanly when the client hangs up");
+
+        // The server connection each flow was stored with, by request path.
+        let server_conn_of = |path: &str| {
+            ctx.store()
+                .list()
+                .into_iter()
+                .find_map(|id| match ctx.store().get(id) {
+                    Some(Flow::Http(f)) if f.request.path == path => f.server_conn,
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no stored flow for {path} with a server connection"))
+        };
+        let before = server_conn_of("/one");
+        let after = server_conn_of("/two");
+        assert_eq!(
+            before.established,
+            SystemTime::UNIX_EPOCH,
+            "the flow served on the original connection keeps its record"
+        );
+        assert!(
+            after.established > SystemTime::UNIX_EPOCH,
+            "the flow served on the replacement connection must record when it was established"
+        );
+        assert_eq!(
+            (
+                after.peer,
+                after.sni.as_deref(),
+                after.alpn.as_deref(),
+                after.tls
+            ),
+            (origin_addr(), Some("origin.test"), Some("http/1.1"), true),
+            "only the establishment time changes"
         );
     }
 }

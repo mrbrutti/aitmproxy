@@ -113,10 +113,13 @@ impl Origin {
         self.accepted.load(Ordering::SeqCst)
     }
 
-    /// Wait until the origin has performed its idle act `n` times, then give the
-    /// bytes (or the FIN) a beat to reach the proxy's socket. Waiting on the act
-    /// itself rather than a fixed sleep keeps the tests independent of how
-    /// loaded the machine is.
+    /// Wait until the origin has performed its idle act `n` times, then sleep a
+    /// further 100 ms. Waiting on the act removes the dependence on how long the
+    /// origin's own idle timer takes to fire. The trailing sleep still rests on
+    /// one timing assumption: that the FIN (or the stray bytes) written to the
+    /// loopback socket has reached the proxy's end of it within those 100 ms,
+    /// which on loopback takes microseconds. A badly stalled machine could break
+    /// that and make a test fail spuriously; it would not make one pass wrongly.
     async fn wait_idle_acts(&self, n: usize) {
         let deadline = Instant::now() + IO_TIMEOUT;
         while self.idle_acts.load(Ordering::SeqCst) < n {
