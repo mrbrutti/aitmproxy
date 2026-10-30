@@ -227,6 +227,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aitm-plugin-scanner"
+version = "0.1.0"
+dependencies = [
+ "aitm-core",
+ "anyhow",
+ "futures",
+]
+
+[[package]]
 name = "aitm-plugin-sessionio"
 version = "0.1.0"
 dependencies = [

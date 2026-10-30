@@ -10,3 +10,7 @@ workspace = true
 
 [dependencies]
 aitm-core = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
