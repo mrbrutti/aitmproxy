@@ -32,6 +32,7 @@
 //! }
 //! ```
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
@@ -40,7 +41,7 @@ use aitm_plugin::language::{
     GuardHandle, Guarded, HostCallContextSource, HostCallCtx, HostError, HostFn, ProtocolLanguage,
     RegisterError, ScriptHostRegistry,
 };
-use rhai::{Dynamic, Engine, EvalAltResult, Module, Position};
+use rhai::{Dynamic, Engine, EvalAltResult, Module, NativeCallContext, Position};
 
 use crate::marshal::{dynamic_to_value, value_to_dynamic};
 
@@ -50,6 +51,92 @@ use crate::marshal::{dynamic_to_value, value_to_dynamic};
 /// arguments simply finds no overload and is a normal "function not found"
 /// script error.
 const MAX_ARITY: usize = 8;
+
+/// The call-source label [`dispatch`] falls back to when neither the seed nor the
+/// per-eval [`NativeCallContext`] names an origin.
+const DEFAULT_CALL_SOURCE: &str = "rhai";
+
+thread_local! {
+    /// The caller context seeded for the eval running on **this** thread, if any.
+    ///
+    /// Every script/PoC invocation boundary (plugin hook dispatch, the PoC
+    /// runner, a `script:` step — all wired in plan Task 3) calls
+    /// [`seed_call_context`] *before* evaluating and holds the returned
+    /// [`CallContextGuard`] for the eval; [`dispatch`] reads this on every
+    /// `<ns>.<fn>` call. An eval that reaches a seam host fn with this unset is
+    /// **refused fail-closed** (plan AC3) — never treated as an operator.
+    ///
+    /// It is a *thread-local* on purpose: `wire::build` shares **one** `Engine`
+    /// across all frontends, and rhai (`sync`) runs each eval synchronously on
+    /// its own calling thread. A per-thread cell is therefore seen by exactly the
+    /// eval that seeded it and every nested host-fn call that eval makes on the
+    /// same thread, and never by a concurrent eval on another thread — so two
+    /// frontends evaluating at once cannot read each other's trust. Using an
+    /// engine-global tag (e.g. `Engine::set_default_tag`) would not be safe here.
+    static CALL_CONTEXT: RefCell<Option<SeededCallContext>> = const { RefCell::new(None) };
+}
+
+/// The per-eval caller context an invocation boundary seeds and [`dispatch`]
+/// reads. Owned (no rhai types) so it can live in [`CALL_CONTEXT`] across the
+/// whole eval and be cloned cheaply per host-fn call.
+#[derive(Clone)]
+struct SeededCallContext {
+    caller: CallerTrust,
+    tag: Option<Value>,
+    source: Option<String>,
+}
+
+/// Seed the caller trust (and an optional per-eval `tag` / call-`source` label)
+/// for the eval about to run on this thread, returning a guard that clears the
+/// seed when it drops.
+///
+/// **Every production invocation boundary must call this before evaluating.** A
+/// seam host fn reached without a live seed is refused fail-closed by
+/// [`dispatch`] (plan AC3) — there is no operator default, so an un-seeded eval
+/// can never widen an agent's trust.
+///
+/// Nesting and concurrency: a boundary that runs inside another (a `script:`
+/// step inside a PoC) may seed again; the previous seed is restored when the
+/// inner guard drops, so nested seam calls on the thread always observe the
+/// innermost live seed. Because the seed lives in a thread-local for the whole
+/// eval, a seam fn reached through nested calls on the same thread still sees it,
+/// and a concurrent eval on another thread never does.
+#[must_use = "the seeded caller context is cleared when the guard drops"]
+pub fn seed_call_context(
+    caller: CallerTrust,
+    tag: Option<Value>,
+    source: Option<String>,
+) -> CallContextGuard {
+    let previous = CALL_CONTEXT.with(|cell| {
+        cell.borrow_mut().replace(SeededCallContext {
+            caller,
+            tag,
+            source,
+        })
+    });
+    CallContextGuard { previous }
+}
+
+/// The RAII guard returned by [`seed_call_context`]: restores the previously
+/// seeded context (normally none) when dropped, so a seed never outlives its
+/// eval or leaks onto the thread for a later, unrelated one.
+#[must_use = "the seeded caller context is cleared when the guard drops"]
+pub struct CallContextGuard {
+    previous: Option<SeededCallContext>,
+}
+
+impl Drop for CallContextGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        CALL_CONTEXT.with(|cell| *cell.borrow_mut() = previous);
+    }
+}
+
+/// The caller context seeded on this thread, if any — a clone, so no borrow of
+/// the thread-local is held across the host-fn call.
+fn current_call_context() -> Option<SeededCallContext> {
+    CALL_CONTEXT.with(|cell| cell.borrow().clone())
+}
 
 /// One registered host fn: its guard and the fn itself.
 struct Entry {
@@ -217,10 +304,10 @@ macro_rules! arity {
         let n = $name.to_string();
         $engine.register_fn(
             $name,
-            move |ns: &mut ProtoNs, $( $arg: Dynamic ),+ |
+            move |ctx: NativeCallContext, ns: &mut ProtoNs, $( $arg: Dynamic ),+ |
                 -> Result<Dynamic, Box<EvalAltResult>> {
                 let args = [ $( $arg ),+ ];
-                dispatch(ns, &n, &args)
+                dispatch(&ctx, ns, &n, &args)
             },
         );
     }};
@@ -234,7 +321,9 @@ fn register_method(engine: &mut Engine, name: &str) {
     let n = name.to_string();
     engine.register_fn(
         name,
-        move |ns: &mut ProtoNs| -> Result<Dynamic, Box<EvalAltResult>> { dispatch(ns, &n, &[]) },
+        move |ctx: NativeCallContext, ns: &mut ProtoNs| -> Result<Dynamic, Box<EvalAltResult>> {
+            dispatch(&ctx, ns, &n, &[])
+        },
     );
 
     arity!(engine, name, a0);
@@ -247,10 +336,39 @@ fn register_method(engine: &mut Engine, name: &str) {
     arity!(engine, name, a0, a1, a2, a3, a4, a5, a6, a7);
 }
 
-/// Marshal the Rhai arguments to `Value`s, run the guard's permit check, call
-/// the registered host fn, and marshal its result back. A guard refusal and a
-/// host-fn error both surface as catchable Rhai runtime errors.
-fn dispatch(ns: &ProtoNs, name: &str, args: &[Dynamic]) -> Result<Dynamic, Box<EvalAltResult>> {
+/// Thread the per-eval [`HostCallCtx`] through one `<ns>.<name>(...)` call:
+/// read the caller context seeded at the invocation boundary, marshal the Rhai
+/// arguments to `Value`s, run the guard's permit check, call the registered host
+/// fn, and marshal its result back.
+///
+/// This is the **one** place in the codebase that touches [`NativeCallContext`]
+/// (plan AC8): it builds a rhai-free [`HostCallContextSource`] from the seeded
+/// tag/source and the per-eval context, so the guard and host fn see only
+/// `aitm_core` types.
+///
+/// **Fail-closed (plan AC3).** If no caller context is seeded for this eval the
+/// call is refused *before any effect* with a clear "no caller context" error —
+/// never defaulted to [`CallerTrust::Operator`]. A guard refusal, a missing
+/// context, and a host-fn error all surface as catchable Rhai runtime errors.
+fn dispatch(
+    ctx: &NativeCallContext,
+    ns: &ProtoNs,
+    name: &str,
+    args: &[Dynamic],
+) -> Result<Dynamic, Box<EvalAltResult>> {
+    // Fail-closed first: an eval that reaches a seam host fn without a seeded
+    // caller context is refused before anything runs — not treated as operator.
+    let seed = current_call_context().ok_or_else(|| {
+        host_error(HostError::GuardRefused {
+            namespace: ns.namespace.clone(),
+            reason: format!(
+                "no caller context seeded for this evaluation; refusing `{}.{}` \
+                 (fail-closed: the invocation boundary must seed the caller trust)",
+                ns.namespace, name
+            ),
+        })
+    })?;
+
     let mut values = Vec::with_capacity(args.len());
     for arg in args {
         values.push(dynamic_to_value(arg).map_err(|err| runtime_error(err.to_string()))?);
@@ -266,15 +384,19 @@ fn dispatch(ns: &ProtoNs, name: &str, args: &[Dynamic]) -> Result<Dynamic, Box<E
             ))
         })?;
 
-    // TODO(Task 2): build the `HostCallCtx` from the per-eval `NativeCallContext`
-    // (the script's tag + call origin) and the caller trust seeded at the
-    // invocation boundary (Task 3), failing closed when unseeded. Until the
-    // bridge lands, dispatch threads a placeholder source that carries no tag and
-    // the most restrictive (`Agent`) trust, so the permit-before-effect order and
-    // the threaded `HostFn`/`permit` signatures are exercised without widening
-    // trust.
-    let source = UnseededSource;
-    let hostctx = HostCallCtx::new(CallerTrust::Agent, &source);
+    // The rhai-free source for this call: the seeded tag (falling back to the
+    // per-eval `NativeCallContext` tag) and a call-source label (the seed's, else
+    // the caller's script source, else a static default).
+    let source = RhaiCallSource {
+        tag: seed
+            .tag
+            .or_else(|| ctx.tag().and_then(|tag| dynamic_to_value(tag).ok())),
+        call_source: seed
+            .source
+            .or_else(|| ctx.call_source().map(str::to_string))
+            .unwrap_or_else(|| DEFAULT_CALL_SOURCE.to_string()),
+    };
+    let hostctx = HostCallCtx::new(seed.caller, &source);
 
     // Deny-by-default: the guard admits the call before any effect runs.
     entry.guard.permit(&hostctx, name).map_err(host_error)?;
@@ -282,19 +404,21 @@ fn dispatch(ns: &ProtoNs, name: &str, args: &[Dynamic]) -> Result<Dynamic, Box<E
     Ok(value_to_dynamic(&out))
 }
 
-/// TODO(Task 2): a placeholder [`HostCallContextSource`] used until the rhai
-/// bridge builds a real `NativeCallContext`-backed source. It carries no tag and
-/// a static origin so Task 1 keeps the workspace compiling without implementing
-/// any seeding.
-struct UnseededSource;
+/// The concrete [`HostCallContextSource`] the bridge builds for one call: the
+/// per-eval tag and origin resolved by [`dispatch`], owned so it carries no rhai
+/// type and the host fn/guard read only `aitm_core` values.
+struct RhaiCallSource {
+    tag: Option<Value>,
+    call_source: String,
+}
 
-impl HostCallContextSource for UnseededSource {
+impl HostCallContextSource for RhaiCallSource {
     fn tag(&self) -> Option<Value> {
-        None
+        self.tag.clone()
     }
 
     fn call_source(&self) -> &str {
-        "rhai"
+        &self.call_source
     }
 }
 

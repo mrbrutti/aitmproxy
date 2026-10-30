@@ -19,10 +19,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aitm_core::Value;
+use aitm_core::{CallerTrust, Value};
 use aitm_plugin::language::{PocStepInputs, ProtocolLanguage};
 use aitm_plugin_rhai::{
-    build_engine_with_languages, production_languages, registered_host_fns, RhaiLimits,
+    build_engine_with_languages, production_languages, registered_host_fns, seed_call_context,
+    RhaiLimits,
 };
 use aitm_proto_l4::backend::{CaptureInjectBackend, CaptureSource, L4Error};
 use aitm_proto_l4::config::L4Config;
@@ -180,6 +181,11 @@ fn ac4_sensitive_verb_refused_when_agent_gate_closed() {
         build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(5), &[&lang])
             .expect("engine builds with l4 installed");
 
+    // Task 2 fail-closed: the seam now requires a seeded caller context. L4's
+    // guard still reads its build-time `agent_sourced` here (migrated in Task 4),
+    // so the seeded trust only keeps dispatch from refusing fail-closed; the
+    // assertions below are unchanged. Seeded `Agent` to match `agent_sourced=true`.
+    let _seed = seed_call_context(CallerTrust::Agent, None, None);
     let err = engine
         .eval::<rhai::Dynamic>(SEND_RECV_SCRIPT)
         .expect_err("a closed agent gate refuses l4.send_recv");
@@ -205,6 +211,9 @@ fn ac4_sensitive_verb_runs_when_agent_gate_open() {
         build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(5), &[&lang])
             .expect("engine builds");
 
+    // Task 2 fail-closed: seed a caller context (Agent, matching
+    // `agent_sourced=true`) so dispatch proceeds to L4's build-time gate.
+    let _seed = seed_call_context(CallerTrust::Agent, None, None);
     let out = engine
         .eval::<rhai::Dynamic>(SEND_RECV_SCRIPT)
         .expect("an open agent gate admits l4.send_recv");
@@ -234,6 +243,9 @@ fn ac4_read_verb_is_ungated() {
     let engine =
         build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(5), &[&lang])
             .expect("engine builds");
+    // Task 2 fail-closed: seed a caller context (Agent, matching
+    // `agent_sourced=true`) so dispatch reaches the ungated Read verb.
+    let _seed = seed_call_context(CallerTrust::Agent, None, None);
     let out = engine
         .eval::<rhai::Dynamic>("l4.interfaces()")
         .expect("l4.interfaces is ungated");
@@ -253,6 +265,9 @@ fn ac4_operator_engine_bypasses_the_agent_gate() {
     let engine =
         build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(5), &[&lang])
             .expect("engine builds");
+    // Task 2 fail-closed: seed a caller context (Operator, matching
+    // `agent_sourced=false`) so dispatch proceeds to L4's build-time gate.
+    let _seed = seed_call_context(CallerTrust::Operator, None, None);
     let _ = engine
         .eval::<rhai::Dynamic>(SEND_RECV_SCRIPT)
         .expect("operator engine bypasses the agent gate");
@@ -278,6 +293,10 @@ fn ac4_out_of_scope_send_recv_refusal_surfaces_to_the_script() {
         let spec = #{ layers: [ #{ ipv4: #{ dst: "10.9.9.9" } }, #{ udp: #{ dst_port: 9 } } ] };
         l4.send_recv(spec, "10.9.9.9", "lo", 9, 50)
     "#;
+    // Task 2 fail-closed: seed a caller context (Agent, matching
+    // `agent_sourced=true`) so the refusal under test is the scope check, not the
+    // missing-context fail-closed.
+    let _seed = seed_call_context(CallerTrust::Agent, None, None);
     let err = engine
         .eval::<rhai::Dynamic>(script)
         .expect_err("an out-of-scope send_recv is refused");
@@ -310,6 +329,9 @@ fn inject_count_zero_is_a_no_op() {
         let spec = #{ layers: [ #{ ipv4: #{ dst: "127.0.0.1" } }, #{ udp: #{ dst_port: 9 } } ] };
         l4.inject(spec, "127.0.0.1", "lo", 0)
     "#;
+    // Task 2 fail-closed: seed a caller context (Operator, matching
+    // `agent_sourced=false`) so dispatch reaches the inject no-op.
+    let _seed = seed_call_context(CallerTrust::Operator, None, None);
     let out = engine
         .eval::<rhai::Dynamic>(script)
         .expect("inject with count:0 runs and is a no-op");
