@@ -42,7 +42,8 @@ struct OverviewPanel: View {
                     BarRow(label: entry.statusClass?.rangeLabel ?? "none",
                            labelColor: entry.statusClass?.color ?? Tok.Ink.tertiary,
                            labelWidth: Self.codeWidth, value: String(entry.count),
-                           fraction: Self.fraction(entry.count, of: stats.statusMax))
+                           fraction: Self.fraction(entry.count, of: stats.statusMax),
+                           barColor: (entry.statusClass?.color ?? Tok.Ink.tertiary).color)
                         .accessibilityLabel("\(entry.statusClass?.rangeLabel ?? "No status"), \(entry.count)")
                 }
             }
@@ -58,7 +59,8 @@ struct OverviewPanel: View {
                     let top = max(Self.seconds(p.p99), 0.001)
                     ForEach([("p50", p.p50), ("p90", p.p90), ("p99", p.p99)], id: \.0) { name, value in
                         BarRow(label: name, labelColor: Tok.Ink.secondary, labelWidth: Self.codeWidth,
-                               value: Format.duration(value), fraction: Self.seconds(value) / top)
+                               value: Format.duration(value), fraction: Self.seconds(value) / top,
+                               barColor: Palette.accent)
                             .accessibilityLabel("\(name), \(Format.duration(value))")
                     }
                 }
@@ -152,6 +154,7 @@ private struct BarRow: View {
     var labelWidth: CGFloat
     var value: String
     var fraction: Double
+    var barColor: Color = Tok.Ink.secondary.color
 
     var body: some View {
         HStack(spacing: Space.md) {
@@ -159,7 +162,7 @@ private struct BarRow: View {
                 .font(Tok.Face.data(Tok.Typography.Size.sm, .medium))
                 .foregroundStyle(labelColor.color)
                 .frame(width: labelWidth, alignment: .leading)
-            Bar(fraction: fraction)
+            Bar(fraction: fraction, color: barColor)
             Text(value)
                 .font(Tok.Face.data(Tok.Typography.Size.sm))
                 .foregroundStyle(Tok.Ink.secondary.color)
@@ -211,12 +214,13 @@ private struct HostRow: View {
 /// The bar itself: tertiary ink, 8 pt tall, badge radius, no track.
 private struct Bar: View {
     var fraction: Double
+    var color: Color = Tok.Ink.secondary.color
     static let height: CGFloat = 8
 
     var body: some View {
         GeometryReader { proxy in
             RoundedRectangle(cornerRadius: Tok.Radius.badge)
-                .fill(Tok.Ink.tertiary.color)
+                .fill(color)
                 .frame(width: fraction > 0 ? max(Self.height / 2, proxy.size.width * min(fraction, 1)) : 0)
         }
         .frame(height: Self.height)
