@@ -14,7 +14,8 @@ findings store; it does not create or delete findings.
    target/class/severity/since if the user asked to filter) and present the
    recorded findings.
 3. Render using the **`aitmproxy-rendering`** skill:
-   - the list as a table with columns: id, severity, class, title, target, when;
+   - the list as a table with columns: id, severity, class, title, target, when
+     (`discovered_at`);
    - a single finding as a labelled detail block, with the reproduction steps
      quoted.
 4. If the store is empty, say so — that means no findings directory is

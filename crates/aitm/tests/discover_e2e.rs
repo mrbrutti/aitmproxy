@@ -240,6 +240,52 @@ async fn scan_discover_end_to_end() {
         has_query_q,
         "a query injection point named `q` must be discovered: {points:?}"
     );
+
+    // `/redirect?next=/` itself 302s to `/`; the redirecting URL must still be a
+    // reached endpoint, or the `next` parameter on it is never enumerated.
+    let has_query_next = points.iter().any(|p| {
+        let Value::Object(p) = p else { return false };
+        p.get("location") == Some(&Value::Str("query".into()))
+            && p.get("name") == Some(&Value::Str("next".into()))
+    });
+    assert!(
+        has_query_next,
+        "the redirector's `next` parameter must be discovered: {points:?}"
+    );
+
+    // A re-scan of the same site must return the same points, not those plus
+    // the previous scan's captures: the same `(location, name)` multiset, which
+    // also pins the count.
+    let rescan = discover(&rig).await;
+    let Some(Value::Array(rescan_points)) = rescan.get("injection_points") else {
+        panic!("re-scan must carry an injection_points array: {rescan:?}");
+    };
+    assert_eq!(
+        point_keys(rescan_points),
+        point_keys(points),
+        "a re-scan of the same site must return the same injection points, not accumulate"
+    );
+}
+
+/// The `(location, name)` of every injection point, sorted, so two scans'
+/// outputs compare as multisets.
+fn point_keys(points: &[Value]) -> Vec<(String, String)> {
+    let mut keys: Vec<(String, String)> = points
+        .iter()
+        .map(|p| {
+            let Value::Object(p) = p else {
+                panic!("an injection point must be an object: {p:?}");
+            };
+            match (p.get("location"), p.get("name")) {
+                (Some(Value::Str(location)), Some(Value::Str(name))) => {
+                    (location.clone(), name.clone())
+                }
+                _ => panic!("an injection point must carry a location and a name: {p:?}"),
+            }
+        })
+        .collect();
+    keys.sort();
+    keys
 }
 
 /// The browser survives a scan: a later `scan.discover` in the same session must

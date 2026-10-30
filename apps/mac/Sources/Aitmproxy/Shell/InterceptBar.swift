@@ -56,11 +56,53 @@ struct InterceptBar: View {
                     .truncationMode(.middle)
             }
             Spacer(minLength: Space.sm)
-            HStack(spacing: Tok.Metric.gapTight) {
-                PrimaryButton(target.map { session.pendingEditCount($0.id) > 0 } == true ? "Apply & Resume" : "Resume", hint: "⌘⏎") {
-                    if let target { session.applyAndResume(target.id) }
-                }
+            // Collapse the secondary actions into an overflow menu when the bar is
+            // narrow (e.g. a side panel opened), so buttons never truncate to ellipses.
+            ViewThatFits(in: .horizontal) {
+                actions(compact: false)
+                actions(compact: true)
+            }
+        }
+        .font(Tok.Face.ui(Tok.Typography.Size.md))
+        .foregroundStyle(Tok.Intercept.onBase.color)
+        .padding(.horizontal, Space.md)
+        .frame(height: Tok.Size.interceptBar)
+        .frame(maxWidth: .infinity)
+        .background(Tok.Intercept.base.color)
+        .overlay(alignment: .top) { Rule() }
+        .overlay(alignment: .bottom) { Rule() }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Intercept: \(session.paused.count) paused")
+    }
+
+    /// The paused-bar actions. `compact` keeps only Resume and folds the rest into
+    /// an overflow menu; `ViewThatFits` picks it when the full row would not fit.
+    @ViewBuilder private func actions(compact: Bool) -> some View {
+        let resumeTitle = target.map { session.pendingEditCount($0.id) > 0 } == true ? "Apply & Resume" : "Resume"
+        HStack(spacing: Tok.Metric.gapTight) {
+            PrimaryButton(resumeTitle, hint: "⌘⏎") { if let target { session.applyAndResume(target.id) } }
                 .accessibilityIdentifier("resume-button")
+            if compact {
+                Menu {
+                    if let target, row(target).state == .paused {
+                        Button("Edit Paused Request") { session.editPaused(target.id) }
+                    }
+                    Button("Resume All") { session.resumeAll() }
+                    Menu("Kill") {
+                        ForEach(KillMode.allCases, id: \.self) { mode in
+                            Button(mode.title) { session.killMode = mode; if let target { session.kill(target.id) } }
+                        }
+                    }
+                    Button("Breakpoint Rules…") { session.rulesVisible = true }
+                    Button("Disarm Intercept") { session.arm(false) }
+                } label: {
+                    GhostButton("More", menu: true) {}
+                }
+                .menuStyle(.button)
+                .buttonStyle(.plain)
+                .menuIndicator(.hidden)
+                .fixedSize()
+            } else {
                 if let target, row(target).state == .paused {
                     GhostButton("Edit", hint: "e") { session.editPaused(target.id) }
                         .accessibilityIdentifier("edit-button")
@@ -88,16 +130,6 @@ struct InterceptBar: View {
                 GhostButton("Disarm", hint: "i") { session.arm(false) }
             }
         }
-        .font(Tok.Face.ui(Tok.Typography.Size.md))
-        .foregroundStyle(Tok.Intercept.onBase.color)
-        .padding(.horizontal, Space.md)
-        .frame(height: Tok.Size.interceptBar)
-        .frame(maxWidth: .infinity)
-        .background(Tok.Intercept.base.color)
-        .overlay(alignment: .top) { Rule() }
-        .overlay(alignment: .bottom) { Rule() }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Intercept: \(session.paused.count) paused")
     }
 
     private func row(_ r: FlowRow) -> FlowRow { r }

@@ -11,17 +11,37 @@ the same recorded fixture. Design, degradations and the bus contract are in
 ## Run
 
 ```
-usage: aitm-tui (--bus host:port (--token-file p | --token t (insecure: visible in ps)) [--allow-remote-bus] | --fixture [path]) [--poc-dir dir] [--ansi|--truecolor] [--poll ms]
+usage: aitm-tui (--bus host:port (--token-file p | --token t (insecure: visible in ps)) [--allow-remote-bus] [--expect-role agent|operator] | --fixture [path]) [--poc-dir dir] [--ansi|--truecolor] [--poll ms]
        aitm-tui --snapshot out.svg [--cols N --rows N]
-       aitm-tui --snapshot-core out.svg [--cols N --rows N]   (fixture limited to the 56 core tools)
+       aitm-tui --snapshot-core out.svg [--cols N --rows N]   (fixture limited to the core tools)
        --poc-dir: where P (poc.build) writes the PoC YAML; use the proxy's poc.dir so poc.run can read it
+       --expect-role: the role you expect the token to resolve to; the status line warns if it does not (it is never sent to the server)
 ```
 
-**Against a running proxy.** The proxy's loopback TCP transport and its token:
+(The binary's own usage text still says "the 56 core tools" for `--snapshot-core`;
+the list it uses, `CORE_TOOLS`, has 59.) With neither `--bus` nor `--fixture`, and
+no `AITM_BUS`, it prints this usage and exits with status 2.
+
+**Against a running proxy.** The proxy's loopback TCP transport and its token.
+Configure that transport in the proxy's `config.yaml`, start the proxy (`aitm`), and
+put the same token in a file:
+
+```yaml
+mcp:
+  transport:
+    loopback_tcp:
+      port: 9090
+      token: <a long random token>
+```
 
 ```sh
 aitm-tui --bus 127.0.0.1:9090 --token-file ~/.aitm/bus.token --poc-dir ~/engagement/pocs
 ```
+
+The token line decides the role: the loopback token connects as an **agent**
+(gated like any MCP agent); the proxy's `mcp.operator_token` (create one with
+`aitm operator-token generate`) connects as an **operator**. `--expect-role` only
+makes the status line warn when the role the proxy assigned differs.
 
 `--poc-dir` names the directory a built PoC is written to. The core's
 `poc.build` answers with the PoC's **YAML text**, not a file; the TUI writes
@@ -41,7 +61,8 @@ on loopback is **refused** unless `--allow-remote-bus` is given, because the
 token travels in cleartext until the TLS bus lands (core follow-up F15). The
 TUI writes the token line, sends `initialize` as client `aitm-tui`, then
 `tools/list` once and builds the palette from it. The flow list is polled
-every `--poll` ms (default 500, floor 100) until F4 adds push. A lost
+every `--poll` ms (default 500, floor 100); the TUI does not use the core's
+`flow.subscribe` push yet. A lost
 connection reconnects with back-off (0.5 s doubling to 10 s); the status bar
 shows the bus state.
 
@@ -63,8 +84,9 @@ log because `RUST_LOG` is unset.
 main screen from the fixture and exits. The extension picks the format:
 `.svg`, `.ans`/`.ansi` (escape codes), anything else plain text. Default 200×50.
 `--snapshot-core` renders the same screen against the fixture limited to the
-50 tools the core serves today (`CORE_TOOLS`), so the two pictures show what
-is real now and what the remaining F-tools (the F1 agent pair) add.
+59 tools in `CORE_TOOLS` (`crates/aitm-tui/src/lib.rs`), the commands the core
+serves. The built-in fixture currently carries exactly those 59, so the two
+pictures are the same.
 
 `--ansi` forces the 16-colour palette, `--truecolor` the hex palette;
 otherwise the terminal is detected (see Terminal capabilities).
@@ -108,7 +130,7 @@ optional, keyboard complete.
 | `↑`/`k`, `↓`/`j`, `PgUp`, `PgDn`, `Home`/`g`, `End`/`G` | move |
 | `Enter` / `Esc` / `Space` | open inspector / back / quick look |
 | `Tab`/`→`, `Shift-Tab`/`←`, `1`–`9`, `0` | next / previous / nth chip |
-| `b`, `[`, `]` | toggle sidebar, previous / next sidebar item (Scope filters the list; Findings, Browser, Agent open their panels) |
+| `b`, `[`, `]` | toggle sidebar, previous / next sidebar item (Scope filters the list; Findings, Browser, Agent and Scan open their panels) |
 | `i` · `a` / `A` · `d` or `x` | arm/disarm interception · resume one / all (out-of-scope flows are skipped and counted) · kill |
 | `e` · `r` · `n` | edit the paused request · replay · compose from selection |
 | `p` / `m` / `c` · `P` | pin host / mark / comment · build PoC (name, then param) |
@@ -127,6 +149,7 @@ optional, keyboard complete.
 | `↑`/`k`, `↓`/`j`, `PgUp`, `PgDn`/`Space`, `Home`/`g`, `End`/`G` | scroll |
 | `z` | fold (JSON tree) |
 | `e`, `a`, `d`/`x`, `r`, `n`, `P`, `y`, `o`, `i`, `:`, `/`, `?` | as in Flows |
+| `b` / `s` | on an L4 flow only: build a craft / inject (confirmed with `y`); no-op on HTTP flows |
 
 **Edit** (a paused request): `Ctrl-S` or `F5` apply and resume · `Ctrl-R`
 revert · `Esc` back · arrows, `Home`, `End`, `Enter`, `Backspace`, `Tab` and
@@ -157,7 +180,19 @@ shown with their script's name). The YAML and description come from
 `Esc`/`q` back.
 
 **Agent**: `1`/`a` all tools · `2`/`r` read-only · `3`/`p` paused ·
-`↑`/`k`, `↓`/`j` scroll the log · `Esc`/`q` back.
+`↑`/`k`, `↓`/`j` scroll the log · `Esc`/`q` back. When the bus serves the `l4.*`
+commands (L4 enabled in the core's `config.yaml`; privileged, Linux first), `c`,
+`i`, `n` and `w` toggle the per-feature L4 agent gates (capture, inject,
+intercept, scope widening).
+
+**Scan** (`:scan`, or the sidebar's Scan item; shown only when the bus offers
+`scan.discover`): `r` crawls the selected flow's host or the first concrete scope
+entry (the host must be in scope) · `Tab`/`Shift-Tab` switch between the
+endpoints and injection-point lists · `↑`/`k`, `↓`/`j`, `PgUp`, `PgDn`,
+`Home`/`g`, `End`/`G` move · `Enter`/`→` open the selected row's flow in the
+inspector · `F` findings · `:` palette · `Esc`/`q` back. It is discovery only; the
+core must have its embedded browser for a real crawl (without one,
+`scan.discover` answers `stopped_reason: "no_browser"` from stored flows).
 
 **CA** (`:ca`): `e` export (asks `[pem|der] [path]`) · `i` install · `u`
 uninstall (both confirmed with `y/N` first) · `Esc`/`q` back.
@@ -192,10 +227,10 @@ once the core resolves the peer to its process (`flow.detail` reports
 |---|---|
 | `intercept` | Arm/disarm interception (`i`) |
 | `resume` / `resume all` | Resume the targeted paused flow / every paused flow |
-| `kill` | Kill the targeted paused flow (abort mode: reset; 429/503 need F3) |
+| `kill` | Kill the targeted paused flow (always `flow.kill` with the default `reset` mode; for `429`/`503` run `:flow.kill id=… mode=429`) |
 | `replay` | Repeat the selected flow unchanged (`r`) |
 | `compose` | Compose a request, prefilled from the selection (`n`) |
-| `compose get\|post-json\|post-form\|ws` | Compose from a template (`ws` needs F9) |
+| `compose get\|post-json\|post-form\|ws` | Compose from a template (`ws` is not built: it only toasts) |
 | `curl <command>` | Import a curl command line into compose |
 | `filter <expr>` | Set the filter expression (`/`) |
 | `scope add <host>` | Add a host to scope (scope-as-authorisation) |
@@ -208,12 +243,13 @@ once the core resolves the peer to its process (`flow.detail` reports
 | `ca` | CA panel: `ca.status` facts, export, install, uninstall |
 | `config` | Config panel: the redacted `config.get` view |
 | `browser` | Browser view: URL, DOM outline, screenshot; navigate and eval |
+| `scan` / `scan <host>` | Scan view (`scan.discover`): `:scan` only opens it; `:scan <host>` crawls that host, and `r` in the view crawls the selected flow's host or the first concrete scope entry. Out-of-scope hosts are refused client-side. Needs the scanner plugin on the bus. |
 | `layout h\|v` | Inspector below or right |
 | `split` | Split view — not built in this pass |
-| `export` | Export flows — needs F10 |
+| `export` | Export flows — not built in the TUI (the toast names `flow.export`; run `:flow.export`, which takes `ids`, `format` and `path`) |
 | `sidebar` | Toggle the sidebar (`b`) |
 | `pin [host]` | Pin a host to the top of the list (`p`) |
-| `import <path>` | Import HAR / mitmproxy / Proxyman flows — needs F10 |
+| `import <path>` | Import flows from a file (`flow.import`: `aitm`, HAR or mitmproxy `.flows`); needs the tool on the bus |
 | `clear` | Clear completed flows (`flow.clear`; the toast says `cleared N flows · M in flight kept`) |
 | `pause` / `record` | Pause / resume capture (`proxy.pause` / `proxy.resume`) |
 | `copy` | Copy the selected URL (OSC 52) |
@@ -269,7 +305,7 @@ login                              URLs containing "login"
 The TUI builds its palette from `tools/list` and never assumes a tool exists.
 A feature whose tool is absent renders disabled with the label
 `needs core follow-up F<n>`, where F<n> is the row in foundation §5; it is
-never hidden and never fails silently. Against today's core that is:
+never hidden and never fails silently. The follow-ups were:
 
 | Follow-up | Tool(s) | What is disabled |
 |---|---|---|
@@ -283,6 +319,14 @@ never hidden and never fails silently. Against today's core that is:
 | F11 | `tls.passthrough.list/add/remove` | SSL include/exclude list (which hosts to MITM) |
 | F13 (rest) | findings export | export of a finding (YAML + PNG + HAR) |
 | F14 | `browser.tabs`, `browser.screencast` | a live browser viewport and the tab count in the sidebar (the Browser view itself is built; see **Browser** above) |
+
+The current core (`CORE_TOOLS`, 59 commands) serves the tools for every row
+above except F5 (rest), F13 (rest) and F14. A few surfaces still show their
+`needs core follow-up` label anyway, because the TUI itself has not built the
+feature, not because the core lacks the tool: the `Rules…` breakpoint editor (F3),
+kill modes `429`/`503` from the `d` key (F3; use `:flow.kill id=… mode=429`),
+push instead of polling (F4), `:compose ws` (F9), and `:export` and Saved
+sessions (F10).
 
 **Lit up with the core of 2026-10-28** (the merge that brought `tools/list`
 to 37): F5 `flow.detail` (bodies, headers, connections, metadata, sizes,
@@ -315,7 +359,7 @@ core dependency; build-or-descope is Matt's call):
 
 - split view (two lists side by side ≥ 160 columns) — `:split` says so
 - saved filters by name; match highlighting in body viewers; the sidebar quick filter
-- compose templates Multipart and WebSocket (`:compose ws` names F9); the compose Query field and body modes; edit templates
+- compose templates Multipart and WebSocket (`:compose ws` only toasts); the compose Query field and body modes; edit templates
 - WebSocket sent/received direction filter
 - setup-guide text; column hide; a Comment column (≥ 170 columns); palette recent/pinned
 - custom columns, multi-select with a summary, overview dashboard text
@@ -365,11 +409,11 @@ base64-encodes them as `body` / `data` with `body_size` / `length` the way
 would (resume attaches the recorded `on_resume` response, kill marks the
 flow, replay and `request.send` append, `flow.clear` drops completed flows).
 In tests, `aitm_tui::fixture_app(cols, rows)` loads it into an `App`
-(`fixture_app_core` with only the 56 core tools); `snapshot::render` draws to
+(`fixture_app_core` with only the 59 core tools); `snapshot::render` draws to
 a buffer and `to_text` / `to_svg` / `to_ansi` serialise it.
 `docs/design/tui/main-screen.svg` is such a snapshot with every proposed tool
 present; `docs/design/tui/main-screen-core.svg` is the same screen against
-today's 56 core tools — with M4 merged the F1 agent surface is lit, so the core
+the 59 core tools — with M4 merged the F1 agent surface is lit, so the core
 screen now matches the full one.
 
 ## Development

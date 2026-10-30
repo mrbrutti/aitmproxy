@@ -3,8 +3,9 @@
 //! Installing or activating the `NETransparentProxyProvider` system extension is
 //! a privileged, human-present action. Mirroring the deny-by-default posture of
 //! `ca.allow_agent_install` (`crates/aitm-core/src/config.rs`) and
-//! `l4.allow_agent_widen` (`crates/aitm-proto-l4/src/config.rs`), the agent
-//! frontend (`Frontend::Mcp`) is refused unless the operator explicitly sets
+//! `l4.allow_agent_widen` (`crates/aitm-proto-l4/src/config.rs`), an untrusted
+//! (agent) caller, any origin `Frontend::is_trusted_control` does not trust, is
+//! refused unless the operator explicitly sets
 //! [`SysexActivationConfig::allow_agent_sysex_install`].
 
 use std::fmt;
@@ -17,10 +18,10 @@ use aitm_core::Frontend;
 /// defaults to `false`: deny-by-default, exactly like `ca.allow_agent_install`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SysexActivationConfig {
-    /// Allow the agent frontend (`Frontend::Mcp`) to trigger the sysex
-    /// install/activation. **Default false** — installing a system extension is
-    /// an operator action, so an agent must never reach it unless a human
-    /// operator opts in.
+    /// Allow an untrusted (agent) caller, any origin `Frontend::is_trusted_control`
+    /// does not trust, to trigger the sysex install/activation. **Default false**
+    /// — installing a system extension is an operator action, so an agent must
+    /// never reach it unless a human operator opts in.
     pub allow_agent_sysex_install: bool,
 }
 
@@ -50,20 +51,22 @@ impl std::error::Error for ActivationRefused {}
 
 /// Gate the macOS system-extension install/activation on the caller's origin.
 ///
-/// Human-present origins (`Frontend::Cli`, `Frontend::Operator`) may always
-/// trigger the operator action. Every other origin — the agent (`Frontend::Mcp`)
-/// and, because [`Frontend`] is `#[non_exhaustive]`, any future non-human
-/// frontend — is treated as agent-driven and refused unless the operator has set
+/// Who counts as a human-present, trusted origin is decided in one place,
+/// [`Frontend::is_trusted_control`] (which delegates to
+/// `aitm_core::CallerTrust::is_trusted_control`). A trusted origin may always
+/// trigger the operator action; every other origin is treated as agent-driven
+/// and refused unless the operator has set
 /// [`SysexActivationConfig::allow_agent_sysex_install`]. Deny-by-default: a new
-/// origin is never silently allowed through.
+/// origin must be classified in `aitm-core` (default: agent), so it is never
+/// silently allowed through.
 pub fn check_activation_caller(
     origin: Frontend,
     cfg: &SysexActivationConfig,
 ) -> Result<(), ActivationRefused> {
-    match origin {
-        Frontend::Cli | Frontend::Operator => Ok(()),
-        _ if cfg.allow_agent_sysex_install => Ok(()),
-        _ => Err(ActivationRefused),
+    if origin.is_trusted_control() || cfg.allow_agent_sysex_install {
+        Ok(())
+    } else {
+        Err(ActivationRefused)
     }
 }
 
@@ -94,6 +97,30 @@ mod tests {
         let off = SysexActivationConfig::default();
         assert!(check_activation_caller(Frontend::Cli, &off).is_ok());
         assert!(check_activation_caller(Frontend::Operator, &off).is_ok());
+    }
+
+    #[test]
+    fn activation_matrix_covers_every_variant_and_flag() {
+        let off = SysexActivationConfig::default();
+        let on = SysexActivationConfig {
+            allow_agent_sysex_install: true,
+        };
+        let cells = [
+            (Frontend::Cli, off, Ok(())),
+            (Frontend::Cli, on, Ok(())),
+            (Frontend::Operator, off, Ok(())),
+            (Frontend::Operator, on, Ok(())),
+            (Frontend::Mcp, off, Err(ActivationRefused)),
+            (Frontend::Mcp, on, Ok(())),
+        ];
+        for (origin, cfg, expected) in cells {
+            assert_eq!(
+                check_activation_caller(origin, &cfg),
+                expected,
+                "origin {origin:?}, allow_agent_sysex_install {}",
+                cfg.allow_agent_sysex_install
+            );
+        }
     }
 
     #[test]

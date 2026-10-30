@@ -1,10 +1,12 @@
 # Automated scanner
 
-The automated scanner is a **deterministic, Burp-style scanner** built into
-aitmproxy as the `aitm-plugin-scanner` plugin. It crawls an in-scope target and
-discovers **injection points** — the places in a request where a value can be
-tampered with — so an operator (human or AI) starts from a concrete map of the
-attack surface instead of a blank page.
+The automated scanner is a **deterministic crawler and injection-point finder**
+built into aitmproxy as the `aitm-plugin-scanner` plugin — the discovery stage of
+a Burp-style scanner. It crawls an in-scope target and discovers **injection
+points** — the places in a request where a value can be tampered with — so an
+operator (human or AI) starts from a concrete map of the attack surface instead
+of a blank page. It does not attack anything: active fuzzing and injection are
+roadmap, not shipped.
 
 It is **deterministic and AI-free**: the same target and the same configuration
 produce the same crawl and the same injection points, driven only by the shape of
@@ -37,8 +39,10 @@ scope-bound**. It will only touch hosts you have explicitly put in scope:
   on top of the per-navigation guard checks above.
 - The crawl is **same-origin and in-scope only**, bounded by depth, page, and
   time caps (below).
-- `scan.discover` is a `Write`-sensitivity command, so it is subject to the
-  operator approval gate when an agent runs it.
+- `scan.discover` is a `Write`-sensitivity command: it is bound by the agent
+  policy when an agent runs it (it runs under `all`, `auto` and `ask`; it is
+  refused under `readonly` and `paused`), and always by scope, rate and SSRF
+  checks.
 
 Discovered examples are **scrubbed of secrets**: credential-bearing values
 (`Authorization`, `Cookie` values, and parameters whose names look like session
@@ -47,8 +51,8 @@ or auth material) are returned as `<redacted>`, never echoed in the result.
 ## Running it
 
 `scan.discover` is a plugin command, so — like every command in aitmproxy — it is
-**auto-surfaced over MCP, the CLI, and the UIs** at once, with the same scope and
-sensitivity rules. It is **operator-run and agent-taskable**.
+registered once and reachable from MCP, the one-shot CLI and the UIs, with the
+same scope and sensitivity rules. It is **operator-run and agent-taskable**.
 
 **One discovery at a time.** All crawls share the one embedded-browser page, so
 two at once would interleave their navigations and each would harvest the
@@ -63,7 +67,19 @@ close the panel, the crawl keeps running and keeps the slot until it finishes or
 hits its time budget (default **10 minutes**), so you can be refused by your own
 earlier scan. Wait for it to end rather than retrying.
 
-### CLI
+A real crawl needs a **running proxy with its embedded browser**: the bare `aitm`
+server (the MCP server), `aitm web` and `aitm tui` each launch the configured
+engine (obscura by default; see [INSTALL.md](../INSTALL.md) if it is not found)
+and register `scan.discover`. Drive it through one of those, not the one-shot CLI.
+
+### MCP
+
+Call the `scan.discover` tool with the same parameters (`target`, and optionally
+`max_depth` and `max_pages`) from any connected agent or MCP client. It is both
+**agent-taskable** (an agent can run a discovery pass on its own) and
+**operator-driven**.
+
+### CLI (one-shot, no crawl)
 
 ```bash
 aitm scan discover --target https://example.test/
@@ -71,20 +87,28 @@ aitm scan discover --target https://example.test/
 aitm scan discover --target https://example.test/ --max_depth 2 --max_pages 50
 ```
 
-### MCP
-
-Call the `scan.discover` tool with the same parameters from any connected agent
-or MCP client. It is both **agent-taskable** (an agent can run a discovery pass
-on its own) and **operator-driven**.
+The `aitm <family> <verb>` form is a **one-shot, in-process** dispatch: it builds a
+fresh core with an empty flow store and **no browser**, runs this one command and
+exits. It never connects to a proxy you have running, so it cannot crawl and
+cannot see that proxy's flows. Against a target whose host is in scope it returns
+no endpoints, `pages_crawled: 0` and `stopped_reason: "no_browser"` (the
+store-only fallback has nothing to list); against any other host it fails with an
+out-of-scope error before fetching anything. The one-shot process takes its scope
+from `scope.entries` in `config.yaml`; an `aitm scope add` run in a separate
+process neither persists nor reaches the running proxy. Treat the CLI form as a
+way to check argument parsing and scope, and use MCP or a UI for actual scans.
 
 ### UIs
 
 All three operator UIs — the **web UI**, the **TUI**, and the **macOS app** —
 have a **Scan** view that launches `scan.discover` against an in-scope target and
-renders the result: the discovered endpoints and injection points. Both the
-endpoint rows and the injection-point rows **link back to the flow** they were
-found in, so an operator can jump straight from a discovered point to the
-captured request behind it.
+renders the result: the discovered endpoints and injection points. The
+injection-point rows **link back to the flow** they were found in, and an endpoint
+row links to the newest captured flow that served it (`endpoint_flows`), so an
+operator can jump straight from a discovered point to the captured request
+behind it. In the web UI the Scan item appears in the sidebar only when the
+connected core offers the `scan.discover` tool; in the TUI, `r` launches a scan
+from the Scan view.
 
 ## Inputs
 
@@ -94,11 +118,10 @@ captured request behind it.
 | `max_depth` | int | no | Crawl depth limit. Clamped to the configured cap (default **3**) — it can only lower the cap, never raise it. |
 | `max_pages` | int | no | Maximum pages to crawl. Clamped to the configured cap (default **200**). |
 
-The remaining limits come from the plugin's `ScannerConfig` and are not
-per-call overridable in Stage 1: a request budget (default **2000**) and a crawl
-time budget (default **10 minutes**). `max_depth` / `max_pages` overrides are
-always clamped **down** to these configured caps — a caller can tighten a scan
-but never exceed the operator-set bounds.
+The remaining limit is a crawl time budget (default **10 minutes**). These
+defaults are built in: there is no `config.yaml` key for them, and `max_depth` /
+`max_pages` overrides are always clamped **down** to the caps — a caller can
+tighten a scan but never exceed them.
 
 ## Output
 
@@ -106,10 +129,13 @@ but never exceed the operator-set bounds.
 
 | Key | Type | Description |
 |---|---|---|
-| `endpoints` | array of strings | The in-scope URLs the crawl reached. |
-| `injection_points` | array of objects | The discovered injection points (below). |
+| `endpoints` | array of strings | The in-scope URLs the crawl reached. A link that redirects within the origin contributes both the URL the crawl requested and the page it landed on. |
+| `injection_points` | array of objects | The discovered injection points (below). Repeated scans of the same site do not accumulate: a point is unique per `(endpoint URL, location, name)` and carries the newest captured flow that showed it. |
+| `endpoint_flows` | object (URL to flow id) | Maps each endpoint URL (as in `endpoints`) to the id of the newest captured flow that served it. An endpoint with no capture is absent. |
 | `pages_crawled` | int | Number of pages successfully navigated. |
-| `stopped_reason` | string or null | Why the crawl stopped early (e.g. `"navigation_failed"`, `"guard_refused"`, or a cap being hit); `null` if it completed normally. |
+| `stopped_reason` | string or null | Why the crawl stopped early: `"max_pages"`, `"max_depth"`, `"time_budget"`, `"left_scope"` (a navigation landed off-origin or out of scope, such as a redirect, and the crawl aborted there), `"navigation_failed"` (every navigation failed), `"guard_refused"` (the guard refused every link), or `"no_browser"` (no browser engine attached; see below). `null` if the reachable graph was exhausted. |
+
+Each array is capped at 1024 entries.
 
 Each entry in `injection_points` is an object:
 
@@ -129,12 +155,13 @@ reads the request and yields a point for each:
 - **`query`** — each URL query-string parameter (percent-decoded).
 - **`body_param`** — each form-encoded body parameter, and each top-level JSON
   object key in a JSON body.
-- **`header`** — request headers that carry attacker-influenceable values.
+- **`header`** — each request header other than `Cookie` and `Host` (a header whose
+  name reads as a secret, such as `Authorization`, carries `<redacted>`).
 - **`cookie`** — each request cookie (value always redacted).
 - **`path_segment`** — numeric path segments (likely identifiers), e.g. the `42`
   in `/users/42/profile`.
-- **`redirect`** — a parameter whose value is itself a URL (an open-redirect
-  candidate).
+- **`redirect`** — a query or body parameter whose value is itself a URL
+  (starts with `http://`, `https://` or `//`; an open-redirect candidate).
 
 Because discovery is driven purely by the request, it finds the same points a
 human would read off the traffic, every time.
@@ -150,6 +177,7 @@ human would read off the traffic, every time.
     "https://example.test/account/",
     "https://example.test/redirect"
   ],
+  "endpoint_flows": { "https://example.test/": "…", "https://example.test/search": "…" },
   "injection_points": [
     { "flow": "…", "location": "query",    "name": "q",       "example": "test" },
     { "flow": "…", "location": "cookie",   "name": "session", "example": "<redacted>" },
@@ -163,21 +191,22 @@ human would read off the traffic, every time.
 ## How it crawls
 
 The crawl is a bounded breadth-first walk driven over aitmproxy's embedded
-[obscura browser](../README.md#the-obscura-browser): it navigates the seed,
+[obscura browser](../README.md#embedded-browser): it navigates the seed,
 harvests same-origin in-scope links (tag-aware — only `<a>`/`<area>` `href` and
 `<form>` `action`, never script or comment bodies), and enqueues them under the
 depth / page / time caps. The browser proxies through aitmproxy, so each
 navigation produces captured flows that the enumerator then reads. When no
-browser engine is attached, discovery falls back to enumerating injection points
-from flows already in the store, so a store-only run still honours scope and rate
-state.
+browser engine is attached (obscura not found, or a one-shot CLI call), discovery
+does not navigate: it lists the distinct same-origin, in-scope request URLs
+already in the flow store (up to `max_pages`) and enumerates their injection
+points, reporting `stopped_reason: "no_browser"` and `pages_crawled: 0`. That
+store-only run still honours scope and rate state.
 
 ## Roadmap: the active stages
 
 Discovery (`scan.discover`) is the **only** scanner command that exists today.
 The **active** stages are designed but **not built yet** — they are on the
-roadmap (targeted for a later release, v0.6), not present features. Do not expect
-these commands on a current build:
+roadmap, not present features. Do not expect these commands on a current build:
 
 - **`scan.inject`** *(planned)* — send payloads to the discovered injection
   points.
@@ -185,7 +214,7 @@ these commands on a current build:
   target.
 - **`scan.report`** *(planned)* — turn confirmed hits into reproducible PoCs and
   recorded findings via the
-  [PoC / check engine](../README.md#poc--check-engine).
+  [PoC engine](../README.md#scripting-and-reproducible-pocs).
 
 Until those land, treat `scan.discover` as a **read-only reconnaissance** step:
 it tells you *where* to look; injection, confirmation, and reporting stay with
