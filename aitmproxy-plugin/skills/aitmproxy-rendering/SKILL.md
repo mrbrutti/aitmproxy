@@ -41,16 +41,20 @@ Instead of dumping the array, render:
 
 | id | method | host | path | status | ms | state |
 |----|--------|------|------|--------|----|-------|
-| `3f2a` | GET | `api.example.com` | `/v1/users` | 200 ok | 48 | done |
-| `3f2b` | POST | `api.example.com` | `/v1/login` | 302 -> | 91 | done |
-| `3f2c` | WS | `api.example.com` | `/socket` | — pending | — | parked |
+| `3f2a` | GET | `api.example.com` | `/v1/users` | 200 ok | 48 | observed |
+| `3f2b` | POST | `api.example.com` | `/v1/login` | 302 -> | 91 | resumed |
+| `3f2c` | GET | `api.example.com` | `/v1/export` | — pending | — | intercepted |
 
-### findings.list — array (or `{findings:[…]}`) of `{id,title,class,severity,target,when}`
+(`state` is the flow's interception state: `observed`, `intercepted`, `resumed` or
+`killed`. Flow ids are UUIDs; abbreviate them for display. A WebSocket row has
+`kind: "websocket"` and null `method`/`path`/`status`; label it `WS`.)
+
+### findings.list — array (or `{findings:[…]}`) of `{id,title,class,severity,target,discovered_at,origin,poc_ref,passed,control_passed}`
 
 | id | severity | title | class | target |
 |----|----------|-------|-------|--------|
-| `F-01` | 🔴 critical | SQLi in login | sqli | `api.example.com` |
-| `F-02` | 🟡 medium | Missing CSRF token | csrf | `app.example.com` |
+| `sqli-9f3c01ab` | 🔴 critical | SQLi in login | sqli | `api.example.com` |
+| `csrf-4d2e7b10` | 🟡 medium | Missing CSRF token | csrf | `app.example.com` |
 
 ### proxy.status — `{listening,address,intercept_armed,paused,capturing,flows}`
 

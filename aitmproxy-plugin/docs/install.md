@@ -10,14 +10,19 @@ Every host launches the proxy's own binary as the MCP server, so `aitm` must be
 on your `PATH` first:
 
 ```bash
-cargo build --release          # from the repo root
+brew tap mrbrutti/aitmproxy && brew install aitm   # Apple Silicon macOS; public tap, no token
+# or from source, at the repo root:
+cargo build --release
 cargo install --path crates/aitm   # or copy target/release/aitm onto PATH
-aitm --version
 ```
 
+On Linux use the `.deb` / `.rpm` from the release page (see the repo's
+`INSTALL.md`). Check that `aitm` resolves with `aitm config get`, a one-shot
+command that prints the redacted config. (There is no `aitm --version`.)
+
 Bare **`aitm`** (no subcommand) serves the **stdio MCP** server and is the
-default transport. The same invocation also starts the intercepting proxy on
-`127.0.0.1:8080`.
+default transport; there is no `aitm mcp` subcommand. The same invocation also
+starts the intercepting proxy on `127.0.0.1:8080`.
 
 ---
 
@@ -89,19 +94,28 @@ subcommand) and add the resulting server in ChatGPT developer mode.
 
 For a stable endpoint (a hosted connector or submission) run aitmproxy's
 **streamable-HTTP** transport instead of stdio. Enable it in the aitmproxy
-config:
+config file, `config.yaml` (macOS: `~/Library/Application Support/aitmproxy/config.yaml`;
+Linux: `~/.config/aitmproxy/config.yaml`; or pass `--config <path>` / set
+`AITM_CONFIG`):
 
-```toml
-transport = { streamable_http = { bind = "127.0.0.1:8084", token = "<bearer>", allowed_origins = [], path = "/mcp" } }
+```yaml
+mcp:
+  transport:
+    streamable_http:
+      bind: 127.0.0.1:8084
+      token: "<bearer>"
+      # allowed_origins: []     # optional; exact Origin allowlist
+      # path: /mcp              # optional; the default
 ```
 
-Defaults: `bind` = `127.0.0.1:8084`, `path` = `/mcp`, `allowed_origins` = empty
-(no cross-origin). **`token` is required** and non-empty — it is the Bearer
-credential on every request, and the only authentication the endpoint has. The
-endpoint is then `http://127.0.0.1:8084/mcp`.
+`bind` and `token` are required. `allowed_origins` defaults to empty (no
+cross-origin requests) and `path` to `/mcp`. **`token` must be non-empty** — it is
+the Bearer credential on every request, and the only authentication the endpoint
+has. With the block above the endpoint is `http://127.0.0.1:8084/mcp`.
 
 > stdio (bare `aitm`) remains the **default** transport. The streamable-HTTP
-> listener is opt-in and only runs when this config block is present.
+> listener is opt-in and only runs when this block is present; the config selects
+> exactly one MCP transport, so with it set the MCP server speaks HTTP, not stdio.
 
 Steps:
 
@@ -132,10 +146,12 @@ export AITM_BIN=/absolute/path/to/aitm   # e.g. a dev build: target/debug/aitm
 Claude expands `${VAR:-default}` in `.mcp.json`, so an unset `AITM_BIN` falls
 back to `aitm` on `PATH`. Use this when the released `aitm` (Homebrew tap
 `mrbrutti/homebrew-aitmproxy`) predates a feature you need, or to test a local
-build. Confirm the build has the plugin's MCP surface with:
+build. `aitm --help` is not a real flag — the CLI answers
+`expected a command before flags` — but it prints its command listing to stderr,
+which is how to confirm a build has the plugin's MCP surface:
 
 ```bash
-aitm --help   # the output lists `flow table` when the build includes it
+aitm --help 2>&1 | grep 'flow table'   # present when the build includes flow.table
 ```
 
 The OpenAI `mcp.json` uses a bare `aitm` command (OpenAI does not document

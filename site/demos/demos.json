@@ -38,7 +38,7 @@
       "mode": "operator",
       "video": "clips/scope.mp4",
       "poster": "clips/posters/scope.jpg",
-      "caption": "Deny-by-default: only authorized hosts can be touched"
+      "caption": "Deny-by-default: active actions are refused for any host outside the scope"
     },
     {
       "id": "poc",

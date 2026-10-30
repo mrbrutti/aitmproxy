@@ -42,7 +42,7 @@
 <section class="hero">
   <div class="wrap">
     <h1 class="display"><span class="line"><span>Intercept anything&nbsp;—</span></span><span class="line"><span>by&nbsp;hand or by&nbsp;agent.</span></span></h1>
-    <p class="lead">aitmproxy captures, intercepts, edits, replays and reproduces traffic across four layers of the wire — HTTP, WebSocket, HTTP/2 and raw L4 packets. One core, driven completely by an operator or by an AI assistant: the same commands over the CLI, the GUI and MCP.</p>
+    <p class="lead">aitmproxy captures, intercepts, edits, replays and reproduces traffic across four layers of the wire — HTTP, WebSocket, HTTP/2 and raw L4 packets. One core, driven completely by an operator or by an AI assistant: the same commands from the three UIs, the one-shot CLI and MCP.</p>
 
     <div class="weave" role="img" aria-label="aitmproxy sits on the wire as an interceptor. One message at a time — an HTTP request, a WebSocket frame, an HTTP/2 frame, a raw L4 packet — is pulled off the wire, rebuilt in the flow viewer, held and edited, then sent back on in a changed form, while other traffic flows past untouched.">
       <div class="endpoint endpoint--client" aria-hidden="true">
@@ -65,7 +65,7 @@
           <span class="wp-proto">HTTP/1.1</span>
           <span class="m m-post">POST</span>
           <span class="path">/api/cart/items</span>
-          <span class="state">armed</span>
+          <span class="state">paused</span>
         </div>
         <div class="wp-body">
           <div class="flow-row" style="--i:1"><span class="h">host:</span> shop.example.com</div>
@@ -76,7 +76,7 @@
         </div>
         <div class="wp-bar flow-row" style="--i:6">
           <span class="dot" aria-hidden="true"></span>
-          <span class="wp-bar-label">held · <code>127.0.0.1:8080</code></span>
+          <span class="wp-bar-label">paused · <code>127.0.0.1:8080</code></span>
           <span class="spacer"></span>
           <span class="wp-act wp-act--go">Resume</span>
           <span class="wp-act wp-act--kill">Kill</span>
@@ -93,13 +93,13 @@
     <div class="operators">
       <div class="operator">
         <p class="operator-who">by hand</p>
-        <code><span class="pr">$ </span>aitm flow mutate --id 41 --set-body <span class="s">'{"qty":999}'</span></code>
+        <code><span class="pr">web UI </span>press <span class="s">i</span> to arm, edit the held body to <span class="s">{"qty":999}</span>, then Apply &amp; Resume</code>
       </div>
       <div class="operator operator--agent">
         <p class="operator-who">by agent</p>
-        <code>flow.mutate({ id: 41, set_body: <span class="s">'{"qty":999}'</span> })</code>
+        <code>flow.mutate({ id: <span class="s">"&lt;flow-id&gt;"</span>, edits: { body: <span class="s">'{"qty":999}'</span> } })</code>
       </div>
-      <p class="operators-note">Two operators, one command. Both reach the same held flow, and both land in the same audit log.</p>
+      <p class="operators-note">Two operators, one command. Apply &amp; Resume sends the same <code>flow.mutate</code> and <code>flow.resume</code> an agent calls, both reach the same held flow, and both land in the same audit log.</p>
     </div>
 
     <div class="hero-cta">
@@ -107,7 +107,7 @@
       <a class="arrow" href="docs.html">Read the docs</a>
       <div class="cmd"><code><span class="pr">$ </span>brew install mrbrutti/aitmproxy/aitm</code><button class="copy" type="button" data-copy aria-label="Copy install command"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
     </div>
-    <p class="hero-foot">Written in memory-safe Rust. Runs on macOS and Linux. Open source under MIT or Apache-2.0.</p>
+    <p class="hero-foot">Written in memory-safe Rust. Runs on macOS and Linux. Licensed under MIT or Apache-2.0.</p>
   </div>
 </section>
 
@@ -115,7 +115,7 @@
 <section class="section" id="see">
   <div class="wrap">
     <h2 class="h2" data-reveal>The same flow, in the real thing.</h2>
-    <p class="lead deck" data-reveal data-d="1">Not a mockup. This is the web UI armed on a staging host — eleven requests paused on the wire, the intercept bar lit amber, the agent toggle idle in the corner.</p>
+    <p class="lead deck" data-reveal data-d="1">Not a mockup. This is the web UI, armed, on sample data — eleven requests paused on the wire, the intercept bar lit amber, the agent toggle idle in the corner.</p>
     <figure class="shot" data-reveal data-d="2">
       <div class="frame">
         <picture>
@@ -136,7 +136,7 @@
 <section class="section showcase" id="showcase" hidden aria-label="Watch aitmproxy work">
   <div class="wrap">
     <h2 class="h2" data-reveal>Watch it work.</h2>
-    <p class="lead deck" data-reveal data-d="1">Short, real captures from the running tool. Step through a capability — each one is the same core, driven by hand or by agent.</p>
+    <p class="lead deck" data-reveal data-d="1">Short, real captures of the running tool, recorded in the web UI against a local test target. Step through a capability — each one is a command in the same core that an agent can call too.</p>
     <div class="showcase-grid" data-reveal data-d="2">
       <ol class="showcase-steps" role="tablist" aria-label="Features"></ol>
       <div class="showcase-stage">
@@ -153,35 +153,37 @@
 <section class="section" id="operators">
   <div class="wrap">
     <h2 class="h2" data-reveal>Two operators. One control surface.</h2>
-    <p class="lead deck" data-reveal data-d="1">Every action in aitmproxy is a command. A person runs it from the CLI or a GUI; an AI assistant calls the very same command over MCP. There is no second API for agents and no hidden menu for humans — one core, and one record of who did what.</p>
+    <p class="lead deck" data-reveal data-d="1">Every action in aitmproxy is a registered command. A person drives a running core from the web UI, the terminal UI or the macOS app; an AI assistant calls the very same command over MCP. There is no second API for agents and no hidden menu for humans — one core, and one record of who did what. The one-shot CLI (<code>aitm &lt;family&gt; &lt;verb&gt;</code>) runs a single command in its own process, which suits self-contained jobs such as <code>aitm ca status</code>; it does not steer a proxy that is already running.</p>
 
     <div class="split">
       <div class="split-col" data-reveal>
-        <h3>By hand, in a terminal</h3>
+        <h3>By hand, in the web UI</h3>
         <figure class="code term">
-          <figcaption><span>zsh — aitm</span><button class="copy" type="button" data-copy aria-label="Copy transcript"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="pr">$ </span><span class="in">aitm intercept add --match <span class="s">'POST /api/cart/*'</span></span>
-<span class="out">rule r1 armed · POST /api/cart/*</span>
-<span class="pr">$ </span><span class="in">aitm flow list --held</span>
-<span class="out">41  POST  /api/cart/items  armed  —</span>
-<span class="pr">$ </span><span class="in">aitm flow mutate --id 41 --set-body <span class="s">'{"qty":999}'</span></span>
-<span class="out">flow 41 body updated (27 B)</span>
-<span class="pr">$ </span><span class="in">aitm flow resume --id 41</span>
-<span class="out">flow 41 → 200 in 212 ms</span></code></pre>
+          <figcaption><span>web UI — aitm web</span><button class="copy" type="button" data-copy aria-label="Copy transcript"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="pr">› </span><span class="in">press <span class="s">i</span></span>
+<span class="out">Intercept armed — every request pauses here</span>
+<span class="pr">› </span><span class="in">select the paused <span class="s">POST /api/cart/items</span> row</span>
+<span class="out">Paused · request</span>
+<span class="pr">› </span><span class="in">edit the body to <span class="s">{"qty":999}</span></span>
+<span class="out">1 edit pending</span>
+<span class="pr">› </span><span class="in">Apply &amp; Resume <span class="s">⌘⏎</span></span>
+<span class="out">sends flow.mutate, then flow.resume</span></code></pre>
         </figure>
       </div>
       <div class="split-col" data-reveal data-d="1">
         <h3>By agent, over MCP</h3>
         <figure class="code term">
           <figcaption><span>mcp — aitmproxy</span><button class="copy" type="button" data-copy aria-label="Copy transcript"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="who">›</span> <span class="in">intercept.add({ match: <span class="s">"POST /api/cart/*"</span> })</span>
-<span class="who">‹</span> <span class="out">{ rule: "r1", state: "armed" }</span>
-<span class="who">›</span> <span class="in">flow.list({ held: <span class="n">true</span> })</span>
-<span class="who">‹</span> <span class="out">[{ id: 41, method: "POST", path: "/api/cart/items", state: "armed" }]</span>
-<span class="who">›</span> <span class="in">flow.mutate({ id: <span class="n">41</span>, set_body: <span class="s">'{"qty":999}'</span> })</span>
-<span class="who">‹</span> <span class="out">{ id: 41, body_bytes: 27 }</span>
-<span class="who">›</span> <span class="in">flow.resume({ id: <span class="n">41</span> })</span>
-<span class="who">‹</span> <span class="out">{ id: 41, status: 200, ms: 212 }</span></code></pre>
+<pre><code><span class="who">›</span> <span class="in">flow.intercept({ rules: [{ method: <span class="s">"POST"</span>, url: <span class="s">"*/api/cart/*"</span> }] })</span>
+<span class="who">‹</span> <span class="out">{ enabled: true, rules: [{ id: "rule-0", phase: "request", … }] }</span>
+<span class="who">›</span> <span class="in">flow.list()</span>
+<span class="who">‹</span> <span class="out">["7c1d9e3a-52b0-4f6e-8a14-d3b9f0a62c17"]</span>
+<span class="who">›</span> <span class="in">flow.get({ id: <span class="s">"7c1d9e3a-…"</span> })</span>
+<span class="who">‹</span> <span class="out">{ id: "7c1d9e3a-…", kind: "http", intercept: "intercepted", method: "POST", path: "/api/cart/items", status: null, … }</span>
+<span class="who">›</span> <span class="in">flow.mutate({ id: <span class="s">"7c1d9e3a-…"</span>, edits: { body: <span class="s">'{"qty":999}'</span> } })</span>
+<span class="who">‹</span> <span class="out">"7c1d9e3a-52b0-4f6e-8a14-d3b9f0a62c17"</span>
+<span class="who">›</span> <span class="in">flow.resume({ id: <span class="s">"7c1d9e3a-…"</span> })</span>
+<span class="who">‹</span> <span class="out">"resumed"</span></code></pre>
         </figure>
       </div>
     </div>
@@ -197,13 +199,13 @@
       </svg>
       <div class="audit-wrap" data-reveal data-d="2"><table class="audit">
         <caption>One log. Every command, whoever issued it.</caption>
-        <thead><tr><th>time</th><th>operator</th><th>command</th><th>target</th><th>result</th></tr></thead>
+        <thead><tr><th>time</th><th>origin</th><th>command</th><th>args</th><th>result</th></tr></thead>
         <tbody>
-          <tr><td class="t">12:04:17.221</td><td class="who">hand</td><td>intercept.add</td><td>r1</td><td>armed</td></tr>
-          <tr><td class="t">12:04:19.004</td><td class="who">agent</td><td>flow.list</td><td>held</td><td>1 flow</td></tr>
-          <tr class="same"><td class="t">12:04:21.310</td><td class="who">hand</td><td>flow.mutate</td><td>#41</td><td>body 27 B</td></tr>
-          <tr class="same"><td class="t">12:04:21.318</td><td class="who">agent</td><td>flow.mutate</td><td>#41</td><td>body 27 B</td></tr>
-          <tr><td class="t">12:04:23.902</td><td class="who">hand</td><td>flow.resume</td><td>#41</td><td>200 · 212 ms</td></tr>
+          <tr><td class="t">12:04:17.221</td><td class="who">operator</td><td>flow.intercept</td><td>{"enabled":true}</td><td>ok</td></tr>
+          <tr><td class="t">12:04:19.004</td><td class="who">agent</td><td>flow.list</td><td>—</td><td>ok</td></tr>
+          <tr class="same"><td class="t">12:04:21.310</td><td class="who">operator</td><td>flow.mutate</td><td>{"id":"7c1d9e3a-…","edits":{…}}</td><td>ok</td></tr>
+          <tr class="same"><td class="t">12:04:21.318</td><td class="who">agent</td><td>flow.mutate</td><td>{"id":"7c1d9e3a-…","edits":{…}}</td><td>ok</td></tr>
+          <tr><td class="t">12:04:23.902</td><td class="who">operator</td><td>flow.resume</td><td>{"id":"7c1d9e3a-…"}</td><td>ok</td></tr>
         </tbody>
       </table></div>
     </div>
@@ -214,33 +216,33 @@
 <section class="section" id="flows">
   <div class="wrap">
     <h2 class="h2" data-reveal>A request, held in mid-air.</h2>
-    <p class="lead deck" data-reveal data-d="1">Everything aitmproxy sees is a Flow with a short lifecycle. Observed flows pass straight through and are recorded. A rule can intercept one: the request pauses, readable and editable, until you resume it or drop it.</p>
+    <p class="lead deck" data-reveal data-d="1">Everything aitmproxy sees is a Flow with a short lifecycle. Observed flows pass straight through and are recorded. Arm interception, or add a rule, and a request pauses, readable and editable, until you resume it or kill it.</p>
 
     <div class="life">
       <div>
-        <div class="life-diagram" role="img" aria-label="Flow lifecycle: observed, then intercepted, then resumed; an intercepted flow can also be dropped." data-reveal data-fx="line">
+        <div class="life-diagram" role="img" aria-label="Flow lifecycle: observed, then intercepted, then resumed; an intercepted flow can also be killed." data-reveal data-fx="line">
           <div class="stations">
             <div class="station"><b>observed</b><span>seen, recorded, forwarded</span></div>
-            <div class="station station--held"><b>intercepted</b><span>held, readable, editable</span><em class="drop-label">dropped</em></div>
+            <div class="station station--held"><b>intercepted</b><span>held, readable, editable</span><em class="drop-label">killed</em></div>
             <div class="station"><b>resumed</b><span>sent on, as edited</span></div>
           </div>
           <div class="life-line"></div>
         </div>
         <dl class="life-defs" data-reveal data-d="1">
           <div><dt>observed</dt><dd>The default. The flow is logged with full request and response, timing and TLS details, and forwarded untouched.</dd></div>
-          <div><dt>intercepted</dt><dd>A rule matched, or you armed the flow by hand. The request (or the response) waits inside the proxy. Edit headers, body, URL or status; nothing moves until you say so.</dd></div>
-          <div><dt>resumed or dropped</dt><dd>Resume sends the edited flow on its way and records the diff. Drop answers the client yourself, or not at all.</dd></div>
+          <div><dt>intercepted</dt><dd>Interception was armed, or a rule matched. The request (or, under a response rule, the response) waits inside the proxy. Edit method, URL, headers and body, or the status of a held response; nothing moves until you say so.</dd></div>
+          <div><dt>resumed or killed</dt><dd>Resume sends the edited flow on its way; the flow keeps its original, so the inspector can diff and revert the edits. Kill resets the client's connection, or answers it with a 429 or 503 and never reaches the upstream.</dd></div>
         </dl>
       </div>
 
       <div class="ui" aria-label="Flow list with one intercepted flow selected" data-reveal data-d="2">
-        <div class="ui-bar"><span class="dot" aria-hidden="true"></span><span>listening on <code>127.0.0.1:8080</code></span><span class="spacer"></span><span>1 held</span></div>
+        <div class="ui-bar"><span class="dot" aria-hidden="true"></span><span>listening on <code>127.0.0.1:8080</code></span><span class="spacer"></span><span>1 paused</span></div>
         <table class="flows">
-          <thead><tr><th>#</th><th>method</th><th>url</th><th>status</th><th>time</th></tr></thead>
+          <thead><tr><th>#</th><th>method</th><th>url</th><th>status</th><th>duration</th></tr></thead>
           <tbody>
             <tr><td class="num">43</td><td><span class="m m-ws">WS</span></td><td class="url">wss://api.example.com/live</td><td><span class="chip chip--ws">101</span></td><td class="time">—</td></tr>
             <tr><td class="num">42</td><td><span class="m m-get">GET</span></td><td class="url">/api/users/me</td><td class="st-ok">200</td><td class="time">12 ms</td></tr>
-            <tr class="is-held"><td class="num">41</td><td><span class="m m-post">POST</span></td><td class="url">/api/cart/items</td><td><span class="chip chip--armed">armed</span></td><td class="time">—</td></tr>
+            <tr class="is-held"><td class="num">41</td><td><span class="m m-post">POST</span></td><td class="url">/api/cart/items</td><td><span class="chip chip--armed">Paused</span></td><td class="time">—</td></tr>
             <tr><td class="num">40</td><td><span class="m m-get">GET</span></td><td class="url">/api/products?page=2</td><td class="st-ok">200</td><td class="time">38 ms</td></tr>
             <tr><td class="num">39</td><td><span class="m m-get">GET</span></td><td class="url">/api/products?page=1</td><td class="st-ok">200</td><td class="time">41 ms</td></tr>
           </tbody>
@@ -254,9 +256,9 @@ content-type: application/json
 { "sku": "A-1042", "qty": <span class="edit" style="background:var(--signal)">999</span> }</pre>
         </div>
         <div class="ui-actions">
-          <span class="btnlike is-primary">Resume <kbd class="key">↩</kbd></span>
-          <span class="btnlike">Drop <kbd class="key">⌫</kbd></span>
-          <span class="btnlike">Replay <kbd class="key">R</kbd></span>
+          <span class="btnlike is-primary">Resume <kbd class="key">⌘⏎</kbd></span>
+          <span class="btnlike">Kill <kbd class="key">⌘\</kbd></span>
+          <span class="btnlike">Replay <kbd class="key">r</kbd></span>
         </div>
       </div>
     </div>
@@ -267,29 +269,29 @@ content-type: application/json
 <section class="section" id="features">
   <div class="wrap">
     <h2 class="h2" data-reveal>Everything on the wire is yours to change.</h2>
-    <p class="lead deck" data-reveal data-d="1">Each capability is a command, so each one works from the app, the terminal, a script or an assistant. The fragments below are the real shape of the tool.</p>
+    <p class="lead deck" data-reveal data-d="1">Each capability is a registered command, so each one is reachable from the UIs and from an assistant over MCP. The fragments below sketch the shape of the tool.</p>
 
     <div class="features">
       <article class="feature" data-reveal>
         <h3 class="h3">Intercept and edit by rule</h3>
-        <p>Hold requests or responses that match a method, path, host or header. Edit, then resume.</p>
+        <p>Hold every request, or only those that match a method, host or URL pattern, at the request or the response. Edit, then resume.</p>
         <div class="ui"><div class="ui-lines">
-          <div><span class="k">rule</span><span>r1 · <span class="chip chip--armed">armed</span></span></div>
-          <div><span class="k">match</span><span>POST /api/cart/*</span></div>
-          <div><span class="k">hold</span><span>request, response</span></div>
-          <div><span class="k">held</span><span>#41 · 1 of 1</span></div>
+          <div><span class="k">intercept</span><span><span class="chip chip--armed">armed</span> · 1 rule</span></div>
+          <div><span class="k">match</span><span>POST */api/cart/*</span></div>
+          <div><span class="k">phase</span><span>request</span></div>
+          <div><span class="k">paused</span><span>1</span></div>
         </div></div>
         <a class="arrow" href="features.html#intercept">Intercept rules</a>
       </article>
 
       <article class="feature" data-reveal>
         <h3 class="h3">Replay and compose</h3>
-        <p>Send any flow again with changes, or compose a request from scratch. Each replay is a new flow.</p>
+        <p>Send a captured request again, or compose one from scratch. Each replay is a new flow, and both are scope-guarded.</p>
         <div class="ui"><div class="ui-lines">
-          <div><span class="k">replay</span><span>#41 → #44</span></div>
-          <div><span class="k">set</span><span>header <span class="edit">X-Debug: 1</span></span></div>
-          <div><span class="k">result</span><span>200 · 198 ms · 1.2 kB</span></div>
-          <div><span class="k">diff</span><span>body +0 −0 · headers +1</span></div>
+          <div><span class="k">replay</span><span>r on #41 → #44 ↻</span></div>
+          <div><span class="k">result</span><span>200 · 198 ms</span></div>
+          <div><span class="k">compose</span><span>n · method, URL, headers, body</span></div>
+          <div><span class="k">scope</span><span>out-of-scope hosts refused</span></div>
         </div></div>
         <a class="arrow" href="features.html#replay">Replay</a>
       </article>
@@ -298,9 +300,9 @@ content-type: application/json
         <h3 class="h3">Map Local and Map Remote</h3>
         <p>Answer a request from a file on disk, or redirect it to another upstream, without touching the app.</p>
         <div class="ui"><div class="ui-lines">
-          <div><span class="k">local</span><span>GET /api/flags → ./fixtures/flags.json</span></div>
-          <div><span class="k">remote</span><span>api.example.com/* → localhost:4000/*</span></div>
-          <div><span class="k">hits</span><span>12 local · 48 remote</span></div>
+          <div><span class="k">local</span><span>GET */api/flags → fixtures/flags.json</span></div>
+          <div><span class="k">remote</span><span>api.example.com → localhost:4000</span></div>
+          <div><span class="k">root</span><span>maps.root confines the files</span></div>
         </div></div>
         <a class="arrow" href="features.html#map">Map rules</a>
       </article>
@@ -311,7 +313,7 @@ content-type: application/json
         <div class="ui"><div class="ui-lines">
           <div><span class="dir">↑</span><span>text · {"op":"ping"}</span></div>
           <div><span class="dir">↓</span><span>text · {"op":"pong"}</span></div>
-          <div class="inj"><span class="dir">↑</span><span>inject · {"op":"subscribe","ch":"orders"}</span></div>
+          <div class="inj"><span class="dir">↑</span><span>text · injected · {"op":"subscribe","ch":"orders"}</span></div>
           <div><span class="dir">↓</span><span>text · {"op":"ok","ch":"orders"}</span></div>
         </div></div>
         <a class="arrow" href="features.html#websocket">WebSocket</a>
@@ -321,19 +323,19 @@ content-type: application/json
         <h3 class="h3">HTTP/2, per stream</h3>
         <p>Negotiated over ALPN and decrypted with the local CA. Each multiplexed stream is an ordinary flow you can hold and edit.</p>
         <div class="ui"><div class="ui-lines">
-          <div><span class="k">stream</span><span>5 · <span class="chip chip--armed">armed</span></span></div>
-          <div><span class="k">:method</span><span>POST · :path /graphql</span></div>
-          <div><span class="k">frame</span><span>DATA · editable</span></div>
+          <div><span class="k">stream</span><span>5 · <span class="chip chip--armed">Paused</span></span></div>
+          <div><span class="k">request</span><span>POST /graphql · h2</span></div>
+          <div><span class="k">edit</span><span>method, path, headers, body</span></div>
         </div></div>
         <a class="arrow" href="features.html#http2">HTTP/2</a>
       </article>
 
       <article class="feature" data-reveal>
         <h3 class="h3">Raw L4 packets</h3>
-        <p>Sit on a raw TCP stream, capture the bytes both ways, and hold a segment to read, edit and release — any protocol, not just HTTP.</p>
+        <p>Capture TCP and UDP packets, craft and inject your own, and — on Linux, with privileges — hold a packet in the path to edit and release it. Off by default.</p>
         <div class="ui"><div class="ui-lines">
-          <div><span class="k">listen</span><span>tcp :5432 → db.internal:5432</span></div>
-          <div><span class="k">held</span><span>#58 · 24 bytes · PSH, ACK</span></div>
+          <div><span class="k">capture</span><span>eth0 · tcp 10.0.0.4:51514 → :5432</span></div>
+          <div><span class="k">held</span><span>#58 · 44 bytes · in-path (Linux)</span></div>
           <div><span class="k">edit</span><span>database <span class="edit">market_prod</span></span></div>
         </div></div>
         <a class="arrow" href="features.html#l4">Raw L4</a>
@@ -341,11 +343,11 @@ content-type: application/json
 
       <article class="feature" data-reveal>
         <h3 class="h3">Sessions and HAR</h3>
-        <p>Save a capture as a session, reopen it later, and move traffic in or out as HAR.</p>
+        <p>Save the flow store as a session, reopen it later, and move traffic in or out as HAR or mitmproxy flows.</p>
         <div class="ui"><div class="ui-lines">
-          <div><span class="k">session</span><span>checkout.aitm · 312 flows</span></div>
-          <div><span class="k">export</span><span>checkout.har · 2.4 MB</span></div>
-          <div><span class="k">import</span><span>from-browser.har · 88 flows</span></div>
+          <div><span class="k">session</span><span>session.save → checkout.json</span></div>
+          <div><span class="k">export</span><span>flow.export · format har</span></div>
+          <div><span class="k">import</span><span>flow.import ← from-browser.har</span></div>
         </div></div>
         <a class="arrow" href="features.html#sessions">Sessions</a>
       </article>
@@ -365,30 +367,30 @@ content-type: application/json
         <h3 class="h3">Embedded headless browser</h3>
         <p>A browser that already trusts the proxy, for reproducing findings and taking the screenshot that proves them.</p>
         <div class="ui"><div class="ui-lines">
-          <div><span class="k">open</span><span>{{target}}/search?q=…</span></div>
-          <div><span class="k">eval</span><span>window.__marker → "k7x2"</span></div>
-          <div><span class="k">shot</span><span>confirmed.png · 1280×800</span></div>
+          <div><span class="k">navigate</span><span>{{target}}/search?q=…</span></div>
+          <div><span class="k">eval</span><span>window.__aitm → "k7x2"</span></div>
+          <div><span class="k">screenshot</span><span>PNG, kept as a PoC artifact</span></div>
         </div></div>
         <a class="arrow" href="features.html#browser">Browser</a>
       </article>
 
       <article class="feature" data-reveal>
         <h3 class="h3">Certificate management</h3>
-        <p>Generate, export, install and remove the local CA from the CLI or the app. Nothing is installed without asking.</p>
+        <p>The local CA is generated on first run. Export it, check where it is trusted, install it and remove it again, from the CLI or the app. Nothing is installed without asking.</p>
         <div class="ui"><div class="ui-lines">
-          <div><span class="k">ca</span><span>aitmproxy local CA · 2026-01-14</span></div>
-          <div><span class="k">status</span><span>trusted · login keychain</span></div>
-          <div><span class="k">export</span><span>aitm-ca.pem</span></div>
+          <div><span class="k">ca</span><span>aitmproxy root CA · generated on first run</span></div>
+          <div><span class="k">status</span><span>per store: login keychain, system keychain</span></div>
+          <div><span class="k">export</span><span>aitm ca export --out aitm-ca.pem</span></div>
         </div></div>
         <a class="arrow" href="features.html#certs">Certificates</a>
       </article>
 
       <article class="feature" data-reveal>
         <h3 class="h3">Scriptable, all of it</h3>
-        <p>Every command above has a CLI form and an MCP form, and all of them can be called from a Rhai plugin.</p>
+        <p>Every command above is registered once: the UIs and MCP call it by the same name, the self-contained ones also run one-shot from the CLI, and Rhai plugins can register commands of their own.</p>
         <div class="pair">
-          <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm flow resume --id 41</code></div>
-          <div class="pair-row is-agent"><span class="pair-who">agent</span><code>flow.resume({ id: 41 })</code></div>
+          <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm script validate --path guard-admin-writes.rhai</code></div>
+          <div class="pair-row is-agent"><span class="pair-who">agent</span><code>script.validate({ path: <span class="s">"guard-admin-writes.rhai"</span> })</code></div>
         </div>
         <a class="arrow" href="scripting.html">Scripting</a>
       </article>
@@ -429,17 +431,20 @@ content-type: application/json
 <section class="section" id="languages">
   <div class="wrap">
     <h2 class="h2" data-reveal>Two small languages, written for people.</h2>
-    <p class="lead deck" data-reveal data-d="1">Plugins are Rhai scripts with a few hooks and a capability list. Reproductions are YAML files you can read top to bottom. Both are meant to be written by hand first, and by an assistant second.</p>
+    <p class="lead deck" data-reveal data-d="1">Plugins are Rhai scripts with a handful of hooks. Reproductions are YAML files you can read top to bottom. Both are meant to be written by hand first, and by an assistant second.</p>
 
     <div class="langs">
       <div data-reveal>
         <div class="lang-intro">
           <h3 class="h3">Rhai for plugins</h3>
-          <p>A plugin sees each flow as it passes, can edit it, answer it, or record a finding. It runs in a sandbox and gets only the capabilities it declares. One flow API spans HTTP, WebSocket, HTTP/2 and L4, so a new protocol needs no new language. <a class="arrow" href="scripting.html">Scripting reference</a></p>
+          <p>A plugin sees each flow as it passes, can edit it, answer it, or record a finding. It runs in a sandbox: it reaches the network and the browser only through scope- and rate-gated host calls. The same hooks see HTTP/1.1, HTTP/2 and WebSocket flows, and an <code>l4</code> namespace reaches raw packets. <a class="arrow" href="scripting.html">Scripting reference</a></p>
         </div>
         <figure class="code">
-          <figcaption><span>addons/guard-admin-writes.rhai</span><button class="copy" type="button" data-copy aria-label="Copy Rhai example"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="c">// addons/guard-admin-writes.rhai</span>
+          <figcaption><span>guard-admin-writes.rhai</span><button class="copy" type="button" data-copy aria-label="Copy Rhai example"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="c">// guard-admin-writes.rhai</span>
+<span class="k">const</span> NAME = <span class="s">"guard-admin-writes"</span>;
+<span class="k">const</span> API  = <span class="s">"1"</span>;
+
 <span class="k">fn</span> <span class="f">on_request</span>(flow) {
     <span class="k">let</span> req = flow.request;
     <span class="k">if</span> req.path.starts_with(<span class="s">"/admin"</span>) &amp;&amp; req.method != <span class="s">"GET"</span> {
@@ -463,22 +468,33 @@ content-type: application/json
           <figcaption><span>pocs/reflected-xss-search-q.yaml</span><button class="copy" type="button" data-copy aria-label="Copy YAML example"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
 <pre><code><span class="yk">id:</span> <span class="yv">reflected-xss-search-q</span>
 <span class="yk">info:</span>
-  <span class="yk">name:</span> <span class="yv">Reflected value in search 'q' parameter</span>
+  <span class="yk">name:</span> <span class="yv">Reflected XSS in search 'q' parameter</span>
   <span class="yk">severity:</span> <span class="yv">high</span>
+<span class="yk">variables:</span>
+  <span class="p">-</span> <span class="yk">name:</span> <span class="yv">target</span>
+    <span class="yk">required:</span> <span class="yv">true</span>
+  <span class="p">-</span> <span class="yk">name:</span> <span class="yv">marker</span>
+    <span class="yk">default:</span> <span class="s">"{{rand_text_alpha(8)}}"</span>
+  <span class="p">-</span> <span class="yk">name:</span> <span class="yv">payload</span>
+    <span class="yk">default:</span> <span class="s">"&lt;script&gt;window.__aitm='{{marker}}'&lt;/script&gt;"</span>
 <span class="yk">steps:</span>
   <span class="p">-</span> <span class="yk">http:</span>
-      <span class="yk">url:</span> <span class="s">"{{target}}/search?q={{payload}}"</span>
+      <span class="yk">method:</span> <span class="yv">GET</span>
+      <span class="yk">url:</span> <span class="s">"{{target}}/search?q={{url_encode(payload)}}"</span>
       <span class="yk">matchers:</span>
         <span class="p">-</span> <span class="yk">type:</span> <span class="yv">word</span>
           <span class="yk">part:</span> <span class="yv">body</span>
-          <span class="yk">word:</span> <span class="s">"{{marker}}"</span>
+          <span class="yk">word:</span> <span class="s">"window.__aitm='{{marker}}'"</span>
+  <span class="p">-</span> <span class="yk">browser:</span>
+      <span class="yk">action:</span> <span class="yv">navigate</span>
+      <span class="yk">url:</span> <span class="s">"{{target}}/search?q={{url_encode(payload)}}"</span>
   <span class="p">-</span> <span class="yk">browser:</span>
       <span class="yk">action:</span> <span class="yv">screenshot</span>
-      <span class="yk">label:</span> <span class="yv">confirmed</span>
+      <span class="yk">label:</span> <span class="yv">xss-triggered</span>
 <span class="yk">success:</span>
   <span class="yk">all:</span>
     <span class="p">-</span> <span class="yk">type:</span> <span class="yv">browser-eval</span>
-      <span class="yk">expr:</span> <span class="s">"window.__marker"</span>
+      <span class="yk">expr:</span> <span class="s">"window.__aitm"</span>
       <span class="yk">equals:</span> <span class="s">"{{marker}}"</span></code></pre>
         </figure>
       </div>
@@ -490,26 +506,26 @@ content-type: application/json
 <section class="section" id="scanner">
   <div class="wrap">
     <h2 class="h2" data-reveal>Map the attack surface, by command.</h2>
-    <p class="lead deck" data-reveal data-d="1">The scanner is a plugin, not a mode. <code>scan.discover</code> drives the embedded browser to crawl an authorized, in-scope target, then reads the captured flows back for injection points — query and body parameters, headers, path segments. Like everything else it is one command, so an operator runs it and an assistant can be tasked with the very same call.</p>
+    <p class="lead deck" data-reveal data-d="1">The scanner is a plugin, not a mode. <code>scan.discover</code> drives the embedded browser to crawl an authorized, in-scope target, then reads the captured flows back for injection points — query and body parameters, headers, cookies, path segments. Like everything else it is one command, so an operator runs it from a UI and an assistant can be tasked with the very same call.</p>
 
     <div class="split">
       <div class="split-col" data-reveal>
         <h3>Run it, by hand or by agent</h3>
         <div class="pair">
-          <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm scan discover --target <span class="s">'https://staging.example.com'</span></code></div>
-          <div class="pair-row is-agent"><span class="pair-who">agent</span><code>scan.discover({ target: <span class="s">"https://staging.example.com"</span> })</code></div>
+          <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">web UI </span>Scan → pick an in-scope target → Discover <span class="pr">(TUI: Scan view, then </span><span class="s">r</span><span class="pr">)</span></code></div>
+          <div class="pair-row is-agent"><span class="pair-who">agent</span><code>scan.discover({ target: <span class="s">"https://staging.example.com/"</span>, max_depth: <span class="n">2</span>, max_pages: <span class="n">50</span> })</code></div>
         </div>
-        <p class="deck muted">Deny-by-default: a target outside the session scope is refused before the crawler opens a single page. Discovery today; injection and PoC generation build on the same seam.</p>
+        <p class="deck muted">Deny-by-default: a target outside the scope is refused before the crawler opens a single page. What ships today is discovery only; active fuzzing and injection are on the roadmap.</p>
       </div>
       <div class="split-col" data-reveal data-d="1">
         <h3>What it hands back</h3>
         <div class="ui">
           <div class="ui-bar"><span class="dot" aria-hidden="true"></span><span>scan.discover</span><span class="spacer"></span><span>staging.example.com</span></div>
           <div class="ui-lines">
-            <div><span class="k">endpoints</span><span>37 across 9 hosts</span></div>
-            <div><span class="k">injection</span><span>84 points · query, body, header</span></div>
-            <div><span class="k">crawled</span><span>42 pages · same-origin, in-scope</span></div>
-            <div><span class="k">stopped</span><span>page cap reached</span></div>
+            <div><span class="k" style="min-width:16ch">endpoints</span><span>37 URLs · same-origin, in-scope</span></div>
+            <div><span class="k" style="min-width:16ch">injection_points</span><span>84 · query, body_param, header, cookie</span></div>
+            <div><span class="k" style="min-width:16ch">pages_crawled</span><span>42</span></div>
+            <div><span class="k" style="min-width:16ch">stopped_reason</span><span>max_pages</span></div>
           </div>
         </div>
       </div>
@@ -524,7 +540,7 @@ content-type: application/json
     <div class="stats">
       <div class="stat" data-reveal><b>0</b><span>lines of <code>unsafe</code> Rust in the whole tool</span></div>
       <div class="stat" data-reveal data-d="1"><b>~31,000</b><span>requests per second, sustained on a single instance, with flat memory</span></div>
-      <div class="stat" data-reveal data-d="2"><b>100<small>%</small></b><span>of the tool is scriptable and controllable, by hand or by agent</span></div>
+      <div class="stat" data-reveal data-d="2"><b>1</b><span>command registry behind every UI, the one-shot CLI and MCP, with one audit log</span></div>
       <div class="stat" data-reveal><b>3</b><span>user interfaces: macOS, web and terminal, on one core</span></div>
       <div class="stat" data-reveal data-d="1"><b>4</b><span>layers on the wire — HTTP, WebSocket, HTTP/2 and raw L4 packets, each editable</span></div>
       <div class="stat" data-reveal data-d="2"><b>2</b><span>licences to choose from, MIT or Apache-2.0; macOS and Linux</span></div>
@@ -537,17 +553,18 @@ content-type: application/json
   <div class="wrap">
     <div class="install">
       <div data-reveal>
-        <h2 class="h2">Install in one line. Capture in three.</h2>
-        <p class="lead deck">Homebrew or Cargo on macOS and Linux, or a native Linux package. Trust the local certificate once, start the proxy, and point your app or browser at it.</p>
+        <h2 class="h2">Install, trust, capture.</h2>
+        <p class="lead deck">Homebrew on macOS (Apple Silicon), or a native package or tarball on Linux. Trust the local certificate once, start the web UI, and point your app or browser at the proxy.</p>
         <p class="deck"><a class="arrow" href="download.html">All the ways to install v0.5.0</a></p>
       </div>
       <div data-reveal data-d="1">
         <div class="steps">
-          <div class="cmd"><code><span class="pr">$ </span>brew install mrbrutti/aitmproxy/aitm</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
+          <div class="cmd"><code><span class="pr">$ </span>brew tap mrbrutti/aitmproxy</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
+          <div class="cmd"><code><span class="pr">$ </span>brew install aitm</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
           <div class="cmd"><code><span class="pr">$ </span>aitm ca install</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
-          <div class="cmd"><code><span class="pr">$ </span>aitm start</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
+          <div class="cmd"><code><span class="pr">$ </span>aitm web</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
         </div>
-        <p class="deck muted">The proxy listens on <code>127.0.0.1:8080</code>; the web UI opens on <code>:8082</code>. Prefer the macOS app, Linux packages or Cargo? The <a href="download.html">download page</a> has every option.</p>
+        <p class="deck muted">The proxy listens on <code>127.0.0.1:8080</code>. <code>aitm web</code> serves the web UI on <code>127.0.0.1:8082</code> and prints a one-time <code>web UI (agent): http://127.0.0.1:8082/#t=…</code> link; open it in a browser, since nothing opens for you. Prefer the macOS app or a Linux package? The <a href="download.html">download page</a> has every option.</p>
       </div>
     </div>
   </div>

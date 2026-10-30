@@ -2,7 +2,8 @@
 
 ## Getting the obscura browser engine
 
-aitmproxy drives an embedded browser — the forked **obscura** Chromium engine,
+aitmproxy drives an embedded browser — the forked **obscura** engine (a Rust
+headless browser engine that embeds V8 and speaks CDP; it is not Chromium),
 released as prebuilt binaries in the private `mrbrutti/obscura` repo. `aitm`
 finds it at runtime in this order (`crates/aitm-browser/src/obscura.rs`,
 `discover_binary`):
@@ -12,9 +13,9 @@ finds it at runtime in this order (`crates/aitm-browser/src/obscura.rs`,
 3. **`obscura` next to the `aitm` executable** (`current_exe()` → `<dir>/obscura`);
 4. `obscura` on `PATH`.
 
-A packaged install (`.deb`/`.rpm`/tarball from `scripts/package.sh` and
-`scripts/package-linux.sh`) stages `obscura` beside `aitm`, so step 3 just works.
-A plain `git clone` + `cargo build` does **not**: `cargo` puts `aitm` in
+A packaged install (the release `.deb`/`.rpm`/tarball, built by
+`scripts/package-linux.sh` and `scripts/package.sh`) stages `obscura` beside
+`aitm`, so step 3 just works. A plain `git clone` + `cargo build` does **not**: `cargo` puts `aitm` in
 `target/debug/` (or `target/release/`), but nothing puts `obscura` there.
 
 ### One command
@@ -29,7 +30,7 @@ from `mrbrutti/obscura` (tag `aitm-v1`), verifies it against the release
 `target/release/` (and clears macOS quarantine). After that:
 
 ```bash
-cargo run -p aitm -- <args>            # debug build finds obscura
+cargo run -p aitm -- <args>            # debug build finds obscura (e.g. `-- web`, `-- tui`)
 cargo run --release -p aitm -- <args>  # release build finds obscura
 ```
 
@@ -50,9 +51,9 @@ If a browser-driving command fails with **"obscura (the embedded browser engine)
 was not found"**, obscura is not beside your `aitm` binary — run
 `scripts/fetch-obscura-dev.sh` (the error message says the same, and lists the
 `AITM_OBSCURA_BIN` / `browser.obscura.binary` overrides). If it fails with
-**"is not the aitmproxy obscura fork"**, the binary found is a stock
-Chromium/obscura, not the aitmproxy fork; re-run the fetch script or point
-`AITM_OBSCURA_BIN` at the fork.
+**"is not the aitmproxy obscura fork"**, the binary found is some other
+`obscura` (its `--help` does not list `--ca-cert`), not the aitmproxy fork;
+re-run the fetch script or point `AITM_OBSCURA_BIN` at the fork.
 
 ## Running the obscura-backed tests
 

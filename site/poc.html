@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PoC format — aitmproxy docs</title>
-<meta name="description" content="Reference for aitmproxy's YAML PoC format: a saved, re-runnable reproduction of a finding, with steps, matchers, variables and a success condition.">
+<meta name="description" content="Reference for aitmproxy's YAML PoC format: a saved, re-runnable reproduction of a finding, with steps, variables and a success condition, and how poc.run executes it.">
 <link rel="stylesheet" href="styles.css">
 <script>(function(d){var c=" js";try{if(!matchMedia("(prefers-reduced-motion: reduce)").matches&&!sessionStorage.getItem("aitm.intro")){c+=" intro-on";sessionStorage.setItem("aitm.intro","1");}}catch(e){}d.className+=c;})(document.documentElement);</script>
 </head>
@@ -49,7 +49,7 @@
         <h2>Automate</h2>
         <ul>
           <li><a href="#">CLI reference</a></li>
-          <li><a href="#">MCP server</a></li>
+          <li><a href="docs.html#mcp">MCP server</a></li>
           <li><a href="scripting.html">Rhai scripting</a></li>
           <li><a href="poc.html" aria-current="page">PoC format</a></li>
           <li><a href="#">Audit log</a></li>
@@ -70,101 +70,163 @@
 
   <article class="article">
     <h1 class="display">The PoC format</h1>
-    <p class="lead">A PoC is a saved, re-runnable reproduction of a finding: a few steps, a few matchers and one success condition, in a YAML file a colleague can read top to bottom. Write one when you confirm something; run it again when you need to know whether it is still true.</p>
+    <p class="lead">A PoC is a saved, re-runnable reproduction of a finding: a few steps and one success condition, in a YAML file a colleague can read top to bottom. Write one when you confirm something; run it again when you need to know whether it is still true.</p>
 
     <div class="prose">
       <h2 id="what">What a PoC is</h2>
-      <p>Findings decay. A screenshot proves what was true on Tuesday; a PoC proves what is true now. aitmproxy stores a PoC as a declarative file rather than a script so that it has no hidden state, can be diffed and reviewed like code, and can be written by a person first and an assistant second. Every PoC run passes through the proxy, so the flows it generates are captured, inspectable and auditable like any other traffic.</p>
+      <p>Findings decay. A screenshot proves what was true on Tuesday; a PoC proves what is true now. aitmproxy stores a PoC as a declarative file rather than a script so that it has no hidden state, can be diffed and reviewed like code, and can be written by a person first and an assistant second. A <code>script</code> step is there for the cases that need real logic. The requests a PoC sends go through the proxy's own client, so the flows it generates are captured and inspectable like any other traffic.</p>
+      <p>You can also start from traffic you have already captured. <code>poc.build</code> turns a flow into a parameterized PoC and returns it as YAML text; it writes no file. The base URL becomes <code>{{target}}</code>, and credential headers (<code>Cookie</code>, <code>Authorization</code>, <code>Proxy-Authorization</code>, <code>X-Api-Key</code>) become required variables, so no secret lands in a file you share.</p>
 
       <h2 id="schema">Schema</h2>
+      <p>The file must be <code>.yaml</code> or <code>.yml</code> and at most 1 MiB, and YAML anchors and aliases (<code>&amp;a</code>, <code>*a</code>) are rejected. Unknown top-level keys are ignored, but <code>id</code>, <code>info</code>, <code>steps</code> and <code>success</code> must be present.</p>
       <table>
         <thead><tr><th>Key</th><th>Type</th><th>Meaning</th></tr></thead>
         <tbody>
-          <tr><td><code>id</code></td><td>string, required</td><td>A stable slug. Used in filenames, findings and the audit log.</td></tr>
-          <tr><td><code>info.name</code></td><td>string, required</td><td>One line a reader understands without opening anything else.</td></tr>
-          <tr><td><code>info.severity</code></td><td><code>info | low | medium | high</code></td><td>Carried onto the finding when the PoC succeeds.</td></tr>
-          <tr><td><code>info.tags</code></td><td>list of strings</td><td>Optional, filterable.</td></tr>
-          <tr><td><code>vars</code></td><td>map</td><td>Default values for <code>{{variables}}</code>; see <a href="#variables">Variables</a>.</td></tr>
-          <tr><td><code>steps</code></td><td>list, required</td><td>Run in order. Each step is one of the <a href="#steps">step types</a>. A step with matchers that fails stops the run.</td></tr>
-          <tr><td><code>success</code></td><td><code>all</code> or <code>any</code> of conditions</td><td>Evaluated after the last step. Decides whether the finding is confirmed.</td></tr>
+          <tr><td><code>id</code></td><td>string, required</td><td>A slug: lowercase letters, digits and hyphens, at most 64 characters, starting with a letter or digit. It names the run's output directory and file, and is the finding's <code>poc_ref</code>.</td></tr>
+          <tr><td><code>info.name</code></td><td>string, required</td><td>One line a reader understands without opening anything else. It becomes the finding's title.</td></tr>
+          <tr><td><code>info.severity</code></td><td><code>info | low | medium | high | critical</code>, required</td><td>Carried onto the finding when the PoC passes.</td></tr>
+          <tr><td><code>info.cwe</code></td><td>string</td><td>Optional, such as <code>CWE-79</code>. It is the finding's class; without it the first tag is, then the <code>id</code>.</td></tr>
+          <tr><td><code>info.description</code>, <code>info.author</code>, <code>info.reference</code>, <code>info.tags</code>, <code>info.metadata</code></td><td>string, string, list, list, map</td><td>Optional, and kept as written when a file is saved and reloaded.</td></tr>
+          <tr><td><code>variables</code></td><td>list</td><td>Optional. Each entry is a map with <code>name</code> and, optionally, <code>default</code>, <code>description</code> and <code>required</code>; see <a href="#variables">Variables</a>.</td></tr>
+          <tr><td><code>steps</code></td><td>list, required</td><td>Run in order. Each entry is a map with one key naming the <a href="#steps">step type</a>.</td></tr>
+          <tr><td><code>success</code></td><td>required</td><td>A matcher, a list of matchers (all must hold), or <code>all</code>, <code>any</code> or <code>not</code> over matchers. Evaluated after the last step. The PoC passes if and only if it is true.</td></tr>
         </tbody>
       </table>
 
       <h2 id="steps">Step types</h2>
       <div class="api" data-reveal>
-        <div><div class="sig">http<small>send one request through the proxy</small></div><div><code>url</code> (required), <code>method</code> (default <code>GET</code>), <code>headers</code>, <code>body</code>, <code>follow_redirects</code> (default <code>false</code>), <code>matchers</code>. The response is kept for later matchers and for <code>{{last.body}}</code>.</div></div>
-        <div><div class="sig">browser<small>drive the embedded headless browser</small></div><div><code>action</code> is one of <code>navigate</code> (<code>url</code>), <code>screenshot</code> (<code>label</code>), <code>eval</code> (<code>expr</code>, stores the result), <code>click</code> (<code>selector</code>), <code>fill</code> (<code>selector</code>, <code>value</code>). The browser already trusts the proxy and goes through it.</div></div>
-        <div><div class="sig">replay<small>re-send a captured flow</small></div><div><code>flow</code> (id from the session) with optional <code>set_header</code>, <code>set_body</code>, <code>set_query</code>. Useful for PoCs written from a live session.</div></div>
-        <div><div class="sig">ws<small>WebSocket exchange</small></div><div><code>url</code>, then a <code>send</code> list and an <code>expect</code> list of frames; <code>timeout_ms</code>.</div></div>
-        <div><div class="sig">wait<small>pause</small></div><div><code>ms</code>. For targets with eventual consistency.</div></div>
+        <div><div class="sig">http<small>send one request through the proxy</small></div><div><code>method</code> and <code>url</code> are required; <code>url</code> is absolute and templated, usually <code>{{target}}/path</code>. Optional <code>headers</code> (a map), <code>body</code> (a string) and <code>extract</code> (a list of extractors, below). The request goes through the proxy's guarded client, so the host must be in scope and rate limits apply. The response is what later <code>success</code> matchers and extractors read, and its flow is the finding's capture. A step's own <code>matchers</code> and <code>matchers-condition</code> are kept when a file is saved but not evaluated; put the checks in <code>success</code>.</div></div>
+        <div><div class="sig">browser<small>drive the embedded browser</small></div><div><code>action</code> is one of <code>navigate</code> (<code>url</code>), <code>click</code> (<code>target</code>, a CSS selector), <code>type</code> (<code>selector</code>, <code>text</code>), <code>eval</code> (<code>expr</code>; the value is kept for <code>browser-eval</code> matchers and extractors) or <code>screenshot</code> (<code>label</code>). It needs the embedded browser, and a run without one fails. <code>navigate</code> is scope- and SSRF-guarded. Only the last screenshot is kept.</div></div>
+        <div><div class="sig">extract<small>bind a variable from the last response</small></div><div><code>name</code> and <code>type</code>, which is <code>regex</code> (<code>regex</code>, and <code>group</code>, where the default <code>0</code> is the whole match), <code>json</code> (<code>json</code>, a dotted path such as <code>data.token</code>), <code>kval</code> (<code>kval</code>, a response header name) or <code>browser-eval</code> (<code>expr</code>, a value an earlier <code>eval</code> step kept). The value is available as <code>{{name}}</code> to later steps and to <code>dsl</code> matchers. An extractor that finds nothing binds nothing. The same entries work as a list under an <code>http</code> step.</div></div>
+        <div><div class="sig">script<small>a Rhai escape hatch</small></div><div><code>script</code> is Rhai source that may <code>return pass</code> or <code>return fail</code>; it can read and set run variables with <code>vars.get(name)</code> and <code>vars.set(name, value)</code>. An optional <code>name</code> lets <code>success</code> read the verdict as <code>step("name")</code>, which is <code>"pass"</code>, <code>"fail"</code>, <code>"neutral"</code> or <code>"error"</code>. It runs in the scripting sandbox, behind the same guards as everything else.</div></div>
+        <div><div class="sig">l4<small>and other protocol steps</small></div><div>Any other step key names a protocol, run by that protocol's handler; one nobody registered fails at run time, never silently. <code>l4</code> takes <code>op</code> (<code>craft</code>, <code>inject</code> or <code>send_recv</code>) and can bind a field of the received packet, such as <code>field: tcp.flags</code>. It runs only where the L4 module is enabled: a privileged core, Linux first.</div></div>
       </div>
 
       <h2 id="matchers">Matchers and success</h2>
-      <p>Matchers sit inside a step and check its result. Success conditions sit at the end and check the whole run. They share one vocabulary:</p>
+      <p>Matchers live in <code>success</code>. They are judged against the most recent <code>http</code> response, plus anything an extractor, a <code>script</code> step or a <code>browser</code> step bound.</p>
       <table>
         <thead><tr><th>type</th><th>fields</th><th>true when</th></tr></thead>
         <tbody>
-          <tr><td><code>word</code></td><td><code>part</code>, <code>word</code> (string or list), <code>condition</code> (<code>and</code> or <code>or</code>)</td><td>the given part contains the word(s)</td></tr>
-          <tr><td><code>regex</code></td><td><code>part</code>, <code>regex</code></td><td>the part matches</td></tr>
-          <tr><td><code>status</code></td><td><code>status</code> (int or list)</td><td>the response status is one of them</td></tr>
-          <tr><td><code>header</code></td><td><code>name</code>, <code>equals</code> or <code>contains</code></td><td>the header matches</td></tr>
-          <tr><td><code>browser-eval</code></td><td><code>expr</code>, <code>equals</code></td><td>the expression, evaluated in the page, equals the value</td></tr>
-          <tr><td><code>screenshot-exists</code></td><td><code>label</code></td><td>a screenshot with that label was taken</td></tr>
+          <tr><td><code>status</code></td><td><code>status</code> (one integer)</td><td>the response status equals it</td></tr>
+          <tr><td><code>word</code></td><td><code>word</code> (a string), <code>part</code></td><td>the part contains the string</td></tr>
+          <tr><td><code>regex</code></td><td><code>regex</code>, <code>part</code></td><td>the pattern matches the part</td></tr>
+          <tr><td><code>dsl</code></td><td><code>dsl</code> (an expression)</td><td>the expression is true</td></tr>
+          <tr><td><code>browser-eval</code></td><td><code>expr</code>, <code>equals</code></td><td>the value <code>expr</code> gives in the page equals <code>equals</code></td></tr>
         </tbody>
       </table>
-      <p><code>part</code> is one of <code>body</code>, <code>header</code>, <code>status</code> or <code>all</code>. Any matcher takes <code>negative: true</code> to invert it.</p>
+      <p><code>part</code> is <code>body</code> (the default), <code>header</code> or <code>all</code>. Any matcher takes <code>negative: true</code> to invert it. Combine matchers with <code>all</code>, <code>any</code> and <code>not</code>; a bare list means <code>all</code>, and an empty one is rejected. A <code>dsl</code> matcher may stand alone as <code>- dsl: 'status_code == 200'</code>. Patterns and expressions are checked before the first request goes out, so a bad regex fails the run early. Editor completion also lists <code>size</code> and <code>binary</code> matchers; the engine does not run them yet and rejects them as unknown.</p>
+      <p>A <code>dsl</code> expression reads <code>status_code</code>, <code>body</code>, <code>content_length</code> and any variable an extractor, a <code>script</code> step or a protocol step bound, and combines them with <code>==</code>, <code>!=</code>, <code>&amp;&amp;</code>, <code>||</code>, <code>!</code> and parentheses. Its functions are <code>contains</code>, <code>url_encode</code>, <code>base64</code>, <code>html_escape</code>, <code>to_lower</code>, <code>len</code>, <code>concat</code>, <code>rand_text_alpha</code> and <code>step</code>. Variables from <code>variables</code> reach an expression as <code>{{name}}</code>, by text substitution before it is evaluated.</p>
 
       <h2 id="variables">Variables</h2>
-      <p>Anything in <code>{{double braces}}</code> is substituted before a step runs. Three names are reserved:</p>
+      <p>Anything in <code>{{double braces}}</code> is substituted before a step runs, and again inside <code>success</code>. A placeholder is one of three things:</p>
       <ul>
-        <li><code>{{target}}</code> — the base URL, always supplied on the command line so a PoC file never hard-codes a host.</li>
-        <li><code>{{marker}}</code> — a random token generated per run, so a reflection cannot be a coincidence or a cache.</li>
-        <li><code>{{payload}}</code> — by default the marker wrapped in the PoC's <code>vars.payload</code> template; override it per run.</li>
+        <li>a variable name, such as <code>{{param}}</code>;</li>
+        <li>one of the runtime placeholders computed from the <code>target</code> variable: <code>{{BaseURL}}</code> and <code>{{RootURL}}</code> (the scheme and authority), <code>{{Hostname}}</code>, <code>{{Host}}</code> (the hostname with its port, if the target gave one), <code>{{Port}}</code> (<code>80</code> or <code>443</code> when it gave none), <code>{{Path}}</code> and <code>{{Scheme}}</code>;</li>
+        <li>a DSL expression, such as <code>{{url_encode(payload)}}</code>.</li>
       </ul>
-      <p>Everything else comes from <code>vars</code> in the file, overridden by <code>--var name=value</code>. Results of earlier steps are reachable as <code>{{last.body}}</code>, <code>{{last.status}}</code> and <code>{{steps.N.body}}</code>.</p>
+      <p>No names are reserved. <code>target</code> is the one the command line fills (<code>--target</code>), so a PoC file never hard-codes a host. A value supplied at run time beats a <code>default</code>, and a variable with neither is an error the first time something uses it. <code>required: true</code> marks a variable the caller is expected to supply; the engine does not check it on its own.</p>
+      <p>A default may itself be a placeholder. Defaults are evaluated once at the start of the run, in order, so a later one can use an earlier one. That is how a PoC gets a fresh marker each run: <code>marker</code> below is a random string, and <code>payload</code> wraps it, so a reflection cannot be a coincidence or a cache. Data from a response reaches later steps only through an extractor.</p>
 
       <h2 id="example">Complete example</h2>
-      <p>A reflected value in a search parameter. The first step sends the marker and checks it comes back in the body. The second step opens the same page in the embedded browser and keeps a screenshot. Success requires that the page's own JavaScript saw the marker, which is a stronger claim than text in a body.</p>
+      <p>A reflected value in a search parameter, from the project's own test fixture. The first step sends a payload that carries a random marker. The second and third drive the embedded browser to the same URL and keep a screenshot. <code>success</code> asks for three things at once: the page answered <code>200</code>, the marker came back in the body unescaped, and the page's own JavaScript set <code>window.__aitm</code> to the marker, which is a stronger claim than text in a body. Against a patched target that escapes the quote, the word check fails and so does the PoC.</p>
       <figure class="code" data-reveal>
         <figcaption><span>pocs/reflected-xss-search-q.yaml</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
 <pre><code><span class="yk">id:</span> <span class="yv">reflected-xss-search-q</span>
 <span class="yk">info:</span>
-  <span class="yk">name:</span> <span class="yv">Reflected value in search 'q' parameter</span>
+  <span class="yk">name:</span> <span class="yv">Reflected XSS in search 'q' parameter</span>
   <span class="yk">severity:</span> <span class="yv">high</span>
+  <span class="yk">description:</span> <span class="yv">The 'q' parameter is reflected unescaped into the HTML response.</span>
+  <span class="yk">reference:</span>
+    <span class="p">-</span> <span class="yv">https://owasp.org/www-community/attacks/xss/</span>
+  <span class="yk">cwe:</span> <span class="yv">CWE-79</span>
+  <span class="yk">tags:</span> [<span class="yv">xss</span>, <span class="yv">reflected</span>]
+
+<span class="yk">variables:</span>
+  <span class="p">-</span> <span class="yk">name:</span> <span class="yv">target</span>
+    <span class="yk">description:</span> <span class="yv">Base URL of the vulnerable app</span>
+    <span class="yk">required:</span> <span class="yv">true</span>
+  <span class="p">-</span> <span class="yk">name:</span> <span class="yv">param</span>
+    <span class="yk">default:</span> <span class="yv">q</span>
+    <span class="yk">description:</span> <span class="yv">Reflected query parameter</span>
+  <span class="p">-</span> <span class="yk">name:</span> <span class="yv">marker</span>
+    <span class="yk">default:</span> <span class="s">"{{rand_text_alpha(8)}}"</span>
+    <span class="yk">description:</span> <span class="yv">Unique marker to confirm script execution</span>
+  <span class="p">-</span> <span class="yk">name:</span> <span class="yv">payload</span>
+    <span class="yk">default:</span> <span class="s">"&lt;script&gt;window.__aitm='{{marker}}'&lt;/script&gt;"</span>
+    <span class="yk">description:</span> <span class="yv">XSS payload carrying the marker</span>
+
 <span class="yk">steps:</span>
+  <span class="c"># 1. Send the injection. This flow is the finding's capture.</span>
   <span class="p">-</span> <span class="yk">http:</span>
-      <span class="yk">url:</span> <span class="s">"{{target}}/search?q={{payload}}"</span>
-      <span class="yk">matchers:</span>
-        <span class="p">-</span> <span class="yk">type:</span> <span class="yv">word</span>
-          <span class="yk">part:</span> <span class="yv">body</span>
-          <span class="yk">word:</span> <span class="s">"{{marker}}"</span>
+      <span class="yk">method:</span> <span class="yv">GET</span>
+      <span class="yk">url:</span> <span class="s">"{{target}}/search?{{param}}={{url_encode(payload)}}"</span>
+
+  <span class="c"># 2. Load the same URL in the browser and confirm the script ran.</span>
+  <span class="p">-</span> <span class="yk">browser:</span>
+      <span class="yk">action:</span> <span class="yv">navigate</span>
+      <span class="yk">url:</span> <span class="s">"{{target}}/search?{{param}}={{url_encode(payload)}}"</span>
   <span class="p">-</span> <span class="yk">browser:</span>
       <span class="yk">action:</span> <span class="yv">screenshot</span>
-      <span class="yk">label:</span> <span class="yv">confirmed</span>
+      <span class="yk">label:</span> <span class="yv">xss-triggered</span>
+
 <span class="yk">success:</span>
   <span class="yk">all:</span>
+    <span class="p">-</span> <span class="yk">type:</span> <span class="yv">status</span>
+      <span class="yk">status:</span> <span class="n">200</span>
+    <span class="p">-</span> <span class="yk">type:</span> <span class="yv">word</span>
+      <span class="yk">part:</span> <span class="yv">body</span>
+      <span class="yk">word:</span> <span class="s">"window.__aitm='{{marker}}'"</span>
     <span class="p">-</span> <span class="yk">type:</span> <span class="yv">browser-eval</span>
-      <span class="yk">expr:</span> <span class="s">"window.__marker"</span>
-      <span class="yk">equals:</span> <span class="s">"{{marker}}"</span></code></pre>
+      <span class="yk">expr:</span> <span class="s">"window.__aitm"</span>
+      <span class="yk">equals:</span> <span class="s">"{{marker}}"</span>     <span class="c"># the marker seen in the live page</span></code></pre>
       </figure>
 
       <h2 id="run">Running a PoC</h2>
-      <p>Run one file or a directory of them. The exit code is <code>0</code> when every PoC's success condition holds, so a PoC can sit in CI as a regression test for a fix. By agent, the same call returns the result as structured data.</p>
+      <p><code>poc.run</code> loads the file, runs the steps in order with no agent in the loop, judges <code>success</code> and writes its artifacts. <code>http</code> steps go through the proxy's guarded client, so the target must be in scope (<code>scope.entries</code> in <code>config.yaml</code>); <code>browser</code> steps also need the embedded browser. <code>--target</code> fills the variable <code>target</code>, and <code>--vars</code> takes a JSON object of any others; both beat a <code>default</code>. The path must end in <code>.yaml</code> or <code>.yml</code>, and when <code>poc.dir</code> is set, <code>poc.run</code>, <code>poc.get</code> and <code>poc.list</code> are confined to that directory.</p>
       <div class="pair">
-        <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm poc run pocs/reflected-xss-search-q.yaml --var target=https://staging.example.com</code></div>
-        <div class="pair-row"><span class="pair-who">agent</span><code>poc.run({ path: <span class="s">"pocs/reflected-xss-search-q.yaml"</span>, vars: { target: <span class="s">"https://staging.example.com"</span> } })</code></div>
+        <div class="pair-row"><span class="pair-who">cli</span><code><span class="pr">$ </span>aitm poc run --poc_path pocs/status-check.yaml --target https://staging.example.com --vars '{"param":"q"}'</code></div>
+        <div class="pair-row"><span class="pair-who">agent</span><code>poc.run({ poc_path: <span class="s">"pocs/reflected-xss-search-q.yaml"</span>, target: <span class="s">"https://staging.example.com"</span>, vars: { param: <span class="s">"q"</span> } })</code></div>
       </div>
+      <p>The one-shot CLI has no browser attached, so it runs only PoCs without <code>browser</code> steps or <code>browser-eval</code> matchers. That is why the first line names a different file: the example above needs the browser, so run it by agent or from a UI's Findings panel (<em>Run again</em>). Either way the result has the same shape, and the CLI prints it as JSON:</p>
       <figure class="code term">
         <figcaption><span>zsh — aitm</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="pr">$ </span><span class="in">aitm poc run pocs/reflected-xss-search-q.yaml --var target=https://staging.example.com</span>
-<span class="out">reflected-xss-search-q   marker k7x2m9</span>
-<span class="out">  step 1  http     GET /search?q=…        200  word:body  ok   (flow #51)</span>
-<span class="out">  step 2  browser  screenshot confirmed   ok   (flows #52–#67)</span>
-<span class="out">  success browser-eval window.__marker == "k7x2m9"   ok</span>
-<span class="out">confirmed · high · finding #3 · pocs/out/reflected-xss-search-q/confirmed.png</span></code></pre>
+<pre><code><span class="pr">$ </span><span class="in">aitm poc run --poc_path pocs/status-check.yaml --target https://staging.example.com</span>
+<span class="out">{</span>
+<span class="out">  "evaluated": [</span>
+<span class="out">    {</span>
+<span class="out">      "assertion": "status == 200",</span>
+<span class="out">      "matched": true</span>
+<span class="out">    }</span>
+<span class="out">  ],</span>
+<span class="out">  "finding_capture": "&lt;flow-id&gt;",</span>
+<span class="out">  "passed": true,</span>
+<span class="out">  "poc_path": "…/aitm-poc-status-check-…/status-check.poc.yaml",</span>
+<span class="out">  "recorded_id": "status-check-…",</span>
+<span class="out">  "screenshot_path": ""</span>
+<span class="out">}</span></code></pre>
+      </figure>
+      <p><code>passed</code> is the verdict, and <code>evaluated</code> lists each leaf of <code>success</code> with whether it matched. A PoC that runs and fails still returns normally, so the CLI exits <code>0</code> whether <code>passed</code> is true or false, and exits <code>1</code> only when the command itself errors: a bad file, an out-of-scope host, a missing browser. To use a PoC as a regression test in CI, test the field, for example <code>aitm poc run … | jq -e .passed</code>.</p>
+
+      <h3 id="artifacts">The three artifacts</h3>
+      <ul>
+        <li><strong>Finding capture</strong> (<code>finding_capture</code>): the flow of the last <code>http</code> step, as an id in the flow store. With no <code>http</code> step the newest flow captured during the run stands in, and a run that captured nothing fails. The one-shot CLI's store ends with the command, so the id matters most in a long-lived core.</li>
+        <li><strong>The PoC file</strong> (<code>poc_path</code>): a YAML copy, <code>&lt;id&gt;.poc.yaml</code>, in a fresh owner-only directory <code>aitm-poc-&lt;id&gt;-…</code> under <code>poc.out_dir</code>, or the system temp directory when that is unset.</li>
+        <li><strong>The screenshot</strong> (<code>screenshot_path</code>): <code>screenshot.png</code> in the same directory when the PoC took one, and an empty string when it did not. <code>poc.artifact</code> reads either file back, confined to <code>poc.out_dir</code>.</li>
+      </ul>
+
+      <h3 id="findings">Where findings go</h3>
+      <p>A passing run also records a finding when <code>findings.dir</code> is set: <code>&lt;findings.dir&gt;/&lt;id&gt;.yaml</code> plus a line in <code>runs.jsonl</code>, and its id comes back as <code>recorded_id</code>. The title is <code>info.name</code>, the class is <code>info.cwe</code> (else the first tag, else the PoC <code>id</code>), the severity is <code>info.severity</code> and the target is the <code>target</code> variable; the record points at the PoC file, the screenshot and the capture. With no <code>findings.dir</code>, nothing is persisted. <code>findings.record</code> writes the same kind of record by hand, for something you confirmed manually, and <code>findings.list</code> and <code>findings.get</code> read them back.</p>
+      <figure class="code" data-reveal>
+        <figcaption><span>config.yaml</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="yk">poc:</span>
+  <span class="yk">dir:</span> <span class="yv">/path/to/pocs</span>
+  <span class="yk">out_dir:</span> <span class="yv">/path/to/pocs/out</span>
+  <span class="yk">allow_agent_run:</span> <span class="yv">false</span>      <span class="c"># the default</span>
+<span class="yk">findings:</span>
+  <span class="yk">dir:</span> <span class="yv">/path/to/findings</span></code></pre>
       </figure>
       <div class="callout">
-        <p>Like every command, a PoC run is recorded in the audit log with its operator, its variables and the flows it produced. A reproduction nobody can trace is not a reproduction.</p>
+        <p><strong>By agent:</strong> over MCP, <code>poc.run</code> is refused unless <code>poc.allow_agent_run</code> is <code>true</code>. Operator sessions and the one-shot CLI are never gated: the terminal UI and the macOS app's own core are operator sessions, and the web UI becomes one when <code>mcp.operator_token</code> is set. <code>poc.run</code> is also a write command, so the agent policy applies: it runs under <code>auto</code>, <code>all</code> and <code>ask</code> and is refused under <code>readonly</code> and <code>paused</code>. Scope, rate limits and the SSRF check apply in every case. Calls an assistant makes are recorded in the audit ring with their origin, and <code>agent.activity</code> reads it.</p>
       </div>
     </div>
 
@@ -194,7 +256,7 @@
   <div class="wrap">
     <div>
       <a class="wordmark" href="index.html">aitmproxy<i aria-hidden="true"></i></a>
-      <p class="fine">A fast, memory-safe intercepting proxy for inspecting and editing HTTP, WebSocket, HTTP/2 and raw L4 traffic during development and authorized testing. Use it on systems you own or are permitted to test.</p>
+      <p class="fine">A fast, memory-safe intercepting proxy for inspecting and editing HTTP, WebSocket and HTTP/2 traffic, and raw L4 on a privileged Linux core, during development and authorized testing. Use it on systems you own or are permitted to test.</p>
     </div>
     <div>
       <h4>Product</h4>

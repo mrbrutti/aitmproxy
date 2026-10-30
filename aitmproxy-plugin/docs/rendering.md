@@ -23,7 +23,7 @@ falling back to `prefers-color-scheme`).
 | **findings** | `findings.list` | recorded findings — one row each (severity, title, class, target) |
 | **finding-detail** | `findings.get` | one finding in full, with its evidence and linked flow |
 | **scope** | `scope.list` | in-scope hosts and TLS passthrough entries |
-| **poc-result** | `poc.run` | a PoC run outcome and its reproduction |
+| **poc-result** | `poc.run`, `poc.get` | a PoC run outcome and its reproduction |
 | **proxy-status** | `proxy.status` | listening address, intercept/pause/capture state, flow count |
 
 Each widget maps the tool's `structuredContent` directly to its view and never
