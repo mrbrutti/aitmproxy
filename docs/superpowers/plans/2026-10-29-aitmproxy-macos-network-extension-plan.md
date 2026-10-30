@@ -505,6 +505,16 @@ Kept by the main session during stage 6. One row per finding.
 | 14 | quality | Minor | "no sysex embedded" hint named `SIGN_IDENTITY`, but the code reads `NE_SIGN_IDENTITY` | fixed — hint corrected to `NE_SIGN_IDENTITY` |
 | 10 | quality | Minor | Deprecated `NENetworkRule(remoteNetwork:…)` init (macOS 15) emits a build warning; Task 10 says "not deprecated NWHostEndpoint" | fixed — switched to the non-deprecated `remoteNetworkEndpoint:` init; `swiftc` compiles clean (no warning) |
 | 10 | spec | Minor | `swiftc` build replaces the plan's `apps/mac/Extension/Aitmproxy.xcodeproj` (spec D6) | **accepted by Matt 2026-10-30** (via orchestrator) — repo is SwiftPM-only ("no Xcode project", apps/mac/CLAUDE.md) and the Task-1 spike proved swiftc + manual codesign handles the `-systemextension` entitlement on Xcode 27.1; spec D6 to be amended to swiftc |
+| 11 | spec, security, quality | n/a | **PASS panel 2026-10-30** — no Critical/Important; security signed off the code + model (NE-AC6/AC7). | — |
+| 11 | quality | Minor | `decodeCore` was stricter than its forward-compat doc (non-object payload tore the channel down) | fixed — accepts any single-key object as ignored |
+| 11 | quality | Minor | Unowned `TODO(tighten)` on the team-wide requirement | fixed — TODO now references the plan Review log / Task 11 hardening |
+| 11 | quality | Minor | ~680-line DEBUG self-check co-located in `FlowHandoff.swift` | noted in-code as deliberate (no separate test target; `#if DEBUG` excludes it from release); splitting tracked as cleanup |
+| 11 | security | Minor | Code requirement is team-wide (`OU=995PCLM9KH`), not aitm's full designated requirement | **accepted (hardening TODO)** — plan Task 11 specifies the team requirement; narrow to aitm's identifier before GA (TODO in code) |
+| 11 | security | Minor | Inherent `LOCAL_PEERTOKEN` TOCTOU (verified core passing its fd on) — outside threat model; pidversion defeats pid-reuse | **accepted** — confirm at Task 18 the real core passes no accepted fds to unverified children |
+| 11 | security | Minor | `claim()` can block the NE queue up to ~4s under a wedged (verified) core before fail-open | **accepted (low priority)** — bounded + self-gated; optional move off-queue / lower timeout as hardening |
+| 11 | security | Minor | No cap on concurrent claimed flows (threads/memory per flow in the root sysex) | **accepted (hardening TODO)** — add a soft cap (fail open past it) as a follow-up |
+| 11 | security | Minor (info) | `FD_CLOEXEC` set result ignored (no exec in the sysex today) | accepted — informational |
+| 11 | spec, security, quality | Minor | Live decoy/real-core round-trip + core-side rendezvous writer + scope-spec emitter not exercised here | **deferred by design** — live decoy run → Task 18; rendezvous writer + scope emitter are core-side follow-ups (flagged in code + PR #100) |
 
 ## Shipped
 

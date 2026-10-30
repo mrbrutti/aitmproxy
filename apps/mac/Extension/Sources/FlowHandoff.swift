@@ -94,10 +94,11 @@ enum PeerAuth {
     /// Code requirement the core must satisfy. This is deliberately the team-level
     /// requirement the plan specifies: it accepts ANY binary signed by an Apple-
     /// anchored certificate whose leaf subject OU is our team.
-    /// TODO(tighten): once aitm's final signing identifier is fixed, narrow this to
-    /// its full designated requirement, e.g. append
-    /// `and identifier "<aitm signing identifier>"`, so another binary from the same
-    /// team (a helper, an old build) cannot impersonate the core.
+    /// TODO(macos-ne milestone hardening — tracked in the plan's Review log, Task 11):
+    /// once aitm's final signing identifier is fixed, narrow this to its full
+    /// designated requirement, e.g. append `and identifier "<aitm signing identifier>"`,
+    /// so another binary from the same team (a helper, an old build) cannot impersonate
+    /// the core. The team-level requirement is what plan Task 11 specifies for now.
     static let coreRequirement =
         "anchor apple generic and certificate leaf[subject.OU] = \"\(coreTeamID)\""
 
@@ -210,9 +211,11 @@ enum HandoffMessages {
 
     /// Decode a core->provider control body.
     static func decodeCore(_ body: Data) throws -> CoreMessage {
+        // Any single-key externally-tagged object is well-formed; a variant we don't
+        // act on (whatever its payload shape) is ignored for forward compatibility —
+        // only a malformed non-single-key object tears the channel down.
         guard let object = try? JSONSerialization.jsonObject(with: body),
-              let dict = object as? [String: Any], dict.count == 1,
-              let (_, payload) = dict.first, payload is [String: Any] else {
+              let dict = object as? [String: Any], dict.count == 1 else {
             throw HandoffError.malformed("control frame is not a single externally-tagged object")
         }
         if let scope = dict["Scope"] as? [String: Any] {
@@ -1320,6 +1323,11 @@ final class FlowHandoff: @unchecked Sendable {
 // one-line `main.swift` calling `HandoffSelfCheck.run()` with `-D DEBUG`. It drives
 // the real code over real socketpairs with a fake core and fake NE flows, and
 // asserts LITERAL expected wire bytes. It needs no root, no entitlement, no NE.
+//
+// Co-located deliberately: the Extension has no separate test target (it is built by
+// `apps/mac/build.sh` via `swiftc Sources/*.swift`, with no `-D DEBUG`, so this whole
+// block is excluded from the release binary). Splitting it into its own `#if DEBUG`
+// file is a tracked readability cleanup (plan Review log, Task 11 Minor).
 #if DEBUG
 enum HandoffSelfCheck {
     private final class Box<T>: @unchecked Sendable {
