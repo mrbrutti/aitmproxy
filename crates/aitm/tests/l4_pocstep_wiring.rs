@@ -19,6 +19,7 @@ use aitm_core::{CommandHost, Config, Frontend, HttpFlow, HttpRequest, Params, Pr
 use aitm_plugin::language::ProtocolLanguage;
 use aitm_poc::step_registry::PocStepRegistry;
 use aitm_poc::{ScriptStepCtx, ScriptStepError, ScriptStepExecutor, ScriptVerdict};
+use aitm_proto_l4::backend::pcap::PcapBackend;
 use aitm_proto_l4::backend::{CaptureInjectBackend, CaptureSource, L4Error};
 use aitm_proto_l4::config::L4Config;
 use aitm_proto_l4::flow::{InMemoryL4FlowStore, L4FlowStore};
@@ -164,7 +165,10 @@ fn unique_dir(tag: &str) -> PathBuf {
 
 /// Assemble a proxy the way `main` does for the l4 PoC path: ONE guard + store feed
 /// `Features::l4_shared` (hence the `L4Module`) and the `l4:` step registry.
-fn assemble_l4_poc_run(allow_agent_inject: bool, backend: Arc<MockBackend>) -> Assembled {
+fn assemble_l4_poc_run(
+    allow_agent_inject: bool,
+    backend: Arc<dyn CaptureInjectBackend>,
+) -> Assembled {
     let guard = loopback_guard(allow_agent_inject);
     let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
     let registry = {
@@ -207,7 +211,17 @@ async fn run_poc(
     frontend: Option<Frontend>,
 ) -> (anyhow::Result<Value>, Arc<MockBackend>) {
     let backend = MockBackend::new();
-    let assembled = assemble_l4_poc_run(allow_agent_inject, backend.clone());
+    let result = run_poc_with(allow_agent_inject, frontend, backend.clone()).await;
+    (result, backend)
+}
+
+/// Run `poc.run` on the l4 fixture over an arbitrary backend (mock or real pcap).
+async fn run_poc_with(
+    allow_agent_inject: bool,
+    frontend: Option<Frontend>,
+    backend: Arc<dyn CaptureInjectBackend>,
+) -> anyhow::Result<Value> {
+    let assembled = assemble_l4_poc_run(allow_agent_inject, backend);
     let proxy = assembled.proxy;
     let store = proxy.store();
     let guard = proxy.guard();
@@ -219,7 +233,7 @@ async fn run_poc(
     let path = dir.join("l4-send-recv.poc.yaml");
     std::fs::write(&path, L4_POC).expect("write poc");
 
-    let result = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let mut host = CommandHost::new(store.as_ref(), client.as_ref(), guard.as_ref(), None);
         if let Some(f) = frontend {
             host = host.with_frontend(f);
@@ -238,8 +252,7 @@ async fn run_poc(
             .invoke(args, &host)
     })
     .await
-    .expect("poc.run task");
-    (result, backend)
+    .expect("poc.run task")
 }
 
 fn err_text(result: anyhow::Result<Value>) -> String {
@@ -298,4 +311,45 @@ async fn unseeded_host_is_fail_closed() {
         "an unseeded host is refused by the disabled inject gate, got: {msg}"
     );
     assert!(backend.injected().is_empty());
+}
+
+/// AC9: the real-wire proof. Privilege-gated like `aitm-proto-l4`'s
+/// `active_roundtrip.rs`: skipped on macOS or without `AITM_L4_TESTS=1`, and it
+/// skips (not fails) when the host lacks raw L4 privilege / libpcap.
+///
+/// The PoC is `l4:`-only (no `http:` step), so a run whose `l4:` step reached the
+/// real wire still ends in the finding-anchor's "no HTTP flow" error. That error is
+/// the success signal here: it proves the stimulus went through the assembled
+/// `poc.run` past the registration, scope and agent gates onto a real libpcap
+/// backend. A gate or registration failure would instead read "no handler
+/// registered", "disabled" or "out of L4 scope".
+#[test]
+#[ignore = "needs raw L4 privilege + Linux loopback; run with AITM_L4_TESTS=1 via the Terminal panel"]
+fn operator_l4_step_injects_on_real_loopback() {
+    if !(!cfg!(target_os = "macos") && std::env::var("AITM_L4_TESTS").ok().as_deref() == Some("1"))
+    {
+        return;
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let backend: Arc<dyn CaptureInjectBackend> = Arc::new(PcapBackend::new());
+    let result = rt.block_on(run_poc_with(false, Some(Frontend::Operator), backend));
+    let msg = err_text(result);
+    if msg.to_ascii_lowercase().contains("unavailable") {
+        // No raw privilege / libpcap on this host: fail-closed, skip.
+        return;
+    }
+    for broken in ["no handler registered", "disabled", "out of L4 scope"] {
+        assert!(
+            !msg.contains(broken),
+            "gate/registration must not refuse an operator loopback run ({broken}), got: {msg}"
+        );
+    }
+    assert!(
+        msg.contains("no HTTP flow"),
+        "the l4 step must reach the wire, then hit the finding-anchor, got: {msg}"
+    );
 }
