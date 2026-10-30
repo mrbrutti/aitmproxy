@@ -43,8 +43,10 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
+use super::rendezvous;
+
 /// Filenames of the two sockets inside the capture directory.
-const CONTROL_SOCK: &str = "control.sock";
+pub(crate) const CONTROL_SOCK: &str = "control.sock";
 const DATA_SOCK: &str = "data.sock";
 
 /// Upper bound on a control-frame body we will allocate for from a peer-declared
@@ -171,6 +173,19 @@ impl CaptureListener {
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Publish this listener's socket dir to the well-known rendezvous path so
+    /// the Swift provider can discover it. Returns an RAII guard that removes the
+    /// rendezvous file on drop. Call after [`bind`](Self::bind) has locked the
+    /// dir to 0700.
+    ///
+    /// # Errors
+    /// Fails if the socket dir cannot be canonicalized, its path is too long to
+    /// fit a socket name within `sun_path`, or the rendezvous file cannot be
+    /// created (see [`rendezvous::RendezvousFile::publish`]).
+    pub fn publish_rendezvous(&self) -> io::Result<rendezvous::RendezvousFile> {
+        rendezvous::RendezvousFile::publish(self.dir(), rendezvous::RENDEZVOUS_PATH)
     }
 
     /// Path of the control socket.
