@@ -37,7 +37,9 @@ const MAX_DOM_BYTES: usize = 2 * 1024 * 1024;
 /// What a crawl reached and why it stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrawlOutcome {
-    /// Normalized in-scope URLs reached, in crawl order, deduplicated.
+    /// Normalized in-scope URLs reached, in crawl order, deduplicated. A
+    /// request that redirected within scope is recorded as well as the page it
+    /// landed on (requested first).
     pub endpoints: Vec<String>,
     /// Pages successfully navigated. Failed navigations are **not** counted
     /// here, but they do count against `max_pages` (see [`crawl`]).
@@ -153,9 +155,11 @@ pub async fn crawl(
 
         // A redirect or meta-refresh may have taken the browser somewhere else.
         // A landing page that is off-origin or out of scope ends the crawl on
-        // the spot (`left_scope`): it is neither recorded nor harvested, and no
-        // further page is navigated. Silently continuing would let a target
-        // walk the browser around other hosts one redirect at a time.
+        // the spot (`left_scope`): neither it nor the requested URL is recorded,
+        // nothing is harvested, and no further page is navigated. Silently
+        // continuing would let a target walk the browser around other hosts
+        // one redirect at a time. A same-origin, in-scope landing records both
+        // the requested URL and the landing page (below).
         let Some(page) = parse_target(&nav.final_url)
             .filter(|u| u.origin() == origin && host.guard().in_scope(&guard_authority(u)))
         else {
@@ -163,10 +167,16 @@ pub async fn crawl(
             stopped = Some("left_scope");
             break;
         };
+        // The requested URL passed the enqueue filter and this page's gate, so
+        // a request that redirected within scope is a reachable endpoint in its
+        // own right (its parameters are the redirector's attack surface), not
+        // only the page it landed on. Record it first.
         let page_key = page.as_str().to_string();
         visited.insert(page_key.clone());
-        if seen_endpoints.insert(page_key.clone()) {
-            endpoints.push(page_key);
+        for key in [url.as_str().to_string(), page_key] {
+            if seen_endpoints.insert(key.clone()) {
+                endpoints.push(key);
+            }
         }
 
         let Some(remaining) = remaining_budget(cfg.time_budget, started) else {
@@ -876,6 +886,81 @@ mod tests {
             !out.endpoints.iter().any(|u| u.contains("evil.example")),
             "off-scope URL leaked into endpoints: {:?}",
             out.endpoints
+        );
+    }
+
+    /// A same-origin, in-scope redirect is a reachable endpoint in its own
+    /// right: the requested URL is recorded as well as the page it landed on,
+    /// and the crawl carries on past it.
+    #[tokio::test]
+    async fn crawl_records_a_same_origin_redirect_request_as_an_endpoint() {
+        let browser = StubBrowser::new("<p>leaf</p>")
+            .page(TARGET, r#"<a href="/go">go</a> <a href="/other">other</a>"#)
+            .redirect("http://target.test/go", "http://target.test/landing");
+        let store = MemFlowStore::new();
+        let guard = scoped_guard("target.test");
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, Some(&browser));
+
+        let out = crawl(&host, TARGET, &ScannerConfig::default())
+            .await
+            .expect("crawl succeeds");
+
+        assert_eq!(
+            out.endpoints,
+            vec![
+                "http://target.test/".to_string(),
+                "http://target.test/go".to_string(),
+                "http://target.test/landing".to_string(),
+                "http://target.test/other".to_string(),
+            ],
+            "the redirecting request and its landing page are both recorded, requested first"
+        );
+        assert_eq!(out.pages_crawled, 3);
+        assert_eq!(out.stopped_reason, None);
+        assert_eq!(
+            browser.navigated(),
+            vec![
+                "http://target.test/".to_string(),
+                "http://target.test/go".to_string(),
+                "http://target.test/other".to_string(),
+            ],
+            "the crawl continued past the in-scope redirect"
+        );
+    }
+
+    /// A redirect that lands on a page already recorded (here the seed) adds
+    /// only the requested URL; the landing page is not duplicated.
+    #[tokio::test]
+    async fn crawl_dedups_a_redirect_that_lands_on_an_already_recorded_page() {
+        let browser = StubBrowser::new("<p>leaf</p>")
+            .page(TARGET, r#"<a href="/go">go</a>"#)
+            .redirect("http://target.test/go", TARGET);
+        let store = MemFlowStore::new();
+        let guard = scoped_guard("target.test");
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, Some(&browser));
+
+        let out = crawl(&host, TARGET, &ScannerConfig::default())
+            .await
+            .expect("crawl succeeds");
+
+        assert_eq!(
+            out.endpoints,
+            vec![
+                "http://target.test/".to_string(),
+                "http://target.test/go".to_string(),
+            ],
+            "the seed is recorded once even though `/go` lands on it"
+        );
+        assert_eq!(out.pages_crawled, 2);
+        assert_eq!(out.stopped_reason, None);
+        assert_eq!(
+            browser.navigated(),
+            vec![
+                "http://target.test/".to_string(),
+                "http://target.test/go".to_string(),
+            ]
         );
     }
 
