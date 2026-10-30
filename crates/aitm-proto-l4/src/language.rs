@@ -62,8 +62,8 @@ use std::time::{Duration, SystemTime};
 
 use aitm_core::Value;
 use aitm_plugin::language::{
-    GuardHandle, Guarded, HostError, HostFn, HostFnSig, NamespaceCatalog, ParamSig, PocStepHandler,
-    PocStepInputs, PocStepOutcome, PocStepSchema, ProtocolLanguage, RegisterError,
+    GuardHandle, Guarded, HostCallCtx, HostError, HostFn, HostFnSig, NamespaceCatalog, ParamSig,
+    PocStepHandler, PocStepInputs, PocStepOutcome, PocStepSchema, ProtocolLanguage, RegisterError,
     ScriptHostRegistry,
 };
 
@@ -204,7 +204,12 @@ impl ProtocolLanguage for L4Language {
         for (verb, gate) in VERBS {
             let live = self.live.clone();
             let verb_name = (*verb).to_string();
-            let f: HostFn = Box::new(move |args: &[Value]| host_fn(&live, &verb_name, args));
+            // TODO(Task 4): read `ctx.caller()` for the live agent gate instead
+            // of the build-time `agent_sourced` bool. Task 1 only threads the
+            // signature; the gate decision is unchanged.
+            let f: HostFn = Box::new(move |_ctx: &HostCallCtx, args: &[Value]| {
+                host_fn(&live, &verb_name, args)
+            });
             let guard = L4SeamGuard {
                 agent_sourced: self.agent_sourced,
                 gates: self.live.guard.agent_gates(),
@@ -249,7 +254,10 @@ impl GuardHandle for L4SeamGuard {
         NAMESPACE
     }
 
-    fn permit(&self, fn_name: &str) -> Result<(), HostError> {
+    fn permit(&self, _ctx: &HostCallCtx, fn_name: &str) -> Result<(), HostError> {
+        // TODO(Task 4): gate on `_ctx.caller()` (the live per-call trust) and drop
+        // the build-time `agent_sourced` bool. Task 1 only threads the signature;
+        // the decision is unchanged.
         agent_gate_check(self.agent_sourced, &self.gates, fn_name, self.gate)
     }
 }
@@ -514,7 +522,7 @@ fn do_inject(
             filter: None,
             queue: None,
         },
-        packets: Vec::new(),
+        packets: std::collections::VecDeque::new(),
         metadata: L4Meta::default(),
     });
     // `count` already defaults to 1 for an *absent* arg (the Rhai/PoC callers use

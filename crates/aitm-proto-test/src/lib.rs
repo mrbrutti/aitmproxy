@@ -14,8 +14,8 @@
 use std::collections::BTreeMap;
 
 use aitm_plugin::language::{
-    GuardHandle, Guarded, HostError, HostFn, HostFnSig, NamespaceCatalog, PocStepHandler,
-    PocStepInputs, PocStepOutcome, PocStepSchema, ProtocolLanguage, RegisterError,
+    GuardHandle, Guarded, HostCallCtx, HostError, HostFn, HostFnSig, NamespaceCatalog,
+    PocStepHandler, PocStepInputs, PocStepOutcome, PocStepSchema, ProtocolLanguage, RegisterError,
     ScriptHostRegistry,
 };
 use aitm_plugin::Value;
@@ -99,7 +99,7 @@ impl GuardHandle for StubGuard {
         NAMESPACE
     }
 
-    fn permit(&self, fn_name: &str) -> Result<(), HostError> {
+    fn permit(&self, _ctx: &HostCallCtx, fn_name: &str) -> Result<(), HostError> {
         if self.allow {
             Ok(())
         } else {
@@ -123,7 +123,8 @@ impl ProtocolLanguage for TestLanguage {
     fn register_host_fns(&self, reg: &mut dyn ScriptHostRegistry) -> Result<(), RegisterError> {
         // `test.ping()` — a liveness probe. Its guard always admits: there is
         // no effect to gate, but the seam still requires a `Guarded` wrapper.
-        let ping: HostFn = Box::new(|_args: &[Value]| Ok(Value::Str(PING_REPLY.to_string())));
+        let ping: HostFn =
+            Box::new(|_ctx: &HostCallCtx, _args: &[Value]| Ok(Value::Str(PING_REPLY.to_string())));
         reg.register(
             NAMESPACE,
             "ping",
@@ -133,7 +134,9 @@ impl ProtocolLanguage for TestLanguage {
         // `test.effect()` — a stand-in for a guard-checked effect. The guard
         // admits or refuses per `effect_allowed`; on a refusal the engine never
         // calls this fn.
-        let effect: HostFn = Box::new(|_args: &[Value]| Ok(Value::Str(EFFECT_REPLY.to_string())));
+        let effect: HostFn = Box::new(|_ctx: &HostCallCtx, _args: &[Value]| {
+            Ok(Value::Str(EFFECT_REPLY.to_string()))
+        });
         reg.register(
             NAMESPACE,
             "effect",

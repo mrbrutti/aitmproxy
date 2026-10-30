@@ -25,9 +25,9 @@ use std::sync::Arc;
 
 use aitm_core::{HttpFlow, HttpRequest, MemFlowStore, ProxyClient, StdGuard, Value};
 use aitm_plugin::language::{
-    GuardHandle, Guarded, HostError, HostFn, HostFnSig, NamespaceCatalog, NamespaceEntry,
-    PocStepHandler, PocStepInputs, PocStepOutcome, PocStepSchema, ProtocolLanguage, RegisterError,
-    ScriptHostRegistry,
+    GuardHandle, Guarded, HostCallCtx, HostError, HostFn, HostFnSig, NamespaceCatalog,
+    NamespaceEntry, PocStepHandler, PocStepInputs, PocStepOutcome, PocStepSchema, ProtocolLanguage,
+    RegisterError, ScriptHostRegistry,
 };
 use aitm_plugin_rhai::config::RhaiConfig;
 use aitm_plugin_rhai::host_core::{MemoryFindingSink, ScriptServices};
@@ -293,7 +293,7 @@ impl GuardHandle for AllowGuard {
         "fake"
     }
 
-    fn permit(&self, _fn_name: &str) -> Result<(), HostError> {
+    fn permit(&self, _ctx: &HostCallCtx, _fn_name: &str) -> Result<(), HostError> {
         Ok(())
     }
 }
@@ -355,7 +355,7 @@ impl ProtocolLanguage for FakeLang {
 
     fn register_host_fns(&self, reg: &mut dyn ScriptHostRegistry) -> Result<(), RegisterError> {
         for name in &self.fns {
-            let f: HostFn = Box::new(|_args: &[Value]| Ok(Value::Null));
+            let f: HostFn = Box::new(|_ctx: &HostCallCtx, _args: &[Value]| Ok(Value::Null));
             reg.register(&self.ns, name, Guarded::new(Box::new(AllowGuard), f))?;
         }
         Ok(())

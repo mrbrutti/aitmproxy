@@ -7,11 +7,13 @@
 //! `aitm-plugin`'s own test proves the trait is implementable without a
 //! dev-dependency cycle (`aitm-proto-test` depends on `aitm-plugin`).
 
+use std::sync::{Arc, Mutex};
+
 use aitm_plugin::language::{
-    GuardHandle, Guarded, HostFn, NamespaceCatalog, ProtocolLanguage, RegisterError,
-    ScriptHostRegistry,
+    GuardHandle, Guarded, HostCallContextSource, HostCallCtx, HostError, HostFn, NamespaceCatalog,
+    ProtocolLanguage, RegisterError, ScriptHostRegistry,
 };
-use aitm_plugin::Value;
+use aitm_plugin::{CallerTrust, Value};
 
 /// A guard handle that admits everything — the inline test needs *some* guard
 /// to build a `Guarded`, which is the point: there is no unguarded path.
@@ -36,7 +38,7 @@ impl ProtocolLanguage for Inline {
     }
 
     fn register_host_fns(&self, reg: &mut dyn ScriptHostRegistry) -> Result<(), RegisterError> {
-        let ping: HostFn = Box::new(|_args: &[Value]| Ok(Value::Null));
+        let ping: HostFn = Box::new(|_ctx: &HostCallCtx, _args: &[Value]| Ok(Value::Null));
         reg.register("test", "ping", Guarded::new(Box::new(AllowGuard), ping))
     }
 
@@ -113,4 +115,93 @@ fn test_language_registers_its_host_fns() {
 fn test_language_has_no_poc_step_yet() {
     let lang = Inline;
     assert!(lang.poc_step().is_none());
+}
+
+/// A stub per-call source: carries a fixed tag/source so the ctx accessors can
+/// be exercised without a rhai `NativeCallContext` (that concrete source lands
+/// in Task 2).
+struct StubSource;
+
+impl HostCallContextSource for StubSource {
+    fn tag(&self) -> Option<Value> {
+        None
+    }
+
+    fn call_source(&self) -> &str {
+        "test-source"
+    }
+}
+
+/// A guard that records the caller trust `permit` was invoked with, proving the
+/// per-invocation ctx reaches the guard and it can read `ctx.caller()`.
+struct CallerRecordingGuard {
+    seen: Arc<Mutex<Option<CallerTrust>>>,
+}
+
+impl GuardHandle for CallerRecordingGuard {
+    fn guard_name(&self) -> &str {
+        "rec"
+    }
+
+    fn permit(&self, ctx: &HostCallCtx, _fn_name: &str) -> Result<(), HostError> {
+        *self.seen.lock().expect("lock") = Some(ctx.caller());
+        Ok(())
+    }
+}
+
+/// The host fn and the guard both observe the per-invocation `HostCallCtx`: the
+/// fn reads `ctx.caller()` to shape its result, and the guard's `permit` sees the
+/// same caller through the ctx. This fails if `HostFn`/`permit` are not threaded
+/// with a `HostCallCtx`.
+#[test]
+fn host_fn_and_guard_observe_caller_trust() {
+    // A host fn whose output reflects the caller trust it was handed.
+    let f: HostFn = Box::new(|ctx: &HostCallCtx, _args: &[Value]| {
+        Ok(Value::Str(match ctx.caller() {
+            CallerTrust::Agent => "agent".to_string(),
+            CallerTrust::Operator => "operator".to_string(),
+        }))
+    });
+    let seen = Arc::new(Mutex::new(None));
+    let guard = CallerRecordingGuard { seen: seen.clone() };
+
+    // `register` accepts only a `Guarded<HostFn>` — the guarded-by-construction
+    // property. Simulate the engine's dispatch: permit, then call, both with the
+    // ctx.
+    let guarded = Guarded::new(Box::new(guard), f);
+    let (g, func) = guarded.into_parts();
+
+    let source = StubSource;
+    let ctx = HostCallCtx::new(CallerTrust::Operator, &source);
+    g.permit(&ctx, "ping").expect("recording guard admits");
+    let out = func(&ctx, &[]).expect("host fn runs");
+
+    assert_eq!(out, Value::Str("operator".to_string()));
+    assert_eq!(*seen.lock().expect("lock"), Some(CallerTrust::Operator));
+    assert_eq!(ctx.call_source(), "test-source");
+    assert_eq!(ctx.tag(), None);
+}
+
+/// `CallerTrust::from(Frontend)` maps an agent iff `Frontend::Mcp`; the human
+/// CLI and an operator-token connection are both `Operator`.
+#[test]
+fn caller_trust_from_frontend_agent_iff_mcp() {
+    use aitm_plugin::Frontend;
+    assert_eq!(CallerTrust::from(Frontend::Mcp), CallerTrust::Agent);
+    assert_eq!(CallerTrust::from(Frontend::Cli), CallerTrust::Operator);
+    assert_eq!(CallerTrust::from(Frontend::Operator), CallerTrust::Operator);
+}
+
+/// AC8: the seam stays rhai-free — `aitm-plugin`'s manifest declares no `rhai`
+/// dependency. Reads this crate's own `Cargo.toml`.
+#[test]
+fn aitm_plugin_has_no_rhai_dependency() {
+    let manifest =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).expect("read");
+    for line in manifest.lines() {
+        assert!(
+            !line.trim_start().starts_with("rhai"),
+            "aitm-plugin must not depend on rhai (AC8): found `{line}`"
+        );
+    }
 }

@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use aitm_core::{HttpFlow, HttpRequest, MemFlowStore, ProxyClient, StdGuard, Value};
 use aitm_plugin::language::{
-    GuardHandle, Guarded, HostError, HostFn, NamespaceCatalog, PocStepHandler, ProtocolLanguage,
-    RegisterError, ScriptHostRegistry,
+    GuardHandle, Guarded, HostCallCtx, HostError, HostFn, NamespaceCatalog, PocStepHandler,
+    ProtocolLanguage, RegisterError, ScriptHostRegistry,
 };
 use aitm_plugin_rhai::config::{RhaiConfig, RhaiLimits, ScriptEntry};
 use aitm_plugin_rhai::engine::build_engine_with_languages;
@@ -110,7 +110,7 @@ impl GuardHandle for AllowGuard {
         "other"
     }
 
-    fn permit(&self, _fn_name: &str) -> Result<(), HostError> {
+    fn permit(&self, _ctx: &HostCallCtx, _fn_name: &str) -> Result<(), HostError> {
         Ok(())
     }
 }
@@ -125,7 +125,7 @@ impl ProtocolLanguage for OtherLanguage {
     }
 
     fn register_host_fns(&self, reg: &mut dyn ScriptHostRegistry) -> Result<(), RegisterError> {
-        let ping: HostFn = Box::new(|_args: &[Value]| Ok(Value::Int(42)));
+        let ping: HostFn = Box::new(|_ctx: &HostCallCtx, _args: &[Value]| Ok(Value::Int(42)));
         reg.register("other", "ping", Guarded::new(Box::new(AllowGuard), ping))
     }
 

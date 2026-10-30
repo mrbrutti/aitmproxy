@@ -40,7 +40,7 @@
 
 use std::collections::BTreeMap;
 
-use aitm_core::Value;
+use aitm_core::{CallerTrust, Value};
 use serde::{Deserialize, Serialize};
 
 /// A protocol's contribution to both language faces (Rhai scripting + PoC) and
@@ -95,12 +95,68 @@ pub trait ScriptHostRegistry {
     fn register(&mut self, ns: &str, name: &str, f: Guarded<HostFn>) -> Result<(), RegisterError>;
 }
 
-/// A rhai-agnostic host function: it takes positional [`Value`] arguments and
-/// returns a [`Value`] (or a [`HostError`]). The rhai engine marshals the
-/// script's arguments into `Value`s and the returned `Value` back into a
-/// `Dynamic` (Task 2), so a protocol crate writes host fns with no `rhai`
-/// dependency.
-pub type HostFn = Box<dyn Fn(&[Value]) -> Result<Value, HostError> + Send + Sync>;
+/// The per-invocation surface a first-party host fn reads, independent of the
+/// scripting engine. The concrete implementation over rhai's `NativeCallContext`
+/// lands in `aitm-plugin-rhai` (plan Task 2); keeping the trait here keeps the
+/// seam **rhai-free** — a host fn reads the call's tag/source through this trait
+/// object, never a rhai type.
+///
+/// A [`HostCallCtx`] only *borrows* the source for the duration of one call, so
+/// the trait object itself needs no `Send`/`Sync` bound (it is never stored in
+/// the `Send + Sync` [`HostFn`]; it is passed by reference at call time).
+pub trait HostCallContextSource {
+    /// The per-eval tag seeded at the invocation boundary (e.g. the script's
+    /// options map), or `None` when the call carries no tag.
+    fn tag(&self) -> Option<Value>;
+
+    /// A short label for where the call originated (for `finding` provenance and
+    /// diagnostics).
+    fn call_source(&self) -> &str;
+}
+
+/// The per-invocation context threaded through every seam [`HostFn`] and
+/// [`GuardHandle::permit`]: the caller's trust ([`CallerTrust`]) plus the
+/// rhai-free [`HostCallContextSource`] carrying the call's tag/origin. It is
+/// constructed fresh at each invocation boundary (the rhai `dispatch` bridge in
+/// Task 2, the PoC runner in Task 3) and borrowed for the duration of one call,
+/// so a first-party host fn or a guard can gate on *who* is calling without the
+/// seam touching rhai.
+pub struct HostCallCtx<'a> {
+    caller: CallerTrust,
+    ctx: &'a dyn HostCallContextSource,
+}
+
+impl<'a> HostCallCtx<'a> {
+    /// Build a context for one call from the caller's trust and the per-eval
+    /// source.
+    pub fn new(caller: CallerTrust, ctx: &'a dyn HostCallContextSource) -> Self {
+        Self { caller, ctx }
+    }
+
+    /// The caller's trust: a present operator vs. an autonomous agent.
+    pub fn caller(&self) -> CallerTrust {
+        self.caller
+    }
+
+    /// The per-eval tag, delegated to the [`HostCallContextSource`].
+    pub fn tag(&self) -> Option<Value> {
+        self.ctx.tag()
+    }
+
+    /// The call's origin label, delegated to the [`HostCallContextSource`].
+    pub fn call_source(&self) -> &str {
+        self.ctx.call_source()
+    }
+}
+
+/// A rhai-agnostic host function: it takes the per-invocation [`HostCallCtx`]
+/// and positional [`Value`] arguments and returns a [`Value`] (or a
+/// [`HostError`]). The rhai engine marshals the script's arguments into `Value`s
+/// and the returned `Value` back into a `Dynamic` (Task 2) and builds the
+/// `HostCallCtx` from the per-eval context, so a protocol crate writes host fns
+/// with no `rhai` dependency. A host fn that does not need the context simply
+/// ignores it (`|_ctx, args| ...`).
+pub type HostFn = Box<dyn Fn(&HostCallCtx, &[Value]) -> Result<Value, HostError> + Send + Sync>;
 
 /// A guard-wrapped registration payload. A [`Guarded`] can only be built with a
 /// [`GuardHandle`] ([`Guarded::new`]), and [`ScriptHostRegistry::register`]
@@ -155,8 +211,12 @@ pub trait GuardHandle: Send + Sync {
     /// `allow_agent_*` / sensitivity gates (an agent-driven run may be denied a
     /// verb a human-driven one is allowed); it is not implemented here. The
     /// `fn_name` is the unqualified verb (`"craft"`, `"ping"`), so one guard can
-    /// make per-verb decisions.
-    fn permit(&self, fn_name: &str) -> Result<(), HostError> {
+    /// make per-verb decisions. The per-invocation [`HostCallCtx`] carries the
+    /// caller's trust ([`HostCallCtx::caller`]) so a guard can admit a verb for a
+    /// present operator that it refuses for an agent (Task 4's `L4SeamGuard`); the
+    /// deny-by-default provided impl ignores it and still refuses.
+    fn permit(&self, ctx: &HostCallCtx, fn_name: &str) -> Result<(), HostError> {
+        let _ = ctx;
         Err(HostError::GuardRefused {
             namespace: self.guard_name().to_string(),
             reason: format!("deny-by-default: `{fn_name}` is not permitted by this guard"),

@@ -22,10 +22,10 @@
 //!
 //! ```compile_fail
 //! use aitm_core::Value;
-//! use aitm_plugin::language::{HostFn, ScriptHostRegistry};
+//! use aitm_plugin::language::{HostCallCtx, HostFn, ScriptHostRegistry};
 //!
 //! fn demo(reg: &mut dyn ScriptHostRegistry) {
-//!     let f: HostFn = Box::new(|_args: &[Value]| Ok(Value::Null));
+//!     let f: HostFn = Box::new(|_ctx: &HostCallCtx, _args: &[Value]| Ok(Value::Null));
 //!     // `register` demands a `Guarded<HostFn>`; a bare host fn is rejected, so
 //!     // an effectful fn cannot forget its guard.
 //!     let _ = reg.register("test", "effect", f);
@@ -35,8 +35,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
+use aitm_core::{CallerTrust, Value};
 use aitm_plugin::language::{
-    GuardHandle, Guarded, HostError, HostFn, ProtocolLanguage, RegisterError, ScriptHostRegistry,
+    GuardHandle, Guarded, HostCallContextSource, HostCallCtx, HostError, HostFn, ProtocolLanguage,
+    RegisterError, ScriptHostRegistry,
 };
 use rhai::{Dynamic, Engine, EvalAltResult, Module, Position};
 
@@ -264,10 +266,36 @@ fn dispatch(ns: &ProtoNs, name: &str, args: &[Dynamic]) -> Result<Dynamic, Box<E
             ))
         })?;
 
+    // TODO(Task 2): build the `HostCallCtx` from the per-eval `NativeCallContext`
+    // (the script's tag + call origin) and the caller trust seeded at the
+    // invocation boundary (Task 3), failing closed when unseeded. Until the
+    // bridge lands, dispatch threads a placeholder source that carries no tag and
+    // the most restrictive (`Agent`) trust, so the permit-before-effect order and
+    // the threaded `HostFn`/`permit` signatures are exercised without widening
+    // trust.
+    let source = UnseededSource;
+    let hostctx = HostCallCtx::new(CallerTrust::Agent, &source);
+
     // Deny-by-default: the guard admits the call before any effect runs.
-    entry.guard.permit(name).map_err(host_error)?;
-    let out = (entry.f)(&values).map_err(host_error)?;
+    entry.guard.permit(&hostctx, name).map_err(host_error)?;
+    let out = (entry.f)(&hostctx, &values).map_err(host_error)?;
     Ok(value_to_dynamic(&out))
+}
+
+/// TODO(Task 2): a placeholder [`HostCallContextSource`] used until the rhai
+/// bridge builds a real `NativeCallContext`-backed source. It carries no tag and
+/// a static origin so Task 1 keeps the workspace compiling without implementing
+/// any seeding.
+struct UnseededSource;
+
+impl HostCallContextSource for UnseededSource {
+    fn tag(&self) -> Option<Value> {
+        None
+    }
+
+    fn call_source(&self) -> &str {
+        "rhai"
+    }
 }
 
 /// A catchable runtime error; the engine fills in the call position.
