@@ -90,11 +90,18 @@ impl Command for ScriptCommand {
         // for a human), never refused for a missing context and never widened to
         // operator (spec AC3). Held across the call under `block_in_place`.
         let caller = CallerTrust::from(host.frontend());
+        // Thread the per-eval tag (the script's options, as a rhai-free `Value`)
+        // and call source (the script name) through the seed, so the seam-migrated
+        // `option`/`finding` read them off `HostCallCtx` (the old
+        // `CallFnOptions::with_tag(Options)` custom-type tag could not cross the
+        // rhai-free seam). Fail-closed when unseeded is preserved by the seam.
+        let tag = self.options.to_value();
+        let source = self.ast.source().map(str::to_string);
         let result = blocking(|| {
             let _run = begin_run(RunKind::Command, self.budget.hook_timeout);
-            let _seed = seed_call_context(caller, None, None);
+            let _seed = seed_call_context(caller, Some(tag), source);
             self.engine.call_fn_with_options::<Dynamic>(
-                CallFnOptions::new().with_tag(self.options.clone()),
+                CallFnOptions::new(),
                 &mut Scope::new(),
                 &self.ast,
                 self.func.fn_name(),
@@ -125,15 +132,23 @@ pub struct ScriptRegHandle<'a> {
     reg: &'a mut Registry,
     options: Options,
     budget: Budget,
+    caller: CallerTrust,
 }
 
 impl<'a> ScriptRegHandle<'a> {
     /// A handle over `reg` with no options set yet and the default budget.
+    ///
+    /// The caller trust defaults to the **least-privileged** [`CallerTrust::Agent`]
+    /// (fail-closed, like `PocStepInputs::default`): a `load` evaluated through a
+    /// handle whose trust was never set can only ever *under*-grant a seam verb,
+    /// never silently widen an agent to operator. The production path sets the
+    /// script's authoring trust explicitly via [`with_caller`](Self::with_caller).
     pub fn new(reg: &'a mut Registry) -> Self {
         Self {
             reg,
             options: Options::default(),
             budget: Budget::default(),
+            caller: CallerTrust::Agent,
         }
     }
 
@@ -148,6 +163,14 @@ impl<'a> ScriptRegHandle<'a> {
     /// The budget `load` runs under, and every command it registers.
     pub fn with_budget(mut self, budget: Budget) -> Self {
         self.budget = budget;
+        self
+    }
+
+    /// The caller trust `load` evaluates under (the script's authoring trust),
+    /// which [`run_load`](Self::run_load) seeds so a seam host fn `load` reaches
+    /// (`option`, a guarded verb) is gated on the author — never left unseeded.
+    pub fn with_caller(mut self, caller: CallerTrust) -> Self {
+        self.caller = caller;
         self
     }
 
@@ -167,10 +190,20 @@ impl<'a> ScriptRegHandle<'a> {
         let script = ast.source().unwrap_or("script").to_string();
         let collector = RegCollector::default();
 
+        // Seed the per-eval caller trust (the script's authoring trust) plus the
+        // tag (the configured options, as a `Value`) and source (the script name)
+        // so a seam host fn `load` reaches — `option(...)` today — is seeded and
+        // gated, never fails closed for a missing context (spec AC3). This boundary
+        // seeds internally so a direct `run_load` (the loader's `load` bridge, a
+        // test) is covered, not only the plugin hook-dispatch path.
+        let caller = self.caller;
+        let tag = self.options.to_value();
+        let source = ast.source().map(str::to_string);
         blocking(|| {
             let _run = begin_run(RunKind::Load, self.budget.hook_timeout);
+            let _seed = seed_call_context(caller, Some(tag), source);
             engine.call_fn_with_options::<Dynamic>(
-                CallFnOptions::new().with_tag(self.options.clone()),
+                CallFnOptions::new(),
                 &mut Scope::new(),
                 ast,
                 LOAD_HOOK,

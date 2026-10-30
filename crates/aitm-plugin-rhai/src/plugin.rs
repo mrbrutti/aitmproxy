@@ -335,15 +335,15 @@ impl LoadedScript {
     /// `on_request` (spec §8's error policy, applied to load).
     pub(crate) fn run_load(&self, reg: &mut Registry) {
         let ast = self.handle.current();
+        // `load(reg)` can reach a seam host fn (`option`, …); `run_load` seeds this
+        // boundary with the script's authoring trust (plus the options tag and the
+        // script source) before it evaluates, so such a call is gated on the author
+        // — never refused for a missing context, never widened to operator (spec
+        // AC3). The seeding lives inside `run_load` so it also covers a direct call.
         let mut handle = ScriptRegHandle::new(reg)
             .with_options((**self.options.load()).clone())
-            .with_budget(self.budget);
-        // `load(reg)` can reach a seam host fn; seed this boundary with the
-        // script's authoring trust before it evaluates so such a call is gated on
-        // the author (never refused for a missing context, never widened to
-        // operator). `run_load` evaluates under `block_in_place` on this thread,
-        // so the thread-local seed is live for the whole load (spec AC3).
-        let _seed = seed_call_context(self.handle.authoring_trust(), None, None);
+            .with_budget(self.budget)
+            .with_caller(self.handle.authoring_trust());
         if let Err(err) = handle.run_load(&self.engine, &ast) {
             tracing::error!(target: SCRIPT_TARGET, script = %self.meta.name, "{err}");
         }
@@ -366,17 +366,22 @@ impl LoadedScript {
         // A hook runs detached from any frontend (the proxy fires it), so seed
         // this boundary with the script's authoring trust: an agent-authored
         // hook's seam calls are gated `Agent`, an operator-authored one's
-        // `Operator`. Held across the whole hook (and any seam call nested in it),
-        // and never left unseeded — fail-closed, never an operator default (spec
-        // AC6, AC3).
+        // `Operator`. The per-eval tag (the options, as a `Value`) and source (the
+        // script name) are threaded through the same seed, so the seam-migrated
+        // `option`/`finding` read them off `HostCallCtx` (the old
+        // `with_tag(Options)` custom-type tag could not cross the rhai-free seam).
+        // Held across the whole hook (and any seam call nested in it), never left
+        // unseeded — fail-closed, never an operator default (spec AC6, AC3).
         let authoring = self.handle.authoring_trust();
+        let tag = options.to_value();
+        let source = ast.source().map(str::to_string);
         blocking(|| {
             let _run = begin_run(RunKind::Hook, self.budget.hook_timeout);
             let _active = ActiveFlow::enter(Arc::clone(state));
-            let _seed = seed_call_context(authoring, None, None);
+            let _seed = seed_call_context(authoring, Some(tag), source);
             self.engine
                 .call_fn_with_options::<Dynamic>(
-                    CallFnOptions::new().with_tag(options),
+                    CallFnOptions::new(),
                     &mut Scope::new(),
                     ast,
                     hook,

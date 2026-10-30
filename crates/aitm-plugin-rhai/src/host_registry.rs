@@ -404,6 +404,50 @@ fn dispatch(
     Ok(value_to_dynamic(&out))
 }
 
+/// Run a guard-wrapped seam host fn registered under a **global** (non-namespaced)
+/// Rhai name, threading the per-eval [`HostCallCtx`] exactly as [`dispatch`] does
+/// for `<ns>.<name>` calls: read the caller context seeded at the invocation
+/// boundary, build the rhai-free [`HostCallContextSource`] from the seed's
+/// tag/source, run the guard's permit check (permit-before-effect), then the host
+/// fn.
+///
+/// The first-party `option`/`finding` verbs ([`crate::host_core`]) stay **global**
+/// Rhai functions for call-syntax back-compat (AC7: `option("x")` /
+/// `finding(#{…})` are unchanged), so they cannot take the [`ProtoNs`] receiver
+/// [`dispatch`] path; they take this sibling instead. Like [`dispatch`] it is a
+/// place rhai meets the seam, but it touches **no** [`NativeCallContext`] — the
+/// tag and call source come from the per-eval seed, so the migrated host-fn
+/// bodies stay rhai-free (AC8).
+///
+/// **Fail-closed (AC3).** With no seeded caller context the call is refused before
+/// any effect with a clear "no caller context" error — never defaulted to
+/// [`CallerTrust::Operator`]. Unlike [`dispatch`], an absent call source falls back
+/// to the **empty** string (not [`DEFAULT_CALL_SOURCE`]) so a first-party fn such
+/// as `finding` can apply its own `"<unnamed script>"` provenance default and
+/// preserve its exact pre-seam behaviour.
+pub fn run_seam_global(
+    namespace: &str,
+    fn_name: &str,
+    guard: &dyn GuardHandle,
+    f: &HostFn,
+    args: &[Value],
+) -> Result<Value, HostError> {
+    let seed = current_call_context().ok_or_else(|| HostError::GuardRefused {
+        namespace: namespace.to_string(),
+        reason: format!(
+            "no caller context seeded for this evaluation; refusing `{fn_name}` \
+             (fail-closed: the invocation boundary must seed the caller trust)"
+        ),
+    })?;
+    let source = RhaiCallSource {
+        tag: seed.tag,
+        call_source: seed.source.unwrap_or_default(),
+    };
+    let hostctx = HostCallCtx::new(seed.caller, &source);
+    guard.permit(&hostctx, fn_name)?;
+    (f)(&hostctx, args)
+}
+
 /// The concrete [`HostCallContextSource`] the bridge builds for one call: the
 /// per-eval tag and origin resolved by [`dispatch`], owned so it carries no rhai
 /// type and the host fn/guard read only `aitm_core` values.

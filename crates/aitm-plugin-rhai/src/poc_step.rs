@@ -167,9 +167,14 @@ impl ScriptStepExecutor for RhaiScriptExecutor {
         // script face, AC3). The guard is held across the whole eval, so a seam
         // call nested in the step still observes it.
         let caller = CallerTrust::from(ctx.host.frontend());
+        // A PoC `script:` step carries no options, so the per-eval tag stays `None`
+        // (`option(...)` reads `()`); the call source is the step's name, which the
+        // seam-migrated `finding(...)` records off `HostCallCtx::call_source()` —
+        // identical to the pre-seam `NativeCallContext` AST source set at compile.
+        let source = Some(name.to_string());
         let result = blocking(|| {
             let _run = begin_run(RunKind::PocStep, self.budget.hook_timeout);
-            let _seed = seed_call_context(caller, None, None);
+            let _seed = seed_call_context(caller, None, source);
             self.engine.eval_ast_with_scope::<Dynamic>(&mut scope, &ast)
         });
 
