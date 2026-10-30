@@ -1,28 +1,27 @@
-//! HTTP/1 path hardening, end to end over loopback (plan
-//! `2026-10-30-http1-path-hardening-plan`, Task 5).
+//! HTTP/1 path hardening, end to end over loopback.
 //!
-//! The sandbox-runnable unit tests in `module.rs` and `tests/sansio.rs` are the
-//! authoritative red-to-green proof of the three fixes. These tests corroborate
-//! them against a real `Proxy`, real sockets and, for the TLS cases, a real
-//! handshake with a hand-rolled origin:
+//! The unit tests in `module.rs` and `tests/sansio.rs` pin each fix in
+//! isolation. These tests check the same fixes against a real `Proxy`, real
+//! sockets and, for the TLS cases, a real handshake with a hand-rolled origin:
 //!
 //! - a cleartext `CONNECT` tunnel dials the `CONNECT` target, never the `Host`
-//!   header of the request inside it (AC15, AC17);
+//!   header of the request inside it, and the SSRF-guarded listener judges that
+//!   target, not the `Host`;
 //! - a complete response, or a partial head, that an origin writes in the same
 //!   read as the end of a legitimate response is neither forwarded nor parsed as
 //!   the next response, and the upstream it came from is replaced, over
-//!   cleartext and through a TLS tunnel (AC10, AC11, AC12);
-//! - the replay sender returns only the first of two responses (AC13);
+//!   cleartext and through a TLS tunnel;
+//! - the replay sender returns only the first of two responses;
 //! - an origin that accepts a TCP connection and never answers the TLS handshake
-//!   cannot pin the proxy: the handshake is bounded (AC6).
+//!   cannot pin the proxy: the handshake is bounded.
 //!
 //! They bind loopback ports, so they run under the Terminal panel, not the Bash
 //! sandbox (CLAUDE.md). Every wait on the network is bounded and fails with a
 //! message naming what it was waiting for; there are no fixed ports.
 //!
-//! The helpers are copied from `tests/stale_upstream.rs` (the file the plan says
-//! not to refactor), adapted where noted.
+//! The helpers are adapted from `tests/stale_upstream.rs`.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -113,7 +112,7 @@ enum Behaviour {
     StrayAfterFirst(&'static str),
 }
 
-/// A hand-rolled HTTP/1.1 origin and what it has observed.
+/// A hand-rolled origin on `127.0.0.1` and what it has observed.
 struct Origin {
     addr: SocketAddr,
     /// TCP connections accepted so far.
@@ -124,6 +123,32 @@ impl Origin {
     fn accepted(&self) -> usize {
         self.accepted.load(Ordering::SeqCst)
     }
+}
+
+/// Bind a loopback listener and run `per_conn` on its own task for every TCP
+/// connection it accepts. `per_conn` gets the connection and its 1-based number
+/// (the order it was accepted in); the count of accepted connections is what
+/// [`Origin::accepted`] reports. The accept loop is the one every origin here
+/// shares, whatever it then does with the connection.
+async fn spawn_origin<F, Fut>(per_conn: F) -> Origin
+where
+    F: Fn(TcpStream, usize) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
+    let addr = listener.local_addr().expect("origin addr");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let count = accepted.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            let conn_no = count.fetch_add(1, Ordering::SeqCst) + 1;
+            tokio::spawn(per_conn(tcp, conn_no));
+        }
+    });
+    Origin { addr, accepted }
 }
 
 /// Read one request head (buffering any bytes past it in `buf`) and return its
@@ -170,20 +195,7 @@ where
 
 /// A cleartext origin on `127.0.0.1`.
 async fn spawn_plain_origin(behaviour: Behaviour) -> Origin {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
-    let addr = listener.local_addr().expect("origin addr");
-    let accepted = Arc::new(AtomicUsize::new(0));
-    let acc = accepted.clone();
-    tokio::spawn(async move {
-        loop {
-            let Ok((tcp, _)) = listener.accept().await else {
-                break;
-            };
-            let conn_no = acc.fetch_add(1, Ordering::SeqCst) + 1;
-            tokio::spawn(answer_requests(tcp, conn_no, behaviour));
-        }
-    });
-    Origin { addr, accepted }
+    spawn_origin(move |tcp, conn_no| answer_requests(tcp, conn_no, behaviour)).await
 }
 
 /// A TLS origin on `127.0.0.1` with a self-signed leaf and no ALPN (so the
@@ -204,100 +216,94 @@ async fn spawn_tls_origin(behaviour: Behaviour) -> Origin {
         )
         .expect("origin server config");
     let acceptor = TlsAcceptor::from(Arc::new(cfg));
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
-    let addr = listener.local_addr().expect("origin addr");
-    let accepted = Arc::new(AtomicUsize::new(0));
-    let acc = accepted.clone();
-    tokio::spawn(async move {
-        loop {
-            let Ok((tcp, _)) = listener.accept().await else {
-                break;
+    spawn_origin(move |tcp, conn_no| {
+        let acceptor = acceptor.clone();
+        async move {
+            let Ok(tls) = acceptor.accept(tcp).await else {
+                return;
             };
-            let conn_no = acc.fetch_add(1, Ordering::SeqCst) + 1;
-            let acceptor = acceptor.clone();
-            tokio::spawn(async move {
-                let Ok(tls) = acceptor.accept(tcp).await else {
-                    return;
-                };
-                answer_requests(tls, conn_no, behaviour).await;
-            });
+            answer_requests(tls, conn_no, behaviour).await;
         }
-    });
-    Origin { addr, accepted }
+    })
+    .await
 }
 
 /// An origin that accepts TCP connections and never answers: it writes nothing,
 /// so a TLS handshake with it can only stall. It reads and discards whatever the
 /// peer sends (the ClientHello) for one reason: that is the only way to learn
-/// that the peer closed.
-struct StallOrigin {
-    addr: SocketAddr,
-    /// TCP connections accepted so far.
-    accepted: Arc<AtomicUsize>,
-    /// Signalled (as a stored permit, so a later wait still sees it) once a peer
-    /// has closed its end of a connection.
-    peer_closed: Arc<Notify>,
-}
-
-impl StallOrigin {
-    fn accepted(&self) -> usize {
-        self.accepted.load(Ordering::SeqCst)
-    }
-}
-
-async fn spawn_stall_origin() -> StallOrigin {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind stall origin");
-    let addr = listener.local_addr().expect("stall origin addr");
-    let accepted = Arc::new(AtomicUsize::new(0));
+/// that the peer closed. Returns the origin and a `Notify` signalled (as a
+/// stored permit, so a later wait still sees it) once a peer has closed its end
+/// of a connection.
+async fn spawn_stall_origin() -> (Origin, Arc<Notify>) {
     let peer_closed = Arc::new(Notify::new());
-    let (acc, closed) = (accepted.clone(), peer_closed.clone());
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut tcp, _)) = listener.accept().await else {
-                break;
-            };
-            acc.fetch_add(1, Ordering::SeqCst);
-            let closed = closed.clone();
-            tokio::spawn(async move {
-                let mut sink = [0u8; 1024];
-                loop {
-                    match tcp.read(&mut sink).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
-                    }
+    let closed = peer_closed.clone();
+    let origin = spawn_origin(move |mut tcp, _conn_no| {
+        let closed = closed.clone();
+        async move {
+            let mut sink = [0u8; 1024];
+            loop {
+                match tcp.read(&mut sink).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
                 }
-                closed.notify_one();
-            });
+            }
+            closed.notify_one();
         }
-    });
-    StallOrigin {
-        addr,
-        accepted,
-        peer_closed,
-    }
+    })
+    .await;
+    (origin, peer_closed)
 }
 
 // ---------------------------------------------------------------------------
 // The proxy
 // ---------------------------------------------------------------------------
 
-/// Run a `Proxy` with the HTTP module (a fresh CA) and no plugins. `127.0.0.1`
-/// is in scope so the guarded upstream connector admits the origins. When
-/// `tls_handshake_timeout` is given, the module bounds its TLS handshake to an
-/// origin by it. Returns the proxy address, the CA's root PEM and the proxy's
-/// flow store (taken before the proxy moves into its task).
+/// Which listener, and so which upstream connector, a test proxy runs.
+#[derive(Clone, Copy)]
+enum Egress {
+    /// `Proxy::run`: the passive connector relays to any address without a scope
+    /// gate.
+    Passive,
+    /// `Proxy::run_browser`: the SSRF-guarded connector refuses a loopback target
+    /// unless scope names that address (and port).
+    Guarded,
+}
+
+/// Run a passive `Proxy` (see [`Egress::Passive`]) with the HTTP module (a fresh
+/// CA) and no plugins. The passive connector relays without a scope gate, so the
+/// origins need no scope entry. When `tls_handshake_timeout` is given, the module
+/// bounds its TLS handshake to an origin by it. Returns the proxy address, the
+/// CA's root PEM and the proxy's flow store.
 async fn run_proxy(
+    tls_handshake_timeout: Option<Duration>,
+) -> (SocketAddr, String, Arc<dyn FlowStore>) {
+    start_proxy(Egress::Passive, &[], tls_handshake_timeout).await
+}
+
+/// Run an SSRF-guarded `Proxy` (see [`Egress::Guarded`]) whose scope is exactly
+/// `scope` (`host` or `host:port` entries), with the HTTP module (a fresh CA) and
+/// no plugins. Loopback is private, so the guard admits a loopback dial only when
+/// an entry names that address and port.
+async fn run_guarded_proxy(scope: &[String]) -> (SocketAddr, String, Arc<dyn FlowStore>) {
+    start_proxy(Egress::Guarded, scope, None).await
+}
+
+/// Build the proxy, start `egress`'s listener on a free loopback port and wait
+/// until it accepts connections. Returns the proxy address, the CA's root PEM and
+/// the proxy's flow store (taken before the proxy moves into its task).
+async fn start_proxy(
+    egress: Egress,
+    scope: &[String],
     tls_handshake_timeout: Option<Duration>,
 ) -> (SocketAddr, String, Arc<dyn FlowStore>) {
     let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
     let root_pem = ca.root_cert_pem().to_string();
     let config = Config {
         scope: ScopeConfig {
-            entries: vec![ScopeEntry {
-                host: "127.0.0.1".to_string(),
-            }],
+            entries: scope
+                .iter()
+                .map(|host| ScopeEntry { host: host.clone() })
+                .collect(),
             ..ScopeConfig::default()
         },
         ..Config::default()
@@ -315,7 +321,10 @@ async fn run_proxy(
     let store = proxy.store();
     let addr = free_port();
     tokio::spawn(async move {
-        let _ = proxy.run(addr).await;
+        let _ = match egress {
+            Egress::Passive => proxy.run(addr).await,
+            Egress::Guarded => proxy.run_browser(addr).await,
+        };
     });
     let deadline = Instant::now() + IO_TIMEOUT;
     while !matches!(
@@ -529,13 +538,10 @@ fn body_text(flow: &HttpFlow) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Defect 1 (AC15, AC17). In a cleartext CONNECT tunnel the route is the
-/// CONNECT target. A request inside it that names another origin in `Host` is
-/// still answered by the CONNECT target, and the one upstream connection serves
-/// every request in the tunnel.
-///
-/// Red before Task 4: the tunnel's first request dials the origin its `Host`
-/// names, so the target accepts nothing and the decoy accepts the connection.
+/// In a cleartext CONNECT tunnel the route is the CONNECT target. A request
+/// inside it that names another origin in `Host` is still answered by the
+/// CONNECT target, and the one upstream connection serves every request in the
+/// tunnel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cleartext_tunnel_dials_the_connect_target_not_the_host_header() {
     let target = spawn_plain_origin(Behaviour::Normal).await;
@@ -575,6 +581,60 @@ async fn a_cleartext_tunnel_dials_the_connect_target_not_the_host_header() {
         one.server_conn.as_ref().map(|c| c.peer),
         Some(target.addr),
         "server_conn.peer must be the CONNECT target the request was dialled to"
+    );
+}
+
+/// The SSRF-guarded listener (`Proxy::run_browser`) judges a cleartext CONNECT
+/// tunnel by its CONNECT target, never by the `Host` of the request inside it.
+/// Loopback is private, so the guard admits a loopback dial only when scope
+/// names that exact address and port. Two loopback origins, one in scope
+/// (`allowed`) and one not (`denied`), make both directions observable:
+///
+/// - a tunnel to `denied` whose request says `Host: <allowed>` is refused: the
+///   client sees the connection close and neither origin accepts anything. A
+///   proxy that handed the guard the `Host` would reach `allowed`.
+/// - a tunnel to `allowed` whose request says `Host: <denied>` is answered by
+///   `allowed`, and `denied` still accepts nothing. A proxy that handed the guard
+///   the `Host` would refuse it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_guard_judges_a_cleartext_tunnel_by_its_connect_target_not_the_host_header() {
+    let allowed = spawn_plain_origin(Behaviour::Normal).await;
+    let denied = spawn_plain_origin(Behaviour::Normal).await;
+    let (proxy, _root, _store) = run_guarded_proxy(&[allowed.addr.to_string()]).await;
+
+    // CONNECT to the out-of-scope origin, with a `Host` naming the in-scope one.
+    let mut client = Client::new(connect_tunnel(proxy, denied.addr).await);
+    let why = client
+        .get("/refused", &allowed.addr.to_string())
+        .await
+        .expect_err("the guard must refuse the dial to the out-of-scope CONNECT target");
+    assert!(
+        !why.starts_with("timed out"),
+        "the proxy must close a refused tunnel, not leave it hanging: {why}"
+    );
+    assert_eq!(
+        denied.accepted(),
+        0,
+        "the out-of-scope CONNECT target must never be dialled"
+    );
+    assert_eq!(
+        allowed.accepted(),
+        0,
+        "the Host header must not choose the tunnel's upstream"
+    );
+
+    // CONNECT to the in-scope origin, with a `Host` naming the out-of-scope one.
+    let mut client = Client::new(connect_tunnel(proxy, allowed.addr).await);
+    let reply = client
+        .get("/admitted", &denied.addr.to_string())
+        .await
+        .expect("the in-scope CONNECT target must be reached whatever the Host says");
+    assert_eq!(reply, (200, "conn=1 path=/admitted".to_string()));
+    assert_eq!(allowed.accepted(), 1);
+    assert_eq!(
+        denied.accepted(),
+        0,
+        "the out-of-scope origin named only in Host must never be dialled"
     );
 }
 
@@ -646,14 +706,10 @@ async fn assert_a_stray_response_never_reaches_the_client<S>(
     }
 }
 
-/// Defect 2 (AC10, AC11), cleartext forward proxy. The origin writes a complete
-/// stray response in the same write as its first response. The client gets only
-/// the legitimate response, and request 2 on the same client connection is
-/// answered by a fresh upstream connection, not by the stray.
-///
-/// Red before Task 3: with only the machine guard the stray stays buffered on a
-/// live upstream and is read as the answer to request 2 (`POISON`); before the
-/// guard it was forwarded to the client behind response 1.
+/// Cleartext forward proxy. The origin writes a complete stray response in the
+/// same write as its first response. The client gets only the legitimate
+/// response, and request 2 on the same client connection is answered by a fresh
+/// upstream connection, not by the stray.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stray_response_in_the_same_read_is_not_forwarded() {
     let origin = spawn_plain_origin(Behaviour::StrayAfterFirst(STRAY)).await;
@@ -671,11 +727,9 @@ async fn a_stray_response_in_the_same_read_is_not_forwarded() {
     .await;
 }
 
-/// Defect 2 (AC12), through a TLS tunnel. The same stray, but the replacement
-/// connection must be a TLS reconnect to the origin (a second TCP accept), never
-/// a cleartext fallback.
-///
-/// Red before Task 3, for the same reason as the cleartext test.
+/// Through a TLS tunnel. The same stray, but the replacement connection must be
+/// a TLS reconnect to the origin (a second TCP accept), never a cleartext
+/// fallback.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stray_response_in_the_same_read_is_not_forwarded_through_a_tls_tunnel() {
     let origin = spawn_tls_origin(Behaviour::StrayAfterFirst(STRAY)).await;
@@ -686,14 +740,10 @@ async fn a_stray_response_in_the_same_read_is_not_forwarded_through_a_tls_tunnel
     assert_a_stray_response_never_reaches_the_client(&mut client, "", &host, &origin, &store).await;
 }
 
-/// Defect 2 (AC11), a partial head. The origin writes the start of a response
-/// head after its first response and keeps the connection open, so it would
-/// answer request 2 if the proxy sent it there. A fragment left in the buffer of
-/// a live upstream would be glued onto that answer and the origin would pick
-/// its status line.
-///
-/// Red before Task 3: request 2 rides the live connection and comes back with
-/// status 500 from the fragment, body `conn=1 path=/two`.
+/// A partial head. The origin writes the start of a response head after its
+/// first response and keeps the connection open, so it would answer request 2 if
+/// the proxy sent it there. A fragment left in the buffer of a live upstream
+/// would be glued onto that answer and the origin would pick its status line.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stray_head_fragment_does_not_corrupt_the_next_response() {
     let origin = spawn_plain_origin(Behaviour::StrayAfterFirst(FRAGMENT)).await;
@@ -724,11 +774,8 @@ async fn a_stray_head_fragment_does_not_corrupt_the_next_response() {
     );
 }
 
-/// Defect 2 (AC13). `Http1Sender` (replay, `request.send`, the scanner) drives
-/// the same machine and must return only the first of two responses an origin
-/// writes in one go.
-///
-/// Red before Task 2: the body is `legitPOISON` and the head is the stray's.
+/// `Http1Sender` (replay, `request.send`, the scanner) drives the same machine
+/// and must return only the first of two responses an origin writes in one go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_replay_sender_returns_only_the_first_of_two_responses() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
@@ -771,16 +818,13 @@ async fn the_replay_sender_returns_only_the_first_of_two_responses() {
     }
 }
 
-/// Defect 3 (AC6). The origin accepts the TCP connection and never answers the
-/// TLS handshake. The proxy, with a 300 ms bound, gives up on it: the client's
-/// own handshake with the proxy fails (the proxy drops the connection) no sooner
-/// than 250 ms and well inside the guard, and the origin sees the proxy close.
-///
-/// Red before Task 1: nothing bounds the proxy's handshake, so the client's
-/// handshake is still pending when the 5 s guard fires.
+/// The origin accepts the TCP connection and never answers the TLS handshake.
+/// The proxy, with a 300 ms bound, gives up on it: the client's own handshake
+/// with the proxy fails (the proxy drops the connection) no sooner than 250 ms
+/// and well inside the guard, and the origin sees the proxy close.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_proxy_gives_up_on_an_origin_that_stalls_the_tls_handshake() {
-    let stall = spawn_stall_origin().await;
+    let (stall, peer_closed) = spawn_stall_origin().await;
     let (proxy, root_pem, _store) = run_proxy(Some(TLS_HANDSHAKE_BOUND)).await;
     let tcp = connect_tunnel(proxy, stall.addr).await;
     let name = ServerName::try_from(stall.addr.ip().to_string()).expect("server name");
@@ -804,12 +848,8 @@ async fn the_proxy_gives_up_on_an_origin_that_stalls_the_tls_handshake() {
         elapsed >= Duration::from_millis(250),
         "the handshake failed after {elapsed:?}, before the proxy's 300 ms bound could have expired"
     );
-    assert!(
-        elapsed < IO_TIMEOUT,
-        "the handshake failed only after {elapsed:?}"
-    );
 
-    tokio::time::timeout(IO_TIMEOUT, stall.peer_closed.notified())
+    tokio::time::timeout(IO_TIMEOUT, peer_closed.notified())
         .await
         .expect("the stalled origin never saw the proxy close its connection");
     assert_eq!(
