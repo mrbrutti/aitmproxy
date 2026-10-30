@@ -200,8 +200,9 @@ fn is_url(value: &str) -> bool {
 }
 
 /// Read body bytes the way `detail.rs` does: buffered bodies yield their bytes,
-/// a still-streaming body yields nothing.
-fn body_bytes(body: &Body) -> Option<&[u8]> {
+/// a still-streaming body yields nothing. Shared with `passive.rs` so request
+/// and response bodies are read identically.
+pub(crate) fn body_bytes(body: &Body) -> Option<&[u8]> {
     match body {
         Body::Bytes(b) => Some(b.as_slice()),
         Body::Empty => Some(&[]),

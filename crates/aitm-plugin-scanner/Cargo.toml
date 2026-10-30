@@ -10,6 +10,8 @@ workspace = true
 
 [dependencies]
 aitm-core = { workspace = true }
+aitm-findings = { workspace = true }
+aitm-poc = { workspace = true }
 anyhow = { workspace = true }
 futures = { workspace = true }
 # JSON request bodies are parsed with the same serializer the rest of the tree
