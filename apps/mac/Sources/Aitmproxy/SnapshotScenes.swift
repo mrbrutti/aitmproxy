@@ -44,8 +44,9 @@ enum SnapshotScene: String, CaseIterable {
 
     /// Task 8: a seeded embedded `CoreConnection` so the health dot and the
     /// core-log panel render without a live core (snapshots use fixtures).
-    private static func core(_ status: CoreConnection.Status, label: String) -> CoreConnection {
-        CoreConnection(id: .fixture, kind: .embedded, endpoint: BusEndpoint(port: 0, token: ""), status: status, label: label)
+    private static func core(_ status: CoreConnection.Status, label: String, proxyAddress: String? = nil) -> CoreConnection {
+        CoreConnection(id: .fixture, kind: .embedded, endpoint: BusEndpoint(port: 0, token: ""), status: status,
+                       label: label, proxyAddress: proxyAddress)
     }
 
     func apply(to session: Session) {
@@ -167,7 +168,7 @@ enum SnapshotScene: String, CaseIterable {
             session.requestTab = .timing
             session.responseTab = .headers
         case .coreRunning:
-            session.coreHealth.connection = Self.core(.ready, label: "Embedded core · proxy 127.0.0.1:8080")
+            session.coreHealth.connection = Self.core(.ready, label: "Embedded core · proxy 127.0.0.1:8080", proxyAddress: "127.0.0.1:8080")
         case .coreRestarting:
             session.coreHealth.connection = Self.core(.starting, label: "Embedded core")
         case .coreFailed:
@@ -175,7 +176,7 @@ enum SnapshotScene: String, CaseIterable {
                 .degraded(reason: "the core exited unexpectedly (status 1)\naitm: address already in use (os error 48)"),
                 label: "Embedded core")
         case .coreLog:
-            session.coreHealth.connection = Self.core(.ready, label: "Embedded core · proxy 127.0.0.1:8081")
+            session.coreHealth.connection = Self.core(.ready, label: "Embedded core · proxy 127.0.0.1:8081", proxyAddress: "127.0.0.1:8081")
             for line in [
                 "aitm 0.1.0 starting",
                 "proxy listening on 127.0.0.1:8081 (8080 was in use)",
