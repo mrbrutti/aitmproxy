@@ -30,9 +30,11 @@ type TestBus = BusClient &
     /**
      * Failure / latency injection: `flow.list` fails or is held, the next `tools/list` rejects, and
      * the next `failStatus` `proxy.status` calls throw (set these BEFORE `start()` to fail bootstrap);
-     * `setState` moves the bus through open / reconnecting / closed.
+     * `setState` moves the bus through open / reconnecting / closed, and `failDetail` lists flow ids
+     * whose `flow.detail` / `flow.get` always error (a flow the core cannot render).
      */
     ctl: {
+      failDetail: Set<string>;
       failFlowList: boolean;
       holdFlowList: Promise<void> | null;
       failToolsOnce: boolean;
@@ -53,7 +55,7 @@ function bridgeBus(address = '127.0.0.1:8082'): TestBus {
   const peak = { detail: 0 };
   let detailInFlight = 0;
   const [state, setState] = createSignal<BusState>('open');
-  const ctl: TestBus['ctl'] = { failFlowList: false, holdFlowList: null, failToolsOnce: false, failStatus: 0, setState };
+  const ctl: TestBus['ctl'] = { failDetail: new Set(), failFlowList: false, holdFlowList: null, failToolsOnce: false, failStatus: 0, setState };
   return {
     ...mock,
     address,
@@ -84,6 +86,7 @@ function bridgeBus(address = '127.0.0.1:8082'): TestBus {
         ctl.failStatus--;
         throw new BusError('proxy.status: bus closed (1006)');
       }
+      if ((tool === 'flow.detail' || tool === 'flow.get') && ctl.failDetail.has(args.id as string)) throw new BusError(`${tool}: flow ${String(args.id)} cannot be read`);
       if (tool !== 'flow.detail') return mock.call<T>(tool, args);
       peak.detail = Math.max(peak.detail, ++detailInFlight);
       try {
@@ -108,6 +111,18 @@ function captureSilently(bus: TestBus, seq: number): string {
   const flow = generateResponse(generateRequest({ rng: mulberry32(seq), seq, now, armed: false, scope: [] }), mulberry32(seq), now);
   bus.flowsById().set(flow.id, flow);
   return flow.id;
+}
+
+/** A flow still waiting for its response: `status` is null, so the loop keeps re-reading it. */
+function captureInFlight(bus: TestBus, seq: number): string {
+  const flow = generateRequest({ rng: mulberry32(seq), seq, now: Date.now(), armed: false, scope: [] });
+  bus.flowsById().set(flow.id, flow);
+  return flow.id;
+}
+
+/** The core answers that in-flight flow's request, so its next read has a status. */
+function complete(bus: TestBus, id: string) {
+  bus.flowsById().set(id, generateResponse(bus.flowsById().get(id)!, mulberry32(1), Date.now()));
 }
 
 const STATE: StateNotification = { listening: true, intercept_armed: false, paused: 0, agent: 'all' };
@@ -331,6 +346,66 @@ describe('app store — a core with a large backlog', () => {
     }
 
     expect(app.entries.map((e) => e.id)).toEqual(ids);
+  });
+});
+
+describe('app store — flows the core cannot render', () => {
+  const capture = (bus: TestBus, n: number) => Array.from({ length: n }, (_, i) => captureSilently(bus, i + 1));
+
+  it('a cap-sized run of unreadable flows does not starve the healthy ones behind it, nor spin the loop', async () => {
+    const bus = bridgeBus();
+    const ids = capture(bus, 250);
+    for (const id of ids.slice(0, 201)) bus.ctl.failDetail.add(id); // the oldest 201 always error
+    const { app } = start(bus);
+
+    for (let s = 0; s < 3; s++) {
+      bus.emit('notifications/aitm/flow', FLOW_PING); // push is live, so only backlog can force polls
+      await tick(1000);
+    }
+
+    // The 49 readable flows behind the 201 bad ones are in, in capture order, within a few ticks…
+    expect(app.entries.map((e) => e.id)).toEqual(ids.slice(201));
+
+    // …and the loop is NOT hammering the bad ones at the 500 ms cadence: over the next 10 s of live
+    // push it makes only the heartbeat's polls (the bad flows are retried only after a pause).
+    const lists = bus.count('flow.list');
+    const details = bus.count('flow.detail');
+    for (let s = 0; s < 10; s++) {
+      bus.emit('notifications/aitm/flow', FLOW_PING);
+      await tick(1000);
+    }
+    expect(bus.count('flow.list') - lists).toBeLessThanOrEqual(3); // ~1 heartbeat + its follow-up, not ~20
+    expect(bus.count('flow.detail') - details).toBeLessThanOrEqual(2 * 201);
+  });
+
+  it('does not let flows that cannot be re-read crowd the healthy in-flight ones out of the refresh window', async () => {
+    const bus = bridgeBus();
+    const ids = Array.from({ length: 60 }, (_, i) => captureInFlight(bus, i + 1));
+    const { app } = start(bus);
+    await tick(300); // all 60 are known, none has a status yet
+    expect(ids.every((id) => app.byId.get(id)?.raw.status == null)).toBe(true);
+
+    for (const id of ids.slice(0, 50)) bus.ctl.failDetail.add(id); // the oldest 50 can no longer be read
+    const healthy = ids.slice(50);
+    for (const id of healthy) complete(bus, id); // the core finished the other 10
+
+    await tick(1500); // the refresh window is 50 flows wide: the bad ones must not fill it forever
+
+    expect(healthy.map((id) => app.byId.get(id)?.raw.status != null)).toEqual(healthy.map(() => true));
+  });
+
+  it('retries an unreadable flow after a pause, so a flow that recovers still arrives', async () => {
+    const bus = bridgeBus();
+    const [id] = capture(bus, 1);
+    bus.ctl.failDetail.add(id!);
+    const { app } = start(bus);
+    await tick(2000);
+    expect(app.entries).toHaveLength(0); // unreadable for now
+
+    bus.ctl.failDetail.delete(id!); // the core recovers
+    await tick(6000); // longer than the retry pause
+
+    expect(app.entries.map((e) => e.id)).toEqual([id]);
   });
 });
 

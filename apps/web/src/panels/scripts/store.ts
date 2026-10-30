@@ -22,6 +22,15 @@ import {
 /** What the editor's result region shows: a validate summary, a save result, or the core's error text verbatim. */
 export type Outcome = { kind: 'valid'; report: ScriptReport } | { kind: 'saved'; report: ScriptReport } | { kind: 'error'; text: string };
 
+export interface RefreshOpts {
+  /**
+   * Raise no toast if `script.list` fails. For a read nobody asked for in that moment (the sidebar's
+   * count on page load, the panel opening): the panel's error block, or no count, is the signal. A click
+   * on Refresh or Retry, or the re-read after an action, leaves it off so a failure is announced.
+   */
+  quiet?: boolean;
+}
+
 export interface ScriptsStore {
   /** `script.list` is advertised: without it the panel says the core has no scripts tier. */
   offered: Accessor<boolean>;
@@ -55,9 +64,9 @@ export interface ScriptsStore {
   nameError: Accessor<string | null>;
   outcome: Accessor<Outcome | null>;
   /** Re-read `script.list` alone: all the sidebar's count needs. */
-  refreshList: () => Promise<void>;
+  refreshList: (opts?: RefreshOpts) => Promise<void>;
   /** Re-read the scripts and their findings. */
-  refresh: () => Promise<void>;
+  refresh: (opts?: RefreshOpts) => Promise<void>;
   toggle: (row: ScriptRow) => Promise<void>;
   reload: (row: ScriptRow) => Promise<void>;
   validate: () => Promise<void>;
@@ -66,6 +75,8 @@ export interface ScriptsStore {
 
 /** Why authoring is off for an agent session; the core enforces it, the panel only explains it. */
 export const AGENT_REASON = 'Agent session — the core refuses script authoring unless rhai.allow_agent_authoring is set. Connect as the operator to author.';
+
+const NOT_A_LIST = 'script.list answered with something that is not a list.';
 
 const NAME_RULE = 'A name may contain only letters, digits, "_" and "-".';
 
@@ -100,9 +111,10 @@ function build(app: AppStore): ScriptsStore {
   // A keyed store, not a signal: a refresh after a click updates the rows in place, so the control
   // you just used keeps its DOM node (and its keyboard focus).
   const [rows, setRows] = createStore<ScriptRow[]>([]);
-  const [loaded, setLoaded] = createSignal(false);
   const [listed, setListed] = createSignal(false);
   const [listError, setListError] = createSignal<string | null>(null);
+  // Settled once: a `script.list` has either answered or failed. Until then "no scripts" is a guess.
+  const loaded = () => listed() || listError() !== null;
   const [findings, setFindings] = createSignal<ScriptFindings>({ findings: [], dropped: 0 });
   const [busy, setBusy] = createSignal(false);
   const [name, setName] = createSignal('');
@@ -120,26 +132,30 @@ function build(app: AppStore): ScriptsStore {
 
   const active = createMemo(() => (offered() && listed() && listError() === null ? activeCount(rows) : null));
 
-  async function refreshList(): Promise<void> {
+  async function refreshList(opts: RefreshOpts = {}): Promise<void> {
     if (!offered()) return;
+    // The list body shows this (a toast alone is gone in 6 s); the rows stay as the last good list.
+    const fail = (message: string, toast: string) => {
+      setListError(message);
+      if (!opts.quiet) app.notice(toast, 'error');
+    };
     await app.call('script.list').then(
       (raw) => {
-        setRows(reconcile(parseScriptList(raw), { key: 'name' }));
+        const parsed = parseScriptList(raw);
+        if (parsed === null) return fail(NOT_A_LIST, NOT_A_LIST);
+        setRows(reconcile(parsed, { key: 'name' }));
         setListed(true);
         setListError(null);
       },
-      (e) => {
-        // The body shows this (a toast alone is gone in 6 s); the rows stay as the last good list.
-        setListError(messageOf(e));
-        app.notice(`script.list: ${messageOf(e)}`, 'error');
-      },
+      (e) => fail(messageOf(e), `script.list: ${messageOf(e)}`),
     );
-    setLoaded(true);
   }
 
-  async function refresh(): Promise<void> {
+  // `quiet` covers only the list: it has an in-panel error block. A findings failure has no such place,
+  // so it always toasts.
+  async function refresh(opts: RefreshOpts = {}): Promise<void> {
     if (!offered()) return;
-    const jobs: Promise<void>[] = [refreshList()];
+    const jobs: Promise<void>[] = [refreshList(opts)];
     if (hasFindings()) {
       jobs.push(
         app.call('script.findings', { limit: FINDINGS_LIMIT }).then(

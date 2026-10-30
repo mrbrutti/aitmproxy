@@ -63,7 +63,7 @@ export const Sidebar: Component<{ class?: string }> = (props) => {
   const scripts = scriptsStore(app);
   createEffect(
     on(scripts.offered, (offered) => {
-      if (offered && !scripts.loaded()) void scripts.refreshList();
+      if (offered && !scripts.loaded()) void scripts.refreshList({ quiet: true });
     }),
   );
   const [open, setOpen] = createSignal({ pinned: true, apps: true, domains: true });

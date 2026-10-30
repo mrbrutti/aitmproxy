@@ -55,8 +55,11 @@ const Report: Component<{ kind: 'valid' | 'saved'; report: ScriptReport }> = (pr
 export const ScriptEditor: Component<{ store: ScriptsStore }> = (props) => {
   const s = props.store;
   const hasSource = () => s.source().trim() !== '';
-  const canValidate = () => s.canValidate() && !s.busy() && hasSource();
-  const canSave = () => s.canSave() && !s.busy() && hasSource() && isScriptName(s.name());
+  // `disabled` is for what cannot be done at all (not offered, not allowed, nothing or an invalid name to
+  // send). While a call is in flight a button is only `aria-disabled` and the store ignores the click, so
+  // a keyboard user keeps focus on the button they just pressed.
+  const canValidate = () => s.canValidate() && hasSource();
+  const canSave = () => s.canSave() && hasSource() && isScriptName(s.name());
 
   const error = () => {
     const o = s.outcome();
@@ -113,12 +116,21 @@ export const ScriptEditor: Component<{ store: ScriptsStore }> = (props) => {
       </div>
 
       <div class={css.actions}>
-        <Button variant="outline" disabled={!canValidate()} title={s.canValidate() ? 'Compile it without saving' : 'script.validate is not offered by this core'} onClick={() => void s.validate()}>
+        <Button
+          variant="outline"
+          class={css.guarded}
+          disabled={!canValidate()}
+          aria-disabled={s.busy() ? 'true' : undefined}
+          title={s.canValidate() ? 'Compile it without saving' : 'script.validate is not offered by this core'}
+          onClick={() => void s.validate()}
+        >
           Validate
         </Button>
         <Button
           variant="primary"
+          class={css.guarded}
           disabled={!canSave()}
+          aria-disabled={s.busy() ? 'true' : undefined}
           title={s.agent() ? AGENT_REASON : s.canSave() ? 'Write it to the scripts directory and enable it' : 'script.save is not offered by this core'}
           onClick={() => void s.save()}
         >

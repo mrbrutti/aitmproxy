@@ -340,6 +340,14 @@ export function createAppStore(bus: BusClient) {
     const PUSH_FRESH_MS = 10_000;
     /** At most this many unseen flows are fetched per poll, so a core holding tens of thousands cannot be hit with that many concurrent `flow.detail` calls. */
     const MAX_FRESH_PER_POLL = 200;
+    /**
+     * A flow whose `flow.detail` / `flow.get` failed is left alone this long before it is tried again.
+     * Without the pause a run of unreadable flows (at least a window's worth) is the head of every
+     * capped fetch, fails every time, and starves the healthy flows behind it while keeping `backlog`
+     * (and so the 500 ms cadence) on for good.
+     */
+    const FAILED_RETRY_MS = 5000;
+    const failedAt = new Map<FlowId, number>();
     let pollLoopOn = false;
     let toolsLoaded = false;
     /** The last poll left unseen flows behind (the per-poll cap): keep polling until they are all in, push or not. */
@@ -354,13 +362,24 @@ export function createAppStore(bus: BusClient) {
       lastPollAt = Date.now();
       try {
         const ids = await bus.call<string[]>('flow.list');
-        // Oldest first, so the list stays in capture order while the backlog drains.
-        const unseen = ids.filter((id) => !byId.has(id));
+        const now = Date.now();
+        const held = (id: FlowId) => {
+          const at = failedAt.get(id);
+          return at !== undefined && now - at >= 0 && now - at < FAILED_RETRY_MS;
+        };
+        // Forget pauses that ended and flows that are gone (flow.clear), so the map stays small.
+        if (failedAt.size) {
+          const listed = new Set(ids);
+          for (const id of failedAt.keys()) if (!held(id) || !listed.has(id)) failedAt.delete(id);
+        }
+        // Oldest first, so the list stays in capture order while the backlog drains. Only flows not
+        // paused for a recent failure are eligible, and the backlog is measured over those alone.
+        const unseen = ids.filter((id) => !byId.has(id) && !held(id));
         const fresh = unseen.slice(0, MAX_FRESH_PER_POLL);
         backlog = unseen.length > fresh.length;
         const pending = ids.filter((id) => {
           const e = byId.get(id);
-          return e && e.raw.status == null && e.raw.intercept !== 'killed';
+          return e && e.raw.status == null && e.raw.intercept !== 'killed' && !held(id);
         });
         const want = [...fresh, ...pending.slice(0, 50)];
         // `flow.detail {body: none}` is a summary with headers, sizes, times and the connection
@@ -369,14 +388,22 @@ export function createAppStore(bus: BusClient) {
         const got = await Promise.all(
           want.map((id) => (rich ? bus.call('flow.detail', { id, body: 'none' }) : bus.call('flow.get', { id })).catch(() => null)),
         );
+        const failedNow = Date.now();
         batch(() => {
           got.forEach((raw, i) => {
-            if (raw) upsert(toSummary(raw, ids.indexOf(want[i]!) + 1));
+            const id = want[i]!;
+            if (raw) {
+              failedAt.delete(id);
+              upsert(toSummary(raw, ids.indexOf(id) + 1));
+            } else failedAt.set(id, failedNow);
           });
           recomputePaused();
         });
       } catch {
-        /* reconnecting; next tick */
+        // `flow.list` itself failed. The loop only calls an open bus, so this is a call that errored on
+        // a live connection: it is retried on the next tick. A core that keeps erroring leaves the list
+        // as it was (stale), and nothing says so: no toast, and the status bar only reflects whether
+        // the bus connection is up. (Individual unreadable flows are handled by `failedAt`.)
       }
     }
     async function pollStatus() {

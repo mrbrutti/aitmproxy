@@ -69,8 +69,12 @@ const obj = (v: unknown): Record<string, unknown> => (v && typeof v === 'object'
 const str = (v: unknown): string => (typeof v === 'string' ? v : '');
 const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
 
-export function parseScriptList(raw: unknown): ScriptRow[] {
-  if (!Array.isArray(raw)) return [];
+/**
+ * The rows of a `script.list` answer, or null when the answer is not a list at all: a malformed reply
+ * is a failure to read, not "no scripts", and the caller must be able to tell the two apart.
+ */
+export function parseScriptList(raw: unknown): ScriptRow[] | null {
+  if (!Array.isArray(raw)) return null;
   const rows: ScriptRow[] = [];
   for (const item of raw) {
     const o = obj(item);

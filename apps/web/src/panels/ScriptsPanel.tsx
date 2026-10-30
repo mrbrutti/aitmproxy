@@ -18,7 +18,7 @@ export const ScriptsPanel: Component = () => {
   // Read on open and when the tool list arrives; the state itself outlives the panel (see ./scripts/store).
   createEffect(
     on(store.offered, (offered) => {
-      if (offered) void store.refresh();
+      if (offered) void store.refresh({ quiet: true });
     }),
   );
 

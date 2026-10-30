@@ -28,10 +28,15 @@ describe('parseScriptList', () => {
     ]);
   });
 
-  it('degrades a garbage payload to empty rows instead of throwing', () => {
-    expect(parseScriptList(null)).toEqual([]);
-    expect(parseScriptList({})).toEqual([]);
-    expect(parseScriptList('nope')).toEqual([]);
+  it('answers null, not an empty list, for anything that is not a list, so the caller can tell a malformed reply from "no scripts"', () => {
+    expect(parseScriptList(null)).toBeNull();
+    expect(parseScriptList(undefined)).toBeNull();
+    expect(parseScriptList({})).toBeNull();
+    expect(parseScriptList('nope')).toBeNull();
+    expect(parseScriptList([])).toEqual([]); // a real, empty list
+  });
+
+  it('drops an entry it cannot act on and keeps the rest', () => {
     // An entry without a usable name cannot be acted on, so it is dropped; the rest survive.
     expect(parseScriptList([42, { name: '' }, { name: 'ok', enabled: 'yes', hooks: [1, 'on_request'], last_error: 7 }])).toEqual([
       { name: 'ok', path: '', api: '', hooks: ['on_request'], enabled: false, lastError: null },

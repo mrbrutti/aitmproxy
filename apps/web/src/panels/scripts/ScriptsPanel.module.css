@@ -215,7 +215,7 @@
 }
 .switch:disabled,
 .switch[aria-disabled='true'],
-.reload[aria-disabled='true'] {
+.guarded[aria-disabled='true'] {
   opacity: 0.45;
 }
 

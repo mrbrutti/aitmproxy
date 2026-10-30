@@ -64,6 +64,30 @@ describe('app store — core version', () => {
     expect(app.proxy.version).toBe('1.2.4');
   });
 
+  it('ignores a non-string or missing version on the status poll too, keeping the last good one', async () => {
+    let reported: unknown = '1.2.3';
+    let reads = 0;
+    const app = start(
+      withStatus((s) => {
+        reads++;
+        return { ...s, version: reported };
+      }, '127.0.0.1:8082'), // a real address, so proxy.status is also read by the poll loop, not just at bootstrap
+    );
+    await tick(200);
+    expect(app.proxy.version).toBe('1.2.3');
+    expect(reads).toBe(1); // bootstrap's refreshSide
+
+    reported = 5;
+    await tick(2500); // one poll at ~2 s
+    expect(reads).toBe(2); // the poll did read it…
+    expect(app.proxy.version).toBe('1.2.3'); // …and ignored the number
+
+    reported = null;
+    await tick(2500);
+    expect(reads).toBe(3);
+    expect(app.proxy.version).toBe('1.2.3');
+  });
+
   it.each([
     ['omits version (a core older than the field)', (s: Record<string, unknown>) => Object.fromEntries(Object.entries(s).filter(([k]) => k !== 'version'))],
     ['sends a non-string version', (s: Record<string, unknown>) => ({ ...s, version: 5 })],

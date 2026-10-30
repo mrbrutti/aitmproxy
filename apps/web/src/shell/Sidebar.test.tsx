@@ -118,8 +118,12 @@ describe('Sidebar Scripts count', () => {
 
   it('shows no count when script.list fails, and when the core does not offer it, and then calls nothing', async () => {
     const failed = mountScripts({ list: () => Promise.reject(new BusError('rhai host is not running')) });
-    await waitFor(() => expect(failed.app.toast()?.text).toBe('script.list: rhai host is not running'));
+    // Wait on what happened (the call was made and settled), not on a toast: the sidebar raises none.
+    await waitFor(() => expect(failed.calls).toContain('script.list'));
+    await waitFor(() => expect(scriptsStore(failed.app).loaded()).toBe(true));
     expect(count()).toBeNull();
+    // The count is a courtesy nobody asked for: a core with no rhai host must not greet every page load with an error toast.
+    expect(failed.app.toast()).toBeNull();
     cleanup();
 
     const { app, calls } = mountScripts({ tools: (all) => all.filter((t) => !t.name.startsWith('script.')) });
@@ -127,6 +131,13 @@ describe('Sidebar Scripts count', () => {
     await flush();
     expect(count()).toBeNull();
     expect(calls.filter((c) => c.startsWith('script.'))).toEqual([]);
+  });
+
+  it('shows no count for a script.list answer that is not a list', async () => {
+    const { app } = mountScripts({ list: () => Promise.resolve({ error: 'not a list' }) });
+    await waitFor(() => expect(scriptsStore(app).loaded()).toBe(true));
+    expect(count()).toBeNull();
+    expect(app.toast()).toBeNull();
   });
 
   it('reads script.list once on bootstrap, and not the findings', async () => {

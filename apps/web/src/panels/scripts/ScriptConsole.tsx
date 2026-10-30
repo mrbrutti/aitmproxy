@@ -17,7 +17,14 @@ export const ScriptConsole: Component<{ store: ScriptsStore }> = (props) => {
     <section class={css.console} aria-label="Console">
       <div class={css.sectionTitle}>
         <h3>Console</h3>
-        <Button variant="small" class={css.spacer} disabled={s.busy()} title="Re-read the scripts and their findings" onClick={() => void s.refresh()}>
+        {/* Never really `disabled`: while a call is in flight it is aria-disabled and ignores the click, so focus stays put. */}
+        <Button
+          variant="small"
+          class={`${css.spacer} ${css.guarded}`}
+          aria-disabled={s.busy() ? 'true' : undefined}
+          title="Re-read the scripts and their findings"
+          onClick={() => !s.busy() && void s.refresh()}
+        >
           Refresh
         </Button>
       </div>

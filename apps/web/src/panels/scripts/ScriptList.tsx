@@ -17,7 +17,8 @@ export const ScriptList: Component<{ store: ScriptsStore }> = (props) => {
     <section class={css.list} aria-label="Loaded scripts">
       <div class={css.sectionTitle}>
         <h3>Loaded</h3>
-        <Show when={s.listed()}>
+        {/* A row count is a fact only about a list that was read and has not since failed to re-read. */}
+        <Show when={s.listed() && !s.listError()}>
           <span class={css.n}>{s.rows().length}</span>
         </Show>
       </div>
@@ -83,7 +84,7 @@ export const ScriptList: Component<{ store: ScriptsStore }> = (props) => {
                   <Button
                     variant="small"
                     aria-label={`Reload ${row.name}`}
-                    class={css.reload}
+                    class={css.guarded}
                     disabled={!s.canReload()}
                     aria-disabled={s.busy() ? 'true' : undefined}
                     title={reason(s.canReload(), 'script.reload') ?? `Recompile ${row.name} from its file`}
