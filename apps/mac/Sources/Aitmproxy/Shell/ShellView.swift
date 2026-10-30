@@ -187,6 +187,10 @@ struct MainView: View {
                     VRule()
                     listPane(1)
                 }
+            } else if session.page == .connections {
+                // Viz-first Connection page: the waterfall replaces the flow table; the
+                // inspector opens on select. The dashboard band sits above (see above).
+                ConnectionWaterfall()
             } else {
                 flowTable
             }
