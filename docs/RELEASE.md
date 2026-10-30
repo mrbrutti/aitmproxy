@@ -7,7 +7,8 @@ the macOS assets into `SHA256SUMS`, **mirrors every asset to the public tap repo
 (`mrbrutti/homebrew-aitmproxy`) so downloads are tokenless, and writes the website
 manifest; and the public Homebrew tap's formula/cask are bumped out-of-band.
 
-A release produces, on a public GitHub Release for tag `v<ver>`:
+A release produces the following assets, attached to the source-repo Release for
+tag `v<ver>` and mirrored to the same-tag Release on the public tap repo:
 
 - Linux (per arch `x86_64` and `aarch64`): `aitm-<ver>-<triple>.tar.gz`,
   `aitm-<ver>-<arch>.deb`, `aitm-<ver>-<arch>.rpm` — built in CI.
@@ -31,7 +32,7 @@ If any changes, this runbook changes with it:
 1. **macOS is signed locally, not in CI (KEY #1).** The Developer ID cert and
    App Store Connect `.p8` key are Matt's identity and live only on his Mac;
    they are deliberately kept out of CI secrets. So CI builds Linux only, and
-   steps 3 below run on Matt's Mac.
+   step 3 below runs on Matt's Mac.
 2. **Binaries are public; the source repo is private (KEY #2, updated
    2026-10-30).** The website's download links must be fetchable by a tokenless
    visitor. The source repo `mrbrutti/aitmproxy` stays **private**; CI builds and
@@ -132,7 +133,8 @@ gh release upload v<ver> \
 ### 4. Re-run `finalize` so the checksums and manifest cover macOS
 
 Now that every asset (Linux from CI + macOS from step 3) is attached, re-run the
-`finalize` job via `workflow_dispatch` (input: `tag = v<ver>`). It downloads all
+`finalize` job via `workflow_dispatch` (inputs: `tag = v<ver>` and
+`finalize_only = true`, which skips the Linux build jobs). It downloads all
 Release assets, writes a combined `SHA256SUMS` (one line per asset) and uploads
 it, then runs `scripts/gen-downloads-manifest.sh` to regenerate
 `site/downloads.json` and commits it to `main` so `pages.yml` redeploys the

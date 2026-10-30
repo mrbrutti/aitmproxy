@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    Command, CommandHost, FlowId, Frontend, ParamDef, ParamSchema, Params, Registry, Sensitivity,
-    TypeDesc, Value,
+    Command, CommandHost, FlowId, ParamDef, ParamSchema, Params, Registry, Sensitivity, TypeDesc,
+    Value,
 };
 use aitm_poc::Severity;
 
@@ -522,7 +522,7 @@ impl Command for FindingsRemove {
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         // Operator/CLI-only: refuse the agent role here, independent of the D2
         // policy gate in `call_tool` (which also blocks it under Paused/ReadOnly).
-        if host.frontend() == Frontend::Mcp {
+        if !host.caller_is_trusted_control() {
             anyhow::bail!("findings.remove is operator/CLI-only");
         }
         let id = args.get_str("id")?;

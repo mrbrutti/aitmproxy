@@ -26,9 +26,10 @@ struct AppearanceSettings: View {
     }
 }
 
-/// A small sample window in the chosen accent: a sidebar, two tasks, a tag,
-/// a button, and a switch. It redraws as people pick a color.
-/// Swap the sample words for ones from this app.
+/// A small sample of aitmproxy's OWN surfaces in the chosen accent — a sidebar
+/// with a selected page, two flow rows (method + status badges, accent path link),
+/// and the primary button + Agent toggle. The accent lifts chrome and selection;
+/// the method/status hues are fixed data colours and stay put. Redraws on pick.
 private struct AccentPreview: View {
     private let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
 
@@ -44,59 +45,56 @@ private struct AccentPreview: View {
         .overlay(shape.strokeBorder(.separator, lineWidth: 1))
         .allowsHitTesting(false)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Preview of the accent color")
+        .accessibilityLabel("Preview of the accent colour on aitmproxy's own components")
     }
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: Space.xs) {
             HStack(spacing: Space.xs) {
-                ForEach(0..<3, id: \.self) { _ in
-                    Circle().fill(.quaternary).frame(width: 8, height: 8)
-                }
+                ProductMark().frame(width: 12, height: 12)
+                Text("aitmproxy").font(.caption.weight(.medium)).foregroundStyle(.primary)
             }
             .padding(.leading, Space.xs)
             .padding(.bottom, Space.sm)
-            sidebarRow("Inbox", symbol: "tray", selected: true)
-            sidebarRow("Today", symbol: "star", selected: false)
-            sidebarRow("Done", symbol: "checkmark.circle", selected: false)
+            sidebarRow("Overview", symbol: "chart.bar", selected: false)
+            sidebarRow("Connection Log", symbol: "point.3.connected.trianglepath.dotted", selected: true)
+            sidebarRow("Scan", symbol: "magnifyingglass", selected: false)
             Spacer(minLength: 0)
         }
         .padding(Space.sm)
-        .frame(width: 128)
+        .frame(width: 148)
         .background(.background.secondary)
     }
 
     private func sidebarRow(_ title: String, symbol: String, selected: Bool) -> some View {
         Label(title, systemImage: symbol)
-            .font(.callout)
-            .foregroundStyle(selected ? Palette.onAccent : .primary)
+            .font(.caption)
+            .foregroundStyle(selected ? Palette.accentText : .primary)
+            .lineLimit(1)
             .padding(.horizontal, Space.sm)
             .frame(maxWidth: .infinity, minHeight: 24, alignment: .leading)
-            .background(selected ? Palette.accent : .clear,
+            .background(selected ? Palette.accent.opacity(0.15) : .clear,
                         in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private var content: some View {
         VStack(alignment: .leading, spacing: Space.sm) {
-            HStack(alignment: .firstTextBaseline) {
-                Text("Inbox").font(.headline)
-                Spacer()
-                Text("1 left").font(.caption).foregroundStyle(Palette.accentText)
-            }
-            task("Pick a color", done: true)
-            task("Ship the first build", done: false, tag: "Today")
+            flowRow(method: "GET", pair: Tok.Method.get, host: "api.shop-staging.test",
+                    path: "/api/products", status: "200", statusColor: Tok.Status.success)
+            flowRow(method: "POST", pair: Tok.Method.post, host: "auth.shop-staging.test",
+                    path: "/api/auth/login", status: "paused", statusColor: Tok.Intercept.deep)
             Spacer(minLength: 0)
-            // Drawn, not real controls: the preview is a picture, and real
-            // controls turn gray when the window is not in front.
+            // Drawn, not real controls: the preview is a picture, and real controls
+            // turn gray when the window is not in front.
             HStack {
-                Label("Add Task", systemImage: "plus")
+                Text("Resume")
                     .font(.callout.weight(.medium))
                     .foregroundStyle(Palette.onAccent)
                     .padding(.horizontal, Space.md)
                     .frame(height: 24)
                     .background(Palette.accent, in: Capsule())
                 Spacer()
-                Text("Focus").font(.caption).foregroundStyle(.secondary)
+                Text("Agent").font(.caption).foregroundStyle(.secondary)
                 Capsule()
                     .fill(Palette.accent)
                     .frame(width: 28, height: 16)
@@ -108,24 +106,20 @@ private struct AccentPreview: View {
         .padding(Space.md)
     }
 
-    private func task(_ title: String, done: Bool, tag: String? = nil) -> some View {
+    private func flowRow(method: String, pair: ColorPair, host: String, path: String,
+                         status: String, statusColor: DynamicColor) -> some View {
         HStack(spacing: Space.sm) {
-            Image(systemName: done ? "checkmark.circle.fill" : "circle")
-                .foregroundStyle(done ? AnyShapeStyle(.tint) : AnyShapeStyle(.tertiary))
-            Text(title)
-                .strikethrough(done)
-                .foregroundStyle(done ? .secondary : .primary)
-            Spacer()
-            if let tag {
-                Text(tag)
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(Palette.accentText)
-                    .padding(.horizontal, Space.sm)
-                    .padding(.vertical, 2)
-                    .background(Palette.accent.opacity(0.15), in: Capsule())
-            }
+            Badge(text: method, pair: pair)
+            (Text(host).foregroundStyle(Tok.Ink.primary.color)
+                + Text(path).foregroundStyle(Palette.accentText))
+                .font(Tok.Face.data(Tok.Typography.Size.xs))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: Space.xs)
+            Text(status)
+                .font(Tok.Face.data(Tok.Typography.Size.xs, .medium))
+                .foregroundStyle(statusColor.color)
         }
-        .font(.callout)
     }
 }
 

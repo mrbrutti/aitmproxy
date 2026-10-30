@@ -26,11 +26,14 @@ reviewer can re-run it; findings are human-readable YAML records.
 
 ### The agent-run-PoC gate
 
-Running a PoC sends real exploit traffic, so it is a Sensitive action. Under the
-`ask` agent policy (`agent.status`) a `poc.run` from the agent frontend **parks for
-operator approval** (`agent.approve --request_id --allow`); under `readonly` or
-`paused` it does not run at all. Do not try to bypass the gate — confirm the
-operator wants the PoC executed and that the target is in authorized scope.
+Running a PoC sends real exploit traffic, so an agent frontend (MCP) may run
+`poc.run` **only if the operator opted in** with `poc.allow_agent_run: true` under
+`poc:` in `config.yaml` (off by default). Otherwise the call is refused with a
+message naming that key, and the operator runs the PoC from the web UI, TUI, macOS
+app or the one-shot CLI instead. `poc.run` is a Write-tier command, so the agent
+policy (`agent.status`) also applies: under `readonly` or `paused` it does not run
+at all. Do not try to bypass the gate — confirm the operator wants the PoC executed
+and that the target is in authorized scope.
 
 ## Inspect PoCs and artifacts
 

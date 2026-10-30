@@ -344,11 +344,24 @@ assert the macOS path routes through it (NE-AC3); no separate choke is added. Su
 
 - **Satisfies:** NE-AC8.
 - **Depends on:** Task 1, Task 11.
-- **Files:** `apps/mac/Extension/Sources/TransparentProxyProvider.swift` (modify).
-- **Change:** in `handleNewFlow`, exclude flows whose **source-app identity**
-  (audit-token signing identifier) is `aitm` or the embedded `obscura` (predicate
-  left to the builder within "not pid-based"); rely on wildcard rules already
-  excluding loopback (the bus, obscura↔core on 127.0.0.1).
+- **Files:** `apps/mac/Extension/Sources/TransparentProxyProvider.swift` (modify — the
+  two entry-point call sites) and `apps/mac/Extension/Sources/FlowHandoff.swift` (modify —
+  the `SelfExclusion` predicate, placed beside the sibling identity/auth helpers in the
+  same Extension target and testable from the DEBUG self-check; Files line expanded
+  2026-10-30 per the Task-12 spec-panel finding).
+- **Change:** in `handleNewFlow` **and** `handleNewUDPFlow`, exclude flows whose
+  **source app is signed by our Developer ID team** — the source-app **audit token**
+  resolved to a `SecCode` and checked against the team requirement (OU `995PCLM9KH`),
+  reusing Task 11's `PeerAuth.verifyPeer`. Keyed on the code signature, not pid and not a
+  guessed identifier string; rely on wildcard rules already excluding loopback (the bus,
+  obscura↔core on 127.0.0.1).
+- **Why by team code signature (security panel, 2026-10-30):** aitm and obscura are both
+  team-signed, so both are excluded regardless of their specific signing identifier — this
+  **eliminates** the self-DoS a guessed "aitm"/"obscura" string risked (a wrong guess would
+  silently self-capture and loop). It over-excludes any other `995PCLM9KH`-signed binary,
+  which in practice is only aitmproxy's own — acceptable; narrowing to aitm's full
+  designated requirement (spec D4 "aitm and obscura specifically") is a tracked GA-hardening
+  item. NE-AC8's live confirmation (zero self-/loopback flows) still happens at Task 18.
 - **Test / pass condition (Terminal panel, real Mac):** run a capture session with
   the core dialing upstream and obscura browsing; inspect the flow list and
   confirm **no** flow is attributed to `aitm` or `obscura` and no loopback flow
@@ -360,9 +373,17 @@ assert the macOS path routes through it (NE-AC3); no separate choke is added. Su
 - **Satisfies:** NE-AC9; NE-AC10 (end-to-end); NE-AC11 (end-to-end).
 - **Depends on:** Task 1, Task 7 (the Rust gate), Task 11.
 - **Files:** `apps/mac/Sources/Aitmproxy/Bus/ExtensionController.swift` (create),
-  `apps/mac/Sources/Aitmproxy/Bus/CoreHealthState.swift` (modify — add the
-  capture-capability state beside core health), `apps/mac/Sources/Aitmproxy/App.swift`
-  (modify — submit the activation request on launch, operator-triggered only).
+  `apps/mac/Sources/Aitmproxy/Bus/CoreHealthState.swift` (modify — the
+  capture-capability property beside core health). **Files-line expanded 2026-10-30 per
+  the Task-13 panel:** `apps/mac/Sources/AitmproxyKit/CaptureCapability.swift` (create — the
+  pure `CaptureCapability` state machine + `CaptureExtension` bundle gate, in AitmproxyKit
+  so it is unit-testable; the `Aitmproxy` executable has no test target),
+  `apps/mac/Tests/AitmproxyKitTests/CaptureCapabilityTests.swift` (create — 14 tests), and
+  `apps/mac/Sources/Aitmproxy/Shell/ShellView.swift` (modify — the single operator
+  activation call site in the launch `.task`). **`App.swift` is deliberately UNTOUCHED**
+  (the orchestrator required minimal App.swift because another session was rewriting it;
+  `ShellView`'s `.task` is the real launch surface and there is exactly one `Window`, so
+  one controller).
 - **Change:** submit `OSSystemExtensionRequest.activationRequest` to
   `OSSystemExtensionManager.shared` early; keep the app alive while pending;
   surface `CaptureCapability` transitions `extension-not-installed → pending-approval
@@ -428,7 +449,14 @@ assert the macOS path routes through it (NE-AC3); no separate choke is added. Su
 - **Satisfies:** NE-AC14.
 - **Depends on:** Task 1, Task 11.
 - **Files:** `apps/mac/Sources/Aitmproxy/Bus/ExtensionController.swift` (modify),
-  `apps/mac/Extension/Info.plist` (modify — bump `CFBundleVersion`).
+  `apps/mac/Extension/Info.plist` (modify — `CFBundleVersion` comment; `build.sh`
+  already stamps `__BUILD__` with a timestamp, so no literal bump is needed).
+  Beyond the declared list (recorded here per workflow): the settle/backoff/
+  connected-check schedule is extracted as the pure, unit-tested
+  `TunnelReconcilePolicy` in `apps/mac/Sources/AitmproxyKit/CaptureCapability.swift`
+  (modify), with coverage in
+  `apps/mac/Tests/AitmproxyKitTests/CaptureCapabilityTests.swift` (modify) — keeping
+  the framework-facing controller thin, matching the Task-13 split.
 - **Change:** `actionForReplacingExtension` returns `.replace`; after a
   replacement, reconcile the saved `NETransparentProxyManager` configuration
   (settle delay + connected-check) so a version bump does not leave it disabled
@@ -446,7 +474,17 @@ assert the macOS path routes through it (NE-AC3); no separate choke is added. Su
 - **Depends on:** Task 1, Task 11.
 - **Files:** `apps/mac/Sources/Aitmproxy/Bus/ExtensionController.swift` (modify),
   `apps/mac/Sources/Aitmproxy/SettingsView.swift` (modify — indicator + uninstall
-  control).
+  control). Beyond the declared list (recorded here per workflow):
+  `apps/mac/Sources/AitmproxyKit/CaptureCapability.swift` (modify — the `.uninstalled`
+  event and the `isCaptureOn` / `isInstalledOrInstalling` / `canUninstall` predicates
+  the indicator and button read) + its tests in
+  `apps/mac/Tests/AitmproxyKitTests/CaptureCapabilityTests.swift` (modify); and
+  `apps/mac/Sources/Aitmproxy/Bus/CoreHealthState.swift` (modify — a weak
+  `extensionController` handle, published by `start()`, so the Settings window, a
+  separate scene, can reach the controller to uninstall without a global singleton
+  and without touching `ShellView`). The build owner replaced the coder's first cut
+  (a `static weak var current` on the controller) with this handle: same operator-only
+  reachability, no global mutable state.
 - **Change:** show a visible "capture is on" indicator while the extension is
   active and attached; an uninstall path that submits `deactivationRequest` and
   removes the `NETransparentProxyManager` configuration. Indicator obeys the
@@ -475,9 +513,38 @@ assert the macOS path routes through it (NE-AC3); no separate choke is added. Su
   3. **Out-of-scope** traffic is **not** captured.
   4. With the core stopped, ordinary browsing is **unaffected** (fail-open,
      NE-AC5).
-  Pass: all four observed on a real Mac — the milestone's "real packets, not
+  5. **CROSS-UI (Matt's explicit mandate, 2026-10-30):** the captured in-scope flow
+     (HTTPS + the L4/UDP flow) must appear in **all three UIs reading the same core**:
+     (a) the **macOS app**, (b) **`aitm web`**, (c) **`aitm tui`** — not just at the
+     provider. Capture proof + a shot/assertion from each UI.
+  Pass: all five observed on a real Mac — the milestone's "real packets, not
   screenshots" bar.
-- **Done when:** all four conditions hold (Terminal panel).
+- **REPEATABLE E2E SCRIPT (Matt's mandate, 2026-10-30):** everything about the NE that
+  CAN be automated is scripted + asserted on ground truth under **`tests/e2e/ne/`**
+  (aligning with the `e2e-test-arch` `tests/e2e/` runner once it lands): build/sign/
+  notarize/install checks (codesign -d entitlements, stapler/spctl, systemextensionsctl
+  parse), the provider↔core handoff (the Rust `CaptureListener` round-trip, already in
+  `macos_capture_*` tests), loop-avoidance self-exclusion, and the capability state
+  machine (the `CaptureCapabilityTests`). The **ONLY** manual step allowed is the **two
+  System Settings approval clicks** (Apple requires a human); the script pauses for them
+  and resumes, asserting `[activated enabled]` + the cross-UI appearance afterward.
+  **Depends on:** the `e2e-test-arch` runner + the orchestrator's core-side rendezvous
+  writer + Task-2 scope-spec emitter landing first.
+- **LIVE-VERIFICATION CARRY-FORWARDS (from the 16/17 panel, 2026-10-30):**
+  - Confirm whether a real Mac emits a transient `NEVPNStatus.invalid` during a version-bump
+    replacement. If it does NOT, map `.invalid` to a degrade in
+    `ExtensionController.applyTunnelStatus` so an externally-removed proxy configuration stops
+    reading "Capture is on" (today `.invalid` is advisory to avoid a sticky degrade on a
+    replacement blip).
+  - Confirm whether `OSSystemExtensionRequest` deactivation is ever human-gated (a System
+    Settings prompt). If NEVER, harden `deactivate()` with a bounded timeout guarded by
+    `deactivation != nil` (so a late real callback cannot double-resume) against a dropped
+    terminal callback; if it IS human-gated, surface a "needs approval" state during uninstall
+    instead of a silent "Removing…".
+  - Confirm the `NEVPNError.code → TunnelFailure` classification against real reconcile
+    failures — especially that refusing "Add Proxy Configurations" is permanent (not retried).
+- **Done when:** all five conditions hold on a real Mac AND the repeatable `tests/e2e/ne/`
+  script passes every automatable assertion (Terminal panel).
 
 ### Task 19: Mandatory Stage-6 security review
 
@@ -504,7 +571,35 @@ Kept by the main session during stage 6. One row per finding.
 | 14 | security, quality | Minor | `codesign … \| grep -v … \|\| true` swallows codesign's exit status; a failed restricted-entitlement sign still prints "installed (signed)" | fixed — new `cs()` wrapper aborts the build on codesign failure |
 | 14 | quality | Minor | "no sysex embedded" hint named `SIGN_IDENTITY`, but the code reads `NE_SIGN_IDENTITY` | fixed — hint corrected to `NE_SIGN_IDENTITY` |
 | 10 | quality | Minor | Deprecated `NENetworkRule(remoteNetwork:…)` init (macOS 15) emits a build warning; Task 10 says "not deprecated NWHostEndpoint" | fixed — switched to the non-deprecated `remoteNetworkEndpoint:` init; `swiftc` compiles clean (no warning) |
-| 10 | spec | Minor | `swiftc` build replaces the plan's `apps/mac/Extension/Aitmproxy.xcodeproj` (spec D6) | **pending Matt's ratification** — repo convention is "no Xcode project" (apps/mac/CLAUDE.md) and the Task-1 spike proved swiftc+manual codesign handles the `-systemextension` entitlement; recommend amending spec D6 to swiftc |
+| 10 | spec | Minor | `swiftc` build replaces the plan's `apps/mac/Extension/Aitmproxy.xcodeproj` (spec D6) | **accepted by Matt 2026-10-30** (via orchestrator) — repo is SwiftPM-only ("no Xcode project", apps/mac/CLAUDE.md) and the Task-1 spike proved swiftc + manual codesign handles the `-systemextension` entitlement on Xcode 27.1; spec D6 to be amended to swiftc |
+| 11 | spec, security, quality | n/a | **PASS panel 2026-10-30** — no Critical/Important; security signed off the code + model (NE-AC6/AC7). | — |
+| 11 | quality | Minor | `decodeCore` was stricter than its forward-compat doc (non-object payload tore the channel down) | fixed — accepts any single-key object as ignored |
+| 11 | quality | Minor | Unowned `TODO(tighten)` on the team-wide requirement | fixed — TODO now references the plan Review log / Task 11 hardening |
+| 11 | quality | Minor | ~680-line DEBUG self-check co-located in `FlowHandoff.swift` | noted in-code as deliberate (no separate test target; `#if DEBUG` excludes it from release); splitting tracked as cleanup |
+| 11 | security | Minor | Code requirement is team-wide (`OU=995PCLM9KH`), not aitm's full designated requirement | **accepted (hardening TODO)** — plan Task 11 specifies the team requirement; narrow to aitm's identifier before GA (TODO in code) |
+| 11 | security | Minor | Inherent `LOCAL_PEERTOKEN` TOCTOU (verified core passing its fd on) — outside threat model; pidversion defeats pid-reuse | **accepted** — confirm at Task 18 the real core passes no accepted fds to unverified children |
+| 11 | security | Minor | `claim()` can block the NE queue up to ~4s under a wedged (verified) core before fail-open | **accepted (low priority)** — bounded + self-gated; optional move off-queue / lower timeout as hardening |
+| 11 | security | Minor | No cap on concurrent claimed flows (threads/memory per flow in the root sysex) | **accepted (hardening TODO)** — add a soft cap (fail open past it) as a follow-up |
+| 11 | security | Minor (info) | `FD_CLOEXEC` set result ignored (no exec in the sysex today) | accepted — informational |
+| 11 | spec, security, quality | Minor | Live decoy/real-core round-trip + core-side rendezvous writer + scope-spec emitter not exercised here | **deferred by design** — live decoy run → Task 18; rendezvous writer + scope emitter are core-side follow-ups (flagged in code + PR #100) |
+| 12 | spec | Important | `SelfExclusion` added to `FlowHandoff.swift`, not named in Task 12's Files list (undeclared file) | fixed — Task 12 Files line expanded to declare `FlowHandoff.swift` (placement beside the sibling identity helpers, testable from the DEBUG self-check); no cross-task leak |
+| 12 | security | Important | Self-exclusion rested on *guessed* signing identifiers; a wrong/under-match silently self-captures → loop (self-DoS) | **FIXED (orchestrator override of the tracked-acceptance)** — re-hardened to check the source-app **audit token** against the team requirement (OU `995PCLM9KH`) via Task 11's `PeerAuth.verifyPeer`; aitm/obscura are both team-signed so the guess is eliminated. Security panel re-run for a clean sign-off |
+| 12 | security | Minor | Over-match: now excludes ANY `995PCLM9KH`-signed binary, broader than spec D4 "aitm/obscura specifically" | **accepted** — in practice the only team-signed binaries a user runs are aitmproxy's own; GA-narrowing uses the decoupled `SelfExclusion.selfRequirement` and MUST cover both aitm AND obscura designated requirements (next row) |
+| 12 | security (re-review) | Minor | Self-exclusion reused `PeerAuth.coreRequirement`; narrowing that to aitm-only at GA would silently stop excluding obscura → loop | **FIXED (pre-merge)** — gave self-exclusion its own `SelfExclusion.selfRequirement` constant, decoupled from the core-peer requirement, so the two GA-narrowings cannot entangle; obscura stays excluded. Security re-review verdict: **PASS / clean sign-off** |
+| 12 | security | Minor | No automated unit test for `isSelf` | **accepted** — it is now a `SecCode` call (needs a real process), not a pure predicate; live confirmation of zero self/loopback flows at Task 18 |
+| 13 | spec, security, quality | n/a | **PASS panel 2026-10-30** — all three PASS, no Critical/Important. NE-AC9/10/11 met at the code level; live `[Mac]` checks HELD to Task 18. | — |
+| 13 | spec, quality, security | Minor | Declared `App.swift` left untouched; activation wiring in `ShellView.swift`; pure state machine + test in `AitmproxyKit`, not the declared files | **accepted** — Files line expanded above; App.swift untouched by the orchestrator's instruction (another session rewrites it); `Aitmproxy` executable has no test target so pure logic went to AitmproxyKit (mirrors `CoreHealth`). Not a cross-task leak |
+| 13 | quality | Minor | `applyTunnelStatus` called synchronously after `startVPNTunnel` is a no-op in the common path | **FIXED** — comment added noting it only catches a reused already-connected manager |
+| 13 | quality | Minor | `applying(.activated)`/`.needsUserApproval` reset away from `.capturing` unguarded (asymmetric with tunnel events) | **FIXED (doc)** — `applying(_:)` doc now states activation events are authoritative and intentionally override `.capturing` (a real re-approval), while tunnel events are advisory |
+| 13 | security | Minor | "single call site" of `ExtensionController.start()` is convention, not compiler-enforced; a future second caller could reach activation | **accepted (non-exploitable)** — the reviewer confirmed FOUR independent layers protect NE-AC11 (one call site; agents can't drive GUI lifecycle; any future bus path still hits the Rust `allow_agent_sysex_install` gate; macOS requires interactive approval). Strong in-code comment present; a CI/test grep guard is an optional future hardening |
+| 16, 17 | spec, security, quality | n/a | **PASS panel 2026-10-30** — all three PASS, no Critical/Important. NE-AC14/AC15 met at the code level; live `[Mac]` checks HELD to Task 18. The build-owner's singleton→`CoreHealthState.extensionController` weak handle was reviewed clean ("the right idiom… no cleaner approach worth the churn"); operator-only invariant confirmed (grep: no bus/MCP/Session/palette path to `start()`/`uninstall()`/the handle). | — |
+| 16, 17 | quality | Minor | `waitUntilConnected` duplicated its connected-check inside and after the loop | **FIXED (verified swift test green)** — single sample site (`for sample in 0...pollCount`, sleep only when `sample < pollCount`); same sample/sleep counts, no behaviour change |
+| 16, 17 | quality | Minor | `NEVPNStatus.invalid` folds into `.tunnelDisconnected`, so an externally-removed config can still read "Capture is on" | **documented + Task-18 carry-forward** — kept advisory to avoid a *sticky* degrade on a transient mid-replacement `.invalid`; code comment + a Task 18 live item to map `.invalid`→degrade if a real Mac never emits it transiently |
+| 16, 17 | quality | Minor | Two test gaps: `.capturing.applying(.tunnelConnected)` idempotency; `TunnelReconcilePolicy.pollCount` `max(1,…)` floor | **FIXED (verified)** — added `anAlreadyCapturingStateIsUnchangedByAnotherTunnelConnectedEvent` + `theConnectedCheckAlwaysSamplesAtLeastOnce` (318 tests green) |
+| 16, 17 | security | Minor | Deactivation continuation has no timeout; a dropped terminal callback would hang `uninstall()` with the activity assertion held | **accepted + Task-18 carry-forward** — `OSSystemExtensionRequest` delivers exactly one terminal callback and deactivation may itself wait on a human prompt (a blind timeout could fail a legitimate wait); code comment records the decision; revisit with a guarded timeout at Task 18 if deactivation proves never human-gated |
+| 16, 17 | security | Minor (info) | `removeSavedConfiguration` left `tunnelManager` non-nil on a mid-loop throw | **FIXED** — `tunnelManager = nil` up front (torn down regardless) |
+| 16, 17 | spec | Minor | `isTransient` leash-#58 classifier was pure logic but untested in app-target code | **FIXED (verified)** — hoisted the retry policy to `TunnelFailure` in AitmproxyKit with a table test; `ExtensionController` maps `NEVPNError.code`→`TunnelFailure` via a compiler-checked exhaustive switch |
+| 16, 17 | spec | Minor (info) | `build.sh` stamps `CFBundleVersion` at minute resolution; two builds in one minute would not trigger a replace | **accepted (out of range)** — `build.sh` is not a Task 16/17 file; a rebuild+reactivate cycle exceeds a minute. Note for the orchestrator: switch to `%Y%m%d%H%M%S` |
 
 ## Shipped
 

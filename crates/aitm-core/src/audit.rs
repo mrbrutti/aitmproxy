@@ -104,6 +104,10 @@ impl AuditEntry {
 /// The lower-case wire label for a frontend role, as it appears in an entry's
 /// `origin`. Exhaustive over [`Frontend`]'s variants so a new role must be named
 /// here deliberately.
+#[deny(
+    clippy::wildcard_enum_match_arm,
+    clippy::match_wildcard_for_single_variants
+)]
 pub fn origin_label(frontend: Frontend) -> &'static str {
     match frontend {
         Frontend::Cli => "cli",

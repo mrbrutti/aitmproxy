@@ -75,25 +75,23 @@
 
   <article class="article">
     <h1 class="display">Getting started</h1>
-    <p class="lead">Ten minutes from an empty terminal to a request held in mid-air and edited, first by you, then by an assistant. Everything here works the same in the macOS app, the web UI and the terminal UI.</p>
+    <p class="lead">Ten minutes from an empty terminal to a request held in mid-air and edited, first by you in a UI, then by an assistant. The same commands sit behind the macOS app, the web UI, the terminal UI and the MCP server.</p>
 
     <div class="prose">
       <h2 id="install">Install</h2>
-      <p>aitmproxy is open source and ships for macOS and Linux; Windows is not supported. The <code>aitm</code> command bundles the proxy, the terminal UI, the web UI, the embedded browser and the MCP server. Pick the path for your OS — the <a href="download.html">download page</a> lists every package and checksum for v0.5.0.</p>
+      <p>aitmproxy ships for macOS and Linux; Windows is not supported. The <code>aitm</code> command is the core: it runs the proxy, serves the web UI (<code>aitm web</code>), the terminal UI (<code>aitm tui</code>) and the MCP server, and runs one-shot commands. The embedded browser is a separate engine that <code>aitm</code> finds beside itself; the macOS app, the Linux packages and the release tarballs bundle it. Pick the path for your OS — the <a href="download.html">download page</a> lists every package and checksum for v0.5.0.</p>
 
       <h3 id="install-macos">macOS (Apple Silicon)</h3>
-      <p>Install from the project's public Homebrew tap — no account or token needed.</p>
+      <p>Install from the project's public Homebrew tap — no account or token needed. The formula and the app are Apple Silicon only, and the app needs macOS 26 or later. The app bundles its own core, so it does not need the formula.</p>
       <figure class="code" data-reveal>
         <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
 <pre><code><span class="pr">$ </span>brew tap mrbrutti/aitmproxy
-<span class="pr">$ </span>brew install aitm                 <span class="out"># CLI + web + TUI</span>
-<span class="pr">$ </span>brew install --cask aitmproxy     <span class="out"># the macOS app</span>
-<span class="pr">$ </span>aitm --version
-<span class="out">aitm 0.5.0 (unsafe: 0)</span></code></pre>
+<span class="pr">$ </span>brew install aitm                 <span class="out"># the core: CLI, web UI, TUI, MCP</span>
+<span class="pr">$ </span>brew install --cask aitmproxy     <span class="out"># the macOS app, self-contained</span></code></pre>
       </figure>
 
       <h3 id="install-linux">Linux (x86-64 and aarch64)</h3>
-      <p>Install the native package for your distribution. It places <code>aitm</code> and <code>aitm-tui</code> on your <code>PATH</code> (installed under <code>/usr/lib/aitmproxy</code>, symlinked from <code>/usr/bin</code>), with the embedded browser alongside.</p>
+      <p>Download the package for your distribution and CPU from the <a href="download.html">download page</a> (the <code>.deb</code> comes as <code>amd64</code> or <code>arm64</code>, the <code>.rpm</code> as <code>x86_64</code> or <code>aarch64</code>), then install it. It places <code>aitm</code> and <code>aitm-tui</code> on your <code>PATH</code> (installed under <code>/usr/lib/aitmproxy</code>, symlinked from <code>/usr/bin</code>), with the embedded browser alongside.</p>
       <figure class="code" data-reveal>
         <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
 <pre><code><span class="pr">$ </span>sudo apt install ./aitm-0.5.0-amd64.deb     <span class="out"># Debian / Ubuntu</span>
@@ -101,109 +99,135 @@
       </figure>
 
       <h3 id="install-cargo">Cargo, or from source</h3>
-      <p>With a recent Rust toolchain, install the binary directly. A bare build produces <code>aitm</code>; the packaged builds above add <code>aitm-tui</code> and the browser.</p>
+      <p>The source repository is private, so this needs git credentials with access to it, and Rust 1.97 or newer. A bare build produces only <code>aitm</code>: no <code>aitm-tui</code>, no browser engine, and no built web UI (<code>aitm web</code> serves a placeholder until the web app is built). Prefer the packages above unless you are developing.</p>
       <figure class="code" data-reveal>
         <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
 <pre><code><span class="pr">$ </span>cargo install --git https://github.com/mrbrutti/aitmproxy aitm</code></pre>
       </figure>
 
       <h2 id="trust">Trust the certificate</h2>
-      <p>To read HTTPS, aitmproxy terminates TLS with a certificate authority it generates on your machine, for your machine. Nothing leaves your computer. Before browsers and apps will accept it, that CA must be trusted.</p>
+      <p>To read HTTPS, aitmproxy terminates TLS with a certificate authority it generates on your machine, for your machine. The CA key stays there; <code>ca export</code> writes the certificate only. Before browsers and apps will accept it, that CA must be trusted. The embedded browser already trusts it and needs no install.</p>
       <figure class="code" data-reveal>
         <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
 <pre><code><span class="pr">$ </span>aitm ca install
-<span class="out">aitmproxy local CA   created just now   fingerprint 3A:9F:…:C2</span>
-<span class="out">install into login keychain? [y/N] </span><span class="in">y</span>
-<span class="out">login keychain       trusted</span>
+<span class="out">Install the aitmproxy root CA (SHA-256 3A:9F:…:C2) into /Users/you/Library/Keychains/login.keychain-db (scope user)? Every TLS client that uses that store will then trust certificates this proxy mints. (The embedded obscura browser is unaffected; it trusts the CA via --ca-cert.) [y/N] </span><span class="in">y</span>
+<span class="out">{</span>
+<span class="out">  "changed": true,</span>
+<span class="out">  "platform": "macos",</span>
+<span class="out">  "scope": "user",</span>
+<span class="out">  …</span>
+<span class="out">}</span>
 <span class="pr">$ </span>aitm ca status
-<span class="out">login keychain       trusted</span>
-<span class="out">system keychain      not installed</span></code></pre>
+<span class="out">{</span>
+<span class="out">  "exists": true,</span>
+<span class="out">  "fingerprint_sha256": "3A:9F:…:C2",</span>
+<span class="out">  "stores": {</span>
+<span class="out">    "system": { "installed": "absent", "trusted": "unknown", … },</span>
+<span class="out">    "user": { "installed": "present", "trusted": "unknown", … }</span>
+<span class="out">  },</span>
+<span class="out">  …</span>
+<span class="out">}</span></code></pre>
       </figure>
+      <p>The <code>ca</code> commands print their result as JSON (shortened above). <code>ca install</code> and <code>ca uninstall</code> ask before they touch a trust store; without a terminal, pass <code>--yes</code> to confirm, and <code>--dry_run</code> lists what would run and changes nothing. On macOS the default scope is the login keychain, and <code>ca status</code> reports whether the certificate is present, not whether its trust settings are right, so confirm <em>Always Trust</em> in Keychain Access. Linux has no per-user store: its scope is <code>system</code>, which writes to the system ca-certificates anchors and so needs the privileges for that.</p>
       <div class="callout">
-        <p><strong>By agent:</strong> an assistant connected over MCP can call <code>ca.status()</code> and <code>ca.export()</code>, but <code>ca.install</code> is a human-only command. Trust decisions stay with the person at the keyboard.</p>
+        <p><strong>By agent:</strong> an assistant connected over MCP can call <code>ca.status()</code> and <code>ca.export()</code> any time, and <code>ca.install({ dry_run: true })</code> to preview. A real <code>ca.install</code> or <code>ca.uninstall</code> is refused under the default agent policy, and even under the <code>all</code> policy unless you also set <code>ca.allow_agent_install: true</code> in <code>config.yaml</code>. Trust decisions stay with the person at the keyboard.</p>
       </div>
-      <p>For a device that is not this machine (a phone, a VM), export the certificate with <code>aitm ca export --out aitm-ca.pem</code> and install it there by the device's usual means. Hosts that pin their certificates can be excluded with <a href="features.html#tls">TLS passthrough</a>.</p>
+      <p>For a device that is not this machine (a phone, a VM), export the certificate with <code>aitm ca export --out aitm-ca.pem</code> (it refuses to overwrite an existing file) and install it there by the device's usual means. Hosts that pin their certificates can be excluded with <a href="features.html#tls">TLS passthrough</a>.</p>
 
       <h2 id="capture">Capture</h2>
-      <p>Start the proxy. It listens on <code>127.0.0.1:8080</code> and serves the web UI on <code>127.0.0.1:8082</code>. Point a browser, a simulator or your app at the proxy and flows start arriving.</p>
+      <p>Run the proxy with a UI. <code>aitm web</code> listens for traffic on <code>127.0.0.1:8080</code> and serves the web UI on <code>127.0.0.1:8082</code>. It prints a one-time link carrying the web UI's token; you open it yourself, because nothing is opened for you. <code>aitm tui</code> runs the same proxy with the terminal UI in one process. Point a browser, a simulator or your app at the proxy and flows start arriving.</p>
       <figure class="code" data-reveal>
         <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="pr">$ </span>aitm start
-<span class="out">proxy    http://127.0.0.1:8080</span>
-<span class="out">web ui   http://127.0.0.1:8082</span>
-<span class="out">mcp      stdio (run `aitm mcp` from your assistant)</span>
-<span class="pr">$ </span>curl -x http://127.0.0.1:8080 https://shop.example.com/api/products?page=2
-<span class="pr">$ </span>aitm flow list --last 3
-<span class="out">42  GET   /api/users/me          200   12 ms</span>
-<span class="out">41  POST  /api/cart/items        200  198 ms</span>
-<span class="out">40  GET   /api/products?page=2   200   38 ms</span></code></pre>
+<pre><code><span class="pr">$ </span>aitm web
+<span class="out">web UI (agent): http://127.0.0.1:8082/#t=…</span>
+<span class="c"># in another terminal</span>
+<span class="pr">$ </span>curl --cacert aitm-ca.pem -x http://127.0.0.1:8080 https://example.com/</code></pre>
       </figure>
-      <p>The macOS app and the terminal UI (<code>aitm tui</code>) show the same list live. Select a flow to read the request and response, headers and body, timing and the TLS details of the connection.</p>
+      <p>The <code>--cacert</code> file is the PEM from <code>aitm ca export --out aitm-ca.pem</code>; leave it off if the client already uses the trust store you installed the CA into. Capture is passive and needs no scope. Scope gates the active tools (replay, <code>request.send</code>, the browser, the scanner, PoC runs), and the UIs refuse to act on a held flow whose host is not in scope. List your targets under <code>scope.entries</code> in <code>config.yaml</code> (<code>~/Library/Application Support/aitmproxy/config.yaml</code> on macOS, <code>~/.config/aitmproxy/config.yaml</code> on Linux):</p>
+      <figure class="code" data-reveal>
+        <figcaption><span>config.yaml</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="yk">scope:</span>
+  <span class="yk">entries:</span> [<span class="s">"shop.example.com"</span>, <span class="s">"*.staging.example.com"</span>]</code></pre>
+      </figure>
+      <p>The macOS app and the terminal UI show the same list live. Select a flow to read the request and response, headers and body, timing and the TLS details of the connection. The keys that matter for the next section:</p>
       <table>
-        <thead><tr><th>Shortcut</th><th>Action</th></tr></thead>
+        <thead><tr><th>Action</th><th>Web UI</th><th>Terminal UI</th><th>macOS app</th></tr></thead>
         <tbody>
-          <tr><td><kbd>/</kbd></td><td>Filter flows by method, host, path or status</td></tr>
-          <tr><td><kbd>↩</kbd></td><td>Resume the selected held flow</td></tr>
-          <tr><td><kbd>⌫</kbd></td><td>Drop the selected held flow</td></tr>
-          <tr><td><kbd>R</kbd></td><td>Replay the selected flow</td></tr>
-          <tr><td><kbd>I</kbd></td><td>Arm interception for the selected flow's path</td></tr>
+          <tr><td>Arm or disarm interception</td><td><kbd>I</kbd></td><td><kbd>i</kbd></td><td><kbd>I</kbd></td></tr>
+          <tr><td>Edit the held request</td><td><kbd>E</kbd></td><td><kbd>e</kbd></td><td><kbd>E</kbd></td></tr>
+          <tr><td>Resume the held flow (Apply &amp; Resume once edited)</td><td><kbd>⌘↩</kbd></td><td><kbd>a</kbd>, or <kbd>Ctrl-S</kbd> / <kbd>F5</kbd> in the editor</td><td><kbd>⌘↩</kbd></td></tr>
+          <tr><td>Kill the held flow</td><td><kbd>D</kbd> or <kbd>⌘\</kbd></td><td><kbd>d</kbd> or <kbd>x</kbd></td><td><kbd>⌘\</kbd></td></tr>
+          <tr><td>Replay the selected flow</td><td><kbd>R</kbd></td><td><kbd>r</kbd></td><td><kbd>R</kbd></td></tr>
+          <tr><td>Filter flows</td><td><kbd>⌘F</kbd></td><td><kbd>/</kbd></td><td><kbd>⌘F</kbd></td></tr>
         </tbody>
       </table>
+      <p>In the web UI ⌘ is <kbd>Ctrl</kbd> off macOS, and <kbd>⌘K</kbd> opens a command palette. In the terminal UI <kbd>?</kbd> lists every key and <kbd>:</kbd> opens the palette.</p>
 
       <h2 id="intercept">Intercept and edit</h2>
-      <p>Interception pauses a request in mid-air. Add a rule for the traffic you care about, trigger it from the app, and the flow appears as <em>armed</em>: readable and editable, going nowhere until you say so.</p>
-      <figure class="code" data-reveal>
-        <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="pr">$ </span>aitm intercept add --match <span class="s">'POST /api/cart/*'</span>
-<span class="out">rule r1 armed · POST /api/cart/*</span>
-<span class="c"># …add something to the cart in the app…</span>
-<span class="pr">$ </span>aitm flow list --held
-<span class="out">41  POST  /api/cart/items  armed  —</span>
-<span class="pr">$ </span>aitm flow show --id 41 --body
-<span class="out">{ "sku": "A-1042", "qty": 1 }</span>
-<span class="pr">$ </span>aitm flow mutate --id 41 --set-body <span class="s">'{"qty":999}'</span>
-<span class="out">flow 41 body updated (27 B)</span>
-<span class="pr">$ </span>aitm flow resume --id 41
-<span class="out">flow 41 → 200 in 212 ms</span></code></pre>
-      </figure>
-      <p>In the app, the same four moves are: select the held row, edit the body in the detail pane, press <kbd>↩</kbd> to resume or <kbd>⌫</kbd> to drop. Response interception works the same way; add <code>--hold response</code> to the rule and the response pauses on its way back.</p>
+      <p>Interception parks a request before it leaves the proxy: readable and editable, going nowhere until you resume or kill it. You do it from a UI, because the web UI, the terminal UI and the macOS app are attached to the running proxy.</p>
+      <ol>
+        <li>Open a UI: the link <code>aitm web</code> printed, <code>aitm tui</code>, or the macOS app.</li>
+        <li>Press <kbd>I</kbd> to arm interception. The web UI shows a bar reading <em>Intercept armed — every request pauses here</em>. Armed with no rules, every new request is held at the request phase; responses are not.</li>
+        <li>Trigger the traffic from your app. Held requests show as paused, counted in the bar. Select one.</li>
+        <li>Press <kbd>E</kbd> (<kbd>e</kbd> in the terminal UI) and edit the held request: its headers, the raw request or the body. Nothing is sent yet. In the web UI the edit bar counts your pending edits, and <em>Apply</em> alone changes the held request without releasing it.</li>
+        <li>Release it with <em>Apply &amp; Resume</em> (<kbd>⌘↩</kbd>), which sends your edit and then lets the request go. In the terminal UI press <kbd>Ctrl-S</kbd> or <kbd>F5</kbd> inside the editor. Or kill it (<kbd>⌘\</kbd>, or <kbd>d</kbd> in the terminal UI); the web UI's Kill menu offers <em>Reset connection</em>, <em>Respond 429 Too Many Requests</em> and <em>Respond 503 Service Unavailable</em>.</li>
+      </ol>
+      <p>A UI will not edit, replay or kill a flow whose host is out of scope; it says <em>Out of scope — add &lt;host&gt; to scope to act</em>. Add the host to scope first, from the Scope panel or <code>scope.entries</code> in <code>config.yaml</code>.</p>
+      <div class="callout">
+        <p><strong>The CLI is one-shot.</strong> <code>aitm &lt;family&gt; &lt;verb&gt;</code> builds its own empty core, runs one command and exits. It does not connect to a proxy you started with <code>aitm</code>, <code>aitm web</code> or <code>aitm tui</code>, so <code>aitm flow list</code>, <code>aitm flow mutate</code> and <code>aitm flow resume</code> cannot see or release that proxy's held flows. Use the one-shot form for commands that stand alone: <code>ca</code>, <code>config get</code>, <code>request send</code>, <code>poc run</code>, <code>findings list</code>, <code>script validate</code>. <code>scan discover</code> is not on that list: it needs the running core's embedded browser, which a one-shot process does not have.</p>
+      </div>
+      <p>To hold only some traffic, interception takes rules: a method, a host, a URL pattern and a phase (<code>request</code>, <code>response</code>, <code>ws_frame</code> or <code>any</code>). An assistant sets them with <code>flow.intercept</code>, below; the web UI's <em>Rules…</em> button is disabled for now. A rule with phase <code>response</code> parks the response on its way back, and an edit to a parked response may also set <code>status</code>.</p>
 
       <h3 id="by-agent">The same thing, by agent</h3>
-      <p>Connect an assistant to <code>aitm mcp</code> and it gets the same commands with the same names. Here is the sequence above as the assistant sees it:</p>
+      <p>An assistant connected over MCP calls the same commands under the same names. Arming interception is a sensitive command, so under the default <code>auto</code> policy an assistant cannot do it: you arm it with <kbd>I</kbd>, or set the policy to <code>ask</code>, which holds the call until you approve it in a UI. Once something is held, listing, editing, resuming and killing are ordinary commands. Here is the sequence, with the assistant arming under <code>ask</code>:</p>
       <figure class="code term">
         <figcaption><span>mcp — aitmproxy</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="who">›</span> <span class="in">intercept.add({ match: <span class="s">"POST /api/cart/*"</span> })</span>
-<span class="who">‹</span> <span class="out">{ rule: "r1", state: "armed" }</span>
-<span class="who">›</span> <span class="in">flow.list({ held: <span class="n">true</span> })</span>
-<span class="who">‹</span> <span class="out">[{ id: 41, method: "POST", path: "/api/cart/items", state: "armed" }]</span>
-<span class="who">›</span> <span class="in">flow.mutate({ id: <span class="n">41</span>, set_body: <span class="s">'{"qty":999}'</span> })</span>
-<span class="who">‹</span> <span class="out">{ id: 41, body_bytes: 27 }</span>
-<span class="who">›</span> <span class="in">flow.resume({ id: <span class="n">41</span> })</span>
-<span class="who">‹</span> <span class="out">{ id: 41, status: 200, ms: 212 }</span></code></pre>
+<pre><code><span class="c"># policy ask: the call waits for you to approve it in a UI</span>
+<span class="who">›</span> <span class="in">flow.intercept({ rules: [{ method: <span class="s">"POST"</span>, url: <span class="s">"*/api/cart/*"</span> }] })</span>
+<span class="who">‹</span> <span class="out">{ enabled: true, rules: [ … ] }</span>
+<span class="c"># …add something to the cart in the app…</span>
+<span class="who">›</span> <span class="in">flow.table()</span>
+<span class="who">‹</span> <span class="out">{ flows: [{ id: "&lt;flow-id&gt;", kind: "http", state: "intercepted", method: "POST", authority: "shop.example.com", path: "/api/cart/items", status: null, … }] }</span>
+<span class="who">›</span> <span class="in">flow.mutate({ id: <span class="s">"&lt;flow-id&gt;"</span>, edits: { body: <span class="s">'{"qty":999}'</span> } })</span>
+<span class="who">‹</span> <span class="out">"&lt;flow-id&gt;"</span>
+<span class="who">›</span> <span class="in">flow.resume({ id: <span class="s">"&lt;flow-id&gt;"</span> })</span>
+<span class="who">‹</span> <span class="out">"resumed"</span></code></pre>
       </figure>
-      <p>Whoever issued them, the commands land in one audit log with the operator named: <code>aitm log tail</code> shows it live.</p>
+      <p>Flow ids are UUID strings; <code>flow.list</code> and <code>flow.table</code> return them, and <code>flow.detail</code> reads the held request's headers and body. Calls an assistant makes over MCP are recorded with their origin in the audit ring; <code>agent.activity</code> reads it, and the Agent page of each UI shows the same entries.</p>
 
       <h2 id="mcp">Connect an assistant (MCP)</h2>
-      <p>aitmproxy is an MCP server: every command on this page is exposed to an assistant under the same name and shape. Connect one and it drives the proxy — hold, edit, replay, script, reproduce — through the same audited core you use by hand. How you connect depends on whether the client launches a command or reaches a URL.</p>
+      <p>aitmproxy is an MCP server: every registered command is exposed to an assistant under the same name and shape. Connect one and it drives the proxy — hold, edit, replay, script, reproduce — through the same core you use by hand. Running <code>aitm</code> with no arguments starts the proxy and the MCP server together. The transport is one of stdio (the default), loopback TCP or streamable HTTP, and <code>aitm</code> serves exactly the one you configure. How you connect depends on whether the client launches a command or reaches a URL.</p>
 
       <h3 id="mcp-claude">Claude Code and Claude Desktop</h3>
-      <p>Claude speaks MCP over stdio, so it launches <code>aitm mcp</code> directly. In Claude Code, add it in one line:</p>
+      <p>Claude speaks MCP over stdio, so it launches <code>aitm</code> directly: bare <code>aitm</code> serves MCP on stdio. In Claude Code, add it in one line:</p>
       <figure class="code" data-reveal>
         <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="pr">$ </span>claude mcp add aitmproxy -- aitm mcp</code></pre>
+<pre><code><span class="pr">$ </span>claude mcp add aitmproxy -- aitm</code></pre>
       </figure>
       <p>For Claude Desktop, add the server to <code>claude_desktop_config.json</code>:</p>
       <figure class="code" data-reveal>
         <figcaption><span>claude_desktop_config.json</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
 <pre><code><span class="p">{</span>
   <span class="yk">"mcpServers"</span>: <span class="p">{</span>
-    <span class="yk">"aitmproxy"</span>: <span class="p">{</span> <span class="yk">"command"</span>: <span class="s">"aitm"</span>, <span class="yk">"args"</span>: [<span class="s">"mcp"</span>] <span class="p">}</span>
+    <span class="yk">"aitmproxy"</span>: <span class="p">{</span> <span class="yk">"command"</span>: <span class="s">"aitm"</span> <span class="p">}</span>
   <span class="p">}</span>
 <span class="p">}</span></code></pre>
       </figure>
 
       <h3 id="mcp-chatgpt">ChatGPT and other URL connectors</h3>
-      <p>Some clients — ChatGPT's connectors among them — reach an MCP server over a URL rather than launching a command. For those, run aitmproxy's MCP on a loopback TCP port guarded by a token and point the connector at it. Set it in <code>config.yaml</code>:</p>
+      <p>Some clients — ChatGPT's connectors among them — reach an MCP server over a URL rather than launching a command. For those, enable the streamable-HTTP transport in <code>config.yaml</code>:</p>
+      <figure class="code" data-reveal>
+        <figcaption><span>config.yaml</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
+<pre><code><span class="yk">mcp:</span>
+  <span class="yk">transport:</span>
+    <span class="yk">streamable_http:</span>
+      <span class="yk">bind:</span> <span class="n">127.0.0.1:8084</span>
+      <span class="yk">token:</span> <span class="s">"a long random secret"</span></code></pre>
+      </figure>
+      <p>Start <code>aitm</code> and the endpoint is <code>http://127.0.0.1:8084/mcp</code>. Every request must carry <code>Authorization: Bearer &lt;token&gt;</code>, or it is refused with <code>401</code>. <code>path</code> defaults to <code>/mcp</code>; <code>allowed_origins</code> defaults to empty, which accepts no cross-origin request. There is no TLS in the listener, and it exposes the proxy's control plane, so keep it on loopback and put a tunnel or HTTPS in front of it before anything else reaches it. Keep the token secret: whoever holds it can drive the proxy as an agent.</p>
+
+      <h3 id="mcp-loopback">Loopback TCP</h3>
+      <p>The third transport is a plain newline-delimited JSON-RPC socket on <code>127.0.0.1</code>. It is what the macOS app uses to attach to an external core:</p>
       <figure class="code" data-reveal>
         <figcaption><span>config.yaml</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
 <pre><code><span class="yk">mcp:</span>
@@ -212,16 +236,16 @@
       <span class="yk">port:</span> <span class="n">8083</span>
       <span class="yk">token:</span> <span class="s">"a long random secret"</span></code></pre>
       </figure>
-      <p>Start <code>aitm</code> and the MCP server listens on <code>127.0.0.1:8083</code>; the first line of every connection must present <code>{"token":"…"}</code> or it is refused with <code>-32001</code>. The connector has to reach that address, so this fits an assistant running on the same machine. Keep the token secret — it carries the full command surface.</p>
+      <p>The first line of every connection must be <code>{"token":"…"}</code> with exactly that one key, or the connection is refused with error <code>-32001</code>.</p>
       <div class="callout">
-        <p><strong>Least privilege:</strong> an assistant gets the agent command set by default. The sensitive verbs — installing the CA, widening scope, running a PoC — stay off until you opt in, and every call lands in the one audit log with the operator named.</p>
+        <p><strong>Least privilege:</strong> an assistant connects as an agent under the <code>auto</code> policy. Read and write commands run; sensitive ones are refused even if their own switch is on. To allow one, you set the policy to <code>all</code> and open its gate in <code>config.yaml</code> (<code>ca.allow_agent_install</code> for the CA, <code>scope.allow_agent_widen</code> for scope), or set <code>ask</code> and approve each call in a UI. <code>poc.run</code> is a write command but has its own switch, <code>poc.allow_agent_run</code>, off by default. Every call is recorded with its origin in the audit ring (<code>agent.activity</code>).</p>
       </div>
 
       <h2 id="next">Next steps</h2>
       <ul>
-        <li><a href="features.html#replay">Replay a flow with one change</a> and diff the responses.</li>
+        <li><a href="features.html#replay">Replay a captured request</a>, or compose one from scratch.</li>
         <li><a href="features.html#map">Serve a fixture with Map Local</a> while the backend is still being written.</li>
-        <li><a href="scripting.html">Write a ten-line Rhai plugin</a> that blocks or tags traffic as it passes.</li>
+        <li><a href="scripting.html">Write a short Rhai plugin</a> that blocks or marks traffic as it passes.</li>
         <li><a href="poc.html">Save a reproduction as a PoC</a> so the finding can be re-run next week.</li>
       </ul>
     </div>
@@ -250,7 +274,7 @@
   <div class="wrap">
     <div>
       <a class="wordmark" href="index.html">aitmproxy<i aria-hidden="true"></i></a>
-      <p class="fine">A fast, memory-safe intercepting proxy for inspecting and editing HTTP, WebSocket, HTTP/2 and raw L4 traffic during development and authorized testing. Use it on systems you own or are permitted to test.</p>
+      <p class="fine">A fast, memory-safe intercepting proxy for inspecting and editing HTTP, WebSocket and HTTP/2 traffic, and raw L4 on a privileged Linux core, during development and authorized testing. Use it on systems you own or are permitted to test.</p>
     </div>
     <div>
       <h4>Product</h4>

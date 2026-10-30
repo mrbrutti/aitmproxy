@@ -1,8 +1,11 @@
 # scripts
 
-`package.sh` builds `aitm` in release mode, downloads the matching
+`package.sh` builds the web UI (`apps/web`, via `npm ci && npm run build`, because
+`aitm` embeds it at compile time), then `aitm` and `aitm-tui` in release mode,
+downloads the matching
 `obscura-<target>.tar.gz` for the host from the obscura fork's GitHub Release
-(`mrbrutti/obscura`, tag `OBSCURA_TAG`, default `aitm-v1`), verifies it against
+(`mrbrutti/obscura`, a private repository, so `gh` must be authenticated with read
+access to it; tag `OBSCURA_TAG`, default `aitm-v1`), verifies it against
 the release's `SHA256SUMS`, strips macOS quarantine, and writes
 `dist/aitm-<version>-<target>.tar.gz` containing exactly three files: `aitm`,
 `aitm-tui`, and `obscura`. Extract that tarball anywhere and run `./aitm`: the
@@ -36,6 +39,24 @@ verification as `package.sh`), and copies a real `obscura` into both
 entry, or `AITM_OBSCURA_BIN`. Override the release tag with `OBSCURA_TAG`; supply
 a PAT via `OBSCURA_GH_TOKEN` if `gh` is not logged in. See
 [`docs/DEVELOPMENT.md`](../docs/DEVELOPMENT.md).
+
+The macOS and release helpers:
+
+- `make-dmg.sh` packages the `Aitmproxy.app` that `apps/mac/build.sh` installed
+  into `dist/Aitmproxy-<version>.dmg` (`APP=` overrides the app path). It does not
+  sign or notarize.
+- `notarize-dmg.sh` re-signs that app with a Developer ID and the hardened
+  runtime, builds the DMG with `make-dmg.sh`, notarizes it with `notarytool`, and
+  staples the ticket. It needs `ASC_ISSUER_ID` (plus an App Store Connect `.p8`
+  key) and refuses an app that does not bundle its embedded `aitm` + `obscura`
+  core, so run `package.sh` then `apps/mac/build.sh` first.
+- `gen-downloads-manifest.sh <tag> <owner/repo> <SHA256SUMS> <asset-name>...`
+  prints the `site/downloads.json` manifest; the release workflow's `finalize`
+  job runs it.
+- `bus-agent-check.py` drives a live `aitm` over its loopback MCP bus the way an
+  agent does and reports what works; `tui-live-check.sh embed|bus` drives the real
+  TUI by keystrokes under tmux. Both bind ports, so run them in a real shell; see
+  [`crates/aitm-tui/README.md`](../crates/aitm-tui/README.md).
 
 For the full end-to-end release procedure — tag, let CI build the Linux
 artifacts, build/sign/notarize the macOS DMG + tarball on Matt's Mac, re-run the

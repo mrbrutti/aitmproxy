@@ -368,10 +368,11 @@ pub(crate) fn active_commands(
 /// Wrap the Sensitive, per-capability-gated `l4.*` commands in `cmds` with their
 /// [`L4AgentGate`] (the second M4 dimension), leaving the rest untouched. The module
 /// applies this to the wire + intercept command lists before the privilege gate, so
-/// an agent (`Frontend::Mcp`) call to a gated verb is refused unless its
-/// `l4.allow_agent_*` flag is on; the operator and CLI roles bypass it. Scope-add's
-/// widen gate lives inside the command (it refuses every runtime caller when off);
-/// everything here is Mcp-only.
+/// an untrusted (agent) caller, i.e. any caller `Frontend::is_trusted_control` does
+/// not trust, is refused a gated verb unless its `l4.allow_agent_*` flag is on; the
+/// trusted-control roles (operator and CLI) bypass it. Scope-add's widen gate lives
+/// inside the command (it refuses every runtime caller when off); everything here
+/// is gated for an untrusted caller only.
 pub(crate) fn agent_gate(
     cmds: Vec<Arc<dyn Command>>,
     gates: &Arc<L4AgentGates>,
