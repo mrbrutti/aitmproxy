@@ -131,71 +131,61 @@ the spec's recommended default and flags it).**
   the real build (Tasks 11, 14) must adopt. **Nothing from the branch is reused
   as code.**
 
-### Task 2: macOS capture backend scaffold + TCP flow → ProtocolModule with authoritative dst
+### Task 2: macOS capture-backend adapter → `CaptureIngress` (folds old Tasks 2–4)
 
-- **Satisfies:** NE-AC1.
-- **Depends on:** Phase-1 `CaptureIngress` (prerequisite — not in this worktree).
-- **Files:** `crates/aitm/src/macos_capture/mod.rs` (create — module root, shared
-  types, submodule declarations), `crates/aitm/src/macos_capture/tcp.rs`
-  (create), `crates/aitm/tests/macos_capture_tcp.rs` (create), `crates/aitm/src/lib.rs`
-  (modify — add `pub mod macos_capture;`).
-- **Change:** shared types `CapturedTcpFlow { stream: ByteStream, dst: SocketAddr,
-  sni: Option<String>, source_app: SourceAppId }`, `CapturedUdpFlow { … }`,
-  `SourceAppId` (signing-identifier-backed; self-exclusion predicate left to the
-  builder), and
-  `pub async fn dispatch_captured_tcp(ingress: &CaptureIngress, flow: CapturedTcpFlow)`
-  that builds a `NextLayerHint` whose `dst` is the flow's **original remote
-  endpoint** (not a client peer) and `client_hello_sni` is `flow.sni`, then hands
-  the `ByteStream` to the Phase-1 ingress. (`ByteStream` =
-  `Pin<Box<dyn AsyncReadWrite + Send>>`, `crates/aitm-core/src/stream.rs`.)
-- **Test:** `tcp_flow_dispatches_to_http_with_original_dst` feeds a synthesized
-  in-scope TCP flow with `dst = 93.184.216.34:443`, `sni = Some("example.com")`
-  and TLS-ClientHello first bytes through `dispatch_captured_tcp`; asserts the
-  HTTP module claims it and the captured `NextLayerHint.dst.to_string()` equals
-  the literal **`"93.184.216.34:443"`** (and *not* the synthesized client peer
-  `"127.0.0.1:50000"`).
-- **Done when:** the test passes and the full gate passes.
+- **Satisfies:** NE-AC1, NE-AC2, NE-AC3.
+- **Depends on:** `CaptureIngress` (on `main`, PR #47) **and Task 8** (which pins the
+  handoff flow representation this adapter maps from). **Deferred until Task 8 lands.**
+- **Scope note (why this folds old Tasks 2–4):** the ingress TCP/UDP dispatch,
+  deny-by-default, authoritative-dst `NextLayerHint`, and in-scope-unclaimed passthrough
+  **already exist on `main`** (prereq plan, PR #47). This task is the **thin macOS
+  adapter** that converts a handoff flow into the ingress's own types and calls it — it
+  does **not** re-implement dispatch and does **not** redeclare the flow types. NE-AC3
+  (deny-by-default) is satisfied by the ingress itself; this task asserts the macOS path
+  routes through it.
+- **Files:** `crates/aitm/src/macos_capture/adapter.rs` (create),
+  `crates/aitm/tests/macos_capture_adapter.rs` (create),
+  `crates/aitm/src/macos_capture/mod.rs` (create-or-extend — `mod adapter;`; trivial
+  parallel-merge with the other Band-B tasks' one-line appends),
+  `crates/aitm/src/ingress.rs` (modify — carry-over Minor fixes only, below).
+- **Change:** map Task 8's per-flow handoff (control-channel `NewFlow` metadata + the
+  per-flow data socket) to the ingress types **defined in `crates/aitm/src/ingress.rs`**:
+  build `CapturedTcpFlow { stream, dst, sni, first_bytes, peer_identity }` and
+  `CapturedUdpFlow { target, datagrams, peer_identity }`, mapping the macOS
+  `source_app: SourceAppId` → `peer_identity: Option<String>`; then call
+  `dispatch_captured_tcp(&CoreIngress, flow)` (TCP) and `CoreIngress::dispatch_udp(&flow)`
+  (UDP). **No new guard** — deny-by-default is enforced inside the ingress (`dispatch_tcp`
+  refuses out-of-scope before any dispatch; `dispatch_udp` via `L4Guard`).
+  **Carry-over Minors from the PR #47 panel, fix here in `ingress.rs`:** (b) log the
+  module-spawn error the way `handle_conn` does, and dedup the duplicated hint/ctx block;
+  (c) add the passthrough dial-failure test; (d) drop the needless `first_bytes` clone.
+- **Test:** `macos_tcp_flow_adapts_and_dispatches` — a synthesized handoff TCP flow to
+  `dst = 93.184.216.34:443`, `sni = Some("example.com")`, a set `source_app` becomes a
+  `CapturedTcpFlow` whose `peer_identity` is the mapped source-app id, and
+  `dispatch_captured_tcp` returns `StreamOutcome::Dispatched` with the HTTP module's
+  `NextLayerHint.dst.to_string() == "93.184.216.34:443"`; an **out-of-scope** flow
+  returns `StreamOutcome::Refused` with zero dispatch. `macos_udp_flow_adapts_and_dispatches`
+  — in-scope UDP admitted, out-of-scope refused via `L4Guard`. Plus the (c) passthrough
+  dial-failure test.
+- **Done when:** the tests pass and the full gate passes.
 
-### Task 3: UDP flow → flow-level L4 unit behind L4Guard
+### Task 3: ~~UDP flow → flow-level L4 unit behind L4Guard~~ — FOLDED into Task 2
 
-- **Satisfies:** NE-AC2.
-- **Depends on:** Phase-1 `CaptureIngress`; Task 2 (shared types + `mod.rs`).
-- **Files:** `crates/aitm/src/macos_capture/udp.rs` (create),
-  `crates/aitm/tests/macos_capture_udp.rs` (create),
-  `crates/aitm/src/macos_capture/mod.rs` (modify — append `mod udp;`).
-- **Change:**
-  `pub fn dispatch_captured_udp(guard: &L4Guard, store: &dyn L4FlowStore, flow: CapturedUdpFlow) -> Result<L4FlowId, L4GuardError>`
-  that represents the UDP flow as a **flow-level L4 unit** (new `L4FlowKind`
-  variant vs synthesized frames is the builder's choice, within "no raw-packet
-  machinery"), calls `L4Guard::check(action, &target)` first, and only records
-  the flow in the `L4FlowStore` on an `Ok(L4Permit)`.
-  (`L4Guard::check` is `crates/aitm-proto-l4/src/guard.rs`.)
-- **Test:** `udp_in_scope_admitted_out_of_scope_refused` — an **in-scope** UDP
-  flow returns `Ok(L4FlowId)` and `store.list().len() == 1`; an **out-of-scope**
-  UDP flow returns `Err(L4GuardError::…)` and `store.list().len() == 0` (no
-  datagram reached the store).
-- **Done when:** the test passes and the full gate passes.
+The ingress already dispatches UDP via `L4Guard` (prereq PR #47). The macOS UDP
+adaptation is the `CapturedUdpFlow` half of the Task 2 adapter; there is no separate
+UDP dispatch function to build. Superseded.
 
-### Task 4: Deny-by-default below the ingress (both protocols)
+### Task 4: ~~Deny-by-default below the ingress (both protocols)~~ — FOLDED into Task 2
 
-- **Satisfies:** NE-AC3.
-- **Depends on:** Task 2, Task 3.
-- **Files:** `crates/aitm/src/macos_capture/mod.rs` (modify — a shared
-  `admit(flow)` choke that runs the guard before dispatch for TCP *and* UDP),
-  `crates/aitm/tests/macos_capture_guard.rs` (create).
-- **Change:** route every captured flow (TCP via Task 2, UDP via Task 3) through
-  the core's guard **below** the ingress before any module/plugin sees it; a
-  test-visible `dispatched_count` hook (or a counting stub `ProtocolModule` /
-  `L4FlowStore`) proving no dispatch on refusal.
-- **Test:** `out_of_scope_tcp_and_udp_never_dispatched` — synthesized
-  out-of-scope TCP and UDP flows each yield `dispatched_count == 0`; in-scope
-  equivalents each yield `dispatched_count == 1`.
-- **Done when:** the test passes and the full gate passes.
+Deny-by-default below the ingress is enforced **inside** the ingress on `main` (prereq
+PR #47: `dispatch_tcp` refuses out-of-scope before any dispatch; `dispatch_udp` via
+`L4Guard`), and was verified by that PR's Stage-6 security panel. Task 2's adapter tests
+assert the macOS path routes through it (NE-AC3); no separate choke is added. Superseded.
 
 ### Task 5: Raw packet-level L4 honestly unavailable on the macOS embedded core
 
 - **Satisfies:** NE-AC4.
-- **Depends on:** Phase-1 `CaptureIngress`; Task 2 (`mod.rs`).
+- **Depends on:** `CaptureIngress` (on `main`). Independently launchable now — creates-or-extends `crates/aitm/src/macos_capture/mod.rs` + the `lib.rs` export (trivial parallel-merge with the other Band-B tasks).
 - **Files:** `crates/aitm/src/macos_capture/availability.rs` (create),
   `crates/aitm/tests/macos_capture_availability.rs` (create),
   `crates/aitm/src/macos_capture/mod.rs` (modify — append `mod availability;`).
@@ -212,7 +202,7 @@ the spec's recommended default and flags it).**
 ### Task 6: Capture-capability state + honest degradation reason (core side)
 
 - **Satisfies:** NE-AC10 (Rust / capability-state-mapping side).
-- **Depends on:** Task 2 (`mod.rs`).
+- **Depends on:** `CaptureIngress` (on `main`). Independently launchable now — creates-or-extends `macos_capture/mod.rs` + `lib.rs` export (trivial parallel-merge).
 - **Files:** `crates/aitm/src/macos_capture/capability.rs` (create),
   `crates/aitm/tests/macos_capture_capability.rs` (create),
   `crates/aitm/src/macos_capture/mod.rs` (modify — append `mod capability;`).
@@ -230,7 +220,7 @@ the spec's recommended default and flags it).**
 ### Task 7: Operator-only approval gate (agent cannot install/approve the sysex)
 
 - **Satisfies:** NE-AC11 (gate).
-- **Depends on:** Task 2 (`mod.rs`).
+- **Depends on:** `CaptureIngress` (on `main`). Independently launchable now — creates-or-extends `macos_capture/mod.rs` + `lib.rs` export (trivial parallel-merge).
 - **Files:** `crates/aitm/src/macos_capture/activation_gate.rs` (create),
   `crates/aitm/tests/macos_capture_gate.rs` (create),
   `crates/aitm/src/macos_capture/mod.rs` (modify — append `mod activation_gate;`).
@@ -250,8 +240,8 @@ the spec's recommended default and flags it).**
 
 ### Task 8: Core-listener handoff — control/data separation, 0700 dir, per-flow backpressure
 
-- **Satisfies:** NE-AC7 (Rust loopback round-trip), NE-AC6 (core-listener side).
-- **Depends on:** Task 2 (shared types).
+- **Satisfies:** NE-AC7 (Rust loopback round-trip), NE-AC6 (core-listener side). Also folds carry-over Minor (a): forward `in_scope` on the delegating `LateGuard` (`crates/aitm/src/wire.rs`) and `LateHandles` (`crates/aitm/src/scripts.rs`) so the capture path's guard delegation is complete before a live feeder routes through it.
+- **Depends on:** `CaptureIngress` (on `main`). Independently launchable now — creates-or-extends `macos_capture/mod.rs` + `lib.rs` export (trivial parallel-merge). Pins the handoff flow representation that Task 2 (adapter) maps from. The shared `CapturedTcpFlow`/`CapturedUdpFlow` types come from `crates/aitm/src/ingress.rs` — do not redeclare them.
 - **Files:** `crates/aitm/src/macos_capture/listener.rs` (create),
   `crates/aitm/tests/macos_capture_listener.rs` (create),
   `crates/aitm/src/macos_capture/mod.rs` (modify — append `mod listener;`).
