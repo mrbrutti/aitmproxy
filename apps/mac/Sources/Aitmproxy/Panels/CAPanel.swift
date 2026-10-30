@@ -190,18 +190,27 @@ struct CAPanel: View {
         Task {
             defer { busy = false }
             actionError = nil
+            let command = install ? "ca.install" : "ca.uninstall"
             do {
-                _ = try await session.runCommand(install ? "ca.install" : "ca.uninstall", [:])
+                // ca.install / ca.uninstall are confirm-gated over the bus: the first call
+                // returns a confirm token and applies nothing; it must be re-sent with
+                // `_confirm` to actually run (the alert above is the human confirmation).
+                // Missing this re-call was the silent no-op — the first response looked like
+                // success while the keychain was never touched.
+                let result = try await session.runCommand(command, [:])
+                if let token = result["confirm_token"]?.stringValue {
+                    _ = try await session.runCommand(command, ["_confirm": .string(token)])
+                }
                 if let json = try? await session.runCommand("ca.status", [:]), let parsed = CAStatus(json: json) {
                     self.status = parsed
                 }
-                // Install can report success from the child core while the login-keychain
-                // trust never lands; say so here instead of silently looking installed.
-                if install, let s = self.status, !(s.installed && s.trusted) {
+                // The install can finish without login-keychain trust landing (the macOS
+                // trust dialog may not surface in this process); say so, don't look installed.
+                if install, let current = self.status, !(current.installed && current.trusted) {
                     actionError = "Install finished but the CA is not trusted in the login keychain yet. Export the PEM and trust it in Keychain Access, or follow the setup guide below."
                 }
             } catch {
-                let message = "ca.\(install ? "install" : "uninstall"): \(BusService.describe(error))"
+                let message = "\(command): \(BusService.describe(error))"
                 actionError = message
                 session.lastError = message
             }
