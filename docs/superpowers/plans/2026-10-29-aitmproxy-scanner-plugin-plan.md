@@ -42,6 +42,15 @@ T6/T7 (Stage 2) → T9 → T10 → T11 → T12 (Stage 3) → T13 → T14 → T15
 Satisfies **AC1-AC4**. Ends shippable: `scan.discover` crawls and enumerates,
 touches only in-scope hosts, injects nothing.
 
+**External dependency (finding S2, not this crate's work):** complete scope
+confinement of browser-autonomous egress (redirects/sub-resources to out-of-scope
+**public** hosts) requires a core change to the browser-facing proxy connector,
+tracked as its own browser/core spec + plan (spec → "Browser-autonomous egress and
+scope (S2)"). It does **not** block these tasks against the loopback test target.
+This crate's interim mitigation is the `left_scope` abort in Task 4 + the schema
+note in Task 5; the plugin must **not** edit `aitm-core` to close S2 (if it finds
+it must, it stops and reports).
+
 ### Task 1: crate skeleton + `ScannerPlugin` + `ScannerConfig`
 
 - **Satisfies:** foundation for AC1-AC4 (no AC proven alone).
@@ -70,7 +79,8 @@ touches only in-scope hosts, injects nothing.
 
 ### Task 2: injection-point model + `enumerate`
 
-- **Satisfies:** AC2 (and the data model for AC1).
+- **Satisfies:** AC2 (and the data model for AC1); AC13 redaction from the first
+  structured result.
 - **Depends on:** Task 1.
 - **Files:** `crates/aitm-plugin-scanner/src/discover.rs` (create); re-export from `lib.rs`.
 - **Change:**
@@ -85,13 +95,22 @@ touches only in-scope hosts, injects nothing.
   Parse the request's query keys, form/JSON body keys, headers, cookies, path
   segments (flag numeric object-ids), and URL-valued params (`Redirect`). Read
   only from the passed flow — **never** call any `aitm_testtarget::manifest`.
+  Redact each `example` at the source (AC13): **every `Location::Cookie` value is
+  `[redacted]` unconditionally**; header/query/body values are redacted via
+  `aitm_core::redact::{is_secret_key, scrub_text}` plus the
+  `session`/`sid`/`jwt`/`auth`/`csrf`/`key`/`sig`/`signature` name set. The
+  injection-point **name** is kept (it is what later stages fuzz); only the value
+  is scrubbed.
 - **Test:** `enumerate_finds_query_body_cookie_path` builds an `HttpFlow` with
   `GET /account/2/profile?q=1&next=http://x` and a `Cookie: sid=abc` header and
   asserts the returned set contains exactly `{Query "q", Redirect "next",
   PathSegment "2", Cookie "sid"}` (literal count and names);
   `enumerate_reads_no_manifest` is a source/behavior assertion that `enumerate`
   takes only `&HttpFlow` and the crate's `Cargo.toml` has **no** `aitm-testtarget`
-  dependency outside `[dev-dependencies]`.
+  dependency outside `[dev-dependencies]`. `enumerate_redacts_secret_values` builds
+  a flow with `Cookie: PHPSESSID=abc123`, `Authorization: Bearer abc123`, and
+  `?access_token=abc123` and asserts no returned `example` contains `abc123` while
+  the point **names** (`PHPSESSID`, `Authorization`, `access_token`) are present.
 - **Done when:** tests pass and the full gate passes.
 
 ### Task 3: `aitm-testtarget` crawlable linked surface (independent / fan-out)
@@ -125,13 +144,20 @@ touches only in-scope hosts, injects nothing.
   Breadth-first from `target`: `navigate` via `host.browser()`, `get_dom`, harvest
   links/forms, enqueue only same-origin URLs where `host.guard().in_scope(host_of(url))`
   is true, dedupe by normalized URL, stop at `max_depth`/`max_pages`/`time_budget`
-  (set `stopped_reason`). Each navigation's flow is captured in `host.store()`.
+  (set `stopped_reason`). Each navigation's flow is captured in `host.store()`. If a
+  navigation lands off-scope/off-origin (`final_url` fails `in_scope`/`origin`
+  match — a browser-followed redirect, finding S2), **abort the crawl** and set
+  `stopped_reason = "left_scope"` instead of `continue` (interim S2 mitigation; the
+  complete fix is the external browser-egress gate).
 - **Test** (`#[cfg_attr(not(AITM_OBSCURA), ignore)]`): `crawl_walks_in_scope_graph`
   crawls the Task 3 target and asserts `endpoints` contains the six seeded paths
   and `pages_crawled >= 6`; `crawl_skips_out_of_scope` seeds a link to an
   unscoped host and asserts it is absent from `endpoints` and `guard` recorded no
   action for it. A non-gated `crawl_respects_max_pages` unit test over a stub
   `BrowserDriver` asserts `stopped_reason == Some("max_pages")` at the cap.
+  `crawl_aborts_on_off_scope_landing` drives a stub whose `navigate` returns an
+  off-origin `final_url` and asserts the crawl stops with
+  `stopped_reason == Some("left_scope")` and does not enqueue past it (AC3, S2).
 - **Done when:** the gated tests pass under obscura and the non-gated gate is green.
 
 ### Task 5: `scan.discover` command + discovery e2e

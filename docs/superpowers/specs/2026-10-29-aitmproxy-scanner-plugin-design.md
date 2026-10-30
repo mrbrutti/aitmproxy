@@ -89,9 +89,18 @@ gates.
 
 ## Anti-goals
 
-- A scanner that touches an out-of-scope host, from **any** caller. If an agent
-  (or operator, or the free-form loop) can make the scanner inject outside the
-  operator-authorized scope, the design has failed.
+- A scanner that **issues a request** to an out-of-scope host, from **any**
+  caller. If an agent (or operator, or the free-form loop) can make the scanner
+  *issue* (crawl-navigate, inject, replay, or craft) a request outside the
+  operator-authorized scope, the design has failed. Every request the scanner
+  issues passes `check_active` at the single guarded client chokepoint. **Carve-out
+  (finding S2):** egress the *embedded browser* performs on its own while
+  rendering an in-scope page it was handed — following a 3xx/`meta refresh`/JS
+  redirect, or loading a sub-resource (`<img>`/`<script>`/`<iframe>`/CSS/font) on
+  an out-of-scope **public** host — is a browser-layer exposure the plugin cannot
+  fully close, because it is not a request the plugin issues. It is addressed at
+  the proxy chokepoint, not in this crate (see Design → "Browser-autonomous
+  egress and scope (S2)"); until that lands it is a documented residual.
 - An unbounded scan: an uncapped crawl, an unlimited payload cross-product, or a
   run that ignores the rate guard / per-host back-off is a failure even if it
   finds bugs.
@@ -255,6 +264,55 @@ never leaves scope. When the browser engine is unavailable (hermetic default
 test), discovery can also run over flows already in the store, so the enumerator
 is unit-testable without a browser.
 
+### Browser-autonomous egress and scope (S2)
+
+The Stage-1 security panel found (finding S2) that while the scanner gates every
+navigation it *initiates* with `check_active` and only enqueues same-origin
+in-scope links, the embedded browser still performs egress of its own once it
+holds a page: it follows 3xx / `meta refresh` / JS redirects and loads
+sub-resources. The browser-facing proxy listener (`Proxy::run_browser` →
+`SsrfConnector`, `aitm-core/src/proxy.rs`) applies `ssrf_check`, which blocks
+**private/loopback** targets but — by design — lets **public** hosts through
+(`blocked_by_policy(HostClass::Public) == false`, `aitm-core/src/guard.rs`). So an
+in-scope page that redirects to, or embeds a resource on, an out-of-scope public
+host causes a request there before the crawler discards the off-origin result.
+This is a pre-existing property of **all** browser-driven features (the M4 agent
+crawl has the same exposure); the scanner merely exercises it systematically.
+
+**Decision (Architect's call).** The correct, complete fix is at the proxy
+chokepoint, **option (a)**: extend the browser-facing `SsrfConnector` to refuse an
+out-of-scope **public** host when a *scope-confined egress mode* is active — the
+same `ssrf_check` already receives `scope` and the `authority`, so this is a
+narrow, well-located addition (a public host outside scope joins private/loopback
+as refused-unless-scoped). It must be a **mode**, not an always-on block: the
+browser-facing listener is also the general-interception path, where an operator
+legitimately browses arbitrary public hosts, so scope-confinement is enabled for a
+scan campaign (and offered to the M4 agent crawl) and off for free browsing.
+Because this edits `aitm-core`, it is **out of this crate's "no core edits"
+boundary** and is tracked as its **own browser/core spec + plan** (own-initiative
+proposal), going through its own panel review and Matt's approval like any core
+change — the scanner *depends on* it but does not contain it.
+
+The plugin-only alternatives the panel listed are rejected as incomplete: fetching
+the navigation chain first via `ProxyClient::send` with redirects disabled
+(reviewer option 1) verifies the redirect chain but still cannot stop the browser
+loading out-of-scope **sub-resources** once the verified page renders; it closes
+only part of the hole. **Interim posture, in this crate (plan Stage 1):** on an
+off-scope landing (`final_url` out of scope/off-origin) the crawl **aborts and
+records `stopped_reason = "left_scope"`** rather than silently continuing, and
+`scan.discover`'s command description states the residual sub-resource/redirect
+exposure until the egress gate lands. This bounds the exposure to at most the
+sub-resources of pages already fetched and makes it visible.
+
+**Stage impact.** S2 does **not** block later stages. Active injection (Stage 3)
+is issued through the guarded client (`request.send`/`flow.replay` → `check_active`),
+never through the browser, so attack payloads cannot reach an out-of-scope host
+regardless of S2. Passive checks (Stage 2) issue no new traffic. The egress gate
+is a hardening that **must** land before the scanner is pointed at a real external
+target in a live engagement (touching third parties then is an authorization-
+boundary violation), but it does not block building or shipping Stages 2-5 against
+the seeded **loopback** test target, where all egress is in-scope by construction.
+
 ### Discover (injection points from the flow, never a manifest)
 
 `enumerate(flow: &HttpFlow) -> Vec<InjectionPoint>` parses the **same request
@@ -353,7 +411,11 @@ stage.
    access; a flow with `?q=1&id=2` + a cookie yields exactly those points).
 3. **AC3:** Crawl honors `max_depth`/`max_pages` and only touches in-scope hosts:
    a link to an out-of-scope host is absent from `endpoints` and no request is
-   sent to it (observable: guard records no action for that host).
+   sent to it (observable: guard records no action for that host). If a navigation
+   *lands* off-scope/off-origin (a browser-followed redirect, finding S2), the
+   crawl **aborts** and returns `stopped_reason == "left_scope"` rather than
+   continuing (literal: a stub browser returning an off-origin `final_url` stops
+   the crawl with `left_scope`).
 4. **AC4:** `scan.discover` reports `Sensitivity::Write`; every request it issues
    passes `check_active` (an out-of-scope target returns `GuardError::OutOfScope`).
 
@@ -392,7 +454,15 @@ stage.
     finding; index entries carry `poc_path`/`class`/`passed`).
 13. **AC13:** A secret (e.g. an `Authorization` header) that passed through a
     scanned request never appears in a `FindingRecord`, the rendered report, or any
-    structured `scan.*` result (reuses the redaction posture).
+    structured `scan.*` result (reuses `aitm_core::redact`). This holds from the
+    **first** structured result (`scan.discover`), not only at finding time. Because
+    a session cookie often has an ordinary name (`PHPSESSID`, `sid`, `JSESSIONID`),
+    **every `Location::Cookie` value is redacted unconditionally** (the cookie name
+    is the useful injection-point datum; the value is session state), and
+    header/query/body values are redacted by the `is_secret_key` key-name set
+    *plus* `session`/`sid`/`jwt`/`auth`/`csrf`/`key`/`sig`/`signature`. Literal: a
+    flow with `Cookie: PHPSESSID=abc123`, `Authorization: Bearer abc123`, and
+    `?access_token=abc123` yields no `abc123` anywhere in any `scan.*` result.
 
 **Stage 5 — broaden coverage + both-paths**
 
