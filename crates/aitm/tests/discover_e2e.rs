@@ -1,9 +1,15 @@
-//! Obscura-gated end-to-end test for `scan.discover`.
+//! Obscura-gated end-to-end tests for `scan.discover`.
 //!
-//! It serves the bundled multi-vuln `aitm-testtarget` (vulnerable seed), scopes
-//! its loopback host, drives `scan.discover` through the embedded obscura engine
-//! routed via the proxy, and asserts the discovered endpoints cover the seeded
-//! paths and that the `q` query parameter shows up as an injection point.
+//! Each test serves the bundled multi-vuln `aitm-testtarget` (vulnerable seed),
+//! scopes its loopback host and drives `scan.discover` through the embedded
+//! obscura engine routed via the proxy:
+//!
+//! - `scan_discover_end_to_end`: the discovered endpoints cover the seeded
+//!   paths and the `q` query parameter shows up as an injection point;
+//! - `scan_discover_three_times_reuses_the_browser`: sequential scans in one
+//!   session all crawl (the browser needs no reset between them);
+//! - `scan_discover_over_the_web_bridge_returns`: the result reaches a `/bus`
+//!   WebSocket client, as the web Scan panel drives it.
 //!
 //! Gated on a real browser the M4 way, through the shared rig's
 //! [`obscura_enabled`](rig::obscura_enabled): with `AITM_OBSCURA` unset the test
@@ -32,6 +38,7 @@ mod scripted_driver;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,9 +46,8 @@ use aitm::wire::{assemble, Assembled};
 use aitm_browser::launch;
 use aitm_core::{
     engine_may_reach_private, CommandHost, Config, HttpFlow, HttpRequest, McpTransport, Params,
-    ProxyClient, Registry, ScopeEntry, Value,
+    ProxyClient, ScopeEntry, Value,
 };
-use aitm_plugin_scanner::{ScannerConfig, ScannerPlugin};
 use aitm_testtarget::{SeedMode, TestTarget};
 use futures::future::BoxFuture;
 use rig::obscura_enabled;
@@ -80,11 +86,33 @@ async fn wait_listening(addr: SocketAddr) {
     }
 }
 
+/// A CA directory of the rig's own, removed when the rig drops. The tests in this
+/// binary run on parallel threads and `CertAuthority::load_or_generate` is not
+/// safe to race on one directory, so a process-wide path will not do.
+struct CaDir(PathBuf);
+
+impl CaDir {
+    fn new() -> Self {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        Self(std::env::temp_dir().join(format!("aitm-scan-ca-{}-{n}", std::process::id())))
+    }
+}
+
+impl Drop for CaDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Everything one end-to-end scan needs: the vulnerable target, the proxy's
-/// store and guard, the launched engine, and the resolved `scan.discover`.
+/// store and guard, the launched engine, and the `scan.discover` the proxy's own
+/// registry serves (the same instance every frontend reaches).
 struct ScanRig {
-    /// Held so the target keeps serving for the rig's lifetime.
+    /// Held so the target keeps serving, and the CA directory existing, for the
+    /// rig's lifetime.
     _target: TestTarget,
+    _ca_dir: CaDir,
     target_url: String,
     store: Arc<dyn aitm_core::FlowStore>,
     guard: Arc<dyn aitm_core::ScopeRateGuard>,
@@ -106,8 +134,9 @@ async fn scan_rig() -> ScanRig {
 
     // A proxy that MITMs the target as an HTTPS origin; the engine routes through
     // its browser-facing listener.
+    let ca_dir = CaDir::new();
     let mut cfg = Config::default();
-    cfg.ca.dir = std::env::temp_dir().join(format!("aitm-scan-ca-{}", std::process::id()));
+    cfg.ca.dir = ca_dir.0.clone();
     cfg.ssl_insecure = true;
     cfg.browser.proxy_addr = free_addr();
     cfg.scope.entries = vec![ScopeEntry {
@@ -132,11 +161,10 @@ async fn scan_rig() -> ScanRig {
         .await
         .expect("launch obscura through the proxy");
 
-    // The public command path: register the scanner plugin and resolve the
-    // command from the registry, exactly as a frontend would.
-    let mut reg = Registry::new();
-    reg.add_plugin(Box::new(ScannerPlugin::new(ScannerConfig::default())));
-    let cmd = reg
+    // The public command path: resolve the command from the proxy's registry,
+    // exactly as a frontend would, so `cmd` and `mcp` share one instance.
+    let cmd = services
+        .registry
         .command("scan.discover")
         .expect("scan.discover registered")
         .clone();
@@ -146,6 +174,7 @@ async fn scan_rig() -> ScanRig {
 
     ScanRig {
         _target: target,
+        _ca_dir: ca_dir,
         target_url,
         store,
         guard,
@@ -231,21 +260,16 @@ async fn scan_discover_end_to_end() {
     );
 }
 
-/// The browser survives a scan: a second `scan.discover` in the same session
-/// must crawl as well as the first, not stop at `navigation_failed`.
+/// The browser survives a scan: a later `scan.discover` in the same session must
+/// crawl as well as the first, not stop at `navigation_failed`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scan_discover_twice_reuses_the_browser() {
+async fn scan_discover_three_times_reuses_the_browser() {
     if !obscura_enabled() {
         return;
     }
     let rig = scan_rig().await;
     for run in 1..=3 {
         let result = discover(&rig).await;
-        eprintln!(
-            "run {run}: stopped_reason={:?} pages_crawled={:?}",
-            result.get("stopped_reason"),
-            result.get("pages_crawled")
-        );
         assert_ne!(
             result.get("stopped_reason"),
             Some(&Value::Str("navigation_failed".into())),
@@ -292,22 +316,21 @@ async fn scan_discover_over_the_web_bridge_returns() {
     let (mut ws, _) = tokio_tungstenite::connect_async(req)
         .await
         .expect("connect");
-    let send = |v: serde_json::Value| Message::text(format!("{v}\n"));
+    let frame = |v: serde_json::Value| Message::text(format!("{v}\n"));
     ws.send(Message::text(format!(
         "{}\n",
         serde_json::json!({ "token": operator })
     )))
     .await
     .expect("token");
-    ws.send(send(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+    ws.send(frame(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize",
         "params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"aitm-web","version":"0"}}})))
         .await
         .expect("initialize");
     ws.next().await.expect("initialize reply").expect("frame");
 
     for run in 1..=2 {
-        let started = Instant::now();
-        ws.send(send(
+        ws.send(frame(
             serde_json::json!({"jsonrpc":"2.0","id":10 + run,"method":"tools/call",
             "params":{"name":"scan.discover","arguments":{"target": rig.target_url}}}),
         ))
@@ -320,12 +343,7 @@ async fn scan_discover_over_the_web_bridge_returns() {
             .expect("ws ok");
         let text = reply.into_text().expect("text frame").to_string();
         let v: serde_json::Value = serde_json::from_str(&text).expect("json reply");
-        eprintln!(
-            "bridge run {run}: {:?} in {:?}; stopped_reason={}",
-            v["id"],
-            started.elapsed(),
-            v["result"]["structuredContent"]["stopped_reason"]
-        );
+        assert_eq!(v["id"], 10 + run, "reply to the scan request: {text}");
         let n = v["result"]["structuredContent"]["endpoints"]
             .as_array()
             .map_or(0, Vec::len);
