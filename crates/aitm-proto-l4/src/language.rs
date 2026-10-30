@@ -64,7 +64,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use aitm_core::{CallerTrust, Value};
+use aitm_core::Value;
 use aitm_plugin::language::{
     GuardHandle, Guarded, HostCallCtx, HostError, HostFn, HostFnSig, NamespaceCatalog, ParamSig,
     PocStepHandler, PocStepInputs, PocStepOutcome, PocStepSchema, ProtocolLanguage, RegisterError,
@@ -255,8 +255,9 @@ impl GuardHandle for L4SeamGuard {
         // Gate on the **live per-call caller trust** (`ctx.caller()`), not a
         // build-time bool: the shared engine serves operator and agent callers
         // alike, so only the trust of *this* invocation can decide the agent gate.
+        // The gate applies to every caller the shared predicate does not trust.
         agent_gate_check(
-            ctx.caller() == CallerTrust::Agent,
+            !ctx.caller().is_trusted_control(),
             &self.gates,
             fn_name,
             self.gate,
@@ -265,20 +266,21 @@ impl GuardHandle for L4SeamGuard {
 }
 
 /// Enforce the per-capability agent gate for `verb`, exactly as the command
-/// path's [`L4AgentGate`](crate::commands) does: an **agent** caller (`is_agent`,
-/// i.e. the live `CallerTrust::Agent` of this invocation) is refused a Sensitive
-/// verb whose `l4.allow_agent_*` gate is closed; an **operator** caller bypasses
-/// it, as the operator/CLI roles do on the command path. The input is the *live
+/// path's [`L4AgentGate`](crate::commands) does: a **gated** caller (`gated`,
+/// i.e. a caller the shared `CallerTrust::is_trusted_control` predicate does not
+/// trust, the live agent of this invocation) is refused a Sensitive verb whose
+/// `l4.allow_agent_*` gate is closed; a **trusted-control** caller (operator/CLI)
+/// bypasses it, as those roles do on the command path. The input is the *live
 /// per-call trust*, never a build-time snapshot, so one shared engine gates each
 /// call correctly. A verb with no agent gate (`None`) is always admitted here
 /// (its own guard, e.g. `scope.add`'s widen, runs in the verb body).
 fn agent_gate_check(
-    is_agent: bool,
+    gated: bool,
     gates: &L4AgentGates,
     verb: &str,
     gate: Option<AgentGate>,
 ) -> Result<(), HostError> {
-    if !is_agent {
+    if !gated {
         return Ok(());
     }
     if let Some(gate) = gate {
@@ -651,7 +653,7 @@ impl PocStepHandler for L4StepHandler {
         // the **live caller trust of this PoC run** (`inputs.caller`, seeded by the
         // runner from the `poc.run` `CommandHost` frontend), never a build-time bool.
         agent_gate_check(
-            inputs.caller == CallerTrust::Agent,
+            !inputs.caller.is_trusted_control(),
             &self.live.guard.agent_gates(),
             &op,
             gate_for(&op),
