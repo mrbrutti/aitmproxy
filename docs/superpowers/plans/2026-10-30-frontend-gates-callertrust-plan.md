@@ -231,6 +231,27 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 5 (Tester) | tester | Minor | `Frontend` doc scan sentence over-claims (scan flags only the agent role) | fixed in 5eff8bd |
+| 5 (Tester) | tester | Minor | `any_role` / `fanout_role` Operator routing in `aitm-mcp` missing from "Adding a variant" | fixed in 5eff8bd (doc names D4 handshake, `any_role`, `fanout_role`) |
+| 5 (Tester) | tester | Minor | scan is a tripwire, not a proof; Task 10 red demonstration replaced by a fixture test | accepted (orchestrator, autonomous mode): stated limitation, documented in the scan header; fixture test exercises the same `scan_tree` |
+| 1-10 | quality | Minor | Q1 doc over-claims / Operator routing omitted | fixed in 5eff8bd |
+| 1-10 | quality | Minor | Q2 module headers still describe the old `== Mcp` condition (`language.rs`, `commands/mod.rs`, rhai `commands.rs`, `activation_gate.rs`) | fixed in 5eff8bd (comments only) |
+| 1-10 | quality | Minor | Q3 catch-all detector misses guards containing `=` | fixed in b53f32b (lazy guard, new red-first vectors) |
+| 1-10 | quality | Minor | Q4 `classifier_wildcard_free.rs` mostly replaceable by a clippy attribute; exact-body pin | fixed in 5eff8bd (deny lints on the three classifiers, proven to reject a replaced arm) and b53f32b (pin relaxed to no `match`/`=>`) |
+| 1-10 | quality | Minor | Q5 fixture test copies the scan loop, `ALLOWED` skip unexercised | fixed in b53f32b (`scan_tree` shared, allow-list skip tested) |
+| 1-10 | quality | Minor | Q6 non-vacuity pins file paths; lexer larger than planned | non-vacuity fixed in b53f32b (content-based); scanner size accepted (orchestrator, autonomous mode): correct on all 228 files, blanker prevents a real false negative |
+| 1-10 | quality | Minor | Q7 `trust_tests` self-comparing helper and duplicate stub | fixed in 5eff8bd |
+| 1-10 | quality | Minor | Q8 gate-order tests coupled to store/parser wording | fixed in b53f32b |
+| 1-10 | quality | Minor | Q9 double negative at `agent_gate_check(gated)` call sites; cosmetic test indentation | accepted (orchestrator, autonomous mode): call-site shape is mandated by the spec |
+| 1-10 | quality | Minor | Q9 allow-list rationale repeated in four gate comments | fixed in 5eff8bd |
+| 1-10 | security | Minor | X1 scan misses `if let`, `let ... else`, `Some(..)` operands; workspace members outside `crates/` | fixed in b53f32b (match arms and aliasing left as documented evasions: legitimate label sites exist) |
+| 1-10 | security | Minor | X2 wildcard check misses `mut x =>` / `ref x =>` | fixed in b53f32b; `x @ _ =>` remains an undetected shape (clippy `redundant_pattern` covers it) |
+| 1-10 | security | Minor | X3 "Adding a variant" omits Operator-keyed sites in `aitm-mcp` | fixed in 5eff8bd |
+| 1-10 | spec | Minor | S1 scan sentence over-claims | fixed in 5eff8bd |
+| 1-10 | spec | Minor | S2 activation_gate doc says a new origin "is classified as an agent" | fixed in 5eff8bd |
+| 1-10 | spec | Minor | S3 Tester commit prefix does not follow `test(<area>): tester -` | accepted (orchestrator, autonomous mode): history left as is |
+| 1-10 | spec | Minor | S4 scanner larger than the spec's sizing, extra self-test | accepted (orchestrator, autonomous mode): in-spirit, test-only, spec delegated the implementation |
+| 1-10 | spec | Minor | S5 Status lines attribute approval to the orchestrator, not Matt | accepted (orchestrator, autonomous mode): honest attribution under Matt's standing self-approve instruction; the two Open questions and two new observations are surfaced to Matt in the PR |
 
 ## Shipped
 
