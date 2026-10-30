@@ -30,6 +30,7 @@ use hyper::header::{self, HeaderMap, HeaderValue};
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::Value as JsonValue;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role, WebSocketConfig};
@@ -48,6 +49,14 @@ pub const MAX_MESSAGE_BYTES: usize = 16 << 20;
 /// unauthenticated connection-exhaustion DoS (remote under
 /// `AITM_WEB_INSECURE_BIND`). The deadline is absolute, so pings cannot extend it.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A peer being refused must finish the close handshake within this budget. `close`
+/// sends our Close frame and then reads until the peer answers it; without a
+/// deadline a peer that never answers — or keeps sending data — pins the
+/// connection's task and socket indefinitely, including on the pre-auth refusals
+/// that [`HANDSHAKE_TIMEOUT`] exists to bound. Past the deadline the connection is
+/// dropped; that is not an error.
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The most frames one connection may have running at once. At the cap the relay
 /// stops reading further frames (TCP backpressure) until one finishes, so neither
@@ -234,14 +243,15 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
             next = ws.next(), if in_flight.len() < MAX_IN_FLIGHT => match next {
                 Some(Ok(Message::Text(text))) => {
                     let Some(lines) = bounded_lines(lines_of(text.as_str())) else {
-                        return close(ws, CloseCode::Size, TOO_MANY_LINES).await;
+                        return refuse(ws, in_flight, CloseCode::Size, TOO_MANY_LINES).await;
                     };
                     if !lines.is_empty() {
                         in_flight.push(dispatch_frame(&state.mcp, role, lines));
                     }
                 }
                 Some(Ok(Message::Binary(_))) => {
-                    return close(ws, CloseCode::Unsupported, "text frames only").await;
+                    return refuse(ws, in_flight, CloseCode::Unsupported, "text frames only")
+                        .await;
                 }
                 Some(Ok(Message::Close(frame))) => {
                     debug!(?frame, "websocket closed by the client");
@@ -300,17 +310,53 @@ fn classify_token(first: &str, state: &WebState) -> Option<Frontend> {
     None
 }
 
-async fn close(mut ws: Ws, code: CloseCode, reason: &'static str) -> anyhow::Result<()> {
+/// Refuse the peer after authentication: drop the frames in flight, then close.
+/// Dropping the handles frees the replies already produced rather than holding
+/// them (up to `MAX_IN_FLIGHT` × [`MAX_LINES_PER_FRAME`]) for the whole close
+/// handshake; the blocking tasks still running are detached, as when the
+/// connection ends any other way.
+async fn refuse(
+    ws: Ws,
+    in_flight: FuturesUnordered<FrameTask>,
+    code: CloseCode,
+    reason: &'static str,
+) -> anyhow::Result<()> {
+    drop(in_flight);
+    close(ws, code, reason).await
+}
+
+async fn close(ws: Ws, code: CloseCode, reason: &'static str) -> anyhow::Result<()> {
+    close_within(ws, code, reason, CLOSE_DRAIN_TIMEOUT).await
+}
+
+/// Send a Close frame and wait for the peer to answer it, for at most `limit`
+/// (covering our write as well as the drain, so a peer that stops reading cannot
+/// stall it either). Running out of time is not an error: the connection is
+/// dropped, which is all a peer that will not finish the handshake is owed.
+async fn close_within<S>(
+    mut ws: WebSocketStream<S>,
+    code: CloseCode,
+    reason: &'static str,
+    limit: Duration,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let frame = CloseFrame {
         code,
         reason: reason.into(),
     };
-    if let Err(e) = ws.close(Some(frame)).await {
-        debug!(error = %e, "websocket close failed");
-        return Ok(());
+    let handshake = async {
+        if let Err(e) = ws.close(Some(frame)).await {
+            debug!(error = %e, "websocket close failed");
+            return;
+        }
+        // Drain so the close handshake completes and the client sees our frame.
+        while let Some(Ok(_)) = ws.next().await {}
+    };
+    if tokio::time::timeout(limit, handshake).await.is_err() {
+        debug!("websocket close handshake timed out; dropping the connection");
     }
-    // Drain so the close handshake completes and the client sees our frame.
-    while let Some(Ok(_)) = ws.next().await {}
     Ok(())
 }
 
@@ -499,6 +545,69 @@ mod tests {
             Some(vec!["{\"a\":1}".to_owned()])
         );
         assert_eq!(bounded_lines(lines_of("")), Some(Vec::new()));
+    }
+
+    /// Both ends of an in-memory WebSocket: (server end, client end).
+    async fn socket_pair() -> (
+        WebSocketStream<tokio::io::DuplexStream>,
+        WebSocketStream<tokio::io::DuplexStream>,
+    ) {
+        let (server, client) = tokio::io::duplex(64 * 1024);
+        (
+            WebSocketStream::from_raw_socket(server, Role::Server, None).await,
+            WebSocketStream::from_raw_socket(client, Role::Client, None).await,
+        )
+    }
+
+    #[tokio::test]
+    async fn close_gives_up_on_a_peer_that_never_answers() {
+        // The client end is held open but never read from or written to, so it
+        // never answers our Close frame. Without a deadline the drain waits forever.
+        let (server, _stalled_client) = socket_pair().await;
+        let closed = tokio::time::timeout(
+            Duration::from_secs(5),
+            close_within(
+                server,
+                CloseCode::Size,
+                TOO_MANY_LINES,
+                Duration::from_millis(50),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(closed, Ok(Ok(()))),
+            "close must give up on a stalled peer and return Ok, got {closed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_completes_the_handshake_with_a_peer_that_answers() {
+        let (server, mut client) = socket_pair().await;
+        // A drain limit far above the outer bound: finishing inside the outer bound
+        // proves the handshake completed rather than the deadline firing.
+        let server_side = close_within(
+            server,
+            CloseCode::Size,
+            TOO_MANY_LINES,
+            Duration::from_secs(30),
+        );
+        let client_side = async {
+            // The client sees our Close frame, then answers it by polling on until
+            // the server finishes and the stream ends.
+            let frame = match client.next().await {
+                Some(Ok(Message::Close(Some(frame)))) => frame,
+                other => panic!("expected a Close frame, got {other:?}"),
+            };
+            assert_eq!(frame.code, CloseCode::Size);
+            assert_eq!(frame.reason.as_str(), TOO_MANY_LINES);
+            while let Some(Ok(_)) = client.next().await {}
+        };
+        let (closed, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server_side, client_side)
+        })
+        .await
+        .expect("the close handshake completes without waiting for the drain deadline");
+        closed.expect("a completed handshake is Ok");
     }
 
     #[test]
