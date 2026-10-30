@@ -21,13 +21,14 @@ use aitm_core::{
 };
 use futures::future::BoxFuture;
 
-const COMMANDS: [&str; 6] = [
+const COMMANDS: [&str; 7] = [
     "browser.navigate",
     "browser.click",
     "browser.type",
     "browser.screenshot",
     "browser.eval",
     "browser.get_dom",
+    "browser.confine",
 ];
 
 /// A `ProxyClient` no browser command should ever reach.

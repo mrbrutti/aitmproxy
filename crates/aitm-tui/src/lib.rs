@@ -256,6 +256,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "browser.screenshot",
     "browser.eval",
     "browser.get_dom",
+    "browser.confine",
     "poc.build",
     "poc.run",
     "poc.list",

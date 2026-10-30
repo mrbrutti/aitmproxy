@@ -50,6 +50,7 @@ const EXPECTED_TOOLS: [&str; 54] = [
     "browser.screenshot",
     "browser.eval",
     "browser.get_dom",
+    "browser.confine",
     "poc.build",
     "poc.run",
     "poc.list",
@@ -211,7 +212,12 @@ fn ac7_exact_tool_set() {
             )
         })
         .collect();
-    assert_eq!(actual.len(), 6, "six browser.* tools: {:?}", actual.keys());
+    assert_eq!(
+        actual.len(),
+        7,
+        "seven browser.* tools: {:?}",
+        actual.keys()
+    );
     let actual_text = serde_json::to_string_pretty(&actual).expect("serialize schemas");
     let snapshot_text = std::fs::read_to_string(BROWSER_SCHEMAS_SNAPSHOT).unwrap_or_else(|e| {
         panic!("read snapshot {BROWSER_SCHEMAS_SNAPSHOT}: {e}\nactual schemas:\n{actual_text}\n")

@@ -24,6 +24,19 @@ it beside the resolved `aitm` binary. `.deb` depends on `libc6, libgcc-s1`;
 Needs `nfpm` on `PATH` (install via `go install` or its release binary). Set
 `CARGO_BUILD_FLAGS="--target <triple>"` to cross-build a non-host arch.
 
+`fetch-obscura-dev.sh` is the **development** counterpart: it drops the obscura
+engine next to the dev binaries without a full package build. `aitm` discovers
+obscura beside its own executable, but `cargo build`/`cargo run -p aitm` only put
+`aitm` in `target/debug/` (or `target/release/`) — nothing puts `obscura` there.
+Run `scripts/fetch-obscura-dev.sh` once: it detects the host target, downloads
+and SHA256SUMS-verifies the matching `obscura-<triple>.tar.gz` (same source and
+verification as `package.sh`), and copies a real `obscura` into both
+`target/debug/` and `target/release/` (honouring `CARGO_TARGET_DIR`). Then
+`cargo run -p aitm` and local demos drive the browser with no config, `PATH`
+entry, or `AITM_OBSCURA_BIN`. Override the release tag with `OBSCURA_TAG`; supply
+a PAT via `OBSCURA_GH_TOKEN` if `gh` is not logged in. See
+[`docs/DEVELOPMENT.md`](../docs/DEVELOPMENT.md).
+
 For the full end-to-end release procedure — tag, let CI build the Linux
 artifacts, build/sign/notarize the macOS DMG + tarball on Matt's Mac, re-run the
 `finalize` job, and update the Homebrew tap — see the ordered runbook in

@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use aitm_bus_client::InProcessHandler;
 use aitm_core::{
-    AgentState, BrowserDriver, Config, FlowStore, Frontend, McpTransport, PipelineClient, Proxy,
-    ProxyClient, Registry, ScopeRateGuard,
+    AgentState, BrowserDriver, Config, EgressConfinement, FlowStore, Frontend, McpTransport,
+    PipelineClient, Proxy, ProxyClient, Registry, ScopeRateGuard,
 };
 use aitm_mcp::{ConnCtx, McpServer};
 use aitm_tui::{RunOptions, TransportChoice};
@@ -85,6 +85,9 @@ pub struct Services {
     pub client: Arc<dyn ProxyClient>,
     pub guard: Arc<dyn ScopeRateGuard>,
     pub browser: Option<Arc<dyn BrowserDriver>>,
+    /// The proxy's live browser-egress posture (`Proxy::egress()`), shared with
+    /// every frontend so `browser.confine` flips the connector's real posture.
+    pub egress: Arc<EgressConfinement>,
     /// Where tui-mode tracing went (see [`init_tracing`]), for the startup toast.
     pub log: TuiLog,
 }
@@ -120,6 +123,7 @@ pub fn services(
         client,
         guard,
         browser,
+        egress: proxy.egress(),
         log,
     }
 }
@@ -141,6 +145,9 @@ pub fn server(cfg: &Config, transport: McpTransport, services: &Services) -> Mcp
         // Wire the persistent finding recorder so a poc.run records on pass (T7);
         // persistence stays gated on findings.dir.
         .with_finding_recorder(Arc::new(aitm_findings::DiskFindingRecorder))
+        // The proxy's live egress posture, so browser.confine over any server
+        // built here (agent transport, TUI bus, web bridge) flips the real one.
+        .with_egress(services.egress.clone())
         .with_services(
             services.store.clone(),
             services.client.clone(),
@@ -397,5 +404,56 @@ mod tests {
             .startup_note(),
             "embedded proxy · logging disabled: could not open /tmp/aitm-tui-7.log: Is a directory (os error 21)"
         );
+    }
+
+    /// Task 4b / AC9 (end-to-end reachability): the service handles `main`
+    /// shares carry the proxy's live egress posture (the same `Arc`, not a
+    /// copy), and a `browser.confine` sent to a `tui::server`-built server —
+    /// the one way every server in this binary is built — flips that very
+    /// posture on and back off.
+    #[test]
+    fn frontend_servers_toggle_the_proxy_egress_posture() {
+        let mut cfg = Config::default();
+        cfg.ca.dir = std::env::temp_dir().join(format!("aitm-tui-egress-{}", std::process::id()));
+        let proxy = crate::wire::build_proxy(&cfg).expect("build proxy");
+        let services = services(&proxy, &cfg, None, TuiLog::Off);
+        assert!(
+            Arc::ptr_eq(&services.egress, &proxy.egress()),
+            "the frontends share the proxy's own posture handle"
+        );
+
+        let srv = server(&cfg, McpTransport::Stdio, &services);
+        let operator = ConnCtx::new(Frontend::Operator);
+        let confine = |on: bool| -> serde_json::Value {
+            let req = serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "browser.confine", "arguments": {"on": on}}
+            });
+            let resp = srv
+                .handle_on(&operator, &req.to_string())
+                .expect("a response");
+            serde_json::from_str(&resp).expect("response is JSON")
+        };
+
+        assert!(!proxy.egress().confined(), "fixture starts free");
+        let resp = confine(true);
+        assert_eq!(
+            resp["result"]["structuredContent"],
+            serde_json::json!({"confined": true}),
+            "{resp}"
+        );
+        assert!(
+            proxy.egress().confined(),
+            "the proxy's live posture flipped on"
+        );
+
+        let resp = confine(false);
+        assert_eq!(
+            resp["result"]["structuredContent"],
+            serde_json::json!({"confined": false}),
+            "{resp}"
+        );
+        assert!(!proxy.egress().confined(), "and back off");
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
     }
 }
