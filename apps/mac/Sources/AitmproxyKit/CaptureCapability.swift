@@ -59,8 +59,11 @@ public enum CaptureCapabilityEvent: Hashable, Sendable {
 
 extension CaptureCapability {
     /// The capability after `event`. Pure, so the framework-facing controller stays
-    /// thin glue. Tunnel events only mean something once the extension is approved:
-    /// a late one never overrides a pending approval or a degradation.
+    /// thin glue. Tunnel events are ADVISORY — a late one never overrides a pending
+    /// approval or a degradation. Activation events (`needsUserApproval`, `activated`,
+    /// `willCompleteAfterReboot`, `failed`) are AUTHORITATIVE and intentionally reset
+    /// even from `.capturing`: a genuine re-approval/re-activation really did change the
+    /// extension's state, so the capability must follow it rather than cling to capturing.
     public func applying(_ event: CaptureCapabilityEvent) -> CaptureCapability {
         switch event {
         case .needsUserApproval:

@@ -120,6 +120,9 @@ final class ExtensionController: NSObject {
             try await manager.loadFromPreferences()
             observeTunnel(manager)
             try manager.connection.startVPNTunnel()
+            // Usually `.connecting` here, which is a no-op; this only catches a REUSED
+            // manager already `.connected` before the observer was wired. The normal
+            // `.connected` transition arrives through `observeTunnel`.
             applyTunnelStatus(manager.connection.status)
         } catch {
             apply(.failed("Could not start the capture tunnel: \(error.localizedDescription)"))
