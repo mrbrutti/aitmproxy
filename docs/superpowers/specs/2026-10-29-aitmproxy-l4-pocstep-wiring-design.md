@@ -12,14 +12,33 @@ on live per-call trust, and the `ProtocolLanguage` seam already gives L4 a nativ
 `PocStepInputs::caller` and gates exactly like the rhai face. The runner
 (`StdPocRunner`) already dispatches a `Step::Protocol { ns, body, extract }` to a
 registered `PocStepHandler` and seeds `inputs.caller` from the `poc.run`
-command's frontend (`CallerTrust::from(host.frontend())`). The one missing wire is
-in production assembly: `run_poc_command` builds the runner with the script
-executor but **never** threads a `PocStepRegistry`, and nothing in
-`crates/aitm/src/{main.rs,wire.rs}` hands the L4 handler to `poc.run`. So an `l4:`
-step in a PoC YAML run via `poc.run` today fails with "no handler registered for
-protocol step `l4:`". This change threads the L4 step handler — over the **same**
-shared `L4Guard` + `L4FlowStore` the rhai face and the `l4.*` command module
-already share — into the production `poc.run`. It is wiring, not redesign.
+command's frontend (`CallerTrust::from(host.frontend())`). There are **two**
+missing wires, discovered during the build:
+
+1. **The file loader rejects `l4:` before the registry is ever consulted.**
+   `poc.run` → `parse_poc` → `schema::validate` enforces a hardcoded
+   `KNOWN_STEPS` allow-list (`["http","browser","extract","script"]`,
+   `crates/aitm-poc/src/schema.rs:32,61`) and returns `UnknownStep` for any other
+   key. So an `l4:` PoC **file** fails at validation with `unknown step type
+   `l4`` — *before* the Protocol seam or any registry runs. This allow-list is a
+   pre-seam leftover: `model.rs:77` already documents that an unknown namespace
+   key deserializes to `Step::Protocol`, and `protocol_step.rs::unknown_protocol_step_errors_at_run`
+   already makes an **unregistered** namespace a **runtime** error. `validate`
+   was simply never aligned to that #44 seam contract, so the seam is unreachable
+   from a PoC file. *(The spec's original premise — that the failure was "no
+   handler registered" — was wrong; corrected after the build verified source.)*
+2. **Production assembly never threads the registry.** `run_poc_command` builds
+   the runner with the script executor but **never** threads a
+   `PocStepRegistry`, and nothing in `crates/aitm/src/{main.rs,wire.rs}` hands the
+   L4 handler to `poc.run`.
+
+This change (a) relaxes `schema::validate` to accept a protocol-shaped step so
+the loader is consistent with the already-shipped seam contract — deny-by-default
+preserved because an unregistered namespace still fails, now at **runtime**, never
+silently — and (b) threads the L4 step handler, over the **same** shared
+`L4Guard` + `L4FlowStore` the rhai face and the `l4.*` command module already
+share, into the production `poc.run`. It is wiring + a loader-alignment bug fix,
+not redesign.
 
 ## Goals
 
@@ -48,7 +67,9 @@ already share — into the production `poc.run`. It is wiring, not redesign.
 - No change to the rhai `l4.*` host-fn face or to the `l4.*` command module.
 - No new `l4:` verbs; no change to `poc-yaml.schema.json` / `rhai.api.json` or any
   shared language definition (the catalog already advertises the `l4:` step via
-  `L4Language::catalog().poc_step`).
+  `L4Language::catalog().poc_step`). The Rust `schema::validate` allow-list IS
+  relaxed (see Design) to accept a protocol-shaped step — that is a loader bug fix
+  aligning with the #44 seam contract, not a language-definition change.
 - Not changing the runner's HTTP finding-anchor contract. `StdPocRunner` still
   requires an HTTP flow to anchor the finding capture, so an **l4-only** PoC (no
   `http:` step) still ends with the existing "no HTTP flow was captured" error
@@ -126,10 +147,28 @@ already share — into the production `poc.run`. It is wiring, not redesign.
 
 ### The gap
 
-`run_poc_command` (runner.rs) builds the runner and calls `with_script_executor`
-but never `with_step_handlers`. `PocCommands::load` never passes a registry. So
-`poc.run`'s runner always has an empty `step_handlers`, and every `l4:` step hits
-the "no handler registered" error.
+Gap A (loader): `schema::validate` (`crates/aitm-poc/src/schema.rs:32,61`) rejects
+any step key outside `KNOWN_STEPS = ["http","browser","extract","script"]` as
+`UnknownStep`, so an `l4:` PoC file fails at `parse_poc` before the registry runs.
+This contradicts the shipped seam contract (`model.rs:77` deserializes unknown
+namespaces to `Step::Protocol`; `protocol_step.rs::unknown_protocol_step_errors_at_run`
+rejects an unregistered namespace at runtime). Fix: relax `validate` to accept a
+**protocol-shaped** step — exactly one namespace key (not one of the four fixed)
+plus the model's permitted step-level siblings (e.g. `extract`) — while keeping
+every other check (required `id`/`info`, the four fixed steps' structural checks,
+and rejecting a malformed step: empty map, multiple step keys, unparseable shape).
+An unknown/unregistered namespace is then refused at **runtime** (the registry
+lookup), never silently run — deny-by-default is preserved, the rejection just
+moves from parse-time to run-time. This shifts the existing AC-L7
+(`crates/aitm-poc/tests/serde.rs::unknown_step_rejected`, the `telnet` test) from
+"validate rejects an unknown step" to "validate accepts the protocol shape; the
+run/registry rejects the unregistered namespace."
+
+Gap B (assembly): `run_poc_command` (runner.rs) builds the runner and calls
+`with_script_executor` but never `with_step_handlers`; `PocCommands::load` never
+passes a registry. So `poc.run`'s runner always has an empty `step_handlers`, and
+even once Gap A is fixed every `l4:` step would hit the "no handler registered"
+runtime error until the registry is threaded.
 
 ### The change — two threading edits plus tests
 
@@ -199,10 +238,16 @@ executor **and** `with_step_handlers(l4 registry)` → `run_inner` hits
 Each is observable through an invoked `poc.run` over a recording
 `CaptureInjectBackend` (privilege-free), unless marked privilege-gated.
 
-1. **AC1 (registration):** With `l4.enabled`, a PoC whose step is
-   `l4: { op: send_recv, ... }` run via the assembled `poc.run` does **not** fail
-   with `"no handler registered for protocol step `l4:`"`. (Before this change it
-   does; this is the regression proof.)
+1. **AC1 (loader + registration):** With `l4.enabled`, a PoC **file** whose step
+   is `l4: { op: send_recv, ... }` run via the assembled `poc.run` (a) PASSES
+   `schema::validate` (no `unknown step type `l4`` error) and (b) dispatches to
+   `L4StepHandler` — i.e. does **not** fail with `"no handler registered for
+   protocol step `l4:`"` either. (Before this change it fails at (a); this is the
+   regression proof. A loader-level test asserts an `l4:` file parses + validates
+   and reaches the handler.)
+   - **AC1b (deny-by-default preserved):** a PoC file with an **unregistered**
+     namespace step (e.g. `telnet:`) PASSES validate but is REFUSED at runtime
+     (never silently run) — the updated AC-L7 contract.
 2. **AC2 (operator runs):** With the `poc.run` `CommandHost` built
    `with_frontend(Frontend::Operator)` (or `Cli`), the `l4:` `send_recv`/`inject`
    step reaches the recording backend exactly once
@@ -227,10 +272,12 @@ Each is observable through an invoked `poc.run` over a recording
    `allow_agent_*` flag drives AC3/AC4 — the `poc.run` gate honours the same
    guard the command module was built over.
 7. **AC7 (scope discipline):** The diff changes only
-   `crates/aitm-poc/src/runner.rs`, `crates/aitm/src/wire.rs`,
-   `crates/aitm/src/main.rs`, and test/fixture files. `L4StepHandler`,
-   `L4Language`'s gate logic, the rhai host-fn face, and the `l4.*` command module
-   are unchanged; no `l4:` verb is added; no shared language definition changes.
+   `crates/aitm-poc/src/runner.rs`, `crates/aitm-poc/src/schema.rs` (the validate
+   relaxation), `crates/aitm/src/wire.rs`, `crates/aitm/src/main.rs`, and
+   test/fixture files (including `crates/aitm-poc/tests/serde.rs` for the AC-L7
+   shift). `L4StepHandler`, `L4Language`'s gate logic, the rhai host-fn face, and
+   the `l4.*` command module are unchanged; no `l4:` verb is added; no shared
+   language definition (`poc-yaml.schema.json` / `rhai.api.json`) changes.
 8. **AC8 (gate):**
    `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
    passes. (`node --test docs/design/languages/` only if a shared def changes —

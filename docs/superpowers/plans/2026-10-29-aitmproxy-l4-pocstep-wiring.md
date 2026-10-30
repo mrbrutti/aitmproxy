@@ -6,14 +6,18 @@
 
 ## Overview
 
-Three sequential tasks. Task 1 threads a `PocStepRegistry` through the `poc.run`
+Four sequential tasks. Task 1 threads a `PocStepRegistry` through the `poc.run`
 command in `aitm-poc` (no L4 dependency — pure seam plumbing), proven by a
-unit test with a fake handler. Task 2 builds the L4 step registry from the live
-`L4Language` in the binary and threads it through `ScriptWiring` into `poc.run`,
-proven by a hermetic production-assembly test with a recording backend covering
-AC1–AC6. Task 3 adds the privilege-gated real-wire loopback proof (AC9) and runs
-the full branch gate (AC7, AC8). The tasks are sequential (2 depends on 1, 3 on
-2); none are independent. Every task is test-first.
+unit test with a fake handler. **Task 1b (added after the build found the gap)
+relaxes `schema::validate` to accept a protocol-shaped step so an `l4:` PoC file
+parses at all — aligning the loader with the already-shipped #44 seam contract;
+without it Task 2's assembly test is unreachable.** Task 2 builds the L4 step
+registry from the live `L4Language` in the binary and threads it through
+`ScriptWiring` into `poc.run`, proven by a hermetic production-assembly test with
+a recording backend covering AC1–AC6. Task 3 adds the privilege-gated real-wire
+loopback proof (AC9) and runs the full branch gate (AC7, AC8). The tasks are
+sequential (1b depends on 1, 2 on 1b, 3 on 2); none are independent. Every task is
+test-first.
 
 ## Tasks
 
@@ -66,10 +70,35 @@ the full branch gate (AC7, AC8). The tasks are sequential (2 depends on 1, 3 on
   `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test -p aitm-poc`
   passes.
 
+### Task 1b: relax `schema::validate` to accept a protocol-shaped step
+
+- **Satisfies:** AC1 (loader half), AC1b (deny-by-default at runtime), AC7; the AC-L7 shift.
+- **Depends on:** Task 1 (independent files, but keep the branch sequential).
+- **Files:** `crates/aitm-poc/src/schema.rs` (modify — relax `KNOWN_STEPS` gate),
+  `crates/aitm-poc/tests/serde.rs` (modify — the AC-L7 `unknown_step_rejected` /
+  `telnet` test).
+- **Change:** in `validate`, accept a step whose key is EITHER one of the four
+  fixed types (keep their existing structural checks) OR a **protocol-shaped**
+  step: exactly one namespace key (not a fixed type) plus the model's permitted
+  step-level siblings (e.g. `extract`). KEEP every other check — required
+  `id`/`info`, and reject a malformed step (empty map, multiple step keys, or an
+  otherwise unparseable shape). Do NOT make `validate` accept arbitrary input. An
+  unknown/unregistered namespace is left to fail at RUNTIME (the registry lookup),
+  never silently run.
+- **Test:** rewrite `crates/aitm-poc/tests/serde.rs::unknown_step_rejected` to the
+  seam contract: a `telnet:` step now PASSES `validate` (protocol-shaped), and a
+  separate assertion proves an unregistered namespace is REFUSED at runtime (reuse
+  the `protocol_step.rs` runtime-rejection pattern or assert the registry lookup
+  errors) — i.e. "an unregistered step never silently runs." Add a positive test:
+  an `l4:`-shaped step passes `validate`.
+- **Done when:** the updated + new tests pass and `cargo fmt --check && cargo
+  clippy --all-targets -- -D warnings && cargo test -p aitm-poc` passes. Commit
+  separately from Task 1.
+
 ### Task 2: build the L4 step registry and thread it from assembly
 
 - **Satisfies:** AC1, AC2, AC3, AC4, AC5, AC6.
-- **Depends on:** Task 1.
+- **Depends on:** Task 1b.
 - **Files:**
   `crates/aitm/src/wire.rs` (modify — `ScriptWiring`, `PocCommands`,
   `assemble_with_scripts`),
@@ -173,6 +202,7 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 1 | Build (coder) | Blocker | Spec premise wrong: an `l4:` PoC file fails at `schema::validate` (`KNOWN_STEPS` allow-list), not at "no handler registered" — the #44 seam is unreachable from a PoC file; the loader allow-list is a pre-seam leftover | Architect-ratified scope widening: added Task 1b to relax `validate` to a protocol-shaped step (deny-by-default preserved at runtime); AC1/AC7/AC-L7 + the spec premise corrected; schema.rs + serde.rs added to scope |
 
 ## Shipped
 
