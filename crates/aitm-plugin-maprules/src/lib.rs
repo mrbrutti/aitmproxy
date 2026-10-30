@@ -303,6 +303,14 @@ fn split_url(url: &str) -> anyhow::Result<(String, String, String)> {
         None => (rest, "/"),
     };
     validate_authority(authority)?;
+    // The rewritten path reaches the upstream request line verbatim (the wire
+    // encoder formats `"{method} {path} HTTP/1.1"` with no CR/LF strip), so a
+    // space or control byte in it would smuggle a header or a second request.
+    if path.bytes().any(|b| b <= b' ' || b == 0x7f) {
+        anyhow::bail!(
+            "redirect url {url:?} has a space or control character in its path; percent-encode it"
+        );
+    }
     Ok((scheme.to_string(), authority.to_string(), path.to_string()))
 }
 

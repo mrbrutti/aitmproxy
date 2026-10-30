@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
-use aitm::wire::{build_proxy_with, Features};
+use aitm::wire::{assemble_with, build_proxy_with, Features};
 use aitm_core::Config;
 use aitm_proto_l4::config::L4Config;
 use aitm_proto_l4::L4Privilege;
@@ -104,4 +104,54 @@ fn l4_enabled_no_priv_builds() {
     // The read verb and a wire verb are both registered (honest surface).
     assert!(proxy.registry().command("l4.interfaces").is_some());
     assert!(proxy.registry().command("l4.inject").is_some());
+}
+
+/// L4OPS-AC17: with L4 enabled, the assembly binds the protocol-general capture
+/// ingress to the live module, so a future capture backend (Phase 2's macOS Network
+/// Extension) feeds the same guard + store the operator reads via `l4.flow.*`.
+#[test]
+fn l4_ingress_bound_when_enabled() {
+    let cfg = config_with_ca("ingress-on");
+    let features = Features {
+        l4: l4_enabled(),
+        l4_privilege: Some(L4Privilege::available()),
+        ..Features::default()
+    };
+    let assembled = assemble_with(&cfg, &features).expect("assemble with l4 enabled");
+    assert!(
+        assembled.l4_ingress.is_some(),
+        "the capture ingress is wired when L4 is enabled"
+    );
+}
+
+/// L4OPS-AC17: the capture ingress is assembled for **every** build — its stream/TCP
+/// half is wired so a capture backend (Phase 2's macOS Network Extension) can feed
+/// captured TCP whether or not L4/UDP is enabled. With L4 disabled, only the L4/UDP
+/// half is absent: a UDP dispatch is `Unhandled`.
+#[test]
+fn l4_ingress_stream_half_present_udp_absent_when_disabled() {
+    use aitm_proto_l4::types::{L4Direction, L4Proto, L4Target};
+
+    let cfg = config_with_ca("ingress-off");
+    let assembled = assemble_with(&cfg, &Features::default()).expect("assemble with l4 disabled");
+    let ingress = assembled
+        .l4_ingress
+        .expect("the stream half of the capture ingress is wired for every build");
+
+    let flow = aitm::ingress::CapturedUdpFlow {
+        target: L4Target {
+            interface: "lo0".to_string(),
+            direction: L4Direction::Outbound,
+            dst: Some("127.0.0.1".parse().unwrap()),
+            dst_port: Some(9),
+            proto: L4Proto::Udp,
+        },
+        datagrams: vec![b"probe".to_vec()],
+        peer_identity: None,
+    };
+    assert_eq!(
+        ingress.dispatch_udp(flow),
+        aitm::ingress::IngressOutcome::Unhandled,
+        "no L4/UDP half when L4 is disabled"
+    );
 }

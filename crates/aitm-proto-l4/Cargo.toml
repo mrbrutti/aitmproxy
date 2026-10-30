@@ -12,9 +12,18 @@ description = "Authorized raw-L4 / packet MITM: capture, scapy-style craft + gua
 # (Command/Plugin/CommandHost/ParamSchema/Value/Registry) but not `aitm-plugin`
 # (the ProtocolModule acceptor seam).
 aitm-core.workspace = true
+# The `ProtocolLanguage` / `ScriptHostRegistry` / `PocStepHandler` /
+# `NamespaceCatalog` seam this crate implements to contribute its `l4.*` Rhai
+# host namespace and native `l4:` PoC step (plan Task 6). Acyclic: `aitm-plugin`
+# depends only on `aitm-core`, never on `aitm-proto-l4`.
+aitm-plugin.workspace = true
 # `Command::invoke` returns `anyhow::Result<Value>`.
 anyhow.workspace = true
 serde = { version = "1", features = ["derive"] }
+# The `PocStepHandler::run` body is a late-parsed `serde_yaml::Value` (the seam's
+# human-friendly PoC-step contract), so the `l4:` step handler (Task 6) needs
+# serde_yaml at library scope, not only in tests.
+serde_yaml = "0.9"
 # The command layer bridges a transport-neutral `Value` craft spec / scope entry
 # into the serde-derived `PacketSpec` / `L4ScopeEntry`, and round-trips the
 # uuid-backed `L4ScopeId` / `L4FlowId` as strings on the bus (the reason Task 1/3
@@ -54,11 +63,19 @@ pcap = "2.5"
 nfq = "0.2.5"
 
 [dev-dependencies]
-# config is authored as YAML by the operator; the deserialization test parses it.
-serde_yaml = "0.9"
 # The command tests build a core `CommandHost`, whose `ProxyClient` seam returns a
 # `BoxFuture`; the stub client needs `futures`.
 futures.workspace = true
+# The seam tests (Task 6, `tests/language.rs`) build the real sandboxed Rhai
+# engine (`build_engine_with_languages`) with the `L4Language` installed and run
+# an end-to-end `l4:` PoC step through the `aitm-poc` runner. These are
+# **dev-dependencies**, so the back-edge to `aitm-plugin-rhai` (which depends on
+# `aitm-proto-l4`) is a dev-only cycle Cargo permits — the library graph stays
+# acyclic.
+aitm-plugin-rhai.workspace = true
+aitm-plugin.workspace = true
+aitm-poc.workspace = true
+rhai = { version = "1.27", features = ["sync"] }
 
 [lints]
 workspace = true

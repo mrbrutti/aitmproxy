@@ -74,6 +74,9 @@ pub enum Mode {
     Config,
     Help,
     QuickLook,
+    /// The L4 inject confirm-over-the-wire overlay (ui-ext §3.4, L4OPS-AC10):
+    /// shows the server's wire summary; `y` re-issues with `_confirm`.
+    L4Confirm,
 }
 
 /// What the one-line prompt is collecting.
@@ -861,6 +864,9 @@ pub struct App {
     /// File-name slugs for `poc.build` calls in flight, oldest first (C12:
     /// the reply is the YAML text, named after what the operator typed).
     pub poc_build_pending: VecDeque<String>,
+    /// The L4 operator surface's state (ui-ext Part 3): flows, scope, agent
+    /// gates, craft editor, inject confirm. Inert until the bus offers `l4.*`.
+    pub l4: crate::l4::L4State,
 }
 
 impl App {
@@ -921,6 +927,7 @@ impl App {
             poc_get_inflight: VecDeque::new(),
             pending_artifact: None,
             poc_build_pending: VecDeque::new(),
+            l4: crate::l4::L4State::default(),
         }
     }
 
@@ -1054,9 +1061,25 @@ impl App {
         self.selected_row().map(FlowRow::url)
     }
 
-    /// Scope-as-authorisation (§2.7): `host`, `host:port`, `*.wildcard`.
+    /// Scope-as-authorisation (§2.7): `host`, `host:port`, `*.wildcard`. An L4
+    /// row is in scope when an `l4.scope.list` entry covers its interface
+    /// (the courtesy signal; the guard is the enforcement, Part 5).
     pub fn in_scope(&self, row: &FlowRow) -> bool {
+        if row.kind == FlowKind::L4 {
+            return self
+                .l4
+                .flows
+                .get(&row.id)
+                .is_some_and(|f| self.l4.in_scope(f));
+        }
         scope_covers(&self.scope, &row.authority)
+    }
+
+    /// The full L4 flow for the current selection, if it is an L4 flow.
+    pub fn selected_l4(&self) -> Option<&crate::l4::L4Flow> {
+        self.selected
+            .as_deref()
+            .and_then(|id| self.l4.flows.get(id))
     }
 
     pub fn group_by(&self) -> Option<GroupBy> {
@@ -1395,7 +1418,10 @@ impl App {
                 out.push(BusRequest::Intercept(armed));
             }
             Action::Resume => {
-                if let Some(r) = self.intercept_target().cloned() {
+                if let Some(f) = self.selected_l4().cloned() {
+                    // L4: resume == forward the parked in-path packet.
+                    out.extend(self.l4_intercept_verb("l4.intercept.forward", &f));
+                } else if let Some(r) = self.intercept_target().cloned() {
                     if self.gate(&r) {
                         out.push(BusRequest::Resume(r.id));
                     }
@@ -1428,12 +1454,22 @@ impl App {
                 }
             }
             Action::Kill => {
-                if let Some(r) = self.intercept_target().cloned() {
+                if let Some(f) = self.selected_l4().cloned() {
+                    // L4: kill == drop the parked in-path packet.
+                    out.extend(self.l4_intercept_verb("l4.intercept.drop", &f));
+                } else if let Some(r) = self.intercept_target().cloned() {
                     if self.gate(&r) {
                         out.push(BusRequest::Kill(r.id));
                     }
                 } else {
                     self.toast(Level::Info, "Nothing paused.");
+                }
+            }
+            Action::Edit if self.selected_row().is_some_and(|r| r.kind == FlowKind::L4) => {
+                // L4: edit == open the craft editor to mutate the packet.
+                self.l4.pane = crate::l4::L4Pane::Craft;
+                if self.mode == Mode::Flows {
+                    self.mode = Mode::Inspector;
                 }
             }
             Action::Edit => {
@@ -1618,11 +1654,15 @@ impl App {
                 self.prompt = self.filter_text.clone();
             }
             Action::InspectorPaneToggle => {
-                self.inspector.pane = match self.inspector.pane {
-                    Pane::Request => Pane::Response,
-                    Pane::Response => Pane::Request,
-                };
-                self.inspector.reset_view();
+                if self.selected_row().is_some_and(|r| r.kind == FlowKind::L4) {
+                    self.l4.pane = self.l4.pane.next();
+                } else {
+                    self.inspector.pane = match self.inspector.pane {
+                        Pane::Request => Pane::Response,
+                        Pane::Response => Pane::Request,
+                    };
+                    self.inspector.reset_view();
+                }
             }
             Action::InspectorTabNext => self.tab_step(1),
             Action::InspectorTabPrev => self.tab_step(-1),
@@ -1699,8 +1739,147 @@ impl App {
                     out.extend(self.submit());
                 }
             }
+            Action::L4Build => out.extend(self.l4_build()),
+            Action::L4Inject => out.extend(self.l4_inject()),
+            Action::L4Confirm(yes) => out.extend(self.l4_answer_confirm(yes)),
+            Action::L4ToggleGate(gate) => out.extend(self.l4_toggle_gate(gate)),
         }
         out
+    }
+
+    // ---------------------------------------------------- L4 operator surface
+
+    /// Build the craft YAML into a hex preview via `l4.craft` (L4OPS-AC8).
+    fn l4_build(&mut self) -> Vec<BusRequest> {
+        if self.selected_l4().is_none() {
+            return Vec::new();
+        }
+        if !self.has_tool("l4.craft") {
+            self.toast(Level::Warn, "l4.craft is not on this bus");
+            return Vec::new();
+        }
+        match parse_craft_yaml(&self.l4.craft.text()) {
+            Ok(spec) => {
+                self.l4.craft.error = None;
+                vec![BusRequest::Call {
+                    name: "l4.craft".into(),
+                    args: json!({ "spec": spec }),
+                }]
+            }
+            Err(e) => {
+                self.l4.craft.error = Some(e);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Inject the crafted packet via `l4.inject` only (L4OPS-AC10). Gated by L4
+    /// scope-as-authorisation; the guard's own refusal still surfaces verbatim
+    /// from the server, and the operator confirms over the wire before it sends.
+    fn l4_inject(&mut self) -> Vec<BusRequest> {
+        let Some(flow) = self.selected_l4().cloned() else {
+            return Vec::new();
+        };
+        if !self.has_tool("l4.inject") {
+            self.toast(Level::Warn, "l4.inject is not on this bus");
+            return Vec::new();
+        }
+        if !self.l4.inject_in_scope(&flow) {
+            let iface = if flow.interface.is_empty() {
+                "this interface".to_string()
+            } else {
+                format!("`{}`", flow.interface)
+            };
+            self.toast(
+                Level::Warn,
+                format!("Out of L4 scope — add an inject entry for {iface} to inject"),
+            );
+            return Vec::new();
+        }
+        let spec = match parse_craft_yaml(&self.l4.craft.text()) {
+            Ok(s) => s,
+            Err(e) => {
+                self.l4.craft.error = Some(e);
+                self.toast(Level::Warn, "Fix the craft YAML before injecting");
+                return Vec::new();
+            }
+        };
+        let mut args = json!({ "spec": spec.clone(), "interface": flow.interface });
+        if let Some(dst) = craft_dst(&spec) {
+            args["dst"] = Value::String(dst);
+        }
+        self.l4.pending = Some(("l4.inject".to_string(), args.clone()));
+        vec![BusRequest::Call {
+            name: "l4.inject".into(),
+            args,
+        }]
+    }
+
+    /// Answer the inject confirm overlay (L4OPS-AC10): `yes` re-issues the
+    /// identical call plus the reserved `_confirm` token; `no` cancels.
+    fn l4_answer_confirm(&mut self, yes: bool) -> Vec<BusRequest> {
+        self.mode = Mode::Inspector;
+        let Some(c) = self.l4.confirm.take() else {
+            return Vec::new();
+        };
+        if yes {
+            vec![BusRequest::Call {
+                name: c.call.clone(),
+                args: c.confirmed_args(),
+            }]
+        } else {
+            self.toast(Level::Info, format!("{} cancelled", c.call));
+            Vec::new()
+        }
+    }
+
+    /// Toggle one per-feature agent gate (L4OPS-AC11). Where `l4.agent.set` is
+    /// present it flips the gate the guard enforces; where absent the toggle is
+    /// read-only with an honest note. The agent can never flip its own gates
+    /// (enforced by the core), so this is an operator action.
+    fn l4_toggle_gate(&mut self, gate: crate::l4::L4Gate) -> Vec<BusRequest> {
+        if !self.has_tool("l4.agent.set") {
+            self.toast(
+                Level::Warn,
+                "L4 agent gates are read-only here — set `l4.allow_agent_*` in config and restart (l4.agent.set is not on this bus)",
+            );
+            return Vec::new();
+        }
+        let next = !self.l4.gates.get(gate);
+        vec![BusRequest::Call {
+            name: "l4.agent.set".into(),
+            args: json!({ "capability": gate.wire(), "allowed": next }),
+        }]
+    }
+
+    /// Forward / Drop a parked in-path L4 packet (ui-ext §3.4, L4OPS-AC12),
+    /// through the same confirm-over-the-wire path; feature-detected from
+    /// `l4.intercept.*`, documented-limited when absent.
+    fn l4_intercept_verb(&mut self, tool: &str, flow: &crate::l4::L4Flow) -> Vec<BusRequest> {
+        if !self.has_tool(tool) {
+            self.toast(
+                Level::Warn,
+                format!("{tool} is not on this bus — in-path intercept is documented-limited here"),
+            );
+            return Vec::new();
+        }
+        if flow.parked().is_none() {
+            self.toast(
+                Level::Info,
+                "No parked L4 packet — Forward/Drop need an in-path intercept session",
+            );
+            return Vec::new();
+        }
+        if !self.l4.in_scope(flow) {
+            self.toast(Level::Warn, "Out of L4 scope — intercept actions disabled");
+            return Vec::new();
+        }
+        let args = json!({ "id": flow.id });
+        self.l4.pending = Some((tool.to_string(), args.clone()));
+        vec![BusRequest::Call {
+            name: tool.to_string(),
+            args,
+        }]
     }
 
     fn gate(&mut self, r: &FlowRow) -> bool {
@@ -1991,6 +2170,10 @@ impl App {
             }
             Mode::Prompt(PromptKind::Confirm) => {
                 let _ = self.answer_confirm(false);
+                return;
+            }
+            Mode::L4Confirm => {
+                let _ = self.l4_answer_confirm(false);
                 return;
             }
             Mode::Prompt(kind) => {
@@ -2326,6 +2509,37 @@ impl App {
                     _ => self.compose.field,
                 };
             }
+            Mode::Inspector | Mode::QuickLook
+                if self.selected_row().is_some_and(|r| r.kind == FlowKind::L4) =>
+            {
+                // An L4 flow: Up/Down move the packet cursor (Packets pane) or
+                // the craft editor's line (Craft pane); the renderer clamps.
+                match self.l4.pane {
+                    crate::l4::L4Pane::Craft => {
+                        let n = self.l4.craft.lines.len().max(1);
+                        let c = self.l4.craft.cursor_line;
+                        self.l4.craft.cursor_line = match action {
+                            Action::Up => c.saturating_sub(1),
+                            Action::Down => (c + 1).min(n - 1),
+                            Action::Home => 0,
+                            Action::End => n - 1,
+                            _ => c,
+                        };
+                    }
+                    _ => {
+                        let n = self.selected_l4().map_or(0, |f| f.packets.len());
+                        let c = self.l4.packet_cursor;
+                        self.l4.packet_cursor = match (action, n) {
+                            (_, 0) => 0,
+                            (Action::Up, _) => c.saturating_sub(1),
+                            (Action::Down, _) => (c + 1).min(n - 1),
+                            (Action::Home, _) => 0,
+                            (Action::End, _) => n - 1,
+                            _ => c.min(n - 1),
+                        };
+                    }
+                }
+            }
             Mode::Inspector | Mode::QuickLook => {
                 // Up/Down move the cursor line (the renderer scrolls to keep it
                 // visible); PgUp/PgDn move the window by a page and pull the
@@ -2422,6 +2636,17 @@ impl App {
     }
 
     fn tab_step(&mut self, d: i32) {
+        // An L4 flow cycles its inspector panes (Packets / Craft / Intercept).
+        if self.selected_row().is_some_and(|r| r.kind == FlowKind::L4) {
+            let cur = crate::l4::L4Pane::ALL
+                .iter()
+                .position(|p| *p == self.l4.pane)
+                .unwrap_or(0);
+            let n = crate::l4::L4Pane::ALL.len() as i32;
+            let next = (cur as i32 + d).rem_euclid(n) as usize;
+            self.l4.pane = crate::l4::L4Pane::ALL[next];
+            return;
+        }
         let (tab, n) = match self.inspector.pane {
             Pane::Request => (&mut self.inspector.request_tab, REQUEST_TABS.len()),
             Pane::Response => (&mut self.inspector.response_tab, RESPONSE_TABS.len()),
@@ -2439,6 +2664,11 @@ impl App {
     /// Ask the bus for `id`'s detail when it can answer (`flow.detail`, F5)
     /// and the app neither has it nor has given up on it.
     fn request_detail(&mut self, id: &str, out: &mut Vec<BusRequest>) {
+        // L4 flows carry no `flow.detail`; their packets arrive on the `l4.*`
+        // poll and live in `self.l4.flows`.
+        if self.row(id).is_some_and(|r| r.kind == FlowKind::L4) {
+            return;
+        }
         if self.has_tool("flow.detail")
             && !self.details.contains_key(id)
             && !self.detail_failed.contains(id)
@@ -2941,7 +3171,9 @@ impl App {
                     }
                 }
                 let before = self.flows.len();
-                self.flows.retain(|r| seen.contains(&r.id));
+                // Keep L4 rows: they are refreshed by the separate `l4.*` pass.
+                self.flows
+                    .retain(|r| r.kind == FlowKind::L4 || seen.contains(&r.id));
                 if self.flows.len() != before {
                     self.rebuild_index();
                 }
@@ -2951,7 +3183,7 @@ impl App {
                 if self
                     .selected
                     .as_deref()
-                    .is_some_and(|id| !seen.contains(id))
+                    .is_some_and(|id| self.row(id).is_none())
                 {
                     self.selected = None;
                 }
@@ -2977,6 +3209,51 @@ impl App {
             }
             BusEvent::Intercept(armed) => self.intercept_armed = armed,
             BusEvent::Scope(entries) => self.scope = entries,
+            // A pass over `l4.flow.list` + `l4.flow.get`: upsert L4 rows into the
+            // union flow list and keep the full packet logs in `self.l4.flows`.
+            BusEvent::L4Flows(values) => {
+                let mut seen: HashSet<String> = HashSet::with_capacity(values.len());
+                let parsed: Vec<crate::l4::L4Flow> = values
+                    .iter()
+                    .filter_map(crate::l4::L4Flow::from_json)
+                    .collect();
+                for f in parsed {
+                    seen.insert(f.id.clone());
+                    if let Some(&i) = self.index.get(&f.id) {
+                        let seq = self.flows[i].seq;
+                        self.flows[i] = FlowRow::from_l4(&f, seq);
+                    } else {
+                        let row = FlowRow::from_l4(&f, self.next_seq);
+                        self.next_seq += 1;
+                        self.index.insert(row.id.clone(), self.flows.len());
+                        self.flows.push(row);
+                    }
+                    self.l4.flows.insert(f.id.clone(), f);
+                }
+                let before = self.flows.len();
+                self.flows
+                    .retain(|r| r.kind != FlowKind::L4 || seen.contains(&r.id));
+                if self.flows.len() != before {
+                    self.rebuild_index();
+                }
+                self.l4.flows.retain(|id, _| seen.contains(id));
+                if self
+                    .selected
+                    .as_deref()
+                    .is_some_and(|id| self.row(id).is_none())
+                {
+                    self.selected = None;
+                }
+                let packets = self.selected_l4().map_or(0, |f| f.packets.len());
+                self.l4.packet_cursor = self.l4.packet_cursor.min(packets.saturating_sub(1));
+            }
+            BusEvent::L4Scope(entries) => {
+                self.l4.scope = entries
+                    .iter()
+                    .filter_map(crate::l4::L4ScopeEntry::from_json)
+                    .collect();
+            }
+            BusEvent::L4Agent(v) => self.l4.gates = crate::l4::L4Gates::from_json(&v),
             BusEvent::Findings(library) => self.merge_library(library, &mut out),
             BusEvent::Agent(a) => self.agent = a,
             BusEvent::CallOk { name, value } => {
@@ -3201,6 +3478,60 @@ impl App {
                             self.request_detail(&id, &mut out);
                         }
                     }
+                    // L4 craft build() → the hex preview (L4OPS-AC8).
+                    "l4.craft" => {
+                        let bytes = value
+                            .get("bytes")
+                            .and_then(Value::as_str)
+                            .and_then(crate::base64::decode);
+                        let layers = value
+                            .get("summary")
+                            .and_then(|s| s.get("layers"))
+                            .and_then(Value::as_array)
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|l| l.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        match bytes {
+                            Some(b) => {
+                                self.toast(Level::Info, format!("craft built: {} bytes", b.len()));
+                                self.l4.craft.preview = Some(b);
+                                self.l4.craft.preview_layers = layers;
+                                self.l4.craft.error = None;
+                            }
+                            None => {
+                                self.l4.craft.error = Some("l4.craft returned no bytes".into());
+                            }
+                        }
+                        return out;
+                    }
+                    // L4 guarded wire verbs: a `needs_confirmation` reply opens
+                    // the confirm overlay (L4OPS-AC10); a plain reply is success.
+                    "l4.inject" | "l4.send_recv" | "l4.intercept.forward" | "l4.intercept.drop" => {
+                        let (call, args) = self
+                            .l4
+                            .pending
+                            .take()
+                            .unwrap_or((name.clone(), Value::Null));
+                        match crate::l4::L4Confirm::from_reply(&call, &args, &value) {
+                            Some(confirm) => {
+                                self.l4.confirm = Some(confirm);
+                                self.mode = Mode::L4Confirm;
+                                return out;
+                            }
+                            None => {
+                                let shown: String = value_text(&value).chars().take(120).collect();
+                                self.toast(Level::Info, format!("{name}: {shown}"));
+                            }
+                        }
+                    }
+                    // L4 agent gate set/status reply: the four gate states.
+                    "l4.agent.set" => {
+                        self.l4.gates = crate::l4::L4Gates::from_json(&value);
+                        self.toast(Level::Info, "L4 agent gate updated");
+                    }
                     n if is_tracked_browser_call(n) => {
                         self.browser_settled();
                         self.on_browser_ok(n, &value, &mut out);
@@ -3238,6 +3569,11 @@ impl App {
                     "poc.artifact" => self.pending_artifact = None,
                     "poc.build" => {
                         self.poc_build_pending.pop_front();
+                    }
+                    // A guard refusal (out-of-scope / rate / denylist / oversize /
+                    // count) is surfaced verbatim; drop the pending confirm.
+                    "l4.inject" | "l4.send_recv" | "l4.intercept.forward" | "l4.intercept.drop" => {
+                        self.l4.pending = None;
                     }
                     _ => {}
                 }
@@ -3461,6 +3797,30 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
 ];
 
 /// Subsequence match: every char of `needle` appears in order in `hay`.
+/// Parse the craft editor's YAML into a `PacketSpec` JSON value for `l4.craft`
+/// / `l4.inject`. The error is surfaced verbatim in the craft pane.
+fn parse_craft_yaml(yaml: &str) -> Result<Value, String> {
+    serde_yaml::from_str::<Value>(yaml).map_err(|e| format!("craft YAML: {e}"))
+}
+
+/// The destination IP from a craft spec's `ipv4` / `ipv6` layer, for
+/// `l4.inject`'s `dst` argument; `None` when the spec declares no such layer.
+fn craft_dst(spec: &Value) -> Option<String> {
+    let layers = spec.get("layers")?.as_array()?;
+    for layer in layers {
+        for key in ["ipv4", "ipv6"] {
+            if let Some(dst) = layer
+                .get(key)
+                .and_then(|l| l.get("dst"))
+                .and_then(Value::as_str)
+            {
+                return Some(dst.to_string());
+            }
+        }
+    }
+    None
+}
+
 pub fn fuzzy(needle: &str, hay: &str) -> bool {
     let mut it = hay.chars();
     needle.chars().all(|n| it.any(|h| h == n))

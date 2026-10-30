@@ -25,13 +25,15 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use aitm_core::{Command, CommandHost, ParamDef, ParamSchema, Params, TypeDesc, Value};
+use aitm_core::{
+    Command, CommandHost, ParamDef, ParamSchema, Params, Sensitivity, TypeDesc, Value,
+};
 
 use crate::backend::CaptureInjectBackend;
 use crate::craft::PacketSpec;
 use crate::flow::{L4Bind, L4Flow, L4FlowId, L4FlowKind, L4FlowStore, L4Meta, L4Packet};
 use crate::guard::{L4Guard, L4GuardError};
-use crate::types::{L4Action, L4Direction};
+use crate::types::{L4Action, L4Capability, L4Direction, L4Target};
 use crate::wire::send_on_wire;
 
 /// `l4.inject {spec, dst, interface, port?, count?}` → inject a crafted spec to a
@@ -61,6 +63,64 @@ impl Inject {
 impl Command for Inject {
     fn name(&self) -> &str {
         "l4.inject"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        // Writes crafted packets to the wire.
+        Sensitivity::Sensitive
+    }
+
+    /// The operator confirm-over-the-wire prompt (spec §2.4): a summary of exactly
+    /// what will hit the wire. `None` — no confirmation offered, so no token is minted
+    /// — when the guard would refuse this target (out of scope, denylisted, or rate
+    /// disabled); `invoke` then surfaces the specific typed refusal (AC6:
+    /// out-of-scope is refused **before** any token is minted). Only the operator
+    /// role is offered this handshake by the server.
+    fn confirm_prompt(&self, args: &Params) -> Option<String> {
+        let spec = super::parse_packet_spec(super::require(args, "spec").ok()?).ok()?;
+        let dst: IpAddr = args.get_str("dst").ok()?.parse().ok()?;
+        let interface = args.get_str("interface").ok()?.to_string();
+        let dst_port = match args.get("port") {
+            Some(_) => Some(u16::try_from(args.get_int("port").ok()?).ok()?),
+            None => None,
+        };
+        let count = match args.get("count") {
+            Some(_) => u32::try_from(args.get_int("count").ok()?).ok()?,
+            None => 1,
+        };
+        let bytes = spec.build().ok()?;
+        let target = L4Target {
+            interface: interface.clone(),
+            direction: L4Direction::Outbound,
+            dst: Some(dst),
+            dst_port,
+            proto: spec.transport_proto(),
+        };
+        // The authoritative scope / denylist / rate decision. An `Err` here (the guard
+        // would refuse) means no confirmation and no token — `invoke` refuses with the
+        // typed error instead.
+        let permit = self.guard.check(L4Action::Inject, &target).ok()?;
+        let summary = PacketSpec::summarize(&bytes);
+        let entry = super::covering_scope_entry(
+            &self.guard,
+            &interface,
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            Some(dst),
+            dst_port,
+        );
+        Some(super::wire_confirm_summary(
+            "l4.inject",
+            dst,
+            dst_port,
+            &interface,
+            L4Direction::Outbound,
+            &summary.layers,
+            summary.length,
+            count,
+            permit.remaining(),
+            entry.as_ref(),
+        ))
     }
 
     fn schema(&self) -> ParamSchema {
@@ -204,7 +264,7 @@ impl Command for Inject {
                 filter: None,
                 queue: None,
             },
-            packets: Vec::new(),
+            packets: std::collections::VecDeque::new(),
             metadata: L4Meta::default(),
         });
 

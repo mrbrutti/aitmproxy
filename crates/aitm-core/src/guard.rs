@@ -27,6 +27,14 @@ pub trait ScopeRateGuard: Send + Sync {
     fn remove_scope(&self, entry: &str) -> bool;
     /// The current scope entries.
     fn list_scope(&self) -> Vec<ScopeEntry>;
+    /// Whether `host` is currently in the scope allowlist — a read-only predicate
+    /// with no rate, concurrency, or error-budget effect. The capture ingress
+    /// scope-gates a captured stream on this (authority = SNI else dst IP) before
+    /// any module match or upstream dial. Default is **deny-by-default**, so a
+    /// guard that does not implement it refuses every host.
+    fn in_scope(&self, _host: &str) -> bool {
+        false
+    }
     /// Record an error against `host`; once its budget is exhausted the guard
     /// disables it (with backoff) and `check_active` refuses it. Default: no-op.
     fn record_error(&self, _host: &str) {}
@@ -380,8 +388,14 @@ impl StdGuard {
             .factor
             .max(1.0)
             .powi(n.saturating_sub(1) as i32);
-        let secs = self.backoff.base.as_secs_f64() * factor;
-        Duration::from_secs_f64(secs).min(self.backoff.max)
+        // Clamp the (unbounded, possibly infinite) exponential to the cap
+        // *before* converting: `Duration::from_secs_f64` panics on a value that
+        // overflows `Duration`, and `disable_count` grows without bound, so a
+        // host disabled enough times (~69 with the shipped defaults) would panic
+        // the command task here — before the `.min(max)` cap could run.
+        let max = self.backoff.max;
+        let secs = (self.backoff.base.as_secs_f64() * factor).min(max.as_secs_f64());
+        Duration::try_from_secs_f64(secs).unwrap_or(max).min(max)
     }
 
     /// Reconfigure the per-host rate at runtime (drives AC-P4: changing the
@@ -393,16 +407,6 @@ impl StdGuard {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
-    }
-
-    fn in_scope(&self, host: &str) -> bool {
-        // Recover from a poisoned lock rather than silently refusing/allowing:
-        // deny-by-default still holds, every entry is still consulted.
-        self.scope
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .any(|e| host_in_scope(host, &e.host))
     }
 
     fn is_disabled(&self, host: &str) -> bool {
@@ -541,6 +545,17 @@ impl ScopeRateGuard for StdGuard {
             .clone()
     }
 
+    fn in_scope(&self, host: &str) -> bool {
+        // Recover from a poisoned lock rather than silently refusing/allowing:
+        // deny-by-default still holds, every entry is still consulted. Same
+        // normalized host matching `check_active` uses — no new matching logic.
+        self.scope
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|e| host_in_scope(host, &e.host))
+    }
+
     /// Record an error. On reaching the per-host budget the host is disabled for
     /// a backoff window (exponential per disable); after the window it is eligible
     /// again. The error counter resets so the next budget triggers the next,
@@ -579,5 +594,46 @@ impl ScopeRateGuard for StdGuard {
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(key, until);
         }
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+
+    /// `backoff_for` must stay bounded by the cap for any disable count, never
+    /// panicking in `Duration::from_secs_f64` when the exponential overflows a
+    /// `Duration` (regression: the cap was applied only after the conversion).
+    #[test]
+    fn backoff_never_overflows_and_stays_capped() {
+        let g = StdGuard::default();
+        let max = g.backoff.max;
+        for n in [1u32, 10, 69, 70, 128, 1000, u32::MAX] {
+            let d = g.backoff_for(n);
+            assert!(
+                d <= max,
+                "backoff for n={n} exceeded the cap: {d:?} > {max:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The read-only `in_scope` predicate reflects the scope allowlist exactly: a
+    /// scoped host is in scope, an unscoped host is not (deny-by-default).
+    #[test]
+    fn std_guard_in_scope_predicate() {
+        let guard = StdGuard::default();
+        guard.add_scope(ScopeEntry {
+            host: "example.com".to_string(),
+        });
+        assert!(guard.in_scope("example.com"), "a scoped host is in scope");
+        assert!(
+            !guard.in_scope("evil.com"),
+            "an unscoped host is out of scope (deny-by-default)"
+        );
     }
 }

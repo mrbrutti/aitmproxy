@@ -186,6 +186,13 @@ impl Command for L4Gated {
         self.inner.schema()
     }
 
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        // Classify honestly even while unavailable, so `tools/list` and the policy
+        // gate see the real tier (all gated verbs are Sensitive, but delegate rather
+        // than assume).
+        self.inner.sensitivity()
+    }
+
     fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
         Err(anyhow::Error::new(L4Error::Unavailable(
             self.reason.clone(),
@@ -285,34 +292,53 @@ impl Plugin for L4Module {
     }
 
     fn load(&mut self, reg: &mut Registry) {
+        // The single shared agent-gate object the guard owns: the Mcp-only wrapper and
+        // the `l4.agent.*` commands read/flip the same gates the guard's
+        // `add_runtime_scope` enforces, so an operator toggle is one live source of truth.
+        let gates = self.guard.agent_gates();
         // The pure/read verbs (`l4.interfaces`, `l4.scope.*`, `l4.flow.*`, `l4.craft`)
-        // work regardless of privilege — never gated.
+        // work regardless of privilege — never privilege-gated. `l4.scope.add`'s widen
+        // gate lives in the guard (`add_runtime_scope`), so these are unwrapped.
         for cmd in crate::commands::active_commands(self.guard(), self.store()) {
             reg.add_command(cmd);
         }
         // M5 Task 10 — the wire-touching commands (`l4.capture.*`, `l4.inject`,
-        // `l4.send_recv`). Registered even when raw capture/inject is unavailable, but
-        // gated to a fail-closed `L4Unavailable` naming the missing capability so the
-        // operator who opted in sees an honest, drivable surface (amended M5 Task 13).
+        // `l4.send_recv`). Two layers wrap each Sensitive verb: the Mcp-only
+        // per-capability agent gate (`agent_gate`, inner), then the fail-closed
+        // privilege gate (`gate`, outer) so an unprivileged core returns a typed
+        // `L4Unavailable` before the flag is even consulted. The operator who opted in
+        // still sees an honest, drivable surface (amended M5 Task 13).
         for cmd in gate(
-            crate::commands::wire_commands(self.guard(), self.store()),
+            crate::commands::agent_gate(
+                crate::commands::wire_commands(self.guard(), self.store()),
+                &gates,
+            ),
             self.privilege.capture_inject.as_deref(),
         ) {
             reg.add_command(cmd);
         }
         // The in-path interception commands (M5 Task 12) register additively over
         // the shared session registry, so a `start` outlives the call and the later
-        // verdict commands reach it. Gated on in-path (`CAP_NET_ADMIN`) privilege the
-        // same way.
+        // verdict commands reach it. Agent-gated (`intercept` capability) then
+        // privilege-gated on in-path (`CAP_NET_ADMIN`) the same way.
         for cmd in gate(
-            crate::commands::intercept::intercept_commands(
-                self.guard(),
-                self.store(),
-                self.sessions.clone(),
-                self.intercept_cfg.clone(),
+            crate::commands::agent_gate(
+                crate::commands::intercept::intercept_commands(
+                    self.guard(),
+                    self.store(),
+                    self.sessions.clone(),
+                    self.intercept_cfg.clone(),
+                ),
+                &gates,
             ),
             self.privilege.intercept.as_deref(),
         ) {
+            reg.add_command(cmd);
+        }
+        // The operator-only live toggle: `l4.agent.status` (read the four gates) and
+        // `l4.agent.set` (flip one). Never privilege- or agent-gated here — the set
+        // command self-gates to operator/CLI, and status is read-only.
+        for cmd in crate::commands::agent_commands(gates.clone()) {
             reg.add_command(cmd);
         }
     }
@@ -690,7 +716,7 @@ mod tests {
                 filter: None,
                 queue: None,
             },
-            packets: vec![L4Packet {
+            packets: std::collections::VecDeque::from(vec![L4Packet {
                 dir: L4Direction::Outbound,
                 timestamp: std::time::SystemTime::now(),
                 bytes: vec![0u8; 33],
@@ -699,7 +725,7 @@ mod tests {
                     length: 33,
                 },
                 injected: true,
-            }],
+            }]),
             metadata: L4Meta::default(),
         });
 

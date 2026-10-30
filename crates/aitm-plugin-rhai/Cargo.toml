@@ -8,10 +8,19 @@ description = "Rhai scripting tier: a .rhai file becomes an ordered-chain Plugin
 
 [dependencies]
 aitm-core.workspace = true
+# The `ProtocolLanguage` / `ScriptHostRegistry` / `Guarded` seam a protocol
+# crate registers its `<ns>.*` host fns against (acyclic: aitm-plugin depends
+# only on aitm-core).
+aitm-plugin.workspace = true
 # `check_url` + `SystemResolver`: the one resolve-then-classify SSRF decision
 # the Rust `browser.navigate` command makes, reused for the script verb.
 aitm-browser.workspace = true
 aitm-poc.workspace = true
+# `production_languages()` constructs the shipped `L4Language` so its
+# `NamespaceCatalog` assembles into `rhai.api.json` (plan Task 6). Only the
+# static catalog is needed here; `aitm-proto-l4` depends on `aitm-plugin` +
+# `aitm-core`, never back on this crate, so the library graph stays acyclic.
+aitm-proto-l4.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 # `time`: every guarded host call is wrapped in `tokio::time::timeout` for the
@@ -21,10 +30,21 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
 # sandbox relies on) and never `internals` (M3 spec §7, plan Global Constraints).
 rhai = { version = "1.27", features = ["sync"] }
 arc-swap = "1"
+# The `dsl` prelude helpers: base64 encode/decode (the decode half validates, so
+# a vetted codec rather than a hand-rolled one), SHA-256 + MD5 (RustCrypto, one
+# `Digest` API), and regex. `md-5` is required for `md5` regardless, so `sha2`
+# comes from the same ecosystem; `regex` is the version four sibling crates use.
+base64 = "0.22"
+regex = "1"
+sha2 = "0.10"
+md-5 = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 serde_yaml = "0.9"
+# The seam's test consumer: proves a protocol crate registers `test.*` host fns
+# and a script calls them with no edit to this crate (acyclic dev-dep).
+aitm-proto-test.workspace = true
 # `metadata` only for the tests: it exposes `gen_fn_signatures`, which the
 # sandbox audit (`tests/engine.rs`) pins the global function table with. Not a
 # production feature (resolver 2 keeps dev features out of the binary build).

@@ -8,7 +8,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aitm_core::{Command, CommandHost, ParamDef, ParamSchema, Params, TypeDesc, Value};
+use aitm_core::{
+    Command, CommandHost, ParamDef, ParamSchema, Params, Sensitivity, TypeDesc, Value,
+};
 
 use crate::flow::{L4Flow, L4FlowStore};
 
@@ -27,6 +29,10 @@ impl FlowList {
 impl Command for FlowList {
     fn name(&self) -> &str {
         "l4.flow.list"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
     }
 
     fn schema(&self) -> ParamSchema {
@@ -65,6 +71,10 @@ impl FlowGet {
 impl Command for FlowGet {
     fn name(&self) -> &str {
         "l4.flow.get"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
     }
 
     fn schema(&self) -> ParamSchema {
@@ -157,7 +167,7 @@ fn flow_fields() -> Vec<ParamDef> {
 }
 
 /// An [`L4Flow`] as a transport-neutral object.
-fn flow_to_value(flow: &L4Flow) -> Value {
+pub(crate) fn flow_to_value(flow: &L4Flow) -> Value {
     use crate::flow::L4FlowKind;
     use crate::types::L4Direction;
 

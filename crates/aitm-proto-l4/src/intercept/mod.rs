@@ -365,7 +365,7 @@ pub fn start_intercept(
             id: L4FlowId::new(),
             kind: L4FlowKind::Intercept,
             bind,
-            packets: Vec::new(),
+            packets: std::collections::VecDeque::new(),
             metadata: L4Meta::default(),
         });
         if open_tx.send(Ok(flow_id)).is_err() {

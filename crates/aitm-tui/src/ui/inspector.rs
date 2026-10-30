@@ -25,6 +25,10 @@ pub fn follow_up_sentence(tab: &str, f: &str) -> String {
 }
 
 pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    // An L4 flow has its own inspector (packets, layer tree, craft, intercept).
+    if app.selected_row().is_some_and(|r| r.kind == FlowKind::L4) {
+        return crate::ui::l4::inspector(app, theme, area, buf);
+    }
     buf.set_style(area, theme.surface());
     for x in area.x..area.right() {
         buf.set_string(x, area.y, "─", theme.rule());

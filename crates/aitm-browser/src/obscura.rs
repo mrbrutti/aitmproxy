@@ -209,7 +209,7 @@ fn free_loopback_port() -> anyhow::Result<u16> {
 /// `RandomState`), for the per-run directory and ready-file names. Not a secret;
 /// just enough entropy that the path a local attacker would have to pre-create
 /// is unguessable.
-fn random_token() -> String {
+pub(crate) fn random_token() -> String {
     let a = std::collections::hash_map::RandomState::new()
         .build_hasher()
         .finish();
@@ -232,13 +232,13 @@ fn make_run_dir() -> io::Result<(PathBuf, PathBuf)> {
 }
 
 #[cfg(unix)]
-fn create_private_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new().mode(0o700).create(dir)
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
     std::fs::create_dir(dir)
 }
 

@@ -3,13 +3,15 @@
 // multi-select, the row context menu, and the §2.8 empty states.
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show, Switch, Match, type Component } from 'solid-js';
 import { createVirtualizer } from '@tanstack/solid-virtual';
-import { useApp } from '~/state/context';
+import { useApp, useL4 } from '~/state/context';
 import type { FlowEntry } from '~/state/app';
 import { Menu, type MenuEntry } from '~/components/Menu';
 import { pointAnchor, type AnchorRect } from '~/components/floating';
 import { EVENTS } from '~/shell/shortcuts';
+import type { UnionRow } from '~/panels/l4/model';
 import { compareFlows, createColumnState, type ColumnId, type ColumnStore } from './columns';
 import { FlowRow } from './FlowRow';
+import { L4FlowRow } from './L4FlowRow';
 import { CommentPopover, flowMenu, markItems, PocPopover } from './ContextMenu';
 import { isAtBottom } from './scroll';
 import css from './FlowList.module.css';
@@ -37,6 +39,7 @@ export interface FlowListProps {
 
 export const FlowList: Component<FlowListProps> = (props) => {
   const app = useApp();
+  const l4 = useL4();
   const cols = props.columns ?? createColumnState();
   const [rowPx, setRowPx] = createSignal(readRowPx());
   const [atBottom, setAtBottom] = createSignal(true);
@@ -53,6 +56,17 @@ export const FlowList: Component<FlowListProps> = (props) => {
     return [...v].sort((a, b) => compareFlows(s, a.raw, b.raw));
   });
   const count = () => rows().length;
+
+  // L4 sessions are top-level rows in this one list (parity with TUI/macOS). They are appended
+  // after the virtualised HTTP rows, and shown only in the unified view (chip "all") or the L4
+  // focus filter — never under an HTTP-specific chip or an app/domain/scope source.
+  const l4Rows = createMemo<UnionRow[]>(() => {
+    if (!l4 || !l4.present()) return [];
+    if (app.ui.chip !== 'all') return [];
+    const side = app.ui.sidebar.kind;
+    if (side !== 'all' && side !== 'l4') return [];
+    return l4.rows();
+  });
 
   const virtualizer = createVirtualizer({
     get count() {
@@ -228,7 +242,7 @@ export const FlowList: Component<FlowListProps> = (props) => {
         class={css.scroll}
         role="grid"
         aria-label="Flows"
-        aria-rowcount={count() + 1}
+        aria-rowcount={count() + l4Rows().length + 1}
         aria-multiselectable="true"
         tabIndex={0}
         onScroll={onScroll}
@@ -289,15 +303,23 @@ export const FlowList: Component<FlowListProps> = (props) => {
           </For>
         </div>
 
+        <Show when={l4Rows().length}>
+          <div class={css.l4Rows} role="rowgroup" aria-label="L4 sessions">
+            <For each={l4Rows()}>
+              {(row, i) => <L4FlowRow row={row} seq={i() + 1} cols={cols} selected={app.selectedIds().has(row.id)} />}
+            </For>
+          </div>
+        </Show>
+
         <Switch>
-          <Match when={app.total() === 0}>
+          <Match when={app.total() === 0 && l4Rows().length === 0}>
             <div class={css.empty}>
               <span>
                 No flows yet — point a client at <span class={css.mono}>{app.proxy.address || '127.0.0.1:8080'}</span> or open the browser.
               </span>
             </div>
           </Match>
-          <Match when={count() === 0}>
+          <Match when={count() === 0 && l4Rows().length === 0}>
             <div class={css.empty}>
               <span>No flows match</span>
               <button type="button" onClick={clearFilters}>

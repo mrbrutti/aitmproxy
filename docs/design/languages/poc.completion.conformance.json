@@ -56,12 +56,12 @@
     "expected_candidates": [ "name", "default", "description", "required" ]
   },
   {
-    "name": "key: a step offers the four step types",
+    "name": "key: a step offers the step types",
     "context": "steps:\n  - ",
     "caret": 11,
     "kind": "key",
     "path": "steps[]",
-    "expected_candidates": [ "http", "browser", "extract", "script" ]
+    "expected_candidates": [ "http", "browser", "extract", "script", "l4" ]
   },
   {
     "name": "key: http step fields",

@@ -146,6 +146,33 @@ impl Theme {
         self.fg(&color::agent::BASE)
     }
 
+    /// The L4 hue (ui-ext §3.2, OQ1 → slate/indigo): a foreground distinct from
+    /// accent-blue, intercept-amber, agent-teal and WS-violet. TUI-local until
+    /// the foundation adds `color.l4.*` to `tokens.json` (OQ1 is Matt's); on
+    /// ANSI it degrades to blue, the `L4` badge text disambiguating it.
+    pub fn l4(&self) -> Style {
+        if self.truecolor {
+            Style::default().fg(Color::Rgb(0x81, 0x8C, 0xF8))
+        } else {
+            Style::default().fg(Color::Blue)
+        }
+    }
+
+    /// The L4 kind badge: a slate/indigo tint + on-colour text (§2.2), bold;
+    /// blue on ANSI.
+    pub fn l4_badge(&self) -> Style {
+        if self.truecolor {
+            Style::default()
+                .fg(Color::Rgb(0xC7, 0xCD, 0xFF))
+                .bg(Color::Rgb(0x31, 0x33, 0x52))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD)
+        }
+    }
+
     /// The badge for an HTTP method (case-insensitive). Unknown methods use
     /// the grey `method.head` pair.
     pub fn method(&self, method: &str) -> Style {

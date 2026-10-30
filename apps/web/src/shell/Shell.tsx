@@ -1,13 +1,15 @@
 // The primary screen (§2.6). Owns the grid, the splitter, global shortcuts and the dev perf probe;
 // every region is its own component. The lower region shows the Inspector or the active panel.
 import { createSignal, Match, onCleanup, onMount, Show, Switch, type Component } from 'solid-js';
-import { useApp } from '~/state/context';
+import { useApp, useL4 } from '~/state/context';
 import { Inspector } from '~/inspector/Inspector';
 import { FindingsPanel } from '~/panels/FindingsPanel';
 import { BrowserPanel } from '~/panels/BrowserPanel';
 import { ScopePanel } from '~/panels/ScopePanel';
 import { AgentPanel } from '~/panels/AgentPanel';
 import { ScriptsPanel } from '~/panels/ScriptsPanel';
+import { L4InspectorPanel } from '~/panels/l4/L4InspectorPanel';
+import { L4CaptureBar } from '~/panels/l4/L4CaptureBar';
 import { ComposeSheet } from '~/compose/ComposeSheet';
 import { CommandPalette } from '~/palette/CommandPalette';
 import { FlowList } from '~/flows/FlowList';
@@ -46,6 +48,7 @@ const writeSplit = (key: string, v: number) => {
 
 export const Shell: Component = () => {
   const app = useApp();
+  const l4 = useL4();
   const [splits, setSplits] = createSignal<Record<'horizontal' | 'vertical', number | null>>({
     horizontal: readSplit(SPLIT_KEYS.horizontal),
     vertical: readSplit(SPLIT_KEYS.vertical),
@@ -111,6 +114,9 @@ export const Shell: Component = () => {
         </Show>
         <div ref={body} class={css.body} data-layout={app.ui.layout} style={{ '--split': `${(split() * 100).toFixed(2)}%` }}>
           <div class={css.listPane}>
+            <Show when={l4 && app.ui.sidebar.kind === 'l4'}>
+              <L4CaptureBar store={l4!} />
+            </Show>
             <FlowList />
             <Show when={app.proxy.armed}>
               <InterceptBar />
@@ -126,7 +132,10 @@ export const Shell: Component = () => {
             onKeyDown={onSplitterKey}
           />
           <div class={css.lower} id="aitm-lower">
-            <Switch fallback={<Inspector />}>
+            {/* The lower region is a side panel when one is open, else the inspector for the
+                selected flow — dispatched by kind: an L4 session opens the L4 inspector (packets +
+                craft + intercept), every other flow the HTTP Request|Response inspector. */}
+            <Switch fallback={l4 && app.selectedIsL4() ? <L4InspectorPanel store={l4} /> : <Inspector />}>
               <Match when={app.ui.panel === 'findings'}>
                 <FindingsPanel />
               </Match>

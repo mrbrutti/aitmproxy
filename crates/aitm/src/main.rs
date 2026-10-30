@@ -197,8 +197,8 @@ async fn run() -> anyhow::Result<()> {
             tier.errors.len()
         );
     }
-    for plugin in &tier.plugins {
-        info!(target: "aitm::scripts", script = %plugin.name(), "script plugin registered");
+    for name in tier.host.set().names() {
+        info!(target: "aitm::scripts", script = %name, "script loaded into the host");
     }
     // Scripts see bodies up to the proxy's configured cap; the engine's string
     // and blob limits default to the same figure, and must keep up with it.
@@ -221,6 +221,10 @@ async fn run() -> anyhow::Result<()> {
         agent_state,
         push_tx,
         audit_ring,
+        // The protocol-general capture ingress is bound to the live L4 module here but
+        // not fed in Phase 1 (the pcap capture path is `l4.capture.*`'s own; a backend
+        // that calls `accept` is Phase 2's macOS Network/System Extension).
+        l4_ingress: _,
     } = assemble_with_scripts(
         &cfg,
         &Features {
@@ -228,11 +232,10 @@ async fn run() -> anyhow::Result<()> {
             ..Features::default()
         },
         ScriptWiring {
-            plugins: tier
-                .plugins
-                .into_iter()
-                .map(|p| Box::new(p.with_max_body(max_body)) as Box<dyn Plugin>)
-                .collect(),
+            // One host plugin dispatches every script from a single chain
+            // position; it carries the proxy's body cap to each script's
+            // snapshot, including any appended live by `script.save`.
+            plugins: vec![Box::new(tier.host.with_max_body(max_body)) as Box<dyn Plugin>],
             executor: Some(tier.executor.clone()),
             // Both command providers: the rhai tier (script.validate/reload,
             // script.findings) and the persistent findings store, whose

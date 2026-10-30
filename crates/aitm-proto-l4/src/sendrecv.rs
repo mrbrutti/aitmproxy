@@ -214,7 +214,7 @@ pub fn send_recv(
                 filter: None,
                 queue: None,
             },
-            packets: Vec::new(),
+            packets: std::collections::VecDeque::new(),
             metadata: L4Meta::default(),
         });
         worker_store.append_packet(flow_id, make_packet(&bytes, L4Direction::Outbound, true));

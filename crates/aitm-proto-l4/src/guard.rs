@@ -276,13 +276,15 @@ pub struct L4Guard {
     /// of "an entry contained within the dangerous range"; it can never globally
     /// disable the denylist (an explicit covering entry is still required).
     dangerous_dst_override: bool,
-    /// Whether a runtime (bus/MCP) caller may widen the deny-by-default scope via
-    /// [`add_runtime_scope`](L4Guard::add_runtime_scope). Comes from
-    /// `L4Config::allow_agent_widen` (default false). SEC-2 lives **here**, at the
-    /// security boundary — not in a command wrapper — so no in-process caller of the
-    /// shared guard can widen scope, or mint operator provenance, while the operator
-    /// has runtime widening off.
-    allow_agent_widen: bool,
+    /// The shared per-capability agent gates (inject / capture / intercept / widen),
+    /// seeded from `L4Config` (all default false). The guard owns the single instance
+    /// so it is the one source of truth: the guard reads the **widen** gate here (SEC-2
+    /// stays at the security boundary — not in a command wrapper — so no in-process
+    /// caller of the shared guard can widen scope while the operator has it off), while
+    /// the module shares this very `Arc` with the Mcp-only command wrapper and the
+    /// operator-only `l4.agent.set`/`status`, so an operator toggle governs every
+    /// enforcement point at once (a live, non-cosmetic switch).
+    agent_gates: Arc<crate::gates::L4AgentGates>,
     in_flight: Arc<AtomicU32>,
 }
 
@@ -301,9 +303,18 @@ impl L4Guard {
             max_packet_bytes: cfg.max_packet_bytes,
             max_packets_per_call: cfg.max_packets_per_call,
             dangerous_dst_override: cfg.dangerous_dst_override,
-            allow_agent_widen: cfg.allow_agent_widen,
+            agent_gates: crate::gates::L4AgentGates::from_config(cfg),
             in_flight: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    /// The shared per-capability agent gates (an `Arc` clone). The module hands this
+    /// same object to the Mcp-only command wrapper and the `l4.agent.*` commands, so
+    /// the widen gate the guard enforces here and the inject/capture/intercept gates
+    /// the wrapper enforces are one live source of truth.
+    #[must_use]
+    pub fn agent_gates(&self) -> Arc<crate::gates::L4AgentGates> {
+        self.agent_gates.clone()
     }
 
     /// The ONLY gate. Called before a capture/interception binds and before any
@@ -418,7 +429,7 @@ impl L4Guard {
     /// guard cannot bypass them (the bug the command-wrapper-only check left open).
     /// Returns the entry's id.
     pub fn add_runtime_scope(&self, mut entry: L4ScopeEntry) -> Result<L4ScopeId, L4GuardError> {
-        if !self.allow_agent_widen {
+        if !self.agent_gates.allowed(crate::gates::AgentGate::Widen) {
             return Err(L4GuardError::ScopeWideningDisabled);
         }
         entry.source = L4ScopeSource::Runtime;
@@ -590,6 +601,21 @@ fn danger_range(ip: IpAddr) -> Option<(IpAddr, u8)> {
             }
         }
         IpAddr::V6(v6) => {
+            // An IPv4-mapped (`::ffff:a.b.c.d`) or NAT64 (`64:ff9b::/96`) address
+            // routes to the embedded IPv4, so classify that: otherwise the v4
+            // control-plane denylist (loopback, 169.254 metadata, ...) is
+            // bypassable by sending the v6 form of the same target. Report the
+            // block in v6 space (the v4 prefix shifted into the low 32 bits) so
+            // a config scope override declared against the v6 dst still lifts it.
+            if let Some(v4) = mapped_ipv4_dst(v6) {
+                if let Some((IpAddr::V4(net), p4)) = danger_range(IpAddr::V4(v4)) {
+                    let mut seg = v6.segments();
+                    let n = net.octets();
+                    seg[6] = u16::from_be_bytes([n[0], n[1]]);
+                    seg[7] = u16::from_be_bytes([n[2], n[3]]);
+                    return Some((IpAddr::V6(Ipv6Addr::from(seg)), 96 + p4));
+                }
+            }
             if v6.is_loopback() {
                 Some((IpAddr::V6(Ipv6Addr::LOCALHOST), 128))
             } else if v6.is_unspecified() {
@@ -608,6 +634,21 @@ fn danger_range(ip: IpAddr) -> Option<(IpAddr, u8)> {
     }
 }
 
+/// The embedded IPv4 of an IPv4-mapped (`::ffff:a.b.c.d`) or NAT64
+/// (`64:ff9b::/96`) IPv6 address — both of which route to that v4 destination.
+fn mapped_ipv4_dst(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let s = v6.segments();
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6].iter().all(|&x| x == 0) {
+        let hi = s[6].to_be_bytes();
+        let lo = s[7].to_be_bytes();
+        return Some(Ipv4Addr::new(hi[0], hi[1], lo[0], lo[1]));
+    }
+    None
+}
+
 /// The target of a guard check — resolved from a capture/interception bind or a
 /// decoded packet.
 pub type L4Target = crate::types::L4Target;
@@ -616,6 +657,31 @@ pub type L4Target = crate::types::L4Target;
 mod tests {
     use super::*;
     use crate::types::{L4Direction, L4ScopeSource, PortRange, RateCap};
+
+    /// An IPv4-mapped or NAT64 IPv6 destination must be classified by its
+    /// embedded IPv4, so the v4 control-plane denylist cannot be bypassed by
+    /// sending the v6 form of the same target.
+    #[test]
+    fn mapped_and_nat64_dangerous_v4_are_blocked() {
+        let m = |s: &str| danger_range(s.parse::<IpAddr>().unwrap());
+        // IPv4-mapped forms of dangerous v4 targets.
+        assert!(m("::ffff:169.254.169.254").is_some(), "mapped metadata");
+        assert!(m("::ffff:127.0.0.1").is_some(), "mapped loopback");
+        assert!(m("::ffff:0.0.0.0").is_some(), "mapped unspecified");
+        // NAT64 well-known prefix form.
+        assert!(m("64:ff9b::169.254.169.254").is_some(), "nat64 metadata");
+        // A mapped *public* address is not blocked (and neither is a public v6).
+        assert!(m("::ffff:93.184.216.34").is_none(), "mapped public v4");
+        assert!(
+            m("2606:2800:220:1:248:1893:25c8:1946").is_none(),
+            "public v6"
+        );
+        // The reported block stays in v6 space so a v6 scope override can match.
+        if let Some((addr, prefix)) = m("::ffff:169.254.169.254") {
+            assert!(matches!(addr, IpAddr::V6(_)), "block reported in v6 space");
+            assert_eq!(prefix, 96 + 16, "169.254.0.0/16 mapped to a /112");
+        }
+    }
 
     fn cfg() -> L4Config {
         L4Config::default()

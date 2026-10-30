@@ -164,6 +164,13 @@ impl ScopeRateGuard for LateHandles {
         self.guard.get().map(|g| g.list_scope()).unwrap_or_default()
     }
 
+    /// Forward to the bound guard; unbound keeps the trait's deny-by-default
+    /// `false`. The capture ingress scope-gates captured streams on this, so the
+    /// delegation must be complete before a live feeder routes through it.
+    fn in_scope(&self, host: &str) -> bool {
+        self.guard.get().map(|g| g.in_scope(host)).unwrap_or(false)
+    }
+
     fn record_error(&self, host: &str) {
         if let Some(guard) = self.guard.get() {
             guard.record_error(host);

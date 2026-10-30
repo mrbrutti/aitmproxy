@@ -442,6 +442,20 @@ impl Http1Machine {
         self.pending_upgrade = None;
         events.push(HttpSansIoEvent::ResponseComplete(id));
     }
+
+    /// Ready the machine for the next request after a plugin answered the
+    /// current one without an upstream round-trip (a short circuit). There is
+    /// no upstream response, so `finish_response` never runs; this performs the
+    /// same client-side reset it would. Without it the client stays in
+    /// `Phase::Waiting`, so a kept-alive connection never parses its next
+    /// request and every further byte accumulates in the (then-uncapped)
+    /// receive buffer — only `Phase::Head` enforces the head-size cap.
+    pub fn short_circuit_done(&mut self) {
+        if matches!(self.client.phase, Phase::Waiting) {
+            self.client.phase = Phase::Head;
+        }
+        self.pending_upgrade = None;
+    }
 }
 
 impl HttpStateMachine for Http1Machine {
@@ -562,6 +576,9 @@ fn parse_chunk_size(line: &[u8]) -> Result<u64> {
     let size = text.split(';').next().unwrap_or("").trim();
     if size.is_empty() {
         bail!("empty chunk size");
+    }
+    if !size.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("invalid chunk size {size:?}");
     }
     u64::from_str_radix(size, 16).map_err(|_| anyhow!("invalid chunk size {size:?}"))
 }
@@ -691,8 +708,11 @@ fn upgrade_protocol(headers: &HeaderMap) -> Option<String> {
 /// request/response-smuggling vector (RFC 7230 §3.3.3).
 fn content_length(headers: &HeaderMap) -> Result<Option<u64>> {
     let parse = |v: &str| {
-        v.trim()
-            .parse::<u64>()
+        let t = v.trim();
+        if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+            bail!("invalid Content-Length {v:?}");
+        }
+        t.parse::<u64>()
             .map_err(|_| anyhow!("invalid Content-Length {v:?}"))
     };
     let mut values = headers
@@ -984,6 +1004,67 @@ mod tests {
             response_framing(200, "GET", &h).is_err(),
             "CL + TE on a response must be rejected (RFC 7230 §3.3.3)"
         );
+    }
+
+    #[test]
+    fn short_circuit_resets_for_the_next_keep_alive_request() {
+        // A plugin answers a request without an upstream round-trip (short
+        // circuit): `finish_request` left the client in `Phase::Waiting`, and
+        // only `finish_response` resets it to `Head`. Without a reset the next
+        // request on a kept-alive connection is never parsed and every further
+        // byte piles into `client.buf` unbounded (only `Phase::Head` is
+        // head-size-capped). `short_circuit_done` must ready the machine so the
+        // second request parses.
+        let mut m = Http1Machine::new();
+        let ev = m
+            .on_bytes(Side::Client, b"GET /mock HTTP/1.1\r\nHost: t\r\n\r\n")
+            .unwrap();
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, HttpSansIoEvent::RequestComplete(_))),
+            "first request should complete"
+        );
+        // The plugin's short-circuit response path in module.rs.
+        m.enqueue_response(&HttpResponse {
+            status: 200,
+            headers: HeaderMap::new(),
+            body: Body::Empty,
+            version: HttpVersion::Http11,
+            timestamp: std::time::SystemTime::now(),
+        });
+        m.short_circuit_done();
+
+        let ev2 = m
+            .on_bytes(Side::Client, b"GET /next HTTP/1.1\r\nHost: t\r\n\r\n")
+            .unwrap();
+        assert!(
+            ev2.iter()
+                .any(|e| matches!(e, HttpSansIoEvent::RequestHeaders(_))),
+            "a second keep-alive request after a short circuit must parse, got {ev2:?}"
+        );
+    }
+
+    #[test]
+    fn content_length_rejects_a_leading_plus() {
+        // Rust's integer parse accepts a leading '+' (`"+5".parse::<u64>() == 5`),
+        // which is not a valid RFC 7230 `1*DIGIT`. Reject it rather than diverge
+        // from stricter peers.
+        let h = headers(&[("Content-Length", "+5")]);
+        assert!(
+            content_length(&h).is_err(),
+            "Content-Length with a leading '+' must be rejected"
+        );
+        let ok = headers(&[("Content-Length", "5")]);
+        assert_eq!(content_length(&ok).unwrap(), Some(5));
+    }
+
+    #[test]
+    fn chunk_size_rejects_a_leading_plus() {
+        assert!(
+            parse_chunk_size(b"+a").is_err(),
+            "a chunk-size with a leading '+' must be rejected"
+        );
+        assert_eq!(parse_chunk_size(b"a").unwrap(), 10);
     }
 
     #[test]
