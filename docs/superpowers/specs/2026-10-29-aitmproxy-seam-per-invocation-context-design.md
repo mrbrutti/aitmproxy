@@ -1,6 +1,6 @@
 # Per-invocation context for the `ProtocolLanguage` host-fn seam design
 
-**Status:** draft (2026-10-29, f8-ext-reconcile architect) — awaiting Matt's approval. Design only; nothing here is built.
+**Status:** Approved (orchestrator, on Matt's delegation, 2026-10-29). Stage-3 plan: `docs/superpowers/plans/2026-10-29-aitmproxy-seam-per-invocation-context.md`. All three open questions resolved to the recommended defaults (see Open questions). Not yet built.
 **Directive:** Matt, 2026-10-29 — "write the spec for the seam per-invocation-context enhancement (threading Frontend/NativeCallContext into the ProtocolLanguage HostFn) that unblocks l4 live-gating and the Task-5 host-fn migration."
 **Extends (amends) the seam:** `docs/superpowers/specs/2026-10-28-aitmproxy-protocol-extensible-languages-design.md` (shipped on `main`: `aitm-plugin::language` seam + `aitm-plugin-rhai` host registry). Unblocks the deferred **Task 5** (migrate `http`/`browser`/`store`/`scope` onto the seam) and the deferred **L4 live scripting wiring** (PR #48 landed l4 catalogued-only).
 **Grounding (verified against `main` + the `claude/proto-l4-task6` tip):**
@@ -126,6 +126,8 @@ Observable via `cargo test` (+ Terminal-panel loopback for AC4).
 
 ## Open questions
 
-1. **Caller trust for a hook — authoring-trust vs ambient.** This spec sources a hook's trust from the **script's authoring trust** (agent-authored ⇒ `Agent`). Alternative: treat all hook-time effects as operator-trust (the operator ran the proxy) and rely solely on `scripts.allow_agent_authoring` at author time. Recommend **authoring-trust** (an agent that authored a hook should not gain operator-level l4 powers at hook time); confirm with the L4 + M4 owners.
-2. **One shared `CallerTrust` vs richer context.** Start with `{Operator, Agent}`; a future need (e.g. the specific operator identity for audit) can extend `HostCallCtx` without another signature change. Accept the minimal enum now.
-3. **Scope of the first-party migration in this task vs a follow-up.** This spec requires at least one namespace migrated (AC7) to prove the seam; whether all four land here or across follow-ups is the builder/orchestrator's call.
+Resolved at approval (2026-10-29, orchestrator on Matt's delegation):
+
+1. **Caller trust for a hook — authoring-trust vs ambient → DECIDED: authoring-trust.** A hook's trust is the **script's authoring trust** (agent-authored ⇒ `Agent`, operator-authored ⇒ `Operator`); hook-time effects are NOT treated as blanket operator-trust. Rationale: an agent that authored a hook must not gain operator-level l4 powers at hook time. The plan keeps "confirm with the L4 + M4 owners" as a checkpoint, but authoring-trust is the decision.
+2. **One shared `CallerTrust` vs richer context → DECIDED: minimal `{Operator, Agent}` now,** derived from `Frontend` (`Agent` iff `Frontend::Mcp`). `HostCallCtx` can be extended later (e.g. operator identity for audit) without another signature change.
+3. **First-party migration scope for this task → DECIDED: migrate `log.option` + `finding` only** (the two context consumers), satisfying AC7's minimum and proving both the context-needing and effectful paths move. `http`/`browser`/`store`/`scope` are incremental follow-ups, not required in this task.
