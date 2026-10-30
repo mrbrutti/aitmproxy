@@ -128,12 +128,21 @@ impl Command for ScanDiscover {
 
         // Enumerate injection points from the captured requests whose normalized
         // URL is one of the reached endpoints — observed traffic only.
-        let endpoint_set: HashSet<&str> = outcome.endpoints.iter().map(String::as_str).collect();
+        // Capped at MAX_RESULT_ITEMS to match the exposed `endpoints` array (which is
+        // `.take(MAX_RESULT_ITEMS)` below), so `endpoint_flows` and `endpoints` stay in
+        // lockstep and neither grows unbounded on a long crawl.
+        let endpoint_set: HashSet<&str> = outcome
+            .endpoints
+            .iter()
+            .take(MAX_RESULT_ITEMS)
+            .map(String::as_str)
+            .collect();
         let mut injection_points: Vec<Value> = Vec::new();
         // Map each reached endpoint (keyed by the same scrubbed URL the result
         // exposes in `endpoints`) to the first captured flow that served it, so a UI
-        // can link an endpoint row to its flow (AC3). Best-effort and capped like the
-        // arrays; an endpoint with no captured flow is simply absent from the map.
+        // can link an endpoint row to its flow (AC3). Bounded by `endpoint_set` (<=
+        // MAX_RESULT_ITEMS), i.e. capped like the arrays; an endpoint with no captured
+        // flow is simply absent from the map.
         let mut endpoint_flows: BTreeMap<String, Value> = BTreeMap::new();
         for id in host.store().list() {
             if injection_points.len() >= MAX_RESULT_ITEMS
@@ -482,9 +491,9 @@ mod tests {
         };
         let q_point = points
             .iter()
-            .find(|p| {
-                matches!(p, Value::Object(o) if o.get("name") == Some(&Value::Str("q".into())))
-            })
+            .find(
+                |p| matches!(p, Value::Object(o) if o.get("name") == Some(&Value::Str("q".into()))),
+            )
             .expect("a q injection point");
         let Value::Object(o) = q_point else {
             unreachable!()
