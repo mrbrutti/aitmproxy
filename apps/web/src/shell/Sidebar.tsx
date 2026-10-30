@@ -1,6 +1,7 @@
 // Sidebar (§2.6): brand row, Working / All / aitmproxy groups, quick filter at the bottom.
-import { createMemo, createSignal, For, onCleanup, onMount, Show, type Component, type JSX } from 'solid-js';
+import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show, type Component, type JSX } from 'solid-js';
 import { useApp } from '~/state/context';
+import { scriptsStore } from '~/panels/scripts/store';
 import type { SidebarItem } from '~/state/app';
 import { Icon, type IconName } from '~/components/Icon';
 import { Kbd } from '~/components/Kbd';
@@ -57,6 +58,14 @@ const Item: Component<ItemProps> = (props) => (
 
 export const Sidebar: Component<{ class?: string }> = (props) => {
   const app = useApp();
+  // The Scripts count is the scripts store's: one cheap `script.list` (never the findings), and only when
+  // the core offers it; after that the panel's own actions keep it current.
+  const scripts = scriptsStore(app);
+  createEffect(
+    on(scripts.offered, (offered) => {
+      if (offered && !scripts.loaded()) void scripts.refreshList();
+    }),
+  );
   const [open, setOpen] = createSignal({ pinned: true, apps: true, domains: true });
   const [allDomains, setAllDomains] = createSignal(false);
   let input: HTMLInputElement | undefined;
@@ -101,7 +110,10 @@ export const Sidebar: Component<{ class?: string }> = (props) => {
           <circle cx="8" cy="8" r="1.6" fill="currentColor" />
         </svg>
         <h1 class={css.wordmark}>aitmproxy</h1>
-        <span class={css.version}>{app.proxy.version}</span>
+        {/* The core's version from proxy.status; nothing until it answers (never a made-up number). */}
+        <Show when={app.proxy.version}>
+          <span class={css.version}>v{app.proxy.version}</span>
+        </Show>
       </div>
 
       <nav ref={nav} class={css.nav} onKeyDown={onNavKey}>
@@ -167,7 +179,13 @@ export const Sidebar: Component<{ class?: string }> = (props) => {
         </Show>
         <Item icon="flag" label="Findings" count={app.proxy.findings.length} countKind="queue" current={is({ kind: 'findings' })} onClick={pick({ kind: 'findings' })} />
         <Item icon="globe" label="Browser" count="1 tab" current={is({ kind: 'browser' })} onClick={pick({ kind: 'browser' })} />
-        <Item icon="code" label="Scripts" count="0 active" current={is({ kind: 'scripts' })} onClick={pick({ kind: 'scripts' })} />
+        <Item
+          icon="code"
+          label="Scripts"
+          count={scripts.active() === null ? null : `${scripts.active()} active`}
+          current={is({ kind: 'scripts' })}
+          onClick={pick({ kind: 'scripts' })}
+        />
         <Item
           icon="circle-dot"
           label="L4"

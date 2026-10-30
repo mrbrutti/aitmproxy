@@ -86,6 +86,9 @@ steps:
   - screenshot: true
 `;
 
+/** The `version` the fixture bus's `proxy.status` reports — synthetic, so it never passes for a real build. */
+const MOCK_VERSION = '0.0.0-fixtures';
+
 export function createMockBus(opts: MockBusOptions = {}): BusClient & MockControls {
   const rng = mulberry32(opts.seed ?? 42);
   let rate = opts.rate ?? 4;
@@ -175,6 +178,93 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
     injected_count: f.injected_count,
     packets: f.packets,
   });
+
+  // ---- Rhai scripts (F8): an in-memory `script.*` -------------------------------------------------
+  // Mirrors crates/aitm-plugin-rhai/src/commands.rs — list / enable / disable / reload / validate /
+  // save / findings with the core's reply shapes and refusal text — so the Scripts panel works in the
+  // dev UI and in tests. Validation is a small static scan (NAME/API consts, hook functions,
+  // `reg.command`/`reg.option` names, bracket balance), not a Rhai compile.
+  interface ScriptFx {
+    name: string;
+    path: string;
+    api: string;
+    hooks: string[];
+    enabled: boolean;
+    last_error: string | null;
+  }
+  const SCRIPT_DIR = '/Users/matt/aitm/scripts';
+  const SCRIPT_HOOKS = ['on_request_headers', 'on_request', 'on_response_headers', 'on_response', 'on_ws_start', 'on_ws_message', 'on_ws_end', 'on_error'];
+  const scriptFx: ScriptFx[] = [
+    { name: 'redact-auth', path: `${SCRIPT_DIR}/redact-auth.rhai`, api: '1', hooks: ['on_request', 'on_response'], enabled: true, last_error: null },
+    { name: 'tag-admin', path: `${SCRIPT_DIR}/tag-admin.rhai`, api: '1', hooks: ['on_request'], enabled: false, last_error: null },
+    {
+      name: 'flaky-parser',
+      path: `${SCRIPT_DIR}/flaky-parser.rhai`,
+      api: '1',
+      hooks: ['on_response'],
+      enabled: true,
+      last_error: 'on_response: Property not found: content_type (line 12)',
+    },
+  ];
+  // Oldest first, as the core's in-memory sink returns them.
+  const scriptFindings = [
+    { name: 'Bearer token sent over cleartext HTTP', severity: 'high', flow_id: 'flow_0007', detail: 'Authorization header on http://api.shop-staging.test/v1/cart', tags: ['auth', 'cleartext'], source: 'redact-auth', at: Date.now() - 300_000 },
+    { name: 'Admin path probed', severity: 'info', flow_id: null, detail: null, tags: ['admin'], source: 'tag-admin', at: Date.now() - 120_000 },
+    { name: 'Verbose error body', severity: 'medium', flow_id: 'flow_0031', detail: 'Stack trace in a 500 response', tags: [], source: 'flaky-parser', at: Date.now() - 30_000 },
+  ];
+  function scriptNamed(name: string): ScriptFx {
+    const s = scriptFx.find((x) => x.name === name);
+    if (!s) throw new BusError(`no loaded script is named \`${name}\`; loaded: ${scriptFx.length ? scriptFx.map((x) => x.name).join(', ') : '(none)'}`);
+    return s;
+  }
+  /** The core's pinned compile-error shape, for the mistakes the scan can see: unbalanced brackets and an open string. */
+  function scriptCompileError(source: string): string | null {
+    const closes: Record<string, string> = { '(': ')', '[': ']', '{': '}' };
+    const stack: { ch: string; line: number; col: number }[] = [];
+    const fail = (line: number, col: number, what: string, reason: string, help: string) => `error: <source>:${line}:${col} — ${what}\n  reason: ${reason}\n  help: ${help}`;
+    let line = 1;
+    let col = 0;
+    let inString = false;
+    let inComment = false;
+    for (let i = 0; i < source.length; i++) {
+      const ch = source[i]!;
+      if (ch === '\n') {
+        line++;
+        col = 0;
+        inComment = false;
+        continue;
+      }
+      col++;
+      if (inComment) continue;
+      if (inString) {
+        if (ch === '\\') i++;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === '/' && source[i + 1] === '/') inComment = true;
+      else if (ch in closes) stack.push({ ch, line, col });
+      else if (ch === ')' || ch === ']' || ch === '}') {
+        const top = stack.pop();
+        if (!top) return fail(line, col, `unexpected '${ch}'`, `it closes nothing`, `remove it, or add the matching opener`);
+        if (closes[top.ch] !== ch) return fail(line, col, `expecting '${closes[top.ch]}' but found '${ch}'`, `the '${top.ch}' opened at ${top.line}:${top.col} is still open`, `match each opener with its own closer`);
+      }
+    }
+    if (inString) return fail(line, col + 1, 'unterminated string', 'the source ends inside a string literal', 'the file ends mid-statement; look for an unclosed brace, bracket, or string');
+    const open = stack.pop();
+    if (open) return fail(line, col + 1, `expecting '${closes[open.ch]}' to end the block opened at ${open.line}:${open.col}`, 'the source ends before the block closes', 'the file ends mid-statement; look for an unclosed brace, bracket, or string');
+    return null;
+  }
+  /** What the core reports about a script's text: name, API, hooks and the `registers` scan. */
+  function scriptReport(source: string) {
+    const names = (re: RegExp) => [...source.matchAll(re)].map((m) => m[1]!);
+    return {
+      name: /\bconst\s+NAME\s*=\s*"([^"]+)"/.exec(source)?.[1] ?? '<source>',
+      api: /\bconst\s+API\s*=\s*"([^"]+)"/.exec(source)?.[1] ?? '1',
+      hooks: SCRIPT_HOOKS.filter((h) => new RegExp(`\\bfn\\s+${h}\\s*\\(`).test(source)),
+      registers: { commands: names(/\breg\.command\(\s*"([^"]+)"/g), options: names(/\breg\.option\(\s*"([^"]+)"/g) },
+    };
+  }
 
   const timers = new Set<ReturnType<typeof setTimeout>>();
   let loop: ReturnType<typeof setInterval> | null = null;
@@ -626,7 +716,7 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
       }
       case 'proxy.status':
         // Listener state and capture state are separate on the bus.
-        return { listening: true, address: '127.0.0.1:8080', capturing, intercept_armed: armed, paused: pausedCount(), flows: flows.size, protocol: 'HTTP/2' };
+        return { listening: true, address: '127.0.0.1:8080', capturing, intercept_armed: armed, paused: pausedCount(), flows: flows.size, protocol: 'HTTP/2', version: MOCK_VERSION };
       case 'proxy.pause':
         capturing = false;
         recordActivity(tool, args, 'web');
@@ -734,6 +824,55 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
         }
         return { status: 'needs_confirmation', prompt: `${tool === 'l4.intercept.drop' ? 'Drop' : 'Forward'} the parked packet.`, confirm_token: `l4-${Date.now()}` };
 
+      // ---- Rhai scripts (F8): see the `script*` fixtures above ----
+      case 'script.list':
+        return scriptFx.map((s) => ({ ...s, hooks: [...s.hooks] }));
+      case 'script.enable':
+      case 'script.disable': {
+        const s = scriptNamed(need(args, 'name'));
+        s.enabled = tool === 'script.enable';
+        recordActivity(tool, args, 'web');
+        return { name: s.name, enabled: s.enabled };
+      }
+      case 'script.reload': {
+        const s = scriptNamed(need(args, 'name'));
+        s.last_error = null;
+        recordActivity(tool, args, 'web');
+        return { name: s.name, api: s.api, path: s.path, hooks: [...s.hooks] };
+      }
+      case 'script.validate': {
+        const hasPath = typeof args.path === 'string';
+        const hasSource = typeof args.source === 'string';
+        if (hasPath && hasSource) throw new BusError('script.validate takes exactly one of `path` or `source`, got both');
+        if (!hasPath && !hasSource) throw new BusError('script.validate takes exactly one of `path` or `source`, got neither');
+        if (hasPath) throw new BusError('the fixture bus has no script files to read; pass `source`');
+        const source = args.source as string;
+        const err = scriptCompileError(source);
+        if (err) throw new BusError(err);
+        return scriptReport(source);
+      }
+      case 'script.save': {
+        const name = typeof args.name === 'string' ? args.name : '';
+        if (!/^[A-Za-z0-9_-]+$/.test(name))
+          throw new BusError(`\`name\` must be a single path segment matching [A-Za-z0-9_-]+ (no separators, dots or spaces), got ${JSON.stringify(name)}`);
+        const source = need(args, 'source');
+        if (args.enable != null && typeof args.enable !== 'boolean') throw new BusError('`enable` must be a boolean');
+        const enable = typeof args.enable === 'boolean' ? args.enable : true;
+        const err = scriptCompileError(source);
+        if (err) throw new BusError(err);
+        const { api, hooks, registers } = scriptReport(source);
+        const path = `${SCRIPT_DIR}/${name}.rhai`;
+        const loaded = scriptFx.find((s) => s.name === name);
+        if (loaded) Object.assign(loaded, { api, hooks, enabled: enable, last_error: null });
+        else scriptFx.push({ name, path, api, hooks, enabled: enable, last_error: null });
+        recordActivity(tool, { name, enable }, 'web');
+        return { name, path, api, hooks, registers, restart_required: registers.commands.length > 0 || registers.options.length > 0 };
+      }
+      case 'script.findings': {
+        const keep = typeof args.limit === 'number' ? Math.max(0, args.limit) : scriptFindings.length;
+        return { findings: scriptFindings.slice(Math.max(0, scriptFindings.length - keep)).map((f) => ({ ...f, tags: [...f.tags] })), dropped: 0 };
+      }
+
       default:
         throw new BusError(`unknown tool ${tool}`, -32602);
     }
@@ -792,6 +931,13 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
     ['l4.intercept.list', 'Parked L4 packets awaiting a decision.', {}],
     ['l4.intercept.forward', 'Forward a parked L4 packet (confirm-gated).', { id: { type: 'string' } }, ['id']],
     ['l4.intercept.drop', 'Drop a parked L4 packet (confirm-gated).', { id: { type: 'string' } }, ['id']],
+    ['script.list', 'List the loaded scripts in chain order: name, path, API, hooks, whether enabled, and the most recent hook error (null if none).', {}],
+    ['script.validate', 'Compile a .rhai script without loading it; reports its name, API, hooks and the commands/options its load(reg) registers, or the positioned compile error. Give exactly one of `path` or `source`.', { path: { type: 'string', description: 'path to the .rhai file to check; exactly one of `path` or `source`' }, source: { type: 'string', description: 'the script text to check; exactly one of `path` or `source`' } }],
+    ['script.reload', 'Recompile a loaded script from its file and swap its hooks live; a failed recompile keeps the previous version.', { name: { type: 'string', description: "the script's NAME (or file stem) as loaded" } }, ['name']],
+    ['script.enable', "Turn a loaded script's hooks back on live. Idempotent. Answers { name, enabled }.", { name: { type: 'string', description: "the script's NAME (or file stem) as loaded" } }, ['name']],
+    ['script.disable', "Turn a loaded script's hooks off live without unloading it. Idempotent. Answers { name, enabled }.", { name: { type: 'string', description: "the script's NAME (or file stem) as loaded" } }, ['name']],
+    ['script.save', 'Write a script to <scripts_dir>/<name>.rhai after checking it compiles. Its hooks go live immediately; restart_required is true only when it registers commands or options.', { name: { type: 'string', description: "the script's file stem: letters, digits, `_` and `-` only" }, source: { type: 'string', description: 'the script text' }, enable: { type: 'boolean', description: "sets the saved script's live enabled flag (default true)" } }, ['name', 'source']],
+    ['script.findings', 'Findings scripts emitted with finding(...) this run (in-memory, not persisted), oldest first, plus how many the bounded sink dropped.', { limit: { type: 'integer', description: 'return only the newest N findings' } }],
   ].map(([name, description, properties, required]) => ({
     name: name as string,
     description: description as string,
@@ -800,7 +946,7 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
       properties: properties as NonNullable<ToolDef['inputSchema']['properties']>,
       ...(required ? { required: required as string[] } : {}),
     },
-    mutates: !/\.(list|get|detail|status|tabs|get_dom|screenshot|activity|artifact|export)$/.test(name as string),
+    mutates: !/\.(list|get|detail|status|tabs|get_dom|screenshot|activity|artifact|export|validate|findings)$/.test(name as string),
     confirm: /^ca\.(un)?install$/.test(name as string) ? 'This changes the system trust store.' : null,
   }));
 

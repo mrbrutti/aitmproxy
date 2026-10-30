@@ -117,8 +117,9 @@ interface ProxyState {
   findings: PocRun[];
   activity: ActivityEntry[];
   tools: ToolDef[];
-  /** Live bus has no push until F4: the store polls `flow.list`. */
+  /** True while the poll loop is the live source (no push notifications arriving); false on push or on the static fixtures bus. */
   polling: boolean;
+  /** The core's version, from `proxy.status`; empty until it answers (never a made-up number). */
   version: string;
 }
 
@@ -211,7 +212,7 @@ export function createAppStore(bus: BusClient) {
       activity: [],
       tools: [],
       polling: false,
-      version: '0.3.0',
+      version: '',
     });
     let activitySeq = 0;
 
@@ -303,12 +304,18 @@ export function createAppStore(bus: BusClient) {
       });
     }
 
+    // When the last flow/state notification landed. The poll loop backs off only while push is
+    // demonstrably flowing — never because the core merely *advertises* `flow.subscribe`.
+    let lastPushAt = Number.NEGATIVE_INFINITY;
+
     bus.onNotification((method, params) => {
       switch (method) {
         case 'notifications/aitm/flow':
+          lastPushAt = Date.now();
           onFlowEvent(params as FlowNotification);
           break;
         case 'notifications/aitm/state':
+          lastPushAt = Date.now();
           onState(params as StateNotification);
           break;
         case 'notifications/aitm/agent':
@@ -317,10 +324,21 @@ export function createAppStore(bus: BusClient) {
       }
     });
 
-    // ---- polling fallback (bus without F4) --------------------------------
+    // ---- live updates: poll unless push is demonstrably flowing -------------
+    // Every real bus is polled. `flow.subscribe` being advertised proves nothing — nothing here calls
+    // it, and the /bus bridge pushes no notifications — so the loop runs regardless, and only skips
+    // its work while a flow/state notification arrived within PUSH_FRESH_MS. Even then a heartbeat
+    // poll runs every PUSH_FRESH_MS, so a push that dies quietly (or carries only state) cannot freeze
+    // the list. The static `fixtures` bus is a snapshot and is never polled.
+    const POLL_MS = 500;
+    const STATUS_EVERY_TICKS = 4; // ~2 s while polling
+    const PUSH_FRESH_MS = 10_000;
     let pollTimer: ReturnType<typeof setTimeout> | null = null;
+    let pollLoopOn = false;
     let pollTicks = 0;
+    let lastPollAt = Number.NEGATIVE_INFINITY;
     async function pollOnce() {
+      lastPollAt = Date.now();
       try {
         const ids = await bus.call<string[]>('flow.list');
         const fresh = ids.filter((id) => !byId.has(id));
@@ -348,26 +366,40 @@ export function createAppStore(bus: BusClient) {
     async function pollStatus() {
       if (!proxy.tools.some((t) => t.name === 'proxy.status')) return;
       try {
-        const s = await bus.call<{ capturing?: boolean; intercept_armed?: boolean; address?: string | null; paused?: number }>('proxy.status');
+        const s = await bus.call<{ capturing?: boolean; intercept_armed?: boolean; address?: string | null; paused?: number; version?: unknown }>('proxy.status');
         setProxy({
           listening: s.capturing ?? proxy.listening,
           armed: typeof s.intercept_armed === 'boolean' ? s.intercept_armed : proxy.armed,
           address: s.address ?? proxy.address,
+          version: typeof s.version === 'string' ? s.version : proxy.version,
         });
       } catch {
         /* next tick */
       }
     }
     function startPolling() {
-      if (pollTimer) return;
-      setProxy('polling', true);
+      if (pollLoopOn) return;
+      pollLoopOn = true;
       const tick = async () => {
-        await pollOnce();
-        // Without push (F4) the listener/intercept state is polled too, every ~2 s.
-        if (++pollTicks % 4 === 0) await pollStatus();
-        pollTimer = setTimeout(tick, 500);
+        pollTimer = null;
+        // A closed bus ends the loop (nothing is rescheduled), so no timer outlives it.
+        if (bus.state() === 'closed') {
+          pollLoopOn = false;
+          setProxy('polling', false);
+          return;
+        }
+        const now = Date.now();
+        const sincePush = now - lastPushAt;
+        const pushLive = sincePush >= 0 && sincePush < PUSH_FRESH_MS;
+        setProxy('polling', !pushLive);
+        if (!pushLive || now - lastPollAt >= PUSH_FRESH_MS) {
+          await pollOnce();
+          // The listener/intercept state is polled too: every ~2 s on the loop, on each heartbeat under push.
+          if (pushLive || ++pollTicks % STATUS_EVERY_TICKS === 0) await pollStatus();
+        }
+        pollTimer = setTimeout(tick, POLL_MS);
       };
-      void tick();
+      pollTimer = setTimeout(tick, POLL_MS);
     }
 
     // ---- PoC session state ----------------------------------------------------
@@ -470,6 +502,7 @@ export function createAppStore(bus: BusClient) {
               paused?: number | boolean;
               intercept_armed?: boolean;
               protocol?: string;
+              version?: unknown;
             }>('proxy.status')
             .then((s) =>
               setProxy({
@@ -481,6 +514,8 @@ export function createAppStore(bus: BusClient) {
                 address: (typeof s.listening === 'string' ? s.listening : s.address) ?? proxy.address,
                 protocol: s.protocol ?? proxy.protocol,
                 armed: typeof s.intercept_armed === 'boolean' ? s.intercept_armed : proxy.armed,
+                // The binary's version; a core older than the field sends none, and nothing is better than a guess.
+                version: typeof s.version === 'string' ? s.version : proxy.version,
               }),
             )
             .catch(() => {}),
@@ -494,11 +529,13 @@ export function createAppStore(bus: BusClient) {
         const tools = await bus.tools();
         setProxy('tools', tools);
         await refreshSide();
-        if (!tools.some((t) => t.name === 'flow.subscribe') && bus.address !== 'fixtures') startPolling();
-        else await pollOnce();
+        await pollOnce(); // the snapshot of what was captured before this page connected
       } catch (e) {
         notice((e as Error).message, 'error');
       }
+      // Outside the try on purpose: a failed bootstrap (tools/list rejected, say) must not leave the
+      // list frozen. The loop keeps trying every tick, and `flow.list` needs no catalogue.
+      if (bus.address !== 'fixtures') startPolling();
     }
     void bootstrap();
 
