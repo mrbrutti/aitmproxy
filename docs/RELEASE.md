@@ -49,6 +49,16 @@ The full Rust gate must be green before you tag:
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
+## Prerequisites
+
+- **`OBSCURA_GH_TOKEN` repository secret.** The release workflow's Linux jobs run
+  `scripts/package.sh` / `scripts/package-linux.sh`, which `gh release download`
+  the obscura engine from the **separate private** repo `mrbrutti/obscura`. The
+  default `GITHUB_TOKEN` cannot read another private repo, so those steps use
+  `secrets.OBSCURA_GH_TOKEN` — a read-scoped GitHub PAT with access to
+  `mrbrutti/obscura`. Add it under **Settings ▸ Secrets and variables ▸ Actions**
+  before the first release, or the obscura download fails. Never commit the token.
+
 ## Steps
 
 ### 1. Bump the version and commit
