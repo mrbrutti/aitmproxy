@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Download — aitmproxy</title>
-<meta name="description" content="Install aitmproxy with Homebrew on macOS and Linux: the core proxy, the macOS app, the web UI, the terminal UI and the MCP server. Open source, MIT or Apache-2.0.">
+<meta name="description" content="Install aitmproxy with Homebrew on macOS (Apple Silicon) or a native package on Linux: the core proxy, the macOS app, the web UI, the terminal UI and the MCP server. Licensed MIT or Apache-2.0.">
 <link rel="stylesheet" href="styles.css">
 <script>(function(d){var c=" js";try{if(!matchMedia("(prefers-reduced-motion: reduce)").matches&&!sessionStorage.getItem("aitm.intro")){c+=" intro-on";sessionStorage.setItem("aitm.intro","1");}}catch(e){}d.className+=c;})(document.documentElement);</script>
 </head>
@@ -40,7 +40,7 @@
 <section class="page-head">
   <div class="wrap">
     <h1 class="display">Get aitmproxy <span class="ver">v0.5.0</span></h1>
-    <p class="lead">The first release. Install the <code>aitm</code> binary — core proxy, terminal UI, web UI and MCP server — with Homebrew or Cargo, grab a native Linux package, or build from source. The macOS app ships the same core. Everything is open source, MIT or Apache-2.0.</p>
+    <p class="lead">Install the <code>aitm</code> binary — core proxy, web UI, terminal UI and MCP server — with Homebrew on macOS (Apple Silicon), or take a native package or tarball on Linux. The macOS app bundles its own core. Licensed under MIT or Apache-2.0. macOS and Linux only; there is no Windows build.</p>
   </div>
 </section>
 
@@ -56,16 +56,16 @@
           <div class="cmd"><code><span class="pr">$ </span>brew install aitm</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
           <div class="cmd"><code><span class="pr">$ </span>brew install --cask aitmproxy</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
         </div>
-        <p class="deck muted">The formula is the CLI and the three UIs; the cask is the macOS app, which drives the same core. The tap and the release binaries are public — no token needed. On Linux, use a native package below, or Cargo.</p>
+        <p class="deck muted">The formula is the <code>aitm</code> core with its web and terminal UIs; the cask is the macOS app, which bundles and manages its own core. Both are Apple Silicon only. The tap and the release assets are public, so no token is needed. On Linux, use a native package or tarball below.</p>
       </div>
       <div>
         <h2 class="h2" data-reveal>Then capture.</h2>
-        <p class="lead deck">Trust the local certificate once, start the proxy, and point your app, browser or client at <code>127.0.0.1:8080</code>.</p>
+        <p class="lead deck">Trust the local certificate once, start the web UI, and point your app, browser or client at <code>127.0.0.1:8080</code>.</p>
         <div class="steps">
           <div class="cmd"><code><span class="pr">$ </span>aitm ca install</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
           <div class="cmd"><code><span class="pr">$ </span>aitm web</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
         </div>
-        <p class="deck muted">Prefer the terminal? <code>aitm tui</code> starts the core and the TUI together. <a class="arrow" href="docs.html">Getting started, step by step</a></p>
+        <p class="deck muted"><code>aitm web</code> serves the UI on <code>127.0.0.1:8082</code> and prints a one-time <code>web UI (agent): http://127.0.0.1:8082/#t=…</code> link; open it in a browser, since nothing opens for you. Prefer the terminal? <code>aitm tui</code> starts the core and the TUI together. <a class="arrow" href="docs.html">Getting started, step by step</a></p>
       </div>
     </div>
   </div>
@@ -79,9 +79,9 @@
 <section class="section" id="downloads" style="padding-top:0">
   <div class="wrap">
     <h2 class="h2" data-reveal>Packages and archives</h2>
-    <p class="lead deck">Prefer a native package or a plain archive? The v0.5.0 release attaches a <code>.deb</code>, an <code>.rpm</code> and a <code>.tar.gz</code> for Linux (x86-64 and aarch64), with a signed macOS <code>.dmg</code> following once notarization is set up. Each asset is listed below with its SHA-256 the moment the release finishes publishing.</p>
+    <p class="lead deck">Prefer a native package or a plain archive? The v0.5.0 release attaches a <code>.deb</code>, an <code>.rpm</code> and a <code>.tar.gz</code> for Linux (x86-64 and aarch64), and, for macOS on Apple Silicon, the app as a <code>.dmg</code> and a <code>.tar.gz</code> of the <code>aitm</code> binaries. Each asset is listed below with its SHA-256. Releases are public on the <a href="https://github.com/mrbrutti/homebrew-aitmproxy/releases/tag/v0.5.0">release page</a>.</p>
     <div class="downloads" data-downloads hidden></div>
-    <p class="deck muted" data-reveal>The table above fills in from the release manifest. If it is empty, the v0.5.0 artifacts are still publishing — check back shortly, or use Homebrew above, Cargo, or build from source in the meantime.</p>
+    <p class="deck muted" data-reveal>The table above fills in from the release manifest. If it is empty, use Homebrew above or the release page.</p>
   </div>
 </section>
 
@@ -89,7 +89,7 @@
 <section class="section" id="source" style="padding-top:0">
   <div class="wrap">
     <h2 class="h2" data-reveal>Cargo and from source</h2>
-    <p class="lead deck">With a recent Rust toolchain you can install the <code>aitm</code> binary directly, or clone and build. A bare <code>cargo</code> build produces <code>aitm</code>; the packaged builds above add the <code>aitm-tui</code> and embedded browser alongside it.</p>
+    <p class="lead deck">With a recent Rust toolchain you can install the <code>aitm</code> binary directly. The source repository is private, so this needs git credentials with access to it. A bare <code>cargo</code> build produces <code>aitm</code> only: no <code>aitm-tui</code>, no bundled obscura browser engine, and no embedded web UI unless <code>apps/web</code> was built first. The packaged builds above include all three.</p>
     <div class="steps" data-reveal data-d="1">
       <div class="cmd"><code><span class="pr">$ </span>cargo install --git https://github.com/mrbrutti/aitmproxy aitm</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
     </div>
@@ -104,21 +104,21 @@
     <div class="features">
       <article class="feature" data-reveal>
         <h3 class="h3">macOS app</h3>
-        <p>Native Swift and SwiftUI, universal for Apple Silicon and Intel, signed and notarized.</p>
+        <p>Native Swift and SwiftUI, for Apple Silicon, signed and notarized. It bundles its own core and obscura, or attaches to an external core you run.</p>
         <div class="ui"><div class="ui-lines">
           <div><span class="k">install</span><span>brew install --cask aitmproxy</span></div>
-          <div><span class="k">needs</span><span>macOS 13 Ventura or later</span></div>
-          <div><span class="k">arch</span><span>arm64 · x86-64 (universal)</span></div>
+          <div><span class="k">needs</span><span>macOS 26 (Tahoe) or later</span></div>
+          <div><span class="k">arch</span><span>arm64 (Apple Silicon only)</span></div>
         </div></div>
         <a class="arrow" href="index.html#apps">See the app</a>
       </article>
       <article class="feature" data-reveal data-d="1">
         <h3 class="h3">Web &amp; CLI</h3>
-        <p>The <code>aitm</code> binary ships the SolidJS web UI and every command. Runs on macOS and Linux.</p>
+        <p>The <code>aitm</code> binary ships the SolidJS web UI and every command, and serves MCP over stdio when run with no arguments. Runs on macOS and Linux.</p>
         <div class="ui"><div class="ui-lines">
-          <div><span class="k">install</span><span>brew install aitm</span></div>
+          <div><span class="k">install</span><span>brew install aitm (Apple Silicon)</span></div>
           <div><span class="k">web</span><span>aitm web → 127.0.0.1:8082</span></div>
-          <div><span class="k">linux</span><span>x86-64 · arm64</span></div>
+          <div><span class="k">linux</span><span>x86-64 · arm64, .deb · .rpm · .tar.gz</span></div>
         </div></div>
         <a class="arrow" href="index.html#apps">See the web UI</a>
       </article>
@@ -127,7 +127,7 @@
         <p>A ratatui interface in the same binary, keyboard-complete and happy over SSH.</p>
         <div class="ui"><div class="ui-lines">
           <div><span class="k">start</span><span>aitm tui</span></div>
-          <div><span class="k">needs</span><span>any truecolor terminal</span></div>
+          <div><span class="k">attach</span><span>aitm-tui, to a running core</span></div>
           <div><span class="k">remote</span><span>works over SSH</span></div>
         </div></div>
         <a class="arrow" href="index.html#apps">See the TUI</a>
@@ -144,11 +144,11 @@
       <div class="stat" data-reveal><b>1</b><span>core proxy — HTTP, WebSocket, HTTP/2 and raw L4, with TLS passthrough</span></div>
       <div class="stat" data-reveal data-d="1"><b>3</b><span>user interfaces — macOS, web and terminal</span></div>
       <div class="stat" data-reveal data-d="2"><b>1</b><span>embedded headless browser for reproducing findings</span></div>
-      <div class="stat" data-reveal><b>1</b><span>MCP server, so an assistant can drive all of it</span></div>
+      <div class="stat" data-reveal><b>1</b><span>MCP server, so an assistant can drive it</span></div>
       <div class="stat" data-reveal data-d="1"><b>2</b><span>small languages — Rhai plugins and YAML reproductions</span></div>
-      <div class="stat" data-reveal data-d="2"><b>0</b><span>cost — open source under MIT or Apache-2.0</span></div>
+      <div class="stat" data-reveal data-d="2"><b>2</b><span>licences to choose from, MIT or Apache-2.0</span></div>
     </div>
-    <p class="deck muted" style="margin-top:var(--gap)">Source, issues and the full changelog live on the project repository. Build from source with a recent Rust toolchain if you prefer.</p>
+    <p class="deck muted" style="margin-top:var(--gap)">Releases, packages and checksums are public on the release page. The source repository is private.</p>
     <p class="deck"><a class="btn" href="docs.html">Read the docs</a> <a class="arrow" href="index.html" style="margin-left:1rem">Back to the overview</a></p>
   </div>
 </section>
