@@ -50,6 +50,45 @@ host — switch the app to **external** in **Settings ▸ Bus**:
 The app always connects as an operator (`clientInfo aitm-mac`) over loopback
 TCP and never acts as the agent.
 
+## Building from source (`cargo` / bare binary)
+
+`cargo build`, `cargo install`, and the bare `aitm` binary build **only** `aitm`.
+They do **not** produce the `obscura` browser engine — it is a separate artifact
+published at `mrbrutti/obscura` (tag `aitm-v1`). An `aitm` with no `obscura`
+reachable runs the proxy fine, but the browser engine fails to launch with
+`no obscura binary found …`.
+
+`aitm` looks for `obscura` in this order (first hit wins):
+
+1. `browser.obscura.binary` in `config.yaml`
+2. the `AITM_OBSCURA_BIN` environment variable
+3. `obscura` next to the `aitm` executable
+4. `obscura` on `PATH`
+
+So after building from source, make `obscura` reachable by any one of:
+
+- **Bundle it beside `aitm` (recommended).** `scripts/package.sh` builds a
+  release `aitm`, downloads the matching `obscura-<target>.tar.gz` for your host,
+  verifies it against the release `SHA256SUMS`, and writes
+  `dist/aitm-<version>-<target>.tar.gz` holding `aitm` and `obscura` side by side.
+  Extract it anywhere and run `./aitm` — discovery step 3 finds `obscura`
+  automatically, with no `PATH` entry or config key. Needs `gh` authenticated.
+- **Point at an existing engine.** `export AITM_OBSCURA_BIN=/path/to/obscura`, or
+  set `browser.obscura.binary: /path/to/obscura` in `config.yaml`.
+
+`obscura` must be the aitmproxy fork (its `--help` lists `--ca-cert`); a stock
+Chromium will be rejected at probe time. On macOS, clear the download quarantine
+with `xattr -d com.apple.quarantine /path/to/obscura` or it will fail to spawn.
+
+## Linux and other platforms
+
+The Homebrew formula and cask above are Apple-Silicon macOS only. On Linux (and
+other targets), build from source as above: `obscura` ships Linux release assets
+for both `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` at
+`mrbrutti/obscura@aitm-v1`, so `scripts/package.sh` run **on the Linux host**
+produces a `dist/aitm-<version>-<target>.tar.gz` with `aitm` and `obscura`
+bundled together, exactly as on macOS.
+
 ---
 
 ## Release note: Homebrew tap self-sufficiency (applied in the tap, not here)
