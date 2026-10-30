@@ -499,6 +499,12 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 14 | spec | Important | NE build installed to `~/Applications`, where the sysex cannot activate (spike: Code=3); must be `/Applications` | fixed — build.sh now selects `/Applications` for an NE build, keeps `~/Applications` for the dev loop |
+| 10 | spec | Important | Catch-all rule was `.TCP`, foreclosing UDP capture (NE-AC2/AC17); plan says "protocol any" | fixed — rule now `protocol: .any` (TCP+UDP) |
+| 14 | security, quality | Minor | `codesign … \| grep -v … \|\| true` swallows codesign's exit status; a failed restricted-entitlement sign still prints "installed (signed)" | fixed — new `cs()` wrapper aborts the build on codesign failure |
+| 14 | quality | Minor | "no sysex embedded" hint named `SIGN_IDENTITY`, but the code reads `NE_SIGN_IDENTITY` | fixed — hint corrected to `NE_SIGN_IDENTITY` |
+| 10 | quality | Minor | Deprecated `NENetworkRule(remoteNetwork:…)` init (macOS 15) emits a build warning; Task 10 says "not deprecated NWHostEndpoint" | fixed — switched to the non-deprecated `remoteNetworkEndpoint:` init; `swiftc` compiles clean (no warning) |
+| 10 | spec | Minor | `swiftc` build replaces the plan's `apps/mac/Extension/Aitmproxy.xcodeproj` (spec D6) | **pending Matt's ratification** — repo convention is "no Xcode project" (apps/mac/CLAUDE.md) and the Task-1 spike proved swiftc+manual codesign handles the `-systemextension` entitlement; recommend amending spec D6 to swiftc |
 
 ## Shipped
 

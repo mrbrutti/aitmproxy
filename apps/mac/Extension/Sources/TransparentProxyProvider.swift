@@ -24,13 +24,18 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                              completionHandler: @escaping (Error?) -> Void) {
         os_log("startProxy", log: log, type: .default)
         let settings = NETransparentProxyNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
-        // Catch-all included rule: any remote, outbound TCP. Provider *rules* cannot
-        // be hot-edited without a restart, so the rule stays broad and the per-flow
-        // decision (handleNewFlow, once the handoff lands) does the real scoping.
-        let tcp = NENetworkRule(remoteNetwork: nil, remotePrefix: 0,
-                                localNetwork: nil, localPrefix: 0,
-                                protocol: .TCP, direction: .outbound)
-        settings.includedNetworkRules = [tcp]
+        // Catch-all included rule: any remote, outbound, protocol **any** so both
+        // TCP byte-stream flows and UDP datagram flows reach the provider (spec D1,
+        // NE-AC2). Provider *rules* cannot be hot-edited without a restart, so the
+        // rule stays broad and the per-flow decision (handleNewFlow, once the handoff
+        // lands) does the real scoping.
+        // Use the non-deprecated macOS 15+ initializer (…NetworkEndpoint:, nw_endpoint_t)
+        // rather than the deprecated NWHostEndpoint one; the distinct label selects it
+        // for a nil catch-all.
+        let rule = NENetworkRule(remoteNetworkEndpoint: nil, remotePrefix: 0,
+                                 localNetworkEndpoint: nil, localPrefix: 0,
+                                 protocol: .any, direction: .outbound)
+        settings.includedNetworkRules = [rule]
         setTunnelNetworkSettings(settings) { error in
             if let error = error {
                 os_log("setTunnelNetworkSettings error %{public}@",

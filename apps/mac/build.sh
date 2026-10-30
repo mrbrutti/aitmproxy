@@ -21,6 +21,19 @@ if [[ -z "$identity" ]]; then
 fi
 [[ -n "$identity" ]] || identity=-
 
+# Detect a Network/System Extension build early: it needs a Developer ID identity
+# (resolved by SHA — a team can hold two same-named certs, and codesign needs it
+# unambiguous) and both A1 provisioning profiles. An NE build installs to
+# /Applications (the Task-1 spike proved the sysex is rejected from ~/Applications
+# with OSSystemExtensionError Code=3); a normal dev build stays in ~/Applications so
+# the snapshot/selftest tooling is unaffected.
+ne_app_profile="${NE_APP_PROFILE:-$HOME/Library/MobileDevice/Provisioning Profiles/Aitmproxy Host DeveloperID.provisionprofile}"
+ne_sysex_profile="${NE_SYSEX_PROFILE:-$HOME/Library/MobileDevice/Provisioning Profiles/Aitmproxy NE DeveloperID.provisionprofile}"
+ne_identity=""
+if [[ -f "$ne_app_profile" && -f "$ne_sysex_profile" ]]; then
+  ne_identity="${NE_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | awk '/Developer ID Application/ {print $2; exit}')}"
+fi
+
 swift build -c $config --package-path "$here" --scratch-path "$scratch" 2>&1 | grep -E "error|warning|Build complete" | grep -v "^\[" || true
 bin="$scratch/$config/$name"
 [[ -x "$bin" ]] || { echo "build failed"; exit 1; }
@@ -32,8 +45,12 @@ if [[ -n "$stale" ]]; then
   exit 1
 fi
 
-app="$HOME/Applications/$name.app"
-mkdir -p "$HOME/Applications"
+# An NE build installs to /Applications (required for sysex activation); the normal
+# dev loop keeps ~/Applications so snapshot/selftest tooling is unaffected.
+apps_dir="$HOME/Applications"
+[[ -n "$ne_identity" ]] && apps_dir="/Applications"
+app="$apps_dir/$name.app"
+mkdir -p "$apps_dir"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin" "$app/Contents/MacOS/$name"
@@ -86,23 +103,14 @@ else
 fi
 
 # --- Network/System Extension capture path (Band C Task 10/14) ---------------
-# Build and embed the sysex only for a Developer ID build with the NE provisioning
-# profiles present. The restricted NE entitlements must be authorised by an
-# embedded Developer ID profile, and the Task-1 spike proved the sysex activates
-# only when the app is Developer-ID-signed, NOTARIZED, and installed to
-# /Applications. An ad-hoc or Apple Development build (the normal UI dev loop)
-# skips it, so this does not change day-to-day development.
-ne_app_profile="${NE_APP_PROFILE:-$HOME/Library/MobileDevice/Provisioning Profiles/Aitmproxy Host DeveloperID.provisionprofile}"
-ne_sysex_profile="${NE_SYSEX_PROFILE:-$HOME/Library/MobileDevice/Provisioning Profiles/Aitmproxy NE DeveloperID.provisionprofile}"
+# Build and embed the sysex for an NE build. ne_identity and the two profiles were
+# resolved near the top (where they also selected /Applications as the install dir).
+# The restricted NE entitlements must be authorised by an embedded Developer ID
+# profile, and the Task-1 spike proved the sysex activates only when the app is
+# Developer-ID-signed, NOTARIZED, and in /Applications. A normal ad-hoc or Apple
+# Development dev build leaves sysex_bundle empty and is unaffected.
 sysex_id="com.mrbrutti.aitmproxy.ne"
 sysex_bundle=""
-# Resolve a Developer ID Application identity by SHA (there can be two certs with
-# the same name on this team, so match by SHA, not name — codesign needs it
-# unambiguous). An NE build runs only when both profiles and such an identity exist.
-ne_identity=""
-if [[ -f "$ne_app_profile" && -f "$ne_sysex_profile" ]]; then
-  ne_identity="${NE_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | awk '/Developer ID Application/ {print $2; exit}')}"
-fi
 if [[ -n "$ne_identity" ]]; then
   ext="$here/Extension"
   sdk=$(xcrun --show-sdk-path --sdk macosx)
@@ -117,7 +125,7 @@ if [[ -n "$ne_identity" ]]; then
   cp "$ne_app_profile" "$app/Contents/embedded.provisionprofile"
   echo "built + embedded system extension: $sysex_bundle"
 else
-  echo "no system extension embedded (needs a Developer ID identity + the two NE profiles; set SIGN_IDENTITY / NE_APP_PROFILE / NE_SYSEX_PROFILE)"
+  echo "no system extension embedded (needs a Developer ID identity + the two NE profiles; set NE_SIGN_IDENTITY / NE_APP_PROFILE / NE_SYSEX_PROFILE)"
 fi
 
 xattr -cr "$app"
@@ -129,14 +137,27 @@ xattr -cr "$app"
 sign_identity="${ne_identity:-$identity}"
 runtime_opts=(--options runtime)
 [[ "$sign_identity" != "-" ]] && runtime_opts+=(--timestamp)
+# codesign that ABORTS the build on a real failure while hiding the benign
+# "replacing existing signature" chatter. A plain `… | grep -v … || true` lets
+# grep's exit status mask codesign's, so a failed restricted-entitlement sign would
+# still read as success — the very class of bug this NE work fixes.
+cs() {
+  local out
+  if ! out=$(codesign "$@" 2>&1); then
+    print -r -- "$out" >&2
+    echo "build failed: codesign $*" >&2
+    exit 1
+  fi
+  print -r -- "$out" | grep -v "replacing existing signature" || true
+}
 # obscura is Chromium-based: under the hardened runtime it needs JIT entitlements
 # or it crashes (SIGTRAP) on V8 init. aitm (plain Rust) needs none.
 obscura_ent="$here/EmbeddedObscura.entitlements"
 if [[ -f "$coredir/obscura" ]]; then
-  codesign --force "${runtime_opts[@]}" --entitlements "$obscura_ent" --sign "$sign_identity" "$coredir/obscura" 2>&1 | grep -v "replacing existing signature" || true
+  cs --force "${runtime_opts[@]}" --entitlements "$obscura_ent" --sign "$sign_identity" "$coredir/obscura"
 fi
 if [[ -f "$coredir/aitm" ]]; then
-  codesign --force "${runtime_opts[@]}" --sign "$sign_identity" "$coredir/aitm" 2>&1 | grep -v "replacing existing signature" || true
+  cs --force "${runtime_opts[@]}" --sign "$sign_identity" "$coredir/aitm"
 fi
 # The system extension signs inside-out BEFORE the app, with its own restricted
 # NE entitlements (Task 14). The app is then signed with its NE entitlements too,
@@ -144,10 +165,10 @@ fi
 # activation. Non-NE dev builds keep the plain app signature (no entitlements).
 app_sign_opts=(--force)
 if [[ -n "$sysex_bundle" ]]; then
-  codesign --force "${runtime_opts[@]}" --entitlements "$here/Extension/Aitmproxy-Extension.entitlements" --sign "$sign_identity" "$sysex_bundle" 2>&1 | grep -v "replacing existing signature" || true
+  cs --force "${runtime_opts[@]}" --entitlements "$here/Extension/Aitmproxy-Extension.entitlements" --sign "$sign_identity" "$sysex_bundle"
   app_sign_opts+=("${runtime_opts[@]}" --entitlements "$here/Aitmproxy.entitlements")
 fi
-codesign "${app_sign_opts[@]}" --sign "$sign_identity" "$app" 2>&1 | grep -v "replacing existing signature" || true
+cs "${app_sign_opts[@]}" --sign "$sign_identity" "$app"
 echo "installed $app (signed: ${sign_identity})"
 
 if [[ " $* " == *" --open "* ]]; then
