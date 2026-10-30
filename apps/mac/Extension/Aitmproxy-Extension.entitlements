@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  System-extension entitlements. Developer ID distribution values; authorised by
+  the embedded Developer ID provisioning profile "Aitmproxy NE DeveloperID"
+  (App ID 995PCLM9KH.com.mrbrutti.aitmproxy.ne), minted in A1. The sysex does not
+  carry system-extension.install (only the host app installs it).
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.developer.networking.networkextension</key>
+    <array>
+        <string>app-proxy-provider-systemextension</string>
+    </array>
+    <key>com.apple.application-identifier</key>
+    <string>995PCLM9KH.com.mrbrutti.aitmproxy.ne</string>
+    <key>com.apple.developer.team-identifier</key>
+    <string>995PCLM9KH</string>
+</dict>
+</plist>
