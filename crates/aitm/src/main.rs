@@ -425,14 +425,22 @@ async fn run() -> anyhow::Result<()> {
         let mcp = tui::server(&cfg, cfg.mcp.transport.clone(), &services)
             .with_mcp_roles(cfg.mcp.operator_token.clone(), cfg.mcp.stdio_role)
             .with_agent_state(agent_state)
-            .with_push(push_tx)
+            .with_push(push_tx.clone())
             .with_audit_ring(audit_ring);
 
         // `aitm web`: a second McpServer over the same registry and services
-        // (`serve` consumes the first), driven by the bridge's `handle` calls.
+        // (`serve` consumes the first), driven by the bridge's `handle_on` calls.
+        // It is fed the core event stream too, with its own dispatcher: each
+        // server keeps its own subscription registry and only `serve` spawns a
+        // dispatcher, so without this a `/bus` subscription would sit in a
+        // registry nothing feeds. Exactly one dispatcher per server, or every
+        // subscriber receives each event twice.
         let web_server = match (web_settings, web_listener) {
             (Some(settings), Some(listener)) => {
-                let bus = tui::server(&cfg, cfg.mcp.transport.clone(), &services);
+                let bus = Arc::new(
+                    tui::server(&cfg, cfg.mcp.transport.clone(), &services).with_push(push_tx),
+                );
+                bus.spawn_push_dispatcher();
                 // Operator access on the web UI is tied to `mcp.operator_token`
                 // being configured to a NON-EMPTY value (operator role exists at
                 // all); there is no separate `aitm web` opt-in. An empty token is
@@ -448,7 +456,7 @@ async fn run() -> anyhow::Result<()> {
                     .is_some_and(|t| !t.is_empty())
                     .then(web::generate_token);
                 let state = Arc::new(WebState {
-                    mcp: Arc::new(bus),
+                    mcp: bus,
                     agent_token: settings.token.clone(),
                     operator_token: operator_token.clone(),
                 });

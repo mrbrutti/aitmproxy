@@ -757,6 +757,10 @@ async fn replies_stay_in_order_while_pushes_flow() {
                     .unwrap_or_default()
                     .to_owned(),
             );
+        } else if frame["method"] == "notifications/aitm/agent" {
+            // Every finished tool call is audited and fanned to all subscribers, so
+            // this frame's own commands show up on the stream. Neither a reply nor
+            // a flow push.
         } else {
             panic!("unexpected frame: {frame}");
         }
