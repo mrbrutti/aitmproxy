@@ -29,6 +29,7 @@ export type SidebarItem =
   | { kind: 'domain'; key: string }
   | { kind: 'scope' }
   | { kind: 'findings' }
+  | { kind: 'scan' }
   | { kind: 'browser' }
   | { kind: 'scripts' }
   | { kind: 'l4' }
@@ -65,7 +66,7 @@ export type Theme = 'system' | 'light' | 'dark';
 export type Density = 'dense' | 'default' | 'comfortable';
 export type AgentPolicy = StateNotification['agent'];
 export type KillMode = 'reset' | '429' | '503';
-export type Panel = 'inspector' | 'findings' | 'browser' | 'scope' | 'agent' | 'scripts';
+export type Panel = 'inspector' | 'findings' | 'scan' | 'browser' | 'scope' | 'agent' | 'scripts';
 
 export interface FlowEntry {
   readonly id: FlowId;
@@ -797,7 +798,7 @@ export function createAppStore(bus: BusClient) {
         // `l4` is a FILTER over the one unified list (like `scope`), not a panel: it stays on the
         // inspector so the lower region shows the HTTP or L4 inspector by the selected flow's kind.
         const panel: Panel =
-          s.kind === 'findings' ? 'findings' : s.kind === 'browser' ? 'browser' : s.kind === 'scope' ? 'scope' : s.kind === 'agent' ? 'agent' : s.kind === 'scripts' ? 'scripts' : 'inspector';
+          s.kind === 'findings' ? 'findings' : s.kind === 'scan' ? 'scan' : s.kind === 'browser' ? 'browser' : s.kind === 'scope' ? 'scope' : s.kind === 'agent' ? 'agent' : s.kind === 'scripts' ? 'scripts' : 'inspector';
         setUi('panel', panel);
       }),
       setPanel: (p: Panel) => setUi('panel', p),
@@ -1026,6 +1027,9 @@ export function createAppStore(bus: BusClient) {
           notice(`PoC ${r.passed ? 'passed' : 'did not pass'}${Array.isArray(r.evaluated) ? ` — ${r.evaluated.filter((e) => e.matched).length} of ${r.evaluated.length} assertions matched` : ''}`);
           return r as PocRun;
         }),
+      // The scanner's scope-bound discovery launch (Stage 1). The Scan view binds `target` to an
+      // in-scope host, so the call is deny-by-default at the UI; the core re-gates it anyway.
+      scanDiscover: (args: Record<string, unknown>) => guarded('scan', () => bus.call<unknown>('scan.discover', args)),
       ensurePocSource,
       refreshSide,
       /** The lifted L4 store calls this on each refresh so selection/list routing knows L4 ids. */

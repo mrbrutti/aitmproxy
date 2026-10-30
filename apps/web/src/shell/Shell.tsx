@@ -4,6 +4,7 @@ import { createSignal, Match, onCleanup, onMount, Show, Switch, type Component }
 import { useApp, useL4 } from '~/state/context';
 import { Inspector } from '~/inspector/Inspector';
 import { FindingsPanel } from '~/panels/FindingsPanel';
+import { ScanPanel } from '~/panels/ScanPanel';
 import { BrowserPanel } from '~/panels/BrowserPanel';
 import { ScopePanel } from '~/panels/ScopePanel';
 import { AgentPanel } from '~/panels/AgentPanel';
@@ -138,6 +139,9 @@ export const Shell: Component = () => {
             <Switch fallback={l4 && app.selectedIsL4() ? <L4InspectorPanel store={l4} /> : <Inspector />}>
               <Match when={app.ui.panel === 'findings'}>
                 <FindingsPanel />
+              </Match>
+              <Match when={app.ui.panel === 'scan'}>
+                <ScanPanel />
               </Match>
               <Match when={app.ui.panel === 'browser'}>
                 <BrowserPanel />

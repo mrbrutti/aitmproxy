@@ -1,0 +1,246 @@
+/* The Scan view: a launch header over the tool schema, then the discovered endpoints and injection
+   points. Tokens only — no hard-coded colours or spacing (spec §Constraints). */
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  font-family: var(--font-ui);
+  color: var(--color-text-primary);
+  background: var(--color-ground-page);
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-line-rule);
+}
+
+.icon {
+  color: var(--color-text-tertiary);
+}
+
+.title {
+  margin: 0;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
+}
+
+.sub {
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-xs);
+}
+
+.scrollBody {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.empty,
+.note {
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-sm);
+  margin: 0;
+}
+
+/* ---- launch header ---- */
+.launch {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.targetRow {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-end;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.grow {
+  flex: 1;
+  min-width: 0;
+}
+
+.label {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+
+.selectWrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.select {
+  width: 100%;
+  height: var(--size-control);
+  padding: 0 var(--space-3);
+  font-family: var(--font-ui);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-primary);
+  background: var(--color-ground-surface);
+  border: 1px solid var(--color-line-control);
+  border-radius: var(--radius-control);
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.targetUrl {
+  font-family: var(--font-data);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.addWrap {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--color-line-rule);
+}
+
+.addLabel {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-tertiary);
+}
+
+/* ---- results ---- */
+.results {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-height: 0;
+}
+
+.sectionTitle {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-secondary);
+}
+
+.n {
+  margin-left: var(--space-1);
+  color: var(--color-text-tertiary);
+  font-weight: var(--font-weight-regular);
+}
+
+.scroll {
+  position: relative;
+  max-height: 40vh;
+  overflow: auto;
+  border: 1px solid var(--color-line-rule);
+  border-radius: var(--radius-control);
+  background: var(--color-ground-surface);
+}
+
+.canvas {
+  position: relative;
+  width: 100%;
+}
+
+.vrow {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+}
+
+.endpoint {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 100%;
+  padding: 0 var(--space-3);
+  border-bottom: 1px solid var(--color-line-rule);
+}
+
+.url {
+  font-family: var(--font-data);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.point {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  height: 100%;
+  padding: 0 var(--space-3);
+  text-align: left;
+  border: none;
+  border-bottom: 1px solid var(--color-line-rule);
+  background: transparent;
+  color: var(--color-text-primary);
+  cursor: pointer;
+  font-family: var(--font-ui);
+}
+
+.point:hover {
+  background: var(--color-ground-raised);
+}
+
+.loc {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.pname {
+  font-family: var(--font-data);
+  font-size: var(--font-size-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.example {
+  font-family: var(--font-data);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 40%;
+}
+
+.meta {
+  display: flex;
+  gap: var(--space-3);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-tertiary);
+}
+
+.stopped {
+  color: var(--color-status-server-error);
+}
