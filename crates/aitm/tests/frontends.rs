@@ -19,7 +19,7 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 53] = [
+const EXPECTED_TOOLS: [&str; 54] = [
     // M4 agent-control and F4 subscription tools, registered unconditionally by
     // the `AgentPlugin` and `SubscriptionPlugin` in `wire.rs`.
     "agent.status",
@@ -50,6 +50,7 @@ const EXPECTED_TOOLS: [&str; 53] = [
     "browser.screenshot",
     "browser.eval",
     "browser.get_dom",
+    "browser.confine",
     "poc.build",
     "poc.run",
     "poc.list",

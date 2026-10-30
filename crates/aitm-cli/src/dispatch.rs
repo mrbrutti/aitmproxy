@@ -11,8 +11,8 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use aitm_core::{
-    BrowserDriver, Command, CommandHost, FlowId, FlowStore, Frontend, ParamSchema, Params,
-    ProxyClient, Registry, ScopeRateGuard, SsrfPolicy, TypeDesc, Value,
+    BrowserDriver, Command, CommandHost, EgressConfinement, FlowId, FlowStore, Frontend,
+    ParamSchema, Params, ProxyClient, Registry, ScopeRateGuard, SsrfPolicy, TypeDesc, Value,
 };
 use anyhow::Context as _;
 use serde_json::Value as JsonValue;
@@ -39,6 +39,10 @@ pub struct Cli {
     poc_dir: Option<std::path::PathBuf>,
     config: Option<Arc<aitm_core::Config>>,
     finding_recorder: Option<Arc<dyn aitm_core::FindingRecorder>>,
+    /// The proxy's live browser-egress posture, handed to every host so
+    /// `browser.confine` toggles the connector's real posture. `None` = the
+    /// toggle is unavailable on this frontend (the command then errors).
+    egress: Option<Arc<EgressConfinement>>,
     confirmer: Arc<dyn Confirmer>,
 }
 
@@ -54,8 +58,17 @@ impl Cli {
             poc_dir: None,
             config: None,
             finding_recorder: None,
+            egress: None,
             confirmer: Arc::new(TtyConfirmer::from_stdin()),
         }
+    }
+
+    /// Attach the proxy's live browser-egress posture (`Proxy::egress()`), so a
+    /// CLI `browser.confine` flips the connector's real posture. Without it the
+    /// command errors rather than toggling a detached copy.
+    pub fn with_egress(mut self, egress: Arc<EgressConfinement>) -> Self {
+        self.egress = Some(egress);
+        self
     }
 
     /// Attach the proxy configuration so `config.get`/`proxy.status` can read it.
@@ -134,6 +147,10 @@ impl Cli {
         };
         let host = match &self.finding_recorder {
             Some(rec) => host.with_finding_recorder(rec.as_ref()),
+            None => host,
+        };
+        let host = match &self.egress {
+            Some(egress) => host.with_egress(egress.as_ref()),
             None => host,
         };
         if !yes {
@@ -413,5 +430,90 @@ fn type_hint(ty: &TypeDesc) -> &'static str {
         TypeDesc::Array(_) => "json-array",
         TypeDesc::Object(_) | TypeDesc::Map(_) => "json-object",
         TypeDesc::Any => "value",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aitm_core::{
+        EgressConfinement, HttpFlow, HttpRequest, MemFlowStore, Sensitivity, StdGuard,
+    };
+    use futures::future::BoxFuture;
+
+    /// A `ProxyClient` the probe never reaches.
+    struct NoClient;
+
+    impl ProxyClient for NoClient {
+        fn send(&self, _req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+            Box::pin(async { anyhow::bail!("egress.probe does not use the proxy client") })
+        }
+    }
+
+    /// `egress.probe`: reports exactly what `browser.confine` reads off the
+    /// host (`host.egress()`), so the wiring is testable here without the
+    /// browser crate.
+    struct EgressProbe;
+
+    impl Command for EgressProbe {
+        fn name(&self) -> &str {
+            "egress.probe"
+        }
+        fn sensitivity(&self) -> Sensitivity {
+            Sensitivity::Read
+        }
+        fn schema(&self) -> ParamSchema {
+            ParamSchema {
+                description: "Report the host's browser-egress posture.".into(),
+                params: vec![],
+                result: TypeDesc::Str,
+            }
+        }
+        fn invoke(&self, _args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+            Ok(Value::Str(match host.egress() {
+                None => "absent".into(),
+                Some(e) if e.confined() => "confined".into(),
+                Some(_) => "free".into(),
+            }))
+        }
+    }
+
+    fn cli() -> Cli {
+        let mut reg = Registry::new();
+        reg.add_command(Arc::new(EgressProbe));
+        Cli::new(Arc::new(reg)).with_services(
+            Arc::new(MemFlowStore::new()),
+            Arc::new(NoClient),
+            Arc::new(StdGuard::default()),
+            None,
+        )
+    }
+
+    fn probe(cli: &Cli) -> Value {
+        cli.dispatch(&["egress".to_string(), "probe".to_string()])
+            .expect("egress.probe dispatches")
+    }
+
+    /// Task 4b / AC9: the host a `Cli` assembles carries the live posture it
+    /// was wired with — the same handle, so a later flip is visible through it.
+    #[test]
+    fn cli_host_carries_the_wired_egress_posture() {
+        let posture = Arc::new(EgressConfinement::new(false));
+        let cli = cli().with_egress(posture.clone());
+        assert_eq!(probe(&cli), Value::Str("free".into()));
+
+        posture.set_base(true);
+        assert_eq!(
+            probe(&cli),
+            Value::Str("confined".into()),
+            "the host reads the live handle, not a snapshot"
+        );
+    }
+
+    /// Without `with_egress` the host carries no posture (fail-closed: a
+    /// `browser.confine` on such a host errors rather than toggling nothing).
+    #[test]
+    fn cli_host_without_wiring_carries_no_posture() {
+        assert_eq!(probe(&cli()), Value::Str("absent".into()));
     }
 }
