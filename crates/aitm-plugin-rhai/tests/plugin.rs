@@ -20,8 +20,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use aitm_core::{
     Body, CallerTrust, Chain, ConnInfo, Event, Flow, FlowCtx, FlowError, FlowId, FlowMeta,
-    FlowStore, HeaderMap, HttpFlow, HttpRequest, HttpVersion, InterceptState, MemFlowStore, Plugin,
-    ProxyClient, Registry, StdGuard, Value, Verdict, WsDir, WsFlow, WsMessage, WsOpcode,
+    FlowStore, HeaderMap, HttpFlow, HttpRequest, HttpResponse, HttpVersion, InterceptState,
+    MemFlowStore, Plugin, ProxyClient, Registry, StdGuard, Value, Verdict, WsDir, WsFlow,
+    WsMessage, WsOpcode,
 };
 use aitm_plugin::language::{
     GuardHandle, Guarded, HostCallCtx, HostError, HostFn, NamespaceCatalog, PocStepHandler,
@@ -133,6 +134,24 @@ fn http_flow() -> Flow {
         metadata: FlowMeta::default(),
         intercept: InterceptState::Observed,
     })
+}
+
+/// `http_flow()` that already carries a `200` response with a known body, so a
+/// hook dispatched on `ResponseHeaders` / `Response` sees a response to edit.
+fn http_flow_with_response() -> Flow {
+    let mut flow = http_flow();
+    if let Flow::Http(f) = &mut flow {
+        let mut headers = HeaderMap::new();
+        headers.set("Content-Type", "text/plain");
+        f.response = Some(HttpResponse {
+            status: 200,
+            version: HttpVersion::Http11,
+            headers,
+            body: Body::Bytes(b"upstream-body".to_vec()),
+            timestamp: SystemTime::now(),
+        });
+    }
+    flow
 }
 
 /// A WebSocket flow holding one client→server text frame.
@@ -471,6 +490,153 @@ async fn response_write_in_the_request_phase_is_an_error_not_a_short_circuit() {
     assert!(
         msg.contains("no response yet") && msg.contains("set_response"),
         "the error names the fix: {msg}"
+    );
+}
+
+/// AC1: a `flow.response.body` write inside `on_response` is refused — the
+/// response is already forwarded to the client there, so applying it would be a
+/// silent no-op. The hook errors (chain still continues), the stored response is
+/// unchanged, and the bus error names `on_response_headers`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_write_is_refused_as_post_forward() {
+    let h = Harness::default(r#"fn on_response(flow) { flow.response.body = "tampered"; }"#);
+    let id = h.insert(http_flow_with_response());
+
+    let verdict = h.dispatch(Event::Response(id)).await;
+
+    assert_eq!(verdict, Verdict::Continue);
+    let flow = h.flow(id);
+    let resp = http(&flow)
+        .response
+        .as_ref()
+        .expect("the response is present");
+    assert!(
+        matches!(&resp.body, Body::Bytes(b) if b == b"upstream-body"),
+        "the on_response body write must not apply: {:?}",
+        resp.body
+    );
+    let errors = h.wait_for_errors(1).await;
+    assert_eq!(errors.len(), 1, "exactly one Event::Error: {errors:?}");
+    let msg = script_error_message(&errors[0]);
+    assert!(
+        msg.contains("on_response_headers"),
+        "the error names the response mutation hook: {msg}"
+    );
+}
+
+/// AC3: a `flow.set_response(...)` inside `on_response` is refused the same way;
+/// the stored response is unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_set_response_is_refused_as_post_forward() {
+    let h = Harness::default(r#"fn on_response(flow) { flow.set_response(503, #{}, "late"); }"#);
+    let id = h.insert(http_flow_with_response());
+
+    let verdict = h.dispatch(Event::Response(id)).await;
+
+    assert_eq!(verdict, Verdict::Continue);
+    let flow = h.flow(id);
+    let resp = http(&flow)
+        .response
+        .as_ref()
+        .expect("the response is present");
+    assert_eq!(
+        resp.status, 200,
+        "set_response in on_response must not apply"
+    );
+    assert!(matches!(&resp.body, Body::Bytes(b) if b == b"upstream-body"));
+    let errors = h.wait_for_errors(1).await;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    let msg = script_error_message(&errors[0]);
+    assert!(msg.contains("on_response_headers"), "names the fix: {msg}");
+}
+
+/// AC2: a response header write inside `on_response` is refused the same way (the
+/// `ScriptHeaders` response-side path), while request headers remain writable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_header_write_is_refused_as_post_forward() {
+    let h =
+        Harness::default(r#"fn on_response(flow) { flow.response.headers.set("X-Late", "1"); }"#);
+    let id = h.insert(http_flow_with_response());
+
+    let verdict = h.dispatch(Event::Response(id)).await;
+
+    assert_eq!(verdict, Verdict::Continue);
+    let flow = h.flow(id);
+    let resp = http(&flow)
+        .response
+        .as_ref()
+        .expect("the response is present");
+    assert_eq!(
+        resp.headers.get("X-Late"),
+        None,
+        "the on_response header write must not apply"
+    );
+    let errors = h.wait_for_errors(1).await;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    let msg = script_error_message(&errors[0]);
+    assert!(msg.contains("on_response_headers"), "names the fix: {msg}");
+}
+
+/// AC4: the same mutations inside `on_response_headers` still apply — the contract
+/// is phase-scoped (post-forward only), not a blanket ban on editing the response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_headers_mutation_still_applies() {
+    let h = Harness::default(
+        r#"fn on_response_headers(flow) {
+            flow.response.status = 201;
+            flow.response.headers.set("X-H", "1");
+            flow.response.body = "rewritten";
+        }"#,
+    );
+    let id = h.insert(http_flow_with_response());
+
+    let verdict = h.dispatch(Event::ResponseHeaders(id)).await;
+
+    assert_eq!(verdict, Verdict::Continue);
+    let flow = h.flow(id);
+    let resp = http(&flow)
+        .response
+        .as_ref()
+        .expect("the response is present");
+    assert_eq!(resp.status, 201);
+    assert_eq!(resp.headers.get("X-H"), Some("1"));
+    assert!(
+        matches!(&resp.body, Body::Bytes(b) if b == b"rewritten"),
+        "on_response_headers may replace the body: {:?}",
+        resp.body
+    );
+    assert!(
+        h.probe.errors().is_empty(),
+        "a legitimate on_response_headers mutation must not error: {:?}",
+        h.probe.errors()
+    );
+}
+
+/// AC5: `on_response` stays fully usable as an observe-only hook — reading the
+/// response, marking, and commenting all run without error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_observe_only_is_allowed() {
+    let h = Harness::default(
+        r#"fn on_response(flow) {
+            if flow.response.status == 200 {
+                flow.mark("ok");
+                flow.comment = flow.response.body;
+            }
+        }"#,
+    );
+    let id = h.insert(http_flow_with_response());
+
+    let verdict = h.dispatch(Event::Response(id)).await;
+
+    assert_eq!(verdict, Verdict::Continue);
+    let flow = h.flow(id);
+    let f = http(&flow);
+    assert_eq!(f.metadata.marks, vec!["ok".to_string()]);
+    assert_eq!(f.metadata.comment.as_deref(), Some("upstream-body"));
+    assert!(
+        h.probe.errors().is_empty(),
+        "reading the response and marking must not error: {:?}",
+        h.probe.errors()
     );
 }
 

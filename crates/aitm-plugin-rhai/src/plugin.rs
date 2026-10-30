@@ -48,7 +48,7 @@ use crate::command::ScriptRegHandle;
 use crate::config::{RhaiConfig, ScriptMeta};
 use crate::engine::{begin_run, blocking, Budget, RunKind};
 use crate::error::ScriptError;
-use crate::flow_api::{ActiveFlow, ScriptFlow, ScriptWsMessage};
+use crate::flow_api::{ActiveFlow, ResponsePhase, ScriptFlow, ScriptWsMessage};
 use crate::flow_state::FlowState;
 use crate::host_core::{Options, ScriptServices};
 use crate::host_registry::seed_call_context;
@@ -364,6 +364,7 @@ impl LoadedScript {
         hook: &str,
         state: &Arc<Mutex<FlowState>>,
         args: Vec<Dynamic>,
+        response_forwarded: bool,
     ) -> Result<(), Box<EvalAltResult>> {
         let options = (**self.options.load()).clone();
         // A hook runs detached from any frontend (the proxy fires it), so seed
@@ -381,6 +382,9 @@ impl LoadedScript {
         blocking(|| {
             let _run = begin_run(RunKind::Hook, self.budget);
             let _active = ActiveFlow::enter(Arc::clone(state));
+            // on_response fires post-forward: enter the observe-only response phase
+            // so a response write in it is refused loudly, not silently dropped.
+            let _phase = response_forwarded.then(ResponsePhase::forwarded);
             let _seed = seed_call_context(authoring, Some(tag), source);
             self.engine
                 .call_fn_with_options::<Dynamic>(
@@ -415,7 +419,11 @@ impl LoadedScript {
         let flow_id = lock(&state).id;
         let args = hook_args(ev, &state);
 
-        match self.call_hook(&ast, hook, &state, args) {
+        // on_response is dispatched after the response has been forwarded to the
+        // client, so a response write in it cannot reach the client; the setters
+        // refuse it in this phase (spec §Design).
+        let response_forwarded = matches!(ev, Event::Response(_));
+        match self.call_hook(&ast, hook, &state, args, response_forwarded) {
             Ok(()) => {
                 // A clean `on_error` run is the script handling its own
                 // failure's `Event::Error`; it must not erase that failure.
