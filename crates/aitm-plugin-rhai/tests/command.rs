@@ -8,13 +8,19 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::sync::{Mutex, PoisonError};
+
 use aitm_core::{
-    CommandHost, HttpFlow, HttpRequest, MemFlowStore, Params, ProxyClient, Registry, StdGuard,
-    TypeDesc, Value,
+    CallerTrust, CommandHost, Frontend, HttpFlow, HttpRequest, MemFlowStore, Params, ProxyClient,
+    Registry, StdGuard, TypeDesc, Value,
+};
+use aitm_plugin::language::{
+    GuardHandle, Guarded, HostCallCtx, HostError, HostFn, NamespaceCatalog, PocStepHandler,
+    ProtocolLanguage, RegisterError, ScriptHostRegistry,
 };
 use aitm_plugin_rhai::command::{register_reg_api, ScriptRegHandle};
 use aitm_plugin_rhai::config::RhaiLimits;
-use aitm_plugin_rhai::engine::build_engine;
+use aitm_plugin_rhai::engine::{build_engine, build_engine_with_languages};
 use rhai::{Engine, AST};
 
 /// A client that is never reached: a script command runs no network verb here.
@@ -288,4 +294,112 @@ async fn script_without_load_registers_nothing() {
 
     assert_eq!(registry.commands().count(), 0);
     assert_eq!(options, aitm_plugin_rhai::host_core::Options::default());
+}
+
+// ===========================================================================
+// Task 3 — the script-command invocation boundary seeds the caller trust from
+// the invoking `CommandHost` frontend before the script function (which can
+// reach a seam host fn) evaluates (spec AC3 command boundary).
+// ===========================================================================
+
+/// A seam language whose `probe.note()` records the live `ctx.caller()`.
+struct CapturingLanguage {
+    seen: Arc<Mutex<Vec<CallerTrust>>>,
+}
+
+struct AdmitGuard;
+
+impl GuardHandle for AdmitGuard {
+    fn guard_name(&self) -> &str {
+        "probe"
+    }
+
+    fn permit(&self, _ctx: &HostCallCtx, _fn_name: &str) -> Result<(), HostError> {
+        Ok(())
+    }
+}
+
+impl ProtocolLanguage for CapturingLanguage {
+    fn namespace(&self) -> &str {
+        "probe"
+    }
+    fn api_version(&self) -> &str {
+        "1"
+    }
+    fn register_host_fns(&self, reg: &mut dyn ScriptHostRegistry) -> Result<(), RegisterError> {
+        let seen = Arc::clone(&self.seen);
+        let note: HostFn = Box::new(move |ctx: &HostCallCtx, _args: &[Value]| {
+            seen.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(ctx.caller());
+            Ok(Value::Null)
+        });
+        reg.register("probe", "note", Guarded::new(Box::new(AdmitGuard), note))
+    }
+    fn poc_step(&self) -> Option<Box<dyn PocStepHandler>> {
+        None
+    }
+    fn catalog(&self) -> NamespaceCatalog {
+        NamespaceCatalog {
+            namespace: "probe".to_string(),
+            api_version: "1".to_string(),
+            host_fns: vec![],
+            poc_step: None,
+            sources: vec![],
+        }
+    }
+}
+
+/// AC3 (command boundary): a script-registered command invoked by a given
+/// frontend seeds that frontend's trust for the command's eval, so the seam fn
+/// the command body calls observes `Agent` for an MCP agent and `Operator` for
+/// the human CLI — never refused "no caller context", never a silent operator
+/// default.
+#[tokio::test(flavor = "multi_thread")]
+async fn script_command_seeds_frontend_caller_trust() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let lang = CapturingLanguage {
+        seen: Arc::clone(&seen),
+    };
+    let mut engine =
+        build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(2), &[&lang])
+            .expect("the capturing seam language installs");
+    register_reg_api(&mut engine);
+    let engine = Arc::new(engine);
+
+    let ast = compile_named(
+        &engine,
+        "demo",
+        r#"fn load(reg) { reg.add_command("demo.probe", "", |args| { probe.note(); "ok" }); }"#,
+    );
+    let mut registry = Registry::new();
+    load_into(&mut registry, &engine, &ast);
+    let cmd = registry
+        .command("demo.probe")
+        .expect("demo.probe is registered");
+
+    let store = MemFlowStore::new();
+    let client = StubClient;
+    let guard = StdGuard::default();
+
+    // An agent (MCP) frontend: the command eval is seeded Agent.
+    let host = CommandHost::new(&store, &client, &guard, None).with_frontend(Frontend::Mcp);
+    assert_eq!(
+        cmd.invoke(Params::default(), &host).expect("invokes"),
+        Value::Str("ok".into()),
+        "the command ran (seeded), not refused for a missing caller context"
+    );
+    assert_eq!(
+        *seen.lock().unwrap_or_else(PoisonError::into_inner),
+        vec![CallerTrust::Agent]
+    );
+
+    // A human CLI frontend: the same command, now seeded Operator.
+    seen.lock().unwrap_or_else(PoisonError::into_inner).clear();
+    let host = CommandHost::new(&store, &client, &guard, None).with_frontend(Frontend::Cli);
+    cmd.invoke(Params::default(), &host).expect("invokes");
+    assert_eq!(
+        *seen.lock().unwrap_or_else(PoisonError::into_inner),
+        vec![CallerTrust::Operator]
+    );
 }

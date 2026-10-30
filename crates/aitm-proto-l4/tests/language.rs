@@ -400,7 +400,13 @@ fn ac5_send_recv_step_binds_packet_tcp_flags() {
     vars.insert("target_ip".to_string(), Value::Str("127.0.0.1".to_string()));
 
     let outcome = handler
-        .run(&body, &PocStepInputs { vars })
+        .run(
+            &body,
+            &PocStepInputs {
+                vars,
+                caller: CallerTrust::Operator,
+            },
+        )
         .expect("the in-scope l4: step runs");
 
     // The `packet` source is dotted-walkable: `field: tcp.flags` resolves to "SA",
@@ -439,7 +445,13 @@ fn ac5_out_of_scope_target_is_refused() {
     vars.insert("target_ip".to_string(), Value::Str("10.9.9.9".to_string()));
 
     let err = handler
-        .run(&body, &PocStepInputs { vars })
+        .run(
+            &body,
+            &PocStepInputs {
+                vars,
+                caller: CallerTrust::Operator,
+            },
+        )
         .expect_err("an out-of-scope target is refused");
     assert!(
         err.to_string().contains("out of L4 scope"),

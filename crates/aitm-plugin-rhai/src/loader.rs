@@ -24,6 +24,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use aitm_core::CallerTrust;
 use aitm_plugin::language::ProtocolLanguage;
 use rhai::{Dynamic, Engine, ParseError, ParseErrorType, AST};
 
@@ -285,6 +286,12 @@ impl RhaiLoader {
             options,
             &self.cfg,
         )
+        // A script loaded from disk via config is operator-authored: the operator
+        // placed it (or pointed config at it), so its hooks/`load` seam calls are
+        // operator-trust. `script.save` by an agent overrides this to `Agent` on
+        // the returned script (commands.rs), so an agent-saved script keeps agent
+        // trust in-session (spec AC6, Open-Q 1).
+        .with_authoring_trust(CallerTrust::Operator)
         .with_error_sink(Arc::clone(&self.errors)))
     }
 

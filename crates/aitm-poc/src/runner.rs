@@ -33,8 +33,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    Body, ClickTarget, Command, CommandHost, FlowId, HeaderMap, HttpRequest, HttpVersion, ParamDef,
-    ParamSchema, Params, Registry, TypeDesc, Value,
+    Body, CallerTrust, ClickTarget, Command, CommandHost, FlowId, HeaderMap, HttpRequest,
+    HttpVersion, ParamDef, ParamSchema, Params, Registry, TypeDesc, Value,
 };
 use futures::future::BoxFuture;
 
@@ -389,9 +389,14 @@ impl StdPocRunner {
                         )
                     })?;
                     // Hand the handler the resolved variables so it can expand
-                    // any `{{placeholder}}` inside its own body.
+                    // any `{{placeholder}}` inside its own body, plus the live
+                    // caller trust of this run — sourced from the `poc.run`
+                    // command's frontend — so a native `<ns>:` handler (which
+                    // bypasses the rhai thread-local seed) can gate an effect per
+                    // call, exactly as the scripting face does (Ruling A, AC5).
                     let inputs = PocStepInputs {
                         vars: live.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                        caller: CallerTrust::from(host.frontend()),
                     };
                     let outcome = handler.run(body, &inputs).map_err(|e| {
                         anyhow::anyhow!("poc.run: protocol step `{ns}:` failed: {e}")

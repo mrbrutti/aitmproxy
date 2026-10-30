@@ -261,11 +261,37 @@ pub trait PocStepHandler: Send + Sync {
 /// handler can expand `{{placeholder}}`s inside its own body. Expressed purely
 /// in seam terms ([`aitm_core::Value`]) — it carries none of `aitm-poc`'s
 /// run context, keeping the seam acyclic.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PocStepInputs {
     /// The variables resolved so far (caller bindings over variable defaults,
     /// plus any earlier steps' bindings), by name.
     pub vars: BTreeMap<String, Value>,
+    /// The live caller trust of the `poc.run` this step belongs to, sourced by
+    /// the runner from the command's [`CommandHost`](aitm_core::CommandHost)
+    /// frontend (`CallerTrust::from(host.frontend())`).
+    ///
+    /// A native `<ns>:` step handler runs in **pure Rust**, bypassing the rhai
+    /// engine, so it cannot read the per-eval thread-local seed the scripting
+    /// face uses; it reads this field instead to gate an effect on the live
+    /// caller, exactly as the rhai face reads [`HostCallCtx::caller`] (Task 4's
+    /// `L4StepHandler`). Keeping it an [`aitm_core::CallerTrust`] keeps the seam
+    /// and `aitm-poc` rhai-free.
+    pub caller: CallerTrust,
+}
+
+impl Default for PocStepInputs {
+    /// Fail-closed: an unset caller is the **most restrictive**
+    /// [`CallerTrust::Agent`], never [`CallerTrust::Operator`]. A construction
+    /// site that forgets to thread the real caller can then only ever
+    /// *under*-grant a verb, never silently widen an agent to operator trust —
+    /// the same fail-closed spirit the rhai bridge enforces by refusing an
+    /// unseeded eval.
+    fn default() -> Self {
+        Self {
+            vars: BTreeMap::new(),
+            caller: CallerTrust::Agent,
+        }
+    }
 }
 
 /// What a [`PocStepHandler::run`] produced, adapted by the runner into its match

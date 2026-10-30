@@ -344,7 +344,13 @@ mod tests {
         vars.insert("greeting".to_string(), Value::Str("hello".to_string()));
 
         let outcome = TestStepHandler
-            .run(&body, &PocStepInputs { vars })
+            .run(
+                &body,
+                &PocStepInputs {
+                    vars,
+                    caller: aitm_plugin::CallerTrust::Operator,
+                },
+            )
             .expect("echo runs");
         assert_eq!(
             outcome.bindings.get("echoed"),

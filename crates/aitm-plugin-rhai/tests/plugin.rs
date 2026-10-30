@@ -19,12 +19,16 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use aitm_core::{
-    Body, Chain, ConnInfo, Event, Flow, FlowCtx, FlowError, FlowId, FlowMeta, FlowStore, HeaderMap,
-    HttpFlow, HttpRequest, HttpVersion, InterceptState, MemFlowStore, Plugin, ProxyClient,
-    Registry, StdGuard, Verdict, WsDir, WsFlow, WsMessage, WsOpcode,
+    Body, CallerTrust, Chain, ConnInfo, Event, Flow, FlowCtx, FlowError, FlowId, FlowMeta,
+    FlowStore, HeaderMap, HttpFlow, HttpRequest, HttpVersion, InterceptState, MemFlowStore, Plugin,
+    ProxyClient, Registry, StdGuard, Value, Verdict, WsDir, WsFlow, WsMessage, WsOpcode,
+};
+use aitm_plugin::language::{
+    GuardHandle, Guarded, HostCallCtx, HostError, HostFn, NamespaceCatalog, PocStepHandler,
+    ProtocolLanguage, RegisterError, ScriptHostRegistry,
 };
 use aitm_plugin_rhai::config::{RhaiConfig, RhaiLimits, ScriptMeta};
-use aitm_plugin_rhai::engine::build_engine;
+use aitm_plugin_rhai::engine::{build_engine, build_engine_with_languages};
 use aitm_plugin_rhai::flow_api::register_flow_api;
 use aitm_plugin_rhai::host_core::{
     FindingCapability, LogCapability, MemoryFindingSink, Options, ScriptCapability, ScriptServices,
@@ -868,5 +872,235 @@ async fn append_if_absent_refuses_a_duplicate_name() {
         marks.iter().filter(|m| m.as_str() == "dup").count(),
         1,
         "the deduped hook ran exactly once: {marks:?}"
+    );
+}
+
+// ===========================================================================
+// Task 3 — every production invocation boundary seeds the caller trust before
+// an eval can reach a seam host fn (fail-closed otherwise). A hook seeds the
+// script's **authoring trust** (spec AC6); `load(reg)` seeds it too (AC3, the
+// load boundary). The seam-namespace probe OBSERVES the seeded trust, since L4
+// does not gate on trust until Task 4.
+// ===========================================================================
+
+/// A seam language whose `probe.note()` records the live `ctx.caller()` into a
+/// shared log, so a test can observe exactly what trust the invocation boundary
+/// seeded. Its guard admits every call (the observation, not the gate, is under
+/// test here).
+struct CapturingLanguage {
+    seen: Arc<Mutex<Vec<CallerTrust>>>,
+}
+
+struct AdmitGuard;
+
+impl GuardHandle for AdmitGuard {
+    fn guard_name(&self) -> &str {
+        "probe"
+    }
+
+    fn permit(&self, _ctx: &HostCallCtx, _fn_name: &str) -> Result<(), HostError> {
+        Ok(())
+    }
+}
+
+impl ProtocolLanguage for CapturingLanguage {
+    fn namespace(&self) -> &str {
+        "probe"
+    }
+
+    fn api_version(&self) -> &str {
+        "1"
+    }
+
+    fn register_host_fns(&self, reg: &mut dyn ScriptHostRegistry) -> Result<(), RegisterError> {
+        let seen = Arc::clone(&self.seen);
+        let note: HostFn = Box::new(move |ctx: &HostCallCtx, _args: &[Value]| {
+            seen.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(ctx.caller());
+            Ok(Value::Null)
+        });
+        reg.register("probe", "note", Guarded::new(Box::new(AdmitGuard), note))
+    }
+
+    fn poc_step(&self) -> Option<Box<dyn PocStepHandler>> {
+        None
+    }
+
+    fn catalog(&self) -> NamespaceCatalog {
+        NamespaceCatalog {
+            namespace: "probe".to_string(),
+            api_version: "1".to_string(),
+            host_fns: vec![],
+            poc_step: None,
+            sources: vec![],
+        }
+    }
+}
+
+/// Minimal services for a seam-enabled `LoadedScript` under test.
+fn seam_services() -> ScriptServices {
+    ScriptServices {
+        store: Arc::new(MemFlowStore::new()),
+        client: Arc::new(StubClient),
+        browser: None,
+        guard: Arc::new(StdGuard::default()),
+        findings: Arc::new(MemoryFindingSink::new()),
+        rt: tokio::runtime::Handle::current(),
+    }
+}
+
+/// Build a `LoadedScript` on an engine carrying the capturing seam language, with
+/// the given authoring trust recorded on its handle.
+fn seam_script(
+    seen: &Arc<Mutex<Vec<CallerTrust>>>,
+    src: &str,
+    authoring: CallerTrust,
+    reg_api: bool,
+) -> LoadedScript {
+    let lang = CapturingLanguage {
+        seen: Arc::clone(seen),
+    };
+    let mut engine =
+        build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(5), &[&lang])
+            .expect("the capturing seam language installs");
+    if reg_api {
+        aitm_plugin_rhai::command::register_reg_api(&mut engine);
+    }
+    let ast = engine.compile(src).expect("the script compiles");
+    let cfg = config(RhaiLimits::default(), Duration::from_secs(5));
+    LoadedScript::new(
+        meta("probe-script"),
+        Arc::new(engine),
+        ast,
+        seam_services(),
+        Options::default(),
+        &cfg,
+    )
+    .with_authoring_trust(authoring)
+}
+
+/// AC6: a plugin hook's seam host-fn call is gated on the script's **authoring
+/// trust** — an operator-authored script observes `Operator`, an agent-authored
+/// one `Operator` must never appear; it observes `Agent`. One shared engine, the
+/// trust decided per script, not at build.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hook_seeds_the_scripts_authoring_trust() {
+    // Operator-authored: the hook's `probe.note()` sees Operator.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let script = seam_script(
+        &seen,
+        r#"fn on_request(flow) { probe.note(); }"#,
+        CallerTrust::Operator,
+        false,
+    );
+    let mut flow = http_flow();
+    let id = flow.id();
+    let verdict = script.dispatch(&Event::Request(id), &mut FlowCtx::new(&mut flow), MAX_BODY);
+    assert_eq!(verdict, Verdict::Continue);
+    assert_eq!(
+        *seen.lock().unwrap_or_else(PoisonError::into_inner),
+        vec![CallerTrust::Operator],
+        "an operator-authored hook must seed Operator (and reach the seam at all)"
+    );
+
+    // Agent-authored: the same engine shape, the hook now sees Agent.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let script = seam_script(
+        &seen,
+        r#"fn on_request(flow) { probe.note(); }"#,
+        CallerTrust::Agent,
+        false,
+    );
+    let mut flow = http_flow();
+    let id = flow.id();
+    let verdict = script.dispatch(&Event::Request(id), &mut FlowCtx::new(&mut flow), MAX_BODY);
+    assert_eq!(verdict, Verdict::Continue);
+    assert_eq!(
+        *seen.lock().unwrap_or_else(PoisonError::into_inner),
+        vec![CallerTrust::Agent],
+        "an agent-authored hook must seed Agent, never widen to Operator"
+    );
+}
+
+/// AC3 (own verification): the hook boundary is actually seeded — a hook reaching
+/// a seam fn is NEVER refused with "no caller context" (which would mean an
+/// unseeded production path). The fail-closed dispatch error would drop the hook
+/// (recording nothing); the recorded trust proves the boundary seeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hook_boundary_is_never_left_unseeded() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let script = seam_script(
+        &seen,
+        r#"fn on_request(flow) { probe.note(); }"#,
+        CallerTrust::Agent,
+        false,
+    );
+    let mut flow = http_flow();
+    let id = flow.id();
+    script.dispatch(&Event::Request(id), &mut FlowCtx::new(&mut flow), MAX_BODY);
+    assert_eq!(
+        seen.lock().unwrap_or_else(PoisonError::into_inner).len(),
+        1,
+        "the hook reached the seam fn (seeded); an unseeded boundary would fail \
+         closed and record nothing"
+    );
+}
+
+/// AC3 (load boundary): a script's `load(reg)` that reaches a seam host fn is
+/// seeded with the script's authoring trust — `load` runs (installing nothing
+/// here) and the seam call is observed, not refused "no caller context".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn load_boundary_seeds_authoring_trust() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let script = seam_script(
+        &seen,
+        r#"fn load(reg) { probe.note(); }"#,
+        CallerTrust::Agent,
+        true,
+    );
+    let set = ScriptSet::new(vec![script]);
+    let mut host = ScriptHost::new(set);
+    let mut registry = Registry::new();
+    host.load(&mut registry);
+    assert_eq!(
+        *seen.lock().unwrap_or_else(PoisonError::into_inner),
+        vec![CallerTrust::Agent],
+        "a load(reg) reaching the seam must be seeded with the authoring trust, \
+         never refused for a missing caller context"
+    );
+}
+
+/// A fresh `LoadedScript` whose authoring trust was never set defaults to the
+/// most-restrictive `Agent` — fail-closed, never a silent `Operator`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authoring_trust_defaults_to_agent() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    // Build a script WITHOUT calling `with_authoring_trust`.
+    let lang = CapturingLanguage {
+        seen: Arc::clone(&seen),
+    };
+    let engine =
+        build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(5), &[&lang])
+            .expect("installs");
+    let ast = engine
+        .compile(r#"fn on_request(flow) { probe.note(); }"#)
+        .expect("compiles");
+    let cfg = config(RhaiLimits::default(), Duration::from_secs(5));
+    let script = LoadedScript::new(
+        meta("defaulted"),
+        Arc::new(engine),
+        ast,
+        seam_services(),
+        Options::default(),
+        &cfg,
+    );
+    let mut flow = http_flow();
+    let id = flow.id();
+    script.dispatch(&Event::Request(id), &mut FlowCtx::new(&mut flow), MAX_BODY);
+    assert_eq!(
+        *seen.lock().unwrap_or_else(PoisonError::into_inner),
+        vec![CallerTrust::Agent],
+        "an unset authoring trust must fail closed to Agent, never Operator"
     );
 }

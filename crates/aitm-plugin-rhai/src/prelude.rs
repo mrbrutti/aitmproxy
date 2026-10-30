@@ -21,6 +21,16 @@ const PRELUDE_PATH: &str = "prelude.rhai";
 
 /// Compile the prelude under `engine` (so it is bound by the same limits as
 /// any script) into a module whose functions are the helpers.
+///
+/// **No caller context is seeded here (plan Task 3, fail-closed audit).** This
+/// `eval_ast_as_new` evaluates only the prelude's *top level*, which is nothing
+/// but `fn` definitions (`ok`, `contains_ci`, `json`) — it makes no `<ns>.fn()`
+/// seam call, so no seam host fn is reached at prelude-load time and there is
+/// nothing to gate. The helpers are only ever *invoked* later, from inside a
+/// hook, a `script:` step, or a command — each of which seeds the caller trust
+/// at its own boundary. Were the prelude to ever call a seam fn at its top
+/// level, that call would fail closed ("no caller context"), never default to
+/// operator.
 pub fn load_prelude(engine: &Engine) -> Result<Module, ScriptError> {
     let ast = engine.compile(PRELUDE_SRC).map_err(|err| {
         let pos = err.position();

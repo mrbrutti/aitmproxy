@@ -20,12 +20,15 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use aitm_core::{Command, CommandHost, ParamDef, ParamSchema, Params, Registry, TypeDesc, Value};
+use aitm_core::{
+    CallerTrust, Command, CommandHost, ParamDef, ParamSchema, Params, Registry, TypeDesc, Value,
+};
 use rhai::{CallFnOptions, Dynamic, Engine, EvalAltResult, FnPtr, Position, Scope, AST};
 
 use crate::engine::{begin_run, blocking, Budget, RunKind};
 use crate::error::ScriptError;
 use crate::host_core::Options;
+use crate::host_registry::seed_call_context;
 use crate::marshal::{dynamic_to_value, value_to_dynamic};
 
 /// The hook this bridge drives.
@@ -77,12 +80,19 @@ impl Command for ScriptCommand {
     /// was built, so a command reaches the network only the way a hook does.
     /// The call runs as a `Command` run under the script's budget; a failure
     /// is reported in the pinned `ScriptError` format, naming the command.
-    fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+    fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         let mut call_args = self.func.curry().to_vec();
         call_args.push(Dynamic::from_map(args_map(&args)));
 
+        // Seed the per-eval caller trust from the invoking frontend before the
+        // script function runs: a command body can reach a seam host fn, so this
+        // boundary is gated on the live caller (`Agent` for an agent, `Operator`
+        // for a human), never refused for a missing context and never widened to
+        // operator (spec AC3). Held across the call under `block_in_place`.
+        let caller = CallerTrust::from(host.frontend());
         let result = blocking(|| {
             let _run = begin_run(RunKind::Command, self.budget.hook_timeout);
+            let _seed = seed_call_context(caller, None, None);
             self.engine.call_fn_with_options::<Dynamic>(
                 CallFnOptions::new().with_tag(self.options.clone()),
                 &mut Scope::new(),
