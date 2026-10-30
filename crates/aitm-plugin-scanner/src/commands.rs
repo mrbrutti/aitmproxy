@@ -9,7 +9,11 @@
 //! Deny-by-default throughout: the crawl gates the target host through
 //! [`aitm_core::ScopeRateGuard::check_active`] before its first navigation, so
 //! an out-of-scope target is refused before anything is fetched, and every page
-//! the crawl then visits takes its own permit.
+//! the crawl then visits takes its own permit. The crawl also runs under a
+//! campaign hold on the proxy's browser-egress posture
+//! ([`aitm_core::EgressConfinement::confine`]), so the browser-facing connector
+//! refuses an out-of-scope public host before dialing it; the hold is an RAII
+//! token released when the command returns.
 //!
 //! The result carries no credentials: [`crate::discover::enumerate`] replaces a
 //! secret-named point's example with a placeholder, and every free-text string
@@ -57,10 +61,10 @@ impl Command for ScanDiscover {
                           visible in captured requests. No injection or fuzzing is performed. \
                           `max_depth`/`max_pages` may lower the configured caps, never raise them. \
                           A navigation that lands off-origin or out of scope (a redirect) aborts \
-                          the crawl with `stopped_reason = \"left_scope\"`. Note: the embedded \
-                          browser may still fetch out-of-scope sub-resources/redirect targets \
-                          before the crawl aborts; a proxy-level scope-confined egress gate is \
-                          the full fix (tracked separately)."
+                          the crawl with `stopped_reason = \"left_scope\"`. While the crawl runs \
+                          the proxy's browser-egress posture is held confined, so the embedded \
+                          browser cannot fetch an out-of-scope public host (sub-resource or \
+                          redirect target); the hold is released when the command returns."
                 .into(),
             params: vec![
                 ParamDef {
@@ -110,6 +114,16 @@ impl Command for ScanDiscover {
         // one place on purpose: a second `check_active` here for the same seed
         // would spend a second rate token and a second concurrency slot, and
         // with `max_concurrency == 1` would refuse the crawl's own permit.
+        //
+        // S2: run the whole crawl under a campaign hold on the proxy's
+        // browser-egress posture, so the `SsrfConnector` refuses any
+        // out-of-scope public host the browser is sent to (a redirect, a
+        // sub-resource) *before* dialing it. The RAII token is dropped when
+        // `invoke` returns — on success, error, or unwind — so a finished scan
+        // never leaves the posture confined (`set_base` would). A host with no
+        // posture wired crawls unconfined, as before; the `left_scope` abort in
+        // the crawl stays as defense-in-depth.
+        let _confine = host.egress_handle().map(|e| e.confine());
         let outcome = block_on(crawl(host, target, &cfg))?;
 
         // Enumerate injection points from the captured requests whose normalized
@@ -180,13 +194,72 @@ impl Command for ScanDiscover {
 mod tests {
     use super::*;
     use aitm_core::{
-        Body, ConnInfo, FlowId, FlowMeta, FlowStore, GuardError, HeaderMap, HttpFlow, HttpRequest,
-        HttpVersion, InterceptState, MemFlowStore, ProxyClient, ScopeEntry, ScopeRateGuard,
-        StdGuard,
+        Body, BrowserDriver, ClickTarget, ConnInfo, EgressConfinement, FlowId, FlowMeta, FlowStore,
+        GuardError, HeaderMap, HttpFlow, HttpRequest, HttpVersion, InterceptState, MemFlowStore,
+        NavOutcome, ProxyClient, ScopeEntry, ScopeRateGuard, StdGuard,
     };
     use futures::future::BoxFuture;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::sync::{Arc, Mutex};
     use std::time::SystemTime;
+
+    /// A browser that serves one fixed page and, at every `navigate()`, records
+    /// whether the shared egress posture was confined at that instant — the
+    /// moment the real browser would be issuing the request.
+    struct PostureProbeBrowser {
+        posture: Arc<EgressConfinement>,
+        observed: Mutex<Vec<bool>>,
+    }
+
+    impl PostureProbeBrowser {
+        fn new(posture: Arc<EgressConfinement>) -> Self {
+            Self {
+                posture,
+                observed: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// `confined()` as seen at each navigation, in order.
+        fn observed(&self) -> Vec<bool> {
+            self.observed.lock().expect("observed lock").clone()
+        }
+    }
+
+    impl BrowserDriver for PostureProbeBrowser {
+        fn navigate(&self, url: &str) -> BoxFuture<'_, anyhow::Result<NavOutcome>> {
+            let url = url.to_string();
+            Box::pin(async move {
+                self.observed
+                    .lock()
+                    .expect("observed lock")
+                    .push(self.posture.confined());
+                Ok(NavOutcome {
+                    final_url: url,
+                    status: Some(200),
+                })
+            })
+        }
+
+        fn click(&self, _target: ClickTarget) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { unimplemented!("the crawler never clicks") })
+        }
+
+        fn type_text(&self, _selector: &str, _text: &str) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { unimplemented!("the crawler never types") })
+        }
+
+        fn screenshot(&self) -> BoxFuture<'_, anyhow::Result<Vec<u8>>> {
+            Box::pin(async { unimplemented!("the crawler never screenshots") })
+        }
+
+        fn eval(&self, _expr: &str) -> BoxFuture<'_, anyhow::Result<Value>> {
+            Box::pin(async { unimplemented!("the crawler never evals") })
+        }
+
+        fn get_dom(&self) -> BoxFuture<'_, anyhow::Result<String>> {
+            Box::pin(async { Ok(r#"<a href="/one">one</a>"#.to_string()) })
+        }
+    }
 
     /// A `ProxyClient` the command must never reach: discovery is read-only and
     /// crawls through the browser, never the proxy client.
@@ -463,6 +536,74 @@ mod tests {
             err.to_string().contains("non-negative"),
             "explains the refusal: {err}"
         );
+    }
+
+    /// S2, the real fix: the crawl runs under a campaign hold on the proxy's
+    /// browser-egress posture, so every navigation the browser issues happens
+    /// while the `SsrfConnector` refuses out-of-scope public hosts — and the
+    /// hold is released the moment `invoke` returns, leaving the standing (off)
+    /// base untouched.
+    #[test]
+    fn scan_discover_crawls_under_egress_confinement() {
+        let posture = Arc::new(EgressConfinement::new(false));
+        let browser = PostureProbeBrowser::new(posture.clone());
+        let store = MemFlowStore::new();
+        let guard = scoped_guard();
+        let client = NoSendClient;
+        let host =
+            CommandHost::new(&store, &client, &guard, Some(&browser)).with_egress(posture.clone());
+        let cmd = ScanDiscover {
+            cfg: ScannerConfig::default(),
+        };
+        assert!(!posture.confined(), "fixture starts with the free posture");
+
+        let result = cmd
+            .invoke(
+                params(&[("target", Value::Str("http://target.test/".into()))]),
+                &host,
+            )
+            .expect("an in-scope seed crawls");
+
+        // The crawl really navigated (seed + the one harvested link).
+        assert_eq!(
+            endpoints_of(&result),
+            vec!["http://target.test/", "http://target.test/one"]
+        );
+        // (a) every navigation saw the posture confined.
+        assert_eq!(
+            browser.observed(),
+            vec![true, true],
+            "each navigation must run while egress is confined"
+        );
+        // (b) the hold is released when the command returns: the base was off
+        // and stays off, so a finished scan never leaves the browser confined.
+        assert!(
+            !posture.confined(),
+            "the campaign hold must be released after invoke returns"
+        );
+    }
+
+    /// Without a wired posture (a frontend that never attached one) the crawl
+    /// runs exactly as before: there is nothing to hold, and nothing errors.
+    #[test]
+    fn scan_discover_without_egress_handle_still_crawls() {
+        let store = MemFlowStore::new();
+        store.insert(captured("/one", HeaderMap::new()));
+        let guard = scoped_guard();
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, None);
+        assert!(host.egress_handle().is_none());
+        let cmd = ScanDiscover {
+            cfg: ScannerConfig::default(),
+        };
+
+        let result = cmd
+            .invoke(
+                params(&[("target", Value::Str("http://target.test/".into()))]),
+                &host,
+            )
+            .expect("no posture wired is not an error");
+        assert_eq!(endpoints_of(&result), vec!["http://target.test/one"]);
     }
 
     /// The target gate and the crawl use one parser, so a URL whose real host is
