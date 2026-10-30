@@ -1,7 +1,138 @@
 {
   "_comment": "Rhai completion + hover catalog. THE SHIPPED ENGINE IS CANONICAL: crates/aitm-plugin-rhai/tests/api_catalog.rs asserts a bijection between the engine's registered host surface (gen_fn_signatures) and the IMPLEMENTED entries here, so every implemented entry must name a real registered token and every registered author-facing token must appear here. Entries with \"status\": \"planned\" (the dsl crypto/encoding helpers) are specced but not yet registered on the engine; they are excluded from the bijection until a production follow-up lands them. Entry names are fully qualified (`flow.request.headers.get`); a surface completes the last segment after the receiver chain. `kind` is object | property | method | function. In-script Rhai method names can differ from the MCP/CLI tool names (browser.type_text vs the browser.type tool, browser.evaluate vs browser.eval) because `type`/`eval` are Rhai reserved words.",
   "api_version": "1",
-  "namespaces": {},
+  "namespaces": {
+    "l4": {
+      "api_version": "0.1.0",
+      "fns": [
+        {
+          "name": "interfaces",
+          "params": [],
+          "returns": "array",
+          "description": "List the capture-capable network interfaces (read-only)."
+        },
+        {
+          "name": "craft",
+          "params": [
+            {
+              "name": "spec",
+              "type": "object",
+              "description": "A scapy-style PacketSpec (layers)."
+            }
+          ],
+          "returns": "object",
+          "description": "Build on-wire bytes from a PacketSpec (pure; no guard, no wire)."
+        },
+        {
+          "name": "scope.add",
+          "params": [
+            {
+              "name": "entry",
+              "type": "object",
+              "description": "A scope entry: cidr, interface, direction, capability, ports?, inject_rate_pps?."
+            }
+          ],
+          "returns": "string",
+          "description": "Add a runtime L4 scope entry (gated by the guard's widen capability)."
+        },
+        {
+          "name": "scope.remove",
+          "params": [
+            {
+              "name": "id",
+              "type": "string",
+              "description": "The scope entry id to remove."
+            }
+          ],
+          "returns": "bool",
+          "description": "Remove a runtime L4 scope entry by id."
+        },
+        {
+          "name": "scope.list",
+          "params": [],
+          "returns": "array",
+          "description": "List the current L4 scope entries (read-only)."
+        },
+        {
+          "name": "flow.list",
+          "params": [],
+          "returns": "array",
+          "description": "List the ids of stored L4 flows (read-only)."
+        },
+        {
+          "name": "flow.get",
+          "params": [
+            {
+              "name": "id",
+              "type": "string",
+              "description": "The L4 flow id to summarize."
+            }
+          ],
+          "returns": "object",
+          "description": "Summarize one stored L4 flow and its packets (read-only)."
+        },
+        {
+          "name": "inject",
+          "params": [
+            {
+              "name": "spec",
+              "type": "object",
+              "description": "The stimulus PacketSpec (layers)."
+            },
+            {
+              "name": "dst",
+              "type": "string",
+              "description": "The destination IP the stimulus targets."
+            },
+            {
+              "name": "interface",
+              "type": "string",
+              "description": "The interface to inject on."
+            },
+            {
+              "name": "count",
+              "type": "int",
+              "description": "How many copies to send (default 1)."
+            }
+          ],
+          "returns": "object",
+          "description": "Guarded wire write of a crafted packet (Inject capability)."
+        },
+        {
+          "name": "send_recv",
+          "params": [
+            {
+              "name": "spec",
+              "type": "object",
+              "description": "The stimulus PacketSpec (layers)."
+            },
+            {
+              "name": "dst",
+              "type": "string",
+              "description": "The destination IP (and FiveTuple reply host)."
+            },
+            {
+              "name": "interface",
+              "type": "string",
+              "description": "The interface to inject on and capture from."
+            },
+            {
+              "name": "port",
+              "type": "int",
+              "description": "The destination port, matched in correlation."
+            },
+            {
+              "name": "timeout_ms",
+              "type": "int",
+              "description": "How long to await the reply (default 1000)."
+            }
+          ],
+          "returns": "object",
+          "description": "Scapy sr1: inject a stimulus and return the correlated reply (Inject+Capture)."
+        }
+      ]
+    }
+  },
   "hooks": [
     {
       "name": "load",
@@ -65,108 +196,509 @@
     }
   ],
   "flow": [
-    { "name": "flow.id", "kind": "property", "signature": "flow.id -> string", "description": "The flow's id." },
-    { "name": "flow.kind", "kind": "property", "signature": "flow.kind -> \"http\" | \"ws\"", "description": "Whether this is an HTTP or a WebSocket flow." },
-    { "name": "flow.marks", "kind": "property", "signature": "flow.marks -> array", "description": "The marks on this flow (settable)." },
-    { "name": "flow.comment", "kind": "property", "signature": "flow.comment -> string", "description": "The operator comment on this flow (settable)." },
-    { "name": "flow.is_replay", "kind": "property", "signature": "flow.is_replay -> bool", "description": "True when this flow is a replay." },
-
-    { "name": "flow.request", "kind": "object", "description": "The request side of the flow." },
-    { "name": "flow.request.method", "kind": "property", "signature": "flow.request.method -> string", "description": "The request method (settable)." },
-    { "name": "flow.request.url", "kind": "property", "signature": "flow.request.url -> string", "description": "The full URL, scheme://authority/path?query (settable)." },
-    { "name": "flow.request.path", "kind": "property", "signature": "flow.request.path -> string", "description": "The request path (settable)." },
-    { "name": "flow.request.headers", "kind": "object", "description": "The request headers, a map-like object." },
-    { "name": "flow.request.headers.get", "kind": "method", "signature": "get(k)", "description": "The value of header k." },
-    { "name": "flow.request.headers.set", "kind": "method", "signature": "set(k, v)", "description": "Set header k to v." },
-    { "name": "flow.request.headers.remove", "kind": "method", "signature": "remove(k)", "description": "Remove header k." },
-    { "name": "flow.request.headers.has", "kind": "method", "signature": "has(k)", "description": "True when header k is present." },
-    { "name": "flow.request.headers.keys", "kind": "method", "signature": "keys()", "description": "The header names, as an array." },
-    { "name": "flow.request.body", "kind": "property", "signature": "flow.request.body -> string | bytes", "description": "The request body (get/set)." },
-    { "name": "flow.request.bytes", "kind": "property", "signature": "flow.request.bytes -> bytes", "description": "The request body as raw bytes (get/set)." },
-    { "name": "flow.request.set_json", "kind": "method", "signature": "set_json(obj)", "description": "Set the request body to the JSON encoding of obj." },
-    { "name": "flow.request.query", "kind": "property", "signature": "flow.request.query -> map", "description": "The query parameters, a map-like object." },
-
-    { "name": "flow.response", "kind": "object", "description": "The response side of the flow." },
-    { "name": "flow.response.status", "kind": "property", "signature": "flow.response.status -> int", "description": "The response status code (settable)." },
-    { "name": "flow.response.headers", "kind": "object", "description": "The response headers, a map-like object." },
-    { "name": "flow.response.headers.get", "kind": "method", "signature": "get(k)", "description": "The value of header k." },
-    { "name": "flow.response.headers.set", "kind": "method", "signature": "set(k, v)", "description": "Set header k to v." },
-    { "name": "flow.response.headers.remove", "kind": "method", "signature": "remove(k)", "description": "Remove header k." },
-    { "name": "flow.response.headers.has", "kind": "method", "signature": "has(k)", "description": "True when header k is present." },
-    { "name": "flow.response.headers.keys", "kind": "method", "signature": "keys()", "description": "The header names, as an array." },
-    { "name": "flow.response.body", "kind": "property", "signature": "flow.response.body -> string | bytes", "description": "The response body." },
-    { "name": "flow.response.bytes", "kind": "property", "signature": "flow.response.bytes -> bytes", "description": "The response body as raw bytes (get/set)." },
-
-    { "name": "flow.set_response", "kind": "method", "signature": "flow.set_response(status, headers, body)", "description": "Short-circuit before upstream: answer the request with this response." },
-    { "name": "flow.intercept", "kind": "method", "signature": "flow.intercept()", "description": "Pause this flow for operator intervention." },
-    { "name": "flow.resume", "kind": "method", "signature": "flow.resume()", "description": "Resume a paused flow." },
-    { "name": "flow.kill", "kind": "method", "signature": "flow.kill()", "description": "Kill this flow." },
-    { "name": "flow.backup", "kind": "method", "signature": "flow.backup()", "description": "Snapshot the flow so it can be reverted." },
-    { "name": "flow.revert", "kind": "method", "signature": "flow.revert()", "description": "Restore the flow to its last backup." },
-    { "name": "flow.mark", "kind": "method", "signature": "flow.mark(tag)", "description": "Add a mark to this flow." }
+    {
+      "name": "flow.id",
+      "kind": "property",
+      "signature": "flow.id -> string",
+      "description": "The flow's id."
+    },
+    {
+      "name": "flow.kind",
+      "kind": "property",
+      "signature": "flow.kind -> \"http\" | \"ws\"",
+      "description": "Whether this is an HTTP or a WebSocket flow."
+    },
+    {
+      "name": "flow.marks",
+      "kind": "property",
+      "signature": "flow.marks -> array",
+      "description": "The marks on this flow (settable)."
+    },
+    {
+      "name": "flow.comment",
+      "kind": "property",
+      "signature": "flow.comment -> string",
+      "description": "The operator comment on this flow (settable)."
+    },
+    {
+      "name": "flow.is_replay",
+      "kind": "property",
+      "signature": "flow.is_replay -> bool",
+      "description": "True when this flow is a replay."
+    },
+    {
+      "name": "flow.request",
+      "kind": "object",
+      "description": "The request side of the flow."
+    },
+    {
+      "name": "flow.request.method",
+      "kind": "property",
+      "signature": "flow.request.method -> string",
+      "description": "The request method (settable)."
+    },
+    {
+      "name": "flow.request.url",
+      "kind": "property",
+      "signature": "flow.request.url -> string",
+      "description": "The full URL, scheme://authority/path?query (settable)."
+    },
+    {
+      "name": "flow.request.path",
+      "kind": "property",
+      "signature": "flow.request.path -> string",
+      "description": "The request path (settable)."
+    },
+    {
+      "name": "flow.request.headers",
+      "kind": "object",
+      "description": "The request headers, a map-like object."
+    },
+    {
+      "name": "flow.request.headers.get",
+      "kind": "method",
+      "signature": "get(k)",
+      "description": "The value of header k."
+    },
+    {
+      "name": "flow.request.headers.set",
+      "kind": "method",
+      "signature": "set(k, v)",
+      "description": "Set header k to v."
+    },
+    {
+      "name": "flow.request.headers.remove",
+      "kind": "method",
+      "signature": "remove(k)",
+      "description": "Remove header k."
+    },
+    {
+      "name": "flow.request.headers.has",
+      "kind": "method",
+      "signature": "has(k)",
+      "description": "True when header k is present."
+    },
+    {
+      "name": "flow.request.headers.keys",
+      "kind": "method",
+      "signature": "keys()",
+      "description": "The header names, as an array."
+    },
+    {
+      "name": "flow.request.body",
+      "kind": "property",
+      "signature": "flow.request.body -> string | bytes",
+      "description": "The request body (get/set)."
+    },
+    {
+      "name": "flow.request.bytes",
+      "kind": "property",
+      "signature": "flow.request.bytes -> bytes",
+      "description": "The request body as raw bytes (get/set)."
+    },
+    {
+      "name": "flow.request.set_json",
+      "kind": "method",
+      "signature": "set_json(obj)",
+      "description": "Set the request body to the JSON encoding of obj."
+    },
+    {
+      "name": "flow.request.query",
+      "kind": "property",
+      "signature": "flow.request.query -> map",
+      "description": "The query parameters, a map-like object."
+    },
+    {
+      "name": "flow.response",
+      "kind": "object",
+      "description": "The response side of the flow."
+    },
+    {
+      "name": "flow.response.status",
+      "kind": "property",
+      "signature": "flow.response.status -> int",
+      "description": "The response status code (settable)."
+    },
+    {
+      "name": "flow.response.headers",
+      "kind": "object",
+      "description": "The response headers, a map-like object."
+    },
+    {
+      "name": "flow.response.headers.get",
+      "kind": "method",
+      "signature": "get(k)",
+      "description": "The value of header k."
+    },
+    {
+      "name": "flow.response.headers.set",
+      "kind": "method",
+      "signature": "set(k, v)",
+      "description": "Set header k to v."
+    },
+    {
+      "name": "flow.response.headers.remove",
+      "kind": "method",
+      "signature": "remove(k)",
+      "description": "Remove header k."
+    },
+    {
+      "name": "flow.response.headers.has",
+      "kind": "method",
+      "signature": "has(k)",
+      "description": "True when header k is present."
+    },
+    {
+      "name": "flow.response.headers.keys",
+      "kind": "method",
+      "signature": "keys()",
+      "description": "The header names, as an array."
+    },
+    {
+      "name": "flow.response.body",
+      "kind": "property",
+      "signature": "flow.response.body -> string | bytes",
+      "description": "The response body."
+    },
+    {
+      "name": "flow.response.bytes",
+      "kind": "property",
+      "signature": "flow.response.bytes -> bytes",
+      "description": "The response body as raw bytes (get/set)."
+    },
+    {
+      "name": "flow.set_response",
+      "kind": "method",
+      "signature": "flow.set_response(status, headers, body)",
+      "description": "Short-circuit before upstream: answer the request with this response."
+    },
+    {
+      "name": "flow.intercept",
+      "kind": "method",
+      "signature": "flow.intercept()",
+      "description": "Pause this flow for operator intervention."
+    },
+    {
+      "name": "flow.resume",
+      "kind": "method",
+      "signature": "flow.resume()",
+      "description": "Resume a paused flow."
+    },
+    {
+      "name": "flow.kill",
+      "kind": "method",
+      "signature": "flow.kill()",
+      "description": "Kill this flow."
+    },
+    {
+      "name": "flow.backup",
+      "kind": "method",
+      "signature": "flow.backup()",
+      "description": "Snapshot the flow so it can be reverted."
+    },
+    {
+      "name": "flow.revert",
+      "kind": "method",
+      "signature": "flow.revert()",
+      "description": "Restore the flow to its last backup."
+    },
+    {
+      "name": "flow.mark",
+      "kind": "method",
+      "signature": "flow.mark(tag)",
+      "description": "Add a mark to this flow."
+    }
   ],
   "msg": [
-    { "name": "msg.direction", "kind": "property", "signature": "msg.direction -> \"c2s\" | \"s2c\"", "description": "Frame direction: client-to-server or server-to-client." },
-    { "name": "msg.opcode", "kind": "property", "signature": "msg.opcode -> \"text\" | \"binary\" | \"ping\" | \"pong\" | \"close\"", "description": "The WebSocket opcode." },
-    { "name": "msg.text", "kind": "property", "signature": "msg.text -> string", "description": "The frame as text (settable)." },
-    { "name": "msg.data", "kind": "property", "signature": "msg.data -> bytes", "description": "The frame payload as bytes." },
-    { "name": "msg.set_text", "kind": "method", "signature": "msg.set_text(s)", "description": "Replace the frame payload with the text s." },
-    { "name": "msg.set_bytes", "kind": "method", "signature": "msg.set_bytes(b)", "description": "Replace the frame payload with the bytes b." },
-    { "name": "msg.drop", "kind": "method", "signature": "msg.drop()", "description": "Do not forward this frame." }
+    {
+      "name": "msg.direction",
+      "kind": "property",
+      "signature": "msg.direction -> \"c2s\" | \"s2c\"",
+      "description": "Frame direction: client-to-server or server-to-client."
+    },
+    {
+      "name": "msg.opcode",
+      "kind": "property",
+      "signature": "msg.opcode -> \"text\" | \"binary\" | \"ping\" | \"pong\" | \"close\"",
+      "description": "The WebSocket opcode."
+    },
+    {
+      "name": "msg.text",
+      "kind": "property",
+      "signature": "msg.text -> string",
+      "description": "The frame as text (settable)."
+    },
+    {
+      "name": "msg.data",
+      "kind": "property",
+      "signature": "msg.data -> bytes",
+      "description": "The frame payload as bytes."
+    },
+    {
+      "name": "msg.set_text",
+      "kind": "method",
+      "signature": "msg.set_text(s)",
+      "description": "Replace the frame payload with the text s."
+    },
+    {
+      "name": "msg.set_bytes",
+      "kind": "method",
+      "signature": "msg.set_bytes(b)",
+      "description": "Replace the frame payload with the bytes b."
+    },
+    {
+      "name": "msg.drop",
+      "kind": "method",
+      "signature": "msg.drop()",
+      "description": "Do not forward this frame."
+    }
   ],
   "globals": [
-    { "name": "log", "kind": "function", "signature": "log(msg)", "description": "Write msg to the script's log." },
-    { "name": "log.info", "kind": "function", "signature": "log.info(msg)", "description": "Log at info level." },
-    { "name": "log.warn", "kind": "function", "signature": "log.warn(msg)", "description": "Log at warn level." },
-    { "name": "log.error", "kind": "function", "signature": "log.error(msg)", "description": "Log at error level." },
-
-    { "name": "http.send", "kind": "function", "signature": "http.send(#{ method, url, headers, body }) -> #{ status, headers, body, flow_id }", "description": "Send an HTTP request through the proxy's own client (scope- and rate-gated); the exchange is captured as a flow." },
-
-    { "name": "browser.navigate", "kind": "function", "signature": "browser.navigate(url)", "description": "Navigate the embedded browser to url (scope- and SSRF-gated)." },
-    { "name": "browser.click", "kind": "function", "signature": "browser.click(selector_or_xy)", "description": "Click an element by selector, or a point by coordinates." },
-    { "name": "browser.type_text", "kind": "function", "signature": "browser.type_text(selector, text)", "description": "Type text into the element matching selector. In-script Rhai method name is `type_text` (`type` is a Rhai reserved word); the MCP/CLI tool is still named `browser.type`." },
-    { "name": "browser.screenshot", "kind": "function", "signature": "browser.screenshot() -> bytes", "description": "Capture the page as PNG bytes." },
-    { "name": "browser.evaluate", "kind": "function", "signature": "browser.evaluate(expr) -> value", "description": "Evaluate a JavaScript expression in the page. In-script Rhai method name is `evaluate` (`eval` is a Rhai reserved word); the MCP/CLI tool is still named `browser.eval`." },
-    { "name": "browser.get_dom", "kind": "function", "signature": "browser.get_dom() -> string", "description": "The page's DOM as a string." },
-
-    { "name": "store.get", "kind": "function", "signature": "store.get(id) -> flow view", "description": "Read one flow from the flow store by id." },
-    { "name": "store.query", "kind": "function", "signature": "store.query(#{ host, method, status, kind, is_replay }) -> array of flow views", "description": "Query the flow store; returns matching flow views." },
-
-    { "name": "scope.add", "kind": "function", "signature": "scope.add(host)", "description": "Add host to the authorised scope." },
-    { "name": "scope.list", "kind": "function", "signature": "scope.list() -> array", "description": "The hosts currently in scope." },
-
-    { "name": "option", "kind": "function", "signature": "option(name) -> value", "description": "The value of an option set at load." },
-    { "name": "halt", "kind": "function", "signature": "halt()", "description": "Return from a hook to halt the plugin chain (Verdict::Halt). Returning nothing continues the chain." },
-
-    { "name": "finding", "kind": "function", "signature": "finding(#{ name, severity, flow_id, detail, tags })", "description": "Record a security finding; severity is info | low | medium | high | critical." },
-
-    { "name": "ok", "kind": "function", "signature": "ok(resp)", "description": "Prelude helper: wrap resp as a successful short-circuit response." },
-    { "name": "contains_ci", "kind": "function", "signature": "contains_ci(hay, needle)", "description": "Prelude helper: case-insensitive substring check." },
-    { "name": "json", "kind": "function", "signature": "json(m)", "description": "Prelude helper: encode the map m as a JSON string." }
+    {
+      "name": "log",
+      "kind": "function",
+      "signature": "log(msg)",
+      "description": "Write msg to the script's log."
+    },
+    {
+      "name": "log.info",
+      "kind": "function",
+      "signature": "log.info(msg)",
+      "description": "Log at info level."
+    },
+    {
+      "name": "log.warn",
+      "kind": "function",
+      "signature": "log.warn(msg)",
+      "description": "Log at warn level."
+    },
+    {
+      "name": "log.error",
+      "kind": "function",
+      "signature": "log.error(msg)",
+      "description": "Log at error level."
+    },
+    {
+      "name": "http.send",
+      "kind": "function",
+      "signature": "http.send(#{ method, url, headers, body }) -> #{ status, headers, body, flow_id }",
+      "description": "Send an HTTP request through the proxy's own client (scope- and rate-gated); the exchange is captured as a flow."
+    },
+    {
+      "name": "browser.navigate",
+      "kind": "function",
+      "signature": "browser.navigate(url)",
+      "description": "Navigate the embedded browser to url (scope- and SSRF-gated)."
+    },
+    {
+      "name": "browser.click",
+      "kind": "function",
+      "signature": "browser.click(selector_or_xy)",
+      "description": "Click an element by selector, or a point by coordinates."
+    },
+    {
+      "name": "browser.type_text",
+      "kind": "function",
+      "signature": "browser.type_text(selector, text)",
+      "description": "Type text into the element matching selector. In-script Rhai method name is `type_text` (`type` is a Rhai reserved word); the MCP/CLI tool is still named `browser.type`."
+    },
+    {
+      "name": "browser.screenshot",
+      "kind": "function",
+      "signature": "browser.screenshot() -> bytes",
+      "description": "Capture the page as PNG bytes."
+    },
+    {
+      "name": "browser.evaluate",
+      "kind": "function",
+      "signature": "browser.evaluate(expr) -> value",
+      "description": "Evaluate a JavaScript expression in the page. In-script Rhai method name is `evaluate` (`eval` is a Rhai reserved word); the MCP/CLI tool is still named `browser.eval`."
+    },
+    {
+      "name": "browser.get_dom",
+      "kind": "function",
+      "signature": "browser.get_dom() -> string",
+      "description": "The page's DOM as a string."
+    },
+    {
+      "name": "store.get",
+      "kind": "function",
+      "signature": "store.get(id) -> flow view",
+      "description": "Read one flow from the flow store by id."
+    },
+    {
+      "name": "store.query",
+      "kind": "function",
+      "signature": "store.query(#{ host, method, status, kind, is_replay }) -> array of flow views",
+      "description": "Query the flow store; returns matching flow views."
+    },
+    {
+      "name": "scope.add",
+      "kind": "function",
+      "signature": "scope.add(host)",
+      "description": "Add host to the authorised scope."
+    },
+    {
+      "name": "scope.list",
+      "kind": "function",
+      "signature": "scope.list() -> array",
+      "description": "The hosts currently in scope."
+    },
+    {
+      "name": "option",
+      "kind": "function",
+      "signature": "option(name) -> value",
+      "description": "The value of an option set at load."
+    },
+    {
+      "name": "halt",
+      "kind": "function",
+      "signature": "halt()",
+      "description": "Return from a hook to halt the plugin chain (Verdict::Halt). Returning nothing continues the chain."
+    },
+    {
+      "name": "finding",
+      "kind": "function",
+      "signature": "finding(#{ name, severity, flow_id, detail, tags })",
+      "description": "Record a security finding; severity is info | low | medium | high | critical."
+    },
+    {
+      "name": "ok",
+      "kind": "function",
+      "signature": "ok(resp)",
+      "description": "Prelude helper: wrap resp as a successful short-circuit response."
+    },
+    {
+      "name": "contains_ci",
+      "kind": "function",
+      "signature": "contains_ci(hay, needle)",
+      "description": "Prelude helper: case-insensitive substring check."
+    },
+    {
+      "name": "json",
+      "kind": "function",
+      "signature": "json(m)",
+      "description": "Prelude helper: encode the map m as a JSON string."
+    }
   ],
   "dsl": [
-    { "name": "b64_encode", "kind": "function", "status": "planned", "signature": "b64_encode(s)", "description": "Base64-encode s. PLANNED: specced but not yet registered on the engine; a production follow-up implements it, at which point it leaves the planned bucket and the drift guard requires the engine token." },
-    { "name": "b64_decode", "kind": "function", "status": "planned", "signature": "b64_decode(s)", "description": "Base64-decode s. PLANNED: not yet registered on the engine." },
-    { "name": "url_encode", "kind": "function", "status": "planned", "signature": "url_encode(s)", "description": "Percent-encode s for use in a URL. PLANNED: not yet registered on the engine." },
-    { "name": "hex_encode", "kind": "function", "status": "planned", "signature": "hex_encode(s)", "description": "Hex-encode s. PLANNED: not yet registered on the engine." },
-    { "name": "sha256", "kind": "function", "status": "planned", "signature": "sha256(s)", "description": "SHA-256 digest of s. PLANNED: not yet registered on the engine." },
-    { "name": "md5", "kind": "function", "status": "planned", "signature": "md5(s)", "description": "MD5 digest of s. PLANNED: not yet registered on the engine." },
-    { "name": "rand_text_alpha", "kind": "function", "status": "planned", "signature": "rand_text_alpha(n)", "description": "A random string of n letters. PLANNED: not yet registered on the engine." },
-    { "name": "rand_int", "kind": "function", "status": "planned", "signature": "rand_int(a, b)", "description": "A random integer between a and b. PLANNED: not yet registered on the engine." },
-    { "name": "regex_match", "kind": "function", "status": "planned", "signature": "regex_match(pat, s)", "description": "True when pattern pat matches s. PLANNED: not yet registered on the engine." },
-    { "name": "regex_extract", "kind": "function", "status": "planned", "signature": "regex_extract(pat, s, group)", "description": "The capture group of pat's match in s. PLANNED: not yet registered on the engine." }
+    {
+      "name": "b64_encode",
+      "kind": "function",
+      "status": "planned",
+      "signature": "b64_encode(s)",
+      "description": "Base64-encode s. PLANNED: specced but not yet registered on the engine; a production follow-up implements it, at which point it leaves the planned bucket and the drift guard requires the engine token."
+    },
+    {
+      "name": "b64_decode",
+      "kind": "function",
+      "status": "planned",
+      "signature": "b64_decode(s)",
+      "description": "Base64-decode s. PLANNED: not yet registered on the engine."
+    },
+    {
+      "name": "url_encode",
+      "kind": "function",
+      "status": "planned",
+      "signature": "url_encode(s)",
+      "description": "Percent-encode s for use in a URL. PLANNED: not yet registered on the engine."
+    },
+    {
+      "name": "hex_encode",
+      "kind": "function",
+      "status": "planned",
+      "signature": "hex_encode(s)",
+      "description": "Hex-encode s. PLANNED: not yet registered on the engine."
+    },
+    {
+      "name": "sha256",
+      "kind": "function",
+      "status": "planned",
+      "signature": "sha256(s)",
+      "description": "SHA-256 digest of s. PLANNED: not yet registered on the engine."
+    },
+    {
+      "name": "md5",
+      "kind": "function",
+      "status": "planned",
+      "signature": "md5(s)",
+      "description": "MD5 digest of s. PLANNED: not yet registered on the engine."
+    },
+    {
+      "name": "rand_text_alpha",
+      "kind": "function",
+      "status": "planned",
+      "signature": "rand_text_alpha(n)",
+      "description": "A random string of n letters. PLANNED: not yet registered on the engine."
+    },
+    {
+      "name": "rand_int",
+      "kind": "function",
+      "status": "planned",
+      "signature": "rand_int(a, b)",
+      "description": "A random integer between a and b. PLANNED: not yet registered on the engine."
+    },
+    {
+      "name": "regex_match",
+      "kind": "function",
+      "status": "planned",
+      "signature": "regex_match(pat, s)",
+      "description": "True when pattern pat matches s. PLANNED: not yet registered on the engine."
+    },
+    {
+      "name": "regex_extract",
+      "kind": "function",
+      "status": "planned",
+      "signature": "regex_extract(pat, s, group)",
+      "description": "The capture group of pat's match in s. PLANNED: not yet registered on the engine."
+    }
   ],
   "reg": [
-    { "name": "reg.add_command", "kind": "method", "signature": "reg.add_command(name, help, |args| { ... })", "description": "Register a script command, callable from `load(reg)`. `reg` is the registration handle passed to the load hook." },
-    { "name": "reg.add_option", "kind": "method", "signature": "reg.add_option(name, default, help)", "description": "Register a configurable option, callable from `load(reg)`; read it back later with `option(name)`." }
+    {
+      "name": "reg.add_command",
+      "kind": "method",
+      "signature": "reg.add_command(name, help, |args| { ... })",
+      "description": "Register a script command, callable from `load(reg)`. `reg` is the registration handle passed to the load hook."
+    },
+    {
+      "name": "reg.add_option",
+      "kind": "method",
+      "signature": "reg.add_option(name, default, help)",
+      "description": "Register a configurable option, callable from `load(reg)`; read it back later with `option(name)`."
+    }
   ],
   "vars": [
-    { "name": "vars.get", "kind": "method", "signature": "vars.get(name) -> value", "description": "Read a PoC run variable by name. `vars` is the per-step handle a PoC `script:` step runs against." },
-    { "name": "vars.set", "kind": "method", "signature": "vars.set(name, value)", "description": "Set a PoC run variable, visible to later steps." }
+    {
+      "name": "vars.get",
+      "kind": "method",
+      "signature": "vars.get(name) -> value",
+      "description": "Read a PoC run variable by name. `vars` is the per-step handle a PoC `script:` step runs against."
+    },
+    {
+      "name": "vars.set",
+      "kind": "method",
+      "signature": "vars.set(name, value)",
+      "description": "Set a PoC run variable, visible to later steps."
+    }
   ],
   "denied": [
-    { "name": "denied.capability", "kind": "property", "signature": "denied.capability -> string", "description": "The capability that was denied. `denied` is the token a scope-/SSRF-gated host call returns when it is refused." },
-    { "name": "denied.host", "kind": "property", "signature": "denied.host -> string", "description": "The host the denied call targeted." },
-    { "name": "denied.reason", "kind": "property", "signature": "denied.reason -> string", "description": "Why the call was denied." }
+    {
+      "name": "denied.capability",
+      "kind": "property",
+      "signature": "denied.capability -> string",
+      "description": "The capability that was denied. `denied` is the token a scope-/SSRF-gated host call returns when it is refused."
+    },
+    {
+      "name": "denied.host",
+      "kind": "property",
+      "signature": "denied.host -> string",
+      "description": "The host the denied call targeted."
+    },
+    {
+      "name": "denied.reason",
+      "kind": "property",
+      "signature": "denied.reason -> string",
+      "description": "Why the call was denied."
+    }
   ]
 }

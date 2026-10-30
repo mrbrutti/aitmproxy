@@ -18,10 +18,12 @@ pub mod flow;
 pub mod gates;
 pub mod guard;
 pub mod intercept;
+pub mod language;
 pub mod module;
 pub mod sendrecv;
 pub mod types;
 pub mod wire;
 
 pub use backend::L4Error;
+pub use language::L4Language;
 pub use module::{L4Module, L4Privilege};

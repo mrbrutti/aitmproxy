@@ -60,12 +60,17 @@ impl std::fmt::Display for AssembleError {
 
 impl std::error::Error for AssembleError {}
 
-/// The namespaces that ship to operators, in catalog order. **Empty in Task 4**;
-/// Task 5 adds `http`/`browser`/`store`/`scope` and Task 6 adds `l4`. The test
-/// namespace (`aitm-proto-test`) is deliberately absent — it must not pollute
-/// operator completion.
+/// The namespaces that ship to operators, in catalog order. Task 6 adds `l4`
+/// (the first consumer of the seam); Task 5 adds `http`/`browser`/`store`/`scope`.
+/// The test namespace (`aitm-proto-test`) is deliberately absent — it must not
+/// pollute operator completion.
+///
+/// `l4` is contributed as [`aitm_proto_l4::L4Language::for_catalog`], which needs
+/// only static data (`catalog()` / `namespace()` / `api_version()`); it carries a
+/// default deny-by-default guard so no live engagement state is required to
+/// describe the surface.
 pub fn production_languages() -> Vec<Box<dyn ProtocolLanguage>> {
-    Vec::new()
+    vec![Box::new(aitm_proto_l4::L4Language::for_catalog())]
 }
 
 /// Concatenate each language's [`NamespaceCatalog`] into `rhai.api.json`'s
@@ -153,10 +158,18 @@ pub fn assemble_poc_steps(
     Ok(doc)
 }
 
-/// AC8 (one vocabulary) — whether a namespace's PoC `op` verb vocabulary matches
-/// its Rhai host-fn names. A namespace with no PoC step, or a step with no `op`
-/// enum, is vacuously consistent; otherwise the `op` enum must equal the set of
-/// host-fn names, so the same verbs are learned once across both faces.
+/// AC8 (one vocabulary) — whether a namespace's PoC `op` verb vocabulary is a
+/// consistent part of its Rhai host-fn names. A namespace with no PoC step, or a
+/// step with no `op` enum, is vacuously consistent; otherwise every `op` verb must
+/// be a real host-fn name, i.e. the `op` set is a (possibly proper) **subset** of
+/// the host-fn vocabulary.
+///
+/// A one-shot PoC step may legitimately expose only the subset of verbs that fit a
+/// single assertion step — e.g. l4's `op` enum is its wire verbs
+/// (`craft`/`inject`/`send_recv`), a strict subset of the nine `l4.*` host fns /
+/// commands — so an exact equality would be wrong. What AC8 forbids is a *divergent*
+/// vocabulary: an `op` verb the host-fn set does not contain. The subset test still
+/// bites on that (a verb outside the set makes it not a subset).
 pub fn vocabulary_consistent(cat: &NamespaceCatalog) -> bool {
     let Some(step) = &cat.poc_step else {
         return true;
@@ -166,7 +179,7 @@ pub fn vocabulary_consistent(cat: &NamespaceCatalog) -> bool {
     };
     let fn_names: BTreeSet<&str> = cat.host_fns.iter().map(|f| f.name.as_str()).collect();
     let verbs: BTreeSet<&str> = verbs.iter().map(|s| s.as_str()).collect();
-    verbs == fn_names
+    verbs.is_subset(&fn_names)
 }
 
 /// One namespace whose runnable `<ns>:` PoC step and catalogued PoC step

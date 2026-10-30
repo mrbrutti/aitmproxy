@@ -164,6 +164,11 @@ fn catalog_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/design/languages/rhai.api.json")
 }
 
+fn poc_schema_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/design/languages/poc-yaml.schema.json")
+}
+
 /// The catalog's *implemented* tokens. Sections other than `hooks` (hooks are
 /// author-defined functions, not host callables) are walked; entries marked
 /// `"status": "planned"` are the separate not-yet-built bucket and excluded.
@@ -548,16 +553,17 @@ fn poc_face_drift_rejects_a_drifted_poc_step() {
 }
 
 /// Golden — the shipped `rhai.api.json` `namespaces` object equals
-/// `assemble_namespaces(production_languages())`. Empty in this task; Task 5/6
-/// populate `production_languages()` and re-verify against the shipped file.
+/// `assemble_namespaces(production_languages())`. Task 6 adds `l4`, so the `l4`
+/// namespace is present and its assembly must match the shipped file byte-for-byte
+/// (regenerated when the catalog changes).
 #[test]
 fn shipped_namespaces_equal_production_assembly() {
     let langs = production_languages();
     let refs: Vec<&dyn ProtocolLanguage> = langs.iter().map(|b| b.as_ref()).collect();
     let doc = assemble_namespaces(&refs).expect("production assembles");
     assert!(
-        doc.is_empty(),
-        "production namespaces are empty until Task 5 (http/browser) and Task 6 (l4) join"
+        doc.contains_key("l4"),
+        "Task 6 puts the `l4` namespace into production_languages()"
     );
 
     let text = std::fs::read_to_string(catalog_path()).expect("the catalog is readable");
@@ -570,6 +576,54 @@ fn shipped_namespaces_equal_production_assembly() {
         namespaces, &expected,
         "shipped `namespaces` must equal assemble_namespaces(production_languages())"
     );
+}
+
+/// Golden (PoC face) — the shipped `poc-yaml.schema.json`'s per-namespace `<ns>:`
+/// step nodes equal `assemble_poc_steps(production_languages())`. Mirrors
+/// `shipped_namespaces_equal_production_assembly` for the PoC face: Task 6 puts the
+/// `l4:` step into production, so the shipped schema must ship it and it cannot
+/// drift from l4's `poc_step` (regenerate the schema when the catalog changes).
+#[test]
+fn shipped_poc_steps_equal_production_assembly() {
+    let langs = production_languages();
+    let refs: Vec<&dyn ProtocolLanguage> = langs.iter().map(|b| b.as_ref()).collect();
+    let steps = assemble_poc_steps(&refs).expect("production poc steps assemble");
+    assert!(
+        steps.contains_key("l4"),
+        "Task 6 puts the `l4:` step into production_languages()"
+    );
+
+    let text = std::fs::read_to_string(poc_schema_path()).expect("the poc schema is readable");
+    let parsed: serde_yaml::Value =
+        serde_yaml::from_str(&text).expect("the poc schema is valid JSON");
+    let step_keys = parsed
+        .get("keys")
+        .and_then(|k| k.get("steps"))
+        .and_then(|s| s.get("items"))
+        .and_then(|i| i.get("keys"))
+        .expect("poc schema has steps[].items.keys");
+    let one_of = parsed
+        .get("keys")
+        .and_then(|k| k.get("steps"))
+        .and_then(|s| s.get("items"))
+        .and_then(|i| i.get("one_of_keys"))
+        .and_then(serde_yaml::Value::as_sequence)
+        .expect("poc schema has steps[].items.one_of_keys");
+
+    for (ns, doc) in &steps {
+        let shipped = step_keys
+            .get(ns)
+            .unwrap_or_else(|| panic!("poc schema must ship the `{ns}:` step node"));
+        let expected = serde_yaml::to_value(doc).expect("the assembled step node serializes");
+        assert_eq!(
+            shipped, &expected,
+            "shipped `{ns}:` step node must equal assemble_poc_steps(production_languages())"
+        );
+        assert!(
+            one_of.iter().any(|v| v.as_str() == Some(ns.as_str())),
+            "the `{ns}:` step must be listed in steps[].items.one_of_keys"
+        );
+    }
 }
 
 /// Review Focus — two namespaces with a same-named fn stay namespaced; neither
@@ -602,10 +656,11 @@ fn duplicate_namespace_is_an_error() {
 }
 
 /// AC8 (mechanism) — where a namespace contributes a PoC step, its `op` verb
-/// vocabulary equals its host-fn names: one vocabulary across the Rhai and PoC
-/// faces. The test namespace catalogs a step with no `op` enum, so the check
-/// holds vacuously; a synthetic namespace exercises both the match and the
-/// mismatch.
+/// vocabulary is a consistent **subset** of its host-fn names: one vocabulary
+/// across the Rhai and PoC faces, with the PoC face free to expose only the verbs
+/// that fit a one-shot step (e.g. l4's wire verbs). The test namespace contributes
+/// no step, so the check holds vacuously; a synthetic namespace exercises the exact
+/// match, a proper subset, and a divergent mismatch.
 #[test]
 fn one_vocabulary_across_script_and_poc() {
     // `test`'s catalogued step declares no `op` enum — vacuously consistent.
@@ -628,7 +683,17 @@ fn one_vocabulary_across_script_and_poc() {
     };
     assert!(vocabulary_consistent(&good.catalog()));
 
-    // op-enum diverges from the host-fn names: inconsistent — the guard bites.
+    // op-enum is a proper subset of the host-fn names: still consistent — a one-shot
+    // PoC step may offer only some of the shared vocabulary (l4 is exactly this: the
+    // `op` enum is the wire subset of the nine `l4.*` host fns).
+    let subset = FakeLang {
+        step: Some(step(&["craft"])),
+        ..FakeLang::simple("demo", &["craft", "inject", "scan"])
+    };
+    assert!(vocabulary_consistent(&subset.catalog()));
+
+    // op-enum diverges from the host-fn names (a verb the host-fn set lacks):
+    // inconsistent — the guard still bites.
     let bad = FakeLang {
         step: Some(step(&["craft", "WRONG"])),
         ..FakeLang::simple("demo", &["craft", "inject"])
