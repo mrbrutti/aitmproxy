@@ -199,6 +199,58 @@ fn scope_add_gated_from_agent_frontend() {
         .expect("agent scope.add allowed when scope.allow_agent_widen is set");
 }
 
+/// embedded-core-scope (AC13): a present human operator (`Frontend::Operator`,
+/// an operator-token connection such as the mac app) may widen scope with the
+/// agent gate ON; an autonomous agent (`Frontend::Mcp`) stays refused; the CLI
+/// is unchanged.
+#[test]
+fn operator_may_widen_scope() {
+    use aitm_core::{Frontend, ScopeRateGuard};
+
+    let store = Arc::new(MemFlowStore::new());
+    let guard = Arc::new(StdGuard::default());
+    let client = pipe(&store, &guard);
+
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(ScopePlugin::new(false)));
+    let add = reg.command("scope.add").expect("scope.add registered");
+
+    // Operator: allowed, and the entry lands in the guard's scope set.
+    let operator = CommandHost::new(store.as_ref(), &client, guard.as_ref(), None)
+        .with_frontend(Frontend::Operator);
+    let added = add
+        .invoke(params(&[("host", Value::Str("op.test".into()))]), &operator)
+        .expect("a present human operator may widen scope with the agent gate on");
+    assert_eq!(added, Value::Str("op.test".into()));
+    let listed: Vec<String> = guard.list_scope().into_iter().map(|e| e.host).collect();
+    assert_eq!(listed, vec!["op.test".to_string()]);
+
+    // Agent: still refused, and the refusal names the agent frontend.
+    let agent = CommandHost::new(store.as_ref(), &client, guard.as_ref(), None)
+        .with_frontend(Frontend::Mcp);
+    let err = add
+        .invoke(params(&[("host", Value::Str("agent.test".into()))]), &agent)
+        .expect_err("an agent must stay gated when allow_agent_widen is off");
+    assert!(
+        err.to_string().contains("agent frontend"),
+        "refusal should name the agent frontend: {err}"
+    );
+    let listed: Vec<String> = guard.list_scope().into_iter().map(|e| e.host).collect();
+    assert_eq!(
+        listed,
+        vec!["op.test".to_string()],
+        "the agent added nothing"
+    );
+
+    // CLI: unchanged, always allowed.
+    let cli = CommandHost::new(store.as_ref(), &client, guard.as_ref(), None)
+        .with_frontend(Frontend::Cli);
+    add.invoke(params(&[("host", Value::Str("cli.test".into()))]), &cli)
+        .expect("the human CLI may always widen scope");
+    let listed: Vec<String> = guard.list_scope().into_iter().map(|e| e.host).collect();
+    assert_eq!(listed, vec!["op.test".to_string(), "cli.test".to_string()]);
+}
+
 /// A guard whose only limiter is the per-host bucket: global and concurrency
 /// are set generously so the burst exercises `per_host_rps` alone.
 fn permissive_guard(per_host_rps: u32) -> StdGuard {
