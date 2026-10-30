@@ -53,10 +53,10 @@
         <p class="lead deck">On macOS (Apple Silicon), tap the project, then install the <code>aitm</code> binary — web UI and embedded browser bundled in — or the notarized app as a cask.</p>
         <div class="steps">
           <div class="cmd"><code><span class="pr">$ </span>brew tap mrbrutti/aitmproxy</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
-          <div class="cmd"><code><span class="pr">$ </span>brew install mrbrutti/aitmproxy/aitm</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
-          <div class="cmd"><code><span class="pr">$ </span>brew install --cask mrbrutti/aitmproxy/aitmproxy</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
+          <div class="cmd"><code><span class="pr">$ </span>brew install aitm</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
+          <div class="cmd"><code><span class="pr">$ </span>brew install --cask aitmproxy</code><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></div>
         </div>
-        <p class="deck muted">The formula is the CLI and the three UIs; the cask is the macOS app, which drives the same core. While the v0.5.0 tap is private, set <code>HOMEBREW_GITHUB_API_TOKEN=$(gh auth token)</code> first so Homebrew can fetch it. On Linux, use a native package below, or Cargo.</p>
+        <p class="deck muted">The formula is the CLI and the three UIs; the cask is the macOS app, which drives the same core. The tap and the release binaries are public — no token needed. On Linux, use a native package below, or Cargo.</p>
       </div>
       <div>
         <h2 class="h2" data-reveal>Then capture.</h2>
@@ -116,7 +116,7 @@
         <h3 class="h3">Web &amp; CLI</h3>
         <p>The <code>aitm</code> binary ships the SolidJS web UI and every command. Runs on macOS and Linux.</p>
         <div class="ui"><div class="ui-lines">
-          <div><span class="k">install</span><span>brew install aitmproxy</span></div>
+          <div><span class="k">install</span><span>brew install aitm</span></div>
           <div><span class="k">web</span><span>aitm web → 127.0.0.1:8082</span></div>
           <div><span class="k">linux</span><span>x86-64 · arm64</span></div>
         </div></div>

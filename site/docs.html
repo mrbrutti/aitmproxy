@@ -82,12 +82,12 @@
       <p>aitmproxy is open source and ships for macOS and Linux; Windows is not supported. The <code>aitm</code> command bundles the proxy, the terminal UI, the web UI, the embedded browser and the MCP server. Pick the path for your OS — the <a href="download.html">download page</a> lists every package and checksum for v0.5.0.</p>
 
       <h3 id="install-macos">macOS (Apple Silicon)</h3>
-      <p>Install from the project's Homebrew tap. While the v0.5.0 tap is private, export a token first so Homebrew can fetch it.</p>
+      <p>Install from the project's public Homebrew tap — no account or token needed.</p>
       <figure class="code" data-reveal>
         <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="pr">$ </span>export HOMEBREW_GITHUB_API_TOKEN=$(gh auth token)
-<span class="pr">$ </span>brew install mrbrutti/aitmproxy/aitm            <span class="out"># CLI + web + TUI</span>
-<span class="pr">$ </span>brew install --cask mrbrutti/aitmproxy/aitmproxy  <span class="out"># the macOS app</span>
+<pre><code><span class="pr">$ </span>brew tap mrbrutti/aitmproxy
+<span class="pr">$ </span>brew install aitm                 <span class="out"># CLI + web + TUI</span>
+<span class="pr">$ </span>brew install --cask aitmproxy     <span class="out"># the macOS app</span>
 <span class="pr">$ </span>aitm --version
 <span class="out">aitm 0.5.0 (unsafe: 0)</span></code></pre>
       </figure>
