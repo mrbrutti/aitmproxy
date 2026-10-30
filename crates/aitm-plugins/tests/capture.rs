@@ -7,7 +7,7 @@ use std::time::SystemTime;
 use aitm_core::{
     Body, CommandHost, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow,
     HttpRequest, HttpResponse, HttpVersion, InterceptState, MemFlowStore, Params, Plugin,
-    ProxyClient, Registry, StdGuard, Value,
+    ProxyClient, Registry, StdGuard, Value, WsFlow,
 };
 use aitm_plugins::CapturePlugin;
 use futures::future::BoxFuture;
@@ -131,5 +131,98 @@ fn flow_get_unknown_id_is_an_error() {
     assert!(
         err.to_string().contains(&missing.to_string()),
         "error should name the id: {err}"
+    );
+}
+
+fn ws_flow(handshake: FlowId) -> Flow {
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    Flow::WebSocket(WsFlow {
+        id: FlowId::new(),
+        handshake,
+        messages: Vec::new(),
+        client_conn: ConnInfo {
+            peer: addr,
+            sni: None,
+            alpn: None,
+            tls: false,
+            established: SystemTime::now(),
+        },
+        server_conn: None,
+        metadata: FlowMeta::default(),
+        intercept: InterceptState::Observed,
+    })
+}
+
+#[test]
+fn flow_table_rows() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(CapturePlugin::new()));
+
+    let store = MemFlowStore::new();
+    let http = store.insert(http_flow("GET", "/a", Some(200)));
+    let _ws = store.insert(ws_flow(http));
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(&store, &client, &guard, None);
+
+    let table = reg
+        .command("flow.table")
+        .expect("flow.table registered")
+        .invoke(Params::default(), &host)
+        .expect("flow.table ok");
+
+    let Value::Object(obj) = table else {
+        panic!("flow.table must return an object, got {table:?}");
+    };
+    let Some(Value::Array(rows)) = obj.get("flows") else {
+        panic!("flow.table result must have a `flows` array: {obj:?}");
+    };
+    assert_eq!(rows.len(), 2, "two flows captured");
+
+    let Value::Object(http_row) = &rows[0] else {
+        panic!("row 0 must be an object, got {:?}", rows[0]);
+    };
+    assert_eq!(http_row.get("kind"), Some(&Value::Str("http".into())));
+    assert_eq!(http_row.get("method"), Some(&Value::Str("GET".into())));
+    assert_eq!(http_row.get("status"), Some(&Value::Int(200)));
+    assert_eq!(http_row.get("state"), Some(&Value::Str("observed".into())));
+    assert_eq!(
+        http_row.get("marks"),
+        Some(&Value::Array(vec![])),
+        "no marks by default"
+    );
+
+    let Value::Object(ws_row) = &rows[1] else {
+        panic!("row 1 must be an object, got {:?}", rows[1]);
+    };
+    assert_eq!(ws_row.get("kind"), Some(&Value::Str("websocket".into())));
+    assert_eq!(ws_row.get("method"), Some(&Value::Null));
+    assert_eq!(ws_row.get("state"), Some(&Value::Str("observed".into())));
+}
+
+#[test]
+fn flow_list_unchanged_ids_only() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(CapturePlugin::new()));
+
+    let store = MemFlowStore::new();
+    let first = store.insert(http_flow("GET", "/a", Some(200)));
+    let second = store.insert(ws_flow(first));
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(&store, &client, &guard, None);
+
+    let list = reg
+        .command("flow.list")
+        .expect("flow.list registered")
+        .invoke(Params::default(), &host)
+        .expect("flow.list ok");
+    assert_eq!(
+        list,
+        Value::Array(vec![
+            Value::Str(first.to_string()),
+            Value::Str(second.to_string()),
+        ]),
+        "flow.list is a bare array of id strings, oldest first"
     );
 }

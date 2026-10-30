@@ -21,6 +21,7 @@ use aitm_core::{
 use serde_json::{json, Map, Value as JsonValue};
 use tokio::sync::{broadcast, Notify};
 
+use crate::http::{StreamableHttp, StreamableHttpCfg};
 use crate::json::{params_from_json, to_json};
 use crate::schema::{McpSchemaDerive, StdSchemaDerive};
 use crate::transport::{self, LoopbackTcp};
@@ -1094,6 +1095,24 @@ impl McpServer {
                 }
                 listener.serve(server).await
             }
+            McpTransport::StreamableHttp {
+                bind,
+                token,
+                allowed_origins,
+                path,
+            } => {
+                let listener = StreamableHttp::bind(StreamableHttpCfg {
+                    bind,
+                    token,
+                    allowed_origins,
+                    path,
+                })
+                .await?;
+                if let Some(f) = on_bound {
+                    f(listener.local_addr());
+                }
+                listener.serve(server).await
+            }
         }
     }
 
@@ -1168,11 +1187,58 @@ impl McpServer {
                     // show it and warn on mismatch (Decision C). Additive and
                     // top-level — it describes this connection, not the server.
                     "role": role_str(conn.role),
-                    "capabilities": {"tools": {}},
+                    // Additive (W2): advertise `resources` so MCP Apps hosts fetch
+                    // the widget templates, plus the MCP Apps extension id. Clients
+                    // that don't know these keys ignore them (research 08 §3.3).
+                    "capabilities": {
+                        "tools": {},
+                        "resources": {},
+                        "extensions": {
+                            "io.modelcontextprotocol/ui": {
+                                "mimeTypes": [crate::widgets::RESOURCE_MIME],
+                            }
+                        }
+                    },
                     "serverInfo": {"name": "aitmproxy", "version": aitm_core::VERSION},
                 }))
             }
             "ping" => Ok(json!({})),
+            "resources/list" => {
+                let resources: Vec<JsonValue> = crate::widgets::widgets()
+                    .iter()
+                    .map(|w| {
+                        json!({
+                            "uri": w.uri,
+                            "name": w.name,
+                            "title": w.title,
+                            "description": w.description,
+                            "mimeType": crate::widgets::RESOURCE_MIME,
+                            "_meta": crate::widgets::resource_meta(w),
+                        })
+                    })
+                    .collect();
+                Ok(json!({"resources": resources}))
+            }
+            "resources/read" => {
+                let uri = params
+                    .get("uri")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| RpcError::new(INVALID_PARAMS, "missing resource `uri`"))?;
+                let widget = crate::widgets::widgets()
+                    .iter()
+                    .find(|w| w.uri == uri)
+                    .ok_or_else(|| {
+                        RpcError::new(INVALID_PARAMS, format!("unknown resource {uri}"))
+                    })?;
+                Ok(json!({
+                    "contents": [{
+                        "uri": widget.uri,
+                        "mimeType": crate::widgets::RESOURCE_MIME,
+                        "text": widget.html,
+                        "_meta": crate::widgets::resource_meta(widget),
+                    }]
+                }))
+            }
             "tools/list" => {
                 let tools: Vec<JsonValue> = self
                     .registry

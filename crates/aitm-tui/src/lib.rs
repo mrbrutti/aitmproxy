@@ -218,7 +218,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     result
 }
 
-/// The 56 commands the bus serves today — `tools/list` of the core as of
+/// The 57 commands the bus serves today — `tools/list` of the core as of
 /// the 2026-10-29 M4 merge: foundation §4.1's 22, plus `flow.detail` (F5),
 /// `flow.mark` / `flow.comment` (F6), `proxy.status` / `proxy.pause` /
 /// `proxy.resume` / `flow.clear` / `config.get` (F7), `scope.remove` (F12),
@@ -233,6 +233,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
 pub const CORE_TOOLS: &[&str] = &[
     "flow.list",
     "flow.get",
+    "flow.table",
     "flow.detail",
     "flow.intercept",
     "flow.resume",

@@ -1,0 +1,16 @@
+{
+  "name": "aitmproxy",
+  "version": "0.1.0",
+  "description": "An authorized-security-testing intercepting-proxy driver with rich MCP Apps widgets.",
+  "author": {
+    "name": "mrbrutti"
+  },
+  "homepage": "https://github.com/mrbrutti/aitmproxy",
+  "repository": "https://github.com/mrbrutti/aitmproxy",
+  "skills": [
+    "./skills"
+  ],
+  "commands": [
+    "./commands"
+  ]
+}

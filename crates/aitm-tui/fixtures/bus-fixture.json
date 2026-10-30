@@ -26,6 +26,7 @@
   },
   "tools": [
     { "name": "flow.list", "description": "List captured flow ids, oldest first.", "inputSchema": { "type": "object", "properties": {} } },
+    { "name": "flow.table", "description": "Summarize every captured flow as one table row (method, authority, path, status, duration, state); backs the flows widget.", "inputSchema": { "type": "object", "properties": {} } },
     { "name": "flow.get", "description": "Summarize one captured flow: kind, request line, status, state.", "inputSchema": { "type": "object", "properties": { "id": { "type": "string", "description": "The flow to summarize." } }, "required": ["id"] } },
     { "name": "flow.detail", "description": "(F5) Headers, bodies, connections, metadata and timing for one flow.", "inputSchema": { "type": "object", "properties": { "id": { "type": "string", "description": "The flow." }, "body": { "type": "string", "description": "none | inline | range" } }, "required": ["id"] } },
     { "name": "flow.intercept", "description": "Arm (default) or disarm interception: while armed, every request is parked until flow.resume or flow.kill releases it.", "inputSchema": { "type": "object", "properties": { "enabled": { "type": "boolean", "description": "true to arm (default), false to disarm." } } } },

@@ -222,8 +222,25 @@ Total: **20 tasks.**
   inside `McpServer::serve`, to dispatch the new variant; Task 5 does not touch
   this arm),
   `crates/aitm/src/main.rs` (modify — wire/accept the variant where
-  `McpTransport` is matched),
+  `McpTransport` is matched, incl. the bus-endpoint applier ~L559),
+  `crates/aitm/src/config_file.rs` (modify — add `TransportFile::StreamableHttp`
+  so the transport is selectable from config),
+  `crates/aitm-plugins/src/control.rs` (modify — the status renderer match ~L283),
+  `crates/aitm/src/tui.rs` (modify — the transport-descriptor match ~L222),
   `crates/aitm-mcp/tests/http.rs` (create).
+
+  **Amendment (orchestrator, 2026-10-29): Task 4 owns the full `McpTransport`
+  variant ripple.** Adding the variant (Task 2) makes several exhaustive
+  production matches non-exhaustive that no task had claimed (found by Task 1 at
+  `control.rs:283`). Task 4 adds a `StreamableHttp` arm to EVERY exhaustive
+  production match so the whole workspace compiles: `control.rs` (report the
+  transport name/bind, NEVER the token), `tui.rs` (treat as an addressable agent
+  endpoint, mirror `LoopbackTcp`), `main.rs` bus-endpoint applier (StreamableHttp
+  does not use the loopback-bus `endpoint_file`; follow the `Stdio` pattern), the
+  `server.rs` serve arm (dispatch to the http module). Also add the
+  `TransportFile::StreamableHttp { bind, token, #[serde(default)] allowed_origins,
+  #[serde(default)] path }` config-file variant + its `From` arm, with a
+  config round-trip test, so an operator can actually enable it.
 - **Change:**
   - `Cargo.toml`: add `hyper = { version = "1", features = ["server","http1"] }`,
     `hyper-util`, `http-body-util` (pin alongside the existing `tokio` features;
@@ -311,9 +328,14 @@ Total: **20 tasks.**
       it on `McpTool` (e.g. `pub result: TypeDesc` set from `cmd.schema().result`)
       or thread it where `to_json` builds the overlay — builder's call, but it must
       not change the `ui == None` output.
-  - `server.rs` `tools/list` arm: after `StdSchemaDerive.to_mcp_tool(cmd)`, set
-    `tool.ui = aitm_mcp::widget_meta_for(cmd.name())` before `.to_json()`. Touch
-    nothing else.
+  - **Amendment (orchestrator, 2026-10-29): do the overlay in `schema.rs`, NOT
+    `server.rs`.** So T4 (serve arm) and T5 can run in parallel without both
+    editing `server.rs`: have `StdSchemaDerive::to_mcp_tool` itself set
+    `ui = crate::widgets::widget_meta_for(cmd.name())` (returns `None` for
+    non-widget tools, keeping their `to_json` byte-identical per AC6). The
+    `server.rs` `tools/list` arm stays byte-identical (still just
+    `StdSchemaDerive.to_mcp_tool(cmd).to_json()`). **T5 does not touch
+    `server.rs`** — its only files are `schema.rs` and `tests/mcp.rs`.
 - **Test:** in `crates/aitm-mcp/tests/mcp.rs`:
   - `fn widget_tools_carry_meta()`: in `tools/list`, for `flow.table` assert
     `_meta.ui.resourceUri == "ui://aitm/flows"` and equals

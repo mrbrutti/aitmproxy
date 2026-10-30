@@ -279,6 +279,7 @@ impl Fixture {
             "flow.list" => Ok(Value::Array(
                 self.flows.iter().map(|f| f["id"].clone()).collect(),
             )),
+            "flow.table" => Ok(json!({ "flows": self.flows.clone() })),
             "flow.get" => Ok(Self::summary(self.flow(&id_arg()?)?)),
             "flow.detail" => Ok(Self::detail(self.flow(&id_arg()?)?)),
             "flow.intercept" => {
