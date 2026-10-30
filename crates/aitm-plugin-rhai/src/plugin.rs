@@ -34,11 +34,12 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use aitm_core::{
-    Event, EventSink, FlowCtx, FlowError, FlowId, LimitConfig, Plugin, Registry, Verdict,
+    CallerTrust, Event, EventSink, FlowCtx, FlowError, FlowId, LimitConfig, Plugin, Registry,
+    Verdict,
 };
 use arc_swap::ArcSwap;
 use rhai::{CallFnOptions, Dynamic, Engine, EvalAltResult, Scope, AST};
@@ -50,6 +51,7 @@ use crate::error::ScriptError;
 use crate::flow_api::{ActiveFlow, ScriptFlow, ScriptWsMessage};
 use crate::flow_state::FlowState;
 use crate::host_core::{Options, ScriptServices};
+use crate::host_registry::seed_call_context;
 
 /// Log target for hook failures, so an operator can filter script errors.
 const SCRIPT_TARGET: &str = "aitm_plugin_rhai::script";
@@ -95,6 +97,43 @@ pub struct ScriptHandle {
     /// Whether the script's hooks run. Advisory and read per event: no other
     /// state depends on it, so relaxed ordering is enough.
     enabled: AtomicBool,
+    /// The script's **authoring trust** — whether a present operator or an
+    /// autonomous agent authored it (an agent only while
+    /// `scripts.allow_agent_authoring` is on, per F8). A hook and a `load(reg)`
+    /// run detached from any frontend (the proxy fires them), so the per-eval
+    /// caller trust seeded at those boundaries is this authoring trust, not an
+    /// ambient operator default: an agent that authored a hook must not gain
+    /// operator-level seam powers at hook time (spec Open-Q 1).
+    ///
+    /// Stored as an atomic (like [`ScriptHandle::enabled`]) and read per
+    /// invocation; a `script.save` over the handle can re-set it to the saver's
+    /// trust. Encoded by [`trust_code`]/[`trust_from_code`]; a fresh handle
+    /// defaults to the most-restrictive [`CallerTrust::Agent`] (fail-closed).
+    authoring: AtomicU8,
+}
+
+/// The [`ScriptHandle::authoring`] encoding of a fresh, not-yet-attributed
+/// handle: the most-restrictive [`CallerTrust::Agent`], so an unset authoring
+/// trust can only ever under-grant, never widen a hook to operator.
+const AUTHORING_AGENT: u8 = 0;
+/// The [`ScriptHandle::authoring`] encoding of [`CallerTrust::Operator`].
+const AUTHORING_OPERATOR: u8 = 1;
+
+/// Encode a caller trust for [`ScriptHandle::authoring`].
+fn trust_code(trust: CallerTrust) -> u8 {
+    match trust {
+        CallerTrust::Agent => AUTHORING_AGENT,
+        CallerTrust::Operator => AUTHORING_OPERATOR,
+    }
+}
+
+/// Decode a [`ScriptHandle::authoring`] value; any non-operator code is the
+/// fail-closed [`CallerTrust::Agent`].
+fn trust_from_code(code: u8) -> CallerTrust {
+    match code {
+        AUTHORING_OPERATOR => CallerTrust::Operator,
+        _ => CallerTrust::Agent,
+    }
 }
 
 impl ScriptHandle {
@@ -105,7 +144,24 @@ impl ScriptHandle {
             meta: ArcSwap::from_pointee(meta.clone()),
             ast: ArcSwap::from_pointee(named(ast, &meta.name)),
             enabled: AtomicBool::new(true),
+            // Fail-closed until a loader/save explicitly records authorship.
+            authoring: AtomicU8::new(AUTHORING_AGENT),
         }
+    }
+
+    /// The script's authoring trust, read per hook/`load` invocation.
+    pub fn authoring_trust(&self) -> CallerTrust {
+        trust_from_code(self.authoring.load(Ordering::Relaxed))
+    }
+
+    /// Record who authored (or last saved) the script: the loader seeds the
+    /// least-privilege [`CallerTrust::Agent`] for a config-placed script (its
+    /// provenance is unknown — a config entry names a file path, not its
+    /// author), and only an in-session `script.save` records the saving
+    /// frontend's true trust. Read live, so a re-save takes effect on the next
+    /// hook.
+    pub fn set_authoring_trust(&self, trust: CallerTrust) {
+        self.authoring.store(trust_code(trust), Ordering::Relaxed);
     }
 
     /// The script's `NAME` (or file stem).
@@ -237,6 +293,17 @@ impl LoadedScript {
         Self { errors, ..self }
     }
 
+    /// Record the script's authoring trust on its handle (the loader seeds the
+    /// least-privilege [`CallerTrust::Agent`] for a config-placed script of
+    /// unknown provenance; only an in-session `script.save` records the saving
+    /// frontend's true trust). This is the trust a hook and `load(reg)` seed,
+    /// since both run detached from any frontend (spec Open-Q 1). Omitting it
+    /// leaves the fail-closed [`CallerTrust::Agent`] default.
+    pub fn with_authoring_trust(self, trust: CallerTrust) -> Self {
+        self.handle.set_authoring_trust(trust);
+        self
+    }
+
     pub fn meta(&self) -> &ScriptMeta {
         &self.meta
     }
@@ -271,9 +338,15 @@ impl LoadedScript {
     /// `on_request` (spec §8's error policy, applied to load).
     pub(crate) fn run_load(&self, reg: &mut Registry) {
         let ast = self.handle.current();
+        // `load(reg)` can reach a seam host fn (`option`, …); `run_load` seeds this
+        // boundary with the script's authoring trust (plus the options tag and the
+        // script source) before it evaluates, so such a call is gated on the author
+        // — never refused for a missing context, never widened to operator (spec
+        // AC3). The seeding lives inside `run_load` so it also covers a direct call.
         let mut handle = ScriptRegHandle::new(reg)
             .with_options((**self.options.load()).clone())
-            .with_budget(self.budget);
+            .with_budget(self.budget)
+            .with_caller(self.handle.authoring_trust());
         if let Err(err) = handle.run_load(&self.engine, &ast) {
             tracing::error!(target: SCRIPT_TARGET, script = %self.meta.name, "{err}");
         }
@@ -293,12 +366,25 @@ impl LoadedScript {
         args: Vec<Dynamic>,
     ) -> Result<(), Box<EvalAltResult>> {
         let options = (**self.options.load()).clone();
+        // A hook runs detached from any frontend (the proxy fires it), so seed
+        // this boundary with the script's authoring trust: an agent-authored
+        // hook's seam calls are gated `Agent`, an operator-authored one's
+        // `Operator`. The per-eval tag (the options, as a `Value`) and source (the
+        // script name) are threaded through the same seed, so the seam-migrated
+        // `option`/`finding` read them off `HostCallCtx` (the old
+        // `with_tag(Options)` custom-type tag could not cross the rhai-free seam).
+        // Held across the whole hook (and any seam call nested in it), never left
+        // unseeded — fail-closed, never an operator default (spec AC6, AC3).
+        let authoring = self.handle.authoring_trust();
+        let tag = options.to_value();
+        let source = ast.source().map(str::to_string);
         blocking(|| {
             let _run = begin_run(RunKind::Hook, self.budget.hook_timeout);
             let _active = ActiveFlow::enter(Arc::clone(state));
+            let _seed = seed_call_context(authoring, Some(tag), source);
             self.engine
                 .call_fn_with_options::<Dynamic>(
-                    CallFnOptions::new().with_tag(options),
+                    CallFnOptions::new(),
                     &mut Scope::new(),
                     ast,
                     hook,

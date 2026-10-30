@@ -66,6 +66,33 @@ pub enum Frontend {
     Operator,
 }
 
+/// Whether the caller behind a scripting/PoC invocation is a present human
+/// operator or an autonomous agent. Distinct from [`Frontend`] because the
+/// per-invocation seam only needs the trust distinction (human-present vs.
+/// agent) to gate a verb (`l4.allow_agent_*`, and later `log.option`/`finding`),
+/// not which exact surface issued the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallerTrust {
+    /// A present human operator — the human-driven `aitm` CLI ([`Frontend::Cli`])
+    /// or an operator-token MCP connection ([`Frontend::Operator`]).
+    Operator,
+    /// An autonomous agent over MCP ([`Frontend::Mcp`]).
+    Agent,
+}
+
+impl From<Frontend> for CallerTrust {
+    /// The caller is an [`Agent`](CallerTrust::Agent) **iff** the frontend is
+    /// [`Frontend::Mcp`]; the human-driven CLI ([`Frontend::Cli`]) and an
+    /// operator-token MCP connection ([`Frontend::Operator`]) both map to
+    /// [`CallerTrust::Operator`], since a present human is behind each.
+    fn from(frontend: Frontend) -> Self {
+        match frontend {
+            Frontend::Mcp => CallerTrust::Agent,
+            Frontend::Cli | Frontend::Operator => CallerTrust::Operator,
+        }
+    }
+}
+
 /// Core services a command may use, without depending on any protocol crate.
 pub struct CommandHost<'a> {
     store: &'a dyn FlowStore,

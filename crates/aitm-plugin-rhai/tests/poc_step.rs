@@ -16,12 +16,16 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use aitm_core::{
-    Body, CommandHost, ConnInfo, FlowId, FlowMeta, HeaderMap, HttpFlow, HttpRequest, HttpResponse,
-    HttpVersion, InterceptState, MemFlowStore, ProxyClient, ScopeEntry, ScopeRateGuard, StdGuard,
-    Value,
+    Body, CallerTrust, CommandHost, ConnInfo, FlowId, FlowMeta, Frontend, HeaderMap, HttpFlow,
+    HttpRequest, HttpResponse, HttpVersion, InterceptState, MemFlowStore, ProxyClient, ScopeEntry,
+    ScopeRateGuard, StdGuard, Value,
+};
+use aitm_plugin::language::{
+    GuardHandle, Guarded, HostCallCtx, HostError, HostFn, NamespaceCatalog, PocStepHandler,
+    ProtocolLanguage, RegisterError, ScriptHostRegistry,
 };
 use aitm_plugin_rhai::config::RhaiLimits;
-use aitm_plugin_rhai::engine::build_engine;
+use aitm_plugin_rhai::engine::{build_engine, build_engine_with_languages};
 use aitm_plugin_rhai::host_core::{
     FindingCapability, LogCapability, MemoryFindingSink, ScriptCapability, ScriptServices,
 };
@@ -509,4 +513,135 @@ async fn repeated_steps_do_not_leak_scope() {
         )
         .expect("runs again");
     assert_eq!(again, ScriptVerdict::Pass);
+}
+
+// ===========================================================================
+// Task 3 — a PoC `script:` step seeds the caller trust from the `poc.run`
+// `CommandHost` frontend before the step evaluates, so a seam host fn the step
+// calls observes the live trust (spec AC5 script face; AC3 poc-step boundary).
+// ===========================================================================
+
+/// A seam language whose `probe.trust()` returns the live `ctx.caller()` label.
+struct ProbeLanguage;
+
+struct AdmitGuard;
+
+impl GuardHandle for AdmitGuard {
+    fn guard_name(&self) -> &str {
+        "probe"
+    }
+    fn permit(&self, _ctx: &HostCallCtx, _fn_name: &str) -> Result<(), HostError> {
+        Ok(())
+    }
+}
+
+impl ProtocolLanguage for ProbeLanguage {
+    fn namespace(&self) -> &str {
+        "probe"
+    }
+    fn api_version(&self) -> &str {
+        "1"
+    }
+    fn register_host_fns(&self, reg: &mut dyn ScriptHostRegistry) -> Result<(), RegisterError> {
+        let trust: HostFn = Box::new(|ctx: &HostCallCtx, _args: &[Value]| {
+            let label = match ctx.caller() {
+                CallerTrust::Operator => "operator",
+                CallerTrust::Agent => "agent",
+            };
+            Ok(Value::Str(label.to_string()))
+        });
+        reg.register("probe", "trust", Guarded::new(Box::new(AdmitGuard), trust))
+    }
+    fn poc_step(&self) -> Option<Box<dyn PocStepHandler>> {
+        None
+    }
+    fn catalog(&self) -> NamespaceCatalog {
+        NamespaceCatalog {
+            namespace: "probe".to_string(),
+            api_version: "1".to_string(),
+            host_fns: vec![],
+            poc_step: None,
+            sources: vec![],
+        }
+    }
+}
+
+impl Harness {
+    /// An engine carrying the probe seam language plus the `vars` handle, as the
+    /// loader would build one with a protocol language installed.
+    fn seam_engine(&self) -> Arc<Engine> {
+        let mut engine = build_engine_with_languages(
+            &RhaiLimits::default(),
+            Duration::from_secs(5),
+            &[&ProbeLanguage],
+        )
+        .expect("the probe seam language installs");
+        VarsCapability.register(&mut engine, &self.services);
+        Arc::new(engine)
+    }
+
+    /// Run `script` as a step under a `CommandHost` declaring `frontend`.
+    fn run_step_as(
+        &self,
+        exec: &RhaiScriptExecutor,
+        script: &str,
+        vars: &mut aitm_poc::VarBindings,
+        frontend: Frontend,
+    ) -> Result<ScriptVerdict, ScriptStepError> {
+        let host = CommandHost::new(
+            self.store.as_ref(),
+            self.client.as_ref(),
+            self.guard.as_ref(),
+            None,
+        )
+        .with_frontend(frontend);
+        let mut step_results = BTreeMap::new();
+        let mut artifacts: Vec<PathBuf> = Vec::new();
+        let mut ctx = ScriptStepCtx {
+            vars,
+            host: &host,
+            step_results: &mut step_results,
+            artifacts: &mut artifacts,
+        };
+        let step = ScriptStep {
+            script: script.to_string(),
+            name: Some("s".to_string()),
+        };
+        exec.run_step(&step, &mut ctx)
+    }
+}
+
+/// AC5 (script face): a `script:` step in a PoC observes the `poc.run` frontend's
+/// trust via `ctx.caller()` — `Agent` for an MCP agent, `Operator` for the human
+/// CLI. AC3: the step boundary is seeded (never refused "no caller context").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_step_seeds_frontend_caller_trust() {
+    let h = Harness::new();
+    let exec = RhaiScriptExecutor::new(h.seam_engine(), h.services.clone());
+
+    let mut vars = aitm_poc::VarBindings::new();
+    let verdict = h
+        .run_step_as(
+            &exec,
+            r#"vars.set("seen", probe.trust()); return pass;"#,
+            &mut vars,
+            Frontend::Mcp,
+        )
+        .expect("an agent-frontend step runs (seeded), not refused for missing context");
+    assert_eq!(verdict, ScriptVerdict::Pass);
+    assert_eq!(str_var(&vars, "seen").as_deref(), Some("agent"));
+
+    let mut vars = aitm_poc::VarBindings::new();
+    h.run_step_as(
+        &exec,
+        r#"vars.set("seen", probe.trust()); return pass;"#,
+        &mut vars,
+        Frontend::Cli,
+    )
+    .expect("a CLI-frontend step runs");
+    assert_eq!(
+        str_var(&vars, "seen").as_deref(),
+        Some("operator"),
+        "the human CLI frontend must seed Operator, never leave the step agent"
+    );
 }

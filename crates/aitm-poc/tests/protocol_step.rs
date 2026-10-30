@@ -10,14 +10,16 @@
 //! steps**. One anchoring http step gives the run a captured flow, sent through
 //! a `PipelineClient` over a no-network sender; nothing listens on a port.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    Body, CommandHost, HeaderMap, HttpRequest, HttpResponse, HttpVersion, LimitConfig,
-    MemFlowStore, PipelineClient, RequestSender, ScopeEntry, ScopeRateGuard, StdGuard, Value,
+    Body, CallerTrust, CommandHost, Frontend, HeaderMap, HttpRequest, HttpResponse, HttpVersion,
+    LimitConfig, MemFlowStore, PipelineClient, RequestSender, ScopeEntry, ScopeRateGuard, StdGuard,
+    Value,
 };
-use aitm_plugin::language::PocStepHandler;
+use aitm_plugin::language::{HostError, PocStepHandler, PocStepInputs, PocStepOutcome};
 use aitm_poc::model::ProtoExtract;
 use aitm_poc::{Poc, PocRunResult, PocRunner, StdPocRunner, Step, VarBindings};
 use aitm_proto_test::TestStepHandler;
@@ -148,6 +150,102 @@ success:
         result.passed,
         "the `test:` step's binding + extracted source must satisfy success; outcomes: {:?}",
         result.evaluated
+    );
+}
+
+/// A stand-in native (`l4:`-style) step handler that does NOT go through rhai and
+/// so cannot read the thread-local seed: it echoes the caller trust the runner
+/// threaded into [`PocStepInputs::caller`] back out as a binding, so a test can
+/// assert the native PoC-step face carries the live frontend trust (spec AC5,
+/// Ruling A).
+struct CallerEchoHandler;
+
+impl PocStepHandler for CallerEchoHandler {
+    fn ns(&self) -> &str {
+        "caller"
+    }
+
+    fn run(
+        &self,
+        _body: &serde_yaml::Value,
+        inputs: &PocStepInputs,
+    ) -> Result<PocStepOutcome, HostError> {
+        let label = match inputs.caller {
+            CallerTrust::Operator => "operator",
+            CallerTrust::Agent => "agent",
+        };
+        let mut bindings = BTreeMap::new();
+        bindings.insert("caller_seen".to_string(), Value::Str(label.to_string()));
+        Ok(PocStepOutcome {
+            sources: BTreeMap::new(),
+            bindings,
+        })
+    }
+}
+
+/// Run a PoC with the `caller:` echo handler wired, under a chosen frontend, and
+/// return whether `success` (which asserts the echoed trust) passed.
+async fn run_caller_poc(success_dsl: &str, frontend: Frontend) -> bool {
+    let yaml = format!(
+        r#"
+id: caller-trust
+info:
+  name: caller trust
+  severity: low
+steps:
+  - http:
+      method: GET
+      url: "http://poc.test/"
+  - caller:
+      op: note
+success:
+  - dsl: '{success_dsl}'
+"#
+    );
+    let poc: Poc = serde_yaml::from_str(&yaml).expect("PoC parses");
+
+    let store = Arc::new(MemFlowStore::new());
+    let guard = Arc::new(StdGuard::new(LimitConfig::default()));
+    guard.add_scope(ScopeEntry {
+        host: "poc.test".to_string(),
+    });
+    let client = PipelineClient::new(store.clone(), guard.clone(), Arc::new(OkSender));
+    let host =
+        CommandHost::new(store.as_ref(), &client, guard.as_ref(), None).with_frontend(frontend);
+
+    let handler: Arc<dyn PocStepHandler> = Arc::new(CallerEchoHandler);
+    let runner = StdPocRunner::with_output_dir(std::env::temp_dir()).with_step_handler(handler);
+    runner
+        .run(&poc, VarBindings::new(), &host)
+        .await
+        .expect("run with the caller handler")
+        .passed
+}
+
+/// AC5 (native face): an `l4:`-style protocol step run through the runner carries
+/// the live `poc.run` frontend trust in `PocStepInputs.caller` — `Agent` for an
+/// MCP agent frontend, `Operator` for the human CLI — asserted end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protocol_step_carries_frontend_caller_trust() {
+    // An agent-driven run: the native step sees `Agent`.
+    assert!(
+        run_caller_poc(r#"caller_seen == "agent""#, Frontend::Mcp).await,
+        "an Mcp (agent) frontend must thread CallerTrust::Agent into PocStepInputs.caller"
+    );
+    assert!(
+        !run_caller_poc(r#"caller_seen == "operator""#, Frontend::Mcp).await,
+        "an agent run must NOT be seen as operator"
+    );
+
+    // A human CLI run: the native step sees `Operator`.
+    assert!(
+        run_caller_poc(r#"caller_seen == "operator""#, Frontend::Cli).await,
+        "the human CLI frontend must thread CallerTrust::Operator into PocStepInputs.caller"
+    );
+    // An operator-token MCP connection is also operator trust.
+    assert!(
+        run_caller_poc(r#"caller_seen == "operator""#, Frontend::Operator).await,
+        "an operator-token frontend must thread CallerTrust::Operator"
     );
 }
 

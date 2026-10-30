@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aitm_core::{
-    CommandHost, HttpFlow, HttpRequest, MemFlowStore, Params, ProxyClient, Registry, StdGuard,
-    Value,
+    CommandHost, Frontend, HttpFlow, HttpRequest, MemFlowStore, Params, ProxyClient, Registry,
+    StdGuard, Value,
 };
 use aitm_plugin_rhai::config::{RhaiConfig, RhaiLimits, ScriptEntry};
 use aitm_plugin_rhai::host_core::{MemoryFindingSink, ScriptServices};
@@ -162,4 +162,96 @@ async fn poc_step_reaches_vars_and_prelude_on_the_loader_engine() {
         Some(&Value::Str("yes".into())),
         "vars.set wrote back through the shared bindings",
     );
+}
+
+// ===========================================================================
+// Task 4 — L4 live on the PRODUCTION tier (`wire::build_with_languages`), gated
+// per call. Not a bespoke test engine: this is the exact builder the binary uses.
+// ===========================================================================
+
+/// Through the real `wire::build_with_languages` (what `main.rs` calls), an
+/// `L4Language` is installed live on the ONE shared engine and its `l4.*` host fns
+/// gate on the per-call caller trust the executor seeds from the `poc.run` frontend:
+/// an Agent `l4.send_recv` with the inject gate CLOSED is refused before the wire
+/// (socket-free), while a read verb runs for an Operator caller. Proves L4 scripting
+/// is production-live and per-call-gated end-to-end through the tier builder.
+#[tokio::test(flavor = "multi_thread")]
+async fn l4_is_live_on_the_production_tier_and_gated_per_call() {
+    use aitm_proto_l4::backend::pcap::PcapBackend;
+    use aitm_proto_l4::config::L4Config;
+    use aitm_proto_l4::flow::InMemoryL4FlowStore;
+    use aitm_proto_l4::guard::L4Guard;
+    use aitm_proto_l4::language::L4Language;
+
+    // Default L4 config ⇒ `allow_agent_inject` is false (deny-by-default).
+    let cfg = L4Config::default();
+    let lang = L4Language::new(
+        Arc::new(L4Guard::new(&cfg)),
+        Arc::new(PcapBackend::new()),
+        Arc::new(InMemoryL4FlowStore::new()),
+    );
+
+    let tier = wire::build_with_languages(config(vec![]), services(), &[&lang])
+        .expect("the scripting tier builds with l4 installed live");
+
+    let store = MemFlowStore::new();
+    let client = StubClient;
+    let guard = StdGuard::default();
+
+    // (1) Agent caller (default `Frontend::Mcp`): the closed inject gate refuses the
+    // live `l4.send_recv` before anything reaches the wire — socket-free.
+    {
+        let mut vars = VarBindings::new();
+        let mut step_results = BTreeMap::new();
+        let mut artifacts: Vec<PathBuf> = Vec::new();
+        let host = CommandHost::new(&store, &client, &guard, None);
+        let mut ctx = ScriptStepCtx {
+            vars: &mut vars,
+            host: &host,
+            step_results: &mut step_results,
+            artifacts: &mut artifacts,
+        };
+        let step = ScriptStep {
+            name: Some("l4probe".into()),
+            script: r#"
+                let spec = #{ layers: [ #{ ipv4: #{ dst: "127.0.0.1" } }, #{ udp: #{ dst_port: 9 } } ] };
+                l4.send_recv(spec, "127.0.0.1", "lo", 9, 50)
+            "#
+            .into(),
+        };
+        let err = tier
+            .executor
+            .run_step(&step, &mut ctx)
+            .expect_err("an Agent l4.send_recv is refused by the closed inject gate");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("disabled") && msg.contains("inject"),
+            "the Agent refusal names the disabled inject capability, got: {msg}"
+        );
+    }
+
+    // (2) Operator caller: a read verb (`l4.interfaces`) runs — the namespace is live
+    // and ungated verbs work regardless of trust.
+    {
+        let mut vars = VarBindings::new();
+        let mut step_results = BTreeMap::new();
+        let mut artifacts: Vec<PathBuf> = Vec::new();
+        let host =
+            CommandHost::new(&store, &client, &guard, None).with_frontend(Frontend::Operator);
+        let mut ctx = ScriptStepCtx {
+            vars: &mut vars,
+            host: &host,
+            step_results: &mut step_results,
+            artifacts: &mut artifacts,
+        };
+        let step = ScriptStep {
+            name: Some("ifaces".into()),
+            script: "l4.interfaces(); return pass;".into(),
+        };
+        let verdict = tier
+            .executor
+            .run_step(&step, &mut ctx)
+            .expect("the live l4.interfaces read verb runs for an Operator caller");
+        assert_eq!(verdict, ScriptVerdict::Pass);
+    }
 }

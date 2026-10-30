@@ -15,15 +15,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aitm_core::{HttpFlow, HttpRequest, MemFlowStore, ProxyClient, StdGuard, Value};
+use aitm_core::{CallerTrust, HttpFlow, HttpRequest, MemFlowStore, ProxyClient, StdGuard, Value};
 use aitm_plugin::language::{
-    GuardHandle, Guarded, HostError, HostFn, NamespaceCatalog, PocStepHandler, ProtocolLanguage,
-    RegisterError, ScriptHostRegistry,
+    GuardHandle, Guarded, HostCallCtx, HostError, HostFn, NamespaceCatalog, PocStepHandler,
+    ProtocolLanguage, RegisterError, ScriptHostRegistry,
 };
 use aitm_plugin_rhai::config::{RhaiConfig, RhaiLimits, ScriptEntry};
 use aitm_plugin_rhai::engine::build_engine_with_languages;
 use aitm_plugin_rhai::error::ScriptError;
 use aitm_plugin_rhai::host_core::{MemoryFindingSink, ScriptServices};
+use aitm_plugin_rhai::host_registry::seed_call_context;
 use aitm_plugin_rhai::loader::RhaiLoader;
 use aitm_proto_test::TestLanguage;
 use rhai::Engine;
@@ -39,6 +40,7 @@ fn engine_for(languages: &[&dyn ProtocolLanguage]) -> Engine {
 fn script_calls_test_ping_through_the_seam() {
     let lang = TestLanguage::new();
     let engine = engine_for(&[&lang]);
+    let _seed = seed_call_context(CallerTrust::Operator, None, None);
     let out: String = engine.eval("test.ping()").expect("ping evaluates");
     assert_eq!(out, "pong");
 }
@@ -49,6 +51,7 @@ fn script_calls_test_ping_through_the_seam() {
 fn effect_runs_when_guard_admits() {
     let lang = TestLanguage::with_effect_allowed(true);
     let engine = engine_for(&[&lang]);
+    let _seed = seed_call_context(CallerTrust::Operator, None, None);
     let out: String = engine.eval("test.effect()").expect("effect evaluates");
     assert_eq!(out, "effected");
 }
@@ -59,6 +62,7 @@ fn effect_runs_when_guard_admits() {
 fn effect_refused_when_guard_refuses() {
     let lang = TestLanguage::with_effect_allowed(false);
     let engine = engine_for(&[&lang]);
+    let _seed = seed_call_context(CallerTrust::Operator, None, None);
     let err = engine
         .eval::<String>("test.effect()")
         .expect_err("effect refused");
@@ -93,10 +97,233 @@ fn same_fn_name_in_two_namespaces_stays_namespaced() {
     let t = TestLanguage::new();
     let o = OtherLanguage;
     let engine = engine_for(&[&t, &o]);
+    let _seed = seed_call_context(CallerTrust::Operator, None, None);
     let from_test: String = engine.eval("test.ping()").expect("test.ping");
     let from_other: i64 = engine.eval("other.ping()").expect("other.ping");
     assert_eq!(from_test, "pong");
     assert_eq!(from_other, 42);
+}
+
+// ===========================================================================
+// Task 2 — per-eval caller context threads through `dispatch`, fail-closed when
+// unseeded (spec AC1 / AC3; plan Review Focus "nested seam call keeps the tag").
+// ===========================================================================
+
+/// AC1: a seam host fn reads `ctx.caller()`; on **one** engine, two evals seeded
+/// with different trust each observe their own — the context is per-invocation,
+/// not per-engine or build-time.
+#[test]
+fn seam_fn_reads_seeded_caller_trust_per_eval() {
+    let probe = ProbeLanguage;
+    let engine = engine_for(&[&probe]);
+
+    let as_agent: String = {
+        let _seed = seed_call_context(CallerTrust::Agent, None, None);
+        engine
+            .eval("probe.trust()")
+            .expect("probe.trust under an agent seed")
+    };
+    assert_eq!(as_agent, "agent");
+
+    let as_operator: String = {
+        let _seed = seed_call_context(CallerTrust::Operator, None, None);
+        engine
+            .eval("probe.trust()")
+            .expect("probe.trust under an operator seed")
+    };
+    assert_eq!(as_operator, "operator");
+}
+
+/// AC3 (fail-closed, its own verification): an eval that reaches a seam host fn
+/// with **no** seeded caller context is refused with a clear "no caller context"
+/// error, and the effect never runs.
+#[test]
+fn seam_fn_fails_closed_without_seeded_context() {
+    let probe = ProbeLanguage;
+    let engine = engine_for(&[&probe]);
+
+    // No `seed_call_context`: the eval reaches `probe.gated` with no context.
+    let err = engine
+        .eval::<String>("probe.gated()")
+        .expect_err("an unseeded seam call must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no caller context"),
+        "the refusal must name the missing caller context, got: {msg}"
+    );
+    // The effect never ran: `probe.gated` returns "ran" only once admitted.
+    assert!(
+        !msg.contains("ran"),
+        "fail-closed must refuse before the effect, got: {msg}"
+    );
+}
+
+/// AC3: the fail-closed path is **not** silently treated as `Operator`. The same
+/// `probe.gated` fn is guarded operator-only: seeded `Operator` it runs, seeded
+/// `Agent` it is refused by the guard, and **unseeded** it is refused *before*
+/// the guard — proving no operator default widens an un-seeded eval.
+#[test]
+fn unseeded_seam_call_is_not_treated_as_operator() {
+    let probe = ProbeLanguage;
+    let engine = engine_for(&[&probe]);
+
+    // Seeded operator: the operator-only guard admits; the effect runs.
+    let ran: String = {
+        let _seed = seed_call_context(CallerTrust::Operator, None, None);
+        engine
+            .eval("probe.gated()")
+            .expect("an operator seed admits the operator-only effect")
+    };
+    assert_eq!(ran, "ran");
+
+    // Seeded agent: the operator-only guard refuses (its own message).
+    {
+        let _seed = seed_call_context(CallerTrust::Agent, None, None);
+        let err = engine
+            .eval::<String>("probe.gated()")
+            .expect_err("an agent seed is refused by the operator-only guard");
+        assert!(
+            err.to_string().contains("operator-only"),
+            "the guard refusal must surface, got: {err}"
+        );
+    }
+
+    // Unseeded: refused before the guard — not run as an operator would be.
+    let err = engine
+        .eval::<String>("probe.gated()")
+        .expect_err("an unseeded operator-only call must still be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no caller context"),
+        "an unseeded call must fail closed, never default to Operator, got: {msg}"
+    );
+}
+
+/// Review Focus: the per-eval seed survives **nested** seam calls — a seam fn
+/// reached through nested Rhai function calls still sees the seeded trust and
+/// tag set once at the eval boundary.
+#[test]
+fn nested_seam_calls_keep_the_seeded_context() {
+    let probe = ProbeLanguage;
+    let engine = engine_for(&[&probe]);
+
+    // One seed for the whole eval; the seam fn sits two frames deep.
+    let _seed = seed_call_context(
+        CallerTrust::Operator,
+        Some(Value::Str("opts".to_string())),
+        None,
+    );
+
+    let trust: String = engine
+        .eval(
+            r#"
+            fn inner() { probe.trust() }
+            fn outer() { inner() }
+            outer()
+            "#,
+        )
+        .expect("nested probe.trust evaluates");
+    assert_eq!(trust, "operator", "the trust survives the nested calls");
+
+    let tag: String = engine
+        .eval(
+            r#"
+            fn inner() { probe.tag() }
+            fn outer() { inner() }
+            outer()
+            "#,
+        )
+        .expect("nested probe.tag evaluates");
+    assert_eq!(tag, "opts", "the seeded tag survives the nested calls");
+}
+
+/// An inline language whose fns read the per-invocation [`HostCallCtx`]:
+/// `probe.trust()` returns the caller trust, `probe.tag()` the seeded tag, and
+/// `probe.gated()` is guarded operator-only (for the fail-closed proofs).
+struct ProbeLanguage;
+
+/// A guard that admits every call (for the context-reading probes).
+struct AdmitGuard;
+
+impl GuardHandle for AdmitGuard {
+    fn guard_name(&self) -> &str {
+        "probe"
+    }
+
+    fn permit(&self, _ctx: &HostCallCtx, _fn_name: &str) -> Result<(), HostError> {
+        Ok(())
+    }
+}
+
+/// A guard that admits only an [`CallerTrust::Operator`] caller — so an eval that
+/// is wrongly treated as an operator would be *admitted*; fail-closed must refuse
+/// it before this guard is even consulted.
+struct OperatorOnlyGuard;
+
+impl GuardHandle for OperatorOnlyGuard {
+    fn guard_name(&self) -> &str {
+        "probe"
+    }
+
+    fn permit(&self, ctx: &HostCallCtx, fn_name: &str) -> Result<(), HostError> {
+        match ctx.caller() {
+            CallerTrust::Operator => Ok(()),
+            CallerTrust::Agent => Err(HostError::GuardRefused {
+                namespace: "probe".to_string(),
+                reason: format!("`{fn_name}` is operator-only"),
+            }),
+        }
+    }
+}
+
+/// The caller trust as the probe surfaces it to a script.
+fn caller_label(ctx: &HostCallCtx) -> String {
+    match ctx.caller() {
+        CallerTrust::Operator => "operator".to_string(),
+        CallerTrust::Agent => "agent".to_string(),
+    }
+}
+
+impl ProtocolLanguage for ProbeLanguage {
+    fn namespace(&self) -> &str {
+        "probe"
+    }
+
+    fn api_version(&self) -> &str {
+        "1"
+    }
+
+    fn register_host_fns(&self, reg: &mut dyn ScriptHostRegistry) -> Result<(), RegisterError> {
+        let trust: HostFn =
+            Box::new(|ctx: &HostCallCtx, _args: &[Value]| Ok(Value::Str(caller_label(ctx))));
+        reg.register("probe", "trust", Guarded::new(Box::new(AdmitGuard), trust))?;
+
+        let tag: HostFn =
+            Box::new(|ctx: &HostCallCtx, _args: &[Value]| Ok(ctx.tag().unwrap_or(Value::Null)));
+        reg.register("probe", "tag", Guarded::new(Box::new(AdmitGuard), tag))?;
+
+        let gated: HostFn =
+            Box::new(|_ctx: &HostCallCtx, _args: &[Value]| Ok(Value::Str("ran".to_string())));
+        reg.register(
+            "probe",
+            "gated",
+            Guarded::new(Box::new(OperatorOnlyGuard), gated),
+        )
+    }
+
+    fn poc_step(&self) -> Option<Box<dyn PocStepHandler>> {
+        None
+    }
+
+    fn catalog(&self) -> NamespaceCatalog {
+        NamespaceCatalog {
+            namespace: "probe".to_string(),
+            api_version: "1".to_string(),
+            host_fns: vec![],
+            poc_step: None,
+            sources: vec![],
+        }
+    }
 }
 
 /// A second inline language with its own namespace and a same-named `ping` fn.
@@ -110,7 +337,7 @@ impl GuardHandle for AllowGuard {
         "other"
     }
 
-    fn permit(&self, _fn_name: &str) -> Result<(), HostError> {
+    fn permit(&self, _ctx: &HostCallCtx, _fn_name: &str) -> Result<(), HostError> {
         Ok(())
     }
 }
@@ -125,7 +352,7 @@ impl ProtocolLanguage for OtherLanguage {
     }
 
     fn register_host_fns(&self, reg: &mut dyn ScriptHostRegistry) -> Result<(), RegisterError> {
-        let ping: HostFn = Box::new(|_args: &[Value]| Ok(Value::Int(42)));
+        let ping: HostFn = Box::new(|_ctx: &HostCallCtx, _args: &[Value]| Ok(Value::Int(42)));
         reg.register("other", "ping", Guarded::new(Box::new(AllowGuard), ping))
     }
 
@@ -248,6 +475,7 @@ async fn seam_namespace_api_version_gates_scripts() {
     loader
         .load_one(&ScriptEntry::new(modern.path()))
         .expect("an API-2 script meets the seam namespace version and loads");
+    let _seed = seed_call_context(CallerTrust::Operator, None, None);
     let pong: String = loader
         .engine()
         .eval("test.ping()")
