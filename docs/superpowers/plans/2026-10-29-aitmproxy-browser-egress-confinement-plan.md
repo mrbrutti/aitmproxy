@@ -1,6 +1,6 @@
 # Browser scope-confined egress mode implementation plan
 
-**Status:** draft
+**Status:** approved (2026-10-29 by Matt)
 **Spec:** `docs/superpowers/specs/2026-10-29-aitmproxy-browser-egress-confinement-design.md`
 **Branch / worktree:** `feat/browser-egress-confinement`
 

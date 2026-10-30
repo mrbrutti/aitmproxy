@@ -1,6 +1,6 @@
 # Browser scope-confined egress mode design
 
-**Status:** draft
+**Status:** approved (2026-10-29 by Matt)
 **Research inputs:** scanner security-panel finding **S2** (PR #67 review);
 `docs/superpowers/specs/2026-10-29-aitmproxy-scanner-plugin-design.md`
 (anti-goal: *"a scanner that touches an out-of-scope host, from any caller … the

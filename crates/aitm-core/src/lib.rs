@@ -13,6 +13,7 @@ pub mod client;
 pub mod command;
 pub mod config;
 pub mod ctx;
+pub mod egress;
 pub mod error;
 pub mod event;
 pub mod flow;
@@ -46,6 +47,7 @@ pub use ctx::{
     BrowserDriver, CallerTrust, ClickTarget, CommandHost, FindingDraft, FindingRecorder, FlowCtx,
     Frontend, NavOutcome, ProxyClient,
 };
+pub use egress::{ConfinementToken, EgressConfinement};
 pub use error::{FlowError, GuardError};
 pub use event::{Event, Verdict};
 pub use flow::{
