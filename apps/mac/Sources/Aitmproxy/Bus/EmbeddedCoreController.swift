@@ -86,6 +86,19 @@ final class EmbeddedCoreController {
         Task { [core] in await core.stop() }
     }
 
+    /// Restart the embedded core in place so Settings ▸ Proxy edits (listen port,
+    /// upstream-TLS verification) take effect: stop the child and spawn a fresh one,
+    /// which re-reads those settings. The event pump keeps running, so status flows
+    /// stopped → starting → ready. Starts a stopped core instead of nothing.
+    func restart() {
+        guard isRunning else { start(); return }
+        update { $0.status = .starting }
+        Task { [core] in
+            await core.stop()
+            await core.start()
+        }
+    }
+
     /// Arm the quit teardown once, for the controller's lifetime, so an
     /// embedded→external→embedded cycle never stacks observers.
     private func armTerminateObserver() {

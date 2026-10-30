@@ -25,6 +25,7 @@ struct SettingsView: View {
             switch tab {
             case .general: GeneralSettings()
             case .bus: BusSettings()
+            case .proxy: ProxySettings()
             case .appearance: AppearanceSettings()
             }
         }
@@ -36,7 +37,7 @@ struct SettingsView: View {
 
 /// The Settings tabs. Snapshot mode walks through every case.
 enum SettingsTab: String, CaseIterable, Identifiable {
-    case general, bus, appearance
+    case general, bus, proxy, appearance
 
     var id: String { rawValue }
 
@@ -44,6 +45,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         switch self {
         case .general: "General"
         case .bus: "Bus"
+        case .proxy: "Proxy"
         case .appearance: "Appearance"
         }
     }
@@ -52,6 +54,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         switch self {
         case .general: "gearshape"
         case .bus: "network"
+        case .proxy: "lock.shield"
         case .appearance: "paintpalette"
         }
     }
@@ -137,6 +140,42 @@ struct BusSettings: View {
                 reconnect (Proxy ▸ Reconnect Bus, ⌃⌘R) to apply it. The role the bus assigns is \
                 shown in the status bar, with a warning when it differs from the expected role.
                 """)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// Settings ▸ Proxy: the embedded core's editable config — the proxy listen port and
+/// upstream TLS verification. Changes persist to UserDefaults and apply when the bundled
+/// core restarts (EmbeddedCore re-reads them each spawn). An external core is governed by
+/// its own config.yaml, so the controls are read-only then.
+struct ProxySettings: View {
+    @Environment(Session.self) private var session
+    @AppStorage(UserDefaultsActiveKindPersistence.key) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
+    @AppStorage("proxy.preferredPort") private var port = 8080
+    @AppStorage("proxy.verifyUpstreamTLS") private var verifyTLS = true
+
+    private var usesEmbedded: Bool { (ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded) == .embedded }
+
+    var body: some View {
+        @Bindable var session = session
+        Section("Embedded proxy") {
+            TextField("Listen port", value: $port, format: .number.grouping(.never))
+            Toggle("Verify upstream TLS", isOn: $verifyTLS)
+            if !verifyTLS {
+                Text("Disabling TLS verification lets the proxy trust any upstream certificate. Use it only to reach a server with a self-signed or mismatched cert — never on an untrusted network.")
+                    .font(.callout)
+                    .foregroundStyle(Tok.Status.serverError.color)
+            }
+        }
+        .disabled(!usesEmbedded)
+        Section {
+            Button("Apply & Restart Core") { session.restartCoreTick += 1 }
+                .disabled(!usesEmbedded)
+            Text(usesEmbedded
+                 ? "The bundled core restarts to apply these — the proxy and bus briefly drop and rebind. If the chosen port is taken, the core picks a free one and the toolbar shows the real address."
+                 : "The active core is external; its port and TLS come from the config.yaml it was launched with. Switch to the embedded core in Bus to manage them here.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }

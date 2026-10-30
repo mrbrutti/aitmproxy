@@ -73,6 +73,7 @@ struct ShellView: View {
         .toolbar { ShellToolbar(sidebarVisible: $session.sidebarVisible) }
         .onChange(of: session.detachRequestTick) { openWindow(id: "inspector") }
         .onChange(of: session.reconnectTick) { bus?.start() }
+        .onChange(of: session.restartCoreTick) { embeddedCore?.restart() }
         .task {
             session.attachActivityHooks()
             if session.layout == .detached { openWindow(id: "inspector") }
