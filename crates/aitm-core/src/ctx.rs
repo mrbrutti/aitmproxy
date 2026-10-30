@@ -59,18 +59,30 @@ pub trait BrowserDriver: Send + Sync {
 /// Classify the new variant in exactly two places, both in `aitm-core`:
 /// `CallerTrust::from` (this file, its trust class) and `origin_label`
 /// (`audit.rs`, its wire label). Both are wildcard-free matches, so `aitm-core`
-/// does not build until you do.
+/// does not build until you do. That covers classification only; for a variant
+/// that is a human surface, see the `Operator` routing note below.
 ///
 /// Every trust gate in the workspace derives from the one predicate
 /// [`CallerTrust::is_trusted_control`], reached through
 /// [`Frontend::is_trusted_control`] or [`CommandHost::caller_is_trusted_control`],
-/// so classifying the variant once is enough: no gate crate needs an edit. If
+/// so classifying the variant once is enough: no trust gate needs an edit. If
 /// `CallerTrust` itself grows a variant, `is_trusted_control` is the single place
-/// to classify it. Never compare a `Frontend` with `==` or `!=` to decide trust: a
-/// comparison against the agent role is a deny-list that fails open for a variant
-/// added later, and the compiler cannot exhaustiveness-check it. The source scan
-/// `crates/aitm-core/tests/trust_gate_scan.rs` rejects any such `==` or `!=`
-/// comparison of a role in any `crates/*/src` file.
+/// to classify it. Never compare a `Frontend` against the agent role
+/// (`Frontend::Mcp`, `CallerTrust::Agent`) with `==` or `!=` to decide trust: that
+/// is a deny-list that fails open for a variant added later, and the compiler
+/// cannot exhaustiveness-check it. The source scan
+/// `crates/aitm-core/tests/trust_gate_scan.rs` rejects an `==`, `!=`, `matches!` or
+/// `if let` comparison against the agent role in any `crates/*/src` file. It does
+/// not flag a Cli-only `!= Frontend::Cli` gate: that one is legitimate, because it
+/// fails closed for every variant added later.
+///
+/// Classification is not routing. `aitm-mcp` also keys on [`Frontend::Operator`]
+/// itself: the D4 confirm handshake (`conn.role == Frontend::Operator`),
+/// `any_role(Frontend::Operator)` in `park_for_approval` and
+/// `fanout_role(Frontend::Operator, ..)` (all in `crates/aitm-mcp/src/server.rs`;
+/// find them by symbol, line numbers move). A new variant classified as
+/// [`CallerTrust::Operator`] passes every trust gate but does not get the confirm
+/// handshake or approval routing unless those sites are updated too.
 ///
 /// Label-only sites (`role_str` in `aitm-mcp`, `frontend_label` in `aitm-ca`,
 /// `origin_str` in `aitm-findings`) map an unclassified variant to the agent label
@@ -171,6 +183,10 @@ impl CallerTrust {
     /// allow-list: a wildcard-free `match`, so adding a `CallerTrust` variant does
     /// not compile until it is classified here, and nothing is trusted by default.
     #[must_use]
+    #[deny(
+        clippy::wildcard_enum_match_arm,
+        clippy::match_wildcard_for_single_variants
+    )]
     pub fn is_trusted_control(self) -> bool {
         match self {
             CallerTrust::Operator => true,
@@ -192,6 +208,10 @@ impl From<Frontend> for CallerTrust {
     /// until it is placed in this table. Default a new variant to
     /// [`CallerTrust::Agent`]; map it to [`CallerTrust::Operator`] only when a
     /// present human is behind every connection of that kind.
+    #[deny(
+        clippy::wildcard_enum_match_arm,
+        clippy::match_wildcard_for_single_variants
+    )]
     fn from(frontend: Frontend) -> Self {
         match frontend {
             Frontend::Mcp => CallerTrust::Agent,
@@ -458,19 +478,22 @@ fn set_intercept(flow: &mut Flow, state: InterceptState) {
     }
 }
 
+/// A `ProxyClient` that is never called: the one shared stub for this file's
+/// test modules, which only need a `CommandHost` to exist.
+#[cfg(test)]
+struct NoopClient;
+#[cfg(test)]
+impl ProxyClient for NoopClient {
+    fn send(&self, _req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+        Box::pin(async { anyhow::bail!("NoopClient: send not supported in this test") })
+    }
+}
+
 #[cfg(test)]
 mod finding_recorder_tests {
     use super::*;
     use crate::guard::StdGuard;
     use crate::store::MemFlowStore;
-
-    /// A `ProxyClient` that is never called in these tests.
-    struct NoopClient;
-    impl ProxyClient for NoopClient {
-        fn send(&self, _req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
-            Box::pin(async { anyhow::bail!("NoopClient: send not supported in this test") })
-        }
-    }
 
     /// A recorder that asserts on the draft it is given and returns a fixed id.
     struct StubRecorder;
@@ -524,35 +547,21 @@ mod finding_recorder_tests {
 ///
 /// These live in `aitm-core/src` (not `tests/`) on purpose: `Frontend` is
 /// `#[non_exhaustive]`, so a wildcard-free `match` over it compiles only inside
-/// this crate. Adding a variant to either enum therefore breaks this module's
-/// build until its expected trust is stated here too.
+/// this crate. Adding a `Frontend` variant therefore breaks this module's build
+/// until its expected trust is stated in `expected_trusted`; a new `CallerTrust`
+/// variant already breaks the wildcard-free match in
+/// [`CallerTrust::is_trusted_control`] itself.
 #[cfg(test)]
 mod trust_tests {
     use super::*;
     use crate::guard::StdGuard;
     use crate::store::MemFlowStore;
 
-    /// A `ProxyClient` that is never called in these tests.
-    struct StubClient;
-    impl ProxyClient for StubClient {
-        fn send(&self, _req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
-            Box::pin(async { anyhow::bail!("StubClient: send not supported in this test") })
-        }
-    }
-
     /// The expected trust of each `Frontend`, wildcard-free on purpose.
     fn expected_trusted(f: Frontend) -> bool {
         match f {
             Frontend::Cli | Frontend::Operator => true,
             Frontend::Mcp => false,
-        }
-    }
-
-    /// The expected trust of each `CallerTrust`, wildcard-free on purpose.
-    fn expected_trusted_for_trust(t: CallerTrust) -> bool {
-        match t {
-            CallerTrust::Operator => true,
-            CallerTrust::Agent => false,
         }
     }
 
@@ -588,18 +597,13 @@ mod trust_tests {
                 CallerTrust::from(f).is_trusted_control(),
                 "Frontend::is_trusted_control must delegate to CallerTrust for {f:?}"
             );
-            assert_eq!(
-                CallerTrust::from(f).is_trusted_control(),
-                expected_trusted_for_trust(CallerTrust::from(f)),
-                "CallerTrust::is_trusted_control disagrees with the pinned table for {f:?}"
-            );
         }
     }
 
     #[test]
     fn command_host_caller_is_trusted_control_follows_frontend() {
         let store = MemFlowStore::new();
-        let client = StubClient;
+        let client = NoopClient;
         let guard = StdGuard::default();
 
         // A host never given a frontend defaults to Frontend::Mcp: untrusted.

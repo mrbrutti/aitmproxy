@@ -22,8 +22,9 @@
 //! 1. The **agent gate** (`l4.allow_agent_*`) is enforced here, in
 //!    [`agent_gate_check`], exactly as the command path's
 //!    [`L4AgentGate`](crate::commands) enforces it — but only when **this call's
-//!    live caller trust** is [`Agent`](aitm_core::CallerTrust::Agent)
-//!    (`Frontend::Mcp`), never for an operator caller. The trust is read per call
+//!    live caller** is untrusted (an agent: a caller `Frontend::is_trusted_control`
+//!    does not trust, today [`Agent`](aitm_core::CallerTrust::Agent) /
+//!    `Frontend::Mcp`), never for a trusted-control caller. The trust is read per call
 //!    (`HostCallCtx::caller()` for the Rhai face, `PocStepInputs::caller` for the
 //!    `l4:` step), so the one shared engine gates each invocation on its real
 //!    caller rather than any build-time snapshot.

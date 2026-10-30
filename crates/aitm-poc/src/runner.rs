@@ -1102,9 +1102,8 @@ fn run_poc_command(
 ) -> anyhow::Result<Value> {
     // T3: an untrusted (agent) caller may run `poc.run` only when the operator
     // opted in via `poc.allow_agent_run`. A trusted-control caller (`Cli`,
-    // `Operator`) is never gated. The role is decided by the shared
-    // `CommandHost::caller_is_trusted_control`, so a new frontend variant is gated
-    // by default. Deny-by-default (mirrors scope.add / ca.install).
+    // `Operator`) is never gated: see `CommandHost::caller_is_trusted_control`.
+    // Deny-by-default (mirrors scope.add / ca.install).
     if !host.caller_is_trusted_control()
         && !host
             .config()

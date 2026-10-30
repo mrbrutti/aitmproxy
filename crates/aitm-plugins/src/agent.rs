@@ -181,8 +181,7 @@ impl Command for AgentSet {
         // Operator/CLI only. The policy gate already refuses this for the agent
         // under most policies, but `All` would let it through — so the command
         // self-gates too: the agent can never change its own policy. Only a trusted
-        // control role passes (`caller_is_trusted_control`, an allow-list), so a
-        // frontend added later is refused until it is classified.
+        // control role passes: see `CommandHost::caller_is_trusted_control`.
         if !host.caller_is_trusted_control() {
             bail!(
                 "agent.set refused: the agent cannot change its own policy; only an operator or \
@@ -330,9 +329,8 @@ impl Command for AgentApprove {
     }
 
     fn invoke(&self, _args: Params, host: &CommandHost) -> anyhow::Result<Value> {
-        // Only a trusted control role (operator or CLI) may even reach the fallback;
-        // `caller_is_trusted_control` is an allow-list, so an unclassified frontend
-        // is refused like the agent.
+        // Only a trusted control role (operator or CLI) may even reach the fallback:
+        // see `CommandHost::caller_is_trusted_control`.
         if !host.caller_is_trusted_control() {
             bail!(
                 "agent.approve refused: the agent cannot approve its own requests; only an \

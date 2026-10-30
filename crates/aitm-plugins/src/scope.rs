@@ -86,8 +86,7 @@ impl Command for ScopeAdd {
         // agent frontend (MCP) unless the operator opted in (mirrors ca.install).
         // A present human — the CLI or an operator-token connection
         // (`Frontend::Operator`, e.g. the mac/web/tui surfaces) — may always widen:
-        // `caller_is_trusted_control` is the one allow-list of those roles, so a
-        // frontend added later is gated until it is classified.
+        // see `CommandHost::caller_is_trusted_control`.
         if !host.caller_is_trusted_control() && !self.allow_agent_widen {
             anyhow::bail!(
                 "scope.add refused: widening scope from an agent frontend is disabled. Set \

@@ -35,9 +35,10 @@
 //!   `Sensitive`.
 //!
 //! **Agent gating.** `save`, `reload`, `enable` and `disable` are `Sensitive`
-//! (so `AgentPolicy` parks them under Ask) and additionally refuse a
-//! `Frontend::Mcp` caller unless `rhai.allow_agent_authoring` is set; the
-//! human CLI and an operator connection are never gated by the flag.
+//! (so `AgentPolicy` parks them under Ask) and additionally refuse an untrusted
+//! (agent) caller, any caller `Frontend::is_trusted_control` does not trust, unless
+//! `rhai.allow_agent_authoring` is set; the human CLI and an operator connection
+//! are never gated by the flag.
 //! `list`, `validate` and `findings` are `Read` and never gated.
 
 use std::collections::BTreeMap;

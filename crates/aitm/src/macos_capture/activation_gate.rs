@@ -3,8 +3,9 @@
 //! Installing or activating the `NETransparentProxyProvider` system extension is
 //! a privileged, human-present action. Mirroring the deny-by-default posture of
 //! `ca.allow_agent_install` (`crates/aitm-core/src/config.rs`) and
-//! `l4.allow_agent_widen` (`crates/aitm-proto-l4/src/config.rs`), the agent
-//! frontend (`Frontend::Mcp`) is refused unless the operator explicitly sets
+//! `l4.allow_agent_widen` (`crates/aitm-proto-l4/src/config.rs`), an untrusted
+//! (agent) caller, any origin `Frontend::is_trusted_control` does not trust, is
+//! refused unless the operator explicitly sets
 //! [`SysexActivationConfig::allow_agent_sysex_install`].
 
 use std::fmt;
@@ -17,10 +18,10 @@ use aitm_core::Frontend;
 /// defaults to `false`: deny-by-default, exactly like `ca.allow_agent_install`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SysexActivationConfig {
-    /// Allow the agent frontend (`Frontend::Mcp`) to trigger the sysex
-    /// install/activation. **Default false** — installing a system extension is
-    /// an operator action, so an agent must never reach it unless a human
-    /// operator opts in.
+    /// Allow an untrusted (agent) caller, any origin `Frontend::is_trusted_control`
+    /// does not trust, to trigger the sysex install/activation. **Default false**
+    /// — installing a system extension is an operator action, so an agent must
+    /// never reach it unless a human operator opts in.
     pub allow_agent_sysex_install: bool,
 }
 
@@ -56,8 +57,8 @@ impl std::error::Error for ActivationRefused {}
 /// trigger the operator action; every other origin is treated as agent-driven
 /// and refused unless the operator has set
 /// [`SysexActivationConfig::allow_agent_sysex_install`]. Deny-by-default: a new
-/// origin is classified as an agent in `aitm-core`, so it is never silently
-/// allowed through.
+/// origin must be classified in `aitm-core` (default: agent), so it is never
+/// silently allowed through.
 pub fn check_activation_caller(
     origin: Frontend,
     cfg: &SysexActivationConfig,
