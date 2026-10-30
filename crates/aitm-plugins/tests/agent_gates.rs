@@ -139,3 +139,76 @@ fn agent_approve_command_refuses_the_agent_and_lets_humans_reach_the_fallback() 
         assert_eq!(err.to_string(), fallback, "frontend {frontend:?}");
     }
 }
+
+/// The role gate runs before any argument is read: the agent gets the role refusal
+/// for a missing, malformed or unknown argument (and the policy stays put), while a
+/// trusted caller with the same bad input gets the command's own argument error and
+/// never the role refusal.
+#[test]
+fn agent_set_gate_precedes_argument_validation() {
+    let state = Arc::new(AgentState::new(AgentPolicy::Auto));
+    let reg = agent_registry(&state);
+    let refusal = "agent.set refused: the agent cannot change its own policy; only an operator or \
+                   the human CLI may set it.";
+
+    let bad_calls: [(&str, Params, &str); 3] = [
+        (
+            "no policy param",
+            params(&[]),
+            "missing required param `policy`",
+        ),
+        (
+            "unknown policy",
+            params(&[("policy", Value::Str("bogus".into()))]),
+            "unknown policy `bogus`; expected all | auto | ask | readonly | paused",
+        ),
+        (
+            "non-string policy",
+            params(&[("policy", Value::Int(1))]),
+            "param `policy` must be a string, got Int(1)",
+        ),
+    ];
+    for (what, args, own_error) in bad_calls {
+        let err = invoke_as(&reg, "agent.set", args.clone(), Frontend::Mcp)
+            .expect_err("the agent is refused before its arguments are read");
+        assert_eq!(err.to_string(), refusal, "agent with {what}");
+
+        for frontend in [Frontend::Operator, Frontend::Cli] {
+            let err = invoke_as(&reg, "agent.set", args.clone(), frontend)
+                .expect_err("a bad argument is rejected for a trusted caller");
+            assert_eq!(err.to_string(), own_error, "{frontend:?} with {what}");
+        }
+    }
+    assert_eq!(
+        state.policy(),
+        AgentPolicy::Auto,
+        "no refused or rejected agent.set changed the policy"
+    );
+}
+
+/// `agent.approve` ignores its arguments, so the role gate must decide on the role
+/// alone: the agent is refused even with no arguments at all, and a trusted caller
+/// with no arguments still reaches the fallback.
+#[test]
+fn agent_approve_gate_decides_on_the_role_alone() {
+    let state = Arc::new(AgentState::new(AgentPolicy::All));
+    let reg = agent_registry(&state);
+
+    let err = invoke_as(&reg, "agent.approve", params(&[]), Frontend::Mcp)
+        .expect_err("the agent is refused with no arguments");
+    assert_eq!(
+        err.to_string(),
+        "agent.approve refused: the agent cannot approve its own requests; only an operator or \
+         the human CLI may approve a parked sensitive command."
+    );
+    for frontend in [Frontend::Operator, Frontend::Cli] {
+        let err = invoke_as(&reg, "agent.approve", params(&[]), frontend)
+            .expect_err("the in-process fallback always refuses");
+        assert_eq!(
+            err.to_string(),
+            "agent.approve is resolved by the MCP server against its parked-request table; it \
+             cannot be invoked in this context.",
+            "frontend {frontend:?}"
+        );
+    }
+}

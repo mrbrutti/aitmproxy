@@ -480,3 +480,124 @@ fn scan_is_not_vacuous() {
         "aitm-core/src/ctx.rs is not among the scanned files"
     );
 }
+
+/// `scan_is_not_vacuous` proves the walk reads top-level `src/*.rs`; this proves it
+/// also reaches gate files that live in nested directories, so a walker that
+/// stopped recursing could not shrink the scan to the top level and still pass.
+#[test]
+fn scan_reaches_nested_gate_files() {
+    let files = rust_sources(&crates_dir());
+    for nested in [
+        "aitm-proto-l4/src/commands/agent.rs",
+        "aitm/src/macos_capture/activation_gate.rs",
+    ] {
+        assert!(
+            files.iter().any(|p| p.ends_with(nested)),
+            "{nested} (a nested gate file) is not among the scanned files"
+        );
+    }
+}
+
+/// A throwaway `crates/` tree under the system temp dir, removed on drop.
+struct FixtureTree(PathBuf);
+
+impl FixtureTree {
+    fn new(tag: &str) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "aitm-trust-scan-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        fs::create_dir_all(&root).expect("create fixture root");
+        Self(root)
+    }
+
+    fn write(&self, rel: &str, body: &str) {
+        let path = self.0.join(rel);
+        fs::create_dir_all(path.parent().expect("fixture file has a parent"))
+            .expect("create fixture dir");
+        fs::write(&path, body).expect("write fixture file");
+    }
+}
+
+impl Drop for FixtureTree {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The walker, over a fixture `crates/` tree: it descends into nested `src/`
+/// directories, picks up only `*.rs`, and ignores `tests/`, `benches/`, a
+/// Cargo.toml, a stray file directly under `crates/`, and a crate with no `src/`.
+#[test]
+fn rust_sources_walks_nested_src_only() {
+    let tree = FixtureTree::new("walk");
+    tree.write("a/src/lib.rs", "");
+    tree.write("a/src/deep/er/x.rs", "");
+    tree.write("a/src/notes.txt", "");
+    tree.write("a/tests/t.rs", "");
+    tree.write("a/benches/b.rs", "");
+    tree.write("a/Cargo.toml", "");
+    tree.write("b/src/y.rs", "");
+    tree.write("c/README.md", "");
+    tree.write("stray.rs", "");
+
+    let rel: Vec<String> = rust_sources(&tree.0)
+        .iter()
+        .map(|p| {
+            p.strip_prefix(&tree.0)
+                .expect("under the fixture root")
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    assert_eq!(
+        rel,
+        vec![
+            "a/src/deep/er/x.rs".to_string(),
+            "a/src/lib.rs".to_string(),
+            "b/src/y.rs".to_string()
+        ]
+    );
+}
+
+/// End to end on a fixture tree: a deny-list gate re-introduced in a nested `src/`
+/// file is reported with its file and line, a migrated gate next to it is not, and
+/// a deny-list shape that appears only under `tests/` is out of scope.
+#[test]
+fn a_reintroduced_deny_list_gate_is_found_with_file_and_line() {
+    let tree = FixtureTree::new("probe");
+    tree.write(
+        "probe/src/deep/gate.rs",
+        "fn migrated(h: &CommandHost) -> bool { !h.caller_is_trusted_control() }\n\
+         \n\
+         fn probe(h: &CommandHost) -> bool {\n    h.frontend() == Frontend::Mcp\n}\n",
+    );
+    tree.write(
+        "probe/tests/not_scanned.rs",
+        "fn t(h: &CommandHost) -> bool { h.frontend() == Frontend::Mcp }\n",
+    );
+
+    let mut found: Vec<(String, usize, String)> = Vec::new();
+    for path in rust_sources(&tree.0) {
+        let src = fs::read_to_string(&path).expect("read fixture source");
+        let rel = path
+            .strip_prefix(&tree.0)
+            .expect("under the fixture root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        for (line, snippet) in deny_list_hits(&src) {
+            found.push((rel.clone(), line, snippet));
+        }
+    }
+    assert_eq!(
+        found,
+        vec![(
+            "probe/src/deep/gate.rs".to_string(),
+            4,
+            "== Frontend::Mcp".to_string()
+        )]
+    );
+}
