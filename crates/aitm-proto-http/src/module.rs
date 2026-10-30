@@ -522,9 +522,10 @@ async fn serve(
     let mut machine = Http1Machine::new();
     let mut buf = vec![0u8; READ_CHUNK];
     let mut current_authority: Option<String> = conn.tunnel_authority.clone();
-    // Set when the origin sent bytes after a completed response. The framing of
-    // that connection can no longer be trusted, so the next request must not
-    // ride it; it is replaced through the same path as a closed upstream.
+    // Set when the origin sent bytes after a completed response on a connection
+    // that stays open (one that closes anyway needs no replacing). The framing of
+    // that upstream can no longer be trusted, so the next request must not ride
+    // it; it is replaced through the same path as a closed upstream.
     let mut upstream_tainted = false;
 
     loop {
@@ -750,8 +751,17 @@ async fn serve(
                     }
                     (tunnel.clone(), tunnel.clone(), addr)
                 }
+                // A tunnel with no resolved address cannot say where it goes.
+                // Falling through to the request's `Host` would let it choose
+                // the upstream, so refuse instead. No constructor builds this
+                // state; this arm keeps a later edit from reaching it silently.
+                (Some(_), None) => {
+                    bail!(
+                        "tunnel has no resolved CONNECT address; refusing to dial the request Host"
+                    )
+                }
                 // Forward proxy: the request's own authority is the route.
-                _ => {
+                (None, _) => {
                     let target = Target::resolve(&request.authority, 80).await?;
                     (request.authority.clone(), target.authority(), target.addr)
                 }
@@ -897,12 +907,23 @@ async fn serve(
             let upstream_io: ByteStream = Box::pin(Prefixed::with_prefix(upstream_io, server_rest));
             return ctx.handoff_upgrade(client_io, upstream_io, id, hint).await;
         }
-        // The response is complete and already forwarded. The machine parses no
-        // response while no request awaits one, so whatever the origin sent
-        // behind it is still in the machine's buffer, unparsed. Drop it (never
-        // log it) and mark the connection tainted: those bytes are not an answer
-        // to anything, and a partial head left in the buffer would otherwise be
-        // glued onto the next response on this connection.
+        // The response is complete and already forwarded. When either side said
+        // `Connection: close` the client connection ends here and the upstream
+        // goes with it; whatever the origin sent behind the response is dropped
+        // with them (it never reaches the client), so there is nothing to
+        // replace and nothing to log.
+        if request_close || response_close {
+            let _ = client.shutdown().await;
+            return Ok(());
+        }
+        // The connection stays open and the upstream is meant to be reused. The
+        // machine parses no response while no request awaits one, so whatever the
+        // origin sent behind this response is still in the machine's buffer,
+        // unparsed. Drop it (never log it) and mark the upstream tainted: those
+        // bytes are not an answer to anything, and a partial head left in the
+        // buffer would otherwise be glued onto the next response on this
+        // connection. Only this path warns, because only here is an upstream
+        // replaced.
         let surplus = machine.take_leftover(Side::Server);
         if !surplus.is_empty() {
             tracing::warn!(
@@ -911,10 +932,6 @@ async fn serve(
                 "origin sent bytes after a completed response; discarding them and replacing the upstream connection"
             );
             upstream_tainted = true;
-        }
-        if request_close || response_close {
-            let _ = client.shutdown().await;
-            return Ok(());
         }
     }
 }
@@ -3018,6 +3035,71 @@ mod tests {
         );
     }
 
+    /// A tunnel whose authority is known but whose address was never resolved
+    /// cannot say where it goes. `serve` must refuse it, not fall back to dialing
+    /// the request's `Host`, which is the route a tunnel may never take. No
+    /// constructor builds this state (`Conn::plain` and `mitm` set both fields
+    /// together), so the literal below is the only way to reach it; the test
+    /// keeps a later edit from reaching it silently.
+    #[tokio::test]
+    async fn serve_refuses_a_tunnel_that_has_no_resolved_address() {
+        // An origin is on offer, so a dial would succeed and answer: the refusal
+        // has to come from `serve`, not from a connector with nothing to give.
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, dialed) = ctx_with(vec![Box::pin(up)]);
+        let _origin = tokio::spawn(origin_serve(origin_end, vec!["first"], false));
+        let conn = Conn {
+            scheme: "http".to_string(),
+            tunnel_authority: Some("127.0.0.1:8080".to_string()),
+            tunnel_addr: None,
+            client_conn: ConnInfo {
+                peer: unknown_peer(),
+                sni: None,
+                alpn: None,
+                tls: false,
+                established: SystemTime::now(),
+            },
+            server_conn: None,
+        };
+        let (mut client, proxy_side) = duplex(64 * 1024);
+
+        let serving = serve(&ctx, Box::pin(proxy_side), None, None, conn, MAX_BODY);
+        let script = async {
+            client
+                .write_all(get_request("/one", "127.0.0.1:9090").as_bytes())
+                .await
+                .expect("send");
+            // One read: EOF (no bytes) when `serve` refuses and drops the
+            // connection, response bytes if it answered. Reading to EOF would
+            // hang on a keep-alive answer instead of failing on it.
+            let mut chunk = [0u8; 512];
+            let n = client.read(&mut chunk).await.expect("read");
+            // Hang up, so a `serve` that answered sees the client finish.
+            drop(client);
+            chunk[..n].to_vec()
+        };
+        let (served, got) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(serving, script)
+        })
+        .await
+        .expect("serve hung");
+
+        let err = served.expect_err("a tunnel with no resolved address must be refused");
+        assert_eq!(
+            err.to_string(),
+            "tunnel has no resolved CONNECT address; refusing to dial the request Host"
+        );
+        assert!(
+            got.is_empty(),
+            "the client reads no response bytes: {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        assert!(
+            dialed.lock().expect("dialed lock").is_empty(),
+            "nothing may be dialed, in particular not the request's Host"
+        );
+    }
+
     // ---- edge cases added by the Stage 5 tester pass ----------------------
 
     /// The tunnel's authority and its resolved address are one fact: `serve`
@@ -3184,6 +3266,140 @@ mod tests {
         assert!(
             !events.iter().any(|e| matches!(e, Event::Error { .. })),
             "events: {events:?}"
+        );
+    }
+
+    /// The message of every WARN-or-worse event emitted on the thread that
+    /// installed it. Hand-written on `tracing`'s own `Subscriber` trait so a test
+    /// can pin what the proxy tells the operator without a capture dependency.
+    struct WarnCapture {
+        messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// Pulls the `message` field out of one event.
+    struct MessageOf(String);
+
+    impl tracing::field::Visit for MessageOf {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            // `Level` orders by verbosity: ERROR < WARN < INFO < DEBUG < TRACE.
+            *metadata.level() <= tracing::Level::WARN
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut message = MessageOf(String::new());
+            event.record(&mut message);
+            self.messages.lock().expect("messages lock").push(message.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Capture every WARN-or-worse event on this thread until the guard drops.
+    /// `#[tokio::test]` runs the test future on this thread, so it sees `serve`'s.
+    fn capture_warnings() -> (tracing::subscriber::DefaultGuard, Arc<Mutex<Vec<String>>>) {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let guard = tracing::subscriber::set_default(WarnCapture {
+            messages: messages.clone(),
+        });
+        (guard, messages)
+    }
+
+    /// An origin that answers a `Connection: close` request and then appends a
+    /// bare CRLF is closing anyway: no upstream is replaced, so `serve` must not
+    /// say it is replacing one. The warning is for the connection that stays open.
+    #[tokio::test]
+    async fn serve_does_not_warn_about_surplus_when_the_connection_closes_anyway() {
+        let (_guard, warnings) = capture_warnings();
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, dialed) = ctx_with(vec![Box::pin(up)]);
+        let _origin = tokio::spawn(origin_serve_trailing(
+            origin_end,
+            vec!["legit"],
+            "\r\n",
+            false,
+        ));
+        let (mut client, proxy_side) = duplex(64 * 1024);
+
+        let serving = serve(
+            &ctx,
+            Box::pin(proxy_side),
+            None,
+            None,
+            Conn::plain(unknown_peer(), None),
+            MAX_BODY,
+        );
+        let script = async {
+            client
+                .write_all(
+                    b"GET http://127.0.0.1:8080/one HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("send");
+            let mut got = Vec::new();
+            client.read_to_end(&mut got).await.expect("read to EOF");
+            got
+        };
+        let (served, got) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(serving, script)
+        })
+        .await
+        .expect("serve hung");
+
+        served.expect("a Connection: close request ends cleanly");
+        assert!(
+            String::from_utf8_lossy(&got).ends_with("\r\n\r\nlegit"),
+            "response: {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        assert_eq!(dialed.lock().expect("dialed lock").len(), 1);
+        assert_eq!(
+            *warnings.lock().expect("warnings lock"),
+            Vec::<String>::new(),
+            "a connection that is closing anyway replaces nothing and warns of nothing"
+        );
+    }
+
+    /// The other side of the ordering: on a connection that stays open the same
+    /// surplus is an upstream being replaced, and that is worth one warning.
+    #[tokio::test]
+    async fn serve_warns_once_when_surplus_replaces_the_upstream_of_an_open_connection() {
+        let (_guard, warnings) = capture_warnings();
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, dialed) = ctx_with(vec![Box::pin(up)]);
+        let _origin = tokio::spawn(origin_serve_trailing(
+            origin_end,
+            vec!["legit"],
+            "\r\n",
+            false,
+        ));
+
+        let bodies = serve_requests(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            &[get_request("http://127.0.0.1:8080/one", "127.0.0.1:8080")],
+        )
+        .await;
+
+        assert_eq!(bodies, vec!["legit"]);
+        assert_eq!(dialed.lock().expect("dialed lock").len(), 1);
+        assert_eq!(
+            *warnings.lock().expect("warnings lock"),
+            vec![
+                "origin sent bytes after a completed response; discarding them and replacing the upstream connection"
+                    .to_string()
+            ]
         );
     }
 
