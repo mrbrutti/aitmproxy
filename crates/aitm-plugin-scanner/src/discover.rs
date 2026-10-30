@@ -29,8 +29,9 @@ pub const REDACTED: &str = "<redacted>";
 const EXTRA_SECRET_NEEDLES: &[&str] = &["sid", "jwt", "csrf", "session", "auth"];
 
 /// Whether a header / query / body parameter name reads as a secret: the shared
-/// vocabulary plus [`EXTRA_SECRET_NEEDLES`].
-fn is_secret_name(name: &str) -> bool {
+/// vocabulary plus [`EXTRA_SECRET_NEEDLES`]. `pub(crate)` so `reproduce`'s PoC
+/// scrubber masks exactly the names `enumerate` redacts here — one vocabulary.
+pub(crate) fn is_secret_name(name: &str) -> bool {
     if is_secret_key(name) {
         return true;
     }

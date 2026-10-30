@@ -292,6 +292,15 @@ fn guard_authority(url: &Url) -> String {
     format!("{host}:{port}")
 }
 
+/// The guard `host:port` for a bare target string: [`parse_target`] then
+/// [`guard_authority`], so a target is parsed, refused (userinfo, non-`http(s)`
+/// scheme, no host) and folded to an authority exactly the way the crawl's own
+/// seed is. The one entry point other engines (`inject`) use, so they cannot
+/// grow a second, laxer parser.
+pub(crate) fn guard_authority_for(target: &str) -> Option<String> {
+    parse_target(target).map(|url| guard_authority(&url))
+}
+
 /// The time left in the budget, or `None` when it is spent.
 fn remaining_budget(budget: Duration, started: Instant) -> Option<Duration> {
     budget
@@ -877,6 +886,32 @@ mod tests {
             "off-scope URL leaked into endpoints: {:?}",
             out.endpoints
         );
+    }
+
+    /// `guard_authority_for` is the one place a bare target string becomes the
+    /// `host:port` the guard is asked about, shared with `inject`: it folds the
+    /// default port in, and refuses what `parse_target` refuses (userinfo, a
+    /// non-http scheme, no host).
+    #[test]
+    fn guard_authority_for_folds_port_and_rejects_userinfo() {
+        assert_eq!(
+            guard_authority_for("http://target.test/"),
+            Some("target.test:80".to_string())
+        );
+        assert_eq!(
+            guard_authority_for(" https://Target.Test/a/b?q=1 "),
+            Some("target.test:443".to_string())
+        );
+        assert_eq!(
+            guard_authority_for("http://target.test:8080/"),
+            Some("target.test:8080".to_string())
+        );
+        // `http://target.test@evil.com/` reads as the target to a human while the
+        // client connects to `evil.com`: refused outright, as are credentials.
+        assert_eq!(guard_authority_for("http://user:pw@target.test/"), None);
+        assert_eq!(guard_authority_for("http://target.test@evil.com/"), None);
+        assert_eq!(guard_authority_for("ftp://target.test/"), None);
+        assert_eq!(guard_authority_for("not a url"), None);
     }
 
     /// `\` is a path separator to a WHATWG browser, so the host of

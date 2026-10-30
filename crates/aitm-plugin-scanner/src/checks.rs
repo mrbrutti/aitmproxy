@@ -402,7 +402,38 @@ mod tests {
             value: String::new(),
             marker: None,
         };
-        assert!(def.confirm(200, "anything at all", &[], &empty).is_none());
+        // An HTML Content-Type, so the HTML gate passes and the empty-word guard
+        // is the only thing standing between this payload and a false hit.
+        let html = vec![("Content-Type".to_string(), "text/html".to_string())];
+        assert!(def.confirm(200, "anything at all", &html, &empty).is_none());
+    }
+
+    #[test]
+    fn open_redirect_location_value_must_start_on_the_same_line() {
+        // The regex allows only spaces/tabs between `Location:` and the URL. A
+        // bare `\s*` would let an *empty* Location value run on into the next
+        // header line, so a header named `//aitm-scan-sentinel.invalid/x` would
+        // read as `Location: //aitm-scan-sentinel.invalid/x`.
+        let def = CheckDefinition::open_redirect();
+        let payload = def.payloads.first().expect("a payload");
+        let headers = vec![
+            ("Location".to_string(), String::new()),
+            (
+                "//aitm-scan-sentinel.invalid/x".to_string(),
+                "1".to_string(),
+            ),
+        ];
+        assert!(
+            def.confirm(302, "", &headers, payload).is_none(),
+            "an empty Location must not borrow the next header line"
+        );
+
+        // Control: the same sentinel as the Location *value* does confirm.
+        let real = vec![(
+            "Location".to_string(),
+            "//aitm-scan-sentinel.invalid/x".to_string(),
+        )];
+        assert!(def.confirm(302, "", &real, payload).is_some());
     }
 
     #[test]
