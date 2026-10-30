@@ -30,6 +30,14 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
 # sandbox relies on) and never `internals` (M3 spec §7, plan Global Constraints).
 rhai = { version = "1.27", features = ["sync"] }
 arc-swap = "1"
+# The `dsl` prelude helpers: base64 encode/decode (the decode half validates, so
+# a vetted codec rather than a hand-rolled one), SHA-256 + MD5 (RustCrypto, one
+# `Digest` API), and regex. `md-5` is required for `md5` regardless, so `sha2`
+# comes from the same ecosystem; `regex` is the version four sibling crates use.
+base64 = "0.22"
+regex = "1"
+sha2 = "0.10"
+md-5 = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
