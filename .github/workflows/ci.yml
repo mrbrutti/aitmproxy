@@ -1,0 +1,59 @@
+name: CI
+
+# Runs the Rust gate — the same one CLAUDE.md requires before any review —
+# on every pull request and on pushes to main, so a non-compiling or
+# lint-dirty main can never land silently again. Before this, the repo had
+# only pages.yml (site deploy) and release.yml (tag releases); nothing
+# compiled the workspace in CI, which let a broken main slip in once.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Read-only token: the gate builds and tests, it publishes nothing.
+permissions:
+  contents: read
+
+# One run per ref; a newer push cancels an in-flight run on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-gate:
+    name: Rust gate (fmt + clippy + test)
+    runs-on: ubuntu-latest
+    # Drop debuginfo: `cargo test` links every test binary (chromiumoxide + rhai
+    # + the full graph), and with debug symbols the parallel link step exhausts
+    # the runner's memory/disk — the linker dies with "ld ... signal 7 (Bus
+    # error)". A pass/fail gate needs no symbols, so this is a safe, standard cut.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The workspace links libpcap (the `pcap` crate, L4 capture). macOS ships
+      # it; Ubuntu runners need the -dev package or the test link step fails
+      # with `unable to find library -lpcap`.
+      - name: Install system build deps
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      - name: Install Rust toolchain (stable + rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test

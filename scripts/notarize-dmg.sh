@@ -44,11 +44,20 @@ echo "notarize-dmg.sh: asc key    $asc_key (id $asc_key_id)"
 #    Contents/Resources/core; nested Mach-O there must be signed before the app,
 #    since signing the outer bundle does not seal executables under Resources.
 core="$app/Contents/Resources/core"
+# A shipped release must bundle the embedded core (aitm + obscura) — the whole
+# point of the self-contained app. build.sh skips the core when none is staged
+# (dev falls back to an external core), so guard the release path here: refuse to
+# notarize a core-less app rather than ship one silently. Fix: run
+# scripts/package.sh, then apps/mac/build.sh (or set AITM_CORE_DIR/CORE_TARBALL),
+# before this script.
+for bin in obscura aitm; do
+    [ -f "$core/$bin" ] || { echo "notarize-dmg.sh: $app is missing its embedded core ($core/$bin). Run scripts/package.sh then apps/mac/build.sh so the app bundles aitm + obscura, then re-run." >&2; exit 1; }
+done
 # obscura (Chromium-based) needs JIT entitlements under the hardened runtime or
 # it SIGTRAPs on V8 init ("embedded browser unavailable"); aitm needs none.
 obscura_ent="$repo_root/apps/mac/EmbeddedObscura.entitlements"
-[ -f "$core/obscura" ] && codesign --force --options runtime --timestamp --entitlements "$obscura_ent" --sign "$dev_id" "$core/obscura"
-[ -f "$core/aitm" ] && codesign --force --options runtime --timestamp --sign "$dev_id" "$core/aitm"
+codesign --force --options runtime --timestamp --entitlements "$obscura_ent" --sign "$dev_id" "$core/obscura"
+codesign --force --options runtime --timestamp --sign "$dev_id" "$core/aitm"
 codesign --force --options runtime --timestamp --sign "$dev_id" "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
 

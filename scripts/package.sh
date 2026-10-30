@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Bundle a release `aitm` with the obscura fork binary for the host target.
 #
-# Output: dist/aitm-<aitm version>-<target>.tar.gz containing `aitm` and
-# `obscura` side by side. `aitm` finds `obscura` next to its own executable, so
-# extracting the tarball anywhere is enough (spec M2 §D3, M2-AC19).
+# Output: dist/aitm-<aitm version>-<target>.tar.gz containing `aitm`,
+# `aitm-tui`, and `obscura` side by side. `aitm` finds `obscura` next to its own
+# executable, so extracting the tarball anywhere is enough (spec M2 §D3,
+# M2-AC19). `aitm-tui` is the detached operator UI shipped alongside the CLI
+# (distribution spec §A).
 #
 # Environment:
 #   OBSCURA_TAG   release tag on mrbrutti/obscura to fetch (default: aitm-v1)
@@ -43,6 +45,9 @@ echo "package.sh: building the web UI (apps/web)"
 echo "package.sh: cargo build --release -p aitm"
 cargo build --release -p aitm
 
+echo "package.sh: cargo build --release -p aitm-tui"
+cargo build --release -p aitm-tui
+
 echo "package.sh: downloading ${asset} and SHA256SUMS from ${fork_repo}@${tag}"
 gh release download "$tag" --repo "$fork_repo" --dir "$work" \
     --pattern "$asset" --pattern SHA256SUMS
@@ -59,7 +64,8 @@ stage="$work/stage"
 mkdir -p "$stage"
 tar -xzf "$work/$asset" -C "$stage" obscura
 cp "target/release/aitm" "$stage/aitm"
-chmod 755 "$stage/aitm" "$stage/obscura"
+cp "target/release/aitm-tui" "$stage/aitm-tui"
+chmod 755 "$stage/aitm" "$stage/aitm-tui" "$stage/obscura"
 
 # A download on macOS may carry Gatekeeper's quarantine flag; `aitm` would
 # otherwise fail to spawn `obscura`. Absent attribute is fine.
@@ -69,7 +75,7 @@ fi
 
 mkdir -p dist
 out="dist/aitm-${version}-${target}.tar.gz"
-tar -czf "$out" -C "$stage" aitm obscura
+tar -czf "$out" -C "$stage" aitm aitm-tui obscura
 
 echo "package.sh: wrote ${out}"
 tar -tzf "$out"
