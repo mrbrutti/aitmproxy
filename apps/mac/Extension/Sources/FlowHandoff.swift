@@ -156,25 +156,33 @@ enum PeerAuth {
 /// excluded by the provider's outbound wildcard rule, which keeps the proxy port out of
 /// the loop.
 enum SelfExclusion {
+    /// Code requirement for "signed by us". Team-wide for now, so it covers BOTH aitm and
+    /// the embedded obscura (which share only the team OU, not an identifier). Kept as its
+    /// OWN constant, DECOUPLED from `PeerAuth.coreRequirement` on purpose: the core-peer
+    /// requirement is tracked to narrow to aitm's designated requirement at GA, but
+    /// self-exclusion must keep excluding obscura too — so narrowing THIS one must cover
+    /// BOTH binaries' designated requirements, not just aitm's, or obscura's flows would
+    /// loop (flagged by the Task-12 security re-review).
+    static let selfRequirement =
+        "anchor apple generic and certificate leaf[subject.OU] = \"\(PeerAuth.coreTeamID)\""
+
     /// True if the flow's SOURCE APP is signed by our Developer ID team. aitm and the
     /// embedded obscura are both team-signed, so they are excluded regardless of their
     /// specific signing identifier — there is NO reliance on guessing "aitm"/"obscura",
     /// so a renamed/reverse-DNS/empty identifier cannot slip through and loop (the
-    /// self-DoS the string guess risked). Reuses the same audit-token → SecCode → team
-    /// requirement check Task 11 uses for the core peer; the SecCode cost is per NEW flow
-    /// (connection), not per packet.
+    /// self-DoS the string guess risked). The audit-token → SecCode → requirement check
+    /// (same mechanism Task 11 uses for the core peer) costs one SecCode validity check
+    /// per NEW flow (connection), not per packet.
     ///
     /// Over-exclusion: this also excludes any OTHER 995PCLM9KH-signed binary. In practice
     /// the only such binaries a user runs are aitmproxy's own, which is exactly what must
-    /// be excluded. Narrowing to aitm's full designated requirement (spec D4 "aitm and
-    /// obscura specifically") is a tracked GA-hardening item (plan Review log), as for the
-    /// Task 11 core requirement. A missing/malformed audit token cannot be verified, so
-    /// such a flow is NOT treated as self (local flows reliably carry the token).
+    /// be excluded. A missing/malformed audit token cannot be verified, so such a flow is
+    /// NOT treated as self (local self flows reliably carry the token).
     static func isSelf(sourceAppAuditToken data: Data?) -> Bool {
         guard let data, data.count == MemoryLayout<audit_token_t>.size else { return false }
         var token = audit_token_t()
         _ = withUnsafeMutableBytes(of: &token) { data.copyBytes(to: $0) }
-        return PeerAuth.verifyPeer(auditToken: token, requirement: PeerAuth.coreRequirement)
+        return PeerAuth.verifyPeer(auditToken: token, requirement: selfRequirement)
     }
 }
 
