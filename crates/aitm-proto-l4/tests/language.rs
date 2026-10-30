@@ -258,6 +258,75 @@ fn ac4_operator_engine_bypasses_the_agent_gate() {
         .expect("operator engine bypasses the agent gate");
 }
 
+#[test]
+fn ac4_out_of_scope_send_recv_refusal_surfaces_to_the_script() {
+    // Agent-sourced engine, inject gate OPEN, so the refusal is NOT the agent gate
+    // — it is the shared L4Guard's deny-by-default scope check: a Rhai script that
+    // calls l4.send_recv to a host no scope entry covers sees the "out of L4 scope"
+    // refusal surface as an eval error (AC4's scope refusal on the script face).
+    let backend = MockBackend::with_replies(vec![]);
+    let lang = L4Language::new(
+        loopback_guard(true),
+        backend.clone(),
+        Arc::new(InMemoryL4FlowStore::new()),
+        true,
+    );
+    let engine =
+        build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(5), &[&lang])
+            .expect("engine builds");
+    let script = r#"
+        let spec = #{ layers: [ #{ ipv4: #{ dst: "10.9.9.9" } }, #{ udp: #{ dst_port: 9 } } ] };
+        l4.send_recv(spec, "10.9.9.9", "lo", 9, 50)
+    "#;
+    let err = engine
+        .eval::<rhai::Dynamic>(script)
+        .expect_err("an out-of-scope send_recv is refused");
+    assert!(
+        err.to_string().contains("out of L4 scope"),
+        "the deny-by-default scope refusal must surface to the script, got: {err}"
+    );
+    assert!(
+        backend.injected().is_empty(),
+        "nothing reached the wire on an out-of-scope refusal"
+    );
+}
+
+#[test]
+fn inject_count_zero_is_a_no_op() {
+    // `l4.inject(..., 0)` with an explicit count of 0 sends nothing — the loop is
+    // `0..count`, not `.max(1)`, so an explicit zero is a deliberate no-op (an
+    // absent count still defaults to 1).
+    let backend = MockBackend::with_replies(vec![]);
+    let lang = L4Language::new(
+        loopback_guard(true),
+        backend.clone(),
+        Arc::new(InMemoryL4FlowStore::new()),
+        false,
+    );
+    let engine =
+        build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(5), &[&lang])
+            .expect("engine builds");
+    let script = r#"
+        let spec = #{ layers: [ #{ ipv4: #{ dst: "127.0.0.1" } }, #{ udp: #{ dst_port: 9 } } ] };
+        l4.inject(spec, "127.0.0.1", "lo", 0)
+    "#;
+    let out = engine
+        .eval::<rhai::Dynamic>(script)
+        .expect("inject with count:0 runs and is a no-op");
+    let map = out.try_cast::<rhai::Map>().expect("inject returns a map");
+    let sent = map
+        .get("sent")
+        .expect("sent field")
+        .clone()
+        .as_int()
+        .expect("sent is an int");
+    assert_eq!(sent, 0, "an explicit count:0 sends zero packets");
+    assert!(
+        backend.injected().is_empty(),
+        "count:0 puts nothing on the wire"
+    );
+}
+
 // ===========================================================================
 // AC5 — the native l4: PoC step
 // ===========================================================================
@@ -382,7 +451,9 @@ fn ac8_one_vocabulary_across_catalog_poc_rhai_and_commands() {
     // (1) catalog host-fn names
     let catalog_names: BTreeSet<String> = catalog.host_fns.iter().map(|f| f.name.clone()).collect();
 
-    // (2) the l4: step `op` verb vocabulary
+    // (2) the l4: step `op` verb vocabulary — the WIRE SUBSET of the shared
+    // vocabulary (a one-shot step runs only craft/inject/send_recv), not the full
+    // host-fn set. The invariant is *consistent subset*, never a divergent set.
     let op_verbs: BTreeSet<String> = catalog
         .poc_step
         .as_ref()
@@ -402,9 +473,20 @@ fn ac8_one_vocabulary_across_catalog_poc_rhai_and_commands() {
         .map(|(_, name)| name)
         .collect();
 
+    // The step op set is a subset of — and every op is a real member of — the one
+    // shared host-fn vocabulary (AC8: consistent subset, not divergence).
+    assert!(
+        op_verbs.is_subset(&catalog_names),
+        "every l4: step op must be a real catalog host-fn (consistent subset)"
+    );
     assert_eq!(
-        catalog_names, op_verbs,
-        "catalog host-fns == l4: step op verbs"
+        op_verbs,
+        BTreeSet::from([
+            "craft".to_string(),
+            "inject".to_string(),
+            "send_recv".to_string()
+        ]),
+        "the l4: step exposes exactly the three wire verbs"
     );
     assert_eq!(
         catalog_names, registered,

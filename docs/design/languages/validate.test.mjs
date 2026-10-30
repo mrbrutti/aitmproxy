@@ -273,8 +273,8 @@ test("poc-yaml.schema.json: top level + step shapes", () => {
   ]);
   assert.deepEqual(set(Object.keys(schemaNode(s, "variables[]").keys)), ["default", "description", "name", "required"]);
   const step = schemaNode(s, "steps[]");
-  assert.deepEqual(set(Object.keys(step.keys)), ["browser", "extract", "http", "script"]);
-  assert.deepEqual(set(step.one_of_keys), ["browser", "extract", "http", "script"]);
+  assert.deepEqual(set(Object.keys(step.keys)), ["browser", "extract", "http", "l4", "script"]);
+  assert.deepEqual(set(step.one_of_keys), ["browser", "extract", "http", "l4", "script"]);
   assert.deepEqual(set(Object.keys(schemaNode(s, "steps[].http").keys)), [
     "body",
     "extract",
@@ -335,10 +335,17 @@ test("poc-yaml.schema.json: protocol-step mechanism is in place", () => {
     assert.ok(pe.keys?.[k]?.type, `protocol_extractor.${k} is defined`);
   }
 
-  // The fixed steps are untouched by this task: the protocol steps are not added
-  // to the shipped step keys (production namespaces are still empty).
+  // Task 6 ships the first concrete consumer: the `l4:` step node, generated from
+  // l4's NamespaceCatalog. Its `op` enum is the wire subset of the `l4.*` vocabulary
+  // and it contributes the `packet` matcher/extractor source.
   const step = schemaNode(s, "steps[]");
-  assert.deepEqual(set(Object.keys(step.keys)), ["browser", "extract", "http", "script"]);
+  assert.deepEqual(set(Object.keys(step.keys)), ["browser", "extract", "http", "l4", "script"]);
+  const l4 = schemaNode(s, "steps[].l4");
+  assert.equal(l4.type, "map", "the l4: step is a map node");
+  assert.ok(l4.description?.length > 0, "the l4: step is described");
+  assert.deepEqual(set(l4.keys.op.enum), ["craft", "inject", "send_recv"], "l4: op enum is the wire subset");
+  assert.equal(l4.keys.op.type, "enum", "l4: op is an enum node");
+  assert.deepEqual(l4.sources, ["packet"], "the l4: step contributes the packet source");
 });
 
 // ---------------------------------------------------------------------------

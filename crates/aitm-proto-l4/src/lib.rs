@@ -25,5 +25,5 @@ pub mod types;
 pub mod wire;
 
 pub use backend::L4Error;
-pub use language::{L4Language, L4StepHandler};
+pub use language::L4Language;
 pub use module::{L4Module, L4Privilege};

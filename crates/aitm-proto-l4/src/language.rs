@@ -7,7 +7,7 @@
 //! - **Rhai:** `register_host_fns` installs the `l4.*` host namespace
 //!   (`l4.interfaces`, `l4.craft`, `l4.scope.*`, `l4.flow.*`, `l4.inject`,
 //!   `l4.send_recv`) so a script calls `l4.send_recv(spec, dst, iface, port)`.
-//! - **PoC:** `poc_step` returns the native [`L4StepHandler`] for the `l4:` step,
+//! - **PoC:** `poc_step` returns the native `L4StepHandler` for the `l4:` step,
 //!   whose human-friendly, scapy-style body produces a `packet` matcher/extractor
 //!   source a PoC asserts on (`extract { type: packet, field: tcp.flags }`).
 //! - **Catalog:** `catalog` describes both faces as the data that assembles into
@@ -113,6 +113,15 @@ const VERBS: &[(&str, Option<AgentGate>)] = &[
     ("inject", Some(AgentGate::Inject)),
     ("send_recv", Some(AgentGate::Inject)),
 ];
+
+/// The **wire** subset of [`VERBS`] — the verbs a one-shot `l4:` PoC step actually
+/// runs (`craft`, `inject`, `send_recv`), in catalog order. The full [`VERBS`] set
+/// stays the one shared Rhai host-fn / `l4.*` command vocabulary; the `l4:` step's
+/// `op` enum is this *consistent subset* of it (AC8): every step `op` is a real
+/// host-fn verb, but the query / session verbs have no one-shot assertion step, so
+/// they are driven from a `script:` step instead. The other six `VERBS` would
+/// `BadArgs` at runtime as a `l4:` `op`, so they are kept out of the step enum.
+const WIRE_VERBS: &[&str] = &["craft", "inject", "send_recv"];
 
 /// The agent gate that governs `verb`, if any (the command path's `gate_for`).
 fn gate_for(verb: &str) -> Option<AgentGate> {
@@ -373,9 +382,15 @@ fn do_craft(spec: &PacketSpec) -> Result<Value, HostError> {
         "layers".to_string(),
         Value::Array(summary.layers.iter().cloned().map(Value::Str).collect()),
     );
-    sum.insert("length".to_string(), Value::Int(summary.length as i64));
+    sum.insert(
+        "length".to_string(),
+        Value::Int(i64::try_from(summary.length).unwrap_or(i64::MAX)),
+    );
     let mut obj = BTreeMap::new();
-    obj.insert("length".to_string(), Value::Int(bytes.len() as i64));
+    obj.insert(
+        "length".to_string(),
+        Value::Int(i64::try_from(bytes.len()).unwrap_or(i64::MAX)),
+    );
     obj.insert("summary".to_string(), Value::Object(sum));
     obj.insert("bytes".to_string(), Value::Bytes(bytes));
     Ok(Value::Object(obj))
@@ -502,8 +517,11 @@ fn do_inject(
         packets: Vec::new(),
         metadata: L4Meta::default(),
     });
+    // `count` already defaults to 1 for an *absent* arg (the Rhai/PoC callers use
+    // `unwrap_or(1)`); an *explicit* `count: 0` is a deliberate no-op, so iterate
+    // `0..count` rather than forcing at least one copy with `.max(1)`.
     let mut sent: i64 = 0;
-    for _ in 0..count.max(1) {
+    for _ in 0..count {
         send_on_wire(&mut permit, live.backend.as_ref(), interface, &bytes).map_err(l4_err)?;
         live.store.append_packet(
             flow_id,
@@ -597,7 +615,7 @@ fn send_recv_value(flow_id: L4FlowId, outcome: &SendRecvOutcome) -> Value {
 /// received reply as the [`PACKET_SOURCE`] source — an object whose `tcp.flags`
 /// renders scapy-style (`"SA"` for SYN-ACK), so a sibling `extract` + a `dsl`
 /// success assert on it.
-pub struct L4StepHandler {
+pub(crate) struct L4StepHandler {
     live: L4Live,
     agent_sourced: bool,
 }
@@ -804,8 +822,8 @@ fn parse_layer(
             ..Ipv6Spec::default()
         })),
         "tcp" => Ok(Layer::Tcp(TcpSpec {
-            src_port: opt_u16(fields, "sport").or(opt_u16(fields, "src_port"))?,
-            dst_port: opt_u16(fields, "dport").or(opt_u16(fields, "dst_port"))?,
+            src_port: opt_u16_any(fields, &["sport", "src_port"])?,
+            dst_port: opt_u16_any(fields, &["dport", "dst_port"])?,
             seq: opt_u32(fields, "seq")?,
             ack: opt_u32(fields, "ack")?,
             flags: opt_tcp_flags(fields)?,
@@ -813,8 +831,8 @@ fn parse_layer(
             ..TcpSpec::default()
         })),
         "udp" => Ok(Layer::Udp(UdpSpec {
-            src_port: opt_u16(fields, "sport").or(opt_u16(fields, "src_port"))?,
-            dst_port: opt_u16(fields, "dport").or(opt_u16(fields, "dst_port"))?,
+            src_port: opt_u16_any(fields, &["sport", "src_port"])?,
+            dst_port: opt_u16_any(fields, &["dport", "dst_port"])?,
             ..UdpSpec::default()
         })),
         "icmp" => Ok(Layer::Icmp(IcmpSpec {
@@ -901,6 +919,31 @@ fn opt_u16(fields: &serde_yaml::Value, key: &str) -> Result<Option<u16>, HostErr
     }
 }
 
+/// Parse the first present key among `keys` as a u16 port, parsing it **once** and
+/// propagating its range error. Unlike `opt_u16(a).or(opt_u16(b))?` — where
+/// `Result::or` returns `self` on `Ok(None)`, leaving the alias dead code and
+/// *swallowing* an out-of-range primary port's `Err` — this picks the first key
+/// that is actually present (so the alias is live) and never silently drops an
+/// invalid, agent-controlled port value.
+fn opt_u16_any(fields: &serde_yaml::Value, keys: &[&str]) -> Result<Option<u16>, HostError> {
+    for key in keys {
+        match fields.get(key) {
+            None | Some(serde_yaml::Value::Null) => continue,
+            Some(v) => {
+                return match v.as_u64() {
+                    Some(n) => u16::try_from(n).map(Some).map_err(|_| {
+                        HostError::BadArgs(format!("`{key}` out of range (0..=65535)"))
+                    }),
+                    None => Err(HostError::BadArgs(format!(
+                        "`{key}` must be a number (0..=65535)"
+                    ))),
+                };
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn opt_u32(fields: &serde_yaml::Value, key: &str) -> Result<Option<u32>, HostError> {
     match fields.get(key).and_then(serde_yaml::Value::as_u64) {
         Some(n) => u32::try_from(n)
@@ -973,7 +1016,10 @@ fn packet_to_value(bytes: &[u8]) -> Value {
     use etherparse::{NetSlice, TransportSlice};
 
     let mut obj = BTreeMap::new();
-    obj.insert("length".to_string(), Value::Int(bytes.len() as i64));
+    obj.insert(
+        "length".to_string(),
+        Value::Int(i64::try_from(bytes.len()).unwrap_or(i64::MAX)),
+    );
 
     if let Some(parsed) = crate::craft::parse_frame(bytes) {
         match parsed.net {
@@ -1166,8 +1212,9 @@ fn bad(e: anyhow::Error) -> HostError {
 // ===========================================================================
 
 /// The `l4.*` host-fn signatures for `rhai.api.json` — one entry per [`VERBS`]
-/// verb, so the catalog, the Rhai namespace, and the `l4:` step `op` vocabulary
-/// are the one set (AC8).
+/// verb, so the catalog, the Rhai namespace, and the `l4.*` command names are the
+/// one shared vocabulary (AC8). The `l4:` step `op` enum is the [`WIRE_VERBS`]
+/// subset of this set (a consistent subset, not a divergent vocabulary).
 fn catalog_host_fns() -> Vec<HostFnSig> {
     let p = |name: &str, ty: &str, desc: &str| ParamSig {
         name: name.to_string(),
@@ -1267,8 +1314,10 @@ fn catalog_host_fns() -> Vec<HostFnSig> {
     ]
 }
 
-/// The `l4:` PoC step schema for `poc-yaml.schema.json`. Its `op` enum is exactly
-/// the [`VERBS`] host-fn names — the one vocabulary (AC8) — and it contributes the
+/// The `l4:` PoC step schema for `poc-yaml.schema.json`. Its `op` enum is the
+/// [`WIRE_VERBS`] subset of the [`VERBS`] host-fn names — the one vocabulary's wire
+/// verbs (AC8: the step `op` set is a *consistent subset* of the host-fn /
+/// command vocabulary, never a divergent one) — and it contributes the
 /// [`PACKET_SOURCE`] matcher/extractor source.
 fn catalog_poc_step() -> PocStepSchema {
     PocStepSchema {
@@ -1279,8 +1328,76 @@ fn catalog_poc_step() -> PocStepSchema {
             .to_string(),
         enums: BTreeMap::from([(
             "op".to_string(),
-            VERBS.iter().map(|(v, _)| (*v).to_string()).collect(),
+            WIRE_VERBS.iter().map(|v| (*v).to_string()).collect(),
         )]),
         sources: vec![PACKET_SOURCE.to_string()],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    fn layer(src: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(src).expect("the test layer YAML parses")
+    }
+
+    /// The `src_port`/`dst_port` aliases are live (not dead code): a layer using
+    /// the alias form sets the port, exactly as the scapy `sport`/`dport` form does.
+    #[test]
+    fn tcp_port_aliases_are_live() {
+        let vars = BTreeMap::new();
+        match parse_layer(&layer("tcp: { src_port: 1234, dst_port: 80 }"), &vars)
+            .expect("the aliased tcp layer parses")
+        {
+            Layer::Tcp(spec) => {
+                assert_eq!(spec.src_port, Some(1234));
+                assert_eq!(spec.dst_port, Some(80));
+            }
+            other => panic!("expected a TCP layer, got {other:?}"),
+        }
+    }
+
+    /// An out-of-range port is **rejected**, not silently left unset — the `?`
+    /// range error is propagated rather than swallowed by `Result::or`.
+    #[test]
+    fn tcp_out_of_range_port_is_rejected() {
+        let vars = BTreeMap::new();
+        let err = parse_layer(&layer("tcp: { sport: 99999 }"), &vars)
+            .expect_err("a port above 65535 is rejected");
+        assert!(
+            err.to_string().contains("out of range"),
+            "the range error must surface, got: {err}"
+        );
+    }
+
+    /// The UDP alias is live too (the same helper governs both transports).
+    #[test]
+    fn udp_port_alias_is_live() {
+        let vars = BTreeMap::new();
+        match parse_layer(&layer("udp: { dst_port: 53 }"), &vars)
+            .expect("the aliased udp layer parses")
+        {
+            Layer::Udp(spec) => assert_eq!(spec.dst_port, Some(53)),
+            other => panic!("expected a UDP layer, got {other:?}"),
+        }
+    }
+
+    /// The `l4:` step `op` enum is the wire subset of the shared host-fn
+    /// vocabulary — every op is a real verb, and it is exactly the three wire verbs.
+    #[test]
+    fn poc_step_op_enum_is_the_wire_subset() {
+        let step = catalog_poc_step();
+        let ops = step.enums.get("op").expect("the l4: step has an op enum");
+        assert_eq!(ops, &vec!["craft", "inject", "send_recv"]);
+        let verbs: BTreeSet<&str> = VERBS.iter().map(|(v, _)| *v).collect();
+        for op in ops {
+            assert!(
+                verbs.contains(op.as_str()),
+                "the step op `{op}` must be a real host-fn verb"
+            );
+        }
     }
 }
