@@ -55,15 +55,19 @@ public enum CaptureCapabilityEvent: Hashable, Sendable {
     case tunnelConnected
     /// The capture tunnel left the connected state.
     case tunnelDisconnected
+    /// The operator uninstalled the extension: it is deactivated and its proxy
+    /// configuration is gone (Task 17).
+    case uninstalled
 }
 
 extension CaptureCapability {
     /// The capability after `event`. Pure, so the framework-facing controller stays
     /// thin glue. Tunnel events are ADVISORY — a late one never overrides a pending
     /// approval or a degradation. Activation events (`needsUserApproval`, `activated`,
-    /// `willCompleteAfterReboot`, `failed`) are AUTHORITATIVE and intentionally reset
-    /// even from `.capturing`: a genuine re-approval/re-activation really did change the
-    /// extension's state, so the capability must follow it rather than cling to capturing.
+    /// `willCompleteAfterReboot`, `failed`) and `uninstalled` are AUTHORITATIVE and
+    /// intentionally reset even from `.capturing`: a genuine re-approval, re-activation
+    /// or removal really did change the extension's state, so the capability must follow
+    /// it rather than cling to capturing.
     public func applying(_ event: CaptureCapabilityEvent) -> CaptureCapability {
         switch event {
         case .needsUserApproval:
@@ -78,7 +82,102 @@ extension CaptureCapability {
             return self == .approvedAttached ? .capturing : self
         case .tunnelDisconnected:
             return self == .capturing ? .approvedAttached : self
+        case .uninstalled:
+            return .extensionNotInstalled
         }
+    }
+
+    /// Whether the operator-facing "capture is on" indicator reads on (Task 17,
+    /// NE-AC15): the extension is approved and attached, whether or not the tunnel
+    /// has finished connecting.
+    public var isCaptureOn: Bool {
+        self == .approvedAttached || self == .capturing
+    }
+
+    /// Whether there is an extension to report on at all. `false` for a build with no
+    /// embedded extension (and after an uninstall), so the capture section stays hidden.
+    public var isInstalledOrInstalling: Bool {
+        self != .extensionNotInstalled
+    }
+
+    /// Whether an uninstall is offered. Once the extension is approved, and also from
+    /// `.degraded` so a failed install can be cleaned up; not while approval is still
+    /// outstanding (nothing is installed yet) or when there is nothing to remove.
+    public var canUninstall: Bool {
+        switch self {
+        case .approvedAttached, .capturing, .degraded: true
+        case .extensionNotInstalled, .pendingApproval: false
+        }
+    }
+}
+
+/// How the host app reconciles the saved `NETransparentProxyManager` configuration
+/// after the extension is (re)activated (Task 16, NE-AC14). A version-bump replacement
+/// can leave the saved configuration disabled (leash #58), so the app waits for the
+/// system to settle, re-enables and saves the configuration, then checks the tunnel
+/// really reaches `connected`, retrying with a bounded exponential backoff.
+///
+/// Pure data and arithmetic so the schedule is unit-tested; the framework calls live in
+/// `ExtensionController`.
+public struct TunnelReconcilePolicy: Equatable, Sendable {
+    /// How long to wait after a replacement before touching the configuration: the OS
+    /// is still swapping the extension and may disable the configuration afterwards.
+    public var settleAfterReplacement: Duration
+    /// Total attempts (enable, save, start, connected-check), including the first.
+    public var maxAttempts: Int
+    /// How long one attempt waits for the tunnel to reach `connected`.
+    public var connectWindow: Duration
+    /// How often the connected-check samples the tunnel status inside the window.
+    public var pollInterval: Duration
+    /// The wait after the first failed attempt; it doubles per failure.
+    public var firstBackoff: Duration
+    /// The ceiling for the doubling backoff.
+    public var maxBackoff: Duration
+
+    /// The shipped schedule. Worst case before reporting `.degraded` (replacement, four
+    /// attempts each waiting out the window, backoffs 1 + 2 + 4 s) is about 33 seconds.
+    public static let standard = TunnelReconcilePolicy(
+        settleAfterReplacement: .seconds(2),
+        maxAttempts: 4,
+        connectWindow: .seconds(6),
+        pollInterval: .milliseconds(500),
+        firstBackoff: .seconds(1),
+        maxBackoff: .seconds(8))
+
+    /// What to do after an attempt failed.
+    public enum Decision: Equatable, Sendable {
+        case retry(after: Duration)
+        case giveUp
+    }
+
+    /// The settle wait before the first attempt: only a replaced extension needs one.
+    public func settleDelay(afterReplacement: Bool) -> Duration {
+        afterReplacement ? settleAfterReplacement : .zero
+    }
+
+    /// The wait after failed attempt number `attempt` (1-based): `firstBackoff`
+    /// doubling per failure, never above `maxBackoff`.
+    public func backoff(afterAttempt attempt: Int) -> Duration {
+        var delay = firstBackoff
+        var remaining = attempt - 1
+        while remaining > 0, delay < maxBackoff {
+            delay = min(delay * 2, maxBackoff)
+            remaining -= 1
+        }
+        return delay
+    }
+
+    /// How many status samples fit in one `connectWindow`.
+    public var pollCount: Int {
+        max(1, Int(connectWindow / pollInterval))
+    }
+
+    /// Retry only a failure that can clear by itself (`retryable`) and only while
+    /// attempts remain. A permanent failure, such as the operator refusing the
+    /// "Add Proxy Configurations" prompt, gives up at once rather than re-prompting.
+    public func decision(afterFailedAttempt attempt: Int, retryable: Bool) -> Decision {
+        guard retryable, attempt < maxAttempts else { return .giveUp }
+        return .retry(after: backoff(afterAttempt: attempt))
     }
 }
 
