@@ -43,8 +43,20 @@
     <p class="lead">aitmproxy captures, intercepts, edits, replays and reproduces traffic across four layers of the wire — HTTP, WebSocket, HTTP/2 and raw L4 packets. One core, driven completely by an operator or by an AI assistant: the same commands over the CLI, the GUI and MCP.</p>
 
     <div class="weave" role="img" aria-label="aitmproxy sits on the wire as an interceptor. One message at a time — an HTTP request, a WebSocket frame, an HTTP/2 frame, a raw L4 packet — is pulled off the wire, rebuilt in the flow viewer, held and edited, then sent back on in a changed form, while other traffic flows past untouched.">
-      <span class="node node--client" aria-hidden="true"><span class="node-label">client</span></span>
-      <span class="node node--server" aria-hidden="true"><span class="node-label">server</span></span>
+      <div class="endpoint endpoint--client" aria-hidden="true">
+        <span class="endpoint-chip">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1.5"/><path d="M2 6.2h12"/><path d="M4 4.6h.01"/></svg>
+          <b>client</b>
+        </span>
+        <span class="endpoint-sub">browser · curl · app</span>
+      </div>
+      <div class="endpoint endpoint--server" aria-hidden="true">
+        <span class="endpoint-chip">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2.5" y="2.5" width="11" height="4.6" rx="1"/><rect x="2.5" y="8.9" width="11" height="4.6" rx="1"/><path d="M5 4.8h.01"/><path d="M5 11.2h.01"/></svg>
+          <b>server</b>
+        </span>
+        <span class="endpoint-sub">api.example.com</span>
+      </div>
       <div class="weave-panel" aria-hidden="true" data-state="armed" data-proto="http" data-ui>
         <div class="wp-head flow-row" style="--i:0">
           <span class="id">#41</span>

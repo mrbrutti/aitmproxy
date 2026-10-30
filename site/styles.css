@@ -239,9 +239,23 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
   margin-block: clamp(2rem, 5vw, 3.5rem);
   height: clamp(320px, 48vh, 480px);
 }
-.weave .node { position: absolute; top: 50%; transform: translateY(-50%); font-style: italic; font-size: var(--fs-small); color: var(--ink-2); z-index: 2; }
-.weave .node--client { left: var(--margin); }
-.weave .node--server { right: var(--margin); }
+/* the two endpoints of the wire: client ↔ aitmproxy (the panel) ↔ server.
+   Flat monochrome chips that the wire plugs into, each with a role and a concrete sub-label. */
+.weave .endpoint { position: absolute; top: 50%; transform: translateY(-50%); z-index: 3; }
+.weave .endpoint--client { left: var(--margin); }
+.weave .endpoint--server { right: var(--margin); }
+.endpoint-chip {
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  background: var(--paper); border: 1px solid var(--hairline); border-radius: var(--radius);
+  padding: 0.4rem 0.65rem; box-shadow: var(--shadow-lift);
+  font-family: var(--serif); color: var(--ink);
+}
+.endpoint-chip svg { width: 15px; height: 15px; stroke: currentColor; color: var(--ink-2); fill: none; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+.endpoint-chip b { font-weight: 500; font-size: var(--fs-small); letter-spacing: 0.06em; text-transform: uppercase; }
+.endpoint--server .endpoint-chip { flex-direction: row-reverse; }
+.endpoint-sub { position: absolute; top: 100%; margin-top: 0.5rem; white-space: nowrap; font-family: var(--mono); font-size: var(--fs-mono-s); color: var(--ink-3); }
+.endpoint--client .endpoint-sub { left: 0.15rem; }
+.endpoint--server .endpoint-sub { right: 0.15rem; text-align: right; }
 
 /* the interceptor: the flow-viewer panel, centred on the wire (its own product chrome) */
 .weave-panel {
@@ -673,7 +687,14 @@ html.intro-on.intro-reveal :is(.nav, main, .footer) { animation: fade-in 900ms v
 
 @media (max-width: 640px) {
   .weave { height: auto; min-height: 220px; margin-inline: 0; width: auto; padding-block: 1.25rem; }
-  .weave .node { position: static; display: block; text-align: center; transform: none; }
+  .weave { display: flex; flex-direction: column; align-items: center; gap: 0.25rem; }
+  .weave .endpoint { position: static; transform: none; display: inline-flex; flex-direction: column; align-items: center; }
+  .weave .endpoint--client { order: 1; }
+  .weave-panel { order: 2; }
+  .weave .endpoint--server { order: 3; }
+  .proto-legend { order: 4; }
+  .endpoint-sub { position: static; margin-top: 0.3rem; text-align: center; left: auto; right: auto; }
+  .endpoint--server .endpoint-chip { flex-direction: row; }
   .weave-panel { position: static; transform: none; width: 100%; margin: 1rem auto; font-size: var(--fs-mono-s); }
   /* the static mobile panel always shows its message — override the phase-based hide/build */
   .weave[data-phase] .flow-row { opacity: 1; transform: none; animation: none; }
