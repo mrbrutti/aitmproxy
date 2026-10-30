@@ -374,8 +374,8 @@ fn poc_run_refuses_a_symlinked_poc_file() {
     let guard = StdGuard::default();
     // A human-CLI frontend so the loader-security check is reached (the T3 agent
     // gate only applies to Frontend::Mcp).
-    let host = CommandHost::new(&store, &client, &guard, None)
-        .with_frontend(aitm_core::Frontend::Cli);
+    let host =
+        CommandHost::new(&store, &client, &guard, None).with_frontend(aitm_core::Frontend::Cli);
 
     let args = Params::new(
         [(
