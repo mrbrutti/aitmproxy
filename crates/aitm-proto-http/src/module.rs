@@ -483,9 +483,11 @@ impl Conn {
 /// first request's authority and reopened when the authority changes.
 ///
 /// An upstream the origin closed while the client idled is replaced before the
-/// next request is forwarded on it. `reconnect` is how a TLS tunnel (which hands
-/// in an already-handshaken `upstream`) redoes its TLS connection; the cleartext
-/// paths pass `None` and redial through the ordinary connect step.
+/// next request is forwarded on it, and so is one whose origin sent bytes after
+/// a completed response (those bytes are discarded, never forwarded or parsed).
+/// `reconnect` is how a TLS tunnel (which hands in an already-handshaken
+/// `upstream`) redoes its TLS connection; the cleartext paths pass `None` and
+/// redial through the ordinary connect step.
 async fn serve(
     ctx: &ModuleCtx,
     mut client: ByteStream,
@@ -497,6 +499,10 @@ async fn serve(
     let mut machine = Http1Machine::new();
     let mut buf = vec![0u8; READ_CHUNK];
     let mut current_authority: Option<String> = conn.tunnel_authority.clone();
+    // Set when the origin sent bytes after a completed response. The framing of
+    // that connection can no longer be trusted, so the next request must not
+    // ride it; it is replaced through the same path as a closed upstream.
+    let mut upstream_tainted = false;
 
     loop {
         // --- Request: gather head + body, emitting RequestHeaders as soon as
@@ -654,8 +660,13 @@ async fn serve(
         // covered: the origin closing in the instant between this probe and the
         // write below (retrying an idempotent, bodyless request would be a
         // separate change).
+        //
+        // A tainted upstream (the origin sent bytes after its last response, see
+        // below) is replaced here too, never by clearing `upstream` where the
+        // taint is found: in a TLS tunnel that would skip the `reconnect` arm and
+        // the ordinary connect step below would dial the origin in cleartext.
         let mut redial: Option<String> = None;
-        if upstream.as_mut().is_some_and(upstream_is_stale) {
+        if upstream_tainted || upstream.as_mut().is_some_and(upstream_is_stale) {
             tracing::debug!(
                 authority = current_authority.as_deref().unwrap_or_default(),
                 "discarding an upstream connection that was closed or is no longer usable"
@@ -688,6 +699,7 @@ async fn serve(
                 None if conn.tunnel_authority.is_some() => redial = current_authority.clone(),
                 None => {}
             }
+            upstream_tainted = false;
         }
         let needs_connect = match (&upstream, &conn.tunnel_authority, &current_authority) {
             (None, _, _) => true,
@@ -843,6 +855,21 @@ async fn serve(
             let client_io: ByteStream = Box::pin(Prefixed::with_prefix(client, client_rest));
             let upstream_io: ByteStream = Box::pin(Prefixed::with_prefix(upstream_io, server_rest));
             return ctx.handoff_upgrade(client_io, upstream_io, id, hint).await;
+        }
+        // The response is complete and already forwarded. The machine parses no
+        // response while no request awaits one, so whatever the origin sent
+        // behind it is still in the machine's buffer, unparsed. Drop it (never
+        // log it) and mark the connection tainted: those bytes are not an answer
+        // to anything, and a partial head left in the buffer would otherwise be
+        // glued onto the next response on this connection.
+        let surplus = machine.take_leftover(Side::Server);
+        if !surplus.is_empty() {
+            tracing::warn!(
+                authority = current_authority.as_deref().unwrap_or_default(),
+                bytes = surplus.len(),
+                "origin sent bytes after a completed response; discarding them and replacing the upstream connection"
+            );
+            upstream_tainted = true;
         }
         if request_close || response_close {
             let _ = client.shutdown().await;
@@ -1424,6 +1451,36 @@ mod tests {
         (ctx, dialed)
     }
 
+    /// Records every event the module emits, in order, and lets it continue.
+    struct RecordingSink {
+        events: Mutex<Vec<Event>>,
+    }
+
+    impl EventSink for RecordingSink {
+        fn emit(&self, ev: Event) -> BoxFuture<'_, Verdict> {
+            self.events.lock().expect("events lock").push(ev);
+            Box::pin(async { Verdict::Continue })
+        }
+    }
+
+    /// Like [`ctx_with`], with a [`RecordingSink`] as the event sink.
+    fn ctx_recording(streams: Vec<ByteStream>) -> (ModuleCtx, DialLog, Arc<RecordingSink>) {
+        let dialed = Arc::new(Mutex::new(Vec::new()));
+        let connector = StubConnector {
+            dialed: dialed.clone(),
+            streams: Mutex::new(streams),
+        };
+        let sink = Arc::new(RecordingSink {
+            events: Mutex::new(Vec::new()),
+        });
+        let ctx = ModuleCtx::new(
+            Arc::new(MemFlowStore::new()),
+            sink.clone(),
+            Arc::new(connector),
+        );
+        (ctx, dialed, sink)
+    }
+
     fn origin_addr() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), 8443)
     }
@@ -1694,10 +1751,15 @@ mod tests {
     /// choose the status line.
     const INJECTED_HEAD: &str = "HTTP/1.1 500 Injected\r\nX-Junk: ";
 
+    /// A complete second response an origin writes behind its first one, in the
+    /// same write. A proxy that parsed it would forward it to the client as the
+    /// answer to a request nobody made.
+    const STRAY_RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nPOISON";
+
     /// Like [`origin_serve`], with `trailer` appended to the last response in the
     /// same write, so the proxy reads it together with that response.
     async fn origin_serve_trailing<S>(
-        mut io: S,
+        io: S,
         bodies: Vec<&'static str>,
         trailer: &'static str,
         then_close: bool,
@@ -1705,6 +1767,33 @@ mod tests {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let last = bodies.len().saturating_sub(1);
+        origin_serve_trailing_on(io, bodies, trailer, last, then_close).await;
+    }
+
+    /// Like [`origin_serve`], with `trailer` appended to the FIRST response in the
+    /// same write. The connection stays open and keeps answering the rest of
+    /// `bodies`, so it is a live upstream the proxy could still reuse.
+    async fn origin_serve_trailing_after_first<S>(
+        io: S,
+        bodies: Vec<&'static str>,
+        trailer: &'static str,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        origin_serve_trailing_on(io, bodies, trailer, 0, false).await;
+    }
+
+    /// The origin behind both helpers above: `trailer` rides in the same write as
+    /// the response to the `trailer_on`-th request.
+    async fn origin_serve_trailing_on<S>(
+        mut io: S,
+        bodies: Vec<&'static str>,
+        trailer: &'static str,
+        trailer_on: usize,
+        then_close: bool,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         for (i, body) in bodies.into_iter().enumerate() {
             let mut seen = Vec::new();
             let mut chunk = [0u8; 256];
@@ -1714,7 +1803,7 @@ mod tests {
                     Ok(n) => seen.extend_from_slice(&chunk[..n]),
                 }
             }
-            let trailer = if i == last { trailer } else { "" };
+            let trailer = if i == trailer_on { trailer } else { "" };
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}{trailer}",
                 body.len()
@@ -1732,15 +1821,28 @@ mod tests {
     }
 
     /// Send a GET on the client end and return the `Content-Length`-framed body.
-    /// Every origin here answers 200, so any other status fails the test.
+    /// Every origin here answers 200, so any other status fails the test. Bytes
+    /// read past the response are dropped; use [`client_get_keep`] to see them.
     async fn client_get(io: &mut DuplexStream, target: &str, host: &str) -> String {
+        client_get_keep(io, &mut Vec::new(), target, host).await
+    }
+
+    /// Like [`client_get`], but every byte read past the response stays in
+    /// `pending`, and `pending` is consumed before the stream is read. A response
+    /// the proxy forwarded behind the real one therefore cannot be dropped
+    /// unnoticed: it shows up in `pending`, or as the answer to the next request.
+    async fn client_get_keep(
+        io: &mut DuplexStream,
+        pending: &mut Vec<u8>,
+        target: &str,
+        host: &str,
+    ) -> String {
         let request = format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n\r\n");
         io.write_all(request.as_bytes()).await.expect("send");
-        let mut buf = Vec::new();
         let mut chunk = [0u8; 512];
         loop {
-            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+            if let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&pending[..end]).to_ascii_lowercase();
                 let status = head.split(' ').nth(1).unwrap_or_default();
                 assert_eq!(status, "200", "unexpected response head {head:?}");
                 let len: usize = head
@@ -1748,13 +1850,16 @@ mod tests {
                     .find_map(|l| l.strip_prefix("content-length: "))
                     .and_then(|v| v.parse().ok())
                     .expect("response Content-Length");
-                if buf.len() >= end + 4 + len {
-                    return String::from_utf8_lossy(&buf[end + 4..end + 4 + len]).into_owned();
+                if pending.len() >= end + 4 + len {
+                    let body =
+                        String::from_utf8_lossy(&pending[end + 4..end + 4 + len]).into_owned();
+                    pending.drain(..end + 4 + len);
+                    return body;
                 }
             }
             let n = io.read(&mut chunk).await.expect("read response");
             assert!(n > 0, "connection closed before a full response arrived");
-            buf.extend_from_slice(&chunk[..n]);
+            pending.extend_from_slice(&chunk[..n]);
         }
     }
 
@@ -2286,6 +2391,293 @@ mod tests {
             ),
             (origin_addr(), Some("origin.test"), Some("http/1.1"), true),
             "only the establishment time changes"
+        );
+    }
+
+    // ---- surplus bytes after a completed response -------------------------
+
+    #[tokio::test]
+    async fn serve_does_not_forward_a_second_response_read_with_the_first() {
+        let (up1, origin1_end) = duplex(64 * 1024);
+        let (up2, origin2_end) = duplex(64 * 1024);
+        let (ctx, dialed, sink) = ctx_recording(vec![Box::pin(up1), Box::pin(up2)]);
+        // Origin 1 writes the answer and a complete second response in one write,
+        // then stays open. The connection is therefore live, but tainted.
+        let _origin1 = tokio::spawn(origin_serve_trailing(
+            origin1_end,
+            vec!["legit"],
+            STRAY_RESPONSE,
+            false,
+        ));
+        let _origin2 = tokio::spawn(origin_serve(origin2_end, vec!["second"], false));
+        let (mut client, proxy_side) = duplex(64 * 1024);
+        let conn = Conn::plain(unknown_peer(), None);
+
+        let serving = serve(&ctx, Box::pin(proxy_side), None, None, conn, MAX_BODY);
+        let script = async {
+            let mut pending = Vec::new();
+            let first = client_get_keep(
+                &mut client,
+                &mut pending,
+                "http://127.0.0.1:8080/one",
+                "127.0.0.1:8080",
+            )
+            .await;
+            let after_first = pending.clone();
+            let second = client_get_keep(
+                &mut client,
+                &mut pending,
+                "http://127.0.0.1:8080/two",
+                "127.0.0.1:8080",
+            )
+            .await;
+            // Hang up, so `serve` sees the client finish and returns.
+            drop(client);
+            (first, after_first, second, pending)
+        };
+        let (served, (first, after_first, second, pending)) =
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(serving, script)
+            })
+            .await
+            .expect("serve hung: request 2 went to the tainted upstream, which never answers");
+
+        served.expect("serve ends cleanly when the client hangs up");
+        assert_eq!(first, "legit");
+        assert!(
+            after_first.is_empty(),
+            "the stray response must not reach the client: {:?}",
+            String::from_utf8_lossy(&after_first)
+        );
+        assert_eq!(second, "second");
+        assert!(
+            pending.is_empty(),
+            "nothing may follow the second response: {:?}",
+            String::from_utf8_lossy(&pending)
+        );
+        assert_eq!(
+            *dialed.lock().expect("dialed lock"),
+            vec![
+                dial("127.0.0.1:8080", "127.0.0.1:8080"),
+                dial("127.0.0.1:8080", "127.0.0.1:8080")
+            ],
+            "the tainted upstream is replaced by a second connection to the same authority"
+        );
+
+        // The plugin chain saw each exchange exactly once: four events per flow,
+        // and no error for a flow that delivered its response.
+        let events = sink.events.lock().expect("events lock");
+        assert_eq!(events.len(), 8, "events: {events:?}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::ResponseHeaders(_)))
+                .count(),
+            2,
+            "events: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::Response(_)))
+                .count(),
+            2,
+            "events: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Error { .. })),
+            "events: {events:?}"
+        );
+
+        // The stored response is the legitimate one, not the stray.
+        let stored = ctx
+            .store()
+            .list()
+            .into_iter()
+            .find_map(|id| match ctx.store().get(id) {
+                Some(Flow::Http(f)) if f.request.path == "/one" => Some(f),
+                _ => None,
+            })
+            .expect("a stored flow for /one");
+        let response = stored.response.expect("a stored response for /one");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.headers.get("content-length"), Some("5"));
+        assert!(
+            matches!(response.body, Body::Bytes(ref b) if b.as_slice() == b"legit"),
+            "stored body: {:?}",
+            response.body
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_does_not_glue_a_stray_head_fragment_onto_the_next_response_on_a_live_upstream() {
+        let (up1, origin1_end) = duplex(64 * 1024);
+        let (up2, origin2_end) = duplex(64 * 1024);
+        let (ctx, dialed) = ctx_with(vec![Box::pin(up1), Box::pin(up2)]);
+        // Origin 1 stays open and would answer request 2 itself, behind the head
+        // fragment it left. Riding that connection would let it pick the status.
+        let _origin1 = tokio::spawn(origin_serve_trailing_after_first(
+            origin1_end,
+            vec!["first", "second"],
+            INJECTED_HEAD,
+        ));
+        let _origin2 = tokio::spawn(origin_serve(origin2_end, vec!["second"], false));
+        let (mut client, proxy_side) = duplex(64 * 1024);
+        let conn = Conn::plain(unknown_peer(), None);
+
+        let serving = serve(&ctx, Box::pin(proxy_side), None, None, conn, MAX_BODY);
+        let script = async {
+            let mut pending = Vec::new();
+            let first = client_get_keep(
+                &mut client,
+                &mut pending,
+                "http://127.0.0.1:8080/one",
+                "127.0.0.1:8080",
+            )
+            .await;
+            // `client_get_keep` fails the test if this answer carries the status
+            // line of the head fragment (500) instead of a 200.
+            let second = client_get_keep(
+                &mut client,
+                &mut pending,
+                "http://127.0.0.1:8080/two",
+                "127.0.0.1:8080",
+            )
+            .await;
+            drop(client);
+            (first, second, pending)
+        };
+        let (served, (first, second, pending)) =
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(serving, script)
+            })
+            .await
+            .expect("serve hung");
+
+        served.expect("serve ends cleanly when the client hangs up");
+        assert_eq!((first.as_str(), second.as_str()), ("first", "second"));
+        assert!(pending.is_empty(), "pending: {pending:?}");
+        assert_eq!(
+            *dialed.lock().expect("dialed lock"),
+            vec![
+                dial("127.0.0.1:8080", "127.0.0.1:8080"),
+                dial("127.0.0.1:8080", "127.0.0.1:8080")
+            ],
+            "the live upstream that left a fragment behind must be replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_reconnects_over_tls_after_a_stray_response() {
+        let (first_up, first_server) = tls_pair().await;
+        let (second_c, second_s) = duplex(64 * 1024);
+        let (ctx, dialed) = ctx_with(vec![Box::pin(second_c)]);
+        let _origin1 = tokio::spawn(origin_serve_trailing(
+            first_server,
+            vec!["legit"],
+            STRAY_RESPONSE,
+            false,
+        ));
+        let _origin2 = tokio::spawn(async move {
+            let tls = TlsAcceptor::from(server_config(&[]))
+                .accept(second_s)
+                .await
+                .expect("origin 2 handshake");
+            origin_serve(tls, vec!["second"], false).await;
+        });
+        let module = HttpModule::new().with_insecure(true);
+        let (mut client, proxy_side) = duplex(64 * 1024);
+
+        let serving = serve(
+            &ctx,
+            Box::pin(proxy_side),
+            Some(first_up),
+            Some(reconnect_to(&module)),
+            tunnel_conn(),
+            MAX_BODY,
+        );
+        let script = async {
+            let mut pending = Vec::new();
+            let first =
+                client_get_keep(&mut client, &mut pending, "/one", "origin.test:8443").await;
+            let after_first = pending.clone();
+            let second =
+                client_get_keep(&mut client, &mut pending, "/two", "origin.test:8443").await;
+            drop(client);
+            (first, after_first, second, pending)
+        };
+        let (served, (first, after_first, second, pending)) =
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(serving, script)
+            })
+            .await
+            .expect("serve hung: request 2 went to the tainted upstream, which never answers");
+
+        served.expect("serve ends cleanly when the client hangs up");
+        assert_eq!(first, "legit");
+        assert!(after_first.is_empty(), "pending: {after_first:?}");
+        assert_eq!(second, "second");
+        assert!(pending.is_empty(), "pending: {pending:?}");
+        assert_eq!(
+            *dialed.lock().expect("dialed lock"),
+            vec![("origin.test:8443".to_string(), origin_addr())],
+            "exactly one dial, the TLS reconnect, through the connector"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_fails_closed_for_a_tainted_tls_upstream_without_a_reconnect() {
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, dialed) = ctx_with(Vec::new());
+        let _origin = tokio::spawn(origin_serve_trailing(
+            origin_end,
+            vec!["legit"],
+            STRAY_RESPONSE,
+            false,
+        ));
+        let (mut client, proxy_side) = duplex(64 * 1024);
+
+        let serving = serve(
+            &ctx,
+            Box::pin(proxy_side),
+            Some(Box::pin(up)),
+            None,
+            tunnel_conn(),
+            MAX_BODY,
+        );
+        let script = async {
+            let mut pending = Vec::new();
+            let first =
+                client_get_keep(&mut client, &mut pending, "/one", "origin.test:8443").await;
+            client
+                .write_all(b"GET /two HTTP/1.1\r\nHost: origin.test:8443\r\n\r\n")
+                .await
+                .expect("send");
+            let mut got = Vec::new();
+            client.read_to_end(&mut got).await.expect("read to EOF");
+            (first, pending, got)
+        };
+        let (served, (first, pending, got)) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(serving, script)
+        })
+        .await
+        .expect("serve hung: request 2 went to the tainted upstream, which never answers");
+
+        assert_eq!(first, "legit");
+        assert!(pending.is_empty(), "pending: {pending:?}");
+        let err =
+            served.expect_err("a tainted TLS upstream with no reconnect must fail the request");
+        assert_eq!(
+            err.to_string(),
+            "upstream TLS connection closed and cannot be re-established"
+        );
+        assert!(
+            got.is_empty(),
+            "the client must see no further bytes: {got:?}"
+        );
+        assert!(
+            dialed.lock().expect("dialed lock").is_empty(),
+            "nothing may be dialed, in particular not in cleartext"
         );
     }
 }
