@@ -6,7 +6,7 @@ import Observation
 
 /// The sidebar's entries (foundation §2.6). Snapshot mode walks every case.
 enum SidebarPage: String, CaseIterable, Identifiable {
-    case pinned, saved, apps, domains, overview, connections, scope, findings, browser, scripts, agent, ca, config
+    case pinned, saved, apps, domains, overview, connections, scope, scan, findings, browser, scripts, agent, ca, config
 
     var id: String { rawValue }
 
@@ -19,6 +19,7 @@ enum SidebarPage: String, CaseIterable, Identifiable {
         case .overview: "Overview"
         case .connections: "Connection Log"
         case .scope: "Scope"
+        case .scan: "Scan"
         case .findings: "Findings"
         case .browser: "Browser"
         case .scripts: "Scripts"
@@ -37,6 +38,7 @@ enum SidebarPage: String, CaseIterable, Identifiable {
         case .overview: "chart.bar"
         case .connections: "point.3.connected.trianglepath.dotted"
         case .scope: Tok.Glyph.scope
+        case .scan: Tok.Glyph.search
         case .findings: Tok.Glyph.poc
         case .browser: Tok.Glyph.browser
         case .scripts: "chevron.left.forwardslash.chevron.right"
@@ -50,7 +52,7 @@ enum SidebarPage: String, CaseIterable, Identifiable {
     var showsFlows: Bool {
         switch self {
         case .pinned, .saved, .apps, .domains, .scope, .connections: true
-        case .overview, .findings, .browser, .scripts, .agent, .ca, .config: false
+        case .overview, .scan, .findings, .browser, .scripts, .agent, .ca, .config: false
         }
     }
 
@@ -147,6 +149,8 @@ final class Session {
     var l4Enabled: Bool { tools.contains { $0.name == "l4.flow.list" } }
     var l4HasSetter: Bool { tools.contains { $0.name == "l4.agent.set" } }
     var l4HasIntercept: Bool { tools.contains { $0.name == "l4.intercept.start" } }
+    /// `scan.discover` is advertised by the current core (feature-detected): the Scan page is offered, else hidden.
+    var scanEnabled: Bool { ScanForm.isOffered(in: tools) }
     var selection: Set<FlowID> = []
     /// The flow the inspector shows: the last clicked row.
     var focused: FlowID?
@@ -319,6 +323,13 @@ final class Session {
                             + "64 pps. Re-send with _confirm to put it on the wire."),
                         "confirm_token": .string("l4-\(UUID().uuidString.prefix(8))"),
                     ])
+                case "scan.discover":
+                    // The scanner gates the seed before its first navigation: an out-of-scope target is refused, never crawled.
+                    let target = args["target"]?.stringValue ?? ""
+                    guard let authority = ScanForm.authority(of: target), Scope.contains(authority, in: scopeHosts) else {
+                        throw BusError.tool(message: "scan.discover refused: OutOfScope — \(target) is not in scope (deny-by-default).")
+                    }
+                    return Fixtures.scanDiscover
                 case "l4.agent.status": return l4AgentGatesJSON()
                 case "l4.agent.set":
                     if let cap = args["capability"]?.stringValue, let allowed = args["allowed"]?.boolValue {
@@ -361,6 +372,7 @@ final class Session {
     // MARK: Panels (M5): each panel owns its state; the session holds one of each.
 
     @ObservationIgnored lazy var poc = PocPanelState(session: self)
+    @ObservationIgnored lazy var scan = ScanPanelState(session: self)
     @ObservationIgnored lazy var browser = BrowserState(session: self)
     @ObservationIgnored lazy var activity = ActivityState(session: self)
     var activityLogVisible = false
@@ -547,5 +559,6 @@ final class Session {
         select(Fixtures.rows[9].id)
         poc.load()
         findingsCount = poc.findings.count
+        scan.loadFixture()
     }
 }

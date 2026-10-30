@@ -44,7 +44,7 @@ extension Session {
         for (title, subtitle, shortcut, action) in locals {
             all.append(PaletteItem(id: "local:\(title)", section: .local, title: title, subtitle: subtitle, shortcut: shortcut, method: nil, kind: .local(action)))
         }
-        let setup: [(String, String, () -> Void)] = [
+        var setup: [(String, String, () -> Void)] = [
             ("Certificate Authority…", "Status, export, install the proxy's CA", { [self] in show(.ca) }),
             ("Configuration…", "The proxy's effective config", { [self] in show(.config) }),
             ("Overview", "Session statistics", { [self] in show(.overview) }),
@@ -53,6 +53,10 @@ extension Session {
             ("Add Host to Scope…", "Authorise a host for testing", { [self] in scopeSheetVisible = true }),
             ("Open Browser", "Show the embedded browser", { [self] in show(.browser) }),
         ]
+        // Offered only when the core lists scan.discover; opening the page never scans.
+        if scanEnabled {
+            setup.append(("Scan…", "Crawl an in-scope target for endpoints and injection points", { [self] in show(.scan) }))
+        }
         for (title, subtitle, action) in setup {
             all.append(PaletteItem(id: "setup:\(title)", section: .setup, title: title, subtitle: subtitle, shortcut: nil, method: nil, kind: .local(action)))
         }
