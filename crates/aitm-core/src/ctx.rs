@@ -68,7 +68,9 @@ pub trait BrowserDriver: Send + Sync {
 /// `CallerTrust` itself grows a variant, `is_trusted_control` is the single place
 /// to classify it. Never compare a `Frontend` with `==` or `!=` to decide trust: a
 /// comparison against the agent role is a deny-list that fails open for a variant
-/// added later, and the compiler cannot exhaustiveness-check it.
+/// added later, and the compiler cannot exhaustiveness-check it. The source scan
+/// `crates/aitm-core/tests/trust_gate_scan.rs` rejects any such `==` or `!=`
+/// comparison of a role in any `crates/*/src` file.
 ///
 /// Label-only sites (`role_str` in `aitm-mcp`, `frontend_label` in `aitm-ca`,
 /// `origin_str` in `aitm-findings`) map an unclassified variant to the agent label
