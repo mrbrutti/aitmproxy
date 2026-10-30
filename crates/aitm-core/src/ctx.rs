@@ -140,6 +140,7 @@ pub struct CommandHost<'a> {
     client_label: Option<String>,
     config: Option<std::sync::Arc<crate::config::Config>>,
     finding_recorder: Option<&'a dyn FindingRecorder>,
+    egress: Option<&'a crate::egress::EgressConfinement>,
 }
 
 impl<'a> CommandHost<'a> {
@@ -166,6 +167,7 @@ impl<'a> CommandHost<'a> {
             client_label: None,
             config: None,
             finding_recorder: None,
+            egress: None,
         }
     }
 
@@ -199,6 +201,20 @@ impl<'a> CommandHost<'a> {
     pub fn with_ssrf(mut self, policy: crate::config::SsrfPolicy) -> Self {
         self.ssrf = policy;
         self
+    }
+
+    /// Attach the proxy's live browser-egress posture, so `browser.confine`
+    /// (and later the scanner) can toggle it. `None` (the default) means the
+    /// toggle is unavailable on this host — a frontend that never invokes
+    /// `browser.confine` need not wire it.
+    pub fn with_egress(mut self, egress: &'a crate::egress::EgressConfinement) -> Self {
+        self.egress = Some(egress);
+        self
+    }
+
+    /// The attached browser-egress posture, if the frontend wired one.
+    pub fn egress(&self) -> Option<&crate::egress::EgressConfinement> {
+        self.egress
     }
 
     /// Declare which frontend built this host (defaults to [`Frontend::Mcp`]).

@@ -413,6 +413,11 @@ pub struct BrowserConfig {
     pub ignore_cert_errors: bool,
     pub nav_timeout: Duration,
     pub ssrf: SsrfPolicy,
+    /// Start the browser-facing listener in scope-confined egress mode: refuse an
+    /// out-of-scope PUBLIC host (scanner S2). **Off by default** — the general
+    /// interception path must let an operator browse arbitrary public hosts. A
+    /// scan campaign or agent crawl turns it on at runtime.
+    pub confine_egress_to_scope: bool,
 }
 
 impl Default for BrowserConfig {
@@ -428,6 +433,8 @@ impl Default for BrowserConfig {
             ignore_cert_errors: true,
             nav_timeout: Duration::from_secs(30),
             ssrf: SsrfPolicy::default(),
+            // Off: free browsing is the general-interception default (spec AC8).
+            confine_egress_to_scope: false,
         }
     }
 }
