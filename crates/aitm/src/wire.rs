@@ -150,7 +150,8 @@ pub fn assemble_with_scripts(
     )?);
     let http = HttpModule::with_ca(ca.clone())
         .with_insecure(cfg.ssl_insecure)
-        .with_max_body_bytes(cfg.limits.max_body_bytes);
+        .with_max_body_bytes(cfg.limits.max_body_bytes)
+        .with_max_concurrent_streams(cfg.limits.max_concurrent_streams as usize);
 
     // The control plugin's `proxy.status` reports whether intercept is armed and
     // whether the proxy is serving, so it shares the intercept plugin's armed flag

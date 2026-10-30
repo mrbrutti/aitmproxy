@@ -11,6 +11,14 @@ aitm-core.workspace = true
 aitm-plugin.workspace = true
 anyhow.workspace = true
 futures.workspace = true
+# HTTP/2 engine (the one `hyper` uses) + the `http` request/response/pseudo-header
+# types it speaks. Versions are pinned here, not in the root manifest, per the
+# proto-http sibling-session convention. (M7)
+h2 = "0.4"
+http = "1"
+# The byte buffer type `h2`'s `SendStream`/`RecvStream` speak (re-exported by
+# neither `h2` nor `http`); required to drive the h2 body frames. (M7 Task 2)
+bytes = "1"
 tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
 # Certificate authority: root generation + leaf minting, and the leaf cache.
 rcgen = { version = "0.14", features = ["x509-parser"] }
@@ -35,6 +43,18 @@ libc = "0.2"
 [dev-dependencies]
 uuid.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+# The real intercept plugin + its flow.intercept/mutate/resume/kill commands,
+# driven through the registry so h2 interception is tested end to end against the
+# same plugin set the chain dispatches through (M7 Task 3).
+aitm-plugins.workspace = true
+# The real Map Local/Remote plugin + its map.add command, driven through the
+# registry so h2 Map Remote cross-origin is tested end to end against the same
+# plugin + scope guard the chain dispatches through (M7 Task 4).
+aitm-plugin-maprules.workspace = true
+# The real session/flow-export plugin + its session.save/load + flow.export/import
+# commands, driven through a registry so an h2 flow's session/HAR version tag is
+# tested end to end over the actual serialization surface (M7 Task 6, AC-H2.11).
+aitm-plugin-sessionio.workspace = true
 
 [lints]
 workspace = true
