@@ -100,27 +100,47 @@ test-first and leaves the full gate green.
   refused (private default unaffected). Keep the existing private-target test.
 - **Done when:** the new + existing proxy tests pass and the full gate passes.
 
-### Task 4: toggle surface — `CommandHost` handle + `browser.confine`
+### Task 4a: toggle command — `CommandHost` handle + `browser.confine`
 
 - **Satisfies:** AC9
 - **Depends on:** Task 1, Task 3
 - **Files:** `crates/aitm-core/src/ctx.rs` (modify: add `egress:
   Option<&'a EgressConfinement>` field + `with_egress` + `egress()` accessor to
-  `CommandHost`), the builtin-command module that registers core commands
-  (modify: add the `browser.confine` `Command` impl + register it),
-  its test module (modify).
-- **Change:** `CommandHost` carries an optional `&EgressConfinement`. A new
-  `struct ConfineCommand` implementing `Command`: `name() = "browser.confine"`;
-  `schema()` = one bool param `on`, result object `{ confined: bool }`;
-  `sensitivity() = Sensitivity::Sensitive`; `invoke` reads `host.egress()`, calls
-  `set_base(on)`, returns `{ confined: <posture>.confined() }` (error if no egress
-  handle wired). Register it beside the other `browser.*`/core builtins.
+  `CommandHost`), `crates/aitm-browser/src/commands.rs` (modify: add the
+  `browser.confine` `Command` impl + register it beside the other `browser.*`
+  commands), test module in the same file.
+- **Change:** `CommandHost` carries an optional `&EgressConfinement` (default
+  `None`). A new `struct Confine` implementing `Command`: `name() =
+  "browser.confine"`; `schema()` = one bool param `on`, result object
+  `{ confined: bool }`; `sensitivity() = Sensitivity::Sensitive`; `invoke` reads
+  `host.egress()`, calls `set_base(on)`, returns `{ confined: <posture>.confined() }`
+  (a clear error if no egress handle is wired). Register it in
+  `aitm_browser::commands::register`.
 - **Test:** `browser_confine_toggles_posture` — wire a `CommandHost` with an
   `EgressConfinement`, invoke `browser.confine {on:true}` → result
   `{confined:true}` and `confined()` true; `{on:false}` → false.
-  `browser_confine_is_sensitive` — `ConfineCommand.sensitivity() ==
-  Sensitivity::Sensitive`.
+  `browser_confine_is_sensitive` — `Confine.sensitivity() == Sensitivity::Sensitive`.
 - **Done when:** both tests pass and the full gate passes.
+
+### Task 4b: thread the posture handle through the live frontends
+
+- **Satisfies:** AC9 (end-to-end reachability)
+- **Depends on:** Task 4a
+- **Files:** `crates/aitm-cli/src/dispatch.rs`, `crates/aitm-mcp/src/server.rs`,
+  `crates/aitm/src/tui.rs`, `crates/aitm/src/main.rs` (modify). (`aitm-proto-l4`
+  and `aitm-poc` host-assembly sites stay `egress: None` — they never invoke
+  `browser.confine`.)
+- **Change:** `Dispatch` and `McpServer` each gain an `egress:
+  Arc<EgressConfinement>` field + constructor parameter; their `CommandHost`
+  assembly calls `.with_egress(&self.egress)`. The TUI host-assembly site likewise
+  gets `.with_egress(..)`. `main.rs` passes `proxy.egress()` into each. Stop and
+  report if a constructor-signature change ripples into unlisted test/builder
+  sites rather than editing them blindly.
+- **Test:** an integration assertion that a frontend-assembled host carries the
+  posture (or, if cheaper, that `main` wiring compiles + the existing frontend
+  tests stay green). Reachability is the point.
+- **Done when:** the gate passes and `browser.confine` toggles the proxy's live
+  posture through an assembled frontend host.
 
 ## Review log
 
