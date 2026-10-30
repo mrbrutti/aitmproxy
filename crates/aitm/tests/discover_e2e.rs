@@ -38,7 +38,6 @@ mod scripted_driver;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -86,33 +85,16 @@ async fn wait_listening(addr: SocketAddr) {
     }
 }
 
-/// A CA directory of the rig's own, removed when the rig drops. The tests in this
-/// binary run on parallel threads and `CertAuthority::load_or_generate` is not
-/// safe to race on one directory, so a process-wide path will not do.
-struct CaDir(PathBuf);
-
-impl CaDir {
-    fn new() -> Self {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        Self(std::env::temp_dir().join(format!("aitm-scan-ca-{}-{n}", std::process::id())))
-    }
-}
-
-impl Drop for CaDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// Everything one end-to-end scan needs: the vulnerable target, the proxy's
 /// store and guard, the launched engine, and the `scan.discover` the proxy's own
 /// registry serves (the same instance every frontend reaches).
 struct ScanRig {
     /// Held so the target keeps serving, and the CA directory existing, for the
-    /// rig's lifetime.
+    /// rig's lifetime. The directory is the rig's own: the tests in this binary
+    /// run on parallel threads and `CertAuthority::load_or_generate` is not safe
+    /// to race on one directory.
     _target: TestTarget,
-    _ca_dir: CaDir,
+    _ca_dir: rig::TempDir,
     target_url: String,
     store: Arc<dyn aitm_core::FlowStore>,
     guard: Arc<dyn aitm_core::ScopeRateGuard>,
@@ -134,9 +116,9 @@ async fn scan_rig() -> ScanRig {
 
     // A proxy that MITMs the target as an HTTPS origin; the engine routes through
     // its browser-facing listener.
-    let ca_dir = CaDir::new();
+    let ca_dir = rig::TempDir::new("scan-ca");
     let mut cfg = Config::default();
-    cfg.ca.dir = ca_dir.0.clone();
+    cfg.ca.dir = ca_dir.path().to_path_buf();
     cfg.ssl_insecure = true;
     cfg.browser.proxy_addr = free_addr();
     cfg.scope.entries = vec![ScopeEntry {
@@ -327,7 +309,16 @@ async fn scan_discover_over_the_web_bridge_returns() {
         "params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"aitm-web","version":"0"}}})))
         .await
         .expect("initialize");
-    ws.next().await.expect("initialize reply").expect("frame");
+    let init = ws
+        .next()
+        .await
+        .expect("initialize reply")
+        .expect("frame")
+        .into_text()
+        .expect("text frame");
+    let init: serde_json::Value = serde_json::from_str(init.as_str()).expect("json reply");
+    assert_eq!(init["id"], 1, "reply to initialize: {init}");
+    assert!(init["result"].is_object(), "initialize succeeded: {init}");
 
     for run in 1..=2 {
         ws.send(frame(
