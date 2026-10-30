@@ -497,7 +497,7 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   `tracing::debug!` line carries only a fixed tag (the `GuardError` variant name,
   `runner_error` or `record_error`), never error text. Reached through `campaign::run_class`
   (Task 9), which wraps the call in `inject::bounded`. In the tests below `deadline` is `now
-  + 60 s` unless stated.
+  + 60 s` unless stated (T5's `deadline_after(60 s)` helper).
 - **Test** (same hermetic fixtures as Task 16; fixtures take the budget by `&mut usize`):
   - `records_once_and_decrements_budget` (AC10, AC22): reflecting stub, `findings.dir = tmp`,
     counting recorder wired, `budget = 5` → `Recorded { .. }`, `budget == 4`, the store holds
@@ -584,7 +584,8 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   `cargo clippy -- -D warnings`.
   Gate the target host up front with the read-only `host.guard().in_scope(authority)`
   (`ScopeRateGuard::in_scope`: no rate token, permit or error budget; `authority` is
-  `host:port`, the port defaulted from the scheme as `crawl.rs` does) and return
+  `host:port`, the port defaulted from the scheme with a 3-line private helper copied from
+  `crawl.rs`'s `guard_authority` — `crawl.rs` is not in T5's Files, so copy rather than edit) and return
   `GuardError::OutOfScope(authority.to_string())` when it is false; that is the only `Err`
   `inject` returns. (`check_active` takes a token on every call, so using it here would let a
   second swept class fail with `RateLimited` after the first drained the per-host bucket; a
@@ -593,7 +594,8 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   + `scheme://authority/path` **without the query** + location + name) was already injected in
   this call (first flow wins), a point whose source flow is no longer in the store, and a
   point whose source request has a non-token method or a path with a space or control byte —
-  all counted in `skipped`, the last never sent. For each remaining point, try the class payloads in order
+  the evicted-flow and bad-request-line skips are counted in `skipped` (the bad request line
+  is never sent); the dedupe skip is not. For each remaining point, try the class payloads in order
   (≤ `per_class_payload_cap`). Before every send: if `budget.checked_sub(1)` is `None`, stop
   with `stopped_reason = Some("budget")`; if `deadline` has passed, stop with
   `Some("time_budget")`. Send the mutated `HttpRequest` (only the one targeted location
@@ -627,8 +629,9 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   insert and return the flow they build, count their calls and expose `requests() ->
   Vec<HttpRequest>` (every request they received, in order — later tasks assert "the stub
   saw X on the replay request" through it) — `Reflect` (the body echoes the mutated value;
-  `Reflect::only("q")` echoes that one parameter's value only, which the AC24 rows with a
-  credential-named query/form point need so that only `q` confirms), `Escape` (same,
+  `Reflect::only("q")` echoes that one parameter's value only — it reads `q` from the query,
+  a form body or a top-level JSON key — which the AC24 rows with a credential-named query,
+  form or JSON-body point need so that only `q` confirms), `Escape` (same,
   HTML-escaped), `Slow(d)` (sleeps `d` before answering), `SlowOnRepeat(d)` (the first request
   for a given method + `req.path` is answered at once; a later request with the same method
   and path sleeps `d`), `BigBody(len)` (a body of `len` bytes), `Scripted(queue)` (each call
@@ -952,6 +955,7 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   pub struct CampaignSummary { pub run_id: String, pub phase: String,
       pub pages_crawled: usize, pub requests_used: usize, pub request_budget: usize,
       pub confirmed_count: usize, pub stopped_reason: Option<&'static str> }
+  #[derive(Debug)]
   pub struct ClassRun { pub inject: crate::inject::InjectOutcome,
       pub outcomes: Vec<crate::reproduce::ReproOutcome>,
       pub stopped_reason: Option<&'static str> }
@@ -1272,6 +1276,30 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| T6-T10 | spec, quality | Important | Every command-registration task fails the workspace gate unless it also edits the `aitm-tui` `CORE_TOOLS` / `bus-fixture.json` / `tester_shell.rs` pins; the closed file list forbade it | fixed in eaef723 |
+| T4, T8, T9 | spec, quality | Important | `scan.run`'s reproduce+record loop had no owner (copy-paste or silent no-record) | fixed in eaef723 (shared `reproduce_and_record`), refined in a8a7ab4 (`run_class`, typed results) |
+| T4, T16 | spec, quality, security | Important | "No credential reaches the PoC file" false beyond four headers; AC24 vacuous | fixed in eaef723, redesigned in a8a7ab4 (placeholders + one `scrub_text` backstop), claim narrowed in e04ec44 / 9840323; OQ11 open |
+| T5, T8 | quality | Important | One Confirmed -> one reproduction -> one record duplicates findings per point; no `findings.dir` / per-confirmation failure policy | fixed in eaef723 |
+| T9, OQ2/OQ7 | quality | Important | T9 contradicted OQ2; OQ7's default contradicted T9/T10 | fixed in eaef723 |
+| T5, T9 | security, spec, quality | Important | `Confirmed` retained full response bodies; replay loop not time-bounded; runner error text echoed credentials; injection send failures discarded confirmations; pre-check false refusals | fixed in a8a7ab4 |
+| T13 | tester, quality | Important | `#[cfg_attr(not(AITM_OBSCURA), ignore)]` is not a cargo cfg: trips `unexpected_cfgs` and can never run | fixed in e04ec44 (runtime `rig::obscura_enabled()` guard) |
+| T5 | quality | Important | `pub(crate)` helpers + shared test helpers trip `dead_code` under `-D warnings` at T5's gate | fixed in e04ec44 |
+| AC18 | tester | Important | no named test / `inputSchema` assertion | fixed in e04ec44 (`scan_tools_have_non_empty_input_schemas`) |
+| AC20 | tester, quality, spec | Important/Minor | `>= 3` classes cannot be met by the dispatched plan (no seeded class confirms generically) | fixed in e04ec44: AC20 amended to the shipped two; third class optional follow-up (**needs Matt's approval of the AC20 amendment**) |
+| T6 | quality | Important | `ScanPassive { cfg }` field never read -> clippy fails at T6's gate | fixed in 9840323 (unit struct) |
+| T5, T8, T9 | security | Important | `inject`'s up-front `check_active` returned `RateLimited` -> `Err` between swept classes, losing earlier classes' findings | fixed in 9840323 (read-only `in_scope` gate; AC34(viii)) |
+| T8, T10 | security | Minor | Agent-gate posture (`defers_to_command_gate` entries) is a decision, gate must fail closed | fixed (OQ6 dispatch gate; `!matches!(Cli\|Operator)`); **Matt's explicit OQ6 answer required before T8/T10 dispatch** |
+| spec/plan | all | Minor (~60) | wording, test-name/count drift, duplication, helper signatures, path conventions, deadlines in tests, derives, edge-case tests | fixed across eaef723 / a8a7ab4 / e04ec44 / 9840323 |
+| T8, T10 | quality (M10) | Minor | split an early scanner-independent `aitm-mcp` task out of T8; dedupe MCP test helpers into `tests/support/` | accepted by orchestrator (autonomous mode, 2026-10-30): keeps task numbering stable and the entries must land with/after the command-side flag check; helper dedupe is a follow-up |
+| spec | spec | Minor | cross-flow endpoint dedupe extends round-1 finding I4's literal wording | accepted by orchestrator (2026-10-30): matches I4's intent; recorded in Architect's call 17 / AC27 |
+| T16 | spec | Minor | open-redirect statuses 300, 304-306, 309-399 can never reproduce (fail closed) | accepted by orchestrator (2026-10-30); resolved further by T18 part A moving the status clause into `success_assertion` |
+| T5, spec | security, quality | Minor | `UnreproReason`/`StopReason` full enums; surfacing `send_errors`/`skipped`; aggregate retained-request-bytes cap; `Variable.default` provenance; leaked temp dirs | accepted by orchestrator (2026-10-30): `&'static str` enforces constants-only; the rest are one-line Left-to-builder notes or follow-ups |
+| spec | security (r5) | Important | the "not detected" list omitted a nested JSON-quoted `"authorization":"…"` key (`scrub_text` needs `authorization` followed directly by `:`/`=`) | fixed in the final commit (spec backstop bullet, "What is guaranteed" (a), OQ11) |
+| T5, T9, T17 | security (r5) | Minor | `OutOfScope` for a later swept class (operator removed scope mid-campaign) is still a hard `Err`; 10 consecutive refusals labelled `guard_refused` even when a rate bucket would eventually admit; whether a charged non-rate error resets the consecutive counter is unstated; AC34(viii) case 1 is timing-sensitive | accepted by orchestrator (2026-10-30): fail-closed and operator-initiated; the deterministic case 2 is the stronger proof; builder pins the counter reset when writing T5/T17 |
+| T5, T9 | quality (r5) | Minor | skip-count wording, `guard_authority` helper provenance, `ClassRun` derive, `Reflect::only` coverage, T17 deadline wording, T6 paragraph readability | fixed in the final commit (T6 readability accepted) |
+| out of range | security, quality | n/a | scope-plugin design/plan still say `control_passed == Some(false)`; integration Task 8 needs an ordering note; `findings.record` can forge a "reproduced" record; `poc.allow_agent_run` fails open on `== Mcp` | recorded in the PR description, not changed here |
+
+Panel rounds: 1 (24204cd) spec FAIL 3I/3M, quality FAIL 7I/9M, security FAIL 1I/6M; 2 (eaef723) spec FAIL 2I, quality FAIL 4I, security FAIL 5I, tester 6 gaps; 3 (a8a7ab4) spec PASS, tester 3I, quality 2I, security 1I; 4 (e04ec44) spec PASS, tester PASS, quality 1I, security 1I; 5 (9840323) quality PASS, security 1I (nested `authorization` in the not-detected list, fixed in the final commit; a one-sentence documentation fix, not re-reviewed). Fix-task inputs: `panel-findings-round{1,2,3}.md` in the session notes folder.
 
 ## Shipped
 

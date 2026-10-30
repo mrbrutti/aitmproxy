@@ -669,7 +669,9 @@ built `Step::Http`:
   vocabulary is `authorization`, `bearer`, `token`, `password`, `passwd`, `pwd`,
   `secret`, `cookie`, `credential` and `api[_-]?key`; it does **not** see `pass`, `pw`,
   `key`, `sig`, `code`, `pin`, `otp`, `sid`, `session`, `jwt`, `csrf`, `auth`,
-  `PHPSESSID` or `jsessionid` (and `bearer` except as `Bearer <value>`). Those names are covered only where the placeholder step
+  `PHPSESSID` or `jsessionid` (and `bearer` except as `Bearer <value>`, and `authorization`
+  except as `authorization:` / `authorization=` — a JSON-quoted `"authorization":"…"`
+  puts a `"` between the name and the colon, so a nested one is not seen). Those names are covered only where the placeholder step
   looks (a header, a cookie, a top-level query/form/JSON key) or by the structural
   path-parameter refusal; "What is guaranteed" lists what that leaves undetected.
 - `bindings` carries `target` (the attack flow's `scheme://authority`) plus one entry
@@ -684,14 +686,16 @@ under `scrub_text`; and every `unreproduced[].reason` is a constant, so no runne
 templater or header-validation error — which can quote a rendered URL or header value —
 reaches a result. What is **not** detected, exactly: (a) a name `scrub_text` has no
 needle for — the list above plus `bearer=` (it matches `bearer` only as `Bearer <value>`)
+and a nested JSON-quoted `"authorization":"…"` (`{"cfg":{"authorization":"Basic …"}}`)
 — that is a *nested* JSON object or array key (`{"card":{"pin":"q7x9k2"}}`,
 `{"data":{"sessionId":"…"}}`) or appears in a non-credential header value such as
 `Referer: …?PHPSESSID=…` or in a query or header value (`…&x=a;sid=…`); a path
 parameter is refused structurally, not here; (b) a credential percent-encoded inside
 another value (`?next=http%3A%2F%2Fh%2F%3Ftoken%3D…`): `token` is a needle, but encoding
 removes the `=` framing it needs; (c) a credential inside a form or JSON string *value*
-that carries an encoded blob (a JSON document or `k=v` pairs as one value), and a JSON
-key written with `\u` escapes when the body is carried verbatim; (d) an opaque token in
+that carries an ENCODED or ESCAPED blob (a JSON document with escaped quotes as one
+value; plain `k=v` pairs in a value ARE seen by `scrub_text`), and a JSON key written
+with `\u` escapes when the body is carried verbatim; (d) an opaque token in
 a path segment (`/reset/9f8a…`); and (e) a bare credential value with no `key=`,
 `Bearer` or `Authorization` framing. Open question 11 asks whether to close (a) by
 widening the backstop. The PoC is as sensitive as the captured request it was built from,
@@ -1317,7 +1321,8 @@ default changes a task, the question says which.
     let an unreproduced point try its next payload.
 11. **Widen the credential backstop?** The backstop sees only `scrub_text`'s narrower
     vocabulary, so credential-vocabulary names that are nested keys, sit in non-credential
-    header values or query values, or are percent-encoded inside another value reach the
+    header values or query values, or are percent-encoded inside another value — and a nested
+    JSON-quoted `"authorization":"…"` key — reach the
     PoC YAML (listed under "What is guaranteed, and what is not"; AC24 row 17 tests the
     nested `pin` case). Default: **no change**. Alternative: widen the backstop to the union
     vocabulary (`scrub_text`'s plus `is_secret_name` and `POC_EXTRA_NEEDLES`), fail-closed —
