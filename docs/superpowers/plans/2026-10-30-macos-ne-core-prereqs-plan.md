@@ -1,6 +1,6 @@
 # macOS NE core prerequisites — rendezvous writer + scope-spec emitter plan
 
-**Status:** Approved 2026-10-30 (self-approved per Matt's autonomous mandate; C1–C7 confirmed). Execute Task 1 then Task 2.
+**Status:** Approved 2026-10-30 (self-approved; C1–C7 confirmed). Tasks 1 + 2 implemented (commit 5219598, PR #122). **Fix pass in progress** after the Stage-6 security FAIL — see the Review log; Task 2's L7 rule + fixture amended below.
 **Spec:** `docs/superpowers/specs/2026-10-30-macos-ne-core-prereqs-design.md`
 **Branch / worktree:** `claude/nervous-feynman-6d408a` (this worktree)
 
@@ -107,42 +107,55 @@ in the sandbox; the full gate runs via the Terminal panel.
 - **Change:**
   - `pub fn provider_scope_spec(l7: &[aitm_core::ScopeEntry], l4: &[aitm_proto_l4::types::L4ScopeEntry]) -> crate::macos_capture::listener::ScopeSpec`
     implementing the token rules from the spec's Design §Piece 2:
-    - L7: trim+lowercase `host`; `*.suffix` → emit `suffix` then `*.suffix`
-      (skip if suffix empty); else
-      `aitm_core::authority::Authority::parse_with_default(raw, 0)` → on `Ok`
-      emit `a.host` when `a.port == 0` else `a.to_string()`; on `Err` skip.
+    - L7 (amended — security findings 1 + 2): trim+lowercase `host`. A host label is
+      **emittable** only if it passes the provider's `isValidHostname`
+      (`FlowHandoff.swift:577-583`: non-empty, ≤253, no leading `.`, no `..`, chars in
+      `[a-z0-9.\-_]`) — add a private `is_emittable_host(&str) -> bool` mirroring it.
+      Rules: **skip** any entry whose host parses as `std::net::IpAddr` (bare,
+      `host:port`, bracketed v6, or `*.`-suffix) — finding 2, IP targets belong in the
+      L4 scope. `*.suffix` → if suffix empty / IpAddr / not `is_emittable_host` → skip,
+      else emit `suffix` then `*.suffix`. Else `Authority::parse_with_default(raw, 0)`
+      → `Err` → skip; `Ok(a)` where `a.host` is IpAddr or not `is_emittable_host` →
+      skip (finding 1); `a.port == 0` → emit `a.host`; `a.port != 0` → emit
+      `format!("{}:{}", a.host, a.port)` (`a.host` is a validated DNS name, never an
+      IPv6 literal, so no bracketing).
     - L4: keep only `capability == L4Capability::Capture && interface == crate::macos_capture::adapter::CAPTURE_INTERFACE && direction == L4Direction::Outbound`;
       require host-prefix CIDR (`V4`/32 or `V6`/128, else skip); any-port
       (`lo==0 && hi==65535`) → bare `addr.to_string()`; single-port (`lo==hi`) →
-      `ip:port` with IPv6 bracketed (`[ip]:port`); partial range → skip.
+      `std::net::SocketAddr::new(addr, lo).to_string()` (stdlib gives `ip:port` for v4
+      and `[ip]:port` for v6 — quality Minor, replaces a hand-rolled `bracket_ip`);
+      partial range → skip.
     - Collect tokens L7-then-L4 in input order, de-duplicate preserving first
       appearance, join with `" "`, wrap in `ScopeSpec { spec }`.
-  - Private helpers (builder's discretion): e.g. `l7_tokens`, `l4_tokens`, a
-    `bracket_ip(addr, port)` formatter.
-- **Test** (in `scope_spec.rs`, pure):
-  - `emits_byte_exact_spec_for_representative_scopes` — build the pinned fixture
-    (spec §"Pinned scope fixture"): L7 `["Example.com", "*.api.example.com", "10.0.0.5:8080", "[2001:db8::1]:443"]`;
-    L4 the eight entries listed there. Assert
-    `provider_scope_spec(&l7, &l4).spec == "example.com api.example.com *.api.example.com 10.0.0.5:8080 [2001:db8::1]:443 198.51.100.7 203.0.113.9:53 2001:db8::2"`
-    (**AC8, AC9, AC11, AC12**).
+  - Private helpers (builder's discretion): e.g. `l7_tokens`, `l4_token`,
+    `is_emittable_host`, `push_unique`. Delete the redundant `CAPTURE_INTERFACE`
+    import in the test module (quality Minor).
+- **Test** (in `scope_spec.rs`, pure; fixture = spec §"Pinned scope fixture", amended):
+  - `emits_byte_exact_spec_for_representative_scopes` — L7
+    `["Example.com", "*.api.example.com", "10.0.0.5:8080", "[2001:db8::1]:443", "a,b.com", "*.c;d.com"]`;
+    L4 the nine entries listed in the spec (incl. the IPv6 single-port
+    `2001:db8::3/128:443`). Assert
+    `provider_scope_spec(&l7, &l4).spec == "example.com api.example.com *.api.example.com 198.51.100.7 203.0.113.9:53 2001:db8::2 [2001:db8::3]:443"`
+    (**AC8, AC9, AC11, AC12, AC13, AC14**).
   - `swift_scope_matcher_mirror_claims_and_rejects` — a local faithful mirror of
-    `ScopeMatcher` (`parse` FlowHandoff.swift:543-575 + `matches` :520-535,
-    cited in comments; IP tokens/flows compared as `std::net::IpAddr`), built
-    from the emitted `spec`, asserts each pinned case:
+    `ScopeMatcher` (`parse` FlowHandoff.swift:543-575 + `matches` :520-535, cited in
+    comments; IP tokens/flows compared as `std::net::IpAddr`), built from the emitted
+    `spec`, asserts each pinned case:
     - `true`: `(Some("example.com"),"1.1.1.1",443)`,
       `(Some("www.api.example.com"),"1.1.1.1",443)`,
-      `(Some("api.example.com"),"1.1.1.1",443)`,
-      `(None,"198.51.100.7",9999)`, `(None,"203.0.113.9",53)`,
-      `(None,"2001:db8::2",12345)`, `(None,"10.0.0.5",8080)`.
+      `(Some("api.example.com"),"1.1.1.1",443)`, `(None,"198.51.100.7",9999)`,
+      `(None,"203.0.113.9",53)`, `(None,"2001:db8::2",12345)`,
+      `(None,"2001:db8::3",443)`.
     - `false`: `(Some("evil.com"),"9.9.9.9",1)`,
-      `(Some("api.example.com.evil"),"1.1.1.1",443)`,
-      `(None,"203.0.113.9",54)`, `(None,"10.0.0.5",9090)`,
-      `(None,"192.0.2.1",1500)`, `(None,"10.0.0.1",1)`,
-      `(None,"198.51.100.50",1)`
-    (**AC9, AC10, AC11, AC12**).
-  - (Optional, builder's discretion) a focused `skips_unrepresentable_l4_entries`
-    asserting the AC8 string contains none of `192.0.2.1`, `10.0.0.`,
-    `198.51.100.5` — a direct restatement of the skip rule (**AC11**).
+      `(Some("api.example.com.evil"),"1.1.1.1",443)`, `(None,"203.0.113.9",54)`,
+      `(None,"2001:db8::3",444)`, `(None,"10.0.0.5",8080)`,
+      `(Some("unrelated.example"),"10.0.0.5",8080)`, `(None,"192.0.2.1",1500)`,
+      `(None,"10.0.0.1",1)`, `(None,"198.51.100.50",1)`, `(Some("b.com"),"5.5.5.5",1)`
+    (**AC9, AC10, AC11, AC12, AC13, AC14**).
+  - `skips_unrepresentable_entries` — assert the AC8 string contains none of
+    `"10.0.0.5"`, `"2001:db8::1"` (IP-valued L7, AC14), `"b.com"`, `"d.com"`, `","`,
+    `";"` (separator L7, AC13), `"10.0.0.0"` (non-host CIDR), `"192.0.2."` (partial
+    range) — a direct restatement of the skip rules.
 - **Done when:** every test above passes and the full gate passes.
 
 ## Review log
@@ -151,6 +164,15 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 2 | security | Important | L7 tokens emitted unsanitized into the provider's separator-delimited grammar: a host with `,`/`;`/whitespace fragments into extra provider tokens (provider splits before parsing; `Authority` allows `,`/`;`) → over-inclusive, broken connections | FIX: validate each emitted L7 host/suffix token against the provider's `isValidHostname` char set; skip anything that fails. Spec §Piece 2 L7 rule + AC13 amended 2026-10-30. |
+| 2 | security | Important | IP-valued L7 entries map to provider destination-IP match, but the core L7 gate matches the SNI/host string → a flow to that IP with a different SNI is claimed then refused (over-inclusive, broken connection); grammar cannot express the core's semantics | FIX: skip any L7 entry whose host (bare, with port, or `*.` suffix) parses as an `IpAddr` — IP-based capture is expressed via the L4 scope. Spec §Piece 2 L7 rule, pinned fixture, AC8/AC10, + AC14 amended 2026-10-30. |
+| 1 | security | Minor | Rendezvous body uses lossy `display()` while the length guard measures raw bytes (non-UTF-8 canonical path: fails safe, near-impossible) | FIX: write the raw `OsStr` bytes + `\n` so the body matches the measured length. |
+| 2 | quality | Minor | `bracket_ip` IPv6 single-port branch unexercised (AC12 claims it) | FIX: add an IPv6 single-port L4 entry to the fixture (`2001:db8::3/128` port 443 → `[2001:db8::3]:443`) + truth-table cases. |
+| 2 | quality | Minor | Redundant `CAPTURE_INTERFACE` import in the test module (scope_spec.rs:140) | FIX: delete the redundant import. |
+| 1 | quality | Minor | AC4 test loop hardcodes `12`/`104` instead of the production constants | FIX: use `super::listener::CONTROL_SOCK.len()` and `SUN_PATH_MAX` in the loop. |
+| 2 | quality | Minor (optional) | `bracket_ip` reimplements `SocketAddr`'s Display | FIX: replace with `std::net::SocketAddr::new(addr, port).to_string()` (stdlib guarantees correct bracketing). |
+| 1 | spec | Minor | Unrequested `#[derive(Debug)]` + `#[must_use]` on `RendezvousFile` not in the plan's Change list | ACCEPTED 2026-10-30 (orchestrator, per Matt's autonomous mandate): both are idiomatic and harmless on a one-field RAII guard; `Debug` is needed for `.unwrap_err()` in AC4; quality reviewer endorsed. No code change. |
+| 2 | spec | (adjudicated) | `skips_unrepresentable_l4_entries` uses `10.0.0.0` instead of the plan's self-colliding `10.0.0.` literal | ACCEPTED 2026-10-30: coder's discriminator is correct and better; AC11 coverage complete. |
 
 ## Shipped
 

@@ -1,6 +1,6 @@
 # macOS NE core prerequisites — rendezvous writer + scope-spec emitter design
 
-**Status:** Approved 2026-10-30 (self-approved per Matt's autonomous mandate; no open questions; Architect's calls C1–C7 confirmed).
+**Status:** Approved 2026-10-30 (self-approved per Matt's autonomous mandate; C1–C7 confirmed). **Amended 2026-10-30** after the Stage-6 security FAIL: §Piece 2 L7 rule now skips IP-valued entries (finding 2) and validates host labels against the provider's `isValidHostname` before emitting (finding 1); pinned fixture + AC8/AC10 updated; AC12 strengthened (IPv6 single-port); AC13/AC14 added. See the plan's Review log.
 **Research inputs:** `docs/research/10-macos-network-extension.md`,
 `docs/superpowers/specs/2026-10-29-aitmproxy-macos-network-extension-design.md`
 (NE-AC5/6/7), and that plan's Review log (Task 11 deferred item: "core-side
@@ -184,27 +184,45 @@ to one already emitted; join with `" "`; no leading/trailing space.
 **L7 → tokens** (`aitm_core::ScopeEntry { host: String }`, config.rs:166; core
 match semantics `Authority::matches_scope_entry`, authority.rs:83):
 
+A host label is **emittable** only if it is a valid hostname by the provider's own
+rule (`FlowHandoff.swift:577-583` `isValidHostname`): non-empty, ≤253 chars, no
+leading `.`, no `..`, and every char in `[a-z0-9.\-_]`. This is the crux of the
+two security findings below — the provider **splits the whole spec on `,`, `;`, and
+whitespace _before_ parsing** (`FlowHandoff.swift:514-517`), so a token that
+contains any of those (which `Authority` does **not** reject in a host —
+authority.rs:70 blocks only `/ space \t \r \n \0`, **not `,`/`;`**) would fragment
+into extra provider entries. So an un-emittable label is **skipped**, never emitted.
+
 - Trim and lowercase the raw `host`.
-- If it starts with `*.`: strip the prefix to `suffix`. If `suffix` is empty,
-  **skip** the entry. Otherwise emit **both** `suffix` (the apex) **and**
-  `*.suffix` (the wildcard). Rationale: the core's `*.suffix` matches the apex
-  **and** subdomains (authority.rs:86 — `host == suffix || host.ends_with(".suffix")`),
-  but the provider's `*.x` matches **subdomains only** (FlowHandoff.swift:531 —
-  `host.hasSuffix("." + suffix)`), so the extra apex token makes the provider
-  claim the apex too. (The `*.` branch does not go through `Authority`; emitting
-  the apex token unvalidated is acceptable because the provider drops a malformed
-  token on its side — but an empty suffix is a clear no-op and is skipped here.)
+- **Skip IP-valued entries.** If the host (bare, `host:port`, bracketed IPv6, or the
+  `*.`-suffix below) parses as a `std::net::IpAddr`, **skip** it. Reason (security
+  finding 2): the provider matches an IP token against the flow's **destination IP**,
+  ignoring the hostname (`FlowHandoff.swift:526-527`), but the core L7 gate matches
+  the **SNI/host string** (`ingress.rs:183-188` → `authority.rs:89-90`). A flow to
+  that IP carrying a different SNI would be claimed by the provider and then refused
+  by the core → broken connection (over-inclusive). No provider token can reproduce
+  the core's "IP matched as a host string, only when it is the SNI" semantics, so IP
+  targets belong in the **L4 scope** (which the provider and `L4Guard` both match by
+  IP), not here.
+- If it starts with `*.`: strip the prefix to `suffix`. If `suffix` is empty, parses
+  as an `IpAddr`, or is not an emittable hostname, **skip**. Otherwise emit **both**
+  `suffix` (the apex) **and** `*.suffix` (the wildcard). Rationale: the core's
+  `*.suffix` matches the apex **and** subdomains (authority.rs:86 —
+  `host == suffix || host.ends_with(".suffix")`), but the provider's `*.x` matches
+  **subdomains only** (FlowHandoff.swift:531 — `host.hasSuffix("." + suffix)`), so
+  the extra apex token makes the provider claim the apex too.
 - Otherwise parse the raw string with
   `aitm_core::authority::Authority::parse_with_default(raw, 0)`:
-  - `Err(_)` → **skip** the entry (the core would not treat it as a plain host
-    either).
-  - `Ok(a)` with `a.port == 0` → emit `a.host` (lowercased, IPv6 **unbracketed**
-    — `Authority::new` strips brackets). A portless core entry matches any port
-    of its host; a bare provider token with no `:port` likewise matches any port.
-  - `Ok(a)` with `a.port != 0` → emit `a.to_string()` (`host:port`, IPv6 as
-    `[host]:port` via `Authority`'s `Display`, authority.rs:116-122). A
-    `host:port` core entry matches that port only; the provider token with a port
-    matches that port only.
+  - `Err(_)` → **skip** (the core would not treat it as a plain host either).
+  - `Ok(a)` whose `a.host` is **not** an emittable hostname → **skip** (security
+    finding 1: this is what rejects a `,`/`;`/whitespace-bearing host before it can
+    fragment the spec).
+  - `Ok(a)` with `a.port == 0` → emit `a.host`. A portless core entry matches any
+    port of its host; a bare provider token with no `:port` likewise matches any port.
+  - `Ok(a)` with `a.port != 0` → emit `a.host:a.port` (`host:port`). A `host:port`
+    core entry matches that port only; the provider token with a port matches that
+    port only. (`a.host` is a validated DNS name here — never an IPv6 literal, which
+    was skipped above — so no bracketing is needed.)
 
 **L4 → tokens** (`aitm_proto_l4::types::L4ScopeEntry`, types.rs:58; gate
 `L4Guard::check(Capture, target)` via `ingress::udp_admits`). The NE UDP path
@@ -282,7 +300,10 @@ Scope:
 
 8. **AC8:** for the pinned representative fixture (below), `provider_scope_spec`
    returns exactly:
-   `"example.com api.example.com *.api.example.com 10.0.0.5:8080 [2001:db8::1]:443 198.51.100.7 203.0.113.9:53 2001:db8::2"`.
+   `"example.com api.example.com *.api.example.com 198.51.100.7 203.0.113.9:53 2001:db8::2 [2001:db8::3]:443"`.
+   (The IP-valued L7 entries and the separator-bearing L7 entries are **skipped** —
+   security findings 1 and 2 — so no `10.0.0.5`, `2001:db8::1`, comma, or semicolon
+   appears.)
 9. **AC9:** the `*.suffix` dual-emission is observable: the Swift-`ScopeMatcher`
    mirror, fed the emitted spec, claims **both** the apex `api.example.com`
    **and** a subdomain `www.api.example.com`.
@@ -297,29 +318,48 @@ Scope:
 12. **AC12:** L4 any-port emits a bare IP, single-port emits `ip:port`, and an
     IPv6 host address is bare/unbracketed for any-port and `[ip]:port` for
     single-port (covered by the AC8 string's `198.51.100.7`, `203.0.113.9:53`,
-    `2001:db8::2`).
+    `2001:db8::2`, and the IPv6 **single-port** `[2001:db8::3]:443`, with the mirror
+    claiming `(None, "2001:db8::3", 443)` and rejecting `(None, "2001:db8::3", 444)`).
+13. **AC13 (security finding 1):** an L7 entry whose host or `*.`-suffix contains a
+    provider separator (`,`, `;`, ASCII whitespace) or any char outside
+    `isValidHostname`'s `[a-z0-9.\-_]` contributes **no** token — proven by the AC8
+    string containing no `,`/`;` and not the injected `b.com`/`d.com`, and by the
+    mirror rejecting `(Some("b.com"), "5.5.5.5", 1)`.
+14. **AC14 (security finding 2):** an L7 entry whose host parses as an `IpAddr`
+    (bare, with port, bracketed IPv6, or as a `*.` suffix) contributes **no** token
+    — proven by the AC8 string containing no `10.0.0.5` or `2001:db8::1`, and by the
+    mirror rejecting both `(None, "10.0.0.5", 8080)` and, crucially,
+    `(Some("unrelated.example"), "10.0.0.5", 8080)` (the over-inclusion that would
+    break a connection).
 
-### Pinned scope fixture (for AC8/AC10/AC11/AC12)
+### Pinned scope fixture (for AC8/AC10/AC11/AC12/AC13/AC14)
 
-**L7** (`Vec<ScopeEntry>` by `host`, in order): `"Example.com"`,
-`"*.api.example.com"`, `"10.0.0.5:8080"`, `"[2001:db8::1]:443"`.
+**L7** (`Vec<ScopeEntry>` by `host`, in order): `"Example.com"` (→ `example.com`),
+`"*.api.example.com"` (→ apex + wildcard), `"10.0.0.5:8080"` (IP-valued → **skip**,
+AC14), `"[2001:db8::1]:443"` (IP-valued → **skip**, AC14), `"a,b.com"` (comma →
+**skip**, AC13), `"*.c;d.com"` (semicolon in suffix → **skip**, AC13).
 
 **L4** (`Vec<L4ScopeEntry>`, in order; all fields except the varied one set to
 `capability = Capture`, `interface = "macos-ne"`, `direction = Outbound`):
-`198.51.100.7/32` any-port; `203.0.113.9/32` port `53..=53`; `2001:db8::2/128`
-any-port; `10.0.0.0/24` any-port (non-host → skip); `192.0.2.1/32` port
-`1000..=2000` (partial → skip); `198.51.100.50/32` any-port but
-`capability = Inject` (skip); `198.51.100.51/32` any-port but `interface = "en0"`
-(skip); `198.51.100.52/32` any-port but `direction = Inbound` (skip).
+`198.51.100.7/32` any-port (→ `198.51.100.7`); `203.0.113.9/32` port `53..=53`
+(→ `203.0.113.9:53`); `2001:db8::2/128` any-port (→ `2001:db8::2`);
+`2001:db8::3/128` port `443..=443` (→ `[2001:db8::3]:443`, the IPv6 single-port case,
+AC12); `10.0.0.0/24` any-port (non-host → skip); `192.0.2.1/32` port `1000..=2000`
+(partial → skip); `198.51.100.50/32` any-port but `capability = Inject` (skip);
+`198.51.100.51/32` any-port but `interface = "en0"` (skip); `198.51.100.52/32`
+any-port but `direction = Inbound` (skip).
 
 Mirror match cases (AC10) — `true`: `(Some("example.com"), "1.1.1.1", 443)`,
 `(Some("www.api.example.com"), "1.1.1.1", 443)`,
 `(Some("api.example.com"), "1.1.1.1", 443)`, `(None, "198.51.100.7", 9999)`,
 `(None, "203.0.113.9", 53)`, `(None, "2001:db8::2", 12345)`,
-`(None, "10.0.0.5", 8080)`. `false`: `(Some("evil.com"), "9.9.9.9", 1)`,
+`(None, "2001:db8::3", 443)`. `false`: `(Some("evil.com"), "9.9.9.9", 1)`,
 `(Some("api.example.com.evil"), "1.1.1.1", 443)`, `(None, "203.0.113.9", 54)`,
-`(None, "10.0.0.5", 9090)`, `(None, "192.0.2.1", 1500)`,
-`(None, "10.0.0.1", 1)`, `(None, "198.51.100.50", 1)`.
+`(None, "2001:db8::3", 444)`, `(None, "10.0.0.5", 8080)` (IP-valued L7 skipped,
+AC14), `(Some("unrelated.example"), "10.0.0.5", 8080)` (the over-inclusion AC14
+prevents), `(None, "192.0.2.1", 1500)`, `(None, "10.0.0.1", 1)`,
+`(None, "198.51.100.50", 1)`, `(Some("b.com"), "5.5.5.5", 1)` (separator L7 skipped,
+AC13).
 
 ## Left to the builder
 

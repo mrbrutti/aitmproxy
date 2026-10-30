@@ -13,7 +13,7 @@
 //! commit to MITM on a flow the core guard then refuses, breaking the user's
 //! connection (spec Anti-goals).
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use crate::macos_capture::adapter::CAPTURE_INTERFACE;
 
@@ -53,30 +53,79 @@ fn push_unique(tokens: &mut Vec<String>, token: String) {
 }
 
 /// The provider tokens for one L7 scope entry (`host`, `host:port`, or
-/// `*.wildcard`). Core match semantics: [`aitm_core::authority::Authority::matches_scope_entry`]
+/// `*.wildcard`), or none when the entry cannot be represented exactly. Core match
+/// semantics: [`aitm_core::authority::Authority::matches_scope_entry`]
 /// (authority.rs:83).
+///
+/// Two security rules shape this (spec Design §Piece 2, findings 1 and 2):
+/// *IP-valued* entries are **skipped** — the provider matches an IP token by the
+/// flow's destination IP (FlowHandoff.swift:526-527), but the core L7 gate matches
+/// the SNI/host string (ingress.rs:183-188 → authority.rs:89-90), so a flow to that
+/// IP carrying a different SNI would be claimed by the provider and then refused by
+/// the core (over-inclusive); IP targets belong in the L4 scope. And every emitted
+/// host/suffix must pass the provider's own `isValidHostname` ([`is_emittable_host`]),
+/// because the provider splits the whole spec on `,`/`;`/whitespace *before* parsing
+/// (FlowHandoff.swift:514-517) and `Authority` does **not** reject those in a host
+/// (authority.rs:70) — an unvalidated token would fragment the provider's spec into
+/// extra entries (over-inclusive).
 fn l7_tokens(host: &str) -> Vec<String> {
     let normalized = host.trim().to_ascii_lowercase();
     // `*.suffix`: the core's wildcard matches the apex *and* subdomains
     // (authority.rs:86), but the provider's `*.x` matches subdomains only
     // (FlowHandoff.swift:531). Emit the apex token too so the provider claims the
-    // apex as well. An empty suffix is a no-op and is skipped (spec call C5).
+    // apex as well. Skip an empty (spec call C5), IP-valued (finding 2), or
+    // non-emittable (finding 1) suffix.
     if let Some(suffix) = normalized.strip_prefix("*.") {
-        if suffix.is_empty() {
+        if suffix.is_empty() || suffix.parse::<IpAddr>().is_ok() || !is_emittable_host(suffix) {
             return Vec::new();
         }
         return vec![suffix.to_string(), format!("*.{suffix}")];
     }
+    // Finding 2: an IP-valued entry (bare `10.0.0.5`, `10.0.0.5:8080`, or
+    // `[2001:db8::1]:443`) belongs in the L4 scope, not here — emitting it would make
+    // the provider claim any flow to that IP regardless of SNI, which the core L7 gate
+    // then refuses, breaking the connection.
+    if is_ip_valued(&normalized) {
+        return Vec::new();
+    }
     // Otherwise it is a plain host or `host:port`. A string the core would not
     // treat as a host either is skipped.
     match aitm_core::authority::Authority::parse_with_default(&normalized, 0) {
+        // Finding 1: a host that is an IP literal, or that fails the provider's
+        // `isValidHostname` (e.g. bears a `,`/`;` separator `Authority` allows), is
+        // skipped before it can over-match or fragment the provider spec.
+        Ok(a) if a.host.parse::<IpAddr>().is_ok() || !is_emittable_host(&a.host) => Vec::new(),
         // Portless: matches any port of the host → a bare provider token.
         Ok(a) if a.port == 0 => vec![a.host],
-        // With a port: matches that port only → a `host:port` provider token
-        // (IPv6 bracketed via `Authority`'s `Display`, authority.rs:116-122).
-        Ok(a) => vec![a.to_string()],
+        // With a port: matches that port only → a `host:port` provider token.
+        // `a.host` is a validated DNS name (never an IPv6 literal — those were skipped
+        // above), so no bracketing is needed.
+        Ok(a) => vec![format!("{}:{}", a.host, a.port)],
         Err(_) => Vec::new(),
     }
+}
+
+/// Whether `s` (already trimmed + lowercased) is an IP-valued target: a bare IP
+/// ([`IpAddr`]) or an `ip:port` / `[ip]:port` socket address ([`SocketAddr`]). Such
+/// targets are expressed via the L4 scope, never as an L7 host token (finding 2).
+fn is_ip_valued(s: &str) -> bool {
+    s.parse::<IpAddr>().is_ok() || s.parse::<SocketAddr>().is_ok()
+}
+
+/// Mirror of the provider's `isValidHostname` (`FlowHandoff.swift:577-583`): a host
+/// label is emittable only if it is non-empty, ≤253 chars, has no leading `.` and no
+/// `..`, and every char is in `[a-z0-9.\-_]`. The provider splits the whole spec on
+/// `,`/`;`/whitespace *before* parsing (FlowHandoff.swift:514-517), so any token
+/// bearing one of those — which `Authority` does not reject (authority.rs:70) — must
+/// be skipped here or it fragments the provider's spec (security finding 1).
+fn is_emittable_host(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 253
+        && !s.starts_with('.')
+        && !s.contains("..")
+        && s.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.' || c == '_'
+        })
 }
 
 /// The provider token for one L4 scope entry, or `None` when the entry cannot gate
@@ -106,24 +155,16 @@ fn l4_token(entry: &aitm_proto_l4::types::L4ScopeEntry) -> Option<String> {
         return None;
     }
 
-    // any-port → bare IP; single-port → `ip:port`; a partial range cannot be
-    // represented without widening and is skipped.
+    // any-port → bare IP; single-port → `ip:port` (stdlib `SocketAddr` Display gives
+    // `ip:port` for v4 and `[ip]:port` for v6); a partial range cannot be represented
+    // without widening and is skipped.
     let (lo, hi) = (entry.ports.lo, entry.ports.hi);
     if lo == 0 && hi == u16::MAX {
         Some(addr.to_string())
     } else if lo == hi {
-        Some(bracket_ip(addr, lo))
+        Some(SocketAddr::new(addr, lo).to_string())
     } else {
         None
-    }
-}
-
-/// Format `ip:port`, bracketing an IPv6 address as `[ip]:port` (the same bracketing
-/// as `Authority`'s `Display`, authority.rs:116-122).
-fn bracket_ip(addr: IpAddr, port: u16) -> String {
-    match addr {
-        IpAddr::V6(_) => format!("[{addr}]:{port}"),
-        IpAddr::V4(_) => format!("{addr}:{port}"),
     }
 }
 
@@ -137,15 +178,19 @@ mod tests {
     };
 
     use super::*;
-    use crate::macos_capture::adapter::CAPTURE_INTERFACE;
 
-    /// The pinned L7 fixture (spec §"Pinned scope fixture"), in order.
+    /// The pinned L7 fixture (spec §"Pinned scope fixture"), in order. The two
+    /// IP-valued entries (`10.0.0.5:8080`, `[2001:db8::1]:443`) are skipped
+    /// (security finding 2, AC14); the two separator-bearing entries (`a,b.com`,
+    /// `*.c;d.com`) are skipped (security finding 1, AC13).
     fn l7_fixture() -> Vec<aitm_core::ScopeEntry> {
         [
             "Example.com",
             "*.api.example.com",
             "10.0.0.5:8080",
             "[2001:db8::1]:443",
+            "a,b.com",
+            "*.c;d.com",
         ]
         .into_iter()
         .map(|h| aitm_core::ScopeEntry {
@@ -214,6 +259,15 @@ mod tests {
                 Outbound,
                 Capture,
             ),
+            // Representable: IPv6 single-port host CIDR → `[ip]:port` (AC12).
+            l4_entry(
+                "2001:db8::3",
+                128,
+                (443, 443),
+                CAPTURE_INTERFACE,
+                Outbound,
+                Capture,
+            ),
             // Non-host CIDR (prefix 24) → skip.
             l4_entry(
                 "10.0.0.0",
@@ -255,30 +309,31 @@ mod tests {
         ]
     }
 
-    /// **AC8/AC9/AC11/AC12.** The emitted spec is byte-exact for the representative
-    /// fixture: L7 tokens (apex before wildcard) then L4 tokens, input order,
-    /// de-duplicated, single-space joined, with every unrepresentable L4 entry
-    /// absent.
+    /// **AC8/AC9/AC11/AC12/AC13/AC14.** The emitted spec is byte-exact for the
+    /// representative fixture: L7 tokens (apex before wildcard) then L4 tokens, input
+    /// order, de-duplicated, single-space joined, with every unrepresentable entry
+    /// absent — no IP-valued L7 token (`10.0.0.5`, `2001:db8::1`; finding 2) and no
+    /// separator-bearing L7 token (`,`, `;`; finding 1).
     #[test]
     fn emits_byte_exact_spec_for_representative_scopes() {
         let spec = provider_scope_spec(&l7_fixture(), &l4_fixture()).spec;
         assert_eq!(
             spec,
-            "example.com api.example.com *.api.example.com 10.0.0.5:8080 \
-             [2001:db8::1]:443 198.51.100.7 203.0.113.9:53 2001:db8::2"
+            "example.com api.example.com *.api.example.com 198.51.100.7 203.0.113.9:53 2001:db8::2 [2001:db8::3]:443"
         );
     }
 
-    /// **AC9/AC10/AC11/AC12.** A faithful Rust mirror of the Swift provider's
-    /// `ScopeMatcher`, fed the emitted spec, claims every intended flow and rejects
-    /// every out-of-scope flow in the pinned truth-table.
+    /// **AC9/AC10/AC11/AC12/AC13/AC14.** A faithful Rust mirror of the Swift
+    /// provider's `ScopeMatcher`, fed the emitted spec, claims every intended flow
+    /// and rejects every out-of-scope flow in the pinned truth-table.
     #[test]
     fn swift_scope_matcher_mirror_claims_and_rejects() {
         let spec = provider_scope_spec(&l7_fixture(), &l4_fixture()).spec;
         let matcher = ScopeMatcherMirror::new(&spec);
 
         // Claimed (true): the apex and a subdomain of the `*.` entry (AC9), each
-        // representable L4 token at an in-range port, and an L7 host/host:port.
+        // representable L4 token at an in-range port (incl. the IPv6 single-port
+        // `[2001:db8::3]:443`, AC12), and an L7 host.
         for (host, ip, port) in [
             (Some("example.com"), "1.1.1.1", 443u16),
             (Some("www.api.example.com"), "1.1.1.1", 443),
@@ -286,7 +341,7 @@ mod tests {
             (None, "198.51.100.7", 9999),
             (None, "203.0.113.9", 53),
             (None, "2001:db8::2", 12345),
-            (None, "10.0.0.5", 8080),
+            (None, "2001:db8::3", 443),
         ] {
             assert!(
                 matcher.matches(host, ip, port),
@@ -295,15 +350,20 @@ mod tests {
         }
 
         // Rejected (false): out-of-scope host, a `*.` near-miss, a wrong port on a
-        // single-port entry, and every skipped L4 entry's address (AC11).
+        // single-port entry, every skipped L4 entry's address (AC11), the IP-valued
+        // L7 addresses — crucially `(Some("unrelated.example"), "10.0.0.5", 8080)`,
+        // the over-inclusion AC14 prevents — and the separator-bearing L7 host (AC13).
         for (host, ip, port) in [
             (Some("evil.com"), "9.9.9.9", 1u16),
             (Some("api.example.com.evil"), "1.1.1.1", 443),
             (None, "203.0.113.9", 54),
-            (None, "10.0.0.5", 9090),
+            (None, "2001:db8::3", 444),
+            (None, "10.0.0.5", 8080),
+            (Some("unrelated.example"), "10.0.0.5", 8080),
             (None, "192.0.2.1", 1500),
             (None, "10.0.0.1", 1),
             (None, "198.51.100.50", 1),
+            (Some("b.com"), "5.5.5.5", 1),
         ] {
             assert!(
                 !matcher.matches(host, ip, port),
@@ -312,22 +372,25 @@ mod tests {
         }
     }
 
-    /// **AC11** (direct restatement). None of the skipped L4 addresses leak into the
-    /// emitted spec. NB: the discriminator for the skipped `10.0.0.0/24` is its base
-    /// address `10.0.0.0`, *not* the substring `10.0.0.` — the latter also matches
-    /// the legitimate L7 token `10.0.0.5:8080`.
+    /// **AC11/AC13/AC14** (direct restatement). None of the skipped entries leak into
+    /// the emitted spec: the IP-valued L7 addresses (finding 2), the separator-bearing
+    /// L7 hosts (finding 1), the non-host CIDR, and the partial-range L4 entry.
     #[test]
-    fn skips_unrepresentable_l4_entries() {
+    fn skips_unrepresentable_entries() {
         let spec = provider_scope_spec(&l7_fixture(), &l4_fixture()).spec;
-        assert!(
-            !spec.contains("192.0.2.1"),
-            "partial-range entry leaked: {spec}"
-        );
+        // IP-valued L7 entries (AC14).
+        assert!(!spec.contains("10.0.0.5"), "IP-valued L7 leaked: {spec}");
+        assert!(!spec.contains("2001:db8::1"), "IP-valued L7 leaked: {spec}");
+        // Separator-bearing L7 entries (AC13): neither the injected labels nor the
+        // separators themselves may appear.
+        assert!(!spec.contains("b.com"), "separator L7 leaked: {spec}");
+        assert!(!spec.contains("d.com"), "separator L7 leaked: {spec}");
+        assert!(!spec.contains(','), "comma leaked into spec: {spec}");
+        assert!(!spec.contains(';'), "semicolon leaked into spec: {spec}");
+        // L4 skips (AC11). NB: the non-host discriminator is the base address
+        // `10.0.0.0`; the partial-range discriminator is the `192.0.2.` prefix.
         assert!(!spec.contains("10.0.0.0"), "non-host CIDR leaked: {spec}");
-        assert!(
-            !spec.contains("198.51.100.5"),
-            "filtered entry leaked: {spec}"
-        );
+        assert!(!spec.contains("192.0.2."), "partial-range leaked: {spec}");
     }
 
     // ----------------------------------------------------------------------------

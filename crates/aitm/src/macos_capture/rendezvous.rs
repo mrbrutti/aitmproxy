@@ -19,6 +19,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Write as _;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
@@ -67,7 +68,6 @@ impl RendezvousFile {
             ));
         }
         let rendezvous_path = rendezvous_path.into();
-        let body = format!("{}\n", abs.display());
 
         // Unlink-first then create-new: `create_new` (O_CREAT|O_EXCL) fails
         // `AlreadyExists` on any entry — regular file OR symlink — that reappears
@@ -79,7 +79,12 @@ impl RendezvousFile {
             .create_new(true)
             .mode(0o600)
             .open(&rendezvous_path)?;
-        file.write_all(body.as_bytes())?;
+        // Write the canonical path from its raw OS bytes (plus a trailing newline), so
+        // the body the provider reads is exactly the bytes the `sun_path` guard above
+        // measured (`abs.as_os_str().len()`); a lossy `display()` could disagree for a
+        // non-UTF-8 path (security finding 1).
+        file.write_all(abs.as_os_str().as_bytes())?;
+        file.write_all(b"\n")?;
 
         Ok(RendezvousFile {
             path: rendezvous_path,
@@ -229,9 +234,15 @@ mod tests {
     fn too_long_dir_path_is_rejected() {
         // AC4
         let scratch = Scratch::new("ac4");
-        // Build a nested dir whose canonical path makes abs.len() + 1 + 12 >= 104.
+        // Build a nested dir whose canonical path trips the production guard. The loop
+        // uses the real constants (not literal 12/104) so it cannot drift from the
+        // check `publish` enforces.
         let mut dir = scratch.path().to_path_buf();
-        while fs::canonicalize(&dir).unwrap().as_os_str().len() + 1 + 12 < 104 {
+        while fs::canonicalize(&dir).unwrap().as_os_str().len()
+            + 1
+            + crate::macos_capture::listener::CONTROL_SOCK.len()
+            < SUN_PATH_MAX
+        {
             dir.push("components-padding-segment");
             fs::create_dir(&dir).unwrap();
         }
