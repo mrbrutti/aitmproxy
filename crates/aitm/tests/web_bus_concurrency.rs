@@ -12,8 +12,10 @@
 //!   connection with `Size` before any of its lines runs;
 //! - at most `MAX_IN_FLIGHT` frames are in flight per connection; further frames
 //!   wait unread (TCP backpressure) and none is lost;
-//! - a command that panics ends its own connection only; a client Close is seen
-//!   while a command is still parked, and the parked command then runs to completion.
+//! - a command that panics ends its own connection only; below the in-flight cap a
+//!   client Close is seen while a command is still parked (at the cap the bridge is
+//!   not reading, and notices only once a frame finishes), and the parked command
+//!   then runs to completion.
 //!
 //! Hermetic: the commands under test are in-process test commands (`test.block`,
 //! `test.sleep`, `test.tick`, `test.panic`) registered through the scripting wiring's
@@ -400,6 +402,15 @@ fn call_line(id: u64, name: &str) -> String {
     .to_string()
 }
 
+/// One frame of `count` `tools/call` lines for `name` (ids `1..=count`), led by
+/// `lead` when given — e.g. the token line, to share the token's frame.
+fn call_frame(lead: Option<String>, count: u64, name: &str) -> String {
+    lead.into_iter()
+        .chain((1..=count).map(|id| call_line(id, name)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Open the bus: connect, send the token, and `initialize`.
 async fn open_bus(server: &Server) -> Ws {
     let mut ws = ws_connect(server).await;
@@ -577,18 +588,91 @@ async fn a_frame_of_exactly_the_line_cap_is_answered_in_full() {
     let server = start("lines-at-cap", &commands).await;
     let mut ws = open_bus(&server).await;
 
-    let frame = (1..=MAX_LINES_PER_FRAME)
-        .map(|id| call_line(id, "flow.list"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let frame = call_frame(None, MAX_LINES_PER_FRAME, "flow.list");
     send_text(&mut ws, frame).await;
+    expect_answered_in_order(&mut ws, MAX_LINES_PER_FRAME).await;
+}
 
-    // One reply per line, one text frame each, in the order the lines were sent.
-    for id in 1..=MAX_LINES_PER_FRAME {
-        let reply = recv_json(&mut ws).await;
+/// Read `count` replies and check each is `flow.list`'s empty result, one text
+/// frame per line, in the order the lines (ids `1..=count`) were sent.
+async fn expect_answered_in_order(ws: &mut Ws, count: u64) {
+    for id in 1..=count {
+        let reply = recv_json(ws).await;
         assert_eq!(reply["id"], id, "replies stay in line order: {reply}");
         assert_eq!(reply["result"]["structuredContent"], json!([]), "{reply}");
     }
+}
+
+#[tokio::test]
+async fn a_token_frame_of_exactly_the_line_cap_is_answered_in_full() {
+    let commands = TestCommands::new();
+    let server = start("token-lines-at-cap", &commands).await;
+    let mut ws = ws_connect(&server).await;
+
+    // The token line shares the frame with a full cap's worth of requests; the
+    // token line itself is not a request and does not count against the cap.
+    let frame = call_frame(Some(token_line()), MAX_LINES_PER_FRAME, "flow.list");
+    send_text(&mut ws, frame).await;
+    expect_answered_in_order(&mut ws, MAX_LINES_PER_FRAME).await;
+}
+
+#[tokio::test]
+async fn a_token_frame_over_the_line_cap_closes_the_connection_and_runs_nothing() {
+    let commands = TestCommands::new();
+    let server = start("token-lines-over-cap", &commands).await;
+    let mut ws = ws_connect(&server).await;
+
+    let frame = call_frame(Some(token_line()), MAX_LINES_PER_FRAME + 1, "test.tick");
+    send_text(&mut ws, frame).await;
+
+    let drained = drain_until_end(&mut ws, FAST).await;
+    assert!(
+        drained.ended,
+        "an oversized token frame must close the connection; it answered {} lines instead",
+        drained.replies.len()
+    );
+    assert!(
+        drained.replies.is_empty(),
+        "no line of an oversized token frame may be answered, got {:?}",
+        drained.replies
+    );
+    assert_eq!(
+        drained.close_code,
+        Some(CloseCode::Size),
+        "the Close frame says why"
+    );
+    assert_eq!(commands.ticks(), 0, "no line of an oversized frame may run");
+}
+
+#[tokio::test]
+async fn a_bad_token_is_refused_before_the_line_cap_is_considered() {
+    let commands = TestCommands::new();
+    let server = start("bad-token-over-cap", &commands).await;
+    let mut ws = ws_connect(&server).await;
+
+    // A wrong token leading an oversized frame must get the ordinary unauthorized
+    // refusal (`Policy`), not `Size`: authentication comes before the cap.
+    let bad_token = json!({ "token": "nope" }).to_string();
+    let frame = call_frame(Some(bad_token), MAX_LINES_PER_FRAME + 1, "test.tick");
+    send_text(&mut ws, frame).await;
+
+    let drained = drain_until_end(&mut ws, FAST).await;
+    assert!(drained.ended, "a refused connection must be closed");
+    assert_eq!(
+        drained.replies.len(),
+        1,
+        "exactly the unauthorized reply, got {:?}",
+        drained.replies
+    );
+    let refusal: JsonValue = serde_json::from_str(&drained.replies[0]).expect("reply is JSON");
+    assert_eq!(refusal["error"]["code"], -32001, "{refusal}");
+    assert!(refusal["id"].is_null(), "{refusal}");
+    assert_eq!(
+        drained.close_code,
+        Some(CloseCode::Policy),
+        "refused as unauthorized, not as too large"
+    );
+    assert_eq!(commands.ticks(), 0, "no line may run for a refused token");
 }
 
 #[tokio::test]
@@ -597,14 +681,11 @@ async fn a_frame_over_the_line_cap_closes_the_connection_and_runs_nothing() {
     let server = start("lines-over-cap", &commands).await;
     let mut ws = open_bus(&server).await;
 
-    let frame = (1..=MAX_LINES_PER_FRAME + 1)
-        .map(|id| call_line(id, "test.tick"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let frame = call_frame(None, MAX_LINES_PER_FRAME + 1, "test.tick");
     send_text(&mut ws, frame).await;
 
-    // The connection is closed — a Close frame or an abrupt reset, either is the
-    // server dropping it — and not one of the frame's lines was answered or run.
+    // The server has read the whole frame, so it refuses with a `Size` Close frame
+    // before dropping the connection; not one of the frame's lines is answered or run.
     let drained = drain_until_end(&mut ws, FAST).await;
     assert!(
         drained.ended,
@@ -616,9 +697,11 @@ async fn a_frame_over_the_line_cap_closes_the_connection_and_runs_nothing() {
         "no line of an oversized frame may be answered, got {:?}",
         drained.replies
     );
-    if let Some(code) = drained.close_code {
-        assert_eq!(code, CloseCode::Size, "the Close frame says why");
-    }
+    assert_eq!(
+        drained.close_code,
+        Some(CloseCode::Size),
+        "the Close frame says why"
+    );
     assert_eq!(commands.ticks(), 0, "no line of an oversized frame may run");
 }
 
@@ -655,8 +738,9 @@ async fn a_client_close_is_seen_while_a_command_is_parked() {
     send_text(&mut ws, call_line(1, "test.block")).await;
     wait_until("test.block to start", || commands.parking.entered() == 1).await;
 
-    // The client closes while the command is still parked; the bridge notices at
-    // once rather than after the command, and the stream ends.
+    // The client closes while the command is still parked. One frame is in flight,
+    // below the cap, so the bridge is still reading: it notices at once rather than
+    // after the command, and the stream ends.
     ws.close(None).await.expect("client close");
     let drained = drain_until_end(&mut ws, FAST).await;
     assert!(

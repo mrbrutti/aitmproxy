@@ -5,16 +5,18 @@
 //!
 //! A frame is the unit of work. The lines inside one frame run in order and are
 //! answered in order, one text frame per reply, once the whole frame is done. A
-//! frame may carry at most `MAX_LINES_PER_FRAME` (256) lines; a client that sends
-//! more is closed (`Size`) before any of its lines runs.
+//! frame may carry at most `MAX_LINES_PER_FRAME` lines; a client that sends more
+//! is closed (`Size`) before any of its lines runs.
 //!
 //! Frames run concurrently (up to `MAX_IN_FLIGHT` per connection), so a
 //! long-running command — `scan.discover` can run for minutes — never freezes the
 //! other requests on the same socket; replies across frames arrive in completion
 //! order and clients correlate them by JSON-RPC `id`. Clients that need one
 //! request's effect before the next must wait for its reply; a Close or disconnect
-//! discards replies still in flight. All policy stays in the core: the bridge
-//! authenticates, splits lines, and forwards.
+//! discards replies still in flight. At the in-flight cap the loop stops reading,
+//! so a client Close or disconnect is only noticed once a frame finishes — bounded
+//! by those in-flight frames' own completion. All policy stays in the core: the
+//! bridge authenticates, splits lines, and forwards.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,6 +64,10 @@ const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// stops reading further frames (TCP backpressure) until one finishes, so neither
 /// blocking tasks nor queued frames can grow without bound however fast a peer
 /// sends. Each frame holds one blocking-pool thread while its commands run.
+///
+/// The cost of that backpressure: at the cap the loop is not reading at all, so a
+/// client Close or disconnect is only noticed once a frame finishes — bounded by
+/// the in-flight frames' own completion, however long their commands run.
 pub const MAX_IN_FLIGHT: usize = 16;
 
 // The relay's `select!` panics when every branch is disabled; with a non-zero cap
