@@ -55,8 +55,13 @@ two at once would interleave their navigations and each would harvest the
 other's pages. A `scan.discover` started while another is still running is
 therefore **refused immediately** with `scan.discover is already running; wait
 for it to finish before starting another …` — it never touches the browser.
-Wait for the running scan to finish (it ends on success, error, or panic, and the
-next one then runs normally); scans run back to back need no reset in between.
+The running scan gives the slot back however it ends, and the next one then runs
+normally; scans run back to back need no reset in between.
+
+A scan is **not cancelled when its client goes away**. If you Ctrl-C the CLI or
+close the panel, the crawl keeps running and keeps the slot until it finishes or
+hits its time budget (default **10 minutes**), so you can be refused by your own
+earlier scan. Wait for it to end rather than retrying.
 
 ### CLI
 
