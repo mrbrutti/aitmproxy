@@ -58,37 +58,82 @@ fn body_of(code: &str, from: usize, anchor: &str) -> String {
 }
 
 /// The match arms of `body` that are catch-alls: a wildcard (`_ =>`, `_ if g =>`)
-/// or a bare binding (`other =>`, `x if g =>`), as the trimmed text of each.
+/// or a bare binding (`other =>`, `mut x =>`, `ref x if g =>`), as the
+/// whitespace-normalised text of each.
 fn catch_all_arms(body: &str) -> Vec<String> {
-    // A pattern that is a lone lowercase identifier or `_`, optionally guarded,
-    // then `=>`. A path or tuple-struct pattern (`Frontend::Cli`, `Some(x)`) never
-    // matches this, so only genuine catch-alls are reported.
-    let catch_all = Regex::new(r"(?m)(?:^|[{,|])\s*([a-z_][a-z0-9_]*)\s*(?:if\s[^=]*)?=>")
-        .expect("static regex compiles");
+    // A pattern that is a lone lowercase identifier or `_` (optionally `ref`/`mut`),
+    // optionally guarded, then `=>`. A path or tuple-struct pattern
+    // (`Frontend::Cli`, `Some(x)`) never matches this, so only genuine catch-alls
+    // are reported.
+    //
+    // The guard is lazy so it stops at its own `=>` (a guard may itself hold `=`:
+    // `_ if n == 1 =>`, `_ if n <= 1 =>`) and a catch-all after it is still seen,
+    // and `(?s)` lets it span lines, so a guard rustfmt broke across lines is read.
+    let catch_all =
+        Regex::new(r"(?ms)(?:^|[{,|])\s*(?:ref\s+)?(?:mut\s+)?([a-z_][a-z0-9_]*)\s*(?:if\s.*?)?=>")
+            .expect("static regex compiles");
     catch_all
         .captures_iter(body)
         .map(|c| {
             c[0].trim()
                 .trim_start_matches([',', '{', '|'])
-                .trim()
-                .to_string()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
         })
         .collect()
 }
 
 #[test]
 fn catch_all_detector_flags_wildcards_and_bindings_only() {
-    // Each of these has a catch-all: the check must see it.
-    for flagged in [
-        "match x { A => 1, _ => 2 }",
-        "match x { A => 1, other => 2 }",
-        "match x { A => 1,\n    _ if g => 2 }",
-        "match x {\n    A => 1,\n    _ => 2,\n}",
-        "match x { A | B => 1, rest => 2 }",
-    ] {
-        assert!(
-            !catch_all_arms(flagged).is_empty(),
-            "expected a catch-all in {flagged:?}"
+    // Each of these has catch-all arms: the check must report exactly these, in order,
+    // whitespace-normalised.
+    let flagged: &[(&str, &[&str])] = &[
+        ("match x { A => 1, _ => 2 }", &["_ =>"]),
+        ("match x { A => 1, other => 2 }", &["other =>"]),
+        ("match x { A => 1,\n    _ if g => 2 }", &["_ if g =>"]),
+        ("match x {\n    A => 1,\n    _ => 2,\n}", &["_ =>"]),
+        ("match x { A | B => 1, rest => 2 }", &["rest =>"]),
+        // A guard that itself contains `=`: `==`, `!=`, `<=`, `>=`.
+        ("match x { A => 1, _ if n == 1 => 2 }", &["_ if n == 1 =>"]),
+        (
+            "match x { A => 1, other if n != 1 => 2 }",
+            &["other if n != 1 =>"],
+        ),
+        ("match x { A => 1, _ if n <= 1 => 2 }", &["_ if n <= 1 =>"]),
+        ("match x { A => 1, _ if n >= 1 => 2 }", &["_ if n >= 1 =>"]),
+        // rustfmt may break a long guard across lines.
+        (
+            "match x {\n    A => 1,\n    _ if n\n        == 1 => 2,\n}",
+            &["_ if n == 1 =>"],
+        ),
+        // A lazy guard stops at its own `=>`, so a catch-all after it is still seen.
+        (
+            "match x { A => 1, _ if g == 1 => 2, other => 3 }",
+            &["_ if g == 1 =>", "other =>"],
+        ),
+        // Binding catch-alls: `mut x`, `ref x`, `ref mut x`, with or without a guard.
+        ("match x { A => 1, mut y => 2 }", &["mut y =>"]),
+        ("match x { A => 1, ref y => 2 }", &["ref y =>"]),
+        ("match x { A => 1, ref mut y => 2 }", &["ref mut y =>"]),
+        (
+            "match x { A => 1, mut y if y == 1 => 2 }",
+            &["mut y if y == 1 =>"],
+        ),
+        ("match x {\n    A => 1,\n    ref y => 2,\n}", &["ref y =>"]),
+        ("match x { A | mut y => 1 }", &["mut y =>"]),
+        // A guarded named arm is skipped, the catch-all after it is not.
+        ("match x { A if n == 1 => 1, _ => 2 }", &["_ =>"]),
+        (
+            "match x { A => 1, b if c => 2, D => 3, _ => 4 }",
+            &["b if c =>", "_ =>"],
+        ),
+    ];
+    for (input, arms) in flagged {
+        assert_eq!(
+            catch_all_arms(input),
+            arms.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            "wrong catch-all arms in {input:?}"
         );
     }
     // None of these does.
@@ -97,6 +142,13 @@ fn catch_all_detector_flags_wildcards_and_bindings_only() {
         "match x { A | B => 1, C => 2 }",
         "match x { Frontend::Cli | Frontend::Operator => CallerTrust::Operator, Frontend::Mcp => CallerTrust::Agent }",
         "match x {\n    CallerTrust::Operator => true,\n    CallerTrust::Agent => false,\n}",
+        // A guarded named arm is not a catch-all, whatever the guard holds.
+        "match x { A if n == 1 => 1, B => 2 }",
+        "match x { Frontend::Cli if n <= 1 => 1, Frontend::Mcp => 2, Frontend::Operator => 3 }",
+        // Lowercase text inside an arm body is not an arm pattern.
+        "match x { A => { let y = 1; y }, B => 2 }",
+        "match x { A => { if a == 1 { 1 } else { 2 } }, B => 3 }",
+        "match x { A => foo(a, b), B => 2 }",
     ] {
         assert_eq!(
             catch_all_arms(clean),
@@ -218,8 +270,38 @@ fn pipeline_reports_a_wildcard_planted_in_a_classifier_body() {
     }
 }
 
+/// Whether `body` classifies variants itself: it holds a `match` (which also covers
+/// `matches!`) or a `=>` arm. A body that only delegates holds neither.
+fn classifies_variants(body: &str) -> bool {
+    body.contains("match") || body.contains("=>")
+}
+
+#[test]
+fn classification_detector_flags_match_and_arms_only() {
+    for classifying in [
+        "match self { Frontend::Mcp => false, _ => true }",
+        "matches!(self, Frontend::Cli | Frontend::Operator)",
+        "match self {\n    Frontend::Mcp => false,\n    Frontend::Cli | Frontend::Operator => true,\n}",
+    ] {
+        assert!(
+            classifies_variants(classifying),
+            "expected {classifying:?} to count as classifying"
+        );
+    }
+    for delegating in [
+        "CallerTrust::from(self).is_trusted_control()",
+        "\n        CallerTrust::from(self)\n            .is_trusted_control()\n    ",
+    ] {
+        assert!(
+            !classifies_variants(delegating),
+            "expected {delegating:?} to count as delegating"
+        );
+    }
+}
+
 /// `Frontend::is_trusted_control` must delegate, not classify: it holds no `match`
-/// of its own, so the answer for every variant is decided in exactly one place.
+/// and no `=>` arm of its own, so the answer for every variant is decided in exactly
+/// one place. What it answers is pinned in `ctx::trust_tests`, not here.
 #[test]
 fn frontend_predicate_delegates_and_does_not_classify() {
     let code = strip_line_comments(&read_src("src/ctx.rs"));
@@ -227,8 +309,14 @@ fn frontend_predicate_delegates_and_does_not_classify() {
         .find("impl Frontend {")
         .expect("`impl Frontend {` in ctx.rs");
     let body = body_of(&code, from, "is_trusted_control(self) -> bool");
-    assert_eq!(
-        body.split_whitespace().collect::<Vec<_>>().join(" "),
-        "CallerTrust::from(self).is_trusted_control()"
+    // Non-vacuity: a real body was read, not an empty one.
+    assert!(
+        !body.trim().is_empty(),
+        "`Frontend::is_trusted_control` has an empty body"
+    );
+    assert!(
+        !classifies_variants(&body),
+        "`Frontend::is_trusted_control` must delegate to `CallerTrust`, not classify \
+         variants itself (no `match`, no `=>`); body read was:\n{body}"
     );
 }

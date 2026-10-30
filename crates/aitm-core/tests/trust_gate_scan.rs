@@ -8,11 +8,22 @@
 //! `Frontend` variant is added, and the compiler cannot exhaustiveness-check a
 //! comparison. This test scans every `crates/*/src/**/*.rs` for that shape.
 //!
-//! It is a tripwire for the shape that shipped, not a proof. Aliasing
-//! (`let agent = Frontend::Mcp; x == agent`), comparing a role string, or a cast
-//! all evade it. The scanner is a pure function with its own self-tests, so a
-//! regex edit cannot silently weaken it, and a non-vacuity test proves it reads
-//! the files it claims to.
+//! What it flags: `==`/`!=` against the agent role (`Frontend::Mcp`,
+//! `CallerTrust::Agent`), bare or wrapped (`x == Some(Frontend::Mcp)`), either side;
+//! a refutable `if let` / `let .. else` / `while let` pattern naming it; and the
+//! role anywhere inside `matches!(..)`.
+//!
+//! It is a tripwire for the shapes that shipped, not a proof. Known evasions:
+//! - **Match arms.** `match f { Frontend::Mcp => deny, _ => allow }` is a deny-list
+//!   too, but a plain arm is how legitimate label sites classify
+//!   (aitm-findings/src/record.rs), so arms are not flagged. The three classifiers
+//!   that must stay exhaustive are pinned by `classifier_wildcard_free.rs`.
+//! - **Aliasing.** `let agent = Frontend::Mcp; x == agent`, a role string, a cast, or
+//!   `x.eq(&Frontend::Mcp)` / `assert_eq!(x, Frontend::Mcp)` all evade it.
+//!
+//! The scanner is a pure function with its own self-tests, so a regex edit cannot
+//! silently weaken it, and a non-vacuity test proves it reads the files it claims
+//! to (by content, and by checking every workspace member lives under `crates/`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,10 +41,16 @@ const MAX_SNIPPET: usize = 160;
 
 /// The compiled matchers, built once.
 struct Patterns {
-    /// `==`/`!=` then an untrusted role: `x == Frontend::Mcp`.
+    /// `==`/`!=` then an untrusted role, bare, borrowed or wrapped in a constructor
+    /// call: `x == Frontend::Mcp`, `x == Some(&Frontend::Mcp)`.
     op_then_role: Regex,
-    /// An untrusted role then `==`/`!=`: `Frontend::Mcp != x`.
+    /// An untrusted role, bare or wrapped, then `==`/`!=`: `Frontend::Mcp != x`,
+    /// `Some(Frontend::Mcp) == x`.
     role_then_op: Regex,
+    /// A refutable `let` pattern naming an untrusted role, up to its `=`:
+    /// `if let Frontend::Mcp = f`, `let CallerTrust::Agent = c else { .. }`,
+    /// `if let Some(Frontend::Mcp) = x`.
+    let_role: Regex,
     /// An untrusted role anywhere (used inside `matches!` bodies).
     role: Regex,
     /// The opening of a `matches!` call; the last char is the opening bracket.
@@ -46,10 +63,17 @@ fn patterns() -> &'static Patterns {
         // An untrusted role with any path prefix (`aitm_core::Frontend::Mcp`).
         // `\s*` around `::` tolerates rustfmt line-breaking.
         let role = r"\b(?:\w+\s*::\s*)*(?:Frontend\s*::\s*Mcp|CallerTrust\s*::\s*Agent)\b";
+        // Zero or more constructor-call openers before a role (`Some(`, `Ok(&`,
+        // `Option::Some(`), so a wrapped operand is still an operand.
+        let wrap = r"(?:(?:\w+\s*::\s*)*\w+\s*\(\s*&?\s*)*";
         let compile = |pattern: &str| Regex::new(pattern).expect("static regex compiles");
         Patterns {
-            op_then_role: compile(&format!(r"(?:==|!=)\s*&?\s*{role}")),
-            role_then_op: compile(&format!(r"{role}\s*(?:==|!=)")),
+            op_then_role: compile(&format!(r"(?:==|!=)\s*&?\s*{wrap}{role}")),
+            role_then_op: compile(&format!(r"{wrap}{role}(?:\s*\))*\s*(?:==|!=)")),
+            // The gaps stop at the first `=` or `;`: `let x = Frontend::Mcp;` has its
+            // `=` before the role (construction, not a pattern), and a bare `let x;`
+            // ends at its `;`, so neither reaches a role mentioned later.
+            let_role: compile(&format!(r"\blet\b[^=;]*?{role}[^=;]*?=")),
             role: compile(role),
             matches_open: compile(r"\bmatches\s*!\s*[(\[{]"),
         }
@@ -208,14 +232,20 @@ fn closing_bracket_end(code: &str, from: usize, open: u8) -> usize {
 /// `(1-based line, snippet)`, in source order. The line is where the hit starts.
 ///
 /// A hit is `==`/`!=` next to `Frontend::Mcp` or `CallerTrust::Agent` (either
-/// order, any path prefix, whitespace and newlines tolerated), or either name
-/// anywhere inside a `matches!(...)`. Overlapping matches merge into one hit.
+/// order, any path prefix, optionally wrapped in a constructor call such as
+/// `Some(..)`, whitespace and newlines tolerated); a refutable `let` / `if let` /
+/// `while let` pattern naming either role (`if let Frontend::Mcp = f`); or either
+/// name anywhere inside a `matches!(...)`. Overlapping matches merge into one hit.
+///
+/// A plain `match` arm (`Frontend::Mcp => ..`) is deliberately not a hit: arms
+/// are how label sites classify (aitm-findings/src/record.rs), and the
+/// compile-time forcing for the classifiers is `classifier_wildcard_free.rs`.
 fn deny_list_hits(src: &str) -> Vec<(usize, String)> {
     let code = blank_comments_and_literals(src);
     let pats = patterns();
 
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for re in [&pats.op_then_role, &pats.role_then_op] {
+    for re in [&pats.op_then_role, &pats.role_then_op, &pats.let_role] {
         ranges.extend(re.find_iter(&code).map(|m| (m.start(), m.end())));
     }
     for open in pats.matches_open.find_iter(&code) {
@@ -331,6 +361,62 @@ fn scanner_flags_every_deny_list_shape() {
             "let is_agent = frontend == Frontend::Mcp;",
             (1, "== Frontend::Mcp"),
         ),
+        // `if let` / `let .. else` against the untrusted role: a refutable pattern is
+        // a comparison in disguise.
+        (
+            "if let Frontend::Mcp = host.frontend() {",
+            (1, "let Frontend::Mcp ="),
+        ),
+        (
+            "let Frontend::Mcp = host.frontend() else {",
+            (1, "let Frontend::Mcp ="),
+        ),
+        (
+            "if let CallerTrust::Agent = ctx.caller() {",
+            (1, "let CallerTrust::Agent ="),
+        ),
+        (
+            "let CallerTrust::Agent = ctx.caller() else { return };",
+            (1, "let CallerTrust::Agent ="),
+        ),
+        (
+            "while let aitm_core::Frontend::Mcp = f {",
+            (1, "let aitm_core::Frontend::Mcp ="),
+        ),
+        (
+            "if let Some(Frontend::Mcp) = maybe {",
+            (1, "let Some(Frontend::Mcp) ="),
+        ),
+        (
+            "if let Frontend::Mcp | Frontend::Operator = f {",
+            (1, "let Frontend::Mcp | Frontend::Operator ="),
+        ),
+        (
+            // Multi-line: rustfmt put `=` on its own line.
+            "let Frontend::Mcp\n    = host.frontend()\nelse {",
+            (1, "let Frontend::Mcp ="),
+        ),
+        // `Some(..)`-wrapped operands of `==` / `!=`, either side.
+        (
+            "if maybe == Some(Frontend::Mcp) {",
+            (1, "== Some(Frontend::Mcp"),
+        ),
+        (
+            "if maybe != Some(&Frontend::Mcp) {",
+            (1, "!= Some(&Frontend::Mcp"),
+        ),
+        (
+            "if maybe == Option::Some(CallerTrust::Agent) {",
+            (1, "== Option::Some(CallerTrust::Agent"),
+        ),
+        (
+            "if Some(Frontend::Mcp) == maybe {",
+            (1, "Some(Frontend::Mcp) =="),
+        ),
+        (
+            "if maybe\n    == Some(\n        Frontend::Mcp,\n    )\n{",
+            (2, "== Some( Frontend::Mcp"),
+        ),
     ];
     for (input, (line, snippet)) in cases {
         assert_eq!(
@@ -358,6 +444,30 @@ fn scanner_ignores_legitimate_shapes() {
         "_ => CallerTrust::Agent,",
         // Constructing a host for a role.
         "CommandHost::new(&s, &c, &g, None).with_frontend(Frontend::Mcp)",
+        // Match arms are label/classification sites (aitm-findings/src/record.rs),
+        // not comparisons: never flagged.
+        "Frontend::Mcp => \"mcp\",",
+        "Some(Frontend::Mcp) => true,",
+        "Frontend::Mcp | Frontend::Operator => label(),",
+        // Constructing or storing the role is not a comparison.
+        "let x = Frontend::Mcp;",
+        "let mut role: Frontend = Frontend::Mcp;",
+        "let (a, b) = (Frontend::Mcp, 1);",
+        "let t = CallerTrust::Agent;",
+        "let f = Some(Frontend::Mcp);",
+        "foo(Frontend::Mcp, 1)",
+        "call(Frontend::Mcp) + 1",
+        "x = Frontend::Mcp;",
+        // A `let` that binds no untrusted role, and one `;` away from a later mention.
+        "if let Some(Frontend::Cli) = x {",
+        "if let Frontend::Cli | Frontend::Operator = f {",
+        "let x;\nx = Frontend::Mcp;",
+        "let a = 1;\nlet Frontend::Cli = f else { return };",
+        // Wrapped trusted roles compare fine.
+        "if maybe == Some(Frontend::Cli) {",
+        "if maybe != Some(&Frontend::Operator) {",
+        "if Some(Frontend::Cli) == maybe {",
+        "let r = x == Frontend::Cli;",
     ];
     for input in inputs {
         assert_eq!(
@@ -433,12 +543,15 @@ fn scanner_blanks_comments_and_literals_before_matching() {
     );
 }
 
-#[test]
-fn no_deny_list_gate_in_any_crate_src() {
-    let crates_dir = crates_dir();
+/// Scan every `<crates_dir>/*/src/**/*.rs` and report each deny-list hit as
+/// `crates/<path under crates_dir>:<line>: <snippet>`, in path then source order.
+/// A file whose path ends with an `allowed` suffix (component-wise, as
+/// `Path::ends_with`) is skipped. This is the whole pipeline the real check and the
+/// fixture tests share: walk, read, `deny_list_hits`, format.
+fn scan_tree(crates_dir: &Path, allowed: &[(&str, &str)]) -> Vec<String> {
     let mut offenders: Vec<String> = Vec::new();
-    for path in rust_sources(&crates_dir) {
-        if ALLOWED
+    for path in rust_sources(crates_dir) {
+        if allowed
             .iter()
             .any(|(suffix, _reason)| path.ends_with(suffix))
         {
@@ -446,11 +559,21 @@ fn no_deny_list_gate_in_any_crate_src() {
         }
         let src =
             fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let shown = path.strip_prefix(&crates_dir).unwrap_or(&path);
+        let shown = path
+            .strip_prefix(crates_dir)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
         for (line, snippet) in deny_list_hits(&src) {
-            offenders.push(format!("crates/{}:{line}: {snippet}", shown.display()));
+            offenders.push(format!("crates/{shown}:{line}: {snippet}"));
         }
     }
+    offenders
+}
+
+#[test]
+fn no_deny_list_gate_in_any_crate_src() {
+    let offenders = scan_tree(&crates_dir(), ALLOWED);
     assert_eq!(
         offenders,
         Vec::<String>::new(),
@@ -463,21 +586,111 @@ fn no_deny_list_gate_in_any_crate_src() {
     );
 }
 
+/// The `members = [ .. ]` entries of a workspace manifest, with `#` comments
+/// ignored. A tiny reader, not a TOML parser: `Cargo.toml` is read as text because
+/// this crate takes no TOML dependency for one test.
+fn workspace_members(manifest: &str) -> Vec<String> {
+    let uncommented: String = manifest
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let list = Regex::new(r"(?s)\bmembers\s*=\s*\[(.*?)\]").expect("static regex compiles");
+    let entry = Regex::new(r#""([^"]*)""#).expect("static regex compiles");
+    list.captures(&uncommented).map_or_else(Vec::new, |c| {
+        entry
+            .captures_iter(&c[1])
+            .map(|e| e[1].to_string())
+            .collect()
+    })
+}
+
+#[test]
+fn workspace_members_reader_reads_the_members_array_only() {
+    let manifest = "[workspace]\n\
+resolver = \"2\"\n\
+members = [\n\
+    \"crates/a\",\n\
+    # \"crates/commented-out\",\n\
+    \"crates/b\", # trailing \"note\"\n\
+    \"apps/c\",\n\
+]\n\
+exclude = [\"crates/skipped\"]\n\
+[workspace.package]\n\
+edition = \"2021\"\n";
+    assert_eq!(
+        workspace_members(manifest),
+        vec![
+            "crates/a".to_string(),
+            "crates/b".to_string(),
+            "apps/c".to_string()
+        ]
+    );
+    assert_eq!(
+        workspace_members("[package]\nname = \"x\"\n"),
+        Vec::<String>::new()
+    );
+}
+
 #[test]
 fn scan_is_not_vacuous() {
-    let files = rust_sources(&crates_dir());
+    let crates = crates_dir();
+    let files = rust_sources(&crates);
     assert!(
         files.len() >= 100,
         "the scan read only {} files; the crates path is wrong",
         files.len()
     );
+    for expected in ["aitm-mcp/src/server.rs", "aitm-core/src/ctx.rs"] {
+        assert!(
+            files.iter().any(|p| p.ends_with(expected)),
+            "{expected}: expected file not found; was it moved?"
+        );
+    }
+
+    // Content, not names: the scan reads the migrated gates themselves. The
+    // predicate is defined in aitm-core, so a user in another crate proves the walk
+    // reaches gate code beyond the crate that owns the predicate, and survives the
+    // gates moving between files.
+    let users: Vec<&PathBuf> = files
+        .iter()
+        .filter(|p| {
+            fs::read_to_string(p)
+                .unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+                .contains("caller_is_trusted_control")
+        })
+        .collect();
     assert!(
-        files.iter().any(|p| p.ends_with("aitm-mcp/src/server.rs")),
-        "aitm-mcp/src/server.rs is not among the scanned files"
+        users
+            .iter()
+            .any(|p| !p.starts_with(crates.join("aitm-core"))),
+        "no scanned file outside aitm-core mentions `caller_is_trusted_control`; \
+         the migrated gates are not being read. Files that do: {users:?}"
+    );
+
+    // Every workspace member lives under `crates/`, the only tree the scan walks. A
+    // member elsewhere would be silently unscanned, so adding one must fail here
+    // until the walk covers it.
+    let manifest = crates
+        .parent()
+        .expect("crates dir has a parent: the workspace root")
+        .join("Cargo.toml");
+    let members = workspace_members(
+        &fs::read_to_string(&manifest)
+            .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display())),
     );
     assert!(
-        files.iter().any(|p| p.ends_with("aitm-core/src/ctx.rs")),
-        "aitm-core/src/ctx.rs is not among the scanned files"
+        members.iter().any(|m| m == "crates/aitm-core"),
+        "the members reader found {members:?}; expected it to list crates/aitm-core"
+    );
+    let outside: Vec<&String> = members
+        .iter()
+        .filter(|m| !m.starts_with("crates/"))
+        .collect();
+    assert_eq!(
+        outside,
+        Vec::<&String>::new(),
+        "workspace member(s) outside crates/ are not covered by the trust-gate scan"
     );
 }
 
@@ -493,7 +706,8 @@ fn scan_reaches_nested_gate_files() {
     ] {
         assert!(
             files.iter().any(|p| p.ends_with(nested)),
-            "{nested} (a nested gate file) is not among the scanned files"
+            "{nested}: expected file not found; was it moved? (it is a nested gate file the \
+             walk must reach)"
         );
     }
 }
@@ -563,9 +777,11 @@ fn rust_sources_walks_nested_src_only() {
     );
 }
 
-/// End to end on a fixture tree: a deny-list gate re-introduced in a nested `src/`
-/// file is reported with its file and line, a migrated gate next to it is not, and
-/// a deny-list shape that appears only under `tests/` is out of scope.
+/// End to end on a fixture tree, through the same `scan_tree` the real check calls:
+/// a deny-list gate re-introduced in a nested `src/` file is reported with its file
+/// and line, a migrated gate next to it is not, a deny-list shape that appears only
+/// under `tests/` is out of scope, and an allow-list entry skips exactly the file it
+/// names.
 #[test]
 fn a_reintroduced_deny_list_gate_is_found_with_file_and_line() {
     let tree = FixtureTree::new("probe");
@@ -580,24 +796,29 @@ fn a_reintroduced_deny_list_gate_is_found_with_file_and_line() {
         "fn t(h: &CommandHost) -> bool { h.frontend() == Frontend::Mcp }\n",
     );
 
-    let mut found: Vec<(String, usize, String)> = Vec::new();
-    for path in rust_sources(&tree.0) {
-        let src = fs::read_to_string(&path).expect("read fixture source");
-        let rel = path
-            .strip_prefix(&tree.0)
-            .expect("under the fixture root")
-            .to_string_lossy()
-            .replace('\\', "/");
-        for (line, snippet) in deny_list_hits(&src) {
-            found.push((rel.clone(), line, snippet));
-        }
-    }
+    // No allow-list: the one hit, with its crates-relative file and line.
     assert_eq!(
-        found,
-        vec![(
-            "probe/src/deep/gate.rs".to_string(),
-            4,
-            "== Frontend::Mcp".to_string()
-        )]
+        scan_tree(&tree.0, &[]),
+        vec!["crates/probe/src/deep/gate.rs:4: == Frontend::Mcp".to_string()]
     );
+
+    // An allow-list entry naming that file (a path suffix) skips it.
+    assert_eq!(
+        scan_tree(&tree.0, &[("probe/src/deep/gate.rs", "fixture")]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        scan_tree(&tree.0, &[("gate.rs", "fixture")]),
+        Vec::<String>::new()
+    );
+
+    // Entries that do not name the file skip nothing: a different file, and a
+    // partial last component (`Path::ends_with` compares whole components).
+    for other in ["other.rs", "deep/other.rs", "ate.rs", "src/deep"] {
+        assert_eq!(
+            scan_tree(&tree.0, &[(other, "fixture")]),
+            vec!["crates/probe/src/deep/gate.rs:4: == Frontend::Mcp".to_string()],
+            "allow-list entry {other:?} must not skip gate.rs"
+        );
+    }
 }

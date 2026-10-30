@@ -142,8 +142,9 @@ fn agent_approve_command_refuses_the_agent_and_lets_humans_reach_the_fallback() 
 
 /// The role gate runs before any argument is read: the agent gets the role refusal
 /// for a missing, malformed or unknown argument (and the policy stays put), while a
-/// trusted caller with the same bad input gets the command's own argument error and
-/// never the role refusal.
+/// trusted caller with the same bad input is past the gate: it is rejected for its
+/// argument, and the error is never the role refusal. The argument errors' own wording
+/// belongs to the parser and is not pinned here.
 #[test]
 fn agent_set_gate_precedes_argument_validation() {
     let state = Arc::new(AgentState::new(AgentPolicy::Auto));
@@ -151,24 +152,15 @@ fn agent_set_gate_precedes_argument_validation() {
     let refusal = "agent.set refused: the agent cannot change its own policy; only an operator or \
                    the human CLI may set it.";
 
-    let bad_calls: [(&str, Params, &str); 3] = [
-        (
-            "no policy param",
-            params(&[]),
-            "missing required param `policy`",
-        ),
+    let bad_calls: [(&str, Params); 3] = [
+        ("no policy param", params(&[])),
         (
             "unknown policy",
             params(&[("policy", Value::Str("bogus".into()))]),
-            "unknown policy `bogus`; expected all | auto | ask | readonly | paused",
         ),
-        (
-            "non-string policy",
-            params(&[("policy", Value::Int(1))]),
-            "param `policy` must be a string, got Int(1)",
-        ),
+        ("non-string policy", params(&[("policy", Value::Int(1))])),
     ];
-    for (what, args, own_error) in bad_calls {
+    for (what, args) in bad_calls {
         let err = invoke_as(&reg, "agent.set", args.clone(), Frontend::Mcp)
             .expect_err("the agent is refused before its arguments are read");
         assert_eq!(err.to_string(), refusal, "agent with {what}");
@@ -176,7 +168,11 @@ fn agent_set_gate_precedes_argument_validation() {
         for frontend in [Frontend::Operator, Frontend::Cli] {
             let err = invoke_as(&reg, "agent.set", args.clone(), frontend)
                 .expect_err("a bad argument is rejected for a trusted caller");
-            assert_eq!(err.to_string(), own_error, "{frontend:?} with {what}");
+            assert_ne!(
+                err.to_string(),
+                refusal,
+                "{frontend:?} with {what} must not get the role refusal"
+            );
         }
     }
     assert_eq!(

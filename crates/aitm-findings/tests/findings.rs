@@ -421,8 +421,10 @@ fn findings_remove_refuses_the_agent_and_admits_operator_and_cli() {
 
 /// The role gate runs before any argument or id validation: the agent sees the same
 /// refusal for a malformed, oversized, traversal or unknown id as for a good one, and
-/// learns nothing about the store; a trusted caller with the same input gets the
-/// store's own validation error instead (never the role refusal).
+/// learns nothing about the store; a trusted caller with the same input is past the
+/// gate, so it never gets the role refusal. What the store then says about a bad id
+/// (its wording, its length limit, whether an unknown id is an error) is the store's
+/// contract and is tested at the store level, not pinned here.
 #[test]
 fn findings_remove_gate_precedes_param_and_id_validation() {
     let reg = findings_reg();
@@ -431,8 +433,11 @@ fn findings_remove_gate_precedes_param_and_id_validation() {
     let survivor = record_as_operator(&reg, &cfg, "IDOR on /account/9");
     let survivor_yaml = dir.join(format!("{survivor}.yaml"));
     assert!(survivor_yaml.exists());
+    let refusal = "findings.remove is operator/CLI-only";
 
-    let oversized = "a".repeat(129);
+    // Far past any plausible id-length limit, so the vector stays "oversized" if the
+    // store's limit moves.
+    let oversized = "a".repeat(4096);
     let bad_args: Vec<(&str, Vec<(&str, Value)>)> = vec![
         ("no id param", vec![]),
         ("empty id", vec![("id", Value::Str(String::new()))]),
@@ -449,28 +454,37 @@ fn findings_remove_gate_precedes_param_and_id_validation() {
         // The agent: always the role refusal, whatever the arguments.
         let err = call_as(&reg, &cfg, Frontend::Mcp, "findings.remove", args)
             .expect_err("the agent is refused before the arguments are read");
-        assert_eq!(
-            err.to_string(),
-            "findings.remove is operator/CLI-only",
-            "agent with {what}"
-        );
+        assert_eq!(err.to_string(), refusal, "agent with {what}");
 
-        // Operator and CLI: past the role gate (never the role refusal); every bad
-        // input is rejected by the store's own validation, except an unknown but
-        // well-formed id, which removes idempotently.
+        // Operator and CLI: past the role gate. Whatever the store makes of the
+        // input (an error of its own wording, or success), it is never the refusal.
         for frontend in [Frontend::Operator, Frontend::Cli] {
-            let outcome = call_as(&reg, &cfg, frontend, "findings.remove", args);
-            match (*what, outcome) {
-                ("unknown id", Ok(v)) => assert_eq!(v, Value::Object(BTreeMap::new())),
-                ("unknown id", Err(e)) => panic!("unknown id removes idempotently, got: {e}"),
-                (_, Ok(v)) => panic!("{frontend:?} with {what} must be rejected, got {v:?}"),
-                (_, Err(e)) => assert_ne!(
+            if let Err(e) = call_as(&reg, &cfg, frontend, "findings.remove", args) {
+                assert_ne!(
                     e.to_string(),
-                    "findings.remove is operator/CLI-only",
+                    refusal,
                     "{frontend:?} with {what} must not get the role refusal"
-                ),
+                );
             }
         }
+    }
+
+    // A path-traversal id never succeeds for a trusted caller either: the gate being
+    // ahead of validation must not mean validation is skipped for those who pass it.
+    for frontend in [Frontend::Operator, Frontend::Cli] {
+        let err = call_as(
+            &reg,
+            &cfg,
+            frontend,
+            "findings.remove",
+            &[("id", Value::Str("../escape".into()))],
+        )
+        .expect_err("a traversal id is rejected for a trusted caller");
+        assert_ne!(
+            err.to_string(),
+            refusal,
+            "{frontend:?} with a traversal id is past the gate"
+        );
     }
 
     // Nothing the agent (or a rejected request) did touched the stored finding.
@@ -478,20 +492,6 @@ fn findings_remove_gate_precedes_param_and_id_validation() {
         survivor_yaml.exists(),
         "no refused or rejected remove may delete {survivor}.yaml"
     );
-
-    // Specific operator-side rejections, pinned to the store's wording.
-    let err = call_as(
-        &reg,
-        &cfg,
-        Frontend::Operator,
-        "findings.remove",
-        &[("id", Value::Str("../escape".into()))],
-    )
-    .expect_err("a traversal id is rejected for the operator");
-    assert_eq!(err.to_string(), "invalid finding id `../escape`");
-    let err = call_as(&reg, &cfg, Frontend::Cli, "findings.remove", &[])
-        .expect_err("a missing id is rejected for the CLI");
-    assert_eq!(err.to_string(), "missing required param `id`");
 }
 
 #[test]
