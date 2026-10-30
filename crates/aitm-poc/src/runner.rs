@@ -1323,7 +1323,7 @@ mod tests {
     /// control that proves the assertion can fail.
     #[test]
     fn protocol_step_dispatches_through_registered_command() {
-        use aitm_core::{Frontend, HttpFlow, HttpRequest, MemFlowStore, StdGuard};
+        use aitm_core::{Config, HttpFlow, HttpRequest, MemFlowStore, StdGuard};
         use futures::future::BoxFuture;
 
         struct NoClient;
@@ -1345,10 +1345,16 @@ mod tests {
         let store = MemFlowStore::new();
         let client = NoClient;
         let guard = StdGuard::default();
-        // Run as the human CLI: this test exercises the protocol-step dispatch,
-        // not poc.run's agent gate (#66). An Mcp (agent) host is refused by that
-        // gate before dispatch, so it would never reach the step logic under test.
-        let host = CommandHost::new(&store, &client, &guard, None).with_frontend(Frontend::Cli);
+        // This test exercises protocol-step dispatch through the registry, not
+        // poc.run's agent-run gate (added in #66). Opt into `poc.allow_agent_run`
+        // via the host config so the gate doesn't refuse before dispatch runs,
+        // leaving the no-handler error as the thing under test.
+        let run_cfg = {
+            let mut c = Config::default();
+            c.poc.allow_agent_run = true;
+            Arc::new(c)
+        };
+        let host = CommandHost::new(&store, &client, &guard, None).with_config(run_cfg);
         let args = || {
             Params::new(
                 [(
