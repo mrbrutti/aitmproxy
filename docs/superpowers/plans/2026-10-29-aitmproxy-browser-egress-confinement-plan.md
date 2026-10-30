@@ -144,10 +144,20 @@ test-first and leaves the full gate green.
 
 ## Review log
 
-Kept by the main session during stage 6. One row per finding.
+Two independent Stage-6 panels ran on the feature diff (`origin/main...HEAD`): this
+session's security/quality/spec reviewers **and** the scanner-finish session's.
+Both returned **3 × PASS — no Critical, Important, or anti-goal findings.** All 10
+acceptance criteria are mapped to passing tests. Minor findings and dispositions:
 
 | Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
+| 2 | Quality | Minor | `guard.rs` confinement refusal returned `OutOfScope(host)` (bare host), dropping the port — a port-mismatch refusal named a host that *is* scoped on another port. | Fixed: returns the full `authority`; AC1 test updated. |
+| 1 | Quality | Minor | `config.rs` default-off comment cited "spec AC6"; the default is AC8. | Fixed. |
+| 4b | Quality | Minor | `dispatch.rs` test module re-imported `EgressConfinement` already in scope via `use super::*` (could trip `unused_imports`). | Fixed: dropped the redundant import. |
+| 1 | Quality | Minor (optional) | `egress.rs` AC6 test never took a hold on top of `base==true`. | Fixed: added the on-base hold/restore case. |
+| 4b | Quality | Minor | `EgressProbe`/`NoClient` harness duplicated across `dispatch.rs` + `server.rs` test mods. | Accepted — different crates, no shared test-support crate; consistent with the existing `NoClient` duplication idiom. |
+| 2 | Spec | Minor | `crates/aitm-poc/src/runner.rs` carried an unrelated pre-existing-test fix (out of declared scope). | Resolved: merged `origin/main` (PR #74 fixes the same test); `runner.rs` now matches main, so the branch no longer changes it. |
+| 4a | Spec | Minor | Undeclared tool-surface files edited (`aitm-tui` `CORE_TOOLS` + `bus-fixture.json` + `tester_shell` counts; `aitm` `frontends.rs` `EXPECTED_TOOLS`/browser-count/`browser-tool-schemas.json`; `aitm-browser/tests/ssrf.rs` `COMMANDS`). | Accepted — mechanically compelled by registering the plan-sanctioned `browser.confine` tool; no new behaviour. |
 
 ## Shipped
 

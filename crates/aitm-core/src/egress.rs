@@ -93,6 +93,15 @@ mod tests {
         }
         // Both tokens dropped: posture falls back to the (off) base.
         assert!(!c.confined());
+
+        // A hold on top of an ON base: dropping it restores the base (still on),
+        // so a campaign that ends never widens egress that config/command set.
+        c.set_base(true);
+        {
+            let _t = c.confine();
+            assert!(c.confined());
+        }
+        assert!(c.confined(), "dropping a hold must not clear an on base");
     }
 
     #[test]

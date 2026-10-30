@@ -436,9 +436,9 @@ fn type_hint(ty: &TypeDesc) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aitm_core::{
-        EgressConfinement, HttpFlow, HttpRequest, MemFlowStore, Sensitivity, StdGuard,
-    };
+    // `EgressConfinement` is already in scope via `use super::*` (the module imports
+    // it for the `Cli.egress` field), so it is not re-imported here.
+    use aitm_core::{HttpFlow, HttpRequest, MemFlowStore, Sensitivity, StdGuard};
     use futures::future::BoxFuture;
 
     /// A `ProxyClient` the probe never reaches.

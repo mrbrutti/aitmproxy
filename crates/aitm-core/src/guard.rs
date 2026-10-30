@@ -265,9 +265,11 @@ pub fn ssrf_check(
         // Public target. In confined mode it must additionally be in scope. Match
         // the full requested `authority` (port included), exactly as
         // `StdGuard::in_scope` does, so a `host:port` scope entry is honored and an
-        // unparseable authority never matches → deny by default.
+        // unparseable authority never matches → deny by default. The refusal names
+        // the full `authority`, not the bare host, so a port-mismatch refusal is
+        // diagnosable (a host scoped only on another port is not silently blamed).
         if confine_to_scope && !scope.iter().any(|e| host_in_scope(authority, &e.host)) {
-            return Err(GuardError::OutOfScope(host));
+            return Err(GuardError::OutOfScope(authority.to_string()));
         }
         return Ok(());
     }

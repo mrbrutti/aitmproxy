@@ -433,7 +433,7 @@ impl Default for BrowserConfig {
             ignore_cert_errors: true,
             nav_timeout: Duration::from_secs(30),
             ssrf: SsrfPolicy::default(),
-            // Off: free browsing is the general-interception default (spec AC6).
+            // Off: free browsing is the general-interception default (spec AC8).
             confine_egress_to_scope: false,
         }
     }

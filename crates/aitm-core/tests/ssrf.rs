@@ -29,7 +29,7 @@ fn confined_refuses_out_of_scope_public() {
 
     let r = ssrf_check(&policy, &none, true, "example.test:443", ip(PUBLIC_DST));
     assert!(
-        matches!(r, Err(GuardError::OutOfScope(ref h)) if h == "example.test"),
+        matches!(r, Err(GuardError::OutOfScope(ref h)) if h == "example.test:443"),
         "empty scope must refuse a public host under confinement, got {r:?}"
     );
 
