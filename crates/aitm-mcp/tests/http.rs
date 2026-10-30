@@ -8,7 +8,9 @@
 //! plus the pure-function guard unit tests in `src/http.rs`.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use aitm_core::{
     Command, CommandHost, McpTransport, ParamSchema, Params, Registry, Sensitivity, TypeDesc, Value,
@@ -301,4 +303,144 @@ async fn end_to_end_matches_stdio() {
         .as_str()
         .expect("text")
         .starts_with("<!DOCTYPE html>"));
+}
+
+/// As [`spawn`], but also hands back the transport's live-SSE-connection counter
+/// so a test can prove a `GET` connection is reclaimed after the client leaves.
+async fn spawn_with_handle(allowed_origins: Vec<String>) -> (SocketAddr, Arc<AtomicUsize>) {
+    let server = test_server();
+    let http = StreamableHttp::bind(StreamableHttpCfg {
+        bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        token: TOKEN.into(),
+        allowed_origins,
+        path: "/mcp".into(),
+    })
+    .await
+    .expect("bind 127.0.0.1:0");
+    let addr = http.local_addr();
+    let active = http.active_sse_connections();
+    tokio::spawn(async move {
+        let _ = http.serve(server).await;
+    });
+    (addr, active)
+}
+
+/// A JSON array of `n` `tools/list` requests (each with a distinct id), as one
+/// batch body.
+fn batch_requests(n: usize) -> String {
+    let items: Vec<JsonValue> = (0..n)
+        .map(|i| json!({"jsonrpc":"2.0","id": i,"method":"tools/list","params":{}}))
+        .collect();
+    JsonValue::Array(items).to_string()
+}
+
+/// F1 — an authorized `GET` opens an SSE writer task; when the client reads the
+/// `: connected` preamble and then disconnects, the server reclaims the
+/// connection (the writer task tears down and the live-connection count returns
+/// to zero) rather than parking on `wait()` forever.
+///
+/// Binds a port, so it runs only in the real shell (the sandbox returns EPERM on
+/// `bind`); the orchestrator runs it in the Terminal panel.
+#[tokio::test]
+async fn sse_get_connection_is_reclaimed_on_disconnect() {
+    let (addr, active) = spawn_with_handle(vec![]).await;
+    let host = addr.to_string();
+    assert_eq!(active.load(Ordering::Relaxed), 0, "baseline is zero");
+
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .expect("handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/mcp")
+        .header("Host", &host)
+        .header("Authorization", &authz())
+        .body(Full::new(Bytes::new()))
+        .expect("request");
+    let mut resp = sender.send_request(req).await.expect("send GET");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The opening SSE comment arrives, proving the writer task is live.
+    let frame = resp
+        .frame()
+        .await
+        .expect("a preamble frame")
+        .expect("preamble frame is ok");
+    let data = frame.into_data().expect("the preamble is a data frame");
+    assert_eq!(&data[..], b": connected\n\n");
+    assert_eq!(
+        active.load(Ordering::Relaxed),
+        1,
+        "the GET registered one live SSE connection"
+    );
+
+    // The client goes away: drop the response body (and its receiver), the
+    // sender, and the connection task.
+    drop(resp);
+    drop(sender);
+    conn_task.abort();
+
+    // The writer observes the disconnect and tears the connection down.
+    let reclaimed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if active.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        reclaimed.is_ok(),
+        "the SSE connection leaked: the writer task did not tear down after disconnect"
+    );
+}
+
+/// F2 — a batch longer than the element cap is refused with `400` before any
+/// dispatch, while a batch exactly at the cap is dispatched normally (`200` with
+/// one reply per element). Binds a port — runs in the Terminal panel.
+#[tokio::test]
+async fn over_cap_batch_is_rejected_at_cap_works() {
+    // Mirrors `MAX_BATCH_LEN` in `src/http.rs`; keep in sync.
+    const CAP: usize = 256;
+    let addr = spawn(vec![]).await;
+    let host = addr.to_string();
+
+    // One over the cap: refused outright, never dispatched.
+    let (status, body) = request(
+        addr,
+        "POST",
+        "/mcp",
+        &[("Host", &host), ("Authorization", &authz())],
+        &batch_requests(CAP + 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        !body.contains("\"result\""),
+        "an over-cap batch must not reach a tool: {body:?}"
+    );
+
+    // Exactly at the cap: dispatched, one reply per element.
+    let (status, body) = request(
+        addr,
+        "POST",
+        "/mcp",
+        &[("Host", &host), ("Authorization", &authz())],
+        &batch_requests(CAP),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v: JsonValue = serde_json::from_str(&body).expect("json array reply");
+    assert_eq!(
+        v.as_array().expect("array").len(),
+        CAP,
+        "every at-cap request gets a reply"
+    );
 }

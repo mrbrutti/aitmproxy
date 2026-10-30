@@ -3132,6 +3132,24 @@ fn resources_read_doctype_and_unknown() {
                 .starts_with("<!DOCTYPE html>"),
             "doctype: {resp}"
         );
+        // Design B: the read item carries the same resource `_meta` as the list
+        // entry (CSP, domain, border, display modes — standard + `openai/*`).
+        let meta = &item["_meta"];
+        assert_eq!(meta["ui"]["csp"]["connectDomains"], json!([]), "{resp}");
+        assert_eq!(meta["ui"]["csp"]["resourceDomains"], json!([]), "{resp}");
+        assert_eq!(
+            meta["openai/widgetCSP"]["connect_domains"],
+            json!([]),
+            "{resp}"
+        );
+        assert_eq!(meta["ui"]["domain"], "aitmproxy.widget", "{resp}");
+        assert_eq!(meta["openai/widgetDomain"], "aitmproxy.widget", "{resp}");
+        assert!(meta["ui"]["prefersBorder"].is_boolean(), "{resp}");
+        assert_eq!(
+            meta["openai/ui"]["availableDisplayModes"],
+            json!(["inline"]),
+            "{resp}"
+        );
     }
     // Unknown uri → INVALID_PARAMS.
     let bad = rpc(&srv, 3, "resources/read", json!({"uri": "ui://aitm/nope"}));

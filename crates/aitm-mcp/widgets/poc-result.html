@@ -341,7 +341,7 @@ main{padding:var(--space-4,16px);display:flex;flex-direction:column;gap:var(--sp
 <body>
 <main id="app"></main>
 <script>
-// ——— shared runtime (identical in every widget) ———
+// ——— shared runtime (keep in sync across widgets) ———
 const openai = window.openai || {};
 function toolOutput(){ return (openai && openai.toolOutput) || {}; }
 function applyTheme(){

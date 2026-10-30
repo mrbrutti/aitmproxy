@@ -617,10 +617,26 @@ both light and dark. Handlers check `event.source === window.parent` and
 
 ## Review log
 
-Kept by the main session during stage 6. One row per finding.
+Kept by the main session during stage 6. One row per finding. Panel run on
+`main..HEAD` (base `427d395`, head `aa16aed`), 2026-10-30.
 
-| Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
+| Area | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
+| http.rs GET/SSE | security | Important | GET/SSE writer task leaks per connection (never detects client disconnect) → unbounded task/memory growth | Fixed (fix-A: select on tx.closed/sink.wait + drop_connection + teardown test) |
+| http.rs batch | security | Minor | JSON-RPC batch has no element cap (post-auth CPU/memory amplification) | Fixed (fix-A: batch length cap → 400) |
+| http.rs listener | security | Minor | No connection cap / header-read timeout (slow-loris), pre-auth | Fixed (fix-A: header timeout + connection semaphore) |
+| widget_lint.rs | security | Minor | Lint docstring claims CSP/external-ref coverage but doesn't enforce it | Fixed (fix-B: added external-ref/@import/srcdoc/fetch/.src assertions) |
+| widget_lint.rs | quality | Minor | "no type=module" rule documented but not asserted | Fixed (fix-B) |
+| widget_lint.rs | quality | Minor | `find_hex` duplicates `all_hex`; smoke test guards the unused twin | Fixed (fix-B: single shared scanner) |
+| widgets/README.md | quality | Minor | README says `<script type="module">` vs classic house style | Fixed (fix-B) |
+| widgets/*.html | quality | Minor | "identical in every widget" comment not literally identical | Fixed (fix-B: comment softened/reconciled) |
+| widgets token block | quality | Minor | 295-line token block duplicated ×7 | Accepted (orchestrator, 2026-10-30): deliberate CSP-clean self-contained-doc constraint; `build.mjs` + lint markers mitigate drift |
+| mcp.rs resources/read | spec | Minor | `resources/read` `contents[0]._meta` not asserted | Fixed (fix-B: added `_meta` assertions) |
+| .mcp.json / mcp.json | spec | Minor | Server key `aitmproxy` + command `aitm` vs plan's `aitm` + `${AITM_BIN:-aitm}` | Accepted (orchestrator, 2026-10-30): functional and internally consistent; bare `aitm` avoids an unverified env-expansion dependency; `aitm`-on-PATH documented in README/install.md |
+| docs/superpowers/widget-convention.md | spec | Important | Doc not in spec Design K file set | Accepted (orchestrator, 2026-10-30): internal widget house-style/coordination doc under `docs/superpowers/` (alongside spec/plan), not a shipped plugin deliverable |
+| aitmproxy-plugin/docs/install.md | spec | Important | Undeclared file (spec put install content in README) | Accepted (orchestrator, 2026-10-30): in-scope install/test content, split into a dedicated guide the README links; better organized than inlining |
+
+All AC1–AC14 have real tests with literal assertions (spec-reviewer confirmed); AC15 (full gate) green. No `unsafe` introduced (security-reviewer confirmed). MV6 transport guards signed off; the one Important security defect (SSE leak) is fixed below and re-reviewed.
 
 ## Shipped
 

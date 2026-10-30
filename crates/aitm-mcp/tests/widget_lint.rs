@@ -50,25 +50,8 @@ fn count(hay: &str, needle: &str) -> usize {
     hay.matches(needle).count()
 }
 
-/// Find the first literal 6-digit hex colour (`#RRGGBB`) and its byte offset.
-/// Equivalent to the regex `#[0-9a-fA-F]{6}`.
-fn find_hex(s: &str) -> Option<(usize, String)> {
-    let bytes = s.as_bytes();
-    let is_hex = |b: u8| b.is_ascii_hexdigit();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'#' && i + 7 <= bytes.len() {
-            let hex = &bytes[i + 1..i + 7];
-            if hex.iter().all(|&b| is_hex(b)) {
-                return Some((i, format!("#{}", std::str::from_utf8(hex).unwrap())));
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
 /// Collect every literal 6-digit hex colour as `(byte_offset, text)`.
+/// Equivalent to every match of the regex `#[0-9a-fA-F]{6}`.
 fn all_hex(s: &str) -> Vec<(usize, String)> {
     let bytes = s.as_bytes();
     let mut out = Vec::new();
@@ -108,6 +91,52 @@ fn find_inline_handler(s: &str) -> Option<String> {
         i += 1;
     }
     None
+}
+
+/// Whether any `<script …>` open tag carries a `src` attribute (an external
+/// script load). Scans each `<script` open tag up to its closing `>`.
+fn script_tag_has_src(s: &str) -> bool {
+    let mut rest = s;
+    while let Some(pos) = rest.find("<script") {
+        let after = &rest[pos..];
+        match after.find('>') {
+            Some(end) => {
+                if after[..end].contains("src") {
+                    return true;
+                }
+                rest = &after[end..];
+            }
+            None => break,
+        }
+    }
+    false
+}
+
+/// Whether the source assigns to a `.<prop>` property (a dynamic external load),
+/// e.g. `img.src = url`. Matches `.<prop>` at a word boundary followed by a lone
+/// `=` (not `==`/`===`), ignoring surrounding spaces.
+fn assigns_property(s: &str, prop: &str) -> bool {
+    let needle = format!(".{prop}");
+    let bytes = s.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = s[from..].find(&needle) {
+        let after = from + rel + needle.len();
+        // The property name must end here (so `.src` does not match `.srcset`).
+        let boundary =
+            after >= bytes.len() || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+        if boundary {
+            let mut j = after;
+            while j < bytes.len() && bytes[j] == b' ' {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'=' && (j + 1 >= bytes.len() || bytes[j + 1] != b'=')
+            {
+                return true;
+            }
+        }
+        from = after;
+    }
+    false
 }
 
 /// AC14 #1: every widget starts with `<!DOCTYPE html>` and is non-empty.
@@ -243,10 +272,66 @@ fn widgets_inline_token_block() {
     }
 }
 
-/// Guard: `find_hex` is self-consistent (a minimal smoke so a deleted body is a
-/// failing test, not a silent pass).
+/// AC14 #6: no widget pulls in an external reference. The house style is a
+/// single self-contained, CSP-clean document with a classic `<script>` — no
+/// `type="module"`, no remote URLs, no external `<script src>`/`<link>`
+/// stylesheet/`@import`/`srcdoc`, and no runtime `fetch(` or dynamic
+/// `.src`/`.href` assignment. This matches the `resources/*` CSP that forbids
+/// every connect/resource domain, so a future widget cannot introduce a load.
+#[test]
+fn no_external_refs_in_widgets() {
+    const BANNED: &[&str] = &[
+        "http://",
+        "https://",
+        "type=\"module\"",
+        "type='module'",
+        "<link ",
+        "@import",
+        "srcdoc",
+        "fetch(",
+    ];
+    for path in widget_files() {
+        let src = read(&path);
+        for pat in BANNED {
+            assert!(
+                !src.contains(pat),
+                "{} contains external-reference pattern `{}`",
+                name(&path),
+                pat
+            );
+        }
+        assert!(
+            !script_tag_has_src(&src),
+            "{} has a <script> with a `src=` attribute (external load)",
+            name(&path)
+        );
+        for prop in ["src", "href"] {
+            assert!(
+                !assigns_property(&src, prop),
+                "{} assigns `.{}` dynamically (external load)",
+                name(&path),
+                prop
+            );
+        }
+    }
+}
+
+/// Guard: `all_hex` — the scanner the real lint uses — is self-consistent (a
+/// minimal smoke so a deleted body is a failing test, not a silent pass).
 #[test]
 fn hex_scanner_detects_a_colour() {
-    assert_eq!(find_hex("x: #Ab12Cd;"), Some((3, "#Ab12Cd".to_string())));
-    assert_eq!(find_hex("no colour here #zzz"), None);
+    assert_eq!(all_hex("x: #Ab12Cd;"), vec![(3, "#Ab12Cd".to_string())]);
+    assert!(all_hex("no colour here #zzz").is_empty());
+}
+
+/// Guard: the external-reference scanners actually fire on a positive example
+/// (so a deleted body is a failing test, not a silent pass).
+#[test]
+fn external_ref_scanners_detect() {
+    assert!(script_tag_has_src("<script src=\"x.js\"></script>"));
+    assert!(!script_tag_has_src("<script>const x = 1;</script>"));
+    assert!(assigns_property("img.src = url", "src"));
+    assert!(assigns_property("a.href=foo", "href"));
+    assert!(!assigns_property("const srcset = 1;", "src"));
+    assert!(!assigns_property("if (a.src === b) {}", "src"));
 }

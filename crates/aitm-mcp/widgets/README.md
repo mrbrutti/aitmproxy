@@ -2,7 +2,7 @@
 
 Source for the rich MCP Apps widgets served by `aitm-mcp` over `resources/*`.
 Each `<widget>.html` is a complete, CSP-clean HTML5 document (inlined `<style>`
-and `<script type="module">`, no external assets) and is `include_str!`-ed into
+and classic `<script>`, no external assets) and is `include_str!`-ed into
 `src/widgets.rs`.
 
 ## Palette: `tokens.css`
