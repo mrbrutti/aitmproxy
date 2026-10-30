@@ -150,7 +150,14 @@ actor EmbeddedCore {
         // CSPRNG draws, so they never collide in practice.
         let token = EmbeddedCoreLaunch.freshToken()
         let operatorToken = EmbeddedCoreLaunch.freshToken()
-        guard let proxyPort = EmbeddedCoreLaunch.pickProxyPort(preferred: defaultProxyPort),
+        // Operator-editable (Settings ▸ Proxy), read fresh each spawn so Apply &
+        // Restart Core picks them up: the preferred listen port and whether to verify
+        // upstream TLS. Unset values fall back to the secure defaults.
+        let defaults = UserDefaults.standard
+        let savedPort = defaults.integer(forKey: "proxy.preferredPort")
+        let preferredPort = (savedPort > 0 && savedPort <= 65535) ? UInt16(savedPort) : defaultProxyPort
+        let sslInsecure = !(defaults.object(forKey: "proxy.verifyUpstreamTLS") as? Bool ?? true)
+        guard let proxyPort = EmbeddedCoreLaunch.pickProxyPort(preferred: preferredPort),
               let browserProxyPort = EmbeddedCoreLaunch.pickProxyPort(preferred: defaultBrowserProxyPort)
         else {
             await failPermanently("could not find a free proxy port")
@@ -173,7 +180,8 @@ actor EmbeddedCore {
                 browserProxyPort: browserProxyPort,
                 token: token,
                 operatorToken: operatorToken,
-                endpointFile: endpointURL
+                endpointFile: endpointURL,
+                sslInsecure: sslInsecure
             )
             try EmbeddedCoreLaunch.writeConfig(config.yaml(), to: configURL)  // yaml() escapes/validates spliced paths
         } catch {

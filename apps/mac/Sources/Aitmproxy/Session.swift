@@ -245,6 +245,9 @@ final class Session {
     /// Bumped by Proxy ▸ Reconnect Bus (⌃⌘R) so the shell re-resolves the
     /// endpoint and reconnects — picking up a newly pasted operator token.
     var reconnectTick = 0
+    /// Bumped by Settings ▸ Proxy "Apply & Restart Core" to restart the embedded core so
+    /// edited proxy settings (listen port, upstream-TLS) take effect.
+    var restartCoreTick = 0
     /// The single active core connection's id this launch (Task 5). Every flow
     /// ingested over the bus is stamped with it; fixture/offline data uses the
     /// well-known `.fixture` id. The seam for multi-core: a second connection is

@@ -87,6 +87,34 @@ import Testing
         #expect(yaml.contains("stop_timeout: 2"))
     }
 
+    private func config(sslInsecure: Bool) -> EmbeddedCoreLaunch.Config {
+        EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"),
+            sslInsecure: sslInsecure
+        )
+    }
+
+    @Test func secure_default_emits_no_ssl_insecure_key() throws {
+        // Verifying upstream TLS is the default, so the key is omitted entirely and
+        // the core keeps `ssl_insecure: false` — the app never weakens TLS silently.
+        let yaml = try config(sslInsecure: false).yaml()
+        #expect(!yaml.contains("ssl_insecure"))
+    }
+
+    @Test func ssl_insecure_is_a_top_level_unindented_key() throws {
+        // The core models `ssl_insecure` as a top-level key (sibling of `listen`),
+        // and `deny_unknown_fields` rejects any wrapper — so a line like
+        // `upstream:\n  ssl_insecure: true` would make the core refuse to start.
+        // The opt-out must therefore be an unindented, top-level `ssl_insecure: true`.
+        let yaml = try config(sslInsecure: true).yaml()
+        let lines = yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(lines.contains("ssl_insecure: true"))   // exact line: column 0, no indent
+        #expect(!yaml.contains("upstream"))              // no wrapper object the core would reject
+    }
+
     @Test func swift_stop_grace_exceeds_the_embedded_core_obscura_budget() {
         // The SIGTERM→SIGKILL grace must outlast the core's whole obscura teardown
         // budget (stop_timeout + the core's 1 s reap margin) so a clean SIGTERM is
