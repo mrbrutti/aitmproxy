@@ -70,6 +70,7 @@ struct GeneralSettings: View {
             }
             Toggle("Auto-select new flows", isOn: $session.autoSelect)
         }
+        CaptureSettings()
     }
 }
 
@@ -138,6 +139,71 @@ struct BusSettings: View {
                 """)
                 .font(.callout)
                 .foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// The macOS capture extension's state and its uninstall (Task 17, NE-AC15), on the
+/// General tab. Reads the capability the `ExtensionController` pushes into
+/// `CoreHealthState`; hidden when there is no extension to report on (a development
+/// build, fixture and snapshot runs, and after an uninstall).
+///
+/// Uninstall is the operator's button and nothing else: there is no bus, MCP or
+/// `Session` verb for it (the controller documents why).
+struct CaptureSettings: View {
+    @Environment(Session.self) private var session
+    @State private var confirming = false
+    @State private var removing = false
+
+    var body: some View {
+        let capability = session.coreHealth.captureCapability
+        if capability.isInstalledOrInstalling {
+            Section("Capture") {
+                LabeledContent(capability.isCaptureOn ? "Capture is on" : "Capture is off") {
+                    Label {
+                        Text(capability.title)
+                    } icon: {
+                        Image(systemName: symbol(for: capability))
+                            .foregroundStyle(capability.isCaptureOn ? Palette.accent : Color.secondary)
+                    }
+                }
+                if let reason = capability.degradedReason {
+                    Text(reason)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                if capability.canUninstall {
+                    Button(removing ? "Removing…" : "Uninstall Capture Extension…", role: .destructive) {
+                        confirming = true
+                    }
+                    .disabled(removing)
+                    .confirmationDialog(
+                        "Uninstall the capture extension?", isPresented: $confirming, titleVisibility: .visible
+                    ) {
+                        Button("Uninstall", role: .destructive, action: uninstall)
+                    } message: {
+                        Text("Capture stops and its proxy configuration is removed. Relaunching the app installs it again and asks for approval again.")
+                    }
+                }
+            }
+        }
+    }
+
+    private func symbol(for capability: CaptureCapability) -> String {
+        switch capability {
+        case .extensionNotInstalled: "circle.slash"
+        case .pendingApproval: "hourglass"
+        case .approvedAttached: "checkmark.circle"
+        case .capturing: "record.circle.fill"
+        case .degraded: "exclamationmark.triangle"
+        }
+    }
+
+    private func uninstall() {
+        removing = true
+        Task {
+            await session.coreHealth.extensionController?.uninstall()
+            removing = false
         }
     }
 }

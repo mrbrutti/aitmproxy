@@ -9,6 +9,7 @@
     <key>CFBundleName</key><string>AitmproxyNE</string>
     <key>CFBundlePackageType</key><string>SYSX</string>
     <key>CFBundleShortVersionString</key><string>__VERSION__</string>
+    <!-- Task 16: build.sh stamps the build placeholder below with a timestamp on every build, so each sysex is a newer version and the OS replaces the old one. Never hard-code it. -->
     <key>CFBundleVersion</key><string>__BUILD__</string>
     <key>LSMinimumSystemVersion</key><string>26.0</string>
     <key>NSSystemExtensionUsageDescription</key>
