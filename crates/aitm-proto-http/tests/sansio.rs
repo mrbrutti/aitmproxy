@@ -196,3 +196,396 @@ fn encodes_request_for_server() {
         Some(&b"POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nhi"[..])
     );
 }
+
+/// A machine that has been fed `request` on the client side, plus the flow id of
+/// the exchange the request opened.
+fn exchange(request: &[u8]) -> (Http1Machine, FlowId) {
+    let mut m = Http1Machine::new();
+    let events = m.on_bytes(Side::Client, request).unwrap();
+    let id = flow_of(&events);
+    (m, id)
+}
+
+/// A `GET` answered in full with `ok`, so the machine is idle and ready for the
+/// next exchange. Returns the machine and the completed exchange's flow id.
+fn completed_exchange() -> (Http1Machine, FlowId) {
+    let (mut m, id) = exchange(b"GET /done HTTP/1.1\r\nHost: h\r\n\r\n");
+    let events = m
+        .on_bytes(
+            Side::Server,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        )
+        .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            HttpSansIoEvent::ResponseHeaders(id),
+            HttpSansIoEvent::ResponseBodyChunk {
+                flow: id,
+                bytes: b"ok".to_vec()
+            },
+            HttpSansIoEvent::ResponseComplete(id),
+        ]
+    );
+    (m, id)
+}
+
+// ---------------------------------------------------------------------------
+// Characterization: how the machine answers well-behaved server traffic. These
+// pin today's behaviour so the surplus-bytes guard cannot change it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn head_response_completes_without_a_body() {
+    let (mut m, id) = exchange(b"HEAD /x HTTP/1.1\r\nHost: h\r\n\r\n");
+    let events = m
+        .on_bytes(
+            Side::Server,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+        )
+        .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            HttpSansIoEvent::ResponseHeaders(id),
+            HttpSansIoEvent::ResponseComplete(id),
+        ]
+    );
+    assert_eq!(m.take_leftover(Side::Server), Vec::<u8>::new());
+}
+
+#[test]
+fn not_modified_response_completes_without_a_body() {
+    let (mut m, id) = exchange(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
+    let events = m
+        .on_bytes(
+            Side::Server,
+            b"HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n",
+        )
+        .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            HttpSansIoEvent::ResponseHeaders(id),
+            HttpSansIoEvent::ResponseComplete(id),
+        ]
+    );
+    assert_eq!(m.take_leftover(Side::Server), Vec::<u8>::new());
+}
+
+#[test]
+fn no_content_response_completes_without_a_body() {
+    let (mut m, id) = exchange(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
+    let events = m
+        .on_bytes(Side::Server, b"HTTP/1.1 204 No Content\r\n\r\n")
+        .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            HttpSansIoEvent::ResponseHeaders(id),
+            HttpSansIoEvent::ResponseComplete(id),
+        ]
+    );
+    assert_eq!(m.take_leftover(Side::Server), Vec::<u8>::new());
+}
+
+#[test]
+fn chunked_response_streams_and_completes() {
+    let (mut m, id) = exchange(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
+    let events = m
+        .on_bytes(
+            Side::Server,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nwxyz\r\n0\r\n\r\n",
+        )
+        .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            HttpSansIoEvent::ResponseHeaders(id),
+            HttpSansIoEvent::ResponseBodyChunk {
+                flow: id,
+                bytes: b"wxyz".to_vec()
+            },
+            HttpSansIoEvent::ResponseComplete(id),
+        ]
+    );
+    assert_eq!(m.take_leftover(Side::Server), Vec::<u8>::new());
+}
+
+#[test]
+fn close_delimited_response_completes_at_eof() {
+    let (mut m, id) = exchange(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
+    let events = m
+        .on_bytes(Side::Server, b"HTTP/1.1 200 OK\r\n\r\nbody")
+        .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            HttpSansIoEvent::ResponseHeaders(id),
+            HttpSansIoEvent::ResponseBodyChunk {
+                flow: id,
+                bytes: b"body".to_vec()
+            },
+        ]
+    );
+    assert_eq!(
+        m.on_eof(Side::Server),
+        vec![HttpSansIoEvent::ResponseComplete(id)]
+    );
+    assert_eq!(m.take_leftover(Side::Server), Vec::<u8>::new());
+}
+
+#[test]
+fn interim_continue_is_skipped_before_the_final_response() {
+    let (mut m, id) = exchange(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
+    let events = m
+        .on_bytes(
+            Side::Server,
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        )
+        .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            HttpSansIoEvent::ResponseHeaders(id),
+            HttpSansIoEvent::ResponseBodyChunk {
+                flow: id,
+                bytes: b"ok".to_vec()
+            },
+            HttpSansIoEvent::ResponseComplete(id),
+        ]
+    );
+    assert_eq!(m.response().unwrap().status, 200);
+    assert_eq!(m.take_leftover(Side::Server), Vec::<u8>::new());
+}
+
+#[test]
+fn switching_protocols_leaves_the_following_bytes_for_the_next_protocol() {
+    let (mut m, id) = exchange(
+        b"GET /chat HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+    );
+    let events = m
+        .on_bytes(
+            Side::Server,
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nWSDATA",
+        )
+        .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            HttpSansIoEvent::ResponseHeaders(id),
+            HttpSansIoEvent::ResponseComplete(id),
+        ]
+    );
+    assert!(m.is_upgraded());
+    assert_eq!(m.take_leftover(Side::Server), b"WSDATA".to_vec());
+}
+
+#[test]
+fn a_pipelined_request_is_parsed_after_the_first_response() {
+    let mut m = Http1Machine::new();
+    let first = m
+        .on_bytes(
+            Side::Client,
+            b"GET /1 HTTP/1.1\r\nHost: h\r\n\r\nGET /2 HTTP/1.1\r\nHost: h\r\n\r\n",
+        )
+        .unwrap();
+    let id1 = flow_of(&first);
+    assert_eq!(
+        first,
+        vec![
+            HttpSansIoEvent::RequestHeaders(id1),
+            HttpSansIoEvent::RequestComplete(id1),
+        ],
+        "the second request stays parked until the first is answered"
+    );
+
+    let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    let r1 = m.on_bytes(Side::Server, answer).unwrap();
+    assert_eq!(
+        r1,
+        vec![
+            HttpSansIoEvent::ResponseHeaders(id1),
+            HttpSansIoEvent::ResponseBodyChunk {
+                flow: id1,
+                bytes: b"ok".to_vec()
+            },
+            HttpSansIoEvent::ResponseComplete(id1),
+        ]
+    );
+
+    let second = m.on_bytes(Side::Client, b"").unwrap();
+    let id2 = flow_of(&second);
+    assert_ne!(id1, id2);
+    assert_eq!(
+        second,
+        vec![
+            HttpSansIoEvent::RequestHeaders(id2),
+            HttpSansIoEvent::RequestComplete(id2),
+        ]
+    );
+
+    let r2 = m.on_bytes(Side::Server, answer).unwrap();
+    assert_eq!(
+        r2,
+        vec![
+            HttpSansIoEvent::ResponseHeaders(id2),
+            HttpSansIoEvent::ResponseBodyChunk {
+                flow: id2,
+                bytes: b"ok".to_vec()
+            },
+            HttpSansIoEvent::ResponseComplete(id2),
+        ]
+    );
+    assert_eq!(m.take_leftover(Side::Server), Vec::<u8>::new());
+}
+
+#[test]
+fn a_response_before_any_request_is_an_error() {
+    let mut m = Http1Machine::new();
+    let result = m.on_bytes(
+        Side::Server,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert!(
+        result.is_err(),
+        "response bytes before any request must be an error, got {result:?}"
+    );
+}
+
+#[test]
+fn a_partial_second_head_in_the_same_read_stays_buffered() {
+    let (mut m, id) = exchange(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
+    let events = m
+        .on_bytes(
+            Side::Server,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nlegitHTTP/1.1 500 Injected\r\nX-Junk: ",
+        )
+        .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            HttpSansIoEvent::ResponseHeaders(id),
+            HttpSansIoEvent::ResponseBodyChunk {
+                flow: id,
+                bytes: b"legit".to_vec()
+            },
+            HttpSansIoEvent::ResponseComplete(id),
+        ]
+    );
+    assert_eq!(
+        m.take_leftover(Side::Server),
+        b"HTTP/1.1 500 Injected\r\nX-Junk: ".to_vec()
+    );
+}
+
+#[test]
+fn unsolicited_server_bytes_beyond_the_head_cap_are_an_error() {
+    let (mut m, _id) = completed_exchange();
+    let result = m.on_bytes(Side::Server, &vec![b'x'; 64 * 1024 + 1]);
+    assert!(
+        result.is_err(),
+        "unsolicited bytes past the 64 KiB head cap must be an error, got {result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Surplus server bytes: a response head is parsed only while a request awaits
+// one. Anything else the server sends stays in its buffer, unparsed.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_second_complete_response_in_the_same_read_is_left_unparsed() {
+    let (mut m, id) = exchange(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
+    let events = m
+        .on_bytes(
+            Side::Server,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nlegitHTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nPOISON",
+        )
+        .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            HttpSansIoEvent::ResponseHeaders(id),
+            HttpSansIoEvent::ResponseBodyChunk {
+                flow: id,
+                bytes: b"legit".to_vec()
+            },
+            HttpSansIoEvent::ResponseComplete(id),
+        ]
+    );
+    assert_eq!(
+        m.response().unwrap().headers.get("content-length"),
+        Some("5"),
+        "the stray response must not replace the legitimate head"
+    );
+    assert_eq!(
+        m.take_leftover(Side::Server),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nPOISON".to_vec()
+    );
+}
+
+#[test]
+fn a_response_after_the_exchange_completed_is_not_parsed() {
+    let (mut m, _id) = completed_exchange();
+    let stray = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nPOISON";
+    let events = m.on_bytes(Side::Server, stray).unwrap();
+    assert_eq!(events, vec![]);
+    assert_eq!(m.take_leftover(Side::Server), stray.to_vec());
+}
+
+#[test]
+fn a_response_while_the_request_body_is_arriving_waits_for_the_request() {
+    let mut m = Http1Machine::new();
+    let first = m
+        .on_bytes(
+            Side::Client,
+            b"POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\n\r\nab",
+        )
+        .unwrap();
+    let id = flow_of(&first);
+    assert_eq!(
+        first,
+        vec![
+            HttpSansIoEvent::RequestHeaders(id),
+            HttpSansIoEvent::RequestBodyChunk {
+                flow: id,
+                bytes: b"ab".to_vec()
+            },
+        ]
+    );
+
+    let early = m
+        .on_bytes(
+            Side::Server,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+    assert_eq!(
+        early,
+        vec![],
+        "a response is not parsed while its request is still arriving"
+    );
+
+    let rest = m.on_bytes(Side::Client, b"cd").unwrap();
+    assert_eq!(
+        rest,
+        vec![
+            HttpSansIoEvent::RequestBodyChunk {
+                flow: id,
+                bytes: b"cd".to_vec()
+            },
+            HttpSansIoEvent::RequestComplete(id),
+        ]
+    );
+
+    // The parked response is released once the request is complete.
+    let released = m.on_bytes(Side::Server, b"").unwrap();
+    assert_eq!(
+        released,
+        vec![
+            HttpSansIoEvent::ResponseHeaders(id),
+            HttpSansIoEvent::ResponseComplete(id),
+        ]
+    );
+}
