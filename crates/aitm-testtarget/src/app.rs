@@ -11,7 +11,6 @@ use std::sync::Mutex;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -48,10 +47,16 @@ pub(crate) async fn serve_connection(stream: TcpStream, state: std::sync::Arc<Ap
         .await;
 }
 
-async fn route(
-    req: Request<Incoming>,
+/// Dispatch one request. Generic over the body so the in-process tests can
+/// drive it with a [`Full`] body; the server passes hyper's [`hyper::body::Incoming`].
+async fn route<B>(
+    req: Request<B>,
     state: std::sync::Arc<AppState>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+) -> Result<Response<Full<Bytes>>, Infallible>
+where
+    B: hyper::body::Body,
+    B::Data: bytes::Buf,
+{
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
@@ -274,15 +279,20 @@ fn index() -> Response<Full<Bytes>> {
         .iter()
         .map(|href| format!("<li><a href=\"{href}\">{href}</a></li>"))
         .collect();
+    // One form alongside the anchors, so a crawler has a form graph to walk as
+    // well as a link graph. It submits `q` to `/search` by GET, exactly like
+    // the first link above.
+    let form = "<form action=\"/search\" method=\"get\">\
+                <input name=\"q\"><button>search</button></form>";
     html(
         StatusCode::OK,
-        format!("<html><body><h1>aitm test target</h1><ul>{items}</ul></body></html>"),
+        format!("<html><body><h1>aitm test target</h1><ul>{items}</ul>{form}</body></html>"),
     )
 }
 
 // --- Helpers -----------------------------------------------------------------
 
-fn header(req: &Request<Incoming>, name: &str) -> Option<String> {
+fn header<B>(req: &Request<B>, name: &str) -> Option<String> {
     req.headers()
         .get(name)
         .and_then(|v| v.to_str().ok())
@@ -416,4 +426,125 @@ fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    //! Hermetic route-level tests: drive [`route`] in-process with a [`Full`]
+    //! body, so they run where loopback binding is refused (the Bash sandbox).
+    //! The socket-level suites live in `tests/target.rs` and `tests/serve_bin.rs`.
+
+    use std::sync::Arc;
+
+    use super::*;
+
+    /// `GET path` against a fresh target in `mode`; returns (status, body).
+    async fn get(mode: SeedMode, path: &str) -> (StatusCode, String) {
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Full::new(Bytes::new()))
+            .expect("valid request");
+        let resp = route(req, Arc::new(AppState::new(mode)))
+            .await
+            .expect("route is infallible");
+        let status = resp.status();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("full body")
+            .to_bytes();
+        (
+            status,
+            String::from_utf8(body.to_vec()).expect("utf-8 body"),
+        )
+    }
+
+    /// Percent-encode everything but the URL-unreserved set so a marker with
+    /// `<` / `>` is a valid request-target (mirrors the socket-level suites).
+    fn enc(s: &str) -> String {
+        let mut out = String::new();
+        for b in s.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(b as char)
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn index_links_all_seeded_endpoints() {
+        let (status, body) = get(SeedMode::Vulnerable, "/").await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Every seeded endpoint is linked, so a crawler can discover it honestly.
+        for path in [
+            "/search",
+            "/comments",
+            "/fetch",
+            "/account/",
+            "/admin",
+            "/redirect",
+        ] {
+            assert!(
+                body.contains(&format!("href=\"{path}")),
+                "index must link {path}: {body}"
+            );
+        }
+
+        // The crawl stage needs a form to walk, not just anchors: one search
+        // form, GET to /search, with a `q` field.
+        assert!(
+            body.contains("<form"),
+            "index must contain a <form>: {body}"
+        );
+        assert!(
+            body.contains("action=\"/search\""),
+            "form must target /search: {body}"
+        );
+        assert!(
+            body.contains("method=\"get\""),
+            "form must submit via GET: {body}"
+        );
+        assert!(
+            body.contains("name=\"q\""),
+            "form must carry the q field /search reads: {body}"
+        );
+
+        // The landing page is mode-independent: identical in both seed modes.
+        let (_, patched) = get(SeedMode::Patched, "/").await;
+        assert_eq!(body, patched, "index must be identical in both SeedModes");
+    }
+
+    #[tokio::test]
+    async fn existing_routes_unchanged() {
+        let path = format!("/search?q={}", enc(seed::REFLECTED_XSS_MARKER));
+
+        // Vulnerable: the marker is reflected verbatim.
+        let (status, body) = get(SeedMode::Vulnerable, &path).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            format!(
+                "<html><body><h1>Results for {}</h1></body></html>",
+                seed::REFLECTED_XSS_MARKER
+            )
+        );
+
+        // Patched: the same request comes back escaped, never raw.
+        let (status, body) = get(SeedMode::Patched, &path).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !body.contains(seed::REFLECTED_XSS_MARKER),
+            "patched must not reflect the marker raw: {body}"
+        );
+        assert!(
+            body.contains("&lt;xss-reflected-7f3a&gt;"),
+            "patched must HTML-escape the marker: {body}"
+        );
+    }
 }
