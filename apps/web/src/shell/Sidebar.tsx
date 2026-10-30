@@ -162,6 +162,9 @@ export const Sidebar: Component<{ class?: string }> = (props) => {
 
         <div class={css.group}>aitmproxy</div>
         <Item icon="crosshair" label="Scope" count={app.proxy.scope.length} countKind="queue" current={is({ kind: 'scope' })} onClick={pick({ kind: 'scope' })} />
+        <Show when={app.proxy.tools.some((t) => t.name === 'scan.discover')}>
+          <Item icon="search" label="Scan" current={is({ kind: 'scan' })} onClick={pick({ kind: 'scan' })} />
+        </Show>
         <Item icon="flag" label="Findings" count={app.proxy.findings.length} countKind="queue" current={is({ kind: 'findings' })} onClick={pick({ kind: 'findings' })} />
         <Item icon="globe" label="Browser" count="1 tab" current={is({ kind: 'browser' })} onClick={pick({ kind: 'browser' })} />
         <Item icon="code" label="Scripts" count="0 active" current={is({ kind: 'scripts' })} onClick={pick({ kind: 'scripts' })} />
