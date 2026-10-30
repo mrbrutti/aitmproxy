@@ -15,7 +15,8 @@ use std::collections::BTreeMap;
 
 use aitm_plugin::language::{
     GuardHandle, Guarded, HostError, HostFn, HostFnSig, NamespaceCatalog, PocStepHandler,
-    PocStepInputs, PocStepOutcome, ProtocolLanguage, RegisterError, ScriptHostRegistry,
+    PocStepInputs, PocStepOutcome, PocStepSchema, ProtocolLanguage, RegisterError,
+    ScriptHostRegistry,
 };
 use aitm_plugin::Value;
 
@@ -168,8 +169,22 @@ impl ProtocolLanguage for TestLanguage {
                         .to_string(),
                 },
             ],
-            poc_step: None,
-            sources: vec![],
+            // The seam's PoC face: the runnable `test:` step
+            // ([`TestStepHandler`]) must be catalogued, or the PoC-face drift
+            // guard (`poc_face_drift`) reports it as silently lagging the
+            // engine. No `op` enum is advertised: the step's single PoC verb
+            // (`echo`) is intentionally disjoint from this namespace's scripting
+            // host fns (`ping`/`effect`, the seam's liveness/guard probes), so
+            // the namespace declares no shared `op` vocabulary and is vacuously
+            // vocabulary-consistent (AC8 bites only when `op` is catalogued).
+            poc_step: Some(PocStepSchema {
+                step: NAMESPACE.to_string(),
+                description: "A pure stand-in protocol step (`op: echo`) used by the seam tests."
+                    .to_string(),
+                enums: BTreeMap::new(),
+                sources: vec![ECHO_SOURCE.to_string()],
+            }),
+            sources: vec![ECHO_SOURCE.to_string()],
         }
     }
 }
@@ -194,10 +209,6 @@ pub struct TestStepHandler;
 impl PocStepHandler for TestStepHandler {
     fn ns(&self) -> &str {
         NAMESPACE
-    }
-
-    fn sources(&self) -> Vec<String> {
-        vec![ECHO_SOURCE.to_string()]
     }
 
     fn run(
@@ -287,6 +298,14 @@ mod tests {
         assert_eq!(cat.host_fns.len(), 2);
         assert_eq!(cat.host_fns[0].name, "ping");
         assert_eq!(cat.host_fns[1].name, "effect");
+
+        // The runnable `test:` step is catalogued (the PoC-face bijection), with
+        // the `echo` source but no `op` enum (vacuously vocabulary-consistent).
+        let step = cat.poc_step.expect("the `test:` PoC step is catalogued");
+        assert_eq!(step.step, "test");
+        assert_eq!(step.sources, vec!["echo".to_string()]);
+        assert!(step.enums.is_empty());
+        assert_eq!(cat.sources, vec!["echo".to_string()]);
     }
 
     #[test]
@@ -310,7 +329,6 @@ mod tests {
             .poc_step()
             .expect("test namespace contributes a `test:` PoC step");
         assert_eq!(handler.ns(), "test");
-        assert_eq!(handler.sources(), vec!["echo".to_string()]);
     }
 
     /// `op: echo` binds `echoed` and produces the `echo` source, expanding a

@@ -54,6 +54,19 @@ pub enum IngressOutcome {
     Unhandled,
 }
 
+/// One captured **UDP** flow: a batch of datagrams to one [`L4Target`], tagged with
+/// the dispatch context the L4 guard authorizes against. A thin, symmetric companion
+/// to [`CapturedTcpFlow`] over the existing deny-by-default L4 path.
+pub struct CapturedUdpFlow {
+    /// What [`L4Guard::check`](aitm_proto_l4::guard::L4Guard::check) decides on
+    /// (interface / direction / dst / port / proto).
+    pub target: aitm_proto_l4::types::L4Target,
+    /// The raw on-wire bytes of each captured datagram.
+    pub datagrams: Vec<Vec<u8>>,
+    /// The source-app signing identity, if the backend knows it.
+    pub peer_identity: Option<String>,
+}
+
 /// The protocol-general capture / ingress boundary. A capture backend — Phase 1: the
 /// Linux/CLI L4 `pcap` backend; Phase 2: the macOS Network/System Extension — calls
 /// [`accept`](CaptureIngress::accept) with each captured unit, and the implementation
@@ -64,18 +77,55 @@ pub trait CaptureIngress: Send + Sync {
     fn accept(&self, unit: CapturedUnit) -> IngressOutcome;
 }
 
-/// The core's capture ingress. Holds the per-protocol dispatch wiring; Phase 1 wires
-/// the L4 dispatch (the shared guard + flow store). A protocol with no dispatch wired
-/// yields [`IngressOutcome::Unhandled`].
+/// One captured **TCP/stream** flow, tagged with the dispatch context the core routes
+/// on. A capture backend (Phase 2's macOS Network/System Extension) presents the
+/// client stream with the **authoritative original destination** it observed, so the
+/// core dispatches on the real remote endpoint — not an accepted-socket peer.
+pub struct CapturedTcpFlow {
+    /// The captured client byte stream. It must still yield `first_bytes` (the backend
+    /// observes them without consuming, mirroring today's `TcpStream::peek`).
+    pub stream: aitm_core::ByteStream,
+    /// The authoritative original remote endpoint the client was reaching.
+    pub dst: std::net::SocketAddr,
+    /// The remote hostname / ClientHello SNI, if the backend knows it.
+    pub sni: Option<String>,
+    /// The backend's observed initial bytes (for protocol sniffing); the `stream`
+    /// still yields them.
+    pub first_bytes: Vec<u8>,
+    /// The source-app signing identity, if the backend knows it (macOS `SourceAppId`).
+    pub peer_identity: Option<String>,
+}
+
+/// What the ingress did with a captured TCP/stream flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamOutcome {
+    /// A [`ProtocolModule`](aitm_core::ProtocolModule) claimed the flow and was spawned.
+    Dispatched,
+    /// In scope but unclaimed: the original dst was dialled and bytes tunnelled verbatim.
+    PassedThrough,
+    /// Out of scope: refused before any module match, spawn, or connector dial.
+    Refused,
+    /// Stream dispatch is not wired in this build.
+    Unhandled,
+}
+
+/// The core's capture ingress. Holds the per-protocol dispatch wiring; the L4 dispatch
+/// (the shared guard + flow store) and the stream dispatch (the module list, chain,
+/// guarded connector + scope guard). A protocol with no dispatch wired yields
+/// [`IngressOutcome::Unhandled`] / [`StreamOutcome::Unhandled`].
 pub struct CoreIngress {
     l4: Option<L4Dispatch>,
+    stream: Option<StreamDispatch>,
 }
 
 impl CoreIngress {
     /// An ingress with no protocol wired — every unit is [`IngressOutcome::Unhandled`].
     #[must_use]
     pub fn empty() -> Self {
-        Self { l4: None }
+        Self {
+            l4: None,
+            stream: None,
+        }
     }
 
     /// Wire the L4 dispatch over the module's **shared** guard and flow store, so an
@@ -89,8 +139,146 @@ impl CoreIngress {
                 store,
                 flow: Mutex::new(None),
             }),
+            stream: None,
         }
     }
+
+    /// Wire the TCP/stream dispatch over the live proxy's **shared** module list, event
+    /// chain, guarded upstream connector, and scope guard — the same wiring the acceptor
+    /// uses — so a captured stream is claimed, emitted, dialled, and scope-gated exactly
+    /// as a proxied one. Builder-style so the L4 and stream halves compose.
+    #[must_use]
+    pub fn with_stream(
+        mut self,
+        modules: Arc<[Arc<dyn aitm_core::ProtocolModule>]>,
+        store: Arc<dyn aitm_core::FlowStore>,
+        sink: Arc<dyn aitm_core::EventSink>,
+        connector: Arc<dyn aitm_core::UpstreamConnector>,
+        guard: Arc<dyn aitm_core::ScopeRateGuard>,
+    ) -> Self {
+        self.stream = Some(StreamDispatch {
+            modules,
+            store,
+            sink,
+            connector,
+            guard,
+        });
+        self
+    }
+
+    /// Dispatch one captured TCP/stream flow: scope-gate it (authority = SNI else the
+    /// dst IP) through the L7 [`ScopeRateGuard`](aitm_core::ScopeRateGuard), then route
+    /// it behind the **authoritative original destination**. An in-scope flow a module
+    /// claims is spawned ([`StreamOutcome::Dispatched`]); an in-scope flow no module
+    /// claims is dialled through the SSRF-guarded connector and tunnelled verbatim
+    /// ([`StreamOutcome::PassedThrough`]); an out-of-scope flow is refused before any
+    /// module match, spawn, or dial ([`StreamOutcome::Refused`]).
+    pub async fn dispatch_tcp(&self, mut flow: CapturedTcpFlow) -> StreamOutcome {
+        let Some(sd) = self.stream.as_ref() else {
+            return StreamOutcome::Unhandled;
+        };
+
+        // Deny-by-default: the authority is the SNI if the backend knows it, else the
+        // authoritative dst IP. An out-of-scope flow is refused before any work.
+        let authority = flow
+            .sni
+            .clone()
+            .unwrap_or_else(|| flow.dst.ip().to_string());
+        if !sd.guard.in_scope(&authority) {
+            return StreamOutcome::Refused;
+        }
+
+        // `dst` is the authoritative original destination — not an accepted-socket peer.
+        let hint = aitm_core::NextLayerHint {
+            dst: flow.dst,
+            is_tls: flow.first_bytes.first() == Some(&0x16),
+            client_hello_sni: flow.sni.clone(),
+            alpn: Vec::new(),
+            first_bytes: flow.first_bytes.clone(),
+            from_upgrade: false,
+        };
+
+        match sd.modules.iter().find(|m| m.matches(&hint)).cloned() {
+            Some(module) => {
+                let ctx = aitm_core::ModuleCtx::new(
+                    sd.store.clone(),
+                    sd.sink.clone(),
+                    sd.connector.clone(),
+                )
+                .with_modules(sd.modules.clone())
+                .with_hint(hint);
+                let _ = module.spawn(flow.stream, ctx).await;
+                StreamOutcome::Dispatched
+            }
+            None => {
+                // In scope but unclaimed: dial the original dst through the SSRF-guarded
+                // connector and tunnel verbatim. The flow was taken, not silently
+                // dropped — a dial failure still reports PassedThrough.
+                match sd.connector.connect(&authority, flow.dst).await {
+                    Ok(mut up) => {
+                        let _ = tokio::io::copy_bidirectional(&mut flow.stream, &mut up).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            dst = %flow.dst,
+                            error = %e,
+                            "captured-stream passthrough: upstream dial failed"
+                        );
+                    }
+                }
+                StreamOutcome::PassedThrough
+            }
+        }
+    }
+
+    /// Dispatch a captured UDP flow over the **existing** L4 path: each datagram goes
+    /// through the same [`L4Guard::check`](aitm_proto_l4::guard::L4Guard::check)
+    /// `(Capture, target)` a `pcap`-fed packet passes — no new guard. [`Captured`] if at
+    /// least one datagram was authorized and stored, else [`Refused`]; [`Unhandled`] when
+    /// no L4 backend is wired.
+    ///
+    /// [`Captured`]: IngressOutcome::Captured
+    /// [`Refused`]: IngressOutcome::Refused
+    /// [`Unhandled`]: IngressOutcome::Unhandled
+    pub fn dispatch_udp(&self, flow: CapturedUdpFlow) -> IngressOutcome {
+        if self.l4.is_none() {
+            return IngressOutcome::Unhandled;
+        }
+        let mut captured = 0usize;
+        for datagram in flow.datagrams {
+            if self.accept(CapturedUnit::L4 {
+                target: flow.target.clone(),
+                bytes: datagram,
+            }) == IngressOutcome::Captured
+            {
+                captured += 1;
+            }
+        }
+        if captured >= 1 {
+            IngressOutcome::Captured
+        } else {
+            IngressOutcome::Refused
+        }
+    }
+}
+
+/// The stream half of the ingress: the shared dispatch wiring a captured TCP flow is
+/// routed through — the ordered module list, the flow store, the event chain, the
+/// guarded upstream connector, and the L7 scope guard.
+struct StreamDispatch {
+    modules: Arc<[Arc<dyn aitm_core::ProtocolModule>]>,
+    store: Arc<dyn aitm_core::FlowStore>,
+    sink: Arc<dyn aitm_core::EventSink>,
+    connector: Arc<dyn aitm_core::UpstreamConnector>,
+    guard: Arc<dyn aitm_core::ScopeRateGuard>,
+}
+
+/// Dispatch a captured TCP/stream flow through `ingress`. The entry point a capture
+/// backend (macOS-NE Band B) calls; delegates to [`CoreIngress::dispatch_tcp`]. A free
+/// function because the stream-wired, async dispatch cannot ride the object-safe
+/// [`CaptureIngress`] trait without a new `async-trait` dependency.
+pub async fn dispatch_captured_tcp(ingress: &CoreIngress, flow: CapturedTcpFlow) -> StreamOutcome {
+    ingress.dispatch_tcp(flow).await
 }
 
 impl CaptureIngress for CoreIngress {
@@ -251,6 +439,305 @@ mod tests {
         assert!(
             !flow.packets[0].injected,
             "ingress-fed capture is observed, never injected"
+        );
+    }
+
+    // ---- Task 2: captured TCP/stream dispatch ----
+
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use aitm_core::{
+        ActionPermit, ByteStream, Event, EventSink, FlowStore, GuardError, MemFlowStore, ModuleCtx,
+        NextLayerHint, ProtocolModule, ScopeEntry, ScopeRateGuard, UpstreamConnector, Verdict,
+    };
+    use futures::future::BoxFuture;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A scope guard whose only consulted method is `in_scope`, fixed per test.
+    struct MockGuard {
+        in_scope: bool,
+    }
+
+    impl ScopeRateGuard for MockGuard {
+        fn check_active(&self, _host: &str) -> Result<ActionPermit, GuardError> {
+            unreachable!("dispatch_tcp consults only in_scope")
+        }
+        fn add_scope(&self, _entry: ScopeEntry) {}
+        fn remove_scope(&self, _entry: &str) -> bool {
+            false
+        }
+        fn list_scope(&self) -> Vec<ScopeEntry> {
+            Vec::new()
+        }
+        fn in_scope(&self, _host: &str) -> bool {
+            self.in_scope
+        }
+    }
+
+    /// An event sink that is never emitted to in these tests (no module emits).
+    struct MockSink;
+
+    impl EventSink for MockSink {
+        fn emit(&self, _ev: Event) -> BoxFuture<'_, Verdict> {
+            Box::pin(async { unreachable!("no event is emitted in these tests") })
+        }
+    }
+
+    /// A stub module: claims or not per `claims`, counts spawns, and records the
+    /// `NextLayerHint` it was spawned with so the test can assert the dst/SNI.
+    struct StubModule {
+        claims: bool,
+        spawn_calls: Arc<AtomicUsize>,
+        recorded: Arc<Mutex<Option<NextLayerHint>>>,
+    }
+
+    impl ProtocolModule for StubModule {
+        fn id(&self) -> &str {
+            "stub"
+        }
+        fn matches(&self, _hint: &NextLayerHint) -> bool {
+            self.claims
+        }
+        fn spawn(&self, _io: ByteStream, ctx: ModuleCtx) -> BoxFuture<'_, anyhow::Result<()>> {
+            self.spawn_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(h) = ctx.hint() {
+                *self.recorded.lock().unwrap_or_else(PoisonError::into_inner) = Some(h.clone());
+            }
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A connector that counts dials and hands back a pre-seeded upstream stream once.
+    struct MockConnector {
+        dial_calls: Arc<AtomicUsize>,
+        upstream: Mutex<Option<ByteStream>>,
+    }
+
+    impl UpstreamConnector for MockConnector {
+        fn connect(
+            &self,
+            _authority: &str,
+            _dst: SocketAddr,
+        ) -> BoxFuture<'_, anyhow::Result<ByteStream>> {
+            self.dial_calls.fetch_add(1, Ordering::SeqCst);
+            let taken = self
+                .upstream
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            Box::pin(async move { taken.ok_or_else(|| anyhow::anyhow!("no upstream seeded")) })
+        }
+    }
+
+    fn store() -> Arc<dyn FlowStore> {
+        Arc::new(MemFlowStore::with_limits(16, 1 << 20))
+    }
+
+    /// A tiny open duplex end, for a flow stream whose bytes a test does not drive.
+    fn dummy_stream() -> ByteStream {
+        Box::pin(tokio::io::duplex(16).0)
+    }
+
+    /// AC17 (stream half): an in-scope flow a module claims is dispatched, and the
+    /// module is spawned with the **authoritative original destination** as the hint's
+    /// `dst` (not an accepted-socket peer) and the SNI the backend observed.
+    #[tokio::test]
+    async fn tcp_flow_dispatches_to_http_with_original_dst() {
+        let spawn_calls = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::new(Mutex::new(None));
+        let module: Arc<dyn ProtocolModule> = Arc::new(StubModule {
+            claims: true,
+            spawn_calls: spawn_calls.clone(),
+            recorded: recorded.clone(),
+        });
+        let dial_calls = Arc::new(AtomicUsize::new(0));
+        let connector: Arc<dyn UpstreamConnector> = Arc::new(MockConnector {
+            dial_calls: dial_calls.clone(),
+            upstream: Mutex::new(None),
+        });
+        let ingress = CoreIngress::empty().with_stream(
+            Arc::from(vec![module]),
+            store(),
+            Arc::new(MockSink),
+            connector,
+            Arc::new(MockGuard { in_scope: true }),
+        );
+
+        let flow = CapturedTcpFlow {
+            stream: dummy_stream(),
+            dst: "93.184.216.34:443".parse().unwrap(),
+            sni: Some("example.com".to_string()),
+            first_bytes: vec![0x16, 0x03, 0x01],
+            peer_identity: None,
+        };
+
+        assert_eq!(ingress.dispatch_tcp(flow).await, StreamOutcome::Dispatched);
+        assert_eq!(
+            spawn_calls.load(Ordering::SeqCst),
+            1,
+            "the module is spawned"
+        );
+        assert_eq!(
+            dial_calls.load(Ordering::SeqCst),
+            0,
+            "a claimed flow is not dialled"
+        );
+        let hint = recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .expect("the module recorded its hint");
+        assert_eq!(
+            hint.dst.to_string(),
+            "93.184.216.34:443",
+            "the hint carries the authoritative original dst, not a socket peer"
+        );
+        assert_eq!(hint.client_hello_sni.as_deref(), Some("example.com"));
+    }
+
+    /// AC17 (stream half): an out-of-scope flow is refused before any module match,
+    /// spawn, or connector dial.
+    #[tokio::test]
+    async fn out_of_scope_tcp_refused_before_any_work() {
+        let spawn_calls = Arc::new(AtomicUsize::new(0));
+        let module: Arc<dyn ProtocolModule> = Arc::new(StubModule {
+            claims: true,
+            spawn_calls: spawn_calls.clone(),
+            recorded: Arc::new(Mutex::new(None)),
+        });
+        let dial_calls = Arc::new(AtomicUsize::new(0));
+        let connector: Arc<dyn UpstreamConnector> = Arc::new(MockConnector {
+            dial_calls: dial_calls.clone(),
+            upstream: Mutex::new(None),
+        });
+        let ingress = CoreIngress::empty().with_stream(
+            Arc::from(vec![module]),
+            store(),
+            Arc::new(MockSink),
+            connector,
+            Arc::new(MockGuard { in_scope: false }),
+        );
+
+        let flow = CapturedTcpFlow {
+            stream: dummy_stream(),
+            dst: "93.184.216.34:443".parse().unwrap(),
+            sni: Some("example.com".to_string()),
+            first_bytes: vec![0x16, 0x03, 0x01],
+            peer_identity: None,
+        };
+
+        assert_eq!(ingress.dispatch_tcp(flow).await, StreamOutcome::Refused);
+        assert_eq!(
+            spawn_calls.load(Ordering::SeqCst),
+            0,
+            "no module is spawned"
+        );
+        assert_eq!(
+            dial_calls.load(Ordering::SeqCst),
+            0,
+            "no upstream is dialled"
+        );
+    }
+
+    /// AC17 (stream half): an in-scope flow no module claims is passed through — the
+    /// original dst is dialled once and bytes are tunnelled verbatim, not dropped.
+    #[tokio::test]
+    async fn in_scope_unclaimed_tcp_passes_through_not_dropped() {
+        let spawn_calls = Arc::new(AtomicUsize::new(0));
+        let module: Arc<dyn ProtocolModule> = Arc::new(StubModule {
+            claims: false,
+            spawn_calls: spawn_calls.clone(),
+            recorded: Arc::new(Mutex::new(None)),
+        });
+
+        // The client stream: the flow holds one end, the test drives the other.
+        let (mut client_ctl, client_io) = tokio::io::duplex(1024);
+        // The upstream the connector hands back; the test holds the far end.
+        let (up_near, mut up_far) = tokio::io::duplex(1024);
+
+        let dial_calls = Arc::new(AtomicUsize::new(0));
+        let connector: Arc<dyn UpstreamConnector> = Arc::new(MockConnector {
+            dial_calls: dial_calls.clone(),
+            upstream: Mutex::new(Some(Box::pin(up_near))),
+        });
+        let ingress = CoreIngress::empty().with_stream(
+            Arc::from(vec![module]),
+            store(),
+            Arc::new(MockSink),
+            connector,
+            Arc::new(MockGuard { in_scope: true }),
+        );
+
+        let flow = CapturedTcpFlow {
+            stream: Box::pin(client_io),
+            dst: "93.184.216.34:443".parse().unwrap(),
+            sni: Some("example.com".to_string()),
+            first_bytes: b"GET / HTTP/1.1\r\n".to_vec(),
+            peer_identity: None,
+        };
+
+        let (outcome, _) = tokio::join!(ingress.dispatch_tcp(flow), async {
+            client_ctl.write_all(b"hello").await.unwrap();
+            client_ctl.shutdown().await.unwrap();
+            drop(client_ctl);
+            let mut got = Vec::new();
+            up_far.read_to_end(&mut got).await.unwrap();
+            assert_eq!(
+                got, b"hello",
+                "client bytes are tunnelled to the upstream verbatim"
+            );
+            drop(up_far);
+        });
+
+        assert_eq!(outcome, StreamOutcome::PassedThrough);
+        assert_eq!(
+            spawn_calls.load(Ordering::SeqCst),
+            0,
+            "no module claimed the flow"
+        );
+        assert_eq!(
+            dial_calls.load(Ordering::SeqCst),
+            1,
+            "the original dst is dialled once"
+        );
+    }
+
+    /// AC17 (symmetry): a captured UDP flow rides the **same** deny-by-default L4 path.
+    /// An in-scope datagram is admitted and stored; an out-of-scope one on the same
+    /// interface is refused and reaches no store.
+    #[test]
+    fn udp_in_scope_admitted_out_of_scope_refused() {
+        let mut cfg = L4Config::default();
+        cfg.scope.push(capture_entry("127.0.0.1"));
+        let guard = Arc::new(L4Guard::new(&cfg));
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let ingress = CoreIngress::with_l4(guard, store.clone());
+
+        // In scope → admitted through the real L4 guard and stored.
+        let in_flow = CapturedUdpFlow {
+            target: l4_target("127.0.0.1"),
+            datagrams: vec![b"probe".to_vec()],
+            peer_identity: None,
+        };
+        assert_eq!(ingress.dispatch_udp(in_flow), IngressOutcome::Captured);
+        assert_eq!(
+            store.list().len(),
+            1,
+            "one capture flow holds the admitted datagram"
+        );
+
+        // Out of scope → refused by the same guard; nothing new is stored.
+        let out_flow = CapturedUdpFlow {
+            target: l4_target("127.0.0.2"),
+            datagrams: vec![b"probe".to_vec()],
+            peer_identity: None,
+        };
+        assert_eq!(ingress.dispatch_udp(out_flow), IngressOutcome::Refused);
+        assert_eq!(
+            store.list().len(),
+            1,
+            "the out-of-scope datagram reached no store"
         );
     }
 
