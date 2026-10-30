@@ -12,6 +12,7 @@ struct CAPanel: View {
     @State private var status: CAStatus?
     @State private var agentMayInstall = false
     @State private var busy = false
+    @State private var actionError: String?
 
     var body: some View {
         ScrollView {
@@ -38,22 +39,65 @@ struct CAPanel: View {
     }
 
     private func statusLine(_ status: CAStatus) -> some View {
-        VStack(alignment: .leading, spacing: Space.sm) {
+        VStack(alignment: .leading, spacing: Space.md) {
             HStack(spacing: Space.md) {
-                Text(status.statusText)
-                    .font(Tok.Face.ui(Tok.Typography.Size.md, .medium))
-                    .foregroundStyle((status.installed ? Tok.Ink.primary : Tok.Intercept.deep).color)
+                Badge(text: status.statusText, pair: Self.statusPair(status), uppercase: false)
                 if let expires = status.expires {
                     Text("expires \(expires.formatted(.dateTime.year().month(.abbreviated).day()))")
                         .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.secondary.color)
                 }
             }
-            if !status.fingerprint.isEmpty {
-                keyValue("SHA-256", status.fingerprint)
-            }
+            if !status.fingerprint.isEmpty { fingerprint(status.fingerprint) }
             keyValue("Subject", status.subject)
             if let path = status.path { keyValue("Path", path) }
+            if let actionError {
+                Label(actionError, systemImage: "exclamationmark.triangle.fill")
+                    .font(Tok.Face.ui(Tok.Typography.Size.sm))
+                    .foregroundStyle(Tok.Status.serverError.color)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
+    }
+
+    /// Green when installed and trusted, amber when installed but not trusted, grey
+    /// when present but not installed, red when the CA is missing.
+    private static func statusPair(_ s: CAStatus) -> ColorPair {
+        if s.installed, s.trusted { return Tok.Method.post }
+        if s.installed { return Tok.Method.put }
+        if s.exists { return Tok.Method.connect }
+        return Tok.Method.delete
+    }
+
+    /// SHA-256 grouped into byte pairs, wrapping across lines, with a copy button.
+    private func fingerprint(_ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: Space.md) {
+            Text("SHA-256").font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.secondary.color)
+                .frame(width: 72, alignment: .leading)
+            Text(Self.grouped(value))
+                .font(Tok.Face.data(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.primary.color)
+                .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(value, forType: .string)
+            } label: {
+                Image(systemName: Tok.Glyph.copy).font(.system(size: Tok.Size.iconInline))
+                    .foregroundStyle(Tok.Ink.secondary.color)
+            }
+            .buttonStyle(.plain).help("Copy fingerprint")
+            Spacer(minLength: 0)
+        }
+    }
+
+    /// Hex digits in space-separated pairs; falls back to the raw value if it has none.
+    private static func grouped(_ s: String) -> String {
+        let hex = s.filter(\.isHexDigit)
+        var out = ""
+        for (i, c) in hex.enumerated() {
+            if i > 0, i.isMultiple(of: 2) { out.append(" ") }
+            out.append(c)
+        }
+        return out.isEmpty ? s : out
     }
 
     private func keyValue(_ key: String, _ value: String) -> some View {
@@ -124,8 +168,14 @@ struct CAPanel: View {
         busy = true
         Task {
             defer { busy = false }
-            do { _ = try await session.runCommand("ca.export", ["format": .string(format), "path": .string(url.path)]) }
-            catch { session.lastError = "ca.export: \(BusService.describe(error))" }
+            do {
+                actionError = nil
+                _ = try await session.runCommand("ca.export", ["format": .string(format), "path": .string(url.path)])
+            } catch {
+                let message = "ca.export: \(BusService.describe(error))"
+                actionError = message
+                session.lastError = message
+            }
         }
     }
 
@@ -139,13 +189,21 @@ struct CAPanel: View {
         busy = true
         Task {
             defer { busy = false }
+            actionError = nil
             do {
                 _ = try await session.runCommand(install ? "ca.install" : "ca.uninstall", [:])
                 if let json = try? await session.runCommand("ca.status", [:]), let parsed = CAStatus(json: json) {
                     self.status = parsed
                 }
+                // Install can report success from the child core while the login-keychain
+                // trust never lands; say so here instead of silently looking installed.
+                if install, let s = self.status, !(s.installed && s.trusted) {
+                    actionError = "Install finished but the CA is not trusted in the login keychain yet. Export the PEM and trust it in Keychain Access, or follow the setup guide below."
+                }
             } catch {
-                session.lastError = "ca.\(install ? "install" : "uninstall"): \(BusService.describe(error))"
+                let message = "ca.\(install ? "install" : "uninstall"): \(BusService.describe(error))"
+                actionError = message
+                session.lastError = message
             }
         }
     }

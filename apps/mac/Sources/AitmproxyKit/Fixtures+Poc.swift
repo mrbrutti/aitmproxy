@@ -82,7 +82,7 @@ extension Fixtures {
 
     /// The CA installed and trusted in the user keychain, expiring in 2027.
     public static let caStatus = CAStatus(
-        fingerprint: "A1:B2:C3:D4:E5:F6:07:18:29:3A:4B:5C:6D:7E:8F:90:A1:B2:C3:D4:E5:F6:07:18:29:3A:4B:5C:6D:7E:8F:90",
+        fingerprint: "9F:86:D0:81:88:4C:7D:65:9A:2F:EA:A0:C5:5A:D0:15:A3:BF:4F:1B:2B:0B:82:2C:D1:5D:6C:15:B0:F0:0A:08",
         subject: "aitmproxy root CA", installed: true, trusted: true,
         expires: {
             var c = DateComponents(); c.year = 2027; c.month = 10; c.day = 27

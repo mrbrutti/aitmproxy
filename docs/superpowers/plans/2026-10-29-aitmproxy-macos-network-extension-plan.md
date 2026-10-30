@@ -373,9 +373,17 @@ assert the macOS path routes through it (NE-AC3); no separate choke is added. Su
 - **Satisfies:** NE-AC9; NE-AC10 (end-to-end); NE-AC11 (end-to-end).
 - **Depends on:** Task 1, Task 7 (the Rust gate), Task 11.
 - **Files:** `apps/mac/Sources/Aitmproxy/Bus/ExtensionController.swift` (create),
-  `apps/mac/Sources/Aitmproxy/Bus/CoreHealthState.swift` (modify — add the
-  capture-capability state beside core health), `apps/mac/Sources/Aitmproxy/App.swift`
-  (modify — submit the activation request on launch, operator-triggered only).
+  `apps/mac/Sources/Aitmproxy/Bus/CoreHealthState.swift` (modify — the
+  capture-capability property beside core health). **Files-line expanded 2026-10-30 per
+  the Task-13 panel:** `apps/mac/Sources/AitmproxyKit/CaptureCapability.swift` (create — the
+  pure `CaptureCapability` state machine + `CaptureExtension` bundle gate, in AitmproxyKit
+  so it is unit-testable; the `Aitmproxy` executable has no test target),
+  `apps/mac/Tests/AitmproxyKitTests/CaptureCapabilityTests.swift` (create — 14 tests), and
+  `apps/mac/Sources/Aitmproxy/Shell/ShellView.swift` (modify — the single operator
+  activation call site in the launch `.task`). **`App.swift` is deliberately UNTOUCHED**
+  (the orchestrator required minimal App.swift because another session was rewriting it;
+  `ShellView`'s `.task` is the real launch surface and there is exactly one `Window`, so
+  one controller).
 - **Change:** submit `OSSystemExtensionRequest.activationRequest` to
   `OSSystemExtensionManager.shared` early; keep the app alive while pending;
   surface `CaptureCapability` transitions `extension-not-installed → pending-approval
@@ -533,6 +541,11 @@ Kept by the main session during stage 6. One row per finding.
 | 12 | security | Minor | Over-match: now excludes ANY `995PCLM9KH`-signed binary, broader than spec D4 "aitm/obscura specifically" | **accepted** — in practice the only team-signed binaries a user runs are aitmproxy's own; GA-narrowing uses the decoupled `SelfExclusion.selfRequirement` and MUST cover both aitm AND obscura designated requirements (next row) |
 | 12 | security (re-review) | Minor | Self-exclusion reused `PeerAuth.coreRequirement`; narrowing that to aitm-only at GA would silently stop excluding obscura → loop | **FIXED (pre-merge)** — gave self-exclusion its own `SelfExclusion.selfRequirement` constant, decoupled from the core-peer requirement, so the two GA-narrowings cannot entangle; obscura stays excluded. Security re-review verdict: **PASS / clean sign-off** |
 | 12 | security | Minor | No automated unit test for `isSelf` | **accepted** — it is now a `SecCode` call (needs a real process), not a pure predicate; live confirmation of zero self/loopback flows at Task 18 |
+| 13 | spec, security, quality | n/a | **PASS panel 2026-10-30** — all three PASS, no Critical/Important. NE-AC9/10/11 met at the code level; live `[Mac]` checks HELD to Task 18. | — |
+| 13 | spec, quality, security | Minor | Declared `App.swift` left untouched; activation wiring in `ShellView.swift`; pure state machine + test in `AitmproxyKit`, not the declared files | **accepted** — Files line expanded above; App.swift untouched by the orchestrator's instruction (another session rewrites it); `Aitmproxy` executable has no test target so pure logic went to AitmproxyKit (mirrors `CoreHealth`). Not a cross-task leak |
+| 13 | quality | Minor | `applyTunnelStatus` called synchronously after `startVPNTunnel` is a no-op in the common path | **FIXED** — comment added noting it only catches a reused already-connected manager |
+| 13 | quality | Minor | `applying(.activated)`/`.needsUserApproval` reset away from `.capturing` unguarded (asymmetric with tunnel events) | **FIXED (doc)** — `applying(_:)` doc now states activation events are authoritative and intentionally override `.capturing` (a real re-approval), while tunnel events are advisory |
+| 13 | security | Minor | "single call site" of `ExtensionController.start()` is convention, not compiler-enforced; a future second caller could reach activation | **accepted (non-exploitable)** — the reviewer confirmed FOUR independent layers protect NE-AC11 (one call site; agents can't drive GUI lifecycle; any future bus path still hits the Rust `allow_agent_sysex_install` gate; macOS requires interactive approval). Strong in-code comment present; a CI/test grep guard is an optional future hardening |
 
 ## Shipped
 

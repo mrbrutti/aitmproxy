@@ -57,7 +57,8 @@ struct ListeningPill: View {
             HStack(spacing: 0) {
                 Text("aitmproxy").fontWeight(.medium).foregroundStyle(Tok.Ink.primary.color)
                 Text(" · \(session.capturing ? "listening" : "paused") ")
-                Text(session.listenAddress).font(Tok.Face.data(Tok.Typography.Size.sm, .medium))
+                Text(session.coreHealth.connection?.proxyAddress ?? session.listenAddress)
+                    .font(Tok.Face.data(Tok.Typography.Size.sm, .medium))
                     .foregroundStyle(Tok.Ink.primary.color)
                 Text(" · HTTP/2")
                 if session.interceptArmed { Text(" · intercept armed") }

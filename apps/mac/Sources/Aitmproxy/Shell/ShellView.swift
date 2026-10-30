@@ -9,6 +9,7 @@ struct ShellView: View {
     @Environment(\.openWindow) private var openWindow
     @State private var bus: BusService?
     @State private var embeddedCore: EmbeddedCoreController?
+    @State private var captureExtension: ExtensionController?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -93,6 +94,14 @@ struct ShellView: View {
                 session.connection = model
                 embeddedCore = controller
                 bus = service
+                // Operator-launch activation of the macOS capture extension (Task 13,
+                // NE-AC11): the only call site, so no bus/MCP/agent path can trigger it.
+                // Inert unless this build embeds the extension.
+                if captureExtension == nil {
+                    let capture = ExtensionController(health: session.coreHealth)
+                    capture.start()
+                    captureExtension = capture
+                }
             }
             SelfTest.runIfRequested(session: session)
             Snapshot.runIfRequested(session: session, openSettings: openSettings)
@@ -178,6 +187,14 @@ struct MainView: View {
                     VRule()
                     listPane(1)
                 }
+            } else if session.page == .connections {
+                // Viz-first Connection page: the waterfall replaces the flow table; the
+                // inspector opens on select. The dashboard band sits above (see above).
+                ConnectionWaterfall()
+            } else if session.page == .apps, session.clients.isEmpty {
+                // No Network/System Extension ⇒ no source-app attribution, so the Apps
+                // grouping is empty. Explain it rather than showing a bare "0".
+                AppsNeedsExtension()
             } else {
                 flowTable
             }
@@ -266,6 +283,21 @@ struct EmptyFlows: View {
         .padding(.top, Tok.Size.columnHeader)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .allowsHitTesting(false)
+    }
+}
+
+/// The Apps page before the Network/System Extension lands: proxy capture carries
+/// no source-app attribution, so there is nothing to group by. Explain it rather
+/// than showing a bare "0".
+struct AppsNeedsExtension: View {
+    var body: some View {
+        ContentUnavailableView {
+            Label("No app attribution yet", systemImage: "app.badge")
+        } description: {
+            Text("Grouping flows by source app needs the macOS capture extension. Proxy capture alone cannot tell which app each flow came from.")
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Tok.Ground.surface.color)
     }
 }
 

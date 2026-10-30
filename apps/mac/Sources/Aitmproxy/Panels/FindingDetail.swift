@@ -78,16 +78,24 @@ struct FindingDetail: View {
     }
 
     @ViewBuilder private func screenshot(_ finding: Finding) -> some View {
-        if let data = finding.screenshot {
+        if let data = finding.screenshot,
+           let decoded = DecodedImage(data: data, contentType: "image/png"),
+           decoded.width >= 16, decoded.height >= 16 {
+            // Size the well to the image (capped) so a small capture is not a giant empty box.
             ImageBodyView(data: data, contentType: "image/png")
-                .frame(height: 220) // grid: ok fixed screenshot viewport
+                .frame(height: min(220, CGFloat(decoded.height) + 56))
+                .frame(maxWidth: .infinity)
                 .background(Tok.Ground.surface.color)
                 .overlay(RoundedRectangle(cornerRadius: Tok.Radius.control).strokeBorder(Tok.Line.border.color))
+                .clipShape(RoundedRectangle(cornerRadius: Tok.Radius.control))
         } else {
-            Text("No screenshot")
-                .font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.tertiary.color)
-                .frame(maxWidth: .infinity).frame(height: 220) // grid: ok placeholder at the image's size
-                .background(Tok.Ground.raised.color, in: RoundedRectangle(cornerRadius: Tok.Radius.control))
+            ContentUnavailableView {
+                Label("No screenshot captured", systemImage: "photo")
+            } description: {
+                Text(finding.hasRun ? "This run captured no screenshot." : "Run the PoC to capture a screenshot.")
+            }
+            .frame(maxWidth: .infinity).frame(height: 120) // grid: ok empty-state height
+            .background(Tok.Ground.raised.color, in: RoundedRectangle(cornerRadius: Tok.Radius.control))
         }
     }
 
