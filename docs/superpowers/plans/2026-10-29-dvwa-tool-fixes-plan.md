@@ -215,18 +215,35 @@ Independence map (no two parallel tasks share a file):
 
 - **Satisfies:** AC12.
 - **Depends on:** none (parallel).
-- **Files:** `crates/aitm-plugin-rhai/src/config.rs` (add `browser_timeout` to
-  `RhaiConfig` + default), `crates/aitm-plugin-rhai/src/engine.rs` (add
-  `browser_timeout` to `Budget`, carry through `begin_run`/`remaining_budget`
-  context or a sibling accessor), `crates/aitm-plugin-rhai/src/host_net.rs`
-  (a `block_on_browser` that uses the browser budget; browser verbs call it),
-  tests in `crates/aitm-plugin-rhai/tests/` or an inline `#[cfg(test)]` module.
-- **Change:** `RhaiConfig::browser_timeout: Duration` (default 30s),
-  `Budget::browser_timeout`, and a browser-call budget resolver (e.g.
-  `remaining_browser_budget()` or a `block_on` variant taking an explicit
-  budget). Route `browser.navigate/click/eval/...` host calls through the larger
-  budget; keep `http.*`/`store.*`/`scope.*` on `remaining_budget()`. Preserve the
-  `Timeout` abort token and the in-hook refusal of `browser.*`.
+- **Files (expanded after a coder gap report):**
+  `crates/aitm-plugin-rhai/src/config.rs` (add `browser_timeout` to `RhaiConfig`
+  + default), `crates/aitm-plugin-rhai/src/engine.rs` (add `browser_timeout` to
+  `Budget`; `begin_run` carries it into the thread-local `Run`; add a helper to
+  read it and to extend the current run's deadline), `host_net.rs`
+  (`block_on_browser`), and the `Budget`/`begin_run` sites the new field touches:
+  `src/poc_step.rs` (the `Budget { .. }` full literal ~:78 **and** the
+  `begin_run` call ~:162), `src/command.rs` (`begin_run` ~:85, :161),
+  `src/plugin.rs` (`begin_run` ~:297), `tests/poc_step.rs` (the `Budget { .. }`
+  literal ~:393), `crates/aitm/src/config_file.rs` (parse `browser_timeout`
+  alongside `hook_timeout` ~:342-361), and `src/error.rs` (timeout message should
+  report the budget that actually fired, not always `hook_timeout`). Tests inline
+  or in `crates/aitm-plugin-rhai/tests/`. (Note: these are all in
+  `aitm-plugin-rhai`/`aitm`, disjoint from the `aitm-poc/src/runner.rs` chain —
+  `src/poc_step.rs` here is the rhai crate's file, not the runner.)
+- **Change:** `RhaiConfig::browser_timeout: Duration` (default 30s) →
+  `Budget::browser_timeout`. `begin_run` stores both the deadline and
+  `browser_timeout` in the thread-local `Run`. A `block_on_browser` used by
+  `browser.navigate/click/type_text/screenshot/evaluate/get_dom`: (1) waits on
+  the future bounded by `browser_timeout` (not `remaining_budget()`); (2) **before
+  returning, extends the run deadline to at least `now + <small slack>`** via the
+  new engine helper, so the post-call `on_progress` abort (which fires when
+  `now > run.deadline`) does not immediately kill the script after a long
+  legitimate browser call — this is the fix for the coder's observed "returns Ok
+  then aborts on next op" interaction, and is required for T9 to actually help a
+  `poc.run` script step / command whose enclosing `hook_timeout` is small. Keep
+  `http.*`/`store.*`/`scope.*` on `remaining_budget()`. Preserve the `Timeout`
+  abort token and the in-flow-hook refusal of `browser.*`. `error.rs` reports the
+  budget that fired.
 - **Test:** `budget::browser_call_uses_browser_budget` — with a `Budget` whose
   `hook_timeout` is 50ms and `browser_timeout` is 5s, a browser-path `block_on`
   over a future that completes in ~200ms returns `Ok`, while a non-browser
