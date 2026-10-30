@@ -589,3 +589,119 @@ fn a_response_while_the_request_body_is_arriving_waits_for_the_request() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Edge cases a proxy must survive: what a hostile or broken origin can leave
+// behind a completed response. Added by the Stage 5 tester pass.
+// ---------------------------------------------------------------------------
+
+/// The head cap is a limit on what is buffered, so exactly the cap is fine and
+/// one byte more is not. Pins the boundary of the check, not just "big is bad".
+#[test]
+fn unsolicited_server_bytes_up_to_the_head_cap_are_buffered() {
+    let (mut m, _id) = completed_exchange();
+    let stray = vec![b'x'; 64 * 1024];
+    assert_eq!(m.on_bytes(Side::Server, &stray).unwrap(), vec![]);
+    assert_eq!(m.take_leftover(Side::Server), stray);
+}
+
+/// A driver that keeps feeding unsolicited bytes in small reads must hit the cap
+/// too: it applies to what has piled up, not to each read on its own.
+#[test]
+fn unsolicited_server_bytes_count_toward_the_head_cap_across_reads() {
+    let (mut m, _id) = completed_exchange();
+    assert_eq!(
+        m.on_bytes(Side::Server, &vec![b'x'; 40 * 1024]).unwrap(),
+        vec![]
+    );
+    let result = m.on_bytes(Side::Server, &vec![b'x'; 40 * 1024]);
+    assert!(
+        result.is_err(),
+        "80 KiB of unsolicited bytes in two reads must pass the 64 KiB cap, got {result:?}"
+    );
+}
+
+/// The cap holds in the other state that leaves server bytes parked: a request
+/// whose body is still arriving.
+#[test]
+fn unsolicited_server_bytes_beyond_the_head_cap_are_an_error_while_a_request_is_arriving() {
+    let mut m = Http1Machine::new();
+    m.on_bytes(
+        Side::Client,
+        b"POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\n\r\nab",
+    )
+    .unwrap();
+    let result = m.on_bytes(Side::Server, &vec![b'x'; 64 * 1024 + 1]);
+    assert!(
+        result.is_err(),
+        "server bytes parked past the 64 KiB cap must be an error, got {result:?}"
+    );
+}
+
+/// An empty read after a completed exchange is not an event and not an error.
+#[test]
+fn an_empty_server_read_after_a_completed_exchange_is_a_no_op() {
+    let (mut m, _id) = completed_exchange();
+    assert_eq!(m.on_bytes(Side::Server, b"").unwrap(), vec![]);
+    assert_eq!(m.take_leftover(Side::Server), Vec::<u8>::new());
+}
+
+/// Bytes that are not HTTP at all, ending in a blank line, would make a parser
+/// that took them for a response head fail the whole connection. Left unparsed,
+/// they cost the legitimate response nothing.
+#[test]
+fn garbage_after_a_completed_response_is_left_unparsed() {
+    let (mut m, id) = exchange(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
+    let events = m
+        .on_bytes(
+            Side::Server,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nlegit\x00\x01\x02 not http at all\r\n\r\n",
+        )
+        .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            HttpSansIoEvent::ResponseHeaders(id),
+            HttpSansIoEvent::ResponseBodyChunk {
+                flow: id,
+                bytes: b"legit".to_vec()
+            },
+            HttpSansIoEvent::ResponseComplete(id),
+        ]
+    );
+    assert_eq!(
+        m.take_leftover(Side::Server),
+        b"\x00\x01\x02 not http at all\r\n\r\n".to_vec()
+    );
+}
+
+/// Some old servers end a body with a bare CRLF. It is surplus like any other
+/// byte (the driver treats it as such), and it must not be parsed away.
+#[test]
+fn a_bare_crlf_after_a_completed_response_is_left_for_the_driver() {
+    let (mut m, id) = exchange(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
+    let events = m
+        .on_bytes(
+            Side::Server,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nlegit\r\n",
+        )
+        .unwrap();
+    assert_eq!(events.last(), Some(&HttpSansIoEvent::ResponseComplete(id)));
+    assert_eq!(m.take_leftover(Side::Server), b"\r\n".to_vec());
+}
+
+/// The server hanging up after a completed exchange, with unsolicited bytes
+/// still parked, completes nothing and invents no events.
+#[test]
+fn eof_after_a_completed_exchange_with_parked_bytes_emits_nothing() {
+    let (mut m, _id) = completed_exchange();
+    assert_eq!(
+        m.on_bytes(
+            Side::Server,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nPOISON"
+        )
+        .unwrap(),
+        vec![]
+    );
+    assert_eq!(m.on_eof(Side::Server), vec![]);
+}
