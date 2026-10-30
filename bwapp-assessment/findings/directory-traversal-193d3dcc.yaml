@@ -1,0 +1,20 @@
+id: directory-traversal-193d3dcc
+title: Directory / Path Traversal
+class: directory_traversal
+severity: high
+target: http://127.0.0.1:8088/directory_traversal_1.php
+discovered_at: 2026-10-30T05:36:31.48514Z
+origin: mcp
+client_label: blind-pentest-agent
+poc_ref: 06-directory-traversal.yaml
+reproduction:
+  passed: true
+  run_at: 2026-10-30T05:36:31.485139Z
+artifacts:
+  finding_capture: 0f33dd71-0397-4cc6-98b7-91d70a181bd2
+  poc_path: 06-directory-traversal.yaml
+  screenshot_path: ''
+flows:
+- 0f33dd71-0397-4cc6-98b7-91d70a181bd2
+- 2ed5d6c6-3964-491a-9aed-a23413e08e1a
+notes: 'Confirmed live via aitmproxy. Evidence: ../ escapes the base dir; /etc/passwd disclosed. PoC 06-directory-traversal.yaml passed.'

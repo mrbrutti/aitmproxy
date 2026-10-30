@@ -1,0 +1,11 @@
+# Binary blobs extracted at setup time (see README); reproducible, not tracked.
+qemu-x86_64-static
+busybox-amd64
+busybox-arm64
+bwapp-wrap/qemu-x86_64-static
+bwapp-wrap/busybox-arm64
+obsdl/
+*.tar.gz
+mech-test.sh
+register-qemu.sh
+register-in-container.sh

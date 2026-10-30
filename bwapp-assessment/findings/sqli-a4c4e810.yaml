@@ -1,0 +1,20 @@
+id: sqli-a4c4e810
+title: SQL Injection (GET/Search) - UNION exfiltration
+class: sqli
+severity: critical
+target: http://127.0.0.1:8088/sqli_1.php
+discovered_at: 2026-10-30T05:36:14.374192Z
+origin: mcp
+client_label: blind-pentest-agent
+poc_ref: 02-sqli-get-search.yaml
+reproduction:
+  passed: true
+  run_at: 2026-10-30T05:36:14.374191Z
+artifacts:
+  finding_capture: 89f8f9c5-8d3f-4155-82fa-aa00de2d3f70
+  poc_path: 02-sqli-get-search.yaml
+  screenshot_path: ''
+flows:
+- 89f8f9c5-8d3f-4155-82fa-aa00de2d3f70
+- 6c42e115-c03a-416d-8648-96cf1fc9ca59
+notes: 'Confirmed live via aitmproxy. Evidence: UNION injects attacker columns; DB version exfiltrated. PoC 02-sqli-get-search.yaml passed.'

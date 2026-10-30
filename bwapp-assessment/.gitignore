@@ -1,0 +1,20 @@
+# Large media / recordings — delivered to the operator, not tracked in git.
+*.mp4
+*.gif
+*.cast
+*.mov
+# Ephemeral run artifacts.
+out/
+bus.endpoint
+__pycache__/
+# Scratch exploration scripts (superseded by run-assessment.py).
+probe.py
+send.py
+union.py
+fixtest.py
+smoke.jsonl
+login.jsonl
+login2.jsonl
+run-in-termapp.sh
+setup-window.scpt
+run-window.scpt

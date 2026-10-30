@@ -1,0 +1,20 @@
+id: os-command-injection-9e1b0fea
+title: OS Command Injection (RCE)
+class: os_command_injection
+severity: critical
+target: http://127.0.0.1:8088/commandi.php
+discovered_at: 2026-10-30T05:36:18.681777Z
+origin: mcp
+client_label: blind-pentest-agent
+poc_ref: 03-os-command-injection.yaml
+reproduction:
+  passed: true
+  run_at: 2026-10-30T05:36:18.681777Z
+artifacts:
+  finding_capture: ac2f8891-0d9b-45cc-9be1-fda9b6dc6c27
+  poc_path: 03-os-command-injection.yaml
+  screenshot_path: ''
+flows:
+- ac2f8891-0d9b-45cc-9be1-fda9b6dc6c27
+- 2ab8171a-42db-416f-ad85-8c9fd3cc8b03
+notes: 'Confirmed live via aitmproxy. Evidence: shell metachar runs ''id'' as www-data. PoC 03-os-command-injection.yaml passed.'

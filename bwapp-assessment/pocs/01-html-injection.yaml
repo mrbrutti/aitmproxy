@@ -1,0 +1,40 @@
+id: bwapp-html-injection-get
+info:
+  name: HTML Injection - Reflected (GET) in firstname/lastname
+  severity: medium
+  description: >
+    The firstname/lastname GET parameters of htmli_get.php are reflected into
+    the HTML response without output encoding, allowing arbitrary markup
+    injection (a precursor to reflected XSS / content spoofing).
+  reference:
+    - https://owasp.org/www-community/attacks/HTML_Injection
+  cwe: CWE-79
+  tags: [htmli, reflected]
+variables:
+  - name: target
+    required: true
+  - name: cookie
+    required: true
+    description: Authenticated bWAPP session cookie (PHPSESSID=...; security_level=0)
+  - name: marker
+    default: "AITMHTMLi{{rand_text_alpha(6)}}"
+  - name: payload
+    default: "<h1>{{marker}}</h1>"
+steps:
+  - http:
+      method: GET
+      url: "{{target}}/htmli_get.php?firstname={{url_encode(payload)}}&lastname=x&form=submit"
+      headers:
+        Cookie: "{{cookie}}"
+      matchers-condition: and
+      matchers:
+        - type: status
+          status: 200
+        - type: word
+          part: body
+          word: "{{payload}}"
+success:
+  all:
+    - type: word
+      part: body
+      word: "{{payload}}"

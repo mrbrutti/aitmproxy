@@ -1,0 +1,20 @@
+id: php-code-injection-9f772fa6
+title: PHP Code Injection (RCE)
+class: php_code_injection
+severity: critical
+target: http://127.0.0.1:8088/phpi.php
+discovered_at: 2026-10-30T05:36:27.252513Z
+origin: mcp
+client_label: blind-pentest-agent
+poc_ref: 05-php-code-injection.yaml
+reproduction:
+  passed: true
+  run_at: 2026-10-30T05:36:27.252513Z
+artifacts:
+  finding_capture: 92d435ef-4f96-48e9-ae25-84dee59642d2
+  poc_path: 05-php-code-injection.yaml
+  screenshot_path: ''
+flows:
+- 92d435ef-4f96-48e9-ae25-84dee59642d2
+- a6e24fb0-8e5c-4414-b35f-fa66b6add95b
+notes: 'Confirmed live via aitmproxy. Evidence: message passed to a PHP eval sink; system() runs. PoC 05-php-code-injection.yaml passed.'

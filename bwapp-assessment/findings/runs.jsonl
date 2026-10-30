@@ -1,0 +1,7 @@
+{"finding_id":"html-injection-664f9e0b","poc_ref":"01-html-injection.yaml","passed":true,"control_passed":null,"at":"2026-10-30T05:36:10.105841Z","origin":"mcp"}
+{"finding_id":"sqli-a4c4e810","poc_ref":"02-sqli-get-search.yaml","passed":true,"control_passed":null,"at":"2026-10-30T05:36:14.374191Z","origin":"mcp"}
+{"finding_id":"os-command-injection-9e1b0fea","poc_ref":"03-os-command-injection.yaml","passed":true,"control_passed":null,"at":"2026-10-30T05:36:18.681777Z","origin":"mcp"}
+{"finding_id":"xss-reflected-d395e58c","poc_ref":"04-xss-reflected-get.yaml","passed":true,"control_passed":null,"at":"2026-10-30T05:36:22.921125Z","origin":"mcp"}
+{"finding_id":"php-code-injection-9f772fa6","poc_ref":"05-php-code-injection.yaml","passed":true,"control_passed":null,"at":"2026-10-30T05:36:27.252513Z","origin":"mcp"}
+{"finding_id":"directory-traversal-193d3dcc","poc_ref":"06-directory-traversal.yaml","passed":true,"control_passed":null,"at":"2026-10-30T05:36:31.485139Z","origin":"mcp"}
+{"finding_id":"local-file-inclusion-0608347c","poc_ref":"07-local-file-inclusion.yaml","passed":true,"control_passed":null,"at":"2026-10-30T05:36:35.716485Z","origin":"mcp"}

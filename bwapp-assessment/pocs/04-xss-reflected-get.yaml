@@ -1,0 +1,39 @@
+id: bwapp-xss-reflected-get
+info:
+  name: Cross-Site Scripting - Reflected (GET) in xss_get.php
+  severity: high
+  description: >
+    The firstname/lastname GET parameters of xss_get.php are reflected into the
+    HTML response without encoding, so an injected <script> element is returned
+    verbatim and executes in the victim's browser.
+  reference:
+    - https://owasp.org/www-community/attacks/xss/
+  cwe: CWE-79
+  tags: [xss, reflected]
+variables:
+  - name: target
+    required: true
+  - name: cookie
+    required: true
+  - name: marker
+    default: "AITMXSS{{rand_text_alpha(6)}}"
+  - name: payload
+    default: "<script>window.__aitm='{{marker}}'</script>"
+steps:
+  - http:
+      method: GET
+      url: "{{target}}/xss_get.php?firstname={{url_encode(payload)}}&lastname=x&form=submit"
+      headers:
+        Cookie: "{{cookie}}"
+      matchers-condition: and
+      matchers:
+        - type: status
+          status: 200
+        - type: word
+          part: body
+          word: "{{payload}}"
+success:
+  all:
+    - type: word
+      part: body
+      word: "{{payload}}"

@@ -1,0 +1,20 @@
+id: xss-reflected-d395e58c
+title: Cross-Site Scripting - Reflected (GET)
+class: xss_reflected
+severity: high
+target: http://127.0.0.1:8088/xss_get.php
+discovered_at: 2026-10-30T05:36:22.921125Z
+origin: mcp
+client_label: blind-pentest-agent
+poc_ref: 04-xss-reflected-get.yaml
+reproduction:
+  passed: true
+  run_at: 2026-10-30T05:36:22.921125Z
+artifacts:
+  finding_capture: e293bca2-9d38-41fb-a09f-99a16de90877
+  poc_path: 04-xss-reflected-get.yaml
+  screenshot_path: ''
+flows:
+- e293bca2-9d38-41fb-a09f-99a16de90877
+- 200cae65-da46-4263-bc64-1471c90e721e
+notes: 'Confirmed live via aitmproxy. Evidence: script element reflected verbatim. PoC 04-xss-reflected-get.yaml passed.'

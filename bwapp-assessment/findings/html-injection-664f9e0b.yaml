@@ -1,0 +1,20 @@
+id: html-injection-664f9e0b
+title: HTML Injection - Reflected (GET)
+class: html_injection
+severity: medium
+target: http://127.0.0.1:8088/htmli_get.php
+discovered_at: 2026-10-30T05:36:10.105841Z
+origin: mcp
+client_label: blind-pentest-agent
+poc_ref: 01-html-injection.yaml
+reproduction:
+  passed: true
+  run_at: 2026-10-30T05:36:10.105841Z
+artifacts:
+  finding_capture: 17b6ce98-4afc-4dcb-8cf9-2a89bb628bac
+  poc_path: 01-html-injection.yaml
+  screenshot_path: ''
+flows:
+- 17b6ce98-4afc-4dcb-8cf9-2a89bb628bac
+- 6c623951-22a1-49a2-bef5-4c8dc18cffb0
+notes: 'Confirmed live via aitmproxy. Evidence: firstname reflected unescaped into HTML. PoC 01-html-injection.yaml passed.'
