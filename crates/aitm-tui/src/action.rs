@@ -69,6 +69,9 @@ pub enum Action {
     /// Scan view `r`: launch a scope-bound `scan.discover` (deny-by-default:
     /// an out-of-scope target is refused; a running crawl blocks re-launch).
     ScanLaunch,
+    /// Scan view Tab: move the cursor between the endpoints list and the
+    /// injection-points list, so either can be walked and opened with ⏎.
+    ScanFocusToggle,
     AgentSet(AgentPolicy),
     // Text prompts
     PaletteOpen,

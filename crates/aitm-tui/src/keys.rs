@@ -87,9 +87,10 @@ fn browser(key: KeyEvent) -> Option<Action> {
     })
 }
 
-/// The Scan view (scanner-integration Stage 1): ↑↓ walk the injection points,
-/// `r` launches the scope-bound crawl (the only key that does), `F` jumps to
-/// the findings pane, `:` palette, `?` help, Esc/`q` back.
+/// The Scan view (scanner-integration Stage 1): ↑↓ walk the focused list, Tab
+/// switches focus between the endpoints and the injection points, `r` launches
+/// the scope-bound crawl (the only key that does), `F` jumps to the findings
+/// pane, `:` palette, `?` help, Esc/`q` back.
 fn scan(key: KeyEvent) -> Option<Action> {
     if let Some(a) = nav(key) {
         return Some(a);
@@ -97,7 +98,9 @@ fn scan(key: KeyEvent) -> Option<Action> {
     Some(match key.code {
         KeyCode::Esc | KeyCode::Char('q') => Action::Back,
         KeyCode::Char('r') => Action::ScanLaunch,
-        // Open the selected injection point's flow in the inspector.
+        // Switch the cursor between the endpoints and injection-points lists.
+        KeyCode::Tab | KeyCode::BackTab => Action::ScanFocusToggle,
+        // Open the focused list's selected flow in the inspector.
         KeyCode::Enter | KeyCode::Right => Action::Enter,
         KeyCode::Char('F') => Action::OpenFindings,
         KeyCode::Char(':') => Action::PaletteOpen,

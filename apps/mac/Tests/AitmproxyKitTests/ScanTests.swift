@@ -10,14 +10,20 @@ import Testing
 /// operator surface does with its result.
 @Suite struct ScanTests {
     /// A `scan.discover` result exactly as the core serialises it: reached
-    /// endpoints, injection points (one secret-named param and one cookie
-    /// already redacted at the source), the crawl budget used, and no stop reason.
+    /// endpoints, the flow each one was fetched in (keyed by the same scrubbed
+    /// URL string as `endpoints`), injection points (one secret-named param and
+    /// one cookie already redacted at the source), the crawl budget used, and no
+    /// stop reason.
     static let resultJSON = """
     {
       "endpoints": [
         "http://auth.shop-staging.test/",
         "http://auth.shop-staging.test/login?next=%2Fdashboard"
       ],
+      "endpoint_flows": {
+        "http://auth.shop-staging.test/": "00000041-0000-4000-8000-000000000041",
+        "http://auth.shop-staging.test/login?next=%2Fdashboard": "00000050-0000-4000-8000-000000000050"
+      },
       "injection_points": [
         { "flow": "00000050-0000-4000-8000-000000000050", "location": "query", "name": "next", "example": "/dashboard" },
         { "flow": "00000050-0000-4000-8000-000000000050", "location": "body_param", "name": "password", "example": "<redacted>" },
@@ -95,6 +101,108 @@ import Testing
         let known = Set(Fixtures.rows.map(\.id))
         #expect(result.injectionPoints.allSatisfy { known.contains($0.flowID) })
         #expect(result.injectionPoints.contains { $0.example == "<redacted>" })
+    }
+
+    // MARK: Endpoint flows (AC3: an endpoint links to the flow it was fetched in)
+
+    /// `endpoint_flows` is keyed by the same scrubbed URL string `endpoints`
+    /// carries, so an endpoint row resolves its flow by looking up its own text.
+    @Test func decodesEndpointFlowsKeyedByTheEndpointURL() throws {
+        let result = try Self.decoded()
+
+        #expect(result.endpointFlows == [
+            "http://auth.shop-staging.test/": "00000041-0000-4000-8000-000000000041",
+            "http://auth.shop-staging.test/login?next=%2Fdashboard": "00000050-0000-4000-8000-000000000050",
+        ])
+        #expect(result.flowID(forEndpoint: "http://auth.shop-staging.test/") == FlowID("00000041-0000-4000-8000-000000000041"))
+        #expect(result.flowID(forEndpoint: "http://auth.shop-staging.test/login?next=%2Fdashboard")
+                == FlowID("00000050-0000-4000-8000-000000000050"))
+        // Every endpoint stays verbatim; linking never rewrites the URL.
+        #expect(result.endpoints == ["http://auth.shop-staging.test/", "http://auth.shop-staging.test/login?next=%2Fdashboard"])
+    }
+
+    /// An endpoint the map does not list (the crawl reached it but no flow was
+    /// recorded, or the flow was evicted) has no link; the row stays plain.
+    @Test func anEndpointAbsentFromTheMapHasNoFlow() throws {
+        let result = try Self.decoded()
+        #expect(result.flowID(forEndpoint: "http://auth.shop-staging.test/not-crawled") == nil)
+        #expect(result.flowID(forEndpoint: "") == nil)
+        // The key is matched exactly, not by prefix or after normalising.
+        #expect(result.flowID(forEndpoint: "http://auth.shop-staging.test") == nil)
+        #expect(result.flowID(forEndpoint: "HTTP://auth.shop-staging.test/") == nil)
+    }
+
+    /// A core that predates `endpoint_flows` (or a null / mistyped value) still
+    /// yields a usable result: no links, every other field intact.
+    @Test func aMissingOrMalformedEndpointFlowsMapIsEmptyNotFatal() throws {
+        func result(_ flows: JSONValue?) throws -> ScanResult {
+            var json: [String: JSONValue] = ["endpoints": ["http://a.test/"], "injection_points": [], "pages_crawled": 1]
+            if let flows { json["endpoint_flows"] = flows }
+            return try ScanResult(json: .object(json))
+        }
+        for flows: JSONValue? in [nil, .null, ["http://a.test/"], .string("f1"), .number(3), [:]] {
+            let decoded = try result(flows)
+            #expect(decoded.endpointFlows.isEmpty, "endpoint_flows = \(String(describing: flows))")
+            #expect(decoded.flowID(forEndpoint: "http://a.test/") == nil)
+            #expect(decoded.endpoints == ["http://a.test/"])
+            #expect(decoded.pagesCrawled == 1)
+        }
+    }
+
+    /// Only a non-empty string flow id is a link; a bad entry is dropped without
+    /// taking its neighbours (or the injection points) with it.
+    @Test func aBadEndpointFlowEntryIsDroppedAndTheRestKept() throws {
+        let json: JSONValue = [
+            "endpoints": ["http://a.test/", "http://a.test/b", "http://a.test/c", "http://a.test/d"],
+            "endpoint_flows": [
+                "http://a.test/": "f1", "http://a.test/b": "", "http://a.test/c": 7, "http://a.test/d": .null,
+            ],
+            "injection_points": [["flow": "f1", "location": "query", "name": "q", "example": "1"]],
+            "pages_crawled": 4,
+        ]
+        let result = try ScanResult(json: json)
+        #expect(result.endpointFlows == ["http://a.test/": "f1"])
+        #expect(result.flowID(forEndpoint: "http://a.test/") == FlowID("f1"))
+        #expect(result.flowID(forEndpoint: "http://a.test/b") == nil)
+        #expect(result.flowID(forEndpoint: "http://a.test/c") == nil)
+        #expect(result.flowID(forEndpoint: "http://a.test/d") == nil)
+        #expect(result.injectionPoints.count == 1)
+    }
+
+    /// The state the panel binds to carries the links, and a new result replaces
+    /// them rather than merging with the last crawl's.
+    @Test func stateResolvesEndpointFlowsAndReplacesThemOnANewResult() throws {
+        var state = ScanState()
+        #expect(state.endpointFlows.isEmpty)
+        #expect(state.flowID(forEndpoint: "http://auth.shop-staging.test/") == nil)
+
+        state.finish(try Self.decoded())
+        #expect(state.endpointFlows.count == 2)
+        #expect(state.flowID(forEndpoint: "http://auth.shop-staging.test/") == FlowID("00000041-0000-4000-8000-000000000041"))
+        #expect(state.flowID(forEndpoint: "http://auth.shop-staging.test/login?next=%2Fdashboard")
+                == FlowID("00000050-0000-4000-8000-000000000050"))
+        #expect(state.flowID(forEndpoint: "http://elsewhere.test/") == nil)
+
+        state.finish(try ScanResult(json: ["endpoints": ["http://a.test/"], "endpoint_flows": ["http://a.test/": "f9"], "pages_crawled": 1]))
+        #expect(state.endpointFlows == ["http://a.test/": "f9"])
+        #expect(state.flowID(forEndpoint: "http://auth.shop-staging.test/") == nil, "the last crawl's links are gone")
+        #expect(state.flowID(forEndpoint: "http://a.test/") == FlowID("f9"))
+    }
+
+    /// The fixture session answers `scan.discover` with links so snapshots show
+    /// linked endpoints; each link names the fixture flow for that very URL.
+    @Test func theFixtureLinksEveryEndpointToItsFixtureFlow() throws {
+        let result = try ScanResult(json: Fixtures.scanDiscover)
+        let rows = Dictionary(uniqueKeysWithValues: Fixtures.rows.map { ($0.id, $0) })
+
+        #expect(result.endpointFlows.count == result.endpoints.count)
+        for endpoint in result.endpoints {
+            let flow = try #require(result.flowID(forEndpoint: endpoint), "\(endpoint) has a flow")
+            let row = try #require(rows[flow], "\(endpoint) links to a fixture flow")
+            let tail = row.query.map { "\(row.path)?\($0)" } ?? row.path
+            #expect(endpoint.hasSuffix("://\(row.authority)\(tail)"), "\(endpoint) is the URL of flow \(row.seq)")
+        }
+        #expect(result.flowID(forEndpoint: "http://api.shop-staging.test/api/orders?page=3") == Fixtures.id(45))
     }
 
     // MARK: ScanState

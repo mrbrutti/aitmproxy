@@ -1,7 +1,7 @@
 //! The Scan operator surface (scanner-integration Stage 1, AC4): a scope-bound
-//! `scan.discover` launch header, the discovered endpoints (each resolving to a
-//! flow already in the store) and the discovered injection points. It mirrors
-//! the Findings/Browser panels' shape and reuses the shared list rendering; the
+//! `scan.discover` launch header, the discovered endpoints (each openable to its
+//! linked flow, AC3) and the discovered injection points. It mirrors the
+//! Findings/Browser panels' shape and reuses the shared list rendering; the
 //! scanner engine is `aitm-plugin-scanner` and this only surfaces its result.
 
 use ratatui::buffer::Buffer;
@@ -9,10 +9,10 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
-use crate::app::App;
+use crate::app::{App, ScanFocus};
 use crate::theme::Theme;
 use crate::ui::bars::put;
-use crate::ui::overlays::{boxed, lines_into};
+use crate::ui::overlays::boxed;
 use crate::ui::selection_bg;
 use crate::ui::text::{cells, truncate};
 
@@ -99,36 +99,59 @@ fn header(app: &App, theme: &Theme, target_area: Rect, hint_area: Rect, buf: &mu
             theme.fg(&crate::tokens::color::status::SERVER_ERROR),
         ),
         None => Line::styled(
-            " r scan (scope-bound; viewing never crawls) · ↑↓ injection points · F findings",
+            " r scan (scope-bound) · Tab switch list · ↑↓ move · ⏎ open flow · F findings",
             theme.text_tertiary(),
         ),
     };
     put(buf, hint_area, hint);
 }
 
-/// The reached endpoints, each a flow already in the store.
+/// The reached endpoints: a cursor list of URLs rendered verbatim. When the
+/// endpoints list is focused (Tab), ⏎ opens the selected endpoint's linked flow
+/// in the inspector (AC3) — the cursor row is highlighted only while focused.
 fn endpoints(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    let mut lines = vec![Line::styled(
-        " Endpoints",
+    buf.set_string(
+        area.x + 1,
+        area.y,
+        "Endpoints",
         theme.accent().add_modifier(Modifier::BOLD),
-    )];
-    if app.scan.endpoints.is_empty() {
-        lines.push(Line::styled(
-            " none yet — r scans an in-scope target",
-            theme.text_tertiary(),
-        ));
-    } else {
-        for e in &app.scan.endpoints {
-            lines.push(Line::from(vec![
-                Span::styled(" • ", theme.text_tertiary()),
-                Span::styled(
-                    truncate(e, usize::from(area.width).saturating_sub(4)),
-                    theme.text_primary(),
-                ),
-            ]));
-        }
+    );
+    let body = Rect::new(
+        area.x,
+        area.y + 1,
+        area.width,
+        area.height.saturating_sub(1),
+    );
+    if body.height == 0 {
+        return;
     }
-    lines_into(buf, area, &lines, 0);
+    if app.scan.endpoints.is_empty() {
+        buf.set_string(
+            body.x + 1,
+            body.y,
+            "none yet — r scans an in-scope target",
+            theme.text_tertiary(),
+        );
+        return;
+    }
+    let focused = app.scan.focus == ScanFocus::Endpoints;
+    let h = usize::from(body.height);
+    let cursor = app.scan.endpoint_cursor.min(app.scan.endpoints.len() - 1);
+    let top = cursor.saturating_sub(h.saturating_sub(1));
+    for (k, e) in app.scan.endpoints.iter().enumerate().skip(top).take(h) {
+        let y = body.y + cells(k - top);
+        if focused && k == cursor {
+            buf.set_style(Rect::new(body.x, y, body.width, 1), selection_bg(theme));
+        }
+        let line = Line::from(vec![
+            Span::styled(" • ", theme.text_tertiary()),
+            Span::styled(
+                truncate(e, usize::from(body.width).saturating_sub(4)),
+                theme.text_primary(),
+            ),
+        ]);
+        buf.set_line(body.x, y, &line, body.width);
+    }
 }
 
 /// The discovered injection points: a cursor list of location + name + a
@@ -154,12 +177,13 @@ fn points(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         buf.set_string(body.x + 1, body.y, "none yet", theme.text_tertiary());
         return;
     }
+    let focused = app.scan.focus == ScanFocus::Points;
     let h = usize::from(body.height);
     let cursor = app.scan.cursor.min(app.scan.points.len() - 1);
     let top = cursor.saturating_sub(h.saturating_sub(1));
     for (k, p) in app.scan.points.iter().enumerate().skip(top).take(h) {
         let y = body.y + cells(k - top);
-        if k == cursor {
+        if focused && k == cursor {
             buf.set_style(Rect::new(body.x, y, body.width, 1), selection_bg(theme));
         }
         let line = Line::from(vec![

@@ -128,10 +128,26 @@ impl Command for ScanDiscover {
 
         // Enumerate injection points from the captured requests whose normalized
         // URL is one of the reached endpoints — observed traffic only.
-        let endpoint_set: HashSet<&str> = outcome.endpoints.iter().map(String::as_str).collect();
+        // Capped at MAX_RESULT_ITEMS to match the exposed `endpoints` array (which is
+        // `.take(MAX_RESULT_ITEMS)` below), so `endpoint_flows` and `endpoints` stay in
+        // lockstep and neither grows unbounded on a long crawl.
+        let endpoint_set: HashSet<&str> = outcome
+            .endpoints
+            .iter()
+            .take(MAX_RESULT_ITEMS)
+            .map(String::as_str)
+            .collect();
         let mut injection_points: Vec<Value> = Vec::new();
+        // Map each reached endpoint (keyed by the same scrubbed URL the result
+        // exposes in `endpoints`) to the first captured flow that served it, so a UI
+        // can link an endpoint row to its flow (AC3). Bounded by `endpoint_set` (<=
+        // MAX_RESULT_ITEMS), i.e. capped like the arrays; an endpoint with no captured
+        // flow is simply absent from the map.
+        let mut endpoint_flows: BTreeMap<String, Value> = BTreeMap::new();
         for id in host.store().list() {
-            if injection_points.len() >= MAX_RESULT_ITEMS {
+            if injection_points.len() >= MAX_RESULT_ITEMS
+                && endpoint_flows.len() >= endpoint_set.len()
+            {
                 break;
             }
             let Some(Flow::Http(flow)) = host.store().get(id) else {
@@ -143,6 +159,12 @@ impl Command for ScanDiscover {
                 continue;
             };
             if !endpoint_set.contains(normalized.as_str()) {
+                continue;
+            }
+            endpoint_flows
+                .entry(scrub_text(&normalized))
+                .or_insert_with(|| Value::Str(id.to_string()));
+            if injection_points.len() >= MAX_RESULT_ITEMS {
                 continue;
             }
             for point in enumerate(&flow) {
@@ -178,6 +200,8 @@ impl Command for ScanDiscover {
             ),
         );
         result.insert("injection_points".into(), Value::Array(injection_points));
+        // endpoint URL (scrubbed, matching an entry in `endpoints`) -> flow id.
+        result.insert("endpoint_flows".into(), Value::Object(endpoint_flows));
         result.insert(
             "pages_crawled".into(),
             Value::Int(i64::try_from(outcome.pages_crawled).unwrap_or(i64::MAX)),
@@ -420,6 +444,64 @@ mod tests {
         assert!(
             found.iter().any(|s| s == "Authorization"),
             "the header point name must survive redaction: {found:?}"
+        );
+    }
+
+    /// AC3: every reached endpoint is mapped to the flow that served it, so a UI
+    /// can link an endpoint row to its capture. The mapping points at the same flow
+    /// the endpoint's injection points were enumerated from.
+    #[test]
+    fn discover_links_each_endpoint_to_its_flow() {
+        let store = MemFlowStore::new();
+        store.insert(captured("/one?q=1", HeaderMap::new()));
+        let guard = scoped_guard();
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, None);
+        let cmd = ScanDiscover {
+            cfg: ScannerConfig::default(),
+        };
+
+        let result = cmd
+            .invoke(
+                params(&[("target", Value::Str("http://target.test/".into()))]),
+                &host,
+            )
+            .expect("an in-scope target with no browser falls back to the store");
+
+        let Value::Object(map) = &result else {
+            panic!("object result: {result:?}");
+        };
+        let endpoint = endpoints_of(&result)
+            .into_iter()
+            .next()
+            .expect("one reached endpoint");
+        assert_eq!(endpoint, "http://target.test/one?q=1");
+
+        // endpoint_flows links that endpoint to a flow id...
+        let Some(Value::Object(ef)) = map.get("endpoint_flows") else {
+            panic!("the result carries an endpoint_flows map: {result:?}");
+        };
+        let Some(Value::Str(flow_id)) = ef.get(&endpoint) else {
+            panic!("the endpoint links to its flow: {result:?}");
+        };
+
+        // ...and it is the same flow the `q` injection point was found in.
+        let Some(Value::Array(points)) = map.get("injection_points") else {
+            panic!("injection_points array: {result:?}");
+        };
+        let q_point = points
+            .iter()
+            .find(
+                |p| matches!(p, Value::Object(o) if o.get("name") == Some(&Value::Str("q".into()))),
+            )
+            .expect("a q injection point");
+        let Value::Object(o) = q_point else {
+            unreachable!()
+        };
+        assert_eq!(
+            o.get("flow"),
+            Some(&Value::Str(flow_id.clone())),
+            "endpoint_flows points at the same flow as its injection point",
         );
     }
 
