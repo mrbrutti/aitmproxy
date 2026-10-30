@@ -15,8 +15,9 @@ use futures::executor::block_on;
 
 use crate::ssrf::{check_url, HostResolver, SystemResolver};
 
-/// Register the six `browser.*` commands. `policy` governs `browser.navigate`'s
-/// SSRF check; scope comes from the `CommandHost` at invoke time.
+/// Register the seven `browser.*` commands. `policy` governs `browser.navigate`'s
+/// SSRF check; scope comes from the `CommandHost` at invoke time, and the
+/// egress posture `browser.confine` toggles comes from the host as well.
 pub fn register_browser_commands(reg: &mut Registry, policy: SsrfPolicy) {
     let resolver: Arc<dyn HostResolver> = Arc::new(SystemResolver);
     reg.add_command(Arc::new(Navigate { policy, resolver }));
@@ -25,6 +26,7 @@ pub fn register_browser_commands(reg: &mut Registry, policy: SsrfPolicy) {
     reg.add_command(Arc::new(Screenshot));
     reg.add_command(Arc::new(Eval));
     reg.add_command(Arc::new(GetDom));
+    reg.add_command(Arc::new(Confine));
 }
 
 /// The same registration as a [`Plugin`], for the proxy's plugin list.
@@ -278,5 +280,130 @@ impl Command for GetDom {
 
     fn invoke(&self, _args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         Ok(Value::Str(block_on(driver(host)?.get_dom())?))
+    }
+}
+
+/// `browser.confine {on}`: set the standing browser-egress posture. Unlike the
+/// other `browser.*` commands this never touches the driver — it flips the
+/// [`EgressConfinement`](aitm_core::EgressConfinement) the proxy's connector
+/// consults on every browser connection. Enabling tightens (out-of-scope public
+/// hosts are refused), disabling widens, so it is `Sensitive`, like `scope.add`.
+struct Confine;
+
+impl Command for Confine {
+    fn name(&self) -> &str {
+        "browser.confine"
+    }
+    fn sensitivity(&self) -> aitm_core::Sensitivity {
+        aitm_core::Sensitivity::Sensitive
+    }
+
+    fn schema(&self) -> ParamSchema {
+        schema(
+            "Confine the embedded browser's egress to the current scope (on), or \
+             restore free public browsing (off). Private/loopback handling is \
+             unaffected either way.",
+            vec![param(
+                "on",
+                TypeDesc::Bool,
+                true,
+                "true to confine browser egress to scope; false to lift it.",
+            )],
+            TypeDesc::Object(vec![param(
+                "confined",
+                TypeDesc::Bool,
+                true,
+                "The effective posture after the toggle (base OR any live campaign hold).",
+            )]),
+        )
+    }
+
+    fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        let on = args.get_bool("on")?;
+        let egress = host
+            .egress()
+            .ok_or_else(|| anyhow::anyhow!("browser egress posture not available on this host"))?;
+        egress.set_base(on);
+        let mut fields = BTreeMap::new();
+        fields.insert("confined".to_string(), Value::Bool(egress.confined()));
+        Ok(Value::Object(fields))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aitm_core::{
+        EgressConfinement, HttpFlow, HttpRequest, MemFlowStore, ProxyClient, Sensitivity, StdGuard,
+    };
+    use futures::future::BoxFuture;
+
+    /// A `ProxyClient` that `browser.confine` must never reach.
+    struct NoClient;
+
+    impl ProxyClient for NoClient {
+        fn send(&self, _req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+            Box::pin(async { anyhow::bail!("browser.confine does not use the proxy client") })
+        }
+    }
+
+    fn on(value: bool) -> Params {
+        let mut map = BTreeMap::new();
+        map.insert("on".to_string(), Value::Bool(value));
+        Params::new(map)
+    }
+
+    fn confined_field(result: &Value) -> bool {
+        match result {
+            Value::Object(fields) => match fields.get("confined") {
+                Some(Value::Bool(b)) => *b,
+                other => panic!("`confined` must be a bool, got {other:?}"),
+            },
+            other => panic!("result must be an object, got {other:?}"),
+        }
+    }
+
+    /// AC9: `browser.confine {on}` sets the posture's base and reports it back.
+    #[test]
+    fn browser_confine_toggles_posture() {
+        let store = MemFlowStore::new();
+        let guard = StdGuard::default();
+        let egress = std::sync::Arc::new(EgressConfinement::new(false));
+        let host = CommandHost::new(&store, &NoClient, &guard, None).with_egress(egress.clone());
+        assert!(!egress.confined(), "fixture starts free");
+
+        let result = Confine.invoke(on(true), &host).expect("toggle on");
+        assert!(confined_field(&result));
+        assert!(egress.confined(), "the shared posture flipped on");
+
+        let result = Confine.invoke(on(false), &host).expect("toggle off");
+        assert!(!confined_field(&result));
+        assert!(!egress.confined(), "the shared posture flipped back off");
+    }
+
+    /// Toggling the browser-egress boundary is an authorization decision, so
+    /// the command sits in the operator-gated tier like `scope.add`.
+    #[test]
+    fn browser_confine_is_sensitive() {
+        assert_eq!(Confine.sensitivity(), Sensitivity::Sensitive);
+    }
+
+    /// A host assembled without a posture handle refuses clearly rather than
+    /// pretending the toggle took effect.
+    #[test]
+    fn browser_confine_without_handle_errors() {
+        let store = MemFlowStore::new();
+        let guard = StdGuard::default();
+        let host = CommandHost::new(&store, &NoClient, &guard, None);
+        assert!(host.egress().is_none());
+
+        let err = Confine
+            .invoke(on(true), &host)
+            .expect_err("no posture wired");
+        assert!(
+            err.to_string()
+                .contains("browser egress posture not available on this host"),
+            "{err}"
+        );
     }
 }

@@ -17,6 +17,19 @@
     },
     "type": "object"
   },
+  "browser.confine": {
+    "additionalProperties": false,
+    "properties": {
+      "on": {
+        "description": "true to confine browser egress to scope; false to lift it.",
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "on"
+    ],
+    "type": "object"
+  },
   "browser.eval": {
     "additionalProperties": false,
     "properties": {

@@ -218,7 +218,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     result
 }
 
-/// The 57 commands the bus serves today — `tools/list` of the core as of
+/// The 59 commands the bus serves today — `tools/list` of the core as of
 /// the 2026-10-29 M4 merge: foundation §4.1's 22, plus `flow.detail` (F5),
 /// `flow.mark` / `flow.comment` (F6), `proxy.status` / `proxy.pause` /
 /// `proxy.resume` / `flow.clear` / `config.get` (F7), `scope.remove` (F12),
@@ -257,6 +257,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "browser.screenshot",
     "browser.eval",
     "browser.get_dom",
+    "browser.confine",
     "poc.build",
     "poc.run",
     "poc.list",
@@ -290,6 +291,8 @@ pub const CORE_TOOLS: &[&str] = &[
     "agent.approve",
     "flow.subscribe",
     "flow.unsubscribe",
+    // Scanner plugin (Stage 1): read-only crawl + injection-point discovery.
+    "scan.discover",
 ];
 
 /// An [`App`] loaded synchronously from the built-in fixture, sized `cols`×`rows`,

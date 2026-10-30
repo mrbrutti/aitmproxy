@@ -19,7 +19,7 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 54] = [
+const EXPECTED_TOOLS: [&str; 56] = [
     // M4 agent-control and F4 subscription tools, registered unconditionally by
     // the `AgentPlugin` and `SubscriptionPlugin` in `wire.rs`.
     "agent.status",
@@ -52,6 +52,7 @@ const EXPECTED_TOOLS: [&str; 54] = [
     "browser.screenshot",
     "browser.eval",
     "browser.get_dom",
+    "browser.confine",
     "poc.build",
     "poc.run",
     "poc.list",
@@ -79,6 +80,9 @@ const EXPECTED_TOOLS: [&str; 54] = [
     "map.add",
     "map.list",
     "map.remove",
+    // The deterministic scanner (Stage 1): `ScannerPlugin` is registered
+    // unconditionally in `wire.rs`, so its one command is on every surface.
+    "scan.discover",
 ];
 
 /// The six `browser.*` tool schemas as M1 shipped them, keyed by tool name.
@@ -210,7 +214,12 @@ fn ac7_exact_tool_set() {
             )
         })
         .collect();
-    assert_eq!(actual.len(), 6, "six browser.* tools: {:?}", actual.keys());
+    assert_eq!(
+        actual.len(),
+        7,
+        "seven browser.* tools: {:?}",
+        actual.keys()
+    );
     let actual_text = serde_json::to_string_pretty(&actual).expect("serialize schemas");
     let snapshot_text = std::fs::read_to_string(BROWSER_SCHEMAS_SNAPSHOT).unwrap_or_else(|e| {
         panic!("read snapshot {BROWSER_SCHEMAS_SNAPSHOT}: {e}\nactual schemas:\n{actual_text}\n")

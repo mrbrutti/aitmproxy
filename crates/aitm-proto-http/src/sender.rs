@@ -158,7 +158,11 @@ impl RequestSender for Http1Sender {
                 let scope = gate.scope.list_scope();
                 let authority = Authority::new(&host, port).to_string();
                 for ip in &ips {
-                    ssrf_check(&gate.policy, &scope, &authority, *ip)
+                    // `confine_to_scope = false`: scope-confined egress is a
+                    // browser-only posture (scanner S2). Active reissue is already
+                    // scope-gated upstream by `check_active`; it must not be gated
+                    // again here (per the egress-confinement spec's anti-goal).
+                    ssrf_check(&gate.policy, &scope, false, &authority, *ip)
                         .map_err(|e| anyhow!("SSRF: refusing reissue to {host}: {e}"))?;
                 }
             }

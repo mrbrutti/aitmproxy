@@ -13,6 +13,7 @@ members = [
     "crates/aitm-plugin-passthrough",
     "crates/aitm-plugin-wsctl",
     "crates/aitm-plugin-maprules",
+    "crates/aitm-plugin-scanner",
     "crates/aitm-browser",
     "crates/aitm-ca",
     "crates/aitm-poc",
@@ -70,3 +71,4 @@ aitm-cli = { path = "crates/aitm-cli" }
 aitm-testtarget = { path = "crates/aitm-testtarget" }
 aitm-bus-client = { path = "crates/aitm-bus-client" }
 aitm-tui = { path = "crates/aitm-tui" }
+aitm-plugin-scanner = { path = "crates/aitm-plugin-scanner" }

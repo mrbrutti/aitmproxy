@@ -118,7 +118,12 @@ pub fn check_url(
     // the same way everywhere.
     let authority = Authority::new(&host, port).to_string();
     for ip in &addrs {
-        ssrf_check(policy, scope, &authority, *ip)
+        // `confine_to_scope = false`: this is the non-dialing `browser.navigate`
+        // pre-flight. Scope-confined egress (scanner S2) is enforced authoritatively
+        // at the proxy's `SsrfConnector`, through which the actual navigation (and
+        // every redirect/sub-resource) dials; confining here too is a possible
+        // follow-up for an earlier, cleaner refusal, not required for S2 closure.
+        ssrf_check(policy, scope, false, &authority, *ip)
             .map_err(|_| GuardError::PrivateAddressBlocked(host.clone()))?;
     }
 

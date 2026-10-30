@@ -15,8 +15,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use aitm_core::{
     AgentPolicy, AgentState, AuditEntry, AuditResult, AuditRing, AuditSink, BrowserDriver, Command,
-    CommandHost, Event, Flow, FlowId, FlowQuery, FlowStore, Frontend, McpTransport, ProxyClient,
-    Registry, ScopeRateGuard, Sensitivity, SsrfPolicy,
+    CommandHost, EgressConfinement, Event, Flow, FlowId, FlowQuery, FlowStore, Frontend,
+    McpTransport, ProxyClient, Registry, ScopeRateGuard, Sensitivity, SsrfPolicy,
 };
 use serde_json::{json, Map, Value as JsonValue};
 use tokio::sync::{broadcast, Notify};
@@ -747,6 +747,10 @@ pub struct McpServer {
     /// `DiskFindingRecorder`). `None` = no persistence (deny-by-default; also
     /// gated on `findings.dir`). (T7)
     finding_recorder: Option<Arc<dyn aitm_core::FindingRecorder>>,
+    /// The proxy's live browser-egress posture, handed to every host so
+    /// `browser.confine` toggles the connector's real posture. `None` = the
+    /// toggle is unavailable on this server (the command then errors).
+    egress: Option<Arc<EgressConfinement>>,
     /// The second loopback-TCP token; a connection presenting it is an operator.
     operator_token: Option<Arc<str>>,
     /// The role a stdio connection speaks as (default [`Frontend::Mcp`]).
@@ -818,6 +822,7 @@ impl McpServer {
             poc_dir: None,
             config: None,
             finding_recorder: None,
+            egress: None,
             operator_token: None,
             stdio_role: Frontend::Mcp,
             // The milestone default; wiring overrides it from `McpConfig.policy`.
@@ -964,6 +969,14 @@ impl McpServer {
         self
     }
 
+    /// Attach the proxy's live browser-egress posture (`Proxy::egress()`), so a
+    /// `browser.confine` over this server flips the connector's real posture.
+    /// Without it the command errors rather than toggling a detached copy.
+    pub fn with_egress(mut self, egress: Arc<EgressConfinement>) -> Self {
+        self.egress = Some(egress);
+        self
+    }
+
     /// Wire the finding recorder so a `poc.run` persists a durable finding (T7).
     /// Persistence stays gated on `findings.dir`; `None` records nothing.
     pub fn with_finding_recorder(mut self, recorder: Arc<dyn aitm_core::FindingRecorder>) -> Self {
@@ -1024,6 +1037,7 @@ impl McpServer {
             poc_dir,
             config,
             finding_recorder,
+            egress,
             operator_token,
             stdio_role,
             agent_state,
@@ -1048,6 +1062,7 @@ impl McpServer {
             poc_dir,
             config,
             finding_recorder,
+            egress,
             operator_token: operator_token.clone(),
             stdio_role,
             agent_state,
@@ -1427,6 +1442,10 @@ impl McpServer {
         // hard-coded agent: an operator UI is treated as a human, an agent as an
         // agent, so gated commands and policy decide by who is actually on the end.
         .with_frontend(conn.role);
+        let host = match &self.egress {
+            Some(egress) => host.with_egress(egress.clone()),
+            None => host,
+        };
         let host = match &conn.client_label {
             Some(label) => host.with_client_label(label.clone()),
             None => host,
@@ -2077,5 +2096,95 @@ mod tests {
             id1, "apr_1",
             "request ids are not the old sequential counter"
         );
+    }
+
+    // ------------------------------------------------ Task 4b: egress wiring
+
+    use aitm_core::{
+        HttpFlow, HttpRequest, MemFlowStore, ParamSchema, Params, StdGuard, TypeDesc, Value,
+    };
+    use futures::future::BoxFuture;
+
+    /// A `ProxyClient` the probe never reaches.
+    struct NoClient;
+
+    impl ProxyClient for NoClient {
+        fn send(&self, _req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+            Box::pin(async { anyhow::bail!("egress.probe does not use the proxy client") })
+        }
+    }
+
+    /// `egress.probe`: reports exactly what `browser.confine` reads off the
+    /// host (`host.egress()`), so the wiring is testable here without the
+    /// browser crate.
+    struct EgressProbe;
+
+    impl Command for EgressProbe {
+        fn name(&self) -> &str {
+            "egress.probe"
+        }
+        fn sensitivity(&self) -> Sensitivity {
+            Sensitivity::Read
+        }
+        fn schema(&self) -> ParamSchema {
+            ParamSchema {
+                description: "Report the host's browser-egress posture.".into(),
+                params: vec![],
+                result: TypeDesc::Str,
+            }
+        }
+        fn invoke(&self, _args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+            Ok(Value::Str(match host.egress() {
+                None => "absent".into(),
+                Some(e) if e.confined() => "confined".into(),
+                Some(_) => "free".into(),
+            }))
+        }
+    }
+
+    fn probe_server() -> McpServer {
+        let mut reg = Registry::new();
+        reg.add_command(Arc::new(EgressProbe));
+        McpServer::new(Arc::new(reg), McpTransport::Stdio).with_services(
+            Arc::new(MemFlowStore::new()),
+            Arc::new(NoClient),
+            Arc::new(StdGuard::default()),
+            None,
+        )
+    }
+
+    fn probe(srv: &McpServer) -> JsonValue {
+        let req = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "egress.probe", "arguments": {}}
+        });
+        let resp = srv.handle(&req.to_string()).expect("a response");
+        let resp: JsonValue = serde_json::from_str(&resp).expect("response is JSON");
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        resp["result"]["structuredContent"].clone()
+    }
+
+    /// Task 4b / AC9: the host an `McpServer` assembles per `tools/call` carries
+    /// the live posture it was wired with — the same handle, so a later flip
+    /// is visible through it.
+    #[test]
+    fn mcp_host_carries_the_wired_egress_posture() {
+        let posture = Arc::new(EgressConfinement::new(false));
+        let srv = probe_server().with_egress(posture.clone());
+        assert_eq!(probe(&srv), json!("free"));
+
+        posture.set_base(true);
+        assert_eq!(
+            probe(&srv),
+            json!("confined"),
+            "the host reads the live handle, not a snapshot"
+        );
+    }
+
+    /// Without `with_egress` the host carries no posture (fail-closed: a
+    /// `browser.confine` on such a host errors rather than toggling nothing).
+    #[test]
+    fn mcp_host_without_wiring_carries_no_posture() {
+        assert_eq!(probe(&probe_server()), json!("absent"));
     }
 }

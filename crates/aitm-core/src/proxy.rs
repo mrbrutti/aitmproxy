@@ -11,6 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::chain::Chain;
 use crate::config::Config;
+use crate::egress::EgressConfinement;
 use crate::guard::{ScopeRateGuard, StdGuard};
 use crate::plugin::Plugin;
 use crate::protocol::{EventSink, ModuleCtx, NextLayerHint, ProtocolModule, UpstreamConnector};
@@ -31,6 +32,9 @@ struct ProxyInner {
     modules: Arc<[Arc<dyn ProtocolModule>]>,
     /// SSRF posture enforced on the browser-facing listener.
     browser_ssrf: crate::config::SsrfPolicy,
+    /// Runtime egress-confinement posture for the browser-facing listener
+    /// (scanner finding S2); shared with the command/host wiring.
+    egress: Arc<EgressConfinement>,
 }
 
 impl Proxy {
@@ -62,6 +66,13 @@ impl Proxy {
         self.inner.guard.clone()
     }
 
+    /// The browser-egress confinement posture (for the command/host wiring and
+    /// the scanner's campaign token). Shared with every [`SsrfConnector`] the
+    /// proxy builds, so a toggle here is seen by the next upstream dial.
+    pub fn egress(&self) -> Arc<EgressConfinement> {
+        self.inner.egress.clone()
+    }
+
     /// The registered protocol modules, shared. The capture ingress dispatches a
     /// captured stream through the **same** ordered module list the acceptor uses,
     /// so a captured HTTP/TLS/WS flow is claimed exactly as a proxied one is.
@@ -85,6 +96,7 @@ impl Proxy {
             Arc::new(SsrfConnector {
                 policy: self.inner.browser_ssrf.clone(),
                 guard: self.inner.guard.clone(),
+                egress: self.inner.egress.clone(),
             })
         } else {
             Arc::new(PassiveConnector)
@@ -224,6 +236,7 @@ async fn handle_conn(
         Arc::new(SsrfConnector {
             policy: inner.browser_ssrf.clone(),
             guard: inner.guard.clone(),
+            egress: inner.egress.clone(),
         })
     } else {
         Arc::new(PassiveConnector)
@@ -320,6 +333,10 @@ impl UpstreamConnector for PassiveConnector {
 struct SsrfConnector {
     policy: crate::config::SsrfPolicy,
     guard: Arc<dyn ScopeRateGuard>,
+    /// Live confinement posture: when `confined()`, an out-of-scope PUBLIC host
+    /// is refused too (scanner finding S2). Read per dial, so a toggle applies to
+    /// the next connection without rebuilding the connector.
+    egress: Arc<EgressConfinement>,
 }
 
 impl UpstreamConnector for SsrfConnector {
@@ -330,7 +347,13 @@ impl UpstreamConnector for SsrfConnector {
     ) -> BoxFuture<'_, anyhow::Result<ByteStream>> {
         let authority = authority.to_string();
         Box::pin(async move {
-            crate::guard::ssrf_check(&self.policy, &self.guard.list_scope(), &authority, dst.ip())?;
+            crate::guard::ssrf_check(
+                &self.policy,
+                &self.guard.list_scope(),
+                self.egress.confined(),
+                &authority,
+                dst.ip(),
+            )?;
             dial(dst).await
         })
     }
@@ -383,6 +406,9 @@ impl ProxyBuilder {
         let registry = Arc::new(registry);
         let chain = Arc::new(Chain::new(registry.clone(), store.clone()));
         let browser_ssrf = config.browser.ssrf.clone();
+        let egress = Arc::new(EgressConfinement::new(
+            config.browser.confine_egress_to_scope,
+        ));
 
         Ok(Proxy {
             inner: Arc::new(ProxyInner {
@@ -392,6 +418,7 @@ impl ProxyBuilder {
                 chain,
                 modules: self.modules.into(),
                 browser_ssrf,
+                egress,
             }),
         })
     }
@@ -401,6 +428,7 @@ impl ProxyBuilder {
 mod tests {
     use super::{is_benign_disconnect, parse_client_hello_sni, Proxy};
     use crate::config::Config;
+    use crate::error::GuardError;
     use crate::protocol::{ModuleCtx, NextLayerHint, ProtocolModule};
     use crate::stream::ByteStream;
     use futures::future::BoxFuture;
@@ -455,6 +483,52 @@ mod tests {
         assert!(
             result.is_err(),
             "a private, out-of-scope target must be refused by the SSRF-guarded connector"
+        );
+    }
+
+    #[tokio::test]
+    async fn confined_connector_refuses_out_of_scope_public() {
+        // Empty scope. With the runtime posture confined, an out-of-scope PUBLIC
+        // host is refused before any dial (scanner finding S2). Turning the
+        // posture back off leaves the private default untouched.
+        let proxy = Proxy::builder()
+            .with_config(Config::default())
+            .build()
+            .expect("build proxy");
+        let e = proxy.egress();
+        assert!(!e.confined(), "Config::default() seeds the free posture");
+
+        // Assert on the guard's own error, not just `is_err()`: a failed dial
+        // (e.g. no network in a sandbox) is also an `Err`, and must not be
+        // mistaken for the connector refusing the host before dialing.
+        e.set_base(true);
+        let public = proxy
+            .upstream_connector(true)
+            .connect("93.184.216.34", "93.184.216.34:80".parse().unwrap())
+            .await
+            .err()
+            .expect("confined posture must refuse an out-of-scope public host");
+        assert!(
+            matches!(
+                public.downcast_ref::<GuardError>(),
+                Some(GuardError::OutOfScope(h)) if h == "93.184.216.34"
+            ),
+            "expected GuardError::OutOfScope before any dial, got: {public:?}"
+        );
+
+        e.set_base(false);
+        let private = proxy
+            .upstream_connector(true)
+            .connect("10.1.2.3", "10.1.2.3:80".parse().unwrap())
+            .await
+            .err()
+            .expect("a private, out-of-scope target must still be refused");
+        assert!(
+            matches!(
+                private.downcast_ref::<GuardError>(),
+                Some(GuardError::PrivateAddressBlocked(h)) if h == "10.1.2.3"
+            ),
+            "the private default is unaffected by confinement being off, got: {private:?}"
         );
     }
 
