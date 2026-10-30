@@ -64,6 +64,13 @@ fi
 # Extract just the obscura member once; copy it into each profile dir.
 tar -xzf "$work/$asset" -C "$work" obscura
 
+# Defence in depth: the member must be a real file, not a symlink that the `cp`
+# below would dereference. A SHA-verified tarball is trusted, but assert anyway.
+if [ ! -f "$work/obscura" ] || [ -L "$work/obscura" ]; then
+    echo "fetch-obscura-dev.sh: extracted obscura is not a regular file" >&2
+    exit 1
+fi
+
 copied=()
 for profile in debug release; do
     dest_dir="$target_dir/$profile"

@@ -40,7 +40,26 @@ Small change; implemented in one worktree/branch, one commit, then gate + panel.
 
 ## Review log
 
-(filled during panel review)
+Panel on `9d04a8e..c36517f` (security, quality, spec), all **PASS** — no Critical
+or Important findings.
+
+- **Minor (spec + quality): AC3 test did not assert the package-install hint.**
+  Fixed — added the `"install an aitmproxy package"` needle to
+  `obscura_spawn.rs`'s not-found assertion.
+- **Minor (security): tarball `obscura` member could be a symlink `cp` would
+  dereference** (only reachable via a compromised, SHA-verified release; same as
+  `package.sh`). Fixed — `fetch-obscura-dev.sh` now rejects a non-regular-file /
+  symlink `obscura` member after extraction.
+- **Minor (quality): download+verify recipe duplicated with `package.sh`.**
+  Accepted (spec §Design explicitly chose to mirror the one trusted recipe);
+  extract a shared helper only if a third caller or a verify-logic change appears.
+- **Minor (quality): the `probe` "not the fork" message has no test.** Accepted —
+  AC3 only required the not-found error to be unit-tested; adding a probe-path
+  test needs a fake non-fork executable harness, out of proportion to a
+  string-only change on a cold path.
+
+Post-review: PR #74 fixed the same red gate on `main`; this branch was rebased
+onto it and the redundant `runner.rs` commit dropped (see spec §Discovered).
 
 ## Shipped
 

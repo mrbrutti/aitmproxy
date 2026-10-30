@@ -320,6 +320,7 @@ fn discovery_order() {
     let not_found = format!("{not_found:#}");
     for needle in [
         "scripts/fetch-obscura-dev.sh",
+        "install an aitmproxy package",
         "AITM_OBSCURA_BIN",
         "browser.obscura.binary",
     ] {

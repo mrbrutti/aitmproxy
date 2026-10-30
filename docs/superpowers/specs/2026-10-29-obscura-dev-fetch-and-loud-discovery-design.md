@@ -109,10 +109,12 @@ with no `poc.allow_agent_run`. PR #73 ("unbreak main gate") fixed the sibling
 gate blocks AC5 and would make this PR's CI red through no fault of this change,
 so unbreaking it is in scope for "make aitmproxy ship properly … CI green".
 
-Fix (mirrors #73's convention exactly): the test opts into `poc.allow_agent_run`
-via `CommandHost::…with_config(...)`, so it reaches the protocol-step dispatch it
-actually tests. The T3 agent-run gate itself is unchanged. Committed separately
-from the obscura work.
+Resolution: this was fixed independently on `main` by PR #74 ("fix: unbreak main
+- poc.run agent gate refused protocol_step dispatch test"), which landed the same
+fix (the test opts into `poc.allow_agent_run`) while this branch was in review.
+This branch was rebased onto that commit and its own redundant `runner.rs` commit
+dropped, so the PR no longer carries a `runner.rs` change — `main` is green again
+via #74, and this PR is purely the obscura dev-fetch + loud-discovery work.
 
 ## File scope
 
@@ -121,5 +123,5 @@ from the obscura work.
 - Edit: `crates/aitm-browser/src/obscura.rs` (two error strings),
   `crates/aitm-browser/tests/obscura_spawn.rs` (assert AC3),
   `scripts/README.md` (document the script).
-- Edit (gate unbreak, separate commit): `crates/aitm-poc/src/runner.rs`
-  (the one broken test's host setup only).
+- (The gate-unbreak `crates/aitm-poc/src/runner.rs` edit was dropped: PR #74
+  landed the same fix on `main` first; this branch rebased onto it.)
