@@ -53,6 +53,32 @@ extension Fixtures {
             tool("ca.install", "Install the CA into the login keychain (asks for confirmation)."),
             tool("ca.uninstall", "Remove the CA from the login keychain (asks for confirmation)."),
             tool("ratelimit.status", "Show the per-host rate limit and back-off state.", [("host", str("Host to inspect."), false), ("limit", int("Requests per second."), false)]),
+            // Raw-L4 (M5 aitm-proto-l4), advertised when `l4.enabled`. The surface
+            // feature-detects these by name from tools/list.
+            tool("l4.interfaces", "List the host's capturable network interfaces."),
+            tool("l4.scope.add", "Add a deny-by-default L4 scope entry (operator-confirmed; agent needs l4.allow_agent_widen).",
+                 [("cidr", str("addr/prefix."), true), ("interface", str("Interface, e.g. lo0."), true),
+                  ("direction", str("inbound or outbound."), true), ("capability", str("capture, inject or intercept."), true),
+                  ("ports", str("lo-hi, a port, or * for any."), false)]),
+            tool("l4.scope.list", "List the current L4 scope entries."),
+            tool("l4.capture.start", "Start capturing on an interface, bound to the L4 scope.",
+                 [("interface", str("Interface to capture on."), true)]),
+            tool("l4.capture.stop", "Stop a capture session.", [("id", flowID, true)]),
+            tool("l4.capture.status", "Report the active L4 capture sessions."),
+            tool("l4.flow.list", "List captured / crafted / intercepted L4 flow ids, oldest first."),
+            tool("l4.flow.get", "Summarise one L4 flow: kind, bind, and its packets.", [("id", flowID, true)]),
+            tool("l4.craft", "Build a layered PacketSpec into on-wire bytes and a structural summary.",
+                 [("spec", ["type": "object", "description": "A PacketSpec: { layers: [ {ipv4|udp|tcp|icmp|…: {…}} ] }."], true)]),
+            tool("l4.inject", "Inject a crafted PacketSpec (guarded; operator-confirmed over the wire).",
+                 [("spec", ["type": "object", "description": "The PacketSpec to inject."], true),
+                  ("dst", str("Destination IP."), true), ("interface", str("Interface."), true),
+                  ("port", int("Destination port."), false), ("count", int("How many copies (default 1)."), false)]),
+            tool("l4.send_recv", "Send a crafted packet and return the reply(s) (guarded, operator-confirmed).",
+                 [("spec", ["type": "object", "description": "The PacketSpec to send."], true),
+                  ("dst", str("Destination IP."), true), ("interface", str("Interface."), true), ("port", int("Destination port."), false)]),
+            tool("l4.agent.status", "Report the four per-capability agent gate states (capture, inject, intercept, widen)."),
+            tool("l4.agent.set", "Open or close one per-capability agent gate (operator-only).",
+                 [("capability", str("capture, inject, intercept or widen."), true), ("allowed", bool("true opens, false closes."), true)]),
         ]
     }()
 }

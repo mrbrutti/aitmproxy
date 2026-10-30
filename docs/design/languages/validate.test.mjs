@@ -158,6 +158,33 @@ test("rhai.api.json: shape", () => {
   assert.equal(new Set(names).size, names.length, "entry names are unique across the catalog");
 });
 
+test("rhai.api.json: namespaces is an extensible per-protocol map", () => {
+  const api = load("rhai.api.json");
+  // The protocol-extensibility seam adds a top-level `namespaces` MAP (not an
+  // array like the fixed sections), keyed by protocol; each namespace is
+  // assembled from its NamespaceCatalog. It is {} until http/browser/l4 join.
+  assert.ok(
+    api.namespaces && typeof api.namespaces === "object" && !Array.isArray(api.namespaces),
+    "namespaces is a map",
+  );
+  for (const [ns, entry] of Object.entries(api.namespaces)) {
+    assert.ok(entry && typeof entry === "object", `${ns} entry is an object`);
+    assert.ok(typeof entry.api_version === "string" && entry.api_version.length > 0, `${ns}.api_version`);
+    assert.ok(Array.isArray(entry.fns), `${ns}.fns is an array`);
+    for (const f of entry.fns) {
+      assert.equal(typeof f.name, "string", `${ns} fn has a name`);
+      assert.ok(f.description?.length > 0, `${ns}.${f.name} description`);
+      assert.equal(typeof f.returns, "string", `${ns}.${f.name} returns`);
+      assert.ok(Array.isArray(f.params), `${ns}.${f.name} params is an array`);
+      for (const p of f.params) {
+        assert.equal(typeof p.name, "string", `${ns}.${f.name} param name`);
+        assert.equal(typeof p.type, "string", `${ns}.${f.name} param type`);
+        assert.ok(p.description?.length > 0, `${ns}.${f.name} param description`);
+      }
+    }
+  }
+});
+
 test("rhai.api.json: hooks are exactly the plugin-system hook table", () => {
   const api = load("rhai.api.json");
   assert.deepEqual(set(api.hooks.map((h) => h.name)), HOOKS);
@@ -246,8 +273,8 @@ test("poc-yaml.schema.json: top level + step shapes", () => {
   ]);
   assert.deepEqual(set(Object.keys(schemaNode(s, "variables[]").keys)), ["default", "description", "name", "required"]);
   const step = schemaNode(s, "steps[]");
-  assert.deepEqual(set(Object.keys(step.keys)), ["browser", "extract", "http", "script"]);
-  assert.deepEqual(set(step.one_of_keys), ["browser", "extract", "http", "script"]);
+  assert.deepEqual(set(Object.keys(step.keys)), ["browser", "extract", "http", "l4", "script"]);
+  assert.deepEqual(set(step.one_of_keys), ["browser", "extract", "http", "l4", "script"]);
   assert.deepEqual(set(Object.keys(schemaNode(s, "steps[].http").keys)), [
     "body",
     "extract",
@@ -289,6 +316,36 @@ test("poc-yaml.schema.json: every node is described; enums are non-empty strings
     }
   }
   assert.ok(count > 30, "walked a non-trivial tree");
+});
+
+test("poc-yaml.schema.json: protocol-step mechanism is in place", () => {
+  const s = load("poc-yaml.schema.json");
+  // The seam adds a generic `<ns>:` step shape in $defs that concrete protocol
+  // steps (generated from each NamespaceCatalog) take; Task 6's l4: step is the
+  // first consumer. The mechanism must exist even while no namespace ships one.
+  const ps = s.$defs?.protocol_step;
+  assert.ok(ps && ps.type === "map", "$defs.protocol_step is a map node");
+  assert.ok(ps.description?.length > 0, "protocol_step is described");
+  assert.ok(ps.keys?.op?.type === "string", "protocol_step has an `op` key");
+
+  const pe = s.$defs?.protocol_extractor;
+  assert.ok(pe && pe.type === "map", "$defs.protocol_extractor is a map node");
+  assert.ok(pe.description?.length > 0, "protocol_extractor is described");
+  for (const k of ["name", "type", "field"]) {
+    assert.ok(pe.keys?.[k]?.type, `protocol_extractor.${k} is defined`);
+  }
+
+  // Task 6 ships the first concrete consumer: the `l4:` step node, generated from
+  // l4's NamespaceCatalog. Its `op` enum is the wire subset of the `l4.*` vocabulary
+  // and it contributes the `packet` matcher/extractor source.
+  const step = schemaNode(s, "steps[]");
+  assert.deepEqual(set(Object.keys(step.keys)), ["browser", "extract", "http", "l4", "script"]);
+  const l4 = schemaNode(s, "steps[].l4");
+  assert.equal(l4.type, "map", "the l4: step is a map node");
+  assert.ok(l4.description?.length > 0, "the l4: step is described");
+  assert.deepEqual(set(l4.keys.op.enum), ["craft", "inject", "send_recv"], "l4: op enum is the wire subset");
+  assert.equal(l4.keys.op.type, "enum", "l4: op is an enum node");
+  assert.deepEqual(l4.sources, ["packet"], "the l4: step contributes the packet source");
 });
 
 // ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@
       "response_tabs": ["Headers", "Set-Cookie", "Body", "Raw", "JSON/Tree", "Diff"],
       "viewers": ["pretty", "json-tree", "image", "hex", "protobuf", "msgpack", "sse", "markdown", "diff", "raw"]
     },
+    "list_cmd": "flow.list",
     "detail_cmd": { "command": "flow.detail", "gate": "F5", "fallback": "flow.get (summary only: no headers, bodies, timing or metadata)" },
     "realtime": { "subscription": "F4", "events": ["created", "request", "response", "intercepted", "released", "killed", "mutated", "meta"] },
     "status": "shipped"
@@ -35,6 +36,7 @@
       "shared_list": "message-stream",
       "compose": { "controls": ["send", "inject", "drop"], "gate": "F9", "disabled_text": "needs core F9" }
     },
+    "list_cmd": "flow.list",
     "detail_cmd": { "command": "flow.detail.messages", "gate": "F5", "fallback": "handshake only; frames show 'frames need core F5'" },
     "realtime": { "subscription": "F4", "events": ["created", "ws_message", "released", "killed"] },
     "status": "frames-gated"
@@ -59,6 +61,7 @@
       "intercept": { "verbs": ["forward", "mutate", "drop"], "timeout": "intercept_timeout with on_timeout: Forward | Drop" },
       "scope": "out-of-L4-scope sessions and packets are dimmed; every craft, inject, forward and drop action is disabled with the scope tooltip"
     },
+    "list_cmd": "l4.flow.list",
     "detail_cmd": {
       "command": "l4.flow.get",
       "gate": "M5",

@@ -44,7 +44,7 @@
       "items": {
         "type": "map",
         "description": "One step.",
-        "one_of_keys": ["http", "browser", "extract", "script"],
+        "one_of_keys": ["http", "browser", "extract", "script", "l4"],
         "keys": {
           "http": {
             "type": "map",
@@ -90,6 +90,18 @@
               "name": { "type": "string", "description": "Optional label; success can reference the step's verdict by this name." },
               "script": { "type": "string", "description": "Rhai source; may `return pass` or `return fail`." }
             }
+          },
+          "l4": {
+            "type": "map",
+            "description": "Run a native L4 verb and assert on the received `packet` (scapy-style, human-readable). `op: send_recv` injects a stimulus and binds the reply as the `packet` source (e.g. `field: tcp.flags`).",
+            "keys": {
+              "op": {
+                "type": "enum",
+                "enum": ["craft", "inject", "send_recv"],
+                "description": "Allowed values for `op` in a `l4:` step."
+              }
+            },
+            "sources": ["packet"]
           }
         }
       }
@@ -159,6 +171,23 @@
         "json": { "type": "string", "description": "JSONPath or jq expression (json)." },
         "kval": { "type": "string", "description": "Header or cookie key, dashes as underscores (kval)." },
         "expr": { "type": "string", "description": "Expression to evaluate (dsl, browser-eval)." },
+        "internal": { "type": "boolean", "description": "Pass between steps without printing." }
+      }
+    },
+    "protocol_step": {
+      "type": "map",
+      "description": "A protocol namespace's native `<ns>:` step (extensibility seam). Its body keys are the namespace's verb vocabulary — host-fn names from the Rhai `<ns>.*` vocabulary, or the one-shot subset of them that fits a single assertion step (e.g. l4's wire verbs) — and a sibling `extract:` reads a field from one of the step's named sources. Concrete `<ns>` step entries under steps[].items.keys are generated from each protocol's NamespaceCatalog; this is the shared shape they take. The l4 namespace is the first consumer (Task 6): see steps[].items.keys.l4.",
+      "keys": {
+        "op": { "type": "string", "description": "The verb to run; one of the namespace's host-fn names." }
+      }
+    },
+    "protocol_extractor": {
+      "type": "map",
+      "description": "A `<ns>:` step's sibling extractor: reads `field` from a named source the step produced (e.g. `type: packet, field: tcp.flags`).",
+      "keys": {
+        "name": { "type": "string", "description": "Binds a variable for later steps and success." },
+        "type": { "type": "string", "description": "The source name the step produced (e.g. packet, echo)." },
+        "field": { "type": "string", "description": "Dotted field path into the named source (e.g. tcp.flags)." },
         "internal": { "type": "boolean", "description": "Pass between steps without printing." }
       }
     }

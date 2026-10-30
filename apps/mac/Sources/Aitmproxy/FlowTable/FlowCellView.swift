@@ -88,7 +88,11 @@ final class FlowCellView: NSTableCellView {
             label.stringValue = row.isReplay ? "\(row.seq) ↻" : "\(row.seq)"
             label.isHidden = false
         case .url:
-            label.attributedStringValue = urlText(row, dim: dim, size: body)
+            if let l4 = row.l4 {
+                label.attributedStringValue = l4Text(l4, dim: dim, size: body)
+            } else {
+                label.attributedStringValue = urlText(row, dim: dim, size: body)
+            }
             label.isHidden = false
         case .client:
             if let client = row.client {
@@ -101,11 +105,24 @@ final class FlowCellView: NSTableCellView {
             }
             label.isHidden = false
         case .method:
-            badge.text = row.method.label
-            badge.pair = row.method.badge
+            // L4 wears the slate/indigo kind badge; HTTP/WS wear the method badge.
+            if row.kind == .l4 {
+                badge.text = "L4"
+                badge.pair = Tok.L4.badge
+            } else {
+                badge.text = row.method.label
+                badge.pair = row.method.badge
+            }
             badge.uppercase = true
             badge.isHidden = false
         case .status:
+            if let l4 = row.l4 {
+                // The L4 Status cell shows the session state (capture / craft / intercept).
+                label.stringValue = l4.sessionState.label
+                label.textColor = (l4.sessionState == .intercept ? Tok.Intercept.deep : meta).nsColor
+                label.isHidden = false
+                break
+            }
             switch row.state {
             case .paused:
                 badge.text = "Paused"
@@ -137,12 +154,20 @@ final class FlowCellView: NSTableCellView {
             label.stringValue = row.state == .pending ? "…" : Format.duration(row.duration)
             label.isHidden = false
         case .request:
-            label.stringValue = row.kind == .websocket ? row.wsFrames.map { "\($0.sent) ↑" } ?? Format.dash
-                : Format.bytes(row.requestBytes)
+            if let l4 = row.l4 {
+                label.stringValue = "\(l4.packetCount) pkt"
+            } else {
+                label.stringValue = row.kind == .websocket ? row.wsFrames.map { "\($0.sent) ↑" } ?? Format.dash
+                    : Format.bytes(row.requestBytes)
+            }
             label.isHidden = false
         case .response:
-            label.stringValue = row.kind == .websocket ? row.wsFrames.map { "\($0.received) ↓" } ?? Format.dash
-                : Format.bytes(row.responseBytes)
+            if let l4 = row.l4 {
+                label.stringValue = l4.injectedCount > 0 ? "\(l4.injectedCount) inj" : Format.dash
+            } else {
+                label.stringValue = row.kind == .websocket ? row.wsFrames.map { "\($0.received) ↓" } ?? Format.dash
+                    : Format.bytes(row.responseBytes)
+            }
             label.isHidden = false
         case .ssl:
             let (symbol, tint): (String?, NSColor) = switch row.tls {
@@ -208,6 +233,19 @@ final class FlowCellView: NSTableCellView {
         monogram.setAccessibilityRole(.image)
         monogram.setAccessibilityLabel(row.client?.name)
         icon.setAccessibilityLabel(icon.image?.accessibilityDescription)
+    }
+
+    /// The L4 row's target: a `[TCP]` sub-label in the slate/indigo hue, then the
+    /// bound target (`iface · filter`). Out-of-scope rows dim.
+    private func l4Text(_ info: L4RowInfo, dim: Bool, size: CGFloat) -> NSAttributedString {
+        let font = Tok.Face.nsData(size)
+        let sub = dim ? Tok.Ink.tertiary : Tok.L4.deep
+        let target = dim ? Tok.Ink.tertiary : Tok.Ink.primary
+        let text = NSMutableAttributedString()
+        text.append(NSAttributedString(string: info.subLabel + "  ",
+                                       attributes: [.font: Tok.Face.nsData(size, .medium), .foregroundColor: sub.nsColor]))
+        text.append(NSAttributedString(string: info.target, attributes: [.font: font, .foregroundColor: target.nsColor]))
+        return text
     }
 
     /// Host in ink, path in the link colour, query dimmed; killed rows struck through.

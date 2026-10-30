@@ -31,6 +31,7 @@ export type SidebarItem =
   | { kind: 'findings' }
   | { kind: 'browser' }
   | { kind: 'scripts' }
+  | { kind: 'l4' }
   | { kind: 'agent' };
 
 export type FilterField =
@@ -167,6 +168,11 @@ export function createAppStore(bus: BusClient) {
 
     const [selectedId, setSelectedIdRaw] = createSignal<FlowId | null>(null);
     const [selectedIds, setSelectedIds] = createSignal<ReadonlySet<FlowId>>(new Set<FlowId>());
+
+    // L4 flows are not HTTP `FlowEntry`s — they live in the lifted L4 store and come from
+    // `l4.flow.list`. The store registers their ids here so selection routes to the L4 inspector
+    // (not the HTTP `flow.detail` path) and the unified list knows which ids are L4.
+    const [l4Ids, setL4IdsSig] = createSignal<ReadonlySet<FlowId>>(new Set<FlowId>());
 
     const [ui, setUi] = createStore<UiState>({
       chip: 'all',
@@ -526,6 +532,10 @@ export function createAppStore(bus: BusClient) {
           return f.authority === s.key;
         case 'scope':
           return f.inScope;
+        case 'l4':
+          // The L4 focus view: hide HTTP/WebSocket so only L4 session rows show (the list appends
+          // them). L4 rows are not FlowEntries, so they are never excluded by this HTTP predicate.
+          return false;
         default:
           return true;
       }
@@ -668,6 +678,12 @@ export function createAppStore(bus: BusClient) {
       return id ? (details[id] ?? null) : null;
     });
 
+    /** True when the selected id is an L4 session — the lower region shows the L4 inspector. */
+    const selectedIsL4 = createMemo<boolean>(() => {
+      const id = selectedId();
+      return !!id && l4Ids().has(id);
+    });
+
     const oldestPaused = createMemo<FlowEntry | null>(() => {
       const sel = selected();
       if (sel && sel.flow.intercept === 'paused') return sel;
@@ -703,6 +719,14 @@ export function createAppStore(bus: BusClient) {
 
     function select(id: FlowId | null, opts: { additive?: boolean; range?: boolean } = {}) {
       batch(() => {
+        // An L4 session: single-select, open the L4 inspector, and skip the HTTP detail fetch
+        // (L4 detail is `l4.flow.get`, held by the L4 store, not `flow.detail`).
+        if (id && l4Ids().has(id)) {
+          setSelectedIds(new Set<FlowId>([id]));
+          setSelectedIdRaw(id);
+          setUi('panel', 'inspector');
+          return;
+        }
         if (id && opts.additive) {
           const next = new Set(selectedIds());
           if (next.has(id)) next.delete(id);
@@ -770,6 +794,8 @@ export function createAppStore(bus: BusClient) {
       setChip: (c: Chip) => setUi('chip', c),
       setSidebar: (s: SidebarItem) => batch(() => {
         setUi('sidebar', s);
+        // `l4` is a FILTER over the one unified list (like `scope`), not a panel: it stays on the
+        // inspector so the lower region shows the HTTP or L4 inspector by the selected flow's kind.
         const panel: Panel =
           s.kind === 'findings' ? 'findings' : s.kind === 'browser' ? 'browser' : s.kind === 'scope' ? 'scope' : s.kind === 'agent' ? 'agent' : s.kind === 'scripts' ? 'scripts' : 'inspector';
         setUi('panel', panel);
@@ -1002,6 +1028,8 @@ export function createAppStore(bus: BusClient) {
         }),
       ensurePocSource,
       refreshSide,
+      /** The lifted L4 store calls this on each refresh so selection/list routing knows L4 ids. */
+      setL4Ids: (ids: readonly FlowId[]) => setL4IdsSig(new Set<FlowId>(ids)),
       call: <T,>(tool: string, args?: Record<string, unknown>) => bus.call<T>(tool, args),
     };
 
@@ -1020,6 +1048,8 @@ export function createAppStore(bus: BusClient) {
       selectedIds,
       selected,
       selectedDetail,
+      selectedIsL4,
+      l4Ids,
       detailLoading,
       detailError,
       oldestPaused,

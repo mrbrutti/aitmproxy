@@ -17,6 +17,22 @@ body,
 html {
   /* Density moves row pitch; cell padding and body size follow in the components. */
   --row: var(--size-row-dense);
+
+  /* L4 badge hue (ui-ext Part 3 OQ1 / foundation): a slate/indigo distinct from accent-blue,
+     intercept-amber, agent-teal and WS-magenta. Surface-local until the foundation tokens adopt
+     it, so this one web change does not edit the shared tokens.json. */
+  --color-l4-deep: #3a3f8f;
+  --color-l4-tint: #e7e8fb;
+}
+html[data-theme='dark'] {
+  --color-l4-deep: #b9bcf5;
+  --color-l4-tint: #26294d;
+}
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme='light']) {
+    --color-l4-deep: #b9bcf5;
+    --color-l4-tint: #26294d;
+  }
 }
 html[data-density='default'] {
   --row: var(--size-row-default);

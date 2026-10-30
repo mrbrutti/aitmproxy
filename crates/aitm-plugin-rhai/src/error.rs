@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use aitm_core::GuardError;
+use aitm_plugin::language::RegisterError;
 use rhai::EvalAltResult;
 
 use crate::engine::{AbortKind, Budget};
@@ -70,6 +71,20 @@ pub enum ScriptError {
         namespace: String,
         min_api: String,
     },
+    /// Two seam protocol languages claimed the same `<namespace>.<name>` while
+    /// the loader built its engine; registration never last-wins (Task 2 Review
+    /// Focus, surfaced on the loader's build path by Task 7).
+    LanguageCollision { namespace: String, name: String },
+}
+
+impl From<RegisterError> for ScriptError {
+    fn from(err: RegisterError) -> Self {
+        match err {
+            RegisterError::Collision { namespace, name } => {
+                ScriptError::LanguageCollision { namespace, name }
+            }
+        }
+    }
 }
 
 impl ScriptError {
@@ -173,6 +188,9 @@ const HELP_CAP: &str = "raise the script's `const API` to the capability's versi
                         is written for that contract; a lower-API script is denied the namespace by \
                         default.";
 
+const HELP_COLLISION: &str = "two protocol languages registered the same host function; each \
+                              namespace must be owned by one language.";
+
 impl std::fmt::Display for ScriptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -241,6 +259,11 @@ impl std::fmt::Display for ScriptError {
                 f,
                 "error: {script} — declares API '{declared}' but the '{namespace}' capability \
                  requires API '{min_api}' or newer\n  help: {HELP_CAP}"
+            ),
+            ScriptError::LanguageCollision { namespace, name } => write!(
+                f,
+                "error: host function '{namespace}.{name}' is registered by two protocol \
+                 languages\n  help: {HELP_COLLISION}"
             ),
         }
     }

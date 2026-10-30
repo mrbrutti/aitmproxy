@@ -379,8 +379,24 @@ honestly-degraded capability.
 
 Kept by the main session during stage 6. One row per finding.
 
+Branch-level Stage-6 panel on `feat/l4-operator-surfaces` (security + quality + spec,
+read-only), run after the Stages B–G build was integrated and synced to current `main`
+(`b0ddc5f`). Per-task panels during M5 landing (Stage A → `main`, PR #15) are recorded
+in that milestone's own log; the three M5 security findings (SEC-1 mutate→forward
+re-check, SEC-2 `scope.add` gating, SEC-3 per-packet rate) landed on `main` before the
+branch forked and are not re-listed here.
+
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| Branch | security-reviewer | — | PASS. Deny-by-default holds: `Frontend::Mcp` is gated on both `AgentPolicy` and the per-capability `l4.allow_agent_*` flag (default false); the widen gate has a single enforcement point in `L4Guard::add_runtime_scope`; runtime scope entries (`L4ScopeSource::Runtime`) cannot lift the dangerous-destination denylist; `#![forbid(unsafe_code)]` across `aitm-proto-l4`; one `send_on_wire` choke point. No new vulnerabilities. | Accepted — no action. |
+| 13 | quality-reviewer | Important | TUI `l4.scope.list` parser read `cidr`/`ports` as JSON objects, but the real command emits strings (`"127.0.0.1/32"`, `"0-65535"`); scope rows rendered wrong. `proto_of` also took the outermost layer, breaking innermost-wins parity with web/macOS. | Fixed in `af9019b` (parse as strings; `layers.iter().rev()`). |
+| 8 | quality-reviewer | Minor | `confirm_prompt` text built per-verb with near-duplicate branches. | Accepted — follow-up (cosmetic dedup; no behaviour change). |
+| 6 | quality-reviewer | Minor | Secret/token masking logic duplicated across two call sites. | Accepted — follow-up (dedup; both sites correct today). |
+| 7 | quality-reviewer | Minor | Per-packet rate meter does not refund the counter when a packet is rejected before send. | Accepted — follow-up (conservative direction: over-counts, never under-counts a gate). |
+| 12 | quality-reviewer | Minor | web surface has no add-L4-scope control; operator can view/enter scope but adds it via another surface. | Accepted — follow-up (parity gap, not a correctness defect; tracked for Phase-1.1). |
+| 15 | spec-reviewer | Important | AC16 (cross-surface parity) has no standalone runtime conformance fixture that drives all three surfaces from one case table. | **Recommend accept** (architect): parity is enforced structurally — shared `tokens.json` + `flow-kinds.json` generated into all three surfaces, plus per-surface unit tests (Tasks 12/13/14) asserting the same L4 row/detail shape. **Accepted by Matt 2026-10-29** (parity satisfied by shared defs + unit tests). |
+| 16 | spec-reviewer | Important | AC14 (two-way acceptance with real packets) is exercised on the CLI/Linux in-path path (MCP acceptance, Task 16) but not with real packets through the macOS surface. | **Recommend accept** (architect): matches Matt's Phase-1 decision (CLI/Linux-first). Real-packet macOS capture is Phase 2 (Network/System Extension, "the Proxyman way"); the branch carries the unified operator surface and Linux real-packet acceptance. **Accepted by Matt 2026-10-29** (Phase-1 is CLI/Linux-first; macOS real packets are Phase 2). |
+| 17 | spec-reviewer (CUA) | Note | The human confirm-over-the-wire **dialog** click-path is not demonstrable on an unprivileged macOS operator host — not because of role/F1, but because it is **privilege-gated**: `L4Gated` (`crates/aitm-proto-l4/src/module.rs` ~170–200) short-circuits an unprivileged wire verb in `invoke()` and leaves `confirm_prompt` → `None`, so no `needs_confirmation` is offered even to `Frontend::Operator`; with no wire verb succeeding, `l4.flow.list` stays empty, no L4 session renders, and the craft/Inject dialog never mounts. | Accepted as **honest AC18 degradation**: `#35` operator identity is confirmed wired (agent-policy gate bypassed, per-feature MCP toggles flip live by operator click); the full sensitive-action + confirm-dialog click-path is Linux/elevated and is proven **agent-driven** in Task 16. web CUA = 10 PASS / 0 FAIL / 1 GAP / 1 SKIP (`4019061`). |
 
 ## Shipped
 
