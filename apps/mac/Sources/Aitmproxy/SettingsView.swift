@@ -116,7 +116,7 @@ struct BusSettings: View {
         Section("External connection") {
             Toggle("Read address and token from aitmproxy's config.yaml", isOn: $fromConfig)
             TextField("Host", text: $host).disabled(fromConfig)
-            TextField("Port", value: $port, format: .number).disabled(fromConfig)
+            TextField("Port", value: $port, format: .number.grouping(.never)).disabled(fromConfig)
             TextField("Token file", text: $tokenFile, prompt: Text("~/Library/Application Support/aitmproxy/mcp.token"))
                 .disabled(fromConfig)
         }

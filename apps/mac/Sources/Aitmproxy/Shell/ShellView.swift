@@ -165,7 +165,7 @@ struct MainView: View {
                 ScopePanel()
                 Rule()
             } else if session.page == .connections {
-                ConnectionLogPanel().frame(height: 280)
+                ConnectionDashboard().frame(height: 260)
                 Rule()
             } else if !Store.usesFixtures, session.scopeHosts.isEmpty, case .connected = session.bus {
                 ScopeBanner()
