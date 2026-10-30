@@ -41,20 +41,10 @@ H2_UPSTREAM_JS = os.path.join(PROXY_DIR, "h2_upstream.mjs")
 # ---------------------------------------------------------------------------
 @dataclasses.dataclass
 class ProxyConfig(CoreConfig):
+    # ssl_insecure + ca_dir now live on CoreConfig and are emitted by its to_yaml;
+    # ProxyConfig only overrides the ssl_insecure default (trust the self-signed
+    # TLS upstreams this surface uses). No to_yaml override — the base handles it.
     ssl_insecure: bool = True
-    ca_dir: str | None = None
-
-    def to_yaml(self) -> str:
-        base = super().to_yaml()
-        extra: list[str] = []
-        if self.ssl_insecure:
-            extra.append("ssl_insecure: true")
-        if self.ca_dir:
-            extra.append("ca:")
-            extra.append(f'  dir: "{self.ca_dir}"')
-        if not extra:
-            return base
-        return base + "\n".join(extra) + "\n"
 
 
 def new_ca_dir() -> str:

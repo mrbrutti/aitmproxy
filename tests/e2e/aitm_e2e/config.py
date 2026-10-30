@@ -33,6 +33,15 @@ class CoreConfig:
     findings_dir: str | None = None
     l4_enabled: bool = False
     l4_flags: dict[str, bool] = field(default_factory=dict)
+    # CA: a per-run dir isolates the MITM CA from the operator's real store; aitm
+    # writes <ca_dir>/ca.crt on boot (use aitm_e2e.tls.ca_cert to locate it).
+    ca_dir: str | None = None
+    # ssl_insecure: trust a self-signed UPSTREAM cert (for TLS echo origins).
+    ssl_insecure: bool = False
+    # Rhai scripting: scripts_dir is auto-loaded + is where script.save writes;
+    # allow_agent_authoring opens script.save/reload to an agent frontend.
+    rhai_scripts_dir: str | None = None
+    rhai_allow_agent_authoring: bool = False
 
     def to_yaml(self) -> str:
         lines: list[str] = [
@@ -67,6 +76,17 @@ class CoreConfig:
             lines.append("  enabled: true")
             for flag, val in self.l4_flags.items():
                 lines.append(f"  {flag}: {str(bool(val)).lower()}")
+        if self.ca_dir:
+            lines.append("ca:")
+            lines.append(f"  dir: {_yaml_str(self.ca_dir)}")
+        if self.rhai_scripts_dir or self.rhai_allow_agent_authoring:
+            lines.append("rhai:")
+            if self.rhai_scripts_dir:
+                lines.append(f"  scripts_dir: {_yaml_str(self.rhai_scripts_dir)}")
+            if self.rhai_allow_agent_authoring:
+                lines.append("  allow_agent_authoring: true")
+        if self.ssl_insecure:
+            lines.append("ssl_insecure: true")
         lines.append("")
         return "\n".join(lines)
 

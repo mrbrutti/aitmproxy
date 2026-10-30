@@ -13,11 +13,13 @@ under a surface directory. A suite may tag itself in its first ~20 lines:
     # e2e: needs=obscura      -> informational (the suite itself SKIPs 77 if absent)
 
 Usage:
-    python3 tests/e2e/run.py [SURFACE ...] [--jobs N] [--manual] [--list]
+    python3 tests/e2e/run.py [SURFACE ...] [--jobs N] [--build] [--manual] [--list]
 
   SURFACE   limit to these surface dirs (e.g. `web proxy`); default: all
   --jobs N  run up to N suites at once (default 4, capped at 6). Each suite picks
             its own free ports so parallel runs don't collide. --manual forces 1.
+  --build   cargo build -p aitm -p aitm-testtarget first (preflight). Without it,
+            a missing aitm is fatal and a missing aitm-testtarget-serve warns.
   --manual  include tier=manual suites and let them prompt the operator
   --list    list discovered suites and exit
 """
@@ -100,10 +102,40 @@ def run_suite(suite: dict, child_env: dict) -> tuple:
     return ("fail", label, f"exit {code}", dt, proc.stdout)
 
 
+def _repo_root() -> str:
+    return os.path.dirname(os.path.dirname(E2E_DIR))
+
+
+def preflight(build: bool) -> None:
+    """Ensure the binaries the suites need exist. `aitm` is required by every
+    suite; `aitm-testtarget-serve` only by ca/poc/findings/scripting, so a miss
+    there is a loud warning, not a hard stop. `--build` builds both first."""
+    repo = _repo_root()
+    aitm = os.environ.get("AITM_BIN") or os.path.join(repo, "target", "debug", "aitm")
+    tgt = (os.environ.get("AITM_TESTTARGET_BIN")
+           or os.path.join(repo, "target", "debug", "aitm-testtarget-serve"))
+    if build:
+        print("preflight: cargo build -p aitm -p aitm-testtarget ...", flush=True)
+        if subprocess.run(["cargo", "build", "-p", "aitm", "-p", "aitm-testtarget"],
+                          cwd=repo).returncode != 0:
+            print("FATAL: cargo build failed", flush=True)
+            sys.exit(1)
+    if not os.path.exists(aitm):
+        print(f"FATAL: aitm binary missing: {aitm}\n"
+              "  build it: cargo build -p aitm  (or pass --build, or set AITM_BIN)", flush=True)
+        sys.exit(1)
+    if not os.path.exists(tgt):
+        print(f"WARNING: aitm-testtarget-serve missing: {tgt}\n"
+              "  ca/poc/findings/scripting will FAIL without it — "
+              "build: cargo build -p aitm-testtarget  (or --build, or set AITM_TESTTARGET_BIN)",
+              flush=True)
+
+
 def main() -> int:
     args = sys.argv[1:]
     manual = "--manual" in args
     do_list = "--list" in args
+    build = "--build" in args
     jobs = 4
     surfaces: list[str] = []
     i = 0
@@ -136,6 +168,8 @@ def main() -> int:
     if not suites:
         print("no e2e suites found (looked for test_*.py / *.sh under tests/e2e/<surface>/)")
         return 1
+
+    preflight(build)
 
     child_env = dict(os.environ)
     child_env["PYTHONPATH"] = E2E_DIR + os.pathsep + child_env.get("PYTHONPATH", "")

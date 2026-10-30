@@ -63,18 +63,24 @@ class Aitm:
         workdir = tempfile.mkdtemp(prefix="aitm-e2e-")
         cfg.poc_dir = cfg.poc_dir or os.path.join(workdir, "poc")
         cfg.poc_out_dir = cfg.poc_out_dir or os.path.join(workdir, "poc-out")
-        dirs = [cfg.poc_dir, cfg.poc_out_dir]
+        # Per-run CA dir isolates the MITM CA from the operator's real store.
+        cfg.ca_dir = cfg.ca_dir or os.path.join(workdir, "ca")
+        dirs = [cfg.poc_dir, cfg.poc_out_dir, cfg.ca_dir]
         if cfg.findings_dir:
             dirs.append(cfg.findings_dir)
+        if cfg.rhai_scripts_dir:
+            dirs.append(cfg.rhai_scripts_dir)
         for d in dirs:
             os.makedirs(d, exist_ok=True)
         cfg_path = write_config(os.path.join(workdir, "config.yaml"), cfg)
         return workdir, cfg_path
 
     @classmethod
-    def server(cls, cfg: CoreConfig, start_timeout: float = 30.0) -> "Aitm":
+    def server(cls, cfg: CoreConfig, start_timeout: float = 30.0,
+               scripts: list[str] | None = None) -> "Aitm":
         """Bare `aitm`: proxy on cfg.proxy_port + loopback-TCP MCP bus (ephemeral,
-        learned from --bus-endpoint-file)."""
+        learned from --bus-endpoint-file). `scripts` passes `--script <path>` per
+        entry (loaded in order, after any rhai.scripts_dir auto-load)."""
         bin_ = _aitm_bin()
         if not os.path.exists(bin_):
             raise FileNotFoundError(
@@ -84,6 +90,8 @@ class Aitm:
         workdir, cfg_path = cls._prep(cfg)
         self = cls(cfg, workdir, mode="server")
         argv = [bin_, "--config", cfg_path, "--bus-endpoint-file", self._endpoint_file]
+        for s in scripts or []:
+            argv += ["--script", s]
         self._spawn(argv)
         if not self._wait_endpoint_file(start_timeout):
             self._die("the bus endpoint file was never written")
@@ -92,8 +100,10 @@ class Aitm:
         return self
 
     @classmethod
-    def web(cls, cfg: CoreConfig, start_timeout: float = 30.0) -> "Aitm":
-        """`aitm web`: proxy + embedded web UI + /bus bridge on a free web port."""
+    def web(cls, cfg: CoreConfig, start_timeout: float = 30.0,
+            scripts: list[str] | None = None) -> "Aitm":
+        """`aitm web`: proxy + embedded web UI + /bus bridge on a free web port.
+        `scripts` passes `--script <path>` per entry (global flags, before `web`)."""
         bin_ = _aitm_bin()
         if not os.path.exists(bin_):
             raise FileNotFoundError(
@@ -103,10 +113,10 @@ class Aitm:
         workdir, cfg_path = cls._prep(cfg)
         web_port = free_port()
         self = cls(cfg, workdir, mode="web", web_port=web_port)
-        argv = [
-            bin_, "--config", cfg_path,
-            "web", "--listen", f"127.0.0.1:{web_port}", "--token", cfg.agent_token, "--no-open",
-        ]
+        argv = [bin_, "--config", cfg_path]
+        for s in scripts or []:
+            argv += ["--script", s]
+        argv += ["web", "--listen", f"127.0.0.1:{web_port}", "--token", cfg.agent_token, "--no-open"]
         self._spawn(argv)
         if not _wait_port(web_port, start_timeout):
             self._die(f"the web UI never bound 127.0.0.1:{web_port}")
