@@ -118,3 +118,25 @@ The endpoint binds **loopback only** by default, has **no in-process TLS**, and
 exposes a MITM proxy control plane. Before binding anything other than loopback,
 read [`security.md`](security.md) — a non-loopback bind must be fronted by a
 tunnel or HTTPS and signed off by a security reviewer.
+
+## Targeting a specific `aitm` build (connecting the MCP)
+
+The plugin's Claude MCP server runs `${AITM_BIN:-aitm}`: by default it launches
+`aitm` from your `PATH`, but you can point it at any build without editing the
+plugin by setting the `AITM_BIN` environment variable before starting the client:
+
+```bash
+export AITM_BIN=/absolute/path/to/aitm   # e.g. a dev build: target/debug/aitm
+```
+
+Claude expands `${VAR:-default}` in `.mcp.json`, so an unset `AITM_BIN` falls
+back to `aitm` on `PATH`. Use this when the released `aitm` (Homebrew tap
+`mrbrutti/homebrew-aitmproxy`) predates a feature you need, or to test a local
+build. Confirm the build has the plugin's MCP surface with:
+
+```bash
+aitm --help   # the output lists `flow table` when the build includes it
+```
+
+The OpenAI `mcp.json` uses a bare `aitm` command (OpenAI does not document
+`${VAR:-default}` expansion); there, put the desired `aitm` first on `PATH`.
