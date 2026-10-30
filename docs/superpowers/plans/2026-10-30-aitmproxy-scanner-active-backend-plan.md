@@ -14,6 +14,19 @@ already-shipped `CommandHost::egress_handle()`; the agent gate reads the
 already-shipped `ScannerConfig.allow_agent_active`; active requests ride the
 already-shipped `PipelineClient::send` → `check_active` chokepoint.
 
+**Amendment 2026-10-30** (the spec's Design amendment note explains the provenance:
+three corrections from the closed PR #84 draft, re-verified against the code, plus two
+gaps found while verifying). It changes this plan in four places and nowhere else:
+**Task 4** now runs the PoC through `StdPocRunner` on a recorder-less narrowed host and
+records `control_passed: None`; **Task 5**'s `Confirmed` carries the attack flow;
+**Tasks 8 and 10** each add one `defers_to_command_gate` entry in
+`crates/aitm-mcp/src/server.rs` (so that file, its test file `mcp.rs` and a new
+`crates/aitm/tests/scan_agent_gate.rs` join the serial command chain's shared files);
+**Task 12** asserts `control_passed == None` and proves vulnerable-versus-patched by two
+separate calls. The `defers_to_command_gate` entries are the default for the spec's
+Open question 6; if Matt answers "leave them out", Tasks 8 and 10 drop their entries
+and flip the matching test arms.
+
 The crate splits cleanly into **engine library modules** (one new file each →
 fan out) and a **command-registration chain** (every command lives in
 `commands.rs`, registers in `plugin.rs`, and bumps `crates/aitm/tests/frontends.rs`
@@ -29,12 +42,19 @@ ScanStatus cmds) → T13 (both-paths e2e).
 
 - **Wave 1 (fan-out, independent):** T1 `passive.rs`, T2 `checks.rs`,
   T3 `report.rs`.
-- **Wave 2 (fan-out, independent):** T4 `reproduce.rs`, T5 `inject.rs`.
+- **Wave 2 (fan-out, independent):** T4 `reproduce.rs`, T5 `inject.rs`. They stay
+  independent because T4 takes the attack `HttpFlow` by reference, not T5's
+  `Confirmed`; the only coupling is that T5's `Confirmed.attack_flow` is the id a later
+  task resolves to the flow T4 consumes.
 - **Wave 3 (serial command chain begins + campaign engine):** T6 `ScanPassive`,
   then T7 `ScanReport` (share `commands.rs`); T9 `campaign.rs` (engine, independent
   of the command chain, may run parallel to T6/T7).
 - **Wave 4 (serial command chain continues):** T8 `ScanInject`, then T10
-  `ScanRun`+`ScanStatus` (share `commands.rs`).
+  `ScanRun`+`ScanStatus` (share `commands.rs`, and now also `aitm-mcp`'s `server.rs`
+  and `mcp.rs` and the new `crates/aitm/tests/scan_agent_gate.rs`). The `aitm-mcp`
+  half of each task needs no scanner code (its test uses a stub command named after
+  the real one), so the orchestrator may split it out as a small task if T8 proves too
+  large for one sitting; it must still run before integration Task 8.
 - **Wave 5 (fan-out, independent tests):** T11 passive hermetic e2e, T12 inject
   live e2e, T13 both-paths/campaign e2e, T14 docs.
 
@@ -46,9 +66,18 @@ ScanStatus cmds) → T13 (both-paths e2e).
 - **TDD:** failing test first; the Coder's report shows both runs.
 - **No core edits.** Only the shipped `aitm-plugin-scanner` crate, plus
   `crates/aitm/tests/frontends.rs` (contract) and new tests under
-  `crates/aitm/tests/`. If a task finds it must edit an `aitm-core` type, it
-  **stops and reports**. It must **not** edit `wire.rs`/`config_file.rs` for the
-  `allow_agent_active` flag (integration plan D-MCP2 owns that).
+  `crates/aitm/tests/`, plus — **only in Tasks 8 and 10** — one match arm each in
+  `defers_to_command_gate` (`crates/aitm-mcp/src/server.rs`, a policy list, not an
+  `aitm-core` type) with its test in `crates/aitm-mcp/tests/mcp.rs`. If a task finds
+  it must edit an `aitm-core` type, it **stops and reports**. It must **not** edit
+  `wire.rs`/`config_file.rs` for the `allow_agent_active` flag (integration plan
+  D-MCP2 owns that).
+- **Reproduce + record (every task that confirms a finding: 4, 8, 9).** The PoC runs
+  through `aitm_poc::StdPocRunner` on `reproduce::narrowed_host(host)` (no finding
+  recorder, no `Config`), never through the `poc.run` command (a command cannot call a
+  command) and never on the command's own host (that would add a second, runner-made
+  record). The scanner records only via `DiskFindingStore`, never
+  `host.finding_recorder()`, and every production record has `control_passed: None`.
 - **Extend, don't reinvent:** build on the shipped `ScannerConfig`,
   `enumerate`/`InjectionPoint`/`Location`, `crawl`/`normalize_url`/`block_on`,
   `egress_handle`, and the `aitm-poc`/`aitm-findings` seams.
@@ -199,33 +228,101 @@ ScanStatus cmds) → T13 (both-paths e2e).
 
 ### Task 4: reproduce + record (`reproduce.rs`) — Wave 2, independent
 
-- **Satisfies:** AC10 (build/record half), AC11 (record redaction).
-- **Depends on:** Task 2 (`CheckDefinition`).
+- **Satisfies:** AC10 (build, reproduce and record), AC11 (record redaction), AC22
+  (one record per reproduction), AC24 (no credential persisted by reproduction).
+  *(Amended 2026-10-30; the earlier text recorded `control_passed: Some(false)` from a
+  production control run, which cannot exist, and was silent on how the PoC is run.)*
+- **Depends on:** Task 2 (`CheckDefinition`). Independent of Task 5: every function
+  here takes the attack `HttpFlow` by reference, not T5's `Confirmed`.
 - **Files:** `crates/aitm-plugin-scanner/src/reproduce.rs` (create), `lib.rs` (modify).
+  Nothing else: every `CommandHost` accessor the narrowed host needs already exists
+  (`crates/aitm-core/src/ctx.rs` :226-281), so there is no `aitm-core` edit. The
+  scanner crate already depends on `aitm-poc` and `aitm-findings`.
 - **Change:**
   ```rust
-  pub fn build_poc(flow: &aitm_core::HttpFlow, def: &crate::checks::CheckDefinition,
+  pub fn build_poc(attack_flow: &aitm_core::HttpFlow,
+      def: &crate::checks::CheckDefinition,
       point: &crate::discover::InjectionPoint, payload: &crate::checks::Payload)
       -> anyhow::Result<aitm_poc::Poc>;
+  pub fn narrowed_host<'a>(host: &'a aitm_core::CommandHost<'_>)
+      -> aitm_core::CommandHost<'a>;
+  pub async fn reproduce(host: &aitm_core::CommandHost<'_>, poc: &aitm_poc::Poc,
+      attack_flow: &aitm_core::HttpFlow) -> anyhow::Result<aitm_poc::PocRunResult>;
+  pub fn finding_record(host: &aitm_core::CommandHost<'_>,
+      def: &crate::checks::CheckDefinition, target: &str, poc: &aitm_poc::Poc,
+      run: &aitm_poc::PocRunResult) -> aitm_findings::FindingRecord;
   pub fn record_finding(host: &aitm_core::CommandHost<'_>,
       rec: aitm_findings::FindingRecord) -> anyhow::Result<String>;
   ```
-  `build_poc` assembles `aitm_poc::PocSpec { info: PocInfo{ name, severity, .. },
-  variables, success }` where `success` is `def`'s confirming `Assertion`, then
-  `aitm_poc::StdPocBuilder::default().build(flow, spec)`. `record_finding`
-  constructs `DiskFindingStore::new(dir)` from the configured `findings.dir` and
-  calls `FindingStore::record(rec)` (empty dir → `Ok` no-op id or an explicit
-  `bail!`, builder's call); it never copies a param value or raw header into
-  `rec.title`/`rec.notes`.
-- **Test:** `build_poc_sets_success_assertion` builds a PoC for `reflected_xss()`
-  and asserts `poc.success` is the class's confirming `Assertion` and the step URL
-  is parameterized to a `{{target}}` variable (round-trips via `aitm_poc` serde).
-  `record_round_trips` writes a `FindingRecord` with `reproduction { passed: true,
-  control_passed: Some(false), .. }` to a temp dir and asserts `FindingStore::get`
-  returns it with those fields. `record_redacts_secret` records a finding whose
-  source flow carried `Authorization: Bearer abc123` and asserts the stored
-  record's `title`/`notes` contain no `abc123`.
-- **Done when:** the three tests pass and the full gate passes.
+  - `build_poc` is fed the **attack flow** (the replay flow `client().send` returned
+    for the confirming request), not the benign source flow: the builder
+    parameterizes the concrete URL pieces of the flow it is given, and only the attack
+    flow contains the payload. It assembles `aitm_poc::PocSpec { info: PocInfo{ name,
+    severity, .. }, variables, success }` where `success` is `def`'s confirming
+    `Assertion` (`CheckDefinition::success_assertion`, `pub(crate)`), then
+    `aitm_poc::StdPocBuilder::default().build(attack_flow, spec)`. `PocInfo.severity`
+    comes from a class-to-severity mapping local to this file (the shipped
+    `CheckDefinition` has no severity field; do not add one). The poc `name` carries
+    the class and the param **name**, never a param value.
+  - `narrowed_host` rebuilds a `CommandHost` from `host.store()`, `host.client()`,
+    `host.guard()`, `host.browser()` and carries `frontend()`, `ssrf_policy()`,
+    `poc_dir()`, `client_label()` and `egress_handle()`, but attaches **no finding
+    recorder and no `Config`** (`config()` only yields `&Config`, and the runner reads
+    `findings.dir` only through it, so either omission silences the runner's
+    auto-record at `crates/aitm-poc/src/runner.rs` :466-510).
+  - `reproduce` runs `poc` through `aitm_poc::StdPocRunner` (trait `PocRunner`) on
+    `narrowed_host(host)`, output directory chosen as `run_poc_command` chooses it
+    (`host.config()` `poc.out_dir`, else the temp dir; `runner.rs` :1152-1155). It
+    sends exactly one more request. Bindings: `target` = the attack flow's
+    `scheme://authority`; for each required, default-less credential variable the
+    builder introduced (`cookie`, `authorization`, `proxy_authorization`,
+    `x_api_key`), the matching request-header value from `attack_flow`, bound **in
+    memory only** (an unbound placeholder fails the run with "unknown variable",
+    `crates/aitm-poc/src/template.rs` :115-119). It does **not** apply the
+    `poc.allow_agent_run` gate (that lives in `run_poc_command`, :1106-1117; the PoC is
+    scanner-built and HTTP-only, and the caller's `scanner.allow_agent_active` already
+    governs this phase).
+  - `finding_record` builds the `FindingRecord` directly: `class = def.class`,
+    `severity` from the same mapping, `title = poc.info.name`, `target` through
+    `scrub_text`, `origin = host.frontend()`, `client_label`, `poc_ref = poc.id`,
+    `reproduction { passed: run.passed, control_passed: None, run_at: now }`,
+    `artifacts` and `flows` from `run`, `notes: None`. `control_passed` is **always
+    `None`** here: a real target has no patched control (`DiskFindingRecorder`
+    hard-codes the same, `crates/aitm-findings/src/recorder.rs` :42).
+  - `record_finding` constructs `DiskFindingStore::new(dir)` from the configured
+    `findings.dir` and calls `FindingStore::record(rec)` (empty dir → `Ok` no-op id or
+    an explicit `bail!`, builder's call). It must **never** call
+    `host.finding_recorder()`.
+- **Test** (hermetic; stub `ProxyClient` that returns a flow whose body reflects the
+  marker and inserts it in the store; temp dir for `findings.dir`; a counting
+  `aitm_core::FindingRecorder` stub):
+  - `build_poc_sets_success_assertion` builds a PoC for `reflected_xss()` from an
+    attack flow whose URL carries the marker, and asserts `poc.success ==
+    def.success_assertion(&payload)` and the single `Step::Http` URL starts with
+    `{{target}}`.
+  - `reproduce_does_not_auto_record`: outer host built with
+    `.with_config(findings.dir = tmp)` **and** `.with_finding_recorder(&counting)`;
+    after `reproduce(..)` assert `run.passed == true`, `run.recorded_id == None`, and
+    `counting.calls() == 0`.
+  - `reproduce_then_record_writes_one_record`: same setup, then
+    `record_finding(&host, finding_record(..))`; assert
+    `DiskFindingStore::new(tmp).list(&FindingFilter::default()).len() == 1` and
+    `counting.calls() == 0` (AC22).
+  - `record_has_no_control`: `FindingStore::get(id)` returns `reproduction.passed ==
+    true`, `reproduction.control_passed == None`, `class == "reflected-xss"`.
+  - `record_keeps_failed_reproduction`: `finding_record(..)` over a `PocRunResult`
+    with `passed: false` returns a record with `reproduction.passed == false` and
+    `reproduction.control_passed == None` (a run that does not pass is recorded
+    truthfully, not dropped).
+  - `reproduce_binds_credentials_in_memory`: an attack flow carrying `Authorization:
+    Bearer abc123` and `Cookie: PHPSESSID=abc123`: assert `run.passed == true`, and
+    the file at `run.poc_path` contains `{{authorization}}` and `{{cookie}}` and does
+    not contain `abc123` (AC24).
+  - `record_redacts_secret`: an attack flow with `Authorization: Bearer abc123` and a
+    target `http://t.test/?access_token=abc123`; assert the stored record's `title`,
+    `notes` and `target` contain no `abc123`.
+- **Done when:** the seven tests pass (each shown failing first) and the full gate
+  passes.
 
 ### Task 5: injector + correlator engine (`inject.rs`) — Wave 2, independent
 
@@ -237,7 +334,8 @@ ScanStatus cmds) → T13 (both-paths e2e).
   pub struct InjectOutcome { pub class: String, pub tested: usize,
       pub confirmed: Vec<Confirmed>, pub stopped_reason: Option<String> }
   pub struct Confirmed { pub injection_point: crate::discover::InjectionPoint,
-      pub payload: String, pub evidence: String }
+      pub payload: String, pub evidence: String,
+      pub attack_flow: aitm_core::FlowId }
   pub async fn inject(host: &aitm_core::CommandHost<'_>, target: &str,
       def: &crate::checks::CheckDefinition,
       points: &[crate::discover::InjectionPoint], budget: &mut usize,
@@ -248,12 +346,17 @@ ScanStatus cmds) → T13 (both-paths e2e).
   payload (batteringram, ≤ `per_class_payload_cap`): craft the mutated
   `HttpRequest` (mutate only the one targeted `Location`), `host.client().send(req)`
   (the guarded chokepoint — inserts the replay flow), build a `MatchContext` from
-  the response, call `def.confirm`, push `Confirmed` on a hit. Decrement `budget`
-  per send; at 0 stop with `stopped_reason = Some("budget")`.
+  the response, call `def.confirm`, push `Confirmed` on a hit with `attack_flow` set
+  to the id of the flow `send` returned (Task 4's `build_poc` needs the request that
+  carried the payload, not the benign source flow; amended 2026-10-30). Decrement
+  `budget` per send; at 0 stop with `stopped_reason = Some("budget")`. Reproduction
+  requests are not issued here; the caller decrements `budget` for each one.
 - **Test** (hermetic, stub `ProxyClient`): `inject_confirms_on_vulnerable` — a stub
   client that reflects the payload marker in the body — asserts `confirmed` is
-  non-empty. `inject_empty_on_patched` — a stub that HTML-escapes/omits the marker
-  — asserts `confirmed` is empty. `inject_stops_at_budget` with `budget == 1`
+  non-empty and that `confirmed[0].attack_flow` equals the id of the flow the stub
+  returned for that request (the stub inserts the flow it returns, as
+  `PipelineClient::send` does). `inject_empty_on_patched` — a stub that
+  HTML-escapes/omits the marker — asserts `confirmed` is empty. `inject_stops_at_budget` with `budget == 1`
   asserts `tested == 1` and `stopped_reason == Some("budget")`.
   `inject_out_of_scope_refused` with an empty-scope guard asserts the error
   downcasts to `GuardError::OutOfScope`.
@@ -261,12 +364,23 @@ ScanStatus cmds) → T13 (both-paths e2e).
 
 ### Task 8: `scan.inject` command + the agent gate + confinement — Wave 4, serial (chain #3)
 
-- **Satisfies:** AC5, AC7, AC8, AC9, AC10, AC11, AC12, AC13, AC18 (partial).
+- **Satisfies:** AC5, AC7, AC8, AC9, AC10, AC11, AC12, AC13, AC18 (partial), AC21
+  (the `scan.inject` half), AC22, AC24, AC25. *(AC21-AC25 and the reproduce/record
+  half of AC10 added or amended 2026-10-30.)*
 - **Depends on:** Tasks 4, 5; **Task 7** (shares `commands.rs`/`plugin.rs`/`frontends.rs`).
 - **Files:** `crates/aitm-plugin-scanner/src/commands.rs` (modify — add
   `ScanInject`), `plugin.rs` (modify — register with `self.cfg.clone()`),
   `crates/aitm/tests/frontends.rs` (modify — `EXPECTED_TOOLS` 58 → 59, add
-  `"scan.inject"`; update any confirmable-tools list that fails).
+  `"scan.inject"`; update any confirmable-tools list that fails),
+  `crates/aitm-mcp/src/server.rs` (modify — add the one arm `"scan.inject"` to the
+  `defers_to_command_gate` match, with a comment naming `scanner.allow_agent_active`,
+  beside the `scope.add`/`l4.*` arms; Correction 2),
+  `crates/aitm-mcp/tests/mcp.rs` (modify — add a `Sensitive` stub named `scan.inject`
+  to `policy_server`, plus the policy test below),
+  `crates/aitm/tests/scan_agent_gate.rs` (create — the real-command policy test;
+  Task 10 extends it, serially). **Shared-file note:** `server.rs`, `mcp.rs` and
+  `scan_agent_gate.rs` are touched here and again by Task 10; they are why those two
+  tasks must stay serial.
 - **Change:** `ScanInject { cfg: ScannerConfig }` impl `Command`:
   `name()=="scan.inject"`, `sensitivity()==Sensitivity::Sensitive`,
   `schema()` with required `target: Str`, `class: Str`, optional `injection_point`.
@@ -277,12 +391,22 @@ ScanStatus cmds) → T13 (both-paths e2e).
   3. `let def = CheckDefinition::for_class(class).ok_or_else(..)?;` enumerate points
      from store flows for `target`; `let mut budget = self.cfg.request_budget;`
      `block_on(inject(host, target, &def, &points, &mut budget, &self.cfg))`.
-  4. For each `Confirmed`: `build_poc` + record via `reproduce::record_finding`
-     (vulnerable `passed`; patched `control_passed` best-effort) → collect
-     `finding_ids`.
+  4. For each `Confirmed` (amended 2026-10-30): if the remaining `budget` is `0`,
+     skip reproduction (the confirmation stays in `confirmed`, gets no finding id, and
+     `stopped_reason` becomes `Some("budget")`); otherwise decrement `budget` by one
+     and run, in order, `host.store().get(confirmed.attack_flow)` →
+     `reproduce::build_poc` → `block_on(reproduce::reproduce(host, &poc, &attack_flow))`
+     → `reproduce::finding_record(..)` → `reproduce::record_finding(host, rec)`; push
+     the returned id onto `finding_ids`. There is **no** patched-control run and the
+     command never calls `host.finding_recorder()`; the record's `control_passed` is
+     `None` (spec "Reproduce → record").
   5. Return `Value::Object { class, tested, confirmed[{injection_point{flow,
      location,name}, payload, evidence}], finding_ids, stopped_reason }`, scrubbed.
   `confirm_prompt` returns `Some(..)`.
+  6. Policy layer (Correction 2): in `crates/aitm-mcp/src/server.rs`, add
+     `"scan.inject"` to `defers_to_command_gate`. Default for the spec's Open
+     question 6; if Matt answers "leave them out", omit this arm and flip the `All`
+     arms of the two policy tests below.
 - **Test:** `scan_inject_is_sensitive` asserts `sensitivity() == Sensitive`.
   `scan_inject_confirm_prompt_some` asserts `confirm_prompt(args).is_some()`.
   `agent_refused_without_flag` builds the host with `Frontend::Mcp` and
@@ -296,6 +420,39 @@ ScanStatus cmds) → T13 (both-paths e2e).
   asserts `confined()` was true during the send and false after `invoke` returns
   (AC9). `inject_result_redacts` asserts no `abc123` from an `Authorization` source
   flow in the result (AC11).
+  Added 2026-10-30 (each shown failing first):
+  - `inject_records_one_finding_without_control` (AC10, AC22): a reflecting stub,
+    `findings.dir` set to a temp dir, a counting `FindingRecorder` wired on the host;
+    assert `finding_ids.len()` equals the number of records in
+    `DiskFindingStore::list(&FindingFilter::default())` and is `>= 1`, every stored
+    record has `reproduction.passed == true` and `reproduction.control_passed ==
+    None`, and `counting.calls() == 0`.
+  - `inject_budget_exhausted_skips_reproduction` (AC25): `request_budget == 1` with a
+    reflecting stub; assert `confirmed` is non-empty, `finding_ids` is empty,
+    `stopped_reason == Some("budget")`, and the stub saw exactly `1` request.
+  - `inject_poc_file_has_no_credential` (AC24): a source flow with `Authorization:
+    Bearer abc123`; read the YAML at the recorded `artifacts.poc_path`; assert it
+    contains `{{authorization}}` and not `abc123`.
+  - `all_policy_defers_scan_inject_to_its_gate` in `crates/aitm-mcp/tests/mcp.rs`
+    (AC21, membership): add `GatedCmd { name: "scan.inject", gate: |_| true }` to
+    `policy_server`; with a config supplied (as `f8_script_authoring_not_auto_authorized_under_all`
+    does), assert `!is_refused(call_as(&all, Frontend::Mcp, "scan.inject"))` under
+    `AgentPolicy::All` and `is_refused(..)` under `AgentPolicy::Auto`. This is the
+    repository's convention for proving an allow-list entry by name
+    (`all_sensitive_honors_config_gate`, mcp.rs :1480-1506, with `script.save` as the
+    negative control, :1255-1258); `aitm-mcp` has no scanner dependency, so a stub is
+    the right level.
+  - `scan_inject_policy_layers` in `crates/aitm/tests/scan_agent_gate.rs` (AC21, real
+    command, like `crates/aitm/tests/l4_operator_surfaces.rs`): a `Registry` with
+    `ScannerPlugin::new(ScannerConfig { allow_agent_active, .. })`, an `McpServer`
+    over stub services; (a) `AgentPolicy::All`, flag `false`, role `Frontend::Mcp`,
+    `scan.inject {target, class}` → `isError == true`, text contains
+    `scanner.allow_agent_active` and does **not** contain `not allowed to the agent
+    under` (it reached the command's own gate); (b) `AgentPolicy::Auto`, flag `true`
+    → text contains ``the agent policy is `auto` `` (refused by policy); (c) role
+    `Frontend::Cli`, flag `false` → text contains neither string (a `Cli` connection
+    is never policy-refused; use `Cli`, not `Operator`, because an `Operator`
+    connection gets the confirm handshake first, `server.rs` :1402).
 - **Done when:** all tests pass, the `frontends.rs` contract passes, the full gate
   passes.
 
@@ -336,12 +493,20 @@ ScanStatus cmds) → T13 (both-paths e2e).
 
 ### Task 10: `scan.run` + `scan.status` commands — Wave 4, serial (chain #4)
 
-- **Satisfies:** AC14, AC15, AC16, AC17, AC18 (final contract).
-- **Depends on:** Task 9; **Task 8** (shares `commands.rs`/`plugin.rs`/`frontends.rs`).
+- **Satisfies:** AC14, AC15, AC16, AC17, AC18 (final contract), AC21 (the `scan.run`
+  half; added 2026-10-30).
+- **Depends on:** Task 9; **Task 8** (shares `commands.rs`/`plugin.rs`/`frontends.rs`,
+  and now `crates/aitm-mcp/src/server.rs`, `crates/aitm-mcp/tests/mcp.rs` and
+  `crates/aitm/tests/scan_agent_gate.rs`, which Task 8 created).
 - **Files:** `crates/aitm-plugin-scanner/src/commands.rs` (modify — add `ScanRun`,
   `ScanStatus`), `plugin.rs` (modify — register both; hold the status snapshot),
   `crates/aitm/tests/frontends.rs` (modify — `EXPECTED_TOOLS` 59 → 61, add
-  `"scan.run"`, `"scan.status"`).
+  `"scan.run"`, `"scan.status"`),
+  `crates/aitm-mcp/src/server.rs` (modify — add the one arm `"scan.run"` to the
+  `defers_to_command_gate` match, next to Task 8's `"scan.inject"`),
+  `crates/aitm-mcp/tests/mcp.rs` (modify — add a `Sensitive` stub named `scan.run` to
+  `policy_server` and the policy test below),
+  `crates/aitm/tests/scan_agent_gate.rs` (modify — add the `scan.run` arms).
 - **Change:** `ScanRun { cfg: ScannerConfig, status: Arc<Mutex<Option<CampaignSummary>>> }`
   impl `Command`: `name()=="scan.run"`, `sensitivity()==Sensitive`, same agent gate
   + `confirm_prompt` as `ScanInject`, `schema()` required `target`, optional
@@ -353,7 +518,11 @@ ScanStatus cmds) → T13 (both-paths e2e).
   `Value::Object { run_id, phase, pages_crawled, requests_used, request_budget,
   confirmed_count, stopped_reason }` from the snapshot (or `Null`s when none). The
   shared `status` `Arc` is owned by `ScannerPlugin` and cloned into both commands in
-  `load()`.
+  `load()`. Policy layer (Correction 2): add `"scan.run"` to `defers_to_command_gate`
+  in `crates/aitm-mcp/src/server.rs` (default for the spec's Open question 6; same
+  fallback as Task 8). `scan.run`'s inject phase already reproduces and records through
+  Task 4's functions (Task 9 / the global "Reproduce + record" constraint), so this
+  task adds no recording code.
 - **Test:** `scan_run_is_sensitive_and_gated` asserts `sensitivity() == Sensitive`
   and the agent refusal without the flag (error names `scanner.allow_agent_active`).
   `scan_run_confined` asserts `confined()` during the run, released after (AC15).
@@ -361,6 +530,17 @@ ScanStatus cmds) → T13 (both-paths e2e).
   `stopped_reason == "budget"` (AC16). `scan_status_is_read` asserts
   `sensitivity() == Read`; `scan_status_reflects_last_run` runs `scan.run` then
   `scan.status` and asserts the status `run_id` matches the run's.
+  Added 2026-10-30 (each shown failing first):
+  - `all_policy_defers_scan_run_to_its_gate` in `crates/aitm-mcp/tests/mcp.rs` (AC21,
+    membership): `GatedCmd { name: "scan.run", gate: |_| true }` in `policy_server`;
+    with a config supplied, `!is_refused(..)` for `Frontend::Mcp` under
+    `AgentPolicy::All` and `is_refused(..)` under `AgentPolicy::Auto`.
+  - `scan_run_policy_layers` in `crates/aitm/tests/scan_agent_gate.rs` (AC21, real
+    command): the same three arms as Task 8's `scan_inject_policy_layers`, for
+    `scan.run {target}`: `All` + flag `false` + `Frontend::Mcp` → text contains
+    `scanner.allow_agent_active` and not `not allowed to the agent under`; `Auto` +
+    flag `true` → text contains ``the agent policy is `auto` ``; `Frontend::Cli` →
+    neither string.
 - **Done when:** tests pass, the `frontends.rs` contract passes (`[&str; 61]`),
   the full gate passes.
 
@@ -383,7 +563,8 @@ ScanStatus cmds) → T13 (both-paths e2e).
 
 ### Task 12: inject live e2e (vulnerable vs patched) — Wave 5, independent
 
-- **Satisfies:** AC6, AC8, AC10 (end-to-end).
+- **Satisfies:** AC6, AC8, AC10 (end-to-end), AC22 (end-to-end), AC23.
+  *(AC22/AC23 and the `control_passed == None` assertion amended 2026-10-30.)*
 - **Depends on:** Task 8.
 - **Files:** `crates/aitm/tests/inject_e2e.rs` (create — lives in the `aitm`
   integration-test crate, beside `discover_e2e.rs`, to reach `aitm::wire::assemble`
@@ -393,10 +574,18 @@ ScanStatus cmds) → T13 (both-paths e2e).
   through the assembled proxy's `PipelineClient` (no browser → **not**
   obscura-gated; it binds a loopback port, which the real gate/Terminal panel
   allows).
-- **Test:** `inject_confirms_vulnerable_only` asserts `confirmed` is non-empty
-  against vulnerable and empty against patched, and a `FindingRecord` exists with
-  `reproduction.passed == true` / `control_passed == Some(false)`.
-  `inject_e2e_out_of_scope` asserts an unscoped target refuses with
+  The harness configures `findings.dir` to a temp dir. The vulnerable-versus-patched
+  proof is **two separate `scan.inject` calls**, one per `SeedMode`; production code
+  runs no patched-control request (Correction 3).
+- **Test:** `inject_confirms_vulnerable_only`: the call against the vulnerable base
+  asserts `confirmed` non-empty, `finding_ids` non-empty, and every stored
+  `FindingRecord` has `reproduction.passed == true` and `reproduction.control_passed
+  == None`; the call against the patched base asserts `confirmed` empty,
+  `finding_ids` empty, and no stored record whose `target` is the patched base.
+  `inject_e2e_does_not_double_record`: with the real `aitm_findings::DiskFindingRecorder`
+  wired onto the host as `crates/aitm/src/main.rs` :301 wires it, one vulnerable call
+  leaves the findings store holding exactly `finding_ids.len()` records (never twice
+  that). `inject_e2e_out_of_scope` asserts an unscoped target refuses with
   `GuardError::OutOfScope`.
 - **Done when:** the tests pass (loopback bind) and the full gate passes.
 
@@ -438,10 +627,20 @@ ScanStatus cmds) → T13 (both-paths e2e).
 | Wave | Tasks | Parallel? | Shared-file bottleneck |
 |---|---|---|---|
 | 1 | T1 `passive.rs`, T2 `checks.rs`, T3 `report.rs` | fully independent | none (distinct new files; each also touches `lib.rs` re-export — **coordinate the `lib.rs` edits or serialize the one-line re-export adds**) |
-| 2 | T4 `reproduce.rs`, T5 `inject.rs` | independent of each other | `lib.rs` re-export only |
+| 2 | T4 `reproduce.rs`, T5 `inject.rs` | independent of each other (T4 takes the attack `HttpFlow`, T5 emits its id in `Confirmed.attack_flow`) | `lib.rs` re-export only |
 | 3 | T6 `ScanPassive` → T7 `ScanReport`; T9 `campaign.rs` | T9 ∥ (T6→T7) | T6,T7 share `commands.rs`/`plugin.rs`/`frontends.rs` → **serial** |
-| 4 | T8 `ScanInject` → T10 `ScanRun`+`ScanStatus` | serial | share `commands.rs`/`plugin.rs`/`frontends.rs` |
+| 4 | T8 `ScanInject` → T10 `ScanRun`+`ScanStatus` | serial | share `commands.rs`/`plugin.rs`/`frontends.rs`, and (amended 2026-10-30) **`crates/aitm-mcp/src/server.rs`, `crates/aitm-mcp/tests/mcp.rs`, `crates/aitm/tests/scan_agent_gate.rs`** (T8 adds `scan.inject`'s arm/stub/test; T10 adds `scan.run`'s) |
 | 5 | T11, T12, T13, T14 | fully independent | distinct test/doc files |
+
+**Production files outside `crates/aitm-plugin-scanner` that more than one task
+touches** (amended 2026-10-30): `crates/aitm/tests/frontends.rs` (T6, T7, T8, T10 — the
+`EXPECTED_TOOLS` bump) and `crates/aitm-mcp/src/server.rs` + `crates/aitm-mcp/tests/mcp.rs`
+(T8, T10 — one `defers_to_command_gate` arm and one stub/test each). Every one of those
+tasks is already in the serial command chain, so no two writers share a file. The
+`aitm-mcp` half of T8/T10 is scanner-independent and separable (see the Wave 4
+bullet); it must merge before the integration plan's Task 8, whose
+`scan_inject_gate_is_wired_default_off` test cannot pass without the `scan.inject`
+entry.
 
 **Note on `lib.rs`:** T1–T5 and T9 each add a one-line `pub use`/`pub mod` to
 `lib.rs`. To keep two writers off one file, either (a) land a tiny pre-task that
