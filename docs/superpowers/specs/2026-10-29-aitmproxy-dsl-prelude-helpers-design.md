@@ -251,9 +251,11 @@ plugin-system plan's unbuilt "Task 12") remains out of scope and is unaffected.
    `tests/api_catalog.rs::catalog_matches_engine_host_surface` passes (engine ≡
    catalogue, both directions). No bespoke `dsl` drift test is added.
 6. **AC6** — The node golden `docs/design/languages/validate.test.mjs` passes
-   unchanged; `rhai.api.json` is edited **only** to remove `"status": "planned"`
-   from the ten `dsl` entries (names, signatures, order, and structure
-   unchanged).
+   unchanged; `rhai.api.json` is edited **only** to (a) remove `"status":
+   "planned"` from the ten `dsl` entries and (b) correct each entry's now-false
+   "not yet registered" `description` to a short accurate one. Names,
+   signatures, and order are unchanged; the golden checks description *shape*
+   (non-empty), not content, so it stays green.
 7. **AC7** — `aitm_poc::dsl::rand_int(a, b)` exists, is `pub`, returns a value in
    `[a, b]`, uses the module's existing thread-local RNG, and `rand_int(7, 7) == 7`.
 8. **AC8** — Parity: `url_encode`, the base64 alphabet, and the
