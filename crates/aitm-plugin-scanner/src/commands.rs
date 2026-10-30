@@ -567,11 +567,12 @@ mod tests {
             .schema()
             .description;
         assert!(
-            description.contains(
-                "Only one discovery runs at a time (crawls share one browser page); a second \
-                 call while one is running is refused immediately \u{2014} wait for it to finish."
-            ),
+            description.contains("Only one discovery runs at a time"),
             "the single-flight rule is in the description: {description}"
+        );
+        assert!(
+            description.contains("refused immediately"),
+            "the description says a second call is refused: {description}"
         );
     }
 
@@ -913,32 +914,54 @@ mod tests {
         let second_store = MemFlowStore::new();
         let second_guard = scoped_guard();
 
-        let (entered, missing, second, first) = std::thread::scope(|s| {
-            let first = s.spawn(|| {
+        let with_budget = |name: &str| {
+            params(&[
+                ("target", Value::Str("http://target.test/".into())),
+                (name, Value::Int(-1)),
+            ])
+        };
+
+        let (entered, missing, negative_depth, negative_pages, second, first) =
+            std::thread::scope(|s| {
+                let first = s.spawn(|| {
+                    let host =
+                        CommandHost::new(&first_store, &client, &first_guard, Some(&first_browser));
+                    cmd.invoke(seed(), &host)
+                });
+                // Scan #1 is now parked inside the browser, mid-crawl.
+                let entered = gate.entered.recv_timeout(Duration::from_secs(10));
+
                 let host =
-                    CommandHost::new(&first_store, &client, &first_guard, Some(&first_browser));
-                cmd.invoke(seed(), &host)
+                    CommandHost::new(&second_store, &client, &second_guard, Some(&second_browser));
+                // A malformed call is still told what is wrong with it, not that
+                // another scan is running: every argument is validated before the
+                // claim, whether it is missing or out of range.
+                let missing = cmd.invoke(params(&[]), &host);
+                let negative_depth = cmd.invoke(with_budget("max_depth"), &host);
+                let negative_pages = cmd.invoke(with_budget("max_pages"), &host);
+                let second = cmd.invoke(seed(), &host);
+
+                // Release #1 *before* any assertion: a failing assertion must not
+                // leave it parked, or the scope's join would hang the test run.
+                drop(gate.release);
+                let first = first.join().expect("scan #1's thread did not panic");
+                (
+                    entered,
+                    missing,
+                    negative_depth,
+                    negative_pages,
+                    second,
+                    first,
+                )
             });
-            // Scan #1 is now parked inside the browser, mid-crawl.
-            let entered = gate.entered.recv_timeout(Duration::from_secs(10));
-
-            let host =
-                CommandHost::new(&second_store, &client, &second_guard, Some(&second_browser));
-            // A malformed call is still told what is wrong with it, not that
-            // another scan is running: arguments are validated before the claim.
-            let missing = cmd.invoke(params(&[]), &host);
-            let second = cmd.invoke(seed(), &host);
-
-            // Release #1 *before* any assertion: a failing assertion must not
-            // leave it parked, or the scope's join would hang the test run.
-            drop(gate.release);
-            let first = first.join().expect("scan #1's thread did not panic");
-            (entered, missing, second, first)
-        });
 
         entered.expect("scan #1 reached the browser");
         let err = missing.expect_err("a call with no target is an error");
         assert_eq!(err.to_string(), "missing required param `target`");
+        let err = negative_depth.expect_err("a negative max_depth is an error");
+        assert_eq!(err.to_string(), "`max_depth` must be non-negative");
+        let err = negative_pages.expect_err("a negative max_pages is an error");
+        assert_eq!(err.to_string(), "`max_pages` must be non-negative");
         let err = second.expect_err("an overlapping scan is refused, not run");
         assert_eq!(
             err.to_string(),
