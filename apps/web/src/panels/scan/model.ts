@@ -23,11 +23,17 @@ export interface ScanResult {
 
 const asString = (v: unknown): string => (typeof v === 'string' ? v : '');
 
+// Match the engine's MAX_RESULT_ITEMS (crates/aitm-plugin-scanner): bound the rows we
+// allocate/render so a drifted backend contract can't jank the tab with a huge payload.
+const MAX_RESULT_ROWS = 1024;
+
 export function parseScanResult(raw: unknown): ScanResult {
   const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
-  const endpoints = Array.isArray(r.endpoints) ? r.endpoints.filter((e): e is string => typeof e === 'string') : [];
+  const endpoints = Array.isArray(r.endpoints)
+    ? r.endpoints.slice(0, MAX_RESULT_ROWS).filter((e): e is string => typeof e === 'string')
+    : [];
   const injectionPoints = Array.isArray(r.injection_points)
-    ? r.injection_points.map((p): InjectionPointRow => {
+    ? r.injection_points.slice(0, MAX_RESULT_ROWS).map((p): InjectionPointRow => {
         const o = (p && typeof p === 'object' ? p : {}) as Record<string, unknown>;
         return { flow: asString(o.flow), location: asString(o.location), name: asString(o.name), example: asString(o.example) };
       })

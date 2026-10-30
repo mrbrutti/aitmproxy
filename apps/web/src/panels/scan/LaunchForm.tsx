@@ -27,12 +27,13 @@ export const LaunchForm: Component<LaunchFormProps> = (props) => {
 
   // Build the form from the tool's inputSchema minus `target`: the target is scope-bound here, chosen
   // from the authorized hosts, never typed free-hand. The rest of the schema drives the form.
-  const formTool = createMemo<Pick<ToolDef, 'inputSchema'>>(() => {
-    const properties = { ...(props.tool.inputSchema.properties ?? {}) };
-    delete properties.target;
-    return { inputSchema: { ...props.tool.inputSchema, properties, required: (props.tool.inputSchema.required ?? []).filter((r) => r !== 'target') } };
-  });
-  const form = createFormState(formTool());
+  // Built once from the (stable) scan.discover schema minus `target`; not reactive by design.
+  const properties = { ...(props.tool.inputSchema.properties ?? {}) };
+  delete properties.target;
+  const formTool: Pick<ToolDef, 'inputSchema'> = {
+    inputSchema: { ...props.tool.inputSchema, properties, required: (props.tool.inputSchema.required ?? []).filter((r) => r !== 'target') },
+  };
+  const form = createFormState(formTool);
 
   const target = () => `${scheme()}://${host()}/`;
   const canLaunch = () => !props.running && host() !== '' && form.result().valid;
