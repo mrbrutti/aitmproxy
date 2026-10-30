@@ -18,6 +18,15 @@
 //! refuses an out-of-scope public host before dialing it; the hold is an RAII
 //! token released when the command returns.
 //!
+//! Single-flight: there is exactly one browser page, so two crawls running at
+//! once would interleave their navigations on it (each harvesting the other's
+//! pages, or losing its seed navigation to the other). `scan.discover` is
+//! therefore refused **immediately** while another discovery is running on the
+//! same command, before it takes an egress hold or touches the browser, and the
+//! next one runs normally as soon as the running one ends — on success, error,
+//! or unwind (the claim is an RAII token). Sequential scans need no browser
+//! reset between them.
+//!
 //! The result carries no credentials: [`crate::discover::enumerate`] replaces a
 //! secret-named point's example with a placeholder, and every free-text string
 //! that reaches the caller is additionally run through
@@ -25,6 +34,7 @@
 //! masked as well.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aitm_core::redact::scrub_text;
 use aitm_core::{
@@ -42,7 +52,45 @@ const MAX_RESULT_ITEMS: usize = 1024;
 /// `scan.discover` — list reachable in-scope URLs and the parameter names
 /// present in captured requests. Registered by [`crate::ScannerPlugin`].
 pub(crate) struct ScanDiscover {
-    pub(crate) cfg: ScannerConfig,
+    cfg: ScannerConfig,
+    /// Set while a discovery is running. The command is created once per
+    /// registry and shared (behind an `Arc`) by every frontend built over it, so
+    /// this one flag serializes every `scan.discover` that can reach the one
+    /// shared browser page.
+    in_flight: AtomicBool,
+}
+
+impl ScanDiscover {
+    pub(crate) fn new(cfg: ScannerConfig) -> Self {
+        Self {
+            cfg,
+            in_flight: AtomicBool::new(false),
+        }
+    }
+}
+
+/// The claim on [`ScanDiscover::in_flight`], held for the whole discovery. It
+/// releases the flag when dropped, so the slot is given back on success, on
+/// error, and on unwind alike.
+struct InFlightSlot<'a>(&'a AtomicBool);
+
+impl<'a> InFlightSlot<'a> {
+    /// Claim the slot, or `None` if a discovery already holds it. The slot is
+    /// built only on success (`map`, not an eagerly evaluated `then_some`): a
+    /// slot built on failure would clear the running scan's flag when dropped.
+    fn claim(flag: &'a AtomicBool) -> Option<Self> {
+        // A plain try-lock pairing (`Acquire` on a successful claim, `Release` in
+        // `Drop`); the flag guards no data, it only keeps a second crawl out.
+        flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self(flag))
+    }
+}
+
+impl Drop for InFlightSlot<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl Command for ScanDiscover {
@@ -67,7 +115,9 @@ impl Command for ScanDiscover {
                           the crawl with `stopped_reason = \"left_scope\"`. While the crawl runs \
                           the proxy's browser-egress posture is held confined, so the embedded \
                           browser cannot fetch an out-of-scope public host (sub-resource or \
-                          redirect target); the hold is released when the command returns."
+                          redirect target); the hold is released when the command returns. \
+                          Only one discovery runs at a time (crawls share one browser page); a second \
+                          call while one is running is refused immediately \u{2014} wait for it to finish."
                 .into(),
             params: vec![
                 ParamDef {
@@ -110,14 +160,20 @@ impl Command for ScanDiscover {
             cfg.max_pages = cfg.max_pages.min(requested);
         }
 
-        // Deny-by-default: the crawl gates the seed through the scope/rate
-        // guard before its first navigation (and the no-browser fallback takes
-        // one permit of its own), so an out-of-scope target returns
-        // `GuardError::OutOfScope` before anything is fetched. The gate lives in
-        // one place on purpose: a second `check_active` here for the same seed
-        // would spend a second rate token and a second concurrency slot, and
-        // with `max_concurrency == 1` would refuse the crawl's own permit.
-        //
+        // Single-flight: one browser page is shared by every crawl, so a second
+        // discovery running now would interleave its navigations with the running
+        // one. Refuse it here, after argument validation (a bad argument is still
+        // reported as such). `_slot` is claimed before `_confine` is taken, so a
+        // refused call returns before it does anything: no egress hold, no
+        // browser. Locals drop in reverse order, so on the way out the hold is
+        // released first and the slot last.
+        let Some(_slot) = InFlightSlot::claim(&self.in_flight) else {
+            anyhow::bail!(
+                "scan.discover is already running; wait for it to finish before starting \
+                 another (concurrent crawls share one browser page and would corrupt each other)"
+            );
+        };
+
         // S2: run the whole crawl under a campaign hold on the proxy's
         // browser-egress posture, so the `SsrfConnector` refuses any
         // out-of-scope public host the browser is sent to (a redirect, a
@@ -127,6 +183,14 @@ impl Command for ScanDiscover {
         // posture wired crawls unconfined, as before; the `left_scope` abort in
         // the crawl stays as defense-in-depth.
         let _confine = host.egress_handle().map(|e| e.confine());
+
+        // Deny-by-default: the crawl gates the seed through the scope/rate
+        // guard before its first navigation (and the no-browser fallback takes
+        // one permit of its own), so an out-of-scope target returns
+        // `GuardError::OutOfScope` before anything is fetched. The gate lives in
+        // one place on purpose: a second `check_active` here for the same seed
+        // would spend a second rate token and a second concurrency slot, and
+        // with `max_concurrency == 1` would refuse the crawl's own permit.
         let outcome = block_on(crawl(host, target, &cfg))?;
 
         // Enumerate injection points from the captured requests whose normalized
@@ -244,8 +308,10 @@ mod tests {
     };
     use futures::future::BoxFuture;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-    use std::sync::{Arc, Mutex};
-    use std::time::SystemTime;
+    use std::panic::AssertUnwindSafe;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::{Duration, SystemTime};
 
     /// A browser that serves one fixed page and, at every `navigate()`, records
     /// whether the shared egress posture was confined at that instant — the
@@ -277,6 +343,121 @@ mod tests {
                     .lock()
                     .expect("observed lock")
                     .push(self.posture.confined());
+                Ok(NavOutcome {
+                    final_url: url,
+                    status: Some(200),
+                })
+            })
+        }
+
+        fn click(&self, _target: ClickTarget) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { unimplemented!("the crawler never clicks") })
+        }
+
+        fn type_text(&self, _selector: &str, _text: &str) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { unimplemented!("the crawler never types") })
+        }
+
+        fn screenshot(&self) -> BoxFuture<'_, anyhow::Result<Vec<u8>>> {
+            Box::pin(async { unimplemented!("the crawler never screenshots") })
+        }
+
+        fn eval(&self, _expr: &str) -> BoxFuture<'_, anyhow::Result<Value>> {
+            Box::pin(async { unimplemented!("the crawler never evals") })
+        }
+
+        fn get_dom(&self) -> BoxFuture<'_, anyhow::Result<String>> {
+            Box::pin(async { Ok(r#"<a href="/one">one</a>"#.to_string()) })
+        }
+    }
+
+    /// The test's end of a gated [`GatedBrowser`].
+    struct Gate {
+        /// Receives one message every time the browser is navigated, so the test
+        /// can wait until a crawl is genuinely parked inside the browser.
+        entered: mpsc::Receiver<()>,
+        /// Dropping this releases every held navigation, and every later one.
+        release: mpsc::Sender<()>,
+    }
+
+    /// The browser's end of a [`Gate`]: it announces each navigation on `entered`,
+    /// then parks on `release`. Only the `Receiver` needs a `Mutex` to be `Sync`.
+    struct BrowserGate {
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    /// What a [`GatedBrowser`] does when it is navigated. A browser has exactly
+    /// one behaviour, so it cannot be both gated and panicking.
+    enum Behaviour {
+        /// Every navigation succeeds at once.
+        Open,
+        /// Every navigation panics, as a crashing driver would.
+        Panic,
+        /// Every navigation announces itself, then parks until the test releases it.
+        Gated(BrowserGate),
+    }
+
+    /// A browser for the single-flight tests: it serves one fixed page
+    /// (`<a href="/one">`, so a crawl of the seed reaches the seed and `/one`),
+    /// counts the navigations it is asked for, and behaves as its [`Behaviour`]
+    /// says. Unrelated to `crawl.rs`'s `StubBrowser`, which serves crafted pages
+    /// per URL.
+    struct GatedBrowser {
+        navigations: AtomicUsize,
+        behaviour: Behaviour,
+    }
+
+    impl GatedBrowser {
+        fn new(behaviour: Behaviour) -> Self {
+            Self {
+                navigations: AtomicUsize::new(0),
+                behaviour,
+            }
+        }
+
+        fn open() -> Self {
+            Self::new(Behaviour::Open)
+        }
+
+        fn panicking() -> Self {
+            Self::new(Behaviour::Panic)
+        }
+
+        fn gated() -> (Self, Gate) {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let browser = Self::new(Behaviour::Gated(BrowserGate {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            }));
+            let gate = Gate {
+                entered: entered_rx,
+                release: release_tx,
+            };
+            (browser, gate)
+        }
+
+        fn navigations(&self) -> usize {
+            self.navigations.load(Ordering::SeqCst)
+        }
+    }
+
+    impl BrowserDriver for GatedBrowser {
+        fn navigate(&self, url: &str) -> BoxFuture<'_, anyhow::Result<NavOutcome>> {
+            let url = url.to_string();
+            Box::pin(async move {
+                self.navigations.fetch_add(1, Ordering::SeqCst);
+                match &self.behaviour {
+                    Behaviour::Open => {}
+                    Behaviour::Panic => panic!("the browser was told to panic mid-crawl"),
+                    Behaviour::Gated(gate) => {
+                        let _ = gate.entered.send(());
+                        // Parks this thread, deliberately: the crawl is "in flight"
+                        // until the test drops `Gate::release` (recv then errors).
+                        let _ = gate.release.lock().expect("release lock").recv();
+                    }
+                }
                 Ok(NavOutcome {
                     final_url: url,
                     status: Some(200),
@@ -566,9 +747,7 @@ mod tests {
                 store,
                 guard: scoped_guard(),
                 client: NoSendClient,
-                cmd: ScanDiscover {
-                    cfg: ScannerConfig::default(),
-                },
+                cmd: ScanDiscover::new(ScannerConfig::default()),
             }
         }
 
@@ -586,10 +765,25 @@ mod tests {
 
     #[test]
     fn scan_discover_is_write() {
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
         assert_eq!(cmd.sensitivity(), Sensitivity::Write);
+    }
+
+    /// The description MCP clients read says a second concurrent scan is refused,
+    /// so an agent knows to wait rather than retry.
+    #[test]
+    fn schema_description_says_only_one_discovery_runs_at_a_time() {
+        let description = ScanDiscover::new(ScannerConfig::default())
+            .schema()
+            .description;
+        assert!(
+            description.contains("Only one discovery runs at a time"),
+            "the single-flight rule is in the description: {description}"
+        );
+        assert!(
+            description.contains("refused immediately"),
+            "the description says a second call is refused: {description}"
+        );
     }
 
     #[test]
@@ -598,9 +792,7 @@ mod tests {
         let guard = StdGuard::default(); // empty scope: deny-by-default
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
 
         let err = cmd
             .invoke(
@@ -631,9 +823,7 @@ mod tests {
         let guard = scoped_guard();
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
 
         let result = cmd
             .invoke(
@@ -669,9 +859,7 @@ mod tests {
         let guard = scoped_guard();
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
 
         let result = cmd
             .invoke(
@@ -732,9 +920,7 @@ mod tests {
         });
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
 
         let result = cmd
             .invoke(
@@ -756,9 +942,7 @@ mod tests {
         let guard = scoped_guard();
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
 
         let result = cmd
             .invoke(
@@ -783,12 +967,10 @@ mod tests {
         let guard = scoped_guard();
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig {
-                max_pages: 2,
-                ..ScannerConfig::default()
-            },
-        };
+        let cmd = ScanDiscover::new(ScannerConfig {
+            max_pages: 2,
+            ..ScannerConfig::default()
+        });
 
         let result = cmd
             .invoke(
@@ -813,9 +995,7 @@ mod tests {
         let guard = scoped_guard();
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
 
         let err = cmd
             .invoke(
@@ -846,9 +1026,7 @@ mod tests {
         let client = NoSendClient;
         let host =
             CommandHost::new(&store, &client, &guard, Some(&browser)).with_egress(posture.clone());
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
         assert!(!posture.confined(), "fixture starts with the free posture");
 
         let result = cmd
@@ -887,9 +1065,7 @@ mod tests {
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
         assert!(host.egress_handle().is_none());
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
 
         let result = cmd
             .invoke(
@@ -911,9 +1087,7 @@ mod tests {
         });
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
+        let cmd = ScanDiscover::new(ScannerConfig::default());
 
         let err = cmd
             .invoke(
@@ -927,6 +1101,178 @@ mod tests {
         assert_eq!(
             err.downcast_ref::<GuardError>(),
             Some(&GuardError::OutOfScope("evil.com:80".into()))
+        );
+    }
+
+    /// The seed every single-flight test scans.
+    fn seed() -> Params {
+        params(&[("target", Value::Str("http://target.test/".into()))])
+    }
+
+    /// There is one browser page, shared by every crawl. Two scans at once would
+    /// interleave their navigations on it (one scan harvests the other's pages),
+    /// so a second `scan.discover` is refused up front — before it touches the
+    /// browser — and the one already running is unharmed.
+    #[test]
+    fn overlapping_scan_is_refused_without_touching_the_browser() {
+        let cmd = ScanDiscover::new(ScannerConfig::default());
+        let (first_browser, gate) = GatedBrowser::gated();
+        let second_browser = GatedBrowser::open();
+        let client = NoSendClient;
+        let first_store = MemFlowStore::new();
+        let first_guard = scoped_guard();
+        let second_store = MemFlowStore::new();
+        let second_guard = scoped_guard();
+
+        let with_budget = |name: &str| {
+            params(&[
+                ("target", Value::Str("http://target.test/".into())),
+                (name, Value::Int(-1)),
+            ])
+        };
+
+        let (entered, missing, negative_depth, negative_pages, second, first) =
+            std::thread::scope(|s| {
+                let first = s.spawn(|| {
+                    let host =
+                        CommandHost::new(&first_store, &client, &first_guard, Some(&first_browser));
+                    cmd.invoke(seed(), &host)
+                });
+                // Scan #1 is now parked inside the browser, mid-crawl.
+                let entered = gate.entered.recv_timeout(Duration::from_secs(10));
+
+                let host =
+                    CommandHost::new(&second_store, &client, &second_guard, Some(&second_browser));
+                // A malformed call is still told what is wrong with it, not that
+                // another scan is running: every argument is validated before the
+                // claim, whether it is missing or out of range.
+                let missing = cmd.invoke(params(&[]), &host);
+                let negative_depth = cmd.invoke(with_budget("max_depth"), &host);
+                let negative_pages = cmd.invoke(with_budget("max_pages"), &host);
+                let second = cmd.invoke(seed(), &host);
+
+                // Release #1 *before* any assertion: a failing assertion must not
+                // leave it parked, or the scope's join would hang the test run.
+                drop(gate.release);
+                let first = first.join().expect("scan #1's thread did not panic");
+                (
+                    entered,
+                    missing,
+                    negative_depth,
+                    negative_pages,
+                    second,
+                    first,
+                )
+            });
+
+        entered.expect("scan #1 reached the browser");
+        let err = missing.expect_err("a call with no target is an error");
+        assert_eq!(err.to_string(), "missing required param `target`");
+        let err = negative_depth.expect_err("a negative max_depth is an error");
+        assert_eq!(err.to_string(), "`max_depth` must be non-negative");
+        let err = negative_pages.expect_err("a negative max_pages is an error");
+        assert_eq!(err.to_string(), "`max_pages` must be non-negative");
+        let err = second.expect_err("an overlapping scan is refused, not run");
+        assert_eq!(
+            err.to_string(),
+            "scan.discover is already running; wait for it to finish before starting \
+             another (concurrent crawls share one browser page and would corrupt each other)"
+        );
+        assert_eq!(
+            second_browser.navigations(),
+            0,
+            "the refused scan must not touch the browser"
+        );
+
+        let first = first.expect("scan #1 is unharmed by the refused overlap");
+        assert_eq!(
+            endpoints_of(&first),
+            vec!["http://target.test/", "http://target.test/one"]
+        );
+        assert_eq!(first_browser.navigations(), 2);
+    }
+
+    /// The browser needs no reset between crawls: scans run one after another on
+    /// the same command each see the whole target, so single-flight must hold the
+    /// slot only while a scan is running.
+    #[test]
+    fn scan_runs_again_after_the_previous_one_finished() {
+        let cmd = ScanDiscover::new(ScannerConfig::default());
+        let browser = GatedBrowser::open();
+        let store = MemFlowStore::new();
+        let guard = scoped_guard();
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, Some(&browser));
+
+        for round in 1..=3 {
+            let result = cmd
+                .invoke(seed(), &host)
+                .unwrap_or_else(|err| panic!("scan #{round} must run: {err}"));
+            assert_eq!(
+                endpoints_of(&result),
+                vec!["http://target.test/", "http://target.test/one"],
+                "scan #{round} crawls the whole target"
+            );
+        }
+        assert_eq!(browser.navigations(), 6, "three scans, two pages each");
+    }
+
+    /// A scan that ends in an error must give the slot back: the next scan is
+    /// not refused as "already running".
+    #[test]
+    fn slot_is_released_when_a_scan_errors() {
+        let cmd = ScanDiscover::new(ScannerConfig::default());
+        let browser = GatedBrowser::open();
+        let store = MemFlowStore::new();
+        let guard = scoped_guard();
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, Some(&browser));
+
+        // An out-of-scope seed fails the crawl itself, after the slot is taken.
+        let err = cmd
+            .invoke(
+                params(&[("target", Value::Str("http://unscoped.example/".into()))]),
+                &host,
+            )
+            .expect_err("an out-of-scope target is refused");
+        assert_eq!(
+            err.downcast_ref::<GuardError>(),
+            Some(&GuardError::OutOfScope("unscoped.example:80".into()))
+        );
+
+        let result = cmd
+            .invoke(seed(), &host)
+            .expect("the failed scan released the slot");
+        assert_eq!(
+            endpoints_of(&result),
+            vec!["http://target.test/", "http://target.test/one"]
+        );
+    }
+
+    /// Nor may a scan that panics wedge the command: unwinding releases the slot.
+    #[test]
+    fn slot_is_released_when_a_scan_panics() {
+        let cmd = ScanDiscover::new(ScannerConfig::default());
+        let client = NoSendClient;
+
+        let panicking = GatedBrowser::panicking();
+        let store = MemFlowStore::new();
+        let guard = scoped_guard();
+        let host = CommandHost::new(&store, &client, &guard, Some(&panicking));
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| cmd.invoke(seed(), &host)));
+        assert!(outcome.is_err(), "the browser panicked mid-crawl");
+        assert_eq!(panicking.navigations(), 1);
+
+        let browser = GatedBrowser::open();
+        let store = MemFlowStore::new();
+        let guard = scoped_guard();
+        let host = CommandHost::new(&store, &client, &guard, Some(&browser));
+        let result = cmd
+            .invoke(seed(), &host)
+            .expect("the unwound scan released the slot");
+        assert_eq!(
+            endpoints_of(&result),
+            vec!["http://target.test/", "http://target.test/one"]
         );
     }
 
@@ -1095,15 +1441,13 @@ mod tests {
         let guard = scoped_guard();
         let client = NoSendClient;
         let host = CommandHost::new(&store, &client, &guard, None);
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig {
-                // The no-browser fallback lists at most `max_pages` endpoints;
-                // raise it so all 600 are reached and the point cap is the
-                // only bound in play.
-                max_pages: 2048,
-                ..ScannerConfig::default()
-            },
-        };
+        let cmd = ScanDiscover::new(ScannerConfig {
+            // The no-browser fallback lists at most `max_pages` endpoints;
+            // raise it so all 600 are reached and the point cap is the
+            // only bound in play.
+            max_pages: 2048,
+            ..ScannerConfig::default()
+        });
 
         let result = cmd
             .invoke(
