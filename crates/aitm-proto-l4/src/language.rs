@@ -625,10 +625,6 @@ impl PocStepHandler for L4StepHandler {
         NAMESPACE
     }
 
-    fn sources(&self) -> Vec<String> {
-        vec![PACKET_SOURCE.to_string()]
-    }
-
     fn run(
         &self,
         body: &serde_yaml::Value,
