@@ -171,6 +171,9 @@
     return strands;
   }
   function measure() {
+    /* colours must be read before the field is built — a ResizeObserver can fire before
+       begin() runs readColors(); building (and caching) strands then leaves them colourless */
+    if (!C.ink) return;
     var centerY = ch / 2, halfP = (panel ? panel.offsetWidth : Math.min(cw * 0.5, 520)) / 2;
     var x0 = Math.max(18, cw * 0.03), x1 = cw - x0, center = cw / 2;
     /* keep the plasma field stable when only the panel height changes (it does, each cycle,

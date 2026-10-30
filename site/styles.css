@@ -325,6 +325,32 @@ kbd.key { font-family: var(--mono); font-size: 0.75rem; border: 1px solid curren
 .proto-legend li.is-active { color: var(--ink); }
 .proto-legend li.is-active::before { background: var(--p); opacity: 1; transform: scale(1.25); box-shadow: 0 0 0 4px color-mix(in srgb, var(--p) 22%, transparent); }
 
+/* ---- feature showcase: a timeline stepper driving one demo video (showcase.js) ---- */
+.showcase-grid { display: grid; grid-template-columns: minmax(12rem, 1fr) 1.9fr; gap: var(--gap); margin-top: clamp(1.5rem, 3vw, 2.5rem); align-items: start; }
+.showcase-steps { list-style: none; border-top: 1px solid var(--hairline); }
+.showcase-step { border-bottom: 1px solid var(--hairline); }
+.showcase-step > button {
+  display: grid; grid-template-columns: auto 1fr; align-items: baseline; gap: 0.8rem;
+  width: 100%; text-align: left; background: none; border: 0; cursor: pointer;
+  padding: 0.9rem 0.3rem; color: var(--ink-2); position: relative;
+  transition: color var(--dur) var(--ease-out);
+}
+.showcase-step > button:hover { color: var(--ink); }
+.showcase-step.is-active > button { color: var(--ink); }
+.s-num { font-family: var(--mono); font-size: var(--fs-mono-s); color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.showcase-step.is-active .s-num { color: var(--accent); }
+.s-text { display: flex; flex-direction: column; gap: 0.15rem; min-width: 0; }
+.s-feature { font-size: var(--fs-lead); font-weight: 500; line-height: 1.2; letter-spacing: -0.01em; }
+.s-mode { font-family: var(--mono); font-size: 0.6875rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--agent-deep); }
+.s-bar { position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; overflow: hidden; }
+.showcase-step.is-active .s-bar { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.s-bar > i { display: block; height: 100%; background: var(--accent); transform: scaleX(0); transform-origin: left; }
+.showcase-stage .frame { margin: 0; }
+.showcase-media { position: relative; aspect-ratio: 16 / 10; background: var(--page); }
+.showcase-video { width: 100%; height: 100%; object-fit: cover; display: block; background: var(--page); transition: opacity 240ms var(--ease-out); }
+.showcase-video.is-switching { opacity: 0; }
+.showcase-cap { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* the build: the request assembles row by row when the packet lands, clears before the next */
 .flow-row { opacity: 0; transform: translateY(7px); }
 .weave[data-phase="build"] .flow-row { animation: wp-row-in 480ms var(--ease-out) calc(var(--i, 0) * 70ms) both; }
@@ -671,6 +697,7 @@ html.intro-on.intro-reveal :is(.nav, main, .footer) { animation: fade-in 900ms v
   .weave-panel { width: min(34rem, 72vw); }
   .operators { grid-template-columns: 1fr; }
   .life { grid-template-columns: 1fr; }
+  .showcase-grid { grid-template-columns: 1fr; }
   .faces { grid-template-columns: 1fr; }
   .shot-grid { grid-template-columns: 1fr; }
   .langs { grid-template-columns: 1fr; }

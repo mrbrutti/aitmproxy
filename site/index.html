@@ -126,6 +126,27 @@
   </div>
 </section>
 
+<!-- ============ SHOWCASE: feature demos ============
+     Progressive enhancement: showcase.js fetches demos/demos.json (written by the
+     release/demos pipeline) and reveals this section with one timeline step per clip.
+     While the manifest is absent or empty the section stays hidden and the page reads
+     exactly as without it. -->
+<section class="section showcase" id="showcase" hidden aria-label="Watch aitmproxy work">
+  <div class="wrap">
+    <h2 class="h2" data-reveal>Watch it work.</h2>
+    <p class="lead deck" data-reveal data-d="1">Short, real captures from the running tool. Step through a capability — each one is the same core, driven by hand or by agent.</p>
+    <div class="showcase-grid" data-reveal data-d="2">
+      <ol class="showcase-steps" role="tablist" aria-label="Features"></ol>
+      <div class="showcase-stage">
+        <figure class="frame">
+          <div class="showcase-media"><video class="showcase-video" muted playsinline preload="none"></video></div>
+          <figcaption><span class="dot live" aria-hidden="true"></span><span class="showcase-cap"></span></figcaption>
+        </figure>
+      </div>
+    </div>
+  </div>
+</section>
+
 <!-- ============ DUALITY ============ -->
 <section class="section" id="operators">
   <div class="wrap">
@@ -562,5 +583,6 @@ content-type: application/json
 <script src="intro.js"></script>
 <script src="site.js"></script>
 <script src="weave.js"></script>
+<script src="showcase.js"></script>
 </body>
 </html>
