@@ -172,11 +172,31 @@ passes). The two checks never interact — confinement runs only on the
 `!blocked` public branch; the private branch and its rebinding refusal are
 untouched.
 
-Matching on `host` (the requested authority's host), not the resolved `dst`, is
-intentional and mirrors the scanner crawler's own `in_scope(host)` off-origin
-drop: scope is expressed as hostnames, and a public `dst` IP is never scoped by
-name. An unparseable authority yields an out-of-scope refusal under confinement
-(deny-by-default).
+Matching on the requested **`authority`** (host **and** port), not the resolved
+`dst`, is intentional and mirrors the scanner crawler's own `in_scope(host)`
+off-origin drop: scope is expressed as hostnames, and a public `dst` IP is never
+scoped by name. The match passes the full `authority` to `host_in_scope` (port
+included) so a `host:port` scope entry is honored exactly as `StdGuard::in_scope`
+honors it. An unparseable authority yields an out-of-scope refusal under
+confinement (deny-by-default).
+
+### `ssrf_check`'s other callers (resolved during implementation)
+
+`ssrf_check` has **three** production callers, not one. Only the browser-facing
+connector is confined; the other two pass `confine_to_scope = false`:
+
+- `crates/aitm-core/src/proxy.rs` — `SsrfConnector::connect` (the browser-facing
+  listener): **confined**, reads the runtime posture.
+- `crates/aitm-proto-http/src/sender.rs` — `Http1Sender::send`, the **active
+  reissue** path shared by `flow.replay`/`request.send`/`poc.run`: **not
+  confined**. Confining it would violate the anti-goal (active paths are already
+  scope-gated by `check_active`).
+- `crates/aitm-browser/src/ssrf.rs` — `check_url`, the **non-dialing
+  `browser.navigate` pre-flight**: **not confined** here. The actual navigation
+  (and every redirect/sub-resource) dials through the proxy's `SsrfConnector`,
+  which is the authoritative gate, so this is not a bypass. Threading confinement
+  into the pre-flight too — for an earlier, cleaner `browser.navigate` refusal —
+  is a recorded **follow-up**, not required for S2 closure. **(Architect's call.)**
 
 ### Threading through the proxy
 
@@ -244,7 +264,10 @@ redirect fails the navigation — the desired campaign behavior.
 8. **AC8:** `BrowserConfig::default().confine_egress_to_scope == false`, and a
    proxy built from it starts in free mode (AC3 holds end-to-end through the
    connector).
-9. **AC9:** `browser.confine { on: true }` sets `confined()` true and returns
+9. **AC10:** A `host:port` scope entry is honored under confinement: with scope
+   `["target.example:443"]`, confined, `"target.example:443"` → `Ok`, and
+   `"target.example:8443"` → `Err(OutOfScope)`.
+10. **AC9:** `browser.confine { on: true }` sets `confined()` true and returns
    `{ confined: true }`; `{ on: false }` sets it false. Its `sensitivity()` is
    `Sensitive` (asserted), so the agent-policy gate treats it like `scope.add`.
 

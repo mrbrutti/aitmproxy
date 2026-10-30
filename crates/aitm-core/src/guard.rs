@@ -239,9 +239,17 @@ pub fn engine_may_reach_private(policy: &crate::config::SsrfPolicy, scope: &[Sco
 /// resolves private is a DNS-rebinding attempt). Used by the browser proxy
 /// connector so redirects, page `fetch`, sub-resources and `browser.eval` are all
 /// covered, not only the first navigation.
+///
+/// With `confine_to_scope` set, a *public* target must additionally be in scope
+/// (the normal wildcard-aware hostname match [`StdGuard::in_scope`] uses) or it
+/// is refused `OutOfScope` — the scope-confined egress posture a scanner or
+/// operator arms so the browser cannot be steered off-target. Confinement runs
+/// only on the public branch; the private/loopback block and its rebinding
+/// refusal are identical under either posture.
 pub fn ssrf_check(
     policy: &crate::config::SsrfPolicy,
     scope: &[ScopeEntry],
+    confine_to_scope: bool,
     authority: &str,
     dst: IpAddr,
 ) -> Result<(), GuardError> {
@@ -254,6 +262,13 @@ pub fn ssrf_check(
     let blocked = blocked_by_policy(classify_host(&host), policy)
         || blocked_by_policy(classify_ip(dst), policy);
     if !blocked {
+        // Public target. In confined mode it must additionally be in scope. Match
+        // the full requested `authority` (port included), exactly as
+        // `StdGuard::in_scope` does, so a `host:port` scope entry is honored and an
+        // unparseable authority never matches → deny by default.
+        if confine_to_scope && !scope.iter().any(|e| host_in_scope(authority, &e.host)) {
+            return Err(GuardError::OutOfScope(host));
+        }
         return Ok(());
     }
 

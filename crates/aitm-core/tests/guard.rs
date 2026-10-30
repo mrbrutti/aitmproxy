@@ -55,6 +55,7 @@ fn ssrf_connector_decision() {
     assert!(ssrf_check(
         &policy,
         &none,
+        false,
         "example.test:443",
         "93.184.216.34".parse().unwrap()
     )
@@ -65,13 +66,20 @@ fn ssrf_connector_decision() {
         ssrf_check(
             &policy,
             &none,
+            false,
             "localhost:3000",
             "127.0.0.1".parse().unwrap()
         ),
         Err(GuardError::PrivateAddressBlocked(_))
     ));
     assert!(matches!(
-        ssrf_check(&policy, &none, "internal:80", "10.0.0.5".parse().unwrap()),
+        ssrf_check(
+            &policy,
+            &none,
+            false,
+            "internal:80",
+            "10.0.0.5".parse().unwrap()
+        ),
         Err(GuardError::PrivateAddressBlocked(_))
     ));
 
@@ -80,6 +88,7 @@ fn ssrf_connector_decision() {
         ssrf_check(
             &policy,
             &none,
+            false,
             "evil.test:80",
             "169.254.169.254".parse().unwrap()
         ),
@@ -91,6 +100,7 @@ fn ssrf_connector_decision() {
     assert!(ssrf_check(
         &policy,
         &scope,
+        false,
         "127.0.0.1:3000",
         "127.0.0.1".parse().unwrap()
     )
@@ -98,18 +108,27 @@ fn ssrf_connector_decision() {
     assert!(ssrf_check(
         &policy,
         &scope,
+        false,
         "127.0.0.1:3001",
         "127.0.0.1".parse().unwrap()
     )
     .is_err());
     let wild = vec![scoped("*.local")];
-    assert!(ssrf_check(&policy, &wild, "db.local:5432", "10.1.2.3".parse().unwrap()).is_err());
+    assert!(ssrf_check(
+        &policy,
+        &wild,
+        false,
+        "db.local:5432",
+        "10.1.2.3".parse().unwrap()
+    )
+    .is_err());
 
     // An explicit IP-literal scope entry lifts the block for that IP.
     let ip_scope = vec![scoped("10.0.0.5")];
     assert!(ssrf_check(
         &policy,
         &ip_scope,
+        false,
         "internal:80",
         "10.0.0.5".parse().unwrap()
     )
@@ -126,6 +145,7 @@ fn scoped_hostname_does_not_lift_private() {
         ssrf_check(
             &policy,
             &scope,
+            false,
             "evil.test:80",
             "127.0.0.1".parse().unwrap()
         ),
@@ -135,6 +155,7 @@ fn scoped_hostname_does_not_lift_private() {
         ssrf_check(
             &policy,
             &scope,
+            false,
             "evil.test:80",
             "169.254.169.254".parse().unwrap()
         ),
@@ -145,13 +166,21 @@ fn scoped_hostname_does_not_lift_private() {
     assert!(ssrf_check(
         &policy,
         &ip_scope,
+        false,
         "evil.test:80",
         "127.0.0.1".parse().unwrap()
     )
     .is_ok());
     // A scoped `localhost` authority to a loopback dst is still allowed.
     let lh = vec![scoped("localhost")];
-    assert!(ssrf_check(&policy, &lh, "localhost:3000", "127.0.0.1".parse().unwrap()).is_ok());
+    assert!(ssrf_check(
+        &policy,
+        &lh,
+        false,
+        "localhost:3000",
+        "127.0.0.1".parse().unwrap()
+    )
+    .is_ok());
 }
 
 /// Audit I15: the engine's `--allow-private-network` input is policy ∪ scope.

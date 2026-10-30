@@ -330,7 +330,15 @@ impl UpstreamConnector for SsrfConnector {
     ) -> BoxFuture<'_, anyhow::Result<ByteStream>> {
         let authority = authority.to_string();
         Box::pin(async move {
-            crate::guard::ssrf_check(&self.policy, &self.guard.list_scope(), &authority, dst.ip())?;
+            // `false` = free posture; Task 3 replaces this with the runtime
+            // `EgressConfinement` posture.
+            crate::guard::ssrf_check(
+                &self.policy,
+                &self.guard.list_scope(),
+                false,
+                &authority,
+                dst.ip(),
+            )?;
             dial(dst).await
         })
     }
