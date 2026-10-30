@@ -72,7 +72,7 @@ private struct PhaseRow: View {
                 .frame(width: 72, alignment: .leading)
             GeometryReader { geo in
                 RoundedRectangle(cornerRadius: Tok.Radius.badge)
-                    .fill(Tok.Ink.tertiary.color)
+                    .fill(Self.color(for: phase))
                     .frame(width: barWidth(in: geo.size.width), height: Space.sm)
             }
             .frame(height: Space.sm)
@@ -85,6 +85,16 @@ private struct PhaseRow: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(phase.rawValue)
         .accessibilityValue(duration.map(Format.duration) ?? "not reported")
+    }
+
+    /// Each phase a distinct hue, waterfall-style (dns · connect · tls · wait · download).
+    private static let phaseColors: [Color] = [
+        Tok.Mark.purple.color, Tok.Mark.blue.color, Tok.Mark.green.color, Tok.Mark.orange.color, Tok.Mark.teal.color,
+    ]
+
+    private static func color(for phase: FlowTiming.Phase) -> Color {
+        let index = FlowTiming.Phase.allCases.firstIndex(of: phase) ?? 0
+        return phaseColors[index % phaseColors.count]
     }
 
     private func barWidth(in available: CGFloat) -> CGFloat {
