@@ -2,7 +2,8 @@
 // Mirrors the Findings/Scope panels and reuses the schema-form, the scope surface and the virtual list
 // rather than inventing new infrastructure. Viewing the panel calls nothing: a scan runs only on an
 // explicit, scope-bound form submit (deny-by-default). The result renders the discovered endpoints and
-// injection points; each injection point links back to its flow.
+// injection points; each injection point links back to its flow, as does each endpoint the engine
+// captured a flow for (`endpoint_flows`).
 import { createMemo, createSignal, Show, type Component } from 'solid-js';
 import { Icon } from '~/components';
 import { useApp } from '~/state/context';
@@ -33,8 +34,9 @@ export const Scan: Component = () => {
     }
   };
 
-  // injection_points → flow: each point carries the flow it was found in; open it through the existing
-  // detail loader, exactly as the flow list does.
+  // → flow: an injection point carries the flow it was found in, and `endpoint_flows` names the flow
+  // that served each endpoint. Both open it through the existing detail loader, exactly as the flow
+  // list does.
   const openFlow = (flowId: string) => {
     if (flowId) void app.loadDetail(flowId);
   };
@@ -61,17 +63,9 @@ export const Scan: Component = () => {
                 <h3 class={css.sectionTitle}>
                   Endpoints <span class={css.n}>{r().endpoints.length}</span>
                 </h3>
-                {/* endpoint → flow is a Stage-1 parity gap (consistent with the TUI view): `endpoints`
-                    are plain URL strings with no flow id, and the store resolves a flow only by id, so
-                    linking an endpoint to its flow needs a backend flow-id-per-endpoint. Until then,
-                    endpoints render as plain rows. */}
                 <Show when={r().endpoints.length > 0} fallback={<p class={css.empty}>No endpoints reached.</p>}>
                   <VirtualList items={r().endpoints} rowHeight={ENDPOINT_ROW} label="Endpoints">
-                    {(url) => (
-                      <div class={css.endpoint} data-endpoint title={url}>
-                        <span class={css.url}>{url}</span>
-                      </div>
-                    )}
+                    {(url) => <EndpointRow url={url} flow={r().endpointFlows.get(url)} onOpen={openFlow} />}
                   </VirtualList>
                 </Show>
               </section>
@@ -98,6 +92,25 @@ export const Scan: Component = () => {
     </section>
   );
 };
+
+// An endpoint the engine captured a flow for is a control that opens it; one without stays an inert
+// row. Both render the URL verbatim — it is already scrubbed upstream.
+const EndpointRow: Component<{ url: string; flow: string | undefined; onOpen: (flowId: string) => void }> = (props) => (
+  <Show
+    when={props.flow}
+    fallback={
+      <div class={css.endpoint} data-endpoint title={props.url}>
+        <span class={css.url}>{props.url}</span>
+      </div>
+    }
+  >
+    {(flow) => (
+      <button type="button" class={`${css.endpoint} ${css.linked}`} data-endpoint data-flow={flow()} title={`Open flow ${flow()}`} onClick={() => props.onOpen(flow())}>
+        <span class={css.url}>{props.url}</span>
+      </button>
+    )}
+  </Show>
+);
 
 const PointRow: Component<{ point: InjectionPointRow; onOpen: () => void }> = (props) => (
   <button type="button" class={css.point} data-point data-flow={props.point.flow} title={`Open flow ${props.point.flow}`} onClick={props.onOpen}>

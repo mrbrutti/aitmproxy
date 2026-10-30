@@ -67,16 +67,37 @@ final class ScanPanelState {
     func select(_ index: Int) { model.selected = index }
 
     /// The flow an injection point was seen in is still in the flow list.
-    func canOpen(_ point: InjectionPoint) -> Bool { session.rows.contains { $0.id == point.flowID } }
+    func canOpen(_ point: InjectionPoint) -> Bool { isListed(point.flowID) }
 
     /// Open the point's flow in the inspector: select it and show the flow list. A flow
     /// that is no longer listed is refused, not selected.
-    func open(_ point: InjectionPoint) {
-        guard canOpen(point) else {
-            session.lastError = "flow \(point.flow) is not in the flow list (cleared, or not captured here)"
+    func open(_ point: InjectionPoint) { openFlow(point.flowID) }
+
+    /// The flow the crawl fetched this endpoint in, or nil when the result links none
+    /// (the row is then plain).
+    func flowID(forEndpoint url: String) -> FlowID? { model.flowID(forEndpoint: url) }
+
+    /// The result links this endpoint to a flow.
+    func isLinked(endpoint url: String) -> Bool { flowID(forEndpoint: url) != nil }
+
+    /// The endpoint is linked and its flow is still in the flow list.
+    func canOpen(endpoint url: String) -> Bool { flowID(forEndpoint: url).map(isListed) ?? false }
+
+    /// Open the endpoint's flow like an injection point's. An unlinked endpoint does
+    /// nothing; a linked flow that is no longer listed is refused, not selected.
+    func open(endpoint url: String) {
+        guard let flow = flowID(forEndpoint: url) else { return }
+        openFlow(flow)
+    }
+
+    private func isListed(_ flow: FlowID) -> Bool { session.rows.contains { $0.id == flow } }
+
+    private func openFlow(_ flow: FlowID) {
+        guard isListed(flow) else {
+            session.lastError = "flow \(flow.raw) is not in the flow list (cleared, or not captured here)"
             return
         }
-        session.select(point.flowID)
+        session.select(flow)
         session.show(.apps)
     }
 }
@@ -225,10 +246,11 @@ struct ScanPanel: View {
         } else {
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    // Plain rows: the result carries no flow id per endpoint, so an endpoint cannot open its flow.
-                    // Stage-1 parity gap — needs a backend flow-id-per-endpoint; injection points below do open theirs.
+                    // An endpoint the result links to a flow opens it, like an injection point; the rest stay plain.
                     ForEach(Array(state.endpoints.enumerated()), id: \.offset) { _, url in
-                        ScanEndpointRow(url: url)
+                        ScanEndpointRow(url: url, linked: state.isLinked(endpoint: url), openable: state.canOpen(endpoint: url)) {
+                            state.open(endpoint: url)
+                        }
                     }
                 }
             }
@@ -275,21 +297,67 @@ struct ScanPanel: View {
     }
 }
 
-/// One reached endpoint: a plain URL row (see the parity-gap note in `ScanPanel`).
+/// One reached endpoint, its URL exactly as the scanner returned it. When the result
+/// links the endpoint to the flow it was fetched in (`linked`), the row opens that flow:
+/// double-click, the trailing chevron, or Open Flow in the context menu. An unlinked row
+/// stays a plain, selectable URL.
 struct ScanEndpointRow: View {
     var url: String
+    /// The result carries a flow id for this endpoint.
+    var linked: Bool
+    /// That flow is still in the flow list, so opening it can succeed.
+    var openable: Bool
+    var open: () -> Void
 
     var body: some View {
+        HStack(spacing: Space.sm) {
+            if linked {
+                // Double-click opens the flow, so the text is not selectable here; Copy URL stays in the menu.
+                label
+                Button(action: open) {
+                    Image(systemName: Tok.Glyph.chevron)
+                        .font(.system(size: Tok.Size.iconInline))
+                        .foregroundStyle(Tok.Ink.tertiary.color)
+                        .frame(width: Space.lg, height: Tok.Size.Row.dense)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(PressStyle())
+                .disabled(!openable)
+                .help(openable ? "Open flow" : "This flow is no longer in the flow list (cleared, or not captured here).")
+            } else {
+                label.textSelection(.enabled)
+            }
+        }
+        .padding(.leading, Space.md)
+        .padding(.trailing, linked ? Space.sm : Space.md)
+        .frame(maxWidth: .infinity, minHeight: Tok.Size.Row.dense, alignment: .leading)
+        .contentShape(Rectangle())
+        .opensOnDoubleClick(linked, open)
+        .overlay(alignment: .bottom) { Rule(color: Tok.Line.rule) }
+        .contextMenu {
+            if linked {
+                Button("Open Flow", action: open).disabled(!openable)
+            }
+            Button("Copy URL") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(url, forType: .string)
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(url)
+        .accessibilityAddTraits(linked ? .isButton : [])
+        .accessibilityActions {
+            if linked { Button("Open flow", action: open) }
+        }
+    }
+
+    private var label: some View {
         Text(url)
             .font(Tok.Face.data(Tok.Typography.Size.md))
             .foregroundStyle(Tok.Ink.primary.color)
             .lineLimit(1)
             .truncationMode(.middle)
-            .textSelection(.enabled)
-            .padding(.horizontal, Space.md)
-            .frame(maxWidth: .infinity, minHeight: Tok.Size.Row.dense, alignment: .leading)
-            .overlay(alignment: .bottom) { Rule(color: Tok.Line.rule) }
-            .accessibilityLabel(url)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -390,6 +458,12 @@ struct ScanPointDetail: View {
 }
 
 private extension View {
+    /// Runs `action` on a double-click when `enabled`. Left off otherwise so an unlinked
+    /// row's selectable text keeps its own double-click.
+    @ViewBuilder func opensOnDoubleClick(_ enabled: Bool, _ action: @escaping () -> Void) -> some View {
+        if enabled { onTapGesture(count: 2, perform: action) } else { self }
+    }
+
     /// The launch bar's text field: plain, on `surface`, a control-border outline.
     func scanFieldChrome() -> some View {
         textFieldStyle(.plain)

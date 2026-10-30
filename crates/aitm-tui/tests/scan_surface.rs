@@ -37,13 +37,19 @@ fn discover_targets(reqs: &[BusRequest]) -> Vec<String> {
 }
 
 /// A `scan.discover` result: two endpoints, two injection points (one redacted
-/// cookie), mirroring the scanner's `endpoints` + `injection_points` JSON.
+/// cookie), mirroring the scanner's `endpoints` + `injection_points` JSON. The
+/// `endpoint_flows` map (AC3) links one endpoint URL to its flow id, keyed by
+/// the same scrubbed URL that appears in `endpoints`; the root URL is
+/// deliberately absent, to exercise the "no linked flow" path.
 fn discover_result() -> Value {
     json!({
         "endpoints": [
             "http://auth.shop-staging.test/",
             "http://auth.shop-staging.test/login"
         ],
+        "endpoint_flows": {
+            "http://auth.shop-staging.test/login": "f50"
+        },
         "injection_points": [
             { "flow": "f50", "location": "query", "name": "next", "example": "/dashboard" },
             { "flow": "f50", "location": "cookie", "name": "session", "example": "<redacted>" }
@@ -280,6 +286,79 @@ fn enter_opens_the_selected_injection_points_flow() {
         toast.contains("f-missing") && toast.contains("not in the flow list"),
         "the refusal names the flow: {toast:?}"
     );
+}
+
+/// AC3 endpoint→flow link: the result's `endpoint_flows` map (endpoint URL →
+/// flow id, keyed by the same scrubbed URL as `endpoints`) populates the state;
+/// Tab focuses the endpoints list and ⏎ opens the selected endpoint's flow in
+/// the existing inspector — parity with the injection-point path. An endpoint
+/// with no entry in the map opens nothing (and does not crash).
+#[test]
+fn enter_opens_the_selected_endpoints_flow() {
+    // Tab toggles which of the two Scan lists has the cursor.
+    assert_eq!(
+        keys::map(press(KeyCode::Tab), Mode::Scan),
+        Some(Action::ScanFocusToggle),
+        "Tab switches focus between endpoints and injection points"
+    );
+
+    let mut app = fixture_app_core(200, 50);
+    let _ = app.update(Action::OpenScan);
+    let _ = app.update(Action::ScanLaunch);
+    let _ = app.on_bus(BusEvent::CallOk {
+        name: "scan.discover".into(),
+        value: discover_result(),
+    });
+
+    // `endpoint_flows` parsed into state, keyed by the scrubbed endpoint URL.
+    assert_eq!(
+        app.scan
+            .endpoint_flows
+            .get("http://auth.shop-staging.test/login")
+            .map(String::as_str),
+        Some("f50"),
+        "endpoint_flows links the /login endpoint to its flow id"
+    );
+    assert!(
+        !app.scan
+            .endpoint_flows
+            .contains_key("http://auth.shop-staging.test/"),
+        "the root endpoint has no linked flow"
+    );
+
+    // Focus the endpoints list, move to /login (the second endpoint, the one
+    // with a flow) and open it: parity with the injection-point ⏎ path.
+    app.selected = None;
+    let _ = app.update(Action::ScanFocusToggle);
+    let _ = app.update(Action::Down);
+    assert_eq!(
+        app.scan.endpoint_cursor, 1,
+        "Down moves the endpoint cursor"
+    );
+    let _ = app.update(Action::Enter);
+    assert_eq!(
+        app.selected.as_deref(),
+        Some("f50"),
+        "the endpoint's linked flow becomes the selection"
+    );
+    assert_eq!(
+        app.mode,
+        Mode::Inspector,
+        "and opens in the existing inspector"
+    );
+
+    // An endpoint with no linked flow: stay put, select nothing.
+    app.mode = Mode::Scan;
+    let _ = app.update(Action::Up);
+    assert_eq!(app.scan.endpoint_cursor, 0, "back on the root endpoint");
+    app.selected = None;
+    let _ = app.update(Action::Enter);
+    assert_eq!(
+        app.mode,
+        Mode::Scan,
+        "no inspector for an endpoint with no linked flow"
+    );
+    assert_eq!(app.selected, None, "nothing is selected");
 }
 
 /// PgUp/PgDn page the injection-point cursor like the flow and findings lists

@@ -34,6 +34,12 @@ const RESULT = {
     { flow: 'flow_1', location: 'query', name: 'q', example: 'shoes' },
     { flow: 'flow_2', location: 'cookie', name: 'session_token', example: '<redacted>' },
   ],
+  // endpoint URL (the same scrubbed string as in `endpoints`) -> the flow that served it. An endpoint
+  // with no captured flow — here `/search` — is simply absent from the map.
+  endpoint_flows: {
+    'https://app.example/': 'flow_1',
+    'https://app.example/login': 'flow_2',
+  },
   pages_crawled: 3,
   stopped_reason: null,
 };
@@ -69,6 +75,22 @@ function stubApp(opts: { tools?: ToolDef[]; scope?: { host: string }[]; result?:
 
 const tick = () => new Promise((r) => setTimeout(r, 30));
 
+/** Render the panel and run one scan: pick the in-scope target, submit, settle. */
+async function launchScan(app: AppStore) {
+  const r = render(() => (
+    <AppProvider store={app}>
+      <ScanPanel />
+    </AppProvider>
+  ));
+  const target = r.getByLabelText<HTMLSelectElement>('Target');
+  target.value = 'app.example';
+  target.dispatchEvent(new Event('change', { bubbles: true }));
+  await tick();
+  r.getByRole('button', { name: /discover/i }).click();
+  await tick();
+  return r;
+}
+
 // jsdom has no layout: the virtual list measures the scroll element via clientHeight, so give every
 // element a tall box and all rows render (mirrors FlowList.test.tsx).
 const proto = HTMLElement.prototype;
@@ -96,7 +118,24 @@ describe('parseScanResult', () => {
   });
 
   it('tolerates a missing/garbage result without throwing', () => {
-    expect(parseScanResult(null)).toEqual({ endpoints: [], injectionPoints: [], pagesCrawled: null, stoppedReason: null });
+    expect(parseScanResult(null)).toEqual({ endpoints: [], injectionPoints: [], endpointFlows: new Map(), pagesCrawled: null, stoppedReason: null });
+  });
+
+  it('reads endpoint_flows as an endpoint-url -> flow-id map, keyed like `endpoints`', () => {
+    const r = parseScanResult(RESULT);
+    expect(r.endpointFlows.get('https://app.example/')).toBe('flow_1');
+    expect(r.endpointFlows.get('https://app.example/login')).toBe('flow_2');
+    // An endpoint the engine captured no flow for is absent — not an empty string.
+    expect(r.endpointFlows.has('https://app.example/search')).toBe(false);
+    expect(r.endpointFlows.size).toBe(2);
+  });
+
+  it('drops a non-object endpoint_flows and any non-string flow id', () => {
+    expect(parseScanResult({ ...RESULT, endpoint_flows: 'nope' }).endpointFlows.size).toBe(0);
+    expect(parseScanResult({ ...RESULT, endpoint_flows: ['nope'] }).endpointFlows.size).toBe(0);
+    expect(parseScanResult({ ...RESULT, endpoint_flows: null }).endpointFlows.size).toBe(0);
+    const mixed = parseScanResult({ endpoint_flows: { a: 'flow_1', b: 7, c: null, d: { flow: 'x' }, e: '' } }).endpointFlows;
+    expect([...mixed.entries()]).toEqual([['a', 'flow_1']]);
   });
 });
 
@@ -191,5 +230,33 @@ describe('ScanPanel', () => {
     const points = r.container.querySelectorAll<HTMLElement>('[aria-label="Injection points"] [data-point]');
     points[0]!.click();
     expect(loadDetail).toHaveBeenCalledWith('flow_1');
+  });
+
+  it('opens the flow for an endpoint carried in endpoint_flows, via loadDetail with its flow id', async () => {
+    const { app, loadDetail } = stubApp({ tools: [scanTool()], scope: [{ host: 'app.example' }], result: RESULT });
+    const r = await launchScan(app);
+
+    const endpoints = r.container.querySelectorAll<HTMLElement>('[aria-label="Endpoints"] [data-endpoint]');
+    expect(endpoints).toHaveLength(3);
+    // `/` -> flow_1 and `/login` -> flow_2: both open their flow through the same loader the
+    // injection-point rows use.
+    endpoints[0]!.click();
+    expect(loadDetail).toHaveBeenCalledWith('flow_1');
+    endpoints[1]!.click();
+    expect(loadDetail).toHaveBeenCalledWith('flow_2');
+    expect(loadDetail).toHaveBeenCalledTimes(2);
+  });
+
+  it('leaves an endpoint absent from endpoint_flows a plain, unclickable row', async () => {
+    const { app, loadDetail } = stubApp({ tools: [scanTool()], scope: [{ host: 'app.example' }], result: RESULT });
+    const r = await launchScan(app);
+
+    const endpoints = r.container.querySelectorAll<HTMLElement>('[aria-label="Endpoints"] [data-endpoint]');
+    const search = endpoints[2]!;
+    // Still rendered verbatim, but it is not a control and clicking it opens nothing.
+    expect(search.textContent).toBe('https://app.example/search');
+    expect(search.tagName).not.toBe('BUTTON');
+    search.click();
+    expect(loadDetail).not.toHaveBeenCalled();
   });
 });

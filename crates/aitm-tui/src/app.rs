@@ -186,6 +186,18 @@ impl InjectionPointRow {
     }
 }
 
+/// Which of the Scan view's two lists holds the cursor. Tab toggles it; ↑↓ walk
+/// the focused list and ⏎ opens its selected row's flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanFocus {
+    /// The reached-endpoints list (⏎ opens the endpoint's linked flow, AC3).
+    Endpoints,
+    /// The injection-points list (⏎ opens the point's flow). The default, so
+    /// the point list stays the first thing the operator walks.
+    #[default]
+    Points,
+}
+
 /// The Scan view's state (scanner-integration Stage 1): what `scan.discover`
 /// has reported so far. Plain data; `App::on_bus` fills it and `ui::scan` draws
 /// it. The model mirrors the scanner's `endpoints` + `injection_points` JSON.
@@ -196,12 +208,20 @@ pub struct ScanState {
     pub running: bool,
     /// The scope-bound target URL the last launch sent.
     pub target: Option<String>,
-    /// The reached endpoints from the last result (each resolves to a flow).
+    /// The reached endpoints from the last result (each a flow in the store).
     pub endpoints: Vec<String>,
+    /// AC3 endpoint→flow links from the last result: the scrubbed endpoint URL
+    /// (as it appears in `endpoints`) → the flow id it was reached as. Not every
+    /// endpoint has an entry; ⏎ on an unlinked endpoint opens nothing.
+    pub endpoint_flows: HashMap<String, String>,
     /// The discovered injection points from the last result.
     pub points: Vec<InjectionPointRow>,
     /// The injection-point list cursor.
     pub cursor: usize,
+    /// The endpoints-list cursor.
+    pub endpoint_cursor: usize,
+    /// Which list the cursor is on; Tab toggles it.
+    pub focus: ScanFocus,
     /// The last `scan.discover` failure, shown until the next launch.
     pub error: Option<String>,
 }
@@ -1455,13 +1475,25 @@ impl App {
                         }
                     }
                 }
-                // Scan: the selected injection point's flow (the id the scanner
-                // reported) opens in the inspector — parity with the web view's
-                // endpoint→flow links. An id no longer listed is refused, not
-                // selected.
+                // Scan: ⏎ opens the focused list's selected flow in the
+                // inspector — the injection point's flow, or the endpoint's
+                // linked flow (AC3). Parity with the web view's endpoint→flow
+                // links. An endpoint with no linked flow opens nothing; a flow
+                // no longer in the store is refused, not selected.
                 Mode::Scan => {
-                    if let Some(p) = self.scan.points.get(self.scan.cursor) {
-                        let id = p.flow.clone();
+                    let id = match self.scan.focus {
+                        ScanFocus::Points => self
+                            .scan
+                            .points
+                            .get(self.scan.cursor)
+                            .map(|p| p.flow.clone()),
+                        ScanFocus::Endpoints => self
+                            .scan
+                            .endpoints
+                            .get(self.scan.endpoint_cursor)
+                            .and_then(|e| self.scan.endpoint_flows.get(e).cloned()),
+                    };
+                    if let Some(id) = id {
                         if self.row(&id).is_some() {
                             self.selected = Some(id);
                             self.mode = Mode::Inspector;
@@ -1755,6 +1787,12 @@ impl App {
                 } else {
                     self.scan_launch(None, &mut out);
                 }
+            }
+            Action::ScanFocusToggle => {
+                self.scan.focus = match self.scan.focus {
+                    ScanFocus::Points => ScanFocus::Endpoints,
+                    ScanFocus::Endpoints => ScanFocus::Points,
+                };
             }
             Action::AgentSet(p) => {
                 if self.has_tool("agent.set") {
@@ -2676,14 +2714,20 @@ impl App {
                 }
             }
             Mode::Scan => {
-                let n = self.scan.points.len();
+                // ↑↓/paging walk whichever list Tab has focused.
+                let (n, cursor) = match self.scan.focus {
+                    ScanFocus::Points => (self.scan.points.len(), &mut self.scan.cursor),
+                    ScanFocus::Endpoints => {
+                        (self.scan.endpoints.len(), &mut self.scan.endpoint_cursor)
+                    }
+                };
                 if n > 0 {
-                    // A page is the points list body: the terminal minus the
-                    // panel chrome (three bars, two box edges, the target and
-                    // hint lines, the list heading).
+                    // A page is the list body: the terminal minus the panel
+                    // chrome (three bars, two box edges, the target and hint
+                    // lines, the list heading).
                     let page = usize::from(self.height.saturating_sub(8)).max(1);
-                    let c = self.scan.cursor;
-                    self.scan.cursor = match action {
+                    let c = *cursor;
+                    *cursor = match action {
                         Action::Up => c.saturating_sub(1),
                         Action::Down => (c + 1).min(n - 1),
                         Action::PageUp => c.saturating_sub(page),
@@ -3758,6 +3802,19 @@ impl App {
                                     .collect()
                             })
                             .unwrap_or_default();
+                        // AC3: endpoint URL → flow id. Keep only string→string
+                        // pairs; a missing or garbage map leaves it empty.
+                        self.scan.endpoint_flows = value
+                            .get("endpoint_flows")
+                            .and_then(Value::as_object)
+                            .map(|m| {
+                                m.iter()
+                                    .filter_map(|(k, v)| {
+                                        v.as_str().map(|s| (k.clone(), s.to_string()))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
                         self.scan.points = value
                             .get("injection_points")
                             .and_then(Value::as_array)
@@ -3767,6 +3824,10 @@ impl App {
                             .scan
                             .cursor
                             .min(self.scan.points.len().saturating_sub(1));
+                        self.scan.endpoint_cursor = self
+                            .scan
+                            .endpoint_cursor
+                            .min(self.scan.endpoints.len().saturating_sub(1));
                         self.toast(
                             Level::Info,
                             format!(

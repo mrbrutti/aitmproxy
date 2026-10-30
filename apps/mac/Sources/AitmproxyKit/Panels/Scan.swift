@@ -48,17 +48,23 @@ public struct InjectionPoint: Hashable, Sendable, Codable {
 }
 
 /// The `scan.discover` result (`crates/aitm-plugin-scanner/src/commands.rs`):
-/// `{endpoints, injection_points, pages_crawled, stopped_reason}`.
+/// `{endpoints, endpoint_flows, injection_points, pages_crawled, stopped_reason}`.
 public struct ScanResult: Hashable, Sendable, Codable {
-    /// The URLs the crawl reached. The core reports no flow id per endpoint.
+    /// The URLs the crawl reached, scrubbed by the scanner and shown verbatim.
     public var endpoints: [String]
+    /// The flow each endpoint was fetched in: `endpoints` entry (the same scrubbed
+    /// URL string) → flow id. An endpoint with no entry has no flow to open. Read
+    /// it through `flowID(forEndpoint:)`.
+    public var endpointFlows: [String: String]
     public var injectionPoints: [InjectionPoint]
     public var pagesCrawled: Int
     /// Why the crawl stopped early (`max_pages`, `left_scope`, `navigation_failed`, …); nil when it ran out of links.
     public var stoppedReason: String?
 
-    public init(endpoints: [String], injectionPoints: [InjectionPoint], pagesCrawled: Int, stoppedReason: String? = nil) {
+    public init(endpoints: [String], endpointFlows: [String: String] = [:], injectionPoints: [InjectionPoint],
+                pagesCrawled: Int, stoppedReason: String? = nil) {
         self.endpoints = endpoints
+        self.endpointFlows = endpointFlows
         self.injectionPoints = injectionPoints
         self.pagesCrawled = pagesCrawled
         self.stoppedReason = stoppedReason
@@ -66,6 +72,7 @@ public struct ScanResult: Hashable, Sendable, Codable {
 
     private enum CodingKeys: String, CodingKey {
         case endpoints
+        case endpointFlows = "endpoint_flows"
         case injectionPoints = "injection_points"
         case pagesCrawled = "pages_crawled"
         case stoppedReason = "stopped_reason"
@@ -74,9 +81,38 @@ public struct ScanResult: Hashable, Sendable, Codable {
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.init(endpoints: try c.decodeIfPresent([String].self, forKey: .endpoints) ?? [],
+                  endpointFlows: Self.links(in: c),
                   injectionPoints: try c.decodeIfPresent([InjectionPoint].self, forKey: .injectionPoints) ?? [],
                   pagesCrawled: try c.decodeIfPresent(Int.self, forKey: .pagesCrawled) ?? 0,
                   stoppedReason: try c.decodeIfPresent(String.self, forKey: .stoppedReason))
+    }
+
+    /// The flow an endpoint opens, or nil when the crawl recorded none for it. The
+    /// key is the endpoint's own text, matched exactly (the scanner keys the map by
+    /// the same scrubbed string it lists in `endpoints`).
+    public func flowID(forEndpoint url: String) -> FlowID? { Self.flowID(for: url, in: endpointFlows) }
+
+    static func flowID(for url: String, in flows: [String: String]) -> FlowID? {
+        guard let raw = flows[url], !raw.isEmpty else { return nil }
+        return FlowID(raw)
+    }
+
+    /// Reads `endpoint_flows` defensively. A core that predates the field, a null,
+    /// or a value that is not an object reads as no links; inside the object, an
+    /// entry whose value is not a non-empty string is dropped on its own. Links are
+    /// a convenience on top of the endpoint list, so a bad one never fails the result.
+    private static func links(in c: KeyedDecodingContainer<CodingKeys>) -> [String: String] {
+        let raw = (try? c.decodeIfPresent([String: LinkValue].self, forKey: .endpointFlows)) ?? [:]
+        return raw.compactMapValues { value in value.id.flatMap { $0.isEmpty ? nil : $0 } }
+    }
+
+    /// One `endpoint_flows` value: the flow id when it is a string, nil for anything else.
+    private struct LinkValue: Decodable {
+        let id: String?
+
+        init(from decoder: any Decoder) throws {
+            id = try? decoder.singleValueContainer().decode(String.self)
+        }
     }
 
     /// Decodes what the bus returned. Throws for anything but an object, or for
@@ -196,6 +232,8 @@ public struct ScanState: Equatable, Sendable {
     public var target: String?
     /// The URLs the last crawl reached.
     public var endpoints: [String] = []
+    /// Endpoint URL → the flow it was fetched in, from the last crawl (see `ScanResult.endpointFlows`).
+    public var endpointFlows: [String: String] = [:]
     public var points: [InjectionPoint] = []
     /// The selected injection point (an index into `points`).
     public var selected: Int?
@@ -211,6 +249,9 @@ public struct ScanState: Equatable, Sendable {
     public var selectedPoint: InjectionPoint? {
         selected.flatMap { points.indices.contains($0) ? points[$0] : nil }
     }
+
+    /// The flow an endpoint row opens, or nil when the last crawl recorded none for it.
+    public func flowID(forEndpoint url: String) -> FlowID? { ScanResult.flowID(for: url, in: endpointFlows) }
 
     /// `2 endpoints · 4 injection points · 2 pages`.
     public var summary: String {
@@ -230,6 +271,7 @@ public struct ScanState: Equatable, Sendable {
         running = false
         error = nil
         endpoints = result.endpoints
+        endpointFlows = result.endpointFlows
         points = result.injectionPoints
         pagesCrawled = result.pagesCrawled
         stoppedReason = result.stoppedReason
@@ -262,18 +304,23 @@ public struct ScanState: Equatable, Sendable {
 }
 
 extension Fixtures {
-    /// A `scan.discover` result over the fixture capture: every injection point
-    /// names a fixture flow, and the secret-named ones arrive redacted, as the
-    /// scanner returns them. The fixture session answers `scan.discover` with it.
+    /// A `scan.discover` result over the fixture capture: every endpoint and every
+    /// injection point names a fixture flow (`endpoint_flows` is keyed by the same
+    /// URL string `endpoints` lists), and the secret-named points arrive redacted,
+    /// as the scanner returns them. The fixture session answers `scan.discover` with it.
     public static let scanDiscover: JSONValue = {
         func point(_ n: Int, _ location: String, _ name: String, _ example: String) -> JSONValue {
             ["flow": .string(id(n).raw), "location": .string(location), "name": .string(name), "example": .string(example)]
         }
+        let products = "http://api.shop-staging.test/api/products?category=electronics&limit=20"
+        let orders = "http://api.shop-staging.test/api/orders?page=3"
+        let login = "http://auth.shop-staging.test/api/auth/login"
         return [
-            "endpoints": [
-                "http://api.shop-staging.test/api/products?category=electronics&limit=20",
-                "http://api.shop-staging.test/api/orders?page=3",
-                "http://auth.shop-staging.test/api/auth/login",
+            "endpoints": [.string(products), .string(orders), .string(login)],
+            "endpoint_flows": [
+                products: .string(id(41).raw),
+                orders: .string(id(45).raw),
+                login: .string(id(50).raw),
             ],
             "injection_points": [
                 point(41, "query", "category", "electronics"),
