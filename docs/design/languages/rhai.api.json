@@ -585,72 +585,62 @@
     {
       "name": "b64_encode",
       "kind": "function",
-      "status": "planned",
       "signature": "b64_encode(s)",
-      "description": "Base64-encode s. PLANNED: specced but not yet registered on the engine; a production follow-up implements it, at which point it leaves the planned bucket and the drift guard requires the engine token."
+      "description": "Base64-encode s (standard alphabet, `=` padding)."
     },
     {
       "name": "b64_decode",
       "kind": "function",
-      "status": "planned",
       "signature": "b64_decode(s)",
-      "description": "Base64-decode s. PLANNED: not yet registered on the engine."
+      "description": "Base64-decode s; errors on invalid base64 or non-UTF-8 bytes."
     },
     {
       "name": "url_encode",
       "kind": "function",
-      "status": "planned",
       "signature": "url_encode(s)",
-      "description": "Percent-encode s for use in a URL. PLANNED: not yet registered on the engine."
+      "description": "Percent-encode s for use in a URL (RFC 3986 unreserved set)."
     },
     {
       "name": "hex_encode",
       "kind": "function",
-      "status": "planned",
       "signature": "hex_encode(s)",
-      "description": "Hex-encode s. PLANNED: not yet registered on the engine."
+      "description": "Lowercase-hex-encode the UTF-8 bytes of s."
     },
     {
       "name": "sha256",
       "kind": "function",
-      "status": "planned",
       "signature": "sha256(s)",
-      "description": "SHA-256 digest of s. PLANNED: not yet registered on the engine."
+      "description": "SHA-256 digest of s, as lowercase hex."
     },
     {
       "name": "md5",
       "kind": "function",
-      "status": "planned",
       "signature": "md5(s)",
-      "description": "MD5 digest of s. PLANNED: not yet registered on the engine."
+      "description": "MD5 digest of s, as lowercase hex (legacy, non-secure)."
     },
     {
       "name": "rand_text_alpha",
       "kind": "function",
-      "status": "planned",
       "signature": "rand_text_alpha(n)",
-      "description": "A random string of n letters. PLANNED: not yet registered on the engine."
+      "description": "A random string of n ASCII letters."
     },
     {
       "name": "rand_int",
       "kind": "function",
-      "status": "planned",
       "signature": "rand_int(a, b)",
-      "description": "A random integer between a and b. PLANNED: not yet registered on the engine."
+      "description": "A random integer in the inclusive range [a, b]; errors when a > b."
     },
     {
       "name": "regex_match",
       "kind": "function",
-      "status": "planned",
       "signature": "regex_match(pat, s)",
-      "description": "True when pattern pat matches s. PLANNED: not yet registered on the engine."
+      "description": "True when pattern pat matches anywhere in s; errors on an invalid pattern."
     },
     {
       "name": "regex_extract",
       "kind": "function",
-      "status": "planned",
       "signature": "regex_extract(pat, s, group)",
-      "description": "The capture group of pat's match in s. PLANNED: not yet registered on the engine."
+      "description": "The text of capture group of pat's first match in s (\"\" if none); errors on an invalid pattern."
     }
   ],
   "reg": [
