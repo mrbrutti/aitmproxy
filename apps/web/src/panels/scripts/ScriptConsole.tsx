@@ -29,7 +29,22 @@ export const ScriptConsole: Component<{ store: ScriptsStore }> = (props) => {
             <span class={css.n}>{failing().length}</span>
           </Show>
         </div>
-        <Show when={failing().length > 0} fallback={<p class={css.quiet}>No script has failed.</p>}>
+        <Show
+          when={failing().length > 0}
+          fallback={
+            // "Nothing has failed" is a claim about a list that was read: not before it answers, not after it failed.
+            <Show
+              when={s.listError()}
+              fallback={
+                <Show when={s.listed()}>
+                  <p class={css.quiet}>No script has failed.</p>
+                </Show>
+              }
+            >
+              <p class={css.quiet}>Unknown — the scripts could not be read.</p>
+            </Show>
+          }
+        >
           <ul>
             <For each={failing()}>
               {(row) => (

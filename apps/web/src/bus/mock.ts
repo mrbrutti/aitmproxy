@@ -192,7 +192,7 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
     enabled: boolean;
     last_error: string | null;
   }
-  const SCRIPT_DIR = '/Users/matt/aitm/scripts';
+  const SCRIPT_DIR = '/home/operator/.aitm/scripts';
   const SCRIPT_HOOKS = ['on_request_headers', 'on_request', 'on_response_headers', 'on_response', 'on_ws_start', 'on_ws_message', 'on_ws_end', 'on_error'];
   const scriptFx: ScriptFx[] = [
     { name: 'redact-auth', path: `${SCRIPT_DIR}/redact-auth.rhai`, api: '1', hooks: ['on_request', 'on_response'], enabled: true, last_error: null },

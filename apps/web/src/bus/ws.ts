@@ -46,6 +46,7 @@ export function createWsBus(opts: WsBusOptions): BusClient {
   let closedByUser = false;
   let toolsCache: ToolDef[] | null = null;
   let ready: Promise<void> = Promise.resolve();
+  let readyPending = false;
   let resolveReady: () => void = () => {};
   let timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -58,8 +59,25 @@ export function createWsBus(opts: WsBusOptions): BusClient {
     }
   })();
 
+  /**
+   * Callers wait on `ready` until a connection is open. While one is pending it is KEPT across failed
+   * attempts: replacing it would strand every caller that already holds it (they would never be
+   * released, even once a later attempt succeeds). A fresh one is armed only after the last settled.
+   */
   function armReady() {
-    ready = new Promise<void>((r) => (resolveReady = r));
+    if (readyPending) return;
+    readyPending = true;
+    ready = new Promise<void>((r) => {
+      resolveReady = () => {
+        readyPending = false;
+        r();
+      };
+    });
+  }
+
+  /** Release every waiter: the bus opened, or was closed (they then fail fast in `send`). */
+  function settleReady() {
+    if (readyPending) resolveReady();
   }
 
   function send(obj: unknown) {
@@ -146,7 +164,7 @@ export function createWsBus(opts: WsBusOptions): BusClient {
         attempt = 0;
         setLastError(null);
         setState('open');
-        resolveReady();
+        settleReady();
       } catch (e) {
         setLastError((e as Error).message);
         sock.close();
@@ -186,6 +204,7 @@ export function createWsBus(opts: WsBusOptions): BusClient {
       timer = null;
       ws?.close();
       setState('closed');
+      settleReady(); // callers still waiting for a connection proceed and fail with 'bus not connected'
     },
     async tools() {
       if (toolsCache) return toolsCache;

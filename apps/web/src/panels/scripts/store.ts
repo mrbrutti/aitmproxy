@@ -33,11 +33,16 @@ export interface ScriptsStore {
   canSave: Accessor<boolean>;
   hasFindings: Accessor<boolean>;
   rows: Accessor<ScriptRow[]>;
-  /** The first `script.list` answered (or failed): until then "no scripts" would be a guess. */
+  /** The first `script.list` settled, answered or failed: until then "no scripts" would be a guess. */
   loaded: Accessor<boolean>;
+  /** A `script.list` has answered at least once: only then are the rows, and "nothing has failed", facts. */
+  listed: Accessor<boolean>;
+  /** The core's text from the latest `script.list` if it failed, else null. A success clears it. */
+  listError: Accessor<string | null>;
   /**
    * How many scripts are enabled, or null while that is unknown: `script.list` is not offered, has not
-   * answered yet, or has only failed. Never a made-up zero.
+   * answered yet, or its latest read failed. Never a made-up zero, never a count from a list that could
+   * not be re-read.
    */
   active: Accessor<number | null>;
   findings: Accessor<ScriptFindings>;
@@ -62,7 +67,7 @@ export interface ScriptsStore {
 /** Why authoring is off for an agent session; the core enforces it, the panel only explains it. */
 export const AGENT_REASON = 'Agent session — the core refuses script authoring unless rhai.allow_agent_authoring is set. Connect as the operator to author.';
 
-export const NAME_RULE = 'A name may contain only letters, digits, "_" and "-".';
+const NAME_RULE = 'A name may contain only letters, digits, "_" and "-".';
 
 const states = new WeakMap<AppStore, ScriptsStore>();
 
@@ -81,9 +86,10 @@ function build(app: AppStore): ScriptsStore {
   const has = (tool: string) => app.proxy.tools.some((t) => t.name === tool);
   const offered = createMemo(() => has('script.list'));
   // The role is read live (`null` = the server echoed none): only a known agent session is switched off,
-  // so an unknown one still reaches the core and shows its answer. These are plain accessors, not memos,
-  // so building the store (the sidebar does it for the count) reads neither the role nor the tool list
-  // until a control actually asks.
+  // so an unknown one still reaches the core and shows its answer. Building the store (the sidebar does
+  // it for the count) evaluates only the `offered` and `active` memos, which read the tool list; these
+  // are plain accessors, so the role is not read until a control asks, and a partial app with no bus
+  // (a unit test hosting the sidebar) can build it.
   const agent = () => app.bus.role() === 'agent';
   const canToggle = () => !agent() && has('script.enable') && has('script.disable');
   const canReload = () => !agent() && has('script.reload');
@@ -96,14 +102,23 @@ function build(app: AppStore): ScriptsStore {
   const [rows, setRows] = createStore<ScriptRow[]>([]);
   const [loaded, setLoaded] = createSignal(false);
   const [listed, setListed] = createSignal(false);
+  const [listError, setListError] = createSignal<string | null>(null);
   const [findings, setFindings] = createSignal<ScriptFindings>({ findings: [], dropped: 0 });
   const [busy, setBusy] = createSignal(false);
   const [name, setName] = createSignal('');
   const [source, setSource] = createSignal('');
   const [outcome, setOutcome] = createSignal<Outcome | null>(null);
+  // Bumped on every edit of the name or the source: a validate answer for text that has since changed
+  // is discarded rather than shown beside the new text.
+  let draftRev = 0;
+  const edited = (set: (v: string) => void) => (v: string) => {
+    draftRev++;
+    setOutcome(null);
+    set(v);
+  };
   const nameError = createMemo(() => (name() !== '' && !isScriptName(name()) ? NAME_RULE : null));
 
-  const active = createMemo(() => (offered() && listed() ? activeCount(rows) : null));
+  const active = createMemo(() => (offered() && listed() && listError() === null ? activeCount(rows) : null));
 
   async function refreshList(): Promise<void> {
     if (!offered()) return;
@@ -111,8 +126,13 @@ function build(app: AppStore): ScriptsStore {
       (raw) => {
         setRows(reconcile(parseScriptList(raw), { key: 'name' }));
         setListed(true);
+        setListError(null);
       },
-      (e) => app.notice(`script.list: ${messageOf(e)}`, 'error'),
+      (e) => {
+        // The body shows this (a toast alone is gone in 6 s); the rows stay as the last good list.
+        setListError(messageOf(e));
+        app.notice(`script.list: ${messageOf(e)}`, 'error');
+      },
     );
     setLoaded(true);
   }
@@ -142,7 +162,7 @@ function build(app: AppStore): ScriptsStore {
         await app.call(tool, args);
       } catch (e) {
         app.notice(`${tool}: ${messageOf(e)}`, 'error');
-        return;
+        return; // a failed action must not fall through to its success toast or the refresh
       }
       done?.();
       await refresh();
@@ -161,13 +181,15 @@ function build(app: AppStore): ScriptsStore {
     hasFindings,
     rows: () => rows,
     loaded,
+    listed,
+    listError,
     active,
     findings,
     busy,
     name,
-    setName,
+    setName: edited(setName),
     source,
-    setSource,
+    setSource: edited(setSource),
     nameError,
     outcome,
     refreshList,
@@ -177,11 +199,13 @@ function build(app: AppStore): ScriptsStore {
     async validate() {
       const text = source();
       if (busy() || !canValidate() || text.trim() === '') return;
+      const rev = draftRev;
       setBusy(true);
       try {
-        setOutcome({ kind: 'valid', report: parseReport(await app.call('script.validate', { source: text })) });
+        const next: Outcome = { kind: 'valid', report: parseReport(await app.call('script.validate', { source: text })) };
+        if (rev === draftRev) setOutcome(next);
       } catch (e) {
-        setOutcome({ kind: 'error', text: messageOf(e) });
+        if (rev === draftRev) setOutcome({ kind: 'error', text: messageOf(e) });
       } finally {
         setBusy(false);
       }
@@ -189,7 +213,9 @@ function build(app: AppStore): ScriptsStore {
     async save() {
       const text = source();
       const n = name();
-      // The name is re-checked here, not only on the button: Enter or a stale click must not reach the core.
+      // The same conditions the Save button is gated on, held here too so no other caller (a shortcut, a
+      // test) can send the core a name it would refuse or an empty script. A save result is always shown
+      // (it records a write that happened), even if the text was edited while the call was in flight.
       if (busy() || !canSave() || !isScriptName(n) || text.trim() === '') return;
       setBusy(true);
       try {

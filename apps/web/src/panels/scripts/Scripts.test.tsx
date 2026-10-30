@@ -9,6 +9,7 @@ import { BusError, type BusClient, type BusRole, type ToolDef } from '~/bus/type
 import { createAppStore } from '~/state/app';
 import { AppProvider } from '~/state/context';
 import { ScriptsPanel } from '../ScriptsPanel';
+import { scriptsStore } from './store';
 
 interface MountOpts {
   /** Replace one tool's reply: return a value to answer with it, an Error to reject, `undefined` to fall through to the fixture. */
@@ -90,6 +91,10 @@ const text = (el: Element | null | undefined) => el?.textContent?.replace(/\s+/g
 const type = (label: string, value: string) => fireEvent.input(screen.getByLabelText(label), { target: { value } });
 /** The first `script.list` has landed and the rows are on screen (the console's findings load alongside and may land first). */
 const ready = () => waitFor(() => expect(row('redact-auth')).not.toBeNull());
+/** Let every already-queued promise continuation run: a call a handler made has been recorded, a toast it set is set. */
+const flush = async () => {
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+};
 
 describe('ScriptsPanel — list', () => {
   it('renders one row per loaded script with hooks, api and enabled state, and counts the active ones', async () => {
@@ -122,21 +127,64 @@ describe('ScriptsPanel — list', () => {
   });
 
   it('says so in place, and calls nothing, when the core does not offer script.list', async () => {
-    const { calls } = mount({ tools: (all) => all.filter((t) => !t.name.startsWith('script.')) });
-    expect(await screen.findByText(/Scripts are not enabled on this core/)).toBeTruthy();
+    const { app, calls } = mount({ tools: (all) => all.filter((t) => !t.name.startsWith('script.')) });
+    // The panel says so from the first paint; what matters is that nothing is asked once the tool list is known.
+    await waitFor(() => expect(app.proxy.tools.length).toBeGreaterThan(0));
+    await flush();
+    expect(screen.getByText(/Scripts are not enabled on this core/)).toBeTruthy();
     expect(screen.queryByLabelText('Script source')).toBeNull();
     expect(screen.queryByRole('switch')).toBeNull();
-    await new Promise((r) => setTimeout(r, 50));
     expect(calls.filter((c) => c.tool.startsWith('script.'))).toEqual([]);
   });
 });
 
 describe('ScriptsPanel — list errors', () => {
-  it("surfaces a failing script.list with the core's text instead of showing an empty list as fact", async () => {
-    const { app } = mount({ reply: (tool) => (tool === 'script.list' ? new BusError('rhai host is not running') : undefined) });
-    await waitFor(() => expect(app.toast()).toEqual({ text: 'script.list: rhai host is not running', kind: 'error' }));
-    // A failed list is not "0 active": the header stays silent about a count it does not know.
+  const MSG = 'rhai host is not running';
+
+  it("shows a failing script.list as a failure, with the core's text and a Retry, never as an empty list", async () => {
+    let failing = true;
+    const { app } = mount({ reply: (tool) => (tool === 'script.list' && failing ? new BusError(MSG) : undefined) });
+    const err = await waitFor(() => {
+      const found = document.querySelector<HTMLElement>('[data-list-error]');
+      expect(found).not.toBeNull();
+      return found!;
+    });
+    expect(text(err)).toContain(MSG);
+    expect(app.toast()).toEqual({ text: `script.list: ${MSG}`, kind: 'error' }); // the toast is only the second signal
+    // The body never states what it does not know: not "no scripts", not "no script has failed", not a count.
+    expect(screen.queryByText('No scripts loaded.')).toBeNull();
+    expect(screen.queryByText('No script has failed.')).toBeNull();
     expect(screen.queryByText(/ active$/)).toBeNull();
+    expect(document.querySelector('[data-script]')).toBeNull();
+
+    failing = false;
+    fireEvent.click(within(err).getByRole('button', { name: 'Retry' }));
+    await ready();
+    expect(document.querySelector('[data-list-error]')).toBeNull();
+    expect(screen.getByText('2 active')).toBeTruthy();
+  });
+
+  it('keeps the last good rows, with the error beside them, when a later refresh fails', async () => {
+    let failing = false;
+    mount({ reply: (tool) => (tool === 'script.list' && failing ? new BusError(MSG) : undefined) });
+    await ready();
+
+    failing = true;
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    await waitFor(() => expect(document.querySelector('[data-list-error]')).not.toBeNull());
+    expect(row('redact-auth')).not.toBeNull(); // still the last good list, still actionable
+    expect(screen.queryByText(/ active$/)).toBeNull(); // but no count claimed from a list that could not be re-read
+  });
+
+  it('claims nothing about scripts or their errors before the first script.list answers', async () => {
+    let answer!: (v: unknown) => void;
+    mount({ reply: (tool) => (tool === 'script.list' ? new Promise((r) => (answer = r)) : undefined) });
+    await waitFor(() => expect(answer).toBeTypeOf('function')); // script.list is in flight
+    expect(screen.queryByText('No script has failed.')).toBeNull();
+    expect(screen.queryByText('No scripts loaded.')).toBeNull();
+
+    answer([{ name: 'quiet', path: '/p/quiet.rhai', api: '1', hooks: [], enabled: true, last_error: null }]);
+    expect(await screen.findByText('No script has failed.')).toBeTruthy();
   });
 });
 
@@ -150,7 +198,7 @@ describe('ScriptsPanel — row actions', () => {
     fireEvent.click(before);
     await waitFor(() => expect(toggle().getAttribute('aria-checked')).toBe('false'));
     expect(screen.getByText('1 active')).toBeTruthy();
-    // The refresh updates the row in place: the control you just used keeps its node, so it keeps keyboard focus.
+    // The refresh updates the row in place, so the control you just used keeps its node (and its keyboard focus).
     expect(toggle()).toBe(before);
     expect(calls.filter((c) => c.tool === 'script.disable')).toEqual([{ tool: 'script.disable', args: { name: 'redact-auth' } }]);
     const afterDisable = (await bus.call<{ name: string; enabled: boolean }[]>('script.list')).find((s) => s.name === 'redact-auth');
@@ -171,6 +219,45 @@ describe('ScriptsPanel — row actions', () => {
     await waitFor(() => expect(row('flaky-parser').querySelector('[data-last-error]')).toBeNull());
     expect(calls.filter((c) => c.tool === 'script.reload')).toEqual([{ tool: 'script.reload', args: { name: 'flaky-parser' } }]);
     expect(app.toast()).toEqual({ text: 'Reloaded flaky-parser', kind: 'info' });
+  });
+
+  it('keeps the error toast, re-reads nothing and shows no success when a reload fails', async () => {
+    const msg = "error: flaky-parser:12:5 — expecting ')' to end the call";
+    const { app, calls } = mount({ reply: (tool) => (tool === 'script.reload' ? new BusError(msg) : undefined) });
+    await ready();
+    const lists = () => calls.filter((c) => c.tool === 'script.list').length;
+    const before = lists();
+
+    fireEvent.click(within(row('flaky-parser')).getByRole('button', { name: 'Reload flaky-parser' }));
+    await waitFor(() => expect(app.toast()?.kind).toBe('error'));
+    await flush();
+    expect(app.toast()).toEqual({ text: `script.reload: ${msg}`, kind: 'error' }); // not replaced by "Reloaded flaky-parser"
+    expect(lists()).toBe(before);
+    expect(row('flaky-parser').querySelector('[data-last-error]')).not.toBeNull();
+  });
+
+  it('keeps the row controls focusable while an action is in flight: aria-disabled, not disabled, and a second click is ignored', async () => {
+    let finish!: (v: unknown) => void;
+    const { calls } = mount({ reply: (tool) => (tool === 'script.disable' ? new Promise((r) => (finish = r)) : undefined) });
+    await ready();
+    const toggle = within(row('redact-auth')).getByRole('switch', { name: 'redact-auth enabled' });
+    const reload = within(row('redact-auth')).getByRole('button', { name: 'Reload redact-auth' });
+    toggle.focus();
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle.getAttribute('aria-disabled')).toBe('true'));
+    expect(reload.getAttribute('aria-disabled')).toBe('true');
+    // A `disabled` button drops keyboard focus in a real browser; aria-disabled keeps it.
+    expect(toggle.hasAttribute('disabled')).toBe(false);
+    expect(reload.hasAttribute('disabled')).toBe(false);
+    expect(document.activeElement).toBe(toggle);
+    fireEvent.click(toggle);
+    fireEvent.click(reload);
+    expect(calls.filter((c) => c.tool === 'script.disable')).toHaveLength(1);
+    expect(calls.some((c) => c.tool === 'script.reload')).toBe(false);
+
+    finish({ name: 'redact-auth', enabled: false });
+    await waitFor(() => expect(toggle.hasAttribute('aria-disabled')).toBe(false));
   });
 
   it("surfaces the core's refusal verbatim and leaves the state unchanged", async () => {
@@ -234,7 +321,7 @@ describe('ScriptsPanel — new-script editor', () => {
     const result = await screen.findByLabelText('Result');
     await waitFor(() => expect(text(result)).toContain('Saved probe'));
     expect(calls.filter((c) => c.tool === 'script.save')).toEqual([{ tool: 'script.save', args: { name: 'probe', source: GOOD_SRC, enable: true } }]);
-    expect(text(result.querySelector('[data-field="path"]'))).toBe('/Users/matt/aitm/scripts/probe.rhai');
+    expect(text(result.querySelector('[data-field="path"]'))).toBe('/home/operator/.aitm/scripts/probe.rhai');
     expect(text(result)).toContain('No restart needed');
     expect(text(result)).not.toContain('Restart required');
 
@@ -269,7 +356,7 @@ describe('ScriptsPanel — new-script editor', () => {
     const save = screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement;
     expect(save.disabled).toBe(true);
     fireEvent.click(save);
-    await new Promise((r) => setTimeout(r, 50));
+    await flush();
     expect(calls.some((c) => c.tool === 'script.save')).toBe(false);
 
     type('Script name', 'good-name_1');
@@ -286,6 +373,41 @@ describe('ScriptsPanel — new-script editor', () => {
     expect((screen.getByRole('button', { name: 'Validate' }) as HTMLButtonElement).disabled).toBe(false);
     // A source alone is not savable: the file needs a name.
     expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+describe('ScriptsPanel — stale results', () => {
+  it('drops a validate or save result as soon as the source or the name is edited', async () => {
+    mount();
+    await ready();
+    type('Script source', BAD_SRC);
+    fireEvent.click(screen.getByRole('button', { name: 'Validate' }));
+    const result = await screen.findByLabelText('Result');
+    await within(result).findByRole('alert');
+
+    type('Script source', GOOD_SRC);
+    expect(within(result).queryByRole('alert')).toBeNull();
+    expect(text(result)).toBe('');
+
+    type('Script name', 'probe');
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(text(result)).toContain('Saved probe'));
+    type('Script name', 'probe-2');
+    expect(text(result)).toBe('');
+  });
+
+  it('does not show a validate answer that arrives after the source was edited', async () => {
+    let finish!: (v: unknown) => void;
+    mount({ reply: (tool) => (tool === 'script.validate' ? new Promise((r) => (finish = r)) : undefined) });
+    await ready();
+    type('Script source', GOOD_SRC);
+    fireEvent.click(screen.getByRole('button', { name: 'Validate' }));
+    await waitFor(() => expect(finish).toBeTypeOf('function'));
+
+    type('Script source', `${GOOD_SRC}// edited\n`);
+    finish({ name: 'probe', api: '1', hooks: ['on_request'], registers: { commands: [], options: [] } });
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Validate' }) as HTMLButtonElement).disabled).toBe(false)); // the call settled
+    expect(text(screen.getByLabelText('Result'))).toBe('');
   });
 });
 
@@ -387,5 +509,55 @@ describe('ScriptsPanel — capability gating', () => {
     type('Script source', GOOD_SRC);
     expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true);
     expect((within(row('redact-auth')).getByRole('switch', { name: 'redact-auth enabled' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+});
+
+describe('scripts store — guards', () => {
+  it('save() sends nothing without a valid name and a source, and sends the exact request once it has both', async () => {
+    const { app, calls } = mount();
+    await ready();
+    const store = scriptsStore(app);
+    const saves = () => calls.filter((c) => c.tool === 'script.save');
+
+    await store.save(); // nothing typed
+    store.setName('bad name!');
+    store.setSource(GOOD_SRC);
+    await store.save(); // a name the core would refuse
+    store.setName('probe');
+    store.setSource(' \n\t');
+    await store.save(); // a blank source
+    expect(saves()).toEqual([]);
+
+    store.setSource(GOOD_SRC);
+    await store.save();
+    expect(saves()).toEqual([{ tool: 'script.save', args: { name: 'probe', source: GOOD_SRC, enable: true } }]);
+  });
+
+  it('validate() sends nothing for a blank source, and only the source otherwise', async () => {
+    const { app, calls } = mount();
+    await ready();
+    const store = scriptsStore(app);
+    const validates = () => calls.filter((c) => c.tool === 'script.validate');
+
+    store.setSource('  \n');
+    await store.validate();
+    expect(validates()).toEqual([]);
+
+    store.setSource(GOOD_SRC);
+    await store.validate();
+    expect(validates()).toEqual([{ tool: 'script.validate', args: { source: GOOD_SRC } }]);
+  });
+
+  it('save() is refused for an agent session, validate() is not', async () => {
+    const { app, calls } = mount({ role: 'agent' });
+    await ready();
+    const store = scriptsStore(app);
+    store.setName('probe');
+    store.setSource(GOOD_SRC);
+
+    await store.save();
+    expect(calls.some((c) => c.tool === 'script.save')).toBe(false);
+    await store.validate();
+    expect(calls.filter((c) => c.tool === 'script.validate')).toHaveLength(1);
   });
 });

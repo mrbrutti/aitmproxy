@@ -65,7 +65,7 @@ describe('Sidebar Scripts count', () => {
   });
 
   /** The mock bus (3 scripts, 2 enabled), with the tool list and the `script.list` answer overridable. */
-  function mountScripts(opts: { tools?: (all: ToolDef[]) => ToolDef[]; list?: () => Promise<unknown> } = {}) {
+  function mountScripts(opts: { tools?: (all: ToolDef[]) => ToolDef[]; list?: () => Promise<unknown> | undefined } = {}) {
     const mock = createMockBus({ initial: 0, rate: 0, agentActive: false });
     mocks.push(mock);
     const calls: string[] = [];
@@ -77,7 +77,10 @@ describe('Sidebar Scripts count', () => {
       },
       async call<T>(tool: string, args: Record<string, unknown> = {}): Promise<T> {
         calls.push(tool);
-        if (tool === 'script.list' && opts.list) return (await opts.list()) as T;
+        if (tool === 'script.list' && opts.list) {
+          const answer = opts.list(); // undefined: answer from the fixture
+          if (answer !== undefined) return (await answer) as T;
+        }
         return mock.call<T>(tool, args);
       },
     };
@@ -90,6 +93,10 @@ describe('Sidebar Scripts count', () => {
     return { app, calls };
   }
 
+  /** Let every already-queued promise continuation run: a call made on mount has been recorded by now. */
+  const flush = async () => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  };
   const item = () => screen.getByText('Scripts').closest('button')!;
   /** The item's count text, or null when it shows none. */
   const count = () => item().querySelector('[data-kind]')?.textContent ?? null;
@@ -110,13 +117,14 @@ describe('Sidebar Scripts count', () => {
   });
 
   it('shows no count when script.list fails, and when the core does not offer it, and then calls nothing', async () => {
-    mountScripts({ list: () => Promise.reject(new BusError('rhai host is not running')) });
-    await new Promise((r) => setTimeout(r, 60));
+    const failed = mountScripts({ list: () => Promise.reject(new BusError('rhai host is not running')) });
+    await waitFor(() => expect(failed.app.toast()?.text).toBe('script.list: rhai host is not running'));
     expect(count()).toBeNull();
     cleanup();
 
-    const { calls } = mountScripts({ tools: (all) => all.filter((t) => !t.name.startsWith('script.')) });
-    await new Promise((r) => setTimeout(r, 60));
+    const { app, calls } = mountScripts({ tools: (all) => all.filter((t) => !t.name.startsWith('script.')) });
+    await waitFor(() => expect(app.proxy.tools.length).toBeGreaterThan(0));
+    await flush();
     expect(count()).toBeNull();
     expect(calls.filter((c) => c.startsWith('script.'))).toEqual([]);
   });
@@ -125,6 +133,20 @@ describe('Sidebar Scripts count', () => {
     const { calls } = mountScripts();
     await waitFor(() => expect(count()).toBe('2 active'));
     expect(calls.filter((c) => c.startsWith('script.'))).toEqual(['script.list']);
+  });
+
+  it('goes back to no count when a later script.list fails, rather than keeping a stale one', async () => {
+    let failing = false;
+    const { app } = mountScripts({ list: () => (failing ? Promise.reject(new BusError('rhai host is not running')) : undefined) });
+    await waitFor(() => expect(count()).toBe('2 active'));
+
+    failing = true;
+    await scriptsStore(app).refreshList();
+    expect(count()).toBeNull();
+
+    failing = false;
+    await scriptsStore(app).refreshList();
+    expect(count()).toBe('2 active');
   });
 
   it('follows the scripts store: disabling a script updates the count', async () => {

@@ -147,10 +147,11 @@ fn proxy_status_reports_armed_capturing_paused_and_listening() {
     assert_eq!(field(&status, "address"), &Value::Null);
 }
 
-/// The web sidebar shows the core's version from here, so it must be the real build's version
-/// (the workspace version every crate shares), not a number baked into a UI.
+/// The web sidebar shows the core's version from here, so it must be the real build's version, not a
+/// number baked into a UI. `env!("CARGO_PKG_VERSION")` here is this crate's version, which is the
+/// workspace version (every crate sets `version.workspace = true`) and so the binary's.
 #[test]
-fn proxy_status_reports_the_binary_version() {
+fn proxy_status_reports_the_workspace_crate_version() {
     let reg = reg();
     let store = MemFlowStore::new();
     let guard = StdGuard::default();
@@ -160,14 +161,15 @@ fn proxy_status_reports_the_binary_version() {
         field(&status, "version"),
         &Value::Str(env!("CARGO_PKG_VERSION").into())
     );
-    // Not an empty or placeholder string: a dotted semver triple.
+    // Not an empty or placeholder string. Deliberately no semver-shape check: a pre-release such as
+    // `0.6.0-rc.1` or a build-metadata suffix is a legitimate version and must not break this test.
     let Value::Str(v) = field(&status, "version") else {
         panic!("version is a string");
     };
-    assert_eq!(v.split('.').count(), 3, "not a semver version: {v}");
+    assert!(!v.is_empty(), "version is empty");
     assert!(
-        v.split('.').all(|p| p.parse::<u32>().is_ok()),
-        "not a semver version: {v}"
+        v.starts_with(|c: char| c.is_ascii_digit()),
+        "version should start with a digit: {v}"
     );
 
     // The schema documents it, so tools/list tells a client the key exists.

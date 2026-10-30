@@ -304,18 +304,20 @@ export function createAppStore(bus: BusClient) {
       });
     }
 
-    // When the last flow/state notification landed. The poll loop backs off only while push is
-    // demonstrably flowing — never because the core merely *advertises* `flow.subscribe`.
-    let lastPushAt = Number.NEGATIVE_INFINITY;
+    // When the last flow / state notification landed. The poll loop backs off only while the matching
+    // stream is demonstrably flowing — never because the core merely *advertises* `flow.subscribe`,
+    // and never for the list because only the state stream (throughput ticks) is alive.
+    let lastFlowPushAt = Number.NEGATIVE_INFINITY;
+    let lastStatePushAt = Number.NEGATIVE_INFINITY;
 
     bus.onNotification((method, params) => {
       switch (method) {
         case 'notifications/aitm/flow':
-          lastPushAt = Date.now();
+          lastFlowPushAt = Date.now();
           onFlowEvent(params as FlowNotification);
           break;
         case 'notifications/aitm/state':
-          lastPushAt = Date.now();
+          lastStatePushAt = Date.now();
           onState(params as StateNotification);
           break;
         case 'notifications/aitm/agent':
@@ -326,22 +328,36 @@ export function createAppStore(bus: BusClient) {
 
     // ---- live updates: poll unless push is demonstrably flowing -------------
     // Every real bus is polled. `flow.subscribe` being advertised proves nothing — nothing here calls
-    // it, and the /bus bridge pushes no notifications — so the loop runs regardless, and only skips
-    // its work while a flow/state notification arrived within PUSH_FRESH_MS. Even then a heartbeat
-    // poll runs every PUSH_FRESH_MS, so a push that dies quietly (or carries only state) cannot freeze
-    // the list. The static `fixtures` bus is a snapshot and is never polled.
+    // it, and the /bus bridge pushes no notifications — so the loop runs regardless. It skips the flow
+    // poll only while a FLOW notification arrived within PUSH_FRESH_MS, and the status poll only while
+    // a STATE one did (a bridge that pushes just throughput ticks must not slow the list down). Even
+    // then a heartbeat runs every PUSH_FRESH_MS, so a push that dies quietly or loses events cannot
+    // freeze either. The loop touches the bus only while it is `open` (a call into a bus that is
+    // reconnecting can wait on it indefinitely), and heals a bootstrap that never got the tool
+    // catalogue. The static `fixtures` bus is a snapshot and is never polled.
     const POLL_MS = 500;
-    const STATUS_EVERY_TICKS = 4; // ~2 s while polling
+    const STATUS_EVERY_MS = 2000; // while the state stream is not pushing
     const PUSH_FRESH_MS = 10_000;
-    let pollTimer: ReturnType<typeof setTimeout> | null = null;
+    /** At most this many unseen flows are fetched per poll, so a core holding tens of thousands cannot be hit with that many concurrent `flow.detail` calls. */
+    const MAX_FRESH_PER_POLL = 200;
     let pollLoopOn = false;
-    let pollTicks = 0;
+    let toolsLoaded = false;
+    /** The last poll left unseen flows behind (the per-poll cap): keep polling until they are all in, push or not. */
+    let backlog = false;
     let lastPollAt = Number.NEGATIVE_INFINITY;
+    let lastStatusAt = Number.NEGATIVE_INFINITY;
+    const isFresh = (at: number, now: number) => {
+      const age = now - at;
+      return age >= 0 && age < PUSH_FRESH_MS;
+    };
     async function pollOnce() {
       lastPollAt = Date.now();
       try {
         const ids = await bus.call<string[]>('flow.list');
-        const fresh = ids.filter((id) => !byId.has(id));
+        // Oldest first, so the list stays in capture order while the backlog drains.
+        const unseen = ids.filter((id) => !byId.has(id));
+        const fresh = unseen.slice(0, MAX_FRESH_PER_POLL);
+        backlog = unseen.length > fresh.length;
         const pending = ids.filter((id) => {
           const e = byId.get(id);
           return e && e.raw.status == null && e.raw.intercept !== 'killed';
@@ -365,6 +381,7 @@ export function createAppStore(bus: BusClient) {
     }
     async function pollStatus() {
       if (!proxy.tools.some((t) => t.name === 'proxy.status')) return;
+      lastStatusAt = Date.now();
       try {
         const s = await bus.call<{ capturing?: boolean; intercept_armed?: boolean; address?: string | null; paused?: number; version?: unknown }>('proxy.status');
         setProxy({
@@ -377,29 +394,44 @@ export function createAppStore(bus: BusClient) {
         /* next tick */
       }
     }
+    /** `polling` means the loop is the live source: the bus is open and no flow notifications are arriving. */
+    const syncPollingFlag = () => setProxy('polling', bus.state() === 'open' && !isFresh(lastFlowPushAt, Date.now()));
     function startPolling() {
       if (pollLoopOn) return;
       pollLoopOn = true;
+      syncPollingFlag();
       const tick = async () => {
-        pollTimer = null;
-        // A closed bus ends the loop (nothing is rescheduled), so no timer outlives it.
+        // A closed bus ends the loop: nothing is rescheduled, so at most one more tick runs after close.
         if (bus.state() === 'closed') {
           pollLoopOn = false;
           setProxy('polling', false);
           return;
         }
-        const now = Date.now();
-        const sincePush = now - lastPushAt;
-        const pushLive = sincePush >= 0 && sincePush < PUSH_FRESH_MS;
-        setProxy('polling', !pushLive);
-        if (!pushLive || now - lastPollAt >= PUSH_FRESH_MS) {
-          await pollOnce();
-          // The listener/intercept state is polled too: every ~2 s on the loop, on each heartbeat under push.
-          if (pushLive || ++pollTicks % STATUS_EVERY_TICKS === 0) await pollStatus();
+        try {
+          syncPollingFlag();
+          // Only an open bus is called. Anything else (connecting, reconnecting) is waited out: a call
+          // issued into it can stay pending, and since the loop never overlaps itself that would stall it.
+          if (bus.state() === 'open') {
+            if (!toolsLoaded) {
+              // A bootstrap that never got the tool catalogue heals here, then re-reads the side data.
+              try {
+                await loadCatalogue();
+              } catch {
+                /* next tick */
+              }
+            }
+            const now = Date.now();
+            if (backlog || !isFresh(lastFlowPushAt, now) || now - lastPollAt >= PUSH_FRESH_MS) await pollOnce();
+            const later = Date.now();
+            // State/armed/version: every ~2 s unless state is pushed, and on the heartbeat even then.
+            const statusEvery = isFresh(lastStatePushAt, later) ? PUSH_FRESH_MS : STATUS_EVERY_MS;
+            if (later - lastStatusAt >= statusEvery) await pollStatus();
+          }
+        } finally {
+          setTimeout(tick, POLL_MS);
         }
-        pollTimer = setTimeout(tick, POLL_MS);
       };
-      pollTimer = setTimeout(tick, POLL_MS);
+      setTimeout(tick, POLL_MS);
     }
 
     // ---- PoC session state ----------------------------------------------------
@@ -492,7 +524,8 @@ export function createAppStore(bus: BusClient) {
         );
       // No read for the intercept state exists: `flow.intercept {}` ARMS (enabled defaults to
       // true), so the armed flag comes only from notifications/aitm/state and our own calls.
-      if (has('proxy.status'))
+      if (has('proxy.status')) {
+        lastStatusAt = Date.now();
         jobs.push(
           bus
             .call<{
@@ -520,15 +553,22 @@ export function createAppStore(bus: BusClient) {
             )
             .catch(() => {}),
         );
+      }
       await Promise.all(jobs);
+    }
+
+    /** The tool catalogue, then everything read through it. Shared by bootstrap and the loop's heal. */
+    async function loadCatalogue() {
+      const tools = await bus.tools();
+      setProxy('tools', tools);
+      toolsLoaded = true;
+      await refreshSide();
     }
 
     async function bootstrap() {
       bus.connect();
       try {
-        const tools = await bus.tools();
-        setProxy('tools', tools);
-        await refreshSide();
+        await loadCatalogue();
         await pollOnce(); // the snapshot of what was captured before this page connected
       } catch (e) {
         notice((e as Error).message, 'error');
