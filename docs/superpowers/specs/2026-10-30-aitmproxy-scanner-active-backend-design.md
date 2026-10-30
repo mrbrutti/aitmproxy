@@ -32,8 +32,9 @@ injection points, deny-by-default, scope- and budget-bound, with egress
 confinement and redaction (PR #67). This design completes the deterministic
 scanner's backend for a **v0.6** release (v0.5 ships discovery-only): the five
 remaining `scan.*` verbs — `scan.passive`, `scan.report`, `scan.inject`,
-`scan.run`, `scan.status` — built **entirely by extending the shipped
-`aitm-plugin-scanner` crate**, reusing the shipped `ScannerConfig`,
+`scan.run`, `scan.status` — built **by extending the shipped
+`aitm-plugin-scanner` crate** (plus the two non-core list edits in Constraints),
+reusing the shipped `ScannerConfig`,
 `ScannerPlugin`, `enumerate`/`InjectionPoint`/`Location`, and `crawl`, and reusing
 the `aitm_poc` matcher/builder/runner vocabulary and `aitm-findings` store/report —
 with **no edit to `aitm-core`**. The active verbs (`scan.inject`, `scan.run`) carry
@@ -53,7 +54,8 @@ and the seeded Vulnerable/Patched test target.
 - **`scan.report {target?}`** (**Read**) folds recorded findings into a human
   report and a machine index via `aitm_findings::{render_report, render_index}`,
   returning `{ report_md, index }`.
-- **`scan.inject {target, class, injection_point?}`** (**Sensitive**) injects a
+- **`scan.inject {target, class, injection_point?}`** (**Sensitive**; the optional
+  `injection_point` is a `{flow, location, name}` object naming one point) injects a
   bounded per-class payload set into discovered injection points through the single
   guarded client chokepoint (`host.client().send` → `check_active`), correlates
   internally with `matcher::evaluate` to confirm, builds a reproducible PoC via
@@ -108,9 +110,10 @@ and the seeded Vulnerable/Patched test target.
 - Follow-ups, deliberately not in v0.6: an operator-editable payload dictionary
   (nuclei-style YAML directory, e.g. `scanner.payloads_dir`) instead of Rust-literal
   payload sets; the `ClusterBomb` multi-position attack mode (only `BatteringRam`
-  ships); Stage-5 breadth (more classes than the three registered); live
+  ships); Stage-5 breadth (more classes than the registered ones); live
   phase-boundary progress and a single-in-flight guard for `scan.run` (Open question
-  7); and a replay-method policy for non-idempotent requests (Open question 9).
+  7); a method policy for injection and replay (Open question 9); and small-budget
+  persistence (Open question 10).
 
 ## Anti-goals
 
@@ -139,7 +142,8 @@ and the seeded Vulnerable/Patched test target.
   passing run.
 - A **production** `control_passed` that claims a patched-control comparison the
   scanner cannot perform against a real target.
-- One bad confirmation (a hostile request body, an unwritable findings directory)
+- One bad confirmation or one failed send (a hostile request body, an unwritable
+  findings directory, a transport error or rate-limit refusal mid-injection)
   **aborting the call** and discarding the confirmations already found.
 
 ## Constraints
@@ -169,7 +173,9 @@ and the seeded Vulnerable/Patched test target.
      (`crates/aitm-tui/fixtures/bus-fixture.json`) and the tool-count pins in
      `crates/aitm-tui/tests/tester_shell.rs` change with it (PR #67 did exactly this
      for `scan.discover`).
-  Everything else outside the crate is a test or doc file.
+  Everything else outside the crate is a test or doc file. Inside the crate,
+  `Cargo.toml` gains exactly one dependency, `tracing` (already a workspace
+  dependency; `Cargo.lock` follows), for a scrubbed debug line.
 - **Confinement is RAII.** `EgressConfinement::confine()` returns a
   `ConfinementToken` that holds the hold until dropped (refcounted on the shared
   `Arc`); the active phase relies on the drop, never on `set_base`.
@@ -179,9 +185,13 @@ and the seeded Vulnerable/Patched test target.
   injector and the reproduction both send through `host.client().send` and add no
   second network path; the injector additionally gates the target host up front
   (deny-by-default, like the crawl seed) so an out-of-scope target is refused before
-  enumeration. A single request may take up to the sender's 60-second response
-  timeout (`RESPONSE_TIMEOUT` in `crates/aitm-proto-http/src/sender.rs`), so a time
-  budget can overshoot by at most one request.
+  enumeration. **Time is bounded by one deadline.** A call computes `deadline = start +
+  time_budget` once; before each injection send, each replay and each rate-limit wait
+  it stops when the deadline has passed, and every injection send and every replay
+  runs under `tokio::time::timeout(min(remaining, 60 s))` (remaining time by
+  `saturating_duration_since`, never a wrapping subtraction). The 60 s is the sender's
+  own `RESPONSE_TIMEOUT` (`crates/aitm-proto-http/src/sender.rs`), so a call overshoots
+  `time_budget` by at most scheduling jitter, never by a slow response.
 - **Reuse, do not reinvent:** correlation via `aitm_poc::matcher::{MatchContext,
   evaluate}` + `Assertion`; PoC via `aitm_poc::{StdPocBuilder, PocSpec, Poc,
   PocInfo, Variable, Severity}` and run via `aitm_poc::{StdPocRunner, PocRunner,
@@ -221,9 +231,9 @@ policy layer".
 |---|---|---|
 | `ScannerConfig { max_depth, max_pages, request_budget, time_budget, per_class_payload_cap, allow_agent_active }`, `Default` = (3, 200, 2000, 600 s, 25, false) | `config.rs` | Reused as-is; the agent gate reads `allow_agent_active`; `request_budget`/`time_budget`/`per_class_payload_cap` bound inject + run. **No field added.** |
 | `ScannerPlugin::new(cfg)`; `Plugin::load(&mut self, reg)` → `reg.add_command(Arc::new(..))` | `plugin.rs` | `load` extended to register the five new commands, each holding a clone of `self.cfg`. |
-| `enumerate(&HttpFlow) -> Vec<InjectionPoint>`; `InjectionPoint { flow, location, name, example }`; `Location { Query, BodyParam, Header, Cookie, PathSegment, Redirect }` (redaction built in); private `is_secret_name` | `discover.rs` | The injector enumerates points from store flows exactly as `scan.discover` does; `example` is already redacted. `is_secret_name` becomes `pub(crate)` and is the one credential-name predicate (PoC builder). |
+| `enumerate(&HttpFlow) -> Vec<InjectionPoint>`; `InjectionPoint { flow, location, name, example }`; `Location { Query, BodyParam, Header, Cookie, PathSegment, Redirect }` (redaction built in); private `is_secret_name` | `discover.rs` | The injector enumerates points from store flows exactly as `scan.discover` does; `example` is already redacted. `is_secret_name` becomes `pub(crate)` (visibility only) for the PoC builder. |
 | `crawl(host, target, cfg) -> CrawlOutcome { endpoints, pages_crawled, stopped_reason }`; `normalize_url`, `block_on`; `MAX_RESULT_ITEMS = 1024` (in `commands.rs`) | `crawl.rs`, `commands.rs` | `scan.run`'s discover phase calls `crawl`; the sync commands call `block_on`; result arrays are capped at 1024 as `scan.discover` caps them. |
-| `CheckDefinition { class, locations, payloads, mode }` with `confirm`, `reflected_xss()`, `open_redirect()`, `for_class`, `pub(crate) success_assertion`; two registered classes; reflected-XSS payloads are `<aitm-canary-0001>`…`<aitm-canary-0008>` | `checks.rs` | The class registry. `success_assertion` is the PoC's `success` for reflected-XSS. Gains `registered_classes()` and a third class. |
+| `CheckDefinition { class, locations, payloads, mode }` with `confirm`, `reflected_xss()`, `open_redirect()`, `for_class`, `pub(crate) success_assertion`; `pub(crate)` consts `CLASS_REFLECTED_XSS`, `CLASS_OPEN_REDIRECT`; two registered classes; reflected-XSS payloads are `<aitm-canary-0001>`…`<aitm-canary-0008>`; `confirm` today checks open-redirect's 3xx clause itself | `checks.rs` | The class registry. Gains `registered_classes()`; `success_assertion` takes over the 3xx clause (see "`scan.inject`"); a third class is optional (Open question 2). |
 | `load_records(host, target?)` (exact-match `FindingFilter.target`, empty without `findings.dir`), `index_to_value` | `report.rs` | `scan.report`'s read half; its target filter changes (see "`scan.report`"). |
 | `CommandHost::{store, client, guard, browser, frontend, config, egress_handle, ssrf_policy, poc_dir, client_label, finding_recorder}`; builders `new`, `with_config(Arc<Config>)`, `with_ssrf`, `with_egress`, `with_frontend`, `with_client_label`, `with_poc_dir`, `with_finding_recorder`; no `Registry` field; `Frontend` is `#[non_exhaustive]` (`Cli`, `Mcp`, `Operator`) | `ctx.rs` | All service access (except `finding_recorder`). `config()` yields `Option<&Config>`; `Config: Clone`. |
 | `EgressConfinement::confine(self: &Arc<Self>) -> ConfinementToken` (RAII, refcounted) | `egress.rs` | Active phase: `let _confine = host.egress_handle().map(|e| e.confine());`. |
@@ -231,13 +241,10 @@ policy layer".
 | `Command` trait: `name`, `schema() -> ParamSchema`, `invoke(args, host) -> Result<Value>`, `sensitivity()`, `confirm_prompt(&Params) -> Option<String>`, `mutates`, `summarize` | `command.rs` | New commands implement these; `scan.inject`/`scan.run` override `confirm_prompt`. |
 | `run_poc_command`'s gate: `host.frontend() == Frontend::Mcp && !config.poc.allow_agent_run` → `bail!`; `Operator`/`Cli` never gated | `aitm-poc` `runner.rs` | The shape `scanner.allow_agent_active` follows (with a fail-closed expression, see "Agent gate summary"). |
 | `MatchContext::new(status, body).with_header(..)`; `evaluate(&Assertion, &MatchContext) -> bool`; `Assertion::{Status, Word{word,part}, Regex{regex,part}, Dsl, All, Any, Not}`; `MatchPart::{Body, Header, All}`; the DSL has `==`, `!=`, `&&`, `\|\|`, `!` (no ordering operators) | `aitm-poc matcher/model/dsl` | Correlation, passive checks, and the PoC's `success`. |
-| `StdPocBuilder::build(&HttpFlow, PocSpec{info, variables, success}) -> Poc`; `PocInfo { name, severity, references, tags, cwe, description, author, metadata }` (no `Default`); `Variable { name, default, description, required }`; `Severity`. The builder redacts only the headers `Cookie`, `Authorization`, `Proxy-Authorization`, `X-API-Key` to required default-less `{{var}}` placeholders; URL path/query, body and every other header are carried verbatim; the PoC id is `slug(info.name)` | `aitm-poc builder/model` | PoC emit on confirm; the scanner's own hardening sits on top (see "Building the PoC"). |
-| `PocRunner::run(&self, &Poc, VarBindings, &CommandHost) -> BoxFuture<Result<PocRunResult>>`; `StdPocRunner::{new, with_output_dir}`; `PocRunResult { passed, finding_capture, poc_path, screenshot_path, evaluated, recorded_id }`. `run_inner` runs `precheck` (PoC id must match `^[a-z0-9][a-z0-9-]{0,63}$`), renders `{{expr}}` placeholders (a non-identifier expression is evaluated by the DSL; an unbound identifier fails with "unknown variable"; there is **no escape syntax**), writes the YAML to a private (0700/0600) directory whether or not the run passed, and auto-records through `host.finding_recorder()` only when the run **passed** and a recorder **and** `findings.dir` are present | `runner.rs`, `template.rs` | The reproduction engine; the auto-record is the double-record hazard. |
-| `FindingDraft` and `DiskFindingRecorder` (hard-codes `control_passed: None`, `notes: None`; the runner fills `class` from `poc.info.cwe`, else the first tag, else the PoC id) | `aitm-core ctx.rs`; `aitm-findings recorder.rs`; `runner.rs` | Why the scanner does not record through the runner's auto-record. |
-| `FindingStore::record` redacts only `title` and `notes`; `FindingFilter::matches` compares `target` exactly; `render_report`/`render_index` count a finding "reproduced" only for `control_passed == Some(false)`; the test-target grader likewise, and matches a finding to a planted vuln by `class` and the **path** of `finding.target` | `aitm-findings store/record/report`; `aitm-testtarget grader.rs` | Record `target` rule; consequence of `control_passed: None`. |
-| `findings.dir` defaults to `None`; with none, `findings.list` is empty and `findings.record` errors | `aitm-core config.rs` | Default installs have no findings directory (see "Failure handling"). |
-| `policy_decision`: `(All, Sensitive) => defers_to_command_gate(name)`; `(Auto, Sensitive) => false`; `(Ask, Sensitive)` parks for operator approval, then runs the command as the agent. `defers_to_command_gate` lists `ca.install`, `ca.uninstall`, `scope.add` and the `l4.*` Sensitive verbs; `script.save` is deliberately absent | `aitm-mcp server.rs`; tests in `aitm-mcp tests/mcp.rs` | The policy layer in front of `scanner.allow_agent_active`. |
-| Contract lists: `EXPECTED_TOOLS: [&str; 56]` (includes `scan.discover`) in `frontends.rs`; `CORE_TOOLS` (includes `scan.discover`), `bus-fixture.json` and the `59` pins in `tester_shell.rs`; `COMMAND_NAMESPACES` in `agent_surface.rs` lists ten namespaces and **not** `scan` | `crates/aitm/tests`, `crates/aitm-tui` | Bump targets: `EXPECTED_TOOLS` → `[&str; 61]`, TUI family → 64. |
+| `StdPocBuilder::build(&HttpFlow, PocSpec{info, variables, success}) -> Poc` (reads only `flow.request`); `PocInfo { name, severity, references, tags, cwe, description, author, metadata }` and `Variable { name, default: Option<Value>, description: String, required: bool }` (neither has `Default`); `Severity`. It redacts only the headers `Cookie`, `Authorization`, `Proxy-Authorization`, `X-API-Key`; the PoC id is `slug(info.name)` | `aitm-poc builder/model` | PoC emit on confirm; the scanner's own hardening sits on top (see "Building the PoC"). |
+| `PocRunner::run(&self, &Poc, VarBindings, &CommandHost) -> BoxFuture<Result<PocRunResult>>`; `StdPocRunner::{new, with_output_dir}`; `PocRunResult { passed, finding_capture, poc_path, screenshot_path, evaluated, recorded_id }`; a send error from the client propagates unchanged out of `run` (so `downcast_ref::<GuardError>()` works); a runner error can quote the rendered URL (`http step URL {url:?} …`) or a header value | `runner.rs`, `template.rs`, `aitm-core header.rs` | The reproduction engine; the auto-record is the double-record hazard; the error echo is why reasons are constants. |
+| `FindingStore::record` redacts only `title` and `notes`; `render_report`/`render_index` count a finding "reproduced" only for `control_passed == Some(false)`; the test-target grader likewise, and matches a finding to a planted vuln by `class` and the **path** of `finding.target` | `aitm-findings store/record/report`; `aitm-testtarget grader.rs` | Record `target` rule; consequence of `control_passed: None`. |
+| `COMMAND_NAMESPACES` in `agent_surface.rs` lists ten namespaces and **not** `scan`; the contract-list pins are in Constraints and AC18 | `crates/aitm/tests` | The docs task adds `scan`. |
 | Seeded target: `SeedMode::{Vulnerable, Patched}`, routes incl. `/search?q=`, `/redirect?next=`, linked `/` index | `aitm-testtarget` | Confirmation pass-on-vulnerable / fail-on-patched. |
 
 ### Module layout
@@ -245,22 +252,28 @@ policy layer".
 ```
 crates/aitm-plugin-scanner/src/
   passive.rs    (shipped)  PassiveFinding, passive_checks(&HttpFlow) -> Vec<PassiveFinding>
-  checks.rs     (shipped; modify)  + registered_classes(), + a third registered class
+  checks.rs     (shipped; modify)  + registered_classes(); success_assertion owns the
+                                   open-redirect 3xx clause; optional third class
   report.rs     (shipped; modify)  load_records filters by origin + path prefix
   discover.rs   (shipped; modify)  is_secret_name -> pub(crate); no behaviour change
-  inject.rs     (new)  MAX_CONFIRMED, InjectOutcome, Confirmed, inject(..)
-  reproduce.rs  (new)  BuiltPoc, build_poc, narrowed_host, reproduce, finding_record,
-                       record_finding, ReproOutcome, reproduce_and_record
-  campaign.rs   (new)  DEFAULT_SWEEP, CampaignSummary, run_campaign(..)
-  commands.rs   (modify) add ScanPassive, ScanReport, ScanInject, ScanRun, ScanStatus
+  inject.rs     (new)  MAX_CONFIRMED, InjectOutcome, Confirmed, inject(..),
+                       target_flows(..), class_points(..)
+  reproduce.rs  (new)  BuiltPoc, BuildRefused, build_poc, narrowed_host, reproduce,
+                       finding_record, record_finding, ReproOutcome, reproduce_and_record
+  campaign.rs   (new)  DEFAULT_SWEEP, CampaignSummary, ClassRun, run_class,
+                       CampaignOutcome, run_campaign(..)   (typed results, no JSON)
+  commands.rs   (modify) the five commands + the pub(crate) result-shaping helpers
   plugin.rs     (modify) register the five commands
-  lib.rs        (modify) pub mod reproduce; pub mod inject; pub mod campaign
+  lib.rs        (modify) pub mod reproduce; pub mod inject; pub mod campaign;
+                         #[cfg(test)] mod test_support
+  test_support.rs (new, #[cfg(test)])  stub clients, counting recorder, temp dirs
 ```
 
 `ScannerPlugin` continues to observe no events. Engine modules are pure library
 code with their own files, so independent tasks fan out; the command structs all
 live in `commands.rs` + register in `plugin.rs` + bump the contract lists, so they
-form one serialized chain.
+form one serialized chain. Engine modules never build `Value`s: all result shaping
+is in `commands.rs`.
 
 ### `scan.passive` — Read, no traffic
 
@@ -285,10 +298,10 @@ pub struct PassiveFinding { pub class: String, pub flow: FlowId,
 pub fn passive_checks(flow: &aitm_core::HttpFlow) -> Vec<PassiveFinding>;
 ```
 
-`ScanPassive` (`Sensitivity::Read`) iterates `host.store().list()` filtered to
-`target` (when given, same-origin/in-scope via `crawl::normalize_url`), runs
-`passive_checks`, and returns `{ findings: [ {class, flow, location, name,
-evidence, severity} ] }`. It calls **no** `client().send` and **no** browser —
+`ScanPassive` (`Sensitivity::Read`) runs `passive_checks` over `target_flows(host,
+target)` (`inject.rs`: the stored HTTP flows whose scheme, host and effective port
+equal the target's, or every stored flow when `target` is absent), and returns `{
+findings: [ {class, flow, location, name, evidence, severity} ] }`. It calls **no** `client().send` and **no** browser —
 flow count is unchanged across the call, so it runs under `AgentPolicy::ReadOnly`.
 Every string in the result is passed through `scrub_text`; a finding never carries
 a param *value* (only its name + the class/location), so a reflected secret is not
@@ -309,8 +322,11 @@ converter; `render_index` returns serde_json). Index entries carry `poc_path`,
 
 **`target` filter.** A record matches `target` when its `target` URL has the same
 scheme, host and effective port as the argument and its path equals, or extends on a
-`/` boundary, the argument's path (an empty or `/` path matches every path); query and
-fragment are ignored on both sides, and a default port equals an absent one. An
+`/` boundary, the argument's path (a trailing `/` on the argument's path is ignored, so
+an empty or `/` path matches every path); both URLs are parsed first, so host case,
+userinfo and dot-segments (`/a/../b` is `/b`) are normalised away, while `%2F` stays
+a literal character (`/a%2Fb` does not extend `/a`); query and fragment are ignored on
+both sides, and a default port equals an absent one. An
 argument that does not parse as an absolute URL matches only a record whose `target`
 is exactly equal. `FindingFilter.target` is an exact string match and so cannot relate
 a campaign base URL (`http://host:8080`) to a recorded endpoint
@@ -339,39 +355,54 @@ impl CheckDefinition {
     pub fn reflected_xss() -> Self;   // Word{ marker, Body }, locations Query/BodyParam
     pub fn open_redirect() -> Self;   // 3xx + Regex over the Location header, location Redirect
     pub fn for_class(class: &str) -> Option<Self>;
-    pub fn registered_classes() -> &'static [&'static str];  // >= 3; first two are the default sweep
+    pub fn registered_classes() -> &'static [&'static str];  // first two are the default sweep
 }
 ```
 
 `registered_classes()` lists every class `for_class` resolves, in a stable order whose
-first two entries are literally `"reflected-xss"` and `"open-redirect"`; the third is
-the opt-in class that fills AC20 (builder's choice, see "Left to the builder").
+first two entries are literally `"reflected-xss"` and `"open-redirect"`. A third class
+is optional and not pinned (Open question 2). **One definition of success.**
+`success_assertion(payload)` is each class's single success assertion: for open-redirect
+it is `All[ Any[ Status(301), Status(302), Status(303), Status(307), Status(308) ],
+<the Location regex> ]` (the DSL has no ordering operator, hence the explicit
+statuses), and `confirm` evaluates it unchanged instead of carrying its own `300..=399`
+clause. A PoC's `success` is exactly this assertion, so it is never weaker than the
+check that confirmed it; every class, including an optional third, keeps it that way.
+(The explicit statuses make `confirm` stricter than today's `300..=399`: a `300` or
+`304`–`306` redirect no longer confirms. Fail-closed, accepted.)
 
 `inject.rs`:
 
 ```
 pub const MAX_CONFIRMED: usize = 1024;
 pub struct InjectOutcome { pub class: String, pub tested: usize,
-    pub confirmed: Vec<Confirmed>, pub stopped_reason: Option<String> }
+    pub confirmed: Vec<Confirmed>, pub skipped: usize, pub send_errors: usize,
+    pub stopped_reason: Option<String> }
 pub struct Confirmed { pub injection_point: InjectionPoint,
-    pub payload: String, pub evidence: String,
-    pub attack_flow: aitm_core::HttpFlow }   // the flow `send` returned for the confirming request
+    pub payload: Payload, pub evidence: String,
+    pub attack_flow: aitm_core::HttpFlow }   // the flow `send` returned, `response` set to None
 pub async fn inject(host: &CommandHost<'_>, target: &str, def: &CheckDefinition,
-    points: &[InjectionPoint], budget: &mut usize, cfg: &ScannerConfig)
-    -> anyhow::Result<InjectOutcome>;
+    points: &[InjectionPoint], budget: &mut usize, cfg: &ScannerConfig,
+    deadline: std::time::Instant) -> anyhow::Result<InjectOutcome>;
+pub(crate) fn target_flows(host: &CommandHost<'_>, target: Option<&str>)
+    -> Vec<aitm_core::HttpFlow>;       // stored flows of the target's origin, store order
+pub(crate) fn class_points(flows: &[aitm_core::HttpFlow], def: &CheckDefinition)
+    -> Vec<InjectionPoint>;            // `enumerate`, kept to `def.locations`
 ```
 
 `inject` gates the target host up front (`host.guard().check_active` →
-`GuardError::OutOfScope` on an unscoped target, deny-by-default). It then visits the
-applicable points in order, skipping a point whose endpoint key — request method,
-`scheme://authority/path`, location and name — was already injected in this call (a
-repeat capture of one endpoint is one point; first flow wins). For each remaining
-point it tries the class payloads in order (batteringram, capped at
-`per_class_payload_cap`): before every send it stops if the budget is zero
-(`stopped_reason = "budget"`, via `checked_sub`, never wrapping) or if `cfg.time_budget`
-has elapsed since `inject` started (`"time_budget"`); it crafts the mutated
-`HttpRequest` (only the one targeted point changes), sends it through
-`host.client().send` (the one guarded chokepoint), builds a `MatchContext` from the
+`GuardError::OutOfScope` on an unscoped target, deny-by-default); that up-front refusal
+is the **only** `Err` it returns. It then visits the applicable points in order,
+skipping a point whose endpoint key — request method, `scheme://authority/path` **with
+the query stripped**, location and name — was already injected in this call (a repeat
+capture of one endpoint is one point; first flow wins), and a point whose source flow
+is no longer in the store (counted in `skipped`; `InjectionPoint` carries only the
+`FlowId`). For each remaining point it tries the class payloads in order
+(batteringram, capped at `per_class_payload_cap`): before every send it stops if the
+budget is zero (`stopped_reason = "budget"`, via `checked_sub`, never wrapping) or if
+`deadline` has passed (`"time_budget"`); it crafts the mutated `HttpRequest` (only the
+one targeted point changes), sends it through `host.client().send` (the one guarded
+chokepoint) under the time bound in Constraints, builds a `MatchContext` from the
 returned flow's response, calls `def.confirm`, and decrements the shared `budget`.
 **On a point's first confirmation it records one `Confirmed` and skips that point's
 remaining payloads** (a reflect-everything parameter is one finding, and the saved
@@ -381,13 +412,28 @@ class-appropriate markers (reflected-XSS uses a benign unique canary element, no
 executing script; open-redirect uses an off-origin sentinel host under `.invalid`
 compared in `Location`).
 
-*Architect's call — `Confirmed` carries the `HttpFlow`, not its id.* The PoC is built
-from the request that actually carried the payload (the benign source flow in
-`injection_point.flow` does not contain it), and `send` already hands that flow back.
-Carrying it removes a store re-fetch that FIFO eviction (the store keeps 50 000 flows
-or 512 MiB) or `flow.clear` could turn into a missing flow in the middle of a run, and
-keeps the reproduction free of store access. It holds a whole captured request, so
-`Confirmed` is never serialised or logged: result objects are built field by field.
+**A failed send never discards what was found.** `inject` returns `Ok(InjectOutcome)`
+with the confirmations so far in every case below; the error text is never forwarded
+(it is counted in `send_errors` and may go to a scrubbed `tracing::debug!`). Per
+attempt, by what `send` returns (`GuardError` is in `aitm-core error.rs`):
+
+| `send` result | What happens |
+|---|---|
+| `RateLimited { retry_after }` (nothing was sent) | wait `min(retry_after, remaining)`, retry the same attempt, **no budget charge**; a guard that never admits ends at the deadline with `time_budget` |
+| `HostDisabled`, `OutOfScope` or `PrivateAddressBlocked` | stop with `stopped_reason = "guard_refused"` |
+| the time bound elapsed | stop with `"time_budget"` (the attempt is charged) |
+| any other error (a transport failure, `ConcurrencyExceeded`) | charge the attempt, count it, continue; five consecutive such errors stop the call with `stopped_reason = "send_error"` |
+
+*Architect's call — `Confirmed` carries the attack `HttpFlow` with `response = None`.*
+The PoC is built from the request that actually carried the payload (the benign source
+flow in `injection_point.flow` does not contain it), and `send` already hands that flow
+back. Carrying the request removes a store re-fetch that FIFO eviction (the store keeps
+50 000 flows or 512 MiB) or `flow.clear` could turn into a missing flow mid-run. The
+response is dropped at once: `build_poc` reads only `flow.request` and `finding_record`
+only the id, whereas up to `MAX_CONFIRMED` retained responses could total 1024 × the
+sender's 16 MiB response cap outside the store's own cap (the retained request body is
+bounded by the 10 MiB per-message capture cap). `Confirmed` is never serialised or
+logged: result objects are built field by field.
 
 `ScanInject { cfg: ScannerConfig }` (`Sensitivity::Sensitive`):
 
@@ -405,17 +451,18 @@ keeps the reproduction free of store access. It holds a whole captured request, 
 2. **Confinement:** `let _confine = host.egress_handle().map(|e| e.confine());`
    before the active phase; dropped (RAII) when `invoke` returns.
 3. Resolve `class` through `CheckDefinition::for_class` (an unknown class is an error
-   that lists `registered_classes()`); enumerate points from the store flows for
-   `target`, select those matching `def.locations` (or the single `injection_point`
-   argument when given); `let mut budget = self.cfg.request_budget;`; call
-   `block_on(inject(..))`.
-4. For each `Confirmed`, in order, call `block_on(reproduce_and_record(host, &def,
-   &c.injection_point, &c.payload, &c.attack_flow, &mut budget))` and fold the
-   `ReproOutcome` (see "Reproduce → record"): `Recorded` → push the id onto
-   `finding_ids`; `Unreproduced` → an `unreproduced` entry with the scrubbed reason;
-   `NoFindingsDir` → set the `reproduction` marker and stop calling; `BudgetExhausted`
-   → an `unreproduced` entry with reason `"budget"` and `stopped_reason = "budget"`. The
-   loop never propagates a per-confirmation failure with `?`.
+   that lists `registered_classes()`); `class_points(&target_flows(host, Some(target)),
+   &def)` gives the points, or, when the `injection_point` argument is given, only the
+   one point with that `flow` (a `FlowId` string), `location` (a `Location::as_str`
+   token) and non-empty `name` — a malformed object or no such point is an error naming
+   the argument; `let mut budget = self.cfg.request_budget;` and `deadline = now +
+   cfg.time_budget` (checked add); call `block_on(run_class(..))`.
+4. `run_class` ("The replay loop") returns a `ClassRun`; `fold_outcomes(&run)` shapes
+   it: `Recorded` → the id onto `finding_ids`; `Unreproduced` → an `unreproduced`
+   entry with its constant reason; `NoFindingsDir` → the `reproduction` marker;
+   `BudgetExhausted` → an `unreproduced` entry with reason `"budget"`. The command
+   never calls `host.finding_recorder()` and returns `Err` only for the gate, an
+   unknown class or argument, and the up-front scope refusal.
 5. Return the result object below. All strings scrubbed; every array capped at 1024.
 6. `confirm_prompt` returns `Some("Run active injection (class <class>) against
    <target>? This issues attack traffic to the authorized target.")` so human
@@ -433,7 +480,9 @@ keeps the reproduction free of store access. It holds a whole captured request, 
 ```
 
 `confirmed` always lists every confirmation (one per point at most) and is never
-reduced by a reproduction failure. With `reproduction` null, `confirmed.len() ==
+reduced by a reproduction failure; each `reason` is one of the constants listed under
+"Failure handling". `stopped_reason` is one of `budget`, `time_budget`, `max_confirmed`,
+`guard_refused`, `send_error` or null. With `reproduction` null, `confirmed.len() ==
 finding_ids.len() + unreproduced.len()`; `reproduced` is true exactly for the
 confirmations that have an id in `finding_ids`. With `reproduction` set,
 `finding_ids` and `unreproduced` are empty and every `reproduced` is false.
@@ -444,11 +493,12 @@ confirmations that have an id in `finding_ids`. With `reproduction` set,
 
 ```
 pub struct BuiltPoc { pub poc: aitm_poc::Poc, pub bindings: aitm_poc::VarBindings }
+pub enum BuildRefused { Credential, Template }   // Display: the two constants below
 pub fn build_poc(attack_flow: &HttpFlow, def: &CheckDefinition,
-    point: &InjectionPoint, payload: &Payload) -> anyhow::Result<BuiltPoc>;
+    point: &InjectionPoint, payload: &Payload) -> Result<BuiltPoc, BuildRefused>;
 pub(crate) fn narrowed_host<'a>(host: &'a CommandHost<'_>) -> CommandHost<'a>;
-pub async fn reproduce(host: &CommandHost<'_>, built: &BuiltPoc,
-    attack_flow: &HttpFlow) -> anyhow::Result<aitm_poc::PocRunResult>;
+pub async fn reproduce(host: &CommandHost<'_>, built: &BuiltPoc)
+    -> anyhow::Result<aitm_poc::PocRunResult>;
 pub fn finding_record(host: &CommandHost<'_>, def: &CheckDefinition,
     attack_flow: &HttpFlow, poc: &aitm_poc::Poc, run: &aitm_poc::PocRunResult)
     -> aitm_findings::FindingRecord;
@@ -461,24 +511,40 @@ pub enum ReproOutcome {
     BudgetExhausted,                   // budget was zero: nothing sent, nothing recorded
 }
 pub async fn reproduce_and_record(host: &CommandHost<'_>, def: &CheckDefinition,
-    point: &InjectionPoint, payload: &str, attack_flow: &HttpFlow,
+    point: &InjectionPoint, payload: &Payload, attack_flow: &HttpFlow,
     budget: &mut usize) -> ReproOutcome;
 ```
 
-**One owner.** `reproduce_and_record` is the single function that turns a
-confirmation into a (maybe) finding; both `scan.inject` and `scan.run` call it, so the
-confirm → reproduce → record behaviour, its budget accounting and its failure
-isolation exist once. It takes raw values (not `Confirmed`) so the reproduce engine
-does not depend on the injector. It never returns an error: every per-confirmation
-failure becomes `Unreproduced`. In order: (1) no `findings.dir` in `host.config()` →
-`NoFindingsDir`; (2) `*budget` is zero (`checked_sub`) → `BudgetExhausted`; (3) resolve
-`payload` against `def.payloads` and `build_poc` (a refusal → `Unreproduced`); (4)
-decrement `*budget` by one, immediately before calling `reproduce`, so a refused build
-costs nothing (a pre-check refusal or a run error costs one — conservative, since a
-request may have been sent); (5) `reproduce` (its credential pre-check refusal or any
-run error → `Unreproduced` with the error text through `scrub_text`); (6) `!run.passed`
-→ `Unreproduced` ("replay did not confirm"), **no record**; (7) `finding_record` +
-`record_finding` (an error → `Unreproduced`, "record failed: …"); (8) `Recorded`.
+**One owner.** `reproduce_and_record` is the single function that turns one
+confirmation into a (maybe) finding; both callers reach it through `run_class`, so the
+confirm → reproduce → record behaviour and its budget accounting exist once. It takes
+raw values (not `Confirmed`) so the reproduce engine does not depend on the injector.
+It never returns an error: every per-confirmation failure becomes `Unreproduced` with
+a **constant** reason (see "Failure handling"). In order: (1) no `findings.dir` in
+`host.config()` → `NoFindingsDir`; (2) `*budget` is zero (`checked_sub`) →
+`BudgetExhausted`; (3) `build_poc` (`Err(BuildRefused)` → `Unreproduced`, the variant's
+constant); (4) decrement `*budget` by one, immediately before calling `reproduce`, so a
+refused build costs nothing (a run error costs one — conservative, since a request may
+have been sent); (5) `reproduce`: an `Err` whose root is `GuardError::OutOfScope` or
+`PrivateAddressBlocked` (`downcast_ref`) → `Unreproduced("replay blocked: out of
+scope")`, any other `Err` → `Unreproduced("replay failed")`; the error text goes only to
+a `tracing::debug!` line, after `scrub_text`; (6) `!run.passed` → `Unreproduced("replay
+did not confirm")`, **no record**; (7) `finding_record` + `record_finding` (an error →
+`Unreproduced("record failed")`, detail likewise only in the debug line); (8)
+`Recorded`.
+
+**The replay loop.** `campaign::run_class(host, target, def, points, budget, cfg,
+deadline) -> anyhow::Result<ClassRun>` is the one place that injects a class and then
+reproduces its confirmations; `scan.inject` calls it once and `scan.run` once per swept
+class, so the fold, the budget accounting and the time bound exist once. `ClassRun {
+inject: InjectOutcome, outcomes: Vec<ReproOutcome>, stopped_reason: Option<String> }`
+holds one outcome per `inject.confirmed` entry, in order. Per confirmation: after a
+`NoFindingsDir` the rest are `NoFindingsDir` with no call; at or past `deadline` it is
+`Unreproduced("time_budget")` with no call; otherwise `reproduce_and_record` runs under
+`tokio::time::timeout(min(remaining, 60 s))`, and a timeout is `Unreproduced("time_budget")`
+when the deadline has been reached, else `Unreproduced("replay failed")`. `stopped_reason`
+is the injector's, else `"budget"` or `"time_budget"` when a confirmation ended that way.
+Only the up-front scope refusal returns `Err`.
 
 **Building the PoC.** `build_poc` is fed the *attack* flow, because `StdPocBuilder`
 parameterizes the concrete URL pieces of the flow it is given and the benign source
@@ -489,70 +555,84 @@ built `Step::Http`:
 - `info` is `PocInfo { name, severity, references: [], tags: [class], cwe: None,
   description: None, author: None, metadata: None }`. `name` is `"<class>: <param>"`
   where `<param>` is the injection point's name with every character outside
-  `[A-Za-z0-9_.-]` replaced by `_`, truncated to 32 characters (empty becomes
-  `param`), so the slugged PoC id always satisfies the runner's 64-character id rule
-  and a hostile parameter name cannot make `precheck` reject it. `severity` comes
-  from a class-to-severity mapping local to `reproduce.rs` (the shipped
-  `CheckDefinition` has no severity field; **Architect's call:** reflected-XSS →
-  `Medium`, open-redirect → `Low`, any other class → `Info`).
-- `success` is `CheckDefinition::success_assertion(payload)`: for reflected-XSS the
-  payload's `Word { word: marker, part: Body }`; for open-redirect that assertion
-  is `Regex` over the `Location` header only, so the PoC `success` is
-  `All[ Any[ Status(301), Status(302), Status(303), Status(307), Status(308) ],
-  <the Location regex> ]` — `confirm` requires a 3xx and the PoC must not be weaker
-  than the check that confirmed it (the DSL has no ordering operator, hence the
-  explicit statuses).
+  `[A-Za-z0-9_.-]` replaced by `_` and bounded (empty becomes `param`; the bound is the
+  builder's choice), so the slugged PoC id always satisfies the runner's 64-character
+  id rule and a hostile parameter name cannot make `precheck` reject it. `severity`
+  comes from a class-to-severity mapping local to `reproduce.rs`, keyed by the
+  `CLASS_*` constants (the shipped `CheckDefinition` has no severity field;
+  **Architect's call:** reflected-XSS → `Medium`, open-redirect → `Low`, any other
+  class → `Info`); a test asserts every `registered_classes()` entry is mapped.
+- `success` is `CheckDefinition::success_assertion(payload)`, unchanged — the same
+  assertion `confirm` evaluates (see "`scan.inject`"), so the PoC is never weaker than
+  the check that confirmed it.
 - The base URL becomes `{{target}}` and the injected value `{{payload}}`.
 - **Credential parameterisation.** A request component is a *credential* when its
-  name matches `discover::is_secret_name` (the shared `aitm_core::redact::is_secret_key`
-  vocabulary plus the substrings `sid`, `jwt`, `csrf`, `session`, `auth` —
-  over-matching on purpose) or it is a `Cookie`. Every credential **header**, **query
-  key**, and top-level **form-urlencoded or JSON-object body key** has its value
-  replaced by a required, default-less `{{var}}` placeholder (a `Variable` with
-  `default: None, required: true`) and the real value is recorded in
-  `BuiltPoc.bindings` for in-memory use only. Variable names are the component name
-  lowercased with every character outside `[a-z0-9]` replaced by `_` (so
-  `X-CSRF-Token` → `x_csrf_token`, matching the builder's own header rule), with a
-  `_2`, `_3` suffix on a collision and never `target`, `payload` or `param`. The
-  injection point itself is exempt: its value is the inert payload, so a point named
-  `token` stays `token={{payload}}`.
-- **Refusals.** `build_poc` returns `Err` (and no PoC exists) when a credential cannot
-  be parameterised: a path parameter whose name is credential-like
-  (`/search;jsessionid=…`), or a non-empty body that is neither form-urlencoded nor a
-  JSON object (multipart, text, a JSON array). It also returns `Err` when any
-  builder-derived string other than the placeholders it inserted — URL, header value,
-  body — contains `{{` or `}}`: the templater has no escape syntax, an unbound
-  `{{x}}` fails the run with "unknown variable", and a non-identifier `{{expr}}` is
-  *evaluated by the DSL*, so captured hostile content must never become a template.
-  Refusal texts are constants naming the component class, never a value.
+  name — compared case-insensitively **after percent-decoding** — matches
+  `discover::is_secret_name` (the shared `aitm_core::redact::is_secret_key`
+  vocabulary plus `sid`, `jwt`, `csrf`, `session`, `auth`) **or** the scanner-local
+  `POC_EXTRA_NEEDLES` in `reproduce.rs` (`key`, `sig`, `code`, `pass`, `pw`, `otp`,
+  `pin`; substring match, over-matching on purpose), or it is a `Cookie`. (The extra
+  needles live in `reproduce.rs`, not in `discover.rs`: widening the shared predicate
+  would also redact `scan.discover` examples and make `scan.passive` skip parameters
+  such as `keyword` or `code`.) Every credential **header**, **top-level query key**,
+  and **top-level form-urlencoded or JSON-object body key** has its value replaced by a
+  required, default-less `{{var}}` placeholder (a `Variable { name, default: None,
+  description: <fixed text>, required: true }`) and the real value is recorded in
+  `BuiltPoc.bindings` for in-memory use only. A query or form value is bound as its
+  **raw wire text** (still percent-encoded), never decoded, so the runner substitutes
+  exactly the captured bytes. Variable names are the component name (decoded)
+  lowercased with every character outside `[a-z0-9]` replaced by `_` (so `X-CSRF-Token`
+  → `x_csrf_token`), unique and never `target`, `payload` or `param` (collision
+  handling is the builder's choice). The injection point itself is exempt: its value is
+  the inert payload, so a point named `token` stays `token={{payload}}`.
+- **Refusals.** `build_poc` returns `Err(BuildRefused::Credential)` (and no PoC exists)
+  when a credential cannot be parameterised — a path parameter whose name is a
+  credential (`/search;jsessionid=…`), or a non-empty body that is neither
+  form-urlencoded nor a JSON object (multipart, text, a JSON array) — or when the
+  backstop below trips; and `Err(BuildRefused::Template)` when any builder-derived
+  string — URL, header **name** or value, body — contains `{{` outside the placeholders
+  the builder inserted: the templater has no escape syntax, an unbound `{{x}}` fails
+  the run with "unknown variable", and a non-identifier `{{expr}}` is *evaluated by the
+  DSL*, so captured hostile content must never become a template. A lone `}}` is
+  copied verbatim by the templater and is not refused. The two `Display` texts are the
+  constants `build refused: credential` and `build refused: template`; no value is ever
+  in them.
+- **The backstop.** After building the step, `build_poc` requires
+  `aitm_core::redact::scrub_text(s) == s` for the URL, every header value and the body,
+  each taken with the placeholders the builder inserted removed (so a placeholder cannot
+  trip it); otherwise `Err(BuildRefused::Credential)`. `scrub_text` is unanchored, so
+  it catches credential material the placeholder step never looked at, at any depth: a
+  nested JSON object (`{"login":{"password":"…"}}`), an array of objects, a pretty-printed
+  body, a `Referer: …?token=…` or any other custom header, a `Bearer …` anywhere. Its
+  vocabulary is `authorization`, `bearer`, `token`, `password`, `passwd`, `pwd`,
+  `secret`, `cookie`, `credential` and `api[_-]?key`; it does **not** see `pass`, `key`,
+  `sig`, `code`, `pin`, `otp` or `jsessionid` — those are caught only as a top-level
+  key or header (placeholders) or as a path parameter (the structural refusal).
 - `bindings` carries `target` (the attack flow's `scheme://authority`) plus one entry
   per credential variable.
 
 **What is guaranteed, and what is not.** Credential material the scanner can
 identify never reaches the PoC YAML, the finding record, `runs.jsonl`, or any result:
-credential-named headers, query keys, form/JSON body keys and cookies are
-placeholders bound in memory only; a request whose credential cannot be parameterised
-yields no PoC and no record; and `reproduce`'s pre-check refuses to run a PoC whose
-serialised YAML contains any bound credential value or any `Cookie` value from the
-attack request (values shorter than 4 bytes are exempt from that substring check —
-they would match arbitrary YAML — and rely on the structural rule alone; Architect's
-call). What is **not** detected: a secret carried in a non-credential-named parameter,
-an opaque path segment, or any component the name predicate does not recognise. The
-PoC is as sensitive as the captured request it was built from, which is why the
-runner writes it to a private (owner-only) directory under `poc.out_dir` or the temp
-dir.
+credential-named headers, top-level query/form/JSON keys and cookies are placeholders
+bound in memory only; a request whose credential cannot be parameterised yields no PoC
+and no record; the backstop refuses any build whose remaining strings still change
+under `scrub_text`; and every `unreproduced[].reason` is a constant, so no runner,
+templater or header-validation error — which can quote a rendered URL or header value —
+reaches a result. What is **not** detected: a secret under a name outside both
+vocabularies that is not a top-level key or header, an opaque token in a path segment
+(`/reset/9f8a…`), and a bare credential value with no `key=`, `Bearer` or
+`Authorization` framing. The PoC is as sensitive as the captured request it was built
+from, which is why the runner writes it to a private (owner-only) directory under
+`poc.out_dir` or the temp dir.
 
-**Running the PoC (Correction 1).** A command cannot invoke another command:
-`CommandHost` holds no `Registry` and `Command::invoke` receives nothing else, so
-there is no "call `poc.run`" primitive. The scanner does what `scan.discover` already
-does with `crawl`/`enumerate` — it calls the library engine directly. `reproduce` runs
-the built PoC through `aitm_poc::StdPocRunner`, the engine the `poc.run` command itself
-calls (`run_poc_command`), with its output directory chosen as `run_poc_command`
-chooses it (`poc.out_dir` from `host.config()`, else the system temp dir). Before
-running, it serialises the PoC and returns `Err` if the YAML contains any bound
-credential value or any `Cookie` value from the attack request (see above). It then
-issues exactly **one** further guarded, captured request, with `bindings` handed to the
-runner.
+**Running the PoC.** A command cannot invoke another command: `CommandHost` holds no
+`Registry` and `Command::invoke` receives nothing else, so there is no "call `poc.run`"
+primitive. The scanner does what `scan.discover` already does with `crawl`/`enumerate`
+— it calls the library engine directly. `reproduce` runs the built PoC through
+`aitm_poc::StdPocRunner`, the engine the `poc.run` command itself calls
+(`run_poc_command`), with its output directory chosen as `run_poc_command` chooses it
+(`poc.out_dir` from `host.config()`, else the system temp dir). It issues exactly
+**one** further guarded, captured request, with `bindings` handed to the runner.
 
 `narrowed_host(host)` rebuilds a `CommandHost` from the same borrowed `store`, `client`
 and `guard` plus `frontend`, `ssrf_policy`, `poc_dir`, `client_label`, the egress handle
@@ -588,32 +668,37 @@ run.finding_capture]` (the confirming request first; the replay second), `notes:
 None`. `record_finding` persists it via `DiskFindingStore::new(dir)` with `dir` from
 `host.config().findings.dir`, and returns `Err` (never a fabricated id) when no `dir`
 is configured; it never calls `host.finding_recorder()`. *Why the scanner records its
-own:* the runner's draft files the finding under `poc.info.cwe`, else the first tag,
-else the PoC id, so a CWE later added to the PoC metadata would silently change the
-class, whereas the scanner's class strings (`reflected-xss`, `open-redirect`) are what
-the test-target grader matches; and recording must work on a host with no recorder
-wired. `FindingStore::record` scrubs `title` and `notes` at the store boundary; the
-scanner additionally scrubs `target` (the store does not) and never puts a parameter
-value or raw header into `title`.
+own:* `build_poc` sets `tags = [class]` and `cwe = None`, so the runner's draft would
+carry the same class string; the decisive reasons are that the draft's `target` is the
+bare `target` binding (`http://host:port`), whose path `/` the test-target grader's
+`endpoint_of` match can never equal to a planted endpoint, and that `FindingDraft` has
+no `control_passed` field and no endpoint target to fill; recording must also work on a
+host with no recorder wired. `FindingStore::record` scrubs `title` and `notes` at the
+store boundary; the scanner additionally scrubs `target` (the store does not) and
+never puts a parameter value or raw header into `title`.
 
 **Record target.** `target` is the attack request's `scheme://authority/path` with no
-query, fragment or userinfo, through `scrub_text` (literal:
-`http://127.0.0.1:8080/search`). That satisfies every consumer: the test-target
+query, fragment or userinfo, through `scrub_text`, and with the markdown-active
+characters `[ ] ( ) ! < > *` and the backtick percent-encoded, because `render_report`
+interpolates `target` unescaped into `Affected endpoint:` (literal:
+`http://127.0.0.1:8080/search`). `_` is left alone: it is not link or HTML syntax, and
+encoding it would stop `scan.report {target}` matching common underscore paths. That
+satisfies every consumer: the test-target
 grader matches a finding by `class` and the *path* of `target` (query ignored);
 `render_index` publishes it as `target_path`; and `scan.report {target: <campaign
 base>}` finds it through the origin-and-path-prefix rule above. A secret in the query
 string can never reach it.
 
-**Failure handling and `findings.dir`.** `findings.dir` defaults to `None`, so a
-default install has no store to record into. In that case reproduction and recording
-are **skipped**: `confirmed` is returned intact with `finding_ids: []`, `unreproduced:
-[]` and `reproduction: "skipped: no findings.dir"`; no replay request is sent and no
-id is fabricated. For every other per-confirmation failure (a refused build, a
-refused pre-check, a runner or templater error, an unwritable store, a failed replay)
-the confirmation stays in `confirmed` with `reproduced: false`, gains an `unreproduced`
-entry whose reason is a constant or a `scrub_text`-scrubbed error, and the loop
-continues with the next confirmation. A hostile target cannot abort a call by planting
-template syntax in content the scanner captured.
+**Failure handling.** `findings.dir` defaults to `None`, so a default install records
+nothing: reproduction is skipped (`reproduction: "skipped: no findings.dir"`, no replay
+sent, no id fabricated; AC28). Every other per-confirmation failure leaves the
+confirmation in `confirmed` with `reproduced: false` and one `unreproduced` entry whose
+`reason` is **always one of these constants, never error text**: `build refused:
+credential`, `build refused: template`, `replay blocked: out of scope`, `replay
+failed`, `replay did not confirm`, `record failed`, `time_budget`, `budget`. (Runner,
+templater and header errors quote the rendered URL or header value, and `scrub_text`
+stops at whitespace, so `?password=correct%20horse` would leak `horse`.) The loop
+continues with the next confirmation (AC29).
 
 **Budget.** The replay is a request like any other: it goes through the same
 chokepoint (`check_active`, rate, back-off) and is counted against the shared budget
@@ -623,7 +708,7 @@ with an `unreproduced` entry (reason `budget`) and the call stops with
 `stopped_reason = "budget"`. Every decrement is `checked_sub`; a zero budget never
 wraps.
 
-**`control_passed` is `None` in production (Correction 3).** The scope design's AC11
+**`control_passed` is `None` in production.** The scope design's AC11
 described a confirmed finding recording `control_passed == Some(false)` "on the
 patched control", as if diffing against a patched variant were something `scan.inject`
 does at runtime. It cannot: a real target (a client's staging site, DVWA) has no
@@ -648,37 +733,54 @@ must not assert a non-zero "reproduced" count for scanner records.
 ```
 pub const DEFAULT_SWEEP: [&str; 2] = ["reflected-xss", "open-redirect"];
 pub struct CampaignSummary { pub run_id: String, pub phase: String,
-    pub pages_crawled: usize, pub requests_used: usize, pub confirmed_count: usize,
+    pub pages_crawled: usize, pub requests_used: usize, pub request_budget: usize,
+    pub confirmed_count: usize, pub stopped_reason: Option<String> }
+pub struct ClassRun { pub inject: InjectOutcome, pub outcomes: Vec<ReproOutcome>,
     pub stopped_reason: Option<String> }
+pub async fn run_class(host: &CommandHost<'_>, target: &str, def: &CheckDefinition,
+    points: &[InjectionPoint], budget: &mut usize, cfg: &ScannerConfig,
+    deadline: std::time::Instant) -> anyhow::Result<ClassRun>;   // "The replay loop"
+pub struct CampaignOutcome { pub crawl: CrawlOutcome, pub passive: Vec<PassiveFinding>,
+    pub classes: Vec<ClassRun>, pub records: Vec<aitm_findings::FindingRecord> }
 pub async fn run_campaign(host: &CommandHost<'_>, target: &str, active: bool,
-    cfg: &ScannerConfig) -> anyhow::Result<(CampaignSummary, Value)>;
+    cfg: &ScannerConfig) -> anyhow::Result<(CampaignSummary, CampaignOutcome)>;
 ```
 
 `ScanRun { cfg }` (`Sensitivity::Sensitive`, same agent gate + `confirm_prompt` as
 `scan.inject`, and its own `defers_to_command_gate` entry — see "MCP policy layer")
 takes a **single** `let _confine = host.egress_handle().map(|e| e.confine());` for
-the whole campaign and runs, under one shared `request_budget` and one `time_budget`:
-**discover** (`crawl`; because `crawl` takes no budget argument, the phase charges its
-`pages_crawled` against the shared budget when it returns) → **passive**
-(`passive_checks` over captured flows) → **inject** (when `active`: each class in
-`DEFAULT_SWEEP` in order, through `inject` with the campaign's *remaining* time, each
-confirmation through `reproduce_and_record` with the same `&mut budget` and the same
-fold as `scan.inject`) → **report** (`load_records` over the target, then
-`render_report`/`render_index`). It returns `{ run_id, discover, passive, inject,
-report, stopped_reason }`, where `discover`, `passive` and `report` are the
-corresponding verbs' result objects and `inject` is `{ classes: [ <one scan.inject
+the whole campaign and runs, under one shared `request_budget` and one `deadline`
+(start + `time_budget`): **discover** (`crawl`; because `crawl` takes no budget
+argument, the phase charges its `pages_crawled` against the shared budget when it
+returns, with a saturating subtraction) → **passive** (`passive_checks` over
+`target_flows`, run *before* inject so scanner replays are never judged) → **inject**
+(when `active`: each class in `DEFAULT_SWEEP` in order through `run_class`, with the
+shared `&mut budget` and the one `deadline`) → **report** (`load_records` over the
+target). Results are shaped only in `commands.rs`: `run_campaign` returns typed phase
+outputs and never builds a `Value`; the `pub(crate)` helpers `discover_value`,
+`passive_value`, `report_value` and `fold_outcomes(&ClassRun) -> ClassReport` (with
+`to_value()`) are written by the task that owns each verb, and `ScanRun::invoke` reuses
+them, so the campaign's `discover`, `passive`, `report` and `inject.classes[i]` objects
+are the standalone verbs' by construction. It returns `{ run_id, discover, passive,
+inject, report, stopped_reason }`, where `inject` is `{ classes: [ <one scan.inject
 result per swept class> ], tested, finding_ids: [every id], reproduction,
 stopped_reason }` (with `active == false`: `classes: []`, `tested: 0`, `finding_ids:
 []`). The shared budget means the inject phase sees the requests the discover phase
-already spent and the replays it makes itself; hitting the budget stops the campaign
-with `stopped_reason = "budget"`, and exhausting the time budget with
-`"time_budget"`. The default sweep is exactly the two default-active classes; the
-third registered class is reachable only through `scan.inject {class}` (Open question
-2).
+already spent and the replays it makes itself.
+
+**The campaign's `stopped_reason`** is `budget`, `time_budget` or `guard_refused` — the
+shared bounds, taken from the first phase or class that hit one — and nothing else.
+Discover's `no_browser`, `max_pages`, `max_depth`, `left_scope` and `navigation_failed`
+stay inside the `discover` object (only a discover `time_budget` ends the campaign),
+and a class's `max_confirmed` and `send_error` stay in its `inject.classes[i]`. The
+default sweep is exactly the two default-active classes; an optional third class is
+reachable only through `scan.inject {class}` (Open question 2).
 
 `ScanStatus { … }` (`Sensitivity::Read`) returns the plugin's last completed campaign
 snapshot `{ run_id, phase, pages_crawled, requests_used, request_budget,
-confirmed_count, stopped_reason }`, or nulls when none has completed. **(Architect's
+confirmed_count, stopped_reason }` — a copy of the `CampaignSummary`, whose
+`request_budget` field is `cfg.request_budget`, so `ScanStatus` holds no config — or
+nulls when none has completed. **(Architect's
 call:** progress is a *snapshot* read, not a streamed channel — matches the
 integration spec's polling baseline. The snapshot is held in a process-lifetime
 `Mutex` owned by the plugin, stored once when `run_campaign` returns, bounded to the
@@ -728,7 +830,8 @@ autonomous agent cannot self-authorize on a flag alone (`mcp.rs` tests
 `f8_script_authoring_not_auto_authorized_under_all`, `all_sensitive_honors_config_gate`;
 scripting command-surface spec AC8) — which is why this is a question for Matt rather
 than a settled fact. The `defers_to_command_gate` arm must land in the same merge as,
-or after, the command-side flag check; Tasks 8 and 10 add both together.
+or after, the command-side flag check; the `ScanInject` and `ScanRun` command tasks of
+the plan each add both together.
 
 **Operator-configurability of the flag** (threading a config-file `[scanner]`
 section into `ScannerConfig` at `wire.rs`, today hard-wired `::default()`) is owned
@@ -739,8 +842,8 @@ backend plan provides the plugin gate + its unit tests (which construct
 honour "no core edits". See Open question 5. The integration plan's Task 8 test
 (`scan_inject_gate_is_wired_default_off`, "accepted with the flag on under
 `AgentPolicy::All`") can only pass once the `defers_to_command_gate` entry has landed,
-and that plan does not mention it; backend Task 8 must therefore merge before
-integration Task 8.
+and that plan does not mention it; the backend `ScanInject` task must therefore merge
+before the integration plan's Task 8.
 
 ### UI-shape reconciliation (checked against the integration design)
 
@@ -761,7 +864,7 @@ extra `unreproduced` and `reproduction` keys are additive.
 ## Acceptance criteria
 
 Numbering is self-contained to this spec; the scope spec's AC it restates is noted
-in brackets. AC1-AC25 keep their numbers; AC26-AC33 are appended.
+in brackets. AC1-AC25 keep their numbers; AC26-AC34 are appended.
 
 **Stage 2 — passive + report (Read)**
 
@@ -845,13 +948,17 @@ in brackets. AC1-AC25 keep their numbers; AC26-AC33 are appended.
 19. **AC19:** Loading `ScannerPlugin` with the full command set leaves the M4
     free-form loop working: the M4 scripted-driver gate still passes with the
     scanner loaded, and a driver that calls `scan.discover`/`scan.inject` records
-    the same findings (no new mandatory gate in front of the free-form path).
-    [scope AC16]
+    the same findings (no new mandatory gate in front of the free-form path). The
+    scripted-driver arm needs `AITM_OBSCURA`; the default gate skips it, so this AC is
+    verified only where obscura is set. [scope AC16]
 20. **AC20:** The class registry knows ≥ 3 classes (`CheckDefinition::registered_classes().len()
     >= 3`, each resolving through `for_class`, the first two literally `["reflected-xss",
     "open-redirect"]`), each class's payload set capped at `per_class_payload_cap`; a
-    multi-position class under a small budget stays ≤ `request_budget`; and `scan.run`'s
-    default sweep touches exactly `["reflected-xss", "open-redirect"]`. [scope AC14]
+    class with several injection points under a small budget stays ≤ `request_budget`
+    (`inject_budget_n_plus_one_sends_exact_count`); and `scan.run`'s default sweep
+    touches exactly `["reflected-xss", "open-redirect"]`. The third-class clause is met
+    **only if** the optional part of the plan's class-registry task lands (Open question
+    2); otherwise Matt amends this clause to the shipped two. [scope AC14]
 
 **Criteria for the reproduce/record, policy and bounding behaviour (appended)**
 
@@ -868,38 +975,49 @@ in brackets. AC1-AC25 keep their numbers; AC26-AC33 are appended.
     `scan.run`) in the `aitm-mcp` policy-test server is **not** refused under `All` and
     **is** refused under `Auto`, proving the `defers_to_command_gate` entry by name the
     way `ca.install`/`scope.add` are proven. (These arms assume Open question 6's
-    default; the `All` arms flip if Matt answers "leave them out".) [new; Correction 2]
+    default; the `All` arms flip if Matt answers "leave them out".) [new]
 22. **AC22 (one record per reproduced confirmation):** With a counting
     `FindingRecorder` wired onto the host and `findings.dir` configured, a reproduced
     confirmation leaves the counter at `0`, `PocRunResult.recorded_id == None`, and the
     findings store holds exactly one `FindingRecord` per reproduced confirmation (never
-    two). [new; Correction 1]
+    two). [new]
 23. **AC23 (control is a test property):** The vulnerable-versus-patched proof is two
     separate `scan.inject` calls: one against `SeedMode::Vulnerable` (`confirmed`
     non-empty, `finding_ids` non-empty, every stored record `passed == true` and
     `control_passed == None`) and one against `SeedMode::Patched` (`confirmed` empty,
     `finding_ids` empty, no stored record whose `target` is on the patched base's
     origin, and `scan.report {target: <patched base>}` returns an empty `index`). No
-    production code path sends a patched-control request. [new; Correction 3; refines
-    AC6/AC10]
-24. **AC24 (no credential persists):** For each row of the literal table below, a
-    reflecting target and a configured `findings.dir`, the value `abc123` is absent
-    from **all five** of: the PoC YAML at `artifacts.poc_path`, the stored finding YAML,
-    `runs.jsonl`, the serialised `scan.inject` result, and the serialised `scan.report`
-    output (`report_md` and `index`). Rows 1-6 and 8 reproduce and record (the
-    credential is bound in memory, so the replay passes) and the PoC YAML contains the
-    row's placeholder; row 7 yields no PoC and no record. [new; extends AC11]
+    production code path sends a patched-control request. [new; refines AC6/AC10]
+24. **AC24 (no credential persists):** For **every** row of the literal table below,
+    against a reflecting target with a configured `findings.dir`, the row's secret
+    (`abc123` unless stated) is absent from **all five** of: the PoC YAML at
+    `artifacts.poc_path`, the stored finding YAML, `runs.jsonl`, the serialised
+    `scan.inject` result, and the serialised `scan.report` output (`report_md` and
+    `index`). Each request also carries the reflecting point `q=<marker>` (in the
+    query, except rows 10-12 where it is a top-level JSON key). The outcome is asserted
+    unconditionally per row. **Recorded** rows: `confirmed.len() == 1`,
+    `finding_ids.len() == 1`, `unreproduced` empty, the PoC YAML contains the row's
+    placeholder, and the stub target saw the real, raw value on the replay request.
+    **Refused** rows: `confirmed.len() == 1`, `finding_ids` empty, `unreproduced` has
+    exactly one entry whose `reason` is the row's constant, `findings.dir` holds no
+    `*.yaml`, and no PoC file exists. [new; extends AC11]
 
-    | # | Component | Captured request fragment | Placeholder in the PoC YAML |
+    | # | Captured request fragment | Outcome | Placeholder / reason |
     |---|---|---|---|
-    | 1 | header | `X-CSRF-Token: abc123` | `{{x_csrf_token}}` |
-    | 2 | header | `X-Auth-Token: abc123` | `{{x_auth_token}}` |
-    | 3 | header | `Authorization: Bearer abc123` | `{{authorization}}` |
-    | 4 | header | `Cookie: PHPSESSID=abc123` | `{{cookie}}` |
-    | 5 | query | `?q=<marker>&access_token=abc123` | `{{access_token}}` |
-    | 6 | form body | `password=abc123` | `{{password}}` |
-    | 7 | path parameter | `/search;jsessionid=abc123?q=<marker>` | none — `unreproduced` has one entry, `finding_ids` is empty |
-    | 8 | JSON body | `{"token":"abc123"}` | `{{token}}` |
+    | 1 | header `X-CSRF-Token: abc123` | Recorded | `{{x_csrf_token}}` |
+    | 2 | header `X-Auth-Token: abc123` | Recorded | `{{x_auth_token}}` |
+    | 3 | header `Authorization: Bearer abc123` | Recorded | `{{authorization}}` |
+    | 4 | header `Cookie: PHPSESSID=abc123` | Recorded | `{{cookie}}` |
+    | 5 | query `access_token=abc123` | Recorded | `{{access_token}}` |
+    | 6 | query, percent-encoded key `acc%65ss_token=abc123` | Recorded | `{{access_token}}` (key matched after decoding) |
+    | 7 | query `password=correct%20horse` (secret strings `correct%20horse` and `horse`) | Recorded | `{{password}}` (bound raw, not decoded) |
+    | 8 | form body `password=abc123` | Recorded | `{{password}}` |
+    | 9 | JSON body `{"token":"abc123"}` | Recorded | `{{token}}` |
+    | 10 | nested JSON `{"login":{"password":"abc123"},"q":"x"}` | Refused (backstop) | `build refused: credential` |
+    | 11 | array of objects `{"users":[{"password":"abc123"}],"q":"x"}` | Refused (backstop) | `build refused: credential` |
+    | 12 | the row-10 body pretty-printed over several lines | Refused (backstop) | `build refused: credential` |
+    | 13 | header `Referer: http://127.0.0.1:8080/reset?token=abc123` | Refused (backstop) | `build refused: credential` |
+    | 14 | path parameter `/search;jsessionid=abc123?q=<marker>` | Refused (structural; `scrub_text` does not see `jsessionid`) | `build refused: credential` |
 25. **AC25 (reproduction is budgeted):** With `request_budget == 1` against a
     reflecting target, `scan.inject` returns `confirmed` non-empty, `finding_ids`
     empty, one `unreproduced` entry with reason `budget`, `stopped_reason ==
@@ -910,10 +1028,16 @@ in brackets. AC1-AC25 keep their numbers; AC26-AC33 are appended.
     target that takes 100 ms per response and never reflects, `scan.inject` reports
     `tested == 1` and `stopped_reason == "time_budget"`. (ii) With 1025 distinct
     reflecting single-parameter flows and a sufficient budget, `confirmed.len() ==
-    1024` and `stopped_reason == "max_confirmed"`. (iii) `scan.run` hands its inject
-    phase the campaign's *remaining* time: with `time_budget` of 50 ms and a discover
-    phase that takes longer, the campaign reports `stopped_reason == "time_budget"` and
-    the target observes no injection request. [new; Anti-goal "unbounded"]
+    1024` and `stopped_reason == "max_confirmed"`. (iii) `scan.run` shares one deadline
+    across its phases: with `time_budget` of 50 ms and a discover phase that takes
+    longer, the campaign reports `stopped_reason == "time_budget"` and the target
+    observes no injection request, while the same stored flow with the default
+    `time_budget` observes exactly one injection request. (iv) The deadline also bounds the replay loop: with two
+    vulnerable points, `time_budget` of 20 ms and a target that answers an injection
+    request at once but takes 500 ms on a repeat of the same request, the target
+    observes exactly three requests (two injections, one replay that is cut off at the
+    deadline), `finding_ids` is empty, and both confirmations are `unreproduced` with
+    reason `time_budget`. [new; Anti-goal "unbounded"]
 27. **AC27 (one finding per vulnerable point):** Against a target that reflects every
     value of `q` (one captured `/search?q=` flow, or several captures of the same
     endpoint), `scan.inject {class: "reflected-xss"}` sends exactly one injection request
@@ -926,8 +1050,10 @@ in brackets. AC1-AC25 keep their numbers; AC26-AC33 are appended.
 29. **AC29 (a failed confirmation never aborts the call):** With two vulnerable
     points, the first of whose captured request carries a header `X-Note: {{x}}`,
     `scan.inject` returns `Ok` with `confirmed.len() == 2`, `finding_ids.len() == 1` and
-    `unreproduced.len() == 1` whose reason does not contain `{{x}}`; likewise when the
-    findings directory cannot be written (reason begins `record failed`). [new]
+    `unreproduced.len() == 1` whose reason is exactly `build refused: template`; likewise
+    when the findings directory cannot be written (reason exactly `record failed`), and
+    when the replay fails with an error whose text contains a secret (reason exactly
+    `replay failed`, the secret in no result). [new]
 30. **AC30 (a failed replay is not a finding):** When the replay does not pass (a
     target that reflects the marker on the injection request but not on replay), the
     confirmation is listed in `confirmed` with `reproduced == false` and in
@@ -936,8 +1062,10 @@ in brackets. AC1-AC25 keep their numbers; AC26-AC33 are appended.
 31. **AC31 (`scan.run` reproduces and records):** `scan.run` against a stored reflecting
     flow (no browser, so discover spends no request) with `request_budget == 3` returns
     an `inject` phase with `finding_ids.len() == 1`, the store holds exactly one record,
-    and the summary reports `requests_used == 2` (one injection, one replay) and
-    `confirmed_count == 1`. [new]
+    and the summary reports `requests_used == 2` (one injection, one replay),
+    `confirmed_count == 1` and `stopped_reason == None` (discover's `no_browser` does
+    not become the campaign's); its `passive` and `report` objects equal the standalone
+    `scan.passive` and `scan.report` results for the same store. [new]
 32. **AC32 (record target):** A recorded finding's `target` is the attack request's
     `scheme://authority/path` without query or fragment, scrubbed (literal:
     `http://127.0.0.1:<port>/search`); `scan.report {target: <campaign base URL>}`
@@ -948,6 +1076,23 @@ in brackets. AC1-AC25 keep their numbers; AC26-AC33 are appended.
     `GuardError::OutOfScope` and the sender observed zero requests; a `narrowed_host`
     keeps the outer host's frontend, SSRF policy, egress handle and config, and drops
     the finding recorder and browser. [new]
+34. **AC34 (a failed send never discards what was found):** `inject` returns `Ok` in
+    every case below, with the confirmations found so far. (i) Three single-point
+    endpoints against a reflect-everything target whose second request fails once with a
+    transport error: the failed attempt is charged and counted, the same point tries its
+    next payload, so `confirmed.len() == 3`, `tested == 4`, `send_errors == 1`, the client
+    is called 4 times, and `stopped_reason` is null; when every request fails, the call
+    stops after exactly 5 requests with `confirmed` empty, `tested == 5` and
+    `stopped_reason == "send_error"`. (ii) A guard that answers
+    `RateLimited { retry_after: 20 ms }` to the first request and admits afterwards: the
+    same attempt is retried (the client is called twice, once refused and once served),
+    `confirmed.len() == 1` and the budget was charged once. (iii) A `HostDisabled` answer on the second point stops
+    the call with `stopped_reason == "guard_refused"`, keeping the first point's
+    confirmation. (iv) A source flow removed from the store is skipped (`skipped == 1`),
+    not an error. (v) `scan.inject {injection_point}` accepts a well-formed `{flow,
+    location, name}` object naming an enumerated point and rejects a malformed object, an
+    unknown `flow` and a point that does not exist, each with an error naming
+    `injection_point`. [new; Anti-goal "aborting the call"]
 
 ## Left to the builder
 
@@ -963,16 +1108,12 @@ in brackets. AC1-AC25 keep their numbers; AC26-AC33 are appended.
 - Recording is **not** left open: it goes through `DiskFindingStore`, never
   `host.finding_recorder()`.
 - The exact way `narrowed_host` rebuilds the host from the existing accessors and
-  builders, and the names of the credential placeholders beyond the rule in "Building
-  the PoC" (valid identifiers, unique, never `target`/`payload`/`param`).
-- Whether the per-confirmation reproduction loop also checks the time deadline before
-  each replay (recommended: the loop is bounded by `MAX_CONFIRMED` sequential
-  replays, so the overshoot is bounded either way).
+  builders, and the credential-placeholder naming and collision handling beyond the
+  rule in "Building the PoC" (bounded, sanitised, unique).
 - The serde_json→`aitm_core::Value` converter for `render_index` (shipped).
-- Which third seeded class fills AC20 (stored-XSS, SSRF, IDOR, or auth-bypass), under
-  the constraint that it must be confirmable from one response to one request with an
-  inert payload; a task that finds none of the four fits **stops and reports** (a spec
-  gap), it does not widen `confirm`.
+- A known coverage limit, not a safety issue: the endpoint dedupe is first-capture-wins,
+  so a stale unauthenticated first capture of an endpoint shadows later authenticated
+  captures of it.
 
 ## Open questions
 
@@ -985,12 +1126,19 @@ default changes a task, the question says which.
    hard ceiling an operator can raise per class; the *default* set is small to keep
    a campaign fast and low-noise. Alternative: ship the full 25-payload sets by
    default (louder, slower, more coverage).
-2. **Which classes does `scan.run` sweep by default?** Default: **reflected-XSS +
-   open-redirect only** (inert markers + patched controls, zero test-target work),
-   plus one more registered class for AC20 that is **opt-in per `scan.inject {class}`**
-   but **not** run by `scan.run`'s default sweep. AC20's registry half (≥ 3 classes
-   known to `for_class`) holds either way. Alternative: `scan.run` sweeps every
-   registered class by default (changes `DEFAULT_SWEEP` in Task 9).
+2. **Which classes does `scan.run` sweep by default, and is there a third?** Default:
+   **reflected-XSS + open-redirect only** (inert markers + patched controls, zero
+   test-target work). A third registered class (AC20's ≥ 3 clause) is **not pinned**:
+   none of the four remaining seeded classes confirms from one request and one response
+   with an inert payload and no target-specific knowledge — stored-XSS needs two
+   requests, IDOR and auth-bypass need a baseline, and SSRF confirms only on a seeded
+   marker the scanner must not read, after a non-inert internal-address payload. So the
+   optional third-class part of the plan's class-registry task is non-blocking; AC20's
+   third-class clause holds only if it lands, otherwise Matt amends AC20 to the shipped
+   two, or names a class outside the six seeded ones. If one lands it is opt-in per
+   `scan.inject {class}` and **not** in `scan.run`'s sweep. Alternative: `scan.run`
+   sweeps every registered class by default (changes `DEFAULT_SWEEP` in the campaign
+   task).
 3. **Default active-request budget for a campaign?** Default: keep the shipped
    `request_budget = 2000` and `time_budget = 600 s`. Confirm or adjust.
 4. **Does `scan.run` auto-confine egress and auto-enable the active (inject)
@@ -1017,10 +1165,11 @@ default changes a task, the question says which.
    regardless of the flag. Alternative: **leave them out**, as `script.save` is, so an
    agent's active scan can only be authorized under `Ask` with an operator present and
    the flag matters only there; then AC21's `All` arms flip (refused by policy even with
-   the flag on) and Tasks 8 and 10 drop their allow-list arms. This is a posture
-   choice, so **Matt's explicit answer is needed before Tasks 8 and 10 are dispatched**;
-   with no answer the entries are left out (the fail-closed choice). The arm lands in the
-   same merge as, or after, the command-side flag check (each task adds both).
+   the flag on) and the `ScanInject` and `ScanRun` command tasks drop their allow-list
+   arms. This is a posture choice, so **Matt's explicit answer is needed before those two
+   tasks are dispatched**; with no answer the entries are left out (the fail-closed
+   choice). The arm lands in the same merge as, or after, the command-side flag check
+   (each task adds both).
 7. **`scan.run` execution model and live progress.** Default, as planned: `scan.run`
    is synchronous (a blocking `invoke`, bounded by `time_budget`, default 600 s) and
    `scan.status` reads a snapshot stored once, after `run_campaign` returns — so a UI
@@ -1031,7 +1180,7 @@ default changes a task, the question says which.
    (without that guard two concurrent campaigns each assume they own the whole
    `request_budget`); or return `{run_id}` at once and work in a background task (never
    holds a connection ~10 minutes, but needs a lifecycle/cancellation story no command
-   has today). Adopting either changes Tasks 9 and 10.
+   has today). Adopting either changes the campaign and `ScanRun` tasks.
 8. **Do passive observations reach the Findings pane?** `scan.passive` persists
    nothing, and `scan.report` renders only recorded `FindingRecord`s, so the
    integration UIs' Findings pane (which reads `scan.report`'s index) shows **zero**
@@ -1040,31 +1189,32 @@ default changes a task, the question says which.
    levels, and `aitm-findings` records a finding as "a separate, explicit, gated act".
    Alternative: add an `observed` array to `scan.report`, or persist passive hits at a
    low-confidence tier.
-9. **Replay policy for non-idempotent methods.** Reproduction replays the attack
-   request with the method it was captured with, so a confirmed `POST`/`PUT`/`DELETE`
-   injection runs its side effect twice (once injected, once replayed). Default: **no
-   change** — replay whatever method was captured, as `poc.run` and `request.send`
-   already would; this is surfaced, not decided. Alternatives: reproduce only
-   idempotent methods (`GET`/`HEAD`/`OPTIONS`) and report the rest as `unreproduced`
-   with reason `non-idempotent method`, or make it a `ScannerConfig` flag.
+9. **Method policy for injection and replay.** Injection and reproduction both send
+   with the method the request was captured with, so a captured `POST`/`PUT`/`DELETE`
+   point gets up to 8 injection requests (one per payload until the first confirmation)
+   and, once confirmed, one replay — each running its side effect. Default: **no
+   change** — send whatever method was captured, as `poc.run` and `request.send`
+   already would; this is surfaced, not decided. Alternatives: inject and replay only
+   idempotent methods (`GET`/`HEAD`/`OPTIONS`) and report the rest as skipped or
+   `unreproduced` with reason `non-idempotent method`, or make it a `ScannerConfig` flag.
+10. **Small budgets and unreproduced points.** Injection spends the shared budget before
+    any replay is considered, so a small `request_budget` can end with confirmations and
+    no persisted record, and a point whose replay fails is not retried with its next
+    payload. Default: **no change**. Alternatives: reserve one request per pending replay
+    before each injection, or reproduce each confirmation as it is found (interleaved);
+    let an unreproduced point try its next payload; wait out a rate-limited replay
+    (today a refused replay is `replay failed`).
 
 ## Summary
 
 This design completes the deterministic scanner's backend for v0.6 by extending the
-**shipped** `aitm-plugin-scanner` crate with five verbs — `scan.passive` and
-`scan.report` (Read), `scan.inject` and `scan.run` (Sensitive, agent-gated,
-egress-confined), and `scan.status` (Read) — reusing the shipped `ScannerConfig`,
-`enumerate`, `crawl`, and `egress_handle`, the `aitm_poc` matcher/PoC vocabulary, and
-the `aitm-findings` store/report, with **no `aitm-core` edit**. Active injection rides
-the single guarded client chokepoint, holds an RAII `ConfinementToken` for its whole
-phase, and refuses every caller but the operator/CLI unless `scanner.allow_agent_active`
-is set. Each confirmation is reproduced once through `StdPocRunner` on a recorder-less
-narrowed host and recorded once through `DiskFindingStore` with `control_passed: None`,
-by one function shared by `scan.inject` and `scan.run`; credentials are parameterised out
-of the PoC, a failed or unrecordable replay never aborts the call and never becomes a
-finding, and the policy layer needs `defers_to_command_gate` entries (Open question 6).
-Thirty-three acceptance criteria map to the three stages; result shapes match what the
-integration plan's UI tasks consume.
+shipped `aitm-plugin-scanner` crate with `scan.passive`, `scan.report`, `scan.inject`,
+`scan.run` and `scan.status`, with no `aitm-core` edit. Active injection is gated,
+scope-confined and bounded by one request budget and one deadline; each confirmation is
+reproduced once on a recorder-less narrowed host and recorded once with
+`control_passed: None`. Credentials are placeholdered and backstopped by `scrub_text`,
+failures never abort a call and never leak text, and the policy layer needs
+`defers_to_command_gate` entries (Open question 6). Thirty-four acceptance criteria.
 
 ### Architect's calls made (for Matt to approve or correct)
 
@@ -1082,49 +1232,44 @@ integration plan's UI tasks consume.
    `scan.status {run_id, phase, pages_crawled, requests_used, request_budget,
    confirmed_count, stopped_reason}`.
 5. Tiers: `scan.passive`/`report`/`status` = Read; `scan.inject`/`run` = Sensitive.
-6. First active classes **reflected-XSS + open-redirect**; a third registered class
-   (`registered_classes()`) fills AC20 and is opt-in per `scan.inject`; `scan.run`'s
-   default sweep is `DEFAULT_SWEEP` (the first two).
+6. First active classes **reflected-XSS + open-redirect**; a third class is optional and
+   not pinned (none of the four remaining seeded classes qualifies, Open question 2);
+   `scan.run`'s default sweep is `DEFAULT_SWEEP` (the first two).
 7. `scan.status` is a last-completed-run **snapshot** (polling baseline); live progress
    and a single-in-flight guard are Open question 7, not v1.
 8. Operator-configurability of the flag is left to the integration plan's D-MCP2/AC9.
 9. Correlation stays internal (no `scan.correlate` verb), returned as `evidence`.
 10. Contract lists: each command-registration task bumps `EXPECTED_TOOLS` (56 → 61) and
     the `aitm-tui` family (`CORE_TOOLS`, fixture, pins: 59 → 64).
-11. Reproduction runs `aitm_poc::StdPocRunner` directly on a **narrowed host that keeps
-    every service and a `Config` clone and drops only the finding recorder and browser**,
-    so the replay is scope/SSRF/egress-confined like any request and the runner's
-    auto-record is inert.
-12. The scanner records through `DiskFindingStore`, never `host.finding_recorder()`; only a
-    **passing** replay is recorded; the confirming flow is first in `flows`.
-13. `control_passed` is `None` in every production record; the vulnerable-versus-patched
-    proof is two separate calls in the e2e tests.
-14. `scan.inject`/`scan.run` are added to `defers_to_command_gate` as the default for
-    Open question 6, **gated on Matt's explicit answer** before Tasks 8 and 10 dispatch.
-15. The replay is governed by `scanner.allow_agent_active` alone (`poc.allow_agent_run` is
-    not re-applied), is counted against the shared budget, and all decrements are
-    `checked_sub`.
-16. `Confirmed` carries the `HttpFlow` (not an id), so no store re-fetch can fail.
-17. One reproduction and record per injection point (endpoint key = method +
-    `scheme://authority/path` + location + name); `inject` stops a point after its first
-    confirmation and skips repeat captures of one endpoint.
-18. Credential parameterisation by the scanner's own `is_secret_name` predicate (promoted to
-    `pub(crate)`) over headers, query keys and form/JSON body keys; unparameterisable
-    credentials (path parameters, multipart/opaque bodies) refuse the PoC; a fail-closed
-    pre-check serialises the PoC and refuses on any bound credential or Cookie value (values
-    under 4 bytes exempt); the guarantee is stated as exactly that, no wider.
-19. Template metacharacters (`{{`, `}}`) in builder-derived content **refuse** the build —
-    the templater has no escape syntax and evaluates non-identifier expressions.
-20. The PoC `name` carries the class and the parameter name sanitised to `[A-Za-z0-9_.-]`,
-    32 characters; severity mapping reflected-XSS → `Medium`, open-redirect → `Low`, other
-    → `Info`; the open-redirect PoC `success` ANDs five redirect statuses with the
-    `Location` regex.
-21. Record `target` is the attack request's `scheme://authority/path` without query;
-    `scan.report`'s `target` filter becomes origin-and-path-prefix (a change to the shipped
-    `report.rs`, its own task).
-22. With no `findings.dir`, reproduction and recording are skipped with an explicit
-    `reproduction` marker; per-confirmation failures are isolated into `unreproduced`.
-23. Time budget: `inject` stops at `cfg.time_budget` (`"time_budget"`, as `crawl` already
-    says) and at `MAX_CONFIRMED = 1024` (`"max_confirmed"`); `scan.run` passes the inject
-    phase the remaining time; discover charges `pages_crawled` against the shared budget.
-24. Moved out of the blocking questions into Non-goals/follow-ups: the payload-set source.
+11. Reproduction runs `StdPocRunner` on a narrowed host (recorder and browser dropped) —
+    "Running the PoC".
+12. The scanner records through `DiskFindingStore`, only a passing replay, `control_passed:
+    None` — "When a record is written", "`control_passed` is `None` in production".
+13. `scan.inject`/`scan.run` are added to `defers_to_command_gate` as the default for Open
+    question 6, **gated on Matt's explicit answer** before the two command tasks dispatch.
+14. The replay is governed by `scanner.allow_agent_active` alone and counted against the
+    shared budget — "Running the PoC", "Budget".
+15. `Confirmed` carries the attack `HttpFlow` with `response = None` — "`scan.inject`".
+16. One reproduction per point; dedupe key has the query stripped; a failed send never
+    discards confirmations (rate limit waited out, guard refusal and five consecutive
+    errors stop with a reason) — "`scan.inject`".
+17. Credentials: placeholders for credential headers and top-level query/form/JSON keys
+    (percent-decoded, case-insensitive match; seven extra needles kept in `reproduce.rs`,
+    not widened in `discover.rs`), plus one `scrub_text` backstop on what survives into the
+    PoC — "Building the PoC".
+18. Only `{{` refuses a build, not `}}` — "Building the PoC".
+19. Every `unreproduced[].reason` is a constant; `build_poc` returns a two-variant
+    `BuildRefused`; `tracing` is the crate's one new dependency — "Failure handling".
+20. PoC name, severity mapping keyed by `CLASS_*`, class `success` owned by
+    `success_assertion` (which tightens `confirm` to the five redirect statuses) — "Building
+    the PoC", "`scan.inject`".
+21. Record `target` is the endpoint with `[ ] ( ) ! < > *` and backtick percent-encoded and `_`
+    left alone; `scan.report`'s filter is origin-and-path-prefix with a trailing slash ignored
+    — "Record target", "`scan.report`".
+22. One deadline for the whole call; every send under `timeout(min(remaining, 60 s))`;
+    `run_class` (campaign.rs) owns inject-then-replay for both verbs, so the `ScanInject`
+    command task depends on the campaign task; engines return typed results and `commands.rs`
+    shapes them; `CampaignSummary` carries `request_budget` — "Constraints", "The replay
+    loop", "`scan.run`".
+23. The third class is optional and non-blocking; if none lands Matt amends AC20 to the
+    shipped two — Open question 2.
