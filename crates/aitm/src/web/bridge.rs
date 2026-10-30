@@ -4,12 +4,17 @@
 //! requires on its first line; every later text frame holds one or more lines.
 //!
 //! A frame is the unit of work. The lines inside one frame run in order and are
-//! answered in order, one text frame per reply, once the whole frame is done.
+//! answered in order, one text frame per reply, once the whole frame is done. A
+//! frame may carry at most `MAX_LINES_PER_FRAME` (256) lines; a client that sends
+//! more is closed (`Size`) before any of its lines runs.
+//!
 //! Frames run concurrently (up to `MAX_IN_FLIGHT` per connection), so a
 //! long-running command — `scan.discover` can run for minutes — never freezes the
 //! other requests on the same socket; replies across frames arrive in completion
-//! order and clients correlate them by JSON-RPC `id`. All policy stays in the
-//! core: the bridge authenticates, splits lines, and forwards.
+//! order and clients correlate them by JSON-RPC `id`. Clients that need one
+//! request's effect before the next must wait for its reply; a Close or disconnect
+//! discards replies still in flight. All policy stays in the core: the bridge
+//! authenticates, splits lines, and forwards.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,7 +53,24 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// stops reading further frames (TCP backpressure) until one finishes, so neither
 /// blocking tasks nor queued frames can grow without bound however fast a peer
 /// sends. Each frame holds one blocking-pool thread while its commands run.
-const MAX_IN_FLIGHT: usize = 16;
+pub const MAX_IN_FLIGHT: usize = 16;
+
+// The relay's `select!` panics when every branch is disabled; with a non-zero cap
+// the read branch is enabled whenever nothing is in flight.
+const _: () = assert!(MAX_IN_FLIGHT > 0);
+
+/// The most request lines one text frame may carry. A frame is dispatched line by
+/// line and its replies are held until the whole frame is done, so an unbounded
+/// frame is a post-auth CPU/memory amplifier: one 16 MiB frame can hold hundreds
+/// of thousands of tiny lines, and up to [`MAX_IN_FLIGHT`] such frames may be in
+/// flight on one connection. A frame carrying more is refused — the connection is
+/// closed with `Size` — before any of its lines is dispatched. The 16 MiB message
+/// bound still applies independently. Same figure as `MAX_BATCH_LEN` in the MCP
+/// HTTP transport. The token line is not a request and does not count.
+const MAX_LINES_PER_FRAME: usize = 256;
+
+/// The `Size` close reason for a frame over [`MAX_LINES_PER_FRAME`].
+const TOO_MANY_LINES: &str = "too many lines in one frame";
 
 /// JSON-RPC error code for a refused token (matches `LoopbackTcp`).
 pub const UNAUTHORIZED: i64 = -32001;
@@ -138,7 +160,7 @@ type Ws = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
     // Authentication: the first non-empty line of the first text frame. The
     // token's class picks the role every later line runs as.
-    let mut pending: Vec<String> = Vec::new();
+    let pending: Vec<String>;
     let role;
     let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
     loop {
@@ -160,8 +182,13 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
                     ws.send(Message::text(UNAUTHORIZED_REPLY)).await?;
                     return close(ws, CloseCode::Policy, "unauthorized").await;
                 };
+                // The lines that share the token's frame are ordinary requests and
+                // answer to the same cap; only an authenticated peer gets here.
+                let Some(rest) = bounded_lines(lines) else {
+                    return close(ws, CloseCode::Size, TOO_MANY_LINES).await;
+                };
                 role = resolved;
-                pending.extend(lines.map(str::to_owned));
+                pending = rest;
                 break;
             }
             Some(Ok(Message::Binary(_))) => {
@@ -204,9 +231,11 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
                     ws.send(Message::text(reply)).await?;
                 }
             }
-            frame = ws.next(), if in_flight.len() < MAX_IN_FLIGHT => match frame {
+            next = ws.next(), if in_flight.len() < MAX_IN_FLIGHT => match next {
                 Some(Ok(Message::Text(text))) => {
-                    let lines: Vec<String> = lines_of(text.as_str()).map(str::to_owned).collect();
+                    let Some(lines) = bounded_lines(lines_of(text.as_str())) else {
+                        return close(ws, CloseCode::Size, TOO_MANY_LINES).await;
+                    };
                     if !lines.is_empty() {
                         in_flight.push(dispatch_frame(&state.mcp, role, lines));
                     }
@@ -238,6 +267,9 @@ type FrameTask = tokio::task::JoinHandle<Vec<String>>;
 /// one text frame each once the whole frame is done. The role makes the browser's
 /// own `initialize` reply carry the right `role` echo, and gates commands exactly
 /// as the other frontends do. Concurrency is across frames, never within one.
+///
+/// A line that panics discards the replies the frame's earlier lines produced
+/// (they are held until the frame is done) and ends the connection.
 fn dispatch_frame(mcp: &Arc<McpServer>, role: Frontend, lines: Vec<String>) -> FrameTask {
     let mcp = Arc::clone(mcp);
     tokio::task::spawn_blocking(move || {
@@ -285,6 +317,17 @@ async fn close(mut ws: Ws, code: CloseCode, reason: &'static str) -> anyhow::Res
 /// Non-empty, trimmed lines of a frame.
 fn lines_of(text: &str) -> impl Iterator<Item = &str> {
     text.split('\n').map(str::trim).filter(|l| !l.is_empty())
+}
+
+/// Own `lines` for dispatch, or `None` when there are more than
+/// [`MAX_LINES_PER_FRAME`]. At most one line past the cap is read and copied, so
+/// refusing an oversized frame costs a bounded amount however many lines it holds.
+fn bounded_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Option<Vec<String>> {
+    let owned: Vec<String> = lines
+        .take(MAX_LINES_PER_FRAME + 1)
+        .map(str::to_owned)
+        .collect();
+    (owned.len() <= MAX_LINES_PER_FRAME).then_some(owned)
 }
 
 /// `line` is exactly `{"token":"…"}` (one key, a string) and its value equals
@@ -424,6 +467,38 @@ mod tests {
             &hv("ws://127.0.0.1:8081"),
             "127.0.0.1:8081"
         ));
+    }
+
+    #[test]
+    fn a_frame_may_carry_at_most_the_line_cap() {
+        assert_eq!(MAX_LINES_PER_FRAME, 256);
+        // Exactly at the cap is accepted whole, in order.
+        let at_cap: String = (0..MAX_LINES_PER_FRAME).map(|i| format!("{i}\n")).collect();
+        let lines = bounded_lines(lines_of(&at_cap)).expect("a frame at the cap is accepted");
+        assert_eq!(lines.len(), 256);
+        assert_eq!(lines.first().map(String::as_str), Some("0"));
+        assert_eq!(lines.last().map(String::as_str), Some("255"));
+        // One line over is refused.
+        let over: String = (0..=MAX_LINES_PER_FRAME)
+            .map(|i| format!("{i}\n"))
+            .collect();
+        assert_eq!(bounded_lines(lines_of(&over)), None);
+        // A flood is refused after reading only one line past the cap.
+        let flood = "x\n".repeat(100_000);
+        let mut seen = 0usize;
+        let counted = lines_of(&flood).inspect(|_| seen += 1);
+        assert_eq!(bounded_lines(counted), None);
+        assert_eq!(seen, MAX_LINES_PER_FRAME + 1);
+    }
+
+    #[test]
+    fn blank_lines_do_not_count_against_the_line_cap() {
+        let padded = "\n  \r\n".repeat(MAX_LINES_PER_FRAME) + "{\"a\":1}\n\n";
+        assert_eq!(
+            bounded_lines(lines_of(&padded)),
+            Some(vec!["{\"a\":1}".to_owned()])
+        );
+        assert_eq!(bounded_lines(lines_of("")), Some(Vec::new()));
     }
 
     #[test]
