@@ -71,7 +71,8 @@ impl Command for ProxyStatus {
         ParamSchema {
             description:
                 "The proxy's live state: `listening` (bool) + `address`, `intercept_armed`, \
-                          `paused` (parked-flow count), `capturing`, and `flows` (visible count)."
+                          `paused` (parked-flow count), `capturing`, `flows` (visible count), and \
+                          `version` (the aitm binary's version)."
                     .into(),
             params: vec![],
             result: TypeDesc::Object(Vec::new()),
@@ -99,6 +100,11 @@ impl Command for ProxyStatus {
             Value::Int(host.store().intercepted_count() as i64),
         );
         obj.insert("flows".into(), Value::Int(host.store().count() as i64));
+        // The workspace version (every crate inherits it), so a UI shows what is really running.
+        obj.insert(
+            "version".into(),
+            Value::Str(env!("CARGO_PKG_VERSION").into()),
+        );
         Ok(Value::Object(obj))
     }
 }
