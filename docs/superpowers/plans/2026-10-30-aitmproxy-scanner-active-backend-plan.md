@@ -62,7 +62,7 @@ lists" = the files in Global constraints; "policy files" = `crates/aitm-mcp/src/
 | T14 docs | 5 | T10 | `README.md`, `tests/readme.rs`, `agent/PLAYBOOK.md` (repo root), `crates/aitm/tests/agent_surface.rs` |
 
 **Parallel:** T18 ∥ T5 ∥ T15 first; T4 starts once T18 part A lands, and T16 once **both**
-T4 and T5 have landed; T6 → T7 ∥ T9; T11–T14 all ∥. **`lib.rs` order (Wave 2):** T5 lands
+T4 and T5 have landed; T6 → T7 ∥ T9; then T8 → T10; T11–T14 all ∥. **`lib.rs` order (Wave 2):** T5 lands
 its `lib.rs` lines first (`pub mod inject;` and `#[cfg(test)] mod test_support;`); T4 then
 adds `pub mod reproduce;` on top — T4's other work may proceed in parallel, only its final
 merge waits for T5. The `aitm-mcp` half of T8 and T10 needs no scanner
@@ -101,16 +101,26 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   `host.finding_recorder()`; only a passing replay is recorded; every production record
   has `control_passed: None`; a per-confirmation failure is an `unreproduced` entry,
   never a `?` out of the call.
-- **No credential persists, no error text forwarded.** No credential reaches the PoC YAML,
-  a stored record, `runs.jsonl`, or any result (spec "Building the PoC", AC24; fixtures use
-  the literal `abc123`), and every `unreproduced[].reason` is one of the constants in the
-  spec's "Failure handling" — runner, templater and build-refusal text is never forwarded.
-- **Bounded.** One deadline per call; every injection send and every replay runs inside
-  `inject::bounded` (`timeout(min(remaining, 60 s))`), a rate-limit refusal goes through
-  `inject::wait_out_rate_limit`, and a timeout counts as `time_budget` only when it fires at
-  or after the deadline; remaining time and budgets use `saturating_duration_since` /
-  `checked_sub` (spec Constraints, "A failed send never discards what was found"). Timing
-  tests use a deadline of at least 200 ms against a 2–5 s slow response.
+- **No identifiable credential persists, no error text forwarded.** No credential the
+  scanner can identify reaches the PoC YAML, a stored record, `runs.jsonl`, or any result
+  (spec "Building the PoC" and "What is guaranteed, and what is not", AC24 including its
+  labelled accepted-limit row; fixtures use the literal `abc123`), and every
+  `unreproduced[].reason` is one of the constants in the spec's "Failure handling" —
+  runner, templater and build-refusal text is never forwarded.
+- **No unread fields.** A command struct holds only fields its `invoke` reads, and every
+  non-`pub` struct field is read somewhere: an unread field fails `cargo clippy -- -D
+  warnings` at the task that adds it (`ScanPassive` and `ScanReport` are unit structs;
+  `ScanInject` and `ScanRun` read `cfg`; `ScanRun` and `ScanStatus` read the shared status
+  slot).
+- **Bounded.** One deadline per call, computed with `inject::deadline_after`; every
+  injection send and every replay runs inside `inject::bounded` (`timeout(min(remaining,
+  60 s))`), a rate-limit refusal goes through `inject::wait_out_rate_limit` (at most
+  `MAX_RATE_LIMIT_WAITS` consecutive refusals), and a timeout counts as `time_budget` only
+  when it fires at or after the deadline; remaining time and budgets use
+  `saturating_duration_since` / `checked_sub` (spec Constraints, "A failed send never
+  discards what was found"). `inject`'s up-front scope gate is the read-only
+  `host.guard().in_scope(authority)`, which takes no rate token. Timing tests use a
+  deadline of at least 200 ms against a 2–5 s slow response.
 - **Shared test support (T5).** `src/test_support.rs` (`#[cfg(test)]`) holds the stub
   clients, counting recorder and temp-dir helper; later tasks only `use` it. A helper a
   later task needs that is not there is defined in that task's own test module, never
@@ -122,7 +132,10 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   two `tools.len()` pins in `crates/aitm-tui/tests/tester_shell.rs` (`fixture_app_core…`
   and the `fixture_app(200, 50)` assertion). Without these, `tui_live_bus.rs` and
   `tester_shell.rs` fail the workspace gate. Running counts: `EXPECTED_TOOLS` 56 → 57
-  (T6) → 58 (T7) → 59 (T8) → 61 (T10); TUI pins 59 → 60 → 61 → 62 → 64.
+  (T6) → 58 (T7) → 59 (T8) → 61 (T10); TUI pins 59 → 60 → 61 → 62 → 64. Two doc comments
+  that still say "59 commands" (`crates/aitm-tui/tests/tester_shell.rs:924` and
+  `crates/aitm-tui/src/lib.rs:221`) are cosmetic and no assertion reads them: T10, the last
+  registration, updates both to 64; T6–T8 leave them.
 - **Citations.** Code references in this plan are to `main` at `78405c3`, by file and
   symbol.
 - **Extend, don't reinvent:** build on the shipped `ScannerConfig`,
@@ -203,8 +216,10 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   `crates/aitm-tui/fixtures/bus-fixture.json` (modify — add a `scan.passive` entry with an
   optional `target` string property), `crates/aitm-tui/tests/tester_shell.rs` (modify —
   both pins 59 → 60).
-- **Change:** `ScanPassive { cfg: ScannerConfig }` impl `Command`:
-  `name()=="scan.passive"`, `sensitivity()==Sensitivity::Read`,
+- **Change:** `ScanPassive` (a unit struct, like `ScanReport`: `invoke` reads no config —
+  the result cap is the file-private `MAX_RESULT_ITEMS` — and a never-read `cfg` field would
+  fail `cargo clippy -- -D warnings` at this task's gate; `plugin.rs` registers it with
+  `Arc::new(ScanPassive)`) impl `Command`: `name()=="scan.passive"`, `sensitivity()==Sensitivity::Read`,
   `confirm_prompt()==None`, `schema()` with optional `target: Str`. `invoke` runs
   `passive_checks` over `inject::target_flows(host, target)` and returns
   `passive_value(&findings)`. No `client().send`, no `browser()`. This task also writes
@@ -230,8 +245,11 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   `scan_tools_have_non_empty_input_schemas` (AC18; new, in `crates/aitm/tests/frontends.rs`;
   it iterates whatever `scan.*` tools the proxy lists, so Tasks 7, 8 and 10 do not edit it):
   over the assembled proxy's `tools/list`, every `scan.*` tool's `inputSchema` is a JSON
-  object whose `properties` is a non-empty object (`ac7_exact_tool_set` snapshots schemas
-  only for `browser.*` and the operator tools). The three existing contract tests are `ac7_exact_tool_set`
+  object whose `properties` is a non-empty object, and it first asserts that at least
+  `scan.discover` and `scan.passive` are listed (so it fails first while `scan.passive` is
+  unregistered and passes once this task registers it; for Tasks 7, 8 and 10 it is a guard
+  test shown passing) (`ac7_exact_tool_set` snapshots
+  schemas only for `browser.*` and the operator tools). The three existing contract tests are `ac7_exact_tool_set`
   (`frontends.rs`), `tui_bus_task_runs_against_the_live_loopback_server` (`tui_live_bus.rs`)
   and `fixture_app_core_offers_exactly_the_core_tools_with_the_agent_surface_lit`
   (`tester_shell.rs`); they are shown failing first — with only the command registered,
@@ -254,7 +272,7 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   `EXPECTED_TOOLS` 57 → 58, add `"scan.report"`), `crates/aitm-tui/src/lib.rs` (modify —
   `CORE_TOOLS`), `crates/aitm-tui/fixtures/bus-fixture.json` (modify — a `scan.report`
   entry), `crates/aitm-tui/tests/tester_shell.rs` (modify — pins 60 → 61).
-- **Change:** `ScanReport { }` impl `Command`: `name()=="scan.report"`,
+- **Change:** `ScanReport` (a unit struct) impl `Command`: `name()=="scan.report"`,
   `sensitivity()==Read`, `confirm_prompt()==None`, `schema()` optional `target`.
   `invoke` = `report_value(&report::load_records(host, target))`, where this task also
   writes the shared helper
@@ -280,10 +298,10 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
 
 ### Task 4: PoC builder (`build_poc` in `reproduce.rs`) — Wave 2, reproduce chain 1/3
 
-- **Satisfies:** AC10 (build half), AC11 and AC24 (no credential in the PoC), AC29
+- **Satisfies:** AC10 (build half), AC11 and AC24 (no identifiable credential in the PoC), AC29
   (template-metacharacter half).
 - **Depends on:** Task 18 part A (`registered_classes()`, and `success_assertion` owning the
-  open-redirect 3xx clause).
+  open-redirect 3xx clause); Task 5 (its `lib.rs` lines land first).
 - **Files:** `crates/aitm-plugin-scanner/src/reproduce.rs` (create),
   `crates/aitm-plugin-scanner/src/discover.rs` (modify — `fn is_secret_name` becomes
   `pub(crate) fn is_secret_name`; visibility only, no behaviour change), `lib.rs` (modify —
@@ -342,8 +360,8 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
     credential`; additionally a multipart body (`Content-Type: multipart/form-data;
     boundary=x`, non-empty), a `text/plain` non-empty body and a JSON-array body each return
     `Err(BuildRefused::Credential)`.
-  - `build_poc_accepts_the_labelled_limit` (AC24 row 17): the nested `{"card":{"pin":"1234"},
-    "q":"x"}` body builds `Ok` and the step body still contains `1234` — the documented
+  - `build_poc_accepts_the_labelled_limit` (AC24 row 17): the nested `{"card":{"pin":"q7x9k2"},
+    "q":"x"}` body builds `Ok` and the step body still contains `q7x9k2` — the documented
     undetected case (spec Open question 11), asserted so the limit stays honest.
   - `build_poc_substitutes_the_payload_in_a_body` (AC10): a form-urlencoded injection point
     (`POST`, body `q=<aitm-canary-0001>&page=1`) yields a step body containing `q={{payload}}`
@@ -473,7 +491,8 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   template`); a `reproduce` `Err` whose root `downcast_ref::<GuardError>()` is
   `RateLimited { retry_after }` is waited out with `inject::wait_out_rate_limit(retry_after,
   deadline)` and retried (no budget charge; `Unreproduced("time_budget")` if the deadline
-  passes while waiting), `OutOfScope` or `PrivateAddressBlocked` is `replay blocked: out of
+  passes while waiting, `Unreproduced("replay failed")` after `MAX_RATE_LIMIT_WAITS`
+  consecutive refusals), `OutOfScope` or `PrivateAddressBlocked` is `replay blocked: out of
   scope`, any other is `replay failed`; a failed record is `record failed`. The single
   `tracing::debug!` line carries only a fixed tag (the `GuardError` variant name,
   `runner_error` or `record_error`), never error text. Reached through `campaign::run_class`
@@ -506,7 +525,9 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
     `Err(GuardError::RateLimited { retry_after: 20 ms })` and whose later calls reflect,
     `findings.dir = tmp`, `budget = 5` → `Recorded { .. }`, the stub was called exactly `2`
     times, `budget == 4` (charged once), the store holds exactly `1` record; with `deadline`
-    already passed the same stub yields `Unreproduced { reason: "time_budget" }`.
+    already passed the same stub yields `Unreproduced { reason: "time_budget" }`; a stub that
+    answers `RateLimited { retry_after: 1 ms }` ten times in a row yields `Unreproduced {
+    reason: "replay failed" }` after exactly `10` calls.
 - **Done when:** the eight tests pass (each shown failing first) and the full gate passes.
   (The AC24 table is proven once, at the command level, by Task 8's
   `inject_leaks_no_credential_anywhere`.)
@@ -514,7 +535,7 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
 ### Task 5: injector + correlator engine (`inject.rs`) — Wave 2, independent
 
 - **Satisfies:** AC6 (engine), AC8 (out-of-scope), AC12 (budget), AC26 (i, ii), AC27 (inject
-  half), AC34.
+  half), AC34 (i–iv).
 - **Depends on:** Task 2 (`CheckDefinition`); uses shipped `enumerate` + `client()`.
 - **Files:** `crates/aitm-plugin-scanner/src/inject.rs` (create),
   `crates/aitm-plugin-scanner/src/test_support.rs` (create, `#[cfg(test)]`), `lib.rs` (modify
@@ -523,9 +544,12 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   Constraints time bound; signatures are authoritative):
   ```rust
   pub const MAX_CONFIRMED: usize = 1024;
+  pub const MAX_RATE_LIMIT_WAITS: usize = 10;  // consecutive RateLimited waits, no send between
+  #[derive(Debug)]
   pub struct InjectOutcome { pub class: String, pub tested: usize,
       pub confirmed: Vec<Confirmed>, pub skipped: usize, pub send_errors: usize,
       pub stopped_reason: Option<&'static str> }   // a fixed constant, by type
+  #[derive(Debug)]
   pub struct Confirmed { pub injection_point: crate::discover::InjectionPoint,
       pub payload: crate::checks::Payload, pub evidence: String,
       pub attack_flow: aitm_core::HttpFlow }   // `send`'s flow, `response` set to None
@@ -538,15 +562,19 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
       -> Vec<aitm_core::HttpFlow>;
   pub fn class_points(flows: &[aitm_core::HttpFlow],
       def: &crate::checks::CheckDefinition) -> Vec<crate::discover::InjectionPoint>;
+  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
   pub struct TimedOut { pub at_deadline: bool }
+  pub fn deadline_after(budget: std::time::Duration) -> std::time::Instant;
   pub async fn bounded<T>(deadline: std::time::Instant,
       fut: impl std::future::Future<Output = T>) -> Result<T, TimedOut>;
   pub async fn wait_out_rate_limit(retry_after: std::time::Duration,
       deadline: std::time::Instant) -> bool;
   ```
-  `bounded` runs `fut` under `tokio::time::timeout(min(remaining, 60 s))`, `remaining =
-  deadline.saturating_duration_since(now)`; `TimedOut.at_deadline` is true when the deadline
-  had been reached when it fired (false when only the 60 s cap fired).
+  `deadline_after(budget)` is `Instant::now().checked_add(budget)`, falling back to a
+  far-future instant on overflow (saturating, never a panic); Tasks 8 and 9 call it instead of
+  re-deriving the deadline. `bounded` runs `fut` under `tokio::time::timeout(min(remaining,
+  60 s))`, `remaining = deadline.saturating_duration_since(now)`; `TimedOut.at_deadline` is true
+  when the deadline had been reached when it fired (false when only the 60 s cap fired).
   `wait_out_rate_limit` sleeps `min(retry_after, remaining)` and returns `true`, or returns
   `false` without sleeping once the deadline has passed. Both are shared with `reproduce_and_record`
   (Task 17) and `run_class` (Task 9), so the time logic exists once.
@@ -554,12 +582,18 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   flows/points for this target" API): until Tasks 6, 8 and 9 land they have no non-test caller,
   and an unused `pub(crate)` fn would warn `dead_code` and fail this task's own
   `cargo clippy -- -D warnings`.
-  Gate the target host up front via `host.guard().check_active(authority)?` (→
-  `GuardError::OutOfScope` for an unscoped target); that is the only `Err` `inject` returns.
-  Visit the points in order, skipping a point whose endpoint key (request method +
-  `scheme://authority/path` **without the query** + location + name) was already injected in
-  this call (first flow wins), and a point whose source flow is no longer in the store
-  (counted in `skipped`). For each remaining point, try the class payloads in order
+  Gate the target host up front with the read-only `host.guard().in_scope(authority)`
+  (`ScopeRateGuard::in_scope`: no rate token, permit or error budget; `authority` is
+  `host:port`, the port defaulted from the scheme as `crawl.rs` does) and return
+  `GuardError::OutOfScope(authority.to_string())` when it is false; that is the only `Err`
+  `inject` returns. (`check_active` takes a token on every call, so using it here would let a
+  second swept class fail with `RateLimited` after the first drained the per-host bucket; a
+  test guard that does not override `in_scope` denies every host, so test guards wrap a scoped
+  `StdGuard`.) Visit the points in order, skipping a point whose endpoint key (request method
+  + `scheme://authority/path` **without the query** + location + name) was already injected in
+  this call (first flow wins), a point whose source flow is no longer in the store, and a
+  point whose source request has a non-token method or a path with a space or control byte —
+  all counted in `skipped`, the last never sent. For each remaining point, try the class payloads in order
   (≤ `per_class_payload_cap`). Before every send: if `budget.checked_sub(1)` is `None`, stop
   with `stopped_reason = Some("budget")`; if `deadline` has passed, stop with
   `Some("time_budget")`. Send the mutated `HttpRequest` (only the one targeted location
@@ -575,7 +609,9 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   flow and keeps points whose location is in `def.locations`.
   Handling of what `send` returns, per attempt (the spec's table): a `RateLimited {
   retry_after }` refusal (nothing was sent) goes through `wait_out_rate_limit` and retries
-  the same attempt without charging `budget`; `HostDisabled`, `OutOfScope` or
+  the same attempt without charging `budget`, and `MAX_RATE_LIMIT_WAITS` consecutive
+  refusals with no successful send between stop with `Some("guard_refused")` (a guard with
+  `per_host_rps = 0` answers `RateLimited { 1 s }` forever); `HostDisabled`, `OutOfScope` or
   `PrivateAddressBlocked` stops with `Some("guard_refused")` (`PipelineClient` never returns
   `PrivateAddressBlocked` — the sender's SSRF refusal is a plain error, so a target that
   resolves to a private address ends as `send_error`); a `bounded` timeout with `at_deadline`
@@ -590,16 +626,20 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   builder `http_flow(method, url, headers, body) -> HttpFlow`; stub `ProxyClient`s that
   insert and return the flow they build, count their calls and expose `requests() ->
   Vec<HttpRequest>` (every request they received, in order — later tasks assert "the stub
-  saw X on the replay request" through it) — `Reflect` (the body echoes the mutated value),
-  `Escape` (same, HTML-escaped), `Slow(d)` (sleeps `d` before answering), `SlowOnRepeat(d)`
-  (the first request for a given method + `req.path` is answered at once; a later request
-  with the same method and path sleeps `d`), `BigBody(len)` (a body of `len` bytes),
-  `Scripted(queue)` (each call answers from a queue of serve-reflecting,
-  `Err(GuardError::..)` or `Err(anyhow!(..))`); `CountingSender` (a counting `RequestSender`
+  saw X on the replay request" through it) — `Reflect` (the body echoes the mutated value;
+  `Reflect::only("q")` echoes that one parameter's value only, which the AC24 rows with a
+  credential-named query/form point need so that only `q` confirms), `Escape` (same,
+  HTML-escaped), `Slow(d)` (sleeps `d` before answering), `SlowOnRepeat(d)` (the first request
+  for a given method + `req.path` is answered at once; a later request with the same method
+  and path sleeps `d`), `BigBody(len)` (a body of `len` bytes), `Scripted(queue)` (each call
+  answers from a queue of serve-reflecting, serve-plain (a 200 that does not reflect — the
+  "reflect, then not" case), `Err(GuardError::..)` or `Err(anyhow!(..))`); `CountingSender`
+  (a counting `RequestSender`
   returning a canned reflecting response, for Task 16's real-`PipelineClient` test);
   `CountingRecorder` (a `FindingRecorder` with `calls()`); `tmp_dir() -> PathBuf` (a
   `FlowId`-suffixed directory under `std::env::temp_dir()`, so no `tempfile` dependency).
-- **Test** (hermetic, stub `ProxyClient` from `test_support`):
+- **Test** (hermetic, stub `ProxyClient` from `test_support`; in every test `deadline` is
+  `deadline_after(60 s)` and `budget` is large unless the test says otherwise):
   - `inject_confirms_on_vulnerable`: a `Reflect` stub — `confirmed.len() == 1`,
     `confirmed[0].payload.value == "<aitm-canary-0001>"`, and `confirmed[0].attack_flow.id`
     equals the id of the flow the stub returned.
@@ -619,13 +659,14 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
     `stopped_reason == Some("budget")`, the stub saw `0` requests, `budget == 0`.
   - `inject_out_of_scope_refused`: an empty-scope guard — the error downcasts to
     `GuardError::OutOfScope`.
-  - `inject_stops_at_time_budget` (AC26 i): `deadline == now + 200 ms`, a `Slow(3 s)` stub
+  - `inject_stops_at_time_budget` (AC26 i): `deadline == deadline_after(200 ms)`, a `Slow(3 s)` stub
     that never reflects — the first send is cut off at the deadline (the test itself ends at
     about 200 ms), `tested == 1`, `stopped_reason == Some("time_budget")`.
   - `bounded_and_wait_respect_the_deadline`: `bounded(now + 200 ms, sleep(3 s))` returns
     `Err(TimedOut { at_deadline: true })`; `bounded(now + 200 ms, ready(7))` returns `Ok(7)`;
     `wait_out_rate_limit(20 ms, now + 200 ms)` returns `true` after about 20 ms and
-    `wait_out_rate_limit(20 ms, now - 1 ms)` returns `false` at once.
+    `wait_out_rate_limit(20 ms, now - 1 ms)` returns `false` at once;
+    `deadline_after(Duration::MAX)` does not panic and is later than `now + 1 year`.
   - `inject_caps_confirmed` (AC26 ii): `1025` flows with distinct paths (`/p0` … `/p1024`,
     one `q` each, inserted in a `MemFlowStore`), reflect-everything stub, `budget == 2000` —
     `confirmed.len() == 1024`, `tested == 1024`, `stopped_reason == Some("max_confirmed")`.
@@ -641,19 +682,27 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   - `inject_waits_out_rate_limit` (AC34 ii): `Scripted` whose first call is
     `Err(GuardError::RateLimited { retry_after: 20 ms })` and later calls reflect, one point,
     `budget == 5` — `confirmed.len() == 1`, the stub was called exactly `2` times,
-    `tested == 1`, `budget == 4` (the refused call was not charged).
+    `tested == 1`, `budget == 4` (the refused call was not charged). A second case:
+    `Scripted` answering `RateLimited { retry_after: 1 ms }` ten times in a row —
+    `Ok`, `stopped_reason == Some("guard_refused")`, `tested == 0`, `confirmed` empty, the stub
+    was called exactly `10` times (`MAX_RATE_LIMIT_WAITS`), `budget` unchanged.
   - `inject_stops_on_guard_refusal` (AC34 iii): two endpoints, the second call answering
     `GuardError::HostDisabled` — `Ok`, `confirmed.len() == 1`, `stopped_reason ==
     Some("guard_refused")`, the stub was called exactly `2` times.
   - `inject_skips_an_evicted_source_flow` (AC34 iv): a `Reflect` stub and two points, one whose
     `FlowId` is not in the store — `Ok`, `skipped == 1`, the other point is still injected
     (`tested == 1`).
+  - `inject_skips_a_request_line_with_a_control_byte` (AC34 iv): a `Reflect` stub and two
+    points, the first from a hand-built source flow whose path holds a raw `\r\n` (a space or
+    other control byte behaves the same), the second normal — `Ok`, `skipped == 1`, the stub saw
+    exactly `1` request, and no request in `requests()` has a control byte in its path (a path
+    carrying the literal text `%0d%0a` is not a control byte and is sent as captured).
   - `target_flows_and_class_points`: a store holding flows on `http://t.test:8080` and
     `http://other.test:8080` — `target_flows(host, Some("http://t.test:8080"))` returns exactly
     the first flow's id, `None` returns both, an unparseable target returns none; for a flow
     with a `q` query parameter, a header and a cookie, `class_points(.., &reflected_xss())`
     returns only the `q` point.
-- **Done when:** the seventeen tests pass (each shown failing first) and the full gate passes.
+- **Done when:** the eighteen tests pass (each shown failing first) and the full gate passes.
 
 ### Task 18: class registry and the one success assertion (`checks.rs`) — Wave 2, independent
 
@@ -742,9 +791,9 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
      enumerated point with that `flow` (parsed as a `FlowId`), `location` (a
      `Location::as_str` token) and non-empty `name`; a malformed object, an unknown `flow` or
      no such point is an error naming `injection_point`. `let mut budget =
-     self.cfg.request_budget;` `let deadline` = now + `cfg.time_budget` (`checked_add`;
-     overflow saturates to no deadline); `block_on(campaign::run_class(host, target, &def,
-     &points, &mut budget, &self.cfg, deadline))`.
+     self.cfg.request_budget;` `let deadline =
+     inject::deadline_after(self.cfg.time_budget);` `block_on(campaign::run_class(host,
+     target, &def, &points, &mut budget, &self.cfg, deadline))`.
   4. Shape the returned `ClassRun` with the `pub(crate)` helper this task writes in
      `commands.rs`: `fold_outcomes(&ClassRun) -> ClassReport`, with `ClassReport::to_value()`
      (reused by Task 10). `ClassReport` is field for field the result object below: `{ class:
@@ -757,7 +806,8 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
      `reproduced: false` and `reproduction = Str("skipped: no findings.dir")`;
      `BudgetExhausted` → `reproduced: false` and an `unreproduced` entry with reason
      `"budget"`. The command never calls `host.finding_recorder()` and returns `Err` only for
-     the gate, an unknown class or `injection_point`, and the up-front scope refusal.
+     the gate, an unknown class or `injection_point`, and `inject`'s read-only up-front scope
+     refusal (`GuardError::OutOfScope`).
   5. Return `Value::Object { class, tested, confirmed[{injection_point{flow,location,name},
      payload, evidence, reproduced}], finding_ids, unreproduced, reproduction (Null or the
      marker), stopped_reason }`, scrubbed, arrays capped at `MAX_RESULT_ITEMS` (1024).
@@ -826,8 +876,8 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
     failed"`; a third case where the replay send fails with `anyhow!("boom password=hunter2
     horse")`, `reason == "replay failed"` and `hunter2` and `horse` appear nowhere in the
     serialised result.
-  - `inject_failed_replay_is_not_recorded` (AC30): a stub that reflects on the injection request
-    but not on the replay: `confirmed.len() == 1`, `confirmed[0].reproduced == false`,
+  - `inject_failed_replay_is_not_recorded` (AC30): a `Scripted` stub whose first answer reflects
+    (the injection request) and whose second is serve-plain (the replay): `confirmed.len() == 1`, `confirmed[0].reproduced == false`,
     `finding_ids` empty, `unreproduced.len() == 1`, the store holds `0` records.
   - `inject_budget_exhausted_skips_reproduction` (AC25): `request_budget == 1`, a configured
     `findings.dir` (without one the outcome is `NoFindingsDir`) and a reflecting
@@ -839,7 +889,9 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
     `unreproduced.len() == 1`, `stopped_reason == Some("budget")`.
   - `inject_leaks_no_credential_anywhere` (AC11, AC24; the one proof of the table): for each of
     the seventeen rows of the spec's AC24 table, run `scan.inject` then `scan.report {}` with
-    `findings.dir = tmp` and assert **unconditionally** the row's outcome — *Recorded* rows
+    `findings.dir = tmp` and a `Reflect::only("q")` stub (so the credential-named query, form
+    and JSON points never confirm and `confirmed.len() == 1`) and assert **unconditionally**
+    the row's outcome — *Recorded* rows
     (1–9): `confirmed.len() == 1`, `finding_ids.len() == 1`, `unreproduced` empty, the PoC YAML
     at the index entry's `poc_path` contains the row's placeholder, and the stub's
     `requests()` shows the real raw value on the replay request; *Refused* rows (10–16):
@@ -849,7 +901,7 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
     `horse`) is absent from all five of: the PoC YAML (where one exists), the stored finding
     YAML (`<tmp>/*.yaml`), `<tmp>/runs.jsonl`, the serialised `scan.inject` result, and the
     serialised `scan.report` result. **Row 17 is the labelled accepted limit and is inverted:**
-    outcome Recorded (`finding_ids.len() == 1`), `1234` present in the PoC YAML, and absent
+    outcome Recorded (`finding_ids.len() == 1`), `q7x9k2` present in the PoC YAML, and absent
     from the other four surfaces.
   - `all_policy_defers_scan_inject_to_its_gate` in `crates/aitm-mcp/tests/mcp.rs` (AC21,
     membership): add `GatedCmd { name: "scan.inject", gate: |_| true }` to `policy_server`; with
@@ -886,7 +938,7 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
 ### Task 9: campaign engine (`campaign.rs`) — Wave 3, independent of the command chain
 
 - **Satisfies:** AC16 (shared budget), AC20 (default sweep), AC26 (iii, iv), AC28 (engine),
-  AC31.
+  AC31, AC34 (viii).
 - **Depends on:** Tasks 5 (`bounded`, `target_flows`, `class_points`), 15, 17 (and shipped
   `crawl`, `passive`, `checks`, `report`).
 - **Files:** `crates/aitm-plugin-scanner/src/campaign.rs` (create), `lib.rs` (modify —
@@ -923,8 +975,7 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   `Unreproduced("time_budget")` when `TimedOut.at_deadline`, else `Unreproduced("replay
   failed")`. `ClassRun.stopped_reason` is the injector's, else `"budget"` or `"time_budget"`
   when a confirmation ended that way. `run_campaign` takes one `let mut budget =
-  cfg.request_budget;` and one `deadline` (start + `time_budget`, `checked_add`, overflow
-  saturating to no deadline): discover
+  cfg.request_budget;` and one `deadline = inject::deadline_after(cfg.time_budget)`: discover
   (`crawl`, which takes no budget argument — charge `pages_crawled` against `budget` with a
   saturating subtraction when it returns), passive (`passive_checks` over
   `inject::target_flows`, before inject), inject (when `active`: each class in `DEFAULT_SWEEP`,
@@ -944,7 +995,8 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
     `stopped_reason == Some("budget")` and `requests_used == 1` (the one injection; the
     replay was refused for budget).
   - `campaign_default_sweep_is_xss_and_open_redirect` (AC20): the store holds a `GET
-    /search?q=` flow and a `GET /redirect?next=` flow, and an instrumented stub records the
+    /search?q=` flow and a `GET /redirect?next=https://app.test/home` flow (a URL-valued
+    `next`, so `enumerate` classifies it as a `Redirect` point), and an instrumented stub records the
     classes whose payloads it saw; the set, in order, is exactly `["reflected-xss",
     "open-redirect"]` (a third registered class is never swept), and `DEFAULT_SWEEP ==
     ["reflected-xss", "open-redirect"]`.
@@ -962,14 +1014,25 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
     module) whose navigation sleeps 3 s, `summary.stopped_reason == Some("time_budget")`
     and the stub saw `0` injection requests; the control run, same flow, default `time_budget`
     and no browser, makes the stub see exactly `1` injection request.
-  - `run_class_bounds_the_replay_loop` (AC26 iv): two vulnerable points, `deadline == now +
-    200 ms`, `findings.dir` set, a `SlowOnRepeat(3 s)` stub — the stub saw exactly `3`
+  - `run_class_bounds_the_replay_loop` (AC26 iv): two vulnerable points, `deadline ==
+    deadline_after(200 ms)`, `findings.dir` set, a `SlowOnRepeat(3 s)` stub — the stub saw exactly `3`
     requests (the test itself ends at about 200 ms), `outcomes` holds two `Unreproduced {
     reason: "time_budget" }`, and `stopped_reason == Some("time_budget")`.
   - `run_class_stops_calling_after_no_findings_dir` (AC28 engine): two vulnerable points, no
     `findings.dir` — `outcomes` is two `NoFindingsDir` and the stub saw exactly `2` requests
     (the injections only).
-- **Done when:** the seven tests pass (each shown failing first) and the full gate passes.
+  - `campaign_survives_a_drained_rate_bucket` (AC34 viii): a real `PipelineClient` over a
+    `StdGuard::new(LimitConfig { per_host_rps: 3, ..LimitConfig::default() })` scoped to the
+    target host and a `CountingSender`, a store holding the reflecting `GET /search?q=` flow
+    and the `GET /redirect?next=https://app.test/home` flow, `findings.dir` set, default
+    `time_budget`: the crawl seed, class 1's injection and its replay use the three tokens, so
+    class 2 starts with an empty bucket — `run_campaign` still returns `Ok`,
+    `outcome.classes.len() == 2`, `outcome.classes[0].outcomes` is one `Recorded`, the store
+    holds exactly `1` record, and `summary.stopped_reason == None`. (With a `check_active` as
+    the up-front gate, class 2 would have failed the whole call with `RateLimited`.) A second
+    case wraps a scoped `StdGuard` in a guard (defined in this test module) whose first
+    `check_active` answers `RateLimited`: `run_class` returns `Ok`.
+- **Done when:** the eight tests pass (each shown failing first) and the full gate passes.
 
 ### Task 10: `scan.run` + `scan.status` commands — Wave 4, serial (command chain 4/4)
 
@@ -982,10 +1045,12 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
 - **Files:** `crates/aitm-plugin-scanner/src/commands.rs` (modify — add `ScanRun`,
   `ScanStatus`), `plugin.rs` (modify — register both; hold the status snapshot),
   `crates/aitm/tests/frontends.rs` (modify — `EXPECTED_TOOLS` 59 → 61, add `"scan.run"`,
-  `"scan.status"`), `crates/aitm-tui/src/lib.rs` (modify — `CORE_TOOLS` gains both names),
+  `"scan.status"`), `crates/aitm-tui/src/lib.rs` (modify — `CORE_TOOLS` gains both names; the "59 commands" doc
+  comment at :221 becomes 64),
   `crates/aitm-tui/fixtures/bus-fixture.json` (modify — a `scan.run` entry with required
   `target` and optional `active`, and a `scan.status` entry with an optional `run_id`),
-  `crates/aitm-tui/tests/tester_shell.rs` (modify — pins 62 → 64),
+  `crates/aitm-tui/tests/tester_shell.rs` (modify — pins 62 → 64; the "59 commands" doc
+  comment at :924 becomes 64),
   `crates/aitm-mcp/src/server.rs` (modify — add the one arm `"scan.run"` to the
   `defers_to_command_gate` match, next to Task 8's `"scan.inject"`),
   `crates/aitm-mcp/tests/mcp.rs` (modify — add a `Sensitive` stub named `scan.run` to
@@ -1008,7 +1073,8 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   report_value(&outcome.records), stopped_reason (the summary's) }`; with `active == false`
   the `inject` object is `classes: []`, `tested: 0`, `finding_ids: []`, `reproduction:
   Null`, `stopped_reason: Null`. `ScanStatus { status: Arc<Mutex<..>> }`: `sensitivity()==Read`,
-  `confirm_prompt()==None`, returns `Value::Object { run_id, phase, pages_crawled,
+  `confirm_prompt()==None`, `schema()` declares the optional `run_id: Str` (`aitm-mcp`
+  rejects undeclared properties, `json.rs`), returns `Value::Object { run_id, phase, pages_crawled,
   requests_used, request_budget, confirmed_count, stopped_reason }` copied from the last
   completed `CampaignSummary` (its `request_budget` field is `cfg.request_budget`, so
   `ScanStatus` holds no config), or `Null`s when none. The shared `status` `Arc` is owned by
@@ -1024,8 +1090,9 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   `report`, `stopped_reason`. `scan_run_confined` (AC15) probes `confined()` from **both** a
   stub browser (during discover) and a stub client (during inject and replay), asserts it was
   true in every phase and false after `invoke` returns. `scan_run_on_an_empty_store_is_ok`
-  (AC34 vii): an empty store → `Ok`, `inject.tested == 0`, no panic. `scan_run_budget_stops` with `request_budget == 1` and `findings.dir`
-  set asserts the result `stopped_reason == "budget"` (AC16). `scan_status_is_read` asserts
+  (AC34 vii): an empty store → `Ok`, `inject.tested == 0`, no panic. `scan_run_budget_stops`
+  with a stored reflecting `GET /search?q=` flow, `request_budget == 1` and `findings.dir` set
+  asserts the result `stopped_reason == "budget"` (AC16). `scan_status_is_read` asserts
   `sensitivity() == Read` and `confirm_prompt(&empty).is_none()` (AC13);
   `scan_status_reflects_last_run` runs `scan.run` then `scan.status` and asserts the status
   `run_id` matches the run's and `request_budget` equals the configured `request_budget`, and
@@ -1103,7 +1170,11 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
 - **Satisfies:** AC11 (whole campaign result), AC14, AC17, AC19, AC31 (end-to-end). (AC16's
   budget behaviour is asserted by Tasks 9 and 10, not here.)
 - **Depends on:** Task 10.
-- **Files:** `crates/aitm/tests/scan_run_e2e.rs` (create).
+- **Files:** `crates/aitm/tests/scan_run_e2e.rs` (create). It declares the rig's three sibling
+  support modules exactly as `discover_e2e.rs:23-29` does, each with `#[allow(dead_code)]`:
+  `#[path = "../../aitm-browser/tests/support/engines.rs"] mod engines;`,
+  `#[path = "support/rig.rs"] mod rig;` and `#[path = "support/scripted_driver.rs"] mod
+  scripted_driver;` (`rig.rs` refers to the other two by crate path).
 - **Change:** (a) assemble the proxy with `ScannerPlugin` loaded, run `scan.run` against the
   seeded loopback target (with `findings.dir` configured and one captured `GET /search?q=seed`
   flow that also carries `Authorization: Bearer abc123` and `Cookie: PHPSESSID=abc123`), then
@@ -1126,9 +1197,10 @@ out (the fail-closed choice) and the AC21 `All` arms flip.
   when `AITM_OBSCURA` is unset (`crates/aitm/tests/m4_scripted_e2e.rs`), so on the default gate
   that arm passes without running — AC19 is verified only where `AITM_OBSCURA=1` (with
   `AITM_OBSCURA_BIN`) is set. It begins with the same runtime guard (`if
-  !rig::obscura_enabled() { eprintln!("skipped: set AITM_OBSCURA=1"); return; }`, as
-  `discover_e2e.rs` and `m4_scripted_e2e.rs` do); the printed skip line under `--nocapture`
-  is the only visibility, and the default gate reports the test `ok`.
+  !rig::obscura_enabled() { return; }`, as `discover_e2e.rs` and `m4_scripted_e2e.rs` do —
+  `obscura_enabled()` itself prints the skip line, so the test adds no `eprintln!`); the
+  printed skip line under `--nocapture` is the only visibility, and the default gate reports
+  the test `ok`.
 - **Done when:** the non-gated test passes in the default gate, and `free_form_loop_unaffected`
   passes under obscura.
 
