@@ -1,81 +1,109 @@
-# tests/e2e — REAL end-to-end scenarios
+# aitmproxy end-to-end test suite
 
-These scenarios boot a **real** `aitm` proxy (dedicated ports, per-run throwaway
-dirs, a throwaway CA), a **real** seeded target (`aitm-testtarget-serve`), and, for
-the CA cells, a hermetic loopback HTTPS origin. They drive the product the way an
-operator or agent does — the one-shot CLI, the loopback-TCP MCP bus, and real
-`curl` — and assert on **independent observers** (curl's TLS handshake and received
-bytes, findings written to disk, the testtarget's own vuln logic), never the
-proxy's own view. This is the standard Matt set after green fixture tests let a
-broken app ship: a scenario only passes if the feature works on the wire.
+Real, repeatable scripts that boot a **real** `aitm` core, drive **real** traffic,
+and assert on **independently-observed ground truth** — never fixtures, never
+frozen expectations. This is the suite we re-run to verify the app actually works,
+growing to cover every command / feature / protocol across every surface.
 
-They align with the settled e2e-test-framework convention (PR #110): the layout is
-`tests/e2e/<surface>/test_*.py`, each test is run as a subprocess and classified by
-**exit code — 0 = PASS, 77 = SKIP (a one-line reason is printed first), anything else
-= FAIL**. The aggregate runner exits non-zero iff a required suite FAILs; skips are
-loud, never green.
+Design rationale, the full matrix, and the tier split are in the spec/plan:
+`docs/superpowers/specs/2026-10-30-aitmproxy-e2e-real-test-framework-design.md`
+and `docs/superpowers/plans/2026-10-30-aitmproxy-e2e-real-test-framework-plan.md`.
+
+## Why this exists
+
+The macOS app and web UI shipped broken despite all-green tests, because those
+tests rendered fixtures / drove in-process models / froze their expectations; and
+the live harness that should have caught it (`apps/web/scripts/selftest-live.mjs`)
+drifted RED (a hard-coded 37-tool list, the wrong token under policy, frozen
+"the core lacks X" assertions) and stopped being trusted. So every suite here:
+
+1. **Real artifact** — a real `aitm` core (real proxy, bus, plugins), real traffic,
+   and real clients/UIs; never an in-process model or a snapshot.
+2. **Independent observer** — assert on something the tool under test does not
+   control: the upstream echo-record server, a real client (`curl`, obscura), the
+   real bound socket (`proxy.status`), the findings store on disk. Never "the
+   panel says installed".
+3. **Derived expectation** — the tool set comes from live `tools/list` reconciled
+   against the Rust `EXPECTED_TOOLS` contract (`crates/aitm/tests/frontends.rs`);
+   never a hard-coded count, list, or "not-yet-implemented" assertion.
 
 ## Layout
 
-- `ca/`, `poc/`, `findings/`, `scripting/` — one Tier-1 `test_*.py` per surface. Each
-  is standalone-runnable and honours the exit-code contract above.
-- `lib/harness.py` — a thin, self-contained helper these tests use **until the shared
-  `tests/e2e/aitm_e2e/` library (PR #110) is on main**: it boots aitm/testtarget/
-  HTTPS-origin, a stdlib loopback-TCP MCP client (agent vs operator, `_confirm`), a
-  `curl` helper, the reporter, and process-group cleanup (obscura children included —
-  never a machine-wide `pkill`). When `aitm_e2e` lands, these imports migrate to
-  `Aitm`/`BusClient`/`Upstream`/`CoreConfig`; the surface is intentionally small.
-- `run.sh` — a stopgap aggregate runner (same exit-code contract) until the
-  framework's `tests/e2e/run.py` is on main.
+```
+tests/e2e/
+  run.py              the runner (discovers + runs suites, exit-code gate)
+  README.md           this file
+  aitm_e2e/           the shared Python harness library (import from here)
+    core.py           Aitm.server(...) / Aitm.web(...) — boot a real core
+    bus.py            BusClient — MCP over loopback-TCP (operator AND agent)
+    config.py         CoreConfig — per-run config on DEDICATED free ports
+    upstream.py       Upstream — the HTTP echo-record independent observer
+    proxyutil.py      via_proxy(...) — a real client request through the proxy
+  lib/
+    contract.sh       exit-code + manual-pause helpers for non-Python suites
+  <surface>/          one dir per surface: web, proxy, ca, poc, findings,
+                      scripting, l4, core, ne, tui, ...
+    test_*.py         a scenario (python3), or
+    *.sh              a conformant shell/cargo suite (bash)
+```
+
+Each surface session owns its own `tests/e2e/<surface>/` dir, so additions merge
+without collision. **Do not** build a second harness — reuse `aitm_e2e`.
+
+## The contract (every suite obeys this)
+
+A suite is a standalone executable that signals its result by **exit code**:
+
+| exit | meaning |
+|---|---|
+| `0` | PASS |
+| `77` | SKIP (print a one-line reason first; e.g. a missing real dependency) |
+| other | FAIL |
+
+Python suites use the helpers in `aitm_e2e` (`check`, `ok`, `fail`, `skip`,
+`section`); shell suites `source tests/e2e/lib/contract.sh` (`e2e_pass`,
+`e2e_skip`, `e2e_fail`, `e2e_check`, `e2e_pause`). The runner exits non-zero iff a
+required suite FAILs; SKIPs are loud and never read as green.
+
+## Tiers (tag a suite with `# e2e: tier=...`)
+
+- **T0** — the in-process Rust suite (`cargo test`); kept, not re-implemented here.
+- **T1** — this Python bus suite on a real runner (the merge gate): real core +
+  real traffic + real obscura (gated on `AITM_OBSCURA=1`) + `aitm-testtarget`.
+- **T2** — real-Mac GUI / sysex (macOS app, Network Extension); tag `tier=manual`
+  for steps needing a human (e.g. the macOS trust-store or sysex approval clicks).
+- **T3** — DVWA / blind-agent capstone; real machine, not CI-reproducible.
+
+A `tier=manual` suite is **skipped unless** the runner is given `--manual`, in
+which case it may `pause(...)` / `e2e_pause` for the operator.
 
 ## Running
 
+Port binding / running `aitm` happens on a real shell (the Claude Terminal panel),
+never the sandbox. Build the binary first (`cargo build -p aitm`).
+
 ```bash
-# Build the binaries the suite needs (or point the env vars at prebuilt ones).
-cargo build -p aitm -p aitm-testtarget
-
-# All surfaces (stopgap runner; use tests/e2e/run.py once #110 is on main):
-tests/e2e/run.sh
-tests/e2e/run.sh ca poc          # a subset
-
-# A single test directly (the runner just subprocesses this and reads the exit code):
-python3 tests/e2e/ca/test_ca_trust.py
+cargo build -p aitm                         # build the core under test
+python3 tests/e2e/run.py                    # run all auto suites
+python3 tests/e2e/run.py web proxy          # only these surfaces
+python3 tests/e2e/run.py --list             # list discovered suites
+AITM_OBSCURA=1 python3 tests/e2e/run.py     # require real obscura for browser cells
+python3 tests/e2e/run.py ne --manual        # include manual (human-in-the-loop) steps
 ```
 
-Binary discovery: `$AITM_BIN` / `$AITM_TESTTARGET_BIN`, else
-`target/{debug,release}/<bin>`. Port binding and a real `security`/`curl` mean these
-run outside the Claude Bash sandbox (via the Terminal panel or a normal shell), on
-dedicated non-default ports (never 8080/8081/8082 — the app may be running).
+Env: `AITM_BIN` (path to the `aitm` binary; default `target/debug/aitm`),
+`AITM_OBSCURA=1` + `AITM_OBSCURA_BIN` (require/locate real obscura),
+`AITM_E2E_MANUAL=1` (set by `--manual`).
 
-### Opt-in cells
+## Adding a suite
 
-- `AITM_E2E_CA_REAL=1` — run the **real OS trust-store** install → curl-without-`-k`
-  → uninstall cycle in `t1_ca_trust`. Skipped by default: on macOS a user-scope
-  `security add-trusted-cert` needs a GUI authorization dialog (unattended-unsafe);
-  on Linux the ca-certificates anchor path runs non-interactively.
-
-## What each scenario proves
-
-| Scenario | Proves (independent observer) |
-|---|---|
-| `t1_ca_trust` | `ca.export` emits a PEM a real `curl --cacert` accepts through the proxy (HTTP 200 from a MITM'd origin); with **no** trust configured the minted leaf is rejected (curl exit 60); `ca.status` shape; `ca.install --dry_run` lists the real `security` commands; an **agent** `ca.install` is refused by the gate while an **operator** dry-run is allowed; `ca.*` in `tools/list`. The real keychain cycle is a T2 opt-in. |
-| `t1_findings_persist_redact` | a recorded finding persists as `<id>.yaml`, lists and gets back; secrets in `notes`/`title`/**`target`** are `[redacted]` in the on-disk file; `findings.remove` is operator/CLI-only (agent refused) and an operator remove deletes the on-disk artifact. |
-| `t1_poc_reproduce` | `poc.run` reproduces reflected XSS against the vulnerable target (a `word` matcher on the reflected payload; the patched target fails — parsed from JSON `passed`, not the exit code) and auto-records a finding; `poc.build` from a captured flow is **credential-free** (no query/body/header secret in the artifact). |
-| `t1_scripting_live` | a boot-loaded Rhai `on_request` hook injects a header the **upstream** acts on (the `/admin` bypass), an `on_response_headers` hook adds a header the **client** receives, a `reg.add_command` ScriptCommand is callable by an operator and refused for an agent (Sensitive), and deny-by-default refuses filesystem and out-of-scope `http.send`. |
-
-## Notes / findings surfaced by this suite
-
-- **macOS CA install is not a core hang.** `RealExecutor` bounds the `security`
-  subprocess (15s read / 180s mutate) and returns a clear `timed out` error. The
-  macOS app's *silent* `ca.install` failure is app-side (agent-gating/role, an
-  app-side timeout shorter than the OS dialog, or the GUI auth dialog not being
-  surfaced), not a core hang. User-scope trust requires that GUI dialog, so the real
-  cycle is a T2/attended (or Linux) cell.
-- **`ca.status` `trusted` is always `unknown` on macOS** (no reliable CLI trust
-  check). The real trust signal is the `curl --cacert`/no-trust pair, which this
-  suite uses.
-- **Rhai `on_response` cannot mutate the response on the wire.** The response is
-  streamed, so the mutation point is `on_response_headers`; `on_response` fires after
-  `ResponseComplete` (post-forward) and its response edits are a silent no-op. The
-  scripting scenario uses `on_response_headers`. The `rhai.api.json` wording implies
-  `on_response` can mutate the client-bound response — a doc/footgun gap to close.
+1. Put `tests/e2e/<surface>/test_<flow>.py` (or a conformant `*.sh`).
+2. `from aitm_e2e import ...`, `from aitm_e2e.core import Aitm`, etc.
+3. Boot with `CoreConfig(... DEDICATED free ports ...)` so you never collide with
+   the operator's running app (don't use the defaults 8080/8081/8082).
+4. Assert on an **independent observer**, not a fixture or the proxy's own view.
+5. Connect at the **right role**: `BusClient.operator(core)` or `.agent(core)`;
+   assert the operator/agent asymmetry rather than stumbling into a refusal.
+6. Clean up by your own child PID only (the core reaps obscura on stop) — never
+   `pkill -f obscura` (it kills concurrent sessions).
+7. Never log the bus token.
