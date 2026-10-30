@@ -256,7 +256,17 @@ async fn run_poc_with(
     std::fs::write(&path, poc_body).expect("write poc");
 
     tokio::task::spawn_blocking(move || {
-        let mut host = CommandHost::new(store.as_ref(), client.as_ref(), guard.as_ref(), None);
+        // These tests exercise the L4 *inject* gate (and unseeded fail-closed
+        // trust), not poc.run's separate agent gate. Opt into `poc.allow_agent_run`
+        // via the host config so an agent/unseeded run passes that gate and reaches
+        // the `l4:` step, where the L4 inject gate is the thing under test.
+        let run_cfg = {
+            let mut c = Config::default();
+            c.poc.allow_agent_run = true;
+            Arc::new(c)
+        };
+        let mut host = CommandHost::new(store.as_ref(), client.as_ref(), guard.as_ref(), None)
+            .with_config(run_cfg);
         if let Some(f) = frontend {
             host = host.with_frontend(f);
         }
