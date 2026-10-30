@@ -211,7 +211,9 @@ async fn scan_discover_end_to_end() {
         "the redirector's `next` parameter must be discovered: {points:?}"
     );
 
-    // A re-scan of the same site must not accumulate the previous scan's flows.
+    // A re-scan of the same site must return the same points, not those plus
+    // the previous scan's captures: the same `(location, name)` multiset, which
+    // also pins the count.
     let Value::Object(rescan) = scan().await else {
         panic!("scan.discover must return an object on a re-scan");
     };
@@ -219,8 +221,27 @@ async fn scan_discover_end_to_end() {
         panic!("re-scan must carry an injection_points array: {rescan:?}");
     };
     assert_eq!(
-        rescan_points.len(),
-        points.len(),
+        point_keys(rescan_points),
+        point_keys(points),
         "a re-scan of the same site must return the same injection points, not accumulate"
     );
+}
+
+/// The `(location, name)` of every injection point, sorted, so two scans'
+/// outputs compare as multisets.
+fn point_keys(points: &[Value]) -> Vec<(String, String)> {
+    let mut keys: Vec<(String, String)> = points
+        .iter()
+        .filter_map(|p| {
+            let Value::Object(p) = p else { return None };
+            match (p.get("location"), p.get("name")) {
+                (Some(Value::Str(location)), Some(Value::Str(name))) => {
+                    Some((location.clone(), name.clone()))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    keys.sort();
+    keys
 }

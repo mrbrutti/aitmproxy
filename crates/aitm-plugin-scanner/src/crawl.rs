@@ -158,8 +158,7 @@ pub async fn crawl(
         // the spot (`left_scope`): neither it nor the requested URL is recorded,
         // nothing is harvested, and no further page is navigated. Silently
         // continuing would let a target walk the browser around other hosts
-        // one redirect at a time. A same-origin, in-scope landing records both
-        // the requested URL and the landing page (below).
+        // one redirect at a time.
         let Some(page) = parse_target(&nav.final_url)
             .filter(|u| u.origin() == origin && host.guard().in_scope(&guard_authority(u)))
         else {

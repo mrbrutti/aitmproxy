@@ -141,18 +141,22 @@ impl Command for ScanDiscover {
             .map(String::as_str)
             .collect();
         let mut injection_points: Vec<Value> = Vec::new();
-        // (normalized URL, location, name) -> index into `injection_points`. The
+        // (endpoint URL, location, name) -> index into `injection_points`. The
         // store keeps every earlier scan's captures of the same site, so the
         // same point turns up once per capture; it is reported once, at the
         // position of its first appearance, carrying the newest capture's flow
         // and example. The cap bounds distinct keys; replacing an existing
-        // entry is always allowed.
-        let mut point_index: HashMap<(String, Location, String), usize> = HashMap::new();
+        // entry is always allowed. The URL is borrowed from `outcome` through
+        // `endpoint_set`, so no per-point copy of it is made.
+        let mut point_index: HashMap<(&str, Location, String), usize> = HashMap::new();
         // Map each reached endpoint (keyed by the same scrubbed URL the result
         // exposes in `endpoints`) to the newest captured flow that served it, so
         // a UI can link an endpoint row to its flow (AC3). `list()` is in
         // insertion order, so overwriting on every hit leaves the latest capture
-        // without consulting clocks. Bounded by `endpoint_set` (<=
+        // without consulting clocks. Deliberately not limited to flows newer
+        // than the crawl: the `no_browser` store-only fallback has only older
+        // flows, and an endpoint whose fresh capture was missed should still
+        // link the older real one. Bounded by `endpoint_set` (<=
         // MAX_RESULT_ITEMS), i.e. capped like the arrays; an endpoint with no
         // captured flow is simply absent from the map.
         let mut endpoint_flows: BTreeMap<String, Value> = BTreeMap::new();
@@ -165,16 +169,19 @@ impl Command for ScanDiscover {
             let Some(normalized) = normalize_url(&raw) else {
                 continue;
             };
-            if !endpoint_set.contains(normalized.as_str()) {
+            let Some(&url) = endpoint_set.get(normalized.as_str()) else {
                 continue;
-            }
-            endpoint_flows.insert(scrub_text(&normalized), Value::Str(id.to_string()));
+            };
+            endpoint_flows.insert(scrub_text(url), Value::Str(id.to_string()));
             for point in enumerate(&flow) {
-                let key = (
-                    normalized.clone(),
-                    point.location.clone(),
-                    point.name.clone(),
-                );
+                let key = (url, point.location.clone(), point.name.clone());
+                // Decide before building anything: once the cap is full a new
+                // key is dropped here, unbuilt, rather than assembled and
+                // scrubbed only to be thrown away.
+                let slot = point_index.get(&key).copied();
+                if slot.is_none() && injection_points.len() >= MAX_RESULT_ITEMS {
+                    continue;
+                }
                 let mut obj = BTreeMap::new();
                 obj.insert("flow".into(), Value::Str(point.flow.to_string()));
                 obj.insert(
@@ -186,16 +193,16 @@ impl Command for ScanDiscover {
                 // catches a credential embedded inside an otherwise innocent
                 // value (`next=…?access_token=…`).
                 obj.insert("example".into(), Value::Str(scrub_text(&point.example)));
-                if let Some(slot) = point_index
-                    .get(&key)
-                    .and_then(|&idx| injection_points.get_mut(idx))
-                {
-                    // Seen in an earlier capture: keep its place, take the
-                    // newer flow's id and example.
-                    *slot = Value::Object(obj);
-                } else if injection_points.len() < MAX_RESULT_ITEMS {
-                    point_index.insert(key, injection_points.len());
-                    injection_points.push(Value::Object(obj));
+                match slot {
+                    Some(idx) => {
+                        if let Some(existing) = injection_points.get_mut(idx) {
+                            *existing = Value::Object(obj);
+                        }
+                    }
+                    None => {
+                        point_index.insert(key, injection_points.len());
+                        injection_points.push(Value::Object(obj));
+                    }
                 }
             }
         }
@@ -309,8 +316,6 @@ mod tests {
         /// path+query -> HTML served for it; unknown pages serve an empty body.
         pages: HashMap<String, String>,
         current: Mutex<Option<String>>,
-        /// Ids of the flows this browser inserted, in navigation order.
-        inserted: Mutex<Vec<FlowId>>,
     }
 
     impl CapturingBrowser {
@@ -322,12 +327,7 @@ mod tests {
                     .map(|(path, html)| (path.to_string(), html.to_string()))
                     .collect(),
                 current: Mutex::new(None),
-                inserted: Mutex::new(Vec::new()),
             }
-        }
-
-        fn inserted(&self) -> Vec<FlowId> {
-            self.inserted.lock().expect("inserted lock").clone()
         }
     }
 
@@ -341,8 +341,7 @@ mod tests {
                     .to_string();
                 let mut headers = HeaderMap::new();
                 headers.set("X-Trace", "trace-1");
-                let id = self.store.insert(captured(&path, headers));
-                self.inserted.lock().expect("inserted lock").push(id);
+                self.store.insert(captured(&path, headers));
                 *self.current.lock().expect("current lock") = Some(path);
                 Ok(NavOutcome {
                     final_url: url,
@@ -547,6 +546,44 @@ mod tests {
 
     const SITE_ROOT: &str =
         r#"<a href="/search?q=hello">search</a> <a href="/account/1">account</a>"#;
+
+    /// A site served by a [`CapturingBrowser`] over one shared store, scanned
+    /// as many times as a test likes: every `scan()` is a full `scan.discover`
+    /// of `http://target.test/`, and the store keeps each earlier scan's
+    /// captures, exactly as the proxy's would.
+    struct Site {
+        store: Arc<MemFlowStore>,
+        browser: CapturingBrowser,
+        guard: StdGuard,
+        client: NoSendClient,
+        cmd: ScanDiscover,
+    }
+
+    impl Site {
+        fn new(pages: &[(&str, &str)]) -> Self {
+            let store = Arc::new(MemFlowStore::new());
+            Self {
+                browser: CapturingBrowser::new(store.clone(), pages),
+                store,
+                guard: scoped_guard(),
+                client: NoSendClient,
+                cmd: ScanDiscover {
+                    cfg: ScannerConfig::default(),
+                },
+            }
+        }
+
+        fn scan(&self) -> Value {
+            let host =
+                CommandHost::new(&*self.store, &self.client, &self.guard, Some(&self.browser));
+            self.cmd
+                .invoke(
+                    params(&[("target", Value::Str("http://target.test/".into()))]),
+                    &host,
+                )
+                .expect("an in-scope seed crawls")
+        }
+    }
 
     #[test]
     fn scan_discover_is_write() {
@@ -899,26 +936,16 @@ mod tests {
     /// each of them serves the same endpoints.
     #[test]
     fn repeated_identical_scans_equal_one_scan() {
-        let store = Arc::new(MemFlowStore::new());
-        let browser = CapturingBrowser::new(store.clone(), &[("/", SITE_ROOT)]);
-        let guard = scoped_guard();
-        let client = NoSendClient;
-        let host = CommandHost::new(&*store, &client, &guard, Some(&browser));
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
-        let scan = || {
-            cmd.invoke(
-                params(&[("target", Value::Str("http://target.test/".into()))]),
-                &host,
-            )
-            .expect("an in-scope seed crawls")
-        };
+        let site = Site::new(&[("/", SITE_ROOT)]);
 
-        let first = scan();
-        let _second = scan();
-        let third = scan();
-        assert_eq!(store.count(), 9, "three scans captured three pages each");
+        let first = site.scan();
+        let _second = site.scan();
+        let third = site.scan();
+        assert_eq!(
+            site.store.count(),
+            9,
+            "three scans captured three pages each"
+        );
 
         assert_eq!(
             endpoints_of(&first),
@@ -943,7 +970,7 @@ mod tests {
         assert_eq!(shape(&third_points), shape(&first_points));
 
         // No (url, location, name) key appears twice.
-        let urls = flow_urls(&store);
+        let urls = flow_urls(&site.store);
         let mut keys = HashSet::new();
         for p in &third_points {
             let key = (urls[&p.flow].clone(), p.location.clone(), p.name.clone());
@@ -958,30 +985,17 @@ mod tests {
     /// the newest (the one this scan just made), not the oldest.
     #[test]
     fn endpoint_flows_prefers_the_newest_flow() {
-        let store = Arc::new(MemFlowStore::new());
-        let browser = CapturingBrowser::new(store.clone(), &[("/", SITE_ROOT)]);
-        let guard = scoped_guard();
-        let client = NoSendClient;
-        let host = CommandHost::new(&*store, &client, &guard, Some(&browser));
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
-        let scan = || {
-            cmd.invoke(
-                params(&[("target", Value::Str("http://target.test/".into()))]),
-                &host,
-            )
-            .expect("an in-scope seed crawls")
-        };
+        let site = Site::new(&[("/", SITE_ROOT)]);
 
-        let _first = scan();
-        let after_first = browser.inserted();
+        // `list()` is in insertion order, so the ids past scan 1's are scan 2's.
+        let _first = site.scan();
+        let after_first = site.store.list();
         assert_eq!(after_first.len(), 3, "scan 1 captured three pages");
-        let second = scan();
-        let all = browser.inserted();
+        let second = site.scan();
+        let all = site.store.list();
         assert_eq!(all.len(), 6, "scan 2 captured the same three pages again");
 
-        let urls = flow_urls(&store);
+        let urls = flow_urls(&site.store);
         // Scan 2's flow for each URL.
         let newest: BTreeMap<String, String> = all[3..]
             .iter()
@@ -1013,34 +1027,128 @@ mod tests {
         }
     }
 
+    /// Output order is stable across rescans: a point sits where it first
+    /// appeared, and a repeat key overwrites it there rather than moving it.
+    /// Compared as the ordered sequence, not sorted.
+    #[test]
+    fn rescan_keeps_each_injection_point_in_its_place() {
+        let site = Site::new(&[("/", SITE_ROOT)]);
+
+        let first = points_of(&site.scan());
+        let second = points_of(&site.scan());
+
+        let order = |points: &[Point]| -> Vec<(String, String)> {
+            points
+                .iter()
+                .map(|p| (p.location.clone(), p.name.clone()))
+                .collect()
+        };
+        assert_eq!(first.len(), 5, "{first:?}");
+        assert_eq!(
+            order(&second),
+            order(&first),
+            "scan 2 must list the same points in the same positions as scan 1"
+        );
+        // ...and each position really was overwritten: it now carries scan 2's
+        // flow, not scan 1's.
+        for (idx, (a, b)) in first.iter().zip(&second).enumerate() {
+            assert_ne!(
+                a.flow, b.flow,
+                "position {idx} must carry the newer capture's flow: {a:?} vs {b:?}"
+            );
+        }
+    }
+
+    /// `MAX_RESULT_ITEMS` bounds the number of DISTINCT keys, not the number of
+    /// writes: once the cap is full a new key is dropped, but a capture of a key
+    /// already in the list still overwrites it with the newer flow.
+    ///
+    /// Store-only (no browser), so the store's shape is the whole input: 600
+    /// endpoints x 2 query points = 1200 distinct keys, so the cap fills at the
+    /// 512th endpoint; the newest capture of the FIRST endpoint is stored last,
+    /// when the cap is already full.
+    #[test]
+    fn cap_bounds_distinct_keys_but_an_existing_key_is_still_overwritten() {
+        let store = MemFlowStore::new();
+        for i in 0..600 {
+            store.insert(captured(&format!("/p{i}?a=1&b=2"), HeaderMap::new()));
+        }
+        let newest = store
+            .insert(captured("/p0?a=1&b=2", HeaderMap::new()))
+            .to_string();
+        let guard = scoped_guard();
+        let client = NoSendClient;
+        let host = CommandHost::new(&store, &client, &guard, None);
+        let cmd = ScanDiscover {
+            cfg: ScannerConfig {
+                // The no-browser fallback lists at most `max_pages` endpoints;
+                // raise it so all 600 are reached and the point cap is the
+                // only bound in play.
+                max_pages: 2048,
+                ..ScannerConfig::default()
+            },
+        };
+
+        let result = cmd
+            .invoke(
+                params(&[("target", Value::Str("http://target.test/".into()))]),
+                &host,
+            )
+            .expect("an in-scope target with no browser falls back to the store");
+
+        assert_eq!(
+            endpoints_of(&result).len(),
+            600,
+            "every endpoint is reached"
+        );
+        let points = points_of(&result);
+        assert_eq!(
+            points.len(),
+            MAX_RESULT_ITEMS,
+            "the cap bounds the number of distinct keys, never exceeded"
+        );
+        let urls = flow_urls(&store);
+        let keys: HashSet<(String, String, String)> = points
+            .iter()
+            .map(|p| (urls[&p.flow].clone(), p.location.clone(), p.name.clone()))
+            .collect();
+        assert_eq!(
+            keys.len(),
+            MAX_RESULT_ITEMS,
+            "every listed point is distinct"
+        );
+        // The keys past the cap were dropped, not swapped in for earlier ones.
+        assert!(
+            !points
+                .iter()
+                .any(|p| urls[&p.flow] == "http://target.test/p599?a=1&b=2"),
+            "a new key past the cap is dropped"
+        );
+
+        // The first endpoint's `a` point was reached again after the cap filled
+        // and still took the newest flow, in its original (first) position.
+        let p0_a = points
+            .iter()
+            .find(|p| urls[&p.flow] == "http://target.test/p0?a=1&b=2" && p.name == "a")
+            .expect("the first endpoint's `a` point is listed");
+        assert_eq!(
+            p0_a.flow, newest,
+            "an existing key is overwritten with the newest flow even when the cap is full"
+        );
+        assert_eq!(points[0], *p0_a, "and it kept its place");
+    }
+
     /// The dedupe key includes the URL: the same `(location, name)` on two
     /// different endpoints stays two points, each read from its own flow.
     #[test]
     fn rescan_dedupe_does_not_merge_distinct_urls() {
-        let store = Arc::new(MemFlowStore::new());
-        let browser = CapturingBrowser::new(
-            store.clone(),
-            &[("/", r#"<a href="/a?q=1">a</a> <a href="/b?q=2">b</a>"#)],
-        );
-        let guard = scoped_guard();
-        let client = NoSendClient;
-        let host = CommandHost::new(&*store, &client, &guard, Some(&browser));
-        let cmd = ScanDiscover {
-            cfg: ScannerConfig::default(),
-        };
-        let scan = || {
-            cmd.invoke(
-                params(&[("target", Value::Str("http://target.test/".into()))]),
-                &host,
-            )
-            .expect("an in-scope seed crawls")
-        };
+        let site = Site::new(&[("/", r#"<a href="/a?q=1">a</a> <a href="/b?q=2">b</a>"#)]);
 
-        let _first = scan();
-        let second = scan();
+        let _first = site.scan();
+        let second = site.scan();
 
         let points = points_of(&second);
-        let urls = flow_urls(&store);
+        let urls = flow_urls(&site.store);
         let q: Vec<&Point> = points
             .iter()
             .filter(|p| p.location == "query" && p.name == "q")
