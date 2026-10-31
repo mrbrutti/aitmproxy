@@ -233,8 +233,8 @@ fn is_label_noise(c: char) -> bool {
 /// [`crate::redact::scrub_text`], trims, and truncates to
 /// [`MAX_CLIENT_LABEL_CHARS`] characters. It returns `None` when nothing is left.
 /// A second application can only mask more (masking can remove an escape, and the
-/// cut can land inside a mask), never reveal more; the label stays bounded, within
-/// a few characters of the cap after a later `scrub_text`. It does not rewrite a
+/// cut can land inside a mask), never reveal more; the label stays bounded, up to
+/// about 10 characters over the cap after a later `scrub_text`. It does not rewrite a
 /// server-minted name such as [`WEB_BRIDGE_CLIENT_LABEL`]; use
 /// [`declared_client_label`] where a client supplies the label.
 pub fn sanitize_client_label(raw: &str) -> Option<String> {
@@ -269,22 +269,44 @@ fn label_skeleton(label: &str) -> String {
         .collect()
 }
 
+/// The suffix [`declared_client_label`] puts on a label that reads as a reserved
+/// name.
+const DECLARED_SUFFIX: &str = " (declared)";
+
+/// Whether a label's skeleton equals a reserved name's.
+fn reads_as_reserved(label: &str) -> bool {
+    let skeleton = label_skeleton(label);
+    RESERVED_CLIENT_LABELS
+        .iter()
+        .any(|name| label_skeleton(name) == skeleton)
+}
+
 /// Sanitise a label a client declared (see [`sanitize_client_label`]) and keep it
 /// from posing as a server-minted one: a label whose skeleton (its ASCII letters
 /// and digits, lower-cased) equals a reserved name's gets a ` (declared)` suffix,
 /// so case, blanks, punctuation, and any invisible character the sanitiser keeps
 /// cannot make a client look like the server's `web-bridge`. Apply it only where a
 /// client declares its label, never to a label the server mints.
+///
+/// The result is at most [`MAX_CLIENT_LABEL_CHARS`] characters including the
+/// suffix, so the server's own pass over a stored label (which cuts to that cap)
+/// leaves it unchanged and cannot drop the suffix. To fit it, a reserved-looking
+/// label is first cut to the cap less the suffix and trimmed; if that head still
+/// reads as the reserved name it gets the suffix, and if the cut took the name
+/// apart the head is returned as it is, since it no longer poses as the reserved
+/// one.
 pub fn declared_client_label(raw: &str) -> Option<String> {
     let label = sanitize_client_label(raw)?;
-    let skeleton = label_skeleton(&label);
-    let reserved = RESERVED_CLIENT_LABELS
-        .iter()
-        .any(|name| label_skeleton(name) == skeleton);
-    if reserved {
-        Some(format!("{label} (declared)"))
+    if !reads_as_reserved(&label) {
+        return Some(label);
+    }
+    let room = MAX_CLIENT_LABEL_CHARS - DECLARED_SUFFIX.chars().count();
+    let head: String = label.chars().take(room).collect();
+    let head = head.trim_end();
+    if reads_as_reserved(head) {
+        Some(format!("{head}{DECLARED_SUFFIX}"))
     } else {
-        Some(label)
+        Some(head.to_string())
     }
 }
 
@@ -648,7 +670,7 @@ mod tests {
             Some("web-bridge".to_string())
         );
 
-        // Idempotent: sanitising a sanitised label changes nothing.
+        // For these inputs, sanitising a sanitised label changes nothing.
         let long = "A".repeat(10 << 20);
         let nuls = "\u{0}".repeat(10 << 20);
         // The 64-char cut lands inside the masked value, and inside the key.
@@ -774,6 +796,51 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "a reserved name got through: {bad:#?}");
+    }
+
+    #[test]
+    fn declared_client_label_survives_the_consumption_pass() {
+        // The server sanitises a stored label again where it consumes it, so what
+        // `declared_client_label` returns must be a label that pass leaves alone:
+        // at most the cap, the same text, and either still marked or no longer
+        // reading as the reserved name. A padded lookalike of 62 to 64 characters
+        // used to lose its suffix to that cut.
+        assert_eq!(
+            declared_client_label("web-bridge"),
+            Some("web-bridge (declared)".to_string())
+        );
+        let reserved = label_skeleton(WEB_BRIDGE_CLIENT_LABEL);
+        let mut bad: Vec<String> = Vec::new();
+        for pad in ['\u{17B4}', '\u{FFF0}', '\u{206A}', '_'] {
+            // `web-bridge` is 10 characters: pad it out to every length up to 70.
+            for total in 10..=70 {
+                let padding = pad.to_string().repeat(total - 10);
+                for (shape, raw) in [
+                    ("trailing pad", format!("web-bridge{padding}")),
+                    ("inner pad", format!("web{padding}-bridge")),
+                ] {
+                    let row = format!("U+{:04X} {shape}, {total} chars", u32::from(pad));
+                    let Some(got) = declared_client_label(&raw) else {
+                        bad.push(format!("{row}: no label"));
+                        continue;
+                    };
+                    let chars = got.chars().count();
+                    if chars > MAX_CLIENT_LABEL_CHARS {
+                        bad.push(format!("{row}: {chars} chars over the cap: {got:?}"));
+                    }
+                    let again = sanitize_client_label(&got);
+                    if again.as_deref() != Some(got.as_str()) {
+                        bad.push(format!(
+                            "{row}: the consumption pass changed {got:?} to {again:?}"
+                        ));
+                    }
+                    if !got.ends_with(" (declared)") && label_skeleton(&got) == reserved {
+                        bad.push(format!("{row}: reads as the reserved name: {got:?}"));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "bad declared labels: {bad:#?}");
     }
 
     #[test]

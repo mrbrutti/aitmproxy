@@ -637,6 +637,66 @@ fn a_directly_assigned_label_is_stripped_and_scrubbed_at_the_server() {
     assert_eq!(ring.recent(None, Some(1))[0].client_label, None);
 }
 
+/// A padded lookalike of the reserved `web-bridge` keeps what marks it as a
+/// client's own through the server's consumption pass. `declared_client_label` is
+/// what a transport stores; the server sanitises it again to 64 characters where
+/// it builds the host and the ring entry. A label of 62 to 64 characters that
+/// read as `web-bridge` once lost its ` (declared)` suffix to that cut, so a
+/// client's entry and finding showed the server's own name. Each row names the
+/// raw label, and the exact label the ring entry and the host must both carry.
+#[test]
+fn a_padded_reserved_name_keeps_its_declared_suffix_through_the_server() {
+    // U+17B4 (a Khmer vowel inherent, invisible) is kept by the sanitiser.
+    let pad = |n: usize| "\u{17B4}".repeat(n);
+    let rows: [(&str, String, String); 3] = [
+        (
+            "trailing pad, 64 chars",
+            format!("web-bridge{}", pad(54)),
+            // Cut to 53 chars, still reads as the name: marked, 64 chars in all.
+            format!("web-bridge{} (declared)", pad(43)),
+        ),
+        (
+            "inner pad, 64 chars",
+            format!("web{}-bridge", pad(54)),
+            // Cut to 53 chars, the head is `web` and no longer reads as the name.
+            format!("web{}", pad(50)),
+        ),
+        (
+            "inner pad, 50 chars",
+            format!("web{}-bridge", pad(40)),
+            // Short enough that nothing is cut: marked whole.
+            format!("web{}-bridge (declared)", pad(40)),
+        ),
+    ];
+
+    let mut bad: Vec<String> = Vec::new();
+    for (row, raw, want) in rows {
+        let stored = aitm_core::declared_client_label(&raw).expect("a label remains");
+        if stored != want {
+            bad.push(format!("{row}: transport stores {stored:?}, want {want:?}"));
+        }
+
+        let ring = Arc::new(AuditRing::default());
+        let srv = audit_server(ring.clone());
+        let conn = labelled(&stored);
+        let reply = call(&srv, &conn, "demo.client", json!({}));
+        let host_label = reply["result"]["structuredContent"]
+            .as_str()
+            .expect("demo.client returns its label as a string");
+        if host_label != want {
+            bad.push(format!("{row}: host sees {host_label:?}, want {want:?}"));
+        }
+        let entries = ring.recent(None, None);
+        if entries.len() != 1 || entries[0].client_label.as_deref() != Some(want.as_str()) {
+            bad.push(format!(
+                "{row}: ring holds {:?}, want one entry labelled {want:?}",
+                entries.iter().map(|e| &e.client_label).collect::<Vec<_>>()
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "a label changed at the server: {bad:#?}");
+}
+
 /// Calls from several threads at once are each audited exactly once, in the lane
 /// they belong in, and no source loses or gains an entry.
 #[test]
