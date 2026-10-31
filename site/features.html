@@ -216,7 +216,7 @@
     <ul>
       <li>Packet capture with a hex and ASCII view, scoped by CIDR, interface and direction.</li>
       <li>In-path hold, mutate, forward or drop: Linux only, through NFQUEUE, with <code>CAP_NET_ADMIN</code>. Capture and inject need <code>CAP_NET_RAW</code>.</li>
-      <li>Off by default (<code>l4.enabled</code>). Without privilege the wire commands answer <code>L4Unavailable</code>. The macOS app's embedded core degrades the same way; a macOS Network Extension capture path is in progress and is not part of v0.5.0.</li>
+      <li>Off by default (<code>l4.enabled</code>). Without privilege the wire commands answer <code>L4Unavailable</code>. The macOS app's embedded core degrades the same way; since v0.5.2 the app ships a Network Extension capture path, off by default behind an operator toggle.</li>
     </ul>
     <div class="pair">
       <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">web UI </span>L4 → Capture interface <span class="s">eth0</span> → Start capture</code></div>
