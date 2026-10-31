@@ -35,10 +35,11 @@ impl ProxyClient for StubClient {
 }
 
 /// Optional `Any`-typed parameters of `demo.accept`: one per argument shape the
-/// tables below send (`a` carries the nested-collection row of AC45).
-const ACCEPT_PARAMS: [&str; 12] = [
+/// tables below send (`a` carries the nested-collection row of AC45, `list` the
+/// 500000-leaf call of AC46).
+const ACCEPT_PARAMS: [&str; 13] = [
     "headers", "pairs", "entries", "request", "edits", "selector", "text", "vars", "note", "raw",
-    "body", "a",
+    "body", "a", "list",
 ];
 
 /// A `Write` command that accepts any of [`ACCEPT_PARAMS`] and succeeds, so the
@@ -484,5 +485,231 @@ fn the_reason_is_scrubbed_strictly_at_the_source() {
             !text.contains("SECRET60"),
             "the secret reached the {surface} entry: {text}"
         );
+    }
+}
+
+// ------------------------------------------- header shapes beyond AC45's rows
+
+/// The text-mask literal a hidden raw header line carries (`Name: [redacted]`).
+const T: &str = "[redacted]";
+
+/// Header shapes the AC45 rows do not send, as `(arguments, expected audit
+/// args)`: a pair whose second element is not a string, a pair that is the whole
+/// value of the key, raw `Name: value` lines, and a header object that carries a
+/// `values` list. Every secret-bearing value is a canary.
+fn header_shape_rows() -> Vec<(JsonValue, JsonValue)> {
+    let c = canary;
+    vec![
+        // a pair whose second element is any type: rule D decides by the name.
+        (
+            json!({"headers": [
+                ["X-N", 5],
+                ["X-Null", null],
+                ["X-Obj", {"k": c(20)}],
+                ["Content-Length", 7],
+            ]}),
+            json!({"headers": [
+                ["X-N", R],
+                ["X-Null", R],
+                ["X-Obj", R],
+                ["Content-Length", 7],
+            ]}),
+        ),
+        // the pair is the value of the key itself.
+        (
+            json!({"headers": ["X-Debug", c(21)]}),
+            json!({"headers": ["X-Debug", R]}),
+        ),
+        // raw header lines: benign survive, the rest are hidden.
+        (
+            json!({"headers": [
+                "Host: example.com",
+                "Accept: text/html",
+                format!("X-Debug: {}", c(22)),
+                format!("Cookie: a={}; c=d", c(22)),
+                "Authorization: Basic Zm9v",
+            ]}),
+            json!({"headers": [
+                "Host: example.com",
+                "Accept: text/html",
+                format!("X-Debug: {T}"),
+                format!("Cookie: {T}"),
+                format!("Authorization: {T}"),
+            ]}),
+        ),
+        // raw lines in a response collection, deep in the arguments.
+        (
+            json!({"a": {"response_headers": [format!("Set-Cookie: sid={}", c(23))]}}),
+            json!({"a": {"response_headers": [format!("Set-Cookie: {T}")]}}),
+        ),
+        // a header object with a `values` list beside its value.
+        (
+            json!({"headers": [{
+                "name": "X-Debug", "value": c(24), "values": [c(24), "b"],
+            }]}),
+            json!({"headers": [{"name": "X-Debug", "value": R, "values": R}]}),
+        ),
+        // a header object with a `values` list and no `value`.
+        (
+            json!({"headers": [{"name": "Set-Cookie", "values": [c(25)]}]}),
+            json!({"headers": [{"name": "Set-Cookie", "values": R}]}),
+        ),
+        // a benign name keeps its value and the other members take the general walk.
+        (
+            json!({"headers": [{"name": "Host", "value": "h.test", "values": ["a=b"]}]}),
+            json!({"headers": [{"name": "Host", "value": "h.test", "values": ["a=b"]}]}),
+        ),
+    ]
+}
+
+/// Send each row to `demo.accept` as an agent and return one message per wrong
+/// row: the parsed ring `args_summary` is not the expectation, the three surfaces
+/// disagree, or a canary reached any of them.
+fn row_failures(rows: Vec<(JsonValue, JsonValue)>) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (input, expected) in rows {
+        let rig = Rig::new();
+        let reply = rig.agent_call("demo.accept", input.clone());
+        if is_error(&reply) {
+            failures.push(format!("input {input}: demo.accept was refused: {reply}"));
+            continue;
+        }
+        let views = rig.views("demo.accept");
+        let (ring, same) = views.args();
+        match serde_json::from_str::<JsonValue>(ring) {
+            Ok(parsed) if parsed == expected => {}
+            Ok(parsed) => {
+                failures.push(format!("input {input}: expected {expected}, got {parsed}"))
+            }
+            Err(e) => failures.push(format!("input {input}: args is not JSON ({e}): {ring}")),
+        }
+        if !same {
+            failures.push(format!(
+                "input {input}: the three surfaces differ: ring {ring}, pushed {}, activity {}",
+                views.pushed["args"], views.activity["args"]
+            ));
+        }
+        for (surface, text) in [
+            ("ring", format!("{:?}", views.ring)),
+            ("pushed", views.pushed.to_string()),
+            ("activity", views.activity.to_string()),
+        ] {
+            if text.contains("CNRY") {
+                failures.push(format!(
+                    "input {input}: a canary reached the {surface}: {text}"
+                ));
+            }
+        }
+    }
+    failures
+}
+
+/// Header pairs of any value type, raw header lines and header objects with a
+/// `values` list are default-deny under a header-collection key, through the real
+/// server, with the ring, the pushed line and `agent.activity` in agreement.
+#[test]
+fn header_pairs_lines_and_objects_are_default_deny() {
+    let failures = row_failures(header_shape_rows());
+    assert!(
+        failures.is_empty(),
+        "{} row(s) wrong:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+// ------------------------------------------------------- bounded work (AC46)
+
+/// `redact_value` returns at most 4097 characters for a 16 MiB string leaf, and a
+/// wide value of 100 leaves of 100 KiB is shown as exactly 16 leaves cut at 4096
+/// bytes plus an ellipsis and 84 ellipsis leaves: deterministic, not a clock.
+#[test]
+fn redaction_output_is_bounded_in_size() {
+    let huge = redact_value(&JsonValue::String("a".repeat(16 * 1024 * 1024)));
+    let text = huge.as_str().expect("a string leaf stays a string");
+    assert!(
+        text.chars().count() <= 4097,
+        "the leaf kept {} characters",
+        text.chars().count()
+    );
+    assert_eq!(text, format!("{}…", "a".repeat(4096)));
+
+    let wide = redact_value(&JsonValue::Array(vec![
+        JsonValue::String(
+            "b".repeat(100 * 1024)
+        );
+        100
+    ]));
+    let leaves = wide.as_array().expect("an array stays an array");
+    let total: usize = leaves.iter().map(|v| v.as_str().map_or(0, str::len)).sum();
+    // 16 leaves of 4096 bytes + the three-byte `…`, then 84 leaves of `…` alone.
+    assert_eq!(total, 16 * (4096 + 3) + 84 * 3, "the bytes the leaves kept");
+    assert_eq!(leaves.len(), 100);
+    assert_eq!(leaves[15].as_str().map(str::len), Some(4096 + 3));
+    assert_eq!(leaves[16].as_str(), Some("…"));
+}
+
+/// One `demo.accept` call: the time it took, whether it was accepted, and the
+/// ring entry's `args_summary` (the pushed line and `agent.activity` must carry
+/// the same string).
+fn timed_accept(args: JsonValue) -> (std::time::Duration, String) {
+    let rig = Rig::new();
+    let started = std::time::Instant::now();
+    let reply = rig.agent_call("demo.accept", args);
+    let took = started.elapsed();
+    assert!(!is_error(&reply), "demo.accept was refused: {reply}");
+    let views = rig.views("demo.accept");
+    let (ring, same) = views.args();
+    assert!(same, "the three surfaces carry the ring's string");
+    (took, ring.to_string())
+}
+
+/// AC46: the work `redact_args` does is bounded whatever the arguments weigh. A
+/// 16 MiB body and a 500000-leaf list each return within 5 seconds with an entry of
+/// at most 515 bytes; a secret inside the examined 4 KiB of a leaf is masked and one
+/// past it is absent. (The clock is the spec's check; the bytes of
+/// `redaction_output_is_bounded_in_size` and the unit tests are the deterministic
+/// ones.)
+#[test]
+fn redaction_work_is_bounded() {
+    let five_seconds = std::time::Duration::from_secs(5);
+
+    let (took, entry) = timed_accept(json!({"body": "a".repeat(16 * 1024 * 1024)}));
+    assert!(took < five_seconds, "a 16 MiB body took {took:?}");
+    assert!(entry.len() <= 515, "the entry is {} bytes", entry.len());
+    assert!(entry.starts_with(r#"{"body":"aaaa"#), "entry: {entry}");
+
+    let (took, entry) = timed_accept(json!({"list": vec!["x"; 500_000]}));
+    assert!(took < five_seconds, "a 500000-leaf list took {took:?}");
+    assert!(entry.len() <= 515, "the entry is {} bytes", entry.len());
+    assert!(entry.starts_with(r#"{"list":["x","x""#), "entry: {entry}");
+
+    // A 5000-character leaf with `password=<canary>` starting at character 4000
+    // (inside the examined bound) and at character 4100 (beyond it).
+    let secret = canary(46);
+    let leaf_with_key_at = |start: usize| {
+        let mut leaf = format!("{} password={secret} ", "a".repeat(start - 1));
+        leaf.push_str(&"a".repeat(5000 - leaf.chars().count()));
+        leaf
+    };
+    for start in [4000, 4100] {
+        let leaf = leaf_with_key_at(start);
+        assert_eq!(leaf.chars().count(), 5000);
+        let (took, entry) = timed_accept(json!({"body": leaf.clone()}));
+        assert!(took < five_seconds, "the 5000-character leaf took {took:?}");
+        assert!(
+            !entry.contains(&secret),
+            "the secret at character {start} reached the entry: {entry}"
+        );
+        // The source value itself, which the 512-byte cap of the entry hides
+        // behind: inside the bound the key is masked; past it the text is cut.
+        let shown = redact_value(&json!({"body": leaf}));
+        let shown = shown["body"].as_str().expect("a string").to_string();
+        assert!(!shown.contains(&secret), "the secret survived: {shown}");
+        if start == 4000 {
+            assert!(shown.contains("password=[redacted]"), "masked: {shown}");
+        } else {
+            assert_eq!(shown, format!("{}…", "a".repeat(4096)));
+        }
     }
 }
