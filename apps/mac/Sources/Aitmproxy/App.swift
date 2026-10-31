@@ -228,13 +228,13 @@ struct FlowCommands: Commands {
                 .keyboardShortcut("r", modifiers: [.command, .control, .shift])
                 .disabled(session.coreHealth.connection == nil)
             Divider()
-            // The same steps as Settings ▸ Capture's toggle (CaptureSwitch). ⌃⌘C: none of
+            // The same steps as Settings ▸ All Apps' toggle (CaptureSwitch). ⌃⌘A: none of
             // the reconnect/restart/pause/replay chords on R, and no other C chord but ⇧⌘C.
-            Button((session.coreHealth.captureChoice ?? captureEnabled) ? "Turn Off Capture" : "Turn On Capture") {
+            Button((session.coreHealth.captureChoice ?? captureEnabled) ? "Stop Capturing All Apps" : "Capture All Apps") {
                 let on = !(session.coreHealth.captureChoice ?? captureEnabled)
                 Task { await CaptureSwitch.set(on, session: session) }
             }
-            .keyboardShortcut("c", modifiers: [.command, .control])
+            .keyboardShortcut("a", modifiers: [.command, .control])
             .disabled(!session.coreHealth.captureControlsAvailable || session.coreHealth.captureBusy || !usesEmbedded)
         }
         CommandMenu("Agent") {

@@ -64,13 +64,13 @@ struct StatusPanel: View {
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Status")
         .confirmationDialog(
-            "Uninstall the capture extension?", isPresented: $confirmingUninstall, titleVisibility: .visible
+            "Uninstall the extension?", isPresented: $confirmingUninstall, titleVisibility: .visible
         ) {
             Button("Uninstall", role: .destructive) {
                 Task { await CaptureSwitch.uninstall(session: session) }
             }
         } message: {
-            Text("Capture stops, and the extension and its proxy configuration are removed. Turning capture on again installs the extension again and asks for approval again.")
+            Text("Other apps' traffic stops being captured, and the extension and its proxy configuration are removed. Turning the extension on again installs it again and asks for approval again.")
         }
     }
 

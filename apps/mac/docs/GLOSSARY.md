@@ -62,6 +62,6 @@ One name per thing, everywhere: buttons, menus, tooltips, errors, stories.
 | Apps / Domains | Sidebar groups: flows by client process / by host | clients, sources, hosts |
 | Status | The page that shows Core, Bus and Capture with their controls and what to do next (⌘0, or the toolbar pill) | dashboard, home, overview (that is the traffic page) |
 | Core | The aitm proxy process: embedded (the app runs it) or external (the operator runs it) | server, daemon, backend |
-| Capture extension | The macOS system extension that captures other apps' traffic; on, off, waiting for approval, or degraded. Its toolbar switch says "Capture" | NE, sysext, network extension (in UI text) |
-| Turn On / Turn Off Capture | The operator's switch for the capture extension: the toolbar's Capture switch, Settings ▸ Capture, Proxy ▸ Turn On/Off Capture (⌃⌘C), the Status card | enable, disable, pause (that is the proxy) |
+| All Apps | System-wide capture through the macOS network extension: every Mac app's traffic, including apps that ignore proxy settings, and the source of the Apps page's per-app grouping; on, off, waiting for approval, or degraded. Toolbar switch, Status lane and Settings tab all say "All Apps"; "the extension" names the mechanism only where macOS does (approval, uninstall) | Capture, Extension, NE, sysext, transparent proxy (in UI text) |
+| Capture All Apps / Stop Capturing All Apps | The operator's switch for All Apps: the toolbar's All Apps switch, Settings ▸ All Apps, Proxy ▸ Capture All Apps (⌃⌘A), the Status card | enable, disable, turn on capture, pause (that is the proxy) |
 | Getting started | The Status page's live checklist: core, bus, extension, scope, first flow | onboarding, wizard, tour |

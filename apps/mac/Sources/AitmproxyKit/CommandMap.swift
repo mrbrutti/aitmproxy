@@ -179,7 +179,7 @@ public enum CommandMap {
             E("Proxy", "Core Log…", "⌃⌘L", items: toggle(["Core Log…", "Hide Core Log"], "⌃⌘L")),
             E("Proxy", "Reconnect Bus", "⌃⌘R", items: one("Reconnect Bus", "⌃⌘R")),
             E("Proxy", "Restart Core", "⌃⇧⌘R", items: one("Restart Core", "⌃⇧⌘R")),
-            E("Proxy", "Turn On/Off Capture", "⌃⌘C", items: toggle(["Turn On Capture", "Turn Off Capture"], "⌃⌘C")),
+            E("Proxy", "Capture / Stop Capturing All Apps", "⌃⌘A", items: toggle(["Capture All Apps", "Stop Capturing All Apps"], "⌃⌘A")),
         ]
     }()
 

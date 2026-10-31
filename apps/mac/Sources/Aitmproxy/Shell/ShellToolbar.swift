@@ -122,7 +122,7 @@ struct ProxySwitch: View {
 /// degraded — off when the lane is off; `captureChoice` carries it through a switch in flight.
 /// Its colour is the lane's state, so "on, nothing in scope" shows the warning hue and
 /// "waiting for approval" the working hue. Flips through `CaptureSwitch.set` — the same steps as Settings ▸
-/// Capture, Proxy ▸ Turn On / Turn Off Capture (⌃⌘C) and the Status card. Operator-only:
+/// All Apps, Proxy ▸ Capture All Apps / Stop Capturing All Apps (⌃⌘A) and the Status card. Operator-only:
 /// reached by a click here and nowhere else (`tools/check-capture-operator-only.sh` lists this
 /// file beside those three).
 struct CaptureExtensionSwitch: View {
@@ -134,7 +134,7 @@ struct CaptureExtensionSwitch: View {
         let embedded = session.embeddedCoreActive
         let on = ToolbarSwitches.capturePosition(choice: health.captureChoice, lane: summary.capture)
         ToolbarSwitch(
-            title: "Capture", on: on, tint: summary.capture.state.color.color,
+            title: "All Apps", on: on, tint: summary.capture.state.color.color,
             enabled: ToolbarSwitches.captureLive(health, embedded: embedded),
             help: ToolbarSwitches.captureHelp(summary.capture, controlsAvailable: health.captureControlsAvailable,
                                               embedded: embedded, busy: health.captureBusy, choice: on)
@@ -179,19 +179,19 @@ enum ToolbarSwitches {
     /// What the switch shows: the choice while a switch is in flight, else the lane's fact.
     static func capturePosition(choice: Bool?, lane: ConnectionLane) -> Bool { choice ?? captureOn(lane) }
 
-    /// The same gate as Settings ▸ Capture's toggle and Proxy ▸ Turn On / Turn Off Capture.
+    /// The same gate as Settings ▸ All Apps' toggle and Proxy ▸ Capture All Apps.
     static func captureLive(_ health: CoreHealthState, embedded: Bool) -> Bool {
         health.captureControlsAvailable && !health.captureBusy && embedded
     }
 
     static func captureHelp(_ lane: ConnectionLane, controlsAvailable: Bool, embedded: Bool, busy: Bool,
                             choice: Bool) -> String {
-        if busy { return "Switching the capture extension…" }
-        if !controlsAvailable { return "The capture extension is not in this build" }
+        if busy { return "Switching All Apps…" }
+        if !controlsAvailable { return "All Apps capture is not in this build" }
         if !embedded { return "The active core is external — switch to the embedded core in Settings ▸ Bus to control capture" }
         var lines = [choice
-            ? "Turn off the capture extension (⌃⌘C)"
-            : "Turn on the capture extension: it captures other apps' traffic without proxy settings (⌃⌘C)"]
+            ? "Stop capturing all apps (⌃⌘A)"
+            : "Capture all apps: every Mac app's traffic, including apps that ignore proxy settings, through the macOS extension (⌃⌘A)"]
         lines.append("\(lane.compact) — \(lane.detail)")
         if let remedy = lane.remedy { lines.append(remedy) }
         return lines.joined(separator: "\n")
@@ -199,7 +199,7 @@ enum ToolbarSwitches {
 }
 
 /// A word and a small switch: the toolbar's control for one on/off thing. A real `Toggle` under
-/// a custom style, so VoiceOver gets a checkbox titled "Proxy" / "Capture" with an on/off value
+/// a custom style, so VoiceOver gets a checkbox titled "Proxy" / "All Apps" with an on/off value
 /// and AXPress flips it (a plain `Button` here exposed an untitled "toggle button" and swallowed
 /// System Events clicks — found live, 2026-10-31). The track takes its owner's colour when on
 /// (a lane's state colour, the agent teal) and tertiary when off; disabled drops the word to

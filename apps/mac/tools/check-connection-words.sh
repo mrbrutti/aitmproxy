@@ -16,7 +16,7 @@ export LC_ALL=C
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 status=0
 
-words='"(running|not running|starting…|restarting…|stopped|failed|external|connected|connecting…|offline|bus failed|capture on|capture off|capture degraded|waiting for approval|on, nothing in scope|no extension|Capturing|Approved|Awaiting approval|core running|core failed)"'
+words='"(running|not running|starting…|restarting…|stopped|failed|external|connected|connecting…|offline|bus failed|capture on|capture off|capture degraded|extension on|extension off|extension degraded|all apps on|all apps off|all apps degraded|waiting for approval|on, nothing in scope|no extension|Capturing|Approved|Awaiting approval|core running|core failed)"'
 # Skipped: comments, the self-test (it ASSERTS the words), and filter values (`FilterRow(.state, …, "failed")`
 # is a flow-state query, not a connection word).
 hits=$(grep -rnE --include='*.swift' -e "$words" Sources/Aitmproxy | grep -vE ':[0-9]+:[[:space:]]*///?' | grep -vE '^Sources/Aitmproxy/SelfTest(\+[A-Za-z]+)?\.swift:' | grep -vE ':[0-9]+:.*FilterRow\(\.[a-z]+,' ; echo "rc=${PIPESTATUS[0]}")

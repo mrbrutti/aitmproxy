@@ -50,7 +50,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .general: "General"
         case .bus: "Bus"
         case .proxy: "Proxy"
-        case .capture: "Capture"
+        case .capture: "All Apps"
         case .appearance: "Appearance"
         }
     }
@@ -212,7 +212,7 @@ struct ProxySettings: View {
 
 /// Settings ▸ Capture: the operator's switch for L4 capture on this Mac, what the capture
 /// extension is doing, and its uninstall (Task 17, NE-AC15). Capture is off until the
-/// operator turns it on here, with Proxy ▸ Turn On Capture or the toolbar's Capture switch. Reads the capability the
+/// operator turns it on here, with Proxy ▸ Capture All Apps or the toolbar's All Apps switch. Reads the capability the
 /// `ExtensionController` pushes into `CoreHealthState`. With no extension in this build
 /// (a development build, fixture and snapshot runs) the controls give way to a note: a
 /// toggle that does nothing is never shown.
@@ -245,7 +245,7 @@ struct CaptureSettings: View {
             capability: capability, supported: health.captureSupported, scopeHostCount: session.scopeHosts.count)
         Section("Network extension") {
             if health.captureControlsAvailable {
-                Toggle("Capture L4 traffic", isOn: Binding(
+                Toggle("Capture traffic from all apps", isOn: Binding(
                     get: { health.captureChoice ?? captureEnabled },
                     set: { on in Task { await CaptureSwitch.set(on, session: session) } }
                 ))
@@ -298,7 +298,7 @@ struct CaptureSettings: View {
                         .foregroundStyle(.secondary)
                 }
                 if capability.canUninstall {
-                    Button(removing ? "Removing…" : "Uninstall Capture Extension…", role: .destructive) {
+                    Button(removing ? "Removing…" : "Uninstall Extension…", role: .destructive) {
                         confirming = true
                     }
                     .disabled(removing || health.captureBusy)
@@ -311,7 +311,7 @@ struct CaptureSettings: View {
                     }
                 }
             } else {
-                LabeledContent("Capture L4 traffic", value: "Not available in this build")
+                LabeledContent("Capture traffic from all apps", value: "Not available in this build")
                 Text("L4 capture needs the signed Aitmproxy app with its capture extension. This build does not include it.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -340,7 +340,7 @@ struct CaptureSettings: View {
 }
 
 /// The operator's capture on, off and uninstall, in one place so Settings ▸ Capture, Proxy ▸
-/// Turn On / Turn Off Capture, the Status page and the toolbar's Capture switch run identical
+/// Capture All Apps, the Status page and the toolbar's All Apps switch run identical
 /// steps. Operator-only: those callers are all there is. No bus verb, `Session` action or palette entry reaches `enable()`,
 /// `disable()`, `uninstall()` or the persisted `capture.enabled` choice (see
 /// `ExtensionController`).
@@ -375,7 +375,7 @@ enum CaptureSwitch {
         // disagree a click asks for what is already chosen. Say so instead of doing nothing.
         if !health.captureBusy, health.extensionController != nil, embeddedCoreActive,
            on == (Store.defaults.object(forKey: "capture.enabled") as? Bool ?? false) {
-            session.lastError = "Capture is already \(on ? "on" : "off") in Settings ▸ Capture; the extension reports otherwise — turn it off and on again there"
+            session.lastError = "All Apps is already \(on ? "on" : "off") in Settings ▸ All Apps; the extension reports otherwise — turn it off and on again there"
         }
         guard !health.captureBusy, health.extensionController != nil, embeddedCoreActive,
               on != (Store.defaults.object(forKey: "capture.enabled") as? Bool ?? false)

@@ -196,7 +196,7 @@ Surface (ux-design table): a sidebar page — a place the operator comes back to
 - Empty/offline: when the bus is offline the Core and Capture cards still render their last
   known state and the Bus card carries the remedy; nothing on the page is blank.
 - Keyboard: Proxy ▸ Status (⌘0) opens it; every card action is also a Proxy-menu item (Restart
-  Core, Reconnect Bus, Turn On/Off Capture, Scope…, Core Log…, Browser) — all exist today.
+  Core, Reconnect Bus, Capture / Stop Capturing All Apps, Scope…, Core Log…, Browser) — all exist today.
 
 ### 3. Sidebar information architecture and landing page (revised after Matt's review)
 
@@ -278,12 +278,12 @@ into the cluster. Everything in the cluster reads `Session.connectionSummary`.
   as operator to pause or resume the proxy" in its help. The same `proxy.status` read drives the
   pill's "intercept armed" from `intercept_armed`, so arming by another client shows too. Help when live: "Pause the proxy: traffic still passes and new flows are not
   recorded (⇧⌘R)" / "Resume recording flows (⇧⌘R)".
-- **Capture switch** (`ToolbarSwitch("Capture")`): the capture extension's on/off. Its position
+- **All Apps switch** (`ToolbarSwitch("All Apps")`): system-wide capture through the extension, on/off (revision 3: Matt rejected "Capture" — it reads as the proxy's recording — and "Extension" — Proxyman's technology word; the feature is named for what it gives the operator: every Mac app's traffic without proxy settings, and the Apps page it feeds. Switch, lane title, Settings tab and menu all say *All Apps*; "the extension" appears only where macOS uses it: approval and uninstall). Its position
   is the published fact, never the preference key (§1): on whenever the capture lane is not
   `off` — capturing, waiting for approval, degraded — off when the lane is off;
   `coreHealth.captureChoice` carries it through a switch in flight. It flips through
   `CaptureSwitch.set`, the same
-  steps as Settings ▸ Capture, Proxy ▸ Turn On Capture / Turn Off Capture (⌃⌘C) and the Status
+  steps as Settings ▸ All Apps, Proxy ▸ Capture All Apps / Stop Capturing All Apps (⌃⌘A) and the Status
   card. Its track colour is the **capture lane's state colour** when on — so "on, nothing in
   scope" shows the warning hue, "waiting for approval" the working hue, "capture degraded" the
   error hue — and tertiary when off; the help carries the lane's word, detail and remedy. Disabled
@@ -294,10 +294,11 @@ into the cluster. Everything in the cluster reads `Session.connectionSummary`.
   joins Settings, the Proxy menu and the Status page in the capture tripwire's allow-list with an
   `expect`; no bus verb, `Session` action or palette entry reaches it.
 - **Words**: one word per idea. *Proxy* is the listener (on / paused); *Capture* is the
-  extension (GLOSSARY "Capture extension"; its switch and menu say Turn On / Turn Off Capture).
+  extension, named *All Apps* in every label (GLOSSARY "All Apps"; its switch says All Apps, its menu
+  Capture All Apps / Stop Capturing All Apps).
   "Pause Capture / Resume Capture" → "Pause Proxy / Resume Proxy" everywhere (menu, palette,
   command map, the status-bar error prefix, stories); "Enable Capture / Disable Capture" → "Turn
-  On Capture / Turn Off Capture" (the `ConnectionAction` titles already said so). The command map
+  On Capture / Turn Off Capture", then (review 3) → "Capture All Apps / Stop Capturing All Apps" (⌃⌘A). The command map
   also gains the Proxy menu's Reconnect Bus (⌃⌘R) and Restart Core (⌃⇧⌘R), which it had been
   missing, so the map lists every Proxy-menu item the Status cards twin.
 - **Sidebar brand row**: `›•‹ aitmproxy`, a label, not a button; no badge, no summary.
@@ -309,7 +310,7 @@ into the cluster. Everything in the cluster reads `Session.connectionSummary`.
   and memory. Three reasons the controls stay up: (1) HIG and the trade: toolbars carry the
   frequent controls, bottom bars carry counts and view toggles (Finder, Mail, Xcode; Proxyman,
   Charles and Wireshark all put record/capture at the top and counts at the bottom);
-  (2) Turn On Capture triggers macOS system-extension approval dialogs — a consequential action
+  (2) Capture All Apps triggers macOS system-extension approval dialogs — a consequential action
   that should not look like a footer toggle; (3) the first-run flow lands on Status with the pill
   directly above the page it opens and the Getting-started row "Turn on the capture extension"
   pointing at a switch in view, not at the far corner. The bottom variant (`● 127.0.0.1:8080 ·
@@ -341,7 +342,7 @@ bar order as before (h1 is now ⌘7). Chips get `.help` for the three new ones.
 | Capture on / off | The operator's switch for the capture extension | enable/disable (buttons say Turn On / Turn Off) |
 | Getting started | The Status page's live checklist | onboarding, wizard, tour |
 
-Buttons: Turn On Capture, Turn Off Capture, Restart Core, Start Core, Stop Core, Reconnect,
+Buttons: Capture All Apps, Stop Capturing All Apps, Restart Core, Start Core, Stop Core, Reconnect,
 Open Scope…, Core Log…, Open Browser, Copy Address, Uninstall Capture Extension…, Switch to
 Embedded… (opens Settings ▸ Bus).
 
@@ -550,4 +551,13 @@ Re-review of the fix commit (spec PASS, security PASS; Minors only), applied in 
 | P2-29 | Spec | Minor | ST-AC9's enabled clause pinned on one input | FIXED — `captureLive` checked for installed+embedded (live), external (off), busy (off) |
 | P2-30 | Spec | Minor | ST-AC12 open on a spec marked implemented | OPEN for Matt — VoiceOver / Accessibility Inspector read-out of the switches |
 | P2-31 | Orchestrator | — | The pill's "intercept armed" was a client flag (same class as P2-1) | FIXED — `refreshProxyStatus` also reads `intercept_armed` |
+
+Matt's review 3 (2026-10-31, on the live app): "even with the extension on, the Apps sidebar is not
+populated" and "the Capture button makes no sense — it is not clear what it refers to; it is always
+capturing the proxy."
+
+| # | Point | Disposition |
+|---|---|---|
+| R3-1 | "Capture" as the switch label reads as the proxy's recording; "Extension" (Proxyman's word) rejected too | FIXED — Matt chose *All Apps* from three proposals (All Apps / System-wide / Transparent): toolbar switch, lane title ("All Apps: all apps off"), Status card actions (Capture All Apps / Stop Capturing All Apps / Uninstall Extension…), Proxy menu (⌃⌘A), Settings tab (toggle "Capture traffic from all apps"), GLOSSARY. Kit identifiers (`CaptureSwitch`, `captureLane`, `turnCaptureOn`) keep their names; the tripwires follow the new labels |
+| R3-2 | Apps sidebar empty with the extension on | ROUTED to its own session (`mac-attribution`): the extension sends `source_app`, the core maps it to `peer_identity` and then drops it (`detail.rs` writes `"process": null`), and the app never decodes a client — core → app end to end, separate PR |
 
