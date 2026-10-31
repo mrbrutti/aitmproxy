@@ -68,4 +68,34 @@ import Testing
         meter.reset()
         #expect(meter.sample(up: 5_000, down: 5_000, at: t0.addingTimeInterval(1)) == .zero)
     }
+
+    // The totals come from a bus peer the app does not authenticate: absurd values
+    // must read as absurd numbers, never trap the process (security review).
+
+    @Test func hostileTotalsSaturateInsteadOfTrapping() {
+        var meter = ThroughputMeter(window: 3)
+        _ = meter.sample(up: 0, down: 0, at: t0)
+        // 2^63-1 bytes in half a second: the rate would be 2^64, beyond Int64.
+        let burst = meter.sample(up: Int64.max, down: Int64.max, at: t0.addingTimeInterval(0.5))
+        #expect(burst == ThroughputMeter.Rate(up: Int64.max, down: Int64.max))
+        // Int64.min after Int64.max: a negative total counts as zero, which is a
+        // shrink, so it re-baselines rather than subtracting across the whole range.
+        #expect(meter.sample(up: Int64.min, down: Int64.min, at: t0.addingTimeInterval(1)) == .zero)
+        #expect(meter.sample(up: 1_000, down: 0, at: t0.addingTimeInterval(1.5)) == ThroughputMeter.Rate(up: 2_000, down: 0))
+    }
+
+    @Test func rateSaturatesAndNeverGoesNegative() {
+        #expect(ThroughputMeter.rate(from: 0, to: 1_000, over: 0.5) == 2_000)
+        #expect(ThroughputMeter.rate(from: Int64.min, to: Int64.max, over: 1) == Int64.max)
+        #expect(ThroughputMeter.rate(from: 0, to: Int64.max, over: 0.001) == Int64.max)
+        #expect(ThroughputMeter.rate(from: 10, to: 5, over: 1) == 0)
+    }
+
+    @Test func totalSaturatesSkipsUnknownAndIgnoresNegatives() {
+        #expect(ThroughputMeter.total([1, 2, nil, 3]) == 6)
+        #expect(ThroughputMeter.total([Int64.max, 1]) == Int64.max)
+        #expect(ThroughputMeter.total([Int64.max, Int64.max, nil]) == Int64.max)
+        #expect(ThroughputMeter.total([-50, 7]) == 7)
+        #expect(ThroughputMeter.total([Int64?]()) == 0)
+    }
 }

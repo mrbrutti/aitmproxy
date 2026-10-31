@@ -151,9 +151,10 @@ final class BusService: FlowActions {
             if rows != session.rows { session.rows = rows }
             // ↑ is what clients sent (request bodies), ↓ what came back (response bodies),
             // as the core reports them; the meter turns the running totals into a rate.
+            // Saturating sums: the sizes are peer-supplied and must never trap the app.
             let rate = throughput.sample(
-                up: summaries.values.reduce(0) { $0 + ($1.requestBytes ?? 0) },
-                down: summaries.values.reduce(0) { $0 + ($1.responseBytes ?? 0) },
+                up: ThroughputMeter.total(summaries.values.lazy.map(\.requestBytes)),
+                down: ThroughputMeter.total(summaries.values.lazy.map(\.responseBytes)),
                 at: Date())
             if session.upBytesPerSecond != rate.up { session.upBytesPerSecond = rate.up }
             if session.downBytesPerSecond != rate.down { session.downBytesPerSecond = rate.down }

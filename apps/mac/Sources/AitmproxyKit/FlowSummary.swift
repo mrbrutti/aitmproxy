@@ -60,8 +60,15 @@ public struct FlowSummary: Hashable, Sendable {
         self.status = json["status"]?.intValue
         self.handshake = json["handshake"]?.stringValue.map(FlowID.init)
         self.messages = json["messages"]?.intValue
-        self.requestBytes = json["request_bytes"]?.intValue.map(Int64.init)
-        self.responseBytes = json["response_bytes"]?.intValue.map(Int64.init)
+        // A size is a count: a negative value from the wire is not one and reads as
+        // unknown (nil), so it is neither shown nor counted.
+        self.requestBytes = Self.size(json["request_bytes"])
+        self.responseBytes = Self.size(json["response_bytes"])
+    }
+
+    private static func size(_ value: JSONValue?) -> Int64? {
+        guard let size = value?.intValue, size >= 0 else { return nil }
+        return Int64(size)
     }
 
     /// A row with the fields the summary carries; the rest stay nil and draw as

@@ -66,6 +66,13 @@ import Testing
         let sized = try #require(FlowSummary(json: with)).row(seq: 1)
         #expect(sized.requestBytes == 0)
         #expect(sized.responseBytes == 2_048)
+        // A negative size is not a size: unknown (nil), never counted as 0 or shown.
+        let negative: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                                   "method": "GET", "scheme": "http", "authority": "h", "path": "/", "status": 200,
+                                   "request_bytes": -1, "response_bytes": -9_000_000_000]
+        let rejected = try #require(FlowSummary(json: negative)).row(seq: 1)
+        #expect(rejected.requestBytes == nil)
+        #expect(rejected.responseBytes == nil)
     }
 
     @Test func decodesWebSocketSummary() throws {
