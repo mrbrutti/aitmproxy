@@ -5,6 +5,7 @@
 //! `/bus` WebSocket bridge (F15). Kept as a library so the wiring is testable
 //! (AC-P3/AC-P4, CA-AC27) without the process entrypoint.
 
+pub mod bundled;
 pub mod config_file;
 pub mod env;
 pub mod ingress;
