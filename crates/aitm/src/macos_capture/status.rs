@@ -328,7 +328,6 @@ impl CaptureStatus {
 #[derive(Clone)]
 pub struct CaptureStatusWriter(Arc<Shared>);
 
-#[allow(dead_code)] // scaffolding: removed by plan Task 2, which wires feeder.rs
 impl CaptureStatusWriter {
     /// The sockets are bound and the rendezvous is published.
     pub(super) fn listening(&self) {
@@ -436,7 +435,6 @@ impl CaptureStatusReader {
 /// The tokens of a provider scope spec, exactly as the emitter joined them.
 /// `provider_scope_spec` never emits a token containing whitespace, so this
 /// round-trips: `scope_tokens(&spec).join(" ") == spec.spec` (spec D2).
-#[allow(dead_code)] // scaffolding: removed by plan Task 2, which wires feeder.rs
 pub(crate) fn scope_tokens(spec: &ScopeSpec) -> Vec<String> {
     spec.spec
         .split_ascii_whitespace()
