@@ -19,7 +19,7 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 56] = [
+const EXPECTED_TOOLS: [&str; 58] = [
     // M4 agent-control and F4 subscription tools, registered unconditionally by
     // the `AgentPlugin` and `SubscriptionPlugin` in `wire.rs`.
     "agent.status",
@@ -80,9 +80,11 @@ const EXPECTED_TOOLS: [&str; 56] = [
     "map.add",
     "map.list",
     "map.remove",
-    // The deterministic scanner (Stage 1): `ScannerPlugin` is registered
-    // unconditionally in `wire.rs`, so its one command is on every surface.
+    // The deterministic scanner: `ScannerPlugin` is registered unconditionally in
+    // `wire.rs`, so its commands are on every surface.
     "scan.discover",
+    "scan.passive",
+    "scan.report",
 ];
 
 /// The six `browser.*` tool schemas as M1 shipped them, keyed by tool name.
@@ -272,6 +274,51 @@ fn ac7_exact_tool_set() {
     let headers_schema = &mutate["inputSchema"]["properties"]["edits"]["properties"]["headers"];
     assert_eq!(headers_schema["type"], "object");
     assert_eq!(headers_schema["additionalProperties"]["type"], "string");
+}
+
+/// AC18: every `scan.*` tool the proxy lists carries an input schema an MCP
+/// client can build a call from: an object whose `properties` is non-empty.
+/// It iterates whatever `scan.*` tools are registered, so a new scan verb is
+/// covered without editing this test; it first asserts the two verbs that must
+/// always be there, so an unregistered command fails it rather than slipping
+/// through an empty loop.
+#[test]
+fn scan_tools_have_non_empty_input_schemas() {
+    let proxy = build_proxy(&config("scan-schemas")).expect("build proxy");
+    let server = McpServer::new(proxy.registry_arc(), McpTransport::Stdio);
+    let resp = rpc(&server, 1, "tools/list", json!({}));
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+
+    let scan_tools: Vec<&JsonValue> = tools
+        .iter()
+        .filter(|t| t["name"].as_str().is_some_and(|n| n.starts_with("scan.")))
+        .collect();
+    let names: Vec<&str> = scan_tools
+        .iter()
+        .map(|t| t["name"].as_str().expect("tool name"))
+        .collect();
+    for required in ["scan.discover", "scan.passive"] {
+        assert!(
+            names.contains(&required),
+            "`{required}` must be listed; scan.* tools listed: {names:?}"
+        );
+    }
+
+    for tool in scan_tools {
+        let name = tool["name"].as_str().expect("tool name");
+        let schema = &tool["inputSchema"];
+        assert!(
+            schema.is_object(),
+            "`{name}` inputSchema is a JSON object: {schema}"
+        );
+        let properties = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("`{name}` inputSchema.properties is an object: {schema}"));
+        assert!(
+            !properties.is_empty(),
+            "`{name}` inputSchema.properties must not be empty: {schema}"
+        );
+    }
 }
 
 #[test]

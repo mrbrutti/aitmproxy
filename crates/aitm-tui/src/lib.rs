@@ -218,8 +218,8 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     result
 }
 
-/// The 59 commands the bus serves today — `tools/list` of the core as of
-/// the 2026-10-29 M4 merge: foundation §4.1's 22, plus `flow.detail` (F5),
+/// The 61 commands the bus serves today — `tools/list` of the core as of
+/// the 2026-10-29 M4 merge plus the scanner commands: foundation §4.1's 22, plus `flow.detail` (F5),
 /// `flow.mark` / `flow.comment` (F6), `proxy.status` / `proxy.pause` /
 /// `proxy.resume` / `flow.clear` / `config.get` (F7), `scope.remove` (F12),
 /// `poc.list` / `poc.get` / `poc.artifact` (F13), the M3 Rhai commands
@@ -293,6 +293,10 @@ pub const CORE_TOOLS: &[&str] = &[
     "flow.unsubscribe",
     // Scanner plugin (Stage 1): read-only crawl + injection-point discovery.
     "scan.discover",
+    // Scanner plugin (Stage 2): passive checks over captured flows (Read).
+    "scan.passive",
+    // Scanner plugin (Stage 2): findings report + index over recorded findings (Read).
+    "scan.report",
 ];
 
 /// An [`App`] loaded synchronously from the built-in fixture, sized `cols`×`rows`,
