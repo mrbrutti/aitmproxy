@@ -259,7 +259,9 @@ final class BusService: FlowActions {
 
     func clear() async throws {
         _ = try await call("flow.clear")
-        summaries = [:]
+        // The cache is not wiped here: the core keeps in-flight and parked flows, and
+        // the next poll prunes the cleared ids itself. Wiping would make the survivors
+        // "never seen" and count their whole size as traffic a second time.
         session.rows = []
         session.details = [:]
         session.select(nil)
