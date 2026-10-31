@@ -29,6 +29,27 @@ pub const DEFAULT_AUDIT_CAPACITY: usize = 4096;
 /// bound.
 pub const DEFAULT_ARGS_SUMMARY_CAP: usize = 512;
 
+/// The `client_label` the web bridge stamps on every connection it serves. The
+/// server mints it (a bridge connection never declares one), so it names the
+/// path an entry arrived by, not the client behind it.
+pub const WEB_BRIDGE_CLIENT_LABEL: &str = "web-bridge";
+
+/// The longest `client_label` an entry or a host carries, in characters. A
+/// client-declared label cannot grow an entry without bound.
+pub const MAX_CLIENT_LABEL_CHARS: usize = 64;
+
+/// The longest error reason an audit entry keeps, in bytes, before it is
+/// truncated. A verbose or hostile reason cannot grow an entry without bound.
+pub const DEFAULT_RESULT_REASON_CAP: usize = 1024;
+
+/// Labels only the server may mint; a client that declares one is rewritten by
+/// [`declared_client_label`].
+const RESERVED_CLIENT_LABELS: &[&str] = &[WEB_BRIDGE_CLIENT_LABEL];
+
+/// How many characters of a raw label [`sanitize_client_label`] ever reads, so
+/// its work is bounded whatever the input size.
+const LABEL_SCAN_CHARS: usize = 1024;
+
 /// The outcome of one recorded invocation: it ran (`Ok`) or it was refused /
 /// failed, carrying the human reason (`Error`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +134,63 @@ pub fn origin_label(frontend: Frontend) -> &'static str {
         Frontend::Cli => "cli",
         Frontend::Mcp => "mcp",
         Frontend::Operator => "operator",
+    }
+}
+
+/// Whether a character is dropped from a client label: a control character, or
+/// an invisible or bidirectional-override character that could make one label
+/// pose as another in a UI.
+fn is_label_noise(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}'
+        )
+}
+
+/// The one sanitiser for a client label, whatever its source.
+///
+/// It reads only the first [`LABEL_SCAN_CHARS`] characters of `raw`, so its work
+/// is bounded however large the input. It drops control, invisible, and
+/// bidirectional-override characters, masks credential material with
+/// [`crate::redact::scrub_text`], trims, and truncates to
+/// [`MAX_CLIENT_LABEL_CHARS`] characters. It returns `None` when nothing is left.
+/// Applying it to its own output changes nothing, and it does not rewrite a
+/// server-minted name such as [`WEB_BRIDGE_CLIENT_LABEL`]; use
+/// [`declared_client_label`] where a client supplies the label.
+pub fn sanitize_client_label(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .take(LABEL_SCAN_CHARS)
+        .filter(|c| !is_label_noise(*c))
+        .collect();
+    let scrubbed = crate::redact::scrub_text(&cleaned);
+    let bounded: String = scrubbed
+        .trim()
+        .chars()
+        .take(MAX_CLIENT_LABEL_CHARS)
+        .collect();
+    let label = bounded.trim();
+    if label.is_empty() {
+        None
+    } else {
+        Some(label.to_string())
+    }
+}
+
+/// Sanitise a label a client declared (see [`sanitize_client_label`]) and keep it
+/// from posing as a server-minted one: a label equal, ignoring ASCII case and
+/// surrounding blanks, to a reserved name gets a ` (declared)` suffix. Apply it
+/// only where a client declares its label, never to a label the server mints.
+pub fn declared_client_label(raw: &str) -> Option<String> {
+    let label = sanitize_client_label(raw)?;
+    let reserved = RESERVED_CLIENT_LABELS
+        .iter()
+        .any(|name| label.trim().eq_ignore_ascii_case(name));
+    if reserved {
+        Some(format!("{label} (declared)"))
+    } else {
+        Some(label)
     }
 }
 
@@ -251,6 +329,75 @@ mod tests {
                     .into_iter()
                     .collect()
             ))
+        );
+    }
+
+    #[test]
+    fn sanitize_client_label_bounds_a_hostile_label() {
+        assert_eq!(
+            sanitize_client_label(&"A".repeat(10 << 20)),
+            Some("A".repeat(64))
+        );
+        assert_eq!(sanitize_client_label(&"\u{0}".repeat(10 << 20)), None);
+        assert_eq!(
+            sanitize_client_label("a\u{0}b\nc\u{202E}d"),
+            Some("abcd".to_string())
+        );
+        let scrubbed = sanitize_client_label("token=abc123").expect("a label remains");
+        assert!(!scrubbed.contains("abc123"), "secret leaked: {scrubbed}");
+        assert!(scrubbed.contains("[redacted]"), "not masked: {scrubbed}");
+        assert_eq!(sanitize_client_label(""), None);
+        assert_eq!(sanitize_client_label("   "), None);
+        assert_eq!(
+            sanitize_client_label("aitm-mac"),
+            Some("aitm-mac".to_string())
+        );
+        assert_eq!(
+            sanitize_client_label("web-bridge"),
+            Some("web-bridge".to_string())
+        );
+
+        // Idempotent: sanitising a sanitised label changes nothing.
+        let long = "A".repeat(10 << 20);
+        let nuls = "\u{0}".repeat(10 << 20);
+        // The 64-char cut lands inside the masked value, and inside the key.
+        let cut_in_mask = format!("{}token=abc123", "x".repeat(56));
+        let cut_in_key = format!("{}token=abc123", "x".repeat(60));
+        for raw in [
+            long.as_str(),
+            nuls.as_str(),
+            cut_in_mask.as_str(),
+            cut_in_key.as_str(),
+            "a\u{0}b\nc\u{202E}d",
+            "token=abc123",
+            "",
+            "   ",
+            "aitm-mac",
+            "web-bridge",
+        ] {
+            let once = sanitize_client_label(raw);
+            let bounded_and_clean = once
+                .as_deref()
+                .is_none_or(|l| l.chars().count() <= 64 && !l.contains("abc123"));
+            assert!(bounded_and_clean, "unbounded or leaking: {once:?}");
+            let twice = once.as_deref().and_then(sanitize_client_label);
+            assert_eq!(twice, once, "not idempotent for a {}-byte input", raw.len());
+        }
+    }
+
+    #[test]
+    fn declared_client_label_rewrites_a_reserved_name() {
+        assert_eq!(
+            declared_client_label("web-bridge"),
+            Some("web-bridge (declared)".to_string())
+        );
+        assert_eq!(
+            declared_client_label("  WEB-BRIDGE "),
+            Some("WEB-BRIDGE (declared)".to_string())
+        );
+        assert_eq!(
+            declared_client_label("aitm-mac"),
+            Some("aitm-mac".to_string())
         );
     }
 }
