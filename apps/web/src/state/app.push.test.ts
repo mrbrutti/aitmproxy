@@ -331,6 +331,11 @@ describe('app store — a flow push is a trigger, never data', () => {
 
     expect(bus.callArgs('flow.detail')).toEqual([]);
     expect(app.entries).toHaveLength(0);
+
+    bus.ctl.setState('open');
+    await tick(700); // one tick: the reopened bus takes a fresh snapshot, pending push or not
+
+    expect(app.entries.map((e) => e.id)).toEqual(['f_1']);
   });
 
   it('a flush waits for the tool catalogue', async () => {

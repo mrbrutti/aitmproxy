@@ -6,7 +6,7 @@
 //    so the virtualizer re-reads the visible slice at most 60×/s regardless of arrival rate;
 //  - filters run over untracked raw snapshots, never through store proxies.
 
-import { batch, createMemo, createRoot, createSignal, untrack, type Accessor } from 'solid-js';
+import { batch, createEffect, createMemo, createRoot, createSignal, on, untrack, type Accessor } from 'solid-js';
 import { createStore, produce, reconcile, type SetStoreFunction } from 'solid-js/store';
 import type { BusClient, AgentNotification, FlowNotification, StateNotification, ToolDef } from '~/bus/types';
 import { toDetail, toSummary } from '~/bus/normalize';
@@ -260,7 +260,7 @@ export function createAppStore(bus: BusClient) {
     function clearFlows() {
       entries.length = 0;
       byId.clear();
-      pushPending.clear();
+      dropPending();
       clearEpoch++;
       setDetails(reconcile({}));
       setSelectedIdRaw(null);
@@ -321,7 +321,18 @@ export function createAppStore(bus: BusClient) {
       queuePush(n.id);
     }
 
+    /**
+     * Only a complete payload is state. The `lagged` marker and any partial push would otherwise
+     * delete `listening`, `armed` and `agent` from the store (a Solid store drops a key set to
+     * undefined) and zero throughput and memory; they write nothing and advance no clock.
+     */
+    const isCompleteState = (p: unknown): p is StateNotification => {
+      const s = p as Partial<StateNotification> | null | undefined;
+      return typeof s?.listening === 'boolean' && typeof s?.intercept_armed === 'boolean';
+    };
+
     function onState(s: StateNotification) {
+      if (!isCompleteState(s)) return;
       batch(() => {
         setProxy({
           listening: s.listening,
@@ -343,9 +354,12 @@ export function createAppStore(bus: BusClient) {
       });
     }
 
-    // When the last flow / state notification landed. The poll loop backs off only while the matching
-    // stream is demonstrably flowing — never because the core merely *advertises* `flow.subscribe`,
-    // and never for the list because only the state stream (throughput ticks) is alive.
+    // When the last flow / complete state notification landed. The poll loop backs off only while the
+    // matching stream is demonstrably flowing — never because the core merely *advertises*
+    // `flow.subscribe`, and never for the list because only the state stream (throughput ticks) is
+    // alive. Only `notifications/aitm/flow` advances the flow clock (an audit line, a state line or
+    // the `lagged` marker says nothing about flows); only a complete state payload advances the state
+    // clock. Both are reset when the bus (re)opens, and the flow clock by `lagged`.
     let lastFlowPushAt = Number.NEGATIVE_INFINITY;
     let lastStatePushAt = Number.NEGATIVE_INFINITY;
 
@@ -356,8 +370,18 @@ export function createAppStore(bus: BusClient) {
           onFlowEvent(params as FlowNotification);
           break;
         case 'notifications/aitm/state':
+          if ((params as { lagged?: unknown } | null | undefined)?.lagged === true) {
+            // The server's lane for this connection overflowed and dropped notifications. The marker
+            // is not state and proves nothing about the flow stream: push is distrusted until the next
+            // flow notification, and the list is resynced now, not on the next tick. The server pushes
+            // no state, so nothing in the status was lost and that clock is left alone.
+            lastFlowPushAt = Number.NEGATIVE_INFINITY;
+            requestPollNow();
+            break;
+          }
+          if (!isCompleteState(params)) break;
           lastStatePushAt = Date.now();
-          onState(params as StateNotification);
+          onState(params);
           break;
         case 'notifications/aitm/agent':
           onAgent(params as AgentNotification);
@@ -373,10 +397,12 @@ export function createAppStore(bus: BusClient) {
     // every real bus is still polled. The loop skips the flow poll only while a FLOW notification
     // arrived within PUSH_FRESH_MS, and the status poll only while a STATE one did (a bridge that
     // pushes just throughput ticks must not slow the list down). Even then a heartbeat runs every
-    // PUSH_FRESH_MS, so a push that dies quietly or loses events cannot freeze either. The loop
-    // touches the bus only while it is `open` (a call into a bus that is reconnecting can wait on it
-    // indefinitely), and heals a bootstrap that never got the tool catalogue. The static `fixtures`
-    // bus is a snapshot and is never polled.
+    // PUSH_FRESH_MS, so a push that dies quietly or loses events cannot freeze either. When the bus
+    // (re)opens both clocks are reset and the pending set dropped, so the first tick after an outage
+    // takes a fresh snapshot; a `lagged` marker resyncs at once (`requestPollNow`), single-flight with
+    // the tick's own poll. The loop touches the bus only while it is `open` (a call into a bus that is
+    // reconnecting can wait on it indefinitely), and heals a bootstrap that never got the tool
+    // catalogue. The static `fixtures` bus is a snapshot and is never polled.
     const POLL_MS = 500;
     const STATUS_EVERY_MS = 2000; // while the state stream is not pushing
     const PUSH_FRESH_MS = 10_000;
@@ -449,7 +475,28 @@ export function createAppStore(bus: BusClient) {
         });
       }
     }
-    async function pollOnce() {
+    /** The poll in progress, if any: `pollOnce` joins it rather than overlapping it. */
+    let pollRunning: Promise<void> | null = null;
+    /** A resync was requested while a poll was running: exactly one more runs when it finishes. */
+    let pollTrailing = false;
+    /** Single-flight: the running poll's promise when one is running, else a new one. */
+    function pollOnce(): Promise<void> {
+      if (pollRunning) return pollRunning;
+      pollRunning = runPoll().finally(() => {
+        pollRunning = null;
+        if (pollTrailing) {
+          pollTrailing = false;
+          void pollOnce();
+        }
+      });
+      return pollRunning;
+    }
+    /** Resync now, not on the next tick: start a poll, or fold into one trailing poll if one is running. */
+    function requestPollNow(): void {
+      if (pollRunning) pollTrailing = true;
+      else void pollOnce();
+    }
+    async function runPoll() {
       lastPollAt = Date.now();
       try {
         const ids = await bus.call<string[]>('flow.list');
@@ -490,6 +537,15 @@ export function createAppStore(bus: BusClient) {
         pushTimer = null;
         void flushPush();
       }, PUSH_COALESCE_MS);
+    }
+    /** Forget every queued id and disarm the timer: the list was cleared, or the connection is new. */
+    function dropPending() {
+      pushPending.clear();
+      pushPauseDirty = false;
+      if (pushTimer !== null) {
+        clearTimeout(pushTimer);
+        pushTimer = null;
+      }
     }
     /** Queue an id a flow push named; one flush runs at a time, and the next timer is armed when it finishes. */
     function queuePush(id: FlowId) {
@@ -549,6 +605,23 @@ export function createAppStore(bus: BusClient) {
         /* next tick */
       }
     }
+    // Every (re)connection is a new stream: nothing pushed before an outage says anything about what
+    // was captured during it. Both clocks are reset so the next tick takes a fresh snapshot even if a
+    // push was fresh seconds ago, held failures are retried, and ids queued for the socket that is
+    // gone are dropped (the snapshot covers them). Deferred: the state at creation is not a transition.
+    createEffect(
+      on(
+        bus.state,
+        (s) => {
+          if (s !== 'open') return;
+          lastFlowPushAt = Number.NEGATIVE_INFINITY;
+          lastStatePushAt = Number.NEGATIVE_INFINITY;
+          failedAt.clear();
+          dropPending();
+        },
+        { defer: true },
+      ),
+    );
     /** `polling` means the loop is the live source: the bus is open and no flow notifications are arriving. */
     const syncPollingFlag = () => setProxy('polling', bus.state() === 'open' && !isFresh(lastFlowPushAt, Date.now()));
     function startPolling() {
