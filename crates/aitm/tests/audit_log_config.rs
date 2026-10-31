@@ -7,14 +7,18 @@
 //! file's setting exactly as it was (and says so with one warning): for an audit
 //! control the fail-safe direction is "stay on", so a typo must not disable the
 //! trail. Paths are Unix literals; the repo's CI is Unix.
+//!
+//! Task W3 adds AC3 (`stream_paths_follow_the_rule`): the three stream files are
+//! derived from the one configured base path.
 
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use aitm::audit_log::{stream_path, StreamKind};
 use aitm::config_file::parse;
 use aitm::env;
-use aitm_core::{AuditLogSetting, Config};
+use aitm_core::{AuditLogSetting, CaConfig, Config};
 use tracing_subscriber::fmt::MakeWriter;
 
 /// The `mcp.audit_log` the file parser produced, or the whole error chain.
@@ -208,6 +212,72 @@ fn audit_log_env_wins_and_never_silently_disables() {
         ] {
             check(start, Some(value), start, true);
         }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} row(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// AC3: the control stream is the configured base; the agent and reads streams
+/// put `.agent` / `.reads` before the final extension (or append it when there
+/// is none). The default path sits beside the CA audit log; `Off` has no path.
+#[test]
+fn stream_paths_follow_the_rule() {
+    let rows = [
+        (
+            "/a/audit.jsonl",
+            [
+                "/a/audit.jsonl",
+                "/a/audit.agent.jsonl",
+                "/a/audit.reads.jsonl",
+            ],
+        ),
+        ("/a/audit", ["/a/audit", "/a/audit.agent", "/a/audit.reads"]),
+        // Extra row: only the final extension is split off.
+        (
+            "/a/audit.v2.jsonl",
+            [
+                "/a/audit.v2.jsonl",
+                "/a/audit.v2.agent.jsonl",
+                "/a/audit.v2.reads.jsonl",
+            ],
+        ),
+    ];
+    let mut failures: Vec<String> = Vec::new();
+    for (base, want) in rows {
+        let base = PathBuf::from(base);
+        let got: Vec<PathBuf> = [StreamKind::Control, StreamKind::Agent, StreamKind::Reads]
+            .into_iter()
+            .map(|kind| stream_path(&base, kind))
+            .collect();
+        let want: Vec<PathBuf> = want.into_iter().map(PathBuf::from).collect();
+        if got != want {
+            failures.push(format!("{base:?}: left: {got:?}, right: {want:?}"));
+        }
+    }
+
+    // `Default` is `audit.jsonl` in the directory the CA audit log lives in.
+    // (These two rows are green on arrival: Task W1 built `resolved_path`.)
+    match AuditLogSetting::Default.resolved_path() {
+        Some(path) => {
+            if path.file_name() != Some("audit.jsonl".as_ref()) {
+                failures.push(format!("Default: {path:?} does not end in audit.jsonl"));
+            }
+            let ca_log = CaConfig::default().audit_log;
+            if path.parent() != ca_log.parent() {
+                failures.push(format!(
+                    "Default: parent of {path:?} is not the parent of {ca_log:?}"
+                ));
+            }
+        }
+        None => failures.push("Default: resolved_path() is None".to_string()),
+    }
+    if let Some(path) = AuditLogSetting::Off.resolved_path() {
+        failures.push(format!("Off: left: Some({path:?}), right: None"));
     }
 
     assert!(
