@@ -237,6 +237,7 @@ mod tests {
                 status,
                 version: HttpVersion::Http11,
                 headers: resp_headers,
+                trailers: HeaderMap::new(),
                 body: Body::Bytes(body.as_bytes().to_vec()),
                 timestamp: SystemTime::now(),
             }),

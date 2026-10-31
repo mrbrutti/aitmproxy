@@ -417,6 +417,7 @@ async fn drive_stream(
             status: 413,
             version: HttpVersion::H2,
             headers,
+            trailers: HeaderMap::new(),
             body: Body::Bytes(b"request body exceeds the configured limit".to_vec()),
             timestamp: SystemTime::now(),
         };

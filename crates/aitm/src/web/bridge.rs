@@ -5,7 +5,8 @@
 //! line; every later text frame holds one or more lines.
 //!
 //! An authenticated connection is one `ConnCtx`: its role, a unique `conn_id`,
-//! and a bounded `NotificationSink`, shared by every frame it sends. That is what
+//! the server-minted `client_label` `web-bridge`, and a bounded
+//! `NotificationSink`, shared by every frame it sends. That is what
 //! lets `flow.subscribe` work here as it does over loopback TCP: a subscription is
 //! tagged with the connection and dropped when the connection ends, on every exit
 //! path. Frames are detached rather than cancelled, so one may still be running
@@ -264,12 +265,11 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
     // connection's subscriptions. The guard runs that teardown when this
     // function returns by any path, a panicked frame included.
     let sink = NotificationSink::new(state.mcp.push_capacity());
-    let conn = Arc::new(ConnCtx {
+    let conn = Arc::new(bridge_conn_ctx(
         role,
-        client_label: None,
-        conn_id: state.mcp.next_conn_id(),
-        out: Some(sink.clone()),
-    });
+        state.mcp.next_conn_id(),
+        sink.clone(),
+    ));
     let guard = ConnGuard {
         mcp: Arc::clone(&state.mcp),
         conn_id: conn.conn_id,
@@ -396,6 +396,19 @@ fn dispatch_frame(mcp: &Arc<McpServer>, conn: &Arc<ConnCtx>, lines: Vec<String>)
             .filter_map(|line| mcp.handle_on(&conn, line))
             .collect()
     })
+}
+
+/// The one `ConnCtx` for an authenticated bridge connection. Its label is the
+/// server-minted [`aitm_core::WEB_BRIDGE_CLIENT_LABEL`]: it names the path (the
+/// web bridge), not the client. The bridge never reads `initialize.clientInfo`,
+/// because any holder of the bridge token can open the socket and a declared name
+/// would be forgeable.
+pub(crate) fn bridge_conn_ctx(role: Frontend, conn_id: u64, out: NotificationSink) -> ConnCtx {
+    let mut ctx = ConnCtx::new(role);
+    ctx.client_label = Some(aitm_core::WEB_BRIDGE_CLIENT_LABEL.to_string());
+    ctx.conn_id = conn_id;
+    ctx.out = Some(out);
+    ctx
 }
 
 /// Tears down a connection's server-side state when it ends. Held by `relay`
@@ -614,6 +627,21 @@ fn plain(status: StatusCode, text: &'static str) -> Response<Full<Bytes>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bridge_conn_ctx_carries_the_server_minted_label() {
+        let operator = bridge_conn_ctx(Frontend::Operator, 7, NotificationSink::new(4));
+        assert_eq!(operator.client_label.as_deref(), Some("web-bridge"));
+        assert_eq!(operator.conn_id, 7);
+        assert!(operator.out.is_some());
+        assert_eq!(aitm_core::origin_label(operator.role), "operator");
+
+        let agent = bridge_conn_ctx(Frontend::Mcp, 7, NotificationSink::new(4));
+        assert_eq!(agent.client_label.as_deref(), Some("web-bridge"));
+        assert_eq!(agent.conn_id, 7);
+        assert!(agent.out.is_some());
+        assert_eq!(aitm_core::origin_label(agent.role), "mcp");
+    }
 
     #[test]
     fn token_line_must_be_exactly_the_token_object() {

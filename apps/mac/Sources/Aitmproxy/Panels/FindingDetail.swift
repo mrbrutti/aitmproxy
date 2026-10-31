@@ -48,7 +48,7 @@ struct FindingDetail: View {
                 }
             FlatButton("Export") { export() }
         }
-        .padding(.horizontal, Space.md)
+        .padding(.horizontal, Space.margin)
         .frame(height: Tok.Size.inspectorHeader)
     }
 

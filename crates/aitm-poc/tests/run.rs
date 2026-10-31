@@ -60,6 +60,7 @@ impl RequestSender for TargetSender {
                 status,
                 version: HttpVersion::Http11,
                 headers: HeaderMap::new(),
+                trailers: HeaderMap::new(),
                 body: Body::Bytes(body.as_bytes().to_vec()),
                 timestamp: SystemTime::now(),
             })

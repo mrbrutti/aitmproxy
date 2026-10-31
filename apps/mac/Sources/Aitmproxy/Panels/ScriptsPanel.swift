@@ -45,15 +45,11 @@ struct ScriptsPanel: View {
     }
 
     private var header: some View {
-        HStack(spacing: Space.md) {
-            TrackedLabel("Scripts")
-            Spacer(minLength: Space.sm)
+        PageHeader("Scripts") {
             Text("\(scripts.filter(\.isActive).count) active")
                 .font(Tok.Face.ui(Tok.Typography.Size.sm))
                 .foregroundStyle(Tok.Ink.secondary.color)
         }
-        .padding(.horizontal, Space.margin)
-        .frame(height: Tok.Size.filterBar)
         .gridProbe("scripts.title", area: "scripts")
     }
 

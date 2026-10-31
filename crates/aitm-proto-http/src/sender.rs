@@ -314,3 +314,219 @@ fn split_authority(authority: &str, scheme: &str) -> Result<(String, u16)> {
     let port = if auth.port == 0 { default } else { auth.port };
     Ok((auth.host, port))
 }
+
+/// `drive` over an in-memory stream: the reissue path returns the trailers of a
+/// chunked response (the machine captures them; the sender needs no change of
+/// its own) and fails closed on a trailer section over the machine's caps.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{duplex, DuplexStream};
+
+    /// A request for `path` on `127.0.0.1:8080`.
+    fn request(method: &str, path: &str, headers: &[(&str, &str)], body: Body) -> HttpRequest {
+        let mut map = HeaderMap::new();
+        for (name, value) in headers {
+            map.set(name, value);
+        }
+        HttpRequest {
+            method: method.into(),
+            scheme: "http".into(),
+            authority: "127.0.0.1:8080".into(),
+            path: path.into(),
+            version: aitm_core::HttpVersion::Http11,
+            headers: map,
+            body,
+            timestamp: SystemTime::now(),
+        }
+    }
+
+    fn get_x() -> HttpRequest {
+        request("GET", "/x", &[("Host", "127.0.0.1:8080")], Body::Empty)
+    }
+
+    /// Read one request from `io` (its head and the `Content-Length` body bytes
+    /// that follow), returning every byte read.
+    async fn read_request(io: &mut DuplexStream) -> Vec<u8> {
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            if let Some(end) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&seen[..end]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .map(|v| v.trim().parse::<usize>().expect("numeric Content-Length"))
+                    .unwrap_or(0);
+                if seen.len() >= end + 4 + length {
+                    return seen;
+                }
+            }
+            let n = io.read(&mut buf).await.expect("origin read");
+            assert!(n > 0, "the sender closed before it wrote a whole request");
+            seen.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    /// The origin: read one request, record it, then write each segment with a
+    /// 10 ms pause between so the machine sees them as separate reads. After the
+    /// last segment it holds the connection open until the sender hangs up.
+    /// Returns the request bytes it read. A failed write means the sender
+    /// already gave up (the case under test), so it just stops.
+    async fn origin(mut io: DuplexStream, segments: Vec<Vec<u8>>) -> Vec<u8> {
+        let seen = read_request(&mut io).await;
+        for (i, segment) in segments.iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if io.write_all(segment).await.is_err() || io.flush().await.is_err() {
+                return seen;
+            }
+        }
+        let mut sink = [0u8; 1];
+        let _ = io.read(&mut sink).await;
+        seen
+    }
+
+    /// Run `drive` for `req` against an origin that answers with `segments`;
+    /// returns what `drive` returned and the request bytes the origin saw.
+    async fn exchange(req: HttpRequest, segments: Vec<Vec<u8>>) -> (Result<HttpResponse>, Vec<u8>) {
+        let (client, server) = duplex(64 * 1024);
+        let origin = tokio::spawn(origin(server, segments));
+        let result = tokio::time::timeout(Duration::from_secs(10), drive(client, &req))
+            .await
+            .expect("drive finished within the guard");
+        let seen = origin.await.expect("origin task");
+        (result, seen)
+    }
+
+    fn seg(text: &str) -> Vec<u8> {
+        text.as_bytes().to_vec()
+    }
+
+    fn trailers(resp: &HttpResponse) -> Vec<(&str, &str)> {
+        resp.trailers.iter().collect()
+    }
+
+    #[tokio::test]
+    async fn drive_returns_the_trailers_of_a_chunked_response() {
+        let (result, _) = exchange(
+            get_x(),
+            vec![seg(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Sum\r\n\r\n\
+                 5\r\nhello\r\n0\r\nX-Sum: abc\r\nServer-Timing: origin;dur=1\r\n\r\n",
+            )],
+        )
+        .await;
+        let resp = result.expect("the exchange succeeds");
+        assert_eq!(resp.status, 200);
+        match &resp.body {
+            Body::Bytes(b) => assert_eq!(b.as_slice(), b"hello"),
+            other => panic!("body was {other:?}, want Bytes(hello)"),
+        }
+        assert_eq!(
+            trailers(&resp),
+            vec![("X-Sum", "abc"), ("Server-Timing", "origin;dur=1")]
+        );
+        assert_eq!(
+            resp.headers.get("x-sum"),
+            None,
+            "a trailer is never merged into the headers"
+        );
+        assert_eq!(resp.headers.get("trailer"), Some("X-Sum"));
+    }
+
+    #[tokio::test]
+    async fn drive_returns_trailers_that_arrive_in_a_later_read() {
+        let (result, _) = exchange(
+            get_x(),
+            vec![
+                seg(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Sum\r\n\r\n\
+                     5\r\nhello\r\n0\r\n",
+                ),
+                seg("X-Sum: abc\r\n"),
+                seg("Server-Timing: origin;dur=1\r\n"),
+                seg("\r\n"),
+            ],
+        )
+        .await;
+        let resp = result.expect("the exchange succeeds");
+        match &resp.body {
+            Body::Bytes(b) => assert_eq!(b.as_slice(), b"hello"),
+            other => panic!("body was {other:?}, want Bytes(hello)"),
+        }
+        assert_eq!(
+            trailers(&resp),
+            vec![("X-Sum", "abc"), ("Server-Timing", "origin;dur=1")]
+        );
+        assert_eq!(resp.headers.get("x-sum"), None);
+    }
+
+    #[tokio::test]
+    async fn drive_fails_on_a_trailer_section_over_the_cap() {
+        let mut section = String::from("0\r\n");
+        for i in 0..65 {
+            section.push_str(&format!("f{i}: v\r\n"));
+        }
+        section.push_str("\r\n");
+        let (result, _) = exchange(
+            get_x(),
+            vec![
+                seg("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"),
+                seg(&section),
+            ],
+        )
+        .await;
+        let err = result.expect_err("65 trailer fields exceed the machine's cap");
+        assert!(err.to_string().contains("trailer"), "{err}");
+    }
+
+    /// Characterization: a request that carries `Expect: 100-continue` goes out
+    /// head and body together, without waiting for the origin to say anything.
+    #[tokio::test]
+    async fn drive_writes_an_expect_request_head_and_body_together() {
+        let req = request(
+            "POST",
+            "/up",
+            &[("Host", "127.0.0.1:8080"), ("Expect", "100-continue")],
+            Body::Bytes(b"hello".to_vec()),
+        );
+        let (result, seen) = exchange(
+            req,
+            vec![seg("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")],
+        )
+        .await;
+        assert_eq!(
+            String::from_utf8_lossy(&seen),
+            "POST /up HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nExpect: 100-continue\r\n\
+             Content-Length: 5\r\n\r\nhello"
+        );
+        assert_eq!(result.expect("the exchange succeeds").status, 200);
+    }
+
+    /// Characterization: an origin's own interim `100 Continue` is skipped, so
+    /// the response `drive` returns is the final one.
+    #[tokio::test]
+    async fn drive_skips_an_origin_interim_100_for_a_request_that_carries_expect() {
+        let req = request(
+            "POST",
+            "/up",
+            &[("Host", "127.0.0.1:8080"), ("Expect", "100-continue")],
+            Body::Bytes(b"hello".to_vec()),
+        );
+        let (result, _) = exchange(
+            req,
+            vec![seg(
+                "HTTP/1.1 100 Continue\r\n\r\n\
+                 HTTP/1.1 302 Found\r\nLocation: /c\r\nContent-Length: 0\r\n\r\n",
+            )],
+        )
+        .await;
+        let resp = result.expect("the exchange succeeds");
+        assert_eq!(resp.status, 302);
+        assert_eq!(resp.headers.get("location"), Some("/c"));
+        assert!(matches!(resp.body, Body::Empty), "body was {:?}", resp.body);
+        assert!(resp.trailers.is_empty());
+    }
+}

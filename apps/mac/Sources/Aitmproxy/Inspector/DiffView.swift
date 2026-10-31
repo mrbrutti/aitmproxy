@@ -64,7 +64,7 @@ struct DiffView: View {
                     .frame(width: Space.md)
                 Text(section.title.uppercased())
                     .font(Tok.Face.ui(Tok.Typography.Size.xs, .medium))
-                    .tracking(0.5)
+                    .tracking(0.6)
                     .foregroundStyle(Tok.Ink.tertiary.color)
                 if changed {
                     Text("+\(section.diff.insertions) −\(section.diff.deletions)")

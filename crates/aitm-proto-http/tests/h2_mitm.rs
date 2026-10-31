@@ -606,6 +606,7 @@ impl Plugin for MapLocal {
                 status: 200,
                 version: HttpVersion::H2,
                 headers,
+                trailers: HeaderMap::new(),
                 body: Body::Bytes(self.body.clone()),
                 timestamp: std::time::SystemTime::now(),
             });

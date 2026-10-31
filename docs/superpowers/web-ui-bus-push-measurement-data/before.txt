@@ -1,0 +1,24 @@
+bus-load (before) · ui origin mcp · bus ws://127.0.0.1:18082/bus · proxy 127.0.0.1:18080 · script role agent
+subscribed: sub_id 2
+
+idle: 30 s, hands off the page
+
+idle window: 30.0 s · 75 ui calls (origin mcp) · 0 other-origin
+flow.list      2.00/s
+proxy.status   0.50/s
+total          2.50/s
+notifications  flow 0.00/s · agent 2.50/s · state 0.00/s
+
+traffic: 20 req/s for 30 s via 127.0.0.1:18080 to http://127.0.0.1:62888/
+
+traffic window: 31.0 s · 676 ui calls (origin mcp) · 0 other-origin
+flow.detail    19.34/s
+flow.list      1.97/s
+proxy.status   0.48/s
+total          21.79/s
+notifications  flow 77.36/s · agent 21.79/s · state 0.00/s
+requests       600 sent · 600 ok · 0 failed · 0 skipped (window includes a 1000 ms settle)
+flow.detail    1.00 per new flow (spec R3 threshold 2.5)
+
+flow.list now: 1200 ids · 46801 bytes (result JSON) · 100914 bytes (reply frame)
+json: $TMPDIR/before.json

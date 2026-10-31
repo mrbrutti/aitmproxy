@@ -35,6 +35,7 @@ impl RequestSender for OkSender {
                 status: 200,
                 version: HttpVersion::Http11,
                 headers: HeaderMap::new(),
+                trailers: HeaderMap::new(),
                 body: Body::Bytes(b"ok".to_vec()),
                 timestamp: SystemTime::now(),
             })

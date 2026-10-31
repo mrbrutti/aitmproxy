@@ -147,6 +147,7 @@ fn http_flow_with_response() -> Flow {
             status: 200,
             version: HttpVersion::Http11,
             headers,
+            trailers: HeaderMap::new(),
             body: Body::Bytes(b"upstream-body".to_vec()),
             timestamp: SystemTime::now(),
         });

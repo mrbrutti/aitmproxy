@@ -57,7 +57,10 @@ func emitColor(_ name: String, _ value: Any, _ description: String?, _ depth: In
     guard let modes = value as? [String: Any],
           let light = modes["light"], let dark = modes["dark"] else { return }
     if let l = light as? String, let d = dark as? String {
-        line("static let \(ident(name)) = DynamicColor(light: \(hex(l)), dark: \(hex(d)))", depth)
+        // Optional Increase-Contrast overrides (nil falls back to light/dark).
+        let hcl = (modes["highContrastLight"] as? String).map { ", highContrastLight: \(hex($0))" } ?? ""
+        let hcd = (modes["highContrastDark"] as? String).map { ", highContrastDark: \(hex($0))" } ?? ""
+        line("static let \(ident(name)) = DynamicColor(light: \(hex(l)), dark: \(hex(d))\(hcl)\(hcd))", depth)
     } else if let l = light as? [String: String], let d = dark as? [String: String],
               let lf = l["fg"], let lb = l["bg"], let df = d["fg"], let db = d["bg"] {
         line("static let \(ident(name)) = ColorPair(", depth)
@@ -149,7 +152,10 @@ line("/// A colour with a light and a dark value, for SwiftUI views and AppKit c
 line("struct DynamicColor: Hashable, Sendable {")
 line("let light: UInt32", 1)
 line("let dark: UInt32", 1)
-line("var nsColor: NSColor { NSColor.dynamic(light: light, dark: dark) }", 1)
+line("/// Increase-Contrast overrides; nil falls back to light/dark.", 1)
+line("var highContrastLight: UInt32? = nil", 1)
+line("var highContrastDark: UInt32? = nil", 1)
+line("var nsColor: NSColor { NSColor.dynamic(light: light, dark: dark, highContrastLight: highContrastLight, highContrastDark: highContrastDark) }", 1)
 line("var color: Color { Color(nsColor: nsColor) }", 1)
 line("}")
 line()

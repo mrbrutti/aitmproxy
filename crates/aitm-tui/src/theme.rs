@@ -487,7 +487,8 @@ mod tests {
         assert_eq!(Theme::new(false).surface(), Style::default());
         assert_eq!(
             Theme::new(true).raised().bg,
-            Some(Color::Rgb(0x26, 0x26, 0x28))
+            // Denser dark neutral from the mac Wave 14 token pass (tokens.json ground.raised).
+            Some(Color::Rgb(0x2C, 0x2C, 0x2F))
         );
     }
 }

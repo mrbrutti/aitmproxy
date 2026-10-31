@@ -1,0 +1,113 @@
+{
+  "label": "final",
+  "at": "2026-10-31T03:07:04.667Z",
+  "valid": true,
+  "warnings": [],
+  "url": "ws://127.0.0.1:18082/bus",
+  "proxy": "127.0.0.1:18080",
+  "uiOrigin": "mcp",
+  "server": {
+    "name": "aitmproxy",
+    "version": "0.5.0"
+  },
+  "role": "agent",
+  "subId": 2,
+  "idle": {
+    "startMs": 1793416024669,
+    "endMs": 1793416054671,
+    "secs": 30.002,
+    "perCommand": {
+      "proxy.status": 15,
+      "flow.list": 50
+    },
+    "total": 65,
+    "otherOrigins": {},
+    "windowMs": 30002,
+    "ratePerSec": {
+      "proxy.status": 0.49996666888874075,
+      "flow.list": 1.6665555629624693
+    },
+    "totalPerSec": 2.16652223185121,
+    "notifications": {
+      "flow": 0,
+      "agent": 65,
+      "state": 0,
+      "other": 0,
+      "lagged": 0,
+      "nonAudit": 0,
+      "dropped": 0
+    },
+    "notificationsPerSec": {
+      "flow": 0,
+      "agent": 2.16652223185121,
+      "state": 0,
+      "other": 0,
+      "lagged": 0,
+      "nonAudit": 0,
+      "dropped": 0
+    }
+  },
+  "traffic": {
+    "startMs": 1793416054927,
+    "endMs": 1793416085958,
+    "secs": 31.031,
+    "perCommand": {
+      "flow.detail": 640,
+      "proxy.status": 16,
+      "flow.list": 3
+    },
+    "total": 659,
+    "otherOrigins": {},
+    "windowMs": 31031,
+    "ratePerSec": {
+      "flow.detail": 20.62453675356901,
+      "proxy.status": 0.5156134188392253,
+      "flow.list": 0.09667751603235475
+    },
+    "totalPerSec": 21.23682768844059,
+    "notifications": {
+      "flow": 2400,
+      "agent": 659,
+      "state": 0,
+      "other": 0,
+      "lagged": 0,
+      "nonAudit": 0,
+      "dropped": 0
+    },
+    "notificationsPerSec": {
+      "flow": 77.3420128258838,
+      "agent": 21.23682768844059,
+      "state": 0,
+      "other": 0,
+      "lagged": 0,
+      "nonAudit": 0,
+      "dropped": 0
+    },
+    "requests": {
+      "rate": 20,
+      "secs": 30,
+      "sent": 600,
+      "ok": 600,
+      "failed": 0,
+      "skipped": 0,
+      "firstError": null,
+      "elapsedMs": 30030
+    },
+    "flowDetailPerRequest": 1.0666666666666667
+  },
+  "flowList": {
+    "ids": 1100,
+    "bytes": 42901,
+    "frameBytes": 92514
+  },
+  "collected": {
+    "auditLines": 725,
+    "flow": 2400,
+    "agent": 725,
+    "state": 0,
+    "other": 0,
+    "lagged": 0,
+    "nonAudit": 0,
+    "dropped": 0
+  }
+}

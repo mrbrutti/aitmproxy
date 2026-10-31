@@ -12,11 +12,17 @@
 //! for now. `actions_last_minute` is sourced from the F2 audit ring (Task 8).
 //! `agent.activity` (Read, any role) reads the same ring so a surface or a
 //! reconnecting agent can catch up on recent activity (spec D3a.4).
+//!
+//! The audit ring has two lanes: an evidence lane (refusals, failures, and every
+//! Write or Sensitive run) and a routine lane (successful reads only), so a burst
+//! of reads cannot push evidence out. `actions_last_minute` counts both lanes,
+//! across every surface: a UI that polls `agent.status` counts too.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aitm_core::audit::{DEFAULT_AUDIT_CAPACITY, DEFAULT_ROUTINE_AUDIT_CAPACITY};
 use aitm_core::{
     AgentPolicy, AgentState, AuditRing, Command, CommandHost, ParamDef, ParamSchema, Params,
     Plugin, Registry, Sensitivity, TypeDesc, Value,
@@ -108,8 +114,9 @@ impl Command for AgentStatus {
                     "actions_last_minute",
                     TypeDesc::Int,
                     true,
-                    "Command invocations recorded in the last minute (sourced from the F2 audit \
-                     ring).",
+                    "Command invocations still held in the audit ring that were recorded in the \
+                     last minute, across both lanes and every surface (a polling UI counts). \
+                     Saturates at what the ring holds.",
                 ),
                 param(
                     "connected_clients",
@@ -205,6 +212,16 @@ impl Command for AgentSet {
 /// recent command activity without replaying the whole `notifications/aitm/agent`
 /// stream (spec D3a.4). `since` is Unix-epoch milliseconds (entries strictly
 /// after it); `limit` keeps the most recent `limit` of those.
+///
+/// Entries merge oldest-first across the ring's two lanes. The ring is a live
+/// view, not a complete record. A source that already holds one of a lane's table
+/// slots keeps a floor of its entries against a flood. That is not isolation: a
+/// source that arrives after the slots are taken, or that shares a label with a
+/// flooder, can be flushed, and every agent-token connection of the web bridge is
+/// ONE source, `(mcp, web-bridge)`. Labels are unauthenticated display strings;
+/// `origin` is authoritative. A call with no `limit` can return up to
+/// `DEFAULT_AUDIT_CAPACITY + DEFAULT_ROUTINE_AUDIT_CAPACITY` entries with the
+/// default lane sizes (both lanes full), so passing `limit` is advisable.
 struct AgentActivity(Arc<AuditRing>);
 
 impl Command for AgentActivity {
@@ -218,10 +235,15 @@ impl Command for AgentActivity {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "Recent command-invocation audit entries (who ran what, with what \
-                          redacted arguments, and the outcome), oldest first. Read-only and \
-                          readable by any role."
-                .to_string(),
+            description: format!(
+                "Recent command-invocation audit entries (who ran what, with what redacted \
+                 arguments, and the outcome), oldest first. A live view, not a complete \
+                 record: a high-volume source can flush other sources' entries. `origin` is \
+                 authoritative; `client_label` is an unauthenticated display string. A call \
+                 with no `limit` can return up to {} entries at the default sizes, so pass \
+                 `limit`. Read-only and readable by any role.",
+                DEFAULT_AUDIT_CAPACITY + DEFAULT_ROUTINE_AUDIT_CAPACITY
+            ),
             params: vec![
                 param(
                     "since",
@@ -243,7 +265,9 @@ impl Command for AgentActivity {
                     "client_label",
                     TypeDesc::Str,
                     false,
-                    "The client label, when one was declared.",
+                    "The client label: the server-minted `web-bridge` for the web bridge, \
+                     otherwise the client's declared `initialize.clientInfo.name`, sanitised to \
+                     at most 64 characters. Display-only; `origin` is authoritative.",
                 ),
                 param("command", TypeDesc::Str, true, "The dotted command name."),
                 param(

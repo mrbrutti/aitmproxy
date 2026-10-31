@@ -1,5 +1,6 @@
 // WebSocket bus client: one connection for calls and notifications, token as the first
-// message (mirrors LoopbackTcp's token line, §4.1), reconnect with back-off (§4.2 step 5).
+// message (mirrors LoopbackTcp's token line, §4.1), reconnect with back-off (§4.2 step 5),
+// `flow.subscribe` on every open before the bus is marked open (web-ui-bus-push D1).
 
 import { createSignal } from 'solid-js';
 import {
@@ -24,6 +25,11 @@ export interface WsBusOptions {
   expect?: BusRole | null;
   /** Back-off schedule in ms; the last value repeats. */
   backoff?: number[];
+  /**
+   * How long an open waits for the `flow.subscribe` reply before opening without it (default 3000).
+   * Only a server that swallows unknown calls ever runs the clock out.
+   */
+  subscribeTimeoutMs?: number;
 }
 
 interface Pending {
@@ -34,6 +40,7 @@ interface Pending {
 
 export function createWsBus(opts: WsBusOptions): BusClient {
   const backoff = opts.backoff ?? [250, 500, 1000, 2000, 5000];
+  const subscribeTimeoutMs = opts.subscribeTimeoutMs ?? 3000;
   const [state, setState] = createSignal<BusState>('idle');
   const [lastError, setLastError] = createSignal<string | null>(null);
   const [role, setRole] = createSignal<BusRole | null>(null);
@@ -103,6 +110,34 @@ export function createWsBus(opts: WsBusOptions): BusClient {
     pending.clear();
   }
 
+  /**
+   * Subscribe this connection to flow/agent pushes (`flow.subscribe {}`), awaited before the bus is
+   * marked open so the stream exists before the bootstrap `flow.list` goes out (the bridge runs
+   * frames concurrently; only an awaited reply orders them). Goes through `request`, not
+   * `client.call`, which awaits `ready` and would deadlock here. Never throws: a refusal (`isError`),
+   * an unknown-tool error, a closed socket and a silent server all resolve, the bus opens, and the
+   * poll loop covers the missing stream. A timed-out request is dropped from `pending` so a late
+   * reply is ignored.
+   */
+  async function subscribeOnOpen(): Promise<void> {
+    const id = nextId; // `request` takes this id synchronously; kept so the timeout can drop its entry
+    const reply = request<ToolCallResult>('tools/call', { name: 'flow.subscribe', arguments: {} });
+    let expire: () => void = () => {};
+    const timedOut = new Promise<void>((r) => (expire = r));
+    const subscribeTimer = setTimeout(() => {
+      pending.delete(id);
+      expire();
+    }, subscribeTimeoutMs);
+    await Promise.race([
+      reply.then(
+        () => undefined,
+        () => undefined,
+      ),
+      timedOut,
+    ]);
+    clearTimeout(subscribeTimer);
+  }
+
   function onMessage(ev: MessageEvent) {
     const text = typeof ev.data === 'string' ? ev.data : '';
     // The bridge may batch several newline-delimited lines in one frame.
@@ -114,8 +149,20 @@ export function createWsBus(opts: WsBusOptions): BusClient {
       } catch {
         continue;
       }
+      // `JSON.parse` also yields `null`, arrays and bare scalars; none is a message, and `null` would
+      // throw on the property reads below, outside the handler try/catch, and lose the rest of the frame.
+      if (!msg || typeof msg !== 'object' || Array.isArray(msg)) continue;
       if (typeof msg.method === 'string' && msg.id === undefined) {
-        for (const h of handlers) h(msg.method, msg.params);
+        for (const h of handlers) {
+          // A handler is the store's code. One that throws must not take the other handlers down, nor
+          // the rest of this frame (it may carry the subscribe reply or a call's reply). Swallowed: this
+          // client has no log, and the store's poll loop re-reads whatever the notification was about.
+          try {
+            h(msg.method, msg.params);
+          } catch {
+            // see above
+          }
+        }
         continue;
       }
       if (typeof msg.id === 'number') {
@@ -161,6 +208,10 @@ export function createWsBus(opts: WsBusOptions): BusClient {
         // treated as "role unknown" (null), never asserted as a role.
         setRole(asRole(info?.role));
         send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+        await subscribeOnOpen();
+        // The socket may have closed, or the user closed the bus, while the subscribe was pending.
+        // `onclose` has already scheduled the reconnect (or marked us closed): do not open this one.
+        if (closedByUser || ws !== sock || sock.readyState !== WebSocket.OPEN) return;
         attempt = 0;
         setLastError(null);
         setState('open');

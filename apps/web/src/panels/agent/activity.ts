@@ -1,5 +1,6 @@
-// Activity-log logic (foundation §2.7 "Agent toggle", §4.8): origin labels, the compact args
-// summary, and the All / Agent / Human / Errors filters. Pure, so the table stays a thin view.
+// Activity-log view logic (foundation §2.7 "Agent toggle", §4.8): origin labels, the compact args
+// summary, the All / Agent / Human / Errors filters. Pure, so the table stays a thin view. The rule
+// that drops the UI's own polling before a line reaches the log is `bus/noise.ts`.
 
 import type { ActivityEntry, AgentPolicy } from '~/state/app';
 

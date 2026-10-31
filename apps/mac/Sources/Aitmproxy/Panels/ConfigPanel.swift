@@ -56,7 +56,7 @@ struct ConfigPanel: View {
             Spacer()
             FlatButton("Reload", symbol: "arrow.clockwise") { load() }
         }
-        .padding(.horizontal, Space.md)
+        .padding(.horizontal, Space.margin)
         .frame(height: Tok.Size.inspectorHeader)
     }
 

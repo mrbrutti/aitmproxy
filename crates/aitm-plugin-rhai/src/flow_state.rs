@@ -186,6 +186,7 @@ impl FlowState {
                     status,
                     version,
                     headers: header_map(headers),
+                    trailers: HeaderMap::new(),
                     body: Body::Bytes(body),
                     timestamp: SystemTime::now(),
                 }),
