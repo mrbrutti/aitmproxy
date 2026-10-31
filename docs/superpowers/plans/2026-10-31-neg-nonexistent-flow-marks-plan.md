@@ -52,7 +52,7 @@ with Task 2's report as an input (Architect's call; stage not skipped).
 - **Satisfies:** AC1, AC2 (green side), AC3, AC4, AC7
 - **Depends on:** Task 1
 - **Files:** throwaway `tests/e2e/neg/test_zz_inject_leak_mark.py`, `..._wipe_mark.py`, `..._leak_comment.py`, `..._leak_mutation.py` (create, run, delete; never committed)
-- **Change:** each copy is the final test plus one inserted block immediately before `detail_after = rd.call("flow.detail", ...)`, acting on `real_id` over a Write-capable connection: F1 `flow.mark` with `[BARRAGE_MARK]`; F2 a sentinel `flow.mark` inserted before `detail_before`, then after the barrage `flow.mark` with a list not containing the sentinel or `BARRAGE_MARK`; F3 `flow.comment` with text `"injected"`; F4 `flow.mutate` with a response edit (e.g. `{"status": 418}`; Tester's call, it must change `flow.detail`).
+- **Change:** each copy is the final test plus one inserted block immediately before `detail_after = rd.call("flow.detail", ...)`, acting on `real_id` over a Write-capable connection: F1 `flow.mark` with `[BARRAGE_MARK]`; F2 a sentinel `flow.mark` inserted before `detail_before`, then after the barrage `flow.mark` with a list not containing the sentinel or `BARRAGE_MARK`; F3 `flow.comment` with text `"injected"`; F4 `flow.mutate` with a request header edit `{"headers": {"x-e2e-injected": "1"}}` (a response `status` edit is refused on a completed flow; Tester's call, it must change `flow.detail`).
 - **Test (literal expectations, run in the Terminal):**
   - AC1: `python3 tests/e2e/run.py --shared-core web audit neg` -> exit 0; `neg/test_nonexistent_flow_error` PASS; no SKIP for `audit`/`neg`.
   - AC7: `python3 tests/e2e/run.py --shared-core neg` three times, exit 0 each.

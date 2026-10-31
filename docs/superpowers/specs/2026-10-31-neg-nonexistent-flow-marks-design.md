@@ -95,7 +95,7 @@ control flow. Rejected for this fix; AC3 covers the wipe case instead.
    - F1 leaked barrage mark (`flow.mark` with the barrage label): prefix (i).
    - F2 wiped mark (seed a sentinel mark before `detail_before`; after the barrage `flow.mark` with a different list): prefix (ii).
    - F3 leaked comment (`flow.comment`): prefix of check 1.
-   - F4 leaked mutation (`flow.mutate` on the response): prefix of check 1.
+   - F4 leaked mutation (`flow.mutate` with a request header edit; a response `status` edit is refused on a completed flow, `crates/aitm-plugins/src/mutate.rs`): prefix of check 1.
 4. AC4: `git diff --stat main` lists only the test, this spec, and the plan; nothing under `crates/`, `scripts/`, or `tests/e2e/run.py`; no throwaway file remains.
 5. AC5: `python3 -m py_compile tests/e2e/neg/test_nonexistent_flow_error.py` passes. No Rust changed, so the Rust gate (`cargo fmt/clippy/test`) is not required; the e2e build in AC1 is the only cargo step.
 6. AC6: the test file contains none of `missing-nosniff`, `version-disclosure` (`grep -c` is 0) and adds no `time.sleep` or polling loop beyond the existing `SETTLE_S` sleep.
