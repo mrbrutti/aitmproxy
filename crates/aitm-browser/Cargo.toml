@@ -24,6 +24,14 @@ tracing.workspace = true
 # URL authority parsing for the SSRF guard (already in the tree via chromiumoxide).
 url = "2"
 
+# `kill(pid, None)` null-signal liveness probe for reaping stale obscura run dirs
+# whose owning `aitm` is provably dead (D1) — never a process scan. `nix` wraps the
+# one unsafe libc call, so this crate keeps the workspace `unsafe_code = "forbid"`
+# with no local `unsafe`. Already in the tree transitively; declared here as a
+# direct, unix-gated dependency with only the `signal` feature.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
 
