@@ -18,6 +18,15 @@
 //! safe to write (an absolute path, a parent no other user can replace the file
 //! in, a regular file with a single name, mode `0600`) and starts it with a
 //! `start` marker.
+//!
+//! [`start`] is the boot. It resolves the `mcp.audit_log` setting (`Off` starts
+//! nothing and creates nothing), refuses a configuration in which a stream file
+//! would be the CA audit log, opens each stream under the boot policy (a path the
+//! operator named that cannot be used fails the boot; the default path starts
+//! degraded and says so once per stream), registers every secret the process
+//! holds with the writer's [`SecretRegistry`], attaches the writer to the shared
+//! ring and says one line. The [`AuditLogHandle`] it returns reaches the running
+//! writer: its registry, its health and its shutdown.
 
 use std::fmt;
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -29,7 +38,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use aitm_core::{AuditEntry, AuditLane, DurableAudit, DurableAuditStatus, Frontend};
+use aitm_core::{
+    AuditEntry, AuditLane, AuditLogSetting, AuditRing, Config, DurableAudit, DurableAuditStatus,
+    Frontend, McpTransport,
+};
 use tracing::{info, warn};
 
 mod registry;
@@ -632,10 +644,8 @@ fn shift_rotated_files(path: &Path, keep: usize) -> io::Result<()> {
 }
 
 /// The real [`Backend`]: files on disk, opened and hardened by [`preflight`].
-#[allow(dead_code)] // used from Task W11
 struct FsBackend;
 
-#[allow(dead_code)] // used from Task W11
 impl Backend for FsBackend {
     fn open(&mut self, path: &Path, stream: StreamKind) -> io::Result<Box<dyn LogFile>> {
         let file: Box<dyn LogFile> = Box::new(preflight(path, stream)?);
@@ -705,29 +715,29 @@ struct StreamSpec {
 /// uses [`Tuning::production`]; tests shorten an interval or a cap instead of
 /// sleeping for it.
 #[derive(Debug, Clone)]
-struct Tuning {
+#[doc(hidden)]
+pub struct Tuning {
     /// Entries each stream's queue holds, indexed by [`StreamKind::index`].
-    queue: [usize; 3],
+    pub(crate) queue: [usize; 3],
     /// Size at which each stream's file rotates.
-    cap_bytes: [u64; 3],
+    pub(crate) cap_bytes: [u64; 3],
     /// Rotated files each stream keeps.
-    keep: [usize; 3],
+    pub(crate) keep: [usize; 3],
     /// How often a stream checks that its path still names its file.
-    recheck: Duration,
+    pub(crate) recheck: Duration,
     /// How soon a failed stream tries to reopen its file.
-    reopen: Duration,
+    pub(crate) reopen: Duration,
     /// How soon a stream retries a rotation that failed.
-    rotate_retry: Duration,
+    pub(crate) rotate_retry: Duration,
     /// How often a repeated failure is logged again.
-    warn_every: Duration,
+    pub(crate) warn_every: Duration,
 }
 
 impl Tuning {
     /// The spec's constants: the per-stream limits of [`StreamKind`], a re-check
     /// every 5 s, a reopen after 1 s, a rotation retry after 60 s and one log
     /// line per failure kind per 60 s.
-    #[allow(dead_code)] // used from Task W11
-    fn production() -> Tuning {
+    pub fn production() -> Tuning {
         Tuning {
             queue: StreamKind::ALL.map(StreamKind::queue_capacity),
             cap_bytes: StreamKind::ALL.map(StreamKind::max_bytes),
@@ -736,6 +746,17 @@ impl Tuning {
             reopen: Duration::from_secs(1),
             rotate_retry: Duration::from_secs(60),
             warn_every: Duration::from_secs(60),
+        }
+    }
+
+    /// These numbers with every stream's size cap set to `bytes`: a test that
+    /// wants a file to rotate after a few lines asks for a small one. Nothing
+    /// else changes.
+    #[doc(hidden)]
+    pub fn with_cap_bytes(self, bytes: u64) -> Tuning {
+        Tuning {
+            cap_bytes: [bytes; 3],
+            ..self
         }
     }
 }
@@ -1392,13 +1413,16 @@ pub struct AuditLogWriter {
     /// The streams' threads until a shutdown takes them, so `shutdown` works
     /// through `&self`.
     threads: Mutex<Vec<JoinHandle<()>>>,
+    /// The secrets the writer masks by value (spec Design 14.4). Empty until
+    /// `start` registers the configured ones; the stream threads do not mask with
+    /// it yet.
+    registry: Arc<SecretRegistry>,
 }
 
 impl AuditLogWriter {
     /// Starts the three stream threads over `specs` (in [`StreamKind::ALL`]
     /// order). Fails only when a thread cannot be spawned; the threads started
     /// before it end by themselves.
-    #[allow(dead_code)] // used from Task W11
     fn from_specs(specs: [StreamSpec; 3], tuning: Tuning) -> io::Result<AuditLogWriter> {
         let [control, agent, reads] = specs;
         let (control, control_thread) = spawn_stream(StreamKind::Control, control, &tuning)?;
@@ -1407,7 +1431,13 @@ impl AuditLogWriter {
         Ok(AuditLogWriter {
             streams: [control, agent, reads],
             threads: Mutex::new(vec![control_thread, agent_thread, reads_thread]),
+            registry: Arc::new(SecretRegistry::new()),
         })
+    }
+
+    /// The registry the writer masks with, empty at first.
+    pub fn registry(&self) -> &Arc<SecretRegistry> {
+        &self.registry
     }
 
     /// Flushes and stops the writer within `budget`: stops `record` taking
@@ -1536,6 +1566,301 @@ impl DurableAudit for AuditLogWriter {
     }
 }
 
+/// Where a secret came from, for the registry's warning about a short one: the
+/// label for the operator bridge token this process mints itself.
+const BRIDGE_TOKEN_SOURCE: &str = "web.operator_bridge_token";
+
+/// A variable of the process environment is taken for a secret when its name
+/// contains one of these (ASCII case-insensitively). `SSH_AUTH_SOCK` and `HOME`
+/// match none of them, deliberately: only names that say "secret" are masked by
+/// value, so the masking cannot rewrite ordinary text.
+const SECRET_ENV_FRAGMENTS: [&str; 10] = [
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+    "api_key",
+    "apikey",
+    "private_key",
+    "passphrase",
+    "access_key",
+];
+
+/// Whether the environment variable `name` looks like it holds a secret.
+fn is_secret_env_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    SECRET_ENV_FRAGMENTS
+        .iter()
+        .any(|fragment| lower.contains(fragment))
+}
+
+/// What `start` returns when the audit log is on: the way to reach the running
+/// writer. Clones share the writer and its registry. `Debug` prints the number
+/// of registered secrets and nothing else, and there is no `Display`.
+#[derive(Clone)]
+pub struct AuditLogHandle {
+    writer: Arc<AuditLogWriter>,
+    registry: Arc<SecretRegistry>,
+}
+
+impl fmt::Debug for AuditLogHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuditLogHandle")
+            .field("secrets", &self.registry.len())
+            .finish()
+    }
+}
+
+impl AuditLogHandle {
+    /// The registry the writer masks with.
+    pub fn registry(&self) -> &Arc<SecretRegistry> {
+        &self.registry
+    }
+
+    /// Registers `secret` (from the place `source` names) with the writer, which
+    /// masks it in every field it writes from now on.
+    pub fn register_secret(&self, source: &str, secret: &str) -> Registration {
+        self.registry.register(source, secret)
+    }
+
+    /// Mints the per-run operator bridge token (`web::generate_token`) and
+    /// registers it **before it returns**, so the token is never usable before it
+    /// is masked. The `aitm web` block of `main.rs` calls this (through
+    /// [`bridge_token`]) in place of `web::generate_token`.
+    pub fn generate_bridge_token(&self) -> String {
+        let token = crate::web::generate_token();
+        self.registry.register(BRIDGE_TOKEN_SOURCE, &token);
+        token
+    }
+
+    /// Flushes and stops the writer within `budget`; see
+    /// [`AuditLogWriter::shutdown`].
+    pub fn shutdown(&self, budget: Duration) -> ShutdownReport {
+        self.writer.shutdown(budget)
+    }
+
+    /// The writer's health, as the ring's sink reports it.
+    pub fn status(&self) -> DurableAuditStatus {
+        self.writer.status()
+    }
+}
+
+/// The operator bridge token: minted through the handle (so it is registered
+/// before the caller sees it) when the audit log is on, and by
+/// `web::generate_token` alone, registering nothing, when it is off. The one
+/// expression `main.rs` calls.
+pub fn bridge_token(handle: Option<&AuditLogHandle>) -> String {
+    match handle {
+        Some(handle) => handle.generate_bridge_token(),
+        None => crate::web::generate_token(),
+    }
+}
+
+/// Starts the durable audit log the configuration asks for, or says it is off.
+///
+/// `cfg.mcp.audit_log` decides: `Off` returns `Ok(None)` and touches nothing;
+/// anything else resolves a base path and starts the writer there, with the
+/// boot policy of [`start_at`] (a path set with `Path` is *explicit*). Every
+/// secret the process holds (the transport, operator and agent tokens, the web
+/// agent bridge token `web_token`, and each variable of `env` whose name looks
+/// like a secret) is registered with the writer before the sink is attached, so
+/// no entry can reach a file ahead of its registration. `env` is the process
+/// environment, injected so that a test supplies its own.
+pub fn start(
+    cfg: &Config,
+    ring: &Arc<AuditRing>,
+    web_token: Option<&str>,
+    env: &[(String, String)],
+) -> anyhow::Result<Option<AuditLogHandle>> {
+    start_tuned(cfg, ring, web_token, env, Tuning::production())
+}
+
+/// Starts the writer on `base` (the control stream's file; the other two sit
+/// beside it) and attaches it to `ring`, registering no secret.
+///
+/// The boot policy (spec Design 4): with `explicit` set (the operator named the
+/// path) a stream that cannot be used fails the boot with an error naming the
+/// path and the reason, before any thread is started; without it the stream
+/// starts degraded, one warning names the path and the reason, and the writer
+/// retries opening it. A relative `base` is unusable either way. A stream path
+/// equal to `ca_log` is an error in both modes, and nothing is created.
+///
+/// A ring takes one sink: a second writer for the same ring is an error.
+pub fn start_at(
+    ring: &Arc<AuditRing>,
+    base: &Path,
+    ca_log: &Path,
+    explicit: bool,
+) -> anyhow::Result<Option<AuditLogHandle>> {
+    start_core(
+        ring,
+        base,
+        ca_log,
+        explicit,
+        Tuning::production(),
+        Vec::new(),
+    )
+}
+
+/// [`start`] with the writer's numbers and intervals given: the seam a test uses
+/// to make a stream rotate after a few lines.
+#[doc(hidden)]
+pub fn start_tuned(
+    cfg: &Config,
+    ring: &Arc<AuditRing>,
+    web_token: Option<&str>,
+    env: &[(String, String)],
+    tuning: Tuning,
+) -> anyhow::Result<Option<AuditLogHandle>> {
+    let Some((base, explicit)) = boot_target(&cfg.mcp.audit_log) else {
+        return Ok(None);
+    };
+    let secrets = configured_secrets(cfg, web_token, env);
+    start_core(ring, &base, &cfg.ca.audit_log, explicit, tuning, secrets)
+}
+
+/// Where the writer starts for `setting` and whether the path is *explicit*
+/// (the operator named it, so an unusable one fails the boot); `None` when the
+/// log is off. Resolves a path and touches nothing.
+fn boot_target(setting: &AuditLogSetting) -> Option<(PathBuf, bool)> {
+    let base = setting.resolved_path()?;
+    Some((base, matches!(setting, AuditLogSetting::Path(_))))
+}
+
+/// Every secret the writer must mask from the first line: `(source label,
+/// value)`, an empty value skipped. A label names a place and never carries a
+/// value; an environment variable's is `env:<NAME>`.
+fn configured_secrets(
+    cfg: &Config,
+    web_token: Option<&str>,
+    env: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut secrets: Vec<(String, String)> = Vec::new();
+    let mut add = |label: &str, value: &str| {
+        if !value.is_empty() {
+            secrets.push((label.to_string(), value.to_string()));
+        }
+    };
+    match &cfg.mcp.transport {
+        McpTransport::LoopbackTcp { token, .. } | McpTransport::StreamableHttp { token, .. } => {
+            add("mcp.transport.token", token);
+        }
+        McpTransport::Stdio => {}
+    }
+    if let Some(token) = &cfg.mcp.operator_token {
+        add("mcp.operator_token", token);
+    }
+    if let Some(token) = &cfg.mcp.agent_token {
+        add("mcp.agent_token", token);
+    }
+    if let Some(token) = web_token {
+        add("web.agent_bridge_token", token);
+    }
+    for (name, value) in env {
+        if is_secret_env_name(name) {
+            add(&format!("env:{name}"), value);
+        }
+    }
+    secrets
+}
+
+/// One stream's file, opened and hardened by [`preflight`]. A path that cannot
+/// be used is an error when `explicit`; otherwise one warning names the path
+/// and the reason and the stream is returned without a file, to be retried.
+fn open_stream(kind: StreamKind, base: &Path, explicit: bool) -> anyhow::Result<StreamSpec> {
+    let path = stream_path(base, kind);
+    // A relative base gives a relative path, which `preflight` refuses before it
+    // touches anything.
+    let file: Option<Box<dyn LogFile>> = match preflight(&path, kind) {
+        Ok(file) => Some(Box::new(file)),
+        Err(error) if explicit => {
+            anyhow::bail!("{error}; fix mcp.audit_log (or AITM_AUDIT_LOG) or set it to off")
+        }
+        Err(error) => {
+            warn!(
+                target: "aitm::audit",
+                stream = kind.label(),
+                path = %path.display(),
+                error = %error,
+                "the audit log cannot be used; the writer starts degraded and retries opening it"
+            );
+            None
+        }
+    };
+    Ok(StreamSpec {
+        path,
+        backend: Box::new(FsBackend),
+        file,
+    })
+}
+
+/// The boot, in order: refuse a stream path that is the CA audit log; open each
+/// stream (control, agent, reads) under the boot policy; start the writer;
+/// register every secret; attach the sink; say one line when every stream is open.
+fn start_core(
+    ring: &Arc<AuditRing>,
+    base: &Path,
+    ca_log: &Path,
+    explicit: bool,
+    tuning: Tuning,
+    secrets: Vec<(String, String)>,
+) -> anyhow::Result<Option<AuditLogHandle>> {
+    for kind in StreamKind::ALL {
+        let path = stream_path(base, kind);
+        if path == ca_log {
+            anyhow::bail!(
+                "the {} stream of the audit log would be {}, which is ca.audit_log: the CA audit log and the general audit log are different logs and must not share a file; move mcp.audit_log or ca.audit_log",
+                kind.label(),
+                path.display()
+            );
+        }
+    }
+    let control = open_stream(StreamKind::Control, base, explicit)?;
+    let agent = open_stream(StreamKind::Agent, base, explicit)?;
+    let reads = open_stream(StreamKind::Reads, base, explicit)?;
+    let healthy = [&control, &agent, &reads]
+        .iter()
+        .all(|stream| stream.file.is_some());
+    let writer = match AuditLogWriter::from_specs([control, agent, reads], tuning) {
+        Ok(writer) => Arc::new(writer),
+        Err(error) if explicit => anyhow::bail!("{error}"),
+        Err(error) => {
+            warn!(
+                target: "aitm::audit",
+                error = %error,
+                "the audit writer could not be started; nothing is written to the audit log this run"
+            );
+            return Ok(None);
+        }
+    };
+    // Before the sink is attached: no entry can reach a file ahead of these.
+    for (source, secret) in &secrets {
+        writer.registry().register(source, secret);
+    }
+    if !ring.attach_durable(writer.clone()) {
+        // The writer started above is not the ring's sink: stop it.
+        let _ = writer.shutdown(SHUTDOWN_BUDGET);
+        anyhow::bail!(
+            "a durable audit sink is already attached to this audit ring; a ring takes one"
+        );
+    }
+    // One line, and only for a healthy start: a stream that could not be opened
+    // has already said so (a warning naming its file), and "on" beside that
+    // would be false comfort.
+    if healthy {
+        info!(
+            target: "aitm::audit",
+            path = %stream_path(base, StreamKind::Control).display(),
+            "durable audit log on"
+        );
+    }
+    Ok(Some(AuditLogHandle {
+        registry: Arc::clone(writer.registry()),
+        writer,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1545,7 +1870,9 @@ mod tests {
     use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, PoisonError};
     use std::time::{Duration, Instant};
 
-    use aitm_core::{AuditEntry, AuditResult, AuditRing, AuditSink};
+    use aitm_core::{
+        AuditEntry, AuditLogSetting, AuditResult, AuditRing, AuditSink, Config, McpTransport,
+    };
     use serde_json::Value;
 
     /// A unique scratch directory that removes itself on drop, including a
@@ -5709,5 +6036,873 @@ mod tests {
         assert_eq!(gap["from"], BASE_MS + 2);
         assert_eq!(gap["to"], BASE_MS + 50);
         assert!(!shared.degraded.load(Ordering::Relaxed), "recovered");
+    }
+
+    // ---- start, the handle and the boot policy (Task W11) --------------
+    //
+    // No test here resolves `AuditLogSetting::Default`: that would write to the
+    // operator's real config directory. Every start names a path under a
+    // scratch directory, and every config puts `ca.audit_log` there too.
+
+    /// A config whose audit log is `setting` and whose CA audit log is inside
+    /// `dir`, so nothing a test starts touches a directory of the operator's.
+    fn config_for(dir: &Scratch, setting: AuditLogSetting) -> Config {
+        let mut cfg = Config::default();
+        cfg.mcp.audit_log = setting;
+        cfg.ca.audit_log = dir.join("ca-audit.jsonl");
+        cfg
+    }
+
+    fn fresh_ring() -> Arc<AuditRing> {
+        Arc::new(AuditRing::new(8192))
+    }
+
+    /// Shuts `handle` down and fails the test when the flush did not finish.
+    fn flush(handle: &AuditLogHandle) {
+        let report = handle.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+    }
+
+    /// The names of everything directly inside `dir`, sorted.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+            .map(|entry| entry.expect("a directory entry").file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// What each line of `path` is: its `command` for an entry, its `marker`
+    /// for a marker.
+    fn line_shape(path: &Path) -> Vec<String> {
+        read_lines(path)
+            .iter()
+            .map(|line| {
+                line.get("command")
+                    .or_else(|| line.get("marker"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// 64 hexadecimal digits, as `web::generate_token` makes them.
+    fn is_bridge_token_shaped(token: &str) -> bool {
+        token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
+    /// AC5: a fresh start creates the missing directories `0700` and all three
+    /// files `0600`, and each file holds exactly one line: its `start` marker.
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_start_creates_private_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("fresh-start");
+        let base = dir.join("a").join("b").join("audit.jsonl");
+        let cfg = config_for(&dir, AuditLogSetting::Path(base.clone()));
+        let ring = fresh_ring();
+        let handle = start(&cfg, &ring, None, &[])
+            .expect("a usable explicit path starts")
+            .expect("an audit log is on");
+        flush(&handle);
+
+        let mode = |path: &Path| {
+            fs::metadata(path)
+                .map(|meta| meta.permissions().mode() & 0o777)
+                .unwrap_or(0)
+        };
+        let mut failures: Vec<String> = Vec::new();
+        for parent in [dir.join("a"), dir.join("a").join("b")] {
+            let got = mode(&parent);
+            if got != 0o700 {
+                failures.push(format!("{}: left: {got:o}, right: 700", parent.display()));
+            }
+        }
+        for kind in StreamKind::ALL {
+            let path = stream_path(&base, kind);
+            let got = mode(&path);
+            if got != 0o600 {
+                failures.push(format!("{}: left: {got:o}, right: 600", path.display()));
+            }
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            let lines: Vec<&str> = text.lines().collect();
+            if lines.len() != 1 {
+                failures.push(format!(
+                    "{}: left: {} lines, right: 1: {text:?}",
+                    path.display(),
+                    lines.len()
+                ));
+                continue;
+            }
+            let Ok(marker) = serde_json::from_str::<Value>(lines[0]) else {
+                failures.push(format!(
+                    "{}: the line is not JSON: {text:?}",
+                    path.display()
+                ));
+                continue;
+            };
+            let mut keys: Vec<&str> = marker
+                .as_object()
+                .map(|object| object.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            keys.sort_unstable();
+            if keys != ["at", "marker", "pid", "schema", "stream", "version"] {
+                failures.push(format!("{}: keys {keys:?}", path.display()));
+            }
+            if marker["marker"] != "start" || marker["schema"] != 1 {
+                failures.push(format!(
+                    "{}: not a schema 1 start: {marker}",
+                    path.display()
+                ));
+            }
+            if marker["stream"] != kind.label() {
+                failures.push(format!(
+                    "{}: left: {}, right: {:?}",
+                    path.display(),
+                    marker["stream"],
+                    kind.label()
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} row(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// AC6: a second start on the same path appends: the control file reads
+    /// `start, c1, c2, c3, start, c4, c5`, and nothing of the first run is lost.
+    #[test]
+    fn restart_appends_never_truncates() {
+        let dir = scratch("restart");
+        let base = dir.join("audit.jsonl");
+        let ca_log = dir.join("ca-audit.jsonl");
+
+        let ring = fresh_ring();
+        let first = start_at(&ring, &base, &ca_log, true)
+            .expect("the first start")
+            .expect("an audit log is on");
+        for (i, command) in ["c1", "c2", "c3"].into_iter().enumerate() {
+            ring.append_in(
+                AuditLane::Evidence,
+                entry(command, Frontend::Operator, 1 + i as u64),
+            );
+        }
+        flush(&first);
+
+        // A restart is a new process: a fresh ring takes its own sink.
+        let ring = fresh_ring();
+        let second = start_at(&ring, &base, &ca_log, true)
+            .expect("the second start")
+            .expect("an audit log is on");
+        for (i, command) in ["c4", "c5"].into_iter().enumerate() {
+            ring.append_in(
+                AuditLane::Evidence,
+                entry(command, Frontend::Operator, 10 + i as u64),
+            );
+        }
+        flush(&second);
+
+        assert_eq!(
+            line_shape(&base),
+            ["start", "c1", "c2", "c3", "start", "c4", "c5"]
+        );
+    }
+
+    /// AC9: an explicit path that cannot be used fails the boot and creates
+    /// nothing; the same path as a default starts degraded and counts every
+    /// entry as a write failure; a relative path is unusable either way.
+    #[test]
+    fn explicit_fails_the_boot_default_degrades() {
+        let dir = scratch("boot-policy");
+        let blocker = dir.join("F");
+        fs::write(&blocker, b"a regular file where a directory is needed")
+            .expect("write the blocking file");
+        let base = blocker.join("audit.jsonl");
+        let ca_log = dir.join("ca-audit.jsonl");
+
+        // Explicit: an error, nothing created, no sink.
+        let ring = fresh_ring();
+        let refused = start_at(&ring, &base, &ca_log, true);
+        assert!(
+            refused.is_err(),
+            "expected Err for an explicit unusable path, got {refused:?}"
+        );
+        assert_eq!(names_in(&dir.0), ["F"], "nothing was created");
+        assert!(ring.durable_status().is_none(), "no sink was attached");
+
+        // Default: it boots, degraded at once, and an entry counts as a failure.
+        let ring = fresh_ring();
+        let handle = match start_at(&ring, &base, &ca_log, false) {
+            Ok(Some(handle)) => handle,
+            other => panic!("expected Some for a default unusable path, got {other:?}"),
+        };
+        let status = ring
+            .durable_status()
+            .expect("a sink is attached although the path is unusable");
+        assert!(status.degraded, "degraded at once: {status:?}");
+        ring.append_in(AuditLane::Evidence, entry("lost", Frontend::Operator, 1));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                ring.durable_status()
+                    .is_some_and(|status| status.write_failures == 1)
+            }),
+            "the entry was not counted as a write failure: {:?}",
+            ring.durable_status()
+        );
+        let status = ring.durable_status().expect("the sink stays attached");
+        assert_eq!(status.write_failures, 1);
+        assert!(status.degraded, "still degraded: {status:?}");
+        flush(&handle);
+        assert_eq!(names_in(&dir.0), ["F"], "still nothing created");
+
+        // A relative path is unusable in both modes, and nothing is created
+        // relative to the working directory.
+        let relative_dir = format!("aitm-w11-relative-{}", std::process::id());
+        let relative = Path::new(&relative_dir).join("audit.jsonl");
+        let ring = fresh_ring();
+        let explicit = start_at(&ring, &relative, &ca_log, true);
+        let ring_default = fresh_ring();
+        let default = start_at(&ring_default, &relative, &ca_log, false);
+        let created = Path::new(&relative_dir).exists();
+        let _ = fs::remove_dir_all(&relative_dir);
+        assert!(
+            explicit.is_err(),
+            "expected Err for an explicit relative path, got {explicit:?}"
+        );
+        let Ok(Some(degraded)) = default else {
+            panic!("expected Some for a default relative path, got {default:?}");
+        };
+        assert!(
+            ring_default
+                .durable_status()
+                .is_some_and(|status| status.degraded),
+            "a relative default path starts degraded"
+        );
+        flush(&degraded);
+        assert!(!created, "{relative_dir}/ was created");
+    }
+
+    /// AC10: with the log off nothing is created and no sink is attached.
+    /// (Written before `start` existed, it passes against a stub that returns
+    /// `Ok(None)`; the other tests are what make `start` do anything.)
+    #[test]
+    fn off_creates_nothing() {
+        let dir = scratch("off");
+        let cfg = config_for(&dir, AuditLogSetting::Off);
+        let ring = fresh_ring();
+        let env = [("SERVICE_TOKEN".to_string(), "CNRYW11x0ff0ff01".to_string())];
+        let started = start(&cfg, &ring, Some("CNRYW11x0ff0ff02"), &env)
+            .expect("an audit log that is off is not an error");
+        assert!(started.is_none(), "expected no handle, got {started:?}");
+        assert_eq!(
+            names_in(&dir.0),
+            Vec::<String>::new(),
+            "the directory stays empty"
+        );
+        assert!(ring.durable_status().is_none(), "no sink is attached");
+    }
+
+    /// AC53: the operator bridge token is registered when it is minted, before
+    /// the caller sees it; with the audit off the fallback registers nothing.
+    #[test]
+    fn the_operator_bridge_token_is_registered_when_minted() {
+        let dir = scratch("bridge-token");
+        let ring = fresh_ring();
+        let handle = start_at(&ring, &dir.join("audit.jsonl"), &dir.join("ca.jsonl"), true)
+            .expect("start")
+            .expect("an audit log is on");
+        assert_eq!(handle.registry().len(), 0, "start registers nothing itself");
+
+        let mut failures: Vec<String> = Vec::new();
+        let first = handle.generate_bridge_token();
+        let second = handle.generate_bridge_token();
+        let through_fallback = bridge_token(Some(&handle));
+        for (row, token) in [
+            ("first", &first),
+            ("second", &second),
+            ("bridge_token(Some)", &through_fallback),
+        ] {
+            if !is_bridge_token_shaped(token) {
+                failures.push(format!("{row}: not 64 hex digits: {} bytes", token.len()));
+            }
+            let masked = handle.registry().mask(&format!("a {token} b"));
+            if masked != "a [redacted] b" {
+                failures.push(format!(
+                    "{row}: left: {masked:?}, right: \"a [redacted] b\""
+                ));
+            }
+        }
+        if first == second || first == through_fallback || second == through_fallback {
+            failures.push("two tokens were equal".to_string());
+        }
+        if handle.registry().len() != 3 {
+            failures.push(format!(
+                "left: {} secrets registered, right: 3",
+                handle.registry().len()
+            ));
+        }
+
+        // With the audit off (no handle) the same expression mints a token and
+        // registers nothing anywhere.
+        let before = handle.registry().len();
+        let plain = bridge_token(None);
+        if !is_bridge_token_shaped(&plain) {
+            failures.push(format!("bridge_token(None): {} bytes", plain.len()));
+        }
+        if handle.registry().len() != before {
+            failures.push("bridge_token(None) registered a token".to_string());
+        }
+        if handle.registry().mask(&plain) != plain {
+            failures.push("bridge_token(None) is masked by a handle it never met".to_string());
+        }
+        flush(&handle);
+        assert!(
+            failures.is_empty(),
+            "{} row(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// Five made-up secrets, one of them shorter than 8 bytes so that the
+    /// registry's short-secret warning fires. None is a prefix of another.
+    const SECRETS_51: [&str; 5] = [
+        "CNRY51x0badf001",
+        "CNRY51x0badf002",
+        "CNRY51x0badf003",
+        "CNRY51x0badf004",
+        "Q51x5",
+    ];
+
+    /// The log of one entry carrying every secret in every text field, written
+    /// to a file that fails: the stream's thread body runs on this thread so a
+    /// subscriber scoped to it sees the warning.
+    fn log_of_a_failing_write_carrying(secrets: &[&str]) -> String {
+        let (log, ()) = logged_until("WARN", || {
+            let state = FakeState::plain();
+            state.fail_next.store(1, Ordering::SeqCst);
+            let spec = StreamSpec {
+                path: PathBuf::from("/fake/w11-secrets/the-file.jsonl"),
+                backend: Box::new(FakeBackend(state.clone())),
+                file: Some(Box::new(FakeFile(state.clone()))),
+            };
+            let tuning = Tuning {
+                reopen: Duration::ZERO,
+                ..Tuning::production()
+            };
+            let shared = StreamShared::default();
+            let (tx, rx) = sync_channel(4);
+            let all = secrets.join(" ");
+            let carrying = AuditEntry {
+                client_label: Some(all.clone()),
+                connection_id: Some(all.clone()),
+                args_summary: format!("{{\"k\":\"{all}\"}}"),
+                result: AuditResult::Error(all.clone()),
+                ..entry(&all, Frontend::Mcp, BASE_MS)
+            };
+            shared.queued.fetch_add(1, Ordering::Relaxed);
+            tx.send(Msg::Entry(carrying)).expect("queue the entry");
+            tx.send(Msg::Close).expect("queue the close");
+            run_stream(rx, spec, &shared, StreamKind::Agent, &tuning);
+        });
+        log
+    }
+
+    /// AC51: no registered secret reaches a `Debug` text or a log line. The
+    /// registry's `Debug` is its count; the handle's and the writer's carry no
+    /// value; `start` and a failing write log no secret, a short one included.
+    /// (That nothing here has a `Display` is a grep: see the task's gate.)
+    #[test]
+    fn a_secret_never_appears_in_debug_display_or_logs() {
+        let dir = scratch("secret-hygiene");
+        let base = dir.join("audit.jsonl");
+        let (log, handle) = logged_until("WARN", || {
+            let mut cfg = config_for(&dir, AuditLogSetting::Path(base.clone()));
+            cfg.mcp.transport = McpTransport::LoopbackTcp {
+                port: 0,
+                token: SECRETS_51[0].to_string(),
+                endpoint_file: None,
+            };
+            cfg.mcp.operator_token = Some(SECRETS_51[1].to_string());
+            // The short one: the registry warns that this source is only
+            // partly covered, naming the source and never the value.
+            cfg.mcp.agent_token = Some(SECRETS_51[4].to_string());
+            let env = [("SERVICE_TOKEN".to_string(), SECRETS_51[3].to_string())];
+            let handle = start_tuned(
+                &cfg,
+                &fresh_ring(),
+                Some(SECRETS_51[2]),
+                &env,
+                Tuning::production(),
+            )
+            .expect("start")
+            .expect("an audit log is on");
+            flush(&handle);
+            handle
+        });
+        assert_eq!(handle.registry().len(), 5, "all five were registered");
+
+        let mut failures: Vec<String> = Vec::new();
+        let mut texts: Vec<(&str, String)> = vec![
+            ("the log of start", log.clone()),
+            ("registry", format!("{:?}", handle.registry())),
+            ("registry by value", format!("{:?}", **handle.registry())),
+            ("handle", format!("{handle:?}")),
+            ("writer", format!("{:?}", handle.writer)),
+            ("status", format!("{:?}", handle.status())),
+            (
+                "the log of a failing write",
+                log_of_a_failing_write_carrying(&SECRETS_51),
+            ),
+        ];
+        for secret in SECRETS_51 {
+            texts.push((
+                "a registration",
+                format!("{:?}", handle.register_secret("source", secret)),
+            ));
+        }
+        for (what, text) in &texts {
+            for secret in SECRETS_51 {
+                if text.contains(secret) {
+                    failures.push(format!("{what} contains a registered secret: {text}"));
+                }
+            }
+        }
+        // The shapes: the counts, and the warning about the short one.
+        let registry_debug = format!("{:?}", handle.registry());
+        if registry_debug != "SecretRegistry { secrets: 5 }" {
+            failures.push(format!("registry Debug: {registry_debug}"));
+        }
+        let handle_debug = format!("{handle:?}");
+        if handle_debug != "AuditLogHandle { secrets: 5 }" {
+            failures.push(format!("handle Debug: {handle_debug}"));
+        }
+        if !log.contains("WARN")
+            || !log.contains("mcp.agent_token")
+            || !log.contains("shorter than 8")
+        {
+            failures.push(format!("the short-secret warning is missing: {log}"));
+        }
+        let failing = log_of_a_failing_write_carrying(&SECRETS_51);
+        if !failing.contains("WARN") || !failing.contains("/fake/w11-secrets/the-file.jsonl") {
+            failures.push(format!("the failing write logged no warning: {failing}"));
+        }
+        assert!(
+            failures.is_empty(),
+            "{} row(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// Made up, like every canary in these tests; 8 bytes or more so that each
+    /// is masked as a substring.
+    const SRC_TRANSPORT: &str = "CNRYW11x1a2b3c01";
+    const SRC_OPERATOR: &str = "CNRYW11x1a2b3c02";
+    const SRC_AGENT: &str = "CNRYW11x1a2b3c03";
+    const SRC_WEB: &str = "CNRYW11x1a2b3c04";
+    const SRC_ENV: &str = "CNRYW11x1a2b3c05";
+    /// Values of variables whose names do not look like secrets.
+    const SRC_SOCK: &str = "/tmp/sock11xxxxxxxx";
+    const SRC_HOME: &str = "/home/u11xxxxxx";
+
+    /// The sources `start_tuned` registers, and the ones it leaves alone: the
+    /// transport token (either transport), `operator_token`, `agent_token`, the
+    /// web token argument and the secret-named variables of the injected
+    /// environment; not `SSH_AUTH_SOCK`, not `HOME`, and no empty value.
+    #[test]
+    fn start_registers_the_configured_sources() {
+        let dir = scratch("sources");
+        let transports = [
+            (
+                "loopback",
+                McpTransport::LoopbackTcp {
+                    port: 0,
+                    token: SRC_TRANSPORT.to_string(),
+                    endpoint_file: None,
+                },
+            ),
+            (
+                "streamable http",
+                McpTransport::streamable_http_default(SRC_TRANSPORT.to_string()),
+            ),
+        ];
+        let env: Vec<(String, String)> = [
+            ("GITHUB_TOKEN", SRC_ENV),
+            ("SSH_AUTH_SOCK", SRC_SOCK),
+            ("HOME", SRC_HOME),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .to_vec();
+
+        let mut failures: Vec<String> = Vec::new();
+        for (row, transport) in transports {
+            let base = dir.join(&row.replace(' ', "-")).join("audit.jsonl");
+            let mut cfg = config_for(&dir, AuditLogSetting::Path(base));
+            cfg.mcp.transport = transport;
+            cfg.mcp.operator_token = Some(SRC_OPERATOR.to_string());
+            cfg.mcp.agent_token = Some(SRC_AGENT.to_string());
+            let handle = start_tuned(
+                &cfg,
+                &fresh_ring(),
+                Some(SRC_WEB),
+                &env,
+                Tuning::production(),
+            )
+            .expect("start")
+            .expect("an audit log is on");
+            if handle.registry().len() != 5 {
+                failures.push(format!(
+                    "{row}: left: {} secrets, right: 5",
+                    handle.registry().len()
+                ));
+            }
+            for (name, secret) in [
+                ("transport token", SRC_TRANSPORT),
+                ("operator_token", SRC_OPERATOR),
+                ("agent_token", SRC_AGENT),
+                ("web token", SRC_WEB),
+                ("GITHUB_TOKEN", SRC_ENV),
+            ] {
+                let masked = handle.registry().mask(&format!("x {secret} y"));
+                if masked != "x [redacted] y" {
+                    failures.push(format!("{row}: {name}: left: {masked:?}, right: masked"));
+                }
+            }
+            for (name, value) in [("SSH_AUTH_SOCK", SRC_SOCK), ("HOME", SRC_HOME)] {
+                let text = format!("x {value} y");
+                let masked = handle.registry().mask(&text);
+                if masked != text {
+                    failures.push(format!("{row}: {name}: left: {masked:?}, right: {text:?}"));
+                }
+            }
+            flush(&handle);
+        }
+
+        // Nothing configured, or only empty values: nothing is registered.
+        let mut cfg = config_for(
+            &dir,
+            AuditLogSetting::Path(dir.join("empty").join("audit.jsonl")),
+        );
+        cfg.mcp.operator_token = Some(String::new());
+        cfg.mcp.agent_token = Some(String::new());
+        let env = [("EMPTY_TOKEN".to_string(), String::new())];
+        let handle = start_tuned(&cfg, &fresh_ring(), Some(""), &env, Tuning::production())
+            .expect("start")
+            .expect("an audit log is on");
+        if !handle.registry().is_empty() {
+            failures.push(format!(
+                "empty values: left: {} secrets, right: 0",
+                handle.registry().len()
+            ));
+        }
+        flush(&handle);
+
+        assert!(
+            failures.is_empty(),
+            "{} row(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// Which environment variable names are secret-looking: each of the ten
+    /// fragments, in any case; and the names that must stay out.
+    #[test]
+    fn secret_env_names_match_the_documented_fragments() {
+        let secret = [
+            "TOKEN",
+            "GITHUB_TOKEN",
+            "github_token",
+            "Service_Token_2",
+            "AWS_SECRET_ACCESS_KEY",
+            "CLIENT_SECRET",
+            "DB_PASSWORD",
+            "DB_PASSWD",
+            "SERVICE_CREDENTIALS",
+            "ANTHROPIC_API_KEY",
+            "VENDOR_APIKEY",
+            "SIGNING_PRIVATE_KEY",
+            "GPG_PASSPHRASE",
+            "AWS_ACCESS_KEY_ID",
+        ];
+        let plain = [
+            "SSH_AUTH_SOCK",
+            "HOME",
+            "PATH",
+            "EDITOR",
+            "RUST_LOG",
+            "AITM_AUDIT_LOG",
+            "KEYBOARD_LAYOUT",
+            "TERM",
+            "",
+        ];
+        let mut failures: Vec<String> = Vec::new();
+        for name in secret {
+            if !is_secret_env_name(name) {
+                failures.push(format!("{name:?}: left: false, right: true"));
+            }
+        }
+        for name in plain {
+            if is_secret_env_name(name) {
+                failures.push(format!("{name:?}: left: true, right: false"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} row(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// A healthy start says exactly one line: at `info`, on the audit target,
+    /// naming the control file; no token, label, count or other path.
+    #[test]
+    fn a_healthy_start_says_one_line_naming_the_control_file() {
+        let dir = scratch("one-line");
+        let base = dir.join("audit.jsonl");
+        let (log, ()) = logged_until("INFO", || {
+            let cfg = config_for(&dir, AuditLogSetting::Path(base.clone()));
+            let env = [("SERVICE_TOKEN".to_string(), SRC_TRANSPORT.to_string())];
+            let handle = start_tuned(
+                &cfg,
+                &fresh_ring(),
+                Some(SRC_OPERATOR),
+                &env,
+                Tuning::production(),
+            )
+            .expect("start")
+            .expect("an audit log is on");
+            flush(&handle);
+        });
+        let shown = base.display().to_string();
+        assert_eq!(log.lines().count(), 1, "exactly one line: {log}");
+        assert!(log.contains("INFO"), "at info: {log}");
+        assert!(log.contains("aitm::audit"), "on the audit target: {log}");
+        assert!(log.contains(&shown), "naming the control file: {log}");
+        for other in [
+            "audit.agent.jsonl",
+            "audit.reads.jsonl",
+            SRC_TRANSPORT,
+            SRC_OPERATOR,
+            "SERVICE_TOKEN",
+        ] {
+            assert!(!log.contains(other), "the line also carries {other}: {log}");
+        }
+    }
+
+    /// A default path that cannot be used does not stop the boot, and says
+    /// why: one warning per stream that could not be opened, on the audit
+    /// target, naming that stream's file and the reason, and no secret.
+    #[test]
+    fn a_default_path_that_cannot_be_used_warns_with_the_path_and_the_reason() {
+        let dir = scratch("degraded-warning");
+        let blocker = dir.join("F");
+        fs::write(&blocker, b"a regular file where a directory is needed")
+            .expect("write the blocking file");
+        let base = blocker.join("audit.jsonl");
+        let (log, handle) = logged_until("WARN", || {
+            let cfg = config_for(&dir, AuditLogSetting::Path(base.clone()));
+            // `start_at` with `explicit: false` is the default-path policy.
+            let ring = fresh_ring();
+            let handle = start_at(&ring, &base, &cfg.ca.audit_log, false)
+                .expect("a default path never fails the boot")
+                .expect("a writer is started degraded");
+            flush(&handle);
+            handle
+        });
+        let warns: Vec<&str> = log.lines().filter(|line| line.contains("WARN")).collect();
+        assert_eq!(warns.len(), 3, "one warning per failed stream: {log}");
+        assert_eq!(
+            log.lines().count(),
+            3,
+            "nothing but the warnings, in particular no \"audit log on\" line: {log}"
+        );
+        for kind in StreamKind::ALL {
+            let shown = stream_path(&base, kind).display().to_string();
+            let naming: Vec<&&str> = warns.iter().filter(|line| line.contains(&shown)).collect();
+            assert_eq!(naming.len(), 1, "one warning names {shown}: {log}");
+            assert!(
+                naming[0].contains("aitm::audit"),
+                "on the audit target: {log}"
+            );
+        }
+        // The reason is the operating system's, through the preflight's own text.
+        assert!(
+            warns.iter().all(|line| line.contains("audit log ")),
+            "each warning carries the preflight's reason: {log}"
+        );
+        assert!(handle.status().degraded, "the writer reports degraded");
+    }
+
+    /// One stream that cannot be used degrades alone: the other two are open
+    /// and written, one warning names the stream that is not, and the boot says
+    /// no "log on" line (it is not a healthy start).
+    #[test]
+    fn one_unusable_stream_degrades_alone() {
+        let dir = scratch("one-bad-stream");
+        let base = dir.join("audit.jsonl");
+        // A directory where the agent stream's file should be: refused.
+        fs::create_dir(dir.join("audit.agent.jsonl")).expect("make the blocking directory");
+        let ca_log = dir.join("ca-audit.jsonl");
+        let ring = fresh_ring();
+        let (log, handle) = logged_until("WARN", || {
+            // A fresh ring each attempt: a ring takes one sink.
+            let handle = start_at(&fresh_ring(), &base, &ca_log, false)
+                .expect("a default path never fails the boot")
+                .expect("a writer is started");
+            handle.shutdown(FLUSH_BUDGET);
+            handle
+        });
+        drop(handle);
+
+        let agent = dir.join("audit.agent.jsonl").display().to_string();
+        let warns: Vec<&str> = log.lines().filter(|line| line.contains("WARN")).collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "one warning, for the stream that failed: {log}"
+        );
+        assert!(warns[0].contains(&agent), "it names the agent file: {log}");
+        assert_eq!(log.lines().count(), 1, "and nothing else is said: {log}");
+
+        // The other streams work: an operator entry reaches the control file, and
+        // the writer as a whole reports degraded.
+        let handle = start_at(&ring, &base, &ca_log, false)
+            .expect("a default path never fails the boot")
+            .expect("a writer is started");
+        assert!(handle.status().degraded, "one stream is down: degraded");
+        ring.append_in(AuditLane::Evidence, entry("kept", Frontend::Operator, 1));
+        flush(&handle);
+        assert_eq!(entry_commands(&base), ["kept"], "the control stream wrote");
+    }
+
+    /// The sink is set once: a second writer for a ring that has one is an
+    /// error (the new writer is shut down), and the first goes on recording.
+    #[test]
+    fn a_ring_that_already_has_a_sink_refuses_a_second_writer() {
+        let dir = scratch("second-sink");
+        let ca_log = dir.join("ca-audit.jsonl");
+        let ring = fresh_ring();
+        let first = start_at(&ring, &dir.join("one.jsonl"), &ca_log, true)
+            .expect("the first writer")
+            .expect("an audit log is on");
+
+        let second = start_at(&ring, &dir.join("two.jsonl"), &ca_log, true);
+        let message = match &second {
+            Err(error) => format!("{error:#}"),
+            Ok(other) => panic!("expected an error for a second sink, got {other:?}"),
+        };
+        assert!(message.contains("already"), "the reason is said: {message}");
+
+        ring.append_in(AuditLane::Evidence, entry("kept", Frontend::Operator, 1));
+        flush(&first);
+        assert_eq!(entry_commands(&dir.join("one.jsonl")), ["kept"]);
+        assert_eq!(
+            entry_commands(&dir.join("two.jsonl")),
+            Vec::<String>::new(),
+            "the refused writer wrote no entry"
+        );
+    }
+
+    /// The setting decides where the writer starts and which boot policy
+    /// applies: `Off` starts nothing, a path the operator named is explicit, and
+    /// the default path is not. (The `Default` row resolves a path and creates
+    /// nothing: only `start` would.) Through `start`, an explicit path that
+    /// cannot be used fails the boot.
+    #[test]
+    fn the_setting_decides_the_boot_policy() {
+        let dir = scratch("setting-policy");
+        let named = dir.join("named.jsonl");
+        assert_eq!(boot_target(&AuditLogSetting::Off), None);
+        assert_eq!(
+            boot_target(&AuditLogSetting::Path(named.clone())),
+            Some((named, true))
+        );
+        let (default_path, explicit) =
+            boot_target(&AuditLogSetting::Default).expect("the default setting has a path");
+        assert!(!explicit, "the default path is not explicit");
+        assert_eq!(
+            default_path.file_name(),
+            Some("audit.jsonl".as_ref()),
+            "{default_path:?}"
+        );
+
+        let blocker = dir.join("F");
+        fs::write(&blocker, b"a regular file where a directory is needed")
+            .expect("write the blocking file");
+        let cfg = config_for(&dir, AuditLogSetting::Path(blocker.join("audit.jsonl")));
+        let started = start(&cfg, &fresh_ring(), None, &[]);
+        assert!(
+            started.is_err(),
+            "expected Err for a configured path that cannot be used, got {started:?}"
+        );
+        assert_eq!(names_in(&dir.0), ["F"], "nothing was created");
+    }
+
+    /// `with_cap_bytes` sets the three caps and nothing else.
+    #[test]
+    fn with_cap_bytes_sets_the_three_caps_and_nothing_else() {
+        let production = Tuning::production();
+        let tuned = Tuning::production().with_cap_bytes(4096);
+        assert_eq!(tuned.cap_bytes, [4096; 3]);
+        assert_eq!(tuned.queue, production.queue);
+        assert_eq!(tuned.keep, production.keep);
+        assert_eq!(tuned.recheck, production.recheck);
+        assert_eq!(tuned.reopen, production.reopen);
+        assert_eq!(tuned.rotate_retry, production.rotate_retry);
+        assert_eq!(tuned.warn_every, production.warn_every);
+    }
+
+    /// The tuning `start_tuned` is given reaches the streams: with a 512-byte
+    /// cap the agent file rotates, with the production cap it does not.
+    #[test]
+    fn a_tuned_start_rotates_at_the_tuned_cap() {
+        let dir = scratch("tuned-start");
+        let mut failures: Vec<String> = Vec::new();
+        for (row, tuning, rotates) in [
+            (
+                "a 512-byte cap",
+                Tuning::production().with_cap_bytes(512),
+                true,
+            ),
+            ("the production cap", Tuning::production(), false),
+        ] {
+            let base = dir.join(&row.replace(' ', "-")).join("audit.jsonl");
+            let cfg = config_for(&dir, AuditLogSetting::Path(base.clone()));
+            let ring = fresh_ring();
+            let handle = start_tuned(&cfg, &ring, None, &[], tuning)
+                .expect("start")
+                .expect("an audit log is on");
+            for i in 0..20_u64 {
+                ring.append_in(
+                    AuditLane::Evidence,
+                    entry(&format!("agent-call-{i}"), Frontend::Mcp, i),
+                );
+            }
+            flush(&handle);
+            let agent = stream_path(&base, StreamKind::Agent);
+            let first_rotated = rotated_path(&agent, 1);
+            if first_rotated.exists() != rotates {
+                failures.push(format!(
+                    "{row}: left: {} exists, right: {rotates}",
+                    first_rotated.display()
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} row(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 }

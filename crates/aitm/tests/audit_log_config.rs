@@ -10,15 +10,19 @@
 //!
 //! Task W3 adds AC3 (`stream_paths_follow_the_rule`): the three stream files are
 //! derived from the one configured base path.
+//!
+//! Task W11 adds AC4 (`a_stream_path_equal_to_the_ca_log_is_refused`): `start`
+//! refuses a configuration in which a stream file would be the CA audit log.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use aitm::audit_log::{stream_path, StreamKind};
+use aitm::audit_log::{self, stream_path, StreamKind};
 use aitm::config_file::parse;
 use aitm::env;
-use aitm_core::{AuditLogSetting, CaConfig, Config};
+use aitm_core::{AuditLogSetting, AuditRing, CaConfig, Config};
 use tracing_subscriber::fmt::MakeWriter;
 
 /// The `mcp.audit_log` the file parser produced, or the whole error chain.
@@ -278,6 +282,128 @@ fn stream_paths_follow_the_rule() {
     }
     if let Some(path) = AuditLogSetting::Off.resolved_path() {
         failures.push(format!("Off: left: Some({path:?}), right: None"));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} row(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// A unique scratch directory under the system temp directory that removes
+/// itself on drop (the crate has no `tempfile`). Unique per process, clock tick
+/// and call.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Scratch {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "aitm-audit-config-{tag}-{}-{nanos}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+        Scratch(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// The names of everything directly inside the directory, sorted.
+    fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&self.0)
+            .expect("read the scratch directory")
+            .map(|entry| entry.expect("a directory entry").file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// AC4: the general audit and the CA audit are different logs with different
+/// shapes and must never share a file. `start` refuses a configuration in which
+/// any of the three stream files is `ca.audit_log`, says so by name, and creates
+/// nothing; a different CA log is not a collision.
+#[test]
+fn a_stream_path_equal_to_the_ca_log_is_refused() {
+    let dir = Scratch::new("ca-collision");
+    let base = dir.path().join("audit.jsonl");
+    let rows = [
+        // The control stream is the base itself.
+        ("the control stream", dir.path().join("audit.jsonl")),
+        // A derived stream path collides the same way.
+        ("the reads stream", dir.path().join("audit.reads.jsonl")),
+        ("the agent stream", dir.path().join("audit.agent.jsonl")),
+    ];
+
+    let mut failures: Vec<String> = Vec::new();
+    for (row, ca_log) in rows {
+        let mut cfg = Config::default();
+        cfg.mcp.audit_log = AuditLogSetting::Path(base.clone());
+        cfg.ca.audit_log = ca_log.clone();
+        let ring = Arc::new(AuditRing::new(16));
+        match audit_log::start(&cfg, &ring, None, &[]) {
+            Err(err) => {
+                let text = format!("{err:#}");
+                if !text.contains("ca.audit_log") {
+                    failures.push(format!(
+                        "{row}: the error does not name ca.audit_log: {text}"
+                    ));
+                }
+                let shown = ca_log.display().to_string();
+                if !text.contains(&shown) {
+                    failures.push(format!("{row}: the error does not name {shown}: {text}"));
+                }
+            }
+            Ok(other) => failures.push(format!(
+                "{row}: left: Ok({other:?}), right: an error naming ca.audit_log"
+            )),
+        }
+        let left = dir.names();
+        if !left.is_empty() {
+            failures.push(format!("{row}: left: {left:?}, right: no file created"));
+        }
+        if ring.durable_status().is_some() {
+            failures.push(format!("{row}: a sink was attached to the ring"));
+        }
+    }
+
+    // The other side of the check: a CA log that is none of the three paths
+    // starts normally (so an `start` that always refused would not pass).
+    let mut cfg = Config::default();
+    cfg.mcp.audit_log = AuditLogSetting::Path(base.clone());
+    cfg.ca.audit_log = dir.path().join("ca-audit.jsonl");
+    let ring = Arc::new(AuditRing::new(16));
+    match audit_log::start(&cfg, &ring, None, &[]) {
+        Ok(Some(handle)) => {
+            let report = handle.shutdown(std::time::Duration::from_secs(5));
+            if !report.complete {
+                failures.push(format!(
+                    "a distinct CA log: the flush did not finish: {report:?}"
+                ));
+            }
+            if !base.is_file() {
+                failures.push("a distinct CA log: the control file was not created".to_string());
+            }
+        }
+        other => failures.push(format!(
+            "a distinct CA log: left: {other:?}, right: Ok(Some(handle))"
+        )),
     }
 
     assert!(
