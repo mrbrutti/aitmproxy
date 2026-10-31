@@ -119,6 +119,38 @@ public struct ClientInfo: Hashable, Sendable {
     }
 }
 
+/// `source_app` on the wire (spec 2026-10-31-ne-source-app-on-the-wire, D5): the signing
+/// identifier the capture backend observed for the process that opened the connection,
+/// turned into the client the sidebar's Apps group keys on.
+extension ClientInfo {
+    /// Identifiers whose last dotted component is not the app's name. Safari opens its
+    /// sockets from the WebKit networking process, so without the entry a Safari visit
+    /// would group as `Networking`. The raw identifier stays in `bundleID` either way.
+    public static let knownSourceApps: [String: String] = [
+        "com.apple.WebKit.Networking": "Safari",
+        "org.mozilla.firefox": "Firefox",
+    ]
+
+    /// The client for a flow whose `source_app` is `identifier`: the name from
+    /// `displayName(forSourceApp:)`, the default monogram (its first character), the
+    /// identifier as `bundleID`, no pid. Equal identifiers give equal clients, so
+    /// `Session.clients` counts them as one group.
+    public init(sourceApp identifier: String) {
+        self.init(name: ClientInfo.displayName(forSourceApp: identifier), bundleID: identifier)
+    }
+
+    /// The name shown for a source-app identifier: `knownSourceApps` first; else the text
+    /// after the last `.`, casing kept as sent (`com.apple.curl` → `curl`,
+    /// `com.apple.Safari` → `Safari`); with no `.`, or nothing after the last one
+    /// (`trailing.`), the whole identifier.
+    public static func displayName(forSourceApp identifier: String) -> String {
+        if let known = knownSourceApps[identifier] { return known }
+        guard let dot = identifier.lastIndex(of: ".") else { return identifier }
+        let tail = identifier[identifier.index(after: dot)...]
+        return tail.isEmpty ? identifier : String(tail)
+    }
+}
+
 /// One row of the flow list: everything the columns show. Fields the bus
 /// does not report yet (F5) are optional and render as a grey dash.
 public struct FlowRow: Identifiable, Hashable, Sendable {
