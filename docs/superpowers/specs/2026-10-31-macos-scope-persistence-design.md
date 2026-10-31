@@ -405,7 +405,11 @@ corresponding sentence above.
   default). Likewise, when the embedded core accepted the verb but the follow-up
   `scope.list` failed, the action throws `"Scope change applied but not saved:
   scope.list failed"` rather than reporting success over a stale file
-  (re-review Minor). The in-memory scope is unchanged either way.
+  (re-review Minor); if the operator switched Settings ▸ Bus to External inside
+  that round trip, it throws `"Scope change applied but not saved: the active
+  core changed"` for the same reason (wave-2 review Minor). A verb the embedded
+  core applied either reaches the file or is reported. The in-memory scope is
+  unchanged either way.
 - **D1, `save`.** `save` writes `sanitized(hosts)` (the file only ever holds
   what `load` keeps) and throws `EmbeddedScope.SaveError.tooLarge(bytes:)` when
   the encoded JSON would exceed the 1 MiB `load` cap, so a list the next launch
