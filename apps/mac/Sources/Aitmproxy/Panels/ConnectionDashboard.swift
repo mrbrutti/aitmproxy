@@ -341,7 +341,7 @@ private struct LatencyMini: View {
                 .frame(width: 36, alignment: .leading)
             GeometryReader { geo in
                 RoundedRectangle(cornerRadius: Tok.Radius.badge)
-                    .fill(Palette.accent)
+                    .fill(Tok.Ink.secondary.color)
                     .frame(width: max(2, geo.size.width * min(1, Self.seconds(value) / top)))
             }
             .frame(height: 8)

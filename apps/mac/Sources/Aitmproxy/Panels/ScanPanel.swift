@@ -524,10 +524,7 @@ struct ScanPointDetail: View {
         .frame(maxWidth: 320, alignment: .leading)
     }
 
-    private static let typeColors: [Color] = [
-        Tok.Mark.blue.color, Tok.Mark.green.color, Tok.Mark.orange.color,
-        Tok.Mark.purple.color, Tok.Mark.teal.color, Tok.Mark.pink.color,
-    ]
+    private static let typeColors: [Color] = ChartPalette.categorical
 
     private static func typeColor(_ index: Int) -> Color { typeColors[index % typeColors.count] }
 

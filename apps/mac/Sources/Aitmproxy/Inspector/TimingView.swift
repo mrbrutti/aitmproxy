@@ -103,10 +103,9 @@ private struct PhaseRow: View {
         .help(duration == nil ? "" : "Starts at \(Format.duration(start))")
     }
 
-    /// Each phase a distinct hue, waterfall-style (dns · connect · tls · wait · download).
-    private static let phaseColors: [Color] = [
-        Tok.Mark.purple.color, Tok.Mark.blue.color, Tok.Mark.green.color, Tok.Mark.orange.color, Tok.Mark.teal.color,
-    ]
+    /// Each phase a distinct hue, waterfall-style (dns · connect · tls · wait · download);
+    /// the shared categorical scale so a phase's colour matches its position elsewhere.
+    private static let phaseColors: [Color] = ChartPalette.categorical
 
     private static func color(for phase: FlowTiming.Phase) -> Color {
         let index = FlowTiming.Phase.allCases.firstIndex(of: phase) ?? 0
