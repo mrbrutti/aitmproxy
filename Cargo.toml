@@ -24,6 +24,7 @@ members = [
     "crates/aitm-testtarget",
     "crates/aitm-bus-client",
     "crates/aitm-tui",
+    "crates/aitm-peer-token",
     "crates/aitm",
 ]
 
@@ -72,3 +73,4 @@ aitm-testtarget = { path = "crates/aitm-testtarget" }
 aitm-bus-client = { path = "crates/aitm-bus-client" }
 aitm-tui = { path = "crates/aitm-tui" }
 aitm-plugin-scanner = { path = "crates/aitm-plugin-scanner" }
+aitm-peer-token = { path = "crates/aitm-peer-token" }
