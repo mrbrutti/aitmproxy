@@ -7,7 +7,7 @@
 //! `Command::invoke` against a `CommandHost` built from the attached services.
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -31,12 +31,30 @@ use crate::transport::{self, LoopbackTcp};
 /// are dropped and the connection is flagged `lagged`; replies are never bounded.
 pub const DEFAULT_PUSH_CAPACITY: usize = 4096;
 
+/// The default for [`McpServer::write_timeout`], which defines what the deadline
+/// bounds. At 30 s, one 16 MiB frame can still finish at about 0.53 MiB/s, far
+/// below any real reader.
+pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The most subscriptions one connection may hold at once (web-bus-push spec
 /// AC11). Each is a registry entry retained until `flow.unsubscribe` or the end
 /// of the connection, and every pushed event is matched against all of them
 /// under the registry lock, so an authenticated client must not be able to grow
-/// them without bound.
+/// them without bound. This bounds one connection only; opening many connections
+/// is bounded by [`MAX_SUBS_TOTAL`].
 const MAX_SUBS_PER_CONN: usize = 32;
+
+/// The most subscriptions the registry holds at once across all connections
+/// (bus-hardening spec D1), per `McpServer`. The registry's size drives the cost
+/// of every fan-out (flow events, state pushes, the per-tool-call audit line),
+/// all of which walk it under the registry lock, so a token-holder opening many
+/// connections must not be able to grow it without bound either. 4096 is 128
+/// connections at [`MAX_SUBS_PER_CONN`], far above real use, and keeps the
+/// registry under 10 MiB. A subscribe past it is refused, not evicting anyone;
+/// `flow.unsubscribe` or the end of a connection frees slots.
+const MAX_SUBS_TOTAL: usize = 4096;
+
+const _: () = assert!(MAX_SUBS_TOTAL >= MAX_SUBS_PER_CONN);
 
 /// The longest `filter.host` or `filter.method` a subscribe may carry, in bytes
 /// (web-bus-push spec AC11). A longer value is refused, never truncated: a
@@ -413,6 +431,9 @@ enum SubscribeRefused {
     Closed,
     /// The connection already holds `MAX_SUBS_PER_CONN` subscriptions.
     TooMany,
+    /// The registry already holds `MAX_SUBS_TOTAL` subscriptions across all
+    /// connections.
+    TableFull,
 }
 
 /// The per-server subscription registry. Subscriptions are keyed by an opaque
@@ -444,13 +465,17 @@ impl Subscriptions {
     }
 
     /// Register a subscription for `conn_id` (speaking as `role`) over `sink`;
-    /// returns its `sub_id`, or a refusal without registering: `Closed` when
-    /// `sink` is already closed, `TooMany` when the connection already holds
-    /// `MAX_SUBS_PER_CONN` subscriptions. Both checks run under the registry
-    /// lock. For `Closed` that means, with a transport that closes the sink
-    /// before `drop_connection`, a subscribe racing the teardown is either
-    /// refused here or swept by the pending drop; it cannot slip in between and
-    /// outlive its connection (web-bus-push spec D4).
+    /// returns its `sub_id`, or a refusal without registering. The checks run
+    /// in this order, all under the one registry lock: `Closed` when `sink` is
+    /// already closed, then `TooMany` when the connection already holds
+    /// `MAX_SUBS_PER_CONN` subscriptions, then `TableFull` when the registry
+    /// already holds `MAX_SUBS_TOTAL`. The per-connection cause comes before the
+    /// table one because it is the cause the client controls and can fix, and it
+    /// keeps its own text whatever the global load (bus-hardening spec D1).
+    /// For `Closed` that means, with a transport that closes the sink before
+    /// `drop_connection`, a subscribe racing the teardown is either refused here
+    /// or swept by the pending drop; it cannot slip in between and outlive its
+    /// connection (web-bus-push spec D4).
     fn add(
         &self,
         conn_id: u64,
@@ -465,6 +490,9 @@ impl Subscriptions {
         let held = st.subs.iter().filter(|s| s.conn_id == conn_id).count();
         if held >= MAX_SUBS_PER_CONN {
             return Err(SubscribeRefused::TooMany);
+        }
+        if st.subs.len() >= MAX_SUBS_TOTAL {
+            return Err(SubscribeRefused::TableFull);
         }
         st.next_sub += 1;
         let sub_id = st.next_sub;
@@ -496,10 +524,22 @@ impl Subscriptions {
     /// setting the sink's own overflow flag, because the next `drain` would write
     /// that flag while the policy is still muted and leak a bit under pause. The
     /// policy is read once, under the registry lock, so one snapshot covers every
-    /// subscription and the read is as late as it can be. `wants` is tested first,
-    /// so a connection is marked only when a line it would have received was
-    /// suppressed. A connection gets the line at most once per call, and a due
-    /// `lagged` marker precedes it.
+    /// subscription and the read is as late as it can be. A connection gets the line
+    /// at most once per call, and a due `lagged` marker precedes it.
+    ///
+    /// Ordering rule: `wants` is tested before any per-connection bookkeeping (the
+    /// `seen` insert and the `gapped` record), so a connection is recorded only for
+    /// a line it would have received. Recording first would let a non-matching
+    /// subscription mask a later matching one on the same connection, a silent
+    /// missed delivery.
+    ///
+    /// Cost under the lock: the once-per-call de-dup is a `HashSet`, so the `seen`
+    /// check is O(1) per subscription. The `gapped` bookkeeping is not: it is a
+    /// linear scan per connection delivered to or muted while any gap is recorded,
+    /// and a gap entry stays until that connection is next delivered a line or
+    /// ends. So a fan-out is O(subscriptions) under the lock only while no gap is
+    /// recorded. Converting `gapped` to a `HashSet` is a known follow-up (the
+    /// `gapped` scan in the bus-hardening spec's residuals).
     ///
     /// A mute stops new lines, not everything already in motion. These are accepted:
     ///
@@ -519,12 +559,11 @@ impl Subscriptions {
         let mut guard = self.lock();
         let muted = pushes_muted();
         let st = &mut *guard;
-        let mut seen: Vec<u64> = Vec::new();
+        let mut seen: HashSet<u64> = HashSet::new();
         for sub in &st.subs {
-            if seen.contains(&sub.conn_id) || !wants(sub) {
+            if !wants(sub) || !seen.insert(sub.conn_id) {
                 continue;
             }
-            seen.push(sub.conn_id);
             if muted && !sub.role.is_trusted_control() {
                 if !st.gapped.contains(&sub.conn_id) {
                     st.gapped.push(sub.conn_id);
@@ -963,6 +1002,8 @@ pub struct McpServer {
     push_tx: Option<broadcast::Sender<Event>>,
     /// Per-connection push-sink capacity (notification lines) before drop-oldest.
     push_capacity: usize,
+    /// The write deadline (see [`McpServer::write_timeout`]). Always at least 1 ms.
+    write_timeout: Duration,
     /// Monotonic source of per-connection ids, so each streaming connection's
     /// subscriptions can be dropped when it ends.
     conn_seq: Arc<AtomicU64>,
@@ -1029,6 +1070,7 @@ impl McpServer {
             subscriptions: Arc::new(Subscriptions::default()),
             push_tx: None,
             push_capacity: DEFAULT_PUSH_CAPACITY,
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
             conn_seq: Arc::new(AtomicU64::new(0)),
             dispatcher_spawned: AtomicBool::new(false),
             confirm_tokens: Arc::new(ConfirmTokens::default()),
@@ -1083,6 +1125,37 @@ impl McpServer {
     /// size a connection's sink when the caller did not inject one.
     pub fn push_capacity(&self) -> usize {
         self.push_capacity
+    }
+
+    /// Set the write deadline (see [`McpServer::write_timeout`] for what it
+    /// bounds). Stored clamped to at least 1 ms: a zero deadline would fail every
+    /// write at once. Defaults to [`DEFAULT_WRITE_TIMEOUT`].
+    pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = timeout.max(Duration::from_millis(1));
+        self
+    }
+
+    /// The write deadline a transport applies to its writes to a peer. This is
+    /// the one statement of what the deadline means; the transports refer here.
+    ///
+    /// It bounds each send on its own: one websocket frame on the web bridge, one
+    /// `write_all` or one `flush` on the line transport. It is not a budget for a
+    /// connection or for a batch of writes, and a transport reads it once, when
+    /// the connection starts.
+    ///
+    /// The clock stops when the socket has accepted the frame, not when the peer
+    /// has read it. A peer that keeps reading frees room in the socket buffers as
+    /// it goes, so its sends complete and it is not cut for being slow, unless it
+    /// reads a frame slower than the frame's size over the deadline (see
+    /// [`DEFAULT_WRITE_TIMEOUT`] for that rate). A peer that stops reading with
+    /// the buffers full leaves the next send pending until the deadline expires,
+    /// and the transport then ends the connection, so the peer cannot pin the
+    /// connection's task, its descriptor and its subscriptions.
+    ///
+    /// A stopped peer is noticed only when something is sent to it, and then
+    /// within one deadline. The deadline does not bound an idle connection.
+    pub fn write_timeout(&self) -> Duration {
+        self.write_timeout
     }
 
     /// Spawn this server's push dispatcher: one task that drains the core event
@@ -1144,7 +1217,10 @@ impl McpServer {
     /// Drop every subscription a connection held (called by the transport when
     /// the connection ends), and the record that it had a push suppressed while
     /// the agent policy was `paused` (see [`McpServer::push_flow_event`]), so the
-    /// per-connection gap set cannot outlive the connection.
+    /// per-connection gap set cannot outlive the connection. Close the connection's
+    /// sink first, then call this; see `Subscriptions::add`, which refuses a
+    /// subscribe on a closed sink and so makes that order the contract a transport
+    /// must follow (`serve_lines` and the web bridge's `ConnGuard` both do).
     pub fn drop_connection(&self, conn_id: u64) {
         self.subscriptions.drop_connection(conn_id);
     }
@@ -1326,6 +1402,7 @@ impl McpServer {
             subscriptions,
             push_tx,
             push_capacity,
+            write_timeout,
             conn_seq,
             dispatcher_spawned,
             confirm_tokens,
@@ -1352,6 +1429,7 @@ impl McpServer {
             subscriptions,
             push_tx,
             push_capacity,
+            write_timeout,
             conn_seq,
             dispatcher_spawned,
             confirm_tokens,
@@ -1584,8 +1662,8 @@ impl McpServer {
                 // not a command invocation, so it is not audited (pushing its own
                 // line back to the subscriber would be self-referential noise). A
                 // *refusal* (the agent blocked under `Paused`, a closed connection,
-                // the per-connection cap, an over-long filter) is audited like any
-                // refused command (RF#6).
+                // the per-connection cap, a full subscription table, an over-long
+                // filter) is audited like any refused command (RF#6).
                 if !is_subscription_verb(name) || is_error_result(&value) {
                     self.record_audit(conn, name, &arguments, &value);
                 }
@@ -2127,8 +2205,9 @@ impl McpServer {
     /// Register a subscription for this connection; optionally replay matching
     /// store entries after `since` before live events. Returns `{sub_id}`, or a
     /// tool error (and replays nothing) when a filter value is over-long, the
-    /// connection's sink is already closed, or the connection is at its
-    /// subscription cap.
+    /// connection's sink is already closed, the connection is at its
+    /// subscription cap, or the server's whole subscription table is full
+    /// (each refusal has its own text; see `Subscriptions::add` for the order).
     fn subscribe(
         &self,
         conn_id: u64,
@@ -2159,6 +2238,12 @@ impl McpServer {
                 return tool_error(format!(
                     "flow.subscribe refused: too many subscriptions on this connection (max \
                      {MAX_SUBS_PER_CONN}); flow.unsubscribe first"
+                ));
+            }
+            Err(SubscribeRefused::TableFull) => {
+                return tool_error(format!(
+                    "flow.subscribe refused: the server's subscription table is full (max \
+                     {MAX_SUBS_TOTAL} across all connections); try again later"
                 ));
             }
         };
@@ -2637,6 +2722,334 @@ mod tests {
     #[test]
     fn mcp_host_without_wiring_carries_no_posture() {
         assert_eq!(probe(&probe_server()), json!("absent"));
+    }
+
+    /// Bus-hardening AC7: a fresh server carries the 30 s default write deadline,
+    /// and the exported constant is that same 30 s.
+    #[test]
+    fn write_timeout_defaults_to_30_seconds() {
+        let srv = McpServer::new(Arc::new(Registry::new()), McpTransport::Stdio);
+        assert_eq!(srv.write_timeout(), Duration::from_secs(30));
+        assert_eq!(DEFAULT_WRITE_TIMEOUT, Duration::from_secs(30));
+    }
+
+    /// Bus-hardening AC7: `with_write_timeout` stores the value it is given, and
+    /// clamps zero up to 1 ms (a zero deadline would fail every write at once).
+    #[test]
+    fn with_write_timeout_sets_it_and_clamps_zero() {
+        let srv = McpServer::new(Arc::new(Registry::new()), McpTransport::Stdio)
+            .with_write_timeout(Duration::from_secs(7));
+        assert_eq!(srv.write_timeout(), Duration::from_secs(7));
+
+        let srv = McpServer::new(Arc::new(Registry::new()), McpTransport::Stdio)
+            .with_write_timeout(Duration::ZERO);
+        assert_eq!(srv.write_timeout(), Duration::from_millis(1));
+    }
+
+    /// Connections it takes to fill the registry at the per-connection cap.
+    const FULL_CONNECTIONS: u64 = 128;
+
+    /// Register `per_conn` unfiltered subscriptions for each id in `conn_ids`,
+    /// speaking as `role`, each connection on its own `NotificationSink::new(4)`.
+    /// Every add must succeed. Returns the sinks in `conn_ids` order.
+    fn add_connections(
+        reg: &Subscriptions,
+        role: Frontend,
+        conn_ids: impl IntoIterator<Item = u64>,
+        per_conn: usize,
+    ) -> Vec<NotificationSink> {
+        conn_ids
+            .into_iter()
+            .map(|conn_id| {
+                let sink = NotificationSink::new(4);
+                for n in 0..per_conn {
+                    let added = reg.add(conn_id, role, sink.clone(), FlowFilter::default());
+                    assert!(
+                        added.is_ok(),
+                        "connection {conn_id}, subscription {n}: {added:?}"
+                    );
+                }
+                sink
+            })
+            .collect()
+    }
+
+    /// A registry holding exactly `MAX_SUBS_TOTAL` subscriptions: connections
+    /// `1..=128` of `MAX_SUBS_PER_CONN` (32) each.
+    fn full_registry() -> (Subscriptions, Vec<NotificationSink>) {
+        let reg = Subscriptions::default();
+        let sinks = add_connections(
+            &reg,
+            Frontend::Operator,
+            1..=FULL_CONNECTIONS,
+            MAX_SUBS_PER_CONN,
+        );
+        assert_eq!(reg.lock().subs.len(), MAX_SUBS_TOTAL);
+        (reg, sinks)
+    }
+
+    /// `add` as an operator with no filter: the call shape every refusal test
+    /// below repeats.
+    fn add_unfiltered(
+        reg: &Subscriptions,
+        conn_id: u64,
+        sink: NotificationSink,
+    ) -> Result<u64, SubscribeRefused> {
+        reg.add(conn_id, Frontend::Operator, sink, FlowFilter::default())
+    }
+
+    /// A sink whose connection has already been torn down.
+    fn closed_sink() -> NotificationSink {
+        let sink = NotificationSink::new(4);
+        sink.close();
+        sink
+    }
+
+    /// The `sub_id` of the first subscription `conn_id` holds.
+    fn a_sub_id_of(reg: &Subscriptions, conn_id: u64) -> u64 {
+        reg.lock()
+            .subs
+            .iter()
+            .find(|s| s.conn_id == conn_id)
+            .map(|s| s.sub_id)
+            .unwrap_or_else(|| panic!("connection {conn_id} holds no subscription"))
+    }
+
+    /// Bus-hardening AC1 / D1: the registry holds at most 4096 subscriptions
+    /// across all connections. 128 connections at the per-connection cap fill it
+    /// (every add succeeds), and a 129th connection is refused `TableFull`
+    /// without growing it.
+    #[test]
+    fn the_table_cap_refuses_another_connection() {
+        assert_eq!(MAX_SUBS_TOTAL, 4096);
+        let (reg, _sinks) = full_registry();
+
+        assert_eq!(
+            add_unfiltered(&reg, FULL_CONNECTIONS + 1, NotificationSink::new(4)),
+            Err(SubscribeRefused::TableFull)
+        );
+        assert_eq!(
+            reg.lock().subs.len(),
+            4096,
+            "a refused add registers nothing"
+        );
+    }
+
+    /// Bus-hardening AC2 / D1: with the registry full the refusal precedence is
+    /// closed, then per-connection, then table. A closed sink is `Closed` even
+    /// for a connection that is also at its own cap; a connection at its cap is
+    /// `TooMany` even though the table is also full; a connection with room under
+    /// its own cap (fresh, or holding 31) gets `TableFull`.
+    #[test]
+    fn refusal_precedence_is_closed_then_per_connection_then_table() {
+        let (reg, _sinks) = full_registry();
+
+        // Connection 1 holds 32 and the table is full: every later check would
+        // fire, yet a closed sink is reported as `Closed`.
+        assert_eq!(
+            add_unfiltered(&reg, 1, closed_sink()),
+            Err(SubscribeRefused::Closed)
+        );
+        assert_eq!(
+            add_unfiltered(&reg, FULL_CONNECTIONS + 1, closed_sink()),
+            Err(SubscribeRefused::Closed)
+        );
+        // Open sink, connection 1 at its cap, table full: the cause the client
+        // controls wins.
+        assert_eq!(
+            add_unfiltered(&reg, 1, NotificationSink::new(4)),
+            Err(SubscribeRefused::TooMany)
+        );
+        // Open sink, connection with no subscriptions, table full.
+        assert_eq!(
+            add_unfiltered(&reg, FULL_CONNECTIONS + 1, NotificationSink::new(4)),
+            Err(SubscribeRefused::TableFull)
+        );
+
+        // A connection holding 31 (room under its own cap) is still refused by
+        // the table: move one slot from connection 1 to a new connection first.
+        let sub_id = a_sub_id_of(&reg, 1);
+        assert!(reg.remove(1, sub_id));
+        assert!(add_unfiltered(&reg, FULL_CONNECTIONS + 1, NotificationSink::new(4)).is_ok());
+        assert_eq!(
+            add_unfiltered(&reg, 1, NotificationSink::new(4)),
+            Err(SubscribeRefused::TableFull),
+            "connection 1 holds 31 of 32, so only the table can refuse it"
+        );
+        assert_eq!(reg.lock().subs.len(), MAX_SUBS_TOTAL);
+    }
+
+    /// Bus-hardening AC3 / D1: with the registry full, removing one subscription
+    /// frees exactly one slot: one more add succeeds and the next is refused.
+    #[test]
+    fn unsubscribe_frees_exactly_one_table_slot() {
+        let (reg, _sinks) = full_registry();
+        let sub_id = a_sub_id_of(&reg, 1);
+
+        assert!(reg.remove(1, sub_id), "the subscription existed");
+        assert_eq!(reg.lock().subs.len(), MAX_SUBS_TOTAL - 1);
+
+        assert!(
+            add_unfiltered(&reg, FULL_CONNECTIONS + 1, NotificationSink::new(4)).is_ok(),
+            "the freed slot is usable"
+        );
+        assert_eq!(
+            add_unfiltered(&reg, FULL_CONNECTIONS + 2, NotificationSink::new(4)),
+            Err(SubscribeRefused::TableFull),
+            "only one slot was freed"
+        );
+        assert_eq!(reg.lock().subs.len(), MAX_SUBS_TOTAL);
+    }
+
+    /// Bus-hardening AC3 / D1: ending a connection frees all of its table slots.
+    /// Dropping connection 1 (32 subscriptions) lets a new connection add 32, and
+    /// its 33rd is the per-connection refusal, not the table one.
+    #[test]
+    fn ending_a_connection_frees_its_table_slots() {
+        let (reg, _sinks) = full_registry();
+
+        reg.drop_connection(1);
+        assert_eq!(reg.lock().subs.len(), MAX_SUBS_TOTAL - MAX_SUBS_PER_CONN);
+
+        let sink = NotificationSink::new(4);
+        for n in 0..MAX_SUBS_PER_CONN {
+            assert!(
+                add_unfiltered(&reg, FULL_CONNECTIONS + 1, sink.clone()).is_ok(),
+                "add {n} fits in the 32 freed slots"
+            );
+        }
+        assert_eq!(
+            add_unfiltered(&reg, FULL_CONNECTIONS + 1, sink),
+            Err(SubscribeRefused::TooMany),
+            "the new connection is now at its own cap, which takes precedence"
+        );
+        assert_eq!(
+            add_unfiltered(&reg, FULL_CONNECTIONS + 2, NotificationSink::new(4)),
+            Err(SubscribeRefused::TableFull),
+            "and the table is full again"
+        );
+        assert_eq!(reg.lock().subs.len(), MAX_SUBS_TOTAL);
+    }
+
+    /// Bus-hardening AC4 / D1: through `handle_on`, a `flow.subscribe` on a full
+    /// table is a tool error with its own text (not the per-connection one), no
+    /// `structuredContent`, and registers nothing.
+    #[test]
+    fn a_full_table_refuses_flow_subscribe_with_its_own_text() {
+        let srv = McpServer::new(Arc::new(Registry::new()), McpTransport::Stdio);
+        // Pre-fill with other connections' ids, minted the way a transport does,
+        // so the connection under test is a different one.
+        let _sinks = add_connections(
+            &srv.subscriptions,
+            Frontend::Mcp,
+            (0..FULL_CONNECTIONS).map(|_| srv.next_conn_id()),
+            MAX_SUBS_PER_CONN,
+        );
+        assert_eq!(srv.subscriptions.lock().subs.len(), MAX_SUBS_TOTAL);
+
+        let conn = ConnCtx {
+            role: Frontend::Operator,
+            client_label: None,
+            conn_id: srv.next_conn_id(),
+            out: Some(NotificationSink::new(4)),
+        };
+        let req = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "flow.subscribe", "arguments": {}}});
+        let reply = srv
+            .handle_on(&conn, &req.to_string())
+            .expect("flow.subscribe replies");
+        let reply: JsonValue = serde_json::from_str(&reply).expect("the reply is JSON");
+
+        assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            "flow.subscribe refused: the server's subscription table is full (max 4096 across \
+             all connections); try again later"
+        );
+        assert!(
+            reply["result"].get("structuredContent").is_none(),
+            "no sub_id is minted for a refused subscribe: {reply}"
+        );
+        assert_eq!(
+            srv.subscriptions.lock().subs.len(),
+            MAX_SUBS_TOTAL,
+            "a refused subscribe registers nothing"
+        );
+    }
+
+    /// Bus-hardening AC5 / D2: `fanout_state` at the table cap (4096 connections
+    /// of one subscription each) reaches every connection exactly once.
+    #[test]
+    fn fanout_state_reaches_every_connection_once_at_the_table_cap() {
+        let reg = Subscriptions::default();
+        let sinks = add_connections(&reg, Frontend::Operator, 1..=MAX_SUBS_TOTAL as u64, 1);
+        assert_eq!(sinks.len(), 4096);
+
+        reg.fanout_state("state-line", &|| false);
+
+        for (i, sink) in sinks.iter().enumerate() {
+            assert_eq!(
+                sink.queued_len(),
+                1,
+                "connection {} got exactly one line",
+                i + 1
+            );
+        }
+        assert_eq!(sinks[0].drain(), vec!["state-line".to_string()]);
+    }
+
+    /// Bus-hardening AC5 / D2: `fanout_role(Operator, ..)` reaches each operator
+    /// connection once however many subscriptions it holds (3 here), and no
+    /// agent connection at all.
+    #[test]
+    fn fanout_role_reaches_only_that_role_once_per_connection() {
+        let reg = Subscriptions::default();
+        let operators = add_connections(&reg, Frontend::Operator, 1..=10, 3);
+        let agents = add_connections(&reg, Frontend::Mcp, 11..=20, 3);
+
+        reg.fanout_role(Frontend::Operator, "operator-line", &|| false);
+
+        for (i, sink) in operators.iter().enumerate() {
+            assert_eq!(
+                sink.queued_len(),
+                1,
+                "operator connection {} got exactly one line",
+                i + 1
+            );
+        }
+        for (i, sink) in agents.iter().enumerate() {
+            assert_eq!(
+                sink.queued_len(),
+                0,
+                "agent connection {} got nothing",
+                i + 11
+            );
+        }
+        assert_eq!(operators[0].drain(), vec!["operator-line".to_string()]);
+    }
+
+    /// Bus-hardening D2: `fanout_role` goes through the one
+    /// `Subscriptions::fanout`, which tests `wants` before it records the
+    /// connection as seen. This registry-level test pins that insert-after-`wants`
+    /// rule with a role-shaped `wants`; the same line that
+    /// `a_non_matching_subscription_does_not_mask_a_matching_one` in `tests/mcp.rs`
+    /// pins with a filter-shaped one. The real transports never mix roles on one
+    /// connection id, so the registry is driven directly: connection 1 holds an
+    /// agent subscription first and an operator one second, and an operator-only
+    /// line must still reach it, once.
+    #[test]
+    fn fanout_role_does_not_let_another_roles_subscription_mask_a_matching_one() {
+        let reg = Subscriptions::default();
+        let sink = NotificationSink::new(4);
+        for role in [Frontend::Mcp, Frontend::Operator] {
+            assert!(reg
+                .add(1, role, sink.clone(), FlowFilter::default())
+                .is_ok());
+        }
+
+        reg.fanout_role(Frontend::Operator, "operator-line", &|| false);
+
+        assert_eq!(sink.drain(), vec!["operator-line".to_string()]);
     }
 
     // ------------------- agent policy revocation: the read refusal and the gap record

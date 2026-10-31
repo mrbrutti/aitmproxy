@@ -22,385 +22,43 @@
 //! command-provider slot; `flow.list` is the real one. No browser, no network
 //! beyond loopback.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, SystemTime};
+// The `/bus` harness shared with the other `web_bus_*` suites.
+#[path = "support/web_bus.rs"]
+#[allow(dead_code)] // this suite uses a subset of the shared harness
+mod web_bus;
 
 use aitm::web::bridge::MAX_IN_FLIGHT;
-use aitm::web::{self, WebState};
-use aitm::wire::{assemble_with_scripts, Assembled, Features, ScriptWiring};
-use aitm_core::{
-    Command, CommandHost, Config, HttpFlow, HttpRequest, McpTransport, ParamSchema, Params, Plugin,
-    ProxyClient, Registry, Sensitivity, TypeDesc, Value,
-};
-use aitm_mcp::McpServer;
-use futures::future::BoxFuture;
-use futures::{SinkExt as _, StreamExt as _};
 use serde_json::{json, Value as JsonValue};
-use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use web_bus::{
+    call_line, drain_until_end, recv_json, send_text, wait_until, ws_connect, Server,
+    ServerOptions, TestCommands, Ws, AGENT_TOKEN, FAST, SETTLE,
+};
 
-const AGENT_TOKEN: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-/// Generous bound for anything that is expected to happen.
-const TIMEOUT: Duration = Duration::from_secs(10);
-/// Short bound for something that must happen while a sibling command is still
-/// parked: long enough for a loaded machine to serve one `flow.list` or notice a
-/// close, short enough that a bridge that waits for the command fails the test.
-const FAST: Duration = Duration::from_secs(5);
-/// How long a bridge that ignores the in-flight cap is given to start more
-/// commands before the cap is asserted.
-const SETTLE: Duration = Duration::from_millis(200);
-/// How long `test.sleep` holds its blocking thread.
-const SLEEP: Duration = Duration::from_millis(100);
-/// The most a parked `test.block` waits for the test to release it. The test
-/// releases it (a panicking test releases it on unwind); this only stops a wedged
-/// run from pinning the runtime's blocking pool at shutdown.
-const BLOCK_LIMIT: Duration = Duration::from_secs(30);
 /// The most request lines one frame may carry: the contract figure, the same as
 /// `MAX_BATCH_LEN` in the MCP HTTP transport, pinned here as a literal.
 const MAX_LINES_PER_FRAME: u64 = 256;
 
-fn temp_ca_dir(tag: &str) -> PathBuf {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("aitm-web-concurrency-{tag}-{nanos}-{n}"))
-}
-
-/// A `ProxyClient` nothing in these tests invokes.
-struct UnusedClient;
-impl ProxyClient for UnusedClient {
-    fn send(&self, _req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
-        Box::pin(async { anyhow::bail!("not called") })
-    }
-}
-
-/// What `test.block` parks on: a one-shot latch that stays open once opened, so
-/// any number of parked commands are released together, and a count of how many
-/// have started and finished.
-struct Parking {
-    open: Mutex<bool>,
-    opened: Condvar,
-    entered: AtomicUsize,
-    completed: AtomicUsize,
-}
-
-impl Parking {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            open: Mutex::new(false),
-            opened: Condvar::new(),
-            entered: AtomicUsize::new(0),
-            completed: AtomicUsize::new(0),
-        })
-    }
-
-    fn entered(&self) -> usize {
-        self.entered.load(Ordering::SeqCst)
-    }
-
-    fn completed(&self) -> usize {
-        self.completed.load(Ordering::SeqCst)
-    }
-
-    fn open(&self) {
-        // A poisoned latch is still a latch: open it so no command stays parked.
-        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
-        *open = true;
-        self.opened.notify_all();
-    }
-
-    /// Block the calling thread until the latch opens, or [`BLOCK_LIMIT`] passes.
-    fn park(&self) -> anyhow::Result<()> {
-        let open = self
-            .open
-            .lock()
-            .map_err(|_| anyhow::anyhow!("parking latch poisoned"))?;
-        let (_open, timed_out) = self
-            .opened
-            .wait_timeout_while(open, BLOCK_LIMIT, |open| !*open)
-            .map_err(|_| anyhow::anyhow!("parking latch poisoned"))?;
-        anyhow::ensure!(!timed_out.timed_out(), "test.block was never released");
-        Ok(())
-    }
-}
-
-/// Opens the latch on [`Release::release`] or when dropped, so a test that
-/// panics still wakes every parked blocking thread.
-struct Release(Arc<Parking>);
-
-impl Release {
-    fn release(&self) {
-        self.0.open();
-    }
-}
-
-impl Drop for Release {
-    fn drop(&mut self) {
-        self.0.open();
-    }
-}
-
-fn str_schema(description: &str) -> ParamSchema {
-    ParamSchema {
-        description: description.into(),
-        params: vec![],
-        result: TypeDesc::Str,
-    }
-}
-
-/// `test.block`: a synchronous `invoke` that parks until the test releases it.
-struct BlockCmd(Arc<Parking>);
-
-impl Command for BlockCmd {
-    fn name(&self) -> &str {
-        "test.block"
-    }
-    fn sensitivity(&self) -> Sensitivity {
-        Sensitivity::Read
-    }
-    fn schema(&self) -> ParamSchema {
-        str_schema("Parks until the test releases it.")
-    }
-    fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
-        self.0.entered.fetch_add(1, Ordering::SeqCst);
-        self.0.park()?;
-        self.0.completed.fetch_add(1, Ordering::SeqCst);
-        Ok(Value::Str("released".into()))
-    }
-}
-
-/// `test.sleep`: holds its blocking thread for [`SLEEP`], then replies.
-struct SleepCmd;
-
-impl Command for SleepCmd {
-    fn name(&self) -> &str {
-        "test.sleep"
-    }
-    fn sensitivity(&self) -> Sensitivity {
-        Sensitivity::Read
-    }
-    fn schema(&self) -> ParamSchema {
-        str_schema("Sleeps briefly, then replies.")
-    }
-    fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
-        std::thread::sleep(SLEEP);
-        Ok(Value::Str("slept".into()))
-    }
-}
-
-/// `test.tick`: counts its invocations, so a test can tell whether a line ran.
-struct TickCmd(Arc<AtomicUsize>);
-
-impl Command for TickCmd {
-    fn name(&self) -> &str {
-        "test.tick"
-    }
-    fn sensitivity(&self) -> Sensitivity {
-        Sensitivity::Read
-    }
-    fn schema(&self) -> ParamSchema {
-        str_schema("Counts one invocation, then replies.")
-    }
-    fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Ok(Value::Str("ticked".into()))
-    }
-}
-
-/// `test.panic`: a command that panics.
-struct PanicCmd;
-
-impl Command for PanicCmd {
-    fn name(&self) -> &str {
-        "test.panic"
-    }
-    fn sensitivity(&self) -> Sensitivity {
-        Sensitivity::Read
-    }
-    fn schema(&self) -> ParamSchema {
-        str_schema("Panics.")
-    }
-    fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
-        panic!("test.panic: deliberate panic in a command");
-    }
-}
-
-/// The test commands and the state a test reads back from them.
-#[derive(Clone)]
-struct TestCommands {
-    parking: Arc<Parking>,
-    ticks: Arc<AtomicUsize>,
-}
-
-impl TestCommands {
-    fn new() -> Self {
-        Self {
-            parking: Parking::new(),
-            ticks: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    /// The guard that releases `test.block`; hold it for the whole test.
-    fn release_guard(&self) -> Release {
-        Release(self.parking.clone())
-    }
-
-    fn ticks(&self) -> usize {
-        self.ticks.load(Ordering::SeqCst)
-    }
-}
-
-impl Plugin for TestCommands {
-    fn name(&self) -> &str {
-        "web-bus-concurrency-test"
-    }
-    fn load(&mut self, reg: &mut Registry) {
-        reg.add_command(Arc::new(BlockCmd(self.parking.clone())));
-        reg.add_command(Arc::new(SleepCmd));
-        reg.add_command(Arc::new(TickCmd(self.ticks.clone())));
-        reg.add_command(Arc::new(PanicCmd));
-    }
-}
-
-struct Server {
-    addr: std::net::SocketAddr,
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-/// A served `aitm web` over the real wired registry plus the test commands.
+/// A served `aitm web` over the real wired registry plus the test commands, set up
+/// for this suite: no operator token, only `test.block`, `test.sleep`, `test.tick`
+/// and `test.panic`, and the `McpServer`'s own default gate rather than the wired
+/// one the push suite uses.
 async fn start(tag: &str, commands: &TestCommands) -> Server {
-    let mut cfg = Config::default();
-    cfg.ca.dir = temp_ca_dir(tag);
-    let scripts = ScriptWiring {
-        commands: vec![Box::new(commands.clone())],
-        ..ScriptWiring::default()
-    };
-    let Assembled { proxy, .. } =
-        assemble_with_scripts(&cfg, &Features::default(), scripts).expect("assemble");
-    let client: Arc<dyn ProxyClient> = Arc::new(UnusedClient);
-    let mcp = McpServer::new(proxy.registry_arc(), McpTransport::Stdio).with_services(
-        proxy.store(),
-        client,
-        proxy.guard(),
-        None,
-    );
-    let state = Arc::new(WebState {
-        mcp: Arc::new(mcp),
-        agent_token: AGENT_TOKEN.to_owned(),
-        operator_token: None,
-        bad_token_throttle: Default::default(),
-    });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("local addr");
-    let task = tokio::spawn(web::serve(listener, state));
-    Server { addr, task }
-}
-
-type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
-
-async fn ws_connect(server: &Server) -> Ws {
-    let req = format!("ws://{}/bus", server.addr)
-        .into_client_request()
-        .expect("client request");
-    let (ws, _) = tokio::time::timeout(TIMEOUT, connect_async(req))
-        .await
-        .expect("handshake within the timeout")
-        .expect("handshake");
-    ws
-}
-
-async fn send_text(ws: &mut Ws, text: impl Into<String>) {
-    ws.send(Message::text(text.into())).await.expect("send");
-}
-
-/// The next text frame; `None` when the stream closed first.
-async fn recv_text(ws: &mut Ws) -> Option<String> {
-    loop {
-        let next = tokio::time::timeout(TIMEOUT, ws.next())
-            .await
-            .expect("frame within the timeout");
-        match next {
-            Some(Ok(Message::Text(t))) => return Some(t.to_string()),
-            Some(Ok(Message::Close(_))) | None => return None,
-            Some(Ok(_)) => continue,
-            Some(Err(WsError::ConnectionClosed)) | Some(Err(WsError::AlreadyClosed)) => {
-                return None
-            }
-            Some(Err(e)) => panic!("websocket error: {e}"),
-        }
-    }
-}
-
-async fn recv_json(ws: &mut Ws) -> JsonValue {
-    let text = recv_text(ws).await.expect("a text frame");
-    serde_json::from_str(&text).expect("reply is JSON")
-}
-
-/// Everything a socket yielded until its stream ended or a bound passed.
-struct Drained {
-    /// The text frames received before the end.
-    replies: Vec<String>,
-    /// The code of the Close frame, when the stream ended with one.
-    close_code: Option<CloseCode>,
-    /// The stream ended — a Close frame, end of stream, or a connection reset —
-    /// before the bound elapsed.
-    ended: bool,
-}
-
-/// Read until the stream ends or `bound` elapses. Unlike [`recv_text`] this
-/// treats any error as the end of the stream: the callers are waiting for the
-/// server to drop the connection, cleanly or not, and must not panic when it does.
-async fn drain_until_end(ws: &mut Ws, bound: Duration) -> Drained {
-    let deadline = tokio::time::Instant::now() + bound;
-    let mut out = Drained {
-        replies: Vec::new(),
-        close_code: None,
-        ended: false,
-    };
-    loop {
-        match tokio::time::timeout_at(deadline, ws.next()).await {
-            Err(_) => return out,
-            Ok(Some(Ok(Message::Text(text)))) => out.replies.push(text.to_string()),
-            Ok(Some(Ok(Message::Close(frame)))) => {
-                out.close_code = frame.map(|f| f.code);
-                out.ended = true;
-                return out;
-            }
-            Ok(Some(Ok(_))) => {}
-            Ok(Some(Err(_))) | Ok(None) => {
-                out.ended = true;
-                return out;
-            }
-        }
-    }
+    web_bus::start(
+        tag,
+        &commands.without_extras(),
+        ServerOptions {
+            operator_token: None,
+            wired_gate: false,
+            ..ServerOptions::default()
+        },
+    )
+    .await
 }
 
 /// The token line, as its own frame (the way the web client authenticates).
 fn token_line() -> String {
     json!({ "token": AGENT_TOKEN }).to_string()
-}
-
-/// A `tools/call` request line for `name` with no arguments.
-fn call_line(id: u64, name: &str) -> String {
-    json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
-           "params": {"name": name, "arguments": {}}})
-    .to_string()
 }
 
 /// One frame of `count` `tools/call` lines for `name` (ids `1..=count`), led by
@@ -412,7 +70,9 @@ fn call_frame(lead: Option<String>, count: u64, name: &str) -> String {
         .join("\n")
 }
 
-/// Open the bus: connect, send the token, and `initialize`.
+/// Open the bus: connect, send the token, and `initialize`. The `initialize` reply
+/// must be the first frame the server sends; the shared `web_bus::open_bus` skips
+/// ahead to it and checks the role echo instead, which is a different check.
 async fn open_bus(server: &Server) -> Ws {
     let mut ws = ws_connect(server).await;
     send_text(&mut ws, token_line()).await;
@@ -427,18 +87,6 @@ async fn open_bus(server: &Server) -> Ws {
     let init = recv_json(&mut ws).await;
     assert_eq!(init["id"], 0, "initialize reply: {init}");
     ws
-}
-
-/// Poll `cond` until it holds; panic after [`TIMEOUT`].
-async fn wait_until(what: &str, cond: impl Fn() -> bool) {
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    while !cond() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
 }
 
 #[tokio::test]
