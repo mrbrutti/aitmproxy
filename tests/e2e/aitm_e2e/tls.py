@@ -50,6 +50,21 @@ def curl_http_version(args, timeout: float = 20):
     return rc, out.decode().strip(), err
 
 
+def curl_code(args, timeout: float = 20):
+    """curl plus the HTTP status: returns (rc, http_code:int, body:str). Folded in
+    from the surface sessions' lib/seeded.py."""
+    rc, out, _ = curl([*args, "-o", "-", "-w", "\n__CODE__%{http_code}"], timeout=timeout)
+    body = out.decode("utf-8", "replace")
+    code = 0
+    if "__CODE__" in body:
+        body, _, c = body.rpartition("__CODE__")
+        try:
+            code = int(c.strip())
+        except ValueError:
+            code = 0
+    return rc, code, body
+
+
 def upstream_cert(work: str) -> tuple[str, str]:
     """A self-signed cert/key for a loopback TLS upstream (CN/SAN 127.0.0.1)."""
     key = os.path.join(work, "upstream.key")
