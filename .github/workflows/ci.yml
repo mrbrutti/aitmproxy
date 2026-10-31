@@ -44,10 +44,11 @@ jobs:
           fetch-depth: 0
 
       # Decide whether the Rust gate applies to this change. Site-only, docs-only,
-      # markdown-only and CI/workflow-only PRs cannot affect the Rust build, so they
-      # skip the heavy steps below (the job still reports success). Anything else —
-      # any .rs, Cargo.toml/lock, rust-toolchain, scripts, etc. — runs the full gate.
-      # Pushes to main and manual dispatches always run it.
+      # markdown-only, CI/workflow-only and design-lint-config-only (.impeccable/)
+      # PRs cannot affect the Rust build, so they skip the heavy steps below (the
+      # job still reports success). Anything else — any .rs, Cargo.toml/lock,
+      # rust-toolchain, scripts, etc. — runs the full gate. Pushes to main and
+      # manual dispatches always run it.
       - name: Detect whether the Rust gate applies
         id: changes
         run: |
@@ -60,7 +61,7 @@ jobs:
           base="$(git merge-base "origin/${{ github.base_ref }}" HEAD)"
           changed="$(git diff --name-only "$base" HEAD)"
           printf 'Changed files:\n%s\n' "$changed"
-          if printf '%s\n' "$changed" | grep -qvE '^(site/|docs/|\.github/|.*\.md$)'; then
+          if printf '%s\n' "$changed" | grep -qvE '^(site/|docs/|\.github/|\.impeccable/|.*\.md$)'; then
             echo "rust=true" >> "$GITHUB_OUTPUT"
             echo "Rust/build files changed — running the full gate."
           else

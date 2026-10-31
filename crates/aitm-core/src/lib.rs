@@ -30,8 +30,10 @@ pub mod value;
 
 pub use agent::{AgentPolicy, AgentState};
 pub use audit::{
-    origin_label, AuditEntry, AuditResult, AuditRing, AuditSink, DEFAULT_ARGS_SUMMARY_CAP,
-    DEFAULT_AUDIT_CAPACITY,
+    declared_client_label, lane_for, origin_label, sanitize_client_label, AuditEntry, AuditLane,
+    AuditResult, AuditRing, AuditSink, DEFAULT_ARGS_SUMMARY_CAP, DEFAULT_AUDIT_CAPACITY,
+    DEFAULT_RESULT_REASON_CAP, DEFAULT_ROUTINE_AUDIT_CAPACITY, MAX_AUDIT_SOURCES,
+    MAX_CLIENT_LABEL_CHARS, WEB_BRIDGE_CLIENT_LABEL,
 };
 pub use authority::{Authority, AuthorityError};
 pub use body::{Body, StreamBody};

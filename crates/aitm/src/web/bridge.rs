@@ -5,7 +5,8 @@
 //! line; every later text frame holds one or more lines.
 //!
 //! An authenticated connection is one `ConnCtx`: its role, a unique `conn_id`,
-//! and a bounded `NotificationSink`, shared by every frame it sends. That is what
+//! the server-minted `client_label` `web-bridge`, and a bounded
+//! `NotificationSink`, shared by every frame it sends. That is what
 //! lets `flow.subscribe` work here as it does over loopback TCP: a subscription is
 //! tagged with the connection and dropped when the connection ends, on every exit
 //! path. Frames are detached rather than cancelled, so one may still be running
@@ -16,6 +17,17 @@
 //! notification lane is bounded by the server's `push_capacity` (drop-oldest,
 //! then a `notifications/aitm/state {lagged:true}` marker on the next drain), so
 //! a client that stops reading cannot grow server memory.
+//!
+//! Every send after authentication, a reply or a push, is bounded by the server's
+//! write deadline, read once when the connection authenticates; what the deadline
+//! measures is stated once, on [`McpServer::write_timeout`]. A peer that stops
+//! reading while we write is therefore gone within it: `relay` returns an error,
+//! the guard drops the connection's subscriptions and closes its sink, and the task
+//! and socket are released. No Close frame is attempted, since a peer that is not
+//! reading cannot answer one. The deadline only fires while we are writing; an idle
+//! connection is never timed. Before authentication the same peer is bounded
+//! differently: the token must arrive within `HANDSHAKE_TIMEOUT`, and the refusal
+//! of a bad token (reply, then Close) gets `CLOSE_DRAIN_TIMEOUT` for each step.
 //!
 //! Replies do not ride the sink: a finished frame's replies go straight to the
 //! socket in line order, so a reply is never dropped or queued twice. A push
@@ -37,8 +49,9 @@
 //! request's effect before the next must wait for its reply; a Close or disconnect
 //! discards replies still in flight. At the in-flight cap the loop stops reading,
 //! so a client Close or disconnect is noticed once a frame finishes or a push send
-//! fails, bounded by those in-flight frames' own completion. All policy stays in
-//! the core: the bridge authenticates, splits lines, and forwards.
+//! fails (a send that cannot complete fails at the write deadline), bounded by
+//! those in-flight frames' own completion. All policy stays in the core: the
+//! bridge authenticates, splits lines, and forwards.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,7 +92,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// deadline a peer that never answers — or keeps sending data — pins the
 /// connection's task and socket indefinitely, including on the pre-auth refusals
 /// that [`HANDSHAKE_TIMEOUT`] exists to bound. Past the deadline the connection is
-/// dropped; that is not an error.
+/// dropped; that is not an error. The same budget bounds the reply that precedes
+/// the Close of a bad-token refusal (`refuse_unauthorized`), where expiry is an
+/// error because the peer was not even reading.
 const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The most frames one connection may have running at once. At the cap the relay
@@ -90,7 +105,9 @@ const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// The cost of that backpressure: at the cap the loop is not reading at all, so a
 /// client Close or disconnect is noticed once a frame finishes or a push send
 /// fails, bounded by the in-flight frames' own completion, however long their
-/// commands run.
+/// commands run. A send to a peer that has stopped reading fails at the write
+/// deadline (see the module doc), so such a peer is noticed within that deadline
+/// once something is sent to it; until then nothing notices it.
 pub const MAX_IN_FLIGHT: usize = 16;
 
 // With a zero cap the relay's read branch would never be enabled, so an
@@ -116,6 +133,56 @@ pub const UNAUTHORIZED: i64 = -32001;
 /// The reply to a bad or missing token line.
 pub const UNAUTHORIZED_REPLY: &str =
     r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32001,"message":"unauthorized"}}"#;
+
+/// The bad-token refusal warn is logged at most once per this window, carrying
+/// the count of refusals accumulated since the last emit. A browser tab left open
+/// from a prior `aitm web` run reconnects every few seconds with its now-stale
+/// token; without a throttle every attempt logs a line and floods the console.
+pub const BAD_TOKEN_WINDOW: Duration = Duration::from_secs(60);
+
+/// Rate-limiter for the bad-token refusal warn ([`BAD_TOKEN_WINDOW`]). The
+/// decision lives in a pure, clock-injectable unit ([`BadTokenThrottle::record`]);
+/// the interior `Mutex` lets one throttle be shared behind `&WebState` across all
+/// connections. Default-constructed with no window open.
+#[derive(Default)]
+pub struct BadTokenThrottle {
+    inner: std::sync::Mutex<ThrottleState>,
+}
+
+#[derive(Default)]
+struct ThrottleState {
+    /// Refusals seen since the last emit, including the one being recorded.
+    pending: u64,
+    /// When the current window opened; `None` until the first refusal.
+    window_start: Option<std::time::Instant>,
+}
+
+impl BadTokenThrottle {
+    /// Record one bad-token refusal observed at `now`. Returns `Some(count)` when
+    /// this refusal should be logged — the first ever and the first in each new
+    /// window — where `count` is the number of refusals accumulated since the last
+    /// emit; returns `None` when it falls inside the current window and should be
+    /// suppressed. On an emit the window restarts at `now` and the count resets.
+    pub fn record(&self, now: std::time::Instant) -> Option<u64> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending += 1;
+        let emit = match state.window_start {
+            None => true,
+            Some(start) => now.saturating_duration_since(start) >= BAD_TOKEN_WINDOW,
+        };
+        if emit {
+            let count = state.pending;
+            state.pending = 0;
+            state.window_start = Some(now);
+            Some(count)
+        } else {
+            None
+        }
+    }
+}
 
 /// The outcome of validating an upgrade request.
 pub enum Handshake {
@@ -216,9 +283,13 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
                     continue; // whitespace only; wait for a real first line
                 };
                 let Some(resolved) = classify_token(first, state) else {
-                    warn!("web bus: refused a connection with a bad token");
-                    ws.send(Message::text(UNAUTHORIZED_REPLY)).await?;
-                    return close(ws, CloseCode::Policy, "unauthorized").await;
+                    if let Some(n) = state.bad_token_throttle.record(std::time::Instant::now()) {
+                        warn!(
+                            refusals = n,
+                            "web bus: refused connections with a bad token (suppressing repeats)"
+                        );
+                    }
+                    return refuse_unauthorized(ws, CLOSE_DRAIN_TIMEOUT).await;
                 };
                 // The lines that share the token's frame are ordinary requests and
                 // answer to the same cap; only an authenticated peer gets here.
@@ -249,17 +320,20 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
     // connection's subscriptions. The guard runs that teardown when this
     // function returns by any path, a panicked frame included.
     let sink = NotificationSink::new(state.mcp.push_capacity());
-    let conn = Arc::new(ConnCtx {
+    let conn = Arc::new(bridge_conn_ctx(
         role,
-        client_label: None,
-        conn_id: state.mcp.next_conn_id(),
-        out: Some(sink.clone()),
-    });
+        state.mcp.next_conn_id(),
+        sink.clone(),
+    ));
     let guard = ConnGuard {
         mcp: Arc::clone(&state.mcp),
         conn_id: conn.conn_id,
         sink: sink.clone(),
     };
+    // The write deadline for every send from here on, read once like the sink's
+    // capacity above. The pre-auth refusal and the close handshake are bounded by
+    // `CLOSE_DRAIN_TIMEOUT` instead (`refuse_unauthorized`, `close_within`).
+    let write_timeout = state.mcp.write_timeout();
 
     // One task per frame, so a slow command (its blocking `invoke`) cannot stall
     // the reads and replies of the other frames on this socket. At most
@@ -281,20 +355,23 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
         tokio::select! {
             // A frame finished: send its replies, in line order, one text frame
             // each. A panicked command surfaces as a `JoinError` and ends the
-            // connection with an error.
+            // connection with an error, as does a send that outlasts the write
+            // deadline.
             Some(done) = in_flight.next(), if !in_flight.is_empty() => {
                 for reply in done? {
-                    ws.send(Message::text(reply)).await?;
+                    send_within(&mut ws, Message::text(reply), write_timeout).await?;
                 }
             }
             // The server pushed to this connection: drain the sink and send each
             // line as one text frame. Not gated on the in-flight cap, so pushes
             // keep flowing while the read branch is paused. `Notify` stores a
             // permit, so a push that lands while another branch is mid-send is
-            // taken on the next turn; a spurious wake drains nothing.
+            // taken on the next turn; a spurious wake drains nothing. Each send is
+            // bounded by the write deadline: a peer that has stopped reading ends
+            // the connection here instead of pinning it.
             _ = sink.wait() => {
                 for line in sink.drain() {
-                    ws.send(Message::text(line)).await?;
+                    send_within(&mut ws, Message::text(line), write_timeout).await?;
                 }
             }
             next = ws.next(), if in_flight.len() < MAX_IN_FLIGHT => match next {
@@ -330,6 +407,26 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
     }
 }
 
+/// Send one text frame, giving up if the socket has not accepted it within
+/// `limit`; what the limit measures is stated on [`McpServer::write_timeout`].
+/// Post-authentication sends pass that deadline, the pre-auth refusal passes
+/// [`CLOSE_DRAIN_TIMEOUT`]. Expiry is an error whose text contains `timed out
+/// after`; a transport error from the send passes through. The caller drops the
+/// connection on either, since a half-written frame leaves the socket unusable.
+async fn send_within<S>(
+    ws: &mut WebSocketStream<S>,
+    msg: Message,
+    limit: Duration,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(limit, ws.send(msg)).await {
+        Ok(sent) => Ok(sent?),
+        Err(_) => anyhow::bail!("websocket send timed out after {limit:?}"),
+    }
+}
+
 /// A frame's worth of work in flight: the replies its lines produced, in line
 /// order (a notification yields none).
 type FrameTask = tokio::task::JoinHandle<Vec<String>>;
@@ -354,6 +451,19 @@ fn dispatch_frame(mcp: &Arc<McpServer>, conn: &Arc<ConnCtx>, lines: Vec<String>)
             .filter_map(|line| mcp.handle_on(&conn, line))
             .collect()
     })
+}
+
+/// The one `ConnCtx` for an authenticated bridge connection. Its label is the
+/// server-minted [`aitm_core::WEB_BRIDGE_CLIENT_LABEL`]: it names the path (the
+/// web bridge), not the client. The bridge never reads `initialize.clientInfo`,
+/// because any holder of the bridge token can open the socket and a declared name
+/// would be forgeable.
+pub(crate) fn bridge_conn_ctx(role: Frontend, conn_id: u64, out: NotificationSink) -> ConnCtx {
+    let mut ctx = ConnCtx::new(role);
+    ctx.client_label = Some(aitm_core::WEB_BRIDGE_CLIENT_LABEL.to_string());
+    ctx.conn_id = conn_id;
+    ctx.out = Some(out);
+    ctx
 }
 
 /// Tears down a connection's server-side state when it ends. Held by `relay`
@@ -414,6 +524,26 @@ async fn refuse(
     drop(in_flight);
     drop(guard);
     close(ws, code, reason).await
+}
+
+/// Refuse a peer whose first line was a bad token: send [`UNAUTHORIZED_REPLY`], then
+/// close with `Policy`. The reply and the close handshake each get `limit`
+/// ([`CLOSE_DRAIN_TIMEOUT`] in production), because [`HANDSHAKE_TIMEOUT`] covers
+/// only the wait for the token. An unauthenticated peer can fill the send path
+/// before it ever sends one, by pinging without reading: tungstenite answers each
+/// Ping with a Pong, and once the socket buffers are full the reply has nowhere to
+/// go. An unbounded send would then pin the task, the socket and the upgraded
+/// connection for as long as the peer stays silent.
+///
+/// If the reply is not accepted within `limit` the error comes back and the
+/// connection is dropped with it, with no Close attempted: a peer that is not
+/// reading cannot answer one, and the handshake would only spend a second `limit`.
+async fn refuse_unauthorized<S>(mut ws: WebSocketStream<S>, limit: Duration) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    send_within(&mut ws, Message::text(UNAUTHORIZED_REPLY), limit).await?;
+    close_within(ws, CloseCode::Policy, "unauthorized", limit).await
 }
 
 async fn close(ws: Ws, code: CloseCode, reason: &'static str) -> anyhow::Result<()> {
@@ -552,6 +682,21 @@ fn plain(status: StatusCode, text: &'static str) -> Response<Full<Bytes>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bridge_conn_ctx_carries_the_server_minted_label() {
+        let operator = bridge_conn_ctx(Frontend::Operator, 7, NotificationSink::new(4));
+        assert_eq!(operator.client_label.as_deref(), Some("web-bridge"));
+        assert_eq!(operator.conn_id, 7);
+        assert!(operator.out.is_some());
+        assert_eq!(aitm_core::origin_label(operator.role), "operator");
+
+        let agent = bridge_conn_ctx(Frontend::Mcp, 7, NotificationSink::new(4));
+        assert_eq!(agent.client_label.as_deref(), Some("web-bridge"));
+        assert_eq!(agent.conn_id, 7);
+        assert!(agent.out.is_some());
+        assert_eq!(aitm_core::origin_label(agent.role), "mcp");
+    }
 
     #[test]
     fn token_line_must_be_exactly_the_token_object() {
@@ -701,10 +846,174 @@ mod tests {
         closed.expect("a completed handshake is Ok");
     }
 
+    /// bus-hardening AC8, the stalled half: the client end is held open but never
+    /// read, so a 1 MiB message cannot fit the 64 KiB duplex and the send parks,
+    /// exactly as a send to a stopped socket does. Without a deadline it never
+    /// returns.
+    #[tokio::test]
+    async fn send_within_gives_up_on_a_stalled_peer() {
+        let (mut server, _stalled_client) = socket_pair().await;
+        let message = Message::text("x".repeat(1 << 20));
+        let sent = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_within(&mut server, message, Duration::from_millis(50)),
+        )
+        .await
+        .expect("send_within must return within 2 s of a 50 ms limit, not park on the peer");
+        let err = sent.expect_err("a send the peer never accepts must fail");
+        assert!(
+            err.to_string().contains("timed out"),
+            "the error must say the send timed out, got: {err}"
+        );
+    }
+
+    /// bus-hardening AC8, the live half: a peer that reads takes the whole 1 MiB,
+    /// and a limit far above the time that takes does not fire.
+    #[tokio::test]
+    async fn send_within_delivers_to_a_live_peer() {
+        let (mut server, mut client) = socket_pair().await;
+        let text = "y".repeat(1 << 20);
+        let expected = text.clone();
+        let read_it = async {
+            match client.next().await {
+                Some(Ok(Message::Text(received))) => received.to_string(),
+                other => panic!("the client must receive the text frame, got {other:?}"),
+            }
+        };
+        let (sent, received) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                send_within(&mut server, Message::text(text), Duration::from_secs(5)),
+                read_it
+            )
+        })
+        .await
+        .expect("a live peer takes 1 MiB well inside 10 s");
+        sent.expect("a send the peer reads must succeed");
+        assert_eq!(received.len(), 1 << 20, "the whole message arrives");
+        assert!(received == expected, "the message arrives intact");
+    }
+
+    /// A peer that is gone (its end dropped) fails the send at once with the
+    /// transport's own error, not after the limit and not as a timeout. `relay` ends
+    /// the connection on any `Err`, so what matters is that a dead socket is
+    /// reported promptly instead of being waited on, and that the error is not
+    /// mislabelled as the write deadline (which would send an operator hunting for a
+    /// slow reader).
+    #[tokio::test]
+    async fn send_within_reports_a_gone_peer_as_a_send_error_not_a_timeout() {
+        let (mut server, client) = socket_pair().await;
+        drop(client);
+        let message = Message::text("z".repeat(1 << 20));
+        let sent = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_within(&mut server, message, Duration::from_secs(30)),
+        )
+        .await
+        .expect("a gone peer fails the send at once, far inside the 30 s limit");
+        let err = sent.expect_err("a send to a gone peer must fail");
+        assert!(
+            !err.to_string().contains("timed out"),
+            "a transport error passes through unchanged, not as a timeout: {err}"
+        );
+    }
+
+    /// A peer that sends a bad token while our send path is already full is refused
+    /// within the limit, and the connection is dropped. In production the peer fills
+    /// the path by sending Pings and never reading, so tungstenite's automatic Pongs
+    /// occupy the socket buffers; here a 1 MiB send to a peer that never reads leaves
+    /// the duplex in the same state (the frame is queued, the buffer is full), after
+    /// the same limit has expired once. Without a bound the refusal reply parks on
+    /// that full path for as long as the peer stays silent.
+    #[tokio::test]
+    async fn the_bad_token_refusal_gives_up_on_a_peer_whose_send_path_is_full() {
+        let (mut server, mut client) = socket_pair().await;
+        // Bounded from outside too: were `send_within` to regress to an unbounded
+        // send, this setup step would hang the test instead of failing it.
+        let fill = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_within(
+                &mut server,
+                Message::text("x".repeat(1 << 20)),
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("setup: the fill must return within 2 s of a 50 ms limit, not park on the peer")
+        .expect_err("setup: a 1 MiB send to a peer that never reads must not fit the duplex");
+        assert!(
+            fill.to_string().contains("timed out after"),
+            "setup: the fill must end by timing out, got: {fill}"
+        );
+
+        let refused = tokio::time::timeout(
+            Duration::from_secs(2),
+            refuse_unauthorized(server, Duration::from_millis(50)),
+        )
+        .await
+        .expect("the refusal must return within 2 s of a 50 ms limit; its send is unbounded");
+        let err = refused.expect_err("a refusal the peer never accepts must end in an error");
+        assert!(
+            err.to_string().contains("timed out after"),
+            "the error must say the send timed out, got: {err}"
+        );
+
+        // The server end went out of scope with the error, so the peer reaches the
+        // end of what it was sent: the connection is dropped, not left half-open.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(Ok(_)) = client.next().await {}
+        })
+        .await
+        .expect("a dropped connection ends the peer's stream");
+    }
+
+    /// The refusal path for a peer that reads is unchanged: the unauthorized reply,
+    /// then a Policy Close, then the close handshake runs to its end. The limit is far
+    /// above the outer bound, so finishing proves the handshake completed rather than
+    /// a deadline firing.
+    #[tokio::test]
+    async fn the_bad_token_refusal_reaches_a_live_peer_then_closes_it() {
+        let (server, mut client) = socket_pair().await;
+        let server_side = refuse_unauthorized(server, Duration::from_secs(30));
+        let client_side = async {
+            match client.next().await {
+                Some(Ok(Message::Text(reply))) => assert_eq!(reply.as_str(), UNAUTHORIZED_REPLY),
+                other => panic!("expected the unauthorized reply first, got {other:?}"),
+            }
+            match client.next().await {
+                Some(Ok(Message::Close(Some(frame)))) => {
+                    assert_eq!(frame.code, CloseCode::Policy);
+                    assert_eq!(frame.reason.as_str(), "unauthorized");
+                }
+                other => panic!("expected a Policy Close frame second, got {other:?}"),
+            }
+            while let Some(Ok(_)) = client.next().await {}
+        };
+        let (refused, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server_side, client_side)
+        })
+        .await
+        .expect("a peer that reads is refused without waiting for any deadline");
+        refused.expect("a completed refusal is Ok");
+    }
+
     #[test]
     fn unauthorized_reply_is_valid_json_rpc() {
         let v: JsonValue = serde_json::from_str(UNAUTHORIZED_REPLY).unwrap();
         assert_eq!(v["error"]["code"], UNAUTHORIZED);
         assert!(v["id"].is_null());
+    }
+
+    /// AC6: the bad-token refusal warn is rate-limited to at most one line per
+    /// [`BAD_TOKEN_WINDOW`], each carrying the count accumulated since the last
+    /// emit. The first-ever refusal and the first after the window emit; refusals
+    /// inside the window are suppressed.
+    #[test]
+    fn bad_token_throttle_emits_then_suppresses_until_the_window() {
+        let t = BadTokenThrottle::default();
+        let t0 = std::time::Instant::now();
+        assert_eq!(t.record(t0), Some(1));
+        assert_eq!(t.record(t0 + Duration::from_secs(1)), None);
+        assert_eq!(t.record(t0 + Duration::from_secs(2)), None);
+        assert_eq!(t.record(t0 + Duration::from_secs(61)), Some(3));
     }
 }

@@ -176,6 +176,14 @@ async fn run() -> anyhow::Result<()> {
         .scripts
         .extend(script_args.into_iter().map(ScriptEntry::new));
 
+    // Ship-by-default detection catalogue (scripts/bundled → share/aitm/scripts):
+    // passive OWASP/vuln detectors plus operator-invoked active/L4 command scripts.
+    // Appended last and deduped by path, so a config `scripts:`, `AITM_SCRIPTS`,
+    // or `--script` entry naming the same file wins (the bundled copy is skipped);
+    // observe-only passives keep deny-by-default. `AITM_NO_BUNDLED_SCRIPTS` turns
+    // the whole catalogue off, `AITM_BUNDLED_SCRIPTS` points it at another dir.
+    aitm::bundled::apply(&mut rhai_cfg, |k| std::env::var(k).ok());
+
     // The tier is built before the proxy — a script compiles against the shared
     // engine, and the engine's host verbs close over these handles — so they are
     // bound to the proxy's real ones below, before anything is served.
@@ -265,21 +273,7 @@ async fn run() -> anyhow::Result<()> {
         macos_capture,
         ..Features::default()
     };
-    let Assembled {
-        proxy,
-        ca,
-        listening,
-        agent_state,
-        push_tx,
-        audit_ring,
-        // The protocol-general capture ingress and the live L4 guard feed the macOS
-        // Network/System Extension capture session below (macOS builds with
-        // `macos_capture.enabled` only). On every other build, or with it disabled
-        // (the default), they are dropped unused: the pcap capture path is
-        // `l4.capture.*`'s own and nothing calls `accept`.
-        l4_ingress,
-        l4_guard,
-    } = assemble_with_scripts(
+    let assembled = assemble_with_scripts(
         &cfg,
         &features,
         ScriptWiring {
@@ -296,6 +290,25 @@ async fn run() -> anyhow::Result<()> {
             commands: vec![Box::new(tier.commands), Box::new(FindingsPlugin::new())],
         },
     )?;
+    let governance = assembled.governance();
+    let Assembled {
+        proxy,
+        ca,
+        listening,
+        agent_state,
+        push_tx,
+        audit_ring,
+        // The protocol-general capture ingress and the live L4 guard feed the macOS
+        // Network/System Extension capture session below (macOS builds with
+        // `macos_capture.enabled` only). On every other build, or with it disabled
+        // (the default), they are dropped unused: the pcap capture path is
+        // `l4.capture.*`'s own and nothing calls `accept`.
+        l4_ingress,
+        l4_guard,
+        // `..` stands only for the private `governance` (taken above). Any new
+        // `pub` field of `Assembled` must be named here, not absorbed by it.
+        ..
+    } = assembled;
 
     if let Mode::Cli(argv) = &mode {
         // One-shot CLI dispatch (no browser needed): the same service
@@ -458,8 +471,15 @@ async fn run() -> anyhow::Result<()> {
     // We are about to serve: `proxy.status.listening` now reports the truth.
     listening.store(true, std::sync::atomic::Ordering::Relaxed);
     let result = if mode == Mode::Tui {
+        // `aitm tui`: the loopback agent server is built by `tui::build_servers`
+        // on the core's shared policy state and audit ring (the `governance`
+        // passed here, from `assembled.governance()` above) through
+        // `tui::with_shared_governance`, so a live `agent.set` governs it and
+        // its calls land in `agent.activity`. `push_tx` is not fed to it
+        // (follow-up "tui-mode push"): a loopback subscriber still gets the
+        // `notifications/aitm/agent` lines but no `notifications/aitm/flow`.
         tokio::select! {
-            result = tui::run(&cfg, &proxy, services, proxy_listener, browser_listener) => result,
+            result = tui::run(&cfg, &proxy, services, governance, proxy_listener, browser_listener) => result,
             never = capture_run => match never {},
         }
     } else {
@@ -487,6 +507,12 @@ async fn run() -> anyhow::Result<()> {
         // server keeps its own subscription registry and only `serve` spawns a
         // dispatcher, so without this a `/bus` subscription would sit in a
         // registry nothing feeds.
+        // Read both pre-bound listen addresses before the `web_server` block;
+        // the listeners are still owned here and move into `proxy.run_on` /
+        // `proxy.run_browser_on` below, so the startup summary captures their
+        // addresses now.
+        let proxy_addr = proxy_listener.local_addr()?;
+        let browser_addr = browser_listener.local_addr()?;
         let web_server = match (web_settings, web_listener) {
             (Some(settings), Some(listener)) => {
                 let bus = Arc::new(
@@ -516,6 +542,7 @@ async fn run() -> anyhow::Result<()> {
                     mcp: bus,
                     agent_token: settings.token.clone(),
                     operator_token: operator_token.clone(),
+                    bad_token_throttle: Default::default(),
                 });
                 if settings.insecure_bind {
                     warn!(
@@ -530,15 +557,22 @@ async fn run() -> anyhow::Result<()> {
                 let bound = listener.local_addr()?;
                 let url = web::ui_url(bound, &settings.token);
                 // Log only the bound address; the token must never reach a
-                // tracing sink. The one-time println is the operator's link.
+                // tracing sink. The one-time summary println is the operator's
+                // link — its URLs carry the token on purpose (stdout, not logs).
                 web::log_listening(bound);
-                println!("web UI (agent): {url}");
-                // When operator access is configured, print its URL too; it
-                // carries the ephemeral operator bridge token in the fragment,
-                // never the mcp operator token.
-                if let Some(op) = &operator_token {
-                    println!("web UI (operator): {}", web::operator_ui_url(bound, op));
-                }
+                let operator_url = operator_token
+                    .as_ref()
+                    .map(|op| web::operator_ui_url(bound, op));
+                println!(
+                    "{}",
+                    web::startup_summary(
+                        &url,
+                        operator_url.as_deref(),
+                        proxy_addr,
+                        browser_addr,
+                        "ready"
+                    )
+                );
                 Some((listener, state))
             }
             _ => None,

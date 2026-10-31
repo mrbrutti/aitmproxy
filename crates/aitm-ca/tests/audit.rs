@@ -137,6 +137,7 @@ fn ca_status_entry() -> AuditEntry {
         at: SystemTime::now(),
         origin: Frontend::Mcp,
         client_label: Some("aitm-mac".to_string()),
+        connection_id: None,
         command: "ca.status".to_string(),
         args_summary: "{}".to_string(),
         result: AuditResult::Ok,
@@ -178,4 +179,45 @@ fn ca_audit_is_a_subset() {
     // ring and the JSONL agree field for field.
     let expected: serde_json::Value = serde_json::from_str(&entry_to_jsonl(&entry)).unwrap();
     assert_eq!(value, expected);
+}
+
+/// AC17: the durable line and `AuditEntry::to_value` are one shape. The key set
+/// of the JSONL object equals the key set of the ring's rendering (the seven keys
+/// including `connection_id`), and the id survives as a string.
+#[test]
+fn durable_line_has_the_same_keys_as_to_value() {
+    let e = AuditEntry {
+        connection_id: Some("conn_ab-1".into()),
+        ..ca_status_entry()
+    };
+
+    let durable: serde_json::Value = serde_json::from_str(&entry_to_jsonl(&e)).unwrap();
+    let mut durable_keys: Vec<String> = durable.as_object().unwrap().keys().cloned().collect();
+    durable_keys.sort_unstable();
+
+    let aitm_core::Value::Object(rendered) = e.to_value() else {
+        panic!("to_value must render an object");
+    };
+    let rendered_keys: Vec<String> = rendered.keys().cloned().collect();
+
+    assert_eq!(durable_keys, rendered_keys);
+    assert_eq!(
+        durable_keys,
+        [
+            "args",
+            "at",
+            "client_label",
+            "command",
+            "connection_id",
+            "origin",
+            "result"
+        ]
+    );
+    assert_eq!(durable["connection_id"], "conn_ab-1");
+
+    // An entry with no streaming connection renders the key as null, not absent.
+    let none: serde_json::Value =
+        serde_json::from_str(&entry_to_jsonl(&ca_status_entry())).unwrap();
+    assert!(none.as_object().unwrap().contains_key("connection_id"));
+    assert_eq!(none["connection_id"], serde_json::Value::Null);
 }

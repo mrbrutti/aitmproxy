@@ -67,6 +67,14 @@ cp "target/release/aitm" "$stage/aitm"
 cp "target/release/aitm-tui" "$stage/aitm-tui"
 chmod 755 "$stage/aitm" "$stage/aitm-tui" "$stage/obscura"
 
+# Ship the default detection catalogue beside the binary; aitm discovers it at
+# `<exe_dir>/share/aitm/scripts` and loads the passive detectors by default.
+mkdir -p "$stage/share/aitm/scripts"
+# `/.` copies the CONTENTS of scripts/bundled (active/, http/, l4/, ws/, README)
+# into the dest on both BSD cp (macOS) and GNU cp — a bare `scripts/bundled/`
+# nests under `bundled/` on GNU cp, so pin the contents form.
+cp -R scripts/bundled/. "$stage/share/aitm/scripts/"
+
 # A download on macOS may carry Gatekeeper's quarantine flag; `aitm` would
 # otherwise fail to spawn `obscura`. Absent attribute is fine.
 if [ "$(uname -s)" = Darwin ]; then
@@ -75,7 +83,7 @@ fi
 
 mkdir -p dist
 out="dist/aitm-${version}-${target}.tar.gz"
-tar -czf "$out" -C "$stage" aitm aitm-tui obscura
+tar -czf "$out" -C "$stage" aitm aitm-tui obscura share
 
 echo "package.sh: wrote ${out}"
 tar -tzf "$out"

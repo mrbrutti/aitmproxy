@@ -20,6 +20,24 @@
         ],
         "createdAt": "2026-10-28T04:30:35.953Z",
         "reason": "lead designer (this session): the intercept dot pulses only while requests are genuinely paused awaiting the operator (live state), stops when disarmed and under prefers-reduced-motion; documented as motion.interceptPulse in docs/design/tokens.json"
+      },
+      {
+        "rule": "undersized-ui-text",
+        "value": "*",
+        "files": [
+          "site/download.html"
+        ],
+        "createdAt": "2026-10-31T05:36:38.448Z",
+        "reason": "claude: .ver is 0.5em of --fs-display (clamp 26-36px) = 13-18px; measured 13px live at 375px, above the 11px floor. Static detector mis-resolves the em against 16px body -> 8px"
+      },
+      {
+        "rule": "border-accent-on-rounded",
+        "value": "*",
+        "files": [
+          "site/docs.html"
+        ],
+        "createdAt": "2026-10-31T05:37:14.715Z",
+        "reason": "claude: all 35 hits are the intentional <kbd> keycap glyph (.prose kbd: 1px hairline border + 2px bottom edge + 3px radius) — hairline color not accent, a key glyph not a card; DOM scan confirms no accent-bordered rounded card exists on the page"
       }
     ]
   }

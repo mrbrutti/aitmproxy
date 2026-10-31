@@ -2,10 +2,14 @@
 //! TCP listener that requires a token on every connection. Both run the same
 //! [`serve_lines`] loop; the TCP transport first consumes one auth line.
 
+use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
+use std::time::Duration;
 
 use aitm_core::Frontend;
 use anyhow::Context as _;
@@ -14,6 +18,7 @@ use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Take,
 };
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinError;
 
 use crate::server::{error_response, ConnCtx, McpServer, NotificationSink, UNAUTHORIZED};
 
@@ -22,8 +27,9 @@ use crate::server::{error_response, ConnCtx, McpServer, NotificationSink, UNAUTH
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Serve newline-delimited JSON-RPC on one connection: each line in is one
-/// message, each reply out is one line. Returns at EOF. Commands run on the
-/// blocking pool so a slow tool cannot stall the runtime.
+/// message, each reply out is one line. Returns at EOF, at a read error, or when
+/// the writer fails (see below). Commands run on the blocking pool so a slow tool
+/// cannot stall the runtime.
 ///
 /// The write half is owned by a dedicated writer task draining the connection's
 /// bounded [`NotificationSink`] (F4): both request replies and server-initiated
@@ -31,6 +37,20 @@ pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 /// connection and the read loop never blocks on a slow socket. The sink is the
 /// `conn.out` the subscription registry pushes to; when the connection ends its
 /// subscriptions are dropped and the writer drains and exits.
+///
+/// Each write the writer makes (one `write_all` per line, and the `flush`) runs
+/// under [`McpServer::write_timeout`], which states what that deadline does and
+/// does not detect. Expiry alone would not end the connection, because the read
+/// loop sits in `read_line` and a stopped but still-open peer never sends EOF. So
+/// if the writer ends in an error before the read loop ends, the read loop is
+/// abandoned: the sink is closed, the connection's subscriptions are dropped, and
+/// the writer's error is returned. A writer ends in an error when the deadline
+/// expires, when a write fails, or when its task panics (the error then says the
+/// writer task failed). If the read loop ends first, or the writer ends cleanly,
+/// the connection ends when the read loop does; in the first case the writer is
+/// given the chance to drain what is queued (still bounded by the deadline). A
+/// command already running on the blocking pool when the loop is abandoned
+/// finishes, but its reply is lost, as on any disconnect.
 ///
 /// `conn` carries the connection's role (from its auth token, or `stdio_role`)
 /// and, once an `initialize` arrives, its `clientInfo.name` label; every message
@@ -56,64 +76,132 @@ where
     if conn.conn_id == 0 {
         conn.conn_id = server.next_conn_id();
     }
-    // When the writer task ends — the socket closed, or `write_all` errored
-    // because the client disconnected — close the sink. That unblocks a read loop
-    // parked in `await_reply_capacity` (which would otherwise wait forever for a
-    // writer that has gone) so the connection tears down cleanly.
-    let writer_task = tokio::spawn({
+    let conn_id = conn.conn_id;
+    let write_timeout = server.write_timeout();
+    let mut writer_task = Some(tokio::spawn({
         let sink = sink.clone();
         async move {
-            let r = write_loop(writer, sink.clone()).await;
+            let result = write_loop(writer, sink.clone(), write_timeout).await;
+            // When the writer ends (the socket closed, a write failed, or a write
+            // hit its deadline) close the sink. That unblocks a read loop parked
+            // in `await_reply_capacity`, which would otherwise wait forever for a
+            // writer that has gone, so the connection tears down cleanly. A
+            // panic skips this line; teardown below closes the sink regardless.
             sink.close();
-            r
+            result
         }
-    });
+    }));
 
-    let mut reader = reader.take(MAX_MESSAGE_BYTES as u64);
-    let mut line = String::new();
-    let outcome: anyhow::Result<()> = async {
-        while read_message(&mut reader, &mut line).await? {
-            let message = line.trim().to_string();
-            if message.is_empty() {
-                continue;
-            }
-            // The client names itself once, in `initialize`; carry that label
-            // onto the connection for audit (first one wins) without re-parsing.
-            if conn.client_label.is_none() {
-                if let Some(label) = client_label_from_initialize(&message) {
-                    conn.client_label = Some(label);
+    // Race the read loop against the writer. The lib's tokio build omits the
+    // `macros` feature (as in `http.rs`), so there is no `select!`: the two
+    // futures are polled by hand, the read loop first, so that if it has ended
+    // (EOF, a read error) that ends the connection even if the writer ended in the
+    // same instant. A `JoinHandle` must not be polled or awaited again once it has
+    // completed, so `writer_task` is emptied as soon as it has.
+    let mut read = std::pin::pin!(read_loop(server.clone(), reader, conn, sink.clone()));
+    let outcome = std::future::poll_fn(|cx| {
+        if let Poll::Ready(outcome) = read.as_mut().poll(cx) {
+            return Poll::Ready(outcome);
+        }
+        if let Some(task) = writer_task.as_mut() {
+            if let Poll::Ready(joined) = Pin::new(task).poll(cx) {
+                writer_task = None;
+                // A writer that failed ends the connection now. One that ended
+                // cleanly leaves the read loop to end it.
+                if let Some(err) = writer_failure(joined) {
+                    return Poll::Ready(Err(err));
                 }
             }
-            let srv = server.clone();
-            let c = conn.clone();
-            let reply = tokio::task::spawn_blocking(move || srv.handle_on(&c, &message)).await?;
-            if let Some(reply) = reply {
-                // Replies ride the sink too (never dropped); the writer task
-                // serializes them with any interleaved notifications.
-                sink.push_reply(reply);
-            }
-            // Backpressure (RF#3): if the client is not draining its socket the
-            // writer cannot flush, so replies accumulate. Once the reply lane hits
-            // its high-water mark, stop reading new requests until the writer has
-            // drained below it — bounding memory without dropping any reply. If the
-            // sink has closed (client gone), this returns at once so the loop ends.
-            sink.await_reply_capacity().await;
         }
-        Ok(())
-    }
+        Poll::Pending
+    })
     .await;
 
-    // Teardown: drop this connection's subscriptions, then let the writer drain
+    // Teardown: close the sink, then drop this connection's subscriptions. In that
+    // order a `flow.subscribe` still in flight (a command on the blocking pool
+    // that outlived the abandoned read loop) is either refused, because the sink
+    // is closed, or swept by the drop; it cannot register after the drop and
+    // outlive the connection (see `Subscriptions::add`). Then let the writer drain
     // what is queued and exit.
-    server.drop_connection(conn.conn_id);
     sink.close();
-    let _ = writer_task.await;
+    server.drop_connection(conn_id);
+    if let Some(task) = writer_task {
+        if let Some(err) = writer_failure(task.await) {
+            tracing::debug!(
+                error = %format_args!("{err:#}"),
+                "bus connection's writer ended with an error"
+            );
+        }
+    }
     outcome
 }
 
+/// The error a finished writer task ended the connection with, if it failed: the
+/// writer's own error (the deadline, or a failed write), or the join error of a
+/// writer that panicked or was cancelled. `None` when the writer ended cleanly.
+fn writer_failure(joined: Result<anyhow::Result<()>, JoinError>) -> Option<anyhow::Error> {
+    match joined {
+        Ok(Ok(())) => None,
+        Ok(Err(err)) => Some(err),
+        Err(join) => Some(anyhow::Error::new(join).context("the connection's writer task failed")),
+    }
+}
+
+/// The read half of [`serve_lines`]: dispatch each incoming line through
+/// `server` and queue its reply on `sink`, until EOF, a read error, or a line
+/// over [`MAX_MESSAGE_BYTES`].
+async fn read_loop<R>(
+    server: Arc<McpServer>,
+    reader: R,
+    mut conn: ConnCtx,
+    sink: NotificationSink,
+) -> anyhow::Result<()>
+where
+    R: AsyncBufRead + Unpin + Send,
+{
+    let mut reader = reader.take(MAX_MESSAGE_BYTES as u64);
+    let mut line = String::new();
+    while read_message(&mut reader, &mut line).await? {
+        let message = line.trim().to_string();
+        if message.is_empty() {
+            continue;
+        }
+        // The client names itself once, in `initialize`; carry that label
+        // onto the connection for audit (first one wins) without re-parsing.
+        if conn.client_label.is_none() {
+            if let Some(label) = client_label_from_initialize(&message) {
+                conn.client_label = Some(label);
+            }
+        }
+        let srv = server.clone();
+        let c = conn.clone();
+        let reply = tokio::task::spawn_blocking(move || srv.handle_on(&c, &message)).await?;
+        if let Some(reply) = reply {
+            // Replies ride the sink too (never dropped); the writer task
+            // serializes them with any interleaved notifications.
+            sink.push_reply(reply);
+        }
+        // Backpressure (RF#3): if the client is not draining its socket the
+        // writer cannot flush, so replies accumulate. Once the reply lane hits
+        // its high-water mark, stop reading new requests until the writer has
+        // drained below it — bounding memory without dropping any reply. If the
+        // sink has closed (client gone), this returns at once so the loop ends.
+        sink.await_reply_capacity().await;
+    }
+    Ok(())
+}
+
 /// Drain `sink` to `writer` until the sink is closed and empty. Each frame is a
-/// complete JSON-RPC line; a trailing newline is appended per line.
-async fn write_loop<W>(mut writer: W, sink: NotificationSink) -> anyhow::Result<()>
+/// complete JSON-RPC line; a trailing newline is appended per line. Every
+/// `write_all`, and the `flush` after a batch, runs under `write_timeout` (see
+/// [`McpServer::write_timeout`]); when one expires the loop returns an error whose
+/// text starts `write timed out after` and the connection is given up on (see
+/// [`serve_lines`]).
+async fn write_loop<W>(
+    mut writer: W,
+    sink: NotificationSink,
+    write_timeout: Duration,
+) -> anyhow::Result<()>
 where
     W: AsyncWrite + Unpin + Send,
 {
@@ -122,9 +210,9 @@ where
         if !frames.is_empty() {
             for mut frame in frames {
                 frame.push('\n');
-                writer.write_all(frame.as_bytes()).await?;
+                within(write_timeout, writer.write_all(frame.as_bytes())).await?;
             }
-            writer.flush().await?;
+            within(write_timeout, writer.flush()).await?;
             // Re-check for anything queued while we were writing before parking.
             continue;
         }
@@ -136,15 +224,34 @@ where
     Ok(())
 }
 
-/// The `initialize.clientInfo.name`, if `message` is an `initialize` request that
-/// carries a non-empty name; `None` otherwise.
+/// Run one write-side operation, giving up if it takes longer than `limit`.
+/// Expiry is an error whose text starts `write timed out after`; an I/O error
+/// from the operation itself passes through unchanged.
+async fn within(
+    limit: Duration,
+    operation: impl Future<Output = io::Result<()>>,
+) -> anyhow::Result<()> {
+    match tokio::time::timeout(limit, operation).await {
+        Ok(result) => Ok(result?),
+        Err(_) => anyhow::bail!("write timed out after {limit:?}"),
+    }
+}
+
+/// The label a client declares in `initialize.clientInfo.name`, if `message` is an
+/// `initialize` request that carries one; `None` otherwise.
+///
+/// The name is client-controlled, so it passes through
+/// [`aitm_core::declared_client_label`]: bounded, stripped of control and bidi
+/// characters, credential-scrubbed, and a server-minted name such as `web-bridge`
+/// is rewritten to `web-bridge (declared)` so a client cannot pose as it. A name
+/// that is empty after that yields `None`.
 fn client_label_from_initialize(message: &str) -> Option<String> {
     let v: JsonValue = serde_json::from_str(message).ok()?;
     if v.get("method").and_then(JsonValue::as_str)? != "initialize" {
         return None;
     }
     let name = v.get("params")?.get("clientInfo")?.get("name")?.as_str()?;
-    (!name.is_empty()).then(|| name.to_string())
+    aitm_core::declared_client_label(name)
 }
 
 /// Serve over this process's stdin/stdout until stdin closes. The stdio
@@ -231,8 +338,15 @@ impl LoopbackTcp {
             let agent = self.agent_token.clone();
             let operator = self.operator_token.clone();
             tokio::spawn(async move {
-                // A failed connection is that client's problem, not the server's.
-                let _ = serve_connection(srv, stream, &agent, operator.as_deref()).await;
+                // A failed connection is that client's problem, not the server's:
+                // it is logged at debug (never with a token; the errors carry none)
+                // and the listener goes on accepting.
+                if let Err(err) = serve_connection(srv, stream, &agent, operator.as_deref()).await {
+                    tracing::debug!(
+                        error = %format_args!("{err:#}"),
+                        "bus connection ended with an error"
+                    );
+                }
             });
         }
     }
@@ -364,6 +478,14 @@ async fn read_message<R: AsyncBufRead + Unpin>(
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use aitm_core::{McpTransport, Registry};
+    use serde_json::json;
+    use tokio::io::{duplex, split, DuplexStream, Lines, ReadHalf, WriteHalf};
+    use tokio::net::TcpSocket;
+    use tokio::task::JoinHandle;
+
     /// A unique temp path for one test, cleaned up by the test itself.
     fn temp_endpoint_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -415,6 +537,46 @@ mod tests {
         // Nothing to assert beyond: there is no path, so nothing is written or
         // leaked; dropping must not panic.
         drop(listener);
+    }
+
+    /// An `initialize` request whose `clientInfo.name` is `name`.
+    fn initialize_with_name(name: &str) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "clientInfo": { "name": name } },
+        })
+        .to_string()
+    }
+
+    /// AC14: the label captured from `initialize` is bounded (a 10 MiB name
+    /// becomes 64 chars), a client cannot claim the server-minted `web-bridge`
+    /// name, an ordinary name is kept, and an empty or absent name is `None`.
+    #[test]
+    fn client_label_from_initialize_is_bounded_and_unforgeable() {
+        assert_eq!(
+            client_label_from_initialize(&initialize_with_name(&"A".repeat(10 << 20))),
+            Some("A".repeat(64))
+        );
+        assert_eq!(
+            client_label_from_initialize(&initialize_with_name("web-bridge")),
+            Some("web-bridge (declared)".to_string())
+        );
+        assert_eq!(
+            client_label_from_initialize(&initialize_with_name("aitm-mac")),
+            Some("aitm-mac".to_string())
+        );
+        assert_eq!(
+            client_label_from_initialize(&initialize_with_name("")),
+            None
+        );
+        assert_eq!(
+            client_label_from_initialize(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#
+            ),
+            None
+        );
     }
 
     #[test]
@@ -471,5 +633,645 @@ mod tests {
             Some(Frontend::Mcp)
         );
         assert_eq!(classify_token(r#"{"token":"no"}"#, "ag", Some("op")), None);
+    }
+
+    /// A bare server (no commands, no store: `flow.subscribe` needs neither)
+    /// whose line-transport write deadline is `deadline`.
+    fn server_with_deadline(deadline: Duration) -> Arc<McpServer> {
+        Arc::new(
+            McpServer::new(Arc::new(Registry::new()), McpTransport::Stdio)
+                .with_write_timeout(deadline),
+        )
+    }
+
+    /// One `notifications/aitm/state` push carrying `seq` and 4 KiB of padding,
+    /// so a handful of them overflow any small pipe.
+    fn push_padded(server: &McpServer, seq: u64) {
+        server.push_state(json!({"seq": seq, "pad": "p".repeat(4096)}));
+    }
+
+    /// The `flow.subscribe` request every test sends first, as one line.
+    fn subscribe_line() -> String {
+        let mut line = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "flow.subscribe", "arguments": {}},
+        })
+        .to_string();
+        line.push('\n');
+        line
+    }
+
+    /// Assert that `reply` is the line of a successful `flow.subscribe`, that is,
+    /// carries a `sub_id`. No test here needs the id itself.
+    fn assert_subscribed_reply(reply: &str) {
+        let reply: JsonValue = serde_json::from_str(reply).expect("the reply is JSON");
+        assert!(
+            reply["result"]["structuredContent"]["sub_id"].is_u64(),
+            "the subscribe reply carries a sub_id: {reply}"
+        );
+    }
+
+    /// The client end of a `serve_lines` connection over an in-memory pipe, plus
+    /// the injected push sink and the server task, so a test can watch all three.
+    struct LineClient {
+        writer: WriteHalf<DuplexStream>,
+        lines: Lines<BufReader<ReadHalf<DuplexStream>>>,
+        sink: NotificationSink,
+        task: JoinHandle<anyhow::Result<()>>,
+    }
+
+    /// Serve one `Frontend::Operator` connection of `server` over `duplex(256)`:
+    /// a pipe so small that a write blocks exactly like a stopped socket. `sink`
+    /// is the connection's injected push sink, so the test can watch its bounds.
+    fn serve_over_tiny_pipe(server: &Arc<McpServer>, sink: NotificationSink) -> LineClient {
+        serve_through(server, sink, |server_write| server_write)
+    }
+
+    /// As [`serve_over_tiny_pipe`], with the server's write half passed through
+    /// `wrap` first, for a test that needs a writer with its own behaviour.
+    fn serve_through<W>(
+        server: &Arc<McpServer>,
+        sink: NotificationSink,
+        wrap: impl FnOnce(WriteHalf<DuplexStream>) -> W,
+    ) -> LineClient
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (client, server_side) = duplex(256);
+        let (server_read, server_write) = split(server_side);
+        let mut conn = ConnCtx::new(Frontend::Operator);
+        conn.out = Some(sink.clone());
+        let task = tokio::spawn(serve_lines(
+            server.clone(),
+            BufReader::new(server_read),
+            wrap(server_write),
+            conn,
+        ));
+        let (client_read, writer) = split(client);
+        LineClient {
+            writer,
+            lines: BufReader::new(client_read).lines(),
+            sink,
+            task,
+        }
+    }
+
+    impl LineClient {
+        /// Send `flow.subscribe {}`, read exactly one line, and assert it is a
+        /// successful subscribe reply.
+        async fn subscribe(&mut self) {
+            self.writer
+                .write_all(subscribe_line().as_bytes())
+                .await
+                .expect("send flow.subscribe");
+            self.writer.flush().await.expect("flush flow.subscribe");
+            let reply = self
+                .lines
+                .next_line()
+                .await
+                .expect("read the subscribe reply")
+                .expect("a reply line");
+            assert_subscribed_reply(&reply);
+        }
+
+        /// The next line from the server, parsed.
+        async fn next_json(&mut self) -> JsonValue {
+            let line = self
+                .lines
+                .next_line()
+                .await
+                .expect("read a line")
+                .expect("a line was expected");
+            serde_json::from_str(&line).expect("a JSON line")
+        }
+    }
+
+    /// A client that subscribes and then neither reads nor closes cannot pin the
+    /// connection (bus-hardening AC14). The writer's `write_all` stalls on the
+    /// full pipe, the write deadline expires, and `serve_lines` returns that error
+    /// instead of parking in `read_line` for a peer that never sends EOF; the
+    /// subscriptions are dropped and the sink closed, so a later push queues
+    /// nothing.
+    #[tokio::test]
+    async fn a_stopped_line_reader_ends_the_connection_after_the_write_deadline() {
+        let server = server_with_deadline(Duration::from_millis(200));
+        let mut client = serve_over_tiny_pipe(&server, NotificationSink::new(64));
+        client.subscribe().await;
+
+        for seq in 0..16 {
+            push_padded(&server, seq);
+        }
+        // From here the client neither reads nor closes: it holds both halves.
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), client.task)
+            .await
+            .expect("serve_lines returned within 5 s of the pushes (the deadline is 200 ms)")
+            .expect("the serve_lines task did not panic");
+        let err = ended.expect_err("a writer that hit its deadline ends the connection in error");
+        assert!(
+            err.to_string().contains("write timed out"),
+            "the error names the write deadline: {err}"
+        );
+        assert!(
+            client.sink.is_closed(),
+            "the connection's sink is closed when it ends"
+        );
+
+        let before = client.sink.queued_len();
+        push_padded(&server, 99);
+        assert_eq!(
+            client.sink.queued_len(),
+            before,
+            "the subscription was dropped, so a later push reaches nothing"
+        );
+        drop((client.writer, client.lines));
+    }
+
+    /// A reader that is slow but live is not cut (bus-hardening AC15). It reads
+    /// one line per 20 ms, so it frees room for the next write well inside the 1 s
+    /// deadline every time (50 times over), yet the 100 lines take 2 s in all,
+    /// longer than the deadline: a deadline over the whole batch instead of over
+    /// each write would end this connection. The reader receives every pushed
+    /// line, in order, and the connection is still up afterwards; it ends only when
+    /// the client closes.
+    #[tokio::test]
+    async fn a_slow_line_reader_is_not_disconnected() {
+        const PUSHES: u64 = 100;
+        let server = server_with_deadline(Duration::from_secs(1));
+        // The sink holds every push, so none is dropped as lag before it is read.
+        let mut client = serve_over_tiny_pipe(&server, NotificationSink::new(PUSHES as usize));
+        client.subscribe().await;
+
+        for seq in 0..PUSHES {
+            push_padded(&server, seq);
+        }
+        for seq in 0..PUSHES {
+            let line = client.next_json().await;
+            assert_eq!(
+                line["method"], "notifications/aitm/state",
+                "push {seq} arrived as a state notification: {line}"
+            );
+            assert_eq!(
+                line["params"]["seq"], seq,
+                "the pushes arrive in order, none lost: {line}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !client.task.is_finished(),
+            "a slow but live reader is not disconnected"
+        );
+
+        drop((client.writer, client.lines));
+        let ended = tokio::time::timeout(Duration::from_secs(5), client.task)
+            .await
+            .expect("serve_lines ends once the client closes")
+            .expect("the serve_lines task did not panic");
+        ended.expect("a client that closes ends the connection cleanly");
+    }
+
+    /// A writer that ends cleanly (here the sink is closed under it with nothing
+    /// queued) does not end the connection: the read loop keeps serving until the
+    /// client closes, and teardown does not await the finished writer a second
+    /// time (which would panic the task).
+    #[tokio::test]
+    async fn a_writer_that_ends_cleanly_does_not_end_the_connection() {
+        let server = server_with_deadline(Duration::from_millis(200));
+        let client = serve_over_tiny_pipe(&server, NotificationSink::new(64));
+        client.sink.close();
+        // Long enough for the writer to see the closed sink and finish.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !client.task.is_finished(),
+            "a cleanly ended writer leaves the read loop running"
+        );
+
+        drop((client.writer, client.lines));
+        let ended = tokio::time::timeout(Duration::from_secs(5), client.task)
+            .await
+            .expect("serve_lines ends once the client closes")
+            .expect("the serve_lines task did not panic at teardown");
+        ended.expect("a client that closes ends the connection cleanly");
+    }
+
+    /// A writer that takes every byte at once but whose `flush` never completes,
+    /// like a stdout whose consumer has stopped. Neither a duplex pipe nor a TCP
+    /// socket can make `flush` block (theirs finish at once), so the duplex and TCP
+    /// tests cannot tell whether the flush is under the write deadline.
+    struct StuckFlush;
+
+    impl AsyncWrite for StuckFlush {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The `flush` after a batch is under the write deadline too, not only each
+    /// `write_all`. This is the stdio shape, where `flush` is what waits on a
+    /// parent that has stopped reading our stdout.
+    #[tokio::test]
+    async fn a_flush_that_never_completes_hits_the_write_deadline() {
+        let sink = NotificationSink::new(4);
+        sink.push("a line".into());
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            write_loop(StuckFlush, sink, Duration::from_millis(100)),
+        )
+        .await
+        .expect("write_loop returned within 5 s of a 100 ms deadline instead of parking in flush");
+        let err = ended.expect_err("a flush that never completes ends the writer in error");
+        assert!(
+            err.to_string().contains("write timed out"),
+            "the error names the write deadline: {err}"
+        );
+    }
+
+    /// A client that keeps sending requests and never reads the replies is
+    /// disconnected, the stop the subscribe-then-stall test does not cover. The
+    /// writer stalls on the full pipe and replies pile up to the reply lane's
+    /// high-water mark (4 here), so the read loop is normally held back by that
+    /// backpressure rather than parked in `read_line` (the test does not assert
+    /// which of the two it is in). The client never closes, so only the writer's
+    /// failure can end the connection, and it must.
+    #[tokio::test]
+    async fn a_client_that_floods_requests_and_never_reads_replies_is_disconnected() {
+        let server = server_with_deadline(Duration::from_millis(200));
+        let LineClient {
+            writer: mut client_write,
+            lines: client_read,
+            sink,
+            task,
+        } = serve_over_tiny_pipe(&server, NotificationSink::with_limits(64, 4));
+
+        // Both client halves stay alive to the end, so the pipe never closes. The
+        // flood is its own task: once the server stops reading, its writes block.
+        let flood = tokio::spawn(async move {
+            for id in 0..64 {
+                let line = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/list"}}"#) + "\n";
+                if client_write.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            client_write
+        });
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("serve_lines returned within 5 s (the deadline is 200 ms) though the client never closed")
+            .expect("the serve_lines task did not panic");
+        let err = ended.expect_err("a writer that hit its deadline ends the connection in error");
+        assert!(
+            err.to_string().contains("write timed out"),
+            "the error names the write deadline: {err}"
+        );
+        assert!(
+            sink.is_closed(),
+            "the connection's sink is closed when it ends"
+        );
+        flood.abort();
+        drop(client_read);
+    }
+
+    /// A client that vanishes while the writer is blocked on a full pipe ends the
+    /// connection at once through the I/O error, long before the write deadline
+    /// (30 s here), and its subscription goes with it: a dead peer ends the
+    /// connection whichever of the reader or the writer notices it first.
+    #[tokio::test]
+    async fn a_client_that_disconnects_mid_write_ends_the_connection_at_once() {
+        let server = server_with_deadline(Duration::from_secs(30));
+        let mut client = serve_over_tiny_pipe(&server, NotificationSink::new(64));
+        client.subscribe().await;
+        for seq in 0..16 {
+            push_padded(&server, seq);
+        }
+        // Let the writer park in `write_all` on the full pipe, then vanish.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop((client.writer, client.lines));
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), client.task)
+            .await
+            .expect(
+                "serve_lines returned within 5 s of the disconnect, far inside the 30 s deadline",
+            )
+            .expect("the serve_lines task did not panic");
+        if let Err(err) = ended {
+            assert!(
+                !err.to_string().contains("write timed out"),
+                "a dead peer is an I/O error, not the write deadline: {err}"
+            );
+        }
+        assert!(
+            client.sink.is_closed(),
+            "the connection's sink is closed when it ends"
+        );
+        let before = client.sink.queued_len();
+        push_padded(&server, 99);
+        assert_eq!(
+            client.sink.queued_len(),
+            before,
+            "the subscription was dropped, so a later push reaches nothing"
+        );
+    }
+
+    /// Passes writes through to the server half of a pipe until `armed` is set,
+    /// then panics in `poll_write`: a writer whose task dies without returning an
+    /// error. Until it is armed the client can subscribe and read its reply.
+    struct PanicsWhenArmed {
+        inner: WriteHalf<DuplexStream>,
+        armed: Arc<AtomicBool>,
+    }
+
+    impl AsyncWrite for PanicsWhenArmed {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            assert!(
+                !self.armed.load(Ordering::SeqCst),
+                "the test armed this writer to panic"
+            );
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A writer task that panics ends the connection as an error, the same as one
+    /// that returns an error: `serve_lines` returns `Err` naming the writer task
+    /// (well inside the 30 s write deadline, so the deadline is not what ended it),
+    /// the sink is closed, and the connection's subscriptions are dropped. The
+    /// client subscribes and reads a pushed line first, so the subscription is
+    /// known to be live before the writer is armed to panic.
+    #[tokio::test]
+    async fn a_panicking_writer_ends_the_connection() {
+        let server = server_with_deadline(Duration::from_secs(30));
+        let armed = Arc::new(AtomicBool::new(false));
+        let mut client = serve_through(&server, NotificationSink::new(64), {
+            let armed = armed.clone();
+            move |inner| PanicsWhenArmed { inner, armed }
+        });
+        client.subscribe().await;
+        push_padded(&server, 0);
+        let line = client.next_json().await;
+        assert_eq!(
+            line["params"]["seq"], 0,
+            "the subscription is live and the writer works before it is armed: {line}"
+        );
+
+        armed.store(true, Ordering::SeqCst);
+        push_padded(&server, 1);
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), client.task)
+            .await
+            .expect("serve_lines returned within 5 s of the writer panicking")
+            .expect("the serve_lines task did not panic");
+        let err = ended.expect_err("a writer task that panicked ends the connection in error");
+        assert!(
+            err.to_string().contains("writer task failed"),
+            "the error names the failed writer task: {err}"
+        );
+        assert!(
+            client.sink.is_closed(),
+            "the connection's sink is closed when it ends"
+        );
+
+        let before = client.sink.queued_len();
+        push_padded(&server, 99);
+        assert_eq!(
+            client.sink.queued_len(),
+            before,
+            "the subscription was dropped, so a later push reaches nothing"
+        );
+        drop((client.writer, client.lines));
+    }
+
+    /// The write deadline reaches a real socket (bus-hardening AC16). The client's
+    /// receive buffer is 4096 bytes, it sends the token and a `flow.subscribe`,
+    /// reads the reply, and stops reading while the test pushes 16 MiB of state
+    /// lines. Once the server's own buffers fill, the 1 s write deadline ends the
+    /// writer and the server half-closes, so on resuming the client reads what was
+    /// buffered and then hits EOF, having received fewer bytes than were pushed.
+    ///
+    /// This proves only that the server stops writing and half-closes. It does not
+    /// prove that the read loop is abandoned or that the subscriptions are dropped:
+    /// dropping the write half sends a FIN whether or not `serve_lines` returns, so
+    /// the test stays green if the writer's error is ignored. Those two properties
+    /// are proven over a duplex pipe by
+    /// `a_stopped_line_reader_ends_the_connection_after_the_write_deadline` and
+    /// `a_client_that_floods_requests_and_never_reads_replies_is_disconnected`.
+    ///
+    /// Assumption: the kernel buffers along the loopback path hold well under
+    /// 16 MiB between them, so the pushes overrun them. `LoopbackTcp::bind` does
+    /// not let a test shrink the server's send buffer, so nothing here enforces it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopped_tcp_client_is_disconnected_by_the_write_deadline() {
+        // The default sink capacity, so every one of the pushes is attempted.
+        const LINES: usize = 4096;
+        const PAD: usize = 4096;
+        let server = server_with_deadline(Duration::from_secs(1));
+        let listener = LoopbackTcp::bind(0, "tok".into(), None)
+            .await
+            .expect("bind 127.0.0.1:0");
+        let addr = listener.local_addr();
+        let serving = tokio::spawn(listener.serve(server.clone()));
+
+        // The small receive buffer has to be set before connect to take effect.
+        let socket = TcpSocket::new_v4().expect("a TCP socket");
+        socket
+            .set_recv_buffer_size(4096)
+            .expect("shrink the receive buffer");
+        let stream = socket.connect(addr).await.expect("connect to the listener");
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        write_half
+            .write_all(b"{\"token\":\"tok\"}\n")
+            .await
+            .expect("send the token line");
+        write_half
+            .write_all(subscribe_line().as_bytes())
+            .await
+            .expect("send flow.subscribe");
+        let mut reply = String::new();
+        reader
+            .read_line(&mut reply)
+            .await
+            .expect("read the subscribe reply");
+        assert_subscribed_reply(&reply);
+
+        for seq in 0..LINES {
+            push_padded(&server, seq as u64);
+        }
+        // Stop reading while the server fills the socket buffers, hits its 1 s
+        // deadline, and gives the connection up.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let mut received = 0usize;
+        let reached_eof = tokio::time::timeout(Duration::from_secs(15), async {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => received += n,
+                }
+            }
+        })
+        .await;
+        assert!(
+            reached_eof.is_ok(),
+            "the server closed the connection once its write deadline expired \
+             (received {received} bytes, still open after 15 s)"
+        );
+        assert!(
+            received < LINES * PAD,
+            "the connection was cut before every pushed byte was delivered \
+             (received {received} of {} bytes)",
+            LINES * PAD
+        );
+        serving.abort();
+    }
+
+    // ---- Stage 5 tester additions: what a hostile client can put in `initialize`. ----
+
+    /// A message with `method` and `params`, as JSON text.
+    fn message(method: serde_json::Value, params: serde_json::Value) -> String {
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+            .to_string()
+    }
+
+    #[test]
+    fn client_label_from_initialize_gives_no_label_for_malformed_messages() {
+        let deep_array = "[".repeat(200_000);
+        let deep_params = format!(r#"{{"method":"initialize","params":{deep_array}"#);
+        let mut rows: Vec<(String, String)> = vec![
+            ("empty".into(), String::new()),
+            ("blank".into(), "  \n ".into()),
+            ("not JSON".into(), "not json".into()),
+            (
+                "truncated object".into(),
+                r#"{"method":"initialize""#.into(),
+            ),
+            ("null".into(), "null".into()),
+            ("array".into(), "[]".into()),
+            ("number".into(), "42".into()),
+            ("string".into(), r#""initialize""#.into()),
+            ("200k-deep array".into(), deep_array),
+            ("200k-deep params".into(), deep_params),
+            (
+                "no method".into(),
+                json!({"params": {"clientInfo": {"name": "x"}}}).to_string(),
+            ),
+        ];
+        // The method must be exactly the string `initialize`.
+        for method in [
+            json!("tools/call"),
+            json!("Initialize"),
+            json!(" initialize"),
+            json!(1),
+            json!(null),
+            json!(["initialize"]),
+        ] {
+            rows.push((
+                format!("method {method}"),
+                message(method, json!({"clientInfo": {"name": "x"}})),
+            ));
+        }
+        // `params.clientInfo.name` must be a string.
+        for (what, params) in [
+            ("no params", json!(null)),
+            ("array params", json!([{"clientInfo": {"name": "x"}}])),
+            ("string params", json!("clientInfo")),
+            ("no clientInfo", json!({})),
+            ("null clientInfo", json!({"clientInfo": null})),
+            ("string clientInfo", json!({"clientInfo": "x"})),
+            ("array clientInfo", json!({"clientInfo": ["x"]})),
+            ("no name", json!({"clientInfo": {}})),
+            ("null name", json!({"clientInfo": {"name": null}})),
+            ("number name", json!({"clientInfo": {"name": 7}})),
+            ("bool name", json!({"clientInfo": {"name": true}})),
+            ("array name", json!({"clientInfo": {"name": ["x"]}})),
+            ("object name", json!({"clientInfo": {"name": {"a": "x"}}})),
+        ] {
+            rows.push((what.into(), message(json!("initialize"), params)));
+        }
+        let leaked: Vec<&str> = rows
+            .iter()
+            .filter(|(_, text)| client_label_from_initialize(text).is_some())
+            .map(|(what, _)| what.as_str())
+            .collect();
+        assert!(leaked.is_empty(), "these gave a label: {leaked:?}");
+    }
+
+    #[test]
+    fn client_label_from_initialize_cleans_a_hostile_name() {
+        // Blank, invisible, and control-only names leave nothing to label with.
+        for name in [
+            "   ".to_string(),
+            "\t\n".to_string(),
+            "\u{200B}\u{FEFF}\u{202E}".to_string(),
+            "\u{0}\u{7}\u{1b}".to_string(),
+            "\u{200B}".repeat(1 << 20),
+            "\u{0}".repeat(1 << 18),
+        ] {
+            assert_eq!(
+                client_label_from_initialize(&initialize_with_name(&name)),
+                None,
+                "a name of {} chars made a label",
+                name.chars().count()
+            );
+        }
+        // Control characters go, a credential is masked, blanks are trimmed.
+        assert_eq!(
+            client_label_from_initialize(&initialize_with_name("agent\u{0}-x token=abc123zz")),
+            Some("agent-x token=[redacted]".to_string())
+        );
+        assert_eq!(
+            client_label_from_initialize(&initialize_with_name("  aitm-tui  ")),
+            Some("aitm-tui".to_string())
+        );
+        // Dressing the reserved name up does not get it past the guard.
+        assert_eq!(
+            client_label_from_initialize(&initialize_with_name("WEB\u{200B} bridge")),
+            Some("WEB bridge (declared)".to_string())
+        );
+        // JSON allows a name twice; the parser keeps the last, and the guard sees it.
+        assert_eq!(
+            client_label_from_initialize(
+                r#"{"method":"initialize","params":{"clientInfo":{"name":"a","name":"web-bridge"}}}"#
+            ),
+            Some("web-bridge (declared)".to_string())
+        );
     }
 }

@@ -9,14 +9,23 @@
 //!
 //! `connected_clients` is part of the declared `agent.status` shape; its data
 //! source (the connection registry) lands in a later M4 task, so it reports `[]`
-//! for now. `actions_last_minute` is sourced from the F2 audit ring (Task 8).
+//! for now. `actions_last_minute` is sourced from the F2 audit ring (Task 8), as
+//! the caller may see it, and `exclude_self` leaves out the caller's own connection.
 //! `agent.activity` (Read, any role) reads the same ring so a surface or a
-//! reconnecting agent can catch up on recent activity (spec D3a.4).
+//! reconnecting agent can catch up on recent activity (spec D3a.4); a caller that
+//! is not trusted control gets only the entries it may see (`AuditEntry::visible_to`).
+//!
+//! The audit ring has two lanes: an evidence lane (refusals, failures, and every
+//! Write or Sensitive run) and a routine lane (successful reads only), so a burst
+//! of reads cannot push evidence out. `actions_last_minute` counts both lanes,
+//! across every surface: a UI that polls `agent.status` counts too, unless it
+//! passes `exclude_self`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aitm_core::audit::{DEFAULT_AUDIT_CAPACITY, DEFAULT_ROUTINE_AUDIT_CAPACITY};
 use aitm_core::{
     AgentPolicy, AgentState, AuditRing, Command, CommandHost, ParamDef, ParamSchema, Params,
     Plugin, Registry, Sensitivity, TypeDesc, Value,
@@ -75,7 +84,18 @@ fn param(name: &str, ty: TypeDesc, required: bool, description: &str) -> ParamDe
     }
 }
 
-/// `agent.status {} -> {policy, actions_last_minute, connected_clients}` (Read).
+/// `agent.status {exclude_self?} -> {policy, actions_last_minute, connected_clients}`
+/// (Read; any role).
+///
+/// `actions_last_minute` is the caller's view of the ring
+/// ([`AuditRing::count_since_for`] with the caller's frontend): a caller that is not
+/// trusted control does not count entries made by trusted control (operator, CLI),
+/// so it equals what `agent.activity` would return to the same caller for the last
+/// minute. With `exclude_self: true` the entries made by the caller's own
+/// connection (the server-assigned id on [`CommandHost::connection_id`]) are left
+/// out, so a client's own polling does not inflate the number it reads. A caller
+/// with no connection id has nothing to exclude. The flag changes only the count
+/// this caller receives; it cannot lower what any other connection sees.
 struct AgentStatus {
     state: Arc<AgentState>,
     audit: Arc<AuditRing>,
@@ -94,9 +114,18 @@ impl Command for AgentStatus {
         ParamSchema {
             description:
                 "Report the current agent policy and recent agent activity. Read-only and \
-                          readable by any role."
+                          readable by any role, but the activity count covers only the entries \
+                          the caller may see: a caller that is not trusted control does not \
+                          count entries made by trusted control (operator, CLI)."
                     .to_string(),
-            params: vec![],
+            params: vec![param(
+                "exclude_self",
+                TypeDesc::Bool,
+                false,
+                "When true, leave out the calls made by this connection (for example a UI's own \
+                 polling) from `actions_last_minute`. Default false; a caller with no connection \
+                 id excludes nothing.",
+            )],
             result: TypeDesc::Object(vec![
                 param(
                     "policy",
@@ -108,8 +137,10 @@ impl Command for AgentStatus {
                     "actions_last_minute",
                     TypeDesc::Int,
                     true,
-                    "Command invocations recorded in the last minute (sourced from the F2 audit \
-                     ring).",
+                    "Command invocations still held in the audit ring that were recorded in the \
+                     last minute, across both lanes and every surface, and that the caller may \
+                     see (a polling UI counts, unless `exclude_self` leaves out its own \
+                     connection). Saturates at what the ring holds.",
                 ),
                 param(
                     "connected_clients",
@@ -126,10 +157,22 @@ impl Command for AgentStatus {
         }
     }
 
-    fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
-        let last_minute = self
-            .audit
-            .count_since(SystemTime::now() - Duration::from_secs(60));
+    fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        // `exclude_self` is a schema-declared optional boolean: a non-boolean never
+        // reaches here (the schema coercion refuses it as invalid params), and
+        // absent means off. The excluded id is the one the host carries; with
+        // none, nothing is excluded.
+        let exclude_self = matches!(args.get("exclude_self"), Some(Value::Bool(true)));
+        let exclude = if exclude_self {
+            host.connection_id()
+        } else {
+            None
+        };
+        let last_minute = self.audit.count_since_for(
+            host.frontend(),
+            SystemTime::now() - Duration::from_secs(60),
+            exclude,
+        );
         let mut fields = BTreeMap::new();
         fields.insert(
             "policy".to_string(),
@@ -205,6 +248,22 @@ impl Command for AgentSet {
 /// recent command activity without replaying the whole `notifications/aitm/agent`
 /// stream (spec D3a.4). `since` is Unix-epoch milliseconds (entries strictly
 /// after it); `limit` keeps the most recent `limit` of those.
+///
+/// Callable by any role, but the result is the caller's view of the ring
+/// ([`AuditRing::recent_for`] with the caller's frontend): a caller that is not
+/// trusted control never receives an entry made by trusted control (operator,
+/// CLI), and `limit` counts only the entries it may see. The ring itself, and
+/// the durable log, are never filtered.
+///
+/// Entries merge oldest-first across the ring's two lanes. The ring is a live
+/// view, not a complete record. A source that already holds one of a lane's table
+/// slots keeps a floor of its entries against a flood. That is not isolation: a
+/// source that arrives after the slots are taken, or that shares a label with a
+/// flooder, can be flushed, and every agent-token connection of the web bridge is
+/// ONE source, `(mcp, web-bridge)`. Labels are unauthenticated display strings;
+/// `origin` is authoritative. A call with no `limit` can return up to
+/// `DEFAULT_AUDIT_CAPACITY + DEFAULT_ROUTINE_AUDIT_CAPACITY` entries with the
+/// default lane sizes (both lanes full), so passing `limit` is advisable.
 struct AgentActivity(Arc<AuditRing>);
 
 impl Command for AgentActivity {
@@ -218,10 +277,16 @@ impl Command for AgentActivity {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "Recent command-invocation audit entries (who ran what, with what \
-                          redacted arguments, and the outcome), oldest first. Read-only and \
-                          readable by any role."
-                .to_string(),
+            description: format!(
+                "Recent command-invocation audit entries (who ran what, with what redacted \
+                 arguments, and the outcome), oldest first. A live view, not a complete \
+                 record: a high-volume source can flush other sources' entries. `origin` is \
+                 authoritative; `client_label` is an unauthenticated display string. A call \
+                 with no `limit` can return at most {} entries at the default sizes, so pass \
+                 `limit`. Read-only and readable by any role, but a caller that is not trusted \
+                 control does not see entries made by trusted control (operator, CLI).",
+                DEFAULT_AUDIT_CAPACITY + DEFAULT_ROUTINE_AUDIT_CAPACITY
+            ),
             params: vec![
                 param(
                     "since",
@@ -243,7 +308,16 @@ impl Command for AgentActivity {
                     "client_label",
                     TypeDesc::Str,
                     false,
-                    "The client label, when one was declared.",
+                    "The client label: the server-minted `web-bridge` for the web bridge, \
+                     otherwise the client's declared `initialize.clientInfo.name`, sanitised to \
+                     at most 64 characters. Display-only; `origin` is authoritative.",
+                ),
+                param(
+                    "connection_id",
+                    TypeDesc::Str,
+                    false,
+                    "The server-assigned id of the connection that made the call; null when not \
+                     attributable.",
                 ),
                 param("command", TypeDesc::Str, true, "The dotted command name."),
                 param(
@@ -262,7 +336,7 @@ impl Command for AgentActivity {
         }
     }
 
-    fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+    fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         let since = match args.get("since") {
             Some(Value::Int(ms)) if *ms >= 0 => {
                 Some(UNIX_EPOCH + Duration::from_millis(*ms as u64))
@@ -275,7 +349,7 @@ impl Command for AgentActivity {
         };
         let entries = self
             .0
-            .recent(since, limit)
+            .recent_for(host.frontend(), since, limit)
             .iter()
             .map(|e| e.to_value())
             .collect();
@@ -340,6 +414,94 @@ impl Command for AgentApprove {
         bail!(
             "agent.approve is resolved by the MCP server against its parked-request table; it \
              cannot be invoked in this context."
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A registry carrying the real `AgentPlugin` over a fresh state.
+    fn registry() -> Registry {
+        let mut reg = Registry::new();
+        reg.add_plugin(Box::new(AgentPlugin::new(Arc::new(AgentState::new(
+            AgentPolicy::Auto,
+        )))));
+        reg
+    }
+
+    /// AC16 (activity half): the `agent.activity` result object declares an optional
+    /// string `connection_id`, and its description says a caller that is not trusted
+    /// control does not see trusted-control entries.
+    #[test]
+    fn agent_activity_schema_declares_connection_id() {
+        let reg = registry();
+        let schema = reg
+            .command("agent.activity")
+            .expect("agent.activity is registered")
+            .schema();
+
+        let TypeDesc::Array(item) = &schema.result else {
+            panic!("agent.activity returns an array, got {:?}", schema.result);
+        };
+        let TypeDesc::Object(fields) = item.as_ref() else {
+            panic!("agent.activity items are objects, got {item:?}");
+        };
+        let field = fields
+            .iter()
+            .find(|f| f.name == "connection_id")
+            .unwrap_or_else(|| panic!("no connection_id field in {fields:?}"));
+        assert!(
+            matches!(field.ty, TypeDesc::Str),
+            "connection_id is a string, got {:?}",
+            field.ty
+        );
+        assert!(
+            !field.required,
+            "connection_id is optional (null when unattributable)"
+        );
+
+        assert!(
+            schema.description.contains("trusted control"),
+            "the description names the viewer filter: {}",
+            schema.description
+        );
+    }
+
+    /// AC16 (status half): `agent.status` declares exactly one param, an optional
+    /// boolean `exclude_self`, and its description says the count covers only the
+    /// entries the caller may see (a caller that is not trusted control).
+    #[test]
+    fn agent_status_schema_declares_exclude_self() {
+        let reg = registry();
+        let schema = reg
+            .command("agent.status")
+            .expect("agent.status is registered")
+            .schema();
+
+        let field = schema
+            .params
+            .iter()
+            .find(|p| p.name == "exclude_self")
+            .unwrap_or_else(|| panic!("no exclude_self param in {:?}", schema.params));
+        assert!(
+            matches!(field.ty, TypeDesc::Bool),
+            "exclude_self is a boolean, got {:?}",
+            field.ty
+        );
+        assert!(!field.required, "exclude_self is optional (default off)");
+        assert_eq!(
+            schema.params.len(),
+            1,
+            "exclude_self is the only param: {:?}",
+            schema.params
+        );
+
+        assert!(
+            schema.description.contains("trusted control"),
+            "the description names the viewer filter: {}",
+            schema.description
         );
     }
 }

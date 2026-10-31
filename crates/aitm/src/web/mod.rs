@@ -74,6 +74,10 @@ pub struct WebState {
     /// configured (operator role exists at all). `None` ⇒ the web UI is
     /// agent-only, exactly as before this change.
     pub operator_token: Option<String>,
+    /// Rate-limiter for the bad-token refusal warn, shared across every
+    /// connection via the `Arc`-shared `WebState` so a stale tab reconnecting
+    /// across connections logs at most one line per [`bridge::BAD_TOKEN_WINDOW`].
+    pub bad_token_throttle: bridge::BadTokenThrottle,
 }
 
 /// `aitm web …` after argument parsing.
@@ -210,6 +214,41 @@ pub fn log_listening(bound: SocketAddr) {
     tracing::info!(%bound, "web UI listening");
 }
 
+/// One legible, prominent startup block for `aitm web`, printed to **stdout**
+/// (never a tracing sink). It is the operator's first-run map: the Web UI URL
+/// (with its `#t=` token), the Operator URL when operator access is configured,
+/// the proxy and browser/obscura listen addresses, and the bus state.
+///
+/// The URLs carry the bus token *on purpose* — this is stdout, which the
+/// operator reads to open the UI; the token is the one bus-auth secret and must
+/// stay here, out of every logging sink (see [`log_listening`], which omits it).
+/// Labels are padded so every value lines up in one column.
+pub fn startup_summary(
+    web_url: &str,
+    operator_url: Option<&str>,
+    proxy: SocketAddr,
+    browser: SocketAddr,
+    bus: &str,
+) -> String {
+    use std::fmt::Write as _;
+    let rule = "─".repeat(60);
+    let mut out = String::new();
+    // Writing into the owned `String` is infallible, so the `writeln!` results are
+    // discarded deliberately.
+    let _ = writeln!(out, "{rule}");
+    let _ = writeln!(out, "  aitm web");
+    let _ = writeln!(out, "{rule}");
+    let _ = writeln!(out, "  Web UI     {web_url}");
+    if let Some(op) = operator_url {
+        let _ = writeln!(out, "  Operator   {op}");
+    }
+    let _ = writeln!(out, "  Proxy      {proxy}");
+    let _ = writeln!(out, "  Browser    {browser}  (SSRF-filtered)");
+    let _ = writeln!(out, "  Bus        {bus}");
+    out.push_str(&rule);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +376,43 @@ mod tests {
     fn operator_ui_url_adds_the_expect_operator_fragment() {
         let url = operator_ui_url("127.0.0.1:8082".parse().unwrap(), "deadbeef");
         assert_eq!(url, "http://127.0.0.1:8082/#t=deadbeef&expect=operator");
+    }
+
+    /// AC3: the one startup summary block carries every endpoint the operator
+    /// needs — the Web UI URL (with its token), the proxy and browser listen
+    /// addresses, and the bus state — and the Operator URL only when configured.
+    #[test]
+    fn startup_summary_lists_every_endpoint() {
+        // With an operator URL configured, it appears on its own line.
+        let s = startup_summary(
+            "http://127.0.0.1:8082/#t=deadbeef",
+            Some("http://127.0.0.1:8082/#t=optok&expect=operator"),
+            "127.0.0.1:8080".parse().unwrap(),
+            "127.0.0.1:8081".parse().unwrap(),
+            "ready",
+        );
+        assert!(s.contains("http://127.0.0.1:8082/#t=deadbeef"), "{s}");
+        assert!(s.contains("127.0.0.1:8080"), "{s}");
+        assert!(s.contains("127.0.0.1:8081"), "{s}");
+        assert!(s.contains("ready"), "{s}");
+        assert!(
+            s.contains("http://127.0.0.1:8082/#t=optok&expect=operator"),
+            "{s}"
+        );
+
+        // Without an operator URL, the block still carries every other field
+        // and never mentions the operator fragment.
+        let s = startup_summary(
+            "http://127.0.0.1:8082/#t=deadbeef",
+            None,
+            "127.0.0.1:8080".parse().unwrap(),
+            "127.0.0.1:8081".parse().unwrap(),
+            "ready",
+        );
+        assert!(s.contains("http://127.0.0.1:8082/#t=deadbeef"), "{s}");
+        assert!(s.contains("127.0.0.1:8080"), "{s}");
+        assert!(s.contains("127.0.0.1:8081"), "{s}");
+        assert!(!s.contains("expect=operator"), "{s}");
     }
 
     /// C4 regression: the "listening" log carries the bound address but never

@@ -575,3 +575,85 @@ describe('createWsBus subscribes on every open', () => {
     expect(h).toHaveBeenCalledTimes(1);
   });
 });
+
+// A stale tab (left open from a prior `aitm web` run) presents a now-invalid token. The server
+// refuses it with a 1008 (Policy) close or an `id:null` / code `-32001` reply; the client must stop
+// hammering, go to the `'unauthorized'` state and surface the reopen-the-URL message (D4, AC4/AC5).
+// A non-auth close (1006/1001/network) is a transient blip and must still reconnect with the token.
+describe('createWsBus auth failure', () => {
+  let clients: ReturnType<typeof createWsBus>[] = [];
+  const bus = () => {
+    const c = createWsBus({ url: 'ws://127.0.0.1/bus', token: 'bridge-token', backoff: [5] });
+    clients.push(c);
+    return c;
+  };
+  beforeEach(() => {
+    FakeWebSocket.last = null;
+    FakeWebSocket.count = 0;
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+  });
+  afterEach(() => {
+    for (const c of clients) c.close();
+    clients = [];
+    vi.unstubAllGlobals();
+  });
+
+  it('a_bad_token_reply_then_1008_stays_unauthorized', async () => {
+    // The real bad-token sequence the bridge produces: the `-32001` reply (Signal A) arrives first and
+    // latches the auth failure, then the Policy (1008) close follows. The tab must stay unauthorized and
+    // not reconnect.
+    const client = bus();
+    client.connect();
+    const sock = FakeWebSocket.last!;
+    sock.onopen?.();
+    sock.onmessage?.({
+      data: JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32001, message: 'unauthorized' } }) + '\n',
+    });
+    sock.onclose?.({ code: 1008 });
+
+    expect(client.state()).toBe('unauthorized');
+    expect(client.lastError()).toContain('reopen');
+    await sleep(30); // long enough for a back-off (5 ms) reconnect to have shown up, had one been scheduled
+    expect(FakeWebSocket.count).toBe(1);
+  });
+
+  it('a_bare_1008_close_reconnects', async () => {
+    // A 1008 (Policy) close WITHOUT a preceding `-32001` reply is an authentication *timeout*, not a bad
+    // token (e.g. a valid tab whose first send was delayed past the handshake deadline). It is transient
+    // and must reconnect — not latch the valid tab into `unauthorized`.
+    const client = bus();
+    client.connect();
+    const sock = FakeWebSocket.last!;
+    sock.onopen?.();
+    sock.onclose?.({ code: 1008 });
+
+    expect(client.state()).toBe('reconnecting');
+    expect(client.state()).not.toBe('unauthorized');
+  });
+
+  it('a_minus32001_reply_stops_reconnecting', async () => {
+    const client = bus();
+    client.connect();
+    const sock = FakeWebSocket.last!;
+    sock.onopen?.();
+    sock.onmessage?.({
+      data: JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32001, message: 'unauthorized' } }) + '\n',
+    });
+
+    expect(client.state()).toBe('unauthorized');
+    expect(client.lastError()).toContain('reopen');
+    await sleep(30);
+    expect(FakeWebSocket.count).toBe(1);
+  });
+
+  it('a_1006_close_still_reconnects', async () => {
+    const client = bus();
+    client.connect();
+    const sock = FakeWebSocket.last!;
+    sock.onopen?.();
+    sock.onclose?.({ code: 1006 });
+
+    // A non-auth close is a transient blip, not an auth failure: it must still schedule a reconnect.
+    expect(client.state()).toBe('reconnecting');
+  });
+});

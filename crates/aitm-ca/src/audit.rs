@@ -189,8 +189,12 @@ impl aitm_core::AuditSink for FileAuditLog {
 }
 
 /// One core [`aitm_core::AuditEntry`] as a JSON Lines object — the general-audit
-/// format, shared by the in-memory ring's rendering (`to_value`), the agent
-/// stream, and this durable log so CA entries are a subset of one shape.
+/// format, one shape shared by the in-memory ring's rendering
+/// ([`aitm_core::AuditEntry::to_value`]), the agent stream, and this durable log,
+/// so CA entries are a subset of it. The key set is the same as `to_value`'s:
+/// `at`, `origin`, `client_label`, `connection_id`, `command`, `args`, `result`.
+/// `connection_id` is the server-assigned connection id (a string), or `null`
+/// when the call is not attributable to a streaming connection.
 pub fn entry_to_jsonl(entry: &aitm_core::AuditEntry) -> String {
     let result = match &entry.result {
         aitm_core::AuditResult::Ok => serde_json::json!("ok"),
@@ -200,6 +204,7 @@ pub fn entry_to_jsonl(entry: &aitm_core::AuditEntry) -> String {
         "at": entry.at_millis(),
         "origin": aitm_core::origin_label(entry.origin),
         "client_label": entry.client_label,
+        "connection_id": entry.connection_id,
         "command": entry.command,
         "args": entry.args_summary,
         "result": result,

@@ -61,7 +61,7 @@ export interface ToolCallResult {
   isError?: boolean;
 }
 
-export type BusState = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed';
+export type BusState = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed' | 'unauthorized';
 
 /**
  * The connection role the server/bridge resolves from the presented token (Decision A/C). The
