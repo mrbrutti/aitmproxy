@@ -11,20 +11,24 @@ struct HexView: View {
     private var lineCount: Int { HexDump.lineCount(data.count) }
 
     var body: some View {
-        ScrollView([.vertical, .horizontal]) {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                if data.isEmpty {
-                    Hint(text: "No body")
+        // The content is at least the viewport's size, so a short dump sits
+        // top-leading and never floats in the middle of the pane (as CodeView).
+        GeometryReader { viewport in
+            ScrollView([.vertical, .horizontal]) {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    if data.isEmpty {
+                        Hint(text: "No body")
+                    }
+                    ForEach(0..<lineCount, id: \.self) { index in
+                        HexRow(line: HexDump.lines(data, range: index..<(index + 1)).first, bodySize: bodySize)
+                    }
                 }
-                ForEach(0..<lineCount, id: \.self) { index in
-                    HexRow(line: HexDump.lines(data, range: index..<(index + 1)).first, bodySize: bodySize)
-                }
+                .padding(Space.md)
+                .frame(minWidth: viewport.size.width, minHeight: viewport.size.height, alignment: .topLeading)
             }
-            .padding(Space.md)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .textSelection(.enabled)
+            .accessibilityLabel("Hex dump, \(lineCount) lines")
         }
-        .textSelection(.enabled)
-        .accessibilityLabel("Hex dump, \(lineCount) lines")
     }
 }
 

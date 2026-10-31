@@ -1,11 +1,12 @@
 import AitmproxyKit
 import SwiftUI
 
-/// The Timing tab (S-020): one bar per phase, proportional to the longest,
-/// in the tertiary tier with the duration printed beside it; the total under
-/// them. A missing phase prints a dash and no bar; a real zero prints `0 ms`.
-/// No timing (the live bus does not carry phase timings yet, F5): a follow-up
-/// notice, not perpetual loading bars.
+/// The Timing tab (S-020): a real waterfall — each phase's bar starts where the
+/// previous one ended and is scaled to the total, so DNS → Connect → TLS → Wait →
+/// Download reads left to right. The duration is printed beside each bar and the
+/// total under them. A missing phase prints a dash and no bar; a real zero prints
+/// `0 ms`. No timing (the live bus does not carry phase timings yet, F5): a
+/// follow-up notice, not perpetual loading bars.
 struct TimingView: View {
     var timing: FlowTiming?
     /// The row's Duration column, when known; printed beside the sum if they differ.
@@ -14,8 +15,8 @@ struct TimingView: View {
     var body: some View {
         if let timing {
             VStack(alignment: .leading, spacing: Space.sm) {
-                ForEach(FlowTiming.Phase.allCases, id: \.self) { phase in
-                    PhaseRow(phase: phase, duration: timing.duration(of: phase), longest: longest(timing))
+                ForEach(cascade(timing), id: \.phase) { step in
+                    PhaseRow(phase: step.phase, duration: step.duration, start: step.start, total: timing.total)
                 }
                 Text(totalText(timing))
                     .font(Tok.Face.ui(Tok.Typography.Size.sm, .medium))
@@ -44,8 +45,17 @@ struct TimingView: View {
         }
     }
 
-    private func longest(_ timing: FlowTiming) -> Duration {
-        FlowTiming.Phase.allCases.compactMap(timing.duration(of:)).max() ?? .zero
+    /// Each phase with the cumulative offset where its bar begins (the sum of the
+    /// prior phases; a missing phase contributes nothing to the offset).
+    private func cascade(_ timing: FlowTiming) -> [(phase: FlowTiming.Phase, duration: Duration?, start: Duration)] {
+        var start: Duration = .zero
+        var steps: [(FlowTiming.Phase, Duration?, Duration)] = []
+        for phase in FlowTiming.Phase.allCases {
+            let duration = timing.duration(of: phase)
+            steps.append((phase, duration, start))
+            start += duration ?? .zero
+        }
+        return steps
     }
 
     /// `total 412 ms`, or `total 412 ms · row 415 ms` when the row's Duration disagrees.
@@ -58,11 +68,13 @@ struct TimingView: View {
     }
 }
 
-/// `Wait  ▬▬▬▬▬▬▬  289 ms`
+/// `Wait        ▬▬▬▬▬▬▬  289 ms` — the bar sits at its start offset in the track.
 private struct PhaseRow: View {
     var phase: FlowTiming.Phase
     var duration: Duration?
-    var longest: Duration
+    /// Cumulative offset where this phase's bar begins.
+    var start: Duration
+    var total: Duration
 
     var body: some View {
         HStack(spacing: Space.md) {
@@ -74,6 +86,8 @@ private struct PhaseRow: View {
                 RoundedRectangle(cornerRadius: Tok.Radius.badge)
                     .fill(Self.color(for: phase))
                     .frame(width: barWidth(in: geo.size.width), height: Space.sm)
+                    .padding(.leading, fraction(start) * geo.size.width)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(height: Space.sm)
             Text(Format.duration(duration))
@@ -84,7 +98,9 @@ private struct PhaseRow: View {
         .frame(height: Space.xl)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(phase.rawValue)
-        .accessibilityValue(duration.map(Format.duration) ?? "not reported")
+        .accessibilityValue(duration == nil ? "not reported"
+            : "starts at \(Format.duration(start)), \(Format.duration(duration))")
+        .help(duration == nil ? "" : "Starts at \(Format.duration(start))")
     }
 
     /// Each phase a distinct hue, waterfall-style (dns · connect · tls · wait · download).
@@ -98,9 +114,14 @@ private struct PhaseRow: View {
     }
 
     private func barWidth(in available: CGFloat) -> CGFloat {
-        guard let duration, duration > .zero, longest > .zero else { return 0 }
-        let fraction = seconds(duration) / seconds(longest)
-        return max(2, available * fraction)
+        guard let duration, duration > .zero, total > .zero else { return 0 }
+        return max(2, available * fraction(duration))
+    }
+
+    /// This duration as a share of the whole flow, clamped to the track.
+    private func fraction(_ d: Duration) -> CGFloat {
+        guard total > .zero else { return 0 }
+        return min(1, CGFloat(seconds(d) / seconds(total)))
     }
 
     private func seconds(_ d: Duration) -> Double {

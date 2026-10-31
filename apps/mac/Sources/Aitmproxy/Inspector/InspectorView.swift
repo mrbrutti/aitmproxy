@@ -13,6 +13,7 @@ struct InspectorView: View {
             VStack(spacing: 0) {
                 if let row = session.focusedRow {
                     SummaryStrip(row: row, detail: session.focusedDetail)
+                        .gridProbe("inspector.strip", area: "inspector", edge: nil)
                     Rule()
                     if row.kind == .websocket {
                         // A WebSocket is a message stream, not a request/response pair (S-045).
@@ -37,6 +38,7 @@ struct InspectorView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .gridArea("inspector", inset: 0)
         }
         .background(Tok.Ground.surface.color)
     }
@@ -44,10 +46,10 @@ struct InspectorView: View {
 
 struct EmptyInspector: View {
     var body: some View {
-        VStack(spacing: Space.sm) {
-            Text("Nothing selected").font(Tok.Face.ui(Tok.Typography.Size.xl, .medium)).foregroundStyle(Tok.Ink.primary.color)
-            Text("Select a flow to inspect it, or press ↑ ↓.").font(Tok.Face.ui(Tok.Typography.Size.md))
-                .foregroundStyle(Tok.Ink.tertiary.color)
+        ContentUnavailableView {
+            Label("No Flow Selected", systemImage: "square.dashed")
+        } description: {
+            Text("Select a flow in the list to inspect it, or press ↑ ↓.")
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -62,18 +64,16 @@ struct SummaryStrip: View {
         HStack(spacing: Tok.Metric.padInner) {
             Badge(text: row.method.label, pair: row.method.badge)
             statusPill
-            HStack(spacing: 0) {
-                Text(row.site).foregroundStyle(Tok.Ink.primary.color)
-                Text(row.path).foregroundStyle(Tok.Ink.link.color)
-                if let query = row.query { Text("?\(query)").foregroundStyle(Tok.Ink.tertiary.color) }
-            }
-            .font(Tok.Face.data(Tok.Typography.Size.md))
-            .lineLimit(1)
-            .truncationMode(.middle)
-            // Deterministic read-back of which flow the inspector is showing (CUA / a11y).
-            .accessibilityElement(children: .ignore)
-            .accessibilityIdentifier("inspector-url")
-            .accessibilityValue(row.url)
+            // One concatenated Text so a single middle-truncation applies to the whole
+            // URL, instead of three Texts each ellipsing on their own.
+            url
+                .font(Tok.Face.data(Tok.Typography.Size.md))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                // Deterministic read-back of which flow the inspector is showing (CUA / a11y).
+                .accessibilityElement(children: .ignore)
+                .accessibilityIdentifier("inspector-url")
+                .accessibilityValue(row.url)
             if let detail {
                 ExportMenu(detail: detail, row: row)
             } else {
@@ -88,12 +88,17 @@ struct SummaryStrip: View {
                 .help("Copy URL")
             }
             Spacer(minLength: Space.sm)
+            // The meta keeps its full size; the URL truncates instead of the numbers.
             HStack(spacing: Tok.Metric.gapMeta) {
                 if let c = detail?.connection {
                     Text([c.httpVersion, c.tlsVersion, c.alpn].compactMap { $0 }.joined(separator: " · "))
                 }
-                meta("req", Format.bytes(row.requestBytes))
-                if row.responseBytes != nil { meta("resp", Format.bytes(row.responseBytes)) }
+                // A WebSocket / raw-L4 flow has no request/response byte split, so those
+                // columns would read "req –"; show the stream's size cues only.
+                if !isStream {
+                    meta("req", Format.bytes(row.requestBytes))
+                    if row.responseBytes != nil { meta("resp", Format.bytes(row.responseBytes)) }
+                }
                 if let d = row.duration { meta("", Format.duration(d)) }
                 if let client = detail?.connection.clientAddress { meta("client", client) }
                 Text(row.inScope ? "in scope" : "out of scope")
@@ -102,9 +107,24 @@ struct SummaryStrip: View {
             .font(Tok.Face.ui(Tok.Typography.Size.sm))
             .foregroundStyle(Tok.Ink.secondary.color)
             .lineLimit(1)
+            .fixedSize()
+            .layoutPriority(1)
         }
         .padding(.horizontal, Space.md)
         .frame(height: Tok.Size.inspectorHeader)
+    }
+
+    /// A WebSocket or raw-L4 flow: a message stream, not a request/response pair.
+    private var isStream: Bool { row.kind == .websocket || row.kind == .l4 }
+
+    /// `site` + `path` + `?query` as one Text, so middle-truncation treats it as a whole.
+    private var url: Text {
+        var text = Text(row.site).foregroundStyle(Tok.Ink.primary.color)
+            + Text(row.path).foregroundStyle(Tok.Ink.link.color)
+        if let query = row.query {
+            text = text + Text("?\(query)").foregroundStyle(Tok.Ink.tertiary.color)
+        }
+        return text
     }
 
     private func meta(_ label: String, _ value: String) -> some View {
@@ -160,46 +180,49 @@ struct PaneTabs<Tab: Hashable & CustomStringConvertible, Trailing: View>: View {
 
     var body: some View {
         HStack(spacing: Space.sm) {
-            // The tabs scroll when the pane is narrow; they never wrap and never widen the window.
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 2) {
-                    Text(title).font(Tok.Face.ui(Tok.Typography.Size.lg, .semibold)).foregroundStyle(Tok.Ink.primary.color)
-                        .padding(.trailing, Tok.Metric.padInner)
-                        .fixedSize()
-                    ForEach(tabs, id: \.self) { tab in
-                        let on = tab == selected
-                        Button { selected = tab } label: {
-                            Text(tab.description)
-                                .font(Tok.Face.ui(Tok.Typography.Size.md, on ? .medium : .regular))
-                                .foregroundStyle(on ? Palette.accentText : Tok.Ink.secondary.color)
-                                .lineLimit(1)
-                                .fixedSize()
-                                .padding(.horizontal, Tok.Metric.gapTight)
-                                .frame(height: Tok.Size.tabBar)
-                                .overlay(alignment: .bottom) {
-                                    if on { Rectangle().fill(Palette.accent).frame(height: 2).padding(.horizontal, Tok.Metric.gapTight) }
-                                }
-                                .contentShape(Rectangle())
+            // The tabs scroll when the pane is narrow; they never wrap and never widen
+            // the window. The selected tab is always scrolled into view, so a late tab
+            // (JSON, Diff) can never be the one pushed off-screen by the trailing controls.
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 2) {
+                        Text(title).font(Tok.Face.ui(Tok.Typography.Size.lg, .semibold)).foregroundStyle(Tok.Ink.primary.color)
+                            .padding(.trailing, Tok.Metric.padInner)
+                            .fixedSize()
+                        ForEach(tabs, id: \.self) { tab in
+                            tabButton(tab).id(tab)
                         }
-                        .buttonStyle(.plain)
                     }
-                    Button {} label: {
-                        Text("+").font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.tertiary.color)
-                            .padding(.horizontal, Tok.Metric.gapTight).frame(height: Tok.Size.tabBar)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Add viewer")
                 }
+                .frame(minWidth: 72, minHeight: Tok.Size.tabBar, maxHeight: Tok.Size.tabBar)
+                .onAppear { proxy.scrollTo(selected, anchor: .center) }
+                .onChange(of: selected) { _, tab in proxy.scrollTo(tab, anchor: .center) }
             }
-            .frame(height: Tok.Size.tabBar)
-            Spacer(minLength: 0)
+            Spacer(minLength: Space.sm)
             trailing
-                .layoutPriority(1)
         }
         .padding(.horizontal, Space.md)
         .frame(height: Tok.Size.tabBar)
         .frame(minWidth: 0)
         .overlay(alignment: .bottom) { Rule() }
+    }
+
+    private func tabButton(_ tab: Tab) -> some View {
+        let on = tab == selected
+        return Button { selected = tab } label: {
+            Text(tab.description)
+                .font(Tok.Face.ui(Tok.Typography.Size.md, on ? .medium : .regular))
+                .foregroundStyle(on ? Palette.accentText : Tok.Ink.secondary.color)
+                .lineLimit(1)
+                .fixedSize()
+                .padding(.horizontal, Tok.Metric.gapTight)
+                .frame(height: Tok.Size.tabBar)
+                .overlay(alignment: .bottom) {
+                    if on { Rectangle().fill(Palette.accent).frame(height: 2).padding(.horizontal, Tok.Metric.gapTight) }
+                }
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -250,6 +273,7 @@ final class BodyViewState {
     var rendered = false
     var find = FindState()
     var findShown = false
+    var imageZoom: ImageZoom = .fit
 }
 
 /// Picks the viewer a body needs (foundation §2.7 "Body viewers"): images,
@@ -266,7 +290,7 @@ struct BodyHost: View {
     var body: some View {
         if let data = message.body, !data.isEmpty {
             switch (state.format, BodyKind.detect(contentType: message.contentType, data: data)) {
-            case (.auto, .image): ImageBodyView(data: data, contentType: message.contentType)
+            case (.auto, .image): ImageBodyView(data: data, contentType: message.contentType, zoom: state.imageZoom)
             case (.auto, .protobuf): ProtobufBodyView(data: data, bodySize: bodySize)
             case (.auto, .messagepack): MessagePackBodyView(data: data, bodySize: bodySize)
             default:
@@ -289,10 +313,9 @@ struct BodyHost: View {
             let kind = BodyKind.detect(contentType: message.contentType, data: data)
             let detected = BodyFormat.detect(message)
             HStack(spacing: Space.xs) {
-                if state.findShown { FindBar(state: state.find, isPresented: $state.findShown) }
                 if let extent, extent.isTruncated { TruncatedChip(extent: extent) }
                 if case .image = kind, state.format == .auto {
-                    ImageControls(data: data, contentType: message.contentType)
+                    ImageControls(data: data, contentType: message.contentType, zoom: $state.imageZoom)
                 } else if state.format == .auto, (message.contentType ?? "").lowercased().hasPrefix("text/event-stream") {
                     SSEControls(state: sseState)
                 } else {
@@ -345,6 +368,7 @@ struct RequestPane: View {
 
     var body: some View {
         @Bindable var session = session
+        @Bindable var bodyState = bodyState
         VStack(spacing: 0) {
             PaneTabs(title: "Request", tabs: RequestTab.allCases, selected: $session.requestTab) {
                 if tab == .body, let detail {
@@ -354,6 +378,9 @@ struct RequestPane: View {
                     Text(n > 0 ? "\(n) pending" : "editing").font(Tok.Face.ui(Tok.Typography.Size.sm))
                         .foregroundStyle(n > 0 ? Tok.Intercept.deep.color : Tok.Ink.tertiary.color)
                 }
+            }
+            if tab == .body, bodyState.findShown {
+                FindRow(state: bodyState.find, isPresented: $bodyState.findShown)
             }
             if let detail {
                 switch tab {
@@ -389,7 +416,7 @@ struct RequestPane: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onChange(of: session.findRequestTick) { if tab == .body { bodyState.findShown = true } }
-        .onChange(of: row.id) { bodyState.format = .auto; bodyState.findShown = false }
+        .onChange(of: row.id) { bodyState.format = .auto; bodyState.findShown = false; bodyState.imageZoom = .fit }
     }
 }
 
@@ -411,6 +438,13 @@ struct ResponsePane: View {
         return (a, b)
     }
 
+    /// `#45 → #46` for the two compared flows, in capture order.
+    private var compareLabel: String? {
+        let chosen = session.rows.filter { session.selection.contains($0.id) }
+        guard chosen.count == 2 else { return nil }
+        return "#\(chosen[0].seq) → #\(chosen[1].seq)"
+    }
+
     private var treeState: JSONTreeState? {
         if let tree, tree.0 == row.id { return tree.1 }
         return nil
@@ -418,9 +452,13 @@ struct ResponsePane: View {
 
     var body: some View {
         @Bindable var session = session
+        @Bindable var bodyState = bodyState
         VStack(spacing: 0) {
             PaneTabs(title: "Response", tabs: ResponseTab.allCases, selected: $session.responseTab) {
                 trailing
+            }
+            if tab == .body, bodyState.findShown {
+                FindRow(state: bodyState.find, isPresented: $bodyState.findShown)
             }
             if let response = detail?.response {
                 switch tab {
@@ -443,18 +481,22 @@ struct ResponsePane: View {
                 diff
             } else if row.state == .paused, let previous = previousResponse {
                 CodeView(lines: BodyLines.body(previous),
-                         header: "No response yet — the request is paused. Showing the last response to this endpoint (flow 38, 11:04:12) for reference.",
+                         header: "No response yet — the request is paused. Showing the last response to this endpoint for reference.",
                          footer: nil)
             } else if row.state == .pending || detail == nil {
                 LoadingLines()
             } else {
-                Text(row.state == .killed ? "Killed — no response" : "No response")
-                    .font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.secondary.color)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                ContentUnavailableView {
+                    Label("No Response", systemImage: row.state == .killed ? "xmark.circle" : "tray")
+                } description: {
+                    Text(row.state == .killed ? "This flow was killed before a response arrived."
+                         : "No response was received for this flow.")
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .onChange(of: row.id, initial: true) { rebuildTree(); bodyState.format = .auto; bodyState.findShown = false }
+        .onChange(of: row.id, initial: true) { rebuildTree(); bodyState.format = .auto; bodyState.findShown = false; bodyState.imageZoom = .fit }
         .onChange(of: detail?.response?.body) { rebuildTree() }
         .onChange(of: session.findRequestTick) { if tab == .body { bodyState.findShown = true } }
     }
@@ -473,7 +515,7 @@ struct ResponsePane: View {
         case .json:
             if let state = treeState { JSONTreeControls(state: state) }
         case .diff:
-            if let pair = diffPair { DiffControls(result: FlowDiff.compare(pair.0, pair.1), state: diffState) }
+            if let pair = diffPair { DiffControls(result: FlowDiff.compare(pair.0, pair.1), state: diffState, compareLabel: compareLabel) }
         case .body:
             if let response = detail?.response {
                 BodyHost.controls(message: response, extent: detail?.responseBodyExtent, state: bodyState, sseState: sseState)
