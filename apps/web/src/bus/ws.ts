@@ -41,6 +41,7 @@ interface Pending {
 export function createWsBus(opts: WsBusOptions): BusClient {
   const backoff = opts.backoff ?? [250, 500, 1000, 2000, 5000];
   const subscribeTimeoutMs = opts.subscribeTimeoutMs ?? 3000;
+  const UNAUTHORIZED_MESSAGE = 'token expired — reopen the URL printed by `aitm web`';
   const [state, setState] = createSignal<BusState>('idle');
   const [lastError, setLastError] = createSignal<string | null>(null);
   const [role, setRole] = createSignal<BusRole | null>(null);
@@ -51,6 +52,9 @@ export function createWsBus(opts: WsBusOptions): BusClient {
   let nextId = 1;
   let attempt = 0;
   let closedByUser = false;
+  // Set once the server refuses this connection's token (a 1008 close or an `id:null`/-32001 reply).
+  // A stale tab must stop reconnecting and show why, instead of hammering a token that will never work.
+  let authFailed = false;
   let toolsCache: ToolDef[] | null = null;
   let ready: Promise<void> = Promise.resolve();
   let readyPending = false;
@@ -111,6 +115,19 @@ export function createWsBus(opts: WsBusOptions): BusClient {
   }
 
   /**
+   * The server rejected this connection's token. Latch `authFailed` so `scheduleReconnect` stops, go
+   * to the `'unauthorized'` state with the reopen-the-URL message, fail any in-flight calls, and
+   * release waiters. A stale tab reconnecting forever with a dead token is the thing to prevent.
+   */
+  function markAuthFailed() {
+    authFailed = true;
+    setState('unauthorized');
+    setLastError(UNAUTHORIZED_MESSAGE);
+    failAllPending(UNAUTHORIZED_MESSAGE);
+    settleReady();
+  }
+
+  /**
    * Subscribe this connection to flow/agent pushes (`flow.subscribe {}`), awaited before the bus is
    * marked open so the stream exists before the bootstrap `flow.list` goes out (the bridge runs
    * frames concurrently; only an awaited reply orders them). Goes through `request`, not
@@ -165,6 +182,12 @@ export function createWsBus(opts: WsBusOptions): BusClient {
         }
         continue;
       }
+      // Signal A — the definitive refusal reply: an error with no request id (`id:null`/undefined) and
+      // the unauthorized code. Not a reply to any pending call, so it must be handled before that branch.
+      if ((msg.id === null || msg.id === undefined) && msg.error?.code === -32001) {
+        markAuthFailed();
+        continue;
+      }
       if (typeof msg.id === 'number') {
         const p = pending.get(msg.id);
         if (!p) continue;
@@ -176,7 +199,7 @@ export function createWsBus(opts: WsBusOptions): BusClient {
   }
 
   function scheduleReconnect() {
-    if (closedByUser) return;
+    if (closedByUser || authFailed) return;
     const delay = backoff[Math.min(attempt, backoff.length - 1)] ?? 5000;
     attempt++;
     setState('reconnecting');
@@ -217,6 +240,9 @@ export function createWsBus(opts: WsBusOptions): BusClient {
         setState('open');
         settleReady();
       } catch (e) {
+        // A pending `initialize` rejected by an auth-failure close/reply lands here; the unauthorized
+        // state and message are already set and must not be overwritten with the rejection text.
+        if (authFailed) return;
         setLastError((e as Error).message);
         sock.close();
       }
@@ -229,6 +255,12 @@ export function createWsBus(opts: WsBusOptions): BusClient {
       toolsCache = null;
       setRole(null); // role is per-connection; re-resolved on the next initialize.
       failAllPending(`bus closed (${ev.code})`);
+      // A bad token is caught by Signal A (the `-32001` reply) in `onMessage`, which the bridge always
+      // sends *before* it closes with `CloseCode::Policy` (1008) — so `authFailed` is already latched
+      // here and `scheduleReconnect` returns early. The close code itself is NOT used to detect auth
+      // failure: the bridge also closes with 1008 on an authentication *timeout* (a valid tab whose
+      // first send was delayed), which is transient and must reconnect, not latch the tab into
+      // `unauthorized`. So every close that is not an already-latched auth failure reconnects.
       if (closedByUser) setState('closed');
       else scheduleReconnect();
     };
@@ -245,6 +277,7 @@ export function createWsBus(opts: WsBusOptions): BusClient {
     roleMismatch: () => expectRole != null && role() !== expectRole,
     connect() {
       closedByUser = false;
+      authFailed = false; // an explicit reconnect may carry a fresh token, so let it retry.
       if (ws || timer) return;
       attempt = 0;
       open();

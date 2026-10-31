@@ -333,6 +333,7 @@ async fn scan_discover_over_the_web_bridge_returns() {
         mcp: rig.mcp.clone(),
         agent_token: "a".repeat(64),
         operator_token: Some(operator.clone()),
+        bad_token_throttle: Default::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

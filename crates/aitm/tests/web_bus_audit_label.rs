@@ -92,6 +92,7 @@ async fn start(tag: &str) -> Server {
         mcp,
         agent_token: AGENT_TOKEN.to_owned(),
         operator_token: Some(OPERATOR_TOKEN.to_owned()),
+        bad_token_throttle: Default::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

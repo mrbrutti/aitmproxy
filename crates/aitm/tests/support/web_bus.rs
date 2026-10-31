@@ -467,6 +467,7 @@ pub async fn start(tag: &str, commands: &TestCommands, opts: ServerOptions) -> S
         mcp: mcp.clone(),
         agent_token: AGENT_TOKEN.to_owned(),
         operator_token: opts.operator_token,
+        bad_token_throttle: Default::default(),
     });
     let listener = match opts.send_buffer {
         // A `TcpSocket` is the only way to set `SO_SNDBUF` before `listen`, which
