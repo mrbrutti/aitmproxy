@@ -12,6 +12,16 @@
 //! flow then goes direct/uncaptured but works. Widening would make the provider
 //! commit to MITM on a flow the core guard then refuses, breaking the user's
 //! connection (spec Anti-goals).
+//!
+//! **Transport.** The L7 tokens this module emits — `host`, `host:port`, and
+//! `*.suffix` — gate **TCP flows only**. A UDP flow is claimed by the provider solely
+//! through an L4 IP token (`ip` / `ip:port`, from `l4_token`), and a datagram to port
+//! 53, 5353, or 853 is **never** claimed, whatever the tokens say
+//! (`FlowHandoff.swift` `ScopeMatcher.matches(kind:…)` and `neverClaimedDatagramPorts`).
+//! The embedded core has no UDP backend, so the provider must fail open on the system
+//! resolver: macOS attributes an app's DNS lookup to that app *with the looked-up name
+//! attached*, so a host token would otherwise match the port-53 datagram and
+//! black-hole the lookup (observed live, 2026-10-31).
 
 use std::net::{IpAddr, SocketAddr};
 
