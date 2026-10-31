@@ -1103,3 +1103,68 @@ fn request_trailers_are_parsed_bounded_and_dropped() {
     let events = m.on_bytes(Side::Client, &wire).unwrap();
     assert_eq!(events.len(), 3, "64 request trailer fields are accepted");
 }
+
+/// The origin hangs up inside the trailer section: two fields arrived whole and a
+/// third was cut off, and no blank line ever came. A chunked body that was not
+/// terminated is not a complete response, so the machine must not report one, and
+/// must not capture half a section as if it were the origin's trailers.
+#[test]
+fn an_eof_inside_the_trailer_section_does_not_complete_the_response() {
+    let (mut m, _) = at_trailer_section();
+    assert_eq!(
+        m.on_bytes(Side::Server, b"X-A: 1\r\nx-b: 2\r\nx-c: par")
+            .unwrap(),
+        vec![],
+        "the section is still open"
+    );
+
+    assert_eq!(
+        m.on_eof(Side::Server),
+        vec![],
+        "a cut-short chunked body is not a complete response"
+    );
+    assert!(
+        trailers_of(&m).is_empty(),
+        "a section that never ended is not captured"
+    );
+}
+
+/// The request side's caps hold when the section arrives a line per read, as a
+/// hostile client would send it to keep each read under the limit: the budget is
+/// the whole section's, not each read's, so the section is refused at the field
+/// or the byte that crosses it and cannot be fed forever.
+#[test]
+fn request_trailer_caps_hold_when_the_section_arrives_a_line_per_read() {
+    let head = b"POST /u HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n";
+
+    // 64 fields, each in its own read, are within the cap; the 65th is refused.
+    let mut m = Http1Machine::new();
+    m.on_bytes(Side::Client, head).unwrap();
+    for i in 0..64 {
+        let events = m
+            .on_bytes(Side::Client, format!("f{i}: v\r\n").as_bytes())
+            .unwrap_or_else(|e| panic!("field {i} of 64 is within the cap: {e}"));
+        assert_eq!(events, vec![], "the section is still open after field {i}");
+    }
+    let err = m
+        .on_bytes(Side::Client, b"f64: v\r\n")
+        .expect_err("the 65th field, alone in its read, crosses the cap");
+    assert!(err.to_string().contains("trailer"), "{err}");
+
+    // Sixteen 1 KiB lines, each in its own read, fill 16384 counted bytes; the
+    // seventeenth crosses it.
+    let kib = format!("x: {}\r\n", "v".repeat(1019)).into_bytes();
+    assert_eq!(kib.len(), 1024);
+    let mut m = Http1Machine::new();
+    m.on_bytes(Side::Client, head).unwrap();
+    for n in 1..=16 {
+        let events = m
+            .on_bytes(Side::Client, &kib)
+            .unwrap_or_else(|e| panic!("line {n} of 16 is within the cap: {e}"));
+        assert_eq!(events, vec![], "the section is still open after line {n}");
+    }
+    let err = m
+        .on_bytes(Side::Client, &kib)
+        .expect_err("the 17th 1 KiB line crosses 16384 counted bytes");
+    assert!(err.to_string().contains("trailer"), "{err}");
+}

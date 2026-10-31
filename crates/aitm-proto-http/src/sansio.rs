@@ -1578,6 +1578,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn expectation_is_not_pending_when_part_of_the_body_arrived_with_the_head() {
+        // Any content byte buffered with the head makes the go-ahead pointless,
+        // not only a whole body: five bytes are declared and three came with it.
+        let mut raw = expect_head("Expect: 100-continue\r\n");
+        raw.extend_from_slice(b"hel");
+        let (m, events) = after_request(&raw);
+        let id = request_id(&events);
+        assert_eq!(
+            events,
+            vec![
+                HttpSansIoEvent::RequestHeaders(id),
+                HttpSansIoEvent::RequestBodyChunk {
+                    flow: id,
+                    bytes: b"hel".to_vec()
+                },
+            ]
+        );
+        assert!(
+            !m.expects_continue(),
+            "a partial body arrived with the head"
+        );
+    }
+
+    #[test]
+    fn expectation_holds_for_every_http_1_x_but_1_0() {
+        // The machine accepts any `HTTP/1.x` request line; only the exact token
+        // `HTTP/1.0` is exempt, every later minor version counts as 1.1 or later.
+        for (version, want) in [
+            ("HTTP/1.1", true),
+            ("HTTP/1.2", true),
+            ("HTTP/1.9", true),
+            ("HTTP/1.0", false),
+        ] {
+            let raw = format!(
+                "POST /u {version}\r\nHost: h\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n"
+            );
+            let (m, _) = after_request(raw.as_bytes());
+            assert_eq!(m.expects_continue(), want, "request line version {version}");
+        }
+    }
+
     // ---- writing a response's trailers ------------------------------------
 
     /// A response head carrying `headers` with a streamed body.
@@ -1868,6 +1910,39 @@ mod tests {
         assert_eq!(
             m.poll_outbound(Side::Client),
             Some(b"0\r\nX-Sum: abc\r\nx-sum: def\r\n\r\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn an_empty_trailer_value_survives_capture_and_forwarding() {
+        // A field with no value is legal. It is captured as an empty string, and
+        // what the writer emits for it parses back to the same capture, so a
+        // forwarded empty field is still the field the origin sent.
+        const CHUNKED_HEAD: &[u8] =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n";
+        let parse = |wire: &[u8]| {
+            let mut m = Http1Machine::new();
+            m.on_bytes(Side::Client, b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n")
+                .unwrap();
+            m.on_bytes(Side::Server, wire).unwrap();
+            m.response().expect("response").trailers.clone()
+        };
+        let mut wire = CHUNKED_HEAD.to_vec();
+        wire.extend_from_slice(b"0\r\nx-empty:\r\nx-sum: abc\r\n\r\n");
+        let captured = parse(&wire);
+        assert_eq!(
+            captured.iter().collect::<Vec<_>>(),
+            vec![("x-empty", ""), ("x-sum", "abc")]
+        );
+
+        let mut m = chunk_framed_machine();
+        assert_eq!(m.enqueue_body_end_with_trailers(Side::Client, &captured), 0);
+        let written = m.poll_outbound(Side::Client).expect("a terminator");
+        let mut again = CHUNKED_HEAD.to_vec();
+        again.extend_from_slice(&written);
+        assert_eq!(
+            parse(&again).iter().collect::<Vec<_>>(),
+            captured.iter().collect::<Vec<_>>()
         );
     }
 }

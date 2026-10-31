@@ -4704,6 +4704,138 @@ mod tests {
         );
     }
 
+    /// A chunked upload's head with an expectation: no `Content-Length`, so no
+    /// declared size to refuse it on.
+    const CHUNKED_STRICT_HEAD: &str = "POST /up HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n";
+
+    #[tokio::test]
+    async fn serve_answers_a_chunked_upload_expectation_and_forwards_it_reframed() {
+        // A chunked head declares no length, so it is never refused early on size:
+        // it gets the go-ahead, and the origin receives the body framed by length.
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+        let origin_saw = Arc::new(Mutex::new(Vec::new()));
+        let _origin = tokio::spawn(origin_replying(
+            origin_end,
+            origin_saw.clone(),
+            vec![vec![REPLY_OK]],
+        ));
+
+        let (served, (interim, body, pending)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                client
+                    .write_all(CHUNKED_STRICT_HEAD.as_bytes())
+                    .await
+                    .expect("send head");
+                let interim = read_interim(&mut client, Duration::from_secs(1)).await;
+                client
+                    .write_all(b"3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n")
+                    .await
+                    .expect("send body");
+                let mut pending = Vec::new();
+                let body = read_response_keep(&mut client, &mut pending).await;
+                (interim, body, pending)
+            },
+        )
+        .await;
+
+        served.expect("serve ends cleanly when the client hangs up");
+        assert_eq!(
+            interim.as_deref(),
+            Some(CONTINUE),
+            "the go-ahead for a chunked upload"
+        );
+        assert_eq!(body, "ok");
+        assert!(pending.is_empty(), "pending: {pending:?}");
+        let origin_saw =
+            String::from_utf8_lossy(&origin_saw.lock().expect("seen lock")).into_owned();
+        assert!(
+            origin_saw.contains("Expect: 100-continue\r\n"),
+            "the expectation is forwarded untouched: {origin_saw:?}"
+        );
+        assert!(
+            origin_saw.ends_with("Content-Length: 5\r\n\r\nhello"),
+            "the origin gets the whole body, framed by length: {origin_saw:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_caps_a_chunked_upload_with_an_expectation_as_its_bytes_arrive() {
+        // With no declared length the head cannot be refused, so the client is
+        // told to go ahead; the cap then bites as the body crosses it.
+        let (ctx, dialed) = ctx_with(Vec::new());
+
+        let (served, (interim, rest)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            4,
+            |mut client| async move {
+                client
+                    .write_all(CHUNKED_STRICT_HEAD.as_bytes())
+                    .await
+                    .expect("send head");
+                let interim = read_interim(&mut client, Duration::from_secs(1)).await;
+                client
+                    .write_all(b"5\r\nhello\r\n0\r\n\r\n")
+                    .await
+                    .expect("send body");
+                let mut rest = Vec::new();
+                client.read_to_end(&mut rest).await.expect("read to EOF");
+                (interim, rest)
+            },
+        )
+        .await;
+
+        served.expect("a refused request ends cleanly");
+        assert_eq!(
+            interim.as_deref(),
+            Some(CONTINUE),
+            "a chunked head is not refused before its body, whatever the cap"
+        );
+        let rest = String::from_utf8_lossy(&rest).into_owned();
+        assert!(
+            rest.starts_with("HTTP/1.1 413 Payload Too Large\r\n"),
+            "response: {rest:?}"
+        );
+        assert!(rest.ends_with(OVERSIZED_BODY), "response: {rest:?}");
+        assert!(dialed.lock().expect("dialed lock").is_empty());
+        assert!(stored_http(&ctx, "/up").metadata.truncated);
+    }
+
+    #[tokio::test]
+    async fn serve_ends_quietly_when_the_client_leaves_before_it_can_be_answered() {
+        // The client sends its head and hangs up. The write of the interim fails;
+        // that is the client going away, not a fault for the accept loop to log,
+        // and nothing is dialed for a request that never finished.
+        let (ctx, dialed) = ctx_with(Vec::new());
+
+        let (served, ()) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                client
+                    .write_all(STRICT_HEAD.as_bytes())
+                    .await
+                    .expect("send head");
+                // Dropping the client end hangs up before the proxy can answer.
+            },
+        )
+        .await;
+
+        served.expect("a client that leaves before the interim is not an error");
+        assert!(
+            dialed.lock().expect("dialed lock").is_empty(),
+            "nothing may be dialed"
+        );
+    }
+
     // ---- chunked trailers through `serve` -----------------------------------
 
     /// The head of a chunked response that announces two trailer fields, and its one
@@ -5187,6 +5319,79 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("cookie"),
             "a withheld field's name must not be logged either: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_fails_closed_when_the_origin_drops_inside_the_trailer_section() {
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed, sink) = ctx_recording(vec![Box::pin(up)]);
+        // The origin sends the head, the chunk and a section cut off mid-field, then
+        // hangs up. Nothing in it is a complete trailer section.
+        let _origin = tokio::spawn(async move {
+            let mut io = origin_end;
+            let mut request = [0u8; 512];
+            let _ = io.read(&mut request).await;
+            for segment in [TRAILER_HEAD, "0\r\nx-sum: abc\r\nx-e2e: m"] {
+                io.write_all(segment.as_bytes())
+                    .await
+                    .expect("origin write");
+                io.flush().await.expect("origin flush");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // `io` is dropped here: the connection closes inside the section.
+        });
+
+        let (served, (got, closed)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                client
+                    .write_all(get_request("/t", "127.0.0.1:8080").as_bytes())
+                    .await
+                    .expect("send");
+                read_to_close(&mut client, Duration::from_secs(2)).await
+            },
+        )
+        .await;
+
+        let err = served.expect_err("an origin that drops mid-section fails the connection");
+        assert!(
+            err.to_string().contains("closed before completing"),
+            "error: {err}"
+        );
+        assert!(
+            closed,
+            "the proxy must hang up, not keep the client waiting"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            TRAILER_HEAD,
+            "the client has the head and the chunk, and never a terminator"
+        );
+        let flow = stored_http(&ctx, "/t");
+        assert!(
+            flow.response
+                .as_ref()
+                .is_some_and(|r| r.trailers.is_empty()),
+            "half a section is not captured as the origin's trailers"
+        );
+        let events = sink.events.lock().expect("events lock");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::Error { flow: f, .. } if *f == flow.id))
+                .count(),
+            1,
+            "one typed error for the broken response: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::Response(f) if *f == flow.id)),
+            "an incomplete response is never dispatched as complete: {events:?}"
         );
     }
 }
