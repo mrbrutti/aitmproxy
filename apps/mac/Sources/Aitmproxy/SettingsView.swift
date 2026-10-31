@@ -154,6 +154,18 @@ struct ProxySettings: View {
 
     private var usesEmbedded: Bool { (ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded) == .embedded }
 
+    /// Apply & Restart is live only for the embedded core and only once an edit
+    /// diverges from what the running core was started with. With no applied
+    /// snapshot yet (no core up, or a fixture) it stays live so a first Apply can
+    /// start the core.
+    private var canApply: Bool {
+        guard usesEmbedded else { return false }
+        guard let connection = session.coreHealth.connection,
+              let appliedPort = connection.appliedPort,
+              let appliedVerifyTLS = connection.appliedVerifyUpstreamTLS else { return true }
+        return port != appliedPort || verifyTLS != appliedVerifyTLS
+    }
+
     var body: some View {
         @Bindable var session = session
         Section("Embedded proxy") {
@@ -172,7 +184,7 @@ struct ProxySettings: View {
         .disabled(!usesEmbedded)
         Section {
             Button("Apply and Restart Core") { session.restartCoreTick += 1 }
-                .disabled(!usesEmbedded)
+                .disabled(!canApply)
             Text(usesEmbedded
                  ? "The bundled core restarts to apply these — the proxy and bus briefly drop and rebind. If the chosen port is taken, the core picks a free one, shown above as the bound address."
                  : "The active core is external; its port and TLS come from the config.yaml it was launched with. Switch to the embedded core in Bus to manage them here.")

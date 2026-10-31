@@ -56,6 +56,7 @@ private let withResponse = [41, 42, 43, 44, 45, 46, 47, 48, 53, 54]
         "~u \"\\\"quoted\\\"\"",
         "~u \"\"",
         "~scope out",
+        "~state paused",
         "~ws sent",
         "~path:eq /api/me & ~query page",
         "~comment todo",
@@ -177,6 +178,16 @@ private let withResponse = [41, 42, 43, 44, 45, 46, 47, 48, 53, 54]
         #expect(try seqs("~origin human") == [])
         #expect(try seqs("~replay") == [46])
         #expect(try seqs("~origin agent & !~replay") == [48])
+    }
+
+    @Test func state() throws {
+        #expect(try seqs("~state paused") == [50, 51])
+        #expect(try seqs("~state killed") == [49])
+        #expect(try seqs("~state pending") == [52])
+        #expect(try seqs("~state failed") == [])
+        #expect(try seqs("~state complete") == [41, 42, 43, 44, 45, 46, 47, 48, 53, 54])
+        // The Errors tile's set: transport failures, killed flows, or 5xx.
+        #expect(try seqs("~state failed | ~state killed | ~c 5") == [45, 49])
     }
 
     @Test func marks() throws {
@@ -511,7 +522,7 @@ private let withResponse = [41, 42, 43, 44, 45, 46, 47, 48, 53, 54]
     }
 
     @Test func fieldAndOperatorCatalog() {
-        #expect(FilterField.allCases.count == 19)
+        #expect(FilterField.allCases.count == 20)
         #expect(FilterOperator.allCases.count == 8)
         #expect(FilterField.allCases.allSatisfy { !$0.title.isEmpty && !$0.operators.isEmpty })
         #expect(FilterOperator.allCases.allSatisfy { !$0.title.isEmpty })
