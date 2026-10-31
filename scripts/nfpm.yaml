@@ -59,6 +59,12 @@ contents:
     dst: "/usr/lib/aitmproxy/aitm-tui"
     file_info:
       mode: 0o755
+  # The default detection catalogue, discovered beside the binary. No file_info:
+  # the staged tree already carries the right modes (package-linux.sh sets files
+  # 0644 and dirs 0755), and a blanket `mode: 0o644` here would also land on the
+  # directories, dropping their execute bit and making the catalogue unreadable.
+  - src: "${STAGEDIR}/usr/lib/aitmproxy/share/aitm/scripts"
+    dst: "/usr/lib/aitmproxy/share/aitm/scripts"
   - src: "/usr/lib/aitmproxy/aitm"
     dst: "/usr/bin/aitm"
     type: symlink

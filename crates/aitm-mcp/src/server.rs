@@ -73,15 +73,19 @@ pub const UNAUTHORIZED: i64 = -32001;
 /// threaded into every message on that connection through [`McpServer::handle_on`].
 ///
 /// The `role` drives policy and confirmation decisions (Tasks 4/5/9); the
-/// `client_label` is the connection's `initialize.clientInfo.name`, carried for
-/// audit only. `out` is the bounded push sink the transport's writer task drains
+/// `client_label` is the connection's declared name, carried for audit only and
+/// sanitised on every consumption (the audit entry and the command host both read
+/// it through one helper), so whatever sets it, the ring never holds more than 64
+/// characters of it. `out` is the bounded push sink the transport's writer task drains
 /// (F4); `conn_id` identifies the connection so its subscriptions are dropped
 /// when it ends. In-process callers (`McpServer::handle`) have no push sink.
 #[derive(Debug, Clone)]
 pub struct ConnCtx {
     /// The frontend this connection speaks as.
     pub role: Frontend,
-    /// The human-readable client label from `initialize.clientInfo.name`.
+    /// The human-readable client label: `initialize.clientInfo.name` for a TCP or
+    /// stdio client, a server-minted name for the web bridge. Display only; it is
+    /// sanitised (bounded, scrubbed) each time it is consumed, not trusted as set.
     pub client_label: Option<String>,
     /// A per-connection id, assigned by the transport, used to drop this
     /// connection's subscriptions when it ends. `0` means "not a streaming
@@ -423,6 +427,13 @@ struct Subscriptions {
 struct SubState {
     next_sub: u64,
     subs: Vec<Subscription>,
+    /// The connections that had a line suppressed under a muted policy and have
+    /// not yet been told (so the first delivery after the mute is preceded by the
+    /// `lagged` marker). Per connection, never a single registry-wide flag: the
+    /// first delivery would clear a flag and a second connection would never be
+    /// told. Written and cleared only inside [`Subscriptions::fanout`] and
+    /// [`Subscriptions::drop_connection`], under the registry lock.
+    gapped: Vec<u64>,
 }
 
 impl Subscriptions {
@@ -473,17 +484,66 @@ impl Subscriptions {
         self.lock().subs.iter().any(|s| s.role == role)
     }
 
-    /// Push `line` to each subscribed connection of `role` (once per connection).
-    fn fanout_role(&self, role: Frontend, line: &str) {
-        let st = self.lock();
+    /// The only code that enqueues to a subscription's sink on a fan-out. The
+    /// `fanout_*` entry points just say which subscriptions want the line, and
+    /// `pushes_muted` is a required argument, so a new fan-out cannot forget the
+    /// mute.
+    ///
+    /// While pushes are muted, a subscription whose role is not trusted control
+    /// ([`Frontend::is_trusted_control`]) gets nothing and its connection is
+    /// recorded in `gapped`. The next delivery to a recorded connection is preceded
+    /// by one `lagged` state line. This function sends that marker itself instead of
+    /// setting the sink's own overflow flag, because the next `drain` would write
+    /// that flag while the policy is still muted and leak a bit under pause. The
+    /// policy is read once, under the registry lock, so one snapshot covers every
+    /// subscription and the read is as late as it can be. `wants` is tested first,
+    /// so a connection is marked only when a line it would have received was
+    /// suppressed. A connection gets the line at most once per call, and a due
+    /// `lagged` marker precedes it.
+    ///
+    /// A mute stops new lines, not everything already in motion. These are accepted:
+    ///
+    /// - Lines already queued in an agent sink may still be written. Nothing is
+    ///   purged, and the bound is the sink capacity. That includes the sink's own
+    ///   overflow `lagged` marker if an overflow happened before the pause.
+    /// - A `flow.subscribe {since}` that passed the gate just before the flip may
+    ///   replay just after it (a replay is not a fan-out).
+    /// - A fan-out that read the policy just before the flip may enqueue just after
+    ///   it.
+    fn fanout(
+        &self,
+        wants: &dyn Fn(&Subscription) -> bool,
+        line: &str,
+        pushes_muted: &dyn Fn() -> bool,
+    ) {
+        let mut guard = self.lock();
+        let muted = pushes_muted();
+        let st = &mut *guard;
         let mut seen: Vec<u64> = Vec::new();
         for sub in &st.subs {
-            if sub.role != role || seen.contains(&sub.conn_id) {
+            if seen.contains(&sub.conn_id) || !wants(sub) {
                 continue;
             }
             seen.push(sub.conn_id);
+            if muted && !sub.role.is_trusted_control() {
+                if !st.gapped.contains(&sub.conn_id) {
+                    st.gapped.push(sub.conn_id);
+                }
+                continue;
+            }
+            if let Some(at) = st.gapped.iter().position(|c| *c == sub.conn_id) {
+                st.gapped.swap_remove(at);
+                sub.sink.push(lagged_state_line());
+            }
             sub.sink.push(line.to_string());
         }
+    }
+
+    /// Push `line` to each subscribed connection of `role` (once per connection),
+    /// through [`Subscriptions::fanout`]: an agent-role connection is not enqueued
+    /// the line while `pushes_muted` says so.
+    fn fanout_role(&self, role: Frontend, line: &str, pushes_muted: &dyn Fn() -> bool) {
+        self.fanout(&|sub| sub.role == role, line, pushes_muted);
     }
 
     /// Remove `sub_id` if it belongs to `conn_id`. Returns whether it existed.
@@ -495,37 +555,29 @@ impl Subscriptions {
         st.subs.len() != before
     }
 
-    /// Drop every subscription belonging to `conn_id` (connection ended).
+    /// Drop every subscription belonging to `conn_id` (connection ended), and its
+    /// recorded gap if it has one, under the same lock: connection ids are never
+    /// reused, so a gap left behind could never be cleared and would leak.
     fn drop_connection(&self, conn_id: u64) {
-        self.lock().subs.retain(|s| s.conn_id != conn_id);
+        let mut st = self.lock();
+        st.subs.retain(|s| s.conn_id != conn_id);
+        st.gapped.retain(|c| *c != conn_id);
     }
 
     /// Push `line` to each connection with at least one subscription matching
-    /// `flow` (at most once per connection, even with several matching subs).
-    fn fanout_flow(&self, flow: &Flow, line: &str) {
-        let st = self.lock();
-        let mut seen: Vec<u64> = Vec::new();
-        for sub in &st.subs {
-            if seen.contains(&sub.conn_id) || !sub.filter.matches(flow) {
-                continue;
-            }
-            seen.push(sub.conn_id);
-            sub.sink.push(line.to_string());
-        }
+    /// `flow` (at most once per connection, even with several matching subs),
+    /// through [`Subscriptions::fanout`]: an agent-role connection is not enqueued
+    /// the line while `pushes_muted` says so.
+    fn fanout_flow(&self, flow: &Flow, line: &str, pushes_muted: &dyn Fn() -> bool) {
+        self.fanout(&|sub| sub.filter.matches(flow), line, pushes_muted);
     }
 
     /// Push `line` to every subscribed connection (once each), regardless of
-    /// filter — state changes concern the whole session.
-    fn fanout_state(&self, line: &str) {
-        let st = self.lock();
-        let mut seen: Vec<u64> = Vec::new();
-        for sub in &st.subs {
-            if seen.contains(&sub.conn_id) {
-                continue;
-            }
-            seen.push(sub.conn_id);
-            sub.sink.push(line.to_string());
-        }
+    /// filter — state changes concern the whole session — through
+    /// [`Subscriptions::fanout`]: an agent-role connection is not enqueued the line
+    /// while `pushes_muted` says so.
+    fn fanout_state(&self, line: &str, pushes_muted: &dyn Fn() -> bool) {
+        self.fanout(&|_sub| true, line, pushes_muted);
     }
 }
 
@@ -646,6 +698,13 @@ fn needs_confirmation(prompt: &str, token: &str) -> JsonValue {
 /// blocking threads leaves ample headroom for the operator's control path (RF#5).
 const MAX_PARKED_REQUESTS: usize = 64;
 
+/// How often a parked waiter re-reads the agent policy while it waits for an
+/// operator. Short enough that a call whose policy has left `ask` is denied about
+/// one slice later rather than at the approval timeout, long enough to cost almost
+/// nothing: at most [`MAX_PARKED_REQUESTS`] waiters, each doing one atomic load
+/// five times a second. See `McpServer::park_for_approval` and `ParkSlot::wait`.
+const PARK_POLICY_RECHECK: Duration = Duration::from_millis(200);
+
 struct ParkedRequests {
     inner: Mutex<ParkState>,
     /// Maximum number of requests parked at once; a further park is refused.
@@ -692,18 +751,42 @@ impl ParkSlot {
         self.cv.notify_all();
     }
 
-    /// Block until resolved or `timeout` elapses; `Some(allow)` if resolved,
-    /// `None` on timeout. Never hangs (Review Focus #4).
-    fn wait(&self, timeout: Duration) -> Option<bool> {
-        let guard = self
+    /// Block until the slot is resolved, `timeout` elapses, or `still_ask` says the
+    /// policy the call was parked under no longer holds, whichever comes first.
+    ///
+    /// The wait is cut into slices of at most `recheck`, so the policy is read about
+    /// that often rather than only at the timeout. A resolved slot is checked before
+    /// the policy on every pass, so an approval that landed wins over a policy change
+    /// seen in the same pass. The policy is not read before the first slice has run
+    /// (a call is not second-guessed in the instant it parks). `still_ask` must be
+    /// lock-free: it runs with the slot's mutex held. A `timeout` too large to
+    /// matter, such as `Duration::MAX`, is effectively unbounded and does not panic.
+    fn wait(&self, timeout: Duration, recheck: Duration, still_ask: &dyn Fn() -> bool) -> ParkWait {
+        let start = Instant::now();
+        let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let guard = match self.cv.wait_timeout_while(guard, timeout, |s| s.is_none()) {
-            Ok((g, _)) => g,
-            Err(poisoned) => poisoned.into_inner().0,
-        };
-        *guard
+        loop {
+            if let Some(allow) = *state {
+                return ParkWait::Resolved(allow);
+            }
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return ParkWait::TimedOut;
+            }
+            let slice = recheck.min(remaining);
+            state = match self.cv.wait_timeout_while(state, slice, |s| s.is_none()) {
+                Ok((guard, _)) => guard,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+            if let Some(allow) = *state {
+                return ParkWait::Resolved(allow);
+            }
+            if !still_ask() {
+                return ParkWait::PolicyChanged;
+            }
+        }
     }
 }
 
@@ -767,8 +850,61 @@ impl ParkedRequests {
 enum ParkOutcome {
     /// An operator approved it; the caller runs the command and returns its result.
     Approved,
-    /// Denied, timed out, or no operator was connected — the agent call is refused.
+    /// Denied, timed out, the agent policy left `ask`, or no operator was connected
+    /// — the agent call is refused.
     Refused(String),
+}
+
+/// How a parked waiter's wait ended (what [`ParkSlot::wait`] returns).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParkWait {
+    /// An operator resolved the slot: `true` approved, `false` denied.
+    Resolved(bool),
+    /// The approval timeout elapsed with the slot unresolved.
+    TimedOut,
+    /// The agent policy was no longer `ask` at a recheck, with the slot unresolved.
+    PolicyChanged,
+}
+
+/// The one test for "the policy a request was parked under still holds", used by
+/// `agent.approve` (`McpServer::handle_approve`), by the waiter's slice recheck
+/// (`McpServer::park_for_approval`), and by [`settle_park`], so the three layers
+/// cannot disagree. A parked request exists only under `ask`.
+///
+/// An unknown future posture (`AgentPolicy` is `#[non_exhaustive]`) is not `Ask`,
+/// so it fails closed and denies the request, as [`agent_reads_allowed`] does.
+fn ask_still_in_force(policy: AgentPolicy) -> bool {
+    policy == AgentPolicy::Ask
+}
+
+/// The pure decision after a parked waiter's wait returns: what the wait ended in,
+/// and the policy read **after** it returned (the slot's guard already released),
+/// become the call's [`ParkOutcome`]. Being pure it can be tested over its whole
+/// table, including approve-then-pause, without a timer.
+///
+/// - `Resolved(true)` is `Approved` only while the policy is still `ask`; under any
+///   other value (including an unknown future one) it is refused naming the change,
+///   because an approval is a grant for the posture it was given under;
+/// - `Resolved(false)` is refused with the existing denial text, under every policy;
+/// - `TimedOut` is refused with the existing timeout text, under every policy;
+/// - `PolicyChanged` is refused naming the change.
+fn settle_park(name: &str, wait: ParkWait, policy: AgentPolicy) -> ParkOutcome {
+    match wait {
+        ParkWait::Resolved(true) if ask_still_in_force(policy) => ParkOutcome::Approved,
+        ParkWait::Resolved(true) | ParkWait::PolicyChanged => ParkOutcome::Refused(format!(
+            "`{name}` refused: the agent policy changed from `ask` to `{}` while this sensitive \
+             command awaited operator approval, so it was not run. Re-issue it if the new \
+             policy allows.",
+            policy.label()
+        )),
+        ParkWait::Resolved(false) => ParkOutcome::Refused(format!(
+            "`{name}` refused: an operator denied the parked sensitive command."
+        )),
+        ParkWait::TimedOut => ParkOutcome::Refused(format!(
+            "`{name}` refused: no operator approved the parked sensitive command within the \
+             approval timeout."
+        )),
+    }
 }
 
 /// The core services a `CommandHost` borrows; shared handles so one server can
@@ -1006,14 +1142,33 @@ impl McpServer {
     }
 
     /// Drop every subscription a connection held (called by the transport when
-    /// the connection ends).
+    /// the connection ends), and the record that it had a push suppressed while
+    /// the agent policy was `paused` (see [`McpServer::push_flow_event`]), so the
+    /// per-connection gap set cannot outlive the connection.
     pub fn drop_connection(&self, conn_id: u64) {
         self.subscriptions.drop_connection(conn_id);
+    }
+
+    /// Whether pushes to a non-trusted-control (agent-role) subscription are
+    /// suppressed right now: the live agent policy, read from the shared
+    /// [`AgentState`] at the moment of the push. It is the same decision
+    /// `read_refusal` makes for a fresh `flow.subscribe`, through the one predicate
+    /// `agent_reads_allowed`, so "may subscribe" and "receives pushes" cannot drift.
+    fn agent_pushes_muted(&self) -> bool {
+        !agent_reads_allowed(self.agent_state.policy())
     }
 
     /// Render `ev` as a `notifications/aitm/flow` line and fan it to every
     /// subscription whose filter matches the event's flow. Non-blocking; a slow
     /// subscriber's sink absorbs or drops the line without stalling the caller.
+    ///
+    /// While the agent policy is `paused` the line is **not enqueued** for a
+    /// non-trusted-control (agent-role) subscription; that connection is recorded
+    /// as having a gap, and the first line delivered to it after the policy relaxes
+    /// is preceded by one `notifications/aitm/state {"lagged":true}` marker ("catch
+    /// up via `flow.list`"). Operator and CLI subscriptions are never muted. The
+    /// policy is read at the push, from the state this server shares with every
+    /// other server on it, so an `agent.set` run anywhere takes effect here.
     pub fn push_flow_event(&self, ev: &Event) {
         let Some(id) = event_flow_id(ev) else {
             return;
@@ -1034,11 +1189,17 @@ impl McpServer {
             },
         })
         .to_string();
-        self.subscriptions.fanout_flow(&flow, &line);
+        self.subscriptions
+            .fanout_flow(&flow, &line, &|| self.agent_pushes_muted());
     }
 
     /// Render a `notifications/aitm/state` line from `state` (a params object)
     /// and fan it to every subscribed connection. Non-blocking.
+    ///
+    /// Under the `paused` agent policy the line is not enqueued for an agent-role
+    /// subscription (a gap is recorded and the marker rides the first delivery
+    /// after resume, exactly as for [`McpServer::push_flow_event`]); operator and
+    /// CLI subscriptions always receive it.
     pub fn push_state(&self, state: JsonValue) {
         let line = json!({
             "jsonrpc": "2.0",
@@ -1046,12 +1207,25 @@ impl McpServer {
             "params": state,
         })
         .to_string();
-        self.subscriptions.fanout_state(&line);
+        self.subscriptions
+            .fanout_state(&line, &|| self.agent_pushes_muted());
     }
 
     /// The shared agent-policy state the policy gate reads and `agent.set` writes.
     /// Wiring seeds it from `McpConfig.policy` and hands the same `Arc` to the
     /// `AgentPlugin`.
+    ///
+    /// Sharing the `Arc` shares the policy live. A policy change on it cuts agent
+    /// pushes and parked approvals on every server that shares the `Arc`, as it
+    /// happens, with no hook to call.
+    ///
+    /// A change does not stop a call that already passed the gate. Its reply is
+    /// still delivered, and work it started (an armed intercept, a running scan)
+    /// carries on. A server that is not given the shared `Arc` sees none of this:
+    /// it keeps its own `AgentState`, so an `agent.set` on it reaches no other
+    /// server and one made elsewhere does not reach it. The agent servers of
+    /// bare `aitm`, `aitm web` and `aitm tui` all share the core's `Arc`
+    /// through `tui::with_shared_governance`.
     pub fn with_agent_state(mut self, agent_state: Arc<AgentState>) -> Self {
         self.agent_state = agent_state;
         self
@@ -1435,7 +1609,8 @@ impl McpServer {
         // push sink and the server's subscription registry — neither of which a
         // `CommandHost` can carry — so the server handles them directly instead
         // of through `Command::invoke`. They are `Read`: gated like any read
-        // (blocked only under `Paused`; only trusted control —
+        // (refused when `agent_reads_allowed` says no: `Paused` today, and any
+        // posture added later; only trusted control —
         // `Frontend::is_trusted_control`: Operator, Cli — bypasses, every other
         // role, including any variant added later, is gated as an agent).
         if name == "flow.subscribe" || name == "flow.unsubscribe" {
@@ -1561,8 +1736,8 @@ impl McpServer {
             Some(egress) => host.with_egress(egress.clone()),
             None => host,
         };
-        let host = match &conn.client_label {
-            Some(label) => host.with_client_label(label.clone()),
+        let host = match conn_audit_label(conn) {
+            Some(label) => host.with_client_label(label),
             None => host,
         };
         let host = match &self.config {
@@ -1602,6 +1777,17 @@ impl McpServer {
     /// never reaches the ring, the durable log, or the pushed `agent` line. Each
     /// entry goes to the always-on ring, the optional durable sink, and the F4
     /// agent stream.
+    ///
+    /// The ring keeps the entry in the lane [`aitm_core::lane_for`] picks from the
+    /// command's registered sensitivity and the outcome: a successful `Read` is
+    /// routine, everything else (refused, failed, `Write`, `Sensitive`, and a name
+    /// the registry does not know) is evidence, so a polling burst cannot evict a
+    /// refusal. The lane only chooses where the ring keeps the entry; the durable
+    /// sink and the agent stream still get every entry.
+    ///
+    /// The entry is bounded before any of them sees it: the label is sanitised on
+    /// consumption and an error reason is scrubbed and then capped. The tool result
+    /// returned to the caller is unchanged.
     fn record_audit(
         &self,
         conn: &ConnCtx,
@@ -1623,20 +1809,23 @@ impl McpServer {
                 .unwrap_or("error");
             // A refusal/error reason can echo a bad argument value (a header error
             // that quotes the offending value, a coercion error), so it is scrubbed
-            // by content before it reaches the ring/durable log/pushed line (RF#3).
-            AuditResult::Error(aitm_core::redact::scrub_text(reason))
+            // by content before it reaches the ring/durable log/pushed line (RF#3),
+            // then capped so an echoed megabyte cannot fill the ring.
+            AuditResult::Error(cap_reason(aitm_core::redact::scrub_text(reason)))
         } else {
             AuditResult::Ok
         };
         let entry = AuditEntry {
             at: SystemTime::now(),
             origin: conn.role,
-            client_label: conn.client_label.clone(),
+            client_label: conn_audit_label(conn),
             command: name.to_string(),
             args_summary: redact_args(arguments),
             result: outcome,
         };
-        self.audit_ring.append(entry.clone());
+        let sensitivity = self.registry.command(name).map(|c| c.sensitivity());
+        let lane = aitm_core::lane_for(sensitivity, &entry.result);
+        self.audit_ring.append_in(lane, entry.clone());
         if let Some(durable) = &self.durable_audit {
             durable.append(entry.clone());
         }
@@ -1647,6 +1836,13 @@ impl McpServer {
     /// subscribed connection (the agent stream concerns the whole session, so it
     /// is not flow-filtered). Non-blocking; a slow subscriber's sink absorbs or
     /// drops the line without stalling the caller (spec D3a.3).
+    ///
+    /// Under the `paused` agent policy the line is not enqueued for an agent-role
+    /// subscription, which includes the audit line of the `agent.set paused` that
+    /// caused the pause (it is pushed after the policy flipped); a gap is recorded
+    /// and the marker rides the first delivery after resume (see
+    /// [`McpServer::push_flow_event`]). Operator and CLI subscriptions always
+    /// receive it.
     pub fn push_agent(&self, entry: &AuditEntry) {
         let line = json!({
             "jsonrpc": "2.0",
@@ -1654,7 +1850,8 @@ impl McpServer {
             "params": to_json(&entry.to_value()),
         })
         .to_string();
-        self.subscriptions.fanout_state(&line);
+        self.subscriptions
+            .fanout_state(&line, &|| self.agent_pushes_muted());
     }
 
     /// The D2 policy decision for one command on one connection. Every role that is
@@ -1709,10 +1906,25 @@ impl McpServer {
     }
 
     /// Park a Sensitive agent call under the `Ask` policy and block until an
-    /// operator resolves it or the approval timeout elapses (spec D4 / RF#4). If no
-    /// operator is connected to receive the request, refuse at once rather than park
-    /// (an unseen request would only time out). On approval the caller runs the
-    /// command as the agent; otherwise the agent call is refused with a clear reason.
+    /// operator resolves it, the approval timeout elapses, or the policy leaves
+    /// `ask` (spec D4 / RF#4). If no operator is connected to receive the request,
+    /// refuse at once rather than park (an unseen request would only time out). On
+    /// approval the caller runs the command as the agent; otherwise the agent call
+    /// is refused with a clear reason.
+    ///
+    /// The policy is live here, not a snapshot, because an approval is a grant for
+    /// the posture it was given under: once the policy has left `ask`, the call must
+    /// not run even if someone approves it. So the waiter re-reads the policy every
+    /// `PARK_POLICY_RECHECK` and once more after the wait returns (the slot's guard
+    /// already released), which catches an approval that landed just before a pause.
+    /// Both reads use `ask_still_in_force` over the shared [`AgentState`], so an
+    /// `agent.set` on any server sharing it reaches this waiter.
+    ///
+    /// Accepted: a policy flap shorter than one recheck slice is not seen (the state
+    /// is one atomic with no generation), so the request stays parked and an
+    /// approval is applied under the policy then in force. A call past its post-wake
+    /// recheck is in flight, like one that passed the gate; the window is
+    /// microseconds.
     fn park_for_approval(
         &self,
         cmd: &dyn Command,
@@ -1737,21 +1949,15 @@ impl McpServer {
             ));
         };
         self.push_approval_request(cmd.name(), arguments, &prompt, &request_id);
-        let outcome = slot.wait(self.approval_timeout);
-        // Clean up a timed-out entry (an approved/denied one was already removed).
+        let waited = slot.wait(self.approval_timeout, PARK_POLICY_RECHECK, &|| {
+            ask_still_in_force(self.agent_state.policy())
+        });
+        // Clean up a timed-out or policy-denied entry (an approved/denied one was
+        // already removed). The slot's guard is released by now.
         self.parked.forget(&request_id);
-        match outcome {
-            Some(true) => ParkOutcome::Approved,
-            Some(false) => ParkOutcome::Refused(format!(
-                "`{}` refused: an operator denied the parked sensitive command.",
-                cmd.name()
-            )),
-            None => ParkOutcome::Refused(format!(
-                "`{}` refused: no operator approved the parked sensitive command within the \
-                 approval timeout.",
-                cmd.name()
-            )),
-        }
+        // The policy is read after the wait returns, so an approval that landed just
+        // before a policy change is still caught.
+        settle_park(cmd.name(), waited, self.agent_state.policy())
     }
 
     /// The human-readable approval prompt for a parked command: the command's own
@@ -1792,13 +1998,27 @@ impl McpServer {
             },
         })
         .to_string();
-        self.subscriptions.fanout_role(Frontend::Operator, &line);
+        // Required by the fan-out, but trusted control is never muted, so it cannot suppress this.
+        self.subscriptions
+            .fanout_role(Frontend::Operator, &line, &|| self.agent_pushes_muted());
     }
 
     /// Resolve a parked `Ask` request (`agent.approve`, spec D4). Operator/CLI only:
     /// the agent can never approve its own request (RF#2). `allow:true` wakes the
     /// waiting agent to run the parked command; `allow:false` refuses it. An unknown
     /// or already-resolved id is a plain error, not a role refusal.
+    ///
+    /// A parked request is only approvable under the policy it was parked under, so
+    /// after the role gate and the two parameter checks the live policy is read once
+    /// (through `ask_still_in_force`). Under `ask` nothing changes. Under anything
+    /// else, `allow:true` resolves the request as **denied** (waking the waiter) and
+    /// returns an error saying the policy is no longer `ask` and the request was
+    /// denied, so the operator is not told "approved" about a call that will not run;
+    /// an id that does not exist still gets the plain "no parked request" error, so
+    /// an unknown id is told apart from a policy refusal. `allow:false` is unchanged
+    /// under every policy: the request is resolved as denied and the reply is a
+    /// success, because a denial is always honoured and an error would suggest the
+    /// request is still pending.
     fn handle_approve(&self, conn: &ConnCtx, arguments: &Map<String, JsonValue>) -> JsonValue {
         if !conn.role.is_trusted_control() {
             return tool_error(
@@ -1817,31 +2037,47 @@ impl McpServer {
         let Some(allow) = arguments.get("allow").and_then(JsonValue::as_bool) else {
             return tool_error("agent.approve requires a boolean `allow`.".to_string());
         };
-        if self.parked.resolve(request_id, allow) {
-            tool_ok(json!({}))
-        } else {
-            tool_error(format!(
+        let policy = self.agent_state.policy();
+        // An approve counts only under the policy the request was parked under;
+        // elsewhere it is resolved as a denial instead.
+        let granted = allow && ask_still_in_force(policy);
+        if !self.parked.resolve(request_id, granted) {
+            return tool_error(format!(
                 "agent.approve: no parked request `{request_id}` is awaiting approval (it may have \
                  already been resolved or timed out)."
-            ))
+            ));
         }
+        if allow && !granted {
+            return tool_error(format!(
+                "agent.approve: the agent policy is no longer `ask` (it is `{}`), so parked \
+                 request `{request_id}` was denied, not approved. The agent may re-issue the call \
+                 under the current policy.",
+                policy.label()
+            ));
+        }
+        tool_ok(json!({}))
     }
 
     /// The policy decision for a `Read` command (`flow.subscribe`/`unsubscribe`):
-    /// `Some(reason)` only when the agent policy is `Paused` (which refuses all) and
-    /// the role is not trusted control ([`Frontend::is_trusted_control`]), `None`
-    /// otherwise. Operator/CLI always pass.
+    /// `Some(reason)` when the role is not trusted control
+    /// ([`Frontend::is_trusted_control`]) and the live policy does not pass
+    /// `agent_reads_allowed`, `None` otherwise. Operator/CLI always pass.
+    ///
+    /// Pushes ask the same predicate through `McpServer::agent_pushes_muted`, so a
+    /// fresh subscribe is accepted exactly when a push would be delivered.
     fn read_refusal(&self, conn: &ConnCtx, name: &str) -> Option<String> {
         if conn.role.is_trusted_control() {
             return None;
         }
-        match self.agent_state.policy() {
-            AgentPolicy::Paused => Some(format!(
-                "`{name}` refused: the agent policy is `paused`; no agent command runs. An operator \
-                 can change it with agent.set."
-            )),
-            _ => None,
+        let policy = self.agent_state.policy();
+        if agent_reads_allowed(policy) {
+            return None;
         }
+        Some(format!(
+            "`{name}` refused: the agent policy is `{}`; no agent command runs. An operator \
+             can change it with agent.set.",
+            policy.label()
+        ))
     }
 
     /// Enforce a server-handled verb's published schema. `flow.subscribe`,
@@ -2018,16 +2254,41 @@ const ARGS_SUMMARY_CAP: usize = aitm_core::DEFAULT_ARGS_SUMMARY_CAP;
 /// ring, the durable log, or the pushed line.
 fn redact_args(arguments: &Map<String, JsonValue>) -> String {
     let redacted = redact_value(&JsonValue::Object(arguments.clone()));
-    let mut rendered = redacted.to_string();
-    if rendered.len() > ARGS_SUMMARY_CAP {
-        let mut cut = ARGS_SUMMARY_CAP;
-        while cut > 0 && !rendered.is_char_boundary(cut) {
+    cap_text(redacted.to_string(), ARGS_SUMMARY_CAP)
+}
+
+/// The audit copy of an error reason, already scrubbed: at most
+/// [`aitm_core::DEFAULT_RESULT_REASON_CAP`] bytes plus the `…` marker. The caller
+/// of the tool still gets the whole text in the tool result; only the ring, the
+/// durable log, and the pushed line carry the capped one.
+fn cap_reason(reason: String) -> String {
+    cap_text(reason, aitm_core::DEFAULT_RESULT_REASON_CAP)
+}
+
+/// Truncate `text` to at most `cap` bytes on a char boundary and append `…`, but
+/// only when something was cut; text within the cap is returned untouched.
+fn cap_text(mut text: String, cap: usize) -> String {
+    if text.len() > cap {
+        let mut cut = cap;
+        while cut > 0 && !text.is_char_boundary(cut) {
             cut -= 1;
         }
-        rendered.truncate(cut);
-        rendered.push('…');
+        text.truncate(cut);
+        text.push('…');
     }
-    rendered
+    text
+}
+
+/// The connection's client label as the audit entry and the command host see it:
+/// [`aitm_core::sanitize_client_label`] applied to `conn.client_label`. The field
+/// is `pub`, so a transport or a test can set it to anything; sanitising here, at
+/// consumption, bounds it (64 chars, control and bidi characters dropped,
+/// credentials scrubbed) however it got there. The reserved-name guard is not
+/// applied: `web-bridge` is the server's own label and passes unchanged.
+fn conn_audit_label(conn: &ConnCtx) -> Option<String> {
+    conn.client_label
+        .as_deref()
+        .and_then(aitm_core::sanitize_client_label)
 }
 
 /// Redact a value for the audit entry, by key *and* by content. A secret-named
@@ -2096,6 +2357,22 @@ fn defers_to_command_gate(name: &str) -> bool {
 /// (and any future operator-only Sensitive command) from being parked.
 fn is_operator_only(name: &str) -> bool {
     matches!(name, "agent.set" | "agent.approve" | "l4.agent.set")
+}
+
+/// The one decision behind both "may an agent-role caller subscribe now"
+/// (`read_refusal`) and "does an agent-role subscription receive pushes now"
+/// (`McpServer::agent_pushes_muted`): a push is a read channel, so pushes are
+/// allowed to exactly the extent that reads are.
+///
+/// An allow-list of the four postures that are not `Paused`. `Paused` and any
+/// posture added later (`AgentPolicy` is `#[non_exhaustive]`) are refused, so this
+/// fails closed like `policy_decision` and `ask_still_in_force`. Whoever adds a
+/// variant must decide it here, once.
+fn agent_reads_allowed(policy: AgentPolicy) -> bool {
+    matches!(
+        policy,
+        AgentPolicy::All | AgentPolicy::Auto | AgentPolicy::Ask | AgentPolicy::ReadOnly
+    )
 }
 
 /// The agent-policy gate's decision for one command (spec D2/D4).
@@ -2219,6 +2496,10 @@ fn flow_summary(flow: &Flow) -> JsonValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use aitm_core::{Body, ConnInfo, FlowMeta, HeaderMap, HttpVersion, InterceptState};
+    use aitm_plugins::AgentPlugin;
+    use std::sync::atomic::AtomicUsize;
 
     /// RF#5: the parked-request table refuses to park beyond its cap, so a flood
     /// of Sensitive `Ask` calls cannot grow the table (and the blocking pool)
@@ -2356,5 +2637,1597 @@ mod tests {
     #[test]
     fn mcp_host_without_wiring_carries_no_posture() {
         assert_eq!(probe(&probe_server()), json!("absent"));
+    }
+
+    // ------------------- agent policy revocation: the read refusal and the gap record
+
+    /// A server whose agent policy is `policy`, with nothing else attached.
+    fn revoke_server_under(policy: AgentPolicy) -> McpServer {
+        McpServer::new(Arc::new(Registry::new()), McpTransport::Stdio)
+            .with_agent_state(Arc::new(AgentState::new(policy)))
+    }
+
+    /// AC21: the `paused` refusal for the two subscription verbs is byte for byte
+    /// the text it always was, and `read_refusal` still refuses only a
+    /// non-trusted-control role, only under `Paused`.
+    #[test]
+    fn revoke_read_refusal_text_is_unchanged() {
+        let paused = revoke_server_under(AgentPolicy::Paused);
+        assert_eq!(
+            paused.read_refusal(&ConnCtx::agent(), "flow.subscribe"),
+            Some(
+                "`flow.subscribe` refused: the agent policy is `paused`; no agent command runs. \
+                 An operator can change it with agent.set."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            paused.read_refusal(&ConnCtx::agent(), "flow.unsubscribe"),
+            Some(
+                "`flow.unsubscribe` refused: the agent policy is `paused`; no agent command runs. \
+                 An operator can change it with agent.set."
+                    .to_string()
+            )
+        );
+        for role in [Frontend::Operator, Frontend::Cli] {
+            assert_eq!(
+                paused.read_refusal(&ConnCtx::new(role), "flow.subscribe"),
+                None,
+                "{role:?} is never refused under Paused"
+            );
+        }
+        for policy in [
+            AgentPolicy::All,
+            AgentPolicy::Auto,
+            AgentPolicy::Ask,
+            AgentPolicy::ReadOnly,
+        ] {
+            assert_eq!(
+                revoke_server_under(policy).read_refusal(&ConnCtx::agent(), "flow.subscribe"),
+                None,
+                "the agent is not refused under {policy:?}"
+            );
+        }
+    }
+
+    /// Insert a minimal HTTP flow into `store`; returns its id.
+    fn revoke_insert_flow(store: &MemFlowStore) -> FlowId {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        store.insert(Flow::Http(HttpFlow {
+            id: FlowId::new(),
+            request: HttpRequest {
+                method: "GET".into(),
+                scheme: "http".into(),
+                authority: "example.com:443".into(),
+                path: "/x".into(),
+                version: HttpVersion::Http11,
+                headers: HeaderMap::new(),
+                body: Body::Empty,
+                timestamp: SystemTime::now(),
+            },
+            response: None,
+            client_conn: ConnInfo {
+                peer: addr,
+                sni: None,
+                alpn: None,
+                tls: false,
+                established: SystemTime::now(),
+            },
+            server_conn: None,
+            metadata: FlowMeta::default(),
+            intercept: InterceptState::Observed,
+        }))
+    }
+
+    /// Design 3 ("required, or it leaks"): the per-connection gap record is removed
+    /// by `drop_connection`. Connection ids are monotonic and never reused, so a
+    /// leaked entry could never be cleared again; it is observable only through the
+    /// private field, which this in-file module can read.
+    #[test]
+    fn revoke_gap_is_dropped_with_its_connection() {
+        let state = Arc::new(AgentState::new(AgentPolicy::Auto));
+        let store = Arc::new(MemFlowStore::new());
+        let srv = McpServer::new(Arc::new(Registry::new()), McpTransport::Stdio)
+            .with_agent_state(state.clone())
+            .with_services(
+                store.clone(),
+                Arc::new(NoClient),
+                Arc::new(StdGuard::default()),
+                None,
+            );
+        // An agent-role connection with a push sink, subscribed through the real verb
+        // (an unregistered verb has no published schema, so it is not schema-checked).
+        let conn = ConnCtx {
+            conn_id: srv.next_conn_id(),
+            out: Some(NotificationSink::new(16)),
+            ..ConnCtx::agent()
+        };
+        let reply = srv
+            .handle_on(
+                &conn,
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "flow.subscribe", "arguments": {}}})
+                .to_string(),
+            )
+            .expect("flow.subscribe replies");
+        let reply: JsonValue = serde_json::from_str(&reply).expect("the reply is JSON");
+        assert!(
+            reply["result"]["structuredContent"]["sub_id"].is_u64(),
+            "setup: the agent subscribes under Auto: {reply}"
+        );
+
+        // One suppressed flow push records the connection's gap.
+        state.set_policy(AgentPolicy::Paused);
+        let id = revoke_insert_flow(&store);
+        srv.push_flow_event(&Event::RequestHeaders(id));
+        assert_eq!(
+            srv.subscriptions.lock().gapped,
+            vec![conn.conn_id],
+            "setup: a suppressed push records the connection's gap"
+        );
+
+        srv.drop_connection(conn.conn_id);
+        assert!(
+            srv.subscriptions.lock().gapped.is_empty(),
+            "gapped must be empty after drop_connection"
+        );
+    }
+
+    // ------------------- the gap record's bounds
+
+    /// A server over `state` and a fresh store, with an empty registry (an
+    /// unregistered verb is not schema-checked, so `flow.subscribe` is served by
+    /// the server itself, as in the test above).
+    fn revoke_server_with_store(state: &Arc<AgentState>) -> (McpServer, Arc<MemFlowStore>) {
+        let store = Arc::new(MemFlowStore::new());
+        let srv = McpServer::new(Arc::new(Registry::new()), McpTransport::Stdio)
+            .with_agent_state(state.clone())
+            .with_services(
+                store.clone(),
+                Arc::new(NoClient),
+                Arc::new(StdGuard::default()),
+                None,
+            );
+        (srv, store)
+    }
+
+    /// A new connection (a role taken from `base`, its own sink and id) subscribed
+    /// through the real `flow.subscribe` verb with no filter.
+    fn revoke_subscribe(srv: &McpServer, base: ConnCtx) -> ConnCtx {
+        let conn = ConnCtx {
+            conn_id: srv.next_conn_id(),
+            out: Some(NotificationSink::new(16)),
+            ..base
+        };
+        let reply = srv
+            .handle_on(
+                &conn,
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "flow.subscribe", "arguments": {}}})
+                .to_string(),
+            )
+            .expect("flow.subscribe replies");
+        let reply: JsonValue = serde_json::from_str(&reply).expect("the reply is JSON");
+        assert!(
+            reply["result"]["structuredContent"]["sub_id"].is_u64(),
+            "setup: the subscribe is accepted: {reply}"
+        );
+        conn
+    }
+
+    /// The gap record is one entry per connection, however many pushes were
+    /// suppressed (so a long pause cannot grow it, and a connection is not marked
+    /// more than once), and `drop_connection` removes only its own connection's
+    /// entry.
+    #[test]
+    fn revoke_gap_is_one_entry_per_connection_however_many_pushes() {
+        let state = Arc::new(AgentState::new(AgentPolicy::Auto));
+        let (srv, store) = revoke_server_with_store(&state);
+        let first = revoke_subscribe(&srv, ConnCtx::agent());
+        let second = revoke_subscribe(&srv, ConnCtx::agent());
+
+        state.set_policy(AgentPolicy::Paused);
+        for n in 0..500 {
+            let id = revoke_insert_flow(&store);
+            srv.push_flow_event(&Event::RequestHeaders(id));
+            srv.push_state(json!({ "n": n }));
+        }
+        let mut gapped = srv.subscriptions.lock().gapped.clone();
+        assert_eq!(
+            gapped.len(),
+            2,
+            "1000 suppressed pushes leave exactly one record per connection"
+        );
+        gapped.sort_unstable();
+        assert_eq!(
+            gapped,
+            vec![first.conn_id, second.conn_id],
+            "the two records are the two subscribed connections"
+        );
+
+        srv.drop_connection(first.conn_id);
+        assert_eq!(
+            srv.subscriptions.lock().gapped,
+            vec![second.conn_id],
+            "drop_connection removes only its own connection's record"
+        );
+    }
+
+    /// A gap is recorded only for a connection that lost a line: not when nobody is
+    /// subscribed, and never for a trusted-control (operator or CLI) subscription,
+    /// which is not muted and so receives every push under `Paused`.
+    #[test]
+    fn revoke_gap_is_never_recorded_for_nobody_or_for_trusted_control() {
+        let state = Arc::new(AgentState::new(AgentPolicy::Paused));
+        let (srv, store) = revoke_server_with_store(&state);
+
+        srv.push_flow_event(&Event::RequestHeaders(revoke_insert_flow(&store)));
+        srv.push_state(json!({"n": 0}));
+        assert!(
+            srv.subscriptions.lock().gapped.is_empty(),
+            "no subscriber, so no gap"
+        );
+
+        let operator = revoke_subscribe(&srv, ConnCtx::new(Frontend::Operator));
+        let cli = revoke_subscribe(&srv, ConnCtx::new(Frontend::Cli));
+        srv.push_flow_event(&Event::RequestHeaders(revoke_insert_flow(&store)));
+        srv.push_state(json!({"n": 1}));
+        assert!(
+            srv.subscriptions.lock().gapped.is_empty(),
+            "operator and CLI subscriptions are never muted, so never gapped"
+        );
+        for (name, conn) in [("operator", &operator), ("cli", &cli)] {
+            let sink = conn.out.as_ref().expect("the connection has a sink");
+            assert_eq!(
+                sink.drain().len(),
+                2,
+                "the {name} subscription received the flow and the state line under Paused"
+            );
+        }
+    }
+
+    // ------------------- agent policy revocation: parked requests follow the live policy
+
+    /// A Sensitive stub (`demo.sensitive`) that counts how often it really ran, so a
+    /// test can tell "the call was refused" from "the call ran and was reported".
+    struct RevokeSensitive {
+        runs: Arc<AtomicUsize>,
+    }
+
+    impl Command for RevokeSensitive {
+        fn name(&self) -> &str {
+            "demo.sensitive"
+        }
+        fn sensitivity(&self) -> Sensitivity {
+            Sensitivity::Sensitive
+        }
+        fn schema(&self) -> ParamSchema {
+            ParamSchema {
+                description: "A Sensitive stub that counts its runs.".into(),
+                params: vec![],
+                result: TypeDesc::Str,
+            }
+        }
+        fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            Ok(Value::Str("ran".into()))
+        }
+    }
+
+    /// A server whose policy starts at `policy`, with the counting Sensitive stub and
+    /// the real `agent.*` verbs over the same state, and an approval timeout (60 s)
+    /// so long that only a policy change or a release can end a wait inside a test.
+    /// Returns the server, the state, and the stub's run counter.
+    fn revoke_park_server(
+        policy: AgentPolicy,
+    ) -> (Arc<McpServer>, Arc<AgentState>, Arc<AtomicUsize>) {
+        let state = Arc::new(AgentState::new(policy));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::new();
+        registry.add_command(Arc::new(RevokeSensitive { runs: runs.clone() }));
+        registry.add_plugin(Box::new(AgentPlugin::new(state.clone())));
+        let srv = McpServer::new(Arc::new(registry), McpTransport::Stdio)
+            .with_agent_state(state.clone())
+            .with_approval_timeout(Duration::from_secs(60))
+            .with_services(
+                Arc::new(MemFlowStore::new()),
+                Arc::new(NoClient),
+                Arc::new(StdGuard::default()),
+                None,
+            );
+        (Arc::new(srv), state, runs)
+    }
+
+    /// The `result` of an operator `agent.approve {request_id, allow}` on `srv`.
+    fn revoke_operator_approve(srv: &McpServer, request_id: &str, allow: bool) -> JsonValue {
+        let reply = srv
+            .handle_on(
+                &ConnCtx::new(Frontend::Operator),
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "agent.approve",
+                        "arguments": {"request_id": request_id, "allow": allow}}})
+                .to_string(),
+            )
+            .expect("agent.approve replies");
+        let reply: JsonValue = serde_json::from_str(&reply).expect("the reply is JSON");
+        reply["result"].clone()
+    }
+
+    /// The first text content of a `tools/call` result.
+    fn revoke_result_text(result: &JsonValue) -> String {
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// A slot's current state (`None` until resolved).
+    fn revoke_slot_state(slot: &ParkSlot) -> Option<bool> {
+        *slot
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// AC11: once the policy has left `ask`, an `agent.approve allow:true` does not
+    /// approve. It returns an error that says why, and the request is denied (the
+    /// slot is `Some(false)`, the table is empty). The parked slot has no waiter, so
+    /// the reply is deterministic whatever the slice timer does.
+    #[test]
+    fn revoke_park_approve_after_leaving_ask_is_refused_and_denies() {
+        for policy in [
+            AgentPolicy::Paused,
+            AgentPolicy::ReadOnly,
+            AgentPolicy::Auto,
+            AgentPolicy::All,
+        ] {
+            let (srv, state, _runs) = revoke_park_server(AgentPolicy::Ask);
+            let (id, slot) = srv.parked.try_park().expect("the table has room");
+            state.set_policy(policy);
+
+            let reply = revoke_operator_approve(&srv, &id, true);
+            let text = revoke_result_text(&reply);
+            assert_eq!(
+                reply["isError"],
+                json!(true),
+                "an approve under {policy:?} must be an error, got: {reply}"
+            );
+            assert!(
+                text.contains("no longer `ask`") && text.contains("denied"),
+                "the refusal says the policy is no longer `ask` and that the request was \
+                 denied (policy {policy:?}): {text}"
+            );
+            assert_eq!(
+                revoke_slot_state(&slot),
+                Some(false),
+                "the slot is resolved as denied under {policy:?}"
+            );
+            assert_eq!(srv.parked.len(), 0, "the table is empty under {policy:?}");
+
+            let again = revoke_operator_approve(&srv, &id, true);
+            assert_eq!(
+                again["isError"],
+                json!(true),
+                "a second approve is an error: {again}"
+            );
+            assert!(
+                revoke_result_text(&again).contains(&format!("no parked request `{id}`")),
+                "a second approve is told the request no longer exists: {again}"
+            );
+        }
+
+        // Unchanged behaviour: with the policy still `ask`, an approve approves.
+        let (srv, _state, _runs) = revoke_park_server(AgentPolicy::Ask);
+        let (id, slot) = srv.parked.try_park().expect("the table has room");
+        let reply = revoke_operator_approve(&srv, &id, true);
+        assert_eq!(
+            reply["isError"],
+            json!(false),
+            "an approve under `ask` still succeeds: {reply}"
+        );
+        assert_eq!(
+            revoke_slot_state(&slot),
+            Some(true),
+            "the slot is approved under `ask`"
+        );
+        assert_eq!(srv.parked.len(), 0, "the table is empty after the approve");
+    }
+
+    /// AC12(i): a denial is always honoured. `agent.approve allow:false` after the
+    /// policy left `ask` still resolves the request as denied and reports success.
+    #[test]
+    fn revoke_park_deny_after_leaving_ask_is_honoured() {
+        let (srv, state, _runs) = revoke_park_server(AgentPolicy::Ask);
+        let (id, slot) = srv.parked.try_park().expect("the table has room");
+        state.set_policy(AgentPolicy::Paused);
+
+        let reply = revoke_operator_approve(&srv, &id, false);
+        assert_eq!(
+            reply["isError"],
+            json!(false),
+            "a denial under Paused is a success: {reply}"
+        );
+        assert_eq!(
+            revoke_slot_state(&slot),
+            Some(false),
+            "the slot is resolved as denied"
+        );
+        assert_eq!(srv.parked.len(), 0, "the table is empty");
+    }
+
+    /// AC13, end to end: a real `park_for_approval` waiter, the policy goes
+    /// `paused`, and then the slot is resolved as **approved** directly through the
+    /// table (bypassing `agent.approve`). Whichever of the waiter's slice recheck or
+    /// the direct resolve gets there first, the call comes back refused naming the
+    /// policy change, and the stub never ran.
+    #[test]
+    fn revoke_park_approve_then_pause_is_denied_end_to_end() {
+        let (srv, state, runs) = revoke_park_server(AgentPolicy::Ask);
+        // An operator subscription registered directly, so the call can park.
+        let operator_sink = NotificationSink::new(16);
+        srv.subscriptions
+            .add(
+                srv.next_conn_id(),
+                Frontend::Operator,
+                operator_sink,
+                FlowFilter::default(),
+            )
+            .expect("the operator subscription registers");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let agent_srv = srv.clone();
+        std::thread::spawn(move || {
+            let reply = agent_srv
+                .handle_on(
+                    &ConnCtx::agent(),
+                    &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "demo.sensitive", "arguments": {}}})
+                    .to_string(),
+                )
+                .expect("the call replies");
+            let _ = tx.send(serde_json::from_str::<JsonValue>(&reply).expect("JSON"));
+        });
+
+        // Wait for the call to park (10 ms steps, 5 s cap), then read its id.
+        let mut waited = Duration::ZERO;
+        while srv.parked.len() < 1 && waited < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+            waited += Duration::from_millis(10);
+        }
+        assert_eq!(srv.parked.len(), 1, "setup: the agent call parked");
+        let id = srv.parked.lock().entries[0].0.clone();
+
+        state.set_policy(AgentPolicy::Paused);
+        // The waiter may already have denied; whether the id was still there is
+        // not the point, so the bool is ignored.
+        let _ = srv.parked.resolve(&id, true);
+
+        let reply = match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(reply) => reply,
+            Err(e) => {
+                let _ = srv.parked.resolve(&id, false);
+                panic!("the agent call did not return within 5s ({e:?})");
+            }
+        };
+        let text = revoke_result_text(&reply["result"]);
+        assert_eq!(
+            reply["result"]["isError"],
+            json!(true),
+            "an approval that lands after the pause must not run the command (counter {}): \
+             {reply}",
+            runs.load(Ordering::SeqCst)
+        );
+        assert!(
+            text.contains("the agent policy changed") && text.contains("`paused`"),
+            "the refusal names the policy change and the new policy: {text}"
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "the Sensitive stub must not have run"
+        );
+    }
+
+    /// `Some(reason)` for a refusal, `None` for an approval.
+    fn revoke_refusal(outcome: ParkOutcome) -> Option<String> {
+        match outcome {
+            ParkOutcome::Approved => None,
+            ParkOutcome::Refused(reason) => Some(reason),
+        }
+    }
+
+    /// AC13, the pure post-wait decision over its full table (spec Design 5.3): an
+    /// approval stands only if the live policy is still `ask`; a denial and a
+    /// timeout keep their existing texts under every policy; a policy change
+    /// refuses and names the new policy.
+    #[test]
+    fn revoke_park_settle_decision_table() {
+        let name = "demo.sensitive";
+        let every_policy = [
+            AgentPolicy::All,
+            AgentPolicy::Auto,
+            AgentPolicy::Ask,
+            AgentPolicy::ReadOnly,
+            AgentPolicy::Paused,
+        ];
+
+        assert_eq!(
+            revoke_refusal(settle_park(
+                name,
+                ParkWait::Resolved(true),
+                AgentPolicy::Ask
+            )),
+            None,
+            "(Resolved(true), Ask) is Approved"
+        );
+        for policy in [
+            AgentPolicy::All,
+            AgentPolicy::Auto,
+            AgentPolicy::ReadOnly,
+            AgentPolicy::Paused,
+        ] {
+            let text = revoke_refusal(settle_park(name, ParkWait::Resolved(true), policy))
+                .unwrap_or_else(|| {
+                    panic!("(Resolved(true), {policy:?}) must be Refused, got Approved")
+                });
+            assert!(
+                text.contains("the agent policy changed")
+                    && text.contains(&format!("`{}`", policy.label())),
+                "(Resolved(true), {policy:?}) names the policy change and the new label: {text}"
+            );
+        }
+
+        for policy in every_policy {
+            assert_eq!(
+                revoke_refusal(settle_park(name, ParkWait::Resolved(false), policy)),
+                Some(
+                    "`demo.sensitive` refused: an operator denied the parked sensitive command."
+                        .to_string()
+                ),
+                "(Resolved(false), {policy:?}) keeps the unchanged denial text"
+            );
+            assert_eq!(
+                revoke_refusal(settle_park(name, ParkWait::TimedOut, policy)),
+                Some(
+                    "`demo.sensitive` refused: no operator approved the parked sensitive \
+                     command within the approval timeout."
+                        .to_string()
+                ),
+                "(TimedOut, {policy:?}) keeps the unchanged timeout text"
+            );
+            let text = revoke_refusal(settle_park(name, ParkWait::PolicyChanged, policy))
+                .unwrap_or_else(|| {
+                    panic!("(PolicyChanged, {policy:?}) must be Refused, got Approved")
+                });
+            assert!(
+                text.contains("the agent policy changed")
+                    && text.contains(&format!("`{}`", policy.label())),
+                "(PolicyChanged, {policy:?}) names the policy change and the new label: {text}"
+            );
+        }
+    }
+
+    /// `ParkSlot::wait` itself (Design 5.2): the total never exceeds the timeout
+    /// (the last slice is shortened to the time remaining), a resolve ends the wait
+    /// at once whatever the slice, a failing recheck ends it as `PolicyChanged`, and
+    /// a slot that is already resolved is `Resolved` even if the policy has moved.
+    #[test]
+    fn revoke_park_slot_wait_honours_timeout_resolve_and_recheck() {
+        // (a) A 50 ms timeout against a 2 s slice: the one slice is cut to the 50 ms
+        // that remain, so the wait is a timeout after at least 50 ms and far short of
+        // the slice.
+        let slot = ParkSlot::new();
+        let started = Instant::now();
+        let waited = slot.wait(Duration::from_millis(50), Duration::from_secs(2), &|| true);
+        let took = started.elapsed();
+        assert_eq!(
+            waited,
+            ParkWait::TimedOut,
+            "(a) an unresolved wait times out"
+        );
+        assert!(
+            took >= Duration::from_millis(50),
+            "(a) the wait lasts the whole timeout, took {took:?}"
+        );
+        assert!(
+            took < Duration::from_secs(1),
+            "(a) the last slice is shortened to the time remaining: a 50 ms timeout \
+             must not wait out a 2 s slice, took {took:?}"
+        );
+
+        // (b) A resolve from another thread ends a long wait at once, not at the
+        // next slice (10 s) and not at the timeout (30 s).
+        let slot = Arc::new(ParkSlot::new());
+        let resolver = {
+            let slot = slot.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                slot.resolve(true);
+            })
+        };
+        let started = Instant::now();
+        let waited = slot.wait(Duration::from_secs(30), Duration::from_secs(10), &|| true);
+        let took = started.elapsed();
+        resolver.join().expect("the resolver thread finishes");
+        assert_eq!(
+            waited,
+            ParkWait::Resolved(true),
+            "(b) a resolve ends the wait with its decision"
+        );
+        assert!(
+            took < Duration::from_secs(5),
+            "(b) a resolve ends the wait at once, took {took:?}"
+        );
+
+        // (c) A failing recheck ends an unresolved wait after about one slice
+        // (20 ms), not at the 30 s timeout.
+        let slot = ParkSlot::new();
+        let started = Instant::now();
+        let waited = slot.wait(Duration::from_secs(30), Duration::from_millis(20), &|| {
+            false
+        });
+        let took = started.elapsed();
+        assert_eq!(
+            waited,
+            ParkWait::PolicyChanged,
+            "(c) a recheck that says the policy moved ends the wait"
+        );
+        assert!(
+            took < Duration::from_secs(5),
+            "(c) the recheck ends the wait within a slice, took {took:?}"
+        );
+
+        // (d) Resolved wins over PolicyChanged: a slot that is already resolved is
+        // reported as resolved even though the policy check would say it moved.
+        let slot = ParkSlot::new();
+        slot.resolve(true);
+        let waited = slot.wait(Duration::from_secs(30), Duration::from_millis(20), &|| {
+            false
+        });
+        assert_eq!(
+            waited,
+            ParkWait::Resolved(true),
+            "(d) a resolved slot is Resolved even when the policy has moved"
+        );
+    }
+
+    // ------------- parked-request edge cases and races (in-process, every wait bounded)
+
+    /// A server under `policy` with the counting Sensitive stub, the real `agent.*`
+    /// verbs, an operator subscription registered directly (so a Sensitive call can
+    /// park), and the given approval timeout. Returns the server, the state, and the
+    /// stub's run counter.
+    fn revoke_tester_server(
+        policy: AgentPolicy,
+        approval_timeout: Duration,
+    ) -> (Arc<McpServer>, Arc<AgentState>, Arc<AtomicUsize>) {
+        let state = Arc::new(AgentState::new(policy));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::new();
+        registry.add_command(Arc::new(RevokeSensitive { runs: runs.clone() }));
+        registry.add_plugin(Box::new(AgentPlugin::new(state.clone())));
+        let srv = Arc::new(
+            McpServer::new(Arc::new(registry), McpTransport::Stdio)
+                .with_agent_state(state.clone())
+                .with_approval_timeout(approval_timeout)
+                .with_services(
+                    Arc::new(MemFlowStore::new()),
+                    Arc::new(NoClient),
+                    Arc::new(StdGuard::default()),
+                    None,
+                ),
+        );
+        srv.subscriptions
+            .add(
+                srv.next_conn_id(),
+                Frontend::Operator,
+                NotificationSink::new(1024),
+                FlowFilter::default(),
+            )
+            .expect("the operator subscription registers");
+        (srv, state, runs)
+    }
+
+    /// Deny every parked request on `srv`, so no waiter outlives a failing test by
+    /// the approval timeout.
+    fn revoke_tester_release_all(srv: &McpServer) {
+        let ids: Vec<String> = srv
+            .parked
+            .lock()
+            .entries
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let _ = srv.parked.resolve(&id, false);
+        }
+    }
+
+    /// An agent-role `demo.sensitive` call on its own thread; the whole JSON-RPC
+    /// reply arrives on the returned channel (a thread that dies drops the sender,
+    /// so the receiver sees a disconnect rather than hanging).
+    fn revoke_tester_spawn_call(srv: &Arc<McpServer>) -> std::sync::mpsc::Receiver<JsonValue> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let srv = srv.clone();
+        std::thread::spawn(move || {
+            let reply = srv
+                .handle_on(
+                    &ConnCtx::agent(),
+                    &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "demo.sensitive", "arguments": {}}})
+                    .to_string(),
+                )
+                .expect("the call replies");
+            let _ = tx.send(serde_json::from_str::<JsonValue>(&reply).expect("JSON"));
+        });
+        rx
+    }
+
+    /// Poll (1 ms steps, 5 s cap) until at least `n` requests are parked; returns the
+    /// parked ids. On the cap, releases whatever is parked and panics.
+    fn revoke_tester_wait_parked(srv: &McpServer, n: usize) -> Vec<String> {
+        let started = Instant::now();
+        loop {
+            let ids: Vec<String> = srv
+                .parked
+                .lock()
+                .entries
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect();
+            if ids.len() >= n {
+                return ids;
+            }
+            if started.elapsed() > Duration::from_secs(5) {
+                revoke_tester_release_all(srv);
+                panic!("only {} of {n} calls parked within 5s", ids.len());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The reply of a spawned call within 5 s. On a timeout, or a thread that died
+    /// (a disconnect), every parked request is released first and then the test
+    /// panics with `what`.
+    fn revoke_tester_recv(
+        srv: &McpServer,
+        rx: &std::sync::mpsc::Receiver<JsonValue>,
+        what: &str,
+    ) -> JsonValue {
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(reply) => reply,
+            Err(e) => {
+                revoke_tester_release_all(srv);
+                panic!("{what} ({e:?})");
+            }
+        }
+    }
+
+    /// Whether a `tools/call` reply is a tool error.
+    fn revoke_tester_is_tool_error(reply: &JsonValue) -> bool {
+        reply["result"]["isError"] == json!(true)
+    }
+
+    /// A JSON object as the `Map` `handle_approve` takes.
+    fn revoke_tester_args(value: JsonValue) -> Map<String, JsonValue> {
+        value
+            .as_object()
+            .expect("the arguments are an object")
+            .clone()
+    }
+
+    /// A waiter that was denied because the policy left `ask` has removed its table
+    /// entry: the table is empty, a late `agent.approve` (either way, under any
+    /// policy) is told no such request exists, and nothing ever ran. Without the
+    /// cleanup a stranded entry would count against the cap forever and a late
+    /// approve would report success for a call that is gone.
+    #[test]
+    fn revoke_park_a_policy_denial_leaves_no_table_entry_and_no_late_grant() {
+        let (srv, state, runs) = revoke_tester_server(AgentPolicy::Ask, Duration::from_secs(60));
+        let rx = revoke_tester_spawn_call(&srv);
+        let ids = revoke_tester_wait_parked(&srv, 1);
+        state.set_policy(AgentPolicy::Paused);
+        let reply = revoke_tester_recv(
+            &srv,
+            &rx,
+            "the parked call did not return within 5s after set_policy(paused)",
+        );
+        let text = revoke_result_text(&reply["result"]);
+        assert!(
+            revoke_tester_is_tool_error(&reply) && text.contains("the agent policy changed"),
+            "the waiter was denied for the policy change: {reply}"
+        );
+        assert_eq!(
+            srv.parked.len(),
+            0,
+            "the waiter removed its table entry after a PolicyChanged"
+        );
+        for policy in [AgentPolicy::Paused, AgentPolicy::Ask] {
+            state.set_policy(policy);
+            for allow in [true, false] {
+                let late = revoke_operator_approve(&srv, &ids[0], allow);
+                assert_eq!(
+                    late["isError"],
+                    json!(true),
+                    "a late approve(allow={allow}) under {policy:?} is an error: {late}"
+                );
+                assert!(
+                    revoke_result_text(&late).contains(&format!("no parked request `{}`", ids[0])),
+                    "a late approve(allow={allow}) under {policy:?} is told the request is gone: \
+                     {late}"
+                );
+            }
+        }
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "the Sensitive stub must not have run"
+        );
+    }
+
+    /// The same cleanup after a timeout: the entry is gone, a late approve finds
+    /// nothing, and the unchanged timeout text is what the agent saw.
+    #[test]
+    fn revoke_park_a_timeout_leaves_no_table_entry_and_no_late_grant() {
+        let (srv, _state, runs) = revoke_tester_server(AgentPolicy::Ask, Duration::from_secs(2));
+        let rx = revoke_tester_spawn_call(&srv);
+        let ids = revoke_tester_wait_parked(&srv, 1);
+        let reply = revoke_tester_recv(&srv, &rx, "the call did not time out within 5s");
+        let text = revoke_result_text(&reply["result"]);
+        assert!(
+            revoke_tester_is_tool_error(&reply) && text.contains("within the approval timeout"),
+            "the unchanged timeout refusal: {reply}"
+        );
+        assert_eq!(
+            srv.parked.len(),
+            0,
+            "the waiter removed its entry on timeout"
+        );
+        let late = revoke_operator_approve(&srv, &ids[0], true);
+        assert_eq!(
+            late["isError"],
+            json!(true),
+            "a late approve is an error: {late}"
+        );
+        assert!(
+            revoke_result_text(&late).contains(&format!("no parked request `{}`", ids[0])),
+            "a late approve is told the request is gone: {late}"
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "the stub must not have run");
+    }
+
+    /// A zero approval timeout is an immediate timeout refusal (a slot that is not
+    /// resolved has no time left on entry), not a hang, and leaves no entry.
+    #[test]
+    fn revoke_park_a_zero_approval_timeout_refuses_at_once_and_leaves_no_entry() {
+        let (srv, _state, runs) = revoke_tester_server(AgentPolicy::Ask, Duration::ZERO);
+        let rx = revoke_tester_spawn_call(&srv);
+        let reply = revoke_tester_recv(&srv, &rx, "a zero-timeout call did not return within 5s");
+        let text = revoke_result_text(&reply["result"]);
+        assert!(
+            revoke_tester_is_tool_error(&reply) && text.contains("within the approval timeout"),
+            "a zero timeout is the timeout refusal: {reply}"
+        );
+        assert_eq!(srv.parked.len(), 0, "no entry is left behind");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "the stub must not have run");
+    }
+
+    /// An operator decision removes the entry too: approve runs the command, deny
+    /// refuses it with the unchanged text, and the table is empty after each.
+    #[test]
+    fn revoke_park_a_decided_request_leaves_no_table_entry() {
+        let (srv, _state, runs) = revoke_tester_server(AgentPolicy::Ask, Duration::from_secs(60));
+
+        let rx = revoke_tester_spawn_call(&srv);
+        let ids = revoke_tester_wait_parked(&srv, 1);
+        let approve = revoke_operator_approve(&srv, &ids[0], true);
+        assert_eq!(
+            approve["isError"],
+            json!(false),
+            "approve under ask: {approve}"
+        );
+        let reply = revoke_tester_recv(&srv, &rx, "the approved call did not return within 5s");
+        assert_eq!(
+            reply["result"]["structuredContent"],
+            json!("ran"),
+            "the approved call ran: {reply}"
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the stub ran once");
+        assert_eq!(srv.parked.len(), 0, "an approved request leaves no entry");
+
+        let rx = revoke_tester_spawn_call(&srv);
+        let ids = revoke_tester_wait_parked(&srv, 1);
+        let deny = revoke_operator_approve(&srv, &ids[0], false);
+        assert_eq!(deny["isError"], json!(false), "deny under ask: {deny}");
+        let reply = revoke_tester_recv(&srv, &rx, "the denied call did not return within 5s");
+        let text = revoke_result_text(&reply["result"]);
+        assert!(
+            revoke_tester_is_tool_error(&reply)
+                && text.contains("an operator denied the parked sensitive command"),
+            "the unchanged denial refusal: {reply}"
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the denied call did not run"
+        );
+        assert_eq!(srv.parked.len(), 0, "a denied request leaves no entry");
+    }
+
+    /// An approval timeout too large for `Instant` arithmetic (`Duration::MAX`) must
+    /// not panic the waiter. Revocation still ends the wait, and an ordinary approve
+    /// still approves.
+    #[test]
+    fn revoke_park_an_overflowing_approval_timeout_neither_panics_nor_blocks_revocation() {
+        let (srv, state, runs) = revoke_tester_server(AgentPolicy::Ask, Duration::MAX);
+        let rx = revoke_tester_spawn_call(&srv);
+        let _ = revoke_tester_wait_parked(&srv, 1);
+        state.set_policy(AgentPolicy::Paused);
+        let reply = revoke_tester_recv(
+            &srv,
+            &rx,
+            "a call parked with an unbounded timeout did not return within 5s of the pause",
+        );
+        let text = revoke_result_text(&reply["result"]);
+        assert!(
+            revoke_tester_is_tool_error(&reply) && text.contains("the agent policy changed"),
+            "the unbounded wait still ends on the policy change: {reply}"
+        );
+        assert_eq!(srv.parked.len(), 0, "no entry is left behind");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "the stub must not have run");
+
+        let (srv, _state, runs) = revoke_tester_server(AgentPolicy::Ask, Duration::MAX);
+        let rx = revoke_tester_spawn_call(&srv);
+        let ids = revoke_tester_wait_parked(&srv, 1);
+        let approve = revoke_operator_approve(&srv, &ids[0], true);
+        assert_eq!(approve["isError"], json!(false), "approve: {approve}");
+        let reply = revoke_tester_recv(&srv, &rx, "the approved call did not return within 5s");
+        assert_eq!(
+            reply["result"]["structuredContent"],
+            json!("ran"),
+            "an unbounded-timeout call is still approvable: {reply}"
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the stub ran once");
+        assert_eq!(srv.parked.len(), 0, "no entry is left behind");
+    }
+
+    /// A full table (`MAX_PARKED_REQUESTS` parked calls, one waiter thread each) is
+    /// denied by one policy change, all within the bound, the table drains to empty,
+    /// the cap refusal for one more call is unchanged, and the capacity is usable
+    /// again afterwards.
+    #[test]
+    fn revoke_park_one_policy_change_denies_a_full_table_and_frees_it() {
+        let (srv, state, runs) = revoke_tester_server(AgentPolicy::Ask, Duration::from_secs(60));
+        let receivers: Vec<_> = (0..MAX_PARKED_REQUESTS)
+            .map(|_| revoke_tester_spawn_call(&srv))
+            .collect();
+        let _ = revoke_tester_wait_parked(&srv, MAX_PARKED_REQUESTS);
+
+        let over = srv
+            .handle_on(
+                &ConnCtx::agent(),
+                &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "demo.sensitive", "arguments": {}}})
+                .to_string(),
+            )
+            .expect("the over-cap call replies");
+        let over: JsonValue = serde_json::from_str(&over).expect("JSON");
+        assert!(
+            revoke_tester_is_tool_error(&over)
+                && revoke_result_text(&over["result"])
+                    .contains("too many sensitive agent commands"),
+            "the cap refusal is unchanged: {over}"
+        );
+        assert_eq!(
+            srv.parked.len(),
+            MAX_PARKED_REQUESTS,
+            "a refused park does not grow the table"
+        );
+
+        state.set_policy(AgentPolicy::Paused);
+        for (i, rx) in receivers.iter().enumerate() {
+            let reply = revoke_tester_recv(
+                &srv,
+                rx,
+                &format!("parked call {i} did not return within 5s after set_policy(paused)"),
+            );
+            let text = revoke_result_text(&reply["result"]);
+            assert!(
+                revoke_tester_is_tool_error(&reply) && text.contains("the agent policy changed"),
+                "parked call {i} is denied for the policy change: {reply}"
+            );
+        }
+        assert_eq!(srv.parked.len(), 0, "the table drained to empty");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "no parked call ran");
+
+        // The capacity is usable again: under `ask` a fresh call parks and is approved.
+        state.set_policy(AgentPolicy::Ask);
+        let rx = revoke_tester_spawn_call(&srv);
+        let ids = revoke_tester_wait_parked(&srv, 1);
+        let approve = revoke_operator_approve(&srv, &ids[0], true);
+        assert_eq!(approve["isError"], json!(false), "approve: {approve}");
+        let reply = revoke_tester_recv(&srv, &rx, "the fresh call did not return within 5s");
+        assert_eq!(
+            reply["result"]["structuredContent"],
+            json!("ran"),
+            "the freed capacity works: {reply}"
+        );
+        assert_eq!(srv.parked.len(), 0, "the table is empty again");
+    }
+
+    /// Malformed `agent.approve` input (empty, missing or mistyped fields, an extra
+    /// field, an empty or 1 MiB `request_id`) must resolve nothing and must not be
+    /// mistaken for the policy refusal, under `ask` and after the policy left it:
+    /// the parked slot stays unresolved and in the table.
+    #[test]
+    fn revoke_park_malformed_approve_input_resolves_nothing() {
+        let oversized = "x".repeat(1 << 20);
+        for policy in [AgentPolicy::Ask, AgentPolicy::Paused] {
+            let (srv, state, _runs) = revoke_park_server(AgentPolicy::Ask);
+            let (id, slot) = srv.parked.try_park().expect("the table has room");
+            state.set_policy(policy);
+
+            let malformed = [
+                json!({}),
+                json!({"request_id": id}),
+                json!({"allow": true}),
+                json!({"request_id": id, "allow": "yes"}),
+                json!({"request_id": 42, "allow": true}),
+                json!({"request_id": id, "allow": true, "unexpected": 1}),
+            ];
+            for args in malformed {
+                let reply = srv
+                    .handle_on(
+                        &ConnCtx::new(Frontend::Operator),
+                        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                            "params": {"name": "agent.approve", "arguments": args}})
+                        .to_string(),
+                    )
+                    .expect("a malformed approve still gets a response");
+                let reply: JsonValue = serde_json::from_str(&reply).expect("JSON");
+                assert!(
+                    reply["error"].is_object() || revoke_tester_is_tool_error(&reply),
+                    "a malformed approve ({args}) under {policy:?} is an error: {reply}"
+                );
+                assert!(
+                    !reply.to_string().contains("no longer `ask`"),
+                    "a malformed approve is not the policy refusal ({args}): {reply}"
+                );
+                assert_eq!(
+                    revoke_slot_state(&slot),
+                    None,
+                    "a malformed approve ({args}) under {policy:?} leaves the slot unresolved"
+                );
+                assert_eq!(
+                    srv.parked.len(),
+                    1,
+                    "a malformed approve ({args}) under {policy:?} leaves the table alone"
+                );
+            }
+
+            for (label, bad_id) in [("empty", ""), ("1 MiB", oversized.as_str())] {
+                let reply = revoke_operator_approve(&srv, bad_id, true);
+                assert_eq!(
+                    reply["isError"],
+                    json!(true),
+                    "an unknown ({label}) request_id under {policy:?} is an error"
+                );
+                assert!(
+                    revoke_result_text(&reply).contains("no parked request"),
+                    "an unknown ({label}) request_id under {policy:?} is a plain unknown-id error"
+                );
+                assert_eq!(
+                    revoke_slot_state(&slot),
+                    None,
+                    "an unknown ({label}) id leaves the slot unresolved"
+                );
+                assert_eq!(
+                    srv.parked.len(),
+                    1,
+                    "an unknown ({label}) id leaves the table alone"
+                );
+            }
+        }
+    }
+
+    /// `handle_approve` keeps its order: the role gate first, then the two parameter
+    /// checks, and only then the live policy. An agent is told it cannot approve (and
+    /// resolves nothing, not even a denial) whatever the policy; trusted control with
+    /// missing or mistyped parameters gets the parameter error, not a policy denial.
+    #[test]
+    fn revoke_park_approve_checks_role_then_parameters_before_the_policy() {
+        for policy in [AgentPolicy::Ask, AgentPolicy::Paused] {
+            let (srv, state, _runs) = revoke_park_server(AgentPolicy::Ask);
+            let (id, slot) = srv.parked.try_park().expect("the table has room");
+            state.set_policy(policy);
+
+            for allow in [true, false] {
+                let reply = srv.handle_approve(
+                    &ConnCtx::agent(),
+                    &revoke_tester_args(json!({"request_id": id, "allow": allow})),
+                );
+                assert_eq!(
+                    reply["isError"],
+                    json!(true),
+                    "an agent approve(allow={allow}) under {policy:?} is refused: {reply}"
+                );
+                assert!(
+                    revoke_result_text(&reply).contains("cannot approve its own requests"),
+                    "an agent gets the role refusal, not a policy one: {reply}"
+                );
+                assert_eq!(
+                    revoke_slot_state(&slot),
+                    None,
+                    "an agent must not resolve a parked request (allow={allow}, {policy:?})"
+                );
+                assert_eq!(srv.parked.len(), 1, "the entry is untouched");
+            }
+
+            for role in [Frontend::Operator, Frontend::Cli] {
+                let conn = ConnCtx::new(role);
+                let missing =
+                    srv.handle_approve(&conn, &revoke_tester_args(json!({"allow": true})));
+                assert!(
+                    revoke_result_text(&missing).contains("requires a string `request_id`"),
+                    "{role:?} without a request_id under {policy:?}: {missing}"
+                );
+                let mistyped = srv.handle_approve(
+                    &conn,
+                    &revoke_tester_args(json!({"request_id": id, "allow": "true"})),
+                );
+                assert!(
+                    revoke_result_text(&mistyped).contains("requires a boolean `allow`"),
+                    "{role:?} with a string allow under {policy:?}: {mistyped}"
+                );
+                assert_eq!(revoke_slot_state(&slot), None, "nothing was resolved");
+                assert_eq!(srv.parked.len(), 1, "the entry is untouched");
+            }
+        }
+    }
+
+    /// The human CLI is trusted control: its approve follows the same live policy as
+    /// the operator's. Under `ask` it approves; once the policy has left `ask` it is
+    /// refused and the request is denied.
+    #[test]
+    fn revoke_park_cli_approve_follows_the_live_policy_like_the_operator() {
+        let (srv, state, _runs) = revoke_park_server(AgentPolicy::Ask);
+        let cli = ConnCtx::new(Frontend::Cli);
+
+        let (id, slot) = srv.parked.try_park().expect("the table has room");
+        let reply = srv.handle_approve(
+            &cli,
+            &revoke_tester_args(json!({"request_id": id, "allow": true})),
+        );
+        assert_eq!(
+            reply["isError"],
+            json!(false),
+            "a CLI approve under ask: {reply}"
+        );
+        assert_eq!(revoke_slot_state(&slot), Some(true), "approved under ask");
+        assert_eq!(srv.parked.len(), 0, "the table is empty");
+
+        let (id, slot) = srv.parked.try_park().expect("the table has room");
+        state.set_policy(AgentPolicy::Paused);
+        let reply = srv.handle_approve(
+            &cli,
+            &revoke_tester_args(json!({"request_id": id, "allow": true})),
+        );
+        let text = revoke_result_text(&reply);
+        assert_eq!(
+            reply["isError"],
+            json!(true),
+            "a CLI approve under paused: {reply}"
+        );
+        assert!(
+            text.contains("no longer `ask`") && text.contains("denied"),
+            "the CLI is told the policy moved and the request was denied: {text}"
+        );
+        assert_eq!(
+            revoke_slot_state(&slot),
+            Some(false),
+            "denied, not approved"
+        );
+        assert_eq!(srv.parked.len(), 0, "the table is empty");
+    }
+
+    /// Two approves racing for one parked request (`allow:true` against
+    /// `allow:false`) have exactly one winner: one finds the request, the other is
+    /// told no such request exists, the winner's decision is the slot's, and the
+    /// table is empty. Odd rounds race under `paused`, where the winner is always a
+    /// denial (an `allow:true` there resolves as denied). 100 rounds.
+    #[test]
+    fn revoke_park_two_racing_approves_have_exactly_one_winner() {
+        for round in 0..100 {
+            let paused = round % 2 == 1;
+            let (srv, state, _runs) = revoke_park_server(AgentPolicy::Ask);
+            let (id, slot) = srv.parked.try_park().expect("the table has room");
+            if paused {
+                state.set_policy(AgentPolicy::Paused);
+            }
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let racer = |allow: bool| {
+                let srv = srv.clone();
+                let id = id.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    revoke_operator_approve(&srv, &id, allow)
+                })
+            };
+            let approver = racer(true);
+            let denier = racer(false);
+            let approve = approver.join().expect("the approve thread finishes");
+            let deny = denier.join().expect("the deny thread finishes");
+
+            let found =
+                |reply: &JsonValue| !revoke_result_text(reply).contains("no parked request");
+            assert_eq!(
+                [found(&approve), found(&deny)]
+                    .iter()
+                    .filter(|f| **f)
+                    .count(),
+                1,
+                "round {round} (paused {paused}): exactly one racer finds the request: \
+                 approve {approve}, deny {deny}"
+            );
+            assert_eq!(
+                revoke_slot_state(&slot),
+                Some(!paused && found(&approve)),
+                "round {round} (paused {paused}): the slot holds the winner's decision \
+                 (approve {approve}, deny {deny})"
+            );
+            if found(&approve) && paused {
+                assert!(
+                    revoke_result_text(&approve).contains("no longer `ask`"),
+                    "round {round}: a winning approve under paused is the policy refusal: {approve}"
+                );
+            } else if found(&approve) {
+                assert_eq!(approve["isError"], json!(false), "round {round}: {approve}");
+            } else {
+                assert_eq!(deny["isError"], json!(false), "round {round}: {deny}");
+            }
+            assert_eq!(srv.parked.len(), 0, "round {round}: the table is empty");
+        }
+    }
+
+    /// An `agent.approve allow:true`, a pause, and the parked waiter all touching one
+    /// slot at once. Invariants over 60 rounds: every call returns; the stub runs at
+    /// most once; a call the operator was told was denied (the policy refusal or no
+    /// such request) never runs; when the approve was issued after the pause had
+    /// returned (odd rounds), the call never runs; and the table is empty at the end.
+    #[test]
+    fn revoke_park_approve_racing_a_pause_never_runs_a_call_the_operator_saw_denied() {
+        for round in 0..60 {
+            let ordered = round % 2 == 1;
+            let (srv, state, runs) =
+                revoke_tester_server(AgentPolicy::Ask, Duration::from_secs(60));
+            let rx = revoke_tester_spawn_call(&srv);
+            let ids = revoke_tester_wait_parked(&srv, 1);
+            let id = ids[0].clone();
+
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let flipped = Arc::new(AtomicBool::new(false));
+            let flipper = {
+                let (state, barrier, flipped) = (state.clone(), barrier.clone(), flipped.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    state.set_policy(AgentPolicy::Paused);
+                    flipped.store(true, Ordering::SeqCst);
+                })
+            };
+            let approver = {
+                let (srv, barrier, flipped) = (srv.clone(), barrier.clone(), flipped.clone());
+                let id = id.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    if ordered {
+                        while !flipped.load(Ordering::SeqCst) {
+                            std::thread::yield_now();
+                        }
+                    }
+                    revoke_operator_approve(&srv, &id, true)
+                })
+            };
+            let approve = approver.join().expect("the approver thread finishes");
+            flipper.join().expect("the flipper thread finishes");
+            let reply = revoke_tester_recv(&srv, &rx, "the racing call did not return within 5s");
+
+            let ran = runs.load(Ordering::SeqCst);
+            let approve_ok = approve["isError"] == json!(false);
+            assert!(ran <= 1, "round {round}: the stub ran {ran} times");
+            if ordered {
+                assert_eq!(
+                    ran, 0,
+                    "round {round}: an approve issued after the pause returned must not run \
+                     the call (approve {approve}, call {reply})"
+                );
+            }
+            if ran == 1 {
+                assert!(
+                    approve_ok && !revoke_tester_is_tool_error(&reply),
+                    "round {round}: a call that ran was approved: approve {approve}, call {reply}"
+                );
+            } else {
+                assert!(
+                    revoke_tester_is_tool_error(&reply),
+                    "round {round}: a call that did not run is refused: {reply}"
+                );
+            }
+            if !approve_ok {
+                assert_eq!(
+                    ran, 0,
+                    "round {round}: an approve the operator saw refused must not run the call \
+                     (approve {approve})"
+                );
+            }
+            assert_eq!(srv.parked.len(), 0, "round {round}: the table is empty");
+        }
+    }
+
+    /// `slot.wait(timeout, recheck, ..)` with a recheck that always answers
+    /// `still_ask`, run on its own thread and bounded: if it has not returned within
+    /// `within` (or its thread died), the slot is resolved as denied, which releases
+    /// the thread, and the test panics. A wait that never ends therefore fails the
+    /// test instead of hanging the run.
+    fn revoke_tester_bounded_wait(
+        slot: &Arc<ParkSlot>,
+        timeout: Duration,
+        recheck: Duration,
+        still_ask: bool,
+        within: Duration,
+        what: &str,
+    ) -> ParkWait {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = slot.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(waiter.wait(timeout, recheck, &move || still_ask));
+        });
+        match rx.recv_timeout(within) {
+            Ok(waited) => waited,
+            Err(e) => {
+                slot.resolve(false);
+                panic!("{what}: the wait did not end within {within:?} ({e:?})");
+            }
+        }
+    }
+
+    /// `ParkSlot` tolerates a poisoned mutex, as `resolve` and the old `wait` did: a
+    /// recheck that panics while the slot's guard is held poisons it, and the slot
+    /// still times out, still reports a policy change, and still resolves.
+    #[test]
+    fn revoke_park_slot_survives_a_poisoned_mutex() {
+        let slot = Arc::new(ParkSlot::new());
+        let poisoner = {
+            let slot = slot.clone();
+            std::thread::spawn(move || {
+                let _ = slot.wait(Duration::from_secs(30), Duration::from_millis(10), &|| {
+                    panic!("poisoning the slot mutex on purpose")
+                });
+            })
+        };
+        assert!(
+            poisoner.join().is_err(),
+            "setup: the recheck panicked with the slot's guard held"
+        );
+        assert!(
+            slot.state.is_poisoned(),
+            "setup: the slot mutex is poisoned"
+        );
+
+        let within = Duration::from_secs(5);
+        assert_eq!(
+            revoke_tester_bounded_wait(
+                &slot,
+                Duration::from_millis(50),
+                Duration::from_millis(10),
+                true,
+                within,
+                "poisoned, timeout"
+            ),
+            ParkWait::TimedOut,
+            "a poisoned slot still times out"
+        );
+        assert_eq!(
+            revoke_tester_bounded_wait(
+                &slot,
+                Duration::from_secs(30),
+                Duration::from_millis(10),
+                false,
+                within,
+                "poisoned, recheck"
+            ),
+            ParkWait::PolicyChanged,
+            "a poisoned slot still reports a policy change"
+        );
+        slot.resolve(true);
+        assert_eq!(
+            revoke_tester_bounded_wait(
+                &slot,
+                Duration::from_secs(30),
+                Duration::from_millis(10),
+                false,
+                within,
+                "poisoned, resolved"
+            ),
+            ParkWait::Resolved(true),
+            "a poisoned slot still resolves"
+        );
+    }
+
+    /// `ParkSlot::wait` edge cases: (e) a resolve that wakes the wait wins over a
+    /// recheck that would say the policy moved; (f) a resolved slot beats a zero
+    /// timeout, and an unresolved zero timeout is `TimedOut` with no recheck; (g) a
+    /// timeout too large for `Instant` arithmetic does not panic and is ended by the
+    /// recheck or by a resolve; (h) the recheck runs on a cadence: not once at the
+    /// end, and not continuously.
+    #[test]
+    fn revoke_park_slot_wait_edge_cases() {
+        // (e) The slice is 10 s and the recheck would say "moved"; a resolve from
+        // another thread wakes the condvar first, so the decision is the answer.
+        let slot = Arc::new(ParkSlot::new());
+        let resolver = {
+            let slot = slot.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                slot.resolve(false);
+            })
+        };
+        let waited = revoke_tester_bounded_wait(
+            &slot,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            false,
+            Duration::from_secs(5),
+            "(e)",
+        );
+        resolver.join().expect("the resolver thread finishes");
+        assert_eq!(
+            waited,
+            ParkWait::Resolved(false),
+            "(e) a resolve that wakes the wait wins over a failing recheck"
+        );
+
+        // (f) Resolved before the deadline is not lost to a zero timeout; an
+        // unresolved zero timeout is a timeout without ever asking the policy.
+        let slot = ParkSlot::new();
+        slot.resolve(true);
+        assert_eq!(
+            slot.wait(Duration::ZERO, Duration::from_millis(20), &|| false),
+            ParkWait::Resolved(true),
+            "(f) a resolved slot is Resolved even with a zero timeout"
+        );
+        let slot = ParkSlot::new();
+        let asked = AtomicUsize::new(0);
+        let started = Instant::now();
+        let waited = slot.wait(Duration::ZERO, Duration::from_millis(20), &|| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            false
+        });
+        assert_eq!(
+            waited,
+            ParkWait::TimedOut,
+            "(f) an unresolved zero timeout is TimedOut"
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            0,
+            "(f) a zero timeout ends before the policy is asked"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "(f) a zero timeout does not wait"
+        );
+
+        // (g) `Duration::MAX` overflows `Instant` addition. No panic; the recheck
+        // ends it, and so does a resolve.
+        let slot = Arc::new(ParkSlot::new());
+        assert_eq!(
+            revoke_tester_bounded_wait(
+                &slot,
+                Duration::MAX,
+                Duration::from_millis(10),
+                false,
+                Duration::from_secs(5),
+                "(g) recheck"
+            ),
+            ParkWait::PolicyChanged,
+            "(g) an unbounded wait is ended by the recheck"
+        );
+        let slot = Arc::new(ParkSlot::new());
+        let resolver = {
+            let slot = slot.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                slot.resolve(true);
+            })
+        };
+        let started = Instant::now();
+        let waited = revoke_tester_bounded_wait(
+            &slot,
+            Duration::MAX,
+            Duration::from_secs(5),
+            true,
+            Duration::from_secs(4),
+            "(g) resolve",
+        );
+        resolver.join().expect("the resolver thread finishes");
+        assert_eq!(
+            waited,
+            ParkWait::Resolved(true),
+            "(g) an unbounded wait is ended by a resolve"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "(g) the resolve ends the unbounded wait at once"
+        );
+
+        // (h) 500 ms in 100 ms slices: the recheck runs after each slice, so several
+        // times (not once at the end of the timeout) and nowhere near continuously.
+        let slot = ParkSlot::new();
+        let rechecks = AtomicUsize::new(0);
+        let started = Instant::now();
+        let waited = slot.wait(
+            Duration::from_millis(500),
+            Duration::from_millis(100),
+            &|| {
+                rechecks.fetch_add(1, Ordering::SeqCst);
+                true
+            },
+        );
+        let took = started.elapsed();
+        let rechecks = rechecks.load(Ordering::SeqCst);
+        assert_eq!(waited, ParkWait::TimedOut, "(h) the wait times out");
+        assert!(
+            took >= Duration::from_millis(500),
+            "(h) the wait lasts the whole timeout, took {took:?}"
+        );
+        assert!(
+            (2..=10).contains(&rechecks),
+            "(h) the recheck runs once per slice (about 5 times in 500 ms of 100 ms \
+             slices), not once and not continuously: {rechecks}"
+        );
+    }
+
+    /// The post-wait decision over the whole cross product of wait result and live
+    /// policy: it is `Approved` exactly for `(Resolved(true), Ask)` and `Refused`
+    /// everywhere else, so no row of the table can grant by accident.
+    #[test]
+    fn revoke_park_settle_approves_only_a_resolved_approval_under_ask() {
+        let waits = [
+            ParkWait::Resolved(true),
+            ParkWait::Resolved(false),
+            ParkWait::TimedOut,
+            ParkWait::PolicyChanged,
+        ];
+        let policies = [
+            AgentPolicy::All,
+            AgentPolicy::Auto,
+            AgentPolicy::Ask,
+            AgentPolicy::ReadOnly,
+            AgentPolicy::Paused,
+        ];
+        for wait in waits {
+            for policy in policies {
+                let approved =
+                    revoke_refusal(settle_park("demo.sensitive", wait, policy)).is_none();
+                assert_eq!(
+                    approved,
+                    wait == ParkWait::Resolved(true) && policy == AgentPolicy::Ask,
+                    "({wait:?}, {policy:?}) is approved only for an approval under ask"
+                );
+            }
+        }
+    }
+
+    /// The recheck slice is the spec's 100 to 250 ms band, so a call is denied
+    /// within one slice plus scheduling. A slice of minutes would defeat the
+    /// bound, a slice of microseconds would make `MAX_PARKED_REQUESTS` waiters spin.
+    #[test]
+    fn revoke_park_recheck_slice_is_within_the_specified_band() {
+        assert!(
+            PARK_POLICY_RECHECK >= Duration::from_millis(100)
+                && PARK_POLICY_RECHECK <= Duration::from_millis(250),
+            "PARK_POLICY_RECHECK is {PARK_POLICY_RECHECK:?}, outside 100 to 250 ms"
+        );
     }
 }
