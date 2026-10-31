@@ -4,7 +4,8 @@ import Foundation
 /// the operator-facing capture capability that sits beside core health. It walks
 /// `extensionNotInstalled → pendingApproval → approvedAttached → capturing`, or
 /// lands in `degraded(reason)` when something goes wrong, so the UI never has to
-/// guess why capture is not live.
+/// guess why capture is not live. `inactive` is the honest resting state once the
+/// operator turns capture off: the extension stays installed, nothing is captured.
 ///
 /// This is the *app's* view (system-extension activation plus the transparent-proxy
 /// tunnel). It mirrors the Rust core's `CaptureCapability`, which the core derives
@@ -21,6 +22,9 @@ public enum CaptureCapability: Hashable, Sendable {
     case capturing
     /// Something went wrong; the reason is the text to show the operator.
     case degraded(String)
+    /// The extension is installed (and approved), but the operator turned capture
+    /// off: no tunnel, nothing captured, full uninstall still on offer.
+    case inactive
 
     /// The operator-facing word for the capability.
     public var title: String {
@@ -30,6 +34,7 @@ public enum CaptureCapability: Hashable, Sendable {
         case .approvedAttached: "Approved"
         case .capturing: "Capturing"
         case .degraded: "Degraded"
+        case .inactive: "Off"
         }
     }
 
@@ -58,16 +63,20 @@ public enum CaptureCapabilityEvent: Hashable, Sendable {
     /// The operator uninstalled the extension: it is deactivated and its proxy
     /// configuration is gone (Task 17).
     case uninstalled
+    /// The operator turned capture off: the tunnel is stopped, the extension stays
+    /// installed.
+    case disabled
 }
 
 extension CaptureCapability {
     /// The capability after `event`. Pure, so the framework-facing controller stays
     /// thin glue. Tunnel events are ADVISORY — a late one never overrides a pending
     /// approval or a degradation. Activation events (`needsUserApproval`, `activated`,
-    /// `willCompleteAfterReboot`, `failed`) and `uninstalled` are AUTHORITATIVE and
-    /// intentionally reset even from `.capturing`: a genuine re-approval, re-activation
-    /// or removal really did change the extension's state, so the capability must follow
-    /// it rather than cling to capturing.
+    /// `willCompleteAfterReboot`, `failed`), `uninstalled` and `disabled` are
+    /// AUTHORITATIVE and intentionally reset even from `.capturing`: a genuine
+    /// re-approval, re-activation, removal or switch-off really did change the
+    /// extension's state, so the capability must follow it rather than cling to
+    /// capturing.
     public func applying(_ event: CaptureCapabilityEvent) -> CaptureCapability {
         switch event {
         case .needsUserApproval:
@@ -84,6 +93,8 @@ extension CaptureCapability {
             return self == .capturing ? .approvedAttached : self
         case .uninstalled:
             return .extensionNotInstalled
+        case .disabled:
+            return .inactive
         }
     }
 
@@ -100,12 +111,13 @@ extension CaptureCapability {
         self != .extensionNotInstalled
     }
 
-    /// Whether an uninstall is offered. Once the extension is approved, and also from
-    /// `.degraded` so a failed install can be cleaned up; not while approval is still
-    /// outstanding (nothing is installed yet) or when there is nothing to remove.
+    /// Whether an uninstall is offered. Once the extension is approved (including while
+    /// capture is switched off), and also from `.degraded` so a failed install can be
+    /// cleaned up; not while approval is still outstanding (nothing is installed yet) or
+    /// when there is nothing to remove.
     public var canUninstall: Bool {
         switch self {
-        case .approvedAttached, .capturing, .degraded: true
+        case .approvedAttached, .capturing, .degraded, .inactive: true
         case .extensionNotInstalled, .pendingApproval: false
         }
     }

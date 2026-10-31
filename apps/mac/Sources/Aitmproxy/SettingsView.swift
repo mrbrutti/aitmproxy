@@ -252,6 +252,7 @@ struct CaptureSettings: View {
         case .approvedAttached: "checkmark.circle"
         case .capturing: "record.circle.fill"
         case .degraded: "exclamationmark.triangle"
+        case .inactive: "pause.circle"
         }
     }
 

@@ -48,6 +48,8 @@ import Testing
         #expect(CaptureCapability.approvedAttached.applying(.tunnelDisconnected) == .approvedAttached)
         #expect(CaptureCapability.degraded("boom").applying(.tunnelDisconnected) == .degraded("boom"))
         #expect(CaptureCapability.pendingApproval.applying(.tunnelDisconnected) == .pendingApproval)
+        // The tunnel going away while capture is already off is not news.
+        #expect(CaptureCapability.inactive.applying(.tunnelDisconnected) == .inactive)
     }
 
     @Test func anAlreadyCapturingStateIsUnchangedByAnotherTunnelConnectedEvent() {
@@ -72,6 +74,7 @@ import Testing
         #expect(CaptureCapability.approvedAttached.title == "Approved")
         #expect(CaptureCapability.capturing.title == "Capturing")
         #expect(CaptureCapability.degraded("x").title == "Degraded")
+        #expect(CaptureCapability.inactive.title == "Off")
     }
 
     @Test func degradedReasonIsReadableOnlyWhenDegraded() {
@@ -85,7 +88,7 @@ import Testing
     @Test func anUninstallLandsOnNotInstalledFromEveryState() {
         let everyState: [CaptureCapability] = [
             .extensionNotInstalled, .pendingApproval, .approvedAttached, .capturing,
-            .degraded("Could not start the capture tunnel: boom"),
+            .degraded("Could not start the capture tunnel: boom"), .inactive,
         ]
         for state in everyState {
             #expect(state.applying(.uninstalled) == .extensionNotInstalled)
@@ -105,6 +108,7 @@ import Testing
         #expect(CaptureCapability.extensionNotInstalled.isCaptureOn == false)
         #expect(CaptureCapability.pendingApproval.isCaptureOn == false)
         #expect(CaptureCapability.degraded("boom").isCaptureOn == false)
+        #expect(CaptureCapability.inactive.isCaptureOn == false)
     }
 
     @Test func theIndicatorSectionShowsOnlyWhenThereIsAnExtensionToReportOn() {
@@ -113,15 +117,50 @@ import Testing
         #expect(CaptureCapability.approvedAttached.isInstalledOrInstalling == true)
         #expect(CaptureCapability.capturing.isInstalledOrInstalling == true)
         #expect(CaptureCapability.degraded("boom").isInstalledOrInstalling == true)
+        #expect(CaptureCapability.inactive.isInstalledOrInstalling == true)
     }
 
     @Test func uninstallIsOfferedOnceApprovedAndAlsoToCleanUpADegradedInstall() {
         #expect(CaptureCapability.capturing.canUninstall == true)
         #expect(CaptureCapability.approvedAttached.canUninstall == true)
         #expect(CaptureCapability.degraded("activation failed").canUninstall == true)
+        // Full removal stays on offer while capture is merely switched off.
+        #expect(CaptureCapability.inactive.canUninstall == true)
         // Nothing to remove yet, and an outstanding approval request is not removable.
         #expect(CaptureCapability.extensionNotInstalled.canUninstall == false)
         #expect(CaptureCapability.pendingApproval.canUninstall == false)
+    }
+
+    // MARK: operator ON/OFF (Task 3, TG-AC6 kit-unit + TG-AC7)
+
+    @Test func theInactiveStateIsInstalledButOff() {
+        #expect(CaptureCapability.inactive.title == "Off")
+        #expect(CaptureCapability.inactive.isCaptureOn == false)
+        #expect(CaptureCapability.inactive.isInstalledOrInstalling == true)
+        #expect(CaptureCapability.inactive.canUninstall == true)
+    }
+
+    @Test func disablingLandsOnInactiveFromEveryRunningState() {
+        // Authoritative like `.uninstalled` (resets even `.capturing`), and idempotent.
+        let everyRunningState: [CaptureCapability] = [
+            .capturing, .approvedAttached, .pendingApproval, .degraded("boom"), .inactive,
+        ]
+        for state in everyRunningState {
+            #expect(state.applying(.disabled) == .inactive)
+        }
+    }
+
+    @Test func enablingFromInactiveReentersActivation() {
+        // Turning capture back on re-submits the activation request; the system either
+        // asks again or, for an already-approved extension, completes with no prompt.
+        #expect(CaptureCapability.inactive.applying(.needsUserApproval) == .pendingApproval)
+        #expect(CaptureCapability.inactive.applying(.activated) == .approvedAttached)
+    }
+
+    @Test func inactiveIsNotLiftedToCapturingByALateTunnelEvent() {
+        // "Capturing" is reached only via `.tunnelConnected` from `.approvedAttached`.
+        #expect(CaptureCapability.inactive.applying(.tunnelConnected) == .inactive)
+        #expect(CaptureCapability.approvedAttached.applying(.tunnelConnected) == .capturing)
     }
 
     // MARK: tunnel reconcile policy (Task 16, NE-AC14)
