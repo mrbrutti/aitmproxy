@@ -43,6 +43,11 @@ else
   sed -e "s/__BUILD__/0/" -e "s/__VERSION__/0.0.0-dev/" "$here/Info.plist.in" > "$dev/Contents/Info.plist"
 fi
 plutil -replace CFBundleExecutable -string "$exe" "$dev/Contents/Info.plist"
+# The installed bundle's embedded core (aitm + obscura), when present, so the dev build can also
+# run LIVE (no APP_FIXTURES) against its own core for end-to-end checks; snapshots never spawn it.
+if [[ -d "$installed/Contents/Resources/core" ]]; then
+  cp -R "$installed/Contents/Resources/core" "$dev/Contents/Resources/core"
+fi
 echo "== bundle $dev ($exe)"
 
 store="/tmp/$name-dev-state$tag"
