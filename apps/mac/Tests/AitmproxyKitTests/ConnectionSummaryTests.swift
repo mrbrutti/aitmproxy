@@ -66,7 +66,7 @@ import Testing
         #expect(make(capability: .capturing, supported: false).capture.word == "no extension")
         #expect(make(capability: .capturing, supported: false).capture.actions.isEmpty)
         let off = make(capability: .extensionNotInstalled).capture
-        #expect(off.state == .off && off.word == "capture off" && off.detail == "extension not installed")
+        #expect(off.state == .off && off.word == "all apps off" && off.detail == "extension not installed")
         #expect(off.actions == [.turnCaptureOn, .openCaptureSettings])
         let inactive = make(capability: .inactive, hosts: 2).capture
         #expect(inactive.detail == "extension installed · 2 hosts in scope")
@@ -75,15 +75,15 @@ import Testing
         #expect(waiting.state == .working && waiting.word == "waiting for approval")
         #expect(waiting.actions.first == .approveInSystemSettings)
         let degraded = make(capability: .degraded("Extension activation failed: code signature invalid")).capture
-        #expect(degraded.state == .error && degraded.word == "capture degraded")
+        #expect(degraded.state == .error && degraded.word == "all apps degraded")
         #expect(degraded.remedy == "macOS refused this build's extension; install the signed Aitmproxy app")
         let empty = make(capability: .capturing, hosts: 0).capture
         #expect(empty.state == .warning && empty.word == "on, nothing in scope")
         #expect(empty.actions.first == .openScope)
         let on = make(capability: .capturing, hosts: 3).capture
-        #expect(on.state == .ok && on.word == "capture on · 3 hosts in scope")
+        #expect(on.state == .ok && on.word == "all apps on · 3 hosts in scope")
         #expect(on.detail == "extension on · 3 hosts in scope")
-        #expect(make(capability: .approvedAttached, hosts: 1).capture.word == "capture on · 1 host in scope")
+        #expect(make(capability: .approvedAttached, hosts: 1).capture.word == "all apps on · 1 host in scope")
     }
 
     @Test func noCaptureWordSaysCapturingWithAnEmptyScope() {
@@ -95,7 +95,7 @@ import Testing
 
     @Test func externalCoreCannotCapture() {
         let lane = make(kind: .external, capability: .capturing, hosts: 2).capture
-        #expect(lane.state == .off && lane.word == "capture off" && lane.actions == [.switchToEmbedded])
+        #expect(lane.state == .off && lane.word == "all apps off" && lane.actions == [.switchToEmbedded])
     }
 
     @Test func coreCaptureStatusSharpensTheOnLane() {
@@ -123,17 +123,17 @@ import Testing
         let fresh = make(core: core(.ready), bus: .connected("x"), role: "operator")
         #expect(fresh.steps.map(\.done) == [true, true, false, false, false])
         #expect(fresh.steps.map(\.title) == [
-            "Core is running", "Bus connected", "Turn on the capture extension",
+            "Core is running", "Bus connected", "Capture all apps (macOS asks you to approve the extension)",
             "Add a host to Scope (for now as example.com:443)", "Point a client at 127.0.0.1:8080, or open the browser",
         ])
         #expect(fresh.steps[2].action == .turnCaptureOn && fresh.steps[3].action == .openScope && fresh.steps[4].action == .openBrowser)
         let waiting = make(core: core(.ready), bus: .connected("x"), role: "operator", capability: .pendingApproval)
-        #expect(waiting.steps[2].title == "Approve the capture extension in System Settings")
+        #expect(waiting.steps[2].title == "Approve the extension in System Settings")
         let done = make(core: core(.ready), bus: .connected("x"), role: "operator", capability: .capturing, hosts: 2, flows: 14)
         #expect(done.steps.map(\.done) == [true, true, true, true, true])
         #expect(done.steps[3].title == "Scope has 2 hosts" && done.steps[4].title == "14 flows captured")
         let unsupported = make(core: core(.ready), bus: .connected("x"), role: "operator", supported: false, hosts: 1, flows: 1)
-        #expect(unsupported.steps[2].title == "Capture extension is not in this build" && unsupported.steps[2].action == nil)
+        #expect(unsupported.steps[2].title == "All Apps capture is not in this build" && unsupported.steps[2].action == nil)
         #expect(!unsupported.allStepsDone)
         let external = make(kind: .external, bus: .connected("x"), role: "operator")
         #expect(external.steps[0].done, "an external core counts as running once the bus is connected")
@@ -144,7 +144,7 @@ import Testing
 
     @Test func actionTitlesAreTitleCaseWithEllipsesWhereAViewOpens() {
         #expect(ConnectionAction.openScope.title == "Open Scope…")
-        #expect(ConnectionAction.turnCaptureOn.title == "Turn On Capture")
+        #expect(ConnectionAction.turnCaptureOn.title == "Capture All Apps")
         #expect(ConnectionAction.uninstallExtension.isDestructive)
         #expect(!ConnectionAction.restartCore.isDestructive)
     }
@@ -153,7 +153,7 @@ import Testing
         let refused = make(bus: .failed("connection refused")).bus
         #expect(refused.remedy == "Reconnect, or check the address in Settings ▸ Bus")
         let degraded = make(capability: .degraded("tunnel setup failed")).capture
-        #expect(degraded.remedy == "Turn capture off and on again; if it stays degraded, uninstall and reinstall the extension")
+        #expect(degraded.remedy == "Turn All Apps off and on again; if it stays degraded, uninstall and reinstall the extension")
     }
 
     @Test func laneStatesRankOffBelowWarningAndTheWorstTieBreaksToTheFirstLane() {
@@ -166,8 +166,8 @@ import Testing
     @Test func compactTooltipAndSpokenComeFromTheLanes() {
         let s = make(core: core(.degraded(reason: "boom")), bus: .connected("127.0.0.1:1"), role: "operator", capability: .extensionNotInstalled)
         #expect(s.core.compact == "core: failed")
-        #expect(s.capture.compact == "capture off")
-        #expect(s.tooltip == "Core: failed — boom\nBus: connected — operator · 127.0.0.1:1\nCapture: capture off — extension not installed")
-        #expect(s.spoken == "core failed, bus connected, capture capture off")
+        #expect(s.capture.compact == "all apps off")
+        #expect(s.tooltip == "Core: failed — boom\nBus: connected — operator · 127.0.0.1:1\nAll Apps: all apps off — extension not installed")
+        #expect(s.spoken == "core: failed, bus: connected, all apps off")
     }
 }
