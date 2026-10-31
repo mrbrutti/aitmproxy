@@ -2,7 +2,7 @@
 
 **Status:** Approved (self-approved in autonomous-approve mode, 2026-10-30)
 **Spec:** `docs/superpowers/specs/2026-10-30-agent-policy-revocation-design.md` (Approved 2026-10-30)
-**Branch / worktree:** `claude/ecstatic-lehmann-199e83` in `/Users/matt/Security/aitmproxy/.claude/worktrees/ecstatic-lehmann-199e83`, first cut from `main` `bd0f9b7`, then rebased onto `origin/main` v0.5.2. **Base SHA for every diff and Tester/panel dispatch: `592a377`.** The branch commits after the rebase are `574ede3` (docs: spec and plan), `68579ab` (task 1), `4546a44` (task 2), `4789b56` (task 3), and `01415f7` (tester duplex tests). Wherever this plan says "the previous task's commit" or `<task-N-sha>`, read the post-rebase SHA above. For a per-task Tester, the base is the previous task's commit.
+**Branch / worktree:** `claude/ecstatic-lehmann-199e83` in `/Users/matt/Security/aitmproxy/.claude/worktrees/ecstatic-lehmann-199e83`, first cut from `main` `bd0f9b7`, rebased onto `origin/main` v0.5.2 (`592a377`), then rebased a final time onto `origin/main` `9fb8cfa` (after PR 162, which put `aitm tui`'s agent server under the shared agent policy). **Base SHA for every diff and Tester/panel dispatch: `9fb8cfa`.** The branch commits, oldest first, are the spec-and-plan commit, the Task 1 commit, the Task 2 commit, the Task 3 commit, the Tester duplex-test commit, the panel-fix commit, the docs-amendment commit, the comment-only commit, and the Review-log-and-Shipped commit. This plan names them by those labels, not by hash, because every rebase rewrites the hashes; list them with `git log --oneline 9fb8cfa..HEAD`. Wherever this plan says "the previous task's commit" or `<task-N-sha>`, read the Task N commit from that list. For a per-task Tester, the base is the previous task's commit.
 
 ## Overview
 
@@ -249,7 +249,8 @@ Where the run departed from this plan, so a reviewer does not have to find out f
    logs use the short `/tmp/apr-*` names, not the `/tmp/agent-policy-revocation-*` names Task 4 writes.)
 2. **One panel for the whole branch**, as Call 9 said; there were no per-task panels.
 3. **The Testers added 32 of the 55 `revoke_` tests** (Task 1: 10, Task 2: 19, and 3 more duplex tests in
-   `01415f7`). They were committed inside the `feat(mcp): task N` commits, except the three in `01415f7`.
+   the Tester duplex-test commit). They were committed inside the `feat(mcp): task N` commits, except the
+   three in the Tester duplex-test commit.
    The Coders wrote the other 23 (the 7 unit and 16 integration tests this plan names). The counts in Task 4
    are the true totals; the per-task red summaries in Tasks 1 and 2 describe the Coders' tests only.
 4. **AC22(b), the clause "AC16 passes either way", was accepted on reasoning, not run.** The five existing `Ask`
@@ -262,7 +263,17 @@ Where the run departed from this plan, so a reviewer does not have to find out f
    spec. Wherever Task 1, Loose end 5, or Task 4 as first written say "R1 to R5" or ask for R-labelled source
    docs, read R1 to R6 and plain words. AC21's grep is "no `sink.push` outside `Subscriptions::fanout` and
    `replay_since`". Task 4 steps 4 and 5 are updated to match.
-6. **Base rebased** onto `origin/main` v0.5.2 (`592a377`); see the header.
+6. **Base rebased twice**: onto `origin/main` v0.5.2 (`592a377`), then onto `origin/main` `9fb8cfa` (after PR 162);
+   see the header. Counts and scope figures quoted below as "measured" were taken before the final rebase onto
+   `9fb8cfa` (the base was then `592a377`), unless a line says otherwise; the full gate was re-run after it
+   (Shipped, Evidence). The scope commands in Task 4 now use `9fb8cfa`. Branch commits are named by label, not
+   hash, because the rebases rewrote the hashes.
+7. **The `aitm tui` caveat was retired by the final rebase.** The panel's Security finding that `aitm tui`'s
+   loopback agent server has a private `AgentState` (Review log) was true when written. PR 162 (on `origin/main`
+   as `9fb8cfa`) puts that server on the core's shared `AgentState` and `AuditRing` through
+   `tui::with_shared_governance`, so `aitm tui` is covered with no edit in `crates/aitm`, and this branch still
+   does not touch `crates/aitm`. The spec's Amendments item 6 records it. The only tui caveat left is PR 162's own
+   follow-up "tui-mode push": that server's flow push feed is not wired, so no live flow pushes occur there.
 
 ### PR description checklist (requested by the panel)
 
@@ -278,16 +289,18 @@ The PR body states each of these, in plain words, so a reader does not have to o
 - [ ] **`ask` to `all` (or to any non-`ask` policy) denies a parked request**, and the agent must re-issue the
   call under the new policy.
 - [ ] **The other spec Risks:** the read side now fails closed for an unknown future posture (a behaviour
-  change, no shipped policy affected, pinned by reading because no test can construct the variant); **TUI mode
-  is not covered** (`aitm tui`'s loopback agent server has a private `AgentState`, so a pause there mutes and
-  denies nothing; the tui-mode governance follow-up); the agent link goes quiet under `paused` (the operator
+  change, no shipped policy affected, pinned by reading because no test can construct the variant); **`aitm tui`
+  is covered** (PR 162 shares the core's `AgentState` with its agent server through
+  `tui::with_shared_governance`, so a pause mutes its audit lines and a policy change denies its parked calls;
+  this change adds nothing tui-specific; the only tui caveat is that its server has no flow push feed yet, PR 162's
+  follow-up "tui-mode push"); the agent link goes quiet under `paused` (the operator
   link does not); a pause during a parked wait ends it early; and the agent-visible reason after
   `agent.approve allow:true` outside `ask` can read "an operator denied ..." or "the agent policy changed".
 - [ ] **AC18 is Terminal-panel-only.** It binds `127.0.0.1:0`, so it ran outside the sandbox; attach or quote
   its red run (AC22(a) at task scope) and its green run, `/tmp/apr-t3-*.log`.
-- [ ] **The true counts, as measured at `01415f7`, before the post-panel fix commit** (the fix commit may add
-  or change tests; if it does, the orchestrator re-measures and the Review log, not this plan, carries the new
-  figures): `cargo test -p aitm-mcp --lib revoke_` is 24 passed; `cargo test -p aitm-mcp --test mcp revoke_`
+- [ ] **The true counts, as measured at the Tester duplex-test commit, before the post-panel fix commit and
+  before the final rebase onto `9fb8cfa`** (the fix commit may add or change tests; if it does, the
+  orchestrator re-measures and the Review log, not this plan, carries the new figures): `cargo test -p aitm-mcp --lib revoke_` is 24 passed; `cargo test -p aitm-mcp --test mcp revoke_`
   is 31 passed (23 `revoke_push_*`, 7 `revoke_park_*`, 1 `revoke_socket_*`); 55 in all, 32 of them added by
   the Testers. Mutation (a) fails 2 unit and 20 integration tests (22 unit and 11 integration pass);
   mutation (b) fails 10 unit and 6 integration tests (14 unit and 25 integration pass).
@@ -480,12 +493,12 @@ is wrong, not red.
    --numstat`, below).
 
 - **Orchestrator checkpoint (Terminal panel, after the Tester passes):**
-  `git diff --numstat 592a377 -- crates/aitm-mcp/tests/mcp.rs` shows `<N>\t0\t..`
+  `git diff --numstat 9fb8cfa -- crates/aitm-mcp/tests/mcp.rs` shows `<N>\t0\t..`
   (zero removed lines); `touch` both sources; then
   `cargo test -p aitm-mcp > /tmp/agent-policy-revocation-t1.log 2>&1; echo "exit=$?"`
   prints `exit=0` (the whole crate, including the existing socket tests). Then commit.
 - **Tester (stage 5, after the Coder):** inputs per the dispatch contract (spec, plan,
-  worktree, base `592a377`, head SHA, "Task 1"). Map AC1-AC10 and AC12(ii) to the tests
+  worktree, base `9fb8cfa`, head SHA, "Task 1"). Map AC1-AC10 and AC12(ii) to the tests
   in the table; re-run steps 4-7 in the sandbox and quote them; confirm the shapes in
   trap 7a, the single `sub.sink.push`, the helper doc names R1-R5, no comparison against
   `Frontend::Mcp` was written, and the helper reads the policy once after the lock. The
@@ -747,7 +760,8 @@ Steps, as AC18, with these refinements:
 - **Files:** none retained. The AC22 steps temporarily edit `server.rs` and restore it.
 
 Steps and required output (orchestrator, Terminal panel; `touch` both sources before each run). Counts below are
-the true totals measured at `01415f7`, before the post-panel fix commit; the fix commit may add or change tests,
+the true totals measured at the Tester duplex-test commit, before the post-panel fix commit and before the final
+rebase onto `9fb8cfa` (the base was then `592a377`); the fix commit may add or change tests,
 in which case the orchestrator re-measures and the Review log carries the new figures. The run used the short log
 names `/tmp/apr-gate.log`, `/tmp/apr-mut-a.log`, `/tmp/apr-mut-b.log`, `/tmp/apr-final-revoke.log` where this
 section writes `/tmp/agent-policy-revocation-*.log` (see Deviations).
@@ -765,19 +779,21 @@ section writes `/tmp/agent-policy-revocation-*.log` (see Deviations).
    **must print** `exit=0`, `24 passed` for the unit binary (the Coders' 7 plus 17 added by the Testers), and
    `31 passed` for `tests/mcp.rs` (23 `revoke_push_*`, 7 `revoke_park_*`, 1 `revoke_socket_*`; the Coders'
    16 plus 15 added by the Testers): 55 `revoke_` tests in all.
-4. **Scope (AC19, AC20), explicit base SHA (`origin/main` moves); the base is `592a377`:**
-   a. `git diff --name-only 592a377..HEAD` lists exactly four paths: `crates/aitm-mcp/src/server.rs`,
+4. **Scope (AC19, AC20), explicit base SHA (`origin/main` moves); the base is `9fb8cfa`:**
+   a. `git diff --name-only 9fb8cfa..HEAD` lists exactly four paths: `crates/aitm-mcp/src/server.rs`,
       `crates/aitm-mcp/tests/mcp.rs`,
       `docs/superpowers/plans/2026-10-30-agent-policy-revocation-plan.md`, and
       `docs/superpowers/specs/2026-10-30-agent-policy-revocation-design.md`.
-   b. `git diff --stat 592a377..HEAD -- crates/aitm-core crates/aitm crates/aitm-plugins` prints nothing.
-   c. `git diff --numstat 592a377..HEAD -- crates/aitm-mcp/tests/mcp.rs` shows `<N>\t0\t..` (zero removed).
+   b. `git diff --stat 9fb8cfa..HEAD -- crates/aitm-core crates/aitm crates/aitm-plugins` prints nothing (this
+      branch still does not touch `crates/aitm`; PR 162's edits to it are already in the base).
+   c. `git diff --numstat 9fb8cfa..HEAD -- crates/aitm-mcp/tests/mcp.rs` shows `<N>\t0\t..` (zero removed).
       For `server.rs`, no removal inside the existing test module. Do not hard-code its line: read where
       `mod tests` starts in the base, and use the line before it (the `#[cfg(test)]` attribute) as the
-      threshold, `st-1`. At `592a377` `mod tests` is at line 2220, so `st-1` is 2219:
-      `st=$(git show 592a377:crates/aitm-mcp/src/server.rs | grep -n '^mod tests' | cut -d: -f1); echo "base mod tests line=$st"`
+      threshold, `st-1`. At `9fb8cfa` `mod tests` is at line 2220 (the same line as at `592a377`: PR 162 changed
+      nothing under `crates/aitm-mcp`), so `st-1` is 2219:
+      `st=$(git show 9fb8cfa:crates/aitm-mcp/src/server.rs | grep -n '^mod tests' | cut -d: -f1); echo "base mod tests line=$st"`
       prints `base mod tests line=2220`, then
-      `git diff -U0 592a377..HEAD -- crates/aitm-mcp/src/server.rs | grep '^@@' | awk -v t=$((st-1)) '{split($2,a,","); n=(a[2]==""?1:a[2]); s=substr(a[1],2); if (n>0 && (s+0)>=t) print "REMOVAL IN TEST REGION: " $0}'`
+      `git diff -U0 9fb8cfa..HEAD -- crates/aitm-mcp/src/server.rs | grep '^@@' | awk -v t=$((st-1)) '{split($2,a,","); n=(a[2]==""?1:a[2]); s=substr(a[1],2); if (n>0 && (s+0)>=t) print "REMOVAL IN TEST REGION: " $0}'`
       prints nothing. (Run both in one shell invocation so `st` is still set.)
 5. **AC21 checks (as amended).** `grep -n 'sink\.push' crates/aitm-mcp/src/server.rs`: every hit is inside
    `Subscriptions::fanout` or `replay_since`, and none is in the `mod tests` module (inside `fanout` the marker
@@ -832,15 +848,16 @@ section writes `/tmp/agent-policy-revocation-*.log` (see Deviations).
 ## Whole-branch stage 5 and stage 6
 
 1. **Whole-branch Tester** (after Task 4): inputs per the dispatch contract (spec, plan, worktree, base
-   `592a377`, head SHA, "whole branch"), with the Task 4 logs attached. Every criterion AC1-AC22 maps to a
+   `9fb8cfa`, head SHA, "whole branch"), with the Task 4 logs attached. Every criterion AC1-AC22 maps to a
    test, a literal check, or a mutation run; the Tester quotes the gate output. PASS or FAIL with reasons.
    (As executed this was not a separate dispatch; see Deviations, item 1.)
 2. **Panel, in parallel, fresh contexts:** `security-reviewer`, `quality-reviewer`, `spec-reviewer`, each given
-   the spec, plan, worktree, base `592a377`, head SHA, "whole branch", the Coders' reports, and the Tester
+   the spec, plan, worktree, base `9fb8cfa`, head SHA, "whole branch", the Coders' reports, and the Tester
    report. Suggested focus, not a limit.
    Security: G1 and G2 hold on every surface whose server shares the `AgentState` (loopback, stdio, `/bus`,
-   including a second `McpServer` sharing state; not `aitm tui`, whose loopback agent server has a private
-   state, a stated Non-goal); trusted control is never muted (allow-list through `is_trusted_control`, including
+   including a second `McpServer` sharing state, and `aitm tui`'s loopback agent server, which PR 162 puts on
+   the shared state; that server's flow push feed is not wired yet, PR 162's follow-up "tui-mode push", so on it
+   only audit lines and parked calls are governed); trusted control is never muted (allow-list through `is_trusted_control`, including
    a future `Frontend` variant); nothing leaks under `paused` (no marker, no notice, no audit line, bar the
    sink's own earlier overflow marker, R1); both sides fail closed (the parked path denies an unknown future
    posture, and the read predicate is an allow-list that refuses one); lock order (registry lock outside, sink
@@ -862,62 +879,65 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
-| 1 | Tester | n/a | Two production mutants survived the Coder's suite: `drop_connection` clearing every connection's gap, and a gap that is not de-duplicated (grows per suppressed push; spurious second marker). | Fixed in 68579ab: the Tester added 10 tests (2 unit, 8 integration) that kill both; all other 13 mutants were already killed. |
-| 2 | Tester | n/a | Eight of 27 production mutants survived: policy change winning over an already-resolved slot, resolved slot with a zero timeout reported as timed out, `Instant + Duration::MAX` overflow, `forget` dropped or a no-op (table entry leak), zero-length and 1 ms recheck slices, a poisoned slot mutex. | Fixed in 4546a44: the Tester added 19 tests (15 unit, 4 integration); all 29 mutants then killed, including the plan's AC22(b) edit. |
-| 3 | Tester | none | PASS. Optional hardening not adopted: step 2 could assert A's full stream, step 1 does not assert "exactly one" F1 line, step 3 does not check F3's path; the `[marker, flow F3]` variant in step 3's allowed list is dead for a correct implementation. | Accepted (autonomous-approve mode, 2026-10-30): none can make the test flaky or vacuous; the Tester's own duplex test (01415f7) pins the exact whole-stream sequences through the real writer. |
-| 3 | Tester | n/a | Added 3 sandbox-runnable real-writer duplex tests (two agents plus an operator pause and resume with exact streams; an agent dropping while paused; a paused agent still gets every reply but no push). | Added in 01415f7. |
+| 1 | Tester | n/a | Two production mutants survived the Coder's suite: `drop_connection` clearing every connection's gap, and a gap that is not de-duplicated (grows per suppressed push; spurious second marker). | Fixed in the Task 1 commit: the Tester added 10 tests (2 unit, 8 integration) that kill both; all other 13 mutants were already killed. |
+| 2 | Tester | n/a | Eight of 27 production mutants survived: policy change winning over an already-resolved slot, resolved slot with a zero timeout reported as timed out, `Instant + Duration::MAX` overflow, `forget` dropped or a no-op (table entry leak), zero-length and 1 ms recheck slices, a poisoned slot mutex. | Fixed in the Task 2 commit: the Tester added 19 tests (15 unit, 4 integration); all 29 mutants then killed, including the plan's AC22(b) edit. |
+| 3 | Tester | none | PASS. Optional hardening not adopted: step 2 could assert A's full stream, step 1 does not assert "exactly one" F1 line, step 3 does not check F3's path; the `[marker, flow F3]` variant in step 3's allowed list is dead for a correct implementation. | Accepted (autonomous-approve mode, 2026-10-30): none can make the test flaky or vacuous; the Tester's own duplex test (the Tester duplex-test commit) pins the exact whole-stream sequences through the real writer. |
+| 3 | Tester | n/a | Added 3 sandbox-runnable real-writer duplex tests (two agents plus an operator pause and resume with exact streams; an agent dropping while paused; a paused agent still gets every reply but no push). | Added in the Tester duplex-test commit. |
 | all | Spec | Minor | The whole-branch Tester did not run and the plan did not record the deviation. | Accepted (autonomous-approve mode): recorded in the plan's Deviations (item 1) and under Shipped; the per-task Testers, the orchestrator's final-head gate and AC22 runs, and the panel's own AC-to-test map stand in for it. |
-| all | Spec | Minor | The plan's counts, AC table and base SHA were stale at head (the Testers added tests; `origin/main` moved). | Fixed in 8974f73 (counts, base `592a377`, scope commands corrected). The AC table is not extended to the 32 Tester additions; the panel's AC map is the record. |
+| all | Spec | Minor | The plan's counts, AC table and base SHA were stale at head (the Testers added tests; `origin/main` moved). | Fixed in the docs-amendment commit (counts, base `592a377` as it was then, scope commands corrected). The AC table is not extended to the 32 Tester additions; the panel's AC map is the record. |
 | all | Spec | Minor | Tester additions for Tasks 1 and 2 sit inside the `feat(mcp): task N` commits, not `test(...): tester -` commits. | Accepted: tests only, inside the two declared test locations; the Review log rows above name them and their count (32 of the 55 `revoke_` tests). |
 | all | Spec | Minor | AC22(b)'s "AC16 passes either way" clause is not shown in the mutation log (the `revoke_` filter does not select the five existing `Ask` tests). | Accepted on reasoning: those tests keep the policy at `ask`, so a `true`-returning `ask_still_in_force` equals the real value; AC3, AC12, AC15 are shown passing under (b). |
-| 1-2 | Security | Minor | `agent_reads_allowed` was a deny-list of `Paused`: an unknown future `#[non_exhaustive]` posture would still subscribe and receive pushes, while `policy_decision` and `ask_still_in_force` fail closed. | Fixed in b1b1c4d: allow-list of All, Auto, Ask, ReadOnly; everything else refused. Spec Design 1, Constraints, the behaviour table and Risks amended in 8974f73. Not testable (no test can construct an unknown variant); pinned by reading and the doc. |
-| all | Security | Minor | Residual list omits calls already past the gate keeping running (R6), the sink's own overflow `lagged` flag (R1 gap), and `aitm tui`'s private `AgentState` (Intent over-claimed "every agent surface"). | Fixed in b1b1c4d (source docs, plain words) and 8974f73 (spec: R6, R1 extended, Intent reworded to "every surface whose server shares the AgentState"); caveats moved onto `with_agent_state` in the comment-only commit. |
+| 1-2 | Security | Minor | `agent_reads_allowed` was a deny-list of `Paused`: an unknown future `#[non_exhaustive]` posture would still subscribe and receive pushes, while `policy_decision` and `ask_still_in_force` fail closed. | Fixed in the panel-fix commit: allow-list of All, Auto, Ask, ReadOnly; everything else refused. Spec Design 1, Constraints, the behaviour table and Risks amended in the docs-amendment commit. Not testable (no test can construct an unknown variant); pinned by reading and the doc. |
+| all | Security | Minor | Residual list omits calls already past the gate keeping running (R6), the sink's own overflow `lagged` flag (R1 gap), and `aitm tui`'s private `AgentState` (Intent over-claimed "every agent surface"). | Fixed in the panel-fix commit (source docs, plain words) and the docs-amendment commit (spec: R6, R1 extended, Intent reworded to "every surface whose server shares the AgentState"); caveats moved onto `with_agent_state` in the comment-only commit. (The `aitm tui` clause: Superseded by PR 162 on main; see Shipped.) |
 | 2 | Security | Minor | A policy-driven denial (`agent.approve allow:true` after the policy left `ask`) is recorded for the agent as "an operator denied", contradicting the operator's own `agent.approve` error. | Accepted (autonomous-approve mode, 2026-10-30): spec 5.1/5.3 mandate the wording, the outcome is safe and the operator's reply carries the reason; fixing it needs a three-valued slot. Recorded in the spec amendments and as a follow-up. |
 | all | Quality | Minor | `RvSock` and `RvWire` test clients are the same harness written twice; `read_until` is a third copy. | Accepted (autonomous-approve mode): test-only; the socket half cannot be exercised in the sandbox so a refactor cannot be verified there; both copies are mutation-checked. Follow-up. |
 | all | Quality | Minor | Coder and Tester wrote overlapping scenarios; a few tests (constant band, computed-oracle cross product, 1 MiB payloads) are change-detectors. | Accepted: deleting risks reopening mutants the Tester recorded as killed (the constant-band test is the only guard of the 100 to 250 ms recheck bound); they are fast. |
 | all | Quality | Minor | Setup, release and naming helpers sprawl (`rv_`, `Rv*`, `revoke_*`, `revoke_tester_*`; three release mechanisms). | Accepted: reading cost only; follow-up with the harness dedupe. |
-| 2 | Quality | Minor | `ParkSlot::wait` builds an `Option<Instant>` deadline with a `None` branch for overflow. | Fixed in b1b1c4d: `start` Instant plus `saturating_sub(start.elapsed())`; the `Duration::MAX` tests still pass. |
-| 1 | Quality | Minor | The marker block is contorted (`Option<String>` + `chain`) to keep exactly one `sub.sink.push`. | Fixed in b1b1c4d (plain `if let` + two pushes); AC21 relaxed to "no sink push outside `fanout` and `replay_since`" in 8974f73. |
-| all | Quality | Minor | Production docs are long, narrate the code, carry spec-private R/G labels, and put parked-path residuals on the fan-out doc. | Fixed in b1b1c4d (rewritten in plain words, no labels in source; residuals split between `fanout` and `park_for_approval`). |
-| all | Quality | Minor | Test comments carry workflow provenance; imports sit mid-module. | Fixed in b1b1c4d for the lines this branch added; the remaining mid-file `use` lines predate the base. |
+| 2 | Quality | Minor | `ParkSlot::wait` builds an `Option<Instant>` deadline with a `None` branch for overflow. | Fixed in the panel-fix commit: `start` Instant plus `saturating_sub(start.elapsed())`; the `Duration::MAX` tests still pass. |
+| 1 | Quality | Minor | The marker block is contorted (`Option<String>` + `chain`) to keep exactly one `sub.sink.push`. | Fixed in the panel-fix commit (plain `if let` + two pushes); AC21 relaxed to "no sink push outside `fanout` and `replay_since`" in the docs-amendment commit. |
+| all | Quality | Minor | Production docs are long, narrate the code, carry spec-private R/G labels, and put parked-path residuals on the fan-out doc. | Fixed in the panel-fix commit (rewritten in plain words, no labels in source; residuals split between `fanout` and `park_for_approval`). |
+| all | Quality | Minor | Test comments carry workflow provenance; imports sit mid-module. | Fixed in the panel-fix commit for the lines this branch added; the remaining mid-file `use` lines predate the base. |
 | 1 | Quality | Minor | Two tests pin the `Vec` representation of `gapped` and one pins the poisoned-slot setup. | Accepted: the leak on `drop_connection` has no externally visible effect, so reading the private field is the only way to test it. |
-| 1-2 | Quality | Minor | `fanout`'s parameter order differs from its wrappers; the `push_approval_request` call passes a mute that can never be true. | Fixed in b1b1c4d (same order; one-line comment). |
-| all | Quality | Minor | Plan text drift (counts, base SHA, test-region threshold). | Fixed in 8974f73. |
-| fix | Security (re-review) | Minor | Two comments imprecise after the fix: `run_tool` still said the verbs are "blocked only under `Paused`"; the `fanout` doc said "at most one line per call". | Fixed in the comment-only commit after 8974f73. |
-| fix | Quality (re-review) | Minor | `G2(iii)` and "pins residual R1" labels and six "guard, passes without the fix" notes remain in test comments; two feature-wide caveats sit on the `fanout` doc; a flap caveat is stated twice. | Fixed in the comment-only commit after 8974f73 (caveats on `with_agent_state` and once on `park_for_approval`). |
+| 1-2 | Quality | Minor | `fanout`'s parameter order differs from its wrappers; the `push_approval_request` call passes a mute that can never be true. | Fixed in the panel-fix commit (same order; one-line comment). |
+| all | Quality | Minor | Plan text drift (counts, base SHA, test-region threshold). | Fixed in the docs-amendment commit. |
+| fix | Security (re-review) | Minor | Two comments imprecise after the fix: `run_tool` still said the verbs are "blocked only under `Paused`"; the `fanout` doc said "at most one line per call". | Fixed in the comment-only commit (after the docs-amendment commit). |
+| fix | Quality (re-review) | Minor | `G2(iii)` and "pins residual R1" labels and six "guard, passes without the fix" notes remain in test comments; two feature-wide caveats sit on the `fanout` doc; a flap caveat is stated twice. | Fixed in the comment-only commit (after the docs-amendment commit): caveats on `with_agent_state` and once on `park_for_approval`. |
 | fix | Quality (re-review) | Note | `cargo doc` warns about an unresolved `await_reply_capacity` link at `server.rs:125`. | Not this branch: it predates the base (commit 42448959). Not changed. |
 | fix | Spec (re-review) | Minor | Seven plan passages still prescribe a single `sub.sink.push` in one loop (grep count 1); HEAD has two pushes inside `fanout` (count 2). | Accepted as plan-text drift: AC21 in the spec is amended; the count at head is 2 for `sub.sink.push` and exactly three `sink.push` sites in all (`fanout` x2, `replay_since`). |
 | fix | Spec (re-review) | Minor | The plan's `fanout` signature (`pushes_muted, wants, line`) differs from HEAD (`wants, line, pushes_muted`). | Accepted: the spec leaves it to the builder; HEAD matches its three wrappers. |
-| fix | Spec (re-review) | Minor | The fix hoisted `use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};` into the top import block of `tests/mcp.rs`, against plan trap 3. | Accepted: a pure added line; `git diff --numstat 592a377 -- crates/aitm-mcp/tests/mcp.rs` is `2248 0`, AC20 holds. |
-| fix | Spec (re-review) | Minor | The plan header's commit list and counts note predate the fix commits. | Re-measured at the fix head: unchanged (24 unit, 31 integration; mutation (a) 2 + 20 failures, (b) 10 + 6). Commits after the rebase: 574ede3, 68579ab, 4546a44, 4789b56, 01415f7, b1b1c4d, 8974f73, plus the comment-only commit. |
+| fix | Spec (re-review) | Minor | The fix hoisted `use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};` into the top import block of `tests/mcp.rs`, against plan trap 3. | Accepted: a pure added line; `git diff --numstat 592a377 -- crates/aitm-mcp/tests/mcp.rs` was `2248 0` (measured at the panel-fix commit, before the final rebase onto `9fb8cfa`; the base was then `592a377`), AC20 holds. After the comment-only commit the figure is `2247 0` (that commit removed one of this branch's own added lines, never a base line). |
+| fix | Spec (re-review) | Minor | The plan header's commit list and counts note predate the fix commits. | Re-measured at the fix head: unchanged (24 unit, 31 integration; mutation (a) 2 + 20 failures, (b) 10 + 6). Commits after that rebase, oldest first: the spec-and-plan commit, the Task 1, Task 2 and Task 3 commits, the Tester duplex-test commit, the panel-fix commit, the docs-amendment commit, plus the comment-only commit. |
 
 ## Shipped
 
 What merged, what was cut, follow-ups. Filled at stage 7 by the main session.
 
-Branch `claude/ecstatic-lehmann-199e83`, rebased onto `origin/main` `592a377` (v0.5.2), opened as a PR against `main`. No open Critical or Important finding at any point; every Minor is fixed or accepted in the Review log above.
+Branch `claude/ecstatic-lehmann-199e83`, rebased onto `origin/main` `9fb8cfa` (after v0.5.2 `592a377` and PR 162), opened as a PR against `main`. No open Critical or Important finding at any point; every Minor is fixed or accepted in the Review log above.
 
 **What shipped.** A policy change on the shared `AgentState` now takes effect on grants already made, in `crates/aitm-mcp` only (`src/server.rs`, plus tests in `tests/mcp.rs`; `aitm-core`, `aitm`, `aitm-plugins` untouched).
 - **Pushes.** `Subscriptions::fanout` is the single fan-out send path. It reads the live policy once per call under the registry lock; while the policy is `paused`, a non-trusted-control subscription is enqueued nothing, and its connection is recorded as gapped. The first delivery after the policy relaxes is preceded by one `notifications/aitm/state {"lagged":true}` marker (per connection, never while paused, never the sink's own overflow flag). Operator and CLI subscriptions are never muted. One predicate, `agent_reads_allowed`, an allow-list of the four known non-paused postures, serves both `read_refusal` (subscribe) and the push gate.
 - **Parked requests.** A Sensitive call parked under `ask` is bound to that policy: `agent.approve allow:true` after the policy left `ask` denies it and says why (`allow:false` is still a success); the waiter rechecks the live policy every 200 ms (`PARK_POLICY_RECHECK`) and again after waking, so approve-then-pause does not run the command; one pure `settle_park` decides the outcome; one predicate, `ask_still_in_force`, serves all three layers.
 - Works across the `aitm web` pair of servers that share the `AgentState` (each reads the shared state at use).
+- Also covers `aitm tui`'s loopback agent server, with no tui-specific edit: PR 162 (already on `main`) shares the core's `AgentState` and `AuditRing` with it through `tui::with_shared_governance`, so `agent.set` reaches its gate and this revocation. Its one caveat is that it has no flow push feed yet (PR 162's follow-up "tui-mode push"), so on it only audit lines and parked calls are governed.
 
-**Evidence** (final head `664ef8c`, rebased on `592a377`).
-- Full gate `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`: `gate3 exit=0`, 2025 passed, 0 failed (log `/tmp/apr-gate3.log`); an earlier gate at the code-identical `b1b1c4d` also `exit=0`, 2025 passed. The five `aitm` web_bus binaries pass unmodified inside it (governance 7, push 10, ask_split 7, roles 5, concurrency 11); `trust_gate_scan` 9 passed.
+**Evidence** (the figures below were measured at the final head before the last rebase, which was then on `592a377`, unless a line says otherwise).
+- Full gate `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`: `gate3 exit=0`, 2025 passed, 0 failed (log `/tmp/apr-gate3.log`); an earlier gate at the code-identical panel-fix commit also `exit=0`, 2025 passed.
+- Full gate re-run after the final rebase onto `9fb8cfa` (PR 162 merged): `gate4 exit=0`, 2044 passed, 0 failed (log `/tmp/apr-gate4.log`; the difference from 2025 is the tests main gained since, PR 162's `aitm tui` governance tests among them). The five `aitm` web_bus binaries pass unmodified inside it (governance 7, push 10, ask_split 7, roles 5, concurrency 11); `trust_gate_scan` 9 passed.
 - `revoke_` tests: 24 unit (`--lib revoke_`) and 31 integration (23 `revoke_push_*`, 7 `revoke_park_*`, 1 `revoke_socket_*`).
 - AC22 mutation runs at the final code: (a) `agent_pushes_muted` forced `false`: 2 unit + 20 integration failures (push, socket and unit-gap tests; every parked test passes); (b) `ask_still_in_force` forced `true`: 10 unit + 6 integration failures (parked tests only; no push or socket test fails). Both restored byte-identical (logs `/tmp/apr-mut-a2.log`, `/tmp/apr-mut-b2.log`).
 - Task 3 real-socket test (Terminal panel): red with the mute off, `0 passed; 1 failed`, `step 2: no line A received names F2` (`/tmp/apr-t3-red.log`); green three times, `1 passed` each (`/tmp/apr-t3-green{1,2,3}.log`).
-- Scope: `git diff --name-only 592a377..HEAD` is `server.rs`, `tests/mcp.rs`, the spec and this plan; `crates/aitm-core`, `crates/aitm`, `crates/aitm-plugins` diff empty; `tests/mcp.rs` numstat `2248 0` (no removed line); no removed line inside the base `mod tests`.
+- Scope, measured before the final rebase onto `9fb8cfa` (the base was `592a377`): `git diff --name-only 592a377..HEAD` is `server.rs`, `tests/mcp.rs`, the spec and this plan; `crates/aitm-core`, `crates/aitm`, `crates/aitm-plugins` diff empty; `tests/mcp.rs` numstat `2248 0` (no removed line); no removed line inside the base `mod tests`.
+- Scope, re-checked after the final rebase (read-only git, at the committed head when this line was written): `git diff --name-only 9fb8cfa..HEAD` is the same four paths; `git diff --stat 9fb8cfa..HEAD -- crates/aitm-core crates/aitm crates/aitm-plugins` prints nothing; `tests/mcp.rs` numstat is `2247 0` (zero removed; one fewer than `2248` because the comment-only commit trimmed one of the branch's own added lines); the base `mod tests` is at line 2220 at `9fb8cfa`, as it was at `592a377`.
 - Panel: spec, security and quality reviews of the whole branch, then a re-review of the fix: all PASS, Minors only (Review log).
 
 **Cut / deviations.**
 - Per-task Tester passes, but no separate whole-branch Tester run: the per-task Testers, the orchestrator's final-head gate and AC22 runs and the panel's AC-to-test map stand in for it. One panel for the whole branch plus a re-review of the fix, not one per task (same call as PR 145).
-- The Testers added 32 of the 55 `revoke_` tests (Task 1: 10, Task 2: 19, plus 3 duplex tests in 01415f7) after surviving production mutants; they sit inside the `feat(mcp): task N` commits except 01415f7.
-- The base moved during the work (`bd0f9b7` to `592a377`, v0.5.2); the branch was rebased once before the final gate. The plan's counts and scope commands were corrected in 8974f73.
+- The Testers added 32 of the 55 `revoke_` tests (Task 1: 10, Task 2: 19, plus 3 duplex tests in the Tester duplex-test commit) after surviving production mutants; they sit inside the `feat(mcp): task N` commits except the Tester duplex-test commit.
+- The base moved twice during the work (`bd0f9b7` to `592a377`, v0.5.2, then to `9fb8cfa`, after PR 162); the branch was rebased after each move. The plan's counts and scope commands were corrected in the docs-amendment commit, and the base in them is now `9fb8cfa`.
 - The unknown-future-posture fail-closed behaviour is not testable (the enum is `#[non_exhaustive]` and `AgentState` cannot produce an unknown value); it is pinned by reading and the doc.
 
 **Follow-ups.**
-- `aitm tui` mode governance: its loopback agent server has a private `AgentState`, so `agent.set` there reaches neither the gate nor this revocation (existing named follow-up from PR 145).
+- `aitm tui` mode governance is not a follow-up of this change: it landed in PR 162, which this branch is rebased onto, so `aitm tui` is covered. PR 162's own follow-up "tui-mode push" (feeding that server's `push_tx`, so flow lines exist there to be governed) stays open and is not part of this change.
 - A three-valued park slot so the agent-visible reason for a policy-driven denial is accurate (today it can read "an operator denied").
 - An operator-facing "approval withdrawn" event for UIs holding an approval card (wire-contract change for web, macOS, TUI).
 - A real `/bus` WebSocket test in `crates/aitm` for the muted agent link.
