@@ -23,6 +23,20 @@ REAL /bus bridge, as the agent token (the `aitm web --token` value):
                                               (server.rs redact_args, redact.rs)
   5. a successful flow.subscribe is NOT audited             (server.rs call_tool)
 
+Sections 6 and 7 pin the server-assigned connection id (spec:
+docs/superpowers/specs/2026-10-30-bus-audit-connection-id-design.md, AC20, D1).
+The id is opaque: only equality and "a str of 1 to 64 bytes" are asserted, never
+its rendering. `client_label` stays null on every /bus line (the pin in 4 holds):
+the bridge still does not copy clientInfo.name.
+
+  6. `initialize` answers a top-level connection_id (a str of 1 to 64 bytes), a
+     repeated initialize returns the same one, and every flow.list audit line of
+     this connection carries it, with client_label null
+                                (server.rs McpServer::connection_id, record_audit)
+  7. a second /bus connection gets a different id; its proxy.status line reaches
+     the first connection's stream with origin "mcp" and ITS id; re-initializing
+     as clientInfo.name "aitm-web" changes neither the id nor the null label
+
 Every check is hard (no skip). The two sibling suites in this directory are left
 as they are (spec non-goal); this one sits beside them.
 """
@@ -35,6 +49,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from aitm_e2e import check, fail, free_port, ok, section  # noqa: E402
+from aitm_e2e.bus import PROTOCOL_VERSION  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.proxyutil import via_proxy  # noqa: E402
@@ -71,10 +86,16 @@ def collect_until(ws, found, timeout: float):
     return hit
 
 
+def audit_lines(ws, command: str) -> list[dict]:
+    """The params of every stashed audit line for `command`, in arrival order."""
+    return [p for p in params_of(ws, AGENT) if p.get("command") == command]
+
+
 def main() -> int:
     up = Upstream().start()
     core = None
     ws = None
+    ws2 = None
     try:
         section("boot aitm web + upstream (upstream in scope)")
         cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
@@ -209,10 +230,101 @@ def main() -> int:
         check(not subscribe_lines,
               f"no agent line has command 'flow.subscribe' (commands seen: "
               f"{sorted({str(p.get('command')) for p in agent_lines})})")
+
+        section("6. the connection's server-assigned id is stable and rides every audit line")
+        # `WsBusClient.connect()` already initialized once; these are two repeats on
+        # the same socket. `initialize` is not a tools/call, so it is never audited
+        # and the line counts the earlier sections asserted are untouched.
+        first = ws.initialize()
+        again = ws.initialize()
+        cid = first.get("connection_id")
+        check(isinstance(cid, str) and 1 <= len(cid.encode("utf-8")) <= 64,
+              f"initialize result carries connection_id as a str of 1 to 64 bytes "
+              f"(got {cid!r}; result keys {sorted(first)})")
+        check(again.get("connection_id") == cid,
+              f"a repeated initialize returns the same connection_id "
+              f"(got {again.get('connection_id')!r}, first was {cid!r})")
+        ws.call("flow.list")
+
+        def two_flow_lists():
+            # Section 4's call plus the one above: at least two flow.list lines.
+            got = audit_lines(ws, "flow.list")
+            return got if len(got) >= 2 else None
+
+        lists = collect_until(ws, two_flow_lists, PUSH_WAIT_S)
+        check(lists is not None,
+              f"at least two flow.list audit lines arrived within {PUSH_WAIT_S:.0f}s "
+              f"(got {len(audit_lines(ws, 'flow.list'))})")
+        check(all(p.get("connection_id") == cid for p in lists),
+              f"every flow.list audit line ({len(lists)}) carries this connection's id {cid!r} "
+              f"(got {[p.get('connection_id') for p in lists]!r})")
+        check(all("client_label" in p and p["client_label"] is None for p in lists),
+              f"every flow.list audit line still has client_label null "
+              f"(got {[p.get('client_label', '<absent>') for p in lists]!r})")
+
+        section("7. a second connection has its own id; re-initializing as 'aitm-web' changes nothing")
+        ws2 = WsBusClient.web_agent(core)
+        cid2 = ws2.initialize().get("connection_id")
+        check(isinstance(cid2, str) and cid2 != cid,
+              f"the second connection's connection_id is a str different from the first's "
+              f"(got {cid2!r}, first {cid!r})")
+        # ws2 never subscribed, so it receives no push; ws (subscribed on the same
+        # server) must receive ws2's audit line. Both are agent-token links, so the
+        # line's origin is 'mcp' and it is visible to ws. Nothing else called
+        # proxy.status on this core, so exactly one such line is ws2's.
+        ws2.call("proxy.status")
+
+        def status_lines():
+            return audit_lines(ws, "proxy.status") or None
+
+        got = collect_until(ws, status_lines, PUSH_WAIT_S)
+        check(got is not None,
+              f"the first connection's stream received an audit line for the second "
+              f"connection's proxy.status within {PUSH_WAIT_S:.0f}s "
+              f"(agent commands seen: {sorted({str(p.get('command')) for p in params_of(ws, AGENT)})})")
+        ws.drain_notifications(timeout=1.0)  # stragglers, so 'exactly one' is over everything sent
+        got = audit_lines(ws, "proxy.status")
+        check(len(got) == 1, f"exactly one proxy.status audit line on the first stream (got {len(got)})")
+        check(got[0].get("origin") == "mcp",
+              f"the second connection's line has origin 'mcp' (got {got[0].get('origin')!r})")
+        check(got[0].get("connection_id") == cid2,
+              f"the second connection's line carries ITS id {cid2!r}, not the first's "
+              f"(got {got[0].get('connection_id')!r})")
+
+        # The UI re-initializes as 'aitm-web' on reconnect; a client-declared name
+        # must not move the server-assigned id nor give the bridge a label (D1, D2).
+        renamed = ws.rpc("initialize", {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "aitm-web", "version": "0"},
+        })
+        check(renamed.get("connection_id") == cid,
+              f"re-initialize with clientInfo.name 'aitm-web' returns the same connection_id "
+              f"(got {renamed.get('connection_id')!r}, expected {cid!r})")
+        before = len(audit_lines(ws, "flow.list"))
+        ws.call("flow.list")
+
+        def one_more_flow_list():
+            got = audit_lines(ws, "flow.list")
+            return got if len(got) > before else None
+
+        after = collect_until(ws, one_more_flow_list, PUSH_WAIT_S)
+        check(after is not None,
+              f"a flow.list audit line after the re-initialize arrived within {PUSH_WAIT_S:.0f}s "
+              f"(had {before}, now {len(audit_lines(ws, 'flow.list'))})")
+        last = after[-1]
+        check(last.get("connection_id") == cid,
+              f"the flow.list line after the re-initialize still carries id {cid!r} "
+              f"(got {last.get('connection_id')!r})")
+        check("client_label" in last and last["client_label"] is None,
+              f"the flow.list line after the re-initialize still has client_label null "
+              f"(got {last.get('client_label', '<absent>')!r}): clientInfo.name is never copied")
         ok("web UI /bus push contract holds against the real core")
     finally:
         if ws:
             ws.close()
+        if ws2:
+            ws2.close()
         if core:
             core.stop()
         up.stop()
