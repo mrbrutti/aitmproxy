@@ -1,72 +1,56 @@
 {
-  "version": "0.5.3",
-  "tag": "v0.5.3",
+  "version": "0.5.4",
+  "tag": "v0.5.4",
   "released": "2026-10-31",
-  "release_url": "https://github.com/mrbrutti/homebrew-aitmproxy/releases/tag/v0.5.3",
+  "release_url": "https://github.com/mrbrutti/homebrew-aitmproxy/releases/tag/v0.5.4",
   "assets": [
     {
-      "platform": "macos",
-      "arch": "aarch64",
-      "format": "dmg",
-      "name": "Aitmproxy-0.5.3.dmg",
-      "url": "https://github.com/mrbrutti/homebrew-aitmproxy/releases/download/v0.5.3/Aitmproxy-0.5.3.dmg",
-      "sha256": "923d0e91a6ed925dc5ed78c521f230a40ab101fe5add85426de9737f8aec995a"
-    },
-    {
-      "platform": "macos",
-      "arch": "aarch64",
-      "format": "tar.gz",
-      "name": "aitm-0.5.3-aarch64-apple-darwin.tar.gz",
-      "url": "https://github.com/mrbrutti/homebrew-aitmproxy/releases/download/v0.5.3/aitm-0.5.3-aarch64-apple-darwin.tar.gz",
-      "sha256": "f7ae8c192e0f7d331b45a948a5840a05ec573730ec47f5d00dd0fc4940c5ca3b"
-    },
-    {
       "platform": "linux",
       "arch": "aarch64",
       "format": "tar.gz",
-      "name": "aitm-0.5.3-aarch64-unknown-linux-gnu.tar.gz",
-      "url": "https://github.com/mrbrutti/homebrew-aitmproxy/releases/download/v0.5.3/aitm-0.5.3-aarch64-unknown-linux-gnu.tar.gz",
-      "sha256": "675ac7357b46403654e2c0a42b7b6e57fecb9237c3bcc2fa93c0929359e29be1"
+      "name": "aitm-0.5.4-aarch64-unknown-linux-gnu.tar.gz",
+      "url": "https://github.com/mrbrutti/homebrew-aitmproxy/releases/download/v0.5.4/aitm-0.5.4-aarch64-unknown-linux-gnu.tar.gz",
+      "sha256": "297082662b638e1e9437a601e4633c16b3a0cdb0e95def2f00d02af036c0d692"
     },
     {
       "platform": "linux",
       "arch": "aarch64",
       "format": "rpm",
-      "name": "aitm-0.5.3-aarch64.rpm",
-      "url": "https://github.com/mrbrutti/homebrew-aitmproxy/releases/download/v0.5.3/aitm-0.5.3-aarch64.rpm",
-      "sha256": "2a275de1ede32f761cbdb94fad1ed48c4acf973e16def7072c4c4ac4d1189134"
+      "name": "aitm-0.5.4-aarch64.rpm",
+      "url": "https://github.com/mrbrutti/homebrew-aitmproxy/releases/download/v0.5.4/aitm-0.5.4-aarch64.rpm",
+      "sha256": "0964371e04bdeb3542774e207e895d11a15cc0ea7f8c0003857b3c30fd424518"
     },
     {
       "platform": "linux",
       "arch": "x86_64",
       "format": "deb",
-      "name": "aitm-0.5.3-amd64.deb",
-      "url": "https://github.com/mrbrutti/homebrew-aitmproxy/releases/download/v0.5.3/aitm-0.5.3-amd64.deb",
-      "sha256": "746086309e7e5332fb416c9b2d4e0f8953cd42f5331f98319b183d89d5fad83d"
+      "name": "aitm-0.5.4-amd64.deb",
+      "url": "https://github.com/mrbrutti/homebrew-aitmproxy/releases/download/v0.5.4/aitm-0.5.4-amd64.deb",
+      "sha256": "a4ef32c00e6b5dcee55dc34c1e9db984d98a469d861d304fa6fbf1c181cfbe97"
     },
     {
       "platform": "linux",
       "arch": "aarch64",
       "format": "deb",
-      "name": "aitm-0.5.3-arm64.deb",
-      "url": "https://github.com/mrbrutti/homebrew-aitmproxy/releases/download/v0.5.3/aitm-0.5.3-arm64.deb",
-      "sha256": "4eb9850bdd90b11f8a5782ff99d9f587df9d3f7e5c2d902a25765bfecfeb1f06"
+      "name": "aitm-0.5.4-arm64.deb",
+      "url": "https://github.com/mrbrutti/homebrew-aitmproxy/releases/download/v0.5.4/aitm-0.5.4-arm64.deb",
+      "sha256": "6de08f897ca79299f9121a0c26d4fba3b2153758b9a803abfd3390e6c6c29cc3"
     },
     {
       "platform": "linux",
       "arch": "x86_64",
       "format": "tar.gz",
-      "name": "aitm-0.5.3-x86_64-unknown-linux-gnu.tar.gz",
-      "url": "https://github.com/mrbrutti/homebrew-aitmproxy/releases/download/v0.5.3/aitm-0.5.3-x86_64-unknown-linux-gnu.tar.gz",
-      "sha256": "9cbafc376953275be3aa0157384ff079f1247be4ba49221d96442afed767a916"
+      "name": "aitm-0.5.4-x86_64-unknown-linux-gnu.tar.gz",
+      "url": "https://github.com/mrbrutti/homebrew-aitmproxy/releases/download/v0.5.4/aitm-0.5.4-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "b3727e8e1acd300997c3f7efad2cc99c9fe0d0f44d3b471144730916ef40daaf"
     },
     {
       "platform": "linux",
       "arch": "x86_64",
       "format": "rpm",
-      "name": "aitm-0.5.3-x86_64.rpm",
-      "url": "https://github.com/mrbrutti/homebrew-aitmproxy/releases/download/v0.5.3/aitm-0.5.3-x86_64.rpm",
-      "sha256": "3448003069ea0bfa6143826f7b0b26f5846acb480e70b6a45202d61f6ccca162"
+      "name": "aitm-0.5.4-x86_64.rpm",
+      "url": "https://github.com/mrbrutti/homebrew-aitmproxy/releases/download/v0.5.4/aitm-0.5.4-x86_64.rpm",
+      "sha256": "38f432c36f2177b415c589e2c1367bd2e73963c0bdb5178355dc5717bc266097"
     }
   ]
 }
