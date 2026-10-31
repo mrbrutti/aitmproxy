@@ -9,114 +9,38 @@
 //! not configured (`operator_token: None`) the operator bridge token value
 //! matches nothing and is refused too (operator-off-by-default).
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+// The `/bus` harness shared with `web_bus_concurrency` and `web_bus_push`.
+#[path = "support/web_bus.rs"]
+#[allow(dead_code)] // this suite uses a subset of the shared harness
+mod web_bus;
 
-use aitm::web::{self, WebState};
-use aitm::wire::{assemble, Assembled};
-use aitm_core::{Config, HttpFlow, HttpRequest, McpTransport, ProxyClient};
-use aitm_mcp::McpServer;
-use futures::future::BoxFuture;
-use futures::{SinkExt as _, StreamExt as _};
 use serde_json::{json, Value as JsonValue};
-use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
-use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
-
-const AGENT_TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const OPERATOR_TOKEN: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const TIMEOUT: Duration = Duration::from_secs(10);
-
-fn temp_ca_dir(tag: &str) -> PathBuf {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("aitm-web-roles-{tag}-{nanos}-{n}"))
-}
-
-/// A `ProxyClient` nothing in these tests invokes.
-struct UnusedClient;
-impl ProxyClient for UnusedClient {
-    fn send(&self, _req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
-        Box::pin(async { anyhow::bail!("not called") })
-    }
-}
-
-struct Server {
-    addr: std::net::SocketAddr,
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
+use tokio_tungstenite::tungstenite::Error as WsError;
+use web_bus::{
+    recv_text, send_text, Server, ServerOptions, TestCommands, Ws, AGENT_TOKEN, OPERATOR_TOKEN,
+};
 
 /// A served `aitm web` whose bridge holds the agent token and, when
-/// `operator` is set, the operator bridge token too.
+/// `operator` is set, the operator bridge token too. It is the server this
+/// suite has always run against: the plain assembly with no test commands and
+/// the `McpServer`'s own default gate, not the wired one the push suite uses.
 async fn start(tag: &str, operator: Option<&str>) -> Server {
-    let mut cfg = Config::default();
-    cfg.ca.dir = temp_ca_dir(tag);
-    let Assembled { proxy, .. } = assemble(&cfg).expect("assemble");
-    let client: Arc<dyn ProxyClient> = Arc::new(UnusedClient);
-    let mcp = McpServer::new(proxy.registry_arc(), McpTransport::Stdio).with_services(
-        proxy.store(),
-        client,
-        proxy.guard(),
-        None,
-    );
-    let state = Arc::new(WebState {
-        mcp: Arc::new(mcp),
-        agent_token: AGENT_TOKEN.to_owned(),
-        operator_token: operator.map(str::to_owned),
-    });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("local addr");
-    let task = tokio::spawn(web::serve(listener, state));
-    Server { addr, task }
+    web_bus::start(
+        tag,
+        &TestCommands::new(),
+        ServerOptions {
+            operator_token: operator.map(str::to_owned),
+            wired_gate: false,
+            test_commands: false,
+            ..ServerOptions::default()
+        },
+    )
+    .await
 }
 
-type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
-
+/// Connect to the bus, handing back the handshake error instead of panicking on it.
 async fn ws_connect(server: &Server) -> Result<Ws, WsError> {
-    let req = format!("ws://{}/bus", server.addr)
-        .into_client_request()
-        .expect("client request");
-    let (ws, _) = tokio::time::timeout(TIMEOUT, connect_async(req))
-        .await
-        .expect("handshake within the timeout")?;
-    Ok(ws)
-}
-
-async fn send_text(ws: &mut Ws, text: impl Into<String>) {
-    ws.send(Message::text(text.into())).await.expect("send");
-}
-
-/// The next text frame; `None` when the stream closed first.
-async fn recv_text(ws: &mut Ws) -> Option<String> {
-    loop {
-        let next = tokio::time::timeout(TIMEOUT, ws.next())
-            .await
-            .expect("frame within the timeout");
-        match next {
-            Some(Ok(Message::Text(t))) => return Some(t.to_string()),
-            Some(Ok(Message::Close(_))) | None => return None,
-            Some(Ok(_)) => continue,
-            Some(Err(WsError::ConnectionClosed)) | Some(Err(WsError::AlreadyClosed)) => {
-                return None
-            }
-            Some(Err(e)) => panic!("websocket error: {e}"),
-        }
-    }
+    web_bus::try_ws_connect(server).await
 }
 
 /// Open the bus with `token`, run `initialize`, and return its result object.

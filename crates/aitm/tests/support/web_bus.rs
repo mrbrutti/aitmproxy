@@ -223,6 +223,30 @@ impl Command for TickCmd {
     }
 }
 
+/// The size of the string `test.blob` returns: 1 MiB. A reply carries it twice (in
+/// `structuredContent` and in the rendered `content` text, neither of which is
+/// truncated), so one reply is a little over 2 MiB on the wire.
+pub const BLOB_BYTES: usize = 1 << 20;
+
+/// `test.blob`: replies with [`BLOB_BYTES`] bytes of text, so a test can make the
+/// bridge's reply send site write far more than the socket buffers hold.
+struct BlobCmd;
+
+impl Command for BlobCmd {
+    fn name(&self) -> &str {
+        "test.blob"
+    }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
+    }
+    fn schema(&self) -> ParamSchema {
+        str_schema("Replies with 1 MiB of text.")
+    }
+    fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+        Ok(Value::Str("b".repeat(BLOB_BYTES)))
+    }
+}
+
 /// `test.panic`: a command that panics.
 struct PanicCmd;
 
@@ -267,6 +291,9 @@ pub struct TestCommands {
     pub parking: Arc<Parking>,
     ticks: Arc<AtomicUsize>,
     sensitive_runs: Arc<AtomicUsize>,
+    /// Whether `test.blob` and `test.sensitive` are registered (see
+    /// [`TestCommands::without_extras`]).
+    extras: bool,
 }
 
 impl TestCommands {
@@ -275,6 +302,18 @@ impl TestCommands {
             parking: Parking::new(),
             ticks: Arc::new(AtomicUsize::new(0)),
             sensitive_runs: Arc::new(AtomicUsize::new(0)),
+            extras: true,
+        }
+    }
+
+    /// The same commands and shared state, minus the ones added since
+    /// `web_bus_concurrency` was written (`test.blob`, `test.sensitive`): exactly
+    /// the four it always registered, `test.block`, `test.sleep`, `test.tick` and
+    /// `test.panic`.
+    pub fn without_extras(&self) -> Self {
+        Self {
+            extras: false,
+            ..self.clone()
         }
     }
 
@@ -299,9 +338,14 @@ impl Plugin for TestCommands {
     fn load(&mut self, reg: &mut Registry) {
         reg.add_command(Arc::new(BlockCmd(self.parking.clone())));
         reg.add_command(Arc::new(SleepCmd));
+        if self.extras {
+            reg.add_command(Arc::new(BlobCmd));
+        }
         reg.add_command(Arc::new(TickCmd(self.ticks.clone())));
         reg.add_command(Arc::new(PanicCmd));
-        reg.add_command(Arc::new(SensitiveCmd(self.sensitive_runs.clone())));
+        if self.extras {
+            reg.add_command(Arc::new(SensitiveCmd(self.sensitive_runs.clone())));
+        }
     }
 }
 
@@ -320,6 +364,23 @@ pub struct ServerOptions {
     /// The operator bridge token; `None` leaves the operator role unconfigured, so
     /// the web UI is agent-only.
     pub operator_token: Option<String>,
+    /// Hand the bridge's `McpServer` the assembled agent state and `approval_timeout`
+    /// (`with_agent_state`, `with_approval_timeout`), as `main.rs` does. `false`
+    /// leaves it on its own defaults, an `Auto` gate and the default approval
+    /// timeout, which is how `web_bus_concurrency` and `web_bus_roles` ran before this
+    /// module existed; `policy` and `approval_timeout` then do not reach the gate.
+    pub wired_gate: bool,
+    /// Register the `commands` passed to [`start`] through the scripting wiring.
+    /// `false` assembles with an empty `ScriptWiring`, the plain `assemble`, as
+    /// `web_bus_roles` always did.
+    pub test_commands: bool,
+    /// The bridge's write deadline (`McpServer::with_write_timeout`); `None` keeps
+    /// the server default.
+    pub write_timeout: Option<Duration>,
+    /// The listener's `SO_SNDBUF` in bytes, set before `bind` and `listen` so every
+    /// accepted socket inherits it; `None` keeps the platform default. A small value
+    /// makes the server's side of a stopped peer's socket fill quickly.
+    pub send_buffer: Option<u32>,
 }
 
 impl Default for ServerOptions {
@@ -330,6 +391,10 @@ impl Default for ServerOptions {
             push_capacity: None,
             dispatcher: false,
             operator_token: Some(OPERATOR_TOKEN.to_owned()),
+            wired_gate: true,
+            test_commands: true,
+            write_timeout: None,
+            send_buffer: None,
         }
     }
 }
@@ -358,9 +423,13 @@ pub async fn start(tag: &str, commands: &TestCommands, opts: ServerOptions) -> S
     let mut cfg = Config::default();
     cfg.ca.dir = temp_ca_dir(tag);
     cfg.mcp.policy = opts.policy;
-    let scripts = ScriptWiring {
-        commands: vec![Box::new(commands.clone())],
-        ..ScriptWiring::default()
+    let scripts = if opts.test_commands {
+        ScriptWiring {
+            commands: vec![Box::new(commands.clone())],
+            ..ScriptWiring::default()
+        }
+    } else {
+        ScriptWiring::default()
     };
     let Assembled {
         proxy,
@@ -370,12 +439,22 @@ pub async fn start(tag: &str, commands: &TestCommands, opts: ServerOptions) -> S
     } = assemble_with_scripts(&cfg, &Features::default(), scripts).expect("assemble");
     let client: Arc<dyn ProxyClient> = Arc::new(UnusedClient);
     let store = proxy.store();
-    let mut mcp = McpServer::new(proxy.registry_arc(), McpTransport::Stdio)
-        .with_services(store.clone(), client, proxy.guard(), None)
-        .with_agent_state(agent_state)
-        .with_approval_timeout(opts.approval_timeout);
+    let mut mcp = McpServer::new(proxy.registry_arc(), McpTransport::Stdio).with_services(
+        store.clone(),
+        client,
+        proxy.guard(),
+        None,
+    );
+    if opts.wired_gate {
+        mcp = mcp
+            .with_agent_state(agent_state)
+            .with_approval_timeout(opts.approval_timeout);
+    }
     if let Some(capacity) = opts.push_capacity {
         mcp = mcp.with_push_capacity(capacity);
+    }
+    if let Some(timeout) = opts.write_timeout {
+        mcp = mcp.with_write_timeout(timeout);
     }
     if opts.dispatcher {
         mcp = mcp.with_push(push_tx.clone());
@@ -389,9 +468,21 @@ pub async fn start(tag: &str, commands: &TestCommands, opts: ServerOptions) -> S
         agent_token: AGENT_TOKEN.to_owned(),
         operator_token: opts.operator_token,
     });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
+    let listener = match opts.send_buffer {
+        // A `TcpSocket` is the only way to set `SO_SNDBUF` before `listen`, which
+        // is what lets the accepted sockets inherit it.
+        Some(size) => {
+            let socket = tokio::net::TcpSocket::new_v4().expect("listener socket");
+            socket.set_send_buffer_size(size).expect("send buffer size");
+            socket
+                .bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+                .expect("bind");
+            socket.listen(1024).expect("listen")
+        }
+        None => tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind"),
+    };
     let addr = listener.local_addr().expect("local addr");
     let task = tokio::spawn(web::serve(listener, state));
     Server {
