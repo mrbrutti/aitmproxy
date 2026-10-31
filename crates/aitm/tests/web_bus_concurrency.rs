@@ -22,7 +22,7 @@
 //! command-provider slot; `flow.list` is the real one. No browser, no network
 //! beyond loopback.
 
-// The `/bus` harness shared with `web_bus_push` and `web_bus_roles`.
+// The `/bus` harness shared with the other `web_bus_*` suites.
 #[path = "support/web_bus.rs"]
 #[allow(dead_code)] // this suite uses a subset of the shared harness
 mod web_bus;

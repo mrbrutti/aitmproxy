@@ -1,5 +1,5 @@
 //! `aitm web` `/bus` write deadline (spec `2026-10-30-bus-hardening-design.md`,
-//! D3/D4, AC9-AC13): a peer that stops reading while the bridge writes is
+//! D3/D4, AC9-AC13 and AC23): a peer that stops reading while the bridge writes is
 //! disconnected within the server's write deadline, and a peer that is slow but
 //! still reading is not.
 //!
@@ -15,7 +15,12 @@
 //!   subscribed 3 s later, so the bound in AC9 is the configured deadline and not
 //!   something else cutting the connection (AC12);
 //! - a reader that sleeps 10 ms between frames against a 1 s deadline is not
-//!   disconnected (AC13).
+//!   disconnected (AC13);
+//! - before authentication, a peer that pings without reading and then sends a bad
+//!   token is dropped when the refusal's own 5 s bound expires, and is never sent
+//!   the refusal or a Close frame, even once it resumes reading (AC23). That one
+//!   exercises the refusal's call site in `relay`, which the in-memory tests in
+//!   `bridge.rs` do not reach.
 //!
 //! A "stopped" client is one that never polls its socket after setup. To make the
 //! kernel buffers small, its socket gets a 4096-byte `SO_RCVBUF` before it
@@ -26,7 +31,8 @@
 //! through the socket (the stream ends once the test resumes reading). Timing
 //! comes from margins, not tuning: the registry must flip within 1 s + 5 s of a
 //! 1 s deadline, the control is checked at 3 s against 30 s, the slow reader
-//! pauses 10 ms per frame against 1 s.
+//! pauses 10 ms per frame against 1 s, and the unauthenticated pinger is given
+//! its 5 s refusal bound plus 2 s before it reads again.
 //!
 //! Hermetic: loopback only; `test.blob` and `test.sensitive` are in-process
 //! commands from the shared harness.
@@ -39,15 +45,17 @@ mod web_bus;
 use std::time::Duration;
 
 use aitm_core::{AgentPolicy, Event};
+use futures::SinkExt as _;
 use tokio::net::TcpSocket;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+use tokio_tungstenite::tungstenite::{Bytes, Message};
 use tokio_tungstenite::{client_async, MaybeTlsStream};
 use web_bus::{
-    assert_refused_without_operator, authenticate, call_line, http_flow, next_frame,
-    probe_ask_gate, push_flow, recv_until, send_text, start, stream_ends_within, subscribe, Probe,
-    Server, ServerOptions, TestCommands, Ws, AGENT_TOKEN, APPROVAL_TIMEOUT, FAST, NO_OPERATOR,
-    OPERATOR_TOKEN, PARKED_TIMED_OUT, SETTLE, TIMEOUT,
+    assert_refused_without_operator, authenticate, call_line, drain_until_end, http_flow,
+    next_frame, probe_ask_gate, push_flow, recv_until, send_text, start, stream_ends_within,
+    subscribe, Probe, Server, ServerOptions, TestCommands, Ws, AGENT_TOKEN, APPROVAL_TIMEOUT, FAST,
+    NO_OPERATOR, OPERATOR_TOKEN, PARKED_TIMED_OUT, SETTLE, TIMEOUT,
 };
 
 /// The write deadline every test but the control gives the server.
@@ -70,6 +78,32 @@ const SERVER_SEND_BUFFER: u32 = 4096;
 const BLOB_LINES: u64 = 16;
 /// How long the control waits after the pump before it looks at the registry.
 const CONTROL_WAIT: Duration = Duration::from_secs(3);
+/// How long the bridge gives the refusal of a bad token (its `CLOSE_DRAIN_TIMEOUT`,
+/// private to `src/web/bridge.rs`). Keep it equal to that. If the bridge's bound
+/// ever grows past this plus [`REFUSAL_MARGIN`] the AC23 test goes red, not green.
+const REFUSAL_DEADLINE: Duration = Duration::from_secs(5);
+/// How much longer than [`REFUSAL_DEADLINE`] the unauthenticated pinger waits
+/// before it reads again, so the server has certainly given up.
+const REFUSAL_MARGIN: Duration = Duration::from_secs(2);
+/// The payload of each Ping: 125 bytes, the most a control frame may carry.
+const PING_PAYLOAD_BYTES: usize = 125;
+/// The size of the Pong the server answers a Ping with: a 2-byte header (server
+/// frames are unmasked, and 125 fits the short length form) plus the echoed payload.
+const PONG_FRAME_BYTES: usize = 2 + PING_PAYLOAD_BYTES;
+/// How much Pong data the flood makes the server queue: 20 MiB, the same order of
+/// margin as the 16 MiB of the other tests. The kernel path of a 4096-byte
+/// `SO_SNDBUF` and `SO_RCVBUF` holds a tiny fraction of it, and even a kernel that
+/// ignored both and autotuned would hold well under it on loopback.
+const PONG_VOLUME: usize = 20 << 20;
+/// How many Pings that is (165,130).
+const PINGS: usize = PONG_VOLUME / PONG_FRAME_BYTES;
+/// How long sending the Pings and the bad-token frame may take. It must stay well
+/// inside the bridge's 10 s `HANDSHAKE_TIMEOUT`, which runs from the upgrade: a
+/// token that arrives later is met by the authentication timeout, a different
+/// bounded path, and the test would then prove nothing about the refusal.
+const FLOOD_BOUND: Duration = Duration::from_secs(6);
+/// A token that is neither of the bridge's (they are `d` and `e` repeated).
+const BAD_TOKEN: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// A server the tests below stop a client against: the `Ask` policy (so the probe
 /// can tell a connected operator from none), a 1 s write deadline and a 4 KiB send
@@ -83,12 +117,12 @@ fn stopped_options() -> ServerOptions {
     }
 }
 
-/// Open the bus as `token` like `web_bus::open_bus`, but over a client socket whose
-/// receive buffer is [`CLIENT_RECV_BUFFER`] bytes, set before `connect`
-/// (bus-hardening spec D4), so a test that then stops reading fills the kernel
-/// buffers after a few KiB. The socket is upgraded with `client_async`, which
-/// yields the same [`Ws`] the shared helpers take.
-async fn open_stopped(server: &Server, token: &str, role: &str) -> Ws {
+/// Connect to the bus and complete the websocket upgrade, but do not authenticate,
+/// over a client socket whose receive buffer is [`CLIENT_RECV_BUFFER`] bytes, set
+/// before `connect` (bus-hardening spec D4), so a test that then stops reading
+/// fills the kernel buffers after a few KiB. The socket is upgraded with
+/// `client_async`, which yields the same [`Ws`] the shared helpers take.
+async fn connect_stopped(server: &Server) -> Ws {
     let socket = TcpSocket::new_v4().expect("client socket");
     socket
         .set_recv_buffer_size(CLIENT_RECV_BUFFER)
@@ -107,7 +141,13 @@ async fn open_stopped(server: &Server, token: &str, role: &str) -> Ws {
     .await
     .expect("handshake within the timeout")
     .expect("handshake");
-    authenticate(ws, token, role).await
+    ws
+}
+
+/// Open the bus as `token` like `web_bus::open_bus`, but over the small-buffer
+/// socket of [`connect_stopped`].
+async fn open_stopped(server: &Server, token: &str, role: &str) -> Ws {
+    authenticate(connect_stopped(server).await, token, role).await
 }
 
 /// Push `count` flow events of a `PATH_BYTES` path straight into the server's
@@ -312,5 +352,91 @@ async fn a_slow_but_live_reader_is_not_disconnected() {
     assert_eq!(
         reply["result"]["isError"], false,
         "the connection must still answer calls after the slow read: {reply}"
+    );
+}
+
+/// Bus-hardening AC23, the pre-auth refusal's call site: an unauthenticated peer
+/// that floods 125-byte Pings without ever reading, then sends a bad token, is
+/// dropped when the refusal's own bound ([`REFUSAL_DEADLINE`], 5 s) expires. It is
+/// never sent the refusal or a Close frame, even if it reads again afterwards.
+///
+/// tungstenite answers every Ping with a Pong, queues the Pongs without limit once
+/// the socket is full, and keeps reading while it cannot write. So [`PINGS`] Pings
+/// from a client with a 4096-byte receive buffer, against a listener with a
+/// 4096-byte send buffer, leave about 20 MiB of Pongs queued in the server and the
+/// kernel path full, while the bad-token frame behind them is still read. The
+/// refusal send then has nowhere to go: bounded, it fails at 5 s and the bridge
+/// drops the connection; unbounded (`ws.send(UNAUTHORIZED_REPLY)`, as the call site
+/// was before this change) it parks until the client drains and then delivers.
+///
+/// The assertion is on content, not on the stream ending: once the path drains the
+/// stream ends either way, a dropped connection after its buffered Pongs and a
+/// refused one after the refusal and a Close. So after [`REFUSAL_DEADLINE`] plus
+/// [`REFUSAL_MARGIN`] the client reads again and requires that the stream ends and
+/// that no text frame mentions `unauthorized` and no Close frame arrived. A path
+/// that was not actually full would deliver the refusal and fail this too, so a
+/// kernel with larger buffers than assumed makes the test red rather than
+/// vacuously green.
+///
+/// The server keeps the default 30 s write deadline, not the 1 s of the other
+/// tests, so that only the 5 s refusal bound can drop the peer inside the wait: a
+/// refusal sent under the post-authentication deadline would fail here.
+///
+/// Takes about 7 s plus the flood, which is a second or two (the in-memory
+/// equivalent measured half a second in a debug build).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unauthenticated_pinging_peer_is_dropped_at_the_refusal_deadline() {
+    let commands = TestCommands::new();
+    let server = start(
+        "preauth-pinging",
+        &commands,
+        ServerOptions {
+            write_timeout: None,
+            ..stopped_options()
+        },
+    )
+    .await;
+    let mut ws = connect_stopped(&server).await;
+
+    let payload = Bytes::from(vec![b'p'; PING_PAYLOAD_BYTES]);
+    tokio::time::timeout(FLOOD_BOUND, async {
+        for _ in 0..PINGS {
+            ws.feed(Message::Ping(payload.clone()))
+                .await
+                .expect("send a ping");
+        }
+        ws.flush().await.expect("flush the pings");
+        send_text(&mut ws, format!(r#"{{"token":"{BAD_TOKEN}"}}"#)).await;
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "sending {PINGS} pings and the bad token took more than {FLOOD_BOUND:?}; the \
+             bridge's 10 s authentication window may have expired, so this run could not \
+             tell the refusal's bound from the authentication timeout"
+        )
+    });
+    // From here the client never polls its socket until the checks below.
+
+    tokio::time::sleep(REFUSAL_DEADLINE + REFUSAL_MARGIN).await;
+
+    let drained = drain_until_end(&mut ws, TIMEOUT).await;
+    let refusals: Vec<&String> = drained
+        .replies
+        .iter()
+        .filter(|reply| reply.contains("unauthorized"))
+        .collect();
+    assert!(
+        refusals.is_empty() && !drained.saw_close,
+        "the bridge gave up on the pinging peer at the refusal deadline, so once the peer \
+         reads again it must be sent neither the refusal nor a Close; got refusals \
+         {refusals:?}, close frame seen: {} (code {:?})",
+        drained.saw_close,
+        drained.close_code
+    );
+    assert!(
+        drained.ended,
+        "the stream of a peer dropped at the refusal deadline must end once it reads \
+         again, but it was still open after {TIMEOUT:?}"
     );
 }

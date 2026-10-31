@@ -46,8 +46,8 @@ pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 /// abandoned: the sink is closed, the connection's subscriptions are dropped, and
 /// the writer's error is returned. A writer ends in an error when the deadline
 /// expires, when a write fails, or when its task panics (the error then says the
-/// writer task failed). A writer that ends cleanly, or a read loop that ends
-/// first, leaves the connection to end when the read loop does, and the writer is
+/// writer task failed). If the read loop ends first, or the writer ends cleanly,
+/// the connection ends when the read loop does; in the first case the writer is
 /// given the chance to drain what is queued (still bounded by the deadline). A
 /// command already running on the blocking pool when the loop is abandoned
 /// finishes, but its reply is lost, as on any disconnect.
@@ -127,7 +127,10 @@ where
     server.drop_connection(conn_id);
     if let Some(task) = writer_task {
         if let Some(err) = writer_failure(task.await) {
-            tracing::debug!(error = %format_args!("{err:#}"), "bus connection's writer ended with an error");
+            tracing::debug!(
+                error = %format_args!("{err:#}"),
+                "bus connection's writer ended with an error"
+            );
         }
     }
     outcome
@@ -333,7 +336,10 @@ impl LoopbackTcp {
                 // it is logged at debug (never with a token; the errors carry none)
                 // and the listener goes on accepting.
                 if let Err(err) = serve_connection(srv, stream, &agent, operator.as_deref()).await {
-                    tracing::debug!(error = %format_args!("{err:#}"), "bus connection ended with an error");
+                    tracing::debug!(
+                        error = %format_args!("{err:#}"),
+                        "bus connection ended with an error"
+                    );
                 }
             });
         }
@@ -611,12 +617,14 @@ mod tests {
         line
     }
 
-    /// The `sub_id` a successful `flow.subscribe` reply line carries.
-    fn sub_id_in(reply: &str) -> u64 {
+    /// Assert that `reply` is the line of a successful `flow.subscribe`, that is,
+    /// carries a `sub_id`. No test here needs the id itself.
+    fn assert_subscribed_reply(reply: &str) {
         let reply: JsonValue = serde_json::from_str(reply).expect("the reply is JSON");
-        reply["result"]["structuredContent"]["sub_id"]
-            .as_u64()
-            .unwrap_or_else(|| panic!("the subscribe reply carries a sub_id: {reply}"))
+        assert!(
+            reply["result"]["structuredContent"]["sub_id"].is_u64(),
+            "the subscribe reply carries a sub_id: {reply}"
+        );
     }
 
     /// The client end of a `serve_lines` connection over an in-memory pipe, plus
@@ -665,8 +673,9 @@ mod tests {
     }
 
     impl LineClient {
-        /// Send `flow.subscribe {}`, read exactly one line, and return its `sub_id`.
-        async fn subscribe(&mut self) -> u64 {
+        /// Send `flow.subscribe {}`, read exactly one line, and assert it is a
+        /// successful subscribe reply.
+        async fn subscribe(&mut self) {
             self.writer
                 .write_all(subscribe_line().as_bytes())
                 .await
@@ -678,7 +687,7 @@ mod tests {
                 .await
                 .expect("read the subscribe reply")
                 .expect("a reply line");
-            sub_id_in(&reply)
+            assert_subscribed_reply(&reply);
         }
 
         /// The next line from the server, parsed.
@@ -1074,7 +1083,7 @@ mod tests {
             .read_line(&mut reply)
             .await
             .expect("read the subscribe reply");
-        sub_id_in(&reply);
+        assert_subscribed_reply(&reply);
 
         for seq in 0..LINES {
             push_padded(&server, seq as u64);

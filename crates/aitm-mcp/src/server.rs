@@ -1001,8 +1001,8 @@ impl McpServer {
     ///
     /// The clock stops when the socket has accepted the frame, not when the peer
     /// has read it. A peer that keeps reading frees room in the socket buffers as
-    /// it goes, so its sends complete and it is never cut for being slow: only a
-    /// reader slower than the frame's size over the deadline is (see
+    /// it goes, so its sends complete and it is not cut for being slow, unless it
+    /// reads a frame slower than the frame's size over the deadline (see
     /// [`DEFAULT_WRITE_TIMEOUT`] for that rate). A peer that stops reading with
     /// the buffers full leaves the next send pending until the deadline expires,
     /// and the transport then ends the connection, so the peer cannot pin the
@@ -1071,7 +1071,10 @@ impl McpServer {
     }
 
     /// Drop every subscription a connection held (called by the transport when
-    /// the connection ends).
+    /// the connection ends). Close the connection's sink first, then call this;
+    /// see `Subscriptions::add`, which refuses a subscribe on a closed sink and so
+    /// makes that order the contract a transport must follow (`serve_lines` and
+    /// the web bridge's `ConnGuard` both do).
     pub fn drop_connection(&self, conn_id: u64) {
         self.subscriptions.drop_connection(conn_id);
     }

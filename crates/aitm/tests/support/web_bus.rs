@@ -1,7 +1,7 @@
-//! Shared harness for the `aitm web` `/bus` suites (`web_bus_push`,
-//! `web_bus_concurrency`, `web_bus_roles`): one served `aitm web` over the real
-//! wired registry plus a few in-process test commands, a websocket client, and the
-//! receive and probe helpers the suites build their assertions from.
+//! Shared harness for the `web_bus_*` suites of the `aitm web` `/bus` bridge: one
+//! served `aitm web` over the real wired registry plus a few in-process test
+//! commands, a websocket client, and the receive and probe helpers the suites
+//! build their assertions from.
 //!
 //! Including files declare it the way the `rig` and `scripted_driver` modules are
 //! declared (not through `support/mod.rs`):
@@ -655,8 +655,11 @@ pub async fn drain_for(ws: &mut Ws, bound: Duration) -> Vec<JsonValue> {
 pub struct Drained {
     /// The text frames received before the end.
     pub replies: Vec<String>,
-    /// The code of the Close frame, when the stream ended with one.
+    /// The code of the Close frame, when the stream ended with one that has a code.
     pub close_code: Option<CloseCode>,
+    /// A Close frame arrived, with a code or without one, as opposed to the stream
+    /// ending by end of stream or a reset.
+    pub saw_close: bool,
     /// The stream ended — a Close frame, end of stream, or a connection reset —
     /// before the bound elapsed.
     pub ended: bool,
@@ -670,6 +673,7 @@ pub async fn drain_until_end(ws: &mut Ws, bound: Duration) -> Drained {
     let mut out = Drained {
         replies: Vec::new(),
         close_code: None,
+        saw_close: false,
         ended: false,
     };
     loop {
@@ -678,6 +682,7 @@ pub async fn drain_until_end(ws: &mut Ws, bound: Duration) -> Drained {
             Ok(Some(Ok(Message::Text(text)))) => out.replies.push(text.to_string()),
             Ok(Some(Ok(Message::Close(frame)))) => {
                 out.close_code = frame.map(|f| f.code);
+                out.saw_close = true;
                 out.ended = true;
                 return out;
             }

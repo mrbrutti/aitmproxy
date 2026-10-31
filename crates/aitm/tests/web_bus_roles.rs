@@ -9,7 +9,7 @@
 //! not configured (`operator_token: None`) the operator bridge token value
 //! matches nothing and is refused too (operator-off-by-default).
 
-// The `/bus` harness shared with `web_bus_concurrency` and `web_bus_push`.
+// The `/bus` harness shared with the other `web_bus_*` suites.
 #[path = "support/web_bus.rs"]
 #[allow(dead_code)] // this suite uses a subset of the shared harness
 mod web_bus;

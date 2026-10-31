@@ -763,9 +763,10 @@ mod tests {
         closed.expect("a completed handshake is Ok");
     }
 
-    /// bus-hardening AC8, the stalled half: the client end is held open but never read, so a 1 MiB
-    /// message cannot fit the 64 KiB duplex and the send parks, exactly as a send
-    /// to a stopped socket does. Without a deadline it never returns.
+    /// bus-hardening AC8, the stalled half: the client end is held open but never
+    /// read, so a 1 MiB message cannot fit the 64 KiB duplex and the send parks,
+    /// exactly as a send to a stopped socket does. Without a deadline it never
+    /// returns.
     #[tokio::test]
     async fn send_within_gives_up_on_a_stalled_peer() {
         let (mut server, _stalled_client) = socket_pair().await;
@@ -783,8 +784,8 @@ mod tests {
         );
     }
 
-    /// bus-hardening AC8, the live half: a peer that reads takes the whole 1 MiB, and a limit far
-    /// above the time that takes does not fire.
+    /// bus-hardening AC8, the live half: a peer that reads takes the whole 1 MiB,
+    /// and a limit far above the time that takes does not fire.
     #[tokio::test]
     async fn send_within_delivers_to_a_live_peer() {
         let (mut server, mut client) = socket_pair().await;
@@ -843,12 +844,18 @@ mod tests {
     #[tokio::test]
     async fn the_bad_token_refusal_gives_up_on_a_peer_whose_send_path_is_full() {
         let (mut server, mut client) = socket_pair().await;
-        let fill = send_within(
-            &mut server,
-            Message::text("x".repeat(1 << 20)),
-            Duration::from_millis(50),
+        // Bounded from outside too: were `send_within` to regress to an unbounded
+        // send, this setup step would hang the test instead of failing it.
+        let fill = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_within(
+                &mut server,
+                Message::text("x".repeat(1 << 20)),
+                Duration::from_millis(50),
+            ),
         )
         .await
+        .expect("setup: the fill must return within 2 s of a 50 ms limit, not park on the peer")
         .expect_err("setup: a 1 MiB send to a peer that never reads must not fit the duplex");
         assert!(
             fill.to_string().contains("timed out after"),
