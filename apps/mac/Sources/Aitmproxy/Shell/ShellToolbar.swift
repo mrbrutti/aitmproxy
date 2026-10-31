@@ -99,18 +99,21 @@ struct ListeningPill: View {
 }
 
 /// On = the proxy records flows; off = paused (`proxy.pause`: traffic still passes, new flows
-/// are not recorded). The same entry as View ▸ Pause Proxy / Resume Proxy (⇧⌘R) and the
-/// palette. Live while the bus is connected — pause is a bus call, whichever core answers.
+/// are not recorded). Its position is the core's published `capturing` (`Session.capturing`,
+/// refreshed from `proxy.status` every poll and from each pause/resume reply, so a pause by
+/// another client — agent, TUI, web — shows here within one poll). The same entry as View ▸
+/// Pause Proxy / Resume Proxy (⇧⌘R) and the palette. Live while the bus is connected as
+/// operator — pause is a bus call, whichever core answers.
 struct ProxySwitch: View {
     @Environment(Session.self) private var session
     var summary: ConnectionSummary
 
     var body: some View {
-        let live = ToolbarSwitches.proxyLive(summary)
         ToolbarSwitch(
-            title: "Proxy", on: live && session.capturing, tint: Tok.Status.success.color, enabled: live,
+            title: "Proxy", on: session.capturing, tint: Tok.Status.success.color,
+            enabled: ToolbarSwitches.proxyLive(summary),
             help: ToolbarSwitches.proxyHelp(summary, capturing: session.capturing)
-        ) { session.setCapturing(!session.capturing) }
+        ) { on in ToolbarSwitches.flipProxy(session, on: on) }
     }
 }
 
@@ -128,27 +131,40 @@ struct CaptureExtensionSwitch: View {
 
     var body: some View {
         let health = session.coreHealth
-        let embedded = (session.connection?.activeKind ?? .embedded) == .embedded
-        let on = health.captureChoice ?? ToolbarSwitches.captureOn(summary.capture)
+        let embedded = session.embeddedCoreActive
+        let on = ToolbarSwitches.capturePosition(choice: health.captureChoice, lane: summary.capture)
         ToolbarSwitch(
             title: "Capture", on: on, tint: summary.capture.state.color.color,
             enabled: ToolbarSwitches.captureLive(health, embedded: embedded),
             help: ToolbarSwitches.captureHelp(summary.capture, controlsAvailable: health.captureControlsAvailable,
                                               embedded: embedded, busy: health.captureBusy, choice: on)
-        ) { Task { await CaptureSwitch.set(!on, session: session) } }
+        ) { on in ToolbarSwitches.flipCapture(session, on: on) }
     }
 }
 
-/// The switches' enabled rules and help text as plain functions, so the self-test can pin
-/// them (ST-AC9) without a view.
+/// The switches' rules, help text and the two flips as plain functions, so the self-test can
+/// drive them (ST-AC9) without a view and the views stay one line each.
+@MainActor
 enum ToolbarSwitches {
-    /// Pause/resume is a bus call: live while the bus is connected (as operator or as agent).
+    /// Pause/resume is a bus call: live while the bus is connected as operator. Connected as
+    /// agent (the bus lane's warning) stands down, so a pause is never logged as an agent action.
     static func proxyLive(_ summary: ConnectionSummary) -> Bool {
-        summary.bus.state == .ok || summary.bus.state == .warning
+        summary.bus.state == .ok
+    }
+
+    /// The Proxy switch's flip: the same entry as View ▸ Pause Proxy / Resume Proxy.
+    static func flipProxy(_ session: Session, on: Bool) {
+        session.setCapturing(on)
+    }
+
+    /// The Capture switch's flip: the same steps as Settings ▸ Capture and Proxy ▸ Turn On/Off
+    /// Capture. Operator-only (`tools/check-capture-operator-only.sh`).
+    static func flipCapture(_ session: Session, on: Bool) {
+        Task { await CaptureSwitch.set(on, session: session) }
     }
 
     static func proxyHelp(_ summary: ConnectionSummary, capturing: Bool) -> String {
-        guard proxyLive(summary) else { return "Bus \(summary.bus.word) — connect to pause or resume the proxy" }
+        guard proxyLive(summary) else { return "Bus \(summary.bus.word) — connect as operator to pause or resume the proxy" }
         return capturing
             ? "Pause the proxy: traffic still passes and new flows are not recorded (⇧⌘R)"
             : "Resume recording flows (⇧⌘R)"
@@ -156,6 +172,9 @@ enum ToolbarSwitches {
 
     /// The switch's resting position: the extension is on unless its lane is off.
     static func captureOn(_ lane: ConnectionLane) -> Bool { lane.state != .off }
+
+    /// What the switch shows: the choice while a switch is in flight, else the lane's fact.
+    static func capturePosition(choice: Bool?, lane: ConnectionLane) -> Bool { choice ?? captureOn(lane) }
 
     /// The same gate as Settings ▸ Capture's toggle and Proxy ▸ Turn On / Turn Off Capture.
     static func captureLive(_ health: CoreHealthState, embedded: Bool) -> Bool {
@@ -186,13 +205,14 @@ struct ToolbarSwitch: View {
     var title: String
     var on: Bool
     var tint: Color
-    var enabled = true
+    var enabled: Bool
     var help: String
-    var action: () -> Void
+    /// Receives the value the switch was flipped to.
+    var action: (Bool) -> Void
 
     var body: some View {
-        Toggle(title, isOn: Binding(get: { on }, set: { _ in action() }))
-            .toggleStyle(ToolbarSwitchStyle(tint: enabled ? tint : Tok.Ink.tertiary.color, enabled: enabled))
+        Toggle(title, isOn: Binding(get: { on }, set: { action($0) }))
+            .toggleStyle(ToolbarSwitchStyle(title: title, tint: tint))
             .disabled(!enabled)
             .help(help)
     }
@@ -201,22 +221,30 @@ struct ToolbarSwitch: View {
 /// Draws a `Toggle` as `[●━] Word`: the shared `SwitchGlyph` and the title in ink (tertiary when
 /// disabled). Tapping anywhere on it flips the binding.
 struct ToolbarSwitchStyle: ToggleStyle {
+    var title: String
     var tint: Color
-    var enabled: Bool
+    /// `.disabled` on the Toggle (or any parent) greys the track and the word together.
+    @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
         Button { configuration.isOn.toggle() } label: {
             HStack(spacing: Space.sm) {
-                SwitchGlyph(on: configuration.isOn, tint: tint)
+                SwitchGlyph(on: configuration.isOn, tint: isEnabled ? tint : Tok.Ink.tertiary.color)
                 configuration.label
                     .font(Tok.Face.ui(Tok.Typography.Size.sm))
-                    .foregroundStyle(enabled ? Tok.Ink.primary.color : Tok.Ink.tertiary.color)
+                    .foregroundStyle(isEnabled ? Tok.Ink.primary.color : Tok.Ink.tertiary.color)
             }
             .padding(.horizontal, Space.sm)
             .frame(height: Tok.Size.control)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        // The Button is the element assistive tech reaches; the title drawn inside it is a
+        // child, so name and value go here — VoiceOver reads "Proxy, on", not "toggle button".
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title)
+        .accessibilityValue(configuration.isOn ? "on" : "off")
+        .accessibilityAddTraits(.isToggle)
     }
 }
 
@@ -230,7 +258,11 @@ struct SwitchGlyph: View {
             .fill(on ? tint : Tok.Ink.tertiary.color)
             .frame(width: Tok.Metric.switchWidth, height: Tok.Metric.switchHeight)
             .overlay(alignment: on ? .trailing : .leading) {
-                Circle().fill(.white).frame(width: Tok.Metric.switchKnob, height: Tok.Metric.switchKnob).padding(2)
+                // A white knob in both appearances, as the system switch draws it: the track
+                // under it is a status colour or the tertiary grey, never the accent.
+                Circle().fill(.white)
+                    .frame(width: Tok.Metric.switchKnob, height: Tok.Metric.switchKnob)
+                    .padding(Tok.Metric.switchKnobInset)
             }
             .accessibilityHidden(true)
     }

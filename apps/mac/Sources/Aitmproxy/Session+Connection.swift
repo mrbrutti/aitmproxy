@@ -8,6 +8,10 @@ import Foundation
 /// Settings rows — reads `connectionSummary`, so their words come from one table and never
 /// disagree. The sidebar and the status bar carry no connection state at all (spec §4).
 extension Session {
+    /// Whether the embedded core is the active kind (embedded when nothing says otherwise): the
+    /// one accessor for the toolbar, the summary and anyone else asking.
+    var embeddedCoreActive: Bool { (connection?.activeKind ?? .embedded) == .embedded }
+
     var connectionSummary: ConnectionSummary {
         ConnectionSummary.make(
             core: coreHealth.connection,

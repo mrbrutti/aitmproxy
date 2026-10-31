@@ -215,10 +215,15 @@ import Testing
         }
         let l4 = Fixtures.l4Rows
         #expect(keeps(.tcp, l4).map { $0.l4?.proto } == [.tcp])
-        #expect(keeps(.udp, l4).count == 2 && keeps(.udp, l4).allSatisfy { $0.l4?.proto == .udp })
+        let udp = keeps(.udp, l4)
+        #expect(udp.count == 2)
+        #expect(udp.allSatisfy { $0.l4?.proto == .udp })
         #expect(keeps(.l4, l4).count == l4.count)
-        #expect(keeps(.l4, Fixtures.rows).isEmpty && keeps(.tcp, Fixtures.rows).isEmpty)
+        #expect(keeps(.l4, Fixtures.rows).isEmpty)
+        #expect(keeps(.tcp, Fixtures.rows).isEmpty)
         #expect(ContentCategory.groups[2] == [.tcp, .udp, .l4])
+        #expect(ContentCategory.shortcutChips.count == 9)
+        #expect(ContentCategory.shortcutChips[4...6] == [.tcp, .udp, .l4])
         #expect(ContentCategory.allCases.allSatisfy { !$0.help.isEmpty })
     }
 

@@ -10,8 +10,8 @@ public enum BusState: Hashable, Sendable {
     case failed(String)
 }
 
-/// How well one lane of the connection is doing. Ordered worst-last so the sidebar's
-/// Status row and the toolbar pill can show the worst lane.
+/// How well one lane of the connection is doing. Ordered worst-last so the toolbar pill
+/// can show the worst lane.
 public enum LaneState: Int, Comparable, Sendable {
     case ok, working, off, warning, error
 
@@ -52,8 +52,8 @@ public enum ConnectionAction: Hashable, Sendable {
 
 /// One of the three lanes the operator must understand: the core (the proxy process), the
 /// bus (the app's link to it) and the capture extension (system-wide capture). Every word
-/// a connection indicator shows comes from here, so the toolbar pill, the status bar, the
-/// sidebar row, the Status page and the Settings rows can never disagree.
+/// a connection indicator shows comes from here, so the toolbar's connection cluster, the
+/// Status page, the Core Log header and the Settings rows can never disagree.
 public struct ConnectionLane: Hashable, Sendable {
     public enum Kind: String, Hashable, Sendable, CaseIterable {
         case core, bus, capture
@@ -82,7 +82,7 @@ public struct ConnectionLane: Hashable, Sendable {
     public let actions: [ConnectionAction]
 
     /// The word with its lane named where the word alone would be ambiguous: "capture off" as is,
-    /// "failed" → "core: failed". For the one-item surfaces (status bar).
+    /// "failed" → "core: failed". For one-line surfaces (the switch help, `spoken`).
     public var compact: String {
         word.hasPrefix(kind.title.lowercased()) ? word : "\(kind.title.lowercased()): \(word)"
     }
@@ -144,20 +144,13 @@ public struct ConnectionSummary: Hashable, Sendable {
 
     public var lanes: [ConnectionLane] { [core, bus, capture] }
 
-    /// The worst lane state: what the sidebar's Status row glyph and the pill's dot show.
+    /// The worst lane state.
     public var overall: LaneState { lanes.map(\.state).max() ?? .ok }
 
     /// The worst lane, for the compact surfaces that show one word.
     public var worst: ConnectionLane { lanes.max { $0.state < $1.state } ?? core }
 
     public var allStepsDone: Bool { steps.allSatisfy(\.done) }
-
-    /// The status bar's one connection word: "connected" while every lane is fine, else the
-    /// worst lane's compact form ("capture off", "core: failed").
-    public var overallWord: String { overall == .ok ? "connected" : worst.compact }
-
-    /// The sidebar badge beside the brand: "ok", or the lane that needs attention ("Capture").
-    public var badge: String { overall == .ok ? "ok" : worst.kind.title }
 
     /// The three lanes in one line, for tooltips: "Core: running — Embedded · proxy …\nBus: …".
     public var tooltip: String {

@@ -69,6 +69,10 @@ public enum ContentCategory: String, CaseIterable, Hashable, Sendable, Identifia
         [.json, .form, .xml, .js, .css, .graphql, .document, .media, .other],
     ]
 
+    /// ⌘1…⌘9: the first nine chips in bar order — the one owner of that rule (the View ▸ Chip
+    /// menu and the command map both read it), so adding a chip moves the later shortcuts once.
+    public static let shortcutChips: [ContentCategory] = Array(groups.flatMap { $0 }.prefix(9))
+
     /// Classifies a response (or request) content type.
     public static func classify(contentType: String?) -> ContentCategory {
         guard let raw = contentType?.lowercased() else { return .other }
@@ -84,8 +88,9 @@ public enum ContentCategory: String, CaseIterable, Hashable, Sendable, Identifia
         return .other
     }
 
-    /// Whether a row passes this chip. Protocol chips look at scheme/kind/version, the L4 chips
-    /// at the row's transport; type chips at the content type.
+    /// Whether a row passes this chip. Protocol chips look at scheme/kind/version; the three
+    /// L4 chips read one field, `row.l4` (set on every packet-level row), so L4 is exactly the
+    /// union of TCP, UDP and the other transports; type chips at the content type.
     public func matches(row: FlowRow, contentType: String?, httpVersion: String?) -> Bool {
         switch self {
         case .all: true
@@ -94,7 +99,7 @@ public enum ContentCategory: String, CaseIterable, Hashable, Sendable, Identifia
         case .websocket: row.kind == .websocket
         case .tcp: row.l4?.proto == .tcp
         case .udp: row.l4?.proto == .udp
-        case .l4: row.kind == .l4
+        case .l4: row.l4 != nil
         case .h1: httpVersion?.hasPrefix("HTTP/1") ?? false
         case .h2: httpVersion?.hasPrefix("HTTP/2") ?? false
         default: Self.classify(contentType: contentType) == self

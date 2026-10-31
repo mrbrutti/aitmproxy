@@ -12,9 +12,9 @@ The primary screen on fixtures and on a live `aitm`: usable for a day of watchin
 As the operator, I launch the app and see the sidebar, window toolbar, chip bar, flow list, intercept bar and status bar laid out as the mockup.
 Screens: apps
 Acceptance:
-- [snap] Sidebar 240 px with Working / All / aitmproxy groups in tracked small caps; brand mark `›•‹ aitmproxy` top-left; filter field at the bottom.
-- [snap] Toolbar holds sidebar toggle, pause capture, compose, clear; the listening pill in the centre; Agent toggle, palette and layout glyphs on the right; no glass capsules behind any group.
-- [snap] Chip bar 36 px with `All | HTTP HTTPS WebSocket | h1 h2 | JSON … Other` and the `Filters ▾` affordance; status bar 28 px on `raised`.
+- [snap] Sidebar 240 px with Traffic / Testing / Automation groups in tracked small caps; brand mark `›•‹ aitmproxy` top-left (a label, no status); filter field at the bottom.
+- [snap] Toolbar holds sidebar toggle, compose, clear; the connection cluster (pill, Proxy switch, Capture switch) in the centre; Agent toggle, palette and layout glyphs on the right; no glass capsules behind any group.
+- [snap] Chip bar 36 px with `All | HTTP HTTPS WebSocket | TCP UDP L4 | h1 h2 | JSON … Other` and the `Filters ▾` affordance; status bar 28 px on `raised` with the list's facts only.
 - [self] Fixtures load 14 rows; the window opens at 1440×900 with a 1100×640 minimum.
 Status: done
 
@@ -249,8 +249,8 @@ UX:
 Status: done
 (Fixtures update locally; live `flow.mark`/`flow.comment` wait on S-core-F6 and surface a status-bar error until then.)
 
-### S-018 Pause capture and clear the session
-As the operator, I click pause in the toolbar to stop recording and clear to drop every flow; both are real proxy state.
+### S-018 Pause the proxy and clear the session
+As the operator, I flip the Proxy switch in the toolbar to stop recording and click clear to drop every flow; both are real proxy state, read back from the core.
 Screens: apps
 Depends: S-005
 Core: F7
@@ -261,7 +261,7 @@ Acceptance:
 UX:
 - Flow: toolbar Proxy switch (or View ▸ Pause Proxy ⇧⌘R) -> switch grey, pill reads "paused" -> click again to resume; toolbar trash (File ▸ Clear Session ⌘⌫) -> list empties -> empty state returns
 - Surface: inline toolbar toggles; Clear asks "Clear 2 paused flows too?" (confirmation dialog, destroys data) only when flows are paused, buttons "Clear" / "Cancel"
-- States: paused + new client traffic -> rows still flow? No: paused capture records nothing; the pill says so. Live bus without F7 -> status-bar error "Pause needs proxy.pause (F7)"; fixtures toggle locally
+- States: paused + new client traffic -> rows still flow? No: a paused proxy records nothing; the pill says so, and a pause from any other client shows within one poll (`proxy.status`). Live bus without F7 -> status-bar error "pause proxy: …"; fixtures toggle locally
 - Words: "Proxy" (the switch), "Pause Proxy" / "Resume Proxy", "Clear Session", tooltip "Pause the proxy: traffic still passes and new flows are not recorded (⇧⌘R)"
 - Access: both in the menu bar; the pill is a status, not a control, to VoiceOver
 Status: done
@@ -1170,7 +1170,7 @@ UX:
 - Surface: sidebar page (a place the operator comes back to); controls inline on the lane cards; destructive Uninstall behind ⋯ with a confirmation dialog. The two everyday controls (Proxy on/paused, Capture on/off) are inline toolbar switches — they change one value already on screen — in the one connection cluster; the brand row and status bar show nothing about connection (Matt's review 2).
 - States: each lane ok / working / off / warning / error with word + detail + remedy; Getting started rows done (✓, stays) or pending (○ + one action), collapsing to one line when all done; Recent "No flows yet — point a client at <address>".
 - Words: Status, Core, Bus, Capture extension, Proxy (the switch) / Pause Proxy / Resume Proxy, Capture (the switch) / Turn On Capture / Turn Off Capture, Restart Core, Reconnect, Open Scope…, Core Log…, Open Browser, Copy Address, Uninstall Capture Extension…, Getting started (GLOSSARY).
-- Access: every card action has a menu-bar twin with a shortcut; dots carry "Core: running" labels; the switches read "Proxy, on" / "Capture, off" with the reason in their help, never colour alone.
+- Access: every card action has a menu-bar twin with a shortcut; dots carry "Core: running" labels; the switches carry label + on/off value + help with the reason, never colour alone (VoiceOver read-out is ST-AC12, open).
 Notes: the capture lane maps PR #181's `CaptureAdvice` 1:1; until the provider stops claiming DNS, the scope step says to add `host:443`. A core `capture.status` verb (proposed) will sharpen the capture detail through `CoreCaptureStatus` without a UI change.
 Status: in progress
 

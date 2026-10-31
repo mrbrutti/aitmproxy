@@ -160,6 +160,7 @@ extension Tok {
         static let switchWidth: CGFloat = 26
         static let switchHeight: CGFloat = 16
         static let switchKnob: CGFloat = 12
+        static let switchKnobInset: CGFloat = 2
         /// Inner padding of pills and buttons.
         static let padInner: CGFloat = 10
         /// The gap between a label and its shortcut hint, or two tight items.
