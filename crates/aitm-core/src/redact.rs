@@ -13,8 +13,15 @@
 //!   `Bearer <token>` — regardless of the key it sits under. This catches the
 //!   secrets a key-only pass misses.
 //!
-//! There is one vocabulary: the pair pass of [`scrub_text`] decides whether a key
-//! is secret by calling [`is_secret_key`], so the two cannot diverge.
+//! There is one list of secret words, read two ways. The standard reading is
+//! [`is_secret_key`] and [`scrub_text`]: the short words match only as a whole
+//! segment of a key. The wide reading is [`is_secret_key_wide`] and
+//! [`scrub_text_wide`]: the same short words also match as substrings (`author`,
+//! `sidebar`), for decisions where a false positive costs nothing and a miss
+//! leaks. The pair pass of each scrubber decides whether a key is secret by
+//! calling the predicate of its own reading, so a scrubber and its predicate
+//! cannot diverge, and both readings share one pair scanner, so the two scrubbers
+//! differ in that predicate and in the host:port exemption, and in nothing else.
 
 use std::sync::OnceLock;
 
@@ -45,20 +52,47 @@ const SECRET_KEY_NEEDLES: &[&str] = &[
 /// Short words that mark a key as secret only when they are a *whole segment* of
 /// it, where segments are the runs of ASCII alphanumerics between every other
 /// character (`x-auth`, `connect.sid`, and `_csrf` match; `author`, `authority`,
-/// `inside`, `side`, and `sessions` do not). Matched case-insensitively.
+/// `inside`, `side`, and `sessions` do not). Matched case-insensitively. The same
+/// words are what [`is_secret_key_wide`] matches as substrings, so one list serves
+/// both readings and a word added here widens both.
 const SECRET_KEY_SEGMENTS: &[&str] = &["sid", "jwt", "csrf", "session", "auth"];
 
 /// Whether an argument key names a secret whose value must never be recorded:
 /// true when the ASCII-lowercased key contains any `SECRET_KEY_NEEDLES` entry, or
 /// when any whole segment of it equals a `SECRET_KEY_SEGMENTS` entry.
 pub fn is_secret_key(key: &str) -> bool {
+    holds_secret_word(&key.to_ascii_lowercase())
+}
+
+/// The wide reading of the key vocabulary: true when [`is_secret_key`] is, or when
+/// the ASCII-lowercased key contains any `SECRET_KEY_SEGMENTS` word as a
+/// substring, whole segment or not (`author`, `authority`, `sidebar`,
+/// `subsidiary`, `inside`, `sessions`, and `userSession` all read as secret).
+/// `is_secret_key(k)` implies `is_secret_key_wide(k)`.
+///
+/// For decisions where a false positive costs nothing and a miss leaks: a PoC
+/// meant to be shared, an example value shown beside a parameter name. Never use
+/// it for MCP argument keys, audit summaries, or text a human reads, because
+/// `authority` is a real argument key.
+pub fn is_secret_key_wide(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
+    holds_secret_word(&lower) || holds_segment_word(&lower)
+}
+
+/// [`is_secret_key`] on a key that is already ASCII-lowercased.
+fn holds_secret_word(lower: &str) -> bool {
     SECRET_KEY_NEEDLES
         .iter()
         .any(|needle| lower.contains(needle))
         || lower
             .split(|c: char| !c.is_ascii_alphanumeric())
             .any(|segment| SECRET_KEY_SEGMENTS.contains(&segment))
+}
+
+/// Whether an already ASCII-lowercased key contains any `SECRET_KEY_SEGMENTS` word
+/// as a substring, whole segment or not.
+fn holds_segment_word(lower: &str) -> bool {
+    SECRET_KEY_SEGMENTS.iter().any(|word| lower.contains(word))
 }
 
 /// The compiled regex passes of [`scrub_text`], applied in order. The `key=value`
@@ -111,12 +145,43 @@ fn patterns() -> &'static [(Regex, &'static str)] {
 /// rather than risk letting a secret through. Residual limit: a bare credential
 /// with no recognisable `key=` or `Bearer`/`Authorization` framing cannot be
 /// detected. Work is linear in the length of `text`.
+///
+/// For the over-matching reading, which also masks keys that merely contain a
+/// short secret word (`author`, `sidebar`), see [`scrub_text_wide`].
 pub fn scrub_text(text: &str) -> String {
+    scrub_with(text, Reading::Standard)
+}
+
+/// [`scrub_text`] with the pair pass judging keys by [`is_secret_key_wide`], and
+/// with no host:port exemption, so `auth.example.com:8443` and
+/// `token.example.com:8443` are masked. It over-redacts by design: use it where a
+/// masked innocent value costs nothing and a missed credential leaks (a PoC meant
+/// to be shared), never on text that goes to an agent, an audit record, or a
+/// finding, where `authority=` and `author=3` are ordinary. The key predicate and
+/// the missing exemption are the only two differences from [`scrub_text`]; the
+/// value rule, quotes, whitespace, and pairs nested in a value are shared with it,
+/// and so is its linear running time.
+pub fn scrub_text_wide(text: &str) -> String {
+    scrub_with(text, Reading::Wide)
+}
+
+/// Which reading of the vocabulary a scan applies. See [`mask_secret_pairs`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    /// [`is_secret_key`], and a host:port is exempt: the reading of [`scrub_text`].
+    Standard,
+    /// [`is_secret_key_wide`], and nothing is exempt: the reading of
+    /// [`scrub_text_wide`].
+    Wide,
+}
+
+/// The two regex passes, then the pair scan, for either entry point.
+fn scrub_with(text: &str, reading: Reading) -> String {
     let mut out = text.to_string();
     for (re, rep) in patterns() {
         out = re.replace_all(&out, *rep).into_owned();
     }
-    mask_secret_pairs(&out)
+    mask_secret_pairs(&out, reading)
 }
 
 /// Whether the ASCII byte `b` can be part of a key run: an ASCII alphanumeric,
@@ -188,10 +253,6 @@ fn skip_blanks(text: &str, mut i: usize) -> usize {
 /// Whether `b` ends an unquoted value: ASCII whitespace or a pair, list, quote,
 /// or JSON delimiter. A non-ASCII byte never does here (the caller decodes it to
 /// find Unicode whitespace), so a value is over- rather than under-redacted.
-// The scanner's copy (`ends_value` in `crates/aitm-plugin-scanner/src/reproduce.rs`)
-// is not in step: it deliberately reads ASCII whitespace only (no vertical tab, no
-// Unicode whitespace). It stays until the scanner vocabulary consolidation
-// follow-up removes it.
 fn ends_value(b: u8) -> bool {
     is_ascii_blank(b) || matches!(b, b'&' | b';' | b',' | b'"' | b'\'' | b'}')
 }
@@ -230,10 +291,6 @@ fn is_opening_quote(text: &str, quote_at: usize) -> bool {
 /// quote that [`is_opening_quote`] does not close the value: it is the opener of
 /// the next pair, and closing there would swallow that pair's key and leave its
 /// value in the clear.
-// The scanner's copy (`closing_quote` in `crates/aitm-plugin-scanner/src/reproduce.rs`)
-// is not in step: it deliberately lacks the opener-shaped rule and so closes at the
-// next pair's opening quote. It stays until the scanner vocabulary consolidation
-// follow-up removes it.
 fn closing_quote(text: &str, from: usize, quote: u8) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut k = from;
@@ -270,7 +327,14 @@ fn is_host_port(run: &[u8], after: &[u8]) -> bool {
 }
 
 /// Replace the value of every `key=value` / `key: value` pair in `text` whose key
-/// run satisfies [`is_secret_key`] with `[redacted]`.
+/// run is secret under `reading` with `[redacted]`.
+///
+/// `reading` is consulted in exactly two places: the secret test of a key run
+/// ([`is_secret_key`] for [`Reading::Standard`], [`is_secret_key_wide`] for
+/// [`Reading::Wide`]) and the host:port exemption (applied for `Standard`, never
+/// for `Wide`). It is read nowhere that decides where a key run, a blank, a
+/// separator, a value, or a closing quote starts or ends, so a pair that both
+/// readings call secret is scanned identically by both, host:port aside.
 ///
 /// One linear scan. A key run is followed by an optional closing quote,
 /// whitespace (newlines included, so a value on the next line is still masked; see
@@ -291,7 +355,7 @@ fn is_host_port(run: &[u8], after: &[u8]) -> bool {
 /// coincide; [`is_opening_quote`] must therefore stay a pure function of the text
 /// around the quote. The vocabulary is consulted only for a key run that is
 /// followed by a separator, so no allocation is spent on the rest of the text.
-fn mask_secret_pairs(text: &str) -> String {
+fn mask_secret_pairs(text: &str, reading: Reading) -> String {
     let bytes = text.as_bytes();
     let len = bytes.len();
     let mut out = String::with_capacity(len);
@@ -325,10 +389,17 @@ fn mask_secret_pairs(text: &str) -> String {
         // The scan only ever stops on char boundaries and `run_end` steps whole
         // chars, so `key_start..key_end` is on char boundaries.
         let key = &text[key_start..key_end];
-        if !is_secret_key(key) {
+        let secret = match reading {
+            Reading::Standard => is_secret_key(key),
+            Reading::Wide => is_secret_key_wide(key),
+        };
+        if !secret {
             continue;
         }
-        if separator == b':' && is_host_port(key.as_bytes(), &bytes[key_end..]) {
+        if reading == Reading::Standard
+            && separator == b':'
+            && is_host_port(key.as_bytes(), &bytes[key_end..])
+        {
             continue;
         }
 
@@ -1463,6 +1534,326 @@ mod tests {
         assert!(
             bad.is_empty(),
             "scrub_text changed on {} recorded rows: {bad:#?}",
+            bad.len()
+        );
+    }
+
+    /// Run [`scrub_text_wide`] over every `(input, expected)` row and return the
+    /// rows that came out different, as [`mismatches`] does for [`scrub_text`].
+    fn mismatches_wide<'a>(rows: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str, String)> {
+        rows.iter()
+            .filter_map(|&(input, expected)| {
+                let actual = scrub_text_wide(input);
+                (actual != expected).then_some((input, expected, actual))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn is_secret_key_wide_reads_the_segment_words_as_substrings() {
+        // `(key, (is_secret_key, is_secret_key_wide))`.
+        let wide_only = [
+            "author",
+            "authority",
+            "authenticated",
+            "inside",
+            "side",
+            "sidebar",
+            "subsidiary",
+            "sessions",
+            "Author",
+            "X-Authority",
+            "rhai.allow_agent_authoring",
+            "userSession",
+        ]
+        .map(|key| (key, (false, true)));
+        let both = ["sid", "X-CSRF", "connect.sid", "PHPSESSID", "Authorization"]
+            .map(|key| (key, (true, true)));
+        let neither = [
+            "path",
+            "host",
+            "body",
+            "note",
+            "method",
+            "page",
+            "q",
+            "username",
+            "next",
+            "Content-Type",
+            "Referer",
+        ]
+        .map(|key| (key, (false, false)));
+        let bad: Vec<String> = wide_only
+            .into_iter()
+            .chain(both)
+            .chain(neither)
+            .filter_map(|(key, expected)| {
+                let actual = (is_secret_key(key), is_secret_key_wide(key));
+                (actual != expected).then(|| {
+                    format!("{key}: expected (standard, wide) {expected:?}, got {actual:?}")
+                })
+            })
+            .collect();
+        assert!(bad.is_empty(), "wrong key decisions: {bad:#?}");
+    }
+
+    #[test]
+    fn is_secret_key_wide_is_a_superset_of_is_secret_key() {
+        let keys = [
+            // is_secret_key_covers_the_session_and_auth_family
+            "sid",
+            "SID",
+            "jwt",
+            "csrf",
+            "_csrf",
+            "session",
+            "auth",
+            "x-auth",
+            "connect.sid",
+            "sessionId",
+            "JSESSIONID",
+            "PHPSESSID",
+            "ASP.NET_SessionId",
+            // is_secret_key_leaves_lookalikes_alone
+            "author",
+            "authority",
+            "authenticated",
+            "inside",
+            "side",
+            "sidebar",
+            "subsidiary",
+            "sessions",
+            "path",
+            "host",
+            "body",
+            "note",
+            "method",
+            // secret_keys_matched_as_substring_case_insensitively
+            "Authorization",
+            "X-Api-Key",
+            "access_token",
+            "Set-Cookie",
+            "db_password",
+            "clientSecret",
+            "CREDENTIAL",
+            // every substring needle, spelled out
+            "authorization",
+            "token",
+            "password",
+            "passwd",
+            "pwd",
+            "secret",
+            "cookie",
+            "api_key",
+            "apikey",
+            "api-key",
+            "bearer",
+            "credential",
+            "sessionid",
+            "phpsessid",
+            // the keys neither reading names
+            "page",
+            "q",
+            "username",
+            "next",
+            "Content-Type",
+            "Referer",
+        ];
+        let standard = keys.iter().filter(|key| is_secret_key(key)).count();
+        assert!(
+            standard >= 34,
+            "only {standard} keys are secret under is_secret_key: the table lost its secret keys"
+        );
+        let bad: Vec<&str> = keys
+            .into_iter()
+            .filter(|key| is_secret_key(key) && !is_secret_key_wide(key))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "is_secret_key but not is_secret_key_wide: {bad:#?}"
+        );
+    }
+
+    #[test]
+    fn is_secret_key_wide_names_every_segment_word() {
+        // Spelled out, not read from `SECRET_KEY_SEGMENTS`: a dropped word must fail.
+        let bad: Vec<String> = ["sid", "jwt", "csrf", "session", "auth"]
+            .into_iter()
+            .flat_map(|word| {
+                [
+                    word.to_string(),
+                    word.to_ascii_uppercase(),
+                    format!("x-{word}-y"),
+                    format!("my{word}2"),
+                ]
+            })
+            .filter(|key| !is_secret_key_wide(key))
+            .collect();
+        assert!(bad.is_empty(), "should be wide secret keys: {bad:#?}");
+    }
+
+    #[test]
+    fn scrub_text_wide_and_is_secret_key_wide_share_one_vocabulary() {
+        let secret = [
+            // The session and auth family, and the look-alikes beside it.
+            "sid",
+            "SID",
+            "jwt",
+            "csrf",
+            "_csrf",
+            "session",
+            "auth",
+            "x-auth",
+            "connect.sid",
+            "sessionId",
+            "JSESSIONID",
+            "PHPSESSID",
+            "ASP.NET_SessionId",
+            "author",
+            "authority",
+            "authenticated",
+            "inside",
+            "side",
+            "sidebar",
+            "subsidiary",
+            "sessions",
+            // The substring needles.
+            "authorization",
+            "token",
+            "password",
+            "passwd",
+            "pwd",
+            "secret",
+            "cookie",
+            "api_key",
+            "apikey",
+            "api-key",
+            "bearer",
+            "credential",
+            // The wide-only keys that the table above does not already hold.
+            "Author",
+            "X-Authority",
+            "rhai.allow_agent_authoring",
+            "userSession",
+        ];
+        let plain = ["path", "host", "body", "note", "method"];
+        // `(key, expected)` where both the predicate and the scrub must say `expected`.
+        let disagree: Vec<(&str, bool)> = secret
+            .into_iter()
+            .map(|key| (key, true))
+            .chain(plain.into_iter().map(|key| (key, false)))
+            .filter(|&(key, expected)| {
+                let text = format!("{key}=VALUE9");
+                is_secret_key_wide(key) != expected || (scrub_text_wide(&text) != text) != expected
+            })
+            .collect();
+        assert!(
+            disagree.is_empty(),
+            "is_secret_key_wide and scrub_text_wide disagree with the table on: {disagree:#?}"
+        );
+    }
+
+    #[test]
+    fn scrub_text_wide_masks_a_wide_only_pair_as_a_standard_pair() {
+        let bad = mismatches_wide(&[
+            ("author=bob&page=2", "author=[redacted]&page=2"),
+            (
+                r#"{"subsidiary":"a b","n":1}"#,
+                r#"{"subsidiary":"[redacted]","n":1}"#,
+            ),
+            ("sidebar='x y' z=1", "sidebar='[redacted]' z=1"),
+            ("author:\n  John", "author:\n  [redacted]"),
+            ("sidebar=abc\u{a0}def", "sidebar=[redacted]\u{a0}def"),
+            ("sidebar='abc def token='S3'", "sidebar='[redacted]'"),
+            (
+                r#"{"sidebar":"YWJj=","user":"bob"}"#,
+                r#"{"sidebar":"[redacted]","user":"bob"}"#,
+            ),
+            ("next=/cb?sidebar=S1", "next=/cb?sidebar=[redacted]"),
+            ("sidebar=&x=1", "sidebar=&x=1"),
+        ]);
+        assert!(bad.is_empty(), "wrong output: {bad:#?}");
+    }
+
+    #[test]
+    fn scrub_text_wide_does_not_exempt_a_host_port() {
+        // The paired guard is `scrub_text_does_not_mask_a_host_port`: the standard
+        // reading still leaves the first three alone.
+        let bad = mismatches_wide(&[
+            ("auth.example.com:8443", "auth.example.com:[redacted]"),
+            (
+                "https://auth.example.com:8443/login",
+                "https://auth.example.com:[redacted]",
+            ),
+            ("token.example.com:8443/x", "token.example.com:[redacted]"),
+            ("sid:12345", "sid:[redacted]"),
+        ]);
+        assert!(bad.is_empty(), "wrong output: {bad:#?}");
+    }
+
+    #[test]
+    fn scrub_text_wide_survives_hostile_inputs_and_stays_linear() {
+        // `assert!` on `==`, not `assert_eq!`: a failure must not print megabytes.
+        let input = "sidebar=".repeat(1 << 19);
+        assert!(
+            scrub_text_wide(&input) == "sidebar=[redacted]",
+            "an unquoted value that holds the key again is masked whole"
+        );
+
+        let input = "sidebar=\"x ".repeat(150_000);
+        assert!(
+            scrub_text_wide(&input) == "sidebar=\"[redacted] ".repeat(150_000),
+            "an opening quote that never closes must still mask every value"
+        );
+
+        let input = "sidebar='x sidebar=\"x ".repeat(75_000);
+        assert!(
+            scrub_text_wide(&input) == "sidebar='[redacted] sidebar=\"[redacted] ".repeat(75_000),
+            "two kinds of unclosed quote must still mask every value"
+        );
+
+        let input = "author.x:1 ".repeat(300_000);
+        assert!(
+            scrub_text_wide(&input) == "author.x:[redacted] ".repeat(300_000),
+            "a dotted key before a port is masked, with no exemption"
+        );
+
+        // A megabyte of one non-ASCII character, as a key run and as a blank run,
+        // holds no pair and comes back as it went in.
+        let input = "\u{e9}".repeat(1 << 19);
+        assert!(scrub_text_wide(&input) == input, "a run of e-acute changed");
+        let input = "\u{a0}".repeat(1 << 19);
+        assert!(scrub_text_wide(&input) == input, "a run of nbsp changed");
+
+        let input = "sid\u{e9}bar=x ".repeat(100_000);
+        assert!(
+            scrub_text_wide(&input) == "sid\u{e9}bar=[redacted] ".repeat(100_000),
+            "a key glued to a non-ASCII letter is one run and is masked"
+        );
+    }
+
+    #[test]
+    fn scrub_text_wide_agrees_with_scrub_text_when_nothing_wide_applies() {
+        let mut checked = 0;
+        let mut bad: Vec<(&str, String, String)> = Vec::new();
+        for &(input, _, agnostic) in RECORDED_SCRUB_TEXT {
+            if !agnostic {
+                continue;
+            }
+            checked += 1;
+            let standard = scrub_text(input);
+            let wide = scrub_text_wide(input);
+            if standard != wide {
+                bad.push((input, standard, wide));
+            }
+        }
+        assert!(
+            checked >= 25,
+            "only {checked} recorded rows are reading-agnostic"
+        );
+        assert!(
+            bad.is_empty(),
+            "(input, scrub_text, scrub_text_wide) disagree on {} of {checked} rows: {bad:#?}",
             bad.len()
         );
     }
