@@ -88,10 +88,16 @@ fn patterns() -> &'static [(Regex, &'static str)] {
 /// (`"key":"value"`). Redacted values become `[redacted]`.
 ///
 /// A quoted value is masked whole, up to its matching unescaped quote, so a value
-/// holding spaces or an escaped quote leaks nothing; an unquoted value, or one
-/// whose opening quote never closes, runs to the first whitespace, `&`, `;`, `,`,
-/// quote, or `}`. An empty value is left alone. A pair nested inside a non-secret
-/// value (`next=/cb?sid=…`) is still found.
+/// holding spaces or an escaped quote leaks nothing. A quote that follows `=` or
+/// `:` (blanks aside) and has a value character after it is the opener of the next
+/// value, not the closer of this one, so an unclosed quote cannot swallow the next
+/// pair's key and leave its value in the clear (`password='a b token='S3'` masks
+/// through `S3`); a padded value (`"token":"YWJj=","user":"bob"`) still closes,
+/// because a delimiter follows its quote. An unquoted value, or one whose opening
+/// quote never closes, runs to the first whitespace, `&`, `;`, `,`, quote, or `}`.
+/// Whitespace is Unicode whitespace (`char::is_whitespace`), as the regex `\s`
+/// this replaces was. An empty value is left alone. A pair nested inside a
+/// non-secret value (`next=/cb?sid=…`) is still found.
 ///
 /// A `host:port` is not a credential: a dotted key directly followed by `:` and
 /// one to five digits ending at `/`, `?`, `#`, a delimiter, or the end of the text
@@ -110,27 +116,124 @@ pub fn scrub_text(text: &str) -> String {
     mask_secret_pairs(&out)
 }
 
-/// Whether `b` can be part of a key run: an ASCII alphanumeric, `_`, `.`, `-`, or
-/// any non-ASCII byte (so a key with non-ASCII letters is one run).
+/// Whether the ASCII byte `b` can be part of a key run: an ASCII alphanumeric,
+/// `_`, `.`, or `-`. A non-ASCII character is part of a key run too, unless it is
+/// whitespace (see [`run_end`]), so a key with non-ASCII letters is one run.
 fn is_key_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-') || b >= 0x80
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')
+}
+
+/// The index where the run of characters starting at `from` ends: at the first
+/// ASCII byte for which `ascii_continues` is false, at the first whitespace
+/// character (see [`blank_len`]), or at the end of `text`. Any other non-ASCII
+/// character continues the run. `from` itself is returned when nothing continues
+/// the run there. A char is read once, and `from` must be on a char boundary.
+fn run_end(text: &str, from: usize, ascii_continues: fn(u8) -> bool) -> usize {
+    let bytes = text.as_bytes();
+    let mut end = from;
+    while end < bytes.len() {
+        let b = bytes[end];
+        if b < 0x80 {
+            if !ascii_continues(b) {
+                break;
+            }
+            end += 1;
+        } else {
+            match text.get(end..).and_then(|rest| rest.chars().next()) {
+                Some(c) if !c.is_whitespace() => end += c.len_utf8(),
+                _ => break,
+            }
+        }
+    }
+    end
+}
+
+/// Whether `b` is ASCII whitespace as [`char::is_whitespace`] reads it: space,
+/// tab, newline, vertical tab, form feed, and carriage return. (`u8`'s own
+/// `is_ascii_whitespace` leaves out the vertical tab.)
+fn is_ascii_blank(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r')
+}
+
+/// The byte length of the whitespace character at `i` (as [`char::is_whitespace`]
+/// reads it, so a no-break space or U+2028 counts), or 0 when the character there
+/// is not whitespace, `i` is the end of `text`, or `i` is not on a char boundary.
+/// ASCII is decided on the byte; only a non-ASCII lead byte is decoded.
+fn blank_len(text: &str, i: usize) -> usize {
+    match text.as_bytes().get(i) {
+        None => 0,
+        Some(&b) if b < 0x80 => usize::from(is_ascii_blank(b)),
+        Some(_) => text
+            .get(i..)
+            .and_then(|rest| rest.chars().next())
+            .filter(|c| c.is_whitespace())
+            .map_or(0, char::len_utf8),
+    }
+}
+
+/// The index of the first byte at or after `i` that does not start a whitespace
+/// character (see [`blank_len`]).
+fn skip_blanks(text: &str, mut i: usize) -> usize {
+    loop {
+        match blank_len(text, i) {
+            0 => return i,
+            n => i += n,
+        }
+    }
 }
 
 /// Whether `b` ends an unquoted value: ASCII whitespace or a pair, list, quote,
-/// or JSON delimiter. A non-ASCII byte never does, so a value is over- rather
-/// than under-redacted.
+/// or JSON delimiter. A non-ASCII byte never does here (the caller decodes it to
+/// find Unicode whitespace), so a value is over- rather than under-redacted.
+// Keep in step with `ends_value` in `aitm-plugin-scanner`'s `reproduce.rs` until
+// the scanner vocabulary consolidation follow-up.
 fn ends_value(b: u8) -> bool {
-    b.is_ascii_whitespace() || matches!(b, b'&' | b';' | b',' | b'"' | b'\'' | b'}')
+    is_ascii_blank(b) || matches!(b, b'&' | b';' | b',' | b'"' | b'\'' | b'}')
+}
+
+/// The index where an unquoted value starting at `from` ends: its first ASCII
+/// byte for which [`ends_value`] holds, its first whitespace character, or the end
+/// of `text`.
+fn unquoted_value_end(text: &str, from: usize) -> usize {
+    run_end(text, from, |b| !ends_value(b))
+}
+
+/// Whether the unescaped `quote` byte at `quote_at` reads as the *opening* quote
+/// of a value rather than the closing quote of the one being searched: the last
+/// character before it that is not whitespace is `=` or `:`, and the character
+/// after it does not end a value (the text's end, whitespace, `&`, `;`, `,`, `}`,
+/// `]`). A padded value (`"token":"YWJj=","user":"bob"`) ends in `=` too, but a
+/// delimiter follows its closing quote, so it still closes.
+fn is_opening_quote(text: &str, quote_at: usize) -> bool {
+    // `quote_at` indexes an ASCII byte, so both slices are on char boundaries.
+    let after_separator = matches!(
+        text[..quote_at]
+            .trim_end_matches(char::is_whitespace)
+            .chars()
+            .next_back(),
+        Some('=' | ':')
+    );
+    after_separator
+        && text[quote_at + 1..]
+            .chars()
+            .next()
+            .is_some_and(|c| !(c.is_whitespace() || matches!(c, '&' | ';' | ',' | '}' | ']')))
 }
 
 /// The index of the unescaped `quote` byte that closes a quoted value starting at
-/// `from`, or `None` if it never closes. A backslash skips the next byte.
-fn closing_quote(bytes: &[u8], from: usize, quote: u8) -> Option<usize> {
+/// `from`, or `None` if it never closes. A backslash skips the next byte, and a
+/// quote that [`is_opening_quote`] does not close the value: it is the opener of
+/// the next pair, and closing there would swallow that pair's key and leave its
+/// value in the clear.
+// Keep in step with `closing_quote` in `aitm-plugin-scanner`'s `reproduce.rs`
+// until the scanner vocabulary consolidation follow-up.
+fn closing_quote(text: &str, from: usize, quote: u8) -> Option<usize> {
+    let bytes = text.as_bytes();
     let mut k = from;
     while k < bytes.len() {
         match bytes[k] {
             b'\\' => k += 2,
-            b if b == quote => return Some(k),
+            b if b == quote && !is_opening_quote(text, k) => return Some(k),
             _ => k += 1,
         }
     }
@@ -159,51 +262,55 @@ fn is_host_port(run: &[u8], after: &[u8]) -> bool {
 /// Replace the value of every `key=value` / `key: value` pair in `text` whose key
 /// run satisfies [`is_secret_key`] with `[redacted]`.
 ///
-/// One linear scan. A key run is followed by an optional closing quote, ASCII
-/// whitespace (newlines included, so a value on the next line is still masked),
-/// `=` or `:`, ASCII whitespace, an optional opening quote, and the value (see
-/// [`scrub_text`] for the value rule). After a masked pair the scan resumes after
-/// the value; after any other key run it resumes right after the run, not after
-/// the value, so a pair nested in a non-secret value is still seen. Each byte is
-/// read a constant number of times: a failed search for a closing quote can
-/// happen at most once per quote character, because any later opening quote of
-/// the same character would have closed it. The vocabulary is consulted only for
-/// a key run that is followed by a separator, so no allocation is spent on the
-/// rest of the text.
+/// One linear scan. A key run is followed by an optional closing quote,
+/// whitespace (newlines included, so a value on the next line is still masked; see
+/// [`blank_len`] for what counts), `=` or `:`, whitespace, an optional opening
+/// quote, and the value (see [`scrub_text`] for the value rule). After a masked
+/// pair the scan resumes after the value; after any other key run it resumes right
+/// after the run, not after the value, so a pair nested in a non-secret value is
+/// still seen.
+///
+/// Each byte is read a constant number of times. A successful search for a closing
+/// quote ends where the scan resumes, so successful searches never overlap. A
+/// failed search for a quote character reads to the end of the text once, and is
+/// remembered: a later search for the same character starts further on and so
+/// considers a subset of the candidates, and a candidate is judged on its
+/// neighbouring characters alone, so it would fail too and is not run. The
+/// vocabulary is consulted only for a key run that is followed by a separator, so
+/// no allocation is spent on the rest of the text.
 fn mask_secret_pairs(text: &str) -> String {
     let bytes = text.as_bytes();
     let len = bytes.len();
     let mut out = String::with_capacity(len);
     // Start of the text not yet copied into `out`.
     let mut copied = 0;
+    // Whether a search for a closing `"` (index 0) or `'` (index 1) has failed.
+    let mut quote_unclosed = [false; 2];
     let mut i = 0;
     while i < len {
-        if !is_key_byte(bytes[i]) {
-            i += 1;
+        let key_start = i;
+        let key_end = run_end(text, key_start, is_key_byte);
+        if key_end == key_start {
+            // A delimiter or a whitespace char: step over the whole char.
+            i += blank_len(text, i).max(1);
             continue;
         }
-        let key_start = i;
-        while i < len && is_key_byte(bytes[i]) {
-            i += 1;
-        }
-        let key_end = i;
+        i = key_end;
 
         // Key run, optional closing quote, whitespace, then `=` or `:`.
         let mut j = key_end;
         if j < len && matches!(bytes[j], b'"' | b'\'') {
             j += 1;
         }
-        while j < len && bytes[j].is_ascii_whitespace() {
-            j += 1;
-        }
+        j = skip_blanks(text, j);
         if j >= len || !matches!(bytes[j], b'=' | b':') {
             continue;
         }
         let separator = bytes[j];
         j += 1;
 
-        // A run starts after an ASCII byte and ends before one (or the text's
-        // end), so `key_start..key_end` is on char boundaries.
+        // The scan only ever stops on char boundaries and `run_end` steps whole
+        // chars, so `key_start..key_end` is on char boundaries.
         let key = &text[key_start..key_end];
         if !is_secret_key(key) {
             continue;
@@ -213,9 +320,7 @@ fn mask_secret_pairs(text: &str) -> String {
         }
 
         // Whitespace, an optional opening quote, then the value.
-        while j < len && bytes[j].is_ascii_whitespace() {
-            j += 1;
-        }
+        j = skip_blanks(text, j);
         let quote = match bytes.get(j) {
             Some(&q) if matches!(q, b'"' | b'\'') => {
                 j += 1;
@@ -224,22 +329,26 @@ fn mask_secret_pairs(text: &str) -> String {
             _ => None,
         };
         let value_start = j;
-        let value_end = match quote.and_then(|q| closing_quote(bytes, value_start, q)) {
+        let closer = quote.and_then(|q| {
+            let unclosed = &mut quote_unclosed[usize::from(q == b'\'')];
+            if *unclosed {
+                return None;
+            }
+            let found = closing_quote(text, value_start, q);
+            *unclosed = found.is_none();
+            found
+        });
+        let value_end = match closer {
             Some(end) => end,
             // Unquoted, or an opening quote that never closes: the plain rule.
-            None => {
-                let mut end = value_start;
-                while end < len && !ends_value(bytes[end]) {
-                    end += 1;
-                }
-                end
-            }
+            None => unquoted_value_end(text, value_start),
         };
         if value_end == value_start {
             continue;
         }
-        // `value_start` follows an ASCII byte and `value_end` precedes one (or is
-        // the end of the text), so both are char boundaries.
+        // `value_start` follows an ASCII byte or a whole whitespace char and
+        // `value_end` is a quote, a delimiter, a whitespace char, or the end of the
+        // text, so both are char boundaries.
         out.push_str(&text[copied..value_start]);
         out.push_str("[redacted]");
         copied = value_end;
@@ -330,7 +439,7 @@ mod tests {
 
     #[test]
     fn is_secret_key_covers_the_session_and_auth_family() {
-        for key in [
+        let bad: Vec<&str> = [
             "sid",
             "SID",
             "jwt",
@@ -344,14 +453,16 @@ mod tests {
             "JSESSIONID",
             "PHPSESSID",
             "ASP.NET_SessionId",
-        ] {
-            assert!(is_secret_key(key), "`{key}` should be a secret key");
-        }
+        ]
+        .into_iter()
+        .filter(|key| !is_secret_key(key))
+        .collect();
+        assert!(bad.is_empty(), "should be secret keys: {bad:#?}");
     }
 
     #[test]
     fn is_secret_key_leaves_lookalikes_alone() {
-        for key in [
+        let bad: Vec<&str> = [
             "author",
             "authority",
             "authenticated",
@@ -365,14 +476,16 @@ mod tests {
             "body",
             "note",
             "method",
-        ] {
-            assert!(!is_secret_key(key), "`{key}` is not a secret key");
-        }
+        ]
+        .into_iter()
+        .filter(|key| is_secret_key(key))
+        .collect();
+        assert!(bad.is_empty(), "should not be secret keys: {bad:#?}");
     }
 
     #[test]
     fn scrub_text_masks_unframed_session_credentials() {
-        for (input, expected) in [
+        let bad = mismatches(&[
             ("sid=abc123", "sid=[redacted]"),
             (
                 "/cb?next=/home&sid=S1&page=2",
@@ -386,14 +499,13 @@ mod tests {
             ("connect.sid=s%3Aabc", "connect.sid=[redacted]"),
             ("x-auth: v1", "x-auth: [redacted]"),
             (r#"{"sid":"S1","n":1}"#, r#"{"sid":"[redacted]","n":1}"#),
-        ] {
-            assert_eq!(scrub_text(input), expected, "input: {input}");
-        }
+        ]);
+        assert!(bad.is_empty(), "wrong output: {bad:#?}");
     }
 
     #[test]
     fn scrub_text_leaves_lookalike_pairs_alone() {
-        for text in [
+        let rows: Vec<(&str, &str)> = [
             "author=bob",
             "authority=example.com",
             "inside=1",
@@ -403,22 +515,24 @@ mod tests {
             "subsidiary=acme",
             "page=2&q=hello",
             "sid=&x=1",
-        ] {
-            assert_eq!(scrub_text(text), text, "input: {text}");
-        }
+        ]
+        .into_iter()
+        .map(|text| (text, text))
+        .collect();
+        let bad = mismatches(&rows);
+        assert!(bad.is_empty(), "should be unchanged: {bad:#?}");
     }
 
     #[test]
     fn scrub_text_masks_quoted_values_whole() {
-        for (input, expected) in [
+        let bad = mismatches(&[
             (r#"{"password":"hunter 2"}"#, r#"{"password":"[redacted]"}"#),
             (r#"{"sid":"a\"b c","n":1}"#, r#"{"sid":"[redacted]","n":1}"#),
             ("{'jwt' : 'a b','n':1}", "{'jwt' : '[redacted]','n':1}"),
             (r#"sid="abc&x=1"#, r#"sid="[redacted]&x=1"#),
             (r#"{"sid":"","n":1}"#, r#"{"sid":"","n":1}"#),
-        ] {
-            assert_eq!(scrub_text(input), expected, "input: {input}");
-        }
+        ]);
+        assert!(bad.is_empty(), "wrong output: {bad:#?}");
     }
 
     #[test]
@@ -430,35 +544,35 @@ mod tests {
     fn scrub_text_masks_a_value_on_the_next_line() {
         // The old pair regex used `\s*` around the separator, so a value on the
         // line after its key was masked; the scan must not be weaker.
-        for (input, expected) in [
+        let bad = mismatches(&[
             ("password:\n  hunter2", "password:\n  [redacted]"),
             ("token=\r\nabc123", "token=\r\n[redacted]"),
-        ] {
-            assert_eq!(scrub_text(input), expected, "input: {input:?}");
-        }
+        ]);
+        assert!(bad.is_empty(), "wrong output: {bad:#?}");
     }
 
     #[test]
     fn scrub_text_does_not_mask_a_host_port() {
-        for text in [
+        let unchanged: Vec<(&str, &str)> = [
             "https://auth.example.com:8443/login",
             "auth.example.com:8443",
             "token.example.com:8443/x",
-        ] {
-            assert_eq!(scrub_text(text), text, "input: {text}");
-        }
-        for (input, expected) in [
+        ]
+        .into_iter()
+        .map(|text| (text, text))
+        .collect();
+        let mut bad = mismatches(&unchanged);
+        bad.extend(mismatches(&[
             ("sid:12345", "sid:[redacted]"),
             ("auth=1", "auth=[redacted]"),
             (r#"{"sid":12345}"#, r#"{"sid":[redacted]}"#),
-        ] {
-            assert_eq!(scrub_text(input), expected, "input: {input}");
-        }
+        ]));
+        assert!(bad.is_empty(), "wrong output: {bad:#?}");
     }
 
     #[test]
     fn scrub_text_and_is_secret_key_share_one_vocabulary() {
-        for key in [
+        let disagree: Vec<&str> = [
             // The session and auth family, and the look-alikes beside it.
             "sid",
             "SID",
@@ -499,14 +613,17 @@ mod tests {
             "api-key",
             "bearer",
             "credential",
-        ] {
+        ]
+        .into_iter()
+        .filter(|key| {
             let text = format!("{key}=VALUE9");
-            assert_eq!(
-                is_secret_key(key),
-                scrub_text(&text) != text,
-                "`{key}`: is_secret_key and scrub_text disagree"
-            );
-        }
+            is_secret_key(key) != (scrub_text(&text) != text)
+        })
+        .collect();
+        assert!(
+            disagree.is_empty(),
+            "is_secret_key and scrub_text disagree on: {disagree:#?}"
+        );
     }
 
     #[test]
@@ -533,11 +650,180 @@ mod tests {
             "2 MiB of backslashes is unchanged"
         );
 
-        // Each opening quote is closed by the next repeat's quote, so the
-        // pairs mask in twos and every byte is read a constant number of times.
+        // A quote after `=` that has a value character after it opens the next
+        // value, it does not close this one, so no quote closes: every value is
+        // masked (the old expectation, masking in twos, left every second `x` in
+        // the clear) and every byte is read a constant number of times.
         assert!(
-            scrub_text(&"sid='x ".repeat(150_000)) == "sid='[redacted]'x ".repeat(75_000),
-            "1 MiB of `sid='x ` masks in pairs"
+            scrub_text(&"sid='x ".repeat(150_000)) == "sid='[redacted] ".repeat(150_000),
+            "1 MiB of `sid='x ` masks every value"
         );
+    }
+
+    /// Run [`scrub_text`] over every `(input, expected)` row and return the rows
+    /// that came out different, as `(input, expected, actual)`, so one failure
+    /// shows every bad row instead of the first.
+    fn mismatches<'a>(rows: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str, String)> {
+        rows.iter()
+            .filter_map(|&(input, expected)| {
+                let actual = scrub_text(input);
+                (actual != expected).then_some((input, expected, actual))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scrub_text_masks_a_quoted_secret_after_an_unclosed_quote() {
+        // An opening quote that never closes by itself, or whose closer is
+        // escaped, used to run on to the NEXT pair's opening quote: that swallowed
+        // the next key and left its quoted value in the clear.
+        let bad = mismatches(&[
+            (
+                r#"password='abc def token='S3CR3T'"#,
+                r#"password='[redacted]'"#,
+            ),
+            (
+                r#"x-api-key="oops see sessionid="S3CR3T" end"#,
+                r#"x-api-key="[redacted]" end"#,
+            ),
+            ("token: \"a b\nsession: \"S3CR3T\"", "token: \"[redacted]\""),
+            (
+                r#"password="C:\dir\" token="S3""#,
+                r#"password="[redacted]""#,
+            ),
+        ]);
+        assert!(bad.is_empty(), "wrong output: {bad:#?}");
+    }
+
+    #[test]
+    fn scrub_text_never_leaves_a_credential_after_an_unclosed_quote() {
+        // (input, credential text that must not survive scrubbing)
+        let rows = [
+            (r#"password='abc def token='S3CR3T'"#, "S3CR3T"),
+            (r#"x-api-key="oops see sessionid="S3CR3T" end"#, "S3CR3T"),
+            ("token: \"a b\nsession: \"S3CR3T\"", "S3CR3T"),
+            (r#"password="C:\dir\" token="S3""#, "S3"),
+            (r#"api_key="x y secret='S3CR3T' z"#, "S3CR3T"),
+            ("password: 'abc\nsecret: 'S3CR3T'", "S3CR3T"),
+            (
+                r#"a_token="1 b_token="2 c_token="3 d_token="S3CR3T" tail"#,
+                "S3CR3T",
+            ),
+            ("data-sid='x y data-token='S3CR3T' z='1'", "S3CR3T"),
+            ("token='abc def sid='S3CR3T", "S3CR3T"),
+            (r#"secret="a b\" sid="S3CR3T""#, "S3CR3T"),
+            (
+                r#"{"a":"x","password":"hunter 2","token":"S3CR3T"}"#,
+                "S3CR3T",
+            ),
+        ];
+        let bad: Vec<(&str, String)> = rows
+            .iter()
+            .filter_map(|&(input, secret)| {
+                let out = scrub_text(input);
+                out.contains(secret).then_some((input, out))
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "a credential was left in the clear: {bad:#?}"
+        );
+    }
+
+    #[test]
+    fn scrub_text_closes_a_padded_value_at_its_own_quote() {
+        // A value that ends in `=` (base64 padding) or `:` is closed by its own
+        // quote when a delimiter follows it, even though a quote after `=` or `:`
+        // otherwise reads as the opening quote of the next value.
+        let bad = mismatches(&[
+            (
+                r#"{"token":"YWJj=","user":"bob"}"#,
+                r#"{"token":"[redacted]","user":"bob"}"#,
+            ),
+            (
+                r#"token="YWJj=" user=bob"#,
+                r#"token="[redacted]" user=bob"#,
+            ),
+            (
+                r#"?token="YWJj="&user=bob"#,
+                r#"?token="[redacted]"&user=bob"#,
+            ),
+            (r#"token="YWJj=""#, r#"token="[redacted]""#),
+            (r#"{"token":"YWJj==" }"#, r#"{"token":"[redacted]" }"#),
+            (r#"{"token":"YWJj="}"#, r#"{"token":"[redacted]"}"#),
+            (
+                r#"{"token":"a:","user":"bob"}"#,
+                r#"{"token":"[redacted]","user":"bob"}"#,
+            ),
+            (
+                "token=\"YWJj=\"\u{a0}user=bob",
+                "token=\"[redacted]\"\u{a0}user=bob",
+            ),
+        ]);
+        assert!(bad.is_empty(), "wrong output: {bad:#?}");
+    }
+
+    #[test]
+    fn scrub_text_stays_linear_when_quotes_open_but_never_close() {
+        // `assert!` on `==`, not `assert_eq!`: a failure must not print megabytes.
+
+        // Every quote after `=` reads as an opener except the last, which ends
+        // the text: one value, one search.
+        let n = (1 << 20) / 5;
+        assert!(
+            scrub_text(&"sid=\"".repeat(n)) == "sid=\"[redacted]\"",
+            "1 MiB of `sid=\"` is one value"
+        );
+
+        // No quote closes: each search fails, and a failed search for a quote
+        // character is not repeated, so every byte is read a constant number of
+        // times.
+        assert!(
+            scrub_text(&"sid=\"x ".repeat(150_000)) == "sid=\"[redacted] ".repeat(150_000),
+            "1 MiB of `sid=\"x ` masks every value"
+        );
+        assert!(
+            scrub_text(&"sid='x ".repeat(150_000)) == "sid='[redacted] ".repeat(150_000),
+            "1 MiB of `sid='x ` masks every value"
+        );
+        assert!(
+            scrub_text(&"sid=\"x sid='x ".repeat(75_000))
+                == "sid=\"[redacted] sid='[redacted] ".repeat(75_000),
+            "1 MiB of alternating quote characters masks every value"
+        );
+    }
+
+    #[test]
+    fn scrub_text_reads_unicode_whitespace_as_blank() {
+        // The old pair regex used the Unicode `\s`; the scan must not be weaker.
+        let bad = mismatches(&[
+            ("password\u{b}=hunter2", "password\u{b}=[redacted]"),
+            (
+                "credentials=\u{a0}\"CNRY0\"",
+                "credentials=\u{a0}\"[redacted]\"",
+            ),
+            (
+                "api_key=\u{b}CNRY0\u{2028}z+?secret='X'",
+                "api_key=\u{b}[redacted]\u{2028}z+?secret='[redacted]'",
+            ),
+            ("token=abc\u{3000}x", "token=[redacted]\u{3000}x"),
+            (
+                "password\u{2003}:\u{2003}hunter2",
+                "password\u{2003}:\u{2003}[redacted]",
+            ),
+            // A Unicode blank ends a key run, as it did for the old regex's key
+            // class: `token` here is not a pair (a quote, not a separator, follows
+            // the blank), so the pair after it is found; and `password` after
+            // `secret…é\n=` is a key, not the tail of that pair's value.
+            (
+                "token\u{a0}'\n:\n]xapi_key:\u{b}S3CR3T",
+                "token\u{a0}'\n:\n]xapi_key:\u{b}[redacted]",
+            ),
+            (
+                "secret\u{2028}é\n=password\u{2028}=S3CR3T",
+                "secret\u{2028}é\n=password\u{2028}=[redacted]",
+            ),
+        ]);
+        assert!(bad.is_empty(), "wrong output: {bad:#?}");
     }
 }

@@ -5,12 +5,27 @@
 //! who ran what, with what (redacted) arguments, and whether it ran or was
 //! refused. The entries land in a bounded in-memory [`AuditRing`] that is always
 //! on (the *live* view the operator "Agent" page and `agent.activity` read) and,
-//! when a durable path is configured, in a JSONL [`AuditSink`] as well — the same
+//! when a durable sink is attached, in a JSONL [`AuditSink`] as well — the same
 //! one format the CA plugin's log is a subset of (spec D3a.2).
 //!
 //! `args_summary` is a redacted, size-capped rendering produced by the caller:
 //! tokens, auth headers, and the CA key material never reach an entry, matching
 //! the M2 CA posture (the bounded-memory + secret-handling constraints).
+//!
+//! # Labels and reasons
+//!
+//! `client_label` is a display string, not an identity: `origin` is the only
+//! authoritative field. The web bridge's connections carry the server-minted
+//! [`WEB_BRIDGE_CLIENT_LABEL`] (`web-bridge`). Every other label is whatever the
+//! client declared, run through [`sanitize_client_label`] (control, invisible, and
+//! bidirectional-override characters dropped, credential material masked by
+//! [`crate::redact::scrub_text`], at most [`MAX_CLIENT_LABEL_CHARS`] = 64
+//! characters) and, where a client declares it, [`declared_client_label`], which
+//! rewrites a reserved name such as `web-bridge` to `web-bridge (declared)`. A
+//! label is unauthenticated: a client can still declare any other name, a
+//! first-party one included. An error reason is scrubbed with
+//! [`crate::redact::scrub_text`] and capped at [`DEFAULT_RESULT_REASON_CAP`]
+//! (1024 bytes) before it is recorded.
 //!
 //! # The ring keeps a fair, bounded record
 //!
@@ -22,14 +37,26 @@
 //!
 //! Inside each lane a full ring evicts the oldest entry of the *source* holding
 //! the most entries, where a source is an origin plus a client label. A lone busy
-//! source still uses the whole lane, but a flood only ever eats the flooder's
-//! own oldest entries. Each lane tracks at most [`MAX_AUDIT_SOURCES`] sources and
-//! files the rest under one overflow source per origin, so a flooder minting a
-//! fresh label per connection cannot shrink an honest source below a fixed floor
-//! of about `capacity / (MAX_AUDIT_SOURCES + 3)` entries.
+//! source still uses the whole lane. A flood can only take entries from sources
+//! holding more than their fair share, never from one below the table-slot floor:
+//! a source that holds a slot keeps about
+//! `capacity / (MAX_AUDIT_SOURCES + one overflow bucket per origin)` entries
+//! however many fresh labels a flooder mints.
 //!
-//! A source can still overwrite its own history, and a restart empties the ring.
-//! Only the durable JSONL sink keeps a complete record; the ring is a live view.
+//! That floor is not isolation. Each lane tracks at most [`MAX_AUDIT_SOURCES`]
+//! sources by name and files the rest under one overflow source per origin, and
+//! labels are unauthenticated:
+//!
+//! - A source that first appears *after* the slots are taken shares its origin's
+//!   overflow bucket with whoever took them, and a flood can flush it to nothing.
+//! - A flooder that declares an honest source's label shares that source's
+//!   entries, and can flush them.
+//! - Every agent-token connection of the web bridge is ONE source,
+//!   `(mcp, web-bridge)`, whichever client is behind it.
+//! - A source can erase its own history, and a restart empties the ring.
+//!
+//! Origin still separates `mcp` from `operator` and `cli`. Only a durable JSONL
+//! sink, once one is attached, keeps a complete record; the ring is a live view.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -40,8 +67,8 @@ use crate::ctx::Frontend;
 use crate::value::Value;
 
 /// The default capacity (entries) of the evidence lane before it evicts. A few
-/// thousand entries is enough for the live "Agent" view; durable audit keeps the
-/// full history when it is configured.
+/// thousand entries is enough for the live "Agent" view; a durable sink, when one
+/// is attached, keeps the full history.
 pub const DEFAULT_AUDIT_CAPACITY: usize = 4096;
 
 /// The default capacity (entries) of the routine lane, half the evidence lane:
@@ -85,7 +112,8 @@ pub enum AuditResult {
     /// The command ran to a successful result.
     Ok,
     /// The command was refused (a policy/confirm gate, a bad argument) or its
-    /// `invoke` failed; the string is the reason already shown to the caller.
+    /// `invoke` failed; the string is a scrubbed copy of the reason, capped at
+    /// [`DEFAULT_RESULT_REASON_CAP`] bytes.
     Error(String),
 }
 
@@ -96,7 +124,9 @@ pub struct AuditEntry {
     pub at: SystemTime,
     /// The frontend role that invoked it (F1 identity).
     pub origin: Frontend,
-    /// The connection's human-readable client label, when it declared one.
+    /// The connection's client label: the server-minted [`WEB_BRIDGE_CLIENT_LABEL`]
+    /// for the web bridge, otherwise the sanitised name the client declared, if it
+    /// declared one. Display-only; `origin` is authoritative.
     pub client_label: Option<String>,
     /// The dotted command name, e.g. `"flow.replay"`.
     pub command: String,
@@ -167,12 +197,26 @@ pub fn origin_label(frontend: Frontend) -> &'static str {
 
 /// Whether a character is dropped from a client label: a control character, or
 /// an invisible or bidirectional-override character that could make one label
-/// pose as another in a UI.
+/// pose as another in a UI (a soft hyphen, a variation selector, a Hangul filler,
+/// a blank braille cell, a tag character, and the zero-width and bidi families).
 fn is_label_noise(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}'
+            '\u{00AD}'
+                | '\u{034F}'
+                | '\u{061C}'
+                | '\u{115F}'..='\u{1160}'
+                | '\u{180B}'..='\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{2800}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FEFF}'
+                | '\u{FFA0}'
+                | '\u{E0000}'..='\u{E007F}'
         )
 }
 
@@ -183,7 +227,9 @@ fn is_label_noise(c: char) -> bool {
 /// bidirectional-override characters, masks credential material with
 /// [`crate::redact::scrub_text`], trims, and truncates to
 /// [`MAX_CLIENT_LABEL_CHARS`] characters. It returns `None` when nothing is left.
-/// Applying it to its own output changes nothing, and it does not rewrite a
+/// A second application can only mask more (masking can remove an escape, and the
+/// cut can land inside a mask), never reveal more; the label stays bounded, within
+/// a few characters of the cap after a later `scrub_text`. It does not rewrite a
 /// server-minted name such as [`WEB_BRIDGE_CLIENT_LABEL`]; use
 /// [`declared_client_label`] where a client supplies the label.
 pub fn sanitize_client_label(raw: &str) -> Option<String> {
@@ -243,7 +289,7 @@ pub fn lane_for(sensitivity: Option<Sensitivity>, result: &AuditResult) -> Audit
 }
 
 /// Where audit entries go. The in-memory [`AuditRing`] implements it (always on);
-/// a durable JSONL log (opt-in by config) implements it too, so one `append`
+/// a durable JSONL log implements it too when one is attached, so one `append`
 /// fans to both without the caller knowing which sinks are attached.
 pub trait AuditSink: Send + Sync {
     /// Record one entry. Infallible by contract: a durable sink that cannot write
@@ -336,8 +382,10 @@ impl Lane {
     /// Drop the oldest entry of the bucket holding the most entries; between
     /// equally full buckets, the one whose oldest entry is the oldest overall. A
     /// bucket left empty leaves the table. The entry just inserted is never the
-    /// victim: it is the newest, so it is the oldest of its bucket only when that
-    /// bucket is the lone bucket, and then the lane is not over capacity.
+    /// victim: it is the newest, so it is the oldest of its bucket only when it is
+    /// that bucket's only entry. Then every bucket holds one entry (the victim has
+    /// the most) and the tie-break picks an older singleton instead; with no other
+    /// bucket the lane is not over capacity, because its capacity is at least 1.
     fn evict_one(&mut self) {
         let victim = self
             .buckets
@@ -381,15 +429,18 @@ impl RingState {
 /// It has two bounded lanes, an evidence lane and a routine lane (see
 /// [`AuditLane`]), so successful `Read` polling never evicts a refusal or a
 /// state-changing call. When a lane is full it evicts the oldest entry of the
-/// source holding the most entries, so one source cannot flush another's entries
-/// however many calls it makes; each lane tracks at most [`MAX_AUDIT_SOURCES`]
-/// sources and files the rest under a per-origin overflow source. Nothing is
+/// source holding the most entries, so a source that holds a table slot keeps a
+/// floor of its entries against a flood. That is a floor, not isolation (see the
+/// module docs): a source that arrives after all [`MAX_AUDIT_SOURCES`] slots of a
+/// lane are taken shares its origin's overflow source, a flooder that declares an
+/// honest source's label shares that source's entries, and every agent-token
+/// connection of the web bridge is the one source `(mcp, web-bridge)`. Nothing is
 /// evicted while a lane has room, and the newest entry is always kept.
 ///
 /// Memory is bounded in entries and, because every entry field is capped by its
 /// producer, in bytes. The ring is a live view, not a complete record: a source
-/// can still overwrite its own history and a restart empties it. The durable
-/// JSONL [`AuditSink`] is the complete answer.
+/// can erase its own history and a restart empties it. A durable JSONL
+/// [`AuditSink`], once one is attached, is the complete answer.
 #[derive(Debug)]
 pub struct AuditRing {
     inner: Mutex<RingState>,
@@ -498,6 +549,8 @@ impl AuditSink for AuditRing {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn entry(command: &str, result: AuditResult) -> AuditEntry {
@@ -581,6 +634,7 @@ mod tests {
         // The 64-char cut lands inside the masked value, and inside the key.
         let cut_in_mask = format!("{}token=abc123", "x".repeat(56));
         let cut_in_key = format!("{}token=abc123", "x".repeat(60));
+        let mut bad: Vec<String> = Vec::new();
         for raw in [
             long.as_str(),
             nuls.as_str(),
@@ -593,14 +647,27 @@ mod tests {
             "aitm-mac",
             "web-bridge",
         ] {
+            // Two inputs are 10 MiB: name an input by its length and a preview.
+            let input = format!(
+                "{}-byte input {:?}",
+                raw.len(),
+                raw.chars().take(80).collect::<String>()
+            );
             let once = sanitize_client_label(raw);
             let bounded_and_clean = once
                 .as_deref()
                 .is_none_or(|l| l.chars().count() <= 64 && !l.contains("abc123"));
-            assert!(bounded_and_clean, "unbounded or leaking: {once:?}");
+            if !bounded_and_clean {
+                bad.push(format!("unbounded or leaking for a {input}: {once:?}"));
+            }
             let twice = once.as_deref().and_then(sanitize_client_label);
-            assert_eq!(twice, once, "not idempotent for a {}-byte input", raw.len());
+            if twice != once {
+                bad.push(format!(
+                    "not idempotent for a {input}: {once:?} then {twice:?}"
+                ));
+            }
         }
+        assert!(bad.is_empty(), "bad sanitiser rows: {bad:#?}");
     }
 
     #[test]
@@ -617,6 +684,127 @@ mod tests {
             declared_client_label("aitm-mac"),
             Some("aitm-mac".to_string())
         );
+    }
+
+    #[test]
+    fn declared_client_label_rewrites_a_reserved_name_hidden_by_invisible_characters() {
+        // Each of these renders as `web-bridge`; none may pass as the real one.
+        let bad: Vec<(&str, Option<String>)> = [
+            "web-bridge\u{AD}",
+            "web\u{AD}-bridge",
+            "web-bridge\u{FE0F}",
+            "web-bridge\u{200B}",
+            "\u{3164}web-bridge",
+            "web-bridge\u{E0020}",
+        ]
+        .into_iter()
+        .map(|raw| (raw, declared_client_label(raw)))
+        .filter(|(_, label)| label.as_deref() != Some("web-bridge (declared)"))
+        .collect();
+        assert!(bad.is_empty(), "a reserved name got through: {bad:#?}");
+    }
+
+    #[test]
+    fn sanitize_client_label_drops_every_invisible_character() {
+        // One or more characters from each range of the dropped set: the label
+        // `a<c>b` must come back as `ab`.
+        let invisible = [
+            '\u{AD}',
+            '\u{34F}',
+            '\u{61C}',
+            '\u{115F}',
+            '\u{1160}',
+            '\u{180B}',
+            '\u{180C}',
+            '\u{180D}',
+            '\u{180E}',
+            '\u{200B}',
+            '\u{200F}',
+            '\u{2028}',
+            '\u{202E}',
+            '\u{2060}',
+            '\u{2069}',
+            '\u{2800}',
+            '\u{3164}',
+            '\u{FE00}',
+            '\u{FE0F}',
+            '\u{FEFF}',
+            '\u{FFA0}',
+            '\u{E0000}',
+            '\u{E0001}',
+            '\u{E0020}',
+            '\u{E007F}',
+        ];
+        let bad: Vec<(char, Option<String>)> = invisible
+            .into_iter()
+            .map(|c| (c, sanitize_client_label(&format!("a{c}b"))))
+            .filter(|(_, label)| label.as_deref() != Some("ab"))
+            .collect();
+        assert!(bad.is_empty(), "an invisible character was kept: {bad:#?}");
+        // A visible non-ASCII letter is not noise.
+        assert_eq!(
+            sanitize_client_label("caf\u{e9}"),
+            Some("caf\u{e9}".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitising_twice_only_ever_masks_more() {
+        // A masked escape, and a truncation inside a mask, are the two ways the
+        // second pass sees different text from the first.
+        let once = sanitize_client_label("password:' auth:\\'");
+        assert_eq!(once.as_deref(), Some("password:' auth:[redacted]'"));
+        let twice = once.as_deref().and_then(sanitize_client_label);
+        assert_eq!(twice.as_deref(), Some("password:'[redacted]'"));
+        // The second pass revealed nothing the first hid: no credential text, and
+        // no more characters than before.
+        let (once, twice) = (once.unwrap_or_default(), twice.unwrap_or_default());
+        assert!(twice.len() <= once.len(), "grew: {once:?} -> {twice:?}");
+        assert!(!twice.contains("auth"), "revealed text: {twice:?}");
+
+        // A cut at 64 characters lands inside `Bearer [redacted]`.
+        let raw = format!("{}Bearer abc123", "x".repeat(50));
+        let cut = sanitize_client_label(&raw).unwrap_or_default();
+        assert_eq!(cut, format!("{}Bearer [redact", "x".repeat(50)));
+        assert_eq!(cut.chars().count(), MAX_CLIENT_LABEL_CHARS);
+        // A later `scrub_text` completes the mask: 3 characters over the cap.
+        let later = crate::redact::scrub_text(&cut);
+        assert_eq!(later, format!("{}Bearer [redacted]", "x".repeat(50)));
+        assert_eq!(later.chars().count(), MAX_CLIENT_LABEL_CHARS + 3);
+        // Sanitising the cut label again stays bounded and shows nothing new.
+        let again = sanitize_client_label(&cut).unwrap_or_default();
+        assert_eq!(again, cut);
+        assert!(!again.contains("abc123") && !later.contains("abc123"));
+    }
+
+    /// An entry recorded `secs` seconds after the Unix epoch, running `command`.
+    fn entry_at(command: &str, secs: u64) -> AuditEntry {
+        AuditEntry {
+            at: UNIX_EPOCH + Duration::from_secs(secs),
+            ..entry(command, AuditResult::Ok)
+        }
+    }
+
+    #[test]
+    fn since_and_count_since_filter_both_lanes() {
+        let ring = AuditRing::with_lane_capacities(8, 8);
+        // Interleaved, so call order differs from lane order.
+        ring.append_in(AuditLane::Routine, entry_at("R-old", 10));
+        ring.append_in(AuditLane::Evidence, entry_at("E-old", 10));
+        ring.append_in(AuditLane::Routine, entry_at("R-new", 100));
+        ring.append_in(AuditLane::Evidence, entry_at("E-new", 100));
+        let t = UNIX_EPOCH + Duration::from_secs(50);
+        assert_eq!(commands(&ring.recent(Some(t), None)), ["R-new", "E-new"]);
+        assert_eq!(ring.count_since(t), 2);
+        // `limit` composes with `since`: the newest of the matching entries.
+        assert_eq!(commands(&ring.recent(Some(t), Some(1))), ["E-new"]);
+        // `recent` keeps entries strictly after `since`; `count_since` counts
+        // entries at or after it.
+        let at_new = UNIX_EPOCH + Duration::from_secs(100);
+        assert!(ring.recent(Some(at_new), None).is_empty());
+        assert_eq!(ring.count_since(at_new), 2);
+        assert_eq!(ring.count_since(UNIX_EPOCH), 4);
+        assert_eq!(ring.recent(None, None).len(), 4);
     }
 
     /// An entry from a chosen source (origin and label) running `command`.

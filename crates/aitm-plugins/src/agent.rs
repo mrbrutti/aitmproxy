@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aitm_core::audit::{DEFAULT_AUDIT_CAPACITY, DEFAULT_ROUTINE_AUDIT_CAPACITY};
 use aitm_core::{
     AgentPolicy, AgentState, AuditRing, Command, CommandHost, ParamDef, ParamSchema, Params,
     Plugin, Registry, Sensitivity, TypeDesc, Value,
@@ -212,10 +213,15 @@ impl Command for AgentSet {
 /// stream (spec D3a.4). `since` is Unix-epoch milliseconds (entries strictly
 /// after it); `limit` keeps the most recent `limit` of those.
 ///
-/// Entries merge oldest-first across the ring's two lanes. How long a source's
-/// entries survive depends on its own volume and its fair share of a lane, not
-/// on what other sources do. A call with no `limit` can return up to 6144
-/// entries (both lanes full), so passing `limit` is advisable.
+/// Entries merge oldest-first across the ring's two lanes. The ring is a live
+/// view, not a complete record. A source that already holds one of a lane's table
+/// slots keeps a floor of its entries against a flood. That is not isolation: a
+/// source that arrives after the slots are taken, or that shares a label with a
+/// flooder, can be flushed, and every agent-token connection of the web bridge is
+/// ONE source, `(mcp, web-bridge)`. Labels are unauthenticated display strings;
+/// `origin` is authoritative. A call with no `limit` can return up to
+/// `DEFAULT_AUDIT_CAPACITY + DEFAULT_ROUTINE_AUDIT_CAPACITY` entries with the
+/// default lane sizes (both lanes full), so passing `limit` is advisable.
 struct AgentActivity(Arc<AuditRing>);
 
 impl Command for AgentActivity {
@@ -229,13 +235,19 @@ impl Command for AgentActivity {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "Recent command-invocation audit entries (who ran what, with what \
-                          redacted arguments, and the outcome), merged oldest first across the \
-                          ring's two lanes. How long a source's entries are kept depends on its \
-                          own volume and fair share. A call with no `limit` can return up to \
-                          6144 entries, so passing `limit` is advisable. Read-only and readable \
-                          by any role."
-                .to_string(),
+            description: format!(
+                "Recent command-invocation audit entries (who ran what, with what redacted \
+                 arguments, and the outcome), merged oldest first across the ring's two lanes. \
+                 The ring is a live view, not a complete record. A source that already holds \
+                 one of a lane's table slots keeps a floor of its entries against a flood; a \
+                 source that arrives after the slots are taken, or that shares a label with a \
+                 flooder, can be flushed, and every agent-token bridge connection is ONE \
+                 source (`mcp`, `web-bridge`). Labels are unauthenticated display strings; \
+                 `origin` is authoritative. A call with no `limit` can return up to {} \
+                 entries (both lanes full, default sizes), so passing `limit` is advisable. \
+                 Read-only and readable by any role.",
+                DEFAULT_AUDIT_CAPACITY + DEFAULT_ROUTINE_AUDIT_CAPACITY
+            ),
             params: vec![
                 param(
                     "since",
