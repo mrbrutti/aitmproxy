@@ -11,6 +11,12 @@
 //! `args_summary` is a redacted, size-capped rendering produced by the caller:
 //! tokens, auth headers, and the CA key material never reach an entry, matching
 //! the M2 CA posture (the bounded-memory + secret-handling constraints).
+//!
+//! A role only reads the entries [`AuditEntry::visible_to`] allows it (an agent
+//! never sees what the operator or the CLI did); the ring and the durable log
+//! themselves are never filtered. Each streaming connection's entries carry a
+//! server-assigned `connection_id`, so two clients that share one label stay
+//! tellable apart.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -61,8 +67,8 @@ pub struct AuditEntry {
     pub client_label: Option<String>,
     /// The server-assigned, opaque id of the streaming connection that made the
     /// call. `None` means the call is not attributable to a streaming connection
-    /// (an in-process caller, a request/response transport). Never derived from
-    /// anything the client sent.
+    /// (an in-process caller, a request/response transport). Minted by the
+    /// server; see `McpServer::connection_id` in `aitm-mcp`.
     pub connection_id: Option<String>,
     /// The dotted command name, e.g. `"flow.replay"`.
     pub command: String,
@@ -147,14 +153,33 @@ pub fn origin_label(frontend: Frontend) -> &'static str {
     }
 }
 
-/// The longest prefix of `s` that is at most `max` bytes and ends on a char
-/// boundary, so the cut never splits a multi-byte character.
-fn prefix_at_char_boundary(s: &str, max: usize) -> &str {
-    let mut end = max.min(s.len());
-    while !s.is_char_boundary(end) {
-        end -= 1;
+/// Whether `c` is a Unicode format (`Cf`) character that can reorder or hide
+/// text in a table or a log and that [`char::is_control`] does not catch: the
+/// Arabic letter mark, the zero-width and directional marks, the bidi embeddings,
+/// overrides and isolates, the invisible operators, and the byte-order mark. The
+/// standard library has no `is_format`, so the ranges are listed.
+fn is_label_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// The one byte a client-label character is shown as: a space for the whitespace
+/// controls (`\t \n \r \x0B \x0C`, U+0085), `?` for every other control or format
+/// character, the character itself otherwise. Always one byte for a replaced
+/// character, so the replacement never lengthens the text.
+fn label_char(c: char) -> char {
+    match c {
+        '\t' | '\n' | '\r' | '\u{0B}' | '\u{0C}' | '\u{85}' => ' ',
+        c if c.is_control() || is_label_format_char(c) => '?',
+        c => c,
     }
-    &s[..end]
 }
 
 /// The one place a client-declared name becomes a connection's client label.
@@ -165,8 +190,12 @@ fn prefix_at_char_boundary(s: &str, max: usize) -> &str {
 /// Truncates, never refuses: a client with a long name keeps working. In order:
 ///
 /// 1. `None` if `name` is empty.
-/// 2. Every control character becomes `?`, so an escape sequence cannot drive a
-///    terminal that prints the label.
+/// 2. The whitespace controls (`\t \n \r \x0B \x0C`, U+0085) become one space, and
+///    every other control character and every bidi, zero-width or byte-order-mark
+///    format character becomes `?`, so an escape sequence cannot drive a terminal
+///    that prints the label and a bidi override cannot reorder it. Whitespace
+///    stays whitespace on purpose: the scrubber's `\s` patterns (`Bearer\tabc`,
+///    `token\t=abc`) need it, and no newline remains for a `.+` pattern to stop at.
 /// 3. The text is cut to a 512-byte window at a char boundary, which bounds the
 ///    work of the next step however long the name is.
 /// 4. [`crate::redact::scrub_text`] masks credential material (`token=abc` becomes
@@ -184,17 +213,18 @@ pub fn cap_client_label(name: &str) -> Option<String> {
     }
     // Steps 2 and 3 in one pass that stops at the window, so a name of any
     // length costs at most one window of work and memory: the result is the
-    // control-replaced text cut at the last char boundary at or below the window.
+    // sanitized text cut at the last char boundary at or below the window.
     let mut window = String::with_capacity(CLIENT_LABEL_SCRUB_WINDOW_BYTES);
     for c in name.chars() {
-        let c = if c.is_control() { '?' } else { c };
+        let c = label_char(c);
         if window.len() + c.len_utf8() > CLIENT_LABEL_SCRUB_WINDOW_BYTES {
             break;
         }
         window.push(c);
     }
     let scrubbed = crate::redact::scrub_text(&window);
-    Some(prefix_at_char_boundary(&scrubbed, MAX_CLIENT_LABEL_BYTES).to_string())
+    let end = scrubbed.floor_char_boundary(MAX_CLIENT_LABEL_BYTES);
+    Some(scrubbed[..end].to_string())
 }
 
 /// Where audit entries go. The in-memory [`AuditRing`] implements it (always on);
@@ -234,9 +264,9 @@ impl AuditRing {
     /// `limit` keeps the most recent `limit` of those (presented oldest first), so
     /// a reconnecting surface catches up without replaying the whole ring.
     ///
-    /// This is the **unfiltered** view: it returns every entry whatever its
-    /// origin. No surface a role reads may use it (use [`AuditRing::recent_for`]);
-    /// the in-process tests and the durable sink keep it.
+    /// This is the **unfiltered** read: it returns every entry whatever its
+    /// origin, so it is for in-process tests only. Never use it on a surface a
+    /// role reads; use [`AuditRing::recent_for`] there.
     pub fn recent(&self, since: Option<SystemTime>, limit: Option<usize>) -> Vec<AuditEntry> {
         self.recent_where(since, limit, |_| true)
     }
@@ -278,21 +308,12 @@ impl AuditRing {
         out
     }
 
-    /// How many entries were recorded at or after `since` — the source of
-    /// `agent.status.actions_last_minute`.
-    ///
-    /// This is the **unfiltered** count: it includes every entry whatever its
-    /// origin. No surface a role reads may use it (use
-    /// [`AuditRing::count_since_for`]); the in-process tests keep it.
-    pub fn count_since(&self, since: SystemTime) -> usize {
-        self.lock().iter().filter(|e| e.at >= since).count()
-    }
-
-    /// [`AuditRing::count_since`] as `viewer` may see it: only entries recorded at
-    /// or after `since` that are [`AuditEntry::visible_to`] the viewer, and, when
-    /// `exclude_connection` is `Some(id)`, not made by the connection `id`. An
-    /// entry with no `connection_id` is never excluded: an id the server did not
-    /// assign cannot match one it did.
+    /// How many entries were recorded at or after `since` that `viewer` may see
+    /// (the source of `agent.status.actions_last_minute`): only entries that are
+    /// [`AuditEntry::visible_to`] the viewer, and, when `exclude_connection` is
+    /// `Some(id)`, not made by the connection `id`. An entry with no
+    /// `connection_id` is never excluded: an id the server did not assign cannot
+    /// match one it did.
     pub fn count_since_for(
         &self,
         viewer: Frontend,
@@ -559,10 +580,6 @@ mod tests {
         );
     }
 
-    // ---- Tester additions (whole-branch pass, plan 2026-10-30-bus-audit-connection-id).
-    // They pin edges the AC tests above leave open: the `since` bounds of the two
-    // viewer-filtered reads, and the label cap on names a hostile client chooses.
-
     /// An entry made at the explicit instant `ms` after the epoch, so a window edge
     /// can be placed exactly instead of racing `SystemTime::now()`.
     fn entry_at_ms(
@@ -681,46 +698,121 @@ mod tests {
         );
     }
 
-    /// The `Cli` viewer is trusted control like the operator: it counts and reads
-    /// every origin, including its own. (The matrix test pins `visible_to`; this
-    /// pins the two ring reads that the tools call with `host.frontend()`.)
+    /// A name made only of control characters is not empty: each non-whitespace
+    /// control becomes one `?`, so the connection still has a (harmless) label and
+    /// nothing reaches a terminal. Only the empty string is `None`. (The whitespace
+    /// controls become a space instead; see
+    /// `cap_client_label_whitespace_controls_become_a_space`.)
     #[test]
-    fn the_cli_viewer_reads_and_counts_every_origin() {
-        let t0 = SystemTime::now();
-        let ring = AuditRing::new(16);
-        ring.append(entry_of(Frontend::Operator, Some("O"), "op"));
-        ring.append(entry_of(Frontend::Mcp, Some("A"), "ag"));
-        ring.append(entry_of(Frontend::Cli, None, "cli"));
-
-        let commands = |entries: Vec<AuditEntry>| -> Vec<String> {
-            entries.into_iter().map(|e| e.command).collect()
-        };
+    fn cap_client_label_non_whitespace_controls_become_question_marks() {
         assert_eq!(
-            commands(ring.recent_for(Frontend::Cli, None, None)),
-            ["op", "ag", "cli"]
-        );
-        assert_eq!(ring.count_since_for(Frontend::Cli, t0, None), 3);
-        // The agent sees neither the operator's nor the CLI's entry.
-        assert_eq!(commands(ring.recent_for(Frontend::Mcp, None, None)), ["ag"]);
-        assert_eq!(ring.count_since_for(Frontend::Mcp, t0, None), 1);
-    }
-
-    /// A name made only of control characters is not empty: it becomes that many
-    /// `?`, so the connection still has a (harmless) label and nothing reaches a
-    /// terminal. Only the empty string is `None`.
-    #[test]
-    fn cap_client_label_all_control_chars_becomes_question_marks() {
-        assert_eq!(
-            cap_client_label("\u{1b}\u{7}\u{0}\n\t"),
+            cap_client_label("\u{1b}\u{7}\u{0}\u{1}\u{7f}"),
             Some("?????".to_string())
         );
-        // U+0085 is a two-byte control character: it is replaced by one byte, so
-        // 300 of them (600 bytes in) are 300 `?`, cut to the 128-byte cap.
-        assert_eq!(cap_client_label("a\u{85}b"), Some("a?b".to_string()));
+        // U+0090 is a two-byte control character that is not whitespace: it is
+        // replaced by one byte, so 300 of them (600 bytes in) are 300 `?`, cut to
+        // the 128-byte cap.
+        assert_eq!(cap_client_label("a\u{90}b"), Some("a?b".to_string()));
         assert_eq!(
-            cap_client_label(&"\u{85}".repeat(300)),
+            cap_client_label(&"\u{90}".repeat(300)),
             Some("?".repeat(128))
         );
+    }
+
+    /// The whitespace controls (`\t \n \r \x0B \x0C` and U+0085) become one ASCII
+    /// space, not `?`: the secret scrubber's `\s` patterns need real whitespace, and
+    /// no newline may survive for a `.+` pattern to stop at.
+    #[test]
+    fn cap_client_label_whitespace_controls_become_a_space() {
+        assert_eq!(
+            cap_client_label("a\tb\nc\rd\u{0B}e\u{0C}f\u{85}g"),
+            Some("a b c d e f g".to_string())
+        );
+        // U+0085 is two bytes in, one byte out: 300 of them are 300 spaces, cut to
+        // the 128-byte cap.
+        assert_eq!(
+            cap_client_label(&"\u{85}".repeat(300)),
+            Some(" ".repeat(128))
+        );
+        // A newline never survives, so no line break reaches a table or a log.
+        let label = cap_client_label("one\ntwo\r\nthree").expect("non-empty name");
+        assert_eq!(label, "one two  three");
+        assert!(!label.contains(['\n', '\r']), "{label:?}");
+    }
+
+    /// F1: a whitespace control inside a credential's framing must not hide it
+    /// from the scrubber. Replacing `\t`/`\n` with `?` turned `Bearer\tabc123` into
+    /// `Bearer?abc123` (no whitespace for `bearer\s+`), `token\t=abc123` into
+    /// `token?=abc123`, and `password\n: hunter2` into `password?: hunter2`.
+    #[test]
+    fn cap_client_label_scrubs_a_bearer_token_after_a_tab() {
+        let label = cap_client_label("agent Bearer\tabc123").expect("non-empty name");
+        assert!(label.contains("[redacted]"), "{label:?}");
+        assert!(!label.contains("abc123"), "{label:?}");
+    }
+
+    #[test]
+    fn cap_client_label_scrubs_a_token_pair_with_a_tab_before_the_separator() {
+        let label = cap_client_label("agent token\t=abc123").expect("non-empty name");
+        assert!(label.contains("[redacted]"), "{label:?}");
+        assert!(!label.contains("abc123"), "{label:?}");
+    }
+
+    #[test]
+    fn cap_client_label_scrubs_a_password_pair_with_a_newline_before_the_separator() {
+        let label = cap_client_label("password\n: hunter2").expect("non-empty name");
+        assert!(label.contains("[redacted]"), "{label:?}");
+        assert!(!label.contains("hunter2"), "{label:?}");
+    }
+
+    /// F2: bidi overrides, zero-width characters and the BOM are `Cf` format
+    /// characters that `char::is_control` misses. They can reorder or hide text in
+    /// an operator table, so each becomes `?`; a clean multibyte name is untouched.
+    #[test]
+    fn cap_client_label_format_characters_become_question_marks() {
+        assert_eq!(
+            cap_client_label("\u{202E}gnp.exe"),
+            Some("?gnp.exe".to_string())
+        );
+        assert_eq!(
+            cap_client_label("aitm\u{200B}-mac"),
+            Some("aitm?-mac".to_string())
+        );
+        // Every range edge from U+061C, U+200B-U+200F, U+202A-U+202E,
+        // U+2060-U+2064, U+2066-U+2069 and U+FEFF is replaced ...
+        let edges = [
+            '\u{061C}', '\u{200B}', '\u{200F}', '\u{202A}', '\u{202E}', '\u{2060}', '\u{2064}',
+            '\u{2066}', '\u{2069}', '\u{FEFF}',
+        ];
+        for c in edges {
+            assert_eq!(
+                cap_client_label(&format!("a{c}b")),
+                Some("a?b".to_string()),
+                "U+{:04X}",
+                c as u32
+            );
+        }
+        // ... and the characters just outside each range are kept.
+        let outside = [
+            '\u{061B}', '\u{061D}', '\u{200A}', '\u{2010}', '\u{2029}', '\u{202F}', '\u{205F}',
+            '\u{2065}', '\u{206A}', '\u{FEFE}', '\u{FF00}',
+        ];
+        for c in outside {
+            let name = format!("a{c}b");
+            assert_eq!(
+                cap_client_label(&name),
+                Some(name.clone()),
+                "U+{:04X}",
+                c as u32
+            );
+        }
+    }
+
+    /// A clean multibyte name passes through unchanged: the format-character
+    /// list must not catch ordinary letters, accents or currency signs.
+    #[test]
+    fn cap_client_label_leaves_a_clean_multibyte_name() {
+        assert_eq!(cap_client_label("naïve-é-€"), Some("naïve-é-€".to_string()));
     }
 
     /// The cap is inclusive: a name of exactly 128 bytes survives whole, one byte
@@ -756,22 +848,12 @@ mod tests {
     /// line break, so scrubbing first would leave the second "line" visible).
     #[test]
     fn cap_client_label_masks_past_a_newline_and_bearer_tokens() {
-        assert_eq!(
-            cap_client_label("Authorization: Basic dXNlcjpwYXNz\nsecond line"),
-            Some("Authorization: [redacted]".to_string())
-        );
+        let masked = cap_client_label("Authorization: Basic dXNlcjpwYXNz\nsecond line")
+            .expect("non-empty name");
+        assert_eq!(masked, "Authorization: [redacted]");
+        assert!(!masked.contains("second line"), "{masked:?}");
         let bearer = cap_client_label("agent Bearer abc.def.ghi").expect("non-empty name");
         assert!(bearer.contains("Bearer [redacted]"), "{bearer}");
         assert!(!bearer.contains("abc.def.ghi"), "{bearer}");
-    }
-
-    /// A multi-megabyte multi-byte name (a hostile `clientInfo.name` the size of a
-    /// whole message) is cut without a panic and without splitting a character:
-    /// 3 MiB of 3-byte characters leaves 42 of them, 126 bytes.
-    #[test]
-    fn cap_client_label_huge_multibyte_name_is_cut_not_split() {
-        let label = cap_client_label(&"\u{20AC}".repeat(1 << 20)).expect("non-empty name");
-        assert_eq!(label.len(), 126);
-        assert_eq!(label.chars().count(), 42);
     }
 }

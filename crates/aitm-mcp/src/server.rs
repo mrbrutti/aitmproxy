@@ -73,22 +73,28 @@ pub const UNAUTHORIZED: i64 = -32001;
 /// threaded into every message on that connection through [`McpServer::handle_on`].
 ///
 /// The `role` drives policy and confirmation decisions (Tasks 4/5/9); the
-/// `client_label` is the connection's `initialize.clientInfo.name`, carried for
-/// audit only. `out` is the bounded push sink the transport's writer task drains
-/// (F4); `conn_id` identifies the connection so its subscriptions are dropped
-/// when it ends. In-process callers (`McpServer::handle`) have no push sink.
+/// `client_label` is the connection's `initialize.clientInfo.name` after
+/// [`aitm_core::cap_client_label`] has capped, sanitized and scrubbed it. It is
+/// copied into every audit entry the connection makes and reaches
+/// `CommandHost::with_client_label`, but no policy decision reads it. `out` is
+/// the bounded push sink the transport's writer task drains (F4); `conn_id`
+/// identifies the connection so its subscriptions are dropped when it ends.
+/// In-process callers (`McpServer::handle`) have no push sink.
 #[derive(Debug, Clone)]
 pub struct ConnCtx {
     /// The frontend this connection speaks as.
     pub role: Frontend,
     /// The human-readable client label from `initialize.clientInfo.name`. Client
     /// controlled: set only through [`aitm_core::cap_client_label`], which bounds
-    /// its length and strips control characters and secrets. A transport that
-    /// writes this field any other way puts unbounded text into every audit entry.
+    /// its length, replaces control and bidi/format characters and masks secrets.
+    /// A transport that writes this field any other way puts unbounded text into
+    /// every audit entry.
     pub client_label: Option<String>,
     /// A per-connection id, assigned by the transport, used to drop this
     /// connection's subscriptions when it ends. `0` means "not a streaming
-    /// connection" (an in-process `handle` call).
+    /// connection" (an in-process `handle` call): `connection_id` is `null` for
+    /// it. It is also the sole input of `McpServer::connection_id`, so it must
+    /// stay unique per server.
     pub conn_id: u64,
     /// The bounded push sink the transport's writer task drains to the socket;
     /// `None` for in-process callers that have no writer task.
@@ -476,17 +482,26 @@ impl Subscriptions {
         self.lock().subs.iter().any(|s| s.role == role)
     }
 
-    /// Push `line` to each subscribed connection of `role` (once per connection).
-    fn fanout_role(&self, role: Frontend, line: &str) {
+    /// Push `line` to the first subscription of each connection for which `keep`
+    /// holds, so a connection receives it at most once however many of its
+    /// subscriptions pass. A connection is marked only after a push, so a later
+    /// subscription of a connection whose earlier ones were skipped can still
+    /// qualify. `keep` runs under the registry lock together with the push.
+    fn fanout_where(&self, line: &str, keep: impl Fn(&Subscription) -> bool) {
         let st = self.lock();
         let mut seen: Vec<u64> = Vec::new();
         for sub in &st.subs {
-            if sub.role != role || seen.contains(&sub.conn_id) {
+            if seen.contains(&sub.conn_id) || !keep(sub) {
                 continue;
             }
             seen.push(sub.conn_id);
             sub.sink.push(line.to_string());
         }
+    }
+
+    /// Push `line` to each subscribed connection of `role` (once per connection).
+    fn fanout_role(&self, role: Frontend, line: &str) {
+        self.fanout_where(line, |sub| sub.role == role);
     }
 
     /// Remove `sub_id` if it belongs to `conn_id`. Returns whether it existed.
@@ -506,29 +521,13 @@ impl Subscriptions {
     /// Push `line` to each connection with at least one subscription matching
     /// `flow` (at most once per connection, even with several matching subs).
     fn fanout_flow(&self, flow: &Flow, line: &str) {
-        let st = self.lock();
-        let mut seen: Vec<u64> = Vec::new();
-        for sub in &st.subs {
-            if seen.contains(&sub.conn_id) || !sub.filter.matches(flow) {
-                continue;
-            }
-            seen.push(sub.conn_id);
-            sub.sink.push(line.to_string());
-        }
+        self.fanout_where(line, |sub| sub.filter.matches(flow));
     }
 
     /// Push `line` to every subscribed connection (once each), regardless of
     /// filter — state changes concern the whole session.
     fn fanout_state(&self, line: &str) {
-        let st = self.lock();
-        let mut seen: Vec<u64> = Vec::new();
-        for sub in &st.subs {
-            if seen.contains(&sub.conn_id) {
-                continue;
-            }
-            seen.push(sub.conn_id);
-            sub.sink.push(line.to_string());
-        }
+        self.fanout_where(line, |_| true);
     }
 
     /// Push the already-rendered audit `line` for `entry` to each subscribed
@@ -539,15 +538,7 @@ impl Subscriptions {
     /// one place. The decision runs under the registry lock with the push, so
     /// a subscription cannot change between the check and the send.
     fn fanout_audit(&self, entry: &AuditEntry, line: &str) {
-        let st = self.lock();
-        let mut seen: Vec<u64> = Vec::new();
-        for sub in &st.subs {
-            if seen.contains(&sub.conn_id) || !entry.visible_to(sub.role) {
-                continue;
-            }
-            seen.push(sub.conn_id);
-            sub.sink.push(line.to_string());
-        }
+        self.fanout_where(line, |sub| entry.visible_to(sub.role));
     }
 }
 
@@ -1049,8 +1040,11 @@ impl McpServer {
     /// `conn_id`, rendered `conn_<16 lowercase hex>-<decimal>` (at most 64 bytes
     /// of printable ASCII). Nothing a request carries is read into it: not
     /// `clientInfo`, not `_meta`, not an argument, not the client label. Callers
-    /// compare it for equality only, and no policy decision keys off it.
-    pub fn connection_id(&self, conn: &ConnCtx) -> Option<String> {
+    /// compare it for equality only, and no policy decision keys off it. It is not
+    /// a secret (an agent that reads its own id can compute the lower-numbered
+    /// ones on this server): nothing accepts it as input, and it cannot be forged
+    /// because the server stamps it from the `ConnCtx`, not because it is hidden.
+    fn connection_id(&self, conn: &ConnCtx) -> Option<String> {
         (conn.conn_id != 0).then(|| format!("conn_{:016x}-{}", self.conn_salt, conn.conn_id))
     }
 
@@ -1346,10 +1340,9 @@ impl McpServer {
                     // show it and warn on mismatch (Decision C). Additive and
                     // top-level — it describes this connection, not the server.
                     "role": role_str(conn.role),
-                    // This connection's server-assigned id (a string), or `null`
-                    // when the caller is not a streaming connection. Additive and
-                    // top-level like `role`, never inside `serverInfo`; read from
-                    // the transport-built `ConnCtx`, never from `params`.
+                    // This connection's id (a string), or `null` when the caller
+                    // is not a streaming connection. Additive and top-level like
+                    // `role`, never inside `serverInfo`.
                     "connection_id": self.connection_id(conn),
                     // Additive (W2): advertise `resources` so MCP Apps hosts fetch
                     // the widget templates, plus the MCP Apps extension id. Clients
@@ -1621,8 +1614,7 @@ impl McpServer {
             Some(label) => host.with_client_label(label.clone()),
             None => host,
         };
-        // The server-assigned id of this connection (never the label, never
-        // anything the request carried), so a command can tell whose call it is.
+        // So a command can tell whose call it is.
         let host = match self.connection_id(conn) {
             Some(id) => host.with_connection_id(id),
             None => host,
@@ -1694,7 +1686,6 @@ impl McpServer {
             at: SystemTime::now(),
             origin: conn.role,
             client_label: conn.client_label.clone(),
-            // Stamped from the transport-built `ConnCtx`, never from the request.
             connection_id: self.connection_id(conn),
             command: name.to_string(),
             args_summary: redact_args(arguments),

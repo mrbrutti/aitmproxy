@@ -151,8 +151,8 @@ impl Command for AgentStatus {
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         // `exclude_self` is a schema-declared optional boolean: a non-boolean never
         // reaches here (the schema coercion refuses it as invalid params), and
-        // absent means off. The excluded id is the server-assigned one the host
-        // carries, never anything the caller sent; with none, nothing is excluded.
+        // absent means off. The excluded id is the one the host carries; with
+        // none, nothing is excluded.
         let exclude_self = matches!(args.get("exclude_self"), Some(Value::Bool(true)));
         let exclude = if exclude_self {
             host.connection_id()

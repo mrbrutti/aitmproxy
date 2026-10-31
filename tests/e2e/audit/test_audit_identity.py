@@ -25,8 +25,9 @@ What is proven, in call order (agents A and B, operator O; ring size after each)
  10   The label step, LAST so the counts above stay exact: a client named
       `"x" * (1 << 20)` makes one call and the operator's `agent.activity` entry
       for it (found by that client's own `initialize` id) has a `client_label`
-      of exactly 128 bytes, `"x" * 128`. Today the label is stored whole, so a
-      16 MiB name times the 4096-entry ring is 64 GiB reachable with one token.
+      of exactly 128 bytes, `"x" * 128`. The label must be capped at ingestion:
+      stored whole, a 16 MiB name times the 4096-entry ring would be 64 GiB
+      reachable with one token.
 
 Every assertion on the oversized label compares lengths or a 128-byte prefix, so
 a failure never prints 1 MiB.

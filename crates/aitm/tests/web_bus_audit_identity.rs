@@ -16,9 +16,6 @@
 //! loopback `/bus` WebSocket bridge, an agent-token and an operator-token
 //! connection, and the audit lines each one is pushed. It binds sockets, so it
 //! runs from the Terminal panel, not the Bash sandbox.
-//!
-//! Layout: the rig and the call helpers come first, one `#[test]` per behaviour
-//! after them, so a later test can add to the file without touching these.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -199,8 +196,10 @@ fn governed_servers_sharing_a_ring_never_share_an_id() {
 // ---------------------------------------------------------------------------
 // AC19: the real `/bus` bridge. Everything below binds a loopback socket.
 //
-// The rig is copied from `web_bus_governance.rs` (integration tests cannot share
-// a module): the served `web::serve` over `assemble`'s registry and `tui::server`,
+// The rig is copied from `web_bus_governance.rs`, not shared through
+// `tests/support/`, because the existing `web_bus_*` test files must stay
+// unmodified on this branch (spec AC24); moving the copies into `tests/support/`
+// is a follow-up. It is the served `web::serve` over `assemble`'s registry and `tui::server`,
 // with the shared governance, the push wiring and the two bridge tokens `main.rs`
 // gives the web run. The one difference is the call helper: that file's `call`
 // throws away every notification frame it skips on the way to a reply, and this

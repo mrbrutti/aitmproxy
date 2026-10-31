@@ -4781,11 +4781,6 @@ fn agent_status_exclude_self_skips_only_the_callers_connection() {
     );
 }
 
-// ------------- Tester additions: whole-branch pass (plan 2026-10-30-bus-audit-connection-id)
-//
-// Edges the AC tests above leave open. Each test's doc names the change to the
-// production code that only it would catch.
-
 /// `(command, origin)` of every `notifications/aitm/agent` line in `conn`'s sink,
 /// oldest first; drains the sink.
 fn agent_line_pairs(conn: &ConnCtx) -> Vec<(String, String)> {

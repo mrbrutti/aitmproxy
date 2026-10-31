@@ -357,10 +357,9 @@ impl<'a> CommandHost<'a> {
         self.client_label.as_deref()
     }
 
-    /// Attach the server-assigned, opaque id of the calling connection. The
-    /// server mints it; it is never derived from the client label or anything
-    /// else the caller sent. Policy and confirmation decisions key off
-    /// [`CommandHost::frontend`], not this id.
+    /// Attach the server-assigned, opaque id of the calling connection (see
+    /// `McpServer::connection_id` in `aitm-mcp`). Policy and confirmation
+    /// decisions key off [`CommandHost::frontend`], not this id.
     pub fn with_connection_id(mut self, id: impl Into<String>) -> Self {
         self.connection_id = Some(id.into());
         self
