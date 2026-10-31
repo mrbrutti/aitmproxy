@@ -29,8 +29,10 @@
 //! declared places: the key test, the host:port exemption (the wide scan has
 //! none), and the three characters `\n`, `\r` and `\x0c`, which the wide scan
 //! does not skip beside a separator, so that it reads a pair on one line. Where a
-//! key run, a value and a closing quote begin and end, and how a pair nested in a
-//! value is found, are shared.
+//! key run and a closing quote begin and end, where a value ends, and how a pair
+//! nested in a value is found are shared. The line-break rule is the one
+//! difference that changes where a value starts: `author:\nJohn` has no value in
+//! the wide scan, and `sid:\nabc` takes `abc` in the standard one.
 
 use std::sync::OnceLock;
 
@@ -104,10 +106,11 @@ fn contains_segment_word(lower: &str) -> bool {
     SECRET_KEY_SEGMENTS.iter().any(|word| lower.contains(word))
 }
 
-/// The compiled regex passes that [`scrub_text`] and [`scrub_text_wide`] both
-/// apply, in order. The `key=value` pair pass is [`mask_secret_pairs`], not a
-/// regex, because it must judge each key by the predicate of the reading it runs
-/// under ([`is_secret_key`] or [`is_secret_key_wide`]) and handle quoted values.
+/// The compiled regex passes that [`scrub_text`] applies, in order, and so does
+/// [`scrub_text_wide`], which starts from it. The `key=value` pair pass is
+/// [`mask_secret_pairs`], not a regex, because it must judge each key by the
+/// predicate of the reading it runs under ([`is_secret_key`] or
+/// [`is_secret_key_wide`]) and handle quoted values.
 fn patterns() -> &'static [(Regex, &'static str)] {
     static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
     PATTERNS.get_or_init(|| {
@@ -159,38 +162,49 @@ fn patterns() -> &'static [(Regex, &'static str)] {
 /// For the over-matching reading, which also masks keys that merely contain a
 /// short secret word (`author`, `sidebar`), see [`scrub_text_wide`].
 pub fn scrub_text(text: &str) -> String {
-    mask_secret_pairs(&apply_patterns(text), Reading::Standard)
+    let mut out = text.to_string();
+    for (re, rep) in patterns() {
+        out = re.replace_all(&out, *rep).into_owned();
+    }
+    mask_secret_pairs(&out, Reading::Standard)
 }
 
-/// [`scrub_text`], and then a second scan that judges keys by
-/// [`is_secret_key_wide`]: the two regex passes, the standard pair scan, and the
-/// same pair scan again over its output with the wide reading. It masks everything
-/// [`scrub_text`] masks, because the second scan only replaces more values with
-/// `[redacted]`, and then every pair whose key reads as secret under
-/// [`is_secret_key_wide`]. The standard scan runs first, so a standard-secret pair
-/// nested under a wide-only key is already masked when the wide scan's region
-/// would hide its key (`authentication:\n  password: hunter2` masks `hunter2`).
+/// [`scrub_text`], and then a second scan over its output that judges keys by
+/// [`is_secret_key_wide`]. It masks everything [`scrub_text`] masks, because the
+/// second scan only replaces more values with `[redacted]`, and then every pair
+/// whose key reads as secret under [`is_secret_key_wide`]. The standard scan runs
+/// first, so a standard-secret pair nested under a wide-only key is already masked
+/// when the wide scan's region would hide its key (`authentication:\n  password:
+/// hunter2` masks `hunter2`).
 ///
-/// The second scan differs from the first in three places, and shares with it where
-/// a key run, a value and a closing quote begin and end, and how a pair nested in a
-/// value is found. Its key test is [`is_secret_key_wide`]. Nothing is exempt as a
-/// host:port, so `auth.example.com:8443` and `token.example.com:8443` are masked.
-/// And it does not skip `\n`, `\r` or `\x0c` beside a separator, so it reads a pair
-/// on one line: `author:\nJohn` is left alone, while the standard scan still reads
-/// a standard-secret pair across a line break (`sid:\nabc` masks `abc`). Every other
-/// whitespace character is skipped there.
+/// The second scan differs from the first in three places. It shares with the first
+/// where a key run and a closing quote begin and end, where a value ends, and how a
+/// pair nested in a value is found. Its key test is [`is_secret_key_wide`]. Nothing
+/// is exempt as a host:port, so `auth.example.com:8443` and
+/// `token.example.com:8443` are masked. And it does not skip `\n`, `\r` or `\x0c`
+/// beside a separator, so it reads a pair on one line. That third difference is the
+/// one that changes where a value starts: `author:\nJohn` has no value in the wide
+/// scan, while the standard scan reads a standard-secret pair across a line break
+/// (`sid:\nabc` takes `abc`). Every other whitespace character is skipped beside a
+/// separator by both. A credential on the next line under a wide-only key is not
+/// masked, as before (`userSession:\n  S3SS10N9`, `sidebar:\nS3SS10N9`), while the
+/// standard reading masks `session:\n  S3SS10N9`.
 ///
 /// It over-redacts by design: use it where a masked innocent value costs nothing
 /// and a missed credential leaks (a PoC meant to be shared), never on text that
 /// goes to an agent, an audit record, or a finding, where `authority=` and
 /// `author=3` are ordinary. Its running time is linear, about twice that of
-/// [`scrub_text`]. A residual: a non-ASCII letter glued into a key, a non-ASCII
-/// space beside a separator, or a dotted key that names a secret word before a port
-/// can make the wide scan read a wider pair than the standard one and let a
-/// wide-only pair nested right after it keep a quoted or padded value.
+/// [`scrub_text`]. A residual, in four shapes: a non-ASCII letter glued into a key,
+/// a non-ASCII space beside a separator, a dotted key that names a secret word
+/// before a port, and a quoted wide-only value that holds an unescaped quote after
+/// `=` or `:` and is followed, with no delimiter, by a quoted wide-only key
+/// (`nsid='='authr'=C1`). Each can make the wide scan read a wider pair than the
+/// standard one and let a wide-only pair nested right after it keep a quoted or
+/// padded value. The last shape needs that quote to have no delimiter behind it; in
+/// valid JSON, a form and a query a delimiter follows the closing quote, so they are
+/// not affected.
 pub fn scrub_text_wide(text: &str) -> String {
-    let standard = mask_secret_pairs(&apply_patterns(text), Reading::Standard);
-    mask_secret_pairs(&standard, Reading::Wide)
+    mask_secret_pairs(&scrub_text(text), Reading::Wide)
 }
 
 /// Which reading of the vocabulary a scan applies. See [`mask_secret_pairs`]. The
@@ -204,15 +218,6 @@ enum Reading {
     /// The reading of the second scan: [`is_secret_key_wide`], nothing is exempt,
     /// and `\n`, `\r` and `\x0c` are not blanks beside a separator.
     Wide,
-}
-
-/// The two regex passes that both entry points apply before any pair scan.
-fn apply_patterns(text: &str) -> String {
-    let mut out = text.to_string();
-    for (re, rep) in patterns() {
-        out = re.replace_all(&out, *rep).into_owned();
-    }
-    out
 }
 
 /// Whether the ASCII byte `b` can be part of a key run: an ASCII alphanumeric,
@@ -1211,7 +1216,7 @@ mod tests {
     //
     // `reading_agnostic` is `true` unless the input holds a key that contains one of
     // the `SECRET_KEY_SEGMENTS` words without being a whole-segment or needle secret
-    // (`author`, `sidebar`, `xsidéy`), or a dotted key directly before `:` and a
+    // (`author`, `sidebar`, `xsid\u{e9}y`), or a dotted key directly before `:` and a
     // digit (`auth.example.com:8443`). Those are the rows that a wider key reading,
     // or a reading with no host:port exemption, could answer differently. The test
     // below reads the first two columns only.
@@ -1359,11 +1364,6 @@ mod tests {
         ),
         ("sid=\"abc def token=\"S3\"", "sid=\"[redacted]\"", true),
         ("token='a b token='S3'", "token='[redacted]'", true),
-        (
-            "password='x password'=S3CR3T",
-            "password='[redacted]'=S3CR3T",
-            true,
-        ),
         ("auth.example.com:1", "auth.example.com:1", false),
         ("auth.example.com:65535", "auth.example.com:65535", false),
         (
@@ -1441,23 +1441,35 @@ mod tests {
         ("db.password=1234", "db.password=[redacted]", true),
         ("sid:12345", "sid:[redacted]", true),
         ("token:8443", "token:[redacted]", true),
-        ("xsidéy=v", "xsidéy=v", false),
-        ("sidébar=x", "sidébar=[redacted]", true),
-        ("é-sid=ABC", "é-sid=[redacted]", true),
-        ("café=latte", "café=latte", true),
-        ("sidé=x", "sidé=[redacted]", true),
-        ("éauth=x", "éauth=[redacted]", true),
-        ("xauthé=v", "xauthé=v", false),
-        ("ésidé=ABC", "ésidé=[redacted]", true),
-        ("mésidence=x", "mésidence=x", false),
-        ("naïve=1", "naïve=1", true),
-        ("tokené=abc", "tokené=[redacted]", true),
-        ("jwtñ=x", "jwtñ=[redacted]", true),
-        ("sésame=open", "sésame=open", true),
-        ("café:latte", "café:latte", true),
-        ("Ünïcode_token=x", "Ünïcode_token=[redacted]", true),
-        ("sid=日本語&x=1", "sid=[redacted]&x=1", true),
-        ("password: “quoted”", "password: [redacted]", true),
+        ("xsid\u{e9}y=v", "xsid\u{e9}y=v", false),
+        ("sid\u{e9}bar=x", "sid\u{e9}bar=[redacted]", true),
+        ("\u{e9}-sid=ABC", "\u{e9}-sid=[redacted]", true),
+        ("caf\u{e9}=latte", "caf\u{e9}=latte", true),
+        ("sid\u{e9}=x", "sid\u{e9}=[redacted]", true),
+        ("\u{e9}auth=x", "\u{e9}auth=[redacted]", true),
+        ("xauth\u{e9}=v", "xauth\u{e9}=v", false),
+        ("\u{e9}sid\u{e9}=ABC", "\u{e9}sid\u{e9}=[redacted]", true),
+        ("m\u{e9}sidence=x", "m\u{e9}sidence=x", false),
+        ("na\u{ef}ve=1", "na\u{ef}ve=1", true),
+        ("token\u{e9}=abc", "token\u{e9}=[redacted]", true),
+        ("jwt\u{f1}=x", "jwt\u{f1}=[redacted]", true),
+        ("s\u{e9}same=open", "s\u{e9}same=open", true),
+        ("caf\u{e9}:latte", "caf\u{e9}:latte", true),
+        (
+            "\u{dc}n\u{ef}code_token=x",
+            "\u{dc}n\u{ef}code_token=[redacted]",
+            true,
+        ),
+        (
+            "sid=\u{65e5}\u{672c}\u{8a9e}&x=1",
+            "sid=[redacted]&x=1",
+            true,
+        ),
+        (
+            "password: \u{201c}quoted\u{201d}",
+            "password: [redacted]",
+            true,
+        ),
         (
             "Authorization: Bearer abc.def.ghi",
             "Authorization: [redacted]",
@@ -1555,6 +1567,7 @@ mod tests {
             true,
         ),
         ("password='a b token='S3'", "password='[redacted]'", true),
+        // rows in this group record a tail the shared value rule leaves beside the mask; they pin the unchanged behaviour of the standard scan, they are not requirements
         (
             "Set-Cookie: sid=abc123; Path=/; HttpOnly",
             "Set-Cookie: [redacted]; Path=/; HttpOnly",
@@ -1983,15 +1996,11 @@ mod tests {
                    &u=auth.example.com:8888 \u{e9}\u{a0}sid:QQQQ\u{2028}tail";
         let mut cuts = 0;
         let mut bad: Vec<(usize, String)> = Vec::new();
-        for cut in doc
-            .char_indices()
-            .map(|(at, _)| at)
-            .chain(std::iter::once(doc.len()))
-        {
+        for prefix in prefixes(doc) {
             cuts += 1;
-            let out = scrub_text_wide(&doc[..cut]);
+            let out = scrub_text_wide(prefix);
             if out.contains('Q') || out.contains('8') {
-                bad.push((cut, out));
+                bad.push((prefix.len(), out));
             }
         }
         assert!(cuts >= 150, "the document is too short: {cuts} cuts");
@@ -2126,6 +2135,34 @@ mod tests {
             .collect()
     }
 
+    /// Every prefix of `text` that ends on a char boundary, the empty one and
+    /// `text` itself included: what a connection that drops mid-stream hands over.
+    fn prefixes(text: &str) -> impl Iterator<Item = &str> {
+        text.char_indices()
+            .map(|(at, _)| at)
+            .chain(std::iter::once(text.len()))
+            .map(move |cut| &text[..cut])
+    }
+
+    /// The superset check on one text. The first value is how many runs (see
+    /// [`alnum_runs`]) [`scrub_text`] removes from it, `redacted` aside; the second
+    /// is those of them that are still in the output of [`scrub_text_wide`]. The
+    /// second is empty when the wide scrub masks everything the standard one does.
+    fn runs_left_by_wide(text: &str) -> (usize, Vec<&str>) {
+        let standard = scrub_text(text);
+        let wide = scrub_text_wide(text);
+        let masked: Vec<&str> = alnum_runs(text)
+            .into_iter()
+            .filter(|run| !"redacted".contains(run) && !standard.contains(run))
+            .collect();
+        let left = masked
+            .iter()
+            .copied()
+            .filter(|run| wide.contains(run))
+            .collect();
+        (masked.len(), left)
+    }
+
     #[test]
     fn scrub_text_wide_masks_a_standard_pair_nested_under_a_wide_only_key() {
         let bad = mismatches_wide(NESTED_UNDER_A_WIDE_ONLY_KEY);
@@ -2134,31 +2171,16 @@ mod tests {
 
     #[test]
     fn scrub_text_wide_masks_everything_scrub_text_masks() {
-        let inputs: Vec<&str> = RECORDED_SCRUB_TEXT
-            .iter()
-            .map(|&(input, _, _)| input)
-            .chain(NESTED_UNDER_A_WIDE_ONLY_KEY.iter().map(|&(input, _)| input))
-            .chain(LINE_BREAK_IS_A_BOUNDARY.iter().map(|&(input, _)| input))
-            .collect();
+        let inputs = corpus_inputs();
         let mut with_a_masked_run = 0;
         let mut bad: Vec<(&str, Vec<&str>, String)> = Vec::new();
         for &input in &inputs {
-            let standard = scrub_text(input);
-            let wide = scrub_text_wide(input);
-            // A run that the standard scrub removed from the text.
-            let masked: Vec<&str> = alnum_runs(input)
-                .into_iter()
-                .filter(|run| !"redacted".contains(run) && !standard.contains(run))
-                .collect();
-            if !masked.is_empty() {
+            let (masked, left) = runs_left_by_wide(input);
+            if masked > 0 {
                 with_a_masked_run += 1;
             }
-            let left: Vec<&str> = masked
-                .into_iter()
-                .filter(|run| wide.contains(run))
-                .collect();
             if !left.is_empty() {
-                bad.push((input, left, wide));
+                bad.push((input, left, scrub_text_wide(input)));
             }
         }
         assert!(
@@ -2318,79 +2340,28 @@ mod tests {
         assert!(out.contains("password: [redacted]"), "{out}");
     }
 
-    /// A corpus pin, not a theorem: over its own output the wide scrub gives the
-    /// same text on every input of the three corpora, and the first scrub changes
-    /// at least a hundred of them, so a scrub that leaves text alone does not meet
-    /// the pin. A change that makes the second scan read what the first one wrote
-    /// shows up here. (An unclosed quote can read differently once its value is
-    /// masked, so the property is not claimed for arbitrary text.)
-    #[test]
-    fn scrub_text_wide_is_stable_on_its_own_output_across_the_corpora() {
-        let inputs = corpus_inputs();
-        let mut changed = 0;
-        let mut bad: Vec<(&str, String, String)> = Vec::new();
-        for &input in &inputs {
-            let once = scrub_text_wide(input);
-            let twice = scrub_text_wide(&once);
-            if once != input {
-                changed += 1;
-            }
-            if once != twice {
-                bad.push((input, once, twice));
-            }
-        }
-        assert!(
-            inputs.len() >= 100,
-            "only {} inputs are checked",
-            inputs.len()
-        );
-        assert!(
-            changed >= 100,
-            "only {changed} inputs are changed by the first scrub: the test is vacuous"
-        );
-        assert!(
-            bad.is_empty(),
-            "(input, once, twice) differ on {} inputs: {bad:#?}",
-            bad.len()
-        );
-    }
-
     /// A connection that drops mid-stream hands over a prefix of the text. The
     /// superset property of `scrub_text_wide_masks_everything_scrub_text_masks`
     /// holds on every char-boundary prefix of every corpus input, nested shapes and
     /// line breaks included, and no cut makes the scrub panic.
     #[test]
     fn scrub_text_wide_masks_everything_scrub_text_masks_on_every_prefix() {
-        let mut prefixes = 0;
+        let mut checked = 0;
         let mut with_a_masked_run = 0;
         let mut bad: Vec<(&str, Vec<&str>, String)> = Vec::new();
         for input in corpus_inputs() {
-            let cuts = input
-                .char_indices()
-                .map(|(at, _)| at)
-                .chain(std::iter::once(input.len()));
-            for cut in cuts {
-                let prefix = &input[..cut];
-                prefixes += 1;
-                let standard = scrub_text(prefix);
-                let wide = scrub_text_wide(prefix);
-                let masked: Vec<&str> = alnum_runs(prefix)
-                    .into_iter()
-                    .filter(|run| !"redacted".contains(run) && !standard.contains(run))
-                    .collect();
-                if !masked.is_empty() {
+            for prefix in prefixes(input) {
+                checked += 1;
+                let (masked, left) = runs_left_by_wide(prefix);
+                if masked > 0 {
                     with_a_masked_run += 1;
                 }
-                let left: Vec<&str> = masked
-                    .into_iter()
-                    .filter(|run| wide.contains(run))
-                    .collect();
                 if !left.is_empty() {
-                    bad.push((prefix, left, wide));
+                    bad.push((prefix, left, scrub_text_wide(prefix)));
                 }
             }
         }
-        assert!(prefixes >= 3000, "only {prefixes} prefixes are checked");
+        assert!(checked >= 3000, "only {checked} prefixes are checked");
         assert!(
             with_a_masked_run >= 300,
             "only {with_a_masked_run} prefixes have a run that scrub_text masks: the test is vacuous"

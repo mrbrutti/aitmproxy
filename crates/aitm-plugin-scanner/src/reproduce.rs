@@ -19,7 +19,8 @@
 //! through `scrub_embedded` — URL userinfo stripped, then
 //! [`aitm_core::redact::scrub_text_wide`], the wide reading of the same
 //! vocabulary [`is_secret_name`] applies to a name, so a credential embedded in
-//! an innocuously named value cannot slip past a narrower reading.
+//! an innocuously named value is judged by the same wide reading, not a narrower
+//! one.
 //!
 //! `record_finding` is a thin wrapper over [`aitm_findings::DiskFindingStore`]:
 //! the store itself scrubs `title`/`notes` of credential material before
@@ -1565,6 +1566,15 @@ mod tests {
             .collect()
     }
 
+    /// Every prefix of `text` that ends on a char boundary, the empty one and
+    /// `text` itself included: what a connection that drops mid-stream hands over.
+    fn prefixes(text: &str) -> impl Iterator<Item = &str> {
+        text.char_indices()
+            .map(|(at, _)| at)
+            .chain(std::iter::once(text.len()))
+            .map(move |cut| &text[..cut])
+    }
+
     /// A parameter whose name only contains one of the short secret words
     /// (`author` holds `auth`) is placeholdered in a PoC and never recorded.
     #[test]
@@ -1786,6 +1796,7 @@ mod tests {
             "{\"sid\":\"[redacted]\",\"jwt\":\"[redacted]\",\"csrf\":\"[redacted]\"}",
         ),
         ("sid=\"abc", "sid=\"[redacted]"),
+        // rows in this group record a tail the shared value rule leaves beside the mask; they pin the unchanged behaviour of the standard scan, they are not requirements
         ("sid='abc def", "sid='[redacted] def"),
         (
             "subsidiary=\"acme corp\"&x=1",
@@ -1910,6 +1921,7 @@ mod tests {
             "/cb?redirect=http://t/x?token=[redacted]&csrf=[redacted]",
         ),
         ("/cb?q=a b&sid=S1", "/cb?q=a b&sid=[redacted]"),
+        // rows in this group record a tail the shared value rule leaves beside the mask; they pin the unchanged behaviour of the standard scan, they are not requirements
         ("/cb?sid=a b c&x=1", "/cb?sid=[redacted] b c&x=1"),
         ("/cb?note=100%&sid=S1", "/cb?note=100%&sid=[redacted]"),
         (
@@ -1943,6 +1955,7 @@ mod tests {
         ("sid=\\", "sid=[redacted]"),
         ("'", "'"),
         ("\"", "\""),
+        // rows in this group record a tail the shared value rule leaves beside the mask; they pin the unchanged behaviour of the standard scan, they are not requirements
         ("auth==\"x\"", "auth=[redacted]\"x\""),
         ("sid=a=b=c", "sid=[redacted]"),
         ("&&&sid=1&&&", "&&&sid=[redacted]&&&"),
@@ -1953,6 +1966,7 @@ mod tests {
         ("sid = ", "sid = "),
         ("sid\t=\tabc", "sid\t=\t[redacted]"),
         ("sid=a\0b", "sid=[redacted]"),
+        // rows in this group record a tail the shared value rule leaves beside the mask; they pin the unchanged behaviour of the standard scan, they are not requirements
         ("sid=a\rb", "sid=[redacted]\rb"),
         ("sid=a\u{c}b", "sid=[redacted]\u{c}b"),
         ("sid:\nabc", "sid:\n[redacted]"),
@@ -2107,14 +2121,10 @@ mod tests {
         // neither the password nor any canary value survives.
         let doc = "//auth:pw@host/x?sid=QQQQ&author=QQQQ";
         let mut bad: Vec<(usize, String)> = Vec::new();
-        for cut in doc
-            .char_indices()
-            .map(|(at, _)| at)
-            .chain(std::iter::once(doc.len()))
-        {
-            let out = scrub_embedded(&doc[..cut]);
+        for prefix in prefixes(doc) {
+            let out = scrub_embedded(prefix);
             if out.contains('Q') || out.contains("pw") {
-                bad.push((cut, out));
+                bad.push((prefix.len(), out));
             }
         }
         assert!(

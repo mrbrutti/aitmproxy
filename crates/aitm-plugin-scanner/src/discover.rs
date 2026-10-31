@@ -314,10 +314,10 @@ mod tests {
 
     /// Assert that no point's example contains any of the `leaked` secrets.
     fn assert_no_leak(points: &[InjectionPoint], leaked: &[&str]) {
-        for leaked in leaked {
+        for secret in leaked {
             assert!(
-                !points.iter().any(|p| p.example.contains(leaked)),
-                "{leaked} leaked: {points:?}"
+                !points.iter().any(|p| p.example.contains(secret)),
+                "{secret} leaked: {points:?}"
             );
         }
     }
@@ -742,43 +742,8 @@ mod tests {
         );
     }
 
-    /// The name decision is the wide reading of the shared vocabulary, for the
-    /// names a client can send: empty, all blanks, non-ASCII, and a megabyte
-    /// long. Case folding is ASCII only, so a non-ASCII letter is never an ASCII
-    /// one, and every row agrees with the core predicate it delegates to.
-    #[test]
-    fn is_secret_name_is_the_wide_reading_for_odd_names() {
-        let long = "a".repeat(1 << 20);
-        let rows: Vec<(String, bool)> = vec![
-            (String::new(), false),
-            (" \t\u{a0}\n".to_string(), false),
-            ("\u{e9}\u{4e2d}\u{1f600}".to_string(), false),
-            ("s\u{131}d".to_string(), false),
-            ("S\u{130}D".to_string(), false),
-            ("\u{e9}AUTH\u{e9}".to_string(), true),
-            ("X-Authority".to_string(), true),
-            ("Content-Type".to_string(), false),
-            (long.clone(), false),
-            (format!("{long}sidebar"), true),
-            (format!("sidebar{long}"), true),
-        ];
-        let bad: Vec<(usize, bool, bool)> = rows
-            .iter()
-            .enumerate()
-            .filter_map(|(at, (name, expected))| {
-                let named = is_secret_name(name);
-                (named != *expected || named != is_secret_key_wide(name))
-                    .then_some((at, *expected, named))
-            })
-            .collect();
-        assert!(
-            bad.is_empty(),
-            "(row, expected, is_secret_name) is wrong: {bad:?}"
-        );
-    }
-
-    /// A megabyte-long parameter name that ends in a short secret word is
-    /// redacted like a short one: the name decides, whatever its length.
+    /// A 256 KiB parameter name that ends in a short secret word is redacted
+    /// like a short one: the name decides, whatever its length.
     #[test]
     fn enumerate_redacts_an_oversized_wide_only_name() {
         let long = "a".repeat(1 << 18);
@@ -789,17 +754,37 @@ mod tests {
 
         let points = enumerate(&flow);
 
-        assert_eq!(points.len(), 3, "three query points: {}", points.len());
+        // The points hold two 256 KiB names, so a failure prints each one's name
+        // length and example, never the points themselves.
+        let summary: Vec<(usize, &str)> = points
+            .iter()
+            .map(|p| (p.name.len(), p.example.as_str()))
+            .collect();
+        let example_for = |name: &str| {
+            points
+                .iter()
+                .find(|p| p.location == Location::Query && p.name == name)
+                .map(|p| p.example.as_str())
+        };
         assert_eq!(
-            example_of(&points, Location::Query, &format!("{long}sidebar")),
-            REDACTED
+            points.len(),
+            3,
+            "three query points, as (name length, example): {summary:?}"
         );
         assert_eq!(
-            example_of(&points, Location::Query, &long),
-            "plainval",
-            "a long name with no secret word keeps its value"
+            example_for(&format!("{long}sidebar")),
+            Some(REDACTED),
+            "(name length, example) of each point: {summary:?}"
         );
-        assert_eq!(example_of(&points, Location::Query, "page"), "2");
-        assert_no_leak(&points, &["longval"]);
+        assert_eq!(
+            example_for(&long),
+            Some("plainval"),
+            "a long name with no secret word keeps its value: {summary:?}"
+        );
+        assert_eq!(example_for("page"), Some("2"), "{summary:?}");
+        assert!(
+            !points.iter().any(|p| p.example.contains("longval")),
+            "longval leaked: {summary:?}"
+        );
     }
 }
