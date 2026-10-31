@@ -614,6 +614,12 @@ Kept by the main session during stage 6. One row per finding.
 | whole branch | Quality | Minor | Process/role narration in comments ("Task N", "Tester"); stale "The 59 commands" on `aitm_tui::CORE_TOOLS`; a fully qualified `CaptureStatusReader` in `feeder::tests`. | fixed in 9892258 |
 | whole branch | Quality | Minor | `last_handoff_at_ms` round-tripped through the `0` sentinel in `to_value()`. | fixed in 9892258 (`map_or(Value::Null, millis_value)`) |
 | whole branch | Spec | Minor | Spec Non-goals ("nothing in `crates/aitm-tui`") contradicted the amended CS-AC1 after d59abdb. | fixed by the orchestrator in the spec (Non-goals carve-out for the tool-set contract), committed with this log |
+| fix 9892258 | Quality (re-review) | Minor | `stale_guard_does_not_clear_a_newer_attachment` asserted `(0, 0)` counters after the stale drop, which cannot fail (the newer attach had just zeroed them). | fixed in 46901f8 (tester: `stale_guard_drop_preserves_the_newer_attachments_handoffs` records handoffs before the stale drop; mutation check: guard removed → 2 failures) |
+| fix 9892258 | Quality (re-review) | Minor | The literal derivation table pins wire names only; `FeederOff("not started")`'s reason text and the `capability_reason == feeder.reason` rule lost their matrix-wide oracle. | fixed in 46901f8 (tester: `capability_reason_is_the_feeder_reason_wherever_it_is_set`, 39 rows + the four `OffReason` literals) |
+| fix 9892258 | Quality (re-review) | Minor | One object builder under two names (`object` in `status::tests`, the `obj` re-export in `feeder::tests`). | accepted by the orchestrator 2026-10-31 (autonomous mode): style only, both names resolve to the one `pub(crate) fn object`; unify in the next touch of these test modules |
+| fix 9892258 | Security (re-review) | — | Both prior Minors verified closed (D4 text in the Swift comment; generation guard with no new lock on the hot path, poisoning recovery and `stopped()`/`Drop` convergence intact); no new findings. | PASS, nothing open |
+| fix 9892258 + merge 2475e05 | Spec (re-review) | — | Non-goals carve-out resolves the prior Minor; the fix stayed within its allowed files; `pub(crate) object` judged within the finding's remit; merge of main 1854fae is the pure merge-tree result and alters no spec-pinned behaviour. | PASS, nothing open |
+| whole branch | Tester (re-check) | — | Fix range re-checked on 2475e05; generation guard proven by mutation (guard removed → 2 failures); three tests added. | PASS; tests in 46901f8 |
 
 ## Shipped
 
