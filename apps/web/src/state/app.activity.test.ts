@@ -9,6 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createAppStore } from './app';
 import { AGENT_LINE, bridgeBus, tick, type TestBus } from './bridgeBus.testkit';
+import { filterActivity } from '~/panels/agent/activity';
 
 const T0 = AGENT_LINE.at; // 1730000000000 = 2024-10-27T03:33:20.000Z
 /** This UI's own poll, echoed back: unlabelled (the bridge labels nothing), our origin, a background read that succeeded. */
@@ -115,6 +116,32 @@ describe('app store — activity intake', () => {
     bus.emit('notifications/aitm/agent', ownPoll(3)); // the genuine unlabelled bridge line is still dropped
 
     expect(app.proxy.activity.map((e) => `${e.origin}/${e.clientLabel}/${e.command}`)).toEqual(['operator/aitm-web/flow.list', 'mcp/aitm-web/flow.list']);
+  });
+
+  // The poll reads a row as `flow.detail {id, body:'none'}` (`fetchRows`); the inspector's click reads
+  // the same flow as `flow.detail {id}`, bodies included. Both are echoed back as our own origin, and
+  // only the poll's exact shape is noise: the operator's click is an action the panel exists to show.
+  it("an own-origin flow.detail is dropped in the poll shape and kept as the inspector's click", async () => {
+    const { bus, app } = start();
+    await tick(200);
+    const detail = (i: number, args: string) => ({ at: T0 + i, origin: 'operator', client_label: null, command: 'flow.detail', args, result: 'ok' });
+
+    bus.emit('notifications/aitm/agent', detail(1, '{"id":"f_1","body":"none"}')); // the poll: dropped
+    expect(app.proxy.activity).toEqual([]);
+
+    bus.emit('notifications/aitm/agent', detail(2, '{"id":"f_1"}')); // the inspector: kept
+    expect(app.proxy.activity).toEqual([
+      { seq: 1, at: '2024-10-27T03:33:20.002Z', origin: 'operator', clientLabel: null, command: 'flow.detail', args: { id: 'f_1' }, result: 'ok' },
+    ]);
+
+    bus.emit('notifications/aitm/agent', detail(3, '{"id":"f_1","body":"none"}')); // the poll again: still dropped
+    bus.emit('notifications/aitm/agent', detail(4, '{"id":"f_1","body":"full"}')); // a content read: kept
+    bus.emit('notifications/aitm/agent', detail(5, '{"id":"f_1","body":"none"')); // unparseable args stay text: kept
+    expect(app.proxy.activity.map((e) => [e.seq, e.args])).toEqual([
+      [1, { id: 'f_1' }],
+      [2, { id: 'f_1', body: 'full' }],
+      [3, '{"id":"f_1","body":"none"'],
+    ]);
   });
 
   it('an approval request line is ignored', async () => {
@@ -224,6 +251,53 @@ describe('app store — activity intake', () => {
 
     expect(app.proxy.activity).toHaveLength(1);
     expect(app.proxy.activity[0]!.command).toBe('flow.replay');
+  });
+
+  // The `{lagged:true}` marker says the server's lane for this connection overflowed and dropped
+  // notifications, audit lines among them (spec D7, fourth amendment). The operator must see the gap:
+  // one synthetic error row goes straight into the log (it is not an audit line and skips the noise
+  // rule), on top of the flow resync the marker already triggers; the Errors chip shows it.
+  it('a lagged marker appends one visible gap row', async () => {
+    vi.setSystemTime(T0);
+    const { bus, app } = start();
+    await tick(200);
+    const lists = bus.count('flow.list');
+
+    bus.emit('notifications/aitm/state', { lagged: true });
+    await tick(50);
+
+    const marker = {
+      seq: 1,
+      origin: 'operator',
+      command: 'audit-log',
+      result: 'error',
+      at: '2024-10-27T03:33:20.200Z', // T0 + the 200 ms of bootstrap: when the marker landed
+      detail: 'the push stream lagged: some audit lines may be missing from this log',
+    };
+    expect(app.proxy.activity).toEqual([marker]);
+    expect(app.proxy.activity[0]!.result).toBe('error');
+    // The Errors filter is `result === 'error'` (panels/agent/activity.ts): the row is one chip away.
+    expect(filterActivity(app.proxy.activity, { kind: 'errors', query: '', clearedThrough: 0 })).toEqual([marker]);
+    // Still a resync, still not state.
+    expect(bus.count('flow.list')).toBe(lists + 1);
+    expect(app.proxy.listening).toBe(true);
+    expect(app.proxy.armed).toBe(false);
+
+    // Two markers are two gaps: appended and numbered, never folded into one.
+    bus.emit('notifications/aitm/state', { lagged: true });
+    expect(app.proxy.activity.map((e) => [e.seq, e.command, e.result])).toEqual([
+      [1, 'audit-log', 'error'],
+      [2, 'audit-log', 'error'],
+    ]);
+
+    // The marker row is capped like every other line: 500 kills push the two markers out, a third
+    // marker pushes the oldest kill out and is the newest row.
+    for (let i = 0; i < 500; i++) bus.emit('notifications/aitm/agent', ownKill(i));
+    bus.emit('notifications/aitm/state', { lagged: true });
+    const list = app.proxy.activity;
+    expect(list).toHaveLength(500);
+    expect(list[0]).toMatchObject({ seq: 4, command: 'flow.kill', args: { id: 'f_1' } });
+    expect(list[499]).toMatchObject({ seq: 503, command: 'audit-log', result: 'error' });
   });
 
   // Audit lines carry what other clients sent (`args` echoes an agent's tool arguments), so the intake

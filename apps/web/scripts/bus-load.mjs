@@ -166,6 +166,24 @@ export function redactUrl(raw) {
   return `${u.protocol}//${u.host}${u.pathname}`;
 }
 
+/**
+ * The "unknown argument" error for what `parseArgs` could not consume. Only flag-like tokens
+ * (leading `-`) are named, cut at any `=`; everything else is a value and is counted, never
+ * echoed: a mistyped `--tokn SECRET` (or `--token=SECRET`) must not put the token in a log line.
+ */
+export function describeLeftoverArgs(args) {
+  const flags = [];
+  let values = 0;
+  for (const a of args) {
+    const s = String(a);
+    if (s.startsWith('-')) flags.push(s.replace(/=[\s\S]*$/, '=<value>'));
+    else values++;
+  }
+  const hidden = values ? `${values} value${values === 1 ? '' : 's'} not shown` : '';
+  const shown = flags.join(' ');
+  return `unknown argument(s): ${shown && hidden ? `${shown} (${hidden})` : shown || hidden}`;
+}
+
 const sum = (o) => Object.values(o).reduce((a, b) => a + b, 0);
 
 /**
@@ -196,10 +214,12 @@ export function assessWindow(name, w, uiOrigin) {
 }
 
 /**
- * The run's verdict for the JSON and the exit code: `valid` iff no measured window has a fatal
- * reason (a skipped window, null, is not judged); `warnings` lists every reason, idle first.
+ * The run's verdict for the JSON and the exit code: `valid` iff at least one window was measured
+ * and no measured window has a fatal reason (a skipped window, null, is not judged; both skipped
+ * is no measurement at all); `warnings` lists every reason, idle first.
  */
 export function assessRun({ idle, traffic }, uiOrigin) {
+  if (!idle && !traffic) return { valid: false, warnings: ['no window was measured'] };
   const warnings = [];
   let valid = true;
   for (const [name, w] of [
@@ -214,9 +234,27 @@ export function assessRun({ idle, traffic }, uiOrigin) {
   return { valid, warnings };
 }
 
+/** The first line a run prints. The bus URL in it is the redacted form, never the raw option. */
+export function headerLine(o, role) {
+  return `bus-load${o.label ? ` (${o.label})` : ''} · ui origin ${o.uiOrigin} · bus ${redactUrl(o.url)} · proxy ${o.proxy} · script role ${role ?? '?'}`;
+}
+
+/** The process exit code for a finished run: 3 when its numbers are unusable (`valid: false`), else 0. */
+export function exitCodeFor({ valid }) {
+  return valid ? 0 : 3;
+}
+
+/** The run's closing line: an unusable run says so (stderr, see `main`); a usable one mentions any advisories. */
+export function verdictLine(out) {
+  const n = out.warnings.length;
+  if (!out.valid) return `bus-load: run INVALID, the numbers above are not usable (${n} warning(s) above); exit ${exitCodeFor(out)}`;
+  return `run: valid${n ? ` (${n} advisory warning(s) above)` : ''}`;
+}
+
 // ---------------------------------------------------------------------------------------------
-// --selftest: the canned window from the plan (Task 0), the collector, the URL redaction and the
-// validity decision; exact lines, exit code
+// --selftest: the canned window from the plan (Task 0), the collector, the URL redaction, the
+// leftover-argv message, the validity decision and main's header/verdict/exit-code wiring; exact
+// lines, exit code
 // ---------------------------------------------------------------------------------------------
 
 function selftest() {
@@ -307,6 +345,25 @@ function selftest() {
     expectEq('non-string is not echoed', redactUrl(undefined), '<unparseable url>');
   });
 
+  // A mistyped `--tokn SECRET` leaves SECRET in the leftover argv; the error must name the flag, never the value.
+  run('leftover argv: flag-like tokens are named, values are counted and never echoed', () => {
+    expectEq('mistyped flag and its value', describeLeftoverArgs(['--tokn', 'SECRET']), 'unknown argument(s): --tokn (1 value not shown)');
+    expectEq('two flags, two values', describeLeftoverArgs(['--tokn', 'SECRET', '--labl', 'x']), 'unknown argument(s): --tokn --labl (2 values not shown)');
+    expectEq('a lone value', describeLeftoverArgs(['SECRET']), 'unknown argument(s): 1 value not shown');
+    expectEq('flag=value keeps the flag only', describeLeftoverArgs(['--token=SECRET']), 'unknown argument(s): --token=<value>');
+    expectEq('flags only', describeLeftoverArgs(['--foo', '-x']), 'unknown argument(s): --foo -x');
+    expectEq('nothing left over', describeLeftoverArgs([]), 'unknown argument(s): ');
+    // The wiring: parseArgs throws that text, so the value never reaches a log line.
+    let msg = '';
+    try {
+      parseArgs(['--tokn', 'SECRET']);
+    } catch (e) {
+      msg = e.message;
+    }
+    expectEq('parseArgs names the flag', msg, 'unknown argument(s): --tokn (1 value not shown)');
+    expectEq('parseArgs never echoes the value', msg.includes('SECRET'), false);
+  });
+
   run('run validity: which window, request and lag conditions make a run unusable, and the warnings listed', () => {
     const window = (total, otherOrigins = {}, lagged = 0, extra = {}) => ({
       total,
@@ -318,6 +375,7 @@ function selftest() {
     const LAGGED_1 = "traffic: the script's own subscription lagged 1x; audit lines were dropped and the counts are a floor";
     const NO_LINES = 'idle: no audit lines arrived during the window; is the page open and connected to this server?';
     const SOME_FAILED = 'traffic: 3 of 600 requests failed; first error: timeout through proxy';
+    const NO_WINDOW = 'no window was measured';
 
     expectEq('healthy idle', assessWindow('idle', window(75), 'mcp'), { fatal: [], advisory: [] });
     expectEq('no lines at all', assessWindow('idle', window(0), 'mcp'), { fatal: [NO_LINES], advisory: [] });
@@ -343,7 +401,9 @@ function selftest() {
     });
 
     expectEq('both windows healthy', assessRun({ idle: window(75), traffic: window(600, {}, 0, { requests: requests(600, 0) }) }, 'mcp'), { valid: true, warnings: [] });
-    expectEq('skipped windows are not judged', assessRun({ idle: null, traffic: null }, 'mcp'), { valid: true, warnings: [] });
+    // A skipped window (null) is not judged, but a run that skipped BOTH measured nothing.
+    expectEq('one skipped window is fine', assessRun({ idle: window(75), traffic: null }, 'mcp'), { valid: true, warnings: [] });
+    expectEq('both windows skipped is not a measurement', assessRun({ idle: null, traffic: null }, 'mcp'), { valid: false, warnings: [NO_WINDOW] });
     expectEq('one lagged window invalidates', assessRun({ idle: window(75), traffic: window(600, {}, 1, { requests: requests(600, 0) }) }, 'mcp'), { valid: false, warnings: [LAGGED_1] });
     expectEq('an empty idle window invalidates', assessRun({ idle: window(0), traffic: null }, 'mcp'), { valid: false, warnings: [NO_LINES] });
     expectEq('advisory alone keeps the run valid', assessRun({ idle: null, traffic: window(600, {}, 0, { requests: requests(597, 3, 'timeout through proxy') }) }, 'mcp'), { valid: true, warnings: [SOME_FAILED] });
@@ -360,6 +420,25 @@ function selftest() {
         ],
       },
     );
+  });
+
+  // The parts of main() that decide what is printed and what the process exits with, without a network.
+  run('main wiring: the header line is redacted, the verdict line and exit code follow the run validity', () => {
+    const o = { label: 'after', uiOrigin: 'mcp', url: 'ws://user:pw@127.0.0.1:8082/bus?t=secret#frag', proxy: '127.0.0.1:8080' };
+    const header = headerLine(o, 'agent');
+    expectEq('header', header, 'bus-load (after) · ui origin mcp · bus ws://127.0.0.1:8082/bus · proxy 127.0.0.1:8080 · script role agent');
+    expectEq('header carries no userinfo or query', header.includes('secret') || header.includes('user:pw'), false);
+    expectEq(
+      'header without a label or a role',
+      headerLine({ ...o, label: null, url: 'ws://127.0.0.1:8082/bus' }, null),
+      'bus-load · ui origin mcp · bus ws://127.0.0.1:8082/bus · proxy 127.0.0.1:8080 · script role ?',
+    );
+    expectEq('exit 0 when valid', exitCodeFor({ valid: true, warnings: [] }), 0);
+    expectEq('exit 0 when valid with advisories', exitCodeFor({ valid: true, warnings: ['traffic: 3 of 600 requests failed; first error: x'] }), 0);
+    expectEq('exit 3 when invalid', exitCodeFor({ valid: false, warnings: ['no window was measured'] }), 3);
+    expectEq('verdict when valid', verdictLine({ valid: true, warnings: [] }), 'run: valid');
+    expectEq('verdict when valid with advisories', verdictLine({ valid: true, warnings: ['a', 'b'] }), 'run: valid (2 advisory warning(s) above)');
+    expectEq('verdict when invalid', verdictLine({ valid: false, warnings: ['a'] }), 'bus-load: run INVALID, the numbers above are not usable (1 warning(s) above); exit 3');
   });
 
   if (failures.length) {
@@ -393,8 +472,9 @@ const HELP = `usage: AITM_WEB_TOKEN=T node apps/web/scripts/bus-load.mjs [option
   -h, --help           this text
 
 Exit codes: 0 ok · 1 error · 2 bad arguments · 3 the run finished but its numbers are unusable (a
-window with no audit line of the UI's origin, no request through the proxy, or a lagged
-subscription; the tables still print, the JSON carries valid:false and the reasons in warnings).
+window with no audit line of the UI's origin, no request through the proxy, a lagged
+subscription, or both windows skipped; the tables still print, the JSON carries valid:false and
+the reasons in warnings).
 
 Setup (the loopback origin must be in scope; --config is the FIRST aitm argument):
   printf 'listen: 127.0.0.1:8080\\nscope:\\n  entries:\\n    - "127.0.0.1"\\n' > $TMPDIR/aitm-load.yaml
@@ -442,7 +522,7 @@ function parseArgs(argv) {
     json: opt('json', null),
     seed: num('seed', null),
   };
-  if (args.length) throw new Error(`unknown argument(s): ${args.join(' ')}`);
+  if (args.length) throw new Error(describeLeftoverArgs(args));
   if (!['mcp', 'operator'].includes(o.uiOrigin)) throw new Error(`--ui-origin must be mcp or operator, got ${o.uiOrigin}`);
   return o;
 }
@@ -721,7 +801,7 @@ async function main(o) {
     traffic: null,
     flowList: null,
   };
-  console.log(`bus-load${o.label ? ` (${o.label})` : ''} · ui origin ${o.uiOrigin} · bus ${shownUrl} · proxy ${o.proxy} · script role ${out.role ?? '?'}`);
+  console.log(headerLine(o, out.role));
   try {
     // The audit stream only reaches subscribed connections (server.rs push_agent -> fanout_state),
     // so without this subscription there is nothing to count.
@@ -797,12 +877,9 @@ async function main(o) {
     writeFileSync(o.json, JSON.stringify(out, null, 2) + '\n');
     console.log(`json: ${o.json}`);
   }
-  if (!out.valid) {
-    console.error(`bus-load: run INVALID, the numbers above are not usable (${out.warnings.length} warning(s) above); exit 3`);
-    return 3;
-  }
-  console.log(`run: valid${out.warnings.length ? ` (${out.warnings.length} advisory warning(s) above)` : ''}`);
-  return 0;
+  const code = exitCodeFor(out);
+  (code === 0 ? console.log : console.error)(verdictLine(out));
+  return code;
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {

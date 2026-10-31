@@ -14,7 +14,7 @@ REAL /bus bridge, as the agent token (the `aitm web --token` value):
   2. a flow push summary is exactly {id, kind, method, authority, path, status}
      with kind "http"                                        (server.rs flow_summary)
   3. flow.detail {id, body:"none"} returns kind "http" with request, client_conn,
-     meta                                                    (detail.rs detail)
+     meta, and its `id` is the requested one                 (detail.rs detail)
   4. the UI's own flow.list is audited and pushed back as a notifications/aitm/agent
      line {at:int, origin:"mcp", client_label:null, command, args:str, result:"ok"}
                                                    (server.rs record_audit, audit.rs)
@@ -123,6 +123,13 @@ def main() -> int:
               f"flow.detail kind is 'http' (got {detail.get('kind') if isinstance(detail, dict) else detail!r})")
         for key in ("request", "client_conn", "meta"):
             check(isinstance(detail, dict) and key in detail, f"flow.detail carries `{key}`")
+        # The UI discards a reply that does not name the requested id (spec D3, after
+        # review round 1), so the row must carry it: `detail` always inserts `id` =
+        # the looked-up flow's id (crates/aitm-plugins/src/detail.rs:152) and the
+        # lookup is by the requested `id` (detail.rs:112-117), so the two are equal.
+        check(isinstance(detail, dict) and detail.get("id") == fid,
+              f"flow.detail reply names the requested flow id {fid!r} "
+              f"(got {detail.get('id') if isinstance(detail, dict) else detail!r})")
 
         section("4. the UI's own flow.list comes back as an audit line in the server shape")
         ws.call("flow.list")
@@ -144,13 +151,16 @@ def main() -> int:
         check(is_int(a.get("at")), f"agent line `at` is an integer (epoch ms), got {a.get('at')!r}")
         check(a.get("origin") == "mcp",
               f"agent line origin is 'mcp' (the --token value is the agent token), got {a.get('origin')!r}")
-        # Pins the fact the UI's noise rule rests on: the /bus bridge mints its
+        # Pins the fact the UI's noise rule rests on: the /bus bridge mints its one
         # ConnCtx with `client_label: None` (crates/aitm/src/web/bridge.rs:251-257),
-        # so the UI's own audit lines carry `client_label: null`, never "aitm-web",
-        # and `isUiPollNoise` (apps/web/src/panels/agent/activity.ts) has to infer
-        # own-ness from `origin` + command (spec D7, R2). A server fix that labels
-        # bridge connections (copying initialize.clientInfo.name) SHOULD fail this
-        # check; when it does, tighten `isUiPollNoise` to the label alone.
+        # so bridge audit lines are unlabelled and the UI's own lines carry
+        # `client_label: null`, never "aitm-web". The rule (`isUiPollNoise`,
+        # apps/web/src/bus/noise.ts) therefore infers own-ness from `origin` +
+        # command (spec D7, R2). If a server change starts labelling bridge
+        # connections this check fails on purpose: revisit D7 then. The follow-up
+        # is a SERVER-assigned connection id on audit lines, NOT trusting a
+        # client-declared label (initialize.clientInfo.name is forgeable; spec D7
+        # third amendment).
         check("client_label" in a and a["client_label"] is None,
               f"agent line client_label is null over /bus (got {a.get('client_label', '<absent>')!r})")
         check(a.get("command") == "flow.list", f"agent line command is 'flow.list', got {a.get('command')!r}")

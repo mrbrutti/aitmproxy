@@ -149,6 +149,9 @@ export function createWsBus(opts: WsBusOptions): BusClient {
       } catch {
         continue;
       }
+      // `JSON.parse` also yields `null`, arrays and bare scalars; none is a message, and `null` would
+      // throw on the property reads below, outside the handler try/catch, and lose the rest of the frame.
+      if (!msg || typeof msg !== 'object' || Array.isArray(msg)) continue;
       if (typeof msg.method === 'string' && msg.id === undefined) {
         for (const h of handlers) {
           // A handler is the store's code. One that throws must not take the other handlers down, nor

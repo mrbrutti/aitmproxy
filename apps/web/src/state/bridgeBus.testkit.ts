@@ -125,10 +125,11 @@ export function bridgeBus(address = '127.0.0.1:8082'): TestBus {
     if (tool !== 'flow.detail') return mock.call<T>(tool, args);
     peak.detail = Math.max(peak.detail, ++detailInFlight);
     try {
-      const gate = ctl.holdReply.get(args.id as string);
-      if (gate) ctl.holdReply.delete(args.id as string);
+      // `held` is the test's promise for this id (made with `gate()` above), used once.
+      const held = ctl.holdReply.get(args.id as string);
+      if (held) ctl.holdReply.delete(args.id as string);
       const reply = await mock.call<T>(tool, args);
-      if (gate) await gate;
+      if (held) await held;
       return reply;
     } finally {
       detailInFlight--;

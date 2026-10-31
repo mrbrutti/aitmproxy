@@ -520,6 +520,37 @@ describe('createWsBus subscribes on every open', () => {
     expect(await outcome(call)).toEqual({ ok: ['f_1'] });
   });
 
+  // `JSON.parse` accepts `null`, arrays and bare scalars; none is a JSON-RPC message. A `null` line used
+  // to throw on `msg.method` outside the handler try/catch and take the rest of the frame down with it,
+  // including the reply riding behind it. Such lines are skipped: no handler runs, nothing resolves.
+  it('a_null_array_or_scalar_line_is_skipped_and_the_reply_behind_it_still_lands', async () => {
+    const client = bus();
+    const h = vi.fn();
+    client.onNotification(h);
+    const sock = await handshake(client);
+    const { id } = await toolCallSent(sock, 'flow.subscribe');
+
+    // `null` ahead of the subscribe reply that gates `open`.
+    sock.onmessage?.({
+      data: ['null', JSON.stringify({ jsonrpc: '2.0', id, result: { structuredContent: { sub_id: 1 } } })].join('\n') + '\n',
+    });
+    await vi.waitFor(() => expect(client.state()).toBe('open'));
+
+    // Once open: null, an array, a bare number, a string and a boolean ahead of a call's reply.
+    const call = client.call<string[]>('flow.list');
+    const { id: listId } = await toolCallSent(sock, 'flow.list');
+    sock.onmessage?.({
+      data:
+        ['null', '[1,2]', '42', '"text"', 'true', JSON.stringify({ jsonrpc: '2.0', id: listId, result: { structuredContent: ['f_1'] } })].join(
+          '\n',
+        ) + '\n',
+    });
+    expect(await outcome(call)).toEqual({ ok: ['f_1'] });
+    expect(h).not.toHaveBeenCalled();
+    expect(client.lastError()).toBe(null);
+    expect(client.state()).toBe('open');
+  });
+
   it('notifications_before_the_subscribe_reply_reach_handlers', async () => {
     const client = bus();
     const h = vi.fn();

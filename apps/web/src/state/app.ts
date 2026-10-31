@@ -154,8 +154,11 @@ export function createAppStore(bus: BusClient) {
     // ---- flows ------------------------------------------------------------
     const entries: FlowEntry[] = [];
     const byId = new Map<FlowId, FlowEntry>();
-    // Push / poll state, declared together and ahead of every reader: `clearFlows` (just below) drops
-    // the pending set and its timer long before the coalescer and the loop are defined.
+    // What lives here: the push coalescer's queue, timer and flags, the row-fetch tickets and the clear
+    // epoch, and the single-flight poll slot. It is declared ahead of `clearFlows` (just below), which
+    // drops the pending set and bumps the epoch long before the coalescer and the loop are defined.
+    // The loop's own state (`failedAt`, `backlog`, `toolsLoaded`, the push clocks, `lastPollAt`,
+    // `lastStatusAt`) is declared with the loop, after the notification handler.
     /** Ids a flow push named that the coalescer has not fetched yet, in first-notification (capture) order. */
     const pushPending = new Set<FlowId>();
     /** The armed coalescing timer, if any (`armPush`). */
@@ -365,7 +368,7 @@ export function createAppStore(bus: BusClient) {
       return true;
     }
 
-    /** Newest audit lines the log keeps. Counted after the noise filter, so it measures what is shown. */
+    /** Newest lines kept (after the push-path filter); a snapshot is capped unfiltered. */
     const ACTIVITY_CAP = 500;
     /**
      * The one intake behind the live push (`append`) and the `agent.activity` snapshot (`replace`)
@@ -389,11 +392,36 @@ export function createAppStore(bus: BusClient) {
         if (mode === 'append' && isUiPollNoise(e, own)) continue;
         kept.push({ ...e, seq: ++activitySeq });
       }
+      commitActivity(kept, mode);
+    }
+    /** Append to (or replace) the log with already-numbered rows and keep the newest ACTIVITY_CAP; nothing kept, nothing changed. */
+    function commitActivity(kept: readonly ActivityEntry[], mode: 'append' | 'replace') {
       if (!kept.length) return;
       setProxy('activity', (list) => {
-        const next = mode === 'replace' ? kept : [...list, ...kept];
+        const next = mode === 'replace' ? [...kept] : [...list, ...kept];
         return next.length > ACTIVITY_CAP ? next.slice(-ACTIVITY_CAP) : next;
       });
+    }
+    /**
+     * The `lagged` marker means the server dropped notifications for this connection, audit lines among
+     * them. The gap is made visible as one synthetic error row (an `audit-log` line of our own, not an
+     * audit entry, so it never meets the noise rule); the lost lines themselves cannot be recovered over
+     * `aitm web` (push spec D7, fourth amendment).
+     */
+    function noteAuditGap() {
+      commitActivity(
+        [
+          {
+            seq: ++activitySeq,
+            origin: 'operator',
+            command: 'audit-log',
+            result: 'error',
+            at: new Date().toISOString(),
+            detail: 'the push stream lagged: some audit lines may be missing from this log',
+          },
+        ],
+        'append',
+      );
     }
 
     function onAgent(a: unknown) {
@@ -428,9 +456,11 @@ export function createAppStore(bus: BusClient) {
             // The server's lane for this connection overflowed and dropped notifications. The marker
             // is not state and proves nothing about the flow stream: push is distrusted until the next
             // flow notification, and the list is resynced now, not on the next tick. The server pushes
-            // no state, so nothing in the status was lost and that clock is left alone.
+            // no state, so nothing in the status was lost and that clock is left alone. Audit lines
+            // were lost too and cannot be re-read: the log gets one row that says so.
             lastFlowPushAt = Number.NEGATIVE_INFINITY;
             requestPollNow();
+            noteAuditGap();
             break;
           }
           // Only a complete payload is a state push: the clock moves only when one was applied.
