@@ -524,14 +524,22 @@ impl Subscriptions {
     /// setting the sink's own overflow flag, because the next `drain` would write
     /// that flag while the policy is still muted and leak a bit under pause. The
     /// policy is read once, under the registry lock, so one snapshot covers every
-    /// subscription and the read is as late as it can be. `wants` is tested first,
-    /// so a connection is marked only when a line it would have received was
-    /// suppressed. A connection gets the line at most once per call, and a due
-    /// `lagged` marker precedes it. The once-per-call de-dup is a `HashSet`, so a
-    /// fan-out is O(subscriptions) under the lock, and a connection is recorded as
-    /// seen only after `wants` has passed, never before: recording first would let a
-    /// non-matching subscription mask a later matching one on the same connection,
-    /// a silent missed delivery.
+    /// subscription and the read is as late as it can be. A connection gets the line
+    /// at most once per call, and a due `lagged` marker precedes it.
+    ///
+    /// Ordering rule: `wants` is tested before any per-connection bookkeeping (the
+    /// `seen` insert and the `gapped` record), so a connection is recorded only for
+    /// a line it would have received. Recording first would let a non-matching
+    /// subscription mask a later matching one on the same connection, a silent
+    /// missed delivery.
+    ///
+    /// Cost under the lock: the once-per-call de-dup is a `HashSet`, so the `seen`
+    /// check is O(1) per subscription. The `gapped` bookkeeping is not: it is a
+    /// linear scan per connection delivered to or muted while any gap is recorded,
+    /// and a gap entry stays until that connection is next delivered a line or
+    /// ends. So a fan-out is O(subscriptions) under the lock only while no gap is
+    /// recorded. Converting `gapped` to a `HashSet` is a known follow-up (the
+    /// `gapped` scan in the bus-hardening spec's residuals).
     ///
     /// A mute stops new lines, not everything already in motion. These are accepted:
     ///
@@ -3020,12 +3028,15 @@ mod tests {
         assert_eq!(operators[0].drain(), vec!["operator-line".to_string()]);
     }
 
-    /// Bus-hardening D2: in `fanout_role` the connection is recorded as seen only
-    /// after one of its subscriptions has passed the role test (the same trap as
-    /// the filter one in `fanout_flow`). The real transports never mix roles on
-    /// one connection id, so the registry is driven directly: connection 1 holds
-    /// an agent subscription first and an operator one second, and an
-    /// operator-only line must still reach it, once.
+    /// Bus-hardening D2: `fanout_role` goes through the one
+    /// `Subscriptions::fanout`, which tests `wants` before it records the
+    /// connection as seen. This registry-level test pins that insert-after-`wants`
+    /// rule with a role-shaped `wants`; the same line that
+    /// `a_non_matching_subscription_does_not_mask_a_matching_one` in `tests/mcp.rs`
+    /// pins with a filter-shaped one. The real transports never mix roles on one
+    /// connection id, so the registry is driven directly: connection 1 holds an
+    /// agent subscription first and an operator one second, and an operator-only
+    /// line must still reach it, once.
     #[test]
     fn fanout_role_does_not_let_another_roles_subscription_mask_a_matching_one() {
         let reg = Subscriptions::default();

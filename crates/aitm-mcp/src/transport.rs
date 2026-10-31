@@ -1173,7 +1173,6 @@ mod tests {
 
     #[test]
     fn client_label_from_initialize_gives_no_label_for_malformed_messages() {
-        use serde_json::json;
         let deep_array = "[".repeat(200_000);
         let deep_params = format!(r#"{{"method":"initialize","params":{deep_array}"#);
         let mut rows: Vec<(String, String)> = vec![
