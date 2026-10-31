@@ -23,6 +23,7 @@
 # Day-to-day iteration without installing anything: tools/snap-dev.sh (DEV_TAG=<tag>).
 set -euo pipefail
 here=${0:A:h}
+repo_root=${here:h:h}
 name="Aitmproxy"
 scratch="$HOME/Library/Developer/$name/build"
 config=release
@@ -62,7 +63,7 @@ apps_dir="$HOME/Applications"
 app="$apps_dir/$name.app"
 # The app version tracks the workspace release (Cargo.toml [workspace.package]) so
 # the DMG name, the bus handshake, and the cask all agree; APP_VERSION overrides.
-version="${APP_VERSION:-$(sed -n '/^\[workspace.package\]/,/^\[/ s/^version *= *"\([^"]*\)".*/\1/p' "${here:h:h}/Cargo.toml" | head -1)}"
+version="${APP_VERSION:-$(sed -n '/^\[workspace.package\]/,/^\[/ s/^version *= *"\([^"]*\)".*/\1/p' "$repo_root/Cargo.toml" | head -1)}"
 [[ -n "$version" ]] || { echo "build failed: no app version (set APP_VERSION)"; exit 1; }
 # Say what is about to be overwritten, and refuse to replace a bundle of another
 # version (a released app the operator still uses) unless --replace says so.
@@ -111,6 +112,62 @@ fi
 # directory holding both) or CORE_TARBALL (a package.sh tarball), else the newest
 # dist/aitm-*-<target>.tar.gz is used. Absent => skip, and the app falls back to
 # an external core (EmbeddedCore.discoverBundled returns nil off-bundle).
+#
+# The core's default detection catalogue ships BESIDE it: aitm discovers the
+# bundled Rhai scripts at <exe_dir>/share/aitm/scripts (crates/aitm/src/bundled.rs,
+# candidates()), and the app launches Contents/Resources/core/aitm, so the
+# catalogue must land at Contents/Resources/core/share/aitm/scripts. Without it
+# the embedded core loads zero default detections and the Scripts page shows 0
+# active: the 0.5.4 bundle shipped that way (core/ held only aitm + obscura).
+# stage_catalogue <dest> <candidate source>...: copies the CONTENTS of the first
+# candidate directory that exists (empty candidates are placeholders; a symlinked
+# one is skipped), prunes tool scratch dirs, normalises modes, and refuses (exit 1)
+# a catalogue with no *.rhai or one carrying a symlink or special file, so that
+# bundle is never built silently again. The .rhai files are plain resources sealed
+# by the app signature; nothing below codesigns them individually.
+stage_catalogue() {
+  local dest=$1; shift
+  local hint="run scripts/package.sh, or point AITM_CORE_DIR/CORE_TARBALL at a core that ships share/aitm/scripts"
+  local src="" cand
+  local -a looked
+  for cand in "$@"; do
+    [[ -n "$cand" ]] || continue
+    looked+=("$cand")
+    if [[ -d "$cand" && ! -L "$cand" ]]; then src=$cand; break; fi
+  done
+  if [[ -z "$src" ]]; then
+    print -r -- "build failed: no detection catalogue to bundle (looked in: ${looked[*]}); $hint" >&2
+    exit 1
+  fi
+  mkdir -p "$dest"
+  # `/.` copies the CONTENTS of $src (active/, http/, l4/, ws/, README) into $dest
+  # on both BSD cp (macOS) and GNU cp; a bare "$src/" nests under its basename on
+  # GNU cp, so pin the contents form (same as scripts/package.sh).
+  cp -R "$src/." "$dest/"
+  # Only the catalogue ships: a working tree can hold tool scratch dirs (.claude/)
+  # beside the scripts (package.sh prunes them the same way).
+  find "$dest" -type d -name '.claude' -prune -exec rm -rf {} +
+  # Only regular files ship in the sealed bundle: cp -R carries symlinks and special
+  # files over as they are, and the app signature must not seal them.
+  # Each find checks its own status (print -r: paths are printed raw, never as
+  # escapes), so an errored listing names the step instead of dying under set -e.
+  local special
+  special=$(find "$dest" ! -type f ! -type d -print -quit) || { print -r -- "build failed: listing $dest failed (find exited non-zero)" >&2; exit 1; }
+  if [[ -n "$special" ]]; then
+    print -r -- "build failed: the detection catalogue contains symlinks or special files ($special); only regular files ship in the bundle" >&2
+    exit 1
+  fi
+  # Files 0644, dirs 0755: readable AND traversable by the core, never executable.
+  find "$dest" -type f -exec chmod 644 {} +
+  find "$dest" -type d -exec chmod 755 {} +
+  local n
+  n=$(find "$dest" -type f -name '*.rhai' | wc -l | tr -d ' ') || { print -r -- "build failed: listing $dest failed (find exited non-zero)" >&2; exit 1; }
+  if (( n == 0 )); then
+    print -r -- "build failed: $src holds no *.rhai, so the app would ship with no default detections; $hint" >&2
+    exit 1
+  fi
+  print -r -- "bundled detection catalogue: $n scripts from $src -> $dest"
+}
 coredir="$app/Contents/Resources/core"
 target=$(rustc -vV 2>/dev/null | sed -n 's/host: //p')
 src_aitm="" src_obscura=""
@@ -119,7 +176,6 @@ if [[ -n "${AITM_CORE_DIR:-}" ]]; then
 else
   tarball="${CORE_TARBALL:-}"
   if [[ -z "$tarball" ]]; then
-    repo_root=$(cd "$here/../.." && pwd)
     tarball=$(ls -t "$repo_root"/dist/aitm-*-"${target:-}".tar.gz 2>/dev/null | head -1 || true)
   fi
   if [[ -n "$tarball" && -f "$tarball" ]]; then
@@ -134,6 +190,17 @@ if [[ -x "$src_aitm" && -x "$src_obscura" ]]; then
   cp "$src_obscura" "$coredir/obscura"
   chmod 755 "$coredir/aitm" "$coredir/obscura"
   echo "bundled embedded core: $coredir/{aitm,obscura}"
+  # Catalogue source, in priority order: the tarball just extracted (package.sh
+  # ships share/aitm/scripts in it), then AITM_CORE_DIR's own share/. A development
+  # bundle (no --ne) may also fall back to the repo's scripts/bundled; a release
+  # (--ne) never takes the catalogue from the working tree, so an --ne build whose
+  # tarball lacks share/ fails here, loudly, instead of shipping a different set.
+  dev_catalogue=""
+  (( want_ne )) || dev_catalogue="$repo_root/scripts/bundled"
+  stage_catalogue "$coredir/share/aitm/scripts" \
+    "${coretmp:+$coretmp/share/aitm/scripts}" \
+    "${AITM_CORE_DIR:+$AITM_CORE_DIR/share/aitm/scripts}" \
+    "$dev_catalogue"
 else
   echo "no embedded core bundled (set AITM_CORE_DIR or CORE_TARBALL, or run scripts/package.sh); app will use an external core"
 fi
