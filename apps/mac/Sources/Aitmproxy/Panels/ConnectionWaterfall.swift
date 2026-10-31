@@ -13,15 +13,11 @@ struct ConnectionWaterfall: View {
     var body: some View {
         let model = Self.build(rows: session.visibleRows)
         VStack(alignment: .leading, spacing: Space.sm) {
-            HStack(spacing: Space.sm) {
-                TrackedLabel("Connections").accessibilityAddTraits(.isHeader)
-                Spacer(minLength: Space.sm)
+            PageHeader("Connections") {
                 Text(model.lanes.count == 1 ? "1 host" : "\(model.lanes.count) hosts")
                     .font(Tok.Face.data(Tok.Typography.Size.sm))
                     .foregroundStyle(Tok.Ink.tertiary.color)
             }
-            .padding(.horizontal, Space.md)
-            .frame(height: Tok.Size.filterBar)
             .gridProbe("waterfall.title", area: "connection-waterfall")
 
             if model.segments.isEmpty {
