@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 
 use aitm_plugin_rhai::config::RhaiLimits;
 use aitm_plugin_rhai::engine::{
-    begin_run, build_engine, current_run, print_sink, remaining_budget, AbortKind, Budget, RunKind,
+    begin_run, build_engine, current_run, enter_constants, print_sink, remaining_budget, AbortKind,
+    Budget, RunKind,
 };
-use rhai::EvalAltResult;
+use rhai::{EvalAltResult, OptimizationLevel, Scope};
 
 /// A run budget with `hook_timeout` of wall-clock and the shipped defaults
 /// for the rest.
@@ -466,4 +467,45 @@ fn print_is_captured() {
     engine.run(r#"print("hi")"#).expect("print must run");
     let lines = sink.lock().expect("sink lock");
     assert_eq!(lines.as_slice(), ["hi".to_string()]);
+}
+
+/// Every script compiles at one pinned level, so a debug and a release core
+/// (and a future rhai default) compile it identically. The level is this
+/// engine's promise, not rhai's default.
+#[test]
+fn optimization_level_is_pinned_to_simple() {
+    let engine = build_engine(&RhaiLimits::default(), Duration::from_secs(2));
+    assert_eq!(engine.optimization_level(), OptimizationLevel::Simple);
+}
+
+/// A script's top-level literal constants are visible inside its functions
+/// (as plain values and as method receivers) only while `enter_constants`
+/// holds them on the thread: the resolver behind `fn on_request(flow) { … TAG
+/// … }` and `load(reg)` closures. A parameter of the same name still wins.
+#[test]
+fn script_constants_resolve_inside_functions_while_entered() {
+    let engine = build_engine(&RhaiLimits::default(), Duration::from_secs(2));
+    let ast = engine
+        .compile(r#"const K = 7; const WORDS = ["a", "b"]; fn f(x) { K * x + WORDS.len() } fn g(K) { K }"#)
+        .expect("compiles");
+
+    let bare = engine.call_fn::<i64>(&mut Scope::new(), &ast, "f", (2_i64,));
+    assert!(
+        matches!(&bare, Err(e) if e.to_string().contains("Variable not found: K")),
+        "{bare:?}"
+    );
+
+    let _constants = enter_constants(&ast);
+    assert_eq!(
+        engine
+            .call_fn::<i64>(&mut Scope::new(), &ast, "f", (2_i64,))
+            .expect("f runs"),
+        16
+    );
+    assert_eq!(
+        engine
+            .call_fn::<i64>(&mut Scope::new(), &ast, "g", (3_i64,))
+            .expect("g runs"),
+        3
+    );
 }

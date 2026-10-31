@@ -25,7 +25,7 @@ use aitm_core::{
 };
 use rhai::{CallFnOptions, Dynamic, Engine, EvalAltResult, FnPtr, Position, Scope, AST};
 
-use crate::engine::{begin_run, blocking, Budget, RunKind};
+use crate::engine::{begin_run, blocking, enter_constants, Budget, RunKind};
 use crate::error::ScriptError;
 use crate::host_core::Options;
 use crate::host_registry::seed_call_context;
@@ -100,6 +100,7 @@ impl Command for ScriptCommand {
         let result = blocking(|| {
             let _run = begin_run(RunKind::Command, self.budget);
             let _seed = seed_call_context(caller, Some(tag), source);
+            let _constants = enter_constants(&self.ast);
             self.engine.call_fn_with_options::<Dynamic>(
                 CallFnOptions::new(),
                 &mut Scope::new(),
@@ -205,6 +206,7 @@ impl<'a> ScriptRegHandle<'a> {
         blocking(|| {
             let _run = begin_run(RunKind::Load, self.budget);
             let _seed = seed_call_context(caller, Some(tag), source);
+            let _constants = enter_constants(ast);
             engine.call_fn_with_options::<Dynamic>(
                 CallFnOptions::new(),
                 &mut Scope::new(),

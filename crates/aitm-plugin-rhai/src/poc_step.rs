@@ -44,7 +44,7 @@ use aitm_poc::{
 use rhai::{Dynamic, Engine, EvalAltResult, Position, Scope, AST};
 
 use crate::config::{DEFAULT_BROWSER_TIMEOUT, DEFAULT_HOOK_TIMEOUT};
-use crate::engine::{begin_run, blocking, Budget, RunKind};
+use crate::engine::{begin_run, blocking, enter_constants, Budget, RunKind};
 use crate::error::ScriptError;
 use crate::host_core::{ScriptCapability, ScriptServices};
 use crate::host_registry::seed_call_context;
@@ -177,6 +177,7 @@ impl ScriptStepExecutor for RhaiScriptExecutor {
         let result = blocking(|| {
             let _run = begin_run(RunKind::PocStep, self.budget);
             let _seed = seed_call_context(caller, None, source);
+            let _constants = enter_constants(&ast);
             self.engine.eval_ast_with_scope::<Dynamic>(&mut scope, &ast)
         });
 
