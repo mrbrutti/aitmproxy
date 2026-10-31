@@ -677,10 +677,8 @@ fn spawn_pump(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use aitm_core::{ActionPermit, GuardError, ScopeEntry, Value};
     use aitm_proto_l4::config::L4Config;
@@ -695,9 +693,10 @@ mod tests {
     use crate::macos_capture::capability::CaptureCapability;
     use crate::macos_capture::listener::{FlowKind, Hello};
     use crate::macos_capture::status::{
-        CaptureStatus, CaptureStatusSnapshot, CaptureStatusWriter, FeederState, OffReason,
-        ProviderState,
+        CaptureStatus, CaptureStatusReader, CaptureStatusSnapshot, CaptureStatusWriter,
+        FeederState, OffReason, ProviderState,
     };
+    use crate::macos_capture::test_support::{at, now_ms, obj, s};
 
     /// How long a test waits for something that should happen promptly.
     const PROMPT: Duration = Duration::from_secs(5);
@@ -813,38 +812,6 @@ mod tests {
         session_with_status(verifier, guard, l4, CaptureStatus::channel(true).0)
     }
 
-    /// Now, as Unix-epoch milliseconds — the clock the status handle stamps with.
-    fn now_ms() -> u64 {
-        let since_epoch = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("test clock is after 1970");
-        u64::try_from(since_epoch.as_millis()).expect("millisecond count fits in u64")
-    }
-
-    fn s(v: &str) -> Value {
-        Value::Str(v.to_string())
-    }
-
-    fn obj(pairs: Vec<(&str, Value)>) -> Value {
-        Value::Object(
-            pairs
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect::<BTreeMap<_, _>>(),
-        )
-    }
-
-    /// `value[key]`: the member of an object; panics on a missing key or a
-    /// non-object so a test reads like the literal it checks.
-    fn at<'a>(value: &'a Value, key: &str) -> &'a Value {
-        match value {
-            Value::Object(map) => map
-                .get(key)
-                .unwrap_or_else(|| panic!("no key {key:?} in {value:?}")),
-            other => panic!("{key:?} indexed into a non-object: {other:?}"),
-        }
-    }
-
     /// Poll `ready` every 5 ms until it holds, panicking with `what` after `PROMPT`.
     async fn until(what: &str, mut ready: impl FnMut() -> bool) {
         timeout(PROMPT, async {
@@ -858,7 +825,7 @@ mod tests {
 
     /// Spec D7's `provider` object when detached.
     fn detached_provider() -> Value {
-        obj(vec![
+        obj([
             ("attached_at", Value::Null),
             ("state", s("detached")),
             ("team_id", Value::Null),
@@ -883,7 +850,7 @@ mod tests {
     async fn attach_and_receive_scope(
         session: &Arc<CaptureSession>,
         pairing: &Arc<Mutex<FlowPairing>>,
-        r: &crate::macos_capture::status::CaptureStatusReader,
+        r: &CaptureStatusReader,
         expected_scope: &str,
     ) -> (ControlChannel, JoinHandle<()>) {
         let (mut provider, core) = control_pair();
@@ -1507,7 +1474,7 @@ mod tests {
         let v = snap.to_value();
         assert_eq!(
             at(&v, "flows_handed_off"),
-            &obj(vec![("tcp", Value::Int(1)), ("udp", Value::Int(0))])
+            &obj([("tcp", Value::Int(1)), ("udp", Value::Int(0))])
         );
         assert_eq!(
             at(&v, "last_handoff_at"),
@@ -1526,7 +1493,7 @@ mod tests {
         assert_eq!((snap.tcp_handed_off, snap.udp_handed_off), (1, 1));
         assert_eq!(
             at(&snap.to_value(), "flows_handed_off"),
-            &obj(vec![("tcp", Value::Int(1)), ("udp", Value::Int(1))])
+            &obj([("tcp", Value::Int(1)), ("udp", Value::Int(1))])
         );
     }
 
@@ -1862,9 +1829,9 @@ mod tests {
         assert_send(&fut);
     }
 
-    // ---- tester additions: the two "cannot start" reasons never carry a path ----
+    // ---- the two "cannot start" reasons never carry a path ----------------------
 
-    /// **Tester (CS-AC5, CS-AC15).** The one bind error whose `Display` embeds the
+    /// **CS-AC5, CS-AC15.** The one bind error whose `Display` embeds the
     /// socket directory — `refuse_symlink`'s — reaches the handle as its
     /// `io::ErrorKind` text only. The test first proves the full error does carry
     /// the path (so the no-path assertion on the status reason discriminates), then
@@ -1945,7 +1912,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(scratch.path());
     }
 
-    /// **Tester (CS-AC5, the second "cannot start" step).** A socket dir whose
+    /// **CS-AC5 (the second "cannot start" step).** A socket dir whose
     /// canonical path is too long for `sun_path` binds fine under a short spelling
     /// (a symlinked *parent*, the system's own `/tmp` → `/private/tmp` shape, which
     /// `refuse_symlink` allows) but cannot be published: `publish_rendezvous` fails

@@ -21,3 +21,5 @@ pub mod peer_auth;
 pub mod rendezvous;
 pub mod scope_spec;
 pub mod status;
+#[cfg(test)]
+pub(crate) mod test_support;

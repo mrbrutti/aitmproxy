@@ -637,8 +637,8 @@ mod tests {
     use super::*;
     use crate::macos_capture::peer_auth::CodeSignatureVerifier;
     use crate::macos_capture::status::{FeederState, OffReason};
+    use crate::macos_capture::test_support::{at, disabled_literal, s};
     use aitm_core::{CommandHost, Params, Value};
-    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::SystemTime;
 
@@ -717,50 +717,6 @@ mod tests {
         )
     }
 
-    fn s(v: &str) -> Value {
-        Value::Str(v.to_string())
-    }
-
-    fn obj(pairs: Vec<(&str, Value)>) -> Value {
-        Value::Object(
-            pairs
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect::<BTreeMap<_, _>>(),
-        )
-    }
-
-    /// Spec D7, "Disabled": what `capture.status` reports when the feature is off.
-    fn disabled_literal() -> Value {
-        obj(vec![
-            ("capability", s("feeder_off")),
-            ("capability_reason", s("macos_capture.enabled is false")),
-            ("enabled", Value::Bool(false)),
-            (
-                "feeder",
-                obj(vec![
-                    ("reason", s("macos_capture.enabled is false")),
-                    ("state", s("off")),
-                ]),
-            ),
-            (
-                "flows_handed_off",
-                obj(vec![("tcp", Value::Int(0)), ("udp", Value::Int(0))]),
-            ),
-            ("last_handoff_at", Value::Null),
-            (
-                "provider",
-                obj(vec![
-                    ("attached_at", Value::Null),
-                    ("state", s("detached")),
-                    ("team_id", Value::Null),
-                ]),
-            ),
-            ("scope_entries", Value::Int(0)),
-            ("scope_tokens", Value::Array(vec![])),
-        ])
-    }
-
     /// CS-AC20: with the feature off, `build_capture_session` builds nothing and
     /// drops the writer, so the handle keeps reporting the constructor's disabled
     /// state, the D7 literal.
@@ -800,17 +756,6 @@ mod tests {
     #[test]
     fn capture_session_present_when_enabled() {
         assert!(build_with(&capture_features(true)).is_some());
-    }
-
-    /// `value[key]`: the member of an object (`Value` has no `Index` impl); panics
-    /// on a missing key or a non-object so a test reads like the literal it checks.
-    fn at<'a>(value: &'a Value, key: &str) -> &'a Value {
-        match value {
-            Value::Object(map) => map
-                .get(key)
-                .unwrap_or_else(|| panic!("no key {key:?} in {value:?}")),
-            other => panic!("{key:?} indexed into a non-object: {other:?}"),
-        }
     }
 
     /// Invoke the registered `capture.status` the way a frontend does: through the

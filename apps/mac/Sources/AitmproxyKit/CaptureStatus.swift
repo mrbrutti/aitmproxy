@@ -65,7 +65,9 @@ public struct CaptureStatus: Hashable, Sendable {
     /// `provider.state == "attached"`: a code-signature-verified provider holds the control channel.
     public var providerAttached: Bool
     public var attachedAt: Date?
-    /// The attached provider's signing team id, when the verifier knows it.
+    /// The Apple team id the provider's code signature was verified against (the
+    /// requirement's pinned OU); not read from the peer's signing information. Nil when
+    /// detached or when the verifier pins no team.
     public var teamID: String?
     /// The scope tokens last pushed to the provider; `scopeTokens.count` is the count.
     public var scopeTokens: [String]

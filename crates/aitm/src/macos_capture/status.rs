@@ -182,7 +182,7 @@ impl CaptureStatusSnapshot {
             ),
             (
                 "last_handoff_at",
-                millis_value(self.last_handoff_at_ms.unwrap_or(0)),
+                self.last_handoff_at_ms.map_or(Value::Null, millis_value),
             ),
             (
                 "provider",
@@ -210,7 +210,7 @@ impl CaptureStatusSnapshot {
 }
 
 /// A `Value::Object` from `(key, value)` pairs.
-fn object<const N: usize>(pairs: [(&str, Value); N]) -> Value {
+pub(crate) fn object<const N: usize>(pairs: [(&str, Value); N]) -> Value {
     Value::Object(
         pairs
             .into_iter()
@@ -253,6 +253,9 @@ struct Inner {
     feeder: FeederState,
     provider: ProviderState,
     tokens: Vec<String>,
+    /// Bumped by every [`CaptureStatusWriter::attached`]; an [`Attachment`] clears
+    /// on drop only while this still equals the value it was issued with.
+    generation: u64,
 }
 
 /// The state both halves of the handle share.
@@ -314,6 +317,7 @@ impl CaptureStatus {
                 feeder: FeederState::Off(reason),
                 provider: ProviderState::Detached,
                 tokens: Vec::new(),
+                generation: 0,
             }),
             tcp_handed_off: AtomicU64::new(0),
             udp_handed_off: AtomicU64::new(0),
@@ -356,18 +360,28 @@ impl CaptureStatusWriter {
     /// the verifier's team, replace the tokens, and start the per-attachment
     /// counters from zero. Hold the returned guard for the life of the
     /// attachment; dropping it records the detach.
+    ///
+    /// A newer attachment supersedes an older guard: each call bumps the handle's
+    /// attachment generation, and a guard whose generation is no longer current
+    /// changes nothing when it drops, so a stale guard can never clear the
+    /// attachment that replaced it.
     #[must_use]
     pub(super) fn attached(&self, team_id: Option<String>, tokens: Vec<String>) -> Attachment {
-        {
+        let generation = {
             let mut inner = lock(&self.0.inner);
             inner.provider = ProviderState::Attached {
                 attached_at_ms: now_ms(),
                 team_id,
             };
             inner.tokens = tokens;
+            inner.generation = inner.generation.wrapping_add(1);
             self.0.reset_counters();
+            inner.generation
+        };
+        Attachment {
+            shared: Arc::clone(&self.0),
+            generation,
         }
-        Attachment(Arc::clone(&self.0))
     }
 
     /// A re-pushed scope reached the provider: replace the tokens.
@@ -390,12 +404,20 @@ impl CaptureStatusWriter {
 /// RAII proof that a provider is attached. Dropping it records the detach
 /// (provider `Detached`, tokens cleared, counters and last-handoff time zeroed),
 /// so an attachment task that is cancelled at shutdown detaches too (spec D3).
-pub struct Attachment(Arc<Shared>);
+/// Only the current guard clears: one superseded by a later
+/// [`CaptureStatusWriter::attached`] drops silently.
+pub struct Attachment {
+    shared: Arc<Shared>,
+    /// The handle's attachment generation when this guard was issued.
+    generation: u64,
+}
 
 impl Drop for Attachment {
     fn drop(&mut self) {
-        let mut inner = lock(&self.0.inner);
-        self.0.clear_attachment(&mut inner);
+        let mut inner = lock(&self.shared.inner);
+        if inner.generation == self.generation {
+            self.shared.clear_attachment(&mut inner);
+        }
     }
 }
 
@@ -641,7 +663,6 @@ fn result_fields() -> Vec<ParamDef> {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use aitm_core::{
         Command, CommandHost, HttpFlow, HttpRequest, MemFlowStore, ParamDef, Params, Plugin,
@@ -658,223 +679,16 @@ mod tests {
     use super::super::feeder::DEFAULT_SOCKET_DIR;
     use super::super::listener::{FlowKind, ScopeSpec};
     use super::super::scope_spec::provider_scope_spec;
+    use super::super::test_support::{
+        at, bind_failed_literal, capturing_literal, disabled_literal, listening_literal, matrix,
+        now_ms, s,
+    };
     use super::{
-        scope_tokens, CaptureStatus, CaptureStatusCommand, CaptureStatusPlugin,
+        object, scope_tokens, CaptureStatus, CaptureStatusCommand, CaptureStatusPlugin,
         CaptureStatusSnapshot, FeederState, OffReason, ProviderState,
     };
 
-    // ---- helpers (Task 3 of the plan reuses these by name) ----------------------
-
-    /// Now, as Unix-epoch milliseconds — the same clock the handle stamps with.
-    fn now_ms() -> u64 {
-        let since_epoch = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("test clock is after 1970");
-        u64::try_from(since_epoch.as_millis()).expect("millisecond count fits in u64")
-    }
-
-    fn s(v: &str) -> Value {
-        Value::Str(v.to_string())
-    }
-
-    fn obj(pairs: Vec<(&str, Value)>) -> Value {
-        Value::Object(
-            pairs
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect::<BTreeMap<_, _>>(),
-        )
-    }
-
-    /// `value[key]`: the member of an object; panics on a missing key or a
-    /// non-object so a test reads like the literal it checks.
-    fn at<'a>(value: &'a Value, key: &str) -> &'a Value {
-        match value {
-            Value::Object(map) => map
-                .get(key)
-                .unwrap_or_else(|| panic!("no key {key:?} in {value:?}")),
-            other => panic!("{key:?} indexed into a non-object: {other:?}"),
-        }
-    }
-
-    /// Spec D7, "Disabled".
-    fn disabled_literal() -> Value {
-        obj(vec![
-            ("capability", s("feeder_off")),
-            ("capability_reason", s("macos_capture.enabled is false")),
-            ("enabled", Value::Bool(false)),
-            (
-                "feeder",
-                obj(vec![
-                    ("reason", s("macos_capture.enabled is false")),
-                    ("state", s("off")),
-                ]),
-            ),
-            (
-                "flows_handed_off",
-                obj(vec![("tcp", Value::Int(0)), ("udp", Value::Int(0))]),
-            ),
-            ("last_handoff_at", Value::Null),
-            (
-                "provider",
-                obj(vec![
-                    ("attached_at", Value::Null),
-                    ("state", s("detached")),
-                    ("team_id", Value::Null),
-                ]),
-            ),
-            ("scope_entries", Value::Int(0)),
-            ("scope_tokens", Value::Array(vec![])),
-        ])
-    }
-
-    /// Spec D7, "Listening, no provider yet".
-    fn listening_literal() -> Value {
-        obj(vec![
-            ("capability", s("awaiting_provider")),
-            ("capability_reason", Value::Null),
-            ("enabled", Value::Bool(true)),
-            (
-                "feeder",
-                obj(vec![("reason", Value::Null), ("state", s("listening"))]),
-            ),
-            (
-                "flows_handed_off",
-                obj(vec![("tcp", Value::Int(0)), ("udp", Value::Int(0))]),
-            ),
-            ("last_handoff_at", Value::Null),
-            (
-                "provider",
-                obj(vec![
-                    ("attached_at", Value::Null),
-                    ("state", s("detached")),
-                    ("team_id", Value::Null),
-                ]),
-            ),
-            ("scope_entries", Value::Int(0)),
-            ("scope_tokens", Value::Array(vec![])),
-        ])
-    }
-
-    /// Spec D7, "Bind failed".
-    fn bind_failed_literal() -> Value {
-        obj(vec![
-            ("capability", s("degraded")),
-            (
-                "capability_reason",
-                s("cannot bind the capture sockets (not a directory)"),
-            ),
-            ("enabled", Value::Bool(true)),
-            (
-                "feeder",
-                obj(vec![
-                    (
-                        "reason",
-                        s("cannot bind the capture sockets (not a directory)"),
-                    ),
-                    ("state", s("bind_failed")),
-                ]),
-            ),
-            (
-                "flows_handed_off",
-                obj(vec![("tcp", Value::Int(0)), ("udp", Value::Int(0))]),
-            ),
-            ("last_handoff_at", Value::Null),
-            (
-                "provider",
-                obj(vec![
-                    ("attached_at", Value::Null),
-                    ("state", s("detached")),
-                    ("team_id", Value::Null),
-                ]),
-            ),
-            ("scope_entries", Value::Int(0)),
-            ("scope_tokens", Value::Array(vec![])),
-        ])
-    }
-
-    /// Spec D7, "Attached and capturing".
-    fn capturing_literal() -> Value {
-        obj(vec![
-            ("capability", s("capturing")),
-            ("capability_reason", Value::Null),
-            ("enabled", Value::Bool(true)),
-            (
-                "feeder",
-                obj(vec![("reason", Value::Null), ("state", s("listening"))]),
-            ),
-            (
-                "flows_handed_off",
-                obj(vec![("tcp", Value::Int(12)), ("udp", Value::Int(3))]),
-            ),
-            ("last_handoff_at", Value::Int(1_761_907_305_123)),
-            (
-                "provider",
-                obj(vec![
-                    ("attached_at", Value::Int(1_761_907_200_000)),
-                    ("state", s("attached")),
-                    ("team_id", s("995PCLM9KH")),
-                ]),
-            ),
-            ("scope_entries", Value::Int(3)),
-            (
-                "scope_tokens",
-                Value::Array(vec![
-                    s("example.com"),
-                    s("*.example.com"),
-                    s("198.51.100.7"),
-                ]),
-            ),
-        ])
-    }
-
-    /// Every `FeederState` (the four `Off` reasons, `Listening`, `BindFailed`) ×
-    /// `ProviderState` {`Detached`, `Attached`} × handoffs {(0,0), (1,0), (0,1)}:
-    /// 36 snapshots, the CS-AC12 matrix.
-    fn matrix() -> Vec<CaptureStatusSnapshot> {
-        let feeders = [
-            FeederState::Off(OffReason::Disabled),
-            FeederState::Off(OffReason::NotMacos),
-            FeederState::Off(OffReason::NotStarted),
-            FeederState::Off(OffReason::Stopped),
-            FeederState::Listening,
-            FeederState::BindFailed("cannot bind the capture sockets (not a directory)".into()),
-        ];
-        let providers = [
-            ProviderState::Detached,
-            ProviderState::Attached {
-                attached_at_ms: 1_761_907_200_000,
-                team_id: Some("995PCLM9KH".into()),
-            },
-        ];
-        let handoffs = [(0u64, 0u64), (1, 0), (0, 1)];
-        let mut rows = Vec::new();
-        for feeder in &feeders {
-            for provider in &providers {
-                for (tcp, udp) in handoffs {
-                    let attached = matches!(provider, ProviderState::Attached { .. });
-                    rows.push(CaptureStatusSnapshot {
-                        enabled: true,
-                        feeder: feeder.clone(),
-                        provider: provider.clone(),
-                        scope_tokens: if attached {
-                            vec!["example.com".into()]
-                        } else {
-                            Vec::new()
-                        },
-                        tcp_handed_off: tcp,
-                        udp_handed_off: udp,
-                        last_handoff_at_ms: if tcp + udp > 0 {
-                            Some(1_761_907_305_123)
-                        } else {
-                            None
-                        },
-                    });
-                }
-            }
-        }
-        rows
-    }
+    // ---- helpers ------------------------------------------------------------------
 
     fn attached_at(snapshot: &CaptureStatusSnapshot) -> u64 {
         match &snapshot.provider {
@@ -960,13 +774,13 @@ mod tests {
         );
         assert_eq!(
             at(&snap.to_value(), "feeder"),
-            &obj(vec![("reason", s("stopped")), ("state", s("off"))])
+            &object([("reason", s("stopped")), ("state", s("off"))])
         );
     }
 
     /// **CS-AC5 (writer level).** A bind failure is `degraded` with the reason in
-    /// both places. (The feeder never calls `stopped()` on this path; Task 2
-    /// proves that at the feeder.)
+    /// both places. (The feeder never calls `stopped()` on this path; the feeder
+    /// tests prove that.)
     #[test]
     fn bind_failed_is_degraded_and_terminal() {
         let reason = "cannot bind the capture sockets (not a directory)";
@@ -1037,7 +851,7 @@ mod tests {
         let v = snap.to_value();
         assert_eq!(
             at(&v, "flows_handed_off"),
-            &obj(vec![("tcp", Value::Int(12)), ("udp", Value::Int(3))])
+            &object([("tcp", Value::Int(12)), ("udp", Value::Int(3))])
         );
         assert_eq!(
             at(&v, "last_handoff_at"),
@@ -1061,7 +875,7 @@ mod tests {
         assert_eq!(snap.capability(), CaptureCapability::AwaitingProvider);
         assert_eq!(
             at(&snap.to_value(), "provider"),
-            &obj(vec![
+            &object([
                 ("attached_at", Value::Null),
                 ("state", s("detached")),
                 ("team_id", Value::Null),
@@ -1093,6 +907,41 @@ mod tests {
 
         drop(guard);
         assert_eq!(r.snapshot(), snap);
+    }
+
+    /// **CS-AC9 (integrity).** A newer attachment supersedes an older guard: when
+    /// the stale guard drops, the newer attachment's provider, tokens and counters
+    /// survive untouched; only the current guard's drop records the detach.
+    #[test]
+    fn stale_guard_does_not_clear_a_newer_attachment() {
+        let (w, r) = CaptureStatus::channel_on(true, true);
+        w.listening();
+        let a = w.attached(None, vec!["a.test".into()]);
+        let b = w.attached(Some("995PCLM9KH".into()), vec!["b.test".into()]);
+
+        drop(a);
+        let snap = r.snapshot();
+        assert!(
+            matches!(
+                &snap.provider,
+                ProviderState::Attached { team_id: Some(team), .. } if team == "995PCLM9KH"
+            ),
+            "the stale guard cleared the newer attachment: {snap:?}"
+        );
+        assert_eq!(snap.scope_tokens, vec!["b.test".to_string()]);
+        assert_eq!((snap.tcp_handed_off, snap.udp_handed_off), (0, 0));
+
+        w.handed_off(FlowKind::Tcp);
+        let snap = r.snapshot();
+        assert_eq!((snap.tcp_handed_off, snap.udp_handed_off), (1, 0));
+        assert_eq!(snap.capability(), CaptureCapability::Capturing);
+
+        drop(b);
+        let snap = r.snapshot();
+        assert_eq!(snap.provider, ProviderState::Detached);
+        assert_eq!(snap.scope_tokens, Vec::<String>::new());
+        assert_eq!((snap.tcp_handed_off, snap.udp_handed_off), (0, 0));
+        assert_eq!(snap.last_handoff_at_ms, None);
     }
 
     /// **CS-AC19.** The D7 capturing literal, then the same attachment with no
@@ -1130,7 +979,7 @@ mod tests {
         assert_eq!(at(&v, "last_handoff_at"), &Value::Null);
         assert_eq!(
             at(&v, "flows_handed_off"),
-            &obj(vec![("tcp", Value::Int(0)), ("udp", Value::Int(0))])
+            &object([("tcp", Value::Int(0)), ("udp", Value::Int(0))])
         );
 
         let incident = CaptureStatusSnapshot {
@@ -1144,35 +993,75 @@ mod tests {
         assert_eq!(at(at(&v, "provider"), "state"), &s("attached"));
     }
 
-    /// **CS-AC12.** The D5 precedence over the whole matrix, with the three
+    /// **CS-AC12.** The D5 precedence over the whole matrix, checked against a
+    /// literal table (one row per feeder state; one column each for detached,
+    /// attached with no handoff, attached with a handoff), with the three
     /// spelled-out rows the plan names, and never an app-side variant.
     #[test]
     fn capability_derivation_table() {
+        let bind_failed = "cannot bind the capture sockets (not a directory)";
+        let table: [(FeederState, &str, &str, &str); 6] = [
+            (
+                FeederState::Off(OffReason::Disabled),
+                "feeder_off",
+                "approved_attached",
+                "capturing",
+            ),
+            (
+                FeederState::Off(OffReason::NotMacos),
+                "feeder_off",
+                "approved_attached",
+                "capturing",
+            ),
+            (
+                FeederState::Off(OffReason::NotStarted),
+                "feeder_off",
+                "approved_attached",
+                "capturing",
+            ),
+            (
+                FeederState::Off(OffReason::Stopped),
+                "feeder_off",
+                "approved_attached",
+                "capturing",
+            ),
+            (
+                FeederState::Listening,
+                "awaiting_provider",
+                "approved_attached",
+                "capturing",
+            ),
+            (
+                FeederState::BindFailed(bind_failed.into()),
+                "degraded",
+                "degraded",
+                "degraded",
+            ),
+        ];
         let rows = matrix();
         assert_eq!(rows.len(), 36);
+        for (feeder, ..) in &table {
+            assert!(
+                rows.iter().any(|snap| snap.feeder == *feeder),
+                "the matrix never visits {feeder:?}"
+            );
+        }
         for snap in &rows {
-            let handoffs = snap.tcp_handed_off + snap.udp_handed_off;
-            let (expected, wire): (CaptureCapability, &str) = match (&snap.feeder, &snap.provider) {
-                (FeederState::BindFailed(r), _) => {
-                    (CaptureCapability::Degraded(r.clone()), "degraded")
+            let (_, detached, attached_idle, attached_capturing) = table
+                .iter()
+                .find(|(feeder, ..)| *feeder == snap.feeder)
+                .unwrap_or_else(|| panic!("no table row for {:?}", snap.feeder));
+            let wire = match &snap.provider {
+                ProviderState::Detached => detached,
+                ProviderState::Attached { .. }
+                    if snap.tcp_handed_off + snap.udp_handed_off == 0 =>
+                {
+                    attached_idle
                 }
-                (_, ProviderState::Attached { .. }) if handoffs > 0 => {
-                    (CaptureCapability::Capturing, "capturing")
-                }
-                (_, ProviderState::Attached { .. }) => {
-                    (CaptureCapability::ApprovedAttached, "approved_attached")
-                }
-                (FeederState::Listening, ProviderState::Detached) => {
-                    (CaptureCapability::AwaitingProvider, "awaiting_provider")
-                }
-                (FeederState::Off(r), ProviderState::Detached) => (
-                    CaptureCapability::FeederOff(r.as_str().into()),
-                    "feeder_off",
-                ),
+                ProviderState::Attached { .. } => attached_capturing,
             };
             let got = snap.capability();
-            assert_eq!(got, expected, "{snap:?}");
-            assert_eq!(got.wire_name(), wire, "{snap:?}");
+            assert_eq!(got.wire_name(), *wire, "{snap:?}");
             assert_eq!(at(&snap.to_value(), "capability"), &s(wire), "{snap:?}");
             assert!(
                 !matches!(
@@ -1199,7 +1088,6 @@ mod tests {
                 last_handoff_at_ms: None,
             }
         };
-        let bind_failed = "cannot bind the capture sockets (not a directory)";
         let degraded = row(
             FeederState::BindFailed(bind_failed.into()),
             attached.clone(),
@@ -1293,7 +1181,7 @@ mod tests {
         );
     }
 
-    // ---- the verb (plan Task 3) -----------------------------------------------------
+    // ---- the verb -------------------------------------------------------------------
 
     /// A `ProxyClient` the verb must never reach (precedent:
     /// `aitm-plugins/tests/control.rs`).
@@ -1528,9 +1416,9 @@ mod tests {
         assert!(!source.contains(concat!("CaptureSession", "::")));
     }
 
-    // ---- tester additions: edge cases the handle must survive -----------------------
+    // ---- edge cases the handle must survive -------------------------------------------
 
-    /// **Tester (CS-AC10 under contention).** `handed_off` is lock-free and must
+    /// **CS-AC10 (under contention).** `handed_off` is lock-free and must
     /// not lose a count: eight threads each record 1 000 handoffs (three TCP to one
     /// UDP) while a reader snapshots continuously; every one is counted and every
     /// intermediate read is a well-formed, attached D7 object.
@@ -1572,7 +1460,7 @@ mod tests {
         assert_eq!(snap.capability(), CaptureCapability::Capturing);
     }
 
-    /// **Tester.** A thread that panics while holding the handle's lock poisons it;
+    /// A thread that panics while holding the handle's lock poisons it;
     /// both halves recover (`PoisonError::into_inner`, as the module promises), so
     /// one bad critical section can neither wedge the verb nor silence the
     /// feeder's later transitions.
@@ -1607,7 +1495,7 @@ mod tests {
         assert_eq!(r.snapshot().feeder, FeederState::Off(OffReason::Stopped));
     }
 
-    /// **Tester (CS-AC9).** The RAII guard holds its own reference to the shared
+    /// **CS-AC9.** The RAII guard holds its own reference to the shared
     /// state, not a borrow of the writer: with every writer gone the attachment
     /// still reads as attached, its drop still records the detach, and the reader
     /// still answers.
@@ -1635,7 +1523,7 @@ mod tests {
         assert_eq!(snap.capability(), CaptureCapability::AwaitingProvider);
     }
 
-    /// **Tester (CS-AC19).** The emitter's saturation branches: a count past
+    /// **CS-AC19.** The emitter's saturation branches: a count past
     /// `i64::MAX` saturates instead of wrapping negative, a stamp that does not fit
     /// `i64` reads as `null` rather than a negative time, and the capability sum
     /// does not overflow. A client never sees a negative integer.
@@ -1671,7 +1559,7 @@ mod tests {
         assert_no_negative(&v);
     }
 
-    /// **Tester (CS-AC8).** `scope_tokens` over blank and ragged specs: empty,
+    /// **CS-AC8.** `scope_tokens` over blank and ragged specs: empty,
     /// whitespace-only, tabs, runs of spaces and a trailing newline tokenize to
     /// exactly the non-empty words, never an empty token, and `scope_entries`
     /// follows the tokens, not the raw spec.
