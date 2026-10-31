@@ -1,0 +1,167 @@
+# NE capture: provider claim rule — implementation plan (hotfix)
+
+**Status:** approved — self-approved 2026-10-31 by the orchestrator session (autonomous mode)
+**Spec:** `docs/superpowers/specs/2026-10-31-ne-claim-rule-design.md`
+**Branch / worktree:** `fix/ne-claim-rule` off `main` 8b193a1, in
+`/Users/matt/Security/aitmproxy/.claude/worktrees/quizzical-payne-463da0`
+
+## Overview
+
+Three file-disjoint tasks. **Run Task 2 first**: it adds the committed runner for the
+Extension's in-file self-checks, which Task 1 uses as its red/green gate. Task 1 (the
+provider rule plus its Swift doc comments) depends on Task 2. Task 3 (Rust doc-only) is
+independent of both and may fan out immediately alongside Task 2. The core-side half of
+the original brief is PR #185 and has no task here (spec, "Handled elsewhere"):
+`crates/aitm/src/ingress.rs`, `macos_capture/feeder.rs`, and `macos_capture/adapter.rs`
+are not edited on this branch.
+
+Shared facts for every coder:
+
+- The Extension has no SwiftPM test target. Its tests are `enum HandoffSelfCheck`
+  (`#if DEBUG`) at the bottom of `apps/mac/Extension/Sources/FlowHandoff.swift`;
+  `static func run() -> [String]` returns failure lines (each starts with `FAIL `) and
+  is empty on success. A check is `r.check("label", <Bool>, <detail>)`.
+- Swift builds need the Terminal panel or a sandbox-writable scratch dir: inside the
+  sandbox run the runner as `NE_SELFCHECK_SCRATCH="$TMPDIR/ne-selfcheck" apps/mac/tools/ne-selfcheck.sh`.
+- Gates (spec CR-AC5), run from the worktree root:
+  `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`;
+  `swift test --package-path apps/mac --scratch-path ~/Library/Developer/Aitmproxy/test-build`;
+  `apps/mac/tools/ne-selfcheck.sh`; `apps/mac/tools/check-capture-toggle.sh`;
+  `apps/mac/tools/check-capture-operator-only.sh`.
+
+## Tasks
+
+### Task 2: the self-check runner `apps/mac/tools/ne-selfcheck.sh`  (do this first)
+
+- **Satisfies:** CR-AC7; enables CR-AC1's test and the `ne-selfcheck.sh` line of CR-AC5
+- **Depends on:** none
+- **Files:** `apps/mac/tools/ne-selfcheck.sh` (create, `chmod +x`)
+- **Change:** a `#!/usr/bin/env bash` script with `set -euo pipefail`, modelled on the
+  header style of `apps/mac/tools/check-capture-operator-only.sh`. Behaviour (spec D5):
+  - `mac_dir=${1:-<the apps/mac that holds this script>}`; fails with a message if
+    `$mac_dir/Extension/Sources/FlowHandoff.swift` is missing.
+  - `scratch=${NE_SELFCHECK_SCRATCH:-$HOME/Library/Developer/Aitmproxy/ne-selfcheck}`;
+    `mkdir -p "$scratch/ModuleCache"`.
+  - Writes `$scratch/main.swift` (heredoc): calls `HandoffSelfCheck.run()`, prints each
+    returned line to stdout, exits `1` if the array is non-empty, else prints `PASS: NE handoff self-check`
+    and exits `0`.
+  - Collects sources: every `$mac_dir/Extension/Sources/*.swift` except
+    `Sources/main.swift` (the real entry point calls `NEProvider.startSystemExtensionMode()`
+    and parks in `dispatchMain()`), plus `$scratch/main.swift`.
+  - Compiles with exactly
+    `xcrun swiftc -sdk "$(xcrun --show-sdk-path --sdk macosx)" -target "$(uname -m)-apple-macos26.0" -D DEBUG -framework NetworkExtension -module-name AitmproxyNESelfCheck -module-cache-path "$scratch/ModuleCache" -o "$scratch/AitmproxyNESelfCheck" <sources>`;
+    on compiler failure prints the compiler output and exits `2`.
+  - Runs `$scratch/AitmproxyNESelfCheck` and exits with its status (0 or 1).
+  - Usage comment at the top: `tools/ne-selfcheck.sh [mac-dir]`, the env var, the three
+    exit codes, and why `main.swift` is excluded.
+- **Test:** no unit test (shell). Verification, both outputs quoted in the report:
+  1. On the branch as checked out (before Task 1): `apps/mac/tools/ne-selfcheck.sh`
+     prints `PASS: NE handoff self-check` and `echo $?` is `0`.
+  2. Temporarily add `r.fail("FAIL probe")` as the first line of `HandoffSelfCheck.run()`
+     after `let r = Recorder()`, run again: stdout contains the line `FAIL probe`,
+     `echo $?` is `1`. Revert the probe (`git diff --stat` shows only the new script).
+  3. `NE_SELFCHECK_SCRATCH="$TMPDIR/ne-selfcheck" apps/mac/tools/ne-selfcheck.sh` also
+     exits `0` (sandbox path), and `ls "$TMPDIR/ne-selfcheck"` shows `main.swift`,
+     `ModuleCache`, `AitmproxyNESelfCheck`.
+  4. `apps/mac/tools/ne-selfcheck.sh /nonexistent` exits non-zero with a one-line message.
+- **Done when:** the four verifications above hold; `git status` shows only the new
+  executable file; `cargo` gate untouched (no Rust change) — state that, do not re-run it.
+
+### Task 1: datagram claim rule in `ScopeMatcher` + self-checks + Swift doc comments
+
+- **Satisfies:** CR-AC1; CR-AC4 (the two Swift doc comments)
+- **Depends on:** Task 2 (its gate)
+- **Files:** `apps/mac/Extension/Sources/FlowHandoff.swift` (modify) — nothing else
+- **Change:**
+  - `struct ScopeMatcher`: add `static let neverClaimedDatagramPorts: Set<UInt16> = [53, 5353, 853]`.
+  - Replace `func matches(hostname: String?, ip: String, port: UInt16) -> Bool` with
+    `func matches(kind: FlowOpenMessage.Kind, hostname: String?, ip: String, port: UInt16) -> Bool`.
+    Order (spec D2): (1) `kind == .udp && Self.neverClaimedDatagramPorts.contains(port)` →
+    `false` before the entry loop; (2) existing per-entry port filter; (3) `.ip` matches
+    either kind; (4) `.host` / `.suffix` match only when `kind == .tcp`. Do **not** keep
+    a kind-less overload or a default argument.
+  - `FlowHandoff.claim(_:)`: the scope guard becomes
+    `attachment.scope.matches(kind: flow.kind, hostname: …, ip: …, port: …)`.
+  - Doc comments (CR-AC4): extend the GRAMMAR block above `struct ScopeMatcher`
+    (currently `/// GRAMMAR (the Rust side …`) with the rule — host and `*.suffix`
+    tokens claim TCP only; IP tokens claim TCP and UDP; a datagram to 53, 5353, or 853 is
+    never claimed, whatever the spec says. Extend the `handleUDP` doc comment
+    (`/// `handleNewUDPFlow` (macOS 15+ …`) with: a UDP flow is claimable only through
+    an IP token and never on a DNS port; host/suffix entries never claim it.
+  - `HandoffSelfCheck`: update the existing `scope(_:)` calls to pass `kind: .tcp`
+    (same expectations). Add the CR-AC1 pins — either in `scope(_:)` or a new
+    `private static func claimRule(_ r: Recorder)` registered in `run()` after `scope(r)`
+    (builder's choice) — using
+    `ScopeMatcher(spec: "example.com, *.api.test, 93.184.216.34, 198.51.100.7:443, [2001:db8::1]:443, www.example.com:80")`.
+    In `coreLinkAndClaim(_:)`, after step 4 ("in scope is claimed"), add the two UDP
+    claim checks against the armed `example.com` link.
+- **Test** (the literal expected values; `kind:` abbreviated as `.udp` / `.tcp`):
+  | check | call | expected |
+  |---|---|---|
+  | bare host never claims UDP | `.udp, "example.com", "203.0.113.5", p` for p in 53, 5353, 853, 443, 1234 | `false` ×5 |
+  | suffix never claims UDP | `.udp, "x.api.test", "203.0.113.5", 443` | `false` |
+  | bare IP token claims UDP | `.udp, nil, "93.184.216.34", 443` | `true` |
+  | IP token ignores hostname | `.udp, "unrelated.org", "93.184.216.34", 4433` | `true` |
+  | ip:port token, that port | `.udp, nil, "198.51.100.7", 443` | `true` |
+  | ip:port token, other port | `.udp, nil, "198.51.100.7", 444` | `false` |
+  | IPv6 token claims UDP | `.udp, nil, "2001:db8::1", 443` | `true` |
+  | DNS never, even by IP | `.udp, nil, "93.184.216.34", p` for p in 53, 5353, 853 | `false` ×3 |
+  | TCP bare host any port | `.tcp, "example.com", "203.0.113.5", p` for p in 443, 8080, 53 | `true` ×3 |
+  | TCP host:port that port | `.tcp, "www.example.com", "203.0.113.5", 80` | `true` |
+  | TCP host:port other port | `.tcp, "www.example.com", "203.0.113.5", 443` | `false` |
+  | TCP suffix | `.tcp, "x.api.test", "203.0.113.5", 8443` | `true` |
+  | TCP IP token on 53 | `.tcp, nil, "93.184.216.34", 53` | `true` |
+  | claim: UDP DNS with matching name | `handoff.claim(FlowDescriptor(kind: .udp, remote: FlowEndpoint(ip: "93.184.216.34", port: 53), remoteHostname: "example.com", sourceApp: "com.apple.curl", local: nil))` | `nil`; `dialPaths.all` unchanged |
+  | claim: UDP 443 with matching name | same with `port: 443` | `nil`; `dialPaths.all` unchanged |
+  TDD order, both runs quoted: (a) add the checks first and run
+  `apps/mac/tools/ne-selfcheck.sh` → exit `1` with `FAIL` lines for the UDP pins (the
+  compile may also fail on the missing `kind:` label — that is the red run; show it);
+  (b) implement; run again → `PASS: NE handoff self-check`, exit `0`.
+- **Done when:** the runner passes; `grep -n '5353' apps/mac/Extension/Sources/FlowHandoff.swift`
+  shows the constant and the two doc-comment lines; `grep -n 'func matches(' apps/mac/Extension/Sources/FlowHandoff.swift`
+  shows exactly one signature and it starts with `kind:`; `swift test --package-path apps/mac …`,
+  `check-capture-toggle.sh`, and `check-capture-operator-only.sh` all exit 0; no file
+  other than `FlowHandoff.swift` changed.
+
+### Task 3: `scope_spec.rs` module doc
+
+- **Satisfies:** CR-AC4 (the Rust half)
+- **Depends on:** none (independent of Tasks 1 and 2)
+- **Files:** `crates/aitm/src/macos_capture/scope_spec.rs` (modify, doc comment only)
+- **Change:** in the `//!` module doc (lines 1–15), add one short paragraph stating the
+  provider's claim rule from the emitter's side: the L7 host / `host:port` / `*.suffix`
+  tokens this module emits gate **TCP only**; a UDP flow is claimed only through an L4
+  IP token (`ip` / `ip:port` from `l4_token`); and a datagram to port 53, 5353, or 853
+  is never claimed regardless of tokens, because the embedded core has no UDP backend
+  and the provider must fail open on the system resolver. No code change, no new tokens.
+- **Test:** `cargo test -p aitm scope_spec` still passes (4 tests, unchanged
+  byte-assertions); `grep -n '5353' crates/aitm/src/macos_capture/scope_spec.rs` prints
+  a `//!` line; `cargo doc -p aitm --no-deps` emits no new warning for this module.
+- **Done when:** the full Rust gate is green
+  (`cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`),
+  output quoted; `git diff --stat` shows only `scope_spec.rs` with additions in comment
+  lines only.
+
+## Stage 5/6 notes for the orchestrator
+
+- Tester on Task 1: besides re-running the runner, confirm no caller of the old
+  three-argument `matches` survives (`grep -rn 'matches(hostname:' apps/mac/Extension`
+  returns nothing) and that `TransparentProxyProvider.swift` is unchanged.
+- Panel on the whole branch: the security lane should confirm the claim is strictly
+  narrower than before (no new `true` path), and that `neverClaimedDatagramPorts` is
+  consulted before any entry (fail open independent of scope).
+- CR-AC6 is deferred to the v0.5.4 DMG (spec); record its log lines under Shipped.
+
+## Review log
+
+Kept by the main session during stage 6. One row per finding.
+
+| Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
+|---|---|---|---|---|
+
+## Shipped
+
+What merged, what was cut, follow-ups. Filled at stage 7. Follow-ups already known:
+stale-attachment / shared-socket-directory hardening; preserving the A/B scripts
+(`/tmp/claude/nescope-test3.py`, `-test4.py`) under `tests/e2e/` as a live NE recipe;
+CR-AC6 evidence from the v0.5.4 DMG.
