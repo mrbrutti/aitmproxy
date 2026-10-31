@@ -576,6 +576,39 @@ mod tests {
         }
     }
 
+    /// A name that only contains one of the short secret words (`subsidiary`
+    /// holds `sid`, `author` holds `auth`) is redacted too: over-matching is
+    /// deliberate, a leaked session id costs more than a hidden example.
+    #[test]
+    fn enumerate_redacts_a_wide_only_parameter_name() {
+        let flow = captured(
+            "/x?subsidiary=acme&author=bob&sidebar=1&page=2",
+            HeaderMap::new(),
+        );
+
+        let points = enumerate(&flow);
+
+        assert_eq!(points.len(), 4, "exactly four query points: {points:?}");
+        for name in ["subsidiary", "author", "sidebar"] {
+            assert_eq!(
+                example_of(&points, Location::Query, name),
+                "<redacted>",
+                "query {name} must be redacted"
+            );
+        }
+        assert_eq!(
+            example_of(&points, Location::Query, "page"),
+            "2",
+            "a plain parameter keeps its value"
+        );
+        for leaked in ["acme", "bob"] {
+            assert!(
+                !points.iter().any(|p| p.example.contains(leaked)),
+                "{leaked} leaked: {points:?}"
+            );
+        }
+    }
+
     /// A hostile body of a million parameters must be capped, and the dedupe
     /// must not be quadratic.
     #[test]
