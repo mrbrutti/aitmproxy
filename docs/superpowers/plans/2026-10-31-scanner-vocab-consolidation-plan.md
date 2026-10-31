@@ -1119,7 +1119,38 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| R1 whole branch (bcd9647) | security | Important | F1: the single wide scan swallows a nested standard-secret key (`authentication:\n  password: hunter2`, `sidebar=sid="C1"`); I1/I2 fail on the aligned alphabet (13,635 / 14,627 of 3M); `scrub_text_wide` not a superset of `scrub_text` | fixed in 623577e (two passes, standard then wide) and 481a272 (15 AC14 rows recorded from the old tree); closed by the round-2 differential (I1 = I2 = 0 on 8.5M aligned inputs, I5 = 0) |
+| R1 | security | Minor | F2: class D, DC1-DC3 relaxations mask a region that ends mid-pair (newline after a separator under a wide-only parent) | fixed for the line-break shapes in 623577e (the wide scan keeps `\n`, `\r`, `\x0c` as a boundary); arms D1-D3 accepted by the orchestrating session under Matt's autonomous-approve mode, 2026-10-31: exotic (non-ASCII glue, non-ASCII space, dotted host:port), measured 16 per 1M full-alphabet inputs, no test pins a leak; flagged in the PR |
+| R1 | security | Minor | F3: DC5 / DC6 rated, with the worst shape (unclosed quote then a vertical tab or Unicode space leaves the whole value) | accepted (same authority and date): the credential itself must hold a vertical tab or Unicode space or follow a malformed quote; `password`, `token`, `api_key` already behaved so in the old pipeline; recorded in spec Residual risks 1 |
+| R1 | security | Minor (pre-existing) | F4: nested YAML under a standard-secret parent leaks through core `scrub_text` (`auth:\n  password: hunter2`) | not this branch; follow-up (Shipped 1) |
+| R1 | quality | Minor | Q1: docs claim the two scrubs "cannot disagree / cannot diverge" | fixed in 623577e (core docs) and 481a272 (scanner docs); the residual wording in C2 fixed in Fix 3 |
+| R1 | quality | Minor | Q2 history comment, Q3 AC15 test doc, Q4 corpus over rustfmt's line limit, Q5 copied scaffolding and helper names | fixed in 623577e (renames) and 481a272 (Q2, Q3, Q4 via five backslash line-continuations with a byte-identical value, Q5 helpers) |
+| R1 | spec | Minor | S1: the standard reading of scanner free text is pinned by one test; swapping `safe_target` or the `commands.rs` free-text calls goes red nowhere | `safe_target` fixed in 481a272 (AC28); the `commands.rs` pin is a follow-up (tests only, in its own test module; AC18 forbids editing it here); tester mutants (i) and (i2) record the survivor |
+| R1 | spec | Minor | S2: the `patterns()` doc edit (41b91a0) is not in Design 9's list | accepted: accurate and doc-only; now Design 9 item 11 |
+| R1 | spec | Minor | S3: Goal 3 (`scrub_text` and `is_secret_key` unchanged for every input) evidenced only by corpora | closed by the I4 differential (6M `scrub_text` inputs, 20.9M `is_secret_key` key runs, 0 differences, repeated in round 2) |
+| R2 whole branch (2c0942d) | security | Minor | D4: DC4's opener-shaped-quote rule lets a wide-only quoted value swallow a nested wide-only quoted key even with balanced quotes (`sidebar="a=":"sessions":"C1"`) | accepted as a documented arm (orchestrating session under Matt's autonomous-approve mode, 2026-10-31): ASCII, quotes directly after `=` or `:`, valid JSON/forms/queries unaffected, same family as PR 171's documented residual for standard keys; a code fix would add a second closing-quote rule; documented in Fix 3 (code doc) and Amendment 2 (spec) |
+| R2 | security | Minor | a credential on the next line under a wide-only key is left in the clear (the F2 rule's exposure) | accepted, byte-identical to the old pipeline (not a regression); documented in Fix 3 and Amendment 2; one follow-up with F4 (core's newline rule) |
+| R2 | security | Minor | `scrub_text_wide` takes more than 4x `scrub_text` on blank-run families (still linear; 46 ms for 8 MiB) | accepted, bound restated in Amendment 2 (Design 7 I3); the optional change to the shared scan was not taken (it would need the I4 re-run) |
+| R2 | security | Minor | DC5 / DC6 / D1-D3 re-rated; `scrub_text_wide` not idempotent on malformed quotes (also true of `scrub_text` and the old tree; a second pass only masks more) | accepted (same authority and date) |
+| R2 | security | Minor (pre-existing) | F4 re-confirmed through real `build_poc` on the url, json, form and text surfaces (identical to the old tree) | follow-up (Shipped 1); recommended soon: it puts a credential into a shareable artifact |
+| R2 | quality | Minor | `scrub_text_wide` repeats `scrub_text`'s body; docs overclaim that a value's start is shared | fixed in Fix 3 (C1, C2) |
+| R2 | quality | Minor | recorded corpora pin a leaked tail, one with the canary `S3CR3T` | fixed in Fix 3 (C5: row deleted, tail groups commented) |
+| R2 | quality | Minor | round-2 tester scaffolding copied (corpus chain, superset computation, prefix iterator, shadowed loop variable) | fixed in Fix 3 (C6) |
+| R2 | quality | Minor | oversized-name test: doc says megabyte, uses 256 KiB, failure dumps megabytes | fixed in Fix 3 (C7) |
+| R2 | quality | Minor | `is_secret_name_is_the_wide_reading_for_odd_names` re-tests a one-line delegate | fixed in Fix 3 (C8: dropped) |
+| R2 | quality | Minor | raw non-ASCII letters in the core corpus | fixed in Fix 3 (C9: escapes) |
+| R2 | spec | Minor | AC23(h) names a second red test that is not red; Design 8 row prescribes a phrase AC20 bans; Design 3 class-D sentence lists two triggers where the code lists more | fixed in Fix 3 (Amendment 2, spec edits S1-S3) |
+| R2 | spec | Minor | tester round 2's stability test (`scrub_text_wide_is_stable_on_its_own_output_across_the_corpora`) has no spec hook and pins a property the docs do not claim | fixed in Fix 3 (C10: dropped); final counts core `redact` 54, scanner 192 recorded in the spec |
 
 ## Shipped
 
 What merged, what was cut, follow-ups. Filled at stage 7.
+
+Follow-ups (recorded now, finalised at stage 7):
+
+1. **F4, core's newline rule** (security, pre-existing, recommended soon): `auth:\n  password: hunter2` becomes `auth:\n  [redacted] hunter2` through core `scrub_text`, so the child value reaches the audit ring, findings text, MCP error text and, via `build_poc`, shareable PoCs; also the next-line credential under a wide-only key (`userSession:\n  S3SS10N9`) stays unmasked. Needs its own spec: core skips a newline after a separator, so a child key is taken as the parent's value.
+2. **S1, the `commands.rs` pin**: a tests-only change in `commands.rs`'s own test module asserting that its free-text calls stay on the standard reading (tester mutants (i), (i2) survive today).
+3. **Class-D arms D1 to D4** are an accepted Minor residual (spec Residual risks 8); the named alternative that removes DC3 and arm D3 (wide scan judges only the five words as substrings) is a one-line change if Matt wants it.
+4. DC5 / DC6 fallback (a lenient unquoted-value end in the wide scan) is named, not built.
+5. `crates/aitm-poc/tests/builder.rs` comments that still say the shared set "lacks jwt/sid" (spec Non-goals): a later docs sweep.
+6. The differential tooling lives only in `/tmp/claude-501/svc-diff-tools{,-r2}/` (outside the repo); copy it to a durable place if it should be reused.

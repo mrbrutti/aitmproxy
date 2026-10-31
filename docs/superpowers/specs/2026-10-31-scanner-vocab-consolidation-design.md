@@ -1,6 +1,6 @@
 # Scanner vocabulary consolidation design
 
-**Status:** approved (2026-10-31, self-approved by the orchestrating session under Matt's autonomous-approve mode); amended after the Stage 6 panel (Amendment 1, 2026-10-31)
+**Status:** approved (2026-10-31, self-approved by the orchestrating session under Matt's autonomous-approve mode); amended after the Stage 6 panel (Amendment 1, Amendment 2, 2026-10-31)
 **Research inputs:** no `docs/research/` note. This is the follow-up named
 "scanner vocabulary consolidation" by `docs/superpowers/specs/2026-10-30-audit-ring-integrity-design.md`
 (Non-goals, Design 4, Residual risks 12-14) and its plan (Shipped section). Code read on
@@ -36,7 +36,8 @@ that `scrub_text` masks in 80,102 of 1,500,000 inputs.
 then the same scan with the wide reading over its output. The first scan is `scrub_text`'s own, so a
 nested pair is masked first, exactly as before, and everything `scrub_text` masks stays masked (the
 second scan only replaces more values with `[redacted]`). "One pair scanner" stays true: one function,
-one value rule, one closing-quote rule, run twice. Cost: about twice the scan time, still linear.
+one value rule, one closing-quote rule, run twice. Cost: about twice the scan time on ordinary text
+(more on a long blank run: Residual risks 12), still linear.
 `scrub_text` and `is_secret_key` are not touched, so AC8 and AC10 stand. Rejected: the single wide scan
 (the reviewed shape; numbers above and in the table below).
 
@@ -53,8 +54,9 @@ whitespace, the vertical tab). Consequences: (a) every line-break shape is byte-
 pipeline printed, so the aligned alphabet of Design 7 now allows line breaks at separators and I2 covers
 them (scratch: 1,000,000 such inputs, 0 violations); (b) DC2 shrinks to non-ASCII whitespace and the
 vertical tab, and `author:\nJohn` is no longer a deliberate change; (c) the reading parameter is
-consulted in a third place (Design 4, AC19). What is left of class D is three exotic arms, D1 to D3
-(Residual risks 8), accepted as a Minor residual; no test pins a leak.
+consulted in a third place (Design 4, AC19). What was left of class D was three exotic arms, D1 to D3
+(Residual risks 8; the round-2 panel found a fourth, D4: Amendment 2), accepted as a Minor residual;
+no test pins a leak.
 
 | Blank rule of the wide scan beside a separator | aligned + line breaks, 1M: I1 inputs / I2 | full alphabet, 1M: inputs that leak more than old | soup, 1M | Verdict |
 |---|---|---|---|---|
@@ -84,6 +86,45 @@ change, Residual risks 9. S1: the `safe_target` pin is added (AC28); the `comman
 follow-up (Residual risks 10). S2: the `patterns()` doc edit is accurate and doc-only, now Design 9 item
 11. S3: closed by I4. Q1 to Q5: Design 9, AC20 and the plan's Fix tasks. Fix tasks may edit tests that
 this branch added; no pre-existing test is edited beyond Design 8's list.
+
+## Amendment 2 (post-round-2 panel), 2026-10-31
+
+The round-2 panel (head `2c0942d`) passed all three reviews with Minor findings only: no Critical, no
+Important, and F1 is closed. Its differential ran 20.5M inputs (8.5M aligned, line breaks at separators
+included): I1, I2, I4 and I5 were 0, and all 269,519 leaking inputs held a trigger T1 to T4. **This
+amendment changes no behaviour of any public function** (`scrub_text`, `scrub_text_wide`,
+`is_secret_key`, `is_secret_key_wide`, `scrub_embedded`, `is_secret_name`). It is documentation, test
+hygiene, one more named residual, and corrected text in this spec. Sections edited in place: the Status
+line, two pointers in Amendment 1, Design 3, 5, 6, 7, 8, 9, Residual risks 2, 4, 8 (and new 11, 12), the
+Acceptance criteria preamble, AC22, AC23, AC24, Open questions, Summary, Architect's calls (new 15 to 17).
+
+1. **Class D has a fourth arm, D4 (Minor).** DC4's opener-shaped-quote rule lets a quoted wide-only value
+   that holds an unescaped quote right after `=` or `:` close at the closing quote of a quoted wide-only
+   key behind it, with no delimiter between. That key is inside the masked region, so its value stays in
+   the clear (`nsid='='authr'=C1` leaves `C1`; Residual risks 8). DC4's "same exposure, shorter output"
+   holds only when the swallowed pair is a standard-secret pair, which the first scan has already masked.
+   Accepted like D1 to D3: no smaller rule exists without a second closing-quote rule, and no test
+   asserts the leak.
+2. **The next-line shape is documented, not changed (Minor).** A credential on the line after a
+   wide-only key stays unmasked, as in the old pipeline (`userSession:\n  S3SS10N9`); the standard
+   reading masks `session:\n  S3SS10N9`. The `scrub_text_wide` doc says so (Design 3, Residual risks 11).
+3. **The I3 timing bound is restated, not the code changed (Minor).** "At most 4 times `scrub_text`" was
+   too tight on blank-run input (Design 7 I3, Residual risks 12). The panel's optional change to the
+   shared scan was not taken: it would touch code both readings share.
+4. **Dispositions, accepted:** DC5, DC6, arms D1 to D4, and that both scrubs are not idempotent on
+   malformed quotes (`scrub_text` included, and the old tree). **Still follow-ups:** F4 (Residual risks
+   9) and the `commands.rs` free-text pin (Residual risks 10).
+5. **Counts.** Head `2c0942d` runs 55 `redact` tests in core and 193 in the scanner; Fix 3 drops two
+   tester tests that no criterion needs (a stability pin the docs do not claim, a re-test of the
+   one-line `is_secret_name` delegate), so after Fix 3: core `redact` 54, scanner 192 (AC22).
+6. **Hygiene (the Coder's Fix 3, no behaviour).** The `scrub_text_wide` and module docs stop saying a
+   value's start is shared: the line-break rule is the one difference that changes where a value starts;
+   `scrub_text_wide`'s body may be `mask_secret_pairs(&scrub_text(text), Reading::Wide)`, already the
+   builder's call; duplicated test scaffolding is extracted; the one recorded row that pins a leaked tail
+   (`password='x password'=S3CR3T`) is removed and the groups that keep such a tail are marked as the
+   standard scan's unchanged behaviour, not requirements. Spec text fixes: AC23 (h) said `scrub_url`'s
+   test goes red under mutant (h) (it does not: `scrub_url` calls `scrub_text` itself), and Design 8
+   prescribed a "before PR 171 none" wording that AC20 bans.
 
 ## Intent
 
@@ -255,10 +296,17 @@ pub fn scrub_text_wide(text: &str) -> String
   every pair whose key reads as secret under `is_secret_key_wide`. The wide scan has **no host:port
   exemption** and does not skip `\n`, `\r` or `\x0c` beside a separator. Doc intent: over-redacts by
   design; says it is two scans of one function, names the three places the second scan differs from
-  the first (key test, host:port exemption, line breaks beside a separator) and says everything else
-  (value rule, quotes, nested pairs) is shared; says in one sentence that a non-ASCII letter glued
-  into a key, or a non-ASCII space beside a separator, can make the wide scan read a wider pair than
-  the standard one and let a wide-only pair nested right after it keep its value (Residual risks 8).
+  the first (key test, host:port exemption, line breaks beside a separator) and says where a key run
+  and a closing quote begin and end, where a value ends and how a nested pair is found are shared,
+  and that the line-break rule is the one difference that changes where a value starts (Amendment 2);
+  says in one sentence that four exotic shapes can make the wide scan read a wider pair than the
+  standard one and let a wide-only pair nested right after it keep its value: a non-ASCII letter
+  glued into a key (D1), a non-ASCII space beside a separator (D2), a dotted key that names a secret
+  before a port (D3), and an unescaped quote right after `=` or `:` inside a quoted wide-only value
+  (D4) (Residual risks 8); and says in one sentence that a credential on the next line under a
+  wide-only key is not masked, as before (`userSession:\n  S3SS10N9`, `sidebar:\nS3SS10N9`), where
+  the standard reading masks `session:\n  S3SS10N9` (Residual risks 11). Examples in docs use short
+  fake canaries.
 - `is_secret_key` and `scrub_text` keep their signatures and, byte for byte, their behaviour.
 
 ### 4. One scan function, two readings, two passes (private seam)
@@ -332,18 +380,19 @@ code**, and a mismatch with this table stops the Coder (spec gap).
 | 3a | `\n`, `\r` or `\x0c` beside a separator | P2: not a blank, so the pair has no value on its line | wide scan: not a blank either | none | identical | `author:\nJohn` unchanged; `authentication:\n  sessionKey: abc123` to `authentication:\n  sessionKey: [redacted]` | AC14, AC27 |
 | 3b | Other whitespace beside a separator (non-ASCII whitespace, vertical tab) | P2: space and tab only | wide scan: skipped as core skips it | masks at least as much (`sidebar\u{a0}:\u{a0}v`), or same exposure with different bytes (`sidebar=\u{b}v`) | accept (DC2) | `sidebar\u{a0}:\u{a0}v` to `sidebar\u{a0}:\u{a0}[redacted]`; `sidebar=\u{b}v` from `sidebar=[redacted]` to `sidebar=\u{b}[redacted]` | AC15, AC5 |
 | 4 | End of an unquoted value | P2: `is_ascii_whitespace` (no vertical tab) and delimiters; non-ASCII never ends | core: also vertical tab and Unicode whitespace | **masks less** | accept (DC5) | `sid=abc\u{a0}def` to `sid=[redacted]\u{a0}def` | AC15 |
-| 5 | Closing quote, both close | P2: first unescaped quote | core: skips an opener-shaped quote (after `=`/`:`, followed by a value char) | same exposure, different bytes | accept (DC4) | `sidebar='abc def token='S3'` to `sidebar='[redacted]'` | AC15, AC5 |
+| 5 | Closing quote, both close | P2: first unescaped quote | core: skips an opener-shaped quote (after `=`/`:`, followed by a value char) | same exposure, different bytes, when the swallowed pair is a standard-secret pair (the first scan masked it); a swallowed quoted wide-only key can keep its value (arm D4, Residual risks 8) | accept (DC4, D4) | `sidebar='abc def token='S3'` to `sidebar='[redacted]'` | AC15, AC5 |
 | 6 | Closing quote, core finds none | P2 closes at the opener-shaped quote | core falls back to the plain unquoted rule and remembers the failed search | **masks less** | accept (DC6) | `sid='abc def token='S3` to `sid='[redacted] def token='[redacted]` | AC15 |
 | 7 | host:port | P1 exempts; P2 re-masks it for any key with a segment word | first scan exempts as P1; wide scan never exempts | masks at least as much | five-word keys unchanged (AC14); needle-only keys accept (DC3) | `token.example.com:8443/x` to `token.example.com:[redacted]` | AC6, AC14, AC15 |
 | 8 | Pairs nested in a value | P1 masks a nested standard pair, P2 then masks the value | the first scan masks a nested standard pair, the wide scan then masks the value | none | identical (the single-scan first design of this spec was not: F1) | `author=password=S3` to `author=[redacted]`, and `sidebar=sid="C1"` to `sidebar=[redacted]"[redacted]"`, both old and new | AC14, AC25 |
 | 9 | Empty value; scan resumption after a non-secret key | resume after the key run | resume after the key run | none | identical | `sid=&password=x` | existing tests, AC14 |
 
 Direction in one sentence: **what can leave more of a value in the clear than today is DC5 and DC6
-(malformed or exotic input, accepted) and class D (three exotic arms that need a non-ASCII character
-or a needle-named dotted host:port, Residual risks 8); nothing that a well-formed input can do.** Well
-formed means the aligned alphabet of Design 7 (ASCII, balanced quotes, no vertical tab, no form feed,
-no `key:digits` host:port, line breaks allowed anywhere): there the new output equals the old output
-byte for byte (I2). The first wording of this paragraph said that only DC5 and DC6 could leave more
+(malformed or exotic input, accepted) and class D (four exotic arms: three need a non-ASCII character
+or a needle-named dotted host:port, the fourth an unescaped quote right after `=` or `:` inside a
+quoted value, Residual risks 8); nothing that a well-formed input can do.** Well formed means the
+aligned alphabet of Design 7 (ASCII, balanced quotes and no unescaped inner quote, no vertical tab, no
+form feed, no `key:digits` host:port, line breaks allowed anywhere): there the new output equals the
+old output byte for byte (I2). The first wording of this paragraph said that only DC5 and DC6 could leave more
 and that I2 held; both were false for the single-scan first design, whose counterexamples were well
 formed: `authentication:\n  password: hunter2` and `sidebar=sid="C1"` left `hunter2` and `C1` in the
 clear (Amendment 1).
@@ -373,7 +422,7 @@ free-text output.
 | DC1 | A key run glues across non-ASCII characters, so a secret word inside it counts (`xsidéy=v`); residual arm D1 | wide-only keys | more masked | none (no existing input has a non-ASCII char glued to a key) |
 | DC2 | A vertical tab or a non-ASCII whitespace character may sit beside the separator (`sidebar\u{a0}:\u{a0}v`, `sidebar=\u{b}v`). A line break or form feed may not: the wide scan keeps `\n`, `\r`, `\x0c` as a boundary, so `author:\nJohn` is unchanged and is not a change; residual arm D2 | wide-only keys (the five words already behaved so through P1) | `sidebar\u{a0}:\u{a0}v` more masked; `sidebar=\u{b}v` same exposure, different bytes | none |
 | DC3 | A needle-only dotted key before a port is masked (`token.example.com:8443/x`); residual arm D3 | needle-only dotted keys | more masked | none |
-| DC4 | A quoted value holding an opener-shaped quote closes at the real closer (`sidebar='abc def token='S3'`) | wide-only keys | same exposure, shorter output | none |
+| DC4 | A quoted value holding an opener-shaped quote closes at the real closer (`sidebar='abc def token='S3'`); residual arm D4 | wide-only keys | same exposure, shorter output, when the swallowed pair is a standard-secret pair; a swallowed quoted wide-only key can keep its value (arm D4) | none |
 | DC5 | An unquoted value ends at a vertical tab or a non-ASCII whitespace char | the five words and wide-only keys | **less masked** | none |
 | DC6 | An unclosed quote with only opener-shaped later quotes ends at the plain unquoted rule | the five words and wide-only keys | **less masked** | none |
 
@@ -421,16 +470,19 @@ freeze ~130 lines of code nobody maintains, and its job is one-time evidence. Th
      (DC1 to DC6 each need something outside the alphabet.)
    - **I3 (full alphabet).** No panic, no char-boundary error; linear time (on each hostile family,
      the time at 2, 4 and 8 MiB is at most 3.0 times the time at the previous size, and
-     `scrub_text_wide` takes at most 4 times what `scrub_text` takes on the same input, about 2
-     expected); and every canary that `new` leaves while `old` masked is in an input that holds at
-     least one **trigger**: T1 a vertical tab or a non-ASCII whitespace character (DC2, DC5, arm D2);
-     T2 a non-ASCII character that is not whitespace, directly beside an ASCII key character (DC1, arm
-     D1); T3 an unclosed or unmatched quote, or an opener-shaped quote (DC4, DC6); T4 a dotted key
-     directly before `:` and one to five digits (DC3, arm D3). A leak in an input with none of the four
-     is a finding. The reviewer also minimizes (deletes characters while some canary still leaks in `new`
-     and not in `old`) at least 25 leaking inputs per trigger kind and groups the minimal reproducers;
-     every group must be DC5, DC6, D1, D2 or D3, and a group outside them is a finding. (The kept tool's
-     trigger test knows only T1 and T3; the reviewer adds T2 and T4.)
+     `scrub_text_wide` takes about twice what `scrub_text` takes on the same input: at most about 2.1
+     times on every family except blank-run families, where `scrub_text` itself takes under 2 ms per
+     MiB and the ratio reaches about 6.3 times (`sid:`, a run of newlines, `x`) while the absolute cost
+     stays linear, 46 ms for 8 MiB; Residual risks 12); and every canary that `new` leaves while `old`
+     masked is in an input that holds at least one **trigger**: T1 a vertical tab or a non-ASCII
+     whitespace character (DC2, DC5, arm D2); T2 a non-ASCII character that is not whitespace,
+     directly beside an ASCII key character (DC1, arm D1); T3 an unclosed or unmatched quote, or an
+     opener-shaped quote (DC4, DC6, arm D4); T4 a dotted key directly before `:` and one to five digits
+     (DC3, arm D3). A leak in an input with none of the four is a finding. The reviewer also minimizes
+     (deletes characters while some canary still leaks in `new` and not in `old`) at least 25 leaking
+     inputs per trigger kind and groups the minimal reproducers; every group must be DC5, DC6, D1, D2,
+     D3 or D4, and a group outside them is a finding. (The kept tool's trigger test knows only T1 and
+     T3; the reviewer adds T2 and T4.)
    - **I4 (the untouched functions).** `scrub_text` over at least 3,000,000 fresh inputs, and
      `is_secret_key` over at least 1,000,000 keys, equal the old tree's outputs (zero differences);
      `is_secret_name` equals the old scanner predicate over at least 1,000,000 keys. (Closes S3; the
@@ -462,7 +514,7 @@ the `EXTRA_SECRET_NEEDLES` import, and `is_key_byte`, `ends_value`, `names_a_sec
 | Test | File | Edit | Reason | Replacement assertion |
 |---|---|---|---|---|
 | `scrub_embedded_covers_every_extra_secret_needle` | `reproduce.rs` | renamed `scrub_embedded_covers_every_segment_word`; body iterates the literal `["sid","jwt","csrf","session","auth"]` instead of `EXTRA_SECRET_NEEDLES` | it names a deleted constant | the same three assertions per word: `is_secret_name(word)`; `scrub_embedded("x_{word}_y=V1&z=2") == "x_{word}_y=[redacted]&z=2"`; `scrub_embedded("{WORD}: V1") == "{WORD}: [redacted]"`. The literal list is deliberate (a dropped word must fail), as core's `is_secret_key_names_every_substring_needle` does. Its doc comment drops "built from the very slice". |
-| `build_poc_drops_the_referer_query_and_leaks_no_session_id` | `reproduce.rs` | doc comment only (~1315) | says none of the names "is in `scrub_text`'s", false since PR 171 | reword as history ("before PR 171 none was..."); no assertion changes |
+| `build_poc_drops_the_referer_query_and_leaks_no_session_id` | `reproduce.rs` | doc comment only (~1315) | says none of the names "is in `scrub_text`'s", false since PR 171 | reword as Design 9 item 8 says (what `scrub_text` alone knew until PR 171, and that the embedded-value scrub must mask all of them), never as "before PR 171 none ...", which AC20 bans; no assertion changes |
 | `build_poc_scrubs_session_ids_embedded_in_a_non_secret_header` | `reproduce.rs` | doc comment only (~1372) | "The needle layer on its own" names a deleted layer | reword to "the embedded-value scrub on its own" |
 | `scrub_embedded_masks_every_shared_vocabulary_name` | `reproduce.rs` | one inline comment (~1510) | "one pass, two vocabularies" | reword to one list, read by the wide scrub (Task 3 wrote "one scan, one list"; Amendment 1 corrects it, Design 9 item 8) |
 | `enumerate_redacts_common_auth_parameter_names` | `discover.rs` | doc comment only (~537) | "outside the shared vocabulary" is false since PR 171 | reword; no assertion changes |
@@ -476,7 +528,10 @@ Core, `crates/aitm-core/src/redact.rs`:
 2. Module doc (~1-24): one list, two readings; `scrub_text` and `scrub_text_wide` named;
    `scrub_text_wide` is the standard scan then the wide scan, so it masks everything `scrub_text`
    masks; the wide scan differs from the standard one in three declared places (key test, host:port
-   exemption, line breaks beside a separator) and shares everything else. **The Stage 6 panel named
+   exemption, line breaks beside a separator) and shares everything else: say where a key run and a
+   closing quote begin and end, where a value ends and how a nested pair is found are shared, and that
+   the line-break rule is the one difference that changes where a value starts, never that "a value" is
+   shared outright (Amendment 2). **The Stage 6 panel named
    two false passages, rewritten by this amendment:** the module doc's "a scrubber and its predicate
    cannot diverge, and both readings share one pair scanner, so the two scrubbers differ in that
    predicate and in the host:port exemption, and in nothing else" (~21-24), and the
@@ -494,7 +549,8 @@ Core, `crates/aitm-core/src/redact.rs`:
    run, separator, value end or closing quote lies. The `Reading` enum docs say the variants are the
    readings of the first and the second scan.
 5b. `scrub_text_wide` doc: rewritten as Design 3 describes (two scans, superset, three differences,
-   linear at about twice `scrub_text`, one sentence on the class-D residual).
+   linear at about twice `scrub_text`, one sentence on the class-D residual naming arms D1 to D4, one
+   on the credential on the next line under a wide-only key).
 5c. Rename two private helpers to the `is_*` / `contains_*` convention (Q5): `holds_secret_word` to
    `is_secret_lower`, `holds_segment_word` to `contains_segment_word`. Three call sites, no test
    names them.
@@ -503,6 +559,9 @@ Scanner, `crates/aitm-plugin-scanner/src/`:
 6. `reproduce.rs` module doc (~17-22): `scrub_embedded` is "URL userinfo stripped, then
    `aitm_core::redact::scrub_text_wide`", not "`scrub_text` plus the same widened name vocabulary";
    say "a narrower reading", not "a narrower list", and reflow the ragged wrap at lines 22-23 (Q1).
+   Amendment 2: not that a credential "cannot slip past a narrower reading" (the wide scan is not
+   unbeatable: Residual risks 8); say a credential embedded in an innocuously named value is judged
+   by the same wide reading, not a narrower one.
 7. `scrub_embedded` doc (~362-373): rewrite. The three-step description and the claim that
    `scrub_text` alone "only knows api_key / token / ..." are false, and so is "the two scrubs cannot
    disagree about which names are secret": say that both judge a key by the same predicate (Q1).
@@ -574,7 +633,9 @@ branch plus current `main`, so a sibling's new `reproduce.rs` test can fail only
 2. **PR 171 Residual risks 12-14 now also bind the PoC path for the five words and wide-only
    keys:** `password='x password'=S3CR3T` style leaks, a quoted key opener right after an unclosed
    quote, `token="token="S3CR3T`, and `Cookie: sid="S3CR3T"` (the `Cookie` pair's unquoted value
-   stops at the quote). The old second scan did not close these either; unchanged.
+   stops at the quote). The old second scan did not close these either, so they are unchanged,
+   except for one case DC4 opens: a quoted wide-only value can now lose a nested quoted wide-only
+   key to the opener-shaped-quote rule and leave that pair's value (arm D4, risk 8).
 3. **A dotted key containing a segment word before a port is still masked in PoC-embedded values**
    (`https://auth.example.com:8443/cb` becomes `https://auth.example.com:[redacted]`): unchanged
    readability cost, now also for needle-only dotted keys (DC3, with arm D3 of risk 8). A PoC step
@@ -582,17 +643,19 @@ branch plus current `main`, so a sibling's new `reproduce.rs` test can fail only
    change.
 4. **Prose false positives get slightly wider for wide-only keys:** `Author:\u{a0}John` loses
    `John` (DC2). A line break no longer widens anything (`Author:\nJohn` is unchanged), unlike
-   `auth:\nnext line`, which the standard scan has always masked for the five words.
+   `auth:\nnext line`, which the standard scan has always masked for the five words. (The
+   missed-credential side of the same rule is risk 11.)
 5. **The wide reading is public.** Another crate could adopt it for audit keys and mask `authority`.
    The doc says not to; nothing enforces it. Core's own `authority` tests guard the standard reading.
 6. **Literal five-word lists in tests do not fail when a word is added to core.** Same as PR 171's
    needle test; accepted. Core's `is_secret_key_wide_names_every_segment_word` is the one that names them.
 7. **The panel differential is out of tree** and depends on `15009b2` staying reachable. If the
    branch is squash-merged the SHA is still in history.
-8. **Class D: a wider pair can swallow a nested wide-only pair (F2).** Three exotic arms remain after
-   the line-break rule. In each, the wide scan masks a region the old pipeline left alone, the region
-   ends inside a nested *wide-only* pair, and that pair's value, which is quoted or padded, stays in
-   the clear. A nested standard-secret pair is never affected: the first scan masks it first.
+8. **Class D: a wider pair can swallow a nested wide-only pair (F2).** Four exotic arms remain after
+   the line-break rule (three were found by the Architect, the fourth by the round-2 panel). In each,
+   the wide scan masks a region the old pipeline left alone, the region ends inside a nested
+   *wide-only* pair, and that pair's value stays in the clear (in D1 to D3 quoted or padded, in D4
+   quoted or bare). A nested standard-secret pair is never affected: the first scan masks it first.
    Examples (old to new):
    - D1, a non-ASCII letter glued into a wide-only key (DC1): `authr\u{e9}=QAUTH:"Q7` from
      `authr\u{e9}=QAUTH:"[redacted]` to `authr\u{e9}=[redacted]"Q7`.
@@ -601,16 +664,32 @@ branch plus current `main`, so a sibling's new `reproduce.rs` test can fail only
      `jwtv:[redacted] sessions:\t[redacted]` to `jwtv:\u{a0} [redacted]\tQ9`.
    - D3, a needle-only dotted host:port key (DC3): `token.example.com:8443/x?sessions="Q5"` from
      `token.example.com:8443/x?sessions="[redacted]"` to `token.example.com:[redacted]"Q5"`.
+   - D4, an unescaped quote right after `=` or `:` inside a quoted wide-only value (DC4's
+     opener-shaped-quote rule): `nsid='='authr'=C1` from `nsid='[redacted]'authr'=[redacted]` to
+     `nsid='[redacted]'=C1`; `sidebar="a=":"sessions":"C1"` from
+     `sidebar="[redacted]":"sessions":"[redacted]"` to `sidebar="[redacted]":"C1"`. The old scan closed
+     at the first quote and so kept the nested key. The wide scan skips the inner quote as an opener
+     and closes at the next one, which is the closing quote of the nested wide-only key, so that key
+     lies inside the masked region and its value does not. (The old outputs are from running
+     `15009b2`'s code, the new from `2c0942d`'s.)
 
    Exposure: a non-ASCII character (D1, D2) or a needle-named dotted host before a port (D3), and a
-   wide-only key right behind it whose value is quoted or padded. Measured (scratch, full alphabet,
-   1,000,000 inputs): 16 inputs leak something that no DC5 or DC6 trigger explains (the samples all hold
-   a non-ASCII letter glued into a key), against 282 for the unrestricted two-scan shape and 7,283 for
-   the single scan; every leaking input holds an I3 trigger. Accepted as Minor: no smaller rule exists
-   (D1 and D3 are the key-run and exemption rules of DC1 and DC3, chosen on purpose; D2 is the half of
-   DC2 that keeps a value led by a non-ASCII space masked). **No test pins one of these outputs**, since
-   a test must not assert a leak; DC1, DC2 and DC3 keep their rows in AC15. The alternative that
-   removes D3 is named in Design 4.
+   wide-only key right behind it whose value is quoted or padded. D4 is ASCII only and needs an
+   unescaped inner quote right after `=` or `:` in a quoted wide-only value, so it is not well formed
+   (the aligned alphabet has none, and valid JSON escapes an inner quote), and then a *quoted*
+   wide-only key behind it with no delimiter between. A delimiter after the first closing quote
+   (`sidebar="a=","sessions":"C1"`), an unquoted nested key (`sidebar="a=":sessions:"C1"`) and a
+   nested standard-secret key (`nsid='='auth'=C1`) leak nothing; valid JSON (an inner quote is
+   escaped) and a form or query string with percent-encoded values hold no such quote. Measured (scratch, full alphabet, 1,000,000 inputs): 16 inputs leak something that
+   no DC5 or DC6 trigger explains (the samples all hold a non-ASCII letter glued into a key), against
+   282 for the unrestricted two-scan shape and 7,283 for the single scan; every leaking input holds an
+   I3 trigger. That count predates D4: the round-2 panel found D4 on 20.5M inputs, and every one of its
+   269,519 leaking inputs holds a trigger T1 to T4 (D4's is T3). Accepted as Minor: no smaller rule
+   exists (D1 and D3 are the key-run and exemption rules of DC1 and DC3, chosen on purpose; D2 is the
+   half of DC2 that keeps a value led by a non-ASCII space masked; D4 is the opener-shaped-quote rule
+   of DC4, shared on purpose so that an unclosed quote cannot swallow the next pair's key). **No test
+   pins one of these outputs**, since a test must not assert a leak; DC1 to DC4 keep their rows in
+   AC15. The alternative that removes D3 is named in Design 4.
 9. **Nested YAML under a standard-secret parent leaks through `scrub_text` (F4, pre-existing, outside
    this change).** `auth:\n  password: hunter2` is `auth:\n  [redacted] hunter2` through `scrub_text`,
    `scrub_embedded`, and the old pipeline alike (same for `credentials:`, `secret:`, `token:`,
@@ -622,12 +701,31 @@ branch plus current `main`, so a sibling's new `reproduce.rs` test can fail only
     `commands.rs` free-text call to `scrub_text_wide` goes red nowhere. The pin belongs in
     `commands.rs`'s own test module, which AC18 forbids editing here: a tests-only follow-up, recorded
     in the plan's Shipped section.
+11. **A credential on the next line under a wide-only key is not masked, as before (Minor, round 2).**
+    `userSession:\n  S3SS10N9` and `sidebar:\nS3SS10N9` come out unchanged through
+    `scrub_text_wide`, `scrub_embedded` and the old pipeline alike, because the wide scan reads a pair
+    on one line (Design 4); the standard reading masks `session:\n  S3SS10N9` and `sid:\nabc`. So this
+    is no regression (I2 covers line breaks at separators), the `scrub_text_wide` doc says so, and no
+    test asserts the leak (AC27's unchanged rows hold non-secret words). A wide scan that crossed the
+    line break was measured and rejected: the YAML shape `authentication:\n  sessionKey: abc123`
+    leaks (the table in Amendment 1).
+12. **`scrub_text_wide` is not always about twice `scrub_text` (Minor, round 2).** On a long run of
+    blank characters the ratio is higher: the standard scan crosses a run of newlines after a
+    separator in one tight skip loop, while the wide scan stops at the line break and steps through
+    the run a character at a time. The panel measured the ratio at up to about 6.3 times on `sid:`,
+    newlines, `x` (where `scrub_text` itself takes under 2 ms per MiB) and at most about 2.1 times on
+    every other family; the Architect's spot check on `2c0942d` gave 4.2 times and 40 ms at 8 MiB. The
+    cost stays linear (46 ms for 8 MiB in the panel's run, at most 3.0 times the previous size per
+    doubling), so nothing is quadratic and the absolute cost is small. Accepted. The panel's optional
+    change to skip a blank run in one step touches the scan both readings share and was not taken
+    (Amendment 2); the bound is restated in Design 7 I3 instead.
 
 ## Acceptance criteria
 
 `[red]` = fails on `15009b2` (does not compile or asserts new behaviour) and passes after.
 `[guard]` = passes on `15009b2` (and is written and run there first) and must pass after, unedited.
-Test names are exact; the Coder may add rows, never remove or weaken one.
+Test names are exact; the Coder may add rows, never remove or weaken one (one exception, Amendment 2:
+the recorded row that pins a leaked tail, `password='x password'=S3CR3T`, is removed).
 
 Core, `crates/aitm-core/src/redact.rs` `mod tests`:
 
@@ -750,7 +848,9 @@ Scanner, `crates/aitm-plugin-scanner/src/`:
 21. AC21 `[guard]` the suites of crates that depend on core's redaction pass unedited:
     `aitm-core`, `aitm-poc`, `aitm-findings`, `aitm-mcp` (port-binding tests in the Terminal
     panel), `aitm-plugins`, `aitm-plugin-scanner`.
-22. AC22 `[guard]` the full Rust gate is green.
+22. AC22 `[guard]` the full Rust gate is green. After Fix 3 (Amendment 2):
+    `cargo test -p aitm-core --lib redact` runs 54 tests and `cargo test -p aitm-plugin-scanner` runs
+    192, all passing (head `2c0942d`: 55 and 193, measured; Fix 3 drops two tester tests).
 23. AC23 `[guard]` mutants killed (Tester, in a scratch copy of the head, never the branch, each
     restored from a pristine copy): (a) `is_secret_key_wide` returns `is_secret_key` only: AC1, AC4,
     AC5, AC11, AC12, AC13 go red; (b) the wide scan exempts a host:port: AC6, AC14, AC15 go red; (c) the
@@ -760,7 +860,9 @@ Scanner, `crates/aitm-plugin-scanner/src/`:
     rows go red; (f) the wide scan skips blanks as core does (`skip_pair_blanks` ignores the reading):
     AC27 and the AC14 rows for line breaks go red; (g) the wide scan skips space and tab only: AC5
     (`author:\u{a0}John`) and AC15 (the DC2 rows) go red; (h) `crawl.rs::safe_target` calls
-    `scrub_text_wide`: AC28 goes red, as does `scrub_url`'s test; (i) one free-text call in
+    `scrub_text_wide`: AC28 goes red and no other test does (`scrub_url` calls `scrub_text` itself; its test,
+`build_poc_reads_the_url_path_by_the_standard_reading`, is killed by mutant (c); measured on `2c0942d`:
+192 passed, 1 failed, the AC28 test); (i) one free-text call in
     `commands.rs` calls `scrub_text_wide`: **expected to survive** (S1: no test pins it; recorded, not
     a finding, with the follow-up of Residual risks 10).
 24. AC24 (review; restated by Amendment 1) the security review report records the panel differential
@@ -770,7 +872,7 @@ Scanner, `crates/aitm-plugin-scanner/src/`:
     the amended aligned alphabet, 1,000,000 on the full alphabet, 1,500,000 for I5), and **I1 = 0 and
     I2 = 0 on the aligned alphabet**; I3 as amended (no panic, linear with the times at 1, 2, 4, 8 MiB
     and the `scrub_text_wide` to `scrub_text` ratio, every leak in a trigger input, the minimal
-    reproducers by family within DC5, DC6, D1, D2, D3); I4 (`scrub_text`, `is_secret_key`,
+    reproducers by family within DC5, DC6, D1, D2, D3, D4); I4 (`scrub_text`, `is_secret_key`,
     `is_secret_name` unchanged: zero differences); I5 (superset: zero violations); the positive
     controls (the `bcd9647` single-scan tree must report I1 and I2 violations on the amended aligned
     alphabet within its first 100,000 inputs, and the mutant (a) tree must report them too); the
@@ -828,8 +930,9 @@ Scanner, `crates/aitm-plugin-scanner/src/`:
 None that block approval. Calls where I chose the safer default over the cheaper one and Matt may
 reverse them: accepting DC5 and DC6 rather than building the fallback (Design 5); the wide scan never
 exempting host:port (Design 4), with the named alternative that also removes DC3 and arm D3; and
-accepting arms D1 to D3 of class D as a Minor residual rather than building a third rule
-(Residual risks 8).
+accepting arms D1 to D4 of class D as a Minor residual rather than building a third rule
+(Residual risks 8); and documenting, not fixing, the credential on the next line under a wide-only key
+(Residual risks 11).
 
 ## Summary
 
@@ -844,12 +947,13 @@ and `\n`, `\r`, `\x0c` kept as a boundary beside a separator. The scanner's name
 identical by construction; PoC embedded-value output is byte for byte what it was on the aligned
 alphabet (line breaks included) and otherwise changes only in six listed ways, four of which mask at
 least as much as before and two (DC5 vertical tab or Unicode space inside an unquoted value, DC6
-unclosed quote) mask slightly less, matching the standard reading's reviewed behaviour; three exotic
-shapes (D1 to D3) can also leave a nested wide-only value, and are a documented Minor residual that no
+unclosed quote) mask slightly less, matching the standard reading's reviewed behaviour; four exotic
+shapes (D1 to D4) can also leave a nested wide-only value, and are a documented Minor residual that no
 test pins. Equivalence is established by corpora recorded from the old code plus an out-of-tree
 million-input differential with stated invariants I1 to I5 (the first run of which found the single-scan
-flaw this amendment fixes). Stale comments in core, `discover.rs` and `reproduce.rs` are listed and
-fixed.
+flaw Amendment 1 fixes). Stale comments in core, `discover.rs` and `reproduce.rs` are listed and
+fixed. The round-2 panel passed with Minor findings; Amendment 2 changes no behaviour, adds the fourth
+exotic arm and the next-line shape to the documented residuals, and restates the timing bound.
 
 ## Architect's calls (for Matt to approve or correct)
 
@@ -883,9 +987,17 @@ fixed.
     makes the line-break shapes, `authentication:\n  sessionKey: abc123` among them, byte-identical to
     the old pipeline. It costs a third consultation of the reading parameter (AC19 reworded). Dropping
     DC2 outright was allowed and was measured worse (space and tab only).
-13. **(Amendment 1, F2)** The three exotic class-D arms D1 to D3 are accepted as a Minor residual with
-    no test that asserts a leak; no smaller rule exists without a second key-run, exemption or value
-    rule.
+13. **(Amendment 1, F2; Amendment 2)** The four exotic class-D arms D1 to D4 (D4 found by the round-2
+    panel) are accepted as a Minor residual with no test that asserts a leak; no smaller rule exists
+    without a second key-run, exemption, value or closing-quote rule.
 14. **(Amendment 1)** The aligned alphabet now allows line breaks at separators (so I2 covers the
     F2 shapes), I3 names four triggers, and I4 (untouched functions) and I5 (superset) are added.
     Fix tasks may edit tests this branch added, never a pre-existing test beyond Design 8.
+15. **(Amendment 2)** D4 is accepted and documented, not fixed. The only fix would be a second
+    closing-quote rule in the wide scan, which is what "one pair scanner" rules out; it needs a quote
+    that is not well formed to fire.
+16. **(Amendment 2)** A credential on the next line under a wide-only key stays unmasked, as before
+    (Residual risks 11). Crossing the line break leaks the YAML shape of F2, which measured worse.
+17. **(Amendment 2)** The I3 timing ratio is restated (about twice, up to about 6.3 times on a long
+    blank run), not the code changed (Residual risks 12). Matt may ask for the shared-scan change that
+    skips a blank run in one step; it touches code both readings share.
