@@ -1895,4 +1895,145 @@ mod tests {
             "rows that differ from the new output (input, expected, actual): {bad:#?}"
         );
     }
+
+    // ---- Edges of the embedded-value scrub: userinfo first, the ends of the text,
+    // ---- non-ASCII boundaries, a text cut short, and the name call sites.
+
+    /// URL userinfo goes first, so a username that reads as a secret word cannot
+    /// make the scan swallow the host, and the password is gone from every output.
+    #[test]
+    fn scrub_embedded_strips_userinfo_before_it_scans() {
+        let rows: &[(&str, &str)] = &[
+            ("//auth:pw@host/x", "//host/x"),
+            ("//sid:pw@host/x?q=1", "//host/x?q=1"),
+            ("//author:pw@host:8443/x", "//host:8443/x"),
+            (
+                "//token:pw@host/x?sidebar=S1",
+                "//host/x?sidebar=[redacted]",
+            ),
+            ("http://auth:pw@host", "http://host"),
+            ("//auth:pw@", "//"),
+            ("x=//auth:pw@h1/a&y=//sid:pw@h2/b", "x=//h1/a&y=//h2/b"),
+            (
+                "\u{e9}//auth:pw@h\u{f6}st/\u{fc}",
+                "\u{e9}//h\u{f6}st/\u{fc}",
+            ),
+        ];
+        let bad: Vec<(&str, &str, String)> = rows
+            .iter()
+            .filter_map(|&(input, expected)| {
+                let actual = scrub_embedded(input);
+                (actual != expected).then_some((input, expected, actual))
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "rows that differ (input, expected, actual): {bad:#?}"
+        );
+
+        // Cut at every char boundary, as a dropped connection would leave it:
+        // neither the password nor any canary value survives.
+        let doc = "//auth:pw@host/x?sid=QQQQ&author=QQQQ";
+        let mut bad: Vec<(usize, String)> = Vec::new();
+        for cut in doc
+            .char_indices()
+            .map(|(at, _)| at)
+            .chain(std::iter::once(doc.len()))
+        {
+            let out = scrub_embedded(&doc[..cut]);
+            if out.contains('Q') || out.contains("pw") {
+                bad.push((cut, out));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "a credential survived in a prefix: {bad:#?}"
+        );
+        assert_eq!(
+            scrub_embedded(doc),
+            "//host/x?sid=[redacted]&author=[redacted]"
+        );
+    }
+
+    /// The ends of the text and the non-ASCII boundaries, as the one scan reads
+    /// them. The non-ASCII rows are the shapes of DC1 and DC5 of the spec, pinned
+    /// here as the new output.
+    #[test]
+    fn scrub_embedded_reads_the_edges_of_the_text() {
+        let rows: &[(&str, &str)] = &[
+            ("", ""),
+            ("author", "author"),
+            ("author:", "author:"),
+            ("x=1&author=", "x=1&author="),
+            ("x=1&author=v", "x=1&author=[redacted]"),
+            ("sidebar=\u{e9}", "sidebar=[redacted]"),
+            ("sidebar=v\u{a0}", "sidebar=[redacted]\u{a0}"),
+            ("\u{e9}author=v", "\u{e9}author=[redacted]"),
+            ("author\u{e9}", "author\u{e9}"),
+            ("si\u{e9}d=v", "si\u{e9}d=v"),
+        ];
+        let bad: Vec<(&str, &str, String)> = rows
+            .iter()
+            .filter_map(|&(input, expected)| {
+                let actual = scrub_embedded(input);
+                (actual != expected).then_some((input, expected, actual))
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "rows that differ (input, expected, actual): {bad:#?}"
+        );
+    }
+
+    /// A wide-only name is a placeholder wherever a PoC step carries a name: a
+    /// header and a JSON key, which are `Scrubber` call sites that no other test
+    /// reaches with a name outside the standard reading.
+    #[test]
+    fn build_poc_placeholders_a_wide_only_header_and_json_key() {
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let flow = flow_with(
+            "POST",
+            "/search?q=hello",
+            &[
+                ("Content-Type", "application/json"),
+                ("X-Authority", "HDRVAL1"),
+            ],
+            Some(
+                r#"{"user":"admin","sidebar":"JSONVAL2","nested":{"subsidiary":"JSONVAL3"},"note":"ok"}"#,
+            ),
+        );
+        let q = point(&flow, Location::Query, "q", "hello");
+
+        let poc = build_poc(&flow, &def, &q, payload).expect("poc builds");
+
+        let serialized = serde_json::to_string(&poc).expect("poc serializes");
+        for secret in ["HDRVAL1", "JSONVAL2", "JSONVAL3"] {
+            assert!(
+                !serialized.contains(secret),
+                "leaked `{secret}`: {serialized}"
+            );
+        }
+        let step = http_step(&poc);
+        assert_eq!(header_of(step, "X-Authority"), Some("{{x_authority}}"));
+        let body: serde_json::Value =
+            serde_json::from_str(step.body.as_deref().expect("a json body")).expect("valid json");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "user": "admin",
+                "sidebar": "{{sidebar}}",
+                "nested": {"subsidiary": "{{subsidiary}}"},
+                "note": "ok",
+            })
+        );
+        for name in ["x_authority", "sidebar", "subsidiary"] {
+            let var = poc
+                .variables
+                .iter()
+                .find(|v| v.name == name)
+                .unwrap_or_else(|| panic!("no `{name}` variable: {:?}", poc.variables));
+            assert!(var.required && var.default.is_none(), "{var:?}");
+        }
+    }
 }

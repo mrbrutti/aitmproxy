@@ -600,6 +600,83 @@ mod tests {
         }
     }
 
+    /// A wide-only name is redacted however it arrives: percent-encoded or
+    /// non-ASCII in a query, with an empty value, with a URL value (a redirect
+    /// point), as a form field, a top-level JSON key, or a header. An empty name
+    /// is skipped and a plain name keeps its value.
+    #[test]
+    fn enumerate_redacts_a_wide_only_name_however_it_arrives() {
+        let flow = captured(
+            "/x?%73idebar=qval&authority=https%3A%2F%2Fevil.test&subsidiary=\
+             &sid%C3%A9=uval&=orphan&&page=2",
+            HeaderMap::new(),
+        );
+        let points = enumerate(&flow);
+        assert_eq!(points.len(), 5, "five named points: {points:?}");
+        assert_eq!(example_of(&points, Location::Query, "sidebar"), REDACTED);
+        assert_eq!(
+            example_of(&points, Location::Redirect, "authority"),
+            REDACTED,
+            "a URL value does not exempt a wide-only name"
+        );
+        assert_eq!(
+            example_of(&points, Location::Query, "subsidiary"),
+            REDACTED,
+            "the name decides, not the value"
+        );
+        assert_eq!(example_of(&points, Location::Query, "sid\u{e9}"), REDACTED);
+        assert_eq!(example_of(&points, Location::Query, "page"), "2");
+        for leaked in ["qval", "evil.test", "uval"] {
+            assert!(
+                !points.iter().any(|p| p.example.contains(leaked)),
+                "{leaked} leaked: {points:?}"
+            );
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.set("Content-Type", "application/x-www-form-urlencoded");
+        headers.set("X-Authority", "hdrval");
+        let flow = captured_body(
+            "/x",
+            headers,
+            Body::Bytes(b"author=formval&page=7".to_vec()),
+        );
+        let points = enumerate(&flow);
+        assert_eq!(example_of(&points, Location::BodyParam, "author"), REDACTED);
+        assert_eq!(example_of(&points, Location::BodyParam, "page"), "7");
+        assert_eq!(
+            example_of(&points, Location::Header, "X-Authority"),
+            REDACTED
+        );
+        for leaked in ["formval", "hdrval"] {
+            assert!(
+                !points.iter().any(|p| p.example.contains(leaked)),
+                "{leaked} leaked: {points:?}"
+            );
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.set("Content-Type", "application/json");
+        let flow = captured_body(
+            "/x",
+            headers,
+            Body::Bytes(br#"{"author":"jsonval","sidebar":{"n":"nestedval"},"page":3}"#.to_vec()),
+        );
+        let points = enumerate(&flow);
+        assert_eq!(example_of(&points, Location::BodyParam, "author"), REDACTED);
+        assert_eq!(
+            example_of(&points, Location::BodyParam, "sidebar"),
+            REDACTED
+        );
+        assert_eq!(example_of(&points, Location::BodyParam, "page"), "3");
+        for leaked in ["jsonval", "nestedval"] {
+            assert!(
+                !points.iter().any(|p| p.example.contains(leaked)),
+                "{leaked} leaked: {points:?}"
+            );
+        }
+    }
+
     /// A hostile body of a million parameters must be capped, and the dedupe
     /// must not be quadratic.
     #[test]
