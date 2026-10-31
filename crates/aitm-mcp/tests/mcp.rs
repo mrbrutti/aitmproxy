@@ -5039,3 +5039,600 @@ fn revoke_push_odd_state_payloads_are_muted_for_agents_and_intact_for_operators(
         "the state line follows, verbatim"
     );
 }
+
+// ===========================================================================
+// Agent policy revocation, Task 2 (plan 2026-10-30-agent-policy-revocation):
+// parked requests follow the live policy. Everything below this banner is new
+// and appended only; no line above it was edited. All of it is in-process
+// (threads and `std::sync::mpsc`, no ports, no runtime) and the tests carry the
+// `revoke_park_` prefix, so `cargo test -p aitm-mcp --test mcp revoke_park`
+// selects exactly these. Every wait is bounded by `recv_timeout`, and a failing
+// run denies the parked request so no thread outlives the test by the approval
+// timeout.
+// ===========================================================================
+
+/// A registry holding one Sensitive stub (`demo.sensitive`, which returns `"ran"`
+/// if the gate lets it through) and the real `agent.*` verbs over `state`.
+fn revoke_ask_registry(state: &Arc<AgentState>) -> Arc<Registry> {
+    let mut reg = Registry::new();
+    reg.add_command(Arc::new(TierCmd {
+        name: "demo.sensitive",
+        sens: Sensitivity::Sensitive,
+    }));
+    reg.add_plugin(Box::new(AgentPlugin::new(state.clone())));
+    Arc::new(reg)
+}
+
+/// A stdio-configured server over `registry` whose policy gate, parked-request
+/// table and approval timeout are its own, reading the policy from `state`.
+fn revoke_ask_server(
+    registry: Arc<Registry>,
+    state: &Arc<AgentState>,
+    approval_timeout: Duration,
+) -> Arc<McpServer> {
+    Arc::new(
+        McpServer::new(registry, McpTransport::Stdio)
+            .with_agent_state(state.clone())
+            .with_approval_timeout(approval_timeout)
+            .with_services(
+                Arc::new(MemFlowStore::new()),
+                Arc::new(StubClient),
+                Arc::new(StdGuard::default()),
+                None,
+            ),
+    )
+}
+
+/// A server under `Ask` and the state it reads. Like `ask_server`, but the state
+/// is handed back, so a test can change the policy directly.
+fn revoke_ask_rig(approval_timeout: Duration) -> (Arc<McpServer>, Arc<AgentState>) {
+    let state = Arc::new(AgentState::new(AgentPolicy::Ask));
+    let srv = revoke_ask_server(revoke_ask_registry(&state), &state, approval_timeout);
+    (srv, state)
+}
+
+/// P and W: two servers over one registry and one `AgentState`, each with its own
+/// parked-request table (the `aitm web` topology: P is the primary, W the `/bus`
+/// server). Returns `(P, W, state)`.
+fn revoke_ask_pair(
+    approval_timeout: Duration,
+) -> (Arc<McpServer>, Arc<McpServer>, Arc<AgentState>) {
+    let state = Arc::new(AgentState::new(AgentPolicy::Ask));
+    let registry = revoke_ask_registry(&state);
+    let p = revoke_ask_server(registry.clone(), &state, approval_timeout);
+    let w = revoke_ask_server(registry, &state, approval_timeout);
+    (p, w, state)
+}
+
+/// Poll `sink` every 10 ms for the `approval_requested` line and return its
+/// `request_id`. The panic text lists every line the operator did receive.
+fn revoke_wait_for_approval_request(sink: &NotificationSink, within: Duration) -> String {
+    let started = std::time::Instant::now();
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        for raw in sink.drain() {
+            let line: JsonValue = serde_json::from_str(&raw)
+                .unwrap_or_else(|e| panic!("a pushed line is JSON ({e}): {raw}"));
+            if line["params"]["event"] == "approval_requested" {
+                return line["params"]["request_id"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("an approval request carries a request_id: {raw}"))
+                    .to_string();
+            }
+            seen.push(raw);
+        }
+        assert!(
+            started.elapsed() < within,
+            "no approval_requested line within {within:?}; the operator received: {seen:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Run a `demo.sensitive` call as an agent-role connection on a `std::thread`; the
+/// reply (the whole JSON-RPC response) arrives on the returned channel.
+fn revoke_spawn_agent_call(srv: &Arc<McpServer>) -> std::sync::mpsc::Receiver<JsonValue> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let srv = srv.clone();
+    std::thread::spawn(move || {
+        let req = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {"name": "demo.sensitive", "arguments": {}}});
+        let reply = srv
+            .handle_on(&ConnCtx::new(Frontend::Mcp), &req.to_string())
+            .expect("a request gets a response");
+        let _ = tx.send(serde_json::from_str::<JsonValue>(&reply).expect("response is JSON"));
+    });
+    rx
+}
+
+/// An operator `agent.approve {request_id, allow: false}` on `srv`: the release
+/// that ends a parked wait.
+fn revoke_deny(srv: &McpServer, request_id: &str) -> JsonValue {
+    call_as_args(
+        srv,
+        Frontend::Operator,
+        "agent.approve",
+        json!({"request_id": request_id, "allow": false}),
+    )
+}
+
+/// Receive the parked call's reply within `within`. On a timeout, first deny the
+/// request on `srv` (so the parked thread ends now, not at the approval timeout),
+/// then panic with `what`.
+fn revoke_recv_or_release(
+    rx: &std::sync::mpsc::Receiver<JsonValue>,
+    srv: &McpServer,
+    request_id: &str,
+    within: Duration,
+    what: &str,
+) -> JsonValue {
+    match rx.recv_timeout(within) {
+        Ok(reply) => reply,
+        Err(e) => {
+            let _ = revoke_deny(srv, request_id);
+            panic!("{what} ({e:?})");
+        }
+    }
+}
+
+/// Denies `request_id` on `srv` when dropped, so any panic between "the call
+/// parked" and "the call returned" still releases the parked thread. After a
+/// normal finish the request is gone and the deny is a harmless error.
+struct RevokeRelease {
+    srv: Arc<McpServer>,
+    request_id: String,
+}
+
+impl Drop for RevokeRelease {
+    fn drop(&mut self) {
+        let _ = revoke_deny(&self.srv, &self.request_id);
+    }
+}
+
+/// The first text content of a `tools/call` reply.
+fn revoke_reply_text(reply: &JsonValue) -> String {
+    reply["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// AC14: a parked call is denied promptly, with no `agent.approve` at all, when
+/// the policy leaves `ask`, for every policy it can move to. The design bound is
+/// one 200 ms slice; the test allows 5 s.
+#[test]
+fn revoke_park_waiter_denies_promptly_when_the_policy_leaves_ask() {
+    for policy in [
+        AgentPolicy::Paused,
+        AgentPolicy::ReadOnly,
+        AgentPolicy::Auto,
+        AgentPolicy::All,
+    ] {
+        let (srv, state) = revoke_ask_rig(Duration::from_secs(60));
+        let operator = rv_subscribe(&srv, Frontend::Operator, json!({}));
+        let rx = revoke_spawn_agent_call(&srv);
+        let request_id = revoke_wait_for_approval_request(&operator.sink, Duration::from_secs(5));
+        let _release = RevokeRelease {
+            srv: srv.clone(),
+            request_id: request_id.clone(),
+        };
+
+        state.set_policy(policy);
+
+        let reply = revoke_recv_or_release(
+            &rx,
+            &srv,
+            &request_id,
+            Duration::from_secs(5),
+            &format!(
+                "the agent call did not return within 5s after set_policy({})",
+                policy.label()
+            ),
+        );
+        let text = revoke_reply_text(&reply);
+        assert!(
+            is_refused(&reply),
+            "a parked call must be refused once the policy is {policy:?}: {reply}"
+        );
+        assert!(
+            text.contains("the agent policy changed")
+                && text.contains(&format!("`{}`", policy.label())),
+            "the refusal names the policy change and the new policy ({policy:?}): {text}"
+        );
+        assert_ne!(
+            reply["result"]["structuredContent"],
+            json!("ran"),
+            "the command must not have run under {policy:?}: {reply}"
+        );
+    }
+}
+
+/// AC15 (guard, passes without the fix): `ask` to `ask` is not a change. The
+/// parked call is still parked four slices later and is still approvable.
+#[test]
+fn revoke_park_ask_to_ask_does_not_deny() {
+    let (srv, _state) = revoke_ask_rig(Duration::from_secs(60));
+    let operator = rv_subscribe(&srv, Frontend::Operator, json!({}));
+    let rx = revoke_spawn_agent_call(&srv);
+    let request_id = revoke_wait_for_approval_request(&operator.sink, Duration::from_secs(5));
+    let _release = RevokeRelease {
+        srv: srv.clone(),
+        request_id: request_id.clone(),
+    };
+
+    let set = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "agent.set",
+        json!({"policy": "ask"}),
+    );
+    assert_eq!(
+        set["result"]["structuredContent"]["policy"],
+        json!("ask"),
+        "setup: agent.set ask ran: {set}"
+    );
+
+    match rx.recv_timeout(Duration::from_millis(800)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        other => panic!("an `ask` to `ask` set must not end the parked call: {other:?}"),
+    }
+
+    let approve = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "agent.approve",
+        json!({"request_id": request_id, "allow": true}),
+    );
+    assert!(
+        !is_refused(&approve),
+        "the approve still succeeds under `ask`: {approve}"
+    );
+    let reply = revoke_recv_or_release(
+        &rx,
+        &srv,
+        &request_id,
+        Duration::from_secs(5),
+        "the approved agent call did not return within 5s",
+    );
+    assert!(!is_refused(&reply), "the approved call ran: {reply}");
+    assert_eq!(
+        reply["result"]["structuredContent"],
+        json!("ran"),
+        "the approved call returns the command's result: {reply}"
+    );
+}
+
+/// AC17: P and W share a registry and a policy but not a parked-request table.
+/// An agent call is parked on W; `agent.set paused` runs on P; W's call is denied
+/// anyway, because the waiter reads the shared state, not a flag set on P.
+#[test]
+fn revoke_park_cross_server_pause_denies_the_other_servers_call() {
+    let (p, w, _state) = revoke_ask_pair(Duration::from_secs(60));
+    let operator = rv_subscribe(&w, Frontend::Operator, json!({}));
+    let rx = revoke_spawn_agent_call(&w);
+    let request_id = revoke_wait_for_approval_request(&operator.sink, Duration::from_secs(5));
+    let _release = RevokeRelease {
+        srv: w.clone(),
+        request_id: request_id.clone(),
+    };
+
+    let paused = call_as_args(
+        &p,
+        Frontend::Operator,
+        "agent.set",
+        json!({"policy": "paused"}),
+    );
+    assert_eq!(
+        paused["result"]["structuredContent"]["policy"],
+        json!("paused"),
+        "setup: agent.set paused ran on P: {paused}"
+    );
+
+    let reply = revoke_recv_or_release(
+        &rx,
+        &w,
+        &request_id,
+        Duration::from_secs(5),
+        "the call parked on W did not return within 5s after agent.set paused ran on P",
+    );
+    let text = revoke_reply_text(&reply);
+    assert!(
+        is_refused(&reply),
+        "W's parked call must be refused after the pause on P: {reply}"
+    );
+    assert!(
+        text.contains("the agent policy changed") && text.contains("`paused`"),
+        "the refusal names the policy change and the new policy: {text}"
+    );
+    assert_ne!(
+        reply["result"]["structuredContent"],
+        json!("ran"),
+        "the command must not have run: {reply}"
+    );
+}
+
+// ===========================================================================
+// Agent policy revocation, Task 2: Tester additions (stage 5). Appended only;
+// nothing above this banner was edited. In-process (threads and `std::sync::mpsc`,
+// no ports), `revoke_park_` prefix, every wait bounded by `recv_timeout` or a
+// capped poll, and a `RevokeRelease` guard denies the parked request on any panic.
+// ===========================================================================
+
+/// A waiter that was denied (for the policy change, and for a timeout) has removed
+/// its entry from the parked-request table, so a late `agent.approve`, either way, is
+/// told no such request exists. Without the cleanup the stale entry would answer a
+/// late approve with success for a call that is already gone.
+#[test]
+fn revoke_park_a_late_approve_after_the_waiter_gave_up_finds_nothing() {
+    // The policy-change denial.
+    let (srv, state) = revoke_ask_rig(Duration::from_secs(60));
+    let operator = rv_subscribe(&srv, Frontend::Operator, json!({}));
+    let rx = revoke_spawn_agent_call(&srv);
+    let request_id = revoke_wait_for_approval_request(&operator.sink, Duration::from_secs(5));
+    let _release = RevokeRelease {
+        srv: srv.clone(),
+        request_id: request_id.clone(),
+    };
+    state.set_policy(AgentPolicy::Paused);
+    let reply = revoke_recv_or_release(
+        &rx,
+        &srv,
+        &request_id,
+        Duration::from_secs(5),
+        "the agent call did not return within 5s after set_policy(paused)",
+    );
+    assert!(
+        is_refused(&reply) && revoke_reply_text(&reply).contains("the agent policy changed"),
+        "the waiter was denied for the policy change: {reply}"
+    );
+    for allow in [true, false] {
+        let late = call_as_args(
+            &srv,
+            Frontend::Operator,
+            "agent.approve",
+            json!({"request_id": request_id, "allow": allow}),
+        );
+        assert!(
+            is_refused(&late)
+                && revoke_reply_text(&late).contains(&format!("no parked request `{request_id}`")),
+            "a late approve(allow={allow}) after the policy denial finds nothing: {late}"
+        );
+    }
+
+    // The timeout denial, under a policy that never changed.
+    let state = Arc::new(AgentState::new(AgentPolicy::Ask));
+    let srv = revoke_ask_server(
+        revoke_ask_registry(&state),
+        &state,
+        Duration::from_millis(400),
+    );
+    let operator = rv_subscribe(&srv, Frontend::Operator, json!({}));
+    let rx = revoke_spawn_agent_call(&srv);
+    let request_id = revoke_wait_for_approval_request(&operator.sink, Duration::from_secs(5));
+    let _release = RevokeRelease {
+        srv: srv.clone(),
+        request_id: request_id.clone(),
+    };
+    let reply = revoke_recv_or_release(
+        &rx,
+        &srv,
+        &request_id,
+        Duration::from_secs(5),
+        "the agent call did not time out within 5s",
+    );
+    assert!(
+        is_refused(&reply) && revoke_reply_text(&reply).contains("within the approval timeout"),
+        "the unchanged timeout refusal: {reply}"
+    );
+    let late = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "agent.approve",
+        json!({"request_id": request_id, "allow": true}),
+    );
+    assert!(
+        is_refused(&late)
+            && revoke_reply_text(&late).contains(&format!("no parked request `{request_id}`")),
+        "a late approve after the timeout finds nothing: {late}"
+    );
+}
+
+/// The operator connection that was asked to approve drops mid-park. The parked
+/// waiter is not stranded: the next policy change still denies it within the bound.
+/// And with the operator gone, a fresh call under `ask` is refused at once because
+/// nobody is there to approve it.
+#[test]
+fn revoke_park_the_operator_dropping_mid_park_does_not_strand_the_waiter() {
+    let (srv, state) = revoke_ask_rig(Duration::from_secs(60));
+    let operator = rv_subscribe(&srv, Frontend::Operator, json!({}));
+    let rx = revoke_spawn_agent_call(&srv);
+    let request_id = revoke_wait_for_approval_request(&operator.sink, Duration::from_secs(5));
+    let _release = RevokeRelease {
+        srv: srv.clone(),
+        request_id: request_id.clone(),
+    };
+
+    srv.drop_connection(operator.conn.conn_id);
+    state.set_policy(AgentPolicy::Paused);
+    let reply = revoke_recv_or_release(
+        &rx,
+        &srv,
+        &request_id,
+        Duration::from_secs(5),
+        "the call whose operator dropped did not return within 5s after set_policy(paused)",
+    );
+    let text = revoke_reply_text(&reply);
+    assert!(
+        is_refused(&reply)
+            && text.contains("the agent policy changed")
+            && text.contains("`paused`"),
+        "the stranded waiter is denied for the policy change: {reply}"
+    );
+
+    // Nobody is subscribed as an operator now: a new call under `ask` is refused
+    // before it parks, with the unchanged no-operator text.
+    state.set_policy(AgentPolicy::Ask);
+    let rx = revoke_spawn_agent_call(&srv);
+    let reply = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a call with no operator connected is refused at once, not parked");
+    assert!(
+        is_refused(&reply) && revoke_reply_text(&reply).contains("no operator is connected"),
+        "the unchanged no-operator refusal: {reply}"
+    );
+}
+
+/// One `agent.set paused` run on P denies every parked call on both servers, two on
+/// each (a stand-in for several agents parked at once), and none of them runs.
+#[test]
+fn revoke_park_one_pause_denies_every_parked_call_on_every_server() {
+    let (p, w, _state) = revoke_ask_pair(Duration::from_secs(60));
+    let op_p = rv_subscribe(&p, Frontend::Operator, json!({}));
+    let op_w = rv_subscribe(&w, Frontend::Operator, json!({}));
+
+    let mut calls = Vec::new();
+    let mut releases = Vec::new();
+    for (name, srv, sink) in [
+        ("P", &p, &op_p.sink),
+        ("P", &p, &op_p.sink),
+        ("W", &w, &op_w.sink),
+        ("W", &w, &op_w.sink),
+    ] {
+        let rx = revoke_spawn_agent_call(srv);
+        let request_id = revoke_wait_for_approval_request(sink, Duration::from_secs(5));
+        releases.push(RevokeRelease {
+            srv: srv.clone(),
+            request_id: request_id.clone(),
+        });
+        calls.push((name, srv.clone(), rx, request_id));
+    }
+
+    let paused = call_as_args(
+        &p,
+        Frontend::Operator,
+        "agent.set",
+        json!({"policy": "paused"}),
+    );
+    assert_eq!(
+        paused["result"]["structuredContent"]["policy"],
+        json!("paused"),
+        "setup: agent.set paused ran on P: {paused}"
+    );
+
+    for (name, srv, rx, request_id) in &calls {
+        let reply = revoke_recv_or_release(
+            rx,
+            srv,
+            request_id,
+            Duration::from_secs(5),
+            &format!("a call parked on {name} did not return within 5s after the pause"),
+        );
+        let text = revoke_reply_text(&reply);
+        assert!(
+            is_refused(&reply)
+                && text.contains("the agent policy changed")
+                && text.contains("`paused`"),
+            "the call parked on {name} is denied for the policy change: {reply}"
+        );
+        assert_ne!(
+            reply["result"]["structuredContent"],
+            json!("ran"),
+            "the call parked on {name} must not have run: {reply}"
+        );
+    }
+    drop(releases);
+}
+
+/// After a revocation the agent can re-issue: the denied request's id is dead (an
+/// approve for it finds nothing), and once the operator is back on `ask` the same
+/// call parks under a fresh id and an approve of that one runs it.
+#[test]
+fn revoke_park_after_a_revocation_the_agent_can_reissue_under_a_fresh_id() {
+    let (srv, _state) = revoke_ask_rig(Duration::from_secs(60));
+    let operator = rv_subscribe(&srv, Frontend::Operator, json!({}));
+
+    let rx = revoke_spawn_agent_call(&srv);
+    let first_id = revoke_wait_for_approval_request(&operator.sink, Duration::from_secs(5));
+    let _release_first = RevokeRelease {
+        srv: srv.clone(),
+        request_id: first_id.clone(),
+    };
+    let paused = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "agent.set",
+        json!({"policy": "paused"}),
+    );
+    assert_eq!(
+        paused["result"]["structuredContent"]["policy"],
+        json!("paused"),
+        "setup: agent.set paused ran: {paused}"
+    );
+    let reply = revoke_recv_or_release(
+        &rx,
+        &srv,
+        &first_id,
+        Duration::from_secs(5),
+        "the first call did not return within 5s after the pause",
+    );
+    assert!(
+        is_refused(&reply) && revoke_reply_text(&reply).contains("the agent policy changed"),
+        "the first call is denied for the policy change: {reply}"
+    );
+
+    let dead = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "agent.approve",
+        json!({"request_id": first_id, "allow": true}),
+    );
+    assert!(
+        is_refused(&dead)
+            && revoke_reply_text(&dead).contains(&format!("no parked request `{first_id}`")),
+        "the revoked request id is dead: {dead}"
+    );
+
+    let ask = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "agent.set",
+        json!({"policy": "ask"}),
+    );
+    assert_eq!(
+        ask["result"]["structuredContent"]["policy"],
+        json!("ask"),
+        "setup: agent.set ask ran: {ask}"
+    );
+    let rx = revoke_spawn_agent_call(&srv);
+    let second_id = revoke_wait_for_approval_request(&operator.sink, Duration::from_secs(5));
+    let _release_second = RevokeRelease {
+        srv: srv.clone(),
+        request_id: second_id.clone(),
+    };
+    assert_ne!(
+        second_id, first_id,
+        "the re-issued call parks under a fresh id"
+    );
+    let approve = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "agent.approve",
+        json!({"request_id": second_id, "allow": true}),
+    );
+    assert!(
+        !is_refused(&approve),
+        "the approve of the fresh id works: {approve}"
+    );
+    let reply = revoke_recv_or_release(
+        &rx,
+        &srv,
+        &second_id,
+        Duration::from_secs(5),
+        "the re-issued call did not return within 5s",
+    );
+    assert_eq!(
+        reply["result"]["structuredContent"],
+        json!("ran"),
+        "the re-issued, approved call ran: {reply}"
+    );
+}
