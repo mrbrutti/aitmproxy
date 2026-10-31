@@ -1957,4 +1957,376 @@ mod tests {
         assert_eq!(ring.count_since_for(Frontend::Mcp, t0, Some("A")), 1);
         assert_eq!(ring.count_since_for(Frontend::Operator, t0, Some("A")), 3);
     }
+
+    // ---- tester, whole-branch pass on the merged tree (plan
+    // 2026-10-30-bus-audit-connection-id, spec A4, AC29): the combinations the
+    // per-AC tests keep apart. ----
+
+    /// Eight entries over both lanes with explicit instants and ids, in call order
+    /// (`E` is the evidence lane, `R` the routine lane; the id is the connection):
+    ///
+    /// | seq | lane | origin   | id  | command | at (ms) |
+    /// |-----|------|----------|-----|---------|---------|
+    /// | 0   | E    | Mcp      | A   | e-ag0   | 1000    |
+    /// | 1   | R    | Operator | O   | r-op1   | 2000    |
+    /// | 2   | R    | Mcp      | B   | r-ag2   | 3000    |
+    /// | 3   | E    | Operator | O   | e-op3   | 4000    |
+    /// | 4   | E    | Mcp      | A   | e-ag4   | 5000    |
+    /// | 5   | R    | Mcp      | B   | r-ag5   | 6000    |
+    /// | 6   | E    | Operator | O   | e-op6   | 7000    |
+    /// | 7   | R    | Mcp      | A   | r-ag7   | 8000    |
+    ///
+    /// Connection A has entries in both lanes (seq 0, 4 in E; 7 in R), so does O
+    /// (seq 1 in R; 3, 6 in E); B is routine only. Call order interleaves the
+    /// lanes, so a read that concatenated one lane after the other would reorder.
+    fn two_lane_ring() -> AuditRing {
+        let ring = AuditRing::with_lane_capacities(8, 8);
+        for (lane, origin, id, command, ms) in [
+            (AuditLane::Evidence, Frontend::Mcp, "A", "e-ag0", 1000),
+            (AuditLane::Routine, Frontend::Operator, "O", "r-op1", 2000),
+            (AuditLane::Routine, Frontend::Mcp, "B", "r-ag2", 3000),
+            (AuditLane::Evidence, Frontend::Operator, "O", "e-op3", 4000),
+            (AuditLane::Evidence, Frontend::Mcp, "A", "e-ag4", 5000),
+            (AuditLane::Routine, Frontend::Mcp, "B", "r-ag5", 6000),
+            (AuditLane::Evidence, Frontend::Operator, "O", "e-op6", 7000),
+            (AuditLane::Routine, Frontend::Mcp, "A", "r-ag7", 8000),
+        ] {
+            ring.append_in(lane, entry_at_ms(origin, Some(id), command, ms));
+        }
+        ring
+    }
+
+    /// `recent_for` with `since`, the viewer filter and `limit` all active over
+    /// entries held in both lanes. The existing tests give `since` and the filter
+    /// over one lane (`recent_for_combines_since_the_filter_and_the_limit`) or both
+    /// lanes without `since` (`recent_for_and_count_since_for_span_both_lanes`); a
+    /// `recent_for` that applied `limit` before the filter, skipped the call-order
+    /// sort across the lanes, or read `since` as inclusive passes both of those.
+    #[test]
+    fn recent_for_across_both_lanes_combines_since_the_filter_and_the_limit() {
+        let ring = two_lane_ring();
+
+        // No `since`, no `limit`: call order across the two lanes, not lane order
+        // (lane order would put e-ag4 before r-ag2).
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, None, None)),
+            ["e-ag0", "r-ag2", "e-ag4", "r-ag5", "r-ag7"]
+        );
+        // `since` is strictly after: r-ag2 sits exactly at 3000 and is out.
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, Some(at_ms(3000)), None)),
+            ["e-ag4", "r-ag5", "r-ag7"]
+        );
+        // One millisecond earlier and it is back in.
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, Some(at_ms(2999)), None)),
+            ["r-ag2", "e-ag4", "r-ag5", "r-ag7"]
+        );
+        // `limit` counts what survives `since` AND the filter, newest kept. Taking
+        // the last 2 before the filter would give the operator's e-op6 and r-ag7,
+        // and so only ["r-ag7"].
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, Some(at_ms(3000)), Some(2))),
+            ["r-ag5", "r-ag7"]
+        );
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, Some(at_ms(3000)), Some(1))),
+            ["r-ag7"]
+        );
+        // A limit above what is visible pads nothing.
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, Some(at_ms(3000)), Some(50))),
+            ["e-ag4", "r-ag5", "r-ag7"]
+        );
+        // A window that starts at the newest entry holds nothing, for every viewer.
+        for viewer in [Frontend::Mcp, Frontend::Operator, Frontend::Cli] {
+            assert_eq!(
+                commands(&ring.recent_for(viewer, Some(at_ms(8000)), None)),
+                Vec::<&str>::new()
+            );
+        }
+        // Trusted control sees both lanes' operator entries, same window and limit.
+        for viewer in [Frontend::Operator, Frontend::Cli] {
+            assert_eq!(
+                commands(&ring.recent_for(viewer, Some(at_ms(4000)), None)),
+                ["e-ag4", "r-ag5", "e-op6", "r-ag7"]
+            );
+            assert_eq!(
+                commands(&ring.recent_for(viewer, Some(at_ms(4000)), Some(3))),
+                ["r-ag5", "e-op6", "r-ag7"]
+            );
+        }
+        // The unfiltered read is unchanged by all of the above.
+        assert_eq!(ring.recent(None, None).len(), 8);
+    }
+
+    /// `count_since_for` with the window edge, the viewer filter and the connection
+    /// exclusion over both lanes, where the excluded connection's entries sit in
+    /// both. AC29 pins the exclusion over both lanes at `t0` (every entry in the
+    /// window); a count that dropped an entry from one lane when excluding, or
+    /// mixed the edge up with `recent_for`'s strict one, passes it.
+    #[test]
+    fn count_since_for_across_both_lanes_combines_the_window_the_filter_and_the_exclusion() {
+        let ring = two_lane_ring();
+
+        // The window edge is inclusive: r-ag2 at 3000 counts at 3000, not at 3001.
+        assert_eq!(ring.count_since_for(Frontend::Mcp, at_ms(3000), None), 4);
+        assert_eq!(ring.count_since_for(Frontend::Mcp, at_ms(3001), None), 3);
+        // A is in both lanes (e-ag4 evidence, r-ag7 routine): both go.
+        assert_eq!(
+            ring.count_since_for(Frontend::Mcp, at_ms(3000), Some("A")),
+            2
+        );
+        // B is routine only (r-ag2, r-ag5).
+        assert_eq!(
+            ring.count_since_for(Frontend::Mcp, at_ms(3000), Some("B")),
+            2
+        );
+        // Trusted control counts everything in the window, then drops its own id
+        // from both lanes: O has r-op1 (routine) and e-op3, e-op6 (evidence).
+        assert_eq!(
+            ring.count_since_for(Frontend::Operator, at_ms(2000), None),
+            7
+        );
+        assert_eq!(
+            ring.count_since_for(Frontend::Operator, at_ms(2000), Some("O")),
+            4
+        );
+        // At 4000 only O's evidence entries remain in the window: 5 held, 2 are O's.
+        assert_eq!(
+            ring.count_since_for(Frontend::Operator, at_ms(4000), Some("O")),
+            3
+        );
+        // The Cli viewer counts as the operator does.
+        assert_eq!(
+            ring.count_since_for(Frontend::Cli, at_ms(2000), Some("O")),
+            4
+        );
+        // Excluding an id the viewer may not see changes nothing: an agent that
+        // names the operator's id learns nothing and lowers nothing.
+        assert_eq!(ring.count_since_for(Frontend::Mcp, at_ms(0), Some("O")), 5);
+        assert_eq!(ring.count_since_for(Frontend::Mcp, at_ms(0), None), 5);
+        // An empty id names no connection: it must not match the entries that have
+        // no id, so nothing is excluded.
+        assert_eq!(
+            ring.count_since_for(Frontend::Operator, at_ms(0), Some("")),
+            8
+        );
+        // ...including when the ring does hold an entry with no id: an in-process or
+        // HTTP-POST call is `None`, and an empty excluded id must not match it.
+        let mixed = AuditRing::new(8);
+        mixed.append_in(
+            AuditLane::Evidence,
+            entry_at_ms(Frontend::Mcp, None, "anon-e", 1000),
+        );
+        mixed.append_in(
+            AuditLane::Routine,
+            entry_at_ms(Frontend::Mcp, None, "anon-r", 2000),
+        );
+        mixed.append_in(
+            AuditLane::Routine,
+            entry_at_ms(Frontend::Mcp, Some("A"), "own", 3000),
+        );
+        assert_eq!(mixed.count_since_for(Frontend::Mcp, at_ms(0), Some("")), 3);
+        assert_eq!(mixed.count_since_for(Frontend::Mcp, at_ms(0), Some("A")), 2);
+        assert_eq!(mixed.count_since_for(Frontend::Mcp, at_ms(0), None), 3);
+        // A window after every entry counts nothing.
+        assert_eq!(
+            ring.count_since_for(Frontend::Mcp, at_ms(9000), Some("A")),
+            0
+        );
+        assert_eq!(
+            ring.count_since_for(Frontend::Operator, at_ms(9000), None),
+            0
+        );
+    }
+
+    /// An entry's `connection_id` belongs to the entry: eviction removes whole
+    /// entries and never rewrites a survivor's id, and the id is not part of the
+    /// source key. Two connections of one `(origin, label)` source (the web
+    /// bridge's case: every agent-token connection is `(mcp, web-bridge)`) share
+    /// one bucket, so the lane evicts the oldest entry of the pair, whichever
+    /// connection made it, yet every survivor still names its own connection. A
+    /// ring that bucketed by id would evict from the connection with more entries
+    /// instead (spec A3: "the id is a read-side attribute").
+    #[test]
+    fn a_connection_id_survives_lane_eviction_and_is_not_a_bucket_key() {
+        let bridge = |id: &str, command: &str| AuditEntry {
+            client_label: Some(WEB_BRIDGE_CLIENT_LABEL.to_string()),
+            ..entry_of(Frontend::Mcp, Some(id), command)
+        };
+        let ids = |entries: &[AuditEntry]| -> Vec<Option<String>> {
+            entries.iter().map(|e| e.connection_id.clone()).collect()
+        };
+        let some = |id: &str| Some(id.to_string());
+        let ring = AuditRing::with_lane_capacities(4, 2);
+
+        // Evidence lane, capacity 4. C1 a1; C2 b1 b2 b3; C1 a2: the fifth entry
+        // evicts the oldest of the one shared bucket, a1 (C1's). A bucket per
+        // connection would hold C2's three against C1's two and evict b1.
+        for (id, command) in [
+            ("C1", "a1"),
+            ("C2", "b1"),
+            ("C2", "b2"),
+            ("C2", "b3"),
+            ("C1", "a2"),
+        ] {
+            ring.append(bridge(id, command));
+        }
+        let held = ring.recent(None, None);
+        assert_eq!(commands(&held), ["b1", "b2", "b3", "a2"]);
+        assert_eq!(ids(&held), [some("C2"), some("C2"), some("C2"), some("C1")]);
+
+        // Routine lane, capacity 2, same source: r1 is evicted, r2 and r3 keep
+        // their own ids and the evidence lane is untouched.
+        for (id, command) in [("C1", "r1"), ("C2", "r2"), ("C1", "r3")] {
+            ring.append_in(AuditLane::Routine, bridge(id, command));
+        }
+        assert_eq!(ring.evidence_len(), 4);
+        assert_eq!(ring.routine_len(), 2);
+        let held = ring.recent(None, None);
+        assert_eq!(commands(&held), ["b1", "b2", "b3", "a2", "r2", "r3"]);
+        assert_eq!(
+            ids(&held),
+            [
+                some("C2"),
+                some("C2"),
+                some("C2"),
+                some("C1"),
+                some("C2"),
+                some("C1")
+            ]
+        );
+        // The viewer-filtered read and the count see the same survivors and ids.
+        assert_eq!(ids(&ring.recent_for(Frontend::Mcp, None, None)), ids(&held));
+        // Six survivors: C1 made a2 and r3, C2 made the other four.
+        assert_eq!(
+            ring.count_since_for(Frontend::Mcp, UNIX_EPOCH, Some("C1")),
+            4
+        );
+        assert_eq!(
+            ring.count_since_for(Frontend::Mcp, UNIX_EPOCH, Some("C2")),
+            2
+        );
+
+        // Past the source table (the overflow bucket shares entries of many
+        // sources) every entry still carries the id of the connection that made it.
+        let sources = MAX_AUDIT_SOURCES + 8;
+        let wide = AuditRing::with_lane_capacities(sources * 2, 1);
+        for i in 0..sources {
+            wide.append(AuditEntry {
+                client_label: Some(format!("src-{i}")),
+                ..entry_of(Frontend::Mcp, Some(&format!("id-{i}")), &format!("c{i}"))
+            });
+        }
+        let held = wide.recent(None, None);
+        assert_eq!(held.len(), sources);
+        assert_eq!(
+            ids(&held),
+            (0..sources)
+                .map(|i| Some(format!("id-{i}")))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Every whitespace character the sanitiser treats as noise (the five ASCII
+    /// whitespace controls, NEL, and the line and paragraph separators).
+    const WHITESPACE_NOISE: [char; 8] = [
+        '\t', '\n', '\u{B}', '\u{C}', '\r', '\u{85}', '\u{2028}', '\u{2029}',
+    ];
+
+    /// The R2 port, for every whitespace noise character. The plan's literals pin
+    /// `\t`, `\n`, U+0085 and U+2028 for the `Bearer` frame; `\r`, U+000B (vertical
+    /// tab), U+000C (form feed) and U+2029 (paragraph separator) are the same bug
+    /// if the blank substitution misses them: `Bearer\u{B}abc123` would be joined
+    /// into `Bearerabc123`, which no scrubber frame matches, and the token would
+    /// reach the ring, the push, `agent.activity` and the findings store.
+    #[test]
+    fn sanitize_client_label_masks_a_credential_after_every_whitespace_control() {
+        for c in WHITESPACE_NOISE {
+            let bearer = format!("agent Bearer{c}abc123");
+            let label = sanitize_client_label(&bearer).expect("a label remains");
+            assert!(
+                !label.contains("abc123"),
+                "{bearer:?} leaked the token: {label:?}"
+            );
+            assert!(
+                label.contains("Bearer [redacted]"),
+                "{bearer:?} was not masked as a bearer token: {label:?}"
+            );
+            // The pair frames do not need the blank, so they hold either way; they
+            // must keep holding with the blank in place.
+            for (raw, secret) in [
+                (format!("agent token{c}=abc123"), "abc123"),
+                (format!("password{c}: hunter2"), "hunter2"),
+            ] {
+                let label = sanitize_client_label(&raw).expect("a label remains");
+                assert!(!label.contains(secret), "{raw:?} leaked: {label:?}");
+                assert!(
+                    label.contains("[redacted]"),
+                    "{raw:?} not masked: {label:?}"
+                );
+            }
+        }
+    }
+
+    /// A whitespace control is one blank, wherever it sits, and the blank counts
+    /// toward the 64-character cut like any other character. The blank is what the
+    /// existing `trim()` calls then act on at the edges: a whitespace control at the
+    /// start or end of a label never survives as a blank, and a label made only of
+    /// them is no label.
+    #[test]
+    fn sanitize_client_label_whitespace_controls_are_one_blank_each_and_count_toward_the_cap() {
+        for c in WHITESPACE_NOISE {
+            // Inside: one blank, never nothing (the label would be joined) and never
+            // collapsed (two controls make two blanks).
+            assert_eq!(
+                sanitize_client_label(&format!("a{c}b")),
+                Some("a b".to_string()),
+                "{c:?} inside a label"
+            );
+            assert_eq!(
+                sanitize_client_label(&format!("a{c}{c}b")),
+                Some("a  b".to_string()),
+                "two {c:?} inside a label"
+            );
+            // At the edges: the substituted blank is trimmed, so the label is bare.
+            for raw in [
+                format!("{c}label"),
+                format!("label{c}"),
+                format!("{c}{c}label{c}{c}"),
+            ] {
+                assert_eq!(
+                    sanitize_client_label(&raw),
+                    Some("label".to_string()),
+                    "{raw:?}"
+                );
+            }
+        }
+        // Nothing but whitespace controls leaves nothing.
+        assert_eq!(
+            sanitize_client_label(&WHITESPACE_NOISE.iter().collect::<String>()),
+            None
+        );
+
+        // The substituted blanks are characters of the label: 30 + 3 + 40 is 73
+        // characters, cut to 64, keeps the three blanks and 31 of the 40 `B`s. Had
+        // the controls been deleted the label would hold 34 `B`s and no blanks.
+        let raw = format!("{}\t\r\u{2029}{}", "A".repeat(30), "B".repeat(40));
+        assert_eq!(
+            sanitize_client_label(&raw),
+            Some(format!("{}   {}", "A".repeat(30), "B".repeat(31)))
+        );
+        // A cut that lands on a substituted blank leaves no trailing blank.
+        let raw = format!("{}\u{B}B", "A".repeat(63));
+        assert_eq!(sanitize_client_label(&raw), Some("A".repeat(63)));
+
+        // The 1024-character scan window counts raw characters, before any
+        // substitution: 1024 controls use it all up, and one fewer leaves room for
+        // the first visible character.
+        let spent = format!("{}tail", "\t".repeat(1024));
+        assert_eq!(sanitize_client_label(&spent), None);
+        let room = format!("{}ab", "\u{C}".repeat(1023));
+        assert_eq!(sanitize_client_label(&room), Some("a".to_string()));
+    }
 }
