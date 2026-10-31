@@ -1593,4 +1593,181 @@ mod tests {
         };
         assert_eq!(at(&snap.to_value(), "scope_entries"), &Value::Int(3));
     }
+
+    // ---- tester re-check of the panel-minors fix ---------------------------------------
+
+    /// **CS-AC12, CS-AC5 (spec D5, last column).** `capability_derivation_table`
+    /// pins the wire name of every matrix row; this pins the reason beside it. Over
+    /// the 36-row matrix plus the three constructor snapshots: under `degraded` and
+    /// `feeder_off` the `capability_reason` is a non-empty string equal, byte for
+    /// byte, to `feeder.reason`; under the three reasonless variants it is `null`.
+    /// Then each of the four `off` reasons is pinned as its `FeederOff` variant by
+    /// literal text, so `not started` is no longer checked only through
+    /// `feeder.reason`.
+    #[test]
+    fn capability_reason_is_the_feeder_reason_wherever_it_is_set() {
+        let mut rows = matrix();
+        rows.push(CaptureStatus::channel(false).1.snapshot());
+        rows.push(CaptureStatus::channel_on(true, false).1.snapshot());
+        rows.push(CaptureStatus::channel_on(true, true).1.snapshot());
+        assert_eq!(rows.len(), 39);
+        let mut with_reason = 0;
+        for snap in &rows {
+            let v = snap.to_value();
+            let wire = at(&v, "capability");
+            let reason = at(&v, "capability_reason");
+            let feeder_reason = at(at(&v, "feeder"), "reason");
+            if wire == &s("degraded") || wire == &s("feeder_off") {
+                with_reason += 1;
+                assert!(
+                    matches!(reason, Value::Str(r) if !r.is_empty()),
+                    "a reason-carrying capability without a reason: {snap:?}"
+                );
+                assert_eq!(reason, feeder_reason, "{snap:?}");
+            } else {
+                assert_eq!(reason, &Value::Null, "{snap:?}");
+                assert!(
+                    matches!(
+                        snap.capability(),
+                        CaptureCapability::Capturing
+                            | CaptureCapability::ApprovedAttached
+                            | CaptureCapability::AwaitingProvider
+                    ),
+                    "{snap:?}"
+                );
+            }
+        }
+        // Six `bind_failed` rows, twelve `off`+`detached` rows, three constructors.
+        assert_eq!(with_reason, 6 + 12 + 3);
+
+        let off = |reason: OffReason| CaptureStatusSnapshot {
+            enabled: true,
+            feeder: FeederState::Off(reason),
+            provider: ProviderState::Detached,
+            scope_tokens: Vec::new(),
+            tcp_handed_off: 0,
+            udp_handed_off: 0,
+            last_handoff_at_ms: None,
+        };
+        assert_eq!(
+            off(OffReason::Disabled).capability(),
+            CaptureCapability::FeederOff("macos_capture.enabled is false".into())
+        );
+        assert_eq!(
+            off(OffReason::NotMacos).capability(),
+            CaptureCapability::FeederOff("not a macOS build".into())
+        );
+        assert_eq!(
+            off(OffReason::NotStarted).capability(),
+            CaptureCapability::FeederOff("not started".into())
+        );
+        assert_eq!(
+            off(OffReason::Stopped).capability(),
+            CaptureCapability::FeederOff("stopped".into())
+        );
+    }
+
+    /// **CS-AC9, CS-AC10 (integrity).** The handoffs the newer attachment has
+    /// already counted survive the stale guard's drop: a superseded guard must not
+    /// zero the counters or the last-handoff stamp of the attachment that replaced
+    /// it, nor knock `capturing` back to `approved_attached`. With no write between
+    /// the two reads, "the snapshot is identical" is the exact "changed nothing"
+    /// oracle. The current guard's drop then resets everything to the listening
+    /// literal.
+    #[test]
+    fn stale_guard_drop_preserves_the_newer_attachments_handoffs() {
+        let (w, r) = CaptureStatus::channel_on(true, true);
+        w.listening();
+        let stale = w.attached(None, vec!["a.test".into()]);
+        let current = w.attached(Some("995PCLM9KH".into()), vec!["b.test".into()]);
+        let before = now_ms();
+        w.handed_off(FlowKind::Tcp);
+        w.handed_off(FlowKind::Udp);
+        let after = now_ms();
+        let live = r.snapshot();
+        assert_eq!((live.tcp_handed_off, live.udp_handed_off), (1, 1));
+        let stamp = live.last_handoff_at_ms.expect("a handoff was stamped");
+        assert!((before..=after).contains(&stamp), "{live:?}");
+        assert_eq!(live.capability(), CaptureCapability::Capturing);
+
+        drop(stale);
+        assert_eq!(
+            r.snapshot(),
+            live,
+            "the stale guard's drop changed the newer attachment"
+        );
+
+        drop(current);
+        let snap = r.snapshot();
+        assert_eq!(snap.capability(), CaptureCapability::AwaitingProvider);
+        assert_eq!(snap.to_value(), listening_literal());
+    }
+
+    /// **CS-AC9 (integrity).** A superseded guard that outlives the current one
+    /// drops silently: the current guard's drop already recorded the detach, and the
+    /// late stale drop leaves the handle exactly as it found it.
+    #[test]
+    fn superseded_guard_dropping_last_changes_nothing() {
+        let (w, r) = CaptureStatus::channel_on(true, true);
+        w.listening();
+        let stale = w.attached(None, vec!["a.test".into()]);
+        let current = w.attached(Some("995PCLM9KH".into()), vec!["b.test".into()]);
+        w.handed_off(FlowKind::Udp);
+
+        drop(current);
+        let detached = r.snapshot();
+        assert_eq!(detached.to_value(), listening_literal());
+
+        drop(stale);
+        assert_eq!(r.snapshot(), detached);
+    }
+
+    /// **CS-AC4/11 (writer level).** `stopped()` with two live guards — a stale one
+    /// and the current one — is `off`/`stopped` + `detached` at once, and stays
+    /// exactly that through both drops whichever guard goes first: neither drop
+    /// moves the feeder off `stopped`, re-attaches, or resurrects a count.
+    #[test]
+    fn stopped_with_two_live_guards_converges_in_either_drop_order() {
+        for stale_first in [true, false] {
+            let (w, r) = CaptureStatus::channel_on(true, true);
+            w.listening();
+            let stale = w.attached(None, vec!["a.test".into()]);
+            let current = w.attached(Some("995PCLM9KH".into()), vec!["b.test".into()]);
+            w.handed_off(FlowKind::Tcp);
+
+            w.stopped();
+            let stopped = r.snapshot();
+            assert_eq!(stopped.feeder, FeederState::Off(OffReason::Stopped));
+            assert_eq!(stopped.provider, ProviderState::Detached);
+            assert_eq!(stopped.scope_tokens, Vec::<String>::new());
+            assert_eq!((stopped.tcp_handed_off, stopped.udp_handed_off), (0, 0));
+            assert_eq!(stopped.last_handoff_at_ms, None);
+            assert_eq!(
+                stopped.capability(),
+                CaptureCapability::FeederOff("stopped".into())
+            );
+
+            let (first, second) = if stale_first {
+                (stale, current)
+            } else {
+                (current, stale)
+            };
+            drop(first);
+            assert_eq!(
+                r.snapshot(),
+                stopped,
+                "stale_first={stale_first}: the first drop changed the handle"
+            );
+            drop(second);
+            assert_eq!(
+                r.snapshot(),
+                stopped,
+                "stale_first={stale_first}: the second drop changed the handle"
+            );
+            assert_eq!(
+                at(&r.snapshot().to_value(), "feeder"),
+                &object([("reason", s("stopped")), ("state", s("off"))])
+            );
+        }
+    }
 }
