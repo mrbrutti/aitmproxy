@@ -166,18 +166,11 @@ impl CoreIngress {
         self
     }
 
-    /// Dispatch one captured TCP/stream flow: scope-gate it (authority = `host:port`,
-    /// the SNI / handoff hostname else the dst IP, with the dst port) through the L7
-    /// [`ScopeRateGuard`](aitm_core::ScopeRateGuard), then route
-    /// it behind the **authoritative original destination**. An in-scope flow a module
-    /// claims is spawned ([`StreamOutcome::Dispatched`]); an in-scope flow no module
-    /// claims is dialled through the SSRF-guarded connector and tunnelled verbatim
-    /// ([`StreamOutcome::PassedThrough`]); an out-of-scope flow is refused before any
-    /// module match, spawn, or dial ([`StreamOutcome::Refused`]).
-    /// Whether backend-supplied hostname text is a plain DNS name — letters, digits,
-    /// `-`, `_` and `.`, nothing else. Brackets, a `:port`, a `/path`, whitespace or
-    /// control characters never occur in a real SNI / connect-by-name hostname, so a
-    /// value carrying them is not trusted as the scope host.
+    /// Whether backend-supplied hostname text is a plain DNS name — at most 253 bytes
+    /// of letters, digits, `-`, `_` and `.`, nothing else. Brackets, a `:port`, a
+    /// `/path`, whitespace or control characters never occur in a real SNI /
+    /// connect-by-name hostname, so a value carrying them is not trusted as the scope
+    /// host.
     fn is_plain_hostname(name: &str) -> bool {
         !name.is_empty()
             && name.len() <= 253
@@ -186,6 +179,14 @@ impl CoreIngress {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
     }
 
+    /// Dispatch one captured TCP/stream flow: scope-gate it (authority = `host:port`,
+    /// the SNI / handoff hostname when it is a plain DNS name else the dst IP, with the
+    /// dst port) through the L7 [`ScopeRateGuard`](aitm_core::ScopeRateGuard), then
+    /// route it behind the **authoritative original destination**. An in-scope flow a
+    /// module claims is spawned ([`StreamOutcome::Dispatched`]); an in-scope flow no
+    /// module claims is dialled through the SSRF-guarded connector and tunnelled
+    /// verbatim ([`StreamOutcome::PassedThrough`]); an out-of-scope flow is refused
+    /// before any module match, spawn, or dial ([`StreamOutcome::Refused`]).
     pub async fn dispatch_tcp(&self, mut flow: CapturedTcpFlow) -> StreamOutcome {
         let Some(sd) = self.stream.as_ref() else {
             return StreamOutcome::Unhandled;
@@ -772,15 +773,23 @@ mod tests {
             StreamOutcome::Dispatched
         );
         assert_eq!(
-            gate_only(as_guard, None, "[2001:db8::1]:8443").await,
+            gate_only(as_guard.clone(), None, "[2001:db8::1]:8443").await,
             StreamOutcome::Dispatched
         );
+        // The plain-name length cap: 253 bytes is still a hostname, 254 is not and
+        // gates on the dst IP instead.
+        let longest = "a".repeat(253);
+        let too_long = "a".repeat(254);
+        _ = gate_only(as_guard.clone(), Some(&longest), "93.184.216.34:443").await;
+        _ = gate_only(as_guard, Some(&too_long), "93.184.216.34:443").await;
         assert_eq!(
             *guard.asked.lock().unwrap_or_else(PoisonError::into_inner),
             vec![
                 "www.example.com:80".to_string(),
                 "93.184.216.34:443".to_string(),
                 "[2001:db8::1]:8443".to_string(),
+                format!("{longest}:443"),
+                "93.184.216.34:443".to_string(),
             ]
         );
     }
