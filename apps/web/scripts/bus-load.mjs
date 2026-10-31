@@ -167,20 +167,29 @@ export function redactUrl(raw) {
 }
 
 /**
- * The "unknown argument" error for what `parseArgs` could not consume. Only flag-like tokens
- * (leading `-`) are named, cut at any `=`; everything else is a value and is counted, never
- * echoed: a mistyped `--tokn SECRET` (or `--token=SECRET`) must not put the token in a log line.
+ * A token that is shaped like a flag and nothing else: `--word` (a letter, then letters, digits
+ * and dashes) or a single `-x`, each with an optional `=...` tail. The tail is group 2.
+ */
+const FLAG_SHAPE = /^(--[A-Za-z][A-Za-z0-9-]*|-[A-Za-z])(=.*)?$/;
+
+/**
+ * The "unknown argument" error for what `parseArgs` could not consume. Only a token that matches
+ * FLAG_SHAPE is named, cut at its `=`; everything else is a value and is counted, never echoed. A
+ * leading dash alone does not make a token a flag: a secret glued to a short flag (`-tSECRET`) or
+ * one that starts with a dash (`--tokn -SECRET`) is a value, like a mistyped `--tokn SECRET` or a
+ * `--token=SECRET`, and none of them may put the token in a log line.
  */
 export function describeLeftoverArgs(args) {
   const flags = [];
   let values = 0;
   for (const a of args) {
-    const s = String(a);
-    if (s.startsWith('-')) flags.push(s.replace(/=[\s\S]*$/, '=<value>'));
+    const m = FLAG_SHAPE.exec(String(a));
+    if (m) flags.push(m[2] === undefined ? m[1] : `${m[1]}=<value>`);
     else values++;
   }
   const hidden = values ? `${values} value${values === 1 ? '' : 's'} not shown` : '';
   const shown = flags.join(' ');
+  if (!shown && !hidden) return 'unknown argument(s): none';
   return `unknown argument(s): ${shown && hidden ? `${shown} (${hidden})` : shown || hidden}`;
 }
 
@@ -352,16 +361,34 @@ function selftest() {
     expectEq('a lone value', describeLeftoverArgs(['SECRET']), 'unknown argument(s): 1 value not shown');
     expectEq('flag=value keeps the flag only', describeLeftoverArgs(['--token=SECRET']), 'unknown argument(s): --token=<value>');
     expectEq('flags only', describeLeftoverArgs(['--foo', '-x']), 'unknown argument(s): --foo -x');
-    expectEq('nothing left over', describeLeftoverArgs([]), 'unknown argument(s): ');
+    expectEq('nothing left over', describeLeftoverArgs([]), 'unknown argument(s): none');
+    // Only a token shaped like a flag is named: `--word` (letters, digits, dashes) or a single
+    // `-x`, each with an optional `=...` tail that is cut. Anything else that starts with a dash is
+    // a value: a secret glued to a short flag (`-tSECRET`), or one that happens to start with a
+    // dash (`--tokn -SECRET`), must not be echoed because of its first character.
+    expectEq('short flag glued to its value', describeLeftoverArgs(['-tSECRET']), 'unknown argument(s): 1 value not shown');
+    expectEq('a value that starts with a dash', describeLeftoverArgs(['--tokn', '-SECRET']), 'unknown argument(s): --tokn (1 value not shown)');
+    expectEq('short flag and its value', describeLeftoverArgs(['-t', 'SECRET']), 'unknown argument(s): -t (1 value not shown)');
+    expectEq('short flag=value keeps the flag only', describeLeftoverArgs(['-t=SECRET']), 'unknown argument(s): -t=<value>');
+    expectEq('dashes inside a long flag are fine', describeLeftoverArgs(['--ui-origin=SECRET']), 'unknown argument(s): --ui-origin=<value>');
+    expectEq('three dashes is not a flag', describeLeftoverArgs(['---token', 'x']), 'unknown argument(s): 2 values not shown');
+    expectEq('a bare dash is not a flag', describeLeftoverArgs(['-']), 'unknown argument(s): 1 value not shown');
+    expectEq('no name after the dashes is not a flag', describeLeftoverArgs(['--=SECRET']), 'unknown argument(s): 1 value not shown');
+    expectEq('an underscore is outside the flag alphabet', describeLeftoverArgs(['--ui_origin', 'x']), 'unknown argument(s): 2 values not shown');
     // The wiring: parseArgs throws that text, so the value never reaches a log line.
-    let msg = '';
-    try {
-      parseArgs(['--tokn', 'SECRET']);
-    } catch (e) {
-      msg = e.message;
-    }
+    const thrown = (argv) => {
+      try {
+        parseArgs(argv);
+      } catch (e) {
+        return e.message;
+      }
+      return '';
+    };
+    const msg = thrown(['--tokn', 'SECRET']);
     expectEq('parseArgs names the flag', msg, 'unknown argument(s): --tokn (1 value not shown)');
     expectEq('parseArgs never echoes the value', msg.includes('SECRET'), false);
+    expectEq('parseArgs never echoes a glued value', thrown(['-tSECRET']).includes('SECRET'), false);
+    expectEq('parseArgs never echoes a dash-led value', thrown(['--tokn', '-SECRET']).includes('SECRET'), false);
   });
 
   run('run validity: which window, request and lag conditions make a run unusable, and the warnings listed', () => {

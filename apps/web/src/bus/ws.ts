@@ -124,7 +124,7 @@ export function createWsBus(opts: WsBusOptions): BusClient {
     const reply = request<ToolCallResult>('tools/call', { name: 'flow.subscribe', arguments: {} });
     let expire: () => void = () => {};
     const timedOut = new Promise<void>((r) => (expire = r));
-    const timer = setTimeout(() => {
+    const subscribeTimer = setTimeout(() => {
       pending.delete(id);
       expire();
     }, subscribeTimeoutMs);
@@ -135,7 +135,7 @@ export function createWsBus(opts: WsBusOptions): BusClient {
       ),
       timedOut,
     ]);
-    clearTimeout(timer);
+    clearTimeout(subscribeTimer);
   }
 
   function onMessage(ev: MessageEvent) {

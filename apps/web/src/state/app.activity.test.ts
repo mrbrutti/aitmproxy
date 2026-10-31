@@ -9,7 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createAppStore } from './app';
 import { AGENT_LINE, bridgeBus, tick, type TestBus } from './bridgeBus.testkit';
-import { filterActivity } from '~/panels/agent/activity';
+import { filterActivity, summarizeArgs } from '~/panels/agent/activity';
 
 const T0 = AGENT_LINE.at; // 1730000000000 = 2024-10-27T03:33:20.000Z
 /** This UI's own poll, echoed back: unlabelled (the bridge labels nothing), our origin, a background read that succeeded. */
@@ -254,10 +254,16 @@ describe('app store — activity intake', () => {
   });
 
   // The `{lagged:true}` marker says the server's lane for this connection overflowed and dropped
-  // notifications, audit lines among them (spec D7, fourth amendment). The operator must see the gap:
-  // one synthetic error row goes straight into the log (it is not an audit line and skips the noise
-  // rule), on top of the flow resync the marker already triggers; the Errors chip shows it.
-  it('a lagged marker appends one visible gap row', async () => {
+  // notifications, audit lines among them, and every reconnect after the first open is a stream the
+  // UI was off for a while (spec D7, fourth amendment). The operator must see the gap: one synthetic
+  // error row goes straight into the log (it is not an audit line and skips the noise rule), with the
+  // sentence in the args cell so it is read in the table and not only in the result tooltip; the
+  // Errors chip shows it. Consecutive gap rows fold into one (count, at), so a sustained lag cannot
+  // evict the 500-row history with notices.
+  const LAG_NOTE = 'audit lines may be missing: the push stream lagged';
+  const RECONNECT_NOTE = 'audit lines may be missing: the bus reconnected';
+
+  it('a lagged marker appends one visible gap row, with the reason in the args cell', async () => {
     vi.setSystemTime(T0);
     const { bus, app } = start();
     await tick(200);
@@ -272,32 +278,120 @@ describe('app store — activity intake', () => {
       command: 'audit-log',
       result: 'error',
       at: '2024-10-27T03:33:20.200Z', // T0 + the 200 ms of bootstrap: when the marker landed
-      detail: 'the push stream lagged: some audit lines may be missing from this log',
+      args: { note: LAG_NOTE, count: 1 },
+      detail: LAG_NOTE,
     };
     expect(app.proxy.activity).toEqual([marker]);
-    expect(app.proxy.activity[0]!.result).toBe('error');
+    // What the args cell shows (`ActivityLog.tsx` renders `summarizeArgs(e.args)`): the sentence, in the table.
+    expect(summarizeArgs(app.proxy.activity[0]!.args)).toBe('{"note":"audit lines may be missing: the push stream lagged","count":1}');
     // The Errors filter is `result === 'error'` (panels/agent/activity.ts): the row is one chip away.
     expect(filterActivity(app.proxy.activity, { kind: 'errors', query: '', clearedThrough: 0 })).toEqual([marker]);
     // Still a resync, still not state.
     expect(bus.count('flow.list')).toBe(lists + 1);
     expect(app.proxy.listening).toBe(true);
     expect(app.proxy.armed).toBe(false);
+  });
 
-    // Two markers are two gaps: appended and numbered, never folded into one.
+  it('consecutive lag markers fold into one gap row that counts them', async () => {
+    vi.setSystemTime(T0);
+    const { bus, app } = start();
+    await tick(200);
+
     bus.emit('notifications/aitm/state', { lagged: true });
-    expect(app.proxy.activity.map((e) => [e.seq, e.command, e.result])).toEqual([
-      [1, 'audit-log', 'error'],
-      [2, 'audit-log', 'error'],
-    ]);
+    await tick(50);
+    const first = app.proxy.activity[0]!;
+    await tick(1000);
+    bus.emit('notifications/aitm/state', { lagged: true });
 
-    // The marker row is capped like every other line: 500 kills push the two markers out, a third
-    // marker pushes the oldest kill out and is the newest row.
-    for (let i = 0; i < 500; i++) bus.emit('notifications/aitm/agent', ownKill(i));
+    // One row, not two: `count` and `at` move to the newest marker; the sentence stays.
+    expect(app.proxy.activity).toEqual([
+      {
+        seq: 2,
+        origin: 'operator',
+        command: 'audit-log',
+        result: 'error',
+        at: '2024-10-27T03:33:21.250Z', // T0 + 200 + 50 + 1000: when the second marker landed
+        args: { note: LAG_NOTE, count: 2 },
+        detail: LAG_NOTE,
+      },
+    ]);
+    // Updated in place, so the rendered row keeps its identity (`<For>` keys by object), while the seq
+    // is fresh: `seq` is the Clear-view watermark (`clearedThrough`), and a fold that kept the old number
+    // would stay hidden behind a Clear made after the first gap.
+    expect(app.proxy.activity[0]).toBe(first);
+    expect(filterActivity(app.proxy.activity, { kind: 'all', query: '', clearedThrough: 1 })).toHaveLength(1);
+
+    bus.emit('notifications/aitm/state', { lagged: true });
+    expect(app.proxy.activity).toHaveLength(1);
+    expect(app.proxy.activity[0]).toMatchObject({ seq: 3, args: { note: LAG_NOTE, count: 3 } });
+  });
+
+  it('a real row between two markers keeps two gap rows', async () => {
+    const { bus, app } = start();
+    await tick(200);
+
+    bus.emit('notifications/aitm/state', { lagged: true });
+    bus.emit('notifications/aitm/agent', ownKill(1));
+    bus.emit('notifications/aitm/state', { lagged: true });
+
+    expect(app.proxy.activity.map((e) => [e.seq, e.command, e.args])).toEqual([
+      [1, 'audit-log', { note: LAG_NOTE, count: 1 }],
+      [2, 'flow.kill', { id: 'f_1' }],
+      [3, 'audit-log', { note: LAG_NOTE, count: 1 }],
+    ]);
+  });
+
+  it('a reconnect appends a gap row on the second open, not the first, and a lag during it folds in', async () => {
+    vi.setSystemTime(T0);
+    const bus = bridgeBus();
+    bus.ctl.setState('connecting'); // the real ws bus is not open when the store is created
+    const { app } = start(bus);
+    await tick(200);
+    expect(app.proxy.activity).toEqual([]);
+
+    bus.ctl.setState('open'); // the first open: nothing was missed
+    await tick(50);
+    expect(app.proxy.activity).toEqual([]);
+
+    bus.ctl.setState('reconnecting');
+    await tick(1000);
+    bus.ctl.setState('open'); // a reconnect: whatever the server pushed in between is gone
+    await tick(50);
+    const row = {
+      seq: 1,
+      origin: 'operator',
+      command: 'audit-log',
+      result: 'error',
+      at: '2024-10-27T03:33:21.250Z', // T0 + 200 + 50 + 1000
+      args: { note: RECONNECT_NOTE, count: 1 },
+      detail: RECONNECT_NOTE,
+    };
+    expect(app.proxy.activity).toEqual([row]);
+    expect(filterActivity(app.proxy.activity, { kind: 'errors', query: '', clearedThrough: 0 })).toEqual([row]);
+
+    bus.emit('notifications/aitm/state', { lagged: true });
+    expect(app.proxy.activity).toHaveLength(1);
+    expect(app.proxy.activity[0]).toMatchObject({ seq: 2, args: { note: RECONNECT_NOTE, count: 2 } });
+  });
+
+  it('gap rows are capped like every other line', async () => {
+    const { bus, app } = start();
+    await tick(200);
+
+    // Alternating with real rows so nothing folds: 250 gaps and 250 kills, seq 1..500.
+    for (let i = 0; i < 250; i++) {
+      bus.emit('notifications/aitm/state', { lagged: true });
+      bus.emit('notifications/aitm/agent', ownKill(i));
+    }
+    expect(app.proxy.activity).toHaveLength(500);
+    expect(app.proxy.activity[0]).toMatchObject({ seq: 1, command: 'audit-log' });
+
+    // One more marker pushes the oldest gap row out and is the newest row.
     bus.emit('notifications/aitm/state', { lagged: true });
     const list = app.proxy.activity;
     expect(list).toHaveLength(500);
-    expect(list[0]).toMatchObject({ seq: 4, command: 'flow.kill', args: { id: 'f_1' } });
-    expect(list[499]).toMatchObject({ seq: 503, command: 'audit-log', result: 'error' });
+    expect(list[0]).toMatchObject({ seq: 2, command: 'flow.kill', args: { id: 'f_0' } });
+    expect(list[499]).toMatchObject({ seq: 501, command: 'audit-log', result: 'error', args: { note: LAG_NOTE, count: 1 } });
   });
 
   // Audit lines carry what other clients sent (`args` echoes an agent's tool arguments), so the intake

@@ -44,9 +44,11 @@ describe('isUiPollNoise / ownOriginOf', () => {
     expect(isUiPollNoise({ ...ownRead, command: 'l4.intercept.list' }, own)).toBe(true);
     expect(isUiPollNoise({ ...ownRead, command: 'browser.screenshot' }, own)).toBe(true);
     expect(isUiPollNoise({ ...ownRead, command: 'browser.navigate' }, own)).toBe(false);
-    // (12) `flow.get` is the inspector's whole-flow read on a click, not a poll: kept even from our own
-    //      origin. `l4.flow.get` is NOT the same case: the L4 store reads it per session every 1.5 s
-    //      (`state/context.tsx`, `panels/l4/store.ts` refresh), so from us it is noise.
+    // (12) `flow.get` is not a timer read of a pushing core: the UI only issues it as the fallback poll
+    //      against a core without `flow.detail`, which a pushing core always has, so leaving it out
+    //      keeps another client's whole-flow read on the same token visible. `l4.flow.get` is NOT the
+    //      same case: the L4 store reads it per session every 1.5 s (`state/context.tsx`,
+    //      `panels/l4/store.ts` refresh), so from us it is noise.
     expect(isUiPollNoise({ ...ownRead, command: 'flow.get' }, own)).toBe(false);
     expect(isUiPollNoise({ ...ownRead, command: 'l4.flow.get' }, own)).toBe(true);
   });
@@ -71,8 +73,9 @@ describe('isUiPollNoise / ownOriginOf', () => {
     expect(isUiPollNoise({ ...detail, args: { id: 'f_1', body: 'none' }, origin: 'mcp' }, own)).toBe(false);
   });
 
-  // The literal list the spec names (D7, as amended after review round 2: `flow.get` is out, a click-driven
-  // whole-flow read; `l4.flow.get` stays, the L4 store polls it per session). The pin below compares the
+  // The literal list the spec names (D7, as amended after review round 2: `flow.get` is out, the UI's
+  // fallback poll against a core without `flow.detail`, never issued against a pushing core, so another
+  // client's whole-flow read stays visible; `l4.flow.get` stays, the L4 store polls it per session). The pin below compares the
   // set to it; the loop after it walks the LITERAL (not the set under test, which would pass for any
   // contents) so every one of the 16 reads is proven to be dropped by the rule, not just the ones the
   // matrix happens to name.

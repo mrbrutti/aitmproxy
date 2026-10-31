@@ -157,8 +157,9 @@ export function createAppStore(bus: BusClient) {
     // What lives here: the push coalescer's queue, timer and flags, the row-fetch tickets and the clear
     // epoch, and the single-flight poll slot. It is declared ahead of `clearFlows` (just below), which
     // drops the pending set and bumps the epoch long before the coalescer and the loop are defined.
-    // The loop's own state (`failedAt`, `backlog`, `toolsLoaded`, the push clocks, `lastPollAt`,
-    // `lastStatusAt`) is declared with the loop, after the notification handler.
+    // The push clocks (`lastFlowPushAt`, `lastStatePushAt`) sit just above the notification handler;
+    // `failedAt`, `backlog`, `toolsLoaded`, `lastPollAt`, `lastStatusAt` and `pollLoopOn` come with
+    // the loop.
     /** Ids a flow push named that the coalescer has not fetched yet, in first-notification (capture) order. */
     const pushPending = new Set<FlowId>();
     /** The armed coalescing timer, if any (`armPush`). */
@@ -395,33 +396,53 @@ export function createAppStore(bus: BusClient) {
       commitActivity(kept, mode);
     }
     /** Append to (or replace) the log with already-numbered rows and keep the newest ACTIVITY_CAP; nothing kept, nothing changed. */
-    function commitActivity(kept: readonly ActivityEntry[], mode: 'append' | 'replace') {
+    function commitActivity(kept: ActivityEntry[], mode: 'append' | 'replace') {
       if (!kept.length) return;
       setProxy('activity', (list) => {
-        const next = mode === 'replace' ? [...kept] : [...list, ...kept];
+        const next = mode === 'replace' ? kept : [...list, ...kept];
         return next.length > ACTIVITY_CAP ? next.slice(-ACTIVITY_CAP) : next;
       });
     }
     /**
-     * The `lagged` marker means the server dropped notifications for this connection, audit lines among
-     * them. The gap is made visible as one synthetic error row (an `audit-log` line of our own, not an
-     * audit entry, so it never meets the noise rule); the lost lines themselves cannot be recovered over
-     * `aitm web` (push spec D7, fourth amendment).
+     * Why audit lines can be missing from the push-fed log (push spec D7, fourth amendment): the server
+     * dropped notifications for this connection (`lagged`), or the bus reconnected and whatever was pushed
+     * during the outage is gone. The sentence goes in `args` so the table shows it, and in `detail` for
+     * the result tooltip.
      */
-    function noteAuditGap() {
-      commitActivity(
-        [
-          {
-            seq: ++activitySeq,
-            origin: 'operator',
-            command: 'audit-log',
-            result: 'error',
-            at: new Date().toISOString(),
-            detail: 'the push stream lagged: some audit lines may be missing from this log',
-          },
-        ],
-        'append',
-      );
+    const GAP_NOTE = {
+      lagged: 'audit lines may be missing: the push stream lagged',
+      reconnected: 'audit lines may be missing: the bus reconnected',
+    } as const;
+    interface GapArgs {
+      note: string;
+      count: number;
+    }
+    /** The `seq` of the gap row this store appended last; a new gap folds into it only while it is still the newest row. */
+    let lastGapSeq = 0;
+    /**
+     * Make a gap visible as one synthetic error row (an `audit-log` line of our own, not an audit entry,
+     * so it never meets the noise rule, and never a real line: the fold matches the row by the seq this
+     * store gave it, not by its shape). Consecutive gaps FOLD into the newest row (`count` and `at`
+     * move, the first reason's sentence stays), so a sustained lag cannot evict the 500-row history
+     * with notices; a real row in between starts a new gap row. The fold updates the row in place
+     * (`<For>` keys by object identity, so the rendered row is not rebuilt) but gives it a fresh `seq`:
+     * `seq` is the Clear-view watermark (`filterActivity`, `clearedThrough`), and a fold that kept the
+     * old number would stay hidden behind a Clear made after the first gap. The lost lines themselves
+     * cannot be recovered over `aitm web`.
+     */
+    function noteAuditGap(why: keyof typeof GAP_NOTE) {
+      const at = new Date().toISOString();
+      const list = untrack(() => proxy.activity);
+      const last = list[list.length - 1];
+      if (last && last.seq === lastGapSeq) {
+        const prev = last.args as GapArgs;
+        lastGapSeq = ++activitySeq;
+        setProxy('activity', list.length - 1, { seq: lastGapSeq, at, args: { note: prev.note, count: prev.count + 1 } });
+        return;
+      }
+      lastGapSeq = ++activitySeq;
+      const args: GapArgs = { note: GAP_NOTE[why], count: 1 };
+      commitActivity([{ seq: lastGapSeq, origin: 'operator', command: 'audit-log', result: 'error', at, args, detail: GAP_NOTE[why] }], 'append');
     }
 
     function onAgent(a: unknown) {
@@ -460,7 +481,7 @@ export function createAppStore(bus: BusClient) {
             // were lost too and cannot be re-read: the log gets one row that says so.
             lastFlowPushAt = Number.NEGATIVE_INFINITY;
             requestPollNow();
-            noteAuditGap();
+            noteAuditGap('lagged');
             break;
           }
           // Only a complete payload is a state push: the clock moves only when one was applied.
@@ -699,12 +720,18 @@ export function createAppStore(bus: BusClient) {
     // Every (re)connection is a new stream: nothing pushed before an outage says anything about what
     // was captured during it. Both clocks are reset so the next tick takes a fresh snapshot even if a
     // push was fresh seconds ago, held failures are retried, and ids queued for the socket that is
-    // gone are dropped (the snapshot covers them). Deferred: the state at creation is not a transition.
+    // gone are dropped (the snapshot covers them). The flows are covered that way; the audit lines
+    // pushed during the outage are not, so every open after the first notes a gap in the Activity log
+    // (the first open missed nothing). Deferred: the state at creation is not a transition, which is
+    // why `hasBeenOpen` is seeded from it (a bus handed over already open has had its first open).
+    let hasBeenOpen = untrack(bus.state) === 'open';
     createEffect(
       on(
         bus.state,
         (s) => {
           if (s !== 'open') return;
+          if (hasBeenOpen) noteAuditGap('reconnected');
+          hasBeenOpen = true;
           lastFlowPushAt = Number.NEGATIVE_INFINITY;
           lastStatePushAt = Number.NEGATIVE_INFINITY;
           failedAt.clear();

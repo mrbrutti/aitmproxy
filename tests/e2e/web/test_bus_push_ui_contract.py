@@ -18,12 +18,16 @@ REAL /bus bridge, as the agent token (the `aitm web --token` value):
   4. the UI's own flow.list is audited and pushed back as a notifications/aitm/agent
      line {at:int, origin:"mcp", client_label:null, command, args:str, result:"ok"}
                                                    (server.rs record_audit, audit.rs)
+  4b. the flow.detail audit line's args parse back to exactly {id, body:"none"}:
+     the UI's body-aware noise rule reads `body` off the echoed args
+                                              (server.rs redact_args, redact.rs)
   5. a successful flow.subscribe is NOT audited             (server.rs call_tool)
 
 Every check is hard (no skip). The two sibling suites in this directory are left
 as they are (spec non-goal); this one sits beside them.
 """
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -167,6 +171,33 @@ def main() -> int:
         check(isinstance(a.get("args"), str),
               f"agent line args is a (redacted JSON) string, got {type(a.get('args')).__name__}")
         check(a.get("result") == "ok", f"agent line result is 'ok', got {a.get('result')!r}")
+
+        section("4b. the flow.detail audit line carries the call's exact args, body:'none' included")
+        # The UI drops its own flow.detail echo only in the poll's exact shape, args.body
+        # == 'none' (apps/web/src/bus/noise.ts isPollDetail; spec D7), so that rule rests
+        # on two server facts pinned here: the audited `args` is the call's arguments
+        # object, redacted by key and content and rendered as JSON (crates/aitm-mcp/src/
+        # server.rs redact_args), and neither `id` nor `body` is a secret key
+        # (crates/aitm-core/src/redact.rs SECRET_KEY_NEEDLES), so both survive verbatim.
+        # Step 3 made exactly one flow.detail call on the only connection to this core.
+
+        def flow_detail_lines():
+            mine = [p for p in params_of(ws, AGENT) if p.get("command") == "flow.detail"]
+            return mine or None
+
+        details = collect_until(ws, flow_detail_lines, PUSH_WAIT_S)
+        check(details is not None,
+              f"an audit line for flow.detail was pushed to the subscriber within {PUSH_WAIT_S:.0f}s "
+              f"(agent commands seen: {sorted({str(p.get('command')) for p in params_of(ws, AGENT)})})")
+        check(len(details) == 1, f"exactly one flow.detail audit line (got {len(details)}): it is step 3's call")
+        d_args = details[0].get("args")
+        check(isinstance(d_args, str), f"flow.detail agent line args is a string, got {type(d_args).__name__}")
+        try:
+            parsed = json.loads(d_args) if isinstance(d_args, str) else None
+        except ValueError:
+            parsed = None
+        check(parsed == {"id": fid, "body": "none"},
+              f"flow.detail args round-trip to exactly {{'id': {fid!r}, 'body': 'none'}} (got {parsed!r})")
 
         section("5. a successful flow.subscribe is not audited")
         # Any such line would have been pushed at subscribe time, long before now; a

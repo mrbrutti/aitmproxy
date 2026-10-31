@@ -7,11 +7,15 @@ import type { AgentNotification, BusRole } from '~/bus/types';
 /**
  * The reads the UI issues on timers or in bulk refreshes (push spec D7, as amended after review
  * round 2). Every call is audited and echoed back to us, so a successful one of these from this
- * connection is the UI watching itself. `flow.get` is not here: it is the inspector's whole-flow read
- * on a click, not a timer. `l4.flow.get` is: the L4 store re-reads every session with it on its
- * 1.5 s poll (`state/context.tsx`, `panels/l4/store.ts`), and it returns a summary (kind, bind,
- * per-packet lengths and layers), never payload bytes. `flow.detail` is here only in the poll's
- * shape (`isPollDetail`).
+ * connection is the UI watching itself. `flow.get` is not here: the UI only issues it as the fallback
+ * poll against a core without `flow.detail`, and a pushing core always has `flow.detail`; leaving it
+ * out means another client's whole-flow read on the same token stays visible. `l4.flow.get` is: the
+ * L4 store re-reads every session with it on its 1.5 s poll (`state/context.tsx`,
+ * `panels/l4/store.ts`), and it returns a summary (kind, bind, per-packet lengths and layers), never
+ * payload bytes. `flow.detail` is here only in the poll's shape (`isPollDetail`). Accepted residual
+ * (spec D7): a `flow.detail {body:'none'}` still returns every request and response header (cookies,
+ * authorization), so a second client on the same token and role reading headers that way is hidden
+ * from the push-fed log too; the server's own audit (ring, durable log) keeps it.
  */
 export const UI_BACKGROUND_READS: ReadonlySet<string> = new Set([
   'flow.list',
