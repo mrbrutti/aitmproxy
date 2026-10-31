@@ -58,6 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Started from a terminal, the process is not a foreground app yet.
         NSApp.setActivationPolicy(.regular)
         NSApp.activate()
+        SelfTest.armWatchdog()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -75,6 +76,17 @@ enum Store {
     static var isOverridden: Bool {
         !(ProcessInfo.processInfo.environment["APP_STORE"] ?? "").isEmpty
     }
+
+    /// The store for the connection settings (`bus.*`, `proxy.*`, `capture.enabled`):
+    /// the operator's real defaults in a normal launch, an isolated suite in a
+    /// self-test, snapshot or fixture run (`SettingsDomain`), so stale Settings ▸ Bus
+    /// residue never steers a test and a test never overwrites it. `UserDefaults` is
+    /// thread-safe but not marked `Sendable`, hence `unsafe`; the embedded core reads
+    /// it off the main actor.
+    nonisolated(unsafe) static let defaults: UserDefaults = {
+        let env = ProcessInfo.processInfo.environment
+        return SettingsDomain.select(environment: env).makeDefaults(registering: SettingsDomain.registration(environment: env))
+    }()
 
     static var url: URL {
         if let path = ProcessInfo.processInfo.environment["APP_STORE"], !path.isEmpty {
@@ -99,11 +111,11 @@ enum Store {
 struct FlowCommands: Commands {
     let session: Session
     /// The persisted capture choice (Settings ▸ Capture), read here for the Enable/Disable label.
-    @AppStorage("capture.enabled") private var captureEnabled = false
+    @AppStorage("capture.enabled", store: Store.defaults) private var captureEnabled = false
     /// The active core kind (Settings ▸ Bus), read exactly as `ProxySettings` reads it: capture
     /// belongs to the embedded core, so the Enable/Disable Capture command stands down unless
     /// that is the active one.
-    @AppStorage(UserDefaultsActiveKindPersistence.key) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
+    @AppStorage(UserDefaultsActiveKindPersistence.key, store: Store.defaults) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
 
     private var usesEmbedded: Bool { (ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded) == .embedded }
 

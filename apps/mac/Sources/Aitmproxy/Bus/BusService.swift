@@ -271,29 +271,10 @@ final class BusService: FlowActions {
 
     /// The proxy's config.yaml (`AITM_CONFIG`, as the `aitm` binary reads it,
     /// else the default path) by default; else Settings > Bus host/port/token file.
+    /// Settings come from `Store.defaults`, so a self-test never sees the
+    /// operator's pasted token.
     static func resolveEndpoint() -> BusEndpoint? {
-        let defaults = UserDefaults.standard
-        // A pasted operator token overrides the config/agent token; its class
-        // makes the server resolve the connection to operator (spec Decision E).
-        // Empty ⇒ not configured, so the app stays an agent by default.
-        let operatorToken = (defaults.string(forKey: "bus.operatorToken") ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let fromConfig = defaults.object(forKey: "bus.fromConfig") as? Bool ?? true
-        if fromConfig, var endpoint = try? BusEndpoint.fromConfigFile(configURL) {
-            if !operatorToken.isEmpty { endpoint.token = operatorToken }
-            return endpoint
-        }
-        let host = defaults.string(forKey: "bus.host") ?? "127.0.0.1"
-        let port = UInt16(clamping: defaults.integer(forKey: "bus.port"))
-        var token = operatorToken
-        if token.isEmpty {
-            let tokenFile = (defaults.string(forKey: "bus.tokenFile") ?? "") as NSString
-            if tokenFile.length > 0, let text = try? String(contentsOfFile: tokenFile.expandingTildeInPath, encoding: .utf8) {
-                token = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-        }
-        guard port > 0, !token.isEmpty else { return nil }
-        return BusEndpoint(host: host, port: port, token: token)
+        BusEndpointSettings(defaults: Store.defaults).endpoint(configURL: configURL)
     }
 
     static var configURL: URL {

@@ -449,7 +449,7 @@ final class Session {
     /// to the server). Called by the bus service on connect; `nil` on disconnect.
     func applyResolvedRole(_ role: String?) {
         resolvedRole = role
-        let expected = ExpectedRole(rawValue: UserDefaults.standard.string(forKey: "bus.expectedRole") ?? "")
+        let expected = ExpectedRole(rawValue: Store.defaults.string(forKey: BusEndpointSettings.Key.expectedRole) ?? "")
         roleWarning = roleMismatch(expected: expected, resolved: role)
     }
 

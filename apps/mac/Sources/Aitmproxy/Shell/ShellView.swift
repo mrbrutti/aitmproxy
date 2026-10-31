@@ -90,7 +90,7 @@ struct ShellView: View {
                 // surface (Task 8) drives the status dot + core-log panel.
                 let controller = EmbeddedCoreController(coreID: session.activeCoreID, bus: service, health: session.coreHealth)
                 let driver = LiveConnectionDriver(embedded: controller, bus: service)
-                let model = ActiveConnectionModel(driver: driver, persistence: UserDefaultsActiveKindPersistence())
+                let model = ActiveConnectionModel(driver: driver, persistence: UserDefaultsActiveKindPersistence(defaults: Store.defaults))
                 model.activate()
                 session.connection = model
                 embeddedCore = controller
