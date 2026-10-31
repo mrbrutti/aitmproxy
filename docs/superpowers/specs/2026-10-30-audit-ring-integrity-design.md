@@ -240,10 +240,14 @@ every surface.
 2. `pub fn sanitize_client_label(raw: &str) -> Option<String>`: the one sanitiser.
    Reads at most the first 1024 chars of `raw` (so work is bounded no matter the
    input), drops every `char::is_control` character and the invisible and bidi set
-   U+200B..=U+200F, U+2028..=U+202E, U+2060..=U+2069, U+FEFF (so a label cannot
-   spoof another in a UI), runs `redact::scrub_text`, trims, truncates to
-   `MAX_CLIENT_LABEL_CHARS` (64) chars, and returns `None` if nothing is left. It is
-   idempotent, and it does not rewrite `web-bridge`.
+   U+200B..=U+200F, U+2028..=U+202E, U+2060..=U+2069, U+FEFF, U+061C, U+00AD,
+   U+034F, U+115F, U+1160, U+3164, U+FFA0, U+180B..=U+180E, U+FE00..=U+FE0F,
+   U+2800, U+E0000..=U+E007F (so a label cannot spoof another in a UI, and
+   `web-bridge` plus an invisible suffix is still rewritten to `web-bridge
+   (declared)`), runs `redact::scrub_text`, trims, truncates to
+   `MAX_CLIENT_LABEL_CHARS` (64) chars, and returns `None` if nothing is left. Its
+   output is bounded and it does not rewrite `web-bridge`; it is not strictly
+   idempotent under a further `scrub_text` (item (d) below).
 3. `pub fn declared_client_label(raw: &str) -> Option<String>`: `sanitize_client_label`
    plus a reserved-name guard. If the sanitised label equals (trimmed, ASCII
    case-insensitive) a server-minted label, `web-bridge` today, it becomes
@@ -267,11 +271,16 @@ passes through unchanged.
 `poc.run` (`aitm-poc/src/runner.rs`, same expression). `CommandHost.client_label` is
 set in exactly one place, `run_tool`. After this change that place uses
 `conn_audit_label`, so (a) findings recorded over the bridge carry `client_label:
-"web-bridge"` instead of `null`; (b) every finding label is at most 64 chars,
-control-free and scrubbed; (c) the schema is unchanged (`Option<String>`), and
-existing records keep their stored values, including `null`; (d) `DiskFindingStore::
-record` keeps its own `scrub_text` on the label, now a harmless second application
-because the sanitiser's output is stable under `scrub_text`; (e) a TCP agent that
+"web-bridge"` instead of `null`; (b) every finding label is about 64 chars (never
+leaks, see (d)), control-free and scrubbed; (c) the schema is unchanged
+(`Option<String>`), and existing records keep their stored values, including `null`;
+(d) `DiskFindingStore::record` keeps its own `scrub_text` on the label, a second
+application that can only mask more and never leaks, but that is not strictly
+idempotent: the sanitiser's output is bounded (64 chars), yet truncation can land
+inside a `[redacted]` mask (`"x"*50 + "Bearer abc123"` sanitises to 64 chars ending
+`Bearer [redact`, which the store's `scrub_text` turns into 67 chars; a cut right
+after `Bearer [` is the worst case, about 73), so a stored finding label can be up to
+about 10 chars over 64; (e) a TCP agent that
 declares `web-bridge` cannot reach a finding under that name, only
 `web-bridge (declared)`. No `aitm-findings` edit is needed.
 
@@ -371,7 +380,11 @@ passes stay regex):
 - A **key run** is a maximal run of ASCII alphanumerics, `_`, `.`, `-`, and any
   non-ASCII char (as the old Unicode `\w` did). Optional one closing quote, optional
   blanks, then `=` or `:` (the separator), optional blanks, optional one opening
-  quote, then the value.
+  quote, then the value. Blanks are ASCII and Unicode whitespace, newlines included
+  (as the old `\s*` was), so masking is no weaker than the old regex. Consequence:
+  prose that ends a line with `auth:`, `session:` or `sid:` loses the first word of
+  the next line (`auth:\nnext line here` becomes `auth:\n[redacted] line here`); that
+  is the old behaviour for the old needle keys and now also applies to the new keys.
 - If `is_secret_key(run)` and the value is non-empty, the value is replaced by
   `[redacted]` and the scan resumes after the value. If the key is not secret the scan
   resumes **after the key run, not after the value**, so a pair nested in a non-secret
@@ -379,9 +392,16 @@ passes stay regex):
 - **Value rule.** If the value opened with a quote and a matching unescaped quote
   exists, the value is everything up to it (a backslash skips the next char). Otherwise
   (unquoted, or an opening quote that never closes) it runs to the first whitespace,
-  `&`, `;`, `,`, `"`, `'`, or `}`. An empty value is left alone. This is the rule
-  `redact_needle_pairs` and its `closing_quote` already implement, so the scanner's
-  pipeline gives the same output after the change.
+  `&`, `;`, `,`, `"`, `'`, or `}`. An empty value is left alone. A quoted value's
+  closing quote must not close the value when it is opener-shaped (the previous
+  non-whitespace byte is `=` or `:` and the next byte is not an end-of-value), so an
+  unclosed or escaped-closer quote can never swallow the next pair's opening quote and
+  leave its value in the clear (`password='abc def token='S3CR3T'`). Failed
+  closing-quote searches are remembered per quote character so the scan stays linear;
+  when no closer exists the plain unquoted rule applies (over-redact, never leak).
+  The base rule is the one `redact_needle_pairs` and its `closing_quote` already
+  implement; the opener-shaped refinement is core-only (the scanner is not edited), so
+  `scrub_text` is the stricter of the two and AC10 still holds.
 - **host:port exemption (Architect's call).** A pair with separator `:`, an unquoted
   key run that contains a `.`, and a value that is 1 to 5 ASCII digits immediately
   after the `:` followed by a terminator (`/`, `?`, `#`, whitespace, a pair delimiter,
@@ -411,7 +431,7 @@ is not this change. Its existing tests are the equivalence oracle.
 |---|---|---|
 | `aitm-mcp` `redact_value` / `redact_args` / `record_audit` | the point of the change: `sid`, `jwt`, `csrf`, `session`, `auth` keys and `key=value` content masked in `args_summary` and error reasons | `audit_redacts_*` in `mcp.rs` unmodified, plus AC29 |
 | `aitm-plugin-scanner` `discover::is_secret_name` | none (superset) | `discover` tests, unmodified |
-| `aitm-plugin-scanner` `reproduce::scrub_embedded` | same output: step 2 now masks the shared vocabulary with the same value rule, step 3 sees `[redacted]` and rewrites it to `[redacted]`; its wider substring needles (`subsidiary=acme`) are still masked by step 3 | the `scrub_embedded_*` tests, unmodified (`..._handles_quotes_and_escapes`, `..._leaves_innocent_text_and_empty_values_alone`, the JSON, form, and Referer cases) |
+| `aitm-plugin-scanner` `reproduce::scrub_embedded` | same output: step 2 now masks the shared vocabulary with the same base value rule, step 3 sees `[redacted]` and rewrites it to `[redacted]`; its wider substring needles (`subsidiary=acme`) are still masked by step 3 | the `scrub_embedded_*` tests, unmodified (`..._handles_quotes_and_escapes`, `..._leaves_innocent_text_and_empty_values_alone`, the JSON, form, and Referer cases) |
 | `aitm-plugin-scanner` `crawl::safe_target`, `commands.rs` endpoint rows and `endpoint_flows` keys | URLs with `?sid=`, `?session=`, `?auth=`, `?jwt=`, `?csrf=` now show `[redacted]` (a leak fix); both sides of the url-to-flow link pass through the same `scrub_text`, so the link holds; two URLs that differ only in such a value collapse to one key | the scanner suite, unmodified (no scanner test asserts a `sid`/`session`/`auth` query value survives `scrub_text`; checked by grep) |
 | `aitm-findings` `DiskFindingStore::record` (`title`, `notes`, `target`, `client_label`) | the same masking in stored YAML; `https://auth.example.com:8443/x` is untouched by the exemption | findings suites, unmodified |
 | `aitm-poc` builder | none (Design 4a) | `crates/aitm-poc/tests/builder.rs`, unmodified |
@@ -448,7 +468,7 @@ the audit copy is capped. No policy refusal text is anywhere near the cap.
 | `agent.activity` (TUI Agent page, `apps/web` `AgentPanel`, macOS `Activity.swift`, agents) | Merged oldest-first by call order across the two lanes; a source's retention depends on its own volume and on lane fair share, not on other sources' polling; default-link entries now carry `client_label: "web-bridge"`; labels are at most 64 chars and scrubbed; error reasons are at most 1 KiB; a full ring can hold up to 6144 entries, so an unlimited call can be 1.5x as large | Entry shape, `since`/`limit` meaning, oldest-first order, that every audited call is present while the ring is not full |
 | `agent.status.actions_last_minute` | Counts both lanes; saturates at what is held; documented as including every surface's polling | The value in PR 145 AC5 (`== 2`); the field and its type |
 | `notifications/aitm/agent` push | `client_label` is sanitised; bridge entries carry `web-bridge` | One push per audited call, routine ones included; shape |
-| Findings (`findings.record`, `poc.run`) | `client_label` is `web-bridge` for bridge-recorded findings (was `null`); every label is at most 64 chars, control-free and scrubbed | Schema; old records; the store's own `scrub_text` |
+| Findings (`findings.record`, `poc.run`) | `client_label` is `web-bridge` for bridge-recorded findings (was `null`); every label is about 64 chars, never leaks, control-free and scrubbed | Schema; old records; the store's own `scrub_text` |
 | CA and durable JSONL (`entry_to_jsonl`, `FileAuditLog`) | Receives the sanitised label | Format; not wired in production |
 | macOS app, TUI | Their own polls land in the routine lane under their declared label; nothing reads `client_label`, so no code change | Everything they call |
 | `aitm web` UI (default link) | Its polls are the `(mcp, web-bridge)` source; evidence is no longer evicted by them; it still inflates `actions_last_minute` | Poll cadence; the link's agent role and gating |
@@ -477,14 +497,16 @@ rebases the branch on `main` before dispatching Task 6 and again before the pane
 2. **A source table floor, not a wall.** With 35 buckets a source keeps at least
    `capacity / 35 - 1` entries against any flood. A source that first appears *after* a
    hostile client has saturated the 32 slots shares its origin's overflow bucket with
-   that client and gets no isolation from it; origin still separates `mcp` from
-   `operator`.
+   that client and gets no isolation from it; likewise a flooder that declares the
+   same label as an honest source shares that source's bucket (labels are
+   unauthenticated). Origin still separates `mcp` from `operator`.
 3. **Reads are not evidence-grade.** Successful `Read` calls, including a `flow.detail`
    read that exfiltrates captured credentials, live in the shorter routine lane and
    can be forgotten sooner. That is the price of keeping polling out of evidence.
 4. **Labels are display strings.** The reserved-name guard is an exact match after
-   sanitising; a homoglyph (`web‑bridge` with U+2011) or a first-party name such as
-   `aitm-mac` can still be declared by any client. Nothing may grant trust by label;
+   sanitising (invisible padding is stripped first, Design 2); a homoglyph letter
+   (`web‑bridge` with U+2011) or a first-party name such as `aitm-mac` can still be
+   declared by any client. Nothing may grant trust by label;
    `origin` is the only authoritative field.
 5. **`actions_last_minute` is inflated by polling UIs** and saturates under extreme
    rates (documented).
@@ -492,11 +514,22 @@ rebases the branch on `main` before dispatching Task 6 and again before the pane
    `auth: none` is masked after the colon; `session-store:6379` (no `.`) is masked;
    `userSession=` (camelCase) and a bare credential with no `key=`/`Bearer` frame are
    not caught; a numeric `host:port`-shaped credential written `a.sid:1234` is
-   exempted.
+   exempted. Blanks around a separator include newlines (as the old `\s*` did), so
+   prose that ends a line with `auth:`, `session:` or `sid:` loses the first word of
+   the next line (`auth:\nnext line here` becomes `auth:\n[redacted] line here`): the
+   old behaviour for the old needle keys, now also for the new ones.
 7. **`entry_to_jsonl` trusts its caller.** A future direct caller with a hand-built
    entry bypasses the sanitiser.
 8. **No durability.** A restart empties the ring.
 9. **The push stream is unfiltered**, so a polling UI still produces one push per call.
+10. **Every agent-token bridge connection is one source.** The web UI and any script
+    holding the agent token are all `(mcp, web-bridge)`, one fair-share source, so
+    they can evict each other's entries but not those of TCP agents or of the operator
+    link.
+11. **The host:port exemption also exempts credential-shaped keys** such as
+    `db.password:1234` and `a.token:1234` (the old code masked them). Accepted: a
+    credential written as a dotted key with `:` and 1-5 digits is rare, and the
+    exemption is what keeps `auth.example.com:8443` readable.
 
 ## Acceptance criteria
 
@@ -539,7 +572,8 @@ that must not change. Test names are exact. No existing test is edited.
 8. **AC8** `[red]` `scrub_text_and_is_secret_key_share_one_vocabulary`: for a table of
    keys (every key in AC1 and AC2 plus the twelve substring needles),
    `is_secret_key(k)` equals `scrub_text(&format!("{k}=VALUE9")) != format!("{k}=VALUE9")`.
-9. **AC9** `[guard]` `scrub_text_survives_hostile_inputs`: 4 MiB of `sid=` repeated
+9. **AC9** `[red]` for its first assertion (the old regex does not mask `sid`), the
+   rest `[guard]`, `scrub_text_survives_hostile_inputs`: 4 MiB of `sid=` repeated
    returns exactly `sid=[redacted]` (the whole remainder is one unquoted value); 4 MiB
    of `a`, 2 MiB of `"`, 2 MiB of `\`, and 1 MiB of `sid='x ` repeated each return
    without panicking (a guard against a quadratic scan, not a timing assertion).
@@ -560,7 +594,10 @@ that must not change. Test names are exact. No existing test is edited.
     `None`; `"a\u{0}b\nc\u{202E}d"` yields `Some("abcd")`; `"token=abc123"` yields a
     string with no `abc123` that contains `[redacted]`; `""` and `"   "` yield `None`;
     `"aitm-mac"` yields `Some("aitm-mac")`; `"web-bridge"` yields `Some("web-bridge")`;
-    `sanitize(sanitize(x)) == sanitize(x)` for each of these.
+    `sanitize(sanitize(x)) == sanitize(x)` for each of these inputs (idempotence is
+    asserted for these only: truncation can land inside a `[redacted]` mask, so a
+    further `scrub_text` over a sanitised label is not strictly idempotent, Design 2
+    (d)).
 13. **AC13** `[red]` (`audit.rs`) `declared_client_label_rewrites_a_reserved_name`:
     `"web-bridge"` yields `Some("web-bridge (declared)")`; `"  WEB-BRIDGE "` yields
     `Some("WEB-BRIDGE (declared)")`; `"aitm-mac"` yields `Some("aitm-mac")`.
@@ -661,8 +698,8 @@ that must not change. Test names are exact. No existing test is edited.
     `classifier_wildcard_free.rs`; the three `audit.rs` unit tests. `git diff --stat`
     names none of those files.
 32. **AC32** `[guard]` Diff scope: only the files listed under Constraints change; the
-    `pub struct ConnCtx` and `pub struct AuditEntry` bodies are byte-identical to
-    `bd0f9b7`.
+    `pub struct ConnCtx` and `pub struct AuditEntry` field set and field types are
+    identical to `bd0f9b7` (doc comments on `client_label` may change).
 33. **AC33** Review-checked: the `audit.rs` module doc, the `agent.activity` and
     `agent.status` description strings and the `agent.rs` module doc describe the two
     lanes, fair share, the label rules, and that `actions_last_minute` counts both
@@ -677,6 +714,28 @@ that must not change. Test names are exact. No existing test is edited.
 35. **AC35** The Rust gate passes: `cargo fmt --check && cargo clippy --all-targets --
     -D warnings && cargo test`.
 
+**Panel round 1 fixes (fix task 1)**
+
+36. **AC36** `[red]` (`redact.rs`, `mod tests`)
+    `scrub_text_does_not_let_an_unclosed_quote_swallow_the_next_pair`: the four panel
+    inputs `password='abc def token='S3CR3T'`, `x-api-key="oops see
+    sessionid="S3CR3T" end`, `token: "a b\nsession: "S3CR3T"` (a real newline), and
+    `password="C:\dir\" token="S3"` leave no `S3CR3T` (the first three) or `S3` (the
+    fourth) credential text in the output; and `{"token":"YWJj=","user":"bob"}` gives
+    `{"token":"[redacted]","user":"bob"}` (a closing quote that follows `=` but is
+    itself followed by an end-of-value still closes the value).
+37. **AC37** `[red]` (`redact.rs`, `mod tests`) `scrub_text_masks_unicode_whitespace_gaps`:
+    `password\x0b=hunter2` is masked (no `hunter2` in the output);
+    `credentials=\u{a0}"CNRY0"` leaves no `CNRY0`; and
+    `api_key=\x0bCNRY0\u{2028}z+?secret='X'` leaves neither `CNRY0` nor `X`.
+38. **AC38** `[red]` (`audit.rs`, `mod tests`)
+    `declared_client_label_rewrites_a_reserved_name_with_invisible_padding`:
+    `format!("web-bridge{c}")` yields `Some("web-bridge (declared)")` for each of the
+    single code points U+061C, U+00AD, U+034F, U+115F, U+1160, U+3164, U+FFA0, U+2800
+    and for the first and last code point of each added range (U+180B..=U+180E,
+    U+FE00..=U+FE0F, U+E0000..=U+E007F); `"web\u{AD}-bridge"` yields
+    `Some("web-bridge (declared)")`; `"aitm-mac\u{3164}"` yields `Some("aitm-mac")`.
+
 ## Left to the builder
 
 - The ring's internal layout (per-source deques versus one deque with counts), the
@@ -685,7 +744,8 @@ that must not change. Test names are exact. No existing test is edited.
 - Whether the pair pass allocates a lowercase key per candidate or compares
   case-insensitively in place, provided it is linear.
 - Whether `sanitize_client_label` pre-truncates before or after `scrub_text`, provided
-  AC12 holds (output at most 64 chars, idempotent, work bounded by a fixed prefix).
+  AC12 holds (output at most 64 chars, idempotent on AC12's inputs, work bounded by a
+  fixed prefix).
 - Whether the reason cap shares a helper with `redact_args`' truncation.
 - Duplicating small test helpers (a `Sensitivity` stub command, the error-echo and
   label-echo commands, the socket helpers) per new test file rather than factoring
