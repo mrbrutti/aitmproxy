@@ -51,7 +51,7 @@ final class ThemeStore {
     static let brand: Theme? = Theme.brand
 
     var themeID: String {
-        didSet { UserDefaults.standard.set(themeID, forKey: "appearance.accent") }
+        didSet { if !Store.isOverridden { UserDefaults.standard.set(themeID, forKey: "appearance.accent") } }
     }
 
     /// True while the Mac's accent is Multicolor.
@@ -66,8 +66,11 @@ final class ThemeStore {
     }
 
     private init() {
+        // APP_ACCENT picks the accent for a run; otherwise the operator's choice, except in a
+        // snapshot, self-test or fixture run (`Store.isOverridden`), which shows the default
+        // so a harness never inherits the operator's accent.
         themeID = ProcessInfo.processInfo.environment["APP_ACCENT"]
-            ?? UserDefaults.standard.string(forKey: "appearance.accent") ?? Self.defaultID
+            ?? (Store.isOverridden ? Self.defaultID : UserDefaults.standard.string(forKey: "appearance.accent") ?? Self.defaultID)
         NotificationCenter.default.addObserver(forName: NSColor.systemColorsDidChangeNotification,
                                                object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.macIsMulticolor = ThemeStore.readMulticolor() }
