@@ -194,15 +194,17 @@ pub fn scrub_text(text: &str) -> String {
 /// and a missed credential leaks (a PoC meant to be shared), never on text that
 /// goes to an agent, an audit record, or a finding, where `authority=` and
 /// `author=3` are ordinary. Its running time is linear, about twice that of
-/// [`scrub_text`]. A residual, in four shapes: a non-ASCII letter glued into a key,
-/// a non-ASCII space beside a separator, a dotted key that names a secret word
-/// before a port, and a quoted wide-only value that holds an unescaped quote after
-/// `=` or `:` and is followed, with no delimiter, by a quoted wide-only key
-/// (`nsid='='authr'=C1`). Each can make the wide scan read a wider pair than the
-/// standard one and let a wide-only pair nested right after it keep a quoted or
-/// padded value. The last shape needs that quote to have no delimiter behind it; in
-/// valid JSON, a form and a query a delimiter follows the closing quote, so they are
-/// not affected.
+/// [`scrub_text`], except on long runs of blank characters, where it takes up to
+/// about six times as long (still linear). A residual, in four shapes: a non-ASCII
+/// letter glued into a key, a non-ASCII space beside a separator, a dotted key whose
+/// name holds one of the longer secret words (`token`, `password`, ...) before a
+/// port, such as `token.example.com:8443`, and a quoted wide-only value that holds
+/// an unescaped quote after `=` or `:` and is followed, with no delimiter, by a
+/// quoted wide-only key (`nsid='='authr'=C1`). Each can make the wide scan read a
+/// wider pair than the standard one and let a wide-only pair nested right after it
+/// keep a quoted or padded value. The last shape needs that quote to have no
+/// delimiter behind it; in valid JSON, a form and a query a delimiter follows the
+/// closing quote, so they are not affected.
 pub fn scrub_text_wide(text: &str) -> String {
     mask_secret_pairs(&scrub_text(text), Reading::Wide)
 }
