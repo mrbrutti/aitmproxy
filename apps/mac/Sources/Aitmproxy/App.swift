@@ -127,64 +127,39 @@ struct FlowCommands: Commands {
                 .disabled(session.rows.isEmpty)
         }
         CommandMenu("Flow") {
+            // Row verbs read the verb table (titles, shortcuts, enabled); the rest are session intents.
             Button(session.interceptArmed ? "Disarm Intercept" : "Arm Intercept") {
                 session.arm(!session.interceptArmed)
             }
             .keyboardShortcut("i", modifiers: [])
-            Button(session.interceptTarget.map { session.pendingEditCount($0.id) > 0 } == true ? "Apply & Resume" : "Resume") {
-                if let target = session.interceptTarget { session.applyAndResume(target.id) }
-            }
-            .keyboardShortcut(.return, modifiers: .command)
-            .disabled(session.interceptTarget == nil)
+            VerbButton(session: session, verb: .resume, target: session.interceptTarget?.id)
             Button("Resume All") { session.resumeAll() }
                 .keyboardShortcut(.return, modifiers: [.command, .option])
                 .disabled(session.paused.isEmpty)
-            Button("Edit Paused Request") { if let id = session.focused { session.perform(.edit, on: id) } }
-                .keyboardShortcut("e", modifiers: [])
-                .disabled(session.focusedRow?.state != .paused)
+            VerbButton(session: session, verb: .edit, target: session.focused)
             // ⌘Z stays Undo inside the request editor; the item reverts the whole draft.
             Button("Revert to Original") { if let id = session.focused { session.revertDraft(id) } }
                 .disabled(session.focused.map { session.pendingEditCount($0) > 0 } != true)
-            Button("Kill") { if let target = session.interceptTarget { session.perform(.kill, on: target.id) } }
-                .keyboardShortcut("\\", modifiers: .command)
-                .disabled(session.interceptTarget == nil)
+            VerbButton(session: session, verb: .kill, target: session.interceptTarget?.id)
             Divider()
-            Button("Replay") { if let id = session.focused { session.perform(.replay, on: id) } }
-                .keyboardShortcut("r", modifiers: [])
-                .disabled(session.focused == nil)
-            Button("Edit & Replay…") { if let id = session.focused { session.editAndReplay(id) } }
-                .keyboardShortcut("r", modifiers: .shift)
-                .disabled(session.focused == nil)
+            VerbButton(session: session, verb: .replay, target: session.focused)
+            VerbButton(session: session, verb: .editAndReplay, target: session.focused)
             Divider()
-            Button("Resume Selected") { session.resumeSelected() }
-                .disabled(session.selectedRows.allSatisfy { $0.state != .paused })
-            Button("Kill Selected") { session.killSelected() }
-                .disabled(session.selectedRows.allSatisfy { $0.state != .paused })
-            Button(session.focusedRow.map { $0.state == .paused || $0.state == .pending } == true ? "Kill" : "Delete") {
-                if let id = session.focused { session.deleteOrKill(id) }
-            }
-            .keyboardShortcut("d", modifiers: [])
-            .disabled(session.focused == nil)
-            Button("Build PoC from Flow…") { if let id = session.focused { session.perform(.buildPoC, on: id) } }
-                .keyboardShortcut("p", modifiers: [])
-                .disabled(session.focused == nil)
+            VerbButton(session: session, verb: .resumeSelected, target: session.focused)
+            VerbButton(session: session, verb: .killSelected, target: session.focused)
+            VerbButton(session: session, verb: .delete, target: session.focused)
+            VerbButton(session: session, verb: .buildPoC, target: session.focused)
             Divider()
-            Menu("Mark") {
+            Menu(session.verbItem(.mark(nil), for: session.focused).title) {
                 ForEach(MarkColor.allCases, id: \.self) { color in
                     Button(color.title) { if let id = session.focused { session.perform(.mark(color), on: id) } }
                 }
                 Divider()
                 Button("Clear Mark") { if let id = session.focused { session.perform(.mark(nil), on: id) } }
             }
-            .disabled(session.focused == nil)
-            Button("Comment…") { if let id = session.focused { session.perform(.comment, on: id) } }
-                .keyboardShortcut("l", modifiers: .command)
-                .disabled(session.focused == nil)
-            Button(session.focusedRow.map { session.isPinned(.host($0.authority)) } == true ? "Unpin Host" : "Pin Host") {
-                if let id = session.focused { session.perform(.pinHost, on: id) }
-            }
-            .keyboardShortcut("p", modifiers: .shift)
-            .disabled(session.focused == nil)
+            .disabled(!session.verbItem(.mark(nil), for: session.focused).enabled)
+            VerbButton(session: session, verb: .comment, target: session.focused)
+            VerbButton(session: session, verb: .pinHost, target: session.focused)
             Button("Add Host to Scope…") { session.addFocusedHostToScope() }
                 .keyboardShortcut("s", modifiers: .shift)
                 .disabled(session.focused == nil)
@@ -201,8 +176,7 @@ struct FlowCommands: Commands {
                 .keyboardShortcut("d", modifiers: .command)
                 .disabled(!session.canDiffSelected)
             // Space on the focused list; a menu shortcut would take Space from every field.
-            Button("Quick Look Body") { if let id = session.focused { session.perform(.quickLook, on: id) } }
-                .disabled(session.focused == nil)
+            VerbButton(session: session, verb: .quickLook, target: session.focused)
         }
         CommandMenu("Proxy") {
             Button("Breakpoint Rules…") { session.rulesVisible = true }
@@ -295,5 +269,39 @@ struct FlowCommands: Commands {
             Button(session.capturing ? "Pause Capture" : "Resume Capture") { session.setCapturing(!session.capturing) }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
         }
+    }
+}
+
+/// One Flow-menu item for a row verb: title, key equivalent and enabled state from `VerbTable`,
+/// so the menu bar can never drift from the row menu or the intercept bar.
+private struct VerbButton: View {
+    let session: Session
+    let verb: FlowVerb
+    let target: FlowID?
+
+    var body: some View {
+        let item = session.verbItem(verb, for: target)
+        Button(item.title) { if let target { session.perform(verb, on: target) } }
+            .keyboardShortcut(item.shortcut.map(KeyboardShortcut.init))
+            .disabled(!item.enabled)
+    }
+}
+
+extension KeyboardShortcut {
+    /// The Kit's `Shortcut` as SwiftUI binds it.
+    init(_ shortcut: Shortcut) {
+        let key: KeyEquivalent = switch shortcut.key {
+        case "\r": .return
+        case "\u{8}": .delete
+        case " ": .space
+        case "\u{1b}": .escape
+        default: KeyEquivalent(Character(shortcut.key))
+        }
+        var modifiers: EventModifiers = []
+        if shortcut.command { modifiers.insert(.command) }
+        if shortcut.shift { modifiers.insert(.shift) }
+        if shortcut.option { modifiers.insert(.option) }
+        if shortcut.control { modifiers.insert(.control) }
+        self.init(key, modifiers: modifiers)
     }
 }

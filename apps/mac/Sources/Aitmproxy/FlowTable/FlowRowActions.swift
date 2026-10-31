@@ -3,17 +3,11 @@ import AppKit
 import Quartz
 import SwiftUI
 
-/// What a row can do, from the keyboard (S-010), the context menu or the Flow menu.
-enum FlowRowAction: Hashable {
-    case resume, kill, delete, replay, editAndReplay, edit, mark(MarkColor?), comment, buildPoC, pinHost, copyURL, quickLook,
-         resumeSelected, killSelected
-}
-
 /// An `NSTableView` that turns mitmproxy's single-key verbs into row actions.
 /// Keys arrive here only while the table is first responder, so a text
-/// field never loses a letter to a verb.
+/// field never loses a letter to a verb. The letters come from `VerbTable`.
 final class FlowKeyTable: NSTableView {
-    var onVerb: ((FlowRowAction) -> Void)?
+    var onVerb: ((FlowVerb) -> Void)?
     var onToggleIntercept: (() -> Void)?
     var onCompose: (() -> Void)?
     var onEnter: (() -> Void)?
@@ -23,22 +17,16 @@ final class FlowKeyTable: NSTableView {
               let key = event.charactersIgnoringModifiers else { return super.keyDown(with: event) }
         switch key {
         case "i": onToggleIntercept?()
-        case "e": onVerb?(.edit)
-        case "r": onVerb?(.replay)
         case "n": onCompose?()
-        case "d": onVerb?(.delete)
-        case "m": onVerb?(.mark(nil))
-        case "c": onVerb?(.comment)
-        case "p": onVerb?(.buildPoC)
-        case " ":
+        case "\r": onEnter?()
+        default:
+            guard let verb = VerbTable.verb(forKey: key, in: VerbTable.items(for: nil)) else { return super.keyDown(with: event) }
             // Space toggles Quick Look, as in Finder.
-            if QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible {
+            if verb == .quickLook, QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible {
                 QLPreviewPanel.shared().orderOut(nil)
             } else {
-                onVerb?(.quickLook)
+                onVerb?(verb)
             }
-        case "\r": onEnter?()
-        default: super.keyDown(with: event)
         }
     }
 

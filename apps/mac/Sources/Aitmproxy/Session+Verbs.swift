@@ -133,27 +133,53 @@ extension Session {
         perform("clear") { [self] in try await actions.clear() }
     }
 
-    /// A row verb from the keyboard, the context menu or the Flow menu (S-010).
-    func perform(_ action: FlowRowAction, on id: FlowID) {
-        guard let row = rows.first(where: { $0.id == id }) else { return }
-        guard row.inScope else {
-            lastError = "Out of scope — add \(row.authority) to scope to act"
+    /// What the verb table needs to know about a row: its drafts, pin state and the
+    /// selection it sits in (`pane` 1 is the split view's second list).
+    func verbContext(for id: FlowID, pane: Int = 0) -> VerbContext? {
+        guard let row = rows.first(where: { $0.id == id }) else { return nil }
+        let selected = pane == 1 ? secondSelection : selection
+        let chosen = rows.filter { selected.contains($0.id) }
+        return VerbContext(row: row,
+                           pendingEdits: pendingEditCount(id),
+                           pinned: isPinned(.host(row.authority)),
+                           selectedCount: chosen.count,
+                           selectedPausedCount: chosen.filter { $0.state == .paused }.count,
+                           isInterceptTarget: interceptTarget?.id == id)
+    }
+
+    /// The verb table for a row (every surface's titles, keys and enabled rules).
+    func verbItems(for id: FlowID?, pane: Int = 0) -> [VerbItem] {
+        VerbTable.items(for: id.flatMap { verbContext(for: $0, pane: pane) })
+    }
+
+    /// One verb item for a row; with no row the default, disabled item.
+    func verbItem(_ verb: FlowVerb, for id: FlowID?, pane: Int = 0) -> VerbItem {
+        verbItems(for: id, pane: pane).first { $0.verb == verb } ?? VerbTable.items(for: nil).first { $0.verb == verb }!
+    }
+
+    /// The only entry for a row verb, from the keyboard, the context menu, the Flow menu or the
+    /// intercept bar (S-010). The table's enabled rule gates it: an off verb reports why.
+    func perform(_ verb: FlowVerb, on id: FlowID) {
+        guard let context = verbContext(for: id) else { return }
+        let row = context.row
+        let item = VerbTable.items(for: context).first { $0.verb == verb }
+        if let item, !item.enabled {
+            lastError = item.disabledReason
             return
         }
-        switch action {
-        case .resume: pendingEditCount(id) > 0 ? applyAndResume(id) : resume(id)
+        switch verb {
+        case .resume: context.pendingEdits > 0 ? applyAndResume(id) : resume(id)
         case .kill: kill(id)
         case .delete: deleteOrKill(id)
         case .replay: replay(id)
         case .editAndReplay: editAndReplay(id)
         case .resumeSelected: resumeSelected()
         case .killSelected: killSelected()
-        case .edit:
-            if row.state == .paused { editPaused(id) } else { lastError = "Only a paused flow can be edited" }
+        case .edit: editPaused(id)
         case .mark(let color): mark(id, color)
         case .comment: select(id)
         case .buildPoC: buildPoCFlowID = id
-        case .pinHost: isPinned(.host(row.authority)) ? unpin(.host(row.authority)) : pin(.host(row.authority))
+        case .pinHost: context.pinned ? unpin(.host(row.authority)) : pin(.host(row.authority))
         case .copyURL:
             Pasteboard.copy(row.url, sensitive: true)
         case .quickLook:

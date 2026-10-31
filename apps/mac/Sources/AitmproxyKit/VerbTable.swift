@@ -45,7 +45,8 @@ public struct VerbItem: Hashable, Sendable {
     public var title: String
     /// The bare list key that fires it while the flow list is first responder (`"e"`, `" "`).
     public var key: String?
-    /// The menu-bar key equivalent (`⌘⏎`, `⇧R`).
+    /// The menu-bar key equivalent (`⌘⏎`, `⇧R`, or the bare letter itself). Nil for a verb whose
+    /// key only works on the focused list (`m` opens the mark menu, Space is Quick Look).
     public var shortcut: Shortcut?
     public var enabled: Bool
     public var group: VerbGroup
@@ -126,23 +127,28 @@ public enum VerbTable {
         let bulkOn = selectedCount > 1 && selectedPausedCount > 0
         let bulkCount = selectedCount > 1 ? " \(selectedCount)" : ""
 
+        // `off` explains a verb the row's state turns off; the scope reason wins when both apply.
         func item(_ verb: FlowVerb, _ title: String, key: String? = nil, shortcut: String? = nil, on: Bool = true,
-                  group: VerbGroup) -> VerbItem {
+                  off: String? = nil, group: VerbGroup) -> VerbItem {
             let enabled = row != nil && inScope && on
+            let why = row == nil ? nil : (reason ?? (on ? nil : off))
             return VerbItem(verb: verb, title: title, key: key, shortcut: shortcut.flatMap(Shortcut.init(display:)),
-                            enabled: enabled, group: group, disabledReason: enabled ? nil : reason)
+                            enabled: enabled, group: group, disabledReason: enabled ? nil : why)
         }
+        let needsPaused = "Only a paused flow can be "
+        let noPausedSelected = "No paused flows in the selection"
 
         return [
-            item(.resume, pendingEdits > 0 ? "Apply & Resume" : "Resume", shortcut: "⌘⏎", on: paused, group: .intercept),
-            item(.edit, "Edit Paused Request", key: "e", on: paused, group: .intercept),
-            item(.delete, inFlight ? "Kill" : "Delete", key: "d", group: .intercept),
-            item(.kill, "Kill", shortcut: "⌘\\", on: paused, group: .intercept),
-            item(.replay, "Replay", key: "r", group: .replay),
+            item(.resume, pendingEdits > 0 ? "Apply & Resume" : "Resume", shortcut: "⌘⏎", on: paused,
+                 off: needsPaused + "resumed", group: .intercept),
+            item(.edit, "Edit Paused Request", key: "e", shortcut: "e", on: paused, off: needsPaused + "edited", group: .intercept),
+            item(.delete, inFlight ? "Kill" : "Delete", key: "d", shortcut: "d", group: .intercept),
+            item(.kill, "Kill", shortcut: "⌘\\", on: paused, off: needsPaused + "killed", group: .intercept),
+            item(.replay, "Replay", key: "r", shortcut: "r", group: .replay),
             item(.editAndReplay, "Edit & Replay…", shortcut: "⇧R", group: .replay),
-            item(.buildPoC, "Build PoC from Flow…", key: "p", group: .replay),
-            item(.resumeSelected, "Resume\(bulkCount) Selected", on: bulkOn, group: .selection),
-            item(.killSelected, "Kill\(bulkCount) Selected", on: bulkOn, group: .selection),
+            item(.buildPoC, "Build PoC from Flow…", key: "p", shortcut: "p", group: .replay),
+            item(.resumeSelected, "Resume\(bulkCount) Selected", on: bulkOn, off: noPausedSelected, group: .selection),
+            item(.killSelected, "Kill\(bulkCount) Selected", on: bulkOn, off: noPausedSelected, group: .selection),
             item(.mark(nil), "Mark", key: "m", group: .annotate),
             item(.comment, row?.comment == nil ? "Comment…" : "Edit Comment…", key: "c", shortcut: "⌘L", group: .annotate),
             item(.pinHost, pinned ? "Unpin Host" : "Pin Host", shortcut: "⇧P", group: .host),
