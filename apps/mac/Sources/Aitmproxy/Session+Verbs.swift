@@ -130,7 +130,7 @@ extension Session {
     }
 
     func setCapturing(_ on: Bool) {
-        perform(on ? "resume capture" : "pause capture") { [self] in try await actions.setCapturing(on) }
+        perform(on ? "resume proxy" : "pause proxy") { [self] in try await actions.setCapturing(on) }
     }
 
     /// Clear asks first when flows are paused (they would be dropped mid-flight). Once the core
