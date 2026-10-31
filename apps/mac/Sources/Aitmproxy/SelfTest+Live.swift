@@ -37,6 +37,11 @@ extension SelfTest {
             check("scope.add lands in scope.list", session.scopeHosts.contains(upstream), "scope \(session.scopeHosts) err \(session.lastError ?? "-")")
             // SP-AC8(b): this is an external core (AITM_CONFIG), so scope.json is never written.
             check("an external core never writes scope.json", !FileManager.default.fileExists(atPath: session.scopeURL.path))
+            // Tester — positive control for "connecting issues no scope.add": the self-test's own
+            // scope.add IS in the activity log as an operator command, so a scope.add issued on
+            // connect would have been visible to that check too (the negative was not vacuous).
+            check("the self-test's own scope.add is recorded as an operator command",
+                  session.activity.visible.contains { $0.origin == .operator && $0.command == "scope.add" })
 
             // flow.intercept both ways: the call that recursed in b7d3163.
             session.arm(true)

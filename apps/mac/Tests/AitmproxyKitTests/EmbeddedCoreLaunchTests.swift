@@ -400,6 +400,86 @@ import Testing
                 "the core's scope_entries_block_round_trips test is gone")
     }
 
+    // MARK: Tester — scope block edge cases (SP-AC4, SP-AC16, SP-AC17)
+
+    @Test func scope_block_emits_unicode_and_yaml_specials_verbatim_inside_quotes() throws {
+        // Hosts `EmbeddedScope.load` keeps (an IDN, mixed case, `#`, `'`) are spliced verbatim:
+        // inside double quotes `#` is a literal, not a comment, and `'` needs no escaping. The
+        // core's `tests/config_file.rs` `scope_entries_quoting_survives_the_parse` parses these
+        // same lines back to the same hosts.
+        let yaml = try config(scopeHosts: ["bücher.example", "API.Example.TEST", "a#b.test", "o'neil.test"]).yaml()
+        let lines = yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let key = try #require(lines.firstIndex(of: "scope:"))
+        #expect(Array(lines.dropFirst(key + 1).prefix(5)) == [
+            "  entries:",
+            "    - \"bücher.example\"",
+            "    - \"API.Example.TEST\"",
+            "    - \"a#b.test\"",
+            "    - \"o'neil.test\"",
+        ])
+    }
+
+    @Test func scope_block_keeps_a_huge_list_whole_and_in_order() throws {
+        // Oversized input: every host becomes exactly one `    - "…"` line, in array order, the
+        // key still appears once, nothing follows the list, and the block still ends in a newline.
+        let hosts = (0..<2_000).map { "h\($0).example.test" }
+        let yaml = try config(scopeHosts: hosts).yaml()
+        let lines = yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(lines.filter { $0 == "scope:" }.count == 1)
+        let key = try #require(lines.firstIndex(of: "scope:"))
+        #expect(lines.dropFirst(key + 1).first == "  entries:")
+        #expect(Array(lines.dropFirst(key + 2).prefix(hosts.count)) == hosts.map { "    - \"\($0)\"" })
+        #expect(lines.count == key + 2 + hosts.count + 1)   // + the empty piece after the final newline
+        #expect(yaml.hasSuffix("    - \"h1999.example.test\"\n"))
+    }
+
+    @Test func scope_block_rejects_a_newline_anywhere_in_the_list() {
+        // The refusal is per host and total: a newline in the last of many hosts, or a bare
+        // newline, throws the host variant (never the path one) and no config text is handed out
+        // (SP-AC16).
+        let many = (0..<50).map { "h\($0).example.test" } + ["last.test\n"]
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("last.test\n")) {
+            try config(scopeHosts: many).yaml()
+        }
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("\n")) {
+            try config(scopeHosts: ["\n"]).yaml()
+        }
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("evil.test\rx")) {
+            try config(scopeHosts: ["evil.test\rx"]).yaml()
+        }
+    }
+
+    @Test func scope_block_rejects_a_crlf_host() {
+        // "\r\n" is one Swift `Character`: the guard must see the CR and LF scalars inside it, not
+        // compare grapheme clusters. From the app's surface this host is unreachable
+        // (`EmbeddedScope.load` drops it), so this pins `yaml()`'s own SP-AC16 contract.
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("evil.test\r\nlisten: 0.0.0.0:1")) {
+            try config(scopeHosts: ["evil.test\r\nlisten: 0.0.0.0:1"]).yaml()
+        }
+    }
+
+    @Test func scope_block_is_purely_additive_to_the_rest_of_the_config() throws {
+        // Everything before the block — tokens, ports, paths, the ssl and capture tails — is
+        // byte-identical with and without a persisted scope; the block only ever appends.
+        let scopeless = try EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"),
+            sslInsecure: true, captureEnabled: true
+        ).yaml()
+        let scoped = try EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"),
+            sslInsecure: true, captureEnabled: true, scopeHosts: ["api.example.test"]
+        ).yaml()
+        #expect(scoped.hasPrefix(scopeless))
+        #expect(scoped.hasSuffix("scope:\n  entries:\n    - \"api.example.test\"\n"))
+        #expect(scoped.count > scopeless.count)
+    }
+
     // MARK: Config path escaping (S3)
 
     @Test func config_paths_are_escaped_for_a_double_quoted_scalar() throws {

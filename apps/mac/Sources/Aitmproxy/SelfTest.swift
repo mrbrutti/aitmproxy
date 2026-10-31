@@ -111,6 +111,8 @@ enum SelfTest {
                   !FileManager.default.fileExists(atPath: session.scopeURL.path) && EmbeddedScope.load(from: session.scopeURL).hosts.isEmpty)
             session.removeScope("persist-probe.test")
             await settle { !session.scopeHosts.contains("persist-probe.test") }
+            check("fixture mode never persists scope on remove either (no scope.json under Store.url)",
+                  !FileManager.default.fileExists(atPath: session.scopeURL.path))
 
             // S-015: Auto-select follows the newest flow, except from a paused row.
             session.autoSelect = true
