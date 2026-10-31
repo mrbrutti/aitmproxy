@@ -31,7 +31,7 @@ struct AppearanceSettings: View {
 /// and the primary button + Agent toggle. The accent lifts chrome and selection;
 /// the method/status hues are fixed data colours and stay put. Redraws on pick.
 private struct AccentPreview: View {
-    private let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+    private let shape = RoundedRectangle(cornerRadius: Tok.Radius.panel, style: .continuous)
 
     var body: some View {
         HStack(spacing: 0) {
@@ -51,7 +51,7 @@ private struct AccentPreview: View {
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: Space.xs) {
             HStack(spacing: Space.xs) {
-                ProductMark().frame(width: 12, height: 12)
+                ProductMark().frame(width: Tok.Size.iconInline, height: Tok.Size.iconInline)
                 Text("aitmproxy").font(.caption.weight(.medium)).foregroundStyle(.primary)
             }
             .padding(.leading, Space.xs)
@@ -72,9 +72,9 @@ private struct AccentPreview: View {
             .foregroundStyle(selected ? Palette.accentText : .primary)
             .lineLimit(1)
             .padding(.horizontal, Space.sm)
-            .frame(maxWidth: .infinity, minHeight: 24, alignment: .leading)
+            .frame(maxWidth: .infinity, minHeight: Tok.Size.control, alignment: .leading)
             .background(selected ? Palette.accent.opacity(0.15) : .clear,
-                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        in: RoundedRectangle(cornerRadius: Tok.Radius.control, style: .continuous))
     }
 
     private var content: some View {
@@ -85,21 +85,28 @@ private struct AccentPreview: View {
                     path: "/api/auth/login", status: "paused", statusColor: Tok.Intercept.deep)
             Spacer(minLength: 0)
             // Drawn, not real controls: the preview is a picture, and real controls
-            // turn gray when the window is not in front.
+            // turn gray when the window is not in front. These mirror the real
+            // controls' tokens so the preview is truthful — Resume is the near-black
+            // inverse button (InterceptBar), the Agent switch is teal (ShellToolbar),
+            // not the accent. The accent still shows above, on selection and the path.
             HStack {
                 Text("Resume")
                     .font(.callout.weight(.medium))
-                    .foregroundStyle(Palette.onAccent)
-                    .padding(.horizontal, Space.md)
-                    .frame(height: 24)
-                    .background(Palette.accent, in: Capsule())
+                    .foregroundStyle(Tok.Ink.onInverse.color)
+                    .padding(.horizontal, Tok.Metric.padInner)
+                    .frame(height: Tok.Metric.barButton)
+                    .background(Tok.Ground.inverse.color,
+                                in: RoundedRectangle(cornerRadius: Tok.Radius.control))
                 Spacer()
                 Text("Agent").font(.caption).foregroundStyle(.secondary)
                 Capsule()
-                    .fill(Palette.accent)
-                    .frame(width: 28, height: 16)
+                    .fill(Tok.Agent.base.color)
+                    .frame(width: Tok.Metric.switchWidth, height: Tok.Metric.switchHeight)
                     .overlay(alignment: .trailing) {
-                        Circle().fill(.white).padding(2).shadow(color: .black.opacity(0.2), radius: 1, y: 1)
+                        // White knob, matching the real Agent toggle (ShellToolbar).
+                        Circle().fill(.white)
+                            .frame(width: Tok.Metric.switchKnob, height: Tok.Metric.switchKnob)
+                            .padding(2)
                     }
             }
         }
@@ -133,7 +140,7 @@ private struct AccentSwatch: View {
         Button(action: choose) {
             Circle()
                 .fill(fill)
-                .frame(width: 16, height: 16)
+                .frame(width: Tok.Size.icon, height: Tok.Size.icon)
                 .overlay {
                     if selected {
                         Circle().fill(theme.onAccent).frame(width: 6, height: 6) // grid: ok
