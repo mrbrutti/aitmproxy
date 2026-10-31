@@ -4,10 +4,18 @@
 //! The proxy is built exactly as the server path builds it; [`build_servers`]
 //! then constructs **two** `McpServer`s over the same `Arc<Registry>` and
 //! service handles. One is served on the configured agent transport — only
-//! when that is loopback TCP, because stdio would share the terminal with the
-//! UI. The other is wrapped as `Arc<McpServer>` so its `handle` becomes the
-//! TUI's in-process bus handler: the bus contract is unchanged, the TUI is a
-//! bus client like the others, there is just no socket between them.
+//! when that is loopback TCP or streamable HTTP, because stdio would share
+//! the terminal with the UI. It is agent-facing and gated, and it runs on the
+//! core's own shared `AgentState` and `AuditRing`, which [`build_servers`]
+//! receives as a sealed `wire::Governance` (`Assembled::governance` is its
+//! only source): a live `agent.set` governs that agent on its next call, and
+//! its calls land in the trail `agent.activity` reads. The other is wrapped as
+//! `Arc<McpServer>` so its `handle` becomes the TUI's in-process bus handler:
+//! the bus contract is unchanged, the TUI is a bus client like the others,
+//! there is just no socket between them. That server is the operator, ungated
+//! by role, and deliberately **not** on the shared ring: the TUI's polling
+//! (`flow.list` every 500 ms plus five panel reads every 3 s, about 220 calls
+//! a minute at idle) would flood it.
 //!
 //! Logging: a `tracing` subscriber writing to stdout or stderr would paint
 //! over the UI, so [`init_tracing`] writes to a file when `RUST_LOG` is set
@@ -139,8 +147,8 @@ pub fn services(
 /// it (see [`build_servers`]). Both servers the bare-`aitm` server run builds
 /// (the primary and the `aitm web` bridge server) take the shared gate and audit
 /// ring from [`with_shared_governance`], the other half of "wired by the
-/// caller". The `aitm tui` loopback agent server does not use it yet (see
-/// [`build_servers`]).
+/// caller". So does the `aitm tui` loopback agent server: [`build_servers`]
+/// applies [`with_shared_governance`] to it from the `Governance` it requires.
 pub fn server(cfg: &Config, transport: McpTransport, services: &Services) -> McpServer {
     McpServer::new(services.registry.clone(), transport)
         .with_ssrf_policy(cfg.browser.ssrf.clone())
@@ -161,8 +169,8 @@ pub fn server(cfg: &Config, transport: McpTransport, services: &Services) -> Mcp
 }
 
 /// Apply the shared agent policy and audit ring to `server`: the one function
-/// `main.rs` and the tests both call, so the tests exercise the wiring the
-/// binary applies.
+/// `main.rs`, [`build_servers`] and the tests all call, so the tests exercise
+/// the wiring the binary applies.
 ///
 /// It shares **exactly** two things, the policy state (`agent_state`, which the
 /// `AgentPlugin`'s `agent.set` writes and the server's gate reads) and the audit
@@ -177,10 +185,19 @@ pub fn server(cfg: &Config, transport: McpTransport, services: &Services) -> Mcp
 /// that server. An approve sent to the other server is the plain "no parked
 /// request" error and approves nothing.
 ///
+/// How a caller gets here differs by mode. In TUI mode it is compile-enforced:
+/// [`build_servers`] cannot be called without a `wire::Governance`, which only
+/// `Assembled::governance` makes, and its agent arm applies this function to
+/// that pair. The bare-`aitm` path (the primary server and the `aitm web`
+/// bridge server in `main.rs`) applies it by convention: nothing in the types
+/// makes it do so.
+///
 /// Residual risk: this makes tests and production share a function, not a
-/// guarantee. No test exercises the governance wiring in `main.rs`, so deleting
-/// the wrapper there would leave them green, and the function cannot force a
-/// future third server to call it.
+/// guarantee. [`build_servers`] is exercised through its production path by
+/// `tests/tui_mode_governance.rs` and `tests/tui_mode_governance_live.rs`, so
+/// dropping the wrapper from its agent arm fails them. `main.rs`'s bare-path
+/// calls still have no such test: deleting the wrapper there would leave every
+/// test green, and the function cannot force a future third server to call it.
 pub fn with_shared_governance(
     server: McpServer,
     agent_state: &Arc<AgentState>,
@@ -260,20 +277,51 @@ pub fn init_tracing() -> TuiLog {
 /// configured transport (`None` when that is stdio, which would share the
 /// terminal with the UI) and the TUI-facing one behind an in-process handler.
 /// Both are built by [`server`], exactly as the server path builds its one.
+///
+/// `governance` is the core's own policy state and audit ring as a sealed
+/// `wire::Governance`, which only `Assembled::governance` makes, so this
+/// function cannot be called without them or with a fresh state in their
+/// place. The agent arm goes through [`with_shared_governance`]; the TUI-facing
+/// arm does not. What follows for `aitm tui`:
+///
+/// - Under the default `auto` the gate decides as before (same seed, same
+///   decisions); what changes is that the loopback agent's calls, allowed or
+///   refused, now show in the TUI Agent panel's `actions_last_minute` and in
+///   `agent.activity`.
+/// - `agent.set`, from the TUI or from any operator-token client, governs the
+///   agent on its next call, in both directions and with no reconnect:
+///   `paused` refuses every agent tool call (`initialize`, `tools/list` and
+///   `ping` still answer), `readonly` allows Read only, and `all` relaxes it
+///   while per-command gates such as `scope.allow_agent_widen` still apply.
+/// - The operator keeps full control while the agent is paused: the TUI and
+///   operator-token clients bypass the gate by role and can `agent.set` back.
+/// - `push_tx` is not fed to the agent server (follow-up "tui-mode push"):
+///   governance does not depend on it. A loopback subscriber still receives
+///   the `notifications/aitm/agent` lines (audit to every subscriber,
+///   `approval_requested` to operator-role ones), but no
+///   `notifications/aitm/flow`.
+/// - Under `ask`, only an operator-token client connected to this same server
+///   and subscribed via `flow.subscribe` can approve a parked Sensitive agent
+///   call, because the `Ask` machinery is per server. The TUI cannot: its
+///   in-process server is a different `McpServer`, and its connection has no
+///   push sink to subscribe on. So with only the TUI attached a Sensitive
+///   agent call is refused at once ("no operator is connected to approve it")
+///   and never parks.
+/// - The TUI's own operator calls stay out of `agent.activity`, as before;
+///   operator-token clients on the agent server are recorded, with origin
+///   `"operator"`. Parking stays capped per server (`MAX_PARKED_REQUESTS`)
+///   plus the approval timeout, as on the primary; no new bound is needed.
 pub fn build_servers(
     cfg: &Config,
     services: Services,
     governance: Governance,
 ) -> (Option<McpServer>, InProcessHandler) {
     let agent = match &cfg.mcp.transport {
-        // The loopback transport is agent-facing, so it carries the M4 policy gate
-        // seeded from `mcp.policy` (default `auto`) and the operator/agent token
-        // classes — an external agent here is gated exactly as on the bare-`aitm`
-        // server path, not left ungated.
-        // Both loopback-TCP and streamable-HTTP are addressable agent endpoints
-        // that do not share the terminal with the TUI, so they carry the policy
-        // gate and the operator/agent token classes exactly as on the bare-`aitm`
-        // server path.
+        // Agent-facing, so gated: built on the core's shared policy state and
+        // audit ring (`governance`, applied through `with_shared_governance`)
+        // with the operator/agent token classes, exactly as on the bare-`aitm`
+        // server path. Loopback TCP and streamable HTTP are both addressable
+        // endpoints that do not share the terminal with the TUI.
         McpTransport::LoopbackTcp { .. } | McpTransport::StreamableHttp { .. } => Some(
             with_shared_governance(
                 server(cfg, cfg.mcp.transport.clone(), &services),
@@ -293,7 +341,9 @@ pub fn build_servers(
     // the operator's own control surface, so its calls run as
     // `Frontend::Operator`, which bypasses the agent policy gate (an operator is
     // the control) — otherwise the operator could not arm intercept, mutate or
-    // kill from their own UI.
+    // kill from their own UI. It is built by `server` alone, so it keeps
+    // `McpServer::new`'s private state and ring: ungoverned and unrecorded on
+    // purpose, since its polling would flood the shared trail.
     let ui = Arc::new(server(cfg, McpTransport::Stdio, &services));
     let handler: InProcessHandler =
         Arc::new(move |line: &str| ui.handle_on(&ConnCtx::new(Frontend::Operator), line));
@@ -301,8 +351,11 @@ pub fn build_servers(
 }
 
 /// Build the two servers over the shared `services` and run the proxy, the
-/// agent transport (loopback TCP only) and the TUI side by side until one of
-/// them ends — the TUI returning on operator quit is the ordinary exit.
+/// agent transport (loopback TCP or streamable HTTP) and the TUI side by side
+/// until one of them ends — the TUI returning on operator quit is the ordinary
+/// exit. `governance` is the core's own policy state and audit ring, from
+/// `Assembled::governance()` in `main.rs`, passed through to [`build_servers`]
+/// for the agent server.
 ///
 /// The caller launches and reaps the browser, as it does for the server path,
 /// and pre-binds the proxy and browser listeners so a port conflict is reported

@@ -460,6 +460,13 @@ async fn run() -> anyhow::Result<()> {
     // We are about to serve: `proxy.status.listening` now reports the truth.
     listening.store(true, std::sync::atomic::Ordering::Relaxed);
     let result = if mode == Mode::Tui {
+        // `aitm tui`: the loopback agent server is built by `tui::build_servers`
+        // on the core's shared policy state and audit ring (the `governance`
+        // passed here, from `assembled.governance()` above) through
+        // `tui::with_shared_governance`, so a live `agent.set` governs it and
+        // its calls land in `agent.activity`. `push_tx` is not fed to it
+        // (follow-up "tui-mode push"): a loopback subscriber still gets the
+        // `notifications/aitm/agent` lines but no `notifications/aitm/flow`.
         tokio::select! {
             result = tui::run(&cfg, &proxy, services, governance, proxy_listener, browser_listener) => result,
             never = capture_run => match never {},
