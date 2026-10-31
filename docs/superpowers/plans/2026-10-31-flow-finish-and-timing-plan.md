@@ -101,9 +101,23 @@ Every task is test-first: write the failing test, run it red, implement, run it 
 
 Kept by the main session during stage 6. One row per finding.
 
-| Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
+Dispositions are the orchestrator's, under Matt's autonomous-approve mode; every "accepted" row is self-accepted 2026-10-31 and flagged in the PR body for Matt. Stage 5 (tester, whole branch) ran on a8577c9 and its test-only additions are b79c89d (PASS: every AC mapped, nine tests added, each red on base). Round 1 ran on head b79c89d (security PASS, quality PASS, spec PASS; no Critical or Important). The Terminal gate was green at a8577c9 and at b79c89d (229/229 test binaries); Swift green (383 + 27); web e2e 7/7.
+
+**Round 1 (00f82ff..b79c89d)**
+
+| Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
+| 4, 5 | quality | Minor | The buffered-length / epoch-ms / whole-ms rules are written once per crate (capture.rs and server.rs) and the two `whole_ms` share a name but not a shape | fixed in e6994bf: the rules moved to the core types (`Body::buffered_len`, `FlowMeta::started_at_ms`, `FlowMeta::duration_ms`), both renderers call them; spec D7/D8 amended to match |
+| 2 | quality | Minor | h1 funnel result named `streamed` (also the name of a local inside the block; h2 says `forwarded`); `std::mem::take(&mut captured)` where a move suffices | fixed in e6994bf |
+| 6 | quality | Minor | Swift helper `epochMillis` also applied to `duration_ms`; FlowRefetchPolicy doc names "the flow-finish change" instead of the behaviour | fixed in e6994bf (`wholeMillis`; doc describes the behaviour) |
+| 2, 3, 4 | quality | Minor | Test fixture duplication (the `flow.get` closure three times in tests/capture.rs; the over-cap trailer section twice in module.rs tests; a third poll-loop copy in h2_mitm.rs) | accepted 2026-10-31: follows each file's existing style; no behaviour at stake |
+| 2 | spec | Minor | AC5 asserts `< 10 s` wall time, not "well under a second" | accepted 2026-10-31: the observed run is 0.00-0.02 s; the bound still fails a real 30 s wait and will not flake on a loaded CI runner |
+| 1 | spec | Minor | `FlowStore` trait-level doc reworded beyond the plan's list ("Every method is required" → "Every primitive is required … the one provided method") | accepted 2026-10-31: the old sentence became false once a provided method existed |
+| 4 | spec | Minor | A third private helper `whole_ms` in capture.rs beyond the plan's two | superseded by the round-1 fix (helpers moved to the core types) |
+| 5 | spec | Minor | Wording edits in test_bus_push_ui_contract.py beyond lines 15-16 and `SUMMARY_KEYS` (docstring line 7, the `SUMMARY_KEYS` comment, the section-2 label) | accepted 2026-10-31: each old phrase described the sparse shape that no longer exists; no check changed |
+| 5 | spec | Minor | A third app.ts comment (~line 500) reworded beyond D9b's two | accepted 2026-10-31: comment-only; the old text contradicted the D9b edit |
+| — | security | Minor | Pre-existing: a detached `Event::Error` dispatch from the Rhai plugin's `report()` snapshots the flow and writes it back after plugins run (`chain.rs` merge), so it can restore a `Streamed` body over an abandoned (or completed) one | accepted 2026-10-31 as follow-up **F5**: not introduced here (the same race exists for `ResponseComplete`); fix is for `merge_plugin_edits` to never regress a buffered body, or for `report()` to emit in sequence |
 
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7. Follow-ups carried from the spec: F1 (no-response flows terminal, incl. h1 malformed-in-the-same-read), F2 (typed `Event::Error` on the h1 timeout/I/O/client-write paths), F3 (WebSocket end marker for `duration_ms`), F4 (web UI applies the full push summary instead of refetching).
+What merged, what was cut, follow-ups. Filled at stage 7. Follow-ups carried from the spec: F1 (no-response flows terminal, incl. h1 malformed-in-the-same-read), F2 (typed `Event::Error` on the h1 timeout/I/O/client-write paths), F3 (WebSocket end marker for `duration_ms`), F4 (web UI applies the full push summary instead of refetching), F5 (the Rhai `report()` detached error dispatch can write a stale `Streamed` snapshot back over a buffered body; security panel round 1).
