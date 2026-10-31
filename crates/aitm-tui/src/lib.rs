@@ -293,6 +293,10 @@ pub const CORE_TOOLS: &[&str] = &[
     "flow.unsubscribe",
     // Scanner plugin (Stage 1): read-only crawl + injection-point discovery.
     "scan.discover",
+    // Scanner plugin (Stage 2): passive checks over captured flows (Read).
+    "scan.passive",
+    // Scanner plugin (Stage 2): findings report + index over recorded findings (Read).
+    "scan.report",
 ];
 
 /// An [`App`] loaded synchronously from the built-in fixture, sized `cols`×`rows`,

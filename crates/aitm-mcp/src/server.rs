@@ -31,6 +31,19 @@ use crate::transport::{self, LoopbackTcp};
 /// are dropped and the connection is flagged `lagged`; replies are never bounded.
 pub const DEFAULT_PUSH_CAPACITY: usize = 4096;
 
+/// The most subscriptions one connection may hold at once (web-bus-push spec
+/// AC11). Each is a registry entry retained until `flow.unsubscribe` or the end
+/// of the connection, and every pushed event is matched against all of them
+/// under the registry lock, so an authenticated client must not be able to grow
+/// them without bound.
+const MAX_SUBS_PER_CONN: usize = 32;
+
+/// The longest `filter.host` or `filter.method` a subscribe may carry, in bytes
+/// (web-bus-push spec AC11). A longer value is refused, never truncated: a
+/// truncated filter would silently watch a different host or method than the
+/// client asked for.
+const MAX_FILTER_VALUE_BYTES: usize = 1024;
+
 /// The default capacity of the core→server event broadcast ring.
 pub const DEFAULT_BROADCAST_CAPACITY: usize = 8192;
 
@@ -267,6 +280,14 @@ impl NotificationSink {
         self.inner.drained.notify_one();
     }
 
+    /// Whether [`NotificationSink::close`] has been called. The subscription
+    /// registry checks this before registering, so a `flow.subscribe` from a frame
+    /// that outlived its connection (a detached web `/bus` frame) is refused
+    /// instead of registering a subscription nothing will ever drain.
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Relaxed)
+    }
+
     /// Whether the sink is closed and holds nothing more to write.
     pub fn is_closed_and_drained(&self) -> bool {
         if !self.inner.closed.load(Ordering::Relaxed) {
@@ -302,21 +323,16 @@ struct FlowFilter {
 }
 
 impl FlowFilter {
-    /// Parse the optional `filter` argument object (`{host?, method?}`).
-    fn parse(filter: Option<&JsonValue>) -> Self {
+    /// Parse the optional `filter` argument object (`{host?, method?}`). A string
+    /// value longer than `MAX_FILTER_VALUE_BYTES` is an error naming the field.
+    fn parse(filter: Option<&JsonValue>) -> Result<Self, String> {
         let Some(obj) = filter.and_then(JsonValue::as_object) else {
-            return Self::default();
+            return Ok(Self::default());
         };
-        Self {
-            host: obj
-                .get("host")
-                .and_then(JsonValue::as_str)
-                .map(str::to_string),
-            method: obj
-                .get("method")
-                .and_then(JsonValue::as_str)
-                .map(str::to_string),
-        }
+        Ok(Self {
+            host: bounded_filter_value(obj, "host")?,
+            method: bounded_filter_value(obj, "method")?,
+        })
     }
 
     /// Whether `flow` passes every set constraint.
@@ -358,6 +374,20 @@ fn host_eq(authority: &str, want: &str) -> bool {
     host.eq_ignore_ascii_case(want) || authority.eq_ignore_ascii_case(want)
 }
 
+/// The string field `key` of a filter object, or an error when it is longer than
+/// `MAX_FILTER_VALUE_BYTES`. A missing or non-string field is `None`: unconstrained.
+fn bounded_filter_value(obj: &Map<String, JsonValue>, key: &str) -> Result<Option<String>, String> {
+    let Some(value) = obj.get(key).and_then(JsonValue::as_str) else {
+        return Ok(None);
+    };
+    if value.len() > MAX_FILTER_VALUE_BYTES {
+        return Err(format!(
+            "flow.subscribe refused: filter.{key} is longer than {MAX_FILTER_VALUE_BYTES} bytes"
+        ));
+    }
+    Ok(Some(value.to_string()))
+}
+
 /// One live subscription: the connection it belongs to, that connection's push
 /// sink, and the filter it watches.
 struct Subscription {
@@ -370,6 +400,15 @@ struct Subscription {
     role: Frontend,
     sink: NotificationSink,
     filter: FlowFilter,
+}
+
+/// Why [`Subscriptions::add`] refused to register a subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscribeRefused {
+    /// The connection's sink is already closed: its teardown ran first.
+    Closed,
+    /// The connection already holds `MAX_SUBS_PER_CONN` subscriptions.
+    TooMany,
 }
 
 /// The per-server subscription registry. Subscriptions are keyed by an opaque
@@ -394,9 +433,28 @@ impl Subscriptions {
     }
 
     /// Register a subscription for `conn_id` (speaking as `role`) over `sink`;
-    /// returns its `sub_id`.
-    fn add(&self, conn_id: u64, role: Frontend, sink: NotificationSink, filter: FlowFilter) -> u64 {
+    /// returns its `sub_id`, or a refusal without registering: `Closed` when
+    /// `sink` is already closed, `TooMany` when the connection already holds
+    /// `MAX_SUBS_PER_CONN` subscriptions. Both checks run under the registry
+    /// lock. For `Closed` that means, with a transport that closes the sink
+    /// before `drop_connection`, a subscribe racing the teardown is either
+    /// refused here or swept by the pending drop; it cannot slip in between and
+    /// outlive its connection (web-bus-push spec D4).
+    fn add(
+        &self,
+        conn_id: u64,
+        role: Frontend,
+        sink: NotificationSink,
+        filter: FlowFilter,
+    ) -> Result<u64, SubscribeRefused> {
         let mut st = self.lock();
+        if sink.is_closed() {
+            return Err(SubscribeRefused::Closed);
+        }
+        let held = st.subs.iter().filter(|s| s.conn_id == conn_id).count();
+        if held >= MAX_SUBS_PER_CONN {
+            return Err(SubscribeRefused::TooMany);
+        }
         st.next_sub += 1;
         let sub_id = st.next_sub;
         st.subs.push(Subscription {
@@ -406,7 +464,7 @@ impl Subscriptions {
             sink,
             filter,
         });
-        sub_id
+        Ok(sub_id)
     }
 
     /// Whether any live subscription belongs to a connection of `role` (e.g. an
@@ -763,14 +821,19 @@ pub struct McpServer {
     /// `flow.unsubscribe` manage it; the dispatcher fans notifications to it.
     subscriptions: Arc<Subscriptions>,
     /// The core→server event broadcast sender; a connection built from the
-    /// `SubscriptionPlugin`'s chain tap. `serve` subscribes a dispatcher task to
-    /// it. `None` disables live flow push (the in-process path).
+    /// `SubscriptionPlugin`'s chain tap. [`McpServer::spawn_push_dispatcher`]
+    /// (called by `serve`) subscribes a dispatcher task to it. `None` disables
+    /// live flow push (the in-process path).
     push_tx: Option<broadcast::Sender<Event>>,
     /// Per-connection push-sink capacity (notification lines) before drop-oldest.
     push_capacity: usize,
     /// Monotonic source of per-connection ids, so each streaming connection's
     /// subscriptions can be dropped when it ends.
     conn_seq: Arc<AtomicU64>,
+    /// Set by the first [`McpServer::spawn_push_dispatcher`] call, so a second
+    /// call is a no-op rather than a second dispatcher delivering every event
+    /// twice.
+    dispatcher_spawned: AtomicBool,
     /// Outstanding operator confirm-over-the-wire tokens (spec D4).
     confirm_tokens: Arc<ConfirmTokens>,
     /// How long a minted confirm token stays valid.
@@ -831,6 +894,7 @@ impl McpServer {
             push_tx: None,
             push_capacity: DEFAULT_PUSH_CAPACITY,
             conn_seq: Arc::new(AtomicU64::new(0)),
+            dispatcher_spawned: AtomicBool::new(false),
             confirm_tokens: Arc::new(ConfirmTokens::default()),
             confirm_ttl: DEFAULT_CONFIRM_TTL,
             audit_ring: Arc::new(AuditRing::default()),
@@ -864,8 +928,9 @@ impl McpServer {
     }
 
     /// Attach the core→server event broadcast (the `SubscriptionPlugin`'s chain
-    /// tap). `serve` spawns a dispatcher that renders each event as a
-    /// `notifications/aitm/flow` line and fans it to matching subscriptions.
+    /// tap). [`McpServer::spawn_push_dispatcher`] (which `serve` calls) spawns a
+    /// dispatcher that renders each event as a `notifications/aitm/flow` line and
+    /// fans it to matching subscriptions.
     pub fn with_push(mut self, tx: broadcast::Sender<Event>) -> Self {
         self.push_tx = Some(tx);
         self
@@ -882,6 +947,49 @@ impl McpServer {
     /// size a connection's sink when the caller did not inject one.
     pub fn push_capacity(&self) -> usize {
         self.push_capacity
+    }
+
+    /// Spawn this server's push dispatcher: one task that drains the core event
+    /// broadcast attached by [`McpServer::with_push`] and fans each event to the
+    /// matching subscriptions through [`McpServer::push_flow_event`]. A no-op
+    /// when no broadcast was attached, and idempotent: a second call on the same
+    /// server spawns nothing, so no subscriber receives an event twice.
+    ///
+    /// `serve` calls this before it listens. A server that is driven without
+    /// `serve` (the web `/bus` bridge, which calls `handle_on` directly) must call
+    /// it itself, or its subscriptions sit in a registry nothing ever feeds.
+    ///
+    /// The task holds this server and runs until the broadcast closes, that is
+    /// until every sender has dropped. In the real wiring that is the life of
+    /// the runtime: the server's own registry retains a sender (the
+    /// `SubscriptionPlugin`'s), so the task, and the server with it, lives until
+    /// the runtime shuts down.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime, like `tokio::spawn`.
+    pub fn spawn_push_dispatcher(self: &Arc<Self>) {
+        let Some(tx) = &self.push_tx else {
+            return;
+        };
+        // The swap alone decides which caller spawns; the flag orders no other
+        // data, so `Relaxed` is enough.
+        if self.dispatcher_spawned.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let dispatch_server = Arc::clone(self);
+        let mut rx = tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => dispatch_server.push_flow_event(&ev),
+                    // The dispatcher fell behind the ring: skip the missed
+                    // events rather than block the chain (spec D3.5).
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
     }
 
     /// Set how long an operator confirm-over-the-wire token stays valid before it
@@ -1045,6 +1153,7 @@ impl McpServer {
             push_tx,
             push_capacity,
             conn_seq,
+            dispatcher_spawned,
             confirm_tokens,
             confirm_ttl,
             audit_ring,
@@ -1067,9 +1176,10 @@ impl McpServer {
             stdio_role,
             agent_state,
             subscriptions,
-            push_tx: push_tx.clone(),
+            push_tx,
             push_capacity,
             conn_seq,
+            dispatcher_spawned,
             confirm_tokens,
             confirm_ttl,
             audit_ring,
@@ -1077,24 +1187,7 @@ impl McpServer {
             parked,
             approval_timeout,
         });
-        // The push dispatcher: for each core event, render + fan a flow
-        // notification to matching subscriptions. One task per server, draining
-        // the broadcast ring; it ends when every sender drops.
-        if let Some(tx) = &push_tx {
-            let dispatch_server = server.clone();
-            let mut rx = tx.subscribe();
-            tokio::spawn(async move {
-                loop {
-                    match rx.recv().await {
-                        Ok(ev) => dispatch_server.push_flow_event(&ev),
-                        // The dispatcher fell behind the ring: skip the missed
-                        // events rather than block the chain (spec D3.5).
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            });
-        }
+        server.spawn_push_dispatcher();
         match selected {
             McpTransport::Stdio => transport::serve_stdio(server).await,
             McpTransport::LoopbackTcp {
@@ -1316,8 +1409,9 @@ impl McpServer {
                 // A subscription verb's *successful* run is connection management,
                 // not a command invocation, so it is not audited (pushing its own
                 // line back to the subscriber would be self-referential noise). A
-                // *refusal* (e.g. the agent blocked under `Paused`) is a gate
-                // decision, so it is audited like any refused command (RF#6).
+                // *refusal* (the agent blocked under `Paused`, a closed connection,
+                // the per-connection cap, an over-long filter) is audited like any
+                // refused command (RF#6).
                 if !is_subscription_verb(name) || is_error_result(&value) {
                     self.record_audit(conn, name, &arguments, &value);
                 }
@@ -1795,7 +1889,10 @@ impl McpServer {
     }
 
     /// Register a subscription for this connection; optionally replay matching
-    /// store entries after `since` before live events. Returns `{sub_id}`.
+    /// store entries after `since` before live events. Returns `{sub_id}`, or a
+    /// tool error (and replays nothing) when a filter value is over-long, the
+    /// connection's sink is already closed, or the connection is at its
+    /// subscription cap.
     fn subscribe(
         &self,
         conn_id: u64,
@@ -1803,7 +1900,10 @@ impl McpServer {
         sink: NotificationSink,
         args: &Map<String, JsonValue>,
     ) -> JsonValue {
-        let filter = FlowFilter::parse(args.get("filter"));
+        let filter = match FlowFilter::parse(args.get("filter")) {
+            Ok(filter) => filter,
+            Err(reason) => return tool_error(reason),
+        };
         // A malformed `since` is already rejected by `enforce_verb_schema` on the
         // registered path, so this `.ok()` only silently drops one when the verb is
         // unregistered (no published schema) — never on the normal path.
@@ -1811,9 +1911,21 @@ impl McpServer {
             .get("since")
             .and_then(JsonValue::as_str)
             .and_then(|s| s.parse::<FlowId>().ok());
-        let sub_id = self
+        let sub_id = match self
             .subscriptions
-            .add(conn_id, role, sink.clone(), filter.clone());
+            .add(conn_id, role, sink.clone(), filter.clone())
+        {
+            Ok(sub_id) => sub_id,
+            Err(SubscribeRefused::Closed) => {
+                return tool_error("flow.subscribe refused: this connection is closed".to_string());
+            }
+            Err(SubscribeRefused::TooMany) => {
+                return tool_error(format!(
+                    "flow.subscribe refused: too many subscriptions on this connection (max \
+                     {MAX_SUBS_PER_CONN}); flow.unsubscribe first"
+                ));
+            }
+        };
         if let Some(since) = since {
             self.replay_since(&sink, &filter, since);
         }
