@@ -176,10 +176,23 @@ fn uds_bind_available(socket_dir: &Path) -> bool {
 // replicates them over the public `aitm_core` traits. ----
 
 /// The L7 scope guard, shared by the session (which lists its scope to push to the
-/// provider) and by the ingress (which enforces it) — as in production. `in_scope`
-/// is an exact host match against the seeded list, so a flow's scope comes from the
-/// SNI it carries, as it does in the real guard.
-struct SeededScope(Vec<ScopeEntry>);
+/// provider) and by the ingress (which enforces it) — as in production. A real
+/// [`StdGuard`](aitm_core::StdGuard) seeded once with the test's scope answers both
+/// `list_scope` and `in_scope`, so the test asserts the real matching contract
+/// (`host:port` authority, a portless entry admits any port) rather than a copy of
+/// it; `check_active` stays unreachable because the feeder and the ingress must
+/// consume no rate or concurrency budget.
+struct SeededScope(aitm_core::StdGuard);
+
+impl SeededScope {
+    fn seeded(entries: Vec<ScopeEntry>) -> Self {
+        let guard = aitm_core::StdGuard::default();
+        for entry in entries {
+            guard.add_scope(entry);
+        }
+        Self(guard)
+    }
+}
 
 impl ScopeRateGuard for SeededScope {
     fn check_active(&self, _host: &str) -> Result<ActionPermit, GuardError> {
@@ -190,10 +203,10 @@ impl ScopeRateGuard for SeededScope {
         false
     }
     fn list_scope(&self) -> Vec<ScopeEntry> {
-        self.0.clone()
+        self.0.list_scope()
     }
     fn in_scope(&self, host: &str) -> bool {
-        self.0.iter().any(|e| e.host.eq_ignore_ascii_case(host))
+        self.0.in_scope(host)
     }
 }
 
@@ -327,7 +340,7 @@ fn build_session(
     l4_config.scope.extend(l4_scope());
     let l4_guard = Arc::new(L4Guard::new(&l4_config));
     let l4_store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
-    let l7_guard = Arc::new(SeededScope(l7_scope()));
+    let l7_guard = Arc::new(SeededScope::seeded(l7_scope()));
 
     let ingress = CoreIngress::with_l4(l4_guard.clone(), l4_store.clone()).with_stream(
         Arc::from(vec![module]),
