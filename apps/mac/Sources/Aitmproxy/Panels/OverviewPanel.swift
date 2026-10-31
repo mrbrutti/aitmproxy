@@ -64,7 +64,7 @@ struct OverviewPanel: View {
                     ForEach([("p50", p.p50), ("p90", p.p90), ("p99", p.p99)], id: \.0) { name, value in
                         BarRow(label: name, labelColor: Tok.Ink.secondary, labelWidth: Self.codeWidth,
                                value: Format.duration(value), fraction: Self.seconds(value) / top,
-                               barColor: Palette.accent)
+                               barColor: Tok.Ink.secondary.color)
                             .accessibilityLabel("\(name), \(Format.duration(value))")
                     }
                 }

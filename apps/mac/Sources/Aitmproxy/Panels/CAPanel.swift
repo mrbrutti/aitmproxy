@@ -64,10 +64,10 @@ struct CAPanel: View {
     /// Green when installed and trusted, amber when installed but not trusted, grey
     /// when present but not installed, red when the CA is missing.
     private static func statusPair(_ s: CAStatus) -> ColorPair {
-        if s.installed, s.trusted { return Tok.Method.post }
-        if s.installed { return Tok.Method.put }
-        if s.exists { return Tok.Method.connect }
-        return Tok.Method.delete
+        if s.installed, s.trusted { return Tok.State.success }
+        if s.installed { return Tok.State.warning }
+        if s.exists { return Tok.State.neutral }
+        return Tok.State.danger
     }
 
     /// SHA-256 grouped into byte pairs, wrapping across lines, with a copy button.
