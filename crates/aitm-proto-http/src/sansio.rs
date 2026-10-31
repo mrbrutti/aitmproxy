@@ -199,7 +199,6 @@ impl Http1Machine {
     /// content still to come (a positive `Content-Length` or chunked framing),
     /// and no content byte buffered with the head. Set when the head is parsed
     /// and cleared by [`Self::enqueue_continue`] or by the next request's head.
-    #[cfg_attr(not(test), allow(dead_code))] // `serve` calls it (plan task 2)
     pub(crate) fn expects_continue(&self) -> bool {
         self.continue_pending
     }
@@ -207,7 +206,6 @@ impl Http1Machine {
     /// Queue the interim `100 Continue` for the client, once: with no
     /// expectation pending this does nothing, and answering clears it, so a
     /// second call queues nothing.
-    #[cfg_attr(not(test), allow(dead_code))] // `serve` calls it (plan task 2)
     pub(crate) fn enqueue_continue(&mut self) {
         if self.continue_pending {
             self.out_client.extend_from_slice(CONTINUE_RESPONSE);
