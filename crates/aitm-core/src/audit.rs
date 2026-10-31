@@ -1873,4 +1873,88 @@ mod tests {
     fn sanitize_client_label_turns_whitespace_controls_into_a_blank() {
         assert_eq!(sanitize_client_label("a\tb\nc"), Some("a b c".to_string()));
     }
+
+    /// The viewer filter is read-side only (plan 2026-10-30-bus-audit-connection-id,
+    /// spec A4 and AC28). `append_in`, eviction and the source table never look at
+    /// who may read an entry, so an operator flood that an agent may not read still
+    /// holds slots and still costs the agent its entries exactly as a visible flood
+    /// would: here the agent's `m1` is evicted although the flood is hidden from it.
+    #[test]
+    fn the_viewer_filter_does_not_change_what_the_ring_keeps() {
+        let ring = AuditRing::with_lane_capacities(4, 1);
+        for command in ["m1", "m2", "m3"] {
+            ring.append(sourced(Frontend::Mcp, None, command));
+        }
+        for i in 0..100 {
+            ring.append(sourced(Frontend::Operator, None, &format!("o{i}")));
+        }
+
+        assert_eq!(ring.evidence_len(), 4);
+        assert_eq!(
+            commands(&ring.recent(None, None)),
+            ["m2", "m3", "o98", "o99"]
+        );
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, None, None)),
+            ["m2", "m3"]
+        );
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, None, Some(1))),
+            ["m3"]
+        );
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Operator, None, None)),
+            ["m2", "m3", "o98", "o99"]
+        );
+    }
+
+    /// `recent_for` and `count_since_for` read both lanes in one lock (spec A4 and
+    /// AC29): `since`, then the viewer filter, then call order, then `limit`, so
+    /// `limit` counts the entries the viewer may see across the evidence and the
+    /// routine lane alike; and the count adds the viewer filter and the
+    /// connection exclusion on top of `at >= since`.
+    #[test]
+    fn recent_for_and_count_since_for_span_both_lanes() {
+        let t0 = SystemTime::now();
+        let ring = AuditRing::with_lane_capacities(8, 8);
+        ring.append_in(
+            AuditLane::Evidence,
+            entry_of(Frontend::Operator, None, "op-e1"),
+        );
+        ring.append_in(
+            AuditLane::Routine,
+            entry_of(Frontend::Mcp, Some("A"), "ag-r1"),
+        );
+        ring.append_in(
+            AuditLane::Evidence,
+            entry_of(Frontend::Mcp, Some("B"), "ag-e2"),
+        );
+        ring.append_in(
+            AuditLane::Routine,
+            entry_of(Frontend::Operator, None, "op-r2"),
+        );
+        ring.append_in(
+            AuditLane::Evidence,
+            entry_of(Frontend::Mcp, Some("A"), "ag-e3"),
+        );
+
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, None, None)),
+            ["ag-r1", "ag-e2", "ag-e3"]
+        );
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, None, Some(2))),
+            ["ag-e2", "ag-e3"]
+        );
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Operator, None, Some(3))),
+            ["ag-e2", "op-r2", "ag-e3"]
+        );
+        assert_eq!(commands(&ring.recent(None, Some(2))), ["op-r2", "ag-e3"]);
+
+        assert_eq!(ring.count_since_for(Frontend::Mcp, t0, None), 3);
+        assert_eq!(ring.count_since_for(Frontend::Operator, t0, None), 5);
+        assert_eq!(ring.count_since_for(Frontend::Mcp, t0, Some("A")), 1);
+        assert_eq!(ring.count_since_for(Frontend::Operator, t0, Some("A")), 3);
+    }
 }

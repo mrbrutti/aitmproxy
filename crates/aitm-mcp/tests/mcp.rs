@@ -5943,6 +5943,32 @@ fn revoke_push_real_verb_pause_then_resume_without_a_visible_push_has_no_marker(
     );
 }
 
+/// Plan 2026-10-30-bus-audit-connection-id, spec A4 (the mute order) and AC30: the
+/// visibility predicate runs before the pause mute accounting, so an audit line an
+/// agent may not see neither reaches a paused agent nor records a gap for it. After
+/// the resume the agent's first delivery is the line it may see and nothing else:
+/// no `lagged` marker, because nothing the agent could have seen was suppressed.
+#[test]
+fn a_hidden_audit_line_neither_reaches_nor_gaps_a_paused_agent() {
+    let rig = RvRig::new(AgentPolicy::Auto);
+    let agent = rv_subscribe(&rig.srv, Frontend::Mcp, json!({}));
+
+    rig.state.set_policy(AgentPolicy::Paused);
+    rv_audit(&rig.srv);
+    rv_assert_silent(
+        &agent.sink,
+        "an operator's audit line under Paused: hidden, so neither delivered nor flagged",
+    );
+
+    rig.state.set_policy(AgentPolicy::Auto);
+    rv_audit_as_agent(&rig.srv);
+    assert_eq!(
+        rv_drain(&agent.sink),
+        vec!["agent agent.status".to_string()],
+        "after the resume the agent gets the line it may see, with no marker for the hidden one"
+    );
+}
+
 /// AC10: two servers over one registry and one `AgentState` (the `aitm web`
 /// topology: P, the primary, and W, the `/bus` server). `agent.set` runs on P; the
 /// subscribers of W are muted and resumed, because the policy is read at use.
