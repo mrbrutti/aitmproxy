@@ -1863,10 +1863,10 @@ mod tests {
         let rows: &[(&str, &str)] = &[
             // old pipeline: `xsid\u{e9}y=v`, unchanged (DC1)
             ("xsid\u{e9}y=v", "xsid\u{e9}y=[redacted]"),
-            // old pipeline: `author:\nJohn`, unchanged (DC2)
-            ("author:\nJohn", "author:\n[redacted]"),
             // old pipeline: `sidebar\u{a0}:\u{a0}v`, unchanged (DC2)
             ("sidebar\u{a0}:\u{a0}v", "sidebar\u{a0}:\u{a0}[redacted]"),
+            // old pipeline: `sidebar=[redacted]` (DC2)
+            ("sidebar=\u{b}v", "sidebar=\u{b}[redacted]"),
             // old pipeline: `token.example.com:8443/x`, unchanged (DC3)
             ("token.example.com:8443/x", "token.example.com:[redacted]"),
             // old pipeline: `sidebar='[redacted]'[redacted]'` (DC4)
