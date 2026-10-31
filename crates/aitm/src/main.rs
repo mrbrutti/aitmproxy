@@ -499,6 +499,12 @@ async fn run() -> anyhow::Result<()> {
         // server keeps its own subscription registry and only `serve` spawns a
         // dispatcher, so without this a `/bus` subscription would sit in a
         // registry nothing feeds.
+        // Read both pre-bound listen addresses before the `web_server` block;
+        // the listeners are still owned here and move into `proxy.run_on` /
+        // `proxy.run_browser_on` below, so the startup summary captures their
+        // addresses now.
+        let proxy_addr = proxy_listener.local_addr()?;
+        let browser_addr = browser_listener.local_addr()?;
         let web_server = match (web_settings, web_listener) {
             (Some(settings), Some(listener)) => {
                 let bus = Arc::new(
@@ -542,15 +548,22 @@ async fn run() -> anyhow::Result<()> {
                 let bound = listener.local_addr()?;
                 let url = web::ui_url(bound, &settings.token);
                 // Log only the bound address; the token must never reach a
-                // tracing sink. The one-time println is the operator's link.
+                // tracing sink. The one-time summary println is the operator's
+                // link — its URLs carry the token on purpose (stdout, not logs).
                 web::log_listening(bound);
-                println!("web UI (agent): {url}");
-                // When operator access is configured, print its URL too; it
-                // carries the ephemeral operator bridge token in the fragment,
-                // never the mcp operator token.
-                if let Some(op) = &operator_token {
-                    println!("web UI (operator): {}", web::operator_ui_url(bound, op));
-                }
+                let operator_url = operator_token
+                    .as_ref()
+                    .map(|op| web::operator_ui_url(bound, op));
+                println!(
+                    "{}",
+                    web::startup_summary(
+                        &url,
+                        operator_url.as_deref(),
+                        proxy_addr,
+                        browser_addr,
+                        "ready"
+                    )
+                );
                 Some((listener, state))
             }
             _ => None,
