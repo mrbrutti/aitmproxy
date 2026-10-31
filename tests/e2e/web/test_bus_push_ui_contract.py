@@ -6,9 +6,10 @@ Spec: docs/superpowers/specs/2026-10-30-web-ui-bus-push-design.md (wire-facts
 table, D3, D6, D7). The UI now subscribes on every connection and treats a flow
 push as a TRIGGER (refetch via flow.detail, never apply the sparse summary), and
 it drops its own polling echo from the Activity panel by inferring own-ness from
-`origin` + command because the bridge labels no connection. Each of those client
-decisions depends on a server fact this suite pins against a REAL core over the
-REAL /bus bridge, as the agent token (the `aitm web --token` value):
+`origin` + command, because the one label the bridge stamps on every connection
+(`web-bridge`) cannot tell the UI from another script on the same token. Each of
+those client decisions depends on a server fact this suite pins against a REAL
+core over the REAL /bus bridge, as the agent token (the `aitm web --token` value):
 
   1. flow.subscribe {} returns an integer sub_id            (server.rs subscribe)
   2. a flow push summary is exactly {id, kind, method, authority, path, status}
@@ -16,8 +17,8 @@ REAL /bus bridge, as the agent token (the `aitm web --token` value):
   3. flow.detail {id, body:"none"} returns kind "http" with request, client_conn,
      meta, and its `id` is the requested one                 (detail.rs detail)
   4. the UI's own flow.list is audited and pushed back as a notifications/aitm/agent
-     line {at:int, origin:"mcp", client_label:null, command, args:str, result:"ok"}
-                                                   (server.rs record_audit, audit.rs)
+     line {at:int, origin:"mcp", client_label:"web-bridge", command, args:str,
+     result:"ok"}                                  (server.rs record_audit, audit.rs)
   4b. the flow.detail audit line's args parse back to exactly {id, body:"none"}:
      the UI's body-aware noise rule reads `body` off the echoed args
                                               (server.rs redact_args, redact.rs)
@@ -26,16 +27,19 @@ REAL /bus bridge, as the agent token (the `aitm web --token` value):
 Sections 6 and 7 pin the server-assigned connection id (spec:
 docs/superpowers/specs/2026-10-30-bus-audit-connection-id-design.md, AC20, D1).
 The id is opaque: only equality and "a str of 1 to 64 bytes" are asserted, never
-its rendering. `client_label` stays null on every /bus line (the pin in 4 holds):
-the bridge still does not copy clientInfo.name.
+its rendering. Since PR 171 the bridge labels every connection `web-bridge`, a
+server-side path name that is never clientInfo.name, so `client_label` is
+"web-bridge" on every /bus line (the pin in 4 asserts it). The label cannot tell
+one /bus connection from another; own-ness comes from `connection_id`.
 
   6. `initialize` answers a top-level connection_id (a str of 1 to 64 bytes), a
      repeated initialize returns the same one, and every flow.list audit line of
-     this connection carries it, with client_label null
+     this connection carries it, with client_label "web-bridge"
                                 (server.rs McpServer::connection_id, record_audit)
   7. a second /bus connection gets a different id; its proxy.status line reaches
      the first connection's stream with origin "mcp" and ITS id; re-initializing
-     as clientInfo.name "aitm-web" changes neither the id nor the null label
+     as clientInfo.name "aitm-web" changes neither the id nor the label, which
+     stays "web-bridge" (never "aitm-web")
 
 Every check is hard (no skip). The two sibling suites in this directory are left
 as they are (spec non-goal); this one sits beside them.
@@ -176,18 +180,22 @@ def main() -> int:
         check(is_int(a.get("at")), f"agent line `at` is an integer (epoch ms), got {a.get('at')!r}")
         check(a.get("origin") == "mcp",
               f"agent line origin is 'mcp' (the --token value is the agent token), got {a.get('origin')!r}")
-        # Pins the fact the UI's noise rule rests on: the /bus bridge mints its one
-        # ConnCtx with `client_label: None` (crates/aitm/src/web/bridge.rs:251-257),
-        # so bridge audit lines are unlabelled and the UI's own lines carry
-        # `client_label: null`, never "aitm-web". The rule (`isUiPollNoise`,
-        # apps/web/src/bus/noise.ts) therefore infers own-ness from `origin` +
-        # command (spec D7, R2). If a server change starts labelling bridge
-        # connections this check fails on purpose: revisit D7 then. The follow-up
-        # is a SERVER-assigned connection id on audit lines, NOT trusting a
+        # Pins the fact the UI's noise rule rests on: since PR 171 the /bus bridge
+        # mints each connection's `ConnCtx` with the server-minted label
+        # `web-bridge` (`bridge_conn_ctx`, crates/aitm/src/web/bridge.rs), a path
+        # name and never `initialize.clientInfo.name`, so every bridge audit line,
+        # the UI's own included, carries `client_label: "web-bridge"`, never
+        # "aitm-web". One shared label cannot tell the UI from another script on
+        # the same token, so the rule (`isUiPollNoise`, apps/web/src/bus/noise.ts)
+        # infers own-ness from `origin` + command (spec D7, R2). If a server change
+        # stops stamping this label, or starts copying a client-declared one, this
+        # check fails on purpose. The reliable own-ness signal is the
+        # SERVER-assigned `connection_id` on audit lines (sections 6 and 7), NOT a
         # client-declared label (initialize.clientInfo.name is forgeable; spec D7
         # third amendment).
-        check("client_label" in a and a["client_label"] is None,
-              f"agent line client_label is null over /bus (got {a.get('client_label', '<absent>')!r})")
+        check("client_label" in a and a["client_label"] == "web-bridge",
+              f"agent line client_label is 'web-bridge' over /bus "
+              f"(got {a.get('client_label', '<absent>')!r})")
         check(a.get("command") == "flow.list", f"agent line command is 'flow.list', got {a.get('command')!r}")
         check(isinstance(a.get("args"), str),
               f"agent line args is a (redacted JSON) string, got {type(a.get('args')).__name__}")
@@ -258,8 +266,8 @@ def main() -> int:
         check(all(p.get("connection_id") == cid for p in lists),
               f"every flow.list audit line ({len(lists)}) carries this connection's id {cid!r} "
               f"(got {[p.get('connection_id') for p in lists]!r})")
-        check(all("client_label" in p and p["client_label"] is None for p in lists),
-              f"every flow.list audit line still has client_label null "
+        check(all("client_label" in p and p["client_label"] == "web-bridge" for p in lists),
+              f"every flow.list audit line still has client_label 'web-bridge' "
               f"(got {[p.get('client_label', '<absent>') for p in lists]!r})")
 
         section("7. a second connection has its own id; re-initializing as 'aitm-web' changes nothing")
@@ -292,7 +300,8 @@ def main() -> int:
               f"(got {got[0].get('connection_id')!r})")
 
         # The UI re-initializes as 'aitm-web' on reconnect; a client-declared name
-        # must not move the server-assigned id nor give the bridge a label (D1, D2).
+        # must not move the server-assigned id (D1) nor replace the bridge's
+        # server-minted label `web-bridge`.
         renamed = ws.rpc("initialize", {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {},
@@ -316,9 +325,10 @@ def main() -> int:
         check(last.get("connection_id") == cid,
               f"the flow.list line after the re-initialize still carries id {cid!r} "
               f"(got {last.get('connection_id')!r})")
-        check("client_label" in last and last["client_label"] is None,
-              f"the flow.list line after the re-initialize still has client_label null "
-              f"(got {last.get('client_label', '<absent>')!r}): clientInfo.name is never copied")
+        check("client_label" in last and last["client_label"] == "web-bridge",
+              f"the flow.list line after the re-initialize still has client_label 'web-bridge', "
+              f"not 'aitm-web' (got {last.get('client_label', '<absent>')!r}): "
+              f"clientInfo.name is never copied")
         ok("web UI /bus push contract holds against the real core")
     finally:
         if ws:

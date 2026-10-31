@@ -25,12 +25,13 @@ What is proven, in call order (agents A and B, operator O; ring size after each)
  10   The label step, LAST so the counts above stay exact: a client named
       `"x" * (1 << 20)` makes one call and the operator's `agent.activity` entry
       for it (found by that client's own `initialize` id) has a `client_label`
-      of exactly 128 bytes, `"x" * 128`. The label must be capped at ingestion:
-      stored whole, a 16 MiB name times the 4096-entry ring would be 64 GiB
-      reachable with one token.
+      of exactly 64 characters, `"x" * 64`. The label must be bounded at
+      ingestion: stored whole, a 16 MiB name times the 6144 entries of the
+      default ring (4096 evidence plus 2048 routine) would be 96 GiB reachable
+      with one token.
 
-Every assertion on the oversized label compares lengths or a 128-byte prefix, so
-a failure never prints 1 MiB.
+Every assertion on the oversized label compares lengths or a 64-character
+prefix, so a failure never prints 1 MiB.
 """
 
 from __future__ import annotations
@@ -47,7 +48,7 @@ from aitm_e2e.core import Aitm  # noqa: E402
 
 LABEL_A = "aitm-e2e-ident-a"
 LABEL_B = "aitm-e2e-ident-b"
-MAX_LABEL_BYTES = 128  # aitm_core::MAX_CLIENT_LABEL_BYTES
+MAX_LABEL_CHARS = 64  # aitm_core::MAX_CLIENT_LABEL_CHARS: characters, not bytes
 MAX_ID_BYTES = 64  # D1: the id is at most 64 bytes of printable ASCII
 BIG_LABEL_BYTES = 1 << 20
 
@@ -160,7 +161,7 @@ def main() -> int:
         check(ids_b == [id_b], f"every `{LABEL_B}` entry carries B's initialize id (got {ids_b}, want {[id_b]})")
 
         # ---------------------------------------------------------------
-        section("10. an oversized client label is cut to 128 bytes at ingestion (runs last: counts stay exact)")
+        section("10. an oversized client label is cut to 64 characters at ingestion (runs last: counts stay exact)")
         host, port = core.bus_addr
         x = BusClient(host, port, core.cfg.agent_token, client_name="x" * BIG_LABEL_BYTES).connect()
         ok(f"connected a client whose initialize name is {BIG_LABEL_BYTES} bytes")
@@ -174,9 +175,10 @@ def main() -> int:
               f"{len(entries)} entries, label lengths {sorted({len(e.get('client_label') or '') for e in entries})})")
         label = mine[0].get("client_label")
         check(isinstance(label, str), f"X's entry has a string client_label (got {type(label).__name__})")
-        check(len(label) == MAX_LABEL_BYTES,
-              f"X's client_label is {MAX_LABEL_BYTES} bytes, not {BIG_LABEL_BYTES} (got {len(label)})")
-        check(label == "x" * MAX_LABEL_BYTES, f"X's client_label is the first {MAX_LABEL_BYTES} bytes of its name")
+        check(len(label) == MAX_LABEL_CHARS,
+              f"X's client_label is {MAX_LABEL_CHARS} characters, not {BIG_LABEL_BYTES} (got {len(label)})")
+        check(label == "x" * MAX_LABEL_CHARS,
+              f"X's client_label is the first {MAX_LABEL_CHARS} characters of its name")
     finally:
         for c in (x, a, b, op):
             if c:
@@ -184,7 +186,7 @@ def main() -> int:
         if core:
             core.stop()
 
-    ok("audit identity: per-connection ids on entries, exclude_self counts, label capped at 128 bytes")
+    ok("audit identity: per-connection ids on entries, exclude_self counts, label capped at 64 characters")
     return 0
 
 
