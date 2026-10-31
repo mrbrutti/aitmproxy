@@ -26,7 +26,7 @@ shows the state.
 - A fresh launch answers "where am I, what can I do, where do I go" in one screen: the Status
   page shows the three lanes (Core, Bus, Capture), each with a state word, one fact, and its
   action; a **Getting started** list ticks off the steps that are already true.
-- Every connection indicator (toolbar pill, status bar, sidebar row, Status page, Settings
+- Every connection indicator (toolbar cluster, Status page, Core Log header, Settings
   rows) draws its words from one `ConnectionSummary` so they never disagree (the B10 class of
   bug is closed by construction, not by review).
 - Enable/disable lives where the state is shown: Start/Stop/Restart Core, Reconnect Bus,
@@ -44,7 +44,8 @@ shows the state.
   a sequence the operator is pushed through, and it stays useful after first run.
 - No new bus verbs. Scope persistence across core restarts (live finding: the scope is lost on
   every restart) is a core/orchestrator item; the Status page only shows the count honestly.
-- No change to Settings ▸ Capture's toggle semantics or to `CaptureSwitch`/`ExtensionController`
+- No change to the on/off steps or their ordering in `CaptureSwitch`/`ExtensionController`
+  (revision 2 adds only the status-bar message for a same-as-chosen click, §4)
   (operator-only, serialized); the Status page calls the same `CaptureSwitch` steps.
 - Source-app attribution on the wire (the NE session's v0.5.4 spec).
 - TUI and web: the model is Kit-only here; the words are written so the TUI/web can adopt them.
@@ -87,7 +88,7 @@ public struct ConnectionLane: Equatable, Sendable {
     public enum Kind: Sendable { case core, bus, capture }
     public let kind: Kind
     public let state: LaneState
-    /// The one word for the sidebar/status bar: "running", "connecting…", "capture on" …
+    /// The one word for the toolbar pill and the Status card: "running", "connecting…", "capture on" …
     public let word: String
     /// The fact under it: "Embedded · proxy 127.0.0.1:8080", "operator · 127.0.0.1:60745",
     /// "3 hosts in scope".
@@ -269,10 +270,13 @@ into the cluster. Everything in the cluster reads `Session.connectionSummary`.
   `Session.setCapturing`, the same entry as View ▸ Pause Proxy / Resume Proxy (⇧⌘R) and the
   palette (traffic still passes, new flows are not recorded — the core has no verb that stops the
   listener). Track colour: the success colour when on, tertiary when paused or disabled. Pause is
-  a bus call whichever core answers, so the switch is live while the **bus lane is `ok`**
-  (connected as operator) and disabled otherwise — connected as agent included, so a pause is
-  never logged as an agent action — with "Bus <word> — connect as operator to pause or resume the
-  proxy" in its help. Help when live: "Pause the proxy: traffic still passes and new flows are not
+  a bus call whichever core answers, so the switch is live while the **bus lane is `ok` and the
+  resolved role is `operator`** (the role itself, not the lane's mismatch warning, which only
+  fires against an Expected-role setting) and disabled otherwise — an agent-token connection
+  included, so a pause from this switch is never logged as an agent action (the menu item and
+  the palette entry carry no such gate; they predate this revision) — with "Bus <word> — connect
+  as operator to pause or resume the proxy" in its help. The same `proxy.status` read drives the
+  pill's "intercept armed" from `intercept_armed`, so arming by another client shows too. Help when live: "Pause the proxy: traffic still passes and new flows are not
   recorded (⇧⌘R)" / "Resume recording flows (⇧⌘R)".
 - **Capture switch** (`ToolbarSwitch("Capture")`): the capture extension's on/off. Its position
   is the published fact, never the preference key (§1): on whenever the capture lane is not
@@ -323,7 +327,7 @@ into the cluster. Everything in the cluster reads `Session.connectionSummary`.
 Matt: "in the top where we filter by protocol we are still missing L4 type of packet traffic."
 `ContentCategory` gains `tcp`, `udp` and `l4` in their own group after the application-layer
 protocols: `All | HTTP HTTPS WebSocket | TCP UDP L4 | h1 h2 | JSON …`. `tcp`/`udp` match
-`row.l4?.proto`; `l4` matches every `kind == .l4` row (ICMP, raw and other included — the
+`row.l4?.proto`; `l4` matches every row carrying `l4` (set on every packet-level row; ICMP, raw and other included — the
 "All" of packet traffic, the word the L4 badge already uses). The ⌘1…⌘9 chip shortcuts follow
 bar order as before (h1 is now ⌘7). Chips get `.help` for the three new ones.
 
@@ -534,4 +538,16 @@ commit on the branch:
 | P2-22 | Spec | Minor | Undeclared files (comment ripples, gallery, `check-capture-toggle.sh`, and now `BusService`, `TokenMapping`, `AppearanceSettings`, `Session+Verbs`) | ACCEPTED — listed in §6 |
 | P2-23 | Spec | Minor | Unrequested non-functional additions (`AgentToggle` shares `SwitchGlyph`; `isSelected` traits on the pill and chips) | ACCEPTED — one glyph, one selection idiom |
 | P2-24 | Spec | Minor | S-001 / S-018 / CAPABILITIES still carried the old toolbar and words | FIXED |
+
+Re-review of the fix commit (spec PASS, security PASS; Minors only), applied in the re-land:
+
+| # | Reviewer | Sev | Finding | Disposition |
+|---|---|---|---|---|
+| P2-25 | Security | Minor | Bus lane `ok` ≠ operator: an agent-token connection with no Expected-role setting kept the Proxy switch live | FIXED — `proxyLive(summary, role:)` requires `resolvedRole == "operator"`; self-test pins agent/nil; §4 and S-072 reworded; menu/palette noted as ungated (pre-existing) |
+| P2-26 | Security | Minor | `ToolbarSwitches.flipCapture` was a second spelling of the capture entry invisible to the tripwire | FIXED — rule 4 denies `ToolbarSwitches|flipCapture`; rule 2 scans `flipCapture` with ShellToolbar as its only file + expect |
+| P2-27 | Security | Minor | Rule-1 exclusions still over-broad; grep errors masked | FIXED — `SelfTest(\+X)?\.swift:` anchor, `FilterRow(\.field,` shape, PIPESTATUS checked |
+| P2-28 | Spec | Minor | Non-goals, Goals, §1 word comment, §4b `.l4` sentence, S-072 acceptance still carried old text | FIXED |
+| P2-29 | Spec | Minor | ST-AC9's enabled clause pinned on one input | FIXED — `captureLive` checked for installed+embedded (live), external (off), busy (off) |
+| P2-30 | Spec | Minor | ST-AC12 open on a spec marked implemented | OPEN for Matt — VoiceOver / Accessibility Inspector read-out of the switches |
+| P2-31 | Orchestrator | — | The pill's "intercept armed" was a client flag (same class as P2-1) | FIXED — `refreshProxyStatus` also reads `intercept_armed` |
 

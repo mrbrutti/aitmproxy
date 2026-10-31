@@ -19,8 +19,13 @@ status=0
 words='"(running|not running|starting…|restarting…|stopped|failed|external|connected|connecting…|offline|bus failed|capture on|capture off|capture degraded|waiting for approval|on, nothing in scope|no extension|Capturing|Approved|Awaiting approval|core running|core failed)"'
 # Skipped: comments, the self-test (it ASSERTS the words), and filter values (`FilterRow(.state, …, "failed")`
 # is a flow-state query, not a connection word).
-hits=$(grep -rnE --include='*.swift' -e "$words" Sources/Aitmproxy | grep -vE ':[0-9]+:[[:space:]]*///?' | grep -vE '^Sources/Aitmproxy/SelfTest' | grep -vE ':[0-9]+:.*FilterRow\(' || true)
-if [ -n "$hits" ]; then
+hits=$(grep -rnE --include='*.swift' -e "$words" Sources/Aitmproxy | grep -vE ':[0-9]+:[[:space:]]*///?' | grep -vE '^Sources/Aitmproxy/SelfTest(\+[A-Za-z]+)?\.swift:' | grep -vE ':[0-9]+:.*FilterRow\(\.[a-z]+,' ; echo "rc=${PIPESTATUS[0]}")
+rc=${hits##*rc=}; hits=${hits%rc=*}
+if [ "$rc" -gt 1 ]; then
+  echo "FAIL check-connection-words: grep could not read Sources/Aitmproxy (exit $rc)"
+  status=1
+fi
+if [ -n "${hits//[[:space:]]/}" ]; then
   printf '%s\n' "$hits"
   echo "FAIL check-connection-words: a view spells a connection state word; read it from ConnectionSummary instead"
   status=1

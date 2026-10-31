@@ -111,8 +111,8 @@ struct ProxySwitch: View {
     var body: some View {
         ToolbarSwitch(
             title: "Proxy", on: session.capturing, tint: Tok.Status.success.color,
-            enabled: ToolbarSwitches.proxyLive(summary),
-            help: ToolbarSwitches.proxyHelp(summary, capturing: session.capturing)
+            enabled: ToolbarSwitches.proxyLive(summary, role: session.resolvedRole),
+            help: ToolbarSwitches.proxyHelp(summary, role: session.resolvedRole, capturing: session.capturing)
         ) { on in ToolbarSwitches.flipProxy(session, on: on) }
     }
 }
@@ -146,10 +146,13 @@ struct CaptureExtensionSwitch: View {
 /// drive them (ST-AC9) without a view and the views stay one line each.
 @MainActor
 enum ToolbarSwitches {
-    /// Pause/resume is a bus call: live while the bus is connected as operator. Connected as
-    /// agent (the bus lane's warning) stands down, so a pause is never logged as an agent action.
-    static func proxyLive(_ summary: ConnectionSummary) -> Bool {
-        summary.bus.state == .ok
+    /// Pause/resume is a bus call: live while the bus is connected AND the resolved role is the
+    /// operator. The role is checked itself, not the lane's role-mismatch warning (that warning
+    /// only fires against an Expected-role setting), so an agent-token connection with no
+    /// expectation set still stands down and a pause from this switch is never logged as an
+    /// agent action.
+    static func proxyLive(_ summary: ConnectionSummary, role: String?) -> Bool {
+        summary.bus.state == .ok && role == "operator"
     }
 
     /// The Proxy switch's flip: the same entry as View ▸ Pause Proxy / Resume Proxy.
@@ -163,8 +166,8 @@ enum ToolbarSwitches {
         Task { await CaptureSwitch.set(on, session: session) }
     }
 
-    static func proxyHelp(_ summary: ConnectionSummary, capturing: Bool) -> String {
-        guard proxyLive(summary) else { return "Bus \(summary.bus.word) — connect as operator to pause or resume the proxy" }
+    static func proxyHelp(_ summary: ConnectionSummary, role: String?, capturing: Bool) -> String {
+        guard proxyLive(summary, role: role) else { return "Bus \(summary.bus.word) — connect as operator to pause or resume the proxy" }
         return capturing
             ? "Pause the proxy: traffic still passes and new flows are not recorded (⇧⌘R)"
             : "Resume recording flows (⇧⌘R)"

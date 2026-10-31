@@ -71,14 +71,23 @@ enum SelfTest {
             check("Status is reached from the toolbar pill and ⌘0, not a list row", !SidebarPage.status.isInSidebar && !SidebarPage.status.showsFlows)
             // ST-AC9: the toolbar switches follow the facts. Fixtures connect the bus, so the Proxy
             // switch is live; this build has no extension, so the Capture switch stands down and says why.
-            check("the toolbar's Proxy switch is live while the bus is connected as operator", ToolbarSwitches.proxyLive(summary))
+            check("the toolbar's Proxy switch is live while the bus is connected as operator", ToolbarSwitches.proxyLive(summary, role: session.resolvedRole))
+            check("the Proxy switch stands down on an agent-token connection even with no role expectation",
+                  !ToolbarSwitches.proxyLive(summary, role: "agent") && !ToolbarSwitches.proxyLive(summary, role: nil))
             ToolbarSwitches.flipProxy(session, on: false)
             await settle { !session.capturing }
             check("flipping the Proxy switch pauses the proxy", !session.capturing)
             ToolbarSwitches.flipProxy(session, on: true)
             await settle { session.capturing }
             check("flipping it again resumes", session.capturing)
-            check("the Proxy switch help names pause (⇧⌘R)", ToolbarSwitches.proxyHelp(summary, capturing: true).contains("⇧⌘R"))
+            check("the Proxy switch help names pause (⇧⌘R)", ToolbarSwitches.proxyHelp(summary, role: "operator", capturing: true).contains("⇧⌘R"))
+            // ST-AC9's enabled clause: each of the three terms flips the Capture switch's liveness.
+            let liveHealth = CoreHealthState()
+            liveHealth.captureCapability = .capturing
+            check("the Capture switch is live with an installed extension on the embedded core", ToolbarSwitches.captureLive(liveHealth, embedded: true))
+            check("the Capture switch stands down with an external core", !ToolbarSwitches.captureLive(liveHealth, embedded: false))
+            liveHealth.captureBusy = true
+            check("the Capture switch stands down while a switch is in flight", !ToolbarSwitches.captureLive(liveHealth, embedded: true))
             check("the toolbar's Capture switch stands down with no extension in this build",
                   !ToolbarSwitches.captureLive(session.coreHealth, embedded: true))
             check("the Capture switch says why it is off", ToolbarSwitches.captureHelp(

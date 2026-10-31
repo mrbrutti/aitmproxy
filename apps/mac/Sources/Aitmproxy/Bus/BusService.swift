@@ -210,11 +210,16 @@ final class BusService: FlowActions {
         }
     }
 
-    /// `proxy.status.capturing` → `Session.capturing`. A core without the verb leaves the flag alone.
+    /// `proxy.status` → `Session.capturing` and `Session.interceptArmed`: both are the core's
+    /// facts (another client can pause or arm), so the Proxy switch and the pill's "intercept
+    /// armed" follow the core, not this client's memory. A core without the verb leaves both alone.
     private func refreshProxyStatus() async {
-        guard let client else { return }
-        if let capturing = (try? await client.call("proxy.status"))?["capturing"]?.boolValue, capturing != session.capturing {
+        guard let client, let status = try? await client.call("proxy.status") else { return }
+        if let capturing = status["capturing"]?.boolValue, capturing != session.capturing {
             session.capturing = capturing
+        }
+        if let armed = status["intercept_armed"]?.boolValue, armed != session.interceptArmed {
+            session.interceptArmed = armed
         }
     }
 

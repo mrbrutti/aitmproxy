@@ -172,6 +172,11 @@ expect "2 toggle glue" "$app_swift" 'CaptureSwitch' 'the menu command calling Ca
 expect "2 toggle glue" "$status_panel" 'CaptureSwitch\.(set|uninstall)' 'the Status page lane card calling CaptureSwitch.set/uninstall'
 expect "2 toggle glue" "$shell_toolbar" 'CaptureSwitch\.set' 'the toolbar Capture switch calling CaptureSwitch.set'
 
+# The toolbar's alias for that call (ToolbarSwitches.flipCapture): a second spelling of the
+# entry point, so it gets the same guard — defined and called in ShellToolbar.swift only.
+scan "2 toggle glue alias" 'flipCapture' "$shell_toolbar"
+expect "2 toggle glue alias" "$shell_toolbar" 'static func flipCapture' 'the alias definition'
+
 # ---- 3. the persisted choice ---------------------------------------------------------
 scan "3 capture.enabled key" "$key_re" \
   "$embedded_core" "$ext_controller" "$settings_view" "$app_swift"
@@ -180,7 +185,7 @@ for f in "$embedded_core" "$ext_controller" "$settings_view" "$app_swift"; do
 done
 
 # ---- 4. the agent-reachable surfaces reference none of it ----------------------------
-deny "$key_re|captureEnabled|CaptureSwitch|ExtensionController|extensionController|OSSystemExtension|(activation|deactivation)Request|submitRequest|restartCoreTick|\.(enable|disable)[[:space:]]*\(" \
+deny "$key_re|captureEnabled|CaptureSwitch|ToolbarSwitches|flipCapture|ExtensionController|extensionController|OSSystemExtension|(activation|deactivation)Request|submitRequest|restartCoreTick|\.(enable|disable)[[:space:]]*\(" \
   Sources/Aitmproxy/Bus/BusService.swift \
   Sources/AitmproxyKit/CommandMap.swift \
   Sources/Aitmproxy/Shell/CommandPalette.swift \
