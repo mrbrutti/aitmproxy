@@ -141,6 +141,43 @@ import Testing
     }
 }
 
+/// Sizes reach every sum in the Kit from the bus, imports and fixtures: none may trap.
+@Suite struct SizeSumSaturationTests {
+    private func row(_ seq: Int, request: Int64?, response: Int64?) -> FlowRow {
+        FlowRow(
+            id: FlowID("row-\(seq)"), seq: seq, method: .get, scheme: "https", authority: "h", path: "/",
+            status: 200, state: .complete, requestBytes: request, responseBytes: response)
+    }
+
+    @Test func rowEqualityNoticesARequestSizeLanding() {
+        // The poll republishes rows only when `!=`: a request size that lands must count.
+        #expect(row(1, request: 100, response: 10) != row(1, request: 200, response: 10))
+        #expect(row(1, request: nil, response: 10) != row(1, request: 0, response: 10))
+        #expect(row(1, request: 100, response: 10) == row(1, request: 100, response: 10))
+    }
+
+    @Test func overviewTotalsSaturate() {
+        let stats = OverviewStats(rows: [row(1, request: Int64.max, response: Int64.max), row(2, request: 1, response: 1)])
+        #expect(stats.requestBytes == Int64.max)
+        #expect(stats.responseBytes == Int64.max)
+    }
+
+    @Test func selectionSummarySaturates() {
+        let summary = SelectionSummary(rows: [row(1, request: Int64.max, response: 1), row(2, request: 7, response: 8)])
+        #expect(summary.sized == 2)
+        #expect(summary.totalBytes == Int64.max)
+    }
+
+    @Test func sizeFilterValueIsFiniteAndRenders() {
+        let huge = MatchContext(subject: FilterSubject(row: row(1, request: Int64.max, response: Int64.max)))
+        let twice = Double(Int64.max) + Double(Int64.max)
+        #expect(huge.number(for: .size) == twice)
+        #expect(huge.text(for: .size) == String(format: "%.0f", twice))
+        let small = MatchContext(subject: FilterSubject(row: row(2, request: 400, response: 600)))
+        #expect(small.text(for: .size) == "1000")
+    }
+}
+
 @Suite struct SyntaxTests {
     @Test func jsonKeysAndValues() {
         let runs = Syntax.json(line: "  \"expires_in\": 3600,")

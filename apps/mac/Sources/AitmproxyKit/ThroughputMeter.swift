@@ -40,8 +40,8 @@ public struct ThroughputMeter: Sendable {
     public let window: Duration
     /// Bytes accounted so far on this connection: request bodies (↑) and response
     /// bodies (↓). Monotone and saturating.
-    public private(set) var upTotal: Int64 = 0
-    public private(set) var downTotal: Int64 = 0
+    private(set) var upTotal: Int64 = 0
+    private(set) var downTotal: Int64 = 0
     private var samples: [Sample] = []
 
     public init(window: Duration = .seconds(3)) {
@@ -64,9 +64,10 @@ public struct ThroughputMeter: Sendable {
     }
 
     /// The window arithmetic on explicit totals (what `sample(at:)` feeds; tests use
-    /// it directly). Totals are expected to grow; one that went backwards starts a
-    /// new baseline rather than reading as negative traffic.
-    public mutating func sample(up: Int64, down: Int64, at: ContinuousClock.Instant) -> Rate {
+    /// it directly). The production totals are monotone and non-negative by
+    /// construction; the clamp and the shrink re-baseline below are defensive guards
+    /// for this seam, so no caller can ever make the rate negative.
+    mutating func sample(up: Int64, down: Int64, at: ContinuousClock.Instant) -> Rate {
         let up = max(up, 0)
         let down = max(down, 0)
         if let last = samples.last, up < last.up || down < last.down {
@@ -104,8 +105,9 @@ public struct ThroughputMeter: Sendable {
     }
 
     /// `a + b` saturating at `Int64.max` instead of trapping. For byte counts, so the
-    /// operands are expected non-negative.
-    public static func saturatingSum(_ a: Int64, _ b: Int64) -> Int64 {
+    /// operands are expected non-negative. Shared with the other size sums in the Kit
+    /// (`OverviewStats`, `SelectionSummary`).
+    static func saturatingSum(_ a: Int64, _ b: Int64) -> Int64 {
         let (sum, overflowed) = a.addingReportingOverflow(b)
         return overflowed ? Int64.max : sum
     }

@@ -372,7 +372,10 @@ struct MatchContext {
         case .method: return row.method.label
         case .status: return row.status.map(String.init)
         case .client: return row.client?.name
-        case .duration, .size: return number(for: field).map { String(Int64($0)) }
+        // `Int64(exactly:)` rather than `Int64(_:)`: a value past Int64 (or non-finite)
+        // must render, not trap.
+        case .duration, .size:
+            return number(for: field).map { Int64(exactly: $0.rounded()).map(String.init) ?? String(format: "%.0f", $0) }
         case .mark: return row.mark?.rawValue
         case .comment: return row.comment
         case .origin:
@@ -401,7 +404,8 @@ struct MatchContext {
             return Double(seconds) * 1_000 + Double(attoseconds) / 1e15
         case .size:
             guard row.requestBytes != nil || row.responseBytes != nil else { return nil }
-            // Summed as doubles: sizes come from the bus and must never trap the app.
+            // Summed as doubles so no pair of sizes can trap: the bus decode bounds its
+            // sizes, but rows also come from imports and fixtures.
             return Double(row.requestBytes ?? 0) + Double(row.responseBytes ?? 0)
         default:
             return nil

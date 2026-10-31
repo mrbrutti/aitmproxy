@@ -60,7 +60,8 @@ public struct SelectionSummary: Hashable, Sendable {
         for row in rows {
             if let req = row.requestBytes, let resp = row.responseBytes {
                 sized += 1
-                // Sizes come from the bus: saturating, so a hostile size cannot trap the app.
+                // Saturating: the bus decode bounds its sizes, but rows also come from
+                // imports and fixtures, and a sum must never trap the app.
                 bytes = ThroughputMeter.saturatingSum(bytes, ThroughputMeter.saturatingSum(max(req, 0), max(resp, 0)))
             }
             if let d = row.duration { duration += d }

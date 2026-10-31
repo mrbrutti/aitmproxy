@@ -111,10 +111,11 @@ import Testing
         #expect(meter.downTotal == 2_048)
     }
 
-    @Test func evictedFlowsDoNotReadAsNegativeTraffic() {
+    @Test func flowsNoLongerListedChangeNothing() {
         // Two 4 000-byte responses are on the board at t=0. By t=1 the store has
-        // evicted one and a 2 000-byte response arrived: the rate is the new traffic,
-        // not "−2 000" from the total shrinking.
+        // evicted one (so it is simply never recorded again) and a 2 000-byte response
+        // arrived: the totals only ever accumulate, so the rate is the new traffic,
+        // never "−2 000" from a set total shrinking.
         var meter = ThroughputMeter(window: .seconds(3))
         meter.record(previous: nil, current: http("a", request: 0, response: 4_000))
         meter.record(previous: nil, current: http("b", request: 0, response: 4_000))

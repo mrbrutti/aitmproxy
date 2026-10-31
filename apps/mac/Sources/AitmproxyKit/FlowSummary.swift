@@ -30,7 +30,7 @@ public struct FlowSummary: Hashable, Sendable {
 
     /// No body a real core buffers approaches this (the default cap is 10 MiB); a size
     /// past it is a lie from the peer, read as unknown so it is neither shown nor summed.
-    public static let maxBodyBytes: Int64 = 1 << 40
+    static let maxBodyBytes: Int64 = 1 << 40
 
     /// An HTTP flow whose response head is here while a body is still streaming: the
     /// core reports sizes and one of them is still unknown. The poll keeps re-fetching

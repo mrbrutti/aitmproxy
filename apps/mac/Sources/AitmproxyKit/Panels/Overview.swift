@@ -62,7 +62,8 @@ public struct OverviewStats: Hashable, Sendable {
         errors = rows.filter { row in
             row.state == .failed || row.state == .killed || row.status.flatMap(StatusClass.init) == .serverError
         }.count
-        // Sizes come from the bus: saturating sums, so a hostile size cannot trap the app.
+        // Saturating sums: the bus decode bounds its sizes, but rows also come from
+        // imports and fixtures, and a sum must never trap the app.
         requestBytes = rows.reduce(0) { ThroughputMeter.saturatingSum($0, max($1.requestBytes ?? 0, 0)) }
         responseBytes = rows.reduce(0) { ThroughputMeter.saturatingSum($0, max($1.responseBytes ?? 0, 0)) }
 
