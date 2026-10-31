@@ -32,7 +32,9 @@ export type TestBus = BusClient &
      * whose `flow.detail` / `flow.get` always error (a flow the core cannot render). `holdReply`
      * holds one `flow.detail` reply per id: the reply is computed when the mock answers (its few ms
      * of latency) but delivered only when the promise settles; the entry is used once and removed.
-     * `hideTools` names tools removed from the catalogue (set before `start()`).
+     * `hideTools` names tools removed from the catalogue (set before `start()`). `activityWire`,
+     * when set, is what `agent.activity` returns instead of the mock's own log: the server's wire
+     * shape (epoch ms, `client_label`, `args` as JSON text), un-normalized and un-filtered.
      */
     ctl: {
       failDetail: Set<string>;
@@ -42,6 +44,7 @@ export type TestBus = BusClient &
       hideTools: Set<string>;
       failToolsOnce: boolean;
       failStatus: number;
+      activityWire: unknown[] | null;
       setState(s: BusState): void;
     };
   };
@@ -67,6 +70,7 @@ export function bridgeBus(address = '127.0.0.1:8082'): TestBus {
     hideTools: new Set(),
     failToolsOnce: false,
     failStatus: 0,
+    activityWire: null,
     setState,
   };
   return {
@@ -102,6 +106,7 @@ export function bridgeBus(address = '127.0.0.1:8082'): TestBus {
         throw new BusError('proxy.status: bus closed (1006)');
       }
       if ((tool === 'flow.detail' || tool === 'flow.get') && ctl.failDetail.has(args.id as string)) throw new BusError(`${tool}: flow ${String(args.id)} cannot be read`);
+      if (tool === 'agent.activity' && ctl.activityWire) return ctl.activityWire as T;
       if (tool !== 'flow.detail') return mock.call<T>(tool, args);
       peak.detail = Math.max(peak.detail, ++detailInFlight);
       try {

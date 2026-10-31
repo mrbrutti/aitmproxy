@@ -9,8 +9,9 @@
 import { batch, createEffect, createMemo, createRoot, createSignal, on, untrack, type Accessor } from 'solid-js';
 import { createStore, produce, reconcile, type SetStoreFunction } from 'solid-js/store';
 import type { BusClient, AgentNotification, FlowNotification, StateNotification, ToolDef } from '~/bus/types';
-import { toDetail, toSummary } from '~/bus/normalize';
+import { toAgentEntry, toDetail, toSummary } from '~/bus/normalize';
 import type { PocRun } from '~/bus/mock';
+import { isUiPollNoise, ownOriginOf } from '~/panels/agent/activity';
 import {
   contentFamily,
   type ContentFamily,
@@ -347,11 +348,35 @@ export function createAppStore(bus: BusClient) {
       });
     }
 
-    function onAgent(a: AgentNotification) {
+    /** Newest audit lines the log keeps. Counted after the noise filter, so it measures what is shown. */
+    const ACTIVITY_CAP = 500;
+    /**
+     * The one intake behind the live push and the `agent.activity` snapshot (push spec D6, D7). Each
+     * line is normalized from the server's wire shape (`toAgentEntry`; an `approval_requested` line is
+     * not an audit entry and is skipped), this UI's own successful background reads are dropped (the
+     * server echoes every call back to us; own-ness is inferred from this connection's role because
+     * the bridge labels nothing), what is kept is numbered, and the newest ACTIVITY_CAP stay. A batch
+     * that keeps nothing changes nothing, in either mode: over `aitm web` the ring `agent.activity`
+     * reads is empty, so the log is fed by push alone there and a snapshot must not replace it with
+     * nothing on every side refresh (scope.add, poc.run, the catalogue heal).
+     */
+    function intakeActivity(raw: readonly unknown[], mode: 'append' | 'replace') {
+      const own = { origin: ownOriginOf(untrack(bus.role)) };
+      const kept: ActivityEntry[] = [];
+      for (const item of raw) {
+        const e = toAgentEntry(item);
+        if (!e || isUiPollNoise(e, own)) continue;
+        kept.push({ ...e, seq: ++activitySeq });
+      }
+      if (!kept.length) return;
       setProxy('activity', (list) => {
-        const next = [...list, { ...a, seq: ++activitySeq }];
-        return next.length > 500 ? next.slice(-500) : next;
+        const next = mode === 'replace' ? kept : [...list, ...kept];
+        return next.length > ACTIVITY_CAP ? next.slice(-ACTIVITY_CAP) : next;
       });
+    }
+
+    function onAgent(a: unknown) {
+      intakeActivity([a], 'append');
     }
 
     // When the last flow / complete state notification landed. The poll loop backs off only while the
@@ -384,7 +409,7 @@ export function createAppStore(bus: BusClient) {
           onState(params);
           break;
         case 'notifications/aitm/agent':
-          onAgent(params as AgentNotification);
+          onAgent(params);
           break;
       }
     });
@@ -735,19 +760,23 @@ export function createAppStore(bus: BusClient) {
       if (has('agent.status'))
         jobs.push(
           bus
-            .call<{ policy: AgentPolicy; actions_last_minute: number; log?: AgentNotification[] }>('agent.status')
+            .call<{ policy: AgentPolicy; actions_last_minute: number; log?: unknown[] }>('agent.status')
             .then((a) => {
               setProxy({ agent: a.policy, agentActionsLastMinute: a.actions_last_minute });
-              // The activity log rides on agent.status as `log` (no agent.activity command on the bus).
-              if (Array.isArray(a.log) && !has('agent.activity')) setProxy('activity', a.log.map((e) => ({ ...e, seq: ++activitySeq })));
+              // On a bus without agent.activity the log rides on agent.status as `log` (the real core sends none).
+              if (Array.isArray(a.log) && !has('agent.activity')) intakeActivity(a.log, 'replace');
             })
             .catch(() => {}),
         );
       if (has('agent.activity'))
         jobs.push(
           bus
-            .call<AgentNotification[]>('agent.activity')
-            .then((list) => setProxy('activity', list.map((a) => ({ ...a, seq: ++activitySeq }))))
+            .call<unknown>('agent.activity')
+            // No `limit`: the ring is the snapshot, and the intake filters and caps it. Over `aitm web`
+            // it is empty today (the web server's own ring is not the one agent.activity reads).
+            .then((list) => {
+              if (Array.isArray(list)) intakeActivity(list, 'replace');
+            })
             .catch(() => {}),
         );
       // No read for the intercept state exists: `flow.intercept {}` ARMS (enabled defaults to
