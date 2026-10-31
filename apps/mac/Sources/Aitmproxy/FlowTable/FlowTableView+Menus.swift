@@ -28,7 +28,9 @@ extension FlowTableView.Coordinator {
             let item = NSMenuItem(title: column.menuTitle, action: #selector(toggleColumn(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = column.rawValue
-            item.state = isVisible(column) ? .on : .off
+            // The check mark is the user's choice; a column hidden to fit the pane shows mixed.
+            item.state = userHidden.contains(column) ? .off : (autoHidden.contains(column) ? .mixed : .on)
+            if autoHidden.contains(column) { item.toolTip = "Hidden to fit the pane" }
             item.isEnabled = !column.alwaysVisible
             menu.addItem(item)
         }
@@ -111,28 +113,23 @@ extension FlowTableView.Coordinator {
 
     // MARK: Columns menu
 
-    private func isVisible(_ column: FlowColumn) -> Bool {
-        table?.tableColumn(withIdentifier: column.identifier)?.isHidden == false
-    }
-
     @objc private func toggleColumn(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String, let column = FlowColumn(rawValue: id), !column.alwaysVisible,
-              let tableColumn = table?.tableColumn(withIdentifier: column.identifier) else { return }
-        tableColumn.isHidden.toggle()
-        fitURLColumn()
+        guard let id = sender.representedObject as? String, let column = FlowColumn(rawValue: id), !column.alwaysVisible else { return }
+        if userHidden.contains(column) { userHidden.remove(column) } else { userHidden.insert(column) }
+        fitColumns()
         saveLayoutSoon()
     }
 
     @objc private func resetColumns() {
         guard let table else { return }
+        userHidden = []
         for (index, column) in FlowColumn.allCases.enumerated() {
             guard let tableColumn = table.tableColumn(withIdentifier: column.identifier) else { continue }
-            tableColumn.isHidden = false
             tableColumn.width = column.width
             let current = table.column(withIdentifier: column.identifier)
             if current != index, current >= 0 { table.moveColumn(current, toColumn: index) }
         }
         if let url = parent.layoutURL { try? FileManager.default.removeItem(at: url) }
-        fitURLColumn()
+        fitColumns()
     }
 }

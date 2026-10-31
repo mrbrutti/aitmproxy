@@ -57,6 +57,9 @@ struct FlowTableView: NSViewRepresentable {
 
         let layout = layoutURL.flatMap(ColumnLayout.load) ?? ColumnLayout()
         let order = layout.resolvedOrder(known: FlowColumn.allCases.map(\.rawValue)).compactMap(FlowColumn.init(rawValue:))
+        coordinator.userHidden = Set(order.filter { column in
+            (layout.widths.isEmpty ? column.defaultHidden : layout.isHidden(column.rawValue)) && !column.alwaysVisible
+        })
         for column in order {
             let c = NSTableColumn(identifier: column.identifier)
             c.title = column.title
@@ -69,7 +72,7 @@ struct FlowTableView: NSViewRepresentable {
             c.headerCell = FlowHeaderCell(textCell: column.title)
             c.headerCell.alignment = column.numeric ? .right : .left
             c.headerToolTip = column.sortKey.map { "Sort by \($0.title)" }
-            c.isHidden = (layout.widths.isEmpty ? column.defaultHidden : layout.isHidden(column.rawValue)) && !column.alwaysVisible
+            c.isHidden = coordinator.userHidden.contains(column)
             if let key = column.sortKey {
                 c.sortDescriptorPrototype = NSSortDescriptor(key: key.rawValue, ascending: true)
             }
@@ -147,6 +150,11 @@ struct FlowTableView: NSViewRepresentable {
         /// True while `updateNSView` pushes SwiftUI's selection or sort into the table.
         var syncing = false
         private var saveTask: Task<Void, Never>?
+        /// Columns the user hid (the header menu's check marks and `columns.json`).
+        var userHidden: Set<FlowColumn> = []
+        /// Columns hidden to fit the pane (S-008): kept apart from the user's set so the header
+        /// menu stays truthful; they come back when the pane widens.
+        private(set) var autoHidden: Set<FlowColumn> = []
 
         init(_ parent: FlowTableView) {
             self.parent = parent
@@ -276,13 +284,27 @@ struct FlowTableView: NSViewRepresentable {
 
         // MARK: Columns (S-008)
 
-        /// The URL column takes whatever width the other visible columns leave, so the table
-        /// always fits its clip: no horizontal scroll bar after a side panel opens, a layout
-        /// change, or a column toggle. AppKit's own column autoresizing only re-tiles on some
-        /// frame changes and never when a saved layout is replayed, so the fit is explicit.
-        func fitURLColumn() {
+        /// Fits the columns to the pane: first the low-priority columns go (`FlowColumn.autoHidePriority`)
+        /// until the fixed columns plus the URL minimum fit the clip, then the URL column takes
+        /// whatever width the visible columns leave. So the table always fits its clip: no
+        /// horizontal scroll bar after a side panel opens, a layout change, or a column toggle.
+        /// AppKit's own column autoresizing only re-tiles on some frame changes and never when a
+        /// saved layout is replayed, so the fit is explicit.
+        func fitColumns() {
             guard let table, let clip = table.enclosingScrollView?.contentView,
                   let url = table.tableColumn(withIdentifier: FlowColumn.url.identifier), !url.isHidden else { return }
+            let fixed = table.tableColumns.compactMap { c -> ColumnFit.Column? in
+                guard let column = FlowColumn(rawValue: c.identifier.rawValue), column != .url else { return nil }
+                return ColumnFit.Column(id: column.rawValue, width: c.width, userHidden: userHidden.contains(column))
+            }
+            let hide = ColumnFit.autoHidden(available: clip.bounds.width, columns: fixed, flexibleMin: url.minWidth,
+                                            priority: FlowColumn.autoHidePriority.map(\.rawValue))
+            autoHidden = Set(hide.compactMap(FlowColumn.init(rawValue:)))
+            for c in table.tableColumns {
+                guard let column = FlowColumn(rawValue: c.identifier.rawValue) else { continue }
+                let hidden = userHidden.contains(column) || autoHidden.contains(column)
+                if c.isHidden != hidden { c.isHidden = hidden }
+            }
             let visible = table.tableColumns.filter { !$0.isHidden }
             let others = visible.filter { $0 !== url }.reduce(CGFloat(0)) { $0 + $1.width }
             let spacing = CGFloat(visible.count) * table.intercellSpacing.width
@@ -297,7 +319,7 @@ struct FlowTableView: NSViewRepresentable {
         }
 
         @objc private func clipResized(_ note: Notification) {
-            fitURLColumn()
+            fitColumns()
         }
 
         func observeColumns(_ table: NSTableView) {
@@ -327,7 +349,8 @@ struct FlowTableView: NSViewRepresentable {
                 layout.order.append(column.identifier.rawValue)
                 // The flexible URL column's width is derived from the pane, never persisted.
                 if column.identifier != FlowColumn.url.identifier { layout.widths[column.identifier.rawValue] = column.width }
-                if column.isHidden { layout.hidden.insert(column.identifier.rawValue) }
+                // Only the user's choice persists; a column hidden to fit the pane comes back on its own.
+                if let id = FlowColumn(rawValue: column.identifier.rawValue), userHidden.contains(id) { layout.hidden.insert(id.rawValue) }
             }
             return layout
         }
