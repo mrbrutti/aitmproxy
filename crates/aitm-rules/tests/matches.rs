@@ -1,6 +1,8 @@
 //! Behaviour of the shared matcher. AC-R1/AC-R2 cover wildcard/regex URL
-//! matching and invalid-regex rejection; the remaining tests pin every other
-//! branch F3/F9/Map depend on (host, phase, method, ws_dir, enabled, protocol).
+//! matching (against the full URL and the path; the per-case contract lives in
+//! `url_match_cases.rs`) and invalid-regex rejection; the remaining tests pin
+//! every other branch F3/F9/Map depend on (host, phase, method, ws_dir, enabled,
+//! protocol).
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::SystemTime;
@@ -21,13 +23,18 @@ fn conn() -> ConnInfo {
     }
 }
 
-/// An HTTP flow with the given method, authority and request path.
+/// An HTTP flow with the given method, authority and request path over `https`.
 fn http_flow_full(method: &str, authority: &str, path: &str) -> Flow {
+    http_flow_scheme("https", method, authority, path)
+}
+
+/// An HTTP flow with every URL-bearing request field chosen by the caller.
+fn http_flow_scheme(scheme: &str, method: &str, authority: &str, path: &str) -> Flow {
     Flow::Http(HttpFlow {
         id: FlowId::new(),
         request: HttpRequest {
             method: method.into(),
-            scheme: "https".into(),
+            scheme: scheme.into(),
             authority: authority.into(),
             path: path.into(),
             version: HttpVersion::Http11,
@@ -88,7 +95,7 @@ fn rule(url: UrlMatch) -> Rule {
     })
 }
 
-// --- AC-R1 / AC-R2: URL matching (path subject) + invalid regex -------------
+// --- AC-R1 / AC-R2: URL matching (full URL or path) + invalid regex ---------
 
 #[test]
 fn wildcard_login_matches() {
@@ -113,10 +120,39 @@ fn invalid_regex_rejected() {
 
 #[test]
 fn oversized_regex_rejected() {
-    // A bounded repetition that compiles to well past the 1 MiB cap.
+    // AC10: a bounded repetition that compiles to well past the 1 MiB cap. URL
+    // regexes compile case-insensitively, so this exercises the cap on the
+    // folded program.
     let err = compile(rule(UrlMatch::Regex("a{1000}{1000}{100}".into())))
         .expect_err("a pattern over the size cap must be rejected, not balloon");
     assert!(matches!(err, RuleError::BadRegex { .. }));
+}
+
+#[test]
+fn host_and_url_clauses_combine() {
+    // AC9: both clauses must hold.
+    let compiled = compile(rule_with(MatchCondition {
+        host: Some(HostMatch::Exact("httpbin.org".into())),
+        url: Some(UrlMatch::Wildcard("*/get".into())),
+        ..cond()
+    }))
+    .expect("valid");
+    assert!(compiled.matches(
+        &http_flow_scheme("http", "GET", "httpbin.org", "/get"),
+        Phase::Request,
+        None
+    ));
+    assert!(!compiled.matches(
+        &http_flow_scheme("http", "GET", "httpbin.org", "/post"),
+        Phase::Request,
+        None
+    ));
+    // The url clause alone would match any host's /get; the host clause narrows it.
+    assert!(!compiled.matches(
+        &http_flow_scheme("http", "GET", "example.com", "/get"),
+        Phase::Request,
+        None
+    ));
 }
 
 // --- Host matching ----------------------------------------------------------
@@ -154,6 +190,27 @@ fn host_wildcard_matches() {
     ));
     assert!(!compiled.matches(
         &http_flow_full("GET", "example.net:443", "/"),
+        Phase::Request,
+        None
+    ));
+}
+
+#[test]
+fn host_wildcard_without_star_stays_exact() {
+    // The url wildcard's star-less substring rule does not leak into `host`:
+    // a star-less host wildcard is still the whole host.
+    let compiled = compile(rule_with(MatchCondition {
+        host: Some(HostMatch::Wildcard("example.com".into())),
+        ..cond()
+    }))
+    .expect("valid host wildcard");
+    assert!(compiled.matches(
+        &http_flow_full("GET", "example.com:443", "/"),
+        Phase::Request,
+        None
+    ));
+    assert!(!compiled.matches(
+        &http_flow_full("GET", "api.example.com:443", "/"),
         Phase::Request,
         None
     ));

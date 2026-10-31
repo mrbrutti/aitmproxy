@@ -9,13 +9,31 @@
 //!
 //! ## URL match subject
 //!
-//! A [`UrlMatch`] clause (wildcard or regex) is evaluated against the request
-//! **target** — the `path` (which already carries the query), e.g. `/api/login`
-//! or `/v2/users?x=1`. Host/authority targeting is the separate [`HostMatch`]
-//! clause. (The spec §0 prose describes matching against
-//! `scheme://authority/path?query`; the plan's authoritative regex test is
-//! path-anchored — `^/v[0-9]+/users$` against `/v2/users` — which cannot match a
-//! `scheme://…` string, so the matcher runs URL clauses against the path.)
+//! A [`UrlMatch`] clause is evaluated against two strings and matches when the
+//! pattern matches **either**:
+//!
+//! 1. the full URL `{scheme}://{authority}{path}`, each field exactly as
+//!    recorded on [`HttpRequest`]: scheme as the core set it (`http`, or
+//!    `https` after TLS MITM), authority as the client sent it (`host` or
+//!    `host:port`), path as sent including the query. An empty path gives
+//!    `scheme://authority` with no synthesised slash;
+//! 2. the path alone (`HttpRequest.path`, which carries the query).
+//!
+//! The second subject keeps path-anchored patterns (`/api/*`, `^/v1/`) working;
+//! for every other pattern shape the path match is implied by the URL match, so
+//! no URL-intended pattern gains a false match.
+//!
+//! **Wildcard** ([`UrlMatch::Wildcard`]): `*` matches any run of characters,
+//! including an empty one; every other character is literal, `?` included (in a
+//! URL it starts the query). A pattern containing a `*` is anchored to the whole
+//! subject; a pattern with no `*` matches as a substring. Matching is
+//! case-insensitive.
+//!
+//! **Regex** ([`UrlMatch::Regex`]): `regex` crate syntax, compiled once under
+//! the size cap and searched (unanchored) in each subject — anchor with `^`/`$`.
+//! Case-insensitive by default; an inline `(?-i)` restores case sensitivity.
+//!
+//! Host/authority targeting on its own is the separate [`HostMatch`] clause.
 
 use aitm_core::{Flow, HttpRequest, WsDir};
 use regex::{Regex, RegexBuilder};
@@ -41,7 +59,8 @@ pub struct Rule {
 /// clause must match for the rule to fire.
 #[derive(Debug, Clone)]
 pub struct MatchCondition {
-    /// Matched against the request target path (see the module docs).
+    /// Matched against the full request URL and against the path alone; either
+    /// may match (see the module docs).
     pub url: Option<UrlMatch>,
     /// Case-insensitive exact method; `None` == any.
     pub method: Option<String>,
@@ -53,8 +72,9 @@ pub struct MatchCondition {
     pub ws_dir: Option<WsDir>,
 }
 
-/// A URL clause: a shell-style wildcard (`*` = any run), or a `regex` crate
-/// pattern.
+/// A URL clause: a shell-style wildcard (`*` = any run, every other character
+/// literal, substring when star-less), or a `regex` crate pattern (searched).
+/// Both are case-insensitive; see the module docs.
 #[derive(Debug, Clone)]
 pub enum UrlMatch {
     Wildcard(String),
@@ -115,18 +135,22 @@ enum CompiledHost {
 pub fn compile(rule: Rule) -> Result<CompiledRule, RuleError> {
     let url = match &rule.condition.url {
         None => None,
-        Some(UrlMatch::Wildcard(pat)) => Some(compile_pattern(&wildcard_to_regex(pat), pat)?),
-        Some(UrlMatch::Regex(pat)) => Some(compile_pattern(pat, pat)?),
+        Some(UrlMatch::Wildcard(pat)) => Some(compile_pattern(
+            &wildcard_to_regex(pat, Anchor::WholeIfStarred),
+            pat,
+            true,
+        )?),
+        Some(UrlMatch::Regex(pat)) => Some(compile_pattern(pat, pat, true)?),
     };
     let host = match &rule.condition.host {
         None => None,
         Some(HostMatch::Exact(h)) => Some(CompiledHost::Exact(h.to_ascii_lowercase())),
         // Hosts are case-insensitive: lowercase the pattern so it matches the
-        // lowercased authority (`authority_host`). Paths are *not* folded here —
-        // URL matching above stays case-sensitive.
+        // lowercased authority (`authority_host`).
         Some(HostMatch::Wildcard(pat)) => Some(CompiledHost::Wildcard(compile_pattern(
-            &wildcard_to_regex(&pat.to_ascii_lowercase()),
+            &wildcard_to_regex(&pat.to_ascii_lowercase(), Anchor::Whole),
             pat,
+            false,
         )?)),
     };
     Ok(CompiledRule { rule, url, host })
@@ -134,9 +158,16 @@ pub fn compile(rule: Rule) -> Result<CompiledRule, RuleError> {
 
 /// Compile `regex_src` under a fixed size cap, attributing any failure (bad
 /// syntax or exceeding [`REGEX_SIZE_LIMIT`]) to the operator-facing `pattern`.
-fn compile_pattern(regex_src: &str, pattern: &str) -> Result<Regex, RuleError> {
+/// The cap applies to the program as built, so a case-insensitive compile is
+/// capped on its (larger) folded form.
+fn compile_pattern(
+    regex_src: &str,
+    pattern: &str,
+    case_insensitive: bool,
+) -> Result<Regex, RuleError> {
     RegexBuilder::new(regex_src)
         .size_limit(REGEX_SIZE_LIMIT)
+        .case_insensitive(case_insensitive)
         .build()
         .map_err(|e| RuleError::BadRegex {
             pattern: pattern.to_string(),
@@ -144,20 +175,38 @@ fn compile_pattern(regex_src: &str, pattern: &str) -> Result<Regex, RuleError> {
         })
 }
 
-/// Translate a shell-style wildcard (`*` = any run) into an anchored regex. Every
-/// other character is matched literally, so the produced regex always compiles.
-fn wildcard_to_regex(pattern: &str) -> String {
+/// How a wildcard pattern is bound to its subject.
+#[derive(Debug, Clone, Copy)]
+enum Anchor {
+    /// Always `^…$`: a star-less host wildcard is still an exact host.
+    Whole,
+    /// `^…$` only when the pattern has a `*`; a star-less pattern is a
+    /// substring, so an operator typing `httpbin.org` gets that host rather
+    /// than an exact-URL rule that can never fire.
+    WholeIfStarred,
+}
+
+/// Translate a shell-style wildcard (`*` = any run) into a regex. Every other
+/// character is matched literally, so the produced regex always compiles.
+fn wildcard_to_regex(pattern: &str, anchor: Anchor) -> String {
+    let anchored = match anchor {
+        Anchor::Whole => true,
+        Anchor::WholeIfStarred => pattern.contains('*'),
+    };
     let mut re = String::with_capacity(pattern.len() + 4);
-    re.push('^');
+    if anchored {
+        re.push('^');
+    }
     for ch in pattern.chars() {
         if ch == '*' {
             re.push_str(".*");
         } else {
-            // Escape one char so regex metacharacters are matched literally.
             re.push_str(&regex::escape(&ch.to_string()));
         }
     }
-    re.push('$');
+    if anchored {
+        re.push('$');
+    }
     re
 }
 
@@ -186,10 +235,10 @@ impl CompiledRule {
     /// dispatching plugin for the event being handled.
     ///
     /// Returns `true` iff the rule is enabled, its condition phase is `Any` or
-    /// equals `phase`, and every present clause matches: `url` against the
-    /// request target, `method` case-insensitively, `host` against the request
-    /// authority, and `ws_dir` against `dir`. Clauses that need a request
-    /// (`url`/`method`/`host`) never match a non-HTTP flow.
+    /// equals `phase`, and every present clause matches: `url` against the full
+    /// request URL or the path alone, `method` case-insensitively, `host`
+    /// against the request authority, and `ws_dir` against `dir`. Clauses that
+    /// need a request (`url`/`method`/`host`) never match a non-HTTP flow.
     pub fn matches(&self, flow: &Flow, phase: Phase, dir: Option<WsDir>) -> bool {
         let cond = &self.rule.condition;
 
@@ -208,9 +257,10 @@ impl CompiledRule {
         let req = http_request(flow);
 
         if let Some(url) = &self.url {
-            match req {
-                Some(req) if url.is_match(&req.path) => {}
-                _ => return false,
+            let Some(req) = req else { return false };
+            let full = format!("{}://{}{}", req.scheme, req.authority, req.path);
+            if !(url.is_match(&full) || url.is_match(&req.path)) {
+                return false;
             }
         }
         if let Some(method) = &cond.method {

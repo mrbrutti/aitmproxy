@@ -402,6 +402,7 @@ dependencies = [
  "aitm-core",
  "anyhow",
  "regex",
+ "serde_json",
 ]
 
 [[package]]
