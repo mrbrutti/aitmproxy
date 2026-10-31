@@ -137,6 +137,36 @@ The variant's in-process counter (`SURVEY-RATE max_1s`) agreed with the log-deri
 (17/s in its first two minutes versus 17 counted from lines), so the log store did not drop
 lines at these rates.
 
+**Controlled bursts (`burst-test.sh`, variant active, 14:04–14:05):** a heavy page in a
+cold headless Chrome profile is the worst case seen all day.
+
+| Load | New flows | Duration | Peak second | Note |
+|---|---|---|---|---|
+| Chrome headless, cold profile, theverge.com | **1 243** | 8 s | **336/s** | arrivals per second: 2, 101, 187, 235, 336, 122, 92, 141, 24 |
+| Chrome headless, cold profile, cnn.com | 176 | 3 s | 108/s | |
+| Chrome headless, cold profile, nytimes.com | 66 | 2 s | 55/s | |
+| Safari (Matt's warm profile), theverge.com | ≈420 | 11 s | 66/s | 38, 50, 42, 34, 66, 59, 17, 18, 34, 36, 23 |
+
+**Provider throughput ceiling (measured from the same burst).** The framework logs `New
+flow` when a flow *arrives*; the variant logs `SURVEY` when `handleNewFlow` *returns*. Over
+the whole burst both counted 1 260 flows (nothing dropped), but per second they diverge:
+
+| Second | arrived (framework) | handled (SURVEY) |
+|---|---|---|
+| 14:04:22 | 101 | 103 |
+| 14:04:23 | 187 | 158 |
+| 14:04:24 | 235 | 197 |
+| 14:04:25 | 336 | 200 |
+| 14:04:26 | 122 | 199 |
+| 14:04:27 | 92 | 203 |
+| 14:04:28 | 141 | 156 |
+
+Handling saturates at **≈200 flows/s** (`SURVEY-RATE max_1s=201` for that minute), i.e.
+one flow per ≈5 ms, which is the `isSelf` cost (R3). A backlog of ≈200 flows built up by
+14:04:25 and drained by 14:04:28, so during that page load new connections waited up to
+about a second inside the provider before going direct. This is the shipped provider's
+behaviour today, before any observe-lane work.
+
 Remote ports: TCP 443 (4 998), UDP 53 (3 969), UDP 443 (1 517, QUIC attempts), TCP 80 (1 424),
 TCP 49152 + 62078 and UDP 3722 (Apple device pairing, 2 400+), UDP 123 (125).
 Interfaces: `en15` 76 %, `en15(bound)` 14 %, `en0(bound)` 6 %, `utun10/12(bound)` 2.6 %, `lo0` 1 flow.
@@ -175,9 +205,14 @@ resolvers (`name = example.com` on a `com.apple.curl` DNS datagram).
 
 `isSelf` dominates by three orders of magnitude and runs on **every** new flow on the Mac
 today, claimed or not, attached or not. The framework log shows the companion
-`com.apple.securityd … UNIX error exception: 2` line per flow. At the observed 60-flow
-second that is ~240 ms of serialized provider time; at the 28/s 10-s burst ~110 ms per
-second.
+`com.apple.securityd … UNIX error exception: 2` line per flow. It is **not cached per
+process**: the first flow of a pid costs p50 4.4 ms and later flows of the same pid p50
+4.1 ms (1 014 flows, 120 pids). The cost is per binary, not per call: per-pid medians range
+from 2.1 ms to 11.3 ms (a Chromium-sized bundle) for normal processes, and ≈125 µs for the
+ten pids whose `proc_pidpath_audittoken` also fails (the Security lookup fails fast; the
+securityd `ENOENT` line suggests an executable no longer at its path, inference). At the
+measured ≈200 flows/s ceiling the provider is CPU-bound in this call during any page load
+(R1, controlled bursts).
 
 ### R4. UDP `return false` on macOS 27 (item 8)
 
@@ -264,18 +299,25 @@ _Filled in after `restore.sh`._
 
 ## Carry into the spec
 
-1. **Queue (Part 3):** 2 048 drop-oldest entries hold 34 s of the worst observed second
-   (60/s) and 73 s of the worst 10-s burst (28/s). 1 024 would still hold 17 s / 36 s. Keep
-   2 048 or lower to 1 024; the writer's 2 s `SO_SNDTIMEO` is the binding constraint, not
-   memory (≈200 B × 2 048 ≈ 400 KiB).
-2. **Core soft cap (Part 4):** 5 000/s is ~80× the observed peak second; it only guards
-   against a pathological loop. 1 000/s would be ample on this evidence; either is fine.
+1. **Queue (Part 3): keep 2 048.** The worst burst measured (cold Chrome, theverge.com) is
+   1 243 flows in 8 s, peak 336/s; organic peaks are 60/s for a second and 28/s over 10 s.
+   2 048 drop-oldest entries hold the whole worst burst with room for a second one, and ≈6 s
+   of a sustained 336/s; 1 024 would already drop the tail of a heavy page load if the writer
+   stalled for 3 s. Memory is ≈400 KiB at ≈200 B/entry. The writer's 2 s `SO_SNDTIMEO` is the
+   binding constraint, not the queue.
+2. **Core soft cap (Part 4):** 5 000/s is 15× the worst observed arrival second (336/s) and
+   25× the provider's current handling ceiling (≈200/s); it only guards against a
+   pathological loop. 1 000/s would still be 3× the worst burst; either is fine. Size the
+   `ObserveStore` for ≈1 flow/s sustained (≈3 600/h, so 20 000 events ≈ 5–6 h of this day's
+   average, ≈1 h of the busiest hour with bursts).
 3. **`isSelf` must leave the per-flow hot path** (new requirement for the plan, not in the
-   spec): cache the verdict per source process, keyed by the audit token's
-   `(pid, pidversion)` (or the 20-byte `sourceAppUniqueIdentifier` cdhash), bounded LRU; and
-   skip it entirely while detached (nothing can be claimed, so a self flow and a foreign
-   flow get the same `false`). This cuts 4–12 ms of serialized provider time per new
-   connection on the Mac today.
+   spec): it is 3.9 ms median / 12 ms p99 per flow, uncached by the framework, and it caps
+   the provider at ≈200 flows/s, so a heavy page load queues connections for up to a second
+   inside the provider today. Cache the verdict per source process, keyed by the audit
+   token's `(pid, pidversion)` or the 20-byte `sourceAppUniqueIdentifier` cdhash, bounded
+   LRU; and skip it entirely while detached (nothing can be claimed, so a self flow and a
+   foreign flow get the same `false`). With that, `handleNewFlow` is ≈60 µs (`proc_pidpath`
+   + detached claim) and the ceiling moves to >10 000/s.
 4. **Observe-lane fields:** `sourceAppAuditToken` and the euid are always available, so the
    same-uid filter (Open question 4) is implementable as written; `remoteHostname` must stay
    optional (absent on 1/3 of TCP, 1/2 of UDP); `remoteFlowEndpoint` can be treated as

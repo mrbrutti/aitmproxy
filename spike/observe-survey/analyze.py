@@ -182,6 +182,30 @@ def survey(path):
     print("interface:", dict(Counter(r["iface"] for r in rows).most_common(8)))
     euids = Counter(r["euid"] for r in rows if r["tok"] == 1)
     print("euid distribution (token present):", dict(euids.most_common(10)))
+
+    import subprocess
+    names = {}
+    for u in sorted(euids):
+        try:
+            names[u] = subprocess.run(["id", "-nu", str(u)], capture_output=True, text=True, timeout=3).stdout.strip() or "?"
+        except Exception:
+            names[u] = "?"
+    print("euid names:", names)
+    seen = Counter()
+    first, later = [], []
+    for r in rows:
+        seen[r["pid"]] += 1
+        (first if seen[r["pid"]] == 1 else later).append(r["self_ns"])
+    print(f"isSelf first flow of a pid: n={len(first)} p50={pct(first, 50) / 1000:.0f}us p90={pct(first, 90) / 1000:.0f}us; later flows: n={len(later)} p50={pct(later, 50) / 1000:.0f}us p90={pct(later, 90) / 1000:.0f}us")
+    per = defaultdict(list)
+    for r in rows:
+        per[r["pid"]].append(r["self_ns"])
+    spread = sorted((pct(v, 50) / 1000, len(v)) for v in per.values() if len(v) >= 15)
+    print("per-pid isSelf medians (us, n) for pids with >=15 flows:", [(round(m), n) for m, n in spread])
+    print("pp_len==0 by euid:", dict(Counter(r["euid"] for r in rows if r["tok"] == 1 and r["pp_len"] <= 0)), "distinct pids:", len(set(r["pid"] for r in rows if r["tok"] == 1 and r["pp_len"] <= 0)))
+    print("pp_len==0 rows isSelf p50 (us):", pct([r["self_ns"] for r in rows if r["pp_len"] <= 0], 50) / 1000)
+    print("hostname set by kind+euid:", dict(Counter((r["k"], r["euid"], r["hn"] > 0) for r in rows).most_common(8)))
+    print("self flows by kind:", dict(Counter(r["k"] for r in rows if r["why"] == "self")))
     print("sid empty by euid:", dict(Counter(r["euid"] for r in rows if r["sid"] == 0 and r["tok"] == 1).most_common(6)))
     print("pp_len==0 (proc_pidpath_audittoken failed):", frac(sum(1 for r in rows if r["tok"] == 1 and r["pp_len"] <= 0)),
           "of token-present rows", sum(1 for r in rows if r["tok"] == 1))
