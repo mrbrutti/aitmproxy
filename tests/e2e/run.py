@@ -20,7 +20,7 @@ Usage:
             its own free ports so parallel runs don't collide. --manual forces 1.
   --build   cargo build -p aitm -p aitm-testtarget first (preflight). Without it,
             a missing aitm is fatal and a missing aitm-testtarget-serve warns.
-  --shared-core  boot ONE core + echo upstream and export AITM_BUS_ADDR /
+  --shared-core  boot ONE core + a seeded aitm-testtarget and export AITM_BUS_ADDR /
             AITM_BUS_TOKEN / AITM_BUS_OPERATOR_TOKEN / AITM_PROXY_ADDR /
             AITM_TARGET_URL so cells that connect to a runner-provided core (and
             otherwise skip) run against it. Cells isolate via per-connection labels.
@@ -136,19 +136,26 @@ def preflight(build: bool) -> None:
 
 
 def _boot_shared_core(child_env: dict):
-    """Boot ONE real core + echo upstream and export the AITM_BUS_* / AITM_PROXY_ADDR
-    / AITM_TARGET_URL env the shared-core cells read (they never boot their own; they
-    isolate via per-connection labels + unique markers). Returns an object with
-    .stop(). Scope is loopback-wide with agent-widen so cells reach their upstreams."""
+    """Boot ONE real core + a seeded aitm-testtarget and export the AITM_BUS_* /
+    AITM_PROXY_ADDR / AITM_TARGET_URL env the shared-core cells read (they never boot
+    their own core; they isolate via per-connection labels + unique markers). Returns
+    an object with .stop(). Scope is loopback-wide with agent-widen so cells reach
+    their own upstreams.
+
+    AITM_TARGET_URL is a real seeded aitm-testtarget (what every cell's runner
+    contract documents it as), not a bare echo: cells that exercise real routes
+    (POST /comments -> 302, GET /comments listing, /search reflection) need it, and
+    echo-only cells boot their own aitm_e2e.upstream.Upstream regardless."""
     sys.path.insert(0, E2E_DIR)
+    sys.path.insert(0, os.path.join(E2E_DIR, "lib"))
     from aitm_e2e import free_port  # noqa: E402
     from aitm_e2e.config import CoreConfig  # noqa: E402
     from aitm_e2e.core import Aitm  # noqa: E402
-    from aitm_e2e.upstream import Upstream  # noqa: E402
+    from seeded import TestTarget  # noqa: E402
 
-    up = Upstream().start()
+    target = TestTarget("vulnerable")
     cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
-                     scope_entries=["127.0.0.1", up.authority],
+                     scope_entries=["127.0.0.1", target.host()],
                      allow_agent_widen=True, ssl_insecure=True)
     core = Aitm.server(cfg)
     host, port = core.bus_addr
@@ -156,14 +163,14 @@ def _boot_shared_core(child_env: dict):
     child_env["AITM_BUS_TOKEN"] = cfg.agent_token
     child_env["AITM_BUS_OPERATOR_TOKEN"] = cfg.operator_token
     child_env["AITM_PROXY_ADDR"] = f"127.0.0.1:{cfg.proxy_port}"
-    child_env["AITM_TARGET_URL"] = up.base + "/echo"
+    child_env["AITM_TARGET_URL"] = target.base_url
     print(f"shared-core: bus {host}:{port}, proxy 127.0.0.1:{cfg.proxy_port}, "
-          f"target {up.base}/echo", flush=True)
+          f"target {target.base_url} (seeded aitm-testtarget)", flush=True)
 
     class _Shared:
         def stop(self):
             core.stop()
-            up.stop()
+            target.stop()
 
     return _Shared()
 
