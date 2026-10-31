@@ -247,6 +247,7 @@ async fn start_bus(tag: &str) -> BusServer {
         mcp,
         agent_token: AGENT_TOKEN.to_owned(),
         operator_token: Some(OPERATOR_TOKEN.to_owned()),
+        bad_token_throttle: Default::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
