@@ -27,6 +27,9 @@ extension SelfTest {
             print("tools/list: \(names.joined(separator: " "))")
             check("tools/list has flow.intercept, flow.list, flow.get, request.send, scope.add",
                   ["flow.intercept", "flow.list", "flow.get", "request.send", "scope.add"].allSatisfy(names.contains))
+            // A core shared with an earlier run may still be paused (F7 below pauses it):
+            // paused, it hides every new flow and request.send would never show up.
+            await resumeCapture(session)
 
             // scope.add through the actions seam; scope.list refreshes.
             session.addScope(upstream)
@@ -141,7 +144,8 @@ extension SelfTest {
                 let outcome = entry.map { $0.result == .ok ? "ok" : $0.result.text + (names.contains(name) ? "" : ", not on the bus yet") } ?? "not recorded"
                 check("\(name) reaches the bus and is recorded (\(outcome))", entry != nil, session.lastError ?? "")
             }
-            if !session.capturing { session.setCapturing(true) }
+            // Leave the core capturing for the next run, and only quit once that landed.
+            await resumeCapture(session)
 
             let recorded = session.activity.entries.filter { $0.origin == .operator }.count
             check("every action is in the activity log (\(recorded) operator entries)", recorded >= 11)
@@ -190,6 +194,14 @@ extension SelfTest {
         } catch {
             return nil
         }
+    }
+
+    /// `proxy.resume`, awaited: the app's `capturing` flag is client-side and the
+    /// run must not depend on what the previous one left on the core.
+    private static func resumeCapture(_ session: Session) async {
+        let resumes = session.activity.entries.filter { $0.command == "proxy.resume" }.count
+        session.setCapturing(true)
+        await settle { session.activity.entries.filter { $0.command == "proxy.resume" }.count > resumes }
     }
 
     private static func finishLive() {
