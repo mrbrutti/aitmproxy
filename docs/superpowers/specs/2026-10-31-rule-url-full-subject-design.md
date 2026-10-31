@@ -31,7 +31,7 @@ working, and pins the preview to the core's answers.
 ## Non-goals
 
 - A rule-preview verb on the bus. The macOS Kit keeps its own Swift matcher; a
-  shared fixture pins it to the core instead.
+  shared case table pins it to the core instead.
 - A web or TUI rule editor. The web "Rules…" button stays disabled and the TUI
   sends only `{enabled}`; neither previews a rule today, so there is nothing
   to align there. Both were checked.
@@ -47,7 +47,7 @@ working, and pins the preview to the core's answers.
 - A second matcher. Intercept, Map and WS rules must keep answering the one
   `CompiledRule::matches` question.
 - A rule that matches in a preview and not in the core, or the reverse, for
-  any case in the shared fixture.
+  any case in the shared case table.
 - A path-only pattern that stops matching after the change.
 
 ## Constraints
@@ -125,7 +125,7 @@ clauses never match them (unchanged). L4 flows do not pass through
 - `aitmproxy-plugin/skills/aitmproxy-intercept-mutate/SKILL.md` and
   `site/docs.html` say the pattern is matched against the full URL and the
   path.
-- One fixture, `crates/aitm-rules/tests/fixtures/url-match-cases.json`, lists
+- One case table (literal matcher cases, not sample data), `crates/aitm-rules/tests/cases/url-match-cases.json`, lists
   `(kind, pattern, scheme, authority, path, query?, expect)` cases. The Rust
   test `crates/aitm-rules/tests/url_match_cases.rs` and the Swift test
   `apps/mac/Tests/AitmproxyKitTests/BreakpointRuleCasesTests.swift` both read
@@ -139,7 +139,7 @@ clauses never match them (unchanged). L4 flows do not pass through
 wildcard and keeps the substring rule for a star-less pattern and the
 lowercase comparison. The regex branch keeps `.caseInsensitive`. The ICU and
 Rust regex dialects differ at the edges (lookaround, named classes); the core
-is authoritative and the shared fixture uses only syntax both accept.
+is authoritative and the shared case table uses only syntax both accept.
 
 ### What does not change
 
@@ -177,7 +177,7 @@ inherit the new `url` semantics through `CompiledRule::matches`.
 10. **AC10 invalid regex still rejected.** `compile` of `{regex:"[bad"}`
     returns `RuleError::BadRegex`; `a{1000}{1000}{100}` is still rejected
     under the size cap with case-insensitivity on.
-11. **AC11 shared fixture.** `url-match-cases.json` holds every AC1–AC8 case
+11. **AC11 shared case table.** `url-match-cases.json` holds every AC1–AC8 case
     (`url`-clause only; AC9 needs a `host` clause the Kit rule has no field
     for, so it is Rust-only); the Rust and Swift tests both read the file and
     every case passes on both sides.

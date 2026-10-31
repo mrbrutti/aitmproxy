@@ -6,10 +6,10 @@
 
 ## Overview
 
-Task 1 changes the one matcher and lands the shared fixture; it runs first and
+Task 1 changes the one matcher and lands the shared case table; it runs first and
 alone. Tasks 2, 3 and 4 then fan out in parallel on disjoint files: Task 2 is
 the Rust contract (plugin schema text, plugin-level and MCP-level tests), Task 3
-is the macOS Kit preview pinned to the fixture, Task 4 is the real-core e2e
+is the macOS Kit preview pinned to the case table, Task 4 is the real-core e2e
 cell plus the operator docs. The Rust gate runs after every task; the Swift
 tests and the e2e cell run in the Terminal panel (SwiftPM and port binding are
 not available in the sandbox). Coders do not commit: four writers share one
@@ -22,7 +22,7 @@ report is in.
 
 - **Satisfies:** AC1–AC11 (Rust side), AC15 (module docs)
 - **Depends on:** none
-- **Files:** `crates/aitm-rules/src/lib.rs` (modify), `crates/aitm-rules/Cargo.toml` (modify: add `serde_json = "1"` under a new `[dev-dependencies]` section), `crates/aitm-rules/tests/matches.rs` (modify), `crates/aitm-rules/tests/fixtures/url-match-cases.json` (create), `crates/aitm-rules/tests/url_match_cases.rs` (create)
+- **Files:** `crates/aitm-rules/src/lib.rs` (modify), `crates/aitm-rules/Cargo.toml` (modify: add `serde_json = "1"` under a new `[dev-dependencies]` section), `crates/aitm-rules/tests/matches.rs` (modify), `crates/aitm-rules/tests/cases/url-match-cases.json` (create), `crates/aitm-rules/tests/url_match_cases.rs` (create)
 - **Change:**
   - Module docs: replace the "URL match subject" section with the spec's
     subject, wildcard and regex rules (full URL `scheme://authority path`,
@@ -39,7 +39,7 @@ report is in.
   - `CompiledRule::matches`: for the `url` clause build
     `format!("{}://{}{}", req.scheme, req.authority, req.path)` once and match
     `url.is_match(&full) || url.is_match(&req.path)`. No `aitm-core` change.
-  - Fixture `url-match-cases.json`:
+  - Case table `url-match-cases.json` (literal matcher cases, not sample data):
     ```json
     { "about": "One case per line. Read by crates/aitm-rules/tests/url_match_cases.rs and apps/mac/Tests/AitmproxyKitTests/BreakpointRuleCasesTests.swift; both must agree.",
       "cases": [
@@ -70,8 +70,8 @@ report is in.
     `path` is the path alone; an optional `query` (no `?`) is joined as
     `path?query` into `HttpRequest.path` on the Rust side and passed as
     `FlowRow.query` on the Swift side.
-  - `tests/url_match_cases.rs`: read the fixture with `serde_json`
-    (`include_str!("fixtures/url-match-cases.json")`), build a `GET` HTTP flow
+  - `tests/url_match_cases.rs`: read the case table with `serde_json`
+    (`include_str!("cases/url-match-cases.json")`), build a `GET` HTTP flow
     per case, `compile` a request-phase rule with the `url` clause, and
     assert `matches(..) == expect` for every case, reporting the failing case's
     `ac`, `pattern` and URL in the panic message. Fail if `cases` is empty.
@@ -81,14 +81,14 @@ report is in.
     matches `GET http://httpbin.org/get`, not `/post`) and AC10's size-cap
     check under case-insensitivity (the existing `oversized_regex_rejected`
     stays and must still reject).
-- **Test:** `cargo test -p aitm-rules` → `url_match_cases::every_fixture_case_agrees_with_the_core` (or the name the coder picks) fails on the current matcher at the first AC1 case and passes after the change; the 15 existing tests stay green.
+- **Test:** `cargo test -p aitm-rules` → `url_match_cases::every_case_agrees_with_the_core` fails on the current matcher at the first AC1 case and passes after the change; the 15 existing tests stay green.
 - **Done when:** both test files pass and the full gate passes.
 
 ### Task 2: `flow.intercept` contract — schema text, plugin-level and MCP-level tests
 
 - **Satisfies:** AC12, AC13, AC15 (schema description)
 - **Depends on:** Task 1
-- **Files:** `crates/aitm-plugins/src/intercept.rs` (modify: the `url` entry of `rule_param_fields` only), `crates/aitm-plugins/tests/intercept_rules.rs` (modify), `crates/aitm/tests/intercept_url_rules_mcp.rs` (create)
+- **Files:** `crates/aitm-plugins/src/intercept.rs` (modify: the `url` entry of `rule_param_fields` only), `crates/aitm-plugins/tests/intercept_rules.rs` (modify), `crates/aitm/tests/intercept_url_rules_mcp.rs` (create), `crates/aitm-plugin-wsctl/src/lib.rs` (modify: the one-line `url` field description in the `ws.intercept` rule schema only), `crates/aitm-plugin-maprules/src/lib.rs` (modify: the `condition` param description of `map.add` only, which today says "Matches the request target path and authority" and is now wrong)
 - **Change:**
   - `rule_param_fields()` `url` description becomes, in substance: "URL
     match against the full request URL (scheme://host[:port]/path?query) and
@@ -96,7 +96,7 @@ report is in.
     other characters literal, case-insensitive; without * it matches as a
     substring), or {wildcard} / {regex} (regex is searched, case-insensitive
     by default, (?-i) restores case)." The `frontends.rs` operator schema
-    snapshot does not cover `flow.intercept`, so no fixture update is due;
+    snapshot does not cover `flow.intercept`, so no snapshot update is due;
     confirm by running `cargo test -p aitm frontends`.
   - `intercept_rules.rs`: add `host_bearing_rule_parks_matching_host`
     (AC12): arm `{url:"*ex.test*", phase:"request"}`; a flow
@@ -125,7 +125,7 @@ report is in.
 ### Task 3: macOS Kit preview agrees with the core
 
 - **Satisfies:** AC11 (Swift side), AC7 and AC6 as the preview sees them
-- **Depends on:** Task 1 (the fixture file)
+- **Depends on:** Task 1 (the case table)
 - **Files:** `apps/mac/Sources/AitmproxyKit/BreakpointRules.swift` (modify: `matches(_:)` and `wildcardMatches(pattern:text:)` and their doc comments only; `arguments`, `validationError` and the types stay as they are), `apps/mac/Tests/AitmproxyKitTests/BreakpointRulesTests.swift` (modify), `apps/mac/Tests/AitmproxyKitTests/BreakpointRuleCasesTests.swift` (create)
 - **Change:**
   - `matches(_ row: FlowRow)`: subjects are `row.url` and
@@ -138,9 +138,9 @@ report is in.
     matches as a substring. Mirrors `crates/aitm-rules` (the core is
     authoritative; `url-match-cases.json` pins both)."
   - Regex branch keeps `.caseInsensitive`.
-  - `BreakpointRuleCasesTests.swift`: locate the fixture from `#filePath`
+  - `BreakpointRuleCasesTests.swift`: locate the case table from `#filePath`
     (five `deletingLastPathComponent()` to the repo root, then
-    `crates/aitm-rules/tests/fixtures/url-match-cases.json`), decode
+    `crates/aitm-rules/tests/cases/url-match-cases.json`), decode
     `{cases: [{ac, kind, pattern, scheme, authority, path, query?, expect}]}`,
     build a `FlowRow(id: FlowID("case-N"), seq: N, method: .get, scheme:, authority:, path:, query:)`
     per case, a `BreakpointRule(url: pattern, matching: kind == "regex" ? .regex : .wildcard)`,
@@ -151,7 +151,7 @@ report is in.
     is now `false`; add `wildcardMatches(pattern: "*/search?q=*", text: "https://h/search?q=1")` is `true`);
     every other expectation stays (login `[50]`, substring `[45, 46]`, posts
     `[44, 50]`, regex `[51, 53]`, `*shop-staging*` count `13`).
-- **Test:** in the Terminal panel, `cd apps/mac && swift test --scratch-path ~/Library/Developer/Aitmproxy/test-build --filter BreakpointRule` → `BreakpointRuleCasesTests` fails on the current `matches` (the `/api/*` and AC8 cases) and passes after; `BreakpointRulesTests` green.
+- **Test:** in the Terminal panel, `cd apps/mac && swift test --scratch-path ~/Library/Developer/Aitmproxy/test-build --filter BreakpointRule` → `BreakpointRuleCasesTests` fails on the current `matches` (the `/api/*` and `^/v[0-9]+/users$` path-anchored cases and the AC7 `*/search?q=*` negative, where `?` matched the `X`) and passes after; `BreakpointRulesTests` green.
 - **Done when:** both Swift suites pass in the Terminal (the sandbox cannot run SwiftPM; the coder writes the code and the orchestrating session runs the tests and feeds back any failure).
 
 ### Task 4: real-core e2e cell and operator docs
