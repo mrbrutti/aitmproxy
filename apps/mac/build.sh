@@ -136,7 +136,7 @@ stage_catalogue() {
     if [[ -d "$cand" && ! -L "$cand" ]]; then src=$cand; break; fi
   done
   if [[ -z "$src" ]]; then
-    echo "build failed: no detection catalogue to bundle (looked in: ${looked[*]}); $hint" >&2
+    print -r -- "build failed: no detection catalogue to bundle (looked in: ${looked[*]}); $hint" >&2
     exit 1
   fi
   mkdir -p "$dest"
@@ -149,22 +149,24 @@ stage_catalogue() {
   find "$dest" -type d -name '.claude' -prune -exec rm -rf {} +
   # Only regular files ship in the sealed bundle: cp -R carries symlinks and special
   # files over as they are, and the app signature must not seal them.
+  # Each find checks its own status (print -r: paths are printed raw, never as
+  # escapes), so an errored listing names the step instead of dying under set -e.
   local special
-  special=$(find "$dest" ! -type f ! -type d -print -quit)
+  special=$(find "$dest" ! -type f ! -type d -print -quit) || { print -r -- "build failed: listing $dest failed (find exited non-zero)" >&2; exit 1; }
   if [[ -n "$special" ]]; then
-    echo "build failed: the detection catalogue contains symlinks or special files ($special); only regular files ship in the bundle" >&2
+    print -r -- "build failed: the detection catalogue contains symlinks or special files ($special); only regular files ship in the bundle" >&2
     exit 1
   fi
   # Files 0644, dirs 0755: readable AND traversable by the core, never executable.
   find "$dest" -type f -exec chmod 644 {} +
   find "$dest" -type d -exec chmod 755 {} +
   local n
-  n=$(find "$dest" -type f -name '*.rhai' | wc -l | tr -d ' ')
+  n=$(find "$dest" -type f -name '*.rhai' | wc -l | tr -d ' ') || { print -r -- "build failed: listing $dest failed (find exited non-zero)" >&2; exit 1; }
   if (( n == 0 )); then
-    echo "build failed: $src holds no *.rhai, so the app would ship with no default detections; $hint" >&2
+    print -r -- "build failed: $src holds no *.rhai, so the app would ship with no default detections; $hint" >&2
     exit 1
   fi
-  echo "bundled detection catalogue: $n scripts from $src -> $dest"
+  print -r -- "bundled detection catalogue: $n scripts from $src -> $dest"
 }
 coredir="$app/Contents/Resources/core"
 target=$(rustc -vV 2>/dev/null | sed -n 's/host: //p')

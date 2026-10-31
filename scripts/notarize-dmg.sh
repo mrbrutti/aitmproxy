@@ -101,11 +101,11 @@ if [ -d "$catalogue" ]; then
     # Both finds check their own status, like the nested-code find below: under
     # pipefail an errored find would otherwise end the script through set -e with
     # no line naming the cause or the fix.
-    rhai_count=$(find "$catalogue" -type f -name '*.rhai' | wc -l | tr -d ' ') || { echo "notarize-dmg.sh: listing the detection catalogue in $catalogue failed (find exited non-zero)" >&2; exit 1; }
+    rhai_count=$(find "$catalogue" -type f -name '*.rhai' | wc -l | tr -d ' ') || { echo "notarize-dmg.sh: listing the detection catalogue in $catalogue failed while counting *.rhai (find exited non-zero)" >&2; exit 1; }
     # Only regular files and directories ship in the sealed bundle: a symlink or a
     # special file in the catalogue is not something the signature should seal
     # (build.sh refuses to stage one; the core's loader never follows symlinks).
-    special=$(find "$catalogue" ! -type f ! -type d -print -quit) || { echo "notarize-dmg.sh: listing the detection catalogue in $catalogue failed (find exited non-zero)" >&2; exit 1; }
+    special=$(find "$catalogue" ! -type f ! -type d -print -quit) || { echo "notarize-dmg.sh: listing the detection catalogue in $catalogue failed while scanning for symlinks or special files (find exited non-zero)" >&2; exit 1; }
 fi
 [ "$rhai_count" -gt 0 ] || { echo "notarize-dmg.sh: $app has no bundled detection catalogue ($catalogue holds no *.rhai). Run scripts/package.sh then apps/mac/build.sh so the catalogue is bundled beside the core, then re-run." >&2; exit 1; }
 [ -z "$special" ] || { echo "notarize-dmg.sh: $catalogue contains a symlink or special file ($special); only regular files ship in the bundle. Re-run apps/mac/build.sh from a clean catalogue (it refuses to stage one like this), then re-run." >&2; exit 1; }

@@ -121,7 +121,7 @@ EOF
 # status like find has after a read error. It still lists everything it could read, so a script
 # that ignores the status carries on with a partial list and leaves the rest of the nested code
 # unsigned. Scoped by root, like FAKE_FAIL_SIGN is by path: the script runs several finds (the
-# catalogue count, then the nested code), and failing them all would stop it at the first one,
+# catalogue count and its symlink scan, then the nested code), and failing them all would stop it at the first one,
 # whichever a case meant to test.
 cat >"$stub/bin/find" <<'EOF'
 #!/usr/bin/env bash
@@ -452,7 +452,7 @@ ln -s fixture.rhai "$catalogue/http/link.rhai"
 run_case
 rc_nonzero_not_dmg "an app whose catalogue contains a symlink"
 expect_not "nothing is signed for an app with a symlink in its catalogue" called "--sign"
-said "the failure names symlinks/special files" "symlink"
+said "the failure names symlinks/special files" "contains a symlink or special file"
 
 echo "--- case 5e: no app"
 mk_case no-app plain
