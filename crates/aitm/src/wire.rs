@@ -13,6 +13,7 @@
 //! with no `aitm-core` edit (AC-P3). The scope and rate limits come from `Config`,
 //! so a config change moves the observed throttle threshold (AC-P4).
 
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use aitm_browser::BrowserPlugin;
@@ -36,6 +37,11 @@ use aitm_proto_l4::guard::L4Guard;
 use aitm_proto_l4::{L4Module, L4Privilege};
 use aitm_proto_ws::{InjectRegistry, WsModule};
 use tracing::{info, warn};
+
+use crate::ingress::CoreIngress;
+use crate::macos_capture::config::MacosCaptureConfig;
+use crate::macos_capture::feeder::CaptureSession;
+use crate::macos_capture::peer_auth::PeerVerifier;
 
 /// Which removable first-party feature plugins to register. Dropping one here is
 /// the whole of AC-P3: the command disappears from the registry with no core edit.
@@ -64,7 +70,7 @@ pub struct Features {
     /// The macOS NE live-capture feeder config. Opt-in and deny-by-default:
     /// `enabled` is false by default, so the default feature set never binds the
     /// capture listener. The feeder runs only when `enabled` and the build is macOS.
-    pub macos_capture: crate::macos_capture::config::MacosCaptureConfig,
+    pub macos_capture: MacosCaptureConfig,
 }
 
 /// A shared L4 guard + flow store, built once by the binary and threaded into both
@@ -85,7 +91,7 @@ impl Default for Features {
             l4: L4Config::default(),
             l4_privilege: None,
             l4_shared: None,
-            macos_capture: crate::macos_capture::config::MacosCaptureConfig::default(),
+            macos_capture: MacosCaptureConfig::default(),
         }
     }
 }
@@ -119,7 +125,14 @@ pub struct Assembled {
     /// dispatched, and dialled exactly as a proxied one, and an ingress-fed L4 packet is
     /// guarded by the *same* `L4Guard` and lands in the *same* `L4FlowStore` the operator
     /// reads via `l4.flow.*`. The boundary assumes no single protocol or backend.
-    pub l4_ingress: Option<crate::ingress::CoreIngress>,
+    pub l4_ingress: Option<CoreIngress>,
+    /// The live L4 guard — a clone of the one the `l4.*` command module owns — `Some`
+    /// iff `features.l4.enabled`, else `None`. The macOS capture feeder reads its scope
+    /// (to build the provider's scope spec) from this exact guard, so the provider is
+    /// pre-filtered by the same L4 engagement state the operator mutates, never a
+    /// divergent copy. Read-only use: the feeder only lists scope here; every
+    /// authorization still goes through the ingress's own `L4Guard::check`.
+    pub l4_guard: Option<Arc<L4Guard>>,
 }
 
 /// The scripting tier, ready to take its place in the chain (M3 spec §8).
@@ -339,9 +352,10 @@ pub fn assemble_with_scripts(
     // L4/UDP is enabled. The L4/UDP half is added only when L4 is enabled, bound to the
     // module's own guard + store so an ingress-fed packet is guarded identically to a
     // pcap-fed one and lands where `l4.flow.*` reads.
+    let l4_guard = l4_half.as_ref().map(|(guard, _)| guard.clone());
     let ingress = match l4_half {
-        Some((guard, store)) => crate::ingress::CoreIngress::with_l4(guard, store),
-        None => crate::ingress::CoreIngress::empty(),
+        Some((guard, store)) => CoreIngress::with_l4(guard, store),
+        None => CoreIngress::empty(),
     };
     let l4_ingress = Some(ingress.with_stream(
         proxy.modules(),
@@ -359,7 +373,33 @@ pub fn assemble_with_scripts(
         push_tx,
         audit_ring,
         l4_ingress,
+        l4_guard,
     })
+}
+
+/// Build the macOS NE live-capture session, or `None` when it is not switched on.
+///
+/// `Some` only when `features.macos_capture.enabled` — the deny-by-default
+/// on-switch, which only the operator's config file can flip (there is no bus,
+/// MCP, or script path to this function; see `no_agent_path_to_capture_session`).
+/// Building is pure: nothing binds and no file is written until the caller drives
+/// [`CaptureSession::run`], so the disabled path costs nothing and is testable in a
+/// sandbox. `ingress`, `l7_guard` and `l4_guard` are the assembled proxy's own
+/// ([`Assembled::l4_ingress`], `Proxy::guard`, [`Assembled::l4_guard`]), so a
+/// captured flow is gated by exactly the guards a proxied one is.
+#[must_use]
+pub fn build_capture_session(
+    features: &Features,
+    ingress: CoreIngress,
+    l7_guard: Arc<dyn ScopeRateGuard>,
+    l4_guard: Option<Arc<L4Guard>>,
+    verifier: Arc<dyn PeerVerifier>,
+    socket_dir: PathBuf,
+) -> Option<CaptureSession> {
+    features
+        .macos_capture
+        .enabled
+        .then(|| CaptureSession::new(Arc::new(ingress), l7_guard, l4_guard, verifier, socket_dir))
 }
 
 /// The protocol modules in registration order. [`PassthroughModule`] is **first**
@@ -484,6 +524,7 @@ pub use aitm_proto_http::Http1Sender;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::macos_capture::peer_auth::CodeSignatureVerifier;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::SystemTime;
 
@@ -522,6 +563,155 @@ mod tests {
             ingress.dispatch_tcp(flow).await,
             crate::ingress::StreamOutcome::Refused,
             "empty scope means out of scope: refused before any dial, no network"
+        );
+    }
+
+    /// Features with only the `macos_capture` switch set.
+    fn capture_features(enabled: bool) -> Features {
+        Features {
+            macos_capture: MacosCaptureConfig {
+                enabled,
+                ..MacosCaptureConfig::default()
+            },
+            ..Features::default()
+        }
+    }
+
+    /// `build_capture_session` over inert parts: nothing here binds or runs, because
+    /// building a session is pure and only `run` touches a socket.
+    fn build_with(features: &Features) -> Option<CaptureSession> {
+        build_capture_session(
+            features,
+            crate::ingress::CoreIngress::empty(),
+            Arc::new(LateGuard::default()),
+            None,
+            Arc::new(CodeSignatureVerifier::default()),
+            std::path::PathBuf::from("/nonexistent-wire-test-dir"),
+        )
+    }
+
+    /// LF-AC1: with `macos_capture.enabled = false` (the default) no capture session
+    /// is built, so nothing can bind a listener or publish a rendezvous file.
+    #[test]
+    fn capture_session_absent_when_disabled() {
+        assert!(build_with(&capture_features(false)).is_none());
+        assert!(
+            build_with(&Features::default()).is_none(),
+            "the default feature set is deny-by-default"
+        );
+    }
+
+    /// The config switch is the one thing that builds a session.
+    #[test]
+    fn capture_session_present_when_enabled() {
+        assert!(build_with(&capture_features(true)).is_some());
+    }
+
+    /// `Assembled.l4_guard` is `Some` exactly when L4 is enabled, and it is the
+    /// module's own guard, not a fresh one: the feeder must scope the provider from
+    /// the same L4 engagement state the operator mutates.
+    #[test]
+    fn l4_guard_tracks_l4_enabled() {
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("l4-guard-on");
+        let shared = L4Shared {
+            guard: Arc::new(L4Guard::new(&L4Config {
+                enabled: true,
+                ..L4Config::default()
+            })),
+            store: Arc::new(aitm_proto_l4::flow::InMemoryL4FlowStore::new()),
+        };
+        let enabled = Features {
+            l4: L4Config {
+                enabled: true,
+                ..L4Config::default()
+            },
+            l4_privilege: Some(L4Privilege::available()),
+            l4_shared: Some(shared.clone()),
+            ..Features::default()
+        };
+        let assembled = assemble_with(&cfg, &enabled).expect("assemble with l4 enabled");
+        let guard = assembled
+            .l4_guard
+            .expect("l4 enabled exposes the l4 guard for the capture feeder");
+        assert!(
+            Arc::ptr_eq(&guard, &shared.guard),
+            "the exposed guard is the shared module guard, not a second instance"
+        );
+
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("l4-guard-off");
+        let disabled = assemble_with(&cfg, &Features::default()).expect("assemble, l4 disabled");
+        assert!(disabled.l4_guard.is_none());
+    }
+
+    /// Every `*.rs` file under `dir`, recursively.
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {dir:?}: {e}")) {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// LF-AC12 (structural): the capture feeder has no agent path. The only way to
+    /// build or start a `CaptureSession` is the config-driven startup in `main.rs`
+    /// (through `wire.rs`); no bus, MCP, CLI, session, or script command source in
+    /// the workspace names either symbol. A tripwire, like
+    /// `one_choke_point_survives_ingress`, over the type-level fact that no other
+    /// crate depends on `aitm`.
+    #[test]
+    fn no_agent_path_to_capture_session() {
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates dir");
+        let aitm_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = Vec::new();
+        for krate in std::fs::read_dir(crates).expect("read crates dir") {
+            let src = krate.expect("crate entry").path().join("src");
+            if src.is_dir() {
+                rust_sources(&src, &mut sources);
+            }
+        }
+
+        // The tripwire must actually be looking at the agent-reachable surfaces.
+        for must_scan in [
+            "aitm-mcp/src/server.rs",
+            "aitm-plugins/src/scope.rs",
+            "aitm-plugin-sessionio/src/lib.rs",
+            "aitm-cli/src/dispatch.rs",
+            "aitm/src/web/bridge.rs",
+            "aitm/src/tui.rs",
+        ] {
+            assert!(
+                sources.iter().any(|p| p.ends_with(must_scan)),
+                "{must_scan} must be among the scanned sources"
+            );
+        }
+
+        let mut offenders = Vec::new();
+        for path in &sources {
+            let allowed = path == &aitm_src.join("main.rs")
+                || path == &aitm_src.join("wire.rs")
+                || path.starts_with(aitm_src.join("macos_capture"));
+            if allowed {
+                continue;
+            }
+            let text = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            for symbol in ["build_capture_session(", "CaptureSession::"] {
+                if text.contains(symbol) {
+                    offenders.push(format!("{} names `{symbol}`", path.display()));
+                }
+            }
+        }
+        assert_eq!(
+            offenders,
+            Vec::<String>::new(),
+            "only the config-driven startup may build or run the capture session"
         );
     }
 }

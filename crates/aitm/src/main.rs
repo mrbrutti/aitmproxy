@@ -20,11 +20,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aitm::config_file::Settings;
+use aitm::macos_capture::feeder;
+use aitm::macos_capture::peer_auth::CodeSignatureVerifier;
 use aitm::render::render_cli_value;
 use aitm::scripts::LateHandles;
 use aitm::tui::TuiLog;
 use aitm::web::{self, WebArgs, WebCommand, WebState};
-use aitm::wire::{assemble_with_scripts, Assembled, Features, ScriptWiring};
+use aitm::wire::{assemble_with_scripts, build_capture_session, Assembled, Features, ScriptWiring};
 use aitm::{config_file, env, operator_token, tui};
 use aitm_core::{engine_may_reach_private, BrowserDriver, Chain, McpTransport, Plugin};
 use aitm_findings::FindingsPlugin;
@@ -154,8 +156,7 @@ async fn run() -> anyhow::Result<()> {
         core: mut cfg,
         rhai: mut rhai_cfg,
         mut l4,
-        // `macos_capture` is consumed by Task 5's runtime wiring; ignore it here until then.
-        ..
+        macos_capture,
     } = config_file::load_settings(config_path.as_deref())?;
     env::apply(&mut cfg, |k| std::env::var(k).ok());
     env::apply_rhai(&mut rhai_cfg, |k| std::env::var(k).ok());
@@ -256,6 +257,14 @@ async fn run() -> anyhow::Result<()> {
         );
     }
 
+    // Built once, outside the call, so the same value both assembles the proxy and
+    // tells `build_capture_session` below whether the macOS capture feeder is on.
+    let features = Features {
+        l4,
+        l4_shared,
+        macos_capture,
+        ..Features::default()
+    };
     let Assembled {
         proxy,
         ca,
@@ -263,17 +272,16 @@ async fn run() -> anyhow::Result<()> {
         agent_state,
         push_tx,
         audit_ring,
-        // The protocol-general capture ingress is bound to the live L4 module here but
-        // not fed in Phase 1 (the pcap capture path is `l4.capture.*`'s own; a backend
-        // that calls `accept` is Phase 2's macOS Network/System Extension).
-        l4_ingress: _,
+        // The protocol-general capture ingress and the live L4 guard feed the macOS
+        // Network/System Extension capture session below (macOS builds with
+        // `macos_capture.enabled` only). On every other build, or with it disabled
+        // (the default), they are dropped unused: the pcap capture path is
+        // `l4.capture.*`'s own and nothing calls `accept`.
+        l4_ingress,
+        l4_guard,
     } = assemble_with_scripts(
         &cfg,
-        &Features {
-            l4,
-            l4_shared,
-            ..Features::default()
-        },
+        &features,
         ScriptWiring {
             // One host plugin dispatches every script from a single chain
             // position; it carries the proxy's body cap to each script's
@@ -415,10 +423,45 @@ async fn run() -> anyhow::Result<()> {
         handles.bind_browser(driver);
     }
 
+    // The macOS Network/System Extension live-capture feeder: `Some` only on a macOS
+    // build with `macos_capture.enabled` (deny-by-default; the config file is the
+    // sole on-switch — no bus, MCP, or script path builds it). It feeds the proxy's
+    // own ingress and guards, and verifies the provider's code signature with the
+    // production requirement. Everywhere else the ingress is dropped, as before.
+    let capture_session = if cfg!(target_os = "macos") {
+        l4_ingress.and_then(|ingress| {
+            build_capture_session(
+                &features,
+                ingress,
+                proxy.guard(),
+                l4_guard,
+                Arc::new(CodeSignatureVerifier::default()),
+                PathBuf::from(feeder::DEFAULT_SOCKET_DIR),
+            )
+        })
+    } else {
+        None
+    };
+    // The feeder runs as an arm beside the proxy accept loops. It is fail-open: one
+    // that is off, cannot bind, or has stopped must never end the run, so this
+    // future never completes (`Infallible`) — only the accept loops, the frontends,
+    // or the shutdown signal end the `select!`. When another arm wins, dropping this
+    // future tears the session down: its rendezvous guard and sockets remove their
+    // files and its pumps see the stop.
+    let capture_run = async move {
+        if let Some(session) = capture_session {
+            session.run(aitm::shutdown_signal()).await;
+        }
+        std::future::pending::<std::convert::Infallible>().await
+    };
+
     // We are about to serve: `proxy.status.listening` now reports the truth.
     listening.store(true, std::sync::atomic::Ordering::Relaxed);
     let result = if mode == Mode::Tui {
-        tui::run(&cfg, &proxy, services, proxy_listener, browser_listener).await
+        tokio::select! {
+            result = tui::run(&cfg, &proxy, services, proxy_listener, browser_listener) => result,
+            never = capture_run => match never {},
+        }
     } else {
         // The bare-`aitm` server path is the dedicated agent entry point, so it
         // carries M4's operator/agent token classes, the shared agent policy
@@ -495,6 +538,7 @@ async fn run() -> anyhow::Result<()> {
             result = proxy.run_browser_on(browser_listener) => result,
             result = mcp.serve() => result,
             result = web_run => result,
+            never = capture_run => match never {},
             () = aitm::shutdown_signal() => {
                 info!("shutdown signal received");
                 Ok(())
