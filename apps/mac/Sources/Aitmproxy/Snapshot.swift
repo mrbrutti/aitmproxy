@@ -6,7 +6,7 @@ import SwiftUI
 ///   APP_STORE=/tmp/x APP_SNAPSHOT=/tmp/shots ~/Applications/Aitmproxy.app/Contents/MacOS/Aitmproxy
 /// writes <page>-light.png and <page>-dark.png for every sidebar page, and
 /// settings-<tab>-light.png and settings-<tab>-dark.png for every Settings tab, then quits.
-/// Settings ▸ Capture also writes settings-capture-<off|awaiting|active|failed>-<mode>.png.
+/// Settings ▸ Capture also writes settings-capture-<off|awaiting|active|failed|noscope>-<mode>.png.
 /// Each PNG gets a <page>-<mode>-layout.json with the grid probes (tools/check-layout.swift).
 /// APP_SNAPSHOT_PAGES=apps,scope limits the pages. Add "settings" to include Settings.
 /// Add APP_ACCENT=<id> to see the pages in another accent. Snapshots always show the fixture session.

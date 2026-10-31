@@ -41,6 +41,10 @@ enum SnapshotScene: String, CaseIterable {
     case inspectWebSocket = "inspect-websocket"
     case inspectL4 = "inspect-l4"
     case inspectL4OutOfScope = "inspect-l4-oos"
+    case appsNoAttribution = "apps-noattribution"
+
+    /// The fixture rows the `appsNoAttribution` scene strips of their client, restored by `reset`.
+    private static var savedRows: [FlowRow]?
 
     /// Task 8: a seeded embedded `CoreConnection` so the health dot and the
     /// core-log panel render without a live core (snapshots use fixtures).
@@ -85,6 +89,13 @@ enum SnapshotScene: String, CaseIterable {
                 m.body = Data("{\n  \"email\": \"ops@shop-staging.test\",\n  \"password\": \"' OR 1=1 --\",\n  \"remember\": true\n}".utf8)
                 session.updateDraft(id, m)
             }
+        case .appsNoAttribution:
+            // Live reality (NS-AC8): captured flows carry no source app, so the Apps page
+            // cannot group them. The table must stay, with the capture-state banner above it.
+            Self.savedRows = Self.savedRows ?? session.rows
+            session.rows = session.rows.map { var row = $0; row.client = nil; return row }
+            session.page = .apps
+            CaptureSnapshotState.noscope.apply(to: session)
         case .scopeSheet:
             session.scopeSheetVisible = true
         case .importDrop:
@@ -224,6 +235,11 @@ enum SnapshotScene: String, CaseIterable {
         session.coreLogVisible = false
         session.coreHealth.connection = nil
         session.coreHealth.log.removeAll()
+        if let rows = savedRows {
+            session.rows = rows
+            savedRows = nil
+            CaptureSnapshotState.reset(session)
+        }
         session.select(session.rows.first { $0.seq == 50 }?.id)
     }
 }
@@ -235,10 +251,13 @@ enum SnapshotScene: String, CaseIterable {
 /// through `captureChoice` instead of writing the operator's real preference.
 /// The raw value names the file: `settings-capture-<state>-<mode>.png`.
 enum CaptureSnapshotState: String, CaseIterable {
-    case off, awaiting, active, failed
+    case off, awaiting, active, failed, noscope
 
     func apply(to session: Session) {
         session.coreHealth.captureSupported = true
+        // Every state starts from the fixture scope; only `noscope` empties it, so a state
+        // never inherits the previous one's scope (the light pass must not leak into dark).
+        session.scopeHosts = Fixtures.scope
         switch self {
         case .off:
             session.coreHealth.captureCapability = .inactive
@@ -253,6 +272,11 @@ enum CaptureSnapshotState: String, CaseIterable {
             session.coreHealth.captureCapability = .degraded(
                 "Could not start the capture tunnel after 4 attempts: the proxy configuration was not allowed")
             session.coreHealth.captureChoice = true
+        case .noscope:
+            // The trap: capture on, scope empty, so nothing is captured. The tab must say so.
+            session.coreHealth.captureCapability = .capturing
+            session.coreHealth.captureChoice = true
+            session.scopeHosts = []
         }
     }
 
@@ -261,5 +285,6 @@ enum CaptureSnapshotState: String, CaseIterable {
         session.coreHealth.captureSupported = false
         session.coreHealth.captureCapability = .extensionNotInstalled
         session.coreHealth.captureChoice = nil
+        session.scopeHosts = Fixtures.scope
     }
 }

@@ -205,6 +205,12 @@ public struct FlowRow: Identifiable, Hashable, Sendable {
         return s
     }
 
+    /// Equality covers the fields a live row can change after it first appears, so the
+    /// table and SwiftUI redraw a row exactly when one of them moves. `client` is in the
+    /// set: the sidebar's Apps groups and the Apps page derive from it, and a row whose
+    /// client changes while everything else stays put (attribution arriving late, or the
+    /// `apps-noattribution` snapshot scene) must not compare equal to its old self —
+    /// SwiftUI skips the update for an equal value, and so does the table's own diff.
     public static func == (lhs: FlowRow, rhs: FlowRow) -> Bool {
         lhs.id == rhs.id && lhs.seq == rhs.seq && lhs.status == rhs.status && lhs.state == rhs.state
             && lhs.edited == rhs.edited && lhs.comment == rhs.comment && lhs.mark == rhs.mark
@@ -212,6 +218,7 @@ public struct FlowRow: Identifiable, Hashable, Sendable {
             && lhs.responseBytes == rhs.responseBytes
             && lhs.inScope == rhs.inScope && lhs.wsFrames?.sent == rhs.wsFrames?.sent
             && lhs.wsFrames?.received == rhs.wsFrames?.received && lhs.l4 == rhs.l4
+            && lhs.client == rhs.client
     }
 
     public func hash(into hasher: inout Hasher) {
