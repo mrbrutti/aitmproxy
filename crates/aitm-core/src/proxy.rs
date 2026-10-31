@@ -243,6 +243,10 @@ async fn handle_conn(
         alpn: Vec::new(),
         first_bytes: first.to_vec(),
         from_upgrade: false,
+        // The explicit-proxy path knows nothing about the client process or a
+        // capture backend: both stay `None` so a proxied flow reports null.
+        peer_identity: None,
+        capture_interface: None,
     };
 
     let Some(module) = inner.modules.iter().find(|m| m.matches(&hint)).cloned() else {

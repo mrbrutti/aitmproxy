@@ -179,7 +179,7 @@ async fn adapt_udp(
         if ingress.dispatch_udp(CapturedUdpFlow {
             target: target.clone(),
             datagrams: vec![datagram],
-            peer_identity: open.source_app.clone(),
+            peer_identity: bounded_source_app(open),
         }) == IngressOutcome::Captured
         {
             outcome = IngressOutcome::Captured;
@@ -190,16 +190,36 @@ async fn adapt_udp(
 
 /// Map a TCP [`FlowOpen`] and its sniffed stream onto the ingress's own
 /// [`CapturedTcpFlow`]: `remote → dst`, `remote_hostname → sni`,
-/// `source_app → peer_identity`. The destination is the **authoritative original**
-/// endpoint the provider observed, not an accepted-socket peer.
+/// `source_app → peer_identity`, and the flow is tagged with [`CAPTURE_INTERFACE`]
+/// so the stored flow can name the backend that delivered it. The destination is
+/// the **authoritative original** endpoint the provider observed, not an
+/// accepted-socket peer.
 fn tcp_flow(open: &FlowOpen, stream: ByteStream, first_bytes: Vec<u8>) -> CapturedTcpFlow {
     CapturedTcpFlow {
         stream,
         dst: open.remote,
         sni: open.remote_hostname.clone(),
         first_bytes,
-        peer_identity: open.source_app.clone(),
+        peer_identity: bounded_source_app(open),
+        interface: CAPTURE_INTERFACE.to_string(),
     }
+}
+
+/// Longest source-app identifier the core keeps. A signing identifier is chosen by
+/// whoever signed the binary, so it is backend-supplied text, not an attestation of
+/// honesty or size: the handoff frame alone bounds it at 1 MiB, and every stored flow
+/// clones it. Real bundle identifiers are a few dozen bytes; anything longer is treated
+/// as absent, the way an implausible `remote_hostname` is distrusted: it keeps a hostile
+/// local signer from bloating every stored flow clone through the 1 MiB frame.
+const MAX_SOURCE_APP_BYTES: usize = 256;
+
+/// The provider's `source_app`, or `None` when it is empty or longer than
+/// [`MAX_SOURCE_APP_BYTES`].
+fn bounded_source_app(open: &FlowOpen) -> Option<String> {
+    open.source_app
+        .as_deref()
+        .filter(|s| !s.is_empty() && s.len() <= MAX_SOURCE_APP_BYTES)
+        .map(str::to_string)
 }
 
 /// Build the L4 dispatch target the UDP guard authorizes against from a UDP
@@ -380,7 +400,8 @@ mod tests {
     }
 
     /// The TCP mapping carries the authoritative remote, the SNI, the source-app
-    /// identity (→ `peer_identity`), and the sniffed `first_bytes`.
+    /// identity (→ `peer_identity`), the sniffed `first_bytes`, and tags the flow
+    /// with the NE capture interface.
     #[test]
     fn tcp_flow_maps_every_handoff_field() {
         let open = tcp_open();
@@ -394,6 +415,42 @@ mod tests {
             "source_app maps onto peer_identity"
         );
         assert_eq!(flow.first_bytes, first);
+        assert_eq!(
+            flow.interface, CAPTURE_INTERFACE,
+            "the adapter, not the ingress, names the backend"
+        );
+    }
+
+    #[test]
+    fn an_oversized_or_empty_source_app_is_dropped_at_the_adapter() {
+        let mut open = tcp_open();
+        open.source_app = Some("x".repeat(MAX_SOURCE_APP_BYTES + 1));
+        assert_eq!(
+            bounded_source_app(&open),
+            None,
+            "longer than the cap is treated as absent"
+        );
+        open.source_app = Some("x".repeat(MAX_SOURCE_APP_BYTES));
+        assert_eq!(
+            bounded_source_app(&open).map(|s| s.len()),
+            Some(MAX_SOURCE_APP_BYTES),
+            "exactly the cap is kept"
+        );
+        open.source_app = Some(String::new());
+        assert_eq!(
+            bounded_source_app(&open),
+            None,
+            "an empty identifier is no app"
+        );
+        open.source_app = Some("com.apple.Safari".to_string());
+        assert_eq!(
+            bounded_source_app(&open).as_deref(),
+            Some("com.apple.Safari")
+        );
+        // Both callers go through the helper: the TCP flow and the UDP target.
+        open.source_app = Some("y".repeat(MAX_SOURCE_APP_BYTES + 1));
+        let flow = tcp_flow(&open, Box::pin(tokio::io::duplex(16).0), Vec::new());
+        assert_eq!(flow.peer_identity, None);
     }
 
     /// The UDP mapping tags the flow with the NE capture interface and the
