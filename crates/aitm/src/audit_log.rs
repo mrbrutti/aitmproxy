@@ -175,7 +175,6 @@ trait LogFile: Send {
     fn sync(&mut self) -> io::Result<()>;
     /// The file's device and inode, `None` where the platform has none (and for
     /// a fake), which skips the path re-check.
-    #[allow(dead_code)] // used from Task W9
     fn id(&self) -> Option<FileId>;
 }
 
@@ -521,12 +520,23 @@ pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
 /// that has to take its `Close`, a thread that has not finished yet).
 const POLL: Duration = Duration::from_millis(1);
 
-/// What a re-check of a stream's path found. Only the common answer exists
-/// until the re-check itself (Task W9) adds the others.
+/// What a re-check of a stream's path found when it compared the path with the
+/// file the stream holds open (spec Design 8). Without it the writer would keep
+/// appending to an unlinked inode and the lines would vanish silently.
 #[derive(Debug, PartialEq, Eq)]
 enum Recheck {
     /// The path still names the open file.
     Same,
+    /// Nothing is at the path, or its directory is gone: the operator removed
+    /// the file. The writer reopens at once.
+    Gone,
+    /// A different regular file is at the path (an external `logrotate` renamed
+    /// the open one). The writer reopens at once.
+    Replaced,
+    /// A symbolic link or a file that is not a regular file is at the path, or the
+    /// path cannot be inspected. The writer drops its handle and writes nothing;
+    /// the failed entries report this reason (the path is put in front of it).
+    Refused(String),
 }
 
 /// How a stream's thread reaches its file: open it, rotate it, and check that
@@ -552,8 +562,8 @@ trait Backend: Send {
         Err(io::ErrorKind::Unsupported.into())
     }
 
-    /// Whether `path` still names `file`. Always the same until Task W9.
-    #[allow(dead_code)] // used from Task W9
+    /// Whether `path` still names `file`. A backend with no path to compare (a
+    /// test double) keeps this default, which says it does.
     fn recheck(&mut self, path: &Path, file: &dyn LogFile) -> Recheck {
         let _ = (path, file);
         Recheck::Same
@@ -642,6 +652,40 @@ impl Backend for FsBackend {
         let file: Box<dyn LogFile> = Box::new(preflight(path, stream)?);
         Ok(file)
     }
+
+    /// Compares what is at `path` now, without following a link, with the open
+    /// `file` (spec Design 8). Nothing there, or no directory to hold it, is
+    /// [`Recheck::Gone`]; a symbolic link, a directory, a FIFO, a socket or a
+    /// device is refused, as is a path that cannot be inspected; a regular file
+    /// is the same file when its device and inode are the open file's and
+    /// [`Recheck::Replaced`] when they are not. A file with no identity (a test
+    /// double, or a platform without one) is taken to be the same. Nothing is
+    /// opened: a FIFO at the path cannot block the check.
+    fn recheck(&mut self, path: &Path, file: &dyn LogFile) -> Recheck {
+        let meta = match fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Recheck::Gone,
+            Err(source) => {
+                return Recheck::Refused(format!("cannot inspect the path: {source}"));
+            }
+        };
+        let kind = meta.file_type();
+        if kind.is_symlink() {
+            return Recheck::Refused(
+                "the path is now a symbolic link; the writer never writes through one".to_string(),
+            );
+        }
+        if !kind.is_file() {
+            return Recheck::Refused(
+                "the path is now not a regular file (a directory, FIFO, socket or device); it is not opened"
+                    .to_string(),
+            );
+        }
+        match (file.id(), file_id(&meta)) {
+            (Some(open), Some(named)) if open != named => Recheck::Replaced,
+            _ => Recheck::Same,
+        }
+    }
 }
 
 /// Everything one stream's thread owns: where its file is, how to reach it, and
@@ -665,7 +709,6 @@ struct Tuning {
     /// Rotated files each stream keeps.
     keep: [usize; 3],
     /// How often a stream checks that its path still names its file.
-    #[allow(dead_code)] // used from Task W9
     recheck: Duration,
     /// How soon a failed stream tries to reopen its file.
     reopen: Duration,
@@ -981,6 +1024,14 @@ struct StreamWriter<'a> {
     /// When the file was last closed by an error, or an open of it last failed.
     /// A stream that arrived without a file counts boot as its last attempt.
     last_open_attempt: Instant,
+    /// How long after the path was last compared with the open file it is
+    /// compared again.
+    recheck: Duration,
+    /// When the path was last compared with the open file, by the interval or by
+    /// a rotation about to begin. Starts when the thread does, so the first
+    /// check by the interval comes one interval after boot (the preflight has
+    /// just looked at the path).
+    last_recheck: Instant,
     /// Size past which the file is rotated.
     cap_bytes: u64,
     /// Rotated files kept.
@@ -1012,6 +1063,8 @@ impl<'a> StreamWriter<'a> {
             shared,
             reopen: tuning.reopen,
             last_open_attempt: Instant::now(),
+            recheck: tuning.recheck,
+            last_recheck: Instant::now(),
             cap_bytes: tuning.cap_bytes[kind.index()],
             keep: tuning.keep[kind.index()],
             rotate_retry: tuning.rotate_retry,
@@ -1033,11 +1086,17 @@ impl<'a> StreamWriter<'a> {
         }
     }
 
-    /// Reopens the file when there is none and it is time, then writes. A write
-    /// that fails closes the file and starts the reopen interval.
+    /// Reopens the file when there is none and it is time; with a file, checks
+    /// that the path still names it when the re-check interval has passed. Then
+    /// writes. A write that fails closes the file and starts the reopen interval.
     fn try_write(&mut self, line: &str) -> io::Result<()> {
         if self.spec.file.is_none() {
             self.reopen_file()?;
+        } else if self.last_recheck.elapsed() >= self.recheck {
+            self.recheck_path();
+            if self.spec.file.is_none() {
+                return Err(copy_error(&self.last_error));
+            }
         }
         let written = self.write_through(Some(line));
         if let Err(error) = &written {
@@ -1055,6 +1114,12 @@ impl<'a> StreamWriter<'a> {
         if self.last_open_attempt.elapsed() < self.reopen {
             return Err(copy_error(&self.last_error));
         }
+        self.open_file()
+    }
+
+    /// Opens the file now, whatever the reopen interval says. A failure starts
+    /// the interval again and is what an entry that fails fast reports.
+    fn open_file(&mut self) -> io::Result<()> {
         match self.spec.backend.open(&self.spec.path, self.kind) {
             Ok(file) => {
                 self.spec.file = Some(file);
@@ -1064,6 +1129,44 @@ impl<'a> StreamWriter<'a> {
                 self.last_open_attempt = Instant::now();
                 self.last_error = copy_error(&error);
                 Err(error)
+            }
+        }
+    }
+
+    /// Compares the path with the open file and acts on the answer (spec
+    /// Design 8), and says whether the file is still the one the path names.
+    ///
+    /// - `Same`: nothing changes.
+    /// - `Gone` or `Replaced`: the handle names an inode the path no longer does,
+    ///   so it is dropped and the path is opened afresh at once, through the
+    ///   backend's `open` (the preflight: it recreates the directory `0700` and
+    ///   writes a `start` marker). A reopen that fails leaves no file and starts
+    ///   the reopen interval, like any failed open.
+    /// - `Refused`: the handle is dropped and nothing is opened. The reopen
+    ///   interval starts, so the entries that follow fail fast with the reason.
+    ///
+    /// Whatever is found, the check has been made: the interval starts again.
+    /// `false` also when the stream has no file to compare.
+    fn recheck_path(&mut self) -> bool {
+        let Some(file) = self.spec.file.as_deref() else {
+            return false;
+        };
+        let answer = self.spec.backend.recheck(&self.spec.path, file);
+        self.last_recheck = Instant::now();
+        match answer {
+            Recheck::Same => true,
+            Recheck::Gone | Recheck::Replaced => {
+                self.spec.file = None;
+                // A failed open is already recorded by `open_file` (the reason,
+                // the interval); the caller sees a stream with no file.
+                let _ = self.open_file();
+                false
+            }
+            Recheck::Refused(reason) => {
+                self.spec.file = None;
+                self.last_open_attempt = Instant::now();
+                self.last_error = refused(&self.spec.path, reason);
+                false
             }
         }
     }
@@ -1116,8 +1219,14 @@ impl<'a> StreamWriter<'a> {
     /// failure keeps the old file, which the line is written to all the same (the
     /// cap is soft while rotation fails), starts the retry interval and logs
     /// through the stream's throttle. It is not a write failure.
+    ///
+    /// The path is checked before every rotation (spec Design 8): renaming
+    /// whatever is at the path, when it is not the file the stream has been
+    /// writing, would move somebody else's file aside and call it ours. When the
+    /// check finds the file changed, the stream reopens (or fails the entry, or
+    /// has no file) instead of rotating: a file just opened is not the full one.
     fn rotate_if_due(&mut self, incoming: u64) {
-        let Some(file) = self.spec.file.as_mut() else {
+        let Some(file) = self.spec.file.as_ref() else {
             return;
         };
         let size = file.size();
@@ -1131,6 +1240,12 @@ impl<'a> StreamWriter<'a> {
         if waiting {
             return;
         }
+        if !self.recheck_path() {
+            return;
+        }
+        let Some(file) = self.spec.file.as_mut() else {
+            return;
+        };
         // What was written is on the device before the file is renamed. Best
         // effort, as at close: a failed sync leaves nothing else to try.
         let _ = file.sync();
@@ -2215,11 +2330,20 @@ mod tests {
         open_calls: AtomicUsize,
         /// An open fails with `PermissionDenied` while this is set.
         fail_open: AtomicBool,
+        /// What the next re-checks answer, in order; `Same` once it is empty.
+        recheck_answers: Mutex<Vec<Recheck>>,
+        /// How many times the backend was asked whether the path still names the file.
+        recheck_calls: AtomicUsize,
     }
 
     impl FakeState {
         fn plain() -> Arc<FakeState> {
             Arc::new(FakeState::default())
+        }
+
+        /// Makes the next re-checks answer `answers`, one each, in order.
+        fn script_rechecks(&self, answers: Vec<Recheck>) {
+            *lock(&self.recheck_answers) = answers;
         }
 
         /// A state whose first write blocks until [`FakeState::release`].
@@ -2321,6 +2445,16 @@ mod tests {
                 ));
             }
             Ok(Box::new(FakeFile(self.0.clone())))
+        }
+
+        fn recheck(&mut self, _path: &Path, _file: &dyn LogFile) -> Recheck {
+            self.0.recheck_calls.fetch_add(1, Ordering::SeqCst);
+            let mut answers = lock(&self.0.recheck_answers);
+            if answers.is_empty() {
+                Recheck::Same
+            } else {
+                answers.remove(0)
+            }
         }
     }
 
@@ -4752,5 +4886,824 @@ mod tests {
                 write_failures: 0
             }
         );
+    }
+
+    // ---- the path re-check (Task W9) -----------------------------------
+
+    /// A re-check before every entry: for the tests whose subject is what the
+    /// writer does about the answer, not when it asks.
+    fn rechecking() -> Tuning {
+        Tuning {
+            recheck: Duration::ZERO,
+            ..Tuning::production()
+        }
+    }
+
+    /// A re-check that never falls due on its own (an hour), and a cap of 2048
+    /// bytes: only a rotation asks.
+    fn rechecking_only_at_rotation() -> Tuning {
+        Tuning {
+            recheck: Duration::from_secs(3600),
+            cap_bytes: [2048; 3],
+            ..Tuning::production()
+        }
+    }
+
+    /// The operator-origin evidence entry `o<i>` (the control stream), whose `at`
+    /// is `BASE_MS + i`.
+    fn operator_entry(i: u64) -> AuditEntry {
+        entry(&format!("o{i}"), Frontend::Operator, BASE_MS + i)
+    }
+
+    /// One word per line of `path`: the entry's command, or the marker's name.
+    fn shape_of(path: &Path) -> Vec<String> {
+        read_lines(path)
+            .iter()
+            .map(|line| {
+                let command = line.get("command").and_then(Value::as_str);
+                let marker = line.get("marker").and_then(Value::as_str);
+                command.or(marker).unwrap_or("?").to_string()
+            })
+            .collect()
+    }
+
+    /// The status of a writer that wrote everything and never failed.
+    const CLEAN: DurableAuditStatus = DurableAuditStatus {
+        degraded: false,
+        dropped: 0,
+        write_failures: 0,
+    };
+
+    /// Makes a FIFO at `path`. `false`, and a `SKIPPED` line, when `mkfifo`
+    /// cannot be spawned: the caller skips that row only.
+    #[cfg(unix)]
+    fn make_fifo(path: &Path, what: &str) -> bool {
+        match std::process::Command::new("mkfifo").arg(path).status() {
+            Ok(status) if status.success() => true,
+            Ok(status) => panic!("mkfifo failed with {status}"),
+            Err(e) => {
+                skipped(&format!("{what}: mkfifo cannot be spawned ({e})"));
+                false
+            }
+        }
+    }
+
+    /// [`fs_writer`] with a backend of the caller's choosing per stream.
+    fn fs_writer_with(
+        dir: &Scratch,
+        tuning: Tuning,
+        backend: impl Fn(StreamKind) -> Box<dyn Backend>,
+    ) -> (Arc<AuditRing>, Arc<AuditLogWriter>, [PathBuf; 3]) {
+        let base = dir.join("audit.jsonl");
+        let paths = StreamKind::ALL.map(|kind| stream_path(&base, kind));
+        let specs = StreamKind::ALL.map(|kind| {
+            let path = stream_path(&base, kind);
+            let file = preflight(&path, kind)
+                .unwrap_or_else(|e| panic!("preflight of the {} stream failed: {e}", kind.label()));
+            StreamSpec {
+                path,
+                backend: backend(kind),
+                file: Some(Box::new(file)),
+            }
+        });
+        let writer = Arc::new(
+            AuditLogWriter::from_specs(specs, tuning).unwrap_or_else(|e| panic!("start: {e}")),
+        );
+        let ring = Arc::new(AuditRing::new(8192));
+        assert!(ring.attach_durable(writer.clone()));
+        (ring, writer, paths)
+    }
+
+    /// The real backend that notes, in order, each call it is asked for, as
+    /// `<stream>:open`, `<stream>:rotate` and `<stream>:recheck:<answer>`. With
+    /// `half_rotation` a rotation moves the names and then fails to create the
+    /// new file: the rotation that gets as far as the rename and no further.
+    struct TracingBackend {
+        stream: StreamKind,
+        events: Events,
+        half_rotation: bool,
+    }
+
+    /// The calls a [`TracingBackend`] was asked for, in order, shared with the test.
+    type Events = Arc<Mutex<Vec<String>>>;
+
+    impl TracingBackend {
+        fn note(&self, what: &str) {
+            lock(&self.events).push(format!("{}:{what}", self.stream.label()));
+        }
+    }
+
+    impl Backend for TracingBackend {
+        fn open(&mut self, path: &Path, stream: StreamKind) -> io::Result<Box<dyn LogFile>> {
+            self.note("open");
+            FsBackend.open(path, stream)
+        }
+
+        fn rotate(
+            &mut self,
+            path: &Path,
+            stream: StreamKind,
+            keep: usize,
+        ) -> io::Result<Box<dyn LogFile>> {
+            self.note("rotate");
+            if self.half_rotation {
+                shift_rotated_files(path, keep)?;
+                return Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "the new file cannot be created",
+                ));
+            }
+            FsBackend.rotate(path, stream, keep)
+        }
+
+        fn recheck(&mut self, path: &Path, file: &dyn LogFile) -> Recheck {
+            let answer = FsBackend.recheck(path, file);
+            self.note(match &answer {
+                Recheck::Same => "recheck:same",
+                Recheck::Gone => "recheck:gone",
+                Recheck::Replaced => "recheck:replaced",
+                Recheck::Refused(_) => "recheck:refused",
+            });
+            answer
+        }
+    }
+
+    /// [`fs_writer`] over [`TracingBackend`]s sharing one event log.
+    fn traced_writer(
+        dir: &Scratch,
+        tuning: Tuning,
+        half_rotation: bool,
+    ) -> (Arc<AuditRing>, Arc<AuditLogWriter>, [PathBuf; 3], Events) {
+        let events = Events::default();
+        let (ring, writer, paths) = fs_writer_with(dir, tuning, |stream| {
+            Box::new(TracingBackend {
+                stream,
+                events: events.clone(),
+                half_rotation,
+            })
+        });
+        (ring, writer, paths, events)
+    }
+
+    fn events_of(events: &Events) -> Vec<String> {
+        lock(events).clone()
+    }
+
+    /// 50 whole lines of exactly 100 bytes each (5000 bytes), written to `path`
+    /// before a writer starts on it: a file already past a 2048-byte cap.
+    fn prefill_past_the_cap(path: &Path) -> String {
+        let old: String = (0..50)
+            .map(|i| format!("{{\"old\":{i:03},\"pad\":\"{}\"}}\n", "p".repeat(79)))
+            .collect();
+        assert_eq!(old.len(), 5000);
+        fs::write(path, &old).expect("pre-fill the file");
+        old
+    }
+
+    /// One run of AC22: after start the control file is deleted, `replace` puts
+    /// something that is not a regular file at its path (and says whether it
+    /// could), and 100 operator entries go through a ring with the writer
+    /// attached. What went wrong, if anything.
+    fn path_replaced_run(label: &str, replace: impl FnOnce(&Path) -> bool) -> Vec<String> {
+        let dir = scratch("recheck-replaced");
+        let (ring, writer, paths) = fs_writer(&dir, rechecking());
+        fs::remove_file(&paths[0]).expect("delete the control file");
+        if !replace(&paths[0]) {
+            writer.shutdown(FLUSH_BUDGET);
+            return Vec::new();
+        }
+        let calls = ring.clone();
+        within(Duration::from_secs(2), "the 100 record calls", move || {
+            for i in 0..100 {
+                calls.append_in(AuditLane::Evidence, operator_entry(i));
+            }
+        });
+        let flusher = writer.clone();
+        let report = within(Duration::from_secs(5), "shutdown", move || {
+            flusher.shutdown(Duration::from_secs(2))
+        });
+
+        let mut problems = Vec::new();
+        if !report.complete {
+            problems.push(format!("{label}: shutdown(2 s) did not finish: {report:?}"));
+        }
+        let want = DurableAuditStatus {
+            degraded: true,
+            dropped: 0,
+            write_failures: 100,
+        };
+        if writer.status() != want {
+            problems.push(format!(
+                "{label}: status is {:?}, expected {want:?}",
+                writer.status()
+            ));
+        }
+        if ring.len() != 100 {
+            problems.push(format!(
+                "{label}: the ring holds {} entries, expected 100",
+                ring.len()
+            ));
+        }
+        problems
+    }
+
+    /// AC22: a path that becomes a directory (or a FIFO) costs the caller
+    /// nothing: every call returns, every entry is a counted write failure, the
+    /// ring has them all, and the writer never opens the thing at the path (a
+    /// FIFO would block it for ever), so the shutdown does not hang either.
+    #[test]
+    fn a_path_that_becomes_a_directory_costs_the_caller_nothing() {
+        let mut problems = path_replaced_run("directory", |path| {
+            fs::create_dir(path).expect("make a directory at the path");
+            true
+        });
+        #[cfg(unix)]
+        problems.extend(path_replaced_run("FIFO", |path| {
+            make_fifo(path, "the FIFO row")
+        }));
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// One run of AC27: after start `remove` takes the control file (or its whole
+    /// directory) away, and one entry is recorded. What went wrong, if anything.
+    fn recreated_after(label: &str, remove: impl FnOnce(&Scratch, &Path)) -> Vec<String> {
+        let dir = scratch("recheck-removed");
+        let (ring, writer, paths) = fs_writer(&dir, rechecking());
+        remove(&dir, &paths[0]);
+        ring.append_in(AuditLane::Evidence, operator_entry(1));
+        let report = writer.shutdown(FLUSH_BUDGET);
+
+        let mut problems = Vec::new();
+        if !report.complete {
+            problems.push(format!("{label}: the flush did not finish: {report:?}"));
+        }
+        if !paths[0].exists() {
+            problems.push(format!("{label}: no file at the path after the entry"));
+            return problems;
+        }
+        let shape = shape_of(&paths[0]);
+        if shape != ["start", "o1"] {
+            problems.push(format!(
+                "{label}: the file holds {shape:?}, expected a start marker then the entry"
+            ));
+        }
+        if writer.status() != CLEAN {
+            problems.push(format!(
+                "{label}: a recreated file is not a failure, but the status is {:?}",
+                writer.status()
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = |path: &Path| fs::metadata(path).map(|m| m.permissions().mode() & 0o777);
+            let parent = paths[0].parent().expect("the file has a parent");
+            if mode(parent).ok() != Some(0o700) {
+                problems.push(format!(
+                    "{label}: the directory has mode {:?}, expected 0700",
+                    mode(parent)
+                ));
+            }
+            if mode(&paths[0]).ok() != Some(0o600) {
+                problems.push(format!(
+                    "{label}: the file has mode {:?}, expected 0600",
+                    mode(&paths[0])
+                ));
+            }
+        }
+        problems
+    }
+
+    /// AC27: an operator who removes the file, or its whole directory, gets a new
+    /// file with a `start` marker at the next entry instead of lines written to an
+    /// unlinked inode.
+    #[test]
+    fn a_removed_file_or_directory_is_recreated_with_a_start_marker() {
+        let mut problems = recreated_after("file", |_dir, file| {
+            fs::remove_file(file).expect("delete the control file");
+        });
+        problems.extend(recreated_after("directory", |dir, _file| {
+            fs::remove_dir_all(&dir.0).expect("remove the stream directory");
+        }));
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// AC28: a symbolic link planted where the file was is not written through:
+    /// its target keeps its bytes, the entry is a counted failure, and the link is
+    /// left where it is.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_swapped_for_a_symlink_is_not_written_through() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch("recheck-symlink");
+        let (ring, writer, paths) = fs_writer(&dir, rechecking());
+        let victim = dir.join("victim.txt");
+        fs::write(&victim, "known bytes\n").expect("write the victim");
+        fs::remove_file(&paths[0]).expect("delete the control file");
+        symlink(&victim, &paths[0]).expect("plant the symlink");
+
+        ring.append_in(AuditLane::Evidence, operator_entry(1));
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        assert_eq!(
+            fs::read(&victim).expect("read the victim"),
+            b"known bytes\n",
+            "the entry was written through the link"
+        );
+        assert_eq!(
+            writer.status(),
+            DurableAuditStatus {
+                degraded: true,
+                dropped: 0,
+                write_failures: 1
+            }
+        );
+        let kind = fs::symlink_metadata(&paths[0]).expect("the link is still there");
+        assert!(kind.file_type().is_symlink(), "the link was replaced");
+    }
+
+    /// The path's rotation check comes before the rotation. A file left past the
+    /// cap and then deleted: the check finds it gone and the writer reopens at
+    /// once, so there is no rotation at all (a rotation would create the file
+    /// too, with the same lines, which only the order of the calls tells apart)
+    /// and no `F.1` is made from a file that is not there.
+    #[test]
+    fn rotation_rechecks_the_path_first() {
+        let dir = scratch("recheck-rotation-gone");
+        prefill_past_the_cap(&dir.join("audit.jsonl"));
+        let (ring, writer, paths, events) =
+            traced_writer(&dir, rechecking_only_at_rotation(), false);
+        fs::remove_file(&paths[0]).expect("delete the control file");
+
+        ring.append_in(AuditLane::Evidence, operator_entry(0));
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        assert_eq!(
+            events_of(&events),
+            ["control:recheck:gone", "control:open"],
+            "the check came first, found nothing, and the writer reopened without rotating"
+        );
+        assert_eq!(shape_of(&paths[0]), ["start", "o0"]);
+        assert!(
+            !numbered(&paths[0], 1).exists(),
+            "an F.1 was made from a file that was deleted"
+        );
+        assert_eq!(writer.status(), CLEAN);
+    }
+
+    /// The same check, finding the file where it was: the rotation goes ahead,
+    /// after it. `F.1` holds the old content and the boot marker, `F` a start
+    /// marker and the entry.
+    #[test]
+    fn a_rotation_of_an_unchanged_path_checks_it_then_rotates() {
+        let dir = scratch("recheck-rotation-same");
+        let old = prefill_past_the_cap(&dir.join("audit.jsonl"));
+        let (ring, writer, paths, events) =
+            traced_writer(&dir, rechecking_only_at_rotation(), false);
+
+        ring.append_in(AuditLane::Evidence, operator_entry(0));
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        assert_eq!(
+            events_of(&events),
+            ["control:recheck:same", "control:rotate"],
+            "the check came before the rotation"
+        );
+        let rotated = fs::read_to_string(numbered(&paths[0], 1)).expect("F.1 exists");
+        assert!(rotated.starts_with(&old), "F.1 lost the old content");
+        assert_eq!(shape_of(&paths[0]), ["start", "o0"]);
+        assert_eq!(writer.status(), CLEAN);
+    }
+
+    /// A symbolic link planted at the path of a file that is due for rotation is
+    /// refused by the check that precedes the rotation: nothing is rotated or
+    /// renamed (the link is not moved aside), the link's target is untouched, and
+    /// the entry is a counted failure.
+    #[cfg(unix)]
+    #[test]
+    fn no_rotation_is_attempted_over_a_refused_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch("recheck-rotation-refused");
+        prefill_past_the_cap(&dir.join("audit.jsonl"));
+        let (ring, writer, paths, events) =
+            traced_writer(&dir, rechecking_only_at_rotation(), false);
+        let victim = dir.join("victim.txt");
+        fs::write(&victim, "known bytes\n").expect("write the victim");
+        fs::remove_file(&paths[0]).expect("delete the control file");
+        symlink(&victim, &paths[0]).expect("plant the symlink");
+
+        ring.append_in(AuditLane::Evidence, operator_entry(0));
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        assert_eq!(events_of(&events), ["control:recheck:refused"]);
+        assert_eq!(fs::read(&victim).expect("read"), b"known bytes\n");
+        let link = fs::symlink_metadata(&paths[0]).expect("the link is still there");
+        assert!(
+            link.file_type().is_symlink(),
+            "the link was moved or replaced"
+        );
+        assert!(!numbered(&paths[0], 1).exists(), "the link was rotated");
+        assert_eq!(
+            writer.status(),
+            DurableAuditStatus {
+                degraded: true,
+                dropped: 0,
+                write_failures: 1
+            }
+        );
+    }
+
+    /// What [`FsBackend::recheck`] says about the path of an open file, row by
+    /// row, as the path changes under it: unchanged, replaced by another file
+    /// (the old one kept, so the new file cannot reuse its inode), deleted, its
+    /// directory deleted, and replaced by a symbolic link, a directory and a FIFO.
+    /// A file with no identity (a fake) is `Same` wherever the path is a regular file.
+    #[test]
+    fn fs_backend_recheck_classifies_the_path() {
+        let dir = scratch("recheck-classify");
+        let mut problems: Vec<String> = Vec::new();
+        let mut row = |label: &str, answer: Recheck, want: &str| {
+            let (name, reason) = match &answer {
+                Recheck::Same => ("same", ""),
+                Recheck::Gone => ("gone", ""),
+                Recheck::Replaced => ("replaced", ""),
+                Recheck::Refused(reason) => ("refused", reason.as_str()),
+            };
+            let expected = want.split_once(':').unwrap_or((want, ""));
+            if name != expected.0 || !reason.contains(expected.1) {
+                problems.push(format!(
+                    "{label}: answered {answer:?}, expected {want:?} (kind, then a word in the reason)"
+                ));
+            }
+        };
+
+        let path = dir.join("a.jsonl");
+        let file = preflight(&path, StreamKind::Control).expect("preflight");
+        row("unchanged", FsBackend.recheck(&path, &file), "same");
+
+        // Another file under the name; the first kept, so the inode is not reused.
+        let moved = dir.join("a.moved");
+        fs::rename(&path, &moved).expect("move the file aside");
+        fs::write(&path, "x\n").expect("a new file at the path");
+        row("replaced", FsBackend.recheck(&path, &file), "replaced");
+
+        let fake = FakeFile(FakeState::plain());
+        row("no identity", FsBackend.recheck(&path, &fake), "same");
+
+        fs::remove_file(&path).expect("delete the file");
+        row("deleted", FsBackend.recheck(&path, &file), "gone");
+
+        let nested = dir.join("sub").join("b.jsonl");
+        let inner = preflight(&nested, StreamKind::Control).expect("preflight of the nested path");
+        fs::remove_dir_all(dir.join("sub")).expect("delete the directory");
+        row(
+            "directory deleted",
+            FsBackend.recheck(&nested, &inner),
+            "gone",
+        );
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&moved, &path).expect("plant a symlink");
+            row(
+                "symlink",
+                FsBackend.recheck(&path, &file),
+                "refused:symbolic link",
+            );
+            fs::remove_file(&path).expect("remove the symlink");
+
+            fs::create_dir(&path).expect("make a directory");
+            row(
+                "directory",
+                FsBackend.recheck(&path, &file),
+                "refused:regular file",
+            );
+            fs::remove_dir(&path).expect("remove the directory");
+
+            if make_fifo(&path, "the FIFO row") {
+                row(
+                    "FIFO",
+                    FsBackend.recheck(&path, &file),
+                    "refused:regular file",
+                );
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// Spec Design 8: a file an external `logrotate` renamed, with a new file
+    /// under the old name, is not written to: the writer reopens through the
+    /// preflight, which keeps the new file's lines, tightens its mode and appends
+    /// a `start` marker; the renamed file gets nothing more.
+    #[test]
+    fn an_externally_rotated_file_is_reopened_not_written_through() {
+        let dir = scratch("recheck-logrotate");
+        let (ring, writer, paths) = fs_writer(&dir, rechecking());
+        let aside = dir.join("audit.jsonl.logrotated");
+        fs::rename(&paths[0], &aside).expect("rename the file as logrotate does");
+        fs::write(&paths[0], "{\"external\":1}\n").expect("a new file under the old name");
+
+        ring.append_in(AuditLane::Evidence, operator_entry(1));
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        assert_eq!(
+            shape_of(&aside),
+            ["start"],
+            "the renamed file was written to"
+        );
+        let lines = read_lines(&paths[0]);
+        assert_eq!(lines.len(), 3, "the new file's line, a marker, the entry");
+        assert_eq!(lines[0]["external"], 1, "the new file's own line is kept");
+        assert_eq!(lines[1]["marker"], "start");
+        assert_eq!(lines[2]["command"], "o1");
+        assert_eq!(writer.status(), CLEAN);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = fs::metadata(&paths[0])
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the reopen went through the preflight");
+        }
+    }
+
+    /// A rotation that renamed `F` to `F.1` and then could not create the new `F`
+    /// leaves the writer appending to the inode now named `F.1`, with no file at
+    /// the path. The next check, from the interval or from the rotation that is
+    /// due again, finds the path gone and reopens through the preflight: a fresh
+    /// `F` with a `start` marker. No line is lost, and neither the failed rotation
+    /// nor the repair is a write failure.
+    #[test]
+    fn a_half_finished_rotation_is_repaired_by_the_next_recheck() {
+        let by_interval = Tuning {
+            recheck: Duration::ZERO,
+            rotate_retry: Duration::from_secs(3600),
+            ..rechecking_only_at_rotation()
+        };
+        let by_rotation = Tuning {
+            recheck: Duration::from_secs(3600),
+            rotate_retry: Duration::ZERO,
+            ..rechecking_only_at_rotation()
+        };
+        let mut problems: Vec<String> = Vec::new();
+        for (label, tuning) in [
+            ("the interval check", by_interval),
+            ("the check before the next rotation", by_rotation),
+        ] {
+            let dir = scratch("recheck-half-rotation");
+            let (ring, writer, paths, events) = traced_writer(&dir, tuning, true);
+            record_fat(&ring, 12);
+            let report = writer.shutdown(FLUSH_BUDGET);
+            if !report.complete {
+                problems.push(format!("{label}: the flush did not finish: {report:?}"));
+            }
+
+            let agent = &paths[1];
+            let events: Vec<String> = events_of(&events)
+                .into_iter()
+                .filter(|event| event.starts_with("agent:"))
+                .collect();
+            let rotation = events.iter().position(|event| event == "agent:rotate");
+            let after: Vec<&str> = rotation
+                .map(|at| events[at..].iter().take(3).map(String::as_str).collect())
+                .unwrap_or_default();
+            if after != ["agent:rotate", "agent:recheck:gone", "agent:open"] {
+                problems.push(format!(
+                    "{label}: the calls from the rotation on are {after:?}; all: {events:?}"
+                ));
+            }
+            if events.iter().filter(|e| *e == "agent:rotate").count() != 1 {
+                problems.push(format!(
+                    "{label}: expected exactly one rotation: {events:?}"
+                ));
+            }
+
+            let rotated = numbered(agent, 1);
+            let files: Vec<PathBuf> = vec![rotated.clone(), agent.clone()];
+            if !rotated.exists() || !agent.exists() {
+                problems.push(format!("{label}: F.1 and F must both exist"));
+                continue;
+            }
+            let commands: Vec<String> =
+                files.iter().flat_map(|file| entry_commands(file)).collect();
+            if commands != names("c", 12) {
+                problems.push(format!("{label}: lines lost or reordered: {commands:?}"));
+            }
+            if shape_of(agent).first().map(String::as_str) != Some("start") {
+                problems.push(format!(
+                    "{label}: the fresh F does not begin with a start marker"
+                ));
+            }
+            if writer.status() != CLEAN {
+                problems.push(format!(
+                    "{label}: neither the failed rotation nor the repair is a failure, status {:?}",
+                    writer.status()
+                ));
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// The interval check waits one interval after the thread starts, runs at
+    /// most once per interval, and runs again when an interval has passed.
+    #[test]
+    fn the_interval_check_first_runs_one_interval_after_boot_and_then_once_per_interval() {
+        let state = FakeState::plain();
+        let shared = StreamShared::default();
+        let mut writer = hand_driven(&state, true, &shared);
+        let calls = || state.recheck_calls.load(Ordering::SeqCst);
+        assert!(
+            writer.last_recheck.elapsed() < Duration::from_secs(1),
+            "the interval starts when the writer does"
+        );
+
+        for i in 1..=3 {
+            writer.write_entry(&agent_entry(i));
+        }
+        assert_eq!(calls(), 0, "no check before the first interval has passed");
+
+        writer.last_recheck = long_ago();
+        writer.write_entry(&agent_entry(4));
+        assert_eq!(calls(), 1, "one check once an interval has passed");
+        writer.write_entry(&agent_entry(5));
+        writer.write_entry(&agent_entry(6));
+        assert_eq!(calls(), 1, "at most one check per interval");
+
+        writer.last_recheck = long_ago();
+        writer.write_entry(&agent_entry(7));
+        assert_eq!(calls(), 2, "and again one interval later");
+        assert_eq!(fake_shape(&state), names("a", 8)[1..]);
+        assert_eq!(shared.write_failures.load(Ordering::Relaxed), 0);
+    }
+
+    /// `Gone` and `Replaced` reopen at once: a reopen interval that is still
+    /// running does not hold the reopen back, and the entry is written to the
+    /// reopened file, not lost.
+    #[test]
+    fn a_gone_or_replaced_path_reopens_at_once_and_the_entry_is_written() {
+        let state = FakeState::plain();
+        state.script_rechecks(vec![Recheck::Gone, Recheck::Replaced]);
+        let shared = StreamShared::default();
+        let mut writer = hand_driven(&state, true, &shared);
+        writer.last_open_attempt = Instant::now();
+
+        for i in 1..=2 {
+            writer.last_recheck = long_ago();
+            writer.write_entry(&agent_entry(i));
+        }
+
+        assert_eq!(state.recheck_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            state.open_calls.load(Ordering::SeqCst),
+            2,
+            "one reopen for each answer, interval or not"
+        );
+        assert_eq!(fake_shape(&state), ["a1", "a2"]);
+        assert_eq!(shared.write_failures.load(Ordering::Relaxed), 0);
+        assert!(!shared.degraded.load(Ordering::Relaxed));
+    }
+
+    /// A `Gone` path whose reopen fails counts the entry as a failure, closes the
+    /// handle and starts the reopen interval: the next entry fails fast with no
+    /// `open`; once the interval has passed the next reopens, and the gap marker
+    /// reports both entries.
+    #[test]
+    fn a_failed_reopen_after_a_gone_path_fails_the_entry_and_starts_the_interval() {
+        let state = FakeState::plain();
+        state.script_rechecks(vec![Recheck::Gone]);
+        state.fail_open.store(true, Ordering::SeqCst);
+        let shared = StreamShared::default();
+        let mut writer = hand_driven(&state, true, &shared);
+
+        writer.last_recheck = long_ago();
+        writer.write_entry(&agent_entry(1));
+        assert_eq!(state.open_calls.load(Ordering::SeqCst), 1, "one try");
+        assert!(writer.spec.file.is_none(), "the handle is closed");
+        assert!(
+            writer.last_open_attempt.elapsed() < Duration::from_secs(1),
+            "the failed reopen started the interval"
+        );
+        assert_eq!(shared.write_failures.load(Ordering::Relaxed), 1);
+        assert!(shared.degraded.load(Ordering::Relaxed));
+
+        writer.write_entry(&agent_entry(2));
+        assert_eq!(
+            state.open_calls.load(Ordering::SeqCst),
+            1,
+            "inside the interval an entry fails fast"
+        );
+        assert_eq!(shared.write_failures.load(Ordering::Relaxed), 2);
+        assert!(state.lines().is_empty(), "nothing was written");
+
+        state.fail_open.store(false, Ordering::SeqCst);
+        writer.last_open_attempt = long_ago();
+        writer.write_entry(&agent_entry(3));
+        assert_eq!(state.open_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fake_shape(&state), ["gap", "a3"]);
+        assert_eq!(fake_gaps(&state)[0]["failed"], 2);
+        assert!(!shared.degraded.load(Ordering::Relaxed), "recovered");
+    }
+
+    /// A `Refused` path counts the entry as a failure, marks the stream degraded,
+    /// drops the handle and writes nothing; it does not open anything (a refused
+    /// path is not retried before the interval), and the reason it was refused is
+    /// the reason the next entries report.
+    #[test]
+    fn a_refused_path_fails_the_entry_and_writes_nothing() {
+        let state = FakeState::plain();
+        state.script_rechecks(vec![Recheck::Refused(
+            "the path is now a symbolic link".to_string(),
+        )]);
+        let shared = StreamShared::default();
+        let mut writer = hand_driven(&state, true, &shared);
+
+        writer.last_recheck = long_ago();
+        writer.write_entry(&agent_entry(1));
+        assert_eq!(shared.write_failures.load(Ordering::Relaxed), 1);
+        assert!(shared.degraded.load(Ordering::Relaxed));
+        assert!(writer.spec.file.is_none(), "the handle is dropped");
+        assert!(state.lines().is_empty(), "nothing was written");
+        assert_eq!(state.open_calls.load(Ordering::SeqCst), 0, "nothing opened");
+        let reason = writer.last_error.to_string();
+        assert!(
+            reason.contains("/fake/hand-driven.jsonl")
+                && reason.contains("the path is now a symbolic link"),
+            "the failure names the path and the reason: {reason}"
+        );
+
+        writer.write_entry(&agent_entry(2));
+        assert_eq!(shared.write_failures.load(Ordering::Relaxed), 2);
+        assert_eq!(state.open_calls.load(Ordering::SeqCst), 0, "fails fast");
+
+        writer.last_open_attempt = long_ago();
+        writer.write_entry(&agent_entry(3));
+        assert_eq!(state.open_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fake_shape(&state), ["gap", "a3"]);
+        assert_eq!(fake_gaps(&state)[0]["failed"], 2);
+        assert!(!shared.degraded.load(Ordering::Relaxed), "recovered");
+    }
+
+    /// The check before a rotation runs after the pending `gap` marker has been
+    /// taken for the write. When it refuses the path the marker goes back: the
+    /// next write that succeeds reports the hole that was already there and the
+    /// entry the refusal cost.
+    #[test]
+    fn a_refusal_before_a_rotation_keeps_the_pending_gap() {
+        let state = FakeState::plain();
+        state.script_rechecks(vec![Recheck::Refused(
+            "the path is now a symbolic link".to_string(),
+        )]);
+        let shared = StreamShared::default();
+        let spec = StreamSpec {
+            path: PathBuf::from("/fake/hand-driven.jsonl"),
+            backend: Box::new(FakeBackend(state.clone())),
+            file: Some(Box::new(FakeFile(state.clone()))),
+        };
+        let tuning = Tuning {
+            cap_bytes: [100; 3],
+            recheck: Duration::from_secs(3600),
+            reopen: Duration::from_secs(5),
+            ..Tuning::production()
+        };
+        let mut writer = StreamWriter::new(StreamKind::Agent, spec, &shared, &tuning);
+        writer.last_open_attempt = long_ago();
+
+        writer.write_entry(&agent_entry(1));
+        assert_eq!(fake_shape(&state), ["a1"], "an empty file is not rotated");
+        // A hole the queue left earlier, still to be written.
+        shared.lock_gap().note_drop((BASE_MS + 50) as i64);
+        writer.write_entry(&agent_entry(2));
+        assert_eq!(
+            state.recheck_calls.load(Ordering::SeqCst),
+            1,
+            "the rotation that was due asked first"
+        );
+        assert_eq!(
+            fake_shape(&state),
+            ["a1"],
+            "the refused entry is not written"
+        );
+        assert_eq!(shared.write_failures.load(Ordering::Relaxed), 1);
+        assert!(writer.spec.file.is_none(), "the handle is dropped");
+
+        writer.last_open_attempt = long_ago();
+        writer.write_entry(&agent_entry(3));
+        assert_eq!(fake_shape(&state), ["a1", "gap", "a3"]);
+        let gap = &fake_gaps(&state)[0];
+        assert_eq!(gap["dropped"], 1, "the earlier hole was kept");
+        assert_eq!(gap["failed"], 1, "and the entry the refusal cost added");
+        assert_eq!(gap["from"], BASE_MS + 2);
+        assert_eq!(gap["to"], BASE_MS + 50);
+        assert!(!shared.degraded.load(Ordering::Relaxed), "recovered");
     }
 }
