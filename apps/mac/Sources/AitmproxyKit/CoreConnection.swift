@@ -75,6 +75,11 @@ public struct CoreConnection: Identifiable, Hashable, Sendable {
     /// the preferred port was taken (AC9), which is what the toolbar must show. nil
     /// until the core reports ready.
     public var proxyAddress: String?
+    /// The Settings ▸ Proxy values this embedded core was last started with, so the
+    /// UI can tell when an edit is still pending an Apply & Restart. Both are nil for
+    /// a non-embedded core and until the embedded core reports ready.
+    public var appliedPort: Int?
+    public var appliedVerifyUpstreamTLS: Bool?
 
     public init(
         id: CoreID = CoreID(),
@@ -82,7 +87,9 @@ public struct CoreConnection: Identifiable, Hashable, Sendable {
         endpoint: BusEndpoint,
         status: Status,
         label: String,
-        proxyAddress: String? = nil
+        proxyAddress: String? = nil,
+        appliedPort: Int? = nil,
+        appliedVerifyUpstreamTLS: Bool? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -90,6 +97,8 @@ public struct CoreConnection: Identifiable, Hashable, Sendable {
         self.status = status
         self.label = label
         self.proxyAddress = proxyAddress
+        self.appliedPort = appliedPort
+        self.appliedVerifyUpstreamTLS = appliedVerifyUpstreamTLS
     }
 }
 

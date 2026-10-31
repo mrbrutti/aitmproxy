@@ -65,6 +65,17 @@ public enum FlowState: Hashable, Sendable {
     case killed
     /// Transport-level failure (no HTTP status).
     case failed
+
+    /// The one-word name used for the `~state` filter and compact labels.
+    public var label: String {
+        switch self {
+        case .pending: "pending"
+        case .complete: "complete"
+        case .paused: "paused"
+        case .killed: "killed"
+        case .failed: "failed"
+        }
+    }
 }
 
 /// Who produced the flow: a client through the proxy, or the agent via

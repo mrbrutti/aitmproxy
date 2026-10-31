@@ -74,6 +74,10 @@ enum Snapshot {
                 }
             }
             if only == nil || only?.contains("settings") == true {
+                // A ready embedded core so Settings ▸ Proxy shows its real resting state:
+                // Apply & Restart disabled (nothing changed) and no divergent bound address.
+                session.coreHealth.connection = SnapshotScene.core(
+                    .ready, label: "Embedded core · proxy 127.0.0.1:8080", proxyAddress: "127.0.0.1:8080")
                 let main = NSApp.windows.first { $0.canBecomeMain && !$0.isSheet }
                 openSettings()
                 try? await Task.sleep(for: .seconds(1))
