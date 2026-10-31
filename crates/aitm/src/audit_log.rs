@@ -170,7 +170,6 @@ trait LogFile: Send {
     /// a reader sees the line at once and a crash tears at most the last line.
     fn append_line(&mut self, line: &str) -> io::Result<()>;
     /// The file's length in bytes, as this handle has grown it.
-    #[allow(dead_code)] // used from Task W8
     fn size(&self) -> u64;
     /// Flushes the file's data to the device.
     fn sync(&mut self) -> io::Result<()>;
@@ -540,8 +539,9 @@ trait Backend: Send {
     fn open(&mut self, path: &Path, stream: StreamKind) -> io::Result<Box<dyn LogFile>>;
 
     /// Moves the full active file aside, keeps `keep` rotated files and opens a
-    /// fresh one. Unsupported until Task W8.
-    #[allow(dead_code)] // used from Task W8
+    /// fresh one (a `start` marker already in it). The caller has synced the
+    /// old file. A backend that never rotates (a test double) keeps this
+    /// default, which refuses.
     fn rotate(
         &mut self,
         path: &Path,
@@ -560,6 +560,63 @@ trait Backend: Send {
     }
 }
 
+/// The name of the `n`th rotated file of the stream file `path`: its whole file
+/// name with `.n` appended (`audit.agent.jsonl` gives `audit.agent.jsonl.1`).
+fn rotated_path(path: &Path, n: usize) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{n}"));
+    PathBuf::from(name)
+}
+
+/// Renames `from` to `to`. A `from` that is not there is skipped: a rotation
+/// that stopped half way (or a file an operator removed) leaves gaps in the
+/// numbering, and the files after the gap still move.
+fn move_aside(from: &Path, to: &Path) -> io::Result<()> {
+    match fs::rename(from, to) {
+        Err(source) if source.kind() != io::ErrorKind::NotFound => Err(failed(
+            from,
+            format_args!("cannot rename it to {}", to.display()),
+            source,
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The names half of a rotation (spec Design 8): frees the slot `F.keep` and
+/// shifts every rotated file up by one, then moves the active file `F` to `F.1`.
+/// Only `F.keep`, the oldest rotated file, is ever deleted, and only when it is
+/// a regular file: anything else there (a symbolic link, a directory, a FIFO)
+/// stops the rotation before it has changed a name, so nothing is deleted or
+/// renamed. Every other step is a rename into a slot the step before it just
+/// emptied, so no file is overwritten. Nothing of another stream is touched.
+fn shift_rotated_files(path: &Path, keep: usize) -> io::Result<()> {
+    // The active file is never the file that is deleted: keep at least one.
+    let keep = keep.max(1);
+    let oldest = rotated_path(path, keep);
+    match fs::symlink_metadata(&oldest) {
+        Ok(meta) if meta.file_type().is_file() => fs::remove_file(&oldest)
+            .map_err(|source| failed(&oldest, "cannot delete the oldest rotated file", source))?,
+        Ok(_) => {
+            return Err(refused(
+                &oldest,
+                "the oldest rotated slot is not a regular file; rotation never deletes one",
+            ))
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(failed(
+                &oldest,
+                "cannot inspect the oldest rotated slot",
+                source,
+            ))
+        }
+    }
+    for n in (1..keep).rev() {
+        move_aside(&rotated_path(path, n), &rotated_path(path, n + 1))?;
+    }
+    move_aside(path, &rotated_path(path, 1))
+}
+
 /// The real [`Backend`]: files on disk, opened and hardened by [`preflight`].
 #[allow(dead_code)] // used from Task W11
 struct FsBackend;
@@ -567,6 +624,21 @@ struct FsBackend;
 #[allow(dead_code)] // used from Task W11
 impl Backend for FsBackend {
     fn open(&mut self, path: &Path, stream: StreamKind) -> io::Result<Box<dyn LogFile>> {
+        let file: Box<dyn LogFile> = Box::new(preflight(path, stream)?);
+        Ok(file)
+    }
+
+    /// Shifts the names ([`shift_rotated_files`]), then creates the new active
+    /// file exactly as the first boot does: [`preflight`] makes it with
+    /// `create_new` (mode `0600`, refusing a name someone planted in the
+    /// meantime) and writes its `start` marker.
+    fn rotate(
+        &mut self,
+        path: &Path,
+        stream: StreamKind,
+        keep: usize,
+    ) -> io::Result<Box<dyn LogFile>> {
+        shift_rotated_files(path, keep)?;
         let file: Box<dyn LogFile> = Box::new(preflight(path, stream)?);
         Ok(file)
     }
@@ -589,10 +661,8 @@ struct Tuning {
     /// Entries each stream's queue holds, indexed by [`StreamKind::index`].
     queue: [usize; 3],
     /// Size at which each stream's file rotates.
-    #[allow(dead_code)] // used from Task W8
     cap_bytes: [u64; 3],
     /// Rotated files each stream keeps.
-    #[allow(dead_code)] // used from Task W8
     keep: [usize; 3],
     /// How often a stream checks that its path still names its file.
     #[allow(dead_code)] // used from Task W9
@@ -600,7 +670,6 @@ struct Tuning {
     /// How soon a failed stream tries to reopen its file.
     reopen: Duration,
     /// How soon a stream retries a rotation that failed.
-    #[allow(dead_code)] // used from Task W8
     rotate_retry: Duration,
     /// How often a repeated failure is logged again.
     warn_every: Duration,
@@ -852,7 +921,8 @@ impl StreamEnds {
 }
 
 /// The body of a stream's thread: writes what it is sent, in order, until a
-/// `Close` (sync, mark closed, exit) or until every sender is gone.
+/// `Close` (mark any hole, sync, mark closed, exit) or until every sender is
+/// gone.
 fn run_stream(
     rx: Receiver<Msg>,
     spec: StreamSpec,
@@ -868,10 +938,7 @@ fn run_stream(
                 shared.queued.fetch_sub(1, Ordering::Relaxed);
             }
             Msg::Close => {
-                if let Some(file) = writer.spec.file.as_mut() {
-                    // A failed sync leaves nothing further to try at exit.
-                    let _ = file.sync();
-                }
+                writer.finish();
                 shared.closed.store(true, Ordering::Release);
                 return;
             }
@@ -879,35 +946,32 @@ fn run_stream(
     }
 }
 
-/// Writes the pending `gap` marker, if any, and then `line`. A marker whose own
-/// write fails goes back into the pending gap, so the hole is still reported by
-/// the next entry that gets written, and the error is returned for the entry
-/// to be counted as failed.
-fn write_with_gap(file: &mut dyn LogFile, line: &str, shared: &StreamShared) -> io::Result<()> {
-    // The guard lives for this statement only: the lock is never held across I/O.
-    let pending = shared.lock_gap().take();
-    if let Some(gap) = pending {
-        let now_ms = unix_ms(SystemTime::now());
-        let marker = gap_marker_line(
-            now_ms,
-            gap.from.unwrap_or(now_ms),
-            gap.to.unwrap_or(now_ms),
-            gap.dropped,
-            gap.failed,
-        );
-        if let Err(error) = file.append_line(&marker) {
-            shared.lock_gap().merge(gap);
-            return Err(error);
-        }
-    }
-    file.append_line(line)
+/// The `gap` marker line that reports `gap`, stamped now. A hole with no span
+/// recorded (nothing sets one without the other) reads as now.
+fn marker_for(gap: &GapState) -> String {
+    let now_ms = unix_ms(SystemTime::now());
+    gap_marker_line(
+        now_ms,
+        gap.from.unwrap_or(now_ms),
+        gap.to.unwrap_or(now_ms),
+        gap.dropped,
+        gap.failed,
+    )
+}
+
+/// An error with the kind and the text of `error`, for the one that has to be
+/// kept as well as returned (an `io::Error` is not `Clone`).
+fn copy_error(error: &io::Error) -> io::Error {
+    io::Error::new(error.kind(), error.to_string())
 }
 
 /// What one stream's thread owns while it runs: its file and the policy for
-/// when the file goes wrong (spec Design 9). Best effort and one attempt per
-/// entry: a failed write loses that entry, closes the file and marks the hole;
-/// the next entry reopens it if the reopen interval has passed and fails fast
-/// otherwise, so a broken disk costs one `open` an interval, not one per entry.
+/// when the file goes wrong (spec Design 9) and when it is full (spec Design 8).
+/// Best effort and one attempt per entry: a failed write loses that entry, closes
+/// the file and marks the hole; the next entry reopens it if the reopen interval
+/// has passed and fails fast otherwise, so a broken disk costs one `open` an
+/// interval, not one per entry. A file at its cap is rotated before the line that
+/// would overflow it is written, and a rotation that fails costs no line.
 struct StreamWriter<'a> {
     kind: StreamKind,
     spec: StreamSpec,
@@ -917,13 +981,22 @@ struct StreamWriter<'a> {
     /// When the file was last closed by an error, or an open of it last failed.
     /// A stream that arrived without a file counts boot as its last attempt.
     last_open_attempt: Instant,
-    /// Lets one failure in an interval reach the log.
+    /// Size past which the file is rotated.
+    cap_bytes: u64,
+    /// Rotated files kept.
+    keep: usize,
+    /// How long after a rotation failed the next try may begin.
+    rotate_retry: Duration,
+    /// When a rotation last failed; `None` after a success and at boot.
+    last_rotation_failure: Option<Instant>,
+    /// Lets one failure in an interval reach the log, a failed rotation included.
     throttle: WarnThrottle,
     /// Entries lost since the last time the stream recovered.
     failures: u64,
-    /// Kind of the latest error, which an entry that fails fast reports: it
-    /// made no attempt of its own.
-    last_error: io::ErrorKind,
+    /// The latest real error of a write or an open, which an entry that fails
+    /// fast reports: it made no attempt of its own, so the reason the stream is
+    /// down is the one the last attempt found.
+    last_error: io::Error,
 }
 
 impl<'a> StreamWriter<'a> {
@@ -939,9 +1012,13 @@ impl<'a> StreamWriter<'a> {
             shared,
             reopen: tuning.reopen,
             last_open_attempt: Instant::now(),
+            cap_bytes: tuning.cap_bytes[kind.index()],
+            keep: tuning.keep[kind.index()],
+            rotate_retry: tuning.rotate_retry,
+            last_rotation_failure: None,
             throttle: WarnThrottle::new(tuning.warn_every),
             failures: 0,
-            last_error: io::ErrorKind::NotConnected,
+            last_error: io::Error::new(io::ErrorKind::NotConnected, "the stream has no open file"),
         }
     }
 
@@ -952,7 +1029,7 @@ impl<'a> StreamWriter<'a> {
         let line = aitm_ca::audit::entry_to_jsonl(entry);
         match self.try_write(&line) {
             Ok(()) => self.succeeded(),
-            Err(error) => self.failed(entry.at_millis(), error.kind()),
+            Err(error) => self.failed(entry.at_millis(), &error),
         }
     }
 
@@ -962,16 +1039,11 @@ impl<'a> StreamWriter<'a> {
         if self.spec.file.is_none() {
             self.reopen_file()?;
         }
-        let Some(file) = self.spec.file.as_mut() else {
-            return Err(io::Error::new(
-                self.last_error,
-                "the stream has no open file",
-            ));
-        };
-        let written = write_with_gap(&mut **file, line, self.shared);
-        if written.is_err() {
+        let written = self.write_through(Some(line));
+        if let Err(error) = &written {
             self.spec.file = None;
             self.last_open_attempt = Instant::now();
+            self.last_error = copy_error(error);
         }
         written
     }
@@ -981,10 +1053,7 @@ impl<'a> StreamWriter<'a> {
     /// interval again.
     fn reopen_file(&mut self) -> io::Result<()> {
         if self.last_open_attempt.elapsed() < self.reopen {
-            return Err(io::Error::new(
-                self.last_error,
-                "the stream has no open file and the next reopen is not due",
-            ));
+            return Err(copy_error(&self.last_error));
         }
         match self.spec.backend.open(&self.spec.path, self.kind) {
             Ok(file) => {
@@ -993,26 +1062,137 @@ impl<'a> StreamWriter<'a> {
             }
             Err(error) => {
                 self.last_open_attempt = Instant::now();
+                self.last_error = copy_error(&error);
                 Err(error)
             }
         }
     }
 
-    /// The entry written at `at_ms` was lost to an error of kind `error`.
-    fn failed(&mut self, at_ms: i64, error: io::ErrorKind) {
+    /// Writes the pending `gap` marker, if any, and then `line`, to the open
+    /// file, which is rotated first when they would not fit under the cap. With
+    /// a marker and no line, writes the marker alone; with neither, does nothing
+    /// and leaves the file untouched.
+    ///
+    /// A marker whose own write fails goes back into the pending gap, so the
+    /// hole is still reported by the next write that succeeds, and the error is
+    /// returned for the entry to be counted as failed.
+    fn write_through(&mut self, line: Option<&str>) -> io::Result<()> {
+        let shared = self.shared;
+        // The guard lives for this statement only: the lock is never held across I/O.
+        let pending = shared.lock_gap().take();
+        let marker = pending.as_ref().map(marker_for);
+        let incoming = marker.as_ref().map_or(0, |marker| marker.len() + 1)
+            + line.map_or(0, |line| line.len() + 1);
+        if incoming == 0 {
+            return Ok(());
+        }
+        self.rotate_if_due(incoming as u64);
+        let Some(file) = self.spec.file.as_mut() else {
+            if let Some(gap) = pending {
+                shared.lock_gap().merge(gap);
+            }
+            return Err(copy_error(&self.last_error));
+        };
+        if let Some(marker) = marker {
+            if let Err(error) = file.append_line(&marker) {
+                if let Some(gap) = pending {
+                    shared.lock_gap().merge(gap);
+                }
+                return Err(error);
+            }
+        }
+        match line {
+            Some(line) => file.append_line(line),
+            None => Ok(()),
+        }
+    }
+
+    /// Rotates the file when it holds something and `incoming` more bytes would
+    /// take it past the cap (so an oversized file at boot rotates on its first
+    /// write, and a line larger than the cap lands in a fresh file), unless a
+    /// rotation failed less than `rotate_retry` ago. At most once per call.
+    ///
+    /// A success replaces the file: the line is then written to the new one. A
+    /// failure keeps the old file, which the line is written to all the same (the
+    /// cap is soft while rotation fails), starts the retry interval and logs
+    /// through the stream's throttle. It is not a write failure.
+    fn rotate_if_due(&mut self, incoming: u64) {
+        let Some(file) = self.spec.file.as_mut() else {
+            return;
+        };
+        let size = file.size();
+        if size == 0 || size.saturating_add(incoming) <= self.cap_bytes {
+            return;
+        }
+        let now = Instant::now();
+        let waiting = self
+            .last_rotation_failure
+            .is_some_and(|failed_at| now.saturating_duration_since(failed_at) < self.rotate_retry);
+        if waiting {
+            return;
+        }
+        // What was written is on the device before the file is renamed. Best
+        // effort, as at close: a failed sync leaves nothing else to try.
+        let _ = file.sync();
+        match self
+            .spec
+            .backend
+            .rotate(&self.spec.path, self.kind, self.keep)
+        {
+            Ok(fresh) => {
+                self.spec.file = Some(fresh);
+                self.last_rotation_failure = None;
+            }
+            Err(error) => {
+                self.last_rotation_failure = Some(now);
+                if let Some(suppressed) = self.throttle.admit(now) {
+                    // The path and the error, never a field of the entry.
+                    warn!(
+                        target: "aitm::audit",
+                        stream = self.kind.label(),
+                        path = %self.spec.path.display(),
+                        error_kind = ?error.kind(),
+                        error = %error,
+                        suppressed,
+                        "an audit log rotation failed; lines go to the current file, over its size cap, and the rotation is retried later"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Ends the stream at a `Close`, once everything queued before it has been
+    /// written: marks a hole that nothing was written after (a line refused or
+    /// lost late, with no entry behind it to carry the marker), then syncs.
+    /// The marker is best effort and is not an entry: when it cannot be written
+    /// (or the stream has no file) the hole is left to the live counters and
+    /// nothing is counted again.
+    fn finish(&mut self) {
+        if self.spec.file.is_some() {
+            let _ = self.write_through(None);
+        }
+        if let Some(file) = self.spec.file.as_mut() {
+            // A failed sync leaves nothing further to try at exit.
+            let _ = file.sync();
+        }
+    }
+
+    /// The entry written at `at_ms` was lost to `error`.
+    fn failed(&mut self, at_ms: i64, error: &io::Error) {
         let shared = self.shared;
         shared.degraded.store(true, Ordering::Release);
         shared.write_failures.fetch_add(1, Ordering::Relaxed);
         shared.lock_gap().note_fail(at_ms);
         self.failures = self.failures.saturating_add(1);
-        self.last_error = error;
         if let Some(suppressed) = self.throttle.admit(Instant::now()) {
-            // The path and the kind of error, never a field of the entry.
+            // The path and the error (our own refusals name the path and the
+            // reason; the system's name the cause), never a field of the entry.
             warn!(
                 target: "aitm::audit",
                 stream = self.kind.label(),
                 path = %self.spec.path.display(),
-                error_kind = ?error,
+                error_kind = ?error.kind(),
+                error = %error,
                 suppressed,
                 "an audit log entry was lost to a write error; the stream retries"
             );
@@ -2022,6 +2202,9 @@ mod tests {
         writer_threads: Mutex<Vec<String>>,
         /// How many times the file was synced.
         syncs: AtomicUsize,
+        /// How many lines the file held at each sync, in order: what a sync
+        /// had been asked to make durable.
+        sync_marks: Mutex<Vec<usize>>,
         /// The next this-many writes fail with `StorageFull`.
         fail_next: AtomicUsize,
         /// A write panics.
@@ -2058,6 +2241,10 @@ mod tests {
 
         fn writer_threads(&self) -> Vec<String> {
             lock(&self.writer_threads).clone()
+        }
+
+        fn sync_marks(&self) -> Vec<usize> {
+            lock(&self.sync_marks).clone()
         }
 
         /// Whether the first write is blocked at the gate.
@@ -2111,6 +2298,8 @@ mod tests {
         }
 
         fn sync(&mut self) -> io::Result<()> {
+            let held = lock(&self.0.lines).len();
+            lock(&self.0.sync_marks).push(held);
             self.0.syncs.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -3163,11 +3352,18 @@ mod tests {
                 estimated_left: 0
             }
         );
+        // The refused entry is not on disk, but the hole it left is: nothing was
+        // written after it, so the shutdown itself writes the marker (Task W8).
         assert_eq!(
             fake_shape(&states[1]),
-            ["a0"],
-            "the refused entry is not on disk"
+            ["a0", "gap"],
+            "the refused entry is not on disk; its hole is marked"
         );
+        let gap = &fake_gaps(&states[1])[0];
+        assert_eq!(gap["dropped"], 1);
+        assert_eq!(gap["failed"], 0);
+        assert_eq!(gap["from"], BASE_MS + 1);
+        assert_eq!(gap["to"], BASE_MS + 1);
         assert_eq!(writer.status().dropped, 1);
     }
 
@@ -3656,6 +3852,8 @@ mod tests {
             "aitm::audit",
             "/fake/log-test/the-file.jsonl",
             "StorageFull",
+            // The error's own text, not only its kind (Task W8).
+            "the fake disk is full",
             "suppressed=0",
         ] {
             assert!(warns[0].contains(needle), "the warn lacks {needle}: {log}");
@@ -3678,6 +3876,881 @@ mod tests {
         assert_eq!(
             fake_shape(&state),
             ["gap".to_string(), format!("{LOG_CANARY}-4")]
+        );
+    }
+
+    // ---- rotation and retention (Task W8) ------------------------------
+
+    /// Real files, a cap of 2048 bytes and `keep` rotated files per stream.
+    fn rotating(keep: usize) -> Tuning {
+        Tuning {
+            cap_bytes: [2048; 3],
+            keep: [keep; 3],
+            ..Tuning::production()
+        }
+    }
+
+    /// The agent-origin entry `c<i>` whose line is about 250 bytes.
+    fn fat_entry(i: u64) -> AuditEntry {
+        AuditEntry {
+            args_summary: "x".repeat(150),
+            ..entry(&format!("c{i}"), Frontend::Mcp, BASE_MS + i)
+        }
+    }
+
+    /// `path` with `.n` appended to its whole file name: how a rotated file is
+    /// named.
+    fn numbered(path: &Path, n: usize) -> PathBuf {
+        PathBuf::from(format!("{}.{n}", path.display()))
+    }
+
+    /// One stream's files, oldest first: `F.n` ... `F.1`, `F`, only the ones
+    /// that exist.
+    fn stream_files(path: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let mut n = 1;
+        while numbered(path, n).exists() {
+            files.push(numbered(path, n));
+            n += 1;
+        }
+        files.reverse();
+        files.push(path.to_path_buf());
+        files
+    }
+
+    /// Records `c0` to `c{n - 1}` through the ring, as every audited call does.
+    fn record_fat(ring: &AuditRing, n: u64) {
+        for i in 0..n {
+            ring.append_in(AuditLane::Evidence, fat_entry(i));
+        }
+    }
+
+    /// The file names in `dir`, sorted.
+    fn dir_listing(dir: &Path) -> Vec<String> {
+        let mut found: Vec<String> = fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("list {}: {e}", dir.display()))
+            .flatten()
+            .map(|child| child.file_name().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Makes `dir` refuse new names (`chmod 0500`) while the files already open
+    /// in it stay writable. `false` when it still takes a new file (the process
+    /// is root): the caller reports the skip.
+    #[cfg(unix)]
+    fn lock_directory(dir: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).expect("chmod 0500");
+        let probe = dir.join("probe");
+        let writable = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .is_ok();
+        if writable {
+            let _ = fs::remove_file(&probe);
+            unlock_directory(dir);
+        }
+        !writable
+    }
+
+    #[cfg(unix)]
+    fn unlock_directory(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    }
+
+    /// The real backend that counts the rotations it is asked for.
+    struct CountingBackend {
+        rotates: Arc<AtomicUsize>,
+    }
+
+    impl Backend for CountingBackend {
+        fn open(&mut self, path: &Path, stream: StreamKind) -> io::Result<Box<dyn LogFile>> {
+            FsBackend.open(path, stream)
+        }
+
+        fn rotate(
+            &mut self,
+            path: &Path,
+            stream: StreamKind,
+            keep: usize,
+        ) -> io::Result<Box<dyn LogFile>> {
+            self.rotates.fetch_add(1, Ordering::SeqCst);
+            FsBackend.rotate(path, stream, keep)
+        }
+    }
+
+    /// [`fs_writer`] whose backends count their rotations (one counter, shared).
+    fn counting_fs_writer(
+        dir: &Scratch,
+        tuning: Tuning,
+    ) -> (
+        Arc<AuditRing>,
+        Arc<AuditLogWriter>,
+        [PathBuf; 3],
+        Arc<AtomicUsize>,
+    ) {
+        let rotates = Arc::new(AtomicUsize::new(0));
+        let base = dir.join("audit.jsonl");
+        let paths = StreamKind::ALL.map(|kind| stream_path(&base, kind));
+        let specs = StreamKind::ALL.map(|kind| {
+            let path = stream_path(&base, kind);
+            let file = preflight(&path, kind)
+                .unwrap_or_else(|e| panic!("preflight of the {} stream failed: {e}", kind.label()));
+            StreamSpec {
+                path,
+                backend: Box::new(CountingBackend {
+                    rotates: rotates.clone(),
+                }),
+                file: Some(Box::new(file)),
+            }
+        });
+        let writer = Arc::new(
+            AuditLogWriter::from_specs(specs, tuning).unwrap_or_else(|e| panic!("start: {e}")),
+        );
+        let ring = Arc::new(AuditRing::new(8192));
+        assert!(ring.attach_durable(writer.clone()));
+        (ring, writer, paths, rotates)
+    }
+
+    /// The command of every entry line in `path` that is a number after `c`.
+    fn c_numbers(path: &Path) -> Vec<u64> {
+        entry_commands(path)
+            .iter()
+            .map(|command| {
+                command[1..]
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{command:?} is not c<number>"))
+            })
+            .collect()
+    }
+
+    /// AC23: with room for every rotated file, rotation loses no line and keeps
+    /// them in order; no file is over the cap and each begins with a `start`
+    /// marker. The line that triggers a rotation is written to the new file.
+    #[test]
+    fn rotation_loses_no_line() {
+        let dir = scratch("rotate-all");
+        let (ring, writer, paths) = fs_writer(&dir, rotating(100));
+        record_fat(&ring, 100);
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        let files = stream_files(&paths[1]);
+        let commands: Vec<String> = files.iter().flat_map(|file| entry_commands(file)).collect();
+        let mut problems: Vec<String> = Vec::new();
+        if files.len() < 3 {
+            problems.push(format!(
+                "only {} file(s) for the stream: the file never rotated",
+                files.len()
+            ));
+        }
+        for file in &files {
+            let len = fs::metadata(file).map(|meta| meta.len()).unwrap_or(0);
+            if len > 2048 {
+                problems.push(format!(
+                    "{} holds {len} bytes, over the 2048 cap",
+                    file.display()
+                ));
+            }
+            if !read_lines(file)
+                .first()
+                .is_some_and(|line| line["marker"] == "start")
+            {
+                problems.push(format!(
+                    "{} does not begin with a start marker",
+                    file.display()
+                ));
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+        assert_eq!(commands, names("c", 100), "every line once, in order");
+        assert_eq!(
+            writer.status(),
+            DurableAuditStatus {
+                degraded: false,
+                dropped: 0,
+                write_failures: 0
+            }
+        );
+    }
+
+    /// AC24: with two rotated files kept, the oldest lines are the ones that go,
+    /// and nothing but the three streams' files and the agent's two rotated
+    /// ones is left in the directory.
+    #[test]
+    fn retention_deletes_only_the_oldest_rotated_file() {
+        let dir = scratch("rotate-keep");
+        let (ring, writer, paths) = fs_writer(&dir, rotating(2));
+        record_fat(&ring, 100);
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        assert_eq!(
+            dir_listing(&dir.0),
+            [
+                "audit.agent.jsonl",
+                "audit.agent.jsonl.1",
+                "audit.agent.jsonl.2",
+                "audit.jsonl",
+                "audit.reads.jsonl"
+            ],
+            "the agent stream keeps its file and two rotated ones, no F.3"
+        );
+        let agent = &paths[1];
+        let oldest_first = [numbered(agent, 2), numbered(agent, 1), agent.clone()];
+        let kept: Vec<u64> = oldest_first
+            .iter()
+            .flat_map(|file| c_numbers(file))
+            .collect();
+        assert!(
+            kept.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "the kept lines are not one contiguous run: {kept:?}"
+        );
+        assert_eq!(kept.last(), Some(&99), "the run ends at the newest line");
+        assert!(
+            kept.first().is_some_and(|first| *first > 0),
+            "c0 is the oldest line and must be gone: {kept:?}"
+        );
+        assert!(
+            c_numbers(agent).contains(&99) || c_numbers(&numbered(agent, 1)).contains(&99),
+            "c99 is in F or F.1"
+        );
+        for other in [&paths[0], &paths[2]] {
+            let lines = read_lines(other);
+            assert_eq!(lines.len(), 1, "{} was written to", other.display());
+            assert_eq!(lines[0]["marker"], "start");
+        }
+    }
+
+    /// AC25: a rotation that cannot rename or create never costs a line: every
+    /// line goes to the file that is still open, which grows past the cap, and a
+    /// failed rotation is not a write failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rotation_never_drops_the_line() {
+        let dir = scratch("rotate-fail");
+        let (ring, writer, paths) = fs_writer(&dir, rotating(100));
+        if !lock_directory(&dir.0) {
+            skipped("a_failed_rotation_never_drops_the_line (running as root)");
+            writer.shutdown(FLUSH_BUDGET);
+            return;
+        }
+        record_fat(&ring, 100);
+        let report = writer.shutdown(FLUSH_BUDGET);
+        unlock_directory(&dir.0);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        let agent = &paths[1];
+        assert_eq!(
+            entry_commands(agent),
+            names("c", 100),
+            "all 100 lines are in the active file"
+        );
+        let len = fs::metadata(agent).expect("the active file").len();
+        assert!(
+            len > 2048,
+            "the cap is soft while rotation fails: {len} bytes"
+        );
+        assert!(!numbered(agent, 1).exists(), "nothing rotated");
+        assert_eq!(
+            writer.status(),
+            DurableAuditStatus {
+                degraded: false,
+                dropped: 0,
+                write_failures: 0
+            },
+            "a failed rotation is not a write failure"
+        );
+    }
+
+    /// AC26: a file that is already over the cap at boot (a restart after a long
+    /// run) is rotated by its first write: the old content, then the boot
+    /// `start` marker, are in `F.1`, and `F` is a fresh file.
+    #[test]
+    fn an_oversized_file_rotates_on_its_first_write() {
+        let dir = scratch("rotate-oversized");
+        let base = dir.join("audit.jsonl");
+        let agent = stream_path(&base, StreamKind::Agent);
+        // 50 whole lines of exactly 100 bytes each.
+        let old: String = (0..50)
+            .map(|i| format!("{{\"old\":{i:03},\"pad\":\"{}\"}}\n", "p".repeat(79)))
+            .collect();
+        assert_eq!(old.len(), 5000);
+        fs::write(&agent, &old).expect("pre-fill the agent file");
+
+        let (ring, writer, _paths) = fs_writer(&dir, rotating(3));
+        ring.append_in(AuditLane::Evidence, fat_entry(0));
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        let rotated = fs::read_to_string(numbered(&agent, 1)).expect("F.1 exists");
+        assert!(
+            rotated.starts_with(&old),
+            "F.1 does not begin with the old content"
+        );
+        let boot_marker: Vec<&str> = rotated[old.len()..].lines().collect();
+        assert_eq!(boot_marker.len(), 1, "F.1 ends with the boot start marker");
+        let boot_marker: Value = serde_json::from_str(boot_marker[0]).expect("a JSON marker");
+        assert_eq!(boot_marker["marker"], "start");
+
+        let fresh = read_lines(&agent);
+        assert_eq!(fresh.len(), 2, "F is a start marker and the entry");
+        assert_eq!(fresh[0]["marker"], "start");
+        assert_eq!(fresh[1]["command"], "c0");
+        assert!(!numbered(&agent, 2).exists(), "one rotation, no F.2");
+    }
+
+    /// The oldest slot holding something that is not a regular file makes the
+    /// rotation fail without deleting or renaming anything; the writer keeps
+    /// writing to the file it has.
+    #[cfg(unix)]
+    #[test]
+    fn rotation_never_deletes_a_non_regular_oldest_slot() {
+        let dir = scratch("rotate-slot");
+        let base = dir.join("audit.jsonl");
+        let agent = stream_path(&base, StreamKind::Agent);
+        fs::write(numbered(&agent, 1), "older\n").expect("make F.1");
+        let slot = numbered(&agent, 2);
+        fs::create_dir(&slot).expect("make a directory at F.2");
+        fs::write(slot.join("keep-me"), "precious").expect("fill the directory");
+
+        let (ring, writer, _paths) = fs_writer(&dir, rotating(2));
+        record_fat(&ring, 100);
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        let slot_kind = fs::symlink_metadata(&slot).map(|meta| meta.file_type().is_dir());
+        assert!(slot_kind.unwrap_or(false), "the directory at F.2 is gone");
+        assert_eq!(
+            fs::read_to_string(slot.join("keep-me")).ok().as_deref(),
+            Some("precious"),
+            "the directory's content was touched"
+        );
+        assert_eq!(
+            fs::read_to_string(numbered(&agent, 1)).ok().as_deref(),
+            Some("older\n"),
+            "F.1 was renamed or rewritten although the rotation could not finish"
+        );
+        assert_eq!(
+            entry_commands(&agent),
+            names("c", 100),
+            "no line was lost to the failed rotation"
+        );
+        assert_eq!(writer.status().write_failures, 0);
+    }
+
+    /// A rotation that failed is retried at most once per `rotate_retry`, and
+    /// retried again when the interval has passed: an hour allows one try over a
+    /// hundred lines, no wait allows one per line. The lines are written either way.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rotation_is_retried_once_per_interval() {
+        let run = |retry: Duration| -> Option<(usize, usize)> {
+            let dir = scratch("rotate-retry");
+            let tuning = Tuning {
+                rotate_retry: retry,
+                ..rotating(100)
+            };
+            let (ring, writer, paths, rotates) = counting_fs_writer(&dir, tuning);
+            if !lock_directory(&dir.0) {
+                writer.shutdown(FLUSH_BUDGET);
+                return None;
+            }
+            record_fat(&ring, 100);
+            let report = writer.shutdown(FLUSH_BUDGET);
+            unlock_directory(&dir.0);
+            assert!(report.complete, "the flush did not finish: {report:?}");
+            Some((
+                rotates.load(Ordering::SeqCst),
+                entry_commands(&paths[1]).len(),
+            ))
+        };
+
+        let Some((once, kept)) = run(Duration::from_secs(3600)) else {
+            skipped("a_failed_rotation_is_retried_once_per_interval (running as root)");
+            return;
+        };
+        assert_eq!((once, kept), (1, 100), "an hour between tries: one try");
+        let (every_line, kept) = run(Duration::ZERO).expect("the first run was not skipped");
+        assert_eq!(kept, 100, "no line lost");
+        assert!(
+            every_line > 10,
+            "no wait between tries: expected a try per line past the cap, got {every_line}"
+        );
+    }
+
+    /// A rotation that fails and then succeeds loses nothing across the change:
+    /// the file that outgrew the cap while the directory was locked is kept whole
+    /// as a rotated file, and the lines written after are in a fresh one.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rotation_succeeds_once_the_directory_allows_it() {
+        let dir = scratch("rotate-recover");
+        let tuning = Tuning {
+            rotate_retry: Duration::ZERO,
+            ..rotating(100)
+        };
+        let (ring, writer, paths) = fs_writer(&dir, tuning);
+        if !lock_directory(&dir.0) {
+            skipped("a_failed_rotation_succeeds_once_the_directory_allows_it (running as root)");
+            writer.shutdown(FLUSH_BUDGET);
+            return;
+        }
+        for i in 0..20 {
+            ring.append_in(AuditLane::Evidence, fat_entry(i));
+        }
+        let agent = paths[1].clone();
+        let written = wait_until(Duration::from_secs(2), || {
+            fs::read_to_string(&agent)
+                .map(|text| text.lines().filter(|l| l.contains("\"command\"")).count() == 20)
+                .unwrap_or(false)
+        });
+        unlock_directory(&dir.0);
+        assert!(written, "the first twenty lines were not written");
+        for i in 20..40 {
+            ring.append_in(AuditLane::Evidence, fat_entry(i));
+        }
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        let files = stream_files(&agent);
+        let commands: Vec<String> = files.iter().flat_map(|file| entry_commands(file)).collect();
+        assert_eq!(commands, names("c", 40), "every line once, in order");
+        assert!(
+            files.len() >= 2,
+            "the file rotated once the directory allowed it"
+        );
+        let first = fs::metadata(&files[0]).expect("the oldest file").len();
+        assert!(
+            first > 2048,
+            "the file kept through the failures: {first} bytes"
+        );
+        assert_eq!(writer.status().write_failures, 0);
+    }
+
+    /// The fake backend refuses to rotate (the trait default), so a stream over
+    /// a small cap fails to rotate on every entry past it. One warn reaches the
+    /// log for those failures (the throttle holds the rest back), it names the
+    /// path and the error, never an entry field, and every entry is written.
+    #[test]
+    fn a_failed_rotation_is_logged_once_through_the_throttle() {
+        let run = || {
+            let state = FakeState::plain();
+            let spec = StreamSpec {
+                path: PathBuf::from("/fake/rotation-log/the-file.jsonl"),
+                backend: Box::new(FakeBackend(state.clone())),
+                file: Some(Box::new(FakeFile(state.clone()))),
+            };
+            let tuning = Tuning {
+                cap_bytes: [100; 3],
+                rotate_retry: Duration::ZERO,
+                warn_every: Duration::from_secs(3600),
+                ..Tuning::production()
+            };
+            let shared = StreamShared::default();
+            let (tx, rx) = sync_channel(8);
+            for i in 1..=4 {
+                let queued = AuditEntry {
+                    args_summary: format!("{{\"token\":\"{LOG_CANARY}\"}}"),
+                    ..entry(&format!("{LOG_CANARY}-{i}"), Frontend::Mcp, BASE_MS + i)
+                };
+                shared.queued.fetch_add(1, Ordering::Relaxed);
+                tx.send(Msg::Entry(queued)).expect("queue an entry");
+            }
+            tx.send(Msg::Close).expect("queue the close");
+            run_stream(rx, spec, &shared, StreamKind::Agent, &tuning);
+            (shared, state)
+        };
+        let (log, (shared, state)) = logged_until("WARN", run);
+
+        let warns: Vec<&str> = log.lines().filter(|line| line.contains("WARN")).collect();
+        assert_eq!(warns.len(), 1, "one warn for three failed rotations: {log}");
+        for needle in [
+            "aitm::audit",
+            "/fake/rotation-log/the-file.jsonl",
+            "Unsupported",
+            "rotation",
+            "suppressed=0",
+        ] {
+            assert!(warns[0].contains(needle), "the warn lacks {needle}: {log}");
+        }
+        assert_eq!(log.lines().count(), 1, "nothing else is logged: {log}");
+        assert!(
+            !log.contains(LOG_CANARY),
+            "an entry field reached the log: {log}"
+        );
+        assert_eq!(
+            fake_entry_count(&state),
+            4,
+            "a failed rotation never costs a line"
+        );
+        assert_eq!(shared.write_failures.load(Ordering::Relaxed), 0);
+        assert!(!shared.degraded.load(Ordering::Relaxed));
+        assert_eq!(
+            state.syncs.load(Ordering::SeqCst),
+            3 + 1,
+            "the file is synced before each try at moving it, and once at close"
+        );
+    }
+
+    /// Spec Design 8: rotate when `size + line.len() > M`: a line that exactly
+    /// fills the cap stays, one byte more rotates, and the `gap` marker that is
+    /// pending is part of what has to fit. Driven by hand over a real file whose
+    /// sizes are measured, so the cap can be set to the byte.
+    #[test]
+    fn the_cap_is_exact_and_counts_the_pending_gap_marker() {
+        let rotated_with = |hole: bool, spare: i64| -> bool {
+            let dir = scratch("rotate-exact");
+            let path = dir.join("audit.agent.jsonl");
+            let file = preflight(&path, StreamKind::Agent).expect("preflight");
+            let boot = LogFile::size(&file) as i64;
+            let queued = fat_entry(0);
+            let line = aitm_ca::audit::entry_to_jsonl(&queued).len() as i64 + 1;
+            let mut gap = GapState::default();
+            gap.note_drop((BASE_MS + 5) as i64);
+            let marker = if hole {
+                marker_for(&gap).len() as i64 + 1
+            } else {
+                0
+            };
+            let cap = (boot + line + marker + spare) as u64;
+
+            let spec = StreamSpec {
+                path: path.clone(),
+                backend: Box::new(FsBackend),
+                file: Some(Box::new(file)),
+            };
+            let tuning = Tuning {
+                cap_bytes: [cap; 3],
+                keep: [3; 3],
+                ..Tuning::production()
+            };
+            let shared = StreamShared::default();
+            if hole {
+                shared.lock_gap().note_drop((BASE_MS + 5) as i64);
+            }
+            let mut writer = StreamWriter::new(StreamKind::Agent, spec, &shared, &tuning);
+            writer.write_entry(&queued);
+            drop(writer);
+
+            // Rotated or not, the active file reads: start, the gap if there was
+            // one, then the entry. Rotated, the old file is only the boot marker.
+            let want: &[&str] = if hole {
+                &["start", "gap", "c0"]
+            } else {
+                &["start", "c0"]
+            };
+            let lines = read_lines(&path);
+            let shape: Vec<&str> = lines
+                .iter()
+                .map(|line| {
+                    line["command"]
+                        .as_str()
+                        .or(line["marker"].as_str())
+                        .unwrap_or("?")
+                })
+                .collect();
+            assert_eq!(shape, want, "hole {hole}, spare {spare}");
+            let rotated = numbered(&path, 1).exists();
+            if rotated {
+                assert_eq!(
+                    read_lines(&numbered(&path, 1)).len(),
+                    1,
+                    "the rotated file is only the boot marker"
+                );
+            }
+            rotated
+        };
+
+        assert!(!rotated_with(false, 0), "a line that exactly fills the cap");
+        assert!(rotated_with(false, -1), "a line one byte over the cap");
+        assert!(
+            !rotated_with(true, 0),
+            "marker and line that exactly fill the cap"
+        );
+        assert!(
+            rotated_with(true, -1),
+            "the pending marker counts: marker and line one byte over the cap"
+        );
+    }
+
+    /// Each stream rotates by its own cap and keeps its own number of rotated
+    /// files, not another stream's: three different caps and keeps, the same
+    /// hundred lines through each.
+    #[test]
+    fn each_stream_rotates_by_its_own_cap_and_keep() {
+        let dir = scratch("rotate-own");
+        let tuning = Tuning {
+            cap_bytes: [1024, 2048, 4096],
+            keep: [1, 2, 3],
+            ..Tuning::production()
+        };
+        let (ring, writer, _paths) = fs_writer(&dir, tuning);
+        for i in 0..100 {
+            let fat = fat_entry(i);
+            let operator = AuditEntry {
+                origin: Frontend::Operator,
+                ..fat.clone()
+            };
+            ring.append_in(AuditLane::Evidence, operator);
+            ring.append_in(AuditLane::Evidence, fat.clone());
+            ring.append_in(AuditLane::Routine, fat);
+        }
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        assert_eq!(
+            dir_listing(&dir.0),
+            [
+                "audit.agent.jsonl",
+                "audit.agent.jsonl.1",
+                "audit.agent.jsonl.2",
+                "audit.jsonl",
+                "audit.jsonl.1",
+                "audit.reads.jsonl",
+                "audit.reads.jsonl.1",
+                "audit.reads.jsonl.2",
+                "audit.reads.jsonl.3",
+            ],
+            "control keeps 1 rotated file, agent 2, reads 3"
+        );
+        let limits = [
+            (&dir.join("audit.jsonl"), 1024),
+            (&dir.join("audit.agent.jsonl"), 2048),
+            (&dir.join("audit.reads.jsonl"), 4096),
+        ];
+        // A rotated file is full: the line that did not fit (under 300 bytes
+        // here) would have taken it past its stream's cap. So a file is neither
+        // over its own cap nor rotated early by a smaller stream's.
+        let mut off: Vec<String> = Vec::new();
+        for (active, cap) in limits {
+            for file in stream_files(active) {
+                let len = fs::metadata(&file).map(|meta| meta.len()).unwrap_or(0);
+                if len > cap {
+                    off.push(format!(
+                        "{} holds {len} bytes, over its {cap} cap",
+                        file.display()
+                    ));
+                }
+                if file != *active && len + 300 <= cap {
+                    off.push(format!(
+                        "{} holds {len} bytes: rotated well before its {cap} cap",
+                        file.display()
+                    ));
+                }
+            }
+        }
+        assert!(off.is_empty(), "{}", off.join("\n"));
+    }
+
+    // ---- the reason in the log, and the gap at shutdown (Task W8) ------
+
+    /// Runs `run` under a subscriber scoped to this thread and returns what it
+    /// logged beside what it returned.
+    fn logged<T>(run: impl FnOnce() -> T) -> (String, T) {
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let capture = capture.clone();
+                move || capture.clone()
+            })
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, run);
+        (capture.text(), out)
+    }
+
+    /// [`logged`] again while the log has no `level` line: `tracing` can cache
+    /// "nobody listens" for a callsite another thread reached first (see
+    /// `failures_are_logged_once_and_the_recovery_names_the_stream`), and one
+    /// more attempt sees the event.
+    fn logged_until<T>(level: &str, mut run: impl FnMut() -> T) -> (String, T) {
+        let mut attempt = logged(&mut run);
+        for _ in 0..4 {
+            if attempt.0.contains(level) {
+                break;
+            }
+            attempt = logged(&mut run);
+        }
+        attempt
+    }
+
+    /// The log of one stream over `path` with the real backend and no open file,
+    /// which is asked to write one entry that carries [`LOG_CANARY`].
+    #[cfg(unix)]
+    fn log_of_a_refused_stream(path: &Path) -> String {
+        let (log, ()) = logged_until("WARN", || {
+            let spec = StreamSpec {
+                path: path.to_path_buf(),
+                backend: Box::new(FsBackend),
+                file: None,
+            };
+            let tuning = Tuning {
+                reopen: Duration::ZERO,
+                ..Tuning::production()
+            };
+            let shared = StreamShared::default();
+            let (tx, rx) = sync_channel(4);
+            let queued = AuditEntry {
+                args_summary: format!("{{\"token\":\"{LOG_CANARY}\"}}"),
+                ..entry(&format!("{LOG_CANARY}-1"), Frontend::Mcp, BASE_MS)
+            };
+            shared.queued.fetch_add(1, Ordering::Relaxed);
+            tx.send(Msg::Entry(queued)).expect("queue an entry");
+            tx.send(Msg::Close).expect("queue the close");
+            run_stream(rx, spec, &shared, StreamKind::Agent, &tuning);
+        });
+        log
+    }
+
+    /// A refusal by the preflight reaches the log with its reason (a symbolic
+    /// link, a second hard link, a world-writable parent, a directory), not only
+    /// the `io::ErrorKind` every one of them shares; and no entry field does.
+    #[cfg(unix)]
+    #[test]
+    fn a_preflight_refusal_is_logged_with_its_reason_and_no_entry_field() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = scratch("refusal-log");
+        let mut rows: Vec<(&str, PathBuf, &str)> = Vec::new();
+
+        let target = dir.join("target.txt");
+        fs::write(&target, "keep\n").expect("write the link target");
+        let link = dir.join("link.jsonl");
+        symlink(&target, &link).expect("make the symlink");
+        rows.push(("symbolic link", link, "symbolic link"));
+
+        let first = dir.join("hard-a.jsonl");
+        fs::write(&first, "x\n").expect("write the hard link source");
+        fs::hard_link(&first, dir.join("hard-b.jsonl")).expect("make the hard link");
+        rows.push(("hard link", first, "hard links"));
+
+        let open_dir = dir.join("open-dir");
+        fs::create_dir(&open_dir).expect("make the world-writable parent");
+        fs::set_permissions(&open_dir, fs::Permissions::from_mode(0o777)).expect("chmod 0777");
+        rows.push((
+            "world-writable parent",
+            open_dir.join("audit.agent.jsonl"),
+            "world-writable",
+        ));
+
+        let directory = dir.join("a-directory.jsonl");
+        fs::create_dir(&directory).expect("make the directory");
+        rows.push(("directory", directory, "not a regular file"));
+
+        let mut failures: Vec<String> = Vec::new();
+        for (label, path, reason) in rows {
+            let log = log_of_a_refused_stream(&path);
+            if !log.contains(reason) {
+                failures.push(format!("{label}: the log lacks {reason:?}: {log}"));
+            }
+            if !log.contains(&path.display().to_string()) {
+                failures.push(format!("{label}: the log lacks the path: {log}"));
+            }
+            if log.contains(LOG_CANARY) {
+                failures.push(format!("{label}: an entry field reached the log: {log}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} row(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// An entry that fails fast, inside the reopen interval, reports the error
+    /// that closed the stream, not a message of its own: the one warn an hour
+    /// later is as informative as the first.
+    #[test]
+    fn an_entry_that_fails_fast_reports_the_reason_of_the_last_real_error() {
+        let state = FakeState::plain();
+        state.fail_open.store(true, Ordering::SeqCst);
+        let shared = StreamShared::default();
+        let mut writer = hand_driven(&state, false, &shared);
+
+        let first = writer.try_write("a").expect_err("the open fails");
+        let second = writer
+            .try_write("b")
+            .expect_err("the interval has not passed");
+        assert_eq!(state.open_calls.load(Ordering::SeqCst), 1, "no second open");
+        assert_eq!(first.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(second.kind(), first.kind());
+        assert!(
+            second.to_string().contains("the fake disk refuses to open"),
+            "the fast failure lost the reason: {second}"
+        );
+    }
+
+    /// A hole noted after the last entry was written is marked in the file by
+    /// the shutdown itself, before the final sync, so that a reader sees it. A
+    /// stream with nothing pending is not touched.
+    #[test]
+    fn a_hole_with_no_later_entry_is_marked_at_shutdown_before_the_sync() {
+        let states = FakeState::three();
+        let writer = fake_writer(&states, Tuning::production());
+        let agent = &writer.streams[StreamKind::Agent.index()];
+        agent.shared.lock_gap().note_drop((BASE_MS + 7) as i64);
+        agent.shared.lock_gap().note_drop((BASE_MS + 9) as i64);
+
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        assert_eq!(fake_shape(&states[1]), ["gap"]);
+        let gap = &fake_gaps(&states[1])[0];
+        assert_eq!(gap["dropped"], 2);
+        assert_eq!(gap["failed"], 0);
+        assert_eq!(gap["from"], BASE_MS + 7);
+        assert_eq!(gap["to"], BASE_MS + 9);
+        assert_eq!(
+            states[1].sync_marks(),
+            [1],
+            "the one sync came after the marker was written"
+        );
+        for untouched in [&states[0], &states[2]] {
+            assert!(
+                untouched.lines().is_empty(),
+                "a stream with no hole must not be written at shutdown"
+            );
+        }
+    }
+
+    /// The marker at shutdown is best effort: when its write fails the shutdown
+    /// still completes, and the counters say what they said (the live counters
+    /// are what is left to report the hole).
+    #[test]
+    fn a_gap_marker_that_fails_at_shutdown_changes_no_counter() {
+        let (states, writer, _release) = stuck_agent_writer(agent_queue(8));
+        let first = writer.shutdown(Duration::from_millis(100));
+        assert!(!first.complete, "the stuck writer cannot have finished");
+        writer.record(AuditLane::Evidence, agent_entry(1));
+        assert_eq!(writer.status().dropped, 1, "refused: a hole is pending");
+
+        // a0 is past the failure check, so the marker's write is the next to fail.
+        states[1].fail_next.store(1, Ordering::SeqCst);
+        states[1].release();
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        assert_eq!(
+            fake_shape(&states[1]),
+            ["a0"],
+            "the marker could not be written"
+        );
+        assert_eq!(
+            writer.status(),
+            DurableAuditStatus {
+                degraded: false,
+                dropped: 1,
+                write_failures: 0
+            }
         );
     }
 }
