@@ -19,9 +19,7 @@ struct StatusBar: View {
                 if let notice = session.clearNotice {
                     HStack(spacing: Tok.Metric.gapTight) {
                         Text("\(notice.text) —")
-                        Button("Undo") { session.undoClear() }
-                            .buttonStyle(.plain)
-                            .foregroundStyle(Tok.Ink.primary.color)
+                        SmallButton("Undo") { session.undoClear() }
                             .help("Put the cleared flows back (⌘Z)")
                     }
                     .accessibilityIdentifier("clear-notice")

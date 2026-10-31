@@ -117,8 +117,8 @@ final class Session {
         }
     }
     /// Rows an undone Clear put back. The core no longer holds them, so the live poll keeps them
-    /// ahead of what it lists; a later Clear or Delete drops them for good.
-    var retainedRows: [FlowRow] = []
+    /// ahead of what it lists (`ClearedFlows.merge`); a later Clear or Delete drops them for good.
+    var restoredFlows: [FlowRow] = []
     /// "Cleared n flows — Undo" in the status bar, for a few seconds after a Clear.
     var clearNotice: ClearNotice?
     /// What the last Clear dropped, until it is undone or the notice lapses.
@@ -599,19 +599,4 @@ final class Session {
         findingsCount = poc.findings.count
         scan.loadFixture()
     }
-}
-
-/// What Clear dropped, kept for one undo step (review D2, rule 43).
-struct ClearedFlows {
-    var rows: [FlowRow]
-    var details: [FlowID: FlowDetail]
-    var wsDetails: [FlowID: WSDetail]
-    var l4Details: [FlowID: L4Flow]
-    var selection: Set<FlowID>
-    var focused: FlowID?
-}
-
-struct ClearNotice: Equatable {
-    var count: Int
-    var text: String { "Cleared \(count) flow\(count == 1 ? "" : "s")" }
 }

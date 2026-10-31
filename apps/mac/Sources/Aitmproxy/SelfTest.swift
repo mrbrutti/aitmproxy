@@ -128,14 +128,15 @@ enum SelfTest {
             session.clearSession(confirm: { _ in true })
             await settle { session.rows.isEmpty }
             check("clearing empties the session", session.rows.isEmpty && session.focused == nil)
-            // D2: Clear keeps one undo step and says so in the status bar.
-            check("Clear registers Undo Clear and the notice", session.clearUndoManager?.canUndo == true
-                && session.clearUndoManager?.undoActionName == "Clear" && session.clearNotice?.count == beforeClear.count)
+            // D2: Clear keeps one undo step (Edit > Undo Clear) and says so in the status bar.
+            check("clear shows the notice with the count and registers Undo Clear",
+                  session.clearNotice?.count == beforeClear.count && session.clearUndoManager?.canUndo == true
+                      && session.clearUndoManager?.undoActionName == "Clear")
             session.clearUndoManager?.undo()
-            check("Undo Clear restores the rows, selection and focus",
-                  session.rows == beforeClear && session.focused == focusBeforeClear
-                      && session.selection == [focusBeforeClear!] && session.clearNotice == nil,
+            check("undo restores the rows, selection and focused flow",
+                  session.rows == beforeClear && session.focused == focusBeforeClear && session.selection == [focusBeforeClear!],
                   "rows \(session.rows.count) of \(beforeClear.count), focused \(String(describing: session.focused))")
+            check("undo dismisses the notice and the step", session.clearNotice == nil && session.clearUndoManager?.canUndo == false)
             session.clearSession(confirm: { _ in true })
             await settle { session.rows.isEmpty }
 

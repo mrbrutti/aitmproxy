@@ -134,7 +134,7 @@ extension Session {
         if pausedCount > 0, !confirm(pausedCount) { return }
         let dropped = ClearedFlows(rows: rows, details: details, wsDetails: wsDetails, l4Details: l4Details,
                                    selection: selection, focused: focused)
-        retainedRows = []
+        restoredFlows = []
         perform("clear") { [self] in try await actions.clear() }
         guard !dropped.rows.isEmpty else { return }
         clearedFlows = dropped
@@ -158,9 +158,8 @@ extension Session {
         clearedFlows = nil
         clearNoticeTask?.cancel()
         clearNotice = nil
-        let restoredIDs = Set(dropped.rows.map(\.id))
-        retainedRows = dropped.rows
-        rows = dropped.rows + rows.filter { !restoredIDs.contains($0.id) }
+        restoredFlows = dropped.rows
+        rows = ClearedFlows.merge(restored: dropped.rows, newer: rows)
         details.merge(dropped.details) { current, _ in current }
         wsDetails.merge(dropped.wsDetails) { current, _ in current }
         l4Details.merge(dropped.l4Details) { current, _ in current }
@@ -233,7 +232,7 @@ extension Session {
             kill(id)
         } else {
             rows.removeAll { $0.id == id }
-            retainedRows.removeAll { $0.id == id }
+            restoredFlows.removeAll { $0.id == id }
             selection.remove(id)
             if focused == id { focused = nil }
         }
