@@ -91,7 +91,9 @@ struct ScopePanel: View {
     private var addRow: some View {
         VStack(alignment: .leading, spacing: Space.xs) {
             HStack(spacing: Space.sm) {
-                TextField("host, host:port or *.wildcard", text: $draft)
+                // Port-qualified for now: a bare host also claims the app's DNS lookup (see
+                // ConnectionSummary.scopeEntryHint); the hint goes when the provider fix lands.
+                TextField("host:443 or host:80 (for now), host:port or *.wildcard:port", text: $draft)
                     .textFieldStyle(.plain)
                     .font(Tok.Face.data(Tok.Typography.Size.md))
                     .padding(.horizontal, Space.sm)

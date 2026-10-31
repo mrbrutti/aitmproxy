@@ -16,6 +16,14 @@ struct StatusBar: View {
                 .help("Follow the newest flow as it arrives (⇧⌘A)")
             Spacer()
             HStack(spacing: Tok.Metric.gapMeta) {
+                if let notice = session.clearNotice {
+                    HStack(spacing: Tok.Metric.gapTight) {
+                        Text("\(notice.text) —")
+                        SmallButton("Undo") { session.undoClear() }
+                            .help("Put the cleared flows back (⌘Z)")
+                    }
+                    .accessibilityIdentifier("clear-notice")
+                }
                 if let error = session.lastError {
                     Label(error, systemImage: "exclamationmark.triangle")
                         .labelStyle(.titleAndIcon)
@@ -40,23 +48,24 @@ struct StatusBar: View {
                 if session.memoryBytes > 0 { Text(Format.bytes(session.memoryBytes)) }
                 Text("↑ \(Format.rate(session.upBytesPerSecond))")
                 Text("↓ \(Format.rate(session.downBytesPerSecond))")
-                // The embedded core's health (Task 8): present only when the app
-                // manages its own core; an external connection shows the bus dot alone.
-                if let connection = session.coreHealth.connection {
-                    CoreHealthDot(connection: connection) { session.coreLogVisible.toggle() }
+                // One connection item, from the same table as the Status page: the worst lane's
+                // name and word while something needs attention, a single "connected" dot when all
+                // is well. The sidebar's brand row and the Status page carry the rest; the bar
+                // never repeats them (rule 64: small facts only, down here).
+                let summary = session.connectionSummary
+                let worst = summary.worst
+                Button { session.show(.status) } label: {
+                    HStack(spacing: Tok.Metric.gapTight) {
+                        Circle().fill(worst.state.color.color).frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
+                        Text(summary.overallWord)
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(summary.overall == .ok ? Tok.Ink.secondary.color : worst.state.color.color)
+                    .contentShape(Rectangle())
                 }
-                HStack(spacing: Tok.Metric.gapTight) {
-                    Circle().fill(busColor.color).frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
-                    Text(busText)
-                }
-                if let role = session.resolvedRole {
-                    Label(role, systemImage: roleSymbol(role))
-                        .labelStyle(.titleAndIcon)
-                        .foregroundStyle(session.roleWarning ? Tok.Status.serverError.color : Tok.Ink.secondary.color)
-                        .help(session.roleWarning
-                            ? "Connected as \(role), not the role you expected (Settings ▸ Bus)"
-                            : "Connected as \(role)")
-                }
+                .buttonStyle(.plain)
+                .help(summary.tooltip + "\nOpens Status (⌘0)")
+                .accessibilityLabel("Connection: \(summary.spoken)")
             }
             .font(Tok.Face.data(Tok.Typography.Size.sm))
         }
@@ -68,30 +77,6 @@ struct StatusBar: View {
         .background(Tok.Ground.raised.color)
         .overlay(alignment: .top) { Rule() }
         .dimsWhenInactive()
-    }
-
-    private var busColor: DynamicColor {
-        switch session.bus {
-        case .connected: Tok.Status.success
-        case .connecting: Tok.Intercept.base
-        case .disconnected: Tok.Ink.tertiary
-        case .failed: Tok.Status.serverError
-        }
-    }
-
-    /// A key badge for operator, a plain person for agent, a warning triangle on mismatch.
-    private func roleSymbol(_ role: String) -> String {
-        if session.roleWarning { return "exclamationmark.triangle.fill" }
-        return role == "operator" ? "person.badge.key.fill" : "person.fill"
-    }
-
-    private var busText: String {
-        switch session.bus {
-        case .connected(let addr): "bus \(addr)"
-        case .connecting(let addr): "connecting \(addr)"
-        case .disconnected: "bus offline"
-        case .failed(let why): "bus: \(why)"
-        }
     }
 }
 

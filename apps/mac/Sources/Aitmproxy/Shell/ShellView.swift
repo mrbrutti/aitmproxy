@@ -90,7 +90,7 @@ struct ShellView: View {
                 // surface (Task 8) drives the status dot + core-log panel.
                 let controller = EmbeddedCoreController(coreID: session.activeCoreID, bus: service, health: session.coreHealth)
                 let driver = LiveConnectionDriver(embedded: controller, bus: service)
-                let model = ActiveConnectionModel(driver: driver, persistence: UserDefaultsActiveKindPersistence())
+                let model = ActiveConnectionModel(driver: driver, persistence: UserDefaultsActiveKindPersistence(defaults: Store.defaults))
                 model.activate()
                 session.connection = model
                 embeddedCore = controller
@@ -134,6 +134,8 @@ struct MainView: View {
     /// The page's own panel, or the flow list with the inspector.
     @ViewBuilder private var content: some View {
         switch session.page ?? .apps {
+        case .status: StatusPanel()
+        case .saved: SavedPanel()
         case .overview: OverviewPanel()
         case .scan: ScanPanel(state: session.scan)
         case .findings: FindingsPanel(state: session.poc)

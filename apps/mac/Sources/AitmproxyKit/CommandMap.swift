@@ -117,6 +117,12 @@ public enum CommandMap {
         typealias I = CommandMapEntry.Item
         func one(_ title: String, _ shortcut: String?) -> [I] { [I([title], shortcut.flatMap(Shortcut.init(display:)))] }
         func toggle(_ titles: [String], _ shortcut: String?) -> [I] { [I(titles, shortcut.flatMap(Shortcut.init(display:)))] }
+        // A row verb's titles, key equivalent and list key come from the verb table, never retyped here.
+        func verb(_ v: FlowVerb) -> [I] {
+            let item = VerbTable.item(v, for: nil)
+            return [I(VerbTable.titles(v), item.shortcut ?? item.key.map { Shortcut($0) })]
+        }
+        func listKey(_ v: FlowVerb) -> String? { VerbTable.item(v, for: nil).key }
         let chips = ["All", "HTTP", "HTTPS", "WebSocket", "h1", "h2", "JSON", "Form", "XML"]
         return [
             E("File", "Compose Request…", "⌘N (`n`)", items: one("Compose Request…", "⌘N"), listKey: "n"),
@@ -126,25 +132,25 @@ public enum CommandMap {
             E("File", "Clear Session", "⌘⌫", items: one("Clear Session", "⌘⌫")),
 
             E("Flow", "Arm/Disarm Intercept", "`i`", items: toggle(["Arm Intercept", "Disarm Intercept"], "i"), listKey: "i"),
-            E("Flow", "Resume / Apply & Resume", "⌘⏎", items: toggle(["Resume", "Apply & Resume"], "⌘⏎")),
+            E("Flow", "Resume / Apply & Resume", "⌘⏎", items: verb(.resume)),
             E("Flow", "Resume All", "⌥⌘⏎", items: one("Resume All", "⌥⌘⏎")),
-            E("Flow", "Kill…", "⌘\\", items: toggle(["Kill", "Kill…"], "⌘\\")),
-            E("Flow", "Edit Paused Request", "`e`", items: one("Edit Paused Request", "e"), listKey: "e"),
+            E("Flow", "Kill…", "⌘\\", items: verb(.kill)),
+            E("Flow", "Edit Paused Request", "`e`", items: verb(.edit), listKey: listKey(.edit)),
             E("Flow", "Revert to Original", "⌘Z (in editor)", items: one("Revert to Original", nil),
               scope: .inContext("⌘Z is Undo in the request editor")),
-            E("Flow", "Replay", "`r`", items: one("Replay", "r"), listKey: "r"),
-            E("Flow", "Edit & Replay", "⇧R", items: one("Edit & Replay…", "⇧R")),
-            E("Flow", "Kill/Delete", "`d`", items: toggle(["Kill", "Delete"], "d"), listKey: "d"),
-            E("Flow", "Mark", "`m`", items: one("Mark", nil), scope: .inContext("m opens the mark menu on the row"), listKey: "m"),
-            E("Flow", "Comment…", "⌘L (`c`)", items: toggle(["Comment…", "Edit Comment…"], "⌘L"), listKey: "c"),
-            E("Flow", "Pin Host", "⇧P", items: toggle(["Pin Host", "Unpin Host"], "⇧P")),
-            E("Flow", "Build PoC from Flow…", "`p`", items: one("Build PoC from Flow…", "p"), listKey: "p"),
+            E("Flow", "Replay", "`r`", items: verb(.replay), listKey: listKey(.replay)),
+            E("Flow", "Edit & Replay", "⇧R", items: verb(.editAndReplay)),
+            E("Flow", "Kill/Delete", "`d`", items: verb(.delete), listKey: listKey(.delete)),
+            E("Flow", "Mark", "`m`", items: verb(.mark(nil)), scope: .inContext("m opens the mark menu on the row"), listKey: listKey(.mark(nil))),
+            E("Flow", "Comment…", "⌘L (`c`)", items: verb(.comment), listKey: listKey(.comment)),
+            E("Flow", "Pin Host", "⇧P", items: verb(.pinHost)),
+            E("Flow", "Build PoC from Flow…", "`p`", items: verb(.buildPoC), listKey: listKey(.buildPoC)),
             E("Flow", "Add Host to Scope…", "⇧S", items: one("Add Host to Scope…", "⇧S")),
             E("Flow", "Copy as cURL / httpie / Python / fetch", "⇧⌘C",
               items: [I("Copy as cURL", "⇧⌘C"), I(["Copy as httpie"]), I(["Copy as Python (requests)"]), I(["Copy as fetch"])]),
             E("Flow", "Diff Selected", "⌘D", items: one("Diff Selected", "⌘D")),
-            E("Flow", "Quick Look Body", "Space", items: one("Quick Look Body", nil),
-              scope: .inContext("Space on the focused list"), listKey: " "),
+            E("Flow", "Quick Look Body", "Space", items: verb(.quickLook),
+              scope: .inContext("Space on the focused list"), listKey: listKey(.quickLook)),
             E("Flow", "Focus Inspector", "⏎", items: one("Focus Inspector", nil),
               scope: .deferred("the inspector has no single focus target yet"), listKey: "\r"),
 
@@ -164,6 +170,7 @@ public enum CommandMap {
             E("Agent", "Activity Log…", "⇧⌘L", items: toggle(["Activity Log…", "Hide Activity Log"], "⇧⌘L")),
             E("Agent", "Approve Pending Request", "⌥⏎", items: one("Approve Pending Request", "⌥⏎")),
 
+            E("Proxy", "Status", "⌘0", items: one("Status", "⌘0")),
             E("Proxy", "Scope…", "⇧⌘O", items: one("Scope…", "⇧⌘O")),
             E("Proxy", "Breakpoint Rules…", "⇧⌘B", items: one("Breakpoint Rules…", "⇧⌘B")),
             E("Proxy", "Certificate Authority…", nil, items: one("Certificate Authority…", nil)),

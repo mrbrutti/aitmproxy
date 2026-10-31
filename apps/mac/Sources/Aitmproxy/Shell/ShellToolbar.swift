@@ -41,56 +41,46 @@ struct ShellToolbar: ToolbarContent {
     }
 }
 
-/// `● aitmproxy · listening 127.0.0.1:8080 · HTTP/2`; the dot is green when
-/// listening, grey when paused, amber while intercept is armed.
+/// `● aitmproxy · 127.0.0.1:8080 · ● bus · ◐ on, nothing in scope`: the three connection
+/// lanes in the words the Status page uses, calm (dot only) while a lane is fine, worded
+/// when it needs attention. Clicking opens the Status page. The core lane carries the
+/// bound proxy address; "paused" and "intercept armed" stay as the capture-state words.
 struct ListeningPill: View {
     @Environment(Session.self) private var session
 
-    /// The embedded core's health bucket, or `nil` for an external core (then the
-    /// pill follows capture/intercept as before, since the app does not own it).
-    private var coreHealth: CoreHealth? { session.coreHealth.health }
-
-    private var dot: DynamicColor {
-        switch coreHealth {
-        case .failed: return Tok.Status.serverError
-        case .restarting: return Tok.Intercept.base
-        default:
-            if !session.capturing { return Tok.Ink.tertiary }
-            return session.interceptArmed ? Tok.Intercept.base : Tok.Status.success
-        }
-    }
-
     var body: some View {
-        HStack(spacing: Space.sm) {
-            Circle().fill(dot.color).frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
-            HStack(spacing: 0) {
-                Text("aitmproxy").fontWeight(.medium).foregroundStyle(Tok.Ink.primary.color)
-                // The pill must tell the truth about the core: a failed embedded core
-                // is not listening, so it must not keep reading "listening …".
-                switch coreHealth {
-                // One word per core state, shared with `CoreHealthDot` (B10).
-                case .failed:
-                    Text(" · \(CoreHealth.failed.statusWord) — not listening")
-                case .restarting:
-                    Text(" · \(CoreHealth.restarting.statusWord)")
-                default:
-                    Text(" · \(session.capturing ? "listening" : "paused") ")
-                    Text(session.coreHealth.connection?.proxyAddress ?? session.listenAddress)
-                        .font(Tok.Face.data(Tok.Typography.Size.sm, .medium))
-                        .foregroundStyle(Tok.Ink.primary.color)
-                    Text(" · HTTP/2")
-                    if session.interceptArmed { Text(" · intercept armed") }
+        let summary = session.connectionSummary
+        Button { session.show(.status) } label: {
+            HStack(spacing: Space.sm) {
+                HStack(spacing: Tok.Metric.gapTight) {
+                    Circle().fill(summary.core.state.color.color).frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
+                    Text("aitmproxy").fontWeight(.medium).foregroundStyle(Tok.Ink.primary.color)
+                    if summary.core.state == .ok {
+                        Text(session.capturing ? " · " : " · paused ")
+                        Text(session.coreHealth.connection?.proxyAddress ?? session.listenAddress)
+                            .font(Tok.Face.data(Tok.Typography.Size.sm, .medium))
+                            .foregroundStyle(Tok.Ink.primary.color)
+                        if session.interceptArmed { Text(" · intercept armed") }
+                    } else {
+                        Text(" · core \(summary.core.word)")
+                    }
                 }
+                LaneDot(lane: summary.bus, quietWhenOK: true)
+                LaneDot(lane: summary.capture, quietWhenOK: true)
             }
             .font(Tok.Face.ui(Tok.Typography.Size.sm))
             .foregroundStyle(Tok.Ink.secondary.color)
             .lineLimit(1)
+            .padding(.leading, Tok.Metric.padInner)
+            .padding(.trailing, Space.md)
+            .frame(height: Tok.Size.control)
+            .background(Tok.Ground.raised.color, in: Capsule())
+            .contentShape(Capsule())
         }
-        .padding(.leading, Tok.Metric.padInner)
-        .padding(.trailing, Space.md)
-        .frame(height: Tok.Size.control)
-        .background(Tok.Ground.raised.color, in: Capsule())
+        .buttonStyle(.plain)
+        .help(summary.tooltip + "\nOpens Status (⌘0)")
         .accessibilityElement(children: .combine)
+        .accessibilityLabel("aitmproxy: \(summary.spoken)")
     }
 }
 

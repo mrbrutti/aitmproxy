@@ -279,7 +279,6 @@ struct BarRow: View {
     var fraction: Double
     var barColor: Color = Tok.Ink.secondary.color
     var action: (() -> Void)? = nil
-    @State private var hovered = false
 
     static let valueWidth: CGFloat = 56
 
@@ -301,17 +300,9 @@ struct BarRow: View {
 
     var body: some View {
         if let action {
-            Button(action: action) {
-                content
-                    .padding(.horizontal, Space.xs)
-                    .frame(height: Tok.Size.Row.dense)
-                    .background(hovered ? Tok.Ground.hover.color : .clear,
-                                in: RoundedRectangle(cornerRadius: Tok.Radius.badge))
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .onHover { hovered = $0 }
-            .accessibilityElement(children: .ignore)
+            Button(action: action) { content }
+                .buttonStyle(HoverRowStyle())
+                .accessibilityElement(children: .ignore)
             .accessibilityHint("Shows its flows")
         } else {
             content.accessibilityElement(children: .ignore)
@@ -325,7 +316,6 @@ private struct HostRow: View {
     var labelWidth: CGFloat
     var fraction: Double
     var action: () -> Void
-    @State private var hovered = false
 
     var body: some View {
         Button(action: action) {
@@ -343,13 +333,8 @@ private struct HostRow: View {
                     .foregroundStyle(Tok.Ink.secondary.color)
                     .frame(width: BarRow.valueWidth, alignment: .trailing)
             }
-            .padding(.horizontal, Space.xs)
-            .frame(height: Tok.Size.Row.dense)
-            .background(hovered ? Tok.Ground.hover.color : .clear, in: RoundedRectangle(cornerRadius: Tok.Radius.badge))
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .onHover { hovered = $0 }
+        .buttonStyle(HoverRowStyle())
         .accessibilityLabel("\(entry.host), \(entry.count)")
         .accessibilityHint("Shows its flows")
     }

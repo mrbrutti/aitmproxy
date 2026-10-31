@@ -1,0 +1,380 @@
+# macOS Status page and first-run flow design
+
+**Status:** implemented on `claude/macos-connection-ux` (2026-10-31); panel-reviewed, revisions below; Matt approves the two open questions
+**Research inputs:** `apps/mac/docs/review-2026-10-31.md` (live findings L1–L9), PR #181 spec
+`2026-10-31-ne-no-scope-honest-state-design.md` (`CaptureAdvice`), the bama `mac-design`
+(rules 3, 5, 27, 28, 56, 59, 64, 76) and `ux-design` (surface table, states, words) skills.
+
+## Intent
+
+On a fresh launch the operator cannot tell what is running and what to do first. The sidebar
+lands on Apps (an empty or misleading page), and the three things that decide whether anything
+will ever appear — the **core** (the proxy process), the **bus** (the app's link to it) and the
+**capture extension** (system-wide capture) — are reported in three unrelated places with three
+vocabularies: a toolbar pill (core port), two status-bar dots (core health, bus address, role)
+and a Settings tab (extension). None of them says what to do next, and the enable/disable
+controls are split between Settings tabs and menu items. Matt's words: "when we start it is not
+clear on the sidebar what option the user needs to look at … expose the Core Bus and NE in the
+UI so show them when it is active and when not, to enable / disable it."
+
+This design adds one **Status** page that is the first thing a new session shows, feeds every
+connection indicator from one pure model, and puts the enable/disable controls on the page that
+shows the state.
+
+## Goals
+
+- A fresh launch answers "where am I, what can I do, where do I go" in one screen: the Status
+  page shows the three lanes (Core, Bus, Capture), each with a state word, one fact, and its
+  action; a **Getting started** list ticks off the steps that are already true.
+- Every connection indicator (toolbar pill, status bar, sidebar row, Status page, Settings
+  rows) draws its words from one `ConnectionSummary` so they never disagree (the B10 class of
+  bug is closed by construction, not by review).
+- Enable/disable lives where the state is shown: Start/Stop/Restart Core, Reconnect Bus,
+  Capture on/off, Open Scope, Install/Uninstall extension — on the Status page, each a plain
+  button with its menu-bar twin.
+- "Not working" states are loud and specific: a failed core, a bus that rejected the token, an
+  extension awaiting approval, capture on with an empty scope, an unnotarized build whose
+  extension can never activate — each names the one thing that fixes it.
+- Returning operators keep their place: the last page is restored; the Status page is the
+  landing page only while the session has nothing to show yet.
+
+## Non-goals
+
+- No onboarding tour, splash, or wizard (rule 76). The Getting started list is live state, not
+  a sequence the operator is pushed through, and it stays useful after first run.
+- No new bus verbs. Scope persistence across core restarts (live finding: the scope is lost on
+  every restart) is a core/orchestrator item; the Status page only shows the count honestly.
+- No change to Settings ▸ Capture's toggle semantics or to `CaptureSwitch`/`ExtensionController`
+  (operator-only, serialized); the Status page calls the same `CaptureSwitch` steps.
+- Source-app attribution on the wire (the NE session's v0.5.4 spec).
+- TUI and web: the model is Kit-only here; the words are written so the TUI/web can adopt them.
+
+## Anti-goals
+
+- A fourth indicator with a fourth vocabulary. If a surface cannot read `ConnectionSummary`, it
+  does not show connection state.
+- A green dot that lies: "Capturing" while the scope is empty, "listening" while the core
+  failed, "connected" with the wrong role. Each lane's `state` must be derived from the
+  published facts (`CoreConnection.Status`, `BusState`, `CaptureAdvice`), never from a
+  preference key.
+- Hiding flows behind a state page: the Status page never replaces the flow list; captured
+  flows stay one click away and the Status page links to them.
+
+## Constraints
+
+- Swift 6 main-actor default isolation; Kit types are `Sendable` values with no SwiftUI.
+- House style: flat monochrome SF Symbols, editorial hierarchy (tracked small-caps section
+  labels, 20 pt document title), hue only on data; status colour is always paired with a word
+  (rule 28). Spacing from `Space`; `.gridArea`/`.gridProbe` on the page and its cards.
+- The capture controls stay operator-only: `tools/check-capture-operator-only.sh` and
+  `check-capture-toggle.sh` must keep passing; no bus/MCP/agent path reaches `CaptureSwitch`.
+- Settings stay preferences (settings.md): Bus tab keeps the external address/token; Capture tab
+  keeps its toggle and uninstall. The Status page is the live control surface; the two must
+  read the same `ConnectionSummary` words.
+- File ownership while PR #181 is open: `ShellView.swift`, `SettingsView.swift`,
+  `Bus/ExtensionController.swift`, `Bus/CoreHealthState.swift`, `Capture*` belong to the NE
+  session; this design needs exactly one line in `ShellView.content` (`case .status:`) and
+  nothing in the others.
+
+## Design
+
+### 1. One model: `ConnectionSummary` (Kit, pure, tested)
+
+```swift
+public enum LaneState: Int, Comparable, Sendable { case ok, working, off, warning, error }  // off = intended absence, ranks below "on but wrong"
+
+public struct ConnectionLane: Equatable, Sendable {
+    public enum Kind: Sendable { case core, bus, capture }
+    public let kind: Kind
+    public let state: LaneState
+    /// The one word for the sidebar/status bar: "running", "connecting…", "capture on" …
+    public let word: String
+    /// The fact under it: "Embedded · proxy 127.0.0.1:8080", "operator · 127.0.0.1:60745",
+    /// "3 hosts in scope".
+    public let detail: String
+    /// What fixes it when state is not .ok, as a sentence ("Restart the core", "Paste the
+    /// operator token in Settings ▸ Bus", "Add a host to Scope"), nil when nothing is needed.
+    public let remedy: String?
+    /// The actions the surface may offer, in order; the first is primary.
+    public let actions: [ConnectionAction]
+}
+
+public enum ConnectionAction: Equatable, Sendable {
+    case startCore, restartCore, showCoreLog, switchToEmbedded
+    case reconnectBus, openBusSettings
+    case turnCaptureOn, turnCaptureOff, openScope, approveInSystemSettings, uninstallExtension, openCaptureSettings
+    case openBrowser, copyListenAddress
+}
+
+public struct ConnectionSummary: Equatable, Sendable {
+    public let core: ConnectionLane
+    public let bus: ConnectionLane
+    public let capture: ConnectionLane
+    /// Worst lane state, for the sidebar's Status row glyph and the toolbar pill's dot.
+    public var overall: LaneState
+    /// Getting-started steps with their done flag, in order.
+    public let steps: [GettingStartedStep]
+
+    public static func make(core: CoreConnection?, activeKind: ActiveCoreKind, bus: BusState,
+                            role: String?, roleWarning: Bool, capability: CaptureCapability,
+                            captureSupported: Bool, scopeHostCount: Int, flowCount: Int,
+                            listenAddress: String, coreCapture: CoreCaptureStatus? = nil) -> ConnectionSummary
+    // builds the CaptureAdvice itself from capability + supported + scope count (one call site)
+    public var overallWord: String   // "connected" | worst.compact — the status bar's one word
+    public var badge: String         // "ok" | worst lane title — the sidebar brand chip
+    public var tooltip: String; public var spoken: String   // the three lanes, for .help / a11y
+}
+
+public struct GettingStartedStep: Equatable, Sendable {
+    public enum Kind: Sendable { case coreRunning, busConnected, extensionOn, scopeSet, firstFlow }
+    public let kind: Kind
+    public let title: String      // "Core is running", "Install the capture extension", …
+    public let done: Bool
+    public let action: ConnectionAction?
+}
+```
+
+Word table (the only place these strings live; the TUI/web may copy it):
+
+| Lane | Facts | state | word | remedy |
+|---|---|---|---|---|
+| Core | embedded `.ready` | ok | running | — |
+| Core | `.starting`/`.connecting` | working | starting… | — |
+| Core | `.degraded(reason)` | error | failed | "Restart the core" (reason as detail) |
+| Core | `.stopped` / no connection | off | stopped / not running | "Start the core" |
+| Core | external kind | off | external | "The app does not manage this core; start and stop it yourself" (detail carries the bus address or "set the address in Settings ▸ Bus") |
+| Bus | `.connected`, role ok | ok | connected | — |
+| Bus | `.connected`, roleWarning | warning | connected as agent | "Paste the operator token in Settings ▸ Bus" |
+| Bus | `.connecting` | working | connecting… | — |
+| Bus | `.failed(why)` | error | bus failed | why as detail; remedy "Paste the operator token…" when why mentions the token, else "Reconnect, or check the address in Settings ▸ Bus" |
+| Bus | `.disconnected` | off | offline | "Start the core" (embedded core down) / "Reconnect" |
+| Capture | `.unsupported` | off | no extension | "This build has no capture extension; the signed app has it" |
+| Capture | `.off` | off | capture off | "Turn on capture to see other apps' traffic" |
+| Capture | `.awaitingApproval` | working | waiting for approval | "Approve the extension in System Settings" |
+| Capture | `.degraded(reason)` | error | capture degraded | reason |
+| Capture | `.onEmptyScope` | warning | on, nothing in scope | "Add a host to Scope" |
+| Capture | `.on(n)` | ok | capture on · n hosts in scope | — (with `coreCapture.providerAttached == false`: warning, "on, core not attached", "Restart the core") |
+| Capture | any, external core active | off | capture off | "Switch to the embedded core to capture other apps' traffic" |
+
+`CaptureAdvice` (PR #181) stays the capture source; `ConnectionSummary.make` maps it so the
+advice's headline/detail and the lane word agree (the lane word is a shortened form; a Kit test
+pins each pair).
+
+### 2. The Status page (`Panels/StatusPanel.swift`, sidebar page `.status`)
+
+Surface (ux-design table): a sidebar page — a place the operator comes back to.
+
+```text
+ STATUS                                                           [Open Browser] [Copy address]
+ ─────────────────────────────────────────────────────────────────────────────────────────────
+ CORE                        BUS                          CAPTURE
+ ● running                   ● connected                  ◐ on, nothing in scope
+ Embedded · 127.0.0.1:8080   operator · 127.0.0.1:60745   extension approved · 0 hosts
+ [Restart Core] [Core Log…]  [Reconnect]                  [Turn Off] [Open Scope…] [⋯]
+ ─────────────────────────────────────────────────────────────────────────────────────────────
+ GETTING STARTED
+ ✓ Core is running                                    127.0.0.1:8080
+ ✓ Bus connected as operator
+ ✓ Capture extension on
+ ○ Add a host to Scope                                 [Open Scope…]
+ ○ Point a client at 127.0.0.1:8080, or open the browser   [Open Browser]
+ ─────────────────────────────────────────────────────────────────────────────────────────────
+ RECENT                                               (last 5 flows, or "No flows yet")
+```
+
+- Three lane cards side by side (stack under 900 pt), each: a `Tok.Status`-coloured dot + the
+  lane word (16/600), the detail in `Tok.Face.data`, the remedy in `Tok.Ink.secondary` when
+  present, then the actions as `FlatButton`s (primary first). The `⋯` menu on Capture holds
+  Uninstall Capture Extension… (destructive, confirmation dialog) and Open Settings ▸ Capture.
+- Capture controls call `CaptureSwitch.set(_:session:)` / `.uninstall` exactly as Settings does
+  and stand down on `captureBusy`; with an external core active the card says capture is the
+  embedded core's and offers Switch to Embedded (→ Settings ▸ Bus) instead of the toggle.
+- Getting started: five rows, each `✓` (done, `Tok.Status.success` + word) or `○` with its one
+  action. Done rows stay (they are facts), so the list is a live checklist, not a tour. When all
+  five are done the section collapses to one line: "Everything is connected — n flows captured".
+- Recent: the last five flows as compact rows (method badge, URL, status) that select the flow
+  and open the Domains page; "No flows yet" with the listen address otherwise.
+- Empty/offline: when the bus is offline the Core and Capture cards still render their last
+  known state and the Bus card carries the remedy; nothing on the page is blank.
+- Keyboard: Proxy ▸ Status (⌘0) opens it; every card action is also a Proxy-menu item (Restart
+  Core, Reconnect Bus, Enable/Disable Capture, Scope…, Core Log…, Browser) — all exist today.
+
+### 3. Sidebar information architecture and landing page (revised after Matt's review)
+
+Matt's reading of the first cut: "the sidebars … are completely in a weird order or
+priorities — what is the main work window, what are other things; now you have a Proxy
+sidebar item and you also show the status in the bottom." The groups below are organised by
+the operator's **jobs** (brief: watch/inspect, intercept, test, supervise), the main work
+window comes first, and the connection state has **one** home.
+
+```text
+ ›•‹ aitmproxy  ● ok            ← the brand row IS the status entry: worst lane glyph + lane
+                                    name when something needs attention ("⚠ Capture",
+                                    "✕ Core"); click → Status page. No separate group/row.
+ TRAFFIC                        ← the main work window: the flow list + inspector
+   Flows                  104   all flows (the default page once connected)
+   Apps                     0   flows grouped by source app (sub-rows per app)
+   Domains                  3   flows grouped by host (sub-rows per host)
+   Pinned                   2   the operator's working set (sub-rows)
+   Connections                  the waterfall/dashboard view of the same flows
+   Overview                     the statistics view of the same flows
+ TESTING                        ← the security work on that traffic
+   Scope                    1
+   Scan                     6
+   Findings                 3
+   Browser              1 tab
+ AUTOMATION                     ← what acts on the operator's behalf
+   Scripts             1 active
+   Agent                14/min
+```
+
+- **Saved** leaves the sidebar until saving exists (S-066): a dead row at the top of the list
+  was the first thing a new operator saw. It returns under Traffic when the core can save.
+- **Status** is reached from the brand row, the toolbar pill, the status bar's one connection
+  item, Proxy ▸ Status (⌘0), and the palette. It is not a sidebar list row: it is the place the
+  app sends you when something is wrong, not a place in the work hierarchy (rule 59).
+- **Status bar** shows counts, throughput and ONE connection item: the worst lane's glyph +
+  lane name + word when a lane needs attention (`⚠ capture: on, nothing in scope`), or a single
+  `● connected` when all is well. Click → Status. The three-lane strip is gone; the bar never
+  duplicates the sidebar.
+- **Toolbar pill** stays the core/proxy address; its bus and capture dots show only when those
+  lanes need attention (as built).
+- **Landing**: a fresh install lands on **Status** and stays there until the operator navigates
+  once; after that the last list page is restored (a session that ended on Status or Saved
+  comes back on Flows). Apps is no longer the default (its empty state was the second thing a
+  new operator saw).
+- Counts: Flows/Apps/Domains/Pinned show their flow counts; Scope/Scan/Findings show queue
+  counts in the raised chip; Browser/Scripts/Agent keep their words.
+
+`SidebarPage` gains `.flows` (all flows, no group) and the `.status` case stays for routing
+and the menu; `.saved` stays in the enum (routing to `SavedPanel`) but `isInSidebar` is false.
+
+### 4. Toolbar pill and status bar read the same model
+
+- `ListeningPill` is a `Button` to `.status`: the core dot + bound proxy address (and "paused",
+  "intercept armed" as today), then the bus and capture `LaneDot`s only while they need
+  attention; `.help` is `summary.tooltip`.
+- The status bar's right group shows ONE connection item, `summary.overallWord` ("connected", or
+  the worst lane's compact form), a `Button` to `.status`. Role mismatch is the bus lane's
+  warning, not a separate badge. `CoreHealthDot` is deleted; the Core Log header shows the core
+  lane's `LaneDot`.
+- Settings ▸ Capture's Status row reads the capture lane word; Settings ▸ Bus gains a
+  "Connection" row with the bus lane word and detail. `tools/check-connection-words.sh` fails
+  when any view spells a lane word itself.
+
+### 5. Words (GLOSSARY additions)
+
+| Term | Means | Not |
+|---|---|---|
+| Status | The page that shows Core, Bus and Capture and what to do next | dashboard, home, overview (that is the traffic page) |
+| Core | The aitm proxy process: embedded (the app runs it) or external (the operator runs it) | server, daemon, backend |
+| Capture extension | The macOS system extension that captures other apps' traffic; on, off, waiting for approval, degraded | NE, sysext, network extension (in UI text) |
+| Capture on / off | The operator's switch for the capture extension | enable/disable (buttons say Turn On / Turn Off) |
+| Getting started | The Status page's live checklist | onboarding, wizard, tour |
+
+Buttons: Turn On Capture, Turn Off Capture, Restart Core, Start Core, Stop Core, Reconnect,
+Open Scope…, Core Log…, Open Browser, Copy Address, Uninstall Capture Extension…, Switch to
+Embedded… (opens Settings ▸ Bus).
+
+### 6. File split
+
+| Piece | Files | Owner |
+|---|---|---|
+| `ConnectionSummary`, `ConnectionLane`, `GettingStartedStep` + tests | `AitmproxyKit/ConnectionSummary.swift`, `Tests/…/ConnectionSummaryTests.swift` | mac-review session |
+| `StatusPanel` + its snapshot scenes (every lane state × light/dark) | `Panels/StatusPanel.swift`, `SnapshotScenes.swift`, `Snapshot.swift` | mac-review session |
+| `SidebarPage.status` + landing rule | `Session.swift` | mac-review session |
+| Sidebar groups + brand-row status entry | `Shell/SidebarView.swift` | mac-review session |
+| `Session+Connection.swift` (summary + action glue), `UI/ConnectionLook.swift` (LaneState look, `LaneDot`), `SelfTest.swift` checks, `tools/check-capture-operator-only.sh` allow-list, `tools/check-connection-words.sh`, `Panels/CoreLogPanel.swift`, `Panels/ScopePanel.swift` prompt | — | mac-review session |
+| Pill + status bar from the summary | `Shell/ShellToolbar.swift`, `Shell/StatusBar.swift`, `Shell/CoreHealthDot.swift` | mac-review session |
+| Proxy ▸ Status (⌘0) + CommandMap entry | `App.swift`, `AitmproxyKit/CommandMap.swift` | mac-review session (wave 3 touches App.swift's Flow menu only — coordinate) |
+| `case .status` / `case .saved` in `MainView.content` | `Shell/ShellView.swift` | mac-review session (after #181 merged) |
+| Settings rows reading lane words | `SettingsView.swift` | mac-review session (after #181 merged) |
+| Glossary, brief IA line, docs | `apps/mac/docs/*` | mac-review session |
+
+## Acceptance criteria
+
+1. **ST-AC1 [kit-unit]** `ConnectionSummary.make` yields the word table above for every
+   `CoreConnection.Status` × `ActiveCoreKind` × `BusState` × roleWarning × `CaptureAdvice`
+   combination listed; `overall` is the worst lane; no lane word is "Capturing" while
+   `scopeHostCount == 0`.
+2. **ST-AC2 [kit-unit]** Getting-started steps are done exactly when the facts say so (core
+   ready; bus connected without role warning; capture `.on`/`.onEmptyScope`; scope count > 0;
+   flowCount > 0), and all-done collapses.
+3. **ST-AC3 [mac-snapshot]** The Status page renders every lane state (12 `status-*` scenes +
+   the page walk) in light and dark with no clipping; `grid-lint` and `check-layout` PASS; nothing on the page is blank when
+   the bus is offline.
+4. **ST-AC4 [self-test]** The landing rule is a pure function (`Session.landingPage(saved:)`)
+   pinned by the self-test: no saved page → `.status`; a saved list page → that page; a saved
+   non-list page (Status, Saved) → `.flows`; an unknown value → `.status`. Fixture, snapshot and
+   self-test runs start on Apps so their scenes stay deterministic. `Proxy ▸ Status` (⌘0) is in
+   the menu bar and the `CommandMap`.
+5. **ST-AC5 [structural]** No view spells a connection state word (`tools/check-connection-words.sh`
+   exits 0: the lane words appear as literals only in the Kit models); both capture tripwires
+   exit 0.
+6. **ST-AC6 [self-test]** Each Status-page action calls the same `Session`/`CaptureSwitch` entry
+   as its menu item (menu audit extended with Status's actions).
+7. **ST-AC7 [manual, real app]** On Matt's Mac with the notarized DMG: fresh launch lands on
+   Status; the three cards read the real state (core running on the bound port, bus connected
+   as operator, capture state per the extension); turning capture off and on from the card
+   changes Settings ▸ Capture and the sidebar glyph within one poll; adding a host from Open
+   Scope… ticks the step; the first flow ticks the last step and Recent fills.
+8. **ST-AC8 [manual]** A local unnotarized NE build shows the Capture card as `capture
+   degraded` with the reason and the remedy "install the signed app"; nothing claims it works.
+
+## Facts from the other sessions folded in (2026-10-31)
+
+- **DNS black hole (NE session, live proof):** a bare hostname in Scope makes the provider claim
+  the app's DNS datagram for that name and the core never answers it, so the host becomes
+  unresolvable and no TCP flow ever opens. Until the provider fix lands (never claim port-53
+  datagrams; hostname entries bind to TCP), the Getting-started "Add a host" step and the
+  Capture card's remedy say to add `host:443` (and `host:80`) entries, and the Scope page's
+  placeholder gets the same hint. Once the fix merges the hint is removed (one string).
+- **No core verb reports extension attach state (orchestrator):** `CaptureCapability` in the
+  core is dead code and `proxy.status.capturing` is the record/pause toggle, not the extension.
+  The capture lane is therefore derived from the app's own tunnel status (`CaptureAdvice`). A
+  read-only `capture.status` verb (enabled, feeder listening, provider attached, scope tokens
+  pushed, flows handed off) is proposed as a separate card; `ConnectionSummary.make` takes an
+  optional `coreCapture: CoreCaptureStatus?` that, when present, overrides the detail line and
+  turns "capture on" into "capture on · attached · n flows handed off". Tunnel status stays the
+  fallback.
+- **Scope persistence is app-side** (persist-scope session): hosts saved in the app store and
+  restored into the embedded config / re-pushed on connect. The Status page keeps reading
+  `scope.list` as the truth; no change here.
+
+## Left to the builder
+
+- Exact card widths/breakpoint (side by side ≥ 900 pt, stacked below), icon choices per lane
+  (monochrome: `cpu`, `point.3.connected.trianglepath.dotted`, `antenna.radiowaves.left.and.right`).
+- Whether Recent reuses `FlowListRow` from the Overview breakdowns (preferred) or a lighter row.
+- How the `@SceneStorage` landing rule handles a fixture/snapshot run (snapshots start on
+  `.apps` as today unless a scene asks for `.status`).
+
+## Open questions
+
+- Matt: Status as the **first sidebar row in its own "Proxy" group** vs the first row of "All"?
+  (Default: own group.)
+- Matt: should Status replace Overview as the landing page even when flows exist? (Default:
+  no — restore the last page; Status only when there is nothing to show yet.)
+
+## Review log
+
+Stage-6 panel 2026-10-31 on `341b68a..07c6772` (security PASS, quality PASS with 10 Minors, spec
+FAIL with 2 Critical + 5 Important). Dispositions, all applied on the branch:
+
+| # | Reviewer | Sev | Finding | Disposition |
+|---|---|---|---|---|
+| 1 | Spec | Critical | No structural check for ST-AC5; Core Log header, Settings ▸ Capture row and the orphaned `CoreHealthDot` still spelled their own words | FIXED — `check-connection-words.sh`; `CoreHealthDot.swift` + `CoreHealth.statusWord` deleted; Core Log header and both Settings rows read the lanes |
+| 2 | Spec | Critical | Landing rule untested; ST-AC4 contradicted "Left to the builder" | FIXED — `Session.landingPage(saved:)` pinned by four self-test checks; ST-AC4 and §3 reworded (Status until the operator navigates once) |
+| 3 | Spec | Important | 8 scenes, not every lane state | FIXED — `status-core-starting/-stopped`, `status-bus-connecting/-agent` added (12 + page walk) |
+| 4 | Spec | Important | Word table / signatures deviated from §1 unexplained | FIXED — §1 amended to the shipped words (stopped is off not failed; off ranks below warning; action names) |
+| 5 | Spec | Important | Scope prompt lacked the `host:443` hint | FIXED — prompt reads "host:443 or host:80 (for now), …" |
+| 6 | Spec | Important | Settings rows not reading lane words | FIXED (file free after #181) |
+| 7 | Spec | Important | Undeclared files / `CoreHealthDot` untouched | FIXED — §6 lists them; the dot is deleted |
+| 8 | Quality | Minor | `steps` read "external" back out of a display word | FIXED — `activeKind` passed in |
+| 9 | Quality | Minor | `activeKind` unobserved | FIXED — `ActiveConnectionModel` is `@Observable` |
+| 10 | Quality | Minor | `default:` in `StatusPanel.run`; dead `.stopCore`, `feederListening` | FIXED — exhaustive switch; both removed |
+| 11 | Quality | Minor | Remedies sniff free-text reasons | ACCEPTED for now (the two enums are the NE session's); fallback branches pinned by tests |
+| 12 | Quality | Minor | Tooltip/spoken/compact strings built per surface; pluralisation ×4 | FIXED — `tooltip`, `spoken`, `compact`, `overallWord`, `badge` on the model; `Format.count` |
+| 13 | Quality | Minor | Landing read side unfiltered; raw `13` | FIXED |
+| 14 | Quality | Minor | `RecentFlowRow` repeats `FlowListRow`'s shell | ACCEPTED (the two pages may drift; a `HoverRowButton` is a wave-3 cleanup) |
+| 15 | Security | Minor | Both capture tripwires red on main since #183 | FIXED here — scripts follow the `Store.defaults` shapes; Kit doc comment no longer spells the key |

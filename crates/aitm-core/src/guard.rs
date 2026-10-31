@@ -28,10 +28,12 @@ pub trait ScopeRateGuard: Send + Sync {
     /// The current scope entries.
     fn list_scope(&self) -> Vec<ScopeEntry>;
     /// Whether `host` is currently in the scope allowlist — a read-only predicate
-    /// with no rate, concurrency, or error-budget effect. The capture ingress
-    /// scope-gates a captured stream on this (authority = SNI else dst IP) before
-    /// any module match or upstream dial. Default is **deny-by-default**, so a
-    /// guard that does not implement it refuses every host.
+    /// with no rate, concurrency, or error-budget effect. Callers pass `host:port`
+    /// (the capture ingress gates a captured stream on the SNI / handoff hostname,
+    /// else the dst IP, with the dst port) and an implementation matches the way
+    /// [`Authority::matches_scope_entry`] does: a portless entry admits any port.
+    /// Default is **deny-by-default**, so a guard that does not implement it refuses
+    /// every host.
     fn in_scope(&self, _host: &str) -> bool {
         false
     }

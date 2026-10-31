@@ -46,7 +46,7 @@ use rhai::{CallFnOptions, Dynamic, Engine, EvalAltResult, Scope, AST};
 
 use crate::command::ScriptRegHandle;
 use crate::config::{RhaiConfig, ScriptMeta};
-use crate::engine::{begin_run, blocking, Budget, RunKind};
+use crate::engine::{begin_run, blocking, enter_constants, Budget, RunKind};
 use crate::error::ScriptError;
 use crate::flow_api::{ActiveFlow, ResponsePhase, ScriptFlow, ScriptWsMessage};
 use crate::flow_state::FlowState;
@@ -349,6 +349,9 @@ impl LoadedScript {
             .with_caller(self.handle.authoring_trust());
         if let Err(err) = handle.run_load(&self.engine, &ast) {
             tracing::error!(target: SCRIPT_TARGET, script = %self.meta.name, "{err}");
+            // `script.list` shows it as `last_error`, like a failed hook; a
+            // command script has no hook that would ever surface it otherwise.
+            self.errors.record(&self.meta.name, err.to_string());
         }
         // Defaults the script declared join the options its hooks read.
         self.options.store(Arc::new(handle.into_options()));
@@ -387,6 +390,7 @@ impl LoadedScript {
             // write is refused loudly; every other hook enters the writable phase.
             let _phase = ResponsePhase::enter(response_forwarded);
             let _seed = seed_call_context(authoring, Some(tag), source);
+            let _constants = enter_constants(ast);
             self.engine
                 .call_fn_with_options::<Dynamic>(
                     CallFnOptions::new(),

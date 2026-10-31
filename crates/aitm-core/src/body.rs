@@ -24,3 +24,16 @@ pub enum Body {
     /// A body still streaming from the wire.
     Streamed(StreamBody),
 }
+
+impl Body {
+    /// The size `flow.get` and the flow pushes report for this body: the buffered
+    /// length in bytes (`Some(0)` for no body), or `None` while it is still
+    /// streaming from the wire and the size is not known yet.
+    pub fn buffered_len(&self) -> Option<usize> {
+        match self {
+            Body::Empty => Some(0),
+            Body::Bytes(bytes) => Some(bytes.len()),
+            Body::Streamed(_) => None,
+        }
+    }
+}

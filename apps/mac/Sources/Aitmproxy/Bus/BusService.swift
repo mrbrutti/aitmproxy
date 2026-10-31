@@ -157,12 +157,17 @@ final class BusService: FlowActions {
             summaries = summaries.filter { known.contains($0.key) }
             refetch.retain(known)
             let coreID = session.activeCoreID
-            let rows = ids.enumerated().compactMap { index, id in summaries[id]?.row(seq: index + 1, coreID: coreID) }
-                .map { row in
-                    var row = row
-                    row.inScope = session.scopeHosts.isEmpty || session.scopeHosts.contains { Self.hostMatches(row.authority, $0) }
-                    return row
-                }
+            func scoped(_ row: FlowRow) -> FlowRow {
+                var row = row
+                row.inScope = session.scopeHosts.isEmpty || session.scopeHosts.contains { Self.hostMatches(row.authority, $0) }
+                return row
+            }
+            let polled = ids.enumerated().compactMap { index, id in summaries[id]?.row(seq: index + 1, coreID: coreID) }.map(scoped)
+            // Rows an undone Clear put back stay ahead of the core's list and follow the live
+            // scope like any other row; new flows number after them.
+            let restored = session.restoredFlows.map(scoped)
+            if restored != session.restoredFlows { session.restoredFlows = restored }
+            let rows = ClearedFlows.merge(restored: restored, newer: polled)
             if rows != session.rows { session.rows = rows }
             let rate = throughput.sample(at: .now)
             if session.upBytesPerSecond != rate.up { session.upBytesPerSecond = rate.up }
@@ -171,10 +176,33 @@ final class BusService: FlowActions {
         }
     }
 
-    private func refreshScope() async {
-        guard let client else { return }
-        if let entries = try? await client.call("scope.list").arrayValue?.compactMap(\.stringValue) {
-            session.scopeHosts = entries
+    /// Re-reads the core's `scope.list` into `session.scopeHosts`. True iff the call
+    /// succeeded and the list was assigned, so a caller never persists a stale list
+    /// after a verb whose follow-up refresh failed (SP-AC19).
+    @discardableResult
+    private func refreshScope() async -> Bool {
+        guard let client else { return false }
+        guard let entries = try? await client.call("scope.list").arrayValue?.compactMap(\.stringValue) else { return false }
+        session.scopeHosts = entries
+        return true
+    }
+
+    /// The only writer of `scope.json` (D4). Snapshot semantics: the file is the embedded
+    /// core's `scope.list` as of the operator's last Scope action — written from
+    /// `addScope`/`removeScope` only after the verb and the refresh both succeeded; never
+    /// on connect or poll, never while the client points at an external core (the callers
+    /// also require that intent to have held across the whole round trip), never in
+    /// fixture/snapshot/self-test runs. A failed save is an error of the action: it throws
+    /// `BusError.tool("Scope change not saved: …")`, which `Session.perform` lands in
+    /// `lastError`, because a silently failed save after a remove would resurrect the host
+    /// at the next launch. By then the core has accepted the change and the refresh has
+    /// set `session.scopeHosts`, so the in-memory scope stays right for this run.
+    private func persistEmbeddedScope() throws {
+        guard preferEmbedded, !Store.usesFixtures else { return }
+        do {
+            try EmbeddedScope(hosts: session.scopeHosts).save(to: session.scopeURL)
+        } catch {
+            throw BusError.tool(message: "Scope change not saved: \(error.localizedDescription)")
         }
     }
 
@@ -237,14 +265,26 @@ final class BusService: FlowActions {
         try await call("request.send", request.arguments).stringValue.map(FlowID.init)
     }
 
-    func addScope(_ host: String) async throws {
-        _ = try await call("scope.add", ["host": .string(host)])
-        await refreshScope()
-    }
+    func addScope(_ host: String) async throws { try await scopeVerb("scope.add", host: host) }
 
-    func removeScope(_ host: String) async throws {
-        _ = try await call("scope.remove", ["host": .string(host)])
-        await refreshScope()
+    func removeScope(_ host: String) async throws { try await scopeVerb("scope.remove", host: host) }
+
+    /// Snapshot the embedded intent before the round trip (a Settings ▸ Bus switch mid-flight
+    /// must not persist the other core's list), run the verb, refresh, then persist only for
+    /// the embedded core. A verb the embedded core applied must either reach `scope.json` or be
+    /// reported: a failed refresh, or a Bus switch to External inside the round trip, leaves the
+    /// file stale, and a stale file reported as success would resurrect a removed host at the
+    /// next launch, so both throw. An external core has no file, so its refresh failure stays a
+    /// poll-recoverable display lag, as before.
+    private func scopeVerb(_ name: String, host: String) async throws {
+        let embedded = preferEmbedded
+        _ = try await call(name, ["host": .string(host)])
+        let refreshed = await refreshScope()
+        guard embedded else { return }
+        guard preferEmbedded, refreshed else {
+            throw BusError.tool(message: "Scope change applied but not saved: \(preferEmbedded ? "scope.list failed" : "the active core changed")")
+        }
+        try persistEmbeddedScope()
     }
 
     func mark(_ id: FlowID, color: MarkColor?) async throws {
@@ -275,29 +315,10 @@ final class BusService: FlowActions {
 
     /// The proxy's config.yaml (`AITM_CONFIG`, as the `aitm` binary reads it,
     /// else the default path) by default; else Settings > Bus host/port/token file.
+    /// Settings come from `Store.defaults`, so a self-test never sees the
+    /// operator's pasted token.
     static func resolveEndpoint() -> BusEndpoint? {
-        let defaults = UserDefaults.standard
-        // A pasted operator token overrides the config/agent token; its class
-        // makes the server resolve the connection to operator (spec Decision E).
-        // Empty ⇒ not configured, so the app stays an agent by default.
-        let operatorToken = (defaults.string(forKey: "bus.operatorToken") ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let fromConfig = defaults.object(forKey: "bus.fromConfig") as? Bool ?? true
-        if fromConfig, var endpoint = try? BusEndpoint.fromConfigFile(configURL) {
-            if !operatorToken.isEmpty { endpoint.token = operatorToken }
-            return endpoint
-        }
-        let host = defaults.string(forKey: "bus.host") ?? "127.0.0.1"
-        let port = UInt16(clamping: defaults.integer(forKey: "bus.port"))
-        var token = operatorToken
-        if token.isEmpty {
-            let tokenFile = (defaults.string(forKey: "bus.tokenFile") ?? "") as NSString
-            if tokenFile.length > 0, let text = try? String(contentsOfFile: tokenFile.expandingTildeInPath, encoding: .utf8) {
-                token = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-        }
-        guard port > 0, !token.isEmpty else { return nil }
-        return BusEndpoint(host: host, port: port, token: token)
+        BusEndpointSettings(defaults: Store.defaults).endpoint(configURL: configURL)
     }
 
     static var configURL: URL {

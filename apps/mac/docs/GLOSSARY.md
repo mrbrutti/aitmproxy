@@ -58,3 +58,8 @@ One name per thing, everywhere: buttons, menus, tooltips, errors, stories.
 | Column | A flow-list column; reorder, resize, hide from the header's context menu | field |
 | Sort | Order the list by a column; `#` ascending is capture order | arrange, group |
 | Apps / Domains | Sidebar groups: flows by client process / by host | clients, sources, hosts |
+| Status | The page that shows Core, Bus and Capture with their controls and what to do next (⌘0) | dashboard, home, overview (that is the traffic page) |
+| Core | The aitm proxy process: embedded (the app runs it) or external (the operator runs it) | server, daemon, backend |
+| Capture extension | The macOS system extension that captures other apps' traffic; on, off, waiting for approval, or degraded | NE, sysext, network extension (in UI text) |
+| Turn On / Turn Off Capture | The operator's switch for the capture extension | enable, disable |
+| Getting started | The Status page's live checklist: core, bus, extension, scope, first flow | onboarding, wizard, tour |

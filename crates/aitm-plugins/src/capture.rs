@@ -69,7 +69,8 @@ impl Command for FlowList {
     }
 }
 
-/// `flow.get {id}` → a summary object for one flow.
+/// `flow.get {id}` → a summary object for one flow: kind, request line, status,
+/// body sizes, timing (`started_at`, `duration_ms`) and interception state.
 struct FlowGet;
 
 impl Command for FlowGet {
@@ -162,27 +163,53 @@ fn summary_fields() -> Vec<ParamDef> {
             "HTTP response body size in bytes; null until the response arrives or while \
              it is still streaming.",
         ),
+        field(
+            "started_at",
+            TypeDesc::Int,
+            false,
+            "When the flow started, in milliseconds since the Unix epoch: the moment the \
+             proxy created the flow (the request head for HTTP, the upgrade for \
+             WebSocket); null if the clock is before the epoch.",
+        ),
+        field(
+            "duration_ms",
+            TypeDesc::Int,
+            false,
+            "Flow duration in whole milliseconds, from start to the end of the response, \
+             or to the point a failed response was abandoned; null while in flight or \
+             unknown.",
+        ),
     ]
 }
 
-/// A buffered body's size in bytes, or `Null` while it is still streaming from the
-/// wire and the size is not known yet. Lets a UI total the traffic it has seen
-/// (the macOS status bar's ↑ / ↓ rate) without fetching a single body.
+/// A body's reported size ([`Body::buffered_len`]) as a `Value`: the byte count,
+/// or `Null` while it is still streaming from the wire and the size is not known
+/// yet. Lets a UI total the traffic it has seen (the macOS status bar's ↑ / ↓
+/// rate) without fetching a single body.
 fn body_bytes(body: &Body) -> Value {
-    match body {
-        Body::Empty => Value::Int(0),
-        Body::Bytes(bytes) => Value::Int(bytes.len() as i64),
-        Body::Streamed(_) => Value::Null,
-    }
+    opt_int(body.buffered_len().map(|n| n as i64))
 }
 
-/// A transport-neutral summary of a flow.
+/// An optional count as a `Value`: the number, or `Null` when it is unknown. The
+/// timing and size rules themselves live on the core types
+/// (`FlowMeta::started_at_ms`, `FlowMeta::duration_ms`, `Body::buffered_len`);
+/// this only renders their answer.
+fn opt_int(n: Option<i64>) -> Value {
+    n.map_or(Value::Null, Value::Int)
+}
+
+/// A transport-neutral summary of a flow: identity, timing, and the per-kind
+/// fields (request line, status and body sizes for HTTP; handshake and message
+/// count for WebSocket). `started_at` is `metadata.created` for both kinds, so
+/// `started_at + duration_ms` is the flow's end.
 fn summarize(flow: &Flow) -> Value {
     let mut obj = BTreeMap::new();
     let mut put = |k: &str, v: Value| {
         obj.insert(k.to_string(), v);
     };
     put("id", Value::Str(flow.id().to_string()));
+    put("started_at", opt_int(flow.metadata().started_at_ms()));
+    put("duration_ms", opt_int(flow.metadata().duration_ms()));
     match flow {
         Flow::Http(f) => {
             put("kind", Value::Str("http".into()));
@@ -320,12 +347,7 @@ fn flow_row(flow: &Flow) -> Value {
                 .collect(),
         ),
     );
-    put(
-        "duration_ms",
-        flow.metadata().duration.map_or(Value::Null, |d| {
-            Value::Int(d.as_millis().min(i64::MAX as u128) as i64)
-        }),
-    );
+    put("duration_ms", opt_int(flow.metadata().duration_ms()));
     match flow {
         Flow::Http(f) => {
             put("kind", Value::Str("http".into()));

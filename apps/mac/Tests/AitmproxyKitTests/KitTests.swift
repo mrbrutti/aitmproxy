@@ -86,6 +86,7 @@ import Testing
         let json: JSONValue = [
             "id": "3f1c0d2e-0000-4000-8000-000000000002", "kind": "websocket", "intercept": "observed",
             "is_replay": false, "handshake": "3f1c0d2e-0000-4000-8000-000000000001", "messages": 21,
+            "started_at": 1_761_908_698_120, "duration_ms": .null,
         ]
         let summary = try #require(FlowSummary(json: json))
         let row = summary.row(seq: 47)
@@ -98,6 +99,52 @@ import Testing
         #expect(row.responseBytes == nil)
         #expect(!summary.reportsBodySizes)
         #expect(!summary.awaitsBodySize)
+        // It starts like any flow, but has no end marker yet, so the core sends a null duration.
+        #expect(summary.startedAt == Date(timeIntervalSince1970: 1_761_908_698.120))
+        #expect(summary.duration == nil)
+    }
+
+    @Test func decodesTiming() throws {
+        // `started_at` is milliseconds since the Unix epoch; `duration_ms` whole milliseconds.
+        let json: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                               "method": "GET", "scheme": "https", "authority": "h", "path": "/", "status": 200,
+                               "request_bytes": 0, "response_bytes": 2_048,
+                               "started_at": 1_761_908_698_120, "duration_ms": 412]
+        let summary = try #require(FlowSummary(json: json))
+        #expect(summary.startedAt == Date(timeIntervalSince1970: 1_761_908_698.120))
+        #expect(summary.duration == .milliseconds(412))
+        // Both reach the row, whose Time and Duration columns already draw them.
+        let row = summary.row(seq: 1)
+        #expect(row.startedAt == summary.startedAt)
+        #expect(row.duration == .milliseconds(412))
+    }
+
+    @Test func timingIsOptionalOnTheWire() throws {
+        // An older core sends no timing keys: both stay nil and the columns draw dashes.
+        let absent: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                                 "method": "GET", "scheme": "https", "authority": "h", "path": "/", "status": 200]
+        let bare = try #require(FlowSummary(json: absent))
+        #expect(bare.startedAt == nil)
+        #expect(bare.duration == nil)
+        // A flow still in flight (or a clock before the epoch) is sent as null.
+        let nulls: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                                "method": "GET", "scheme": "https", "authority": "h", "path": "/", "status": 200,
+                                "started_at": .null, "duration_ms": .null]
+        let pending = try #require(FlowSummary(json: nulls))
+        #expect(pending.startedAt == nil)
+        #expect(pending.duration == nil)
+        // A negative instant or duration is not one: unknown (nil), never a date before 1970.
+        let negative: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                                   "method": "GET", "scheme": "https", "authority": "h", "path": "/", "status": 200,
+                                   "started_at": -5, "duration_ms": -1]
+        let rejected = try #require(FlowSummary(json: negative))
+        #expect(rejected.startedAt == nil)
+        #expect(rejected.duration == nil)
+        // Nor is a fractional millisecond count an integer on this wire.
+        let fractional: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                                     "method": "GET", "scheme": "https", "authority": "h", "path": "/", "status": 200,
+                                     "started_at": 1.5]
+        #expect(try #require(FlowSummary(json: fractional)).startedAt == nil)
     }
 
     @Test func streamingResponseStillAwaitsItsSize() throws {

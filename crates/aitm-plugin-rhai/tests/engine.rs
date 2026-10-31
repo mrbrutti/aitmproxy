@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 
 use aitm_plugin_rhai::config::RhaiLimits;
 use aitm_plugin_rhai::engine::{
-    begin_run, build_engine, current_run, print_sink, remaining_budget, AbortKind, Budget, RunKind,
+    begin_run, build_engine, current_run, enter_constants, print_sink, remaining_budget, AbortKind,
+    Budget, RunKind,
 };
-use rhai::EvalAltResult;
+use rhai::{EvalAltResult, OptimizationLevel, Scope, AST};
 
 /// A run budget with `hook_timeout` of wall-clock and the shipped defaults
 /// for the rest.
@@ -466,4 +467,166 @@ fn print_is_captured() {
     engine.run(r#"print("hi")"#).expect("print must run");
     let lines = sink.lock().expect("sink lock");
     assert_eq!(lines.as_slice(), ["hi".to_string()]);
+}
+
+/// Every script compiles at one pinned level, so a debug and a release core
+/// (and a future rhai default) compile it identically. The level is this
+/// engine's promise, not rhai's default.
+#[test]
+fn optimization_level_is_pinned_to_simple() {
+    let engine = build_engine(&RhaiLimits::default(), Duration::from_secs(2));
+    assert_eq!(engine.optimization_level(), OptimizationLevel::Simple);
+}
+
+/// A script's top-level literal constants are visible inside its functions
+/// (as plain values and as method receivers) only while `enter_constants`
+/// holds them on the thread: the resolver behind `fn on_request(flow) { … TAG
+/// … }` and `load(reg)` closures. A parameter of the same name still wins.
+#[test]
+fn script_constants_resolve_inside_functions_while_entered() {
+    let engine = build_engine(&RhaiLimits::default(), Duration::from_secs(2));
+    let ast = engine
+        .compile(r#"const K = 7; const WORDS = ["a", "b"]; fn f(x) { K * x + WORDS.len() } fn g(K) { K }"#)
+        .expect("compiles");
+
+    let bare = engine.call_fn::<i64>(&mut Scope::new(), &ast, "f", (2_i64,));
+    assert!(
+        matches!(&bare, Err(e) if e.to_string().contains("Variable not found: K")),
+        "{bare:?}"
+    );
+
+    let _constants = enter_constants(&ast);
+    assert_eq!(
+        engine
+            .call_fn::<i64>(&mut Scope::new(), &ast, "f", (2_i64,))
+            .expect("f runs"),
+        16
+    );
+    assert_eq!(
+        engine
+            .call_fn::<i64>(&mut Scope::new(), &ast, "g", (3_i64,))
+            .expect("g runs"),
+        3
+    );
+}
+
+/// `enter_constants` nests: an inner guard replaces the table and its drop
+/// restores the one before it, so a run resumed after another script's run
+/// sees its own constants again; once the last guard drops nothing is visible.
+/// A map of literals is a constant too, usable as a receiver (`M.n`).
+#[test]
+fn enter_constants_nests_and_restores_the_previous_table() {
+    let engine = build_engine(&RhaiLimits::default(), Duration::from_secs(2));
+    let a = engine
+        .compile(r#"const K = 1; const M = #{ n: 10 }; fn f() { K } fn m() { M.n }"#)
+        .expect("a compiles");
+    let b = engine
+        .compile(r#"const K = 2; fn f() { K }"#)
+        .expect("b compiles");
+    let f = |ast: &AST| engine.call_fn::<i64>(&mut Scope::new(), ast, "f", ());
+
+    let outer = enter_constants(&a);
+    assert_eq!(f(&a).expect("a's f"), 1);
+    assert_eq!(
+        engine
+            .call_fn::<i64>(&mut Scope::new(), &a, "m", ())
+            .expect("a's m"),
+        10,
+        "a map literal is a constant and works as a receiver"
+    );
+    {
+        let _inner = enter_constants(&b);
+        assert_eq!(f(&b).expect("b's f"), 2);
+    }
+    assert_eq!(
+        f(&a).expect("a's f after the inner guard dropped"),
+        1,
+        "dropping the inner guard restores the outer table"
+    );
+    drop(outer);
+    let bare = f(&a);
+    assert!(
+        matches!(&bare, Err(e) if e.to_string().contains("Variable not found: K")),
+        "no table is visible once the last guard drops: {bare:?}"
+    );
+}
+
+/// A constant a function reaches through the resolver is still a constant:
+/// Rhai refuses a mutating method on it and an assignment to it, exactly as it
+/// does for a top-level `const`, and the next read sees the literal unchanged.
+/// A script that wants to mutate copies into a local first.
+#[test]
+fn constants_reached_inside_functions_stay_constant() {
+    let engine = build_engine(&RhaiLimits::default(), Duration::from_secs(2));
+    let ast = engine
+        .compile(
+            r#"
+            const PATHS = ["/a"];
+            const N = 1;
+            fn grow() { PATHS.push("/b"); PATHS.len() }
+            fn reassign() { PATHS = []; PATHS.len() }
+            fn bump() { N += 1; N }
+            fn read() { PATHS.len() }
+            fn local_copy() { let p = PATHS; p.push("/b"); `${p.len()}/${PATHS.len()}` }
+            "#,
+        )
+        .expect("compiles");
+    let _constants = enter_constants(&ast);
+    let call = |name: &str| engine.call_fn::<i64>(&mut Scope::new(), &ast, name, ());
+
+    let grow = call("grow");
+    assert!(
+        matches!(&grow, Err(e) if matches!(**e, EvalAltResult::ErrorNonPureMethodCallOnConstant(ref m, _) if m == "push")),
+        "a mutating method on a constant is refused: {grow:?}"
+    );
+    let reassign = call("reassign");
+    assert!(
+        matches!(&reassign, Err(e) if matches!(**e, EvalAltResult::ErrorAssignmentToConstant(ref v, _) if v == "PATHS")),
+        "assigning to a constant is refused: {reassign:?}"
+    );
+    let bump = call("bump");
+    assert!(
+        matches!(&bump, Err(e) if matches!(**e, EvalAltResult::ErrorAssignmentToConstant(ref v, _) if v == "N")),
+        "compound-assigning to a constant is refused: {bump:?}"
+    );
+    assert_eq!(
+        call("read").expect("read runs"),
+        1,
+        "the refused attempts left the constant as declared"
+    );
+    assert_eq!(
+        engine
+            .call_fn::<String>(&mut Scope::new(), &ast, "local_copy", ())
+            .expect("local_copy runs"),
+        "2/1",
+        "a local copy may be mutated and the constant is untouched"
+    );
+}
+
+/// A local or parameter a closure captures keeps shadowing a constant of the
+/// same name: the closure body reads the captured name unindexed, and the
+/// resolver defers to the live scope, where the capture is a parameter. An
+/// uncaptured read of the constant from a closure still resolves.
+#[test]
+fn captured_locals_still_shadow_constants() {
+    let engine = build_engine(&RhaiLimits::default(), Duration::from_secs(2));
+    let ast = engine
+        .compile(
+            r#"
+            const X = 1;
+            fn via_closure() { let X = 5; let c = || X; c.call() }
+            fn param_closure(X) { let c = || X; c.call() }
+            fn unshadowed() { let c = || X; c.call() }
+            "#,
+        )
+        .expect("compiles");
+    let _constants = enter_constants(&ast);
+    let call = |name: &str, args: Vec<rhai::Dynamic>| {
+        engine
+            .call_fn::<i64>(&mut Scope::new(), &ast, name, args)
+            .expect(name)
+    };
+    assert_eq!(call("via_closure", vec![]), 5);
+    assert_eq!(call("param_closure", vec![rhai::Dynamic::from(7_i64)]), 7);
+    assert_eq!(call("unshadowed", vec![]), 1);
 }

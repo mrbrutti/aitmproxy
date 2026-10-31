@@ -2626,23 +2626,46 @@ fn event_label(ev: &Event) -> &'static str {
     }
 }
 
-/// The `flow.get`-shaped summary a notification carries (full detail stays a
-/// `flow.detail` pull, F5).
+/// The summary a `notifications/aitm/flow` line carries: field for field the
+/// `flow.get` object (`summarize` in `aitm-plugins`' capture module). The size
+/// and timing rules are the core types' own (`Body::buffered_len`,
+/// `FlowMeta::started_at_ms`, `FlowMeta::duration_ms`), so the null rules are
+/// shared by construction: a `Streamed` body is `null`; no response is a `null`
+/// status and `null` `response_bytes`; an in-flight flow has a `null`
+/// `duration_ms`; a pre-epoch clock is a `null` `started_at`. Full detail stays
+/// a `flow.detail` pull (F5).
+///
+/// Kept hand-written because `aitm-mcp` must not depend on `aitm-plugins`. The
+/// key set and spelling of the two renderings are locked together by
+/// `push_summary_equals_flow_get_for_http_and_websocket_flows` in
+/// `tests/mcp.rs`, which compares a pushed summary with the real `flow.get`
+/// value and fails on any drift on either side.
 fn flow_summary(flow: &Flow) -> JsonValue {
     match flow {
         Flow::Http(f) => json!({
             "id": f.id.to_string(),
             "kind": "http",
+            "intercept": f.intercept.label(),
+            "is_replay": f.metadata.is_replay,
             "method": f.request.method,
+            "scheme": f.request.scheme,
             "authority": f.request.authority,
             "path": f.request.path,
             "status": f.response.as_ref().map(|r| r.status),
+            "request_bytes": f.request.body.buffered_len(),
+            "response_bytes": f.response.as_ref().and_then(|r| r.body.buffered_len()),
+            "started_at": f.metadata.started_at_ms(),
+            "duration_ms": f.metadata.duration_ms(),
         }),
         Flow::WebSocket(f) => json!({
             "id": f.id.to_string(),
-            "kind": "ws",
+            "kind": "websocket",
+            "intercept": f.intercept.label(),
+            "is_replay": f.metadata.is_replay,
             "handshake": f.handshake.to_string(),
             "messages": f.messages.len(),
+            "started_at": f.metadata.started_at_ms(),
+            "duration_ms": f.metadata.duration_ms(),
         }),
     }
 }

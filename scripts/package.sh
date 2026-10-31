@@ -74,6 +74,9 @@ mkdir -p "$stage/share/aitm/scripts"
 # into the dest on both BSD cp (macOS) and GNU cp — a bare `scripts/bundled/`
 # nests under `bundled/` on GNU cp, so pin the contents form.
 cp -R scripts/bundled/. "$stage/share/aitm/scripts/"
+# Only the catalogue itself ships: a working tree can hold tool scratch dirs
+# (`.claude/`) beside the scripts, and a release tarball must not carry them.
+find "$stage/share/aitm/scripts" -type d -name '.claude' -prune -exec rm -rf {} +
 
 # A download on macOS may carry Gatekeeper's quarantine flag; `aitm` would
 # otherwise fail to spawn `obscura`. Absent attribute is fine.

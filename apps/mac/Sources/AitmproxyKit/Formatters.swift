@@ -62,6 +62,11 @@ public enum Format {
     /// `6 KB/s`.
     public static func rate(_ bytesPerSecond: Int64) -> String { "\(bytes(bytesPerSecond))/s" }
 
+    /// `1 host`, `3 hosts`: a count with its noun, pluralised by adding `s` unless `plural` is given.
+    public static func count(_ n: Int, _ noun: String, plural: String? = nil) -> String {
+        n == 1 ? "1 \(noun)" : "\(n) \(plural ?? noun + "s")"
+    }
+
     /// An RFC 3339 / ISO 8601 timestamp with fractional seconds, as the core emits
     /// for WebSocket frames. A local formatter, since `ISO8601DateFormatter` is not Sendable.
     public static func rfc3339(_ date: Date) -> String {

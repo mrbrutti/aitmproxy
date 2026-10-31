@@ -647,3 +647,50 @@ async fn script_step_seeds_frontend_caller_trust() {
         "the human CLI frontend must seed Operator, never leave the step agent"
     );
 }
+
+/// A PoC step's functions see the step's top-level literal constants, as a
+/// plugin's hooks and `load(reg)` closures do: the executor is the fourth
+/// dispatcher that opens the script's constants around its evaluation. A
+/// computed constant stays invisible inside a function, the documented limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn step_functions_see_the_steps_literal_constants() {
+    let h = Harness::new();
+    let exec = h.executor();
+    let mut vars = aitm_poc::VarBindings::new();
+
+    let verdict = h
+        .run_step(
+            &exec,
+            r#"
+            const K = 7;
+            const WORDS = ["a", "b"];
+            fn total(x) { K * x + WORDS.len() }
+            vars.set("total", `${total(2)}`);
+            if total(2) == 16 { return pass; }
+            return fail;
+            "#,
+            &mut vars,
+        )
+        .expect("the step runs");
+    assert_eq!(verdict, ScriptVerdict::Pass);
+    assert_eq!(str_var(&vars, "total").as_deref(), Some("16"));
+
+    let err = h
+        .run_step(
+            &exec,
+            r#"
+            const Z = [1, 2].len();
+            fn f() { Z }
+            vars.set("z", `${f()}`);
+            return pass;
+            "#,
+            &mut vars,
+        )
+        .expect_err("a computed constant is not visible inside a function");
+    assert!(err.0.contains("Variable not found: Z"), "{}", err.0);
+    assert_eq!(
+        str_var(&vars, "z"),
+        None,
+        "the failed step's var writes are discarded"
+    );
+}

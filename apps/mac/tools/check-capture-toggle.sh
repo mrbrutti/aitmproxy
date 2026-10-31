@@ -285,11 +285,11 @@ has "TG-AC6 deactivate() submits the deactivation request" "$deactivate" 'deacti
 # @AppStorage default of true would arm capture on a fresh install.
 equals "TG-AC8 no capture.enabled read defaults to true or registers a default" \
     "$(grep -rn -E --include='*.swift' 'capture\.enabled.*(\?\? true|register)|register.*capture\.enabled' Sources | grep -v -E ':[0-9]+:[[:space:]]*//' | head -n 1)" ""
-storage=$(grep -rn -F --include='*.swift' '@AppStorage("capture.enabled")' Sources | grep -v -E ':[0-9]+:[[:space:]]*//')
+storage=$(grep -rn -F --include='*.swift' '@AppStorage("capture.enabled", store: Store.defaults)' Sources | grep -v -E ':[0-9]+:[[:space:]]*//')
 if [ "$(grep -c . <<<"$storage")" -ge 2 ]; then
-    pass "TG-AC8 the Settings toggle and the menu label both bind @AppStorage(\"capture.enabled\")"
+    pass "TG-AC8 the Settings toggle and the menu label both bind @AppStorage(\"capture.enabled\", store: Store.defaults)"
 else
-    fail "TG-AC8 expected @AppStorage(\"capture.enabled\") in SettingsView and App (found: ${storage:-none})"
+    fail "TG-AC8 expected @AppStorage(\"capture.enabled\", store: Store.defaults) in SettingsView and App (found: ${storage:-none})"
 fi
 equals "TG-AC8 every @AppStorage(\"capture.enabled\") defaults to false" \
     "$(grep -v -E '= false[[:space:]]*$' <<<"$storage")" ""
@@ -308,14 +308,14 @@ ordered "TG-AC8 the guard is the first thing set() does (before the busy flag is
     "$l_return" "$(line_of "$sw" 'captureBusy = true')"
 has "TG-AC8 set() ignores a request made while another capture action runs" "$sw_guard" '!health.captureBusy'
 has "TG-AC8/#6 set() ignores a request for the state already in force, reading the key as spawn() does" "$sw_guard" \
-    'on != (UserDefaults.standard.object(forKey: "capture.enabled") as? Bool ?? false)'
+    'on != (Store.defaults.object(forKey: "capture.enabled") as? Bool ?? false)'
 hasnt "#6 CaptureSwitch never reads capture.enabled with bool(forKey:) (a non-Bool stored value must read as off)" \
     "$(code_lines "$settings")" 'bool[(]forKey: "capture[.]enabled"'
 has "#3 set() does nothing unless the embedded core is the active kind" "$sw_guard" 'embeddedCoreActive'
 active_kind=$(body_of "$settings" '^[[:space:]]*static var embeddedCoreActive')
 found "#3 CaptureSwitch.embeddedCoreActive" "$active_kind"
 has "#3 embeddedCoreActive reads the persisted active kind the way ActiveConnectionModel does (embedded when unset)" \
-    "$active_kind" '(UserDefaultsActiveKindPersistence().load() ?? .embedded) == .embedded'
+    "$active_kind" '(UserDefaultsActiveKindPersistence(defaults: Store.defaults).load() ?? .embedded) == .embedded'
 has "TG-AC8 enable() submits no second request while one is outstanding or capture is on" "$enable" \
     'guard pendingActivity == nil, !health.captureCapability.isCaptureOn'
 has "TG-AC8 enable() refuses while a disable() or uninstall() runs" "$enable" '!uninstalling, !disabling'
@@ -339,7 +339,7 @@ l_note=$(line_of "$cs_body" 'Not available in this build')
 ordered "visibility the live Toggle sits inside the captureControlsAvailable branch" "$l_avail" "$l_toggle"
 ordered "visibility the 'Not available in this build' note follows the live Toggle (else branch)" "$l_toggle" "$l_note"
 has "#3 the Capture view reads the active core kind exactly as ProxySettings does" "$cs_body" \
-    '@AppStorage(UserDefaultsActiveKindPersistence.key) private var activeKindRaw = ActiveCoreKind.embedded.rawValue'
+    '@AppStorage(UserDefaultsActiveKindPersistence.key, store: Store.defaults) private var activeKindRaw = ActiveCoreKind.embedded.rawValue'
 has "#3 the Capture view's usesEmbedded is ProxySettings's" "$cs_body" \
     'private var usesEmbedded: Bool { (ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded) == .embedded }'
 toggle_text=$(sed -n "${l_toggle:-1},$((${l_toggle:-1} + 6))p" "$settings")
@@ -348,7 +348,7 @@ has "#3 the Capture toggle is disabled unless the embedded core is the active ki
 has "#3 the Capture tab says why the toggle is disabled when the core is not embedded" "$cs_body" 'if !usesEmbedded {'
 hasnt "TG-AC5 the Settings status line never hard-codes 'Capturing' (it shows CaptureCapability.title)" \
     "$cs_body" '"Capturing"'
-has "TG-AC5 the Settings status line shows CaptureCapability.title" "$cs_body" 'Text(capability.title)'
+has "TG-AC5 the Settings status line shows the capture lane word (ConnectionSummary, one vocabulary)" "$cs_body" 'Text(session.connectionSummary.capture.word)'
 has "TG-AC5 a running action reads Working, never Capturing" "$cs_body" 'Text("Working…")'
 
 # ============================ TG-AC10: menu command + non-colliding shortcut ===========
@@ -376,7 +376,7 @@ if [ -n "$menu_item" ]; then
     has "#3 the command stands down unless the embedded core is the active kind" \
         "$(grep -F '.disabled(' <<<"$item_text")" '!usesEmbedded'
     has "#3 the menu reads the active core kind exactly as ProxySettings does" "$(code_lines "$app")" \
-        '@AppStorage(UserDefaultsActiveKindPersistence.key) private var activeKindRaw = ActiveCoreKind.embedded.rawValue'
+        '@AppStorage(UserDefaultsActiveKindPersistence.key, store: Store.defaults) private var activeKindRaw = ActiveCoreKind.embedded.rawValue'
     has "#3 the menu's usesEmbedded is ProxySettings's" "$(code_lines "$app")" \
         'private var usesEmbedded: Bool { (ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded) == .embedded }'
 else
@@ -592,9 +592,9 @@ poll_flows=$(line_of "$poll_body" 'flow[.]list')
 ordered "security-3 pollLoop refreshes the scope on every pass, before it reads flows (inScope reads scopeHosts)" "$poll_refresh" "$poll_flows"
 status_empty=$(line_of "$cap_body" '[}] else if advice[.]offersScope [{]')
 status_text=$(line_of "$cap_body" 'Text[(]"On, nothing in scope"[)]')
-status_title=$(line_of "$cap_body" 'Text[(]capability[.]title[)]')
+status_title=$(line_of "$cap_body" 'Text[(]session[.]connectionSummary[.]capture[.]word[)]')
 ordered "NS-AC2 the Status row's empty-scope branch is tested first" "$status_empty" "$status_text"
-ordered "NS-AC2 the Status row reads 'On, nothing in scope' before the generic capability title branch" "$status_text" "$status_title"
+ordered "NS-AC2 the Status row reads 'On, nothing in scope' before the generic lane-word branch" "$status_text" "$status_title"
 has "NS-AC3 the Apps banner stays on one line and truncates (a long degraded reason must not wrap into the fixed-height row)" "$banner_body" '.lineLimit(1)'
 has "NS-AC3 the Apps banner truncates at the tail" "$banner_body" '.truncationMode(.tail)'
 

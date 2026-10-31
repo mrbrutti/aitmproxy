@@ -6,12 +6,14 @@ import Observation
 
 /// The sidebar's entries (foundation §2.6). Snapshot mode walks every case.
 enum SidebarPage: String, CaseIterable, Identifiable {
-    case pinned, saved, apps, domains, overview, connections, scope, scan, findings, browser, scripts, agent, ca, config
+    case status, flows, pinned, saved, apps, domains, overview, connections, scope, scan, findings, browser, scripts, agent, ca, config
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
+        case .status: "Status"
+        case .flows: "Flows"
         case .pinned: "Pinned"
         case .saved: "Saved"
         case .apps: "Apps"
@@ -31,6 +33,8 @@ enum SidebarPage: String, CaseIterable, Identifiable {
 
     var symbol: String {
         switch self {
+        case .status: "waveform.path.ecg"
+        case .flows: "list.bullet"
         case .pinned: Tok.Glyph.pin
         case .saved: "tray.full"
         case .apps: "app.badge"
@@ -51,13 +55,19 @@ enum SidebarPage: String, CaseIterable, Identifiable {
     /// Pages that show the flow list (the rest open their own panel).
     var showsFlows: Bool {
         switch self {
-        case .pinned, .saved, .apps, .domains, .scope, .connections: true
-        case .overview, .scan, .findings, .browser, .scripts, .agent, .ca, .config: false
+        case .flows, .pinned, .saved, .apps, .domains, .scope, .connections: true
+        case .status, .overview, .scan, .findings, .browser, .scripts, .agent, .ca, .config: false
         }
     }
 
-    /// CA and Configuration open from the Proxy menu and the palette, not the sidebar list.
-    var isInSidebar: Bool { self != .ca && self != .config }
+    /// CA and Configuration open from the Proxy menu and the palette; Status from the brand row,
+    /// the pill, the status bar and ⌘0; Saved waits for the core to save (S-066). None are list rows.
+    var isInSidebar: Bool {
+        switch self {
+        case .ca, .config, .status, .saved: false
+        default: true
+        }
+    }
 }
 
 /// Where the inspector sits (Proxyman's layouts): below, right, or in its own window.
@@ -94,12 +104,7 @@ enum AgentPolicy: String, CaseIterable {
     }
 }
 
-enum BusState: Hashable {
-    case disconnected
-    case connecting(String)
-    case connected(String)
-    case failed(String)
-}
+// `BusState` lives in AitmproxyKit (ConnectionSummary.swift) so the connection indicators share it.
 
 /// Everything the shell shows. One object, shared through the environment.
 /// This file holds the state; the actions sit in one extension file per
@@ -116,6 +121,23 @@ final class Session {
             select(last.id)
         }
     }
+    /// Rows an undone Clear put back. The core no longer holds them, so the live poll keeps them
+    /// ahead of what it lists (`ClearedFlows.merge`); a later Clear or Delete drops them for good.
+    var restoredFlows: [FlowRow] = []
+    /// "Cleared n flows — Undo" in the status bar, for a few seconds after a Clear.
+    var clearNotice: ClearNotice?
+    /// What the last Clear dropped, until it is undone or the notice lapses (then it is released).
+    @ObservationIgnored var clearedFlows: ClearedFlows?
+    @ObservationIgnored var clearNoticeTask: Task<Void, Never>?
+    /// The flow list's undo manager: Clear's one step lives here, and `FlowKeyTable` hands it to
+    /// AppKit as the list's responder, so Edit ▸ Undo Clear (⌘Z) reaches it while the list has
+    /// focus and a text field keeps its own typing undo. No event grouping: a step is registered
+    /// and withdrawn whole, which the headless self-test can prove.
+    @ObservationIgnored let flowUndoManager: UndoManager = {
+        let manager = UndoManager()
+        manager.groupsByEvent = false
+        return manager
+    }()
     /// The sidebar sub-item narrowing the list, if any.
     var group: FlowGroup?
     var details: [FlowID: FlowDetail] = [:] {
@@ -154,7 +176,22 @@ final class Session {
     var selection: Set<FlowID> = []
     /// The flow the inspector shows: the last clicked row.
     var focused: FlowID?
-    var page: SidebarPage? = .apps
+    /// The landing page (spec §3): the list page the operator last used; Status until they
+    /// have navigated once (a fresh install has nothing to show yet, so show what is running
+    /// and what to do first). Only list pages are remembered, so a session that ends on Status
+    /// or Saved comes back on Flows. Fixture, snapshot and self-test runs start on Apps so their
+    /// scenes stay deterministic.
+    static func landingPage(saved: String?) -> SidebarPage {
+        guard let saved, let page = SidebarPage(rawValue: saved) else { return .status }
+        return page.isInSidebar ? page : .flows
+    }
+
+    var page: SidebarPage? = Store.isOverridden ? .apps : Session.landingPage(saved: UserDefaults.standard.string(forKey: "page")) {
+        didSet {
+            guard !Store.isOverridden, let page else { return }
+            UserDefaults.standard.set((page.isInSidebar ? page : .flows).rawValue, forKey: "page")
+        }
+    }
     var chip: ContentCategory = .all
     var layout: InspectorLayout = Store.isOverridden ? .horizontal
         : InspectorLayout(rawValue: UserDefaults.standard.string(forKey: "layout") ?? "") ?? .horizontal {
@@ -263,6 +300,8 @@ final class Session {
         didSet { if pins != oldValue { try? pins.save(to: pinsURL) } }
     }
     var pinsURL: URL { Store.url.appending(path: "pins.json") }
+    /// The embedded core's persisted operator scope (`scope.json`, beside `pins.json`).
+    var scopeURL: URL { EmbeddedScope.url(in: Store.url) }
     var savedSessions = 0
     var memoryBytes: Int64 = 0
     var upBytesPerSecond: Int64 = 0
@@ -286,6 +325,13 @@ final class Session {
 
     init() {
         if !Store.usesFixtures { pins = Pins.load(from: pinsURL) }
+        // The Scope page shows the embedded core's persisted scope before the bus
+        // connects; `refreshScope()` replaces it with the core's `scope.list` on connect (D5).
+        if EmbeddedScope.seedsAtLaunch(activeKind: UserDefaultsActiveKindPersistence().load() ?? .embedded,
+                                       bundledCorePresent: EmbeddedCore.discoverBundled() != nil,
+                                       usesFixtures: Store.usesFixtures) {
+            scopeHosts = EmbeddedScope.load(from: scopeURL).hosts
+        }
         composeHistory = ComposeHistory.load(from: composeURL)
         if !Store.usesFixtures { breakpointRules = BreakpointRules.load(from: rulesURL) }
         loadSavedFilters()
@@ -453,7 +499,7 @@ final class Session {
     /// to the server). Called by the bus service on connect; `nil` on disconnect.
     func applyResolvedRole(_ role: String?) {
         resolvedRole = role
-        let expected = ExpectedRole(rawValue: UserDefaults.standard.string(forKey: "bus.expectedRole") ?? "")
+        let expected = ExpectedRole(rawValue: Store.defaults.string(forKey: BusEndpointSettings.Key.expectedRole) ?? "")
         // The embedded core always connects the app as operator; the Expected-role setting
         // describes an external core. Suppressed only while the embedded core is the ACTIVE
         // connection (a stale "agent" default would otherwise show a permanent triangle on a

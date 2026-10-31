@@ -5,9 +5,9 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::SystemTime;
 
 use aitm_core::{
-    Body, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow, HttpRequest,
-    HttpResponse, HttpVersion, InterceptState, MemFlowStore, ResumeHandle, ScopeEntry,
-    ScopeRateGuard, StdGuard,
+    Body, ClearOutcome, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow,
+    HttpRequest, HttpResponse, HttpVersion, InterceptState, MemFlowStore, ResumeHandle, ScopeEntry,
+    ScopeRateGuard, StdGuard, StreamBody, WsFlow,
 };
 
 fn conn() -> ConnInfo {
@@ -56,6 +56,34 @@ fn http_with_id(id: FlowId, intercept: InterceptState, with_response: bool) -> F
         }
         other => other,
     }
+}
+
+/// An observed HTTP flow whose response head is stored but whose body is still
+/// arriving on the wire (`Body::Streamed`), exactly as the HTTP modules leave a
+/// flow between `ResponseHeaders` and `ResponseComplete`.
+fn streamed_http() -> Flow {
+    match http(InterceptState::Observed, true) {
+        Flow::Http(mut f) => {
+            if let Some(r) = f.response.as_mut() {
+                r.body = Body::Streamed(StreamBody);
+            }
+            Flow::Http(f)
+        }
+        other => other,
+    }
+}
+
+/// An observed WebSocket flow (no messages yet).
+fn ws() -> Flow {
+    Flow::WebSocket(WsFlow {
+        id: FlowId::new(),
+        handshake: FlowId::new(),
+        messages: Vec::new(),
+        client_conn: conn(),
+        server_conn: None,
+        metadata: FlowMeta::default(),
+        intercept: InterceptState::Observed,
+    })
 }
 
 #[test]
@@ -176,6 +204,204 @@ fn clear_removes_terminal_keeps_in_flight_and_parked() {
     assert_eq!(outcome.skipped_in_flight, 2);
     assert!(store.get(in_flight).is_some());
     assert!(store.get(parked).is_some());
+    assert_eq!(store.count(), 2);
+}
+
+// ---- abandon_response (flow-finish-and-timing spec D1, AC1/AC2) ----
+
+#[test]
+fn abandon_response_buffers_a_streamed_response_as_truncated() {
+    // A response whose body is still `Streamed` is finalised as the bytes
+    // captured so far, marked truncated, and given a duration.
+    let Flow::Http(mut f) = streamed_http() else {
+        unreachable!("streamed_http builds an HTTP flow")
+    };
+    assert!(!f.metadata.truncated, "precondition: not truncated");
+    assert!(f.metadata.duration.is_none(), "precondition: no duration");
+
+    assert!(f.abandon_response(vec![1, 2, 3]));
+    let body = &f.response.as_ref().expect("response head is kept").body;
+    assert!(
+        matches!(body, Body::Bytes(b) if b == &vec![1, 2, 3]),
+        "captured bytes are stored, got {body:?}"
+    );
+    assert!(f.metadata.truncated, "an abandoned response is truncated");
+    assert!(
+        f.metadata.duration.is_some(),
+        "an abandoned response has a duration"
+    );
+
+    // Nothing captured: the body becomes `Empty`, not `Bytes(vec![])`.
+    let Flow::Http(mut g) = streamed_http() else {
+        unreachable!("streamed_http builds an HTTP flow")
+    };
+    assert!(g.abandon_response(Vec::new()));
+    let body = &g.response.as_ref().expect("response head is kept").body;
+    assert!(
+        matches!(body, Body::Empty),
+        "no captured bytes => Empty, got {body:?}"
+    );
+    assert!(g.metadata.truncated);
+    assert!(g.metadata.duration.is_some());
+}
+
+#[test]
+fn abandon_response_is_a_no_op_on_a_buffered_or_missing_response() {
+    // A completed `Empty` body: nothing to abandon.
+    let Flow::Http(mut f) = http(InterceptState::Observed, true) else {
+        unreachable!("http builds an HTTP flow")
+    };
+    assert!(!f.abandon_response(vec![1, 2, 3]));
+    assert!(
+        !f.metadata.truncated,
+        "a buffered response is not marked truncated"
+    );
+    assert!(f.metadata.duration.is_none(), "a no-op sets no duration");
+    assert!(matches!(f.response.as_ref().unwrap().body, Body::Empty));
+
+    // A body already buffered (completed, or replaced by a plugin): untouched.
+    f.response.as_mut().unwrap().body = Body::Bytes(vec![9]);
+    assert!(!f.abandon_response(vec![1, 2, 3]));
+    assert!(
+        matches!(f.response.as_ref().unwrap().body, Body::Bytes(ref b) if b == &vec![9]),
+        "a buffered body keeps its bytes"
+    );
+    assert!(!f.metadata.truncated);
+
+    // No response head at all: nothing to finalise (follow-up F1 territory).
+    let Flow::Http(mut g) = http(InterceptState::Observed, false) else {
+        unreachable!("http builds an HTTP flow")
+    };
+    assert!(!g.abandon_response(vec![1, 2, 3]));
+    assert!(g.response.is_none(), "no response is invented");
+    assert!(!g.metadata.truncated);
+    assert!(g.metadata.duration.is_none());
+}
+
+#[test]
+fn clear_removes_a_streamed_response_only_once_it_is_abandoned() {
+    // `is_terminal` proven by behaviour (spec D6): a `Streamed` response is kept
+    // by `clear`, and removed once `abandon_response` has buffered it.
+    let store = MemFlowStore::new();
+    let id = store.insert(streamed_http());
+    assert_eq!(
+        store.clear(),
+        ClearOutcome {
+            cleared: 0,
+            skipped_in_flight: 1
+        },
+        "a streaming response is in flight"
+    );
+
+    assert!(store.abandon_response(id, vec![1, 2, 3]));
+    let stored = store.get(id).expect("still resident after abandon");
+    let Flow::Http(stored) = stored else {
+        unreachable!("stored flow is HTTP")
+    };
+    assert!(
+        matches!(stored.response.as_ref().unwrap().body, Body::Bytes(ref b) if b == &vec![1, 2, 3])
+    );
+    assert!(stored.metadata.truncated);
+
+    assert_eq!(
+        store.clear(),
+        ClearOutcome {
+            cleared: 1,
+            skipped_in_flight: 0
+        },
+        "an abandoned response is terminal"
+    );
+    assert!(store.get(id).is_none());
+    assert_eq!(store.count(), 0);
+}
+
+#[test]
+fn abandon_response_on_an_unknown_id_or_a_websocket_flow_is_false() {
+    let store = MemFlowStore::new();
+    assert!(!store.abandon_response(FlowId::new(), vec![1]));
+
+    let ws_id = store.insert(ws());
+    assert!(!store.abandon_response(ws_id, vec![1]));
+    assert!(
+        store.get(ws_id).is_some(),
+        "the WebSocket flow is untouched"
+    );
+    assert!(!store.get(ws_id).unwrap().metadata().truncated);
+}
+
+// ---- tester additions: idempotence and eviction of an abandoned response ----
+
+#[test]
+fn abandon_response_is_idempotent_a_second_call_changes_nothing() {
+    // The doc promises idempotence by construction: a second call finds a
+    // buffered body, declines, and leaves the first finalisation intact (bytes,
+    // marker and the duration it measured).
+    let Flow::Http(mut f) = streamed_http() else {
+        unreachable!("streamed_http builds an HTTP flow")
+    };
+    assert!(f.abandon_response(vec![1, 2, 3]));
+    let first_duration = f.metadata.duration;
+    assert!(
+        first_duration.is_some(),
+        "the first call measures a duration"
+    );
+
+    assert!(
+        !f.abandon_response(vec![9, 9]),
+        "a second call finds a buffered body and is a no-op"
+    );
+    assert!(
+        matches!(f.response.as_ref().unwrap().body, Body::Bytes(ref b) if b == &vec![1, 2, 3]),
+        "the first capture wins; the second is dropped"
+    );
+    assert!(f.metadata.truncated);
+    assert_eq!(
+        f.metadata.duration, first_duration,
+        "the duration is not re-measured by a no-op"
+    );
+
+    // The store-side method follows: a second call is `false`, and `clear` still
+    // removes exactly one flow.
+    let store = MemFlowStore::new();
+    let id = store.insert(streamed_http());
+    assert!(store.abandon_response(id, vec![1]));
+    assert!(!store.abandon_response(id, vec![2]));
+    assert_eq!(
+        store.clear(),
+        ClearOutcome {
+            cleared: 1,
+            skipped_in_flight: 0
+        }
+    );
+}
+
+#[test]
+fn eviction_removes_an_abandoned_response_like_a_completed_one() {
+    // Spec Goals: "terminal" also means the memory-budget eviction can remove the
+    // flow. With a capacity of one, every insert past the first evicts the
+    // oldest *terminal* flow; a streaming response is passed over, an abandoned
+    // one is taken.
+    let store = MemFlowStore::with_capacity(1);
+    let first = store.insert(streamed_http());
+    let second = store.insert(streamed_http());
+    assert_eq!(
+        store.count(),
+        2,
+        "two streaming responses: neither is terminal, so neither is evicted"
+    );
+    assert!(store.get(first).is_some());
+
+    assert!(store.abandon_response(first, vec![1, 2, 3]));
+    let third = store.insert(streamed_http());
+    assert!(
+        store.get(first).is_none(),
+        "the abandoned response is terminal and is the one evicted"
+    );
+    assert!(
+        store.get(second).is_some(),
+        "a response still streaming is passed over by eviction"
+    );
+    assert!(store.get(third).is_some());
     assert_eq!(store.count(), 2);
 }
 

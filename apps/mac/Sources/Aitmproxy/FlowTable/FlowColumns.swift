@@ -67,6 +67,11 @@ enum FlowColumn: String, CaseIterable {
         }
     }
 
+    /// The columns that give way, first to last, when the pane is narrower than the visible
+    /// columns' minimum sum (about 1096 pt with every column shown); they come back with room.
+    /// `#`, URL and Method never hide; Status and Time stay because a row without them says nothing.
+    static let autoHidePriority: [FlowColumn] = [.edited, .origin, .ssl, .response, .request, .duration, .client]
+
     /// `#`, URL and Method cannot be hidden.
     var alwaysVisible: Bool {
         switch self {
