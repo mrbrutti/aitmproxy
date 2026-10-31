@@ -46,9 +46,9 @@ impl PocBuilder for StdPocBuilder {
         // PoC still reproduces; a JSON body is scrubbed structurally so redaction
         // never corrupts it (an unparseable or opaque body falls back to the shared
         // free-text scrubber, never emitted verbatim); and a credential embedded in a
-        // non-secret value (`next=…?jwt=…`, a `Referer`) is caught per value with the
-        // builder's wider secret-name vocabulary (sid/jwt/session/PHPSESSID). The
-        // shared `aitm_core::redact::scrub_text` / `is_secret_key` are unchanged here.
+        // non-secret value (`next=…?jwt=…`, a `Referer`) is caught per value. Every
+        // "is this key a secret" decision here is `aitm_core::redact::is_secret_key`,
+        // the one shared vocabulary (which includes sid/jwt/csrf/session/PHPSESSID).
         let url = scrub_url_credentials(&parameterize_url(req, &spec.variables));
         let (headers, secret_vars) = request_headers(&req.headers);
 
@@ -175,34 +175,12 @@ fn body_text(body: &Body) -> Option<String> {
     }
 }
 
-/// Secret-name needles the PoC builder masks beyond `aitm_core::redact::is_secret_key`:
-/// the session / CSRF family the scanner's Scrubber also treats as secret. Matched as
-/// a whole key SEGMENT (split on non-alphanumerics), so `sid` does not match `inside`
-/// and `auth` does not match `author`.
-const EXTRA_SECRET_KEY_SEGMENTS: [&str; 5] = ["sid", "jwt", "csrf", "session", "auth"];
-
-/// Well-known session-cookie key names that are a single token with no separator, so
-/// the SEGMENT match above misses them (`PHPSESSID`, `JSESSIONID`, `sessionid`).
-/// Matched as a SUBSTRING — each is itself an unambiguous session-credential name.
-/// (`jsessionid` / `aspsessionid` already contain `sessionid`; `phpsessid` is the
-/// distinct one.)
-const SESSION_KEY_SUBSTRINGS: [&str; 2] = ["sessionid", "phpsessid"];
-
-/// Whether a query / body / header KEY names a credential, for the PoC builder: the
-/// shared `is_secret_key` vocabulary widened with the session/jwt/csrf family, so a
+/// Whether a query / body / header KEY names a credential. The vocabulary lives in
+/// `aitm-core` ([`aitm_core::redact::is_secret_key`]) and is not copied here, so a
 /// directly-captured flow (`poc.build` runs on any stored flow, not only scanner
-/// output) does not bake a `sid=`/`jwt=`/`session=`/`PHPSESSID=` value into the artifact.
+/// output) is judged by the same vocabulary as the audit ring and the findings store.
 fn is_secret_poc_key(key: &str) -> bool {
-    if aitm_core::redact::is_secret_key(key) {
-        return true;
-    }
-    let lower = key.to_ascii_lowercase();
-    if SESSION_KEY_SUBSTRINGS.iter().any(|s| lower.contains(s)) {
-        return true;
-    }
-    lower
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|seg| EXTRA_SECRET_KEY_SEGMENTS.contains(&seg))
+    aitm_core::redact::is_secret_key(key)
 }
 
 /// Redact a value at a secret-named key: everything under it is secret, so force every
@@ -281,15 +259,15 @@ fn scrub_kv_segment(pair: &str) -> String {
 }
 
 /// Content-scrub a NON-secret value that may still embed a credential. A URL carried in
-/// a `next=` / `Referer` value has its own `?query`, where a `jwt=`/`sid=`/`session=`
-/// rides under the builder's WIDER vocabulary -- which the shared `scrub_text` set does
-/// not know. So scrub each embedded query param individually (one level, no recursion --
-/// bounded against a crafted deeply-nested URL): a secret-named param is redacted
-/// ([`redact_secret_pair`]), a `{{…}}` placeholder is kept, and any other value (plus the
-/// base, plus a value with no embedded query) is content-scrubbed for an embedded
-/// `Bearer …` / `access_token=…`. Scrubbing per part -- never over the reassembled string
-/// -- is what keeps a kept placeholder from being eaten by the free-text pass. The shared
-/// `scrub_text` is left unchanged for its other consumers.
+/// a `next=` / `Referer` value has its own `?query`. The per-part scrub here is kept for
+/// placeholder handling, not for vocabulary: the shared `scrub_text` would mask a `{{…}}`
+/// placeholder sitting at a secret key (the declared injection point), so each embedded
+/// query param is scrubbed individually (one level, no recursion -- bounded against a
+/// crafted deeply-nested URL): a secret-named param is redacted ([`redact_secret_pair`]),
+/// a `{{…}}` placeholder is kept, and any other value (plus the base, plus a value with
+/// no embedded query) is content-scrubbed for an embedded `Bearer …` / `access_token=…`.
+/// Scrubbing per part -- never over the reassembled string -- is what keeps a kept
+/// placeholder from being eaten by the free-text pass.
 fn scrub_embedded_credentials(value: &str) -> String {
     let Some((base, query)) = value.split_once('?') else {
         return aitm_core::redact::scrub_text(value);
