@@ -66,7 +66,7 @@ and `intercept` (`crates/aitm-plugins/src/detail.rs`).
    `flow.mark` would surface the label (i) or drop earlier marks (ii).
 3. **Failure messages name what differed.** Checks (i) and (ii) print the marks
    diff (`before -> after`); check 1 prints the names of the differing keys
-   (`differs in: meta.comment, edited`), because a marks diff there would point at
+   (`differs in: edited, meta.comment`), because a marks diff there would point at
    the wrong field. Order of checks: detail-minus-marks, then (i), then (ii).
    Message prefixes are fixed here so evidence is greppable (the builder may
    append detail after them):
@@ -90,7 +90,7 @@ and `intercept` (`crates/aitm-plugins/src/detail.rs`).
    test, so a concurrent suite cannot trip it; the constant is commented as
    reserved). `flow.table` rows list every LISTED flow's `marks`
    (`crates/aitm-plugins/src/capture.rs`); flows captured while capture is paused
-   are not listed (`crates/aitm-core/src/store.rs`), so the scan covers listed flows
+   (and not parked) are not listed (`crates/aitm-core/src/store.rs`), so the scan covers listed flows
    only. The control flow's row must carry a `marks` list or the test fails
    loudly. Prefix:
    `no flow in the store carries the barrage's mark label`.

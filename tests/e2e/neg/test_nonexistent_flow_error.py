@@ -25,8 +25,9 @@ What "clean" means here, asserted on a real core (never fixtures):
         bundled passive detectors add marks to a live flow at any moment, so marks
         are checked on their own);
       - BARRAGE_MARK (the barrage's own label) appears on no listed flow in the
-        store -- flows captured during a capture pause are not listed by flow.table.
-    Also: none was lost (proxy.status still counts the control flow) and the
+        store -- flows captured during a capture pause (and not parked) are not
+        listed by flow.table.
+    Also: no flow was lost (proxy.status still counts the control flow) and the
     missing ids were not created; proxy.status's `paused` / `capturing` fields are
     NOT asserted equal -- on a shared runner core a concurrent suite may
     legitimately park a flow or pause the proxy;

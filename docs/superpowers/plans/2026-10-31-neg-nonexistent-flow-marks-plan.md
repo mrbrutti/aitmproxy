@@ -1,6 +1,6 @@
 # neg/nonexistent-flow marks implementation plan
 
-**Status:** approved (2026-10-31 by Matt via the delegating orchestrator, autonomous-approve mode); amended 2026-10-31 by the orchestrator (self-approved) after panel review: Task 2 (F4 edit type, F5, one copy per run, AC4 base), Task 3 added, Review log and Shipped filled
+**Status:** approved (2026-10-31 by Matt via the delegating orchestrator, autonomous-approve mode); amended 2026-10-31 by the orchestrator (self-approved) after panel review: Overview and Stage 6 paragraph (three tasks, two to three panel rounds), Task 1 message text, Task 2 (F4 edit type, F5, one copy per run, AC4 base), Task 3 added and Task 3's helper list, Review log and Shipped filled
 **Spec:** `docs/superpowers/specs/2026-10-31-neg-nonexistent-flow-marks-design.md`
 **Branch / worktree:** `claude/sleepy-goldwasser-9ec645` (base `main` f979040, after PR #172 and #156 merged; failure first seen on 840e520) in `/Users/matt/Security/aitmproxy/.claude/worktrees/sleepy-goldwasser-9ec645`
 
@@ -8,8 +8,8 @@
 
 Three sequential tasks (Task 3 was added after the first panel review); none is independent (Task 2 reads Task 1's file, Task 3 edits it). Task 1 (Coder)
 edits the single test file; its helper behaviour is proven in the sandbox with a
-no-port Python check. Task 2 (Tester) runs the real e2e and the four fault
-injections. All port-binding runs go through the Terminal panel (`run_in_terminal`,
+no-port Python check. Task 2 (Tester) runs the real e2e and the fault
+injections (four at first; F5 joined with Task 3). All port-binding runs go through the Terminal panel (`run_in_terminal`,
 Matt's real shell; the Bash sandbox cannot bind ports), from the worktree root so
 `run.py` uses this worktree's `target/debug`. Run each command on its own, log to a
 file, and judge by exit status, not a grep pipeline. If the Tester cannot reach the
@@ -58,14 +58,14 @@ its wording follow-up (round 2), each with the prior reports as input; stage not
   - AC7: `python3 tests/e2e/run.py --shared-core neg` three times, exit 0 each.
   - AC3: each copy in its OWN `python3 tests/e2e/run.py --shared-core neg --jobs 1` invocation with only that copy present (the store-wide scan of Task 3 reads every flow on the shared core, so a leftover label from one copy would trip the real test and the others): each copy exits 1 with `[FAIL]` starting `the barrage's mark label 'e2e-missing' is absent from the REAL flow's marks` (F1), `marks only grew: every mark present before the barrage is still present` (F2), `flow.detail of the REAL flow is byte-identical apart from meta.marks` (F3, F4); the real test still PASSes in the same run; F5 (spec AC8) fails with `no flow in the store carries the barrage's mark label`.
   - AC4: delete the copies, then `git status --short` and `git diff --stat f979040` (the branch base; the local `main` ref is stale) list only the test, the spec, and the plan.
-- **Done when:** the report quotes the raw output of every command above, including the four `[FAIL]` lines, and the throwaway files are gone.
+- **Done when:** the report quotes the raw output of every command above, including every injected copy's `[FAIL]` line (four, then five with F5), and the throwaway files are gone.
 
 ### Task 3: panel fix task (added after the first panel review)
 
 - **Satisfies:** AC8; closes the first panel's Minors (see Review log)
 - **Depends on:** Task 1, Task 2
 - **Input:** the findings report `/Users/matt/Library/Application Support/Claude-3p/side-session-notes/local_66678338-65d2-4823-a414-e59ffd702b90/panel1-findings.md` (instead of a task number); spec Design 6 and AC8.
-- **Files:** `tests/e2e/neg/test_nonexistent_flow_error.py` only.
+- **Files:** `tests/e2e/neg/test_nonexistent_flow_error.py` only. New test-private helpers it adds, named here so the plan is complete: `differing_keys`/`_ABSENT` (names the differing keys for check 1's message) and `barrage_carriers` (ids of table rows carrying `BARRAGE_MARK`).
 - **Done when:** py_compile passes; the vocabulary grep prints 0; no new `time.sleep`; the Tester regenerates the injection copies (F1 to F4 unchanged, plus F5 for AC8) and the orchestrator re-runs AC1, AC3, AC7 in the Terminal; the panel runs again on the fix with the first reports in hand.
 
 ## Review log
@@ -74,32 +74,37 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
-| 1-2 | Quality | Minor | (ii) is vacuous when `marks_before` is empty and the file does not say so; the green line over-claims; its only proof of life was in deleted copies | Fixed in 6594460 (comment at `marks_before`, `ok` note) and re-fixed in the round-2 follow-up (note became a suffix on the 'marks only grew' message, comment names the check by its message); wipe proof recorded in Shipped (F2) |
+| 1-2 | Quality | Minor | (ii) is vacuous when `marks_before` is empty and the file does not say so; the green line over-claims; its only proof of life was in deleted copies | Fixed in 6594460 (comment at `marks_before`, `ok` note) and re-fixed in c56db5b (note became a suffix on the 'marks only grew' message, comment names the check by its message); wipe proof recorded in Shipped (F2) |
 | 1-2 | Quality | Minor | Check 1's failure shows the marks delta, not the field that differed; `delta` on all three messages; `:` instead of ` -- ` | Fixed in 6594460: check 1 names the differing keys; marks delta only on (i)/(ii) as `marks_delta`; ` -- ` idiom |
-| 1-2 | Quality | Minor | Header bullet run-on | Fixed in 6594460, then split into two sub-bullets in the round-2 follow-up |
+| 1-2 | Quality | Minor | Header bullet run-on | Fixed in 6594460, then split into two sub-bullets in c56db5b |
 | 1-2 | Quality | Minor | Same rationale in five places | Fixed in 6594460: trimmed to header, `marks_of` docstring, the `marks_before` comment |
 | 1-2 | Quality | Minor | `BARRAGE_MARK` splits the flood constants; long comment | Fixed in 6594460: moved to the wire-vocabulary group, shortened (comment now says it is reserved) |
 | 1-2 | Quality | Minor | Spec Rejected list starts at (b); PR #172 note goes stale | Fixed in 6594460 (spec: chosen (a) labelled; note reduced to a do-not-touch line) |
-| 1-2 | Quality | Minor | Check (ii) has no committed proof of life | Accepted by Matt 2026-10-31 (autonomous-approve mode, via the orchestrator): a committed wipe test would make the cell a writer (spec option (d), rejected); F2 evidence is in Shipped and the file says the check is a tripwire |
+| 1-2 | Quality | Minor | Check (ii) has no committed proof of life | Accepted 2026-10-31 by the orchestrator under Matt's standing autonomous-approve instruction (no separate written acceptance from Matt; the PR asks for his countersign): a committed wipe test would make the cell a writer (spec option (d), rejected); F2 evidence is in Shipped and the file says the check is a tripwire |
 | 1-2 | Security | Minor | Check (i) reads only the control flow though the message says "elsewhere" | Fixed in 6594460: store-wide scan of the `flow.table` rows already fetched (spec Design 6/AC8); F5 injection proves it |
 | 1-2 | Security | Minor | (ii) is a tripwire that is vacuous in practice | Same fix as the Quality vacuity finding |
-| 1-2 | Spec | Minor | AC4's literal `git diff --stat main` uses the stale local `main` | Fixed in 6594460 (spec AC4) and in the round-2 follow-up (plan Task 2) |
-| 1-2 | Spec | Minor | Approved spec/plan amended after approval; Tester improvised the F4 edit first | Recorded here: F4 is a request header edit because a response `status` edit is refused on a completed flow (`mutate.rs:217-227`); the spec/plan were corrected in 299b5e9; both Status lines now list the amendments and who made them |
+| 1-2 | Spec | Minor | AC4's literal `git diff --stat main` uses the stale local `main` | Fixed in 6594460 (spec AC4) and in c56db5b (plan Task 2) |
+| 1-2 | Spec | Minor | Approved spec/plan amended after approval; Tester improvised the F4 edit first | Accepted by the orchestrator under the same instruction. F4 is a request header edit because a response `status` edit is refused on a completed flow (`mutate.rs:217-227`); the spec/plan were corrected in 299b5e9; both Status lines now list the amendments and who made them |
 | 1-2 | Spec | Minor | Evidence logs live outside the repo | Fixed in 6594460: key lines pasted into Shipped |
-| 3 | Security | Minor | "ANY flow in the store" is really every LISTED flow (`flow.table` omits flows captured during a capture pause, `store.rs`); also raised by the Tester | Fixed in the round-2 follow-up: header, scan message, spec Design 6 and Goals say "listed" and name the limit |
-| 3 | Quality | Minor | Comment refers to "(ii)"/"F2", labels that exist only in the spec | Fixed in the round-2 follow-up: names the check by its message, cites spec AC3 |
-| 3 | Quality | Minor | Vacuity note printed before the check it qualifies; the green line carried no caveat | Fixed in the round-2 follow-up: caveat is a suffix on the same message |
-| 3 | Quality | Minor | Header sub-bullet held two rules; "no flow was added" is not asserted | Fixed in the round-2 follow-up: two sub-bullets; the clause says what is asserted |
-| 3 | Quality | Minor | `e2e-missing` is reserved by convention only | Fixed in the round-2 follow-up: constant comment says it is reserved |
-| 3 | Quality, Spec | Minor | Plan Task 2/Overview contradicted the amended spec; spec example `differs in:` wrong; mis-wrapped paragraphs | Fixed in the round-2 follow-up (spec and plan text) |
-| 3 | Spec | Minor | Amendment record incomplete; no approver named | Fixed in the round-2 follow-up: Status lines list every amended section; amendments are the orchestrator's, self-approved in autonomous-approve mode |
-| 3 | Spec | Minor | Commit 6594460 mixes spec/plan edits into the test commit | Recorded: the Coder edited only the test; the orchestrator wrote every spec and plan hunk (Design 3/5/6, AC8, Review log, Shipped) |
+| 3 | Security | Minor | "ANY flow in the store" is really every LISTED flow (`flow.table` omits flows captured during a capture pause, `store.rs`); also raised by the Tester | Fixed in c56db5b: header, scan message, spec Design 6 and Goals say "listed" and name the limit |
+| 3 | Quality | Minor | Comment refers to "(ii)"/"F2", labels that exist only in the spec | Fixed in c56db5b: names the check by its message, cites spec AC3 |
+| 3 | Quality | Minor | Vacuity note printed before the check it qualifies; the green line carried no caveat | Fixed in c56db5b: caveat is a suffix on the same message |
+| 3 | Quality | Minor | Header sub-bullet held two rules; "no flow was added" is not asserted | Fixed in c56db5b: two sub-bullets; the clause says what is asserted |
+| 3 | Quality | Minor | `e2e-missing` is reserved by convention only | Fixed in c56db5b: constant comment says it is reserved |
+| 3 | Quality, Spec | Minor | Plan Task 2/Overview contradicted the amended spec; spec example `differs in:` wrong; mis-wrapped paragraphs | Fixed in c56db5b (spec and plan text) |
+| 3 | Spec | Minor | Amendment record incomplete; no approver named | Fixed in c56db5b: Status lines list every amended section; amendments are the orchestrator's, self-approved in autonomous-approve mode |
+| 3 | Spec | Minor | Commit 6594460 mixes spec/plan edits into the test commit | Accepted 2026-10-31 by the orchestrator under the same instruction (history not rewritten): the Coder edited only the test; the orchestrator wrote every spec and plan hunk (Design 3/5/6, AC8, Review log, Shipped), and c56db5b repeats the bundling |
+| 3b | Quality, Spec | Minor | Round 3: plan still said four injections / `[FAIL]` lines; spec `differs in:` example order; plan Status list incomplete; Shipped pointed at `r2-*.log`; Task 3 helpers not named | Fixed in the round-3 docs commit (the commit after c56db5b) |
+| 3b | Quality | Minor | Header "none was lost" had no antecedent | Fixed in the round-3 docs commit: "no flow was lost"; the evidence was re-run on that file |
+| 3b | Security | Minor | "captured during a capture pause are not listed" overstates the blind spot: a parked flow is still listed (`store.rs` `is_visible`) | Fixed in the round-3 docs commit: "(and not parked)" in the test header and spec Design 6 |
+| 3b | Spec | Minor | Review-log SHA / acceptor format; orchestrator wrote spec body text | Fixed or attributed in the rows above (SHA c56db5b, acceptor named); the final commit's own SHA cannot be cited inside itself |
+| 3b | Spec | Minor | Final logs do not record command lines or the head SHA | Accepted by the orchestrator: the evidence is bound to the test file's sha256, recorded in `final/test.sha256` and in Shipped |
 
 ## Shipped
 
 What shipped: `tests/e2e/neg/test_nonexistent_flow_error.py` now compares `flow.detail` byte-identically apart from `meta.marks`, checks marks on their own (the barrage's label absent from the real flow, earlier marks never wiped), and scans the whole `flow.table` read for the barrage's label (Design 6). No production code, catalogue, runner, or Rust changed, so the Rust gate was not required. PR #172 (the `entries = activity_since(op or rd, ...)` line) had already merged; the branch was fast-forwarded onto it (base f979040), so there was no merge.
 
-Evidence, from real runs in Matt's Terminal on a core with the bundled catalogue ON (`AITM_NO_BUNDLED_SCRIPTS` unset; binaries built with `cargo build -p aitm -p aitm-testtarget` on f979040). Full logs: `side-session-notes/local_66678338-.../` (`step0-red.log`, `r2-*.log`).
+Evidence, from real runs in Matt's Terminal on a core with the bundled catalogue ON (`AITM_NO_BUNDLED_SCRIPTS` unset; binaries built with `cargo build -p aitm -p aitm-testtarget` on f979040). Full logs: `side-session-notes/local_66678338-.../` (`step0-red.log`, and every quoted line below from `final/*.log`).
 
 AC2 red (original test on f979040, `python3 tests/e2e/run.py --shared-core neg`):
 
@@ -109,7 +114,7 @@ e2e summary: 4 pass, 0 skip, 1 fail
   FAIL neg/test_nonexistent_flow_error.py (exit 1)
 ```
 
-AC1 (`python3 tests/e2e/run.py --shared-core web audit neg`, final test, sha256 cbf33b13...): `e2e summary: 14 pass, 0 skip, 0 fail`, `exit=0` (no SKIP of audit or neg; neg/test_nonexistent_flow_error.py PASS).
+AC1 (`python3 tests/e2e/run.py --shared-core web audit neg`, final test, sha256 5081bdea...): `e2e summary: 14 pass, 0 skip, 0 fail`, `exit=0` (no SKIP of audit or neg; neg/test_nonexistent_flow_error.py PASS).
 
 AC7 (`python3 tests/e2e/run.py --shared-core neg`, three consecutive runs on the final test): each `e2e summary: 5 pass, 0 skip, 0 fail`, `exit=0`.
 
@@ -120,7 +125,7 @@ F1 [FAIL] the barrage's mark label 'e2e-missing' is absent from the REAL flow's 
 F2 [FAIL] marks only grew: every mark present before the barrage is still present -- none was replaced or wiped (marks ['e2e-sentinel'] -> ['e2e-other'])
 F3 [FAIL] flow.detail of the REAL flow is byte-identical apart from meta.marks -- no comment or mutation landed on it (differs in: meta.comment)
 F4 [FAIL] flow.detail of the REAL flow is byte-identical apart from meta.marks -- no comment or mutation landed on it (differs in: edited, meta.edited, request)
-F5 [FAIL] no flow in the store carries the barrage's mark label 'e2e-missing' -- no flow.mark landed on any listed flow (scanned 4 flows; carriers: ['475a10d4-ce7b-466f-bfcf-af9be5cf196d'])
+F5 [FAIL] no flow in the store carries the barrage's mark label 'e2e-missing' -- no flow.mark landed on any listed flow (scanned 4 flows; carriers: ['a4d7db34-b188-47d6-b06d-f28f2bca54f2'])
 ```
 
 In F5 the checks before the scan print `[ok]` while the real flow's marks grew `[] -> ['missing-nosniff', 'version-disclosure']`, so detector marks are tolerated and a leak to another listed flow is not. The scan covers listed flows only: `flow.table` omits flows captured while capture is paused (`crates/aitm-core/src/store.rs`).
