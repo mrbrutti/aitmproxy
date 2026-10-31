@@ -136,7 +136,7 @@ Bursts, with the cause read off the `app =` field:
 | Window | Flows | Rate | Cause |
 |---|---|---|---|
 | busiest 1 s (13:17:46) | 60 | 60/s | `com.anthropic.claude-code`, 60 TCP:443 opens in one second |
-| other top seconds | 56, 56, 53, 51, 50 | | same app (four of five), plus `remotepairingd`/`usbmuxd` |
+| other top seconds | 56, 56, 53, 51, 50 | | the same app in four of the five, plus `remotepairingd`/`usbmuxd` |
 | busiest 10 s (08:50:58) | 282 | 28/s | `aitm` (the embedded core, 217 TCP:443 + 58 TCP:80, self-excluded) |
 | busiest minute (10:29) | 634 | 10.6/s | `com.apple.CoreDevice.remotepairingd`: 296 TCP:49152 + 294 UDP:3722 |
 | per active second | p50 2, p90 7, p99 25, max 60 | | 4 631 seconds had ≥1 flow |
@@ -175,9 +175,10 @@ one flow per ≈5 ms, which is the `isSelf` cost (R3). A backlog of ≈200 flows
 about a second inside the provider before going direct. This is the shipped provider's
 behaviour today, before any observe-lane work.
 
-Remote ports: TCP 443 (4 998), UDP 53 (3 969), UDP 443 (1 517, QUIC attempts), TCP 80 (1 424),
-TCP 49152 + 62078 and UDP 3722 (Apple device pairing, 2 400+), UDP 123 (125).
-Interfaces: `en15` 76 %, `en15(bound)` 14 %, `en0(bound)` 6 %, `utun10/12(bound)` 2.6 %, `lo0` 1 flow.
+Remote ports (morning window): TCP 443 (4 998), UDP 53 (3 969), UDP 443 (1 517, QUIC
+attempts), TCP 80 (1 424), TCP 49152 + 62078 and UDP 3722 (Apple device pairing, 2 400+),
+UDP 123 (125). Interfaces: `en15` 76 %, `en15(bound)` 14 %, `en0(bound)` 6 %,
+`utun10/12(bound)` 2.6 %, `lo0` 1 flow.
 
 **Variant window, 13:35–15:43 (afternoon, Matt browsing in Safari; my controlled bursts at
 14:04–14:06 excluded):** 13 370 organic flows, **1.74/s sustained** over 128 min (the busier
@@ -335,15 +336,16 @@ this replacement either.
 - **UDP `false` (item 8): partly disproven.** Datagram traffic itself flows after `false`
   (DNS, NTP, QUIC packets), so the macOS-15 header's "the flow is terminated" is wrong for a
   transparent proxy. But the active catch-all `.any` rule makes `setsockopt(IP_DONTFRAG)`
-  fail with `ECONNRESET` on every connected UDP socket, which breaks Chromium QUIC (HTTP/3 is
-  silently disabled machine-wide while capture is on). This is a shipped v0.5.3 regression
-  independent of the observe-only lane.
+  fail with `ECONNRESET` on every connected UDP socket, which breaks Chromium QUIC (Chrome
+  and Electron apps silently lose HTTP/3 while capture is on; Safari and Firefox keep it).
+  This is present in the shipped v0.5.3 and v0.5.4 providers and is independent of the
+  observe-only lane.
 
 ## Carry into the spec
 
 1. **Queue (Part 3): keep 2 048.** The worst burst measured (cold Chrome, theverge.com) is
-   1 243 flows in 8 s, peak 336/s; organic peaks are 60/s for a second and 28/s over 10 s.
-   2 048 drop-oldest entries hold the whole worst burst with room for a second one, and ≈6 s
+   1 243 flows in 8 s, peak 336/s; organic peaks are 60–70/s for a second and 235 flows over
+   10 s. 2 048 drop-oldest entries hold the whole worst burst with room for a second one, and ≈6 s
    of a sustained 336/s; 1 024 would already drop the tail of a heavy page load if the writer
    stalled for 3 s. Memory is ≈400 KiB at ≈200 B/entry. The writer's 2 s `SO_SNDTIMEO` is the
    binding constraint, not the queue.
@@ -375,8 +377,8 @@ this replacement either.
    rule plus UDP only when the operator scopes a UDP target; rules need a restart to change),
    or (b) exclude UDP:443 via `excludedNetworkRules` and accept blind QUIC, and in either
    case file an Apple Feedback citing thread 770707 with this reproduction
-   (`spike/observe-survey/dontfrag-core.py`). Until then, Matt's Mac has no HTTP/3 while
-   capture is on.
+   (`spike/observe-survey/dontfrag-core.py`). Until then, Chromium-based apps on Matt's Mac
+   have no HTTP/3 while capture is on.
 6. **Operational facts for the plan's install story:** a same-version, newer-build,
    same-team extension replaces the activated one with no user prompt; notarizing the `.app`
    zip is enough for activation; the framework's own per-flow log lines are a zero-cost
