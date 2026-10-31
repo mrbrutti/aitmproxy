@@ -513,7 +513,8 @@ events built in it are dropped and the client receives nothing before the close;
 fail-closed too, and the `Event::Error` is emitted the same way. The in-tree consumers of
 `Event::Error` are the Rhai `on_error` hook (`crates/aitm-plugin-rhai/src/plugin.rs`) and
 `flow.subscribe` bus subscribers (`crates/aitm-plugins/src/subscription.rs`, delivered as an
-MCP flow notification labelled `killed`, on which the web UI refreshes the flow). Without the
+MCP flow notification labelled `killed`; the web UI has a handler for it in
+`apps/web/src/state/app.ts` but does not subscribe today). Without the
 event a refused response was invisible to both. The passive scanner
 (`crates/aitm-plugin-scanner/src/plugin.rs`) observes no events and `aitm-findings` does not
 consume them, so a refused response is still not scanned: the scanner sees only a head-only
@@ -744,8 +745,9 @@ Bug 2: chunked trailers
       `request.send` flow is named `reissue` in the passing version, not `send`): a `[note]` line
       showing the response keys include `trailers` and the trailer names visible
       (`['server-timing', 'x-checksum-sha256', 'x-e2e-trailer']`), then `[ok] flow.detail
-      /chunked/<m>/first: the origin's trailer fields are visible over the bus (as response.trailers
-      or merged into response.headers, RFC 9110 s6.5.1)`.
+      /chunked/<m>/<flow>: the origin's trailer fields are visible over the bus (as response.trailers
+      or merged into response.headers, RFC 9110 s6.5.1)`, where `<flow>` is each of `first`,
+      `again` and `reissue`.
     - Exact consumption and byte identity: `[ok] response 1: NO stray bytes on the socket after
       the framed response (0): the trailer section was consumed exactly, nothing leaked into the
       next exchange` (and the same for response 3); `[ok] after response 2 the socket held NO

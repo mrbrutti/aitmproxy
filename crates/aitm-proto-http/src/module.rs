@@ -5259,9 +5259,10 @@ mod tests {
 
     #[tokio::test]
     async fn serve_reports_a_malformed_trailer_section_as_one_typed_error() {
-        // Event consumers (the scanner, findings, scripts) learn of a response
-        // from its events, so a response the machine refuses must still reach
-        // them as an error, or one bad trailer line would hide a body from them.
+        // Event consumers (the Rhai `on_error` hook and `flow.subscribe` bus
+        // subscribers) learn of a response from its events, so a response the
+        // machine refuses must still reach them as an error, or one bad trailer
+        // line would hide a body from them.
         let mut section = String::from("0\r\n");
         for n in 0..65 {
             section.push_str(&format!("x-evil-91c2-{n}: v\r\n"));
