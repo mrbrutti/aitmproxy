@@ -230,6 +230,7 @@ pub struct CommandHost<'a> {
     poc_dir: Option<std::path::PathBuf>,
     frontend: Frontend,
     client_label: Option<String>,
+    connection_id: Option<String>,
     config: Option<std::sync::Arc<crate::config::Config>>,
     finding_recorder: Option<&'a dyn FindingRecorder>,
     egress: Option<std::sync::Arc<crate::egress::EgressConfinement>>,
@@ -257,6 +258,7 @@ impl<'a> CommandHost<'a> {
             // CLI is treated as agent-driven.
             frontend: Frontend::Mcp,
             client_label: None,
+            connection_id: None,
             config: None,
             finding_recorder: None,
             egress: None,
@@ -353,6 +355,21 @@ impl<'a> CommandHost<'a> {
     /// The connection's client label, if one was declared (`None` otherwise).
     pub fn client_label(&self) -> Option<&str> {
         self.client_label.as_deref()
+    }
+
+    /// Attach the server-assigned, opaque id of the calling connection. The
+    /// server mints it; it is never derived from the client label or anything
+    /// else the caller sent. Policy and confirmation decisions key off
+    /// [`CommandHost::frontend`], not this id.
+    pub fn with_connection_id(mut self, id: impl Into<String>) -> Self {
+        self.connection_id = Some(id.into());
+        self
+    }
+
+    /// The server-assigned id of the calling connection. `None` for an
+    /// in-process caller (a host never given one).
+    pub fn connection_id(&self) -> Option<&str> {
+        self.connection_id.as_deref()
     }
 
     /// Confine `poc.run` to loading PoC files under `dir` (opt-in). `None` leaves
@@ -619,5 +636,34 @@ mod trust_tests {
 
         let mcp = CommandHost::new(&store, &client, &guard, None).with_frontend(Frontend::Mcp);
         assert!(!mcp.caller_is_trusted_control());
+    }
+}
+
+/// Pins the server-assigned connection id carried on a [`CommandHost`].
+#[cfg(test)]
+mod host_identity_tests {
+    use super::*;
+    use crate::guard::StdGuard;
+    use crate::store::MemFlowStore;
+
+    #[test]
+    fn connection_id_defaults_to_none_and_follows_with_connection_id() {
+        let store = MemFlowStore::new();
+        let client = NoopClient;
+        let guard = StdGuard::default();
+
+        // A fresh host has no connection id: an in-process caller.
+        let fresh = CommandHost::new(&store, &client, &guard, None);
+        assert_eq!(fresh.connection_id(), None);
+
+        // The id is whatever the server attached, verbatim.
+        let attached =
+            CommandHost::new(&store, &client, &guard, None).with_connection_id("conn_ab-1");
+        assert_eq!(attached.connection_id(), Some("conn_ab-1"));
+
+        // A label is never promoted into an id.
+        let labelled = CommandHost::new(&store, &client, &guard, None).with_client_label("x");
+        assert_eq!(labelled.client_label(), Some("x"));
+        assert_eq!(labelled.connection_id(), None);
     }
 }
