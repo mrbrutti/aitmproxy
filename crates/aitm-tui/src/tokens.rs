@@ -103,9 +103,10 @@ mod tests {
         //                 + agent 3 + status 7 + syntax 11 + mark 11
         //                 + l4 3 (base/deep/tint, added 2026-10-29 for the L4 badge) = 58
         //   pairs:          method 9 + severity 5 + syntax 2 (diffAdd/diffRemove)
-        //                 + l4.badge 1 = 17
+        //                 + l4.badge 1 + state 4 (success/warning/danger/neutral,
+        //                   added 2026-10-30 for the semantic CA/script badges) = 21
         assert_eq!(ALL_COLORS.len(), 58);
-        assert_eq!(ALL_PAIRS.len(), 17);
+        assert_eq!(ALL_PAIRS.len(), 21);
         assert_eq!(
             color::mark::TEAL.ansi,
             color::mark::TEAL.ansi,
