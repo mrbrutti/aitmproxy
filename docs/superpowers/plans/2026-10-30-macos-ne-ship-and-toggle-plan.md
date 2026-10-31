@@ -499,7 +499,9 @@ xcrun stapler validate dist/Aitmproxy-*.dmg              # SH-AC5
 
 1. **Clean install, no prompt (TG-AC4):** on a Mac with no prior Aitmproxy sysex,
    open the notarized app. **Expect:** no "Network Extensions" / "Add Proxy
-   Configurations" prompt, capture reads Off.
+   Configurations" prompt; the Capture toggle reads OFF. (Per spec §2c the status
+   line reads "Extension not installed" when no saved proxy configuration exists yet,
+   and "Off"/`.inactive` once one does — the toggle position is what reads OFF here.)
 2. **ON activates + captures (TG-AC5, TG-AC3):** Settings ▸ Capture → turn **ON**.
    **Expect:** the two System Settings prompts appear; after approval the state line
    reaches "Capturing" (tunnel `.connected`); the embedded core log shows the feeder
@@ -523,10 +525,53 @@ xcrun stapler validate dist/Aitmproxy-*.dmg              # SH-AC5
 
 ## Review log
 
-Kept by the main session during stage 6. One row per finding.
+Stage-6 panel, 2026-10-30. Security = PASS (6 Minor). Quality = FAIL (2 Important,
+9 Minor). Spec = FAIL (1 Important, 5 Minor). Dispositions by the orchestrator
+(autonomous mode). "Fixed" SHAs added after the fix wave + re-gate.
 
-| Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
+| # | Reviewer | Sev | Finding | Disposition |
 |---|---|---|---|---|
+| 1 | Spec | Important | Uninstall also clears the toggle + restarts the core — correct but unratified (spec said "unchanged") & untested | RATIFIED (see ratification note below); test assertion added — fix wave |
+| 2 | Quality | Important | `disable()` swallows load/save errors, reports `.inactive` regardless; tunnel stop after the save | FIX — collect errors, `.failed(...)` on failure, stop tunnel before save — fix wave |
+| 3 | Quality | Important | Toggle/menu ignore active core kind; ON spawns the embedded core against an External choice | FIX — gate toggle+menu on embedded-active (mirror `ProxySettings.canApply`) — fix wave |
+| 4 | Security | Minor | OFF indicator dishonest on save failure + launch doesn't converge a running tunnel to off | FIX (same as #2) + `detectInactiveExtension` converges to off — fix wave |
+| 5 | Security | Minor | `spawn()` emits the gate even in a non-embedded (dev) build sharing the defaults domain | FIX — `captureEnabled = persisted && CaptureExtension.isEmbedded` + kit test — fix wave |
+| 6 | Quality | Minor | `capture.enabled` read 3 ways; `bool(forKey:)` in `CaptureSwitch` can lock out ON for a non-Bool stored value (tester F3) | FIX (minimal) — `CaptureSwitch` reads `object(forKey:) as? Bool ?? false`; full Kit-helper dedup ACCEPTED as follow-up — fix wave |
+| 7 | Security | Minor | Operator-only tripwire blind spots: `restartCoreTick`/`UserDefaults.set`/bare `"capture"` not denied outside allow-list (no present hole; regression guard) | FIX — harden `check-capture-operator-only.sh` + header note — fix wave |
+| 8 | Security | Minor | `notarize-dmg.sh` verifies entitlements/hardening/authority but not `TeamIdentifier`/profile; `--entitlements :-` deprecated | FIX — add TeamIdentifier assertions, switch to `--entitlements -`, assert `find` exit — fix wave |
+| 9 | Security | Minor | Uninstall reachable while an activation request is still outstanding → state dishonesty | FIX — guard `uninstall()` on `pendingActivity == nil` + `!disabling` — fix wave |
+| 10 | Security | Minor | nested-sign `find` exit status not detected (latent; no nested code today) | FIX (same commit as #8) — fix wave |
+| 11 | Quality | Minor (I introduced) | `verify.sh` F1 addition masks exit status (prints FAIL, exits 0) | FIX — make it exit non-zero + show output — fix wave |
+| 12 | Spec | Minor | Plan manual-step 1 wording "capture reads Off" vs implemented "Extension not installed" on first run | FIXED here (wording tightened) |
+| 13 | Spec | Minor | `captureWanted`/`disabling` flags + changed `.completed` branch not in spec | ACCEPTED — implements the "OFF but tunnel intercepting" anti-goal; private, structurally tested |
+| 14 | Spec | Minor | `CoreHealthState` gained `captureControlsAvailable`/`captureBusy`/`captureChoice` beyond the named `captureSupported` | ACCEPTED — serve TG-AC8 (no restart storm) and TG-AC11 (render states without writing the real pref) |
+| 15 | Spec | Minor | `verify.sh` is an undeclared file | ACCEPTED — addresses tester F1; test-gate wiring only (and #11 fixes its exit status) |
+| 16 | Spec | Minor | `notarize-dmg.sh` ASC-key glob + single-sysex abort undeclared | ACCEPTED — the glob is required for SH-AC8 (shellcheck), the abort enforces spec "exactly one" |
+| 17 | Quality | Minor | Toggle glue covered only by source-grep tripwires, no executable seam test | ACCEPTED — spec tagged these ACs `[structural]`; a `CaptureSwitch` protocol seam + SelfTest check is a follow-up |
+| 18 | Quality | Minor | `.disabled` event overloaded (operator-off + launch-detect); `.inactive` invariant can be loose | ACCEPTED as follow-up — #9's guard mitigates the pending-approval case; a distinct `.foundInstalled` event is a later refactor |
+| 19 | Quality | Minor | Duplicated launch-support predicate / `captureChoice ?? captureEnabled` / `CaptureSwitch` home / reconcile block | ACCEPTED — polish follow-up; no behavioural defect |
+| 20 | Quality | Minor | Flag soup; `uninstall()` guard asymmetric | PARTIAL FIX (#9 adds `!disabling`); the 5-flag→enum refactor ACCEPTED as follow-up |
+| 21 | Quality | Minor | Kit tests redundant/brittle (Rust-source grep pin; hand-built Config) | ACCEPTED — meaningful with literal expected values; redundancy only; shared golden fixture a follow-up |
+| 22 | Quality | Minor | Scripts not wired into CI; `check-notarize-dmg.sh` overlaps the stub runner; duplicated helpers | ACCEPTED as follow-up — CI runner strategy (bash tripwires on ubuntu; macOS job for swift) is an infra decision for the orchestrator/Matt (documented in the shared notes) |
+| 23 | Quality | Minor | Stale/contradictory comments (`isInstalledOrInstalling`; busy-drop wording; operator-only repeated) | ACCEPTED — cosmetic; the fix wave may tidy the `isInstalledOrInstalling` comment opportunistically |
+| 24 | Quality | Minor | Capture "not available" state uses `LabeledContent`, not `ContentUnavailableView` | ACCEPTED — reviewer notes `ContentUnavailableView` is awkward inside a grouped Form; rest of the tab complies |
+
+### Ratification note (orchestrator, 2026-10-30) — resolves finding #1
+The Uninstall action may, after a successful removal, also persist `capture.enabled =
+false` and restart the embedded core. **Rationale:** leaving the toggle ON after a full
+uninstall would make the next launch's `start()` call `enable()` and re-prompt for
+approval with no operator intent, and the toggle would read ON beside "Extension not
+installed" — both the spec's deny-by-default and "UI reflects real state" anti-goals.
+This is an added Architect's call on top of §2d's "Uninstall (unchanged behaviour)",
+and the fix wave adds a structural assertion for it.
+
+### Threat-model note (orchestrator, 2026-10-30) — from the security PASS
+`capture.enabled` lives in same-user `UserDefaults`; a same-user process can
+`defaults write` it and, with the sysex already approved, `start()` enables capture at
+the next launch with no prompt. The menu command (⌃⌘C) is reachable by UI automation.
+Both are bounded by deny-by-default scope + the extension's peer authentication, and
+the first-activation OS approval stays human-gated. This is a net improvement over the
+prior unconditional auto-activation; recorded as accepted residual risk.
 
 ## Shipped
 
