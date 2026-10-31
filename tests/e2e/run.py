@@ -20,6 +20,10 @@ Usage:
             its own free ports so parallel runs don't collide. --manual forces 1.
   --build   cargo build -p aitm -p aitm-testtarget first (preflight). Without it,
             a missing aitm is fatal and a missing aitm-testtarget-serve warns.
+  --shared-core  boot ONE core + echo upstream and export AITM_BUS_ADDR /
+            AITM_BUS_TOKEN / AITM_BUS_OPERATOR_TOKEN / AITM_PROXY_ADDR /
+            AITM_TARGET_URL so cells that connect to a runner-provided core (and
+            otherwise skip) run against it. Cells isolate via per-connection labels.
   --manual  include tier=manual suites and let them prompt the operator
   --list    list discovered suites and exit
 """
@@ -131,11 +135,45 @@ def preflight(build: bool) -> None:
               flush=True)
 
 
+def _boot_shared_core(child_env: dict):
+    """Boot ONE real core + echo upstream and export the AITM_BUS_* / AITM_PROXY_ADDR
+    / AITM_TARGET_URL env the shared-core cells read (they never boot their own; they
+    isolate via per-connection labels + unique markers). Returns an object with
+    .stop(). Scope is loopback-wide with agent-widen so cells reach their upstreams."""
+    sys.path.insert(0, E2E_DIR)
+    from aitm_e2e import free_port  # noqa: E402
+    from aitm_e2e.config import CoreConfig  # noqa: E402
+    from aitm_e2e.core import Aitm  # noqa: E402
+    from aitm_e2e.upstream import Upstream  # noqa: E402
+
+    up = Upstream().start()
+    cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
+                     scope_entries=["127.0.0.1", up.authority],
+                     allow_agent_widen=True, ssl_insecure=True)
+    core = Aitm.server(cfg)
+    host, port = core.bus_addr
+    child_env["AITM_BUS_ADDR"] = f"{host}:{port}"
+    child_env["AITM_BUS_TOKEN"] = cfg.agent_token
+    child_env["AITM_BUS_OPERATOR_TOKEN"] = cfg.operator_token
+    child_env["AITM_PROXY_ADDR"] = f"127.0.0.1:{cfg.proxy_port}"
+    child_env["AITM_TARGET_URL"] = up.base + "/echo"
+    print(f"shared-core: bus {host}:{port}, proxy 127.0.0.1:{cfg.proxy_port}, "
+          f"target {up.base}/echo", flush=True)
+
+    class _Shared:
+        def stop(self):
+            core.stop()
+            up.stop()
+
+    return _Shared()
+
+
 def main() -> int:
     args = sys.argv[1:]
     manual = "--manual" in args
     do_list = "--list" in args
     build = "--build" in args
+    shared_core = "--shared-core" in args
     jobs = 4
     surfaces: list[str] = []
     i = 0
@@ -176,48 +214,54 @@ def main() -> int:
     if manual:
         child_env["AITM_E2E_MANUAL"] = "1"
 
-    results: list[tuple] = []
-    to_run = []
-    for s in suites:
-        label = f"{s['surface']}/{s['name']}"
-        if s["tags"].get("tier") == "manual" and not manual:
-            print(f"SKIP  {label}  (tier=manual; re-run with --manual)")
-            results.append(("skip", label, "tier=manual"))
+    shared = _boot_shared_core(child_env) if shared_core else None
+    nfail = 0
+    try:
+        results: list[tuple] = []
+        to_run = []
+        for s in suites:
+            label = f"{s['surface']}/{s['name']}"
+            if s["tags"].get("tier") == "manual" and not manual:
+                print(f"SKIP  {label}  (tier=manual; re-run with --manual)")
+                results.append(("skip", label, "tier=manual"))
+            else:
+                to_run.append(s)
+
+        def emit(r: tuple) -> None:
+            kind, label, why, dt, out = r
+            if kind == "pass":
+                print(f"PASS  {label}  ({dt:.1f}s)", flush=True)
+            elif kind == "skip":
+                print(f"SKIP  {label}  ({why})", flush=True)
+            else:
+                print(f"FAIL  {label}  (exit after {dt:.1f}s)", flush=True)
+                print(_indent(out), flush=True)
+            results.append((kind, label, why))
+
+        if jobs == 1:
+            for s in to_run:
+                print(f"RUN   {s['surface']}/{s['name']} ...", flush=True)
+                emit(run_suite(s, child_env))
         else:
-            to_run.append(s)
+            print(f"running {len(to_run)} suites, up to {jobs} at once ...", flush=True)
+            with ThreadPoolExecutor(max_workers=jobs) as ex:
+                futures = [ex.submit(run_suite, s, child_env) for s in to_run]
+                for fut in as_completed(futures):
+                    emit(fut.result())
 
-    def emit(r: tuple) -> None:
-        kind, label, why, dt, out = r
-        if kind == "pass":
-            print(f"PASS  {label}  ({dt:.1f}s)", flush=True)
-        elif kind == "skip":
-            print(f"SKIP  {label}  ({why})", flush=True)
-        else:
-            print(f"FAIL  {label}  (exit after {dt:.1f}s)", flush=True)
-            print(_indent(out), flush=True)
-        results.append((kind, label, why))
-
-    if jobs == 1:
-        for s in to_run:
-            print(f"RUN   {s['surface']}/{s['name']} ...", flush=True)
-            emit(run_suite(s, child_env))
-    else:
-        print(f"running {len(to_run)} suites, up to {jobs} at once ...", flush=True)
-        with ThreadPoolExecutor(max_workers=jobs) as ex:
-            futures = [ex.submit(run_suite, s, child_env) for s in to_run]
-            for fut in as_completed(futures):
-                emit(fut.result())
-
-    npass = sum(1 for r in results if r[0] == "pass")
-    nskip = sum(1 for r in results if r[0] == "skip")
-    nfail = sum(1 for r in results if r[0] == "fail")
-    print("\n" + "=" * 60)
-    print(f"e2e summary: {npass} pass, {nskip} skip, {nfail} fail")
-    for kind, label, why in results:
-        if kind == "fail":
-            print(f"  FAIL {label} ({why})")
-        elif kind == "skip":
-            print(f"  skip {label} ({why})")
+        npass = sum(1 for r in results if r[0] == "pass")
+        nskip = sum(1 for r in results if r[0] == "skip")
+        nfail = sum(1 for r in results if r[0] == "fail")
+        print("\n" + "=" * 60)
+        print(f"e2e summary: {npass} pass, {nskip} skip, {nfail} fail")
+        for kind, label, why in results:
+            if kind == "fail":
+                print(f"  FAIL {label} ({why})")
+            elif kind == "skip":
+                print(f"  skip {label} ({why})")
+    finally:
+        if shared:
+            shared.stop()
     return 1 if nfail else 0
 
 

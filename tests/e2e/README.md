@@ -107,3 +107,23 @@ Env: `AITM_BIN` (path to the `aitm` binary; default `target/debug/aitm`),
 6. Clean up by your own child PID only (the core reaps obscura on stop) — never
    `pkill -f obscura` (it kills concurrent sessions).
 7. Never log the bus token.
+
+## Two core models: own-core (default) vs shared-core (`--shared-core`)
+
+Most cells boot their own core per run (isolated, parallel-safe). Some cells
+instead attach to a **runner-provided shared core** via env (`AITM_BUS_ADDR`,
+`AITM_BUS_TOKEN`, optional `AITM_BUS_OPERATOR_TOKEN`, `AITM_PROXY_ADDR`,
+`AITM_TARGET_URL`) and SKIP when it is absent — they isolate on that one core via
+per-connection client labels + unique markers (e.g. `audit`, and the `proto`
+edge cells). Run those with `--shared-core`, which boots one core + echo upstream
+and exports that env:
+
+```bash
+python3 tests/e2e/run.py audit proto neg --shared-core   # env-model surfaces
+python3 tests/e2e/run.py                                  # everything else (own-core)
+```
+
+`--shared-core` is **targeted, not blanket**: don't run it across own-core cells
+that mutate global state (scope / config / sessionio) — on one shared core they
+cross-contaminate. The merge gate is the default `run.py` (own-core; env-model
+cells skip loudly) plus a separate `--shared-core` run over the env-model surfaces.
