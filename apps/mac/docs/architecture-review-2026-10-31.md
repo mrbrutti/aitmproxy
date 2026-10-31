@@ -10,7 +10,7 @@ Ratings: **Strong** = do now · **Worth exploring** = at the named moment · **S
 ## Survey
 
 - **Targets.** `AitmBusClient` (actor, 27 tests) ← `AitmproxyKit` (values only, ~350 tests)
-  ← `Aitmproxy` (`defaultIsolation(MainActor)`, self-test 128 checks). Direction unchanged and
+  ← `Aitmproxy` (`defaultIsolation(MainActor)`, no test target). Direction unchanged and
   right. Kit grew the right way this week: `VerbTable`, `ClearedFlows`, `ConnectionSummary`,
   `CaptureAdvice`, `SettingsDomain`, `BusEndpointSettings` are all values with tests.
 - **Sizes.** Past 600: `Session.swift` 626 (403 after the 10-28 split; it grew back by 223
@@ -38,7 +38,7 @@ Ratings: **Strong** = do now · **Worth exploring** = at the named moment · **S
   one. (`BusService.swift` is frozen until the macOS revision-2 PR merges; carried below.)
 - **Pure logic inside the main-actor store.** `Session.paletteItems(for:)` builds and ranks
   the palette (fuzzy score, literal-title-first, section order, Recent on top) in 90 lines
-  that only the self-test exercises; `Session.landingPage(saved:)`, `clients`/`hosts`
+  that no unit test exercises; `Session.landingPage(saved:)`, `clients`/`hosts`
   counting, `BusService.listenAddress()` (config.yaml parsing) likewise live in the app
   target where Kit tests cannot reach them.
 - **Harness.** `SelfTest.runIfRequested` is one 370-line `Task` closure holding ~100 checks;
@@ -50,8 +50,8 @@ Ratings: **Strong** = do now · **Worth exploring** = at the named moment · **S
   and `settingsTab` read `UserDefaults.standard` without the `Store.isOverridden` guard that
   `page`, `layout` and `autoSelect` have, so a snapshot or self-test run inherits the
   operator's row density, palette history and last Settings tab (the dev bundle shares the
-  bundle id). Writes are guarded, reads are not. A real finding for the harness owner; fixing
-  it changes snapshot output, so it is not part of a behaviour-neutral step here.
+  bundle id). Writes are guarded, reads are not. Fixed as its own small PR (not folded into a
+  pure-move step), proven on a real run — see the step-1 status below.
 - **Deletion test.** `Session+*` extensions: still locality, not modules (no interface).
   `FixtureActions`: deleting it puts fixture behaviour into `Session` — it earns its place as
   the seam's second adapter. The fixture `commandRunner` closure fails the test the other way:
@@ -83,9 +83,9 @@ Benefits: the seam table gains its second named adapter (`BusService.call` / `Fi
 `FixtureBus.swift` joins rule 4's deny list in the same commit (it is the bus's stand-in, so
 it must never mention the capture glue either — the same reason `BusService.swift` is there);
 a fixture verb story stops touching `Session.swift`.
-Proof of same behaviour: build clean; self-test 128/128 (every fixture verb runs through it);
-`tools/check-capture-operator-only.sh` PASS with the new deny entry; light + dark snapshots
-of every page compared against the pre-step bundle.
+Proof of same behaviour: a real run of the dev bundle with the release core and real `curl`
+traffic, window shots before and after; `tools/check-capture-operator-only.sh` PASS with the new
+deny entry; Kit tests unchanged and green.
 Plan: one commit.
 
 ## Session+Fixtures: the session on fixture data  [Strong — step 1]
@@ -99,8 +99,8 @@ doc comment ("the operator act `l4.agent.set` performs"), called by `AgentPanel`
 fixture bus.
 Benefits: one file answers "what does the fixture session look like"; `Session.swift` keeps
 state, `init`, accessors, navigation and pins.
-Proof: build; self-test (it asserts the fixture counts, in-scope counts and the Scripts
-predicate); snapshots as above.
+Proof: the same real run before and after (the moved code only runs in fixture mode, so a real
+run that still captures, lists and counts proves nothing else changed).
 Plan: one commit.
 
 ## Navigation enums out of the state file  [Strong — step 1]
@@ -113,10 +113,10 @@ Proposal: pure move of `SidebarPage`, `InspectorLayout` and `AgentPolicy`. They 
 none of those files change. (They cannot go to Kit: `symbol` reads `Tok.Glyph`.)
 Benefits: `Session.swift` returns under 400 lines and holds one type; a sidebar-page story
 edits `Shell/`.
-Proof: build; self-test's S-069 menu audit (it walks `SidebarPage.allCases`); snapshots.
+Proof: the same real run before and after (sidebar, menus and pages render from the moved enums).
 Plan: one commit.
 
-## Self-test as check groups  [Worth exploring — with the next harness change]
+## Self-test as check groups  [Speculative — only if the self-test stays]
 
 Files: `SelfTest.swift` (510), `SelfTest+Live.swift` (239).
 Signal: a 370-line function (the release optimizer gotcha), 17 commits in 30 days.
@@ -127,18 +127,19 @@ Proposal: `runIfRequested` becomes `for group in checkGroups { await group(sessi
 `static let checkGroups: [(Session) async -> Void]` — one function per story area
 (`checkFixtures`, `checkVerbs`, `checkFilters`, `checkClearUndo`, `checkMenus`, …), each in
 `SelfTest+<Area>.swift`. No check moves or changes its text.
-Proof: the PASS lines, in order, are identical before and after (`diff` of the two logs);
-128/128.
-Plan: three commits (groups, live groups, the shared `settle`/`check` helpers last).
+Proof: the PASS lines, in order, are identical before and after (`diff` of the two logs).
+Plan: three commits (groups, live groups, the shared `settle`/`check` helpers last) — but only
+if the fixture self-test keeps a role; under the 2026-10-31 evidence standard it is not proof
+of behaviour, so splitting it may be work on something that should shrink instead.
 
 ## Palette ranking as a Kit value  [Worth exploring — with the next palette story]
 
 Files: `Session+Palette.swift` (103), `Shell/CommandPalette.swift` (`PaletteItem`).
-Signal: pure logic in the main-actor store that only the self-test can reach.
+Signal: pure logic in the main-actor store that no unit test can reach.
 Proposal: `PaletteRanking.rank(_ items: [Entry], query: String, recent: [String]) -> [Entry]`
 over a small `Entry { id, section, title, subtitle }` in Kit; `PaletteItem` keeps its `Kind`
 (it carries closures, so it stays in the app). The literal-first, section-order,
-Recent-on-top rules get literal tests; the self-test's palette check becomes a Kit test.
+Recent-on-top rules get literal Kit tests.
 Not now: the next palette story (a new section or the Flows query) should pick the `Entry`
 shape; doing it first would guess it.
 
@@ -163,8 +164,8 @@ one commit with the two scripts, and say so in both.
 Files: `Bus/BusService.swift` (frozen today).
 Signal: a drifted copy (identical today; the next scope rule change would make them differ).
 Proposal: delete `hostMatches`, call `Scope.contains(row.authority, in: session.scopeHosts)`
-in `pollLoop`'s `scoped(_:)`. One line, one commit, live self-test as proof (`scope.add` then
-rows in scope).
+in `pollLoop`'s `scoped(_:)`. One line, one commit; proof on a real run: add a host to Scope,
+send traffic to it and to another host, the first rows are in scope and the others are not.
 
 ## Bus poll at 500 ms with no window visible  [Worth exploring — carried]
 
@@ -190,7 +191,10 @@ interface. Not before.
 `SelfTest`, `Snapshot`, `SnapshotScenes`, `FixtureBus`, `FixtureActions.clearFails`,
 `Session.clearNoticeSeconds` compile into the release binary. The app target has no test
 target (SwiftPM cannot test an executable target's internals without a library split), and
-the self-test is how the built binary proves itself. A library split of the app target is a
+the self-test was how the built binary proved itself. Under the 2026-10-31 evidence standard
+(real app, real traffic) the self-test and the snapshot harness are development aids, not
+proof, which makes shipping them in the release binary harder to justify: a library split of
+the app target, with the harness in a separate executable, is the shape that removes them. A
 milestone, not a check-in step.
 
 ## Top recommendation
@@ -205,8 +209,8 @@ merges, with the tripwire scripts in the same commits.
 ## Considered, not recommended
 
 - **A `Prefs` helper for the six `UserDefaults.standard` `didSet` pairs on `Session`**: the
-  real problem is the three unguarded reads (survey), and fixing those changes snapshot
-  output — a harness fix, not a refactor. Route it; do not wrap it.
+  real problem was the unguarded reads (survey), fixed in their own PR; a wrapper would hide
+  the next unguarded read as well as the guarded ones.
 - **`Session+Clear.swift` for the Clear/Undo state and methods**: seven properties and five
   methods, landed last week, one author; splitting it now would be a fourth `Session+` file
   for a concern that may still change (the panel asked for the 8 s lapse). Revisit at 600.
@@ -217,30 +221,42 @@ merges, with the tripwire scripts in the same commits.
 
 ## Step 1 status (2026-10-31)
 
-Shipped on `claude/mac-architecture-616b30`, three commits on `main` 0f00017, one pure move
-each: `FixtureBus` (Session.swift 626 → 564), `Session+Fixtures` (→ 515), navigation enums
-(→ 415). Proof, before vs after:
+Shipped as PR #197 on `claude/mac-architecture-616b30` (main 5eac2a5 merged in), three commits,
+one pure move each: `FixtureBus` (Session.swift 626 → 564), `Session+Fixtures` (→ 515),
+navigation enums (→ 415).
 
-- `swift test`: 493 Kit + 31 BusClient tests green (no test changed).
-- Fixture self-test: **145 of 145** on both builds; the 145 `PASS` lines are identical except
-  the timing check's measured milliseconds.
-- `check-capture-operator-only.sh` PASS (9 surfaces, was 8), `check-capture-toggle.sh` PASS,
-  `check-connection-words.sh` PASS, `grid-lint.sh` PASS, `check-layout.swift` PASS on every
-  captured layout file.
-- **Real run** (dev bundle + the repo's release core, `tools/snap-dev.sh none` with `CORE_DIR`,
-  launched with an isolated `APP_STORE`, five real `curl` requests through the bound proxy
-  port, `tools/winshot.swift` of the window, `/tmp/claude/live-proof.sh`): main and the branch
-  show the same Apps page — Flows 5, Domains 2, Apps 0, the no-scope and no-attribution
-  banners, five 200 rows, `0 / 5 rows` — and differ by 1,761 of 5.2 M pixels, all in the port
-  number, the timestamps and the durations.
-- Fixture snapshots: every page captured in the same run as the baseline differs by ≤ 3.4 k px
-  (the window-activation chrome, as the wave-3 report measured). The full 148-file set could
-  not be captured in one run today: three of four runs lost the main window partway (once with
-  stray keystrokes `'yr '` typed into the sidebar field), while the untouched baseline bundle
-  showed the same loss in one of its two runs — the screen is shared with sibling harnesses
-  that drive the frontmost app, and a snapshot run makes itself frontmost every 0.8 s. A
-  snapshot-gate that survives a shared screen (or runs on a virtual display) is a harness
-  follow-up, not this step's.
+**Evidence standard (Matt, 2026-10-31):** fixture snapshots and the fixture self-test are not
+evidence of behaviour — they show fixture data working while the real app may not. "Behaviour
+unchanged" is shown on the real app with real traffic, plus Kit unit tests of pure logic and the
+source tripwires. Proof for step 1, before (`main`) vs after (the branch):
 
-Not done in step 1: the cards marked "after the revision-2 PR merges" and the harness
-isolation finding (three unguarded `UserDefaults.standard` reads), routed to the orchestrator.
+- **Real run:** dev bundle with the repo's release core (`tools/snap-dev.sh none` with
+  `CORE_DIR`), launched with an isolated `APP_STORE`, five real `curl` requests through the bound
+  proxy port (3× `http://example.com/`, `https://example.com/`, `http://httpbin.org/get`, all
+  200), `tools/winshot.swift` of the window (`/tmp/claude/live-proof.sh`). Both show the same
+  Apps page — Flows 5, Domains 2, Apps 0, the no-scope and no-attribution banners, five 200 rows,
+  `0 / 5 rows` — and differ by 1,761 of 5.2 M pixels, all in the port number, timestamps and
+  durations.
+- `swift test`: 494 Kit + 31 BusClient tests green (no test changed; the moves are in the app target).
+- `check-capture-operator-only.sh` PASS (9 surfaces, was 8), `check-capture-toggle.sh` PASS (it
+  greps nothing that moved), `check-connection-words.sh` PASS, `grid-lint.sh` PASS.
+
+**Found on the way, fixed as its own PR (the harness-isolation card above):** the real run of
+`main` with an isolated `APP_STORE` showed the operator's *comfortable* row density — the three
+unguarded `UserDefaults.standard` reads (`density`, `recentPaletteIDs`, `settingsTab`) plus the
+theme's `appearance.accent` read leaked the operator's prefs into every dev-bundle run on this
+Mac. The fix gates them on `Store.isOverridden`; the same real run on the fixed build shows
+dense rows with the same five flows and counts.
+
+**Superseded the same evening:** the fixture and sample-data modes are being deleted from all
+three frontends by a dedicated session (on the Mac: `FixtureBus.swift`, `Session+Fixtures.swift`,
+the Kit `Fixtures*.swift`, `Snapshot.swift`, `SnapshotScenes.swift`, the fixture `--selftest`,
+`snap.sh`/`selftest.sh` and the fixture modes of the dev tools). PR #197 merges as is and its two
+fixture files go with that removal; what remains of step 1 is `Session.swift` at one type and the
+navigation enums in `Shell/`. Nothing further is built on the fixture seam. The `APP_STORE`
+isolation (`Store.isOverridden`) stays: it is what lets a dev bundle run a real core without
+touching the operator's settings, and PR #201 closes its last leaks.
+
+Not done in step 1: the cards marked "after the revision-2 PR merges" (`BusService.hostMatches`
+→ `Scope.matches` waits for the S-041 PR, which owns `BusService.swift`; the `ShellView` split
+waits for the mac-animations and mac-attribution claims on that file).

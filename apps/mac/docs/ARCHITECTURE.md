@@ -41,6 +41,11 @@ actor, JSON-RPC       values only          SwiftUI + AppKit, main actor by defau
 
 ## Checks that hold the shape
 
+- Evidence of behaviour (Matt, 2026-10-31): the real app — a dev bundle with the bundled core,
+  or the installed app — with real traffic and before/after window shots, plus Kit unit tests of
+  pure logic and the `tools/check-*.sh` source tripwires. Fixture snapshots and the fixture
+  self-test are development aids, not proof: they show fixture data working while the real app
+  may not.
 - `tools/verify.sh`: unit tests, self-test (145 checks, incl. menu-bar coverage from
   `CommandMap`), snapshots light + dark, parts gallery, grid-lint.
 - Kit tests parse `docs/BRIEF.md` (`CommandMapTests`): the brief, the map and the menus stay one
