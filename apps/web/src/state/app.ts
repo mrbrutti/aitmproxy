@@ -153,6 +153,13 @@ export function createAppStore(bus: BusClient) {
     // ---- flows ------------------------------------------------------------
     const entries: FlowEntry[] = [];
     const byId = new Map<FlowId, FlowEntry>();
+    /** Ids a flow push named that the coalescer has not fetched yet, in first-notification (capture) order. */
+    const pushPending = new Set<FlowId>();
+    /** Per id, the ticket of the newest row fetch issued for it; an older reply is dropped. */
+    const fetchTicket = new Map<FlowId, number>();
+    let fetchSeq = 0;
+    /** Bumped by `clearFlows`: a fetch issued under an older epoch applies nothing (no ghost row after `flow.clear`). */
+    let clearEpoch = 0;
     const [version, setVersion] = createSignal(0);
     let bumpScheduled = false;
     const bump = () => {
@@ -253,6 +260,8 @@ export function createAppStore(bus: BusClient) {
     function clearFlows() {
       entries.length = 0;
       byId.clear();
+      pushPending.clear();
+      clearEpoch++;
       setDetails(reconcile({}));
       setSelectedIdRaw(null);
       setSelectedIds(new Set<FlowId>());
@@ -267,6 +276,12 @@ export function createAppStore(bus: BusClient) {
     }
 
     function onFlowEvent(n: FlowNotification) {
+      if (bus.address !== 'fixtures') {
+        onFlowTrigger(n);
+        return;
+      }
+      // The fixtures bus pushes complete, correctly-spelled summaries, and the dev UI and the perf
+      // harness rely on them landing synchronously: apply the summary directly.
       if (n.event === 'cleared') {
         clearFlows();
         return;
@@ -280,6 +295,30 @@ export function createAppStore(bus: BusClient) {
         if (untrack(selectedId) === s.id) void loadDetail(s.id, true);
       }
       if (n.event === 'intercepted' || n.event === 'released' || n.event === 'killed') recomputePaused();
+    }
+
+    /**
+     * A real bus: the push is a trigger, never data. The server's summary is sparse (`kind:"ws"`,
+     * no times, no sizes) and would regress a rich row, so it is ignored; the id is queued and the
+     * coalescer refetches it through the same helper the poll uses.
+     */
+    function onFlowTrigger(n: FlowNotification) {
+      if (n.event === 'cleared') {
+        clearFlows();
+        return;
+      }
+      if (!n.id) return;
+      // A chatty WebSocket would refetch an O(messages) detail many times a second; live message
+      // counters are a non-goal, so a message on a known flow changes nothing. On an unknown id it
+      // is the first we hear of the flow.
+      if (n.event === 'ws_message' && byId.has(n.id)) return;
+      if (n.event === 'response' || n.event === 'mutated' || n.event === 'meta' || n.event === 'released' || n.event === 'killed') {
+        // Detail is stale once anything changed; the inspector refetches on demand.
+        if (details[n.id]) setDetails(produce((d) => delete d[n.id]));
+        if (untrack(selectedId) === n.id) void loadDetail(n.id, true);
+      }
+      if (n.event === 'intercepted' || n.event === 'released' || n.event === 'killed') pushPauseDirty = true;
+      queuePush(n.id);
     }
 
     function onState(s: StateNotification) {
@@ -326,15 +365,18 @@ export function createAppStore(bus: BusClient) {
       }
     });
 
-    // ---- live updates: poll unless push is demonstrably flowing -------------
-    // Every real bus is polled. `flow.subscribe` being advertised proves nothing — nothing here calls
-    // it, and the /bus bridge pushes no notifications — so the loop runs regardless. It skips the flow
-    // poll only while a FLOW notification arrived within PUSH_FRESH_MS, and the status poll only while
-    // a STATE one did (a bridge that pushes just throughput ticks must not slow the list down). Even
-    // then a heartbeat runs every PUSH_FRESH_MS, so a push that dies quietly or loses events cannot
-    // freeze either. The loop touches the bus only while it is `open` (a call into a bus that is
-    // reconnecting can wait on it indefinitely), and heals a bootstrap that never got the tool
-    // catalogue. The static `fixtures` bus is a snapshot and is never polled.
+    // ---- live updates: push as a trigger, poll unless push is demonstrably flowing -------------
+    // The bus client subscribes (`flow.subscribe`, in ws.ts) on every open, and a flow notification
+    // is treated as a trigger: the id is queued and refetched (`onFlowTrigger`, `flushPush`), never
+    // applied from the push's sparse summary. The outcome of the subscribe is not surfaced, and a
+    // confirmed subscription cannot be told from a dispatcher that is not fed until a push arrives, so
+    // every real bus is still polled. The loop skips the flow poll only while a FLOW notification
+    // arrived within PUSH_FRESH_MS, and the status poll only while a STATE one did (a bridge that
+    // pushes just throughput ticks must not slow the list down). Even then a heartbeat runs every
+    // PUSH_FRESH_MS, so a push that dies quietly or loses events cannot freeze either. The loop
+    // touches the bus only while it is `open` (a call into a bus that is reconnecting can wait on it
+    // indefinitely), and heals a bootstrap that never got the tool catalogue. The static `fixtures`
+    // bus is a snapshot and is never polled.
     const POLL_MS = 500;
     const STATUS_EVERY_MS = 2000; // while the state stream is not pushing
     const PUSH_FRESH_MS = 10_000;
@@ -347,6 +389,12 @@ export function createAppStore(bus: BusClient) {
      * (and so the 500 ms cadence) on for good.
      */
     const FAILED_RETRY_MS = 5000;
+    /** A throttle, not a debounce: the first queued id arms one timer, traffic never re-arms it, so push latency is bounded. */
+    const PUSH_COALESCE_MS = 100;
+    /** `flow.detail` calls in flight per flush wave: the bridge runs at most this many frames concurrently. */
+    const PUSH_FETCH_WAVE = 16;
+    /** Distinct ids the coalescer holds; past it the surplus is left to the poll (`backlog`), so memory stays bounded. */
+    const PUSH_MAX_PENDING = 256;
     const failedAt = new Map<FlowId, number>();
     let pollLoopOn = false;
     let toolsLoaded = false;
@@ -358,52 +406,132 @@ export function createAppStore(bus: BusClient) {
       const age = now - at;
       return age >= 0 && age < PUSH_FRESH_MS;
     };
+    /** True while `id` is paused for a recent read failure (shared by the poll and the push flush). */
+    function isHeld(id: FlowId, now: number): boolean {
+      const at = failedAt.get(id);
+      return at !== undefined && now - at >= 0 && now - at < FAILED_RETRY_MS;
+    }
+    /**
+     * The one fetcher behind the poll and the push flush. `flow.detail {body: none}` is a summary
+     * with headers, sizes, times and the connection — everything a row shows — at the cost of one
+     * call per flow, like `flow.get` (used when the catalogue lacks `flow.detail`). `wave` calls are
+     * in flight at a time; each wave is applied in one batch, in id order, with `seqOf(id)` read at
+     * apply time. A good read clears `failedAt`, a failed one sets it. A reply is dropped when the
+     * list was cleared since the fetch was issued (epoch) or a newer fetch for that id was issued
+     * since (ticket), so two fetchers (the heartbeat poll and a flush) cannot land out of order.
+     */
+    async function fetchRows(ids: readonly FlowId[], seqOf: (id: FlowId) => number, wave: number): Promise<void> {
+      const rich = proxy.tools.some((t) => t.name === 'flow.detail');
+      for (let i = 0; i < ids.length; i += wave) {
+        const slice = ids.slice(i, i + wave);
+        const epoch = clearEpoch;
+        const tickets = slice.map((id) => {
+          const t = ++fetchSeq;
+          fetchTicket.set(id, t);
+          return t;
+        });
+        const got = await Promise.all(
+          slice.map((id) => (rich ? bus.call('flow.detail', { id, body: 'none' }) : bus.call('flow.get', { id })).catch(() => null)),
+        );
+        const failedNow = Date.now();
+        batch(() => {
+          got.forEach((raw, j) => {
+            const id = slice[j]!;
+            // Stale when a newer fetch owns the id (it will tidy the ticket) or the list was cleared since.
+            const newest = fetchTicket.get(id) === tickets[j];
+            if (newest) fetchTicket.delete(id);
+            if (!newest || epoch !== clearEpoch) return;
+            if (raw) {
+              failedAt.delete(id);
+              upsert(toSummary(raw, seqOf(id)));
+            } else failedAt.set(id, failedNow);
+          });
+        });
+      }
+    }
     async function pollOnce() {
       lastPollAt = Date.now();
       try {
         const ids = await bus.call<string[]>('flow.list');
         const now = Date.now();
-        const held = (id: FlowId) => {
-          const at = failedAt.get(id);
-          return at !== undefined && now - at >= 0 && now - at < FAILED_RETRY_MS;
-        };
         // Forget pauses that ended and flows that are gone (flow.clear), so the map stays small.
         if (failedAt.size) {
           const listed = new Set(ids);
-          for (const id of failedAt.keys()) if (!held(id) || !listed.has(id)) failedAt.delete(id);
+          for (const id of failedAt.keys()) if (!isHeld(id, now) || !listed.has(id)) failedAt.delete(id);
         }
         // Oldest first, so the list stays in capture order while the backlog drains. Only flows not
         // paused for a recent failure are eligible, and the backlog is measured over those alone.
-        const unseen = ids.filter((id) => !byId.has(id) && !held(id));
+        const unseen = ids.filter((id) => !byId.has(id) && !isHeld(id, now));
         const fresh = unseen.slice(0, MAX_FRESH_PER_POLL);
         backlog = unseen.length > fresh.length;
         const pending = ids.filter((id) => {
           const e = byId.get(id);
-          return e && e.raw.status == null && e.raw.intercept !== 'killed' && !held(id);
+          return e && e.raw.status == null && e.raw.intercept !== 'killed' && !isHeld(id, now);
         });
         const want = [...fresh, ...pending.slice(0, 50)];
-        // `flow.detail {body: none}` is a summary with headers, sizes, times and the connection
-        // — everything a row shows — at the cost of one call per flow, like `flow.get`.
-        const rich = proxy.tools.some((t) => t.name === 'flow.detail');
-        const got = await Promise.all(
-          want.map((id) => (rich ? bus.call('flow.detail', { id, body: 'none' }) : bus.call('flow.get', { id })).catch(() => null)),
-        );
-        const failedNow = Date.now();
-        batch(() => {
-          got.forEach((raw, i) => {
-            const id = want[i]!;
-            if (raw) {
-              failedAt.delete(id);
-              upsert(toSummary(raw, ids.indexOf(id) + 1));
-            } else failedAt.set(id, failedNow);
-          });
-          recomputePaused();
-        });
+        // One wave: the poll's fan-out is bounded by MAX_FRESH_PER_POLL, and its seq is the core's position.
+        await fetchRows(want, (id) => ids.indexOf(id) + 1, Math.max(1, want.length));
+        recomputePaused();
       } catch {
         // `flow.list` itself failed. The loop only calls an open bus, so this is a call that errored on
         // a live connection: it is retried on the next tick. A core that keeps erroring leaves the list
         // as it was (stale), and nothing says so: no toast, and the status bar only reflects whether
         // the bus connection is up. (Individual unreadable flows are handled by `failedAt`.)
+      }
+    }
+    // ---- the push coalescer ------------------------------------------------------------------
+    let pushTimer: ReturnType<typeof setTimeout> | null = null;
+    let flushing = false;
+    /** A queued event was `intercepted|released|killed`: the next flush recomputes `pausedIds` after it applies. */
+    let pushPauseDirty = false;
+    function armPush() {
+      if (pushTimer !== null) return;
+      pushTimer = setTimeout(() => {
+        pushTimer = null;
+        void flushPush();
+      }, PUSH_COALESCE_MS);
+    }
+    /** Queue an id a flow push named; one flush runs at a time, and the next timer is armed when it finishes. */
+    function queuePush(id: FlowId) {
+      if (!pushPending.has(id)) {
+        if (pushPending.size >= PUSH_MAX_PENDING) {
+          // The surplus is dropped; the poll (capped, oldest first) reconciles it on the 500 ms cadence.
+          backlog = true;
+          return;
+        }
+        pushPending.add(id);
+      }
+      if (!flushing) armPush();
+    }
+    async function flushPush(): Promise<void> {
+      if (flushing) return;
+      if (bus.state() !== 'open') {
+        // Nothing is sent into a bus that is not open; the resync on reconnect takes a fresh snapshot.
+        pushPending.clear();
+        return;
+      }
+      if (!toolsLoaded) {
+        // Without the catalogue the fetch would fall back to `flow.get`, a thinner row than the
+        // poll's `flow.detail`; wait for the loop to heal it.
+        armPush();
+        return;
+      }
+      flushing = true;
+      try {
+        const now = Date.now();
+        // Taken and removed now, so an event that arrives while these are in flight re-queues its id
+        // and it is refetched after this flush. Ids paused for a recent failure wait for the poll.
+        const ids = [...pushPending].filter((id) => !isHeld(id, now));
+        pushPending.clear();
+        const pauseDirty = pushPauseDirty;
+        pushPauseDirty = false;
+        // A new id takes the next position at apply time (inside the batch, so consecutive new ids
+        // get consecutive numbers whatever order the replies came back in); a known id keeps its seq.
+        if (ids.length) await fetchRows(ids, (id) => byId.get(id)?.raw.seq ?? entries.length + 1, PUSH_FETCH_WAVE);
+        if (pauseDirty) recomputePaused();
+      } finally {
+        flushing = false;
+        if (pushPending.size) armPush();
       }
     }
     async function pollStatus() {
