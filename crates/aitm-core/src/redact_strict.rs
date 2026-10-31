@@ -18,6 +18,8 @@
 //! `[redacted]`, and is idempotent: `scrub_strict(scrub_strict(x)) ==
 //! scrub_strict(x)`.
 
+use std::borrow::Cow;
+
 use crate::redact::{is_secret_key, scrub_text};
 
 /// The literal every pass writes over a credential.
@@ -147,10 +149,18 @@ pub fn is_benign_header(name: &str) -> bool {
         })
 }
 
-/// Mask credential material in plain text: [`scrub_text`] first (unchanged), then
-/// the strict passes in order: P2 header lines, P3 Basic, Negotiate and NTLM
-/// credentials, P4 URL userinfo, P5 credential shapes, P6 the extra key words.
+/// Mask credential material in plain text. One round is the PEM pre-pass, then
+/// [`scrub_text`] (unchanged), then the strict passes in order: P2 header lines, P3
+/// Basic, Negotiate and NTLM credentials, P4 URL userinfo, P5 credential shapes, P6
+/// the extra key words. The round is repeated until it changes nothing (see below).
 ///
+/// - **PEM pre-pass.** A private key block, from `-----BEGIN ... PRIVATE KEY-----`
+///   (or the PGP `... PRIVATE KEY BLOCK-----`) through the matching `-----END ...`
+///   line, or to the end of the text when there is none, becomes `[redacted]`, and
+///   what came before it stays (`private_key: [redacted]`). It runs first because
+///   every other pass reads text line by line: a key name in front of a block
+///   (`password: -----BEGIN ...`) would have its own mask take the header line and
+///   leave a key body that nothing after that can tell from prose.
 /// - **P2.** The name `authorization`, `proxy-authorization`, `cookie`, `cookie2`
 ///   or `set-cookie` (ASCII case-insensitive, a whole name: not preceded by an
 ///   ASCII alphanumeric, `_`, `.` or `-`) followed by optional blanks and `:`
@@ -164,40 +174,65 @@ pub fn is_benign_header(name: &str) -> bool {
 ///   required) to bytes that contain `:`, the `user:pass` shape. `negotiate` or
 ///   `ntlm` followed by blanks and a token of 16 or more such characters masks the
 ///   token.
-/// - **P4.** In `scheme://userinfo@host` (the userinfo is the text up to the first
-///   `@`, with no `/`, `?`, `#`, blank or quote in it): with a `:` the part after
-///   the first `:` is masked and the user name stays
-///   (`https://user:[redacted]@host`); with no `:` the whole userinfo is masked
-///   only when it is 20 or more bytes long or holds a P5 shape (`ssh://git@host`
-///   stays).
+/// - **P4.** In `scheme://userinfo@host`, the authority ends at the first `/`, `?`,
+///   `#`, blank or quote, and the userinfo is the text up to the last `@` before
+///   that, as a browser reads it. With a `:` the part after the first `:` is
+///   masked and the user name stays (`https://user:[redacted]@host`); with no `:`
+///   the whole userinfo is masked only when it is 20 or more bytes long or holds a
+///   P5 shape (`ssh://git@host` stays). A userinfo with no scheme in front of it
+///   (`//user:pw@host`) is not read.
 /// - **P5.** A credential with a distinctive prefix, a fixed alphabet and a minimum
-///   length: a JWT, a PEM private key block, an AWS access key id, GitHub, GitLab,
-///   Slack, Stripe, `sk-` and Google API keys. It must start at a boundary, a byte
-///   that is not an ASCII alphanumeric (`_` included, so `KEY_ghp_...` is still
-///   masked, and `task-<uuid>` is not an `sk-` key). A run shape ends at a boundary
-///   by construction; an exact-length one (AWS, Google) must be followed by one,
-///   unless an alphanumeric that opens another credential follows it.
+///   length: a JWT or compact JWE, an AWS access key id, GitHub, GitLab, Slack,
+///   Stripe, `sk-` and Google API keys. It must start at a boundary, a byte that is
+///   not an ASCII alphanumeric (`_` included, so `KEY_ghp_...` is still masked, and
+///   `task-<uuid>` is not an `sk-` key). A run shape ends at a boundary by
+///   construction; an exact-length one (AWS, Google) must be followed by one,
+///   unless an alphanumeric that opens another credential follows it. A JWE is a
+///   header and four more segments, to its tag.
 /// - **P6.** A `key=value`, `key: value` or `"key":"value"` pair whose key carries
 ///   one of the audit-only extra words (and no shared one) is masked with the value
 ///   rule of `scrub_text`. P2 has already taken a `pass: value` that starts a line.
 ///
 /// Plain text only: never call this over JSON text, where a line break is the two
-/// characters `\r\n` and a value is followed by `"}`. Linear in the length of
-/// `text`.
+/// characters `\r\n` and a value is followed by `"}`.
 ///
-/// Idempotent: a second call over the output changes nothing, for every row of the
-/// tests and for all but a handful of the dense, hostile strings a fuzz produced
-/// (23 distinct shapes in 30 million). The exceptions are all of one kind, one mask
-/// changing how a neighbour reads, and the second call masks more, never less:
-///
-/// - A value that ends in a backslash before a quote (`otp=\"`): masking it takes the
-///   backslash, so the quote is no longer escaped. `scrub_text` does the same, so it
-///   is not idempotent there on its own.
-/// - A mask that takes away what made an earlier pass hold back: the `.` that made
-///   `scrub_text` read `a.b_c:8443` as a host and a port, a `/` or a blank that ended
-///   a P4 userinfo, the delimiter between a P4 password and the rest of a value.
+/// A fixed point: the round is repeated until its output equals its input, at most
+/// [`MAX_ROUNDS`] (four) times, so a second call over the result changes nothing. One
+/// round does not always settle a text, because a mask can change how a neighbour
+/// reads: masking a value that ends in a backslash un-escapes the quote after it, and
+/// masking a span can remove the `.` that made `scrub_text` read a host and a port,
+/// or a `/` that ended a P4 authority. A text the round leaves alone costs one
+/// round, and the work is at most four passes, each linear in the length of `text`.
+/// A text that has not settled after four rounds is returned as the fourth left it.
 pub fn scrub_strict(text: &str) -> String {
-    let scrubbed = scrub_text(text);
+    converge(text, scrub_round)
+}
+
+/// The most rounds [`scrub_strict`] runs over one text.
+const MAX_ROUNDS: usize = 4;
+
+/// Run `round` over `text` until its output equals its input, at most
+/// [`MAX_ROUNDS`] times, and return that output (the last one, when the text has
+/// not settled by then). A text the round leaves alone costs one round.
+fn converge(text: &str, round: impl Fn(&str) -> String) -> String {
+    let mut current = round(text);
+    if current == text {
+        return current;
+    }
+    for _ in 1..MAX_ROUNDS {
+        let next = round(&current);
+        if next == current {
+            return next;
+        }
+        current = next;
+    }
+    current
+}
+
+/// One round of [`scrub_strict`]: the PEM pre-pass, `scrub_text`, then P2 to P6.
+fn scrub_round(text: &str) -> String {
+    let blocks_masked = mask_pem_blocks(text);
+    let scrubbed = scrub_text(&blocks_masked);
     let headers_masked = mask_header_lines(&scrubbed);
     let basic_masked = mask_basic_credentials(&headers_masked);
     let userinfo_masked = mask_url_userinfo(&basic_masked);
@@ -430,32 +465,132 @@ fn mask_basic_credentials(text: &str) -> String {
     out
 }
 
+/// The most label bytes a PEM private key marker line may carry between the
+/// keyword and the closing dashes (`PGP PRIVATE KEY BLOCK` is 21).
+const PEM_LABEL_MAX: usize = 48;
+
+/// How a label of a private key marker line ends: `PRIVATE KEY` for PEM
+/// (`RSA PRIVATE KEY`, `ENCRYPTED PRIVATE KEY`) and `PRIVATE KEY BLOCK` for the
+/// PGP armor.
+const PEM_LABEL_ENDS: [&[u8]; 2] = [b"PRIVATE KEY", b"PRIVATE KEY BLOCK"];
+
+const PEM_BEGIN: &str = "-----BEGIN ";
+const PEM_END: &str = "-----END ";
+
+/// If a PEM marker line starts at `at` with `keyword` (`-----BEGIN ` or
+/// `-----END `), a label of capital letters, digits and spaces that ends as
+/// [`PEM_LABEL_ENDS`] says, and the closing dashes, the index just past those
+/// dashes.
+fn pem_marker_end(bytes: &[u8], at: usize, keyword: &str) -> Option<usize> {
+    let rest = bytes.get(at..)?;
+    if !rest.starts_with(keyword.as_bytes()) {
+        return None;
+    }
+    let label_start = at + keyword.len();
+    let after_keyword = bytes.get(label_start..)?;
+    let label_len = after_keyword
+        .iter()
+        .take(PEM_LABEL_MAX + 1)
+        .take_while(|&&b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b' ')
+        .count();
+    if label_len > PEM_LABEL_MAX {
+        return None;
+    }
+    let label = &after_keyword[..label_len];
+    if !PEM_LABEL_ENDS.iter().any(|end| label.ends_with(end)) {
+        return None;
+    }
+    let dashes = label_start + label_len;
+    bytes
+        .get(dashes..)?
+        .starts_with(b"-----")
+        .then_some(dashes + 5)
+}
+
+/// The end of the private key block that starts at `at`, or `None` when no
+/// `-----BEGIN ... PRIVATE KEY-----` (or `... PRIVATE KEY BLOCK-----`) line starts
+/// there. The block runs through the first matching `-----END ...` line after it, or
+/// to the end of the text when there is none, so an unterminated block masks
+/// everything after its header. Each marker candidate costs a bounded read and the
+/// search resumes after it.
+fn pem_block_end(text: &str, at: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let header_end = pem_marker_end(bytes, at, PEM_BEGIN)?;
+    let mut from = header_end;
+    while let Some(found) = text.get(from..).and_then(|rest| rest.find(PEM_END)) {
+        let marker = from + found;
+        if let Some(end) = pem_marker_end(bytes, marker, PEM_END) {
+            return Some(end);
+        }
+        from = marker + 1;
+    }
+    Some(text.len())
+}
+
+/// The PEM pre-pass: mask every private key block, header to closing line, before
+/// any other pass runs. The other passes read a block line by line, and a key name
+/// in front of it (`password: -----BEGIN ...`) would have its own mask take the
+/// header line and leave the key body, which nothing after that can tell from text.
+/// What came before the block stays: `private_key: [redacted]`. The text is borrowed
+/// back when it holds no block. One left-to-right search: a header costs a bounded
+/// read, and a block that is masked is skipped whole.
+fn mask_pem_blocks(text: &str) -> Cow<'_, str> {
+    let mut out = String::new();
+    // Start of the text not yet copied into `out`.
+    let mut copied = 0;
+    let mut masked = false;
+    let mut from = 0;
+    while let Some(found) = text.get(from..).and_then(|rest| rest.find(PEM_BEGIN)) {
+        let start = from + found;
+        match pem_block_end(text, start) {
+            Some(end) => {
+                // A block starts on an ASCII `-` and ends on an ASCII `-` or at the
+                // end of the text, so both slice points are char boundaries.
+                out.push_str(&text[copied..start]);
+                out.push_str(REDACTED);
+                copied = end;
+                from = end;
+                masked = true;
+            }
+            None => from = start + 1,
+        }
+    }
+    if !masked {
+        return Cow::Borrowed(text);
+    }
+    out.push_str(&text[copied..]);
+    Cow::Owned(out)
+}
+
 /// Whether `b` can end the scheme in front of `://`: an ASCII alphanumeric, `+`,
 /// `.` or `-`.
 fn is_scheme_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-')
 }
 
-/// The index of the `@` that ends the userinfo of an authority starting at `from`,
-/// or `None` when a `/`, `?`, `#`, quote or whitespace character, or the end of the
-/// text, comes first. Reads no further than that character. Whitespace is Unicode
-/// whitespace, as `scrub_text` reads it: it ends the value of a `key:value` pair
-/// there, so a pass that masked across one (a no-break space inside a "password")
-/// would let the next call read that value further than this one did.
+/// The index of the last `@` of the authority that starts at `from`, which ends its
+/// userinfo, or `None` when the authority has none. The authority ends at the first
+/// `/`, `?`, `#`, quote or whitespace character, or at the end of the text; a
+/// browser takes the host after the last `@`, so a password holding a raw `@` is all
+/// userinfo. Whitespace is Unicode whitespace, as `scrub_text` reads it: it ends the
+/// value of a `key:value` pair there, so a pass that masked across one (a no-break
+/// space inside a "password") would let the next call read that value further than
+/// this one did.
 fn userinfo_end(text: &str, from: usize) -> Option<usize> {
+    let mut last_at = None;
     for (offset, c) in text.get(from..)?.char_indices() {
         match c {
-            '@' => return Some(from + offset),
-            '/' | '?' | '#' | '"' | '\'' => return None,
-            c if c.is_whitespace() => return None,
+            '@' => last_at = Some(from + offset),
+            '/' | '?' | '#' | '"' | '\'' => break,
+            c if c.is_whitespace() => break,
             _ => {}
         }
     }
-    None
+    last_at
 }
 
 /// P4. See [`scrub_strict`]. The text is searched for `://` once, left to right.
-/// The userinfo scan after a `://` stops at the first `/` at the latest, and a later
+/// The authority scan after a `://` stops at the first `/` at the latest, and a later
 /// `://` has a `/` in it, so two scans never overlap and the work is linear.
 fn mask_url_userinfo(text: &str) -> String {
     let bytes = text.as_bytes();
@@ -631,16 +766,24 @@ fn table_shape_end(bytes: &[u8], at: usize) -> Option<usize> {
     })
 }
 
-/// The end of the JWT starting at `at` (on `eyJ`, at a boundary), or `None`: a
-/// first segment of at least 8 base64url characters (the `eyJ` included), a dot, a
-/// second segment of at least 8, a dot, and a third segment of any length, the
-/// signature, which an unsecured token leaves empty.
+/// How many dot-separated segments a compact JWE has: the header, the encrypted
+/// key, the initialisation vector, the ciphertext and the tag.
+const JWE_SEGMENTS: usize = 5;
+
+/// The end of the JWT or compact JWE starting at `at` (on `eyJ`, at a boundary), or
+/// `None`. A JWT is a first segment of at least 8 base64url characters (the `eyJ`
+/// included), a dot, a second segment of at least 8, a dot, and a third segment of
+/// any length, the signature, which an unsecured token leaves empty. A compact JWE
+/// is the first segment and four more: the encrypted key, the vector and the
+/// ciphertext may be empty (`dir` has no key), the tag may not.
 ///
 /// A failed attempt reads the first segment to its end, `first_end`, and the
 /// verdict of any attempt that starts inside that segment is the same (it ends at
-/// the same dot and meets the same second segment, with a shorter first one), so
+/// the same dot and meets the same later segments, with a shorter first one), so
 /// `dead_until` is set and those attempts are skipped: without that, `eyJ-eyJ-...`
-/// would cost a pass over the rest of the text at every `eyJ`.
+/// would cost a pass over the rest of the text at every `eyJ`. An attempt reads at
+/// most four segments past the first, so each run of base64url characters is read a
+/// constant number of times.
 fn jwt_end(bytes: &[u8], at: usize, dead_until: &mut usize) -> Option<usize> {
     if at < *dead_until {
         return None;
@@ -658,66 +801,19 @@ fn jwt_after_first(bytes: &[u8], at: usize, first_end: usize) -> Option<usize> {
     if first_end - at < 8 || bytes.get(first_end) != Some(&b'.') {
         return None;
     }
-    let second_start = first_end + 1;
-    let second_end = skip_while(bytes, second_start, body_base64url);
-    if second_end - second_start < 8 || bytes.get(second_end) != Some(&b'.') {
-        return None;
+    // `ends[k]` is the end of segment `k`; each later one follows a dot.
+    let mut ends = [first_end; JWE_SEGMENTS];
+    let mut count = 1;
+    while count < JWE_SEGMENTS && bytes.get(ends[count - 1]) == Some(&b'.') {
+        ends[count] = skip_while(bytes, ends[count - 1] + 1, body_base64url);
+        count += 1;
     }
-    Some(skip_while(bytes, second_end + 1, body_base64url))
-}
-
-/// The most label bytes a PEM private key marker line may carry between the
-/// keyword and the closing dashes (`RSA PRIVATE KEY` is 15).
-const PEM_LABEL_MAX: usize = 48;
-
-/// If a PEM marker line starts at `at` with `keyword` (`-----BEGIN ` or
-/// `-----END `), a label of capital letters, digits and spaces that ends in
-/// `PRIVATE KEY`, and the closing dashes, the index just past those dashes.
-fn pem_marker_end(bytes: &[u8], at: usize, keyword: &str) -> Option<usize> {
-    let rest = bytes.get(at..)?;
-    if !rest.starts_with(keyword.as_bytes()) {
-        return None;
+    let tag_is_empty = ends[JWE_SEGMENTS - 1] == ends[JWE_SEGMENTS - 2] + 1;
+    if count == JWE_SEGMENTS && !tag_is_empty {
+        return Some(ends[JWE_SEGMENTS - 1]);
     }
-    let label_start = at + keyword.len();
-    let after_keyword = bytes.get(label_start..)?;
-    let label_len = after_keyword
-        .iter()
-        .take(PEM_LABEL_MAX + 1)
-        .take_while(|&&b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b' ')
-        .count();
-    if label_len > PEM_LABEL_MAX || !after_keyword[..label_len].ends_with(b"PRIVATE KEY") {
-        return None;
-    }
-    let dashes = label_start + label_len;
-    bytes
-        .get(dashes..)?
-        .starts_with(b"-----")
-        .then_some(dashes + 5)
-}
-
-/// The end of the PEM private key block that starts at `at`, or `None` when no
-/// `-----BEGIN ... PRIVATE KEY-----` line starts there. The block runs through the
-/// first `-----END ... PRIVATE KEY-----` line after it, or to the end of the text
-/// when there is none, so an unterminated block masks everything after its header.
-/// Each marker candidate costs a bounded read and the search resumes after it.
-///
-/// A name byte glued to the end of the closing line belongs to the block. P2 reads a
-/// header name as a whole run of name bytes, and the closing dashes are name bytes:
-/// `-----END PRIVATE KEY-----cookie: x` is one run to it, not a header. Masking only
-/// up to the dashes would leave `[redacted]cookie: x`, where `cookie` starts a run
-/// and is one, so a second call would mask what the first left.
-fn pem_block_end(text: &str, at: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let header_end = pem_marker_end(bytes, at, "-----BEGIN ")?;
-    let mut from = header_end;
-    while let Some(found) = text.get(from..).and_then(|rest| rest.find("-----END ")) {
-        let marker = from + found;
-        if let Some(end) = pem_marker_end(bytes, marker, "-----END ") {
-            return Some(skip_while(bytes, end, is_name_byte));
-        }
-        from = marker + 1;
-    }
-    Some(text.len())
+    // A JWT: the second segment is at least 8, and a dot and a third segment follow.
+    (count >= 3 && ends[1] - (first_end + 1) >= 8).then_some(ends[2])
 }
 
 /// The end of the P5 credential that starts at `at`, or `None`. `from` is where the
@@ -727,9 +823,7 @@ fn pem_block_end(text: &str, at: usize) -> Option<usize> {
 fn shape_end_at(text: &str, at: usize, from: usize, jwt_dead_until: &mut usize) -> Option<usize> {
     let bytes = text.as_bytes();
     match bytes[at] {
-        // A PEM block needs no boundary: its header is distinctive.
-        b'-' => pem_block_end(text, at),
-        // First bytes of the other shapes. The previous byte must not be an ASCII
+        // First bytes of the shapes. The previous byte must not be an ASCII
         // alphanumeric, so a prefix in the middle of a word (`task-` for `sk-`) is
         // not one. At `from` the previous byte is the end of a credential that is
         // masked by then, and `]` is a boundary: judging the candidate by the byte
@@ -966,4 +1060,45 @@ fn mask_extra_pairs(text: &str) -> String {
     }
     out.push_str(&text[copied..]);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::{converge, MAX_ROUNDS};
+
+    /// `converge` over `round`, and how many times it called it.
+    fn run(text: &str, round: impl Fn(&str) -> String) -> (String, usize) {
+        let calls = Cell::new(0);
+        let out = converge(text, |t| {
+            calls.set(calls.get() + 1);
+            round(t)
+        });
+        (out, calls.get())
+    }
+
+    #[test]
+    fn an_unchanged_text_costs_exactly_one_round() {
+        assert_eq!(run("abc", str::to_string), ("abc".to_string(), 1));
+    }
+
+    #[test]
+    fn rounds_repeat_until_the_output_equals_the_input() {
+        // Each round drops one trailing `x`: `abxx` -> `abx` -> `ab`, and the third
+        // round leaves `ab` as it was, which is the proof of a fixed point.
+        let drop_one = |t: &str| t.strip_suffix('x').unwrap_or(t).to_string();
+        assert_eq!(run("abxx", drop_one), ("ab".to_string(), 3));
+    }
+
+    #[test]
+    fn the_rounds_are_bounded() {
+        // A round that never settles is cut off after MAX_ROUNDS calls, and the last
+        // output is the result.
+        assert_eq!(MAX_ROUNDS, 4);
+        assert_eq!(
+            run("", |t| format!("{t}x")),
+            ("xxxx".to_string(), MAX_ROUNDS)
+        );
+    }
 }

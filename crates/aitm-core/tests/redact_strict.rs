@@ -289,11 +289,11 @@ fn scrub_strict_masks_every_pass_and_keeps_the_benign() {
 
     // Regressions found by fuzzing, each a case where one mask changed how a
     // neighbour read, so that a second call masked what the first left. A name glued
-    // to the closing dashes is part of the block (P2 reads `KEY-----cookie` as one
-    // name until the dashes are masked).
+    // to the closing dashes stays: the block is masked before any other pass runs, so
+    // the name is read as a name by the first call, and its value is masked with it.
     t.row(
         "-----BEGIN PRIVATE KEY-----\nA\n-----END PRIVATE KEY-----cookie: x",
-        "[redacted]: [redacted]",
+        "[redacted]cookie: [redacted]",
     );
     // A no-break space ends a P4 userinfo as it ends a `scrub_text` value; masking
     // across it joined the value to the text after it.
@@ -434,6 +434,239 @@ fn is_secret_key_strict_vocabulary() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Shapes the fuzzer found where one call did not leave a fixed point. Each is
+/// `scrub_strict`'s to settle: the result of a second call must equal the first.
+const FUZZ_FOUND_SHAPES: &[&str] = &[
+    // The value rule masks a trailing backslash, so a quote stops being escaped.
+    "secret=\"\rpw\n:\\\"",
+    "privatekey=' privatekey:\\'",
+    "pass=' pass:\\'",
+    "\tprivatekey:\"=\u{b}\"s",
+    "Pass=\",privatekey:\\\"",
+    " pw:\"\rpass=\\\"",
+    " pass:' privatekey:\\'",
+    "\u{a0}ApiKey:'}apikey::'d",
+    "\"CookieA:\" aCookie:\\\"",
+    "ApiKey=\"\u{c}ApiKey:\\\"",
+    "/apikey:\" auth=\\\"",
+    " token:\" apikey:\\\"",
+    "[pass:\" otp=\\\"",
+    "Authorization.=' pw=\\'",
+    "?ApiKey:\" signing-key:\\\"",
+    "Cookie=\"=\n\"n",
+    // A mask that takes away a terminator or a delimiter another pass stopped at.
+    "w://-----BEGIN PRIVATE KEY----------END PRIVATE KEY-----[]abcdefgh@",
+    "a://okenZm9va_-----BEGIN PRIVATE KEY----------END PRIVATE KEY-----@",
+    "Y://xxxxxxxxxx-----BEGIN PRIVATE KEY----------END PRIVATE KEY-----@",
+    "4://sk_live_pw-----BEGIN PRIVATE KEY----------END PRIVATE KEY-----@",
+    "-://eaaaaaaaa------BEGIN PRIVATE KEY----------END PRIVATE KEY-----@",
+    "h://ApiKey:}@",
+    "A://CookieA:}@",
+    "-://Cookie_:}@",
+    "6://passphrase:/}@",
+    "p://privatekey=.&@",
+    // A mask that takes away the `.` that made `scrub_text` read a host and a port.
+    ".xoxp-et-Cookiex_ApiKey:8",
+    ".xoxb-fghprivate_Cookie:4",
+    ".sk_live_3AuthorizatioSet-Cookie:4",
+    ".rk_test_eyJhbGciOiJProxy-Auth:1",
+    ".rk_test_bmF0dXJlAKIAxoxp-passwd:8",
+    ".xoxp-AAAAAAAAAA_Cookie:3",
+    ".rk_test_NztokenhttpProxy-Auth:1",
+    "AIzaeyJzdWIiOiJ4eyJhbGciOiJauthsk_live_xoxb-234Cookie2",
+];
+
+#[test]
+fn shapes_found_by_fuzzing_are_fixed_points() {
+    // scrub_strict runs its passes again until the text stops changing, so a second
+    // call over any output changes nothing, including the shapes that no single
+    // round settles.
+    let mut failures = Vec::new();
+    for shape in FUZZ_FOUND_SHAPES {
+        let first = scrub_strict(shape);
+        let second = scrub_strict(&first);
+        if first != second {
+            failures.push(format!("{shape:?}: first {first:?}, second {second:?}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} shapes are not fixed points:\n{}",
+        failures.len(),
+        FUZZ_FOUND_SHAPES.len(),
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn a_private_key_block_is_masked_whole_whatever_precedes_it() {
+    // The block is masked before `scrub_text` and P2 run, so a key name in front of
+    // it (whose own mask would eat the BEGIN line) cannot leave the key body behind.
+    let mut t = Table::default();
+    t.row(
+        "password: -----BEGIN PRIVATE KEY-----\nMIIEvQIBADAN\n-----END PRIVATE KEY-----",
+        "password: [redacted]",
+    );
+    t.row(
+        "token=-----BEGIN RSA PRIVATE KEY-----\nMIIEvQIBADAN\n-----END RSA PRIVATE KEY-----",
+        "token=[redacted]",
+    );
+    t.row(
+        "private_key: -----BEGIN PRIVATE KEY-----\nMIIEvQIBADAN\n-----END PRIVATE KEY-----",
+        "private_key: [redacted]",
+    );
+    t.row(
+        "password: -----BEGIN PRIVATE KEY-----\nMII",
+        "password: [redacted]",
+    );
+    t.row(
+        "k: -----BEGIN PRIVATE KEY-----\nAAA\n-----END PRIVATE KEY-----\nafter: 1",
+        "k: [redacted]\nafter: 1",
+    );
+    t.row(
+        "Cookie: a=b\r\n-----BEGIN PRIVATE KEY-----\r\nMII\r\n-----END PRIVATE KEY-----\r\nok",
+        "Cookie: [redacted]\r\n[redacted]\r\nok",
+    );
+
+    // The PGP armor: the label ends in `PRIVATE KEY BLOCK`.
+    t.row(
+        "-----BEGIN PGP PRIVATE KEY BLOCK-----\nabcdef\n-----END PGP PRIVATE KEY BLOCK-----",
+        "[redacted]",
+    );
+    t.row(
+        "pgp:\n-----BEGIN PGP PRIVATE KEY BLOCK-----\nabc\n-----END PGP PRIVATE KEY BLOCK-----\nafter",
+        "pgp:\n[redacted]\nafter",
+    );
+    t.row(
+        "passwd=-----BEGIN PGP PRIVATE KEY BLOCK-----\nQWxs\n-----END PGP PRIVATE KEY BLOCK-----",
+        "passwd=[redacted]",
+    );
+
+    // Public material is not a secret, and the label length is bounded: 48 bytes
+    // match, 49 do not.
+    t.unchanged("-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----");
+    t.unchanged("-----BEGIN PGP PUBLIC KEY BLOCK-----\nmQEN\n-----END PGP PUBLIC KEY BLOCK-----");
+    t.row(
+        &format!(
+            "-----BEGIN {a} PRIVATE KEY-----\nX\n-----END {a} PRIVATE KEY-----",
+            a = "A".repeat(36)
+        ),
+        "[redacted]",
+    );
+    let long = format!(
+        "-----BEGIN {a} PRIVATE KEY-----\nX\n-----END {a} PRIVATE KEY-----",
+        a = "A".repeat(37)
+    );
+    t.unchanged(&long);
+
+    // Hostile, 4 MiB each: a header after a key name that never closes, a header
+    // followed by an endless run of unmatched END keywords, and headers that are
+    // not private-key headers at all.
+    let after_key = "password: -----BEGIN PRIVATE KEY-----\n".repeat((4 << 20) / 38 + 1);
+    t.hostile(
+        "`password: ` + BEGIN x N",
+        after_key,
+        "password: [redacted]".to_string(),
+    );
+    let ends = "-----BEGIN PRIVATE KEY-----x-----END ".repeat((4 << 20) / 37 + 1);
+    t.hostile("BEGIN + unmatched END x N", ends, "[redacted]".to_string());
+    let begins = "-----BEGIN ".repeat((4 << 20) / 11 + 1);
+    t.hostile("`-----BEGIN ` x N", begins.clone(), begins);
+    t.finish();
+}
+
+#[test]
+fn userinfo_runs_to_the_last_at_of_the_authority() {
+    // Browsers resolve the host after the last `@` of the authority, so a password
+    // that holds a raw `@` is all userinfo.
+    let mut t = Table::default();
+    t.row(
+        "https://u:p@ss@host.test/",
+        "https://u:[redacted]@host.test/",
+    );
+    t.row(
+        "https://u:p@ss@host.test/x@y",
+        "https://u:[redacted]@host.test/x@y",
+    );
+    t.row(
+        "https://u:p@ss@host.test?x=1@2",
+        "https://u:[redacted]@host.test?x=1@2",
+    );
+    t.row(
+        "https://u:p@ss@host.test#f@g",
+        "https://u:[redacted]@host.test#f@g",
+    );
+    t.row("\"https://u:p@ss@h\"@x", "\"https://u:[redacted]@h\"@x");
+    t.row("https://u:p@ss@h x@y", "https://u:[redacted]@h x@y");
+    // No colon: the length rule is applied to the whole userinfo, `@` included.
+    t.row(
+        "https://abcdefghi@jklmnopqrst@host.test/",
+        "https://[redacted]@host.test/",
+    );
+    t.unchanged("https://a@b@host.test/");
+    t.unchanged("ssh://git@github.com/o/r");
+    t.unchanged("https://host.test/a@b");
+
+    // Hostile, 4 MiB each: one endless authority of `@`s, with and without a colon.
+    let n = (4 << 20) / 2 + 1;
+    t.hostile(
+        "`https://` + `a@` x N",
+        format!("https://{}", "a@".repeat(n)),
+        "https://[redacted]@".to_string(),
+    );
+    t.hostile(
+        "`https://u:` + `p@` x N",
+        format!("https://u:{}", "p@".repeat(n)),
+        "https://u:[redacted]@".to_string(),
+    );
+    t.finish();
+}
+
+#[test]
+fn a_compact_jwe_is_masked_to_its_tag() {
+    // A compact JWE is a header and four more segments. The encrypted key, the
+    // initialisation vector and the ciphertext may be empty; the tag may not.
+    let mut t = Table::default();
+    t.row(
+        "eyJhbGciOiJSU0EtT0FFUCJ9.encryptedkeyaaaa.ivaaaaaaaa.ciphertextaaaa.tagaaaaaaaaaa",
+        "[redacted]",
+    );
+    t.row(
+        "eyJhbGciOiJkaXIifQ..ivaaaaaaaa.ciphertextaaaa.tagaaaaaaaaaa",
+        "[redacted]",
+    );
+    t.row(
+        "eyJhbGciOiJkaXIifQ...ciphertextaaaa.tagaaaaaaaaaa",
+        "[redacted]",
+    );
+    t.row(
+        "jwe=eyJhbGciOiJkaXIifQ..iv.ct.tag; next=1",
+        "jwe=[redacted]; next=1",
+    );
+    // The three-part JWT keeps its behaviour and its length gates; a fourth part is
+    // not one of its parts.
+    t.row(
+        "a eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln b",
+        "a [redacted] b",
+    );
+    t.row(
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl.tail",
+        "[redacted].tail",
+    );
+    t.unchanged("eyJabc..iv.ct.tag");
+    t.unchanged("eyJhbGciOiJkaXIifQ..iv.ct.");
+    t.unchanged("eyJhbGciOiJIUzI1NiJ9.abcdefg.sig");
+
+    // Hostile, 4 MiB: header-looking segments, five to a JWE.
+    let jwes = (4 << 20) / 60 + 1;
+    t.hostile(
+        "`eyJaaaaaaaa.` x 5N",
+        "eyJaaaaaaaa.".repeat(5 * jwes),
+        "[redacted].".repeat(jwes),
+    );
+    t.finish();
 }
 
 #[test]
