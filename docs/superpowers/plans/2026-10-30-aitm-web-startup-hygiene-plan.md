@@ -41,13 +41,15 @@ Terminal panel, after merge-readiness.
       `reap_stale_run_dirs_in(&std::env::temp_dir(), pid_is_alive)`; when the
       returned `n > 0`, emit exactly one `info!(removed = n, …)`; otherwise
       silent/`debug!`.
-    - `fn pid_is_alive(pid: u32) -> bool` — `#[cfg(unix)]`: `libc::kill(pid as i32, 0)`;
-      `true` on success, `false` only on `ESRCH`, `true` on `EPERM` (and any
-      other errno). `#[cfg(not(unix))]`: returns `true`.
+    - `fn pid_is_alive(pid: u32) -> bool` — `#[cfg(unix)]`:
+      `nix::sys::signal::kill(Pid::from_raw(pid as i32), None)`; `true` on `Ok`,
+      `false` only on `Err(Errno::ESRCH)`, `true` on any other `Err` (`EPERM` etc).
+      `#[cfg(not(unix))]`: returns `true`. No local `unsafe` (`nix` wraps the libc
+      call), so the crate keeps the workspace `unsafe_code = "forbid"`.
   - Update the call site in `ObscuraProcess::start()`: `warn_stale_run_dirs();` →
     `reap_stale_run_dirs();`.
-  - `Cargo.toml`: add
-    `[target.'cfg(unix)'.dependencies]` / `libc = "0.2"`.
+  - `Cargo.toml`: add `[target.'cfg(unix)'.dependencies]` /
+    `nix = { version = "0.29", features = ["signal"] }`; keep `[lints] workspace = true`.
 - **Test:** `reap_removes_only_provably_dead_dirs` (new, in the `obscura` tests
   module). Build a temp base dir; create subdirs `aitm-obscura-111-aaa`,
   `aitm-obscura-222-bbb`, a non-matching dir `not-ours`, and a matching **file**

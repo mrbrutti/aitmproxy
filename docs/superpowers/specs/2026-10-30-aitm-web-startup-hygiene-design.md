@@ -61,8 +61,11 @@ re-derive it.
 
 - Platforms: macOS and Linux (both unix). A `cfg(not(unix))` fallback must
   compile but may be a conservative no-op.
-- Liveness check is `libc::kill(pid, 0)` via errno, never a process scan. `libc`
-  0.2.x is already in `Cargo.lock` transitively; add it as a direct, unix-gated
+- Liveness check is the null-signal `kill(pid, None)` via errno, never a process
+  scan. Use the `nix` crate (already in `Cargo.lock` at 0.29, `signal` feature) so
+  the one unsafe libc call stays inside the audited `nix` crate and
+  `crates/aitm-browser` keeps the workspace `unsafe_code = "forbid"` — no local
+  `unsafe`, no lint override, no new leaf crate. Add `nix` as a direct, unix-gated
   dependency of `crates/aitm-browser`.
 - TDD throughout: a failing test precedes every change. Rust unit tests must be
   hermetic — no port binding, no spawned obscura, no real sibling processes
@@ -103,18 +106,23 @@ in the directory name (not obscura's pid).
     line (wording to match the file; e.g. "removed stale obscura run
     directories"). `n == 0` is silent (or `debug!`). Dirs left in use are never
     warned (at most `debug!`).
-  - `fn pid_is_alive(pid: u32) -> bool` — on unix, `libc::kill(pid as i32, 0)`:
-    returns `true` on success (exists: us, a sibling, or a recycled pid →
-    LEAVE), `true` on `EPERM` (exists under another uid → LEAVE), `false` **only**
-    on `ESRCH` (no such process → owner dead → REMOVE). On `cfg(not(unix))`,
-    returns `true` (conservative: leave).
+  - `fn pid_is_alive(pid: u32) -> bool` — on unix,
+    `nix::sys::signal::kill(Pid::from_raw(pid as i32), None)` (the null-signal
+    existence probe): returns `true` on `Ok` (exists: us, a sibling, or a recycled
+    pid → LEAVE), `false` **only** on `Err(Errno::ESRCH)` (no such process → owner
+    dead → REMOVE), `true` on any other `Err` incl. `EPERM` (exists under another
+    uid → LEAVE). On `cfg(not(unix))`, returns `true` (conservative: leave). No
+    local `unsafe` — `nix` wraps the libc call, so the crate keeps
+    `unsafe_code = "forbid"`.
 - **Conservative direction:** remove only when provably dead. Unparseable name,
   non-dir entry, ambiguous `kill` → LEAVE. PID reuse at worst leaves a dir; it
   never deletes a live sibling's. **(Architect's call — matches the hard hazard
   in the brief.)**
 - Call site in `ObscuraProcess::start()` changes `warn_stale_run_dirs();` to
   `reap_stale_run_dirs();` (same place, before `make_run_dir()`).
-- `Cargo.toml`: add `[target.'cfg(unix)'.dependencies] libc = "0.2"`.
+- `Cargo.toml`: add `[target.'cfg(unix)'.dependencies] nix = { version = "0.29",
+  features = ["signal"] }`; keep `[lints] workspace = true` (crate stays
+  `unsafe_code = "forbid"`).
 - The existing `run_dir_is_private_and_unpredictable` test stays green.
 
 ### D2 — Clean, prominent startup summary (`crates/aitm/src/web/mod.rs`, `crates/aitm/src/main.rs`)
