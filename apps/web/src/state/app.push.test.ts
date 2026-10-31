@@ -8,20 +8,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FlowEventKind } from '~/bus/types';
 import { createAppStore } from './app';
-import { bridgeBus, captureInFlight, captureSilently, complete, type TestBus } from './bridgeBus.testkit';
+import { FLOW_PING, bridgeBus, captureInFlight, captureSilently, complete, gate, tick, type TestBus } from './bridgeBus.testkit';
 
 /** What the server really sends with a flow event: a thin summary, `kind:"ws"` spelled its way, no times, no sizes. */
 const sparse = (id: string) => ({ id, kind: 'ws', method: 'GET', authority: 'x.test', path: '/p', status: null });
 const push = (bus: TestBus, event: FlowEventKind, id: string) => bus.emit('notifications/aitm/flow', { event, id, summary: sparse(id) });
-/** A flow notification that changes nothing (no summary) but proves the flow stream is alive. */
-const FLOW_PING = { event: 'meta', id: 'f_none' };
-const tick = (ms: number) => vi.advanceTimersByTimeAsync(ms);
-/** A promise the test releases by hand, for `ctl.holdReply`. */
-function gate() {
-  let release!: () => void;
-  const promise = new Promise<void>((r) => (release = r));
-  return { promise, release };
-}
 
 let open: TestBus[] = [];
 const start = (bus: TestBus = bridgeBus()) => {
@@ -215,6 +206,33 @@ describe('app store — a flow push is a trigger, never data', () => {
     expect(bus.count('flow.list')).toBeGreaterThan(lists); // the surplus set `backlog`, so the poll ran
   });
 
+  it('a reply that is not the requested flow makes no row and is held off', async () => {
+    const { bus, app } = start();
+    await tick(200);
+    for (let s = 1; s <= 3; s++) captureSilently(bus, s);
+    bus.ctl.replyWith.set('f_1', {}); // a reply with no id at all
+    bus.ctl.replyWith.set('f_2', bus.flowsById().get('f_3')); // a reply that is another flow's row
+
+    push(bus, 'created', 'f_1');
+    push(bus, 'created', 'f_2');
+    await tick(150);
+
+    expect(bus.callArgs('flow.detail')).toEqual([
+      { id: 'f_1', body: 'none' },
+      { id: 'f_2', body: 'none' },
+    ]);
+    // Keyed by the id that was asked for: no ghost row `''`, and f_3 is not written under f_2's fetch.
+    expect(app.entries).toHaveLength(0);
+    expect(app.byId.has('')).toBe(false);
+    expect(app.byId.has('f_3')).toBe(false);
+
+    // Both count as failed reads: pushes inside FAILED_RETRY_MS make no further call.
+    push(bus, 'created', 'f_1');
+    push(bus, 'created', 'f_2');
+    await tick(150);
+    expect(bus.count('flow.detail')).toBe(2);
+  });
+
   it('falls back to flow.get without the flow.detail tool', async () => {
     const bus = bridgeBus();
     bus.ctl.hideTools.add('flow.detail');
@@ -281,6 +299,28 @@ describe('app store — a flow push is a trigger, never data', () => {
     g.release();
     await tick(300);
     expect(b.app.entries).toHaveLength(0);
+  });
+
+  it('a cleared event during a multi-wave flush stops the later waves too', async () => {
+    // 40 ids are three waves of 16. `cleared` lands while wave 1 is in flight: not only is that wave's
+    // reply discarded, waves 2 and 3 are never issued, or they would resurrect 24 rows the operator
+    // just cleared.
+    const { bus, app } = start();
+    await tick(200);
+    const ids = Array.from({ length: 40 }, (_, i) => captureSilently(bus, i + 1));
+    const g = gate();
+    bus.ctl.holdReply.set(ids[0]!, g.promise); // wave 1 cannot complete until released
+
+    for (const id of ids) push(bus, 'created', id);
+    await tick(120);
+    expect(bus.count('flow.detail')).toBe(16); // wave 1 issued and held
+
+    bus.emit('notifications/aitm/flow', { event: 'cleared', id: '' });
+    g.release();
+    await tick(300);
+
+    expect(bus.count('flow.detail')).toBe(16); // no further wave
+    expect(app.entries).toHaveLength(0);
   });
 
   it('a response push invalidates cached detail and reloads the selected flow', async () => {

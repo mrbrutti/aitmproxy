@@ -11,12 +11,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { StateNotification } from '~/bus/types';
 import { createAppStore } from './app';
-import { bridgeBus, captureInFlight, captureSilently, complete, type TestBus } from './bridgeBus.testkit';
+import { FLOW_PING, bridgeBus, captureInFlight, captureSilently, complete, tick, type TestBus } from './bridgeBus.testkit';
 
 const STATE: StateNotification = { listening: true, intercept_armed: false, paused: 0, agent: 'all' };
-/** A flow notification that changes nothing (no summary) but proves the flow stream is alive. */
-const FLOW_PING = { event: 'meta', id: 'f_none' };
-const tick = (ms: number) => vi.advanceTimersByTimeAsync(ms);
 
 let open: TestBus[] = [];
 const start = (bus: TestBus = bridgeBus()) => {

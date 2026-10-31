@@ -1,22 +1,21 @@
 // Activity intake (push spec D6, D7): every audit line, pushed on `notifications/aitm/agent` or read
 // as the `agent.activity` snapshot, goes through one intake that normalizes the server's wire shape
-// to the model the log renders, drops this UI's own successful background reads (the bridge echoes
-// every call back to us), numbers what it keeps, and keeps the newest ACTIVITY_CAP. The bridge role
-// is `operator`, so the UI's own origin is `operator`. The push path for flows is `app.push.test.ts`.
+// to the model the log renders, numbers what it keeps, and keeps the newest ACTIVITY_CAP. Only the
+// PUSH path drops this UI's own successful background reads (the bridge echoes every call back to
+// us); the snapshot is the primary server's ring, which never holds this UI's calls, so it is never
+// filtered. The bridge role is `operator`, so the UI's own origin is `operator`. The push path for
+// flows is `app.push.test.ts`.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createAppStore } from './app';
-import { bridgeBus, type TestBus } from './bridgeBus.testkit';
+import { AGENT_LINE, bridgeBus, tick, type TestBus } from './bridgeBus.testkit';
 
-const T0 = 1730000000000; // 2024-10-27T03:33:20.000Z
-/** An audit line as the server sends it: epoch ms, `client_label`, `args` as redacted JSON text. */
-const AGENT_LINE = { at: T0, origin: 'mcp', client_label: 'claude-code', command: 'flow.replay', args: '{"id":"f_1"}', result: 'ok' };
+const T0 = AGENT_LINE.at; // 1730000000000 = 2024-10-27T03:33:20.000Z
 /** This UI's own poll, echoed back: unlabelled (the bridge labels nothing), our origin, a background read that succeeded. */
 const ownPoll = (i: number) => ({ at: T0 + i, origin: 'operator', client_label: null, command: 'flow.list', args: '{}', result: 'ok' });
 /** An operator action: same connection, but what the panel exists to show. */
 const ownKill = (i: number) => ({ at: T0 + i, origin: 'operator', client_label: null, command: 'flow.kill', args: `{"id":"f_${i}"}`, result: 'ok' });
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
-const tick = (ms: number) => vi.advanceTimersByTimeAsync(ms);
 
 let open: TestBus[] = [];
 const start = (bus: TestBus = bridgeBus()) => {
@@ -36,7 +35,7 @@ afterEach(() => {
 describe('app store — activity intake', () => {
   it('a pushed audit line is normalized', async () => {
     const { bus, app } = start();
-    await tick(200); // bootstrap: the snapshot (empty here) has replaced the log
+    await tick(200); // bootstrap: the `agent.activity` snapshot is empty here and keeps nothing, so the log is untouched
 
     bus.emit('notifications/aitm/agent', AGENT_LINE);
 
@@ -83,19 +82,22 @@ describe('app store — activity intake', () => {
     expect(app.proxy.activity).toHaveLength(0);
   });
 
-  it('the snapshot is normalized, filtered and capped', async () => {
+  // The snapshot is the primary server's ring: it holds other transports' calls and never this UI's, so a
+  // line in it that LOOKS like our poll is some other client's and is shown (spec D7, third amendment).
+  it('the snapshot is normalized and capped but not filtered', async () => {
     const { bus, app } = start();
     await tick(200);
 
-    // 700 wire lines: every seventh is this UI's own `flow.list` (100 of them), the other 600 are
-    // kept; the kept ones are numbered k_0 .. k_599 in ring order.
+    // 700 wire lines: every seventh looks like this UI's own `flow.list` (100 of them), the other 600
+    // are kills numbered k_0 .. k_599 in ring order. All 700 are kept; the newest 500 are wire
+    // indices 200 .. 699, which hold 72 of the polls.
     const wire: unknown[] = [];
-    let kept = 0;
+    let kills = 0;
     for (let i = 0; i < 700; i++) {
       if (i % 7 === 6) wire.push(ownPoll(i));
-      else wire.push({ at: T0 + i, origin: 'operator', client_label: null, command: 'flow.kill', args: `{"id":"k_${kept++}"}`, result: 'ok' });
+      else wire.push({ at: T0 + i, origin: 'operator', client_label: null, command: 'flow.kill', args: `{"id":"k_${kills++}"}`, result: 'ok' });
     }
-    expect(kept).toBe(600);
+    expect(kills).toBe(600);
     bus.ctl.activityWire = wire;
 
     const refreshed = app.refreshSide();
@@ -105,10 +107,9 @@ describe('app store — activity intake', () => {
     const list = app.proxy.activity;
     expect(list).toHaveLength(500);
     for (const e of list) expect(e.at).toMatch(ISO);
-    expect(list.some((e) => e.command === 'flow.list')).toBe(false);
-    expect((list[0]!.args as { id: string }).id).toBe('k_100');
-    expect((list[499]!.args as { id: string }).id).toBe('k_599');
-    expect(list[0]!.at).toBe(new Date(T0 + 116).toISOString()); // k_100 is wire index 116 (100 + 16 polls before it)
+    expect(list.filter((e) => e.command === 'flow.list')).toHaveLength(72);
+    expect(list[0]).toMatchObject({ seq: 201, command: 'flow.kill', args: { id: 'k_172' }, at: new Date(T0 + 200).toISOString() }); // wire index 200: 28 polls before it
+    expect(list[499]).toMatchObject({ seq: 700, command: 'flow.list', origin: 'operator', clientLabel: null, args: {}, at: new Date(T0 + 699).toISOString() }); // wire index 699 is a poll
   });
 
   // Over `aitm web` the ring `agent.activity` reads is empty (the web server's own ring is not the one
@@ -129,12 +130,18 @@ describe('app store — activity intake', () => {
     expect(app.proxy.activity[0]).toEqual({ seq: 1, at: '2024-10-27T03:33:20.000Z', origin: 'mcp', clientLabel: 'claude-code', command: 'flow.replay', args: { id: 'f_1' }, result: 'ok' });
   });
 
-  it('a snapshot of only noise does not wipe the pushed log', async () => {
+  it('a snapshot of only non-audit lines does not wipe the pushed log', async () => {
     const { bus, app } = start();
     await tick(200);
     bus.emit('notifications/aitm/agent', AGENT_LINE);
     expect(app.proxy.activity).toHaveLength(1);
-    bus.ctl.activityWire = [0, 1, 2, 3, 4].map(ownPoll);
+    // Every line normalizes to nothing: approval requests, a line with no command, one with no origin.
+    bus.ctl.activityWire = [
+      { event: 'approval_requested', command: 'ca.install', args_summary: '{}', prompt: 'x', request_id: 'apr_1' },
+      { event: 'approval_requested', command: 'flow.kill', args_summary: '{"id":"f_1"}', prompt: 'y', request_id: 'apr_2' },
+      { at: T0, origin: 'mcp', result: 'ok' },
+      { at: T0, command: 'flow.kill', result: 'ok' },
+    ];
 
     const refreshed = app.refreshSide();
     await tick(50);

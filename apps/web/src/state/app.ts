@@ -8,10 +8,10 @@
 
 import { batch, createEffect, createMemo, createRoot, createSignal, on, untrack, type Accessor } from 'solid-js';
 import { createStore, produce, reconcile, type SetStoreFunction } from 'solid-js/store';
-import type { BusClient, AgentNotification, FlowNotification, StateNotification, ToolDef } from '~/bus/types';
+import type { BusClient, AgentNotification, FlowEventKind, FlowNotification, StateNotification, ToolDef } from '~/bus/types';
 import { toAgentEntry, toDetail, toSummary } from '~/bus/normalize';
+import { isUiPollNoise, ownOriginOf } from '~/bus/noise';
 import type { PocRun } from '~/bus/mock';
-import { isUiPollNoise, ownOriginOf } from '~/panels/agent/activity';
 import {
   contentFamily,
   type ContentFamily,
@@ -154,13 +154,25 @@ export function createAppStore(bus: BusClient) {
     // ---- flows ------------------------------------------------------------
     const entries: FlowEntry[] = [];
     const byId = new Map<FlowId, FlowEntry>();
+    // Push / poll state, declared together and ahead of every reader: `clearFlows` (just below) drops
+    // the pending set and its timer long before the coalescer and the loop are defined.
     /** Ids a flow push named that the coalescer has not fetched yet, in first-notification (capture) order. */
     const pushPending = new Set<FlowId>();
+    /** The armed coalescing timer, if any (`armPush`). */
+    let pushTimer: ReturnType<typeof setTimeout> | null = null;
+    /** A flush is applying; one runs at a time. */
+    let flushing = false;
+    /** A queued event was `intercepted|released|killed`: the next flush recomputes `pausedIds` after it applies. */
+    let pausedIdsStale = false;
     /** Per id, the ticket of the newest row fetch issued for it; an older reply is dropped. */
     const fetchTicket = new Map<FlowId, number>();
     let fetchSeq = 0;
     /** Bumped by `clearFlows`: a fetch issued under an older epoch applies nothing (no ghost row after `flow.clear`). */
     let clearEpoch = 0;
+    /** The poll in progress, if any: `pollOnce` joins it rather than overlapping it. */
+    let pollRunning: Promise<void> | null = null;
+    /** A resync was requested while a poll was running: exactly one more runs when it finishes. */
+    let pollTrailing = false;
     const [version, setVersion] = createSignal(0);
     let bumpScheduled = false;
     const bump = () => {
@@ -276,6 +288,16 @@ export function createAppStore(bus: BusClient) {
       setProxy('pausedIds', ids);
     }
 
+    /** Events after which a flow's cached detail is stale. */
+    const changesDetail = (e: FlowEventKind) => e === 'response' || e === 'mutated' || e === 'meta' || e === 'released' || e === 'killed';
+    /** Events after which `pausedIds` has to be recomputed from the rows. */
+    const changesPause = (e: FlowEventKind) => e === 'intercepted' || e === 'released' || e === 'killed';
+    /** Detail is stale once anything changed: drop the cache, and reload it now if the inspector shows this flow. */
+    function invalidateDetail(id: FlowId) {
+      if (details[id]) setDetails(produce((d) => delete d[id]));
+      if (untrack(selectedId) === id) void loadDetail(id, true);
+    }
+
     function onFlowEvent(n: FlowNotification) {
       if (bus.address !== 'fixtures') {
         onFlowTrigger(n);
@@ -290,12 +312,8 @@ export function createAppStore(bus: BusClient) {
       if (!n.summary) return;
       const s = toSummary(n.summary, entries.length + 1);
       upsert(s);
-      if (n.event === 'response' || n.event === 'mutated' || n.event === 'meta' || n.event === 'released' || n.event === 'killed') {
-        // Detail is stale once anything changed; the inspector refetches on demand.
-        if (details[s.id]) setDetails(produce((d) => delete d[s.id]));
-        if (untrack(selectedId) === s.id) void loadDetail(s.id, true);
-      }
-      if (n.event === 'intercepted' || n.event === 'released' || n.event === 'killed') recomputePaused();
+      if (changesDetail(n.event)) invalidateDetail(s.id);
+      if (changesPause(n.event)) recomputePaused();
     }
 
     /**
@@ -313,12 +331,8 @@ export function createAppStore(bus: BusClient) {
       // counters are a non-goal, so a message on a known flow changes nothing. On an unknown id it
       // is the first we hear of the flow.
       if (n.event === 'ws_message' && byId.has(n.id)) return;
-      if (n.event === 'response' || n.event === 'mutated' || n.event === 'meta' || n.event === 'released' || n.event === 'killed') {
-        // Detail is stale once anything changed; the inspector refetches on demand.
-        if (details[n.id]) setDetails(produce((d) => delete d[n.id]));
-        if (untrack(selectedId) === n.id) void loadDetail(n.id, true);
-      }
-      if (n.event === 'intercepted' || n.event === 'released' || n.event === 'killed') pushPauseDirty = true;
+      if (changesDetail(n.event)) invalidateDetail(n.id);
+      if (changesPause(n.event)) pausedIdsStale = true;
       queuePush(n.id);
     }
 
@@ -332,8 +346,10 @@ export function createAppStore(bus: BusClient) {
       return typeof s?.listening === 'boolean' && typeof s?.intercept_armed === 'boolean';
     };
 
-    function onState(s: StateNotification) {
-      if (!isCompleteState(s)) return;
+    /** Applies a state payload; false when it was not a complete state, in which case nothing was written. */
+    function onState(p: unknown): boolean {
+      if (!isCompleteState(p)) return false;
+      const s = p;
       batch(() => {
         setProxy({
           listening: s.listening,
@@ -346,26 +362,31 @@ export function createAppStore(bus: BusClient) {
           memoryBytes: s.memory_bytes ?? null,
         });
       });
+      return true;
     }
 
     /** Newest audit lines the log keeps. Counted after the noise filter, so it measures what is shown. */
     const ACTIVITY_CAP = 500;
     /**
-     * The one intake behind the live push and the `agent.activity` snapshot (push spec D6, D7). Each
-     * line is normalized from the server's wire shape (`toAgentEntry`; an `approval_requested` line is
-     * not an audit entry and is skipped), this UI's own successful background reads are dropped (the
-     * server echoes every call back to us; own-ness is inferred from this connection's role because
-     * the bridge labels nothing), what is kept is numbered, and the newest ACTIVITY_CAP stay. A batch
-     * that keeps nothing changes nothing, in either mode: over `aitm web` the ring `agent.activity`
-     * reads is empty, so the log is fed by push alone there and a snapshot must not replace it with
-     * nothing on every side refresh (scope.add, poc.run, the catalogue heal).
+     * The one intake behind the live push (`append`) and the `agent.activity` snapshot (`replace`)
+     * (push spec D6, D7). Each line is normalized from the server's wire shape (`toAgentEntry`; an
+     * `approval_requested` line is not an audit entry and is skipped), what is kept is numbered, and
+     * the newest ACTIVITY_CAP stay. Only the PUSH path drops this UI's own successful background
+     * reads: the web server echoes every call made over `/bus` back to us, and own-ness is inferred
+     * from this connection's role because the bridge labels nothing. The snapshot is the PRIMARY
+     * server's ring, which never holds this UI's calls (`crates/aitm/src/main.rs` attaches it to the
+     * primary alone), so filtering it could only hide another client's reads; it is shown whole. A
+     * batch that keeps nothing changes nothing, in either mode: over `aitm web` that ring is empty, so
+     * the log is fed by push alone there and a snapshot must not replace it with nothing on every side
+     * refresh (scope.add, poc.run, the catalogue heal).
      */
     function intakeActivity(raw: readonly unknown[], mode: 'append' | 'replace') {
       const own = { origin: ownOriginOf(untrack(bus.role)) };
       const kept: ActivityEntry[] = [];
       for (const item of raw) {
         const e = toAgentEntry(item);
-        if (!e || isUiPollNoise(e, own)) continue;
+        if (!e) continue;
+        if (mode === 'append' && isUiPollNoise(e, own)) continue;
         kept.push({ ...e, seq: ++activitySeq });
       }
       if (!kept.length) return;
@@ -388,11 +409,19 @@ export function createAppStore(bus: BusClient) {
     let lastFlowPushAt = Number.NEGATIVE_INFINITY;
     let lastStatePushAt = Number.NEGATIVE_INFINITY;
 
+    /** A flow event is an object with a string `event` and a string `id`; anything else is not a flow push at all. */
+    const isFlowNotification = (p: unknown): p is FlowNotification => {
+      const n = p as Partial<FlowNotification> | null | undefined;
+      return typeof n?.event === 'string' && typeof n?.id === 'string';
+    };
+
     bus.onNotification((method, params) => {
       switch (method) {
         case 'notifications/aitm/flow':
+          // Validated before the clock moves: a malformed line proves nothing about the stream.
+          if (!isFlowNotification(params)) break;
           lastFlowPushAt = Date.now();
-          onFlowEvent(params as FlowNotification);
+          onFlowEvent(params);
           break;
         case 'notifications/aitm/state':
           if ((params as { lagged?: unknown } | null | undefined)?.lagged === true) {
@@ -404,9 +433,8 @@ export function createAppStore(bus: BusClient) {
             requestPollNow();
             break;
           }
-          if (!isCompleteState(params)) break;
-          lastStatePushAt = Date.now();
-          onState(params);
+          // Only a complete payload is a state push: the clock moves only when one was applied.
+          if (onState(params)) lastStatePushAt = Date.now();
           break;
         case 'notifications/aitm/agent':
           onAgent(params);
@@ -462,6 +490,8 @@ export function createAppStore(bus: BusClient) {
       const at = failedAt.get(id);
       return at !== undefined && now - at >= 0 && now - at < FAILED_RETRY_MS;
     }
+    /** A `flow.detail` / `flow.get` reply is the row for `id` only if it says so itself. */
+    const isRowFor = (raw: unknown, id: FlowId): boolean => !!raw && typeof raw === 'object' && (raw as { id?: unknown }).id === id;
     /**
      * The one fetcher behind the poll and the push flush. `flow.detail {body: none}` is a summary
      * with headers, sizes, times and the connection — everything a row shows — at the cost of one
@@ -473,9 +503,12 @@ export function createAppStore(bus: BusClient) {
      */
     async function fetchRows(ids: readonly FlowId[], seqOf: (id: FlowId) => number, wave: number): Promise<void> {
       const rich = proxy.tools.some((t) => t.name === 'flow.detail');
+      // One epoch for the whole call: a clear during any wave ends the call, or the later waves would
+      // run under the new epoch and put back rows the operator just cleared.
+      const epoch = clearEpoch;
       for (let i = 0; i < ids.length; i += wave) {
+        if (epoch !== clearEpoch) return;
         const slice = ids.slice(i, i + wave);
-        const epoch = clearEpoch;
         const tickets = slice.map((id) => {
           const t = ++fetchSeq;
           fetchTicket.set(id, t);
@@ -492,7 +525,9 @@ export function createAppStore(bus: BusClient) {
             const newest = fetchTicket.get(id) === tickets[j];
             if (newest) fetchTicket.delete(id);
             if (!newest || epoch !== clearEpoch) return;
-            if (raw) {
+            // Keyed by the id that was asked for: a reply naming another flow, or none, would make a
+            // ghost row (`''`) or overwrite that other row. It is a failed read like any other.
+            if (isRowFor(raw, id)) {
               failedAt.delete(id);
               upsert(toSummary(raw, seqOf(id)));
             } else failedAt.set(id, failedNow);
@@ -500,10 +535,6 @@ export function createAppStore(bus: BusClient) {
         });
       }
     }
-    /** The poll in progress, if any: `pollOnce` joins it rather than overlapping it. */
-    let pollRunning: Promise<void> | null = null;
-    /** A resync was requested while a poll was running: exactly one more runs when it finishes. */
-    let pollTrailing = false;
     /** Single-flight: the running poll's promise when one is running, else a new one. */
     function pollOnce(): Promise<void> {
       if (pollRunning) return pollRunning;
@@ -518,6 +549,9 @@ export function createAppStore(bus: BusClient) {
     }
     /** Resync now, not on the next tick: start a poll, or fold into one trailing poll if one is running. */
     function requestPollNow(): void {
+      // Only an open bus is called (the marker can land during a handshake): a poll parked on `ready`
+      // would hold the single-flight slot and stall the loop's own polls behind it.
+      if (bus.state() !== 'open') return;
       if (pollRunning) pollTrailing = true;
       else void pollOnce();
     }
@@ -551,11 +585,7 @@ export function createAppStore(bus: BusClient) {
         // the bus connection is up. (Individual unreadable flows are handled by `failedAt`.)
       }
     }
-    // ---- the push coalescer ------------------------------------------------------------------
-    let pushTimer: ReturnType<typeof setTimeout> | null = null;
-    let flushing = false;
-    /** A queued event was `intercepted|released|killed`: the next flush recomputes `pausedIds` after it applies. */
-    let pushPauseDirty = false;
+    // ---- the push coalescer (its state is declared with the flows, above) ----------------------
     function armPush() {
       if (pushTimer !== null) return;
       pushTimer = setTimeout(() => {
@@ -566,7 +596,7 @@ export function createAppStore(bus: BusClient) {
     /** Forget every queued id and disarm the timer: the list was cleared, or the connection is new. */
     function dropPending() {
       pushPending.clear();
-      pushPauseDirty = false;
+      pausedIdsStale = false;
       if (pushTimer !== null) {
         clearTimeout(pushTimer);
         pushTimer = null;
@@ -587,8 +617,9 @@ export function createAppStore(bus: BusClient) {
     async function flushPush(): Promise<void> {
       if (flushing) return;
       if (bus.state() !== 'open') {
-        // Nothing is sent into a bus that is not open; the resync on reconnect takes a fresh snapshot.
-        pushPending.clear();
+        // Nothing is sent into a bus that is not open: the queue and its pause mark are dropped, and
+        // the resync on reconnect takes a fresh snapshot.
+        dropPending();
         return;
       }
       if (!toolsLoaded) {
@@ -604,12 +635,17 @@ export function createAppStore(bus: BusClient) {
         // and it is refetched after this flush. Ids paused for a recent failure wait for the poll.
         const ids = [...pushPending].filter((id) => !isHeld(id, now));
         pushPending.clear();
-        const pauseDirty = pushPauseDirty;
-        pushPauseDirty = false;
+        const stale = pausedIdsStale;
+        pausedIdsStale = false;
         // A new id takes the next position at apply time (inside the batch, so consecutive new ids
         // get consecutive numbers whatever order the replies came back in); a known id keeps its seq.
         if (ids.length) await fetchRows(ids, (id) => byId.get(id)?.raw.seq ?? entries.length + 1, PUSH_FETCH_WAVE);
-        if (pauseDirty) recomputePaused();
+        if (stale) recomputePaused();
+      } catch {
+        // Applying a wave threw (the fetch itself never rejects). The ids taken above are not
+        // re-queued: the poll re-reads what is missing, at the heartbeat at the latest, as it does
+        // for any failed read. This runs from a timer, so the error must not escape as an unhandled
+        // rejection, and `flushing` must be released below.
       } finally {
         flushing = false;
         if (pushPending.size) armPush();
@@ -772,8 +808,8 @@ export function createAppStore(bus: BusClient) {
         jobs.push(
           bus
             .call<unknown>('agent.activity')
-            // No `limit`: the ring is the snapshot, and the intake filters and caps it. Over `aitm web`
-            // it is empty today (the web server's own ring is not the one agent.activity reads).
+            // No `limit`: the ring is the snapshot, and the intake caps it (never filters it). Over
+            // `aitm web` it is empty today (the web server's own ring is not the one agent.activity reads).
             .then((list) => {
               if (Array.isArray(list)) intakeActivity(list, 'replace');
             })

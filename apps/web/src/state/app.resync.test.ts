@@ -8,22 +8,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { StateNotification } from '~/bus/types';
 import { createAppStore } from './app';
-import { bridgeBus, captureSilently, type TestBus } from './bridgeBus.testkit';
+import { AGENT_LINE, FLOW_PING, bridgeBus, captureSilently, gate, tick, type TestBus } from './bridgeBus.testkit';
 
 const STATE: StateNotification = { listening: true, intercept_armed: false, paused: 0, agent: 'all', memory_bytes: 123, throughput: { up: 1, down: 2 } };
 /** What the server sends on `notifications/aitm/state` when its per-connection lane overflowed. */
 const LAGGED = { lagged: true };
-/** A flow notification that changes nothing (no summary) but proves the flow stream is alive. */
-const FLOW_PING = { event: 'meta', id: 'f_none' };
-/** An audit line as the server sends it: epoch ms, `client_label`, `args` as a JSON string. */
-const AGENT_LINE = { at: 1730000000000, origin: 'mcp', client_label: 'claude-code', command: 'flow.replay', args: '{"id":"f_1"}', result: 'ok' };
-const tick = (ms: number) => vi.advanceTimersByTimeAsync(ms);
-/** A promise the test releases by hand, for `ctl.holdFlowList`. */
-function gate() {
-  let release!: () => void;
-  const promise = new Promise<void>((r) => (release = r));
-  return { promise, release };
-}
 
 let open: TestBus[] = [];
 const start = (bus: TestBus = bridgeBus()) => {
@@ -115,6 +104,24 @@ describe('app store — the lagged marker', () => {
     await tick(100);
     expect(bus.count('flow.list')).toBe(lists + 2);
   });
+
+  it('lagged while the bus is not open starts no poll', async () => {
+    const { bus, app } = start();
+    await tick(200);
+    captureSilently(bus, 1);
+    const lists = bus.count('flow.list');
+
+    bus.ctl.setState('reconnecting');
+    bus.emit('notifications/aitm/state', LAGGED); // the marker can land during a handshake, before open
+    await tick(1000);
+    expect(bus.count('flow.list')).toBe(lists); // nothing is sent into a bus that is not open
+
+    bus.ctl.setState('open');
+    await tick(700);
+    // The loop is not stalled behind a poll parked on the handshake: the reopen takes its snapshot.
+    expect(bus.count('flow.list')).toBeGreaterThan(lists);
+    expect(app.entries.map((e) => e.id)).toEqual(['f_1']);
+  });
 });
 
 describe('app store — the lagged marker and the loop share one poll', () => {
@@ -131,8 +138,8 @@ describe('app store — the lagged marker and the loop share one poll', () => {
 
     g.release();
     bus.ctl.holdFlowList = null;
-    await tick(100);
-    expect(bus.count('flow.list')).toBeGreaterThanOrEqual(lists + 1); // and the loop carries on afterwards
+    await tick(700); // the held poll finishes and one more loop tick runs (push is distrusted, so it polls)
+    expect(bus.count('flow.list')).toBeGreaterThan(lists + 1); // and the loop carries on afterwards
   });
 });
 
@@ -175,6 +182,32 @@ describe('app store — state payloads and freshness', () => {
     // Neither stream says anything about flows: the list keeps its 500 ms cadence.
     expect(bus.count('flow.list') - lists).toBeGreaterThanOrEqual(12);
     expect(app.proxy.polling).toBe(true);
+  });
+
+  it('a malformed flow notification is ignored and does not make the flow stream fresh', async () => {
+    const { bus, app } = start();
+    await tick(200);
+    const lists = bus.count('flow.list');
+
+    // Nothing below is a flow event (an object with a string `event` and a string `id`): none may
+    // throw out of the handler, queue a fetch, or count as a flow push.
+    for (let s = 0; s < 8; s++) {
+      for (const junk of [null, undefined, {}, { event: 1, id: 2 }, { event: 'created' }, { id: 'f_1' }, 'created', [], 42]) {
+        expect(() => bus.emit('notifications/aitm/flow', junk)).not.toThrow();
+      }
+      await tick(1000);
+    }
+    expect(bus.callArgs('flow.detail')).toEqual([]);
+    expect(bus.count('flow.list') - lists).toBeGreaterThanOrEqual(12); // the 500 ms cadence ran throughout
+    expect(app.proxy.polling).toBe(true);
+
+    // A valid push afterwards is still a push: it is fetched and makes the stream fresh.
+    captureSilently(bus, 1);
+    bus.emit('notifications/aitm/flow', { event: 'created', id: 'f_1' });
+    await tick(600); // the coalescing window, then one loop tick (which is what re-reads the `polling` flag)
+    expect(bus.callArgs('flow.detail')).toContainEqual({ id: 'f_1', body: 'none' });
+    expect(app.byId.has('f_1')).toBe(true);
+    expect(app.proxy.polling).toBe(false);
   });
 });
 

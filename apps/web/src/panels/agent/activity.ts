@@ -1,8 +1,7 @@
-// Activity-log logic (foundation §2.7 "Agent toggle", §4.8): origin labels, the compact args
-// summary, the All / Agent / Human / Errors filters, and the rule that drops the UI's own polling
-// from the log. Pure, so the table stays a thin view.
+// Activity-log view logic (foundation §2.7 "Agent toggle", §4.8): origin labels, the compact args
+// summary, the All / Agent / Human / Errors filters. Pure, so the table stays a thin view. The rule
+// that drops the UI's own polling before a line reaches the log is `bus/noise.ts`.
 
-import { CLIENT_INFO, type AgentNotification, type BusRole } from '~/bus/types';
 import type { ActivityEntry, AgentPolicy } from '~/state/app';
 
 export type ActivityKind = 'all' | 'agent' | 'human' | 'errors';
@@ -94,50 +93,3 @@ export const atMs = (e: Pick<ActivityEntry, 'at'>): number | null => {
   const t = Date.parse(e.at);
   return Number.isFinite(t) ? t : null;
 };
-
-/**
- * The reads the UI issues on timers or in bulk refreshes (push spec D7). Every call is audited and
- * echoed back to us, so a successful one of these from this connection is the UI watching itself.
- */
-export const UI_BACKGROUND_READS: ReadonlySet<string> = new Set([
-  'flow.list',
-  'flow.get',
-  'flow.detail',
-  'proxy.status',
-  'agent.status',
-  'agent.activity',
-  'scope.list',
-  'poc.list',
-  'l4.flow.list',
-  'l4.flow.get',
-  'l4.scope.list',
-  'l4.capture.status',
-  'l4.agent.status',
-  'l4.intercept.status',
-  'l4.intercept.list',
-  'browser.tabs',
-  'browser.screenshot',
-]);
-
-/** The audit `origin` the server records for calls made under this connection's role; unknown matches nothing. */
-export function ownOriginOf(role: BusRole | null): 'operator' | 'mcp' | null {
-  if (role === 'operator') return 'operator';
-  if (role === 'agent') return 'mcp';
-  return null;
-}
-
-/**
- * The flood rule (push spec D7): a line is dropped iff it succeeded, names a background read,
- * and is ours — labelled with our `clientInfo.name` (what a labelled bridge would send), or
- * unlabelled from our own origin (the bridge labels nothing today, so own-ness is inferred).
- * Everything else stays: every action, every error, every labelled client, other frontends' reads.
- */
-export function isUiPollNoise(
-  e: Pick<AgentNotification, 'origin' | 'command' | 'result' | 'clientLabel'>,
-  own: { origin: AgentNotification['origin'] | null },
-): boolean {
-  if (e.result !== 'ok') return false;
-  if (!UI_BACKGROUND_READS.has(e.command)) return false;
-  if (e.clientLabel === CLIENT_INFO.name) return true;
-  return e.clientLabel == null && own.origin !== null && e.origin === own.origin;
-}
