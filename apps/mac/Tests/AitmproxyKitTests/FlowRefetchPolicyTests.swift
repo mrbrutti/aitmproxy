@@ -19,6 +19,10 @@ import Testing
             reportsBodySizes: reportsSizes)
     }
 
+    @Test func defaultBodySizePollLimitIsAMinuteAt500ms() {
+        #expect(FlowRefetchPolicy().bodySizePollLimit == 120)
+    }
+
     @Test func neverSeenIsFetched() {
         var policy = FlowRefetchPolicy()
         #expect(policy.shouldFetch(id, cached: nil) == true)

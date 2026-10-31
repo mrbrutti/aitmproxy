@@ -373,9 +373,11 @@ struct MatchContext {
         case .status: return row.status.map(String.init)
         case .client: return row.client?.name
         // `Int64(exactly:)` rather than `Int64(_:)`: a value past Int64 (or non-finite)
-        // must render, not trap.
+        // must render, not trap. Truncation toward zero keeps the text `Int64(_:)` gave.
         case .duration, .size:
-            return number(for: field).map { Int64(exactly: $0.rounded()).map(String.init) ?? String(format: "%.0f", $0) }
+            return number(for: field).map {
+                Int64(exactly: $0.rounded(.towardZero)).map(String.init) ?? String(format: "%.0f", $0)
+            }
         case .mark: return row.mark?.rawValue
         case .comment: return row.comment
         case .origin:
