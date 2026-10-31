@@ -163,6 +163,80 @@ import Testing
         #expect(CaptureCapability.approvedAttached.applying(.tunnelConnected) == .capturing)
     }
 
+    // MARK: exhaustive sweeps (whole-branch tester, TG-AC6 + TG-AC7)
+
+    /// Every state and every event, so the sweeps below also cover the transitions nobody
+    /// thought to write an example for. `coversEveryCase` is the compile-time tripwire: a new
+    /// case makes its switches non-exhaustive, which forces these two lists to be extended.
+    private static let everyState: [CaptureCapability] = [
+        .extensionNotInstalled, .pendingApproval, .approvedAttached, .capturing,
+        .degraded("boom"), .inactive,
+    ]
+    private static let everyEvent: [CaptureCapabilityEvent] = [
+        .needsUserApproval, .activated, .willCompleteAfterReboot, .failed("boom"),
+        .tunnelConnected, .tunnelDisconnected, .uninstalled, .disabled,
+    ]
+    private static func coversEveryCase(_ state: CaptureCapability, _ event: CaptureCapabilityEvent) {
+        switch state {
+        case .extensionNotInstalled, .pendingApproval, .approvedAttached, .capturing, .degraded, .inactive: break
+        }
+        switch event {
+        case .needsUserApproval, .activated, .willCompleteAfterReboot, .failed, .tunnelConnected,
+             .tunnelDisconnected, .uninstalled, .disabled: break
+        }
+    }
+
+    @Test func capturingIsReachedOnlyByAConnectedTunnelOnAnApprovedExtension() {
+        // The UI must never read "Capturing" before the tunnel is up. Over every state and
+        // event, `.capturing` results only from `.tunnelConnected` applied to `.approvedAttached`,
+        // or from that same event repeated while already capturing.
+        for state in Self.everyState {
+            for event in Self.everyEvent where state.applying(event) == .capturing {
+                #expect(
+                    event == .tunnelConnected && (state == .approvedAttached || state == .capturing),
+                    "\(state) + \(event) reached .capturing")
+            }
+        }
+        // The sanctioned lift does happen, so the sweep above is not vacuous.
+        #expect(CaptureCapability.approvedAttached.applying(.tunnelConnected) == .capturing)
+    }
+
+    @Test func switchingOffIsAuthoritativeAndNeverLeavesCaptureOn() {
+        // From every state, the operator's OFF ends with capture off, an uninstall still on
+        // offer, and a repeat changes nothing. `.extensionNotInstalled → .inactive` is
+        // deliberate: ExtensionController.detectInactiveExtension() relies on it to report an
+        // extension approved on an earlier run and merely switched off.
+        for state in Self.everyState {
+            let off = state.applying(.disabled)
+            #expect(off == .inactive, "\(state) + .disabled")
+            #expect(off.isCaptureOn == false, "\(state) + .disabled left the indicator on")
+            #expect(off.canUninstall == true)
+            #expect(off.isInstalledOrInstalling == true)
+            #expect(off.applying(.disabled) == off)
+        }
+    }
+
+    @Test func aSwitchedOffExtensionMovesOnlyOnActivationOrRemovalEvents() {
+        // A late tunnel report after an OFF must not resurrect capture (anti-goal: turning OFF
+        // but still capturing). Only a fresh activation or a removal moves `.inactive`. The
+        // exhaustive switch makes a new event a compile error here until it is classified.
+        for event in Self.everyEvent {
+            let next = CaptureCapability.inactive.applying(event)
+            switch event {
+            case .tunnelConnected, .tunnelDisconnected, .disabled:
+                #expect(next == .inactive, "inactive + \(event)")
+            case .uninstalled:
+                #expect(next == .extensionNotInstalled)
+            case .needsUserApproval:
+                #expect(next == .pendingApproval)
+            case .activated:
+                #expect(next == .approvedAttached)
+            case .willCompleteAfterReboot, .failed:
+                #expect(next.degradedReason != nil, "inactive + \(event)")
+            }
+        }
+    }
+
     // MARK: tunnel reconcile policy (Task 16, NE-AC14)
 
     @Test func aReplacedExtensionGetsASettleDelayAndAFreshInstallDoesNot() {

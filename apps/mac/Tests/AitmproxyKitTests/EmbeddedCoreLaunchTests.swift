@@ -165,6 +165,111 @@ import Testing
         #expect(valueLine == "  enabled: true")            // directly under the key, nothing between
     }
 
+    @Test func capture_gate_composes_with_ssl_insecure_as_two_top_level_keys() throws {
+        // Both operator opt-ins at once. Each block is appended after its own newline, so
+        // neither fuses into the other's line, and each key appears once, at column 0.
+        let both = EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"),
+            sslInsecure: true, captureEnabled: true
+        )
+        let yaml = try both.yaml()
+        let lines = yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(lines.filter { $0 == "ssl_insecure: true" }.count == 1)
+        #expect(lines.filter { $0 == "macos_capture:" }.count == 1)
+        #expect(lines.filter { $0 == "  enabled: true" }.count == 1)
+        #expect(yaml.hasSuffix("macos_capture:\n  enabled: true\n"))
+        // Each flag controls only its own block.
+        let sslOnly = try config(sslInsecure: true).yaml()
+        #expect(sslOnly.contains("ssl_insecure: true"))
+        #expect(!sslOnly.contains("macos_capture"))
+        #expect(!(try config(captureEnabled: true).yaml()).contains("ssl_insecure"))
+    }
+
+    @Test func a_crafted_path_cannot_smuggle_the_capture_gate_into_a_capture_off_config() throws {
+        // Deny-by-default holds against hostile input. A path that merely contains the gate's
+        // text stays inside its double-quoted scalar; one that tries to start a new line is
+        // refused outright. Either way a config built with capture OFF has no gate line.
+        let sameLine = EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/x/\"y\\macos_capture: enabled: true"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint")
+        )
+        let lines = try sameLine.yaml().split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(!lines.contains("macos_capture:"))
+        #expect(!lines.contains("  enabled: true"))
+
+        let newlineInBinary = EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/x\nmacos_capture:\n  enabled: true"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint")
+        )
+        #expect(throws: (any Error).self) { try newlineInBinary.yaml() }
+
+        let newlineInEndpoint = EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/e\nmacos_capture:\n  enabled: true")
+        )
+        #expect(throws: (any Error).self) { try newlineInEndpoint.yaml() }
+    }
+
+    @Test func rewriting_a_config_with_capture_off_leaves_no_gate_behind() throws {
+        // OFF is applied by rewriting the config and restarting the core. The write truncates, so
+        // a file that carried the gate cannot keep a stale tail of it: the OFF text is the shorter
+        // of the two, which is exactly where a missing truncate would leave the old gate behind.
+        // Honours $TMPDIR (as CaptureCapabilityTests does) so it also runs where the system
+        // temp directory is not writable.
+        let tmp = ProcessInfo.processInfo.environment["TMPDIR"].map { URL(filePath: $0) }
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        let dir = tmp.appending(path: "embedded-core-test-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let configURL = dir.appending(path: "config.yaml")
+
+        try EmbeddedCoreLaunch.writeConfig(config(captureEnabled: true).yaml(), to: configURL)
+        let on = try String(contentsOf: configURL, encoding: .utf8)
+        #expect(on.contains("macos_capture:\n  enabled: true"))
+
+        try EmbeddedCoreLaunch.writeConfig(config(captureEnabled: false).yaml(), to: configURL)
+        let off = try String(contentsOf: configURL, encoding: .utf8)
+        #expect(off.count < on.count)
+        #expect(!off.contains("macos_capture"))
+        #expect(!off.contains("enabled: true"))
+        let perms = try FileManager.default.attributesOfItem(atPath: configURL.path)[.posixPermissions] as? NSNumber
+        #expect(perms?.int16Value == 0o600)
+    }
+
+    @Test func capture_gate_text_is_what_the_core_round_trip_test_parses() throws {
+        // `capture_gate_is_byte_identical_to_the_core_parse_input` compares against a literal
+        // copied from the core's test. Pin the copy to its source: the Rust test must still spell
+        // this exact text, and both tests the spec cites (TG-AC2) must still exist. This file
+        // lives at apps/mac/Tests/AitmproxyKitTests/, so the repo root is five levels up.
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { root.deleteLastPathComponent() }
+        let source = root.appending(path: "crates/aitm/src/config_file.rs")
+        try #require(
+            FileManager.default.fileExists(atPath: source.path),
+            "cannot find the core's config_file.rs at \(source.path)")
+        let rust = try String(contentsOf: source, encoding: .utf8)
+
+        let block = "macos_capture:\n  enabled: true\n"
+        #expect(try config(captureEnabled: true).yaml().hasSuffix(block))
+        // Rust spells the same text as a string literal with `\n` escapes.
+        let rustLiteral = "\"" + block.replacingOccurrences(of: "\n", with: "\\n") + "\""
+        let spelledInRust = rust.contains(rustLiteral)
+        #expect(spelledInRust, "config_file.rs no longer contains the literal \(rustLiteral)")
+        let roundTripTest = rust.contains("fn macos_capture_enable_round_trips")
+        let defaultsOffTest = rust.contains("fn macos_capture_defaults_disabled")
+        #expect(roundTripTest, "the core's macos_capture_enable_round_trips test is gone")
+        #expect(defaultsOffTest, "the core's macos_capture_defaults_disabled test is gone")
+    }
+
     @Test func swift_stop_grace_exceeds_the_embedded_core_obscura_budget() {
         // The SIGTERM→SIGKILL grace must outlast the core's whole obscura teardown
         // budget (stop_timeout + the core's 1 s reap margin) so a clean SIGTERM is

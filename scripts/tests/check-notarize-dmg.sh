@@ -81,6 +81,10 @@ cs_body=$(awk '/^cs\(\)[[:space:]]*\{/ {f=1} f {print} f && /^\}/ {exit}' <<<"$c
 has_fixed "cs() runs codesign with its own arguments" "$cs_body" 'codesign "$@"'
 has_fixed "cs() aborts the script on failure" "$cs_body" 'exit 1'
 has_fixed "cs() hides only the benign 'replacing existing signature' line" "$cs_body" 'replacing existing signature'
+# The capture must be checked bare: `$(codesign "$@" 2>&1 || true)` would hand `if !` a success
+# whatever codesign did, and a failed restricted-entitlement sign would reach notarytool.
+has_fixed "cs() tests codesign's own exit status (nothing masks it inside the capture)" \
+    "$cs_body" 'if ! out=$(codesign "$@" 2>&1); then'
 equals "set -euo pipefail is in force" "$(count_lines '^set -euo pipefail$')" "1"
 present "runtime_opts = hardened runtime + secure timestamp" \
     "$(first_line '^runtime_opts=\(--options runtime --timestamp\)$')"
@@ -91,9 +95,13 @@ equals "no bare codesign --sign outside cs() (except the DMG)" "$bare_sign" ""
 # Nothing pipes codesign into something that would replace its exit status ...
 piped=$(grep -n -E 'codesign[^|]*\|([^|]|$)' <<<"$code")
 equals "codesign is never piped" "$piped" ""
-# ... or swallows it with `|| true` / `|| :`.
-swallowed=$(grep -n -E 'codesign.*\|\|[[:space:]]*(true|:)([[:space:];]|$)' <<<"$code")
+# ... or swallows it with `|| true` / `|| :` (also inside a larger expression: `... || true)`).
+swallowed=$(grep -n -E 'codesign.*\|\|[[:space:]]*(true|:)([^[:alnum:]_]|$)' <<<"$code")
 equals "codesign is never followed by || true" "$swallowed" ""
+# The helpers abort with `exit`, which only ends the script when they run in it: not piped, not
+# inside $(...), and not given an `|| true` that a refactor to `return` would turn into a pass.
+helper_masked=$(grep -n -E '^[[:space:]]*(cs|assert_contains)[[:space:]].*\|\|[[:space:]]*(true|:)([^[:alnum:]_]|$)|^[[:space:]]*(cs|assert_contains)[[:space:]][^|]*[^|]\|[^|]|\$\((cs|assert_contains)[[:space:]]' <<<"$code")
+equals "cs and assert_contains are never swallowed, piped or run in a subshell" "$helper_masked" ""
 # A captured codesign (for the verify greps) must check codesign's own status.
 unchecked=$(grep -n -E '\$\(codesign' <<<"$code" | grep -v -E '\|\||if !')
 equals "every captured codesign checks its exit status" "$unchecked" ""
@@ -200,6 +208,48 @@ verify_before_dmg_and_notary "app NE-provider assertion" "$l_as_app_ne"
 verify_before_dmg_and_notary "app system-extension.install assertion" "$l_as_app_inst"
 verify_before_dmg_and_notary "sysex NE-provider assertion" "$l_as_sysex_ne"
 before "SH-AC4 the verify guard follows the NE sign guard" "$l_guard" "$l_dv"
+
+# Ordering alone does not prove containment. Every NE sign and verify line must sit inside an
+# `if [ -n "$sysex_bundle" ]` block: a verify block that lost its guard fails every non-NE
+# build (SH-AC6), and an NE sign outside it would sign a bundle that is not there. The nearest
+# column-0 `if`/`fi` above the line must be the sysex-presence guard (nested `if`s are indented).
+inside_guard() { # <label> <line>
+    local opener
+    if [ -z "$2" ]; then fail "$1 sits inside the sysex-presence guard (line not found)"; return; fi
+    opener=$(awk -v n="$2" 'NR <= n && /^(if |fi$)/ { last = $0 } END { print last }' <<<"$code")
+    equals "$1 sits inside the sysex-presence guard" "$opener" 'if [ -n "$sysex_bundle" ]; then'
+}
+inside_guard "SH-AC1 nested-code sign" "$l_nested"
+inside_guard "SH-AC1 sysex bundle sign" "$l_sysex"
+inside_guard "SH-AC2 NE app sign" "$l_app_ne"
+inside_guard "SH-AC3 sysex codesign -dv" "$l_dv"
+inside_guard "SH-AC2 app entitlement dump" "$l_app_ents"
+inside_guard "SH-AC4 sysex entitlement dump" "$l_sysex_ents"
+inside_guard "SH-AC3 spctl pre-check" "$l_spctl"
+inside_guard "SH-AC3 Developer ID assertion" "$l_as_dev_id"
+inside_guard "SH-AC3 hardened-runtime assertion" "$l_as_runtime"
+inside_guard "SH-AC2 app NE-provider assertion" "$l_as_app_ne"
+inside_guard "SH-AC2 app system-extension.install assertion" "$l_as_app_inst"
+inside_guard "SH-AC4 sysex NE-provider assertion" "$l_as_sysex_ne"
+
+# --- the entitlement files the script signs with ------------------------------
+# A wrong path, or a file that no longer carries what the verify block demands, would only show
+# up on Matt's Mac after the sign, as a failed release. Fail it here instead (SH-AC2/SH-AC4).
+ent_paths=$(grep -o -E 'apps/mac/[A-Za-z/._-]*[.]entitlements' <<<"$code" | sort -u)
+equals "the script signs with exactly three entitlement files (app, extension, obscura)" \
+    "$(grep -c . <<<"$ent_paths")" "3"
+while IFS= read -r ent_path; do
+    [ -n "$ent_path" ] || continue
+    if [ -f "$repo_root/$ent_path" ]; then pass "entitlement file exists: $ent_path"; else fail "entitlement file missing: $ent_path"; fi
+done <<<"$ent_paths"
+app_ents_text=$(cat "$repo_root/apps/mac/Aitmproxy.entitlements" 2>/dev/null)
+sysex_ents_text=$(cat "$repo_root/apps/mac/Extension/Aitmproxy-Extension.entitlements" 2>/dev/null)
+has_fixed "SH-AC2 Aitmproxy.entitlements carries app-proxy-provider-systemextension" \
+    "$app_ents_text" 'app-proxy-provider-systemextension'
+has_fixed "SH-AC2 Aitmproxy.entitlements carries com.apple.developer.system-extension.install" \
+    "$app_ents_text" 'com.apple.developer.system-extension.install'
+has_fixed "SH-AC4 Aitmproxy-Extension.entitlements carries app-proxy-provider-systemextension" \
+    "$sysex_ents_text" 'app-proxy-provider-systemextension'
 
 # --- SH-AC7: the header documents the credentialed manual step ----------------
 header=$(sed -n '1,/^set -euo pipefail/p' "$script")
