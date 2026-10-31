@@ -20,7 +20,9 @@ import Testing
         #expect(rows.filter(posts.matches).map(\.seq) == [44, 50])
         let regex = BreakpointRule(url: #"/api/(cart|me)$"#, matching: .regex)
         #expect(rows.filter(regex.matches).map(\.seq) == [51, 53])
-        #expect(BreakpointRule.wildcardMatches(pattern: "https://?pi.*", text: "https://api.x"))
+        // `?` is literal (it starts a query), as in the core; it is not a one-character wildcard.
+        #expect(BreakpointRule.wildcardMatches(pattern: "https://?pi.*", text: "https://api.x") == false)
+        #expect(BreakpointRule.wildcardMatches(pattern: "*/search?q=*", text: "https://h/search?q=1"))
     }
 
     @Test func noticeAndWireForm() throws {

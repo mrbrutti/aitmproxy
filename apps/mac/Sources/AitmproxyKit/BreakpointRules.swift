@@ -41,29 +41,33 @@ public struct BreakpointRule: Identifiable, Hashable, Sendable, Codable {
         return nil
     }
 
-    /// Whether a flow matches this rule's URL and method.
+    /// Whether a flow matches this rule's URL and method. The URL pattern is
+    /// evaluated against the full URL and against the path with its query;
+    /// either may match, as `crates/aitm-rules` does for the core.
     public func matches(_ row: FlowRow) -> Bool {
         if !method.isEmpty, method.uppercased() != row.method.label { return false }
+        // A pattern anchored at the path's start (`/api/*`, `^/v1/`) can never
+        // match a subject that starts with a scheme, so the path is a subject too.
+        let subjects = [row.url, row.path + (row.query.map { "?" + $0 } ?? "")]
         switch matching {
         case .wildcard:
-            return Self.wildcardMatches(pattern: url, text: row.url)
+            return subjects.contains { Self.wildcardMatches(pattern: url, text: $0) }
         case .regex:
             guard let re = try? NSRegularExpression(pattern: url, options: [.caseInsensitive]) else { return false }
-            return re.firstMatch(in: row.url, range: NSRange(row.url.startIndex..., in: row.url)) != nil
+            return subjects.contains { re.firstMatch(in: $0, range: NSRange($0.startIndex..., in: $0)) != nil }
         }
     }
 
-    /// `*` any run, `?` one character; a pattern without `*` matches as a substring, as Proxyman does.
+    /// `*` any run; every other character is literal (`?` starts a query); a
+    /// pattern without `*` matches as a substring. Case-insensitive. Mirrors
+    /// `crates/aitm-rules` (the core is authoritative; `url-match-cases.json`
+    /// pins both).
     public static func wildcardMatches(pattern: String, text: String) -> Bool {
         let p = pattern.lowercased(), t = text.lowercased()
-        if !p.contains("*"), !p.contains("?") { return t.contains(p) }
+        if !p.contains("*") { return t.contains(p) }
         var escaped = ""
         for ch in p {
-            switch ch {
-            case "*": escaped += ".*"
-            case "?": escaped += "."
-            default: escaped += NSRegularExpression.escapedPattern(for: String(ch))
-            }
+            escaped += ch == "*" ? ".*" : NSRegularExpression.escapedPattern(for: String(ch))
         }
         guard let re = try? NSRegularExpression(pattern: "^" + escaped + "$") else { return false }
         return re.firstMatch(in: t, range: NSRange(t.startIndex..., in: t)) != nil
