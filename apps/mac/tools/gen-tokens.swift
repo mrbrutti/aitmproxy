@@ -119,6 +119,11 @@ func emitLeaf(_ key: String, _ type: String, _ node: [String: Any], _ depth: Int
             line("static func \(ident(key))(_ duration: Double) -> Animation {", depth)
             line("Animation.timingCurve(\(v[0]), \(v[1]), \(v[2]), \(v[3]), duration: duration)", depth + 1)
             line("}", depth)
+            // The same curve for Core Animation (a computed property: CAMediaTimingFunction is not
+            // Sendable, so a stored static would not be concurrency-safe).
+            line("static var \(ident(key))Timing: CAMediaTimingFunction {", depth)
+            line("CAMediaTimingFunction(controlPoints: \(v[0]), \(v[1]), \(v[2]), \(v[3]))", depth + 1)
+            line("}", depth)
         }
     case "string":
         doc()

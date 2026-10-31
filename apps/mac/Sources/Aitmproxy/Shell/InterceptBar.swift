@@ -7,7 +7,6 @@ import SwiftUI
 struct InterceptBar: View {
     @Environment(Session.self) private var session
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var pulse = false
 
     private var target: FlowRow? { session.interceptTarget }
 
@@ -43,14 +42,9 @@ struct InterceptBar: View {
 
     private var pausedBar: some View {
         HStack(spacing: Tok.Metric.padInner) {
-            Circle()
-                .fill(Tok.Intercept.onBase.color)
+            PulseDot(color: Tok.Intercept.onBase, reduceMotion: reduceMotion)
                 .frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
-                .opacity(pulse && !reduceMotion ? 0.45 : 1)
-                .onAppear {
-                    guard !reduceMotion else { return }
-                    withAnimation(.easeInOut(duration: Tok.Motion.interceptPulse / 2).repeatForever()) { pulse = true }
-                }
+                .accessibilityHidden(true)
             Text("\(session.paused.count) paused").fontWeight(.semibold)
             if coreFailed {
                 Text("· core failed — restart the core to resume")
@@ -220,6 +214,71 @@ struct GhostButton: View {
             .background(Color.black.opacity(0.12), in: RoundedRectangle(cornerRadius: Tok.Radius.control))
         }
         .buttonStyle(PressStyle())
+    }
+}
+
+/// The paused bar's 8 pt dot. Its pulse (opacity 1 → 0.45 and back over `motion.interceptPulse`,
+/// curve `motion.pulse`) is a Core Animation animation on the dot's own layer, so the render server
+/// breathes it and the main thread does nothing per frame: the SwiftUI `repeatForever` it replaces
+/// cost 17–23 % of a core for as long as any flow was paused. Reduce Motion removes the animation
+/// and holds opacity 1; when the setting turns off again the animation is added back. Both run from
+/// `updateNSView`, so a live toggle in System Settings is right in either direction (S-069).
+struct PulseDot: NSViewRepresentable {
+    var color: DynamicColor
+    var reduceMotion: Bool
+
+    func makeNSView(context: Context) -> DotView {
+        let view = DotView()
+        view.wantsLayer = true
+        view.layer?.cornerRadius = Tok.Size.statusDot / 2
+        return view
+    }
+
+    func updateNSView(_ view: DotView, context: Context) {
+        view.fill = color.nsColor
+        view.setPulsing(!reduceMotion)
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: DotView, context: Context) -> CGSize? {
+        CGSize(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
+    }
+
+    final class DotView: NSView {
+        static let pulseKey = "pulse"
+        var fill: NSColor = .clear { didSet { needsDisplay = true } }
+        private(set) var pulsing = false
+
+        override var wantsUpdateLayer: Bool { true }
+        override func updateLayer() { layer?.backgroundColor = fill.cgColor }
+        override func viewDidChangeEffectiveAppearance() {
+            super.viewDidChangeEffectiveAppearance()
+            needsDisplay = true
+        }
+
+        func setPulsing(_ on: Bool) {
+            pulsing = on
+            guard let layer else { return }
+            if on {
+                guard layer.animation(forKey: Self.pulseKey) == nil else { return }
+                let pulse = CABasicAnimation(keyPath: "opacity")
+                pulse.fromValue = 1.0
+                pulse.toValue = 0.45
+                pulse.duration = Tok.Motion.interceptPulse / 2
+                pulse.autoreverses = true
+                pulse.repeatCount = .infinity
+                pulse.timingFunction = Tok.Motion.pulseTiming
+                layer.add(pulse, forKey: Self.pulseKey)
+            } else {
+                layer.removeAnimation(forKey: Self.pulseKey)
+                layer.opacity = 1
+            }
+        }
+
+        /// A layer that left and re-entered a window may have dropped its animations; put it back.
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if pulsing, window != nil { setPulsing(true) }
+        }
     }
 }
 
