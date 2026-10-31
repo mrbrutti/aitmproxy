@@ -43,9 +43,9 @@ fn embed(tag: &str) -> Embedded {
         token: "test-token".into(),
         endpoint_file: None,
     };
-    let (_proxy, services) = assemble_services(&cfg);
+    let (_proxy, services, governance) = assemble_services(&cfg);
     let store = services.store.clone();
-    let (agent, handler) = build_servers(&cfg, services);
+    let (agent, handler) = build_servers(&cfg, services, governance);
     Embedded {
         agent: agent.expect("a loopback-TCP transport gets an agent server"),
         handler,
@@ -143,8 +143,8 @@ async fn both_servers_see_the_one_embedded_proxy() {
 fn a_stdio_agent_transport_gets_no_agent_server_beside_the_tui() {
     let mut cfg = config("stdio");
     cfg.mcp.transport = McpTransport::Stdio;
-    let (_proxy, services) = assemble_services(&cfg);
-    let (agent, handler) = build_servers(&cfg, services);
+    let (_proxy, services, governance) = assemble_services(&cfg);
+    let (agent, handler) = build_servers(&cfg, services, governance);
     assert!(agent.is_none(), "stdio is not served beside the TUI");
     let reply = handler(&json!({"jsonrpc":"2.0","id":1,"method":"ping","params":{}}).to_string())
         .expect("the TUI-side server replies");

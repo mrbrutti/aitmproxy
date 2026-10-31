@@ -57,8 +57,8 @@ fn config(tag: &str) -> Config {
 /// The agent-facing server exactly as `aitm tui` builds it: `assemble`, the
 /// shared service handles, then `tui::build_servers` — the loopback-TCP half.
 fn build_server(cfg: &Config) -> McpServer {
-    let (_proxy, services) = support::assemble_services(cfg);
-    build_servers(cfg, services)
+    let (_proxy, services, governance) = support::assemble_services(cfg);
+    build_servers(cfg, services, governance)
         .0
         .expect("a loopback-TCP transport gets an agent server")
 }
