@@ -18,6 +18,12 @@ final class BusService: FlowActions {
     @ObservationIgnored private var runTask: Task<Void, Never>?
     @ObservationIgnored private var notificationTask: Task<Void, Never>?
     @ObservationIgnored private var summaries: [FlowID: FlowSummary] = [:]
+    /// The status bar's ↑ / ↓ rate, from the change in the summaries' byte totals
+    /// between polls. Reset with each connection so a new core starts from zero.
+    @ObservationIgnored private var throughput = ThroughputMeter()
+    /// Which cached flows each poll asks about again (parked, headless, stale, or a
+    /// body still streaming — for a bounded number of polls). Reset per connection.
+    @ObservationIgnored private var refetch = FlowRefetchPolicy()
     /// The embedded core's bus (Task 6), once it has published its address. When
     /// set it supersedes the config.yaml / Settings endpoint resolution.
     @ObservationIgnored private var endpointOverride: BusEndpoint?
@@ -122,18 +128,30 @@ final class BusService: FlowActions {
     /// Polls `flow.list`, fetches summaries for new and in-flight flows, and
     /// rebuilds the rows oldest-first. Finished flows are not re-fetched.
     private func pollLoop(_ client: BusClient) async throws {
+        throughput.reset()
+        refetch.reset()
+        // However this connection ends — stop(), or a core that went away — no
+        // connection means no traffic: a stale rate must not sit under a failed badge.
+        defer {
+            session.upBytesPerSecond = 0
+            session.downBytesPerSecond = 0
+        }
         while !Task.isCancelled {
             let ids = try await client.call("flow.list").arrayValue?.compactMap { $0.stringValue }.map(FlowID.init) ?? []
             for id in ids {
                 let cached = summaries[id]
-                let inFlight = cached.map { $0.intercept == .intercepted || ($0.status == nil && $0.kind == .http) } ?? true
-                guard cached == nil || inFlight else { continue }
+                guard refetch.shouldFetch(id, cached: cached) else { continue }
                 if let json = try? await client.call("flow.get", ["id": .string(id.raw)]), let summary = FlowSummary(json: json) {
+                    // ↑ is what clients sent (request bodies), ↓ what came back (response
+                    // bodies): each flow's growth since its last summary joins the totals.
+                    throughput.record(previous: cached, current: summary)
                     summaries[id] = summary
+                    refetch.didFetch(id, summary: summary)
                 }
             }
             let known = Set(ids)
             summaries = summaries.filter { known.contains($0.key) }
+            refetch.retain(known)
             let coreID = session.activeCoreID
             let rows = ids.enumerated().compactMap { index, id in summaries[id]?.row(seq: index + 1, coreID: coreID) }
                 .map { row in
@@ -142,6 +160,9 @@ final class BusService: FlowActions {
                     return row
                 }
             if rows != session.rows { session.rows = rows }
+            let rate = throughput.sample(at: .now)
+            if session.upBytesPerSecond != rate.up { session.upBytesPerSecond = rate.up }
+            if session.downBytesPerSecond != rate.down { session.downBytesPerSecond = rate.down }
             try await Task.sleep(for: pollInterval)
         }
     }
@@ -182,9 +203,14 @@ final class BusService: FlowActions {
         session.interceptArmed = armed
     }
 
+    // Resume / Kill change the flow on the core: the next poll refreshes its summary.
+    // The cached one is kept (not dropped) so the row does not blink out and the
+    // throughput meter still has the flow's baseline — a re-fetch counts growth, not
+    // the whole body again.
+
     func resume(_ id: FlowID) async throws {
         _ = try await call("flow.resume", ["id": .string(id.raw)])
-        summaries[id] = nil
+        refetch.markStale(id)
     }
 
     func kill(_ id: FlowID, mode: KillMode) async throws {
@@ -192,7 +218,7 @@ final class BusService: FlowActions {
         var args: [String: JSONValue] = ["id": .string(id.raw)]
         if mode != .reset { args["mode"] = .string(mode.rawValue) }
         _ = try await call("flow.kill", args)
-        summaries[id] = nil
+        refetch.markStale(id)
     }
 
     func mutate(_ id: FlowID, edits: RequestEdits) async throws {
@@ -233,7 +259,9 @@ final class BusService: FlowActions {
 
     func clear() async throws {
         _ = try await call("flow.clear")
-        summaries = [:]
+        // The cache is not wiped here: the core keeps in-flight and parked flows, and
+        // the next poll prunes the cleared ids itself. Wiping would make the survivors
+        // "never seen" and count their whole size as traffic a second time.
         session.rows = []
         session.details = [:]
         session.select(nil)
