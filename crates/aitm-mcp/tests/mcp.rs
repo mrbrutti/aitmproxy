@@ -2005,6 +2005,74 @@ fn a_filter_value_of_exactly_1024_bytes_is_accepted() {
     assert_eq!(method_note["params"]["id"], by_method.to_string());
 }
 
+/// Bus-hardening AC5 (characterization, green before and after the `HashSet`
+/// de-dup): fan-out delivers once per connection, not once per subscription. A
+/// connection holding 32 matching subscriptions (the per-connection cap) and one
+/// holding 3 each get exactly one `notifications/aitm/flow` line for one event.
+#[test]
+fn a_connection_with_many_matching_subscriptions_gets_one_push() {
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store.clone(), 64);
+
+    let full_sink = NotificationSink::new(64);
+    let full = conn_over(&srv, &full_sink);
+    for _ in 0..32 {
+        sub_id_of(&subscribe_on(&srv, &full, json!({})));
+    }
+    let few_sink = NotificationSink::new(64);
+    let few = conn_over(&srv, &few_sink);
+    for _ in 0..3 {
+        sub_id_of(&subscribe_on(&srv, &few, json!({})));
+    }
+
+    let id = store.insert(http_flow("example.com:443", "/one-push"));
+    srv.push_flow_event(&Event::RequestHeaders(id));
+
+    for (label, sink) in [
+        ("32 subscriptions", &full_sink),
+        ("3 subscriptions", &few_sink),
+    ] {
+        assert_eq!(
+            sink.queued_len(),
+            1,
+            "the connection with {label} gets one push for one event"
+        );
+        let note: JsonValue = serde_json::from_str(&sink.drain()[0]).expect("the push is JSON");
+        assert_eq!(note["method"], "notifications/aitm/flow");
+        assert_eq!(note["params"]["id"], id.to_string());
+    }
+}
+
+/// Bus-hardening AC5 / D2 (characterization): on one connection a subscription
+/// whose filter does not match must not mask a later one that does. The first
+/// subscription watches `other.example`, the second is unfiltered; a flow for
+/// `example.com:443` matches only the second and must still be delivered, once.
+/// This is the test that catches a fan-out that records the connection as seen
+/// before it has tested the filter.
+#[test]
+fn a_non_matching_subscription_does_not_mask_a_matching_one() {
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store.clone(), 16);
+    let sink = NotificationSink::new(16);
+    let conn = conn_over(&srv, &sink);
+
+    let first = subscribe_on(&srv, &conn, json!({"filter": {"host": "other.example"}}));
+    let second = subscribe_on(&srv, &conn, json!({}));
+    assert_eq!(sub_id_of(&first), 1);
+    assert_eq!(sub_id_of(&second), 2);
+
+    let id = store.insert(http_flow("example.com:443", "/matches-second-only"));
+    srv.push_flow_event(&Event::RequestHeaders(id));
+
+    assert_eq!(
+        sink.queued_len(),
+        1,
+        "the unfiltered second subscription matches, so the event is delivered once"
+    );
+    let note: JsonValue = serde_json::from_str(&sink.drain()[0]).expect("the push is JSON");
+    assert_eq!(note["params"]["id"], id.to_string());
+}
+
 /// Web `/bus` push, spec Goals (bounded push memory), added by the tester: the
 /// `since` replay rides the same bounded notification lane as live pushes. A
 /// subscribe that replays more flows than `push_capacity` keeps only the newest
