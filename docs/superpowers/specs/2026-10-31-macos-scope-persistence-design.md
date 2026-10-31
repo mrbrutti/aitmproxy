@@ -375,6 +375,37 @@ production Rust change.
 - The file restores only what the operator authorised in a previous run, is
   shown on the Scope page, and remove persists; no new MITM surface.
 
+### Panel amendments (ratified 2026-10-31 by the owning session after the stage-5/6 reports)
+
+Three behaviours were tightened by the panel fix wave; each supersedes the
+corresponding sentence above.
+
+- **D1, `isPersistable`.** In addition to `Scope.validate` and the
+  newline/control-character rule, a host is persistable only if every Unicode
+  scalar is one libyaml's reader prints (`U+0009`, `U+0020…U+007E`, `U+0085`,
+  `U+00A0…U+D7FF`, `U+E000…U+FFFD`, `U+10000…U+10FFFF`). Why: the core's YAML
+  reader refuses U+FFFE/U+FFFF, which `Scope.validate`, the core's own
+  `scope.add` and the Cc/Cf check all accept, so a persisted host could wedge
+  the embedded core in a restart loop (security Important).
+- **D1, `load`/`sanitized` caps.** `load` reads only a regular file of at most
+  1 MiB (anything else → empty); `sanitized` drops hosts longer than 1 024
+  characters and keeps at most 10 000 entries (the first ones, in order). Why:
+  the read runs on the main actor at launch and inside the core actor at every
+  spawn, and the core seeds the guard with a linear-scan de-dup (security Minor).
+- **D2, newline guard.** `yamlDoubleQuoted` rejects a newline or carriage
+  return as Unicode scalars, not Characters: Swift treats `"\r\n"` as one
+  grapheme, so the Character-based `contains` let a CRLF host through (tester
+  F1; SP-AC16 now also covers CRLF).
+- **D4, failed save.** A failed `scope.json` save is surfaced as
+  `session.lastError` ("Scope change not saved: …") instead of being swallowed:
+  a silently failed save after a remove would resurrect the host at the next
+  launch (security Minor; supersedes OQ1's default). The in-memory scope is
+  unchanged.
+- **D4, embedded intent.** `addScope`/`removeScope` snapshot `preferEmbedded`
+  before the verb and persist only if it was and still is true after the
+  refresh, so a Settings ▸ Bus switch mid-action cannot persist the other
+  core's list (quality Minor).
+
 ## Acceptance criteria
 
 Prefix `SP-`. Verification kind in brackets: `[kit]` Swift unit test in

@@ -422,10 +422,24 @@ honours it.
 
 ## Review log
 
-Kept by the owning session during stage 6. One row per finding.
+Stage 5 + 6 on the whole branch `4944058..be251fb`, 2026-10-31. Tester = FAIL (1 finding, F1)
+with 21 tests added (committed as `967115c`). Security = FAIL (1 Important, 2 Minor). Quality =
+PASS (3 Minor). Spec = PASS on the diff (1 Important verification gate: the `[manual]` steps).
+Dispositions by the owning session (autonomous mode). **Fixed in the panel fix wave** (one
+Coder fix task over the findings report `scope-persistence-FIX-FINDINGS.md` in the shared notes
+folder; commit recorded in Shipped). The spec's "Panel amendments" subsection records the
+ratified behaviour changes.
 
-| Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
-|---|---|---|---|---|
+| # | Task | Reviewer | Severity | Finding | Disposition |
+|---|---|---|---|---|---|
+| 1 | 2 | Tester | Important (SP-AC16 contract) | `yamlDoubleQuoted` guards with Character-based `contains("\n")`; a CRLF grapheme passes, so a CRLF host does not throw | FIX — scalar-based guard; red test `scope_block_rejects_a_crlf_host` goes green — fix wave |
+| 2 | 1 | Security | Important | `isPersistable` lets U+FFFE/U+FFFF through (Cn, not Cc/Cf); libyaml refuses them → config parse fails → 5 restarts → `failPermanently`, unrecoverable from the UI | FIX — libyaml-printable allow-list in `isPersistable` + Kit tests — fix wave |
+| 3 | 1 | Security | Minor | `scope.json` read with no type/size/count/length cap (FIFO or multi-GB file; quadratic guard seeding) | FIX — regular-file + 1 MiB check in `load`; 10 000-entry / 1 024-char caps in `sanitized` — fix wave |
+| 4 | 4 | Security | Minor | Swallowed save failure after a remove resurrects the host next launch | FIX — surface via `session.lastError` ("Scope change not saved: …") — fix wave; supersedes OQ1's default |
+| 5 | 4 | Quality | Minor | `preferEmbedded` read after two suspension points; a Bus switch mid-action could persist the other core's list | FIX — snapshot before the verb, require both — fix wave |
+| 6 | 2 | Quality | Minor | The `\r` assertion accepts any error | FIX — assert `hostContainsNewline("evil.test\rx")` — fix wave |
+| 7 | 4 | Quality | Minor | Seventh copy of `UserDefaultsActiveKindPersistence().load() ?? .embedded` | ACCEPTED — follow-up: add `loadOrDefault()` in Kit and point all seven sites at it (consolidation touches `SettingsView.swift`, owned by a concurrent session) |
+| 8 | 4 | Spec | Important (gate) | `[manual]` SP-AC1/3/11/12/13 halves not evidenced in the logs at review time | RUN — `scope-persist-live-proof.sh` (shared notes): keystroke add → `scope.json`; Cmd-Q + relaunch → block + `scope.list` + screenshot with no banner (SP-AC1 display after connect, SP-AC11); Proxy ▸ Restart Core (same `restartCoreTick` path as Settings' Apply and Restart Core) keeps scope (SP-AC13); row ✕ remove → `scope.list []`, file kept as `{"hosts": []}` (SP-AC3). PASS, `/tmp/scope-persist-live-proof-full.log`. SP-AC12 ACCEPTED by reasoning: feeder sends `Scope(current_scope_spec())` right after Hello from `l7_guard.list_scope()`, which the config seeded and `scope.list` proved; the installed extension build belongs to the concurrent NE session's live run, so no second capture-enabled core was started — follow-up: observe the first Scope frame on the next NE live session. The pre-connect instant of SP-AC1 was not captured on screen; the seed is pinned by `seedsAtLaunch…` and the post-connect display by the screenshot |
 
 ## Shipped
 
