@@ -2,7 +2,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-30-web-ui-bus-push-design.md` (D9, AC25)
 **Plan:** `docs/superpowers/plans/2026-10-30-web-ui-bus-push-plan.md` (Task 0 is the instrument, Task 7 fills this note)
-**Instrument:** `apps/web/scripts/bus-load.mjs` (`--help` for the flags; `--selftest` for the pure counter)
+**Instrument:** `apps/web/scripts/bus-load.mjs` (`--help` for the flags; `--selftest` for the pure counters; `--seed N` to fill the store)
 **Status:** skeleton; numbers pending Task 7.
 
 ## Headline
@@ -12,27 +12,39 @@ idle is unchanged. The PR body quotes this line._
 
 ## Method
 
-What is measured is the UI's own call rate against the core, read from the server's audit ring
-(`crates/aitm-core/src/audit.rs`: every audited call is recorded with `origin`, `at` in epoch
-milliseconds, `command`), through `agent.activity {since}` (`crates/aitm-plugins/src/agent.rs`).
-The measuring script is a **separate** bridge connection: it subscribes once with
-`flow.subscribe {}` (only to count what a subscriber is sent) and from then on calls nothing but
-`agent.activity`, so it cannot disturb what it measures. Both the UI and the script are bridge
-connections with `client_label: null` (spec R2), so calls are attributed by `origin`
-(`--ui-origin`, default `mcp`: the page opened at `aitm web`'s default URL is an agent-token
-connection) and the script's own `agent.activity` reads are excluded and reported as such.
+What is measured is the UI's own call rate against the core. The server audits every tool call
+(`crates/aitm-core/src/audit.rs`: `origin`, `at` in epoch milliseconds, `command`, ...) and
+pushes each entry as a `notifications/aitm/agent` line to every subscribed connection
+(`server.rs` `push_agent`). The measuring script is a **separate** bridge connection: it
+subscribes once with `flow.subscribe {}` and then only listens, counting the UI's calls from
+that stream, so it cannot disturb what it measures.
+
+The instrument is the stream and **not** `agent.activity`, which spec D9 named: over `aitm web`
+that ring is empty. The web server is a second `McpServer` with its own audit ring, while the
+`AgentActivity` command reads the primary server's ring (`crates/aitm/src/main.rs:429` attaches
+the ring to the primary only). A first run against the before-binary showed `agent.activity`
+returning `[]` while the same connection's subscription received audit lines at 2.47/s idle and
+21.79/s under traffic. The server-side mismatch is a follow-up, not part of this change.
+
+Both the UI and the script are bridge connections with `client_label: null` (spec R2), so calls
+are attributed by `origin` (`--ui-origin`, default `mcp`: the page opened at `aitm web`'s
+default URL is an agent-token connection). The script's own calls are `flow.subscribe` (not
+audited; the e2e contract pins that) and one `flow.list` after the last window, whose line is
+stamped after the window end; nothing the script does lands inside a window.
 
 Two windows per binary, both with the page open in a real browser:
 
 - **idle**: no traffic, 30 s.
 - **traffic**: 20 plain-HTTP req/s for 30 s through the proxy (`127.0.0.1:8080`) to a loopback
   origin the script starts, plus a 1 s settle. The store is seeded with at least 500 flows
-  beforehand so `flow.list` has a real cost. 30 s at that rate stays well under the 4096-entry
-  ring; the script warns if a read returns a full ring.
+  beforehand so `flow.list` has a real cost. The script warns if its own subscription reported
+  `lagged` during a window (dropped lines make the counts a floor).
 
-Each window's start is the newest ring entry's `at` (server clock); the end is the script's clock
-when it reads the ring back. The script, the proxy and the browser share one host (the origin is
-loopback), so those are the same clock. Rates are counts divided by the window length.
+Window bounds are the script's clock; audit lines are stamped by the server at record time and
+filtered on `at` within the window. The script, the proxy and the browser share one host (the
+origin is loopback), so those are the same clock. After a window closes the script waits 250 ms
+for lines stamped inside it that are still in flight; the bound itself is not widened. Rates
+are counts divided by the window length. Notification rates per kind are counted by arrival.
 
 ### A/B with two binaries
 
@@ -69,11 +81,11 @@ printf 'listen: 127.0.0.1:8080\nscope:\n  entries:\n    - "127.0.0.1"\n' > "$TMP
 "$TMPDIR/aitm-after" --config "$TMPDIR/aitm-load.yaml" web --listen 127.0.0.1:8082 --token T --no-open
 ```
 
-Open the printed `web UI (agent)` URL in a real browser and leave the page open. Seed the store,
-then measure (the seed is the script's own traffic generator with the idle window skipped):
+Open the printed `web UI (agent)` URL in a real browser and leave the page open. Seed the store
+(no bus connection, no windows; 10 requests in flight at a time), then measure:
 
 ```bash
-node apps/web/scripts/bus-load.mjs --token T --idle-secs 0 --traffic-secs 25 --rate 20
+node apps/web/scripts/bus-load.mjs --seed 500
 node apps/web/scripts/bus-load.mjs --token T --label after --json "$TMPDIR/after.json"
 ```
 
@@ -93,14 +105,14 @@ Empty cells are filled by Task 7 from the `--json` output.
 | `proxy.status` | | |
 | `flow.detail` | | |
 | `agent.status` | | |
-| `agent.activity` (UI's own) | | |
+| `agent.activity` | | |
 | _other (list them)_ | | |
 | **total** | | |
 
 - `flow.list` after traffic: _n_ ids, _n_ bytes (result JSON)
 - Subscriber notifications/s (idle / traffic): flow _/_ · agent _/_ · state _/_
 - Requests: _sent_ / _ok_ / _failed_; `flow.detail` per new flow: _n_
-- Ring wrapped: no / yes
+- Subscription lagged during a window: no / yes
 
 ### After (`aitm-after`, UI at the branch head)
 
@@ -110,7 +122,7 @@ Empty cells are filled by Task 7 from the `--json` output.
 | `proxy.status` | | |
 | `flow.detail` | | |
 | `agent.status` | | |
-| `agent.activity` (UI's own) | | |
+| `agent.activity` | | |
 | _other (list them)_ | | |
 | **total** | | |
 
@@ -118,7 +130,7 @@ Empty cells are filled by Task 7 from the `--json` output.
 - Subscriber notifications/s (idle / traffic): flow _/_ · agent _/_ · state _/_
 - Requests: _sent_ / _ok_ / _failed_; `flow.detail` per new flow: _n_ (spec R3: above 2.5 means
   raising `PUSH_COALESCE_MS` to 250 in a follow-up)
-- Ring wrapped: no / yes
+- Subscription lagged during a window: no / yes
 
 ## Reading the result
 
