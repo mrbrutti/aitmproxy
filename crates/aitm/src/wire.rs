@@ -61,6 +61,10 @@ pub struct Features {
     /// scripting engine, so a script's `l4.scope.add` and the bus see one state (no
     /// divergent L4 engagement state).
     pub l4_shared: Option<L4Shared>,
+    /// The macOS NE live-capture feeder config. Opt-in and deny-by-default:
+    /// `enabled` is false by default, so the default feature set never binds the
+    /// capture listener. The feeder runs only when `enabled` and the build is macOS.
+    pub macos_capture: crate::macos_capture::config::MacosCaptureConfig,
 }
 
 /// A shared L4 guard + flow store, built once by the binary and threaded into both
@@ -81,6 +85,7 @@ impl Default for Features {
             l4: L4Config::default(),
             l4_privilege: None,
             l4_shared: None,
+            macos_capture: crate::macos_capture::config::MacosCaptureConfig::default(),
         }
     }
 }

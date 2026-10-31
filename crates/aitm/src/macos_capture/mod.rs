@@ -14,6 +14,7 @@ pub mod activation_gate;
 pub mod adapter;
 pub mod availability;
 pub mod capability;
+pub mod config;
 pub mod listener;
 pub mod rendezvous;
 pub mod scope_spec;

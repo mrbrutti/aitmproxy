@@ -154,6 +154,8 @@ async fn run() -> anyhow::Result<()> {
         core: mut cfg,
         rhai: mut rhai_cfg,
         mut l4,
+        // `macos_capture` is consumed by Task 5's runtime wiring; ignore it here until then.
+        ..
     } = config_file::load_settings(config_path.as_deref())?;
     env::apply(&mut cfg, |k| std::env::var(k).ok());
     env::apply_rhai(&mut rhai_cfg, |k| std::env::var(k).ok());
