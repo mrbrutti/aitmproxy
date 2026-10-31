@@ -17,9 +17,10 @@ use std::sync::OnceLock;
 use regex::Regex;
 
 /// Substrings that mark an argument *key* as carrying a secret (matched
-/// case-insensitively, as a substring, so `X-Api-Key`, `access_token`, and
-/// `set-cookie` are all caught). The content scrubber's `key=value` pass below
-/// is built from the same vocabulary.
+/// case-insensitively, as a substring, so `X-Api-Key`, `access_token`,
+/// `set-cookie`, `JSESSIONID`, and `ASP.NET_SessionId` are all caught). These are
+/// long, distinctive words that are safe to match anywhere inside a key; the short
+/// words that would also hit innocent keys live in [`SECRET_KEY_SEGMENTS`].
 const SECRET_KEY_NEEDLES: &[&str] = &[
     "authorization",
     "token",
@@ -33,15 +34,27 @@ const SECRET_KEY_NEEDLES: &[&str] = &[
     "api-key",
     "bearer",
     "credential",
+    "sessionid",
+    "phpsessid",
 ];
 
-/// Whether an argument key names a secret whose value must never be recorded.
-/// Matched case-insensitively as a substring against [`SECRET_KEY_NEEDLES`].
+/// Short words that mark a key as secret only when they are a *whole segment* of
+/// it, where segments are the runs of ASCII alphanumerics between every other
+/// character (`x-auth`, `connect.sid`, and `_csrf` match; `author`, `authority`,
+/// `inside`, `side`, and `sessions` do not). Matched case-insensitively.
+const SECRET_KEY_SEGMENTS: &[&str] = &["sid", "jwt", "csrf", "session", "auth"];
+
+/// Whether an argument key names a secret whose value must never be recorded:
+/// true when the ASCII-lowercased key contains any [`SECRET_KEY_NEEDLES`] entry,
+/// or when any whole segment of it equals a [`SECRET_KEY_SEGMENTS`] entry.
 pub fn is_secret_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     SECRET_KEY_NEEDLES
         .iter()
         .any(|needle| lower.contains(needle))
+        || lower
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|segment| SECRET_KEY_SEGMENTS.contains(&segment))
 }
 
 /// The compiled content-scrubber passes, applied in order.
@@ -171,5 +184,47 @@ mod tests {
     fn leaves_innocuous_text_untouched() {
         let text = "GET /search?q=hello&page=2";
         assert_eq!(scrub_text(text), text);
+    }
+
+    #[test]
+    fn is_secret_key_covers_the_session_and_auth_family() {
+        for key in [
+            "sid",
+            "SID",
+            "jwt",
+            "csrf",
+            "_csrf",
+            "session",
+            "auth",
+            "x-auth",
+            "connect.sid",
+            "sessionId",
+            "JSESSIONID",
+            "PHPSESSID",
+            "ASP.NET_SessionId",
+        ] {
+            assert!(is_secret_key(key), "`{key}` should be a secret key");
+        }
+    }
+
+    #[test]
+    fn is_secret_key_leaves_lookalikes_alone() {
+        for key in [
+            "author",
+            "authority",
+            "authenticated",
+            "inside",
+            "side",
+            "sidebar",
+            "subsidiary",
+            "sessions",
+            "path",
+            "host",
+            "body",
+            "note",
+            "method",
+        ] {
+            assert!(!is_secret_key(key), "`{key}` is not a secret key");
+        }
     }
 }
