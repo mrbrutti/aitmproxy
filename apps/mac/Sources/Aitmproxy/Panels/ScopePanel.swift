@@ -163,7 +163,7 @@ struct ScopePanel: View {
 
     private func headCell(_ title: String, width: CGFloat, alignment: Alignment = .leading) -> some View {
         Text(title.uppercased())
-            .font(Tok.Face.ui(Tok.Typography.Size.xs, .medium)).tracking(0.5)
+            .font(Tok.Face.ui(Tok.Typography.Size.xs, .medium)).tracking(0.6)
             .foregroundStyle(Tok.Ink.tertiary.color).lineLimit(1)
             .frame(width: width, alignment: alignment)
     }

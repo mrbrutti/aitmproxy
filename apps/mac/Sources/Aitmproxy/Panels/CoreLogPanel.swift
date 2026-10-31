@@ -64,9 +64,7 @@ struct CoreLogPanel: View {
     }
 
     private var header: some View {
-        HStack(spacing: Space.md) {
-            TrackedLabel("Core Log")
-            Spacer(minLength: Space.sm)
+        PageHeader("Core Log") {
             if let connection = state.connection {
                 HStack(spacing: Tok.Metric.gapTight) {
                     Circle().fill(connection.health.dotColor.color)
@@ -77,8 +75,6 @@ struct CoreLogPanel: View {
                 }
             }
         }
-        .padding(.horizontal, Space.md)
-        .frame(height: Tok.Size.filterBar)
     }
 
     private func degraded(_ reason: String) -> some View {

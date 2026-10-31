@@ -74,6 +74,7 @@ struct SidebarView: View {
         }
         .frame(maxHeight: .infinity)
         .background(Tok.Ground.surface.color)
+        .dimsWhenInactive()
     }
 
     /// `›•‹ aitmproxy  0.1` — the product mark in the accent, the wordmark in the UI face.
