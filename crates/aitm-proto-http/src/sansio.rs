@@ -57,6 +57,8 @@ pub enum HttpSansIoEvent {
 pub(crate) const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// Largest chunk-size line (hex size plus extensions) accepted.
 const MAX_CHUNK_LINE_BYTES: usize = 1024;
+/// The interim response that answers a `100-continue` expectation (25 bytes).
+const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 
 /// How a message body is delimited on the wire.
 #[derive(Debug, Clone, Copy)]
@@ -142,6 +144,8 @@ pub struct Http1Machine {
     /// The `Upgrade:` protocol the current request asked for, if any.
     pending_upgrade: Option<String>,
     upgraded: bool,
+    /// The current request carries an unanswered `Expect: 100-continue`.
+    continue_pending: bool,
 }
 
 impl Default for Http1Machine {
@@ -165,6 +169,7 @@ impl Http1Machine {
             response: None,
             pending_upgrade: None,
             upgraded: false,
+            continue_pending: false,
         }
     }
 
@@ -187,6 +192,27 @@ impl Http1Machine {
     /// Whether a 101 completed and the connection now belongs to another protocol.
     pub fn is_upgraded(&self) -> bool {
         self.upgraded
+    }
+
+    /// Whether the current request carries a `100-continue` expectation that
+    /// has not been answered: an HTTP/1.1 head with `Expect: 100-continue`,
+    /// content still to come (a positive `Content-Length` or chunked framing),
+    /// and no content byte buffered with the head. Set when the head is parsed
+    /// and cleared by [`Self::enqueue_continue`] or by the next request's head.
+    #[cfg_attr(not(test), allow(dead_code))] // `serve` calls it (plan task 2)
+    pub(crate) fn expects_continue(&self) -> bool {
+        self.continue_pending
+    }
+
+    /// Queue the interim `100 Continue` for the client, once: with no
+    /// expectation pending this does nothing, and answering clears it, so a
+    /// second call queues nothing.
+    #[cfg_attr(not(test), allow(dead_code))] // `serve` calls it (plan task 2)
+    pub(crate) fn enqueue_continue(&mut self) {
+        if self.continue_pending {
+            self.out_client.extend_from_slice(CONTINUE_RESPONSE);
+            self.continue_pending = false;
+        }
     }
 
     /// Bytes received from `side` that this machine will not parse: anything
@@ -292,13 +318,24 @@ impl Http1Machine {
                     let Some(head) = take_head(&mut self.client.buf)? else {
                         break;
                     };
-                    let req = parse_request(&head)?;
+                    let (req, http_1_0) = parse_request(&head)?;
                     let id = FlowId::new();
                     self.flow = Some(id);
                     self.response = None;
                     self.upgraded = false;
                     self.pending_upgrade = upgrade_protocol(&req.headers);
                     let framing = request_framing(&req.headers)?;
+                    // Assigned for every request so the flag never outlives the
+                    // request it was computed for. `head` is already out of the
+                    // buffer, so an empty buffer means no content came with it.
+                    self.continue_pending = !http_1_0
+                        && expects_100_continue(&req.headers)
+                        && match framing {
+                            Framing::Chunked => true,
+                            Framing::Length(n) => n > 0,
+                            Framing::None | Framing::UntilClose => false,
+                        }
+                        && self.client.buf.is_empty();
                     self.request = Some(req);
                     events.push(HttpSansIoEvent::RequestHeaders(id));
                     match framing {
@@ -603,8 +640,11 @@ fn parse_chunk_size(line: &[u8]) -> Result<u64> {
     u64::from_str_radix(size, 16).map_err(|_| anyhow!("invalid chunk size {size:?}"))
 }
 
-/// Parse a request head: request line plus header fields.
-fn parse_request(head: &[u8]) -> Result<HttpRequest> {
+/// Parse a request head: request line plus header fields. The second value is
+/// whether the request line's version token is exactly `HTTP/1.0`: the model
+/// records every accepted request as `HttpVersion::Http11`, so the token is read
+/// here, where it is still available.
+fn parse_request(head: &[u8]) -> Result<(HttpRequest, bool)> {
     let text = std::str::from_utf8(head).map_err(|_| anyhow!("non-UTF-8 request head"))?;
     let mut lines = text.split("\r\n");
     let line = lines.next().unwrap_or("");
@@ -622,7 +662,7 @@ fn parse_request(head: &[u8]) -> Result<HttpRequest> {
     }
     let headers = parse_headers(lines)?;
     let (scheme, authority, path) = split_target(method, target, &headers);
-    Ok(HttpRequest {
+    let request = HttpRequest {
         method: method.to_string(),
         scheme,
         authority,
@@ -631,7 +671,8 @@ fn parse_request(head: &[u8]) -> Result<HttpRequest> {
         headers,
         body: Body::Empty,
         timestamp: std::time::SystemTime::now(),
-    })
+    };
+    Ok((request, version == "HTTP/1.0"))
 }
 
 /// Scheme, authority and path for a request target in origin, absolute or
@@ -721,6 +762,23 @@ fn upgrade_protocol(headers: &HeaderMap) -> Option<String> {
         .and_then(|u| u.split(',').next())
         .map(|p| p.trim().to_ascii_lowercase())
         .filter(|p| !p.is_empty())
+}
+
+/// Whether any `Expect` field line lists `100-continue`. Every line counts (the
+/// field may repeat), each is split on commas, and a member matches only when
+/// the whole of it, minus optional surrounding SP/HT, equals `100-continue`
+/// ASCII case-insensitively: `100-continue-ish` and `100-continue;x=1` do not.
+fn expects_100_continue(headers: &HeaderMap) -> bool {
+    headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("expect"))
+        .any(|(_, value)| {
+            value.split(',').any(|member| {
+                member
+                    .trim_matches([' ', '\t'])
+                    .eq_ignore_ascii_case("100-continue")
+            })
+        })
 }
 
 /// `Content-Length` as a number, if present and well-formed. More than one
@@ -1094,5 +1152,228 @@ mod tests {
         assert_eq!(reason_phrase(599), "Server Error");
         assert_eq!(reason_phrase(799), "Unknown Status");
         assert!(!reason_phrase(218).is_empty());
+    }
+
+    // ---- an unanswered `Expect: 100-continue` ----------------------------------
+
+    /// A machine fed `raw` on the client side, and the events it produced.
+    fn after_request(raw: &[u8]) -> (Http1Machine, Vec<HttpSansIoEvent>) {
+        let mut m = Http1Machine::new();
+        let events = m.on_bytes(Side::Client, raw).unwrap();
+        (m, events)
+    }
+
+    /// The flow id of a request's first event, which must be `RequestHeaders`.
+    fn request_id(events: &[HttpSansIoEvent]) -> FlowId {
+        match events.first() {
+            Some(HttpSansIoEvent::RequestHeaders(id)) => *id,
+            other => panic!("first event was {other:?}, want RequestHeaders"),
+        }
+    }
+
+    /// `POST /u` with `Content-Length: 5`, then `expect_lines` (each CRLF
+    /// terminated), then the blank line.
+    fn expect_head(expect_lines: &str) -> Vec<u8> {
+        format!("POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n{expect_lines}\r\n")
+            .into_bytes()
+    }
+
+    #[test]
+    fn expectation_is_pending_when_the_body_has_not_arrived() {
+        let (m, events) = after_request(&expect_head("Expect: 100-continue\r\n"));
+        let id = request_id(&events);
+        assert_eq!(events, vec![HttpSansIoEvent::RequestHeaders(id)]);
+        assert!(m.expects_continue());
+    }
+
+    #[test]
+    fn expectation_is_not_pending_when_the_body_arrived_with_the_head() {
+        let mut raw = expect_head("Expect: 100-continue\r\n");
+        raw.extend_from_slice(b"hello");
+        let (m, events) = after_request(&raw);
+        let id = request_id(&events);
+        assert_eq!(
+            events,
+            vec![
+                HttpSansIoEvent::RequestHeaders(id),
+                HttpSansIoEvent::RequestBodyChunk {
+                    flow: id,
+                    bytes: b"hello".to_vec()
+                },
+                HttpSansIoEvent::RequestComplete(id),
+            ]
+        );
+        assert!(!m.expects_continue());
+    }
+
+    #[test]
+    fn expectation_is_ignored_on_http_1_0() {
+        let (m, events) = after_request(
+            b"POST /u HTTP/1.0\r\nHost: h\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n",
+        );
+        let id = request_id(&events);
+        assert_eq!(events, vec![HttpSansIoEvent::RequestHeaders(id)]);
+        assert!(!m.expects_continue());
+    }
+
+    #[test]
+    fn expectation_is_not_pending_when_no_content_follows() {
+        let (m, events) = after_request(
+            b"POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\nExpect: 100-continue\r\n\r\n",
+        );
+        let id = request_id(&events);
+        assert_eq!(
+            events,
+            vec![
+                HttpSansIoEvent::RequestHeaders(id),
+                HttpSansIoEvent::RequestComplete(id),
+            ]
+        );
+        assert!(!m.expects_continue(), "Content-Length: 0 has no content");
+
+        let (m, events) =
+            after_request(b"POST /u HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\n\r\n");
+        let id = request_id(&events);
+        assert_eq!(
+            events,
+            vec![
+                HttpSansIoEvent::RequestHeaders(id),
+                HttpSansIoEvent::RequestComplete(id),
+            ]
+        );
+        assert!(!m.expects_continue(), "no length at all has no content");
+    }
+
+    #[test]
+    fn a_chunked_request_has_a_pending_expectation_until_a_chunk_arrives() {
+        let head = b"POST /u HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n";
+        let (m, events) = after_request(head);
+        let id = request_id(&events);
+        assert_eq!(events, vec![HttpSansIoEvent::RequestHeaders(id)]);
+        assert!(m.expects_continue(), "chunked with no body bytes yet");
+
+        let mut raw = head.to_vec();
+        raw.extend_from_slice(b"5\r\nhello\r\n");
+        let (m, events) = after_request(&raw);
+        let id = request_id(&events);
+        assert_eq!(
+            events,
+            vec![
+                HttpSansIoEvent::RequestHeaders(id),
+                HttpSansIoEvent::RequestBodyChunk {
+                    flow: id,
+                    bytes: b"hello".to_vec()
+                },
+            ]
+        );
+        assert!(!m.expects_continue(), "a chunk arrived with the head");
+    }
+
+    #[test]
+    fn expectation_matching_is_case_insensitive_and_whole_member() {
+        let one_line: &[(&str, bool)] = &[
+            ("100-Continue", true),
+            ("foo, 100-continue", true),
+            ("100-continue, foo", true),
+            ("foo", false),
+            ("100-continue-ish", false),
+            ("100-continue;x=1", false),
+            ("", false),
+        ];
+        for (value, want) in one_line {
+            let (m, _) = after_request(&expect_head(&format!("Expect: {value}\r\n")));
+            assert_eq!(
+                m.expects_continue(),
+                *want,
+                "Expect value {value:?} should give {want}"
+            );
+        }
+        // Every field line counts, not only the first.
+        let (m, _) = after_request(&expect_head("Expect: foo\r\nExpect: 100-continue\r\n"));
+        assert!(
+            m.expects_continue(),
+            "a 100-continue on the second Expect line must match"
+        );
+    }
+
+    #[test]
+    fn enqueue_continue_queues_the_interim_once() {
+        let (mut m, _) = after_request(&expect_head("Expect: 100-continue\r\n"));
+        assert!(m.expects_continue());
+
+        m.enqueue_continue();
+        assert_eq!(
+            m.poll_outbound(Side::Client),
+            Some(b"HTTP/1.1 100 Continue\r\n\r\n".to_vec())
+        );
+        assert!(!m.expects_continue(), "answering clears the expectation");
+
+        m.enqueue_continue();
+        assert_eq!(
+            m.poll_outbound(Side::Client),
+            None,
+            "a second call must queue nothing"
+        );
+        assert_eq!(m.poll_outbound(Side::Server), None, "nothing goes upstream");
+    }
+
+    #[test]
+    fn enqueue_continue_with_nothing_pending_queues_nothing() {
+        let (mut m, _) = after_request(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
+        m.enqueue_continue();
+        assert_eq!(m.poll_outbound(Side::Client), None);
+    }
+
+    #[test]
+    fn the_expectation_flag_resets_for_the_next_request() {
+        // Once answered (the flag is cleared by `enqueue_continue`) and once left
+        // unanswered (only the head-time reset can clear it): either way the next
+        // request on the connection starts with nothing pending.
+        for answered in [true, false] {
+            let (mut m, events) = after_request(&expect_head("Expect: 100-continue\r\n"));
+            let id = request_id(&events);
+            assert!(m.expects_continue());
+            if answered {
+                m.enqueue_continue();
+                assert_eq!(
+                    m.poll_outbound(Side::Client),
+                    Some(CONTINUE_RESPONSE.to_vec())
+                );
+            }
+            let body = m.on_bytes(Side::Client, b"hello").unwrap();
+            assert_eq!(
+                body,
+                vec![
+                    HttpSansIoEvent::RequestBodyChunk {
+                        flow: id,
+                        bytes: b"hello".to_vec()
+                    },
+                    HttpSansIoEvent::RequestComplete(id),
+                ]
+            );
+            let resp = m
+                .on_bytes(
+                    Side::Server,
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+                )
+                .unwrap();
+            assert_eq!(
+                resp,
+                vec![
+                    HttpSansIoEvent::ResponseHeaders(id),
+                    HttpSansIoEvent::ResponseComplete(id),
+                ]
+            );
+
+            let next = m
+                .on_bytes(Side::Client, b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n")
+                .unwrap();
+            let id2 = request_id(&next);
+            assert_ne!(id2, id);
+            assert!(
+                !m.expects_continue(),
+                "a plain GET after a request that expected 100-continue (answered: {answered})"
+            );
+        }
     }
 }
