@@ -10,7 +10,6 @@ struct ShellView: View {
     @State private var bus: BusService?
     @State private var embeddedCore: EmbeddedCoreController?
     @State private var captureExtension: ExtensionController?
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         @Bindable var session = session
@@ -50,15 +49,14 @@ struct ShellView: View {
             if session.paletteVisible {
                 ZStack(alignment: .top) {
                     Color.black.opacity(0.001).ignoresSafeArea().onTapGesture { session.paletteVisible = false }
-                    // Keyboard opens land in the same frame; the mouse gets the popover motion,
-                    // a fade only under Reduce Motion (S-069).
+                    // ⌘K is used all day: it opens and closes in the same frame, from the keyboard and
+                    // from the toolbar alike, with or without Reduce Motion (brief: no entrance motion;
+                    // keyboard actions never animate). A popover transition once sat here, but its
+                    // `.animation` lived inside this branch and never ran; measured on a real run, a
+                    // toolbar click opened and closed the palette in one frame each.
                     CommandPalette()
                         .padding(.top, Space.section * 2)
-                        .transition(session.paletteOpenedByKeyboard ? .identity
-                                    : reduceMotion ? .opacity
-                                    : .scale(scale: 0.97, anchor: .top).combined(with: .opacity))
                 }
-                .animation(session.paletteOpenedByKeyboard ? nil : Tok.Motion.easeOut(Tok.Motion.popover), value: session.paletteVisible)
             }
         }
         .sheet(isPresented: Binding(get: { session.composeVisible }, set: { session.composeVisible = $0 })) {
