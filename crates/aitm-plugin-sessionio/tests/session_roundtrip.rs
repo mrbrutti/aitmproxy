@@ -215,6 +215,206 @@ fn native_session_roundtrips() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// `seeded_flow()` whose response also carries `pairs` as chunked trailers, the
+/// way the HTTP/1 machine records a trailer section after the last chunk.
+fn flow_with_trailers(pairs: &[(&str, &str)]) -> Flow {
+    let Flow::Http(mut f) = seeded_flow() else {
+        panic!("seeded_flow is an http flow");
+    };
+    let resp = f.response.as_mut().expect("seeded flow has a response");
+    for (n, v) in pairs {
+        resp.trailers.set(n, v);
+    }
+    Flow::Http(f)
+}
+
+/// The response trailers of an http flow, as owned `(name, value)` pairs in order.
+fn response_trailers(flow: &Flow) -> Vec<(String, String)> {
+    let Flow::Http(f) = flow else {
+        panic!("expected http flow");
+    };
+    f.response
+        .as_ref()
+        .expect("flow has a response")
+        .trailers
+        .iter()
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect()
+}
+
+/// `flow.export` (native format, no path) over the whole `store`, as the raw document bytes.
+fn export_native(store: &MemFlowStore) -> Vec<u8> {
+    let reg = registry();
+    let guard = StdGuard::default();
+    let client = CountingClient::default();
+    let host = CommandHost::new(store, &client, &guard, None);
+    let out = reg
+        .command("flow.export")
+        .expect("flow.export registered")
+        .invoke(Params::new(BTreeMap::new()), &host)
+        .expect("flow.export ok");
+    let Value::Object(out) = out else {
+        panic!("flow.export returns an object");
+    };
+    let Some(Value::Bytes(bytes)) = out.get("bytes") else {
+        panic!("flow.export with no path returns bytes");
+    };
+    bytes.clone()
+}
+
+/// `flow.import` of native document `bytes` into `store`; returns the new flow ids.
+fn import_native(store: &MemFlowStore, bytes: Vec<u8>) -> Vec<FlowId> {
+    let reg = registry();
+    let guard = StdGuard::default();
+    let client = CountingClient::default();
+    let host = CommandHost::new(store, &client, &guard, None);
+    let mut args = BTreeMap::new();
+    args.insert("bytes".to_string(), Value::Bytes(bytes));
+    let out = reg
+        .command("flow.import")
+        .expect("flow.import registered")
+        .invoke(Params::new(args), &host)
+        .expect("flow.import ok");
+    let Value::Object(out) = out else {
+        panic!("flow.import returns an object");
+    };
+    let Some(Value::Array(ids)) = out.get("ids") else {
+        panic!("flow.import returns an ids array");
+    };
+    ids.iter()
+        .map(|v| {
+            let Value::Str(s) = v else {
+                panic!("ids are strings");
+            };
+            s.parse().expect("valid flow id")
+        })
+        .collect()
+}
+
+/// AC26 — `session.save` then `session.load` into a fresh store restores the
+/// response trailers, including a repeated name (differing only in case) in order.
+#[test]
+fn native_session_roundtrips_response_trailers() {
+    let reg = registry();
+    let guard = StdGuard::default();
+    let client = CountingClient::default();
+
+    let store = MemFlowStore::new();
+    let id = store.insert(flow_with_trailers(&[("X-A", "1"), ("x-a", "2")]));
+
+    let path = std::env::temp_dir().join(format!("aitm-sess-trailers-{}.json", FlowId::new()));
+    let path_str = path.to_string_lossy().to_string();
+
+    let host = CommandHost::new(&store, &client, &guard, None).with_frontend(Frontend::Cli);
+    let mut args = BTreeMap::new();
+    args.insert("path".to_string(), Value::Str(path_str.clone()));
+    reg.command("session.save")
+        .expect("session.save registered")
+        .invoke(Params::new(args), &host)
+        .expect("session.save ok");
+
+    let fresh = MemFlowStore::new();
+    let host = CommandHost::new(&fresh, &client, &guard, None).with_frontend(Frontend::Cli);
+    let mut args = BTreeMap::new();
+    args.insert("path".to_string(), Value::Str(path_str));
+    reg.command("session.load")
+        .expect("session.load registered")
+        .invoke(Params::new(args), &host)
+        .expect("session.load ok");
+
+    let restored = fresh.get(id).expect("flow restored by id");
+    assert_eq!(
+        response_trailers(&restored),
+        vec![
+            ("X-A".to_string(), "1".to_string()),
+            ("x-a".to_string(), "2".to_string()),
+        ],
+        "trailers survive save then load, duplicate name and order intact"
+    );
+    // The trailers ride beside the response, never inside its headers.
+    assert_eq!(
+        headers_vec(&restored, true),
+        headers_vec(&store.get(id).unwrap(), true),
+        "response headers are untouched by the trailers"
+    );
+    assert!(
+        !headers_vec(&restored, true).iter().any(|(n, _)| n == "X-A"),
+        "a trailer is not merged into the headers"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// AC26 — a flow with trailers serialises them as an array of `[name, value]`
+/// pairs in wire order under `response.trailers`.
+#[test]
+fn a_flow_with_trailers_serialises_a_trailers_array_of_pairs() {
+    let store = MemFlowStore::new();
+    store.insert(flow_with_trailers(&[("X-A", "1"), ("x-a", "2")]));
+
+    let doc: serde_json::Value =
+        serde_json::from_slice(&export_native(&store)).expect("export is JSON");
+    assert_eq!(
+        doc["flows"][0]["response"]["trailers"],
+        serde_json::json!([["X-A", "1"], ["x-a", "2"]]),
+    );
+    assert_eq!(
+        doc["schema"], "aitm-session/1",
+        "the schema tag is unchanged"
+    );
+    assert_eq!(doc["flows"][0]["kind"], "http", "the flow tag is unchanged");
+}
+
+/// AC26 — a flow without trailers serialises exactly as before: no `trailers` key.
+#[test]
+fn a_flow_without_trailers_serialises_without_a_trailers_key() {
+    let store = MemFlowStore::new();
+    store.insert(seeded_flow());
+
+    let bytes = export_native(&store);
+    let text = String::from_utf8(bytes.clone()).expect("export is UTF-8");
+    assert!(
+        !text.contains("\"trailers\""),
+        "a response with no trailers writes no `trailers` key, got: {text}"
+    );
+
+    // The response object is exactly today's five fields (serde_json's map is
+    // key-sorted), so the document is the pre-change shape.
+    let doc: serde_json::Value = serde_json::from_slice(&bytes).expect("export is JSON");
+    let keys: Vec<&str> = doc["flows"][0]["response"]
+        .as_object()
+        .expect("response is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, ["body", "headers", "status", "timestamp", "version"]);
+}
+
+/// AC26 — a document saved before this change (no `trailers` key) still loads,
+/// with empty trailers. The export of a no-trailers flow IS the old shape.
+#[test]
+fn an_older_document_loads_with_empty_trailers() {
+    let store = MemFlowStore::new();
+    store.insert(seeded_flow());
+    let old_shape = export_native(&store);
+    assert!(
+        !String::from_utf8(old_shape.clone())
+            .expect("export is UTF-8")
+            .contains("\"trailers\""),
+        "the fixture is the pre-change shape, with no `trailers` key"
+    );
+
+    let fresh = MemFlowStore::new();
+    let ids = import_native(&fresh, old_shape);
+    assert_eq!(ids.len(), 1, "the old document imports its flow");
+    let restored = fresh.get(ids[0]).expect("imported flow present");
+    assert_eq!(response_trailers(&restored), Vec::<(String, String)>::new());
+    let Flow::Http(r) = &restored else {
+        panic!("expected http flow");
+    };
+    assert_eq!(r.response.as_ref().unwrap().status, 201, "the rest loads");
+}
+
 /// AC-F10.3 / Review focus #4 — `flow.export` then `flow.import` into a fresh
 /// store populates it and triggers **no** upstream request: the stub client's
 /// egress counter stays at zero. `session.load` is checked the same way.
