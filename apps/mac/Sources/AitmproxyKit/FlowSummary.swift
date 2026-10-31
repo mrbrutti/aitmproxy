@@ -124,6 +124,8 @@ public struct FlowSummary: Hashable, Sendable {
     private static func identifier(_ value: JSONValue?) -> String? {
         guard let text = value?.stringValue, !text.isEmpty else { return nil }
         return text
+    }
+
     /// A non-negative whole number of milliseconds, else nil: absent, `null`, negative
     /// or fractional (`intValue` already rejects a non-integral number).
     private static func wholeMillis(_ value: JSONValue?) -> Int? {
