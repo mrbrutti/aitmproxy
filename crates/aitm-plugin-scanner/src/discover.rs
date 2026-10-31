@@ -312,6 +312,16 @@ mod tests {
             .unwrap_or_else(|| panic!("no {location:?} point named {name}: {points:?}"))
     }
 
+    /// Assert that no point's example contains any of the `leaked` secrets.
+    fn assert_no_leak(points: &[InjectionPoint], leaked: &[&str]) {
+        for leaked in leaked {
+            assert!(
+                !points.iter().any(|p| p.example.contains(leaked)),
+                "{leaked} leaked: {points:?}"
+            );
+        }
+    }
+
     #[test]
     fn enumerate_finds_query_body_cookie_path() {
         let mut headers = HeaderMap::new();
@@ -592,12 +602,7 @@ mod tests {
             "2",
             "a plain parameter keeps its value"
         );
-        for leaked in ["acme", "bob"] {
-            assert!(
-                !points.iter().any(|p| p.example.contains(leaked)),
-                "{leaked} leaked: {points:?}"
-            );
-        }
+        assert_no_leak(&points, &["acme", "bob"]);
     }
 
     /// A wide-only name is redacted however it arrives: percent-encoded or
@@ -626,12 +631,7 @@ mod tests {
         );
         assert_eq!(example_of(&points, Location::Query, "sid\u{e9}"), REDACTED);
         assert_eq!(example_of(&points, Location::Query, "page"), "2");
-        for leaked in ["qval", "evil.test", "uval"] {
-            assert!(
-                !points.iter().any(|p| p.example.contains(leaked)),
-                "{leaked} leaked: {points:?}"
-            );
-        }
+        assert_no_leak(&points, &["qval", "evil.test", "uval"]);
 
         let mut headers = HeaderMap::new();
         headers.set("Content-Type", "application/x-www-form-urlencoded");
@@ -648,12 +648,7 @@ mod tests {
             example_of(&points, Location::Header, "X-Authority"),
             REDACTED
         );
-        for leaked in ["formval", "hdrval"] {
-            assert!(
-                !points.iter().any(|p| p.example.contains(leaked)),
-                "{leaked} leaked: {points:?}"
-            );
-        }
+        assert_no_leak(&points, &["formval", "hdrval"]);
 
         let mut headers = HeaderMap::new();
         headers.set("Content-Type", "application/json");
@@ -669,12 +664,7 @@ mod tests {
             REDACTED
         );
         assert_eq!(example_of(&points, Location::BodyParam, "page"), "3");
-        for leaked in ["jsonval", "nestedval"] {
-            assert!(
-                !points.iter().any(|p| p.example.contains(leaked)),
-                "{leaked} leaked: {points:?}"
-            );
-        }
+        assert_no_leak(&points, &["jsonval", "nestedval"]);
     }
 
     /// A hostile body of a million parameters must be capped, and the dedupe

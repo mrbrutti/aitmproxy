@@ -13,17 +13,17 @@
 //! over the step's URL and body — a scrub that erases the inject payload at a
 //! secret-named point and corrupts a JSON body — so `build_poc` re-derives the
 //! URL and body from the mutated request and scrubs them, and the rest of what
-//! it copies, itself (see `Scrubber`): every secret-named
-//! header, query parameter, form field and JSON key becomes a required `{{var}}`
-//! placeholder the runner must be given at run time, and every other value is
-//! passed through `scrub_embedded` — URL userinfo stripped, then
+//! it copies, itself (see `Scrubber`): every secret-named header, query
+//! parameter, form field and JSON key becomes a required `{{var}}` placeholder
+//! the runner must be given at run time, and every other value is passed
+//! through `scrub_embedded` — URL userinfo stripped, then
 //! [`aitm_core::redact::scrub_text_wide`], the wide reading of the same
 //! vocabulary [`is_secret_name`] applies to a name, so a credential embedded in
-//! an innocuously named value cannot slip past a narrower list.
-//! `record_finding` is a thin
-//! wrapper over [`aitm_findings::DiskFindingStore`]: the store itself scrubs
-//! `title`/`notes` of credential material before anything reaches disk, and the
-//! record's `target` is scrubbed here.
+//! an innocuously named value cannot slip past a narrower reading.
+//!
+//! `record_finding` is a thin wrapper over [`aitm_findings::DiskFindingStore`]:
+//! the store itself scrubs `title`/`notes` of credential material before
+//! anything reaches disk, and the record's `target` is scrubbed here.
 
 use std::collections::HashSet;
 
@@ -366,11 +366,12 @@ impl<'a> Scrubber<'a> {
 /// URL userinfo is stripped first ([`strip_userinfo`]: `//user:pw@host` →
 /// `//host`), so a `user:pw@` prefix cannot make the scan swallow the host. Then
 /// [`scrub_text_wide`] masks every `key=value` / `key: value` pair whose key
-/// reads as a secret under the wide reading, the same reading [`is_secret_name`]
-/// applies to the *name* of a header or parameter. A `sid=`, `auth=` or `author=`
-/// pair embedded in a `Referer`-style or URL-valued value is therefore masked
-/// exactly as it would be under a name, and the two scrubs cannot disagree about
-/// which names are secret.
+/// reads as a secret: it runs core's one pair scan twice, first with the
+/// standard reading and then with the wide one. This scrub and
+/// [`is_secret_name`], which decides the *name* of a header or parameter, judge
+/// a key by the same predicate, so a `sid=`, `auth=` or `author=` pair embedded
+/// in a `Referer`-style or URL-valued value is masked as it would be under a
+/// name.
 fn scrub_embedded(text: &str) -> String {
     scrub_text_wide(&strip_userinfo(text))
 }
@@ -1179,10 +1180,10 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
-    /// The reviewer's measured leak: before PR 171 none of these names was in
-    /// the shared set, so a `Referer` carrying them was emitted verbatim. The
-    /// shared vocabulary now holds all of them, and the embedded-value scrub and
-    /// the name scrub read it the same way.
+    /// The reviewer's measured leak: `scrub_text` alone did not know these
+    /// names until PR 171, so a `Referer` scrubbed by it alone was emitted
+    /// verbatim. The embedded-value scrub must mask all of them, and the shared
+    /// vocabulary now holds all of them, read the same way by the name scrub.
     #[test]
     fn build_poc_drops_the_referer_query_and_leaks_no_session_id() {
         let def = CheckDefinition::reflected_xss();
@@ -1376,8 +1377,8 @@ mod tests {
             scrub_embedded(r#"{"session":"a b c","n":1}"#),
             r#"{"session":"[redacted]","n":1}"#
         );
-        // The long words of the shared list apply in the same scan as the short
-        // ones (one scan, one list).
+        // The long words of the shared list apply alongside the short ones:
+        // one list, read by the wide scrub.
         assert_eq!(
             scrub_embedded("access_token=T&sid=S"),
             "access_token=[redacted]&sid=[redacted]"
@@ -1551,7 +1552,18 @@ mod tests {
         assert_eq!(percent_decode(""), "");
     }
 
-    // ---- Pins taken before the embedded-value scrub and the name decisions merge ----
+    // ---- Pins: the name decisions, and the output of the old two-scan pipeline ----
+
+    /// The rows whose `scrub_embedded` output is not the expected one, as
+    /// `(input, expected, actual)`, so a failing test lists every bad row at once.
+    fn embedded_mismatches<'a>(rows: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str, String)> {
+        rows.iter()
+            .filter_map(|&(input, expected)| {
+                let actual = scrub_embedded(input);
+                (actual != expected).then_some((input, expected, actual))
+            })
+            .collect()
+    }
 
     /// A parameter whose name only contains one of the short secret words
     /// (`author` holds `auth`) is placeholdered in a PoC and never recorded.
@@ -1660,20 +1672,46 @@ mod tests {
     /// not what anyone expected, and each family is a shape a user can send.
     const RECORDED_SCRUB_EMBEDDED: &[(&str, &str)] = &[
         // (i) every string the existing scrub_embedded_* and build_poc_scrubs_* tests reach
-        ("username=admin&password=PWSECRET789&q=hello", "username=admin&password=[redacted]&q=hello"),
+        (
+            "username=admin&password=PWSECRET789&q=hello",
+            "username=admin&password=[redacted]&q=hello",
+        ),
         ("/cb?access_token=DBLSECRET1", "/cb?access_token=[redacted]"),
-        ("application/x-www-form-urlencoded", "application/x-www-form-urlencoded"),
-        ("{\"password\":\"FORMJSONPW1\"}", "{\"password\":\"[redacted]\"}"),
+        (
+            "application/x-www-form-urlencoded",
+            "application/x-www-form-urlencoded",
+        ),
+        (
+            "{\"password\":\"FORMJSONPW1\"}",
+            "{\"password\":\"[redacted]\"}",
+        ),
         ("application/json", "application/json"),
         ("http://target.test/app", "http://target.test/app"),
         ("admin", "admin"),
         ("Bearer JSONBEARER3", "Bearer [redacted]"),
-        ("/cb?access_token=NESTED999&x=1", "/cb?access_token=[redacted]&x=1"),
-        ("http://t/cb?PHPSESSID=[redacted]&sid=[redacted]&jwt=[redacted]&auth=[redacted]&session=[redacted]&csrf=[redacted]&access_token=[redacted]&page=2", "http://t/cb?PHPSESSID=[redacted]&sid=[redacted]&jwt=[redacted]&auth=[redacted]&session=[redacted]&csrf=[redacted]&access_token=[redacted]&page=2"),
-        ("/cb?sid=NEXTSID&jwt=NEXTJWT&session=NEXTSESS", "/cb?sid=[redacted]&jwt=[redacted]&session=[redacted]"),
-        ("http://t/cb?sid=JSONSID1&jwt=JSONJWT2", "http://t/cb?sid=[redacted]&jwt=[redacted]"),
+        (
+            "/cb?access_token=NESTED999&x=1",
+            "/cb?access_token=[redacted]&x=1",
+        ),
+        (
+            "http://t/cb?PHPSESSID=[redacted]&sid=[redacted]&jwt=[redacted]&auth=[redacted]\
+             &session=[redacted]&csrf=[redacted]&access_token=[redacted]&page=2",
+            "http://t/cb?PHPSESSID=[redacted]&sid=[redacted]&jwt=[redacted]&auth=[redacted]\
+             &session=[redacted]&csrf=[redacted]&access_token=[redacted]&page=2",
+        ),
+        (
+            "/cb?sid=NEXTSID&jwt=NEXTJWT&session=NEXTSESS",
+            "/cb?sid=[redacted]&jwt=[redacted]&session=[redacted]",
+        ),
+        (
+            "http://t/cb?sid=JSONSID1&jwt=JSONJWT2",
+            "http://t/cb?sid=[redacted]&jwt=[redacted]",
+        ),
         ("csrf: JSONCSRF3", "csrf: [redacted]"),
-        ("username=admin&sid=BODYSID1&jwt=BODYJWT2", "username=admin&sid=[redacted]&jwt=[redacted]"),
+        (
+            "username=admin&sid=BODYSID1&jwt=BODYJWT2",
+            "username=admin&sid=[redacted]&jwt=[redacted]",
+        ),
         ("x_sid_y=V1&z=2", "x_sid_y=[redacted]&z=2"),
         ("SID: V1", "SID: [redacted]"),
         ("x_jwt_y=V1&z=2", "x_jwt_y=[redacted]&z=2"),
@@ -1684,7 +1722,10 @@ mod tests {
         ("SESSION: V1", "SESSION: [redacted]"),
         ("x_auth_y=V1&z=2", "x_auth_y=[redacted]&z=2"),
         ("AUTH: V1", "AUTH: [redacted]"),
-        ("{\"sid\":\"a\\\"b c\",\"n\":1}", "{\"sid\":\"[redacted]\",\"n\":1}"),
+        (
+            "{\"sid\":\"a\\\"b c\",\"n\":1}",
+            "{\"sid\":\"[redacted]\",\"n\":1}",
+        ),
         ("{'jwt' : 'a b','n':1}", "{'jwt' : '[redacted]','n':1}"),
         ("sid=\"abc&x=1", "sid=\"[redacted]&x=1"),
         ("{\"sid\":\"\",\"n\":1}", "{\"sid\":\"\",\"n\":1}"),
@@ -1695,89 +1736,203 @@ mod tests {
         ("", ""),
         ("plain text with no pairs", "plain text with no pairs"),
         ("subsidiary=acme", "subsidiary=[redacted]"),
-        ("h\u{e9}llo sid=w\u{f6}rld \u{fc}n\u{ef}", "h\u{e9}llo sid=[redacted] \u{fc}n\u{ef}"),
-        ("PHPSESSID=A&sid=B&jwt=C&auth=D&session=E&csrf=F&page=2", "PHPSESSID=[redacted]&sid=[redacted]&jwt=[redacted]&auth=[redacted]&session=[redacted]&csrf=[redacted]&page=2"),
+        (
+            "h\u{e9}llo sid=w\u{f6}rld \u{fc}n\u{ef}",
+            "h\u{e9}llo sid=[redacted] \u{fc}n\u{ef}",
+        ),
+        (
+            "PHPSESSID=A&sid=B&jwt=C&auth=D&session=E&csrf=F&page=2",
+            "PHPSESSID=[redacted]&sid=[redacted]&jwt=[redacted]&auth=[redacted]&session=[redacted]\
+             &csrf=[redacted]&page=2",
+        ),
         ("X-CSRF: abc", "X-CSRF: [redacted]"),
         ("sid:abc", "sid:[redacted]"),
         ("sid = abc", "sid = [redacted]"),
-        ("{\"sid\":\"S1\",\"jwt\": \"J2\", \"n\":1}", "{\"sid\":\"[redacted]\",\"jwt\": \"[redacted]\", \"n\":1}"),
-        ("{\"session\":\"a b c\",\"n\":1}", "{\"session\":\"[redacted]\",\"n\":1}"),
-        ("access_token=T&sid=S", "access_token=[redacted]&sid=[redacted]"),
+        (
+            "{\"sid\":\"S1\",\"jwt\": \"J2\", \"n\":1}",
+            "{\"sid\":\"[redacted]\",\"jwt\": \"[redacted]\", \"n\":1}",
+        ),
+        (
+            "{\"session\":\"a b c\",\"n\":1}",
+            "{\"session\":\"[redacted]\",\"n\":1}",
+        ),
+        (
+            "access_token=T&sid=S",
+            "access_token=[redacted]&sid=[redacted]",
+        ),
         ("go to http://user:pw@host/p?x=1", "go to http://host/p?x=1"),
         // (ii) quotes and escapes
-        ("{\"token\":\"a\\\\b c\",\"n\":1}", "{\"token\":\"[redacted]\",\"n\":1}"),
-        ("{\"sid\":\"S1\\\\\",\"n\":1}", "{\"sid\":\"[redacted]\",\"n\":1}"),
+        (
+            "{\"token\":\"a\\\\b c\",\"n\":1}",
+            "{\"token\":\"[redacted]\",\"n\":1}",
+        ),
+        (
+            "{\"sid\":\"S1\\\\\",\"n\":1}",
+            "{\"sid\":\"[redacted]\",\"n\":1}",
+        ),
         ("{'sid':'it\\'s','n':1}", "{'sid':'[redacted]','n':1}"),
-        ("{\"auth\":\"x\\\"y z\",\"n\":1}", "{\"auth\":\"[redacted]\",\"n\":1}"),
-        ("{\"session\":\"tab\\there\\nnext\",\"n\":1}", "{\"session\":\"[redacted]\",\"n\":1}"),
+        (
+            "{\"auth\":\"x\\\"y z\",\"n\":1}",
+            "{\"auth\":\"[redacted]\",\"n\":1}",
+        ),
+        (
+            "{\"session\":\"tab\\there\\nnext\",\"n\":1}",
+            "{\"session\":\"[redacted]\",\"n\":1}",
+        ),
         ("sid=\"a b\"&x=1", "sid=\"[redacted]\"&x=1"),
         ("password='a b' z=1", "password='[redacted]' z=1"),
-        ("{\"sid\":\"a\",\"jwt\":\"b\",\"csrf\":\"c\"}", "{\"sid\":\"[redacted]\",\"jwt\":\"[redacted]\",\"csrf\":\"[redacted]\"}"),
+        (
+            "{\"sid\":\"a\",\"jwt\":\"b\",\"csrf\":\"c\"}",
+            "{\"sid\":\"[redacted]\",\"jwt\":\"[redacted]\",\"csrf\":\"[redacted]\"}",
+        ),
         ("sid=\"abc", "sid=\"[redacted]"),
         ("sid='abc def", "sid='[redacted] def"),
-        ("subsidiary=\"acme corp\"&x=1", "subsidiary=\"[redacted]\"&x=1"),
-        ("{\"subsidiary\":\"a b\",\"n\":1}", "{\"subsidiary\":\"[redacted]\",\"n\":1}"),
+        (
+            "subsidiary=\"acme corp\"&x=1",
+            "subsidiary=\"[redacted]\"&x=1",
+        ),
+        (
+            "{\"subsidiary\":\"a b\",\"n\":1}",
+            "{\"subsidiary\":\"[redacted]\",\"n\":1}",
+        ),
         // (iii) pairs nested in a non-secret key's value
         ("next=/cb?sid=S1", "next=/cb?sid=[redacted]"),
         ("next=/cb?author=S1&x=1", "next=/cb?author=[redacted]&x=1"),
         ("next=/cb?sidebar=S1", "next=/cb?sidebar=[redacted]"),
-        ("redirect=http://t/cb?jwt=J1&session=S2&page=3", "redirect=http://t/cb?jwt=[redacted]&session=[redacted]&page=3"),
-        ("url=/a?x=1&password=P1&y=2", "url=/a?x=1&password=[redacted]&y=2"),
+        (
+            "redirect=http://t/cb?jwt=J1&session=S2&page=3",
+            "redirect=http://t/cb?jwt=[redacted]&session=[redacted]&page=3",
+        ),
+        (
+            "url=/a?x=1&password=P1&y=2",
+            "url=/a?x=1&password=[redacted]&y=2",
+        ),
         ("back=/cb%3Fsid%3DS1", "back=/cb%3Fsid%3DS1"),
         ("ref=a?b=c&author=Z9;x=1", "ref=a?b=c&author=[redacted];x=1"),
         ("author=password=S3", "author=[redacted]"),
         ("msg=hello sid=S1 world", "msg=hello sid=[redacted] world"),
         // (iv) URL userinfo
-        ("http://user:pw@host/p?sid=S1", "http://host/p?sid=[redacted]"),
+        (
+            "http://user:pw@host/p?sid=S1",
+            "http://host/p?sid=[redacted]",
+        ),
         ("//auth:pw@host/x", "//host/x"),
-        ("see http://user:pw@host:8080/p?x=1 now", "see http://host:8080/p?x=1 now"),
+        (
+            "see http://user:pw@host:8080/p?x=1 now",
+            "see http://host:8080/p?x=1 now",
+        ),
         ("a=//u1:p1@h1/x&b=//u2@h2", "a=//h1/x&b=//h2"),
-        ("http://u:p@ss@host/x?author=Z", "http://host/x?author=[redacted]"),
-        ("ftp://admin:hunter2@files.example.com/pub", "ftp://files.example.com/pub"),
-        ("https://token:abc@api.example.com:8443/v1?session=S9", "https://api.example.com:8443/v1?session=[redacted]"),
-        ("http://user:pw@host/a@b?e=me@x.com", "http://host/a@b?e=me@x.com"),
+        (
+            "http://u:p@ss@host/x?author=Z",
+            "http://host/x?author=[redacted]",
+        ),
+        (
+            "ftp://admin:hunter2@files.example.com/pub",
+            "ftp://files.example.com/pub",
+        ),
+        (
+            "https://token:abc@api.example.com:8443/v1?session=S9",
+            "https://api.example.com:8443/v1?session=[redacted]",
+        ),
+        (
+            "http://user:pw@host/a@b?e=me@x.com",
+            "http://host/a@b?e=me@x.com",
+        ),
         // (v) empty values
         ("sid=", "sid="),
         ("subsidiary=&x=1", "subsidiary=&x=1"),
         ("token=&sid=&jwt=", "token=&sid=&jwt="),
-        ("{\"sid\":\"\",\"jwt\":\"\",\"n\":1}", "{\"sid\":\"\",\"jwt\":\"\",\"n\":1}"),
+        (
+            "{\"sid\":\"\",\"jwt\":\"\",\"n\":1}",
+            "{\"sid\":\"\",\"jwt\":\"\",\"n\":1}",
+        ),
         ("sid= &x=1", "sid= &x=1"),
         ("sid=&password=x", "sid=&password=[redacted]"),
         ("auth:", "auth:"),
         ("session=\"\"", "session=\"\""),
         // (vi) Authorization and Bearer
-        ("Authorization: Bearer abc.def.ghi", "Authorization: [redacted]"),
-        ("Authorization: Basic dXNlcjpwdw==", "Authorization: [redacted]"),
+        (
+            "Authorization: Bearer abc.def.ghi",
+            "Authorization: [redacted]",
+        ),
+        (
+            "Authorization: Basic dXNlcjpwdw==",
+            "Authorization: [redacted]",
+        ),
         ("authorization=Bearer abc", "authorization=[redacted]"),
         ("Bearer abc123 and more", "Bearer [redacted] and more"),
-        ("curl -H \"Authorization: Bearer T0K3N\" http://t/x", "curl -H \"Authorization: [redacted]"),
+        (
+            "curl -H \"Authorization: Bearer T0K3N\" http://t/x",
+            "curl -H \"Authorization: [redacted]",
+        ),
         ("X-Auth: Bearer abc", "X-Auth: [redacted] [redacted]"),
-        ("Proxy-Authorization: Basic Zm9v", "Proxy-Authorization: [redacted]"),
-        ("{\"Authorization\":\"Bearer abc\"}", "{\"Authorization\":\"[redacted] [redacted]"),
+        (
+            "Proxy-Authorization: Basic Zm9v",
+            "Proxy-Authorization: [redacted]",
+        ),
+        (
+            "{\"Authorization\":\"Bearer abc\"}",
+            "{\"Authorization\":\"[redacted] [redacted]",
+        ),
         ("X-Api-Key: K1", "X-Api-Key: [redacted]"),
         // (vii) Referer-shaped values given directly
-        ("http://t/app?PHPSESSID=REFPHP1&sid=REFSID2&jwt=REFJWT3&auth=REFAUTH4&session=REFSESS5&csrf=REFCSRF6", "http://t/app?PHPSESSID=[redacted]&sid=[redacted]&jwt=[redacted]&auth=[redacted]&session=[redacted]&csrf=[redacted]"),
+        (
+            "http://t/app?PHPSESSID=REFPHP1&sid=REFSID2&jwt=REFJWT3&auth=REFAUTH4&session=REFSESS5\
+             &csrf=REFCSRF6",
+            "http://t/app?PHPSESSID=[redacted]&sid=[redacted]&jwt=[redacted]&auth=[redacted]\
+             &session=[redacted]&csrf=[redacted]",
+        ),
         ("http://t/cb#sid=FRAGSID7", "http://t/cb#sid=[redacted]"),
-        ("https://shop.example.com/cart?author=A1&page=2#session=S2", "https://shop.example.com/cart?author=[redacted]&page=2#session=[redacted]"),
+        (
+            "https://shop.example.com/cart?author=A1&page=2#session=S2",
+            "https://shop.example.com/cart?author=[redacted]&page=2#session=[redacted]",
+        ),
         ("http://t/app", "http://t/app"),
-        ("https://example.com:8443/path?next=/cb%3Fsid%3DS1", "https://example.com:8443/path?next=/cb%3Fsid%3DS1"),
+        (
+            "https://example.com:8443/path?next=/cb%3Fsid%3DS1",
+            "https://example.com:8443/path?next=/cb%3Fsid%3DS1",
+        ),
         // (viii) percent-decoded values as scrub_decoded hands them over
-        ("/cb?sid=NEXTSID&jwt=NEXTJWT", "/cb?sid=[redacted]&jwt=[redacted]"),
-        ("/cb?author=A1&sidebar=S2&page=3", "/cb?author=[redacted]&sidebar=[redacted]&page=3"),
-        ("/cb?next=/x?password=P1&sid=S1", "/cb?next=/x?password=[redacted]&sid=[redacted]"),
-        ("/cb?redirect=http://t/x?token=T1&csrf=C2", "/cb?redirect=http://t/x?token=[redacted]&csrf=[redacted]"),
+        (
+            "/cb?sid=NEXTSID&jwt=NEXTJWT",
+            "/cb?sid=[redacted]&jwt=[redacted]",
+        ),
+        (
+            "/cb?author=A1&sidebar=S2&page=3",
+            "/cb?author=[redacted]&sidebar=[redacted]&page=3",
+        ),
+        (
+            "/cb?next=/x?password=P1&sid=S1",
+            "/cb?next=/x?password=[redacted]&sid=[redacted]",
+        ),
+        (
+            "/cb?redirect=http://t/x?token=T1&csrf=C2",
+            "/cb?redirect=http://t/x?token=[redacted]&csrf=[redacted]",
+        ),
         ("/cb?q=a b&sid=S1", "/cb?q=a b&sid=[redacted]"),
         ("/cb?sid=a b c&x=1", "/cb?sid=[redacted] b c&x=1"),
         ("/cb?note=100%&sid=S1", "/cb?note=100%&sid=[redacted]"),
-        ("/cb?subsidiary=a+b&sid=S1", "/cb?subsidiary=[redacted]&sid=[redacted]"),
+        (
+            "/cb?subsidiary=a+b&sid=S1",
+            "/cb?subsidiary=[redacted]&sid=[redacted]",
+        ),
         // (ix) host:port rows for the five words
         ("auth.example.com:8443", "auth.example.com:[redacted]"),
         ("sid.example.com:8443/x", "sid.example.com:[redacted]"),
         ("jwt.example.com:443", "jwt.example.com:[redacted]"),
         ("csrf.example.com:8080/", "csrf.example.com:[redacted]"),
-        ("session.example.com:9000?x=1", "session.example.com:[redacted]"),
-        ("https://auth.example.com:8443/login", "https://auth.example.com:[redacted]"),
-        ("connect.sid.example.com:12345", "connect.sid.example.com:[redacted]"),
+        (
+            "session.example.com:9000?x=1",
+            "session.example.com:[redacted]",
+        ),
+        (
+            "https://auth.example.com:8443/login",
+            "https://auth.example.com:[redacted]",
+        ),
+        (
+            "connect.sid.example.com:12345",
+            "connect.sid.example.com:[redacted]",
+        ),
         ("sid:12345", "sid:[redacted]"),
         ("example.com:8443/x", "example.com:8443/x"),
         // (x) malformed families
@@ -1814,14 +1969,49 @@ mod tests {
         ("userSession=abc&x=1", "userSession=[redacted]&x=1"),
         ("X-Authority: example", "X-Authority: [redacted]"),
         ("Author=Bob", "Author=[redacted]"),
-        ("rhai.allow_agent_authoring=1", "rhai.allow_agent_authoring=[redacted]"),
+        (
+            "rhai.allow_agent_authoring=1",
+            "rhai.allow_agent_authoring=[redacted]",
+        ),
         ("sidebar='x y' z=1", "sidebar='[redacted]' z=1"),
-        ("{\"sidebar\":\"YWJj=\",\"user\":\"bob\"}", "{\"sidebar\":\"[redacted]\",\"user\":\"bob\"}"),
+        (
+            "{\"sidebar\":\"YWJj=\",\"user\":\"bob\"}",
+            "{\"sidebar\":\"[redacted]\",\"user\":\"bob\"}",
+        ),
+        // (xii) a standard-secret pair nested under a wide-only parent (YAML and
+        // inline), and a line break or form feed beside the separator of a wide-only key
+        (
+            "authentication:\n  password: hunter2",
+            "authentication:\n  password: [redacted]",
+        ),
+        ("author:\n  token: abc123", "author:\n  token: [redacted]"),
+        ("sessions:\n  jwt: J1", "sessions:\n  jwt: [redacted]"),
+        (
+            "sidebar:\n    api_key: K1",
+            "sidebar:\n    api_key: [redacted]",
+        ),
+        (
+            "authentication: {password: hunter2}",
+            "authentication: [redacted] [redacted]}",
+        ),
+        ("sidebar=sid=\"C1\"", "sidebar=[redacted]\"[redacted]\""),
+        ("author=password='C2'", "author=[redacted]'[redacted]'"),
+        ("inside=x?sid\t=\tC9", "inside=[redacted]\t=\t[redacted]"),
+        ("Auths:Pwd: C", "Auths:[redacted] [redacted]"),
+        (
+            "authentication:\n  sessionKey: abc123",
+            "authentication:\n  sessionKey: [redacted]",
+        ),
+        ("side:\nSid2':C", "side:\nSid2':[redacted]"),
+        ("bsid:\rSIDE:'C", "bsid:\rSIDE:'[redacted]"),
+        ("author:\nJohn", "author:\nJohn"),
+        ("sidebar\n:v", "sidebar\n:v"),
+        ("sidebar=\u{c}v", "sidebar=\u{c}v"),
     ];
 
-    /// The old pipeline's output, row by row: the embedded-value scrub still
-    /// returns exactly what it returned before the scanner stopped keeping its
-    /// own second scan.
+    /// The recorded output of the old two-scan pipeline at `15009b2`, row by
+    /// row: for every input of [`RECORDED_SCRUB_EMBEDDED`] the embedded-value
+    /// scrub returns exactly what that pipeline printed.
     #[test]
     fn scrub_embedded_matches_the_recorded_pipeline_output() {
         assert!(
@@ -1838,26 +2028,20 @@ mod tests {
             "an input is listed twice"
         );
 
-        let bad: Vec<(&str, &str, String)> = RECORDED_SCRUB_EMBEDDED
-            .iter()
-            .filter_map(|&(input, recorded)| {
-                let actual = scrub_embedded(input);
-                (actual != recorded).then_some((input, recorded, actual))
-            })
-            .collect();
+        let bad = embedded_mismatches(RECORDED_SCRUB_EMBEDDED);
         assert!(
             bad.is_empty(),
             "rows that differ from the recorded output (input, recorded, actual): {bad:#?}"
         );
     }
 
-    /// The deliberate output changes of the one-scan pipeline, one row per
-    /// change (DC1 to DC6 of the spec), each with the old two-scan pipeline's
-    /// output in a comment. These inputs are the only ones whose
-    /// `scrub_embedded` output differs from what that pipeline printed; every
-    /// row of [`RECORDED_SCRUB_EMBEDDED`] is unchanged. DC5 and DC6 mask less
-    /// than before, and only on malformed input (a vertical tab or a non-ASCII
-    /// space inside an unquoted value, a quote that never closes).
+    /// One row per deliberate change, DC1 to DC6 of the spec
+    /// (`docs/superpowers/specs/2026-10-31-scanner-vocab-consolidation-design.md`),
+    /// each with the output of the old two-scan pipeline at `15009b2` in a
+    /// comment. Every row of [`RECORDED_SCRUB_EMBEDDED`] is unchanged. DC5 and
+    /// DC6 mask less than that pipeline did, and only on malformed input (a
+    /// vertical tab or a non-ASCII space inside an unquoted value, a quote that
+    /// never closes).
     #[test]
     fn scrub_embedded_deliberate_changes_are_exactly_these() {
         let rows: &[(&str, &str)] = &[
@@ -1883,13 +2067,7 @@ mod tests {
         ];
         assert!(rows.len() >= 8, "the table shrank: {} rows", rows.len());
 
-        let bad: Vec<(&str, &str, String)> = rows
-            .iter()
-            .filter_map(|&(input, expected)| {
-                let actual = scrub_embedded(input);
-                (actual != expected).then_some((input, expected, actual))
-            })
-            .collect();
+        let bad = embedded_mismatches(rows);
         assert!(
             bad.is_empty(),
             "rows that differ from the new output (input, expected, actual): {bad:#?}"
@@ -1919,13 +2097,7 @@ mod tests {
                 "\u{e9}//h\u{f6}st/\u{fc}",
             ),
         ];
-        let bad: Vec<(&str, &str, String)> = rows
-            .iter()
-            .filter_map(|&(input, expected)| {
-                let actual = scrub_embedded(input);
-                (actual != expected).then_some((input, expected, actual))
-            })
-            .collect();
+        let bad = embedded_mismatches(rows);
         assert!(
             bad.is_empty(),
             "rows that differ (input, expected, actual): {bad:#?}"
@@ -1955,9 +2127,9 @@ mod tests {
         );
     }
 
-    /// The ends of the text and the non-ASCII boundaries, as the one scan reads
-    /// them. The non-ASCII rows are the shapes of DC1 and DC5 of the spec, pinned
-    /// here as the new output.
+    /// The ends of the text and the non-ASCII boundaries, as the wide scrub
+    /// reads them. The non-ASCII rows are the shapes of DC1 and DC5 of the spec,
+    /// pinned here as the new output.
     #[test]
     fn scrub_embedded_reads_the_edges_of_the_text() {
         let rows: &[(&str, &str)] = &[
@@ -1972,13 +2144,7 @@ mod tests {
             ("author\u{e9}", "author\u{e9}"),
             ("si\u{e9}d=v", "si\u{e9}d=v"),
         ];
-        let bad: Vec<(&str, &str, String)> = rows
-            .iter()
-            .filter_map(|&(input, expected)| {
-                let actual = scrub_embedded(input);
-                (actual != expected).then_some((input, expected, actual))
-            })
-            .collect();
+        let bad = embedded_mismatches(rows);
         assert!(
             bad.is_empty(),
             "rows that differ (input, expected, actual): {bad:#?}"
@@ -2084,6 +2250,20 @@ mod tests {
         assert!(
             url.ends_with("&u=auth.example.com%3A%5Bredacted%5D"),
             "{url}"
+        );
+    }
+
+    /// `safe_target` cleans free text for an error message and keeps the
+    /// standard reading: a query whose names hold a short secret word only inside
+    /// a longer name stays readable. The same text handed to `scrub_embedded` is
+    /// read the wide way and masked, so this pin tells the two readings apart.
+    #[test]
+    fn safe_target_reads_a_query_by_the_standard_reading() {
+        let text = "http://t/x?authority=ex&author=3&side=left";
+        assert_eq!(crate::crawl::safe_target(text), text);
+        assert_eq!(
+            scrub_embedded(text),
+            "http://t/x?authority=[redacted]&author=[redacted]&side=[redacted]"
         );
     }
 }
