@@ -39,6 +39,9 @@ struct OverviewPanel: View {
             .padding(Space.margin)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        // The page never reports a minimum width to the shell split: three-up rows would
+        // otherwise nudge the sidebar divider by a fraction of a point and blur every edge.
+        .frame(minWidth: 0, maxWidth: .infinity)
         .background(Tok.Ground.surface.color)
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
         .gridArea("overview")

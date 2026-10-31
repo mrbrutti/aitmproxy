@@ -62,15 +62,21 @@ struct CommandPalette: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     let grouped = Dictionary(grouping: items.enumerated().map { ($0.offset, $0.element) }, by: { $0.1.section })
-                    ForEach(PaletteSection.allCases, id: \.self) { section in
+                    // Sections appear in the order the ranking produced them, so a literal hit
+                    // (a host typed into the field) leads with its flows instead of sitting
+                    // under every fuzzy command match.
+                    let order = items.reduce(into: [PaletteSection]()) { if !$0.contains($1.section) { $0.append($1.section) } }
+                    ForEach(order, id: \.self) { section in
                         if let rows = grouped[section], !rows.isEmpty {
                             Text(section.title.uppercased())
                                 .font(Tok.Face.ui(Tok.Typography.Size.xs, .medium)).tracking(0.6)
                                 .foregroundStyle(Tok.Ink.tertiary.color)
                                 .padding(.horizontal, Space.lg).padding(.top, Space.md).padding(.bottom, Space.xs)
-                            ForEach(rows, id: \.0) { index, item in
+                            // Rows are identified by the item, not the slot, so a re-ranked list
+                            // (the query changed) re-renders every row instead of reusing stale ones.
+                            ForEach(rows, id: \.1.id) { index, item in
                                 PaletteRow(item: item, highlighted: index == highlighted)
-                                    .id(index)
+                                    .id(item.id)
                                     .onTapGesture { highlighted = index; activate() }
                             }
                         }
@@ -83,7 +89,7 @@ struct CommandPalette: View {
                 }
                 .padding(.bottom, Space.sm)
             }
-            .onChange(of: highlighted) { proxy.scrollTo(highlighted) }
+            .onChange(of: highlighted) { if items.indices.contains(highlighted) { proxy.scrollTo(items[highlighted].id) } }
         }
     }
 
