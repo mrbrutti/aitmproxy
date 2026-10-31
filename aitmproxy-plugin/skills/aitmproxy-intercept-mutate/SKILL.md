@@ -20,8 +20,11 @@ tools park for operator `agent.approve`; under `readonly`/`paused` they do not r
   A rule is an object with optional fields: `phase` (`request` default, `response`,
   `ws_frame`, `any`), `url` (a `*` wildcard string, or `{wildcard}` / `{regex}`),
   `method`, `host` (an exact authority string, or `{exact}` / `{wildcard}`),
-  `ws_dir` (`c2s` / `s2c`), plus `id`, `name`, `enabled`. For example
-  `rules: [{ "method": "POST", "url": "*/api/cart/*" }]`.
+  `ws_dir` (`c2s` / `s2c`), plus `id`, `name`, `enabled`. A `url` pattern is
+  matched against the full URL (`scheme://host[:port]/path?query`) and against
+  the path alone; wildcards are case-insensitive and a pattern without `*`
+  matches as a substring; a regex is searched case-insensitively (`(?-i)` opts
+  out). For example `rules: [{ "method": "POST", "url": "*/api/cart/*" }]`.
 - **`ws.intercept [--enabled] [--rules]`** does the same for WebSocket frames
   (Phase::WsFrame): which live frames are parked for `ws.frame`.
 
