@@ -49,6 +49,7 @@ fn flow_with_bodies() -> Flow {
             status: 200,
             version: HttpVersion::H2,
             headers: headers(&[("content-type", "application/json")]),
+            trailers: HeaderMap::new(),
             body: Body::Bytes(b"{\"token\":\"xyz\"}".to_vec()),
             timestamp: SystemTime::now(),
         }),

@@ -39,6 +39,7 @@ fn xss_flow() -> HttpFlow {
             status: 200,
             version: HttpVersion::Http11,
             headers: HeaderMap::new(),
+            trailers: HeaderMap::new(),
             body: Body::Bytes(b"<html><script>alert(1)</script></html>".to_vec()),
             timestamp: SystemTime::now(),
         }),

@@ -15,6 +15,7 @@ fn http_flow_terminal(authority: &str, path: &str, body_len: usize) -> Flow {
             status: 200,
             version: HttpVersion::Http11,
             headers: HeaderMap::new(),
+            trailers: HeaderMap::new(),
             body: Body::Bytes(vec![b'x'; body_len]),
             timestamp: SystemTime::now(),
         });
@@ -140,6 +141,43 @@ fn insert_get_roundtrip() {
         Flow::Http(f) => assert_eq!(f.request.path, "/a"),
         other => panic!("expected http flow, got {other:?}"),
     }
+}
+
+/// Trailer fields ride beside a response's headers, never in them: the store
+/// hands back the same two lists, in wire order, with case and the duplicate kept.
+#[test]
+fn a_response_keeps_trailers_beside_its_headers_never_in_them() {
+    let mut headers = HeaderMap::new();
+    headers.set("Content-Type", "text/plain");
+    let mut trailers = HeaderMap::new();
+    trailers.set("X-Sum", "abc");
+    trailers.set("x-sum", "def");
+
+    let mut flow = http_flow("a.test", "/t");
+    if let Flow::Http(h) = &mut flow {
+        h.response = Some(HttpResponse {
+            status: 200,
+            version: HttpVersion::Http11,
+            headers,
+            trailers,
+            body: Body::Bytes(b"hello".to_vec()),
+            timestamp: SystemTime::now(),
+        });
+    }
+
+    let store = MemFlowStore::new();
+    let id = store.insert(flow);
+    let Some(Flow::Http(got)) = store.get(id) else {
+        panic!("expected the http flow back from the store");
+    };
+    let response = got.response.expect("the response was stored");
+
+    assert_eq!(
+        response.trailers.iter().collect::<Vec<_>>(),
+        [("X-Sum", "abc"), ("x-sum", "def")]
+    );
+    assert_eq!(response.headers.get("x-sum"), None);
+    assert_eq!(response.headers.len(), 1);
 }
 
 #[test]

@@ -260,6 +260,7 @@ fn rec_to_resp(r: &RespRec) -> HttpResponse {
         status: r.status,
         version: rec_to_version(r.version),
         headers: rec_to_headers(&r.headers),
+        trailers: HeaderMap::new(),
         body: rec_to_body(&r.body),
         timestamp: r.timestamp,
     }

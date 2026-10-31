@@ -269,6 +269,7 @@ fn entry_to_http(entry: &HarEntry) -> anyhow::Result<HttpFlow> {
         status: entry.response.status,
         version: parse_version(&entry.response.http_version),
         headers: har_headers(&entry.response.headers),
+        trailers: HeaderMap::new(),
         body: content_to_body(&entry.response.content)?,
         timestamp: UNIX_EPOCH,
     };

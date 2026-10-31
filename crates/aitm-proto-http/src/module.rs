@@ -1093,6 +1093,7 @@ fn oversized_response() -> HttpResponse {
         status: 413,
         version: HttpVersion::Http11,
         headers,
+        trailers: HeaderMap::new(),
         body: Body::Bytes(b"request body exceeds the configured limit".to_vec()),
         timestamp: SystemTime::now(),
     }

@@ -714,6 +714,7 @@ fn parse_response(head: &[u8]) -> Result<HttpResponse> {
         status,
         version: HttpVersion::Http11,
         headers,
+        trailers: HeaderMap::new(),
         body: Body::Empty,
         timestamp: std::time::SystemTime::now(),
     })
@@ -1104,6 +1105,7 @@ mod tests {
         m.enqueue_response(&HttpResponse {
             status: 200,
             headers: HeaderMap::new(),
+            trailers: HeaderMap::new(),
             body: Body::Empty,
             version: HttpVersion::Http11,
             timestamp: std::time::SystemTime::now(),

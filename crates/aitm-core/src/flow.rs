@@ -50,6 +50,10 @@ impl std::str::FromStr for FlowId {
 }
 
 /// Every captured interaction. An enum so new protocols slot in without core edits.
+// The Http variant is the large one by design: it holds the whole decoded
+// exchange. Boxing it would ripple through every `Flow::Http(` use in the
+// workspace, so the size gap to `WebSocket` is accepted.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Flow {
     Http(HttpFlow),
@@ -140,6 +144,12 @@ pub struct HttpResponse {
     pub status: u16,
     pub version: HttpVersion,
     pub headers: HeaderMap,
+    /// Trailer fields received after a chunked body (RFC 9110 6.5), in wire
+    /// order with duplicates kept. Held apart from `headers` on purpose and
+    /// never merged into them. This is a capture field: no code path writes it
+    /// to a wire without the forbidden-name filter. Only HTTP/1.1 chunked
+    /// responses produce trailers today; h2 trailers are still dropped.
+    pub trailers: HeaderMap,
     pub body: Body,
     pub timestamp: SystemTime,
 }

@@ -70,6 +70,7 @@ impl ProxyClient for StubClient {
                     status: 200,
                     version: HttpVersion::Http11,
                     headers: HeaderMap::new(),
+                    trailers: HeaderMap::new(),
                     body: Body::Bytes(b"pong".to_vec()),
                     timestamp: SystemTime::now(),
                 }),
