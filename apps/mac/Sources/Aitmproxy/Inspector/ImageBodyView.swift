@@ -85,11 +85,25 @@ struct DecodedImage {
     }
 }
 
-/// The picture at 1× (fit to the pane when larger, never upscaled) on an 8 pt
-/// checkerboard, the caption beneath; hex under a notice when it cannot be read.
+/// How the image viewer sizes the picture: Fit the pane, or a fixed zoom.
+enum ImageZoom: Hashable, CaseIterable {
+    case fit, actual, large
+    var label: String {
+        switch self {
+        case .fit: "Fit"
+        case .actual: "100%"
+        case .large: "400%"
+        }
+    }
+}
+
+/// The picture on an 8 pt checkerboard with the caption beneath; the zoom control
+/// in the tab bar picks Fit / 100% / 400%, and Fit upscales a tiny image so it is
+/// not a single dot. Hex under a notice when the bytes cannot be read.
 struct ImageBodyView: View {
     var data: Data
     var contentType: String?
+    var zoom: ImageZoom = .fit
 
     var body: some View {
         if let decoded = DecodedImage(data: data, contentType: contentType) {
@@ -109,15 +123,22 @@ struct ImageBodyView: View {
             let room = CGSize(width: max(1, proxy.size.width - Space.md * 2),
                               height: max(1, proxy.size.height - Space.md * 2 - Space.sm - Space.xl))
             let natural = CGSize(width: CGFloat(decoded.width), height: CGFloat(decoded.height))
-            let scale = min(1, room.width / natural.width, room.height / natural.height)
+            let scale = scaleFactor(for: natural, in: room)
             let drawn = CGSize(width: (natural.width * scale).rounded(.down), height: (natural.height * scale).rounded(.down))
             VStack(spacing: Space.sm) {
-                Image(nsImage: decoded.image)
-                    .resizable()
-                    .interpolation(scale < 1 ? .high : .none)
-                    .frame(width: drawn.width, height: drawn.height)
-                    .background { Checkerboard() }
-                    .accessibilityLabel(decoded.caption)
+                Group {
+                    if zoom == .fit {
+                        image(decoded, drawn: drawn, scale: scale)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        // 100% / 400% can overflow the pane, so they scroll.
+                        ScrollView([.vertical, .horizontal]) {
+                            image(decoded, drawn: drawn, scale: scale)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                }
+                .accessibilityLabel(decoded.caption)
                 Text(decoded.caption)
                     .font(Tok.Face.ui(Tok.Typography.Size.sm))
                     .foregroundStyle(Tok.Ink.secondary.color)
@@ -126,6 +147,28 @@ struct ImageBodyView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(Space.md)
+        }
+    }
+
+    private func image(_ decoded: DecodedImage, drawn: CGSize, scale: CGFloat) -> some View {
+        Image(nsImage: decoded.image)
+            .resizable()
+            .interpolation(scale < 1 ? .high : .none)
+            .frame(width: drawn.width, height: drawn.height)
+            .background { Checkerboard() }
+    }
+
+    /// Fit scales down to the pane but upscales a tiny image (nearest-neighbour)
+    /// so it is at least 64 pt on its longer side; 100% and 400% are literal.
+    private func scaleFactor(for natural: CGSize, in room: CGSize) -> CGFloat {
+        switch zoom {
+        case .actual: return 1
+        case .large: return 4
+        case .fit:
+            let fit = min(1, room.width / natural.width, room.height / natural.height)
+            let longer = max(natural.width, natural.height)
+            if longer * fit < 64 { return min(64, max(room.width, room.height)) / longer }
+            return fit
         }
     }
 }
@@ -155,21 +198,36 @@ private struct Checkerboard: View {
     }
 }
 
-/// The tab bar's trailing slot for an image body: "Open in Preview" and "Export…".
+/// The tab bar's trailing slot for an image body: the Fit / 100% / 400% zoom
+/// segment and an overflow menu with Open in Preview and Export….
 struct ImageControls: View {
     var data: Data
     var contentType: String?
+    @Binding var zoom: ImageZoom
 
     private var fileExtension: String {
         DecodedImage(data: data, contentType: contentType)?.fileExtension ?? "bin"
     }
 
     var body: some View {
-        HStack(spacing: Space.xs) {
-            FlatTextButton("Open in Preview", action: openInPreview)
-                .help("Write the image to a temporary file and open it")
-            FlatTextButton("Export…", action: export)
-                .help("Save the image bytes as a file")
+        HStack(spacing: Space.sm) {
+            FlatSegment(options: ImageZoom.allCases.map { ($0, $0.label) }, selection: $zoom)
+            Menu {
+                Button("Open in Preview") { openInPreview() }
+                Button("Export…") { export() }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: Tok.Size.iconInline))
+                    .foregroundStyle(Tok.Ink.secondary.color)
+                    .frame(width: Space.xxl, height: Space.xxl)
+                    .contentShape(Rectangle())
+            }
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Open or export the image")
+            .accessibilityLabel("Image actions")
         }
     }
 
@@ -192,28 +250,5 @@ struct ImageControls: View {
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let url = panel.url else { return }
         try? data.write(to: url, options: .atomic)
-    }
-}
-
-/// A flat text button for a tab bar's trailing slot: 12 ui secondary, 24 tall, no fill.
-private struct FlatTextButton: View {
-    var title: String
-    var action: () -> Void
-
-    init(_ title: String, action: @escaping () -> Void) {
-        self.title = title
-        self.action = action
-    }
-
-    var body: some View {
-        Button(action: action) {
-            Text(title)
-                .font(Tok.Face.ui(Tok.Typography.Size.sm))
-                .foregroundStyle(Tok.Ink.secondary.color)
-                .padding(.horizontal, Space.sm)
-                .frame(height: Space.xxl)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(PressStyle())
     }
 }

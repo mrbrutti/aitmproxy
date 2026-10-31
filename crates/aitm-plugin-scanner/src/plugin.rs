@@ -28,6 +28,8 @@ impl Plugin for ScannerPlugin {
         reg.add_command(std::sync::Arc::new(crate::commands::ScanDiscover::new(
             self.cfg.clone(),
         )));
+        reg.add_command(std::sync::Arc::new(crate::commands::ScanPassive));
+        reg.add_command(std::sync::Arc::new(crate::commands::ScanReport));
     }
 }
 
@@ -55,5 +57,21 @@ mod tests {
             .expect("scan.discover is registered");
         assert_eq!(cmd.name(), "scan.discover");
         assert_eq!(cmd.sensitivity(), Sensitivity::Write);
+    }
+
+    /// The Stage-2 read verbs are on the registry too, at the `Read` tier, so a
+    /// read-only agent policy can run them.
+    #[test]
+    fn plugin_registers_the_read_verbs() {
+        let mut reg = Registry::new();
+        reg.add_plugin(Box::new(ScannerPlugin::new(ScannerConfig::default())));
+
+        for name in ["scan.passive", "scan.report"] {
+            let cmd = reg
+                .command(name)
+                .unwrap_or_else(|| panic!("{name} is registered"));
+            assert_eq!(cmd.name(), name);
+            assert_eq!(cmd.sensitivity(), Sensitivity::Read, "{name}");
+        }
     }
 }

@@ -1,6 +1,10 @@
-//! The `scan.discover` command: read-only endpoint discovery.
+//! The scanner's MCP commands: `scan.discover` (endpoint discovery, below), and
+//! the two read-only verbs `scan.passive` (passive checks over captured flows)
+//! and `scan.report` (the findings report and index). All result shaping lives
+//! here; the engine modules build no [`Value`] (bar the one JSON-to-[`Value`]
+//! bridge, [`report::index_to_value`]).
 //!
-//! It crawls one operator-authorized, in-scope target (same-origin, scope-bound,
+//! `scan.discover` crawls one operator-authorized, in-scope target (same-origin, scope-bound,
 //! budget-capped — see [`crate::crawl`]) and enumerates the parameter names
 //! present in the requests already captured for the reached endpoints (see
 //! [`crate::discover`]). It performs **no** injection and **no** fuzzing: it only
@@ -40,9 +44,14 @@ use aitm_core::redact::scrub_text;
 use aitm_core::{
     Command, CommandHost, Flow, ParamDef, ParamSchema, Params, Sensitivity, TypeDesc, Value,
 };
+use aitm_findings::{render_index, render_report, FindingRecord};
+use aitm_poc::Severity;
 
 use crate::crawl::{block_on, crawl, normalize_url};
 use crate::discover::{enumerate, Location};
+use crate::inject::target_flows;
+use crate::passive::{passive_checks, PassiveFinding};
+use crate::report;
 use crate::ScannerConfig;
 
 /// Upper bound on each array in the result, so a long crawl cannot return an
@@ -193,108 +202,312 @@ impl Command for ScanDiscover {
         // with `max_concurrency == 1` would refuse the crawl's own permit.
         let outcome = block_on(crawl(host, target, &cfg))?;
 
-        // Enumerate injection points from the captured requests whose normalized
-        // URL is one of the reached endpoints — observed traffic only.
-        // Capped at MAX_RESULT_ITEMS to match the exposed `endpoints` array (which is
-        // `.take(MAX_RESULT_ITEMS)` below), so `endpoint_flows` and `endpoints` stay in
-        // lockstep and neither grows unbounded on a long crawl.
-        let endpoint_set: HashSet<&str> = outcome
-            .endpoints
-            .iter()
-            .take(MAX_RESULT_ITEMS)
-            .map(String::as_str)
-            .collect();
-        let mut injection_points: Vec<Value> = Vec::new();
-        // (endpoint URL, location, name) -> index into `injection_points`. The
-        // store keeps every earlier scan's captures of the same site, so the
-        // same point turns up once per capture; it is reported once, at the
-        // position of its first appearance, carrying the newest capture's flow
-        // and example.
-        let mut point_index: HashMap<(&str, Location, String), usize> = HashMap::new();
-        // Map each reached endpoint (keyed by the same scrubbed URL the result
-        // exposes in `endpoints`) to the newest captured flow that served it, so
-        // a UI can link an endpoint row to its flow (AC3). `list()` is in
-        // insertion order, so overwriting on every hit leaves the latest capture
-        // without consulting clocks. Deliberately not limited to flows newer
-        // than the crawl: the `no_browser` store-only fallback has only older
-        // flows, and an endpoint whose fresh capture was missed should still
-        // link the older real one. Bounded by `endpoint_set` (<=
-        // MAX_RESULT_ITEMS), i.e. capped like the arrays; an endpoint with no
-        // captured flow is simply absent from the map.
-        let mut endpoint_flows: BTreeMap<String, Value> = BTreeMap::new();
-        for id in host.store().list() {
-            let Some(Flow::Http(flow)) = host.store().get(id) else {
+        Ok(discover_value(host, &outcome))
+    }
+}
+
+/// The `scan.discover` result for a finished crawl: the reached `endpoints`, the
+/// `injection_points` enumerated from the captured requests that served them,
+/// the `endpoint_flows` links, `pages_crawled` and `stopped_reason`.
+///
+/// Shared by [`ScanDiscover`] and, later, the `scan.run` driver, so the two
+/// shape the discovery half of their results identically. Reads only the host's store;
+/// every free-text string is run through [`scrub_text`].
+pub(crate) fn discover_value(
+    host: &CommandHost<'_>,
+    outcome: &crate::crawl::CrawlOutcome,
+) -> Value {
+    // Enumerate injection points from the captured requests whose normalized
+    // URL is one of the reached endpoints — observed traffic only.
+    // Capped at MAX_RESULT_ITEMS to match the exposed `endpoints` array (which is
+    // `.take(MAX_RESULT_ITEMS)` below), so `endpoint_flows` and `endpoints` stay in
+    // lockstep and neither grows unbounded on a long crawl.
+    let endpoint_set: HashSet<&str> = outcome
+        .endpoints
+        .iter()
+        .take(MAX_RESULT_ITEMS)
+        .map(String::as_str)
+        .collect();
+    let mut injection_points: Vec<Value> = Vec::new();
+    // (endpoint URL, location, name) -> index into `injection_points`. The
+    // store keeps every earlier scan's captures of the same site, so the
+    // same point turns up once per capture; it is reported once, at the
+    // position of its first appearance, carrying the newest capture's flow
+    // and example.
+    let mut point_index: HashMap<(&str, Location, String), usize> = HashMap::new();
+    // Map each reached endpoint (keyed by the same scrubbed URL the result
+    // exposes in `endpoints`) to the newest captured flow that served it, so
+    // a UI can link an endpoint row to its flow (AC3). `list()` is in
+    // insertion order, so overwriting on every hit leaves the latest capture
+    // without consulting clocks. Deliberately not limited to flows newer
+    // than the crawl: the `no_browser` store-only fallback has only older
+    // flows, and an endpoint whose fresh capture was missed should still
+    // link the older real one. Bounded by `endpoint_set` (<=
+    // MAX_RESULT_ITEMS), i.e. capped like the arrays; an endpoint with no
+    // captured flow is simply absent from the map.
+    let mut endpoint_flows: BTreeMap<String, Value> = BTreeMap::new();
+    for id in host.store().list() {
+        let Some(Flow::Http(flow)) = host.store().get(id) else {
+            continue;
+        };
+        let req = &flow.request;
+        let raw = format!("{}://{}{}", req.scheme, req.authority, req.path);
+        let Some(normalized) = normalize_url(&raw) else {
+            continue;
+        };
+        let Some(&url) = endpoint_set.get(normalized.as_str()) else {
+            continue;
+        };
+        endpoint_flows.insert(scrub_text(url), Value::Str(id.to_string()));
+        for point in enumerate(&flow) {
+            let key = (url, point.location.clone(), point.name.clone());
+            // The cap bounds distinct keys; overwriting an existing one is
+            // always allowed. Decide before building anything, so a new key
+            // past the cap is dropped unbuilt rather than assembled and
+            // scrubbed only to be thrown away.
+            let slot = point_index.get(&key).copied();
+            if slot.is_none() && injection_points.len() >= MAX_RESULT_ITEMS {
                 continue;
-            };
-            let req = &flow.request;
-            let raw = format!("{}://{}{}", req.scheme, req.authority, req.path);
-            let Some(normalized) = normalize_url(&raw) else {
-                continue;
-            };
-            let Some(&url) = endpoint_set.get(normalized.as_str()) else {
-                continue;
-            };
-            endpoint_flows.insert(scrub_text(url), Value::Str(id.to_string()));
-            for point in enumerate(&flow) {
-                let key = (url, point.location.clone(), point.name.clone());
-                // The cap bounds distinct keys; overwriting an existing one is
-                // always allowed. Decide before building anything, so a new key
-                // past the cap is dropped unbuilt rather than assembled and
-                // scrubbed only to be thrown away.
-                let slot = point_index.get(&key).copied();
-                if slot.is_none() && injection_points.len() >= MAX_RESULT_ITEMS {
-                    continue;
+            }
+            let mut obj = BTreeMap::new();
+            obj.insert("flow".into(), Value::Str(point.flow.to_string()));
+            obj.insert(
+                "location".into(),
+                Value::Str(point.location.as_str().to_string()),
+            );
+            obj.insert("name".into(), Value::Str(point.name));
+            // `enumerate` has already replaced a secret-named example; this
+            // catches a credential embedded inside an otherwise innocent
+            // value (`next=…?access_token=…`).
+            obj.insert("example".into(), Value::Str(scrub_text(&point.example)));
+            match slot {
+                Some(idx) => {
+                    if let Some(existing) = injection_points.get_mut(idx) {
+                        *existing = Value::Object(obj);
+                    }
                 }
-                let mut obj = BTreeMap::new();
-                obj.insert("flow".into(), Value::Str(point.flow.to_string()));
-                obj.insert(
-                    "location".into(),
-                    Value::Str(point.location.as_str().to_string()),
-                );
-                obj.insert("name".into(), Value::Str(point.name));
-                // `enumerate` has already replaced a secret-named example; this
-                // catches a credential embedded inside an otherwise innocent
-                // value (`next=…?access_token=…`).
-                obj.insert("example".into(), Value::Str(scrub_text(&point.example)));
-                match slot {
-                    Some(idx) => {
-                        if let Some(existing) = injection_points.get_mut(idx) {
-                            *existing = Value::Object(obj);
-                        }
-                    }
-                    None => {
-                        point_index.insert(key, injection_points.len());
-                        injection_points.push(Value::Object(obj));
-                    }
+                None => {
+                    point_index.insert(key, injection_points.len());
+                    injection_points.push(Value::Object(obj));
                 }
             }
         }
+    }
 
-        let mut result = BTreeMap::new();
-        result.insert(
-            "endpoints".into(),
-            Value::Array(
-                outcome
-                    .endpoints
-                    .iter()
-                    .take(MAX_RESULT_ITEMS)
-                    // A reached URL can carry a token in its query string.
-                    .map(|url| Value::Str(scrub_text(url)))
-                    .collect(),
-            ),
-        );
-        result.insert("injection_points".into(), Value::Array(injection_points));
-        // endpoint URL (scrubbed, matching an entry in `endpoints`) -> flow id.
-        result.insert("endpoint_flows".into(), Value::Object(endpoint_flows));
-        result.insert(
-            "pages_crawled".into(),
-            Value::Int(i64::try_from(outcome.pages_crawled).unwrap_or(i64::MAX)),
-        );
-        result.insert(
-            "stopped_reason".into(),
-            outcome.stopped_reason.map_or(Value::Null, Value::Str),
-        );
-        Ok(Value::Object(result))
+    let mut result = BTreeMap::new();
+    result.insert(
+        "endpoints".into(),
+        Value::Array(
+            outcome
+                .endpoints
+                .iter()
+                .take(MAX_RESULT_ITEMS)
+                // A reached URL can carry a token in its query string.
+                .map(|url| Value::Str(scrub_text(url)))
+                .collect(),
+        ),
+    );
+    result.insert("injection_points".into(), Value::Array(injection_points));
+    // endpoint URL (scrubbed, matching an entry in `endpoints`) -> flow id.
+    result.insert("endpoint_flows".into(), Value::Object(endpoint_flows));
+    result.insert(
+        "pages_crawled".into(),
+        Value::Int(i64::try_from(outcome.pages_crawled).unwrap_or(i64::MAX)),
+    );
+    result.insert(
+        "stopped_reason".into(),
+        outcome
+            .stopped_reason
+            .clone()
+            .map_or(Value::Null, Value::Str),
+    );
+    Value::Object(result)
+}
+
+/// An optional `target` argument: absent or `Null` is `None`, a string is
+/// `Some`, and anything else is an error rather than a silently ignored filter.
+fn optional_target(args: &Params) -> anyhow::Result<Option<&str>> {
+    match args.get("target") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Str(s)) => Ok(Some(s)),
+        Some(other) => anyhow::bail!("param `target` must be a string, got {other:?}"),
+    }
+}
+
+/// `scan.passive` — evaluate the passive checks over already-captured flows.
+/// Registered by [`crate::ScannerPlugin`].
+///
+/// A unit struct: `invoke` reads no configuration. It is `Read` and issues no
+/// traffic — it reads the stored flows and nothing else, with no proxy client
+/// send and no browser — so it runs under a read-only agent policy.
+pub(crate) struct ScanPassive;
+
+impl Command for ScanPassive {
+    fn name(&self) -> &str {
+        "scan.passive"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
+    }
+
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "Run the passive checks (reflected request parameters, missing \
+                          security headers, cookie flags) over the flows already captured \
+                          for `target`, or over every captured flow when `target` is absent. \
+                          Issues no traffic. Findings carry the parameter, header or cookie \
+                          NAME, never its value."
+                .into(),
+            params: vec![ParamDef {
+                name: "target".into(),
+                ty: TypeDesc::Str,
+                required: false,
+                description: "Only flows of this origin (scheme, host and port), e.g. \
+                              `https://app.example`. Absent: every captured flow."
+                    .into(),
+            }],
+            result: TypeDesc::Object(Vec::new()),
+        }
+    }
+
+    fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        let target = optional_target(&args)?;
+        let findings: Vec<PassiveFinding> = target_flows(host, target)
+            .iter()
+            .flat_map(passive_checks)
+            .collect();
+        Ok(passive_value(&findings))
+    }
+}
+
+/// The `scan.passive` result: `{ "findings": [ {class, flow, location, name,
+/// evidence, severity} ] }`, capped at [`MAX_RESULT_ITEMS`].
+///
+/// Every string goes through [`scrub_text`], whatever the engine put in it: the
+/// passive checks never carry a request value, and this is the second line of
+/// defence if one ever did. A finding with no location or name (a missing-header
+/// finding) reports them as `Null`. Shared by [`ScanPassive`] and, later, the
+/// `scan.run` driver.
+pub(crate) fn passive_value(findings: &[PassiveFinding]) -> Value {
+    let text = |s: &str| Value::Str(scrub_text(s));
+    let items = findings
+        .iter()
+        .take(MAX_RESULT_ITEMS)
+        .map(|f| {
+            let mut obj = BTreeMap::new();
+            obj.insert("class".into(), text(&f.class));
+            obj.insert("flow".into(), text(&f.flow.to_string()));
+            obj.insert(
+                "location".into(),
+                f.location
+                    .as_ref()
+                    .map_or(Value::Null, |l| text(l.as_str())),
+            );
+            obj.insert("name".into(), f.name.as_deref().map_or(Value::Null, text));
+            obj.insert("evidence".into(), text(&f.evidence));
+            obj.insert("severity".into(), text(severity_str(f.severity)));
+            Value::Object(obj)
+        })
+        .collect();
+    let mut result = BTreeMap::new();
+    result.insert("findings".into(), Value::Array(items));
+    Value::Object(result)
+}
+
+/// The lowercase nuclei-vocabulary word for a severity, as `aitm-poc` serializes
+/// it. An exhaustive match: a new severity is a compile error here, not a
+/// silently misreported finding.
+fn severity_str(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Info => "info",
+        Severity::Low => "low",
+        Severity::Medium => "medium",
+        Severity::High => "high",
+        Severity::Critical => "critical",
+    }
+}
+
+/// `scan.report` — fold the recorded findings into a markdown report and a
+/// machine-readable index. Registered by [`crate::ScannerPlugin`].
+///
+/// A unit struct: `invoke` reads no configuration beyond the host's findings
+/// directory. It is `Read`: it lists and reads stored findings and writes
+/// nothing, issues no traffic and needs no browser.
+pub(crate) struct ScanReport;
+
+impl Command for ScanReport {
+    fn name(&self) -> &str {
+        "scan.report"
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
+    }
+
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "Fold the recorded findings into `report_md` (one markdown section per \
+                          finding) and `index` (one {poc_path, target_path, class, passed, \
+                          control_passed, finding_capture, screenshot_path} entry per finding). \
+                          `target` selects the findings recorded against that origin, or against \
+                          a path under it. Empty when no findings directory is configured. \
+                          Credentials are masked."
+                .into(),
+            params: vec![ParamDef {
+                name: "target".into(),
+                ty: TypeDesc::Str,
+                required: false,
+                description: "Only findings whose recorded target has this scheme, host and \
+                              port and a path equal to or under this URL's, e.g. \
+                              `https://app.example`. Absent: every recorded finding."
+                    .into(),
+            }],
+            result: TypeDesc::Object(Vec::new()),
+        }
+    }
+
+    fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        let target = optional_target(&args)?;
+        Ok(report_value(&report::load_records(host, target)))
+    }
+}
+
+/// The `scan.report` result: `{ "report_md": Str, "index": Array }`, where
+/// `report_md` is [`render_report`] and `index` is [`render_index`] converted
+/// to the transport-neutral [`Value`], both over the same leading
+/// [`MAX_RESULT_ITEMS`] records, so the two halves describe the same findings.
+///
+/// A shareable report carries no credential (AC11/AC24): the markdown and every
+/// string of the index are run through [`scrub_text`]. The store masks a
+/// finding's `title`, `notes` and `target` when it writes them, but not
+/// `poc_ref` or the artifact paths, and a record may predate the masking or be
+/// edited by hand, so the output is scrubbed here whatever the record holds.
+/// Shared by [`ScanReport`] and, later, the `scan.run` driver.
+pub(crate) fn report_value(recs: &[FindingRecord]) -> Value {
+    let capped = &recs[..recs.len().min(MAX_RESULT_ITEMS)];
+    let mut result = BTreeMap::new();
+    result.insert(
+        "report_md".into(),
+        Value::Str(scrub_text(&render_report(capped))),
+    );
+    result.insert(
+        "index".into(),
+        scrub_value(report::index_to_value(render_index(capped))),
+    );
+    Value::Object(result)
+}
+
+/// `value` with every string, at any depth, run through [`scrub_text`]. Object
+/// keys are the renderer's fixed field names and are left alone.
+fn scrub_value(value: Value) -> Value {
+    match value {
+        Value::Str(s) => Value::Str(scrub_text(&s)),
+        Value::Array(items) => Value::Array(items.into_iter().map(scrub_value).collect()),
+        Value::Object(map) => {
+            Value::Object(map.into_iter().map(|(k, v)| (k, scrub_value(v))).collect())
+        }
+        other => other,
     }
 }
 
@@ -302,10 +515,12 @@ impl Command for ScanDiscover {
 mod tests {
     use super::*;
     use aitm_core::{
-        Body, BrowserDriver, ClickTarget, ConnInfo, EgressConfinement, FlowId, FlowMeta, FlowStore,
-        GuardError, HeaderMap, HttpFlow, HttpRequest, HttpVersion, InterceptState, MemFlowStore,
-        NavOutcome, ProxyClient, ScopeEntry, ScopeRateGuard, StdGuard,
+        Body, BrowserDriver, ClickTarget, Config, ConnInfo, EgressConfinement, FindingsConfig,
+        FlowId, FlowMeta, FlowStore, Frontend, GuardError, HeaderMap, HttpFlow, HttpRequest,
+        HttpResponse, HttpVersion, InterceptState, MemFlowStore, NavOutcome, ProxyClient,
+        ScopeEntry, ScopeRateGuard, StdGuard,
     };
+    use aitm_findings::{DiskFindingStore, FindingArtifacts, FindingStore, Reproduction};
     use futures::future::BoxFuture;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::panic::AssertUnwindSafe;
@@ -1496,6 +1711,633 @@ mod tests {
             "an existing key is overwritten with the newest flow even when the cap is full"
         );
         assert_eq!(points[0], *p0_a, "and it kept its place");
+    }
+
+    // ---- scan.passive ----------------------------------------------------
+
+    /// A captured flow with a response, so the passive checks have a body and
+    /// headers to read. Returns the flow plus its id as the result shows it.
+    fn captured_response(
+        authority: &str,
+        path: &str,
+        req_headers: HeaderMap,
+        resp_headers: HeaderMap,
+        body: &str,
+    ) -> (Flow, String) {
+        let id = FlowId::new();
+        let flow = Flow::Http(HttpFlow {
+            id,
+            request: HttpRequest {
+                method: "GET".into(),
+                scheme: "http".into(),
+                authority: authority.into(),
+                path: path.into(),
+                version: HttpVersion::Http11,
+                headers: req_headers,
+                body: Body::Empty,
+                timestamp: SystemTime::now(),
+            },
+            response: Some(HttpResponse {
+                status: 200,
+                version: HttpVersion::Http11,
+                headers: resp_headers,
+                body: Body::Bytes(body.as_bytes().to_vec()),
+                timestamp: SystemTime::now(),
+            }),
+            client_conn: conn(),
+            server_conn: None,
+            metadata: FlowMeta::default(),
+            intercept: InterceptState::Observed,
+        });
+        (flow, id.to_string())
+    }
+
+    /// The `findings` array of a `scan.passive` result.
+    fn passive_findings_of(result: &Value) -> Vec<BTreeMap<String, Value>> {
+        let Value::Object(map) = result else {
+            panic!("the result is an object: {result:?}");
+        };
+        assert_eq!(
+            map.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["findings"],
+            "the result carries exactly `findings`: {result:?}"
+        );
+        let Some(Value::Array(items)) = map.get("findings") else {
+            panic!("the result carries a findings array: {result:?}");
+        };
+        items
+            .iter()
+            .map(|item| match item {
+                Value::Object(o) => o.clone(),
+                other => panic!("each finding is an object: {other:?}"),
+            })
+            .collect()
+    }
+
+    fn passive_invoke(store: &MemFlowStore, args: Params) -> anyhow::Result<Value> {
+        let guard = scoped_guard();
+        let client = NoSendClient;
+        let host = CommandHost::new(store, &client, &guard, None);
+        ScanPassive.invoke(args, &host)
+    }
+
+    #[test]
+    fn scan_passive_is_read() {
+        let cmd = ScanPassive;
+        assert_eq!(cmd.name(), "scan.passive");
+        assert_eq!(cmd.sensitivity(), Sensitivity::Read);
+        assert!(!cmd.mutates(), "a Read command does not mutate");
+        assert!(
+            cmd.confirm_prompt(&params(&[])).is_none(),
+            "a read-only verb never asks the operator"
+        );
+        let schema = cmd.schema();
+        assert_eq!(schema.params.len(), 1);
+        assert_eq!(schema.params[0].name, "target");
+        assert!(matches!(schema.params[0].ty, TypeDesc::Str));
+        assert!(!schema.params[0].required, "`target` is optional");
+    }
+
+    /// No traffic: the command has no `ProxyClient` to send through (`NoSendClient`
+    /// panics if it is touched) and no browser, and the store is unchanged.
+    #[test]
+    fn scan_passive_issues_no_traffic() {
+        let store = MemFlowStore::new();
+        let (flow, _) = captured_response(
+            "target.test",
+            "/search?q=hello1",
+            HeaderMap::new(),
+            HeaderMap::new(),
+            "you searched hello1",
+        );
+        store.insert(flow);
+        let before = store.count();
+
+        let result = passive_invoke(&store, params(&[])).expect("scan.passive runs");
+
+        assert_eq!(store.count(), before, "scan.passive must add no flow");
+        assert_eq!(before, 1);
+        assert!(
+            !passive_findings_of(&result).is_empty(),
+            "the seeded flow produced findings, so the call did real work: {result:?}"
+        );
+    }
+
+    #[test]
+    fn scan_passive_finds_reflection() {
+        let store = MemFlowStore::new();
+        let (flow, id) = captured_response(
+            "target.test",
+            "/search?q=hello1",
+            HeaderMap::new(),
+            HeaderMap::new(),
+            "you searched hello1",
+        );
+        store.insert(flow);
+
+        let result = passive_invoke(&store, params(&[])).expect("scan.passive runs");
+
+        let expected: BTreeMap<String, Value> = [
+            ("class", Value::Str("reflection".into())),
+            ("flow", Value::Str(id)),
+            ("location", Value::Str("query".into())),
+            ("name", Value::Str("q".into())),
+            (
+                "evidence",
+                Value::Str("request parameter value reflected in response body".into()),
+            ),
+            ("severity", Value::Str("low".into())),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        assert_eq!(
+            passive_findings_of(&result),
+            vec![expected],
+            "one reflection finding naming `q`, nothing else for a plain-http, \
+             non-HTML, cookie-less response"
+        );
+    }
+
+    /// AC3: AC3's literal fixture. No `abc123` reaches any key or value of the
+    /// result, while the result still names what was found.
+    #[test]
+    fn scan_passive_redacts() {
+        let store = MemFlowStore::new();
+        let mut req_headers = HeaderMap::new();
+        req_headers.set("Cookie", "PHPSESSID=abc123");
+        req_headers.set("Authorization", "Bearer abc123");
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.set("Content-Type", "text/html");
+        resp_headers.set("Set-Cookie", "PHPSESSID=abc123");
+        let (flow, _) = captured_response(
+            "target.test",
+            "/search?access_token=abc123&q=abc123",
+            req_headers,
+            resp_headers,
+            "echo abc123 token abc123",
+        );
+        store.insert(flow);
+
+        let result = passive_invoke(&store, params(&[])).expect("scan.passive runs");
+
+        // Not vacuous: the reflected `q`, both missing HTML security headers
+        // and the bare session cookie are all reported by name.
+        let findings = passive_findings_of(&result);
+        let pairs: Vec<(String, Option<String>)> = findings
+            .iter()
+            .map(|f| {
+                let get = |k: &str| match f.get(k) {
+                    Some(Value::Str(s)) => Some(s.clone()),
+                    _ => None,
+                };
+                (get("class").expect("class"), get("name"))
+            })
+            .collect();
+        assert!(
+            pairs.contains(&("reflection".into(), Some("q".into()))),
+            "{pairs:?}"
+        );
+        assert!(
+            pairs.contains(&("cookie-flag".into(), Some("PHPSESSID".into()))),
+            "{pairs:?}"
+        );
+        assert_eq!(
+            pairs.iter().filter(|(c, _)| c == "security-header").count(),
+            2,
+            "CSP and X-Content-Type-Options are missing on this HTML page: {pairs:?}"
+        );
+
+        let mut found = Vec::new();
+        strings(&result, &mut found);
+        assert!(
+            !found.iter().any(|s| s.contains("abc123")),
+            "a request secret reached the result: {found:?}"
+        );
+    }
+
+    /// The command-level scrub is its own defence, not a restatement of the
+    /// engine's: a finding that DID carry a credential in any string field has it
+    /// masked on the way out.
+    #[test]
+    fn passive_value_scrubs_every_string() {
+        let finding = crate::passive::PassiveFinding {
+            class: "x?token=abc123".into(),
+            flow: FlowId::new(),
+            location: Some(Location::Query),
+            name: Some("Authorization: Bearer abc123".into()),
+            evidence: "seen password=abc123 in the body".into(),
+            severity: aitm_poc::Severity::High,
+        };
+
+        let result = passive_value(std::slice::from_ref(&finding));
+
+        let findings = passive_findings_of(&result);
+        assert_eq!(findings.len(), 1);
+        let f = &findings[0];
+        assert_eq!(f["class"], Value::Str("x?token=[redacted]".into()));
+        assert_eq!(f["name"], Value::Str("Authorization: [redacted]".into()));
+        assert_eq!(
+            f["evidence"],
+            Value::Str("seen password=[redacted] in the body".into())
+        );
+        assert_eq!(f["flow"], Value::Str(finding.flow.to_string()));
+        assert_eq!(f["location"], Value::Str("query".into()));
+        assert_eq!(f["severity"], Value::Str("high".into()));
+    }
+
+    /// A finding with no location/name (a missing-header finding) reports them as
+    /// `Null`, and the array is capped at `MAX_RESULT_ITEMS`.
+    #[test]
+    fn passive_value_nulls_missing_fields_and_caps_the_array() {
+        let finding = crate::passive::PassiveFinding {
+            class: "security-header".into(),
+            flow: FlowId::new(),
+            location: None,
+            name: None,
+            evidence: "missing".into(),
+            severity: aitm_poc::Severity::Info,
+        };
+        let many = vec![finding; MAX_RESULT_ITEMS + 10];
+
+        let result = passive_value(&many);
+
+        let findings = passive_findings_of(&result);
+        assert_eq!(findings.len(), MAX_RESULT_ITEMS);
+        assert_eq!(findings[0]["location"], Value::Null);
+        assert_eq!(findings[0]["name"], Value::Null);
+        assert_eq!(findings[0]["severity"], Value::Str("info".into()));
+    }
+
+    /// `target` narrows the stored flows read; an absent one reads them all.
+    #[test]
+    fn scan_passive_target_selects_one_origin() {
+        let store = MemFlowStore::new();
+        let (mine, mine_id) = captured_response(
+            "target.test",
+            "/search?q=hello1",
+            HeaderMap::new(),
+            HeaderMap::new(),
+            "hello1",
+        );
+        let (theirs, _) = captured_response(
+            "other.test",
+            "/search?q=hello1",
+            HeaderMap::new(),
+            HeaderMap::new(),
+            "hello1",
+        );
+        store.insert(mine);
+        store.insert(theirs);
+
+        let scoped = passive_invoke(
+            &store,
+            params(&[("target", Value::Str("http://target.test".into()))]),
+        )
+        .expect("scan.passive runs");
+        let flows: Vec<Value> = passive_findings_of(&scoped)
+            .into_iter()
+            .map(|f| f["flow"].clone())
+            .collect();
+        assert_eq!(flows, vec![Value::Str(mine_id)]);
+
+        let all = passive_invoke(&store, params(&[])).expect("scan.passive runs");
+        assert_eq!(passive_findings_of(&all).len(), 2);
+
+        let err = passive_invoke(&store, params(&[("target", Value::Int(7))]))
+            .expect_err("a non-string target is refused");
+        assert!(
+            err.to_string().contains("`target` must be a string"),
+            "{err}"
+        );
+    }
+
+    // ---- scan.report -----------------------------------------------------
+
+    /// A scratch findings directory, removed when dropped.
+    struct FindingsDir(std::path::PathBuf);
+
+    impl FindingsDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("aitm-scanner-cmd-{}", FlowId::new()));
+            std::fs::create_dir_all(&dir).expect("create findings dir");
+            Self(dir)
+        }
+
+        fn store(&self) -> DiskFindingStore {
+            DiskFindingStore::new(&self.0)
+        }
+    }
+
+    impl Drop for FindingsDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A recorded finding whose every identifying string derives from `id`.
+    fn finding(id: &str, title: &str, target: &str) -> FindingRecord {
+        FindingRecord {
+            id: id.into(),
+            title: title.into(),
+            class: "reflected-xss".into(),
+            severity: aitm_poc::Severity::High,
+            target: target.into(),
+            discovered_at: SystemTime::now(),
+            origin: Frontend::Cli,
+            client_label: None,
+            poc_ref: format!("{id}-poc"),
+            reproduction: Reproduction {
+                passed: true,
+                control_passed: Some(false),
+                run_at: SystemTime::now(),
+            },
+            artifacts: FindingArtifacts {
+                finding_capture: FlowId::new(),
+                poc_path: format!("{id}.poc.yaml"),
+                screenshot_path: format!("{id}.png"),
+            },
+            flows: Vec::new(),
+            notes: None,
+        }
+    }
+
+    /// Invoke `scan.report` against a host whose findings dir is `dir` (none at
+    /// all when `None`).
+    fn report_invoke(dir: Option<&FindingsDir>, args: Params) -> anyhow::Result<Value> {
+        let store = MemFlowStore::new();
+        let guard = scoped_guard();
+        let client = NoSendClient;
+        let mut host = CommandHost::new(&store, &client, &guard, None);
+        if let Some(dir) = dir {
+            host = host.with_config(Arc::new(Config {
+                findings: FindingsConfig {
+                    dir: Some(dir.0.clone()),
+                },
+                ..Config::default()
+            }));
+        }
+        ScanReport.invoke(args, &host)
+    }
+
+    /// A `scan.report` result split into `report_md` and its `index` objects.
+    fn report_parts(result: &Value) -> (String, Vec<BTreeMap<String, Value>>) {
+        let Value::Object(map) = result else {
+            panic!("the result is an object: {result:?}");
+        };
+        assert_eq!(
+            map.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["index", "report_md"],
+            "the result carries exactly `report_md` and `index`: {result:?}"
+        );
+        let Some(Value::Str(md)) = map.get("report_md") else {
+            panic!("report_md is a string: {result:?}");
+        };
+        let Some(Value::Array(items)) = map.get("index") else {
+            panic!("index is an array: {result:?}");
+        };
+        let index = items
+            .iter()
+            .map(|item| match item {
+                Value::Object(o) => o.clone(),
+                other => panic!("each index entry is an object: {other:?}"),
+            })
+            .collect();
+        (md.clone(), index)
+    }
+
+    /// The `## ` finding sections of a rendered report (the title is `# `).
+    fn section_count(md: &str) -> usize {
+        md.lines().filter(|l| l.starts_with("## ")).count()
+    }
+
+    #[test]
+    fn scan_report_is_read() {
+        let cmd = ScanReport;
+        assert_eq!(cmd.name(), "scan.report");
+        assert_eq!(cmd.sensitivity(), Sensitivity::Read);
+        assert!(!cmd.mutates(), "a Read command does not mutate");
+        assert!(
+            cmd.confirm_prompt(&params(&[])).is_none(),
+            "a read-only verb never asks the operator"
+        );
+        let schema = cmd.schema();
+        assert_eq!(schema.params.len(), 1);
+        assert_eq!(schema.params[0].name, "target");
+        assert!(matches!(schema.params[0].ty, TypeDesc::Str));
+        assert!(!schema.params[0].required, "`target` is optional");
+    }
+
+    /// AC4: one `## ` section per recorded finding, and an `index` array with one
+    /// entry per finding carrying `poc_path`, `class` and `passed`.
+    #[test]
+    fn scan_report_one_section_per_finding() {
+        let dir = FindingsDir::new();
+        let store = dir.store();
+        for (id, title) in [
+            ("f-one", "Reflected XSS in q"),
+            ("f-two", "Open redirect in next"),
+            ("f-three", "Reflected XSS in name"),
+        ] {
+            store
+                .record(finding(id, title, "http://t.test:8080/search"))
+                .expect("record finding");
+        }
+
+        let result = report_invoke(Some(&dir), params(&[])).expect("scan.report runs");
+
+        let (md, index) = report_parts(&result);
+        assert_eq!(section_count(&md), 3, "{md}");
+        for title in [
+            "Reflected XSS in q",
+            "Open redirect in next",
+            "Reflected XSS in name",
+        ] {
+            assert!(md.contains(&format!("## {title}\n")), "{title} in {md}");
+        }
+        assert!(
+            md.contains("3 findings, 3 reproduced against a patched control."),
+            "{md}"
+        );
+        assert_eq!(index.len(), 3);
+        let mut poc_paths: Vec<Value> = index.iter().map(|e| e["poc_path"].clone()).collect();
+        poc_paths.sort_by_key(|v| format!("{v:?}"));
+        assert_eq!(
+            poc_paths,
+            vec![
+                Value::Str("f-one.poc.yaml".into()),
+                Value::Str("f-three.poc.yaml".into()),
+                Value::Str("f-two.poc.yaml".into()),
+            ]
+        );
+        for entry in &index {
+            assert_eq!(entry["class"], Value::Str("reflected-xss".into()));
+            assert_eq!(entry["passed"], Value::Bool(true));
+            assert_eq!(entry["control_passed"], Value::Bool(false));
+            assert_eq!(
+                entry["target_path"],
+                Value::Str("http://t.test:8080/search".into())
+            );
+        }
+    }
+
+    /// No findings directory configured: an empty report, not an error.
+    #[test]
+    fn scan_report_without_a_findings_dir_is_empty() {
+        let result = report_invoke(None, params(&[])).expect("scan.report runs");
+
+        let (md, index) = report_parts(&result);
+        assert_eq!(section_count(&md), 0, "{md}");
+        assert!(md.contains("0 findings, 0 reproduced"), "{md}");
+        assert!(index.is_empty());
+    }
+
+    /// The origin-and-path rule (spec "`scan.report`"): a campaign base URL
+    /// selects the record stored against one of its endpoints.
+    #[test]
+    fn scan_report_target_selects_endpoint_records() {
+        let dir = FindingsDir::new();
+        dir.store()
+            .record(finding(
+                "f-one",
+                "Reflected XSS",
+                "http://t.test:8080/search",
+            ))
+            .expect("record finding");
+
+        let base = report_invoke(
+            Some(&dir),
+            params(&[("target", Value::Str("http://t.test:8080".into()))]),
+        )
+        .expect("scan.report runs");
+        let other = report_invoke(
+            Some(&dir),
+            params(&[("target", Value::Str("http://other.test:8080".into()))]),
+        )
+        .expect("scan.report runs");
+
+        let (base_md, base_index) = report_parts(&base);
+        assert_eq!(base_index.len(), 1);
+        assert_eq!(section_count(&base_md), 1, "{base_md}");
+        let (other_md, other_index) = report_parts(&other);
+        assert_eq!(other_index.len(), 0);
+        assert_eq!(section_count(&other_md), 0, "{other_md}");
+
+        let err = report_invoke(Some(&dir), params(&[("target", Value::Int(7))]))
+            .expect_err("a non-string target is refused");
+        assert!(
+            err.to_string().contains("`target` must be a string"),
+            "{err}"
+        );
+    }
+
+    /// AC11/AC24, through the command: the store scrubs `title`/`notes`/`target`
+    /// when it writes, but not `poc_ref` or the artifact paths, so a credential
+    /// an agent put there reaches `scan.report` unless the command masks it.
+    #[test]
+    fn scan_report_leaks_no_secret() {
+        let dir = FindingsDir::new();
+        let mut rec = finding("f-secret", "Reflected XSS", "http://t.test:8080/search?q=1");
+        rec.poc_ref = "poc?access_token=abc123".into();
+        rec.artifacts.poc_path = "poc.yaml?api_key=abc123".into();
+        rec.artifacts.screenshot_path = "shot.png?password=abc123".into();
+        dir.store().record(rec).expect("record finding");
+
+        let result = report_invoke(Some(&dir), params(&[])).expect("scan.report runs");
+
+        let (md, index) = report_parts(&result);
+        // Not vacuous: the finding is reported, and what is not secret survives.
+        assert_eq!(section_count(&md), 1, "{md}");
+        assert_eq!(index.len(), 1);
+        assert!(md.contains("access_token=[redacted]"), "{md}");
+        assert_eq!(
+            index[0]["poc_path"],
+            Value::Str("poc.yaml?api_key=[redacted]".into())
+        );
+        let mut found = Vec::new();
+        strings(&result, &mut found);
+        assert!(
+            !found.iter().any(|s| s.contains("abc123")),
+            "a credential reached the scan.report result: {found:?}"
+        );
+    }
+
+    /// The shaping helper is its own defence: a record that carries a credential
+    /// in ANY field (as a hand-edited or older on-disk record could) is masked in
+    /// `report_md` and in every `index` string.
+    #[test]
+    fn report_value_scrubs_every_field() {
+        let mut rec = finding(
+            "f-secret",
+            "Leak at token=abc123",
+            "http://t.test/x?token=abc123",
+        );
+        rec.class = "x?secret=abc123".into();
+        rec.poc_ref = "poc?password=abc123".into();
+        rec.artifacts.poc_path = "p.yaml?api_key=abc123".into();
+        rec.artifacts.screenshot_path = "s.png?access_token=abc123".into();
+        rec.notes = Some("Authorization: Bearer abc123".into());
+
+        let result = report_value(std::slice::from_ref(&rec));
+
+        let (md, index) = report_parts(&result);
+        assert_eq!(section_count(&md), 1, "{md}");
+        assert_eq!(index.len(), 1);
+        let mut found = Vec::new();
+        strings(&result, &mut found);
+        assert!(
+            !found.iter().any(|s| s.contains("abc123")),
+            "a credential reached the report: {found:?}"
+        );
+        // Names and structure survive; only the values go.
+        assert!(md.contains("token=[redacted]"), "{md}");
+        assert_eq!(
+            index[0]["target_path"],
+            Value::Str("http://t.test/x?token=[redacted]".into())
+        );
+        assert_eq!(index[0]["class"], Value::Str("x?secret=[redacted]".into()));
+        assert_eq!(index[0]["passed"], Value::Bool(true));
+    }
+
+    /// `report_md` and `index` are both capped at `MAX_RESULT_ITEMS`, over the
+    /// SAME leading slice of records, so the two halves of one result agree on
+    /// which findings they describe.
+    #[test]
+    fn report_value_caps_the_report_and_the_index_to_the_same_slice() {
+        let recs: Vec<FindingRecord> = (0..MAX_RESULT_ITEMS + 6)
+            .map(|i| {
+                finding(
+                    &format!("f-{i}"),
+                    &format!("Finding {i}"),
+                    "http://t.test/x",
+                )
+            })
+            .collect();
+
+        let result = report_value(&recs);
+
+        let (md, index) = report_parts(&result);
+        assert_eq!(index.len(), MAX_RESULT_ITEMS);
+        assert_eq!(
+            section_count(&md),
+            MAX_RESULT_ITEMS,
+            "report_md is capped too"
+        );
+        assert!(
+            md.contains(&format!("{MAX_RESULT_ITEMS} findings,")),
+            "the summary line counts the capped slice: {}",
+            md.lines().nth(2).unwrap_or_default()
+        );
+
+        // The last finding inside the cap is in both halves; the first one past
+        // it is in neither.
+        let last = MAX_RESULT_ITEMS - 1;
+        assert!(md.contains(&format!("## Finding {last}\n")));
+        assert_eq!(
+            index[last]["poc_path"],
+            Value::Str(format!("f-{last}.poc.yaml"))
+        );
+        assert!(!md.contains(&format!("## Finding {MAX_RESULT_ITEMS}\n")));
     }
 
     /// The dedupe key includes the URL: the same `(location, name)` on two

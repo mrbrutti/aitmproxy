@@ -193,3 +193,16 @@ class Aitm:
 
     def __exit__(self, *exc) -> None:
         self.stop()
+
+
+def cli(core: "Aitm", *args: str, timeout: float = 90):
+    """Run a one-shot `aitm --config <core's config> <args...>` — its own in-process
+    core, nothing bound (so it can't see the running core's live flows; use it for
+    ca export/status/dry-run, poc run, and other self-contained verbs). Returns
+    (returncode, stdout, stderr). Folded in from the surface sessions' lib/seeded.py."""
+    cfg = os.path.join(core.workdir, "config.yaml")
+    p = subprocess.run(
+        [_aitm_bin(), "--config", cfg, *args],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    return p.returncode, p.stdout, p.stderr

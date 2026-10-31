@@ -102,6 +102,7 @@ struct BuildPoCSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Space.lg) {
             Text("Build PoC").font(Tok.Face.ui(Tok.Typography.Size.lg, .semibold)).foregroundStyle(Tok.Ink.primary.color)
+                .gridProbe("build-poc-title", area: "build-poc", edge: nil)
             if let row {
                 Text("\(row.method.label) \(row.url)").font(Tok.Face.data(Tok.Typography.Size.sm))
                     .foregroundStyle(Tok.Ink.secondary.color).lineLimit(1).truncationMode(.middle)
@@ -110,6 +111,7 @@ struct BuildPoCSheet: View {
                 TextField("reproduced finding", text: $name).textFieldStyle(.roundedBorder)
                     .font(Tok.Face.ui(Tok.Typography.Size.base)).focused($nameFocused)
             }
+            .gridProbe("build-poc-name", area: "build-poc", edge: nil)
             field("Parameter") {
                 FlatMenu(title: param.isEmpty ? "none" : param, width: 220) {
                     Button("none") { param = "" }
@@ -130,8 +132,9 @@ struct BuildPoCSheet: View {
             }
         }
         .padding(Space.xl)
-        .frame(width: 440)
+        .frame(width: 480)
         .background(Tok.Ground.surface.color)
+        .gridArea("build-poc", inset: 0)
         .onAppear {
             if name.isEmpty { name = Self.defaultName(for: row) }
             if param.isEmpty { param = candidates.first ?? "" }

@@ -287,3 +287,35 @@ fn query_by_host() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0], id_a);
 }
+
+/// The method filter is case-insensitive, matching the live subscription path in
+/// `aitm-mcp` (`FlowFilter::matches` uses `eq_ignore_ascii_case`). A flow is
+/// stored with its canonical uppercase method; a lowercase or mixed-case filter
+/// must still match it. Before the fix this compared byte-for-byte, so a
+/// subscriber with `method:"post"` saw live POSTs but an *empty* `since` replay —
+/// the live and replay paths disagreed (the e2e `flow.list` filter defect).
+#[test]
+fn query_method_filter_is_case_insensitive() {
+    let store = MemFlowStore::new();
+    // `http_flow` stores the request with method "GET".
+    let id = store.insert(http_flow("a.test", "/a"));
+
+    for want in ["get", "Get", "GET"] {
+        let hits = store.query(&FlowQuery {
+            method: Some(want.into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            hits,
+            vec![id],
+            "method filter {want:?} must match the stored GET flow"
+        );
+    }
+
+    // A genuinely different method still does not match.
+    let none = store.query(&FlowQuery {
+        method: Some("post".into()),
+        ..Default::default()
+    });
+    assert!(none.is_empty(), "a different method must not match");
+}

@@ -39,7 +39,7 @@ struct ScriptsPanel: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Tok.Ground.surface.color)
-        .gridArea("scripts")
+        .gridArea("scripts", inset: 0)
         .task { await load() }
         .onChange(of: session.tools) { Task { await load() } }
     }
@@ -54,6 +54,7 @@ struct ScriptsPanel: View {
         }
         .padding(.horizontal, Space.margin)
         .frame(height: Tok.Size.filterBar)
+        .gridProbe("scripts.title", area: "scripts")
     }
 
     private var empty: some View {
@@ -217,16 +218,29 @@ private struct ScriptDetail: View {
 
     private func header(_ script: ScriptInfo) -> some View {
         HStack(spacing: Space.md) {
-            Circle()
-                .fill((script.error != nil ? Tok.Status.serverError
-                       : script.enabled ? Tok.Status.success : Tok.Ink.tertiary).color)
-                .frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
             Text(script.name).font(Tok.Face.ui(Tok.Typography.Size.xl, .medium))
                 .foregroundStyle(Tok.Ink.primary.color).lineLimit(1)
             Spacer(minLength: Space.sm)
-            Text(script.enabled ? "Enabled" : "Disabled")
-                .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.secondary.color)
+            // One status, consistent with the sidebar's "N active": an erroring script
+            // reads "Error", never "Enabled", and the icon carries the colour.
+            Label(statusWord(script), systemImage: statusSymbol(script))
+                .labelStyle(.titleAndIcon)
+                .font(Tok.Face.ui(Tok.Typography.Size.sm))
+                .foregroundStyle(statusColor(script).color)
+                .help(script.statusText)
         }
+    }
+
+    private func statusWord(_ s: ScriptInfo) -> String {
+        s.error != nil ? "Error" : s.enabled ? "Active" : "Disabled"
+    }
+
+    private func statusSymbol(_ s: ScriptInfo) -> String {
+        s.error != nil ? "exclamationmark.triangle.fill" : s.enabled ? "checkmark.circle.fill" : "circle"
+    }
+
+    private func statusColor(_ s: ScriptInfo) -> DynamicColor {
+        s.error != nil ? Tok.Status.serverError : s.enabled ? Tok.Status.success : Tok.Ink.tertiary
     }
 
     private func section(_ title: String) -> some View {

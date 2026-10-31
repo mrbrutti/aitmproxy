@@ -18,11 +18,12 @@ struct CAPanel: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Space.lg) {
                 Text("Certificate Authority").font(Tok.Face.ui(Tok.Typography.Size.xl, .medium)).foregroundStyle(Tok.Ink.primary.color)
+                    .gridProbe("ca-title", area: "ca")
                 if let status {
                     statusLine(status)
+                        .gridProbe("ca-status", area: "ca")
                     buttons(status)
-                    Text("Agent may install: \(agentMayInstall ? "yes" : "no")")
-                        .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
+                    agentInstall
                     Rule()
                     guides
                 } else {
@@ -34,7 +35,7 @@ struct CAPanel: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Tok.Ground.surface.color)
-        .gridArea("ca")
+        .gridArea("ca", inset: 0)
         .onAppear(perform: load)
     }
 
@@ -49,7 +50,7 @@ struct CAPanel: View {
             }
             if !status.fingerprint.isEmpty { fingerprint(status.fingerprint) }
             keyValue("Subject", status.subject)
-            if let path = status.path { keyValue("Path", path) }
+            if let path = status.path { pathRow(path) }
             if let actionError {
                 Label(actionError, systemImage: "exclamationmark.triangle.fill")
                     .font(Tok.Face.ui(Tok.Typography.Size.sm))
@@ -106,6 +107,39 @@ struct CAPanel: View {
                 .frame(width: 72, alignment: .leading)
             Text(value).font(Tok.Face.data(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.primary.color)
                 .textSelection(.enabled).lineLimit(1).truncationMode(.middle)
+        }
+    }
+
+    /// The certificate path, with a jump to it in Finder.
+    private func pathRow(_ path: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: Space.md) {
+            Text("Path").font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.secondary.color)
+                .frame(width: 72, alignment: .leading)
+            Text(path).font(Tok.Face.data(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.primary.color)
+                .textSelection(.enabled).lineLimit(1).truncationMode(.middle)
+            FlatButton("Reveal in Finder", symbol: "folder") { reveal(path) }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func reveal(_ path: String) {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    /// Whether the agent may install the CA — a read-only flag owned by config.yaml,
+    /// shown as a labelled value with a pointer to where it is set.
+    private var agentInstall: some View {
+        VStack(alignment: .leading, spacing: Space.xs) {
+            LabeledContent {
+                Text(agentMayInstall ? "Yes" : "No")
+                    .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.secondary.color)
+            } label: {
+                Text("Agent may install")
+                    .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.primary.color)
+            }
+            .frame(maxWidth: 360, alignment: .leading)
+            Hint(text: "Set by ca.allow_agent_install in config.yaml. Even when on, the agent's install still passes the proxy's confirmation.")
+            FlatButton("Open Config", symbol: "doc.text") { session.show(.config) }
         }
     }
 

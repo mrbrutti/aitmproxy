@@ -327,7 +327,11 @@ fn matches(flow: &Flow, q: &FlowQuery) -> bool {
                 }
             }
             if let Some(method) = &q.method {
-                if &f.request.method != method {
+                // Case-insensitive, mirroring the live subscription path in
+                // `aitm-mcp` (`FlowFilter::matches`): a lowercase `method:"post"`
+                // filter must match the stored uppercase method, so the live
+                // stream and the `since` replay agree.
+                if !f.request.method.eq_ignore_ascii_case(method) {
                     return false;
                 }
             }

@@ -25,6 +25,8 @@ use aitm_core::{
 use aitm_plugin_rhai::{RhaiConfig, ScriptEntry};
 use aitm_proto_l4::config::L4Config;
 
+use crate::macos_capture::config::MacosCaptureConfig;
+
 /// `<config_dir>/aitmproxy/config.yaml`: a sibling of the CA dir with the
 /// same fallbacks, taken from the directory `CaConfig::default()` already
 /// resolved rather than resolving it a second way.
@@ -41,6 +43,10 @@ pub struct Settings {
     pub core: Config,
     pub rhai: RhaiConfig,
     pub l4: L4Config,
+    /// The macOS NE live-capture feeder config. Lives outside `Config` (like `l4`)
+    /// to keep `aitm-core` untouched; an absent `macos_capture` section is the
+    /// disabled default (the feeder's deny-by-default on-switch).
+    pub macos_capture: MacosCaptureConfig,
 }
 
 /// Load the config file as the core [`Config`] only.
@@ -69,6 +75,7 @@ pub fn load_settings(path: Option<&Path>) -> anyhow::Result<Settings> {
                 core: Config::default(),
                 rhai: RhaiConfig::default(),
                 l4: L4Config::default(),
+                macos_capture: MacosCaptureConfig::default(),
             }),
             Err(e) => Err(e).with_context(|| format!("reading config file {}", path.display())),
         };
@@ -95,11 +102,17 @@ pub fn parse_full(yaml: &str) -> anyhow::Result<(Config, L4Config)> {
 pub fn parse_settings(yaml: &str) -> anyhow::Result<Settings> {
     let file: ConfigFile = serde_yaml::from_str(yaml).context("parsing config YAML")?;
     let l4 = file.l4.clone().unwrap_or_default();
+    let macos_capture = file.macos_capture.clone().unwrap_or_default();
     let mut core = Config::default();
     let mut rhai = RhaiConfig::default();
     file.apply(&mut core, &mut rhai)?;
     append_scripts_dir_entries(&mut rhai);
-    Ok(Settings { core, rhai, l4 })
+    Ok(Settings {
+        core,
+        rhai,
+        l4,
+        macos_capture,
+    })
 }
 
 /// The "next start" half of `script.save`: a script it wrote into
@@ -169,6 +182,12 @@ struct ConfigFile {
     /// take their fail-closed defaults and a misspelled `l4.*` key is an error.
     /// Lives outside `Config` to keep `aitm-core` untouched (AC19).
     l4: Option<L4Config>,
+    /// The macOS NE live-capture feeder config. Maps directly to
+    /// [`MacosCaptureConfig`] (its own `#[serde(default, deny_unknown_fields)]`
+    /// applies), so an absent section is the disabled default and a misspelled
+    /// `macos_capture.*` key is an error. Lives outside `Config` to keep
+    /// `aitm-core` untouched, like `l4`.
+    macos_capture: Option<MacosCaptureConfig>,
     /// The scripts to load, in chain order (M3 spec §8).
     scripts: Option<Vec<ScriptFile>>,
     /// The scripting sandbox: limits, the per-hook budget, the error policy.
@@ -750,8 +769,38 @@ impl FindingsFile {
 
 #[cfg(test)]
 mod tests {
-    use super::parse;
+    use super::{parse, parse_settings};
     use aitm_core::McpTransport;
+
+    /// LF-AC1: a config file with no `macos_capture` section parses to a disabled
+    /// feeder config — the deny-by-default on-switch stays off.
+    #[test]
+    fn macos_capture_defaults_disabled() {
+        assert!(
+            !parse_settings("listen: 127.0.0.1:8080\n")
+                .unwrap()
+                .macos_capture
+                .enabled
+        );
+    }
+
+    /// `macos_capture.enabled: true` round-trips into an enabled feeder config.
+    #[test]
+    fn macos_capture_enable_round_trips() {
+        assert!(
+            parse_settings("macos_capture:\n  enabled: true\n")
+                .unwrap()
+                .macos_capture
+                .enabled
+        );
+    }
+
+    /// An unknown key under `macos_capture` is an error (`deny_unknown_fields`),
+    /// not a silently kept default.
+    #[test]
+    fn macos_capture_unknown_key_errors() {
+        assert!(parse_settings("macos_capture:\n  nope: true\n").is_err());
+    }
 
     /// The streamable-HTTP transport is selectable from config as a `snake_case`
     /// map; `bind`/`token` are read, `allowed_origins` and `path` take their

@@ -212,11 +212,14 @@ struct GhostButton: View {
 /// Press: 120ms scale(0.97) (motion.press); a plain opacity dip under Reduce Motion (S-069).
 struct PressStyle: ButtonStyle {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .scaleEffect(configuration.isPressed && !reduceMotion ? 0.97 : 1)
-            .opacity(configuration.isPressed && reduceMotion ? 0.7 : 1)
+            // Disabled buttons must read as disabled: these custom buttons carry no
+            // system chrome, so without this a `.disabled` Add/Save looks clickable.
+            .opacity(!isEnabled ? 0.4 : (configuration.isPressed && reduceMotion ? 0.7 : 1))
             .animation(reduceMotion ? nil : Tok.Motion.easeOut(Tok.Motion.press), value: configuration.isPressed)
     }
 }

@@ -22,12 +22,17 @@ struct WebSocketInspector: View {
     var body: some View {
         if let detail {
             if detail.frames.isEmpty {
-                Hint(text: "No frames yet")
-                    .padding(.leading, Space.md)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                ContentUnavailableView {
+                    Label("No Frames", systemImage: "dot.radiowaves.left.and.right")
+                } description: {
+                    Text("This WebSocket has exchanged no frames yet.")
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                SplitPane(axis: .vertical, firstMinimum: 160, secondMinimum: 160, initialSecondFraction: 0.4,
-                          autosaveName: "inspector.ws") {
+                // Same autosave name and fraction as the HTTP Request | Response split, so
+                // the divider doesn't jump when the operator moves between HTTP and WS flows.
+                SplitPane(axis: .vertical, firstMinimum: 160, secondMinimum: 160, initialSecondFraction: 0.5,
+                          autosaveName: "inspector.panes") {
                     WSFramesList(detail: detail, frames: frames(detail), direction: $direction, selected: $selected)
                         .environment(session).themed()
                 } second: {
@@ -45,6 +50,7 @@ struct WebSocketInspector: View {
                 .padding(.leading, Space.md)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         } else {
+        @Bindable var bodyState = bodyState
         let index = min(selected, frames.count - 1)
         let frame = frames[index]
         VStack(spacing: 0) {
@@ -53,11 +59,14 @@ struct WebSocketInspector: View {
                     BodyHost.controls(message: frame.message, extent: nil, state: bodyState, sseState: sseState)
                 }
             }
+            if bodyState.findShown {
+                FindRow(state: bodyState.find, isPresented: $bodyState.findShown)
+            }
             BodyHost(message: frame.message, extent: nil, bodySize: session.density.bodySize,
                      sseState: sseState, state: bodyState)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .onChange(of: index) { bodyState.format = .auto; bodyState.findShown = false }
+        .onChange(of: index) { bodyState.format = .auto; bodyState.findShown = false; bodyState.imageZoom = .fit }
         }
     }
 }

@@ -875,8 +875,13 @@ mod tests {
     fn one_choke_point_survives_ingress() {
         let aitm_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         // Every capture source that reaches the ingress must stay read-only on the
-        // wire: the ingress itself and the macOS capture-backend adapter.
-        for rel in ["ingress.rs", "macos_capture/adapter.rs"] {
+        // wire: the ingress itself, the macOS capture-backend adapter, and the live
+        // feeder that pumps captured flows into it.
+        for rel in [
+            "ingress.rs",
+            "macos_capture/adapter.rs",
+            "macos_capture/feeder.rs",
+        ] {
             let source = std::fs::read_to_string(aitm_src.join(rel))
                 .unwrap_or_else(|e| panic!("read {rel}: {e}"));
             let prod = production_prefix(&source);

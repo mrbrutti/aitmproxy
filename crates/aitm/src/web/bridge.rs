@@ -1,7 +1,29 @@
-//! The `/bus` WebSocket bridge (design §4.9): a dumb relay of newline-delimited
-//! JSON-RPC lines between a browser and the in-process `McpServer`. The first
-//! text frame must be the token line `{"token":"…"}`, exactly as `LoopbackTcp`
-//! requires on its first line; every later text frame holds one or more lines.
+//! The `/bus` WebSocket bridge (design §4.9): a relay of newline-delimited
+//! JSON-RPC lines between a browser and the in-process `McpServer`, and of the
+//! server's push notifications back to the browser. The first text frame must be
+//! the token line `{"token":"…"}`, exactly as `LoopbackTcp` requires on its first
+//! line; every later text frame holds one or more lines.
+//!
+//! An authenticated connection is one `ConnCtx`: its role, a unique `conn_id`,
+//! and a bounded `NotificationSink`, shared by every frame it sends. That is what
+//! lets `flow.subscribe` work here as it does over loopback TCP: a subscription is
+//! tagged with the connection and dropped when the connection ends, on every exit
+//! path. Frames are detached rather than cancelled, so one may still be running
+//! at that point; the sink is closed before the subscriptions are dropped, and
+//! the registry refuses a subscribe on a closed sink, so a late `flow.subscribe`
+//! from such a frame registers nothing. The relay drains the sink onto the
+//! socket, one text frame per notification line, interleaved with replies. The
+//! notification lane is bounded by the server's `push_capacity` (drop-oldest,
+//! then a `notifications/aitm/state {lagged:true}` marker on the next drain), so
+//! a client that stops reading cannot grow server memory.
+//!
+//! Replies do not ride the sink: a finished frame's replies go straight to the
+//! socket in line order, so a reply is never dropped or queued twice. A push
+//! burst can delay a reply by at most one drain batch (at most `push_capacity`
+//! lines plus the lag marker), since the drain arm sends its whole batch before
+//! the loop selects again. The two paths share one socket, so a notification can
+//! arrive before the reply carrying its `sub_id`; clients correlate replies by
+//! JSON-RPC `id`, as over TCP.
 //!
 //! A frame is the unit of work. The lines inside one frame run in order and are
 //! answered in order, one text frame per reply, once the whole frame is done. A
@@ -14,15 +36,15 @@
 //! order and clients correlate them by JSON-RPC `id`. Clients that need one
 //! request's effect before the next must wait for its reply; a Close or disconnect
 //! discards replies still in flight. At the in-flight cap the loop stops reading,
-//! so a client Close or disconnect is only noticed once a frame finishes — bounded
-//! by those in-flight frames' own completion. All policy stays in the core: the
-//! bridge authenticates, splits lines, and forwards.
+//! so a client Close or disconnect is noticed once a frame finishes or a push send
+//! fails, bounded by those in-flight frames' own completion. All policy stays in
+//! the core: the bridge authenticates, splits lines, and forwards.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use aitm_core::Frontend;
-use aitm_mcp::{ConnCtx, McpServer};
+use aitm_mcp::{ConnCtx, McpServer, NotificationSink};
 use bytes::Bytes;
 use futures::stream::FuturesUnordered;
 use futures::{SinkExt as _, StreamExt as _};
@@ -66,12 +88,13 @@ const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// sends. Each frame holds one blocking-pool thread while its commands run.
 ///
 /// The cost of that backpressure: at the cap the loop is not reading at all, so a
-/// client Close or disconnect is only noticed once a frame finishes — bounded by
-/// the in-flight frames' own completion, however long their commands run.
+/// client Close or disconnect is noticed once a frame finishes or a push send
+/// fails, bounded by the in-flight frames' own completion, however long their
+/// commands run.
 pub const MAX_IN_FLIGHT: usize = 16;
 
-// The relay's `select!` panics when every branch is disabled; with a non-zero cap
-// the read branch is enabled whenever nothing is in flight.
+// With a zero cap the relay's read branch would never be enabled, so an
+// authenticated connection could never send a frame.
 const _: () = assert!(MAX_IN_FLIGHT > 0);
 
 /// The most request lines one text frame may carry. A frame is dispatched line by
@@ -220,6 +243,24 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
     }
     debug!(?role, "web bus: connection authenticated");
 
+    // The connection's one `ConnCtx`, minted only now that the peer has
+    // authenticated: every frame runs under it, its sink is where the server
+    // pushes this connection's notifications, and its id is what sweeps the
+    // connection's subscriptions. The guard runs that teardown when this
+    // function returns by any path, a panicked frame included.
+    let sink = NotificationSink::new(state.mcp.push_capacity());
+    let conn = Arc::new(ConnCtx {
+        role,
+        client_label: None,
+        conn_id: state.mcp.next_conn_id(),
+        out: Some(sink.clone()),
+    });
+    let guard = ConnGuard {
+        mcp: Arc::clone(&state.mcp),
+        conn_id: conn.conn_id,
+        sink: sink.clone(),
+    };
+
     // One task per frame, so a slow command (its blocking `invoke`) cannot stall
     // the reads and replies of the other frames on this socket. At most
     // `MAX_IN_FLIGHT` run at once; at the cap the loop stops reading (the read
@@ -233,7 +274,7 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
 
     // Any lines that shared the token's frame are the first frame in flight.
     if !pending.is_empty() {
-        in_flight.push(dispatch_frame(&state.mcp, role, pending));
+        in_flight.push(dispatch_frame(&state.mcp, &conn, pending));
     }
 
     loop {
@@ -246,18 +287,35 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
                     ws.send(Message::text(reply)).await?;
                 }
             }
+            // The server pushed to this connection: drain the sink and send each
+            // line as one text frame. Not gated on the in-flight cap, so pushes
+            // keep flowing while the read branch is paused. `Notify` stores a
+            // permit, so a push that lands while another branch is mid-send is
+            // taken on the next turn; a spurious wake drains nothing.
+            _ = sink.wait() => {
+                for line in sink.drain() {
+                    ws.send(Message::text(line)).await?;
+                }
+            }
             next = ws.next(), if in_flight.len() < MAX_IN_FLIGHT => match next {
                 Some(Ok(Message::Text(text))) => {
                     let Some(lines) = bounded_lines(lines_of(text.as_str())) else {
-                        return refuse(ws, in_flight, CloseCode::Size, TOO_MANY_LINES).await;
+                        return refuse(ws, in_flight, guard, CloseCode::Size, TOO_MANY_LINES)
+                            .await;
                     };
                     if !lines.is_empty() {
-                        in_flight.push(dispatch_frame(&state.mcp, role, lines));
+                        in_flight.push(dispatch_frame(&state.mcp, &conn, lines));
                     }
                 }
                 Some(Ok(Message::Binary(_))) => {
-                    return refuse(ws, in_flight, CloseCode::Unsupported, "text frames only")
-                        .await;
+                    return refuse(
+                        ws,
+                        in_flight,
+                        guard,
+                        CloseCode::Unsupported,
+                        "text frames only",
+                    )
+                    .await;
                 }
                 Some(Ok(Message::Close(frame))) => {
                     debug!(?frame, "websocket closed by the client");
@@ -278,23 +336,45 @@ type FrameTask = tokio::task::JoinHandle<Vec<String>>;
 
 /// Hand one frame's JSON-RPC lines to the core on a blocking thread (each
 /// command's `invoke` runs synchronously there, as `transport::serve_lines` does)
-/// under the connection's resolved `role`. The lines run **in order**, so the
+/// under the connection's shared `ConnCtx`. The lines run **in order**, so the
 /// returned replies are in the order the lines were sent; the caller sends them as
-/// one text frame each once the whole frame is done. The role makes the browser's
-/// own `initialize` reply carry the right `role` echo, and gates commands exactly
-/// as the other frontends do. Concurrency is across frames, never within one.
+/// one text frame each once the whole frame is done. The context's role makes the
+/// browser's own `initialize` reply carry the right `role` echo and gates commands
+/// exactly as the other frontends do; its sink and id are what `flow.subscribe`
+/// attaches to. Concurrency is across frames, never within one.
 ///
 /// A line that panics discards the replies the frame's earlier lines produced
 /// (they are held until the frame is done) and ends the connection.
-fn dispatch_frame(mcp: &Arc<McpServer>, role: Frontend, lines: Vec<String>) -> FrameTask {
+fn dispatch_frame(mcp: &Arc<McpServer>, conn: &Arc<ConnCtx>, lines: Vec<String>) -> FrameTask {
     let mcp = Arc::clone(mcp);
+    let conn = Arc::clone(conn);
     tokio::task::spawn_blocking(move || {
-        let conn = ConnCtx::new(role);
         lines
             .iter()
             .filter_map(|line| mcp.handle_on(&conn, line))
             .collect()
     })
+}
+
+/// Tears down a connection's server-side state when it ends. Held by `relay`
+/// from authentication on, so it runs whichever way `relay` returns: client
+/// Close, stream end, a transport error, a refusal, a panicked frame. It closes
+/// the sink first and drops the connection's subscriptions second. The order
+/// matters: a detached frame may run `flow.subscribe` after this; the registry
+/// refuses a subscribe on a closed sink under its own lock, and one that slipped
+/// in before the close is swept by the drop, so no subscription outlives its
+/// connection (web-bus-push spec D4).
+struct ConnGuard {
+    mcp: Arc<McpServer>,
+    conn_id: u64,
+    sink: NotificationSink,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.sink.close();
+        self.mcp.drop_connection(self.conn_id);
+    }
 }
 
 /// Resolve the first-line token to a role, comparing in constant time against
@@ -316,18 +396,23 @@ fn classify_token(first: &str, state: &WebState) -> Option<Frontend> {
     None
 }
 
-/// Refuse the peer after authentication: drop the frames in flight, then close.
-/// Dropping the handles frees the replies already produced rather than holding
-/// them (up to `MAX_IN_FLIGHT` × [`MAX_LINES_PER_FRAME`]) for the whole close
-/// handshake; the blocking tasks still running are detached, as when the
-/// connection ends any other way.
+/// Refuse the peer after authentication: drop the frames in flight and the
+/// connection's subscriptions, then close. Dropping the handles frees the replies
+/// already produced rather than holding them (up to `MAX_IN_FLIGHT` ×
+/// [`MAX_LINES_PER_FRAME`]) for the whole close handshake; the blocking tasks
+/// still running are detached, as when the connection ends any other way.
+/// Dropping the guard before the handshake means a peer that will not answer our
+/// Close neither counts as a connected subscriber nor is pushed to for the whole
+/// drain budget.
 async fn refuse(
     ws: Ws,
     in_flight: FuturesUnordered<FrameTask>,
+    guard: ConnGuard,
     code: CloseCode,
     reason: &'static str,
 ) -> anyhow::Result<()> {
     drop(in_flight);
+    drop(guard);
     close(ws, code, reason).await
 }
 

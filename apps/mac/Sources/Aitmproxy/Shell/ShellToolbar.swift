@@ -46,9 +46,18 @@ struct ShellToolbar: ToolbarContent {
 struct ListeningPill: View {
     @Environment(Session.self) private var session
 
+    /// The embedded core's health bucket, or `nil` for an external core (then the
+    /// pill follows capture/intercept as before, since the app does not own it).
+    private var coreHealth: CoreHealth? { session.coreHealth.health }
+
     private var dot: DynamicColor {
-        if !session.capturing { return Tok.Ink.tertiary }
-        return session.interceptArmed ? Tok.Intercept.base : Tok.Status.success
+        switch coreHealth {
+        case .failed: return Tok.Status.serverError
+        case .restarting: return Tok.Intercept.base
+        default:
+            if !session.capturing { return Tok.Ink.tertiary }
+            return session.interceptArmed ? Tok.Intercept.base : Tok.Status.success
+        }
     }
 
     var body: some View {
@@ -56,12 +65,21 @@ struct ListeningPill: View {
             Circle().fill(dot.color).frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
             HStack(spacing: 0) {
                 Text("aitmproxy").fontWeight(.medium).foregroundStyle(Tok.Ink.primary.color)
-                Text(" · \(session.capturing ? "listening" : "paused") ")
-                Text(session.coreHealth.connection?.proxyAddress ?? session.listenAddress)
-                    .font(Tok.Face.data(Tok.Typography.Size.sm, .medium))
-                    .foregroundStyle(Tok.Ink.primary.color)
-                Text(" · HTTP/2")
-                if session.interceptArmed { Text(" · intercept armed") }
+                // The pill must tell the truth about the core: a failed embedded core
+                // is not listening, so it must not keep reading "listening …".
+                switch coreHealth {
+                case .failed:
+                    Text(" · core failed — not listening")
+                case .restarting:
+                    Text(" · restarting…")
+                default:
+                    Text(" · \(session.capturing ? "listening" : "paused") ")
+                    Text(session.coreHealth.connection?.proxyAddress ?? session.listenAddress)
+                        .font(Tok.Face.data(Tok.Typography.Size.sm, .medium))
+                        .foregroundStyle(Tok.Ink.primary.color)
+                    Text(" · HTTP/2")
+                    if session.interceptArmed { Text(" · intercept armed") }
+                }
             }
             .font(Tok.Face.ui(Tok.Typography.Size.sm))
             .foregroundStyle(Tok.Ink.secondary.color)

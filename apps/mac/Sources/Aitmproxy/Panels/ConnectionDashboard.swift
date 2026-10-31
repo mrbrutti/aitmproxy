@@ -14,7 +14,9 @@ struct ConnectionDashboard: View {
     private static let sideWidth: CGFloat = 280
 
     var body: some View {
-        let rows = session.rows
+        // Follow the filtered view so the chip bar and filter bar drive the band,
+        // not just the full capture.
+        let rows = session.visibleRows
         let stats = OverviewStats(rows: rows)
         let series = TrafficSeries(rows: rows)
         HStack(alignment: .top, spacing: Space.md) {

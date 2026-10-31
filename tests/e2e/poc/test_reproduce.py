@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
-"""T1: poc.run reproduces a real finding against the seeded target, and poc.build
+# e2e: tier=T1 surface=poc
+"""poc.run reproduces a real finding against the seeded target, and poc.build
 produces a CREDENTIAL-FREE PoC from a captured flow.
 
-Ground-truth observers: the vulnerable-vs-patched verdict from the real target (a
-`word` matcher on the reflected payload -- raw only when vulnerable), and the exact
-bytes of the built PoC YAML.
-
-Notes proven here: poc.run's exit code never reflects pass/fail, so we parse the JSON
-`passed` field; poc.build reads the LIVE flow store, so it is driven over the bus
-after a real request is captured; secrets in the query string / body / credential
-headers must NOT appear in the built artifact (regression: the builder historically
-scrubbed only 4 header names -- see crates/aitm-poc/src/builder.rs).
+Ground truth: the vulnerable-vs-patched verdict from the real target (a `word`
+matcher on the reflected payload — raw only when vulnerable) and the exact bytes of
+the built PoC. poc.run's exit code never reflects pass/fail, so we parse JSON
+`passed`. poc.build reads the LIVE flow store, so it runs over the bus after a real
+request is captured; secrets in the query / body / credential headers must NOT appear
+in the built artifact (regression guard: crates/aitm-poc/src/builder.rs).
 """
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from harness import Harness, Reporter, curl  # noqa: E402
+E2E = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(E2E))
+sys.path.insert(0, str(E2E / "lib"))
+
+from aitm_e2e import check, free_port, ok, section  # noqa: E402
+from aitm_e2e.bus import BusClient  # noqa: E402
+from aitm_e2e.config import CoreConfig  # noqa: E402
+from aitm_e2e.core import Aitm  # noqa: E402
+from seeded import TestTarget, aitm_cli, curl_code  # noqa: E402
 
 MARKER = "<xss-probe-aitm-e2e>"
-POC_YAML = """\
-id: reflected-xss-search-q
+POC_YAML = """id: reflected-xss-search-q
 info:
   name: Reflected XSS in search q parameter
   severity: high
@@ -29,7 +35,6 @@ info:
   tags: [xss, reflected]
 variables:
   - name: target
-    description: Base URL of the target
     required: true
   - name: param
     default: q
@@ -47,7 +52,6 @@ success:
       word: "{{marker}}"
 """ % MARKER
 
-# Distinct secrets, one per leak location, so the assertion pinpoints coverage.
 Q_SECRET = "qSEC-access-token-111"
 B_SECRET = "bSEC-password-222"
 H_SECRET = "hSEC-bearer-333"
@@ -59,71 +63,57 @@ def jparse(s: str):
     return json.loads(s[i:j + 1]) if i >= 0 and j > i else None
 
 
-def main() -> int:
-    r = Reporter("t1_poc_reproduce")
-    with Harness("poc") as h:
-        vuln = h.start_testtarget("vulnerable")
-        patched = h.start_testtarget("patched")
-        host_port = vuln.split("://", 1)[1]
-        h.scope_hosts = [host_port, patched.split("://", 1)[1]]
-        (h.poc_dir / "reflected-xss.poc.yaml").write_text(POC_YAML)
-        h.start_aitm()
-        poc_path = str(h.poc_dir / "reflected-xss.poc.yaml")
+def main() -> None:
+    with TestTarget("vulnerable") as vuln, TestTarget("patched") as patched:
+        poc_dir = tempfile.mkdtemp(prefix="aitm-e2e-poc-")
+        Path(poc_dir, "reflected-xss.poc.yaml").write_text(POC_YAML)
+        cfg = CoreConfig(
+            proxy_port=free_port(),
+            scope_entries=[vuln.host(), patched.host()],
+            poc_dir=poc_dir,
+            findings_dir=os.path.join(poc_dir, "findings"),
+        )
+        with Aitm.server(cfg) as core:
+            poc_path = str(Path(poc_dir, "reflected-xss.poc.yaml"))
 
-        # --- poc.run reproduces the finding against the vulnerable target --- #
-        rc, out, err = h.run_cli("poc", "run", "--poc_path", poc_path, "--target", vuln)
-        res = jparse(out)
-        r.check("poc_run_vuln_passes", bool(res) and res.get("passed") is True,
-                f"rc={rc} passed={res.get('passed') if res else None} err={err[:200]}")
-        # The word leaf (not status) must be what carries it.
-        evaluated = {e.get("assertion"): e.get("matched") for e in (res or {}).get("evaluated", [])}
-        r.check("poc_run_word_matched", any("word" in str(k).lower() or MARKER in str(k) for k in evaluated),
-                f"evaluated={evaluated}")
+            section("poc.run reproduces reflected XSS against the seeded target")
+            rc, out, err = aitm_cli(core, "poc", "run", "--poc_path", poc_path, "--target", vuln.base_url)
+            res = jparse(out)
+            check(bool(res) and res.get("passed") is True,
+                  f"poc.run passes against the vulnerable target (passed={res.get('passed') if res else None})")
+            evaluated = {e.get("assertion"): e.get("matched") for e in (res or {}).get("evaluated", [])}
+            check(any("word" in str(k).lower() for k in evaluated),
+                  f"the word matcher (not just status) carried the finding ({evaluated})")
+            check(bool(res) and bool(res.get("recorded_id")),
+                  "a passing poc.run auto-records a finding")
 
-        # negative control: patched target escapes the payload -> passed:false.
-        rc, out, err = h.run_cli("poc", "run", "--poc_path", poc_path, "--target", patched)
-        res_p = jparse(out)
-        r.check("poc_run_patched_fails", bool(res_p) and res_p.get("passed") is False,
-                f"patched passed={res_p.get('passed') if res_p else None}")
+            rc, out, err = aitm_cli(core, "poc", "run", "--poc_path", poc_path, "--target", patched.base_url)
+            res_p = jparse(out)
+            check(bool(res_p) and res_p.get("passed") is False,
+                  "poc.run fails against the patched target (negative control)")
 
-        # a passing run with findings.dir configured records a finding.
-        if res and res.get("recorded_id"):
-            r.ok("poc_run_records_finding", f"recorded_id={res['recorded_id']}")
-        else:
-            r.fail("poc_run_records_finding", "passing poc.run did not record a finding (findings.dir set)")
+            section("poc.build from a captured flow is credential-free")
+            proxy = f"http://127.0.0.1:{cfg.proxy_port}"
+            url = f"{vuln.base_url}/search?q={MARKER}&access_token={Q_SECRET}"
+            rc, code, _ = curl_code(
+                ["-x", proxy, "-X", "POST", "--data", f"password={B_SECRET}",
+                 "-H", f"Authorization: Bearer {H_SECRET}", "-H", f"X-Auth-Token: {X_SECRET}", url])
+            check(rc == 0, f"a request carrying secrets was proxied + captured (rc={rc})")
 
-        # --- poc.build from a captured flow, credential-free --------------- #
-        # Capture one real request through the proxy carrying secrets in every spot.
-        url = f"{vuln}/search?q={MARKER}&access_token={Q_SECRET}"
-        code, http, _ = curl(
-            url, proxy=h.proxy_url(), extra=[
-                "-X", "POST", "--data", f"password={B_SECRET}",
-                "-H", f"Authorization: Bearer {H_SECRET}",
-                "-H", f"X-Auth-Token: {X_SECRET}",
-            ])
-        r.check("capture_request", code == 0, f"proxied request failed exit={code} http={http}")
+            op = BusClient.operator(core)
+            flows = op.call("flow.list")
+            ids = flows if isinstance(flows, list) else (flows.get("ids", []) if isinstance(flows, dict) else [])
+            check(bool(ids), f"the flow was captured over the bus ({ids})")
+            last = ids[-1]
+            fid = last if isinstance(last, str) else (last.get("id") if isinstance(last, dict) else None)
+            built = op.call("poc.build", {"flow_id": fid, "name": "Reflected XSS", "param": "q"})
+            yaml_text = built if isinstance(built, str) else json.dumps(built)
+            check("steps:" in yaml_text, "poc.build produced a PoC YAML")
+            leaked = [s for s in (Q_SECRET, B_SECRET, X_SECRET, H_SECRET) if s in yaml_text]
+            check(not leaked, f"the built PoC is credential-free (leaked={leaked})")
 
-        op = h.mcp("operator"); op.initialize()
-        flows, _, _ = op.call("flow.list")
-        ids = flows if isinstance(flows, list) else (flows or {}).get("ids") if isinstance(flows, dict) else None
-        r.check("flow_captured", bool(ids), f"no flow captured: {flows!r}")
-        built_ok = False
-        yaml_text = ""
-        if ids:
-            fid = ids[-1] if isinstance(ids[-1], str) else ids[-1].get("id") if isinstance(ids[-1], dict) else None
-            sc, is_err, text = op.call("poc.build", {"flow_id": fid, "name": "Reflected XSS", "param": "q"})
-            # result is a Str (the YAML) in structuredContent or text.
-            yaml_text = sc if isinstance(sc, str) else (text or "")
-            built_ok = (not is_err) and "steps:" in yaml_text
-        r.check("poc_build_ok", built_ok, f"poc.build failed: {yaml_text[:160]!r}")
-
-        leaked = [s for s in (Q_SECRET, B_SECRET, X_SECRET, H_SECRET) if s in yaml_text]
-        r.check("poc_build_credential_free", not leaked,
-                f"secrets baked into the built PoC: {leaked} -- see crates/aitm-poc/src/builder.rs")
-        op.close()
-
-    return r.finish()
+            ok("PoC reproduce + credential-free build verified")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

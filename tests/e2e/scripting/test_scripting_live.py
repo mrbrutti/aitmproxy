@@ -1,26 +1,34 @@
 #!/usr/bin/env python3
-"""T1: Rhai scripting runs for real against live traffic, with deny-by-default guards.
+# e2e: tier=T1 surface=scripting
+"""Rhai scripting runs for real against live traffic, with deny-by-default guards.
 
-Scripts are loaded at boot from rhai.scripts_dir (no MCP needed for hooks to fire).
-Independent observers: a real curl response body rewritten by an on_response hook,
-and the bus result of a script-registered command. Proves:
-  * an on_response hook rewrites a live response the client receives;
-  * a ScriptCommand (reg.add_command) is callable by an operator and REFUSED for an
-    agent (script commands default to Sensitive -> operator/CLI only);
-  * deny-by-default: an unregistered capability (filesystem open_file) and an
-    out-of-scope http.send are both refused.
+Scripts load at boot from rhai.scripts_dir (no MCP needed for hooks to fire).
+Independent observers: a real curl through the proxy (the request edit reaches the
+seeded upstream's /admin logic; the response edit reaches the client) and the bus
+result of a script-registered command. Proves on_request + on_response_headers mutate
+live traffic on the wire, a ScriptCommand is operator-callable and agent-refused
+(script commands default to Sensitive), and deny-by-default refuses filesystem +
+out-of-scope http.send.
 """
+import os
 import sys
+import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from harness import Harness, Reporter, curl  # noqa: E402
+E2E = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(E2E))
+sys.path.insert(0, str(E2E / "lib"))
 
-# on_request mutates the request before it goes upstream; on_response_headers
-# mutates the response before it reaches the client (the response is streamed, so
-# on_response_headers -- not the post-complete on_response -- is the mutation point).
-HOOK = """\
-const NAME = "hook-proof";
+from aitm_e2e import check, free_port, ok, section  # noqa: E402
+from aitm_e2e.bus import BusClient  # noqa: E402
+from aitm_e2e.config import CoreConfig  # noqa: E402
+from aitm_e2e.core import Aitm  # noqa: E402
+from seeded import TestTarget, curl_code  # noqa: E402
+
+# on_request mutates before upstream; on_response_headers mutates before the client
+# (the response is streamed, so on_response_headers -- not the post-complete
+# on_response -- is the response mutation point).
+HOOK = """const NAME = "hook-proof";
 const API = "1";
 fn on_request(flow) {
     flow.request.headers.set("X-Role", "admin");
@@ -29,9 +37,7 @@ fn on_response_headers(flow) {
     flow.response.headers.set("X-Aitm-Hook", "respproof");
 }
 """
-
-CMD = """\
-const NAME = "cmd-proof";
+CMD = """const NAME = "cmd-proof";
 const API = "1";
 fn load(reg) {
     reg.add_command("demo.ping", "liveness check", |args| "pong");
@@ -42,54 +48,45 @@ fn load(reg) {
 """
 
 
-def main() -> int:
-    r = Reporter("t1_scripting_live")
-    with Harness("scripting", scripts={"hook-proof.rhai": HOOK, "cmd-proof.rhai": CMD}) as h:
-        target = h.start_testtarget("vulnerable")
-        h.scope_hosts = [target.split("://", 1)[1]]
-        h.start_aitm()
+def main() -> None:
+    with TestTarget("vulnerable") as target:
+        scripts_dir = tempfile.mkdtemp(prefix="aitm-e2e-rhai-")
+        Path(scripts_dir, "hook-proof.rhai").write_text(HOOK)
+        Path(scripts_dir, "cmd-proof.rhai").write_text(CMD)
+        cfg = CoreConfig(proxy_port=free_port(), scope_entries=[target.host()],
+                         rhai_scripts_dir=scripts_dir)
+        with Aitm.server(cfg) as core:
+            proxy = f"http://127.0.0.1:{cfg.proxy_port}"
 
-        # --- hooks fire on live traffic, mutating both directions ---------- #
-        # /admin returns the admin marker ONLY if the upstream saw X-Role: admin,
-        # which the on_request hook injects -> proves request mutation on the wire.
-        hdrs = h.root / "resp-hdrs.txt"
-        code, http, body = curl(f"{target}/admin", proxy=h.proxy_url(), extra=["-D", str(hdrs)])
-        r.check("hook_request_edit_reaches_upstream",
-                code == 0 and "ADMIN-AREA-MARKER-c6f0" in body,
-                f"exit={code} http={http} body={body[:80]!r}")
-        # The on_response_headers hook adds a response header the client receives.
-        hdr_text = hdrs.read_text() if hdrs.exists() else ""
-        r.check("hook_response_edit_reaches_client",
-                "x-aitm-hook: respproof" in hdr_text.lower(),
-                f"response headers missing the hook's edit: {hdr_text[:160]!r}")
+            section("hooks mutate live traffic in both directions")
+            hdr_file = os.path.join(scripts_dir, "resp-hdrs.txt")
+            rc, code, body = curl_code(["-x", proxy, "-D", hdr_file, f"{target.base_url}/admin"])
+            check(rc == 0 and "ADMIN-AREA-MARKER-c6f0" in body,
+                  "on_request injected X-Role:admin -> the upstream granted /admin (request edit on the wire)")
+            hdrs = open(hdr_file).read() if os.path.exists(hdr_file) else ""
+            check("x-aitm-hook: respproof" in hdrs.lower(),
+                  "on_response_headers added a header the client received (response edit on the wire)")
 
-        op = h.mcp("operator"); op.initialize()
-        agent = h.mcp("agent"); agent.initialize()
+            section("ScriptCommand registered, callable, and gated")
+            op = BusClient.operator(core)
+            agent = BusClient.agent(core)
+            check("demo.ping" in set(op.tool_names()), "reg.add_command registered demo.ping")
+            pong = op.call("demo.ping")
+            check(pong == "pong" or "pong" in str(pong), f"operator demo.ping -> pong ({pong!r})")
+            status, _ = agent.try_call("demo.ping")
+            check(status == "error", "agent demo.ping is refused (script commands are Sensitive)")
 
-        # --- ScriptCommand registered + callable + gated ------------------- #
-        tools = op.tools()
-        r.check("script_command_registered", "demo.ping" in tools,
-                f"demo.* in tools: {sorted(t for t in tools if t.startswith('demo.'))}")
-        sc, is_err, text = op.call("demo.ping")
-        r.check("script_command_operator", (not is_err) and (sc == "pong" or "pong" in (text or "")),
-                f"isError={is_err} sc={sc!r} text={text[:80]!r}")
-        sc, ag_err, ag_text = agent.call("demo.ping")
-        r.check("script_command_agent_refused", ag_err,
-                f"agent should be refused (script commands are Sensitive): isError={ag_err}")
+            section("deny-by-default guards hold")
+            status, msg = op.try_call("demo.fs")
+            check(status == "error" and ("open_file" in msg or "not found" in msg.lower()),
+                  f"filesystem read is denied ({msg[:70]})")
+            status, msg = op.try_call("demo.send")
+            low = msg.lower()
+            check(status == "error" and any(k in low for k in ("denied", "scope", "evil.test", "not found")),
+                  f"out-of-scope http.send is denied ({msg[:90]})")
 
-        # --- deny-by-default guards ---------------------------------------- #
-        sc, fs_err, fs_text = op.call("demo.fs")
-        r.check("deny_filesystem", fs_err and ("open_file" in fs_text or "not found" in fs_text.lower()),
-                f"filesystem read should be denied: isError={fs_err} text={fs_text[:120]!r}")
-        sc, send_err, send_text = op.call("demo.send")
-        low = send_text.lower()
-        r.check("deny_out_of_scope_send", send_err and
-                ("denied" in low or "scope" in low or "evil.test" in low or "not found" in low),
-                f"out-of-scope http.send should be denied: isError={send_err} text={send_text[:160]!r}")
-
-        op.close(); agent.close()
-    return r.finish()
+            ok("scripting hooks + ScriptCommand + deny-by-default verified")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

@@ -29,12 +29,12 @@
 //! wire.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use aitm_core::{Body, CommandHost, Flow, FlowId, GuardError, HttpRequest};
+use aitm_core::{Body, CommandHost, Flow, FlowId, GuardError, HttpFlow, HttpRequest};
 
 use crate::checks::{AttackMode, CheckDefinition};
-use crate::discover::{body_bytes, InjectionPoint, Location, REDACTED};
+use crate::discover::{body_bytes, enumerate, InjectionPoint, Location, REDACTED};
 use crate::ScannerConfig;
 
 /// One per-attempt confirmation: the injection point and payload that
@@ -204,6 +204,92 @@ pub async fn inject(
         confirmed,
         stopped_reason: stopped_reason.map(str::to_string),
     })
+}
+
+/// The stored [`Flow::Http`] flows whose scheme, host and effective port
+/// ([`url::Url::port_or_known_default`]) equal `target`'s, in store order:
+/// every flow for `target == None`, none for an unparseable or hostless
+/// `target`. Read-only — no traffic is issued and no scope/rate guard is
+/// consulted — the "stored flows for this target" helper `scan.passive`,
+/// `scan.inject` and `campaign` share.
+pub fn target_flows(host: &CommandHost<'_>, target: Option<&str>) -> Vec<HttpFlow> {
+    let wanted = match target {
+        Some(t) => {
+            let Ok(parsed) = url::Url::parse(t) else {
+                return Vec::new();
+            };
+            if parsed.host_str().is_none() {
+                return Vec::new();
+            }
+            Some(parsed)
+        }
+        None => None,
+    };
+    host.store()
+        .list()
+        .into_iter()
+        .filter_map(|id| host.store().get(id))
+        .filter_map(|flow| match flow {
+            Flow::Http(http) => Some(http),
+            _ => None,
+        })
+        .filter(|flow| match &wanted {
+            None => true,
+            Some(want) => flow_authority_matches(flow, want),
+        })
+        .collect()
+}
+
+/// Whether `flow`'s own scheme, host and effective port equal `target`'s.
+fn flow_authority_matches(flow: &HttpFlow, target: &url::Url) -> bool {
+    let Ok(flow_url) = url::Url::parse(&format!(
+        "{}://{}/",
+        flow.request.scheme, flow.request.authority
+    )) else {
+        return false;
+    };
+    flow_url.scheme() == target.scheme()
+        && flow_url.host_str() == target.host_str()
+        && flow_url.port_or_known_default() == target.port_or_known_default()
+}
+
+/// The points `def` applies to across `flows`: [`enumerate`] run over each
+/// flow, kept only where the point's [`Location`] is one `def.locations`
+/// names. Read-only — no traffic is issued. Shared with [`target_flows`] by
+/// `scan.passive`, `scan.inject` and `campaign`.
+pub fn class_points(flows: &[HttpFlow], def: &CheckDefinition) -> Vec<InjectionPoint> {
+    flows
+        .iter()
+        .flat_map(enumerate)
+        .filter(|p| def.locations.contains(&p.location))
+        .collect()
+}
+
+/// Why a [`bounded`] future did not complete: the overall `deadline` had
+/// already been reached when its internal timeout fired (`true`), or only the
+/// fixed 60s cap had (`false`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimedOut {
+    pub at_deadline: bool,
+}
+
+/// Run `fut` under `tokio::time::timeout`, bounded by both `deadline` and a
+/// fixed 60s cap — so a far-future `deadline` can never hold a slot for more
+/// than a minute. `remaining = deadline.saturating_duration_since(now)`; the
+/// timeout is `remaining.min(60s)`. Shared by `inject`, `reproduce_and_record`
+/// and `run_class` so the time-bounding logic exists once.
+pub async fn bounded<T>(
+    deadline: Instant,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T, TimedOut> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let budget = remaining.min(Duration::from_secs(60));
+    match tokio::time::timeout(budget, fut).await {
+        Ok(value) => Ok(value),
+        Err(_elapsed) => Err(TimedOut {
+            at_deadline: Instant::now() >= deadline,
+        }),
+    }
 }
 
 /// Read each applicable point's source request from the store once, so the run
@@ -1375,5 +1461,74 @@ mod tests {
         for location in [Location::Header, Location::Cookie, Location::PathSegment] {
             assert!(mutate_request(&flow.request, &at(location, "q"), "X").is_none());
         }
+    }
+
+    // ---- stored-flow helpers: target_flows / class_points --------------------
+
+    /// A captured flow at a given authority, carrying a header and a cookie
+    /// alongside its `q` query parameter (so `class_points` has a header/cookie
+    /// point to filter out).
+    fn flow_at(authority: &str, path: &str) -> HttpFlow {
+        let mut headers = HeaderMap::new();
+        headers.set("X-Custom", "1");
+        headers.set("Cookie", "session=abc");
+        flow_of(HttpRequest {
+            method: "GET".into(),
+            scheme: "http".into(),
+            authority: authority.into(),
+            path: path.into(),
+            version: HttpVersion::Http11,
+            headers,
+            body: Body::Empty,
+            timestamp: SystemTime::now(),
+        })
+    }
+
+    #[test]
+    fn target_flows_and_class_points() {
+        let t = flow_at("t.test:8080", "/search?q=hello");
+        let other = flow_at("other.test:8080", "/search?q=hello");
+        let store = store_with(&[&t, &other]);
+        let client = ReflectingClient { vulnerable: true };
+        let guard = StdGuard::default();
+        let host = CommandHost::new(&store, &client, &guard, None);
+
+        let only_t = target_flows(&host, Some("http://t.test:8080"));
+        assert_eq!(only_t.iter().map(|f| f.id).collect::<Vec<_>>(), vec![t.id]);
+
+        let both = target_flows(&host, None);
+        let both_ids: HashSet<FlowId> = both.iter().map(|f| f.id).collect();
+        assert_eq!(
+            both_ids,
+            HashSet::from([t.id, other.id]),
+            "`None` returns every flow"
+        );
+
+        assert!(
+            target_flows(&host, Some("not a url")).is_empty(),
+            "an unparseable target returns none"
+        );
+
+        let points = class_points(std::slice::from_ref(&t), &CheckDefinition::reflected_xss());
+        assert_eq!(
+            points.len(),
+            1,
+            "only the `q` point: headers/cookies are not reflected-xss locations: {points:?}"
+        );
+        assert_eq!(points[0].name, "q");
+        assert_eq!(points[0].location, Location::Query);
+    }
+
+    // ---- bounded ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn bounded_respects_the_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(200);
+
+        let result = bounded(deadline, tokio::time::sleep(Duration::from_secs(3))).await;
+        assert_eq!(result, Err(TimedOut { at_deadline: true }));
+
+        let result = bounded(deadline, futures::future::ready(7)).await;
+        assert_eq!(result, Ok(7));
     }
 }

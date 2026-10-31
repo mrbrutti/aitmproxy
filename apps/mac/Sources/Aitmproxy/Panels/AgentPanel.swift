@@ -218,6 +218,7 @@ struct AgentPanel: View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: Space.md) {
                 TrackedLabel("Agent")
+                    .gridProbe("agent-title", area: "agent")
                 HStack(spacing: Space.md) {
                     FlatSegment(options: AgentPolicy.allCases.map { ($0, $0.title) },
                                 selection: Binding(get: { session.agentPolicy }, set: { state.choose($0) }))
@@ -233,11 +234,13 @@ struct AgentPanel: View {
                         Hint(text: "Agent policy needs the bus")
                     }
                 }
+                .gridProbe("agent-policy", area: "agent")
                 HStack(spacing: Space.section) {
                     stat("Connected clients", "\(state.connectedClients)")
-                    stat("Actions / min", "\(session.agentActionsLastMinute)")
+                    stat("Actions per minute", "\(session.agentActionsLastMinute)")
                     stat("Pending", "\(state.pending.count)")
                 }
+                .gridProbe("agent-stats", area: "agent")
                 if state.l4Advertised {
                     L4CapabilitySection(state: state, gates: session.l4AgentGates)
                 }
@@ -282,21 +285,32 @@ struct L4CapabilitySection: View {
                 TrackedLabel("Agent L4 capabilities")
             }
             Text(state.l4SetterPresent
-                ? "Turn agent (MCP) access to each raw-L4 capability on or off. Each reflects the l4.allow_agent_* gate that actually governs the agent path."
-                : "Read-only: this core has no l4.agent.set — set l4.allow_agent_* in config and restart. An agent can never flip its own gates.")
+                ? "Turn the agent's access to each raw network capability on or off."
+                : "Read-only here — change these in config.yaml and restart. The agent can never turn its own on.")
                 .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
                 .fixedSize(horizontal: false, vertical: true)
-            ForEach(L4AgentGates.Capability.allCases, id: \.self) { cap in
-                Toggle(isOn: Binding(
-                    get: { gates?.allowed(cap) ?? false },
-                    set: { state.setL4Capability(cap, $0) }
-                )) {
-                    Text(cap.title).font(Tok.Face.ui(Tok.Typography.Size.base)).foregroundStyle(Tok.Ink.primary.color)
+                .help(state.l4SetterPresent
+                    ? "Each switch reflects the l4.allow_agent_* gate that governs the agent (MCP) L4 path."
+                    : "Set l4.allow_agent_* in config.yaml and restart; the operator-only setter refuses an agent (MCP) caller.")
+            // A Grid so every switch lands on one trailing edge instead of starting
+            // right after a ragged label.
+            Grid(alignment: .leading, horizontalSpacing: Space.lg, verticalSpacing: Space.sm) {
+                ForEach(L4AgentGates.Capability.allCases, id: \.self) { cap in
+                    GridRow {
+                        Text(cap.title).font(Tok.Face.ui(Tok.Typography.Size.base)).foregroundStyle(Tok.Ink.primary.color)
+                        Toggle("", isOn: Binding(
+                            get: { gates?.allowed(cap) ?? false },
+                            set: { state.setL4Capability(cap, $0) }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .tint(Tok.L4.base.color)
+                        .disabled(!state.l4SetterPresent)
+                        .accessibilityIdentifier("l4-gate-\(cap.rawValue)")
+                        .accessibilityLabel(cap.title)
+                    }
                 }
-                .toggleStyle(.switch)
-                .tint(Tok.L4.base.color)
-                .disabled(!state.l4SetterPresent)
-                .accessibilityIdentifier("l4-gate-\(cap.rawValue)")
             }
         }
         .padding(.top, Space.sm)
