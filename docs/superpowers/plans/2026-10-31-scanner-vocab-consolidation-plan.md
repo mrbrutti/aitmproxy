@@ -18,6 +18,16 @@ second scan, fixes the stale docs, adds the DC-row test and does the one rename.
 Stage 5 Tester (whole branch, mutants, gate). **Task 5** is the Stage 6 panel, whose security
 reviewer runs the out-of-tree differential.
 
+**Amended after the Stage 6 panel (2026-10-31).** The panel on `bcd9647` failed (security: one
+Important, F1). Tasks 1A to 5 are done and are kept as written, as history. The spec is amended
+(Amendment 1: `scrub_text_wide` is the standard scan then the wide scan, and the wide scan keeps `\n`,
+`\r`, `\x0c` as a boundary), and the work to fix the branch is the section **Fix tasks (post-panel)**
+below: Fix 1 (core, plus the rows of one scanner test), Fix 2 (scanner), then a Tester re-run (Task
+4b) and a panel re-run (Task 5b). The AC coverage table carries the amended and new criteria (AC5,
+AC14, AC15, AC19, AC20, AC23, AC24, AC25 to AC28). **Where the executed text of Task 2, Task 3 or
+Task 5 says "one scan", "exactly two places" for the reading parameter, or lists the AC15 row
+`author:\nJohn`, the amended spec and the Fix tasks supersede it; those tasks are not rewritten.**
+
 ### Execution order (read this before dispatching)
 
 **Execute strictly sequentially: 1A, then 1B, then 2, then 3, then 4, then 5. One writer per file,
@@ -129,6 +139,9 @@ task's commit; the Task 4 and Task 5 inputs below then narrow to that range.
   (in the scanner), `only knows`, `widened locally`, `needle layer`, `two vocabularies`,
   `vocabulary consolidation`, `stays until`, `scanner's copy`, and the phrase "none is in" followed
   by `scrub_text`. Describe the old pipeline as "the old pipeline" or "the old two-scan pipeline".
+  **From the fix tasks on, also banned (AC20 as amended):** `cannot diverge`, `cannot disagree`,
+  `in nothing else`, `narrower list`, `only two differences`, `the only ones whose`, `one-scan`,
+  `before the scanner stopped`, `Pins taken before`, `before PR 171 none`.
 - No code in a doc comment longer than a signature. No raw invisible or non-ASCII whitespace
   character in a test source: write `\u{a0}`, `\u{b}`, `\u{2028}` and the like as escapes, so the
   corpus is reviewable. (A green run on the old tree proves an escape is byte-identical.)
@@ -139,7 +152,9 @@ task's commit; the Task 4 and Task 5 inputs below then narrow to that range.
 - Test names in the AC coverage table are exact. A Coder may add rows to a table, never remove or
   weaken one, and adds no extra test function (the expected test counts below depend on that).
   Fixed counts: `cargo test -p aitm-core --lib redact` is 32 at the start, 33 after Task 1A, 41 after
-  Task 2; the scanner suite is 178 at the start, 182 after Task 1B, 183 after Task 3.
+  Task 2; the scanner suite is 178 at the start, 182 after Task 1B, 183 after Task 3. After the
+  Tester (Task 4, head `bcd9647`): core 45, scanner 189. After Fix 1: core 48, scanner 189. After
+  Fix 2: core 48, scanner 190.
 
 ### Symbols the tasks use (confirmed by reading on `15009b2`)
 
@@ -207,7 +222,7 @@ run in the task that names it:
 | AC2 | 2 | `redact::tests::is_secret_key_wide_is_a_superset_of_is_secret_key` |
 | AC3 | 2 | `redact::tests::is_secret_key_wide_names_every_segment_word` |
 | AC4 | 2 | `redact::tests::scrub_text_wide_and_is_secret_key_wide_share_one_vocabulary` |
-| AC5 | 2 | `redact::tests::scrub_text_wide_masks_a_wide_only_pair_as_a_standard_pair` |
+| AC5 | 2; row amended in Fix 1 | `redact::tests::scrub_text_wide_masks_a_wide_only_pair_as_a_standard_pair` |
 | AC6 | 2 | `redact::tests::scrub_text_wide_does_not_exempt_a_host_port` (paired guard: existing `scrub_text_does_not_mask_a_host_port`) |
 | AC7 | 2 | `redact::tests::scrub_text_wide_survives_hostile_inputs_and_stays_linear` |
 | AC8 | 1A | `redact::tests::scrub_text_is_unchanged_on_the_recorded_corpus` |
@@ -216,17 +231,21 @@ run in the task that names it:
 | AC11 | 1B | `discover::tests::enumerate_redacts_a_wide_only_parameter_name` |
 | AC12 | 1B | `reproduce::tests::build_poc_placeholders_a_wide_only_parameter` |
 | AC13 | 1B | `reproduce::tests::scrub_embedded_and_is_secret_name_agree_on_every_key` |
-| AC14 | 1B | `reproduce::tests::scrub_embedded_matches_the_recorded_pipeline_output` |
-| AC15 | 3 | `reproduce::tests::scrub_embedded_deliberate_changes_are_exactly_these` |
+| AC14 | 1B; fifteen rows added in Fix 2 | `reproduce::tests::scrub_embedded_matches_the_recorded_pipeline_output` |
+| AC15 | 3; rows edited in Fix 1 | `reproduce::tests::scrub_embedded_deliberate_changes_are_exactly_these` |
 | AC16 | 3, 4 | the 178 existing scanner tests; name diff before and after |
 | AC17 | 3 | grep checks and the `scrub_embedded` body check |
 | AC18 | 3, 4 | `git diff` checks |
-| AC19 | 2 (count), 5 | the `reading` use count; review of the diff |
-| AC20 | 2 (core), 3 (scanner), 5 | grep checks; Design 9 checklist; review of the diff |
+| AC19 | 2 (count), Fix 1 (reworded: three places), 5, 5b | the `reading` use count; review of the diff |
+| AC20 | 2 (core), 3 (scanner), Fix 1 (core, amended grep), Fix 2 (scanner, amended grep), 5, 5b | grep checks; Design 9 checklist; review of the diff |
 | AC21 | 2 (poc, findings, plugins), 4 (all, `aitm-mcp` in the Terminal) | suites unedited |
 | AC22 | 4 | the full Rust gate |
-| AC23 | 4 | mutants (a), (b), (c), (d) |
-| AC24 | 5 | the security reviewer's differential report |
+| AC23 | 4, 4b | mutants (a) to (d); (e) to (i) added by Amendment 1 |
+| AC24 | 5, 5b | the security reviewer's differential report (restated by Amendment 1) |
+| AC25 | Fix 1 | `redact::tests::scrub_text_wide_masks_a_standard_pair_nested_under_a_wide_only_key` |
+| AC26 | Fix 1 | `redact::tests::scrub_text_wide_masks_everything_scrub_text_masks` |
+| AC27 | Fix 1 | `redact::tests::scrub_text_wide_keeps_a_line_break_as_a_boundary` |
+| AC28 | Fix 2 | `reproduce::tests::safe_target_reads_a_query_by_the_standard_reading` |
 
 ### Architect's calls in this plan (for Matt to correct)
 
@@ -739,6 +758,360 @@ Check `git worktree list` before dispatching Task 1A for any live session touchi
 base, give the new merge-base to the Tester and the panel. Push with
 `git push origin claude/scanner-vocab-7d36bb` (Terminal panel). Before `gh pr merge`, confirm
 `baseRefName` is `main`.
+
+## Fix tasks (post-panel)
+
+Stage 6 on head `bcd9647` returned: security FAIL (F1 Important; F2 and F3 Minor; F4 pre-existing),
+quality PASS (Q1 to Q5, Minor), spec PASS (S1 to S3, Minor). The consolidated findings report, with the
+reproducers and the security reviewer's measurements, is the Coder's findings input (path in the
+dispatch): `/Users/matt/Library/Application Support/Claude-3p/side-session-notes/local_065ee0e5-73c1-4283-ac0f-aa5da32451e7/scanner-vocab-panel-findings.md`.
+The spec is amended (Amendment 1, read it first). Per Fix-task protocol 4 the spec-shaped finding went
+to the Architect first; **the amended spec and this section need the orchestrator's approval before
+any Coder starts.**
+
+### Order, files, independence
+
+| Step | Depends on | Files (all under `crates/`) | Independent of |
+|---|---|---|---|
+| Fix 1 | none (starts at `bcd9647`) | `aitm-core/src/redact.rs`; `aitm-plugin-scanner/src/reproduce.rs` (the rows of one test only: `scrub_embedded_deliberate_changes_are_exactly_these`) | none |
+| Fix 2 | Fix 1 committed | `aitm-plugin-scanner/src/reproduce.rs`, `aitm-plugin-scanner/src/discover.rs`; `aitm-plugin-scanner/src/crawl.rs` only as a temporary bite-check edit, reverted and proven | none |
+| Task 4b (Tester) | Fix 2 | test modules of the three files; scratch copies outside the repo | none |
+| Task 5b (panel) | Task 4b PASS | none (read-only; scratch copies outside the repo) | none |
+
+**Run strictly one after the other, one writer per file, one Coder per fix, each in this worktree,
+each committing when done.** Fix 1 and Fix 2 are not independent: they share `reproduce.rs`, one git
+index and one `target/`. Fix 2 depends on Fix 1 only for the *green* run of its fifteen new AC14 rows
+(they pass only with the fixed core); its *red* run puts the pre-fix core back temporarily.
+Architect's call: Fix 1 also edits the rows of one scanner test, because the core change turns that
+test red (the row `author:\nJohn` is no longer a deliberate change, spec AC15) and every commit must
+leave the gate green. Fix 1 never touches a pre-existing test; Fix 2 neither (the Design 8 comment
+edits aside).
+
+### Dispositions of the panel's Minors (proposed; the orchestrator records them in the Review log)
+
+| Finding | Disposition |
+|---|---|
+| F1 Important | fixed by Fix 1 (code, core tests) and Fix 2 (AC14 corpus rows); re-verified by Task 5b |
+| F2 Minor (class D) | decided in spec Amendment 1: the wide scan keeps `\n`, `\r`, `\x0c` as a boundary (Fix 1); arms D1 to D3 accepted as a Minor residual (spec Residual risks 8); no test pins a leak |
+| F3 Minor (DC5, DC6) | accept; the worst shape is in spec Residual risks 1 |
+| F4 pre-existing | follow-up, not this branch; recorded in Shipped (spec Residual risks 9) |
+| Q1 | Fix 1 (core docs) and Fix 2 (scanner docs, the ragged wrap) |
+| Q2, Q3, Q4 | Fix 2 |
+| Q5 | Fix 1 (the two core renames) and Fix 2 (`embedded_mismatches`, `assert_no_leak`); the two older loops in `discover.rs` (~518, ~562) stay: pre-existing tests (AC16, Design 8) |
+| S1 | Fix 2 for `safe_target` (AC28); the `commands.rs` pin is a tests-only follow-up in `commands.rs`'s own test module, recorded in Shipped |
+| S2 | accept (spec Design 9 item 11) |
+| S3 | closed by I4 (Task 5b) |
+| Tester residual (mutant (c) is caught only by the `scrub_url` test) | same as S1: mutant (h) and the follow-up |
+
+### Fix 1: two scans, the line-break rule, the core docs and tests
+
+- **Satisfies:** AC5 (amended), AC19 (reworded), AC20 (core part), AC25, AC26, AC27, the AC15 row edit;
+  AC1 to AC4, AC6 to AC10 stay green.
+- **Depends on:** none (starts at `bcd9647`).
+- **Files:** `crates/aitm-core/src/redact.rs`; `crates/aitm-plugin-scanner/src/reproduce.rs`
+  (the rows and row comments of `scrub_embedded_deliberate_changes_are_exactly_these` only).
+- **Change (signatures only; spec Design 3, 4 and 9 are the authority):**
+  - `pub fn scrub_text_wide(text: &str) -> String` keeps its signature. Body: the two regexes once,
+    then `mask_secret_pairs(.., Reading::Standard)`, then `mask_secret_pairs(.., Reading::Wide)` over
+    its output (equivalently `mask_secret_pairs(&scrub_text(text), Reading::Wide)`). `scrub_text` stays
+    one standard scan and its output stays byte for byte what it is; the private `scrub_with` may be
+    reshaped to suit.
+  - add private `fn skip_pair_blanks(text: &str, i: usize, reading: Reading) -> usize`. `Standard`
+    returns `skip_blanks(text, i)`. `Wide` returns the index of the first byte at or after `i` that
+    does not start a whitespace character as `blank_len` reads it, **and also stops at an ASCII `\n`,
+    `\r` or `\x0c`** (those three are left in place; every other whitespace character, the vertical
+    tab and U+0085, U+2028, U+2029 included, is skipped). It replaces `skip_blanks` at the two skips
+    beside a separator in `mask_secret_pairs` (after the key run and its optional closing quote; after
+    the separator). The word `reading` appears in no comment inside `mask_secret_pairs` or
+    `skip_pair_blanks`.
+  - rename two private helpers (Q5): `holds_secret_word` to `is_secret_lower`, `holds_segment_word`
+    to `contains_segment_word` (three call sites; no test names them).
+  - docs, each checked off in the report (spec Design 9 items 2, 5, 5b, 5c): the module doc; the
+    `scrub_text_wide` doc; the `mask_secret_pairs` doc (three places); the `Reading` variant docs (the
+    readings of the first and the second scan; `Wide` is "`is_secret_key_wide`, nothing exempt, and
+    `\n`, `\r`, `\x0c` are not blanks beside a separator"). **Rewrite the two passages the panel named
+    false** (module doc ~21-24: "cannot diverge ... in nothing else"; `scrub_text_wide` doc
+    ~156-164: "the only two differences"), and say "judges a key run by", never "cannot diverge".
+    Include the one-sentence class-D caveat in the `scrub_text_wide` doc. No banned phrase.
+  - no new `pub` item; `lib.rs`, `Cargo.toml` and `Cargo.lock` untouched; no line you add contains
+    `unsafe`.
+- **Tests (written first)**, `mod tests` of `redact.rs`, literal values from the spec; large strings
+  with `assert!(a == b, ..)`:
+  - edit one row of `scrub_text_wide_masks_a_wide_only_pair_as_a_standard_pair`:
+    `("author:\n  John", "author:\n  [redacted]")` becomes
+    `("author:\u{a0}John", "author:\u{a0}[redacted]")`. Its other rows are untouched.
+  - add `scrub_text_wide_masks_a_standard_pair_nested_under_a_wide_only_key` (AC25): the nine rows of
+    AC25 through the existing `mismatches_wide` helper.
+  - add `scrub_text_wide_masks_everything_scrub_text_masks` (AC26): as AC26 words it (the token scan
+    is a closure or a small private function in the test module, not named `holds_*`); assert at
+    least 100 inputs checked and at least 20 with a masked run.
+  - add `scrub_text_wide_keeps_a_line_break_as_a_boundary` (AC27): the eight rows of AC27 through
+    `mismatches_wide`.
+  - no other test is added or edited; the 32 original tests are untouched (AC10).
+- **The scanner row edit (after the core change; see Red step 3):** in
+  `scrub_embedded_deliberate_changes_are_exactly_these`, remove the row `("author:\nJohn",
+  "author:\n[redacted]")` and its comment, and add, with the comment `// old pipeline:
+  `sidebar=[redacted]` (DC2)`, the row `("sidebar=\u{b}v", "sidebar=\u{b}[redacted]")`. Seven rows
+  stay as they are; the table still has eight rows. Nothing else in that test or its doc changes
+  (Fix 2 does the docs).
+- **Red (paste each):**
+  1. Tests only, before any production edit: `touch crates/aitm-core/src/redact.rs && cargo test -p
+     aitm-core --lib redact` prints `test result: FAILED. 45 passed; 3 failed`, the three being
+     exactly `scrub_text_wide_masks_a_standard_pair_nested_under_a_wide_only_key`,
+     `scrub_text_wide_masks_everything_scrub_text_masks` and
+     `scrub_text_wide_keeps_a_line_break_as_a_boundary` (the amended AC5 row is green on the old
+     code). Quote each failure's first bad row; the actual column reads
+     `authentication:\n  [redacted] hunter2` for AC25 and `side:\n[redacted]':C` for AC27.
+  2. After the production change: `cargo test -p aitm-core --lib redact` prints
+     `test result: ok. 48 passed`.
+  3. The consequence in the scanner, before the row edit: `cargo test -p aitm-plugin-scanner --
+     scrub_embedded_deliberate_changes_are_exactly_these` fails with exactly one row in the
+     mismatch list, `("author:\nJohn", "author:\n[redacted]", "author:\nJohn")`. Paste it, then
+     make the row edit.
+  4. `cargo test -p aitm-plugin-scanner` prints `test result: ok. 189 passed`.
+- **Checks (paste each output):**
+  - AC10, tests untouched (temp files, not process substitution):
+    `git show 15009b2:crates/aitm-core/src/redact.rs | sed -n '/^#\[cfg(test)\]/,$p' > "$TMPDIR/redact-tests-before.rs"`,
+    `sed -n '/^#\[cfg(test)\]/,$p' crates/aitm-core/src/redact.rs > "$TMPDIR/redact-tests-after.rs"`,
+    `wc -l < "$TMPDIR/redact-tests-before.rs"` prints `704`, and
+    `diff "$TMPDIR/redact-tests-before.rs" "$TMPDIR/redact-tests-after.rs" | grep -c '^<'` prints `0`.
+  - AC10, API: `git diff -U0 15009b2 -- crates/aitm-core/src/redact.rs | grep -E '^[-+][[:space:]]*pub '`
+    prints exactly the two lines `+pub fn is_secret_key_wide(key: &str) -> bool {` and
+    `+pub fn scrub_text_wide(text: &str) -> String {`; `git diff 15009b2 -- crates/aitm-core/src/lib.rs`
+    is empty.
+  - AC19: `sed -n '/^fn mask_secret_pairs/,/^}/p' crates/aitm-core/src/redact.rs | grep -n reading`
+    prints exactly five lines (name them: the signature, the secret test, the exemption, the two
+    calls of `skip_pair_blanks`); `sed -n '/^fn skip_pair_blanks/,/^}/p' crates/aitm-core/src/redact.rs | grep -c reading`
+    prints `2`.
+  - AC20, core part (red, then green): the amended grep of spec AC20 on `crates/aitm-core/src/redact.rs`
+    prints exactly three lines before the docs edit (`redact.rs:23`, `:24`, `:162`) and nothing after;
+    `grep -n "holds_" crates/aitm-core/src/redact.rs` prints nothing. (The same grep over the scanner
+    still matches seven lines until Fix 2.)
+  - blast radius, each `test result: ok` with 0 failed: `cargo test -p aitm-poc`, `cargo test -p
+    aitm-findings`, `cargo test -p aitm-plugins`.
+  - `git diff --stat bcd9647 -- crates` names exactly `crates/aitm-core/src/redact.rs` and
+    `crates/aitm-plugin-scanner/src/reproduce.rs`; `git diff bcd9647 -- crates | grep -E '^\+.*unsafe'`
+    prints nothing.
+- **Gate (sandbox):** `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test -p aitm-core -p aitm-plugin-scanner`.
+- **Commit:** `fix(redact): the wide scrub runs the standard scan first and keeps a line break as a
+  boundary (plan 2026-10-31-scanner-vocab-consolidation)`, ending with the trailer line
+  `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`; `git add` the two files by exact path.
+- **Done when:** the four red/green outputs, every check and the gate are quoted, Design 9 items 2,
+  5, 5b, 5c are listed as done, and the commit is made.
+
+### Fix 2: the scanner corpus and pin, the scanner docs, the test scaffolding
+
+- **Satisfies:** AC14 (fifteen added rows), AC20 (scanner part), AC28; findings Q1 (scanner), Q2,
+  Q3, Q4, Q5 (scanner), S1; AC11 to AC13, AC15 to AC18 stay green.
+- **Depends on:** Fix 1 committed.
+- **Files:** `crates/aitm-plugin-scanner/src/reproduce.rs`, `crates/aitm-plugin-scanner/src/discover.rs`.
+  `crawl.rs` only for the temporary bite-check edit (step C2), restored and proven; `commands.rs`,
+  every `Cargo.toml` and `Cargo.lock` untouched.
+- **Step order (tests first, refactors on green):**
+  - **A. Q4, the reflow of `RECORDED_SCRUB_EMBEDDED` (a pure refactor, green before and after).** Fifteen
+    rows exceed 100 columns, so rustfmt skips the whole const. Break each long row so every string
+    sits on its own line, as `RECORDED_SCRUB_TEXT` does (a tuple, its two strings on separate lines,
+    trailing commas). No value changes. Run `cargo fmt -p aitm-plugin-scanner`, then review the diff:
+    only line breaks and indentation inside the const. Paste: the long-line count of the const
+    before and after, `awk '/const RECORDED_SCRUB_EMBEDDED/{f=1} f && length($0)>100 {n++} f && /^    \];/{f=0} END{print n+0}' crates/aitm-plugin-scanner/src/reproduce.rs`
+    printing `15` then `0`; `cargo fmt --check` exiting 0; and the row count equal before and after
+    (a temporary `eprintln!("ROWS {}", RECORDED_SCRUB_EMBEDDED.len());` as the first statement of
+    `scrub_embedded_matches_the_recorded_pipeline_output`, run with `--nocapture`, then removed), the
+    AC14 test green both times.
+  - **B. The fifteen F1/F2 rows and AC28, recorded from the old tree.** Cut a scratch copy of the base
+    (never touch the branch to record): `SCRATCH_OLD="$TMPDIR/svc-old"; mkdir -p "$SCRATCH_OLD" &&
+    git archive 15009b2 | tar -x -C "$SCRATCH_OLD"`. In the scratch copy's
+    `crates/aitm-plugin-scanner/src/reproduce.rs` `mod tests` add a throwaway `#[test] #[ignore] fn
+    record_f1_rows()` that runs the old `scrub_embedded` over the fifteen inputs below and prints
+    `({input:?}, {output:?}),` per row, and run it: `CARGO_TARGET_DIR="$SCRATCH_OLD/target" cargo test
+    --offline -p aitm-plugin-scanner record_f1_rows -- --ignored --nocapture` (a full build in a fresh
+    target directory, several minutes: check `df -h` first; if the sandbox cannot, the orchestrator
+    runs it in the Terminal panel and pastes the rows). Paste the printed rows verbatim into
+    `RECORDED_SCRUB_EMBEDDED` (long rows one string per line; write any raw non-ASCII or control
+    character as a `\u{..}` escape, the green run proves it), compare each with the expected column
+    (**a difference stops the Coder: spec gap**), and `rm -rf "$SCRATCH_OLD"` when done.
+
+    | # | input (Rust escapes) | expected old output |
+    |---|---|---|
+    | 1 | `authentication:\n  password: hunter2` | `authentication:\n  password: [redacted]` |
+    | 2 | `author:\n  token: abc123` | `author:\n  token: [redacted]` |
+    | 3 | `sessions:\n  jwt: J1` | `sessions:\n  jwt: [redacted]` |
+    | 4 | `sidebar:\n    api_key: K1` | `sidebar:\n    api_key: [redacted]` |
+    | 5 | `authentication: {password: hunter2}` | `authentication: [redacted] [redacted]}` |
+    | 6 | `sidebar=sid="C1"` | `sidebar=[redacted]"[redacted]"` |
+    | 7 | `author=password='C2'` | `author=[redacted]'[redacted]'` |
+    | 8 | `inside=x?sid\t=\tC9` | `inside=[redacted]\t=\t[redacted]` |
+    | 9 | `Auths:Pwd: C` | `Auths:[redacted] [redacted]` |
+    | 10 | `authentication:\n  sessionKey: abc123` | `authentication:\n  sessionKey: [redacted]` |
+    | 11 | `side:\nSid2':C` | `side:\nSid2':[redacted]` |
+    | 12 | `bsid:\rSIDE:'C` | `bsid:\rSIDE:'[redacted]` |
+    | 13 | `author:\nJohn` | `author:\nJohn` (unchanged) |
+    | 14 | `sidebar\n:v` | `sidebar\n:v` (unchanged) |
+    | 15 | `sidebar=\u{c}v` | `sidebar=\u{c}v` (unchanged) |
+
+    Add the test `reproduce::tests::safe_target_reads_a_query_by_the_standard_reading` (AC28): the
+    input `http://t/x?authority=ex&author=3&side=left`; `crate::crawl::safe_target(input)` equals the
+    input (run it to confirm the literal; if it differs, stop: spec gap), and `scrub_embedded(input)`
+    equals `http://t/x?authority=[redacted]&author=[redacted]&side=[redacted]`. The distinct-input
+    assertion of AC14 must still pass (none of the fifteen duplicates an existing row; if one does,
+    drop the duplicate and say so).
+  - **C. Red (paste each).**
+    1. The fifteen rows against the pre-fix core. Temporarily put it back:
+       `git show bcd9647:crates/aitm-core/src/redact.rs > crates/aitm-core/src/redact.rs`, `touch` it,
+       then `cargo test -p aitm-plugin-scanner -- scrub_embedded_matches_the_recorded_pipeline_output`
+       fails with exactly the fifteen new rows in the mismatch list and no other row (the actual column
+       reads, for row 1, `authentication:\n  [redacted] hunter2`). Restore it:
+       `git show HEAD:crates/aitm-core/src/redact.rs > crates/aitm-core/src/redact.rs`, and paste
+       `git diff --stat -- crates/aitm-core` printing nothing.
+    2. The S1 pin's bite. Temporarily change the one `scrub_text(&bare)` call in `safe_target`
+       (`crawl.rs`) to `scrub_text_wide(&bare)`, run `cargo test -p aitm-plugin-scanner`, paste the
+       failing test names (at least `safe_target_reads_a_query_by_the_standard_reading`; name any
+       other). Restore with `git show HEAD:crates/aitm-plugin-scanner/src/crawl.rs >
+       crates/aitm-plugin-scanner/src/crawl.rs` and paste `git diff 15009b2 --stat --
+       crates/aitm-plugin-scanner/src/crawl.rs crates/aitm-plugin-scanner/src/commands.rs` printing
+       nothing.
+    3. Both tests green on the fixed core: `cargo test -p aitm-plugin-scanner --
+       scrub_embedded_matches_the_recorded_pipeline_output safe_target_reads_a_query_by_the_standard_reading`
+       prints `test result: ok. 2 passed`.
+  - **D. Docs and scaffolding (green throughout; spec Design 9 items 6, 7, 8).**
+    - Q1: the `reproduce.rs` module doc (~12-24): "a narrower reading", not "a narrower list", and
+      reflow the paragraph so no line is ragged (the short line `//! \`record_finding\` is a thin`);
+      the `scrub_embedded` doc (~366-373): replace "the two scrubs cannot disagree about which names
+      are secret" with a sentence saying both judge a key by the same predicate, and describe the wide
+      scrub as two scans of core's one function.
+    - Q2: the doc of `build_poc_drops_the_referer_query_and_leaks_no_session_id` (~1182-1185): say
+      `scrub_text` alone did not know these names until PR 171, so a `Referer` scrubbed by it alone was
+      emitted verbatim, and that the embedded-value scrub must mask all of them; do not imply that
+      shipped PoCs leaked. No assertion changes.
+    - Q3: the doc of `scrub_embedded_deliberate_changes_are_exactly_these` (~1854-1861): "one row per
+      change, DC1 to DC6 of the spec (`docs/superpowers/specs/2026-10-31-scanner-vocab-consolidation-design.md`);
+      every row of `RECORDED_SCRUB_EMBEDDED` is unchanged"; drop "the only ones whose ... differs"; say
+      what is pinned (the recorded output of the old two-scan pipeline at `15009b2`). The same rewording
+      for the doc of `scrub_embedded_matches_the_recorded_pipeline_output` (~1822-1824, drop "before the
+      scanner stopped keeping its own second scan") and for the section comment `// ---- Pins taken
+      before ...` (~1554).
+    - the "one scan" wording: the inline comment in `scrub_embedded_masks_every_shared_vocabulary_name`
+      (~1380) says "one list, read by the wide scrub"; the doc of `scrub_embedded_reads_the_edges_of_the_text`
+      (~1958) says "as the wide scrub reads them".
+    - Q5: add `fn embedded_mismatches<'a>(rows: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str, String)>`
+      to `reproduce::tests`: it runs `scrub_embedded` over each `(input, expected)` and returns the rows
+      whose output differs, as `(input, expected, actual)`. Use it in the four tests that repeat the
+      block: `scrub_embedded_matches_the_recorded_pipeline_output`,
+      `scrub_embedded_deliberate_changes_are_exactly_these`,
+      `scrub_embedded_strips_userinfo_before_it_scans`, `scrub_embedded_reads_the_edges_of_the_text`
+      (their assertion messages are kept). Add `fn assert_no_leak(points: &[InjectionPoint], leaked: &[&str])`
+      to `discover::tests`: it asserts that no point's example contains any of `leaked`, with the message
+      `"{leaked} leaked: {points:?}"`. Use it for the four loops in
+      `enumerate_redacts_a_wide_only_parameter_name` (~595) and
+      `enumerate_redacts_a_wide_only_name_however_it_arrives` (~629, ~651, ~672). **Leave the two older
+      loops (~518, ~562) as they are**: they belong to pre-existing tests (AC16, Design 8).
+    - no comment may contain a banned phrase (AC20 as amended), and none the word `unsafe`.
+- **Checks (paste each output):**
+  - AC16, names: the before list from git as in Task 3 prints `178`; the after list prints `190`;
+    `comm -23 before after` prints exactly `scrub_embedded_covers_every_extra_secret_needle`;
+    `comm -13 before after` prints exactly thirteen names: the six of Task 3's check,
+    `build_poc_placeholders_a_wide_only_header_and_json_key`, `build_poc_reads_the_url_path_by_the_standard_reading`,
+    `enumerate_redacts_a_wide_only_name_however_it_arrives`, `scrub_embedded_masks_a_key_that_merely_contains_each_segment_word`,
+    `scrub_embedded_reads_the_edges_of_the_text`, `scrub_embedded_strips_userinfo_before_it_scans`
+    (the Tester's six), and `safe_target_reads_a_query_by_the_standard_reading`.
+  - AC17 and AC18 exactly as in Task 3 (the greps print nothing, `scrub_embedded` is three lines,
+    `crawl.rs` and `commands.rs` diff empty, no `unsafe`, no manifest change).
+  - AC20 (red, then green): the amended grep of spec AC20 on `crates/aitm-plugin-scanner/src` prints
+    exactly seven lines before step D (`reproduce.rs:22`, `:372`, `:1182`, `:1554`, `:1823`, `:1854`,
+    `:1856`, as numbered at `bcd9647`) and, over `crates/aitm-core/src/redact.rs
+    crates/aitm-plugin-scanner/src` together, nothing after.
+  - Q4: `cargo fmt --check` exits 0 and the long-line count of the const is `0` (step A).
+  - `cargo test -p aitm-plugin-scanner` prints `test result: ok. 190 passed`; `cargo test -p aitm-core --lib redact`
+    prints `test result: ok. 48 passed`.
+  - `git diff --stat bcd9647 -- crates` names exactly `crates/aitm-core/src/redact.rs` and the two
+    scanner files `discover.rs` and `reproduce.rs`; the branch still touches `crawl.rs` and
+    `commands.rs` not at all (AC18).
+- **Gate (sandbox):** `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test -p aitm-core -p aitm-plugin-scanner`.
+- **Commit:** `fix(scanner): pin the F1 shapes and the standard reading of a query, fix the scanner docs
+  and test scaffolding (plan 2026-10-31-scanner-vocab-consolidation)`, with the same trailer; `git add`
+  the two files by exact path.
+- **Done when:** the reflow proof, the recorded rows with the comparison, the two red runs and the
+  green run, every check and the gate are quoted, and the commit is made.
+
+### Task 4b (Stage 5 re-run): Tester, whole branch, on the fix
+
+- **Satisfies:** the whole-branch coverage of AC1 to AC28, AC10, AC16, AC18, AC21, AC22, AC23 (a) to (i).
+- **Depends on:** Fix 2 committed.
+- **Dispatch:** the amended spec path, this plan path, the worktree path, base `15009b2`, head = the
+  Fix 2 commit, "whole branch", the Coder reports of Fix 1 and Fix 2, the prior Tester report, and the
+  panel findings report.
+- **Work:** as Task 4 (coverage map for AC1 to AC28; test quality; structural checks re-run with the
+  literal outputs of Fix 1 and Fix 2; the gate), plus:
+  1. **Test quality of the new tests.** AC26 must not be vacuous (at least 20 inputs with a masked run);
+     AC25 and AC27 rows must each have a literal expected string; no test in the branch asserts a
+     leaked secret (class-D shapes are pinned by none).
+  2. **Mutants in a scratch copy of the head, never in the branch** (as Task 4: `git archive`,
+     `CARGO_TARGET_DIR` inside the scratch, pristine copies, saved `diff -u`, red set, restored green).
+     Mutants (a) to (d) of Task 4 again, and:
+
+     | Mutant | Edit in the scratch copy | Tests that must go red |
+     |---|---|---|
+     | (e) | `scrub_text_wide` runs only the wide scan (the `bcd9647` shape) | AC25, AC26, AC27, the AC14 test (the fifteen new rows) |
+     | (f) | the `Wide` arm of `skip_pair_blanks` returns `skip_blanks(text, i)` | AC25, AC27, the AC14 test (the rows with a line break) |
+     | (g) | the `Wide` arm skips space and tab only | AC5, AC15, `scrub_text_wide_reads_the_edges_of_the_text` |
+     | (h) | `crawl.rs::safe_target` calls `scrub_text_wide` | AC28 (and name every other red test) |
+     | (i) | one free-text call in `commands.rs` calls `scrub_text_wide` | none expected: **record it as the surviving mutant of finding S1** (a tests-only follow-up), not as a weak test |
+
+     A mutant that leaves a listed test green is a finding: strengthen the test and re-run.
+  3. The gate as Task 4 (sandbox: fmt, clippy, `cargo test -p aitm-core -p aitm-plugin-scanner -p aitm-poc -p aitm-findings -p aitm-plugins`; the orchestrator then runs the full workspace gate and `cargo test -p aitm-mcp` in the Terminal panel, gated on exit status).
+- **Report:** the coverage table, added or rewritten tests, each mutant's patch, red set and restored
+  green, the gate output verbatim, PASS or FAIL.
+- **Done when:** every AC has a passing test or review check, mutants (a) to (h) are killed as listed,
+  (i) is recorded as the known survivor, the gate prints `exit=0`, and the verdict is PASS.
+
+### Task 5b (Stage 6 re-run): panel on the fix, with the differential re-run
+
+- **Satisfies:** AC19, AC20, AC24 (restated), and the panel gate of WORKFLOW stage 6.
+- **Depends on:** Task 4b PASS.
+- **Dispatch:** to each of the three reviewers in parallel, fresh context: the amended spec path, this
+  plan path, the worktree path, base `15009b2`, the head SHA, "whole branch", the Coder reports (Fix 1,
+  Fix 2), the Tester 4b report, and **the prior review report** (the panel findings file above).
+- **Spec reviewer:** AC1 to AC28 against the diff and the tests; Design 9 (items 2, 5, 5b, 5c, 6 to 8 and
+  11); the amended DC list (DC2 has no line-break row; `author:\nJohn` is a row of AC14 and not of AC15);
+  AC14 holds the fifteen added rows and no row that DC1 to DC6 change; Fix 1 touched only the stated
+  tests; the two passages the panel named false are gone; F1 closed.
+- **Quality reviewer:** the seam is one scan function run twice with a three-use parameter (AC19, by
+  reading the diff); no logic duplicated between the two scans; docs accurate and no overclaim (Q1
+  closed: no "cannot diverge", no "differ ... in nothing else"); the Q2 to Q5 items done; test hygiene
+  (corpus reflowed, helpers used, no leftover recorder or `eprintln!`).
+- **Security reviewer:** F1 closed (the AC25 reproducers); the F2 decision (the line-break rule) and the
+  arms D1 to D3 rated, with the exposure stated; DC5 and DC6 re-rated; `scrub_text` and `is_secret_key`
+  unchanged (I4); **the differential of AC24**, built out of tree as Task 5 steps 1 to 4 with these
+  changes: (a) a third scratch tree cut from `bcd9647` (the single-scan shape) beside the old and new
+  trees, used as a positive control; (b) the alphabets and invariants are spec Design 7 as amended:
+  the aligned alphabet allows line breaks at separators (lift the three guards of the kept
+  `difftool.py`: the `[=:][ \t]*[\r\n]` check in `aligned_ok` and the two `last_empty` line-break
+  guards in `compose_aligned`, in a scratch copy), I3's four triggers T1 to T4 (add T2 and T4 to the
+  tool's trigger test) with the minimal reproducers grouped by family, I4 and I5 as new runs (`scrub_text`
+  against the old tree for at least 3,000,000 inputs and `is_secret_key` for at least 1,000,000 keys;
+  `scrub_text_wide` against `scrub_text` for at least 1,500,000 inputs); (c) counts: at least 3,000,000
+  inputs in all, at least 1,000,000 on the amended aligned alphabet and 1,000,000 on the full alphabet.
+  **The report must show I1 = 0 and I2 = 0 on the aligned alphabet, the amended I3 (times at 1, 2, 4, 8
+  MiB, the `scrub_text_wide` to `scrub_text` ratio, every leak in a trigger input, the families), I4 = 0
+  differences, I5 = 0 violations, and the positive controls firing** (the `bcd9647` tree reports I1 and I2
+  violations on the amended aligned alphabet within its first 100,000 inputs; the mutant (a) tree too).
+  Clean up every scratch tree and say so. (The Architect's scratch probe and `difftool_nl.py` are in
+  `/tmp/claude-501/svc-arch/`: informational, not part of the repo, and the reviewer builds from the
+  branch.)
+- **Done when:** three reports are in, every finding is in the Review log, no Critical or Important
+  finding is open, and each Minor is fixed or accepted in writing in the Review log.
+
+### Follow-ups for the Shipped section (the orchestrator records them)
+
+1. F4: nested YAML under a standard-secret parent leaks through `scrub_text` (`auth:\n  password: hunter2`),
+   pre-existing and outside this change (spec Residual risks 9); needs a spec of its own (core's
+   newline rule).
+2. S1: a `commands.rs` pin that its free-text calls stay on the standard reading, in `commands.rs`'s own
+   test module (tests only; AC18 forbids editing it here).
+3. Class D arms D1 to D3 are an accepted Minor residual (spec Residual risks 8); the named alternative
+   that removes D3 and DC3 is a one-line change if Matt wants it.
+4. `crates/aitm-poc/tests/builder.rs` comments that still say the shared set "lacks jwt/sid" (spec
+   Non-goals): a later docs sweep.
 
 ## Review log
 
