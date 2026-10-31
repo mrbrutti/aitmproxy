@@ -465,13 +465,21 @@ async fn run() -> anyhow::Result<()> {
     } else {
         // The bare-`aitm` server path is the dedicated agent entry point, so it
         // carries M4's operator/agent token classes, the shared agent policy
-        // gate, the F4 push fan-out and the F2 audit ring. The web bridge and
-        // the TUI are operator frontends, built by `tui::server` without the gate.
-        let mcp = tui::server(&cfg, cfg.mcp.transport.clone(), &services)
-            .with_mcp_roles(cfg.mcp.operator_token.clone(), cfg.mcp.stdio_role)
-            .with_agent_state(agent_state)
-            .with_push(push_tx.clone())
-            .with_audit_ring(audit_ring);
+        // gate, the F4 push fan-out and the F2 audit ring. The web bridge is
+        // not exempt: its agent bridge token resolves to `Frontend::Mcp`, so it
+        // is gated like any agent and must read the policy `agent.set` writes
+        // and record into the ring `agent.activity` reads, which is why both
+        // servers go through `tui::with_shared_governance`. Only the operator
+        // bridge token (present only when `mcp.operator_token` is configured)
+        // is un-gated, by role. The TUI's own in-process server (in
+        // `tui::build_servers`) is the operator and bypasses the gate by role.
+        let mcp = tui::with_shared_governance(
+            tui::server(&cfg, cfg.mcp.transport.clone(), &services),
+            &agent_state,
+            &audit_ring,
+        )
+        .with_mcp_roles(cfg.mcp.operator_token.clone(), cfg.mcp.stdio_role)
+        .with_push(push_tx.clone());
 
         // `aitm web`: a second McpServer over the same registry and services
         // (`serve` consumes the first), driven by the bridge's `handle_on` calls.
@@ -482,7 +490,12 @@ async fn run() -> anyhow::Result<()> {
         let web_server = match (web_settings, web_listener) {
             (Some(settings), Some(listener)) => {
                 let bus = Arc::new(
-                    tui::server(&cfg, cfg.mcp.transport.clone(), &services).with_push(push_tx),
+                    tui::with_shared_governance(
+                        tui::server(&cfg, cfg.mcp.transport.clone(), &services),
+                        &agent_state,
+                        &audit_ring,
+                    )
+                    .with_push(push_tx),
                 );
                 bus.spawn_push_dispatcher();
                 // Operator access on the web UI is tied to `mcp.operator_token`
