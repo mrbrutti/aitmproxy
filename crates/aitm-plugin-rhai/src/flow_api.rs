@@ -21,7 +21,7 @@
 //! HTTP token and its `url` may not re-target the authority: another host is
 //! reached through the guarded `http.send`, never by rewriting a live request.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use aitm_core::{FlowKind, Value};
@@ -65,6 +65,68 @@ thread_local! {
     /// hooks run synchronously on the thread that evaluates them, so the host
     /// binds the flow here for the duration of the call (see [`ActiveFlow`]).
     static ACTIVE_FLOW: RefCell<Option<Arc<Mutex<FlowState>>>> = const { RefCell::new(None) };
+
+    /// Whether the response for the hook running on this thread is already
+    /// committed to the client. Only `on_response` (the `Response` event) sets it,
+    /// via [`ResponsePhase`]: on the streamed path it fires after the response has
+    /// gone to the client, and on the plugin-answered short-circuit path just
+    /// before the committed response is flushed (module.rs) — either way a response
+    /// edit in it is not honoured on the wire. The response setters read this and
+    /// refuse the write loudly (see [`check_response_mutable`]) rather than record
+    /// a silent no-op. Every other hook leaves it `false`, so pre-forward response
+    /// mutation (`on_response_headers`) is unaffected.
+    static RESPONSE_FORWARDED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Sets the response phase for the hook about to run on this thread: `true` for
+/// `on_response` (observe-only — the response is already committed to the client),
+/// `false` for every pre-forward hook. Like [`ActiveFlow`] it always saves the
+/// previous value and restores it on drop, so a nested hook reflects its own phase
+/// rather than inheriting the outer one.
+pub struct ResponsePhase {
+    previous: bool,
+}
+
+impl ResponsePhase {
+    /// Enter `forwarded`'s response phase until the guard drops.
+    pub fn enter(forwarded: bool) -> Self {
+        let previous = RESPONSE_FORWARDED.with(|c| c.replace(forwarded));
+        Self { previous }
+    }
+}
+
+impl Drop for ResponsePhase {
+    fn drop(&mut self) {
+        RESPONSE_FORWARDED.with(|c| c.set(self.previous));
+    }
+}
+
+/// Whether a response write on this thread would land after the response is
+/// already committed to the client (the `on_response` phase).
+fn response_forwarded() -> bool {
+    RESPONSE_FORWARDED.with(Cell::get)
+}
+
+/// The error for a response write in `on_response`. By the time `on_response`
+/// fires the response is already committed to the client (streamed on the normal
+/// path, or about to flush on the plugin short-circuit path), so the edit would
+/// not reach it; the fix is `on_response_headers`, which runs before the response
+/// is sent. `on_response` is observe-only.
+const RESPONSE_FORWARDED_ERR: &str = "flow.response cannot be edited in on_response: on_response is \
+                                      observe-only. It runs on the complete response after it is \
+                                      committed to the client, so an edit here would not reach it. \
+                                      Change the response in on_response_headers, which runs before \
+                                      the response is sent; use on_response to read it, mark, \
+                                      comment, or record findings.";
+
+/// Refuse a response write that would land after the response is committed to the
+/// client (the `on_response` phase), with a catchable error naming
+/// `on_response_headers`.
+fn check_response_mutable() -> ScriptResult {
+    if response_forwarded() {
+        return Err(error(RESPONSE_FORWARDED_ERR));
+    }
+    Ok(())
 }
 
 /// Binds the flow that bare `halt()` records onto, for as long as the guard
@@ -160,12 +222,16 @@ fn register_flow(engine: &mut Engine) {
         })
         .register_fn(
             "set_response",
-            |f: &mut ScriptFlow, status: i64, headers: Map, body: &str| {
+            |f: &mut ScriptFlow, status: i64, headers: Map, body: &str| -> ScriptResult {
+                // In on_response the response is already on the wire; setting it
+                // then would be a silent no-op (see `check_response_mutable`).
+                check_response_mutable()?;
                 lock(&f.0).effects.push(FlowEffect::SetResponse {
                     status: clamp_status(status),
                     headers: header_pairs(headers),
                     body: body.as_bytes().to_vec(),
                 });
+                Ok(())
             },
         )
         .register_fn("intercept", |f: &mut ScriptFlow| {
@@ -365,8 +431,10 @@ impl ScriptResponse {
     }
 
     /// Edit the response; a flow without one yet refuses the write (never
-    /// fabricate a response — `set_response` is the way to create one).
+    /// fabricate a response — `set_response` is the way to create one), and a
+    /// write after the response was forwarded (`on_response`) is refused too.
     fn edit(&self, f: impl FnOnce(&mut ResponseState)) -> ScriptResult {
+        check_response_mutable()?;
         match lock(&self.0).response.as_mut() {
             Some(response) => {
                 f(response);
@@ -392,6 +460,12 @@ impl ScriptHeaders {
 
     fn set(&self, key: &str, value: &str) -> ScriptResult {
         let side = self.1;
+        // A response-header write in `on_response` is post-forward: refuse it
+        // before the syntax checks so the author gets the phase guidance (use
+        // `on_response_headers`), not a header-token error, whatever the key.
+        if matches!(side, HeaderSide::ResponseHeaders) {
+            check_response_mutable()?;
+        }
         // A header name/value with a stray control character (notably CR/LF) is
         // dropped silently when the host writes the flow back through
         // `HeaderMap::try_set`. Refuse it here with a catchable error so the
@@ -432,8 +506,13 @@ impl ScriptHeaders {
         self.1.pairs(&state).map(f).unwrap_or_default()
     }
 
-    /// Edit the pair list; a side the flow does not have refuses the write.
+    /// Edit the pair list; a side the flow does not have refuses the write, and a
+    /// response-header write after the response was forwarded (`on_response`) is
+    /// refused too.
     fn edit(&self, f: impl FnOnce(&mut Vec<(String, String)>)) -> ScriptResult {
+        if matches!(self.1, HeaderSide::ResponseHeaders) {
+            check_response_mutable()?;
+        }
         match self.1.pairs_mut(&mut lock(&self.0)) {
             Some(pairs) => {
                 f(pairs);

@@ -161,13 +161,13 @@
     {
       "name": "on_response_headers",
       "signature": "on_response_headers(flow)",
-      "description": "Fires on the ResponseHeaders event, before the response body is read.",
+      "description": "Fires on the ResponseHeaders event, before the response body streams to the client. This is where you mutate the client-bound response: edit flow.response.status / headers, or replace flow.response.body.",
       "snippet": "fn on_response_headers(flow) {\n    $0\n}"
     },
     {
       "name": "on_response",
       "signature": "on_response(flow)",
-      "description": "Fires on the Response event, once the full response is available.",
+      "description": "Fires on the Response event, once the full response is available. Observe-only: the response is already committed to the client, so editing flow.response here is refused -- read it, mark, comment, or record findings, and mutate the response in on_response_headers.",
       "snippet": "fn on_response(flow) {\n    $0\n}"
     },
     {
