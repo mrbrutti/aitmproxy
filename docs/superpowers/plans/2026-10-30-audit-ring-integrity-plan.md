@@ -161,10 +161,10 @@ the Coder stops and reports rather than editing the test.
 | AC33 | 2, 4, 5, 11 | review-checked doc updates |
 | AC34 | 11 | mutation runs |
 | AC35 | 11 | the Rust gate |
-| *Fix task 1 (panel round 1, whole branch)* | | |
-| AC36 | Fix task 1 | `redact::tests::scrub_text_does_not_let_an_unclosed_quote_swallow_the_next_pair` |
-| AC37 | Fix task 1 | `redact::tests::scrub_text_masks_unicode_whitespace_gaps` |
-| AC38 | Fix task 1 | `audit::tests::declared_client_label_rewrites_a_reserved_name_with_invisible_padding` |
+| *Fix tasks 1 and 2 (panel rounds 1 and 2, whole branch)* | | |
+| AC36 | Fix tasks 1, 2 | `redact::tests::scrub_text_masks_a_quoted_secret_after_an_unclosed_quote`, `redact::tests::scrub_text_never_leaves_a_credential_after_an_unclosed_quote`, `redact::tests::scrub_text_closes_a_padded_value_at_its_own_quote` |
+| AC37 | Fix tasks 1, 2 | `redact::tests::scrub_text_reads_unicode_whitespace_as_blank` |
+| AC38 | Fix tasks 1, 2 | `audit::tests::declared_client_label_rewrites_a_reserved_name_hidden_by_invisible_characters`, `audit::tests::sanitize_client_label_drops_every_invisible_character` |
 
 Tests in `audit_integrity.rs` are run with `cargo test -p aitm-mcp --test
 audit_integrity`.
@@ -247,7 +247,16 @@ audit_integrity`.
   exemption (separator `:`, unquoted key run containing a `.`, 1 to 5 ASCII digits
   immediately after the colon, then `/`, `?`, `#`, whitespace, a pair delimiter, or
   end). (Fix task 1 later amended this: blanks are ASCII and Unicode whitespace and an
-  opener-shaped quote cannot close a value; spec Design 4, AC36, AC37.) Rewrite the
+  opener-shaped quote cannot close a value; spec Design 4, AC36, AC37. The signatures
+  actually built differ from the two above: `is_key_byte(b: u8) -> bool` is
+  ASCII-only (alphanumeric, `_`, `.`, `-`), a non-ASCII character that is not
+  whitespace continues a key run through a small private helper that decodes one
+  char at a time, and `closing_quote(text: &str, from: usize, quote: u8) ->
+  Option<usize>` takes the text, not its bytes, so it can read the characters around
+  a quote. A few more small private helpers were added for whitespace and the
+  opener-shaped rule. Core's `ends_value` and `closing_quote` now differ from the
+  scanner's copies on purpose, until the scanner vocabulary consolidation follow-up.)
+  Rewrite the
   module doc and the `scrub_text` doc to describe the single vocabulary, the quote
   rule, and the exemption (no code, no list copies). Do not introduce a second
   vocabulary constant.
@@ -343,7 +352,10 @@ audit_integrity`.
   spec Design 2 (d)); must not rewrite a reserved name. Add `pub fn declared_client_label(raw:
   &str) -> Option<String>`: `sanitize_client_label`, then if the result equals (trimmed,
   ASCII case-insensitive) an entry of `RESERVED_CLIENT_LABELS`, return
-  `format!("{label} (declared)")`. Re-export the three constants and two functions from
+  `format!("{label} (declared)")`. (Fix task 2 later replaced that equality with a
+  skeleton comparison: the label reduced to its lowercased ASCII alphanumerics equals
+  the skeleton of an entry of `RESERVED_CLIENT_LABELS`; spec Design 2 item 3, AC38.)
+  Re-export the three constants and two functions from
   `lib.rs`. Do not edit `origin_label` or any existing item.
 - **Tests (written first)**, in `audit.rs` `mod tests`:
   - `sanitize_client_label_bounds_a_hostile_label`: `"A".repeat(10 << 20)` to
@@ -694,25 +706,35 @@ audit_integrity`.
 
 Kept by the main session during stage 6. One row per finding.
 
-| Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
+| Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason / accepted by the orchestrator under Matt's standing instruction, to countersign) |
 |---|---|---|---|---|
-| whole branch (round 1) | security | Important | `closing_quote` lets a later quoted secret through (an unclosed or escaped-closer quote swallows the next pair's opening quote) | fixed in fix task 1 (sha filled at integration): spec AC36 |
-| whole branch (round 1) | security | Minor | Pair-separator blanks are ASCII only, weaker than the old `\s*` | fixed in fix task 1 (sha filled at integration): spec AC37 |
-| whole branch (round 1) | security | Minor | Docs claim isolation the source table does not give | fixed in fix task 1 (sha filled at integration): docs qualified, residuals added |
-| whole branch (round 1) | security | Minor | Invisible-character set incomplete (reserved-name guard bypassable with padding) | fixed in fix task 1 (sha filled at integration): spec AC38 |
-| whole branch (round 1) | quality | Minor | Fair-share doc comment wrong | fixed in fix task 1 (sha filled at integration) |
-| whole branch (round 1) | quality | Minor | Sanitiser idempotence claim not literally true | fixed in fix task 1 (sha filled at integration): doc, spec wording, new test |
-| whole branch (round 1) | quality | Minor | `since` filter on `recent` untested | fixed in fix task 1 (sha filled at integration): new test |
-| whole branch (round 1) | quality | Minor | AC23 floor assertion loose | accepted by the orchestrator under Matt's autonomous-approve mode, 2026-10-30: the spec's floor is the contract |
-| whole branch (round 1) | quality | Minor | Loop-table tests stop at the first failing row | fixed in fix task 1 (sha filled at integration): for the new tests only |
-| whole branch (round 1) | quality | Minor | `ends_value` and `closing_quote` duplicated in core and scanner | fixed in fix task 1 (sha filled at integration): cross-reference comments; consolidation is the named follow-up "scanner vocabulary consolidation" |
-| whole branch (round 1) | quality | Minor | Stale or overclaiming doc comments | fixed in fix task 1 (sha filled at integration) |
-| whole branch (round 1) | quality | Minor | `Lane::insert` does needless work | accepted by the orchestrator, 2026-10-30: about 0.8 us per append under the mutex, off the hot path |
-| whole branch (round 1) | spec | Minor | Module doc lacks the label rules | fixed in fix task 1 (sha filled at integration) |
-| whole branch (round 1) | spec | Minor | Newline blanks in the pair pass not in the spec | fixed in fix task 1 (sha filled at integration): spec text (Design 4, Residual risk 6) |
-| whole branch (round 1) | spec | Minor | Residual risk not documented | fixed in fix task 1 (sha filled at integration): residuals added |
-| whole branch (round 1) | spec | Minor | Extra tests and a doc clause beyond the spec | accepted by the orchestrator, 2026-10-30: tests and doc only |
-| whole branch (round 1) | spec | Minor | Spec and plan statements not literally true | fixed in fix task 1 (sha filled at integration): wording |
+| whole branch (round 1) | security | Important | `closing_quote` lets a later quoted secret through (an unclosed or escaped-closer quote swallows the next pair's opening quote) | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): spec AC36 |
+| whole branch (round 1) | security | Minor | Pair-separator blanks are ASCII only, weaker than the old `\s*` | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): spec AC37 |
+| whole branch (round 1) | security | Minor | Docs claim isolation the source table does not give | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): docs qualified, residuals added |
+| whole branch (round 1) | security | Minor | Invisible-character set incomplete (reserved-name guard bypassable with padding) | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): spec AC38 |
+| whole branch (round 1) | quality | Minor | Fair-share doc comment wrong | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b) |
+| whole branch (round 1) | quality | Minor | Sanitiser idempotence claim not literally true | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): doc, spec wording, new test |
+| whole branch (round 1) | quality | Minor | `since` filter on `recent` untested | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): new test |
+| whole branch (round 1) | quality | Minor | AC23 floor assertion loose | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: the spec's floor is the contract |
+| whole branch (round 1) | quality | Minor | Loop-table tests stop at the first failing row | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): for the new tests only |
+| whole branch (round 1) | quality | Minor | `ends_value` and `closing_quote` duplicated in core and scanner | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): cross-reference comments; consolidation is the named follow-up "scanner vocabulary consolidation" |
+| whole branch (round 1) | quality | Minor | Stale or overclaiming doc comments | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b) |
+| whole branch (round 1) | quality | Minor | `Lane::insert` does needless work | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: about 0.8 us per append under the mutex, off the hot path |
+| whole branch (round 1) | spec | Minor | Module doc lacks the label rules | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b) |
+| whole branch (round 1) | spec | Minor | Newline blanks in the pair pass not in the spec | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): spec text (Design 4, Residual risk 6) |
+| whole branch (round 1) | spec | Minor | Residual risk not documented | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): residuals added |
+| whole branch (round 1) | spec | Minor | Extra tests and a doc clause beyond the spec | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: tests and doc only |
+| whole branch (round 1) | spec | Minor | Spec and plan statements not literally true | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): wording |
+| whole branch (round 2) | spec | Important | AC36, AC37 and AC38 test names in the spec and plan differ from the tests as built | fixed in fix task 2 (sha filled at integration): spec and plan aligned to the built names (AC36 lists all three tests, AC38 both) |
+| whole branch (round 2) | spec | Important | AC38 test gap: no negative control and no check over the whole dropped set | fixed in fix task 2 (sha filled at integration): negative controls (`webbridges`, `aitm-mac\u{3164}`) and a loop over the dropped set added (`sanitize_client_label_drops_every_invisible_character`) |
+| whole branch (round 2) | spec | Minor | Design 4 and plan Task 2 text out of step with the code (key run, end-of-value set, "stricter of the two" claim, built signatures) | fixed in fix task 2 (sha filled at integration): spec Design 4, plan Task 2 note |
+| whole branch (round 2) | spec | Minor | Isolation overclaims in the spec itself | fixed in fix task 2 (sha filled at integration): spec Goals, Design 1 (floor, why both lanes), Semantics table, Residual risks 2, Summary |
+| whole branch (round 2) | spec | Minor | Wording leftovers (doc strings) | fixed in fix task 2 (sha filled at integration) |
+| whole branch (round 2) | security | Minor | A quoted key opener directly after an unclosed quote that ends in `=` or `:` can still be swallowed | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: the old regex leaked the adjacent variant, no new capability; Residual risks 12 |
+| whole branch (round 2) | security | Minor | Reserved-name guard bypassable with invisible code points outside the dropped set | fixed in fix task 2 (sha filled at integration): skeleton comparison, spec Design 2 item 3, AC38 |
+| whole branch (round 2) | quality | Minor | Findings 1 to 5, 8 and 9 of the round-2 quality report (Minors 1 to 9, less 6 and 7 below) | fixed in fix task 2 (sha filled at integration) |
+| whole branch (round 2) | quality | Minor | Finding 6: a next key with only a closing quote (`password='x password'=S3CR3T` leaves `S3CR3T`) | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: malformed input only (five regressions in a 1.5M-input differential), the doc is softened; Residual risks 13 |
+| whole branch (round 2) | quality | Minor | Finding 7 of the round-2 quality report | fixed in fix task 2 (sha filled at integration): doc-only |
 
 ## Shipped
 
@@ -720,10 +742,16 @@ What merged, what was cut, follow-ups. Filled at stage 7. Follow-ups already nam
 the spec: "durable audit wiring" (config key, path, rotation, 0600, blocking I/O),
 "scanner vocabulary consolidation" (the scanner drops its own `redact_needle_pairs` and
 pre-pass, shares one `ends_value`/`closing_quote` with core, and fixes its stale doc
-comments), "regenerate the tool reference" (run
+comments; it also removes the scanner's divergent `ends_value`/`closing_quote` copies,
+which lack core's opener-shaped rule and Unicode whitespace), "regenerate the tool reference" (run
 `aitmproxy-plugin/scripts/gen-tool-reference.mjs` so
 `aitmproxy-plugin/docs/tool-reference.md` carries the new `agent.activity` and
 `agent.status` descriptions; `docs/research/mcp-tool-catalog.txt` still holds the old
 text), "agent-stream filtering" (the
 `notifications/aitm/agent` push for routine entries), and the PR 145 follow-ups that
 remain ("tui-mode governance", "unified agent hub", "configurable startup policy").
+Follow-ups found by the panel: the `server.rs` doc comments still say the durable sink
+is "opt-in by config", but no such config key exists (fix them in the "durable audit
+wiring" spec); and consider tightening `is_host_port` in `redact.rs` so that it
+requires the last dotted label of the key to be non-secret (spec Residual risks 11 and
+14).
