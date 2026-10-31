@@ -18,9 +18,9 @@ import Testing
     }
 
     @Test func everyHealthStateHasAWord() {
-        #expect(CoreHealth.running.title == "Running")
-        #expect(CoreHealth.restarting.title == "Restarting")
-        #expect(CoreHealth.failed.title == "Failed")
+        #expect(CoreHealth.running.statusWord == "core running")
+        #expect(CoreHealth.restarting.statusWord == "restarting…")
+        #expect(CoreHealth.failed.statusWord == "core failed")
     }
 
     @Test func statusTitleIsPreciseWhereHealthIsCoarse() {

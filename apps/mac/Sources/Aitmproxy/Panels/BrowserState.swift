@@ -13,6 +13,24 @@ struct BrowserTab: Identifiable, Hashable {
     var url: String
     var lastFrame: Data?
     var isLoading = false
+    /// The page's history as this app has driven it: how many entries, and
+    /// which one is showing. Back / Forward enable from these.
+    var historyCount = 0
+    var historyIndex = 0
+
+    var canGoBack: Bool { historyIndex > 0 }
+    var canGoForward: Bool { historyIndex < historyCount - 1 }
+
+    /// A new navigation drops any forward entries and becomes the latest.
+    mutating func pushHistory() {
+        if historyCount == 0 {
+            historyIndex = 0
+            historyCount = 1
+        } else {
+            historyIndex += 1
+            historyCount = historyIndex + 1
+        }
+    }
 }
 
 /// The Browser view's state (S-054, S-055): tabs, the live frame stream,
@@ -46,7 +64,8 @@ final class BrowserState {
         self.session = session
         if Store.usesFixtures {
             let page = Fixtures.browserPage
-            let tab = BrowserTab(title: page.title, url: page.url, lastFrame: page.png)
+            var tab = BrowserTab(title: page.title, url: page.url, lastFrame: page.png)
+            tab.pushHistory()
             tabs = [tab]
             currentID = tab.id
             urlText = page.url
@@ -120,6 +139,7 @@ final class BrowserState {
         defer { if var done = current { done.isLoading = false; current = done } }
         if Store.usesFixtures {
             tab.title = URL(string: url)?.host() ?? url
+            tab.pushHistory()
             current = tab
             consoleLines.append("navigate \(url) → 200 (fixture)")
             return
@@ -129,6 +149,7 @@ final class BrowserState {
             let finalURL = outcome["final_url"]?.stringValue ?? url
             tab.url = finalURL
             tab.title = URL(string: finalURL)?.host() ?? finalURL
+            tab.pushHistory()
             current = tab
             urlText = finalURL
             if let status = outcome["status"]?.intValue { consoleLines.append("navigate \(finalURL) → \(status)") }
@@ -138,19 +159,53 @@ final class BrowserState {
         }
     }
 
-    // Until F14 adds history commands, back/forward/reload go through `browser.eval`.
-    func back() async { await evalQuietly("history.back()") }
-    func forward() async { await evalQuietly("history.forward()") }
-    func reload() async { await evalQuietly("location.reload()") }
+    // Until F14 adds history commands, back/forward/reload go through `browser.eval`;
+    // the tab's own history depth moves with them so the buttons enable honestly.
+    func back() async {
+        guard let tab = current, tab.canGoBack else { return }
+        // The index moves only once the page did, so a failed eval leaves the buttons honest.
+        guard await evalQuietly("history.back()"), var moved = current else { return }
+        moved.historyIndex -= 1
+        current = moved
+        await syncLocation(pushing: false)
+    }
 
-    private func evalQuietly(_ expr: String) async {
-        guard !Store.usesFixtures else { consoleLines.append("› \(expr)"); return }
+    func forward() async {
+        guard let tab = current, tab.canGoForward else { return }
+        guard await evalQuietly("history.forward()"), var moved = current else { return }
+        moved.historyIndex += 1
+        current = moved
+        await syncLocation(pushing: false)
+    }
+
+    func reload() async { _ = await evalQuietly("location.reload()") }
+
+    /// True when the expression ran on the page.
+    @discardableResult
+    private func evalQuietly(_ expr: String) async -> Bool {
+        guard !Store.usesFixtures else { consoleLines.append("› \(expr)"); return true }
         do {
             _ = try await session.runCommand("browser.eval", ["expr": .string(expr)])
             _ = await screenshot()
+            return true
         } catch {
             fail("browser", error)
+            return false
         }
+    }
+
+    /// A click, a keystroke or an eval can navigate the page (a link, a form, `location = …`).
+    /// Read where the page is now; when it moved, the tab follows and, unless the move was
+    /// our own back/forward, it is a new history entry so Back/Forward stay truthful.
+    private func syncLocation(pushing: Bool = true) async {
+        guard !Store.usesFixtures, var tab = current else { return }
+        guard let href = try? await session.runCommand("browser.eval", ["expr": .string("location.href")]).stringValue,
+              !href.isEmpty, href != tab.url else { return }
+        tab.url = href
+        tab.title = URL(string: href)?.host() ?? href
+        if pushing { tab.pushHistory() }
+        current = tab
+        urlText = href
     }
 
     // MARK: Frames
@@ -232,6 +287,7 @@ final class BrowserState {
         do {
             _ = try await session.runCommand("browser.click", ["x": .number(Double(x)), "y": .number(Double(y))])
             _ = await screenshot()
+            await syncLocation()
         } catch {
             fail("click", error)
         }
@@ -244,6 +300,7 @@ final class BrowserState {
         do {
             _ = try await session.runCommand("browser.type", ["selector": ":focus", "text": .string(text)])
             _ = await screenshot()
+            await syncLocation()
         } catch {
             fail("type", error)
         }
@@ -258,6 +315,7 @@ final class BrowserState {
         do {
             let value = try await session.runCommand("browser.eval", ["expr": .string(trimmed)])
             consoleLines.append(value.stringValue ?? value.serialized())
+            await syncLocation()
         } catch {
             consoleLines.append("✕ \(BusService.describe(error))")
         }

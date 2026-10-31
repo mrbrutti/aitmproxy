@@ -135,7 +135,7 @@ struct GalleryButtonParts: View {
                 VStack(spacing: 2) {
                     bar(Tok.Intercept.base) {
                         PrimaryButton("Resume", hint: "⌘⏎") {}
-                        GhostButton("Resume all") {}
+                        GhostButton("Resume All") {}
                     }
                     bar(Tok.Intercept.base) {
                         GhostButton("Kill", hint: "⌘\\", menu: true) {}

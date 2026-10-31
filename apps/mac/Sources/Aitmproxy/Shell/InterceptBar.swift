@@ -11,6 +11,10 @@ struct InterceptBar: View {
 
     private var target: FlowRow? { session.interceptTarget }
 
+    /// A failed embedded core cannot resume, kill or edit anything: the paused
+    /// bar keeps Disarm and Rules… live and dims the rest (B4).
+    private var coreFailed: Bool { session.coreHealth.health == .failed }
+
     var body: some View {
         if session.paused.isEmpty {
             armedNotice
@@ -48,7 +52,11 @@ struct InterceptBar: View {
                     withAnimation(.easeInOut(duration: Tok.Motion.interceptPulse / 2).repeatForever()) { pulse = true }
                 }
             Text("\(session.paused.count) paused").fontWeight(.semibold)
-            if let target {
+            if coreFailed {
+                Text("· core failed — restart the core to resume")
+                    .opacity(0.9)
+                    .lineLimit(1)
+            } else if let target {
                 Text(targetText(target))
                     .font(Tok.Face.data(Tok.Typography.Size.md))
                     .opacity(0.9)
@@ -82,17 +90,19 @@ struct InterceptBar: View {
         HStack(spacing: Tok.Metric.gapTight) {
             PrimaryButton(resumeTitle, hint: "⌘⏎") { if let target { session.applyAndResume(target.id) } }
                 .accessibilityIdentifier("resume-button")
+                .disabled(coreFailed)
             if compact {
                 Menu {
                     if let target, row(target).state == .paused {
-                        Button("Edit Paused Request") { session.editPaused(target.id) }
+                        Button("Edit Paused Request") { session.editPaused(target.id) }.disabled(coreFailed)
                     }
-                    Button("Resume All") { session.resumeAll() }
+                    Button("Resume All") { session.resumeAll() }.disabled(coreFailed)
                     Menu("Kill") {
                         ForEach(KillMode.allCases, id: \.self) { mode in
                             Button(mode.title) { session.killMode = mode; if let target { session.kill(target.id) } }
                         }
                     }
+                    .disabled(coreFailed)
                     Button("Breakpoint Rules…") { session.rulesVisible = true }
                     Button("Disarm Intercept") { session.arm(false) }
                 } label: {
@@ -106,8 +116,10 @@ struct InterceptBar: View {
                 if let target, row(target).state == .paused {
                     GhostButton("Edit", hint: "e") { session.editPaused(target.id) }
                         .accessibilityIdentifier("edit-button")
+                        .disabled(coreFailed)
                 }
-                GhostButton("Resume all") { session.resumeAll() }
+                GhostButton("Resume All") { session.resumeAll() }
+                    .disabled(coreFailed)
                 Menu {
                     ForEach(KillMode.allCases, id: \.self) { mode in
                         Button {
@@ -125,6 +137,7 @@ struct InterceptBar: View {
                 .menuStyle(.button)
                 .buttonStyle(.plain)
                 .menuIndicator(.hidden)
+                .disabled(coreFailed)
                 .help("Kill \(session.killMode.title.lowercased()) (⌘\\); click the chevron for other modes")
                 GhostButton("Rules…") { session.rulesVisible = true }
                 GhostButton("Disarm", hint: "i") { session.arm(false) }
@@ -134,14 +147,13 @@ struct InterceptBar: View {
 
     private func row(_ r: FlowRow) -> FlowRow { r }
 
+    /// "edited"/"pending" comes from `pendingEditCount` alone, the same predicate
+    /// the Resume title and the editor footer use, so the three never disagree (B3).
     private func targetText(_ row: FlowRow) -> String {
         var s = "\(row.method.label) \(row.url)"
         let pending = session.pendingEditCount(row.id)
         if pending > 0 {
             s += " · \(pending) edit\(pending == 1 ? "" : "s") pending"
-        } else if row.edited, let detail = session.details[row.id], let original = detail.originalRequest {
-            let n = max(abs(detail.request.headers.count - original.headers.count), 1)
-            s += " · edited (\(n) header\(n == 1 ? "" : "s"))"
         }
         return s
     }

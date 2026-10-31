@@ -62,7 +62,8 @@ final class ActivityState {
 
     /// Live before F2: the panel lists this app's own commands only.
     var note: String? {
-        !Store.usesFixtures && !busFed ? "This app's own commands only — every frontend's arrive with notifications/aitm/agent (F2)" : nil
+        // F2: notifications/aitm/agent feeds every frontend's commands.
+        !Store.usesFixtures && !busFed ? "This app's own commands only — other frontends' commands arrive once the core publishes them" : nil
     }
 
     func ingest(_ params: JSONValue) {
@@ -166,7 +167,7 @@ final class ActivityState {
         }
         guard hasTool("agent.set") else {
             intendedPolicy = policy
-            session.lastError = "agent.set needs F1"
+            session.lastError = "The core cannot change the agent policy yet" // core F1
             return
         }
         confirming = true
@@ -229,7 +230,8 @@ struct AgentPanel: View {
                     if state.confirming {
                         Hint(text: "confirming…")
                     } else if let intended = state.intendedPolicy, intended != session.agentPolicy {
-                        Hint(text: "agent.set needs F1 — intended: \(intended.title)")
+                        // F1: agent.set is not on this bus yet.
+                        Hint(text: "The core cannot change the agent policy yet — intended: \(intended.title)")
                     } else if !busOnline {
                         Hint(text: "Agent policy needs the bus")
                     }

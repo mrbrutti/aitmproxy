@@ -85,8 +85,16 @@ extension Session {
             ranked = recent.sorted { recentPaletteIDs.firstIndex(of: String($0.0.id.dropFirst(7))) ?? 0 < recentPaletteIDs.firstIndex(of: String($1.0.id.dropFirst(7))) ?? 0 } + ranked
         }
         let order = PaletteSection.allCases
+        // A literal hit on the title (a URL containing "shop", a verb containing "repl") outranks
+        // a fuzzy subsequence hit from another section, so typing a host surfaces its flows
+        // before commands whose descriptions happen to spell the letters.
+        func literal(_ item: PaletteItem) -> Bool {
+            !trimmed.isEmpty && item.title.localizedCaseInsensitiveContains(trimmed)
+        }
         return ranked
             .sorted { a, b in
+                let la = literal(a.0), lb = literal(b.0)
+                if la != lb { return la }
                 let sa = order.firstIndex(of: a.0.section) ?? 0, sb = order.firstIndex(of: b.0.section) ?? 0
                 return sa == sb ? a.1 > b.1 : sa < sb
             }

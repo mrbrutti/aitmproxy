@@ -73,6 +73,7 @@ enum SnapshotScene: String, CaseIterable {
             session.paletteVisible = true
         case .paletteFlows:
             session.paletteOpenedByKeyboard = true
+            session.paletteSeedQuery = "shop"
             session.paletteVisible = true
         case .multiSelect:
             session.selection = Set(session.rows.prefix(3).map(\.id))
@@ -205,7 +206,7 @@ enum SnapshotScene: String, CaseIterable {
         session.sidebarQuery = ""
         session.paletteVisible = false
         if session.layout == .detached {
-            NSApp.windows.first { $0.title == "Inspector" }?.close()
+            Snapshot.inspectorWindow()?.close()
             session.layout = .horizontal
         }
         session.activityLogVisible = false

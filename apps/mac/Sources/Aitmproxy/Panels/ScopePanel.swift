@@ -205,6 +205,18 @@ struct ScopePanel: View {
         }
         .buttonStyle(.plain)
         .onHover { hovered = $0 ? entry.host : (hovered == entry.host ? nil : hovered) }
+        .contextMenu {
+            Button("Remove from Scope") { remove(entry.host) }
+            Button("Copy Host") {
+                Pasteboard.copy(entry.host)
+            }
+            // Show Flows narrows the Domains page to this host; a wildcard or a host
+            // with no captured flows has no group to show, so the item stays out.
+            if session.hosts.contains(where: { $0.0 == entry.host }) {
+                Divider()
+                Button("Show Flows") { session.show(.domains, group: .host(entry.host)) }
+            }
+        }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(entry.host)
         .accessibilityValue(isPending ? "pending" : entry.limit?.readout ?? "no limit")
