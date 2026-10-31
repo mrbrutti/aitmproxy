@@ -7,6 +7,13 @@
 //! `*BodyChunk` event as soon as it is available. The machine handles one
 //! exchange at a time; after `ResponseComplete` it is ready for the next request
 //! on the same connection.
+//!
+//! A chunked body's trailer section is parsed like a header block, within
+//! 16 KiB and 64 fields, and fails closed. A response's trailers are captured
+//! on the response model ([`Http1Machine::response`], `HttpResponse::trailers`),
+//! never merged into its headers, and are there by the time `ResponseComplete`
+//! is returned. A request's trailers are parsed and bounded the same way, then
+//! dropped: the request model has nowhere to keep them.
 
 use std::fmt::Write as _;
 
@@ -57,6 +64,12 @@ pub enum HttpSansIoEvent {
 pub(crate) const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// Largest chunk-size line (hex size plus extensions) accepted.
 const MAX_CHUNK_LINE_BYTES: usize = 1024;
+/// Largest chunked trailer section accepted, in bytes: the sum of every field
+/// line's length plus its CRLF. The blank line that ends the section is not
+/// counted, so a section of exactly this many bytes is still accepted.
+const MAX_TRAILER_BYTES: usize = 16 * 1024;
+/// Most field lines a chunked trailer section may hold.
+const MAX_TRAILER_FIELDS: usize = 64;
 /// The interim response that answers a `100-continue` expectation (25 bytes).
 const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 
@@ -78,7 +91,9 @@ enum ChunkPhase {
     Data(u64),
     /// Expecting the `\r\n` that closes a chunk's data.
     DataEnd,
-    /// After the zero-size chunk: trailer lines until an empty one.
+    /// After the zero-size chunk: trailer lines until an empty one. Each line is
+    /// parsed like a header field and held in the reader's [`Trailers`], within
+    /// [`MAX_TRAILER_BYTES`] and [`MAX_TRAILER_FIELDS`].
     Trailers,
 }
 
@@ -101,10 +116,21 @@ enum Phase {
     Upgraded,
 }
 
+/// The trailer fields of a chunked body parsed so far, and the bytes they took.
+/// Lives on the reader so a section split across reads accumulates; emptied when
+/// the section ends.
+#[derive(Default)]
+struct Trailers {
+    fields: HeaderMap,
+    /// Each field line's length plus its CRLF, summed (the cap's unit).
+    bytes: usize,
+}
+
 /// One side's receive buffer and parse phase.
 struct Reader {
     buf: Vec<u8>,
     phase: Phase,
+    trailers: Trailers,
 }
 
 impl Reader {
@@ -112,6 +138,7 @@ impl Reader {
         Self {
             buf: Vec::new(),
             phase: Phase::Head,
+            trailers: Trailers::default(),
         }
     }
 }
@@ -184,7 +211,11 @@ impl Http1Machine {
         self.request.as_ref()
     }
 
-    /// The response head of the current exchange, once parsed.
+    /// The response head of the current exchange, once parsed (body `Empty`;
+    /// chunks come as events). Once the machine has returned `ResponseComplete`
+    /// for a chunked body, its `trailers` hold the trailer section the origin
+    /// sent, in wire order with duplicates kept; they are empty before that and
+    /// for every response without a trailer section.
     pub fn response(&self) -> Option<&HttpResponse> {
         self.response.as_ref()
     }
@@ -361,14 +392,21 @@ impl Http1Machine {
                 Phase::Chunked(phase) => {
                     let id = self.current_flow()?;
                     let mut phase = phase;
-                    let step = step_chunked(&mut self.client.buf, &mut phase)?;
+                    let step =
+                        step_chunked(&mut self.client.buf, &mut phase, &mut self.client.trailers)?;
                     self.client.phase = Phase::Chunked(phase);
                     match step {
                         Step::NeedMore => break,
                         Step::Data(bytes) => {
                             events.push(HttpSansIoEvent::RequestBodyChunk { flow: id, bytes })
                         }
-                        Step::Done => self.finish_request(id, &mut events),
+                        Step::Done => {
+                            // Request trailers were parsed and bounded above;
+                            // the request model has nowhere to keep them, so
+                            // they are dropped here.
+                            self.client.trailers = Trailers::default();
+                            self.finish_request(id, &mut events)
+                        }
                     }
                 }
                 // A request body never runs to close; anything else parks the
@@ -452,14 +490,24 @@ impl Http1Machine {
                 Phase::Chunked(phase) => {
                     let id = self.current_flow()?;
                     let mut phase = phase;
-                    let step = step_chunked(&mut self.server.buf, &mut phase)?;
+                    let step =
+                        step_chunked(&mut self.server.buf, &mut phase, &mut self.server.trailers)?;
                     self.server.phase = Phase::Chunked(phase);
                     match step {
                         Step::NeedMore => break,
                         Step::Data(bytes) => {
                             events.push(HttpSansIoEvent::ResponseBodyChunk { flow: id, bytes })
                         }
-                        Step::Done => self.finish_response(id, &mut events),
+                        Step::Done => {
+                            // The section is complete: hand it to the response
+                            // model (and leave the accumulator empty for the
+                            // next response) just before `ResponseComplete`.
+                            let section = std::mem::take(&mut self.server.trailers);
+                            if let Some(resp) = self.response.as_mut() {
+                                resp.trailers = section.fields;
+                            }
+                            self.finish_response(id, &mut events)
+                        }
                     }
                 }
                 Phase::UntilClose => {
@@ -558,8 +606,14 @@ fn step_length(buf: &mut Vec<u8>, remaining: u64) -> Step {
     Step::Data(buf.drain(..take).collect())
 }
 
-/// Advance a chunked-encoding decoder by one step over `buf`.
-fn step_chunked(buf: &mut Vec<u8>, phase: &mut ChunkPhase) -> Result<Step> {
+/// Advance a chunked-encoding decoder by one step over `buf`. A trailer section
+/// accumulates in `trailers` until its blank line returns `Step::Done`; the
+/// caller then takes the fields (or discards them).
+fn step_chunked(
+    buf: &mut Vec<u8>,
+    phase: &mut ChunkPhase,
+    trailers: &mut Trailers,
+) -> Result<Step> {
     match *phase {
         ChunkPhase::Size => {
             let Some(line) = take_line(buf, MAX_CHUNK_LINE_BYTES)? else {
@@ -572,7 +626,7 @@ fn step_chunked(buf: &mut Vec<u8>, phase: &mut ChunkPhase) -> Result<Step> {
                 ChunkPhase::Data(size)
             };
             // Loop back to carry on with the data already buffered.
-            step_chunked(buf, phase)
+            step_chunked(buf, phase, trailers)
         }
         ChunkPhase::Data(remaining) => {
             if buf.is_empty() {
@@ -599,16 +653,38 @@ fn step_chunked(buf: &mut Vec<u8>, phase: &mut ChunkPhase) -> Result<Step> {
             }
             buf.drain(..2);
             *phase = ChunkPhase::Size;
-            step_chunked(buf, phase)
+            step_chunked(buf, phase, trailers)
         }
         ChunkPhase::Trailers => loop {
-            let Some(line) = take_line(buf, MAX_HEAD_BYTES)? else {
+            // A partial line past the cap can never become a legal one, so it
+            // fails now rather than buffering until its CRLF shows up.
+            let Some(line) = take_line(buf, MAX_TRAILER_BYTES)
+                .map_err(|_| anyhow!("trailer section exceeds {MAX_TRAILER_BYTES} bytes"))?
+            else {
                 return Ok(Step::NeedMore);
             };
+            // The blank line ends the section and is not counted.
             if line.is_empty() {
                 return Ok(Step::Done);
             }
-            // Trailer fields are consumed and dropped.
+            trailers.bytes += line.len() + 2;
+            if trailers.bytes > MAX_TRAILER_BYTES {
+                bail!("trailer section exceeds {MAX_TRAILER_BYTES} bytes");
+            }
+            // An obs-fold line (RFC 9112 5.2) is refused, not unfolded: a proxy
+            // may reject it, and folding would let a trailer line extend another.
+            if line.first().is_some_and(|b| matches!(b, b' ' | b'\t')) {
+                bail!("trailer field line starts with whitespace");
+            }
+            let text =
+                std::str::from_utf8(&line).map_err(|_| anyhow!("non-UTF-8 trailer field"))?;
+            if trailers.fields.len() >= MAX_TRAILER_FIELDS {
+                bail!("trailer section exceeds {MAX_TRAILER_FIELDS} fields");
+            }
+            // Trailer names and values are attacker-controlled and this error
+            // can reach a log, so it names the problem, never the field.
+            parse_field_line(text, &mut trailers.fields)
+                .map_err(|_| anyhow!("malformed trailer field"))?;
         },
     }
 }
@@ -727,21 +803,26 @@ fn parse_headers<'a>(lines: impl Iterator<Item = &'a str>) -> Result<HeaderMap> 
         if line.is_empty() {
             continue;
         }
-        let Some((name, value)) = line.split_once(':') else {
-            bail!("malformed header line {line:?}");
-        };
-        let name = name.trim();
-        if name.is_empty() || name.contains(' ') {
-            bail!("malformed header name {name:?}");
-        }
-        // Fail closed on an invalid name/value (control byte, embedded CR/LF).
-        // `set` would *drop* it silently; dropping a framing header such as
-        // `Content-Length` desynchronises us from the peer (request smuggling).
-        headers
-            .try_set(name, value.trim())
-            .map_err(|e| anyhow!("{e}"))?;
+        parse_field_line(line, &mut headers)?;
     }
     Ok(headers)
+}
+
+/// Parse one `name: value` field line and append it to `into`. Used for head
+/// header lines and for trailer lines alike, so the two accept exactly the same
+/// syntax.
+fn parse_field_line(line: &str, into: &mut HeaderMap) -> Result<()> {
+    let Some((name, value)) = line.split_once(':') else {
+        bail!("malformed header line {line:?}");
+    };
+    let name = name.trim();
+    if name.is_empty() || name.contains(' ') {
+        bail!("malformed header name {name:?}");
+    }
+    // Fail closed on an invalid name/value (control byte, embedded CR/LF).
+    // `set` would *drop* it silently; dropping a framing header such as
+    // `Content-Length` desynchronises us from the peer (request smuggling).
+    into.try_set(name, value.trim()).map_err(|e| anyhow!("{e}"))
 }
 
 /// The protocol named by `Upgrade:` when `Connection:` lists `upgrade`.
