@@ -12,6 +12,11 @@
 //! for now. `actions_last_minute` is sourced from the F2 audit ring (Task 8).
 //! `agent.activity` (Read, any role) reads the same ring so a surface or a
 //! reconnecting agent can catch up on recent activity (spec D3a.4).
+//!
+//! The audit ring has two lanes: an evidence lane (refusals, failures, and every
+//! Write or Sensitive run) and a routine lane (successful reads only), so a burst
+//! of reads cannot push evidence out. `actions_last_minute` counts both lanes,
+//! across every surface: a UI that polls `agent.status` counts too.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -108,8 +113,9 @@ impl Command for AgentStatus {
                     "actions_last_minute",
                     TypeDesc::Int,
                     true,
-                    "Command invocations recorded in the last minute (sourced from the F2 audit \
-                     ring).",
+                    "Command invocations still held in the audit ring that were recorded in the \
+                     last minute, across both lanes and every surface (a polling UI counts). \
+                     Saturates at what the ring holds.",
                 ),
                 param(
                     "connected_clients",
@@ -205,6 +211,11 @@ impl Command for AgentSet {
 /// recent command activity without replaying the whole `notifications/aitm/agent`
 /// stream (spec D3a.4). `since` is Unix-epoch milliseconds (entries strictly
 /// after it); `limit` keeps the most recent `limit` of those.
+///
+/// Entries merge oldest-first across the ring's two lanes. How long a source's
+/// entries survive depends on its own volume and its fair share of a lane, not
+/// on what other sources do. A call with no `limit` can return up to 6144
+/// entries (both lanes full), so passing `limit` is advisable.
 struct AgentActivity(Arc<AuditRing>);
 
 impl Command for AgentActivity {
@@ -219,8 +230,11 @@ impl Command for AgentActivity {
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description: "Recent command-invocation audit entries (who ran what, with what \
-                          redacted arguments, and the outcome), oldest first. Read-only and \
-                          readable by any role."
+                          redacted arguments, and the outcome), merged oldest first across the \
+                          ring's two lanes. How long a source's entries are kept depends on its \
+                          own volume and fair share. A call with no `limit` can return up to \
+                          6144 entries, so passing `limit` is advisable. Read-only and readable \
+                          by any role."
                 .to_string(),
             params: vec![
                 param(
@@ -243,7 +257,9 @@ impl Command for AgentActivity {
                     "client_label",
                     TypeDesc::Str,
                     false,
-                    "The client label, when one was declared.",
+                    "The client label: the server-minted `web-bridge` for the web bridge, \
+                     otherwise the client's declared `initialize.clientInfo.name`, sanitised to \
+                     at most 64 characters. Display-only; `origin` is authoritative.",
                 ),
                 param("command", TypeDesc::Str, true, "The dotted command name."),
                 param(

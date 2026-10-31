@@ -5,7 +5,8 @@
 //! line; every later text frame holds one or more lines.
 //!
 //! An authenticated connection is one `ConnCtx`: its role, a unique `conn_id`,
-//! and a bounded `NotificationSink`, shared by every frame it sends. That is what
+//! the server-minted `client_label` `web-bridge`, and a bounded
+//! `NotificationSink`, shared by every frame it sends. That is what
 //! lets `flow.subscribe` work here as it does over loopback TCP: a subscription is
 //! tagged with the connection and dropped when the connection ends, on every exit
 //! path. Frames are detached rather than cancelled, so one may still be running
