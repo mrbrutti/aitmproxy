@@ -8,7 +8,10 @@ import SwiftUI
 struct DynamicColor: Hashable, Sendable {
     let light: UInt32
     let dark: UInt32
-    var nsColor: NSColor { NSColor.dynamic(light: light, dark: dark) }
+    /// Increase-Contrast overrides; nil falls back to light/dark.
+    var highContrastLight: UInt32? = nil
+    var highContrastDark: UInt32? = nil
+    var nsColor: NSColor { NSColor.dynamic(light: light, dark: dark, highContrastLight: highContrastLight, highContrastDark: highContrastDark) }
     var color: Color { Color(nsColor: nsColor) }
 }
 
@@ -212,12 +215,12 @@ enum Tok {
         static let onAccent = DynamicColor(light: 0xFFFFFF, dark: 0x0B1220)
         /// Text on the primary (inverse) button.
         static let onInverse = DynamicColor(light: 0xFFFFFF, dark: 0x111111)
-        /// Identity text: URL host, header names, values, titles.
-        static let primary = DynamicColor(light: 0x111827, dark: 0xE6E6E8)
+        /// Identity text: URL host, header names, values, titles. Increase-Contrast pushes it to pure black/white.
+        static let primary = DynamicColor(light: 0x111827, dark: 0xE6E6E8, highContrastLight: 0x000000, highContrastDark: 0xFFFFFF)
         /// Column headers, labels, timestamps, durations.
-        static let secondary = DynamicColor(light: 0x4B5563, dark: 0xB4B4B8)
+        static let secondary = DynamicColor(light: 0x4B5563, dark: 0xB4B4B8, highContrastLight: 0x1F2937, highContrastDark: 0xD9D9DC)
         /// Placeholders, meta, disabled labels. Floor of the readable tiers (4.7:1 on raised, 5.3:1 on surface in light).
-        static let tertiary = DynamicColor(light: 0x616A78, dark: 0x8E8E93)
+        static let tertiary = DynamicColor(light: 0x616A78, dark: 0x8E8E93, highContrastLight: 0x374151, highContrastDark: 0xBFBFC4)
     }
     /// Two faces, each with one job.
     enum Typography {
