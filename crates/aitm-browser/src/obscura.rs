@@ -941,6 +941,75 @@ mod tests {
         );
     }
 
+    /// Regression guards for the two stage-6 security fixes: a symlink planted
+    /// under the prefix is never followed or removed (the gate is `file_type()`,
+    /// not `Path::is_dir()`), and a pid that is `0` or past `i32::MAX` is left in
+    /// place (so the `pid as i32` liveness probe can never wrap to a negative value
+    /// and signal a process *group*). Every owner is reported dead, yet nothing is
+    /// reaped.
+    #[cfg(unix)]
+    #[test]
+    fn reap_skips_symlinks_and_out_of_range_pids() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static N: AtomicU32 = AtomicU32::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "aitm-reap-sym-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&base).expect("create reap base");
+
+        struct Cleanup<'a>(&'a Path);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(self.0);
+            }
+        }
+        let _guard = Cleanup(&base);
+
+        // A real dir, and a symlink named with a "dead" pid that points at it.
+        let target = base.join("target-dir");
+        std::fs::create_dir(&target).unwrap();
+        let symlink = base.join("aitm-obscura-444-ddd");
+        std::os::unix::fs::symlink(&target, &symlink).unwrap();
+
+        // Pids that parse as u32 but must be left alone: one past i32::MAX
+        // (<= u32::MAX so it parses), and zero.
+        let too_big = base.join("aitm-obscura-3000000000-eee");
+        let zero_pid = base.join("aitm-obscura-0-fff");
+        std::fs::create_dir(&too_big).unwrap();
+        std::fs::create_dir(&zero_pid).unwrap();
+
+        // Report every owner dead; nothing above is a reapable (real-dir, in-range) entry.
+        let removed = reap_stale_run_dirs_in(&base, |_pid| false);
+
+        assert_eq!(
+            removed, 0,
+            "no symlink or out-of-range-pid entry may be reaped"
+        );
+        assert!(
+            symlink.symlink_metadata().is_ok(),
+            "the symlink itself must be left in place: {}",
+            symlink.display()
+        );
+        assert!(
+            target.is_dir(),
+            "the symlink target must never be followed or removed: {}",
+            target.display()
+        );
+        assert!(
+            too_big.is_dir(),
+            "a pid past i32::MAX must be left in place: {}",
+            too_big.display()
+        );
+        assert!(
+            zero_pid.is_dir(),
+            "a pid of 0 must be left in place: {}",
+            zero_pid.display()
+        );
+    }
+
     /// The token has real entropy: a batch of them is all-distinct.
     #[test]
     fn random_token_does_not_repeat() {
