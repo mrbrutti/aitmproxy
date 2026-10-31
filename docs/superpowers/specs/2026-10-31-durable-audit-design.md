@@ -1419,7 +1419,7 @@ per row and per run. `T1` to `T5` are the five registered tokens (the transport 
     `"x\n-----BEGIN PRIVATE KEY-----\nMII"` gives `"x\n[redacted]"`. P6:
     `"passphrase=hunter2&x=1"` gives `"passphrase=[redacted]&x=1"`; `"x=1&private_key=K&y=2"` gives
     `"x=1&private_key=[redacted]&y=2"`; `"{\"pass\":\"p\",\"user\":\"u\"}"` gives
-    `"{\"pass\":\"[redacted]\",\"user\":\"u\"}"`; `"otp: 123456 done"` gives `"otp: [redacted] done"`.
+    `"{\"pass\":\"[redacted]\",\"user\":\"u\"}"`; `"x otp: 123456 done"` gives `"x otp: [redacted] done"` (mid-line: at the start of a line P2 masks the whole line, so `"otp: 123456 done"` gives `"otp: [redacted]"`; orchestrator amendment 3 after R2).
     **Unchanged byte for byte:** `"0f8fad5b-d9cb-469f-a165-9b4f5e5a1d3c"`; `"0123456789abcdef"` x4;
     `"auth.example.com:8443"`; `"https://example.test/a/b?x=1&y=two#frag"`;
     `"ssh://git@github.com/o/r"`; `"git@github.com:o/r.git"`; `"basic information"`;

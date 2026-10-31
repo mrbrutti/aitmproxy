@@ -805,7 +805,7 @@ row of AC44 is the pass's bug, not the table's.
     KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----"`; and `"x\n-----BEGIN PRIVATE KEY-----\nMII"` gives
     `"x\n[redacted]"`. P6: `"passphrase=hunter2&x=1"` gives `"passphrase=[redacted]&x=1"`;
     `"x=1&private_key=K&y=2"` gives `"x=1&private_key=[redacted]&y=2"`; `"{\"pass\":\"p\",\"user\":\"u\"}"`
-    gives `"{\"pass\":\"[redacted]\",\"user\":\"u\"}"`; `"otp: 123456 done"` gives `"otp: [redacted] done"`.
+    gives `"{\"pass\":\"[redacted]\",\"user\":\"u\"}"`; `"x otp: 123456 done"` gives `"x otp: [redacted] done"` (mid-line: at the start of a line P2 masks the whole line, so `"otp: 123456 done"` gives `"otp: [redacted]"`; orchestrator amendment 3 after R2).
     **Unchanged:** `"https://example.test/a/b?x=1&y=two#frag"`; `"ssh://git@github.com/o/r"`;
     `"git@github.com:o/r.git"`; `"sk-prod-eu-1.example.test"`; `"AKIA"`; `"AKIAFOO"`; `"ghp_short"`;
     `"eyJ"`. Hostile inputs (under the same 20 s thread guard): 4 MiB each of `eyJ`, of an unterminated
