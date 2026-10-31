@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use aitm_bus_client::InProcessHandler;
 use aitm_core::{
-    AgentState, BrowserDriver, Config, EgressConfinement, FlowStore, Frontend, McpTransport,
-    PipelineClient, Proxy, ProxyClient, Registry, ScopeRateGuard,
+    AgentState, AuditRing, BrowserDriver, Config, EgressConfinement, FlowStore, Frontend,
+    McpTransport, PipelineClient, Proxy, ProxyClient, Registry, ScopeRateGuard,
 };
 use aitm_mcp::{ConnCtx, McpServer};
 use aitm_tui::{RunOptions, TransportChoice};
@@ -136,7 +136,9 @@ pub fn services(
 /// not here, because they differ by surface: the bare-`aitm` server path and
 /// the `aitm tui` loopback **agent** transport carry the gate (seeded from
 /// `mcp.policy`); the TUI's own in-process server is the operator and bypasses
-/// it (see [`build_servers`]).
+/// it (see [`build_servers`]). For an agent-facing server the gate and the
+/// audit ring come from [`with_shared_governance`], the other half of "wired by
+/// the caller".
 pub fn server(cfg: &Config, transport: McpTransport, services: &Services) -> McpServer {
     McpServer::new(services.registry.clone(), transport)
         .with_ssrf_policy(cfg.browser.ssrf.clone())
@@ -154,6 +156,35 @@ pub fn server(cfg: &Config, transport: McpTransport, services: &Services) -> Mcp
             services.guard.clone(),
             services.browser.clone(),
         )
+}
+
+/// Apply the shared agent policy and audit ring to `server`: the one function
+/// production (`main.rs`) and the tests share, so a test rig cannot pass while
+/// the binary is wired differently.
+///
+/// It shares **exactly** two things, the policy state (`agent_state`, which the
+/// `AgentPlugin`'s `agent.set` writes and the server's gate reads) and the audit
+/// ring (`audit_ring`, which `call_tool` appends to and `agent.activity` /
+/// `agent.status` read), by cloning the two `Arc`s from
+/// `wire::Assembled`. It applies nothing else: no push, no roles, no timeouts.
+///
+/// It does **not** share the `Ask` machinery. The subscription registry, the
+/// parked-request table, the confirm tokens and the connection ids stay per
+/// server. So `agent.approve` resolves only a call parked on the same server,
+/// and an `approval_requested` push reaches only the operators subscribed on
+/// that server. An approve sent to the other server is the plain "no parked
+/// request" error and approves nothing.
+///
+/// Residual risk: this makes tests and production share a function, not a
+/// guarantee. It cannot force a future third server to call it.
+pub fn with_shared_governance(
+    server: McpServer,
+    agent_state: &Arc<AgentState>,
+    audit_ring: &Arc<AuditRing>,
+) -> McpServer {
+    server
+        .with_agent_state(Arc::clone(agent_state))
+        .with_audit_ring(Arc::clone(audit_ring))
 }
 
 /// Where the tui-mode log goes: `explicit` (the value of [`LOG_PATH_ENV`])
@@ -308,6 +339,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aitm_core::{AgentPolicy, AuditResult};
 
     /// SEC-3: the default log is per process (`aitm-tui-<pid>.log`), so two
     /// `aitm tui` runs never share a file in the world-writable temp dir;
@@ -465,5 +497,143 @@ mod tests {
         );
         assert!(!proxy.egress().confined(), "and back off");
         let _ = std::fs::remove_dir_all(&cfg.ca.dir);
+    }
+
+    /// An assembled core plus its service handles, over a CA dir unique to this
+    /// run and removed on drop (so a failing assertion leaves nothing behind).
+    struct Governed {
+        cfg: Config,
+        assembled: crate::wire::Assembled,
+        services: Services,
+    }
+
+    impl Governed {
+        fn new(tag: &str) -> Self {
+            let mut cfg = Config::default();
+            cfg.ca.dir =
+                std::env::temp_dir().join(format!("aitm-tui-gov-{tag}-{}", std::process::id()));
+            let assembled = crate::wire::assemble(&cfg).expect("assemble");
+            let services = services(&assembled.proxy, &cfg, None, TuiLog::Off);
+            Self {
+                cfg,
+                assembled,
+                services,
+            }
+        }
+
+        /// One more `tui::server`, passed through the helper under test with
+        /// this fixture's own shared policy state and audit ring.
+        fn governed_server(&self) -> McpServer {
+            with_shared_governance(
+                server(&self.cfg, McpTransport::Stdio, &self.services),
+                &self.assembled.agent_state,
+                &self.assembled.audit_ring,
+            )
+        }
+    }
+
+    impl Drop for Governed {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.cfg.ca.dir);
+        }
+    }
+
+    /// One `tools/call` with no arguments on `conn`; the whole JSON-RPC reply.
+    fn call(srv: &McpServer, conn: &ConnCtx, name: &str) -> serde_json::Value {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": {}}
+        });
+        let resp = srv.handle_on(conn, &req.to_string()).expect("a response");
+        serde_json::from_str(&resp).expect("response is JSON")
+    }
+
+    /// AC8: a server passed through the helper is gated by the shared policy
+    /// state (an agent is refused under `paused`, with the policy's own reason),
+    /// records the refusal in the shared ring as one `Mcp`-origin entry, and
+    /// leaves the operator ungated.
+    #[test]
+    fn with_shared_governance_gates_an_agent_and_audits_into_the_shared_ring() {
+        let g = Governed::new("gate");
+        let srv = g.governed_server();
+        g.assembled.agent_state.set_policy(AgentPolicy::Paused);
+        let ring = &g.assembled.audit_ring;
+
+        let agent = ConnCtx::new(Frontend::Mcp);
+        let refused = call(&srv, &agent, "flow.list");
+        assert_eq!(
+            refused["result"]["isError"],
+            serde_json::json!(true),
+            "an agent call under `paused` is refused: {refused}"
+        );
+        let text = refused["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.contains("the agent policy is `paused`"),
+            "the refusal names the policy: {refused}"
+        );
+
+        assert_eq!(ring.len(), 1, "the refusal is one entry in the shared ring");
+        let entries = ring.recent(None, None);
+        assert_eq!(entries[0].origin, Frontend::Mcp);
+        assert_eq!(entries[0].command, "flow.list");
+        match &entries[0].result {
+            AuditResult::Error(reason) => {
+                assert!(reason.contains("paused"), "the recorded reason: {reason}");
+            }
+            other => panic!("expected an Error result, got {other:?}"),
+        }
+
+        let operator = ConnCtx::new(Frontend::Operator);
+        let listed = call(&srv, &operator, "flow.list");
+        assert_eq!(
+            listed["result"]["isError"],
+            serde_json::json!(false),
+            "the operator is not gated: {listed}"
+        );
+        assert_eq!(
+            listed["result"]["structuredContent"],
+            serde_json::json!([]),
+            "{listed}"
+        );
+        let from_agent = ring
+            .recent(None, None)
+            .iter()
+            .filter(|e| e.origin == Frontend::Mcp)
+            .count();
+        assert_eq!(from_agent, 1, "the operator's call is not an agent entry");
+    }
+
+    /// AC7: two servers built through the helper from one `Assembled` write one
+    /// trail. One agent call on each lands in the shared ring in call order, and
+    /// one `agent.activity` (served from that ring) lists both.
+    #[test]
+    fn with_shared_governance_gives_two_servers_one_audit_trail() {
+        let g = Governed::new("trail");
+        let first = g.governed_server();
+        let second = g.governed_server();
+        let agent = ConnCtx::new(Frontend::Mcp);
+
+        let listed = call(&first, &agent, "flow.list");
+        assert_eq!(listed["result"]["isError"], serde_json::json!(false));
+        let status = call(&second, &agent, "agent.status");
+        assert_eq!(status["result"]["isError"], serde_json::json!(false));
+
+        let ring = &g.assembled.audit_ring;
+        assert_eq!(ring.len(), 2, "both servers record into the one ring");
+        let entries = ring.recent(None, None);
+        assert_eq!(entries[0].command, "flow.list");
+        assert_eq!(entries[1].command, "agent.status");
+        assert_eq!(entries[0].origin, Frontend::Mcp);
+        assert_eq!(entries[1].origin, Frontend::Mcp);
+
+        let operator = ConnCtx::new(Frontend::Operator);
+        let activity = call(&first, &operator, "agent.activity");
+        let rows = &activity["result"]["structuredContent"];
+        assert_eq!(rows.as_array().map(Vec::len), Some(2), "{activity}");
+        assert_eq!(rows[0]["command"], serde_json::json!("flow.list"));
+        assert_eq!(rows[1]["command"], serde_json::json!("agent.status"));
+        assert_eq!(rows[0]["origin"], serde_json::json!("mcp"));
     }
 }
