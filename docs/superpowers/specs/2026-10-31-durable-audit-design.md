@@ -1347,8 +1347,10 @@ shortened intervals) so no test sleeps for the production intervals.
     path under a regular file exits non-zero within 5 s with a message containing the path and
     prints no `proxy listening` line (it failed before any listener was bound).
 38. **AC38** `[guard]` Harness hermeticity by grep (exit 0): `tests/e2e/aitm_e2e/core.py`,
-    `tests/e2e/cli/cli-startup.sh`, `scripts/bus-agent-check.py`, `scripts/tui-live-check.sh` and
-    `crates/aitm/tests/shutdown.rs` each contain `AITM_AUDIT_LOG`. The behaviour it relies on is AC2 (the env wins) and AC9 (a
+    `tests/e2e/run.py`, `tests/e2e/start/test_bus_endpoint_file.py`, `tests/e2e/cli/cli-startup.sh`,
+    `scripts/bus-agent-check.py`, `scripts/tui-live-check.sh` and
+    `crates/aitm/tests/shutdown.rs` each contain `AITM_AUDIT_LOG` (orchestrator amendment 2:
+    `run.py` and `test_bus_endpoint_file.py` also spawn the real binary). The behaviour it relies on is AC2 (the env wins) and AC9 (a
     path set that way is the only place files appear).
 
 **Docs, fences, gate**
@@ -1370,7 +1372,8 @@ shortened intervals) so no test sleeps for the production intervals.
     `git diff <merge-base>..HEAD -- Cargo.lock crates/aitm/Cargo.toml crates/aitm-mcp/Cargo.toml
     crates/aitm-core/Cargo.toml` is empty.
 41. **AC41** `[guard]` No existing test is edited (the exceptions are the one-line environment
-    addition to `crates/aitm/tests/shutdown.rs`, AC38, and the one e2e assertion of AC59), in
+    additions of AC38, in `crates/aitm/tests/shutdown.rs` and
+    `tests/e2e/start/test_bus_endpoint_file.py`, and the one e2e assertion of AC59), in
     particular `mcp.rs`
     `the_durable_audit_sink_keeps_every_entry_even_those_an_agent_may_not_read`,
     `audit_durable_connection_id.rs`, `crates/aitm-ca/tests/audit.rs`,
