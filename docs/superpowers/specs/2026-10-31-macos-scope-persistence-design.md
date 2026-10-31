@@ -283,7 +283,7 @@ is `await`ed (or the URL is injected at `EmbeddedCore.init` from
 
 ```swift
 @discardableResult private func refreshScope() async -> Bool   // true iff scope.list succeeded and session.scopeHosts was set
-private func persistEmbeddedScope()                              // iff preferEmbedded && !Store.usesFixtures: try? EmbeddedScope(hosts: session.scopeHosts).save(to: session.scopeURL)
+private func persistEmbeddedScope() throws                       // iff preferEmbedded && !Store.usesFixtures: save EmbeddedScope(hosts: session.scopeHosts) to session.scopeURL; a failed save throws BusError.tool("Scope change not saved: …") (panel amendment)
 ```
 
 After the verb **and** the refresh both succeed, persist
@@ -305,9 +305,9 @@ the precondition holds.)
 
 **(Architect's call)** `refreshScope` returns `Bool` so a succeeded `scope.add`
 followed by a failed `scope.list` does not persist a stale list; the next
-successful action re-syncs. **(Architect's call)** A failed save is swallowed
-(`try?`) exactly as `Pins`, `BreakpointRules` and `ColumnLayout` do; the
-in-memory scope stays correct for this run.
+successful action re-syncs. **(Architect's call, superseded by the panel amendment below)** A failed save
+was to be swallowed (`try?`) as `Pins`, `BreakpointRules` and `ColumnLayout` do;
+it is now an error of the action. The in-memory scope stays correct either way.
 
 ### D5. Launch display — `Session.init`
 
