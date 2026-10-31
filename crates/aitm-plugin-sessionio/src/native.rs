@@ -136,6 +136,12 @@ pub struct MetaRec {
     pub duration: Option<Duration>,
     pub truncated: bool,
     pub edited: bool,
+    /// Absent in documents written before capture attribution existed: loads as `None`.
+    #[serde(default)]
+    pub source_app: Option<String>,
+    /// Absent in documents written before capture attribution existed: loads as `None`.
+    #[serde(default)]
+    pub capture_interface: Option<String>,
 }
 
 /// Serde mirror of [`WsMessage`].
@@ -354,6 +360,8 @@ fn meta_to_rec(m: &FlowMeta) -> MetaRec {
         duration: m.duration,
         truncated: m.truncated,
         edited: m.edited,
+        source_app: m.source_app.clone(),
+        capture_interface: m.capture_interface.clone(),
     }
 }
 
@@ -366,6 +374,8 @@ fn rec_to_meta(m: &MetaRec) -> FlowMeta {
         duration: m.duration,
         truncated: m.truncated,
         edited: m.edited,
+        source_app: m.source_app.clone(),
+        capture_interface: m.capture_interface.clone(),
     }
 }
 
@@ -404,5 +414,50 @@ fn rec_to_ws_msg(m: &WsMsgRec) -> WsMessage {
         data: m.data.clone(),
         timestamp: m.timestamp,
         injected: m.injected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `meta` object in the shape written before `source_app` /
+    /// `capture_interface` existed (SA-AC7). `serde_json` renders `SystemTime` as
+    /// `{secs_since_epoch, nanos_since_epoch}`, which is what an older document holds.
+    const PRE_ATTRIBUTION_META: &str = r#"{
+        "marks": ["m"],
+        "comment": null,
+        "is_replay": false,
+        "created": {"secs_since_epoch": 1, "nanos_since_epoch": 0},
+        "duration": null,
+        "truncated": false,
+        "edited": false
+    }"#;
+
+    /// An older document's `meta` (no attribution keys) still loads, as `None`/`None`.
+    #[test]
+    fn meta_rec_without_attribution_loads_as_none() {
+        let rec: MetaRec =
+            serde_json::from_str(PRE_ATTRIBUTION_META).expect("the pre-change shape parses");
+        let meta = rec_to_meta(&rec);
+        assert_eq!(meta.source_app, None);
+        assert_eq!(meta.capture_interface, None);
+        assert_eq!(meta.marks, vec!["m".to_string()], "the rest still loads");
+    }
+
+    /// The two attribution fields survive `meta_to_rec` → serialise → deserialise →
+    /// `rec_to_meta` unchanged (SA-AC7).
+    #[test]
+    fn attribution_round_trips_the_native_format() {
+        let meta = FlowMeta {
+            source_app: Some("com.apple.Safari".into()),
+            capture_interface: Some("macos-ne".into()),
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&meta_to_rec(&meta)).expect("serialises");
+        let rec: MetaRec = serde_json::from_str(&text).expect("deserialises");
+        let back = rec_to_meta(&rec);
+        assert_eq!(back.source_app.as_deref(), Some("com.apple.Safari"));
+        assert_eq!(back.capture_interface.as_deref(), Some("macos-ne"));
     }
 }

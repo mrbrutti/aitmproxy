@@ -79,6 +79,19 @@ impl ProtocolModule for WsModule {
     }
 }
 
+/// The metadata a WebSocket flow starts with, given its handshake `HttpFlow`'s:
+/// exactly the capture attribution (`source_app`, `capture_interface`) is
+/// inherited, so the conversation is attributed to the same client process and
+/// backend as the 101 that opened it. Marks, comment, replay flag and timing are
+/// the WebSocket flow's own and start fresh.
+pub(crate) fn inherit_attribution(handshake: &FlowMeta) -> FlowMeta {
+    FlowMeta {
+        source_app: handshake.source_app.clone(),
+        capture_interface: handshake.capture_interface.clone(),
+        ..FlowMeta::default()
+    }
+}
+
 /// Relay frames between the client and the already-upgraded upstream,
 /// capturing and dispatching each one, until either side closes.
 async fn drive(
@@ -92,8 +105,8 @@ async fn drive(
     let mut upstream = ctx
         .take_upstream()
         .ok_or_else(|| anyhow!("WebSocket module spawned without the upgraded upstream"))?;
-    let (client_conn, server_conn) = match ctx.store().get(handshake) {
-        Some(Flow::Http(h)) => (h.client_conn, h.server_conn),
+    let (client_conn, server_conn, meta) = match ctx.store().get(handshake) {
+        Some(Flow::Http(h)) => (h.client_conn, h.server_conn, h.metadata),
         _ => bail!("handshake flow {handshake} is not a stored HttpFlow"),
     };
 
@@ -116,7 +129,7 @@ async fn drive(
         messages: Vec::new(),
         client_conn,
         server_conn,
-        metadata: FlowMeta::default(),
+        metadata: inherit_attribution(&meta),
         intercept: InterceptState::Observed,
     }));
 
@@ -303,4 +316,31 @@ async fn handle(
 /// panic elsewhere must not drop the live WebSocket out of its relay loop.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SA-AC0: a WebSocket flow inherits exactly the handshake's capture attribution.
+    /// Marks, comment, replay flag and timing are the WebSocket flow's own.
+    #[test]
+    fn inherit_attribution_copies_only_the_two_fields() {
+        let handshake = FlowMeta {
+            source_app: Some("com.apple.Safari".into()),
+            capture_interface: Some("macos-ne".into()),
+            marks: vec!["x".into()],
+            comment: Some("c".into()),
+            is_replay: true,
+            ..FlowMeta::default()
+        };
+
+        let meta = inherit_attribution(&handshake);
+
+        assert_eq!(meta.source_app, Some("com.apple.Safari".into()));
+        assert_eq!(meta.capture_interface, Some("macos-ne".into()));
+        assert!(meta.marks.is_empty());
+        assert_eq!(meta.comment, None);
+        assert!(!meta.is_replay);
+    }
 }

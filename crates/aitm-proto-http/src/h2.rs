@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use aitm_core::{
-    Authority, Body, Event, Flow, FlowId, FlowMeta, HeaderMap, HttpFlow, HttpRequest, HttpResponse,
+    Authority, Body, Event, Flow, FlowId, HeaderMap, HttpFlow, HttpRequest, HttpResponse,
     HttpVersion, InterceptState, StreamBody,
 };
 use aitm_plugin::{ByteStream, ModuleCtx};
@@ -357,7 +357,7 @@ async fn stream_task(
         response: None,
         client_conn: conn.client_conn.clone(),
         server_conn: conn.server_conn.clone(),
-        metadata: FlowMeta::default(),
+        metadata: conn.flow_meta(),
         intercept: InterceptState::Observed,
     }));
     ctx.emit(Event::RequestHeaders(id)).await;

@@ -94,6 +94,10 @@ pub struct CapturedTcpFlow {
     pub first_bytes: Vec<u8>,
     /// The source-app signing identity, if the backend knows it (macOS `SourceAppId`).
     pub peer_identity: Option<String>,
+    /// The capture backend's interface name — the string an operator's L4 scope names
+    /// it by (the macOS NE backend sends `"macos-ne"`). Supplied by the backend's
+    /// adapter; the ingress copies it onto the hint and knows no backend's name.
+    pub interface: String,
 }
 
 /// What the ingress did with a captured TCP/stream flow.
@@ -226,6 +230,11 @@ impl CoreIngress {
             alpn: Vec::new(),
             first_bytes: flow.first_bytes,
             from_upgrade: false,
+            // The attribution the backend observed rides the hint to the claiming
+            // module, which stamps it on the flows it stores. Copied, not interpreted:
+            // the identity is data about the client, never a scope input.
+            peer_identity: flow.peer_identity.take(),
+            capture_interface: Some(flow.interface.clone()),
         };
 
         match sd.modules.iter().find(|m| m.matches(&hint)).cloned() {
@@ -647,6 +656,7 @@ mod tests {
             sni: Some("example.com".to_string()),
             first_bytes: vec![0x16, 0x03, 0x01],
             peer_identity: None,
+            interface: "test-if".to_string(),
         };
 
         assert_eq!(ingress.dispatch_tcp(flow).await, StreamOutcome::Dispatched);
@@ -671,6 +681,59 @@ mod tests {
             "the hint carries the authoritative original dst, not a socket peer"
         );
         assert_eq!(hint.client_hello_sni.as_deref(), Some("example.com"));
+        assert_eq!(
+            hint.peer_identity, None,
+            "a backend that sent no identity yields none — never a placeholder"
+        );
+        assert_eq!(
+            hint.capture_interface.as_deref(),
+            Some("test-if"),
+            "the backend's interface name rides the hint as the ingress received it"
+        );
+    }
+
+    /// SA-AC0: the source-app identity and the backend's interface name a captured
+    /// flow arrives with ride the hint the claiming module is spawned with, verbatim.
+    /// The ingress copies the interface name; it does not know any backend's.
+    #[tokio::test]
+    async fn captured_tcp_identity_rides_the_hint() {
+        let spawn_calls = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::new(Mutex::new(None));
+        let module: Arc<dyn ProtocolModule> = Arc::new(StubModule {
+            claims: true,
+            spawn_calls: spawn_calls.clone(),
+            recorded: recorded.clone(),
+        });
+        let connector: Arc<dyn UpstreamConnector> = Arc::new(MockConnector {
+            dial_calls: Arc::new(AtomicUsize::new(0)),
+            upstream: Mutex::new(None),
+        });
+        let ingress = CoreIngress::empty().with_stream(
+            Arc::from(vec![module]),
+            store(),
+            Arc::new(MockSink),
+            connector,
+            Arc::new(MockGuard::fixed(true)),
+        );
+
+        let flow = CapturedTcpFlow {
+            stream: dummy_stream(),
+            dst: "93.184.216.34:443".parse().unwrap(),
+            sni: Some("example.com".to_string()),
+            first_bytes: vec![0x16, 0x03, 0x01],
+            peer_identity: Some("com.apple.Safari".to_string()),
+            interface: "macos-ne".to_string(),
+        };
+
+        assert_eq!(ingress.dispatch_tcp(flow).await, StreamOutcome::Dispatched);
+        assert_eq!(spawn_calls.load(Ordering::SeqCst), 1);
+        let hint = recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .expect("the module recorded its hint");
+        assert_eq!(hint.peer_identity.as_deref(), Some("com.apple.Safari"));
+        assert_eq!(hint.capture_interface.as_deref(), Some("macos-ne"));
     }
 
     /// AC17 (stream half): an out-of-scope flow is refused before any module match,
@@ -702,6 +765,7 @@ mod tests {
             sni: Some("example.com".to_string()),
             first_bytes: vec![0x16, 0x03, 0x01],
             peer_identity: None,
+            interface: "test-if".to_string(),
         };
 
         assert_eq!(ingress.dispatch_tcp(flow).await, StreamOutcome::Refused);
@@ -748,6 +812,7 @@ mod tests {
                 sni: sni.map(str::to_string),
                 first_bytes: b"GET / HTTP/1.1\r\n".to_vec(),
                 peer_identity: None,
+                interface: "test-if".to_string(),
             })
             .await
     }
@@ -918,6 +983,7 @@ mod tests {
             sni: Some("example.com".to_string()),
             first_bytes: b"GET / HTTP/1.1\r\n".to_vec(),
             peer_identity: None,
+            interface: "test-if".to_string(),
         };
 
         let (outcome, _) = tokio::join!(ingress.dispatch_tcp(flow), async {
@@ -978,6 +1044,7 @@ mod tests {
             sni: Some("example.com".to_string()),
             first_bytes: b"GET / HTTP/1.1\r\n".to_vec(),
             peer_identity: None,
+            interface: "test-if".to_string(),
         };
 
         assert_eq!(

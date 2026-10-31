@@ -98,6 +98,8 @@ async fn toy_module_claims_and_drives() {
         alpn: vec![],
         first_bytes: vec![],
         from_upgrade: false,
+        peer_identity: None,
+        capture_interface: None,
     };
     assert!(module.matches(&hint), "module should claim port 9999");
 

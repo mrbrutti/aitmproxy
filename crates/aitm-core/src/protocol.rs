@@ -48,6 +48,15 @@ pub struct NextLayerHint {
     pub first_bytes: Vec<u8>,
     /// `true` when handed off from an HTTP upgrade.
     pub from_upgrade: bool,
+    /// The signing identifier of the process that opened the client connection, as
+    /// a capture backend observed it. `None` on the explicit-proxy path; set by a
+    /// capture ingress. Backend-supplied text about a client: carried as data, never
+    /// a scope or guard input.
+    pub peer_identity: Option<String>,
+    /// The capture backend that delivered the client connection (its interface
+    /// name, `"macos-ne"`). `None` on the explicit-proxy path; set by a capture
+    /// ingress.
+    pub capture_interface: Option<String>,
 }
 
 /// Dispatches an event through the ordered plugin chain. Implemented in Task 8 by

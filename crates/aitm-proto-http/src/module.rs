@@ -264,7 +264,8 @@ impl HttpModule {
             if next.first() == Some(&TLS_HANDSHAKE) {
                 self.mitm(client, ctx, peer, Some(target)).await
             } else {
-                let conn = Conn::plain(peer, Some((target.authority(), target.addr)));
+                let conn = Conn::plain(peer, Some((target.authority(), target.addr)))
+                    .with_attribution(ctx.hint());
                 serve(
                     &ctx,
                     Box::pin(client),
@@ -283,7 +284,7 @@ impl HttpModule {
                 Box::pin(client),
                 None,
                 None,
-                Conn::plain(peer, None),
+                Conn::plain(peer, None).with_attribution(ctx.hint()),
                 self.max_body_bytes,
             )
             .await
@@ -385,7 +386,10 @@ impl HttpModule {
                 tls: true,
                 established: now,
             }),
-        };
+            source_app: None,
+            capture_interface: None,
+        }
+        .with_attribution(ctx.hint());
 
         // Branch on the negotiated protocol: h2 runs the per-stream `serve_h2`
         // driver; everything else runs the h1 `serve` loop.
@@ -480,12 +484,20 @@ pub(crate) struct Conn {
     pub(crate) tunnel_addr: Option<SocketAddr>,
     pub(crate) client_conn: ConnInfo,
     pub(crate) server_conn: Option<ConnInfo>,
+    /// The signing identifier of the client process, as the capture backend that
+    /// delivered this connection observed it (the hint's `peer_identity`). `None`
+    /// on a proxied connection. Stamped on every flow the connection carries.
+    pub(crate) source_app: Option<String>,
+    /// The capture backend that delivered this connection (the hint's
+    /// `capture_interface`). `None` on a proxied connection.
+    pub(crate) capture_interface: Option<String>,
 }
 
 impl Conn {
     /// A cleartext connection. `tunnel` is the `CONNECT` authority and the
     /// address it resolved to, for a connection inside a tunnel, and `None` for
-    /// a forward-proxy connection.
+    /// a forward-proxy connection. No capture attribution; see
+    /// [`Conn::with_attribution`].
     fn plain(peer: SocketAddr, tunnel: Option<(String, SocketAddr)>) -> Self {
         let (tunnel_authority, tunnel_addr) = match tunnel {
             Some((authority, addr)) => (Some(authority), Some(addr)),
@@ -503,6 +515,30 @@ impl Conn {
                 established: SystemTime::now(),
             },
             server_conn: None,
+            source_app: None,
+            capture_interface: None,
+        }
+    }
+
+    /// Take the capture attribution the acceptor's hint carries (`peer_identity`,
+    /// `capture_interface`). With no hint, or a hint from the explicit-proxy path,
+    /// both stay `None`.
+    fn with_attribution(mut self, hint: Option<&NextLayerHint>) -> Self {
+        if let Some(h) = hint {
+            self.source_app = h.peer_identity.clone();
+            self.capture_interface = h.capture_interface.clone();
+        }
+        self
+    }
+
+    /// A fresh [`FlowMeta`] for a flow on this connection: exactly the capture
+    /// attribution is carried over; marks, comment, replay flag and timing are
+    /// the flow's own.
+    pub(crate) fn flow_meta(&self) -> FlowMeta {
+        FlowMeta {
+            source_app: self.source_app.clone(),
+            capture_interface: self.capture_interface.clone(),
+            ..FlowMeta::default()
         }
     }
 }
@@ -594,7 +630,7 @@ async fn serve(
                             response: None,
                             client_conn: conn.client_conn.clone(),
                             server_conn: conn.server_conn.clone(),
-                            metadata: FlowMeta::default(),
+                            metadata: conn.flow_meta(),
                             intercept: InterceptState::Observed,
                         }));
                         // A client that sent `Expect: 100-continue` holds its body
@@ -1032,6 +1068,10 @@ async fn serve(
                 alpn: vec![protocol],
                 first_bytes: client_rest.clone(),
                 from_upgrade: true,
+                // The re-dispatched module sees the same attribution this
+                // connection's flows were stamped with.
+                peer_identity: conn.source_app.clone(),
+                capture_interface: conn.capture_interface.clone(),
             };
             let client_io: ByteStream = Box::pin(Prefixed::with_prefix(client, client_rest));
             let upstream_io: ByteStream = Box::pin(Prefixed::with_prefix(upstream_io, server_rest));
@@ -2384,6 +2424,8 @@ mod tests {
                 tls: true,
                 established: SystemTime::UNIX_EPOCH,
             }),
+            source_app: None,
+            capture_interface: None,
         }
     }
 
@@ -3667,6 +3709,8 @@ mod tests {
                 established: SystemTime::now(),
             },
             server_conn: None,
+            source_app: None,
+            capture_interface: None,
         };
         let (mut client, proxy_side) = duplex(64 * 1024);
 
@@ -3759,11 +3803,83 @@ mod tests {
         );
         assert!(!flow.metadata.truncated);
         assert_eq!(flow.metadata.marks, Vec::<String>::new());
+        // A proxied connection has no capture attribution: both are `None`, never
+        // a placeholder.
+        assert_eq!(flow.metadata.source_app, None);
+        assert_eq!(flow.metadata.capture_interface, None);
         assert!(
             matches!(flow.intercept, InterceptState::Observed),
             "intercept: {:?}",
             flow.intercept
         );
+    }
+
+    // ---- capture attribution (SA-AC0) ------------------------------------
+
+    /// `Conn::flow_meta` carries exactly the attribution onto a fresh `FlowMeta`:
+    /// marks, comment, replay flag and timing are each flow's own.
+    #[test]
+    fn conn_flow_meta_carries_only_attribution() {
+        let mut conn = Conn::plain(unknown_peer(), None);
+        conn.source_app = Some("com.apple.Safari".into());
+        conn.capture_interface = Some("macos-ne".into());
+
+        let meta = conn.flow_meta();
+
+        assert_eq!(meta.source_app, Some("com.apple.Safari".into()));
+        assert_eq!(meta.capture_interface, Some("macos-ne".into()));
+        assert!(meta.marks.is_empty());
+        assert!(!meta.is_replay);
+        assert_eq!(meta.comment, None);
+    }
+
+    /// SA-AC0: the attribution a capture ingress puts on the hint (`peer_identity`,
+    /// `capture_interface`) reaches the flow the module stores for a cleartext
+    /// request served through `spawn`, as `source_app` / `capture_interface`.
+    #[tokio::test]
+    async fn drive_stamps_the_hint_attribution_on_the_stored_flow() {
+        let (up, origin_end) = duplex(64 * 1024);
+        let store = Arc::new(MemFlowStore::new());
+        let (ctx, _dialed) = ctx_with_sink(vec![Box::pin(up)], store.clone(), Arc::new(NoSink));
+        let ctx = ctx.with_hint(NextLayerHint {
+            dst: unknown_peer(),
+            is_tls: false,
+            client_hello_sni: None,
+            alpn: vec![],
+            first_bytes: b"GET ".to_vec(),
+            from_upgrade: false,
+            peer_identity: Some("com.apple.Safari".into()),
+            capture_interface: Some("macos-ne".into()),
+        });
+        let _origin = tokio::spawn(origin_serve(origin_end, vec!["first"], true));
+        let module = HttpModule::new();
+
+        let (mut client, proxy_side) = duplex(64 * 1024);
+        let serving = module.spawn(Box::pin(proxy_side), ctx);
+        let script = async {
+            let body = client_get(&mut client, "/one", "127.0.0.1:8080").await;
+            // Hang up, so the module sees the client finish and returns.
+            drop(client);
+            body
+        };
+        let (served, body) =
+            tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                .await
+                .expect("spawn hung: the request went to an upstream that never answers");
+        served.expect("the module ends cleanly when the client hangs up");
+        assert_eq!(body, "first");
+
+        // `spawn` took the context, so read the flow back through the shared store.
+        let flow = store
+            .list()
+            .into_iter()
+            .find_map(|id| match store.get(id) {
+                Some(Flow::Http(f)) if f.request.path == "/one" => Some(f),
+                _ => None,
+            })
+            .expect("a stored flow for /one");
+        assert_eq!(flow.metadata.source_app, Some("com.apple.Safari".into()));
+        assert_eq!(flow.metadata.capture_interface, Some("macos-ne".into()));
     }
 
     /// A taint lasts for one replacement. Once the new upstream is in place the

@@ -190,8 +190,10 @@ async fn adapt_udp(
 
 /// Map a TCP [`FlowOpen`] and its sniffed stream onto the ingress's own
 /// [`CapturedTcpFlow`]: `remote → dst`, `remote_hostname → sni`,
-/// `source_app → peer_identity`. The destination is the **authoritative original**
-/// endpoint the provider observed, not an accepted-socket peer.
+/// `source_app → peer_identity`, and the flow is tagged with [`CAPTURE_INTERFACE`]
+/// so the stored flow can name the backend that delivered it. The destination is
+/// the **authoritative original** endpoint the provider observed, not an
+/// accepted-socket peer.
 fn tcp_flow(open: &FlowOpen, stream: ByteStream, first_bytes: Vec<u8>) -> CapturedTcpFlow {
     CapturedTcpFlow {
         stream,
@@ -199,6 +201,7 @@ fn tcp_flow(open: &FlowOpen, stream: ByteStream, first_bytes: Vec<u8>) -> Captur
         sni: open.remote_hostname.clone(),
         first_bytes,
         peer_identity: open.source_app.clone(),
+        interface: CAPTURE_INTERFACE.to_string(),
     }
 }
 
@@ -380,7 +383,8 @@ mod tests {
     }
 
     /// The TCP mapping carries the authoritative remote, the SNI, the source-app
-    /// identity (→ `peer_identity`), and the sniffed `first_bytes`.
+    /// identity (→ `peer_identity`), the sniffed `first_bytes`, and tags the flow
+    /// with the NE capture interface.
     #[test]
     fn tcp_flow_maps_every_handoff_field() {
         let open = tcp_open();
@@ -394,6 +398,10 @@ mod tests {
             "source_app maps onto peer_identity"
         );
         assert_eq!(flow.first_bytes, first);
+        assert_eq!(
+            flow.interface, CAPTURE_INTERFACE,
+            "the adapter, not the ingress, names the backend"
+        );
     }
 
     /// The UDP mapping tags the flow with the NE capture interface and the

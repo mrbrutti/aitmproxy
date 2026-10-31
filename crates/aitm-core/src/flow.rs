@@ -214,6 +214,14 @@ pub struct FlowMeta {
     /// inspector's "Edited" flag; the original is recoverable while the flow is
     /// still intercepted (`InterceptState::Intercepted { backup }`).
     pub edited: bool,
+    /// The signing identifier of the process that opened the client connection, as a
+    /// capture backend observed it (macOS NE: `com.apple.Safari`). `None` for a
+    /// proxied flow. Backend-supplied text about a client: data to store and show,
+    /// never a scope or guard input.
+    pub source_app: Option<String>,
+    /// The capture backend that delivered the client connection (`"macos-ne"`). `None`
+    /// for a proxied flow.
+    pub capture_interface: Option<String>,
 }
 
 impl Default for FlowMeta {
@@ -226,6 +234,8 @@ impl Default for FlowMeta {
             duration: None,
             truncated: false,
             edited: false,
+            source_app: None,
+            capture_interface: None,
         }
     }
 }
