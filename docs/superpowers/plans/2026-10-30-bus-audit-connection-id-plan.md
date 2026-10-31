@@ -299,7 +299,37 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| plan | spec (pre-panel) | Minor | The orchestrator's first-pass doubt that AC21's operator count was 6 | retracted: the operator's own `agent.activity` is audited, so 6 is right (spec status line reworded, plan Ambiguity 1) |
+| T17 | orchestrator run | Minor | The unedited `neg/test_nonexistent_flow_error.py` fails first at `agent.activity has >= 70 entries (63)`, not at the `flow.export` check the plan names | same cause (an agent no longer reads operator entries); the one-line `op or rd` fix clears both, green run recorded |
+| whole branch | tester | Important-grade gaps | AC4 (count window), AC3 (`since`), AC5 (control/scrub order), AC11 (length only), AC12 (dedup), AC13 to AC15 each had a test that survived the removal of its behaviour | fixed in 108bf98: 18 tests, each mutation-checked in a scratch copy |
+| whole branch | spec | Minor | Spec "Hot path" sentence false: `connection_id` is built once in `run_tool` and again in `record_audit` | fixed in c8c249a (spec reworded to "one or two") |
+| whole branch | spec | Minor | Commit subjects use `test(...)` and an ASCII hyphen where the plan's convention line shows `feat(...)` and an em dash | accepted (orchestrator, 2026-10-30, standing autonomy rule): the terminal refuses non-ASCII, `test(...)` is the honest prefix; squash merge makes it moot |
+| whole branch | security | Minor | `cap_client_label` turned `\t \n \r` into `?` before the scrub, so `"agent Bearer\tabc123"` kept its token | fixed in c8c249a (whitespace controls become a space; three red-first tests) |
+| whole branch | security | Minor | Bidi, zero-width and BOM characters pass through the label (display spoofing in operator tables) | fixed in c8c249a (explicit range list replaced by `?`; red-first tests including range edges) |
+| whole branch | security | Minor | The id is salt plus per-server ordinal, so an agent can compute lower-numbered ids; hidden-entry volume is observable from ring aging | accepted (orchestrator, 2026-10-30): the id is not a secret and nothing accepts it as input; unforgeability rests on the server stamping it from `ConnCtx`. Spec D1 exposure text, the anti-goal, R7 and wire-contract note 6 reworded in c8c249a |
+| whole branch | security | hardening | `AuditRing::recent` stays `pub` and unfiltered; no scan test guards a future role-facing caller | not done: deleting `count_since` and a doc warning in c8c249a; a `trust_gate_scan`-style tripwire is a follow-up (renaming `recent` would edit base test lines, AC24) |
+| whole branch | quality | Minor | `AuditRing::count_since` dead code with false docs; stale `ConnCtx`, `conn_id` and module docs | fixed in c8c249a |
+| whole branch | quality | Minor | `fanout_audit` a fourth copy of the dedup loop | fixed in c8c249a (`fanout_where`) |
+| whole branch | quality | Minor | `prefix_at_char_boundary` hand-rolls `floor_char_boundary`; `McpServer::connection_id` pub without a caller | fixed in c8c249a |
+| whole branch | quality | Minor | Process-narrating comments; the unforgeability sentence repeated at seven sites; false "integration tests cannot share a module" comment | fixed in c8c249a (one full statement at `McpServer::connection_id`, pointers elsewhere; rig comment corrected) |
+| whole branch | quality | Minor | Two tests duplicate others (`the_cli_viewer_reads_and_counts_every_origin`, `cap_client_label_huge_multibyte_name_is_cut_not_split`) | fixed in c8c249a (deleted) |
+| whole branch | quality | Minor | About 400 further test lines "deletable", tests pinning marker text such as `[redacted]`, redundant assertions | accepted (orchestrator, 2026-10-30): each kept test failed under a targeted mutation in the tester run; marker text is pinned by one function, `scrub_text` |
+| whole branch | quality | Minor | Test helper duplication in `mcp.rs` and the audit unit tests; the `/bus` rig copied a sixth time | accepted (orchestrator, 2026-10-30): AC24 forbids editing the donor tests, so copying is the price; migrating the six copies into `tests/support/` is a follow-up |
+| whole branch | quality | Minor | `connection_id` computed twice per audited call | accepted: a ~40-byte allocation; spec reworded, no plumbing added |
+| fix task | coder | open point | No sandbox test exercised the `fanout_role` role check after the `fanout_where` refactor | covered by `web_bus_push::agent_role_never_gets_operator_only_pushes`, run in the Terminal panel in the final gate |
+
+Acceptances marked "orchestrator" were made under Matt's standing autonomous-approval rule and are listed in the PR so Matt can overrule any of them.
 
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7.
+**What merged:** a server-minted opaque `connection_id` (`conn_<16 hex salt>-<ordinal>`, null when there is no streaming connection) on every audit entry (ring, `notifications/aitm/agent`, `agent.activity`, durable JSONL) and on the `initialize` result next to `role`; `client_label` capped at 128 bytes, sanitised and scrubbed at its one ingestion site; audit entries of trusted-control origin hidden from agent-role viewers on push, on `agent.activity` and in the count, through one predicate `AuditEntry::visible_to`; and an optional `agent.status {exclude_self}` keyed on the caller's server-assigned id. Server and tests only, nothing under `apps/`.
+
+**What was cut or left out:** attributing HTTP POST and embedded-TUI calls to a connection (they carry null); wiring `with_durable_audit` in production; making `actions_last_minute` agent-origin only for everyone (spec OQ2).
+
+**Follow-ups (none is in this PR):**
+1. `apps/web`: read `connection_id` from the `initialize` result, drop exactly its own background reads on `line.connection_id === bus.connectionId()` (spec's wire-contract table lists what the UI may rely on), feature-detect `exclude_self` before sending it, and retire the origin-based same-token residual in `bus/noise.ts`. Because the UI's default link is the agent token, it will no longer receive operator-origin lines; the operator link shows them.
+2. A `trust_gate_scan`-style tripwire that fails when `crates/*/src` calls the unfiltered `AuditRing::recent` from a role-facing path.
+3. Move the copied loopback `/bus` rig into `crates/aitm/tests/support/` and migrate the six copies.
+4. Regenerate `aitmproxy-plugin/docs/tool-reference.md` and refresh `docs/research/mcp-tool-catalog.txt`: both still quote the old `agent.status` and `agent.activity` descriptions.
+5. U+2028 and U+2029 are not neutralised in the label (some UIs render them as line breaks).
+6. Plan text that predates the panel fixes: Task 6 says `connection_id` is `pub` (now private) and Task 2 says the unfiltered `count_since` stays (deleted); the spec's Constraints section still says the same about `count_since`.
