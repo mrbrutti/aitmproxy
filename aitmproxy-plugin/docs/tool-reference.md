@@ -121,9 +121,9 @@ elevated privileges, is Linux-first, and is not listed here.
 
 | Tool | Parameters | Description |
 | --- | --- | --- |
-| `agent.status` | — | Report the current agent policy and recent agent activity. Read-only and readable by any role. |
+| `agent.status` | `[--exclude_self <true\|false>]` | Report the current agent policy and recent agent activity. Read-only and readable by any role, but the activity count covers only the entries the caller may see: a caller that is not trusted control does not count entries made by trusted control (operator, CLI). |
 | `agent.set` | `--policy <string>` | Set the agent policy (all \| auto \| ask \| readonly \| paused). The deliberate operator act that governs the agent — operator/CLI only; the agent cannot change its own policy. |
-| `agent.activity` | `[--since <int>] [--limit <int>]` | Recent command-invocation audit entries (who ran what, with what redacted arguments, and the outcome), oldest first. Read-only and readable by any role. |
+| `agent.activity` | `[--since <int>] [--limit <int>]` | Recent command-invocation audit entries (who ran what, with what redacted arguments, and the outcome), oldest first. A live view, not a complete record: a high-volume source can flush other sources' entries. `origin` is authoritative; `client_label` is an unauthenticated display string. A call with no `limit` can return at most 6144 entries at the default sizes, so pass `limit`. Read-only and readable by any role, but a caller that is not trusted control does not see entries made by trusted control (operator, CLI). |
 | `agent.approve` | `--request_id <string> --allow <true\|false>` | Approve or deny a Sensitive agent command the server parked under the `ask` policy. Operator/CLI only; the agent cannot approve its own requests. |
 
 ## `script.*`

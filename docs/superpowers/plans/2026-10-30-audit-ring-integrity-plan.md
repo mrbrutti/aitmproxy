@@ -749,29 +749,29 @@ Kept by the main session during stage 6. One row per finding.
 | whole branch (round 1) | quality | Minor | Fair-share doc comment wrong | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6) |
 | whole branch (round 1) | quality | Minor | Sanitiser idempotence claim not literally true | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6): doc, spec wording, new test |
 | whole branch (round 1) | quality | Minor | `since` filter on `recent` untested | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6): new test |
-| whole branch (round 1) | quality | Minor | AC23 floor assertion loose | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: the spec's floor is the contract |
+| whole branch (round 1) | quality | Minor | AC23 floor assertion loose | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); countersigned by the user in the session on 2026-10-31 ("I approve everything"): the spec's floor is the contract |
 | whole branch (round 1) | quality | Minor | Loop-table tests stop at the first failing row | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6): for the new tests only |
 | whole branch (round 1) | quality | Minor | `ends_value` and `closing_quote` duplicated in core and scanner | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6): cross-reference comments; consolidation is the named follow-up "scanner vocabulary consolidation" |
 | whole branch (round 1) | quality | Minor | Stale or overclaiming doc comments | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6) |
-| whole branch (round 1) | quality | Minor | `Lane::insert` does needless work | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: about 0.8 us per append under the mutex, off the hot path |
+| whole branch (round 1) | quality | Minor | `Lane::insert` does needless work | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); countersigned by the user in the session on 2026-10-31 ("I approve everything"): about 0.8 us per append under the mutex, off the hot path |
 | whole branch (round 1) | spec | Minor | Module doc lacks the label rules | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6) |
 | whole branch (round 1) | spec | Minor | Newline blanks in the pair pass not in the spec | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6): spec text (Design 4, Residual risk 6) |
 | whole branch (round 1) | spec | Minor | Residual risk not documented | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6): residuals added |
-| whole branch (round 1) | spec | Minor | Extra tests and a doc clause beyond the spec | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: tests and doc only |
+| whole branch (round 1) | spec | Minor | Extra tests and a doc clause beyond the spec | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); countersigned by the user in the session on 2026-10-31 ("I approve everything"): tests and doc only |
 | whole branch (round 1) | spec | Minor | Spec and plan statements not literally true | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6): wording |
 | whole branch (round 2) | spec | Important | AC36, AC37 and AC38 test names in the spec and plan differ from the tests as built | fixed in 1798ec6 (fix task 2; docs 55e8da7): spec and plan aligned to the built names (AC36 lists all three tests, AC38 both) |
 | whole branch (round 2) | spec | Important | AC38 test gap: no negative control and no check over the whole dropped set | fixed in 1798ec6 (fix task 2; docs 55e8da7): negative controls (`webbridges`, `aitm-mac\u{3164}`) and a loop over the dropped set added (`sanitize_client_label_drops_every_invisible_character`) |
 | whole branch (round 2) | spec | Minor | Design 4 and plan Task 2 text out of step with the code (key run, end-of-value set, "stricter of the two" claim, built signatures) | fixed in 1798ec6 (fix task 2; docs 55e8da7): spec Design 4, plan Task 2 note |
 | whole branch (round 2) | spec | Minor | Isolation overclaims in the spec itself | fixed in 1798ec6 (fix task 2; docs 55e8da7): spec Goals, Design 1 (floor, why both lanes), Semantics table, Residual risks 2, Summary |
 | whole branch (round 2) | spec | Minor | Wording leftovers (doc strings) | fixed in 1798ec6 (fix task 2; docs 55e8da7) |
-| whole branch (round 2) | security | Minor | A quoted key opener directly after an unclosed quote that ends in `=` or `:` can still be swallowed | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: a narrow regression versus the old regex for text where an unclosed `=`/`:`-ending quote sits directly before a victim's quoted key; accepted as Residual risks 12 (the old regex leaked the simpler adjacent `token= "password":"V"` identically) |
+| whole branch (round 2) | security | Minor | A quoted key opener directly after an unclosed quote that ends in `=` or `:` can still be swallowed | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); countersigned by the user in the session on 2026-10-31 ("I approve everything"): a narrow regression versus the old regex for text where an unclosed `=`/`:`-ending quote sits directly before a victim's quoted key; accepted as Residual risks 12 (the old regex leaked the simpler adjacent `token= "password":"V"` identically) |
 | whole branch (round 2) | security | Minor | Reserved-name guard bypassable with invisible code points outside the dropped set | fixed in 1798ec6 (fix task 2; docs 55e8da7): skeleton comparison, spec Design 2 item 3, AC38 |
 | whole branch (round 2) | quality | Minor | Q1: the padded-value table did not pin the end-of-value set (5 mutants survived) | fixed in 1798ec6 (fix task 2; docs 55e8da7): five rows added, all five mutants killed |
 | whole branch (round 2) | quality | Minor | Q2: the per-quote-character memo was untested | fixed in 1798ec6 (fix task 2; docs 55e8da7): two-quote rows added (`a_token="x b_token='y z' c` and its mirror) |
 | whole branch (round 2) | quality | Minor | Q3: the memo soundness comment omitted the invariant | fixed in 1798ec6 (fix task 2; docs 55e8da7) |
 | whole branch (round 2) | quality | Minor | Q4: the "keep in step" comments were inaccurate | fixed in 1798ec6 (fix task 2; docs 55e8da7) |
 | whole branch (round 2) | quality | Minor | Q5: the reason-cap docs said 1024 where the stored reason can be 1027 bytes | fixed in 1798ec6 (fix task 2; docs 55e8da7): docs say "plus a one-character marker" |
-| whole branch (round 2) | quality | Minor | Q6: a next key with only a closing quote (`password'=`; `password='x password'=S3CR3T` leaves `S3CR3T`) | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: malformed input only (11 regressions in a differential of 3M random malformed strings, all of one shape: an unclosed value quote then a later key with only a closing quote, `password'=` or `api_key"=`), the doc is softened; Residual risks 13 |
+| whole branch (round 2) | quality | Minor | Q6: a next key with only a closing quote (`password'=`; `password='x password'=S3CR3T` leaves `S3CR3T`) | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); countersigned by the user in the session on 2026-10-31 ("I approve everything"): malformed input only (11 regressions in a differential of 3M random malformed strings, all of one shape: an unclosed value quote then a later key with only a closing quote, `password'=` or `api_key"=`), the doc is softened; Residual risks 13 |
 | whole branch (round 2) | quality | Minor | Q7: `is_host_port` accepts only ASCII terminators | fixed in 1798ec6 (fix task 2; docs 55e8da7): doc-only, the behaviour is stated (now recorded in spec Residual risks 11) |
 | whole branch (round 2) | quality | Minor | Q8: new-test hygiene | fixed in 1798ec6 (fix task 2; docs 55e8da7) |
 | whole branch (round 2) | quality | Minor | Q9: the `agent.activity` description was full of jargon | fixed in 1798ec6 (fix task 2; docs 55e8da7): shortened to the caller-relevant points, detail moved to doc comments (spec AC33) |
@@ -801,18 +801,19 @@ builder's secret vocabulary is the single shared one in `aitm-core` and `scrub_t
 quote-aware scan. **Cut:** `durable_audit` wiring, a trusted-control Read exemption, a per-origin ring, scanner
 consolidation. **Verification:** the full gate (fmt, clippy, `cargo test`) is green on the rebased head; the socket
 tests ran in the Terminal panel; three panel rounds plus a narrow fourth; the Tester's 33 added tests kill 49
-mutants. **Open:** Matt's countersignature on the Minors marked "accepted by the orchestrator" (listed in the PR).
+mutants. **Countersigned:** the user approved the Minors marked "accepted by the orchestrator" in the session on 2026-10-31 ("I approve everything"); the rows say so. PR 171 merged as `0d50cf4`.
 
 What merged, what was cut, follow-ups. Follow-ups already named by
 the spec: "durable audit wiring" (config key, path, rotation, 0600, blocking I/O),
 "scanner vocabulary consolidation" (the scanner drops its own `redact_needle_pairs` and
 pre-pass, shares one `ends_value`/`closing_quote` with core, and fixes its stale doc
 comments; it also removes the scanner's divergent `ends_value`/`closing_quote` copies,
-which lack core's opener-shaped rule and Unicode whitespace), "regenerate the tool reference" (run
-`aitmproxy-plugin/scripts/gen-tool-reference.mjs` so
-`aitmproxy-plugin/docs/tool-reference.md` carries the new `agent.activity` and
-`agent.status` descriptions; `docs/research/mcp-tool-catalog.txt` still holds the old
-text), "agent-stream filtering" (the
+which lack core's opener-shaped rule and Unicode whitespace), "regenerate the tool reference" (the `agent.status` and `agent.activity` rows of
+`aitmproxy-plugin/docs/tool-reference.md` were refreshed from a current binary in the
+docs follow-up PR; a full run of `aitmproxy-plugin/scripts/gen-tool-reference.mjs` would
+also rewrite the hand-written intro and add the `check.*` namespace, so the generator
+template needs the intro text before the file is regenerated whole;
+`docs/research/mcp-tool-catalog.txt` still holds the old text), "agent-stream filtering" (the
 `notifications/aitm/agent` push for routine entries), and the PR 145 follow-ups that
 remain ("unified agent hub", "configurable startup policy"; "tui-mode governance" has since landed on `main` as PR 162).
 Follow-ups found by the panel: the `server.rs` doc comments still say the durable sink
