@@ -14,7 +14,7 @@
 //!
 //! [`CaptureSession::run`] owns the listener and the rendezvous guard for the whole
 //! session and serves one attached provider at a time. Serving an attachment runs
-//! two concerns concurrently, sharing one per-attachment [`FlowPairing`]:
+//! two concerns concurrently, sharing one per-attachment `FlowPairing`:
 //!
 //! - **control** (`serve_control`): verify the peer's code
 //!   signature, gate on the `Hello`, push the scope (and re-push it when it
@@ -58,17 +58,17 @@ pub const DEFAULT_SOCKET_DIR: &str = "/private/tmp/aitmproxy-capture.d";
 /// How often an attached provider's scope is recomputed. The provider is a coarse
 /// pre-filter under the authoritative core guard, so a scope at most this stale is
 /// safe: too narrow sends a flow direct, too wide is refused by the core guard.
-pub const DEFAULT_SCOPE_POLL: Duration = Duration::from_secs(1);
+pub(crate) const DEFAULT_SCOPE_POLL: Duration = Duration::from_secs(1);
 
 /// Cap on each of the two pending-pairing maps (unpaired opens, unpaired data
 /// sockets); the oldest is evicted past it.
-pub const DEFAULT_PENDING_CAP: usize = 1024;
+pub(crate) const DEFAULT_PENDING_CAP: usize = 1024;
 
 /// Cap on concurrently pumped flows; a pair arriving at the cap is shed.
-pub const DEFAULT_MAX_CONCURRENT_FLOWS: usize = 4096;
+pub(crate) const DEFAULT_MAX_CONCURRENT_FLOWS: usize = 4096;
 
 /// How long an unpaired half may wait for its other half before it is dropped.
-pub const DEFAULT_PENDING_TTL: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_PENDING_TTL: Duration = Duration::from_secs(30);
 
 /// Concurrent data-accept pipelines (accept, handshake, verify, pair). One silent
 /// or slow peer holds one slot, never the whole data path.
@@ -77,6 +77,15 @@ const DATA_ACCEPTORS: usize = 16;
 /// Pause after an accept error before retrying, so a persistent failure (fd
 /// exhaustion) cannot spin the loop.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(500);
+
+/// How long a just-accepted control connection has to be verified and send its
+/// `Hello`. The feeder serves one attachment at a time, so a connected peer that
+/// never says anything (one silent same-uid squatter, or a wedged provider) would
+/// otherwise hold the single attachment slot, and every later provider, forever. A
+/// real provider sends its `Hello` immediately after connecting and verification is
+/// a local Security.framework call; seconds is generous. Mirrors the data socket's
+/// `DATA_HANDSHAKE_TIMEOUT`.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Lock `m`, recovering from a poisoned lock: the maps hold plain data and no
 /// critical section here can leave them inconsistent.
@@ -100,6 +109,7 @@ impl<T> Pending<T> {
         }
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.items.len()
     }
@@ -141,7 +151,7 @@ impl<T> Pending<T> {
 /// two arrive on different sockets in either order, so each side waits, bounded,
 /// for the other. Generic over the data half so the logic is testable without a
 /// bound listener (a real [`DataConnection`] needs one).
-pub struct FlowPairing<D = DataConnection> {
+pub(crate) struct FlowPairing<D = DataConnection> {
     ttl: Duration,
     opens: Pending<FlowOpen>,
     data: Pending<D>,
@@ -151,7 +161,7 @@ impl<D> FlowPairing<D> {
     /// An empty pairing map holding at most `cap` unpaired opens and `cap` unpaired
     /// data halves, each dropped after `ttl` unpaired.
     #[must_use]
-    pub fn new(cap: usize, ttl: Duration) -> Self {
+    pub(crate) fn new(cap: usize, ttl: Duration) -> Self {
         Self {
             ttl,
             opens: Pending::new(cap),
@@ -161,7 +171,7 @@ impl<D> FlowPairing<D> {
 
     /// Offer a `FlowOpen`. Returns the ready pair if its data half is already here,
     /// else holds it (evicting the oldest open past the cap).
-    pub fn offer_open(&mut self, open: FlowOpen, now: Instant) -> Option<(FlowOpen, D)> {
+    pub(crate) fn offer_open(&mut self, open: FlowOpen, now: Instant) -> Option<(FlowOpen, D)> {
         if let Some(data) = self.data.take(open.flow_id) {
             return Some((open, data));
         }
@@ -171,7 +181,12 @@ impl<D> FlowPairing<D> {
 
     /// Offer the data half of `flow_id`. Returns the ready pair if its `FlowOpen` is
     /// already here, else holds it (evicting the oldest data half past the cap).
-    pub fn offer_data(&mut self, flow_id: u64, data: D, now: Instant) -> Option<(FlowOpen, D)> {
+    pub(crate) fn offer_data(
+        &mut self,
+        flow_id: u64,
+        data: D,
+        now: Instant,
+    ) -> Option<(FlowOpen, D)> {
         if let Some(open) = self.opens.take(flow_id) {
             return Some((open, data));
         }
@@ -180,26 +195,28 @@ impl<D> FlowPairing<D> {
     }
 
     /// Drop every half that has waited longer than the ttl.
-    pub fn sweep(&mut self, now: Instant) {
+    pub(crate) fn sweep(&mut self, now: Instant) {
         self.opens.sweep(now, self.ttl);
         self.data.sweep(now, self.ttl);
     }
 
     /// Unpaired opens currently held.
+    #[cfg(test)]
     #[must_use]
-    pub fn pending_opens_len(&self) -> usize {
+    fn pending_opens_len(&self) -> usize {
         self.opens.len()
     }
 
     /// Unpaired data halves currently held.
+    #[cfg(test)]
     #[must_use]
-    pub fn pending_data_len(&self) -> usize {
+    fn pending_data_len(&self) -> usize {
         self.data.len()
     }
 
     /// Halves dropped (cap eviction, replacement, or timeout) since the last call;
     /// resets to 0.
-    pub fn take_evicted(&mut self) -> u64 {
+    pub(crate) fn take_evicted(&mut self) -> u64 {
         std::mem::take(&mut self.opens.evicted) + std::mem::take(&mut self.data.evicted)
     }
 }
@@ -215,15 +232,16 @@ pub struct CaptureSession {
     scope_poll: Duration,
     pending_cap: usize,
     pending_ttl: Duration,
+    hello_timeout: Duration,
     pump_slots: Arc<Semaphore>,
     stop: watch::Sender<bool>,
 }
 
 impl CaptureSession {
     /// A session over the given ingress, guards, verifier, and socket directory,
-    /// with the default tuning ([`DEFAULT_SCOPE_POLL`], [`DEFAULT_PENDING_CAP`],
-    /// [`DEFAULT_PENDING_TTL`], [`DEFAULT_MAX_CONCURRENT_FLOWS`]). `l4_guard` is
-    /// `None` when L4 is not enabled.
+    /// with the default tuning (`DEFAULT_SCOPE_POLL`, `DEFAULT_PENDING_CAP`,
+    /// `DEFAULT_PENDING_TTL`, `DEFAULT_MAX_CONCURRENT_FLOWS`). `l4_guard` is `None`
+    /// when L4 is not enabled.
     #[must_use]
     pub fn new(
         ingress: Arc<CoreIngress>,
@@ -241,36 +259,50 @@ impl CaptureSession {
             scope_poll: DEFAULT_SCOPE_POLL,
             pending_cap: DEFAULT_PENDING_CAP,
             pending_ttl: DEFAULT_PENDING_TTL,
+            hello_timeout: HELLO_TIMEOUT,
             pump_slots: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_FLOWS)),
             stop: watch::channel(false).0,
         }
     }
 
     /// Recompute the scope this often (at least 1 ms).
+    #[cfg(test)]
     #[must_use]
-    pub fn with_scope_poll_interval(mut self, interval: Duration) -> Self {
+    fn with_scope_poll_interval(mut self, interval: Duration) -> Self {
         self.scope_poll = interval.max(Duration::from_millis(1));
         self
     }
 
     /// Cap each pending-pairing map at `cap`.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_pending_cap(mut self, cap: usize) -> Self {
+    fn with_pending_cap(mut self, cap: usize) -> Self {
         self.pending_cap = cap;
         self
     }
 
     /// Drop an unpaired half after `ttl`.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_pending_ttl(mut self, ttl: Duration) -> Self {
+    fn with_pending_ttl(mut self, ttl: Duration) -> Self {
         self.pending_ttl = ttl;
         self
     }
 
     /// Allow at most `max` concurrently pumped flows; more are shed.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_max_concurrent_flows(mut self, max: usize) -> Self {
+    fn with_max_concurrent_flows(mut self, max: usize) -> Self {
         self.pump_slots = Arc::new(Semaphore::new(max));
+        self
+    }
+
+    /// Give a new control connection `timeout` (not `HELLO_TIMEOUT`) to be verified
+    /// and send its `Hello`.
+    #[cfg(test)]
+    #[must_use]
+    fn with_hello_timeout(mut self, timeout: Duration) -> Self {
+        self.hello_timeout = timeout;
         self
     }
 
@@ -379,20 +411,41 @@ impl CaptureSession {
         }
     }
 
-    /// Serve one attached provider's control channel: verify the peer, gate on the
-    /// `Hello`, push the scope and re-push it when it changes, and register each
-    /// `FlowOpen` with `pairing` (starting a pump when its data half is already
-    /// there). Returns when the provider detaches or any step fails.
-    async fn serve_control(&self, mut control: ControlChannel, pairing: &Mutex<FlowPairing>) {
+    /// The control channel's admission prelude: verify the peer, then read and gate
+    /// on its `Hello`. `true` only if both pass; every refusal is logged here.
+    async fn admit_control(&self, control: &mut ControlChannel) -> bool {
         // The peer is verified, and its Hello read, on the whole channel: nothing is
         // read from a peer that has not been verified first.
         if !self.verify_peer(control.as_raw_fd()).await {
             warn!("capture control peer failed code-signature verification; refusing it");
-            return;
+            return false;
         }
-        if let Err(e) = recv_hello(&mut control).await {
+        if let Err(e) = recv_hello(control).await {
             warn!(error = %e, "capture control Hello refused; closing the channel");
-            return;
+            return false;
+        }
+        true
+    }
+
+    /// Serve one attached provider's control channel: verify the peer, gate on the
+    /// `Hello` (both within `hello_timeout`), push the scope and re-push it when it
+    /// changes, and register each `FlowOpen` with `pairing` (starting a pump when its
+    /// data half is already there). Returns when the provider detaches or any step
+    /// fails.
+    async fn serve_control(&self, mut control: ControlChannel, pairing: &Mutex<FlowPairing>) {
+        // Bounded: the feeder serves one attachment at a time, so a peer that
+        // connects and goes quiet must not hold the slot. On elapse the half-admitted
+        // channel is dropped here and the accept loop takes the next connection.
+        match tokio::time::timeout(self.hello_timeout, self.admit_control(&mut control)).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(_elapsed) => {
+                info!(
+                    timeout = ?self.hello_timeout,
+                    "capture control peer was not verified and did not send its Hello in time; dropping it"
+                );
+                return;
+            }
         }
         let (mut reader, mut writer) = control.into_halves();
 
@@ -889,6 +942,78 @@ mod tests {
         assert_eq!(next_frame(&mut provider).await, None);
     }
 
+    /// A peer the verifier accepts that then never sends its `Hello` is cut off at
+    /// the Hello deadline instead of holding the single attachment slot forever:
+    /// `serve_control` returns (so `serve_attachment`'s select completes and the
+    /// accept loop takes the next connection), it never reaches the scope push, and
+    /// the channel is dropped, which the provider sees as a clean EOF.
+    #[tokio::test]
+    async fn verified_peer_that_never_sends_hello_is_cut_off() {
+        let verifier = StubVerifier::new(true);
+        let session = Arc::new(
+            session_with(
+                verifier.clone(),
+                TestGuard::with_hosts(&["example.com"]),
+                None,
+            )
+            .with_hello_timeout(Duration::from_millis(50)),
+        );
+        let pairing = new_pairing(&session);
+        // The provider connects and stays connected, but says nothing.
+        let (mut provider, core) = control_pair();
+
+        timeout(PROMPT, session.serve_control(core, &pairing))
+            .await
+            .expect("a silent peer is cut off at the Hello deadline, not waited on forever");
+
+        assert_eq!(
+            lock(&verifier.seen).len(),
+            1,
+            "the peer was verified before the Hello was awaited"
+        );
+        assert_eq!(
+            next_frame(&mut provider).await,
+            None,
+            "the channel was dropped with no Scope sent"
+        );
+        assert_eq!(pairing_len(&pairing), 0);
+    }
+
+    /// The deadline is a fixed production constant (the tests above shorten it per
+    /// session): a session built with `new` waits exactly `HELLO_TIMEOUT`, five
+    /// seconds, for a peer's `Hello`.
+    #[test]
+    fn hello_timeout_default_is_five_seconds() {
+        assert_eq!(HELLO_TIMEOUT, Duration::from_secs(5));
+        let session = session_with(StubVerifier::new(true), TestGuard::with_hosts(&[]), None);
+        assert_eq!(session.hello_timeout, HELLO_TIMEOUT);
+    }
+
+    /// A peer that sends its `Hello` inside the deadline is unaffected by it.
+    #[tokio::test]
+    async fn prompt_hello_inside_the_deadline_still_attaches() {
+        let session = Arc::new(
+            session_with(
+                StubVerifier::new(true),
+                TestGuard::with_hosts(&["example.com"]),
+                None,
+            )
+            .with_hello_timeout(Duration::from_secs(30)),
+        );
+        let pairing = new_pairing(&session);
+        let (mut provider, core) = control_pair();
+        provider
+            .send(&hello(HANDOFF_PROTOCOL_VERSION))
+            .await
+            .unwrap();
+        let task = attach(&session, &pairing, core);
+
+        assert_eq!(next_frame(&mut provider).await, Some(scope("example.com")));
+
+        drop(provider);
+        timeout(PROMPT, task).await.unwrap().unwrap();
+    }
+
     /// Fail-closed: a verifier that panics is a rejection, not a crash.
     #[tokio::test]
     async fn panicking_verifier_is_a_rejection() {
@@ -993,6 +1118,45 @@ mod tests {
         })
         .await
         .expect("the unpaired open is swept after its ttl");
+
+        drop(provider);
+        timeout(PROMPT, task).await.unwrap().unwrap();
+    }
+
+    /// The session's pending cap bounds the pairing map an attachment fills from its
+    /// control channel: with a cap of 2, a third unpaired `FlowOpen` evicts the
+    /// oldest instead of growing the map.
+    #[tokio::test]
+    async fn pending_cap_bounds_the_unpaired_opens_of_an_attachment() {
+        // A long scope poll keeps the sweep from consuming the eviction count.
+        let session = Arc::new(
+            session_with(StubVerifier::new(true), TestGuard::with_hosts(&[]), None)
+                .with_scope_poll_interval(Duration::from_secs(3600))
+                .with_pending_cap(2),
+        );
+        let pairing = new_pairing(&session);
+        let (mut provider, core) = control_pair();
+        provider
+            .send(&hello(HANDOFF_PROTOCOL_VERSION))
+            .await
+            .unwrap();
+        let task = attach(&session, &pairing, core);
+        assert_eq!(next_frame(&mut provider).await, Some(scope("")));
+
+        for flow_id in 1..=3 {
+            provider
+                .send(&ControlMessage::FlowOpen(open(flow_id)))
+                .await
+                .unwrap();
+        }
+        timeout(PROMPT, async {
+            while lock(&pairing).take_evicted() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the third open evicts the oldest");
+        assert_eq!(pairing_len(&pairing), 2, "the map stays at the cap");
 
         drop(provider);
         timeout(PROMPT, task).await.unwrap().unwrap();

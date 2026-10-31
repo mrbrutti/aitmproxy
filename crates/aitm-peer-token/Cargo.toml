@@ -1,0 +1,21 @@
+[package]
+name = "aitm-peer-token"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Leaf crate holding the one audited unsafe call: read a UNIX socket peer's macOS audit token."
+
+# This crate exists so the rest of the workspace (notably `aitm`) can keep the
+# workspace `unsafe_code = "forbid"`. The workspace lint is `forbid`, which no
+# `#[allow]` can lift, and Cargo cannot combine `workspace = true` with a per-crate
+# override, so this crate restates the workspace lint set (today: `unsafe_code`
+# only) at `deny`: still a hard error everywhere except the one
+# `#[allow(unsafe_code)]` site in `src/lib.rs`. If the workspace gains more
+# `[workspace.lints]`, mirror them here.
+[lints.rust]
+unsafe_code = "deny"
+
+# `getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN)` is macOS-only; nothing links elsewhere.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

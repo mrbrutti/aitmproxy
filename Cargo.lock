@@ -36,6 +36,7 @@ dependencies = [
  "aitm-core",
  "aitm-findings",
  "aitm-mcp",
+ "aitm-peer-token",
  "aitm-plugin",
  "aitm-plugin-maprules",
  "aitm-plugin-passthrough",
@@ -59,7 +60,6 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "libc",
  "rcgen",
  "rustls",
  "security-framework",
@@ -172,6 +172,13 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "aitm-peer-token"
+version = "0.5.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

@@ -153,10 +153,16 @@ impl CaptureListener {
     /// so the bind does not fail with `EADDRINUSE`.
     ///
     /// # Errors
-    /// Fails if the directory cannot be created or locked, or either socket cannot
-    /// be bound.
+    /// Fails ([`io::ErrorKind::InvalidInput`]) if `dir` already exists as a symlink,
+    /// which is refused rather than followed. Fails if the directory cannot be
+    /// created or locked, or either socket cannot be bound.
     pub fn bind(dir: impl AsRef<Path>) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
+        // The socket directory sits at a well-known path in a world-writable parent
+        // (`/private/tmp`), so another process can plant a symlink there before we
+        // run. `set_permissions` below would follow it and chmod, and we would then
+        // create our sockets in, a directory the squatter chose. Refuse it up front.
+        refuse_symlink(&dir)?;
         // Create the directory **atomically private** (mode 0700 at creation), so
         // there is no create→chmod window in which another uid could reach it.
         // `recursive(true)` makes an existing directory a no-op (it does not widen
@@ -242,6 +248,27 @@ impl Drop for CaptureListener {
         // Best-effort: don't leave the bound socket files behind.
         let _ = fs::remove_file(self.dir.join(CONTROL_SOCK));
         let _ = fs::remove_file(self.dir.join(DATA_SOCK));
+    }
+}
+
+/// Fail with [`io::ErrorKind::InvalidInput`] if `dir` already exists **as a
+/// symlink** (to anything, including nothing). Looks at the path itself, not what it
+/// points to (`symlink_metadata`); a missing path or an ordinary directory passes.
+/// Any other failure to inspect the path is returned too, fail-closed. Only the final
+/// path component is checked: the system's own parents (`/tmp` → `/private/tmp`) may
+/// legitimately be links.
+fn refuse_symlink(dir: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "capture socket directory {} is a symlink; refusing to follow it",
+                dir.display()
+            ),
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -549,14 +576,116 @@ where
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use tokio::io::AsyncWriteExt;
 
     use super::{
-        read_handshake, write_data_handshake, AsRawFd, ControlChannel, ControlMessage,
-        DataConnection, DataHandshake, Hello, ScopeSpec,
+        read_handshake, refuse_symlink, write_data_handshake, AsRawFd, CaptureListener,
+        ControlChannel, ControlMessage, DataConnection, DataHandshake, Hello, ScopeSpec,
     };
+
+    /// A unique scratch directory, removed on drop. Kept short: `$TMPDIR` on macOS is
+    /// already long and a Unix socket path must stay under `SUN_LEN`.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "aml-{tag}-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A squatter who plants the socket directory path as a symlink to a directory
+    /// they control must not be followed: `bind` refuses outright, so it neither
+    /// chmods the target to 0700 (which `set_permissions` would do through the link)
+    /// nor creates the sockets inside it. The refusal happens before any socket is
+    /// bound, so this needs no real bind.
+    #[tokio::test]
+    async fn bind_refuses_a_symlinked_socket_dir() {
+        let tmp = TempDir::new("symlink");
+        let target = tmp.path().join("attacker-dir");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = tmp.path().join("capture.d");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = CaptureListener::bind(&link)
+            .err()
+            .expect("a symlinked socket dir must be refused, not followed");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("symlink"),
+            "the refusal says why: {err}"
+        );
+        assert_eq!(mode_of(&target), 0o755, "the link target was not chmodded");
+        assert_eq!(
+            std::fs::read_dir(&target).unwrap().count(),
+            0,
+            "no socket was created in the link target"
+        );
+    }
+
+    /// A dangling symlink at the path is refused the same way (it is still a
+    /// squatter-planted link, whatever it points at).
+    #[tokio::test]
+    async fn bind_refuses_a_dangling_symlink_at_the_socket_dir() {
+        let tmp = TempDir::new("dangle");
+        let link = tmp.path().join("capture.d");
+        std::os::unix::fs::symlink(tmp.path().join("not-there"), &link).unwrap();
+
+        let err = CaptureListener::bind(&link)
+            .err()
+            .expect("a dangling symlink must be refused");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// The guard looks only at the path itself: a path that does not exist yet and
+    /// an ordinary directory both pass (the normal fresh-start and restart cases),
+    /// while a symlink to a plain file is refused like any other link.
+    #[test]
+    fn refuse_symlink_passes_only_non_links() {
+        let tmp = TempDir::new("guard");
+
+        assert!(refuse_symlink(&tmp.path().join("missing")).is_ok());
+        assert!(refuse_symlink(tmp.path()).is_ok(), "an ordinary directory");
+
+        let file = tmp.path().join("plain-file");
+        std::fs::write(&file, b"x").unwrap();
+        let link = tmp.path().join("link-to-file");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let err = refuse_symlink(&link).expect_err("a link to a file is still a link");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // A path whose parent is a regular file cannot be inspected: that error is
+        // returned, not treated as "no symlink here".
+        assert!(refuse_symlink(&file.join("sub")).is_err());
+    }
 
     /// A data socket that connects and never sends its handshake is cut off at the
     /// deadline with `TimedOut`, not waited on forever: otherwise one silent

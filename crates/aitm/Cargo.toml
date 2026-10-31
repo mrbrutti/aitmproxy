@@ -69,7 +69,9 @@ uuid.workspace = true
 # scope or feeds bytes. Security.framework is macOS-only, so every dependency here
 # is behind the target cfg and nothing new links on Linux.
 #   - `security-framework`: `os::macos::code_signing` (`SecCode` / `SecRequirement`).
-#   - `libc`: `getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN)` to read the peer audit token.
+#   - `aitm-peer-token`: reads the peer audit token off the socket. It holds the one
+#     `unsafe` `getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN)` call so that this crate can
+#     keep the workspace `unsafe_code = "forbid"`.
 #   - `core-foundation`: `CFData`, the carrier the `GuestAttributes` audit-token
 #     setter requires. `security-framework` pulls it in regardless (same `0.10`
 #     it pins), so it adds no new crate to the tree; named here because it is
@@ -77,7 +79,7 @@ uuid.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
 core-foundation = "0.10"
-libc = "0.2"
+aitm-peer-token.workspace = true
 
 [dev-dependencies]
 # The hermetic multi-vuln target the M4 browser-capture e2e drives (Task 14).
@@ -92,13 +94,5 @@ rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 
-# PLAN-GAP DEVIATION (macOS NE live-feeder plan, Task 2): the workspace lint is
-# `unsafe_code = "forbid"`, which no `#[allow]` can lift, and this crate must make
-# exactly one `unsafe` libc call (`getsockopt(LOCAL_PEERTOKEN)` in
-# `macos_capture::peer_auth`, which the plan calls for). Cargo cannot combine
-# `workspace = true` with a per-crate override, so this crate restates the
-# workspace lint set (today: `unsafe_code` only) at `deny`: still a hard error
-# everywhere except the one `#[allow(unsafe_code)]` site. If the workspace gains
-# more `[workspace.lints]`, mirror them here.
-[lints.rust]
-unsafe_code = "deny"
+[lints]
+workspace = true

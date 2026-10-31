@@ -97,49 +97,18 @@ mod macos {
     //! The real check, step for step what `PeerAuth` does in Swift:
     //! `getsockopt(LOCAL_PEERTOKEN)` → `SecCodeCopyGuestWithAttributes` with
     //! `kSecGuestAttributeAudit` → `SecRequirementCreateWithString` →
-    //! `SecCodeCheckValidity`.
+    //! `SecCodeCheckValidity`. The `getsockopt` is the one `unsafe` step, so it lives
+    //! in the leaf crate `aitm-peer-token` (`peer_audit_token`); everything here is
+    //! safe code and this crate keeps the workspace `unsafe_code = "forbid"`.
 
-    use std::mem::size_of;
     use std::os::fd::RawFd;
 
+    use aitm_peer_token::{peer_audit_token, AuditToken};
     use core_foundation::base::TCFType;
     use core_foundation::data::CFData;
     use security_framework::os::macos::code_signing::{
         Flags, GuestAttributes, SecCode, SecRequirement,
     };
-
-    /// `audit_token_t`: eight native-endian `unsigned int`s (32 bytes).
-    type AuditToken = [u32; 8];
-
-    /// Size of [`AuditToken`] as the `socklen_t` `getsockopt` traffics in.
-    const AUDIT_TOKEN_LEN: libc::socklen_t = size_of::<AuditToken>() as libc::socklen_t;
-
-    /// The audit token of the process at the other end of connected UNIX socket
-    /// `fd`, or `None` if the kernel will not give it up (bad fd, not a connected
-    /// UNIX socket, short token).
-    #[allow(unsafe_code)]
-    fn peer_audit_token(fd: RawFd) -> Option<AuditToken> {
-        let mut token: AuditToken = [0; 8];
-        let mut len = AUDIT_TOKEN_LEN;
-        // SAFETY: `token` is a live, writable, 4-byte-aligned buffer of exactly
-        // `AUDIT_TOKEN_LEN` (32) bytes, matching `audit_token_t`; `len` is a live
-        // `socklen_t` initialised to that size, so the kernel writes at most
-        // `AUDIT_TOKEN_LEN` bytes into `token` and stores the written length in
-        // `len`. Both pointers are valid for the duration of the call and not
-        // aliased. `fd` is only an integer handed to the kernel: an invalid or
-        // non-socket descriptor makes the call fail with an errno (checked below),
-        // it cannot cause undefined behaviour.
-        let rc = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_LOCAL,
-                libc::LOCAL_PEERTOKEN,
-                token.as_mut_ptr().cast::<libc::c_void>(),
-                &mut len,
-            )
-        };
-        (rc == 0 && len == AUDIT_TOKEN_LEN).then_some(token)
-    }
 
     /// The audit token as the raw bytes `kSecGuestAttributeAudit` expects: the
     /// in-memory representation of `audit_token_t`, as Swift's
