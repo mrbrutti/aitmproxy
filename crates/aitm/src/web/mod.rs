@@ -230,20 +230,21 @@ pub fn startup_summary(
     browser: SocketAddr,
     bus: &str,
 ) -> String {
+    use std::fmt::Write as _;
     let rule = "─".repeat(60);
     let mut out = String::new();
-    out.push_str(&rule);
-    out.push('\n');
-    out.push_str("  aitm web\n");
-    out.push_str(&rule);
-    out.push('\n');
-    out.push_str(&format!("  Web UI     {web_url}\n"));
+    // Writing into the owned `String` is infallible, so the `writeln!` results are
+    // discarded deliberately.
+    let _ = writeln!(out, "{rule}");
+    let _ = writeln!(out, "  aitm web");
+    let _ = writeln!(out, "{rule}");
+    let _ = writeln!(out, "  Web UI     {web_url}");
     if let Some(op) = operator_url {
-        out.push_str(&format!("  Operator   {op}\n"));
+        let _ = writeln!(out, "  Operator   {op}");
     }
-    out.push_str(&format!("  Proxy      {proxy}\n"));
-    out.push_str(&format!("  Browser    {browser}  (SSRF-filtered)\n"));
-    out.push_str(&format!("  Bus        {bus}\n"));
+    let _ = writeln!(out, "  Proxy      {proxy}");
+    let _ = writeln!(out, "  Browser    {browser}  (SSRF-filtered)");
+    let _ = writeln!(out, "  Bus        {bus}");
     out.push_str(&rule);
     out
 }

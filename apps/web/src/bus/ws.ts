@@ -255,12 +255,12 @@ export function createWsBus(opts: WsBusOptions): BusClient {
       toolsCache = null;
       setRole(null); // role is per-connection; re-resolved on the next initialize.
       failAllPending(`bus closed (${ev.code})`);
-      // Signal B — a 1008 (Policy) close is the bridge refusing a stale token. Treat it as an auth
-      // failure and stop, before the reconnect decision; other codes are transient and still reconnect.
-      if (ev.code === 1008) {
-        markAuthFailed();
-        return;
-      }
+      // A bad token is caught by Signal A (the `-32001` reply) in `onMessage`, which the bridge always
+      // sends *before* it closes with `CloseCode::Policy` (1008) — so `authFailed` is already latched
+      // here and `scheduleReconnect` returns early. The close code itself is NOT used to detect auth
+      // failure: the bridge also closes with 1008 on an authentication *timeout* (a valid tab whose
+      // first send was delayed), which is transient and must reconnect, not latch the tab into
+      // `unauthorized`. So every close that is not an already-latched auth failure reconnects.
       if (closedByUser) setState('closed');
       else scheduleReconnect();
     };

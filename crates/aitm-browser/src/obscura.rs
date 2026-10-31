@@ -290,19 +290,35 @@ fn reap_stale_run_dirs_in(base: &Path, is_alive: impl Fn(u32) -> bool) -> usize 
         let Some(rest) = name.strip_prefix(RUN_DIR_PREFIX) else {
             continue;
         };
-        if !entry.path().is_dir() {
+        // Skip anything that is not a real directory. `file_type()` does NOT follow
+        // symlinks (unlike `Path::is_dir`, which stats the target), so a symlink
+        // planted under our prefix is left alone and the gate matches exactly what
+        // `remove_run_dir` would unlink.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
             continue;
         }
+        // Parse the owning `aitm` pid; reject 0 and anything past `i32::MAX` so the
+        // `pid as i32` liveness probe can never wrap to a negative value (which would
+        // target a process *group*, not a process). A malformed name is left in place.
         let Some(pid) = rest
             .split('-')
             .next()
             .and_then(|pid| pid.parse::<u32>().ok())
+            .filter(|&pid| pid != 0 && pid <= i32::MAX as u32)
         else {
             continue;
         };
         if !is_alive(pid) {
             remove_run_dir(&entry.path());
-            removed += 1;
+            // Count only a confirmed removal: `remove_run_dir` is best-effort (it
+            // just `debug!`s on a real error), so re-check the dir is gone before
+            // claiming it in the one summary line.
+            if !entry.path().exists() {
+                removed += 1;
+            }
         }
     }
     removed
