@@ -148,22 +148,26 @@ impl Drop for Scratch {
 }
 
 /// Whether this environment lets us bind the capture sockets and publish the
-/// rendezvous file. The Bash sandbox refuses both (EPERM, `PermissionDenied`); then
-/// the test prints [`SKIP_NOTICE`] and returns so a sandbox run stays green. Any
-/// *other* failure is a real error and panics. Everything the probe created is
-/// released again before it returns.
+/// rendezvous file. Two environments can't, and both skip rather than fail: the Bash
+/// sandbox refuses the UDS bind (EPERM, `PermissionDenied`); and a non-macOS host
+/// (e.g. Linux CI) has no `/private/tmp`, so `publish_rendezvous` fails with
+/// `NotFound` — the NE capture path is macOS-only. In either case the test prints
+/// [`SKIP_NOTICE`] and returns so the run stays green. Any *other* failure is a real
+/// error and panics. Everything the probe created is released again before it returns.
 ///
 /// Must run inside the tokio runtime: binding a Unix listener registers with it.
 fn uds_bind_available(socket_dir: &Path) -> bool {
+    let cant_run_here =
+        |k: io::ErrorKind| matches!(k, io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound);
     let listener = match CaptureListener::bind(socket_dir) {
         Ok(listener) => listener,
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return false,
-        Err(e) => panic!("binding the capture sockets failed for a non-sandbox reason: {e}"),
+        Err(e) if cant_run_here(e.kind()) => return false,
+        Err(e) => panic!("binding the capture sockets failed for an unexpected reason: {e}"),
     };
     match listener.publish_rendezvous() {
         Ok(_guard) => true,
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => false,
-        Err(e) => panic!("publishing the rendezvous file failed for a non-sandbox reason: {e}"),
+        Err(e) if cant_run_here(e.kind()) => false,
+        Err(e) => panic!("publishing the rendezvous file failed for an unexpected reason: {e}"),
     }
 }
 
