@@ -558,4 +558,220 @@ mod tests {
             ))
         );
     }
+
+    // ---- Tester additions (whole-branch pass, plan 2026-10-30-bus-audit-connection-id).
+    // They pin edges the AC tests above leave open: the `since` bounds of the two
+    // viewer-filtered reads, and the label cap on names a hostile client chooses.
+
+    /// An entry made at the explicit instant `ms` after the epoch, so a window edge
+    /// can be placed exactly instead of racing `SystemTime::now()`.
+    fn entry_at_ms(
+        origin: Frontend,
+        connection_id: Option<&str>,
+        command: &str,
+        ms: u64,
+    ) -> AuditEntry {
+        AuditEntry {
+            at: UNIX_EPOCH + std::time::Duration::from_millis(ms),
+            ..entry_of(origin, connection_id, command)
+        }
+    }
+
+    fn at_ms(ms: u64) -> SystemTime {
+        UNIX_EPOCH + std::time::Duration::from_millis(ms)
+    }
+
+    /// `recent_for` runs `since` (strictly after), then the visibility filter, then
+    /// `limit`, oldest first. The AC3 test pins filter-before-limit but never gives
+    /// `since`, so a `recent_for` that ignored `since`, treated it as inclusive, or
+    /// applied `limit` before the filter on this combination would still pass it.
+    #[test]
+    fn recent_for_combines_since_the_filter_and_the_limit() {
+        let ring = AuditRing::new(16);
+        for (origin, command, ms) in [
+            (Frontend::Mcp, "ag1", 1000),
+            (Frontend::Operator, "op1", 2000),
+            (Frontend::Mcp, "ag2", 3000),
+            (Frontend::Operator, "op2", 4000),
+            (Frontend::Mcp, "ag3", 5000),
+            (Frontend::Operator, "op3", 6000),
+        ] {
+            ring.append(entry_at_ms(origin, None, command, ms));
+        }
+        let commands = |entries: Vec<AuditEntry>| -> Vec<String> {
+            entries.into_iter().map(|e| e.command).collect()
+        };
+
+        // The agent after 2000: ag2, ag3 are visible; op2 and op3 are not.
+        assert_eq!(
+            commands(ring.recent_for(Frontend::Mcp, Some(at_ms(2000)), None)),
+            ["ag2", "ag3"]
+        );
+        // limit 1 of what it may see after `since` is the newest visible, ag3, not
+        // the operator's op3 and not an empty result.
+        assert_eq!(
+            commands(ring.recent_for(Frontend::Mcp, Some(at_ms(2000)), Some(1))),
+            ["ag3"]
+        );
+        // A limit above the visible count returns every visible entry, no padding.
+        assert_eq!(
+            commands(ring.recent_for(Frontend::Mcp, Some(at_ms(2000)), Some(5))),
+            ["ag2", "ag3"]
+        );
+        // `since` is strictly after: an entry stamped exactly at it is out, so the
+        // agent whose newest visible entry is at 5000 gets nothing after 5000.
+        assert_eq!(
+            commands(ring.recent_for(Frontend::Mcp, Some(at_ms(5000)), None)),
+            Vec::<String>::new()
+        );
+        // The operator sees everything after 2000, and limit 2 keeps the newest two.
+        assert_eq!(
+            commands(ring.recent_for(Frontend::Operator, Some(at_ms(2000)), None)),
+            ["ag2", "op2", "ag3", "op3"]
+        );
+        assert_eq!(
+            commands(ring.recent_for(Frontend::Operator, Some(at_ms(2000)), Some(2))),
+            ["ag3", "op3"]
+        );
+        // limit 0 is an empty read for every viewer, never "no limit".
+        assert_eq!(
+            commands(ring.recent_for(Frontend::Mcp, None, Some(0))),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            commands(ring.recent_for(Frontend::Operator, None, Some(0))),
+            Vec::<String>::new()
+        );
+    }
+
+    /// `count_since_for` counts entries at or after `since`. The AC4 test places
+    /// every entry after `since`, so a `count_since_for` that dropped the time
+    /// filter altogether still passes it; this one puts entries on both sides of
+    /// the edge and exactly on it.
+    #[test]
+    fn count_since_for_keeps_the_edge_and_drops_what_is_older() {
+        let ring = AuditRing::new(16);
+        for (origin, id, ms) in [
+            (Frontend::Mcp, Some("A"), 9_999),  // one tick before the window
+            (Frontend::Mcp, Some("A"), 10_000), // exactly on the edge: counted
+            (Frontend::Mcp, Some("B"), 10_001), // inside
+            (Frontend::Operator, Some("O"), 9_000), // before the window
+            (Frontend::Operator, Some("O"), 10_500), // inside
+        ] {
+            ring.append(entry_at_ms(origin, id, "x", ms));
+        }
+        let since = at_ms(10_000);
+
+        assert_eq!(ring.count_since_for(Frontend::Mcp, since, None), 2);
+        assert_eq!(ring.count_since_for(Frontend::Mcp, since, Some("A")), 1);
+        assert_eq!(ring.count_since_for(Frontend::Mcp, since, Some("B")), 1);
+        assert_eq!(ring.count_since_for(Frontend::Operator, since, None), 3);
+        assert_eq!(
+            ring.count_since_for(Frontend::Operator, since, Some("O")),
+            2
+        );
+        // A window that starts after every entry counts nothing, for every viewer.
+        assert_eq!(
+            ring.count_since_for(Frontend::Mcp, at_ms(1_000_000), None),
+            0
+        );
+        assert_eq!(
+            ring.count_since_for(Frontend::Operator, at_ms(1_000_000), None),
+            0
+        );
+    }
+
+    /// The `Cli` viewer is trusted control like the operator: it counts and reads
+    /// every origin, including its own. (The matrix test pins `visible_to`; this
+    /// pins the two ring reads that the tools call with `host.frontend()`.)
+    #[test]
+    fn the_cli_viewer_reads_and_counts_every_origin() {
+        let t0 = SystemTime::now();
+        let ring = AuditRing::new(16);
+        ring.append(entry_of(Frontend::Operator, Some("O"), "op"));
+        ring.append(entry_of(Frontend::Mcp, Some("A"), "ag"));
+        ring.append(entry_of(Frontend::Cli, None, "cli"));
+
+        let commands = |entries: Vec<AuditEntry>| -> Vec<String> {
+            entries.into_iter().map(|e| e.command).collect()
+        };
+        assert_eq!(
+            commands(ring.recent_for(Frontend::Cli, None, None)),
+            ["op", "ag", "cli"]
+        );
+        assert_eq!(ring.count_since_for(Frontend::Cli, t0, None), 3);
+        // The agent sees neither the operator's nor the CLI's entry.
+        assert_eq!(commands(ring.recent_for(Frontend::Mcp, None, None)), ["ag"]);
+        assert_eq!(ring.count_since_for(Frontend::Mcp, t0, None), 1);
+    }
+
+    /// A name made only of control characters is not empty: it becomes that many
+    /// `?`, so the connection still has a (harmless) label and nothing reaches a
+    /// terminal. Only the empty string is `None`.
+    #[test]
+    fn cap_client_label_all_control_chars_becomes_question_marks() {
+        assert_eq!(
+            cap_client_label("\u{1b}\u{7}\u{0}\n\t"),
+            Some("?????".to_string())
+        );
+        // U+0085 is a two-byte control character: it is replaced by one byte, so
+        // 300 of them (600 bytes in) are 300 `?`, cut to the 128-byte cap.
+        assert_eq!(cap_client_label("a\u{85}b"), Some("a?b".to_string()));
+        assert_eq!(
+            cap_client_label(&"\u{85}".repeat(300)),
+            Some("?".repeat(128))
+        );
+    }
+
+    /// The cap is inclusive: a name of exactly 128 bytes survives whole, one byte
+    /// more is cut, and a multi-byte character that would straddle byte 128 is
+    /// dropped whole, never split (the result is always valid UTF-8).
+    #[test]
+    fn cap_client_label_keeps_exactly_the_cap_and_never_splits_a_char() {
+        let at_cap = "x".repeat(128);
+        assert_eq!(cap_client_label(&at_cap), Some(at_cap.clone()));
+        assert_eq!(cap_client_label(&"x".repeat(129)), Some(at_cap));
+
+        // 126 ASCII + a two-byte char ends exactly on byte 128: kept whole.
+        let exact = format!("{}é", "a".repeat(126));
+        assert_eq!(exact.len(), 128);
+        assert_eq!(cap_client_label(&exact), Some(exact.clone()));
+        // 127 ASCII + the same char would end on byte 129: the char goes, whole.
+        let over = format!("{}é", "a".repeat(127));
+        assert_eq!(cap_client_label(&over), Some("a".repeat(127)));
+
+        // Four-byte characters: 800 bytes in, 32 whole emoji (128 bytes) out ...
+        let emoji = cap_client_label(&"\u{1F600}".repeat(200)).expect("non-empty name");
+        assert_eq!(emoji.len(), 128);
+        assert_eq!(emoji.chars().count(), 32);
+        // ... and behind one ASCII byte only 31 fit (125 bytes), never a partial one.
+        let shifted =
+            cap_client_label(&format!("a{}", "\u{1F600}".repeat(40))).expect("non-empty name");
+        assert_eq!(shifted.len(), 125);
+        assert_eq!(shifted.chars().count(), 32);
+    }
+
+    /// The order is control characters first, then the scrub: a newline cannot end
+    /// the masked region of an `Authorization:` value (the scrub's `.+` stops at a
+    /// line break, so scrubbing first would leave the second "line" visible).
+    #[test]
+    fn cap_client_label_masks_past_a_newline_and_bearer_tokens() {
+        assert_eq!(
+            cap_client_label("Authorization: Basic dXNlcjpwYXNz\nsecond line"),
+            Some("Authorization: [redacted]".to_string())
+        );
+        let bearer = cap_client_label("agent Bearer abc.def.ghi").expect("non-empty name");
+        assert!(bearer.contains("Bearer [redacted]"), "{bearer}");
+        assert!(!bearer.contains("abc.def.ghi"), "{bearer}");
+    }
+
+    /// A multi-megabyte multi-byte name (a hostile `clientInfo.name` the size of a
+    /// whole message) is cut without a panic and without splitting a character:
+    /// 3 MiB of 3-byte characters leaves 42 of them, 126 bytes.
+    #[test]
+    fn cap_client_label_huge_multibyte_name_is_cut_not_split() {
+        let label = cap_client_label(&"\u{20AC}".repeat(1 << 20)).expect("non-empty name");
+        assert_eq!(label.len(), 126);
+        assert_eq!(label.chars().count(), 42);
+    }
 }

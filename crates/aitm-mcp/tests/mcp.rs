@@ -4780,3 +4780,673 @@ fn agent_status_exclude_self_skips_only_the_callers_connection() {
         "exclude_self is optional: {tool}"
     );
 }
+
+// ------------- Tester additions: whole-branch pass (plan 2026-10-30-bus-audit-connection-id)
+//
+// Edges the AC tests above leave open. Each test's doc names the change to the
+// production code that only it would catch.
+
+/// `(command, origin)` of every `notifications/aitm/agent` line in `conn`'s sink,
+/// oldest first; drains the sink.
+fn agent_line_pairs(conn: &ConnCtx) -> Vec<(String, String)> {
+    agent_lines(conn)
+        .iter()
+        .map(|l| {
+            (
+                l["params"]["command"]
+                    .as_str()
+                    .expect("command is a string")
+                    .to_string(),
+                l["params"]["origin"]
+                    .as_str()
+                    .expect("origin is a string")
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+fn pair(command: &str, origin: &str) -> (String, String) {
+    (command.to_string(), origin.to_string())
+}
+
+/// `fanout_audit` sends each line once per *connection*, however many
+/// subscriptions the connection holds. AC12 subscribes each watcher once, so a
+/// `fanout_audit` that lost its `seen` dedup (one line per subscription) passes
+/// it; here each connection holds three subscriptions and must still get one line.
+/// The agent's three subscriptions also get zero lines for an operator call, not
+/// three.
+#[test]
+fn an_audit_line_is_delivered_once_per_connection_however_many_subscriptions_it_holds() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+    let op = watcher(&srv, Frontend::Operator);
+    let agent = watcher(&srv, Frontend::Mcp);
+    for conn in [&op, &agent] {
+        for _ in 0..2 {
+            let reply = call_on(&srv, conn, "flow.subscribe", json!({}));
+            assert!(
+                !is_refused(&reply),
+                "an extra subscription is accepted: {reply}"
+            );
+        }
+    }
+
+    // An agent call is visible to both roles: one line each, not three.
+    assert!(!is_refused(&call_on(&srv, &agent, "demo.read", json!({}))));
+    assert_eq!(agent_line_pairs(&op), [pair("demo.read", "mcp")]);
+    assert_eq!(agent_line_pairs(&agent), [pair("demo.read", "mcp")]);
+
+    // An operator call reaches the operator once and the agent not at all.
+    assert!(!is_refused(&call_on(&srv, &op, "demo.read", json!({}))));
+    assert_eq!(agent_line_pairs(&op), [pair("demo.read", "operator")]);
+    assert_eq!(agent_line_pairs(&agent), Vec::<(String, String)>::new());
+}
+
+/// A refused `flow.subscribe` is audited like any refusal, under the server-assigned
+/// id of the connection that made it, and the audit fan-out routes it by role: an
+/// operator and a peer agent see it, and so does its own author (own lines are
+/// always visible). The pre-existing refusal test calls with no streaming connection
+/// (id `None`) and has no watchers, so it cannot see a refusal line lose its id or
+/// be dropped from a role's stream.
+#[test]
+fn a_refused_subscribe_is_audited_under_its_callers_id_and_fanned_by_role() {
+    let ring = Arc::new(AuditRing::default());
+    let state = Arc::new(AgentState::new(AgentPolicy::Auto));
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(
+        AgentPlugin::new(state.clone()).with_audit_ring(ring.clone()),
+    ));
+    let srv = McpServer::new(Arc::new(reg), McpTransport::Stdio)
+        .with_services(
+            Arc::new(MemFlowStore::new()),
+            Arc::new(StubClient),
+            Arc::new(StdGuard::default()),
+            None,
+        )
+        .with_agent_state(state.clone())
+        .with_audit_ring(ring.clone());
+
+    // All three subscribe while the policy still allows it (a successful subscribe
+    // is not audited, so the ring is still empty afterwards).
+    let op = watcher(&srv, Frontend::Operator);
+    let peer = watcher(&srv, Frontend::Mcp);
+    let author = watcher(&srv, Frontend::Mcp);
+    let author_id = init_id(&srv, &author);
+    assert_eq!(ring.len(), 0);
+
+    state.set_policy(AgentPolicy::Paused);
+    let reply = call_on(&srv, &author, "flow.subscribe", json!({}));
+    assert!(
+        is_refused(&reply),
+        "an agent subscribe is refused under Paused: {reply}"
+    );
+
+    let entries = ring.recent(None, None);
+    assert_eq!(entries.len(), 1, "the refusal is audited once: {entries:?}");
+    assert_eq!(entries[0].command, "flow.subscribe");
+    assert_eq!(entries[0].origin, Frontend::Mcp);
+    assert_eq!(
+        entries[0].connection_id.as_deref(),
+        Some(author_id.as_str()),
+        "the refusal carries the id its client was told at initialize"
+    );
+    assert!(
+        matches!(entries[0].result, aitm_core::AuditResult::Error(_)),
+        "the entry records a refusal: {:?}",
+        entries[0]
+    );
+
+    for (who, conn) in [
+        ("operator", &op),
+        ("peer agent", &peer),
+        ("author", &author),
+    ] {
+        let lines = agent_lines(conn);
+        assert_eq!(
+            lines.len(),
+            1,
+            "the {who} receives the refusal line: {lines:?}"
+        );
+        let params = &lines[0]["params"];
+        assert_eq!(
+            params["command"],
+            json!("flow.subscribe"),
+            "{who}: {params}"
+        );
+        assert_eq!(params["origin"], json!("mcp"), "{who}: {params}");
+        assert_eq!(params["connection_id"], json!(author_id), "{who}: {params}");
+        assert!(params["result"]["error"].is_string(), "{who}: {params}");
+    }
+}
+
+/// `actions_last_minute` is a one-minute window. The AC14/AC15 tests record every
+/// entry just now, so an `agent.status` that dropped the window (or widened it)
+/// still passes them; here two entries are two minutes old and one is thirty
+/// seconds old. The old ones count for no viewer and the recent one counts for the
+/// agent that may see it.
+#[test]
+fn agent_status_counts_only_the_last_minute() {
+    use aitm_core::AuditSink as _;
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+    let aged = |origin: Frontend, command: &str, age_secs: u64| aitm_core::AuditEntry {
+        at: SystemTime::now() - Duration::from_secs(age_secs),
+        origin,
+        client_label: None,
+        connection_id: None,
+        command: command.to_string(),
+        args_summary: "{}".to_string(),
+        result: aitm_core::AuditResult::Ok,
+    };
+    ring.append(aged(Frontend::Mcp, "old-agent", 120));
+    ring.append(aged(Frontend::Operator, "old-operator", 120));
+    ring.append(aged(Frontend::Mcp, "recent-agent", 30));
+    let agent = minted(&srv, Frontend::Mcp);
+    let op = minted(&srv, Frontend::Operator);
+
+    // The agent: only the 30-second-old entry is in the window.
+    let reply = call_on(&srv, &agent, "agent.status", json!({}));
+    assert_eq!(actions_last_minute(&reply), 1, "{reply}");
+    // The operator: that entry and the agent's status call just recorded; the two
+    // two-minute-old entries are out for it too.
+    let reply = call_on(&srv, &op, "agent.status", json!({}));
+    assert_eq!(actions_last_minute(&reply), 2, "{reply}");
+    // The agent again: still its own two, never the operator's status call.
+    let reply = call_on(&srv, &agent, "agent.status", json!({}));
+    assert_eq!(actions_last_minute(&reply), 2, "{reply}");
+}
+
+/// `exclude_self: false` is "off", exactly like absent, and the flag is per caller.
+/// AC15 passes `true` and absent but never an explicit `false`, so an `invoke` that
+/// excluded whenever the key was merely present would pass it. B's own
+/// `exclude_self: true` leaves out B's calls and counts A's.
+#[test]
+fn agent_status_exclude_self_false_counts_everything() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+    let a = minted(&srv, Frontend::Mcp);
+    let b = minted(&srv, Frontend::Mcp);
+    for _ in 0..3 {
+        assert!(!is_refused(&call_on(&srv, &a, "demo.read", json!({}))));
+    }
+    for _ in 0..2 {
+        assert!(!is_refused(&call_on(&srv, &b, "demo.read", json!({}))));
+    }
+
+    // A, explicit false: all five entries count, A's own three included.
+    let reply = call_on(&srv, &a, "agent.status", json!({"exclude_self": false}));
+    assert_eq!(
+        actions_last_minute(&reply),
+        5,
+        "false excludes nothing: {reply}"
+    );
+
+    // B, true: A's three reads and A's status call count; B's two reads do not.
+    let reply = call_on(&srv, &b, "agent.status", json!({"exclude_self": true}));
+    assert_eq!(
+        actions_last_minute(&reply),
+        4,
+        "B leaves out only B: {reply}"
+    );
+}
+
+/// Malformed `exclude_self`, and the forging attempts the new surface invites: every
+/// non-boolean is `-32602` (no truthy coercion of `1`, `"true"`, `null`), and a
+/// caller cannot name a connection to leave out, nor filter `agent.activity` by one:
+/// the id is server-assigned and read-only for a client. A refused call is a
+/// protocol error, so none of these is audited.
+#[test]
+fn agent_status_refuses_a_non_boolean_exclude_self_and_any_connection_it_is_told_to_name() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+    let a = minted(&srv, Frontend::Mcp);
+    let b = minted(&srv, Frontend::Mcp);
+    let b_id = init_id(&srv, &b);
+    assert!(!is_refused(&call_on(&srv, &a, "demo.read", json!({}))));
+    let before = ring.len();
+
+    for bad in [
+        json!(1),
+        json!(0),
+        json!(null),
+        json!("true"),
+        json!("false"),
+        json!([]),
+        json!({}),
+    ] {
+        let reply = call_on(
+            &srv,
+            &a,
+            "agent.status",
+            json!({"exclude_self": bad.clone()}),
+        );
+        assert_eq!(
+            reply["error"]["code"],
+            json!(-32602),
+            "exclude_self {bad} must be invalid params: {reply}"
+        );
+    }
+    for args in [
+        json!({"connection_id": b_id}),
+        json!({"exclude_self": true, "connection_id": b_id}),
+        json!({"exclude_connection": b_id}),
+    ] {
+        let reply = call_on(&srv, &a, "agent.status", args.clone());
+        assert_eq!(
+            reply["error"]["code"],
+            json!(-32602),
+            "agent.status {args} must not accept a named connection: {reply}"
+        );
+    }
+    let reply = call_on(&srv, &a, "agent.activity", json!({"connection_id": b_id}));
+    assert_eq!(
+        reply["error"]["code"],
+        json!(-32602),
+        "agent.activity takes no connection filter: {reply}"
+    );
+    assert_eq!(ring.len(), before, "protocol errors are not audited");
+}
+
+/// AC10 forges the id inside `initialize`; the id is stamped when a `tools/call`
+/// is audited, so forge it there: `_meta`, a top-level `connection_id`, a label and
+/// an `origin` in the call's params change nothing about the entry, and the same
+/// claim as a tool argument is refused by the schema instead of being stored.
+#[test]
+fn forged_tools_call_fields_never_set_the_entrys_connection_id_label_or_origin() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+    let conn = minted(&srv, Frontend::Mcp);
+    let id = init_id(&srv, &conn);
+
+    let forged = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+        "name": "demo.read", "arguments": {},
+        "_meta": {"connection_id": "conn_victim", "client_label": "victim", "origin": "operator"},
+        "connection_id": "conn_victim", "client_label": "victim", "origin": "operator"}});
+    let reply: JsonValue = serde_json::from_str(
+        &srv.handle_on(&conn, &forged.to_string())
+            .expect("a tools/call gets a reply"),
+    )
+    .expect("json");
+    assert!(
+        !is_refused(&reply) && reply.get("error").is_none(),
+        "the extra fields are ignored, not an error: {reply}"
+    );
+
+    let reply = call_on(
+        &srv,
+        &conn,
+        "demo.read",
+        json!({"connection_id": "conn_victim"}),
+    );
+    assert_eq!(
+        reply["error"]["code"],
+        json!(-32602),
+        "an argument named connection_id is refused: {reply}"
+    );
+
+    let entries = ring.recent(None, None);
+    assert_eq!(entries.len(), 1, "only the first call ran: {entries:?}");
+    assert_eq!(entries[0].connection_id.as_deref(), Some(id.as_str()));
+    assert_eq!(entries[0].client_label, None);
+    assert_eq!(entries[0].origin, Frontend::Mcp);
+}
+
+/// Drive `requests` through the real [`aitm_mcp::transport::serve_lines`] loop on a
+/// fresh in-memory pipe, as a connection the transport has not numbered yet
+/// (`conn_id == 0`, which is how `serve_stdio` and the TCP listener hand it over),
+/// and return one reply per request, in order. Nothing subscribes, so no
+/// notification interleaves with the replies.
+async fn serve_lines_exchange(srv: &Arc<McpServer>, requests: Vec<JsonValue>) -> Vec<JsonValue> {
+    let (client_side, server_side) = tokio::io::duplex(256 * 1024);
+    let (srv_r, srv_w) = tokio::io::split(server_side);
+    let task = tokio::spawn(aitm_mcp::transport::serve_lines(
+        srv.clone(),
+        BufReader::new(srv_r),
+        srv_w,
+        ConnCtx::new(srv.stdio_role()),
+    ));
+    let (cli_r, mut cli_w) = tokio::io::split(client_side);
+    let mut lines = BufReader::new(cli_r).lines();
+    let mut payload = String::new();
+    for request in &requests {
+        payload.push_str(&request.to_string());
+        payload.push('\n');
+    }
+    cli_w.write_all(payload.as_bytes()).await.expect("write");
+    let mut replies = Vec::new();
+    for _ in &requests {
+        let line = lines
+            .next_line()
+            .await
+            .expect("io")
+            .expect("one reply per request");
+        replies.push(serde_json::from_str(&line).expect("a reply is JSON"));
+    }
+    cli_w.shutdown().await.expect("shutdown");
+    task.await.expect("join").expect("loop ends cleanly at EOF");
+    replies
+}
+
+/// The transport path, not just `handle_on`: `serve_lines` numbers a fresh
+/// connection (`conn_id` 0 becomes a minted one), so its `initialize` reports a
+/// non-null id that a repeated or forged `initialize` and a later call all agree
+/// on, and a second connection to the same server gets a different one. The
+/// in-process tests hand `handle_on` a pre-numbered `ConnCtx`, so a `serve_lines`
+/// that stopped numbering connections (every id `null`) passes all of them.
+#[tokio::test]
+async fn serve_lines_numbers_each_connection_and_stamps_its_id_on_its_entries() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = Arc::new(audit_server(ring.clone()));
+    let init = |id: u64, params: JsonValue| json!({"jsonrpc": "2.0", "id": id, "method": "initialize", "params": params});
+    let read = |id: u64| {
+        json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "demo.read", "arguments": {}}})
+    };
+    let forged = json!({
+        "clientInfo": {"name": "conn_victim", "connection_id": "conn_victim"},
+        "_meta": {"connection_id": "conn_victim"},
+        "connection_id": "conn_victim",
+    });
+
+    // Connection one: initialize, a forged re-initialize, a call, initialize again.
+    let one = serve_lines_exchange(
+        &srv,
+        vec![
+            init(1, json!({})),
+            init(2, forged),
+            read(3),
+            init(4, json!({})),
+        ],
+    )
+    .await;
+    let id_one = one[0]["result"]["connection_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("serve_lines numbered the connection: {}", one[0]))
+        .to_string();
+    assert_ne!(id_one, "conn_victim");
+    assert_eq!(
+        one[1]["result"]["connection_id"],
+        json!(id_one),
+        "forged initialize"
+    );
+    assert_eq!(
+        one[3]["result"]["connection_id"],
+        json!(id_one),
+        "initialize after a call"
+    );
+
+    // Connection two on the same server.
+    let two = serve_lines_exchange(&srv, vec![init(1, json!({})), read(2)]).await;
+    let id_two = two[0]["result"]["connection_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("serve_lines numbered the second connection: {}", two[0]))
+        .to_string();
+    assert_ne!(id_one, id_two, "two connections, two ids");
+
+    let entries = ring.recent(None, None);
+    assert_eq!(
+        entries.len(),
+        2,
+        "one demo.read per connection: {entries:?}"
+    );
+    assert_eq!(entries[0].connection_id.as_deref(), Some(id_one.as_str()));
+    assert_eq!(entries[1].connection_id.as_deref(), Some(id_two.as_str()));
+    // The forged name became a label (a label is not an identity), capped; the id
+    // is untouched.
+    assert_eq!(entries[0].client_label.as_deref(), Some("conn_victim"));
+    assert_eq!(entries[1].client_label, None);
+}
+
+/// Every trusted-control role reads the whole ring by every surface, and no agent
+/// reads the CLI's entries either (the AC tests exercise the operator only).
+/// Sequence and the ring after each call: operator read (1), agent read (2), CLI
+/// read (3), CLI `agent.activity` (4), CLI `agent.status` (5), agent
+/// `agent.activity` (6), agent `agent.status` (7).
+#[test]
+fn the_cli_reads_the_whole_ring_by_every_surface_and_no_agent_reads_the_clis_entries() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+    let op = minted(&srv, Frontend::Operator);
+    let cli = minted(&srv, Frontend::Cli);
+    let agent = minted(&srv, Frontend::Mcp);
+    let cli_watch = watcher(&srv, Frontend::Cli);
+    let agent_watch = watcher(&srv, Frontend::Mcp);
+
+    for conn in [&op, &agent, &cli] {
+        assert!(!is_refused(&call_on(&srv, conn, "demo.read", json!({}))));
+    }
+
+    // The CLI reads all three entries, whatever their origin.
+    let rows = activity_rows(&call_on(&srv, &cli, "agent.activity", json!({})));
+    assert_eq!(
+        rows,
+        [
+            pair("demo.read", "operator"),
+            pair("demo.read", "mcp"),
+            pair("demo.read", "cli"),
+        ]
+    );
+    // And counts four: the three reads and its own agent.activity.
+    let reply = call_on(&srv, &cli, "agent.status", json!({}));
+    assert_eq!(actions_last_minute(&reply), 4, "{reply}");
+
+    // The agent reads only its own read, not the operator's nor the CLI's entries,
+    // and counts its read plus its own agent.activity.
+    let rows = activity_rows(&call_on(&srv, &agent, "agent.activity", json!({})));
+    assert_eq!(rows, [pair("demo.read", "mcp")]);
+    let reply = call_on(&srv, &agent, "agent.status", json!({}));
+    assert_eq!(actions_last_minute(&reply), 2, "{reply}");
+
+    // Pushed: the CLI's subscription got all seven lines; the agent's got its own
+    // three and never an operator or CLI line.
+    assert_eq!(
+        agent_line_pairs(&cli_watch),
+        [
+            pair("demo.read", "operator"),
+            pair("demo.read", "mcp"),
+            pair("demo.read", "cli"),
+            pair("agent.activity", "cli"),
+            pair("agent.status", "cli"),
+            pair("agent.activity", "mcp"),
+            pair("agent.status", "mcp"),
+        ]
+    );
+    assert_eq!(
+        agent_line_pairs(&agent_watch),
+        [
+            pair("demo.read", "mcp"),
+            pair("agent.activity", "mcp"),
+            pair("agent.status", "mcp"),
+        ]
+    );
+    assert_eq!(ring.len(), 7, "the ring holds everything, for every viewer");
+}
+
+/// A recording stand-in for the durable JSONL sink.
+#[derive(Default)]
+struct RecordingSink(std::sync::Mutex<Vec<aitm_core::AuditEntry>>);
+
+impl aitm_core::AuditSink for RecordingSink {
+    fn append(&self, entry: aitm_core::AuditEntry) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(entry);
+    }
+}
+
+/// The durable sink is never filtered: it records the operator's entry as well as
+/// the agent's, each with its connection id, in call order, even though an agent
+/// cannot read the operator's entry from the ring or the stream. The AC tests assert
+/// the ring is whole; a role filter moved from the read side into `record_audit`
+/// (so the durable log lost the operator's lines) passes all of them.
+#[test]
+fn the_durable_audit_sink_keeps_every_entry_even_those_an_agent_may_not_read() {
+    let ring = Arc::new(AuditRing::default());
+    let sink = Arc::new(RecordingSink::default());
+    let srv = audit_server(ring.clone()).with_durable_audit(sink.clone());
+    let op = minted(&srv, Frontend::Operator);
+    let agent = minted(&srv, Frontend::Mcp);
+    let op_id = init_id(&srv, &op);
+    let agent_id = init_id(&srv, &agent);
+
+    assert!(!is_refused(&call_on(&srv, &op, "demo.read", json!({}))));
+    assert!(!is_refused(&call_on(&srv, &agent, "demo.read", json!({}))));
+
+    let durable = sink
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(
+        durable
+            .iter()
+            .map(|e| aitm_core::origin_label(e.origin))
+            .collect::<Vec<_>>(),
+        ["operator", "mcp"]
+    );
+    assert_eq!(
+        durable
+            .iter()
+            .map(|e| e.connection_id.clone())
+            .collect::<Vec<_>>(),
+        [Some(op_id), Some(agent_id)]
+    );
+    // The agent's own view of the same history is only its entry.
+    let seen_by_agent = ring.recent_for(Frontend::Mcp, None, None);
+    assert_eq!(seen_by_agent.len(), 1);
+    assert_eq!(seen_by_agent[0].command, "demo.read");
+}
+
+/// A subscriber whose socket went away (its sink closed) or whose connection ended
+/// (its subscriptions dropped) neither stops the fan-out from reaching the
+/// subscribers after it in the registry nor hears a later line. The dead operator
+/// connection subscribed first, so the loop reaches it before the live ones. This is
+/// a regression guard for `fanout_audit` (no current-code mutation but an abort at a
+/// dead subscriber fails it).
+#[test]
+fn a_closed_or_dropped_subscriber_neither_starves_the_others_nor_hears_further_lines() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+    let closed = watcher(&srv, Frontend::Operator);
+    let dropped = watcher(&srv, Frontend::Mcp);
+    let live_agent = watcher(&srv, Frontend::Mcp);
+    let live_op = watcher(&srv, Frontend::Operator);
+
+    // The transport's writer task closes the sink when the client goes away; the
+    // read loop drops the connection's subscriptions when its stream ends.
+    closed.out.as_ref().expect("a watcher has a sink").close();
+    srv.drop_connection(dropped.conn_id);
+
+    let caller = minted(&srv, Frontend::Mcp);
+    assert!(!is_refused(&call_on(&srv, &caller, "demo.read", json!({}))));
+
+    assert_eq!(agent_line_pairs(&live_agent), [pair("demo.read", "mcp")]);
+    assert_eq!(agent_line_pairs(&live_op), [pair("demo.read", "mcp")]);
+    assert_eq!(
+        agent_line_pairs(&dropped),
+        Vec::<(String, String)>::new(),
+        "a dropped connection hears nothing further"
+    );
+}
+
+/// The label cap's call site, end to end, on hostile input. AC11 proves the length
+/// cut through `serve_lines`, and `cap_client_label` is unit-tested alone, but
+/// nothing proves the transport applies the *whole* function: a call site that cut
+/// to 128 bytes without the control-character and scrub steps passes both. Here a
+/// name carrying an ANSI escape and a `token=` secret reaches the command host and
+/// the audit entry sanitised. Around it the connection survives malformed input: a
+/// message that is not a request object, and `initialize` calls whose name is a
+/// number, `null`, absent (`clientInfo` a string) or empty each leave the label
+/// unset and the connection serving; the first valid name wins and a later
+/// `initialize` cannot relabel the connection.
+#[tokio::test]
+async fn serve_lines_sanitises_a_hostile_client_name_and_survives_malformed_ones() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = Arc::new(
+        McpServer::new(role_registry(), McpTransport::Stdio)
+            .with_agent_state(ungated())
+            .with_services(
+                Arc::new(MemFlowStore::new()),
+                Arc::new(StubClient),
+                Arc::new(StdGuard::default()),
+                None,
+            )
+            .with_audit_ring(ring.clone()),
+    );
+    let init = |id: u64, client_info: JsonValue| {
+        json!({"jsonrpc": "2.0", "id": id, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": client_info}})
+    };
+    let label_probe = |id: u64| {
+        json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "demo.client", "arguments": {}}})
+    };
+
+    let replies = serve_lines_exchange(
+        &srv,
+        vec![
+            json!("this is a JSON string, not a request object"),
+            init(2, json!({"name": 12345})),
+            init(3, json!({"name": null})),
+            init(4, json!("just a string")),
+            init(5, json!({"name": ""})),
+            label_probe(6),
+            init(7, json!({"name": "agent\u{1b}[2J token=abc123"})),
+            label_probe(8),
+            init(9, json!({"name": "second-name"})),
+            label_probe(10),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        replies[0]["error"]["code"],
+        json!(-32600),
+        "a non-object message is an invalid request, not a dropped connection: {}",
+        replies[0]
+    );
+    for (i, reply) in replies.iter().enumerate().skip(1) {
+        assert!(
+            reply.get("error").is_none(),
+            "message {i} is answered, not an error: {reply}"
+        );
+    }
+    let seen = |reply: &JsonValue| reply["result"]["structuredContent"].clone();
+    assert_eq!(
+        seen(&replies[5]),
+        json!("<none>"),
+        "no valid name yet: the label is unset"
+    );
+    // Control character to `?`, secret masked, both at the real call site.
+    assert_eq!(seen(&replies[7]), json!("agent?[2J token=[redacted]"));
+    // First valid name wins: a later initialize does not relabel the connection.
+    assert_eq!(seen(&replies[9]), json!("agent?[2J token=[redacted]"));
+
+    // Every initialize reply names the same connection, never null.
+    let ids: Vec<&JsonValue> = [1, 2, 3, 4, 6, 8]
+        .iter()
+        .map(|&i| &replies[i]["result"]["connection_id"])
+        .collect();
+    assert!(ids[0].is_string(), "{}", replies[1]);
+    assert!(
+        ids.iter().all(|id| *id == ids[0]),
+        "one connection, one id across every initialize: {ids:?}"
+    );
+
+    let labels: Vec<Option<String>> = ring
+        .recent(None, None)
+        .into_iter()
+        .map(|e| e.client_label)
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            None,
+            Some("agent?[2J token=[redacted]".to_string()),
+            Some("agent?[2J token=[redacted]".to_string()),
+        ],
+        "the audit entries carry the same sanitised label"
+    );
+}
