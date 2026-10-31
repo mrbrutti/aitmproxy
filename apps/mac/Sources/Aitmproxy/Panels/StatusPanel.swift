@@ -6,8 +6,8 @@ import SwiftUI
 /// session shows. Three lane cards — Core, Bus, Capture — each a state dot + word, the
 /// one fact under it, the remedy when something needs doing, and its actions; then the
 /// Getting-started checklist and the last five flows. Every word comes from
-/// `Session.connectionSummary`, so this page, the pill, the status bar and the sidebar
-/// row can never disagree. Hue only on the state dot; hairline rules, no cards-with-shadows.
+/// `Session.connectionSummary`, so this page, the toolbar's connection cluster, the Core
+/// Log header and the Settings rows can never disagree. Hue only on the state dot; hairline rules, no cards-with-shadows.
 struct StatusPanel: View {
     @Environment(Session.self) private var session
     @Environment(\.openSettings) private var openSettings

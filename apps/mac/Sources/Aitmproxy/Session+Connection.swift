@@ -4,8 +4,9 @@ import Foundation
 
 /// The connection lanes (core, bus, capture) as one value, and the one place a
 /// `ConnectionAction` turns into the same call its menu-bar item makes. Every connection
-/// indicator — the Status page, the toolbar pill, the status bar, the sidebar row — reads
-/// `connectionSummary`, so their words come from one table and never disagree.
+/// indicator — the Status page, the toolbar's connection cluster, the Core Log header, the
+/// Settings rows — reads `connectionSummary`, so their words come from one table and never
+/// disagree. The sidebar and the status bar carry no connection state at all (spec §4).
 extension Session {
     var connectionSummary: ConnectionSummary {
         ConnectionSummary.make(

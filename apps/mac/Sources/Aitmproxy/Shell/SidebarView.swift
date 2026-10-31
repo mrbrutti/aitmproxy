@@ -2,8 +2,8 @@ import AitmproxyKit
 import AppKit
 import SwiftUI
 
-/// Working: Pinned, Saved · All: Apps, Domains · aitmproxy: Scope, Scan,
-/// Findings, Browser, Scripts, Agent (foundation §2.6). Flat `surface`, 28px rows,
+/// Traffic: Flows, Apps, Domains, Pinned, Connections, Overview · Testing: Scope, Scan,
+/// Findings, Browser · Automation: Scripts, Agent (spec §3). Flat `surface`, 28px rows,
 /// counts only on queues. Apps and Domains expand to one sub-item per
 /// client / host; a sub-item narrows the list (S-013); ⇧P pins one (S-014).
 struct SidebarView: View {
@@ -78,37 +78,18 @@ struct SidebarView: View {
         .dimsWhenInactive()
     }
 
-    /// `›•‹ aitmproxy  ● ok` — the product mark and wordmark, and the one place in the sidebar
-    /// that says whether the proxy is working: the worst connection lane's glyph and name when
-    /// something needs attention ("⚠ Capture", "✕ Core"), "ok" otherwise. Clicking opens the
-    /// Status page (also ⌘0, the toolbar pill and the status bar's connection item).
+    /// `›•‹ aitmproxy` — the product mark and wordmark, nothing else. Connection state has one
+    /// home, the toolbar's connection cluster (spec §4, revision 2); this row says nothing about it.
     private var brand: some View {
-        let summary = session.connectionSummary
-        let worst = summary.worst
-        let selected = session.page == .status
-        return Button {
-            session.show(.status)
-        } label: {
-            HStack(spacing: Space.sm) {
-                ProductMark().frame(width: 16, height: 16)
-                Text("aitmproxy").font(Tok.Face.ui(Tok.Typography.Size.md, .medium)).foregroundStyle(Tok.Ink.primary.color)
-                Spacer(minLength: Space.xs)
-                HStack(spacing: Tok.Metric.gapTight) {
-                    Image(systemName: worst.state.symbol).font(.system(size: Tok.Size.iconInline))
-                    Text(summary.badge).lineLimit(1)
-                }
-                .font(Tok.Face.ui(Tok.Typography.Size.sm))
-                .foregroundStyle(summary.overall == .ok ? Tok.Ink.tertiary.color : worst.state.color.color)
-            }
-            .padding(.horizontal, Space.lg)
-            .frame(height: Tok.Size.toolbar)
-            .background(selected ? Tok.Ground.active.color : .clear)
-            .contentShape(Rectangle())
+        HStack(spacing: Space.sm) {
+            ProductMark().frame(width: 16, height: 16)
+            Text("aitmproxy").font(Tok.Face.ui(Tok.Typography.Size.md, .medium)).foregroundStyle(Tok.Ink.primary.color)
+            Spacer(minLength: 0)
         }
-        .buttonStyle(.plain)
-        .help(summary.tooltip + "\nOpens Status (⌘0)")
-        .accessibilityLabel("Status, \(summary.overall == .ok ? "ok" : worst.kind.title + " " + worst.word)")
-        .accessibilityAddTraits(selected ? .isSelected : [])
+        .padding(.horizontal, Space.lg)
+        .frame(height: Tok.Size.toolbar)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("aitmproxy")
     }
 
     /// Editorial section labels: small, tracked capitals in the tertiary tier.
