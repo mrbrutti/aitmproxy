@@ -20,10 +20,10 @@ use web_bus::{
     recv_text, send_text, Server, ServerOptions, TestCommands, Ws, AGENT_TOKEN, OPERATOR_TOKEN,
 };
 
-/// A served `aitm web` whose bridge holds the agent token and, when
-/// `operator` is set, the operator bridge token too. It is the server this
-/// suite has always run against: the plain assembly with no test commands and
-/// the `McpServer`'s own default gate, not the wired one the push suite uses.
+/// A served `aitm web` whose bridge holds the agent token and, when `operator` is
+/// set, the operator bridge token too. It uses the plain assembly with no test
+/// commands and the `McpServer`'s own default gate, not the wired one the push
+/// suite uses.
 async fn start(tag: &str, operator: Option<&str>) -> Server {
     web_bus::start(
         tag,

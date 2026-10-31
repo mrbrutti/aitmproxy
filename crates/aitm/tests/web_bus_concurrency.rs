@@ -39,10 +39,10 @@ use web_bus::{
 /// `MAX_BATCH_LEN` in the MCP HTTP transport, pinned here as a literal.
 const MAX_LINES_PER_FRAME: u64 = 256;
 
-/// A served `aitm web` over the real wired registry plus the test commands. It is
-/// the server this suite has always run against: no operator token, only the four
-/// commands it was written with, and the `McpServer`'s own default gate, not the
-/// wired one the push suite uses.
+/// A served `aitm web` over the real wired registry plus the test commands, set up
+/// for this suite: no operator token, only `test.block`, `test.sleep`, `test.tick`
+/// and `test.panic`, and the `McpServer`'s own default gate rather than the wired
+/// one the push suite uses.
 async fn start(tag: &str, commands: &TestCommands) -> Server {
     web_bus::start(
         tag,

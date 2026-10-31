@@ -12,10 +12,11 @@
 //! mod web_bus;
 //! ```
 //!
-//! Every helper is the strictest copy of the three it replaced, never a more
-//! lenient one: where a suite needs a different signature it keeps a thin
-//! file-local wrapper around the item here. The suites assert on roles and
-//! behaviour, never on the token values, so one token pair serves them all.
+//! Where a suite needs a different signature or a stricter check it keeps a thin
+//! file-local wrapper around the item here (`web_bus_concurrency`'s `open_bus`
+//! asserts that the `initialize` reply is the first frame instead of skipping
+//! ahead to it). The suites assert on roles and behaviour, never on the token
+//! values, so one token pair serves them all.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
@@ -61,9 +62,9 @@ pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(1);
 /// The most a parked `test.block` waits for the test to release it. The test
 /// releases it (a panicking test releases it on unwind); this only stops a wedged
 /// run from pinning the runtime's blocking pool at shutdown.
-pub const BLOCK_LIMIT: Duration = Duration::from_secs(30);
+const BLOCK_LIMIT: Duration = Duration::from_secs(30);
 /// How long `test.sleep` holds its blocking thread.
-pub const SLEEP: Duration = Duration::from_millis(100);
+const SLEEP: Duration = Duration::from_millis(100);
 /// The reason `park_for_approval` gives when it refuses at once for want of a
 /// subscribed operator (no park).
 pub const NO_OPERATOR: &str = "no operator is connected to approve it";
@@ -72,7 +73,7 @@ pub const PARKED_TIMED_OUT: &str =
     "no operator approved the parked sensitive command within the approval timeout";
 
 /// A fresh, unique CA directory under the system temp dir for one test's server.
-pub fn temp_ca_dir(tag: &str) -> PathBuf {
+fn temp_ca_dir(tag: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -83,7 +84,7 @@ pub fn temp_ca_dir(tag: &str) -> PathBuf {
 }
 
 /// A `ProxyClient` nothing in these tests invokes.
-pub struct UnusedClient;
+struct UnusedClient;
 impl ProxyClient for UnusedClient {
     fn send(&self, _req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
         Box::pin(async { anyhow::bail!("not called") })
@@ -226,7 +227,7 @@ impl Command for TickCmd {
 /// The size of the string `test.blob` returns: 1 MiB. A reply carries it twice (in
 /// `structuredContent` and in the rendered `content` text, neither of which is
 /// truncated), so one reply is a little over 2 MiB on the wire.
-pub const BLOB_BYTES: usize = 1 << 20;
+const BLOB_BYTES: usize = 1 << 20;
 
 /// `test.blob`: replies with [`BLOB_BYTES`] bytes of text, so a test can make the
 /// bridge's reply send site write far more than the socket buffers hold.
@@ -306,10 +307,9 @@ impl TestCommands {
         }
     }
 
-    /// The same commands and shared state, minus the ones added since
-    /// `web_bus_concurrency` was written (`test.blob`, `test.sensitive`): exactly
-    /// the four it always registered, `test.block`, `test.sleep`, `test.tick` and
-    /// `test.panic`.
+    /// The same commands and shared state without `test.blob` and
+    /// `test.sensitive`, for a suite that runs against exactly `test.block`,
+    /// `test.sleep`, `test.tick` and `test.panic`.
     pub fn without_extras(&self) -> Self {
         Self {
             extras: false,
@@ -365,14 +365,14 @@ pub struct ServerOptions {
     /// the web UI is agent-only.
     pub operator_token: Option<String>,
     /// Hand the bridge's `McpServer` the assembled agent state and `approval_timeout`
-    /// (`with_agent_state`, `with_approval_timeout`), as `main.rs` does. `false`
-    /// leaves it on its own defaults, an `Auto` gate and the default approval
-    /// timeout, which is how `web_bus_concurrency` and `web_bus_roles` ran before this
-    /// module existed; `policy` and `approval_timeout` then do not reach the gate.
+    /// (`with_agent_state`, `with_approval_timeout`), as `main.rs` does. When
+    /// `false`, the server is built without the wired agent gate, as the older
+    /// suites run it: it keeps its own defaults, an `Auto` gate and the default
+    /// approval timeout, and `policy` and `approval_timeout` do not reach the gate.
     pub wired_gate: bool,
     /// Register the `commands` passed to [`start`] through the scripting wiring.
-    /// `false` assembles with an empty `ScriptWiring`, the plain `assemble`, as
-    /// `web_bus_roles` always did.
+    /// When `false`, the server assembles with an empty `ScriptWiring` (the plain
+    /// `assemble`), for a suite that needs no test commands.
     pub test_commands: bool,
     /// The bridge's write deadline (`McpServer::with_write_timeout`); `None` keeps
     /// the server default.
@@ -715,10 +715,10 @@ pub fn call_line_with(id: u64, name: &str, arguments: JsonValue) -> String {
     .to_string()
 }
 
-/// Open the bus as `token`: connect, authenticate, `initialize`, and check the
-/// role echo is `role`.
-pub async fn open_bus(server: &Server, token: &str, role: &str) -> Ws {
-    let mut ws = ws_connect(server).await;
+/// Authenticate an already connected bus socket as `token`, run `initialize`, and
+/// check the role echo is `role`. For a socket a test connects itself, for example
+/// with socket options [`ws_connect`] does not set.
+pub async fn authenticate(mut ws: Ws, token: &str, role: &str) -> Ws {
     send_text(&mut ws, json!({ "token": token }).to_string()).await;
     send_text(
         &mut ws,
@@ -733,6 +733,11 @@ pub async fn open_bus(server: &Server, token: &str, role: &str) -> Ws {
     ws
 }
 
+/// Open the bus as `token`: connect, then [`authenticate`].
+pub async fn open_bus(server: &Server, token: &str, role: &str) -> Ws {
+    authenticate(ws_connect(server).await, token, role).await
+}
+
 pub async fn open_agent(server: &Server) -> Ws {
     open_bus(server, AGENT_TOKEN, "agent").await
 }
@@ -744,9 +749,9 @@ pub async fn open_operator(server: &Server) -> Ws {
 /// The request id every [`subscribe`] uses.
 const SUBSCRIBE_ID: u64 = 1;
 
-/// `flow.subscribe {}` on `ws`; the reply must carry a `sub_id` (AC1's first
-/// clause). A notification may precede the reply (spec D6), so the reply is
-/// found by id.
+/// `flow.subscribe {}` on `ws`; the reply must carry a `sub_id` (web-bus-push
+/// AC1). A notification may precede the reply (web-bus-push spec D6), so the
+/// reply is found by id.
 pub async fn subscribe(ws: &mut Ws) -> u64 {
     send_text(ws, call_line(SUBSCRIBE_ID, "flow.subscribe")).await;
     let reply = recv_until(ws, "the flow.subscribe reply", |v| v["id"] == SUBSCRIBE_ID).await;

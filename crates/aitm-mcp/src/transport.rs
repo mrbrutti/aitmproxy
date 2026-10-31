@@ -18,6 +18,7 @@ use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Take,
 };
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinError;
 
 use crate::server::{error_response, ConnCtx, McpServer, NotificationSink, UNAUTHORIZED};
 
@@ -26,8 +27,9 @@ use crate::server::{error_response, ConnCtx, McpServer, NotificationSink, UNAUTH
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Serve newline-delimited JSON-RPC on one connection: each line in is one
-/// message, each reply out is one line. Returns at EOF. Commands run on the
-/// blocking pool so a slow tool cannot stall the runtime.
+/// message, each reply out is one line. Returns at EOF, at a read error, or when
+/// the writer fails (see below). Commands run on the blocking pool so a slow tool
+/// cannot stall the runtime.
 ///
 /// The write half is owned by a dedicated writer task draining the connection's
 /// bounded [`NotificationSink`] (F4): both request replies and server-initiated
@@ -37,19 +39,18 @@ pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 /// subscriptions are dropped and the writer drains and exits.
 ///
 /// Each write the writer makes (one `write_all` per line, and the `flush`) runs
-/// under [`McpServer::write_timeout`]. The clock stops when the writer has handed
-/// the line to the socket, not when the peer reads it, so a slow reader that
-/// keeps freeing room is never cut; a peer that stops reading with its buffers
-/// full is. That alone would not end the connection, because the read loop sits
-/// in `read_line` and a stopped but still-open peer never sends EOF. So if the
-/// writer ends in an error (the deadline, or a failed write) before the read loop
-/// ends, the read loop is abandoned: the connection's subscriptions are dropped,
-/// the sink is closed, and the writer's error is returned. A writer that ends
-/// cleanly, or a read loop that ends first, behaves as it always has: the
-/// connection ends when the read loop does, and the writer is given the chance
-/// to drain what is queued (still bounded by the deadline). A command already
-/// running on the blocking pool when the loop is abandoned finishes, but its
-/// reply is lost, as on any disconnect.
+/// under [`McpServer::write_timeout`], which states what that deadline does and
+/// does not detect. Expiry alone would not end the connection, because the read
+/// loop sits in `read_line` and a stopped but still-open peer never sends EOF. So
+/// if the writer ends in an error before the read loop ends, the read loop is
+/// abandoned: the sink is closed, the connection's subscriptions are dropped, and
+/// the writer's error is returned. A writer ends in an error when the deadline
+/// expires, when a write fails, or when its task panics (the error then says the
+/// writer task failed). A writer that ends cleanly, or a read loop that ends
+/// first, leaves the connection to end when the read loop does, and the writer is
+/// given the chance to drain what is queued (still bounded by the deadline). A
+/// command already running on the blocking pool when the loop is abandoned
+/// finishes, but its reply is lost, as on any disconnect.
 ///
 /// `conn` carries the connection's role (from its auth token, or `stdio_role`)
 /// and, once an `initialize` arrives, its `clientInfo.name` label; every message
@@ -76,46 +77,39 @@ where
         conn.conn_id = server.next_conn_id();
     }
     let conn_id = conn.conn_id;
-    // When the writer task ends — the socket closed, `write_all` errored because
-    // the client disconnected, or a write hit its deadline — close the sink. That
-    // unblocks a read loop parked in `await_reply_capacity` (which would
-    // otherwise wait forever for a writer that has gone) so the connection tears
-    // down cleanly.
     let write_timeout = server.write_timeout();
-    let mut writer_task = tokio::spawn({
+    let mut writer_task = Some(tokio::spawn({
         let sink = sink.clone();
         async move {
-            let r = write_loop(writer, sink.clone(), write_timeout).await;
+            let result = write_loop(writer, sink.clone(), write_timeout).await;
+            // When the writer ends (the socket closed, a write failed, or a write
+            // hit its deadline) close the sink. That unblocks a read loop parked
+            // in `await_reply_capacity`, which would otherwise wait forever for a
+            // writer that has gone, so the connection tears down cleanly. A
+            // panic skips this line; teardown below closes the sink regardless.
             sink.close();
-            r
+            result
         }
-    });
+    }));
 
     // Race the read loop against the writer. The lib's tokio build omits the
     // `macros` feature (as in `http.rs`), so there is no `select!`: the two
     // futures are polled by hand, the read loop first, so that if it has ended
     // (EOF, a read error) that ends the connection even if the writer ended in the
     // same instant. A `JoinHandle` must not be polled or awaited again once it has
-    // completed, so `writer_joined` records that it has.
+    // completed, so `writer_task` is emptied as soon as it has.
     let mut read = std::pin::pin!(read_loop(server.clone(), reader, conn, sink.clone()));
-    let mut writer_joined = false;
     let outcome = std::future::poll_fn(|cx| {
         if let Poll::Ready(outcome) = read.as_mut().poll(cx) {
             return Poll::Ready(outcome);
         }
-        if !writer_joined {
-            if let Poll::Ready(joined) = Pin::new(&mut writer_task).poll(cx) {
-                writer_joined = true;
+        if let Some(task) = writer_task.as_mut() {
+            if let Poll::Ready(joined) = Pin::new(task).poll(cx) {
+                writer_task = None;
                 // A writer that failed ends the connection now. One that ended
-                // cleanly leaves the read loop to end it, as before.
-                match joined {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => return Poll::Ready(Err(err)),
-                    Err(join) => {
-                        return Poll::Ready(Err(
-                            anyhow::Error::new(join).context("the connection's writer task failed")
-                        ))
-                    }
+                // cleanly leaves the read loop to end it.
+                if let Some(err) = writer_failure(joined) {
+                    return Poll::Ready(Err(err));
                 }
             }
         }
@@ -123,14 +117,31 @@ where
     })
     .await;
 
-    // Teardown: drop this connection's subscriptions, then let the writer drain
+    // Teardown: close the sink, then drop this connection's subscriptions. In that
+    // order a `flow.subscribe` still in flight (a command on the blocking pool
+    // that outlived the abandoned read loop) is either refused, because the sink
+    // is closed, or swept by the drop; it cannot register after the drop and
+    // outlive the connection (see `Subscriptions::add`). Then let the writer drain
     // what is queued and exit.
-    server.drop_connection(conn_id);
     sink.close();
-    if !writer_joined {
-        let _ = writer_task.await;
+    server.drop_connection(conn_id);
+    if let Some(task) = writer_task {
+        if let Some(err) = writer_failure(task.await) {
+            tracing::debug!(error = %format_args!("{err:#}"), "bus connection's writer ended with an error");
+        }
     }
     outcome
+}
+
+/// The error a finished writer task ended the connection with, if it failed: the
+/// writer's own error (the deadline, or a failed write), or the join error of a
+/// writer that panicked or was cancelled. `None` when the writer ended cleanly.
+fn writer_failure(joined: Result<anyhow::Result<()>, JoinError>) -> Option<anyhow::Error> {
+    match joined {
+        Ok(Ok(())) => None,
+        Ok(Err(err)) => Some(err),
+        Err(join) => Some(anyhow::Error::new(join).context("the connection's writer task failed")),
+    }
 }
 
 /// The read half of [`serve_lines`]: dispatch each incoming line through
@@ -179,9 +190,9 @@ where
 
 /// Drain `sink` to `writer` until the sink is closed and empty. Each frame is a
 /// complete JSON-RPC line; a trailing newline is appended per line. Every
-/// `write_all`, and the `flush` after a batch, must finish within
-/// `write_timeout`; if one does not, the loop returns an error whose text starts
-/// `write timed out after` and the connection is given up on (see
+/// `write_all`, and the `flush` after a batch, runs under `write_timeout` (see
+/// [`McpServer::write_timeout`]); when one expires the loop returns an error whose
+/// text starts `write timed out after` and the connection is given up on (see
 /// [`serve_lines`]).
 async fn write_loop<W>(
     mut writer: W,
@@ -213,10 +224,10 @@ where
 /// Run one write-side operation, giving up if it takes longer than `limit`.
 /// Expiry is an error whose text starts `write timed out after`; an I/O error
 /// from the operation itself passes through unchanged.
-async fn within<T>(
+async fn within(
     limit: Duration,
-    operation: impl Future<Output = io::Result<T>>,
-) -> anyhow::Result<T> {
+    operation: impl Future<Output = io::Result<()>>,
+) -> anyhow::Result<()> {
     match tokio::time::timeout(limit, operation).await {
         Ok(result) => Ok(result?),
         Err(_) => anyhow::bail!("write timed out after {limit:?}"),
@@ -318,8 +329,12 @@ impl LoopbackTcp {
             let agent = self.agent_token.clone();
             let operator = self.operator_token.clone();
             tokio::spawn(async move {
-                // A failed connection is that client's problem, not the server's.
-                let _ = serve_connection(srv, stream, &agent, operator.as_deref()).await;
+                // A failed connection is that client's problem, not the server's:
+                // it is logged at debug (never with a token; the errors carry none)
+                // and the listener goes on accepting.
+                if let Err(err) = serve_connection(srv, stream, &agent, operator.as_deref()).await {
+                    tracing::debug!(error = %format_args!("{err:#}"), "bus connection ended with an error");
+                }
             });
         }
     }
@@ -450,6 +465,8 @@ async fn read_message<R: AsyncBufRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use aitm_core::{McpTransport, Registry};
     use serde_json::json;
@@ -612,18 +629,30 @@ mod tests {
     }
 
     /// Serve one `Frontend::Operator` connection of `server` over `duplex(256)`:
-    /// a pipe so small that a write blocks exactly like a stopped socket. The
-    /// connection's push sink is injected, holding `capacity` notification lines.
-    fn serve_over_tiny_pipe(server: &Arc<McpServer>, capacity: usize) -> LineClient {
+    /// a pipe so small that a write blocks exactly like a stopped socket. `sink`
+    /// is the connection's injected push sink, so the test can watch its bounds.
+    fn serve_over_tiny_pipe(server: &Arc<McpServer>, sink: NotificationSink) -> LineClient {
+        serve_through(server, sink, |server_write| server_write)
+    }
+
+    /// As [`serve_over_tiny_pipe`], with the server's write half passed through
+    /// `wrap` first, for a test that needs a writer with its own behaviour.
+    fn serve_through<W>(
+        server: &Arc<McpServer>,
+        sink: NotificationSink,
+        wrap: impl FnOnce(WriteHalf<DuplexStream>) -> W,
+    ) -> LineClient
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         let (client, server_side) = duplex(256);
         let (server_read, server_write) = split(server_side);
-        let sink = NotificationSink::new(capacity);
         let mut conn = ConnCtx::new(Frontend::Operator);
         conn.out = Some(sink.clone());
         let task = tokio::spawn(serve_lines(
             server.clone(),
             BufReader::new(server_read),
-            server_write,
+            wrap(server_write),
             conn,
         ));
         let (client_read, writer) = split(client);
@@ -664,15 +693,16 @@ mod tests {
         }
     }
 
-    /// AC14: a client that subscribes and then neither reads nor closes cannot
-    /// pin the connection. The writer's `write_all` stalls on the full pipe, the
-    /// write deadline expires, and `serve_lines` returns that error instead of
-    /// parking in `read_line` for a peer that never sends EOF; the subscriptions
-    /// are dropped and the sink closed, so a later push queues nothing.
+    /// A client that subscribes and then neither reads nor closes cannot pin the
+    /// connection (bus-hardening AC14). The writer's `write_all` stalls on the
+    /// full pipe, the write deadline expires, and `serve_lines` returns that error
+    /// instead of parking in `read_line` for a peer that never sends EOF; the
+    /// subscriptions are dropped and the sink closed, so a later push queues
+    /// nothing.
     #[tokio::test]
     async fn a_stopped_line_reader_ends_the_connection_after_the_write_deadline() {
         let server = server_with_deadline(Duration::from_millis(200));
-        let mut client = serve_over_tiny_pipe(&server, 64);
+        let mut client = serve_over_tiny_pipe(&server, NotificationSink::new(64));
         client.subscribe().await;
 
         for seq in 0..16 {
@@ -704,15 +734,19 @@ mod tests {
         drop((client.writer, client.lines));
     }
 
-    /// AC15: a reader that is slow but live (one line per 5 ms) frees room within
-    /// the deadline every time, so it receives every pushed line, in order, and
-    /// the connection is still up afterwards. It ends only when the client closes.
+    /// A reader that is slow but live is not cut (bus-hardening AC15). It reads
+    /// one line per 20 ms, so it frees room for the next write well inside the 1 s
+    /// deadline every time (50 times over), yet the 100 lines take 2 s in all,
+    /// longer than the deadline: a deadline over the whole batch instead of over
+    /// each write would end this connection. The reader receives every pushed
+    /// line, in order, and the connection is still up afterwards; it ends only when
+    /// the client closes.
     #[tokio::test]
     async fn a_slow_line_reader_is_not_disconnected() {
         const PUSHES: u64 = 100;
-        let server = server_with_deadline(Duration::from_millis(200));
+        let server = server_with_deadline(Duration::from_secs(1));
         // The sink holds every push, so none is dropped as lag before it is read.
-        let mut client = serve_over_tiny_pipe(&server, PUSHES as usize);
+        let mut client = serve_over_tiny_pipe(&server, NotificationSink::new(PUSHES as usize));
         client.subscribe().await;
 
         for seq in 0..PUSHES {
@@ -728,7 +762,7 @@ mod tests {
                 line["params"]["seq"], seq,
                 "the pushes arrive in order, none lost: {line}"
             );
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(
             !client.task.is_finished(),
@@ -743,15 +777,14 @@ mod tests {
         ended.expect("a client that closes ends the connection cleanly");
     }
 
-    /// Not in the plan's three: a writer that ends cleanly (here the sink is
-    /// closed under it with nothing queued) does not end the connection. The read
-    /// loop keeps serving until the client closes, as it did before the write
-    /// deadline existed, and the finished writer's `JoinHandle` is not awaited a
-    /// second time at teardown (which would panic the task).
+    /// A writer that ends cleanly (here the sink is closed under it with nothing
+    /// queued) does not end the connection: the read loop keeps serving until the
+    /// client closes, and teardown does not await the finished writer a second
+    /// time (which would panic the task).
     #[tokio::test]
     async fn a_writer_that_ends_cleanly_does_not_end_the_connection() {
         let server = server_with_deadline(Duration::from_millis(200));
-        let client = serve_over_tiny_pipe(&server, 64);
+        let client = serve_over_tiny_pipe(&server, NotificationSink::new(64));
         client.sink.close();
         // Long enough for the writer to see the closed sink and finish.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -798,10 +831,9 @@ mod tests {
         }
     }
 
-    /// Added by the tester (spec D3, "each `write_all` and the `flush`"): the
-    /// `flush` after a batch is under the write deadline too. The AC14 duplex test
-    /// only reaches `write_all`; this one is the stdio shape, where `flush` is what
-    /// waits on a parent that has stopped reading our stdout.
+    /// The `flush` after a batch is under the write deadline too, not only each
+    /// `write_all`. This is the stdio shape, where `flush` is what waits on a
+    /// parent that has stopped reading our stdout.
     #[tokio::test]
     async fn a_flush_that_never_completes_hits_the_write_deadline() {
         let sink = NotificationSink::new(4);
@@ -819,31 +851,25 @@ mod tests {
         );
     }
 
-    /// Added by the tester: the stop AC14 does not cover, a client that keeps
-    /// sending requests and never reads the replies. The writer stalls on the full
-    /// pipe, replies pile up to the reply lane's high-water mark (4 here), so the
-    /// read loop is normally held back by that backpressure rather than parked in
-    /// `read_line` (the test does not assert which of the two it is in). The client
-    /// never closes, so only the writer's failure can end the connection, and it
-    /// must.
+    /// A client that keeps sending requests and never reads the replies is
+    /// disconnected, the stop the subscribe-then-stall test does not cover. The
+    /// writer stalls on the full pipe and replies pile up to the reply lane's
+    /// high-water mark (4 here), so the read loop is normally held back by that
+    /// backpressure rather than parked in `read_line` (the test does not assert
+    /// which of the two it is in). The client never closes, so only the writer's
+    /// failure can end the connection, and it must.
     #[tokio::test]
     async fn a_client_that_floods_requests_and_never_reads_replies_is_disconnected() {
         let server = server_with_deadline(Duration::from_millis(200));
-        let (client, server_side) = duplex(256);
-        let (server_read, server_write) = split(server_side);
-        let sink = NotificationSink::with_limits(64, 4);
-        let mut conn = ConnCtx::new(Frontend::Operator);
-        conn.out = Some(sink.clone());
-        let task = tokio::spawn(serve_lines(
-            server.clone(),
-            BufReader::new(server_read),
-            server_write,
-            conn,
-        ));
+        let LineClient {
+            writer: mut client_write,
+            lines: client_read,
+            sink,
+            task,
+        } = serve_over_tiny_pipe(&server, NotificationSink::with_limits(64, 4));
 
         // Both client halves stay alive to the end, so the pipe never closes. The
         // flood is its own task: once the server stops reading, its writes block.
-        let (client_read, mut client_write) = split(client);
         let flood = tokio::spawn(async move {
             for id in 0..64 {
                 let line = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/list"}}"#) + "\n";
@@ -871,16 +897,14 @@ mod tests {
         drop(client_read);
     }
 
-    /// Added by the tester: a client that vanishes while the writer is blocked on a
-    /// full pipe ends the connection at once through the I/O error, long before the
-    /// write deadline (30 s here), and its subscription goes with it. This is the
-    /// "connection drop mid-stream" case for the reworked `serve_lines` race, which
-    /// must still treat a dead peer as the end whichever of the reader or the writer
-    /// notices it first.
+    /// A client that vanishes while the writer is blocked on a full pipe ends the
+    /// connection at once through the I/O error, long before the write deadline
+    /// (30 s here), and its subscription goes with it: a dead peer ends the
+    /// connection whichever of the reader or the writer notices it first.
     #[tokio::test]
     async fn a_client_that_disconnects_mid_write_ends_the_connection_at_once() {
         let server = server_with_deadline(Duration::from_secs(30));
-        let mut client = serve_over_tiny_pipe(&server, 64);
+        let mut client = serve_over_tiny_pipe(&server, NotificationSink::new(64));
         client.subscribe().await;
         for seq in 0..16 {
             push_padded(&server, seq);
@@ -914,12 +938,109 @@ mod tests {
         );
     }
 
-    /// AC16 (needs a real loopback socket): the same stop over TCP. The client's
+    /// Passes writes through to the server half of a pipe until `armed` is set,
+    /// then panics in `poll_write`: a writer whose task dies without returning an
+    /// error. Until it is armed the client can subscribe and read its reply.
+    struct PanicsWhenArmed {
+        inner: WriteHalf<DuplexStream>,
+        armed: Arc<AtomicBool>,
+    }
+
+    impl AsyncWrite for PanicsWhenArmed {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            assert!(
+                !self.armed.load(Ordering::SeqCst),
+                "the test armed this writer to panic"
+            );
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A writer task that panics ends the connection as an error, the same as one
+    /// that returns an error: `serve_lines` returns `Err` naming the writer task
+    /// (well inside the 30 s write deadline, so the deadline is not what ended it),
+    /// the sink is closed, and the connection's subscriptions are dropped. The
+    /// client subscribes and reads a pushed line first, so the subscription is
+    /// known to be live before the writer is armed to panic.
+    #[tokio::test]
+    async fn a_panicking_writer_ends_the_connection() {
+        let server = server_with_deadline(Duration::from_secs(30));
+        let armed = Arc::new(AtomicBool::new(false));
+        let mut client = serve_through(&server, NotificationSink::new(64), {
+            let armed = armed.clone();
+            move |inner| PanicsWhenArmed { inner, armed }
+        });
+        client.subscribe().await;
+        push_padded(&server, 0);
+        let line = client.next_json().await;
+        assert_eq!(
+            line["params"]["seq"], 0,
+            "the subscription is live and the writer works before it is armed: {line}"
+        );
+
+        armed.store(true, Ordering::SeqCst);
+        push_padded(&server, 1);
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), client.task)
+            .await
+            .expect("serve_lines returned within 5 s of the writer panicking")
+            .expect("the serve_lines task did not panic");
+        let err = ended.expect_err("a writer task that panicked ends the connection in error");
+        assert!(
+            err.to_string().contains("writer task failed"),
+            "the error names the failed writer task: {err}"
+        );
+        assert!(
+            client.sink.is_closed(),
+            "the connection's sink is closed when it ends"
+        );
+
+        let before = client.sink.queued_len();
+        push_padded(&server, 99);
+        assert_eq!(
+            client.sink.queued_len(),
+            before,
+            "the subscription was dropped, so a later push reaches nothing"
+        );
+        drop((client.writer, client.lines));
+    }
+
+    /// The write deadline reaches a real socket (bus-hardening AC16). The client's
     /// receive buffer is 4096 bytes, it sends the token and a `flow.subscribe`,
     /// reads the reply, and stops reading while the test pushes 16 MiB of state
     /// lines. Once the server's own buffers fill, the 1 s write deadline ends the
-    /// connection, so on resuming the client reads what was buffered and then hits
-    /// EOF, having received fewer bytes than were pushed.
+    /// writer and the server half-closes, so on resuming the client reads what was
+    /// buffered and then hits EOF, having received fewer bytes than were pushed.
+    ///
+    /// This proves only that the server stops writing and half-closes. It does not
+    /// prove that the read loop is abandoned or that the subscriptions are dropped:
+    /// dropping the write half sends a FIN whether or not `serve_lines` returns, so
+    /// the test stays green if the writer's error is ignored. Those two properties
+    /// are proven over a duplex pipe by
+    /// `a_stopped_line_reader_ends_the_connection_after_the_write_deadline` and
+    /// `a_client_that_floods_requests_and_never_reads_replies_is_disconnected`.
+    ///
+    /// Assumption: the kernel buffers along the loopback path hold well under
+    /// 16 MiB between them, so the pushes overrun them. `LoopbackTcp::bind` does
+    /// not let a test shrink the server's send buffer, so nothing here enforces it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stopped_tcp_client_is_disconnected_by_the_write_deadline() {
         // The default sink capacity, so every one of the pushes is attempted.

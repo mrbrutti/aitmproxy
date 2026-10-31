@@ -1743,7 +1743,7 @@ fn subscribe_on_an_open_sink_still_works() {
 
     let reply = subscribe_on(&srv, &conn, json!({}));
     assert!(!is_refused(&reply), "an open sink subscribes: {reply}");
-    sub_id_of(&reply);
+    assert_subscribed(&reply);
 
     let id = store.insert(http_flow("example.com:443", "/live"));
     srv.push_flow_event(&Event::RequestHeaders(id));
@@ -1770,6 +1770,12 @@ fn sub_id_of(reply: &JsonValue) -> u64 {
     reply["result"]["structuredContent"]["sub_id"]
         .as_u64()
         .unwrap_or_else(|| panic!("subscribe returns a sub_id: {reply}"))
+}
+
+/// Assert that `reply` is a successful subscribe (it carries a `sub_id`), for
+/// callers that do not need the id.
+fn assert_subscribed(reply: &JsonValue) {
+    sub_id_of(reply);
 }
 
 /// The literal refusal for a connection at the per-connection subscription cap.
@@ -2005,33 +2011,36 @@ fn a_filter_value_of_exactly_1024_bytes_is_accepted() {
     assert_eq!(method_note["params"]["id"], by_method.to_string());
 }
 
-/// Bus-hardening AC5 (characterization, green before and after the `HashSet`
-/// de-dup): fan-out delivers once per connection, not once per subscription. A
-/// connection holding 32 matching subscriptions (the per-connection cap) and one
-/// holding 3 each get exactly one `notifications/aitm/flow` line for one event.
+/// Two operator connections on `srv`, each over its own 64-line sink: one holds
+/// 32 unfiltered subscriptions (the per-connection cap), the other holds 3.
+/// Returns each sink with a label naming its subscription count.
+fn connections_with_32_and_3_subscriptions(
+    srv: &McpServer,
+) -> [(&'static str, NotificationSink); 2] {
+    [("32 subscriptions", 32), ("3 subscriptions", 3)].map(|(label, held)| {
+        let sink = NotificationSink::new(64);
+        let conn = conn_over(srv, &sink);
+        for _ in 0..held {
+            assert_subscribed(&subscribe_on(srv, &conn, json!({})));
+        }
+        (label, sink)
+    })
+}
+
+/// Bus-hardening AC5: fan-out delivers once per connection, not once per
+/// subscription. A connection holding 32 matching subscriptions (the
+/// per-connection cap) and one holding 3 each get exactly one
+/// `notifications/aitm/flow` line for one event.
 #[test]
 fn a_connection_with_many_matching_subscriptions_gets_one_push() {
     let store = Arc::new(MemFlowStore::new());
     let srv = push_server(store.clone(), 64);
-
-    let full_sink = NotificationSink::new(64);
-    let full = conn_over(&srv, &full_sink);
-    for _ in 0..32 {
-        sub_id_of(&subscribe_on(&srv, &full, json!({})));
-    }
-    let few_sink = NotificationSink::new(64);
-    let few = conn_over(&srv, &few_sink);
-    for _ in 0..3 {
-        sub_id_of(&subscribe_on(&srv, &few, json!({})));
-    }
+    let sinks = connections_with_32_and_3_subscriptions(&srv);
 
     let id = store.insert(http_flow("example.com:443", "/one-push"));
     srv.push_flow_event(&Event::RequestHeaders(id));
 
-    for (label, sink) in [
-        ("32 subscriptions", &full_sink),
-        ("3 subscriptions", &few_sink),
-    ] {
+    for (label, sink) in &sinks {
         assert_eq!(
             sink.queued_len(),
             1,
@@ -2043,12 +2052,11 @@ fn a_connection_with_many_matching_subscriptions_gets_one_push() {
     }
 }
 
-/// Bus-hardening AC5 / D2 (characterization): on one connection a subscription
-/// whose filter does not match must not mask a later one that does. The first
-/// subscription watches `other.example`, the second is unfiltered; a flow for
-/// `example.com:443` matches only the second and must still be delivered, once.
-/// This is the test that catches a fan-out that records the connection as seen
-/// before it has tested the filter.
+/// Bus-hardening AC5 / D2: on one connection a subscription whose filter does
+/// not match must not mask a later one that does. The first subscription watches
+/// `other.example`, the second is unfiltered; a flow for `example.com:443`
+/// matches only the second and must still be delivered, once. It catches a
+/// fan-out that records the connection as seen before it has tested the filter.
 #[test]
 fn a_non_matching_subscription_does_not_mask_a_matching_one() {
     let store = Arc::new(MemFlowStore::new());
@@ -2073,35 +2081,21 @@ fn a_non_matching_subscription_does_not_mask_a_matching_one() {
     assert_eq!(note["params"]["id"], id.to_string());
 }
 
-/// Bus-hardening AC5 / D2, added by the tester: `fanout_state` is the fan-out under
-/// both `push_state` and the per-tool-call audit line (`push_agent`), and it must
-/// deliver once per connection however many subscriptions the connection holds.
-/// The server-side `fanout_state` test uses one subscription per connection, so it
-/// cannot see a de-dup that was dropped; this one holds 32 and 3 on two
-/// connections, as `a_connection_with_many_matching_subscriptions_gets_one_push`
-/// does for flow events.
+/// Bus-hardening AC5 / D2: `fanout_state` is the fan-out under both `push_state`
+/// and the per-tool-call audit line (`push_agent`), and it must deliver once per
+/// connection however many subscriptions the connection holds. The server-side
+/// `fanout_state` test uses one subscription per connection, so it cannot see a
+/// de-dup that was dropped; this one holds 32 and 3 on two connections, as
+/// `a_connection_with_many_matching_subscriptions_gets_one_push` does for flow
+/// events.
 #[test]
 fn state_and_audit_pushes_reach_a_connection_once_however_many_subscriptions_it_holds() {
     let store = Arc::new(MemFlowStore::new());
     let srv = push_server(store, 64);
-
-    let full_sink = NotificationSink::new(64);
-    let full = conn_over(&srv, &full_sink);
-    for _ in 0..32 {
-        sub_id_of(&subscribe_on(&srv, &full, json!({})));
-    }
-    let few_sink = NotificationSink::new(64);
-    let few = conn_over(&srv, &few_sink);
-    for _ in 0..3 {
-        sub_id_of(&subscribe_on(&srv, &few, json!({})));
-    }
-    let sinks = [
-        ("32 subscriptions", &full_sink),
-        ("3 subscriptions", &few_sink),
-    ];
+    let sinks = connections_with_32_and_3_subscriptions(&srv);
 
     srv.push_state(json!({"intercept_armed": true}));
-    for (label, sink) in sinks {
+    for (label, sink) in &sinks {
         assert_eq!(
             sink.queued_len(),
             1,
@@ -2121,7 +2115,7 @@ fn state_and_audit_pushes_reach_a_connection_once_however_many_subscriptions_it_
         json!({"authority": "example.com:443", "path": "/audited"}),
     );
     assert!(!is_refused(&reply), "demo.capture runs: {reply}");
-    for (label, sink) in sinks {
+    for (label, sink) in &sinks {
         assert_eq!(
             sink.queued_len(),
             1,
@@ -2133,11 +2127,11 @@ fn state_and_audit_pushes_reach_a_connection_once_however_many_subscriptions_it_
     }
 }
 
-/// Web `/bus` push, spec Goals (bounded push memory), added by the tester: the
-/// `since` replay rides the same bounded notification lane as live pushes. A
-/// subscribe that replays more flows than `push_capacity` keeps only the newest
-/// `push_capacity`, flagged `lagged`, and a drain puts the `lagged` marker before
-/// the surviving events. Also the positive control for
+/// Web `/bus` push, spec Goals (bounded push memory): the `since` replay rides
+/// the same bounded notification lane as live pushes. A subscribe that replays
+/// more flows than `push_capacity` keeps only the newest `push_capacity`, flagged
+/// `lagged`, and a drain puts the `lagged` marker before the surviving events.
+/// Also the positive control for
 /// `subscribe_on_a_closed_sink_is_refused_and_registers_nothing`: the same `since`
 /// argument does replay on an open sink, so that test's "no replay" is not vacuous.
 #[test]
@@ -2159,7 +2153,7 @@ fn since_replay_is_bounded_by_the_sink_and_flags_lag() {
     let sink = NotificationSink::new(srv.push_capacity());
     let conn = conn_over(&srv, &sink);
     let reply = subscribe_on(&srv, &conn, json!({"since": since.to_string()}));
-    sub_id_of(&reply);
+    assert_subscribed(&reply);
     assert_eq!(
         sink.queued_len(),
         CAPACITY,
@@ -2216,7 +2210,7 @@ async fn spawn_push_dispatcher_delivers_a_broadcast_event() {
     let sink = NotificationSink::new(16);
     let conn = conn_over(&srv, &sink);
     let reply = subscribe_on(&srv, &conn, json!({}));
-    sub_id_of(&reply);
+    assert_subscribed(&reply);
 
     let id = store.insert(http_flow("example.com:443", "/bus"));
     tx.send(Event::RequestHeaders(id))
@@ -2261,7 +2255,7 @@ async fn spawn_push_dispatcher_twice_delivers_each_event_once() {
 
     let sink = NotificationSink::new(16);
     let conn = conn_over(&srv, &sink);
-    sub_id_of(&subscribe_on(&srv, &conn, json!({})));
+    assert_subscribed(&subscribe_on(&srv, &conn, json!({})));
     let id = store.insert(http_flow("example.com:443", "/once"));
     tx.send(Event::RequestHeaders(id))
         .expect("the dispatcher holds a broadcast receiver");
@@ -2278,11 +2272,10 @@ async fn spawn_push_dispatcher_twice_delivers_each_event_once() {
     assert_eq!(note["params"]["id"], id.to_string());
 }
 
-/// Web `/bus` push AC9, second clause, added by the tester: `serve` still spawns
-/// the push dispatcher now that the spawn lives in `spawn_push_dispatcher`. The
-/// primary server's loopback-TCP subscribers depend on it, and no other
-/// default-gate test drives `serve` with a broadcast attached (the scripted e2e
-/// that does is gated on `AITM_OBSCURA`). Binds loopback.
+/// Web `/bus` push AC9, second clause: `serve` spawns the push dispatcher through
+/// `spawn_push_dispatcher`. The primary server's loopback-TCP subscribers depend
+/// on it, and no other default-gate test drives `serve` with a broadcast attached
+/// (the scripted e2e that does is gated on `AITM_OBSCURA`). Binds loopback.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serve_still_spawns_the_push_dispatcher() {
     let store = Arc::new(MemFlowStore::new());
@@ -2322,7 +2315,7 @@ async fn serve_still_spawns_the_push_dispatcher() {
             .expect("a reply line"),
     )
     .expect("json");
-    sub_id_of(&reply);
+    assert_subscribed(&reply);
 
     let id = store.insert(http_flow("example.com:443", "/served"));
     tx.send(Event::RequestHeaders(id))
@@ -2358,7 +2351,7 @@ async fn subscribe_pushes_created_on_new_flow() {
     .await;
     let reply = next_json(&mut lines).await;
     assert_eq!(reply["id"], 1);
-    sub_id_of(&reply);
+    assert_subscribed(&reply);
 
     // A new flow arrives through the proxy (the chain dispatches RequestHeaders).
     let id = store.insert(http_flow("example.com:443", "/a"));

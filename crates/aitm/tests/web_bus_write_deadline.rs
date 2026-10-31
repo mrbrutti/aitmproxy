@@ -39,16 +39,15 @@ mod web_bus;
 use std::time::Duration;
 
 use aitm_core::{AgentPolicy, Event};
-use serde_json::json;
 use tokio::net::TcpSocket;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::{client_async, MaybeTlsStream};
 use web_bus::{
-    assert_refused_without_operator, call_line, http_flow, next_frame, probe_ask_gate, push_flow,
-    recv_until, send_text, start, stream_ends_within, subscribe, Probe, Server, ServerOptions,
-    TestCommands, Ws, AGENT_TOKEN, APPROVAL_TIMEOUT, FAST, NO_OPERATOR, OPERATOR_TOKEN,
-    PARKED_TIMED_OUT, SETTLE, TIMEOUT,
+    assert_refused_without_operator, authenticate, call_line, http_flow, next_frame,
+    probe_ask_gate, push_flow, recv_until, send_text, start, stream_ends_within, subscribe, Probe,
+    Server, ServerOptions, TestCommands, Ws, AGENT_TOKEN, APPROVAL_TIMEOUT, FAST, NO_OPERATOR,
+    OPERATOR_TOKEN, PARKED_TIMED_OUT, SETTLE, TIMEOUT,
 };
 
 /// The write deadline every test but the control gives the server.
@@ -85,10 +84,10 @@ fn stopped_options() -> ServerOptions {
 }
 
 /// Open the bus as `token` like `web_bus::open_bus`, but over a client socket whose
-/// receive buffer is [`CLIENT_RECV_BUFFER`] bytes, set before `connect` (D4), so a
-/// test that then stops reading fills the kernel buffers after a few KiB. The
-/// socket is upgraded with `client_async`, which yields the same [`Ws`] the shared
-/// helpers take.
+/// receive buffer is [`CLIENT_RECV_BUFFER`] bytes, set before `connect`
+/// (bus-hardening spec D4), so a test that then stops reading fills the kernel
+/// buffers after a few KiB. The socket is upgraded with `client_async`, which
+/// yields the same [`Ws`] the shared helpers take.
 async fn open_stopped(server: &Server, token: &str, role: &str) -> Ws {
     let socket = TcpSocket::new_v4().expect("client socket");
     socket
@@ -101,25 +100,14 @@ async fn open_stopped(server: &Server, token: &str, role: &str) -> Ws {
     let request = format!("ws://{}/bus", server.addr)
         .into_client_request()
         .expect("client request");
-    let (mut ws, _) = tokio::time::timeout(
+    let (ws, _) = tokio::time::timeout(
         TIMEOUT,
         client_async(request, MaybeTlsStream::Plain(stream)),
     )
     .await
     .expect("handshake within the timeout")
     .expect("handshake");
-    send_text(&mut ws, json!({ "token": token }).to_string()).await;
-    send_text(
-        &mut ws,
-        json!({"jsonrpc": "2.0", "id": 0, "method": "initialize",
-               "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                          "clientInfo": {"name": "aitm-web", "version": "0"}}})
-        .to_string(),
-    )
-    .await;
-    let init = recv_until(&mut ws, "the initialize reply", |v| v["id"] == 0).await;
-    assert_eq!(init["result"]["role"], role, "initialize reply: {init}");
-    ws
+    authenticate(ws, token, role).await
 }
 
 /// Push `count` flow events of a `PATH_BYTES` path straight into the server's
@@ -157,10 +145,10 @@ async fn wait_until_no_operator(server: &Server, bound: Duration) -> Probe {
     }
 }
 
-/// AC9 (the push send site): an operator that subscribes and then never reads while
-/// 16 MiB of flow pushes are sent is disconnected by the write deadline. The probe
-/// flips to "no operator" within the deadline plus 5 s of the pump, then the
-/// client's stream ends once it resumes reading.
+/// Bus-hardening AC9 (the push send site): an operator that subscribes and then
+/// never reads while 16 MiB of flow pushes are sent is disconnected by the write
+/// deadline. The probe flips to "no operator" within the deadline plus 5 s of the
+/// pump, then the client's stream ends once it resumes reading.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stopped_operator_is_disconnected_by_the_write_deadline() {
     let commands = TestCommands::new();
@@ -180,10 +168,10 @@ async fn a_stopped_operator_is_disconnected_by_the_write_deadline() {
     assert_eq!(commands.sensitive_runs(), 0, "no probe ever ran");
 }
 
-/// AC10 (the reply send site): an operator that subscribes, sends one frame of
-/// [`BLOB_LINES`] `test.blob` lines and never reads is disconnected the same way.
-/// No push is involved; the replies, each over 2 MiB, are what the bridge cannot
-/// get onto the socket.
+/// Bus-hardening AC10 (the reply send site): an operator that subscribes, sends
+/// one frame of [`BLOB_LINES`] `test.blob` lines and never reads is disconnected
+/// the same way. No push is involved; the replies, each over 2 MiB, are what the
+/// bridge cannot get onto the socket.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stopped_reader_of_large_replies_is_disconnected_by_the_write_deadline() {
     let commands = TestCommands::new();
@@ -207,10 +195,11 @@ async fn a_stopped_reader_of_large_replies_is_disconnected_by_the_write_deadline
     assert_eq!(commands.sensitive_runs(), 0, "no probe ever ran");
 }
 
-/// AC11: an agent-token connection that subscribes and never reads has its stream
-/// end within the same bound. An agent does not pin `any_role(Operator)`, so the
-/// socket is the observation: the test waits out the deadline plus a second without
-/// reading, so the server has certainly given up, then resumes reading.
+/// Bus-hardening AC11: an agent-token connection that subscribes and never reads
+/// has its stream end within the same bound. An agent does not pin
+/// `any_role(Operator)`, so the socket is the observation: the test waits out the
+/// deadline plus a second without reading, so the server has certainly given up,
+/// then resumes reading.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stopped_agent_is_disconnected_by_the_write_deadline() {
     let commands = TestCommands::new();
@@ -228,10 +217,10 @@ async fn a_stopped_agent_is_disconnected_by_the_write_deadline() {
     );
 }
 
-/// AC12, the control: the same stopped operator on a server with the default 30 s
-/// deadline is still subscribed 3 s after the pump, so the 1 s bound in AC9 is the
-/// configured deadline. The `Ask` probe parks (it is still pending after
-/// `SETTLE`) and is refused with the parked reason, not the no-operator one.
+/// Bus-hardening AC12, the control: the same stopped operator on a server with the
+/// default 30 s deadline is still subscribed 3 s after the pump, so the 1 s bound
+/// in AC9 is the configured deadline. The `Ask` probe parks (it is still pending
+/// after `SETTLE`) and is refused with the parked reason, not the no-operator one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stopped_operator_is_still_connected_before_the_default_deadline() {
     let commands = TestCommands::new();
@@ -270,10 +259,11 @@ async fn a_stopped_operator_is_still_connected_before_the_default_deadline() {
     drop(ws);
 }
 
-/// AC13: a reader that sleeps 10 ms between frames, against a 1 s deadline and a
-/// 16-line sink, is not disconnected. Pushes outrun it, so the sink laps and the
-/// reader is told it lagged, but every send finds room within the deadline: the
-/// final distinctive event arrives and a later `flow.list` call is answered.
+/// Bus-hardening AC13: a reader that sleeps 10 ms between frames, against a 1 s
+/// deadline and a 16-line sink, is not disconnected. Pushes outrun it, so the sink
+/// laps and the reader is told it lagged, but every send finds room within the
+/// deadline: the final distinctive event arrives and a later `flow.list` call is
+/// answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_slow_but_live_reader_is_not_disconnected() {
     const CAPACITY: usize = 16;

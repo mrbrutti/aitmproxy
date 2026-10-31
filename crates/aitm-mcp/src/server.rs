@@ -31,12 +31,9 @@ use crate::transport::{self, LoopbackTcp};
 /// are dropped and the connection is flagged `lagged`; replies are never bounded.
 pub const DEFAULT_PUSH_CAPACITY: usize = 4096;
 
-/// The default write deadline: how long one send (a websocket frame) or one
-/// `write_all`/`flush` may take before the connection is given up on. The clock
-/// stops when the socket has accepted the frame, not when the peer reads it, so a
-/// slow reader that keeps freeing room is never cut; only a peer that stops
-/// reading with its buffers full is. It is 3x the 10 s handshake budget and lets
-/// one 16 MiB frame finish at about 0.53 MiB/s, far below any real reader.
+/// The default for [`McpServer::write_timeout`], which defines what the deadline
+/// bounds. At 30 s, one 16 MiB frame can still finish at about 0.53 MiB/s, far
+/// below any real reader.
 pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The most subscriptions one connection may hold at once (web-bus-push spec
@@ -464,10 +461,10 @@ impl Subscriptions {
     /// already holds `MAX_SUBS_TOTAL`. The per-connection cause comes before the
     /// table one because it is the cause the client controls and can fix, and it
     /// keeps its own text whatever the global load (bus-hardening spec D1).
-    /// For `Closed` the lock means, with a transport that closes the sink
-    /// before `drop_connection`, a subscribe racing the teardown is either
-    /// refused here or swept by the pending drop; it cannot slip in between and
-    /// outlive its connection (web-bus-push spec D4).
+    /// For `Closed` that means, with a transport that closes the sink before
+    /// `drop_connection`, a subscribe racing the teardown is either refused here
+    /// or swept by the pending drop; it cannot slip in between and outlive its
+    /// connection (web-bus-push spec D4).
     fn add(
         &self,
         conn_id: u64,
@@ -861,9 +858,7 @@ pub struct McpServer {
     push_tx: Option<broadcast::Sender<Event>>,
     /// Per-connection push-sink capacity (notification lines) before drop-oldest.
     push_capacity: usize,
-    /// The per-send write deadline a transport applies to its writes (a stopped
-    /// peer is disconnected once this elapses with its buffers full). Always at
-    /// least 1 ms.
+    /// The write deadline (see [`McpServer::write_timeout`]). Always at least 1 ms.
     write_timeout: Duration,
     /// Monotonic source of per-connection ids, so each streaming connection's
     /// subscriptions can be dropped when it ends.
@@ -988,18 +983,33 @@ impl McpServer {
         self.push_capacity
     }
 
-    /// Set the write deadline a transport applies to each send or write (a
-    /// websocket frame on the web bridge, a `write_all`/`flush` on the line
-    /// transport). Stored clamped to at least 1 ms: a zero deadline would fail
-    /// every write at once. Defaults to [`DEFAULT_WRITE_TIMEOUT`].
+    /// Set the write deadline (see [`McpServer::write_timeout`] for what it
+    /// bounds). Stored clamped to at least 1 ms: a zero deadline would fail every
+    /// write at once. Defaults to [`DEFAULT_WRITE_TIMEOUT`].
     pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
         self.write_timeout = timeout.max(Duration::from_millis(1));
         self
     }
 
-    /// The configured write deadline. A transport reads it once per connection and
-    /// bounds each write with it, so a peer that stops reading is disconnected
-    /// instead of pinning its task and subscriptions.
+    /// The write deadline a transport applies to its writes to a peer. This is
+    /// the one statement of what the deadline means; the transports refer here.
+    ///
+    /// It bounds each send on its own: one websocket frame on the web bridge, one
+    /// `write_all` or one `flush` on the line transport. It is not a budget for a
+    /// connection or for a batch of writes, and a transport reads it once, when
+    /// the connection starts.
+    ///
+    /// The clock stops when the socket has accepted the frame, not when the peer
+    /// has read it. A peer that keeps reading frees room in the socket buffers as
+    /// it goes, so its sends complete and it is never cut for being slow: only a
+    /// reader slower than the frame's size over the deadline is (see
+    /// [`DEFAULT_WRITE_TIMEOUT`] for that rate). A peer that stops reading with
+    /// the buffers full leaves the next send pending until the deadline expires,
+    /// and the transport then ends the connection, so the peer cannot pin the
+    /// connection's task, its descriptor and its subscriptions.
+    ///
+    /// A stopped peer is noticed only when something is sent to it, and then
+    /// within one deadline. The deadline does not bound an idle connection.
     pub fn write_timeout(&self) -> Duration {
         self.write_timeout
     }
@@ -2371,8 +2381,6 @@ mod tests {
         assert_eq!(probe(&probe_server()), json!("absent"));
     }
 
-    // ------------------------------------------------ bus-hardening Task 1: write timeout
-
     /// Bus-hardening AC7: a fresh server carries the 30 s default write deadline,
     /// and the exported constant is that same 30 s.
     #[test]
@@ -2394,8 +2402,6 @@ mod tests {
             .with_write_timeout(Duration::ZERO);
         assert_eq!(srv.write_timeout(), Duration::from_millis(1));
     }
-
-    // ------------------------------------------------ bus-hardening Task 5: registry bound
 
     /// Connections it takes to fill the registry at the per-connection cap.
     const FULL_CONNECTIONS: u64 = 128;
@@ -2456,6 +2462,16 @@ mod tests {
         sink
     }
 
+    /// The `sub_id` of the first subscription `conn_id` holds.
+    fn a_sub_id_of(reg: &Subscriptions, conn_id: u64) -> u64 {
+        reg.lock()
+            .subs
+            .iter()
+            .find(|s| s.conn_id == conn_id)
+            .map(|s| s.sub_id)
+            .unwrap_or_else(|| panic!("connection {conn_id} holds no subscription"))
+    }
+
     /// Bus-hardening AC1 / D1: the registry holds at most 4096 subscriptions
     /// across all connections. 128 connections at the per-connection cap fill it
     /// (every add succeeds), and a 129th connection is refused `TableFull`
@@ -2509,13 +2525,7 @@ mod tests {
 
         // A connection holding 31 (room under its own cap) is still refused by
         // the table: move one slot from connection 1 to a new connection first.
-        let sub_id = reg
-            .lock()
-            .subs
-            .iter()
-            .find(|s| s.conn_id == 1)
-            .map(|s| s.sub_id)
-            .expect("connection 1 holds subscriptions");
+        let sub_id = a_sub_id_of(&reg, 1);
         assert!(reg.remove(1, sub_id));
         assert!(add_unfiltered(&reg, FULL_CONNECTIONS + 1, NotificationSink::new(4)).is_ok());
         assert_eq!(
@@ -2531,13 +2541,7 @@ mod tests {
     #[test]
     fn unsubscribe_frees_exactly_one_table_slot() {
         let (reg, _sinks) = full_registry();
-        let sub_id = reg
-            .lock()
-            .subs
-            .iter()
-            .find(|s| s.conn_id == 1)
-            .map(|s| s.sub_id)
-            .expect("connection 1 holds subscriptions");
+        let sub_id = a_sub_id_of(&reg, 1);
 
         assert!(reg.remove(1, sub_id), "the subscription existed");
         assert_eq!(reg.lock().subs.len(), MAX_SUBS_TOTAL - 1);
@@ -2681,12 +2685,12 @@ mod tests {
         assert_eq!(operators[0].drain(), vec!["operator-line".to_string()]);
     }
 
-    /// Bus-hardening D2, added by the tester: in `fanout_role` the connection is
-    /// recorded as seen only after one of its subscriptions has passed the role
-    /// test (the same trap as the filter one in `fanout_flow`). The real transports
-    /// never mix roles on one connection id, so the registry is driven directly:
-    /// connection 1 holds an agent subscription first and an operator one second,
-    /// and an operator-only line must still reach it, once.
+    /// Bus-hardening D2: in `fanout_role` the connection is recorded as seen only
+    /// after one of its subscriptions has passed the role test (the same trap as
+    /// the filter one in `fanout_flow`). The real transports never mix roles on
+    /// one connection id, so the registry is driven directly: connection 1 holds
+    /// an agent subscription first and an operator one second, and an
+    /// operator-only line must still reach it, once.
     #[test]
     fn fanout_role_does_not_let_another_roles_subscription_mask_a_matching_one() {
         let reg = Subscriptions::default();

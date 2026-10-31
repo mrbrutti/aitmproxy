@@ -18,16 +18,15 @@
 //! a client that stops reading cannot grow server memory.
 //!
 //! Every send after authentication, a reply or a push, is bounded by the server's
-//! write deadline ([`McpServer::write_timeout`], read once when the connection
-//! authenticates): one text frame must be accepted by the socket within it, and
-//! the clock stops when the socket takes the frame, not when the peer reads it. A
-//! peer that stops reading while we write, so that the socket buffers fill, is
-//! therefore gone within the deadline: `relay` returns an error, the guard drops
-//! the connection's subscriptions and closes its sink, and the task and socket
-//! are released. No Close frame is attempted, since a peer that is not reading
-//! cannot answer one. A reader that frees room for each frame within the deadline
-//! is never cut, however slowly it reads. The deadline only fires while we are
-//! writing; an idle connection is never timed.
+//! write deadline, read once when the connection authenticates; what the deadline
+//! measures is stated once, on [`McpServer::write_timeout`]. A peer that stops
+//! reading while we write is therefore gone within it: `relay` returns an error,
+//! the guard drops the connection's subscriptions and closes its sink, and the task
+//! and socket are released. No Close frame is attempted, since a peer that is not
+//! reading cannot answer one. The deadline only fires while we are writing; an idle
+//! connection is never timed. Before authentication the same peer is bounded
+//! differently: the token must arrive within `HANDSHAKE_TIMEOUT`, and the refusal
+//! of a bad token (reply, then Close) gets `CLOSE_DRAIN_TIMEOUT` for each step.
 //!
 //! Replies do not ride the sink: a finished frame's replies go straight to the
 //! socket in line order, so a reply is never dropped or queued twice. A push
@@ -92,7 +91,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// deadline a peer that never answers — or keeps sending data — pins the
 /// connection's task and socket indefinitely, including on the pre-auth refusals
 /// that [`HANDSHAKE_TIMEOUT`] exists to bound. Past the deadline the connection is
-/// dropped; that is not an error.
+/// dropped; that is not an error. The same budget bounds the reply that precedes
+/// the Close of a bad-token refusal (`refuse_unauthorized`), where expiry is an
+/// error because the peer was not even reading.
 const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The most frames one connection may have running at once. At the cap the relay
@@ -103,8 +104,9 @@ const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// The cost of that backpressure: at the cap the loop is not reading at all, so a
 /// client Close or disconnect is noticed once a frame finishes or a push send
 /// fails, bounded by the in-flight frames' own completion, however long their
-/// commands run. A push send to a peer that has stopped reading fails at the
-/// write deadline (see the module doc), so a stopped peer is not a further delay.
+/// commands run. A send to a peer that has stopped reading fails at the write
+/// deadline (see the module doc), so such a peer is noticed within that deadline
+/// once something is sent to it; until then nothing notices it.
 pub const MAX_IN_FLIGHT: usize = 16;
 
 // With a zero cap the relay's read branch would never be enabled, so an
@@ -231,8 +233,7 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
                 };
                 let Some(resolved) = classify_token(first, state) else {
                     warn!("web bus: refused a connection with a bad token");
-                    ws.send(Message::text(UNAUTHORIZED_REPLY)).await?;
-                    return close(ws, CloseCode::Policy, "unauthorized").await;
+                    return refuse_unauthorized(ws, CLOSE_DRAIN_TIMEOUT).await;
                 };
                 // The lines that share the token's frame are ordinary requests and
                 // answer to the same cap; only an authenticated peer gets here.
@@ -275,7 +276,8 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
         sink: sink.clone(),
     };
     // The write deadline for every send from here on, read once like the sink's
-    // capacity above (the pre-auth refusal and `close_within` keep their own bounds).
+    // capacity above. The pre-auth refusal and the close handshake are bounded by
+    // `CLOSE_DRAIN_TIMEOUT` instead (`refuse_unauthorized`, `close_within`).
     let write_timeout = state.mcp.write_timeout();
 
     // One task per frame, so a slow command (its blocking `invoke`) cannot stall
@@ -351,13 +353,11 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
 }
 
 /// Send one text frame, giving up if the socket has not accepted it within
-/// `limit`. The clock covers the whole send (the frame is queued and flushed), and
-/// stops when the socket has taken the last byte, not when the peer reads it, so a
-/// peer that reads slowly but steadily is never cut and one that has stopped
-/// reading is, once its socket buffers are full. Expiry is an error whose text
-/// contains `timed out after`; a transport error from the send passes through. The
-/// caller drops the connection on either, since a half-written frame leaves the
-/// socket unusable.
+/// `limit`; what the limit measures is stated on [`McpServer::write_timeout`].
+/// Post-authentication sends pass that deadline, the pre-auth refusal passes
+/// [`CLOSE_DRAIN_TIMEOUT`]. Expiry is an error whose text contains `timed out
+/// after`; a transport error from the send passes through. The caller drops the
+/// connection on either, since a half-written frame leaves the socket unusable.
 async fn send_within<S>(
     ws: &mut WebSocketStream<S>,
     msg: Message,
@@ -456,6 +456,26 @@ async fn refuse(
     drop(in_flight);
     drop(guard);
     close(ws, code, reason).await
+}
+
+/// Refuse a peer whose first line was a bad token: send [`UNAUTHORIZED_REPLY`], then
+/// close with `Policy`. The reply and the close handshake each get `limit`
+/// ([`CLOSE_DRAIN_TIMEOUT`] in production), because [`HANDSHAKE_TIMEOUT`] covers
+/// only the wait for the token. An unauthenticated peer can fill the send path
+/// before it ever sends one, by pinging without reading: tungstenite answers each
+/// Ping with a Pong, and once the socket buffers are full the reply has nowhere to
+/// go. An unbounded send would then pin the task, the socket and the upgraded
+/// connection for as long as the peer stays silent.
+///
+/// If the reply is not accepted within `limit` the error comes back and the
+/// connection is dropped with it, with no Close attempted: a peer that is not
+/// reading cannot answer one, and the handshake would only spend a second `limit`.
+async fn refuse_unauthorized<S>(mut ws: WebSocketStream<S>, limit: Duration) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    send_within(&mut ws, Message::text(UNAUTHORIZED_REPLY), limit).await?;
+    close_within(ws, CloseCode::Policy, "unauthorized", limit).await
 }
 
 async fn close(ws: Ws, code: CloseCode, reason: &'static str) -> anyhow::Result<()> {
@@ -743,7 +763,7 @@ mod tests {
         closed.expect("a completed handshake is Ok");
     }
 
-    /// AC8, the stalled half: the client end is held open but never read, so a 1 MiB
+    /// bus-hardening AC8, the stalled half: the client end is held open but never read, so a 1 MiB
     /// message cannot fit the 64 KiB duplex and the send parks, exactly as a send
     /// to a stopped socket does. Without a deadline it never returns.
     #[tokio::test]
@@ -763,7 +783,7 @@ mod tests {
         );
     }
 
-    /// AC8, the live half: a peer that reads takes the whole 1 MiB, and a limit far
+    /// bus-hardening AC8, the live half: a peer that reads takes the whole 1 MiB, and a limit far
     /// above the time that takes does not fire.
     #[tokio::test]
     async fn send_within_delivers_to_a_live_peer() {
@@ -789,12 +809,12 @@ mod tests {
         assert!(received == expected, "the message arrives intact");
     }
 
-    /// Added by the tester: a peer that is gone (its end dropped) fails the send at
-    /// once with the transport's own error, not after the limit and not as a
-    /// timeout. `relay` ends the connection on any `Err`, so what matters is that a
-    /// dead socket is reported promptly instead of being waited on, and that the
-    /// error is not mislabelled as the write deadline (which would send an operator
-    /// hunting for a slow reader).
+    /// A peer that is gone (its end dropped) fails the send at once with the
+    /// transport's own error, not after the limit and not as a timeout. `relay` ends
+    /// the connection on any `Err`, so what matters is that a dead socket is
+    /// reported promptly instead of being waited on, and that the error is not
+    /// mislabelled as the write deadline (which would send an operator hunting for a
+    /// slow reader).
     #[tokio::test]
     async fn send_within_reports_a_gone_peer_as_a_send_error_not_a_timeout() {
         let (mut server, client) = socket_pair().await;
@@ -811,6 +831,79 @@ mod tests {
             !err.to_string().contains("timed out"),
             "a transport error passes through unchanged, not as a timeout: {err}"
         );
+    }
+
+    /// A peer that sends a bad token while our send path is already full is refused
+    /// within the limit, and the connection is dropped. In production the peer fills
+    /// the path by sending Pings and never reading, so tungstenite's automatic Pongs
+    /// occupy the socket buffers; here a 1 MiB send to a peer that never reads leaves
+    /// the duplex in the same state (the frame is queued, the buffer is full), after
+    /// the same limit has expired once. Without a bound the refusal reply parks on
+    /// that full path for as long as the peer stays silent.
+    #[tokio::test]
+    async fn the_bad_token_refusal_gives_up_on_a_peer_whose_send_path_is_full() {
+        let (mut server, mut client) = socket_pair().await;
+        let fill = send_within(
+            &mut server,
+            Message::text("x".repeat(1 << 20)),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("setup: a 1 MiB send to a peer that never reads must not fit the duplex");
+        assert!(
+            fill.to_string().contains("timed out after"),
+            "setup: the fill must end by timing out, got: {fill}"
+        );
+
+        let refused = tokio::time::timeout(
+            Duration::from_secs(2),
+            refuse_unauthorized(server, Duration::from_millis(50)),
+        )
+        .await
+        .expect("the refusal must return within 2 s of a 50 ms limit; its send is unbounded");
+        let err = refused.expect_err("a refusal the peer never accepts must end in an error");
+        assert!(
+            err.to_string().contains("timed out after"),
+            "the error must say the send timed out, got: {err}"
+        );
+
+        // The server end went out of scope with the error, so the peer reaches the
+        // end of what it was sent: the connection is dropped, not left half-open.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(Ok(_)) = client.next().await {}
+        })
+        .await
+        .expect("a dropped connection ends the peer's stream");
+    }
+
+    /// The refusal path for a peer that reads is unchanged: the unauthorized reply,
+    /// then a Policy Close, then the close handshake runs to its end. The limit is far
+    /// above the outer bound, so finishing proves the handshake completed rather than
+    /// a deadline firing.
+    #[tokio::test]
+    async fn the_bad_token_refusal_reaches_a_live_peer_then_closes_it() {
+        let (server, mut client) = socket_pair().await;
+        let server_side = refuse_unauthorized(server, Duration::from_secs(30));
+        let client_side = async {
+            match client.next().await {
+                Some(Ok(Message::Text(reply))) => assert_eq!(reply.as_str(), UNAUTHORIZED_REPLY),
+                other => panic!("expected the unauthorized reply first, got {other:?}"),
+            }
+            match client.next().await {
+                Some(Ok(Message::Close(Some(frame)))) => {
+                    assert_eq!(frame.code, CloseCode::Policy);
+                    assert_eq!(frame.reason.as_str(), "unauthorized");
+                }
+                other => panic!("expected a Policy Close frame second, got {other:?}"),
+            }
+            while let Some(Ok(_)) = client.next().await {}
+        };
+        let (refused, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server_side, client_side)
+        })
+        .await
+        .expect("a peer that reads is refused without waiting for any deadline");
+        refused.expect("a completed refusal is Ok");
     }
 
     #[test]
