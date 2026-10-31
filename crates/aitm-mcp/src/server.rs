@@ -73,15 +73,19 @@ pub const UNAUTHORIZED: i64 = -32001;
 /// threaded into every message on that connection through [`McpServer::handle_on`].
 ///
 /// The `role` drives policy and confirmation decisions (Tasks 4/5/9); the
-/// `client_label` is the connection's `initialize.clientInfo.name`, carried for
-/// audit only. `out` is the bounded push sink the transport's writer task drains
+/// `client_label` is the connection's declared name, carried for audit only and
+/// sanitised on every consumption (the audit entry and the command host both read
+/// it through one helper), so whatever sets it, the ring never holds more than 64
+/// characters of it. `out` is the bounded push sink the transport's writer task drains
 /// (F4); `conn_id` identifies the connection so its subscriptions are dropped
 /// when it ends. In-process callers (`McpServer::handle`) have no push sink.
 #[derive(Debug, Clone)]
 pub struct ConnCtx {
     /// The frontend this connection speaks as.
     pub role: Frontend,
-    /// The human-readable client label from `initialize.clientInfo.name`.
+    /// The human-readable client label: `initialize.clientInfo.name` for a TCP or
+    /// stdio client, a server-minted name for the web bridge. Display only; it is
+    /// sanitised (bounded, scrubbed) each time it is consumed, not trusted as set.
     pub client_label: Option<String>,
     /// A per-connection id, assigned by the transport, used to drop this
     /// connection's subscriptions when it ends. `0` means "not a streaming
@@ -1732,8 +1736,8 @@ impl McpServer {
             Some(egress) => host.with_egress(egress.clone()),
             None => host,
         };
-        let host = match &conn.client_label {
-            Some(label) => host.with_client_label(label.clone()),
+        let host = match conn_audit_label(conn) {
+            Some(label) => host.with_client_label(label),
             None => host,
         };
         let host = match &self.config {
@@ -1780,6 +1784,10 @@ impl McpServer {
     /// the registry does not know) is evidence, so a polling burst cannot evict a
     /// refusal. The lane only chooses where the ring keeps the entry; the durable
     /// sink and the agent stream still get every entry.
+    ///
+    /// The entry is bounded before any of them sees it: the label is sanitised on
+    /// consumption and an error reason is scrubbed and then capped. The tool result
+    /// returned to the caller is unchanged.
     fn record_audit(
         &self,
         conn: &ConnCtx,
@@ -1801,15 +1809,16 @@ impl McpServer {
                 .unwrap_or("error");
             // A refusal/error reason can echo a bad argument value (a header error
             // that quotes the offending value, a coercion error), so it is scrubbed
-            // by content before it reaches the ring/durable log/pushed line (RF#3).
-            AuditResult::Error(aitm_core::redact::scrub_text(reason))
+            // by content before it reaches the ring/durable log/pushed line (RF#3),
+            // then capped so an echoed megabyte cannot fill the ring.
+            AuditResult::Error(cap_reason(aitm_core::redact::scrub_text(reason)))
         } else {
             AuditResult::Ok
         };
         let entry = AuditEntry {
             at: SystemTime::now(),
             origin: conn.role,
-            client_label: conn.client_label.clone(),
+            client_label: conn_audit_label(conn),
             command: name.to_string(),
             args_summary: redact_args(arguments),
             result: outcome,
@@ -2245,16 +2254,41 @@ const ARGS_SUMMARY_CAP: usize = aitm_core::DEFAULT_ARGS_SUMMARY_CAP;
 /// ring, the durable log, or the pushed line.
 fn redact_args(arguments: &Map<String, JsonValue>) -> String {
     let redacted = redact_value(&JsonValue::Object(arguments.clone()));
-    let mut rendered = redacted.to_string();
-    if rendered.len() > ARGS_SUMMARY_CAP {
-        let mut cut = ARGS_SUMMARY_CAP;
-        while cut > 0 && !rendered.is_char_boundary(cut) {
+    cap_text(redacted.to_string(), ARGS_SUMMARY_CAP)
+}
+
+/// The audit copy of an error reason, already scrubbed: at most
+/// [`aitm_core::DEFAULT_RESULT_REASON_CAP`] bytes plus the `…` marker. The caller
+/// of the tool still gets the whole text in the tool result; only the ring, the
+/// durable log, and the pushed line carry the capped one.
+fn cap_reason(reason: String) -> String {
+    cap_text(reason, aitm_core::DEFAULT_RESULT_REASON_CAP)
+}
+
+/// Truncate `text` to at most `cap` bytes on a char boundary and append `…`, but
+/// only when something was cut; text within the cap is returned untouched.
+fn cap_text(mut text: String, cap: usize) -> String {
+    if text.len() > cap {
+        let mut cut = cap;
+        while cut > 0 && !text.is_char_boundary(cut) {
             cut -= 1;
         }
-        rendered.truncate(cut);
-        rendered.push('…');
+        text.truncate(cut);
+        text.push('…');
     }
-    rendered
+    text
+}
+
+/// The connection's client label as the audit entry and the command host see it:
+/// [`aitm_core::sanitize_client_label`] applied to `conn.client_label`. The field
+/// is `pub`, so a transport or a test can set it to anything; sanitising here, at
+/// consumption, bounds it (64 chars, control and bidi characters dropped,
+/// credentials scrubbed) however it got there. The reserved-name guard is not
+/// applied: `web-bridge` is the server's own label and passes unchanged.
+fn conn_audit_label(conn: &ConnCtx) -> Option<String> {
+    conn.client_label
+        .as_deref()
+        .and_then(aitm_core::sanitize_client_label)
 }
 
 /// Redact a value for the audit entry, by key *and* by content. A secret-named

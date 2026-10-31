@@ -4,7 +4,9 @@
 //! sockets). They prove `record_audit` files each invocation in the lane its
 //! sensitivity and outcome call for (plan 2026-10-30-audit-ring-integrity,
 //! Task 6), so a polling burst cannot evict a refused call and one source's
-//! flood cannot evict another's entry.
+//! flood cannot evict another's entry; and (Task 7) that a hostile client label
+//! and an oversized error reason are bounded before the ring and the host see
+//! them, and that unframed credentials in the arguments are masked.
 
 use std::sync::Arc;
 
@@ -12,9 +14,9 @@ use aitm_core::{
     origin_label, AgentPolicy, AgentState, AuditResult, AuditRing, Command, CommandHost, Frontend,
     HttpFlow, HttpRequest, McpTransport, MemFlowStore, ParamDef, ParamSchema, Params, ProxyClient,
     Registry, Sensitivity, StdGuard, TypeDesc, Value, DEFAULT_AUDIT_CAPACITY,
-    WEB_BRIDGE_CLIENT_LABEL,
+    DEFAULT_RESULT_REASON_CAP, WEB_BRIDGE_CLIENT_LABEL,
 };
-use aitm_mcp::{ConnCtx, McpServer};
+use aitm_mcp::{ConnCtx, McpServer, NotificationSink};
 use aitm_plugins::AgentPlugin;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
@@ -84,8 +86,74 @@ impl Command for ErrEchoCmd {
     }
 }
 
+/// A Read command that returns the client label its [`CommandHost`] carries
+/// (`"<none>"` when there is none), so a test sees exactly what a command like
+/// `findings.record` would stamp on a record.
+struct ClientLabelCmd;
+
+impl Command for ClientLabelCmd {
+    fn name(&self) -> &str {
+        "demo.client"
+    }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
+    }
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "Return the host's client label.".into(),
+            params: vec![],
+            result: TypeDesc::Str,
+        }
+    }
+    fn invoke(&self, _args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        Ok(Value::Str(host.client_label().unwrap_or("<none>").into()))
+    }
+}
+
+/// A Read command that accepts a free-text `note` and a string-map `headers`
+/// and returns its arguments, so the audit entry's `args_summary` has both an
+/// unframed `key=value` run and a secret-named header to redact.
+struct EchoCmd;
+
+impl Command for EchoCmd {
+    fn name(&self) -> &str {
+        "demo.echo"
+    }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
+    }
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "Echo a note and headers.".into(),
+            params: vec![
+                ParamDef {
+                    name: "note".into(),
+                    ty: TypeDesc::Str,
+                    required: false,
+                    description: String::new(),
+                },
+                ParamDef {
+                    name: "headers".into(),
+                    ty: TypeDesc::Map(Box::new(TypeDesc::Str)),
+                    required: false,
+                    description: String::new(),
+                },
+            ],
+            result: TypeDesc::Any,
+        }
+    }
+    fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+        Ok(Value::Object(
+            args.iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        ))
+    }
+}
+
 /// A server whose registry carries `demo.read` (Read), `demo.write` (Write),
-/// `demo.sensitive` (Sensitive), the failing-Read `demo.errecho`, and the real
+/// `demo.sensitive` (Sensitive), the failing-Read `demo.errecho`, the
+/// label-reporting `demo.client`, the argument-echoing `demo.echo`, and the real
 /// `AgentPlugin`, all sharing `ring`, so `agent.activity` and `agent.status` read
 /// exactly what `record_audit` writes. The policy is `Auto`: Read and Write run,
 /// Sensitive is refused (every one of them is audited).
@@ -104,6 +172,8 @@ fn audit_server(ring: Arc<AuditRing>) -> McpServer {
         sens: Sensitivity::Sensitive,
     }));
     reg.add_command(Arc::new(ErrEchoCmd));
+    reg.add_command(Arc::new(ClientLabelCmd));
+    reg.add_command(Arc::new(EchoCmd));
     let state = Arc::new(AgentState::new(AgentPolicy::Auto));
     reg.add_plugin(Box::new(
         AgentPlugin::new(state.clone()).with_audit_ring(ring.clone()),
@@ -292,5 +362,147 @@ fn actions_last_minute_counts_both_lanes() {
         status["result"]["structuredContent"]["actions_last_minute"],
         json!(2),
         "both lanes are counted: {status}"
+    );
+}
+
+/// AC16: a connection whose `client_label` was assigned directly (the field is
+/// `pub`, so capture-time sanitising alone can be bypassed) carries 10 MiB of
+/// `B`. Both the host a command sees and the ring entry hold the 64-char
+/// sanitised label, so across 20 calls the ring keeps `20 * 64` label bytes, not
+/// 200 MiB. Twenty and not more: on unfixed code each call retains a 10 MiB
+/// clone in the ring. Failure messages print lengths, never the label.
+#[test]
+fn a_hostile_label_is_bounded_in_the_ring_and_the_host() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+    let conn = labelled(&"B".repeat(10 << 20));
+    let bounded = "B".repeat(64);
+
+    let reply = call(&srv, &conn, "demo.client", json!({}));
+    let seen = reply["result"]["structuredContent"]
+        .as_str()
+        .expect("demo.client returns its label as a string");
+    assert_eq!(seen.len(), 64, "the host's label length");
+    assert_eq!(seen, bounded);
+
+    let entries = ring.recent(None, None);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].client_label.as_deref().map(str::len),
+        Some(64),
+        "the ring entry's label length"
+    );
+    assert_eq!(entries[0].client_label.as_deref(), Some(bounded.as_str()));
+    assert_eq!(origin_label(entries[0].origin), "mcp");
+    drop(entries);
+
+    for _ in 1..20 {
+        call(&srv, &conn, "demo.client", json!({}));
+    }
+    let entries = ring.recent(None, None);
+    assert_eq!(entries.len(), 20);
+    let stored: usize = entries
+        .iter()
+        .map(|e| e.client_label.as_deref().map_or(0, str::len))
+        .sum();
+    assert_eq!(stored, 20 * 64, "label bytes held by the ring");
+}
+
+/// AC28: a failing command whose error text is 1 MiB (an error can echo caller
+/// input) is audited with a reason capped at `DEFAULT_RESULT_REASON_CAP` bytes
+/// plus the three-byte `…`; the tool result still carries all of it. Failure
+/// messages print lengths, never the reason.
+#[test]
+fn an_oversized_error_reason_is_capped_in_the_ring() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+    let conn = ConnCtx::new(Frontend::Mcp);
+    let reason = "x".repeat(1 << 20);
+
+    let reply = call(&srv, &conn, "demo.errecho", json!({ "reason": reason }));
+    assert!(is_error(&reply), "demo.errecho always fails");
+    let text = reply["result"]["content"][0]["text"]
+        .as_str()
+        .expect("the error carries its text");
+    assert!(
+        text.contains(&reason),
+        "the caller still receives the whole reason ({} bytes of text)",
+        text.len()
+    );
+
+    let entries = ring.recent(None, None);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].command, "demo.errecho");
+    match &entries[0].result {
+        AuditResult::Error(r) => {
+            assert!(
+                r.len() <= DEFAULT_RESULT_REASON_CAP + 3,
+                "the audited reason is {} bytes",
+                r.len()
+            );
+            assert!(r.starts_with("xxxx"), "the head of the reason is kept");
+            assert!(r.ends_with('…'), "truncation is marked");
+        }
+        other => panic!("expected an error result, got {other:?}"),
+    }
+}
+
+/// AC29: unframed credentials (`sid=`, `session=`, `auth=`, `jwt=` inside a
+/// free-text value) and a secret-named header (`X-Session`) are masked in the
+/// ring entry's `args_summary` and in the line pushed to a subscribed operator,
+/// while a look-alike (`author=bob`) is left alone. Green once the shared
+/// vocabulary covers the session and auth family (Tasks 1 and 2).
+#[test]
+fn args_summary_hides_unframed_credentials() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+
+    let mut watcher = ConnCtx::new(Frontend::Operator);
+    watcher.conn_id = srv.next_conn_id();
+    watcher.out = Some(NotificationSink::new(64));
+    let sub = call(&srv, &watcher, "flow.subscribe", json!({}));
+    assert!(!is_error(&sub), "the operator subscribes: {sub}");
+
+    let reply = call(
+        &srv,
+        &ConnCtx::new(Frontend::Mcp),
+        "demo.echo",
+        json!({
+            "note": "go sid=SECRET1 session=SECRET2 auth=SECRET3 jwt=SECRET4 author=bob",
+            "headers": {"X-Session": "SECRET5"},
+        }),
+    );
+    assert!(!is_error(&reply), "demo.echo runs: {reply}");
+
+    let entry = ring
+        .recent(None, None)
+        .into_iter()
+        .find(|e| e.command == "demo.echo")
+        .expect("the echo call was audited");
+    let pushed = watcher
+        .out
+        .as_ref()
+        .expect("the watcher has a sink")
+        .drain()
+        .join("\n");
+    assert!(
+        pushed.contains("notifications/aitm/agent"),
+        "the agent line was pushed: {pushed}"
+    );
+    for secret in ["SECRET1", "SECRET2", "SECRET3", "SECRET4", "SECRET5"] {
+        assert!(
+            !entry.args_summary.contains(secret),
+            "{secret} leaked into the audit entry: {}",
+            entry.args_summary
+        );
+        assert!(
+            !pushed.contains(secret),
+            "{secret} leaked into the pushed line: {pushed}"
+        );
+    }
+    assert!(
+        entry.args_summary.contains("author=bob"),
+        "a look-alike key survives: {}",
+        entry.args_summary
     );
 }
