@@ -1394,13 +1394,13 @@ final class FlowHandoff: @unchecked Sendable {
 
 // MARK: - Self-check (DEBUG only; never part of the shipped extension)
 //
-// Run with a throwaway driver (see the task report): compile this file plus a
-// one-line `main.swift` calling `HandoffSelfCheck.run()` with `-D DEBUG`. It drives
+// Run with `apps/mac/tools/ne-selfcheck.sh`: it builds these sources minus `main.swift`
+// plus a generated driver that calls `HandoffSelfCheck.run()`, with `-DDEBUG`. It drives
 // the real code over real socketpairs with a fake core and fake NE flows, and
 // asserts LITERAL expected wire bytes. It needs no root, no entitlement, no NE.
 //
 // Co-located deliberately: the Extension has no separate test target (it is built by
-// `apps/mac/build.sh` via `swiftc Sources/*.swift`, with no `-D DEBUG`, so this whole
+// `apps/mac/build.sh` via `swiftc Sources/*.swift`, with no DEBUG define, so this whole
 // block is excluded from the release binary). Splitting it into its own `#if DEBUG`
 // file is a tracked readability cleanup (plan Review log, Task 11 Minor).
 #if DEBUG
@@ -1532,8 +1532,7 @@ enum HandoffSelfCheck {
 
     private static func framing(_ r: Recorder) {
         guard let (a, b) = pair() else { r.fail("FAIL framing: no socketpair"); return }
-        var rcvTimeout = timeval(tv_sec: 3, tv_usec: 0)   // a broken cap must FAIL, not hang
-        _ = setsockopt(b.fd, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeout, socklen_t(MemoryLayout<timeval>.size))
+        setRecvTimeout(b.fd, seconds: 3)   // a broken cap must FAIL, not hang
         // round trip
         try? FDIO.writeFrame(a.fd, Data("hello".utf8), max: 100)
         r.check("frame roundtrip", (try? FDIO.readFrame(b.fd, max: 100)).flatMap { $0 }.map(string) == "hello")
@@ -1915,6 +1914,9 @@ enum HandoffSelfCheck {
             FlowHandoff(link: link, requirement: requirement, dial: { path in
                 dialPaths.append(path)
                 guard let (dataCore, dataProvider) = pair() else { throw HandoffError.unavailable("pair") }
+                // Every fake-core data fd is bounded here, where the pair is minted, so a
+                // wrong refusal downstream fails instead of hanging the gate.
+                setRecvTimeout(dataCore.fd, seconds: 5)
                 dataPairs.append((dataCore, dataProvider))
                 return dataProvider
             })
@@ -1936,7 +1938,6 @@ enum HandoffSelfCheck {
               open == #"{"FlowOpen":{"flow_id":1,"kind":"Tcp","remote":"93.184.216.34:443","remote_hostname":"example.com","source_app":"com.apple.curl","local":null}}"#,
               open ?? "nil")
         if let dataCore = dataPairs.all.first?.0 {
-            setRecvTimeout(dataCore.fd, seconds: 5)
             let hs = (try? FDIO.readFrame(dataCore.fd, max: 1 << 20)).flatMap { $0 }.map(string)
             r.check("handshake is the first data frame", hs == #"{"flow_id":1}"#, hs ?? "nil")
         } else {
@@ -1981,7 +1982,6 @@ enum HandoffSelfCheck {
               udpOpen ?? "nil")
         let udpPairs = dataPairs.all
         if udpPairs.count == 2 {
-            setRecvTimeout(udpPairs[1].0.fd, seconds: 5)
             let hs = (try? FDIO.readFrame(udpPairs[1].0.fd, max: 1 << 20)).flatMap { $0 }.map(string)
             r.check("UDP handshake is the first data frame", hs == #"{"flow_id":2}"#, hs ?? "nil")
         } else {

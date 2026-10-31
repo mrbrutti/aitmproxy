@@ -69,20 +69,20 @@ fn push_unique(tokens: &mut Vec<String>, token: String) {
 ///
 /// Two security rules shape this (spec Design §Piece 2, findings 1 and 2):
 /// *IP-valued* entries are **skipped** — the provider matches an IP token by the
-/// flow's destination IP (FlowHandoff.swift:526-527), but the core L7 gate matches
+/// flow's destination IP (`ScopeMatcher.matches`, the `.ip` case, FlowHandoff.swift), but the core L7 gate matches
 /// the SNI/host string (ingress.rs:183-188 → authority.rs:89-90), so a flow to that
 /// IP carrying a different SNI would be claimed by the provider and then refused by
 /// the core (over-inclusive); IP targets belong in the L4 scope. And every emitted
 /// host/suffix must pass the provider's own `isValidHostname` ([`is_emittable_host`]),
 /// because the provider splits the whole spec on `,`/`;`/whitespace *before* parsing
-/// (FlowHandoff.swift:514-517) and `Authority` does **not** reject those in a host
+/// (`isValidHostname`, FlowHandoff.swift) and `Authority` does **not** reject those in a host
 /// (authority.rs:70) — an unvalidated token would fragment the provider's spec into
 /// extra entries (over-inclusive).
 fn l7_tokens(host: &str) -> Vec<String> {
     let normalized = host.trim().to_ascii_lowercase();
     // `*.suffix`: the core's wildcard matches the apex *and* subdomains
     // (authority.rs:86), but the provider's `*.x` matches subdomains only
-    // (FlowHandoff.swift:531). Emit the apex token too so the provider claims the
+    // (`ScopeMatcher.matches`, the `.suffix` case, FlowHandoff.swift). Emit the apex token too so the provider claims the
     // apex as well. Skip an empty (spec call C5), IP-valued (finding 2), or
     // non-emittable (finding 1) suffix.
     if let Some(suffix) = normalized.strip_prefix("*.") {
@@ -123,15 +123,15 @@ fn is_ip_valued(s: &str) -> bool {
 }
 
 /// The emitter's host gate: the provider's `isValidHostname`
-/// (`FlowHandoff.swift:577-583`) — non-empty, ≤253 chars, no leading `.`, no `..`,
+/// (`isValidHostname`, FlowHandoff.swift) — non-empty, ≤253 chars, no leading `.`, no `..`,
 /// every char in `[a-z0-9.\-_]` — **plus** a deliberate trailing-dot skip. The
 /// provider splits the whole spec on `,`/`;`/whitespace *before* parsing
-/// (FlowHandoff.swift:514-517), so any token bearing one of those — which `Authority`
+/// (`isValidHostname`, FlowHandoff.swift), so any token bearing one of those — which `Authority`
 /// does not reject (authority.rs:70) — must be skipped here or it fragments the
 /// provider's spec (security finding 1).
 ///
 /// Trailing dot (security re-review Minor): the provider strips a trailing `.`
-/// (`normalizeHost`, FlowHandoff.swift:537-541) so `example.com.` would match
+/// (`ScopeMatcher.normalizeHost`, FlowHandoff.swift) so `example.com.` would match
 /// `example.com` flows, but the core's `matches_scope_entry` does **not** strip it
 /// (authority.rs:83-93) so the same entry matches nothing. Emitting the token would
 /// make the provider claim a flow the core then refuses (over-inclusive, broken
@@ -436,9 +436,10 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------------
-    // Faithful Rust mirror of the Swift provider's `ScopeMatcher`
-    // (apps/mac/Extension/Sources/FlowHandoff.swift). Each method cites its Swift
-    // source lines. Per spec Architect's call C6, IP tokens/flows are compared by
+    // Faithful Rust mirror of the TCP path of the Swift provider's `ScopeMatcher`
+    // (apps/mac/Extension/Sources/FlowHandoff.swift). Each method names its Swift
+    // counterpart (symbols, not line numbers — those rot). UDP is not modelled: host and
+    // suffix tokens never claim it, and DNS-port datagrams are never claimed. Per spec Architect's call C6, IP tokens/flows are compared by
     // parsing to `std::net::IpAddr` and comparing by value — equivalent to the Swift
     // `IPText.canonical` string compare for the fixture's valid inputs.
     // ----------------------------------------------------------------------------
@@ -460,7 +461,7 @@ mod tests {
     }
 
     impl ScopeMatcherMirror {
-        /// Mirror of `init(spec:)` (FlowHandoff.swift:513-518): split on `,;` +
+        /// Mirror of `init(spec:)` (`ScopeMatcher.init(spec:)`, FlowHandoff.swift): split on `,;` +
         /// whitespace/newlines, drop empties, parse each lowercased token.
         fn new(spec: &str) -> Self {
             let entries = spec
@@ -471,7 +472,10 @@ mod tests {
             Self { entries }
         }
 
-        /// Mirror of `matches(hostname:ip:port:)` (FlowHandoff.swift:520-535).
+        /// Mirror of the **TCP path** of `matches(kind:hostname:ip:port:)` in FlowHandoff.swift.
+        /// UDP is not modelled: host/suffix tokens never claim it and a datagram to a DNS
+        /// port is never claimed (`neverClaimedDatagramPorts`), so every `claimed` below
+        /// means "claimed for a TCP flow".
         fn matches(&self, hostname: Option<&str>, ip: &str, port: u16) -> bool {
             let host = hostname.map(Self::normalize_host);
             // `IPText.canonical(text: ip) ?? ip`: compared by value as `IpAddr`.
@@ -505,7 +509,7 @@ mod tests {
             false
         }
 
-        /// Mirror of `normalizeHost(_:)` (FlowHandoff.swift:537-541): lowercase and
+        /// Mirror of `normalizeHost(_:)` (`ScopeMatcher.normalizeHost`, FlowHandoff.swift): lowercase and
         /// drop a single trailing dot.
         fn normalize_host(h: &str) -> String {
             let mut s = h.to_ascii_lowercase();
@@ -515,7 +519,7 @@ mod tests {
             s
         }
 
-        /// Mirror of `parse(_:)` (FlowHandoff.swift:543-575). `token` is lowercased.
+        /// Mirror of `parse(_:)` (`ScopeMatcher.parse`, FlowHandoff.swift). `token` is lowercased.
         fn parse(token: &str) -> Option<MirrorEntry> {
             // Bracketed IPv6 literal with an optional `:port` (:546-556).
             if let Some(rest0) = token.strip_prefix('[') {
@@ -586,7 +590,7 @@ mod tests {
             }
         }
 
-        /// Mirror of `isValidHostname(_:)` (FlowHandoff.swift:577-583).
+        /// Mirror of `isValidHostname(_:)` (`isValidHostname`, FlowHandoff.swift).
         fn is_valid_hostname(s: &str) -> bool {
             if s.is_empty() || s.len() > 253 || s.starts_with('.') || s.contains("..") {
                 return false;

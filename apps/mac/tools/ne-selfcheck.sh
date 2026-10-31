@@ -31,9 +31,9 @@
 # driver is the module's entry point instead: it calls HandoffSelfCheck.run(), prints the
 # lines, and exits.
 #
-# The DEBUG define is passed as the single token `-DDEBUG` (not `-D DEBUG`): the two-token
-# form was observed to leave HandoffSelfCheck undefined in one run. Everything the
-# compiler writes goes under the scratch dir (-module-cache-path).
+# The DEBUG define is passed as the single token `-DDEBUG`, matching the spec's command
+# line; swiftc accepts either spelling. Everything the compiler writes goes under the
+# scratch dir (-module-cache-path).
 set -euo pipefail
 export LC_ALL=C
 
