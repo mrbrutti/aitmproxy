@@ -787,3 +787,28 @@ no sysex change, no shell command in any product string.
 13. A fourth Status card plus a Getting started row, not a modal; "Packet capture" is the UI word.
 14. Config keys `l4.privilege.{helper_path, macos_app_path, request}`, with `request: at_start` as the CLI path.
 15. Re-probe TTL of 1 s while unavailable.
+
+## Orchestrator conditions on the bundle layout (2026-10-31, approved in principle)
+
+Recorded verbatim in intent from the orchestrator session ("aitmproxy: Rust MITM platform
+design"); the release-pipeline files stay claimed through it and it reviews those diffs.
+
+1. `aitm-l4-helper` is a workspace crate with `version.workspace = true` so app, core, sysex
+   and helper carry one version; `scripts/package.sh` ships it in the tarball and
+   `apps/mac/build.sh` copies it from the tarball only under `--ne` (never from
+   `AITM_CORE_DIR` or a dev build; `tools/snap-dev.sh` tripwire).
+2. `scripts/notarize-dmg.sh`: sign order sysex-nested → sysex → core → helper → app; the helper
+   signed with hardened runtime + timestamp and no entitlements; the post-sign assertions
+   (team 995PCLM9KH, Developer ID authority, runtime) extend to the helper; refuse a bundle with
+   only one of plist/helper; assert the plist's `BundleProgram` points at an existing Mach-O;
+   `scripts/tests/run-notarize-dmg-stubbed.sh` gains the helper cases (present / absent /
+   plist-only).
+3. Homebrew cask: `uninstall launchctl: "com.mrbrutti.aitmproxy.l4-helper"`; the app
+   unregisters the daemon on Settings ▸ Uninstall; documented in `docs/RELEASE.md`.
+4. Linux deb/rpm: helper 0755 root + polkit policy via nfpm `contents`, no maintainer scripts.
+5. The core's `open -a <path> aitmproxy://packet-capture/allow` handoff resolves the INSTALLED
+   app path from the running core's own bundle, never a `/tmp` dev bundle.
+6. **Spike rule.** Any spike that changes system state on Matt's Mac (chmod `/dev/bpf*`, group
+   creation or membership, installing a LaunchDaemon, Login Items prompts) is announced to the
+   orchestrator BEFORE it runs with its exact revert steps, runs only on its go after Matt has
+   been told, and is reverted in the same session. Spikes that can run in a VM run there.
