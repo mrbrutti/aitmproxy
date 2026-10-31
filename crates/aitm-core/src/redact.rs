@@ -1858,4 +1858,161 @@ mod tests {
             bad.len()
         );
     }
+
+    // ---- Edges of the wide reading: the ends of the text, non-ASCII boundaries,
+    // ---- a text cut short, and oversized runs.
+
+    /// The two ends of the text and the places a non-ASCII character can sit, read
+    /// the wide way. Each row follows from the scan's rules (a key run, blanks, a
+    /// separator, a value), not from a recording.
+    #[test]
+    fn scrub_text_wide_reads_the_edges_of_the_text() {
+        let bad = mismatches_wide(&[
+            // Nothing at all, and a key the text ends on or just after.
+            ("", ""),
+            ("sidebar", "sidebar"),
+            ("sidebar=", "sidebar="),
+            ("sidebar:", "sidebar:"),
+            ("sidebar='", "sidebar='"),
+            ("author: ", "author: "),
+            ("author:\n", "author:\n"),
+            ("author:\u{2028}", "author:\u{2028}"),
+            ("sidebar=\u{a0}", "sidebar=\u{a0}"),
+            ("sidebar\u{a0}", "sidebar\u{a0}"),
+            ("sidebar\u{e9}", "sidebar\u{e9}"),
+            // A one-character value is the last thing in the text.
+            ("sidebar=v", "sidebar=[redacted]"),
+            ("x=1&sidebar=v", "x=1&sidebar=[redacted]"),
+            ("author:v", "author:[redacted]"),
+            // A value that is one non-ASCII character (two and four bytes), a NUL,
+            // and a value that a non-ASCII blank ends.
+            ("sidebar=\u{e9}", "sidebar=[redacted]"),
+            ("sidebar=\u{1f600}", "sidebar=[redacted]"),
+            ("sidebar=\0", "sidebar=[redacted]"),
+            ("sidebar=v\u{a0}", "sidebar=[redacted]\u{a0}"),
+            ("sidebar=\u{e9}\u{a0}x", "sidebar=[redacted]\u{a0}x"),
+            // A key glued to a non-ASCII character on either side is one run, and
+            // a word that a non-ASCII character splits is not the word.
+            ("\u{e9}author=v", "\u{e9}author=[redacted]"),
+            ("author\u{e9}=v", "author\u{e9}=[redacted]"),
+            ("\u{1f600}sid=v", "\u{1f600}sid=[redacted]"),
+            ("si\u{e9}d=v", "si\u{e9}d=v"),
+            // A blank is not part of a key run, so a leading no-break space is
+            // stepped over whole and the key behind it is still found.
+            ("\u{a0}sidebar=v", "\u{a0}sidebar=[redacted]"),
+            (
+                "author\u{2028}:\u{2028}v",
+                "author\u{2028}:\u{2028}[redacted]",
+            ),
+            // A non-secret non-ASCII key beside a secret one swallows nothing.
+            (
+                "\u{4e2d}\u{6587}=v&sidebar=1",
+                "\u{4e2d}\u{6587}=v&sidebar=[redacted]",
+            ),
+        ]);
+        assert!(bad.is_empty(), "wrong output: {bad:#?}");
+    }
+
+    /// A connection that drops mid-stream hands over a prefix of the text. Cut at
+    /// every char boundary, the wide scrub never panics and leaves no character of
+    /// a credential behind: every value is a run of `Q` (or of `8`, as a port), and
+    /// neither character appears anywhere else in the text.
+    #[test]
+    fn scrub_text_wide_masks_every_prefix_of_a_credential_bearing_text() {
+        let doc = "GET /x?author=QQQQ&sidebar=QQQQ HTTP/1.1\r\n\
+                   X-Authority: QQQQ\r\n\r\n\
+                   {\"subsidiary\":\"QQQQ\",\"n\":1}&next=/cb?sessions=QQQQ\
+                   &u=auth.example.com:8888 \u{e9}\u{a0}sid:QQQQ\u{2028}tail";
+        let mut cuts = 0;
+        let mut bad: Vec<(usize, String)> = Vec::new();
+        for cut in doc
+            .char_indices()
+            .map(|(at, _)| at)
+            .chain(std::iter::once(doc.len()))
+        {
+            cuts += 1;
+            let out = scrub_text_wide(&doc[..cut]);
+            if out.contains('Q') || out.contains('8') {
+                bad.push((cut, out));
+            }
+        }
+        assert!(cuts >= 150, "the document is too short: {cuts} cuts");
+        assert!(
+            bad.is_empty(),
+            "a credential survived in a prefix: {bad:#?}"
+        );
+
+        let whole = "GET /x?author=[redacted]&sidebar=[redacted] HTTP/1.1\r\n\
+                     X-Authority: [redacted]\r\n\r\n\
+                     {\"subsidiary\":\"[redacted]\",\"n\":1}&next=/cb?sessions=[redacted]\
+                     &u=auth.example.com:[redacted] \u{e9}\u{a0}sid:[redacted]\u{2028}tail";
+        assert!(
+            scrub_text_wide(doc) == whole,
+            "the whole text came out wrong: {:?}",
+            scrub_text_wide(doc)
+        );
+    }
+
+    /// Keys with nothing to match, and keys far too long to be real, are decided
+    /// without a panic. Case folding is ASCII only, so a non-ASCII letter never
+    /// reads as an ASCII one.
+    #[test]
+    fn is_secret_key_wide_survives_degenerate_and_oversized_keys() {
+        assert!(!is_secret_key_wide(""));
+        assert!(!is_secret_key_wide(" \t\u{a0}\n"));
+        assert!(!is_secret_key_wide("\u{e9}\u{4e2d}\u{1f600}"));
+        assert!(is_secret_key_wide("\u{e9}AUTH\u{e9}"));
+        assert!(!is_secret_key_wide("s\u{131}d"), "dotless i is not an i");
+        assert!(!is_secret_key_wide("S\u{130}D"), "dotted I is not an i");
+
+        let long = "a".repeat(1 << 20);
+        assert!(!is_secret_key_wide(&long));
+        assert!(is_secret_key_wide(&format!("{long}sid")));
+        assert!(is_secret_key_wide(&format!("sid{long}")));
+        let multibyte = "\u{e9}".repeat(1 << 19);
+        assert!(!is_secret_key_wide(&multibyte));
+        assert!(is_secret_key_wide(&format!("{multibyte}Auth")));
+    }
+
+    /// One run of a megabyte, in each place the scan reads a run, stays linear and
+    /// is read the same way as a short one.
+    #[test]
+    fn scrub_text_wide_stays_linear_on_one_oversized_run() {
+        let run = "x".repeat(1 << 20);
+        let blanks = " ".repeat(1 << 20);
+
+        // A key run holding the word at its end is masked; one holding no word is not.
+        let input = format!("{run}author=v");
+        assert!(
+            scrub_text_wide(&input) == format!("{run}author=[redacted]"),
+            "a megabyte-long key that ends in `author` was not masked"
+        );
+        let input = format!("{run}=v");
+        assert!(scrub_text_wide(&input) == input, "a plain long key changed");
+
+        // Blanks between the key and the separator, and between it and the value.
+        let input = format!("author{blanks}=v");
+        assert!(
+            scrub_text_wide(&input) == format!("author{blanks}=[redacted]"),
+            "blanks before the separator were not skipped"
+        );
+        let input = format!("author={blanks}v");
+        assert!(
+            scrub_text_wide(&input) == format!("author={blanks}[redacted]"),
+            "blanks after the separator were not skipped"
+        );
+
+        // A value of a megabyte, and a megabyte of nothing but separators.
+        let input = format!("author={run}");
+        assert!(
+            scrub_text_wide(&input) == "author=[redacted]",
+            "a long value"
+        );
+        for separators in [":".repeat(1 << 20), "=".repeat(1 << 20)] {
+            assert!(
+                scrub_text_wide(&separators) == separators,
+                "a run of separators changed"
+            );
+        }
+    }
 }
