@@ -36,8 +36,14 @@ Two windows per binary, both with the page open in a real browser:
 - **idle**: no traffic, 30 s.
 - **traffic**: 20 plain-HTTP req/s for 30 s through the proxy (`127.0.0.1:8080`) to a loopback
   origin the script starts, plus a 1 s settle. The store is seeded with at least 500 flows
-  beforehand so `flow.list` has a real cost. The script warns if its own subscription reported
-  `lagged` during a window (dropped lines make the counts a floor).
+  beforehand so `flow.list` has a real cost.
+
+A run is reported as unusable (exit code 3; `valid: false` and the reasons in `warnings` in the
+JSON; the tables still print) when a window received no audit line with the UI's origin (page not
+open, not on this server, or a wrong `--ui-origin`), when no request got through the proxy, or
+when the script's own subscription reported `lagged` during a window (dropped lines make the
+counts a floor). A run with only advisory warnings (some requests failed) stays valid and lists
+them. The bus URL is printed and saved without userinfo, query and fragment.
 
 Window bounds are the script's clock; audit lines are stamped by the server at record time and
 filtered on `at` within the window. The script, the proxy and the browser share one host (the
@@ -85,11 +91,14 @@ Open the printed `web UI (agent)` URL in a real browser and leave the page open.
 
 ```bash
 node apps/web/scripts/bus-load.mjs --seed 500
-node apps/web/scripts/bus-load.mjs --token T --label after --json "$TMPDIR/after.json"
+AITM_WEB_TOKEN=T node apps/web/scripts/bus-load.mjs --label after --json "$TMPDIR/after.json"
 ```
 
-Repeat with `aitm-before` and `--label before`. If the page was opened at the
-`web UI (operator)` URL, pass that URL's `t=` token as `--token` and add `--ui-origin operator`.
+The token goes in `AITM_WEB_TOKEN` rather than `--token`: argv is visible to other local users
+via `ps`. Repeat with `aitm-before` and `--label before`. If the page was opened at the
+`web UI (operator)` URL, pass that URL's `t=` token in `AITM_WEB_TOKEN` and add
+`--ui-origin operator`. A non-zero exit means the numbers must not be used (`--help` lists the
+exit codes).
 
 ## Results
 

@@ -2,10 +2,15 @@
 // Measures how often the web UI calls the core (spec D9 of 2026-10-30-web-ui-bus-push-design.md).
 // Node >= 22 (global WebSocket), no dependencies, same style as bus-probe.mjs.
 //
-//   node apps/web/scripts/bus-load.mjs --token T [--label before|after|...] [--json out.json]
+//   AITM_WEB_TOKEN=T node apps/web/scripts/bus-load.mjs [--label before|after|...] [--json out.json]
 //   node apps/web/scripts/bus-load.mjs --seed 500 [--proxy 127.0.0.1:8080]   # fill the store, no windows
-//   node apps/web/scripts/bus-load.mjs --selftest                             # pure counters, no network
+//   node apps/web/scripts/bus-load.mjs --selftest                             # pure helpers, no network
 //   node apps/web/scripts/bus-load.mjs --help
+//
+// Exit codes: 0 ok · 1 error · 2 bad arguments · 3 the run finished but its numbers are unusable
+// (`valid: false` and the reasons in `warnings` in the JSON; the tables still print). The token
+// goes in AITM_WEB_TOKEN by preference: argv is visible to other local users via ps. The bus URL
+// is printed and saved without userinfo, query and fragment.
 //
 // INSTRUMENT. The server audits every tool call (crates/aitm-core/src/audit.rs: `at` epoch ms,
 // `origin`, `command`, ...) and pushes each entry as a `notifications/aitm/agent` line to every
@@ -39,7 +44,7 @@
 // Keep that `aitm` in a foreground Terminal tab (it exits when its stdin closes). Open the
 // printed `web UI (agent)` URL in a real browser and leave the page open. Seed the store
 // (`--seed 500`) so `flow.list` has a real cost, then run the measurement. If the page was opened
-// at the `web UI (operator)` URL, pass that URL's `t=` token as --token and `--ui-origin operator`.
+// at the `web UI (operator)` URL, pass that URL's `t=` token in AITM_WEB_TOKEN and `--ui-origin operator`.
 import { createServer, request as httpRequest, Agent } from 'node:http';
 import { writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
@@ -146,8 +151,72 @@ export function newCollector(cap = COLLECTOR_CAP) {
   };
 }
 
+/**
+ * The bus URL as it may be printed or saved: scheme, host, port and path only. Userinfo, query
+ * and fragment are dropped (a `?t=` token or `user:pw@` would otherwise land in the header line,
+ * in connect errors and in the `--json` file). A value that is not a URL is not echoed at all.
+ */
+export function redactUrl(raw) {
+  let u;
+  try {
+    u = new URL(String(raw));
+  } catch {
+    return '<unparseable url>';
+  }
+  return `${u.protocol}//${u.host}${u.pathname}`;
+}
+
+const sum = (o) => Object.values(o).reduce((a, b) => a + b, 0);
+
+/**
+ * What is wrong with one measured window (`w` is the window object `main` builds: `total`,
+ * `otherOrigins`, `notifications.lagged`, and `requests` for the traffic window). `fatal`
+ * reasons make the run's numbers unusable: the script's own subscription lagged (the server
+ * dropped lines, every count is a floor); no audit line with the UI's origin arrived (the page
+ * is not open, not on this server, or `--ui-origin` is wrong); or no request got through the
+ * proxy. `advisory` reasons (some requests failed) are reported but do not invalidate the run.
+ */
+export function assessWindow(name, w, uiOrigin) {
+  const fatal = [];
+  const advisory = [];
+  const lagged = w.notifications?.lagged ?? 0;
+  if (lagged > 0) fatal.push(`${name}: the script's own subscription lagged ${lagged}x; audit lines were dropped and the counts are a floor`);
+  const otherOrigins = w.otherOrigins ?? {};
+  const others = sum(otherOrigins);
+  if (w.total === 0) {
+    if (others === 0) fatal.push(`${name}: no audit lines arrived during the window; is the page open and connected to this server?`);
+    else fatal.push(`${name}: ${others} audit lines arrived but none with origin ${uiOrigin} (seen: ${JSON.stringify(otherOrigins)}); check --ui-origin`);
+  }
+  const r = w.requests;
+  if (r) {
+    if (r.ok === 0) fatal.push(`${name}: no request succeeded through the proxy (first error: ${r.firstError ?? 'no request was sent'}); check --proxy and the 127.0.0.1 scope entry`);
+    else if (r.failed > 0) advisory.push(`${name}: ${r.failed} of ${r.sent} requests failed; first error: ${r.firstError}`);
+  }
+  return { fatal, advisory };
+}
+
+/**
+ * The run's verdict for the JSON and the exit code: `valid` iff no measured window has a fatal
+ * reason (a skipped window, null, is not judged); `warnings` lists every reason, idle first.
+ */
+export function assessRun({ idle, traffic }, uiOrigin) {
+  const warnings = [];
+  let valid = true;
+  for (const [name, w] of [
+    ['idle', idle],
+    ['traffic', traffic],
+  ]) {
+    if (!w) continue;
+    const a = assessWindow(name, w, uiOrigin);
+    if (a.fatal.length) valid = false;
+    warnings.push(...a.fatal, ...a.advisory);
+  }
+  return { valid, warnings };
+}
+
 // ---------------------------------------------------------------------------------------------
-// --selftest: the canned window from the plan (Task 0) and the collector, exact lines, exit code
+// --selftest: the canned window from the plan (Task 0), the collector, the URL redaction and the
+// validity decision; exact lines, exit code
 // ---------------------------------------------------------------------------------------------
 
 function selftest() {
@@ -229,6 +298,70 @@ function selftest() {
     expectEq('otherOrigins', s.otherOrigins, { operator: 1 });
   });
 
+  run('redactUrl: userinfo, query and hash stripped; scheme, host, port and path kept', () => {
+    expectEq('secrets stripped', redactUrl('ws://user:pw@127.0.0.1:8082/bus?t=secret#frag'), 'ws://127.0.0.1:8082/bus');
+    expectEq('query only', redactUrl('ws://127.0.0.1:8082/bus?token=abc'), 'ws://127.0.0.1:8082/bus');
+    expectEq('default url unchanged', redactUrl('ws://127.0.0.1:8082/bus'), 'ws://127.0.0.1:8082/bus');
+    expectEq('wss host:port kept', redactUrl('wss://proxy.example:9443/bus'), 'wss://proxy.example:9443/bus');
+    expectEq('unparseable string is not echoed', redactUrl('not a url ?t=secret'), '<unparseable url>');
+    expectEq('non-string is not echoed', redactUrl(undefined), '<unparseable url>');
+  });
+
+  run('run validity: which window, request and lag conditions make a run unusable, and the warnings listed', () => {
+    const window = (total, otherOrigins = {}, lagged = 0, extra = {}) => ({
+      total,
+      otherOrigins,
+      notifications: { flow: 0, agent: total, state: 0, other: 0, lagged, nonAudit: 0, dropped: 0 },
+      ...extra,
+    });
+    const requests = (ok, failed, firstError = null) => ({ sent: ok + failed, ok, failed, skipped: 0, firstError });
+    const LAGGED_1 = "traffic: the script's own subscription lagged 1x; audit lines were dropped and the counts are a floor";
+    const NO_LINES = 'idle: no audit lines arrived during the window; is the page open and connected to this server?';
+    const SOME_FAILED = 'traffic: 3 of 600 requests failed; first error: timeout through proxy';
+
+    expectEq('healthy idle', assessWindow('idle', window(75), 'mcp'), { fatal: [], advisory: [] });
+    expectEq('no lines at all', assessWindow('idle', window(0), 'mcp'), { fatal: [NO_LINES], advisory: [] });
+    expectEq('lines but none with the ui origin', assessWindow('idle', window(0, { operator: 75 }), 'mcp'), {
+      fatal: ['idle: 75 audit lines arrived but none with origin mcp (seen: {"operator":75}); check --ui-origin'],
+      advisory: [],
+    });
+    expectEq('lagged', assessWindow('traffic', window(600, {}, 2, { requests: requests(600, 0) }), 'mcp'), {
+      fatal: ["traffic: the script's own subscription lagged 2x; audit lines were dropped and the counts are a floor"],
+      advisory: [],
+    });
+    expectEq('no request succeeded', assessWindow('traffic', window(60, {}, 0, { requests: requests(0, 600, 'HTTP 403 from the proxy (is 127.0.0.1 in scope?)') }), 'mcp'), {
+      fatal: ['traffic: no request succeeded through the proxy (first error: HTTP 403 from the proxy (is 127.0.0.1 in scope?)); check --proxy and the 127.0.0.1 scope entry'],
+      advisory: [],
+    });
+    expectEq('no request sent', assessWindow('traffic', window(60, {}, 0, { requests: requests(0, 0) }), 'mcp'), {
+      fatal: ['traffic: no request succeeded through the proxy (first error: no request was sent); check --proxy and the 127.0.0.1 scope entry'],
+      advisory: [],
+    });
+    expectEq('some requests failed is advisory', assessWindow('traffic', window(600, {}, 0, { requests: requests(597, 3, 'timeout through proxy') }), 'mcp'), {
+      fatal: [],
+      advisory: [SOME_FAILED],
+    });
+
+    expectEq('both windows healthy', assessRun({ idle: window(75), traffic: window(600, {}, 0, { requests: requests(600, 0) }) }, 'mcp'), { valid: true, warnings: [] });
+    expectEq('skipped windows are not judged', assessRun({ idle: null, traffic: null }, 'mcp'), { valid: true, warnings: [] });
+    expectEq('one lagged window invalidates', assessRun({ idle: window(75), traffic: window(600, {}, 1, { requests: requests(600, 0) }) }, 'mcp'), { valid: false, warnings: [LAGGED_1] });
+    expectEq('an empty idle window invalidates', assessRun({ idle: window(0), traffic: null }, 'mcp'), { valid: false, warnings: [NO_LINES] });
+    expectEq('advisory alone keeps the run valid', assessRun({ idle: null, traffic: window(600, {}, 0, { requests: requests(597, 3, 'timeout through proxy') }) }, 'mcp'), { valid: true, warnings: [SOME_FAILED] });
+    expectEq(
+      'every reason is listed, idle first, lag before lines before requests',
+      assessRun({ idle: window(0), traffic: window(0, { operator: 2 }, 1, { requests: requests(0, 600, 'x') }) }, 'mcp'),
+      {
+        valid: false,
+        warnings: [
+          NO_LINES,
+          LAGGED_1,
+          'traffic: 2 audit lines arrived but none with origin mcp (seen: {"operator":2}); check --ui-origin',
+          'traffic: no request succeeded through the proxy (first error: x); check --proxy and the 127.0.0.1 scope entry',
+        ],
+      },
+    );
+  });
+
   if (failures.length) {
     console.error('selftest FAILED');
     for (const f of failures) console.error('  ' + f);
@@ -242,11 +375,12 @@ function selftest() {
 // CLI
 // ---------------------------------------------------------------------------------------------
 
-const HELP = `usage: node apps/web/scripts/bus-load.mjs --token T [options]
+const HELP = `usage: AITM_WEB_TOKEN=T node apps/web/scripts/bus-load.mjs [options]
        node apps/web/scripts/bus-load.mjs --seed N [--proxy HOST:PORT] [--label L]
 
-  --url URL            bus URL (default ws://127.0.0.1:8082/bus)
-  --token T            bridge token (or AITM_WEB_TOKEN); the agent token unless --ui-origin operator
+  --url URL            bus URL (default ws://127.0.0.1:8082/bus); printed and saved without userinfo, query, fragment
+  --token T            bridge token; prefer AITM_WEB_TOKEN (argv is visible to other local users via ps).
+                       The agent token unless --ui-origin operator
   --ui-origin ORIGIN   audit origin the UI's calls carry: mcp (default) or operator
   --idle-secs N        idle window length (default 30; 0 skips it)
   --traffic-secs N     traffic window length (default 30; 0 skips it)
@@ -255,8 +389,12 @@ const HELP = `usage: node apps/web/scripts/bus-load.mjs --token T [options]
   --label L            free-form tag for the table, the JSON and the request paths (default none)
   --json PATH          also write every number as JSON to PATH
   --seed N             send N requests through the proxy (${SEED_CONCURRENCY} at a time) and exit; no bus, no windows
-  --selftest           run the pure counters on canned input and exit (no network)
-  --help               this text
+  --selftest           run the pure helpers on canned input and exit (no network)
+  -h, --help           this text
+
+Exit codes: 0 ok · 1 error · 2 bad arguments · 3 the run finished but its numbers are unusable (a
+window with no audit line of the UI's origin, no request through the proxy, or a lagged
+subscription; the tables still print, the JSON carries valid:false and the reasons in warnings).
 
 Setup (the loopback origin must be in scope; --config is the FIRST aitm argument):
   printf 'listen: 127.0.0.1:8080\\nscope:\\n  entries:\\n    - "127.0.0.1"\\n' > $TMPDIR/aitm-load.yaml
@@ -274,8 +412,9 @@ function parseArgs(argv) {
     args.splice(i, 2);
     return v;
   };
-  const flag = (name) => {
-    const i = args.indexOf(`--${name}`);
+  /** `tok` is the literal argument (`--help`, `-h`); both help spellings are consumed so neither is left over as unknown. */
+  const flag = (tok) => {
+    const i = args.indexOf(tok);
     if (i < 0) return false;
     args.splice(i, 1);
     return true;
@@ -287,9 +426,11 @@ function parseArgs(argv) {
     if (!Number.isFinite(n) || n < 0) throw new Error(`--${name} must be a non-negative number, got ${v}`);
     return n;
   };
+  const longHelp = flag('--help');
+  const shortHelp = flag('-h');
   const o = {
-    help: flag('help') || flag('h'),
-    selftest: flag('selftest'),
+    help: longHelp || shortHelp,
+    selftest: flag('--selftest'),
     url: opt('url', 'ws://127.0.0.1:8082/bus'),
     token: opt('token', process.env.AITM_WEB_TOKEN),
     uiOrigin: opt('ui-origin', 'mcp'),
@@ -312,7 +453,13 @@ function parseArgs(argv) {
 // ---------------------------------------------------------------------------------------------
 
 async function connectBus(url, token, onNotification) {
-  const ws = new WebSocket(url, { headers: { Origin: `http://${new URL(url).host}` } });
+  let ws;
+  try {
+    ws = new WebSocket(url, { headers: { Origin: `http://${new URL(url).host}` } });
+  } catch (e) {
+    // A URL the constructor rejects (not a URL, a fragment, ...) is reported redacted, never raw.
+    throw new Error(`bus connect failed at ${redactUrl(url)}: ${e.message}`);
+  }
   let nextId = 0;
   const pending = new Map();
   ws.onmessage = (ev) => {
@@ -339,8 +486,10 @@ async function connectBus(url, token, onNotification) {
   };
   await new Promise((res, rej) => {
     ws.onopen = res;
-    ws.onerror = (e) => rej(new Error(`bus connect failed: ${e?.message ?? url}`));
-    ws.onclose = (ev) => rej(new Error(`bus closed during connect (${ev.code})`));
+    // The error event's `message` is empty for a refused connection; the URL (redacted: no
+    // userinfo, query or fragment) is what tells the operator where the script looked.
+    ws.onerror = (e) => rej(new Error(`bus connect failed at ${redactUrl(url)}${e?.message ? `: ${e.message}` : ''}`));
+    ws.onclose = (ev) => rej(new Error(`bus closed during connect (${ev.code}) at ${redactUrl(url)}`));
   });
   ws.onclose = (ev) => {
     for (const [, p] of pending) p.reject(new Error(`bus closed (${ev.code}) during ${p.method}`));
@@ -547,20 +696,22 @@ function renderNotifications(n) {
   return `${'notifications'.padEnd(14)} ${[kinds, ...extras].join(' · ')}`;
 }
 
-const sum = (o) => Object.values(o).reduce((a, b) => a + b, 0);
-
 async function main(o) {
   if (!o.token) {
-    console.error('need --token (or AITM_WEB_TOKEN); --help for the setup');
+    console.error('need AITM_WEB_TOKEN (or --token); --help for the setup');
     return 2;
   }
   const proxy = splitHostPort(o.proxy);
+  // The only form of the bus URL that is ever printed or saved.
+  const shownUrl = redactUrl(o.url);
   const collector = newCollector();
   const bus = await connectBus(o.url, o.token, collector.on);
   const out = {
     label: o.label,
     at: new Date().toISOString(),
-    url: o.url,
+    valid: null,
+    warnings: [],
+    url: shownUrl,
     proxy: o.proxy,
     uiOrigin: o.uiOrigin,
     server: bus.init?.serverInfo ?? null,
@@ -570,7 +721,7 @@ async function main(o) {
     traffic: null,
     flowList: null,
   };
-  console.log(`bus-load${o.label ? ` (${o.label})` : ''} · ui origin ${o.uiOrigin} · bus ${o.url} · proxy ${o.proxy} · script role ${out.role ?? '?'}`);
+  console.log(`bus-load${o.label ? ` (${o.label})` : ''} · ui origin ${o.uiOrigin} · bus ${shownUrl} · proxy ${o.proxy} · script role ${out.role ?? '?'}`);
   try {
     // The audit stream only reaches subscribed connections (server.rs push_agent -> fanout_state),
     // so without this subscription there is nothing to count.
@@ -578,7 +729,8 @@ async function main(o) {
     out.subId = sub?.sub_id ?? null;
     console.log(`subscribed: sub_id ${out.subId}`);
 
-    const measureWindow = async (name, startMs, before) => {
+    /** Closes a window, prints its table and its warnings; `requests` is the traffic window's tally. */
+    const measureWindow = async (name, startMs, before, requests = null) => {
       const endMs = Date.now();
       await sleep(RECEIVE_GRACE_MS);
       const after = collector.snapshot();
@@ -586,14 +738,22 @@ async function main(o) {
       const secs = s.windowMs / 1000;
       const notifications = diffCounts(before, after, secs);
       const ratePerSec = Object.fromEntries(Object.entries(s.perCommand).map(([k, v]) => [k, v / secs]));
+      const w = { startMs, endMs, secs, ...s, ratePerSec, totalPerSec: s.total / secs, notifications: notifications.count, notificationsPerSec: notifications.perSec };
       console.log('');
       console.log(`${name} window: ${secs.toFixed(1)} s · ${s.total} ui calls (origin ${o.uiOrigin}) · ${sum(s.otherOrigins)} other-origin${notifications.count.lagged ? ' · SUBSCRIPTION LAGGED' : ''}`);
       for (const l of renderWindow(s)) console.log(l);
       console.log(renderNotifications(notifications));
-      if (notifications.count.lagged) console.error(`WARNING: the script's own subscription lagged ${notifications.count.lagged}x during the ${name} window; audit lines were dropped and the counts are a floor`);
-      if (s.total + sum(s.otherOrigins) === 0) console.error(`WARNING: no audit lines arrived during the ${name} window: is the page open and connected to THIS server (${o.url})?`);
-      else if (s.total === 0) console.error(`WARNING: audit lines arrived but none with origin ${o.uiOrigin} (seen: ${JSON.stringify(s.otherOrigins)}); check --ui-origin`);
-      return { startMs, endMs, secs, ...s, ratePerSec, totalPerSec: s.total / secs, notifications: notifications.count, notificationsPerSec: notifications.perSec };
+      if (requests) {
+        const detail = s.perCommand['flow.detail'] ?? 0;
+        w.requests = requests;
+        w.flowDetailPerRequest = requests.ok > 0 ? detail / requests.ok : null;
+        console.log(`${'requests'.padEnd(14)} ${requests.sent} sent · ${requests.ok} ok · ${requests.failed} failed · ${requests.skipped} skipped (window includes a ${SETTLE_MS} ms settle)`);
+        console.log(`${'flow.detail'.padEnd(14)} ${w.flowDetailPerRequest == null ? 'n/a' : w.flowDetailPerRequest.toFixed(2)} per new flow (spec R3 threshold 2.5)`);
+      }
+      // The same texts land in the JSON's `warnings` (assessRun), so the console and the file agree.
+      const { fatal, advisory } = assessWindow(name, w, o.uiOrigin);
+      for (const text of [...fatal, ...advisory]) console.error(`WARNING: ${text}`);
+      return w;
     };
 
     if (o.idleSecs > 0) {
@@ -612,15 +772,7 @@ async function main(o) {
         console.log(`\ntraffic: ${o.rate} req/s for ${o.trafficSecs} s via ${o.proxy} to http://${origin.host}/`);
         const requests = await generateTraffic({ proxy, originHost: origin.host, rate: o.rate, secs: o.trafficSecs, label: o.label });
         await sleep(SETTLE_MS);
-        const w = await measureWindow('traffic', startMs, before);
-        const detail = w.perCommand['flow.detail'] ?? 0;
-        w.requests = requests;
-        w.flowDetailPerRequest = requests.ok > 0 ? detail / requests.ok : null;
-        console.log(`${'requests'.padEnd(14)} ${requests.sent} sent · ${requests.ok} ok · ${requests.failed} failed · ${requests.skipped} skipped (window includes a ${SETTLE_MS} ms settle)`);
-        if (requests.failed) console.error(`WARNING: ${requests.failed} requests failed; first error: ${requests.firstError}`);
-        if (requests.ok === 0) console.error('WARNING: no request succeeded through the proxy; the traffic numbers are meaningless (check --proxy and the 127.0.0.1 scope entry)');
-        console.log(`${'flow.detail'.padEnd(14)} ${w.flowDetailPerRequest == null ? 'n/a' : w.flowDetailPerRequest.toFixed(2)} per new flow (spec R3 threshold 2.5)`);
-        out.traffic = w;
+        out.traffic = await measureWindow('traffic', startMs, before, requests);
       } finally {
         await origin.close();
       }
@@ -639,10 +791,17 @@ async function main(o) {
   } finally {
     bus.close();
   }
+  // The verdict is saved with the numbers, so an unusable run never looks clean on disk either.
+  Object.assign(out, assessRun(out, o.uiOrigin));
   if (o.json) {
     writeFileSync(o.json, JSON.stringify(out, null, 2) + '\n');
     console.log(`json: ${o.json}`);
   }
+  if (!out.valid) {
+    console.error(`bus-load: run INVALID, the numbers above are not usable (${out.warnings.length} warning(s) above); exit 3`);
+    return 3;
+  }
+  console.log(`run: valid${out.warnings.length ? ` (${out.warnings.length} advisory warning(s) above)` : ''}`);
   return 0;
 }
 
