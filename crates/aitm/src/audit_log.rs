@@ -30,6 +30,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aitm_core::{AuditEntry, AuditLane, DurableAudit, DurableAuditStatus, Frontend};
+use tracing::{info, warn};
 
 /// One of the three audit streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -536,7 +537,6 @@ enum Recheck {
 trait Backend: Send {
     /// Opens `path` for append, ready to write (a `start` marker already in it).
     /// The real one is [`preflight`].
-    #[allow(dead_code)] // used from Task W7
     fn open(&mut self, path: &Path, stream: StreamKind) -> io::Result<Box<dyn LogFile>>;
 
     /// Moves the full active file aside, keeps `keep` rotated files and opens a
@@ -564,6 +564,7 @@ trait Backend: Send {
 #[allow(dead_code)] // used from Task W11
 struct FsBackend;
 
+#[allow(dead_code)] // used from Task W11
 impl Backend for FsBackend {
     fn open(&mut self, path: &Path, stream: StreamKind) -> io::Result<Box<dyn LogFile>> {
         let file: Box<dyn LogFile> = Box::new(preflight(path, stream)?);
@@ -575,9 +576,7 @@ impl Backend for FsBackend {
 /// the file itself. `file` is `None` when the stream could not be opened at boot
 /// and is to be retried; such a stream starts degraded.
 struct StreamSpec {
-    #[allow(dead_code)] // used from Task W7
     path: PathBuf,
-    #[allow(dead_code)] // used from Task W7
     backend: Box<dyn Backend>,
     file: Option<Box<dyn LogFile>>,
 }
@@ -599,13 +598,11 @@ struct Tuning {
     #[allow(dead_code)] // used from Task W9
     recheck: Duration,
     /// How soon a failed stream tries to reopen its file.
-    #[allow(dead_code)] // used from Task W7
     reopen: Duration,
     /// How soon a stream retries a rotation that failed.
     #[allow(dead_code)] // used from Task W8
     rotate_retry: Duration,
     /// How often a repeated failure is logged again.
-    #[allow(dead_code)] // used from Task W7
     warn_every: Duration,
 }
 
@@ -667,7 +664,6 @@ impl GapState {
     }
 
     /// An entry lost to a write error, whose `at` was `at_ms`.
-    #[allow(dead_code)] // used from Task W7
     fn note_fail(&mut self, at_ms: i64) {
         self.failed = self.failed.saturating_add(1);
         self.widen(at_ms);
@@ -708,6 +704,43 @@ fn gap_marker_line(now_ms: i64, from: i64, to: i64, dropped: u64, failed: u64) -
         "to": to,
     })
     .to_string()
+}
+
+/// Lets a repeated warning through once per interval, so that a disk that fails
+/// every entry costs one log line a minute and not one per entry. Each stream
+/// has its own, owned by its thread.
+struct WarnThrottle {
+    every: Duration,
+    /// When a line was last let through; `None` before the first.
+    last: Option<Instant>,
+    /// Lines held back since then.
+    suppressed: u64,
+}
+
+impl WarnThrottle {
+    fn new(every: Duration) -> WarnThrottle {
+        WarnThrottle {
+            every,
+            last: None,
+            suppressed: 0,
+        }
+    }
+
+    /// `Some(n)` when a line may be logged at `now`, `n` being how many were held
+    /// back since the previous one; `None` when this one is held back. The first
+    /// call always passes. `now` is a parameter so that a test needs no clock.
+    fn admit(&mut self, now: Instant) -> Option<u64> {
+        let due = self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= self.every);
+        if due {
+            self.last = Some(now);
+            Some(std::mem::take(&mut self.suppressed))
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            None
+        }
+    }
 }
 
 /// A message to a stream's thread.
@@ -820,15 +853,22 @@ impl StreamEnds {
 
 /// The body of a stream's thread: writes what it is sent, in order, until a
 /// `Close` (sync, mark closed, exit) or until every sender is gone.
-fn run_stream(rx: Receiver<Msg>, mut spec: StreamSpec, shared: &StreamShared) {
+fn run_stream(
+    rx: Receiver<Msg>,
+    spec: StreamSpec,
+    shared: &StreamShared,
+    kind: StreamKind,
+    tuning: &Tuning,
+) {
+    let mut writer = StreamWriter::new(kind, spec, shared, tuning);
     while let Ok(message) = rx.recv() {
         match message {
             Msg::Entry(entry) => {
-                write_entry(&mut spec, &entry, shared);
+                writer.write_entry(&entry);
                 shared.queued.fetch_sub(1, Ordering::Relaxed);
             }
             Msg::Close => {
-                if let Some(file) = spec.file.as_mut() {
+                if let Some(file) = writer.spec.file.as_mut() {
                     // A failed sync leaves nothing further to try at exit.
                     let _ = file.sync();
                 }
@@ -863,24 +903,134 @@ fn write_with_gap(file: &mut dyn LogFile, line: &str, shared: &StreamShared) -> 
     file.append_line(line)
 }
 
-/// Writes one entry as its JSONL line, behind the pending `gap` marker if there
-/// is one. A failure (or a stream with no file) is counted, marks the stream
-/// degraded and loses this entry; the next write that succeeds clears
-/// `degraded`.
-fn write_entry(spec: &mut StreamSpec, entry: &AuditEntry, shared: &StreamShared) {
-    let line = aitm_ca::audit::entry_to_jsonl(entry);
-    let written = match spec.file.as_mut() {
-        Some(file) => write_with_gap(&mut **file, &line, shared),
-        None => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "the stream has no open file",
-        )),
-    };
-    match written {
-        Ok(()) => shared.degraded.store(false, Ordering::Release),
-        Err(_) => {
-            shared.degraded.store(true, Ordering::Release);
-            shared.write_failures.fetch_add(1, Ordering::Relaxed);
+/// What one stream's thread owns while it runs: its file and the policy for
+/// when the file goes wrong (spec Design 9). Best effort and one attempt per
+/// entry: a failed write loses that entry, closes the file and marks the hole;
+/// the next entry reopens it if the reopen interval has passed and fails fast
+/// otherwise, so a broken disk costs one `open` an interval, not one per entry.
+struct StreamWriter<'a> {
+    kind: StreamKind,
+    spec: StreamSpec,
+    shared: &'a StreamShared,
+    /// How long after the last try at opening the file the next may begin.
+    reopen: Duration,
+    /// When the file was last closed by an error, or an open of it last failed.
+    /// A stream that arrived without a file counts boot as its last attempt.
+    last_open_attempt: Instant,
+    /// Lets one failure in an interval reach the log.
+    throttle: WarnThrottle,
+    /// Entries lost since the last time the stream recovered.
+    failures: u64,
+    /// Kind of the latest error, which an entry that fails fast reports: it
+    /// made no attempt of its own.
+    last_error: io::ErrorKind,
+}
+
+impl<'a> StreamWriter<'a> {
+    fn new(
+        kind: StreamKind,
+        spec: StreamSpec,
+        shared: &'a StreamShared,
+        tuning: &Tuning,
+    ) -> StreamWriter<'a> {
+        StreamWriter {
+            kind,
+            spec,
+            shared,
+            reopen: tuning.reopen,
+            last_open_attempt: Instant::now(),
+            throttle: WarnThrottle::new(tuning.warn_every),
+            failures: 0,
+            last_error: io::ErrorKind::NotConnected,
+        }
+    }
+
+    /// Writes one entry as its JSONL line, behind the pending `gap` marker if
+    /// there is one. A failure is counted, marks the stream degraded and loses
+    /// this entry; the next write that succeeds clears `degraded`.
+    fn write_entry(&mut self, entry: &AuditEntry) {
+        let line = aitm_ca::audit::entry_to_jsonl(entry);
+        match self.try_write(&line) {
+            Ok(()) => self.succeeded(),
+            Err(error) => self.failed(entry.at_millis(), error.kind()),
+        }
+    }
+
+    /// Reopens the file when there is none and it is time, then writes. A write
+    /// that fails closes the file and starts the reopen interval.
+    fn try_write(&mut self, line: &str) -> io::Result<()> {
+        if self.spec.file.is_none() {
+            self.reopen_file()?;
+        }
+        let Some(file) = self.spec.file.as_mut() else {
+            return Err(io::Error::new(
+                self.last_error,
+                "the stream has no open file",
+            ));
+        };
+        let written = write_with_gap(&mut **file, line, self.shared);
+        if written.is_err() {
+            self.spec.file = None;
+            self.last_open_attempt = Instant::now();
+        }
+        written
+    }
+
+    /// Opens the file if the reopen interval has passed since the last attempt;
+    /// inside it, fails without calling the backend. A failed open starts the
+    /// interval again.
+    fn reopen_file(&mut self) -> io::Result<()> {
+        if self.last_open_attempt.elapsed() < self.reopen {
+            return Err(io::Error::new(
+                self.last_error,
+                "the stream has no open file and the next reopen is not due",
+            ));
+        }
+        match self.spec.backend.open(&self.spec.path, self.kind) {
+            Ok(file) => {
+                self.spec.file = Some(file);
+                Ok(())
+            }
+            Err(error) => {
+                self.last_open_attempt = Instant::now();
+                Err(error)
+            }
+        }
+    }
+
+    /// The entry written at `at_ms` was lost to an error of kind `error`.
+    fn failed(&mut self, at_ms: i64, error: io::ErrorKind) {
+        let shared = self.shared;
+        shared.degraded.store(true, Ordering::Release);
+        shared.write_failures.fetch_add(1, Ordering::Relaxed);
+        shared.lock_gap().note_fail(at_ms);
+        self.failures = self.failures.saturating_add(1);
+        self.last_error = error;
+        if let Some(suppressed) = self.throttle.admit(Instant::now()) {
+            // The path and the kind of error, never a field of the entry.
+            warn!(
+                target: "aitm::audit",
+                stream = self.kind.label(),
+                path = %self.spec.path.display(),
+                error_kind = ?error,
+                suppressed,
+                "an audit log entry was lost to a write error; the stream retries"
+            );
+        }
+    }
+
+    /// An entry was written: the first one after a failure ends the degraded
+    /// state and says so once.
+    fn succeeded(&mut self) {
+        if self.shared.degraded.swap(false, Ordering::AcqRel) {
+            info!(
+                target: "aitm::audit",
+                stream = self.kind.label(),
+                path = %self.spec.path.display(),
+                failures = self.failures,
+                "audit log writes recovered"
+            );
+            self.failures = 0;
         }
     }
 }
@@ -890,21 +1040,22 @@ fn write_entry(spec: &mut StreamSpec, entry: &AuditEntry, shared: &StreamShared)
 fn spawn_stream(
     kind: StreamKind,
     spec: StreamSpec,
-    capacity: usize,
+    tuning: &Tuning,
 ) -> io::Result<(StreamEnds, JoinHandle<()>)> {
-    let (tx, rx) = sync_channel(capacity);
+    let (tx, rx) = sync_channel(tuning.queue[kind.index()]);
     let shared = Arc::new(StreamShared::default());
     shared
         .degraded
         .store(spec.file.is_none(), Ordering::Relaxed);
     let thread_shared = Arc::clone(&shared);
+    let tuning = tuning.clone();
     let handle = thread::Builder::new()
         .name(format!("aitm-audit-{}", kind.label()))
         .spawn(move || {
             // Declared first, so it drops last: when this stream reads as dead
             // its receiver is already gone, and the next record counts as dropped.
             let _guard = DeadGuard(&thread_shared);
-            run_stream(rx, spec, &thread_shared);
+            run_stream(rx, spec, &thread_shared, kind, &tuning);
         })
         .map_err(|source| {
             io::Error::new(
@@ -951,13 +1102,9 @@ impl AuditLogWriter {
     #[allow(dead_code)] // used from Task W11
     fn from_specs(specs: [StreamSpec; 3], tuning: Tuning) -> io::Result<AuditLogWriter> {
         let [control, agent, reads] = specs;
-        let capacity = |kind: StreamKind| tuning.queue[kind.index()];
-        let (control, control_thread) =
-            spawn_stream(StreamKind::Control, control, capacity(StreamKind::Control))?;
-        let (agent, agent_thread) =
-            spawn_stream(StreamKind::Agent, agent, capacity(StreamKind::Agent))?;
-        let (reads, reads_thread) =
-            spawn_stream(StreamKind::Reads, reads, capacity(StreamKind::Reads))?;
+        let (control, control_thread) = spawn_stream(StreamKind::Control, control, &tuning)?;
+        let (agent, agent_thread) = spawn_stream(StreamKind::Agent, agent, &tuning)?;
+        let (reads, reads_thread) = spawn_stream(StreamKind::Reads, reads, &tuning)?;
         Ok(AuditLogWriter {
             streams: [control, agent, reads],
             threads: Mutex::new(vec![control_thread, agent_thread, reads_thread]),
@@ -1881,6 +2028,10 @@ mod tests {
         panic_on_write: AtomicBool,
         /// The first write blocks here when set.
         gate: Option<Gate>,
+        /// How many times the backend was asked to open the file.
+        open_calls: AtomicUsize,
+        /// An open fails with `PermissionDenied` while this is set.
+        fail_open: AtomicBool,
     }
 
     impl FakeState {
@@ -1973,18 +2124,40 @@ mod tests {
 
     impl Backend for FakeBackend {
         fn open(&mut self, _path: &Path, _stream: StreamKind) -> io::Result<Box<dyn LogFile>> {
+            self.0.open_calls.fetch_add(1, Ordering::SeqCst);
+            if self.0.fail_open.load(Ordering::SeqCst) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "the fake disk refuses to open",
+                ));
+            }
             Ok(Box::new(FakeFile(self.0.clone())))
         }
     }
 
     /// A writer over three fake files, one per state, nothing on disk.
     fn fake_writer(states: &[Arc<FakeState>; 3], tuning: Tuning) -> Arc<AuditLogWriter> {
+        fake_writer_with_files(states, tuning, [true; 3])
+    }
+
+    /// [`fake_writer`] where a stream whose `has_file` is false arrives without
+    /// an open file, as one whose boot open failed does.
+    fn fake_writer_with_files(
+        states: &[Arc<FakeState>; 3],
+        tuning: Tuning,
+        has_file: [bool; 3],
+    ) -> Arc<AuditLogWriter> {
         let mut specs = Vec::new();
         for (kind, state) in StreamKind::ALL.into_iter().zip(states) {
+            let file: Option<Box<dyn LogFile>> = if has_file[kind.index()] {
+                Some(Box::new(FakeFile(state.clone())))
+            } else {
+                None
+            };
             specs.push(StreamSpec {
                 path: PathBuf::from(format!("/fake/{}.jsonl", kind.label())),
                 backend: Box::new(FakeBackend(state.clone())),
-                file: Some(Box::new(FakeFile(state.clone()))),
+                file,
             });
         }
         let specs: [StreamSpec; 3] = match specs.try_into() {
@@ -1992,6 +2165,16 @@ mod tests {
             Err(_) => panic!("three streams make three specs"),
         };
         Arc::new(AuditLogWriter::from_specs(specs, tuning).unwrap_or_else(|e| panic!("start: {e}")))
+    }
+
+    /// `production()` with no wait between a failed write and the next try at
+    /// reopening the file: for the tests that are about what happens to the
+    /// entries, not about timing.
+    fn eager_reopen() -> Tuning {
+        Tuning {
+            reopen: Duration::ZERO,
+            ..Tuning::production()
+        }
     }
 
     /// AC11: the lane and the trust of the origin pick the stream, and the
@@ -2192,9 +2375,12 @@ mod tests {
     #[test]
     fn the_estimate_of_entries_left_counts_only_what_is_not_yet_written() {
         let states = [FakeState::plain(), FakeState::gated(), FakeState::plain()];
-        // The first two writes fail before they reach the gate.
+        // The first two writes fail before they reach the gate: the entry
+        // `failed1`, and the gap marker for it that `failed2` tries to write
+        // first. With no wait to reopen, `stuck` then reopens the stream and
+        // blocks in the write of that marker.
         states[1].fail_next.store(2, Ordering::SeqCst);
-        let writer = fake_writer(&states, Tuning::production());
+        let writer = fake_writer(&states, eager_reopen());
         writer.record(AuditLane::Evidence, entry("failed1", Frontend::Mcp, 1));
         writer.record(AuditLane::Evidence, entry("failed2", Frontend::Mcp, 2));
         assert!(
@@ -2331,12 +2517,13 @@ mod tests {
     }
 
     /// A failed write is counted, marks the writer degraded and drops that entry;
-    /// the next write that succeeds clears `degraded` and keeps the counter.
+    /// the next write that succeeds clears `degraded`, keeps the counter and is
+    /// preceded by the gap marker for what was lost.
     #[test]
     fn a_failed_write_is_counted_and_the_next_success_clears_degraded() {
         let states = FakeState::three();
         states[1].fail_next.store(2, Ordering::SeqCst);
-        let writer = fake_writer(&states, Tuning::production());
+        let writer = fake_writer(&states, eager_reopen());
         assert!(!writer.status().degraded, "healthy at the start");
 
         writer.record(AuditLane::Evidence, entry("lost1", Frontend::Mcp, 1));
@@ -2353,7 +2540,7 @@ mod tests {
         writer.record(AuditLane::Evidence, entry("kept", Frontend::Mcp, 3));
         assert!(
             wait_until(Duration::from_secs(2), || {
-                !writer.status().degraded && states[1].lines().len() == 1
+                !writer.status().degraded && states[1].lines().len() == 2
             }),
             "a successful write did not clear degraded: {:?}",
             writer.status()
@@ -2361,8 +2548,14 @@ mod tests {
         let status = writer.status();
         assert_eq!(status.write_failures, 2, "the counter is never reset");
         assert_eq!(status.dropped, 0, "a failed write is not a dropped entry");
+        assert_eq!(fake_shape(&states[1]), ["gap", "kept"]);
+        let gap = &fake_gaps(&states[1])[0];
+        assert_eq!(gap["failed"], 2, "both lost entries are in the marker");
+        assert_eq!(gap["dropped"], 0);
+        assert_eq!(gap["from"], 1);
+        assert_eq!(gap["to"], 2);
         let kept = aitm_ca::audit::entry_to_jsonl(&entry("kept", Frontend::Mcp, 3));
-        assert_eq!(states[1].lines(), [kept]);
+        assert_eq!(states[1].lines()[1], kept);
         assert!(writer.shutdown(FLUSH_BUDGET).complete);
     }
 
@@ -3099,5 +3292,392 @@ mod tests {
             }
         );
         assert_eq!(fake_shape(&states[1]), ["a0"]);
+    }
+
+    // ---- the runtime error policy (Task W7) ----------------------------
+
+    /// AC20: a write error loses that entry, closes the file and marks the hole;
+    /// the next entry reopens the stream, and its line is preceded by one `gap`
+    /// marker that counts the five lost entries and spans their `at`.
+    #[test]
+    fn a_write_error_loses_the_entry_and_marks_the_gap() {
+        let states = FakeState::three();
+        states[0].fail_next.store(5, Ordering::SeqCst);
+        let writer = fake_writer(&states, eager_reopen());
+        let at = |i: u64| BASE_MS + i;
+        let control_entry = |i: u64| entry(&format!("c{i}"), Frontend::Operator, at(i));
+
+        for i in 1..=5 {
+            writer.record(AuditLane::Evidence, control_entry(i));
+        }
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                writer.status().write_failures == 5
+            }),
+            "five failures were not reported: {:?}",
+            writer.status()
+        );
+        assert!(
+            writer.status().degraded,
+            "a stream whose writes fail is degraded"
+        );
+
+        writer.record(AuditLane::Evidence, control_entry(6));
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+        assert!(
+            !writer.status().degraded,
+            "the sixth entry's write succeeded, which clears degraded"
+        );
+
+        let gaps = fake_gaps(&states[0]);
+        assert_eq!(
+            gaps.len(),
+            1,
+            "expected exactly one gap marker with failed == 5, found {}",
+            gaps.len()
+        );
+        assert_eq!(gaps[0]["failed"], 5);
+        assert_eq!(gaps[0]["dropped"], 0);
+        assert_eq!(gaps[0]["from"], at(1));
+        assert_eq!(gaps[0]["to"], at(5));
+        assert_eq!(
+            fake_shape(&states[0]),
+            ["gap", "c6"],
+            "the marker sits right before the first entry written after the hole"
+        );
+        assert_eq!(
+            states[0].open_calls.load(Ordering::SeqCst),
+            5,
+            "each failure closed the file; c2 to c6 each reopened it"
+        );
+        assert_eq!(
+            writer.status(),
+            DurableAuditStatus {
+                degraded: false,
+                dropped: 0,
+                write_failures: 5
+            }
+        );
+    }
+
+    /// A stream that arrived without a file (its boot open failed) counts boot
+    /// as its last attempt: with a long reopen interval every entry is a failure
+    /// that costs no `open`, and once the interval is zero each entry tries one.
+    #[test]
+    fn a_stream_that_never_opened_counts_every_entry_as_a_failure() {
+        let run = |reopen: Duration| {
+            let states = FakeState::three();
+            states[1].fail_open.store(true, Ordering::SeqCst);
+            let tuning = Tuning {
+                reopen,
+                ..Tuning::production()
+            };
+            let writer = fake_writer_with_files(&states, tuning, [true, false, true]);
+            for i in 1..=3 {
+                writer.record(AuditLane::Evidence, agent_entry(i));
+            }
+            let counted = wait_until(Duration::from_secs(2), || {
+                writer.status().write_failures == 3
+            });
+            let status = writer.status();
+            let opens = states[1].open_calls.load(Ordering::SeqCst);
+            let report = writer.shutdown(FLUSH_BUDGET);
+            assert!(report.complete, "the flush did not finish: {report:?}");
+            assert!(
+                states[1].lines().is_empty(),
+                "nothing can be written to a stream with no file"
+            );
+            (counted, status.write_failures, status.degraded, opens)
+        };
+
+        assert_eq!(
+            run(Duration::from_secs(3600)),
+            (true, 3, true, 0),
+            "an hour between opens: three failures and no open"
+        );
+        assert_eq!(
+            run(Duration::ZERO),
+            (true, 3, true, 3),
+            "no wait between opens: three failures and three opens"
+        );
+    }
+
+    /// The throttle admits the first failure, then one line per interval, and
+    /// says how many it swallowed in between: the count starts again after each
+    /// line (the last call, at 121 s, swallowed only the one at 61 s).
+    #[test]
+    fn warn_throttle_logs_first_then_once_per_interval() {
+        let mut throttle = WarnThrottle::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        let at = |seconds: u64| t0 + Duration::from_secs(seconds);
+        let got = [0, 1, 2, 60, 61, 121].map(|seconds| throttle.admit(at(seconds)));
+        assert_eq!(got, [Some(0), None, None, Some(2), None, Some(1)]);
+    }
+
+    /// A writer thread that panics in a write reads as degraded at once, every
+    /// later `record` is counted as dropped, and nothing reaches the caller.
+    #[test]
+    fn a_dead_writer_thread_reports_degraded() {
+        let states = FakeState::three();
+        states[1].panic_on_write.store(true, Ordering::SeqCst);
+        let writer = fake_writer(&states, Tuning::production());
+        writer.record(AuditLane::Evidence, agent_entry(1));
+        assert!(
+            wait_until(Duration::from_secs(2), || writer.status().degraded),
+            "a dead writer thread did not degrade the writer"
+        );
+
+        let caller = writer.clone();
+        within(
+            Duration::from_secs(1),
+            "five records after the writer thread died",
+            move || {
+                for i in 2..=6 {
+                    caller.record(AuditLane::Evidence, agent_entry(i));
+                }
+            },
+        );
+        assert_eq!(writer.status().dropped, 5);
+        assert!(writer.status().degraded, "a dead thread stays degraded");
+    }
+
+    /// A moment far enough back that a reopen interval of a few seconds has
+    /// passed since it, for the tests that drive a [`StreamWriter`] by hand.
+    fn long_ago() -> Instant {
+        Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .expect("the machine has been up for ten seconds")
+    }
+
+    /// A [`StreamWriter`] over `state`, with its file open or not, whose reopen
+    /// interval is five seconds and whose last attempt at opening is [`long_ago`]:
+    /// the next entry may reopen, and an entry that follows an attempt of its own
+    /// must not.
+    fn hand_driven<'a>(
+        state: &Arc<FakeState>,
+        has_file: bool,
+        shared: &'a StreamShared,
+    ) -> StreamWriter<'a> {
+        let file: Option<Box<dyn LogFile>> = if has_file {
+            Some(Box::new(FakeFile(state.clone())))
+        } else {
+            None
+        };
+        let spec = StreamSpec {
+            path: PathBuf::from("/fake/hand-driven.jsonl"),
+            backend: Box::new(FakeBackend(state.clone())),
+            file,
+        };
+        let tuning = Tuning {
+            reopen: Duration::from_secs(5),
+            ..Tuning::production()
+        };
+        let mut writer = StreamWriter::new(StreamKind::Agent, spec, shared, &tuning);
+        writer.last_open_attempt = long_ago();
+        writer
+    }
+
+    /// A write error closes the file and starts the reopen interval: the next
+    /// entry fails fast without an `open`, even though the stream has been up
+    /// longer than the interval; once the interval has passed again the next
+    /// entry reopens and its line is preceded by the gap marker.
+    #[test]
+    fn a_write_error_closes_the_file_and_starts_the_reopen_interval() {
+        let state = FakeState::plain();
+        state.fail_next.store(1, Ordering::SeqCst);
+        let shared = StreamShared::default();
+        let mut writer = hand_driven(&state, true, &shared);
+
+        writer.write_entry(&agent_entry(1));
+        assert!(
+            writer.spec.file.is_none(),
+            "the failed write closed the file"
+        );
+        assert!(
+            writer.last_open_attempt.elapsed() < Duration::from_secs(1),
+            "the failure started the reopen interval"
+        );
+
+        writer.write_entry(&agent_entry(2));
+        assert_eq!(
+            state.open_calls.load(Ordering::SeqCst),
+            0,
+            "inside the interval an entry fails fast"
+        );
+        assert_eq!(shared.write_failures.load(Ordering::Relaxed), 2);
+        assert!(shared.degraded.load(Ordering::Relaxed));
+        assert!(state.lines().is_empty(), "nothing was written yet");
+
+        writer.last_open_attempt = long_ago();
+        writer.write_entry(&agent_entry(3));
+        assert_eq!(state.open_calls.load(Ordering::SeqCst), 1, "one reopen");
+        assert_eq!(fake_shape(&state), ["gap", "a3"]);
+        let gap = &fake_gaps(&state)[0];
+        assert_eq!(gap["failed"], 2);
+        assert_eq!(gap["from"], BASE_MS + 1);
+        assert_eq!(gap["to"], BASE_MS + 2);
+        assert_eq!(shared.write_failures.load(Ordering::Relaxed), 2);
+        assert!(!shared.degraded.load(Ordering::Relaxed), "recovered");
+    }
+
+    /// A failed open starts the reopen interval again: the entry after it fails
+    /// fast without another `open`.
+    #[test]
+    fn a_failed_open_starts_the_reopen_interval_again() {
+        let state = FakeState::plain();
+        state.fail_open.store(true, Ordering::SeqCst);
+        let shared = StreamShared::default();
+        let mut writer = hand_driven(&state, false, &shared);
+
+        writer.write_entry(&agent_entry(1));
+        assert_eq!(
+            state.open_calls.load(Ordering::SeqCst),
+            1,
+            "one try to open"
+        );
+        writer.write_entry(&agent_entry(2));
+        assert_eq!(
+            state.open_calls.load(Ordering::SeqCst),
+            1,
+            "the failed open started the interval: no second open"
+        );
+        assert_eq!(shared.write_failures.load(Ordering::Relaxed), 2);
+
+        state.fail_open.store(false, Ordering::SeqCst);
+        writer.last_open_attempt = long_ago();
+        writer.write_entry(&agent_entry(3));
+        assert_eq!(state.open_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fake_shape(&state), ["gap", "a3"]);
+        assert_eq!(fake_gaps(&state)[0]["failed"], 2);
+        assert!(!shared.degraded.load(Ordering::Relaxed), "recovered");
+    }
+
+    /// What a test subscriber wrote, shared with the test.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&lock(&self.0)).into_owned()
+        }
+    }
+
+    impl io::Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            lock(&self.0).extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Made up, like every canary in these tests; it stands for any entry field.
+    const LOG_CANARY: &str = "CNRY0x00c0ffee00";
+
+    /// Runs one stream's thread body over four entries, the first three of
+    /// which are lost to write errors (the entry `e1`, then the gap marker that
+    /// `e2` and `e3` try to write first), on **this** thread, under a subscriber
+    /// scoped to it. Returns what was logged, the stream's counters and the file.
+    fn run_a_failing_stream_logging() -> (String, StreamShared, Arc<FakeState>) {
+        let state = FakeState::plain();
+        state.fail_next.store(3, Ordering::SeqCst);
+        let spec = StreamSpec {
+            path: PathBuf::from("/fake/log-test/the-file.jsonl"),
+            backend: Box::new(FakeBackend(state.clone())),
+            file: Some(Box::new(FakeFile(state.clone()))),
+        };
+        let tuning = Tuning {
+            reopen: Duration::ZERO,
+            warn_every: Duration::from_secs(3600),
+            ..Tuning::production()
+        };
+        let shared = StreamShared::default();
+        let (tx, rx) = sync_channel(8);
+        for i in 1..=4 {
+            let queued = AuditEntry {
+                args_summary: format!("{{\"token\":\"{LOG_CANARY}\"}}"),
+                ..entry(&format!("{LOG_CANARY}-{i}"), Frontend::Mcp, BASE_MS + i)
+            };
+            shared.queued.fetch_add(1, Ordering::Relaxed);
+            tx.send(Msg::Entry(queued)).expect("queue an entry");
+        }
+        tx.send(Msg::Close).expect("queue the close");
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let capture = capture.clone();
+                move || capture.clone()
+            })
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            run_stream(rx, spec, &shared, StreamKind::Agent, &tuning);
+        });
+        (capture.text(), shared, state)
+    }
+
+    /// Failures are logged at `warn!` once (the throttle swallows the rest of
+    /// the interval), the first success after them is one `info!` that names the
+    /// stream and how many failed, and no line carries anything of an entry. The
+    /// stream's thread body runs on the test's own thread here, so that a
+    /// subscriber scoped to this thread sees its events.
+    #[test]
+    fn failures_are_logged_once_and_the_recovery_names_the_stream() {
+        // `tracing` caches per callsite whether any subscriber wants it. Another
+        // test's stream thread that reaches one of these callsites for the first
+        // time in the process just as this thread installs its subscriber can
+        // leave that cache saying "no one": `tracing-core` computes the interest
+        // against a snapshot of the subscribers, then stores it, and the store
+        // can land after the rebuild this subscriber's installation triggered.
+        // A callsite registers once per process, and installing a subscriber
+        // rebuilds the cache, so one more attempt sees the events. An attempt
+        // whose log lacks a whole level is that race; anything else is judged.
+        let mut attempt = run_a_failing_stream_logging();
+        for _ in 0..4 {
+            if attempt.0.contains("WARN") && attempt.0.contains("INFO") {
+                break;
+            }
+            attempt = run_a_failing_stream_logging();
+        }
+        let (log, shared, state) = attempt;
+
+        let lines_at = |level: &str| -> Vec<&str> {
+            log.lines().filter(|line| line.contains(level)).collect()
+        };
+        let warns = lines_at("WARN");
+        let infos = lines_at("INFO");
+        assert_eq!(warns.len(), 1, "one warn for three failures: {log}");
+        for needle in [
+            "aitm::audit",
+            "/fake/log-test/the-file.jsonl",
+            "StorageFull",
+            "suppressed=0",
+        ] {
+            assert!(warns[0].contains(needle), "the warn lacks {needle}: {log}");
+        }
+        assert_eq!(infos.len(), 1, "one info for the recovery: {log}");
+        for needle in ["aitm::audit", "agent", "failures=3"] {
+            assert!(infos[0].contains(needle), "the info lacks {needle}: {log}");
+        }
+        assert_eq!(
+            log.lines().count(),
+            2,
+            "nothing else is logged on this path: {log}"
+        );
+        assert!(
+            !log.contains(LOG_CANARY),
+            "an entry field reached the log: {log}"
+        );
+        assert_eq!(shared.write_failures.load(Ordering::Relaxed), 3);
+        assert!(!shared.degraded.load(Ordering::Relaxed), "recovered");
+        assert_eq!(
+            fake_shape(&state),
+            ["gap".to_string(), format!("{LOG_CANARY}-4")]
+        );
     }
 }
