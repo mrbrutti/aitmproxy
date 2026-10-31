@@ -253,7 +253,11 @@ fn rule_param_fields() -> Vec<ParamDef> {
         field(
             "url",
             TypeDesc::Any,
-            "URL match: a wildcard string (* = any run), or {wildcard} / {regex}.",
+            "URL match against the full request URL (scheme://host[:port]/path?query) and \
+             against the path alone; either may match. A wildcard string (* = any run, \
+             every other character literal, case-insensitive; with no * it matches as a \
+             substring), or {wildcard} / {regex} (a regex is searched, case-insensitive by \
+             default; (?-i) restores case).",
         ),
         field(
             "method",

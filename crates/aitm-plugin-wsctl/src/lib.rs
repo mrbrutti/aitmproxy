@@ -507,7 +507,8 @@ fn rule_fields() -> Vec<ParamDef> {
         field(
             "url",
             TypeDesc::Any,
-            "wildcard string, or {wildcard|regex}.",
+            "wildcard string, or {wildcard|regex}; matched against the full request URL \
+             (scheme://host[:port]/path?query) and against the path alone.",
         ),
         field("method", TypeDesc::Str, "case-insensitive method."),
         field("host", TypeDesc::Any, "exact string, or {exact|wildcard}."),

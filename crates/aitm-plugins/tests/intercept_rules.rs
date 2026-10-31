@@ -24,12 +24,17 @@ use futures::future::BoxFuture;
 use tokio::sync::oneshot;
 
 fn http_flow(path: &str) -> Flow {
+    http_flow_at("ex.test", path)
+}
+
+/// A `GET http://{authority}{path}` flow, for rules that name a host.
+fn http_flow_at(authority: &str, path: &str) -> Flow {
     Flow::Http(HttpFlow {
         id: FlowId::new(),
         request: HttpRequest {
             method: "GET".into(),
             scheme: "http".into(),
-            authority: "ex.test".into(),
+            authority: authority.into(),
             path: path.into(),
             version: HttpVersion::Http11,
             headers: HeaderMap::new(),
@@ -270,5 +275,52 @@ fn invalid_rule_regex_is_error() {
     assert!(
         dispatch_request(&reg, &store, id).is_some(),
         "the valid rule survived the failed call"
+    );
+}
+
+/// AC12 (rule `url` clause matches the full request URL): a `url` wildcard that
+/// names a host parks the flow for that host, and a flow to another host with
+/// the same path sails through. Before the full-URL subject the clause ran
+/// against the path only, so `*ex.test*` could never fire.
+#[test]
+fn host_bearing_rule_parks_matching_host() {
+    let reg = registry();
+    let store = MemFlowStore::new();
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(&store, &client, &guard, None);
+
+    arm(
+        &reg,
+        &host,
+        params(&[
+            ("enabled", Value::Bool(true)),
+            (
+                "rules",
+                Value::Array(vec![rule_obj(&[
+                    ("url", Value::Str("*ex.test*".into())),
+                    ("phase", Value::Str("request".into())),
+                ])]),
+            ),
+        ]),
+    );
+
+    let matching = store.insert(http_flow_at("ex.test", "/anything"));
+    let mut parked = dispatch_request(&reg, &store, matching)
+        .expect("a host-bearing url rule parks the flow for that host");
+    assert!(
+        is_intercepted(&store, matching),
+        "GET http://ex.test/anything is intercepted under *ex.test*"
+    );
+    assert!(parked.try_recv().is_err(), "still parked before resume");
+
+    let other = store.insert(http_flow_at("other.test", "/anything"));
+    assert!(
+        dispatch_request(&reg, &store, other).is_none(),
+        "GET http://other.test/anything is not parked under *ex.test*"
+    );
+    assert!(
+        !is_intercepted(&store, other),
+        "the other host's flow stays observed"
     );
 }
