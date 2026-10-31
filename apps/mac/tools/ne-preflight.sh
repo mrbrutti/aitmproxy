@@ -11,8 +11,9 @@
 # Why: a team can hold several "Developer ID Application" certificates, and
 # `security find-identity | awk ... exit` picks the first one in the keychain. A
 # system extension signed with a certificate that is not in its embedded profile's
-# DeveloperCertificates is rejected at activation with "code signature invalid"
-# (seen 2026-10-31 with two certificates, 1D24F95F… and 296308E6…).
+# DeveloperCertificates is rejected at activation. On 2026-10-31 the keychain held
+# two (1D24F95F… and 296308E6…); both happened to be in the profiles, which is luck,
+# not a guarantee, so the pick is verified here.
 set -u
 host_profile=${1:?host profile path}
 sysex_profile=${2:?sysex profile path}
