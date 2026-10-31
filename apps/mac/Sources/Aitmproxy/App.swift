@@ -98,6 +98,8 @@ enum Store {
 /// prints on buttons (§2.7). The targets resolve when the item fires.
 struct FlowCommands: Commands {
     let session: Session
+    /// The persisted capture choice (Settings ▸ Capture), read here for the Enable/Disable label.
+    @AppStorage("capture.enabled") private var captureEnabled = false
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
@@ -222,6 +224,15 @@ struct FlowCommands: Commands {
             Button("Restart Core") { session.restartCoreTick += 1 }
                 .keyboardShortcut("r", modifiers: [.command, .control, .shift])
                 .disabled(session.coreHealth.connection == nil)
+            Divider()
+            // The same steps as Settings ▸ Capture's toggle (CaptureSwitch). ⌃⌘C: none of
+            // the reconnect/restart/pause/replay chords on R, and no other C chord but ⇧⌘C.
+            Button((session.coreHealth.captureChoice ?? captureEnabled) ? "Disable Capture" : "Enable Capture") {
+                let on = !(session.coreHealth.captureChoice ?? captureEnabled)
+                Task { await CaptureSwitch.set(on, session: session) }
+            }
+            .keyboardShortcut("c", modifiers: [.command, .control])
+            .disabled(!session.coreHealth.captureControlsAvailable || session.coreHealth.captureBusy)
         }
         CommandMenu("Agent") {
             Picker("Policy", selection: Binding(get: { session.agentPolicy }, set: { session.activity.choose($0) })) {

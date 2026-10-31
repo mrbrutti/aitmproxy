@@ -226,3 +226,39 @@ enum SnapshotScene: String, CaseIterable {
         session.select(session.rows.first { $0.seq == 50 }?.id)
     }
 }
+
+/// The states Settings ▸ Capture shows the operator, walked by snapshot mode (TG-AC11):
+/// off, awaiting approval, capturing, failed. Each seeds what the `ExtensionController`
+/// and the persisted capture choice would give the tab. A snapshot run embeds no
+/// extension, so the seed also marks capture supported, and it seeds the toggle position
+/// through `captureChoice` instead of writing the operator's real preference.
+/// The raw value names the file: `settings-capture-<state>-<mode>.png`.
+enum CaptureSnapshotState: String, CaseIterable {
+    case off, awaiting, active, failed
+
+    func apply(to session: Session) {
+        session.coreHealth.captureSupported = true
+        switch self {
+        case .off:
+            session.coreHealth.captureCapability = .inactive
+            session.coreHealth.captureChoice = false
+        case .awaiting:
+            session.coreHealth.captureCapability = .pendingApproval
+            session.coreHealth.captureChoice = true
+        case .active:
+            session.coreHealth.captureCapability = .capturing
+            session.coreHealth.captureChoice = true
+        case .failed:
+            session.coreHealth.captureCapability = .degraded(
+                "Could not start the capture tunnel after 4 attempts: the proxy configuration was not allowed")
+            session.coreHealth.captureChoice = true
+        }
+    }
+
+    /// Back to what a snapshot run starts with: no extension, nothing seeded.
+    static func reset(_ session: Session) {
+        session.coreHealth.captureSupported = false
+        session.coreHealth.captureCapability = .extensionNotInstalled
+        session.coreHealth.captureChoice = nil
+    }
+}
