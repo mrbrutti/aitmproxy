@@ -481,7 +481,8 @@ async fn bridge_ids_are_server_assigned_and_the_stream_is_role_filtered() {
     );
 
     // (4) The agent's `flow.list` lands on the agent's stream under the agent's id,
-    // with no client label (the bridge never sets one, forged `clientInfo` or not).
+    // and the bridge's own client label, `web-bridge` (the server mints it, since
+    // PR 171: a path name, never `clientInfo.name`, forged or not).
     let listed = agent.call(3, "flow.list", json!({})).await;
     assert_ok("the agent's flow.list", &listed);
     let first = agent
@@ -499,8 +500,8 @@ async fn bridge_ids_are_server_assigned_and_the_stream_is_role_filtered() {
     );
     assert_eq!(
         params.get("client_label"),
-        Some(&JsonValue::Null),
-        "client_label stays null over /bus whatever clientInfo.name claimed: {}",
+        Some(&json!("web-bridge")),
+        "client_label is the server-minted web-bridge over /bus whatever clientInfo.name claimed: {}",
         first[0]
     );
 
@@ -563,7 +564,7 @@ async fn bridge_ids_are_server_assigned_and_the_stream_is_role_filtered() {
     for line in &agent_lines {
         assert_eq!(line["params"]["origin"], "mcp", "{line}");
         assert_eq!(line["params"]["connection_id"], gid.as_str(), "{line}");
-        assert_eq!(line["params"]["client_label"], JsonValue::Null, "{line}");
+        assert_eq!(line["params"]["client_label"], "web-bridge", "{line}");
     }
 
     // The filter is by the viewer's role, not "own lines only": the operator's

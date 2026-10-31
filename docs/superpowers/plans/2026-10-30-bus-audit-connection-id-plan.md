@@ -1,12 +1,12 @@
 # Server-assigned connection id on audit lines implementation plan
 
-**Status:** approved (orchestrator, 2026-10-30, under Matt's standing autonomous-approval rule)
+**Status:** approved (orchestrator, 2026-10-30, under Matt's standing autonomous-approval rule). **Amendment 1 (reconciliation tasks R1-R5, last section of this file): approved by the orchestrator, 2026-10-30, under the standing autonomy rule (spec A10 Q1 and Q2 take their defaults: D3 stands and five PR 166 tests are amended; the whitespace port into PR 171's sanitiser is done).**
 **Spec:** `docs/superpowers/specs/2026-10-30-bus-audit-connection-id-design.md` (approved; Ambiguities 1 is resolved: the spec's AC21 literal 6 stands and the spec's status line no longer says otherwise)
-**Branch / worktree:** `feat/bus-audit-conn-id` in `/Users/matt/Security/aitmproxy/.claude/worktrees/adoring-cartwright-385dea` (base `8315880`)
+**Branch / worktree:** `feat/bus-audit-conn-id` in `/Users/matt/Security/aitmproxy/.claude/worktrees/adoring-cartwright-385dea` (base `8315880`; after main moved, being merged with `origin/main` at `0d50cf4`, see Amendment 1)
 
 ## Overview
 
-Server only. Eighteen small tasks in four waves: `aitm-core` and `aitm-ca` pieces first (T1-T5), then the `aitm-mcp` / `aitm-plugins` behavior (T6-T11, strictly sequential: `server.rs`, `mcp.rs` and `agent.rs` are shared), then the `aitm` integration tests (T12-T13), then the e2e suites (T14-T17, independent of each other), then one whole-branch gate (T18). Each task is test-first, ends green and is committable alone. **No task touches `apps/`, `crates/aitm-tui`, `crates/aitm/src/web/` or `crates/aitm-mcp/src/http.rs`** (AC25): the UI consumer is a separate PR. The three-reviewer panel (security, quality, spec) runs per WORKFLOW stage 6 as the orchestrator dispatches it, after the last task, and once on the whole branch before integration.
+Server only. Eighteen small tasks in four waves: `aitm-core` and `aitm-ca` pieces first (T1-T5), then the `aitm-mcp` / `aitm-plugins` behavior (T6-T11, strictly sequential: `server.rs`, `mcp.rs` and `agent.rs` are shared), then the `aitm` integration tests (T12-T13), then the e2e suites (T14-T17, independent of each other), then one whole-branch gate (T18). Each task is test-first, ends green and is committable alone. **No task touches `apps/`, `crates/aitm-tui`, `crates/aitm/src/web/` or `crates/aitm-mcp/src/http.rs`** (AC25): the UI consumer is a separate PR. The three-reviewer panel (security, quality, spec) runs per WORKFLOW stage 6 as the orchestrator dispatches it, after the last task, and once on the whole branch before integration. **[Amended: `## Amendment 1: reconciliation tasks` at the end governs after the merge with `origin/main` at `0d50cf4`; where a task below conflicts with it, the amendment wins.]**
 
 **Conventions every task obeys.**
 - Re-verify every `file:line` below before editing; the tree may differ slightly. Touch only the files the task declares; need another, stop and report.
@@ -71,7 +71,7 @@ T6 to T11 never overlap: they all edit `server.rs`/`mcp.rs`/`agent.rs`. T12/T13 
 - **Gate:** `cargo fmt --check && cargo clippy -p aitm-core --all-targets -- -D warnings && cargo test -p aitm-core --lib audit:: && cargo test -p aitm-core --test trust_gate_scan --test classifier_wildcard_free` (AC6; sandbox).
 - **Done when:** the three tests and both scan tests pass.
 
-### Task 3: `cap_client_label`
+### Task 3: `cap_client_label` **[SUPERSEDED by Amendment 1: PR 171's `sanitize_client_label` replaces it; R1 removes the function, the constant, the export and all 17 of its tests]**
 
 - **Satisfies:** AC5
 - **Depends on:** Task 2 (same file, sequential)
@@ -132,7 +132,7 @@ T6 to T11 never overlap: they all edit `server.rs`/`mcp.rs`/`agent.rs`. T12/T13 
 - **Gate:** `cargo fmt --check && cargo clippy -p aitm-mcp --all-targets -- -D warnings`, the test (sandbox), full `cargo test -p aitm-mcp` (**Terminal**).
 - **Done when:** the test passes.
 
-### Task 8: Ingestion cap at the one call site
+### Task 8: Ingestion cap at the one call site **[SUPERSEDED in part by Amendment 1: `client_label_from_initialize` calls PR 171's `declared_client_label`; the test keeps its rig and its literals become 64 characters (R1)]**
 
 - **Satisfies:** AC11
 - **Depends on:** Task 3, Task 7 (sequential on `mcp.rs`)
@@ -203,7 +203,7 @@ T6 to T11 never overlap: they all edit `server.rs`/`mcp.rs`/`agent.rs`. T12/T13 
 - **Gate (Terminal):** `cargo fmt --check && cargo clippy -p aitm --all-targets -- -D warnings && cargo test -p aitm --test web_bus_audit_identity --test web_bus_governance --test web_bus_ask_split --test web_bus_push --test web_bus_roles` (those four existing files stay unmodified, AC24).
 - **Done when:** both new tests pass, the existing four files pass untouched, mutation reverted.
 
-### Task 14: e2e `test_bus_push_ui_contract.py` sections 6 and 7 `[e2e]`
+### Task 14: e2e `test_bus_push_ui_contract.py` sections 6 and 7 `[e2e]` **[Amended: every null `client_label` check is `"web-bridge"` after PR 171; see R4]**
 
 - **Satisfies:** AC20
 - **Depends on:** Task 6, Task 9
@@ -236,7 +236,7 @@ T6 to T11 never overlap: they all edit `server.rs`/`mcp.rs`/`agent.rs`. T12/T13 
 - **Gate:** `python3 tests/e2e/run.py web` (Terminal).
 - **Done when:** red on baseline, green on the branch binary.
 
-### Task 16: e2e `test_audit_identity.py` (new) `[e2e]`
+### Task 16: e2e `test_audit_identity.py` (new) `[e2e]` **[Amended: the label length is 64 characters, not 128 bytes; see R4]**
 
 - **Satisfies:** AC22
 - **Depends on:** Task 8, Task 11
@@ -268,7 +268,7 @@ T6 to T11 never overlap: they all edit `server.rs`/`mcp.rs`/`agent.rs`. T12/T13 
 - **Gate:** `python3 tests/e2e/run.py --shared-core neg` exit 0, no `neg` SKIP.
 - **Done when:** red before the edit and green after it, against the branch binary.
 
-### Task 18: Whole-branch verification
+### Task 18: Whole-branch verification **[Amended: its diff bases are `0d50cf4` and its final run is Amendment 1 R5]**
 
 - **Satisfies:** AC24, AC25, and every AC end to end
 - **Depends on:** Tasks 1-17
@@ -332,4 +332,87 @@ Acceptances marked "orchestrator" were made under Matt's standing autonomous-app
 3. Move the copied loopback `/bus` rig into `crates/aitm/tests/support/` and migrate the six copies.
 4. Regenerate `aitmproxy-plugin/docs/tool-reference.md` and refresh `docs/research/mcp-tool-catalog.txt`: both still quote the old `agent.status` and `agent.activity` descriptions.
 5. U+2028 and U+2029 are not neutralised in the label (some UIs render them as line breaks).
-6. Plan text that predates the panel fixes: Task 6 says `connection_id` is `pub` (now private) and Task 2 says the unfiltered `count_since` stays (deleted); the spec's Constraints section still says the same about `count_since`.
+6. Plan text that predates the panel fixes: Task 6 says `connection_id` is `pub` (now private) and Task 2 says the unfiltered `count_since` stays (deleted); the spec's Constraints section still says the same about `count_since`. [Amended: after the merge `count_since` is back, because main's tests call it; Amendment 1 R1.]
+
+## Amendment 1: reconciliation tasks
+
+**Why.** Main moved from `2eae896` to `0d50cf4` (PR 171 audit ring and label sanitiser, PR 166 policy revocation, PR 162 TUI governance) and the orchestrator is merging it into this branch. The design is the spec's `## Amendment 1`. The merge stops with textual conflicts in six files; this section is five tasks that finish it. **Where a task above conflicts with this section, this section wins:** T3 and T8's `cap_client_label` call are dropped; the label literals of T14 and T16 follow R4; T18's diff bases are `0d50cf4`.
+
+**Rules for R1-R5.**
+- Read both sides of every hunk before editing: ours is `HEAD`, theirs is `git show origin/main:<path>`; `git diff --name-only --diff-filter=U` lists the six files. Touch only the files a task declares. Do not change main's behaviour beyond what a task names; a test of main's that fails for a reason not named here: stop and report.
+- Sandbox versus Terminal as in the Conventions above. R1 is a merge resolution: the coder edits files and leaves the tree resolved and green; the orchestrator stages and commits the merge (git runs in the Terminal panel). R2 to R4 commit as `fix(<area>): R<n> - <title> (plan 2026-10-30-bus-audit-connection-id)` with the trailer; gate on exit status; no commit-body word starts with `#`.
+- The `trust_gate_scan` trap of the Conventions holds for new `src` code and `src` tests: compare roles only through `assert_eq!` on lists or `origin_label`, never `==`, `matches!` or `if let` against `Frontend::Mcp`.
+
+### Who touches what
+
+| Task | Files | Depends on | Parallel with |
+|---|---|---|---|
+| R1 | `aitm-core/src/{audit,lib}.rs`, `aitm-mcp/src/{server,transport}.rs`, `aitm-plugins/src/agent.rs`, `aitm-mcp/tests/mcp.rs`, `aitm/tests/web_bus_audit_identity.rs` | the merge in progress | none |
+| R2 | `aitm-core/src/audit.rs`, `aitm-mcp/tests/audit_integrity.rs` | R1 | R4 |
+| R3 | `aitm-core/src/audit.rs`, `aitm-mcp/tests/mcp.rs` | R1, R2 (same `audit.rs`) | R4 |
+| R4 | `tests/e2e/web/test_bus_push_ui_contract.py`, `tests/e2e/audit/test_audit_identity.py` | R1 | R2, R3 |
+| R5 | none | R1 to R4 | none |
+
+R1 cannot be split: the six files compile only together. Do it in the order below and check each crate before the next.
+
+### R1: Resolve the six files, drop D2, amend the colliding tests
+
+- **Satisfies:** AC1-AC4, AC6-AC18 on the merged tree; AC11 (retargeted), AC19, AC31 (spec A6).
+- **Resolution, file by file** (A is ours, B is main's; hunks counted by `<<<<<<<` from the top):
+  1. `crates/aitm-core/src/audit.rs`, 7 hunks. H1 module doc: keep B's `# Labels and reasons` and `# The ring keeps a fair, bounded record` sections and add A's viewer-filter and `connection_id` paragraph after them. H2 constants: B wins; A's `MAX_CLIENT_LABEL_BYTES` and `CLIENT_LABEL_SCRUB_WINDOW_BYTES` go. H3: B wins (`is_label_noise`, `sanitize_client_label`, `label_skeleton`, `reads_as_reserved`, `declared_client_label`, `AuditLane`, `lane_for`); A's `is_label_format_char`, `label_char`, `cap_client_label` go. H4: keep B's `append_in`, and rewrite B's `recent` body as `fn recent_where(&self, since: Option<SystemTime>, limit: Option<usize>, keep: impl Fn(&AuditEntry) -> bool) -> Vec<AuditEntry>` (add `.filter(|(_, e)| keep(e))` after the `since` filter and before `collect`; the sort by seq and the skip to `limit` stay); `recent(since, limit)` calls it with `|_| true` and keeps B's doc plus A's "unfiltered, in-process tests only" line; `recent_for(&self, viewer: Frontend, since: Option<SystemTime>, limit: Option<usize>) -> Vec<AuditEntry>` calls it with `|e| e.visible_to(viewer)` and keeps A's doc (the filter runs before `limit`). H5: keep B's `count_since(&self, since: SystemTime) -> usize` and A's `count_since_for(&self, viewer: Frontend, since: SystemTime, exclude_connection: Option<&str>) -> usize`, both through one private `fn count_where(&self, since: SystemTime, keep: impl Fn(&AuditEntry) -> bool) -> usize` over `state.evidence.entries().chain(state.routine.entries())` with `e.at >= since`; the `count_since` doc says no role-facing surface may call it. H6 and H7 (tests): keep both sides' tests; delete A's 17 `cap_client_label_*` tests wherever they sit (they are spread outside the hunks too); keep A's `entry_of`, `entry_at_ms`, `at_ms`, `visible_to_matrix`, `recent_for_*`, `count_since_for_*`, `to_value_carries_connection_id`; add `connection_id: None` to B's helpers `entry` and `sourced`. If one of A's ring tests encoded single-deque behaviour, rewrite it to lane semantics and say so in the report.
+  2. `crates/aitm-core/src/lib.rs`: B's export list; A's `cap_client_label` and `MAX_CLIENT_LABEL_BYTES` are not exported.
+  3. `crates/aitm-mcp/src/transport.rs`, 2 hunks: B wins (`declared_client_label`, B's doc).
+  4. `crates/aitm-mcp/src/server.rs`, 8 hunks. H1 and H2 (`ConnCtx` and `client_label` docs): B's text, keeping A's `conn_id` sentence (`0` means not a streaming connection; sole input of `McpServer::connection_id`), no mention of `cap_client_label`. H3 to H5 (`Subscriptions`): B's `fanout(wants, line, pushes_muted)`, `fanout_role`, `fanout_flow`, `fanout_state` win and A's `fanout_where` is deleted; keep A's role filter as `fn fanout_audit(&self, entry: &AuditEntry, line: &str, pushes_muted: &dyn Fn() -> bool)`, which is `self.fanout(&|sub| entry.visible_to(sub.role), line, pushes_muted)`, with a doc that `wants` runs before the mute accounting so a hidden line never gaps an agent. H6 (`record_audit` literal): both lines, `client_label: conn_audit_label(conn), connection_id: self.connection_id(conn),`. H7 (`push_agent` doc): B's mute paragraph plus one sentence on role visibility. H8: `self.subscriptions.fanout_audit(entry, &line, &|| self.agent_pushes_muted());`. The auto-merged `run_tool` block already has `conn_audit_label` and `with_connection_id`; leave it. The salt, the `initialize` echo and `connection_id()` are untouched.
+  5. `crates/aitm-plugins/src/agent.rs`, 4 hunks: module doc: A's `exclude_self` sentence plus B's lane paragraph; `actions_last_minute` text, the `AgentActivity` doc and the `agent.activity` description exactly as spec A5 (B's wording, A's `trusted control` sentence, "at most"); the `agent.status` description keeps `trusted control`.
+  6. `crates/aitm-mcp/tests/mcp.rs`, 3 hunks, each both-sides-appended at the file end: keep both blocks (no item name occurs on both sides; checked). Then: in `client_label_is_capped_at_ingestion` every 128 becomes 64; add `fn rv_audit_as_agent(srv: &McpServer)` beside `rv_audit` (a sinkless `Frontend::Mcp` `agent.status` through `call_as`, asserting `!is_refused`); amend the five tests of spec AC31 exactly as listed there, the renamed one being `revoke_push_real_verb_pause_then_resume_without_a_visible_push_has_no_marker`.
+  7. `crates/aitm/tests/web_bus_audit_identity.rs`: the two bridge-line label assertions (ours `:501-503`, `:566`) expect `"web-bridge"` instead of null; fix their messages and the doc line that says null. AC18's in-process `client_label: None` literal stays.
+- **Order and checks (sandbox unless marked).** (a) `cargo test -p aitm-core --lib audit::` and `cargo test -p aitm-core --test trust_gate_scan --test classifier_wildcard_free`. (b) `cargo check --workspace --all-targets`. (c) `cargo test -p aitm-ca`; `cargo test -p aitm-plugins --lib agent::tests`. (d) in-process `mcp.rs` subsets: `cargo test -p aitm-mcp --test mcp -- initialize_ audit_entries connection_ forged an_agent_subscriber agent_activity_ agent_status_ client_label_ command_host_ revoke_push_policy revoke_push_real_verb revoke_push_paused`. (e) **Terminal:** `cargo test -p aitm-core -p aitm-mcp -p aitm-plugins -p aitm-ca`, then `cargo test -p aitm --test web_bus_push --test web_bus_governance --test web_bus_ask_split --test web_bus_audit_label --test web_bus_audit_identity --test tui_mode_governance --test tui_mode_governance_live --test frontends`.
+- **Red/green evidence.** The five amended `revoke_*` tests and `an_agent_subscriber_never_receives_operator_audit_lines` must go red when `fanout_audit`'s `wants` is temporarily `|_| true` and green when restored; the report quotes both runs and shows `server.rs` unchanged by the mutation afterwards. AC11's red is the mutation named in spec A6.
+- **Gate:** `cargo fmt --check && cargo clippy -p aitm-core -p aitm-mcp -p aitm-plugins -p aitm-ca -p aitm --all-targets -- -D warnings`, plus (e).
+- **Done when:** no conflict marker remains, (a) to (e) pass, the mutation evidence is in the report.
+
+### R2: Port gap (a) into PR 171's sanitiser
+
+- **Satisfies:** AC26, AC27. **Depends on:** R1.
+- **Files:** `crates/aitm-core/src/audit.rs` (`sanitize_client_label`, about `:240` on main, and tests), `crates/aitm-mcp/tests/audit_integrity.rs` (one test).
+- **Change.** In `sanitize_client_label(raw: &str) -> Option<String>` replace `.filter(|c| !is_label_noise(*c)).collect()` by a `.filter_map` that yields `Some(' ')` for a character that is noise and `char::is_whitespace`, `None` for any other noise character, `Some(c)` otherwise. Nothing else changes: not `is_label_noise`, not `declared_client_label`, not the redactor, not the two `trim()` calls or the 64-character cut. Update the doc comment: whitespace controls become one blank so `Bearer\tabc` keeps the blank the scrubber needs; every other noise character is dropped.
+- **Test, red first.** Add `sanitize_client_label_masks_a_bearer_token_after_a_whitespace_control` and `sanitize_client_label_turns_whitespace_controls_into_a_blank` with the literals of spec AC26; run them on R1's code and quote the failure (`"agent Bearer\tabc123"` gives `Some("agent Bearerabc123")`, so `!s.contains("abc123")` fails). Then change the function, then make the five edits of AC27 (three in `audit.rs`, two literals in `audit_integrity.rs`) and no other edit to those tests.
+- **Run (sandbox):** `cargo test -p aitm-core --lib audit::tests::sanitize`; `cargo test -p aitm-core --lib audit::`; `cargo test -p aitm-mcp --test audit_integrity a_directly_assigned_label`; `cargo test -p aitm-mcp --lib client_label_from_initialize` (main's `..._cleans_a_hostile_name` stays green unmodified).
+- **Gate:** `cargo fmt --check && cargo clippy -p aitm-core -p aitm-mcp --all-targets -- -D warnings && cargo test -p aitm-core --lib audit:: && cargo test -p aitm-mcp --test audit_integrity`.
+- **Done when:** red shown, then green; the diff of main's tests is exactly the five literals. If Matt declines the port (spec A10 Q2) skip R2 and log gap (a) as accepted.
+
+### R3: D3 over the lanes: pins for the filter, the order and the mute
+
+- **Satisfies:** AC28, AC29, AC30. **Depends on:** R1, R2 (same `audit.rs`).
+- **Files:** `crates/aitm-core/src/audit.rs` (tests only), `crates/aitm-mcp/tests/mcp.rs` (one test). The code landed in R1, so these are integration pins, green on arrival; their red is by mutation.
+- **Tests (literals in spec A6):** in `audit.rs` `mod tests`, `the_viewer_filter_does_not_change_what_the_ring_keeps` (build entries with B's `sourced(origin, label, command)`, append through `AuditSink::append`) and `recent_for_and_count_since_for_span_both_lanes` (A's `entry_of(origin, connection_id, command)` through `append_in(AuditLane::..., ..)`); compare commands as lists. In `mcp.rs`, `a_hidden_audit_line_neither_reaches_nor_gaps_a_paused_agent` over `RvRig`, `rv_subscribe`, `rv_audit`, `rv_audit_as_agent`, `rv_assert_silent`, `rv_drain`.
+- **Red by mutation** (apply, show the test failing, revert, show the source diff empty beyond R1): (i) in `recent_where` apply `limit` before `keep`: AC29's `recent_for(Mcp,None,Some(2))` fails; (ii) make `recent_for` call `recent`: AC28's `["m2","m3"]` fails; (iii) `fanout_audit`'s `wants` becomes `|_| true`: AC30 fails with `["marker","agent agent.status"]`.
+- **Run (sandbox):** `cargo test -p aitm-core --lib audit::tests`; `cargo test -p aitm-mcp --test mcp -- a_hidden_audit_line`.
+- **Gate:** `cargo fmt --check && cargo clippy -p aitm-core -p aitm-mcp --all-targets -- -D warnings`, both runs above, `cargo test -p aitm-core --test trust_gate_scan --test classifier_wildcard_free`.
+- **Done when:** three tests pass, three mutation reds are quoted, no source change.
+
+### R4: e2e alignment `[e2e]`
+
+- **Satisfies:** AC20 and AC22 as amended. **Depends on:** R1.
+- **Files:** `tests/e2e/web/test_bus_push_ui_contract.py`, `tests/e2e/audit/test_audit_identity.py`.
+- **Change.** `test_bus_push_ui_contract.py`: every `client_label is None` / null check becomes `== "web-bridge"` (ours `:189`, `:261-263`, `:319-321`); reword the docstring (`:19, :29, :34`) and the comment at `:177-188`: since PR 171 the bridge labels every connection `web-bridge` (a path name, never `clientInfo.name`), and own-ness comes from `connection_id`; the re-`initialize` with `clientInfo.name == "aitm-web"` check asserts the label is still `"web-bridge"`, not `"aitm-web"`. `test_audit_identity.py`: `MAX_LABEL_BYTES = 128` becomes `MAX_LABEL_CHARS = 64` with its comment; the `"x" * 128` literal and the length checks and messages follow.
+- **Run (Terminal: builds and binds loopback).** `cargo build -p aitm -p aitm-testtarget`. Red first, on the merged binary and the unedited files: `python3 tests/e2e/web/test_bus_push_ui_contract.py` must show `[FAIL]` at section 4 ("agent line client_label is null over /bus (got 'web-bridge')": a main regression since PR 171) and `python3 tests/e2e/audit/test_audit_identity.py` must fail its label-length check (64 against 128). Then edit; both exit 0.
+- **Gate (Terminal):** `python3 tests/e2e/run.py --shared-core web audit`.
+- **Done when:** red shown, then green.
+
+### R5: Whole-branch verification (Terminal)
+
+- **Satisfies:** AC24, AC25 (as amended) and every AC end to end. **Depends on:** R1 to R4. **Files:** none.
+- **Steps and expected results.**
+  1. `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test > $TMPDIR/gate.log 2>&1; echo $?` prints `0`. The known flake `rhai_e2e::script_cannot_escape_or_exceed_scope` may fail: rerun it alone and record both results.
+  2. `cargo build -p aitm -p aitm-testtarget`, then `python3 tests/e2e/run.py --shared-core web audit neg` exits 0, summary `0 fail`, no `audit/*` or `neg/*` SKIP. A red outside the areas spec A8 N8 names: stop and report; do not fix main.
+  3. AC25: `git diff --stat 0d50cf4..HEAD -- apps crates/aitm-tui crates/aitm/src/web crates/aitm-mcp/src/http.rs` is empty.
+  4. AC24: `git diff 0d50cf4..HEAD -- crates/aitm/tests/web_bus_push.rs crates/aitm/tests/web_bus_governance.rs crates/aitm/tests/web_bus_ask_split.rs` is empty; `git diff 0d50cf4..HEAD -- crates/aitm-mcp/tests crates/aitm-core/src/audit.rs | grep '^-[^-]'` prints only the edited lines named in spec AC27 and AC31 (three lines in `audit.rs`, two in `audit_integrity.rs`, the amended lines of the five `revoke_*` tests); print them and compare, since nothing else of main's may be removed.
+  5. Hand `0d50cf4..HEAD` plus the merge commit to the Tester (every AC maps to a test; the mutation reds of R1 and R3 are re-run), then to the three-reviewer panel (security, quality, spec) on the whole branch. The panel runs again because the merge changed the ring, the sanitiser, the push path and the tests it reviewed; the orchestrator adds Review-log rows for spec A2 (gap (a) disposition) and A4 (the nine amended tests).
+- **Done when:** all five hold.
+
+### Ambiguities found while reconciling
+
+1. The brief counted about 25 `cap_client_label` tests; there are 17 (`cap_client_label_*` in `audit.rs`), and R1 removes all of them.
+2. `AuditRing::count_since`, deleted by our panel as dead code, is restored because main's tests call it; it stays unfiltered and in-process only.
+3. Whether R2's whitespace port touches PR 171's literals is the one place this plan edits another session's pinned behaviour on its own initiative; spec A10 Q2 gives the fallback.

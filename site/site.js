@@ -122,13 +122,21 @@
     document.addEventListener("keydown", function (e) { if (e.key === "Escape") menu.removeAttribute("open"); });
   }
 
-  /* Download table: fetch downloads.json (the release manifest) and render one row
-     per asset into [data-downloads]. Progressive enhancement — if the manifest is
-     absent or fails to load or parse, the container stays hidden and the static
-     Homebrew / build-from-source instructions remain the download path. On failure
-     we change nothing and say nothing (no console output). */
+  /* Release manifest: resolve the latest release and let the page derive its
+     version string, the "Get aitmproxy vX.Y.Z" label, the release-page link and
+     the per-platform download table from it — so nothing here is pinned to a
+     version in markup. The primary source is downloads.json, committed to site/
+     by the release pipeline on every release (no network needed). If it is
+     absent or unreadable we fall back to the public tap's GitHub releases API
+     for live resolution. All of this is progressive enhancement: the markup
+     carries a correct fallback version and the static Homebrew / build-from-source
+     instructions, so if nothing resolves we change nothing and say nothing. */
   var dlHost = document.querySelector("[data-downloads]");
-  if (dlHost && window.fetch) {
+  var tagEls = document.querySelectorAll("[data-release-tag]");
+  var urlEls = document.querySelectorAll("[data-release-url]");
+  if ((dlHost || tagEls.length || urlEls.length) && window.fetch) {
+    var GH_LATEST = "https://api.github.com/repos/mrbrutti/homebrew-aitmproxy/releases/latest";
+
     var td = function (text) {
       var cell = document.createElement("td");
       cell.textContent = text == null ? "" : String(text);
@@ -138,8 +146,56 @@
       var s = sha == null ? "" : String(sha);
       return s.length > 12 ? s.slice(0, 12) + "…" : s;
     };
+
+    /* Infer manifest fields from an asset file name, matching
+       scripts/gen-downloads-manifest.sh, for the GitHub API fallback (which
+       carries no platform/arch/format and no checksums of its own). */
+    var formatFor = function (n) {
+      if (/\.tar\.gz$/i.test(n)) return "tar.gz";
+      if (/\.deb$/i.test(n)) return "deb";
+      if (/\.rpm$/i.test(n)) return "rpm";
+      if (/\.dmg$/i.test(n)) return "dmg";
+      return null;
+    };
+    var platformFor = function (n) {
+      if (/\.dmg$/i.test(n) || /apple-darwin/i.test(n)) return "macos";
+      if (/linux/i.test(n) || /\.deb$/i.test(n) || /\.rpm$/i.test(n)) return "linux";
+      return "";
+    };
+    var archFor = function (n) {
+      if (/x86_64|amd64/i.test(n)) return "x86_64";
+      if (/aarch64|arm64/i.test(n)) return "aarch64";
+      if (/\.dmg$/i.test(n)) return "aarch64";
+      return "";
+    };
+    /* Normalise a GitHub releases/latest payload into the downloads.json shape,
+       keeping only recognised package/archive assets (skipping signatures,
+       checksum files and anything else attached to the release). */
+    var fromGitHub = function (gh) {
+      if (!gh || !gh.tag_name) return null;
+      var tag = String(gh.tag_name);
+      var assets = (gh.assets || []).filter(function (a) {
+        return a && a.name && formatFor(a.name);
+      }).map(function (a) {
+        return {
+          platform: platformFor(a.name),
+          arch: archFor(a.name),
+          format: formatFor(a.name),
+          name: a.name,
+          url: a.browser_download_url,
+          sha256: null
+        };
+      });
+      return {
+        version: tag.replace(/^v/, ""),
+        tag: tag,
+        release_url: gh.html_url,
+        assets: assets
+      };
+    };
+
     var renderDownloads = function (data) {
-      if (!data || !data.assets || !data.assets.length) return;
+      if (!dlHost || !data || !data.assets || !data.assets.length) return;
       var ui = document.createElement("div");
       ui.className = "ui";
       var table = document.createElement("table");
@@ -179,15 +235,53 @@
       });
       table.appendChild(tbody);
       ui.appendChild(table);
+      dlHost.innerHTML = "";
       dlHost.appendChild(ui);
       dlHost.removeAttribute("hidden");
     };
-    try {
-      window.fetch("downloads.json", { cache: "no-cache" }).then(function (res) {
+
+    /* Apply a resolved manifest to every version/link/table consumer on the page.
+       Each field is optional: a missing one leaves its markup fallback untouched. */
+    var applyManifest = function (data) {
+      if (!data) return;
+      var tag = data.tag || (data.version ? "v" + data.version : null);
+      if (tag) {
+        tagEls.forEach(function (el) { el.textContent = tag; });
+      }
+      if (data.release_url && /^https?:\/\//i.test(data.release_url)) {
+        urlEls.forEach(function (el) {
+          if (el.tagName === "A") el.setAttribute("href", data.release_url);
+        });
+      }
+      renderDownloads(data);
+    };
+
+    var fetchJSON = function (url, opts) {
+      return window.fetch(url, opts).then(function (res) {
         return res && res.ok ? res.json() : null;
-      }).then(function (data) {
-        if (data) renderDownloads(data);
-      })["catch"](function () { /* no manifest / network / parse error: keep the fallback */ });
+      });
+    };
+
+    try {
+      fetchJSON("downloads.json", { cache: "no-cache" }).then(function (data) {
+        if (data && (data.tag || data.version || (data.assets && data.assets.length))) {
+          applyManifest(data);
+          return;
+        }
+        /* Manifest missing or empty: try the public tap's releases API. */
+        return fetchJSON(GH_LATEST, {
+          cache: "no-cache",
+          headers: { Accept: "application/vnd.github+json" }
+        }).then(function (gh) { applyManifest(fromGitHub(gh)); });
+      })["catch"](function () {
+        /* downloads.json failed outright: last-resort live resolution. */
+        return fetchJSON(GH_LATEST, {
+          cache: "no-cache",
+          headers: { Accept: "application/vnd.github+json" }
+        }).then(function (gh) { applyManifest(fromGitHub(gh)); })["catch"](function () {
+          /* nothing resolved: keep the markup fallback */
+        });
+      });
     } catch (e) { /* fetch threw synchronously: keep the fallback */ }
   }
 })();

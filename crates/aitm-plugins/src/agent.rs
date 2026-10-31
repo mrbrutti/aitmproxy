@@ -14,11 +14,18 @@
 //! `agent.activity` (Read, any role) reads the same ring so a surface or a
 //! reconnecting agent can catch up on recent activity (spec D3a.4); a caller that
 //! is not trusted control gets only the entries it may see (`AuditEntry::visible_to`).
+//!
+//! The audit ring has two lanes: an evidence lane (refusals, failures, and every
+//! Write or Sensitive run) and a routine lane (successful reads only), so a burst
+//! of reads cannot push evidence out. `actions_last_minute` counts both lanes,
+//! across every surface: a UI that polls `agent.status` counts too, unless it
+//! passes `exclude_self`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aitm_core::audit::{DEFAULT_AUDIT_CAPACITY, DEFAULT_ROUTINE_AUDIT_CAPACITY};
 use aitm_core::{
     AgentPolicy, AgentState, AuditRing, Command, CommandHost, ParamDef, ParamSchema, Params,
     Plugin, Registry, Sensitivity, TypeDesc, Value,
@@ -130,8 +137,10 @@ impl Command for AgentStatus {
                     "actions_last_minute",
                     TypeDesc::Int,
                     true,
-                    "Command invocations recorded in the last minute that the caller may see \
-                     (sourced from the F2 audit ring).",
+                    "Command invocations still held in the audit ring that were recorded in the \
+                     last minute, across both lanes and every surface, and that the caller may \
+                     see (a polling UI counts, unless `exclude_self` leaves out its own \
+                     connection). Saturates at what the ring holds.",
                 ),
                 param(
                     "connected_clients",
@@ -245,6 +254,16 @@ impl Command for AgentSet {
 /// trusted control never receives an entry made by trusted control (operator,
 /// CLI), and `limit` counts only the entries it may see. The ring itself, and
 /// the durable log, are never filtered.
+///
+/// Entries merge oldest-first across the ring's two lanes. The ring is a live
+/// view, not a complete record. A source that already holds one of a lane's table
+/// slots keeps a floor of its entries against a flood. That is not isolation: a
+/// source that arrives after the slots are taken, or that shares a label with a
+/// flooder, can be flushed, and every agent-token connection of the web bridge is
+/// ONE source, `(mcp, web-bridge)`. Labels are unauthenticated display strings;
+/// `origin` is authoritative. A call with no `limit` can return up to
+/// `DEFAULT_AUDIT_CAPACITY + DEFAULT_ROUTINE_AUDIT_CAPACITY` entries with the
+/// default lane sizes (both lanes full), so passing `limit` is advisable.
 struct AgentActivity(Arc<AuditRing>);
 
 impl Command for AgentActivity {
@@ -258,11 +277,16 @@ impl Command for AgentActivity {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "Recent command-invocation audit entries (who ran what, with what \
-                          redacted arguments, and the outcome), oldest first. Read-only and \
-                          callable by any role, but a caller that is not trusted control does \
-                          not see entries made by trusted control (operator, CLI)."
-                .to_string(),
+            description: format!(
+                "Recent command-invocation audit entries (who ran what, with what redacted \
+                 arguments, and the outcome), oldest first. A live view, not a complete \
+                 record: a high-volume source can flush other sources' entries. `origin` is \
+                 authoritative; `client_label` is an unauthenticated display string. A call \
+                 with no `limit` can return at most {} entries at the default sizes, so pass \
+                 `limit`. Read-only and readable by any role, but a caller that is not trusted \
+                 control does not see entries made by trusted control (operator, CLI).",
+                DEFAULT_AUDIT_CAPACITY + DEFAULT_ROUTINE_AUDIT_CAPACITY
+            ),
             params: vec![
                 param(
                     "since",
@@ -284,7 +308,9 @@ impl Command for AgentActivity {
                     "client_label",
                     TypeDesc::Str,
                     false,
-                    "The client label, when one was declared.",
+                    "The client label: the server-minted `web-bridge` for the web bridge, \
+                     otherwise the client's declared `initialize.clientInfo.name`, sanitised to \
+                     at most 64 characters. Display-only; `origin` is authoritative.",
                 ),
                 param(
                     "connection_id",

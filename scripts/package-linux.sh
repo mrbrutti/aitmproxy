@@ -105,6 +105,16 @@ cp "$bindir/aitm" "$libdir/aitm"
 cp "$bindir/aitm-tui" "$libdir/aitm-tui"
 chmod 755 "$libdir/aitm" "$libdir/aitm-tui" "$libdir/obscura"
 
+# Default detection catalogue beside the binary: aitm discovers
+# `<exe_dir>/share/aitm/scripts` (exe_dir = /usr/lib/aitmproxy).
+mkdir -p "$libdir/share/aitm/scripts"
+# `/.` copies the CONTENTS of scripts/bundled into the dest on both GNU and BSD
+# cp (a bare `scripts/bundled/` nests under `bundled/` on GNU cp). Files 0644,
+# dirs 0755 so the catalogue stays readable AND traversable once packaged.
+cp -R scripts/bundled/. "$libdir/share/aitm/scripts/"
+find "$libdir/share/aitm/scripts" -type f -exec chmod 644 {} +
+find "$libdir/share/aitm/scripts" -type d -exec chmod 755 {} +
+
 mkdir -p dist
 
 # These four feed scripts/nfpm.yaml. nfpm does NOT reliably expand ${...} in
