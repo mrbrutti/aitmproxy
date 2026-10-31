@@ -39,7 +39,7 @@ struct ScriptsPanel: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Tok.Ground.surface.color)
-        .gridArea("scripts")
+        .gridArea("scripts", inset: 0)
         .task { await load() }
         .onChange(of: session.tools) { Task { await load() } }
     }
@@ -54,6 +54,7 @@ struct ScriptsPanel: View {
         }
         .padding(.horizontal, Space.margin)
         .frame(height: Tok.Size.filterBar)
+        .gridProbe("scripts.title", area: "scripts")
     }
 
     private var empty: some View {
@@ -177,12 +178,12 @@ private struct ScriptDetail: View {
                         section("Error")
                         Text(error)
                             .font(Tok.Face.data(Tok.Typography.Size.md))
-                            .foregroundStyle(Tok.Method.delete.fg.color)
+                            .foregroundStyle(Tok.State.danger.fg.color)
                             .textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
                             .padding(Space.md)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Tok.Method.delete.bg.color, in: RoundedRectangle(cornerRadius: Tok.Radius.control))
+                            .background(Tok.State.danger.bg.color, in: RoundedRectangle(cornerRadius: Tok.Radius.control))
                     }
                     section("Rule")
                     Text(script.ruleSummary)

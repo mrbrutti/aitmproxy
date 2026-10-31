@@ -246,7 +246,8 @@ fn is_intercepted(flow: &Flow) -> bool {
 }
 
 /// Estimated resident bytes of a flow: the buffered body bytes (the dominant
-/// cost) plus header and request-line text, over a small fixed base.
+/// cost) plus header, response-trailer and request-line text, over a small fixed
+/// base.
 fn flow_size(flow: &Flow) -> usize {
     const BASE: usize = 256;
     match flow {
@@ -259,7 +260,7 @@ fn flow_size(flow: &Flow) -> usize {
             let resp = f
                 .response
                 .as_ref()
-                .map(|r| header_bytes(&r.headers) + body_bytes(&r.body))
+                .map(|r| header_bytes(&r.headers) + header_bytes(&r.trailers) + body_bytes(&r.body))
                 .unwrap_or(0);
             BASE + req + resp + meta_bytes(&f.metadata)
         }
@@ -326,7 +327,11 @@ fn matches(flow: &Flow, q: &FlowQuery) -> bool {
                 }
             }
             if let Some(method) = &q.method {
-                if &f.request.method != method {
+                // Case-insensitive, mirroring the live subscription path in
+                // `aitm-mcp` (`FlowFilter::matches`): a lowercase `method:"post"`
+                // filter must match the stored uppercase method, so the live
+                // stream and the `since` replay agree.
+                if !f.request.method.eq_ignore_ascii_case(method) {
                     return false;
                 }
             }

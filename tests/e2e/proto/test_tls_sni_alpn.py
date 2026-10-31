@@ -385,10 +385,13 @@ def obtain_core():
         return attached, False, None
     ca_tmp = tempfile.mkdtemp(prefix="aitm-e2e-tls-ca-")
     ca_dir = os.path.join(ca_tmp, "ca")
+    # ssl_insecure + the per-run ca dir are first-class CoreConfig fields now (the base
+    # to_yaml emits them); set them directly rather than appending, which used to
+    # duplicate the `ca` / `ssl_insecure` keys once the base started emitting them and
+    # made the core refuse to start ("duplicate field `ca`").
     cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
-                     scope_entries=["localhost", "127.0.0.1"])
-    base_to_yaml = cfg.to_yaml
-    cfg.to_yaml = lambda: base_to_yaml() + f'ssl_insecure: true\nca:\n  dir: "{ca_dir}"\n'
+                     scope_entries=["localhost", "127.0.0.1"],
+                     ssl_insecure=True, ca_dir=ca_dir)
     core = Aitm.server(cfg)
     core.proxy_host = "127.0.0.1"
     return core, True, ca_tmp

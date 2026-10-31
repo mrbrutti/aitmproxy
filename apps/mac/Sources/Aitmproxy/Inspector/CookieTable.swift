@@ -8,24 +8,35 @@ struct CookieTable: View {
     var cookies: [Cookie]
     var bodySize: CGFloat = Tok.Typography.Size.md
 
+    // Flags are folded into icons, so this column is narrow; the Value keeps a real
+    // width so the cookie value is always readable (a flexible Value collapses to
+    // nothing once the other columns fill a ~600 pt pane).
     private static let columns: [(title: String, width: CGFloat?)] = [
-        ("Name", 120), ("Value", 200), ("Domain", 160), ("Path", 72), ("Expires", 168), ("Flags", nil),
+        ("Name", 120), ("Value", 200), ("Domain", 160), ("Path", 72), ("Expires", 160), ("Flags", 88),
     ]
 
     var body: some View {
         if cookies.isEmpty {
-            Hint(text: "No cookies")
-                .padding(.leading, Space.md)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            ContentUnavailableView {
+                Label("No Cookies", systemImage: "tray")
+            } description: {
+                Text("This message carries no cookies.")
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            ScrollView([.vertical, .horizontal]) {
-                VStack(spacing: 0) {
-                    ColumnHeads(columns: Self.columns)
-                    ForEach(Array(cookies.enumerated()), id: \.offset) { _, cookie in
-                        row(cookie)
+            // The content is at least the viewport's size, so a short table sits
+            // top-leading and never floats mid-pane (the CodeView pattern). Later
+            // columns are reached by horizontal scroll at a narrow width.
+            GeometryReader { viewport in
+                ScrollView([.vertical, .horizontal]) {
+                    VStack(spacing: 0) {
+                        ColumnHeads(columns: Self.columns)
+                        ForEach(Array(cookies.enumerated()), id: \.offset) { _, cookie in
+                            row(cookie)
+                        }
                     }
+                    .frame(minWidth: viewport.size.width, minHeight: viewport.size.height, alignment: .topLeading)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }
@@ -36,8 +47,8 @@ struct CookieTable: View {
             cell(cookie.value, width: 200)
             cell(cookie.domain ?? Format.dash, width: 160, dim: cookie.domain == nil)
             cell(cookie.path ?? Format.dash, width: 72, dim: cookie.path == nil)
-            cell(expires(cookie), width: 168, dim: cookie.expires == nil && cookie.maxAge == nil)
-            cell(cookie.flagsText.isEmpty ? Format.dash : cookie.flagsText, width: nil, dim: cookie.flagsText.isEmpty)
+            cell(expires(cookie), width: 160, dim: cookie.expires == nil && cookie.maxAge == nil)
+            flags(cookie)
             Spacer(minLength: 0)
         }
         .font(Tok.Face.data(bodySize))
@@ -46,7 +57,7 @@ struct CookieTable: View {
         .overlay(alignment: .bottom) { Rule(color: Tok.Line.rule) }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(cookie.name), \(cookie.value)")
-        .accessibilityValue([cookie.domain, cookie.path, cookie.flagsText].compactMap { $0 }.joined(separator: ", "))
+        .accessibilityValue([cookie.domain, cookie.path, cookie.flagsText.isEmpty ? nil : cookie.flagsText].compactMap { $0 }.joined(separator: ", "))
     }
 
     private func cell(_ text: String, width: CGFloat?, dim: Bool = false) -> some View {
@@ -55,9 +66,28 @@ struct CookieTable: View {
             .lineLimit(1)
             .truncationMode(.tail)
             .frame(width: width, alignment: .leading)
-            .frame(minWidth: width == nil ? 120 : nil, alignment: .leading)
             .help(text)
             .textSelection(.enabled)
+    }
+
+    /// The flags folded into compact icons so the column stays narrow: a lock for
+    /// Secure, a struck-through eye for HttpOnly, the SameSite value as a short word.
+    @ViewBuilder private func flags(_ cookie: Cookie) -> some View {
+        HStack(spacing: Space.xs) {
+            if cookie.secure { Image(systemName: "lock.fill").help("Secure") }
+            if cookie.httpOnly { Image(systemName: "eye.slash").help("HttpOnly") }
+            if let sameSite = cookie.sameSite {
+                Text(sameSite).help("SameSite=\(sameSite)")
+            }
+            if !cookie.secure, !cookie.httpOnly, cookie.sameSite == nil {
+                Text(Format.dash).foregroundStyle(Tok.Ink.tertiary.color)
+            }
+        }
+        .font(.system(size: Tok.Size.iconInline))
+        .foregroundStyle(Tok.Ink.secondary.color)
+        .frame(width: 88, alignment: .leading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(cookie.flagsText.isEmpty ? "no flags" : cookie.flagsText)
     }
 
     /// The Expires column: the date when given, else the Max-Age as seconds, else a dash.

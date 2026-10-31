@@ -1,27 +1,31 @@
 #!/usr/bin/env python3
-"""T1: CA export + real-client MITM trust, status, dry-run, and agent gating.
+# e2e: tier=T1 surface=ca
+"""CA export + real-client MITM trust, status, dry-run, and agent gating.
 
-Asserts on INDEPENDENT observers: a real curl TLS handshake through the proxy
-against a hermetic HTTPS origin the proxy MITMs, plus the on-disk exported cert.
-
-T1 (always): export a usable PEM; `curl --cacert <exported>` through the proxy -> 200
-(proves export + MITM + the minted leaf chains to the exported root); `curl` with NO
-trust -> TLS failure (proves the no-trust test is real); ca.status shape; ca.install
---dry_run lists the real `security` commands; an AGENT ca.install is refused by the
-gate while an OPERATOR dry-run is allowed; ca.* appear in tools/list.
-
-T2 (opt-in AITM_E2E_CA_REAL=1): the real OS-trust cycle install -> curl-without-k 200
--> uninstall -> curl-without-k fails. SKIPPED by default because on macOS user-scope
-`security add-trusted-cert` requires a GUI authorization dialog (unattended-unsafe);
-it runs non-interactively on Linux (ca-certificates anchors) or attended on macOS.
+Asserts on INDEPENDENT observers: a real curl TLS handshake through the proxy against
+a hermetic HTTPS origin the proxy MITMs, plus the on-disk exported cert. T1 (always):
+export a PEM a real `curl --cacert` accepts (HTTP 200 from a MITM'd origin), and with
+NO trust configured the minted leaf is rejected (the no-trust test is real); ca.status
+shape; ca.install --dry_run lists the real `security` commands; an AGENT ca.install is
+gate-refused while an OPERATOR dry-run is allowed; ca.* in tools/list. The real
+OS-keychain cycle is a T2 opt-in (AITM_E2E_CA_REAL=1) — macOS user-scope trust needs a
+GUI dialog, so it is unattended-unsafe there (it runs non-interactively on Linux).
 """
 import json
 import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from harness import Harness, Reporter, curl  # noqa: E402
+E2E = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(E2E))
+sys.path.insert(0, str(E2E / "lib"))
+
+from aitm_e2e import check, free_port, ok, section  # noqa: E402
+from aitm_e2e import tls  # noqa: E402
+from aitm_e2e.bus import BusClient  # noqa: E402
+from aitm_e2e.config import CoreConfig  # noqa: E402
+from aitm_e2e.core import Aitm  # noqa: E402
+from seeded import aitm_cli, curl_code  # noqa: E402
 
 
 def jparse(s: str):
@@ -29,85 +33,74 @@ def jparse(s: str):
     return json.loads(s[i:j + 1]) if i >= 0 and j > i else None
 
 
-def main() -> int:
-    r = Reporter("t1_ca_trust")
-    with Harness("ca") as h:
-        h.start_aitm()
-        origin = h.start_tls_origin()
-        proxy = h.proxy_url()
+def main() -> None:
+    cfg = CoreConfig(proxy_port=free_port(), ssl_insecure=True)
+    with Aitm.server(cfg) as core:
+        proxy = f"http://127.0.0.1:{cfg.proxy_port}"
+        crt, key = tls.upstream_cert(core.workdir)
+        srv, oport = tls.start_https_echo(crt, key)
+        origin = f"https://127.0.0.1:{oport}/"
+        try:
+            section("ca.status (read-only)")
+            rc, out, err = aitm_cli(core, "ca", "status")
+            st = jparse(out)
+            check(bool(st) and st.get("exists") is True, "ca.status reports the CA exists")
+            stores = st.get("stores", {}) if st else {}
+            check(bool(stores) and all(s.get("installed") == "absent" for s in stores.values()),
+                  "both scopes report absent before install")
 
-        # --- ca.status (read-only) ----------------------------------------- #
-        rc, out, err = h.run_cli("ca", "status")
-        st = jparse(out)
-        r.check("status_exists", bool(st) and st.get("exists") is True, f"rc={rc} {err[:200]}")
-        if st:
-            stores = st.get("stores", {})
-            absent = all(s.get("installed") == "absent" for s in stores.values()) if stores else False
-            r.check("status_absent_preinstall", absent, f"stores={stores}")
+            section("ca.export -> a PEM a real curl accepts")
+            exported = os.path.join(core.workdir, "exported-ca.pem")
+            rc, out, err = aitm_cli(core, "ca", "export", "--format", "pem", "--out", exported)
+            ex = jparse(out)
+            check(rc == 0 and bool(ex) and "BEGIN CERTIFICATE" in (ex.get("certificate") or ""),
+                  "ca.export emits a PEM certificate")
+            check(os.path.exists(exported) and "BEGIN CERTIFICATE" in open(exported).read(),
+                  "ca.export --out wrote the cert file")
 
-        # --- ca.export -> usable PEM --------------------------------------- #
-        exported = h.root / "exported-ca.pem"
-        rc, out, err = h.run_cli("ca", "export", "--format", "pem", "--out", str(exported))
-        ex = jparse(out)
-        r.check("export_ok", rc == 0 and bool(ex) and "BEGIN CERTIFICATE" in (ex.get("certificate") or ""),
-                f"rc={rc} {err[:200]}")
-        r.check("export_wrote_file", exported.exists() and "BEGIN CERTIFICATE" in exported.read_text())
+            section("real HTTPS through the proxy, trusting the export")
+            rc, code, _ = curl_code(["-x", proxy, "--cacert", exported, origin])
+            check(rc == 0 and code == 200, f"curl --cacert through the proxy = 200 (rc={rc} http={code})")
+            rc, code, _ = curl_code(["-x", proxy, origin])
+            check(rc != 0 and code != 200, f"the MITM leaf is rejected with no trusted root (rc={rc} http={code})")
 
-        # --- the headline: real HTTPS through the proxy, trusting the export - #
-        code, http, body = curl(origin, proxy=proxy, cacert=str(exported))
-        r.check("mitm_cacert_200", code == 0 and http == 200 and "aitm-e2e-origin-ok" in body,
-                f"exit={code} http={http} body={body[:120]!r}")
+            section("ca.install --dry_run lists the real security commands")
+            rc, out, err = aitm_cli(core, "ca", "install", "--dry_run")
+            dry = jparse(out)
+            cmds = " ".join(dry.get("commands", [])) if dry else ""
+            check(rc == 0 and bool(dry) and dry.get("dry_run") is True and
+                  any(k in cmds for k in ("add-trusted-cert", "certutil", "trust anchor", "update-ca-certificates")),
+                  "dry_run lists the trust-store commands without running them")
 
-        # control: with NO trust configured, the MITM leaf must be rejected.
-        code, http, body = curl(origin, proxy=proxy)
-        r.check("no_trust_rejected", code != 0 and http != 200,
-                f"a MITM leaf was accepted with no trusted root (exit={code} http={http})")
+            section("agent gating vs operator over the bus")
+            op = BusClient.operator(core)
+            agent = BusClient.agent(core)
+            check({"ca.export", "ca.status", "ca.install", "ca.uninstall"} <= set(op.tool_names()),
+                  "ca.* present in tools/list")
+            status, msg = agent.try_call("ca.install", {})
+            check(status == "error", f"agent ca.install is gate-refused ({msg[:70]})")
+            res = op.call("ca.install", {"dry_run": True})
+            check(isinstance(res, dict) and res.get("dry_run") is True,
+                  "operator ca.install --dry_run is allowed (bypasses the agent gate)")
 
-        # --- ca.install --dry_run lists the real security commands --------- #
-        rc, out, err = h.run_cli("ca", "install", "--dry_run")
-        dry = jparse(out)
-        cmds = " ".join(dry.get("commands", [])) if dry else ""
-        r.check("install_dry_run", rc == 0 and bool(dry) and dry.get("dry_run") is True
-                and ("add-trusted-cert" in cmds or "certutil" in cmds or "trust anchor" in cmds
-                     or "update-ca-certificates" in cmds),
-                f"rc={rc} cmds={cmds[:200]!r}")
+            section("real OS trust-store cycle")
+            if os.environ.get("AITM_E2E_CA_REAL") == "1":
+                rc_i, _, err_i = aitm_cli(core, "ca", "install", "--yes", timeout=200)
+                rc_t, code_t, _ = curl_code(["-x", proxy, origin])
+                rc_u, _, _ = aitm_cli(core, "ca", "uninstall", "--yes", timeout=200)
+                rc_t2, code_t2, _ = curl_code(["-x", proxy, origin])
+                check(rc_i == 0 and rc_t == 0 and code_t == 200,
+                      f"real install makes curl-without-k succeed (install rc={rc_i} curl={code_t})")
+                check(rc_u == 0 and code_t2 != 200, f"real uninstall reverses trust (curl={code_t2})")
+            else:
+                print("  [skip tier=T2] real_os_trust_cycle: set AITM_E2E_CA_REAL=1 to run the real "
+                      "install/uninstall; macOS user-scope add-trusted-cert needs a GUI auth dialog "
+                      "(unattended-unsafe), Linux runs it non-interactively", flush=True)
 
-        # --- gating over the real bus -------------------------------------- #
-        op = h.mcp("operator"); op.initialize()
-        agent = h.mcp("agent"); agent.initialize()
-        tools = op.tools()
-        r.check("tools_present",
-                {"ca.export", "ca.status", "ca.install", "ca.uninstall"} <= tools,
-                f"ca.*={sorted(t for t in tools if t.startswith('ca.'))}")
-
-        # Agent install (non-dry, flag off) is refused BEFORE any security command runs.
-        sc, is_err, text = agent.call("ca.install", {})  # no dry_run, no confirm handshake for agent
-        r.check("agent_install_refused", is_err, f"agent ca.install should refuse, text={text[:160]!r}")
-
-        # Operator dry-run is allowed (operator bypasses the agent gate; dry_run skips confirm).
-        sc, is_err, text = op.call("ca.install", {"dry_run": True})
-        r.check("operator_dry_run_allowed", (not is_err) and bool(sc) and sc.get("dry_run") is True,
-                f"isError={is_err} sc={sc}")
-        op.close(); agent.close()
-
-        # --- T2: the real OS-trust round trip (opt-in) --------------------- #
-        if os.environ.get("AITM_E2E_CA_REAL") == "1":
-            rc_i, out_i, err_i = h.run_cli("ca", "install", "--yes", timeout=200)
-            code_t, http_t, _ = curl(origin, proxy=proxy)  # no -k, no --cacert
-            rc_u, _, _ = h.run_cli("ca", "uninstall", "--yes", timeout=200)
-            code_a, _, _ = curl(origin, proxy=proxy)
-            r.check("real_install_trusts", rc_i == 0 and code_t == 0 and http_t == 200,
-                    f"install rc={rc_i} curl exit={code_t} http={http_t} {err_i[:160]}")
-            r.check("real_uninstall_reverses", rc_u == 0 and code_a != 0,
-                    f"uninstall rc={rc_u} curl exit={code_a}")
-        else:
-            r.skip("real_os_trust_cycle", "T2",
-                   "set AITM_E2E_CA_REAL=1 to run the real OS-trust install/uninstall; "
-                   "on macOS user-scope add-trusted-cert needs a GUI auth dialog "
-                   "(unattended-unsafe), it runs non-interactively on Linux")
-
-    return r.finish()
+            ok("CA export + real-client trust + gating verified")
+        finally:
+            srv.shutdown()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

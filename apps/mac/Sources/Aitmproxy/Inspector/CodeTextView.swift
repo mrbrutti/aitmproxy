@@ -128,29 +128,44 @@ struct CodeTextView: NSViewRepresentable {
         private var appliedHighlights: [Range<String.Index>] = []
         private var appliedCurrent: Int?
         private var observer: NSObjectProtocol?
+        private var frameObserver: NSObjectProtocol?
         private var colours: [SyntaxKind: NSColor] = [:]
 
         func attach(textView: NSTextView, ruler: LineNumberRuler, scrollView: NSScrollView) {
             self.textView = textView
             self.ruler = ruler
             scrollView.contentView.postsBoundsChangedNotifications = true
+            scrollView.contentView.postsFrameChangedNotifications = true
             observer = NotificationCenter.default.addObserver(
                 forName: NSView.boundsDidChangeNotification, object: scrollView.contentView, queue: .main
             ) { [weak ruler] _ in
                 MainActor.assumeIsolated { ruler?.needsDisplay = true }
+            }
+            // When a horizontal scroller appears it shortens the clip view; re-fit the
+            // text view so content that fits doesn't also get a vertical scroller.
+            frameObserver = NotificationCenter.default.addObserver(
+                forName: NSView.frameDidChangeNotification, object: scrollView.contentView, queue: .main
+            ) { [weak textView] _ in
+                MainActor.assumeIsolated { textView?.sizeToFit() }
             }
         }
 
         /// Called from `dismantleNSView`: a deinit cannot touch main-actor state.
         func detach() {
             if let observer { NotificationCenter.default.removeObserver(observer) }
+            if let frameObserver { NotificationCenter.default.removeObserver(frameObserver) }
             observer = nil
+            frameObserver = nil
             work?.cancel()
         }
 
         var baseAttributes: [NSAttributedString.Key: Any] {
             let style = NSMutableParagraphStyle()
-            style.lineHeightMultiple = Tok.Typography.LineHeight.code
+            // Fix the line to 20 pt (md × code), the same height CodeView and HexView
+            // draw, instead of a multiple of the font's own leading (which came out ~25).
+            let lineHeight = Tok.Typography.Size.md * Tok.Typography.LineHeight.code
+            style.minimumLineHeight = lineHeight
+            style.maximumLineHeight = lineHeight
             return [
                 .font: Tok.Face.nsData(bodySize),
                 .foregroundColor: Tok.Ink.primary.nsColor,

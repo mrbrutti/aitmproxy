@@ -65,6 +65,7 @@ fn seeded_flow() -> Flow {
             status: 201,
             version: HttpVersion::Http11,
             headers: resp_headers,
+            trailers: HeaderMap::new(),
             body: Body::Bytes(b"{\"ok\":true}".to_vec()),
             timestamp: SystemTime::now(),
         }),

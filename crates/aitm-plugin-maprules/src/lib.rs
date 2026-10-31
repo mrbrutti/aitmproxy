@@ -431,6 +431,7 @@ fn http_response(
         status,
         version: HttpVersion::Http11,
         headers,
+        trailers: HeaderMap::new(),
         body: Body::Bytes(bytes),
         timestamp: SystemTime::now(),
     }

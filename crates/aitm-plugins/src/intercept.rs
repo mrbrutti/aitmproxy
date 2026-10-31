@@ -442,6 +442,7 @@ fn set_short_circuit(flow: &mut Flow, status: u16) {
             status,
             version: f.request.version,
             headers,
+            trailers: HeaderMap::new(),
             body: Body::Empty,
             timestamp: SystemTime::now(),
         });

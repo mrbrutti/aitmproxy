@@ -44,9 +44,10 @@ enum SnapshotScene: String, CaseIterable {
 
     /// Task 8: a seeded embedded `CoreConnection` so the health dot and the
     /// core-log panel render without a live core (snapshots use fixtures).
-    private static func core(_ status: CoreConnection.Status, label: String, proxyAddress: String? = nil) -> CoreConnection {
+    static func core(_ status: CoreConnection.Status, label: String, proxyAddress: String? = nil) -> CoreConnection {
         CoreConnection(id: .fixture, kind: .embedded, endpoint: BusEndpoint(port: 0, token: ""), status: status,
-                       label: label, proxyAddress: proxyAddress)
+                       label: label, proxyAddress: proxyAddress,
+                       appliedPort: 8080, appliedVerifyUpstreamTLS: true)
     }
 
     func apply(to session: Session) {

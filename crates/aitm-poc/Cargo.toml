@@ -20,7 +20,9 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 # json_path parses a target-controlled response body; serde_json's bounded
 # recursion limit and absence of YAML aliases keep that parse DoS-resistant.
-serde_json = "1"
+# `preserve_order`: a built PoC body is reserialized after credential scrubbing, so
+# keep its keys in wire order (don't depend on another crate enabling the feature).
+serde_json = { version = "1", features = ["preserve_order"] }
 regex = "1"
 
 # Unix-only: the `O_NOFOLLOW` constant for a TOCTOU-safe PoC-file open (no unsafe).

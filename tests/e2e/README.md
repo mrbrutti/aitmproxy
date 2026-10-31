@@ -127,3 +127,22 @@ python3 tests/e2e/run.py                                  # everything else (own
 that mutate global state (scope / config / sessionio) — on one shared core they
 cross-contaminate. The merge gate is the default `run.py` (own-core; env-model
 cells skip loudly) plus a separate `--shared-core` run over the env-model surfaces.
+
+## Run matrix (which rig runs which surface)
+
+Every cell is real and runnable; the capability-gated ones SKIP (77) cleanly in the
+headless gate and RUN in the rig that has their dependency. Each gated cell names the
+missing dep in its SKIP line.
+
+| rig | how to run | surfaces that RUN | notes |
+|---|---|---|---|
+| **Headless gate** (CI/dev) | `cargo build -p aitm -p aitm-testtarget` then `run.py` | smoke, surface, request, ws, mcp, passthrough, web, scope, config, sessionio, map, start, neg, flow, proto, ca, poc, findings, scripting, `browser/test_browser_scope_ssrf` | own-core / self-booting; no external deps |
+| **Headless, shared-core** | `run.py --shared-core status protocol edits audit …` | status (needs `lsof`), protocol, edits, audit, and other env-model cells | one booted core + echo upstream; env-model cells attach, else SKIP |
+| **obscura rig** | `AITM_OBSCURA=1` (+ `AITM_OBSCURA_BIN`), then `run.py browser` | `browser/test_browser_navigate` (full nav + captured flow + DOM) | without obscura it SKIPs; `browser_scope_ssrf` already runs headless |
+| **L4 / NE rig** | an `l4.enabled` core + a CONFIG loopback capture scope + raw-capture privilege (libpcap/BPF; macOS NE approved+enabled), exported via `AITM_BUS_ADDR`/`AITM_BUS_OPERATOR_TOKEN`/… then `run.py --shared-core l4` | l4 (both cells) | SKIPs with the precise missing piece when any is absent |
+| **aitm-tui present** | `cargo build -p aitm-tui` (or it on `$PATH`/`AITM_TUI_BIN`), then `run.py tui` | tui (both cells) | drives the real `aitm-tui` in a pty; SKIPs when the binary is absent |
+| **real-Mac / sysex** (T2) | on a real Mac, `run.py ne --manual` | ne, the macOS app + Network Extension | `tier=manual` steps `pause()` for the operator (trust-store / sysex approval clicks) |
+
+The **merge gate** is the first two rows (headless own-core + headless shared-core): all
+PASS or loud-SKIP, zero FAIL. The remaining rows are the live rigs that turn those SKIPs
+into real PASSes where the hardware/privilege/binary exists.
