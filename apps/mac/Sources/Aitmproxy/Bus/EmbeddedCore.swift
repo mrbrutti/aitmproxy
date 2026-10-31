@@ -157,6 +157,9 @@ actor EmbeddedCore {
         let savedPort = defaults.integer(forKey: "proxy.preferredPort")
         let preferredPort = (savedPort > 0 && savedPort <= 65535) ? UInt16(savedPort) : defaultProxyPort
         let sslInsecure = !(defaults.object(forKey: "proxy.verifyUpstreamTLS") as? Bool ?? true)
+        // Settings ▸ Capture toggle: off unless the operator turned it on. Read fresh
+        // here too so Apply & Restart Core flips the core's `macos_capture` gate.
+        let captureEnabled = defaults.object(forKey: "capture.enabled") as? Bool ?? false
         guard let proxyPort = EmbeddedCoreLaunch.pickProxyPort(preferred: preferredPort),
               let browserProxyPort = EmbeddedCoreLaunch.pickProxyPort(preferred: defaultBrowserProxyPort)
         else {
@@ -181,7 +184,8 @@ actor EmbeddedCore {
                 token: token,
                 operatorToken: operatorToken,
                 endpointFile: endpointURL,
-                sslInsecure: sslInsecure
+                sslInsecure: sslInsecure,
+                captureEnabled: captureEnabled
             )
             try EmbeddedCoreLaunch.writeConfig(config.yaml(), to: configURL)  // yaml() escapes/validates spliced paths
         } catch {
