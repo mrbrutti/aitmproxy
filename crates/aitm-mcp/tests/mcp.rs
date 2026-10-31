@@ -4652,3 +4652,131 @@ fn agent_activity_hides_trusted_control_entries_from_agents() {
         "the ring itself is never filtered, only the read"
     );
 }
+
+// ------------- role-filtered agent.status count (plan 2026-10-30-bus-audit-connection-id, T11)
+
+/// `actions_last_minute` from an `agent.status` reply; panics, quoting the reply,
+/// if the call did not return a status object (a refusal or a protocol error).
+fn actions_last_minute(reply: &JsonValue) -> i64 {
+    reply["result"]["structuredContent"]["actions_last_minute"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("agent.status returns actions_last_minute: {reply}"))
+}
+
+/// AC14: `actions_last_minute` is the count of what the caller may see. An agent
+/// does not count the operator's entries (they are in the ring, not in its view);
+/// the operator counts every entry. An entry is recorded after its call returns,
+/// so a call never counts itself.
+#[test]
+fn agent_status_counts_only_what_the_caller_may_see() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+    let op = minted(&srv, Frontend::Operator);
+    let a = minted(&srv, Frontend::Mcp);
+    let b = minted(&srv, Frontend::Mcp);
+
+    for _ in 0..4 {
+        assert!(!is_refused(&call_on(&srv, &op, "demo.read", json!({}))));
+    }
+    for _ in 0..3 {
+        assert!(!is_refused(&call_on(&srv, &a, "demo.read", json!({}))));
+    }
+    assert_eq!(ring.len(), 7, "4 operator entries and A's 3");
+
+    // B has made no call yet. Its view of the ring is A's three entries; the
+    // operator's four are hidden, so the count is 3 and not 7.
+    let reply = call_on(&srv, &b, "agent.status", json!({}));
+    assert!(!is_refused(&reply), "B reads agent.status: {reply}");
+    assert_eq!(
+        actions_last_minute(&reply),
+        3,
+        "an agent counts only agent entries: {reply}"
+    );
+    assert_eq!(ring.len(), 8, "B's agent.status was recorded after it ran");
+
+    // The operator sees everything: its 4, A's 3 and B's agent.status.
+    let reply = call_on(&srv, &op, "agent.status", json!({}));
+    assert!(
+        !is_refused(&reply),
+        "the operator reads agent.status: {reply}"
+    );
+    assert_eq!(
+        actions_last_minute(&reply),
+        8,
+        "a trusted-control caller counts every entry: {reply}"
+    );
+}
+
+/// AC15: `exclude_self: true` drops exactly the caller's own connection from its
+/// own count; it never lowers anyone else's, a caller with no connection id has
+/// nothing to exclude, and a non-boolean value is the ordinary `-32602` and is
+/// not audited. The schema advertises the optional boolean.
+#[test]
+fn agent_status_exclude_self_skips_only_the_callers_connection() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+    let a = minted(&srv, Frontend::Mcp);
+    let b = minted(&srv, Frontend::Mcp);
+
+    for _ in 0..3 {
+        assert!(!is_refused(&call_on(&srv, &a, "demo.read", json!({}))));
+    }
+    for _ in 0..2 {
+        assert!(!is_refused(&call_on(&srv, &b, "demo.read", json!({}))));
+    }
+    assert_eq!(ring.len(), 5, "A's 3 and B's 2");
+
+    // 5 agent entries, A's own 3 excluded.
+    let reply = call_on(&srv, &a, "agent.status", json!({"exclude_self": true}));
+    assert!(!is_refused(&reply), "exclude_self is accepted: {reply}");
+    assert_eq!(actions_last_minute(&reply), 2, "B's two only: {reply}");
+    assert_eq!(ring.len(), 6);
+
+    // Without the flag, A counts its own entries too: 5 plus its previous status.
+    let reply = call_on(&srv, &a, "agent.status", json!({}));
+    assert_eq!(actions_last_minute(&reply), 6, "off by default: {reply}");
+    assert_eq!(ring.len(), 7);
+
+    // A call with no streaming connection has no id of its own, so nothing is
+    // excluded: the count can only err toward more.
+    let anon = ConnCtx::new(Frontend::Mcp);
+    let reply = call_on(&srv, &anon, "agent.status", json!({"exclude_self": true}));
+    assert_eq!(
+        actions_last_minute(&reply),
+        7,
+        "no own id, nothing excluded: {reply}"
+    );
+    assert_eq!(ring.len(), 8);
+
+    // A wrongly typed flag is the schema's ordinary invalid-params error; the
+    // command never ran, so nothing is recorded.
+    let reply = call_on(&srv, &a, "agent.status", json!({"exclude_self": "yes"}));
+    assert_eq!(
+        reply["error"]["code"],
+        json!(-32602),
+        "a non-boolean exclude_self is invalid params: {reply}"
+    );
+    assert_eq!(ring.len(), 8, "a protocol error is not audited");
+
+    // tools/list advertises the optional boolean.
+    let list = rpc(&srv, 1, "tools/list", json!({}));
+    let tool = list["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .find(|t| t["name"] == "agent.status")
+        .expect("agent.status is listed");
+    assert_eq!(
+        tool["inputSchema"]["properties"]["exclude_self"]["type"],
+        json!("boolean"),
+        "exclude_self is a boolean property: {tool}"
+    );
+    let required = tool["inputSchema"]["required"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !required.iter().any(|r| r == "exclude_self"),
+        "exclude_self is optional: {tool}"
+    );
+}

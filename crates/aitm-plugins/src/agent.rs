@@ -9,7 +9,8 @@
 //!
 //! `connected_clients` is part of the declared `agent.status` shape; its data
 //! source (the connection registry) lands in a later M4 task, so it reports `[]`
-//! for now. `actions_last_minute` is sourced from the F2 audit ring (Task 8).
+//! for now. `actions_last_minute` is sourced from the F2 audit ring (Task 8), as
+//! the caller may see it, and `exclude_self` leaves out the caller's own connection.
 //! `agent.activity` (Read, any role) reads the same ring so a surface or a
 //! reconnecting agent can catch up on recent activity (spec D3a.4); a caller that
 //! is not trusted control gets only the entries it may see (`AuditEntry::visible_to`).
@@ -76,7 +77,18 @@ fn param(name: &str, ty: TypeDesc, required: bool, description: &str) -> ParamDe
     }
 }
 
-/// `agent.status {} -> {policy, actions_last_minute, connected_clients}` (Read).
+/// `agent.status {exclude_self?} -> {policy, actions_last_minute, connected_clients}`
+/// (Read; any role).
+///
+/// `actions_last_minute` is the caller's view of the ring
+/// ([`AuditRing::count_since_for`] with the caller's frontend): a caller that is not
+/// trusted control does not count entries made by trusted control (operator, CLI),
+/// so it equals what `agent.activity` would return to the same caller for the last
+/// minute. With `exclude_self: true` the entries made by the caller's own
+/// connection (the server-assigned id on [`CommandHost::connection_id`]) are left
+/// out, so a client's own polling does not inflate the number it reads. A caller
+/// with no connection id has nothing to exclude. The flag changes only the count
+/// this caller receives; it cannot lower what any other connection sees.
 struct AgentStatus {
     state: Arc<AgentState>,
     audit: Arc<AuditRing>,
@@ -95,9 +107,18 @@ impl Command for AgentStatus {
         ParamSchema {
             description:
                 "Report the current agent policy and recent agent activity. Read-only and \
-                          readable by any role."
+                          readable by any role, but the activity count covers only the entries \
+                          the caller may see: a caller that is not trusted control does not \
+                          count entries made by trusted control (operator, CLI)."
                     .to_string(),
-            params: vec![],
+            params: vec![param(
+                "exclude_self",
+                TypeDesc::Bool,
+                false,
+                "When true, leave out the calls made by this connection (for example a UI's own \
+                 polling) from `actions_last_minute`. Default false; a caller with no connection \
+                 id excludes nothing.",
+            )],
             result: TypeDesc::Object(vec![
                 param(
                     "policy",
@@ -109,8 +130,8 @@ impl Command for AgentStatus {
                     "actions_last_minute",
                     TypeDesc::Int,
                     true,
-                    "Command invocations recorded in the last minute (sourced from the F2 audit \
-                     ring).",
+                    "Command invocations recorded in the last minute that the caller may see \
+                     (sourced from the F2 audit ring).",
                 ),
                 param(
                     "connected_clients",
@@ -127,10 +148,22 @@ impl Command for AgentStatus {
         }
     }
 
-    fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
-        let last_minute = self
-            .audit
-            .count_since(SystemTime::now() - Duration::from_secs(60));
+    fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        // `exclude_self` is a schema-declared optional boolean: a non-boolean never
+        // reaches here (the schema coercion refuses it as invalid params), and
+        // absent means off. The excluded id is the server-assigned one the host
+        // carries, never anything the caller sent; with none, nothing is excluded.
+        let exclude_self = matches!(args.get("exclude_self"), Some(Value::Bool(true)));
+        let exclude = if exclude_self {
+            host.connection_id()
+        } else {
+            None
+        };
+        let last_minute = self.audit.count_since_for(
+            host.frontend(),
+            SystemTime::now() - Duration::from_secs(60),
+            exclude,
+        );
         let mut fields = BTreeMap::new();
         fields.insert(
             "policy".to_string(),
@@ -401,6 +434,42 @@ mod tests {
         assert!(
             !field.required,
             "connection_id is optional (null when unattributable)"
+        );
+
+        assert!(
+            schema.description.contains("trusted control"),
+            "the description names the viewer filter: {}",
+            schema.description
+        );
+    }
+
+    /// AC16 (status half): `agent.status` declares exactly one param, an optional
+    /// boolean `exclude_self`, and its description says the count covers only the
+    /// entries the caller may see (a caller that is not trusted control).
+    #[test]
+    fn agent_status_schema_declares_exclude_self() {
+        let reg = registry();
+        let schema = reg
+            .command("agent.status")
+            .expect("agent.status is registered")
+            .schema();
+
+        let field = schema
+            .params
+            .iter()
+            .find(|p| p.name == "exclude_self")
+            .unwrap_or_else(|| panic!("no exclude_self param in {:?}", schema.params));
+        assert!(
+            matches!(field.ty, TypeDesc::Bool),
+            "exclude_self is a boolean, got {:?}",
+            field.ty
+        );
+        assert!(!field.required, "exclude_self is optional (default off)");
+        assert_eq!(
+            schema.params.len(),
+            1,
+            "exclude_self is the only param: {:?}",
+            schema.params
         );
 
         assert!(
