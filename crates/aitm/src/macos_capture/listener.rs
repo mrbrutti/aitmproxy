@@ -38,10 +38,12 @@ use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 
 use super::rendezvous;
@@ -54,6 +56,13 @@ const DATA_SOCK: &str = "data.sock";
 /// `u32` length prefix. Control frames are metadata (a [`Hello`], a [`ScopeSpec`],
 /// a [`FlowOpen`]) — kilobytes, not megabytes; 1 MiB is ample headroom.
 const MAX_FRAME_LEN: usize = 1 << 20;
+
+/// How long [`CaptureListener::accept_data`] waits for a freshly accepted data
+/// socket's [`DataHandshake`]. The handshake is read **before** the peer can be
+/// verified (the verifier needs the finished connection), so without a bound one
+/// silent same-uid peer would pin the accepting task forever. A real provider sends
+/// the handshake immediately after connecting; seconds is generous.
+const DATA_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Upper bound on a length-delimited datagram body. A UDP datagram cannot exceed
 /// 64 KiB, so any larger declared length is corrupt or hostile.
@@ -215,16 +224,12 @@ impl CaptureListener {
     /// independent socket — its own buffers and backpressure.
     ///
     /// # Errors
-    /// Fails if accepting the connection fails, or the peer closes before sending a
-    /// handshake.
+    /// Fails if accepting the connection fails, the peer closes before sending a
+    /// handshake, or the handshake does not arrive within a few seconds
+    /// ([`io::ErrorKind::TimedOut`]).
     pub async fn accept_data(&self) -> io::Result<DataConnection> {
         let (mut stream, _addr) = self.data.accept().await?;
-        let handshake: DataHandshake = read_frame(&mut stream).await?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "data socket closed before its handshake",
-            )
-        })?;
+        let handshake = read_handshake(&mut stream, DATA_HANDSHAKE_TIMEOUT).await?;
         Ok(DataConnection {
             flow_id: handshake.flow_id,
             stream,
@@ -269,16 +274,14 @@ impl ControlChannel {
 
     /// Read the next control message, or `None` at a clean end of stream.
     ///
+    /// Not cancel-safe: dropping this future mid-frame loses the bytes already
+    /// read. A caller that must also write on a timer uses
+    /// [`into_halves`](Self::into_halves) instead of racing this in a `select!`.
+    ///
     /// # Errors
     /// Fails on a short read mid-frame or a malformed frame.
     pub async fn recv(&mut self) -> io::Result<Option<ControlMessage>> {
-        let Some(buf) = read_capped(&mut self.stream, MAX_FRAME_LEN).await? else {
-            return Ok(None);
-        };
-        self.bytes_read += 4 + buf.len() as u64;
-        let msg = serde_json::from_slice(&buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Ok(Some(msg))
+        recv_control(&mut self.stream, &mut self.bytes_read).await
     }
 
     /// Total bytes read off the control channel so far — used to prove the control
@@ -287,6 +290,79 @@ impl ControlChannel {
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read
     }
+
+    /// Split into an independent reader and writer over the one socket, so a
+    /// caller can read frames in one future and write frames in another without
+    /// either borrowing the other (and without ever cancelling a read mid-frame).
+    /// The byte count read so far carries over to the reader. The peer-verification
+    /// fd ([`AsRawFd`]) is only available before the split.
+    #[must_use]
+    pub fn into_halves(self) -> (ControlReader, ControlWriter) {
+        let (read, write) = self.stream.into_split();
+        (
+            ControlReader {
+                read,
+                bytes_read: self.bytes_read,
+            },
+            ControlWriter { write },
+        )
+    }
+}
+
+/// The read half of a split [`ControlChannel`]: the same frame codec and byte
+/// count, over the read side only.
+pub struct ControlReader {
+    read: OwnedReadHalf,
+    bytes_read: u64,
+}
+
+impl ControlReader {
+    /// Read the next control message, or `None` at a clean end of stream. Not
+    /// cancel-safe (see [`ControlChannel::recv`]): run it in a loop that is only
+    /// ever dropped as a whole.
+    ///
+    /// # Errors
+    /// Fails on a short read mid-frame or a malformed frame.
+    pub async fn recv(&mut self) -> io::Result<Option<ControlMessage>> {
+        recv_control(&mut self.read, &mut self.bytes_read).await
+    }
+
+    /// Total bytes read off the control channel so far (including before the
+    /// split).
+    #[must_use]
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+}
+
+/// The write half of a split [`ControlChannel`].
+pub struct ControlWriter {
+    write: OwnedWriteHalf,
+}
+
+impl ControlWriter {
+    /// Send one control message.
+    ///
+    /// # Errors
+    /// Fails on a serialization or write error.
+    pub async fn send(&mut self, msg: &ControlMessage) -> io::Result<()> {
+        write_frame(&mut self.write, msg).await
+    }
+}
+
+/// Read one control frame off `r`, adding its wire size to `bytes_read`. Shared by
+/// [`ControlChannel::recv`] and [`ControlReader::recv`] so the two cannot drift.
+async fn recv_control<R>(r: &mut R, bytes_read: &mut u64) -> io::Result<Option<ControlMessage>>
+where
+    R: AsyncRead + Unpin,
+{
+    let Some(buf) = read_capped(r, MAX_FRAME_LEN).await? else {
+        return Ok(None);
+    };
+    *bytes_read += 4 + buf.len() as u64;
+    let msg =
+        serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(Some(msg))
 }
 
 /// The control stream's file descriptor, so a [`PeerVerifier`] can read the peer's
@@ -420,6 +496,28 @@ where
     Ok(Some(msg))
 }
 
+/// Read the [`DataHandshake`] off a just-accepted data socket within `within`.
+/// A peer that stays silent or sends half a frame is cut off with
+/// [`io::ErrorKind::TimedOut`]; one that closes first is
+/// [`io::ErrorKind::UnexpectedEof`].
+async fn read_handshake<R>(r: &mut R, within: Duration) -> io::Result<DataHandshake>
+where
+    R: AsyncRead + Unpin,
+{
+    match tokio::time::timeout(within, read_frame(r)).await {
+        Ok(Ok(Some(handshake))) => Ok(handshake),
+        Ok(Ok(None)) => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "data socket closed before its handshake",
+        )),
+        Ok(Err(e)) => Err(e),
+        Err(_elapsed) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "data socket sent no handshake in time",
+        )),
+    }
+}
+
 /// Read a `u32`-big-endian length prefix and that many bytes.
 ///
 /// Rejects any declared length above `max` with `InvalidData` **before
@@ -450,7 +548,134 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{AsRawFd, DataConnection};
+    use std::io;
+    use std::time::Duration;
+
+    use tokio::io::AsyncWriteExt;
+
+    use super::{
+        read_handshake, write_data_handshake, AsRawFd, ControlChannel, ControlMessage,
+        DataConnection, DataHandshake, Hello, ScopeSpec,
+    };
+
+    /// A data socket that connects and never sends its handshake is cut off at the
+    /// deadline with `TimedOut`, not waited on forever: otherwise one silent
+    /// same-uid peer (not yet verified — the handshake is read first) pins an
+    /// accept slot indefinitely.
+    #[tokio::test]
+    async fn silent_data_peer_times_out_instead_of_hanging() {
+        let (_silent_peer, mut core) = tokio::io::duplex(64);
+        let err = read_handshake(&mut core, Duration::from_millis(50))
+            .await
+            .expect_err("a silent peer must time out");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    /// A peer that sends only part of the handshake frame (the length prefix, then
+    /// nothing) is cut off the same way.
+    #[tokio::test]
+    async fn half_sent_handshake_times_out() {
+        let (mut peer, mut core) = tokio::io::duplex(64);
+        peer.write_all(&[0, 0, 0, 20]).await.unwrap();
+        let err = read_handshake(&mut core, Duration::from_millis(50))
+            .await
+            .expect_err("a half-sent handshake must time out");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    /// A prompt handshake inside the deadline is read normally, and a peer that
+    /// closes without sending one is `UnexpectedEof`, not a timeout.
+    #[tokio::test]
+    async fn prompt_handshake_is_read_and_early_close_is_eof() {
+        let (mut peer, mut core) = tokio::io::duplex(64);
+        write_data_handshake(&mut peer, DataHandshake { flow_id: 42 })
+            .await
+            .unwrap();
+        assert_eq!(
+            read_handshake(&mut core, Duration::from_secs(5))
+                .await
+                .unwrap(),
+            DataHandshake { flow_id: 42 }
+        );
+
+        let (peer, mut core) = tokio::io::duplex(64);
+        drop(peer);
+        let err = read_handshake(&mut core, Duration::from_secs(5))
+            .await
+            .expect_err("closing before the handshake is an error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// After a split, the reader and the writer work independently over the one
+    /// socket: the reader yields what the provider sent (and counts its bytes), the
+    /// writer's frames reach the provider. This is what lets the feeder read
+    /// `FlowOpen`s while a timer re-sends `Scope` on the same control channel.
+    #[tokio::test]
+    async fn into_halves_reads_and_writes_independently() {
+        let (provider, core) = tokio::net::UnixStream::pair().unwrap();
+        let mut provider = ControlChannel::from_stream(provider);
+        let (mut reader, mut writer) = ControlChannel::from_stream(core).into_halves();
+
+        provider
+            .send(&ControlMessage::Hello(Hello {
+                protocol_version: 1,
+            }))
+            .await
+            .unwrap();
+        writer
+            .send(&ControlMessage::Scope(ScopeSpec {
+                spec: "example.com".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reader.recv().await.unwrap(),
+            Some(ControlMessage::Hello(Hello {
+                protocol_version: 1
+            }))
+        );
+        // 4-byte length prefix + the 32-byte JSON body.
+        assert_eq!(reader.bytes_read(), 36);
+        assert_eq!(
+            provider.recv().await.unwrap(),
+            Some(ControlMessage::Scope(ScopeSpec {
+                spec: "example.com".to_string()
+            }))
+        );
+    }
+
+    /// The bytes already read on the unsplit channel (the Hello the feeder gates on)
+    /// carry over to the reader, so the control/data-separation count stays whole.
+    #[tokio::test]
+    async fn into_halves_keeps_the_bytes_read_so_far() {
+        let (provider, core) = tokio::net::UnixStream::pair().unwrap();
+        let mut provider = ControlChannel::from_stream(provider);
+        let mut core = ControlChannel::from_stream(core);
+        provider
+            .send(&ControlMessage::Hello(Hello {
+                protocol_version: 1,
+            }))
+            .await
+            .unwrap();
+        core.recv().await.unwrap();
+        assert_eq!(core.bytes_read(), 36);
+
+        let (reader, _writer) = core.into_halves();
+        assert_eq!(reader.bytes_read(), 36);
+    }
+
+    /// Dropping both halves closes the socket: the provider sees a clean end of
+    /// stream, not a hang.
+    #[tokio::test]
+    async fn dropping_both_halves_gives_the_provider_a_clean_eof() {
+        let (provider, core) = tokio::net::UnixStream::pair().unwrap();
+        let mut provider = ControlChannel::from_stream(provider);
+        let (reader, writer) = ControlChannel::from_stream(core).into_halves();
+        drop(writer);
+        drop(reader);
+        assert_eq!(provider.recv().await.unwrap(), None);
+    }
 
     /// A `DataConnection` over a connected pair (no path bind) exposes the very
     /// descriptor of its stream, so a peer verifier reads the right socket.

@@ -116,6 +116,34 @@ is run via the Terminal panel after each task.
   - `crates/aitm/src/macos_capture/mod.rs` (modify: add `pub mod feeder;`)
   - `crates/aitm/src/ingress.rs` (modify: extend `one_choke_point_survives_ingress`'s
     scanned set to include `macos_capture/feeder.rs`)
+  - `crates/aitm/src/macos_capture/listener.rs` (modify — **added by the build owner
+    2026-10-30**, see refinement #1): a `ControlChannel::into_halves` split.
+
+- **Build-owner refinements (2026-10-30, from the Task-3 coder's pre-implementation design review; all approved):**
+  1. **`ControlChannel` must split** so the feeder can read `FlowOpen`s and re-send `Scope`
+     on a 1 s timer concurrently. `recv`'s `read_exact` is NOT cancel-safe in `select!`, and
+     the type has no split. Add `pub fn into_halves(self) -> (ControlReader, ControlWriter)`
+     to `listener.rs` via tokio `UnixStream::into_split`; `ControlReader::recv` keeps the
+     codec + `bytes_read`, `ControlWriter::send` keeps the write path. Run peer-verify +
+     `recv_hello` on the UNSPLIT channel first, THEN split; the reader task is only ever
+     cancelled as a whole (never mid-frame), the writer is driven by the poll tick. (~30 lines
+     + a `UnixStream::pair()` test.)
+  2. **`FlowPairing<D = DataConnection>`** generic over the data half, so `pairing_map_is_bounded`
+     and an either-order pairing test run in the sandbox (a real `DataConnection` needs a bind).
+  3. **`spawn_pump` takes a `tokio::sync::watch::Receiver` stop signal** so pumps abort at
+     shutdown (spec LF-AC10); don't rely on a `JoinSet` reap.
+  4. **Shed at the concurrency cap** with `Semaphore::try_acquire_owned` + a log line — never
+     queue (queuing holds sockets open and defeats the fd bound).
+  5. **Run `verifier.verify(...)` under `tokio::task::spawn_blocking`** — it makes
+     Security.framework calls once per data socket; inline would stall a runtime worker.
+  6. **Pairing state is per-attachment, not per-session**, so a reconnecting provider's
+     `flow_id`s can't collide with stale pending entries.
+  7. **Data-accept-stall (follow-up, note in the Review log, NOT a blocker):** `accept_data`
+     reads the handshake before the data peer is verified, so a silent same-uid peer can stall
+     the data-accept path. Mitigate now with a bounded timeout around the handshake read and by
+     structuring the data path so one slow/silent peer cannot stall other flows; a full fix
+     (split accept from handshake in `listener.rs`, verify the fd before reading) is a
+     follow-up. Record the residual in the Review log for the security panel.
 - **Change:**
   - `pub struct CaptureSession` with fields per the spec; `pub fn new(ingress: Arc<CoreIngress>,
     l7_guard: Arc<dyn aitm_core::ScopeRateGuard>, l4_guard: Option<Arc<aitm_proto_l4::guard::L4Guard>>,
@@ -254,6 +282,10 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 2 | build-owner (pre-seed) | — | Workspace `unsafe_code = "forbid"` relaxed to `deny` for `crates/aitm` (one audited `#[allow(unsafe_code)]` getsockopt with `// SAFETY:`) because `forbid` cannot be lifted by `#[allow]` | **FOR THE SECURITY PANEL:** accept this localized relaxation, or isolate the single `getsockopt` into a minimal helper crate to keep the workspace-wide `forbid`. |
+| 3 | build-owner (pre-seed) | Minor | No `recv_hello` timeout: a verified-but-hung provider holds the single control slot until it disconnects, blocking reattachment | **For the panel** — low (the control peer is team-verified first). ~10-line fix (timeout around `recv_hello`) if wanted. |
+| 3 | build-owner (pre-seed) | Minor | Data handshake is read before the data peer is verified; a silent same-uid peer holds an accept slot for the 5 s timeout; ~16 within 5 s could stall the data path (refinement #7 residual) | **For the panel** — low (0700 dir + team-verified control peer). Mitigated now by the 5 s handshake timeout + 16 concurrent accept pipelines; full fix = split accept from handshake and verify the fd before reading. |
+| 3 | build-owner (pre-seed) | info | `rejected_control_peer_gets_no_scope` accepts EOF or `ConnectionReset`; the reset arm (Linux) is unverified on this macOS host (EOF observed 5/5) | accepted — defensive cross-platform arm. |
 
 ## Shipped
 
