@@ -92,8 +92,14 @@ struct ComposeSheet: View {
         }
         .frame(width: 880, height: 560)
         .background(Tok.Ground.surface.color)
-        // Focus only an empty URL field; a template's URL must never open selected.
-        .onAppear { urlFocused = session.composeDraft.url.isEmpty }
+        // Open calm (rule 51): nothing selected. The one exception is an empty URL, which
+        // takes focus a beat after the sheet is key so the calm-open hook does not clear it.
+        .noInitialFocus()
+        .task {
+            guard session.composeDraft.url.isEmpty else { return }
+            try? await Task.sleep(for: .milliseconds(80))
+            urlFocused = true
+        }
     }
 
     private var templates: some View {

@@ -76,26 +76,31 @@ struct ScriptsPanel: View {
             HStack(alignment: .center, spacing: Space.md) {
                 VStack(alignment: .leading, spacing: Space.xs) {
                     HStack(spacing: Space.sm) {
+                        // The name wins the width; the phase chips give way first.
                         Text(script.name).font(Tok.Face.ui(Tok.Typography.Size.md, .medium))
                             .foregroundStyle(Tok.Ink.primary.color).lineLimit(1)
+                            .layoutPriority(1)
                             .help(script.name)
                         ForEach(script.phases, id: \.self) { phase in
                             Badge(text: phase, pair: Self.phaseChip, uppercase: false)
                         }
                     }
-                    Text(script.ruleSummary)
-                        .font(Tok.Face.data(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
-                        .lineLimit(1).truncationMode(.middle)
+                    HStack(spacing: Space.sm) {
+                        Text(script.ruleSummary)
+                            .font(Tok.Face.data(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
+                            .lineLimit(1).truncationMode(.middle)
+                        Spacer(minLength: Space.sm)
+                        // The same word + symbol the detail header uses, so status is never
+                        // colour alone; hue only on the error.
+                        Label(script.statusWord, systemImage: script.statusSymbol)
+                            .labelStyle(.titleAndIcon)
+                            .font(Tok.Face.ui(Tok.Typography.Size.xs, .medium))
+                            .foregroundStyle((script.error != nil ? Tok.Status.serverError : Tok.Ink.secondary).color)
+                            .fixedSize()
+                            .help(script.statusText)
+                    }
                 }
                 Spacer(minLength: Space.sm)
-                // The same word + symbol the detail header uses, so status is never
-                // colour alone; hue only on the error.
-                Label(script.statusWord, systemImage: script.statusSymbol)
-                    .labelStyle(.titleAndIcon)
-                    .font(Tok.Face.ui(Tok.Typography.Size.xs, .medium))
-                    .foregroundStyle((script.error != nil ? Tok.Status.serverError : Tok.Ink.secondary).color)
-                    .fixedSize()
-                    .help(script.statusText)
                 Toggle(script.name, isOn: Binding(get: { script.enabled }, set: { setEnabled(script, $0) }))
                     .toggleStyle(.switch).controlSize(.small).labelsHidden()
                     .accessibilityLabel(script.name)

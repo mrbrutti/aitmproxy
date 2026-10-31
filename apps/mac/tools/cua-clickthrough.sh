@@ -15,6 +15,9 @@ set -u
 cd "${0:A:h}"
 # APP=<binary> runs another build (e.g. the snap-dev bundle /tmp/Aitmproxy-dev.app/Contents/MacOS/Aitmproxy).
 APP="${APP:-$HOME/Applications/Aitmproxy.app/Contents/MacOS/Aitmproxy}"
+# PROC=<process name> when APP is a tagged snap-dev bundle (Aitmproxy-<tag>), so System Events
+# addresses this build and not the installed app that may be running beside it.
+PROC="${PROC:-${APP:t}}"
 rm -rf "$HOME/Library/Saved Application State/com.mrbrutti.aitmproxy.savedState"
 APP_FIXTURES=1 APP_STORE=/tmp/Aitmproxy-cua "$APP" >/tmp/aitm-app-cua.log 2>&1 &
 PID=$!
@@ -22,12 +25,12 @@ sleep 6
 fail=0
 pass() { print "PASS $1" }
 bad()  { print "FAIL $1"; fail=1 }
-se() { osascript -e "tell application \"System Events\" to tell process \"Aitmproxy\" to $1" 2>/dev/null }
-osascript -e 'tell application "Aitmproxy" to activate' >/dev/null 2>&1; sleep 1
+se() { osascript -e "tell application \"System Events\" to tell process \"$PROC\" to $1" 2>/dev/null }
+se 'set frontmost to true' >/dev/null; sleep 1
 
 # --- normalize window to a known origin so pixel math is deterministic ---
 OX=100; OY=100
-size=$(osascript -e "tell application \"System Events\" to tell process \"Aitmproxy\"
+size=$(osascript -e "tell application \"System Events\" to tell process \"$PROC\"
   set position of window 1 to {$OX, $OY}
   delay 0.3
   set s to size of window 1

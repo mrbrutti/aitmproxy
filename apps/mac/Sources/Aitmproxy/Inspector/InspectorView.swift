@@ -208,8 +208,10 @@ struct PaneTabs<Tab: Hashable & CustomStringConvertible, Trailing: View>: View {
                 }
                 .frame(minWidth: 72, minHeight: Tok.Size.tabBar, maxHeight: Tok.Size.tabBar)
                 .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { tabsFrameWidth = $0 }
-                .onAppear { proxy.scrollTo(selected, anchor: .leading) }
-                .onChange(of: selected) { _, tab in proxy.scrollTo(tab, anchor: .leading) }
+                // No anchor: scroll only as far as needed to reveal the tab, so a selected
+                // early tab never pushes "Headers" half off the leading edge.
+                .onAppear { proxy.scrollTo(selected) }
+                .onChange(of: selected) { _, tab in proxy.scrollTo(tab) }
             }
             if tabsOverflow {
                 overflowMenu

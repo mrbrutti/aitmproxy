@@ -26,17 +26,23 @@ stale=$(find "$here/Sources" -name '*.swift' -newer "$bin" | head -1)
 [[ -z "$stale" ]] || { echo "build failed: binary is older than $stale"; exit 1; }
 
 dev="/tmp/$name-dev$tag.app"
+# With a tag the executable is "Aitmproxy-<tag>", so its process name differs from the installed
+# app's and computer-use scripts (System Events, cgclick) can target this build while the real
+# one keeps running. The bundle id stays the same so the fixture/snapshot defaults are shared.
+exe="$name$tag"
 installed="$HOME/Applications/$name.app"
 rm -rf "$dev"
 mkdir -p "$dev/Contents/MacOS" "$dev/Contents/Resources"
-cp "$bin" "$dev/Contents/MacOS/$name"
+cp "$bin" "$dev/Contents/MacOS/$exe"
 if [[ -f "$installed/Contents/Info.plist" ]]; then
-  cp "$installed/Contents/Info.plist" "$dev/Contents/Info.plist"
+  plutil -convert xml1 -o "$dev/Contents/Info.plist" "$installed/Contents/Info.plist"
   cp "$installed/Contents/Resources/"*.icns "$dev/Contents/Resources/" 2>/dev/null || true
   cp "$installed/Contents/Resources/"*.car "$dev/Contents/Resources/" 2>/dev/null || true
 else
   sed -e "s/__BUILD__/0/" -e "s/__VERSION__/0.0.0-dev/" "$here/Info.plist.in" > "$dev/Contents/Info.plist"
 fi
+plutil -replace CFBundleExecutable -string "$exe" "$dev/Contents/Info.plist"
+echo "== bundle $dev ($exe)"
 
 store="/tmp/$name-dev-state$tag"
 shots="/tmp/$name-shots-dev$tag"
@@ -44,6 +50,6 @@ rm -rf "$HOME/Library/Saved Application State/com.mrbrutti.aitmproxy.savedState"
 mkdir -p "$store"
 [[ -n "$pages" ]] && export APP_SNAPSHOT_PAGES="$pages"
 echo "== snapshot ${pages:-all} -> $shots"
-APP_STORE="$store" APP_FIXTURES=1 APP_SNAPSHOT="$shots" "$dev/Contents/MacOS/$name"
+APP_STORE="$store" APP_FIXTURES=1 APP_SNAPSHOT="$shots" "$dev/Contents/MacOS/$exe"
 echo "== done: $shots"
 ls "$shots" 2>/dev/null

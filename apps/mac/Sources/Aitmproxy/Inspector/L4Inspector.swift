@@ -36,7 +36,7 @@ struct L4Inspector: View {
                            gate: gate, onForward: { interceptVerb("l4.intercept.forward") },
                            onDrop: { interceptVerb("l4.intercept.drop") })
             if let detail {
-                SplitPane(axis: .vertical, firstMinimum: 140, secondMinimum: 200, initialSecondFraction: 0.5,
+                SplitPane(axis: .vertical, firstMinimum: 140, secondMinimum: 280, initialSecondFraction: 0.5,
                           autosaveName: "inspector.l4") {
                     L4PacketList(detail: detail, selected: $selected).environment(session).themed()
                 } second: {
