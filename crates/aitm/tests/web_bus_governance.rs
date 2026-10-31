@@ -72,6 +72,8 @@ fn temp_ca_dir(tag: &str) -> PathBuf {
 struct Server {
     addr: SocketAddr,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    /// The CA directory `assemble` wrote key material into; removed on drop.
+    ca_dir: PathBuf,
     /// Kept alive for the test: the registry and store behind the served bridge.
     _proxy: Proxy,
 }
@@ -79,6 +81,7 @@ struct Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.task.abort();
+        let _ = std::fs::remove_dir_all(&self.ca_dir);
     }
 }
 
@@ -92,15 +95,15 @@ async fn start(tag: &str, policy: AgentPolicy) -> Server {
     let assembled = assemble(&cfg).expect("assemble");
     let services = tui::services(&assembled.proxy, &cfg, None, TuiLog::Off);
     let web_server = tui::server(&cfg, cfg.mcp.transport.clone(), &services);
-    let state = Arc::clone(&assembled.agent_state);
-    let ring = Arc::clone(&assembled.audit_ring);
-    let web_server = tui::with_shared_governance(web_server, &state, &ring); // MUTATION-POINT
+    let agent_state = &assembled.agent_state;
+    let audit_ring = &assembled.audit_ring;
+    let web_server = tui::with_shared_governance(web_server, agent_state, audit_ring); // MUTATION-POINT: deleting this line must turn the governance tests red (spec AC12)
     let web_server = web_server
         .with_push(assembled.push_tx.clone())
         .with_approval_timeout(TIMEOUT);
     let mcp = Arc::new(web_server);
     mcp.spawn_push_dispatcher();
-    let state = Arc::new(WebState {
+    let web_state = Arc::new(WebState {
         mcp,
         agent_token: AGENT_TOKEN.to_owned(),
         operator_token: Some(OPERATOR_TOKEN.to_owned()),
@@ -109,10 +112,11 @@ async fn start(tag: &str, policy: AgentPolicy) -> Server {
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("local addr");
-    let task = tokio::spawn(web::serve(listener, state));
+    let task = tokio::spawn(web::serve(listener, web_state));
     Server {
         addr,
         task,
+        ca_dir: cfg.ca.dir.clone(),
         _proxy: assembled.proxy,
     }
 }

@@ -81,7 +81,7 @@ fn rig(tag: &str) -> Rig {
     let primary = primary.with_approval_timeout(APPROVAL_TIMEOUT);
 
     let web = tui::server(&cfg, cfg.mcp.transport.clone(), &services);
-    let web = tui::with_shared_governance(web, state, ring); // MUTATION-POINT
+    let web = tui::with_shared_governance(web, state, ring); // MUTATION-POINT: deleting this line must turn the governance tests red (spec AC12)
     let web = web.with_approval_timeout(APPROVAL_TIMEOUT);
 
     Rig {
@@ -109,6 +109,36 @@ fn text_of(reply: &JsonValue) -> &str {
     reply["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or_default()
+}
+
+/// Wait for the parked call on `agent` to finish and assert its final result is
+/// the operator's denial (`isError` true, with the denial text). Returns nothing.
+fn assert_denied(agent: JoinHandle<JsonValue>) {
+    let reply = agent.join().expect("the agent thread");
+    assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
+    assert!(
+        text_of(&reply).contains("an operator denied the parked sensitive command"),
+        "{reply}"
+    );
+}
+
+/// Run `f` against `srv` on its own thread and return its reply, which it must
+/// give within [`FAST`]. A call that parks instead of refusing blocks its thread
+/// and never replies, so a timeout here is that failure; `what` names the call
+/// in the panic message.
+fn reply_within_fast(
+    srv: &Arc<McpServer>,
+    what: &str,
+    f: impl FnOnce(&McpServer) -> JsonValue + Send + 'static,
+) -> JsonValue {
+    let (tx, rx) = mpsc::channel();
+    let srv = Arc::clone(srv);
+    std::thread::spawn(move || {
+        let _ = tx.send(f(&srv));
+    });
+    rx.recv_timeout(FAST).unwrap_or_else(|_| {
+        panic!("{what} did not return within {FAST:?}: it parked instead of refusing")
+    })
 }
 
 /// An operator connection with a push sink, subscribed on `srv` (`flow.subscribe
@@ -180,9 +210,11 @@ fn announced_request(
         Some(request) => (request, agent),
         None if agent.is_finished() => {
             let reply = agent.join().expect("the agent thread");
-            panic!("no approval_requested within 5s; the agent call already returned: {reply}")
+            panic!(
+                "no approval_requested within {FAST:?}; the agent call already returned: {reply}"
+            )
         }
-        None => panic!("no approval_requested within 5s; the agent call is still running"),
+        None => panic!("no approval_requested within {FAST:?}; the agent call is still running"),
     }
 }
 
@@ -206,7 +238,7 @@ fn request_id_of(request: &JsonValue) -> String {
 /// is refused at once (a 60 s approval timeout is not waited out), and nothing
 /// is announced to the primary's operator.
 ///
-/// Tester: the last block is a control. "Nothing is announced to the primary's
+/// The last block is a control. "Nothing is announced to the primary's
 /// operator" only means something if that operator's sink can hear an
 /// announcement at all, so a primary agent call is then parked and the same
 /// sink must be told.
@@ -215,22 +247,16 @@ fn no_operator_on_the_web_server_refuses_a_web_call_at_once() {
     let rig = rig("no-web-operator");
     let (p_operator, p_sink) = subscribe_operator(&rig.primary);
 
-    let (tx, rx) = mpsc::channel();
-    let web = Arc::clone(&rig.web);
-    std::thread::spawn(move || {
-        let _ = tx.send(agent_scope_add(&web));
-    });
-    let reply = rx.recv_timeout(FAST).unwrap_or_else(|_| {
-        panic!("the web call did not return within 5s: it parked instead of refusing")
-    });
+    let reply = reply_within_fast(&rig.web, "the web call", agent_scope_add);
 
     assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
     assert!(
         text_of(&reply).contains("no operator is connected to approve it"),
         "refused for want of a web operator: {reply}"
     );
-    assert!(
-        wait_for_approval_request(&p_sink, QUIET).is_none(),
+    assert_eq!(
+        wait_for_approval_request(&p_sink, QUIET),
+        None,
         "nothing is announced to the primary's operator"
     );
 
@@ -245,11 +271,7 @@ fn no_operator_on_the_web_server_refuses_a_web_call_at_once() {
         json!({"request_id": request_id, "allow": false}),
     );
     assert_eq!(denied["result"]["isError"], json!(false), "{denied}");
-    let primary_reply = primary_agent.join().expect("the primary agent thread");
-    assert!(
-        text_of(&primary_reply).contains("an operator denied the parked sensitive command"),
-        "{primary_reply}"
-    );
+    assert_denied(primary_agent);
 }
 
 /// AC10: an operator subscribed on the web server is announced the web agent's
@@ -271,13 +293,7 @@ fn an_operator_on_the_web_server_is_asked_and_resolves_on_the_web_server() {
         json!({"request_id": request_id, "allow": false}),
     );
     assert_eq!(approve["result"]["isError"], json!(false), "{approve}");
-
-    let reply = agent.join().expect("the agent thread");
-    assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
-    assert!(
-        text_of(&reply).contains("an operator denied the parked sensitive command"),
-        "{reply}"
-    );
+    assert_denied(agent);
 }
 
 /// AC11: an `agent.approve` for a call parked on the web server, sent to the
@@ -321,26 +337,10 @@ fn an_approve_sent_to_the_primary_approves_nothing_parked_on_the_web_server() {
         json!({"request_id": request_id, "allow": false}),
     );
     assert_eq!(denied["result"]["isError"], json!(false), "{denied}");
-    let reply = agent.join().expect("the agent thread");
-    assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
-    assert!(
-        text_of(&reply).contains("an operator denied the parked sensitive command"),
-        "{reply}"
-    );
+    assert_denied(agent);
 }
 
-/// Wait for `agent` to finish and return its reply: the parked call's final
-/// result, which every test below must find to be the operator's denial.
-fn assert_denied(agent: JoinHandle<JsonValue>) {
-    let reply = agent.join().expect("the agent thread");
-    assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
-    assert!(
-        text_of(&reply).contains("an operator denied the parked sensitive command"),
-        "{reply}"
-    );
-}
-
-/// Tester, privilege edge: `Ask` can now park on the web server, so the web agent
+/// Privilege edge: `Ask` can now park on the web server, so the web agent
 /// can see a parked request on its own server. It must still not be able to
 /// approve it. A second agent connection (the agent bridge token) sends
 /// `agent.approve allow:true` for the parked call: it is the role refusal, and
@@ -381,7 +381,7 @@ fn a_web_agent_cannot_approve_its_own_parked_call() {
     assert_denied(agent);
 }
 
-/// Tester, privilege edge: under `ask` the web agent cannot rewrite the policy.
+/// Privilege edge: under `ask` the web agent cannot rewrite the policy.
 /// `agent.set` is operator-only, so it is refused outright (it never parks for
 /// approval, even with an operator subscribed to approve it), the reason names
 /// the `ask` policy the web gate now enforces, and the policy is unchanged.
@@ -390,27 +390,22 @@ fn a_web_agent_cannot_change_the_policy_under_ask() {
     let rig = rig("agent-set");
     let (w_operator, w_sink) = subscribe_operator(&rig.web);
 
-    let (tx, rx) = mpsc::channel();
-    let web = Arc::clone(&rig.web);
-    std::thread::spawn(move || {
-        let reply = call(
-            &web,
+    let reply = reply_within_fast(&rig.web, "agent.set", |web| {
+        call(
+            web,
             &ConnCtx::new(Frontend::Mcp),
             "agent.set",
             json!({"policy": "all"}),
-        );
-        let _ = tx.send(reply);
-    });
-    let reply = rx.recv_timeout(FAST).unwrap_or_else(|_| {
-        panic!("agent.set did not return within 5s: it parked instead of refusing")
+        )
     });
     assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
     assert!(
         text_of(&reply).contains("under the `ask` policy"),
         "refused under the shared `ask` policy: {reply}"
     );
-    assert!(
-        wait_for_approval_request(&w_sink, QUIET).is_none(),
+    assert_eq!(
+        wait_for_approval_request(&w_sink, QUIET),
+        None,
         "an operator-only command is refused, never parked for approval"
     );
 
@@ -423,7 +418,7 @@ fn a_web_agent_cannot_change_the_policy_under_ask() {
     );
 }
 
-/// Tester, malformed input: an operator `agent.approve` that is missing a field,
+/// Malformed input: an operator `agent.approve` that is missing a field,
 /// has the wrong type for one, or names no parked request is an error and
 /// resolves nothing; the call stays parked until a well-formed approve arrives.
 #[test]
@@ -476,7 +471,7 @@ fn a_malformed_approve_resolves_nothing_and_the_call_stays_parked() {
     assert_denied(agent);
 }
 
-/// Tester, connection drop: the web operator subscribes (the call parks and is
+/// Connection drop: the web operator subscribes (the call parks and is
 /// announced, so the subscription is live), then its connection ends and the
 /// transport drops its subscriptions. A later web agent call must be refused at
 /// once with no operator to approve it, not parked for the full approval timeout
@@ -500,21 +495,19 @@ fn a_web_call_is_refused_at_once_once_the_web_operator_disconnects() {
 
     rig.web.drop_connection(w_operator.conn_id);
 
-    let (tx, rx) = mpsc::channel();
-    let web = Arc::clone(&rig.web);
-    std::thread::spawn(move || {
-        let _ = tx.send(agent_scope_add(&web));
-    });
-    let reply = rx.recv_timeout(FAST).unwrap_or_else(|_| {
-        panic!("the web call did not return within 5s: it parked behind a dropped operator")
-    });
+    let reply = reply_within_fast(
+        &rig.web,
+        "the web call after its operator dropped",
+        agent_scope_add,
+    );
     assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
     assert!(
         text_of(&reply).contains("no operator is connected to approve it"),
         "refused for want of a web operator: {reply}"
     );
-    assert!(
-        wait_for_approval_request(&w_sink, QUIET).is_none(),
+    assert_eq!(
+        wait_for_approval_request(&w_sink, QUIET),
+        None,
         "nothing is announced to a connection that has gone"
     );
 }

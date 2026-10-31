@@ -94,11 +94,9 @@ pub struct Assembled {
     pub listening: Arc<std::sync::atomic::AtomicBool>,
     /// The agent policy state, seeded from `cfg.mcp.policy` and shared with the
     /// `AgentPlugin` already registered, so a server's policy gate reads the same
-    /// policy `agent.set` writes. Apply it with `tui::with_shared_governance` to
-    /// **every agent-facing server** (the primary and the `aitm web` bridge
-    /// server). It does not share the `Ask` approval hub: each server parks and
-    /// approves its own calls, so `agent.approve` resolves only calls parked on
-    /// the same server.
+    /// policy `agent.set` writes. Apply it to both servers the bare-`aitm` server
+    /// run builds (the primary and the `aitm web` bridge server). The `Ask`
+    /// approval hub is not shared; see `tui::with_shared_governance`.
     pub agent_state: Arc<AgentState>,
     /// The F4 push broadcast: the `SubscriptionPlugin` registered in the chain
     /// forwards lifecycle events to it; hand it to `McpServer::with_push` so the
@@ -106,11 +104,10 @@ pub struct Assembled {
     pub push_tx: tokio::sync::broadcast::Sender<aitm_core::Event>,
     /// The F2 command-invocation audit ring, shared with the `AgentPlugin`
     /// already registered (which serves `agent.activity`/`agent.status` from it),
-    /// so a server's `call_tool` records into the same ring. Apply it with
-    /// `tui::with_shared_governance` to **every agent-facing server** (the
-    /// primary and the `aitm web` bridge server). It does not share the `Ask`
-    /// approval hub: each server parks and approves its own calls, so
-    /// `agent.approve` resolves only calls parked on the same server.
+    /// so a server's `call_tool` records into the same ring. Apply it to both
+    /// servers the bare-`aitm` server run builds (the primary and the `aitm web`
+    /// bridge server). The `Ask` approval hub is not shared; see
+    /// `tui::with_shared_governance`.
     pub audit_ring: Arc<AuditRing>,
     /// The protocol-general capture/ingress boundary (L4OPS-AC17). Its stream/TCP half
     /// is wired for every build (from the live proxy's shared modules, store, chain,

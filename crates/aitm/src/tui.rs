@@ -136,9 +136,11 @@ pub fn services(
 /// not here, because they differ by surface: the bare-`aitm` server path and
 /// the `aitm tui` loopback **agent** transport carry the gate (seeded from
 /// `mcp.policy`); the TUI's own in-process server is the operator and bypasses
-/// it (see [`build_servers`]). For an agent-facing server the gate and the
-/// audit ring come from [`with_shared_governance`], the other half of "wired by
-/// the caller".
+/// it (see [`build_servers`]). Both servers the bare-`aitm` server run builds
+/// (the primary and the `aitm web` bridge server) take the shared gate and audit
+/// ring from [`with_shared_governance`], the other half of "wired by the
+/// caller". The `aitm tui` loopback agent server does not use it yet (see
+/// [`build_servers`]).
 pub fn server(cfg: &Config, transport: McpTransport, services: &Services) -> McpServer {
     McpServer::new(services.registry.clone(), transport)
         .with_ssrf_policy(cfg.browser.ssrf.clone())
@@ -159,8 +161,8 @@ pub fn server(cfg: &Config, transport: McpTransport, services: &Services) -> Mcp
 }
 
 /// Apply the shared agent policy and audit ring to `server`: the one function
-/// production (`main.rs`) and the tests share, so a test rig cannot pass while
-/// the binary is wired differently.
+/// `main.rs` and the tests both call, so the tests exercise the wiring the
+/// binary applies.
 ///
 /// It shares **exactly** two things, the policy state (`agent_state`, which the
 /// `AgentPlugin`'s `agent.set` writes and the server's gate reads) and the audit
@@ -176,7 +178,9 @@ pub fn server(cfg: &Config, transport: McpTransport, services: &Services) -> Mcp
 /// request" error and approves nothing.
 ///
 /// Residual risk: this makes tests and production share a function, not a
-/// guarantee. It cannot force a future third server to call it.
+/// guarantee. The tests never run `main.rs` itself, so deleting the wrapper
+/// there would leave them green, and the function cannot force a future third
+/// server to call it.
 pub fn with_shared_governance(
     server: McpServer,
     agent_state: &Arc<AgentState>,
@@ -268,6 +272,11 @@ pub fn build_servers(cfg: &Config, services: Services) -> (Option<McpServer>, In
         // server path.
         McpTransport::LoopbackTcp { .. } | McpTransport::StreamableHttp { .. } => Some(
             server(cfg, cfg.mcp.transport.clone(), &services)
+                // Not yet on `with_shared_governance`: this is a fresh
+                // `AgentState`, not the `AgentPlugin`'s, so in `aitm tui` an
+                // operator's `agent.set` does not reach this gate. Known gap,
+                // follow-up "tui-mode governance" (spec
+                // 2026-10-30-web-bus-agent-governance, Design 7).
                 .with_agent_state(Arc::new(AgentState::new(cfg.mcp.policy)))
                 .with_mcp_roles(cfg.mcp.operator_token.clone(), cfg.mcp.stdio_role),
         ),
