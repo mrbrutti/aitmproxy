@@ -23,7 +23,7 @@ struct FlowTableView: NSViewRepresentable {
     /// The row the inspector should follow (the last clicked one).
     var onFocus: (FlowID?) -> Void
     /// A verb from the keyboard or the context menu, with the row it targets.
-    var onAction: (FlowRowAction, FlowID) -> Void = { _, _ in }
+    var onAction: (FlowVerb, FlowID) -> Void = { _, _ in }
     /// Pending draft edits per flow: the row menu titles Resume vs Apply & Resume from the same
     /// predicate as the intercept bar and the Flow menu.
     @Environment(Session.self) private var session
@@ -38,8 +38,10 @@ struct FlowTableView: NSViewRepresentable {
         table.onVerb = { [weak coordinator] verb in coordinator?.perform(verb) }
         table.onToggleIntercept = { [weak coordinator] in coordinator?.parent.onToggleIntercept() }
         table.onCompose = { [weak coordinator] in coordinator?.parent.onCompose() }
+        table.listUndoManager = session.flowUndoManager
         table.menu = coordinator.makeRowMenu()
         table.rowHeight = density.rowHeight
+        // Zero spacing: the column fit below sums widths alone.
         table.intercellSpacing = .zero
         table.style = .plain
         table.usesAlternatingRowBackgroundColors = false
@@ -57,6 +59,9 @@ struct FlowTableView: NSViewRepresentable {
 
         let layout = layoutURL.flatMap(ColumnLayout.load) ?? ColumnLayout()
         let order = layout.resolvedOrder(known: FlowColumn.allCases.map(\.rawValue)).compactMap(FlowColumn.init(rawValue:))
+        coordinator.userHidden = Set(order.filter { column in
+            (layout.widths.isEmpty ? column.defaultHidden : layout.isHidden(column.rawValue)) && !column.alwaysVisible
+        })
         for column in order {
             let c = NSTableColumn(identifier: column.identifier)
             c.title = column.title
@@ -69,7 +74,7 @@ struct FlowTableView: NSViewRepresentable {
             c.headerCell = FlowHeaderCell(textCell: column.title)
             c.headerCell.alignment = column.numeric ? .right : .left
             c.headerToolTip = column.sortKey.map { "Sort by \($0.title)" }
-            c.isHidden = (layout.widths.isEmpty ? column.defaultHidden : layout.isHidden(column.rawValue)) && !column.alwaysVisible
+            c.isHidden = coordinator.userHidden.contains(column)
             if let key = column.sortKey {
                 c.sortDescriptorPrototype = NSSortDescriptor(key: key.rawValue, ascending: true)
             }
@@ -147,6 +152,11 @@ struct FlowTableView: NSViewRepresentable {
         /// True while `updateNSView` pushes SwiftUI's selection or sort into the table.
         var syncing = false
         private var saveTask: Task<Void, Never>?
+        /// Columns the user hid (the header menu's check marks and `columns.json`).
+        var userHidden: Set<FlowColumn> = []
+        /// Columns hidden to fit the pane (S-008): kept apart from the user's set so the header
+        /// menu stays truthful; they come back when the pane widens.
+        private(set) var autoHidden: Set<FlowColumn> = []
 
         init(_ parent: FlowTableView) {
             self.parent = parent
@@ -197,17 +207,28 @@ struct FlowTableView: NSViewRepresentable {
         // MARK: Row actions (S-010, S-014, S-017)
 
         /// The row a verb targets: the clicked row for the context menu, else the focused/last selected one.
-        private var targetRow: FlowRow? {
+        var targetRow: FlowRow? {
             guard let table else { return nil }
             if table.clickedRow >= 0, rows.indices.contains(table.clickedRow) { return rows[table.clickedRow] }
             if let last = table.selectedRowIndexes.last, rows.indices.contains(last) { return rows[last] }
             return nil
         }
 
-        func perform(_ action: FlowRowAction) {
+        /// The verb table's view of `row` inside this list (its own selection, not the session's).
+        func verbContext(for row: FlowRow) -> VerbContext {
+            let selected = table.map { t in t.selectedRowIndexes.compactMap { rows.indices.contains($0) ? rows[$0] : nil } } ?? []
+            return VerbContext(row: row,
+                               pendingEdits: pendingEdits(row.id),
+                               pinned: parent.isPinned(row.authority),
+                               selectedCount: selected.count,
+                               selectedPausedCount: selected.filter { $0.state == .paused }.count)
+        }
+
+        func perform(_ action: FlowVerb) {
             guard let row = targetRow else { return }
-            if case .mark(nil) = action, let table, let index = rows.firstIndex(of: row) {
-                // `m` opens the mark menu at the row.
+            if case .mark(nil) = action, let table, let index = rows.firstIndex(of: row),
+               VerbTable.item(action, for: verbContext(for: row)).enabled {
+                // `m` opens the mark menu at the row; an off verb falls through so the session reports why.
                 let menu = markMenu(for: row)
                 let rect = table.rect(ofRow: index)
                 menu.popUp(positioning: nil, at: NSPoint(x: rect.minX + 60, y: rect.maxY), in: table)
@@ -220,44 +241,8 @@ struct FlowTableView: NSViewRepresentable {
             parent.onAction(action, row.id)
         }
 
-        private var rowMenu: NSMenu?
-
-        func makeRowMenu() -> NSMenu {
-            let menu = NSMenu(title: "Flow")
-            menu.delegate = self
-            rowMenu = menu
-            return menu
-        }
-
-        private func markMenu(for row: FlowRow) -> NSMenu {
-            let menu = NSMenu(title: "Mark")
-            for color in MarkColor.allCases {
-                let item = NSMenuItem(title: color.title, action: #selector(markChosen(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = color.rawValue
-                item.state = row.mark == color ? .on : .off
-                let swatch = NSImage(size: NSSize(width: 12, height: 12), flipped: false) { rect in
-                    color.color.setFill()
-                    NSBezierPath(roundedRect: rect, xRadius: 3, yRadius: 3).fill()
-                    return true
-                }
-                item.image = swatch
-                menu.addItem(item)
-            }
-            menu.addItem(.separator())
-            let clear = NSMenuItem(title: "Clear Mark", action: #selector(markChosen(_:)), keyEquivalent: "")
-            clear.target = self
-            clear.isEnabled = row.mark != nil
-            menu.addItem(clear)
-            return menu
-        }
-
-        @objc private func markChosen(_ sender: NSMenuItem) {
-            guard let row = targetRow else { return }
-            let color = (sender.representedObject as? String).flatMap(MarkColor.init(rawValue:))
-            parent.onAction(.mark(color), row.id)
-        }
-
+        /// The row's context menu; built on open in `FlowTableView+Menus.swift`.
+        var rowMenu: NSMenu?
         private var commentPopover: NSPopover?
 
         private func showCommentPopover(for row: FlowRow, at rect: NSRect, in table: NSTableView) {
@@ -302,111 +287,27 @@ struct FlowTableView: NSViewRepresentable {
 
         // MARK: Columns (S-008)
 
-        func makeColumnsMenu() -> NSMenu {
-            let menu = NSMenu(title: "Columns")
-            menu.delegate = self
-            return menu
-        }
-
-        /// Rebuilt on open, so check marks follow the current layout.
-        func menuNeedsUpdate(_ menu: NSMenu) {
-            if menu === rowMenu { return buildRowMenu(menu) }
-            menu.removeAllItems()
-            for column in FlowColumn.allCases {
-                let item = NSMenuItem(title: column.menuTitle, action: #selector(toggleColumn(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = column.rawValue
-                item.state = isVisible(column) ? .on : .off
-                item.isEnabled = !column.alwaysVisible
-                menu.addItem(item)
-            }
-            menu.addItem(.separator())
-            let reset = NSMenuItem(title: "Reset Columns", action: #selector(resetColumns), keyEquivalent: "")
-            reset.target = self
-            menu.addItem(reset)
-        }
-
-        /// The row's context menu: every verb, with its key printed (foundation §2.7).
-        private func buildRowMenu(_ menu: NSMenu) {
-            menu.removeAllItems()
-            guard let row = targetRow else { return }
-            func add(_ title: String, _ action: FlowRowAction, key: String = "", enabled: Bool = true) {
-                let item = NSMenuItem(title: title, action: #selector(rowMenuChosen(_:)), keyEquivalent: key)
-                item.keyEquivalentModifierMask = []
-                item.target = self
-                item.representedObject = action
-                item.isEnabled = enabled && row.inScope
-                menu.addItem(item)
-            }
-            let paused = row.state == .paused
-            // One predicate with the bar and the Flow menu: pending drafts, not the applied flag.
-            add(pendingEdits(row.id) > 0 ? "Apply & Resume" : "Resume", .resume, enabled: paused)
-            add("Edit Paused Request", .edit, key: "e", enabled: paused)
-            add(paused || row.state == .pending ? "Kill" : "Delete", .delete, key: "d")
-            menu.addItem(.separator())
-            add("Replay", .replay, key: "r")
-            add("Edit & Replay…", .editAndReplay)
-            add("Build PoC from Flow…", .buildPoC, key: "p")
-            if let table, table.selectedRowIndexes.count > 1 {
-                menu.addItem(.separator())
-                let n = table.selectedRowIndexes.count
-                add("Resume \(n) Selected", .resumeSelected)
-                add("Kill \(n) Selected", .killSelected)
-            }
-            menu.addItem(.separator())
-            let mark = NSMenuItem(title: "Mark", action: nil, keyEquivalent: "")
-            mark.submenu = markMenu(for: row)
-            menu.addItem(mark)
-            add(row.comment == nil ? "Comment…" : "Edit Comment…", .comment, key: "c")
-            menu.addItem(.separator())
-            let pinned = parent.isPinned(row.authority)
-            add(pinned ? "Unpin Host" : "Pin Host", .pinHost)
-            add("Copy URL", .copyURL)
-            if !row.inScope {
-                menu.addItem(.separator())
-                let note = NSMenuItem(title: "Out of scope — add \(row.authority) to scope to act", action: nil, keyEquivalent: "")
-                note.isEnabled = false
-                menu.addItem(note)
-            }
-        }
-
-        @objc private func rowMenuChosen(_ sender: NSMenuItem) {
-            guard let action = sender.representedObject as? FlowRowAction else { return }
-            perform(action)
-        }
-
-        private func isVisible(_ column: FlowColumn) -> Bool {
-            table?.tableColumn(withIdentifier: column.identifier)?.isHidden == false
-        }
-
-        @objc private func toggleColumn(_ sender: NSMenuItem) {
-            guard let id = sender.representedObject as? String, let column = FlowColumn(rawValue: id), !column.alwaysVisible,
-                  let tableColumn = table?.tableColumn(withIdentifier: column.identifier) else { return }
-            tableColumn.isHidden.toggle()
-            fitURLColumn()
-            saveLayoutSoon()
-        }
-
-        @objc private func resetColumns() {
-            guard let table else { return }
-            for (index, column) in FlowColumn.allCases.enumerated() {
-                guard let tableColumn = table.tableColumn(withIdentifier: column.identifier) else { continue }
-                tableColumn.isHidden = false
-                tableColumn.width = column.width
-                let current = table.column(withIdentifier: column.identifier)
-                if current != index, current >= 0 { table.moveColumn(current, toColumn: index) }
-            }
-            if let url = parent.layoutURL { try? FileManager.default.removeItem(at: url) }
-            fitURLColumn()
-        }
-
-        /// The URL column takes whatever width the other visible columns leave, so the table
-        /// always fits its clip: no horizontal scroll bar after a side panel opens, a layout
-        /// change, or a column toggle. AppKit's own column autoresizing only re-tiles on some
-        /// frame changes and never when a saved layout is replayed, so the fit is explicit.
-        func fitURLColumn() {
+        /// Fits the columns to the pane: first the low-priority columns go (`FlowColumn.autoHidePriority`)
+        /// until the fixed columns plus the URL minimum fit the clip, then the URL column takes
+        /// whatever width the visible columns leave. So the table always fits its clip: no
+        /// horizontal scroll bar after a side panel opens, a layout change, or a column toggle.
+        /// AppKit's own column autoresizing only re-tiles on some frame changes and never when a
+        /// saved layout is replayed, so the fit is explicit.
+        func fitColumns() {
             guard let table, let clip = table.enclosingScrollView?.contentView,
                   let url = table.tableColumn(withIdentifier: FlowColumn.url.identifier), !url.isHidden else { return }
+            let fixed = table.tableColumns.compactMap { c -> ColumnFit.Column? in
+                guard let column = FlowColumn(rawValue: c.identifier.rawValue), column != .url else { return nil }
+                return ColumnFit.Column(id: column.rawValue, width: c.width, userHidden: userHidden.contains(column))
+            }
+            let hide = ColumnFit.autoHidden(available: clip.bounds.width, columns: fixed, flexibleMin: url.minWidth,
+                                            priority: FlowColumn.autoHidePriority.map(\.rawValue))
+            autoHidden = Set(hide.compactMap(FlowColumn.init(rawValue:)))
+            for c in table.tableColumns {
+                guard let column = FlowColumn(rawValue: c.identifier.rawValue) else { continue }
+                let hidden = userHidden.contains(column) || autoHidden.contains(column)
+                if c.isHidden != hidden { c.isHidden = hidden }
+            }
             let visible = table.tableColumns.filter { !$0.isHidden }
             let others = visible.filter { $0 !== url }.reduce(CGFloat(0)) { $0 + $1.width }
             let spacing = CGFloat(visible.count) * table.intercellSpacing.width
@@ -421,7 +322,7 @@ struct FlowTableView: NSViewRepresentable {
         }
 
         @objc private func clipResized(_ note: Notification) {
-            fitURLColumn()
+            fitColumns()
         }
 
         func observeColumns(_ table: NSTableView) {
@@ -435,7 +336,7 @@ struct FlowTableView: NSViewRepresentable {
         }
 
         /// Resizes fire many times a second; one write a beat after the last change.
-        private func saveLayoutSoon() {
+        func saveLayoutSoon() {
             saveTask?.cancel()
             saveTask = Task { [weak self] in
                 try? await Task.sleep(for: .milliseconds(300))
@@ -451,7 +352,8 @@ struct FlowTableView: NSViewRepresentable {
                 layout.order.append(column.identifier.rawValue)
                 // The flexible URL column's width is derived from the pane, never persisted.
                 if column.identifier != FlowColumn.url.identifier { layout.widths[column.identifier.rawValue] = column.width }
-                if column.isHidden { layout.hidden.insert(column.identifier.rawValue) }
+                // Only the user's choice persists; a column hidden to fit the pane comes back on its own.
+                if let id = FlowColumn(rawValue: column.identifier.rawValue), userHidden.contains(id) { layout.hidden.insert(id.rawValue) }
             }
             return layout
         }

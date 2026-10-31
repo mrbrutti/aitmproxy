@@ -127,4 +127,18 @@ Each file is plain Rhai using the host API in `docs/design/languages/rhai.api.js
 Passive detectors use the `on_request` / `on_response` / `on_ws_*` hooks and
 `finding(#{ … })`. Active/L4 scripts register a command in `load(reg)` and call
 the scope-gated `http.send` / `l4.*` verbs. The compile-and-run test in
-`crates/aitm-plugin-rhai/tests/bundled_scripts.rs` validates every file here.
+`crates/aitm-plugin-rhai/tests/bundled_scripts.rs` validates every file here,
+and `crates/aitm/tests/bundled_startup.rs` loads the whole catalogue the way
+the binary does at startup (every `load(reg)` included), with and without the
+L4 layer.
+
+Two Rhai rules every script here follows. A top-level `const` with a literal
+value (`const SQL_ERR = "(?i)…"`, `const PATHS = [...]`) may be read inside
+hooks and inside `load(reg)` command closures: the engine resolves such names
+inside functions from the script's constants. A constant computed by a call is
+not visible in functions; a parameter or `let` of the same name shadows the
+constant; and the constant is read-only there, so mutate a copy (`let p =
+PATHS; p.push(x)`). Second, a closure captures every outer name when it is *created*, so a
+command closure that names an optional namespace (`l4` with the L4 layer off)
+fails at load before its `try` can catch anything; the `l4/` scripts call `l4`
+from a named function and keep the `try` in the closure.

@@ -605,14 +605,27 @@ fn m3_capabilities(cfg: &RhaiConfig) -> Vec<Arc<dyn ScriptCapability>> {
 }
 
 /// Whether a script declaring `declared` meets a capability's `min_api`.
-/// Versions are compared numerically where both parse as integers (so `"2"`
-/// satisfies `"1"` but `"1"` does not satisfy `"2"`); anything non-numeric must
-/// match exactly, which is deny-by-default for an unrecognized version string.
+/// Versions that are dotted integers (`"1"`, `"2"`, `"0.1.0"`) compare
+/// numerically, component by component with missing components as zero: `"2"`
+/// satisfies `"1"`, `"1"` satisfies `"0.1.0"` (the L4 namespace's version),
+/// `"1"` does not satisfy `"2"` or `"1.1"`. Anything else must match exactly,
+/// which is deny-by-default for an unrecognized version string.
 pub fn api_satisfies(declared: &str, min_api: &str) -> bool {
-    match (declared.parse::<u32>(), min_api.parse::<u32>()) {
-        (Ok(declared), Ok(min_api)) => declared >= min_api,
+    match (version_parts(declared), version_parts(min_api)) {
+        (Some(mut declared), Some(mut min_api)) => {
+            let len = declared.len().max(min_api.len());
+            declared.resize(len, 0);
+            min_api.resize(len, 0);
+            declared >= min_api
+        }
         _ => declared == min_api,
     }
+}
+
+/// `"0.1.0"` → `[0, 1, 0]`; `None` unless every dot-separated part is an
+/// integer.
+fn version_parts(version: &str) -> Option<Vec<u32>> {
+    version.split('.').map(|part| part.parse().ok()).collect()
 }
 
 /// What the script is called when it declares no `NAME` (spec §2 rule 1).

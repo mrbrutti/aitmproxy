@@ -166,25 +166,55 @@ impl CoreIngress {
         self
     }
 
-    /// Dispatch one captured TCP/stream flow: scope-gate it (authority = SNI else the
-    /// dst IP) through the L7 [`ScopeRateGuard`](aitm_core::ScopeRateGuard), then route
-    /// it behind the **authoritative original destination**. An in-scope flow a module
-    /// claims is spawned ([`StreamOutcome::Dispatched`]); an in-scope flow no module
-    /// claims is dialled through the SSRF-guarded connector and tunnelled verbatim
-    /// ([`StreamOutcome::PassedThrough`]); an out-of-scope flow is refused before any
-    /// module match, spawn, or dial ([`StreamOutcome::Refused`]).
+    /// Whether backend-supplied hostname text is a plain DNS name — at most 253 bytes
+    /// of letters, digits, `-`, `_` and `.`, nothing else. Brackets, a `:port`, a
+    /// `/path`, whitespace or control characters never occur in a real SNI /
+    /// connect-by-name hostname, so a value carrying them is not trusted as the scope
+    /// host.
+    fn is_plain_hostname(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 253
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    }
+
+    /// Dispatch one captured TCP/stream flow: scope-gate it (authority = `host:port`,
+    /// the SNI / handoff hostname when it is a plain DNS name else the dst IP, with the
+    /// dst port) through the L7 [`ScopeRateGuard`](aitm_core::ScopeRateGuard), then
+    /// route it behind the **authoritative original destination**. An in-scope flow a
+    /// module claims is spawned ([`StreamOutcome::Dispatched`]); an in-scope flow no
+    /// module claims is dialled through the SSRF-guarded connector and tunnelled
+    /// verbatim ([`StreamOutcome::PassedThrough`]); an out-of-scope flow is refused
+    /// before any module match, spawn, or dial ([`StreamOutcome::Refused`]).
     pub async fn dispatch_tcp(&self, mut flow: CapturedTcpFlow) -> StreamOutcome {
         let Some(sd) = self.stream.as_ref() else {
             return StreamOutcome::Unhandled;
         };
 
-        // Deny-by-default: the authority is the SNI if the backend knows it, else the
-        // authoritative dst IP. An out-of-scope flow is refused before any work.
-        let authority = flow
-            .sni
-            .clone()
-            .unwrap_or_else(|| flow.dst.ip().to_string());
+        // Deny-by-default. Gate on `host:port`, the same shape a proxied request is
+        // gated on: `Authority::matches_scope_entry` compares ports when the entry
+        // carries one, so a port-qualified entry can only match a ported authority,
+        // while a portless entry still admits any port. The same string goes to
+        // `connector.connect` below, whose SSRF check matches it the same way. A refusal
+        // is a WARN, not a debug line: the client's connection is cut here, and a
+        // capture backend normally hands over only flows it believed in scope.
+        // The hostname is backend-supplied text: only a plain name is trusted as the
+        // host (no brackets, port, path or whitespace — an SNI never carries those, and
+        // `Authority::new` would normalise some of them away); anything else gates on
+        // the dst IP, which only an IP entry can admit.
+        let host = match flow.sni.as_deref() {
+            Some(name) if Self::is_plain_hostname(name) => name.to_string(),
+            _ => flow.dst.ip().to_string(),
+        };
+        let authority = aitm_core::Authority::new(&host, flow.dst.port()).to_string();
         if !sd.guard.in_scope(&authority) {
+            // `?authority`: Debug-escaped, so a hostile hostname cannot forge log lines.
+            tracing::warn!(
+                ?authority,
+                dst = %flow.dst,
+                "captured flow refused: authority not in the core's scope"
+            );
             return StreamOutcome::Refused;
         }
 
@@ -485,9 +515,21 @@ mod tests {
     use futures::future::BoxFuture;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// A scope guard whose only consulted method is `in_scope`, fixed per test.
+    /// A scope guard whose only consulted method is `in_scope`, fixed per test; it
+    /// records every authority it is asked about, so a test can assert exactly what
+    /// `dispatch_tcp` gates on.
     struct MockGuard {
         in_scope: bool,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl MockGuard {
+        fn fixed(in_scope: bool) -> Self {
+            Self {
+                in_scope,
+                asked: Mutex::new(Vec::new()),
+            }
+        }
     }
 
     impl ScopeRateGuard for MockGuard {
@@ -501,7 +543,11 @@ mod tests {
         fn list_scope(&self) -> Vec<ScopeEntry> {
             Vec::new()
         }
-        fn in_scope(&self, _host: &str) -> bool {
+        fn in_scope(&self, host: &str) -> bool {
+            self.asked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(host.to_string());
             self.in_scope
         }
     }
@@ -592,7 +638,7 @@ mod tests {
             store(),
             Arc::new(MockSink),
             connector,
-            Arc::new(MockGuard { in_scope: true }),
+            Arc::new(MockGuard::fixed(true)),
         );
 
         let flow = CapturedTcpFlow {
@@ -647,7 +693,7 @@ mod tests {
             store(),
             Arc::new(MockSink),
             connector,
-            Arc::new(MockGuard { in_scope: false }),
+            Arc::new(MockGuard::fixed(false)),
         );
 
         let flow = CapturedTcpFlow {
@@ -668,6 +714,172 @@ mod tests {
             dial_calls.load(Ordering::SeqCst),
             0,
             "no upstream is dialled"
+        );
+    }
+
+    /// Dispatch one captured flow through an ingress whose only module claims
+    /// everything, against `guard`: the outcome is `Dispatched` iff the guard admits
+    /// the authority `dispatch_tcp` builds. The stream is never read.
+    async fn gate_only(
+        guard: Arc<dyn ScopeRateGuard>,
+        sni: Option<&str>,
+        dst: &str,
+    ) -> StreamOutcome {
+        let module: Arc<dyn ProtocolModule> = Arc::new(StubModule {
+            claims: true,
+            spawn_calls: Arc::new(AtomicUsize::new(0)),
+            recorded: Arc::new(Mutex::new(None)),
+        });
+        let connector: Arc<dyn UpstreamConnector> = Arc::new(MockConnector {
+            dial_calls: Arc::new(AtomicUsize::new(0)),
+            upstream: Mutex::new(None),
+        });
+        let ingress = CoreIngress::empty().with_stream(
+            Arc::from(vec![module]),
+            store(),
+            Arc::new(MockSink),
+            connector,
+            guard,
+        );
+        ingress
+            .dispatch_tcp(CapturedTcpFlow {
+                stream: dummy_stream(),
+                dst: dst.parse().unwrap(),
+                sni: sni.map(str::to_string),
+                first_bytes: b"GET / HTTP/1.1\r\n".to_vec(),
+                peer_identity: None,
+            })
+            .await
+    }
+
+    /// The scope gate sees `host:port` — the handoff hostname (or the dst IP when the
+    /// backend knows none) WITH the destination port, bracketed for IPv6 — never a bare
+    /// host, so port-qualified scope entries can match a captured flow at all.
+    #[tokio::test]
+    async fn captured_tcp_is_gated_on_host_and_port() {
+        let guard = Arc::new(MockGuard::fixed(true));
+        let as_guard: Arc<dyn ScopeRateGuard> = guard.clone();
+        assert_eq!(
+            gate_only(
+                as_guard.clone(),
+                Some("www.example.com"),
+                "93.184.216.34:80"
+            )
+            .await,
+            StreamOutcome::Dispatched
+        );
+        assert_eq!(
+            gate_only(as_guard.clone(), None, "93.184.216.34:443").await,
+            StreamOutcome::Dispatched
+        );
+        assert_eq!(
+            gate_only(as_guard.clone(), None, "[2001:db8::1]:8443").await,
+            StreamOutcome::Dispatched
+        );
+        // The plain-name length cap: 253 bytes is still a hostname, 254 is not and
+        // gates on the dst IP instead.
+        let longest = "a".repeat(253);
+        let too_long = "a".repeat(254);
+        _ = gate_only(as_guard.clone(), Some(&longest), "93.184.216.34:443").await;
+        _ = gate_only(as_guard, Some(&too_long), "93.184.216.34:443").await;
+        assert_eq!(
+            *guard.asked.lock().unwrap_or_else(PoisonError::into_inner),
+            vec![
+                "www.example.com:80".to_string(),
+                "93.184.216.34:443".to_string(),
+                "[2001:db8::1]:8443".to_string(),
+                format!("{longest}:443"),
+                "93.184.216.34:443".to_string(),
+            ]
+        );
+    }
+
+    /// Against the real `StdGuard`: a port-qualified entry admits a captured flow on
+    /// that port only, a portless entry admits any port, and an unrelated host is
+    /// refused — the same semantics `Authority::matches_scope_entry` gives a proxied
+    /// request.
+    #[tokio::test]
+    async fn port_qualified_scope_entry_admits_a_captured_flow_on_that_port_only() {
+        let guard = Arc::new(aitm_core::StdGuard::default());
+        guard.add_scope(ScopeEntry {
+            host: "www.example.com:80".to_string(),
+        });
+        guard.add_scope(ScopeEntry {
+            host: "api.example.com".to_string(),
+        });
+        let guard: Arc<dyn ScopeRateGuard> = guard;
+
+        assert_eq!(
+            gate_only(guard.clone(), Some("www.example.com"), "93.184.216.34:80").await,
+            StreamOutcome::Dispatched,
+            "host:port entry admits the flow on that port"
+        );
+        assert_eq!(
+            gate_only(guard.clone(), Some("www.example.com"), "93.184.216.34:443").await,
+            StreamOutcome::Refused,
+            "host:port entry refuses another port"
+        );
+        assert_eq!(
+            gate_only(guard.clone(), Some("api.example.com"), "93.184.216.34:443").await,
+            StreamOutcome::Dispatched,
+            "a portless entry admits any port"
+        );
+        assert_eq!(
+            gate_only(guard.clone(), Some("api.example.com"), "93.184.216.34:8443").await,
+            StreamOutcome::Dispatched
+        );
+        assert_eq!(
+            gate_only(guard, Some("evil.example"), "93.184.216.34:80").await,
+            StreamOutcome::Refused,
+            "an unrelated host is refused"
+        );
+    }
+
+    /// Backend-supplied hostname text that is not a plain DNS name — a `:port`, a
+    /// bracket, a path, whitespace — is not trusted as the scope host: the flow gates
+    /// on its dst IP instead, which a host entry cannot admit. In particular an SNI
+    /// carrying `:80` must not override the real dst port in the match.
+    #[tokio::test]
+    async fn hostile_hostname_shapes_are_not_trusted_as_the_scope_host() {
+        let guard = Arc::new(aitm_core::StdGuard::default());
+        guard.add_scope(ScopeEntry {
+            host: "scope.example".to_string(),
+        });
+        guard.add_scope(ScopeEntry {
+            host: "scope.example:80".to_string(),
+        });
+        let guard: Arc<dyn ScopeRateGuard> = guard;
+
+        assert_eq!(
+            gate_only(guard.clone(), Some("scope.example"), "93.184.216.34:443").await,
+            StreamOutcome::Dispatched,
+            "the plain name is admitted"
+        );
+        for hostile in [
+            "scope.example:80",
+            "[scope.example",
+            "scope.example]",
+            "scope.example/x",
+            "scope example",
+            "scope.example\n",
+            "",
+        ] {
+            assert_eq!(
+                gate_only(guard.clone(), Some(hostile), "93.184.216.34:443").await,
+                StreamOutcome::Refused,
+                "{hostile:?} is not a hostname and must not match a host entry"
+            );
+        }
+        // The same shapes are harmless when the dst IP itself is in scope.
+        let by_ip = Arc::new(aitm_core::StdGuard::default());
+        by_ip.add_scope(ScopeEntry {
+            host: "93.184.216.34".to_string(),
+        });
+        let by_ip: Arc<dyn ScopeRateGuard> = by_ip;
+        assert_eq!(
+            gate_only(by_ip, Some("[scope.example"), "93.184.216.34:443").await,
+            StreamOutcome::Dispatched,
+            "an IP entry admits the flow by its dst, whatever the hostname text"
         );
     }
 
@@ -697,7 +909,7 @@ mod tests {
             store(),
             Arc::new(MockSink),
             connector,
-            Arc::new(MockGuard { in_scope: true }),
+            Arc::new(MockGuard::fixed(true)),
         );
 
         let flow = CapturedTcpFlow {
@@ -757,7 +969,7 @@ mod tests {
             store(),
             Arc::new(MockSink),
             connector,
-            Arc::new(MockGuard { in_scope: true }),
+            Arc::new(MockGuard::fixed(true)),
         );
 
         let flow = CapturedTcpFlow {

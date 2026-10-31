@@ -3,15 +3,33 @@
 # Build products live in ~/Library/Developer/Aitmproxy, outside the repo
 # (and outside Dropbox or iCloud, which would try to sync them).
 #
-# Usage: ./build.sh            release build, install
-#        ./build.sh --debug    debug build, install
+# Usage: ./build.sh            release build, install to ~/Applications
+#        ./build.sh --debug    debug build, install to ~/Applications
 #        ./build.sh --open     install, then quit the running copy and open the new one
+#        ./build.sh --ne       Network Extension build: Developer ID signing, the sysex
+#                              embedded, installed to /Applications (the only place a
+#                              sysex activates from). Never inferred from the presence of
+#                              the NE profiles: without --ne, /Applications is not touched.
+#        ./build.sh --replace  allow replacing an installed bundle whose
+#                              CFBundleShortVersionString differs from the one being built
+#                              (without it the build refuses, and says what it would have
+#                              overwritten). Same-version rebuilds need no flag.
+#        ./build.sh --ne --allow-unnotarized
+#                              accept that the embedded system extension is not notarized.
+#                              macOS refuses an unnotarized Developer ID sysex ("code
+#                              signature invalid"), so an --ne build on its own can never
+#                              activate capture: it is the INPUT to scripts/notarize-dmg.sh,
+#                              and without this flag it exits 1 after installing to say so.
+# Day-to-day iteration without installing anything: tools/snap-dev.sh (DEV_TAG=<tag>).
 set -euo pipefail
 here=${0:A:h}
 name="Aitmproxy"
 scratch="$HOME/Library/Developer/$name/build"
 config=release
 [[ " $* " == *" --debug "* ]] && config=debug
+want_ne=0; [[ " $* " == *" --ne "* ]] && want_ne=1
+allow_replace=0; [[ " $* " == *" --replace "* ]] && allow_replace=1
+allow_unnotarized=0; [[ " $* " == *" --allow-unnotarized "* ]] && allow_unnotarized=1
 
 # Sign with your Apple Development certificate when you have one (Xcode >
 # Settings > Accounts). Otherwise sign ad hoc, which is fine for your own Mac.
@@ -21,17 +39,44 @@ if [[ -z "$identity" ]]; then
 fi
 [[ -n "$identity" ]] || identity=-
 
-# Detect a Network/System Extension build early: it needs a Developer ID identity
-# (resolved by SHA — a team can hold two same-named certs, and codesign needs it
-# unambiguous) and both A1 provisioning profiles. An NE build installs to
-# /Applications (the Task-1 spike proved the sysex is rejected from ~/Applications
-# with OSSystemExtensionError Code=3); a normal dev build stays in ~/Applications so
-# the snapshot/selftest tooling is unaffected.
+# A Network/System Extension build is an explicit --ne opt-in: it needs a Developer ID
+# identity that both A1 provisioning profiles authorise (tools/ne-preflight.sh resolves
+# it by SHA — a team can hold several same-named certs, and a sysex signed with one the
+# embedded profile does not list fails activation with "code signature invalid"), and it
+# installs to /Applications (the Task-1 spike proved the sysex is rejected from
+# ~/Applications with OSSystemExtensionError Code=3). Inferring it from the presence of
+# the profiles made a plain `--debug` build replace the released app in /Applications
+# (2026-10-31), so without --ne the profiles are ignored and the build stays in
+# ~/Applications.
 ne_app_profile="${NE_APP_PROFILE:-$HOME/Library/MobileDevice/Provisioning Profiles/Aitmproxy Host DeveloperID.provisionprofile}"
 ne_sysex_profile="${NE_SYSEX_PROFILE:-$HOME/Library/MobileDevice/Provisioning Profiles/Aitmproxy NE DeveloperID.provisionprofile}"
 ne_identity=""
-if [[ -f "$ne_app_profile" && -f "$ne_sysex_profile" ]]; then
-  ne_identity="${NE_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | awk '/Developer ID Application/ {print $2; exit}')}"
+if (( want_ne )); then
+  ne_identity=$("$here/tools/ne-preflight.sh" "$ne_app_profile" "$ne_sysex_profile") || exit 1
+fi
+
+# An NE build (--ne) installs to /Applications (required for sysex activation); the
+# normal dev loop keeps ~/Applications so snapshot/selftest tooling is unaffected.
+apps_dir="$HOME/Applications"
+(( want_ne )) && apps_dir="/Applications"
+app="$apps_dir/$name.app"
+# The app version tracks the workspace release (Cargo.toml [workspace.package]) so
+# the DMG name, the bus handshake, and the cask all agree; APP_VERSION overrides.
+version="${APP_VERSION:-$(sed -n '/^\[workspace.package\]/,/^\[/ s/^version *= *"\([^"]*\)".*/\1/p' "${here:h:h}/Cargo.toml" | head -1)}"
+[[ -n "$version" ]] || { echo "build failed: no app version (set APP_VERSION)"; exit 1; }
+# Say what is about to be overwritten, and refuse to replace a bundle of another
+# version (a released app the operator still uses) unless --replace says so.
+# CFBundleVersion is a per-build timestamp, so the comparison is on the version string.
+if [[ -d "$app" ]]; then
+  installed_version=$(plutil -extract CFBundleShortVersionString raw -o - "$app/Contents/Info.plist" 2>/dev/null || echo "?")
+  installed_build=$(plutil -extract CFBundleVersion raw -o - "$app/Contents/Info.plist" 2>/dev/null || echo "?")
+  echo "replacing $app (version $installed_version, build $installed_build) with version $version ($config)"
+  if [[ "$installed_version" != "$version" ]] && (( ! allow_replace )); then
+    echo "refused: installed version $installed_version differs from $version; pass --replace to overwrite it"
+    exit 1
+  fi
+else
+  echo "installing $app (version $version, $config)"
 fi
 
 swift build -c $config --package-path "$here" --scratch-path "$scratch" 2>&1 | grep -E "error|warning|Build complete" | grep -v "^\[" || true
@@ -45,19 +90,10 @@ if [[ -n "$stale" ]]; then
   exit 1
 fi
 
-# An NE build installs to /Applications (required for sysex activation); the normal
-# dev loop keeps ~/Applications so snapshot/selftest tooling is unaffected.
-apps_dir="$HOME/Applications"
-[[ -n "$ne_identity" ]] && apps_dir="/Applications"
-app="$apps_dir/$name.app"
 mkdir -p "$apps_dir"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin" "$app/Contents/MacOS/$name"
-# The app version tracks the workspace release (Cargo.toml [workspace.package]) so
-# the DMG name, the bus handshake, and the cask all agree; APP_VERSION overrides.
-version="${APP_VERSION:-$(sed -n '/^\[workspace.package\]/,/^\[/ s/^version *= *"\([^"]*\)".*/\1/p' "${here:h:h}/Cargo.toml" | head -1)}"
-[[ -n "$version" ]] || { echo "build failed: no app version (set APP_VERSION)"; exit 1; }
 sed -e "s/__BUILD__/$(date +%Y%m%d%H%M)/" -e "s/__VERSION__/$version/" "$here/Info.plist.in" > "$app/Contents/Info.plist"
 # The icon: Icon/AppIcon.icon -> Resources/Assets.car + AppIcon.icns, rebuilt when it changed.
 if [[ -d "$here/Icon/AppIcon.icon" ]]; then
@@ -103,8 +139,8 @@ else
 fi
 
 # --- Network/System Extension capture path (Band C Task 10/14) ---------------
-# Build and embed the sysex for an NE build. ne_identity and the two profiles were
-# resolved near the top (where they also selected /Applications as the install dir).
+# Build and embed the sysex for an --ne build. ne_identity and the two profiles were
+# resolved near the top (where --ne also selected /Applications as the install dir).
 # The restricted NE entitlements must be authorised by an embedded Developer ID
 # profile, and the Task-1 spike proved the sysex activates only when the app is
 # Developer-ID-signed, NOTARIZED, and in /Applications. A normal ad-hoc or Apple
@@ -125,7 +161,7 @@ if [[ -n "$ne_identity" ]]; then
   cp "$ne_app_profile" "$app/Contents/embedded.provisionprofile"
   echo "built + embedded system extension: $sysex_bundle"
 else
-  echo "no system extension embedded (needs a Developer ID identity + the two NE profiles; set NE_SIGN_IDENTITY / NE_APP_PROFILE / NE_SYSEX_PROFILE)"
+  echo "no system extension embedded (pass --ne; it needs a Developer ID identity + the two NE profiles, see NE_SIGN_IDENTITY / NE_APP_PROFILE / NE_SYSEX_PROFILE)"
 fi
 
 xattr -cr "$app"
@@ -170,6 +206,17 @@ if [[ -n "$sysex_bundle" ]]; then
 fi
 cs "${app_sign_opts[@]}" --sign "$sign_identity" "$app"
 echo "installed $app (signed: ${sign_identity})"
+
+# Nothing here notarizes, and macOS refuses an unnotarized Developer ID system
+# extension at activation (Settings ▸ Capture: "Degraded — Extension activation failed:
+# code signature invalid", measured 2026-10-31). Say so where it cannot be missed.
+if [[ -n "$sysex_bundle" ]]; then
+  echo "WARNING: system extension embedded but NOT notarized — activation will fail with 'code signature invalid' until scripts/notarize-dmg.sh runs; the notarized DMG is the only path to a working capture extension"
+  if (( ! allow_unnotarized )); then
+    echo "build.sh: exit 1 — pass --allow-unnotarized when this build is the input to scripts/notarize-dmg.sh (APP=$app)"
+    exit 1
+  fi
+fi
 
 if [[ " $* " == *" --open "* ]]; then
   osascript -e "quit app \"$name\"" 2>/dev/null || true

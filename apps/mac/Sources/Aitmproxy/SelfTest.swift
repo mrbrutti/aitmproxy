@@ -1,6 +1,7 @@
 import AitmBusClient
 import AitmproxyKit
 import AppKit
+import Synchronization
 
 /// Self-test for agents: drives the real session model on fixture data,
 /// prints PASS or FAIL per check, and quits with exit code 0 or 1.
@@ -14,8 +15,38 @@ enum SelfTest {
     static var failures = 0
     static var count = 0
 
+    /// The window scene's `.task` starts the self-test. AppKit opens a bare
+    /// command-line word (one that is neither `--selftest` nor part of a
+    /// `-key value` pair) as a document, and SwiftUI then never opens the main
+    /// window, so that `.task` never fires and the process would idle forever
+    /// (seen 2026-10-31 with `--selftest -bus.activeKind external`). The watchdog
+    /// turns that, and a check that never settles, into a failed run: FAIL and
+    /// exit 1 when the self-test has not started by `startDeadline` or finished by
+    /// `runDeadline`. It runs off the main actor so a busy main thread cannot stall it.
+    nonisolated static let startDeadline: Duration = .seconds(15)
+    nonisolated static let runDeadline: Duration = .seconds(240)
+    nonisolated private static let started = Mutex(false)
+    nonisolated private static let finished = Mutex(false)
+
+    static func armWatchdog() {
+        guard requested else { return }
+        Task.detached {
+            try? await Task.sleep(for: startDeadline)
+            guard started.withLock({ $0 }) else {
+                print("SELFTEST FAIL: not started within \(startDeadline): the main window never appeared. A bare command-line word is opened as a document; pass settings through APP_DEFAULTS_SUITE, not -key value arguments.")
+                exit(1)
+            }
+            try? await Task.sleep(for: runDeadline - startDeadline)
+            guard finished.withLock({ $0 }) else {
+                print("SELFTEST FAIL: not finished within \(runDeadline)")
+                exit(1)
+            }
+        }
+    }
+
     static func runIfRequested(session: Session) {
         guard requested else { return }
+        started.withLock { $0 = true }
         setvbuf(stdout, nil, _IOLBF, 0)
         guard Store.isOverridden else {
             print("SELFTEST refused: set APP_STORE to a folder in /tmp")
@@ -123,9 +154,47 @@ enum SelfTest {
             session.setCapturing(false)
             await settle { !session.capturing }
             check("pausing capture flips the state", !session.capturing)
+            let beforeClear = session.rows
+            let focusBeforeClear = session.focused
+            let selectionBeforeClear = session.selection
             session.clearSession(confirm: { _ in true })
-            await settle { session.rows.isEmpty }
+            await settle { session.rows.isEmpty && session.clearNotice != nil }
             check("clearing empties the session", session.rows.isEmpty && session.focused == nil)
+            // D2: Clear keeps one undo step (Edit > Undo Clear) and says so in the status bar.
+            check("clear shows the notice with the count and registers Undo Clear",
+                  session.clearNotice?.count == beforeClear.count && session.flowUndoManager.canUndo
+                      && session.flowUndoManager.undoActionName == "Clear")
+            session.flowUndoManager.undo()
+            check("undo restores the rows, selection and focused flow",
+                  session.rows == beforeClear && session.focused == focusBeforeClear && session.selection == selectionBeforeClear,
+                  "rows \(session.rows.count) of \(beforeClear.count), focused \(String(describing: session.focused))")
+            check("undo dismisses the notice and the step", session.clearNotice == nil && !session.flowUndoManager.canUndo)
+            // Marking an out-of-scope row from the keyboard is refused like every other verb.
+            let outOfScope = session.rows.first { !$0.inScope }!
+            session.perform(.mark(.red), on: outOfScope.id)
+            check("a mark colour on an out-of-scope row is refused with the reason",
+                  session.rows.first { $0.id == outOfScope.id }?.mark == nil && session.lastError == VerbTable.outOfScopeReason(outOfScope.authority))
+            session.lastError = nil
+            // A refused flow.clear offers no Undo and no notice; the rows stay.
+            let fixtureActions = session.actions as? FixtureActions
+            fixtureActions?.clearFails = true
+            session.clearSession(confirm: { _ in true })
+            await settle { session.lastError != nil }
+            check("a refused clear keeps the rows and offers neither Undo nor the notice",
+                  !session.rows.isEmpty && session.clearNotice == nil && session.clearedFlows == nil && !session.flowUndoManager.canUndo
+                      && session.lastError == "clear: flow.clear refused (fixture)", session.lastError ?? "no error")
+            fixtureActions?.clearFails = false
+            session.lastError = nil
+            // The notice lapses on its own timer and takes the copy and the step with it.
+            Session.clearNoticeSeconds = 0.2
+            session.clearSession(confirm: { _ in true })
+            await settle { session.rows.isEmpty && session.clearNotice != nil }
+            check("the notice shows after the clear", session.clearNotice != nil && session.flowUndoManager.canUndo)
+            await settle { session.clearNotice == nil }
+            check("letting the notice lapse releases the copy and the step",
+                  session.clearedFlows == nil && session.clearNotice == nil && !session.flowUndoManager.canUndo,
+                  "copy \(session.clearedFlows == nil) notice \(session.clearNotice == nil) canUndo \(session.flowUndoManager.canUndo)")
+            Session.clearNoticeSeconds = 8
 
             // M3: filters, saved filters, sidebar query, palette.
             session.loadFixtures()
@@ -402,6 +471,7 @@ enum SelfTest {
 
     /// Quits through NSApp.terminate, never exit(), and closes sheets first.
     static func finish(code: Int32) {
+        finished.withLock { $0 = true }
         exitCode = code
         for window in NSApp.windows { if let sheet = window.attachedSheet { window.endSheet(sheet) } }
         NSApp.terminate(nil)

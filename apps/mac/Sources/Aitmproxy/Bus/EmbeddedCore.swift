@@ -153,7 +153,7 @@ actor EmbeddedCore {
         // Operator-editable (Settings ▸ Proxy), read fresh each spawn so Apply &
         // Restart Core picks them up: the preferred listen port and whether to verify
         // upstream TLS. Unset values fall back to the secure defaults.
-        let defaults = UserDefaults.standard
+        let defaults = Store.defaults
         let savedPort = defaults.integer(forKey: "proxy.preferredPort")
         let preferredPort = (savedPort > 0 && savedPort <= 65535) ? UInt16(savedPort) : defaultProxyPort
         let sslInsecure = !(defaults.object(forKey: "proxy.verifyUpstreamTLS") as? Bool ?? true)

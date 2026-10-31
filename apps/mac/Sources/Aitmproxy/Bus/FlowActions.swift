@@ -1,3 +1,4 @@
+import AitmBusClient
 import AitmproxyKit
 import Foundation
 
@@ -140,7 +141,11 @@ final class FixtureActions: FlowActions {
         session.capturing = on
     }
 
+    /// The self-test flips this to walk the failed-clear path (Undo must not be offered).
+    var clearFails = false
+
     func clear() async throws {
+        if clearFails { throw BusError.tool(message: "flow.clear refused (fixture)") }
         session.rows = []
         session.details = [:]
         session.select(nil)
