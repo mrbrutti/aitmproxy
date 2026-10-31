@@ -96,7 +96,7 @@ enum TrafficClass: String, CaseIterable, Identifiable {
         case .s3xx: "3xx"
         case .s4xx: "4xx"
         case .s5xx: "5xx"
-        case .other: "·"
+        case .other: "none"
         }
     }
 

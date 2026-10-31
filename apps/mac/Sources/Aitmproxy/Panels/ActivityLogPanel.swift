@@ -53,13 +53,9 @@ struct ActivityLogPanel: View {
     }
 
     private var header: some View {
-        HStack(spacing: Space.md) {
-            TrackedLabel("Activity")
-            Spacer(minLength: Space.sm)
+        PageHeader("Activity") {
             FlatSegment(options: Self.originOptions, selection: $state.filter)
         }
-        .padding(.horizontal, Space.md)
-        .frame(height: Tok.Size.filterBar)
     }
 }
 
