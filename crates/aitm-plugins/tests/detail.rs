@@ -428,3 +428,112 @@ fn field_bool(v: &Value, k: &str) -> bool {
         _ => panic!("not an object"),
     }
 }
+
+/// `flow_with_bodies()` whose response also carries `trailers`, in the given order.
+fn flow_with_trailers(pairs: &[(&str, &str)]) -> Flow {
+    let mut flow = flow_with_bodies();
+    let Flow::Http(f) = &mut flow else {
+        panic!("flow_with_bodies builds an HTTP flow");
+    };
+    let resp = f
+        .response
+        .as_mut()
+        .expect("flow_with_bodies has a response");
+    resp.trailers = headers(pairs);
+    flow
+}
+
+/// A `[name, value]` pair as `flow.detail` renders it.
+fn pair(name: &str, value: &str) -> Value {
+    Value::Array(vec![Value::Str(name.into()), Value::Str(value.into())])
+}
+
+#[test]
+fn http_detail_renders_response_trailers_as_name_value_pairs() {
+    let store = MemFlowStore::new();
+    let id = store.insert(flow_with_trailers(&[
+        ("X-Checksum-SHA256", "abc"),
+        ("Server-Timing", "origin;dur=1"),
+    ]));
+    let d = detail(&store, id, Some("inline"));
+
+    let resp = obj(&d, "response");
+    // Trailers are `[name, value]` pairs in wire order, the shape of `headers`;
+    // name case is kept as received.
+    assert_eq!(
+        resp.get("trailers"),
+        Some(&Value::Array(vec![
+            pair("X-Checksum-SHA256", "abc"),
+            pair("Server-Timing", "origin;dur=1"),
+        ]))
+    );
+    // Trailers are never merged into the head: `headers` is untouched.
+    assert_eq!(
+        resp.get("headers"),
+        Some(&Value::Array(vec![pair(
+            "content-type",
+            "application/json"
+        )]))
+    );
+}
+
+#[test]
+fn http_detail_response_has_no_trailers_key_when_there_are_none() {
+    let store = MemFlowStore::new();
+    let id = store.insert(flow_with_bodies());
+    let d = detail(&store, id, Some("inline"));
+
+    // A flow without trailers renders exactly today's six keys.
+    let keys: Vec<&str> = obj(&d, "response").keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        [
+            "body",
+            "body_size",
+            "body_truncated",
+            "headers",
+            "status",
+            "version"
+        ]
+    );
+}
+
+#[test]
+fn http_detail_request_object_is_unchanged_by_trailers() {
+    let store = MemFlowStore::new();
+    let plain = store.insert(flow_with_bodies());
+    let trailed = store.insert(flow_with_trailers(&[("X-Checksum-SHA256", "abc")]));
+
+    let plain_d = detail(&store, plain, Some("inline"));
+    let trailed_d = detail(&store, trailed, Some("inline"));
+
+    let plain_keys: Vec<&str> = obj(&plain_d, "request")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let trailed_keys: Vec<&str> = obj(&trailed_d, "request")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(trailed_keys, plain_keys);
+    // Pin the literal key set too, so two equally wrong objects cannot pass.
+    assert_eq!(
+        trailed_keys,
+        [
+            "authority",
+            "body",
+            "body_size",
+            "body_truncated",
+            "headers",
+            "method",
+            "path",
+            "scheme",
+            "version"
+        ]
+    );
+    // Request trailers are a non-goal: the request headers are the same pairs.
+    assert_eq!(
+        obj(&trailed_d, "request").get("headers"),
+        obj(&plain_d, "request").get("headers")
+    );
+}
