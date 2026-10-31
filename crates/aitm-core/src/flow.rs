@@ -6,7 +6,7 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::oneshot;
 
@@ -108,6 +108,40 @@ pub struct HttpFlow {
     pub intercept: InterceptState,
 }
 
+impl HttpFlow {
+    /// Finalise a response that ended before its body was complete.
+    ///
+    /// When the response head is stored and its body is still
+    /// [`Body::Streamed`], the body becomes `Body::Bytes(captured)` (or
+    /// `Body::Empty` when nothing was captured), `metadata.truncated` is set and
+    /// `metadata.duration` is measured from `metadata.created`; returns `true`.
+    /// In every other case (no response yet; a body already buffered, whether it
+    /// completed or a plugin replaced it) nothing changes and it returns `false`.
+    /// A second call therefore finds a buffered body and is a no-op: the method
+    /// is idempotent by construction.
+    ///
+    /// This is the one rule for "a response that ended early is a truncated,
+    /// finished response". The protocol modules apply it (through
+    /// `FlowStore::abandon_response`) on every failure path once the head is
+    /// stored, so the flow becomes terminal for `flow.clear` and eviction and
+    /// `flow.get` reports a concrete `response_bytes`.
+    pub fn abandon_response(&mut self, captured: Vec<u8>) -> bool {
+        match self.response.as_mut() {
+            Some(r) if matches!(r.body, Body::Streamed(_)) => {
+                r.body = if captured.is_empty() {
+                    Body::Empty
+                } else {
+                    Body::Bytes(captured)
+                };
+                self.metadata.truncated = true;
+                self.metadata.duration = self.metadata.created.elapsed().ok();
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// A captured WebSocket conversation (after the HTTP upgrade).
 #[derive(Debug, Clone)]
 pub struct WsFlow {
@@ -207,8 +241,12 @@ pub struct FlowMeta {
     pub is_replay: bool,
     pub created: SystemTime,
     pub duration: Option<Duration>,
-    /// A body exceeded the configured cap: the stored copy was truncated (the
-    /// client still received the full stream).
+    /// The stored copy of a body is incomplete. Either the body exceeded the
+    /// configured cap (the client still received the full stream), or the
+    /// response ended early (the upstream closed, its read timed out, it sent
+    /// malformed bytes, or the client went away) and the client received what
+    /// the proxy had forwarded by then. The HTTP modules set it on the cap path;
+    /// [`HttpFlow::abandon_response`] sets it on the early-end path.
     pub truncated: bool,
     /// The captured request was edited by `flow.mutate` since capture. Drives the
     /// inspector's "Edited" flag; the original is recoverable while the flow is
@@ -238,6 +276,30 @@ impl Default for FlowMeta {
             capture_interface: None,
         }
     }
+}
+
+impl FlowMeta {
+    /// When the flow started: `created` as whole milliseconds since the Unix
+    /// epoch, saturated at `i64::MAX`; `None` if the clock is before the epoch.
+    /// The one `started_at` rule, so every command surface and push places a
+    /// flow at the same time.
+    pub fn started_at_ms(&self) -> Option<i64> {
+        self.created.duration_since(UNIX_EPOCH).ok().map(whole_ms)
+    }
+
+    /// The flow's duration in whole milliseconds, saturated at `i64::MAX`;
+    /// `None` while the flow is in flight or its end is unknown. The one
+    /// `duration_ms` rule, so `flow.get`, `flow.table` and the pushes cannot
+    /// drift.
+    pub fn duration_ms(&self) -> Option<i64> {
+        self.duration.map(whole_ms)
+    }
+}
+
+/// A duration as whole milliseconds (the fraction dropped), saturated at
+/// `i64::MAX` rather than wrapped or truncated.
+fn whole_ms(d: Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
 }
 
 /// Lifecycle of interception for a single flow.

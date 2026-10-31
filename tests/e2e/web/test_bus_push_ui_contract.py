@@ -4,7 +4,7 @@
 
 Spec: docs/superpowers/specs/2026-10-30-web-ui-bus-push-design.md (wire-facts
 table, D3, D6, D7). The UI now subscribes on every connection and treats a flow
-push as a TRIGGER (refetch via flow.detail, never apply the sparse summary), and
+push as a TRIGGER (refetch via flow.detail, never apply the pushed summary), and
 it drops its own polling echo from the Activity panel by inferring own-ness from
 `origin` + command, because the one label the bridge stamps on every connection
 (`web-bridge`) cannot tell the UI from another script on the same token. Each of
@@ -12,8 +12,8 @@ those client decisions depends on a server fact this suite pins against a REAL
 core over the REAL /bus bridge, as the agent token (the `aitm web --token` value):
 
   1. flow.subscribe {} returns an integer sub_id            (server.rs subscribe)
-  2. a flow push summary is exactly {id, kind, method, authority, path, status}
-     with kind "http"                                        (server.rs flow_summary)
+  2. a flow push summary is exactly the flow.get object (`SUMMARY_KEYS`) with
+     kind "http"                                              (server.rs flow_summary)
   3. flow.detail {id, body:"none"} returns kind "http" with request, client_conn,
      meta, and its `id` is the requested one                 (detail.rs detail)
   4. the UI's own flow.list is audited and pushed back as a notifications/aitm/agent
@@ -62,8 +62,10 @@ from aitm_e2e.ws import WsBusClient  # noqa: E402
 
 FLOW = "notifications/aitm/flow"
 AGENT = "notifications/aitm/agent"
-# The HTTP summary the server renders in `flow_summary` (crates/aitm-mcp/src/server.rs).
-SUMMARY_KEYS = {"id", "kind", "method", "authority", "path", "status"}
+# The HTTP summary the server renders in `flow_summary` (crates/aitm-mcp/src/server.rs):
+# field for field the `flow.get` object (crates/aitm-plugins/src/capture.rs summarize).
+SUMMARY_KEYS = {"id", "kind", "intercept", "is_replay", "method", "scheme", "authority", "path",
+                "status", "request_bytes", "response_bytes", "started_at", "duration_ms"}
 PATH_TAG = "/echo?x=push-contract"
 PUSH_WAIT_S = 8.0
 
@@ -117,7 +119,7 @@ def main() -> int:
         check(isinstance(sub, dict) and is_int(sub.get("sub_id")),
               f"flow.subscribe returned a dict with an integer sub_id: {sub!r}")
 
-        section("2. real proxied traffic -> a notifications/aitm/flow whose summary is sparse")
+        section("2. real proxied traffic -> a notifications/aitm/flow whose summary is the flow.get object")
         resp = via_proxy(cfg.proxy_port, "GET", f"{up.base}{PATH_TAG}")
         check(resp.status == 200, f"traffic through the proxy returned {resp.status}")
 

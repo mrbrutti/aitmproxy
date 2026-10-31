@@ -10,7 +10,11 @@ import type { FlowEventKind } from '~/bus/types';
 import { createAppStore } from './app';
 import { FLOW_PING, bridgeBus, captureInFlight, captureSilently, complete, gate, tick, type TestBus } from './bridgeBus.testkit';
 
-/** What the server really sends with a flow event: a thin summary, `kind:"ws"` spelled its way, no times, no sizes. */
+/**
+ * The sparse summary an OLDER core sends with a flow event (`kind:"ws"`, no times, no sizes). A
+ * current core sends the full `flow.get` object with `kind:"websocket"`; the store treats either as
+ * a trigger, and the old shape is kept here because it is the one a direct apply would corrupt.
+ */
 const sparse = (id: string) => ({ id, kind: 'ws', method: 'GET', authority: 'x.test', path: '/p', status: null });
 const push = (bus: TestBus, event: FlowEventKind, id: string) => bus.emit('notifications/aitm/flow', { event, id, summary: sparse(id) });
 
@@ -60,8 +64,9 @@ describe('app store — a flow push is a trigger, never data', () => {
     expect(before.seq).toBe(1);
 
     push(bus, 'meta', 'f_1');
-    // Not even for an instant: the sparse summary (`kind:"ws"`, no times, no sizes) is never written, so
-    // the row is intact before the refetch answers, not merely repaired by it.
+    // Not even for an instant: the summary (here the sparse old shape, which a direct apply would
+    // corrupt) is never written, so the row is intact before the refetch answers, not merely
+    // repaired by it.
     expect(app.byId.get('f_1')!.raw).toEqual(before);
     await tick(250);
 
