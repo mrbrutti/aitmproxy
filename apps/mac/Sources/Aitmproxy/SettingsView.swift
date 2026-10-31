@@ -233,6 +233,10 @@ struct CaptureSettings: View {
     var body: some View {
         let health = session.coreHealth
         let capability = health.captureCapability
+        // The honest sentence about capture: on + empty scope captures nothing (the
+        // extension is deny-by-default on scope), which must never read as "Capturing".
+        let advice = CaptureAdvice.make(
+            capability: capability, supported: health.captureSupported, scopeHostCount: session.scopeHosts.count)
         Section("Network extension") {
             if health.captureControlsAvailable {
                 Toggle("Capture L4 traffic", isOn: Binding(
@@ -262,6 +266,15 @@ struct CaptureSettings: View {
                             Image(systemName: symbol(for: capability))
                                 .foregroundStyle(capability.isCaptureOn ? Palette.accent : Color.secondary)
                         }
+                    }
+                }
+                if advice.offersScope {
+                    Text("\(advice.headline). \(advice.detail)")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    // Same action as Proxy ▸ Scope…: the Scope page in the main window.
+                    Button("Open Scope…") {
+                        if session.page == .scope { session.scopeSheetVisible = true } else { session.show(.scope) }
                     }
                 }
                 if let reason = capability.degradedReason {

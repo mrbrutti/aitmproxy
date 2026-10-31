@@ -420,7 +420,9 @@ else
 fi
 
 # ============================ TG-AC11: the four snapshot states ========================
-has "TG-AC11 the snapshot states are off, awaiting, active and failed" "$(code_lines "$scenes")" 'case off, awaiting, active, failed'
+has "TG-AC11 the snapshot states are off, awaiting, active, failed and noscope" "$(code_lines "$scenes")" 'case off, awaiting, active, failed, noscope'
+has "NS-AC5 the noscope state seeds an empty scope" "$(code_lines "$scenes")" 'session.scopeHosts = []'
+has "NS-AC5 reset restores the fixture scope" "$(code_lines "$scenes")" 'session.scopeHosts = Fixtures.scope'
 for seeded in '.inactive' '.pendingApproval' '.capturing' '.degraded('; do
     has "TG-AC11 a snapshot state seeds $seeded" "$(code_lines "$scenes")" "captureCapability = $seeded"
 done
@@ -428,6 +430,31 @@ has "TG-AC11 every state is captured" "$(code_lines "$snap")" 'for state in Capt
 has "TG-AC11 each capture is written as settings-capture-<state>-<mode>.png" "$(code_lines "$snap")" \
     'settings-capture-\(state.rawValue)-\(mode).png'
 has "TG-AC11 the capture loop runs in light and dark" "$(code_lines "$snap")" 'for mode in ["light", "dark"]'
+
+# ============ NS-AC2/3/4/8: honest "on but scope is empty" state (hotfix spec 2026-10-31) ====
+# Spec docs/superpowers/specs/2026-10-31-ne-no-scope-honest-state-design.md. The extension is
+# deny-by-default on scope, so capture ON with an EMPTY scope captures nothing; both operator
+# surfaces must say so, and the Apps page must never hide captured flows behind a placeholder.
+settings_code=$(code_lines "$settings")
+shell_code=$(code_lines "$shell")
+has "NS-AC2 Settings computes the advice from the published capability, support and live scope" "$settings_code" 'CaptureAdvice.make('
+has "NS-AC2 Settings shows the empty-scope callout only when the advice offers Scope" "$settings_code" 'if advice.offersScope {'
+has "NS-AC2 Settings offers Open Scope" "$settings_code" 'Button("Open Scope'
+has "NS-AC2 Open Scope goes to the Scope page like Proxy > Scope" "$settings_code" 'session.show(.scope)'
+has "NS-AC3 the Apps banner view exists" "$shell_code" 'struct AppsAttributionBanner: View'
+has "NS-AC3 the Apps empty state view exists" "$shell_code" 'struct AppsEmptyState: View'
+has "NS-AC3 the Apps surfaces compute the advice" "$shell_code" 'CaptureAdvice.make('
+has "NS-AC3 the Apps surfaces offer Scope when the advice says so" "$shell_code" 'if advice.offersScope {'
+has "NS-AC3 the Apps surfaces offer Settings when capture is off" "$shell_code" 'advice.offersSettings'
+has "NS-AC3 Open Settings opens Settings" "$shell_code" 'openSettings()'
+has "NS-AC8 with flows present the Apps page keeps the table and shows the banner" "$shell_code" 'session.clients.isEmpty, !session.rows.isEmpty'
+has "NS-AC8 the full empty state shows only when there are no flows at all" "$shell_code" 'session.clients.isEmpty, session.rows.isEmpty'
+hasnt "NS-AC4 ShellView reads no capture.enabled key" "$shell_code" 'capture\.enabled'
+hasnt "NS-AC4 ShellView never calls the toggle glue" "$shell_code" 'CaptureSwitch'
+hasnt "NS-AC4 ShellView never touches the controller handle" "$shell_code" 'extensionController'
+has "NS-AC5 an apps-noattribution scene exists" "$(code_lines "$scenes")" 'case appsNoAttribution = "apps-noattribution"'
+has "NS-AC5 the apps scene strips the fixture clients" "$(code_lines "$scenes")" 'row.client = nil'
+has "NS-AC5 the apps scene seeds the empty-scope trap" "$(code_lines "$scenes")" 'CaptureSnapshotState.noscope.apply(to: session)'
 
 echo
 if [ "$failures" -eq 0 ]; then

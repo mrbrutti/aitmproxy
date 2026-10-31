@@ -187,6 +187,12 @@ struct MainView: View {
                 ScopeBanner()
                 Rule()
             }
+            if session.page == .apps, session.clients.isEmpty, !session.rows.isEmpty {
+                // Captured flows exist but carry no source app, so this page cannot group them.
+                // Keep the table (captured flows are never hidden) and say why in one line.
+                AppsAttributionBanner()
+                Rule()
+            }
             if session.splitView {
                 // Two lists, own chips and selection, one capture; the focused pane carries a 2 px accent edge.
                 HStack(spacing: 0) {
@@ -198,10 +204,11 @@ struct MainView: View {
                 // Viz-first Connection page: the waterfall replaces the flow table; the
                 // inspector opens on select. The dashboard band sits above (see above).
                 ConnectionWaterfall()
-            } else if session.page == .apps, session.clients.isEmpty {
-                // No Network/System Extension ⇒ no source-app attribution, so the Apps
-                // grouping is empty. Explain it rather than showing a bare "0".
-                AppsNeedsExtension()
+            } else if session.page == .apps, session.clients.isEmpty, session.rows.isEmpty {
+                // No flows at all. Say the one true thing about capture (off, awaiting
+                // approval, on with an EMPTY scope, no extension) rather than a bare "0".
+                // With flows present the table stays and AppsAttributionBanner speaks above it.
+                AppsEmptyState()
             } else {
                 flowTable
             }
@@ -326,15 +333,66 @@ struct EmptyFlows: View {
     }
 }
 
-/// The Apps page before the Network/System Extension lands: proxy capture carries
-/// no source-app attribution, so there is nothing to group by. Explain it rather
-/// than showing a bare "0".
-struct AppsNeedsExtension: View {
+/// One line above the flow table on the Apps page when flows exist but carry no source
+/// app (so nothing can be grouped): the honest capture state from `CaptureAdvice` and the
+/// one action that changes it. The table stays; captured flows are never hidden behind it.
+struct AppsAttributionBanner: View {
+    @Environment(Session.self) private var session
+    @Environment(\.openSettings) private var openSettings
+
     var body: some View {
+        let health = session.coreHealth
+        let advice = CaptureAdvice.make(
+            capability: health.captureCapability, supported: health.captureSupported,
+            scopeHostCount: session.scopeHosts.count)
+        HStack(spacing: Space.sm) {
+            Image(systemName: "app.badge").font(.system(size: Tok.Size.iconInline))
+            Text(advice.banner)
+            Spacer(minLength: Space.sm)
+            if advice.offersScope {
+                Button("Open Scope…") { session.show(.scope) }
+                    .buttonStyle(.link)
+                    .controlSize(.small)
+            } else if advice.offersSettings {
+                Button("Open Settings…") { openSettings() }
+                    .buttonStyle(.link)
+                    .controlSize(.small)
+            }
+        }
+        .font(Tok.Face.ui(Tok.Typography.Size.sm))
+        .foregroundStyle(Tok.Ink.tertiary.color)
+        .padding(.horizontal, Space.md)
+        .frame(height: Tok.Size.Row.dense)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(alignment: .bottom) { Rule(color: Tok.Line.rule) }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// The Apps page when there is nothing to group by. It says the one true thing about
+/// capture (`CaptureAdvice`) instead of always blaming a missing extension: with the
+/// extension on but the scope EMPTY, nothing is captured until a host is added, so the
+/// state offers Scope; off offers Settings. It never toggles capture itself (that stays
+/// operator-only, in the Settings toggle).
+struct AppsEmptyState: View {
+    @Environment(Session.self) private var session
+    @Environment(\.openSettings) private var openSettings
+
+    var body: some View {
+        let health = session.coreHealth
+        let advice = CaptureAdvice.make(
+            capability: health.captureCapability, supported: health.captureSupported,
+            scopeHostCount: session.scopeHosts.count)
         ContentUnavailableView {
-            Label("No app attribution yet", systemImage: "app.badge")
+            Label(advice.headline, systemImage: "app.badge")
         } description: {
-            Text("Grouping flows by source app needs the macOS capture extension. Proxy capture alone cannot tell which app each flow came from.")
+            Text(advice.detail)
+        } actions: {
+            if advice.offersScope {
+                Button("Open Scope…") { session.show(.scope) }
+            } else if advice.offersSettings {
+                Button("Open Settings…") { openSettings() }
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Tok.Ground.surface.color)
