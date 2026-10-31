@@ -1523,21 +1523,43 @@ fn push_registry() -> Arc<Registry> {
     Arc::new(reg)
 }
 
+/// The one builder for a push-section server: the subscription commands
+/// registered, services over `store`, an ungated policy, and, when given, a
+/// per-connection push `capacity` and a core event broadcast `push`. Returned
+/// bare rather than in an `Arc` because `serve` consumes the server.
+fn push_server_with(
+    transport: McpTransport,
+    store: Arc<MemFlowStore>,
+    capacity: Option<usize>,
+    push: Option<broadcast::Sender<Event>>,
+) -> McpServer {
+    let mut srv = McpServer::new(push_registry(), transport)
+        .with_agent_state(ungated())
+        .with_services(
+            store,
+            Arc::new(StubClient),
+            Arc::new(StdGuard::default()),
+            None,
+        );
+    if let Some(capacity) = capacity {
+        srv = srv.with_push_capacity(capacity);
+    }
+    if let Some(push) = push {
+        srv = srv.with_push(push);
+    }
+    srv
+}
+
 /// A server with the subscription commands registered, services over `store`, an
 /// ungated policy, and a small per-connection push `capacity` so overflow is
 /// cheap to force.
 fn push_server(store: Arc<MemFlowStore>, capacity: usize) -> Arc<McpServer> {
-    Arc::new(
-        McpServer::new(push_registry(), McpTransport::Stdio)
-            .with_agent_state(ungated())
-            .with_push_capacity(capacity)
-            .with_services(
-                store,
-                Arc::new(StubClient),
-                Arc::new(StdGuard::default()),
-                None,
-            ),
-    )
+    Arc::new(push_server_with(
+        McpTransport::Stdio,
+        store,
+        Some(capacity),
+        None,
+    ))
 }
 
 type ClientReader = Lines<BufReader<ReadHalf<DuplexStream>>>;
@@ -1721,12 +1743,7 @@ fn subscribe_on_an_open_sink_still_works() {
 
     let reply = subscribe_on(&srv, &conn, json!({}));
     assert!(!is_refused(&reply), "an open sink subscribes: {reply}");
-    assert!(
-        reply["result"]["structuredContent"]["sub_id"]
-            .as_u64()
-            .is_some(),
-        "subscribe returns a sub_id: {reply}"
-    );
+    sub_id_of(&reply);
 
     let id = store.insert(http_flow("example.com:443", "/live"));
     srv.push_flow_event(&Event::RequestHeaders(id));
@@ -2014,12 +2031,7 @@ fn since_replay_is_bounded_by_the_sink_and_flags_lag() {
     let sink = NotificationSink::new(srv.push_capacity());
     let conn = conn_over(&srv, &sink);
     let reply = subscribe_on(&srv, &conn, json!({"since": since.to_string()}));
-    assert!(
-        reply["result"]["structuredContent"]["sub_id"]
-            .as_u64()
-            .is_some(),
-        "an open sink subscribes: {reply}"
-    );
+    sub_id_of(&reply);
     assert_eq!(
         sink.queued_len(),
         CAPACITY,
@@ -2065,28 +2077,18 @@ async fn spawn_push_dispatcher_delivers_a_broadcast_event() {
     // The channel's own receiver is dropped at once, so a successful `send`
     // below proves the dispatcher subscribed its own.
     let (tx, _) = broadcast::channel::<Event>(16);
-    let srv = Arc::new(
-        McpServer::new(push_registry(), McpTransport::Stdio)
-            .with_agent_state(ungated())
-            .with_services(
-                store.clone(),
-                Arc::new(StubClient),
-                Arc::new(StdGuard::default()),
-                None,
-            )
-            .with_push(tx.clone()),
-    );
+    let srv = Arc::new(push_server_with(
+        McpTransport::Stdio,
+        store.clone(),
+        None,
+        Some(tx.clone()),
+    ));
     srv.spawn_push_dispatcher();
 
     let sink = NotificationSink::new(16);
     let conn = conn_over(&srv, &sink);
     let reply = subscribe_on(&srv, &conn, json!({}));
-    assert!(
-        reply["result"]["structuredContent"]["sub_id"]
-            .as_u64()
-            .is_some(),
-        "subscribe returns a sub_id: {reply}"
-    );
+    sub_id_of(&reply);
 
     let id = store.insert(http_flow("example.com:443", "/bus"));
     tx.send(Event::RequestHeaders(id))
@@ -2115,17 +2117,12 @@ async fn spawn_push_dispatcher_delivers_a_broadcast_event() {
 async fn spawn_push_dispatcher_twice_delivers_each_event_once() {
     let store = Arc::new(MemFlowStore::new());
     let (tx, _) = broadcast::channel::<Event>(16);
-    let srv = Arc::new(
-        McpServer::new(push_registry(), McpTransport::Stdio)
-            .with_agent_state(ungated())
-            .with_services(
-                store.clone(),
-                Arc::new(StubClient),
-                Arc::new(StdGuard::default()),
-                None,
-            )
-            .with_push(tx.clone()),
-    );
+    let srv = Arc::new(push_server_with(
+        McpTransport::Stdio,
+        store.clone(),
+        None,
+        Some(tx.clone()),
+    ));
     srv.spawn_push_dispatcher();
     srv.spawn_push_dispatcher();
     assert_eq!(
@@ -2164,22 +2161,16 @@ async fn serve_still_spawns_the_push_dispatcher() {
     // The channel's own receiver is dropped at once, so a successful `send`
     // below proves `serve` subscribed a dispatcher of its own.
     let (tx, _) = broadcast::channel::<Event>(16);
-    let srv = McpServer::new(
-        push_registry(),
+    let srv = push_server_with(
         McpTransport::LoopbackTcp {
             port: 0,
             token: "tok".into(),
             endpoint_file: None,
         },
-    )
-    .with_agent_state(ungated())
-    .with_services(
         store.clone(),
-        Arc::new(StubClient),
-        Arc::new(StdGuard::default()),
         None,
-    )
-    .with_push(tx.clone());
+        Some(tx.clone()),
+    );
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel::<SocketAddr>();
     tokio::spawn(
         srv.on_bound(move |addr| {
@@ -2203,12 +2194,7 @@ async fn serve_still_spawns_the_push_dispatcher() {
             .expect("a reply line"),
     )
     .expect("json");
-    assert!(
-        reply["result"]["structuredContent"]["sub_id"]
-            .as_u64()
-            .is_some(),
-        "flow.subscribe over loopback TCP returns a sub_id: {reply}"
-    );
+    sub_id_of(&reply);
 
     let id = store.insert(http_flow("example.com:443", "/served"));
     tx.send(Event::RequestHeaders(id))
@@ -2244,12 +2230,7 @@ async fn subscribe_pushes_created_on_new_flow() {
     .await;
     let reply = next_json(&mut lines).await;
     assert_eq!(reply["id"], 1);
-    assert!(
-        reply["result"]["structuredContent"]["sub_id"]
-            .as_u64()
-            .is_some(),
-        "subscribe returns a sub_id: {reply}"
-    );
+    sub_id_of(&reply);
 
     // A new flow arrives through the proxy (the chain dispatches RequestHeaders).
     let id = store.insert(http_flow("example.com:443", "/a"));
@@ -2282,9 +2263,7 @@ async fn unsubscribe_stops_push() {
     )
     .await;
     let reply = next_json(&mut lines).await;
-    let sub_id = reply["result"]["structuredContent"]["sub_id"]
-        .as_u64()
-        .expect("sub_id");
+    let sub_id = sub_id_of(&reply);
 
     write_req(
         &mut w,
