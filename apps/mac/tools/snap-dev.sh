@@ -7,10 +7,13 @@
 #
 # Usage: tools/snap-dev.sh              all pages
 #        tools/snap-dev.sh connections  one page (or a comma list)
+#        DEV_TAG=insp tools/snap-dev.sh  own scratch/bundle/shots per session, so two
+#                                        sessions (or worktrees) never overwrite each other
 set -u
 here=${0:A:h:h}
 name=Aitmproxy
-scratch="$HOME/Library/Developer/$name/ui-redesign"
+tag=${DEV_TAG:+-$DEV_TAG}
+scratch="$HOME/Library/Developer/$name/ui-redesign$tag"
 pages=${1:-}
 
 echo "== build (debug)"
@@ -22,7 +25,7 @@ bin="$scratch/debug/$name"
 stale=$(find "$here/Sources" -name '*.swift' -newer "$bin" | head -1)
 [[ -z "$stale" ]] || { echo "build failed: binary is older than $stale"; exit 1; }
 
-dev="/tmp/$name-dev.app"
+dev="/tmp/$name-dev$tag.app"
 installed="$HOME/Applications/$name.app"
 rm -rf "$dev"
 mkdir -p "$dev/Contents/MacOS" "$dev/Contents/Resources"
@@ -35,8 +38,8 @@ else
   sed -e "s/__BUILD__/0/" -e "s/__VERSION__/0.0.0-dev/" "$here/Info.plist.in" > "$dev/Contents/Info.plist"
 fi
 
-store="/tmp/$name-dev-state"
-shots="/tmp/$name-shots-dev"
+store="/tmp/$name-dev-state$tag"
+shots="/tmp/$name-shots-dev$tag"
 rm -rf "$HOME/Library/Saved Application State/com.mrbrutti.aitmproxy.savedState" "$store" "$shots"
 mkdir -p "$store"
 [[ -n "$pages" ]] && export APP_SNAPSHOT_PAGES="$pages"
