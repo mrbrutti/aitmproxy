@@ -31,6 +31,14 @@ use crate::transport::{self, LoopbackTcp};
 /// are dropped and the connection is flagged `lagged`; replies are never bounded.
 pub const DEFAULT_PUSH_CAPACITY: usize = 4096;
 
+/// The default write deadline: how long one send (a websocket frame) or one
+/// `write_all`/`flush` may take before the connection is given up on. The clock
+/// stops when the socket has accepted the frame, not when the peer reads it, so a
+/// slow reader that keeps freeing room is never cut; only a peer that stops
+/// reading with its buffers full is. It is 3x the 10 s handshake budget and lets
+/// one 16 MiB frame finish at about 0.53 MiB/s, far below any real reader.
+pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The most subscriptions one connection may hold at once (web-bus-push spec
 /// AC11). Each is a registry entry retained until `flow.unsubscribe` or the end
 /// of the connection, and every pushed event is matched against all of them
@@ -827,6 +835,10 @@ pub struct McpServer {
     push_tx: Option<broadcast::Sender<Event>>,
     /// Per-connection push-sink capacity (notification lines) before drop-oldest.
     push_capacity: usize,
+    /// The per-send write deadline a transport applies to its writes (a stopped
+    /// peer is disconnected once this elapses with its buffers full). Always at
+    /// least 1 ms.
+    write_timeout: Duration,
     /// Monotonic source of per-connection ids, so each streaming connection's
     /// subscriptions can be dropped when it ends.
     conn_seq: Arc<AtomicU64>,
@@ -893,6 +905,7 @@ impl McpServer {
             subscriptions: Arc::new(Subscriptions::default()),
             push_tx: None,
             push_capacity: DEFAULT_PUSH_CAPACITY,
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
             conn_seq: Arc::new(AtomicU64::new(0)),
             dispatcher_spawned: AtomicBool::new(false),
             confirm_tokens: Arc::new(ConfirmTokens::default()),
@@ -947,6 +960,22 @@ impl McpServer {
     /// size a connection's sink when the caller did not inject one.
     pub fn push_capacity(&self) -> usize {
         self.push_capacity
+    }
+
+    /// Set the write deadline a transport applies to each send or write (a
+    /// websocket frame on the web bridge, a `write_all`/`flush` on the line
+    /// transport). Stored clamped to at least 1 ms: a zero deadline would fail
+    /// every write at once. Defaults to [`DEFAULT_WRITE_TIMEOUT`].
+    pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = timeout.max(Duration::from_millis(1));
+        self
+    }
+
+    /// The configured write deadline. A transport reads it once per connection and
+    /// bounds each write with it, so a peer that stops reading is disconnected
+    /// instead of pinning its task and subscriptions.
+    pub fn write_timeout(&self) -> Duration {
+        self.write_timeout
     }
 
     /// Spawn this server's push dispatcher: one task that drains the core event
@@ -1152,6 +1181,7 @@ impl McpServer {
             subscriptions,
             push_tx,
             push_capacity,
+            write_timeout,
             conn_seq,
             dispatcher_spawned,
             confirm_tokens,
@@ -1178,6 +1208,7 @@ impl McpServer {
             subscriptions,
             push_tx,
             push_capacity,
+            write_timeout,
             conn_seq,
             dispatcher_spawned,
             confirm_tokens,
@@ -2305,5 +2336,29 @@ mod tests {
     #[test]
     fn mcp_host_without_wiring_carries_no_posture() {
         assert_eq!(probe(&probe_server()), json!("absent"));
+    }
+
+    // ------------------------------------------------ bus-hardening Task 1: write timeout
+
+    /// Bus-hardening AC7: a fresh server carries the 30 s default write deadline,
+    /// and the exported constant is that same 30 s.
+    #[test]
+    fn write_timeout_defaults_to_30_seconds() {
+        let srv = McpServer::new(Arc::new(Registry::new()), McpTransport::Stdio);
+        assert_eq!(srv.write_timeout(), Duration::from_secs(30));
+        assert_eq!(DEFAULT_WRITE_TIMEOUT, Duration::from_secs(30));
+    }
+
+    /// Bus-hardening AC7: `with_write_timeout` stores the value it is given, and
+    /// clamps zero up to 1 ms (a zero deadline would fail every write at once).
+    #[test]
+    fn with_write_timeout_sets_it_and_clamps_zero() {
+        let srv = McpServer::new(Arc::new(Registry::new()), McpTransport::Stdio)
+            .with_write_timeout(Duration::from_secs(7));
+        assert_eq!(srv.write_timeout(), Duration::from_secs(7));
+
+        let srv = McpServer::new(Arc::new(Registry::new()), McpTransport::Stdio)
+            .with_write_timeout(Duration::ZERO);
+        assert_eq!(srv.write_timeout(), Duration::from_millis(1));
     }
 }
