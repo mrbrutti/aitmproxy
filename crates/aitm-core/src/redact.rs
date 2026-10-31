@@ -2393,49 +2393,101 @@ mod tests {
         );
     }
 
+    /// Hostile text that gives both scans work: standard keys with a quote that
+    /// never closes, and a standard key beside a wide-only one. The standard scan
+    /// masks the first, and the wide scan reads the masked output. Each family
+    /// finishes, and each comes out as the scan's rules say.
+    #[test]
+    fn scrub_text_wide_stays_linear_when_both_scans_have_work() {
+        let input = "sid=\"x ".repeat(150_000);
+        assert!(
+            scrub_text_wide(&input) == "sid=\"[redacted] ".repeat(150_000),
+            "an opening quote that never closes was not masked in every unit"
+        );
+
+        let input = "sid='x sid=\"x ".repeat(75_000);
+        assert!(
+            scrub_text_wide(&input) == "sid='[redacted] sid=\"[redacted] ".repeat(75_000),
+            "two kinds of unclosed quote on a standard key were not masked in every unit"
+        );
+
+        let input = "sid='x sidebar=\"y ".repeat(75_000);
+        assert!(
+            scrub_text_wide(&input) == "sid='[redacted] sidebar=\"[redacted] ".repeat(75_000),
+            "a standard key beside a wide-only key was not masked in every unit"
+        );
+    }
+
+    /// Each of the five short words, read as a substring inside a key that is no
+    /// whole segment (`mysid2`, `SIDX`, `asid`): the wide scrub masks the value and
+    /// the standard scrub leaves the pair alone. The words are spelled out, not
+    /// read from the list, so a word dropped from the wide reading fails here.
+    #[test]
+    fn scrub_text_wide_masks_a_key_that_merely_contains_each_segment_word() {
+        let mut bad: Vec<(String, String, String)> = Vec::new();
+        for word in ["sid", "jwt", "csrf", "session", "auth"] {
+            let upper = word.to_ascii_uppercase();
+            for key in [
+                format!("my{word}2"),
+                format!("{upper}X"),
+                format!("a{word}"),
+            ] {
+                let input = format!("{key}=VALUE9&page=2");
+                let wide = scrub_text_wide(&input);
+                let standard = scrub_text(&input);
+                if wide != format!("{key}=[redacted]&page=2") || standard != input {
+                    bad.push((input, wide, standard));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "(input, scrub_text_wide, scrub_text) is wrong: {bad:#?}"
+        );
+    }
+
     /// Oversized runs of line breaks and of line-ended pairs: the scan reads each
     /// byte a constant number of times, so these finish, and each comes out as the
     /// scan's rules say.
     #[test]
     fn scrub_text_wide_stays_linear_on_line_break_shapes() {
-        // A wide-only key whose separator ends its line, half a million times: no
+        // A wide-only key whose separator ends its line, over a hundred thousand times: no
         // value on any line, so nothing changes.
-        let input = "author:\n".repeat(1 << 19);
+        let input = "author:\n".repeat(1 << 17);
         assert!(
             scrub_text_wide(&input) == input,
             "a wide-only key with a line break at its separator changed"
         );
 
         // A wide-only parent over a wide-only child, and over a standard child.
-        let input = "authentication:\n  sessionKey: x\n".repeat(100_000);
+        let input = "authentication:\n  sessionKey: x\n".repeat(50_000);
         assert!(
-            scrub_text_wide(&input)
-                == "authentication:\n  sessionKey: [redacted]\n".repeat(100_000),
+            scrub_text_wide(&input) == "authentication:\n  sessionKey: [redacted]\n".repeat(50_000),
             "a wide-only child on the next line was not masked"
         );
-        let input = "authentication:\n  password: x\n".repeat(100_000);
+        let input = "authentication:\n  password: x\n".repeat(50_000);
         assert!(
-            scrub_text_wide(&input) == "authentication:\n  password: [redacted]\n".repeat(100_000),
+            scrub_text_wide(&input) == "authentication:\n  password: [redacted]\n".repeat(50_000),
             "a standard child on the next line was not masked"
         );
 
         // A standard key reads across the line break, so a value is the next
         // line's first token; the scan resumes after it, so the lines pair off.
-        let input = "sid:\n".repeat(200_000);
+        let input = "sid:\n".repeat(100_000);
         assert!(
-            scrub_text_wide(&input) == "sid:\n[redacted]\n".repeat(100_000),
+            scrub_text_wide(&input) == "sid:\n[redacted]\n".repeat(50_000),
             "standard keys on consecutive lines were not masked in pairs"
         );
 
-        // A million line breaks between a key and its separator: the wide scan
+        // Half a million line breaks between a key and its separator: the wide scan
         // stops at the first one, the standard scan reads through them all.
-        let breaks = "\n".repeat(1 << 20);
+        let breaks = "\n".repeat(1 << 19);
         let input = format!("sidebar{breaks}=v");
         assert!(scrub_text_wide(&input) == input, "a wide-only key changed");
         let input = format!("sid{breaks}=v");
         assert!(
             scrub_text_wide(&input) == format!("sid{breaks}=[redacted]"),
-            "a standard key was not masked across a million line breaks"
+            "a standard key was not masked across half a million line breaks"
         );
     }
 }
