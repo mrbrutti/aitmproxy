@@ -1,0 +1,338 @@
+aitmproxy
+v0.5.1
+Working
+Pinned
+Saved
+0
+All
+Apps
+1
+—
+1105
+Domains
+3
+127.0.0.1:59240
+600
+127.0.0.1:59150
+500
+127.0.0.1:59307
+5
+aitmproxy
+Scope
+1
+Scan
+Findings
+0
+Browser
+1 tab
+Scripts
+0 active
+L4
+off
+Agent
+0/min
+⌘⇧F
+aitmproxy · listening 127.0.0.1:18080
+Agent
+0
+All
+HTTP
+HTTPS
+WebSocket
+h1
+h2
+JSON
+Form
+XML
+JS
+CSS
+GraphQL
+Document
+Media
+Other
+Filters
+#
+URL
+Client
+Method
+Status
+Time
+Duration
+Request
+Response
+SSL
+Edited
+Origin
+1080
+http://127.0.0.1:59240/load/merged/579
+—
+GET
+200
+20:46:37.162
+0 ms
+0 B
+56 B
+1081
+http://127.0.0.1:59240/load/merged/580
+—
+GET
+200
+20:46:37.216
+0 ms
+0 B
+56 B
+1082
+http://127.0.0.1:59240/load/merged/581
+—
+GET
+200
+20:46:37.270
+0 ms
+0 B
+56 B
+1083
+http://127.0.0.1:59240/load/merged/582
+—
+GET
+200
+20:46:37.314
+0 ms
+0 B
+56 B
+1084
+http://127.0.0.1:59240/load/merged/583
+—
+GET
+200
+20:46:37.368
+0 ms
+0 B
+56 B
+1085
+http://127.0.0.1:59240/load/merged/584
+—
+GET
+200
+20:46:37.411
+0 ms
+0 B
+56 B
+1086
+http://127.0.0.1:59240/load/merged/585
+—
+GET
+200
+20:46:37.465
+0 ms
+0 B
+56 B
+1087
+http://127.0.0.1:59240/load/merged/586
+—
+GET
+200
+20:46:37.520
+0 ms
+0 B
+56 B
+1088
+http://127.0.0.1:59240/load/merged/587
+—
+GET
+200
+20:46:37.564
+0 ms
+0 B
+56 B
+1089
+http://127.0.0.1:59240/load/merged/588
+—
+GET
+200
+20:46:37.619
+0 ms
+0 B
+56 B
+1090
+http://127.0.0.1:59240/load/merged/589
+—
+GET
+200
+20:46:37.662
+0 ms
+0 B
+56 B
+1091
+http://127.0.0.1:59240/load/merged/590
+—
+GET
+200
+20:46:37.716
+0 ms
+0 B
+56 B
+1092
+http://127.0.0.1:59240/load/merged/591
+—
+GET
+200
+20:46:37.769
+0 ms
+0 B
+56 B
+1093
+http://127.0.0.1:59240/load/merged/592
+—
+GET
+200
+20:46:37.812
+0 ms
+0 B
+56 B
+1094
+http://127.0.0.1:59240/load/merged/593
+—
+GET
+200
+20:46:37.865
+0 ms
+0 B
+56 B
+1095
+http://127.0.0.1:59240/load/merged/594
+—
+GET
+200
+20:46:37.920
+0 ms
+0 B
+56 B
+1096
+http://127.0.0.1:59240/load/merged/595
+—
+GET
+200
+20:46:37.963
+0 ms
+0 B
+56 B
+1097
+http://127.0.0.1:59240/load/merged/596
+—
+GET
+200
+20:46:38.017
+0 ms
+0 B
+56 B
+1098
+http://127.0.0.1:59240/load/merged/597
+—
+GET
+200
+20:46:38.069
+0 ms
+0 B
+56 B
+1099
+http://127.0.0.1:59240/load/merged/598
+—
+GET
+200
+20:46:38.113
+0 ms
+0 B
+56 B
+1100
+http://127.0.0.1:59240/load/merged/599
+—
+GET
+200
+20:46:38.166
+0 ms
+0 B
+56 B
+1101
+http://127.0.0.1:59307/load/liveproof-1793418400020/0
+—
+GET
+200
+20:46:40.118
+2 ms
+0 B
+71 B
+1102
+http://127.0.0.1:59307/load/liveproof-1793418400020/4
+—
+GET
+200
+20:46:40.118
+3 ms
+0 B
+71 B
+1103
+http://127.0.0.1:59307/load/liveproof-1793418400020/2
+—
+GET
+200
+20:46:40.118
+4 ms
+0 B
+71 B
+1104
+http://127.0.0.1:59307/load/liveproof-1793418400020/3
+—
+GET
+200
+20:46:40.118
+4 ms
+0 B
+71 B
+1105
+http://127.0.0.1:59307/load/liveproof-1793418400020/1
+—
+GET
+200
+20:46:40.118
+4 ms
+0 B
+71 B
+Agent
+130 actions / min
+connected clients
+Allow all tools
+Read-only
+Paused
+
+Pending confirmations
+
+Confirmations arrive with the agent stream (F1): this stays empty until the core exposes it — it is not a live “nothing pending”.
+
+Activity log2
+All
+Agent
+Human
+Errors
+Clear view
+time
+origin
+command
+args
+20:47:52
+agent
+script.list
+—
+20:45:22
+agent
+script.list
+—
+Clear
+Filter
+Auto-select
+1105 / 1105 rows
+0 paused
+1 host in scope
+0 findings
+↑ 0 B/s
+↓ 0 B/s
+bus 127.0.0.1:18082

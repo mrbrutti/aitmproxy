@@ -1,0 +1,66 @@
+{
+  "label": "final-idle2",
+  "at": "2026-10-31T03:08:06.283Z",
+  "valid": true,
+  "warnings": [],
+  "url": "ws://127.0.0.1:18082/bus",
+  "proxy": "127.0.0.1:18080",
+  "uiOrigin": "mcp",
+  "server": {
+    "name": "aitmproxy",
+    "version": "0.5.0"
+  },
+  "role": "agent",
+  "subId": 3,
+  "idle": {
+    "startMs": 1793416086285,
+    "endMs": 1793416116287,
+    "secs": 30.002,
+    "perCommand": {
+      "proxy.status": 15,
+      "flow.list": 43
+    },
+    "total": 58,
+    "otherOrigins": {},
+    "windowMs": 30002,
+    "ratePerSec": {
+      "proxy.status": 0.49996666888874075,
+      "flow.list": 1.4332377841477235
+    },
+    "totalPerSec": 1.9332044530364643,
+    "notifications": {
+      "flow": 0,
+      "agent": 58,
+      "state": 0,
+      "other": 0,
+      "lagged": 0,
+      "nonAudit": 0,
+      "dropped": 0
+    },
+    "notificationsPerSec": {
+      "flow": 0,
+      "agent": 1.9332044530364643,
+      "state": 0,
+      "other": 0,
+      "lagged": 0,
+      "nonAudit": 0,
+      "dropped": 0
+    }
+  },
+  "traffic": null,
+  "flowList": {
+    "ids": 1100,
+    "bytes": 42901,
+    "frameBytes": 92514
+  },
+  "collected": {
+    "auditLines": 59,
+    "flow": 0,
+    "agent": 59,
+    "state": 0,
+    "other": 0,
+    "lagged": 0,
+    "nonAudit": 0,
+    "dropped": 0
+  }
+}

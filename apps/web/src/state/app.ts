@@ -6,10 +6,11 @@
 //    so the virtualizer re-reads the visible slice at most 60×/s regardless of arrival rate;
 //  - filters run over untracked raw snapshots, never through store proxies.
 
-import { batch, createMemo, createRoot, createSignal, untrack, type Accessor } from 'solid-js';
+import { batch, createEffect, createMemo, createRoot, createSignal, on, untrack, type Accessor } from 'solid-js';
 import { createStore, produce, reconcile, type SetStoreFunction } from 'solid-js/store';
-import type { BusClient, AgentNotification, FlowNotification, StateNotification, ToolDef } from '~/bus/types';
-import { toDetail, toSummary } from '~/bus/normalize';
+import type { BusClient, AgentNotification, FlowEventKind, FlowNotification, StateNotification, ToolDef } from '~/bus/types';
+import { toAgentEntry, toDetail, toSummary } from '~/bus/normalize';
+import { isUiPollNoise, ownOriginOf } from '~/bus/noise';
 import type { PocRun } from '~/bus/mock';
 import {
   contentFamily,
@@ -153,6 +154,29 @@ export function createAppStore(bus: BusClient) {
     // ---- flows ------------------------------------------------------------
     const entries: FlowEntry[] = [];
     const byId = new Map<FlowId, FlowEntry>();
+    // What lives here: the push coalescer's queue, timer and flags, the row-fetch tickets and the clear
+    // epoch, and the single-flight poll slot. It is declared ahead of `clearFlows` (just below), which
+    // drops the pending set and bumps the epoch long before the coalescer and the loop are defined.
+    // The push clocks (`lastFlowPushAt`, `lastStatePushAt`) sit just above the notification handler;
+    // `failedAt`, `backlog`, `toolsLoaded`, `lastPollAt`, `lastStatusAt` and `pollLoopOn` come with
+    // the loop.
+    /** Ids a flow push named that the coalescer has not fetched yet, in first-notification (capture) order. */
+    const pushPending = new Set<FlowId>();
+    /** The armed coalescing timer, if any (`armPush`). */
+    let pushTimer: ReturnType<typeof setTimeout> | null = null;
+    /** A flush is applying; one runs at a time. */
+    let flushing = false;
+    /** A queued event was `intercepted|released|killed`: the next flush recomputes `pausedIds` after it applies. */
+    let pausedIdsStale = false;
+    /** Per id, the ticket of the newest row fetch issued for it; an older reply is dropped. */
+    const fetchTicket = new Map<FlowId, number>();
+    let fetchSeq = 0;
+    /** Bumped by `clearFlows`: a fetch issued under an older epoch applies nothing (no ghost row after `flow.clear`). */
+    let clearEpoch = 0;
+    /** The poll in progress, if any: `pollOnce` joins it rather than overlapping it. */
+    let pollRunning: Promise<void> | null = null;
+    /** A resync was requested while a poll was running: exactly one more runs when it finishes. */
+    let pollTrailing = false;
     const [version, setVersion] = createSignal(0);
     let bumpScheduled = false;
     const bump = () => {
@@ -253,6 +277,8 @@ export function createAppStore(bus: BusClient) {
     function clearFlows() {
       entries.length = 0;
       byId.clear();
+      dropPending();
+      clearEpoch++;
       setDetails(reconcile({}));
       setSelectedIdRaw(null);
       setSelectedIds(new Set<FlowId>());
@@ -266,7 +292,23 @@ export function createAppStore(bus: BusClient) {
       setProxy('pausedIds', ids);
     }
 
+    /** Events after which a flow's cached detail is stale. */
+    const changesDetail = (e: FlowEventKind) => e === 'response' || e === 'mutated' || e === 'meta' || e === 'released' || e === 'killed';
+    /** Events after which `pausedIds` has to be recomputed from the rows. */
+    const changesPause = (e: FlowEventKind) => e === 'intercepted' || e === 'released' || e === 'killed';
+    /** Detail is stale once anything changed: drop the cache, and reload it now if the inspector shows this flow. */
+    function invalidateDetail(id: FlowId) {
+      if (details[id]) setDetails(produce((d) => delete d[id]));
+      if (untrack(selectedId) === id) void loadDetail(id, true);
+    }
+
     function onFlowEvent(n: FlowNotification) {
+      if (bus.address !== 'fixtures') {
+        onFlowTrigger(n);
+        return;
+      }
+      // The fixtures bus pushes complete, correctly-spelled summaries, and the dev UI and the perf
+      // harness rely on them landing synchronously: apply the summary directly.
       if (n.event === 'cleared') {
         clearFlows();
         return;
@@ -274,15 +316,44 @@ export function createAppStore(bus: BusClient) {
       if (!n.summary) return;
       const s = toSummary(n.summary, entries.length + 1);
       upsert(s);
-      if (n.event === 'response' || n.event === 'mutated' || n.event === 'meta' || n.event === 'released' || n.event === 'killed') {
-        // Detail is stale once anything changed; the inspector refetches on demand.
-        if (details[s.id]) setDetails(produce((d) => delete d[s.id]));
-        if (untrack(selectedId) === s.id) void loadDetail(s.id, true);
-      }
-      if (n.event === 'intercepted' || n.event === 'released' || n.event === 'killed') recomputePaused();
+      if (changesDetail(n.event)) invalidateDetail(s.id);
+      if (changesPause(n.event)) recomputePaused();
     }
 
-    function onState(s: StateNotification) {
+    /**
+     * A real bus: the push is a trigger, never data. The server's summary is sparse (`kind:"ws"`,
+     * no times, no sizes) and would regress a rich row, so it is ignored; the id is queued and the
+     * coalescer refetches it through the same helper the poll uses.
+     */
+    function onFlowTrigger(n: FlowNotification) {
+      if (n.event === 'cleared') {
+        clearFlows();
+        return;
+      }
+      if (!n.id) return;
+      // A chatty WebSocket would refetch an O(messages) detail many times a second; live message
+      // counters are a non-goal, so a message on a known flow changes nothing. On an unknown id it
+      // is the first we hear of the flow.
+      if (n.event === 'ws_message' && byId.has(n.id)) return;
+      if (changesDetail(n.event)) invalidateDetail(n.id);
+      if (changesPause(n.event)) pausedIdsStale = true;
+      queuePush(n.id);
+    }
+
+    /**
+     * Only a complete payload is state. The `lagged` marker and any partial push would otherwise
+     * delete `listening`, `armed` and `agent` from the store (a Solid store drops a key set to
+     * undefined) and zero throughput and memory; they write nothing and advance no clock.
+     */
+    const isCompleteState = (p: unknown): p is StateNotification => {
+      const s = p as Partial<StateNotification> | null | undefined;
+      return typeof s?.listening === 'boolean' && typeof s?.intercept_armed === 'boolean';
+    };
+
+    /** Applies a state payload; false when it was not a complete state, in which case nothing was written. */
+    function onState(p: unknown): boolean {
+      if (!isCompleteState(p)) return false;
+      const s = p;
       batch(() => {
         setProxy({
           listening: s.listening,
@@ -295,44 +366,144 @@ export function createAppStore(bus: BusClient) {
           memoryBytes: s.memory_bytes ?? null,
         });
       });
+      return true;
     }
 
-    function onAgent(a: AgentNotification) {
+    /** Newest lines kept, after the noise filter, on both paths. */
+    const ACTIVITY_CAP = 500;
+    /**
+     * The one intake behind the live push (`append`) and the `agent.activity` snapshot (`replace`)
+     * (push spec D6, D7). Each line is normalized from the server's wire shape (`toAgentEntry`; an
+     * `approval_requested` line is not an audit entry and is skipped), this UI's own successful
+     * background reads are dropped, what is kept is numbered, and the newest ACTIVITY_CAP stay. The
+     * filter runs on BOTH paths: the web server echoes every call made over `/bus` back to us, and
+     * since PR #145 it shares the primary's audit ring (`tui::with_shared_governance`), so the
+     * snapshot holds this UI's own polling too, up to the ring's 4096 lines; own-ness is inferred from
+     * this connection's role because the bridge labels nothing (D7, fifth amendment). A batch that
+     * keeps nothing changes nothing, in either mode: a snapshot that is empty (a fresh core) or all
+     * our own polling must not replace the push-fed log with nothing on every side refresh (scope.add,
+     * poc.run, the catalogue heal).
+     */
+    function intakeActivity(raw: readonly unknown[], mode: 'append' | 'replace') {
+      const own = { origin: ownOriginOf(untrack(bus.role)) };
+      const kept: ActivityEntry[] = [];
+      for (const item of raw) {
+        const e = toAgentEntry(item);
+        if (!e || isUiPollNoise(e, own)) continue;
+        kept.push({ ...e, seq: ++activitySeq });
+      }
+      commitActivity(kept, mode);
+    }
+    /** Append to (or replace) the log with already-numbered rows and keep the newest ACTIVITY_CAP; nothing kept, nothing changed. */
+    function commitActivity(kept: ActivityEntry[], mode: 'append' | 'replace') {
+      if (!kept.length) return;
       setProxy('activity', (list) => {
-        const next = [...list, { ...a, seq: ++activitySeq }];
-        return next.length > 500 ? next.slice(-500) : next;
+        const next = mode === 'replace' ? kept : [...list, ...kept];
+        return next.length > ACTIVITY_CAP ? next.slice(-ACTIVITY_CAP) : next;
       });
     }
+    /**
+     * Why audit lines can be missing from the push-fed log (push spec D7, fourth amendment): the server
+     * dropped notifications for this connection (`lagged`), or the bus reconnected and whatever was pushed
+     * during the outage is gone. The sentence goes in `args` so the table shows it, and in `detail` for
+     * the result tooltip.
+     */
+    const GAP_NOTE = {
+      lagged: 'audit lines may be missing: the push stream lagged',
+      reconnected: 'audit lines may be missing: the bus reconnected',
+    } as const;
+    interface GapArgs {
+      note: string;
+      count: number;
+    }
+    /** The `seq` of the gap row this store appended last; a new gap folds into it only while it is still the newest row. */
+    let lastGapSeq = 0;
+    /**
+     * Make a gap visible as one synthetic error row (an `audit-log` line of our own, not an audit entry,
+     * so it never meets the noise rule, and never a real line: the fold matches the row by the seq this
+     * store gave it, not by its shape). Consecutive gaps FOLD into the newest row (`count` and `at`
+     * move, the first reason's sentence stays), so a sustained lag cannot evict the 500-row history
+     * with notices; a real row in between starts a new gap row. The fold updates the row in place
+     * (`<For>` keys by object identity, so the rendered row is not rebuilt) but gives it a fresh `seq`:
+     * `seq` is the Clear-view watermark (`filterActivity`, `clearedThrough`), and a fold that kept the
+     * old number would stay hidden behind a Clear made after the first gap. The lost lines themselves
+     * cannot be recovered over `aitm web`.
+     */
+    function noteAuditGap(why: keyof typeof GAP_NOTE) {
+      const at = new Date().toISOString();
+      const list = untrack(() => proxy.activity);
+      const last = list[list.length - 1];
+      if (last && last.seq === lastGapSeq) {
+        const prev = last.args as GapArgs;
+        lastGapSeq = ++activitySeq;
+        setProxy('activity', list.length - 1, { seq: lastGapSeq, at, args: { note: prev.note, count: prev.count + 1 } });
+        return;
+      }
+      lastGapSeq = ++activitySeq;
+      const args: GapArgs = { note: GAP_NOTE[why], count: 1 };
+      commitActivity([{ seq: lastGapSeq, origin: 'operator', command: 'audit-log', result: 'error', at, args, detail: GAP_NOTE[why] }], 'append');
+    }
 
-    // When the last flow / state notification landed. The poll loop backs off only while the matching
-    // stream is demonstrably flowing — never because the core merely *advertises* `flow.subscribe`,
-    // and never for the list because only the state stream (throughput ticks) is alive.
+    function onAgent(a: unknown) {
+      intakeActivity([a], 'append');
+    }
+
+    // When the last flow / complete state notification landed. The poll loop backs off only while the
+    // matching stream is demonstrably flowing — never because the core merely *advertises*
+    // `flow.subscribe`, and never for the list because only the state stream (throughput ticks) is
+    // alive. Only `notifications/aitm/flow` advances the flow clock (an audit line, a state line or
+    // the `lagged` marker says nothing about flows); only a complete state payload advances the state
+    // clock. Both are reset when the bus (re)opens, and the flow clock by `lagged`.
     let lastFlowPushAt = Number.NEGATIVE_INFINITY;
     let lastStatePushAt = Number.NEGATIVE_INFINITY;
+
+    /** A flow event is an object with a string `event` and a string `id`; anything else is not a flow push at all. */
+    const isFlowNotification = (p: unknown): p is FlowNotification => {
+      const n = p as Partial<FlowNotification> | null | undefined;
+      return typeof n?.event === 'string' && typeof n?.id === 'string';
+    };
 
     bus.onNotification((method, params) => {
       switch (method) {
         case 'notifications/aitm/flow':
+          // Validated before the clock moves: a malformed line proves nothing about the stream.
+          if (!isFlowNotification(params)) break;
           lastFlowPushAt = Date.now();
-          onFlowEvent(params as FlowNotification);
+          onFlowEvent(params);
           break;
         case 'notifications/aitm/state':
-          lastStatePushAt = Date.now();
-          onState(params as StateNotification);
+          if ((params as { lagged?: unknown } | null | undefined)?.lagged === true) {
+            // The server's lane for this connection overflowed and dropped notifications. The marker
+            // is not state and proves nothing about the flow stream: push is distrusted until the next
+            // flow notification, and the list is resynced now, not on the next tick. The server pushes
+            // no state, so nothing in the status was lost and that clock is left alone. Audit lines
+            // were lost too and cannot be re-read: the log gets one row that says so.
+            lastFlowPushAt = Number.NEGATIVE_INFINITY;
+            requestPollNow();
+            noteAuditGap('lagged');
+            break;
+          }
+          // Only a complete payload is a state push: the clock moves only when one was applied.
+          if (onState(params)) lastStatePushAt = Date.now();
           break;
         case 'notifications/aitm/agent':
-          onAgent(params as AgentNotification);
+          onAgent(params);
           break;
       }
     });
 
-    // ---- live updates: poll unless push is demonstrably flowing -------------
-    // Every real bus is polled. `flow.subscribe` being advertised proves nothing — nothing here calls
-    // it, and the /bus bridge pushes no notifications — so the loop runs regardless. It skips the flow
-    // poll only while a FLOW notification arrived within PUSH_FRESH_MS, and the status poll only while
-    // a STATE one did (a bridge that pushes just throughput ticks must not slow the list down). Even
-    // then a heartbeat runs every PUSH_FRESH_MS, so a push that dies quietly or loses events cannot
-    // freeze either. The loop touches the bus only while it is `open` (a call into a bus that is
+    // ---- live updates: push as a trigger, poll unless push is demonstrably flowing -------------
+    // The bus client subscribes (`flow.subscribe`, in ws.ts) on every open, and a flow notification
+    // is treated as a trigger: the id is queued and refetched (`onFlowTrigger`, `flushPush`), never
+    // applied from the push's sparse summary. The outcome of the subscribe is not surfaced, and a
+    // confirmed subscription cannot be told from a dispatcher that is not fed until a push arrives, so
+    // every real bus is still polled. The loop skips the flow poll only while a FLOW notification
+    // arrived within PUSH_FRESH_MS, and the status poll only while a STATE one did (a bridge that
+    // pushes just throughput ticks must not slow the list down). Even then a heartbeat runs every
+    // PUSH_FRESH_MS, so a push that dies quietly or loses events cannot freeze either. When the bus
+    // (re)opens both clocks are reset and the pending set dropped, so the first tick after an outage
+    // takes a fresh snapshot; a `lagged` marker resyncs at once (`requestPollNow`), single-flight with
+    // the tick's own poll. The loop touches the bus only while it is `open` (a call into a bus that is
     // reconnecting can wait on it indefinitely), and heals a bootstrap that never got the tool
     // catalogue. The static `fixtures` bus is a snapshot and is never polled.
     const POLL_MS = 500;
@@ -347,6 +518,12 @@ export function createAppStore(bus: BusClient) {
      * (and so the 500 ms cadence) on for good.
      */
     const FAILED_RETRY_MS = 5000;
+    /** A throttle, not a debounce: the first queued id arms one timer, traffic never re-arms it, so push latency is bounded. */
+    const PUSH_COALESCE_MS = 100;
+    /** `flow.detail` calls in flight per flush wave: the bridge runs at most this many frames concurrently. */
+    const PUSH_FETCH_WAVE = 16;
+    /** Distinct ids the coalescer holds; past it the surplus is left to the poll (`backlog`), so memory stays bounded. */
+    const PUSH_MAX_PENDING = 256;
     const failedAt = new Map<FlowId, number>();
     let pollLoopOn = false;
     let toolsLoaded = false;
@@ -358,52 +535,170 @@ export function createAppStore(bus: BusClient) {
       const age = now - at;
       return age >= 0 && age < PUSH_FRESH_MS;
     };
-    async function pollOnce() {
+    /** True while `id` is paused for a recent read failure (shared by the poll and the push flush). */
+    function isHeld(id: FlowId, now: number): boolean {
+      const at = failedAt.get(id);
+      return at !== undefined && now - at >= 0 && now - at < FAILED_RETRY_MS;
+    }
+    /** A `flow.detail` / `flow.get` reply is the row for `id` only if it says so itself. */
+    const isRowFor = (raw: unknown, id: FlowId): boolean => !!raw && typeof raw === 'object' && (raw as { id?: unknown }).id === id;
+    /**
+     * The one fetcher behind the poll and the push flush. `flow.detail {body: none}` is a summary
+     * with headers, sizes, times and the connection — everything a row shows — at the cost of one
+     * call per flow, like `flow.get` (used when the catalogue lacks `flow.detail`). `wave` calls are
+     * in flight at a time; each wave is applied in one batch, in id order, with `seqOf(id)` read at
+     * apply time. A good read clears `failedAt`, a failed one sets it. A reply is dropped when the
+     * list was cleared since the fetch was issued (epoch) or a newer fetch for that id was issued
+     * since (ticket), so two fetchers (the heartbeat poll and a flush) cannot land out of order.
+     */
+    async function fetchRows(ids: readonly FlowId[], seqOf: (id: FlowId) => number, wave: number): Promise<void> {
+      const rich = proxy.tools.some((t) => t.name === 'flow.detail');
+      // One epoch for the whole call: a clear during any wave ends the call, or the later waves would
+      // run under the new epoch and put back rows the operator just cleared.
+      const epoch = clearEpoch;
+      for (let i = 0; i < ids.length; i += wave) {
+        if (epoch !== clearEpoch) return;
+        const slice = ids.slice(i, i + wave);
+        const tickets = slice.map((id) => {
+          const t = ++fetchSeq;
+          fetchTicket.set(id, t);
+          return t;
+        });
+        const got = await Promise.all(
+          slice.map((id) => (rich ? bus.call('flow.detail', { id, body: 'none' }) : bus.call('flow.get', { id })).catch(() => null)),
+        );
+        const failedNow = Date.now();
+        batch(() => {
+          got.forEach((raw, j) => {
+            const id = slice[j]!;
+            // Stale when a newer fetch owns the id (it will tidy the ticket) or the list was cleared since.
+            const newest = fetchTicket.get(id) === tickets[j];
+            if (newest) fetchTicket.delete(id);
+            if (!newest || epoch !== clearEpoch) return;
+            // Keyed by the id that was asked for: a reply naming another flow, or none, would make a
+            // ghost row (`''`) or overwrite that other row. It is a failed read like any other.
+            if (isRowFor(raw, id)) {
+              failedAt.delete(id);
+              upsert(toSummary(raw, seqOf(id)));
+            } else failedAt.set(id, failedNow);
+          });
+        });
+      }
+    }
+    /** Single-flight: the running poll's promise when one is running, else a new one. */
+    function pollOnce(): Promise<void> {
+      if (pollRunning) return pollRunning;
+      pollRunning = runPoll().finally(() => {
+        pollRunning = null;
+        if (pollTrailing) {
+          pollTrailing = false;
+          void pollOnce();
+        }
+      });
+      return pollRunning;
+    }
+    /** Resync now, not on the next tick: start a poll, or fold into one trailing poll if one is running. */
+    function requestPollNow(): void {
+      // Only an open bus is called (the marker can land during a handshake): a poll parked on `ready`
+      // would hold the single-flight slot and stall the loop's own polls behind it.
+      if (bus.state() !== 'open') return;
+      if (pollRunning) pollTrailing = true;
+      else void pollOnce();
+    }
+    async function runPoll() {
       lastPollAt = Date.now();
       try {
         const ids = await bus.call<string[]>('flow.list');
         const now = Date.now();
-        const held = (id: FlowId) => {
-          const at = failedAt.get(id);
-          return at !== undefined && now - at >= 0 && now - at < FAILED_RETRY_MS;
-        };
         // Forget pauses that ended and flows that are gone (flow.clear), so the map stays small.
         if (failedAt.size) {
           const listed = new Set(ids);
-          for (const id of failedAt.keys()) if (!held(id) || !listed.has(id)) failedAt.delete(id);
+          for (const id of failedAt.keys()) if (!isHeld(id, now) || !listed.has(id)) failedAt.delete(id);
         }
         // Oldest first, so the list stays in capture order while the backlog drains. Only flows not
         // paused for a recent failure are eligible, and the backlog is measured over those alone.
-        const unseen = ids.filter((id) => !byId.has(id) && !held(id));
+        const unseen = ids.filter((id) => !byId.has(id) && !isHeld(id, now));
         const fresh = unseen.slice(0, MAX_FRESH_PER_POLL);
         backlog = unseen.length > fresh.length;
         const pending = ids.filter((id) => {
           const e = byId.get(id);
-          return e && e.raw.status == null && e.raw.intercept !== 'killed' && !held(id);
+          return e && e.raw.status == null && e.raw.intercept !== 'killed' && !isHeld(id, now);
         });
         const want = [...fresh, ...pending.slice(0, 50)];
-        // `flow.detail {body: none}` is a summary with headers, sizes, times and the connection
-        // — everything a row shows — at the cost of one call per flow, like `flow.get`.
-        const rich = proxy.tools.some((t) => t.name === 'flow.detail');
-        const got = await Promise.all(
-          want.map((id) => (rich ? bus.call('flow.detail', { id, body: 'none' }) : bus.call('flow.get', { id })).catch(() => null)),
-        );
-        const failedNow = Date.now();
-        batch(() => {
-          got.forEach((raw, i) => {
-            const id = want[i]!;
-            if (raw) {
-              failedAt.delete(id);
-              upsert(toSummary(raw, ids.indexOf(id) + 1));
-            } else failedAt.set(id, failedNow);
-          });
-          recomputePaused();
-        });
+        // One wave: the poll's fan-out is bounded by MAX_FRESH_PER_POLL, and its seq is the core's position.
+        await fetchRows(want, (id) => ids.indexOf(id) + 1, Math.max(1, want.length));
+        recomputePaused();
       } catch {
         // `flow.list` itself failed. The loop only calls an open bus, so this is a call that errored on
         // a live connection: it is retried on the next tick. A core that keeps erroring leaves the list
         // as it was (stale), and nothing says so: no toast, and the status bar only reflects whether
         // the bus connection is up. (Individual unreadable flows are handled by `failedAt`.)
+      }
+    }
+    // ---- the push coalescer (its state is declared with the flows, above) ----------------------
+    function armPush() {
+      if (pushTimer !== null) return;
+      pushTimer = setTimeout(() => {
+        pushTimer = null;
+        void flushPush();
+      }, PUSH_COALESCE_MS);
+    }
+    /** Forget every queued id and disarm the timer: the list was cleared, or the connection is new. */
+    function dropPending() {
+      pushPending.clear();
+      pausedIdsStale = false;
+      if (pushTimer !== null) {
+        clearTimeout(pushTimer);
+        pushTimer = null;
+      }
+    }
+    /** Queue an id a flow push named; one flush runs at a time, and the next timer is armed when it finishes. */
+    function queuePush(id: FlowId) {
+      if (!pushPending.has(id)) {
+        if (pushPending.size >= PUSH_MAX_PENDING) {
+          // The surplus is dropped; the poll (capped, oldest first) reconciles it on the 500 ms cadence.
+          backlog = true;
+          return;
+        }
+        pushPending.add(id);
+      }
+      if (!flushing) armPush();
+    }
+    async function flushPush(): Promise<void> {
+      if (flushing) return;
+      if (bus.state() !== 'open') {
+        // Nothing is sent into a bus that is not open: the queue and its pause mark are dropped, and
+        // the resync on reconnect takes a fresh snapshot.
+        dropPending();
+        return;
+      }
+      if (!toolsLoaded) {
+        // Without the catalogue the fetch would fall back to `flow.get`, a thinner row than the
+        // poll's `flow.detail`; wait for the loop to heal it.
+        armPush();
+        return;
+      }
+      flushing = true;
+      try {
+        const now = Date.now();
+        // Taken and removed now, so an event that arrives while these are in flight re-queues its id
+        // and it is refetched after this flush. Ids paused for a recent failure wait for the poll.
+        const ids = [...pushPending].filter((id) => !isHeld(id, now));
+        pushPending.clear();
+        const stale = pausedIdsStale;
+        pausedIdsStale = false;
+        // A new id takes the next position at apply time (inside the batch, so consecutive new ids
+        // get consecutive numbers whatever order the replies came back in); a known id keeps its seq.
+        if (ids.length) await fetchRows(ids, (id) => byId.get(id)?.raw.seq ?? entries.length + 1, PUSH_FETCH_WAVE);
+        if (stale) recomputePaused();
+      } catch {
+        // Applying a wave threw (the fetch itself never rejects). The ids taken above are not
+        // re-queued: the poll re-reads what is missing, at the heartbeat at the latest, as it does
+        // for any failed read. This runs from a timer, so the error must not escape as an unhandled
+        // rejection, and `flushing` must be released below.
+      } finally {
+        flushing = false;
+        if (pushPending.size) armPush();
       }
     }
     async function pollStatus() {
@@ -421,6 +716,29 @@ export function createAppStore(bus: BusClient) {
         /* next tick */
       }
     }
+    // Every (re)connection is a new stream: nothing pushed before an outage says anything about what
+    // was captured during it. Both clocks are reset so the next tick takes a fresh snapshot even if a
+    // push was fresh seconds ago, held failures are retried, and ids queued for the socket that is
+    // gone are dropped (the snapshot covers them). The flows are covered that way; the audit lines
+    // pushed during the outage are not, so every open after the first notes a gap in the Activity log
+    // (the first open missed nothing). Deferred: the state at creation is not a transition, which is
+    // why `hasBeenOpen` is seeded from it (a bus handed over already open has had its first open).
+    let hasBeenOpen = untrack(bus.state) === 'open';
+    createEffect(
+      on(
+        bus.state,
+        (s) => {
+          if (s !== 'open') return;
+          if (hasBeenOpen) noteAuditGap('reconnected');
+          hasBeenOpen = true;
+          lastFlowPushAt = Number.NEGATIVE_INFINITY;
+          lastStatePushAt = Number.NEGATIVE_INFINITY;
+          failedAt.clear();
+          dropPending();
+        },
+        { defer: true },
+      ),
+    );
     /** `polling` means the loop is the live source: the bus is open and no flow notifications are arriving. */
     const syncPollingFlag = () => setProxy('polling', bus.state() === 'open' && !isFresh(lastFlowPushAt, Date.now()));
     function startPolling() {
@@ -534,19 +852,24 @@ export function createAppStore(bus: BusClient) {
       if (has('agent.status'))
         jobs.push(
           bus
-            .call<{ policy: AgentPolicy; actions_last_minute: number; log?: AgentNotification[] }>('agent.status')
+            .call<{ policy: AgentPolicy; actions_last_minute: number; log?: unknown[] }>('agent.status')
             .then((a) => {
               setProxy({ agent: a.policy, agentActionsLastMinute: a.actions_last_minute });
-              // The activity log rides on agent.status as `log` (no agent.activity command on the bus).
-              if (Array.isArray(a.log) && !has('agent.activity')) setProxy('activity', a.log.map((e) => ({ ...e, seq: ++activitySeq })));
+              // On a bus without agent.activity the log rides on agent.status as `log` (the real core sends none).
+              if (Array.isArray(a.log) && !has('agent.activity')) intakeActivity(a.log, 'replace');
             })
             .catch(() => {}),
         );
       if (has('agent.activity'))
         jobs.push(
           bus
-            .call<AgentNotification[]>('agent.activity')
-            .then((list) => setProxy('activity', list.map((a) => ({ ...a, seq: ++activitySeq }))))
+            .call<unknown>('agent.activity')
+            // No `limit`: the ring is the snapshot, and the intake filters and caps it. Over `aitm web`
+            // the ring was empty before PR #145 (the web server's own ring was not the one agent.activity
+            // read); since then it is the primary's, shared, and holds this UI's own polling.
+            .then((list) => {
+              if (Array.isArray(list)) intakeActivity(list, 'replace');
+            })
             .catch(() => {}),
         );
       // No read for the intercept state exists: `flow.intercept {}` ARMS (enabled defaults to

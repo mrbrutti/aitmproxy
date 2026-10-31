@@ -2,7 +2,7 @@
 // branch (crates/aitm-plugins/src/{capture,detail,meta}.rs): if the core changes, change this.
 import { describe, expect, it } from 'vitest';
 import { bytesToBase64, utf8Encode } from '~/lib/bytes';
-import { toDetail, toSummary } from './normalize';
+import { toAgentEntry, toDetail, toSummary } from './normalize';
 
 const b64 = (s: string) => bytesToBase64(utf8Encode(s));
 
@@ -147,5 +147,145 @@ describe('toDetail (bus flow.detail)', () => {
     expect(fx.request.body.text).toBe('hi');
     expect(fx.request.headers[0]).toEqual({ name: 'a', value: 'b' });
     expect(fx.client.name).toBe('curl');
+  });
+});
+
+// The audit line the server pushes on `notifications/aitm/agent` and returns from `agent.activity`
+// (crates/aitm-core/src/audit.rs): `at` epoch ms, `client_label`, `args` a redacted JSON string,
+// `result` `"ok"` or `{error}`. The fixture bus sends the UI model directly.
+describe('toAgentEntry (audit line)', () => {
+  const wire = { at: 1730000000000, origin: 'mcp', client_label: 'claude-code', command: 'flow.replay', args: '{"id":"f_1"}', result: 'ok' };
+
+  it('maps the server shape', () => {
+    expect(toAgentEntry(wire)).toStrictEqual({
+      at: '2024-10-27T03:33:20.000Z',
+      origin: 'mcp',
+      clientLabel: 'claude-code',
+      command: 'flow.replay',
+      args: { id: 'f_1' },
+      result: 'ok',
+    });
+    // An unlabelled connection (the bridge today) keeps the explicit null, so own-ness can be inferred.
+    expect(toAgentEntry({ ...wire, client_label: null })?.clientLabel).toBeNull();
+  });
+
+  it('maps an error result', () => {
+    const e = toAgentEntry({ ...wire, result: { error: 'refused: x' } });
+    expect(e?.result).toBe('error');
+    expect(e?.detail).toBe('refused: x');
+    // An already-model error (fixture bus) stays as it is.
+    const model = toAgentEntry({ origin: 'cli', command: 'scope.add', result: 'error', detail: 'refused', at: '2024-10-27T03:33:20.000Z' });
+    expect(model?.result).toBe('error');
+    expect(model?.detail).toBe('refused');
+  });
+
+  it('keeps unparseable args as text', () => {
+    expect(toAgentEntry({ ...wire, args: '{"id":"f_' })?.args).toBe('{"id":"f_');
+    // A JSON scalar is not an args object either; the redacted text stays as text.
+    expect(toAgentEntry({ ...wire, args: '"f_1"' })?.args).toBe('"f_1"');
+  });
+
+  it('accepts the fixture model', () => {
+    const fx = { origin: 'web', command: 'flow.kill', args: { id: 'f_2' }, result: 'ok', at: '2024-10-27T03:33:20.000Z' };
+    const e = toAgentEntry(fx);
+    expect(e?.origin).toBe('web');
+    expect(e?.args).toEqual({ id: 'f_2' });
+    expect(e?.at).toBe('2024-10-27T03:33:20.000Z');
+    expect(e?.command).toBe('flow.kill');
+    expect(e?.result).toBe('ok');
+  });
+
+  it('rejects non-audit lines', () => {
+    // The operator-role approval request rides the same notification but is not an audit entry.
+    expect(toAgentEntry({ event: 'approval_requested', command: 'ca.install', args_summary: '{}', prompt: 'x', request_id: 'apr_1' })).toBeNull();
+    expect(toAgentEntry({ origin: 'mcp', result: 'ok' })).toBeNull();
+    expect(toAgentEntry({ ...wire, command: '' })).toBeNull();
+    expect(toAgentEntry(null)).toBeNull();
+    expect(toAgentEntry('flow.list')).toBeNull();
+  });
+
+  it('rejects an event line whatever else it carries', () => {
+    // `event` alone marks it: even a line that also has an origin and a command is not an audit entry.
+    expect(toAgentEntry({ ...wire, event: 'approval_requested' })).toBeNull();
+    // A line that cannot be attributed to a frontend is not an entry either (it could not be filtered or labelled).
+    expect(toAgentEntry({ at: wire.at, command: 'flow.replay', args: wire.args, result: 'ok' })).toBeNull();
+  });
+
+  it('survives hostile and oversized fields', () => {
+    // A timestamp outside Date's range is not a time: the entry is still produced, stamped now.
+    for (const at of [1e20, -1e20, Number.NaN, Number.POSITIVE_INFINITY, undefined, null, {}]) {
+      const e = toAgentEntry({ ...wire, at });
+      expect(e, String(at)).not.toBeNull();
+      expect(Number.isFinite(Date.parse(e!.at)), String(at)).toBe(true);
+    }
+    // The server caps `args` at 512 bytes, so a long one is cut mid-JSON; a client must still survive far
+    // more, and keeps no more than its own cap of it (see the cap cases below).
+    const big = '{"x":"' + 'a'.repeat(1_000_000);
+    expect(toAgentEntry({ ...wire, args: big })?.args).toBe(big.slice(0, 2048));
+    // Nesting no parser will take stays text; a prototype key stays plain data.
+    expect(toAgentEntry({ ...wire, args: '['.repeat(200_000) })?.args).toBe('['.repeat(2048));
+    const proto = toAgentEntry({ ...wire, args: '{"__proto__":{"polluted":true}}' });
+    expect(typeof proto?.args).toBe('object');
+    expect(({} as { polluted?: unknown }).polluted).toBeUndefined();
+    // A result that is neither "ok" nor an error object is an error, with no reason to show.
+    for (const result of [null, undefined, 'fine', 7, {}, { error: 5 }]) {
+      const e = toAgentEntry({ ...wire, result });
+      expect(e?.result, JSON.stringify(result)).toBe('error');
+      expect(e?.detail, JSON.stringify(result)).toBeUndefined();
+    }
+  });
+
+  // The 500-entry cap bounds how many lines the log keeps, not how big each is: `client_label` is a
+  // self-declared `clientInfo.name` the server does not cap, and `args`/`error` are server text. Each
+  // string the model keeps is cut to a fixed size; a line within the caps is untouched (the cases above).
+  it('caps clientLabel at 128 chars', () => {
+    expect(toAgentEntry({ ...wire, client_label: 'L'.repeat(128) })?.clientLabel).toBe('L'.repeat(128));
+    expect(toAgentEntry({ ...wire, client_label: 'L'.repeat(129) })?.clientLabel).toBe('L'.repeat(128));
+    expect(toAgentEntry({ ...wire, client_label: 'L'.repeat(10_000) })?.clientLabel).toBe('L'.repeat(128));
+  });
+
+  it('caps detail at 2048 chars', () => {
+    expect(toAgentEntry({ ...wire, result: { error: 'e'.repeat(2048) } })?.detail).toBe('e'.repeat(2048));
+    expect(toAgentEntry({ ...wire, result: { error: 'e'.repeat(2049) } })?.detail).toBe('e'.repeat(2048));
+    // The model shape's `detail` is cut the same way.
+    const model = toAgentEntry({ origin: 'cli', command: 'scope.add', result: 'error', detail: 'd'.repeat(5000), at: '2024-10-27T03:33:20.000Z' });
+    expect(model?.detail).toBe('d'.repeat(2048));
+  });
+
+  it('caps a string args at 2048 chars before parsing it', () => {
+    // Exactly at the cap: still parsed.
+    const atCap = '{"id":"' + 'f'.repeat(2039) + '"}';
+    expect(atCap).toHaveLength(2048);
+    expect(toAgentEntry({ ...wire, args: atCap })?.args).toEqual({ id: 'f'.repeat(2039) });
+    // One over: valid JSON on the wire, but the cut text (the closing brace is gone) no longer parses, so
+    // it stays text, 2048 chars of it.
+    const over = '{"id":"' + 'f'.repeat(2040) + '"}';
+    expect(over).toHaveLength(2049);
+    const cut = '{"id":"' + 'f'.repeat(2040) + '"';
+    expect(cut).toHaveLength(2048);
+    expect(toAgentEntry({ ...wire, args: over })?.args).toBe(cut);
+    // A non-string args (the fixture model's object) is not text and is passed through.
+    expect(toAgentEntry({ ...wire, args: { id: 'f_1' } })?.args).toEqual({ id: 'f_1' });
+  });
+
+  // The cap is also a bound on what the parser can be made to build: nothing deeper than 1024 levels can
+  // fit in 2048 characters, so a hostile balanced nesting either parses to a shallow-enough structure the
+  // panel can stringify, or is cut and stays text. It never reaches the engine's recursion limit.
+  it('keeps a balanced nesting bounded by the args cap', () => {
+    const fits = '['.repeat(1024) + ']'.repeat(1024);
+    expect(fits).toHaveLength(2048);
+    const parsed = toAgentEntry({ ...wire, args: fits })?.args;
+    expect(Array.isArray(parsed)).toBe(true);
+    expect(() => JSON.stringify(parsed)).not.toThrow();
+    expect(JSON.stringify(parsed)).toBe(fits);
+
+    const tooDeep = '['.repeat(1025) + ']'.repeat(1025);
+    expect(tooDeep).toHaveLength(2050);
+    expect(toAgentEntry({ ...wire, args: tooDeep })?.args).toBe(tooDeep.slice(0, 2048)); // cut mid-nesting: text
+  });
+
+  it('measures the label cap in UTF-16 code units, as documented', () => {
+    const label = toAgentEntry({ ...wire, client_label: '😀'.repeat(200) })?.clientLabel; // 400 code units
+    expect(label).toHaveLength(128);
   });
 });

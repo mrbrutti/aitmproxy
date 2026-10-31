@@ -6,6 +6,7 @@
 // notifications may send the client model directly; both are accepted. Missing stays null.
 
 import { base64ToBytes } from '~/lib/bytes';
+import type { AgentNotification } from '~/bus/types';
 import type {
   Body,
   Client,
@@ -287,4 +288,73 @@ export function toDetail(raw: unknown, seqFallback: number): FlowDetail {
         }
       : null,
   };
+}
+
+/** Epoch ms (the server) or an ISO string (the fixture bus) to ISO; anything else is now. */
+function isoOf(v: unknown): string {
+  const n = num(v);
+  if (n !== null) {
+    try {
+      return new Date(n).toISOString();
+    } catch {
+      // Out of Date's range: not a timestamp we can show.
+    }
+  }
+  return str(v) ?? new Date().toISOString();
+}
+
+/**
+ * Caps on the strings one audit line may put into the model. The Activity log's 500-entry cap bounds how
+ * many lines are kept, not how big each is: `client_label` is a self-declared `clientInfo.name` the server
+ * does not cap, and the error reason and `args` are server text. Lengths are in UTF-16 code units.
+ */
+const LABEL_MAX = 128;
+const TEXT_MAX = 2048;
+const clip = (s: string, max: number): string => (s.length > max ? s.slice(0, max) : s);
+
+/**
+ * The audit `args` is redacted JSON text; an object or array is shown structured, anything else as the
+ * text it is. Cut to `TEXT_MAX` BEFORE parsing, so an oversized line yields a bounded string (a cut JSON
+ * text no longer parses and simply stays text), never an unbounded object.
+ */
+function argsOf(v: unknown): unknown {
+  if (typeof v !== 'string') return v;
+  const text = clip(v, TEXT_MAX);
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return parsed !== null && typeof parsed === 'object' ? parsed : text;
+  } catch {
+    return text;
+  }
+}
+
+/**
+ * One audit line (`notifications/aitm/agent`, `agent.activity`) to the Activity model. Accepts the
+ * server's wire shape (crates/aitm-core/src/audit.rs) and the fixture bus's model shape alike.
+ * Returns null for what is not an audit entry: an `approval_requested` line (it carries `event`),
+ * a line without a string `command`, or one without a string `origin` (the model requires it and the
+ * server always sends it; without it the line could be neither attributed nor filtered). Any `result`
+ * other than `'ok'` is shown as `'error'` (web-ui-bus-push D6: shown, never hidden), with the reason as
+ * `detail` when the server gave one. The strings kept are capped (`LABEL_MAX`, `TEXT_MAX`).
+ */
+export function toAgentEntry(raw: unknown): AgentNotification | null {
+  const r = rec(raw);
+  if (r.event !== undefined) return null;
+  const command = str(r.command);
+  const origin = str(r.origin);
+  if (!command || !origin) return null;
+  const detail = str(rec(r.result).error) ?? str(r.detail);
+  const out: AgentNotification = {
+    origin: origin as AgentNotification['origin'],
+    command,
+    result: r.result === 'ok' ? 'ok' : 'error',
+    at: isoOf(r.at),
+  };
+  if ('client_label' in r || 'clientLabel' in r) {
+    const label = str(r.client_label ?? r.clientLabel);
+    out.clientLabel = label === null ? null : clip(label, LABEL_MAX);
+  }
+  if (r.args !== undefined) out.args = argsOf(r.args);
+  if (detail !== null) out.detail = clip(detail, TEXT_MAX);
+  return out;
 }
