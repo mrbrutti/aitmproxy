@@ -183,11 +183,18 @@ final class BusService: FlowActions {
     /// `addScope`/`removeScope` only after the verb and the refresh both succeeded; never
     /// on connect or poll, never while the client points at an external core (the callers
     /// also require that intent to have held across the whole round trip), never in
-    /// fixture/snapshot/self-test runs. A failed save is swallowed like `Pins`: the
-    /// in-memory scope stays right for this run.
-    private func persistEmbeddedScope() {
+    /// fixture/snapshot/self-test runs. A failed save is an error of the action: it throws
+    /// `BusError.tool("Scope change not saved: …")`, which `Session.perform` lands in
+    /// `lastError`, because a silently failed save after a remove would resurrect the host
+    /// at the next launch. By then the core has accepted the change and the refresh has
+    /// set `session.scopeHosts`, so the in-memory scope stays right for this run.
+    private func persistEmbeddedScope() throws {
         guard preferEmbedded, !Store.usesFixtures else { return }
-        try? EmbeddedScope(hosts: session.scopeHosts).save(to: session.scopeURL)
+        do {
+            try EmbeddedScope(hosts: session.scopeHosts).save(to: session.scopeURL)
+        } catch {
+            throw BusError.tool(message: "Scope change not saved: \(error.localizedDescription)")
+        }
     }
 
     // MARK: FlowActions
@@ -255,13 +262,13 @@ final class BusService: FlowActions {
         // write needs `preferEmbedded` to hold both before and after.
         let embedded = preferEmbedded
         _ = try await call("scope.add", ["host": .string(host)])
-        if await refreshScope(), embedded, preferEmbedded { persistEmbeddedScope() }
+        if await refreshScope(), embedded, preferEmbedded { try persistEmbeddedScope() }
     }
 
     func removeScope(_ host: String) async throws {
         let embedded = preferEmbedded
         _ = try await call("scope.remove", ["host": .string(host)])
-        if await refreshScope(), embedded, preferEmbedded { persistEmbeddedScope() }
+        if await refreshScope(), embedded, preferEmbedded { try persistEmbeddedScope() }
     }
 
     func mark(_ id: FlowID, color: MarkColor?) async throws {
