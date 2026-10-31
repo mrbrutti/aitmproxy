@@ -378,15 +378,19 @@ fn a_flow_without_trailers_serialises_without_a_trailers_key() {
         "a response with no trailers writes no `trailers` key, got: {text}"
     );
 
-    // The response object is exactly today's five fields (serde_json's map is
-    // key-sorted), so the document is the pre-change shape.
+    // The response object is exactly today's five fields, so the document is the
+    // pre-change shape. The keys are compared sorted: whether serde_json's map
+    // iterates sorted or in insertion order depends on whether another workspace
+    // crate (aitm-tui) enables `preserve_order`, which differs between
+    // `cargo test -p aitm-plugin-sessionio` and a whole-workspace run.
     let doc: serde_json::Value = serde_json::from_slice(&bytes).expect("export is JSON");
-    let keys: Vec<&str> = doc["flows"][0]["response"]
+    let mut keys: Vec<&str> = doc["flows"][0]["response"]
         .as_object()
         .expect("response is an object")
         .keys()
         .map(String::as_str)
         .collect();
+    keys.sort_unstable();
     assert_eq!(keys, ["body", "headers", "status", "timestamp", "version"]);
 }
 
