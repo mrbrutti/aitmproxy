@@ -1,0 +1,21 @@
+# aitmproxy demo config — benign sample traffic for a product feature video.
+listen: "127.0.0.1:8080"
+scope:
+  entries:
+    - "127.0.0.1:9000"
+  allow_agent_widen: true
+browser:
+  engine: obscura
+  proxy_addr: "127.0.0.1:8081"
+  nav_timeout: 30
+  ssrf:
+    block_private: true
+    block_loopback: true
+    allow_if_in_scope: true
+mcp:
+  transport:
+    loopback_tcp:
+      port: 8090
+      token: "f53c2ce661e3992b2824b9d24aed6b899155c4a790056007"
+      endpoint_file: "/Users/matt/Security/aitmproxy/.claude/worktrees/blind-pentest-bwapp-542fcf/demo-site/bus.endpoint"
+  operator_token: "064a8a192406bb42a9413881659b2d4e37a70b3698aa508d"

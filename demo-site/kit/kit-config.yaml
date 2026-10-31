@@ -1,0 +1,22 @@
+# aitmproxy recording kit — web UI / TUI / macOS app surfaces.
+# High ports so it won't collide with other running cores.
+listen: "127.0.0.1:18080"            # the proxy (point curl/a browser here)
+scope:
+  entries:
+    - "127.0.0.1:19000"              # the benign sample site
+  allow_agent_widen: true
+browser:
+  engine: obscura
+  proxy_addr: "127.0.0.1:18081"      # obscura's dedicated proxy port
+  nav_timeout: 30
+  ssrf:
+    block_private: true
+    block_loopback: true
+    allow_if_in_scope: true
+mcp:
+  transport:
+    loopback_tcp:
+      port: 18090                    # the bus (TUI / macOS app / mcpcli connect here)
+      token: "aitmdemo-agent"
+      endpoint_file: "/Users/matt/Security/aitmproxy/.claude/worktrees/blind-pentest-bwapp-542fcf/demo-site/kit/bus.endpoint"
+  operator_token: "aitmdemo-operator"

@@ -1,0 +1,21 @@
+# aitmproxy recording kit — MCP-over-stdio, for driving aitm from a fresh
+# Claude Code session. Claude speaks MCP to this process over stdio.
+listen: "127.0.0.1:18080"
+scope:
+  entries:
+    - "127.0.0.1:19000"
+  allow_agent_widen: true
+browser:
+  engine: obscura
+  proxy_addr: "127.0.0.1:18081"
+  nav_timeout: 30
+  ssrf:
+    block_private: true
+    block_loopback: true
+    allow_if_in_scope: true
+mcp:
+  transport:
+    stdio: {}
+  # Give the stdio (Claude) connection operator powers so the demo can edit,
+  # replay and intercept without policy prompts.
+  stdio_role: operator

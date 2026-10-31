@@ -1,0 +1,11 @@
+# Media (record these yourself) and runtime artifacts — not tracked.
+*.mp4
+*.gif
+*.cast
+*.mov
+*.png
+bus.endpoint
+webbus.endpoint
+kit/logs/
+kit/bus.endpoint
+__pycache__/
